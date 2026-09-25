@@ -2,23 +2,35 @@
  * persona-connection-errors.ts — Token-safe description of thrown values, and
  * the process-level `unhandledRejection` handler (b.av2 SR-3.3, SR-10.3).
  *
- * A Slack library error can hold secrets beyond its code: its message, its
- * `original` (the raw request error, Authorization header included), request
- * headers, request config and `data`. `describeThrownValue` therefore keeps
+ * A Slack library error can hold secrets beyond its code: its `original`
+ * (the raw request error, Authorization header included), request headers,
+ * request config and `data`, and its message can quote a URL (the Socket Mode
+ * WebSocket `ticket=` URL) or a token. `describeThrownValue` therefore keeps
  * only these things:
  *
  * - the value's constructor name (for an `Error`) or its type (anything else:
  *   `undefined`, `null`, `string`, `object`, …);
  * - for a base agent-director error (constructor name `AgentDirectorError`,
  *   an error name with no dedicated subclass), its `errName`, under the same
- *   short-identifier check as `code` (never its description or message);
+ *   short-identifier check as `code`;
  * - the `code`, only when it is a short identifier (letters, digits and `_`;
  *   a Slack token always contains `-`, so it can never pass);
+ * - the message, when it is a non-empty string, rendered by
+ *   `describeLogMessage`: passed through `redactSlackLogText` (every URL-like
+ *   substring becomes `<redacted-url>`, every token-like one
+ *   `<redacted-token>`), line breaks collapsed to one space, capped at
+ *   `MAX_LOGGED_MESSAGE_LENGTH` characters and JSON-quoted, as
+ *   `message="…"`. A thrown string is treated as a message and gets the same
+ *   form (`string message="…"`); any other non-`Error` value is named by its
+ *   type only;
  * - the stack's frame lines (`at …`), after the message has been cut out of
- *   the stack, so no line of a multi-line message survives, even one shaped
- *   like a frame.
+ *   the stack, so the message appears once, in `message="…"`, and no line of
+ *   a multi-line message survives as a frame, even one shaped like a frame.
  *
- * Nothing else is read, and the value is never serialised.
+ * Nothing else is read, and the value is never serialised. A caller whose
+ * thrown value can quote a file that holds secrets (a credentials file's JSON
+ * parse error) must not pass it here: the credentials reader words its own
+ * fixed causes instead (`persona-credentials.ts`).
  *
  * `slackPlatformReason` reads one more field for callers that want it: the
  * Slack platform reason (`data.error`), under the same short-identifier check
@@ -37,6 +49,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { redactSlackLogText } from './slack-log-redaction.ts'
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -54,6 +68,19 @@ const MAX_STACK_FRAMES = 10
 const FRAME_SEPARATOR = ' <- '
 
 /**
+ * Most characters of a message a description keeps, counted after redaction
+ * and before quoting; a longer message is cut and ends in `…`. The same cap
+ * the spawn-failure notice puts on an agent-director description.
+ */
+export const MAX_LOGGED_MESSAGE_LENGTH = 300
+
+/** What ends a message cut at `MAX_LOGGED_MESSAGE_LENGTH`. */
+const TRUNCATION_MARK = '…'
+
+/** Line breaks a stack or message can contain. */
+const LINE_BREAK_RE = /\r\n|[\n\r\u2028\u2029]/
+
+/**
  * Constructor name of agent-director's base error class. Matched by name, not
  * `instanceof`, so this module imports nothing from agent-director.
  */
@@ -65,12 +92,14 @@ const AGENT_DIRECTOR_BASE_ERROR = 'AgentDirectorError'
 
 /**
  * Describe any thrown or rejected value in one line that is safe to log:
- * `<Type>[ errName=<errName>][ code=<code>][ <frame> <- <frame> …]`
- * (`errName` only for a base `AgentDirectorError`). See the module comment
- * for what is kept. Never throws.
+ * `<Type>[ errName=<errName>][ code=<code>][ message="<message>"][ <frame> <- <frame> …]`
+ * (`errName` only for a base `AgentDirectorError`; for a thrown string,
+ * `string[ message="<message>"]`). See the module comment for what is kept.
+ * Never throws.
  */
 export function describeThrownValue(value: unknown): string {
   try {
+    if (typeof value === 'string') return ['string', describeLogMessage(value)].filter(Boolean).join(' ')
     if (!(value instanceof Error)) return value === null ? 'null' : typeof value
     const type = constructorName(value)
     const parts = [type]
@@ -80,11 +109,37 @@ export function describeThrownValue(value: unknown): string {
     }
     const code = readProp(value, 'code')
     if (typeof code === 'string' && SAFE_IDENTIFIER_RE.test(code)) parts.push(`code=${code}`)
+    const message = describeLogMessage(readProp(value, 'message'))
+    if (message !== '') parts.push(message)
     const frames = stackFrames(value)
     if (frames.length > 0) parts.push(frames.join(FRAME_SEPARATOR))
     return parts.join(' ')
   } catch {
     return 'unknown'
+  }
+}
+
+/**
+ * `message="<text>"` for a non-empty string `text`, else the empty string:
+ * the text through `redactSlackLogText` (URL-like and token-like substrings
+ * replaced), every line break collapsed to one space, cut to
+ * `MAX_LOGGED_MESSAGE_LENGTH` characters (ending in `…` when cut) and
+ * JSON-quoted, so quotes, backslashes and control characters cannot end the
+ * field or the line. The one rendering of free text in a describer's output;
+ * `describeThrownValue` and the `describeAgentDirectorFailure` describers use
+ * it. Never throws.
+ */
+export function describeLogMessage(text: unknown): string {
+  try {
+    if (typeof text !== 'string' || text.trim() === '') return ''
+    const flat = redactSlackLogText(text).split(LINE_BREAK_RE).join(' ').trim()
+    const capped =
+      flat.length > MAX_LOGGED_MESSAGE_LENGTH
+        ? flat.slice(0, MAX_LOGGED_MESSAGE_LENGTH - TRUNCATION_MARK.length) + TRUNCATION_MARK
+        : flat
+    return `message=${JSON.stringify(capped)}`
+  } catch {
+    return ''
   }
 }
 
@@ -121,9 +176,6 @@ function constructorName(error: Error): string {
   const name = readProp(ctor, 'name')
   return typeof name === 'string' && SAFE_IDENTIFIER_RE.test(name) ? name : 'Error'
 }
-
-/** Line breaks a stack or message can contain. */
-const LINE_BREAK_RE = /\r\n|[\n\r\u2028\u2029]/
 
 /**
  * The stack's frame lines, trimmed. The message is cut out first: the stack

@@ -31,6 +31,7 @@ import { _resetBackoffState } from '../src/backoff.ts'
 import { makeMultiPersonaConfig, makePersonaConfig } from './test-helpers/persona-config.ts'
 import type { Persona } from '../src/config.ts'
 import type { PersonaConnectionManager } from '../src/persona-connections.ts'
+import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import {
   createPersonaBringUpController,
@@ -41,7 +42,14 @@ import {
   type ConnectionHarness,
   type ConnectionHarnessOptions,
 } from './test-helpers/persona-connection-harness.ts'
-import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
+import {
+  APP_TOKEN_PREFIX,
+  LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
+  assertNoLeak,
+  fakeToken,
+  sentinelInMessage,
+} from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -307,14 +315,16 @@ describe('startHealthCheck', () => {
   })
 
   // AC 20 (b.av2 SR-10.3): the per-persona catch logs the error's description
-  // (type, safe code, frames), never the error itself. Every console.error
+  // (type, safe code, message through `redactSlackLogText`, frames), never the
+  // error itself. The message carries the leak marker only inside a fake token
+  // and a `ticket=` URL, both of which redaction replaces. Every console.error
   // argument is kept unformatted, so a raw error fails the leak check.
-  test('AC 20: a persona check throws an error carrying fake tokens — one "error checking" line naming its type and code only; the other persona is still restarted; nothing leaks', async () => {
+  test('AC 20: a persona check throws an error carrying fake tokens — one "error checking" line naming its type, code and redacted message; the other persona is still restarted; nothing leaks', async () => {
     const deps = makeDeps({ personas: workList('failing_bot', 'dead_bot'), maxTicks: 1 })
     const alive = deps.isSessionAlive
     deps.isSessionAlive = async (key) => {
       if (key !== 'failing_bot') return alive(key)
-      throw Object.assign(new Error(`status failed ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), {
+      throw Object.assign(new Error(`status failed (${sentinelInMessage('msg')})`), {
         code: 'EIO',
         detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
         note: LEAK_SENTINEL,
@@ -335,7 +345,9 @@ describe('startHealthCheck', () => {
     const lines = errArgs.filter((args) => String(args[0]).includes('error checking'))
     expect(lines).toHaveLength(1)
     expect(lines[0]).toHaveLength(1)
-    expect(String(lines[0]![0])).toStartWith('[slack] health-check: error checking persona=failing_bot: Error code=EIO at ')
+    expect(String(lines[0]![0])).toStartWith(
+      `[slack] health-check: error checking persona=failing_bot: Error code=EIO message="status failed (${REDACTED_SENTINEL_TAIL})" at `,
+    )
     assertNoLeak({ errArgs, notices })
   })
 
@@ -1136,6 +1148,17 @@ describe('forgetDisconnectedStreak — per-persona teardown (b.av2 SR-6.5)', () 
 // directory disappears after it came up (today's cwd-unreachable path).
 // ---------------------------------------------------------------------------
 
+/**
+ * The bring-up controller's claude_config_dir check against a scratch home
+ * `<base>/home` holding a real `.claude`, so no bring-up here depends on the
+ * process home (a dangling `$HOME/.claude` would hold every persona).
+ */
+function configDirCheckUnder(base: string): (persona: Persona) => ReturnType<typeof checkPersonaConfigDir> {
+  const home = join(base, 'home')
+  mkdirSync(join(home, '.claude'), { recursive: true })
+  return (persona) => checkPersonaConfigDir(persona, { home })
+}
+
 describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', () => {
   let dir: string
   let managers: PersonaConnectionManager[]
@@ -1175,6 +1198,7 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
       dryRun: false,
       log,
       clock: h.clock,
+      checkConfigDir: configDirCheckUnder(dir),
       launch: async (persona: Persona) => void launches.push(persona.key),
     })
     controllers.push(controller)

@@ -91,9 +91,10 @@ import type { SlackBotIdentity } from './persona-slack-validation.ts'
 // ---------------------------------------------------------------------------
 
 /**
- * The bring-up step that failed. `claude-config-dir` is the pre-launch check
- * of the persona's claude_config_dir (bug b.g57), which holds an up persona
- * back as `retrying` until the directory resolves.
+ * The bring-up step that failed. `claude-config-dir` is the check of the
+ * persona's claude_config_dir (bug b.g57), right before step 3 and before
+ * every launch, which holds the persona `retrying`, with no Slack
+ * connection, until the directory resolves.
  */
 export type PersonaBringUpStep = 'credentials' | 'working-directory' | 'slack' | 'claude-config-dir'
 

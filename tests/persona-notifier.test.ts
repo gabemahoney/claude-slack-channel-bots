@@ -893,7 +893,7 @@ describe('failed posts and the failure callback (SR-11 spawn-failure-post class)
 })
 
 // ---------------------------------------------------------------------------
-// Failure log lines: Slack platform reason, never free text
+// Failure log lines: Slack platform reason, and the error's message logged redacted
 // ---------------------------------------------------------------------------
 
 describe('failure log lines (SR-10.3 token-safe)', () => {
@@ -901,7 +901,7 @@ describe('failure log lines (SR-10.3 token-safe)', () => {
     ['invalid_blocks on a channel destination', (x) => x.A, 'invalid_blocks', (x) => x.A.permission_prompts],
     ['msg_too_long in the opened DM', (x) => x.D, 'msg_too_long', (x) => stubOpenedDmId(x.D.dm.contact!)],
   ])(
-    'a post refused for the message itself (%s) is dropped, not held: one per-notice line with the short reason beside the destination, the callback once, no episode; the next notice posts at once',
+    'a post refused for the message itself (%s) is dropped, not held: one per-notice line with the short reason beside the destination and the error\'s message logged redacted, the callback once, no episode; the next notice posts at once',
     async (_label, pick, code, where) => {
       const p = pick(f)
       h.validate(p.key)
@@ -913,8 +913,14 @@ describe('failure log lines (SR-10.3 token-safe)', () => {
       expect(h.logs).toHaveLength(1)
       expect(h.logs[0]).toStartWith(`[slack] persona-notifier: failed to post notice for ${ref(p)} to ${where(f)} (reason=${code}): `)
       expect(h.logs[0]).toContain('code=slack_webapi_platform_error')
-      // Never the error message.
-      expect(h.logs[0]).not.toContain('An API error occurred')
+      // The error's message is logged redacted: the stub's rejection quotes a
+      // fake token and a WebSocket ticket URL, each holding the leak sentinel
+      // (the afterEach leak check covers the sentinel itself).
+      const message = /message="([^"]*)"/.exec(h.logs[0]!)?.[1]
+      expect(message).toContain('An API error occurred')
+      expect(message).toContain(code)
+      expect(message).toContain('<redacted-token>')
+      expect(message).toContain('<redacted-url>')
       expect(failures).toHaveLength(1)
       expect(failures[0]).toMatchObject({ step: 'chat.postMessage', code, channelId: where(f) })
       expect(h.hold.view(p.key)).toEqual(NOT_HELD)

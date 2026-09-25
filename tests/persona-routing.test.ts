@@ -90,7 +90,7 @@ import {
 } from './test-helpers/slack-stub.ts'
 import { posts, slackCalls } from './test-helpers/permission-relay-harness.ts'
 import { buildTempArchiveDb } from './test-helpers/archive-db.ts'
-import { LEAK_SENTINEL, assertNoLeak } from './test-helpers/credentials.ts'
+import { REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import {
   NEVER_FIRE_RESTART_DELAY_S,
   makeRestartDeps,
@@ -773,13 +773,16 @@ describe('intake', () => {
     expect(h.p('Alpha Bot').notifications).toHaveLength(0)
   })
 
-  test('a failed ack is logged token-safely and delivery still happens', async () => {
+  test('a failed ack is logged with its message redacted, token-safely, and delivery still happens', async () => {
     const h = makeHarness(ac1Specs())
+    // The marker only inside a fake token and a ticket URL: the shapes the redactor replaces.
     await h.receive(makeChannelMessage({ channel: CA }), ['Alpha Bot'], () => {
-      throw new Error(`ack refused ${LEAK_SENTINEL}`)
+      throw new Error(`ack refused (${sentinelInMessage('ack')})`)
     })
 
-    expect(lines(h, 'failed to ack event')).toHaveLength(1)
+    const failed = lines(h, 'failed to ack event')
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toContain(`ack refused (${REDACTED_SENTINEL_TAIL})`)
     expect(h.p('Alpha Bot').notifications).toHaveLength(1)
     assertNoLeak(captured(h))
   })
@@ -820,7 +823,7 @@ describe('intake', () => {
     expect(h.p('Alpha Bot').stub.calls.reactionsAdd).toEqual([])
   })
 
-  test('a throw in A\'s run is logged naming A, token-safely, and B, receiving the same message on its own connection, still gets its delivery', async () => {
+  test('a throw in A\'s run is logged naming A with its message redacted, token-safely, and B, receiving the same message on its own connection, still gets its delivery', async () => {
     const h = makeHarness(
       [
         { name: 'Alpha Bot', channels: [{ id: CS, delivery: 'all' }] },
@@ -831,7 +834,10 @@ describe('intake', () => {
     const A = h.p('Alpha Bot').persona
     await receiveOnEach(h, makeChannelMessage({ channel: CS }))
 
-    expect(lines(h, `error handling event for persona ${renderPersonaRef(A.name, A.key)}`)).toHaveLength(1)
+    const failed = lines(h, `error handling event for persona ${renderPersonaRef(A.name, A.key)}`)
+    expect(failed).toHaveLength(1)
+    // The harness's throw carries the marker in a fake token and a ticket URL; the line keeps the message, redacted.
+    expect(failed[0]).toContain(`notification failed (${REDACTED_SENTINEL_TAIL})`)
     expect(h.p('Beta Bot').notifications).toHaveLength(1)
     // One ack per receiving connection.
     expect(h.order.filter((m) => m === 'ack')).toHaveLength(2)

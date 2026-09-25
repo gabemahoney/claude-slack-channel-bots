@@ -39,7 +39,6 @@ import {
   type PersonaConfigFs,
   type PersonaConfigInput,
   type PersonaInput,
-  TOKEN_LIKE_NAME_MESSAGE,
 } from '../src/config.ts'
 import { personaKey } from '../src/persona-identity.ts'
 import { assertSendable } from '../src/lib.ts'
@@ -55,6 +54,7 @@ import {
   LEAK_SENTINEL,
   assertNoLeak,
   fakeToken,
+  withoutName,
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
 
@@ -197,8 +197,11 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
    * Load `input`, expecting rejection; returns the message after checking it
    * leaks no placeholder and that the whole error passes `assertNoLeak` (the
    * config leg of AC 20), so every rejection case built on it is leak-checked.
+   * `name` is a token-shaped persona name the error is meant to carry: it and
+   * its key are masked first (`withoutName`), and the rest of the error is
+   * leak-checked as usual.
    */
-  function loadError(input: unknown): string {
+  function loadError(input: unknown, name?: string): string {
     let error: Error | undefined
     try {
       load(input)
@@ -206,7 +209,8 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       error = err as Error
     }
     if (error === undefined) throw new Error('expected loadPersonaConfig to reject the configuration')
-    assertNoLeak(error, 'rejection')
+    if (name === undefined) assertNoLeak(error, 'rejection')
+    else assertNoLeak(withoutName(error, name, personaKey(name)), 'rejection without the name')
     expect(error.message).not.toContain(PLACEHOLDER)
     return error.message
   }
@@ -866,87 +870,37 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  // b.av2 SR-10.3, E13 Director decisions 5 and 14: a persona name shaped like
-  // a Slack token is rejected, and no error renders it or its key (the key
-  // keeps the name's characters, lower-cased; assertNoLeak's sentinel check
-  // is case-insensitive). Every token-shaped name is a sentinel-bearing fake,
-  // and every error goes through loadError or `rejected`, so a leak of either
-  // fails assertNoLeak.
-  describe('token-shaped persona name (SR-10.3; AC 20 config leg)', () => {
-    /** The error prefix of entry `i` with no persona reference: `personas[i]: ` right after the validation prefix. */
-    const bare = (index: number) => `Persona config validation error: personas[${index}]: `
+  // b.av2 SR-1.2 ("No format rule"), E14 Task 0 operator decision A: any
+  // non-empty persona name loads, including one shaped like a Slack token, and
+  // is printed exactly as written in the persona reference of every error.
+  // Only CSCB's own credential values (`bot_token` / `app_token` in an entry)
+  // stay unechoed.
+  //
+  // A token-shaped name is built with `fakeToken`, so it carries the leak
+  // sentinel on purpose. The artifacts here are meant to contain the name, so
+  // they are not passed to `assertNoLeak` whole: that would rightly flag the
+  // sentinel. `withoutName` first masks the name and its key (the key keeps
+  // the name's characters, lower-cased), and `assertNoLeak` checks the rest,
+  // which proves nothing else token-like, such as a credential value, got in.
+  describe('token-shaped persona name (SR-1.2: no format rule; AC 20 config leg)', () => {
     const tokenName = (prefix: string) => fakeToken(prefix, 'name')
 
-    /** Parse `input`'s bytes as a start from the record (or default mode), expecting a rejection. */
-    function rejected(input: unknown, record: boolean): string {
-      try {
-        parsePersonaConfigBytes(Buffer.from(JSON.stringify(input)), join(dir, 'config.json.last-applied'), dir, { home, record })
-      } catch (err) {
-        assertNoLeak(err, 'rejection')
-        return (err as Error).message
-      }
-      throw new Error('expected parsePersonaConfigBytes to reject the configuration')
-    }
+    /** `captured` with `name` (as written) and its key masked, so `assertNoLeak` checks what is left. */
+    const masked = (captured: unknown, name: string) => withoutName(captured, name, personaKey(name))
 
-    test.each([
+    /** The b.av2 SR-2.2 reference of entry `i`: `personas[i]`, the JSON-quoted name and its key. */
+    const indexedRef = (index: number, name: string) => `personas[${index}] ${JSON.stringify(name)} (key=${personaKey(name)})`
+
+    // Token-shaped rows first, then names near the token shape (a word such
+    // as xoxo, a prefix glued to a word or followed by a letter, an upper-case
+    // prefix), which loaded before decision A too and must keep loading: an
+    // upgrade must never refuse to start over a name it accepted before.
+    const XOX = BOT_TOKEN_PREFIX.slice(0, 3)
+    const NAMES: [string, string][] = [
       ['an xoxb- token', tokenName(BOT_TOKEN_PREFIX)],
       ['an xapp- token', tokenName(APP_TOKEN_PREFIX)],
       ['an xoxp- token', tokenName('xoxp-')],
       ['an xoxp- token inside a longer name', `Ops ${tokenName('xoxp-')} bot`],
-    ])('a name that is %s is rejected, naming personas[i] and the rule, never the name or its key', (_label, name) => {
-      const message = loadError(withPersonas(makePersona({ name: 'Ops Bot' }, dir), makePersona({ name }, dir)))
-      expect(message).toBe(`loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": ${bare(1)}${TOKEN_LIKE_NAME_MESSAGE}`)
-      expect(message).not.toContain(name)
-      expect(message).not.toContain(personaKey(name))
-    })
-
-    // Errors of the entry reported before the name check (stage 1: shapes and
-    // unknown keys) name personas[i] only; one checked after it gives way to
-    // the name rule.
-    test.each([
-      ['an unknown key in the entry', { nickname: 'ops' }, 'unknown field(s) in the persona entry: "nickname".'],
-      ['a token-named unknown key in the entry', { [fakeToken(BOT_TOKEN_PREFIX, 'key')]: 1 }, 'unknown field(s) in the persona entry: 1 field whose name is not shown'],
-      ['a non-object dm', { dm: true }, 'dm must be a JSON object'],
-      ['an unknown key in dm', { dm: { enabled: false, relay: true } }, 'unknown field(s) in dm: "relay".'],
-      ['a non-object channel entry', { channels: [null] }, 'channels[0] must be a JSON object'],
-      ['a bad channel ID (checked after the name)', { channels: [{ id: 'D0TEST001', delivery: 'all' }] }, TOKEN_LIKE_NAME_MESSAGE],
-    ])('with %s in the same entry, the first error names personas[i] only', (_label, overrides, reported) => {
-      const name = tokenName(BOT_TOKEN_PREFIX)
-      const message = loadError(withPersonas(makePersona({ name, ...overrides } as Partial<PersonaInput>, dir)))
-      expect(message).toContain(`${bare(0)}${reported}`)
-      expect(message).not.toContain(personaKey(name))
-    })
-
-    test('the same token-shaped name twice is the name rule for the first persona, never a duplicate error', () => {
-      const name = tokenName(APP_TOKEN_PREFIX)
-      const message = loadError(withPersonas(
-        makePersona({ name, working_directory: join(dir, 'p0') }, dir),
-        makePersona({ name, working_directory: join(dir, 'p1') }, dir),
-      ))
-      expect(message).toContain(`${bare(0)}${TOKEN_LIKE_NAME_MESSAGE}`)
-      expect(message).not.toContain('personas[1]')
-      expect(message).not.toContain('duplicate')
-    })
-
-    test('a start from the record gives the same rejection as default mode, naming the record path', () => {
-      const input = withPersonas(makePersona({ name: 'Ops Bot' }, dir), makePersona({ name: tokenName('xoxp-') }, dir))
-      const record = rejected(input, true)
-      expect(record).toBe(`loadPersonaConfig: invalid persona config in "${join(dir, 'config.json.last-applied')}": ${bare(1)}${TOKEN_LIKE_NAME_MESSAGE}`)
-      expect(rejected(input, false)).toBe(record)
-    })
-
-    // Not token-shaped (Director decision 14: a boundary before the prefix and
-    // a digit after the dash): loads, the name and its key as for any name,
-    // from config.json and from a record written by an earlier version, so an
-    // upgrade never refuses to start over a name it accepted before. No
-    // assertNoLeak here: no token is involved (loading reads no credentials
-    // file), and the test helper's wider matcher flags some of these names
-    // on purpose (the word xoxo and a dash before a letter, a prefix followed
-    // by a letter).
-    const XOX = BOT_TOKEN_PREFIX.slice(0, 3)
-    const keyedNames = (config: { personas: readonly { name: string; key: string }[] }) =>
-      config.personas.map((p) => [p.name, p.key])
-    test.each([
       ['a word such as "Xoxo bot"', 'Xoxo bot'],
       ['the word xoxo, a dash and a word', `${XOX}o-bot`],
       ['inboxapp-bot', 'inboxapp-bot'],
@@ -956,18 +910,79 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['the bare prefix text', `must start with ${BOT_TOKEN_PREFIX}`],
       ['a prefix followed by a space', `${APP_TOKEN_PREFIX} x`],
       ['a prefix followed by a letter', `${BOT_TOKEN_PREFIX}abc`],
-      ['an upper-case prefix and a digit (the match is case-sensitive)', `${BOT_TOKEN_PREFIX.toUpperCase()}1abc`],
-    ])('a name that is %s loads from config.json and from the record, keyed as usual', (_label, name) => {
-      const input = withPersonas(makePersona({ name }, dir))
-      const expected = [[name, personaKey(name)]]
-      expect(keyedNames(load(input))).toEqual(expected)
-      const recordPath = join(dir, 'config.json.last-applied')
-      expect(keyedNames(parsePersonaConfigBytes(Buffer.from(JSON.stringify(input)), recordPath, dir, { home, record: true }))).toEqual(expected)
+      ['an upper-case prefix and a digit', `${BOT_TOKEN_PREFIX.toUpperCase()}1abc`],
+    ]
+
+    const keyedNames = (config: { personas: readonly { name: string; key: string }[] }) =>
+      config.personas.map((p) => [p.name, p.key])
+
+    test.each(NAMES)('a name that is %s loads from config.json, as written and keyed as usual', (_label, name) => {
+      const config = load(withPersonas(makePersona({ name: 'Ops Bot' }, dir), makePersona({ name }, dir)))
+      expect(keyedNames(config)).toEqual([['Ops Bot', personaKey('Ops Bot')], [name, personaKey(name)]])
+      assertNoLeak(masked(config, name), 'config without the name')
     })
 
-    test('a near-miss name is still named, with its key, in its entry\'s errors', () => {
-      const message = loadError(withPersonas(makePersona({ name: 'Xoxo bot', permission_prompts: undefined }, dir)))
-      expect(message).toContain(`personas[0] ${JSON.stringify('Xoxo bot')} (key=${personaKey('Xoxo bot')}): permission_prompts`)
+    test.each(NAMES)('a name that is %s loads from the record (record mode) and through resolvePersonaConfig', (_label, name) => {
+      const input = withPersonas(makePersona({ name }, dir))
+      const expected = [[name, personaKey(name)]]
+      const recordPath = join(dir, 'config.json.last-applied')
+      const fromRecord = parsePersonaConfigBytes(Buffer.from(JSON.stringify(input)), recordPath, dir, { home, record: true })
+      expect(keyedNames(fromRecord)).toEqual(expected)
+      const resolved = resolvePersonaConfig(input, dir, home, { record: true })
+      expect(keyedNames(resolved)).toEqual(expected)
+      assertNoLeak(masked([fromRecord, resolved], name), 'record load without the name')
+    })
+
+    // Errors of the entry, from every stage, name personas[i] with the
+    // persona reference rendered from the token-shaped name and its key. The
+    // entry's own bot_token / app_token values are credentials: their key is
+    // named, their value never is (loadError's masked assertNoLeak).
+    test.each([
+      ['an unknown key in the entry', { nickname: 'ops' }, 'unknown field(s) in the persona entry: "nickname".'],
+      ['a bot_token value in the entry', { bot_token: fakeToken(BOT_TOKEN_PREFIX, 'entry') }, 'unknown field(s) in the persona entry: "bot_token".'],
+      ['an app_token value in the entry', { app_token: fakeToken(APP_TOKEN_PREFIX, 'entry') }, 'unknown field(s) in the persona entry: "app_token".'],
+      ['a token-named unknown key in the entry', { [fakeToken(BOT_TOKEN_PREFIX, 'key')]: 1 }, 'unknown field(s) in the persona entry: 1 field whose name is not shown'],
+      ['a non-object dm', { dm: true }, 'dm must be a JSON object'],
+      ['a bot_token value in dm', { dm: { enabled: false, bot_token: fakeToken(BOT_TOKEN_PREFIX, 'dm') } }, 'unknown field(s) in dm: "bot_token".'],
+      ['a non-object channel entry', { channels: [null] }, 'channels[0] must be a JSON object'],
+      ['a bad channel ID', { channels: [{ id: 'D0TEST001', delivery: 'all' }] }, 'channels[0].id must be a Slack channel ID'],
+      ['a missing permission_prompts', { permission_prompts: undefined }, 'permission_prompts'],
+    ])('with %s, the error names personas[i] with the token-shaped name and key as written', (_label, overrides, reported) => {
+      const name = tokenName(BOT_TOKEN_PREFIX)
+      const message = loadError(
+        withPersonas(makePersona({ name: 'Ops Bot' }, dir), makePersona({ name, ...overrides } as Partial<PersonaInput>, dir)),
+        name,
+      )
+      expect(message).toContain(`Persona config validation error: ${indexedRef(1, name)}: ${reported}`)
+      expect(message).not.toContain('personas[0]')
+    })
+
+    test('the same token-shaped name twice gives the duplicate-name error, naming it as written', () => {
+      const name = tokenName(APP_TOKEN_PREFIX)
+      const message = loadError(withPersonas(
+        makePersona({ name, working_directory: join(dir, 'p0') }, dir),
+        makePersona({ name, working_directory: join(dir, 'p1') }, dir),
+      ), name)
+      expect(message).toContain(
+        `${indexedRef(1, name)}: name ${JSON.stringify(name)} is duplicated: ${indexedRef(0, name)} has the same name.`,
+      )
+    })
+
+    test('a start from the record accepts a token-shaped name and reports its entry errors as default mode does', () => {
+      const name = tokenName('xoxp-')
+      const input = withPersonas(makePersona({ name: 'Ops Bot' }, dir), makePersona({ name, permission_prompts: undefined }, dir))
+      const recordPath = join(dir, 'config.json.last-applied')
+      const messages = [true, false].map((record) => {
+        try {
+          parsePersonaConfigBytes(Buffer.from(JSON.stringify(input)), recordPath, dir, { home, record })
+        } catch (err) {
+          assertNoLeak(masked(err, name), 'rejection without the name')
+          return (err as Error).message
+        }
+        throw new Error('expected parsePersonaConfigBytes to reject the configuration')
+      })
+      expect(messages[0]).toContain(`invalid persona config in "${recordPath}": Persona config validation error: ${indexedRef(1, name)}: permission_prompts`)
+      expect(messages[1]).toBe(messages[0])
     })
   })
 

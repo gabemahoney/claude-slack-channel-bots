@@ -22,9 +22,14 @@
 
 /**
  * The recovery state a lost message reports: P not up (b.av2 SR-6.4: its
- * bring-up is retrying or broken, such as a launch waiting for its
- * claude_config_dir, bug b.g57), so no restart is started and its instance is
- * launched once it recovers; a restart of P already pending or running; a
+ * bring-up is retrying or broken, or unknown to the bring-up controller), so
+ * no restart is started and its instance is launched once it recovers. A
+ * retrying or broken persona forwards no Slack event, so this is reached
+ * only by a message P's connection received while P was up, when P stopped
+ * being up before the message found no session (for example a Web API call
+ * refused for its bot token during its handling), or by one received by the
+ * old half of a destructive modify, whose bring-up state is cancelled before
+ * its connection is stopped; a restart of P already pending or running; a
  * human-triggered restart of P started for this message; auto-restart
  * disabled (`session_restart_delay` 0); or P at the restart-failure cap.
  */

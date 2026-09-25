@@ -11,7 +11,8 @@
  * - the real persona-keyed registry: each persona named in `sessions` (default
  *   all) gets a registered session with a fake transport (holding `_GET_stream`
  *   unless `streamless`) and a fake MCP server that records
- *   `notifications/claude/channel` calls (or throws, with `throwOnNotify`).
+ *   `notifications/claude/channel` calls (or throws, with `throwOnNotify`, an
+ *   error whose message carries the leak marker inside a token and a URL).
  *   An `onNotify` hook runs when `notification()` is called and is awaited
  *   before the call is recorded, so a test can put the send in an ordered log,
  *   hold it open or make it fail (a throwing hook: not recorded);
@@ -95,7 +96,7 @@ import {
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
 import { makeStubSlack, type StubSlack, type StubSlackOptions } from './slack-stub.ts'
 import { makePersonaClients, posts, type PersonaClients } from './permission-relay-harness.ts'
-import { LEAK_SENTINEL } from './credentials.ts'
+import { LEAK_SENTINEL, sentinelInMessage } from './credentials.ts'
 import type { FakeClock } from './fake-clock.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 
@@ -159,12 +160,16 @@ export type NotifyHook = (msg: ChannelNotification) => void | Promise<void>
 /**
  * A fake MCP server whose `notification()` records into `notifications`, or
  * throws when `throws`. `onNotify`, when given, runs first (see `NotifyHook`).
+ * The thrown message carries `LEAK_SENTINEL` only inside a fake token and a
+ * `wss://…?ticket=` URL (`sentinelInMessage`): log lines keep a message
+ * after `redactSlackLogText`, which removes both shapes, so the sentinel
+ * shows only if redaction is skipped.
  */
 export function makeSessionServer(notifications: ChannelNotification[], throws = false, onNotify?: NotifyHook): Server {
   return {
     connect: async () => {},
     notification: async (msg: ChannelNotification) => {
-      if (throws) throw new Error(`notification failed ${LEAK_SENTINEL}`)
+      if (throws) throw new Error(`notification failed (${sentinelInMessage('notify')})`)
       if (onNotify) await onNotify(msg)
       notifications.push(msg)
     },

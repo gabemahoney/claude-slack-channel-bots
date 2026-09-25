@@ -563,25 +563,30 @@ describe('a dm destination with DMs off or no contact is refused (SR-5.1)', () =
 // ---------------------------------------------------------------------------
 
 describe('describeDestinationFailure (token-safe)', () => {
-  test('a thrown value whose message holds a token never appears in the description', async () => {
+  test('a token in a thrown value\'s message never appears in the description; the message is logged redacted', async () => {
     const token = fakeToken(BOT_TOKEN_PREFIX, 'x')
     stub(A).script.open.push({ kind: 'reject', value: Object.assign(new Error(`bad auth ${token}`), { code: 'slack_webapi_request_error' }) })
 
     const failed = (await post(A)) as DestinationFailure
     const tail = describeDestinationFailure(failed)
 
-    expect(tail).toStartWith(': Error code=slack_webapi_request_error')
+    expect(tail).toStartWith(': Error code=slack_webapi_request_error message="bad auth <redacted-token>"')
     expect(tail).not.toContain(BOT_TOKEN_PREFIX)
     assertNoLeak({ tail })
   })
 
-  test('a platform error carries its Slack reason and no error text', async () => {
+  test('a platform error carries its Slack reason and the error\'s message logged redacted', async () => {
+    // The stub's platform rejection quotes a fake token and a WebSocket
+    // ticket URL, each holding the leak sentinel.
     stub(A).script.open.push({ kind: 'platform', error: 'missing_scope' })
 
     const tail = describeDestinationFailure((await post(A)) as DestinationFailure)
 
-    expect(tail).toStartWith(' (reason=missing_scope): ')
-    expect(tail).not.toContain('An API error occurred')
+    expect(tail).toStartWith(' (reason=missing_scope): Error code=slack_webapi_platform_error message="')
+    const message = /message="([^"]*)"/.exec(tail)?.[1]
+    expect(message).toContain('missing_scope')
+    expect(message).toContain('<redacted-token>')
+    expect(message).toContain('<redacted-url>')
     assertNoLeak({ tail })
   })
 
@@ -602,7 +607,8 @@ describe('describeDestinationFailureCause (token-safe)', () => {
     const cause = describeDestinationFailureCause(failed)
 
     expect(cause).toBe(`conversations.open code=missing_scope: ${describeThrownValue(failed.error)}`)
-    expect(cause).not.toContain('An API error occurred')
+    expect(cause).toContain('<redacted-token>')
+    expect(cause).toContain('<redacted-url>')
     assertNoLeak({ cause })
   })
 
@@ -630,8 +636,9 @@ describe('describeDestinationFailureCause (token-safe)', () => {
     const cause = describeDestinationFailureCause(failed)
 
     expect(cause).toBe(describeThrownValue(failed.error))
+    expect(cause).toStartWith('Error code=slack_webapi_platform_error ')
     expect(cause).not.toContain('conversations.open')
-    expect(cause).not.toContain('not_in_channel')
+    expect(cause).not.toContain('code=not_in_channel')
     assertNoLeak({ cause })
   })
 
@@ -666,7 +673,7 @@ describe('describeDestinationFailureCause (token-safe)', () => {
   test.each([
     ['conversations.open', 'conversations.open code=network_error: Error code=slack_webapi_request_error'],
     ['chat.postMessage', 'Error code=slack_webapi_request_error'],
-  ] as const)('a fake xoxb- token in the %s error message never appears in the cause', async (step, prefix) => {
+  ] as const)('a fake xoxb- token in the %s error message never appears in the cause; the message is logged redacted', async (step, prefix) => {
     const token = fakeToken(BOT_TOKEN_PREFIX, 'msg')
     const err = Object.assign(new Error(`bad auth ${token}`), { code: 'slack_webapi_request_error' })
     const outcome: WebApiOutcome = { kind: 'reject', value: err }
@@ -677,9 +684,8 @@ describe('describeDestinationFailureCause (token-safe)', () => {
     expect(failed.step).toBe(step)
     const cause = describeDestinationFailureCause(failed)
 
-    expect(cause).toStartWith(prefix)
+    expect(cause).toStartWith(`${prefix} message="bad auth <redacted-token>"`)
     expect(cause).not.toContain(BOT_TOKEN_PREFIX)
-    expect(cause).not.toContain('bad auth')
     assertNoLeak({ cause })
   })
 })

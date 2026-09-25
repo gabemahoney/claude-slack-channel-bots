@@ -26,7 +26,13 @@
  *    credentials or reload calls `assertNoLeak` (imported from the credentials
  *    helper). A suite touches them when it has a value import (not
  *    `import type`, not a `type` specifier, not a SCREAMING_CASE constant)
- *    from one of the `SOURCE_SURFACES` modules, a value import of one of the
+ *    from one of the `SOURCE_SURFACES` modules (the config, credentials,
+ *    bring-up, connection, Slack client and logger, diagnostics, start,
+ *    lifecycle, redaction and reload modules, plus the modules that log or
+ *    post agent-director and Slack failures: the MCP registry, the session
+ *    manager, restart, the permission poller and click handler, the persona
+ *    notifier and destinations, the health check, the CLI and the template
+ *    install), a value import of one of the
  *    `HELPER_SURFACES` helpers (the token builders and sentinel, the
  *    config-file writer, the reload, connection and routing harnesses, the
  *    Slack client factory stub), or sets a stub's `leakMarker`. A suite that
@@ -42,19 +48,29 @@
  *    letter case) appears only in tests/test-helpers/credentials.ts. This file
  *    builds its patterns from identifiers and imported constants, so it holds
  *    neither.
- * 5. No raw error text in a log line (E13 Director decision 16). In every
- *    file under src/, a log call (a console method, or `log`, `logFailure`,
- *    `logViaDeps`, `recordStartupError` or `fatal`, bare or on an object)
- *    never passes a caught error as an argument, interpolates it, reads its
- *    message or stack, hands it to a function that is not a safe describer
- *    (`String(err)`), logs an `errDescription` not through
- *    `redactSlackLogText` or an `errName` not checked by `isSafeIdentifier`.
- *    A caught error is a `catch` or `.catch(…)` binding, a name like `e`,
- *    `err`, `error` or `getErr`, or a name set from a raw use of one; a local
- *    sink function that describes its error parameter is not a sink. The
- *    deliberate exceptions (paths that are not Slack or agent-director ones,
- *    or text CSCB wrote) are listed in `RAW_ERROR_ALLOWED` by file, anchor
- *    and reason; an entry that matches no flagged call fails as stale.
+ * 5. A caught error's text reaches a log line only redacted (E14 Task 0,
+ *    operator decision B1, replacing E13 Director decision 16's "messages
+ *    dropped"). Log lines keep an error's message, but only through
+ *    `redactSlackLogText` (URL-like and token-like text replaced) or a safe
+ *    describer that applies it (`SAFE_DESCRIBERS`: `describeThrownValue` and
+ *    `describeLogMessage` render it as `message="…"`, the
+ *    `describeAgentDirectorFailure` copies and `describeRefreshFailure` the
+ *    same). In every file under src/, a log call (a console method, or `log`,
+ *    `logFailure`, `logViaDeps`, `recordStartupError` or `fatal`, bare or on
+ *    an object) therefore never passes a caught error as an argument,
+ *    interpolates it, reads its message or stack outside a describer call,
+ *    hands it to a function that is not a safe describer (`String(err)`),
+ *    logs an `errDescription` not through `redactSlackLogText` or an
+ *    `errName` not checked by `isSafeIdentifier`. Every describer call (its
+ *    arguments included) is blanked before the rules run, so
+ *    `redactSlackLogText(err.message)` passes and a bare `err.message` beside
+ *    it is still flagged. A caught error is a `catch` or `.catch(…)` binding,
+ *    a name like `e`, `err`, `error` or `getErr`, or a name set from a raw use
+ *    of one; a local sink function that describes its error parameter is not
+ *    a sink. The deliberate exceptions (paths that are not Slack or
+ *    agent-director ones, or text CSCB wrote) are listed in
+ *    `RAW_ERROR_ALLOWED` by file, anchor and reason; an entry that matches no
+ *    flagged call fails as stale.
  *
  * Failure lists name the offending file and rule, never a matched value, and
  * are themselves passed through `assertNoLeak` before they are compared.
@@ -94,6 +110,18 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/persona-lifecycle\.ts$/, 'the persona lifecycle, which tears down, brings up and reconnects personas on a confirmed change'],
   [/^src\/slack-log-redaction\.ts$/, 'the Slack log redactor, whose input can hold tokens and URLs'],
   [/^src\/reload[\w-]*\.ts$/, 'the reload controller, preview or apply'],
+  // The modules the E13 raw-error sweep touched whose output carries an agent-director or Slack failure's text (now
+  // kept, redacted) to a log, a startup error, a Slack post or an MCP tool result (E13 carry, E14 Task 0).
+  [/^src\/registry\.ts$/, "the MCP registry, whose tool results carry a Slack call's failure text back to the session"],
+  [/^src\/session-manager\.ts$/, "the session manager, whose launch lines, startup errors and spawn-failure notices carry agent-director failure text"],
+  [/^src\/restart\.ts$/, "the restart path, whose lines and notices carry agent-director failure text"],
+  [/^src\/permission-poller\.ts$/, "the permission poller, which posts through a persona's client and logs agent-director and Slack failure text"],
+  [/^src\/permission-click-handler\.ts$/, "the click handler, which updates through a persona's client and logs and trails agent-director failure text"],
+  [/^src\/persona-notifier\.ts$/, "the persona notifier, which posts notices through a persona's client and logs Slack failure text"],
+  [/^src\/persona-destination[\w-]*\.ts$/, "the destination resolver and hold, which open DMs through a persona's client and describe Slack failures"],
+  [/^src\/health-check\.ts$/, 'the health check, whose lines carry agent-director failure text'],
+  [/^src\/cli\.ts$/, 'the CLI, which loads the config and logs agent-director failure text'],
+  [/^src\/agent-director-template\.ts$/, "the template install and refresh, whose lines and startup error carry agent-director failure text"],
 ]
 
 /** Test helpers whose named exports build tokens, credentials or config files, or plant the sentinel. */
@@ -103,6 +131,8 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
     makeCredentials: 'builds credentials objects',
     writeCredentialsFile: 'writes a credentials file',
     LEAK_SENTINEL: 'plants the leak sentinel',
+    sentinelInMessage: 'plants the leak sentinel in an error message (in a fake token and a ticket URL)',
+    sentinelTicketUrl: 'plants the leak sentinel in a ticket URL',
   },
   'tests/test-helpers/persona-config.ts': { writeConfigFile: 'writes a config file' },
   'tests/test-helpers/reload-harness.ts': { makeReloadHarness: 'builds the reload harness' },
@@ -126,7 +156,15 @@ const EXEMPT: Record<string, string> = {
   'tests/reload-wiring.test.ts':
     "a source-text audit of src/server.ts plus the pure configInEffect and replySettingsOf over makePersonaConfig fixtures; it reads no credentials and runs no reload controller",
   'tests/persona-identity.test.ts':
-    'fake tokens are inputs to the looksLikeSlackToken / isTokenLike matcher parity table, whose results are booleans; nothing is logged, thrown or written',
+    "fake tokens are inputs to the test helper's TOKEN_LIKE / isTokenLike matcher table, whose results are booleans; nothing is logged, thrown or written",
+  'tests/approve-trust-folder-dialog.test.ts':
+    "drives the session manager's pre-session dialog approval over stub agent-director rows and scripted tmux pane text, none of which holds a token; it reads no config or credentials and builds no Slack client",
+  'tests/block-action-received.test.ts':
+    "the click handler's emitBlockActionReceived over encoded action IDs and fixed channel and user IDs, captured as trail events; no input holds a token or credentials content",
+  'tests/relay-repro.test.ts':
+    "the permission relay end to end over makeStubSlack stubs with no leak marker and a stub agent-director whose rows and request tokens are UUIDs; no input holds a Slack token or credentials content",
+  'tests/outage-state.test.ts':
+    "imports the notifier's formatPersonaNotice only to build the expected outage notice text, which CSCB writes; no input holds a token or credentials content",
 }
 
 /** The AC 20 named legs: suites that must call `assertNoLeak`, with their extra content rules. */
@@ -370,7 +408,7 @@ describe('no token literal under tests/ (b.av2 SR-13.2, TEST-1)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Rule 5: no raw error text in a log line under src/ (E13 Director decision 16)
+// Rule 5: a caught error's text reaches a log line under src/ only redacted (E14 Task 0, decision B1)
 // ---------------------------------------------------------------------------
 
 /** Every `.ts` file under src/, repo-relative, in sorted order. */
@@ -396,14 +434,15 @@ const SINK_CALL = new RegExp(
 
 /**
  * Functions that turn a thrown value (or text taken from one) into
- * token-safe text; their own suites pin what they keep. Each must still be
- * declared under src/.
+ * token-safe text: an error's message only through `redactSlackLogText`
+ * (`describeLogMessage` renders it as `message="…"`). Their own suites pin
+ * what they keep. Each must still be declared under src/.
  */
 const SAFE_DESCRIBERS = [
   'describeThrownValue',
+  'describeLogMessage',
   'describeSlackCallFailure',
   'describeAgentDirectorFailure',
-  'agentDirectorFailureCause',
   'describeCliFailure',
   'describeRefreshFailure',
   'redactSlackLogText',
@@ -661,7 +700,7 @@ const RAW_ERROR_ALLOWED: { file: string; anchor: string; reason: string }[] = [
   },
 ]
 
-describe('no raw error text in a log line under src/ (E13 Director decision 16)', () => {
+describe("a caught error's text reaches a log line under src/ only redacted (E14 Task 0, decision B1)", () => {
   const findings = SOURCE_FILES.flatMap((file) => rawErrorFindings(codeOf(file)).map((finding) => ({ file, ...finding })))
   const allows = (entry: (typeof RAW_ERROR_ALLOWED)[number], f: (typeof findings)[number]): boolean =>
     entry.file === f.file && f.call.includes(entry.anchor)
@@ -686,11 +725,16 @@ describe('no raw error text in a log line under src/ (E13 Director decision 16)'
     ['a redacted errDescription', 'log(`x: ${redactSlackLogText(e.errDescription)}`)', []],
     ['a checked errName', 'log(`x: ${isSafeIdentifier(e.errName) ? e.errName : describeThrownValue(e)}`)', []],
     ['a describing wrapper', 'function logFailure(what, err) { log(`${what}: ${describeThrownValue(err)}`) }\ntry { f() } catch (err) { logFailure("x", err) }', []],
+    // Decision B1: a message is kept, but only redacted (a bare one is the "a caught error's message" row above).
+    ['a redacted err.message', 'try { f() } catch (err) { log(`x: ${redactSlackLogText(err.message)}`) }', []],
+    ['a message through describeLogMessage', 'try { f() } catch (err) { console.error(`x: ${describeLogMessage(err.message)}`) }', []],
+    ['a bare err.message beside a redacted one', 'try { f() } catch (err) { log(`x: ${redactSlackLogText(err.message)} (${err.message})`) }', ["reads a caught error's message or stack"]],
+    ['an agent-director describer as a startup-error cause', "try { f() } catch (err) { recordStartupError('c', `m: ${describeAgentDirectorFailure(err)}`, describeAgentDirectorFailure(err)) }", []],
   ])('rule check: %s', (_label, code, rules) => {
     expect(rawErrorFindings(code).map((f) => f.rule)).toEqual(rules)
   })
 
-  test('no log call passes a caught error, its message, an unredacted errDescription or an unchecked errName, bar the allow-list', () => {
+  test('no log call passes a caught error, its unredacted message, an unredacted errDescription or an unchecked errName, bar the allow-list', () => {
     const failures = findings
       .filter((f) => !RAW_ERROR_ALLOWED.some((entry) => allows(entry, f)))
       .map((f) => `${f.file}: ${f.rule}: ${f.call.slice(0, 120)}`)

@@ -17,11 +17,15 @@
 
 import { renderPersonaRef } from '../../src/persona-identity.ts'
 import type { SlackLogPersona } from '../../src/persona-slack-clients.ts'
-import { LEAK_SENTINEL } from './credentials.ts'
+import { LEAK_SENTINEL, sentinelTicketUrl } from './credentials.ts'
 
-/** A WebSocket URL at `origin` as `apps.connections.open` returns it, its connection ticket sentinel-bearing. */
+/**
+ * A WebSocket URL at `origin` as `apps.connections.open` returns it, its
+ * connection ticket sentinel-bearing: `sentinelTicketUrl` with an `app_id`
+ * query parameter after the ticket.
+ */
 export function ticketUrl(origin: string): string {
-  return `${origin}/link/?ticket=${LEAK_SENTINEL}-ticket&app_id=A0STUB0001`
+  return `${sentinelTicketUrl(origin, `${LEAK_SENTINEL}-ticket`)}&app_id=A0STUB0001`
 }
 
 /** The library's pong-timeout warning at the default client ping timeout (`SlackWebSocket.js`): an allowlisted line. */

@@ -92,7 +92,12 @@ import {
   type PersonaConfig,
   type PersonaConfigFs,
 } from './config.ts'
-import { checkPersonaWorkingDirectory, type WorkingDirectoryFs } from './persona-bringup.ts'
+import {
+  checkPersonaConfigDir,
+  checkPersonaWorkingDirectory,
+  type ConfigDirCheckResult,
+  type WorkingDirectoryFs,
+} from './persona-bringup.ts'
 import { isCredentialsBroken, type PersonaBringUpState } from './persona-bringup-controller.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import {
@@ -390,6 +395,14 @@ export interface ReloadControllerDeps {
    * use the real file system.
    */
   workingDirectoryFs?: Partial<WorkingDirectoryFs>
+  /**
+   * The detection tick's claude_config_dir check of an added persona (bug
+   * b.g57): production passes the session manager's pre-launch check
+   * (`checkLaunchConfigDir`), the one the bring-up controller checks with, so
+   * the preview and the bring-up resolve the directory the same way. Default
+   * `checkPersonaConfigDir` against `home` and the real file system.
+   */
+  checkConfigDir?: (persona: Persona) => ConfigDirCheckResult
   /** The Slack client factory; bound by the work that applies a confirmed change. */
   slackClientFactory?: PersonaSlackClientFactory
   /**
@@ -708,6 +721,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   const remove = deps.remove ?? durableUnlinkSync
   const dryRun = deps.dryRun === true
   const configDir = dirname(paths.config)
+  const checkConfigDir = deps.checkConfigDir ?? ((persona: Persona) => checkPersonaConfigDir(persona, { home: deps.home }))
   let logged: LoggedPendingState = { kind: 'initial' }
   /**
    * The state the last pass derived (`'nothing'`, or the fingerprint of the
@@ -765,11 +779,14 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
 
   /**
    * Whether each added persona can come up, as its bring-up would check it
-   * (b.av2 SR-6.1 steps 1 and 2): the credentials content from the bytes this
-   * pass already read (no second read; none in dry run, where no credentials
-   * file is read) and the working-directory check. No other persona is
-   * probed: a valid candidate has no real-path collision, so the directory
-   * check runs without the others.
+   * (b.av2 SR-6.1 steps 1 and 2, then its claude_config_dir, bug b.g57): the
+   * credentials content from the bytes this pass already read (no second
+   * read; none in dry run, where no credentials file is read), the
+   * working-directory check and the claude_config_dir check
+   * (`resolveRealPathStrict`: a directory not created yet under a resolvable
+   * ancestor passes). Every check runs, so one failure never hides another.
+   * No other persona is probed: a valid candidate has no real-path
+   * collision, so the directory check runs without the others.
    */
   function addedCannotComeUp(
     candidate: PersonaConfig,
@@ -783,6 +800,8 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
         if (credentials !== undefined) causes.push({ step: 'credentials', cause: credentials })
         const directory = checkPersonaWorkingDirectory(persona, { others: [], fs: deps.workingDirectoryFs })
         if (!directory.ok) causes.push({ step: 'working-directory', cause: directory.cause })
+        const configDirResult = checkConfigDir(persona)
+        if (!configDirResult.ok) causes.push({ step: 'claude-config-dir', cause: configDirResult.problem })
         result.set(persona.key, causes)
       } catch (err) {
         noteFactFailure(`whether the added persona ${renderPersonaRef(persona.name, persona.key)} can come up`, err)

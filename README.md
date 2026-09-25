@@ -212,7 +212,7 @@ Two personas share the channel `C0555555555`. `planner` receives every message i
 
 | Field | Required | Description |
 |---|---|---|
-| `name` | yes | The persona's name, used in logs, `/interject` and the crontable. Each persona also has a **key**: the name itself when it is 1–40 characters of `a-z`, `0-9` and `_`, otherwise a derived form. Logs show both, as `"planner" (key=planner)`. The name is shown in logs and Slack messages, so it must not look like a Slack token: a name containing a Slack-token-shaped part (a prefix such as `xoxb-`, `xoxp-` or `xapp-` followed by a digit, not glued to a letter or digit before it) is rejected. Ordinary names such as `inboxapp-bot` or `sandboxapp-1` are fine. |
+| `name` | yes | The persona's name, used in logs, `/interject` and the crontable. Each persona also has a **key**: the name itself when it is 1–40 characters of `a-z`, `0-9` and `_`, otherwise a derived form. Logs show both, as `"planner" (key=planner)`. Any non-empty name is accepted; there is no format rule. Logs, previews and Slack notices show the name JSON-quoted, with its key beside it. Inside a quoted error message (`message="…"`), token-like text is redacted, so a name that looks like a token is redacted there too. |
 | `credentials_file` | yes | Path to the persona's [credentials file](#credentials-files). Absolute, `~` or `~/…`. |
 | `working_directory` | yes | Working directory of the persona's Claude instance. Absolute, `~` or `~/…`. |
 | `channels` | yes, unless `dm.enabled` is `true` | The channels the persona is in. Each entry is `{ "id": "<channel ID>", "delivery": "all" \| "mentions" }`: `all` delivers every message in the channel, `mentions` only messages that @mention the persona or use `@here` / `@channel`. Invite the persona's Slack app to each channel. |
@@ -473,7 +473,7 @@ Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In 
 | Line | Meaning |
 |---|---|
 | `DESTRUCTIVE: …` | Applying it destroys that persona's live session: its instance and its conversation. A removed persona is torn down. A persona whose `name`, `credentials_file` or `working_directory` changed is torn down and brought up fresh. |
-| `… is added but cannot come up: …` | The new persona would fail to come up, for the reasons given. |
+| `… is added but cannot come up: …` | The new persona would fail to come up, for the reasons given: its credentials file, its working directory, and its `claude_config_dir` (`claude_config_dir cannot be resolved to a real path (<errno>)`, for example a symlink on its path that points to nothing). Every reason found is listed. A `claude_config_dir` that doesn't exist yet but whose parent does is fine. |
 | `credentials file "<path>" changed: …` | The persona's credentials file changed at the same path. The line names the persona and the path, never a token, and says what applying it does: a persona that is up opens a new connection, then closes the old one; a persona still retrying retries with the new content; a persona down because of its credentials `will be brought up`. |
 | `credentials file "<path>" changed, but it cannot be used (<cause>): …` | The new content is missing, unreadable or invalid, for example `credentials file does not exist`. A persona that is up keeps its current connection, and a persona still retrying keeps retrying with its current content; confirming logs `persona-credentials-change-failed` in `server.log`, and the change stays pending. A persona down because of its credentials stays down, and confirming logs its usual credentials line and leaves nothing pending. Every start reads the file as it stands, so after a restart the persona is down until the file is fixed and the change confirmed. |
 | `claude_config_dir changed: …, which starts fresh (the conversation is not resumed)` | The persona's next launch uses the new config directory and starts a new conversation. The running instance is kept until then. |
@@ -517,7 +517,7 @@ Each row is one kind of change: what happens once you confirm it, and what happe
 | Change | Once confirmed | Live session |
 |---|---|---|
 | `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, immediately: from the next event or post. A changed DM contact is used for the next prompt. | Kept |
-| A credentials file's content changes (same path), such as a rotated token | Only that persona reconnects: the new connection opens, then the old one closes. If the new file can't be used or Slack refuses it, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. If Slack can't be reached, the old connection stays in use while the new one retries. A persona that is retrying (Slack unreachable, or its working directory unusable) retries with the new content. A persona whose launch is waiting for its `claude_config_dir` (`persona-config-dir-unresolvable`) is reconnected and keeps waiting. A persona down because of its credentials comes up on the confirmed change, with no restart; if its new file can't be used, it stays down with its usual line, such as `persona-credentials-invalid`, and nothing stays pending. | Kept |
+| A credentials file's content changes (same path), such as a rotated token | Only that persona reconnects: the new connection opens, then the old one closes. If the new file can't be used or Slack refuses it, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. If Slack can't be reached, the old connection stays in use while the new one retries. A persona that is retrying (Slack unreachable, its working directory unusable, or held for its `claude_config_dir` by `persona-config-dir-unresolvable`) has no connection and retries with the new content. A persona down because of its credentials comes up on the confirmed change, with no restart; if its new file can't be used, it stays down with its usual line, such as `persona-credentials-invalid`, and nothing stays pending. | Kept |
 | `claude_config_dir` changes (the persona's own or inherited) | Recorded. The persona's next launch uses it and starts fresh when the directory changed: the conversation is not resumed, and the old transcript stays in the old directory. | Kept until the next launch |
 | `stop_hook_bootstrap` changes (the persona's own or inherited) | Recorded. The persona's next launch uses it. | Kept |
 | A persona is removed | Torn down. Its agent-director row is destroyed too. Its posted permission prompts stay in Slack, and clicking one has no effect. Previewed `DESTRUCTIVE:`. | Destroyed |
@@ -541,7 +541,7 @@ To make them take effect sooner, wait for the `reload-applied` line, then run `c
 
 `DESTRUCTIVE:` lines in the preview name the sessions the change destroys when you confirm it (see the table above). Read the preview before you rename it. There is no undo. Re-adding a removed persona brings up a fresh session, and the old conversation isn't guaranteed to resume.
 
-If the teardown can't delete the persona's agent-director row (for example, agent-director is unreachable), the bring-up finds that row. A row whose working directory or config directory no longer matches is replaced. When only the `credentials_file` path changed, the row still matches, so the bring-up may resume it with its conversation.
+If the teardown can't delete the persona's agent-director row (for example, agent-director is unreachable), `server.log` shows `[slack] persona teardown of "<name>" (key=<key>): agent-director delete of cscb_<key> failed: …`, and the bring-up finds that row. A row whose working directory or config directory no longer matches is replaced. When neither changed (for example, only the `credentials_file` path changed), the row still matches, so the bring-up may resume it with its conversation instead of starting fresh.
 
 ### Stale confirmations
 
@@ -1046,6 +1046,8 @@ Personas that share one `claude_config_dir` each follow their own `stop_hook_boo
 
 A running instance keeps the value it launched with, because the guard reads that instance's own record, written only at its launch. The hook itself may appear in or vanish from a shared directory while an instance runs, for example when a neighbour launches; Claude Code normally picks up such edits without a restart, but the instance's own record still decides. On a plain server restart, live instances are reconnected rather than relaunched, so a changed value reaches them at their next launch.
 
+The directory an instance launched with is kept in memory only. After a confirmed `claude_config_dir` change and a plain server restart, the server no longer counts a still-running instance toward its old directory. If every persona it still counts toward that directory has the reminder off, the next hook pass there (the restart's own, or a launch of such a persona) removes the managed hook, and the still-running instance gets no reminder until its next launch. A `clean_restart` relaunches it with its new directory.
+
 ### Personal-dir refusal
 
 The server never installs the hook in your own `~/.claude` (it never edits `~/.claude/settings.json`). A persona whose effective `claude_config_dir` resolves to `~/.claude` (symlinks followed) gets no reminder. At server start the refusal is recorded once as the startup error `stop-hook-bootstrap-refuse-home` (see [Startup errors](#startup-errors)). At a later launch it is a server-log line only.
@@ -1123,7 +1125,7 @@ grep -E '\(key=<key>\)|persona=<key>\b' ~/.claude/channels/slack/server.log
 | `persona-credentials-change-failed` | Keeps running on its old credentials | Fix the credentials file, then confirm the new pending change |
 | `persona-slack-unreachable` | Retries on its own | Nothing; it comes up once Slack answers |
 | `persona-directory-*` | Retries on its own | Create or fix the working directory; the persona comes up with no restart |
-| `persona-config-dir-unresolvable` | Retries on its own; its session is kept | Remount the drive or fix the symlink behind its `claude_config_dir`; the persona resumes its conversation with no restart |
+| `persona-config-dir-unresolvable` | Retries on its own. Its Slack connection is closed and it receives nothing; its instance and conversation are kept | Remount the drive or fix the symlink behind its `claude_config_dir`; the persona reconnects and resumes its conversation with no restart |
 
 While a persona is down, its Claude instance keeps running and keeps its history, but the server doesn't serve it until the persona is up.
 
@@ -1171,7 +1173,7 @@ The notice names the sender (by display name, or user ID; for a bot or webhook p
 
 | Recovery state in the notice | What it means | What to do |
 |------------------------------|---------------|------------|
-| `not up` | The persona isn't up, for example because its launch is waiting for its `claude_config_dir` (`persona-config-dir-unresolvable`), so no restart was started. Its instance is launched once the persona recovers. | Fix the persona's cause (see "A persona doesn't come up or doesn't answer"), then resend once it's back. |
+| `not up` | The persona stopped being up (broken or retrying) while the message was being handled, so no restart was started. A persona that isn't up receives no new messages, so this appears only in that short window. Its instance is launched once the persona recovers. | Fix the persona's cause (see "A persona doesn't come up or doesn't answer"), then resend once it's back. |
 | `restarting` | A restart of the persona's instance was already under way. | Resend the message (or ask the sender to) once the persona is back. |
 | `starting now` | The lost message triggered a fast restart (the backoff delay is clamped down to 5 seconds, never raised). | Resend in a moment, once the persona is back. |
 | `auto-restart disabled` | `session_restart_delay` is `0`; the instance will not restart on its own. | Restart the server, then resend. |

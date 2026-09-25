@@ -59,7 +59,7 @@ import {
 import { createPersonaBringUpController, type PersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { PERSONA_CONFIG_DIR_UNRESOLVABLE } from '../src/persona-diagnostics.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
-import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
+import { APP_TOKEN_PREFIX, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, assertNoLeak, fakeToken, sentinelInMessage } from './test-helpers/credentials.ts'
 import { _resetLaunchedWithDirs, getLaunchedWithDir } from '../src/stop-hook-bootstrap.ts'
 import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
 import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
@@ -259,17 +259,18 @@ describe('scheduleRestart', () => {
   })
 
   // AC 20 (b.av2 SR-10.3): each dep failure the timer's work catches is logged
-  // as its description (type, safe code, frames), never the error itself. The
-  // thrown error carries fake tokens in its message and properties, and every
-  // console.error argument is kept unformatted.
+  // as its description (type, safe code, message through `redactSlackLogText`,
+  // frames), never the error itself. The thrown error carries fake tokens in
+  // its message (with a `ticket=` URL) and properties, and every console.error
+  // argument is kept unformatted.
   test.each<[string, 'isSessionAlive' | 'reconnectSession' | 'launchSession', DepsOpts, string]>([
     ['isSessionAlive throws', 'isSessionAlive', {}, 'isSessionAlive failed'],
     ['reconnectSession throws (session alive)', 'reconnectSession', { isSessionAliveResult: true }, 'reconnectSession failed'],
     ['launchSession throws', 'launchSession', {}, 'launchSession threw'],
-  ])('AC 20: %s with an error carrying fake tokens — one line naming its type and code only; nothing leaks', async (_label, dep, opts, phrase) => {
+  ])('AC 20: %s with an error carrying fake tokens — one line naming its type, code and redacted message; nothing leaks', async (_label, dep, opts, phrase) => {
     const deps = makeDeps(opts)
     deps[dep] = async () => {
-      throw Object.assign(new Error(`${dep} failed ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), {
+      throw Object.assign(new Error(`${dep} refused (${sentinelInMessage('msg')})`), {
         code: 'EIO',
         detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
         note: LEAK_SENTINEL,
@@ -289,7 +290,9 @@ describe('scheduleRestart', () => {
     const lines = errArgs.filter((args) => String(args[0]).includes(phrase))
     expect(lines).toHaveLength(1)
     expect(lines[0]).toHaveLength(1)
-    expect(String(lines[0]![0])).toStartWith(`[slack] restart: ${phrase} for persona=test_bot_1: Error code=EIO at `)
+    expect(String(lines[0]![0])).toStartWith(
+      `[slack] restart: ${phrase} for persona=test_bot_1: Error code=EIO message="${dep} refused (${REDACTED_SENTINEL_TAIL})" at `,
+    )
     assertNoLeak({ errArgs })
   })
 
@@ -2402,8 +2405,12 @@ describe('restart: the reply-guard record holds the effective value before the r
 // (with the applied-persona getter) and launch adapters, the controller's
 // `holdForConfigDir` installed as the session manager's hook and its
 // pre-launch check (`checkLaunchConfigDir`) as the controller's re-check. The
-// failing realpath is injected through `_setConfigDirFs`. Every persona path
-// is under a temp dir removed in afterEach.
+// controller gets the manager's `stop` (recorded) as production wires it, so
+// a hold that starts at the restart closes the persona's Slack connection
+// (b.av2 SR-6.4's directory-broken shape), and its recovery connects again
+// before the launch. The failing realpath is injected through
+// `_setConfigDirFs`. Every persona path is under a temp dir removed in
+// afterEach.
 // ---------------------------------------------------------------------------
 
 describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
@@ -2421,6 +2428,8 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
   let errLines: string[]
   let leftUp: string[]
   let capCalls: string[]
+  /** Every key the controller stopped (its connection closed), in call order. */
+  let stops: string[]
   let origConsoleError: typeof console.error
 
   beforeEach(async () => {
@@ -2440,6 +2449,7 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     errLines = []
     leftUp = []
     capCalls = []
+    stops = []
     broken = false
     origConsoleError = console.error
     console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
@@ -2483,13 +2493,28 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
       calls.spawnCalls.push(params)
       throw errInstanceIdCollision()
     }
+    // The resume joins the shared step log, after the harness's `slack:<key>` markers.
+    const realResume = stub.resume.bind(stub)
+    stub.resume = async (params) => {
+      h.order.push(`resume:${String(params.claude_instance_id)}`)
+      return realResume(params)
+    }
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
     setClientForTests(stub as unknown as Client)
     setSessionNotifier(() => {})
 
     controller = createPersonaBringUpController({
-      connections: { bringUp: h.connections.bringUp, status: (key) => h.manager.status(key) },
+      connections: {
+        bringUp: h.connections.bringUp,
+        status: (key) => h.manager.status(key),
+        // A recording stand-in for the manager's `stop`, which it then runs.
+        stop: (key) => {
+          stops.push(key)
+          h.order.push(`stop:${key}`)
+          return h.manager.stop(key)
+        },
+      },
       dryRun: false,
       log: (line) => void controllerLines.push(line),
       launch: (persona) => spawnForPersona(persona, h.config!, false),
@@ -2556,9 +2581,10 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
   /** Every `persona-config-dir-unresolvable` line, from the controller and the console. */
   const classLines = () => [...controllerLines, ...errLines].filter((l) => l.includes(`${PERSONA_CONFIG_DIR_UNRESOLVABLE}:`))
 
-  test('b.g57: realpath throwing for A\'s claude_config_dir at a restart — no kill, delete, spawn or resume for A (its row untouched), one line naming A and the path, A not up and its count unchanged; once it resolves (fake clock) A resumes the same row with no confirmation; B restarts as before', async () => {
+  test('b.g57: realpath throwing for A\'s claude_config_dir at a restart — no kill, delete, spawn or resume for A (its row untouched), one line naming A and the path, A\'s Slack connection closed, A not up and its count unchanged, the gate refuses its launch; once it resolves (fake clock) A reconnects to Slack, then resumes the same row with no confirmation; B restarts as before', async () => {
     recordFailure(a.key)
     initRestart(makeRealDeps())
+    const orderAtStart = h.order.length
     broken = true
 
     scheduleRestart(a.key, a.working_directory)
@@ -2585,7 +2611,12 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     expect(leftUp).toEqual([a.key])
     expect(getFailureCount(a.key)).toBe(1)
     expect(capCalls).toEqual([])
-    expect(gateLines).toEqual([`[slack] persona=${a.key}: not relaunched — its bring-up has not succeeded; eligible again once it is up`])
+    // The hold closed A's connection before the launch, so the gate refuses it for that.
+    expect(gateLines).toEqual([`[slack] persona=${a.key}: not relaunched — its Slack connection is not brought up; eligible again once it is up`])
+    // The hold closed A's Slack connection (the manager forgot it); B's is untouched.
+    expect(stops).toEqual([a.key])
+    expect(h.manager.status(a.key)).toBeUndefined()
+    expect(h.manager.status(b.key)?.state).toBe('up')
     // B, beside it: killed and spawned fresh, still up, nothing counted.
     expect(idsFor(calls.killCalls, b)).toHaveLength(1)
     expect(idsFor(calls.spawnCalls, b)).toHaveLength(1)
@@ -2598,6 +2629,8 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     expect(idsFor(calls.spawnCalls, a)).toEqual([])
     expect(classLines()).toHaveLength(1)
     expect(controller.isUp(a.key)).toBe(false)
+    expect(h.manager.status(a.key)).toBeUndefined()
+    expect(h.order.slice(orderAtStart)).toEqual([`stop:${a.key}`])
 
     // It resolves: the next re-check (10 s on) clears the hold and launches A,
     // whose row still carries the matching label, so the ladder resumes it.
@@ -2611,6 +2644,14 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     expect(idsFor(calls.spawnCalls, a)).toHaveLength(1) // the spawn that collided with the row
     expect(controller.isUp(a.key)).toBe(true)
     expect(classLines()).toEqual([expect.any(String), expect.stringContaining(': cleared: claude_config_dir resolves to a real path again')])
+    // A connected again with its own held tokens, before the resume reached agent-director.
+    expect(h.order.slice(orderAtStart)).toEqual([`stop:${a.key}`, `slack:${a.key}`, `resume:${personaInstanceId(a.key)}`])
+    expect(h.bringUpCalls.filter((c) => c.key === a.key)).toEqual([
+      { key: a.key, gotTokens: true, ownTokens: true },
+      { key: a.key, gotTokens: true, ownTokens: true },
+    ])
+    expect(h.manager.status(a.key)?.state).toBe('up')
+    expect(stops).toEqual([a.key])
     expect(idsFor(calls.spawnCalls, b)).toHaveLength(1)
     assertNoLeak({ controllerLines, gateLines, errLines, managerLines: h.lines })
   })
@@ -2620,9 +2661,11 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
 // AC 20 (b.av2 SR-10.3): the kill adapter's lines carry no credential value:
 // the "not killing" line for a persona whose claude_config_dir cannot be
 // resolved (bug b.g57), and the generic "error for persona" line for a kill
-// that fails. The adapter is called directly; the failing realpath is
-// injected through `_setConfigDirFs` and the failing kill through the stub
-// client, and each error carries fake tokens in its message and properties.
+// that fails, which keeps the error's message only through
+// `redactSlackLogText`. The adapter is called directly; the failing realpath
+// is injected through `_setConfigDirFs` and the failing kill through the stub
+// client, and each error carries fake tokens in its message and properties
+// (in a message, the marker sits only inside a fake token and a URL).
 // Every raw console.error argument is kept (errors whole), so a line that
 // echoed the thrown error would fail the check. The configured
 // claude_config_dir path is not a credential (paths stay echoed on purpose),
@@ -2638,7 +2681,7 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
 
   /** A realpath failure whose message, path and syscall carry fake tokens (its errno code is real). */
   function sentinelRealpathError(): NodeJS.ErrnoException {
-    return Object.assign(new Error(`EIO: i/o error, realpath ${fakeToken(BOT_TOKEN_PREFIX, 'realpath')}`), {
+    return Object.assign(new Error(`EIO: i/o error, realpath (${sentinelInMessage('realpath')})`), {
       code: 'EIO',
       path: fakeToken(APP_TOKEN_PREFIX, 'path'),
       syscall: LEAK_SENTINEL,
@@ -2688,7 +2731,7 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
     [
       'a hook that throws an error carrying a fake token',
       () => {
-        throw Object.assign(new Error(`hold failed ${fakeToken(BOT_TOKEN_PREFIX, 'hook')}`), { detail: LEAK_SENTINEL })
+        throw Object.assign(new Error(`hold failed (${sentinelInMessage('hook')})`), { detail: LEAK_SENTINEL })
       },
     ],
   ])('AC 20: realpath throws an error carrying fake tokens, %s — the kill is skipped with its one line; no captured argument carries a credential value', async (_label, hook) => {
@@ -2708,15 +2751,15 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
   test.each<[string, () => Error, string]>([
     [
       'a plain error with a safe code',
-      () => Object.assign(new Error(`kill refused ${fakeToken(BOT_TOKEN_PREFIX, 'kill')}`), { code: 'ECONNRESET', detail: LEAK_SENTINEL }),
-      'Error code=ECONNRESET',
+      () => Object.assign(new Error(`kill refused (${sentinelInMessage('kill')})`), { code: 'ECONNRESET', detail: LEAK_SENTINEL }),
+      `Error code=ECONNRESET message="kill refused (${REDACTED_SENTINEL_TAIL})"`,
     ],
     [
       'a base AgentDirectorError whose description carries a fake token',
-      () => errGeneric('kill', 'ErrKillBroken', `kill refused ${fakeToken(APP_TOKEN_PREFIX, 'kill')}`),
-      'AgentDirectorError errName=ErrKillBroken',
+      () => errGeneric('kill', 'ErrKillBroken', `kill refused (${sentinelInMessage('kill', APP_TOKEN_PREFIX)})`),
+      `AgentDirectorError errName=ErrKillBroken message="ErrKillBroken: kill refused (${REDACTED_SENTINEL_TAIL})"`,
     ],
-  ])('AC 20: the kill fails with %s — one "error for persona" line naming the error without its message; no captured argument carries a credential value', async (_label, makeError, shown) => {
+  ])('AC 20: the kill fails with %s — one "error for persona" line naming the error with its message redacted; no captured argument carries a credential value', async (_label, makeError, shown) => {
     const config = makeMultiPersonaConfig([{ name: 'Alpha Desk' }], dir)
     const [a] = config.personas as [Persona]
     const killCalls: KillParams[] = []

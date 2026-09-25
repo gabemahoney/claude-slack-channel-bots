@@ -98,7 +98,12 @@ import type {
 } from './agent-director-client.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { encodePermissionActionId } from './permission-action-id.ts'
-import { describeSlackCallFailure, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
+import {
+  describeLogMessage,
+  describeSlackCallFailure,
+  describeThrownValue,
+  isSafeIdentifier,
+} from './persona-connection-errors.ts'
 import {
   classifySlackError,
   createPersonaDestinations,
@@ -510,11 +515,17 @@ function logViaDeps(deps: PollerDeps, ...args: unknown[]): void {
 
 /**
  * The tail of a failed agent-director call's log line: a typed error's
- * `errName` when it passes `isSafeIdentifier`, else `describeThrownValue(err)`
- * (never the raw `errName`, message or error object).
+ * `errName` when it passes `isSafeIdentifier`, then its `errDescription` as
+ * `message="…"` (`describeLogMessage`: through `redactSlackLogText`, on one
+ * line, capped at `MAX_LOGGED_MESSAGE_LENGTH` characters) when it has one;
+ * else `describeThrownValue(err)`, which renders the message the same way.
+ * Never the raw `errName` or error object.
  */
 export function describeAgentDirectorFailure(err: unknown): string {
-  if (err instanceof AgentDirectorError && isSafeIdentifier(err.errName)) return err.errName
+  if (err instanceof AgentDirectorError && isSafeIdentifier(err.errName)) {
+    const message = describeLogMessage(err.errDescription)
+    return message === '' ? err.errName : `${err.errName} ${message}`
+  }
   return describeThrownValue(err)
 }
 

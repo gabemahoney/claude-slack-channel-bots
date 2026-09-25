@@ -160,7 +160,14 @@ import {
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { asWebClient, makeDeferredWebApiCall, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
-import { BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
+import {
+  BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
+  assertNoLeak,
+  fakeToken,
+  sentinelInMessage,
+} from './test-helpers/credentials.ts'
 import {
   makeManualInterval,
   makePersonaClients,
@@ -2931,26 +2938,63 @@ describe('b.en2 Epic 6 — withOutageDetection wrapper integration (keyed by per
 // ---------------------------------------------------------------------------
 // AC 20 (b.av2 SR-10.3): an agent-director call that fails with an error that
 // is not an agent-director error is logged as its description (type, safe
-// code, frames), never the error itself, on each of the poller's three read
-// sites. The error carries fake tokens in its message and properties. An
-// agent-director error is logged by its errName only when that passes
-// `isSafeIdentifier` (E13 Director decision 16); a token-shaped errName falls
-// back to the description.
+// code, the message logged redacted, frames), never the error itself, on each
+// of the poller's three read sites. The error carries fake tokens and a
+// WebSocket ticket URL in its message, and the leak sentinel in a property. An
+// agent-director error is logged by its errName and its redacted description
+// when that errName passes `isSafeIdentifier`; a token-shaped errName falls
+// back to the description (E14 Task 0, operator decision B1).
 // ---------------------------------------------------------------------------
 
-describe('AC 20: an agent-director call failure on list, get or getPermission is logged without its message', () => {
+describe('AC 20: an agent-director call failure on list, get or getPermission is logged with its message redacted', () => {
+  /** A ticket URL shaped like Slack's Socket Mode WebSocket URL, holding the leak sentinel. */
   const sentinelError = (): Error =>
-    Object.assign(new Error(`socket closed ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
+    Object.assign(new Error(`socket closed ${sentinelInMessage('msg')}`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
   /** An agent-director error whose errName (and so its message) is a fake token. */
   const tokenErrNameError = (): Error => errGeneric('get', fakeToken(BOT_TOKEN_PREFIX, 'errname'), 'transient')
+  /** An agent-director error with a safe errName whose description quotes a fake token and a ticket URL. */
+  const safeErrNameError = (): Error =>
+    errGeneric('get', 'ErrDaemonBusy', `retry later ${sentinelInMessage('desc')}`)
+  const redactedSocket = `message="socket closed ${REDACTED_SENTINEL_TAIL}"`
 
-  test.each<{ site: 'list' | 'get' | 'getPermission'; label: string; makeErr: () => Error; phrase: string; tail: string }>([
-    { site: 'list', label: 'an error carrying fake tokens', makeErr: sentinelError, phrase: 'list failed', tail: 'list failed: Error code=ECONNRESET at ' },
-    { site: 'get', label: 'an error carrying fake tokens', makeErr: sentinelError, phrase: 'get failed for', tail: `get failed for ${INSTANCE_A}: Error code=ECONNRESET at ` },
-    { site: 'getPermission', label: 'an error carrying fake tokens', makeErr: sentinelError, phrase: 'get-permission failed for', tail: `get-permission failed for ${INSTANCE_A} token=${TOKEN_A}: Error code=ECONNRESET at ` },
-    { site: 'get', label: 'an AgentDirectorError with a token-shaped errName', makeErr: tokenErrNameError, phrase: 'get failed for', tail: `get failed for ${INSTANCE_A}: AgentDirectorError at ` },
-    { site: 'getPermission', label: 'an AgentDirectorError with a token-shaped errName', makeErr: tokenErrNameError, phrase: 'get-permission failed for', tail: `get-permission failed for ${INSTANCE_A} token=${TOKEN_A}: AgentDirectorError at ` },
-  ])('AC 20: $site rejects with $label — one line naming its type and safe code only; nothing logged, trailed or posted leaks', async ({ site, makeErr, phrase, tail }) => {
+  test.each<{ site: 'list' | 'get' | 'getPermission'; label: string; makeErr: () => Error; tail: string }>([
+    { site: 'list', label: 'an error carrying fake tokens', makeErr: sentinelError, tail: `list failed: Error code=ECONNRESET ${redactedSocket} at ` },
+    { site: 'get', label: 'an error carrying fake tokens', makeErr: sentinelError, tail: `get failed for ${INSTANCE_A}: Error code=ECONNRESET ${redactedSocket} at ` },
+    { site: 'getPermission', label: 'an error carrying fake tokens', makeErr: sentinelError, tail: `get-permission failed for ${INSTANCE_A} token=${TOKEN_A}: Error code=ECONNRESET ${redactedSocket} at ` },
+    { site: 'get', label: 'an AgentDirectorError with a token-shaped errName', makeErr: tokenErrNameError, tail: `get failed for ${INSTANCE_A}: AgentDirectorError message="<redacted-token> transient" at ` },
+    { site: 'getPermission', label: 'an AgentDirectorError with a token-shaped errName', makeErr: tokenErrNameError, tail: `get-permission failed for ${INSTANCE_A} token=${TOKEN_A}: AgentDirectorError message="<redacted-token> transient" at ` },
+  ])('AC 20: $site rejects with $label — one line naming its type, safe code and redacted message; nothing logged, trailed or posted leaks', async ({ site, makeErr, tail }) => {
+    const { lines, logCalls, trail } = await runFailingSite(site, makeErr)
+
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toHaveLength(1)
+    expect(String(lines[0]![0])).toStartWith(`[slack] permission-poller: ${tail}`)
+    assertNoLeak({ logCalls, trail: trail.events, posts: posts(stubA) })
+  })
+
+  test.each<{ site: 'get' | 'getPermission'; head: string }>([
+    { site: 'get', head: `get failed for ${INSTANCE_A}` },
+    { site: 'getPermission', head: `get-permission failed for ${INSTANCE_A} token=${TOKEN_A}` },
+  ])('AC 20: $site rejects with an AgentDirectorError with a safe errName — the line is the errName and its redacted description, no frames; nothing leaks', async ({ site, head }) => {
+    const { lines, logCalls, trail } = await runFailingSite(site, safeErrNameError)
+
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toHaveLength(1)
+    expect(String(lines[0]![0])).toBe(
+      `[slack] permission-poller: ${head}: ErrDaemonBusy message="retry later ${REDACTED_SENTINEL_TAIL}"`,
+    )
+    assertNoLeak({ logCalls, trail: trail.events, posts: posts(stubA) })
+  })
+
+  /**
+   * Run the poller with `site` rejecting `makeErr()`: one tick, or two for
+   * getPermission (it runs only for a posted request whose row has gone).
+   * Returns the log lines matching the site's phrase, every log call and the trail.
+   */
+  async function runFailingSite(
+    site: 'list' | 'get' | 'getPermission',
+    makeErr: () => Error,
+  ): Promise<{ lines: unknown[][]; logCalls: unknown[][]; trail: TrailCapture }> {
     scriptPostTs(stubA, POST_TS)
     const logCalls: unknown[][] = []
     const trail = makeTrailCapture()
@@ -2968,16 +3012,12 @@ describe('AC 20: an agent-director call failure on list, get or getPermission is
     }), { log: (...args) => { logCalls.push(args) }, emitTrail: trail.emit })
 
     await ivl.tick()
-    // getPermission runs only for a posted request whose row has gone.
     rowsPresent = false
     if (site === 'getPermission') await ivl.tick()
 
-    const lines = logLines(logCalls, phrase)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toHaveLength(1)
-    expect(String(lines[0]![0])).toStartWith(`[slack] permission-poller: ${tail}`)
-    assertNoLeak({ logCalls, trail: trail.events, posts: posts(stubA) })
-  })
+    const phrase = site === 'list' ? 'list failed' : site === 'get' ? 'get failed for' : 'get-permission failed for'
+    return { lines: logLines(logCalls, phrase), logCalls, trail }
+  }
 })
 
 // ---------------------------------------------------------------------------

@@ -398,8 +398,14 @@ export interface PersonaConnectionManager {
    * Stop a persona: cancel its timers and any attempt in flight (its result
    * is discarded), disconnect its socket as the manager's own close, drop its
    * clients and forget it. Idempotent. Resolves once the disconnects settle.
+   * With `endReason`, the persona's own open episode (Slack-unreachable,
+   * credentials refused or a lost connection) first ends with one line
+   * carrying its class label and the cause `cleared: <endReason>`, for a
+   * caller that brings the persona up again later on a fresh connection, so
+   * its start line gets an end. Without it (a teardown, shutdown) nothing is
+   * logged for that episode.
    */
-  stop(key: string): Promise<void>
+  stop(key: string, endReason?: string): Promise<void>
   /** Stop every persona. */
   stopAll(): Promise<void>
 }
@@ -1168,9 +1174,10 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     return entry.status
   }
 
-  async function stop(key: string): Promise<void> {
+  async function stop(key: string, endReason?: string): Promise<void> {
     const entry = entries.get(key)
     if (entry === undefined) return
+    if (endReason !== undefined) entry.tracker.end(endReason)
     entries.delete(key)
     entry.stopped = true
     clearRetryTimer(entry)

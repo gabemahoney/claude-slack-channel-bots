@@ -117,9 +117,10 @@ export const PERSONA_CREDENTIALS_CHANGE_FAILED = 'persona-credentials-change-fai
  * A persona's effective `claude_config_dir` cannot be resolved to a real path
  * (bug b.g57): a symlink on its path points to nothing, or resolving it failed
  * (an unmounted drive, a dropped network mount). The persona is not up
- * (retrying) and is not launched; its agent-director row is kept, and its
- * launch waits until the directory resolves. Logged once when the cause
- * starts and once when it clears (`cleared: …`).
+ * (retrying), has no Slack connection and is not launched; its
+ * agent-director row is kept, and it connects and launches once the
+ * directory resolves. Logged once when the cause starts and once when it
+ * clears (`cleared: …`).
  */
 export const PERSONA_CONFIG_DIR_UNRESOLVABLE = 'persona-config-dir-unresolvable'
 

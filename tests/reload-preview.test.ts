@@ -3,9 +3,7 @@
  * pending-change preview (b.av2 SR-8.4, SR-8.6, SR-10.3) in
  * src/reload-plan.ts: `buildChangePlan`, `changePlanCounts`,
  * `renderChangePlanCounts`, `renderPreviewLines`, `renderPreview`,
- * `renderPreviewLogLines`, `renderInvalidLogLine`, `isCredentialsBroken` and
- * `slackSideOutcome` (the bring-up outcome without a claude_config_dir hold,
- * bug b.g57, which the credentials row's `retrying` fact reads),
+ * `renderPreviewLogLines`, `renderInvalidLogLine` and `isCredentialsBroken`,
  * plus the plan's `configDirsChanged` flag (the agent-director template
  * refresh, SR-8.6 step 5, never rendered) and facts the caller could not
  * gather (`FACT_UNKNOWN`).
@@ -39,7 +37,7 @@ import {
   type PersonaConfigInput,
   type PersonaInput,
 } from '../src/config.ts'
-import { slackSideOutcome, type PersonaBringUpState } from '../src/persona-bringup-controller.ts'
+import type { PersonaBringUpState } from '../src/persona-bringup-controller.ts'
 import { credentialsReadProblem } from '../src/persona-credentials.ts'
 import {
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
@@ -302,6 +300,17 @@ describe('added personas', () => {
       () => [missingCredentials, missingDirectory],
       ['credentials file does not exist', 'working directory does not exist'],
     ],
+    [
+      // Bug b.g57: the check's `problem`, without the held persona's consequence.
+      'an unresolvable claude_config_dir',
+      () => [{ step: 'claude-config-dir', cause: 'claude_config_dir cannot be resolved to a real path (ENOENT: a symlink on its path points to nothing)' }],
+      ['claude_config_dir cannot be resolved to a real path (ENOENT: a symlink on its path points to nothing)'],
+    ],
+    [
+      'all three causes, in the bring-up\'s check order',
+      () => [missingCredentials, missingDirectory, { step: 'claude-config-dir', cause: 'claude_config_dir cannot be resolved to a real path (EACCES)' }],
+      ['credentials file does not exist', 'working directory does not exist', 'claude_config_dir cannot be resolved to a real path (EACCES)'],
+    ],
   ])('an added persona with %s says it cannot come up and why', (_label, causes, expected) => {
     const cannotComeUp = causes()
     const { plan, lines } = preview(
@@ -502,7 +511,7 @@ describe('credentials changed', () => {
   })
 
   const failure = (step: PersonaBringUpStep, cls: string) => ({ step, class: cls, cause: 'x' })
-  /** Its launch waits for its claude_config_dir to resolve (bug b.g57, `holdForConfigDir`). */
+  /** Held for an unresolvable claude_config_dir (bug b.g57): its Slack connection is closed, its launch waits. */
   const configDirHold = () => failure('claude-config-dir', PERSONA_CONFIG_DIR_UNRESOLVABLE)
 
   /** The bring-up states a credentials-changed persona can be in. */
@@ -518,9 +527,9 @@ describe('credentials changed', () => {
     up: { outcome: 'up', causes: {} },
     /** Its first Slack attempt is in flight: no outcome yet, so no connection yet. */
     firstAttempt: { outcome: undefined, causes: {} },
-    /** Bug b.g57: its connection works, its launch waits for its claude_config_dir. */
+    /** Held for its claude_config_dir (bug b.g57): no connection, its launch waits for the directory. */
     heldConfigDir: { outcome: 'retrying', causes: { configDir: configDirHold() } },
-    /** Slack unreachable at its bring-up and held for its claude_config_dir too: no connection yet. */
+    /** Slack unreachable at its bring-up and held for its claude_config_dir too. */
     heldAndRetryingSlack: {
       outcome: 'retrying',
       causes: { slack: failure('slack', PERSONA_SLACK_UNREACHABLE), configDir: configDirHold() },
@@ -535,8 +544,20 @@ describe('credentials changed', () => {
     ['retrying: working directory missing', STATES.retryingDirectory, false, true],
     ['up', STATES.up, false, false],
     ['in its first Slack attempt (no outcome yet)', STATES.firstAttempt, false, true],
-    ['held for its claude_config_dir with a working connection (b.g57): not retrying', STATES.heldConfigDir, false, false],
+    ['held for its claude_config_dir (b.g57), with no connection', STATES.heldConfigDir, false, true],
     ['retrying for Slack and held for its claude_config_dir', STATES.heldAndRetryingSlack, false, true],
+    [
+      'held for its claude_config_dir with its working directory missing too',
+      { outcome: 'retrying', causes: { directory: failure('working-directory', PERSONA_DIRECTORY_MISSING), configDir: configDirHold() } },
+      false,
+      true,
+    ],
+    [
+      'broken because Slack refused its token, with the claude_config_dir hold beside it',
+      { outcome: 'broken', causes: { slack: failure('slack', PERSONA_CREDENTIALS_REFUSED), configDir: configDirHold() } },
+      true,
+      false,
+    ],
     ['the controller does not know', undefined, false, false],
   ])('a persona %s is credentials-broken and retrying exactly as its state says', (_label, state, broken, retrying) => {
     const { plan } = preview(applied(), { ...bravoRotated(), bringUpState: () => state })
@@ -633,16 +654,16 @@ describe('credentials changed', () => {
       (c) => `, but it cannot be used (${c}): it keeps retrying with its current content, instance kept.`,
     ],
     [
-      'held for its claude_config_dir with a working connection (b.g57), content valid: reconnected, not retried',
+      'held for its claude_config_dir (b.g57), content valid: it has no connection, so it retries with the new content',
       STATES.heldConfigDir,
       undefined,
-      () => ': a new connection opens, then the old one closes, instance kept.',
+      () => ': it has no connection yet, so it retries with the new content, instance kept.',
     ],
     [
-      'held for its claude_config_dir with a working connection (b.g57), file missing',
+      'held for its claude_config_dir (b.g57), file missing',
       STATES.heldConfigDir,
       () => MISSING,
-      (c) => `, but it cannot be used (${c}): the current connection is kept, instance kept.`,
+      (c) => `, but it cannot be used (${c}): it keeps retrying with its current content, instance kept.`,
     ],
     [
       'retrying for Slack and held for its claude_config_dir, content valid',
@@ -697,39 +718,6 @@ describe('credentials changed', () => {
       `persona "bravo" (key=bravo): credentials file ${JSON.stringify(credentialsOf('bravo'))} changed${rest(problem ?? '')}`,
     ])
     // `render` ran assertNoLeak over the plan and every form: a cause from sentinel-bearing content leaked nothing.
-  })
-
-  // Rows: a bring-up state's Slack-side outcome (b.g57), then the state. Only
-  // a `retrying` outcome whose one cause is the claude_config_dir hold is `up`
-  // on the Slack side; any other cause beside the hold, or another outcome,
-  // keeps it as it is.
-  test.each<[string, PersonaBringUpState['outcome'], PersonaBringUpState]>([
-    ['held for its claude_config_dir alone', 'up', STATES.heldConfigDir],
-    ['held and retrying for Slack', 'retrying', STATES.heldAndRetryingSlack],
-    [
-      'held and retrying for its working directory',
-      'retrying',
-      { outcome: 'retrying', causes: { directory: failure('working-directory', PERSONA_DIRECTORY_MISSING), configDir: configDirHold() } },
-    ],
-    [
-      'held with a credentials cause beside it',
-      'retrying',
-      { outcome: 'retrying', causes: { credentials: failure('credentials', PERSONA_CREDENTIALS_INVALID), configDir: configDirHold() } },
-    ],
-    [
-      'broken with the hold beside its credentials cause',
-      'broken',
-      { outcome: 'broken', causes: { slack: failure('slack', PERSONA_CREDENTIALS_REFUSED), configDir: configDirHold() } },
-    ],
-    ['broken with the hold as its only cause', 'broken', { outcome: 'broken', causes: { configDir: configDirHold() } }],
-    ['retrying with no cause named', 'retrying', { outcome: 'retrying', causes: {} }],
-    ['retrying for Slack, not held', 'retrying', STATES.retryingSlack],
-    ['retrying for its working directory, not held', 'retrying', STATES.retryingDirectory],
-    ['up', 'up', STATES.up],
-    ['broken by its credentials', 'broken', STATES.brokenRefused],
-    ['in its first Slack attempt (no outcome yet)', undefined, STATES.firstAttempt],
-  ])('slackSideOutcome: a persona %s is %s on the Slack side', (_label, expected, state) => {
-    expect(slackSideOutcome(state)).toBe(expected)
   })
 
   test('why the content cannot be used is asked only for a credentials-changed persona, by its path, and never in dry run', () => {

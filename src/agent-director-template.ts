@@ -39,8 +39,7 @@ import { getClient, DEFAULT_TEMPLATE_NAME } from './agent-director-client.ts'
 import { recordStartupError } from './startup-errors.ts'
 import type { PersonaConfig } from './config.ts'
 import { effectiveClaudeConfigDirs } from './persona-identity.ts'
-import { describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
-import { redactSlackLogText } from './slack-log-redaction.ts'
+import { describeLogMessage, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 
 // ---------------------------------------------------------------------------
 // Injectable dependency surface
@@ -242,14 +241,17 @@ function describeTemplateFailure(err: unknown): string {
 /**
  * The refresh's one-line detail of a rejected `makeTemplate`, safe to log: a
  * typed agent-director error's `errName` when it passes `isSafeIdentifier`,
- * then its description through `redactSlackLogText` (URL-like and token-like
- * text replaced); any other throw, or a typed error whose `errName` fails the
- * check, only through `describeThrownValue`. Never throws.
+ * then its description as `message="…"` (`describeLogMessage`: through
+ * `redactSlackLogText`, on one line, capped at `MAX_LOGGED_MESSAGE_LENGTH`
+ * characters) when it has one; any other throw, or a typed error whose
+ * `errName` fails the check, only through `describeThrownValue`, which
+ * renders the message the same way. Never throws.
  */
 function describeRefreshFailure(err: unknown): string {
   try {
     if (err instanceof AgentDirectorError && isSafeIdentifier(err.errName)) {
-      return `${err.errName}: ${redactSlackLogText(String(err.errDescription))}`
+      const message = describeLogMessage(err.errDescription)
+      return message === '' ? err.errName : `${err.errName} ${message}`
     }
   } catch {
     /* an unreadable typed error falls back to the describer */
@@ -326,11 +328,12 @@ export type TemplateRefreshResult =
  * Never rejects and never exits: a rejection (a typed agent-director error
  * or any throw) logs one line and resolves `{ kind: 'failed' }`. The line
  * names a typed error by its `errName` (only when it passes
- * `isSafeIdentifier`) and its description with URL-like and token-like text
- * redacted (`redactSlackLogText`), and any other throw, or a typed error
+ * `isSafeIdentifier`) and its description as `message="…"` (URL-like and
+ * token-like text redacted by `redactSlackLogText`, on one line, capped at
+ * `MAX_LOGGED_MESSAGE_LENGTH` characters), and any other throw, or a typed error
  * with an unsafe `errName`, only through `describeThrownValue` (its type, a
- * safe `code` and its stack frames, never its message), so a message holding
- * a token never reaches the log. No startup
+ * safe `code`, its message through `redactSlackLogText` and its stack
+ * frames), so a token in a message never reaches the log. No startup
  * error is recorded, nothing is posted and no persona's state is touched,
  * and nothing retries it. A success logs one line too.
  */

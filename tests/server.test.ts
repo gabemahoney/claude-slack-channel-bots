@@ -36,10 +36,11 @@ import { personaInstanceId } from '../src/persona-identity.ts'
 import { makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import {
   APP_TOKEN_PREFIX,
-  BOT_TOKEN_PREFIX,
   LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
   assertNoLeak,
   fakeToken,
+  sentinelInMessage,
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
 
@@ -507,10 +508,12 @@ describe('_buildIsSessionAliveAdapter', () => {
   })
 
   // AC 20 (b.av2 SR-10.3): the catch-all status-error line logs the error's
-  // description (type, safe code, frames), never the error itself. Every
-  // console.error argument is kept unformatted, so a raw error fails the check.
-  test('AC 20: any other status error carrying fake tokens → one "status error" line naming its type and code only; returns false, no flag, nothing leaks', async () => {
-    const statusError = Object.assign(new Error(`status failed ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), {
+  // description (type, safe code, message through `redactSlackLogText`,
+  // frames), never the error itself. The message carries the leak marker only
+  // inside a fake token and a `ticket=` URL, both of which redaction replaces.
+  // Every console.error argument is kept unformatted, so a raw error fails the check.
+  test('AC 20: any other status error carrying fake tokens → one "status error" line naming its type, code and redacted message; returns false, no flag, nothing leaks', async () => {
+    const statusError = Object.assign(new Error(`status failed (${sentinelInMessage('msg')})`), {
       code: 'EIO',
       detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
       note: LEAK_SENTINEL,
@@ -530,7 +533,9 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(getOutageFlags('C1').size).toBe(0)
     expect(errArgs).toHaveLength(1)
     expect(errArgs[0]).toHaveLength(1)
-    expect(String(errArgs[0]![0])).toStartWith('[slack] isSessionAlive: status error for persona=C1: Error code=EIO at ')
+    expect(String(errArgs[0]![0])).toStartWith(
+      `[slack] isSessionAlive: status error for persona=C1: Error code=EIO message="status failed (${REDACTED_SENTINEL_TAIL})" at `,
+    )
     assertNoLeak({ errArgs, emissions })
   })
 })

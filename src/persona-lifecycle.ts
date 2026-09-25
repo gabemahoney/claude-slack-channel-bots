@@ -93,10 +93,14 @@
  *   controller's `changeCredentials` over the connection manager, for a
  *   persona that is up (reconnected: the new connection opens, then the old
  *   one closes; its instance and MCP session are kept) or retrying (it
- *   retries with the new content). Its cached DM conversation is forgotten
- *   right before the new connection comes into use (the controller's
- *   `beforeSwap`, ahead of the notifier's flush at up), whether that swap
- *   happens at once or later; a later swap logs the reconnected line too.
+ *   retries with the new content; a persona held for its claude_config_dir
+ *   is retrying with no connection, opens none, and connects with the new
+ *   content once the directory resolves). Its cached DM conversation is
+ *   forgotten right before the new connection comes into use (the
+ *   controller's `beforeSwap`, ahead of the notifier's flush at up), whether
+ *   that swap happens at once or later, or, for a persona with no connection,
+ *   when it takes the new content; a later swap logs the reconnected line
+ *   too.
  *   Each line is worded from the persona's state after the attempt (a
  *   persona whose current connection was refused meanwhile is not said to
  *   keep it). A persona broken by its credentials by then is left to step
@@ -159,7 +163,6 @@
  *   [slack] persona "<name>" (key=<key>): <step> before bringing it up again failed: <thrown value>
  *   [slack] persona "<name>" (key=<key>): reconnected with its changed credentials; its instance and MCP session are kept
  *   [slack] persona "<name>" (key=<key>): reconnected with its changed credentials and up again; its instance is kept
- *   [slack] persona "<name>" (key=<key>): reconnected with its changed credentials; its session is kept, and its launch waits until its claude_config_dir resolves
  *   [slack] persona "<name>" (key=<key>): its changed credentials cannot reach Slack yet; the new connection retries and the current one stays in use
  *   [slack] persona "<name>" (key=<key>): its changed credentials cannot reach Slack yet; the new connection retries, and it stays broken by its credentials until that connection is in use
  *   [slack] persona "<name>" (key=<key>): it retries its bring-up with its changed credentials
@@ -606,35 +609,35 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
       log(`${prefix}: credentials change not applied — the server is shutting down`)
       return { kind: 'skipped' }
     }
-    // A persona held for its claude_config_dir (bug b.g57) has no MCP session
-    // and its launch still waits, whether or not it was up before the swap.
-    const reconnectedLine = (wasUp: boolean, held: boolean): string =>
-      held
-        ? `${prefix}: reconnected with its changed credentials; its session is kept, and its launch waits until its claude_config_dir resolves`
-        : wasUp
-          ? `${prefix}: reconnected with its changed credentials; its instance and MCP session are kept`
-          : `${prefix}: reconnected with its changed credentials and up again; its instance is kept`
+    const reconnectedLine = (wasUp: boolean): string =>
+      wasUp
+        ? `${prefix}: reconnected with its changed credentials; its instance and MCP session are kept`
+        : `${prefix}: reconnected with its changed credentials and up again; its instance is kept`
+    const forgetDm = (): void => {
+      try {
+        deps.destinations.forget(key)
+      } catch (err) {
+        log(`${prefix}: forgetting its cached DM conversation failed: ${describeThrownValue(err)}`)
+      }
+    }
     const hooks: CredentialsChangeHooks = {
       // Before the swap, so the notifier's flush at up never posts held
       // notices to the old app's DM (the new app may have another DM).
-      beforeSwap: () => {
-        try {
-          deps.destinations.forget(key)
-        } catch (err) {
-          log(`${prefix}: forgetting its cached DM conversation failed: ${describeThrownValue(err)}`)
-        }
-      },
+      beforeSwap: forgetDm,
       // A reconnect left retrying took over after this operation resolved.
       onSwapped: (swap) => {
-        if (swap.late) log(reconnectedLine(swap.wasUp, swap.held === true))
+        if (swap.late) log(reconnectedLine(swap.wasUp))
       },
     }
     const result = await deps.bringUps.changeCredentials(persona, applied.personas, deps.connections, hooks)
     switch (result.kind) {
       case 'swapped':
-        log(reconnectedLine(result.cameBackUp !== true, result.held === true))
+        log(reconnectedLine(result.cameBackUp !== true))
         break
       case 'retrying':
+        // No connection: it comes up on the new content later (a persona held
+        // for its claude_config_dir may have a DM cached from the old app).
+        if (result.connection === 'none') forgetDm()
         log(
           result.connection === 'kept'
             ? `${prefix}: its changed credentials cannot reach Slack yet; the new connection retries and the current one stays in use`

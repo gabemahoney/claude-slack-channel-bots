@@ -434,6 +434,7 @@ import {
 } from '../../src/config.ts'
 import {
   DEFAULT_WORKING_DIRECTORY_FS,
+  checkPersonaConfigDir,
   type PersonaBringUpFs,
   type WorkingDirectoryFs,
 } from '../../src/persona-bringup.ts'
@@ -1882,8 +1883,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
   let tokenWatch: TokenEnvironmentWatch | undefined
   /**
    * Every stand-in call refused because it needs `opts.realLifecycle`. The
-   * controller logs a rejected lifecycle call without its message, so
-   * `h.cleanup()` throws these.
+   * refusal otherwise shows only as the controller's one line for a rejected
+   * lifecycle call, so `h.cleanup()` throws these.
    */
   const standInRefusals: string[] = []
 
@@ -1999,15 +2000,20 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       connections: {
         bringUp: (persona, tokens) => connections.connections.bringUp(persona, tokens),
         status: (key) => connections.manager.status(key),
+        // As server.ts wires it (the manager itself): a claude_config_dir
+        // hold that starts later closes the persona's connection (bug b.g57).
+        stop: (key) => connections.manager.stop(key),
       },
       clock: connections.clock,
       dryRun,
       log,
       fs: runOpts.bringUpFs,
       launch: (persona) => launch(persona, 'retry'),
-      // As server.ts wires it: a held persona's claude_config_dir is
-      // re-checked exactly as the launch checks it (bug b.g57).
-      ...(realLaunch ? { checkConfigDir: checkLaunchConfigDir } : {}),
+      // As server.ts wires it: a persona's claude_config_dir is checked
+      // before its Slack step, and re-checked while it is held, exactly as
+      // the launch checks it (bug b.g57). Without a real launch, against the
+      // temp home as the reload controller checks it, never the process home.
+      checkConfigDir: realLaunch ? checkLaunchConfigDir : (persona) => checkPersonaConfigDir(persona, { home }),
       // As server.ts wires it: a persona that stops being up (a refused
       // reopen, a Web API call refused for its bot token) has its registered
       // MCP session dropped; its instance is kept.

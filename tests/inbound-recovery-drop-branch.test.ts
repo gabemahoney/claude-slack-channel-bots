@@ -6,9 +6,8 @@
  * A Slack message that qualifies for persona P but finds no live,
  * stream-bearing session (no session, a disconnected one, or one that has lost
  * its GET stream) is lost. The branch in src/persona-routing.ts asks whether P
- * is up (bug b.g57: a persona that is not up, such as one held for an
- * unresolvable claude_config_dir while its Slack connection serves, is never
- * restarted from here) and applies P's restart guards (a restart already
+ * is up (b.av2 SR-6.4, bug b.g57: a persona that is not up is never
+ * restarted from here; its own bring-up recovery launches it) and applies P's restart guards (a restart already
  * pending or running, auto-restart disabled, P at the restart-failure cap),
  * schedules a human-triggered restart of P only when none applies ("starting
  * now"), and raises one lost-message
@@ -70,7 +69,7 @@ import {
   type StubSlackOptions,
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
-import { assertNoLeak, LEAK_SENTINEL } from './test-helpers/credentials.ts'
+import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { indicesOf, stripComments } from './test-helpers/source-audit.ts'
 import {
   makeRestartDeps,
@@ -116,6 +115,7 @@ const STUB_USER_NAME = 'stub-user'
 /** In every lost message's text; must never reach a Slack call. */
 const MESSAGE_MARKER = 'lost-body-marker-7Kq2'
 
+
 // ---------------------------------------------------------------------------
 // Harness: the shared routing harness over beta (first) and alpha (second,
 // the receiving persona), with no session registered unless asked
@@ -152,17 +152,21 @@ interface HarnessOptions {
   resolveUserName?: RoutingHarnessOptions['resolveUserName']
   notify?: RoutingHarnessOptions['notify']
   /**
-   * Give the routing the up check (bug b.g57): the real
-   * `createPersonaUpPredicate` over a connection that serves for every
-   * persona and a bring-up outcome that is `up` except for the keys in
-   * `h.notUp`. Without it (and without `notUp`) the routing has no up check.
+   * Give the routing the up check: the real `createPersonaUpPredicate` over
+   * a connection that serves for every persona and a bring-up outcome that
+   * is `up` except for the keys in `h.notUp`. Without it (and without
+   * `notUp`) the routing has no up check.
    */
   upCheck?: boolean
-  /** Names whose bring-up is not `up` (held, as for an unresolvable claude_config_dir); implies `upCheck`. */
+  /**
+   * Names whose bring-up outcome is not `up` although their connection still
+   * delivers a message (a persona that stopped being up while the message
+   * was in flight, or the old half of a destructive modify); implies `upCheck`.
+   */
   notUp?: readonly string[]
 }
 
-/** A connection that serves: a persona held by its bring-up keeps it (b.g57). */
+/** A connection that serves, so only the bring-up outcome decides whether a persona is up. */
 const SERVING: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0SERVING', botId: 'B0SERVING' } }
 
 let dir: string
@@ -398,7 +402,7 @@ describe('AC 26: a lost message is reported once, at the persona\'s destination,
 })
 
 // ===========================================================================
-// AC 26 x SR-7.3 — the recovery state. Five states (not up, from bug b.g57,
+// AC 26 x SR-7.3 — the recovery state. Five states (not up, b.av2 SR-6.4,
 // and the four restart-guard states) × a channel or `dm` destination, on the
 // no-session branch. Each notice identifies its state and no other (so the
 // five texts are pairwise distinct); only "starting now" schedules a launch.
@@ -411,7 +415,7 @@ describe('AC 26: a lost message is reported once, at the persona\'s destination,
  * no-session branch, and the launches there are once it is handled.
  */
 const STATE_SETUPS: Record<LostMessageState, { opts: HarnessOptions; arrange(h: Harness): Promise<void> | void; launches: number }> = {
-  // Bug b.g57: alpha's bring-up is held while its connection serves;
+  // Alpha's bring-up outcome is not up while a message still reaches it;
   // restart.ts itself would launch (fast delay) if it were asked.
   'not-up': { opts: { notUp: ['alpha'] }, arrange: () => {}, launches: 0 },
   // A launch of alpha is already in flight; a stacked one would make two.
@@ -455,19 +459,22 @@ describe('AC 26: the notice reports the recovery state', () => {
 })
 
 // ===========================================================================
-// Bug b.g57 — a persona that is not up (its bring-up held, as for an
-// unresolvable claude_config_dir) keeps its Slack connection, so its messages
-// still arrive and are lost. Each one used to report "starting now" and ask
+// Not up (b.av2 SR-6.4; regression guard for bug b.g57) — a message can
+// still reach a persona whose bring-up outcome is not up: one that stopped
+// being up while the message was being handled, or the old half of a
+// destructive modify after its bring-up was cancelled and before its
+// connection is stopped. Such a message used to report "starting now" and ask
 // for a restart the relaunch gate refused. Now the notice says "not up" and
-// nothing is scheduled: its own recovery launches it. The up check is the
-// real `createPersonaUpPredicate` over a serving connection; the production
-// wiring (the routing gets the server's one `isPersonaUp`) is pinned in
+// nothing is scheduled: the persona's own recovery launches it. The up check
+// is the real `createPersonaUpPredicate` over a serving connection, with the
+// bring-up outcome injected as not up; the production wiring (the routing
+// gets the server's one `isPersonaUp`) is pinned in
 // tests/server-startup-wiring.test.ts.
 // ===========================================================================
 
-describe('b.g57: a lost message for a persona that is not up starts no restart', () => {
+describe('not up: a lost message for a persona that is not up starts no restart', () => {
   test.each(['no session', 'streamless'] as const)(
-    'b.g57 REGRESSION: %s, alpha held with its connection serving: three messages each get exactly the not-up notice at the destination, no restart is asked for, scheduled or launched and nothing is delivered; once alpha is up, the next lost message starts now',
+    'b.g57 REGRESSION: %s, alpha not up while its connection still delivers: three messages each get exactly the not-up notice at the destination, no restart is asked for, scheduled or launched and nothing is delivered; once alpha is up, the next lost message starts now',
     async (branch) => {
       const h = makeHarness({ branch, notUp: ['alpha'] })
       // The relaunch gate over the same bring-up state: before the fix every
@@ -501,7 +508,7 @@ describe('b.g57: a lost message for a persona that is not up starts no restart',
     },
   )
 
-  test('b.g57: one message lost on both connections, beta up and alpha not up: beta reports starting now and is restarted, alpha reports not up and is not, each at its own destination', async () => {
+  test('one message lost on both connections, beta up and alpha not up: beta reports starting now and is restarted, alpha reports not up and is not, each at its own destination', async () => {
     const h = makeHarness({ notUp: ['alpha'] })
     // Beta is `mentions` in the shared channel, so it gets the message by mention.
     const event = messageIn(SHARED, `${mentionText(h.p('beta').stub.identity.botUserId)} ${MESSAGE_MARKER}`)
@@ -521,9 +528,9 @@ describe('b.g57: a lost message for a persona that is not up starts no restart',
     expect(h.launches).toEqual([{ key: h.beta.key, cwd: h.beta.working_directory }])
   })
 
-  test('b.g57: the up check is asked with the persona\'s key, not its name', async () => {
+  test('the up check is asked with the persona\'s key, not its name', async () => {
     const asked: string[] = []
-    const h = makeRoutingHarness([{ name: 'Held Persona', channels: [{ id: SHARED, delivery: 'all' }] }], dir, {
+    const h = makeRoutingHarness([{ name: 'Not Up Persona', channels: [{ id: SHARED, delivery: 'all' }] }], dir, {
       sessions: [],
       restartDelayS: FAST_DELAY_S,
       isPersonaUp: (key) => {
@@ -532,21 +539,21 @@ describe('b.g57: a lost message for a persona that is not up starts no restart',
       },
     })
     harnesses.push(h)
-    const held = h.config!.personas[0]!
-    expect(held.key).not.toBe(held.name)
+    const notUp = h.config!.personas[0]!
+    expect(notUp.key).not.toBe(notUp.name)
 
-    await h.receiveKeys(messageIn(SHARED), [held.key])
+    await h.receiveKeys(messageIn(SHARED), [notUp.key])
 
-    expect(asked).toEqual([held.key])
+    expect(asked).toEqual([notUp.key])
     expect(h.allPosts().map((p) => stateOf(p.text))).toEqual(['not-up'])
-    expect(isRestartPendingOrActive(held.key)).toBe(false)
+    expect(isRestartPendingOrActive(notUp.key)).toBe(false)
   })
 
   // An up persona passing the check to "starting now" is the beta side of the
   // two-persona case above; the AC 26 state table (no up check at all) fails
   // if an absent check counted as not up. This one row shows an up persona
   // still falls through to a later restart-guard state.
-  test('b.g57: alpha up through the up check and at the restart-failure cap: the notice says restart limit reached and nothing launches', async () => {
+  test('alpha up through the up check and at the restart-failure cap: the notice says restart limit reached and nothing launches', async () => {
     const setup = STATE_SETUPS['restart-limit-reached']
     const h = makeHarness({ ...setup.opts, upCheck: true })
     await setup.arrange(h)
@@ -597,11 +604,11 @@ describe('AC 26: the notice names the sender readably, with no mention', () => {
   })
 
   test.each(['no session', 'streamless'] as const)(
-    'AC 26: %s, the user-name lookup rejects: the human-triggered restart still starts and exactly one notice names the user ID, with one token-safe line',
+    'AC 26: %s, the user-name lookup rejects: the human-triggered restart still starts and exactly one notice names the user ID, with one token-safe line that keeps the error\'s message, redacted',
     async (branch) => {
       const h = makeHarness({
         branch,
-        resolveUserName: async () => { throw new Error(`users.info failed ${LEAK_SENTINEL}`) },
+        resolveUserName: async () => { throw new Error(`users.info failed (${sentinelInMessage('users-info')})`) },
       })
 
       await h.deliver(messageIn(SHARED), h.alpha.key)
@@ -609,7 +616,10 @@ describe('AC 26: the notice names the sender readably, with no mention', () => {
       expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: HUMAN, state: 'starting-now' })
       expect(h.notices).toHaveLength(1)
       const ref = renderPersonaRef(h.alpha.name, h.alpha.key)
-      expect(h.logs.filter((l) => l.includes(`user-name lookup for persona ${ref} failed, using the user ID`))).toHaveLength(1)
+      const lookupLines = h.logs.filter((l) => l.includes(`user-name lookup for persona ${ref} failed, using the user ID`))
+      expect(lookupLines).toHaveLength(1)
+      // The error's message is kept, redacted (the sentinel is in no log line: the teardown leak check).
+      expect(lookupLines[0]).toContain('users.info failed')
       expect(h.logs.filter((l) => l.includes('error handling event'))).toEqual([])
       expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
       await waitFor(() => h.launches.length > 0)
@@ -871,9 +881,9 @@ describe('b.kvq (4) SR-7.2: the lost-message notice is held and retried like eve
   )
 
   test.each<[string, RoutingHarnessOptions['notify']]>([
-    ['throws', () => { throw new Error(`notice sink failed ${LEAK_SENTINEL}`) }],
-    ['rejects', async () => { throw new Error(`notice sink failed ${LEAK_SENTINEL}`) }],
-  ])('a notice sink that %s is logged once naming the persona, token-safe and never thrown, and recovery still happens', async (_label, notify) => {
+    ['throws', () => { throw new Error(`notice sink failed (${sentinelInMessage('notice-sink')})`) }],
+    ['rejects', async () => { throw new Error(`notice sink failed (${sentinelInMessage('notice-sink')})`) }],
+  ])('a notice sink that %s is logged once naming the persona and keeping the error\'s message, redacted and token-safe; never thrown, and recovery still happens', async (_label, notify) => {
     const h = makeHarness({ restartDelayS: SLOW_DELAY_S, notify })
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
@@ -882,7 +892,10 @@ describe('b.kvq (4) SR-7.2: the lost-message notice is held and retried like eve
     expect(h.notices).toHaveLength(1)
     expect(h.allPosts()).toEqual([])
     const ref = renderPersonaRef(h.alpha.name, h.alpha.key)
-    expect(h.logs.filter((l) => l.includes(`lost-message notice for persona ${ref} failed`))).toHaveLength(1)
+    const sinkLines = h.logs.filter((l) => l.includes(`lost-message notice for persona ${ref} failed`))
+    expect(sinkLines).toHaveLength(1)
+    // The error's message is kept, redacted (the sentinel is in no log line: the teardown leak check).
+    expect(sinkLines[0]).toContain('notice sink failed')
     expect(h.logs.filter((l) => l.includes('error handling event'))).toEqual([])
     expectBetaUntouched(h)
   })

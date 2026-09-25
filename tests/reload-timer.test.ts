@@ -14,7 +14,7 @@
 import { describe, expect, test } from 'bun:test'
 import { createReloadTickDriver, RELOAD_TICK_INTERVAL_MS } from '../src/reload-timer.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
-import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken } from './test-helpers/credentials.ts'
+import { assertNoLeak, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
 
 /** The prefix of both single-use log lines; the distinguishing phrase follows it. */
 const SINGLE_USE_PREFIX = '[slack] reload: detection timer start()'
@@ -147,26 +147,34 @@ describe('reload-timer — serialization', () => {
 })
 
 describe('reload-timer — a failing pass', () => {
-  const token = fakeToken(BOT_TOKEN_PREFIX, 'thrown')
+  /**
+   * The leak marker as a thrown message carries it (`sentinelInMessage`):
+   * only inside a fake token and a Socket Mode `ticket=` URL. The line keeps
+   * the message after `redactSlackLogText`, which replaces both, so the
+   * marker shows only if redaction is skipped.
+   */
+  const secret = `(${sentinelInMessage('thrown')})`
+  /** `secret` as the line shows it, escaped for a RegExp. */
+  const redacted = RegExp.escape(`(${REDACTED_SENTINEL_TAIL})`)
   test.each([
     {
-      name: 'rejects with an Error whose message holds a token',
-      fail: () => Promise.reject(new Error(`boom ${token}`)),
-      described: /^Error( |;)/,
+      name: 'rejects with an Error whose message holds a token and a URL',
+      fail: () => Promise.reject(new Error(`boom ${secret}`)),
+      described: new RegExp(`^Error message="boom ${redacted}"( at |;)`),
     },
     {
-      name: 'rejects with a bare string holding a token',
-      fail: () => Promise.reject(token),
-      described: /^string;/,
+      name: 'rejects with a bare string holding a token and a URL',
+      fail: () => Promise.reject(`down ${secret}`),
+      described: new RegExp(`^string message="down ${redacted}";`),
     },
     {
       name: 'throws synchronously',
       fail: () => {
-        throw new TypeError(`sync ${token}`)
+        throw new TypeError(`sync ${secret}`)
       },
-      described: /^TypeError( |;)/,
+      described: new RegExp(`^TypeError message="sync ${redacted}"( at |;)`),
     },
-  ])('a tick that $name logs one token-free line and the chain re-arms', async ({ fail, described }) => {
+  ])('a tick that $name logs one line with the message redacted and the chain re-arms', async ({ fail, described }) => {
     const h = makeDriver()
     h.setNext(fail)
     h.driver.start(h.tick)

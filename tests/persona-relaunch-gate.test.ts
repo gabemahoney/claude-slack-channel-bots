@@ -49,12 +49,14 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { Persona } from '../src/config.ts'
 import { _resetHealthCheckState, buildPersonaWorkList, initHealthCheck, startHealthCheck } from '../src/health-check.ts'
 import { _resetOutageState, getOutageFlags, initOutageState } from '../src/outage-state.ts'
+import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
 import { createPersonaBringUpController, type PersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import type { PersonaConnectionManager, PersonaConnectionStatus, PersonaStatusListener } from '../src/persona-connections.ts'
 import { composePersonaStatusListeners, createPersonaRelaunchGate, createPersonaUpPredicate } from '../src/persona-start.ts'
@@ -487,6 +489,17 @@ function startTicks(getPersonas: () => Record<string, string>) {
   return { calls, tick }
 }
 
+/**
+ * The bring-up controller's claude_config_dir check against a scratch home
+ * `<base>/home` holding a real `.claude`, so no bring-up here depends on the
+ * process home (a dangling `$HOME/.claude` would hold every persona).
+ */
+function configDirCheckUnder(base: string): (persona: Persona) => ReturnType<typeof checkPersonaConfigDir> {
+  const home = join(base, 'home')
+  mkdirSync(join(home, '.claude'), { recursive: true })
+  return (persona) => checkPersonaConfigDir(persona, { home })
+}
+
 describe('end to end: the relaunch gate on the health-check work list', () => {
   test('a persona whose first Slack attempt was unreachable is left out of every tick (no stat, no probe, no restart); once the manager\'s retry brings it up, the controller launches it and the next tick schedules it', async () => {
     const h = makeConnectionHarness([{ name: 'Alpha Desk' }, { name: 'Beta Ops' }], dir, {
@@ -505,6 +518,7 @@ describe('end to end: the relaunch gate on the health-check work list', () => {
       dryRun: false,
       log,
       clock: h.clock,
+      checkConfigDir: configDirCheckUnder(dir),
       launch: async (persona) => void launches.push(persona.key),
     })
     controllers.push(controller)

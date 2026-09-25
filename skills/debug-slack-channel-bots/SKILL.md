@@ -120,13 +120,20 @@ ls -l "$STATE"/server.log*
   Persona lines then carry the `[slack]` prefix.
 - **Error detail.** A failure on a Slack or agent-director path (a `<error>`
   in the lines below) shows the error's class, a code such as `ENOENT` or an
-  agent-director error name such as `ErrSpawnNotFound`, and stack frames,
-  never the error's message. The `spawn-failed`, `orphan-cleanup…`,
+  agent-director error name such as `ErrSpawnNotFound`, the error's message
+  as `message="…"`, and stack frames. The message is on one line, cut at 300
+  characters (ending in `…`), with URLs shown as `<redacted-url>` and
+  token-like text as `<redacted-token>`. For an agent-director error the
+  message is agent-director's own description, in the same form, in
+  `server.log` and in the `spawn-failed`, `orphan-cleanup…`,
   `jsonl-transcript-lost-on-resume` and `jsonl-diagnosis-inconclusive`
-  records in `startup-errors.log` and the `Spawn failure:` notice
-  at the persona's destination add agent-director's own description after
-  the error name, with URLs shown as `<redacted-url>` and token-like text as
-  `<redacted-token>`; the notice cuts it at 300 characters. The
+  records in `startup-errors.log`. The `Spawn failure:` notice at the
+  persona's destination renders it differently, as
+  ``Error: `<errName>` — <description>``: URLs and token-like text in the
+  description are redacted as above and it is cut at 300 characters, but
+  it is not quoted, not joined onto one line and gets no `…` mark. An error
+  reading or parsing a credentials file is never quoted: its line states a
+  fixed cause instead. The
   `stop --stop-bots` lines `agent-director initialization failed:` and
   `bot teardown failed:` print the startup gate's or the teardown's own
   message in full. The `[slack] Fatal:` line of a start that failed
@@ -194,10 +201,7 @@ hex digits. Don't derive it by hand: read it from the persona's
 | `retrying` | Slack unreachable, working directory missing or unusable, or `claude_config_dir` unresolvable | Yes, once the cause clears; no restart |
 
 A persona that is not up posts nothing to Slack, and its instance, if one is
-running, is kept but not served. One exception: a persona whose launch waits
-for its `claude_config_dir` to resolve keeps its Slack connection, so each
-message it receives is lost and its destination gets one `Message lost`
-notice with state `not up` per message. Healthy personas are unaffected.
+running, is kept but not served. Healthy personas are unaffected.
 
 ---
 
@@ -348,7 +352,10 @@ running are not affected. See
   `service_unavailable`, `request_timeout`, `ratelimited`).
 - **Logged:** once when it starts, and once when it clears with the cause
   `cleared: Slack answered after being unreachable checking <key> via <check>`.
-  Nothing per attempt.
+  Nothing per attempt. A hold for the persona's config directory ends it
+  instead with the cause
+  `cleared: the persona's Slack connection was closed while its claude_config_dir cannot be resolved`
+  (see [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)).
 - **Recovery:** once Slack answers, the persona is launched from its retry
   (see `up after its bring-up retry` under
   [Other lines you may see](#other-lines-you-may-see)). If Slack answers
@@ -379,6 +386,12 @@ running are not affected. See
   network outage: the reopen keeps retrying, logging nothing more), or a lost
   line followed by `persona-credentials-refused` (see
   [A token was revoked while the persona was running](#a-token-was-revoked-while-the-persona-was-running)).
+- **Other ends:** a lost line closed by one with the cause
+  `cleared: the persona's Slack connection was closed while its claude_config_dir cannot be resolved`
+  means the persona was held for its config directory; see
+  [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable). A
+  persona removed by a confirmed change, or a server shutdown, closes the
+  connection with no further line, so a lost line then has no end.
 - **Library reason:** shortly before the lost line there may be a
   `[slack] persona Socket Mode: personas[<i>] "<name>" (key=<key>): …` line
   from the Slack library, giving its reason:
@@ -452,7 +465,7 @@ running are not affected. See
 
 - **State:** `retrying`. Recovers on its own once the directory resolves; no
   restart and no confirmation.
-- **Line:** `[slack] persona-config-dir-unresolvable: personas[<i>] "<name>" (key=<key>) path="<dir>": claude_config_dir cannot be resolved to a real path (<code>); its session is kept, and its launch waits until it resolves`.
+- **Line:** `[slack] persona-config-dir-unresolvable: personas[<i>] "<name>" (key=<key>) path="<dir>": claude_config_dir cannot be resolved to a real path (<code>); its Slack connection is closed and its launch waits until it resolves`.
   For a symlink that points to nothing, `(<code>)` reads
   `(ENOENT: a symlink on its path points to nothing)`. `<dir>` is the
   persona's effective `claude_config_dir` (its own, else the top-level one,
@@ -461,35 +474,57 @@ running are not affected. See
 - **Meaning:** The persona's Claude config directory, which holds its login,
   settings and conversation history, can't be resolved to a real path.
   Usually it is a symlink onto a drive that isn't mounted, or a network or
-  removable mount that dropped. The server finds this when it goes to launch
-  the persona: at a start, a restart, a retry or a confirmed change.
+  removable mount that dropped. The server checks it right before the
+  persona connects to Slack (at a start, when a confirmed change adds or
+  brings up the persona, and when a working-directory retry reaches Slack),
+  and again at each launch (a restart, a retry, or the next launch after a
+  confirmed `claude_config_dir` change). For a persona a pending change
+  adds, the preview already lists the same cause under `is added but cannot
+  come up` (see [Pending changes](#pending-changes)).
 - **What the server does:**
-  - The persona is not up and nothing is delivered to it. Its MCP session is
-    dropped if it had one, `/interject` returns 503, and its permission
-    prompts wait (see
+  - The persona is not up and has no Slack connection: found before it
+    connects, it never connects; found at a later launch, its Slack
+    connection is closed. It receives no Slack messages, `/interject`
+    returns 503, its MCP session is dropped if it had one, and its
+    permission prompts wait (see
     [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running)).
-  - Its agent-director row and conversation are kept: no kill, no delete and
-    no fresh spawn. Its Slack connection stays open.
+  - Its instance, agent-director row and conversation are kept: no kill, no
+    delete and no fresh spawn.
+  - Its notices are held, up to 20 (the oldest is dropped past that), and
+    posted once it is up again.
   - The directory is re-checked on the persona's own timer, 5 s doubling to
     300 s with no limit, outside the restart counter and cap.
   - The start's transcript check skips the persona, so there is no
     lost-history notice for it.
-  - A message sent to it is lost (see
-    [Other lines you may see](#other-lines-you-may-see), `No live session`),
-    and its destination gets a *Message lost* notice whose recovery state is
-    `not up`: no restart is started for it.
-  - A confirmed change to its credentials file content reconnects it while
-    it waits (see
-    [`persona-credentials-change-failed`](#persona-credentials-change-failed),
-    *When it works*); it stays held.
-- **Logged:** once when it starts; failed re-checks log nothing. Once the
+  - A confirmed change to its credentials file content is taken while it is
+    held: no connection opens, and it connects with the new content once
+    the directory resolves.
+- **Logged:** once when it starts; failed re-checks log nothing. If a
+  launch found it while the persona's Slack connection still had an open
+  [`persona-connection-lost`](#persona-connection-lost),
+  [`persona-slack-unreachable`](#persona-slack-unreachable) or
+  [`persona-credentials-refused`](#persona-credentials-refused) line, that
+  line is closed right after by one of the same class with the cause
+  `cleared: the persona's Slack connection was closed while its claude_config_dir cannot be resolved`.
+  The persona's return then connects afresh, so no restored line follows.
+  A launch queued for the persona just before it was held does nothing when
+  its turn comes; the return launches it instead. Once the
   path resolves, one line with the same class and the cause
-  `cleared: claude_config_dir resolves to a real path again; continuing the launch`,
-  then `[slack] persona "<name>" (key=<key>): up after its claude_config_dir resolved — launching`.
+  `cleared: claude_config_dir resolves to a real path again; continuing the bring-up`,
+  then Slack validation and connection with its current credentials, then
+  `[slack] persona "<name>" (key=<key>): up after its claude_config_dir resolved — launching`.
+  The launch resumes its agent-director row. If Slack is unreachable at that
+  point, the persona becomes `persona-slack-unreachable` and launches once
+  Slack answers. A persona Slack had refused when the hold started gets the
+  cleared cause ending
+  `the persona stays broken until its credentials file is fixed and the change confirmed`
+  instead (see
+  [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials)).
 - **Fix:** Have the operator remount the drive or repair the symlink so the
-  path resolves again. The persona resumes its own session at the next
-  re-check, within 300 s, with no confirmation and no restart. To check the
-  path read only (these show the path, not the directory's contents):
+  path resolves again. The persona reconnects and resumes its own session at
+  the next re-check, within 300 s, with no confirmation and no restart. To
+  check the path read only (these show the path, not the directory's
+  contents):
 
   ```sh
   ls -ld "<dir>"; realpath -e "<dir>"
@@ -509,6 +544,7 @@ running are not affected. See
   and `[slack] persona "<name>" (key=<key>): no longer applied — its claude_config_dir retry stops`
   (a confirmed change removed it). A
   `[slack] persona "<name>" (key=<key>): claude_config_dir retry failed: <error>`
+  or `[slack] persona "<name>" (key=<key>): closing its Slack connection for its claude_config_dir failed: <error>`
   line is an internal error: report it as a bug.
 
 ### `unclaimed-channel`
@@ -704,14 +740,12 @@ running are not affected. See
   `[slack] persona "<name>" (key=<key>): reconnected with its changed credentials and up again; its instance is kept`,
   then `up after its confirmed credentials change — launching`, and its kept
   instance registers again;
-  a persona held for its `claude_config_dir`
-  ([`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable))
-  whose connection works is reconnected the same way and logs
-  `[slack] persona "<name>" (key=<key>): reconnected with its changed credentials; its session is kept, and its launch waits until its claude_config_dir resolves`;
-  it stays held and is launched on the new connection once the directory
-  resolves;
   a retrying one logs
   `[slack] persona "<name>" (key=<key>): it retries its bring-up with its changed credentials`.
+  A persona held for its `claude_config_dir`
+  ([`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)) is
+  retrying with no connection: it takes the new content, opens no
+  connection, and connects with it once the directory resolves.
 - **When its state changed since the preview:** a persona the preview said
   would be reconnected, but that is broken by its credentials when the
   change is applied, logs
@@ -948,7 +982,7 @@ guaranteed to be resumed.
 |---|---|
 | `[slack] persona teardown of "<name>" (key=<key>): starting`, later `…: complete` | The teardown ran. Normal. |
 | `[slack] persona teardown of "<name>" (key=<key>): complete, with <n> failed step(s)` | Some steps failed; each has its own line (below). |
-| `[slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key> failed: <error>` (or `… delete of cscb_<key> failed: …`) | agent-director couldn't kill or delete the instance, often because it was unreachable. The row may still be there (see [Listing instances](#listing-instances)); for a removed persona, the next server start removes it. For a destructively modified persona, its bring-up finds the row: a row whose working directory or config directory no longer matches is replaced, but after a `credentials_file` path change alone the row still matches, so the launch may resume it with its conversation. |
+| `[slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key> failed: <error>` (or `… delete of cscb_<key> failed: …`) | agent-director couldn't kill or delete the instance, often because it was unreachable. The row may still be there (see [Listing instances](#listing-instances)); for a removed persona, the next server start removes it. For a destructively modified persona, its bring-up finds the row: a row whose working directory or config directory no longer matches is replaced, but when neither changed (for example a `credentials_file` path change alone) the row still matches, so the launch may resume it with its conversation instead of spawning a fresh instance. |
 | `[slack] persona teardown of "<name>" (key=<key>): <step> failed: <error>`, any other step | An internal error. The other steps still ran. Report it as a bug. |
 | `[slack] dry-run: persona teardown of "<name>" (key=<key>): skipping the agent-director kill and delete of cscb_<key>` | Dry run: the instance and its row are left alone. |
 | `[slack] Cancelled restart timer for persona=<key>` | A restart that was pending for it was cancelled. |
@@ -1172,7 +1206,7 @@ registers again with its history. If the new token is refused too, a new
   | The hook couldn't be installed: the directory is missing, or its `settings.json` is unreadable or not valid JSON (left untouched). | `startup-errors.log` (at start) or `server.log` (at a launch) has `stop-hook-bootstrap-dir-missing`, `stop-hook-bootstrap-not-a-dir` or `stop-hook-bootstrap-settings-…`; the `jq` command above shows no `slack-reply-guard.sh` entry. | Create the directory or fix the file, then `clean_restart`. |
   | The record couldn't be written at launch. The stale record is removed, so the persona gets no reminder until its next launch. | No record file; `server.log` has `[slack] reply-guard: could not write the record for "<name>" (key=<key>) at <path>`. | Fix the state directory's permissions or free space, then `clean_restart`. |
   | Reminded after opting out: the instance launched while the value was `true`. | The record reads `true`. | `clean_restart` (second row). |
-  | No reminder after a confirmed `claude_config_dir` change and a plain server restart. The server keeps each instance's launched-with directory in memory only, so after the restart it no longer counts the still-running instance toward its old directory, and a disabled neighbour's launch there removes the managed hook. Only the reply reminder is lost, until that instance's next launch. | The `jq` command above, run on the old directory, shows no `slack-reply-guard.sh` entry. | `clean_restart`, with the operator's say-so. |
+  | No reminder after a confirmed `claude_config_dir` change and a plain server restart. The server keeps each instance's launched-with directory in memory only, so after the restart it no longer counts the still-running instance toward its old directory. When every persona the server still counts toward the old directory has the reminder off, the next hook pass there (the restart's own start pass, or a launch of such a neighbour) removes the managed hook. Only the reply reminder is lost, until that instance's next launch. | The `jq` command above, run on the old directory, shows no `slack-reply-guard.sh` entry. | `clean_restart`, with the operator's say-so. |
 
 - **Not a fault:** the hook reminds at most once per turn, only for a turn
   that started from a Slack message the persona received, and only when it
@@ -1189,7 +1223,7 @@ registers again with its history. If the new token is refused too, a new
 | `[slack] persona Socket Mode: personas[<i>] "<name>" (key=<key>): <text>` | A connection-health line from the Slack library: a ping or pong timeout, or `Failed to send ping to Slack`. The connection is treated as dead and reopened. See [`persona-connection-lost`](#persona-connection-lost). |
 | `[WARN]  web-api:WebClient …` (or `[INFO]`, `[ERROR]`) | The Slack library's own line for a persona's Web API client: a Slack response warning, a rate-limit wait, or a failed request. URLs show as `<redacted-url>` and token-like text as `<redacted-token>`. Nothing to do unless it repeats. |
 | `[slack] Session connected: persona "<name>" (key=<key>) cwd="<path>"` | The persona's instance registered: it's being served. |
-| `[slack] No live session for persona "<name>" (key=<key>) chat_id=<id> — dropping message` | The persona's instance has no live MCP session (the persona is up but its instance isn't registered, or the persona isn't up while its Slack connection still receives, as for [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)), so a message for it is lost: not delivered, not saved and not replayed later. Nothing else is posted in `<id>`, the conversation it came from (the notice below lands there only when `<id>` is the destination), and it gets no ack reaction. The persona posts one lost-message notice to its destination: `Persona "<name>" (key=<key>): :warning: *Message lost* — a message from <sender> …`, naming the sender (display name, else user ID; for a bot or webhook post, its name or bot ID) and ending in a `Recovery:` state, never the message text. `not up`: the persona isn't up, so no restart was started; its instance is launched once the persona recovers: fix its cause (its class line), then resend. `restarting` and `starting now`: the instance is being restarted; resend once it's back. `auto-restart disabled` and `restart limit reached`: the notice says to restart the server to recover. If the notice doesn't arrive, look for a [`persona-destination-failed`](#persona-destination-failed) line. |
+| `[slack] No live session for persona "<name>" (key=<key>) chat_id=<id> — dropping message` | The persona's instance has no live MCP session (the persona is up but its instance isn't registered, or the persona stopped being up while the message was being handled), so a message for it is lost: not delivered, not saved and not replayed later. Nothing else is posted in `<id>`, the conversation it came from (the notice below lands there only when `<id>` is the destination), and it gets no ack reaction. The persona posts one lost-message notice to its destination: `Persona "<name>" (key=<key>): :warning: *Message lost* — a message from <sender> …`, naming the sender (display name, else user ID; for a bot or webhook post, its name or bot ID) and ending in a `Recovery:` state, never the message text. `not up`: the persona stopped being up (broken or retrying) while the message was being handled, so no restart was started; its instance is launched once the persona recovers: fix its cause (its class line), then resend. A persona that isn't up receives nothing, so this state appears only when the persona stops being up after its connection received a message and before the session lookup (for example Slack refuses a Web API call for its bot token), or when the old half of a persona being torn down by a destructive change receives a message just before its connection stops. `restarting` and `starting now`: the instance is being restarted; resend once it's back. `auto-restart disabled` and `restart limit reached`: the notice says to restart the server to recover. If the notice doesn't arrive, look for a [`persona-destination-failed`](#persona-destination-failed) line. |
 | `[slack] DROP: no _GET_stream for persona "<name>" (key=<key>) chat_id=<id> cwd="<path>" mcpSessionId=<id> — message will not reach the bot; triggering recovery` | The instance's session is registered and looks connected, but its message stream is gone (the `Dispatching to persona …` line just before it has `hasGetStream=false`). The message is lost exactly as for `No live session` above: the same lost-message notice at the destination, nothing else in the source conversation. |
 | `[slack] persona-routing: user-name lookup for persona "<name>" (key=<key>) failed, using the user ID: …` | The sender's display name couldn't be looked up through the persona's Slack client. The message is handled as usual, with the sender named by user ID (in the delivered message, or in a lost-message notice). Nothing to do unless it repeats; then check the persona's app and the host's Slack connectivity. |
 | `[slack] persona-routing: lost-message notice for persona "<name>" (key=<key>) failed: …` | An internal error raising a lost-message notice: the message was lost and its recovery still ran, but no notice reaches the destination. Report it as a bug, with the persona's lines around it. |
@@ -1243,8 +1277,8 @@ edit, confirm it (see [Confirming a pending change](#confirming-a-pending-change
 Messages about one persona start `personas[<i>] "<name>" (key=<key>): `, or
 just `personas[<i>]: ` when the name itself is the problem. A malformed value
 (a bad channel ID, `dm.contact` or `permission_prompts`) is never echoed, and
-no message shows a token. Messages do quote persona names and keys, channel
-IDs, the configuration file's path and, in the duplicate-path rules, the
+no message shows a `bot_token` or `app_token` value. Messages do quote
+persona names (as written) and keys, channel IDs, the configuration file's path and, in the duplicate-path rules, the
 persona paths. An unknown key's name is quoted only when it is a plain setting
 name (letters and underscores, up to 48 characters); any other unknown key is
 counted instead, since it could be a pasted token. A name with a digit, such
@@ -1271,8 +1305,7 @@ as `channels2`, is therefore not shown. After a fix, start the server again.
 |---|---|---|
 | `personas[<i>] must be a JSON object, got <type>.` | An array element isn't an object. | Make it a persona object. |
 | `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, `… in channels[<j>]: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in the README. |
-| `name is required.` / `name must be a non-empty string.` | Missing or blank name. | Give the persona a name. |
-| `name looks like a Slack token. A persona's name appears in logs, previews and Slack messages, so it must not be a secret; choose another name.` | The name contains something shaped like a Slack token. The message names only `personas[<i>]`, never the name or its key. | Choose another name. |
+| `name is required.` / `name must be a non-empty string.` | Missing or blank name. Any other name is accepted: there is no format rule. | Give the persona a name. |
 | `credentials_file is required.` / `working_directory is required.` | Missing path. | Add it. |
 | `<setting> must be an absolute path, "~" or a path starting with "~/".` | `credentials_file`, `working_directory` or `claude_config_dir` is relative (or not a string). | Use an absolute path or `~/…`. |
 | `stop_hook_bootstrap must be a boolean.` / `dm.enabled must be a boolean.` | Wrong type. | Use `true` or `false`. |
@@ -1449,12 +1482,12 @@ settings.
 | `DESTRUCTIVE: persona "<name>" (key=<key>) is removed: its live session will be destroyed (its instance is torn down).` | The persona is gone from `config.json`. Renaming a persona changes its key, so a rename shows as this line for the old name plus an `is added` line for the new one. |
 | `DESTRUCTIVE: persona "<name>" (key=<key>) working_directory changed to "<path>": its live session will be destroyed, then it is brought up fresh.` | Its `credentials_file` or `working_directory` (compared by real path) changed, or its `name` changed without changing its key (`name changed`). Several are joined by ` and `, e.g. `credentials_file changed to "<path>" and working_directory changed to "<path>"`. At the confirmation the persona is torn down and brought up fresh: the instance is replaced and loses its session history. |
 | `persona "<name>" (key=<key>) is added: it will be brought up and launched.` | A new persona. |
-| `persona "<name>" (key=<key>) is added but cannot come up: <cause>; <cause>.` | A new persona whose bring-up would fail now. The causes are the credentials and working-directory cause texts under [Persona diagnostic classes](#persona-diagnostic-classes) (for example `credentials file does not exist`, `credentials file is invalid: …`, `working directory does not exist`). Fix them before the change is applied. |
+| `persona "<name>" (key=<key>) is added but cannot come up: <cause>; <cause>.` | A new persona whose bring-up would fail now. The causes, in this order, are the credentials and working-directory cause texts under [Persona diagnostic classes](#persona-diagnostic-classes) (for example `credentials file does not exist`, `credentials file is invalid: …`, `working directory does not exist`), then `claude_config_dir cannot be resolved to a real path (<errno>)`, or `(<errno>: a symlink on its path points to nothing)` for a dangling symlink (see [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)). Every check runs, so one cause never hides another. A `claude_config_dir` not created yet under an existing parent is not listed. Fix them before the change is applied. |
 | `persona "<name>" (key=<key>): <settings> changed: applied in place immediately, instance kept.` | `<settings>` lists one or more of `channels` (a channel added or removed), `delivery` (a kept channel's mode), `permission_prompts`, `dm.enabled`, `dm.contact`. Reordering channels isn't a change. |
 | `…: stop_hook_bootstrap changed: takes effect at its next launch, instance kept.` | The persona's own `stop_hook_bootstrap` changed. The running instance doesn't see it until it is launched again. |
 | `…: claude_config_dir changed: takes effect at its next launch, which starts fresh (the conversation is not resumed), instance kept until then.` | The persona's own `claude_config_dir` changed (by real path). The running instance is kept; its next launch uses the new directory and starts a new conversation. With both settings changed, the line reads `claude_config_dir, stop_hook_bootstrap changed:` with this effect. |
-| `…: credentials file "<path>" changed: a new connection opens, then the old one closes, instance kept.` | The credentials file's content changed at the same path, and the persona is up, or held for its `claude_config_dir` with a working connection ([`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable); it stays held after the reconnect). The line names the persona and the path, never a token. |
-| `…: credentials file "<path>" changed: it has no connection yet, so it retries with the new content, instance kept.` | The same, for a persona still retrying its bring-up (Slack unreachable, or its working directory unusable). |
+| `…: credentials file "<path>" changed: a new connection opens, then the old one closes, instance kept.` | The credentials file's content changed at the same path, and the persona is up. The line names the persona and the path, never a token. |
+| `…: credentials file "<path>" changed: it has no connection yet, so it retries with the new content, instance kept.` | The same, for a persona still retrying its bring-up (Slack unreachable, its working directory unusable, or held for its `claude_config_dir`, see [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)). |
 | `…: credentials file "<path>" changed: it is broken by its credentials now, so it will be brought up.` | The same, for a persona that is broken by its credentials: its credentials file is missing, unreadable or invalid, or Slack refused its tokens ([`persona-credentials-refused`](#persona-credentials-refused)). |
 | `…: credentials file "<path>" changed, but it cannot be used (<cause>): the current connection is kept, instance kept.` | The new content is missing, unreadable or invalid; `<cause>` is the credentials cause text, for example `credentials file does not exist` (never file content). The persona is up and keeps its current connection. Confirming it changes nothing and logs [`persona-credentials-change-failed`](#persona-credentials-change-failed). A restart reads the file as it stands, so the persona would then be `broken`: fix the file. |
 | `…: credentials file "<path>" changed, but it cannot be used (<cause>): it keeps retrying with its current content, instance kept.` | The same bad content, for a persona still retrying its bring-up. |
@@ -1573,6 +1606,11 @@ What changes at once, with no restart:
   preview's `DESTRUCTIVE: … changed to "<path>" …` lines. The persona is torn
   down and brought up fresh from its new entry: its instance, agent-director
   row and conversation are destroyed, and the new credentials file is read.
+  If the teardown's agent-director delete fails and neither the working
+  directory nor the config directory changed (for example a `credentials_file`
+  path change alone), the old row can be resumed instead; after a
+  `working_directory` change the row is replaced (the `… delete of cscb_<key>
+  failed` row there).
   See [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
 - **A kept persona's routing settings**, the preview's `… changed: applied in
   place immediately, instance kept` lines: `channels`, a channel's
@@ -2095,7 +2133,7 @@ Read the row's state with the persona's server-log lines:
 | `ended`, `missing`, or no row | The persona is up | The instance is dead. Restart and the health check relaunch it; look for `Scheduling restart for persona=<key>` and `Relaunching session`. |
 | `ended`, `missing`, or no row | The persona is down | Nothing to serve; it's launched once the persona comes up. |
 | No row | `persona teardown of … complete` | The persona was removed by a confirmed change; its instance was destroyed. Expected. |
-| A row | `persona teardown of …: agent-director delete of cscb_<key> failed` | The teardown couldn't delete it. For a removed persona, the next server start removes it; for a destructively modified one, its bring-up replaces or, after a `credentials_file` path change alone, may resume it. |
+| A row | `persona teardown of …: agent-director delete of cscb_<key> failed` | The teardown couldn't delete it. For a removed persona, the next server start removes it; for a destructively modified one, its bring-up replaces it, or may resume it when neither its working directory nor its config directory changed. |
 
 `tmux has-session -t slack_bot_<key>` confirms whether the instance's tmux
 session exists.

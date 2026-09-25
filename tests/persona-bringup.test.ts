@@ -27,18 +27,30 @@
  *     rejected, an abandoned and a refused reopen, with the real event router,
  *     flush listener and bring-up controller wired to the manager (the E2
  *     carry);
- *   - bug b.g57: a launch that finds A's claude_config_dir unresolvable (an
- *     injected EIO, or a symlink pointing to nothing) makes no agent-director
- *     call and hands A to the controller's hold, wired as server.ts wires it:
- *     A is retrying and not up, re-checked on 5 s doubling to 300 s with no
- *     cap, and once the directory resolves one cleared line, then one launch
- *     that resumes A's row; `cancel` leaves no timer; B is untouched. A
- *     confirmed credentials change meanwhile goes by A's Slack side
- *     (`slackSideOutcome`): with its connection working, A is reconnected
- *     (the new connection opens, then the old one closes) and stays held; a
- *     refused new file (at once, or on the reconnect's retry) keeps the old
- *     connection with one `persona-credentials-change-failed` line; A also
- *     retrying for Slack takes the new tokens on its Slack retry instead.
+ *   - bug b.g57 (Task 0 B3: the directory-broken shape): a persona whose
+ *     claude_config_dir is unresolvable (an injected EIO, or a symlink
+ *     pointing to nothing) when its bring-up, or a directory retry, reaches
+ *     the Slack step never connects; a launch that finds it unresolvable
+ *     later makes no agent-director call and hands A to the controller's
+ *     hold, wired as server.ts wires it, which closes A's connection (the
+ *     manager's `stop`, once) and drops its MCP session once, keeping the
+ *     row. A is retrying, re-checked on 5 s doubling to 300 s with no cap;
+ *     once the directory resolves, one cleared line, then Slack with the held
+ *     credentials, then one launch that resumes A's row (after the manager's
+ *     `up` when Slack is unreachable then); the ladder's race fallback keeps
+ *     the row; `cancel` leaves no timer; B is untouched. A confirmed
+ *     credentials change during the hold opens nothing and A returns on the
+ *     new tokens; a hold that starts during a change's reconnect ends that
+ *     reconnect, unless Slack had refused A's own connection first (then it
+ *     is skipped, broken, the old content held); a hold of a persona Slack
+ *     had refused keeps it broken. A notice raised during the hold is held
+ *     and posted once after the reconnect, through A's client, while B keeps
+ *     delivering; the hold ends an open lost episode with its cleared line;
+ *     a Slack launch queued behind the operation that holds A launches
+ *     nothing, and the recovery's own launch runs once.
+ *
+ * The controller's claude_config_dir check defaults to `checkLaunchConfigDir`
+ * over the stub spawn home (`<dir>/home`), so no case reads the OS home.
  *
  * Each bring-up outcome by cause (credentials missing, unreadable, invalid or
  * refused; directory missing or unusable; Slack unreachable), both causes at
@@ -65,20 +77,23 @@ import { getClient } from '../src/agent-director-client.ts'
 import { _resetOutageState, initOutageState } from '../src/outage-state.ts'
 import { DEFAULT_WORKING_DIRECTORY_FS, type PersonaBringUpFs } from '../src/persona-bringup.ts'
 import {
+  createNotUpSessionDropper,
   createPersonaBringUpController,
   type PersonaBringUpController,
   type PersonaBringUpControllerDeps,
   type PersonaBringUpState,
   type CredentialsSwap,
-  type PersonaCredentialsChangeResult,
 } from '../src/persona-bringup-controller.ts'
 import type { PersonaConnectionManager } from '../src/persona-connections.ts'
 import { DEFAULT_CREDENTIALS_FS, credentialsDigest, readCredentialsFile } from '../src/persona-credentials.ts'
 import {
+  PERSONA_CONNECTION_LOST,
+  PERSONA_CONNECTION_RESTORED,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
   PERSONA_CREDENTIALS_REFUSED,
   formatCredentialsChangeFailed,
 } from '../src/persona-diagnostics.ts'
+import { createPersonaSerializer } from '../src/persona-serializer.ts'
 import { createPersonaEventRouter } from '../src/persona-event-router.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { createPersonaNotifier, formatPersonaNotice, type PersonaNotifier } from '../src/persona-notifier.ts'
@@ -110,8 +125,10 @@ import {
   APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
   LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
   assertNoLeak,
   fakeToken,
+  sentinelInMessage,
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
@@ -206,8 +223,14 @@ interface HarnessOptions {
   bringUp?: PersonaConnectionManager['bringUp']
   /** Each persona's claude_config_dir (none by default: both use `<home>/.claude`). */
   claudeConfigDirs?: Record<'a' | 'b', string>
-  /** Passed to the controller as is. */
+  /**
+   * Passed to the controller as is. Default: `checkLaunchConfigDir`, which
+   * resolves against the spawn home `installStubSpawnPath` set (this test's
+   * own `<dir>/home`), never the OS home's `.claude`.
+   */
   checkConfigDir?: PersonaBringUpControllerDeps['checkConfigDir']
+  /** Passed to the controller as is (none by default: each operation runs at once). */
+  serialize?: PersonaBringUpControllerDeps['serialize']
   /** Passed to the controller as is. */
   onLeftUp?: PersonaBringUpControllerDeps['onLeftUp']
   /** Passed to the controller as is (none by default: every persona counts as applied). */
@@ -226,6 +249,8 @@ interface Harness {
   launches: LaunchRecord[]
   /** Keys the controller launched after a retry. */
   retryLaunches: string[]
+  /** Keys the controller closed the connection of (`connections.stop`), in call order; each also appends `stop:<key>` to `order`. */
+  stops: string[]
   /** Credentials file reads, by key. */
   reads: Map<string, number>
   /** Keys whose credentials file must never be read: a read fails the bring-up instead. */
@@ -262,6 +287,7 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
   managers.push(manager)
   const launches: LaunchRecord[] = []
   const retryLaunches: string[] = []
+  const stops: string[] = []
   const reads = new Map<string, number>()
   const forbidReads = new Set<string>()
   const fsOverride: Partial<PersonaBringUpFs> = {}
@@ -285,7 +311,16 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
   }
 
   const controller = createPersonaBringUpController({
-    connections: { bringUp: opts.bringUp ?? conn.connections.bringUp, status: (key) => manager.status(key) },
+    connections: {
+      bringUp: opts.bringUp ?? conn.connections.bringUp,
+      status: (key) => manager.status(key),
+      // A recording stand-in for the manager's `stop`, which it then runs with the same arguments.
+      stop: (key, endReason) => {
+        stops.push(key)
+        order.push(`stop:${key}`)
+        return manager.stop(key, endReason)
+      },
+    },
     dryRun: false,
     log: (line) => void lines.push(line),
     clock: conn.clock,
@@ -315,7 +350,8 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
       retryLaunchesInFlight.push(launched)
       return launched
     },
-    ...(opts.checkConfigDir === undefined ? {} : { checkConfigDir: opts.checkConfigDir }),
+    checkConfigDir: opts.checkConfigDir ?? checkLaunchConfigDir,
+    ...(opts.serialize === undefined ? {} : { serialize: opts.serialize }),
     ...(opts.onLeftUp === undefined ? {} : { onLeftUp: opts.onLeftUp }),
     ...(opts.appliedPersonas === undefined ? {} : { appliedPersonas: opts.appliedPersonas }),
   })
@@ -329,6 +365,7 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     order,
     launches,
     retryLaunches,
+    stops,
     reads,
     forbidReads,
     fsOverride,
@@ -389,7 +426,16 @@ describe('start pass: SR-6.1 order', () => {
 
 describe('bring-up controller: a Slack step that throws', () => {
   test('A is broken with class error and one token-free line naming it; nothing is retried or launched', async () => {
-    const h = makeHarness({ bringUp: async () => { throw new Error(`manager exploded ${LEAK_SENTINEL}`) } })
+    // The marker rides in the message the way a real leak would (inside a
+    // token and a Socket Mode ticket URL), and bare in a property no line may read.
+    const h = makeHarness({
+      bringUp: async () => {
+        throw Object.assign(
+          new Error(`manager exploded (${sentinelInMessage('thrown')})`),
+          { detail: LEAK_SENTINEL },
+        )
+      },
+    })
 
     const summary = await h.controller.bringUp(a, cfg.personas)
 
@@ -399,9 +445,10 @@ describe('bring-up controller: a Slack step that throws', () => {
     })
     expect(h.controller.isUp(a.key)).toBe(false)
     const ref = renderPersonaRef(a.name, a.key)
-    expect(h.lines.filter((l) => l.includes('Slack bring-up threw'))).toEqual([
-      expect.stringContaining(`[slack] persona ${ref} not brought up: Slack bring-up threw: `),
-    ])
+    const threw = h.lines.filter((l) => l.includes('Slack bring-up threw'))
+    expect(threw).toEqual([expect.stringContaining(`[slack] persona ${ref} not brought up: Slack bring-up threw: `)])
+    // It names the error with its message, redacted; the leak check below proves nothing else of it is logged.
+    expect(threw[0]).toContain(`Error message="manager exploded (${REDACTED_SENTINEL_TAIL})"`)
     expect(h.conn.clock.pendingCount()).toBe(0)
     await h.conn.clock.advance(3_600_000)
     expect(h.retryLaunches).toEqual([])
@@ -579,10 +626,11 @@ describe('end to end: A\'s connection trouble makes no agent-director call', () 
 
 // ---------------------------------------------------------------------------
 // Bug b.g57: a claude_config_dir that cannot be resolved holds the persona
-// retrying, its row untouched, until it resolves
+// retrying with no Slack connection, its row untouched, until it resolves
+// (Task 0 B3: the directory-broken shape, b.av2 SR-6.4)
 // ---------------------------------------------------------------------------
 
-describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', () => {
+describe('b.g57: an unresolvable claude_config_dir holds the persona retrying with its Slack connection closed', () => {
   const CONFIG_DIR_CLASS = 'persona-config-dir-unresolvable'
   const DANGLING = 'ENOENT: a symlink on its path points to nothing'
 
@@ -596,6 +644,8 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
   let aResolutions: number
   /** Every `onLeftUp` call. */
   let leftUp: Array<{ key: string; state: PersonaBringUpState }>
+  /** Keys whose registered MCP session the production dropper (wired to `onLeftUp`) dropped. */
+  let dropped: string[]
   /** Every harness this block built, for the afterEach timer check. */
   let harnesses: Harness[]
 
@@ -608,9 +658,11 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
     failing = new Set()
     aResolutions = 0
     leftUp = []
+    dropped = []
     harnesses = []
     // The launch path's resolver (the pre-launch check, the spawn label, the
-    // ladder's comparison) and, through checkLaunchConfigDir, the re-check.
+    // ladder's comparison) and, through checkLaunchConfigDir, the controller's
+    // check before Slack and its re-check.
     _setConfigDirFs({
       realpath: (path) => {
         if (path === aDir) aResolutions++
@@ -630,37 +682,127 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
     for (const h of harnesses) expect(h.conn.clock.pendingCount()).toBe(0)
   })
 
-  /** The harness with A's and B's own config dirs, wired as server.ts wires the hold. */
-  function makeConfigDirHarness(
-    slack?: HarnessOptions['slack'],
-    appliedPersonas?: HarnessOptions['appliedPersonas'],
-  ): Harness {
+  interface ConfigDirHarnessOptions {
+    slack?: HarnessOptions['slack']
+    appliedPersonas?: HarnessOptions['appliedPersonas']
+    serialize?: HarnessOptions['serialize']
+  }
+
+  /** What `connections.bringUp` saw: the persona and how many lines were logged before it. */
+  interface SlackStepRecord {
+    key: string
+    linesBefore: number
+  }
+
+  /**
+   * The harness with A's and B's own config dirs, wired as server.ts wires the
+   * hold: the session manager's hook is the controller's `holdForConfigDir`,
+   * and `onLeftUp` runs the production session dropper over a recording
+   * `drop`. `slackSteps` records each Slack step (step 3) as it starts.
+   */
+  function makeConfigDirHarness(opts: ConfigDirHarnessOptions = {}): Harness & { slackSteps: SlackStepRecord[] } {
+    const slackSteps: SlackStepRecord[] = []
+    const dropSession = createNotUpSessionDropper({
+      drop: async (key) => {
+        dropped.push(key)
+        return true
+      },
+      log: (line) => void consoleLines.push(line),
+    })
+    let late: Harness | undefined
     const h = makeHarness({
-      slack,
+      slack: opts.slack,
       claudeConfigDirs: { a: aDir, b: join(dir, 'claude-b') },
       checkConfigDir: checkLaunchConfigDir,
-      onLeftUp: (persona, state) => void leftUp.push({ key: persona.key, state }),
-      appliedPersonas,
+      onLeftUp: (persona, state) => {
+        leftUp.push({ key: persona.key, state })
+        return dropSession(persona, state)
+      },
+      appliedPersonas: opts.appliedPersonas,
+      serialize: opts.serialize,
+      bringUp: (persona, tokens) => {
+        slackSteps.push({ key: persona.key, linesBefore: late!.lines.length })
+        return late!.conn.connections.bringUp(persona, tokens)
+      },
     })
+    late = h
     setConfigDirUnresolvableHook(h.controller.holdForConfigDir)
     harnesses.push(h)
-    return h
+    return Object.assign(h, { slackSteps })
   }
 
   // The one full pin of this class's cause sentence; other suites match its
   // class, persona and path prefix and its reason only.
   const unresolvableCause = (reason: string) =>
-    `claude_config_dir cannot be resolved to a real path (${reason}); its session is kept, and its launch waits until it resolves`
+    `claude_config_dir cannot be resolved to a real path (${reason}); its Slack connection is closed and its launch waits until it resolves`
   const configDirCause = (reason: string) => ({ step: 'claude-config-dir' as const, class: CONFIG_DIR_CLASS, cause: unresolvableCause(reason) })
+  const heldState = (reason: string): PersonaBringUpState => ({ outcome: 'retrying', causes: { configDir: configDirCause(reason) } })
   const aPrefix = () => `[slack] ${CONFIG_DIR_CLASS}: personas[${a.index}] ${renderPersonaRef(a.name, a.key)} path=${JSON.stringify(aDir)}: `
   const unresolvableLine = (reason: string) => `${aPrefix()}${unresolvableCause(reason)}`
-  const clearedLine = () => `${aPrefix()}cleared: claude_config_dir resolves to a real path again; continuing the launch`
+  const clearedLine = () => `${aPrefix()}cleared: claude_config_dir resolves to a real path again; continuing the bring-up`
   const upLine = () => `[slack] persona ${renderPersonaRef(a.name, a.key)}: up after its claude_config_dir resolved — launching`
   /** Every line of the class, from the controller and the launch path alike. */
   const classLines = (h: Harness) => [...h.lines, ...consoleLines].filter((l) => l.includes(CONFIG_DIR_CLASS))
   /** Whether any agent-director call named A's instance. */
   const adCalledForA = () => JSON.stringify(ad.calls).includes(JSON.stringify(personaInstanceId(a.key)))
   const upPredicate = (h: Harness) => createPersonaUpPredicate(h.conn.manager, h.controller)
+  /** Whether any socket of A's (any credential set) is open. */
+  const aSocketOpen = (h: Harness, ...more: StubSlack[]) =>
+    [h.conn.slack.persona(a.key), ...more].some((stub) => stub.sockets.some((s) => s.connected))
+  /** A's socket activity since `since`, as [event, credential set]. */
+  const socketActivity = (h: Harness, since: number) =>
+    h.conn.slack.activityOf(a.key).slice(since).filter((e) => e.kind === 'socket').map((e) => [e.event, e.credentials])
+  const identityOf = (stub: StubSlack) => ({ botUserId: stub.identity.botUserId, botId: stub.identity.botId })
+  const changeFailedLines = (h: Harness) => h.lines.filter((l) => l.includes(`${PERSONA_CREDENTIALS_CHANGE_FAILED}:`))
+  const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+  /**
+   * Rotate A's credentials file in place to a new fake pair registered with
+   * the stub factory under `label` (its own stub, identity and scripts).
+   * Returns that set's stub and the new file's digest.
+   */
+  function rotateA(h: Harness, label: string, opts: StubSlackOptions = {}): { stub: StubSlack; digest: string } {
+    const botToken = fakeToken(BOT_TOKEN_PREFIX, `${a.key}-${label}-bot`)
+    const appToken = fakeToken(APP_TOKEN_PREFIX, `${a.key}-${label}-app`)
+    const stub = h.conn.slack.addCredentials(a.key, label, { botToken, appToken }, { leakMarker: LEAK_SENTINEL, ...opts })
+    writeCredentialsFile(dir, relative(dir, a.credentials_file), { bot_token: botToken, app_token: appToken })
+    return { stub, digest: credentialsDigest(readCredentialsFile(a.credentials_file)) }
+  }
+
+  /** The controller's confirmed change of A against the applied set, over the real manager, recording its hooks. */
+  function changeA(h: Harness, hookCalls: string[] = [], swaps: CredentialsSwap[] = []) {
+    return h.controller.changeCredentials(a, cfg.personas, h.conn.manager, {
+      beforeSwap: () => void hookCalls.push('beforeSwap'),
+      onSwapped: (swap) => void swaps.push(swap),
+    })
+  }
+
+  /** Record, per spawn of A, the identity A's connection has at that moment. */
+  function recordIdentityAtLaunch(h: Harness): unknown[] {
+    const seen: unknown[] = []
+    const spawn = ad.client.spawn
+    ad.client.spawn = async (params) => {
+      if (params.claude_instance_id === personaInstanceId(a.key)) seen.push(h.conn.manager.identity(a.key))
+      return spawn(params)
+    }
+    return seen
+  }
+
+  /** A's row, launched at the start, has ended; the next spawn of A collides with it and `get` returns it. */
+  function endARow(onGet: () => void = () => {}): void {
+    const row = cannedGetResult({ state: 'ended' }, a, join(dir, 'home'))
+    const spawn = ad.client.spawn
+    ad.client.spawn = async (params) => {
+      const spawned = await spawn(params)
+      if (params.claude_instance_id === personaInstanceId(a.key)) throw errInstanceIdCollision()
+      return spawned
+    }
+    ad.client.get = async (params) => {
+      ad.calls.getCalls.push(params)
+      onGet()
+      return row
+    }
+  }
 
   /** Start pass (A and B launched), then A's directory drops and a restart relaunches A. Returns the call count after the start. */
   async function startThenHoldA(h: Harness): Promise<number> {
@@ -675,31 +817,163 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
     return afterStart
   }
 
-  test('b.g57: hold while up: the relaunch makes no agent-director call; A is retrying with the configDir cause and not up, onLeftUp told once; one line; B unchanged', async () => {
+  // -------------------------------------------------------------------------
+  // A hold that starts while A is up
+  // -------------------------------------------------------------------------
+
+  test('b.g57: hold while up: no agent-director call; A\'s connection is closed (stop, once) and its MCP session dropped once; its row is kept; A is retrying with the configDir cause; one line; B unchanged', async () => {
     const h = makeConfigDirHarness()
 
     const afterStart = await startThenHoldA(h)
 
+    // The row and instance are kept: nothing reached agent-director.
     expect(ad.callCount()).toBe(afterStart)
-    const held: PersonaBringUpState = { outcome: 'retrying', causes: { configDir: configDirCause('EIO') } }
-    expect(h.controller.state(a.key)).toEqual(held)
+    // The connection is closed: the manager's stop, for A only, and no socket of A's open.
+    expect(h.stops).toEqual([a.key])
+    expect(h.conn.manager.status(a.key)).toBeUndefined()
+    expect(aSocketOpen(h)).toBe(false)
+    expect(h.conn.clientFor(a.key)).toBeUndefined()
+    // Left up once: its MCP session dropped once.
+    expect(h.controller.state(a.key)).toEqual(heldState('EIO'))
     expect(h.controller.isUp(a.key)).toBe(false)
     expect(upPredicate(h)(a.key)).toBe(false)
-    expect(leftUp).toEqual([{ key: a.key, state: held }])
+    expect(leftUp).toEqual([{ key: a.key, state: heldState('EIO') }])
+    expect(dropped).toEqual([a.key])
+    expect(classLines(h)).toEqual([unresolvableLine('EIO')])
+    // Its own re-check timer, at the first step of the schedule; nothing else pending (no Slack retry).
+    expect(h.conn.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
+    // B: still up and not stopped (its delivery during the hold is pinned in the notices case below).
     expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
     expect(upPredicate(h)(b.key)).toBe(true)
-    expect(classLines(h)).toEqual([unresolvableLine('EIO')])
-    // Its own re-check timer, at the first step of the schedule; nothing else pending.
+    expect(h.conn.manager.status(b.key)?.state).toBe('up')
+    assertNoLeak(h.captured({ leftUp, dropped }))
+  })
+
+  test('b.g57: notices during the hold: a notice for A raised while held posts nothing; after the recovery reconnects A it is posted exactly once, through A\'s client to A\'s destination, and none on B\'s; an event on B during the hold arrives tagged with B', async () => {
+    // The server's wiring: the real notifier, event router and flush listener, with the controller as the status listener.
+    const received: Array<{ key: string; text: unknown }> = []
+    const notifierLines: string[] = []
+    const h = makeConfigDirHarness()
+    const clientFor = createPersonaClientLookup(h.conn.manager, () => cfg)
+    const notifier = createPersonaNotifier({
+      getPersona: (key) => cfg.personas.find((p) => p.key === key),
+      clientFor,
+      isDryRun: () => false,
+      log: (line) => void notifierLines.push(line),
+    })
+    h.conn.onEvent = createPersonaEventRouter({
+      routing: {
+        receive: async (event, ack, receiver) => {
+          await ack()
+          received.push({ key: receiver as string, text: (event as { text?: unknown } | undefined)?.text })
+        },
+      },
+      clientFor,
+      getPersona: (k) => cfg.personas.find((p) => p.key === k),
+      log: (line) => void consoleLines.push(line),
+    })
+    h.conn.onStatus = composePersonaStatusListeners(
+      createPersonaUpFlushListener(notifier),
+      (key, status) => h.controller.onConnectionStatus(key, status),
+    )
+    const postsOf = (key: string) => h.conn.slack.persona(key).calls.postMessage
+    await startThenHoldA(h)
+    expect(h.stops).toEqual([a.key])
+    const cp = { aPosts: postsOf(a.key).length, bPosts: postsOf(b.key).length }
+
+    await notifier.notify(a.key, 'a notice raised during the hold')
+
+    // Held: A has no validated client while its connection is closed.
+    expect(postsOf(a.key)).toHaveLength(cp.aPosts)
+    // B still delivers during A's hold, tagged with B through the real router.
+    await h.conn.slack.persona(b.key).socket.deliver(makeChannelMessage({ text: 'for B during the hold' }))
+    expect(received).toEqual([{ key: b.key, text: 'for B during the hold' }])
+    // A failed re-check at 5 s posts nothing either.
+    await h.conn.clock.runNext()
+    expect(h.controller.state(a.key)).toEqual(heldState('EIO'))
+    expect(postsOf(a.key)).toHaveLength(cp.aPosts)
+
+    failing.delete(aDir)
+    await h.conn.clock.runNext()
+    await Promise.all(retryLaunchesInFlight)
+
+    // After the reconnect: once, on A's own client, to A's permission_prompts.
+    expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+    expect(h.retryLaunches).toEqual([a.key])
+    expect(postsOf(a.key).slice(cp.aPosts)).toEqual([
+      { channel: a.permission_prompts, text: formatPersonaNotice(a, 'a notice raised during the hold') },
+    ])
+    expect(postsOf(b.key)).toHaveLength(cp.bPosts)
+    // A later reconnect of A posts nothing again.
+    h.conn.slack.persona(a.key).socket.drop()
+    await h.conn.clock.flush()
+    expect(h.conn.manager.status(a.key)?.state).toBe('up')
+    expect(postsOf(a.key)).toHaveLength(cp.aPosts + 1)
+    expect(postsOf(b.key)).toHaveLength(cp.bPosts)
+    expect(received).toEqual([{ key: b.key, text: 'for B during the hold' }])
+    assertNoLeak(h.captured({ leftUp, notifierLines, received, posts: [postsOf(a.key), postsOf(b.key)] }))
+  })
+
+  test('b.g57: a hold while A\'s lost connection is still reopening ends that episode with one cleared line naming the hold; the recovery connects on a fresh episode (no restored line), and a later drop opens and restores a new one', async () => {
+    const h = makeConfigDirHarness()
+    await h.startPass()
+    const ref = renderPersonaRef(a.name, a.key)
+    const lostPrefix = `[slack] ${PERSONA_CONNECTION_LOST}: personas[${a.index}] ${ref} path=${JSON.stringify(a.credentials_file)}: `
+    /** A's Slack episode lines (lost, restored, unreachable, refused), in order. */
+    const episodeLines = () =>
+      h.lines.filter((l) => /^\[slack\] persona-(connection-lost|connection-restored|slack-unreachable|credentials-refused): /.test(l) && l.includes(ref))
+    // A drops; its reopen cannot reach Slack, so its lost line stays open and a reopen retry is due at 5 s.
+    const stubA = h.conn.slack.persona(a.key)
+    stubA.script.connect.push({ kind: 'network' })
+    stubA.socket.drop()
+    await h.conn.clock.advance(0)
+    expect(h.conn.manager.status(a.key)).toMatchObject({ state: 'retrying', phase: 'reopen' })
+    expect(episodeLines()).toEqual([expect.stringMatching(new RegExp(`^${escapeRegExp(lostPrefix)}(?!cleared)`))])
+
+    failing.add(aDir)
+    expect(await launchSession(a.key, cfg)).toBe('skipped')
+
+    const closed = `${lostPrefix}cleared: the persona's Slack connection was closed while its claude_config_dir cannot be resolved`
+    expect(h.stops).toEqual([a.key])
+    expect(episodeLines()).toEqual([episodeLines()[0]!, closed])
+    // Only the re-check is pending: the reopen retry ended with the connection.
     expect(h.conn.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
+
+    failing.delete(aDir)
+    await h.conn.clock.runNext()
+    await Promise.all(retryLaunchesInFlight)
+
+    // The recovery's fresh connection has no episode: no restored or second cleared line.
+    expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+    expect(h.retryLaunches).toEqual([a.key])
+    expect(episodeLines()).toHaveLength(2)
+    expect(episodeLines()[1]).toBe(closed)
+
+    // A later drop is a new episode on the new connection: its lost line, then restored on the reopen.
+    h.conn.slack.persona(a.key).socket.drop()
+    await h.conn.clock.flush()
+    expect(h.conn.manager.status(a.key)?.state).toBe('up')
+    const later = episodeLines().slice(2)
+    expect(later).toHaveLength(2)
+    expect(later[0]!.startsWith(lostPrefix)).toBe(true)
+    expect(later[0]).not.toContain('cleared')
+    expect(later[1]!.startsWith(`[slack] ${PERSONA_CONNECTION_RESTORED}: personas[${a.index}] ${ref} `)).toBe(true)
+    expect(h.retryLaunches).toEqual([a.key])
     assertNoLeak(h.captured({ leftUp }))
   })
 
-  test('b.g57: retry: while unresolvable, A is re-checked on 5 s doubling to 300 s with no cap; nothing is launched, called or logged', async () => {
+  test('b.g57: retry: while unresolvable, A is re-checked on 5 s doubling to 300 s with no cap; nothing connects, launches, is called or logged', async () => {
     const h = makeConfigDirHarness()
     await startThenHoldA(h)
-    const cp = { lines: h.lines.length, console: consoleLines.length, ad: ad.callCount(), resolutions: aResolutions }
+    const cp = {
+      lines: h.lines.length,
+      console: consoleLines.length,
+      ad: ad.callCount(),
+      resolutions: aResolutions,
+      builds: h.conn.slack.buildsOf(a.key).length,
+    }
 
-    // A second restart attempt in the same episode: skipped, no new line, no second timer.
+    // A second restart attempt in the same episode: skipped, no new line, no second timer, no second stop.
     expect(await launchSession(a.key, cfg)).toBe('skipped')
     const delays: number[] = []
     for (let i = 0; i < 15; i++) {
@@ -712,40 +986,54 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
     expect(aResolutions - cp.resolutions).toBe(16)
     // Still waiting after 15 failed re-checks: no cap.
     expect(h.conn.clock.pending().map((t) => t.delayMs)).toEqual([300_000])
-    expect(h.controller.state(a.key)).toEqual({ outcome: 'retrying', causes: { configDir: configDirCause('EIO') } })
+    expect(h.controller.state(a.key)).toEqual(heldState('EIO'))
+    // No Slack step and no client built for A while it is held.
+    expect(h.slackSteps.filter((s) => s.key === a.key)).toHaveLength(1)
+    expect(h.conn.slack.buildsOf(a.key)).toHaveLength(cp.builds)
+    expect(h.stops).toEqual([a.key])
     expect(h.retryLaunches).toEqual([])
     expect(ad.callCount()).toBe(cp.ad)
     expect(h.lines.slice(cp.lines)).toEqual([])
     expect(consoleLines.slice(cp.console)).toEqual([])
     expect(leftUp).toHaveLength(1)
+    expect(dropped).toEqual([a.key])
     expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
     assertNoLeak(h.captured({ leftUp }))
   })
 
-  test('b.g57: recovery: once it resolves, one cleared line, then one launch that resumes A\'s row (no kill, delete or fresh spawn), with no confirmation; A is up again', async () => {
+  test('b.g57: recovery: once it resolves, one cleared line, then Slack with the held credentials (the file is not re-read), then one launch that resumes A\'s row (no kill, delete or fresh spawn); A is up again', async () => {
     const h = makeConfigDirHarness()
     await startThenHoldA(h)
     await h.conn.clock.runNext() // a failed re-check at 5 s
-    // A's row, launched at the start, has ended; its config_dir label is the one
-    // its (resolvable) directory gives. The next spawn of A collides with it.
-    const row = cannedGetResult({ state: 'ended' }, a, join(dir, 'home'))
-    const spawn = ad.client.spawn
-    ad.client.spawn = async (params) => {
-      const spawned = await spawn(params)
-      if (params.claude_instance_id === personaInstanceId(a.key)) throw errInstanceIdCollision()
-      return spawned
+    endARow()
+    // An edit of A's file during the hold that nobody confirmed: the return must not use it.
+    rotateA(h, 'unconfirmed')
+    const cp = {
+      lines: h.lines.length,
+      spawns: ad.calls.spawnCalls.length,
+      order: h.order.length,
+      slackSteps: h.slackSteps.length,
+      bringUpCalls: h.conn.bringUpCalls.length,
+      launches: h.launches.length,
+      reads: h.reads.get(a.key),
     }
-    ad.client.get = async (params) => {
-      ad.calls.getCalls.push(params)
-      return row
-    }
-    const cp = { lines: h.lines.length, spawns: ad.calls.spawnCalls.length }
 
     failing.delete(aDir)
     await h.conn.clock.runNext()
     const launched = await Promise.all(retryLaunchesInFlight)
 
+    // One cleared line, then the Slack step, then one launch, made while A was up on an open socket.
     expect(h.lines.slice(cp.lines)).toEqual([clearedLine(), upLine()])
+    expect(h.slackSteps.slice(cp.slackSteps)).toEqual([{ key: a.key, linesBefore: cp.lines + 1 }])
+    expect(h.order.slice(cp.order)).toEqual([`slack:${a.key}`, `launch:${a.key}`])
+    expect(h.launches.slice(cp.launches)).toEqual([
+      { key: a.key, state: 'up', socketConnected: true, authTests: expect.any(Number) },
+    ])
+    // With the held credentials: the file was not read again, and the tokens are the ones A started with.
+    expect(h.reads.get(a.key)).toBe(cp.reads)
+    expect(h.conn.bringUpCalls.slice(cp.bringUpCalls)).toEqual([{ key: a.key, gotTokens: true, ownTokens: true }])
+    expect(h.conn.manager.identity(a.key)).toEqual(identityOf(h.conn.slack.persona(a.key)))
+    // The launch resumed A's row.
     expect(h.retryLaunches).toEqual([a.key])
     expect(launched).toEqual([{ key: a.key, action: 'resumed' }])
     expect(ad.spawnedIds().slice(cp.spawns)).toEqual([personaInstanceId(a.key)])
@@ -756,25 +1044,105 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
     expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
     expect(upPredicate(h)(a.key)).toBe(true)
     expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
+    expect(h.stops).toEqual([a.key])
     expect(leftUp).toHaveLength(1)
     expect(h.conn.clock.pendingCount()).toBe(0)
     await h.conn.clock.advance(3_600_000)
     expect(h.retryLaunches).toEqual([a.key])
     expect(classLines(h)).toEqual([unresolvableLine('EIO'), clearedLine()])
 
-    // A later drop is a new episode: one new line, its schedule back at 5 s.
+    // A later drop is a new episode: one new line, its connection closed again, its schedule back at 5 s.
     failing.add(aDir)
     expect(await launchSession(a.key, cfg)).toBe('skipped')
     expect(classLines(h)).toEqual([unresolvableLine('EIO'), clearedLine(), unresolvableLine('EIO')])
+    expect(h.stops).toEqual([a.key, a.key])
+    expect(aSocketOpen(h)).toBe(false)
     expect(h.conn.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
     expect(leftUp.map((l) => l.key)).toEqual([a.key, a.key])
+    expect(dropped).toEqual([a.key, a.key])
     assertNoLeak(h.captured({ leftUp, launched }))
   })
 
-  test('b.g57: cancel: cancel(A) during the hold leaves no timer; nothing is re-checked or launched afterwards', async () => {
+  test('b.g57: recovery with Slack unreachable: A is Slack-retrying and nothing is launched; the launch waits for the manager\'s up, then runs once', async () => {
+    const h = makeConfigDirHarness()
+    await startThenHoldA(h)
+    // A's next auth.test (its return) cannot reach Slack; the manager's retry 5 s later succeeds.
+    h.conn.slack.persona(a.key).script.authTest.push({ kind: 'network' })
+    const cp = { order: h.order.length, ad: ad.callCount() }
+
+    failing.delete(aDir)
+    await h.conn.clock.advance(5_000)
+    await Promise.all(retryLaunchesInFlight)
+
+    expect(classLines(h)).toEqual([unresolvableLine('EIO'), clearedLine()])
+    expect(h.order.slice(cp.order)).toEqual([`slack:${a.key}`])
+    expect(h.controller.state(a.key)).toEqual({ outcome: 'retrying', causes: { slack: expect.objectContaining({ step: 'slack' }) } })
+    expect(h.retryLaunches).toEqual([])
+    expect(ad.callCount()).toBe(cp.ad)
+
+    await h.conn.clock.advance(5_000)
+    await Promise.all(retryLaunchesInFlight)
+
+    expect(h.retryLaunches).toEqual([a.key])
+    expect(h.order.slice(cp.order)).toEqual([`slack:${a.key}`, `launch:${a.key}`])
+    expect(h.launches.filter((l) => l.key === a.key).at(-1)).toMatchObject({ state: 'up', socketConnected: true })
+    expect(h.lines.filter((l) => l.startsWith(`[slack] persona ${renderPersonaRef(a.name, a.key)}: up after`))).toEqual([
+      `[slack] persona ${renderPersonaRef(a.name, a.key)}: up after its bring-up retry (Slack) — launching`,
+    ])
+    expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+    await h.conn.clock.advance(3_600_000)
+    expect(h.retryLaunches).toEqual([a.key])
+    expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
+    assertNoLeak(h.captured({ leftUp }))
+  })
+
+  test('b.g57: race fallback: the recovery launch\'s ladder finds the directory unresolvable again: the row is kept (no kill, delete, resume or fresh spawn), A is held again with its new connection closed; once it resolves the same row is resumed', async () => {
+    const h = makeConfigDirHarness()
+    await startThenHoldA(h)
+    // The directory drops again between the re-check and the ladder's comparison of A's row.
+    let dropAtGet = true
+    endARow(() => {
+      if (dropAtGet) failing.add(aDir)
+    })
+    const cp = { spawns: ad.calls.spawnCalls.length }
+
+    failing.delete(aDir)
+    await h.conn.clock.runNext()
+    const [first] = await Promise.all(retryLaunchesInFlight)
+
+    expect(first).toMatchObject({ key: a.key, action: 'deferred' })
+    expect(ad.spawnedIds().slice(cp.spawns)).toEqual([personaInstanceId(a.key)])
+    expect(ad.calls.resumeCalls).toEqual([])
+    expect(ad.calls.killCalls).toEqual([])
+    expect(ad.calls.deleteCalls).toEqual([])
+    // Held again: the connection its return opened is closed, its session dropped again.
+    expect(h.stops).toEqual([a.key, a.key])
+    expect(aSocketOpen(h)).toBe(false)
+    expect(h.controller.state(a.key)).toEqual(heldState('EIO'))
+    expect(classLines(h)).toEqual([unresolvableLine('EIO'), clearedLine(), unresolvableLine('EIO')])
+    expect(leftUp.map((l) => l.key)).toEqual([a.key, a.key])
+    expect(h.conn.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
+
+    dropAtGet = false
+    failing.delete(aDir)
+    await h.conn.clock.runNext()
+    const launched = await Promise.all(retryLaunchesInFlight)
+
+    expect(launched.at(-1)).toEqual({ key: a.key, action: 'resumed' })
+    expect(ad.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(a.key) }])
+    expect(ad.calls.killCalls).toEqual([])
+    expect(ad.calls.deleteCalls).toEqual([])
+    expect(h.retryLaunches).toEqual([a.key, a.key])
+    expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+    expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
+    assertNoLeak(h.captured({ leftUp, launched }))
+  })
+
+  test('b.g57: cancel: cancel(A) during the hold leaves no timer; nothing is re-checked, connected or launched afterwards', async () => {
     const h = makeConfigDirHarness()
     await startThenHoldA(h)
     const resolutions = aResolutions
+    const slackSteps = h.slackSteps.length
 
     h.controller.cancel(a.key)
 
@@ -782,16 +1150,17 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
     failing.delete(aDir)
     await h.conn.clock.advance(3_600_000)
     expect(aResolutions).toBe(resolutions)
+    expect(h.slackSteps).toHaveLength(slackSteps)
     expect(h.retryLaunches).toEqual([])
     expect(classLines(h)).toEqual([unresolvableLine('EIO')])
     assertNoLeak(h.captured({ leftUp }))
   })
 
-  test('b.g57: A held, then dropped from the applied set: its next re-check probes nothing, schedules nothing and ends its retries with one line; A is never launched; B unaffected', async () => {
+  test('b.g57: A held, then dropped from the applied set: its next re-check probes nothing, schedules nothing and ends its retries with one line; A is never connected or launched; B unaffected', async () => {
     let applied: Persona[] | undefined
-    const h = makeConfigDirHarness(undefined, () => applied ?? cfg.personas)
+    const h = makeConfigDirHarness({ appliedPersonas: () => applied ?? cfg.personas })
     await startThenHoldA(h)
-    const cp = { lines: h.lines.length, console: consoleLines.length, ad: ad.callCount(), resolutions: aResolutions }
+    const cp = { lines: h.lines.length, console: consoleLines.length, ad: ad.callCount(), resolutions: aResolutions, slackSteps: h.slackSteps.length }
 
     applied = [b]
     await h.conn.clock.advance(5_000)
@@ -806,6 +1175,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
     failing.delete(aDir)
     await h.conn.clock.advance(3_600_000)
     expect(aResolutions).toBe(cp.resolutions)
+    expect(h.slackSteps).toHaveLength(cp.slackSteps)
     expect(h.retryLaunches).toEqual([])
     expect(ad.callCount()).toBe(cp.ad)
     expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
@@ -813,38 +1183,97 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
     assertNoLeak(h.captured({ leftUp }))
   })
 
-  test('b.g57: the directory resolves while A still retries for Slack: that re-check logs one cleared line and launches nothing; A is launched exactly once when its Slack retry comes up', async () => {
-    // A's first three auth.tests cannot reach Slack: its Slack retries at 5 s and 15 s fail, the one at 35 s comes up.
-    const h = makeConfigDirHarness({ a: { authTest: [{ kind: 'network' }, { kind: 'network' }, { kind: 'network' }] } })
-    await h.startPass()
-    // Held at 1 s, so its re-checks (6 s, 16 s, …) never share an instant with a Slack retry.
+  test('b.g57: hold while A retries its bring-up for Slack: the hold closes it, so no Slack retry runs while held; once the directory resolves A connects and is launched once, through its claude_config_dir return', async () => {
+    // A's first auth.test cannot reach Slack: retrying at the start pass, its retry due at 5 s.
+    const h = makeConfigDirHarness({ slack: { a: { authTest: [{ kind: 'network' }] } } })
+    const started = await h.startPass()
+    expect(started.perPersona.find((p) => p.key === a.key)).toMatchObject({ action: 'not-brought-up', outcome: 'retrying' })
+    // Held at 1 s, so its re-checks (6 s, …) never share an instant with the Slack retry it cancelled.
     await h.conn.clock.advance(1_000)
     failing.add(aDir)
     expect(await launchSession(a.key, cfg)).toBe('skipped')
-    expect(h.controller.state(a.key)).toMatchObject({ outcome: 'retrying', causes: { slack: expect.anything(), configDir: configDirCause('EIO') } })
+    const authTests = h.conn.slack.persona(a.key).calls.authTest.length
+
+    expect(h.stops).toEqual([a.key])
+    expect(h.controller.state(a.key)).toEqual(heldState('EIO'))
+    expect(h.conn.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
+    // Never up: nothing to leave, no session to drop.
+    expect(leftUp).toEqual([])
+    expect(dropped).toEqual([])
+
+    // 5 s: the Slack retry that was due does not run.
+    await h.conn.clock.advance(4_000)
+    expect(h.conn.slack.persona(a.key).calls.authTest).toHaveLength(authTests)
+    expect(adCalledForA()).toBe(false)
 
     failing.delete(aDir)
-    await h.conn.clock.advance(5_000)
+    await h.conn.clock.advance(1_000)
     await Promise.all(retryLaunchesInFlight)
 
     expect(classLines(h)).toEqual([unresolvableLine('EIO'), clearedLine()])
-    expect(h.retryLaunches).toEqual([])
-    expect(adCalledForA()).toBe(false)
-    expect(h.controller.state(a.key)).toEqual({ outcome: 'retrying', causes: { slack: expect.anything() } })
-
-    await h.conn.clock.advance(30_000)
-    await Promise.all(retryLaunchesInFlight)
-
     expect(h.retryLaunches).toEqual([a.key])
     expect(ad.spawnedIds()).toEqual([personaInstanceId(b.key), personaInstanceId(a.key)])
-    expect(h.lines.filter((l) => l.startsWith(`[slack] persona ${renderPersonaRef(a.name, a.key)}: up after`))).toEqual([
-      `[slack] persona ${renderPersonaRef(a.name, a.key)}: up after its bring-up retry (Slack) — launching`,
-    ])
+    expect(h.lines.filter((l) => l.startsWith(`[slack] persona ${renderPersonaRef(a.name, a.key)}: up after`))).toEqual([upLine()])
     expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
     await h.conn.clock.advance(3_600_000)
     expect(h.retryLaunches).toEqual([a.key])
     expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
-    assertNoLeak(h.captured({ leftUp }))
+    assertNoLeak(h.captured({ started, leftUp }))
+  })
+
+  test('b.g57: a Slack launch queued behind an operation that holds A does nothing when its turn comes, though the directory resolved by then: no spawn without a connection; the recovery\'s own launch runs once, after the reconnect', async () => {
+    const serializer = createPersonaSerializer()
+    // A's first auth.test cannot reach Slack: retrying at the start pass, its retry due at 5 s.
+    const h = makeConfigDirHarness({ slack: { a: { authTest: [{ kind: 'network' }] } }, serialize: serializer.run })
+    const started = await h.startPass()
+    expect(started.perPersona.find((p) => p.key === a.key)).toMatchObject({ action: 'not-brought-up', outcome: 'retrying' })
+    // An operation for A (a restart's relaunch) takes A's turn first and waits on a gate.
+    let openGate!: () => void
+    const gate = new Promise<void>((resolve) => (openGate = resolve))
+    const ahead = serializer.run(a.key, async () => {
+      await gate
+      failing.add(aDir)
+      const outcome = await launchSession(a.key, cfg)
+      // The directory is back before the queued launch's turn; the hold's re-check has not run yet.
+      failing.delete(aDir)
+      return outcome
+    })
+
+    // 5 s: A's Slack retry succeeds, so its up queues the controller's launch behind the operation.
+    await h.conn.clock.advance(5_000)
+    expect(h.conn.manager.status(a.key)?.state).toBe('up')
+    expect(h.retryLaunches).toEqual([])
+
+    openGate()
+    expect(await ahead).toBe('skipped')
+    await serializer.whenIdle(a.key)
+    await Promise.all(retryLaunchesInFlight)
+
+    // The queued launch found A held with no connection: nothing launched, nothing reached agent-director.
+    expect(h.stops).toEqual([a.key])
+    expect(aSocketOpen(h)).toBe(false)
+    expect(h.controller.state(a.key)).toEqual(heldState('EIO'))
+    expect(h.retryLaunches).toEqual([])
+    expect(adCalledForA()).toBe(false)
+    expect(h.conn.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
+
+    // The re-check: cleared, reconnected, then its own launch, once.
+    await h.conn.clock.advance(5_000)
+    await serializer.whenIdle(a.key)
+    await Promise.all(retryLaunchesInFlight)
+
+    expect(classLines(h)).toEqual([unresolvableLine('EIO'), clearedLine()])
+    expect(h.retryLaunches).toEqual([a.key])
+    expect(h.launches.filter((l) => l.key === a.key)).toEqual([
+      { key: a.key, state: 'up', socketConnected: true, authTests: expect.any(Number) },
+    ])
+    expect(h.lines.filter((l) => l.startsWith(`[slack] persona ${renderPersonaRef(a.name, a.key)}: up after`))).toEqual([upLine()])
+    expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+    await h.conn.clock.advance(3_600_000)
+    await serializer.whenIdle(a.key)
+    expect(h.retryLaunches).toEqual([a.key])
+    expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
+    assertNoLeak(h.captured({ started, leftUp }))
   })
 
   test.each<[string, (h: Harness) => Promise<void>]>([
@@ -856,7 +1285,7 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
         h.controller.cancel(a.key)
       },
     ],
-  ])('b.g57: holdForConfigDir for A %s returns false and holds nothing (no line, no timer); the launch path then logs the line itself on each attempt', async (_label, arrange) => {
+  ])('b.g57: holdForConfigDir for A %s returns false and holds nothing (no line, no timer, no stop); the launch path then logs the line itself on each attempt', async (_label, arrange) => {
     const h = makeConfigDirHarness()
     await arrange(h)
     failing.add(aDir)
@@ -874,12 +1303,17 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
     expect(consoleLines.slice(cp.console).filter((l) => l.includes(CONFIG_DIR_CLASS))).toEqual([unresolvableLine('EIO'), unresolvableLine('EIO')])
     expect(h.lines.slice(cp.lines)).toEqual([])
     expect(h.conn.clock.pendingCount()).toBe(0)
+    expect(h.stops).toEqual([])
     expect(ad.callCount()).toBe(cp.ad)
     expect(h.controller.state(a.key)).toBeUndefined()
     assertNoLeak(h.captured({ leftUp }))
   })
 
-  test('b.g57: bring-up: A whose claude_config_dir is a symlink pointing to nothing is never launched and ends retrying with this cause; B is launched; A is launched once the drive is back', async () => {
+  // -------------------------------------------------------------------------
+  // Unresolvable before the Slack step: never connects
+  // -------------------------------------------------------------------------
+
+  test('b.g57: bring-up: A whose claude_config_dir is a symlink pointing to nothing never connects (no Slack step, no client) and is never launched; it ends retrying with this cause; B is launched; once the drive is back A connects, then is launched', async () => {
     const h = makeConfigDirHarness()
     rmSync(aTarget, { recursive: true })
 
@@ -892,21 +1326,32 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
       failures: [configDirCause(DANGLING)],
     })
     expectBLaunched(h, result)
+    // Checked after its credentials and working directory, before any Slack step.
+    expect(markersOf(h, a.key)).toEqual([`credentials:${a.key}`, `directory:${a.key}`])
+    expect(h.slackSteps.filter((s) => s.key === a.key)).toEqual([])
+    expect(h.conn.slack.buildsOf(a.key)).toEqual([])
+    expect(h.conn.manager.status(a.key)).toBeUndefined()
+    expect(h.stops).toEqual([])
     expect(ad.spawnedIds()).toEqual([personaInstanceId(b.key)])
     expect(adCalledForA()).toBe(false)
-    expect(h.controller.state(a.key)).toEqual({ outcome: 'retrying', causes: { configDir: configDirCause(DANGLING) } })
+    expect(h.controller.state(a.key)).toEqual(heldState(DANGLING))
     expect(upPredicate(h)(a.key)).toBe(false)
+    expect(leftUp).toEqual([])
     expect(classLines(h)).toEqual([unresolvableLine(DANGLING)])
 
     // Still dangling at the first re-check; the drive is back for the second.
     await h.conn.clock.advance(5_000)
     expect(h.retryLaunches).toEqual([])
+    expect(h.conn.slack.buildsOf(a.key)).toEqual([])
     expect(adCalledForA()).toBe(false)
     mkdirSync(aTarget)
     await h.conn.clock.advance(10_000)
     await Promise.all(retryLaunchesInFlight)
 
+    expect(markersOf(h, a.key)).toEqual(fullOrder(a.key))
+    expect(h.conn.bringUpCalls.filter((c) => c.key === a.key)).toEqual([{ key: a.key, gotTokens: true, ownTokens: true }])
     expect(h.retryLaunches).toEqual([a.key])
+    expect(h.launches.filter((l) => l.key === a.key)).toEqual([{ key: a.key, state: 'up', socketConnected: true, authTests: 1 }])
     expect(ad.spawnedIds()).toEqual([personaInstanceId(b.key), personaInstanceId(a.key)])
     expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
     expect(classLines(h)).toEqual([unresolvableLine(DANGLING), clearedLine()])
@@ -914,208 +1359,274 @@ describe('b.g57: an unresolvable claude_config_dir holds the persona retrying', 
     assertNoLeak(h.captured({ result, leftUp }))
   })
 
-  // -------------------------------------------------------------------------
-  // A confirmed credentials change while A is held (b.g57 code review): by
-  // A's Slack side, not its held outcome
-  // -------------------------------------------------------------------------
-
-  /**
-   * Rotate A's credentials file in place to a new fake pair registered with
-   * the stub factory under `label` (its own stub, identity and scripts).
-   * Returns that set's stub and the new file's digest.
-   */
-  function rotateA(h: Harness, label: string, opts: StubSlackOptions = {}): { stub: StubSlack; digest: string } {
-    const botToken = fakeToken(BOT_TOKEN_PREFIX, `${a.key}-${label}-bot`)
-    const appToken = fakeToken(APP_TOKEN_PREFIX, `${a.key}-${label}-app`)
-    const stub = h.conn.slack.addCredentials(a.key, label, { botToken, appToken }, { leakMarker: LEAK_SENTINEL, ...opts })
-    writeCredentialsFile(dir, relative(dir, a.credentials_file), { bot_token: botToken, app_token: appToken })
-    return { stub, digest: credentialsDigest(readCredentialsFile(a.credentials_file)) }
-  }
-
-  /** The controller's change of A against the applied set, over the real manager, recording its hooks. */
-  function changeA(h: Harness, hookCalls: string[], swaps: CredentialsSwap[]) {
-    return h.controller.changeCredentials(a, cfg.personas, h.conn.manager, {
-      beforeSwap: () => void hookCalls.push(`beforeSwap while ${h.controller.state(a.key)?.outcome}`),
-      onSwapped: (swap) => void swaps.push(swap),
-    })
-  }
-
-  /** A's socket activity since `since`, as [event, credential set]. */
-  const socketActivity = (h: Harness, since: number) =>
-    h.conn.slack.activityOf(a.key).slice(since).filter((e) => e.kind === 'socket').map((e) => [e.event, e.credentials])
-  const identityOf = (stub: StubSlack) => ({ botUserId: stub.identity.botUserId, botId: stub.identity.botId })
-  const changeFailedLines = (h: Harness) => h.lines.filter((l) => l.includes(`${PERSONA_CREDENTIALS_CHANGE_FAILED}:`))
-
-  test('b.g57: credentials change while held with a working connection: reconnected (the new connection opens, then the old one closes), swapped with wasUp; the new file held; A stays held and is not launched; once the directory resolves A is launched on its new connection', async () => {
+  test('b.g57: directory retry: A with a missing working directory and a dangling claude_config_dir is checked for the latter only once its directory is back; held there with no connection; connects and is launched once both resolve', async () => {
     const h = makeConfigDirHarness()
-    await startThenHoldA(h)
-    const cp = { ad: ad.callCount(), activity: h.conn.slack.activityOf(a.key).length, bBuilds: h.conn.slack.buildsOf(b.key).length }
+    rmSync(a.working_directory, { recursive: true })
+    rmSync(aTarget, { recursive: true })
+
+    const result = await h.startPass()
+
+    expect(result.perPersona.find((p) => p.key === a.key)).toMatchObject({ action: 'not-brought-up', outcome: 'retrying' })
+    expect(h.controller.state(a.key)?.causes.directory).toBeDefined()
+    expect(classLines(h)).toEqual([])
+
+    // 5 s: the directory is back; the claude_config_dir check right after holds A before Slack.
+    mkdirSync(a.working_directory)
+    await h.conn.clock.advance(5_000)
+
+    expect(h.controller.state(a.key)).toEqual(heldState(DANGLING))
+    expect(classLines(h)).toEqual([unresolvableLine(DANGLING)])
+    expect(h.slackSteps.filter((s) => s.key === a.key)).toEqual([])
+    expect(h.conn.slack.buildsOf(a.key)).toEqual([])
+    expect(h.conn.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
+
+    mkdirSync(aTarget)
+    await h.conn.clock.advance(5_000)
+    await Promise.all(retryLaunchesInFlight)
+
+    expect(markersOf(h, a.key)).toEqual([
+      `credentials:${a.key}`,
+      `directory:${a.key}`,
+      `directory:${a.key}`,
+      `slack:${a.key}`,
+      `launch:${a.key}`,
+    ])
+    expect(h.retryLaunches).toEqual([a.key])
+    expect(h.lines.filter((l) => l.startsWith(`[slack] persona ${renderPersonaRef(a.name, a.key)}: up after`))).toEqual([upLine()])
+    expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+    expect(classLines(h)).toEqual([unresolvableLine(DANGLING), clearedLine()])
+    expect(h.stops).toEqual([])
+    assertNoLeak(h.captured({ result, leftUp }))
+  })
+
+  // -------------------------------------------------------------------------
+  // A confirmed credentials change while A is held: A has no connection, so
+  // it takes the new file and opens nothing; its return connects with it
+  // -------------------------------------------------------------------------
+
+  test.each<[string, StubSlackOptions['authTest']]>([
+    ['held while up', undefined],
+    ['held while retrying its bring-up for Slack', [{ kind: 'network' }]],
+  ])('b.g57: credentials change %s: retrying with no connection; nothing opens and no swap hook runs; the new file is held; A returns on the new tokens once the directory resolves', async (_label, authTest) => {
+    const h = makeConfigDirHarness(authTest === undefined ? {} : { slack: { a: { authTest } } })
+    await h.startPass()
+    failing.add(aDir)
+    expect(await launchSession(a.key, cfg)).toBe('skipped')
+    expect(h.stops).toEqual([a.key])
+    const cp = { activity: h.conn.slack.activityOf(a.key).length, slackSteps: h.slackSteps.length, bBuilds: h.conn.slack.buildsOf(b.key).length }
     const edited = rotateA(h, 'edited')
     const hookCalls: string[] = []
     const swaps: CredentialsSwap[] = []
 
     const result = await changeA(h, hookCalls, swaps)
 
-    // Swapped as an up persona would be (not skipped, not coming back up: it
-    // was up on Slack), and marked held: it is still held after the swap.
-    expect(result).toEqual({ kind: 'swapped', held: true })
-    expect(hookCalls).toEqual(['beforeSwap while retrying'])
-    expect(swaps).toEqual([{ late: false, wasUp: true, held: true }])
-    expect(socketActivity(h, cp.activity)).toEqual([
-      ['built', 'edited'],
-      ['started', 'edited'],
-      ['connected', 'edited'],
-      ['discarded', INITIAL_CREDENTIALS],
-      ['disconnected', INITIAL_CREDENTIALS],
-    ])
-    expect(h.conn.manager.identity(a.key)).toEqual(identityOf(edited.stub))
+    expect(result).toEqual({ kind: 'retrying', connection: 'none' })
+    expect(hookCalls).toEqual([])
+    expect(swaps).toEqual([])
     expect(h.controller.credentialsDigest(a.key)).toBe(edited.digest)
-    // Still held: retrying with the configDir cause alone, its re-check timer the only one; nothing launched.
-    expect(h.controller.state(a.key)).toEqual({ outcome: 'retrying', causes: { configDir: configDirCause('EIO') } })
-    expect(h.conn.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
-    expect(h.retryLaunches).toEqual([])
-    expect(ad.callCount()).toBe(cp.ad)
+    // Up to the re-check at 5 s: nothing opened for A, not even a Slack retry.
+    await h.conn.clock.advance(4_999)
+    expect(h.conn.slack.activityOf(a.key).slice(cp.activity)).toEqual([])
+    expect(h.slackSteps).toHaveLength(cp.slackSteps)
+    expect(aSocketOpen(h, edited.stub)).toBe(false)
+    expect(h.controller.state(a.key)).toEqual(heldState('EIO'))
     expect(changeFailedLines(h)).toEqual([])
-    // B: no client built, still up.
-    expect(h.conn.slack.buildsOf(b.key)).toHaveLength(cp.bBuilds)
-    expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
+    expect(h.retryLaunches).toEqual([])
 
-    // The directory resolves: one launch of A, made while A is on the new connection.
-    const identityAtLaunch: unknown[] = []
-    const spawn = ad.client.spawn
-    ad.client.spawn = async (params) => {
-      if (params.claude_instance_id === personaInstanceId(a.key)) identityAtLaunch.push(h.conn.manager.identity(a.key))
-      return spawn(params)
-    }
+    const identityAtLaunch = recordIdentityAtLaunch(h)
     failing.delete(aDir)
-    await h.conn.clock.runNext()
+    await h.conn.clock.advance(1)
     await Promise.all(retryLaunchesInFlight)
 
-    expect(h.retryLaunches).toEqual([a.key])
+    // It returned on the new tokens only: no client of the old set built again.
+    expect(h.conn.slack.activityOf(a.key).slice(cp.activity).filter((e) => e.credentials === INITIAL_CREDENTIALS)).toEqual([])
+    expect(h.conn.bringUpCalls.filter((c) => c.key === a.key).at(-1)).toEqual({ key: a.key, gotTokens: true, ownTokens: false })
+    expect(h.conn.manager.identity(a.key)).toEqual(identityOf(edited.stub))
     expect(identityAtLaunch).toEqual([identityOf(edited.stub)])
+    expect(h.retryLaunches).toEqual([a.key])
     expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
     expect(h.controller.credentialsDigest(a.key)).toBe(edited.digest)
+    expect(h.conn.slack.buildsOf(b.key)).toHaveLength(cp.bBuilds)
+    expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
     expect(h.conn.clock.pendingCount()).toBe(0)
     assertNoLeak(h.captured({ result, swaps, hookCalls, leftUp }))
   })
 
-  // Rows: how Slack answers the new file's auth.test, what changeCredentials
-  // resolves with, and how long the fake clock then runs (the reconnect's 5 s
-  // retry, where its refusal is a late one).
-  test.each<[string, StubSlackOptions['authTest'], PersonaCredentialsChangeResult, number]>([
-    ['refused at once', [{ kind: 'platform', error: 'invalid_auth' }], { kind: 'failed', cause: expect.any(String) }, 0],
-    [
-      'unreachable, then refused on the reconnect\'s 5 s retry',
-      [{ kind: 'network' }, { kind: 'platform', error: 'invalid_auth' }],
-      { kind: 'retrying', connection: 'kept' },
-      5_000,
-    ],
-  ])('b.g57: credentials change while held, new file %s: the old connection stays in use; one change-failed line saying so; the old file held again; A stays held', async (_label, authTest, expected, runMs) => {
+  test('b.g57: credentials change while held to a file Slack would refuse: taken with no Slack call; at the return Slack refuses it: A is broken by its credentials, not launched, not retried', async () => {
     const h = makeConfigDirHarness()
-    await startThenHoldA(h)
-    const oldDigest = h.controller.credentialsDigest(a.key)
-    const cp = { ad: ad.callCount(), activity: h.conn.slack.activityOf(a.key).length }
-    rotateA(h, 'refused', { authTest })
+    const afterStart = await startThenHoldA(h)
+    const cp = { activity: h.conn.slack.activityOf(a.key).length }
+    const refused = rotateA(h, 'refused', { authTest: [{ kind: 'platform', error: 'invalid_auth' }] })
 
-    const result = await changeA(h, [], [])
-    expect(result).toEqual(expected)
-    await h.conn.clock.advance(runMs)
+    const result = await changeA(h)
 
-    // One line, the connection-kept ending, with Slack's refusal as its cause.
-    const failed = changeFailedLines(h)
-    const cause = /cannot be used: (.+); the current connection stays in use/.exec(failed[0] ?? '')?.[1] ?? ''
-    expect(cause).toContain('invalid_auth')
-    expect(failed).toEqual([
-      formatCredentialsChangeFailed({ name: a.name, key: a.key, index: a.index, path: a.credentials_file, cause, kept: 'connection' }),
-    ])
-    expect(h.lines.filter((l) => l.includes(`${PERSONA_CREDENTIALS_REFUSED}:`))).toEqual([])
-    expect(h.controller.credentialsDigest(a.key)).toBe(oldDigest)
-    // The old connection was never let go; A is on it still.
-    expect(socketActivity(h, cp.activity).filter(([, set]) => set === INITIAL_CREDENTIALS)).toEqual([])
-    expect(h.conn.manager.identity(a.key)).toEqual(identityOf(h.conn.slack.persona(a.key)))
-    expect(h.controller.state(a.key)).toEqual({ outcome: 'retrying', causes: { configDir: configDirCause('EIO') } })
+    expect(result).toEqual({ kind: 'retrying', connection: 'none' })
+    expect(h.conn.slack.activityOf(a.key).slice(cp.activity)).toEqual([])
+    expect(refused.stub.calls.authTest).toEqual([])
+
+    failing.delete(aDir)
+    await h.conn.clock.advance(5_000)
+    await Promise.all(retryLaunchesInFlight)
+
+    expect(refused.stub.calls.authTest).toHaveLength(1)
+    const state = h.controller.state(a.key)
+    expect(state?.outcome).toBe('broken')
+    expect(state?.causes.slack?.class).toBe(PERSONA_CREDENTIALS_REFUSED)
+    expect(h.lines.filter((l) => l.includes(`${PERSONA_CREDENTIALS_REFUSED}:`))).toHaveLength(1)
     expect(h.retryLaunches).toEqual([])
-    expect(ad.callCount()).toBe(cp.ad)
+    expect(ad.callCount()).toBe(afterStart)
+    expect(h.conn.clock.pendingCount()).toBe(0)
     expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
     assertNoLeak(h.captured({ result, leftUp }))
   })
 
-  // A late swap (the new file's first auth.test cannot reach Slack; the
-  // reconnect's own retry succeeds) is marked held by whether A is held at the
-  // swap, not when the change was confirmed. Rows: the new file's auth.test
-  // script, whether A's directory resolves at the 5 s re-check (before the
-  // swap), when the swap lands, and the swap the hook gets.
-  test.each<[string, StubSlackOptions['authTest'], boolean, number, CredentialsSwap]>([
-    ['A still held at the swap (5 s)', [{ kind: 'network' }], false, 5_000, { late: true, wasUp: true, held: true }],
-    ['A\'s hold cleared at 5 s, before the swap (15 s)', [{ kind: 'network' }, { kind: 'network' }], true, 15_000, { late: true, wasUp: true }],
-  ])('b.g57: late credentials swap, %s: changeCredentials resolves retrying with the connection kept; the swap carries held only while A is held', async (_label, authTest, resolves, swapAtMs, expectedSwap) => {
+  test('b.g57: credentials change while held to a missing file: failed with one change-failed line (it keeps its current credentials); A returns on its held tokens', async () => {
     const h = makeConfigDirHarness()
     await startThenHoldA(h)
-    const cp = { activity: h.conn.slack.activityOf(a.key).length }
-    const edited = rotateA(h, 'edited', { authTest })
-    const swaps: CredentialsSwap[] = []
+    const oldDigest = h.controller.credentialsDigest(a.key)
+    rmSync(a.credentials_file)
 
-    const result = await changeA(h, [], swaps)
+    const result = await changeA(h)
 
-    expect(result).toEqual({ kind: 'retrying', connection: 'kept' })
-    expect(swaps).toEqual([])
-    if (resolves) failing.delete(aDir)
-    await h.conn.clock.advance(5_000)
-    await Promise.all(retryLaunchesInFlight)
-    // The hold cleared: A launched on its old connection, before any swap.
-    expect(h.retryLaunches).toEqual(resolves ? [a.key] : [])
-    await h.conn.clock.advance(swapAtMs - 5_000)
-
-    expect(swaps).toEqual([expectedSwap])
-    expect(socketActivity(h, cp.activity).filter(([event]) => event === 'connected' || event === 'discarded')).toEqual([
-      ['connected', 'edited'],
-      ['discarded', INITIAL_CREDENTIALS],
+    if (result.kind !== 'failed') throw new Error(`expected a failed change, got ${result.kind}`)
+    expect(changeFailedLines(h)).toEqual([
+      formatCredentialsChangeFailed({ name: a.name, key: a.key, index: a.index, path: a.credentials_file, cause: result.cause, kept: 'content' }),
     ])
-    expect(h.conn.manager.identity(a.key)).toEqual(identityOf(edited.stub))
-    expect(h.controller.credentialsDigest(a.key)).toBe(edited.digest)
-    expect(h.controller.state(a.key)).toEqual(
-      resolves ? { outcome: 'up', causes: {} } : { outcome: 'retrying', causes: { configDir: configDirCause('EIO') } },
-    )
-    expect(changeFailedLines(h)).toEqual([])
-    expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
-    assertNoLeak(h.captured({ result, swaps, leftUp }))
-  })
-
-  test('b.g57: credentials change while A is retrying for Slack and held: its Slack retry takes the new tokens (no reconnect); it comes up on them still held, and is launched once the directory resolves', async () => {
-    // A's first auth.test cannot reach Slack: retrying at the start pass, its retry due at 5 s.
-    const h = makeConfigDirHarness({ a: { authTest: [{ kind: 'network' }] } })
-    const started = await h.startPass()
-    expect(started.perPersona.find((p) => p.key === a.key)).toMatchObject({ action: 'not-brought-up', outcome: 'retrying' })
-    failing.add(aDir)
-    expect(await launchSession(a.key, cfg)).toBe('skipped')
-    expect(h.controller.state(a.key)).toMatchObject({ outcome: 'retrying', causes: { slack: expect.anything(), configDir: configDirCause('EIO') } })
-    const cp = { activity: h.conn.slack.activityOf(a.key).length }
-    const edited = rotateA(h, 'edited')
-
-    const result = await changeA(h, [], [])
-
-    expect(result).toEqual({ kind: 'retrying', connection: 'none' })
-    expect(h.controller.credentialsDigest(a.key)).toBe(edited.digest)
-    // Nothing opened yet: the new tokens wait for the Slack retry.
-    expect(h.conn.slack.activityOf(a.key).slice(cp.activity)).toEqual([])
-
-    await h.conn.clock.advance(5_000)
-
-    // The retry used the new tokens only; no client of the old set was built again.
-    expect(h.conn.slack.activityOf(a.key).slice(cp.activity).filter((e) => e.credentials === INITIAL_CREDENTIALS)).toEqual([])
-    expect(h.conn.manager.identity(a.key)).toEqual(identityOf(edited.stub))
-    expect(h.controller.state(a.key)).toEqual({ outcome: 'retrying', causes: { configDir: configDirCause('EIO') } })
-    expect(adCalledForA()).toBe(false)
-    expect(changeFailedLines(h)).toEqual([])
+    expect(h.controller.credentialsDigest(a.key)).toBe(oldDigest)
+    expect(h.controller.state(a.key)).toEqual(heldState('EIO'))
 
     failing.delete(aDir)
-    await h.conn.clock.advance(10_000)
+    await h.conn.clock.advance(5_000)
     await Promise.all(retryLaunchesInFlight)
 
-    expect(ad.spawnedIds()).toEqual([personaInstanceId(b.key), personaInstanceId(a.key)])
+    expect(h.conn.bringUpCalls.filter((c) => c.key === a.key).at(-1)).toEqual({ key: a.key, gotTokens: true, ownTokens: true })
+    expect(h.retryLaunches).toEqual([a.key])
     expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+    assertNoLeak(h.captured({ result, leftUp }))
+  })
+
+  // Rows: the new file's auth.test script, and when the hold starts: during
+  // the reconnect's first attempt (`never` answers; changeCredentials is still
+  // pending), after it resolved retrying with the old connection kept, or
+  // during its first attempt once Slack refused A's own connection (its
+  // reopen: `invalid_auth`), so A is broken when the hold starts.
+  test.each<[string, StubSlackOptions['authTest'], 'in-flight' | 'retrying' | 'in-flight, own connection refused']>([
+    ['while its first attempt is in flight', [{ kind: 'never' }], 'in-flight'],
+    ['while it is retrying (the old connection kept)', [{ kind: 'network' }], 'retrying'],
+    ['while its first attempt is in flight and Slack has refused A\'s own connection', [{ kind: 'never' }], 'in-flight, own connection refused'],
+  ])('b.g57: a hold that starts during a confirmed change\'s reconnect %s closes the reconnect with the connection: no swap ever; A keeps the new file and returns on it, unless Slack refused it: then skipped, broken, the old content held', async (_label, authTest, when) => {
+    const h = makeConfigDirHarness()
+    await h.startPass()
+    const cp = { activity: h.conn.slack.activityOf(a.key).length }
+    const oldDigest = h.controller.credentialsDigest(a.key)
+    const edited = rotateA(h, 'edited', { authTest })
+    const hookCalls: string[] = []
+    const swaps: CredentialsSwap[] = []
+
+    const changing = changeA(h, hookCalls, swaps)
+    if (when === 'retrying') expect(await changing).toEqual({ kind: 'retrying', connection: 'kept' })
+    else await h.conn.clock.advance(0)
+    if (when === 'in-flight, own connection refused') {
+      const stubA = h.conn.slack.persona(a.key)
+      stubA.script.connect.push({ kind: 'platform', error: 'invalid_auth' })
+      stubA.socket.drop()
+      await h.conn.clock.advance(0)
+      expect(h.conn.manager.status(a.key)).toMatchObject({ state: 'broken', phase: 'reopen' })
+    }
+    failing.add(aDir)
+    expect(await launchSession(a.key, cfg)).toBe('skipped')
+    const result = await changing
+
+    expect(h.stops).toEqual([a.key])
+    expect(aSocketOpen(h, edited.stub)).toBe(false)
+    if (when === 'in-flight, own connection refused') {
+      // Slack's refusal is kept: the change is not taken, and stays pending for the recovery.
+      expect(result).toEqual({ kind: 'skipped' })
+      expect(h.controller.state(a.key)).toMatchObject({
+        outcome: 'broken',
+        causes: { slack: { class: PERSONA_CREDENTIALS_REFUSED }, configDir: configDirCause('EIO') },
+      })
+      expect(h.controller.credentialsDigest(a.key)).toBe(oldDigest)
+      expect(h.conn.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
+      failing.delete(aDir)
+      await h.conn.clock.advance(5_000)
+      await Promise.all(retryLaunchesInFlight)
+      // It stays broken: no Slack step for the new file, no launch, no swap.
+      expect(edited.stub.calls.authTest).toEqual([])
+      expect(swaps).toEqual([])
+      expect(hookCalls).toEqual([])
+      expect(h.retryLaunches).toEqual([])
+      expect(h.controller.state(a.key)?.outcome).toBe('broken')
+      expect(h.controller.credentialsDigest(a.key)).toBe(oldDigest)
+      expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
+      expect(h.conn.clock.pendingCount()).toBe(0)
+      assertNoLeak(h.captured({ result, swaps, hookCalls, leftUp }))
+      return
+    }
+    expect(result).toEqual(when === 'in-flight' ? { kind: 'retrying', connection: 'none' } : { kind: 'retrying', connection: 'kept' })
+    expect(h.controller.state(a.key)).toEqual(heldState('EIO'))
+    expect(h.controller.credentialsDigest(a.key)).toBe(edited.digest)
+    // Only the re-check is pending: the reconnect's retry ended with the connection.
+    expect(h.conn.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
+
+    const identityAtLaunch = recordIdentityAtLaunch(h)
+    failing.delete(aDir)
+    await h.conn.clock.advance(5_000)
+    await Promise.all(retryLaunchesInFlight)
+
+    expect(swaps).toEqual([])
+    expect(hookCalls).toEqual([])
+    expect(socketActivity(h, cp.activity).filter(([event]) => event === 'connected')).toEqual([['connected', 'edited']])
+    expect(h.conn.manager.identity(a.key)).toEqual(identityOf(edited.stub))
+    expect(identityAtLaunch).toEqual([identityOf(edited.stub)])
+    expect(h.retryLaunches).toEqual([a.key])
+    expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+    expect(h.controller.credentialsDigest(a.key)).toBe(edited.digest)
+    expect(changeFailedLines(h)).toEqual([])
     expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
     expect(h.conn.clock.pendingCount()).toBe(0)
-    assertNoLeak(h.captured({ started, result, leftUp }))
+    assertNoLeak(h.captured({ result, swaps, hookCalls, leftUp }))
+  })
+
+  test('b.g57: a hold on a persona Slack had refused keeps the refusal: its connection is closed, and once the directory resolves one "stays broken" cleared line; no Slack step, no launch', async () => {
+    const h = makeConfigDirHarness()
+    await h.startPass()
+    // A's reopen is refused: broken by its credentials, its instance left running.
+    const stubA = h.conn.slack.persona(a.key)
+    stubA.script.connect.push({ kind: 'platform', error: 'invalid_auth' })
+    stubA.socket.drop()
+    await h.conn.clock.flush()
+    expect(h.conn.manager.status(a.key)).toMatchObject({ state: 'broken' })
+    expect(leftUp.map((l) => l.key)).toEqual([a.key])
+    const cp = { ad: ad.callCount(), slackSteps: h.slackSteps.length }
+
+    failing.add(aDir)
+    const failure = checkLaunchConfigDir(a)
+    if (failure.ok) throw new Error('A\'s claude_config_dir should be unresolvable')
+    expect(h.controller.holdForConfigDir(a, failure)).toBe(true)
+
+    expect(h.stops).toEqual([a.key])
+    expect(h.controller.state(a.key)).toMatchObject({
+      outcome: 'broken',
+      causes: { slack: { class: PERSONA_CREDENTIALS_REFUSED }, configDir: configDirCause('EIO') },
+    })
+    // Not up before the hold: not told again.
+    expect(leftUp).toHaveLength(1)
+
+    failing.delete(aDir)
+    await h.conn.clock.advance(5_000)
+    await Promise.all(retryLaunchesInFlight)
+
+    expect(classLines(h)).toEqual([
+      unresolvableLine('EIO'),
+      expect.stringMatching(new RegExp(`^${escapeRegExp(aPrefix())}cleared: .*stays broken`)),
+    ])
+    expect(h.slackSteps).toHaveLength(cp.slackSteps)
+    expect(h.retryLaunches).toEqual([])
+    expect(ad.callCount()).toBe(cp.ad)
+    expect(h.controller.state(a.key)).toMatchObject({ outcome: 'broken', causes: { slack: { class: PERSONA_CREDENTIALS_REFUSED } } })
+    expect(h.controller.state(a.key)?.causes.configDir).toBeUndefined()
+    expect(h.conn.clock.pendingCount()).toBe(0)
+    assertNoLeak(h.captured({ leftUp }))
   })
 })

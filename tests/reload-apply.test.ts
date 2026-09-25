@@ -81,7 +81,15 @@ import type { InPlaceSetting } from '../src/reload-plan.ts'
 import { RELOAD_APPLIED, RELOAD_NOOP } from '../src/reload.ts'
 import { personaConfigDirLabelValue } from '../src/session-manager.ts'
 import { errTemplateMalformed, stubCallCount } from './test-helpers/agent-director-stub.ts'
-import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-helpers/credentials.ts'
+import {
+  APP_TOKEN_PREFIX,
+  assertNoLeak,
+  BOT_TOKEN_PREFIX,
+  fakeToken,
+  REDACTED_SENTINEL_TAIL,
+  sentinelInMessage,
+  writtenFile,
+} from './test-helpers/credentials.ts'
 import {
   makeChannelMessage,
   makeDeferredConnect,
@@ -1165,21 +1173,22 @@ describe('step order with teardowns, in-place updates and bring-ups (b.av2 SR-8.
   const STEP_OF: Record<LifecycleTimelineEntry['op'], number> = { teardown: 2, 'update-in-place': 3, reconnect: 4, 'bring-up': 6 }
 
   // Each row fails the step's second persona, so the line must name the one that failed.
-  // Either way the failure is one controller line with no message, the step's other
-  // persona still settles, every later step still runs, and the apply finishes.
+  // Either way the failure is one controller line with its message redacted, the step's
+  // other persona still settles, every later step still runs, and the apply finishes.
   test.each<{ label: string; op: LifecycleTimelineEntry['op']; failing: string; step: string }>([
     { label: 'step 2', op: 'teardown', failing: 'delta', step: '2 (teardowns)' },
     { label: 'AC 58: step 3', op: 'update-in-place', failing: 'charlie', step: '3 (in-place-updates)' },
     { label: 'AC 68: step 4', op: 'reconnect', failing: 'hotel', step: '4 (credentials-reconnects)' },
     { label: 'step 6', op: 'bring-up', failing: 'foxtrot', step: '6 (bring-ups)' },
-  ])("$label: when one $op rejects, it is logged once by the controller without its message, the step's other persona still settles, the later steps still run, and the apply finishes", async ({ op, failing, step }) => {
+  ])("$label: when one $op rejects, it is logged once by the controller with its message redacted, the step's other persona still settles, the later steps still run, and the apply finishes", async ({ op, failing, step }) => {
     const { run, next } = await twoOfEach()
     const [alphaKey, bravoKey, charlieKey, deltaKey, echoKey, foxtrotKey, golfKey, hotelKey] = keysOf(
       'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel',
     )
     const failingKey = h.key(failing)
-    // A failure whose message holds a fake token: only its class may be logged.
-    run.lifecycle.hold(op, failingKey).fail(new Error(`lifecycle op exploded ${fakeToken(APP_TOKEN_PREFIX, 'failure')}`))
+    // A failure whose message holds the sentinel inside a fake token and a Socket Mode
+    // URL: the line keeps the message with both redacted.
+    run.lifecycle.hold(op, failingKey).fail(new Error(`lifecycle op exploded ${sentinelInMessage('failure', APP_TOKEN_PREFIX)}`))
 
     await applyConfig(run, next)
 
@@ -1211,7 +1220,7 @@ describe('step order with teardowns, in-place updates and bring-ups (b.av2 SR-8.
     expect(failed[0]).toStartWith(
       `[slack] reload: apply step ${step} failed for persona ${renderPersonaRef(failing, failingKey)}: Error`,
     )
-    expect(failed[0]).not.toContain('exploded')
+    expect(failed[0]).toContain(`lifecycle op exploded ${REDACTED_SENTINEL_TAIL}`)
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie', 'golf', 'hotel', 'echo', 'foxtrot'))
     expect(run.lifecycle.of('reconnect').find((r) => r.key === golfKey)!.change).toEqual({ kind: 'swapped' })
@@ -2734,7 +2743,7 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
     expectNoPostNoLeak(run)
   })
 
-  test("b.g57: bravo, held because its claude_config_dir stopped resolving (a symlink whose target was removed), is launched once a confirmed change moves it to a directory that resolves: its 5 s re-check reads the applied declaration, not the one it was held with, and spawns it fresh in the new directory; alpha is untouched (real launch)", async () => {
+  test("b.g57: bravo, held because its claude_config_dir stopped resolving (a symlink whose target was removed), has its Slack connection closed and its row kept; a confirmed change moving it to a directory that resolves does nothing at the apply; its 5 s re-check reads the applied declaration, not the one it was held with, reconnects it with its held credentials and spawns it fresh in the new directory; alpha is untouched (real launch)", async () => {
     const target = h.configDir('bravo-target')
     const link = configDirLink('bravo-link', target)
     const { run, personas } = await running(['alpha', ['bravo', { claude_config_dir: link }]], REAL_LAUNCH)
@@ -2748,11 +2757,19 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
     rmSync(target, { recursive: true })
     h.seedRow(bravo!, { state: 'ended' })
     const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+    const activityFrom = run.socketActivity('bravo').length
+    const rowHeld = h.rowOf('bravo')
     expect(await run.relaunch('bravo')).toBe('skipped')
+    await turns()
     expect(run.bringUps.state(bravoKey)).toMatchObject({ outcome: 'retrying', causes: { configDir: expect.anything() } })
     expect(run.isUp('bravo')).toBe(false)
     expect(run.logsOf(PERSONA_CONFIG_DIR_UNRESOLVABLE)).toHaveLength(1)
+    // Its Slack connection is closed, as for a directory-broken persona; its row is kept.
+    const label1 = h.credentialsLabel('bravo')
+    expect(socketActivitySince(run, 'bravo', activityFrom)).toEqual([`discarded ${label1}`, `disconnected ${label1}`])
+    expect(run.connections.manager.status(bravoKey)).toBeUndefined()
     expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual([])
+    expect(h.rowOf('bravo')).toEqual(rowHeld)
     expect(run.clock.pendingCount()).toBe(1)
 
     // A confirmed move to a directory that resolves: a next-launch change, so nothing is done to bravo at the apply.
@@ -2778,9 +2795,98 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
     expect(lines[1]).toContain('cleared')
     expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
     expect(run.isUp('bravo')).toBe(true)
+    // Reconnected with the credentials it was held with: a new client over the same set.
+    expect(socketActivitySince(run, 'bravo', activityFrom)).toEqual([
+      `discarded ${label1}`,
+      `disconnected ${label1}`,
+      `built ${label1}`,
+      `started ${label1}`,
+      `connected ${label1}`,
+    ])
+    expect(run.connections.manager.status(bravoKey)?.state).toBe('up')
     expect(run.clock.pendingCount()).toBe(0)
     alphaUntouched()
     expect(run.composition!.instanceCallsOf('alpha')).toHaveLength(alphaInstanceCalls)
+    expectNoPostNoLeak(run)
+  })
+
+  test("b.g57: a confirmed change moving bravo's claude_config_dir to a directory that does not resolve (a dangling symlink) keeps its connection at the apply; its next launch holds it, closing its Slack connection and dropping its MCP session while its row is kept; a confirmed rotation while held opens no connection and is not pending again; once the directory appears it connects with the rotated credentials and is launched there (real launch)", async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], { ...REAL_LAUNCH, sessions: true })
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const alphaSession = run.session('alpha')
+    const target = h.configDir('bravo-target')
+    const link = configDirLink('bravo-link', target)
+    rmSync(target, { recursive: true })
+    const moved = h.persona('bravo', { claude_config_dir: link })
+    const label1 = h.credentialsLabel('bravo')
+    const bravoSide = slackSideOf(run, 'bravo')
+
+    // The confirmed change: a next-launch change, so nothing is done to bravo at the apply.
+    await applyConfig(run, [alpha!, moved])
+    expect(run.isUp('bravo')).toBe(true)
+    expect(slackSideOf(run, 'bravo')).toEqual(bravoSide)
+    expect(run.logsOf(PERSONA_CONFIG_DIR_UNRESOLVABLE)).toEqual([])
+
+    // Its next launch finds the directory unresolvable: held, its connection closed, its row kept.
+    h.seedRow(bravo!, { state: 'ended' })
+    const rowHeld = h.rowOf('bravo')
+    const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+    const activityFrom = run.socketActivity('bravo').length
+    expect(await run.relaunch('bravo')).toBe('skipped')
+    await turns()
+    expect(run.bringUps.state(bravoKey)).toMatchObject({ outcome: 'retrying', causes: { configDir: expect.anything() } })
+    expect(run.isUp('bravo')).toBe(false)
+    expect(run.logsOf(PERSONA_CONFIG_DIR_UNRESOLVABLE)).toHaveLength(1)
+    expect(socketActivitySince(run, 'bravo', activityFrom)).toEqual([`discarded ${label1}`, `disconnected ${label1}`])
+    expect(run.connections.manager.status(bravoKey)).toBeUndefined()
+    expect(run.session('bravo')).toBeUndefined()
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual([])
+    expect(h.rowOf('bravo')).toEqual(rowHeld)
+
+    // A confirmed rotation while held: taken for its return, no connection opened, its cached DM forgotten.
+    const { label: label2 } = h.rotateCredentials(moved)
+    const callsFrom = run.composition!.calls.length
+    const rotation = run.checkpoint()
+    await (await run.confirmPending()).applying
+    expect(run.lifecycle.of('reconnect')).toEqual([
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'retrying', connection: 'none' } },
+    ])
+    expect(run.composition!.calls.slice(callsFrom)).toContainEqual(['destinations.forget', bravoKey])
+    expect(run.since(rotation).slackBuilds).toBe(0)
+    expect(socketActivitySince(run, 'bravo', activityFrom)).toEqual([`discarded ${label1}`, `disconnected ${label1}`])
+    expect(run.connections.manager.status(bravoKey)).toBeUndefined()
+    expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toEqual([])
+    expect(run.isUp('bravo')).toBe(false)
+    await expectNothingPendingAfter(run)
+
+    // The directory appears: one cleared line, a connection with the rotated credentials, then the launch.
+    h.configDir('bravo-target')
+    const recheck = run.checkpoint()
+    await run.clock.advance(5_000)
+    const lines = run.logsOf(PERSONA_CONFIG_DIR_UNRESOLVABLE)
+    expect(lines).toHaveLength(2)
+    expect(lines[1]).toContain('cleared: ')
+    expect(socketActivitySince(run, 'bravo', activityFrom)).toEqual([
+      `discarded ${label1}`,
+      `disconnected ${label1}`,
+      `built ${label2}`,
+      `started ${label2}`,
+      `connected ${label2}`,
+    ])
+    expect(run.currentStub('bravo')).toBe(run.credentialsStub('bravo', label2))
+    expect(run.connections.manager.identity(bravoKey)).toEqual(identityOf(run.credentialsStub('bravo', label2)))
+    expect(run.since(recheck).lifecycle).toEqual([{ op: 'launch', key: bravoKey, via: 'retry', action: 'spawned' }])
+    // From the ended row labelled with the old directory: deleted, then spawned fresh in the new one.
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['spawn ErrInstanceIdCollision', 'delete ok', 'spawn ok'])
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ claudeConfigDir: link })
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    expect(run.isUp('bravo')).toBe(true)
+    expect(run.clock.pendingCount()).toBe(0)
+    await expectNothingPendingAfter(run)
+    alphaUntouched()
+    expect(run.session('alpha')).toBe(alphaSession)
     expectNoPostNoLeak(run)
   })
 })
@@ -3190,17 +3296,22 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
 // AC 20 at apply: no credential value anywhere (b.av2 SR-10.3, SR-13.4)
 // ---------------------------------------------------------------------------
 
-/** A sentinel-bearing error, as a failing Slack client or socket could reject with (never logged whole). */
+/**
+ * A sentinel-bearing error, as a failing Slack client or socket could reject
+ * with: its message carries the sentinel inside a token and a URL
+ * (`sentinelInMessage`, redacted in a log line), `data` carries it bare
+ * (never read).
+ */
 function sentinelError(what: string): Error {
-  return Object.assign(new Error(`${what} failed ${fakeToken(APP_TOKEN_PREFIX, what)}`), {
+  return Object.assign(new Error(`${what} failed ${sentinelInMessage(what, APP_TOKEN_PREFIX)}`), {
     code: 'slack_socket_mode_stub_failure',
     data: { ok: false, error: 'internal_error', detail: fakeToken(BOT_TOKEN_PREFIX, what) },
   })
 }
 
-/** A plain `Error` (no Slack code) carrying the sentinel in its message and a request-like `original`. */
+/** A plain `Error` (no Slack code) carrying the sentinel in its message (inside a token and a URL) and a request-like `original`. */
 function plainSentinelError(): Error {
-  return Object.assign(new Error(`socket hang up ${fakeToken(BOT_TOKEN_PREFIX, 'hang-up')}`), {
+  return Object.assign(new Error(`socket hang up ${sentinelInMessage('hang-up')}`), {
     original: { headers: { Authorization: `Bearer ${fakeToken(BOT_TOKEN_PREFIX, 'header')}` } },
   })
 }
@@ -3658,7 +3769,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     sweep(run, credentialsFilesOf(...personas, delta))
   })
 
-  test("AC 20: a teardown step before its turn fails with a sentinel-bearing error (bravo's destructive modify): the \"before its turn failed\" line renders it without its message, and the teardown and fresh bring-up still complete (real composition)", async () => {
+  test("AC 20: a teardown step before its turn fails with a sentinel-bearing error (bravo's destructive modify): the \"before its turn failed\" line renders its message redacted, and the teardown and fresh bring-up still complete (real composition)", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
@@ -3687,9 +3798,9 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     const prefix = `[slack] persona teardown of ${renderPersonaRef('bravo', bravoKey)}`
     const beforeTurn = run.since(cp).logs.filter((l) => l.startsWith(`${prefix}: cancelling its bring-up retries before its turn failed: `))
     expect(beforeTurn).toHaveLength(1)
-    // The describeThrownValue form (type, safe code, frames): the thrown message ("cancel failed <token>") never follows the colon.
+    // The describeThrownValue form (type, safe code, message, frames): the thrown message is kept with its token and URL redacted.
     expect(beforeTurn[0]).toStartWith(`${prefix}: cancelling its bring-up retries before its turn failed: Error code=slack_socket_mode_stub_failure `)
-    expect(beforeTurn[0]).not.toContain('cancel failed')
+    expect(beforeTurn[0]).toContain(`cancel failed ${REDACTED_SENTINEL_TAIL}`)
     expect(run.since(cp).logs).toContain(`${prefix}: complete`)
     expect(run.since(cp).lifecycle).toEqual([
       { op: 'teardown', key: bravoKey, via: 'apply' },
@@ -3703,11 +3814,10 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     sweep(run, credentialsFilesOf(...personas))
   })
 
-  test("AC 20: delta, added with a claude_config_dir that does not resolve (a dangling symlink), is held at its apply bring-up (persona-config-dir-unresolvable); its confirmed rotation logs the held-reconnect line; a message it receives is lost with one not-up notice; once the directory resolves, the cleared line and its launch follow; nothing holds a value (real launch)", async () => {
+  test("AC 20: delta, added with a claude_config_dir that does not resolve (a dangling symlink), is held at its apply bring-up (persona-config-dir-unresolvable) and never connects; its confirmed rotation opens no connection, is taken (not pending again) and is what it connects with once the directory resolves, then the cleared line and its launch follow; nothing holds a value (real launch)", async () => {
     await useConfigDirs()
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
     const deltaKey = h.key('delta')
-    const ref = renderPersonaRef('delta', deltaKey)
     const target = h.configDir('delta-target')
     const link = configDirLink('delta-link', target)
     rmSync(target, { recursive: true })
@@ -3716,42 +3826,50 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
     const alphaUntouched = watchUntouched(run, 'alpha')
     const cp = run.checkpoint()
 
-    // The addition: Slack up, the launch held for its directory.
+    // The addition: held before its Slack step, so no client is built and nothing connects.
     await applyConfig(run, [...personas, delta])
     expect(run.bringUps.state(deltaKey)).toMatchObject({ outcome: 'retrying', causes: { configDir: expect.anything() } })
     expect(run.isUp('delta')).toBe(false)
     const held = run.logsOf(PERSONA_CONFIG_DIR_UNRESOLVABLE)
     expect(held).toHaveLength(1)
-    expect(held[0]).toStartWith(`[slack] ${PERSONA_CONFIG_DIR_UNRESOLVABLE}: personas[2] ${ref} path=${JSON.stringify(link)}: `)
+    expect(held[0]).toStartWith(`[slack] ${PERSONA_CONFIG_DIR_UNRESOLVABLE}: personas[2] ${renderPersonaRef('delta', deltaKey)} path=${JSON.stringify(link)}: `)
+    expect(run.socketActivity('delta')).toEqual([])
+    expect(run.connections.manager.status(deltaKey)).toBeUndefined()
+    expect(run.slackCalls()[deltaKey] ?? []).toEqual([])
+    expect(run.lifecycle.records.filter((r) => r.key === deltaKey && r.op === 'launch')).toEqual([])
 
-    // Its rotation, confirmed: reconnected, still held.
+    // Its rotation, confirmed: taken for its return; it opens no connection.
     const { label } = h.rotateCredentials(delta)
+    const rotation = run.checkpoint()
     await (await run.confirmPending()).applying
-    expect(run.currentStub('delta')).toBe(run.credentialsStub('delta', label))
-    expect(run.since(cp).logs).toContain(
-      `[slack] persona ${ref}: reconnected with its changed credentials; its session is kept, and its launch waits until its claude_config_dir resolves`,
-    )
+    expect(run.lifecycle.of('reconnect')).toEqual([
+      { op: 'reconnect', key: deltaKey, via: 'apply', change: { kind: 'retrying', connection: 'none' } },
+    ])
+    expect(run.since(rotation).slackBuilds).toBe(0)
+    expect(run.socketActivity('delta')).toEqual([])
+    expect(run.connections.manager.status(deltaKey)).toBeUndefined()
+    expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toEqual([])
     expect(run.isUp('delta')).toBe(false)
+    // Not pending again: later ticks find nothing to preview or apply.
+    await expectNothingPendingAfter(run)
 
-    // A message for it is lost: one Message lost notice, state not up, to its destination.
-    const stub = run.currentStub('delta')
-    const postsFrom = stub.calls.postMessage.length
-    await stub.socket.deliver(makeChannelMessage({ channel: ownChannel('delta'), text: 'are you there' }))
-    await turns()
-    const notices = stub.calls.postMessage.slice(postsFrom)
-    expect(notices).toHaveLength(1)
-    expect(notices[0]).toMatchObject({ channel: ownChannel('delta') })
-    expect(JSON.stringify(notices[0])).toContain('Recovery: not up')
-
-    // The directory comes back: its re-check logs the cleared line and launches it.
+    // The directory comes back: its re-check logs the cleared line, connects with the rotated credentials and launches it.
     h.configDir('delta-target')
     await run.clock.advance(5_000)
     const lines = run.logsOf(PERSONA_CONFIG_DIR_UNRESOLVABLE)
     expect(lines).toHaveLength(2)
     expect(lines[1]).toContain('cleared: ')
+    expect(run.socketActivity('delta')).toEqual([`built ${label}`, `started ${label}`, `connected ${label}`])
+    expect(run.currentStub('delta')).toBe(run.credentialsStub('delta', label))
+    expect(run.connections.manager.identity(deltaKey)).toEqual(identityOf(run.credentialsStub('delta', label)))
     expect(run.isUp('delta')).toBe(true)
+    expect(run.lifecycle.records.filter((r) => r.key === deltaKey && r.op === 'launch')).toEqual([
+      { op: 'launch', key: deltaKey, via: 'retry', action: 'spawned' },
+    ])
     expect(lastSpawnOf(run, 'delta')).toMatchObject({ claudeConfigDir: link })
+    expect(run.clock.pendingCount()).toBe(0)
     alphaUntouched()
-    sweep(run, credentialsFilesOf(...personas, delta), { notices })
+    expect(run.slackPosts()).toEqual([])
+    sweep(run, credentialsFilesOf(...personas, delta))
   })
 })

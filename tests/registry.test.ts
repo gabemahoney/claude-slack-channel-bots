@@ -32,6 +32,7 @@ import {
   describePersonaNotUp,
   type PersonaBringUpController,
 } from '../src/persona-bringup-controller.ts'
+import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
 import { createPersonaUpPredicate } from '../src/persona-start.ts'
 import {
   closePendingSession,
@@ -75,8 +76,10 @@ import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/pe
 import {
   BOT_TOKEN_PREFIX,
   LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
   assertNoLeak,
   fakeToken,
+  sentinelInMessage,
   writeCredentialsFile,
   writtenFile,
 } from './test-helpers/credentials.ts'
@@ -207,6 +210,17 @@ const REPLY_SETTINGS: ReplySettings = {
 function depsWithReplySettings(overrides: Partial<ReplySettings>): SessionToolDeps {
   const settings: ReplySettings = { ...REPLY_SETTINGS, ...overrides }
   return { ...h.deps, getReplySettings: () => settings }
+}
+
+/**
+ * The bring-up controller's claude_config_dir check against a scratch home
+ * `<base>/home` holding a real `.claude`, so no bring-up here depends on the
+ * process home (a dangling `$HOME/.claude` would hold every persona).
+ */
+function configDirCheckUnder(base: string): (persona: Persona) => ReturnType<typeof checkPersonaConfigDir> {
+  const home = join(base, 'home')
+  mkdirSync(join(home, '.claude'), { recursive: true })
+  return (persona) => checkPersonaConfigDir(persona, { home })
 }
 
 function makeHarness(): Harness {
@@ -687,6 +701,7 @@ describe('not-up personas: MCP session admission and drop (b.av2 SR-6.3, SR-6.4)
       dryRun: opts.dryRun ?? false,
       log,
       clock: c.clock,
+      checkConfigDir: configDirCheckUnder(join(h.dir, 'bring-up')),
       launch: async (persona) => void launches.push(persona.key),
       onLeftUp: createNotUpSessionDropper({ drop: dropPersonaSession, log }),
     })
@@ -1571,9 +1586,11 @@ describe('download_attachment', () => {
     expectNoUrlQuery(result)
   })
 
-  test('a non-Slack failure (fetch network error) → the generic "tool call failed" wording, token-safe', async () => {
+  test('a non-Slack failure (fetch network error) → the generic "tool call failed" wording, token-safe; the log line keeps the message redacted', async () => {
+    // The leak sentinel sits inside a fake token and a URL: the log line keeps
+    // the message redacted, the tool result never quotes it.
     h.fetchHandler = () => {
-      throw new TypeError(`fetch failed ${LEAK_SENTINEL}`)
+      throw new TypeError(`fetch failed (${sentinelInMessage('fetch')})`)
     }
 
     const result = await download([slackFile('F0FILE001', 'report.txt')])
@@ -1583,6 +1600,7 @@ describe('download_attachment', () => {
     expect(h.fetches).toHaveLength(1)
     expect(readdirSync(h.inboxDir)).toEqual([])
     expectNoUrlQuery(result)
+    expect(h.lines.filter((l) => l.includes(`TypeError message="fetch failed (${REDACTED_SENTINEL_TAIL})"`))).toHaveLength(1)
     assertNoLeak({ result, lines: h.lines })
   })
 })

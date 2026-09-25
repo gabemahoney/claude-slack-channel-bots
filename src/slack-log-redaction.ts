@@ -34,9 +34,9 @@ const URL_LIKE_RE = /(?:https?|wss?):\/\/[^\s"'`<>]*[^\s"'`<>.,;:!?)\]}]/gi
 /**
  * A token-like substring: `xox` plus one lowercase letter and `-`, or
  * `xapp-`, and everything after it up to whitespace, a quote or an angle
- * bracket. Wider than `looksLikeSlackToken` on purpose (no boundary before
- * the prefix, nothing required after the dash): redacting an ordinary word
- * costs nothing, missing a token leaks it.
+ * bracket. Deliberately wide (no boundary before the prefix, nothing
+ * required after the dash): redacting an ordinary word costs nothing,
+ * missing a token leaks it.
  */
 const TOKEN_LIKE_RE = /(?:xox[a-z]|xapp)-[^\s"'`<>]*/g
 

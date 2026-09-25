@@ -41,7 +41,7 @@ import {
   type Persona,
   type PersonaConfig,
 } from './config.ts'
-import { isCredentialsBroken, slackSideOutcome, type PersonaBringUpState } from './persona-bringup-controller.ts'
+import { isCredentialsBroken, type PersonaBringUpState } from './persona-bringup-controller.ts'
 import type { CredentialsDigest } from './persona-credentials.ts'
 import { escapeCause } from './persona-diagnostics.ts'
 import { effectiveClaudeConfigDirs, renderPersonaRef } from './persona-identity.ts'
@@ -91,9 +91,13 @@ export const FACT_UNKNOWN = 'unknown'
 /** The marker of a fact that could not be gathered. */
 export type FactUnknown = typeof FACT_UNKNOWN
 
-/** Why an added persona cannot come up: one failed local bring-up step (b.av2 SR-6.1 steps 1 and 2). */
+/**
+ * Why an added persona cannot come up: one failed local bring-up check (b.av2
+ * SR-6.1 steps 1 and 2, and the claude_config_dir check its bring-up runs
+ * before step 3, bug b.g57).
+ */
 export interface AddedPersonaCause {
-  step: 'credentials' | 'working-directory'
+  step: 'credentials' | 'working-directory' | 'claude-config-dir'
   /** The step's cause, as its check words it: token-free, never file content. */
   cause: string
 }
@@ -222,14 +226,12 @@ export interface CredentialsPersonaChange extends ChangePlanPersonaRef {
    */
   credentialsBroken: boolean | undefined
   /**
-   * The persona is retrying its bring-up (Slack-unreachable or
-   * directory-broken), or its first Slack attempt is in flight: it has no
-   * connection yet and retries with the new content (b.av2 SR-8.6), or, when
-   * the new content is not locally valid, with its current content. A
-   * persona whose connection works while its launch waits for its
-   * claude_config_dir (bug b.g57) is not retrying here: it is reconnected
-   * (`slackSideOutcome`). Undefined when its bring-up state could not be
-   * queried.
+   * The persona is retrying its bring-up (Slack-unreachable,
+   * directory-broken, or held for its claude_config_dir, bug b.g57), or its
+   * first Slack attempt is in flight: it has no connection and retries with
+   * the new content (b.av2 SR-8.6), or, when the new content is not locally
+   * valid, with its current content. Undefined when its bring-up state could
+   * not be queried.
    */
   retrying?: boolean
   /**
@@ -528,10 +530,9 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
       const state = facts.bringUpState?.(persona.key)
       const known = state !== FACT_UNKNOWN
       const credentialsBroken = known ? isCredentialsBroken(state) : undefined
-      // By its Slack side: a persona held for its claude_config_dir (b.g57)
-      // with a working connection is reconnected, not retried. An undefined
-      // outcome: its first Slack attempt is in flight, so it has no connection yet.
-      const outcome = known && state !== undefined ? slackSideOutcome(state) : undefined
+      // An undefined outcome: its first Slack attempt is in flight, so it has
+      // no connection yet.
+      const outcome = known ? state?.outcome : undefined
       const retrying = known ? state !== undefined && (outcome === 'retrying' || outcome === undefined) : undefined
       const problem = facts.credentialsProblem?.(persona.credentials_file)
       plan.credentials.push({ ...ref, path: persona.credentials_file, credentialsBroken, retrying, problem })

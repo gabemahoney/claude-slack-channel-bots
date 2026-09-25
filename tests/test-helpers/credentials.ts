@@ -6,11 +6,17 @@
  *   easy to spot in any captured artifact.
  * - `fakeToken` builds a sentinel-bearing fake token at runtime from a prefix,
  *   so no file (this one included) needs a token literal (b.av2 SR-13.2).
+ * - `sentinelInMessage` / `REDACTED_SENTINEL_TAIL` are the one way a test
+ *   error's message carries the sentinel (inside a fake token and a Socket
+ *   Mode `?ticket=` URL, never bare) and what that text reads as once
+ *   redacted; `sentinelTicketUrl` builds the URL on its own.
  * - `makeCredentials` / `writeCredentialsFile` build and write a credentials
  *   file: by default a valid SR-1.4 object, with overrides for every invalid
  *   shape the credentials tests need.
  * - `assertNoLeak` fails the test when the sentinel or a token-like value
  *   appears in captured log lines, errors, results or files the code wrote.
+ * - `withoutName` masks a token-shaped persona name and its key in captured
+ *   artifacts meant to carry them, so `assertNoLeak` checks the rest.
  * - `TOKEN_LIKE` / `isTokenLike` are the one definition of "token-like" that
  *   `assertNoLeak` applies, exported so a repo-level audit (e.g. no token
  *   literal in any test file) uses exactly the same rule.
@@ -18,13 +24,16 @@
  * Isolation (b.av2 SR-13.2): the helper writes only into the directory the
  * caller passes, which must be the test's own `mkdtempSync` directory, and
  * reads only the paths the caller marks with `writtenFile`. It never touches
- * the real home and imports no source module.
+ * the real home. Its one source import is the redaction placeholders from
+ * `src/slack-log-redaction.ts`, a pure module (no imports, no state, nothing
+ * runs at import), so `REDACTED_SENTINEL_TAIL` follows the redactor's output.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { chmodSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, relative, resolve, isAbsolute } from 'node:path'
+import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../../src/slack-log-redaction.ts'
 
 /**
  * Distinctive marker embedded in every fake token value. Letters and digits
@@ -52,12 +61,11 @@ const DEFAULT_FILE_NAME = 'credentials.json'
  * as in the rule text "bot_token must start with xoxb-", a word such as
  * "Xoxo bot", or a prefix glued to a word (`inboxapp-bot`) does not match.
  *
- * The same boundary as the source matcher `looksLikeSlackToken`
- * (`src/persona-identity.ts`), but wider after the dash (a letter as well as a
- * digit), so every value the loader rejects is token-like here too and
- * `assertNoLeak` stays at least as strict (E13 Director decision 14). Not
- * global, so `test` keeps no state between calls; build a global copy from
- * `TOKEN_LIKE.source` to find every occurrence.
+ * Wider after the dash than a real Slack token (a letter as well as a digit),
+ * so a near-token (a prefix followed by a letter) is flagged too and
+ * `assertNoLeak` errs on the strict side. The rows in `tests/persona-identity.test.ts` pin the
+ * boundary and after-dash rules. Not global, so `test` keeps no state between
+ * calls; build a global copy from `TOKEN_LIKE.source` to find every occurrence.
  */
 export const TOKEN_LIKE = /(?<![A-Za-z0-9])(?:xox[a-z]|xapp)-[A-Za-z0-9]/
 
@@ -70,14 +78,55 @@ export function isTokenLike(text: string): boolean {
  * A sentinel-bearing fake token: `prefix`, then a digit, then
  * `LEAK_SENTINEL`, then `-<suffix>` when a suffix is given. The digit right
  * after the prefix gives the fake the real format (every Slack token has a
- * digit after its dash), so the source-side matcher `looksLikeSlackToken`
- * sees it as a token. Pass any prefix (`BOT_TOKEN_PREFIX`, `APP_TOKEN_PREFIX`,
+ * digit after its dash), so it is shaped like a real token, not just like
+ * `TOKEN_LIKE`. Pass any prefix (`BOT_TOKEN_PREFIX`, `APP_TOKEN_PREFIX`,
  * a wrong one, or '' for no prefix); use distinct suffixes to tell two fake
  * tokens apart (e.g. 'env' vs 'file').
  */
 export function fakeToken(prefix: string, suffix = ''): string {
   return `${prefix}1${LEAK_SENTINEL}${suffix === '' ? '' : `-${suffix}`}`
 }
+
+/** The Socket Mode WebSocket origin `sentinelTicketUrl` uses by default (the Slack stub's). */
+export const STUB_WSS_ORIGIN = 'wss://wss-stub.invalid'
+
+/**
+ * A Socket Mode WebSocket URL at `origin` whose connection ticket is `marker`
+ * (`<origin>/link/?ticket=<marker>`), the shape a real connect error's message
+ * quotes. `redactSlackLogText` replaces it whole.
+ */
+export function sentinelTicketUrl(origin: string = STUB_WSS_ORIGIN, marker: string = LEAK_SENTINEL): string {
+  return `${origin}/link/?ticket=${marker}`
+}
+
+/**
+ * The leak marker as a test error's message carries it:
+ * `<fakeToken(prefix, label)> <sentinelTicketUrl(STUB_WSS_ORIGIN, marker)>`,
+ * i.e. a fake token, a space and `wss://wss-stub.invalid/link/?ticket=<marker>`.
+ *
+ * The rule it enforces: log lines keep an error's message after
+ * `redactSlackLogText`, so a message holds the marker only inside a token
+ * shape and a URL shape, both of which the redactor removes. A line that
+ * skips redaction, or loses either pattern, still shows the marker and fails
+ * `assertNoLeak`. Put the marker bare only in fields CSCB must never read
+ * (`data`, headers, `original`, bodies, extra properties). Wrap it as the
+ * message needs (e.g. `` `failed (${sentinelInMessage('x')})` ``); the
+ * redacted text is then `REDACTED_SENTINEL_TAIL` in the same wrapping.
+ *
+ * `label` tells two fakes apart ('' for none); `prefix` is the token prefix
+ * (`APP_TOKEN_PREFIX` for a Socket Mode leg); `marker` is the ticket (a Slack
+ * stub passes its `leakMarker`).
+ */
+export function sentinelInMessage(label: string, prefix: string = BOT_TOKEN_PREFIX, marker: string = LEAK_SENTINEL): string {
+  return `${fakeToken(prefix, label)} ${sentinelTicketUrl(STUB_WSS_ORIGIN, marker)}`
+}
+
+/**
+ * What `sentinelInMessage(…)` reads as after `redactSlackLogText`:
+ * `<redacted-token> <redacted-url>`, built from the redactor's own
+ * placeholders.
+ */
+export const REDACTED_SENTINEL_TAIL = `${REDACTED_TOKEN_PLACEHOLDER} ${REDACTED_URL_PLACEHOLDER}`
 
 /**
  * Overrides for a credentials file.
@@ -174,6 +223,70 @@ export function writtenFile(path: string): WrittenFile {
  */
 export function assertNoLeak(captured: unknown, label = 'captured'): void {
   scan(captured, redact(label), new WeakSet<object>())
+}
+
+/**
+ * A copy of `captured` with every occurrence of a persona `name` and its
+ * `key` replaced by `<name>` / `<key>`, for `assertNoLeak`:
+ * `assertNoLeak(withoutName(captured, name, key))`.
+ *
+ * For a persona whose name is shaped like a Slack token (built with
+ * `fakeToken`, so it holds the sentinel), where the artifacts are meant to
+ * carry the name as written (b.av2 SR-1.2, no format rule). The masked copy
+ * still fails `assertNoLeak` on anything else token-like, such as a
+ * credential value, even one whose text holds the name or the key.
+ *
+ * It covers what `assertNoLeak` checks, with the same traversal: strings,
+ * arrays, plain objects (keys too), Maps and Sets; an `Error` becomes a plain
+ * object of its masked message, stack, String form, own properties, `cause`
+ * and `errors`; a `writtenFile` becomes its masked content (a directory, an
+ * object of masked entry names); bytes, their masked UTF-8 text; any other
+ * object, its masked serialized and String forms. The result is only for
+ * `assertNoLeak`.
+ */
+export function withoutName(captured: unknown, name: string, key: string): unknown {
+  // Longer text first, so a name inside its key (or the reverse) is masked whole.
+  const masks: Array<[string, string]> = [[name, '<name>'], [key, '<key>']]
+  masks.sort((a, b) => b[0].length - a[0].length)
+  const mask = (text: string): string => masks.reduce((t, [from, to]) => t.replaceAll(from, to), text)
+  return maskDeep(captured, mask, new WeakSet<object>())
+}
+
+function maskDeep(value: unknown, mask: (text: string) => string, seen: WeakSet<object>): unknown {
+  if (typeof value === 'string') return mask(value)
+  if (typeof value === 'bigint') return mask(String(value))
+  if (value === null || typeof value !== 'object') return value
+  if (seen.has(value)) return '[Circular]'
+  seen.add(value)
+  const deep = (item: unknown) => maskDeep(item, mask, seen)
+
+  if (value instanceof WrittenFile) return maskPath(value.path, mask)
+  if (value instanceof Uint8Array) return mask(new TextDecoder().decode(value))
+  if (value instanceof Error) {
+    return {
+      message: mask(value.message ?? ''),
+      stack: mask(value.stack ?? ''),
+      string: mask(stringify(value)),
+      properties: Object.fromEntries(
+        Object.entries(value).filter(([k]) => k !== 'cause' && k !== 'errors').map(([k, v]) => [mask(k), deep(v)]),
+      ),
+      cause: 'cause' in value ? deep(value.cause) : undefined,
+      errors: value instanceof AggregateError ? deep(value.errors) : undefined,
+    }
+  }
+  if (Array.isArray(value)) return value.map(deep)
+  if (value instanceof Map) return [...value].map(([k, v]) => [deep(k), deep(v)])
+  if (value instanceof Set) return [...value].map(deep)
+  if (isPlainObject(value) && typeof (value as { toJSON?: unknown }).toJSON !== 'function') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [mask(k), deep(v)]))
+  }
+  return { serialized: mask(serialize(value)), string: mask(stringify(value)) }
+}
+
+/** A file's masked content, or an object of a directory's masked entry names to their masked content. */
+function maskPath(path: string, mask: (text: string) => string): unknown {
+  if (!statSync(path).isDirectory()) return mask(readFileSync(path, 'utf-8'))
+  return Object.fromEntries(readdirSync(path).map((entry) => [mask(entry), maskPath(join(path, entry), mask)]))
 }
 
 /** Replace any sentinel or token-like run in a label so the label never leaks. */

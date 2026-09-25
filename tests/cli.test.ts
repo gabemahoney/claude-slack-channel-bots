@@ -66,7 +66,16 @@ import {
 } from '../src/config.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { readAppliedPersonaConfig } from '../src/reload.ts'
-import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, writeCredentialsFile } from './test-helpers/credentials.ts'
+import {
+  APP_TOKEN_PREFIX,
+  assertNoLeak,
+  BOT_TOKEN_PREFIX,
+  fakeToken,
+  LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
+  sentinelInMessage,
+  writeCredentialsFile,
+} from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
   makeMultiPersonaConfig,
@@ -1358,19 +1367,20 @@ describe('persona-set teardown', () => {
 
   // AC 20 (b.av2 SR-10.3): the pause-escalation, timeout-path "kill failed"
   // and aggregate teardown lines log each error's description (type, a base
-  // agent-director error's errName, safe code, frames), never the error
-  // itself or its message. The errors carry fake tokens; the raw
-  // console.error arguments are checked. With a successful pause and
+  // agent-director error's errName, safe code, message through
+  // `redactSlackLogText`, frames), never the error itself. The errors carry
+  // fake tokens (in a message, with a URL); the raw console.error arguments
+  // are checked. With a successful pause and
   // `exit_timeout: 0` the poll loop never runs, so the timeout path's kill is
   // reached at once.
-  test('AC 20: a pause and then its escalation kill failing with errors carrying fake tokens — the pause and teardown lines name each error without its message; clean_restart exits 1; nothing logged leaks', async () => {
+  test('AC 20: a pause and then its escalation kill failing with errors carrying fake tokens — the pause and teardown lines name each error with its message redacted; clean_restart exits 1; nothing logged leaks', async () => {
     const b = makeDeps({
       directorStatus: async () => ({ state: 'waiting' }),
       directorPause: async () => {
-        throw Object.assign(new Error(`pause refused ${fakeToken(BOT_TOKEN_PREFIX, 'pause')}`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
+        throw Object.assign(new Error(`pause refused (${sentinelInMessage('pause')})`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
       },
       directorKill: async () => {
-        throw new AgentDirectorError('kill', 'ErrKillBroken', `kill refused ${fakeToken(APP_TOKEN_PREFIX, 'kill')}`)
+        throw new AgentDirectorError('kill', 'ErrKillBroken', `kill refused (${sentinelInMessage('kill', APP_TOKEN_PREFIX)})`)
       },
     })
 
@@ -1379,23 +1389,23 @@ describe('persona-set teardown', () => {
     const ref = renderPersonaRef(OPS_NAME, personaKey(OPS_NAME))
     const line = (fragment: string): string[] => stderr.filter((l) => l.includes(fragment))
     expect(line('pause failed').map((l) => l.split(' at ')[0])).toEqual([
-      `[slack] teardownBots: pause failed for persona ${ref} — escalating to kill: Error code=ECONNRESET`,
+      `[slack] teardownBots: pause failed for persona ${ref} — escalating to kill: Error code=ECONNRESET message="pause refused (${REDACTED_SENTINEL_TAIL})"`,
     ])
     expect(line('error during teardown').map((l) => l.split(' at ')[0])).toEqual([
-      '[slack] teardownBots: agent-director error during teardown: AgentDirectorError errName=ErrKillBroken',
+      `[slack] teardownBots: agent-director error during teardown: AgentDirectorError errName=ErrKillBroken message="ErrKillBroken: kill refused (${REDACTED_SENTINEL_TAIL})"`,
     ])
     expect(b.exitCodes).toEqual([1])
     expect(startedServer(b)).toBe(false)
     assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
   })
 
-  test('AC 20: a timeout-path kill failing with an error carrying fake tokens — the "kill failed" and teardown lines name the error without its message; clean_restart exits 1; nothing logged leaks', async () => {
+  test('AC 20: a timeout-path kill failing with an error carrying fake tokens — the "kill failed" and teardown lines name the error with its message redacted; clean_restart exits 1; nothing logged leaks', async () => {
     const b = makeDeps({
       config: opsConfig({ exit_timeout: 0 }),
       directorStatus: async () => ({ state: 'waiting' }),
       directorPause: async () => { /* pause succeeds */ },
       directorKill: async () => {
-        throw Object.assign(new Error(`kill refused ${fakeToken(BOT_TOKEN_PREFIX, 'kill')}`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
+        throw Object.assign(new Error(`kill refused (${sentinelInMessage('kill')})`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
       },
     })
 
@@ -1406,10 +1416,10 @@ describe('persona-set teardown', () => {
     expect(b.pauseCalls).toEqual([opsId()])
     expect(b.killCalls).toEqual([opsId()])
     expect(line('kill failed').map((l) => l.split(' at ')[0])).toEqual([
-      `[slack] teardownBots: kill failed for persona ${ref}: Error code=ECONNRESET`,
+      `[slack] teardownBots: kill failed for persona ${ref}: Error code=ECONNRESET message="kill refused (${REDACTED_SENTINEL_TAIL})"`,
     ])
     expect(line('error during teardown').map((l) => l.split(' at ')[0])).toEqual([
-      '[slack] teardownBots: agent-director error during teardown: Error code=ECONNRESET',
+      `[slack] teardownBots: agent-director error during teardown: Error code=ECONNRESET message="kill refused (${REDACTED_SENTINEL_TAIL})"`,
     ])
     expect(b.exitCodes).toEqual([1])
     expect(startedServer(b)).toBe(false)
@@ -1842,10 +1852,10 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     expect(b.statusCalls).toEqual([])
   })
 
-  test('an incomplete teardown (TeardownIncompleteError) prints its count and retry advice on the teardown-failed line; the underlying error, carrying fake tokens, is only described; exit 1; nothing logged leaks', async () => {
+  test('an incomplete teardown (TeardownIncompleteError) prints its count and retry advice on the teardown-failed line; the underlying error, carrying fake tokens, is only described, its message redacted; exit 1; nothing logged leaks', async () => {
     const b = makeStopDeps({
       directorStatus: async () => {
-        throw Object.assign(new Error(`status refused ${fakeToken(BOT_TOKEN_PREFIX, 'status')}`), { code: 'ECONNREFUSED', note: LEAK_SENTINEL })
+        throw Object.assign(new Error(`status refused (${sentinelInMessage('status')})`), { code: 'ECONNREFUSED', note: LEAK_SENTINEL })
       },
     })
 
@@ -1855,17 +1865,32 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
       '[slack] stop --stop-bots: bot teardown failed: teardownBots: agent-director error — teardown incomplete for 1 persona(s); ' +
         'other personas may already have been paused or killed; rows are never deleted, safe to retry',
     ])
-    expect(linesWith('error during teardown')).toEqual(['[slack] teardownBots: agent-director error during teardown: Error code=ECONNREFUSED'])
+    expect(linesWith('error during teardown')).toEqual([
+      `[slack] teardownBots: agent-director error during teardown: Error code=ECONNREFUSED message="status refused (${REDACTED_SENTINEL_TAIL})"`,
+    ])
     expect(b.exitCodes).toEqual([1])
     assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
   })
 
   test.each<[string, () => unknown, string]>([
-    ['a plain Error with a safe code', () => Object.assign(new Error(`gate ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), { code: 'EACCES', note: LEAK_SENTINEL }), 'Error code=EACCES'],
-    ['a base AgentDirectorError with a safe errName', () => new AgentDirectorError('init', 'ErrGateBroken', `refused ${fakeToken(APP_TOKEN_PREFIX, 'desc')}`), 'AgentDirectorError errName=ErrGateBroken'],
-    ['a base AgentDirectorError whose errName is token-shaped', () => new AgentDirectorError('init', fakeToken(BOT_TOKEN_PREFIX, 'errname'), `refused ${LEAK_SENTINEL}`), 'AgentDirectorError'],
-    ['a rejected string', () => `down ${fakeToken(BOT_TOKEN_PREFIX, 'str')}`, 'string'],
-  ])('initClient throwing %s carrying fake tokens → the initialization-failed line names it by description, never its message; exit 1; nothing logged leaks', async (_label, makeErr, shown) => {
+    [
+      'a plain Error with a safe code',
+      () => Object.assign(new Error(`gate (${sentinelInMessage('msg')})`), { code: 'EACCES', note: LEAK_SENTINEL }),
+      `Error code=EACCES message="gate (${REDACTED_SENTINEL_TAIL})"`,
+    ],
+    [
+      'a base AgentDirectorError with a safe errName',
+      () => new AgentDirectorError('init', 'ErrGateBroken', `refused (${sentinelInMessage('desc', APP_TOKEN_PREFIX)})`),
+      `AgentDirectorError errName=ErrGateBroken message="ErrGateBroken: refused (${REDACTED_SENTINEL_TAIL})"`,
+    ],
+    // The token-shaped errName is left out of the errName= field and redacted where the message quotes it.
+    [
+      'a base AgentDirectorError whose errName is token-shaped',
+      () => new AgentDirectorError('init', fakeToken(BOT_TOKEN_PREFIX, 'errname'), `refused (${sentinelInMessage('desc', APP_TOKEN_PREFIX)})`),
+      `AgentDirectorError message="<redacted-token> refused (${REDACTED_SENTINEL_TAIL})"`,
+    ],
+    ['a rejected string', () => `down (${sentinelInMessage('str')})`, `string message="down (${REDACTED_SENTINEL_TAIL})"`],
+  ])('initClient throwing %s carrying fake tokens → the initialization-failed line names it by description, its message redacted; exit 1; nothing logged leaks', async (_label, makeErr, shown) => {
     const b = makeStopDeps({
       initClient: async () => { throw makeErr() },
       directorStatus: async () => ({ state: 'waiting' }),

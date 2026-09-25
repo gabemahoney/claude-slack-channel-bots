@@ -93,7 +93,15 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeStubSlack, openedDm, type StubSlack } from './test-helpers/slack-stub.ts'
-import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
+import {
+  APP_TOKEN_PREFIX,
+  BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
+  assertNoLeak,
+  fakeToken,
+  sentinelInMessage,
+} from './test-helpers/credentials.ts'
 import {
   makePersonaClients,
   makeTrailCapture,
@@ -886,10 +894,12 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
   })
 
   // AC 20 (b.av2 SR-10.3): the catch-all line logs the error's description
-  // (type, safe code, frames), never the error itself or its message.
+  // (type, safe code, the message logged redacted, frames), never the error
+  // itself (E14 Task 0, operator decision B1).
+  /** A ticket URL shaped like Slack's Socket Mode WebSocket URL, holding the leak sentinel. */
   /** A non-agent-director decide error whose message and properties carry fake tokens. */
   const sentinelDecideError = (): Error =>
-    Object.assign(new Error(`socket closed ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), {
+    Object.assign(new Error(`socket closed ${sentinelInMessage('msg')}`), {
       code: 'ECONNRESET',
       detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
       note: LEAK_SENTINEL,
@@ -909,16 +919,21 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
     return { result, logs, trail }
   }
 
-  // E13 Director decision 16: an agent-director errName is logged only when it
-  // passes `isSafeIdentifier`; a token-shaped one falls back to the description.
+  // An agent-director errName is logged only when it passes
+  // `isSafeIdentifier`, with its redacted description; a token-shaped one
+  // falls back to the description.
   test.each([
-    { label: 'a non-AgentDirectorError carrying fake tokens', makeErr: sentinelDecideError, desc: 'Error code=ECONNRESET at ' },
+    {
+      label: 'a non-AgentDirectorError carrying fake tokens',
+      makeErr: sentinelDecideError,
+      desc: `Error code=ECONNRESET message="socket closed ${REDACTED_SENTINEL_TAIL}" at `,
+    },
     {
       label: 'an AgentDirectorError with a token-shaped errName',
       makeErr: () => errGeneric('decide', fakeToken(BOT_TOKEN_PREFIX, 'errname'), 'transient'),
-      desc: 'AgentDirectorError at ',
+      desc: 'AgentDirectorError message="<redacted-token> transient" at ',
     },
-  ])('AC 20: $label → one "decide failed" line naming its type and safe code only; no log line or Slack call leaks', async ({ makeErr, desc }) => {
+  ])('AC 20: $label → one "decide failed" line naming its type, safe code and redacted message; no log line or Slack call leaks', async ({ makeErr, desc }) => {
     const { result, logs } = await clickWithFailingDecide(makeErr())
 
     expect(result).toBe(true)
@@ -926,6 +941,19 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
     expect(logs[0]).toHaveLength(1)
     expect(String(logs[0]![0])).toStartWith(`[slack] permission-click: decide failed for ${h.instanceA}: ${desc}`)
     expect(h.stubA.calls.update).toHaveLength(0)
+    assertNoLeak({ logs, slack: h.stubA.web.callLog })
+  })
+
+  test('AC 20: an AgentDirectorError with a safe errName → one "decide failed" line that is the errName and its redacted description, no frames; nothing leaks', async () => {
+    const err = errGeneric('decide', 'ErrDaemonBusy', `retry later ${sentinelInMessage('desc')}`)
+    const { result, logs } = await clickWithFailingDecide(err)
+
+    expect(result).toBe(true)
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toHaveLength(1)
+    expect(String(logs[0]![0])).toBe(
+      `[slack] permission-click: decide failed for ${h.instanceA}: ErrDaemonBusy message="retry later ${REDACTED_SENTINEL_TAIL}"`,
+    )
     assertNoLeak({ logs, slack: h.stubA.web.callLog })
   })
 

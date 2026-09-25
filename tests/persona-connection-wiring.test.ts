@@ -126,7 +126,15 @@ import {
 } from './test-helpers/persona-routing-harness.ts'
 import { initRestart } from '../src/restart.ts'
 import { cannedGetResultPlural, cannedListRow, cannedPermissionRequest } from './test-helpers/agent-director-stub.ts'
-import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
+import {
+  APP_TOKEN_PREFIX,
+  BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
+  assertNoLeak,
+  fakeToken,
+  sentinelInMessage,
+} from './test-helpers/credentials.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
 import { outputDuringAsync, socketLogLine, ticketUrl } from './test-helpers/slack-logger-probes.ts'
 
@@ -146,6 +154,21 @@ const CS = 'C0WIRESH1'
 const REQUEST_TOKEN = '44444444-4444-4444-8444-444444444444'
 const CLICKER = 'U0CLICKER1'
 const PROMPT_TS = '1700000000.777777'
+
+/**
+ * A thrown error's message: `text`, then the leak marker only inside a fake
+ * token and a Socket Mode ticket URL (`sentinelInMessage`), the shapes
+ * `redactSlackLogText` replaces. A log line keeps the message, so it shows
+ * the marker only if redaction is skipped.
+ */
+function markedMessage(text: string): string {
+  return `${text} (${sentinelInMessage('thrown')})`
+}
+
+/** The `message="…"` field a log line carries for `markedMessage(text)`: both shapes redacted. */
+function redactedMessageField(text: string): string {
+  return `message="${text} (${REDACTED_SENTINEL_TAIL})"`
+}
 
 const SPECS: PersonaSpec[] = [
   { name: ALPHA, channels: [{ id: CA, delivery: 'all' }, { id: CS, delivery: 'all' }], permission_prompts: CA },
@@ -396,14 +419,14 @@ describe('SR-3.1: each connection\'s inbound events reach the intake with its ow
     expect(logs).toEqual([`[slack] persona=${h.A.key}: ignoring unexpected reaction_added event`])
   })
 
-  test('a throw while handling A\'s event is logged with A\'s key, token-safely, never reaches the manager, and B\'s events are still delivered', async () => {
+  test('a throw while handling A\'s event is logged with A\'s key and its message redacted, token-safely, never reaches the manager, and B\'s events are still delivered', async () => {
     const h = harness()
     await bringUpBoth(h)
     const intake = recordingIntake()
-    // Throw for A only, with a code and a sentinel-bearing message.
+    // Throw for A only, with a code and a message carrying the marker in a token and a URL.
     const throwing: Pick<PersonaRouting, 'receive'> = {
       receive: async (event, ack, key) => {
-        if (key === h.A.key) throw Object.assign(new Error(`boom ${LEAK_SENTINEL}`), { code: 'EBOOM' })
+        if (key === h.A.key) throw Object.assign(new Error(markedMessage('boom')), { code: 'EBOOM' })
         return intake.receive(event, ack, key)
       },
     }
@@ -416,6 +439,7 @@ describe('SR-3.1: each connection\'s inbound events reach the intake with its ow
     const failed = logs.filter((l) => l.includes('event handling failed'))
     expect(failed).toHaveLength(1)
     expect(failed[0]).toStartWith(`[slack] persona=${h.A.key}: message event handling failed: Error code=EBOOM`)
+    expect(failed[0]).toContain(redactedMessageField('boom'))
     expect(intake.calls).toEqual([{ event: onB, key: h.B.key }])
     expect(h.stub(h.B).socket.acks).toHaveLength(1)
     // The router caught it: the manager logged no handler failure.
@@ -423,12 +447,12 @@ describe('SR-3.1: each connection\'s inbound events reach the intake with its ow
     assertNoLeak({ logs, lines: h.lines })
   })
 
-  test('a click handler throw is logged with the persona key and the action\'s place in the payload, token-safely', async () => {
+  test('a click handler throw is logged with the persona key, the action\'s place in the payload and its message redacted, token-safely', async () => {
     const h = harness()
     await bringUpBoth(h)
     const { logs } = plugRouter(h, recordingIntake(), {
       handleClick: async () => {
-        throw new Error(`click failed ${LEAK_SENTINEL}`)
+        throw new Error(markedMessage('click failed'))
       },
     })
 
@@ -437,6 +461,7 @@ describe('SR-3.1: each connection\'s inbound events reach the intake with its ow
     const failed = logs.filter((l) => l.includes('handling failed'))
     expect(failed).toHaveLength(1)
     expect(failed[0]).toStartWith(`[slack] persona=${h.B.key}: interactive action 1 of 1 handling failed: Error`)
+    expect(failed[0]).toContain(redactedMessageField('click failed'))
     expect(h.lines.filter((l) => l.includes('event handler failed'))).toEqual([])
     assertNoLeak({ logs })
   })
@@ -510,10 +535,10 @@ describe('SR-7.1: interactive payloads reach the click handler with the receivin
     expect(h.stub(h.A).socket.acks).toHaveLength(1)
   })
 
-  test('a throw on action 1 is logged with its place in the payload, token-safely, and action 2 is still handled', async () => {
+  test('a throw on action 1 is logged with its place in the payload and its message redacted, token-safely, and action 2 is still handled', async () => {
     const h = harness()
     const click = clickSpy((actionId) => {
-      if (actionId === 'first_action') throw Object.assign(new Error(`click failed ${LEAK_SENTINEL}`), { code: 'EBOOM' })
+      if (actionId === 'first_action') throw Object.assign(new Error(markedMessage('click failed')), { code: 'EBOOM' })
       return true
     })
     const { router, logs, trail } = plugRouter(h, recordingIntake(), { handleClick: click.handleClick })
@@ -528,6 +553,7 @@ describe('SR-7.1: interactive payloads reach the click handler with the receivin
     const failed = logs.filter((l) => l.includes('handling failed'))
     expect(failed).toHaveLength(1)
     expect(failed[0]).toStartWith(`[slack] persona=${h.A.key}: interactive action 1 of 2 handling failed: Error code=EBOOM`)
+    expect(failed[0]).toContain(redactedMessageField('click failed'))
     assertNoLeak({ logs })
   })
 

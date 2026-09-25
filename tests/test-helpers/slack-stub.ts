@@ -85,6 +85,12 @@
  * the message, the `original` (message and an `Authorization` header built
  * with `fakeToken`), HTTP headers and body, the `error` event's error, and
  * fields of `data` other than `data.error`, which stays exactly as scripted.
+ * In a message (the error's own, the `original`'s, the `error` event's) the
+ * marker is carried only inside a fake token and a `wss://…?ticket=` URL
+ * (`sentinelInMessage` from the credentials helper),
+ * because log lines keep a message after `redactSlackLogText`, which removes
+ * both shapes. Everywhere else (headers, `data`, body) it is bare: CSCB must
+ * never read those fields at all.
  * `closed-before-hello` rejects with no value, so it carries nothing. A
  * request error from a client built with `attachOriginalToWebAPIRequestError:
  * false` carries nothing either: without `original` the library keeps only
@@ -103,7 +109,7 @@ import type { AppsConnectionsOpenResponse, WebClient, WebClientOptions } from '@
 import { ErrorCode as SocketModeErrorCode } from '@slack/socket-mode'
 import type { SocketModeOptions } from '@slack/socket-mode'
 import type { PersonaSlackClientFactory } from '../../src/persona-slack-clients.ts'
-import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, fakeToken } from './credentials.ts'
+import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, fakeToken, sentinelInMessage } from './credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Scripted outcomes
@@ -603,16 +609,22 @@ interface CallContext {
   marker: string | undefined
 }
 
-/** ` (<marker>)` when a marker is set, else ''. */
-function markerSuffix(marker: string | undefined): string {
-  return marker === undefined ? '' : ` (${marker})`
+/**
+ * ` (<marker in a token and a URL>)` when a marker is set, else '': the marker
+ * as an error message carries it (`sentinelInMessage`, the token labelled
+ * with the marker), so a line that skips redaction (or loses either pattern)
+ * still shows it.
+ */
+function markerSuffix(marker: string | undefined, tokenPrefix: string): string {
+  return marker === undefined ? '' : ` (${sentinelInMessage(marker, tokenPrefix, marker)})`
 }
 
 function codedError(message: string, code: string, fields: Record<string, unknown> = {}): Error {
   return Object.assign(new Error(message), { code }, fields)
 }
 
-function platformError(error: string | undefined, retryAfter: number | undefined, marker: string | undefined): Error {
+function platformError(error: string | undefined, retryAfter: number | undefined, ctx: CallContext): Error {
+  const { marker } = ctx
   const responseMetadata: Record<string, unknown> = {}
   if (retryAfter !== undefined) responseMetadata.retryAfter = retryAfter
   const data: Record<string, unknown> = { ok: false, response_metadata: responseMetadata }
@@ -621,14 +633,16 @@ function platformError(error: string | undefined, retryAfter: number | undefined
     responseMetadata.messages = [`[ERROR] ${marker}`]
     data.provided = marker
   }
-  return codedError(`An API error occurred: ${error}${markerSuffix(marker)}`, WebApiErrorCode.PlatformError, { data })
+  return codedError(`An API error occurred: ${error}${markerSuffix(marker, ctx.tokenPrefix)}`, WebApiErrorCode.PlatformError, {
+    data,
+  })
 }
 
 /** The axios error `@slack/web-api` wraps in a request error. */
 function axiosError(message: string, code: string, ctx: CallContext): Error {
   const headers: Record<string, string> = { 'Content-Type': 'application/x-www-form-urlencoded' }
   if (ctx.marker !== undefined) headers.Authorization = `Bearer ${fakeToken(ctx.tokenPrefix, ctx.marker)}`
-  const err = codedError(`${message}${markerSuffix(ctx.marker)}`, code, {
+  const err = codedError(`${message}${markerSuffix(ctx.marker, ctx.tokenPrefix)}`, code, {
     isAxiosError: true,
     config: { url: `https://slack.com/api/${ctx.method}`, method: 'post', timeout: ctx.timeoutMs ?? 0, headers },
     request: { method: 'POST', path: `/api/${ctx.method}` },
@@ -658,10 +672,11 @@ function requestError(outcome: 'network' | 'dns' | 'timeout', ctx: CallContext):
   return codedError(`A request error occurred: ${original.message}`, WebApiErrorCode.RequestError, { original })
 }
 
-function httpError(status: number, marker: string | undefined): Error {
+function httpError(status: number, ctx: CallContext): Error {
+  const { marker } = ctx
   const headers: Record<string, string> = { 'content-type': 'text/html' }
   if (marker !== undefined) headers['x-slack-req-id'] = marker
-  return codedError(`An HTTP protocol error occurred: statusCode = ${status}${markerSuffix(marker)}`, WebApiErrorCode.HTTPError, {
+  return codedError(`An HTTP protocol error occurred: statusCode = ${status}${markerSuffix(marker, ctx.tokenPrefix)}`, WebApiErrorCode.HTTPError, {
     statusCode: status,
     statusMessage: STATUS_CODES[status] ?? '',
     headers,
@@ -669,9 +684,9 @@ function httpError(status: number, marker: string | undefined): Error {
   })
 }
 
-function rateLimitedError(retryAfter: number, marker: string | undefined): Error {
+function rateLimitedError(retryAfter: number, ctx: CallContext): Error {
   return codedError(
-    `A rate-limit has been reached, you may retry this request in ${retryAfter} seconds${markerSuffix(marker)}`,
+    `A rate-limit has been reached, you may retry this request in ${retryAfter} seconds${markerSuffix(ctx.marker, ctx.tokenPrefix)}`,
     WebApiErrorCode.RateLimitedError,
     { retryAfter },
   )
@@ -681,15 +696,15 @@ function rateLimitedError(retryAfter: number, marker: string | undefined): Error
 function webApiFailure(outcome: SettledWebApiOutcome | SettledConnectOutcome, ctx: CallContext): Error | undefined {
   switch (outcome.kind) {
     case 'platform':
-      return platformError(outcome.error, outcome.retryAfter, ctx.marker)
+      return platformError(outcome.error, outcome.retryAfter, ctx)
     case 'network':
     case 'dns':
     case 'timeout':
       return requestError(outcome.kind, ctx)
     case 'http':
-      return httpError(outcome.status, ctx.marker)
+      return httpError(outcome.status, ctx)
     case 'rate-limited':
-      return rateLimitedError(outcome.retryAfter, ctx.marker)
+      return rateLimitedError(outcome.retryAfter, ctx)
     default:
       return undefined
   }
@@ -1130,7 +1145,8 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
         if (outcome.kind === 'open-never-answers') return new Promise<AppsConnectionsOpenResponse>(() => {})
         if (outcome.kind === 'reject') throw outcome.value
         if (outcome.kind === 'no-url') {
-          throw new Error(`apps.connections.open did not return a URL! (response: ${marker ?? '[object Object]'})`)
+          const response = marker === undefined ? '[object Object]' : sentinelInMessage(marker, APP_TOKEN_PREFIX, marker)
+          throw new Error(`apps.connections.open did not return a URL! (response: ${response})`)
         }
         const failure = webApiFailure(outcome, connectCtx)
         if (failure !== undefined) throw failure
@@ -1158,7 +1174,7 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
             } else if (outcome.kind === 'closed-before-hello') {
               closeSocket()
             } else if (outcome.kind === 'websocket-error') {
-              const original = Object.assign(new Error(`read ECONNRESET${markerSuffix(marker)}`), { code: 'ECONNRESET' })
+              const original = Object.assign(new Error(`read ECONNRESET${markerSuffix(marker, APP_TOKEN_PREFIX)}`), { code: 'ECONNRESET' })
               const err = codedError(original.message, SocketModeErrorCode.WebsocketError, { original })
               try {
                 emitLifecycle('error', err)

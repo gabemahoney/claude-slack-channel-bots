@@ -27,8 +27,9 @@
  * Every event is handled only for the persona whose connection received it:
  * no other persona's key, connection or client is consulted here. A throw
  * while handling one event is caught and logged with the persona key through
- * `describeThrownValue` (never the error's message, which can hold a token),
- * and never escapes to the manager.
+ * `describeThrownValue` (the error's message only through
+ * `redactSlackLogText`, since it can hold a token or a URL), and never
+ * escapes to the manager.
  *
  * Side-effect free (b.av2 SR-13.1): importing this module creates no client,
  * reads no file, environment variable or token and starts no timer. Every

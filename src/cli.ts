@@ -203,7 +203,8 @@ class TeardownIncompleteError extends Error {
 /**
  * The tail of a CLI failure line: the message of a failure CSCB authored
  * ({@link StartupGateFailedError}, {@link TeardownIncompleteError}), else
- * `describeThrownValue` of the thrown value, never its message.
+ * `describeThrownValue` of the thrown value (its message only through
+ * `redactSlackLogText`).
  */
 function describeCliFailure(err: unknown): string {
   if (err instanceof StartupGateFailedError || err instanceof TeardownIncompleteError) return err.message

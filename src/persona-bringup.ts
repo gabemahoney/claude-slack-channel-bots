@@ -19,11 +19,13 @@
  * outcomes and the directory-retry timers are the bring-up controller's
  * (`persona-bringup-controller.ts`).
  *
- * `checkPersonaConfigDir` (bug b.g57) is the pre-launch check of a persona's
- * effective claude_config_dir: its real path with no lexical fallback
+ * `checkPersonaConfigDir` (bug b.g57) checks a persona's effective
+ * claude_config_dir: its real path with no lexical fallback
  * (`resolveRealPathStrict`), or `persona-config-dir-unresolvable`. The
- * session manager runs it before every launch; the bring-up controller
- * re-checks it while a launch waits for the directory.
+ * session manager runs it before every launch; the bring-up controller runs
+ * it right before a persona's Slack step and re-checks it while the persona
+ * is held, with no Slack connection, for the directory; the reload preview
+ * runs it on each added persona.
  *
  * Logging contract (same as `persona-credentials.ts`): every failure's
  * formatted line is returned; when a `log` is passed each failure line is
@@ -212,10 +214,16 @@ export function checkPersonaWorkingDirectory(
 /** The persona whose effective claude_config_dir is checked (`checkPersonaConfigDir`). */
 export type ConfigDirPersona = Pick<Persona, 'index' | 'name' | 'key' | 'claude_config_dir'>
 
-/** Result of `checkPersonaConfigDir`: the directory's real path (or the one it will have once created), or the failure. */
+/**
+ * Result of `checkPersonaConfigDir`: the directory's real path (or the one it
+ * will have once created), or the failure. A failure's `problem` is its cause
+ * without the consequence for a held persona (`claude_config_dir cannot be
+ * resolved to a real path (<errno>)`), for a reader that words the
+ * consequence itself (the reload preview of an added persona).
+ */
 export type ConfigDirCheckResult =
   | { ok: true; realPath: string }
-  | PersonaCheckFailure<typeof PERSONA_CONFIG_DIR_UNRESOLVABLE>
+  | (PersonaCheckFailure<typeof PERSONA_CONFIG_DIR_UNRESOLVABLE> & { problem: string })
 
 /** Options for `checkPersonaConfigDir`. */
 export interface CheckPersonaConfigDirOptions {
@@ -228,11 +236,12 @@ export interface CheckPersonaConfigDirOptions {
 }
 
 /** What a `persona-config-dir-unresolvable` cause says after the resolution failure. */
-const CONFIG_DIR_UNRESOLVABLE_CONSEQUENCE = 'its session is kept, and its launch waits until it resolves'
+const CONFIG_DIR_UNRESOLVABLE_CONSEQUENCE = 'its Slack connection is closed and its launch waits until it resolves'
 
 /**
  * Check that a persona's effective claude_config_dir can be resolved to a
- * real path before it is launched (bug b.g57), with `resolveRealPathStrict`:
+ * real path before it connects to Slack and before it is launched (bug
+ * b.g57), with `resolveRealPathStrict`:
  * no lexical fallback. A directory not created yet under a resolvable
  * ancestor passes, with the real path it will have. A symlink on its path
  * that points to nothing, or any other resolution failure, is
@@ -250,17 +259,19 @@ export function checkPersonaConfigDir(
   const reason = resolution.danglingSymlink
     ? `${resolution.code}: a symlink on its path points to nothing`
     : resolution.code
-  return personaCheckFailure(
+  const problem = `claude_config_dir cannot be resolved to a real path (${reason})`
+  const failure = personaCheckFailure(
     {
       class: PERSONA_CONFIG_DIR_UNRESOLVABLE,
       name: persona.name,
       key: persona.key,
       index: persona.index,
       path,
-      cause: `claude_config_dir cannot be resolved to a real path (${reason}); ${CONFIG_DIR_UNRESOLVABLE_CONSEQUENCE}`,
+      cause: `${problem}; ${CONFIG_DIR_UNRESOLVABLE_CONSEQUENCE}`,
     },
     options.log,
   )
+  return { ...failure, problem }
 }
 
 /**

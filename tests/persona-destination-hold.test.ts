@@ -67,7 +67,14 @@ import {
   type StubSlack,
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
-import { BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
+import {
+  BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
+  assertNoLeak,
+  fakeToken,
+  sentinelInMessage,
+} from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -117,8 +124,9 @@ beforeEach(() => {
   failures = []
   clock = createFakeClock()
   lookupThrows = undefined
-  // The message carries the leak marker: no line may copy it.
-  lookupError = new Error(`lookup failed ${LEAK_SENTINEL}`)
+  // The message carries the leak marker inside a fake token and a WebSocket
+  // ticket URL: its line logs the message redacted, so no line may copy it.
+  lookupError = new Error(`lookup failed (${sentinelInMessage('lookup')})`)
   resolverThrows = 0
   const log = (line: string): void => {
     logs.push(line)
@@ -768,6 +776,8 @@ describe('held-notice retries', () => {
         expect(onlyTimerDelay()).toBe(10_000)
       }
       expect(logs).toEqual([startLines()[0]!, lookupLine()])
+      // The line keeps the thrown value's message, redacted.
+      expect(logs[1]).toContain(`message="lookup failed (${REDACTED_SENTINEL_TAIL})"`)
       expect(stub(D).calls.conversationsOpen).toHaveLength(2)
       expect(hold.view(D.key)).toEqual({ held: true, heldNotices: 1, nextDueAt: clock.now() + 10_000 })
 

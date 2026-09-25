@@ -29,13 +29,19 @@
  * the outcome. The 64 KiB read cap on
  * the start, tick and confirmation paths. Token secrecy on the reload path
  * (SR-10.3, AC 20): a Slack token pasted under a `bot_token` or `app_token`
- * key, and a token-shaped persona name, each an INVALID candidate on a
- * running server, a confirmed one and a refused start (from the config file
- * or a hand-edited record), with every server-side file under the temp root
- * leak-checked. Every test runs `assertNoLeak` over
- * what each run captured and checks no Slack post, except the one pure case
- * of the default step 3 body (`lifecycleApplySlots` gives each persona one
- * in-place update), which builds no run and handles no token.
+ * key is an INVALID candidate on a running server, a confirmed one and a
+ * refused start (from the config file or a hand-edited record), with every
+ * server-side file under the temp root leak-checked. A token-shaped persona
+ * name is not a secret (b.av2 SR-1.2, no format rule): renaming a persona to
+ * one, or adding one, is a valid candidate previewed and applied with the
+ * name as written, and a start from the config file or the record with one
+ * starts. Every test runs `assertNoLeak` over what each run captured and
+ * checks no Slack post, except the one pure case of the default step 3 body
+ * (`lifecycleApplySlots` gives each persona one in-place update), which
+ * builds no run and handles no token. The token-shaped-name runs' artifacts
+ * are asserted to hold that name (built by `fakeToken`, so it carries the
+ * sentinel), so they run `assertNoLeak` with the name and its key masked
+ * (`withoutName`): the rest, credential values included, is still checked.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -51,7 +57,6 @@ import {
   type Persona,
   type PersonaConfigFs,
   type PersonaInput,
-  TOKEN_LIKE_NAME_MESSAGE,
 } from '../src/config.ts'
 import type { PersonaBringUpOutcome, PersonaCredentialsChangeResult } from '../src/persona-bringup-controller.ts'
 import { CREDENTIALS_UNREADABLE_MARKER } from '../src/persona-credentials.ts'
@@ -90,6 +95,9 @@ import {
   fakeToken,
   LEAK_SENTINEL,
   makeCredentials,
+  REDACTED_SENTINEL_TAIL,
+  sentinelInMessage,
+  withoutName,
   writtenFile,
 } from './test-helpers/credentials.ts'
 import { stubCallCount } from './test-helpers/agent-director-stub.ts'
@@ -129,6 +137,13 @@ afterEach(async () => {
 /** `{ personas }` in file form. */
 function configOf(...personas: PersonaInput[]): { personas: PersonaInput[] } {
   return { personas }
+}
+
+/** A symlink `<root>/<name>` to `<root>/<name>-target`, which does not exist; returns the link's path. */
+function danglingLink(name: string): string {
+  const link = join(h.root, name)
+  symlinkSync(join(h.root, `${name}-target`), link)
+  return link
 }
 
 /** Personas with credentials files and working directories on disk. */
@@ -2105,6 +2120,80 @@ describe('the pending-change preview in the pending file and the server log', ()
     expectNoPostNoLeak(run)
   })
 
+  // Bug b.g57: the bring-up checks an added persona's claude_config_dir before
+  // its Slack step (resolveRealPathStrict: no lexical fallback), so the
+  // preview lists an unresolvable one, worded as the check's `problem`
+  // (without the held persona's consequence), after the credentials and
+  // working-directory causes. A directory not created yet under a resolvable
+  // ancestor is created by the launch, so it is not listed.
+  const DANGLING_CONFIG_DIR = 'claude_config_dir cannot be resolved to a real path (ENOENT: a symlink on its path points to nothing)'
+  test.each<{ label: string; state: PreparedPersonaState; configDir: () => string; causes: string[] }>([
+    {
+      label: 'a claude_config_dir that is a symlink pointing to nothing',
+      state: {},
+      configDir: () => danglingLink('dangling-config'),
+      causes: [DANGLING_CONFIG_DIR],
+    },
+    {
+      label: 'a claude_config_dir under a symlink pointing to nothing',
+      state: {},
+      configDir: () => join(danglingLink('dangling-parent'), 'claude'),
+      causes: [DANGLING_CONFIG_DIR],
+    },
+    {
+      label: 'a claude_config_dir not created yet under an existing ancestor (the control: the launch creates it)',
+      state: {},
+      configDir: () => join(h.root, 'not-created-yet', 'claude'),
+      causes: [],
+    },
+    {
+      label: 'its credentials file missing and a claude_config_dir pointing to nothing',
+      state: { credentials: 'missing' },
+      configDir: () => danglingLink('dangling-config'),
+      causes: ['credentials file does not exist', DANGLING_CONFIG_DIR],
+    },
+    {
+      label: 'its credentials file and working directory missing and a claude_config_dir pointing to nothing',
+      state: { credentials: 'missing', workingDirectory: 'missing' },
+      configDir: () => danglingLink('dangling-config'),
+      causes: ['credentials file does not exist', 'working directory does not exist', DANGLING_CONFIG_DIR],
+    },
+  ])('bug b.g57: an added persona with $label is previewed with every cause that stops it coming up', async ({ state, configDir, causes }) => {
+    const { run, personas } = await running(['alpha'])
+    const dir = configDir()
+    const delta = h.preparePersona('delta', state, { claude_config_dir: dir })
+    const cp = run.checkpoint()
+
+    h.writeConfig(configOf(personas[0]!, delta))
+    await run.ticks.ticks(5)
+
+    expect(h.pendingLines()).toEqual([previewHeader({ added: 1 }), addedLine('delta', causes)])
+    expect(run.since(cp)).toEqual(pendingWritten())
+    // The preview never creates the directory it checks.
+    expect(existsSync(dir)).toBe(false)
+    assertNoLeak(run.captured())
+    expectNoPostNoLeak(run)
+  })
+
+  test('bug b.g57: once the dangling claude_config_dir link\'s target exists, the added persona is previewed as able to come up', async () => {
+    const { run, personas } = await running(['alpha'])
+    const target = join(h.root, 'config-target')
+    const link = join(h.root, 'config-link')
+    symlinkSync(target, link)
+    const delta = h.preparePersona('delta', {}, { claude_config_dir: link })
+
+    h.writeConfig(configOf(personas[0]!, delta))
+    await run.ticks.ticks(3)
+    expect(h.pendingLines()).toEqual([previewHeader({ added: 1 }), addedLine('delta', [DANGLING_CONFIG_DIR])])
+
+    mkdirSync(target)
+    await run.ticks.ticks(3)
+    expect(h.pendingLines()).toEqual([previewHeader({ added: 1 }), addedLine('delta')])
+    expect(run.previewEmissionCount()).toBe(1)
+    assertNoLeak(run.captured())
+    expectNoPostNoLeak(run)
+  })
+
   test('in dry run an added persona is never judged by its credentials: no credentials file is read and only a working-directory cause appears', async () => {
     const [alpha] = materialized('alpha')
     h.writeRecord(configOf(alpha!))
@@ -3257,7 +3346,8 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     const started = await pendingRemoval(['alpha', 'bravo'], {
       applySteps: slots.slots,
       onApplied: () => {
-        throw new Error(`onApplied failed ${LEAK_SENTINEL}`)
+        // The message is kept, through redactSlackLogText: the sentinel sits only inside a fake token and a URL (`sentinelInMessage`).
+        throw new Error(`onApplied failed for ${sentinelInMessage('APPLIED')}`)
       },
     })
     run = started.run
@@ -3269,7 +3359,12 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [
-        expect.stringMatching(/^\[slack\] reload: updating the server's applied configuration failed: Error\b/),
+        expect.stringMatching(
+          new RegExp(
+            "^\\[slack\\] reload: updating the server's applied configuration failed: Error " +
+              `message="onApplied failed for ${REDACTED_SENTINEL_TAIL}"( |$)`,
+          ),
+        ),
         appliedLogged({ removed: 1 }),
       ],
       writes: [{ path: h.paths.lastApplied, ok: true }],
@@ -3287,7 +3382,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(run.appliedKeys()).toEqual(keysOf('alpha'))
     expect(run.appliedConfigs).toHaveLength(1)
     expect(h.pendingExists()).toBe(false)
-    // The thrown message (sentinel-bearing) is never logged.
+    // The thrown message is logged redacted: neither the fake token nor the URL (each holding the sentinel) survives.
     expectNoPostNoLeak(run)
   })
 
@@ -3958,41 +4053,101 @@ describe('a Slack token pasted under a bot_token or app_token key never reaches 
   )
 })
 
-// Director decision 5: a token-shaped persona name is rejected by the loader, never echoed with its key. The reload
-// path carries that error into the pending file and the log on every pending-state change, so it must stay clean too.
-describe('a token-shaped persona name never reaches the pending file, the log, the record or a start refusal', () => {
-  test.each<{ label: string; edit: (alpha: PersonaInput, name: string) => { file: unknown; credentialsFiles?: string[] }; index: number }>([
+// Operator decision A (E14 Task 0, b.av2 SR-1.2 "no format rule"): a persona name shaped like a Slack token is an
+// ordinary name. It loads unmasked, and the pending file, the log, the record and the applied set carry it as written.
+// The name comes from fakeToken, so it holds the sentinel: these runs' artifacts are asserted to contain it, so their
+// leak check masks the name and its key first (withoutName) and checks the rest, the credentials files these runs read
+// and bring the personas up with included.
+describe('a token-shaped persona name is an ordinary name: previewed, applied and started as written', () => {
+  /** A name that holds a whole fake bot token after a space, as a paste into the name field would. */
+  const tokenShapedName = (): string => `Ops bot ${fakeToken(BOT_TOKEN_PREFIX, 'NAME')}`
+
+  /**
+   * No Slack post, and `run.captured()` plus every server-side file but the operator-written ones passes
+   * `assertNoLeak` once `name` and its key are masked.
+   */
+  function expectNoPostNoLeakBesideName(run: ReloadRun, name: string, operatorWritten: string[]): void {
+    expect(run.slackPosts()).toEqual([])
+    const captured = { ...run.captured(), server: h.serverSideFiles(...operatorWritten) }
+    assertNoLeak(withoutName(captured, name, h.key(name)), 'captured without the name')
+  }
+
+  test.each<{
+    label: string
+    edit: (alpha: PersonaInput, name: string) => PersonaInput[]
+    counts: PreviewCounts
+    removed: string[]
+    remaining: string[]
+  }>([
     {
+      // The key follows the name, so a rename is alpha's removal plus the new name's addition over alpha's files.
       label: 'an existing persona renamed to one',
-      edit: (alpha, name) => ({ file: configOf({ ...alpha, name }) }),
-      index: 0,
+      edit: (alpha, name) => [{ ...alpha, name }],
+      counts: { added: 1, removed: 1 },
+      removed: ['alpha'],
+      remaining: [],
     },
     {
       label: 'a new persona added with one',
       edit: (alpha, name) => {
         // Charlie's own files, so everything but the name is valid (paths are derived from the name otherwise).
         const [charlie] = materialized('charlie')
-        return { file: configOf(alpha, { ...charlie!, name }), credentialsFiles: [charlie!.credentials_file] }
+        return [alpha, { ...charlie!, name }]
       },
-      index: 1,
+      counts: { added: 1 },
+      removed: [],
+      remaining: ['alpha'],
     },
-  ])('on a running server, $label is an INVALID candidate naming personas[i] only; its confirmation applies nothing', async ({ edit, index }) => {
-    const name = `Ops bot ${fakeToken(BOT_TOKEN_PREFIX, 'NAME')}`
-    const run = await expectInvalidCandidateStaysClean((alpha) => edit(alpha, name), `personas[${index}]: ${TOKEN_LIKE_NAME_MESSAGE}`)
-    // Neither the name nor its derived key reached a log line or the pending file.
-    const text = [...run.logs, h.readPendingText()!].join('\n')
-    expect(text).not.toContain(name)
-    expect(text).not.toContain(h.key(name))
+  ])('on a running server, $label is a valid candidate previewed with the name as written; one confirmation applies it', async ({ edit, counts, removed, remaining }) => {
+    const name = tokenShapedName()
+    const { run, personas } = await running(['alpha'])
+    const edited = edit(personas[0]!, name)
+    const configBytes = h.writeConfig(configOf(...edited))
+    const operatorWritten = [h.paths.config, ...edited.map((p) => p.credentials_file)]
+    const cp = run.checkpoint()
+    await run.ticks.tick()
+
+    expect(h.pendingLines()).toEqual([previewHeader(counts), ...removed.map(removedLine), addedLine(name)])
+    expect(run.since(cp)).toEqual(pendingWritten())
+    expect(run.logsOf(RELOAD_INVALID)).toEqual([])
+    // Checked while the pending file exists: captured() holds it as a written file.
+    expectNoPostNoLeakBesideName(run, name, operatorWritten)
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(run.appliedKeys()!.sort()).toEqual([...keysOf(...remaining), h.key(name)].sort())
+    expect(run.controller.applied()!.config.personas.find((p) => p.key === h.key(name))?.name).toBe(name)
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged(counts)])
+    expect(run.lifecycle.keys('bring-up')).toContain(h.key(name))
+    expect(h.applyExists()).toBe(false)
+    expect(h.pendingExists()).toBe(false)
+    expectNoPostNoLeakBesideName(run, name, operatorWritten)
   })
 
-  test.each(['config', 'record'] as const)('a start from the %s with a token-shaped persona name refuses, naming personas[i] only', async (source) => {
+  test.each(['config', 'record'] as const)('a start from the %s with a token-shaped persona name starts, the name as written', async (source) => {
     const [alpha, charlie] = materialized('alpha', 'charlie')
-    const name = fakeToken(APP_TOKEN_PREFIX, 'NAME')
-    const run = await expectStartRefused(source, configOf(alpha!, { ...charlie!, name }), `personas[1]: ${TOKEN_LIKE_NAME_MESSAGE}`, [
-      alpha!.credentials_file,
-      charlie!.credentials_file,
+    const name = tokenShapedName()
+    const file = configOf(alpha!, { ...charlie!, name })
+    const bytes = source === 'config' ? h.writeConfig(file) : h.writeRecord(file)
+    // A start from the record runs it whatever the config file holds.
+    if (source === 'record') h.writeConfig(configOf(alpha!))
+
+    const run = await h.start()
+
+    expect(run.outcome.kind === 'applied' && run.outcome.source).toBe(source)
+    expect(h.readRecord()).toEqual(bytes)
+    expect(run.controller.applied()!.config.personas.map((p) => [p.name, p.key])).toEqual([
+      ['alpha', h.key('alpha')],
+      [name, h.key(name)],
     ])
-    expect(run.logs.join('\n')).not.toContain(h.key(name))
+    expect(broughtUp(run)).toEqual([h.key('alpha'), h.key(name)].sort())
+    expect(run.lifecycle.keys('launch').sort()).toEqual([h.key('alpha'), h.key(name)].sort())
+    expect(run.logs.filter((l) => l.includes('Fatal'))).toEqual([])
+    // The record is operator-written only on a start from the record; from the config, CSCB writes it.
+    const operatorWritten = [h.paths.config, alpha!.credentials_file, charlie!.credentials_file]
+    expectNoPostNoLeakBesideName(run, name, source === 'record' ? [...operatorWritten, h.paths.lastApplied] : operatorWritten)
   })
 })
 

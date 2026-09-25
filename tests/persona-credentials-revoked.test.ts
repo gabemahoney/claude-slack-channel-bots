@@ -42,7 +42,7 @@ import { formatPersonaDiagnostic, PERSONA_CREDENTIALS_REFUSED, PERSONA_DESTINATI
 import { createPersonaEventRouter } from '../src/persona-event-router.ts'
 import { createPersonaSerializer } from '../src/persona-serializer.ts'
 import { stubCallCount } from './test-helpers/agent-director-stub.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { REDACTED_SENTINEL_TAIL, assertNoLeak } from './test-helpers/credentials.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { resetRoutingState } from './test-helpers/persona-routing-harness.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
@@ -216,6 +216,11 @@ describe('b.ujn: a Web API call refused with token_revoked marks the persona bro
     expect(run.isUp('bravo')).toBe(true)
     expect(run.session('bravo')).toBeDefined()
     await expectBravoServes(run, bravo, 'after the revocation')
+    // The failed tool call's line keeps the refusal's message, redacted: the stub's
+    // message carries the marker in a fake bot token and a ticket URL, both replaced.
+    const toolFailed = consoleLines.filter((line) => line.includes('Tool "react" failed'))
+    expect(toolFailed).toHaveLength(1)
+    expect(toolFailed[0]).toContain(`token_revoked (${REDACTED_SENTINEL_TAIL})`)
     expectNoLeak(run, { refused })
   })
 

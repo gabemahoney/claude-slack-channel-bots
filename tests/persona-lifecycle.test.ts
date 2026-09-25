@@ -33,7 +33,7 @@
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import type { MakeTemplateParams } from 'agent-director'
-import { mkdtempSync, rmSync, unlinkSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
@@ -53,8 +53,10 @@ import {
   type PersonaBringUpState,
   type PersonaCredentialsChangeResult,
 } from '../src/persona-bringup-controller.ts'
+import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
 import { credentialsDigest, readCredentialsFile } from '../src/persona-credentials.ts'
 import {
+  PERSONA_CONFIG_DIR_UNRESOLVABLE,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
   PERSONA_CREDENTIALS_INVALID,
   PERSONA_CREDENTIALS_MISSING,
@@ -65,6 +67,7 @@ import {
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { createPersonaLifecycle, type PersonaLifecycle, type PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../src/persona-serializer.ts'
+import type { PersonaBringUpStep } from '../src/persona-start.ts'
 import type { InPlaceApplyInput } from '../src/reload-apply.ts'
 import type { InPlaceSetting } from '../src/reload-plan.ts'
 import { _resetRestartState, cancelAllRestartTimers, cancelRestartTimer, initRestart, isRestartPendingOrActive, scheduleRestart } from '../src/restart.ts'
@@ -361,6 +364,17 @@ interface ControllerStack {
 }
 
 /**
+ * The bring-up controller's claude_config_dir check against a scratch home
+ * `<base>/home` holding a real `.claude`, so no bring-up here depends on the
+ * process home (a dangling `$HOME/.claude` would hold every persona).
+ */
+function configDirCheckUnder(base: string): (persona: Persona) => ReturnType<typeof checkPersonaConfigDir> {
+  const home = join(base, 'home')
+  mkdirSync(join(home, '.claude'), { recursive: true })
+  return (persona) => checkPersonaConfigDir(persona, { home })
+}
+
+/**
  * A and B on the connection harness with their files (not brought up yet).
  * The controller reads the harness's applied set, runs its retry work
  * through `f`'s serializer and logs into `h.lines`; teardown cancels it,
@@ -390,12 +404,15 @@ function makeControllerStack(opts: {
     },
   })
   controller = createPersonaBringUpController({
-    connections: { bringUp: h.connections.bringUp, status: (key) => h.manager.status(key) },
+    // The recording bringUp, and the real manager's status and stop (a
+    // claude_config_dir hold closes the persona's connection with it).
+    connections: { bringUp: h.connections.bringUp, status: (key) => h.manager.status(key), stop: (key) => h.manager.stop(key) },
     clock: h.clock,
     dryRun: false,
     log: (line) => void h.lines.push(line),
     appliedPersonas: () => h.config?.personas ?? [],
     serialize: f.serializer.run,
+    checkConfigDir: configDirCheckUnder(dir),
     launch: async (p) => {
       launches.push(p.key)
       return opts.launch?.(p)
@@ -1010,7 +1027,7 @@ function appliedAB(f: Fixture): PersonaConfig {
 }
 
 /** One cause of `step` and `cls` (the cause text is not read by the lifecycle). */
-const causeOf = (step: 'credentials' | 'working-directory' | 'slack', cls: string) => ({ step, class: cls, cause: 'x' })
+const causeOf = (step: PersonaBringUpStep, cls: string) => ({ step, class: cls, cause: 'x' })
 
 /** Bring-up states B can be in when its recovery runs. */
 const STATES = {
@@ -1020,6 +1037,8 @@ const STATES = {
   brokenOther: { outcome: 'broken', causes: { slack: causeOf('slack', 'error') } },
   retryingSlack: { outcome: 'retrying', causes: { slack: causeOf('slack', PERSONA_SLACK_UNREACHABLE) } },
   retryingDirectory: { outcome: 'retrying', causes: { directory: causeOf('working-directory', PERSONA_DIRECTORY_MISSING) } },
+  /** Held for an unresolvable claude_config_dir (bug b.g57): no Slack connection, its launch waits. */
+  heldConfigDir: { outcome: 'retrying', causes: { configDir: causeOf('claude-config-dir', PERSONA_CONFIG_DIR_UNRESOLVABLE) } },
   firstAttempt: { outcome: undefined, causes: {} },
   up: { outcome: 'up', causes: {} },
 } satisfies Record<string, PersonaBringUpState>
@@ -1058,9 +1077,14 @@ describe('recovery bring-up (SR-6.4, SR-8.6 step 6): a credentials-broken person
   /** The recovery's line for a persona no longer broken by its credentials (finding 4's fallback). */
   const notBrokenLine = (f: Fixture) =>
     `[slack] persona ${renderPersonaRef(f.b.name, f.b.key)}: not brought up again — it is not broken by its credentials now, so its changed credentials are applied as a credentials change`
-  /** The recovery's trail when it applies the change instead: the state read, the change, then the state read for its result. */
-  const appliedAsChangeTrail = (f: Fixture) => [
-    `bringUps.state:${f.b.key}`, `bringUps.changeCredentials:${f.b.key}:[${f.a.key},${f.b.key}]`, `bringUps.state:${f.b.key}`,
+  /**
+   * The recovery's trail when it applies the change instead: the state read,
+   * the change, B's cached DM forgotten when the change leaves it with no
+   * connection (`none`), then the state read for its result.
+   */
+  const appliedAsChangeTrail = (f: Fixture, forgotDm = false) => [
+    `bringUps.state:${f.b.key}`, `bringUps.changeCredentials:${f.b.key}:[${f.a.key},${f.b.key}]`,
+    ...(forgotDm ? [`destinations.forget:${f.b.key}`] : []), `bringUps.state:${f.b.key}`,
   ]
 
   // Rows: B's state when the recovery runs, what the controller's change resolves, and the change's own line after the prefix.
@@ -1069,6 +1093,7 @@ describe('recovery bring-up (SR-6.4, SR-8.6 step 6): a credentials-broken person
     ['retrying: Slack unreachable', STATES.retryingSlack, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
     ['retrying: working directory missing', STATES.retryingDirectory, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
     ['in its first Slack attempt (no outcome yet)', STATES.firstAttempt, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
+    ['held for its claude_config_dir (bug b.g57)', STATES.heldConfigDir, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
     ['broken by another Slack error', STATES.brokenOther, { kind: 'skipped' }, undefined],
     ['unknown to the controller', undefined, { kind: 'skipped' }, undefined],
   ])('B %s when the recovery runs: not cleared or brought up; its changed credentials are applied as a credentials change in the same serializer turn, and it resolves with its outcome then and no failures', async (_label, state, changeResult, changeLine) => {
@@ -1076,8 +1101,10 @@ describe('recovery bring-up (SR-6.4, SR-8.6 step 6): a credentials-broken person
 
     expect(await f.lifecycle.bringUp(f.b, appliedAB(f), recovery)).toEqual({ outcome: state?.outcome ?? 'broken', failures: [] })
 
-    // No cancel, stop, forget, storage check, bring-up or launch.
-    expect(f.trail).toEqual(appliedAsChangeTrail(f))
+    // No cancel, stop, storage check, bring-up or launch; B's cached DM is
+    // forgotten only when the change leaves it with no connection.
+    const noConnection = changeResult.kind === 'retrying' && changeResult.connection === 'none'
+    expect(f.trail).toEqual(appliedAsChangeTrail(f, noConnection))
     expect(f.changeCalls).toHaveLength(1)
     expect(f.changeCalls[0]!.connections).toBe(f.connections)
     const ref = renderPersonaRef(f.b.name, f.b.key)
@@ -1213,8 +1240,6 @@ describe('recovery bring-up (SR-6.4, SR-8.6 step 6): a credentials-broken person
 
 describe('credentials change (SR-8.6 step 4): the controller\'s change over the connection manager, one line per outcome', () => {
   const lineOf = (f: Fixture, rest: string) => `[slack] persona ${renderPersonaRef(f.b.name, f.b.key)}: ${rest}`
-  /** The reconnected line of a persona held for its claude_config_dir (bug b.g57): no MCP session, its launch still waits. */
-  const HELD_RECONNECTED = 'reconnected with its changed credentials; its session is kept, and its launch waits until its claude_config_dir resolves'
 
   // Rows: the controller's result, and the lifecycle's line after the persona prefix (none for failed and skipped).
   test.each<[string, PersonaCredentialsChangeResult, string | undefined]>([
@@ -1224,8 +1249,6 @@ describe('credentials change (SR-8.6 step 4): the controller\'s change over the 
       { kind: 'swapped', cameBackUp: true },
       'reconnected with its changed credentials and up again; its instance is kept',
     ],
-    ['swapped, held for its claude_config_dir (bug b.g57)', { kind: 'swapped', held: true }, HELD_RECONNECTED],
-    ['swapped, up again and held for its claude_config_dir: held wins', { kind: 'swapped', cameBackUp: true, held: true }, HELD_RECONNECTED],
     [
       'retrying, the current connection kept',
       { kind: 'retrying', connection: 'kept' },
@@ -1236,7 +1259,11 @@ describe('credentials change (SR-8.6 step 4): the controller\'s change over the 
       { kind: 'retrying', connection: 'broken' },
       'its changed credentials cannot reach Slack yet; the new connection retries, and it stays broken by its credentials until that connection is in use',
     ],
-    ['retrying with no connection yet', { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
+    [
+      'retrying with no connection (Slack unreachable, directory-broken or held for its claude_config_dir)',
+      { kind: 'retrying', connection: 'none' },
+      'it retries its bring-up with its changed credentials',
+    ],
     ['credentials-broken now', { kind: 'credentials-broken' }, 'broken by its credentials now, so it is brought up again rather than reconnected'],
     ['failed (the controller logged it)', { kind: 'failed', cause: 'credentials file does not exist' }, undefined],
     ['skipped', { kind: 'skipped' }, undefined],
@@ -1245,8 +1272,14 @@ describe('credentials change (SR-8.6 step 4): the controller\'s change over the 
 
     expect(await f.lifecycle.reconnectCredentials(f.b, appliedAB(f))).toBe(result)
 
-    // The DM cache is forgotten only through the swap hook, never by the lifecycle itself.
-    expect(f.trail).toEqual([`bringUps.changeCredentials:${f.b.key}:[${f.a.key},${f.b.key}]`])
+    // With a connection (or none taken), the DM cache is forgotten only through
+    // the swap hook. With no connection, the lifecycle forgets it itself once
+    // the change resolves, so a held notice never goes to the old app's DM.
+    const noConnection = result.kind === 'retrying' && result.connection === 'none'
+    expect(f.trail).toEqual([
+      `bringUps.changeCredentials:${f.b.key}:[${f.a.key},${f.b.key}]`,
+      ...(noConnection ? [`destinations.forget:${f.b.key}`] : []),
+    ])
     expect(f.changeCalls).toHaveLength(1)
     expect(f.changeCalls[0]!.connections).toBe(f.connections)
     expect(f.lines).toEqual(rest === undefined ? [] : [lineOf(f, rest)])
@@ -1273,10 +1306,7 @@ describe('credentials change (SR-8.6 step 4): the controller\'s change over the 
     ['at once, refused before it', { late: false, wasUp: false }, undefined],
     ['later, up before it', { late: true, wasUp: true }, 'reconnected with its changed credentials; its instance and MCP session are kept'],
     ['later, refused before it', { late: true, wasUp: false }, 'reconnected with its changed credentials and up again; its instance is kept'],
-    ['at once, held for its claude_config_dir', { late: false, wasUp: true, held: true }, undefined],
-    ['later, up before it and held for its claude_config_dir: held wins', { late: true, wasUp: true, held: true }, HELD_RECONNECTED],
-    ['later, refused before it and held for its claude_config_dir: held wins', { late: true, wasUp: false, held: true }, HELD_RECONNECTED],
-  ])('a swap %s: the swapped hook logs the reconnected line only for a late swap, worded by whether B is held, else by whether it was up before it', async (_label, swap, rest) => {
+  ])('a swap %s: the swapped hook logs the reconnected line only for a late swap, worded by whether it was up before it', async (_label, swap, rest) => {
     const f = makeFixture({ changeResult: { kind: 'retrying', connection: 'kept' } })
     await f.lifecycle.reconnectCredentials(f.b, appliedAB(f))
     const before = f.lines.length
@@ -1284,6 +1314,19 @@ describe('credentials change (SR-8.6 step 4): the controller\'s change over the 
     f.changeCalls[0]!.hooks!.onSwapped!(swap)
 
     expect(f.lines.slice(before)).toEqual(rest === undefined ? [] : [lineOf(f, rest)])
+  })
+
+  test('forgetting the cached DM throws after a change that leaves B with no connection: one token-safe line, the retry line still logged, and the change still resolves', async () => {
+    const f = makeFixture({ changeResult: { kind: 'retrying', connection: 'none' }, fail: ['destinations.forget'] })
+
+    expect(await f.lifecycle.reconnectCredentials(f.b, appliedAB(f))).toEqual({ kind: 'retrying', connection: 'none' })
+
+    expect(f.lines).toHaveLength(2)
+    expect(f.lines[0]).toMatch(
+      new RegExp(`^${RegExp.escape(lineOf(f, 'forgetting its cached DM conversation failed: Error'))}( |$)`),
+    )
+    expect(f.lines[1]).toBe(lineOf(f, 'it retries its bring-up with its changed credentials'))
+    assertNoLeak({ lines: f.lines })
   })
 
   test('forgetting the cached DM throws in the before-swap hook: one token-safe line, and the hook does not throw', async () => {

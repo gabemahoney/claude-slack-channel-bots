@@ -80,6 +80,18 @@
  * reconnected client, a late rejection of an abandoned reconnect `start()`, a
  * failing close, the unhandledRejection handler on a reconnect's failure
  * shapes) and `WebApiCallRefusedLocallyError` leak nothing.
+ * E14 Task 0 (operator decision B1) keeps a thrown value's message in log
+ * lines: `describeThrownValue` gives it redacted (`redactSlackLogText`), on
+ * one line, capped at `MAX_LOGGED_MESSAGE_LENGTH` and JSON-quoted; a thrown
+ * string likewise; any other non-`Error` value by its type only; a
+ * credentials file's JSON parse error is never quoted. A message this suite
+ * builds therefore carries the sentinel only inside a fake token and a
+ * `ticket=` URL (`sentinelInMessage`), so the leak checks still fail on an
+ * unredacted line. For B3 the controller fixture hands it the manager's
+ * `stop`, which a claude_config_dir hold closes the connection with, and a
+ * `checkConfigDir` resolving against the test's own home. `stop(key,
+ * endReason)` ends the persona's open lost, unreachable or refused episode
+ * with one cleared line; a `stop` without a reason (a teardown) logs nothing.
  * Time is a fake clock throughout;
  * nothing sleeps (the start-pass cases poll in 1 ms real-time steps only for
  * the real spawn path).
@@ -147,15 +159,19 @@ import {
   type PersonaSocketEventPayload,
 } from '../src/persona-connections.ts'
 import {
+  MAX_LOGGED_MESSAGE_LENGTH,
   createUnhandledRejectionHandler,
+  describeLogMessage,
   describeSlackCallFailure,
   describeThrownValue,
   isSafeIdentifier,
   slackPlatformReason,
 } from '../src/persona-connection-errors.ts'
+import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { AgentDirectorError, ErrSpawnCapReached, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
 import {
   DEFAULT_WORKING_DIRECTORY_FS,
+  checkPersonaConfigDir,
   checkPersonaLocalBringUp,
   checkPersonaWorkingDirectory,
   type BringUpPersona,
@@ -210,9 +226,12 @@ import {
   APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
   LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
   assertNoLeak,
   fakeToken,
   makeCredentials,
+  sentinelInMessage,
+  sentinelTicketUrl,
   writeCredentialsFile,
   type CredentialsOverrides,
 } from './test-helpers/credentials.ts'
@@ -451,6 +470,9 @@ function sha256Digest(bytes: Uint8Array): string {
 function fileDigest(path: string): string {
   return sha256Digest(readFileSync(path))
 }
+
+/** A Socket Mode WebSocket URL whose `ticket=` holds `LEAK_SENTINEL`, as a real connect error's message can quote one. */
+const SENTINEL_TICKET_URL = sentinelTicketUrl()
 
 /** Bytes that are not valid UTF-8 (a lone continuation byte and 0xff), around the sentinel. */
 const INVALID_UTF8 = Buffer.concat([Buffer.from([0xff, 0x80]), Buffer.from(LEAK_SENTINEL), Buffer.from([0xc3])])
@@ -726,6 +748,28 @@ describe('checkPersonaCredentials: invalid content', () => {
       expect(failure.line).toContain(fragment)
     }
     for (const fragment of absent) expect(failure.cause).not.toContain(fragment)
+  })
+
+  // The parse error's text quotes the file (E14 director decision 2): it is
+  // never logged, not even redacted. The token and URL rows would pass the
+  // leak check if the text were quoted redacted, so the cause is pinned whole.
+  test.each<[string, string]>([
+    ['a bare word', `{"bot_token": ${LEAK_SENTINEL}}`],
+    ['a token-shaped word', `{"bot_token": ${fakeToken(BOT_TOKEN_PREFIX, 'unquoted')}}`],
+    ['a URL', `{"bot_token": ${SENTINEL_TICKET_URL}}`],
+    ['a truncated object', `{"bot_token": "${fakeToken(BOT_TOKEN_PREFIX, 'truncated')}"`],
+  ])('the JSON parse error of a file holding %s is never quoted: the cause is only "not valid JSON"', (_label, content) => {
+    const persona = makePersona()
+    writeCreds(persona, content)
+    const { lines, log } = capture()
+
+    const result = checkPersonaCredentials(persona, { others: [], log })
+
+    const failure = expectFailure(result, PERSONA_CREDENTIALS_INVALID, lines)
+    expect(failure.cause).toBe('credentials file is invalid: not valid JSON')
+    expect(failure.line).not.toContain('message=')
+    expect(failure.line).not.toContain(REDACTED_TOKEN_PLACEHOLDER)
+    expect(failure.line).not.toContain(REDACTED_URL_PLACEHOLDER)
   })
 })
 
@@ -2135,8 +2179,10 @@ async function expectDelivers(h: Harness, p: ManagedPersona, stub: StubSlack = s
 
 /**
  * A `@slack/web-api`-shaped error with `code`, carrying the sentinel in its
- * message, its `original` (message and Authorization header), its response
- * headers and `data`, never in `data.error` (set to `slackError` when given).
+ * message (inside a token and a URL, `sentinelInMessage`), and bare in its
+ * `original` (message and Authorization header), its response headers and
+ * `data`, never in `data.error` (set to `slackError` when given): CSCB never
+ * reads those fields.
  */
 function sentinelSlackError(code: string, slackError?: string): Error {
   const original = Object.assign(new Error(`socket hang up ${LEAK_SENTINEL}`), {
@@ -2145,7 +2191,7 @@ function sentinelSlackError(code: string, slackError?: string): Error {
   })
   const data: Record<string, unknown> = { ok: false, provided: LEAK_SENTINEL }
   if (slackError !== undefined) data.error = slackError
-  return Object.assign(new Error(`A request error occurred: ${LEAK_SENTINEL}`), {
+  return Object.assign(new Error(`A request error occurred: ${sentinelInMessage('message')}`), {
     code,
     original,
     headers: { 'x-slack-req-id': LEAK_SENTINEL, authorization: `Bearer ${fakeToken(APP_TOKEN_PREFIX, 'header')}` },
@@ -2805,7 +2851,7 @@ describe('connection manager: event tagging and isolation (SR-3.1)', () => {
     const failing = personaKey('Alpha')
     const h = makeHarness({
       onEvent: key => {
-        if (key === failing) throw new Error(`handler ${LEAK_SENTINEL}`)
+        if (key === failing) throw new Error(`handler failed (${sentinelInMessage('handler')})`)
       },
     })
     await bringUpBoth(h)
@@ -2819,6 +2865,8 @@ describe('connection manager: event tagging and isolation (SR-3.1)', () => {
     for (const line of h.lines) {
       expect(line).toContain(renderPersonaRef(h.a.name, h.a.key))
       expect(line).toContain('personas[0]')
+      // The handler's message is kept, redacted (E14 B1).
+      expect(line).toContain(`message="handler failed (${REDACTED_SENTINEL_TAIL})"`)
     }
   })
 })
@@ -3020,6 +3068,82 @@ describe('connection manager: reopen rules (SR-3.3)', () => {
     expect(statesOf(h, h.a).at(-1)).toBe('stopped')
     expect(h.manager.status(h.b.key)).toMatchObject({ state: 'up' })
     await expectDelivers(h, h.b)
+  })
+
+  // Rows: the class of A's own open episode, and how it is opened (its bring-up included).
+  test.each<[string, PersonaDiagnosticClass, (h: Harness) => Promise<void>]>([
+    [
+      'a lost connection whose reopen could not reach Slack',
+      PERSONA_CONNECTION_LOST,
+      async h => {
+        await bringUpBoth(h)
+        stubOf(h, h.a).script.connect.push({ kind: 'network' })
+        stubOf(h, h.a).socket.drop()
+      },
+    ],
+    [
+      'a reopen Slack refused',
+      PERSONA_CREDENTIALS_REFUSED,
+      async h => {
+        await bringUpBoth(h)
+        stubOf(h, h.a).script.connect.push({ kind: 'platform', error: 'invalid_auth' })
+        stubOf(h, h.a).socket.drop()
+      },
+    ],
+    [
+      'a bring-up that cannot reach Slack',
+      PERSONA_SLACK_UNREACHABLE,
+      async h => {
+        stubOf(h, h.a).script.authTest.push({ kind: 'network' })
+        expect(await h.manager.bringUp(h.a, h.a.tokens)).toMatchObject({ state: 'retrying', phase: 'bring-up' })
+        expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+      },
+    ],
+  ])('stop(A, endReason) during %s ends that open episode with exactly one line, its class and `cleared: <endReason>`; a second stop logs nothing; B is untouched', async (_label, cls, open) => {
+    const h = makeHarness()
+    await open(h)
+    await h.clock.advance(0)
+    expect(h.lines.at(-1)).toStartWith(`[slack] ${cls}: `)
+    const linesBefore = h.lines.length
+    const reason = 'the persona\'s Slack connection was closed for a test'
+
+    await h.manager.stop(h.a.key, reason)
+    await h.manager.stop(h.a.key, reason)
+
+    expect(h.lines.slice(linesBefore)).toEqual([
+      formatPersonaDiagnostic({ class: cls, name: h.a.name, key: h.a.key, index: h.a.index, path: h.a.credentials_file, cause: `cleared: ${reason}` }),
+    ])
+    expect(h.lines.slice(linesBefore)[0]).toBe(
+      `[slack] ${cls}: personas[${h.a.index}] ${renderPersonaRef(h.a.name, h.a.key)} path=${JSON.stringify(h.a.credentials_file)}: cleared: ${reason}`,
+    )
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(HOUR_MS)
+    expect(h.lines).toHaveLength(linesBefore + 1)
+    expect(h.manager.status(h.a.key)).toBeUndefined()
+    expect(liveSocketsOf(h, h.a)).toBe(0)
+    expect(h.manager.status(h.b.key)).toMatchObject({ state: 'up' })
+    await expectDelivers(h, h.b)
+  })
+
+  test('stop(A, endReason) with no episode open (A up) logs nothing; stop(A) with no reason during an open lost episode (a teardown, b.av2 SR-6.5) logs nothing', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const linesBefore = h.lines.length
+
+    await h.manager.stop(h.a.key, 'nothing to end')
+
+    expect(h.lines.slice(linesBefore)).toEqual([])
+    stubOf(h, h.b).script.connect.push({ kind: 'network' })
+    stubOf(h, h.b).socket.drop()
+    await h.clock.advance(0)
+    expect(h.lines.at(-1)).toStartWith(`[slack] ${PERSONA_CONNECTION_LOST}: `)
+    const lostLines = h.lines.length
+
+    await h.manager.stop(h.b.key)
+
+    expect(h.lines).toHaveLength(lostLines)
+    await h.clock.advance(HOUR_MS)
+    expect(h.lines).toHaveLength(lostLines)
   })
 
   test('stopping A during a bring-up hung on an apps.connections.open that never answers cancels the attempt itself: bring-up resolves stopped, no timer is left; B is untouched', async () => {
@@ -3541,22 +3665,28 @@ describe('unhandledRejection handler (SR-3.3)', () => {
   // carry. The stub rows take the value a client of the stub (leak marker on,
   // built without the SR-3.3 options, so a request error keeps its `original`
   // with the Authorization header) rejects with or emits: a reconnect's
-  // worst case. Called directly; never installed on the real process.
+  // worst case. A message is kept, redacted (E14 B1), so a message built here
+  // carries the sentinel only inside a token and a URL (`sentinelInMessage`).
+  // Called directly; never installed on the real process.
   test.each<[string, () => unknown, string[]]>([
-    ['an Error with the sentinel in its message', () => new Error(`boom ${LEAK_SENTINEL}`), ['Error', 'at ']],
+    [
+      'an Error with the sentinel in its message (in a token and a URL)',
+      () => new Error(`boom (${sentinelInMessage('boom')})`),
+      ['Error', `message="boom (${REDACTED_SENTINEL_TAIL})"`, 'at '],
+    ],
     [
       'a Slack-shaped error with the sentinel in its message, headers, data and original',
       () => sentinelSlackError('slack_webapi_request_error'),
-      ['Error', 'code=slack_webapi_request_error'],
+      ['Error', 'code=slack_webapi_request_error', `message="A request error occurred: ${REDACTED_SENTINEL_TAIL}"`],
     ],
     [
       'an Error whose message spans several lines, the sentinel on a later, frame-shaped line',
-      () => new TypeError(`first line\n    at ${LEAK_SENTINEL} (frame-shaped:1:1)\n${fakeToken(BOT_TOKEN_PREFIX, 'third-line')}`),
-      ['TypeError'],
+      () => new TypeError(`first line\n    at frame_shaped_line (${SENTINEL_TICKET_URL}:1:1)\n${fakeToken(BOT_TOKEN_PREFIX, 'third-line')}`),
+      ['TypeError', 'message="first line', 'frame_shaped_line', REDACTED_TOKEN_PLACEHOLDER],
     ],
     ['undefined', () => undefined, ['undefined']],
     ['null', () => null, ['null']],
-    ['a sentinel-bearing string', () => `boom ${LEAK_SENTINEL}`, ['string']],
+    ['a sentinel-bearing string', () => `boom (${sentinelInMessage('string')})`, [`string message="boom (${REDACTED_SENTINEL_TAIL})"`]],
     ['a plain object holding a token', () => ({ token: fakeToken(APP_TOKEN_PREFIX, 'object') }), ['object']],
     [
       'a stub Socket Mode connect failure (request error from apps.connections.open)',
@@ -3707,41 +3837,243 @@ describe('isSafeIdentifier (SR-10.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// describeThrownValue (SR-10.3, AC 20): a base agent-director error's errName
+// describeThrownValue (SR-10.3, AC 20, E14 B1): the message kept, redacted,
+// on one line, capped; a base agent-director error's errName
 // ---------------------------------------------------------------------------
 
-describe('describeThrownValue: a base AgentDirectorError names its errName, never its description (SR-10.3, AC 20)', () => {
-  /** The description before its stack frames (`<Type>[ errName=…][ code=…]`). */
-  const head = (described: string): string => described.split(' at ')[0]!
-  /** A description that carries a fake token, so a printed one fails the leak check. */
-  const desc = (): string => `refused ${fakeToken(BOT_TOKEN_PREFIX, 'desc')} ${LEAK_SENTINEL}`
+/** A `describeThrownValue` result taken apart. */
+interface DescriptionParts {
+  /** `<Type>[ errName=<errName>][ code=<code>]`. */
+  head: string
+  /** The `message="…"` field, JSON-decoded; undefined when there is none. */
+  message: string | undefined
+  /** The stack frames (`at … <- at …`); '' when there are none. */
+  frames: string
+}
+
+/**
+ * One line: the head, then an optional JSON-quoted message, then optional
+ * frames. No `s` flag, so a description holding a line break never matches.
+ */
+const DESCRIPTION_RE = /^(\S+(?: errName=\S+)?(?: code=\S+)?)(?: message=("(?:[^"\\]|\\.)*"))?(?: (at .*))?$/
+
+/** Split a description into its parts; throws (quoting nothing) when it is not of the documented one-line shape. */
+function describedParts(described: string): DescriptionParts {
+  const match = DESCRIPTION_RE.exec(described)
+  if (match === null) throw new Error('describeThrownValue result is not of the documented one-line shape')
+  return { head: match[1]!, message: match[2] === undefined ? undefined : (JSON.parse(match[2]) as string), frames: match[3] ?? '' }
+}
+
+/** How often `needle` occurs in `text`. */
+function occurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1
+}
+
+describe('describeThrownValue: the message is kept, redacted, on one line and capped (SR-10.3, AC 20, E14 B1)', () => {
+  const TOKEN = REDACTED_TOKEN_PLACEHOLDER
+  const URL = REDACTED_URL_PLACEHOLDER
+
+  test('the cap is 300 characters (E14 director decision 2)', () => {
+    expect(MAX_LOGGED_MESSAGE_LENGTH).toBe(300)
+  })
+
+  // Rows: label, the thrown message, the message the description carries.
+  test.each<[string, string, string]>([
+    ['a bot token', `auth failed for ${fakeToken(BOT_TOKEN_PREFIX, 'bot')}`, `auth failed for ${TOKEN}`],
+    ['an app token', `auth failed for ${fakeToken(APP_TOKEN_PREFIX, 'app')}`, `auth failed for ${TOKEN}`],
+    ['a user token', `auth failed for ${fakeToken('xoxp-', 'user')}`, `auth failed for ${TOKEN}`],
+    ['a token glued to a word', `bearer=${fakeToken(BOT_TOKEN_PREFIX, 'glued')}`, `bearer=${TOKEN}`],
+    ['a Socket Mode ticket= WebSocket URL', `connect to ${SENTINEL_TICKET_URL} failed`, `connect to ${URL} failed`],
+    ['an https URL', `upload to https://files.slack.invalid/${LEAK_SENTINEL}/x?sig=${LEAK_SENTINEL} failed`, `upload to ${URL} failed`],
+    ['a URL holding a token', `GET https://slack.invalid/api?token=${fakeToken(BOT_TOKEN_PREFIX, 'query')}: 500`, `GET ${URL}: 500`],
+    ['a token and a URL', `boom (${sentinelInMessage('pair')})`, `boom (${REDACTED_SENTINEL_TAIL})`],
+  ])('%s in the message comes out as a placeholder, the rest as written', (_label, message, expected) => {
+    const err = new Error(message)
+
+    const described = describeThrownValue(err)
+
+    const parts = describedParts(described)
+    expect(parts.head).toBe('Error')
+    expect(parts.message).toBe(expected)
+    expect(parts.frames).toStartWith('at ')
+    assertNoLeak({ described }, 'described message')
+    expect(() => assertNoLeak(err)).toThrow()
+  })
+
+  test('the fields come in order: type, code, message, frames', () => {
+    const described = describeThrownValue(Object.assign(new TypeError(`bad (${sentinelInMessage('order')})`), { code: 'EIO' }))
+
+    expect(described).toStartWith(`TypeError code=EIO message="bad (${REDACTED_SENTINEL_TAIL})" at `)
+    assertNoLeak({ described })
+  })
+
+  test.each<[string, string]>([
+    ['\\n', '\n'],
+    ['\\r\\n', '\r\n'],
+    ['\\r', '\r'],
+    ['U+2028', '\u2028'],
+    ['U+2029', '\u2029'],
+  ])('a message broken by %s is logged on one line, its lines joined by a space', (_label, lineBreak) => {
+    const described = describeThrownValue(new Error(`first${lineBreak}second${lineBreak}${fakeToken(BOT_TOKEN_PREFIX, 'third')}`))
+
+    expect(described).not.toMatch(/[\n\r\u2028\u2029]/)
+    expect(describedParts(described).message).toBe(`first second ${TOKEN}`)
+    assertNoLeak({ described })
+  })
+
+  test('a multi-line message with a frame-shaped line appears once, in the message, never as a frame', () => {
+    const frameShaped = 'at frame_shaped_line (/nowhere/frame.ts:1:1)'
+    const described = describeThrownValue(new TypeError(`first line\n    ${frameShaped}\n${sentinelInMessage('third')}`))
+
+    const parts = describedParts(described)
+    expect(occurrences(described, 'frame_shaped_line')).toBe(1)
+    expect(parts.message).toContain(frameShaped)
+    expect(parts.message).toStartWith('first line')
+    expect(parts.message).toEndWith(REDACTED_SENTINEL_TAIL)
+    expect(parts.frames).toStartWith('at ')
+    expect(parts.frames).not.toContain('frame_shaped_line')
+    assertNoLeak({ described })
+  })
+
+  // Rows: label, the thrown message, the message the description carries.
+  test.each<[string, () => string, () => string]>([
+    ['exactly the cap: kept whole', () => 'a'.repeat(MAX_LOGGED_MESSAGE_LENGTH), () => 'a'.repeat(MAX_LOGGED_MESSAGE_LENGTH)],
+    ['one over the cap: cut, ending in …', () => 'a'.repeat(MAX_LOGGED_MESSAGE_LENGTH + 1), () => `${'a'.repeat(MAX_LOGGED_MESSAGE_LENGTH - 1)}…`],
+    ['far over the cap: cut, ending in …', () => 'b'.repeat(5_000), () => `${'b'.repeat(MAX_LOGGED_MESSAGE_LENGTH - 1)}…`],
+    [
+      'over the cap before redaction, under it after: kept whole',
+      () => `see https://files.slack.invalid/${'u'.repeat(400)}${LEAK_SENTINEL}`,
+      () => `see ${URL}`,
+    ],
+    [
+      'a token straddling the cut: redacted first, then cut',
+      () => `${'c'.repeat(MAX_LOGGED_MESSAGE_LENGTH - 6)} ${fakeToken(BOT_TOKEN_PREFIX, 'straddle')}`,
+      () => `${'c'.repeat(MAX_LOGGED_MESSAGE_LENGTH - 6)} ${TOKEN}`.slice(0, MAX_LOGGED_MESSAGE_LENGTH - 1) + '…',
+    ],
+    [
+      'line breaks joined before the cut',
+      () => `${'d'.repeat(200)}\n${'e'.repeat(200)}`,
+      () => `${'d'.repeat(200)} ${'e'.repeat(98)}…`,
+    ],
+  ])('the cap, %s', (_label, message, expected) => {
+    const described = describeThrownValue(new Error(message()))
+
+    const logged = describedParts(described).message
+    expect(logged).toBe(expected())
+    expect(logged!.length).toBeLessThanOrEqual(MAX_LOGGED_MESSAGE_LENGTH)
+    assertNoLeak({ described })
+  })
+
+  test('quotes, backslashes and control characters are JSON-escaped, so they cannot end the field or the line', () => {
+    const message = `said "stop"\\ then\ttab" at x`
+    const described = describeThrownValue(new Error(message))
+
+    expect(described).toContain(`message=${JSON.stringify(message)}`)
+    expect(describedParts(described).message).toBe(message)
+  })
+
+  test.each<[string, () => Error]>([
+    ['an empty message', () => new Error('')],
+    ['a whitespace-only message', () => new Error(' \n\t ')],
+    ['a non-string message', () => Object.assign(new Error('x'), { message: 42 })],
+    ['a message getter that throws', () => Object.defineProperty(new Error('x'), 'message', { get: () => { throw new Error(`getter (${sentinelInMessage('getter')})`) } })],
+  ])('%s: no message field', (_label, make) => {
+    const described = describeThrownValue(make())
+
+    expect(described).not.toContain('message=')
+    expect(describedParts(described).head).toBe('Error')
+    assertNoLeak({ described })
+  })
+
+  // Rows: label, the thrown string, the exact description.
+  test.each<[string, string, string]>([
+    ['a string', `boom (${sentinelInMessage('string')})`, `string message="boom (${REDACTED_SENTINEL_TAIL})"`],
+    ['a two-line string', `first\n${fakeToken(APP_TOKEN_PREFIX, 'second')}`, `string message="first ${TOKEN}"`],
+    ['a string over the cap', 'f'.repeat(1_000), `string message="${'f'.repeat(MAX_LOGGED_MESSAGE_LENGTH - 1)}…"`],
+    ['a string with a quote', 'say "hi"', `string message=${JSON.stringify('say "hi"')}`],
+    ['an empty string', '', 'string'],
+    ['a whitespace-only string', '  \n ', 'string'],
+  ])('a thrown string is described as a message: %s', (_label, value, expected) => {
+    const described = describeThrownValue(value)
+
+    expect(described).toBe(expected)
+    assertNoLeak({ described })
+  })
+
+  // Rows: label, the thrown value, the exact description (its type only).
+  test.each<[string, () => unknown, string]>([
+    ['undefined', () => undefined, 'undefined'],
+    ['null', () => null, 'null'],
+    ['a number', () => 42, 'number'],
+    ['a boolean', () => false, 'boolean'],
+    ['a bigint', () => 10n, 'bigint'],
+    ['a symbol', () => Symbol(fakeToken(BOT_TOKEN_PREFIX, 'symbol')), 'symbol'],
+    ['a plain object with a message', () => ({ message: `boom (${sentinelInMessage('object')})` }), 'object'],
+    ['an array of tokens', () => [fakeToken(BOT_TOKEN_PREFIX, 'array')], 'object'],
+    ['a String object', () => new String(`boom ${LEAK_SENTINEL}`), 'object'],
+    ['a function', () => () => LEAK_SENTINEL, 'function'],
+  ])('a thrown value that is neither an Error nor a string shows only its type: %s', (_label, make, expected) => {
+    const described = describeThrownValue(make())
+
+    expect(described).toBe(expected)
+    assertNoLeak({ described })
+  })
+
+  test('describeLogMessage is the one rendering: an Error’s description carries exactly its message’s rendering', () => {
+    const message = `line one\nline two ${sentinelInMessage('rendering')} "quoted"`
+    const rendered = describeLogMessage(message)
+
+    expect(rendered).toBe(`message=${JSON.stringify(`line one line two ${REDACTED_SENTINEL_TAIL} "quoted"`)}`)
+    expect(describeThrownValue(new Error(message))).toStartWith(`Error ${rendered} at `)
+    expect(describeThrownValue(message)).toBe(`string ${rendered}`)
+    for (const empty of ['', '   ', undefined, null, 42, { message }]) expect(describeLogMessage(empty)).toBe('')
+    assertNoLeak({ rendered })
+  })
+})
+
+describe('describeThrownValue: a base AgentDirectorError names its checked errName beside its redacted message (SR-10.3, AC 20, E14 B1)', () => {
+  /** A description that carries the sentinel in a fake token and a URL, so an unredacted one fails the leak check. */
+  const desc = (): string => `refused ${sentinelInMessage('desc')}`
+  /** `desc()` as the description logs it. */
+  const redactedDesc = `refused ${REDACTED_SENTINEL_TAIL}`
   const adError = (errName: unknown): Error => new AgentDirectorError('get', errName as string, desc())
 
-  test.each<[string, () => Error, string]>([
-    ['a short identifier', () => adError('ErrSomethingNew'), 'AgentDirectorError errName=ErrSomethingNew'],
-    ['a 64-character identifier', () => adError(`E${'r'.repeat(63)}`), `AgentDirectorError errName=E${'r'.repeat(63)}`],
-    ['an identifier beside a safe code', () => Object.assign(adError('ErrSomethingNew'), { code: 'EIO' }), 'AgentDirectorError errName=ErrSomethingNew code=EIO'],
-  ])('%s: printed as errName=, the description never', (_label, make, expected) => {
+  // An AgentDirectorError's message is `<errName>: <description>`.
+  test.each<[string, () => Error, string, string]>([
+    ['a short identifier', () => adError('ErrSomethingNew'), 'AgentDirectorError errName=ErrSomethingNew', 'ErrSomethingNew'],
+    ['a 64-character identifier', () => adError(`E${'r'.repeat(63)}`), `AgentDirectorError errName=E${'r'.repeat(63)}`, `E${'r'.repeat(63)}`],
+    [
+      'an identifier beside a safe code',
+      () => Object.assign(adError('ErrSomethingNew'), { code: 'EIO' }),
+      'AgentDirectorError errName=ErrSomethingNew code=EIO',
+      'ErrSomethingNew',
+    ],
+  ])('%s: printed as errName=, then the redacted description', (_label, make, head, errName) => {
     const err = make()
     const described = describeThrownValue(err)
 
-    expect(head(described)).toBe(expected)
-    expect(described).toContain(' at ')
+    const parts = describedParts(described)
+    expect(parts.head).toBe(head)
+    expect(parts.message).toBe(`${errName}: ${redactedDesc}`)
+    expect(parts.frames).toStartWith('at ')
     assertNoLeak({ described })
     expect(() => assertNoLeak(err)).toThrow()
   })
 
+  // The errName is also the start of the message, so a sentinel in it is carried in a token or a URL.
   test.each<[string, unknown]>([
     ['a fake token', fakeToken(BOT_TOKEN_PREFIX, 'errname')],
-    ['a sentinel-bearing phrase', `ErrX ${LEAK_SENTINEL}`],
-    ['two lines', `ErrSomethingNew\n${LEAK_SENTINEL}`],
+    ['a phrase holding a URL', `ErrX ${SENTINEL_TICKET_URL}`],
+    ['two lines', `ErrSomethingNew\n${fakeToken(BOT_TOKEN_PREFIX, 'line-two')}`],
     ['65 characters', `E${'r'.repeat(64)}`],
     ['an empty string', ''],
     ['a number', 42],
-  ])('an errName that is %s is omitted; the description never printed', (_label, errName) => {
+  ])('an errName that is %s is omitted from errName=; the message is kept, redacted', (_label, errName) => {
     const described = describeThrownValue(adError(errName))
 
-    expect(head(described)).toBe('AgentDirectorError')
+    const parts = describedParts(described)
+    expect(parts.head).toBe('AgentDirectorError')
+    expect(parts.message).toEndWith(redactedDesc)
     assertNoLeak({ described })
   })
 
@@ -3750,13 +4082,23 @@ describe('describeThrownValue: a base AgentDirectorError names its errName, neve
     ['a CSCB subclass (ErrSpawnCapReached)', () => new ErrSpawnCapReached(desc()), 'ErrSpawnCapReached'],
     ['a plain Error carrying an errName', () => Object.assign(new Error(desc()), { errName: 'ErrSomethingNew' }), 'Error'],
     ['a TypeError carrying an errName and a code', () => Object.assign(new TypeError(desc()), { errName: 'ErrSomethingNew', code: 'EIO' }), 'TypeError code=EIO'],
-    ['a plain object carrying an errName', () => ({ errName: 'ErrSomethingNew', message: desc() }), 'object'],
-    ['a string', () => desc(), 'string'],
-  ])('%s: described as before, with no errName', (_label, make, expected) => {
+  ])('%s: its type and redacted message, with no errName', (_label, make, head) => {
     const described = describeThrownValue(make())
 
-    expect(head(described)).toBe(expected)
+    const parts = describedParts(described)
+    expect(parts.head).toBe(head)
+    expect(parts.message).toEndWith(redactedDesc)
     expect(described).not.toContain('errName=')
+    assertNoLeak({ described })
+  })
+
+  test.each<[string, () => unknown, string]>([
+    ['a plain object carrying an errName', () => ({ errName: 'ErrSomethingNew', message: desc() }), 'object'],
+    ['a string', () => desc(), `string message="${redactedDesc}"`],
+  ])('%s: described as any other value of its type, with no errName', (_label, make, expected) => {
+    const described = describeThrownValue(make())
+
+    expect(described).toBe(expected)
     assertNoLeak({ described })
   })
 })
@@ -3771,13 +4113,22 @@ describe('describeSlackCallFailure (SR-10.3)', () => {
     ['a sentinel-bearing request error (Authorization header in original)', sentinelSlackError('slack_webapi_request_error'), undefined],
     ['a platform error whose reason is not an identifier', sentinelSlackError('slack_webapi_platform_error', fakeToken(BOT_TOKEN_PREFIX, 'reason')), undefined],
     ['undefined', undefined, undefined],
-    ['a sentinel-bearing string', `boom ${LEAK_SENTINEL}`, undefined],
+    ['a sentinel-bearing string', `boom (${sentinelInMessage('string')})`, undefined],
   ])('%s: ` (reason=…)` only for a safe reason, then `: ` and the thrown-value description; nothing leaks', (_label, value, reason) => {
     const tail = describeSlackCallFailure(value)
 
     expect(tail).toBe(`${reason === undefined ? '' : ` (reason=${reason})`}: ${describeThrownValue(value)}`)
     assertNoLeak({ tail }, 'failure tail')
-    if (typeof value === 'object' && value !== null) expect(() => assertNoLeak(value)).toThrow()
+    if (value !== undefined) expect(() => assertNoLeak(value)).toThrow()
+  })
+
+  test('the thrown value’s message is in the tail, redacted (E14 B1)', () => {
+    const tail = describeSlackCallFailure(sentinelSlackError('slack_webapi_platform_error', 'not_in_channel'))
+
+    expect(tail).toStartWith(
+      ` (reason=not_in_channel): Error code=slack_webapi_platform_error message="A request error occurred: ${REDACTED_SENTINEL_TAIL}"`,
+    )
+    assertNoLeak({ tail }, 'failure tail')
   })
 
   test('a value whose every read throws still yields a line, never throws', () => {
@@ -5574,7 +5925,11 @@ function makeBringUpFixture(opts: BringUpFixtureOptions = {}): BringUpFixture {
         return status
       },
       status: key => h.manager.status(key),
+      // A claude_config_dir hold closes the persona's connection through it (E14 B3).
+      stop: (key, endReason) => h.manager.stop(key, endReason),
     },
+    // Resolved against this test's own home, never the OS home's `.claude`.
+    checkConfigDir: persona => checkPersonaConfigDir(persona, { home: join(dir, 'home') }),
     clock: h.clock,
     dryRun,
     log: line => void h.lines.push(line),
@@ -6731,7 +7086,7 @@ describe('bring-up outcomes (E5)', () => {
     ])('a launch after a %s retry that %s is not a bring-up failure: A stays up, a rejection logs one token-free line, no timer, no second launch, no post', async (via, launchDoes) => {
       const f = makeBringUpFixture({
         launch: async persona => {
-          if (launchDoes === 'rejects') throw new Error(`spawn exploded ${LEAK_SENTINEL} ${fakeToken(BOT_TOKEN_PREFIX, 'launch')}`)
+          if (launchDoes === 'rejects') throw new Error(`spawn exploded (${sentinelInMessage('launch')})`)
           return { key: persona.key, action: 'failed' }
         },
       })
@@ -6754,7 +7109,11 @@ describe('bring-up outcomes (E5)', () => {
       expect(after[1]).toContain(`up after its bring-up retry (${via}) — launching`)
       expect(after.slice(2)).toEqual(
         launchDoes === 'rejects'
-          ? [expect.stringContaining(`[slack] persona ${renderPersonaRef(a.name, a.key)}: launch after its bring-up retry failed: Error `)]
+          ? [
+              expect.stringContaining(
+                `[slack] persona ${renderPersonaRef(a.name, a.key)}: launch after its bring-up retry failed: Error message="spawn exploded (${REDACTED_SENTINEL_TAIL})"`,
+              ),
+            ]
           : [],
       )
       await f.h.clock.advance(HOUR_MS)

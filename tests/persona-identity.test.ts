@@ -4,7 +4,9 @@
  * Covers b.av2 SR-2.1 (key rule and fit constraints), SR-2.2 (instance ID,
  * tmux name, labels, spawn env), the effective config-dir set (SR-6.2, SR-8.6
  * step 5), SR-9.1/SR-9.3 (persona target resolution),
- * SR-10.3 (persona-reference rendering) and SR-13.1 (no import side effects).
+ * SR-10.3 (persona-reference rendering) and SR-13.1 (no import side effects),
+ * plus the test helper's token matcher (`TOKEN_LIKE` / `isTokenLike`), which
+ * `assertNoLeak` applies.
  *
  * Expected keys are literals computed independently from the spec (SHA-256
  * of the UTF-8 name, outside this code base), never by calling personaKey:
@@ -26,7 +28,6 @@ import {
   PERSONA_KEY_MAX_LENGTH,
   configDirLabelValue,
   effectiveClaudeConfigDirs,
-  looksLikeSlackToken,
   personaInstanceId,
   personaKey,
   personaLabels,
@@ -280,61 +281,52 @@ describe('renderPersonaRef', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Token-shaped names (b.av2 SR-10.3; E13 Director decision 14)
+// The test helper's token matcher (tests/test-helpers/credentials.ts)
+//
+// Persona names have no format rule (b.av2 SR-1.2), so the source has no
+// token matcher. `TOKEN_LIKE` / `isTokenLike` still define what
+// `assertNoLeak` flags and what the secrecy audit's no-token-literal scan
+// looks for, so their boundary and after-dash rules are pinned here.
 // ---------------------------------------------------------------------------
 
-describe('looksLikeSlackToken', () => {
+describe('TOKEN_LIKE / isTokenLike (the rule assertNoLeak applies)', () => {
   /** `xox`, cut from the bot prefix so the file holds no token-like literal. */
   const XOX = BOT_TOKEN_PREFIX.slice(0, 3)
 
-  // Every token-shaped row is built at runtime from a prefix, so the file holds
-  // no token literal. A match needs a boundary before the prefix (the start of
-  // the text or anything but an ASCII letter or digit) and a digit after the
+  // Every token-shaped row is built at runtime, so the file holds no token
+  // literal. A match needs a boundary before the prefix (the start of the text
+  // or anything but an ASCII letter or digit) and a letter or digit after the
   // dash; the match is case-sensitive.
   const ROWS: [string, string, boolean][] = [
-    ['an xoxb- token', fakeToken(BOT_TOKEN_PREFIX), true],
+    ['an xoxb- token (fakeToken: a digit after the dash)', fakeToken(BOT_TOKEN_PREFIX), true],
     ['an xapp- token', fakeToken(APP_TOKEN_PREFIX), true],
     ['an xoxp- token', fakeToken('xoxp-'), true],
     ['an xoxe- token', fakeToken('xoxe-'), true],
-    ['a prefix and one digit', `${BOT_TOKEN_PREFIX}1`, true],
     ['a token inside a longer text', `Ops ${fakeToken('xoxp-')} bot`, true],
-    ['a token after a space', `Ops ${BOT_TOKEN_PREFIX}12 bot`, true],
-    ['a token after a colon', `bot:${BOT_TOKEN_PREFIX}1`, true],
-    ['a token in parentheses', `(${APP_TOKEN_PREFIX}1)`, true],
-    ['a token after an underscore', `a_${BOT_TOKEN_PREFIX}1`, true],
-    ['a token after a dash', `a-${BOT_TOKEN_PREFIX}1`, true],
-    ['a token after a non-ASCII letter', `é${BOT_TOKEN_PREFIX}1`, true],
+    ['a token after a colon', `bot:${fakeToken(BOT_TOKEN_PREFIX)}`, true],
+    ['a token in parentheses', `(${fakeToken(APP_TOKEN_PREFIX)})`, true],
+    ['a token after an underscore', `a_${fakeToken(BOT_TOKEN_PREFIX)}`, true],
+    ['a token after a dash', `a-${fakeToken(BOT_TOKEN_PREFIX)}`, true],
+    ['a token after a non-ASCII letter', `é${fakeToken(BOT_TOKEN_PREFIX)}`, true],
+    ['a prefix followed by a letter', `${BOT_TOKEN_PREFIX}abc`, true],
+    ['an xapp- prefix followed by a letter', `${APP_TOKEN_PREFIX}bot`, true],
     ['a bare prefix', BOT_TOKEN_PREFIX, false],
     ['the bare prefix in rule text', `must start with ${APP_TOKEN_PREFIX}`, false],
-    ['a prefix followed by a letter', `${BOT_TOKEN_PREFIX}abc`, false],
-    ['an xapp- prefix followed by a letter', `${APP_TOKEN_PREFIX}bot`, false],
     ['a prefix followed by a space', `${BOT_TOKEN_PREFIX} x`, false],
     ['a prefix followed by an underscore', `${BOT_TOKEN_PREFIX}_x`, false],
     ['a prefix with no dash', `${BOT_TOKEN_PREFIX.slice(0, -1)}abc`, false],
     ['a word such as "Xoxo bot"', 'Xoxo bot', false],
-    ['the word xoxo, a dash and a word', `${XOX}o-bot`, false],
-    ['inboxapp-bot', 'inboxapp-bot', false],
-    ['fluxapp-dev', 'fluxapp-dev', false],
-    ['boxapp-reviewer', 'boxapp-reviewer', false],
-    ['sandboxapp-1 (a digit after the dash, glued to a word)', 'sandboxapp-1', false],
-    ['a token glued after a letter', `bot${BOT_TOKEN_PREFIX}1`, false],
-    ['a token glued after a digit', `7${APP_TOKEN_PREFIX}1`, false],
-    ['an upper-case xoxb- prefix and a digit', `${BOT_TOKEN_PREFIX.toUpperCase()}1abc`, false],
-    ['an upper-case xapp- prefix and a digit', `${APP_TOKEN_PREFIX.toUpperCase()}1abc`, false],
+    ['inboxapp-bot (a prefix glued after a letter)', 'inboxapp-bot', false],
+    ['a token glued after a letter', `bot${fakeToken(BOT_TOKEN_PREFIX)}`, false],
+    ['a token glued after a digit', `7${fakeToken(APP_TOKEN_PREFIX)}`, false],
+    ['an upper-case xoxb- prefix', fakeToken(BOT_TOKEN_PREFIX.toUpperCase()), false],
     ['xox and a digit', `${XOX}1-1abc`, false],
     ['xox and two letters', `${XOX}bb-1abc`, false],
     ['an ordinary name', 'Ops Bot', false],
   ]
 
   test.each(ROWS)('%s', (_label, text, expected) => {
-    expect(looksLikeSlackToken(text)).toBe(expected)
-  })
-
-  // The test helper's matcher, which assertNoLeak applies, may be wider (it
-  // needs no digit after the dash) but must never miss what the loader rejects.
-  test('every source match is also token-like for the test helper', () => {
-    const missed = ROWS.filter(([, text]) => looksLikeSlackToken(text) && !isTokenLike(text)).map(([label]) => label)
-    expect(missed).toEqual([])
+    expect(isTokenLike(text)).toBe(expected)
   })
 })
 

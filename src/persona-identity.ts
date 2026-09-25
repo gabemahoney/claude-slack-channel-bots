@@ -3,8 +3,7 @@
  *
  * A persona is addressed everywhere by its key (b.av2 SR-2.1). This module
  * owns the key rule, the persona-reference rendering used by logs, previews
- * and errors (b.av2 SR-2.2, SR-10.3), the token-shaped-name matcher the
- * loader rejects names with (`looksLikeSlackToken`), the name-or-key target resolver used
+ * and errors (b.av2 SR-2.2, SR-10.3), the name-or-key target resolver used
  * by `/interject` and the crontable (b.av2 SR-9.1, SR-9.3), and the pure derivations of every
  * agent-director and tmux identifier a persona gets (b.av2 SR-2.2): instance
  * ID, tmux session name, labels (including the `config_dir` label) and the
@@ -131,33 +130,6 @@ export function personaKey(name: string): string {
     .replace(/^_+|_+$/g, '')
     .slice(0, PERSONA_KEY_MAX_STEM_LENGTH)
   return stem === '' ? suffix : `${stem}_${suffix}`
-}
-
-/**
- * A Slack token's shape: `xox` plus one lowercase letter and `-` (`xoxb-`,
- * `xoxp-`, `xoxe-`, …) or `xapp-`, followed by a digit, as in every Slack
- * bot, user, app and refresh token format. The prefix must start the text or
- * follow a character other than an ASCII letter or digit (a space,
- * punctuation, `_`), so a token anywhere in the text after such a separator
- * matches, while ordinary names that merely contain the letters do not:
- * `inboxapp-bot`, `sandboxapp-1`, `xoxo-bot`, a bare prefix ("must start
- * with xoxb-") or a prefix followed by a letter. Slack's prefixes are
- * lowercase, so the match is case-sensitive.
- */
-const SLACK_TOKEN_LIKE_RE = /(?<![A-Za-z0-9])(?:xox[a-z]|xapp)-[0-9]/
-
-/**
- * Whether `text` holds something shaped like a Slack token anywhere in it
- * (see `SLACK_TOKEN_LIKE_RE`). The loader rejects a persona name that does
- * (b.av2 SR-10.3): a name is shown in logs, previews, Slack messages and the
- * identifiers derived from its key, and `personaKey` keeps the name's
- * characters, so such a name can only be rejected, never masked. The
- * boundary and the digit keep ordinary names loading: an upgrade must never
- * refuse to start over a name an earlier version accepted, since renaming
- * changes the persona's key and loses its conversation.
- */
-export function looksLikeSlackToken(text: string): boolean {
-  return SLACK_TOKEN_LIKE_RE.test(text)
 }
 
 /**

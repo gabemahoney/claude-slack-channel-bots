@@ -32,7 +32,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import * as os from 'node:os'
 import { join } from 'node:path'
-import type { MakeTemplateParams } from 'agent-director'
+import { AgentDirectorError, ErrTemplateMalformed, type MakeTemplateParams } from 'agent-director'
 
 import {
   buildTemplateParams,
@@ -47,7 +47,7 @@ import {
   errTemplateNameUnsafe,
   makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
-import { BOT_TOKEN_PREFIX, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
+import { BOT_TOKEN_PREFIX, REDACTED_SENTINEL_TAIL, assertNoLeak, fakeToken, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeMultiPersonaConfig, makePersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 
 /**
@@ -483,20 +483,52 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
   })
 
   describe('a rejected refresh is logged, not fatal, and not retried (E13 decision 3)', () => {
-    /** A plain Error whose message carries a fake token: the refresh's line must not show it. */
-    const tokenBearing = (what: string): Error => new Error(`${what} ${fakeToken(BOT_TOKEN_PREFIX, 'refresh')}`)
+    /**
+     * The leak marker as a message carries it (`sentinelInMessage`): only
+     * inside a fake token and a Socket Mode `ticket=` URL. The refresh's line
+     * keeps a message after `redactSlackLogText`, which replaces both, so the
+     * marker shows only if redaction is skipped.
+     */
+    const secret = `(${sentinelInMessage('refresh')})`
+    /** `secret` as the line shows it. */
+    const REDACTED_SECRET = `(${REDACTED_SENTINEL_TAIL})`
+    /** A plain Error whose message carries `secret`. */
+    const tokenBearing = (what: string): Error => new Error(`${what} ${secret}`)
     /**
      * An untyped throw is described only through `describeThrownValue`: its
-     * type, then its stack frames if any (not pinned), never its message.
+     * type, its message redacted, then its stack frames if any (not pinned).
      */
-    const UNTYPED_ERROR = /Error(?: at .*)?/
-    // Rows: a typed error's detail is its exact name and description; an untyped one's matches UNTYPED_ERROR.
+    const untypedError = (what: string): RegExp => new RegExp(`Error ${RegExp.escape(`message="${what} ${REDACTED_SECRET}"`)}(?: at .*)?`)
+    // Rows: a typed error's detail is its exact name and redacted description; an untyped one's matches untypedError.
     type RejectRow = [label: string, opts: () => { makeTemplateError?: Error; getClient?: () => unknown }, detail: string | RegExp, makeTemplateCalls: number]
     const rejectRows: RejectRow[] = [
-      ['typed ErrTemplateMalformed', () => ({ makeTemplateError: errTemplateMalformed() }), 'ErrTemplateMalformed: template malformed', 1],
-      ['typed ErrTemplateNameUnsafe', () => ({ makeTemplateError: errTemplateNameUnsafe() }), 'ErrTemplateNameUnsafe: unsafe template name', 1],
-      ['a generic Error whose message holds a token', () => ({ makeTemplateError: tokenBearing('FFI handle invalid') }), UNTYPED_ERROR, 1],
-      ['getClient() throwing a token-bearing Error (no client installed)', () => ({ getClient: () => { throw tokenBearing('no client installed') } }), UNTYPED_ERROR, 0],
+      ['typed ErrTemplateMalformed', () => ({ makeTemplateError: errTemplateMalformed() }), 'ErrTemplateMalformed message="template malformed"', 1],
+      ['typed ErrTemplateNameUnsafe', () => ({ makeTemplateError: errTemplateNameUnsafe() }), 'ErrTemplateNameUnsafe message="unsafe template name"', 1],
+      [
+        'typed ErrTemplateMalformed whose description holds a token and a URL',
+        () => ({ makeTemplateError: new ErrTemplateMalformed('make-template', 'ErrTemplateMalformed', `bad template ${secret}`) }),
+        `ErrTemplateMalformed message="bad template ${REDACTED_SECRET}"`,
+        1,
+      ],
+      [
+        'typed ErrTemplateMalformed with an empty description',
+        () => ({ makeTemplateError: new ErrTemplateMalformed('make-template', 'ErrTemplateMalformed', '') }),
+        'ErrTemplateMalformed',
+        1,
+      ],
+      [
+        'a base AgentDirectorError whose errName is token-shaped',
+        () => ({ makeTemplateError: new AgentDirectorError('make-template', fakeToken(BOT_TOKEN_PREFIX, 'errname'), `bad ${secret}`) }),
+        new RegExp(`AgentDirectorError ${RegExp.escape(`message="<redacted-token> bad ${REDACTED_SECRET}"`)}(?: at .*)?`),
+        1,
+      ],
+      ['a generic Error whose message holds a token', () => ({ makeTemplateError: tokenBearing('FFI handle invalid') }), untypedError('FFI handle invalid'), 1],
+      [
+        'getClient() throwing a token-bearing Error (no client installed)',
+        () => ({ getClient: () => { throw tokenBearing('no client installed') } }),
+        untypedError('no client installed'),
+        0,
+      ],
     ]
 
     test.each(rejectRows)('%s → resolves failed, one token-safe line, no exit, no startup error', async (_label, opts, detail, makeTemplateCalls) => {

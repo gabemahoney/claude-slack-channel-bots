@@ -646,7 +646,7 @@ const personaRouting = createPersonaRouting({
   // module is still loading.
   notify: (key, text, options) => personaNotifier.notify(key, text, options),
   log: (line) => console.error(line),
-  // A lost message for a persona that is not up restarts nothing (b.g57 hold).
+  // A lost message for a persona that is not up restarts nothing (b.av2 SR-6.4).
   isPersonaUp,
 })
 
@@ -1140,6 +1140,9 @@ export async function main(): Promise<void> {
     // For the preview: a persona broken by its credentials is brought up at
     // apply rather than reconnected (b.av2 SR-8.6).
     bringUpState: (key) => bringUps?.state(key),
+    // Bug b.g57: the preview checks an added persona's claude_config_dir with
+    // the launch's own check, as its bring-up will.
+    checkConfigDir: checkLaunchConfigDir,
     slackClientFactory: PRODUCTION_SLACK_CLIENT_FACTORY,
     // b.av2 SR-8.6 step 1: once the record holds a confirmed change, the
     // server runs its persona set. Server-wide settings keep their start-time
@@ -1255,8 +1258,8 @@ export async function main(): Promise<void> {
     // it, and a persona no longer in it is neither re-checked nor launched.
     appliedPersonas: () => personaConfig?.personas ?? [],
     launch: (persona) => spawnForPersona(persona, personaConfig ?? appliedConfig, false),
-    // Bug b.g57: a held persona's claude_config_dir is re-checked exactly as
-    // the launch checks it.
+    // Bug b.g57: a persona's claude_config_dir is checked before its Slack
+    // step, and re-checked while it is held, exactly as the launch checks it.
     checkConfigDir: checkLaunchConfigDir,
     serialize: personaLifecycle.run,
     // b.av2 SR-6.3: a session is registered only while its persona is up. A
@@ -1271,7 +1274,9 @@ export async function main(): Promise<void> {
   bringUps = personaBringUps
   // Bug b.g57: a launch that finds a persona's claude_config_dir unresolvable
   // launches nothing and hands the persona to the controller, which holds it
-  // retrying and launches it once the directory resolves.
+  // retrying, closes its Slack connection (the manager's `stop`), and once
+  // the directory resolves connects it with its held credentials and
+  // launches it.
   setConfigDirUnresolvableHook(personaBringUps.holdForConfigDir)
 
   // b.av2 SR-6.5 / SR-6.1 / SR-8.6 / SR-6.6 / SR-6.4: the apply's persona

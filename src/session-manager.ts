@@ -113,7 +113,12 @@ import type { ReplyGuardUndo } from './stop-hook-bootstrap.ts'
 import { firstNoticeLine, notifySafely, type PersonaNoticeOptions, type PersonaNotify } from './persona-notifier.ts'
 import type { PersonaBringUpFailure } from './persona-start.ts'
 import type { PersonaBringUpController, PersonaBringUpOutcome } from './persona-bringup-controller.ts'
-import { describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
+import {
+  describeLogMessage,
+  describeThrownValue,
+  isSafeIdentifier,
+  MAX_LOGGED_MESSAGE_LENGTH,
+} from './persona-connection-errors.ts'
 import { describeDestinationFailureCause } from './persona-destination.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { RESTART_FAILURE_CAP } from './restart.ts'
@@ -363,21 +368,37 @@ function sendPersonaNotice(key: string, text: string, options?: PersonaNoticeOpt
 }
 
 /**
+ * The error label of a spawn-failure notice: the typed error's `errName` when
+ * it is a short identifier, else `describeThrownValue` of the error without
+ * its `message="…"` field (which holds the description, prefixed by the
+ * unchecked `errName`). The notice shows the description itself, once,
+ * after the label.
+ */
+function spawnFailureLabel(error: AgentDirectorError): string {
+  if (isSafeIdentifier(error.errName)) return error.errName
+  const described = describeThrownValue(error)
+  const message = describeLogMessage(error.message)
+  return message === '' ? described : described.replace(` ${message}`, '')
+}
+
+/**
  * Raise a spawn-failure notice for persona `key`: the error name, the
- * truncated description and a remediation hint. When a startup notice's post
- * fails, the `spawn-failure-post` startup error is recorded; outside startup
- * the failure is logged.
+ * description (through `redactSlackLogText`, cut to
+ * `MAX_LOGGED_MESSAGE_LENGTH` characters) and a remediation hint. When a
+ * startup notice's post fails, the `spawn-failure-post` startup error is
+ * recorded; outside startup the failure is logged.
  */
 export function notifySpawnFailure(key: string, error: AgentDirectorError, isStartup = true): void {
   const ref = keyRef(key)
   const text =
     `Spawn failure:\n` +
-    `  Error: \`${describeAgentDirectorFailure(error)}\` — ${redactSlackLogText(error.errDescription ?? '').slice(0, 300)}\n` +
+    `  Error: \`${spawnFailureLabel(error)}\` — ${redactSlackLogText(error.errDescription ?? '').slice(0, MAX_LOGGED_MESSAGE_LENGTH)}\n` +
     `  Remediation: ${remediationHint(error)}`
   sendPersonaNotice(key, text, {
     onPostFailure: (failure) => {
-      // Token-safe cause: a Slack rejection's message can carry secrets, so
-      // only the describer's type/code/frames reach stderr and the log file.
+      // Token-safe cause: a Slack rejection can carry secrets, so only the
+      // describer's output (type, code, redacted message, frames) reaches
+      // stderr and the log file.
       // A failed DM open names the step and its code.
       const cause = describeDestinationFailureCause(failure)
       if (isStartup) {
@@ -1501,7 +1522,7 @@ async function tryDelete(
     }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
     console.error(`[slack] tryDelete: failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-    if (isStartup) recordStartupError('spawn-failed', `delete failed for ${ref}: ${describeAgentDirectorFailure(e)}`, agentDirectorFailureCause(e))
+    if (isStartup) recordStartupError('spawn-failed', `delete failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
     notifySpawnFailure(key, e, isStartup)
     return false
   }
@@ -1545,7 +1566,7 @@ async function replaceWithFreshSpawn(
     }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
     console.error(`[slack] spawnForPersona: ${what} failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-    if (isStartup) recordStartupError('spawn-failed', `${what} failed for ${ref}: ${describeAgentDirectorFailure(e)}`, agentDirectorFailureCause(e))
+    if (isStartup) recordStartupError('spawn-failed', `${what} failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
     notifySpawnFailure(key, e, isStartup)
     return { key, action: 'failed' }
   }
@@ -1754,7 +1775,7 @@ async function diagnoseJsonlMissing(
       `(${detailProvenance}): ${candidateStr}.`
     console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
     // Operator-visible signal — reuse the existing startup-errors mechanism.
-    if (isStartup) recordStartupError('jsonl-transcript-lost-on-resume', detail, agentDirectorFailureCause(err))
+    if (isStartup) recordStartupError('jsonl-transcript-lost-on-resume', detail, describeAgentDirectorFailure(err))
     // And a persona notice so it is not buried in logs.
     sendPersonaNotice(
       key,
@@ -1819,27 +1840,21 @@ async function diagnoseJsonlMissing(
 }
 
 /**
- * Token-safe label of a failed agent-director call, for a line that is also
- * posted as a persona notice: a typed agent-director error's `errName` when
- * it is a short identifier, else `describeThrownValue` of the thrown value.
- * Never the value's free-form message.
+ * Token-safe description of a failed agent-director call, for a log line, a
+ * startup-error record (passed instead of the error itself) or a line that is
+ * also posted as a persona notice: a typed agent-director error's `errName`
+ * when it is a short identifier, then its `errDescription` as `message="…"`
+ * (`describeLogMessage`: through `redactSlackLogText`, on one line, capped at
+ * `MAX_LOGGED_MESSAGE_LENGTH` characters) when it has one; else
+ * `describeThrownValue` of the thrown value, which renders the message the
+ * same way. Never the raw error object.
  */
 function describeAgentDirectorFailure(err: unknown): string {
-  if (err instanceof AgentDirectorError && isSafeIdentifier(err.errName)) return err.errName
+  if (err instanceof AgentDirectorError && isSafeIdentifier(err.errName)) {
+    const message = describeLogMessage(err.errDescription)
+    return message === '' ? err.errName : `${err.errName} ${message}`
+  }
   return describeThrownValue(err)
-}
-
-/**
- * Token-safe cause of a failed agent-director call for `recordStartupError`,
- * passed instead of the error itself (whose message, `<errName>:
- * <errDescription>`, is unchecked): the {@link describeAgentDirectorFailure}
- * label, then the error's `errDescription`, when it has one, after
- * `redactSlackLogText`.
- */
-function agentDirectorFailureCause(err: unknown): string {
-  const label = describeAgentDirectorFailure(err)
-  const description = err instanceof AgentDirectorError ? err.errDescription : undefined
-  return typeof description === 'string' && description !== '' ? `${label}: ${redactSlackLogText(description)}` : label
 }
 
 /**
@@ -1862,7 +1877,7 @@ function reportInconclusiveDiagnosis(
     `deleted + fresh-spawned, but diagnosis was INCONCLUSIVE — could not determine whether conversation ` +
     `history was lost because ${reason}.`
   console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
-  if (isStartup) recordStartupError('jsonl-diagnosis-inconclusive', detail, agentDirectorFailureCause(err))
+  if (isStartup) recordStartupError('jsonl-diagnosis-inconclusive', detail, describeAgentDirectorFailure(err))
   sendPersonaNotice(
     key,
     `⚠️ CSCB: on restart I was started fresh; I could not determine whether my prior ` +
@@ -1983,7 +1998,7 @@ async function resumeOrFreshSpawn(
         }
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        if (isStartup) recordStartupError('spawn-failed', `self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`, agentDirectorFailureCause(e))
+        if (isStartup) recordStartupError('spawn-failed', `self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
         notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
@@ -2043,7 +2058,7 @@ async function resumeOrFreshSpawn(
         }
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: fresh spawn after delete failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        if (isStartup) recordStartupError('spawn-failed', `fresh spawn after delete failed for ${ref}: ${describeAgentDirectorFailure(e)}`, agentDirectorFailureCause(e))
+        if (isStartup) recordStartupError('spawn-failed', `fresh spawn after delete failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
         notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
@@ -2067,7 +2082,7 @@ async function resumeOrFreshSpawn(
           return { key, action: 'failed' }
         }
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
-        if (isStartup) recordStartupError('spawn-failed', `fresh spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`, agentDirectorFailureCause(e))
+        if (isStartup) recordStartupError('spawn-failed', `fresh spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
         notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
@@ -2094,7 +2109,7 @@ async function resumeOrFreshSpawn(
         }
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: fresh spawn after ErrSpawnNotFound on resume failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        if (isStartup) recordStartupError('spawn-failed', `fresh spawn after ErrSpawnNotFound on resume failed for ${ref}: ${describeAgentDirectorFailure(e)}`, agentDirectorFailureCause(e))
+        if (isStartup) recordStartupError('spawn-failed', `fresh spawn after ErrSpawnNotFound on resume failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
         notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
@@ -2393,7 +2408,7 @@ async function runPersonaLadder(
         }
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        if (isStartup) recordStartupError('spawn-failed', `self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`, agentDirectorFailureCause(e))
+        if (isStartup) recordStartupError('spawn-failed', `self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
         notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
@@ -2407,7 +2422,7 @@ async function runPersonaLadder(
     } else {
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
       console.error(`[slack] spawnForPersona: spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-      if (isStartup) recordStartupError('spawn-failed', `spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`, agentDirectorFailureCause(e))
+      if (isStartup) recordStartupError('spawn-failed', `spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
       notifySpawnFailure(key, e, isStartup)
       return { key, action: 'failed' }
     }
@@ -2437,7 +2452,7 @@ async function runPersonaLadder(
         }
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: retry-spawn also failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        if (isStartup) recordStartupError('spawn-failed', `retry-spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`, agentDirectorFailureCause(e))
+        if (isStartup) recordStartupError('spawn-failed', `retry-spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
         notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
@@ -2608,7 +2623,6 @@ export async function reconcileOrphans(
     recordStartupError(
       'orphan-cleanup-list-failed',
       `failed to list spawns for orphan reconciliation: ${describeAgentDirectorFailure(e)}`,
-      agentDirectorFailureCause(e),
     )
     return { found: 0, killed: 0, failed: 0 }
   }
@@ -2655,7 +2669,6 @@ export async function reconcileOrphans(
       recordStartupError(
         'orphan-cleanup',
         `kill failed for orphan instanceId=${row.claude_instance_id} persona=${displayPersona}: ${describeAgentDirectorFailure(e)}`,
-        agentDirectorFailureCause(e),
       )
       // continue to delete attempt
     }
@@ -2668,7 +2681,6 @@ export async function reconcileOrphans(
       recordStartupError(
         'orphan-cleanup',
         `delete failed for orphan instanceId=${row.claude_instance_id} persona=${displayPersona}: ${describeAgentDirectorFailure(e)}`,
-        agentDirectorFailureCause(e),
       )
       failed++
     }
@@ -2853,8 +2865,9 @@ export async function startupSessionManager(
     } catch (err) {
       const ref = personaRef(persona)
       // Token-safe: the launch covers the persona's Slack bring-up, so the
-      // thrown value's message can carry secrets. Only the describer's
-      // type/code/frames reach the log and startup-errors.log.
+      // thrown value's message can carry secrets. Only the describer's output
+      // (type, code, message through `redactSlackLogText`, frames) reaches
+      // the log and startup-errors.log.
       const cause = describeThrownValue(err)
       console.error(`[slack] startupSessionManager: unexpected error for ${ref}: ${cause}`)
       recordStartupError('spawn-failed', `unexpected error spawning ${ref}: ${cause}`)

@@ -412,8 +412,9 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   /**
    * b.av2 SR-4.6, SR-7.3: the message is lost. Decide the recovery state from
    * whether P is up (`isPersonaUp`: a persona that is not up, such as one
-   * whose launch waits for its claude_config_dir, is launched by its own
-   * recovery, never restarted from here) and P's real restart guards
+   * that stopped being up while this message was being handled, is launched
+   * by its own recovery, never restarted from here) and P's real restart
+   * guards
    * (pending, auto-restart disabled, cap), schedule a human-triggered restart
    * of P in `cwd` only when the state is `starting-now`, and raise one
    * lost-message notice naming `senderLabel` and the state at P's

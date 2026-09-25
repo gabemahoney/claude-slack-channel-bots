@@ -34,9 +34,10 @@
  *   one per notice or attempt; the notice is never lost to it. A post that
  *   fails for the message itself (`invalid_blocks`, `msg_too_long`, …) is
  *   logged here token-safely and dropped: the log line carries the error
- *   type/code and, when it is a short identifier, Slack's platform reason;
- *   never the error message. Either way the caller's failure callback runs
- *   once, at the notice's first failed attempt. A `dm` destination the
+ *   type/code, its message through `redactSlackLogText` (URL-like and
+ *   token-like text replaced, one line, capped) and, when it is a short
+ *   identifier, Slack's platform reason. Either way the caller's failure
+ *   callback runs once, at the notice's first failed attempt. A `dm` destination the
  *   resolver refuses (DMs off or no contact, which the loader rejects) is
  *   logged by the resolver and not posted.
  *

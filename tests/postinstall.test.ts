@@ -614,7 +614,7 @@ describe('skill links — the retired claude-slack-channels-config link', () => 
     expect(lines.some((l) => l.startsWith('removed:'))).toBe(false)
   })
 
-  test.skipIf(isRoot)('a retired link in a read-only skills dir is kept with described warnings and no throw (skipped as root: permission bits do not bind root)', () => {
+  test.skipIf(isRoot)('a retired link in a read-only skills dir is kept with warnings naming each error\'s code and message, and no throw (skipped as root: permission bits do not bind root)', () => {
     const s = makeSandbox()
     mkdirSync(s.skillsDir, { recursive: true })
     const retired = join(s.skillsDir, RETIRED_SKILL)
@@ -633,10 +633,9 @@ describe('skill links — the retired claude-slack-channels-config link', () => 
     expect(warnings).toHaveLength(2)
     expect(warnings[0]).toStartWith(`warning: could not symlink ${DEBUG_SKILL}: `)
     expect(warnings[1]).toStartWith(`warning: could not remove ${RETIRED_SKILL} link: `)
-    for (const w of warnings) {
-      expect(w).toMatch(/: \w*Error code=E[A-Z]+/)
-      expect(w).not.toContain(s.skillsDir)
-    }
+    // Each names the error by its described form: type, code and its message
+    // (through `redactSlackLogText`), then frames.
+    for (const w of warnings) expect(w).toMatch(/: \w*Error code=(E[A-Z]+) message="\1: [^"]*"/)
     expect(existsSync(s.mcpConfigPath)).toBe(true)
   })
 })
