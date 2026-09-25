@@ -500,8 +500,13 @@ fi
 # trustedDependencies. A FRESH global prefix has no such entry, so the install
 # above succeeds while src/postinstall.ts never runs — and the failure only
 # surfaces much later, as `start` dying with "missing prerequisite: config.json".
-# So: trust the package if the manifest does not already, then verify the
-# artifacts postinstall is responsible for actually exist.
+# So: trust the package if the manifest does not already, then verify the two
+# files postinstall scaffolds that the server and its persona sessions need
+# actually exist: config.json under the state dir (the empty-personas skeleton
+# `start` requires) and ~/.claude/slack-mcp.json (the default mcp_config_path,
+# the MCP config every persona session is launched with via --mcp-config). The
+# debugging-skill link postinstall also creates is a convenience, so it is not
+# checked.
 #
 # Non-fatal by design, like SR-7.5: the release is published, tagged and verified
 # by this point, and the artifacts are scaffolded skeletons an operator can
@@ -528,7 +533,7 @@ if [ "${SR74B_TRUSTED}" != "1" ]; then
 fi
 
 SR74B_MISSING=()
-for sr74b_artifact in "${SR74B_STATE_DIR}/config.json" "${SR74B_STATE_DIR}/access.json" "${SR74B_MCP_CONFIG}"; do
+for sr74b_artifact in "${SR74B_STATE_DIR}/config.json" "${SR74B_MCP_CONFIG}"; do
   if [ ! -f "${sr74b_artifact}" ]; then
     SR74B_MISSING+=("${sr74b_artifact}")
   fi
@@ -538,7 +543,15 @@ if [ "${#SR74B_MISSING[@]}" -gt 0 ]; then
   {
     echo "SR-7.4b (postinstall trust): WARNING — these files the postinstall scaffolds are still missing after the install:"
     printf '  %s\n' "${SR74B_MISSING[@]}"
-    echo "Without them 'claude-slack-channel-bots start' fails with 'missing prerequisite: config.json'. The release IS fully delivered (v${NEXT_VERSION} is on npm + tag on origin + verified locally), so this is NOT a release failure and the script does not exit non-zero here. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun pm -g trust claude-slack-channel-bots' and confirm it prints a '✓ [postinstall]' line, then re-check the paths above. Note that trust SWALLOWS the postinstall's own stdout — the paths existing on disk is the observable proof, not the script's log."
+    for sr74b_artifact in "${SR74B_MISSING[@]}"; do
+      case "${sr74b_artifact}" in
+        "${SR74B_STATE_DIR}/config.json")
+          echo "Without config.json 'claude-slack-channel-bots start' fails with 'missing prerequisite: config.json'." ;;
+        "${SR74B_MCP_CONFIG}")
+          echo "Without slack-mcp.json, persona sessions launched with the default mcp_config_path cannot reach the server's MCP endpoint." ;;
+      esac
+    done
+    echo "The release IS fully delivered (v${NEXT_VERSION} is on npm + tag on origin + verified locally), so this is NOT a release failure and the script does not exit non-zero here. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun pm -g trust claude-slack-channel-bots' and confirm it prints a '✓ [postinstall]' line, then re-check the paths above. Note that trust SWALLOWS the postinstall's own stdout — the paths existing on disk is the observable proof, not the script's log."
   } >&2
 fi
 

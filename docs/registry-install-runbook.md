@@ -126,16 +126,14 @@ you to reinstall by hand.
    entry at all, so this step is required there; a prefix that has carried the
    package before usually already lists it.
 
-   Snapshot the three files the postinstall scaffolds **before** trusting, so you
+   Snapshot the two files the postinstall scaffolds **before** trusting, so you
    can prove afterwards whether it created them and whether it left existing ones
    untouched:
 
    ```sh
    stat -c '%n %s %Y' ~/.claude/channels/slack/config.json \
-                      ~/.claude/channels/slack/access.json \
                       ~/.claude/slack-mcp.json 2>&1 | tee /tmp/cscb-postinstall-before
    sha256sum ~/.claude/channels/slack/config.json \
-             ~/.claude/channels/slack/access.json \
              ~/.claude/slack-mcp.json 2>&1 | tee -a /tmp/cscb-postinstall-before
    ```
 
@@ -149,19 +147,16 @@ you to reinstall by hand.
    The `-g` flag targets the global install; run from an arbitrary directory the
    non-`-g` form errors with `No package.json was found`. `bun pm -g trust` adds
    the package to `trustedDependencies` in the global manifest and runs the
-   blocked postinstall, which scaffolds
-   `~/.claude/channels/slack/{config.json,access.json}` and
-   `~/.claude/slack-mcp.json`. Without this step, a later `start` fails with the
-   cryptic `missing prerequisite: config.json`.
+   blocked postinstall, which scaffolds `~/.claude/channels/slack/config.json`
+   and `~/.claude/slack-mcp.json`. Without this step, a later `start` fails
+   with the cryptic `missing prerequisite: config.json`.
 
    Re-run the same two commands into a second file and diff:
 
    ```sh
    stat -c '%n %s %Y' ~/.claude/channels/slack/config.json \
-                      ~/.claude/channels/slack/access.json \
                       ~/.claude/slack-mcp.json 2>&1 | tee /tmp/cscb-postinstall-after
    sha256sum ~/.claude/channels/slack/config.json \
-             ~/.claude/channels/slack/access.json \
              ~/.claude/slack-mcp.json 2>&1 | tee -a /tmp/cscb-postinstall-after
    diff /tmp/cscb-postinstall-before /tmp/cscb-postinstall-after
    ```
@@ -181,7 +176,7 @@ you to reinstall by hand.
    visible. The files on disk are the only observable evidence.
 
    `/publish promote` performs this same trust-and-verify automatically at
-   SR-7.4b, warning (non-fatally) if any of the three files is still missing
+   SR-7.4b, warning (non-fatally) if either of the two files is still missing
    after the install.
 
 ---

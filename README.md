@@ -1287,7 +1287,7 @@ After all gates pass, the skill, in this order:
 7. Pushes the `v<version>` tag to `origin`, bringing GitHub and npm into agreement.
 8. Polls the npm registry every 5 seconds for up to 10 minutes until the new version is visible, printing a progress line every ~30 seconds. npm propagation commonly takes a few minutes, so a multi-minute wait here is normal.
 9. Sanitizes the bun-1.3.13 empty-string-dependency-key poison from the global `package.json` (see [Installing from a local worktree](#installing-from-a-local-worktree)), removes any pre-existing global install, then runs `bun install -g claude-slack-channel-bots@<version>` — the exact command an end user would run — and verifies the installed bin resolves under `~/.bun/install/global/` at the published version. If the `claude-slack-channel-bots` on PATH resolves somewhere else (an install in another bun prefix shadowing this one), the diagnostic names the shadowing path, the symlink chain, and the manual fix.
-10. Trusts the package if the global manifest does not already (`bun pm -g trust`) and checks that the postinstall's `~/.claude/channels/slack/{config.json,access.json}` and `~/.claude/slack-mcp.json` exist — a missing file is a warning, not a release failure.
+10. Trusts the package if the global manifest does not already (`bun pm -g trust`) and checks that the postinstall's `~/.claude/channels/slack/config.json` (under `SLACK_STATE_DIR` when it is set) and `~/.claude/slack-mcp.json` exist — a missing file is a warning, not a release failure.
 11. Prints a success summary identifying the published version, npm URL, GitHub release tag URL, resolved local install path, and the next-operator-action command.
 
 ### After the skill exits

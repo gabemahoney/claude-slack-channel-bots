@@ -34,6 +34,7 @@ import {
   mkdtempSync,
   mkdirSync,
   rmSync,
+  readdirSync,
   symlinkSync,
   chmodSync,
 } from 'node:fs'
@@ -483,11 +484,23 @@ describe('b.r6x: SR-7.4 outside-prefix arm reports the shadow and still exits 72
 // Driven against a stub `bun` at the front of PATH that records its argv and
 // CWD. No real `bun pm -g trust` ever runs.
 
+/** The warning's consequence sentence for a missing state-dir config.json. */
+const SR74B_CONFIG_CONSEQUENCE =
+  "Without config.json 'claude-slack-channel-bots start' fails with 'missing prerequisite: config.json'."
+/** The warning's consequence sentence for a missing ~/.claude/slack-mcp.json. */
+const SR74B_MCP_CONSEQUENCE =
+  "Without slack-mcp.json, persona sessions launched with the default mcp_config_path cannot reach the server's MCP endpoint."
+
 interface Sr74bOpts {
   /** Write a global manifest, and whether it lists the package as trusted. */
   manifest?: 'trusted' | 'untrusted' | 'absent'
-  /** Create the artifacts the postinstall is responsible for. */
-  artifacts?: boolean
+  /**
+   * Create the files SR-7.4b checks for: the state dir's config.json and
+   * ~/.claude/slack-mcp.json. `true` writes both; the object form picks each.
+   */
+  artifacts?: boolean | { config: boolean; mcp: boolean }
+  /** Write a leftover file with this name into the state dir (not an artifact). */
+  leftover?: string
   /** Point SLACK_STATE_DIR at a temp state dir instead of ~/.claude/…/slack. */
   stateDirOverride?: boolean
   /** Exit code of the stub `bun`. */
@@ -527,12 +540,21 @@ function runSr74b(opts: Sr74bOpts = {}): Sr74bRun {
     ? join(home, 'state')
     : join(home, '.claude/channels/slack')
   const mcpConfig = join(home, '.claude/slack-mcp.json')
-  if (opts.artifacts) {
+  const artifacts =
+    typeof opts.artifacts === 'object'
+      ? opts.artifacts
+      : { config: !!opts.artifacts, mcp: !!opts.artifacts }
+  if (artifacts.config) {
     mkdirSync(stateDir, { recursive: true })
     writeFileSync(join(stateDir, 'config.json'), '{}\n')
-    writeFileSync(join(stateDir, 'access.json'), '{}\n')
+  }
+  if (artifacts.mcp) {
     mkdirSync(dirname(mcpConfig), { recursive: true })
     writeFileSync(mcpConfig, '{}\n')
+  }
+  if (opts.leftover) {
+    mkdirSync(stateDir, { recursive: true })
+    writeFileSync(join(stateDir, opts.leftover), '{}\n')
   }
 
   const stubBin = join(home, 'stub-bin')
@@ -574,8 +596,11 @@ function runSr74b(opts: Sr74bOpts = {}): Sr74bRun {
 }
 
 describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
-  test('a trusted manifest with all artifacts present runs no bun and warns nothing', () => {
+  test('a trusted manifest with config.json + MCP config present and no access.json runs no bun and warns nothing', () => {
+    // b.av2 SR-12: pins the fix for a false warning on every release after
+    // postinstall stopped creating access.json.
     const r = runSr74b({ manifest: 'trusted', artifacts: true })
+    expect(readdirSync(r.stateDir)).toEqual(['config.json'])
     expect(r.code).toBe(0)
     expect(r.bunCalls).toEqual([])
     expect(r.stderr).toBe('')
@@ -601,15 +626,51 @@ describe('b.r6x: SR-7.4b closes the fresh-prefix postinstall trust gap', () => {
     const r = runSr74b({ manifest: 'trusted', artifacts: false })
     expect(r.code).toBe(0) // non-fatal by design: the release IS delivered
     expect(r.stderr).toContain(join(r.stateDir, 'config.json'))
-    expect(r.stderr).toContain(join(r.stateDir, 'access.json'))
     expect(r.stderr).toContain(r.mcpConfig)
+    // b.av2 SR-12: postinstall no longer creates access.json, so it is not on the list.
+    expect(r.stderr).not.toContain('access.json')
+  })
+
+  // Each missing file gets its own consequence sentence, and only a missing
+  // file gets one: a warning that always printed both would blame the MCP
+  // config for a missing config.json (and vice versa).
+  test.each([
+    { missing: 'config.json only', config: false, mcp: true, configLine: true, mcpLine: false },
+    { missing: 'slack-mcp.json only', config: true, mcp: false, configLine: false, mcpLine: true },
+    { missing: 'both files', config: false, mcp: false, configLine: true, mcpLine: true },
+  ])(
+    'missing $missing: the warning states the consequence for each missing file only',
+    ({ config, mcp, configLine, mcpLine }) => {
+      const r = runSr74b({ manifest: 'trusted', artifacts: { config, mcp } })
+      expect(r.code).toBe(0)
+      expect(r.stderr).toContain('SR-7.4b (postinstall trust): WARNING')
+      expect(r.stderr.includes(SR74B_CONFIG_CONSEQUENCE)).toBe(configLine)
+      expect(r.stderr.includes(SR74B_MCP_CONSEQUENCE)).toBe(mcpLine)
+    },
+  )
+
+  test('b.av2 SR-12: a leftover access.json does not stand in for a missing config.json', () => {
+    const r = runSr74b({
+      manifest: 'trusted',
+      artifacts: { config: false, mcp: true },
+      leftover: 'access.json',
+    })
+    expect(r.code).toBe(0)
+    expect(r.stderr).toContain('SR-7.4b (postinstall trust): WARNING')
+    expect(r.stderr).toContain(join(r.stateDir, 'config.json'))
+    expect(r.stderr).not.toContain(r.mcpConfig)
+    expect(r.stderr).not.toContain('access.json')
   })
 
   test('SLACK_STATE_DIR overrides where the artifacts are looked for', () => {
     const present = runSr74b({ manifest: 'trusted', artifacts: true, stateDirOverride: true })
+    expect(readdirSync(present.stateDir)).toEqual(['config.json'])
+    expect(present.code).toBe(0)
     expect(present.stderr).toBe('')
     const missing = runSr74b({ manifest: 'trusted', artifacts: false, stateDirOverride: true })
+    expect(missing.code).toBe(0)
     expect(missing.stderr).toContain(join(missing.stateDir, 'config.json'))
+    expect(missing.stderr).not.toContain('access.json')
     // The default location is not consulted when the override is set.
     expect(missing.stderr).not.toContain(join(missing.home, '.claude/channels/slack'))
   })
