@@ -12,6 +12,7 @@ import type { BrowserContext, Page } from 'playwright-core'
 
 import type { HumanApi, SlackUrls } from '../lib/browser-types.ts'
 import { formBody, SlackTransportError, type SlackParams, type SlackResponse } from '../lib/slack-api.ts'
+import { gotoWithRetry } from './common.ts'
 
 const SESSION_TOKEN_RE = /^xoxc-[0-9A-Za-z-]+$/
 const MAX_RATE_LIMIT_RETRIES = 4
@@ -23,7 +24,7 @@ interface LocalConfigTeam {
 
 /** The session token for `domain` from the web client's local config, or null when not signed in. */
 export async function readSessionToken(page: Page, urls: SlackUrls, domain: string): Promise<string | null> {
-  await page.goto(urls.clientHome(domain), { waitUntil: 'domcontentloaded' }).catch(() => undefined)
+  await gotoWithRetry(page, urls.clientHome(domain)).catch(() => undefined)
   const deadline = Date.now() + 20_000
   while (Date.now() < deadline) {
     // Sent to a sign-in page: there is no session to read.

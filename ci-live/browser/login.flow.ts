@@ -19,7 +19,7 @@ import type { ElementHandle, Locator, Page } from 'playwright-core'
 
 import type { SignInOutcome, SlackUrls } from '../lib/browser-types.ts'
 import { NotRunnableError } from '../lib/secrets.ts'
-import { bareUrl, firstVisible, FlowError, waitForState } from './common.ts'
+import { bareUrl, firstVisible, FlowError, gotoWithRetry, waitForState } from './common.ts'
 
 const SIGNED_IN_URL_RE = /app\.slack\.com\/client|\/ssb\/redirect|\/messages\b|\/archives\/|\/fixture\/client/
 
@@ -64,7 +64,7 @@ async function outcomeAfterSubmit(page: Page): Promise<SignInOutcome> {
 
 /** Sign in with email and password on the workspace's sign-in page. */
 export async function signInWithPassword(page: Page, urls: SlackUrls, domain: string, email: string, password: string): Promise<SignInOutcome> {
-  await page.goto(urls.signIn(domain), { waitUntil: 'domcontentloaded' })
+  await gotoWithRetry(page, urls.signIn(domain))
   const emailField = await firstVisible([
     page.locator('input[type="email"]'),
     page.locator('input[name="email"]'),

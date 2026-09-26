@@ -11,7 +11,7 @@
 import type { Locator, Page } from 'playwright-core'
 
 import type { SlackUrls } from '../lib/browser-types.ts'
-import { buttonLike, clickButton, firstVisible, FlowError } from './common.ts'
+import { buttonLike, clickButton, firstVisible, FlowError, gotoWithRetry } from './common.ts'
 import { APP_TOKEN_RE, findToken } from './page-secrets.ts'
 
 const SCOPE = 'connections:write'
@@ -37,7 +37,7 @@ async function chooseScope(page: Page, scope: Locator): Promise<void> {
 }
 
 export async function generateAppToken(page: Page, urls: SlackUrls, appId: string, name: string): Promise<string> {
-  await page.goto(urls.basicInfoPage(appId), { waitUntil: 'domcontentloaded' })
+  await gotoWithRetry(page, urls.basicInfoPage(appId))
   await clickButton(page, /generate token and scopes/i, 'app token')
   const d = await dialog(page)
   const nameField = await firstVisible([d.getByLabel(/token name/i), d.getByPlaceholder(/token name|name/i), d.locator('input[type="text"]')], 10_000)
@@ -61,7 +61,7 @@ export async function generateAppToken(page: Page, urls: SlackUrls, appId: strin
 }
 
 export async function revokeAppToken(page: Page, urls: SlackUrls, appId: string, name: string): Promise<void> {
-  await page.goto(urls.basicInfoPage(appId), { waitUntil: 'domcontentloaded' })
+  await gotoWithRetry(page, urls.basicInfoPage(appId))
   const entry = await firstVisible(
     [page.getByRole('button', { name, exact: true }), page.getByRole('link', { name, exact: true }), page.getByText(name, { exact: true })],
     20_000,
@@ -76,7 +76,7 @@ export async function revokeAppToken(page: Page, urls: SlackUrls, appId: string,
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
     await page.waitForTimeout(2_000)
-    await page.goto(urls.basicInfoPage(appId), { waitUntil: 'domcontentloaded' })
+    await gotoWithRetry(page, urls.basicInfoPage(appId))
     // The token list must have rendered before an absent name means anything.
     if (!(await firstVisible([page.getByText(/app-level tokens/i)], 15_000))) continue
     const still = await firstVisible([page.getByText(name, { exact: true })], 3_000)

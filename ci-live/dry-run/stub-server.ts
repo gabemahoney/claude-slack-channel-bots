@@ -3,7 +3,8 @@
  * the human session API (`/human-api/<method>`) and fixture HTML pages for
  * the browser flows (sign-in, the emailed-code prompt, install and consent,
  * OAuth & Permissions, Basic Information with App-Level Tokens, and a
- * web-client conversation with a prompt message); and the test mailbox's
+ * web-client conversation with a prompt message, whose first load lands on
+ * a default channel as the real client's does); and the test mailbox's
  * mail.tm API (`/mailtm/token`, `/mailtm/messages[/<id>]`,
  * `/mailtm/sources/<id>`), on 127.0.0.1 only.
  *
@@ -13,10 +14,20 @@
  */
 
 import type { SlackUrls } from '../lib/browser-types.ts'
-import { STUB_TEAM_ID, StubWorkspace } from './stub-state.ts'
+import { blockButtons, STUB_TEAM_ID, StubWorkspace } from './stub-state.ts'
+
+/** What the fixture web client served (the dry run's self-test reads it). */
+export interface StubClientStats {
+  /** Conversation pages served. */
+  conversationLoads: number
+  /** Conversation loads the client sent to its default channel instead. */
+  defaultChannelRedirects: number
+}
 
 export interface StubServer {
   workspace: StubWorkspace
+  /** The fixture web client's counters. */
+  client: StubClientStats
   baseUrl: string
   apiBase: string
   /** The stub mailbox's API base (mailbox.json's `api` in a dry run). */
@@ -183,27 +194,129 @@ function generalPage(ws: StubWorkspace, appId: string): Response {
   )
 }
 
-function conversationPage(ws: StubWorkspace, conv: string): Response {
-  const channel = ws.channels.get(conv)
-  const items = (channel?.messages ?? [])
-    .map((m) => {
-      const buttons = m.blocks
-        ? `<button type="button" onclick="click_('${esc(m.ts)}','Allow')">Allow</button><button type="button" onclick="click_('${esc(m.ts)}','Deny')">Deny</button>`
-        : ''
-      return `<div data-item-key="${esc(m.ts)}"><span>${esc(m.text)}</span>${buttons}</div>`
-    })
+/**
+ * The fixture web client's default channel: its first load of a
+ * conversation lands there instead, as the real client's first load in a
+ * page does (it sends the page to the workspace's default channel).
+ */
+const DEFAULT_CHANNEL = {
+  id: 'C0DRYGENERAL',
+  name: 'general',
+  messages: [
+    { ts: '1700000000.000100', text: 'Welcome to #general.', buttons: [] },
+    { ts: '1700000000.000200', text: 'This is the default channel.', buttons: [] },
+  ],
+}
+/** How long the fixture client takes to boot before it shows a conversation. */
+const CLIENT_BOOT_MS = 1_000
+/** When the cookie banner shows over the fixture client (unless dismissed before). */
+const COOKIE_BANNER_MS = 300
+/** Messages the fixture's message list renders at a time (the real one is a virtual list). */
+const CLIENT_WINDOW = 10
+
+/**
+ * The fixture client: boots (the message pane is hidden meanwhile), then
+ * shows the conversation, or, when told to redirect, replaces the URL with
+ * the default channel's and shows that. Messages carry the real client's
+ * attributes (`data-item-key` / `id="message-list_<ts>"`), Block Kit buttons
+ * theirs (`data-qa="bk_button-element"`, `id="<ts>-<action id>"`,
+ * `data-qa-action-id`). The list renders the newest CLIENT_WINDOW messages
+ * and prepends older ones when scrolled to its top. A OneTrust-style cookie
+ * banner covers the page (intercepting clicks) until accepted.
+ */
+const CLIENT_SCRIPT = `
+const F = JSON.parse(document.getElementById('fixture-data').textContent);
+async function click_(ts, button) {
+  await fetch('/fixture/click', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conv: F.conv, ts, button }) });
+}
+function item(m) {
+  const el = document.createElement('div');
+  el.className = 'msg';
+  el.setAttribute('role', 'listitem');
+  el.setAttribute('data-item-key', m.ts);
+  el.id = 'message-list_' + m.ts;
+  const text = document.createElement('span');
+  text.textContent = m.text;
+  el.append(text);
+  for (const b of m.buttons) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.setAttribute('data-qa', 'bk_button-element');
+    btn.id = m.ts + '-' + b.actionId;
+    btn.setAttribute('data-qa-action-id', b.actionId);
+    btn.textContent = b.text;
+    btn.onclick = () => click_(m.ts, b.text);
+    el.append(btn);
+  }
+  return el;
+}
+function show(view) {
+  document.title = view.name + ' (Channel) - Stub client';
+  const list = document.getElementById('message-list');
+  let start = Math.max(0, view.messages.length - F.window);
+  list.replaceChildren(...view.messages.slice(start).map(item));
+  document.getElementById('pane').hidden = false;
+  list.scrollTop = list.scrollHeight;
+  list.onscroll = () => {
+    if (start === 0 || list.scrollTop > 40) return;
+    const from = Math.max(0, start - F.window);
+    const height = list.scrollHeight;
+    list.prepend(...view.messages.slice(from, start).map(item));
+    start = from;
+    list.scrollTop += list.scrollHeight - height;
+  };
+}
+setTimeout(() => {
+  if (F.redirect) { history.replaceState(null, '', F.redirect.path); show(F.redirect); } else show(F.view);
+}, F.bootMs);
+if (!document.cookie.split('; ').some((c) => c.startsWith('OptanonAlertBoxClosed='))) {
+  setTimeout(() => {
+    const banner = document.createElement('div');
+    banner.id = 'onetrust-banner-sdk';
+    banner.style.cssText = 'position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.3)';
+    const accept = document.createElement('button');
+    accept.type = 'button';
+    accept.id = 'accept-recommended-btn-handler';
+    accept.textContent = 'Accept All Cookies';
+    accept.onclick = () => { document.cookie = 'OptanonAlertBoxClosed=1; path=/'; banner.remove(); };
+    banner.append(accept);
+    document.body.append(banner);
+  }, F.bannerMs);
+}`
+
+/** JSON for an inline `<script type="application/json">` (no `</script>` can end it early). */
+function inlineJson(value: unknown): string {
+  return JSON.stringify(value).replace(/</g, '\\u003c')
+}
+
+function conversationPage(ws: StubWorkspace, teamId: string, conv: string, toDefault: boolean): Response {
+  const messages = (ws.channels.get(conv)?.messages ?? []).map((m) => ({ ts: m.ts, text: m.text, buttons: blockButtons(m.blocks) }))
+  const name = ws.channels.get(conv)?.name ?? conv
+  const data = {
+    conv,
+    window: CLIENT_WINDOW,
+    bootMs: CLIENT_BOOT_MS,
+    bannerMs: COOKIE_BANNER_MS,
+    view: { name, messages },
+    redirect: toDefault ? { path: `/fixture/client/${teamId}/${DEFAULT_CHANNEL.id}`, name: DEFAULT_CHANNEL.name, messages: DEFAULT_CHANNEL.messages } : null,
+  }
+  // The sidebar's channel items carry `data-item-key` (channel ids), as the real client's do.
+  const sidebar = [...ws.channels.values(), DEFAULT_CHANNEL]
+    .map((c) => `<div role="treeitem" data-item-key="${esc(c.id)}">#${esc(c.name)}</div>`)
     .join('')
   return page(
     'Stub client',
-    `<div id="messages">${items}</div><script>
-async function click_(ts, b) { await fetch('/fixture/click', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conv: ${JSON.stringify(conv)}, ts, button: b }) }); }
-</script>`,
+    `<style>#message-list{height:400px;overflow-y:auto;overflow-anchor:none}.msg{min-height:56px}</style>
+<nav aria-label="Channels"><div role="tree">${sidebar}</div></nav>
+<main id="pane" data-qa="message_pane" hidden><div id="message-list" role="list"></div></main>
+<script type="application/json" id="fixture-data">${inlineJson(data)}</script><script>${CLIENT_SCRIPT}</script>`,
   )
 }
 
 export function startStubServer(options: { domain: string; email: string; password: string }): StubServer {
   const ws = new StubWorkspace(options.domain, options.email, options.password)
   const signedIn = (req: Request) => cookieOf(req) === ws.cookie
+  const client: StubClientStats = { conversationLoads: 0, defaultChannelRedirects: 0 }
 
   const server = Bun.serve({
     hostname: '127.0.0.1',
@@ -242,7 +355,14 @@ export function startStubServer(options: { domain: string; email: string; passwo
       if (path === '/fixture/client' || (m = /^\/fixture\/client\/([A-Z0-9]+)\/([A-Z0-9]+)$/.exec(path))) {
         if (!signedIn(req)) return redirect('/fixture/sign_in_with_password')
         const config = JSON.stringify({ teams: { [STUB_TEAM_ID]: { token: ws.sessionToken, domain: ws.domain } } })
-        const body = m ? conversationPage(ws, m[2] as string) : page('Stub client', '<p>Signed in.</p>')
+        let body = page('Stub client', '<p>Signed in.</p>')
+        if (m) {
+          // The first conversation load lands on the default channel; the ones after stay.
+          client.conversationLoads += 1
+          const toDefault = client.conversationLoads === 1
+          if (toDefault) client.defaultChannelRedirects += 1
+          body = conversationPage(ws, m[1] as string, m[2] as string, toDefault)
+        }
         const html = (await body.text()).replace('<body>', `<body><script>localStorage.setItem('localConfig_v2', ${JSON.stringify(config)});</script>`)
         return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } })
       }
@@ -291,6 +411,6 @@ export function startStubServer(options: { domain: string; email: string; passwo
     basicInfoPage: (appId) => `${baseUrl}/fixture/apps/${appId}/general`,
     conversation: (teamId, conversationId) => `${baseUrl}/fixture/client/${teamId}/${conversationId}`,
   }
-  return { workspace: ws, baseUrl, apiBase: `${baseUrl}/api/`, mailApiBase: `${baseUrl}/mailtm`, urls, stop: () => server.stop(true) }
+  return { workspace: ws, client, baseUrl, apiBase: `${baseUrl}/api/`, mailApiBase: `${baseUrl}/mailtm`, urls, stop: () => server.stop(true) }
 }
 

@@ -19,7 +19,7 @@
  * output, which proves the hygiene works.
  */
 
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 
 import type { SlackResponse } from '../lib/slack-api.ts'
 
@@ -211,6 +211,19 @@ export interface StubChannel {
   archived: boolean
   members: Set<string>
   messages: { ts: string; user: string; text: string; blocks?: unknown[] }[]
+}
+
+/** The buttons of a message's Block Kit `actions` blocks: their text and action id. */
+export function blockButtons(blocks: unknown[] | undefined): { text: string; actionId: string }[] {
+  const out: { text: string; actionId: string }[] = []
+  for (const block of blocks ?? []) {
+    const elements = (block as { elements?: unknown }).elements
+    if (!Array.isArray(elements)) continue
+    for (const e of elements as { text?: { text?: unknown }; action_id?: unknown }[]) {
+      if (typeof e.text?.text === 'string' && typeof e.action_id === 'string') out.push({ text: e.text.text, actionId: e.action_id })
+    }
+  }
+  return out
 }
 
 export class StubWorkspace {
@@ -520,18 +533,31 @@ export class StubWorkspace {
     }
   }
 
-  /** A fixture prompt message with Allow/Deny buttons (the dry run's click self-test). */
-  addPrompt(channelId: string, fromUser: string): string {
+  /**
+   * A fixture prompt message with Allow/Deny buttons, their action ids in
+   * CSCB's shape (`perm_<decision>_<instance>_<uuid>`), for the dry run's
+   * click self-test.
+   */
+  addPrompt(channelId: string, fromUser: string, instanceId = 'cscb_persona_a'): string {
     const channel = this.channels.get(channelId)
     if (!channel) throw new Error('no such stub channel')
     const ts = this.nextTs()
+    const token = randomUUID()
+    const button = (text: string, decision: string) => ({ type: 'button', text: { type: 'plain_text', text }, action_id: `perm_${decision}_${instanceId}_${token}` })
     channel.messages.push({
       ts,
       user: fromUser,
       text: 'permission request: Bash',
-      blocks: [{ type: 'actions', elements: [{ text: { text: 'Allow' } }, { text: { text: 'Deny' } }] }],
+      blocks: [{ type: 'actions', elements: [button('Allow', 'allow'), button('Deny', 'deny')] }],
     })
     return ts
+  }
+
+  /** `count` plain messages from `fromUser` (so an earlier message scrolls out of the client's rendered window). */
+  addChatter(channelId: string, fromUser: string, count: number): void {
+    const channel = this.channels.get(channelId)
+    if (!channel) throw new Error('no such stub channel')
+    for (let i = 1; i <= count; i++) channel.messages.push({ ts: this.nextTs(), user: fromUser, text: `chatter ${i} of ${count}` })
   }
 
   /** A click on a fixture prompt: the message updates as CSCB's click handler would update it. */

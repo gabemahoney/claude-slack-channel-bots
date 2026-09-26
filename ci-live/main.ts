@@ -272,11 +272,22 @@ async function dryRunFlowSelfTest(env: RunEnv, ws: Workspace): Promise<string[]>
   const browser = await ws.browser()
   const state = ws.appsFile.load()
   const channel = state.channels['a-home'] as string
-  const ts = stub.workspace.addPrompt(channel, state.personas.a?.bot_user_id ?? 'U0')
+  const botUser = state.personas.a?.bot_user_id ?? 'U0'
+  const ts = stub.workspace.addPrompt(channel, botUser)
+  // Newer messages push the prompt out of the fixture client's rendered window: the flow must scroll up to it.
+  const chatter = 25
+  stub.workspace.addChatter(channel, botUser, chatter)
+  const loadsBefore = stub.client.conversationLoads
   await browser.clickMessageButton(state.team_id ?? '', channel, ts, 'Allow')
   const clicked = stub.workspace.channels.get(channel)?.messages.find((m) => m.ts === ts)?.text === '*Permission* — Allowed'
   if (!clicked) throw new Error('dry-run flow self-test: the button click did not reach the fixture')
-  evidence.push(`button flow: clicked Allow on fixture message ${ts}`)
+  const loads = stub.client.conversationLoads - loadsBefore
+  if (stub.client.defaultChannelRedirects < 1 || loads < 2) {
+    throw new Error("dry-run flow self-test: the fixture client's first load did not land on its default channel, so the re-open went unproven")
+  }
+  evidence.push(
+    `button flow: the fixture client's first load landed on its default channel and the conversation was opened again (${loads} loads); scrolled up past ${chatter} newer messages; clicked Allow on fixture message ${ts}`,
+  )
   const appId = state.personas.b?.app_id as string
   const name = `cscb-live-selftest-${env.runId}`
   const token = await browser.generateAppToken(appId, name)
