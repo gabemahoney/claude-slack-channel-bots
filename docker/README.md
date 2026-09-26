@@ -6,10 +6,15 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 
 ## Images
 
-- **`cscb-ci-base:v3`** (built from `docker/Dockerfile.test.base`) — slow base
+- **`cscb-ci-base:v4`** (built from `docker/Dockerfile.test.base`) — slow base
   layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director). Built
-  lazily once per host. ~1+ GB. No CSCB source inside.
-- **`cscb-ci:latest`** (built from `docker/Dockerfile.test`, `FROM cscb-ci-base:v3`)
+  lazily once per host. ~1+ GB. No CSCB source inside. Its agent-director is
+  the npm package at the range `package.json` declares and the Go binary of
+  the same version (0.10.0 in `v4`; `v3` had 0.7.8). The build takes the
+  GitHub token for agent-director's private release as a BuildKit secret (see
+  [The base build's GitHub token](#the-base-builds-github-token)); `v3`
+  predates that and holds the token in its image history.
+- **`cscb-ci:latest`** (built from `docker/Dockerfile.test`, `FROM cscb-ci-base:v4`)
   — adds `docker/entrypoint.sh`, `tests/`, `testplans/`, the `testuser` account,
   and the `ENTRYPOINT`. Built on every `/ci` run; should complete in under 10 s
   on a warm base.
@@ -23,7 +28,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   The package under test is not in the image; the runner mounts its tarball.
   Built on every `/ci-live` run.
 
-`/ci` detects whether `cscb-ci-base:v3` exists locally; if absent, it builds the
+`/ci` detects whether `cscb-ci-base:v4` exists locally; if absent, it builds the
 base first, then builds `cscb-ci`. The base build is a one-time per-host cost
 per version tag. `/ci-live` does not build the base: it stops (exit 2) and asks
 for one `/ci` run when the base is missing.
@@ -34,7 +39,43 @@ bridge network intermittently fails those fetches with SSL/timeout errors even
 when the host itself reaches the same URLs fine; host networking sidesteps that.
 It affects only the one-time base build, so the blast radius is minimal. If you
 invoke the base build by hand (e.g. the cold-cache path below), pass
-`--network=host` too if you hit a fetch failure.
+`--network=host` too if you hit a fetch failure, and always the token secret
+below.
+
+## The base build's GitHub token
+
+agent-director's release repo is private, so the base build needs a GitHub
+token to download the Go binary. It takes the token only as the BuildKit secret
+`gh_token`, never as a build-arg. By hand, as `/ci` runs it:
+
+```sh
+GH_TOKEN="$(gh auth token)" docker build --network=host \
+  --secret id=gh_token,env=GH_TOKEN --progress=quiet \
+  -f docker/Dockerfile.test.base -t cscb-ci-base:v4 .
+```
+
+- **One command's environment.** Set `GH_TOKEN` only on the `docker build`
+  command, as above; never export it, echo it or pass it with `--build-arg`.
+  `/ci` reads it from the operator's gh CLI (`~/.config/gh-personal` first).
+- **In no image.** The secret is mounted (at `/run/secrets/gh_token`) only
+  while the step that downloads the binary runs, and reaches `curl` only on its
+  standard input. It is in no layer, no image history and no build log. A
+  build-arg's value, by contrast, is recorded in the history of the image and
+  of every image built on it, and the build log prints it.
+- **BuildKit only.** It is docker's default builder since 23.0 (check with
+  `docker buildx version`); the legacy builder refuses the secret mount.
+- **A missing token** fails the step with
+  `ERROR: the gh_token build secret is required`. `--progress=quiet` hides
+  that message: rerun with `--progress=plain` to see which step failed and why.
+- **Check an image by counts only**, never by printing its history:
+  `docker history --no-trunc cscb-ci-base:v4 | grep -c GH_TOKEN=` prints `0`.
+- **`v3` predates the secret.** It was built with a `GH_TOKEN` build-arg, so
+  its image history holds the token's value, and so does every image built on
+  it: `cscb-ci-live:latest` while `docker/Dockerfile.live` names `v3`, and the
+  untagged `cscb-ci` and `cscb-ci-live` builds left over from `v3`. It stays
+  for the branches that still name it. Never push, `docker save` or share a
+  `v3`-based image; once nothing names `v3`, remove it and prune the untagged
+  images built on it.
 
 ## Credential env vars passed to the container
 
@@ -54,8 +95,11 @@ against Anthropic's direct endpoint.
 ## When to bump the base image version
 
 Bump `cscb-ci-base`'s version tag (e.g. `v1` → `v2`) whenever you change
-`docker/Dockerfile.test.base`. There is **no** automatic version derivation —
-bump it manually in every place that names it:
+`docker/Dockerfile.test.base` or the `agent-director` range in `package.json`.
+The base reads the range only when it is built: `/ci` builds a base only when
+its tag is missing, so without a bump every host keeps testing the
+agent-director its existing base was built with. There is **no** automatic
+version derivation — bump it manually in every place that names it:
 
 1. The `FROM` line in `docker/Dockerfile.test`.
 2. The `BASE_TAG` variable in `.claude/skills/ci/SKILL.md`.
@@ -73,14 +117,16 @@ The live image needs no bump of its own for a range change: it reads the
 range at every build (see
 [The live image's agent-director](#the-live-images-agent-director)).
 
-After bumping, the next `/ci` on every host will rebuild the base.
+After bumping, the next `/ci` on every host will rebuild the base. Leave the
+old tag's image in place: other branches and worktrees on the same host that
+still name it keep using it.
 
 ## Verifying the cold-cache path
 
 To simulate a fresh host:
 
 ```bash
-docker rmi cscb-ci-base:v3 cscb-ci:latest 2>/dev/null
+docker rmi cscb-ci-base:v4 cscb-ci:latest 2>/dev/null
 /ci   # or invoke the build sequence from the skill manually
 ```
 
@@ -93,7 +139,7 @@ issue.
 After a `/ci` run, confirm the base layers are intact:
 
 ```bash
-docker history cscb-ci-base:v3
+docker history cscb-ci-base:v4
 ```
 
 Then edit a comment in (e.g.) `tests/integration/test-1-install-startup.sh`
@@ -103,7 +149,7 @@ and re-run the build:
 docker build -f docker/Dockerfile.test -t cscb-ci .
 ```
 
-This should complete in seconds. `docker history cscb-ci-base:v3` should show
+This should complete in seconds. `docker history cscb-ci-base:v4` should show
 the same layer IDs as before — proof the source edit didn't invalidate the
 base.
 

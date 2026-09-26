@@ -16,25 +16,40 @@ test workspace is `/ci-live` (`.claude/skills/ci-live/SKILL.md`).
 2. `npm pack` from repo root; capture tarball filename.
 3. Lazy-build the base image, then build the top image:
    ```bash
-   BASE_TAG=cscb-ci-base:v3  # bump when docker/Dockerfile.test.base changes
+   BASE_TAG=cscb-ci-base:v4  # bump when docker/Dockerfile.test.base or package.json's agent-director range changes
    if ! docker image inspect "${BASE_TAG}" >/dev/null 2>&1; then
      # The base layer fetches the agent-director Go binary from a private GitHub
      # release; supply a token at build time. Prefer the operator's gh CLI token.
+     # The token goes in as the BuildKit secret gh_token, read from GH_TOKEN,
+     # which is set only in this one command's environment. Never pass it with
+     # --build-arg: a build-arg's value is recorded in the image history of the
+     # base and of every image built on it, and the build log prints it.
      # --network=host: the base layer fetches bun and the agent-director binary
      # from GitHub; on some hosts the default docker bridge network intermittently
      # fails these fetches with SSL/timeout errors even when the host reaches the
      # same URLs fine. Host networking sidesteps that. It only affects this
      # one-time base build, so the blast radius is minimal.
-     docker build --network=host -f docker/Dockerfile.test.base \
-       --build-arg GH_TOKEN="$(GH_CONFIG_DIR=$HOME/.config/gh-personal gh auth token 2>/dev/null || gh auth token 2>/dev/null || echo "")" \
-       -t "${BASE_TAG}" .
+     GH_TOKEN="$(GH_CONFIG_DIR=$HOME/.config/gh-personal gh auth token 2>/dev/null || gh auth token 2>/dev/null || echo "")" \
+       docker build --network=host --secret id=gh_token,env=GH_TOKEN --progress=quiet \
+       -f docker/Dockerfile.test.base -t "${BASE_TAG}" .
    fi
    docker build -f docker/Dockerfile.test -t cscb-ci .
    ```
    The base image holds source-independent layers (apt, bun, nodejs, cozempic,
    agent-director) and is built once per host. `docker/Dockerfile.test`'s
-   `FROM` line pins the same tag — keep them in sync. See `docker/README.md`
-   for the base-image bump procedure.
+   `FROM` line pins the same tag — keep them in sync. The base installs
+   agent-director (the npm package and the matching Go binary) at the range
+   `package.json` declares, read at build time only: an existing base keeps
+   the version it was built with, so a range change needs a tag bump too, or
+   `/ci` keeps testing the old agent-director. See `docker/README.md` for the
+   base-image bump procedure.
+
+   The base build needs BuildKit (docker's default builder since 23.0; check
+   with `docker buildx version`) for the `--secret` flag and the Dockerfile's
+   secret mount. `--progress=quiet` hides the build's step output; if the base
+   build fails, rerun the same command with `--progress=plain` in its place to
+   see which step failed and why (the token is a secret mount, so it is never
+   in that output). Never echo `GH_TOKEN` or print the build's environment.
 4. `RESULTS_DIR=$(mktemp -d -t cscb-ci-${RUN_ID}-XXXXXX)` — outside the repo working tree so `/publish prepare`'s SR-2.1 cleanliness check stays happy. Respects `$TMPDIR`; falls back to `/tmp`.
 5. ```bash
    docker run --rm --name cscb-ci-${RUN_ID} \
