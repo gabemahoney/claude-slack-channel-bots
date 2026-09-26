@@ -76,6 +76,7 @@ import {
   checkWaitingRowPane,
   checkWorkingRowPane,
   deletePersonaInstance,
+  endWorkingRowDeferral,
   forgetNotConnectedEpisode,
   forgetWorkingRowEvidence,
   hasPendingWorkingRowEvidence,
@@ -84,6 +85,7 @@ import {
   isLaunchInFlight,
   killPersonaInstance,
   launchSession,
+  noteWorkingRowDeferral,
   notifyDisconnectedWithAutoRestartDisabled,
   notifyPersonaNotConnected,
   notifyRestartCapReached,
@@ -1014,8 +1016,9 @@ export function _buildKillSessionAdapter(
  * into an `ask_user` or `check_permission` session could confirm the dialog's
  * default, so those states are deferred too ('transient'): the deferral is
  * logged, and the persona's `blocked-on-prompt` not-connected notice is raised
- * (once per episode). A later tick reconnects it once the prompt is answered
- * and its turn ends. A `waiting` row's pane is read once first
+ * (once per episode). Once the prompt is answered, a later tick reconnects it
+ * when it can tell the session is idle again (its row reads `waiting`, or the
+ * positive-idle rule shows a `working` row stale). A `waiting` row's pane is read once first
  * (`checkWaitingRowPane`): a running turn or a prompt or dialog on it defers
  * the same way (a prompt raises the same notice); a failed read does not, as
  * the `waiting` row is agent-director's own idle signal.
@@ -1049,7 +1052,15 @@ export function _buildKillSessionAdapter(
  *     per episode) once shown across reads spanning the window. The evidence
  *     is forgotten when an attempt reads the row in another state or can't
  *     read it, when a launch for the persona starts, and when it reconnects,
- *     becomes deliverable again or is torn down;
+ *     becomes deliverable again or is torn down. Each deferral here, and a
+ *     failed tmux probe's below, is one more in the persona's run of
+ *     deferrals on the row (`noteWorkingRowDeferral`): once the run has lasted
+ *     `UNPROVEN_IDLE_NOTICE_AFTER_MS` (10 min), the `unproven-idle`
+ *     not-connected notice is raised (once per episode), so a row whose
+ *     idleness can never be proven is not held back from silently. The run
+ *     ends when an attempt reads another state (a failed status call leaves
+ *     it), when a reconnect is typed, when a launch starts and with the
+ *     episode;
  *   - gone → there is no pane to type into: fire the dead-tmux sweep
  *     (`sweepDeadTmuxChannel`, b.sv7) once and return 'escalate-dead'.
  *     restart.ts then probes liveness again in the same restart run and, when
@@ -1058,7 +1069,8 @@ export function _buildKillSessionAdapter(
  *   - the probe throws → defer ('transient'): a failed probe is no proof the
  *     session is dead (b.rmy).
  * The deferral therefore lasts only while the persona's tmux session exists
- * and gives no positive evidence that the row is stale (b.f2b).
+ * and gives no positive evidence that the row is stale (b.f2b), and is
+ * reported once it has lasted `UNPROVEN_IDLE_NOTICE_AFTER_MS`.
  *
  * @param getPersona  The applied persona with a key (production:
  *   `getAppliedPersona`), for locating a `working` row's transcript under its
@@ -1087,8 +1099,12 @@ export function _buildReconnectSessionAdapter(
       return 'transient'
     }
     // b.f2b: the evidence for a `working` row spans consecutive attempts that
-    // read the row `working`; any other reading ends it.
-    if (state !== 'working') forgetWorkingRowEvidence(key)
+    // read the row `working`; any other reading ends it, and the run of
+    // deferrals on the row with it.
+    if (state !== 'working') {
+      forgetWorkingRowEvidence(key)
+      endWorkingRowDeferral(key)
+    }
     if (state === 'working') {
       const verdict = await workingReconnectVerdict(key, getPersona)
       if (verdict !== 'reconnect') return verdict
@@ -1142,10 +1158,12 @@ export function _buildReconnectSessionAdapter(
  * `ask_user` or `check_permission` (see `_buildReconnectSessionAdapter`):
  * `/mcp reconnect` + Enter could confirm the dialog's default, so nothing is
  * typed. Logs the deferral, raises the `blocked-on-prompt` not-connected
- * notice (once per episode) and returns 'transient'. The notice says a later
- * attempt reconnects the persona once its turn ends: the restart path runs
- * only with auto-restart on (`scheduleRestart` arms nothing while
- * `session_restart_delay` is 0).
+ * notice (once per episode) and returns 'transient'. The notice says that,
+ * once the prompt is answered, CSCB reconnects the persona when it can tell
+ * the session is idle again: the restart path runs only with auto-restart on
+ * (`scheduleRestart` arms nothing while `session_restart_delay` is 0), and
+ * its later attempts reconnect a `waiting` row, or a `working` row the
+ * positive-idle rule shows stale.
  */
 function deferPromptRow(key: string, state: string): 'transient' {
   console.error(
@@ -1164,7 +1182,8 @@ function deferPromptRow(key: string, state: string): 'transient' {
  * with the persona `getPersona` returns): 'reconnect' once the row is shown
  * stale, and the adapter goes on to type `/mcp reconnect`; otherwise defer.
  * Never throws: `sweepDeadTmuxChannel` and `checkWorkingRowPane` swallow
- * their own failures.
+ * their own failures. A failed tmux probe is noted as a deferral on the row
+ * (`noteWorkingRowDeferral`), as `checkWorkingRowPane` notes its own.
  */
 async function workingReconnectVerdict(
   key: string,
@@ -1181,6 +1200,9 @@ async function workingReconnectVerdict(
     console.error(
       `[slack] reconnectSession: persona=${key} is working and its tmux session probe failed: ${describeThrownValue(err)} — deferring /mcp reconnect to a later tick (b.d61/b.rmy)`,
     )
+    // b.f2b: held back from the row once more; a long run is reported. The
+    // restart path runs only with auto-restart on.
+    noteWorkingRowDeferral(key, false)
     return 'transient'
   }
   if (tmuxAlive) {

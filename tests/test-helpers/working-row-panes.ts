@@ -235,6 +235,68 @@ export function withLastLine(line: string): string {
   return `${IDLE_PANE}\n${line}`
 }
 
+/** Claude Code's prompt box on Linux (2.1.280): the `❯` prompt, and the footer. */
+const LINUX_PROMPT_BOX = [
+  '────────────────────────────────────────────────────────────────────────',
+  '❯ ',
+  '────────────────────────────────────────────────────────────────────────',
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+]
+
+/**
+ * A Linux idle screen (Claude Code 2.1.280): Linux draws `●` (U+25CF), not
+ * macOS's `⏺`, at column 0 before every reply and tool call, the glyph the
+ * spinner uses with prefersReducedMotion. Its replies and tool calls hold
+ * ellipses: a tool call whose arguments were cut, a reply that trails off at
+ * the end of its line, one with an ellipsis before a parenthesis, and an MCP
+ * tool call quoting text with one. None of them is a spinner line.
+ */
+export const LINUX_IDLE_PANE = [
+  '❯ check whether the nightly build passed and post the summary',
+  '',
+  '● Bash(gh run view 4121 --json conclusion,jobs --jq \'.jobs[] | select(.conclusion != "success")…)',
+  '  ⎿  {"conclusion":"success","jobs":[…]}',
+  '',
+  '● Let me check the failing job\'s logs…',
+  '',
+  '● Read(.github/workflows/nightly.yml)',
+  '  ⎿  Read 84 lines (ctrl+o to expand)',
+  '',
+  '● Checked the build… (see the thread for the job list)',
+  '',
+  '● slack-channel-router - reply (MCP)(chat_id: "C0123456789", text: "The nightly build passed: 412 tests…")',
+  '  ⎿  sent',
+  '',
+  '● The nightly build passed: 412 tests, no failures. I posted the',
+  '  summary in the channel… and linked the run.',
+  '',
+  '✻ Baked for 4m 11s',
+  '',
+  ...LINUX_PROMPT_BOX,
+  '',
+].join('\n')
+
+/**
+ * The same Linux session mid-turn with a custom spinner verb (the
+ * `spinnerVerbs` setting): an emoji and three words, then the ellipsis and
+ * the turn's status, drawn with an animated glyph.
+ */
+export const CUSTOM_VERB_SPINNER_PANE = [
+  '❯ check whether the nightly build passed and post the summary',
+  '',
+  '● Bash(gh run watch 4121 --exit-status)',
+  '  ⎿  Running…',
+  '',
+  '✻ 🐝 Foraging for nectar… (12s · ↓ 1.2k tokens)',
+  '',
+  ...LINUX_PROMPT_BOX,
+].join('\n')
+
+/** `LINUX_IDLE_PANE` with `line` as its last line of text. */
+export function linuxWithLastLine(line: string): string {
+  return `${LINUX_IDLE_PANE}\n${line}`
+}
+
 // ---------------------------------------------------------------------------
 // Transcripts
 // ---------------------------------------------------------------------------
@@ -298,6 +360,51 @@ export function replyEntry(stopReason: string | null = 'end_turn', extra: Transc
 /** A `system` line Claude Code writes around a turn, such as `turn_duration` or `stop_hook_summary`. */
 export function systemEntry(subtype: string): TranscriptEntry {
   return { type: 'system', subtype, sessionId: TRANSCRIPT_SESSION_ID, timestamp: '2026-09-26T09:14:03.000Z' }
+}
+
+/**
+ * The marker Claude Code writes when the user interrupts a turn: a `user`
+ * entry whose only content block is the text `[Request interrupted by user]`,
+ * or `[Request interrupted by user for tool use]` (`forToolUse`) after a tool
+ * call's rejected result. With `withToolResult` the text block follows a
+ * `tool_result` block in the same entry.
+ */
+export function interruptEntry(forToolUse = false, withToolResult = false): TranscriptEntry {
+  const text = forToolUse ? '[Request interrupted by user for tool use]' : '[Request interrupted by user]'
+  const content: unknown[] = [{ type: 'text', text }]
+  if (withToolResult) {
+    content.unshift({ type: 'tool_result', tool_use_id: 'toolu_01', content: 'The user doesn\'t want to proceed with this tool use.', is_error: true })
+  }
+  return conversation('user', { role: 'user', content })
+}
+
+/** A tool call's result after the user rejected or interrupted it (`is_error`). */
+export function rejectedToolResultEntry(): TranscriptEntry {
+  return conversation('user', {
+    role: 'user',
+    content: [{ type: 'tool_result', tool_use_id: 'toolu_01', content: 'The user doesn\'t want to proceed with this tool use.', is_error: true }],
+  })
+}
+
+/**
+ * A hook's output recorded as an `attachment` entry (Claude Code 2.1.280),
+ * e.g. a Stop hook's `additionalContext` (`hook_additional_context`, which
+ * keeps the turn going), its blocking error (`hook_blocking_error`), or a
+ * SessionStart hook's context.
+ */
+export function hookAttachmentEntry(type: string, hookEvent = 'Stop'): TranscriptEntry {
+  return {
+    parentUuid: null,
+    isSidechain: false,
+    userType: 'external',
+    cwd: '/x',
+    sessionId: TRANSCRIPT_SESSION_ID,
+    version: '2.1.280',
+    type: 'attachment',
+    attachment: { type, content: ['Check the job list before you finish.'], hookName: hookEvent, toolUseID: `hook-${hookEvent}`, hookEvent },
+    uuid: crypto.randomUUID(),
+    timestamp: '2026-09-26T09:14:03.000Z',
+  }
 }
 
 /** A prompt queued while a turn runs (`queue-operation`). */

@@ -980,6 +980,52 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(raised[0]!.text).toContain('`tmux attach -t slack_bot_C1`')
     })
 
+    // b.f2b: at a non-zero delay nothing else escalates a `working` row whose
+    // idleness can't be proven, so the adapter's deferrals on it are bounded:
+    // 10 min after the first, the unproven-idle notice is raised, once.
+    test("REPRO: a working row the adapter can't prove idle (its row names no transcript) is reported once its deferrals have run for 10 min: a failed tmux probe counts as one, a failed status call leaves the run as it is; nothing typed", async () => {
+      const opts: Parameters<typeof makeHarness>[0] = { statusState: 'working', tmux: 'alive', pane: IDLE_PANE }
+      const h = makeHarness(opts)
+      const verdicts = [await h.adapter('C1')] // 0 min: the run starts
+      await clock.advance(4 * 60_000)
+      opts.tmux = 'probe-error'
+      verdicts.push(await h.adapter('C1')) // 4 min
+      await clock.advance(4 * 60_000)
+      opts.tmux = 'alive'
+      opts.statusError = new Error('status failed')
+      verdicts.push(await h.adapter('C1')) // 8 min: no state read
+      const before = raised.length
+      await clock.advance(2 * 60_000)
+      opts.statusError = undefined
+      verdicts.push(await h.adapter('C1')) // 10 min
+      await clock.advance(4 * 60_000)
+      verdicts.push(await h.adapter('C1')) // 14 min
+
+      expect(verdicts).toEqual(Array(5).fill('transient'))
+      expect(h.sendKeysCalls).toEqual([])
+      expect(before).toBe(0)
+      expect(raised.map((n) => n.key)).toEqual(['C1'])
+      expect(raised[0]!.text).toStartWith(':warning: *Not connected*')
+      expect(raised[0]!.text).toContain('its session reads working but CSCB can\'t prove it\'s idle, so it won\'t type into it, and has held back for 10 min')
+      expect(raised[0]!.text).toContain('`tmux attach -t slack_bot_C1`')
+      expect(raised[0]!.text).not.toContain('Automatic restarts are disabled')
+    })
+
+    test('an attempt that reads the row in another state ends the run of deferrals: the next working reading starts it over', async () => {
+      const opts: Parameters<typeof makeHarness>[0] = { statusState: 'working', tmux: 'alive', pane: SPINNER_PANE }
+      const h = makeHarness(opts)
+      const counts: number[] = []
+      for (const [minute, state] of [[0, 'working'], [5, 'working'], [6, 'waiting'], [9, 'working'], [15, 'working'], [19, 'working']] as const) {
+        await clock.advance(minute * 60_000 - clock.now())
+        opts.statusState = state
+        expect(await h.adapter('C1')).toBe('transient') // a running turn, on either row
+        counts.push(raised.length)
+      }
+
+      expect(counts).toEqual([0, 0, 0, 0, 0, 1])
+      expect(h.sendKeysCalls).toEqual([])
+    })
+
     test.each<[string, string, number]>([
       ['a running turn', SPINNER_PANE, 0],
       ['a dialog', PERMISSION_PANE, 1],

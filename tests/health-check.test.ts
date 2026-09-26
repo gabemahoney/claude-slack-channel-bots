@@ -36,6 +36,7 @@ import {
   _resetNotConnectedEpisodes,
   forgetNotConnectedEpisode,
   notifyDisconnectedWithAutoRestartDisabled,
+  notifyPersonaNotConnected,
   setSessionNotifier,
 } from '../src/session-manager.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
@@ -1201,6 +1202,26 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
       expect(raised[0]!.text).toStartWith(head!)
       expect(raised[0]!.text).toContain(detail!)
     }
+  })
+
+  test('one latch for every notice: an unproven-idle notice already raised in the episode (a launch wait that gave up on the working row at delay 0) is the episode\'s one; the tick\'s delay-0 notice raises nothing more', async () => {
+    const raised: Array<{ key: string; text: string }> = []
+    setSessionNotifier((key, text) => { raised.push({ key, text }) })
+    expect(notifyPersonaNotConnected(KEY, { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 10 * 60_000 })).toBe(true)
+    const deps = makeDeps({ isSessionAliveResult: true, isSessionConnectedResult: false, maxTicks: 4 })
+    deps.isAutoRestartDisabled = () => true
+    let asked = 0
+    deps.notifyNotConnected = (key, why) => {
+      asked++
+      notifyDisconnectedWithAutoRestartDisabled(key, why)
+    }
+
+    await runTicks(deps, 4)
+
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([2, 4])
+    expect(asked).toBe(2)
+    expect(raised.map((n) => n.key)).toEqual([KEY])
+    expect(raised[0]!.text).toContain('its session reads working but CSCB can\'t prove it\'s idle')
   })
 
   test('a healthy tick, and only a healthy one, ends the persona\'s not-connected episode (endNotConnectedEpisode): a later episode is reported again', async () => {

@@ -949,7 +949,7 @@ down, report it as a bug, with the persona's lines.
 The persona is up and its Claude instance runs, but messages can't reach it,
 so messages sent to it are lost (each with a *Message lost* notice). Usually
 the launch or the health check reconnects it within minutes. When it can't,
-the persona's destination gets one of three notices. At most one of them is
+the persona's destination gets one of the notices below. At most one of them is
 posted per episode: after one, none is posted again until the instance
 registers with the server again, the health check finds it reachable again,
 or the persona is removed. `server.log` has, when the notice is posted:
@@ -960,8 +960,9 @@ or the persona is removed. `server.log` has, when the notice is posted:
 
 | Notice | `<reason>` | Why | What to do |
 |---|---|---|---|
-| *Waiting on a prompt* | `blocked-on-prompt` | The instance's terminal shows a permission dialog, a question or another prompt that no one answered, or its row reads `ask_user` or `check_permission`. The server never types into one. | With the operator's say-so, attach (`tmux attach -t slack_bot_<key>`) and answer it; a permission prompt also posted to the persona's destination can be answered there. The instance is reconnected once its turn ends; if it stays disconnected, type `/mcp reconnect slack-channel-router` in it. With `session_restart_delay` 0 the notice says so: if it is still not connected once its turn ends, type that command or restart the server. |
+| *Waiting on a prompt* | `blocked-on-prompt` | The instance's terminal shows a permission dialog, a question or another prompt that no one answered, or its row reads `ask_user` or `check_permission`. The server never types into one. | With the operator's say-so, attach (`tmux attach -t slack_bot_<key>`) and answer it; a permission prompt also posted to the persona's destination can be answered there. Once it is answered, the server reconnects the instance when it can tell it is idle again (its row reads `waiting`, or its screen and transcript prove it idle); if it stays disconnected, type `/mcp reconnect slack-channel-router` in it. With `session_restart_delay` 0 the notice says so: if it is still not connected once its turn ends, type that command or restart the server. |
 | *Not connected* | `auto-restart-disabled` | `session_restart_delay` is 0, so nothing will reconnect it. The notice says why it isn't connected (list below). | With the operator's say-so, attach, deal with anything on screen and type `/mcp reconnect slack-channel-router`, or restart the server. |
+| *Not connected* | `unproven-idle` | At any `session_restart_delay`: the row reads `working`, and the server has held back from it for 10 min from its first deferral because it can't prove the instance idle (below). Its first line says `its session reads working but CSCB can't prove it's idle, so it won't type into it`. | With the operator's say-so, attach and look: let a running turn finish and answer anything on screen; if it sits idle at its prompt, type `/mcp reconnect slack-channel-router` in it. With a delay above 0 the server keeps checking and reconnects it once it can tell it is idle; with 0, restart the server if it stays disconnected. |
 | *Not receiving messages* | `auto-restart-disabled` | The instance is connected, but its message stream is gone (`found on two health checks in a row`), and `session_restart_delay` is 0, so nothing will restore it. | As for *Not connected*. |
 
 The *Not connected* notice gives one of these causes:
@@ -972,7 +973,7 @@ The *Not connected* notice gives one of these causes:
 | `it moved to state <state> while CSCB waited to reconnect it` | At its launch, the row moved to `pending` instead of finishing its turn. A move to `ask_user` or `check_permission` posts *Waiting on a prompt* instead. |
 | `agent-director has no record of its session, though its tmux session is alive` | At its launch, the row vanished while the tmux session lives. |
 | `agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it` | The launch waited 10 minutes and agent-director couldn't answer at the end. |
-| `its agent-director row still read <state> 10 min after launch, and CSCB found no proof it was idle` | The launch waited 10 minutes and the row stayed live (for example `working` with a busy screen, or a transcript that doesn't end with a finished reply). |
+| `its agent-director row still read <state> 10 min after launch, and CSCB found no proof it was idle` | The launch waited 10 minutes and the row stayed live but not `working` (for example `pending`). A row still `working` then gets the `unproven-idle` notice instead. |
 
 To see what the instance shows without touching it:
 
@@ -993,21 +994,32 @@ on the API can hold a still screen with no spinner. It reconnects a `working`
 row only when, at every read across 60 s, both of these held and neither
 changed:
 
-- **The screen is idle.** No busy spinner line (such as `✳ Harmonizing… (2m 42s · ↓ 10.1k tokens)`),
+- **The screen is idle.** No busy spinner line (such as `✳ Harmonizing… (2m 42s · ↓ 10.1k tokens)`,
+  or a custom verb of several words from the `spinnerVerbs` setting; on Linux
+  the `●` before each reply and tool call is not a spinner, even with an
+  ellipsis in the line),
   no `esc to interrupt` or `esc to cancel` hint, no API retry message
   (`No response from the API after …`, `Rate limit reached · Retrying in …`,
   `Waiting for API response · will retry in …`, `… · attempt <n>/<m>`), and
   no prompt or dialog (a numbered option list with its `❯` cursor).
 - **The transcript ends with a completed turn.** Its last conversation entry
-  is Claude's final reply. A prompt, a tool call, a tool result or a queued
-  message means the turn is still open. The server reads only the file's last
+  is Claude's final reply, or the `[Request interrupted by user]` (or `… for
+  tool use]`) marker of a turn the user interrupted, which gets no Stop, so
+  agent-director leaves its row `working`. A prompt, a tool call, a tool
+  result, a queued message, or a Stop hook's context or blocking error after
+  the reply (the turn goes on with it) means the turn is still open. The server reads only the file's last
   256 KiB. The file is the row's `jsonl_path` when it names the row's session,
   else `<claude_config_dir>/projects/<slug>/<claude_session_id>.jsonl`, where
   `<slug>` is the row's `cwd` with every character other than a letter, digit
   or `-` replaced by `-`. A transcript that can't be found or read is no sign
   of idleness.
 
-It never types into a running turn or a prompt.
+It never types into a running turn or a prompt. Holding back is bounded,
+though: once the server has held back from a `working` row for 10 min from
+its first deferral, at a launch or in the health check's reconnects, the
+persona's destination gets the `unproven-idle` *Not connected* notice (above),
+whatever `session_restart_delay` is. A row that reads another state, a
+reconnect and a new launch start the 10 min over.
 
 At a launch (a start, an added persona, a relaunch), the launch waits for the
 row. While the row reads `working` it reads the screen every 5 s, and the
@@ -1016,7 +1028,7 @@ transcript whenever the screen sits idle:
 | Line | Meaning |
 |---|---|
 | `[slack] waitForWaitingAndReconnect: "<name>" (key=<key>) reads working, but its pane has shown the same idle screen (no busy indicator, no prompt) and its transcript has ended with a completed turn, both unchanged, for <N>s — treating the row as stale and reconnecting (b.f2b)` | The stale row is reconnected, whatever `session_restart_delay` is. Look for `Session connected` next. |
-| `[slack] waitForWaitingAndReconnect: "<name>" (key=<key>) reads working and its pane shows an idle screen, but <why> — no idle evidence; still waiting for its working row (b.f2b)` | The screen is idle, but `<why>` is `its transcript "<path>" does not end with a completed turn` or `its transcript can't be read: <reason>`. Logged again only when `<why>` changes. The launch keeps waiting. A transcript that can't be read at all leaves the row to the 10-minute limit. |
+| `[slack] waitForWaitingAndReconnect: "<name>" (key=<key>) reads working and its pane shows an idle screen, but <why> — no idle evidence; still waiting for its working row (b.f2b)` | The screen is idle, but `<why>` is `its transcript "<path>" does not end with a completed turn` or `its transcript can't be read: <reason>`. Logged again only when `<why>` changes. The launch keeps waiting. A transcript that can't be read at all leaves the row to the 10-minute limit, and then to the `unproven-idle` notice. |
 | `[slack] waitForWaitingAndReconnect: "<name>" (key=<key>) reads working and its pane has shown a prompt or dialog for <N>s — blocked on it; not typing into it, still waiting (answer it in tmux session "slack_bot_<key>") (b.f2b)` | A prompt is on screen: the *Waiting on a prompt* notice is posted and the launch keeps waiting. Answer the prompt. |
 | `[slack] waitForWaitingAndReconnect: reading the pane of "<name>" (key=<key>) failed: <error> — no idle evidence from it; still waiting for its working row (b.f2b)` | agent-director couldn't read the screen (logged once per wait). The launch keeps waiting. |
 
@@ -1025,7 +1037,9 @@ with what happens next. With `session_restart_delay` above 0 it names the
 health check's recovery; with 0 it ends
 `session_restart_delay is 0, so nothing will reconnect it — the not-connected notice reports it (once per episode) (b.f2b)`
 and the *Not connected* notice (or, for a row at `ask_user` or
-`check_permission`, *Waiting on a prompt*) is posted:
+`check_permission`, *Waiting on a prompt*) is posted. A row still `working`
+at the deadline gets the `unproven-idle` *Not connected* notice at any delay,
+once the server has held back from it for 10 min:
 
 | Line starts with | Meaning |
 |---|---|

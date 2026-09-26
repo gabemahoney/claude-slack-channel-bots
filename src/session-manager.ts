@@ -447,10 +447,17 @@ export function notifyRestartCapReached(key: string): void {
  *   (`cause`, fixed token-free text): its MCP connection is down, or, with
  *   `streamless`, it is connected but its message stream is gone. With
  *   `session_restart_delay` 0 nothing will reconnect it.
+ * - `unproven-idle`: its row reads `working` and CSCB has held back from it,
+ *   typing nothing, for `heldMs` (at least `UNPROVEN_IDLE_NOTICE_AFTER_MS`,
+ *   `noteWorkingRowDeferral`, or a launch wait that gave up on the row at
+ *   `session_restart_delay` 0), because it can't prove the session idle. With
+ *   `autoRestartDisabled` the notice says nothing will reconnect it on its
+ *   own; otherwise that CSCB reconnects it once it can tell it is idle.
  */
 export type NotConnectedNotice =
   | { reason: 'blocked-on-prompt'; autoRestartDisabled: boolean }
   | { reason: 'auto-restart-disabled'; cause: string; streamless?: boolean }
+  | { reason: 'unproven-idle'; autoRestartDisabled: boolean; heldMs: number }
 
 /**
  * Why the health check finds an alive persona undeliverable (b.f2b): its MCP
@@ -506,19 +513,21 @@ export function notifyDisconnectedWithAutoRestartDisabled(key: string, cause: Un
  * End persona `key`'s not-connected episode (b.f2b): its MCP session
  * registered again, the health check found it deliverable again, or it was
  * torn down. Its notice latch is cleared, so a later episode is reported
- * again, and so is the idle evidence the restart path gathered for its
- * `working` row (`checkWorkingRowPane`). Silent; other personas are
- * untouched.
+ * again, and so are the idle evidence the restart path gathered for its
+ * `working` row (`checkWorkingRowPane`) and its run of deferrals on that row
+ * (`noteWorkingRowDeferral`). Silent; other personas are untouched.
  */
 export function forgetNotConnectedEpisode(key: string): void {
   notConnectedNoticeRaised.delete(key)
   workingRowPaneRuns.delete(key)
+  workingRowDeferredSince.delete(key)
 }
 
-/** Test-only seam: end every persona's not-connected episode (notice latches and idle evidence). */
+/** Test-only seam: end every persona's not-connected episode (notice latches, idle evidence and deferral runs). */
 export function _resetNotConnectedEpisodes(): void {
   notConnectedNoticeRaised.clear()
   workingRowPaneRuns.clear()
+  workingRowDeferredSince.clear()
 }
 
 /**
@@ -532,10 +541,19 @@ function buildNotConnectedNotice(key: string, notice: NotConnectedNotice): strin
   if (notice.reason === 'blocked-on-prompt') {
     const after = notice.autoRestartDisabled
       ? `Automatic restarts are disabled (\`session_restart_delay\` is 0): if it is still not connected once its turn ends, type ${reconnect} there or restart the server.`
-      : `Once its turn ends it is reconnected; if it stays disconnected, type ${reconnect} there.`
+      : `Once it is answered, CSCB reconnects it when it can tell the session is idle again (its row reads waiting, or its screen and transcript prove it idle); if it stays disconnected, type ${reconnect} there.`
     return (
       `:warning: *Waiting on a prompt* — this persona is not connected to this server, and its session shows a prompt or dialog in its terminal that no one has answered. CSCB never types into a prompt, so it won't reconnect the persona while the prompt is up; messages sent to it until then are lost.\n` +
       `Attach with ${attach} and answer it. ${after}`
+    )
+  }
+  if (notice.reason === 'unproven-idle') {
+    const after = notice.autoRestartDisabled
+      ? `Automatic restarts are disabled (\`session_restart_delay\` is 0), so nothing will reconnect it on its own; if it stays disconnected, restart the server.`
+      : `Otherwise CSCB keeps checking it and reconnects it once its row reads waiting or its screen and transcript prove it idle.`
+    return (
+      `:warning: *Not connected* — this persona is not connected to this server: its session reads working but CSCB can't prove it's idle, so it won't type into it, and has held back for ${describeWaitSpan(notice.heldMs)}. Messages sent to it until it reconnects are lost.\n` +
+      `Check it with ${attach}: let a running turn finish and answer anything on screen; if it sits idle at its prompt, type ${reconnect} there. ${after}`
     )
   }
   if (notice.streamless === true) {
@@ -1096,6 +1114,30 @@ export function _resetWorkingRowReadIntervalMs(): void {
   _workingRowReadIntervalMs = WORKING_ROW_READ_INTERVAL_MS
 }
 
+/**
+ * How long CSCB holds back from a persona whose row reads `working`, typing
+ * nothing because it can't prove the session idle, before it reports the
+ * persona through the `unproven-idle` not-connected notice (b.f2b), whatever
+ * `session_restart_delay` is: measured from the first deferral of the run
+ * (`noteWorkingRowDeferral`). Without it, a row whose idleness can't be proven
+ * (an unreadable transcript, a compaction summary, a screen that keeps
+ * changing) would be held back from for good, silently. Test-only override
+ * below.
+ */
+export const UNPROVEN_IDLE_NOTICE_AFTER_MS = 10 * 60 * 1000
+
+let _unprovenIdleNoticeAfterMs = UNPROVEN_IDLE_NOTICE_AFTER_MS
+
+/** Test-only seam: override how long deferrals on a `working` row run before the `unproven-idle` notice. */
+export function _setUnprovenIdleNoticeAfterMs(ms: number): void {
+  _unprovenIdleNoticeAfterMs = ms
+}
+
+/** Test-only seam: restore the default. */
+export function _resetUnprovenIdleNoticeAfterMs(): void {
+  _unprovenIdleNoticeAfterMs = UNPROVEN_IDLE_NOTICE_AFTER_MS
+}
+
 /** Trailing pane lines read from a `working` row (as `approvePreSessionDialogs` reads). */
 const WORKING_PANE_LINES = 40
 
@@ -1103,15 +1145,31 @@ const WORKING_PANE_LINES = 40
 const WORKING_PANE_BOTTOM_LINES = 12
 
 /**
- * Claude Code's spinner line while a turn runs, e.g. `✳ Harmonizing… (2m 42s ·
- * ↓ 10.1k tokens)`: a spinner glyph at column 0 (`·` `✢` `✳` `✶` `✻` `✽`, `*`
- * on some terminals, or `●` with prefersReducedMotion), then a verb and an
- * ellipsis; in accessibility or screen-reader mode the timer is left out.
- * Verified against Claude Code 2.1.280 (2026-09-26), which no longer prints
- * "esc to interrupt" while a turn runs. A finished turn's line (`✻ Baked for
- * 4m 11s`) has no ellipsis, and the same text quoted in a reply is indented.
+ * Claude Code's spinner line while a turn runs (2.1.280), matched only in its
+ * own shape: at column 0 a spinner glyph, a space, the spinner's message, an
+ * ellipsis, then the end of the line or ` (` and the turn's status (elapsed
+ * time, tokens, thinking), e.g. `✳ Harmonizing… (2m 42s · ↓ 10.1k tokens)`.
+ * The message holds no ellipsis and is short: a verb from Claude Code's list
+ * (`Harmonizing`, `Fiddle-faddling`), a custom one from the `spinnerVerbs`
+ * setting, which can be several words (`🐝 Buzzing about the hive`), or the
+ * current task's `activeForm`. The status is left out at first, and in
+ * screen-reader mode. The animated glyphs (`·` `✢` `✳` `✶` `✻` `✽`, and `*`
+ * on some terminals) start no other line with an ellipsis: a finished turn's
+ * line (`✻ Baked for 4m 11s`) has none, and text quoted in a reply is
+ * indented.
+ * `●` (U+25CF) is the glyph with prefersReducedMotion, but on Linux Claude
+ * Code also draws it at column 0 before every reply and tool call (macOS draws
+ * `⏺` there), and those lines can hold an ellipsis. So a `●` line counts only
+ * as a single word and an ellipsis ending the line, or as any message whose
+ * ellipsis is followed by ` (` and a status that starts with an elapsed time,
+ * a token arrow or `thinking`/`thought for`; `● Let me check the logs…`,
+ * `● Checked the build… (see the thread)` and `● Bash(ls …)` do not. Verified
+ * (2026-09-26) against the 2.1.280 binary and live panes, which show custom
+ * verbs of an emoji and three words with their status, and `●` reply and tool
+ * lines. 2.1.280 no longer prints "esc to interrupt" while a turn runs.
  */
-const BUSY_SPINNER_LINE_RE = /^[·✢✳✶✻✽*●] +\S[^\n]*…/m
+const BUSY_SPINNER_LINE_RE =
+  /^(?:[·✢✳✶✻✽*] [^\s…][^…\n]{0,79}…(?: \(.*)?|● [\p{L}\p{M}'’-]{1,40}…|● [^\s…][^…\n]{0,79}… \((?:\d+(?:\.\d+)?[smhd]\b|[↓↑] |thinking|thought for ).*)$/mu
 
 /**
  * Busy hints in the pane's bottom lines, matched case-insensitively: the
@@ -1444,6 +1502,55 @@ async function staleWorkingRowIsIdle(
  */
 const workingRowPaneRuns = new Map<string, WorkingPaneRun>()
 
+/**
+ * When each persona's current run of deferrals on its `working` row began
+ * (b.f2b, on the session manager's clock `_now`): the first time a launch
+ * wait or the restart path held back from the row, typing nothing, because it
+ * could not prove the session idle (`noteWorkingRowDeferral`). A run goes on
+ * across reads and attempts that find no proof, whatever the reason: a busy,
+ * changing, blank or unreadable pane, a transcript that doesn't end with a
+ * completed turn or can't be read, idle evidence not yet held for the window,
+ * a prompt, a failed tmux probe. A failed status call neither extends nor
+ * ends it. It ends (`endWorkingRowDeferral`) when the row reads another state,
+ * when a reconnect is typed into it, when any launch for the persona starts
+ * (the launch's own wait starts a new run), and with the persona's
+ * not-connected episode (`forgetNotConnectedEpisode`).
+ */
+const workingRowDeferredSince = new Map<string, number>()
+
+/**
+ * b.f2b: note that CSCB held back from persona `key`'s `working` row once
+ * more, typing nothing, because it could not prove the session idle. The
+ * first deferral of a run starts it (`workingRowDeferredSince`); once the run
+ * has lasted `UNPROVEN_IDLE_NOTICE_AFTER_MS`, the `unproven-idle`
+ * not-connected notice is raised, at any `session_restart_delay`, through the
+ * shared latch: once per episode, and not at all when another not-connected
+ * notice was raised in the episode. `autoRestartDisabled` (`session_restart_delay`
+ * is 0) words what happens next; the restart path runs only with auto-restart
+ * on. Returns whether it raised the notice; `notifyPersonaNotConnected` logs
+ * the line.
+ */
+export function noteWorkingRowDeferral(key: string, autoRestartDisabled: boolean): boolean {
+  const now = _now()
+  let since = workingRowDeferredSince.get(key)
+  if (since === undefined) {
+    since = now
+    workingRowDeferredSince.set(key, since)
+  }
+  const heldMs = now - since
+  if (heldMs < _unprovenIdleNoticeAfterMs) return false
+  return notifyPersonaNotConnected(key, { reason: 'unproven-idle', autoRestartDisabled, heldMs })
+}
+
+/**
+ * b.f2b: end persona `key`'s run of deferrals on its `working` row (it read
+ * another state, a reconnect was typed into it, or a launch for it started),
+ * so a later deferral starts a new run. Silent; other personas are untouched.
+ */
+export function endWorkingRowDeferral(key: string): void {
+  workingRowDeferredSince.delete(key)
+}
+
 /** What `checkWorkingRowPane` and `checkWaitingRowPane` tell the restart path's reconnect adapter (b.f2b). */
 export type WorkingRowPaneVerdict = 'reconnect' | 'defer'
 
@@ -1465,12 +1572,32 @@ export type WorkingRowPaneVerdict = 'reconnect' | 'defer'
  *   or a prompt or dialog. A prompt shown across reads spanning the window
  *   also raises the `blocked-on-prompt` not-connected notice (once per
  *   episode); nothing is ever typed into a prompt.
- * A live turn never ends its transcript with a completed turn, so it is never
- * taken for idle (b.rmy). Logs one line per call; never throws.
+ * Each `defer` is one more deferral in the persona's run on its `working` row
+ * (`noteWorkingRowDeferral`): once the run has lasted
+ * `UNPROVEN_IDLE_NOTICE_AFTER_MS`, the `unproven-idle` notice is raised (once
+ * per episode), so a row whose idleness can never be proven is not held back
+ * from silently. `reconnect` ends the run. A live turn never ends its
+ * transcript with a completed turn, so it is never taken for idle (b.rmy).
+ * Logs one line per call; never throws.
  */
 export async function checkWorkingRowPane(
   key: string,
   persona?: Pick<Persona, 'claude_config_dir'>,
+): Promise<WorkingRowPaneVerdict> {
+  const verdict = await workingRowPaneVerdict(key, persona)
+  if (verdict === 'reconnect') {
+    endWorkingRowDeferral(key)
+  } else {
+    // The restart path runs only with auto-restart on.
+    noteWorkingRowDeferral(key, false)
+  }
+  return verdict
+}
+
+/** `checkWorkingRowPane`'s evidence read and verdict, before its deferral is noted (b.f2b). */
+async function workingRowPaneVerdict(
+  key: string,
+  persona: Pick<Persona, 'claude_config_dir'> | undefined,
 ): Promise<WorkingRowPaneVerdict> {
   const ref = keyRef(key)
   const read = await readWorkingRowEvidence(key, transcriptConfigDir(persona))
@@ -1671,7 +1798,8 @@ export const PROMPT_ROW_STATES: ReadonlySet<string> = new Set(['ask_user', 'chec
  * The not-connected notice for a wait that ended with its session alive and
  * its row in `state` while auto-restart is disabled (b.f2b):
  * `blocked-on-prompt` for `ask_user` or `check_permission` (a prompt is why
- * nothing reconnects it), else `auto-restart-disabled` with `cause`.
+ * nothing reconnects it), else `auto-restart-disabled` with `cause`. (The
+ * timeout words a `working` row's as `unproven-idle` itself.)
  */
 function waitEndedNotice(state: string, cause: string): NotConnectedNotice {
   return PROMPT_ROW_STATES.has(state)
@@ -1905,7 +2033,12 @@ async function tmuxFallbackVerdict(
  * the window is never typed into either: the wait goes on, and the prompt is
  * logged and reported through the not-connected notice, once. The reconnect
  * is part of the launch, not an auto-restart, so it runs whatever
- * `session_restart_delay` is, like the `waiting` branch's.
+ * `session_restart_delay` is, like the `waiting` branch's. Each poll that
+ * reads the row `working` and doesn't reconnect it is one more deferral in
+ * the persona's run on the row (`noteWorkingRowDeferral`), and so is the
+ * timeout on a `working` row: once the run has lasted
+ * `UNPROVEN_IDLE_NOTICE_AFTER_MS`, the `unproven-idle` notice is raised, at
+ * any restart delay (once per episode). Any other state ends the run.
  *
  * b.f2b — every wait that ends without reconnecting a live session (a live
  * transient state, a missing row with a live tmux session, the timeout)
@@ -1914,7 +2047,8 @@ async function tmuxFallbackVerdict(
  * persona, so the not-connected notice is raised (once per episode) instead
  * of claiming the health check will (`reportWaitEndedDisconnected`): the
  * `blocked-on-prompt` notice when the row ended at `ask_user` or
- * `check_permission`, the `auto-restart-disabled` one otherwise.
+ * `check_permission`, `unproven-idle` when the timeout finds it `working`,
+ * the `auto-restart-disabled` one otherwise.
  *
  * b.f2b — a teardown cancels the wait (`cancelWorkingRowWait`). The wait
  * checks after each agent-director call and wakes from its poll sleep at
@@ -1966,7 +2100,8 @@ async function waitForWorkingRow(
   const claude_instance_id = personaInstanceId(key)
   const sessionName = personaTmuxSessionName(key)
   const pollIntervalMs = config.agent_director_poll_interval_ms
-  const deadline = _now() + _waitForWaitingTimeoutMs
+  const waitStartedAt = _now()
+  const deadline = waitStartedAt + _waitForWaitingTimeoutMs
   const paneWatch: WorkingPaneWatch = {
     run: undefined,
     lastReadAt: undefined,
@@ -2027,6 +2162,8 @@ async function waitForWorkingRow(
       return 'failed'
     }
     if (wait.cancelled) return waitCancelled(ref)
+    // b.f2b: a run of deferrals on the `working` row ends with any other state.
+    if (state !== 'working') endWorkingRowDeferral(key)
 
     if (state === 'waiting') {
       return reconnectMcp(key, ref)
@@ -2038,7 +2175,13 @@ async function waitForWorkingRow(
       // reconnected like a `waiting` one.
       const stale = await staleWorkingRowIsIdle(key, ref, config, paneWatch)
       if (wait.cancelled) return waitCancelled(ref)
-      if (stale) return reconnectMcp(key, ref)
+      if (stale) {
+        endWorkingRowDeferral(key)
+        return reconnectMcp(key, ref)
+      }
+      // b.f2b: held back again; a run that has lasted
+      // UNPROVEN_IDLE_NOTICE_AFTER_MS raises the unproven-idle notice.
+      noteWorkingRowDeferral(key, config.session_restart_delay === 0)
       await sleepUnlessCancelled(wait, pollIntervalMs)
       continue
     }
@@ -2109,6 +2252,7 @@ async function waitForWorkingRow(
   }
   if (wait.cancelled) return waitCancelled(ref)
 
+  if (timeoutState !== 'working') endWorkingRowDeferral(key)
   if (timeoutState === 'ended' || timeoutState === 'missing') {
     console.error(
       `[slack] waitForWaitingAndReconnect: timed out for ${ref} after ${_waitForWaitingTimeoutMs}ms — claude process state=${timeoutState} (gone) — dead session`,
@@ -2117,22 +2261,31 @@ async function waitForWorkingRow(
   }
   // b.f2b: the row settled at the deadline — reconnect, as the loop would have.
   if (timeoutState === 'waiting') return reconnectMcp(key, ref)
+  // b.f2b: a `working` row given up on is one more deferral: a run that has
+  // lasted UNPROVEN_IDLE_NOTICE_AFTER_MS raises the unproven-idle notice, at
+  // any restart delay.
+  let notice = waitEndedNotice(
+    timeoutState,
+    `its agent-director row still read ${timeoutState} ${describeWaitSpan(_waitForWaitingTimeoutMs)} after launch, and CSCB found no proof it was idle`,
+  )
+  if (timeoutState === 'working') {
+    const heldMs = _now() - (workingRowDeferredSince.get(key) ?? waitStartedAt)
+    noteWorkingRowDeferral(key, config.session_restart_delay === 0)
+    notice = { reason: 'unproven-idle', autoRestartDisabled: true, heldMs }
+  }
   // b.f2b: say what actually happens next for the restart delay in effect.
   // With auto-restart on, the health check schedules the reconnect, whose
   // adapter types `/mcp reconnect` into a `working` row only on the
   // positive-idle rule across attempts, and never into a prompt
   // (b.9a7/b.rmy); with `session_restart_delay` 0 nothing reconnects it, so
   // the not-connected notice is raised (once per episode: not again after a
-  // prompt report).
+  // prompt or unproven-idle report).
   return reportWaitEndedDisconnected(
     key,
     config,
     `[slack] reconnect: gave up waiting for ${ref} after ${_waitForWaitingTimeoutMs}ms — claude process state=${timeoutState} (alive)`,
-    'the health check schedules a reconnect once it has seen the persona disconnected on two ticks; for a working row it types /mcp reconnect only once its pane has shown the same idle screen and its transcript has ended with a completed turn, both unchanged, across attempts, and never into a prompt (b.9a7/b.rmy/b.f2b)',
-    waitEndedNotice(
-      timeoutState,
-      `its agent-director row still read ${timeoutState} ${describeWaitSpan(_waitForWaitingTimeoutMs)} after launch, and CSCB found no proof it was idle`,
-    ),
+    `the health check schedules a reconnect once it has seen the persona disconnected on two ticks; for a working row it types /mcp reconnect only once its pane has shown the same idle screen and its transcript has ended with a completed turn, both unchanged, across attempts, and never into a prompt, and it reports the persona once CSCB has held back from the row for ${describeWaitSpan(_unprovenIdleNoticeAfterMs)} (b.9a7/b.rmy/b.f2b)`,
+    notice,
   )
 }
 
@@ -3303,8 +3456,10 @@ export async function spawnForPersona(
   const configDirLabel = configDirLabelValue(configDir.realPath, spawnHomeDir())
   // b.f2b: the restart path's idle evidence for an earlier `working` row says
   // nothing about the session this launch brings up (and must not let the
-  // health check skip its two-tick guard while it boots).
+  // health check skip its two-tick guard while it boots), and the launch's own
+  // wait, if any, starts its own run of deferrals on the row.
   forgetWorkingRowEvidence(key)
+  endWorkingRowDeferral(key)
   const launch = runPersonaLadder(persona, config, isStartup, ref, configDirLabel, hooks)
   inFlightLaunches.set(key, launch)
   try {

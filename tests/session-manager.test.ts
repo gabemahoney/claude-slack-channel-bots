@@ -62,13 +62,17 @@
  *     `persona-destination-failed` line per episode, retries on the SR-3.2
  *     backoff, delivery in raised order once the cause clears, and the
  *     failure callback run once per notice, not per retry.
- *   - b.f2b stale `working` rows: how a pane read is classified and folded
- *     into evidence, the restart path's evidence across reconnect attempts
- *     (`checkWorkingRowPane`), the once-per-episode not-connected notice, the
- *     wait at a launch reconnecting a stale row within 60 s (never typing into
- *     a running turn or a prompt) and giving up honestly (`not-reconnected`,
- *     the notice at `session_restart_delay` 0), and the start pass leaving a
- *     launch that waits on a `working` row in flight in the background. These
+ *   - b.f2b stale `working` rows: how a pane read is classified (a Linux
+ *     screen's `●` reply and tool lines are not a spinner; a custom spinner
+ *     verb of several words is) and folded into evidence, the restart path's
+ *     evidence across reconnect attempts (`checkWorkingRowPane`), the
+ *     once-per-episode not-connected notice, the unproven-idle notice once
+ *     deferrals on a `working` row have run for 10 min at any restart delay,
+ *     the wait at a launch reconnecting a stale row within 60 s (never typing
+ *     into a running turn or a prompt) and giving up honestly
+ *     (`not-reconnected`, the notice at `session_restart_delay` 0), and the
+ *     start pass leaving a launch that waits on a `working` row in flight in
+ *     the background. These
  *     cases pass a fake clock's `now` to the session manager's clock seam
  *     (`_setNow`, reset in afterEach) and build their screens and transcripts
  *     from `tests/test-helpers/working-row-panes.ts`.
@@ -140,17 +144,22 @@ import {
   _resetConfigDirFs,
   setConfigDirUnresolvableHook,
   STALE_WORKING_WINDOW_MS,
+  UNPROVEN_IDLE_NOTICE_AFTER_MS,
   WAIT_FOR_WAITING_TIMEOUT_MS,
   _resetNow,
   _setNow,
   _resetNotConnectedEpisodes,
+  _resetUnprovenIdleNoticeAfterMs,
+  _setUnprovenIdleNoticeAfterMs,
   cancelWorkingRowWait,
   checkWaitingRowPane,
   checkWorkingRowPane,
   classifyWorkingPane,
   foldWorkingPaneRun,
+  endWorkingRowDeferral,
   forgetNotConnectedEpisode,
   hasPendingWorkingRowEvidence,
+  noteWorkingRowDeferral,
   notifyDisconnectedWithAutoRestartDisabled,
   notifyPersonaNotConnected,
   type ConfigDirUnresolvableHook,
@@ -234,8 +243,10 @@ import {
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
 import {
+  CUSTOM_VERB_SPINNER_PANE,
   DEV_CHANNELS_DIALOG_PANE,
   IDLE_PANE,
+  LINUX_IDLE_PANE,
   MCP_SERVER_DIALOG_PANE,
   MODEL_PICKER_PANE,
   OTHER_IDLE_PANE,
@@ -249,6 +260,7 @@ import {
   TRUST_DIALOG_PANE,
   appendTranscript,
   endedTurn,
+  linuxWithLastLine,
   promptEntry,
   queuedPromptEntry,
   toolResultEntry,
@@ -433,6 +445,7 @@ afterEach(() => {
   _resetLaunchedWithDirs()
   _resetConfigDirFs()
   _resetNotConnectedEpisodes()
+  _resetUnprovenIdleNoticeAfterMs()
   // b.f2b cases pass a fake clock's `now` to the session manager (`_setNow`).
   _resetNow()
   setConfigDirUnresolvableHook(undefined)
@@ -5175,7 +5188,9 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
 // (`checkWaitingRowPane`). A wait that ends with the session alive and nothing
 // typed returns 'not-reconnected' and says what happens next; with
 // session_restart_delay 0 it raises the not-connected notice, once per
-// episode, instead of claiming the health check will reconnect it. A teardown
+// episode, instead of claiming the health check will reconnect it. At any
+// delay, deferrals on a `working` row that run for
+// UNPROVEN_IDLE_NOTICE_AFTER_MS raise the unproven-idle notice. A teardown
 // cancels a launch's wait (`cancelWorkingRowWait`). The start pass does not
 // wait for a launch that waits on a `working` row.
 //
@@ -5309,6 +5324,12 @@ function linesWith(log: string, fragment: string): string[] {
 
 const RECONNECT_TEXT = `/mcp reconnect ${MCP_SERVER_NAME}`
 
+/** The blocked-on-prompt notice's follow-up with auto-restart on: true whichever path reconnects the persona (b.f2b). */
+const PROMPT_NOTICE_AUTO_RESTART_ON = 'Once it is answered, CSCB reconnects it when it can tell the session is idle again'
+
+/** What the unproven-idle notice says is wrong (b.f2b). */
+const UNPROVEN_IDLE_CLAIM = 'its session reads working but CSCB can\'t prove it\'s idle, so it won\'t type into it'
+
 /** A transcript's identity for the pure fold cases (no file behind it). */
 const SNAPSHOT: TranscriptSnapshot = { path: `/t/${TRANSCRIPT_SESSION_ID}.jsonl`, dev: 1, ino: 7, size: 4_096, mtimeMs: 1_000 }
 
@@ -5324,6 +5345,19 @@ describe('b.f2b: reading a working row\'s pane (classifyWorkingPane, foldWorking
     ['a `*` spinner line (some terminals)', 'busy', withLastLine('* Pondering… (12s)')],
     ['a `●` spinner line (prefersReducedMotion)', 'busy', withLastLine('● Pondering… (12s · ↓ 1.2k tokens)')],
     ['a spinner line with no timer (screen-reader mode)', 'busy', withLastLine('✶ Pondering…')],
+    ['a hyphenated verb (`Fiddle-faddling`)', 'busy', withLastLine('✢ Fiddle-faddling… (3s)')],
+    ['a status of thinking only', 'busy', withLastLine('✽ Flambéing… (thinking)')],
+    ['a custom spinner verb of several words (the spinnerVerbs setting), with its status', 'busy', CUSTOM_VERB_SPINNER_PANE],
+    ['a custom spinner verb of several words, before its status shows', 'busy', linuxWithLastLine('· 🐝 Foraging for nectar…')],
+    ['a task\'s activeForm as the message', 'busy', linuxWithLastLine('✶ Fixing the nightly build\'s flaky test… (1m 3s · ↑ 2.1k tokens · thought for 3s)')],
+    ['a `●` spinner line with a single word and no status yet (prefersReducedMotion)', 'busy', linuxWithLastLine('● Harmonizing…')],
+    ['a `●` spinner line with a custom verb and its status (prefersReducedMotion)', 'busy', linuxWithLastLine('● 🐝 Foraging for nectar… (12s · ↓ 1.2k tokens)')],
+    ['REPRO: a real Linux idle screen: `●` before every reply and tool call, several with an ellipsis', 'idle', LINUX_IDLE_PANE],
+    ['REPRO: a `●` reply that trails off with an ellipsis at the end of its line', 'idle', linuxWithLastLine('● Let me look at the failing job…')],
+    ['REPRO: a `●` reply with an ellipsis before a parenthesis that is no status', 'idle', linuxWithLastLine('● Checked the build… (2 jobs left)')],
+    ['REPRO: a `●` tool call whose arguments were cut with an ellipsis', 'idle', linuxWithLastLine('● Bash(gh run view 4121 --log-failed …)')],
+    ['REPRO: a `●` tool call whose quoted text ends with an ellipsis', 'idle', linuxWithLastLine('● slack-channel-router - reply (MCP)(chat_id: "C0123456789", text: "Looking into it…")')],
+    ['a glyph line whose first ellipsis is followed by more text, not the end or a status', 'idle', linuxWithLastLine('✻ Worked… then stopped…')],
     ['"esc to interrupt" (earlier Claude Code versions)', 'busy', withLastLine('  esc to interrupt')],
     ['a rebound interrupt key', 'busy', withLastLine('  ctrl+c to interrupt')],
     ['a turn paused on a usage limit', 'busy', withLastLine('  continuing automatically at 3pm · esc to cancel')],
@@ -5605,8 +5639,10 @@ describe('b.f2b: the restart path\'s check of a waiting row\'s pane before it re
 
   test.each<[string, 'reconnect' | 'defer', () => PaneReading, string | undefined]>([
     ['an idle screen', 'reconnect', () => IDLE_PANE, undefined],
+    ['REPRO: a Linux idle screen, `●` before its replies and tool calls, several with an ellipsis', 'reconnect', () => LINUX_IDLE_PANE, undefined],
     ['a blank pane', 'reconnect', () => '', undefined],
     ['a running turn (its spinner line)', 'defer', () => SPINNER_PANE, 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
+    ['a running turn with a custom spinner verb of several words', 'defer', () => CUSTOM_VERB_SPINNER_PANE, 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
     ['an API retry row', 'defer', () => withLastLine('  ⎿  Waiting for API response · will retry in 30s'), 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
     ['a failed read (the waiting row alone decides)', 'reconnect', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'waiting')), `persona=C is waiting and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))} — reconnecting on the waiting row alone`],
   ])('%s → %s: C\'s own pane read once, nothing typed here, no notice, one line unless it goes ahead plainly', async (_label, verdict, pane, line) => {
@@ -5624,7 +5660,7 @@ describe('b.f2b: the restart path\'s check of a waiting row\'s pane before it re
     assertNoLeak({ errLog })
   })
 
-  test('a prompt or dialog → defer on every call and never typed into; one blocked-on-prompt notice for the episode, saying it is reconnected once its turn ends', async () => {
+  test('a prompt or dialog → defer on every call and never typed into; one blocked-on-prompt notice for the episode, saying CSCB reconnects it once it can tell the session is idle again', async () => {
     const opts = paneOnly(PERMISSION_PANE)
     let verdicts: string[] = []
     const errLog = await withCapturedErr(async () => {
@@ -5635,15 +5671,19 @@ describe('b.f2b: the restart path\'s check of a waiting row\'s pane before it re
     expect(opts.sendKeysCalls).toEqual([])
     expect(notices.map((n) => n.key)).toEqual(['C'])
     expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
-    expect(notices[0]!.text).toContain('Once its turn ends it is reconnected')
+    expect(notices[0]!.text).toContain(PROMPT_NOTICE_AUTO_RESTART_ON)
+    expect(notices[0]!.text).not.toContain('Once its turn ends it is reconnected')
     expect(linesWith(errLog, 'persona=C is waiting but its pane shows a prompt or dialog — not typing into it')).toHaveLength(2)
   })
 })
 
 describe('b.f2b: the not-connected notice, once per episode', () => {
   test.each<[string, NotConnectedNotice, string, string]>([
-    ['blocked on a prompt, auto-restart on', { reason: 'blocked-on-prompt', autoRestartDisabled: false }, ':warning: *Waiting on a prompt*', 'Once its turn ends it is reconnected'],
+    ['blocked on a prompt, auto-restart on', { reason: 'blocked-on-prompt', autoRestartDisabled: false }, ':warning: *Waiting on a prompt*', PROMPT_NOTICE_AUTO_RESTART_ON],
     ['blocked on a prompt, session_restart_delay 0', { reason: 'blocked-on-prompt', autoRestartDisabled: true }, ':warning: *Waiting on a prompt*', 'Automatic restarts are disabled'],
+    ['a working row whose idleness can\'t be proven, auto-restart on', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 12 * 60_000 }, ':warning: *Not connected*', `${UNPROVEN_IDLE_CLAIM}, and has held back for 12 min`],
+    ['a working row whose idleness can\'t be proven, auto-restart on (what happens next)', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 12 * 60_000 }, ':warning: *Not connected*', 'CSCB keeps checking it and reconnects it once its row reads waiting or its screen and transcript prove it idle'],
+    ['a working row whose idleness can\'t be proven, session_restart_delay 0', { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 10 * 60_000 }, ':warning: *Not connected*', 'Automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it on its own'],
     ['disconnected, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause' }, ':warning: *Not connected*', '(a test cause), and automatic restarts are disabled'],
     ['connected with its message stream gone, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause', streamless: true }, ':warning: *Not receiving messages*', 'its message stream is gone (a test cause), and automatic restarts are disabled'],
   ])('%s: raised once, one log line; its first line says what is wrong, the second how to recover; a second call in the episode raises nothing', async (_label, notice, head, detail) => {
@@ -5674,6 +5714,183 @@ describe('b.f2b: the not-connected notice, once per episode', () => {
     expect(notices.map((n) => n.key)).toEqual(['C'])
     expect(notices[0]!.text).toStartWith(head)
     expect(notices[0]!.text).toContain(detail)
+  })
+})
+
+// b.f2b: at any restart delay, CSCB holding back from a `working` row it can't
+// prove idle is bounded: once its deferrals on the row have run for
+// UNPROVEN_IDLE_NOTICE_AFTER_MS (10 min) from the first, the unproven-idle
+// not-connected notice is raised, once per episode through the shared latch.
+// Before it, a row whose idleness could never be proven (an unreadable
+// transcript, a compaction summary, a screen that keeps changing) was held
+// back from for good at a non-zero delay, and nothing reported it.
+describe('b.f2b: a working row whose idleness can\'t be proven is reported (unproven-idle)', () => {
+  let clock: FakeClock
+  beforeEach(() => {
+    clock = useFakeNow()
+  })
+
+  /** Minutes on the fake clock. */
+  const min = (n: number): number => n * 60_000
+
+  /**
+   * A stub for persona C's `working` row: its pane reads show `pane` until
+   * `show` changes it (an Error fails the read), and its `get` names
+   * `transcript` (without one, the row names no transcript).
+   */
+  function rowStub(pane: PaneReading, transcript?: Transcript) {
+    const opts: StubClientOptions = { sendKeysCalls: [], readPaneCalls: [], getCalls: [] }
+    opts.getResult = cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working', ...transcript?.fields })
+    showPane(opts, pane)
+    installStub(opts)
+    return { show: (next: PaneReading) => showPane(opts, next), sendKeysCalls: opts.sendKeysCalls! }
+  }
+
+  /** Restart-path attempts on C's row at each of `at` (minutes on the fake clock, ascending); the verdicts and the notices raised by each. */
+  async function attemptsAt(at: number[], before?: (minute: number) => void): Promise<{ verdicts: string[]; noticesAfter: number[] }> {
+    const verdicts: string[] = []
+    const noticesAfter: number[] = []
+    for (const minute of at) {
+      await clock.advance(min(minute) - clock.now())
+      before?.(minute)
+      verdicts.push(await checkWorkingRowPane('C'))
+      noticesAfter.push(notices.length)
+    }
+    return { verdicts, noticesAfter }
+  }
+
+  test('the run is measured from its first deferral: nothing 1 ms short of UNPROVEN_IDLE_NOTICE_AFTER_MS, the notice at it, then nothing more in the episode; ending the run starts a new one', async () => {
+    const raised: boolean[] = []
+    await clock.advance(5_000)
+    raised.push(noteWorkingRowDeferral('C', false)) // the run starts at 5 s
+    await clock.advance(UNPROVEN_IDLE_NOTICE_AFTER_MS - 1)
+    raised.push(noteWorkingRowDeferral('C', false))
+    await clock.advance(1)
+    raised.push(noteWorkingRowDeferral('C', false))
+    await clock.advance(min(5))
+    raised.push(noteWorkingRowDeferral('C', false))
+    // Another persona's run is its own.
+    raised.push(noteWorkingRowDeferral('D', false))
+
+    expect(UNPROVEN_IDLE_NOTICE_AFTER_MS).toBe(min(10))
+    expect(raised).toEqual([false, false, true, false, false])
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(notices[0]!.text).toStartWith(':warning: *Not connected*')
+    expect(notices[0]!.text).toContain(`${UNPROVEN_IDLE_CLAIM}, and has held back for 10 min`)
+
+    // A new episode: a run ended and started again is measured afresh.
+    forgetNotConnectedEpisode('C')
+    expect(noteWorkingRowDeferral('C', true)).toBe(false)
+    await clock.advance(min(9))
+    endWorkingRowDeferral('C')
+    expect(noteWorkingRowDeferral('C', true)).toBe(false)
+    await clock.advance(min(9))
+    expect(noteWorkingRowDeferral('C', true)).toBe(false)
+    await clock.advance(min(1))
+    expect(noteWorkingRowDeferral('C', true)).toBe(true)
+    expect(notices.map((n) => n.key)).toEqual(['C', 'C'])
+    expect(notices[1]!.text).toContain('Automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it on its own')
+  })
+
+  test.each<[string, () => { pane: PaneReading | ((minute: number) => PaneReading); transcript?: Transcript }]>([
+    ['REPRO: an idle screen whose row names no transcript (unreadable)', () => ({ pane: IDLE_PANE })],
+    ['REPRO: an idle screen whose transcript ends with a compaction summary', () => ({
+      pane: IDLE_PANE,
+      transcript: transcriptOf([...endedTurn(), { ...promptEntry('This session is being continued from a previous conversation that ran out of context.'), isCompactSummary: true }]),
+    })],
+    ['REPRO: an idle screen that changes at every attempt, its transcript ended', () => ({
+      pane: (minute) => (minute % 8 === 0 ? IDLE_PANE : OTHER_IDLE_PANE),
+      transcript: transcriptOf(),
+    })],
+    ['a turn that keeps running (its spinner line)', () => ({ pane: SPINNER_PANE, transcript: transcriptOf() })],
+    ['a pane that can\'t be read', () => ({ pane: errGeneric('read-pane', 'ErrPaneRead', 'pane read failed') })],
+  ])('%s: restart-path attempts 4 min apart defer with nothing typed; the attempt 12 min after the first raises one unproven-idle notice, worded for auto-restart on; later attempts raise nothing more', async (_label, make) => {
+    const { pane, transcript } = make()
+    const stub = rowStub(typeof pane === 'function' ? pane(0) : pane, transcript)
+    let result!: { verdicts: string[]; noticesAfter: number[] }
+    const errLog = await withCapturedErr(async () => {
+      result = await attemptsAt([0, 4, 8, 12, 16], (minute) => {
+        if (typeof pane === 'function') stub.show(pane(minute))
+      })
+    })
+
+    expect(result.verdicts).toEqual(Array(5).fill('defer'))
+    expect(stub.sendKeysCalls).toEqual([])
+    expect(result.noticesAfter).toEqual([0, 0, 0, 1, 1])
+    expect(notices[0]!.key).toBe('C')
+    expect(notices[0]!.text).toStartWith(':warning: *Not connected*')
+    expect(notices[0]!.text).toContain(`${UNPROVEN_IDLE_CLAIM}, and has held back for 12 min`)
+    expect(notices[0]!.text).toContain('CSCB keeps checking it and reconnects it once its row reads waiting or its screen and transcript prove it idle')
+    const [, second] = notices[0]!.text.split('\n')
+    expect(second).toContain('`tmux attach -t slack_bot_C`')
+    expect(second).toContain(`\`${RECONNECT_TEXT}\``)
+    expect(linesWith(errLog, 'persona=C is not connected (unproven-idle) — raising a not-connected notice')).toHaveLength(1)
+  })
+
+  test('a reconnect on idle proof ends the run: deferrals after it are measured from their own first', async () => {
+    const transcript = transcriptOf()
+    rmSync(transcript.path) // unreadable at first
+    rowStub(IDLE_PANE, transcript)
+    const { verdicts, noticesAfter } = await attemptsAt([0, 3, 6, 9, 10, 11, 15, 19, 21], (minute) => {
+      if (minute === 9) writeTranscript(transcript.path, endedTurn())
+      if (minute === 11) rmSync(transcript.path)
+    })
+
+    // Proof from 9 min, held for the 60 s window at 10 min: the reconnect; the
+    // run that follows starts at 11 min and is reported at 21 min.
+    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'defer', 'reconnect', 'defer', 'defer', 'defer', 'defer'])
+    expect(noticesAfter).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 1])
+    expect(notices[0]!.text).toContain('has held back for 10 min')
+  })
+
+  test('a prompt reported first holds the episode\'s one notice: the run passing 10 min raises nothing more', async () => {
+    const stub = rowStub(PERMISSION_PANE)
+    const { verdicts, noticesAfter } = await attemptsAt([0, 2, 6, 10, 14])
+
+    expect(verdicts).toEqual(Array(5).fill('defer'))
+    expect(stub.sendKeysCalls).toEqual([])
+    expect(noticesAfter).toEqual([0, 1, 1, 1, 1])
+    expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
+  })
+
+  test('any launch for the persona starts a new run: deferrals before it don\'t count toward the notice', async () => {
+    const cfg = waitConfig()
+    rowStub(IDLE_PANE)
+    await checkWorkingRowPane('C')
+    await clock.advance(min(9))
+    expect((await spawnForPersona(personaOf(cfg, 'C'), cfg, false)).action).toBe('spawned')
+
+    const { noticesAfter } = await attemptsAt([10, 14, 18, 19, 20])
+
+    expect(noticesAfter).toEqual([0, 0, 0, 0, 1])
+  })
+
+  test.each<[number, string]>([
+    [60, 'CSCB keeps checking it and reconnects it once its row reads waiting or its screen and transcript prove it idle'],
+    [0, 'Automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it on its own'],
+  ])('a launch wait (session_restart_delay %d) on a working row it can\'t prove idle reports it mid-wait once the run has lasted the bound (3 min here), goes on waiting, and raises nothing more at the deadline; nothing typed', async (delay, wording) => {
+    _setUnprovenIdleNoticeAfterMs(min(3))
+    const cfg = waitConfig({ session_restart_delay: delay })
+    const row = installWorkingRow(clock, { pane: IDLE_PANE, stepMs: 30_000 }, { getResult: workingRowOf(cfg) })
+    const raisedAt: number[] = []
+    setSessionNotifier((key, text, options) => {
+      notices.push({ key, text, options })
+      raisedAt.push(clock.now())
+    })
+
+    let result: string | undefined
+    await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', cfg)
+    })
+
+    expect(result).toBe('not-reconnected')
+    expect(row.sendKeysCalls).toEqual([])
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    // The first poll (30 s) starts the run; the poll at 3 min 30 s reports it.
+    expect(raisedAt).toEqual([30_000 + min(3)])
+    expect(clock.now()).toBeGreaterThanOrEqual(WAIT_FOR_WAITING_TIMEOUT_MS)
+    expect(notices[0]!.text).toContain(`${UNPROVEN_IDLE_CLAIM}, and has held back for 3 min`)
+    expect(notices[0]!.text).toContain(wording)
   })
 })
 
@@ -5782,19 +5999,29 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
 
   /**
    * The wait's give-ups with the session alive (tmux alive, the suite's
-   * default prober): how the stub makes each, and the head and detail of the
-   * notice at session_restart_delay 0. The deadline's status call fails only
-   * after the deadline's fresh sweep (memo TTL 0: two sweeps per wait).
+   * default prober): how the stub makes each, the head and detail of the
+   * notice at session_restart_delay 0, and the detail of the notice at
+   * session_restart_delay 60, if any: only the deadline on a `working` row,
+   * held back from for 10 min, raises one then (unproven-idle). The deadline's
+   * status call fails only after the deadline's fresh sweep (memo TTL 0: two
+   * sweeps per wait).
    */
-  const GIVE_UPS: Array<[string, Pick<WorkingRow, 'pane' | 'stepMs' | 'state'>, string, string]> = [
-    ['the deadline, with the row still working and its pane mid-turn', { state: 'working', pane: SPINNER_PANE, stepMs: 60_000 }, ':warning: *Not connected*', '(its agent-director row still read working 10 min after launch, and CSCB found no proof it was idle)'],
-    ['the row moving to ask_user', { state: 'ask_user', pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Waiting on a prompt*', 'Automatic restarts are disabled (`session_restart_delay` is 0)'],
-    ['agent-director losing the row while its tmux session lives', { state: errSpawnNotFound(), pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Not connected*', '(agent-director has no record of its session, though its tmux session is alive)'],
+  const GIVE_UPS: Array<[string, Pick<WorkingRow, 'pane' | 'stepMs' | 'state'>, string, string, string | undefined]> = [
+    [
+      'the deadline, with the row still working and its pane mid-turn',
+      { state: 'working', pane: SPINNER_PANE, stepMs: 60_000 },
+      ':warning: *Not connected*',
+      `${UNPROVEN_IDLE_CLAIM}, and has held back for 10 min`,
+      'CSCB keeps checking it and reconnects it once its row reads waiting or its screen and transcript prove it idle',
+    ],
+    ['the row moving to ask_user', { state: 'ask_user', pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Waiting on a prompt*', 'Automatic restarts are disabled (`session_restart_delay` is 0)', undefined],
+    ['agent-director losing the row while its tmux session lives', { state: errSpawnNotFound(), pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Not connected*', '(agent-director has no record of its session, though its tmux session is alive)', undefined],
     [
       'the deadline\'s status call failing while its tmux session lives (the tmux fallback)',
       { state: (r) => (r.findMissingCalls.length % 2 === 0 ? errGeneric('status', 'ErrTimeout') : 'working'), pane: SPINNER_PANE, stepMs: 60_000 },
       ':warning: *Not connected*',
       '(agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it)',
+      undefined,
     ],
   ]
 
@@ -5820,7 +6047,7 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     expect(errLog).not.toMatch(/; the health check (recovers|reconnects|reads|schedules) /)
   })
 
-  test.each(GIVE_UPS)('session_restart_delay 60 and %s → not-reconnected with nothing typed and no notice; the log says what the health check does next', async (_label, init) => {
+  test.each(GIVE_UPS)('session_restart_delay 60 and %s → not-reconnected with nothing typed; the log says what the health check does next; a notice only for a working row held back from for 10 min (unproven-idle)', async (_label, init, head, _detail, delay60Detail) => {
     _setFindMissingMemoTtlMs(0)
     const cfg = waitConfig({ session_restart_delay: 60 })
     const row = installWorkingRow(clock, init)
@@ -5832,13 +6059,22 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
 
     expect(result).toBe('not-reconnected')
     expect(row.sendKeysCalls).toEqual([])
-    expect(notices).toEqual([])
+    if (delay60Detail === undefined) {
+      expect(notices).toEqual([])
+    } else {
+      expect(notices.map((n) => n.key)).toEqual(['C'])
+      expect(notices[0]!.text).toStartWith(head)
+      expect(notices[0]!.text).toContain(UNPROVEN_IDLE_CLAIM)
+      expect(notices[0]!.text).toContain(delay60Detail)
+      expect(notices[0]!.text).not.toContain('Automatic restarts are disabled')
+      expect(linesWith(errLog, 'persona=C is not connected (unproven-idle) — raising a not-connected notice')).toHaveLength(1)
+    }
     expect(errLog).not.toContain('nothing will reconnect it')
     expect(errLog).toMatch(/; the health check (recovers|reconnects|reads|schedules) /)
   })
 
   test.each<[number, string]>([
-    [60, 'Once its turn ends it is reconnected'],
+    [60, PROMPT_NOTICE_AUTO_RESTART_ON],
     [0, 'Automatic restarts are disabled'],
   ])('a prompt shown for 60 s while the row reads working is never typed into: one log line and one blocked-on-prompt notice (session_restart_delay %d); the wait goes on and reconnects once the row reads waiting', async (delay, wording) => {
     const cfg = waitConfig({ session_restart_delay: delay })

@@ -10,7 +10,9 @@
  * session to end with a completed turn and to stay unchanged across the whole
  * evidence window. A live turn, an API retry included, never ends that way:
  * its last conversation entry is the prompt or a tool result waiting on the
- * API, or a tool call waiting on its result.
+ * API, a tool call waiting on its result, or a Stop hook's feedback that
+ * keeps the turn going. A turn the user interrupted does end that way, with
+ * its interrupt marker: Claude Code fires no Stop for it.
  *
  * - `locateTranscript` finds the file from the persona's agent-director row
  *   (`get`): its persisted `jsonl_path` when that belongs to the row's
@@ -94,12 +96,58 @@ export type TranscriptReading =
   | { kind: TranscriptTurnState; snapshot: TranscriptSnapshot }
   | { kind: 'unreadable'; reason: string }
 
+/**
+ * The text Claude Code 2.1.280 writes, as a `user` entry's only content block,
+ * when the user interrupts a turn (Esc), and when they interrupt it while a
+ * tool call waits for permission or runs.
+ */
+const INTERRUPT_MARKERS: ReadonlySet<string> = new Set([
+  '[Request interrupted by user]',
+  '[Request interrupted by user for tool use]',
+])
+
+/**
+ * The `attachment` types a Stop hook's output is recorded as when it keeps the
+ * turn going (Claude Code 2.1.280): its `additionalContext`
+ * (`hook_additional_context`) and a blocking error (`hook_blocking_error`),
+ * each with `hookEvent` `Stop`. A Stop hook that ends the turn
+ * (`hook_stopped_continuation`), and any other hook's attachment (a
+ * SessionStart hook's context written after a resumed session's last reply,
+ * for one), is not among them.
+ */
+const TURN_CONTINUING_STOP_HOOK_ATTACHMENTS: ReadonlySet<string> = new Set(['hook_additional_context', 'hook_blocking_error'])
+
 /** A user entry's content when it is a plain string. */
 function stringContent(entry: Record<string, unknown>): string | undefined {
   const message = entry.message
   if (typeof message !== 'object' || message === null) return undefined
   const content = (message as Record<string, unknown>).content
   return typeof content === 'string' ? content : undefined
+}
+
+/**
+ * Whether a user entry is an interrupt marker: its content is a single text
+ * block holding one of `INTERRUPT_MARKERS`. A prompt, a string content (a user
+ * can type the marker's text) and any content with a `tool_result` block is
+ * not.
+ */
+function isInterruptMarker(entry: Record<string, unknown>): boolean {
+  const message = entry.message
+  if (typeof message !== 'object' || message === null) return false
+  const content = (message as Record<string, unknown>).content
+  if (!Array.isArray(content) || content.length !== 1) return false
+  const block: unknown = content[0]
+  if (typeof block !== 'object' || block === null) return false
+  const { type, text } = block as Record<string, unknown>
+  return type === 'text' && typeof text === 'string' && INTERRUPT_MARKERS.has(text)
+}
+
+/** Whether an `attachment` entry records a Stop hook's output that keeps the turn going. */
+function stopHookContinuesTurn(entry: Record<string, unknown>): boolean {
+  const attachment = entry.attachment
+  if (typeof attachment !== 'object' || attachment === null) return false
+  const { type, hookEvent } = attachment as Record<string, unknown>
+  return hookEvent === 'Stop' && typeof type === 'string' && TURN_CONTINUING_STOP_HOOK_ATTACHMENTS.has(type)
 }
 
 /** Whether an assistant entry is the last entry of a completed turn. */
@@ -128,12 +176,20 @@ function assistantEndsTurn(entry: Record<string, unknown>): boolean {
  *   its `<local-command-stdout>`/`<local-command-stderr>` line, and that
  *   output line), so the `/mcp reconnect` CSCB types after a turn doesn't
  *   hide the turn's end;
- * - the first other entry decides: `ended` only for an `assistant` entry whose
- *   stop reason ends a turn and which holds no `tool_use` block. A `user`
- *   entry (a prompt, a tool result, Stop-hook feedback, an interrupt, a slash
- *   command that starts a turn), a `queue-operation` (a prompt waiting to
- *   run), a sidechain entry, a line that isn't a JSON object, or a last line
- *   with no newline yet (still being written) is `open`.
+ * - except that an `attachment` recording a Stop hook's output that keeps the
+ *   turn going (`TURN_CONTINUING_STOP_HOOK_ATTACHMENTS` with `hookEvent`
+ *   `Stop`), written after the turn's last `assistant` entry, is `open`: the
+ *   turn goes on with it, and Claude Code writes nothing else for it (b.rmy);
+ * - the first other entry decides: `ended` for an `assistant` entry whose
+ *   stop reason ends a turn and which holds no `tool_use` block, and for an
+ *   interrupt marker (a `user` entry whose only content block is
+ *   `[Request interrupted by user]` or `[Request interrupted by user for
+ *   tool use]`: the user ended the turn, and Claude Code fires no Stop for
+ *   it, so agent-director's row stays `working`). Any other `user` entry (a
+ *   prompt, a tool result, Stop-hook feedback, a slash command that starts a
+ *   turn), a `queue-operation` (a prompt waiting to run), a sidechain entry,
+ *   a line that isn't a JSON object, or a last line with no newline yet
+ *   (still being written) is `open`.
  * No deciding entry in the tail is `open`. Pure.
  */
 export function transcriptTailTurnState(tail: string, fromStart: boolean): TranscriptTurnState {
@@ -155,7 +211,9 @@ export function transcriptTailTurnState(tail: string, fromStart: boolean): Trans
     if (e.isSidechain === true) return 'open'
     if (e.type === 'assistant') return assistantEndsTurn(e) ? 'ended' : 'open'
     if (e.type === 'queue-operation') return 'open'
+    if (e.type === 'attachment' && stopHookContinuesTurn(e)) return 'open'
     if (e.type !== 'user') continue
+    if (isInterruptMarker(e)) return 'ended'
     const content = stringContent(e)
     if (content === undefined) return 'open'
     if (content.startsWith('<local-command-stdout>') || content.startsWith('<local-command-stderr>')) {

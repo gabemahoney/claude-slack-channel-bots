@@ -3,11 +3,13 @@
  * positive idle signal for a stale `working` row (bug b.f2b;
  * src/session-transcript.ts).
  *
- * - `transcriptTailTurnState`, pure: only an `assistant` entry that ends the
- *   turn (`end_turn`, `stop_sequence`, `refusal`, with no `tool_use` block)
- *   is `ended`; a prompt, a tool result, a tool call, a queued prompt, a
- *   sidechain entry, a line that isn't a JSON object and a last line still
- *   being written are `open`; `system` lines and a completed local command
+ * - `transcriptTailTurnState`, pure: an `assistant` entry that ends the turn
+ *   (`end_turn`, `stop_sequence`, `refusal`, with no `tool_use` block) and an
+ *   interrupt marker (a `user` entry whose only block is the interrupt text)
+ *   are `ended`; a prompt, a tool result, a tool call, a queued prompt, a
+ *   Stop hook's context or blocking error after the reply, a sidechain entry,
+ *   a line that isn't a JSON object and a last line still being written are
+ *   `open`; `system` lines, other attachments and a completed local command
  *   (the `/mcp reconnect` CSCB types) are skipped; a tail that does not start
  *   the file drops its first, possibly cut, line.
  * - `locateTranscript`, pure: the row's persisted `jsonl_path` when it is
@@ -41,9 +43,12 @@ import {
   TRANSCRIPT_SESSION_ID,
   appendTranscript,
   endedTurn,
+  hookAttachmentEntry,
+  interruptEntry,
   localCommandEntries,
   promptEntry,
   queuedPromptEntry,
+  rejectedToolResultEntry,
   replyEntry,
   systemEntry,
   toolResultEntry,
@@ -95,6 +100,38 @@ describe('transcriptTailTurnState', () => {
     ['only system lines: no deciding entry', 'open', [systemEntry('turn_duration'), systemEntry('stop_hook_summary')]],
     ['no entries at all', 'open', []],
   ])('%s → %s', (_label, state, entries) => {
+    expect(transcriptTailTurnState(transcriptJsonl(entries), true)).toBe(state)
+  })
+
+  // A turn the user interrupts gets no Stop, so agent-director's row stays
+  // `working`: the interrupt marker ends the turn. A tool result never does.
+  test.each<[string, TranscriptTurnState, TranscriptEntry[]]>([
+    ['REPRO: a turn interrupted while the model ran: the prompt, then the interrupt marker', 'ended', [...endedTurn(), promptEntry('post it in #ops'), interruptEntry()]],
+    ['REPRO: a turn interrupted during a tool call: the call, its rejected result, then the tool-use interrupt marker', 'ended', [promptEntry(), toolUseEntry(), rejectedToolResultEntry(), interruptEntry(true)]],
+    ['an interrupt marker, then Claude Code\'s own trailing lines (system, a completed /mcp reconnect)', 'ended', [promptEntry(), interruptEntry(), systemEntry('turn_duration'), ...localCommandEntries()]],
+    ['an interrupt marker, then a new prompt', 'open', [promptEntry(), interruptEntry(), promptEntry('try again')]],
+    ['an interrupt marker, then a queued prompt', 'open', [promptEntry(), interruptEntry(), queuedPromptEntry()]],
+    ['a tool result, not an interrupt: the interrupt text in the same entry after a tool_result block', 'open', [promptEntry(), toolUseEntry(), interruptEntry(true, true)]],
+    ['a rejected tool result alone (no marker written yet)', 'open', [promptEntry(), toolUseEntry(), rejectedToolResultEntry()]],
+    ['a prompt whose text is the marker (string content, as a user would type it)', 'open', [...endedTurn(), promptEntry('[Request interrupted by user]')]],
+    ['a sidechain (subagent) interrupt marker', 'open', [promptEntry(), toolUseEntry(), { ...interruptEntry(), isSidechain: true }]],
+  ])('interrupts: %s → %s', (_label, state, entries) => {
+    expect(transcriptTailTurnState(transcriptJsonl(entries), true)).toBe(state)
+  })
+
+  // b.rmy: a Stop hook that returns additionalContext (or a blocking error)
+  // keeps the turn going, and Claude Code records it only as an attachment
+  // after the turn's last assistant entry.
+  test.each<[string, TranscriptTurnState, TranscriptEntry[]]>([
+    ['REPRO: a Stop hook\'s additionalContext after the reply (the turn goes on with it)', 'open', [...endedTurn(), hookAttachmentEntry('hook_additional_context')]],
+    ['a Stop hook\'s blocking error after the reply', 'open', [promptEntry(), replyEntry(), hookAttachmentEntry('hook_blocking_error'), systemEntry('stop_hook_summary')]],
+    ['a Stop hook\'s context, then a completed /mcp reconnect', 'open', [...endedTurn(), hookAttachmentEntry('hook_additional_context'), ...localCommandEntries()]],
+    ['a Stop hook\'s context before the reply that finished the continued turn', 'ended', [promptEntry(), replyEntry(), hookAttachmentEntry('hook_additional_context'), replyEntry(), systemEntry('turn_duration')]],
+    ['a Stop hook that stopped the turn (hook_stopped_continuation)', 'ended', [...endedTurn(), hookAttachmentEntry('hook_stopped_continuation')]],
+    ['a Stop hook that succeeded with no output (hook_success)', 'ended', [...endedTurn(), hookAttachmentEntry('hook_success')]],
+    ['a SessionStart hook\'s context after a resumed session\'s last reply', 'ended', [...endedTurn(), hookAttachmentEntry('hook_additional_context', 'SessionStart')]],
+    ['a PostToolUse hook\'s blocking error after the reply', 'ended', [...endedTurn(), hookAttachmentEntry('hook_blocking_error', 'PostToolUse')]],
+  ])('Stop hook attachments: %s → %s', (_label, state, entries) => {
     expect(transcriptTailTurnState(transcriptJsonl(entries), true)).toBe(state)
   })
 
