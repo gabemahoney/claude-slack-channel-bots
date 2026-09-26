@@ -12,22 +12,57 @@
  *   starts at boot (Check 28's reboot);
  * - agent-director's `~/.agent-director/errors.log` and `ad-trail.jsonl`.
  *
+ * And what tells a tool call still waiting on an unanswered permission
+ * prompt apart from one that ran and never finished, for each persona A–D
+ * (`PERSONA_CAPTURES`):
+ * - its tmux pane (`pane-<key>.txt`), when `tmux ls` lists its session
+ *   (`slack_bot_<key>`): `tmux capture-pane -p -J -S -200`, its last 200
+ *   lines of history and its screen. `-J` joins only the lines tmux itself
+ *   wrapped at the pane's width. Claude Code hard-wraps a long line itself
+ *   (a line break, then indentation or a `│` / `⎿` border), which no capture
+ *   undoes, so a value can reach the copy in pieces: a pane goes through the
+ *   redactor's wrap-aware pass too (`Redactor.redactWrapped`);
+ * - the tail of its Claude transcript (`transcript-<key>.jsonl`): the
+ *   newest regular `*.jsonl` directly in the Claude Code project dir of its
+ *   working directory (`~/.claude/projects/<slug>`, the slug derived from
+ *   the path as Claude Code derives it, `claudeProjectSlug`), its last 200
+ *   whole lines. Copied whether or not the persona's session is still there:
+ *   a session killed mid-turn leaves its transcript behind. JSON lines don't
+ *   wrap, but a transcript goes through the same pass, for its fragments.
+ *
+ * The order: the panes first (a session is gone the moment the container
+ * is removed or stopped, or a watchdog stop's bound runs out), then the logs,
+ * server.log first, then the transcript tails (ordinary files, like the logs).
+ *
  * How:
- * - One `docker exec` per file (the one exec path, lib/container.ts), read
- *   into memory. At most the last `CONTAINER_LOG_MAX_BYTES` of a file are
- *   read, so a runaway log can't blow up the runner's memory.
+ * - One `docker exec` per file (the one exec path, lib/container.ts), a
+ *   fixed script with the paths, session names and caps as arguments,
+ *   read into memory. At most the last `CONTAINER_LOG_MAX_BYTES` of a log,
+ *   and the last `SESSION_CAPTURE_MAX_BYTES` of a pane or a transcript, are
+ *   read, so a runaway file can't blow up the runner's memory.
+ * - A file's read may take `CONTAINER_LOG_EXEC_TIMEOUT_MS`, but a tmux exec
+ *   (`tmux ls`, a pane's capture) only `TMUX_EXEC_TIMEOUT_MS`, and once one
+ *   times out (a stuck tmux server, not tmux's clean "no server running") no
+ *   further pane is captured: tmux can't crowd server.log out of a caller's
+ *   wait.
  * - A copy keeps only whole lines. A file cut at the cap loses its partial
  *   first line, so no tail of a secret is left for the redactor to miss; an
  *   unterminated last line (one still being written when it was read) is
  *   left out too, so no prefix of a secret that is not token-shaped is kept.
  *   Both are noted.
  * - Only a regular file is read: a missing one is noted, a symlink or
- *   anything else is skipped and noted, never followed.
+ *   anything else is skipped and noted, never followed (a transcript's
+ *   directory too). A persona with no tmux session, or no transcript, is
+ *   noted as not there.
  * - Each copy goes through the run's redactor as one text, so a registered
- *   value spanning a line break is masked too. The copies are written mode
- *   600 in `RESULTS_DIR/container-logs/` (mode 700), beside `index.txt`,
- *   which says what was copied, cut, missing, skipped or not copied. The
- *   closing secrecy scan covers them like every other output.
+ *   value spanning a line break is masked too; a pane or a transcript tail
+ *   through `redactWrapped`, which also masks every fragment of 10 or more
+ *   characters of a registered value wherever it is, and a registered value
+ *   or a token a row break with indentation or a border split, in each
+ *   piece. The copies are written mode 600 in `RESULTS_DIR/container-logs/`
+ *   (mode 700), beside `index.txt`, which says what was copied, cut,
+ *   missing, skipped or not copied. The closing secrecy scan covers them
+ *   like every other output.
  * - A failure to copy is logged and never changes the verdict.
  *   `ContainerLogCollector` copies once, however many cleanup paths ask, and
  *   each caller waits only as long as it can afford (`CONTAINER_LOGS_WAIT_MS`,
@@ -48,11 +83,13 @@ import { join } from 'node:path'
 import type { ContainerExec } from './container.ts'
 import { CONTAINER_HOME } from './docker.ts'
 import { describeError } from './errors.ts'
+import { TMUX_NO_SERVER_RE } from './host-state.ts'
 import { CONTAINER_STATE_DIR } from './live-config.ts'
 import type { RunLog } from './log.ts'
 import { formatBytes } from './memory-watchdog.ts'
+import { PERSONA_LETTERS, personaName } from './personas.ts'
 import type { ProcResult } from './proc.ts'
-import type { Redactor } from './redact.ts'
+import { MIN_FRAGMENT_LENGTH, type Redactor } from './redact.ts'
 
 /** The results dir's subdirectory the copies go in. */
 export const CONTAINER_LOGS_DIR = 'container-logs'
@@ -79,6 +116,13 @@ export const MAX_ROTATED_SERVER_LOGS = 10
 
 /** One file's `docker exec` time limit. */
 export const CONTAINER_LOG_EXEC_TIMEOUT_MS = 30_000
+
+/**
+ * A tmux exec's time limit (`tmux ls`, one pane's capture): 5 s. A healthy
+ * tmux answers at once, and a stuck one must not keep the logs, which come
+ * after the panes, from being copied within a caller's wait.
+ */
+export const TMUX_EXEC_TIMEOUT_MS = 5_000
 
 /** How long a cleanup waits for the copy before it removes or stops the container anyway. */
 export const CONTAINER_LOGS_WAIT_MS = 60_000
@@ -134,6 +178,18 @@ export const LIST_ROTATED_SCRIPT = [
 ].join('\n')
 
 /**
+ * The ending every read script shares: with `$f` the file and `$n` the cap,
+ * prints the size line and the kept bytes (see READ_LOG_SCRIPT). Exit 5: the
+ * size could not be read.
+ */
+const PRINT_TAIL = [
+  's=$(stat -c %s -- "$f") || exit 5',
+  'k=0; if [ "$s" -gt "$n" ]; then k=$((s - n)); fi',
+  'printf \'%s %s\\n\' "$s" "$k"',
+  'if [ "$k" -gt 0 ]; then tail -c +"$k" -- "$f" | head -c "$((s - k + 1))"; else head -c "$s" -- "$f"; fi',
+]
+
+/**
  * Reads the regular file $1, keeping at most its last $2 bytes. Prints a
  * first line `<size> <cut>` (the file's size, taken once, and how many bytes
  * before the kept part are left out), then the kept bytes, up to that size
@@ -149,10 +205,7 @@ export const READ_LOG_SCRIPT = [
   'if [ ! -e "$f" ]; then exit 3; fi',
   'if [ ! -f "$f" ]; then exit 4; fi',
   'if [ ! -r "$f" ]; then exit 6; fi',
-  's=$(stat -c %s -- "$f") || exit 5',
-  'k=0; if [ "$s" -gt "$n" ]; then k=$((s - n)); fi',
-  'printf \'%s %s\\n\' "$s" "$k"',
-  'if [ "$k" -gt 0 ]; then tail -c +"$k" -- "$f" | head -c "$((s - k + 1))"; else head -c "$s" -- "$f"; fi',
+  ...PRINT_TAIL,
 ].join('\n')
 
 /** The argv that reads one file in the container (its path and the cap as arguments, never in the script). */
@@ -163,6 +216,129 @@ export function readLogArgv(path: string, maxBytes: number): string[] {
 /** The argv that lists the rotated server logs. */
 export function listRotatedArgv(): string[] {
   return ['bash', '-c', LIST_ROTATED_SCRIPT, 'list', CONTAINER_STATE_DIR]
+}
+
+// ---------------------------------------------------------------------------
+// The personas' tmux panes and Claude transcripts
+// ---------------------------------------------------------------------------
+
+/**
+ * The most of one pane capture or transcript that is read: its last 2 MiB.
+ * A transcript line can be long (a tool result holding a whole file), so the
+ * last 200 lines are kept only as far as they fit.
+ */
+export const SESSION_CAPTURE_MAX_BYTES = 2 * 1024 * 1024
+
+/** How far back a pane capture reaches into the pane's history (`capture-pane -S -200`), besides its screen. */
+export const PANE_HISTORY_LINES = 200
+
+/** How many of a transcript's last whole lines are kept. */
+export const TRANSCRIPT_TAIL_LINES = 200
+
+/** The test user's Claude Code projects dir: one subdirectory of transcripts per working directory. */
+export const CONTAINER_CLAUDE_PROJECTS_DIR = `${CONTAINER_HOME}/.claude/projects`
+
+/**
+ * The name of the directory under `~/.claude/projects/` where Claude Code
+ * keeps the transcripts of a session run in `dir`: the absolute path with
+ * every character but an ASCII letter or digit replaced by `-`
+ * (`/home/testuser/cscb-live/a` → `-home-testuser-cscb-live-a`). Claude Code
+ * shortens a name over 200 characters; a persona's working directory here is
+ * far shorter.
+ */
+export function claudeProjectSlug(dir: string): string {
+  return dir.replace(/[^A-Za-z0-9]/g, '-')
+}
+
+/** One persona's session: where its pane and its transcript are read, and the names of their copies. */
+export interface PersonaCapture {
+  /** The persona key (`persona_a` …). */
+  key: string
+  /** Its tmux session, `slack_bot_<key>`. */
+  session: string
+  /** Its working directory in the container (`~/cscb-live/<letter>`). */
+  workingDirectory: string
+  /** The Claude Code project dir of that working directory, where its transcripts are. */
+  transcriptDir: string
+  /** The pane's copy in container-logs/. */
+  paneCopy: string
+  /** The transcript tail's copy in container-logs/. */
+  transcriptCopy: string
+}
+
+/** The four personas A–D, in order. */
+export const PERSONA_CAPTURES: readonly PersonaCapture[] = PERSONA_LETTERS.map((letter) => {
+  const key = personaName(letter)
+  const workingDirectory = `${CONTAINER_CSCB_LIVE_DIR}/${letter}`
+  return {
+    key,
+    session: `slack_bot_${key}`,
+    workingDirectory,
+    transcriptDir: `${CONTAINER_CLAUDE_PROJECTS_DIR}/${claudeProjectSlug(workingDirectory)}`,
+    paneCopy: `pane-${key}.txt`,
+    transcriptCopy: `transcript-${key}.jsonl`,
+  }
+})
+
+/** Prints the name of every tmux session (`tmux ls`), one per line. With no tmux server running, tmux's own error and exit 1. */
+export const LIST_SESSIONS_SCRIPT = 'tmux ls -F "#{session_name}"'
+
+/**
+ * Captures the pane of the tmux session $1 (`tmux capture-pane -p -J -S
+ * -$3`: the last $3 lines of its history and its screen, the lines tmux
+ * wrapped at the pane's width joined) into a private temp file, removed on
+ * exit, and prints it as
+ * READ_LOG_SCRIPT prints a file, at most its last $2 bytes. Only reads:
+ * never a key sent, never a session changed. Exit 3: no such session (gone
+ * since `tmux ls`); 7: the capture failed.
+ */
+export const CAPTURE_PANE_SCRIPT = [
+  's=$1; n=$2; h=$3',
+  'tmux has-session -t "$s" 2>/dev/null || exit 3',
+  'd=$(mktemp -d) || exit 7',
+  'trap \'rm -rf -- "$d"\' EXIT',
+  'f=$d/pane',
+  'tmux capture-pane -p -J -S "-$h" -t "$s" > "$f" 2>/dev/null || exit 7',
+  ...PRINT_TAIL,
+].join('\n')
+
+/**
+ * Reads the newest transcript in the Claude Code project dir $1: of the
+ * entries directly in it named `*.jsonl` with a plain name (letters, digits,
+ * `.`, `_`, `-`), the regular file (never a symlink, never one in a
+ * subdirectory, as a subagent's is) modified last. Prints its name on a
+ * first line, then the file as READ_LOG_SCRIPT prints it, at most its last
+ * $2 bytes. Exit 3: no such directory, or no transcript in it; 4: the
+ * directory is a symlink (never followed); 5 and 6: as READ_LOG_SCRIPT.
+ */
+export const READ_TRANSCRIPT_SCRIPT = [
+  'p=$1; n=$2',
+  'if [ -L "$p" ]; then exit 4; fi',
+  'cd -- "$p" 2>/dev/null || exit 3',
+  "f=''",
+  'for c in *.jsonl; do',
+  '  case $c in *[!A-Za-z0-9._-]*) continue ;; esac',
+  '  if [ -f "$c" ] && [ ! -L "$c" ] && { [ -z "$f" ] || [ "$c" -nt "$f" ]; }; then f=$c; fi',
+  'done',
+  'if [ -z "$f" ]; then exit 3; fi',
+  'if [ ! -r "$f" ]; then exit 6; fi',
+  'printf \'%s\\n\' "$f"',
+  ...PRINT_TAIL,
+].join('\n')
+
+/** The argv that lists the container's tmux sessions. */
+export function listSessionsArgv(): string[] {
+  return ['bash', '-c', LIST_SESSIONS_SCRIPT, 'sessions']
+}
+
+/** The argv that captures one session's pane (the session, the cap and the history as arguments, never in the script). */
+export function capturePaneArgv(session: string, maxBytes: number): string[] {
+  return ['bash', '-c', CAPTURE_PANE_SCRIPT, 'pane', session, String(maxBytes), String(PANE_HISTORY_LINES)]
+}
+
+/** The argv that reads the newest transcript in one project dir (the dir and the cap as arguments, never in the script). */
+export function readTranscriptArgv(dir: string, maxBytes: number): string[] {
+  return ['bash', '-c', READ_TRANSCRIPT_SCRIPT, 'transcript', dir, String(maxBytes)]
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +403,46 @@ export function wholeLines(content: string, cut: number): WholeLines {
 }
 
 // ---------------------------------------------------------------------------
+// Reading the sessions, a pane and a transcript
+// ---------------------------------------------------------------------------
+
+/** The session names `LIST_SESSIONS_SCRIPT` printed; no tmux server running is no session. A string: why they could not be listed. */
+export function parseSessionList(r: ProcResult): Set<string> | string {
+  if (r.timedOut) return execFailure(r)
+  if (r.code === 0) return new Set(r.stdout.split('\n').map((s) => s.trim()).filter(Boolean))
+  if (TMUX_NO_SERVER_RE.test(r.stderr)) return new Set()
+  return execFailure(r)
+}
+
+/** What one `CAPTURE_PANE_SCRIPT` exec came to: as a file's read, the capture read as the file. */
+export function parsePaneRead(r: ProcResult): LogRead {
+  if (!r.timedOut && r.code === 7) return { kind: 'failed', reason: 'tmux capture-pane failed' }
+  return parseLogRead(r)
+}
+
+/** A transcript's name, as READ_TRANSCRIPT_SCRIPT picks it (and so its copy's path can name it). */
+const TRANSCRIPT_NAME_RE = /^[A-Za-z0-9._-]{1,250}\.jsonl$/
+
+/** What one `READ_TRANSCRIPT_SCRIPT` exec came to: the transcript it picked (`null`: none), and its read. */
+export function parseTranscriptRead(r: ProcResult): { name: string | null; read: LogRead } {
+  if (!r.timedOut && r.code === 4) return { name: null, read: { kind: 'skipped', reason: 'its directory is a symlink (never followed)' } }
+  if (r.timedOut || r.code !== 0) return { name: null, read: parseLogRead(r) }
+  const nl = r.stdout.indexOf('\n')
+  const name = nl === -1 ? '' : r.stdout.slice(0, nl)
+  if (!TRANSCRIPT_NAME_RE.test(name)) return { name: null, read: { kind: 'failed', reason: 'no transcript name line' } }
+  return { name, read: parseLogRead({ ...r, stdout: r.stdout.slice(nl + 1) }) }
+}
+
+/** The last `max` of the whole lines in `text` (each ending with its line break), and how many before them were left out. */
+export function lastLines(text: string, max: number): { text: string; older: number } {
+  const lines = text.split('\n')
+  // `text` is whole lines: the split's last element is the empty string after the final break.
+  const whole = lines.length - 1
+  if (whole <= max) return { text, older: 0 }
+  return { text: `${lines.slice(whole - max, whole).join('\n')}\n`, older: whole - max }
+}
+
+// ---------------------------------------------------------------------------
 // The rotated server logs
 // ---------------------------------------------------------------------------
 
@@ -276,6 +492,8 @@ export type LogOutcome =
       cap: number
       /** The bytes of its unterminated last line, left out (0: it ended with a line break). */
       unterminated: number
+      /** A transcript's whole lines left out before its last `TRANSCRIPT_TAIL_LINES` (set only for a transcript). */
+      older?: number
     })
   | (ContainerLogFile & { status: 'missing' })
   | (ContainerLogFile & { status: 'skipped' | 'failed'; reason: string })
@@ -307,7 +525,11 @@ export interface CollectOptions {
   sink: ContainerLogsSink
   /** False from the moment nothing more may be written (the closing scan is about to read the results). */
   writable: () => boolean
+  /** A log's cap (default `CONTAINER_LOG_MAX_BYTES`). */
   maxBytes?: number
+  /** A pane's or a transcript's cap (default `SESSION_CAPTURE_MAX_BYTES`). */
+  sessionMaxBytes?: number
+  /** A file read's time limit (default `CONTAINER_LOG_EXEC_TIMEOUT_MS`); a tmux exec's is the smaller of it and `TMUX_EXEC_TIMEOUT_MS`. */
   execTimeoutMs?: number
 }
 
@@ -317,10 +539,11 @@ const NOT_WRITTEN = 'the results were already being written'
 export function describeLogOutcome(o: LogOutcome): string {
   switch (o.status) {
     case 'copied': {
+      const older = o.older ? `; its last ${TRANSCRIPT_TAIL_LINES} lines, ${o.older} older left out` : ''
       const tail = o.unterminated > 0 ? `; its unterminated last line (${o.unterminated} bytes, perhaps still being written) left out` : ''
       return o.cut
-        ? `${o.name}: cut: its last ${formatBytes(o.kept)} (${o.kept} of ${o.size} bytes), from the first whole line within the ${formatBytes(o.cap)} cap${tail} (${o.path})`
-        : `${o.name}: copied, ${o.kept} bytes${tail} (${o.path})`
+        ? `${o.name}: cut: its last ${formatBytes(o.kept)} (${o.kept} of ${o.size} bytes), from the first whole line within the ${formatBytes(o.cap)} cap${older}${tail} (${o.path})`
+        : `${o.name}: copied, ${o.kept} bytes${older}${tail} (${o.path})`
     }
     case 'missing':
       return `${o.name}: not there (${o.path})`
@@ -335,44 +558,130 @@ export function describeLogOutcome(o: LogOutcome): string {
 export function summarizeLogOutcomes(outcomes: readonly LogOutcome[], dir: string): string {
   const count = (status: LogOutcome['status']): number => outcomes.filter((o) => o.status === status).length
   const cut = outcomes.filter((o) => o.status === 'copied' && o.cut).length
+  const copiedOf = (names: readonly string[]): number => outcomes.filter((o) => o.status === 'copied' && names.includes(o.name)).length
+  const panes = copiedOf(PERSONA_CAPTURES.map((p) => p.paneCopy))
+  const transcripts = copiedOf(PERSONA_CAPTURES.map((p) => p.transcriptCopy))
   return (
     `container logs: ${count('copied')} copied${cut > 0 ? ` (${cut} cut to its last whole lines within the cap)` : ''}, ` +
-    `${count('missing')} not there, ${count('skipped')} skipped, ${count('failed')} not copied, in ${dir} (${CONTAINER_LOGS_INDEX} lists each)`
+    `${count('missing')} not there, ${count('skipped')} skipped, ${count('failed')} not copied ` +
+    `(tmux panes: ${panes} of ${PERSONA_CAPTURES.length}; transcript tails: ${transcripts} of ${PERSONA_CAPTURES.length}), in ${dir} (${CONTAINER_LOGS_INDEX} lists each)`
   )
 }
 
-async function copyOne(file: ContainerLogFile, o: CollectOptions, maxBytes: number, timeoutMs: number): Promise<LogOutcome> {
-  if (!o.writable()) return { ...file, status: 'failed', reason: NOT_WRITTEN }
-  let r: ProcResult
+/** Run one read in the container; a throw is described, never thrown on. */
+async function execRead(o: CollectOptions, argv: string[], timeoutMs: number): Promise<ProcResult | { thrown: string }> {
   try {
-    r = await o.container.exec(readLogArgv(file.path, maxBytes), { timeoutMs })
+    return await o.container.exec(argv, { timeoutMs })
   } catch (err) {
-    return { ...file, status: 'failed', reason: describeError(err) }
+    return { thrown: describeError(err) }
   }
-  const read = parseLogRead(r)
+}
+
+/**
+ * What a copy is: a log (redacted as one text), a pane (through the
+ * redactor's wrap-aware pass too) or a transcript tail (its last
+ * TRANSCRIPT_TAIL_LINES whole lines, through the same pass).
+ */
+type CopyKind = 'log' | 'pane' | 'transcript'
+
+/**
+ * Keep the whole lines of what one read came to (a transcript's last
+ * TRANSCRIPT_TAIL_LINES), redact them and write the copy; the outcome.
+ */
+function keepCopy(file: ContainerLogFile, read: LogRead, o: CollectOptions, cap: number, kind: CopyKind): LogOutcome {
   if (read.kind === 'missing') return { ...file, status: 'missing' }
   if (read.kind !== 'read') return { ...file, status: read.kind, reason: read.reason }
-  const kept = wholeLines(read.content, read.cut)
-  // Redacted whole, not line by line: a registered value spanning a line break is masked too.
-  const copy = o.redactor.redact(kept.text)
+  const whole = wholeLines(read.content, read.cut)
+  const kept = kind === 'transcript' ? lastLines(whole.text, TRANSCRIPT_TAIL_LINES) : { text: whole.text, older: 0 }
+  // Redacted whole, not line by line: a registered value spanning a line break is masked too;
+  // in a pane or a transcript also its fragments, and a value Claude Code's hard wrap split (redactWrapped).
+  const copy = kind === 'log' ? o.redactor.redact(kept.text) : o.redactor.redactWrapped(kept.text)
   if (!o.writable()) return { ...file, status: 'failed', reason: NOT_WRITTEN }
   try {
     o.sink.write(file.name, copy)
   } catch (err) {
     return { ...file, status: 'failed', reason: `could not be written: ${describeError(err)}` }
   }
-  return { ...file, status: 'copied', size: read.size, kept: Buffer.byteLength(kept.text), cut: read.cut > 0, cap: maxBytes, unterminated: kept.unterminated }
+  return {
+    ...file,
+    status: 'copied',
+    size: read.size,
+    kept: Buffer.byteLength(kept.text),
+    cut: read.cut > 0,
+    cap,
+    unterminated: whole.unterminated,
+    ...(kind === 'transcript' ? { older: kept.older } : {}),
+  }
+}
+
+async function copyOne(file: ContainerLogFile, o: CollectOptions, maxBytes: number, timeoutMs: number): Promise<LogOutcome> {
+  if (!o.writable()) return { ...file, status: 'failed', reason: NOT_WRITTEN }
+  const r = await execRead(o, readLogArgv(file.path, maxBytes), timeoutMs)
+  if ('thrown' in r) return { ...file, status: 'failed', reason: r.thrown }
+  return keepCopy(file, parseLogRead(r), o, maxBytes, 'log')
+}
+
+/** `ms` as whole seconds, for an outcome's reason. */
+function seconds(ms: number): string {
+  return `${Math.round(ms / 1000)} s`
+}
+
+interface ListedSessions {
+  /** The session names; `null` when they were not listed, so every pane is tried (unless `stuck`). */
+  sessions: Set<string> | null
+  /** Why no pane is captured: `tmux ls` timed out (a stuck tmux, not one with no server running). */
+  stuck: string | null
+  /** An outcome when the sessions could not be listed but every pane is still tried. */
+  notes: LogOutcome[]
+}
+
+/** The container's tmux sessions, within `timeoutMs` (TMUX_EXEC_TIMEOUT_MS). */
+async function listSessions(o: CollectOptions, timeoutMs: number): Promise<ListedSessions> {
+  const all: ContainerLogFile = { name: 'pane-*.txt', path: 'tmux ls' }
+  const r = await execRead(o, listSessionsArgv(), timeoutMs)
+  if (!('thrown' in r) && r.timedOut) return { sessions: null, stuck: `tmux ls did not answer within ${seconds(timeoutMs)}`, notes: [] }
+  const listed = 'thrown' in r ? r.thrown : parseSessionList(r)
+  if (typeof listed !== 'string') return { sessions: listed, stuck: null, notes: [] }
+  return { sessions: null, stuck: null, notes: [{ ...all, status: 'failed', reason: `the tmux sessions could not be listed (${listed}); each persona's pane was tried` }] }
+}
+
+/**
+ * One persona's pane, within `timeoutMs` (TMUX_EXEC_TIMEOUT_MS): not there
+ * when `tmux ls` did not list its session, not captured once tmux is stuck
+ * (`stuck`); and whether its capture timed out.
+ */
+async function capturePane(
+  p: PersonaCapture,
+  listed: { sessions: Set<string> | null; stuck: string | null },
+  o: CollectOptions,
+  cap: number,
+  timeoutMs: number,
+): Promise<{ outcome: LogOutcome; timedOut: boolean }> {
+  const file: ContainerLogFile = { name: p.paneCopy, path: `tmux session ${p.session}` }
+  const done = (outcome: LogOutcome, timedOut = false) => ({ outcome, timedOut })
+  if (listed.sessions !== null && !listed.sessions.has(p.session)) return done({ ...file, status: 'missing' })
+  if (listed.stuck !== null) return done({ ...file, status: 'failed', reason: `not captured: ${listed.stuck}` })
+  if (!o.writable()) return done({ ...file, status: 'failed', reason: NOT_WRITTEN })
+  const r = await execRead(o, capturePaneArgv(p.session, cap), timeoutMs)
+  if ('thrown' in r) return done({ ...file, status: 'failed', reason: r.thrown })
+  return done(keepCopy(file, parsePaneRead(r), o, cap, 'pane'), r.timedOut)
+}
+
+/** One persona's transcript tail: its last `TRANSCRIPT_TAIL_LINES` whole lines, the copy's path naming the transcript read. */
+async function copyTranscript(p: PersonaCapture, o: CollectOptions, cap: number, timeoutMs: number): Promise<LogOutcome> {
+  const file: ContainerLogFile = { name: p.transcriptCopy, path: `${p.transcriptDir}/*.jsonl` }
+  if (!o.writable()) return { ...file, status: 'failed', reason: NOT_WRITTEN }
+  const r = await execRead(o, readTranscriptArgv(p.transcriptDir, cap), timeoutMs)
+  if ('thrown' in r) return { ...file, status: 'failed', reason: r.thrown }
+  const { name, read } = parseTranscriptRead(r)
+  return keepCopy(name === null ? file : { ...file, path: `${p.transcriptDir}/${name}` }, read, o, cap, 'transcript')
 }
 
 /** The rotated server logs to copy, and an outcome for any listed entry that is not copied. */
 async function listRotated(o: CollectOptions, timeoutMs: number): Promise<{ files: ContainerLogFile[]; notes: LogOutcome[] }> {
   const all: ContainerLogFile = { name: 'server.log.*', path: `${CONTAINER_STATE_DIR}/server.log.*` }
-  let r: ProcResult
-  try {
-    r = await o.container.exec(listRotatedArgv(), { timeoutMs })
-  } catch (err) {
-    return { files: [], notes: [{ ...all, status: 'failed', reason: `the rotated server logs could not be listed: ${describeError(err)}` }] }
-  }
+  const r = await execRead(o, listRotatedArgv(), timeoutMs)
+  if ('thrown' in r) return { files: [], notes: [{ ...all, status: 'failed', reason: `the rotated server logs could not be listed: ${r.thrown}` }] }
   if (r.timedOut || r.code !== 0) {
     return { files: [], notes: [{ ...all, status: 'failed', reason: `the rotated server logs could not be listed (${execFailure(r)})` }] }
   }
@@ -384,21 +693,36 @@ async function listRotated(o: CollectOptions, timeoutMs: number): Promise<{ file
 }
 
 /**
- * Copy every log file out of the container, one at a time, then write
- * index.txt. Only one file is held at once, as a few strings of at most
- * about the cap each (what was read, its whole lines and their redacted
- * copy). Never throws: every failure is an outcome.
+ * Copy the personas' panes, then every log file, then the personas'
+ * transcript tails out of the container, one at a time, then write
+ * index.txt. The panes come first: a session dies with the container (or a
+ * watchdog stop's bound running out), the files only then; server.log next,
+ * the transcripts, ordinary files too, last. A tmux exec gets at most
+ * TMUX_EXEC_TIMEOUT_MS, and once one times out no further pane is captured.
+ * Only one file is held at once, as a few strings of at most about its cap
+ * each (what was read, its whole lines and their redacted copy). Never
+ * throws: every failure is an outcome.
  */
 export async function collectContainerLogs(o: CollectOptions): Promise<LogOutcome[]> {
   const maxBytes = o.maxBytes ?? CONTAINER_LOG_MAX_BYTES
+  const sessionCap = o.sessionMaxBytes ?? SESSION_CAPTURE_MAX_BYTES
   const timeoutMs = o.execTimeoutMs ?? CONTAINER_LOG_EXEC_TIMEOUT_MS
-  const rotated = await listRotated(o, timeoutMs)
+  const tmuxTimeoutMs = Math.min(TMUX_EXEC_TIMEOUT_MS, timeoutMs)
   const outcomes: LogOutcome[] = []
+  const listed = await listSessions(o, tmuxTimeoutMs)
+  let stuck = listed.stuck
+  for (const p of PERSONA_CAPTURES) {
+    const pane = await capturePane(p, { sessions: listed.sessions, stuck }, o, sessionCap, tmuxTimeoutMs)
+    outcomes.push(pane.outcome)
+    if (pane.timedOut) stuck = `the capture of ${p.paneCopy} did not answer within ${seconds(tmuxTimeoutMs)}`
+  }
+  const rotated = await listRotated(o, timeoutMs)
   for (const file of [SERVER_LOG, ...rotated.files, ...OTHER_LOG_FILES]) outcomes.push(await copyOne(file, o, maxBytes, timeoutMs))
-  outcomes.push(...rotated.notes)
+  for (const p of PERSONA_CAPTURES) outcomes.push(await copyTranscript(p, o, sessionCap, timeoutMs))
+  outcomes.push(...listed.notes, ...rotated.notes)
   if (o.writable()) {
     const index = [
-      `The test container's own logs, copied before it was removed or stopped: each redacted, each file at most its last ${formatBytes(maxBytes)}, whole lines only (a partial first line at a cut and an unterminated last line left out).`,
+      indexHeader(maxBytes, sessionCap),
       ...outcomes.map(describeLogOutcome),
       '',
     ].join('\n')
@@ -409,6 +733,18 @@ export async function collectContainerLogs(o: CollectOptions): Promise<LogOutcom
     }
   }
   return outcomes
+}
+
+/** index.txt's first line: what the copies are, and the rules each follows. */
+export function indexHeader(maxBytes: number, sessionCap: number): string {
+  return (
+    "The test container's own logs, and each persona's tmux pane and Claude transcript tail, copied before it was removed or stopped, each redacted: " +
+    `a pane is \`tmux capture-pane -p -J -S -${PANE_HISTORY_LINES}\` (its last ${PANE_HISTORY_LINES} lines of history and its screen; -J joins only the lines tmux wrapped at the pane's width, not Claude Code's own hard wraps), ` +
+    `a transcript the last ${TRANSCRIPT_TAIL_LINES} lines of the newest *.jsonl in the persona's Claude Code project dir; ` +
+    `in a pane or a transcript, every fragment of ${MIN_FRAGMENT_LENGTH} or more characters of a registered value is masked too, and a registered value or a token a row break with indentation or a border split, in each piece; ` +
+    `a log at most its last ${formatBytes(maxBytes)}, a pane or a transcript at most its last ${formatBytes(sessionCap)}; ` +
+    'whole lines only (a partial first line at a cut and an unterminated last line left out).'
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +783,7 @@ export interface CollectorDeps {
   sink: ContainerLogsSink
   log: Pick<RunLog, 'info' | 'detail' | 'error'>
   maxBytes?: number
+  sessionMaxBytes?: number
   execTimeoutMs?: number
   /** The timer a caller's wait runs on (default: the real one). */
   clock?: CollectorClock
@@ -505,6 +842,7 @@ export class ContainerLogCollector {
         sink: this.deps.sink,
         writable: () => !this.sealed,
         maxBytes: this.deps.maxBytes,
+        sessionMaxBytes: this.deps.sessionMaxBytes,
         execTimeoutMs: this.deps.execTimeoutMs,
       })
       this.result = outcomes

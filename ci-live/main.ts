@@ -18,12 +18,17 @@
  *
  * Before the container is removed or stopped, on every path (Teardown, a
  * failed container start, the cleanup after a signal or the memory
- * watchdog's stop, --keep-container included), its own logs (CSCB's
+ * watchdog's stop, --keep-container included), each persona's tmux pane
+ * (first, while its session lives), the container's own logs (CSCB's
  * server.log and rotated generations, startup-errors.log, cron.log and
  * permission trail, the boot start's boot-start.log, agent-director's
- * errors.log and ad-trail.jsonl) are copied, redacted, capped and cut to
- * whole lines, into container-logs/ (lib/container-logs.ts), once per run. The closing scan covers them; a failure to copy is logged and
- * changes no verdict. A memory watchdog stop waits for the copy only briefly.
+ * errors.log and ad-trail.jsonl) and each persona's Claude transcript tail
+ * are copied, redacted (a pane and a transcript also across Claude Code's
+ * own hard wraps, which `tmux capture-pane -J` does not join), capped and
+ * cut to whole lines, into container-logs/ (lib/container-logs.ts), once
+ * per run. The closing scan covers them; a
+ * failure to copy is logged and changes no verdict. A memory watchdog stop
+ * waits for the copy only briefly.
  *
  * `mailbox --latest` and `mailbox --forwarding` are separate: they take no
  * lock, make no results dir and write no run.log; they only read the test
@@ -68,6 +73,9 @@ import { parseArgs, UsageError, USAGE, type RunOptions } from './lib/args.ts'
 import type { BrowserDriver, BrowserStats } from './lib/browser-types.ts'
 import type { ContainerExec } from './lib/container.ts'
 import {
+  claudeProjectSlug,
+  CONTAINER_CLAUDE_PROJECTS_DIR,
+  CONTAINER_CSCB_LIVE_DIR,
   CONTAINER_LOG_MAX_BYTES,
   CONTAINER_LOGS_DIR,
   CONTAINER_LOGS_INDEX,
@@ -75,7 +83,13 @@ import {
   CONTAINER_LOGS_WAIT_MS,
   ContainerLogCollector,
   containerLogsSink,
+  describeLogOutcome,
   DRY_RUN_CONTAINER_LOG_MAX_BYTES,
+  PANE_HISTORY_LINES,
+  PERSONA_CAPTURES,
+  TRANSCRIPT_TAIL_LINES,
+  type LogOutcome,
+  type PersonaCapture,
 } from './lib/container-logs.ts'
 import { claudeEnvProblem, CONTAINER_CREDENTIALS_DIR, describeContainerEnd, type ContainerEnd, type ContainerStats } from './lib/docker.ts'
 import { describeError, EXIT_FAIL, EXIT_NOT_RUNNABLE, EXIT_PASS } from './lib/errors.ts'
@@ -538,10 +552,20 @@ function dryRunAdoptionEvidence(ws: Workspace, report: ProvisionReport, seeded: 
 
 /** Dry run only: what `seedDryRunContainerLogs` planted, for `dryRunContainerLogsCheck`. */
 interface ContainerLogsSeed {
-  /** A fixture value registered with the redactor (not token-shaped), planted in server.log and the permission trail. */
+  /** A fixture value registered with the redactor (not token-shaped), planted in server.log, the permission trail, A's pane and A's transcript. */
   secret: string
   /** server.log.1's unterminated last line (as a line mid-write): it holds the first half of `secret`, which no redactor knows. */
   unterminated: string
+  /** A's planted transcript (its path in the container), and its unterminated last line, which holds the first half of `secret` too. */
+  transcript: { path: string; unterminated: string }
+  /** What A's pane shows hard-wrapped, as Claude Code wraps a long line itself (`dryPaneWrappedRows`). */
+  wrapped: DryWrapped
+}
+
+/** A token-shaped fixture no redactor knows, and a registered fixture value (not token-shaped), each shown split across rows in A's pane. */
+interface DryWrapped {
+  token: string
+  secret: string
 }
 
 /** The fixture line every planted server log holds. */
@@ -558,6 +582,122 @@ function dryCronLine(n: number): string {
   return `dry-run fixture cron.log line ${String(n).padStart(9, '0')} .........`
 }
 
+/** The persona whose pane and transcript the dry run plants (A); B, C and D get none, so theirs are noted as not there. */
+const DRY_SESSION = PERSONA_CAPTURES[0] as PersonaCapture
+
+/** The pane fixture's first line. */
+const DRY_PANE_MARKER = 'dry-run fixture: the tmux pane of the container-logs self-test'
+
+/** The fixture pane's width, and the padding before the secret on one of its lines: the pane wraps that line inside the secret. */
+const DRY_PANE_WIDTH = 80
+const DRY_PANE_PAD = 'x'.repeat(60)
+
+/** The pane fixture's last line: the fixture session is ready once its pane shows it. */
+const DRY_PANE_END = '(fixture) end of the tmux pane of the container-logs self-test'
+
+/**
+ * A's pane rows that split the token and the secret as Claude Code's hard
+ * wrap does: a line break, then indentation (spaces, `  ⎿  `) or a `│ `
+ * border. Once in the middle of each, once inside the token's prefix and
+ * once before the secret's last 6 characters (a piece too short to be a
+ * fragment by itself). `masked`: each row as the copy must show it, every
+ * piece masked. Each row is shorter than the pane, so tmux wraps none of them
+ * (a row after a split token starts with `(`, not a token character).
+ */
+function dryPaneWrappedRows(w: DryWrapped): { raw: string[]; masked: string[]; pieces: string[] } {
+  const { token: t, secret: s } = w
+  const rows: Array<[string, string, boolean]> = [
+    ['(fixture) hard-wrapped token: ', t.slice(0, 25), false],
+    ['      ', t.slice(25), false],
+    ['│ (fixture) hard-wrapped secret: ', s.slice(0, 25), true],
+    ['│ ', s.slice(25), true],
+    ['(fixture) a token wrapped inside its prefix: ', t.slice(0, 2), false],
+    ['│ ', t.slice(2), false],
+    ['(fixture) short tail: ', s.slice(0, -6), true],
+    ['  ⎿  ', s.slice(-6), true],
+  ]
+  return {
+    raw: [...rows.map(([lead, piece]) => `${lead}${piece}`), DRY_PANE_END],
+    masked: [...rows.map(([lead, , secret]) => `${lead}${secret ? REDACTED_SECRET : REDACTED_TOKEN}`), DRY_PANE_END],
+    pieces: rows.map(([, piece]) => piece),
+  }
+}
+
+/** A's planted transcript: this many whole lines (the copy keeps the last TRANSCRIPT_TAIL_LINES), then an unterminated one. */
+const DRY_TRANSCRIPT_LINES = 250
+
+/** What each transcript that must not be picked holds (an older one, a subagent's, the parent working directory's). */
+const DRY_TRANSCRIPT_DECOY = 'dry-run fixture: not the persona transcript to copy'
+
+/** Line `n` of A's planted transcript; the last one holds `extra`. */
+function dryTranscriptLine(n: number, extra = ''): string {
+  return JSON.stringify({ type: 'fixture', n, cwd: DRY_SESSION.workingDirectory, ...(extra ? { message: extra } : {}) })
+}
+
+/**
+ * Plants, in the container, A's tmux session and transcripts; the planted
+ * transcript's path and its unterminated last line.
+ *
+ * - The session `slack_bot_persona_a`, 80 columns wide, shows a marker line,
+ *   the secret, a line padded so the pane wraps it inside the secret, a
+ *   token-shaped string, then the token and the secret of `wrapped` split
+ *   across rows as Claude Code hard-wraps a long line (`dryPaneWrappedRows`).
+ * - A's project dir holds the transcript to copy (DRY_TRANSCRIPT_LINES whole
+ *   lines, the secret and the token-shaped string in the last, then an
+ *   unterminated line holding the secret's first half), modified 10 minutes
+ *   ago; beside it an older transcript, a newer one in a subagent's
+ *   subdirectory and a symlink named `*.jsonl` to a decoy transcript outside
+ *   it, which is newer (touched now, and checked: `-nt` follows a symlink,
+ *   so a target older than the transcript to copy would prove nothing). The
+ *   parent working directory's project dir (`~/cscb-live`, whose slug A's
+ *   starts with) holds a newer one.
+ */
+async function seedDryRunSessions(tc: ContainerExec, secret: string, tokenShaped: string, wrapped: DryWrapped): Promise<ContainerLogsSeed['transcript']> {
+  const dir = DRY_SESSION.transcriptDir
+  const parentDir = `${CONTAINER_CLAUDE_PROJECTS_DIR}/${claudeProjectSlug(CONTAINER_CSCB_LIVE_DIR)}`
+  const name = `${randomUUID()}.jsonl`
+  const subagent = `${dir}/${randomUUID()}/subagents/agent-fixture.jsonl`
+  const linkTarget = `${CONTAINER_CSCB_LIVE_DIR}/dry-run-symlinked-transcript.jsonl`
+  const decoys = [`${dir}/older-${name}`, subagent, `${parentDir}/${name}`, linkTarget]
+  const panePath = `${CONTAINER_CSCB_LIVE_DIR}/dry-run-pane-fixture.txt`
+  const made = await tc.exec(['bash', '-c', 'mkdir -p -- "$@"', 'mkdir', dir, dirname(subagent), parentDir])
+  if (made.code !== 0) throw new Error(`the transcripts' fixture dirs could not be made (exit ${made.code})`)
+  const unterminated = `{"type":"fixture-mid-write","message":"${secret.slice(0, Math.ceil(secret.length / 2))}`
+  const lines = Array.from({ length: DRY_TRANSCRIPT_LINES }, (_, i) =>
+    dryTranscriptLine(i + 1, i + 1 === DRY_TRANSCRIPT_LINES ? `fixture secret: ${secret}; fixture token-shaped text: ${tokenShaped}` : ''),
+  )
+  await tc.writeFile(`${dir}/${name}`, `${lines.join('\n')}\n${unterminated}`, '600')
+  for (const decoy of decoys) await tc.writeFile(decoy, `${JSON.stringify({ type: 'fixture', message: DRY_TRANSCRIPT_DECOY })}\n`, '600')
+  const pane = [DRY_PANE_MARKER, `fixture secret: ${secret}`, `${DRY_PANE_PAD}${secret}`, `fixture token-shaped text: ${tokenShaped}`, ...dryPaneWrappedRows(wrapped).raw]
+  await tc.writeFile(panePath, `${pane.join('\n')}\n`, '600')
+  const r = await tc.exec([
+    'bash',
+    '-c',
+    [
+      'set -e',
+      'touch -d "10 minutes ago" -- "$1"; touch -d "1 hour ago" -- "$2"; touch -- "$3"',
+      'ln -s -- "$3" "$4"',
+      // -nt follows the symlink: its target must be newer than the transcript to copy, or skipping the symlink proves nothing.
+      '[ "$4" -nt "$1" ] || exit 3',
+      'tmux new-session -d -s "$5" -x "$6" -y 24 bash -c \'cat -- "$1"; exec sleep infinity\' pane-fixture "$7"',
+      'for i in $(seq 1 50); do if tmux capture-pane -p -t "$5" | grep -qF -- "$8"; then exit 0; fi; sleep 0.1; done',
+      'exit 1',
+    ].join('\n'),
+    'seed-sessions',
+    `${dir}/${name}`,
+    decoys[0] as string,
+    linkTarget,
+    `${dir}/link-to-newer-transcript.jsonl`,
+    DRY_SESSION.session,
+    String(DRY_PANE_WIDTH),
+    panePath,
+    DRY_PANE_END,
+  ])
+  if (r.code === 3) throw new Error('the symlinked decoy transcript is not newer than the one to copy: skipping it would prove nothing')
+  if (r.code !== 0) throw new Error(`the fixture tmux session and transcript times could not be planted (exit ${r.code})`)
+  return { path: `${dir}/${name}`, unterminated }
+}
+
 /**
  * Dry run only, after the plan's checks (S2 and 29a have read the state dir)
  * and before Teardown copies the container's logs: a server.log holding a
@@ -565,12 +705,16 @@ function dryCronLine(n: number): string {
  * server.log.1 ending in an unterminated line that holds the first half of
  * the secret, a server.log.2 that is a symlink to A's credentials file, a
  * permission trail holding the secret, and a cron.log over the dry run's cap.
- * startup-errors.log stays missing.
+ * startup-errors.log stays missing. Then A's tmux session and transcripts
+ * (`seedDryRunSessions`), its pane also showing a second token-shaped string
+ * and a second registered value hard-wrapped.
  */
 async function seedDryRunContainerLogs(tc: ContainerExec, redactor: Redactor): Promise<ContainerLogsSeed> {
   const secret = `dry-run-log-secret-${randomUUID()}`
   redactor.addSecret(secret)
   const tokenShaped = `${['xox', 'b-'].join('')}1234567890-1234567890-${'B'.repeat(24)}`
+  const wrapped: DryWrapped = { token: `${['xox', 'b-'].join('')}2345678901-2345678901-${'C'.repeat(24)}`, secret: `dry-run-wrap-${randomUUID()}` }
+  redactor.addSecret(wrapped.secret)
   const unterminated = `fixture line mid-write: ${secret.slice(0, Math.ceil(secret.length / 2))}`
   const s = CONTAINER_STATE_DIR
   await tc.writeFile(`${s}/server.log`, `${DRY_LOG_MARKER}\nfixture secret: ${secret}\nfixture token-shaped text: ${tokenShaped}\n`, '600')
@@ -587,7 +731,59 @@ async function seedDryRunContainerLogs(tc: ContainerExec, redactor: Redactor): P
     `${s}/cron.log`,
   ])
   if (r.code !== 0) throw new Error(`the symlinked server.log.2 and the oversized cron.log could not be planted (exit ${r.code})`)
-  return { secret, unterminated }
+  return { secret, unterminated, wrapped, transcript: await seedDryRunSessions(tc, secret, tokenShaped, wrapped) }
+}
+
+/**
+ * Dry run only: A's pane and transcript tail in Teardown's copy; the
+ * evidence. The pane: captured, the line tmux wrapped at the pane's width
+ * inside the secret joined into one line by -J and the secret masked there
+ * too (no half of it left), the token-shaped text masked, and the rows that
+ * split the second token and the second secret as Claude Code's hard wrap
+ * does (which -J can't join) each masked, no piece of either left. The
+ * transcript: the planted one (not the older one, the subagent's, the
+ * symlink or the parent directory's), its last TRANSCRIPT_TAIL_LINES whole
+ * lines exactly, the secret and the token-shaped text masked, its
+ * unterminated last line left out. B's, C's and D's noted as not there.
+ */
+function dryRunSessionCopiesEvidence(seed: ContainerLogsSeed, outcomes: readonly LogOutcome[], copy: (name: string) => string, index: string): string[] {
+  const outcome = (name: string) => outcomes.find((o) => o.name === name)
+  const masked = (text: string): boolean =>
+    !text.includes(seed.secret) && !text.includes(seed.secret.slice(0, 20)) && !text.includes(seed.secret.slice(-20)) && text.includes(REDACTED_SECRET) && text.includes(REDACTED_TOKEN) && countTokenShaped(text) === 0
+  const pane = copy(DRY_SESSION.paneCopy)
+  // -J keeps a row's trailing spaces: the joined line is the padding and the masked secret, then perhaps spaces.
+  const rows = pane.split('\n').map((l) => l.trimEnd())
+  const joined = rows.includes(`${DRY_PANE_PAD}${REDACTED_SECRET}`)
+  if (outcome(DRY_SESSION.paneCopy)?.status !== 'copied' || !pane.includes(DRY_PANE_MARKER) || !masked(pane) || !joined) {
+    throw new Error(`${DRY_SESSION.paneCopy} was not captured with its wrapped line joined and the secret and the token-shaped text masked`)
+  }
+  // Claude Code's own hard wraps, which -J can't join: each piece masked on its row, none left (the 2-character one only by its row).
+  const wrapped = dryPaneWrappedRows(seed.wrapped)
+  const survivors = wrapped.pieces.filter((piece) => piece.length >= 6 && pane.includes(piece)).length
+  if (!rows.join('\n').includes(wrapped.masked.join('\n')) || survivors > 0) {
+    throw new Error(`${DRY_SESSION.paneCopy}: the token and the registered value split across rows (a row break, then indentation or a border) were not masked in every piece (${survivors} piece(s) left)`)
+  }
+  const transcript = copy(DRY_SESSION.transcriptCopy)
+  const t = outcome(DRY_SESSION.transcriptCopy)
+  const first = DRY_TRANSCRIPT_LINES - TRANSCRIPT_TAIL_LINES + 1
+  const lines = transcript.split('\n')
+  const tailRight =
+    t?.status === 'copied' && t.path === seed.transcript.path && t.older === first - 1 && t.unterminated === Buffer.byteLength(seed.transcript.unterminated) && !t.cut
+  if (!tailRight || lines.length !== TRANSCRIPT_TAIL_LINES + 1 || lines[0] !== dryTranscriptLine(first) || lines.at(-1) !== '' || !masked(transcript) || transcript.includes(DRY_TRANSCRIPT_DECOY)) {
+    throw new Error(`${DRY_SESSION.transcriptCopy} is not the last ${TRANSCRIPT_TAIL_LINES} whole lines of the planted transcript, masked, without its unterminated last line`)
+  }
+  const others = PERSONA_CAPTURES.filter((p) => p !== DRY_SESSION)
+  const noted = [
+    ...[DRY_SESSION.paneCopy, DRY_SESSION.transcriptCopy].map((name) => describeLogOutcome(outcome(name) as LogOutcome)),
+    ...others.flatMap((p) => [`${p.paneCopy}: not there (tmux session ${p.session})`, `${p.transcriptCopy}: not there (${p.transcriptDir}/*.jsonl)`]),
+  ]
+  if (noted.some((n) => !index.includes(n))) throw new Error(`${CONTAINER_LOGS_INDEX} does not note A's pane and transcript tail, and the other personas' as not there`)
+  return [
+    `${DRY_SESSION.paneCopy}: the fixture tmux session's pane captured (tmux capture-pane -p -J -S -${PANE_HISTORY_LINES}); the line tmux wrapped at the ${DRY_PANE_WIDTH}-column pane's width inside the secret joined by -J and masked whole; the token-shaped text masked`,
+    `${DRY_SESSION.paneCopy}: rows split as Claude Code hard-wraps a long line (a row break, then indentation, "│ " or "  ⎿  "), which -J does not join: a token-shaped string split in its middle and inside its prefix, and a registered value split in its middle and before its last 6 characters, each of the ${wrapped.pieces.length} pieces masked on its own row, none of either left`,
+    `${DRY_SESSION.transcriptCopy}: of the transcripts in ${DRY_SESSION.transcriptDir}, the newest regular one copied (not an older one, a subagent's, a symlink to a newer one or the parent directory's); its last ${TRANSCRIPT_TAIL_LINES} of ${DRY_TRANSCRIPT_LINES} whole lines, the secret and the token-shaped text masked, its unterminated last line (${Buffer.byteLength(seed.transcript.unterminated)} bytes holding the first half of the secret) left out`,
+    `the other ${others.length} personas' panes and transcripts noted as not there; ${CONTAINER_LOGS_INDEX} lists each`,
+  ]
 }
 
 /**
@@ -597,10 +793,12 @@ async function seedDryRunContainerLogs(tc: ContainerExec, redactor: Redactor): P
  * its unterminated last line; the symlinked server.log.2 skipped, not
  * followed; cron.log cut to its last whole lines within the dry run's cap
  * (the partial line at the cut dropped); startup-errors.log noted as not
- * there; index.txt noting each.
+ * there; A's pane and transcript tail (`dryRunSessionCopiesEvidence`);
+ * index.txt noting each.
  */
 function dryRunContainerLogsCheck(env: RunEnv, seed: ContainerLogsSeed | string, collector: ContainerLogCollector, t0: number): RecordedResult {
-  const title = "Dry run: the container's own logs copied into the results before its removal (redacted, capped, whole lines only, a missing file noted, a symlink skipped)"
+  const title =
+    "Dry run: the container's own logs, a persona's tmux pane and its transcript tail copied into the results before its removal (redacted, capped, whole lines only, a missing file noted, a symlink skipped)"
   try {
     if (typeof seed === 'string') throw new Error(seed)
     const outcomes = collector.outcomes
@@ -639,6 +837,7 @@ function dryRunContainerLogsCheck(env: RunEnv, seed: ContainerLogsSeed | string,
     if (noted.some((n) => !index.includes(n))) {
       throw new Error(`${CONTAINER_LOGS_INDEX} does not note the cut, the missing and the skipped file, and the unterminated last line left out`)
     }
+    const sessions = dryRunSessionCopiesEvidence(seed, outcomes, copy, index)
     return {
       id: 'container-logs',
       title,
@@ -650,6 +849,7 @@ function dryRunContainerLogsCheck(env: RunEnv, seed: ContainerLogsSeed | string,
         `server.log.1 copied without its unterminated last line (${Buffer.byteLength(seed.unterminated)} bytes holding the first half of the secret, as a line mid-write)`,
         `cron.log (${total} bytes) cut to its last ${keptBytes} bytes, from line ${firstWhole}, the first whole line within the dry run's ${DRY_RUN_CONTAINER_LOG_MAX_BYTES}-byte cap (a real run's is ${CONTAINER_LOG_MAX_BYTES})`,
         `startup-errors.log noted as not there; ${CONTAINER_LOGS_INDEX} lists every file`,
+        ...sessions,
       ]),
     }
   } catch (err) {

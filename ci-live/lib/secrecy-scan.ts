@@ -51,7 +51,22 @@ export function scanText(source: string, text: string, secrets: readonly string[
   return { source, tokenShaped: countTokenShaped(text), knownSecrets: countKnownSecrets(text, secrets) }
 }
 
-/** Scan every file under `dirs` and the extra named texts. */
+/**
+ * What a file read as `nodeScanFs` reads it (latin1: one character per byte)
+ * shows of `secrets`: each as it is, and each holding a character past ASCII
+ * also as its UTF-8 bytes read that way, the spelling it has there.
+ */
+export function latin1Spellings(secrets: readonly string[]): string[] {
+  const out = new Set(secrets)
+  for (const s of secrets) if (/[^\x00-\x7f]/.test(s)) out.add(Buffer.from(s, 'utf-8').toString('latin1'))
+  return [...out]
+}
+
+/**
+ * Scan every file under `dirs` and the extra named texts. `secrets` are the
+ * redactor's known forms (`knownSecrets`, every escaped form included); a
+ * file is also scanned for their latin1 spellings (`latin1Spellings`).
+ */
 export function scanOutputs(
   dirs: readonly string[],
   extra: ReadonlyArray<{ source: string; text: string }>,
@@ -59,8 +74,9 @@ export function scanOutputs(
   fs: ScanFs = nodeScanFs,
 ): ScanReport {
   const counts: ScanCount[] = []
+  const inFiles = latin1Spellings(secrets)
   for (const dir of dirs) {
-    for (const file of fs.listFiles(dir)) counts.push(scanText(file, fs.readFile(file), secrets))
+    for (const file of fs.listFiles(dir)) counts.push(scanText(file, fs.readFile(file), inFiles))
   }
   for (const { source, text } of extra) counts.push(scanText(source, text, secrets))
   const total = counts.reduce((n, c) => n + c.tokenShaped + c.knownSecrets, 0)

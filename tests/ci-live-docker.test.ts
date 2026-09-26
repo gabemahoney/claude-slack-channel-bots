@@ -1079,13 +1079,28 @@ describe('runner wiring (source audit of ci-live/)', () => {
     const failures: string[] = []
     const argvLiterals: string[] = []
     let checkFiles = 0
+    let dryRunSeed = ''
+    let pinnedTakenOut = false
+    /** The one exception: the dry run's fixture session, one `tmux new-session -d` in the test container, in main.ts's seedDryRunSessions. */
+    const DRY_RUN_NEW_SESSION = "'tmux new-session -d -s \"$5\" -x \"$6\" -y 24 bash -c \\'cat -- \"$1\"; exec sleep infinity\\' pane-fixture \"$7\"'"
     for (const path of runnerSources()) {
-      const text = stripComments(readFileSync(path, 'utf-8'))
+      let text = stripComments(readFileSync(path, 'utf-8'))
       const rel = relative(CI_LIVE, path)
       if (rel.startsWith(`checks${join('/')}`)) {
         checkFiles += /kill-session/.test(text) ? 1 : 0
         if (/\bspawn\b|\bSpawnFn\b|\bDockerCli\b|\bBun\.|lib\/proc\.ts|\.docker\b/.test(text)) failures.push(`${rel}: a check reaches a process other than through ctx.container`)
         continue
+      }
+      // Only that one string is taken out, and only from inside seedDryRunSessions: every scan below still covers the rest of the
+      // function, so a second tmux command there (or that string anywhere else) fails the audit.
+      if (rel === 'main.ts') {
+        const [from, to] = balancedAfter(text, text.indexOf('async function seedDryRunSessions('), '{', '}')
+        dryRunSeed = text.slice(from, to)
+        const at = dryRunSeed.indexOf(DRY_RUN_NEW_SESSION)
+        if (at >= 0) {
+          text = text.slice(0, from + at) + text.slice(from + at + DRY_RUN_NEW_SESSION.length)
+          pinnedTakenOut = true
+        }
       }
       if (/kill-session|send-keys|new-session|kill-server/.test(text)) failures.push(`${rel}: builds a tmux command that changes sessions`)
       if (/claude-slack-channel-bots['",\s]+(start|stop|restart)\b/.test(text)) failures.push(`${rel}: builds a CSCB start or stop`)
@@ -1097,6 +1112,28 @@ describe('runner wiring (source audit of ci-live/)', () => {
     expect(argvLiterals).toEqual([
       `${join('lib', 'host-state.ts')}: ['agent-director', '--store-path', hostStorePath(home), 'list', '--label', 'service=cscb']`,
       `${join('lib', 'host-state.ts')}: ['tmux', 'ls', '-F', '#{session_name}']`,
+    ])
+    // The dry run's fixture session: one `tmux new-session -d`, in the one exec script of the container it plants in (tc.exec, never the host), and
+    // nothing that kills a session or sends keys. It runs only in a dry run: seedDryRunContainerLogs, its one caller, is called only `dry ? …` (pinned below).
+    expect(pinnedTakenOut).toBe(true)
+    expect(indicesOf(/new-session/g, code('main.ts')).length).toBe(1)
+    expect(dryRunSeed).not.toMatch(/kill-session|send-keys|kill-server|\bspawn\b|\bBun\.|\.docker\b|container\.|bunSpawn/)
+    const sessionExec = indicesOf(/\btc\.exec\(\[/g, dryRunSeed)
+    expect(sessionExec.length).toBe(2)
+    expect(callArguments(dryRunSeed, sessionExec[1] ?? -1)).toContain(DRY_RUN_NEW_SESSION)
+    const main = code('main.ts')
+    expect(callsOf(main, 'seedDryRunSessions').length).toBe(2)
+    expect(main).toContain('return { secret, unterminated, wrapped, transcript: await seedDryRunSessions(tc, secret, tokenShaped, wrapped) }')
+    // The symlinked decoy transcript proves something only when its target is newer than the transcript to copy (bash's -nt follows
+    // a symlink): the seed touches its own fixture target (never a credentials file, mounted read-only) and checks it.
+    const seedScript = callArguments(dryRunSeed, sessionExec[1] ?? -1)
+    expect(seedScript).toContain("'touch -d \"10 minutes ago\" -- \"$1\"; touch -d \"1 hour ago\" -- \"$2\"; touch -- \"$3\"'")
+    expect(seedScript).toContain("'[ \"$4\" -nt \"$1\" ] || exit 3'")
+    expect(seedScript).not.toContain('CONTAINER_CREDENTIALS_DIR')
+    expect(dryRunSeed).toContain('const linkTarget = `${CONTAINER_CSCB_LIVE_DIR}/dry-run-symlinked-transcript.jsonl`')
+    expect(callsOf(main, 'seedDryRunContainerLogs').map((at) => main.slice(main.lastIndexOf('\n', at) + 1, main.indexOf('\n', at)).trim())).toEqual([
+      'async function seedDryRunContainerLogs(tc: ContainerExec, redactor: Redactor): Promise<ContainerLogsSeed> {',
+      "const logsSeed = dry ? await seedDryRunContainerLogs(tc, env.redactor).catch((err: unknown) => `planting the container's logs failed: ${describeError(err)}`) : null",
     ])
   })
 

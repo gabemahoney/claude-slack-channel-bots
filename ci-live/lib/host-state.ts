@@ -109,8 +109,12 @@ export function hostStorePath(home: string): string {
   return join(home, '.agent-director', 'state.db')
 }
 
-/** `tmux ls` stderr when no tmux server runs (no socket, or nothing listening on it): no sessions. */
-const TMUX_NO_SERVER_RE = /no server running|error connecting to .*\(No such file or directory\)/
+/**
+ * `tmux ls` stderr when no tmux server runs (no socket, or nothing listening
+ * on it): no sessions. The copy of the container's logs reads the container's
+ * `tmux ls` with it too (lib/container-logs.ts).
+ */
+export const TMUX_NO_SERVER_RE = /no server running|error connecting to .*\(No such file or directory\)/
 
 export async function snapshotHost(deps: HostProbeDeps, home: string): Promise<HostSnapshot> {
   const ad = await deps.run(['agent-director', '--store-path', hostStorePath(home), 'list', '--label', 'service=cscb'])

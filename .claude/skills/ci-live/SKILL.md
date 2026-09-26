@@ -197,16 +197,26 @@ evidence — message timestamps, conversation IDs and redacted log lines, never
 a token — plus one row in the testplan's Results-table format, ready to
 paste, and the memory watchdog's peaks; `results.json` has them under
 `memory`), `run.log` (redacted, with the `watchdog:` samples),
-`container.log`, and `container-logs/`: the container's own logs, copied
-before it is removed or stopped on every run (a signal, a memory watchdog
-stop and `--keep-container` included), each redacted and at most its last
-20 MiB, whole lines only (an unterminated last line left out): CSCB's
-`server.log` (with `server.log.1` …), `startup-errors.log`, `cron.log` and
-`permission-trail.jsonl`, Check 28's `boot-start.log`, agent-director's
-`agent-director-errors.log` and `agent-director-ad-trail.jsonl`, and
-`index.txt`, which says which were copied, cut, not there or skipped. To
+`container.log`, and `container-logs/`: copied before the container is
+removed or stopped on every run (a signal, a memory watchdog stop and
+`--keep-container` included), each redacted, whole lines only (an
+unterminated last line left out): first, for each persona A–D with a tmux
+session, `pane-persona_<x>.txt` (`tmux capture-pane -p -J -S -200`, at most
+its last 2 MiB); then the container's own logs, each at most its last
+20 MiB: CSCB's `server.log` (with `server.log.1` …), `startup-errors.log`,
+`cron.log` and `permission-trail.jsonl`, Check 28's `boot-start.log`,
+agent-director's `agent-director-errors.log` and
+`agent-director-ad-trail.jsonl`; then for each persona
+`transcript-persona_<x>.jsonl` (the last 200 lines of its newest Claude
+transcript, at most its last 2 MiB); and `index.txt`, which says which were
+copied, cut, not there, skipped or not copied (a pane tmux didn't capture
+within 5 s included). A pane and a transcript are also masked across
+Claude Code's own hard wraps (every piece of a split secret or token, every
+10-character fragment of a secret), at the price of some over-masking. To
 trace a failed check, read them there (`grep`, never `cat` a whole file into
-the chat). Kept on FAIL; on PASS kept unless `--clean`.
+the chat). A permission prompt on a persona's pane, with no tool result after
+the last tool call in its transcript, is a prompt nobody answered; with no
+prompt on the pane, the call was let through and never finished. Kept on FAIL; on PASS kept unless `--clean`.
 
 Exit codes: 0 PASS, 1 FAIL, 2 not runnable.
 

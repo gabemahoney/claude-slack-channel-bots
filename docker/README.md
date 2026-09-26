@@ -198,7 +198,8 @@ runner lives in `ci-live/` and is not part of the npm package.
 9. Packs the working tree (`npm pack --ignore-scripts`), builds
    `cscb-ci-live` and starts the container with its memory and PID caps.
 10. Runs the plan's checks in the plan's order, then Teardown and HOST.
-    Teardown copies the container's own logs into the results (see
+    Teardown copies each persona's tmux pane, the container's own logs and
+    each persona's Claude transcript tail into the results (see
     [Outputs](#outputs)) before it removes the container.
 11. Writes the results, with the watchdog's peaks, and runs the closing
     secrecy scan.
@@ -279,8 +280,10 @@ alone while a run is going.
   runner) is removed only when no run of the other mode holds its lock.
 - **Stopping a run.** SIGINT (Ctrl-C), SIGTERM and SIGHUP (a closed terminal
   or a killed tmux session) stop a run the same way: no new container
-  starts, the container's own logs are copied into the results (see
-  [Outputs](#outputs)), the test container is removed (unless
+  starts, the personas' tmux panes, the container's own logs and the
+  personas' transcript tails are copied into the results (see
+  [Outputs](#outputs)), the test
+  container is removed (unless
   `--keep-container`), D's
   credentials file goes back to `credentials-staged/`, the browser closes,
   and the results so far are written with a `runner` FAIL row and the
@@ -371,9 +374,10 @@ It stops the run the way a signal does (see
 
 - **Chrome closes at once**, alongside the container's removal, never after
   it, and without waiting for a flow or a sign-in in progress.
-- **The logs' copy is brief.** The container's own logs are still copied
-  before it is removed or stopped, but the stop waits for the copy at most
-  15 s (see [Outputs](#outputs)).
+- **The logs' copy is brief.** The panes, the container's own logs and the
+  transcript tails are still copied before it is removed or stopped (the
+  panes first, then `server.log`), but the stop waits for the whole copy at
+  most 15 s (see [Outputs](#outputs)).
 - **A kept container is stopped.** With `--keep-container`, the container
   is stopped with `docker stop` (its memory freed) and kept for inspection
   (`docker start` restarts it, `docker rm -f` removes it), not left running.
@@ -477,14 +481,23 @@ How they are handled:
   the run knows of 4 characters or more (the passwords, the configuration
   tokens, the generated tokens, the web session token and cookie, the Claude
   key, the test emails, the test mailbox's password and token, an emailed
-  sign-in code), as it is and in its JSON-
-  and Markdown-escaped forms, and any token-shaped text (`xox?-…`, `xapp-…`,
-  `xoxe…`).
+  sign-in code), as it is and in its escaped forms (JSON as encoders write
+  it: also with `/` as `\/` and non-ASCII characters as `\uXXXX`; JSON
+  inside JSON; Markdown), and any token-shaped text (`xox?-…`, `xapp-…`,
+  `xoxe…`). A tmux pane and a transcript tail also go through a pass for
+  Claude Code's own hard wraps (a line break, then indentation or a `│` or
+  `⎿` border), which `tmux capture-pane -J` doesn't join: every fragment of
+  10 or more characters of a known value is masked wherever it is, and so
+  is every piece of a known value or token-shaped text split across rows.
+  The price is some over-masking: a row that ends with a token takes the
+  next row's first word with it.
 - **No browser recordings.** No tracing, video or screenshots.
 - **Closing secrecy scan.** After the results are written, the runner counts
-  token-shaped strings and known secret values (escaped forms included) in
-  every file of the results directory (the copies of the container's own
-  logs in `container-logs/` included) and in the container's docker logs.
+  token-shaped strings and known secret values (escaped forms included, and
+  a value with non-ASCII characters as its UTF-8 bytes read one per
+  character, as the scan reads a file) in every file of the results
+  directory (the copies in `container-logs/`, panes and transcript tails
+  included) and in the container's docker logs.
   The run logs how many copies it scanned
   (`container logs scanned: <n> file(s) in container-logs/`).
   The run fails unless the count is 0, and unless a planted string is found
@@ -650,13 +663,31 @@ secret store refuses any path under the real one.
   `server.log.1` ending in an unterminated line that holds the first half of
   the secret, a `server.log.2` that is a symlink to A's credentials file,
   a permission trail holding the secret and a `cron.log` of 1,100,000 bytes.
+  It also starts a fixture tmux session `slack_bot_persona_a`, 80 columns
+  wide, showing the secret, a line the pane wraps inside the secret and the
+  token-shaped text, then a second token-shaped string and a second
+  registered value split across rows as Claude Code hard-wraps a long line
+  (a line break, then indentation, `│ ` or `  ⎿  `): each once in its
+  middle, the token once inside its prefix and the value once before its
+  last 6 characters. It plants A's transcripts: the one to copy (250 whole
+  lines, the secret and the token in the last, then an unterminated line
+  holding the first half of the secret) beside an older one, a newer one in
+  a subagent's subdirectory and a symlink to a newer decoy transcript (its
+  target touched and checked newer, since `-nt` follows a symlink), and a
+  newer one in the project dir of `~/cscb-live` (whose name A's starts
+  with).
   Its `container-logs` row fails unless Teardown's copy masked the secret
   and the token, copied `server.log.1` without its unterminated last line
   (noted in `index.txt`), skipped the symlink, cut `cron.log`
   to its last whole lines within the dry run's 1 MiB cap (a real run's is
   20 MiB; the smaller one keeps the dry run's results small), noted the
-  missing `startup-errors.log`, and wrote every copy mode 600 in a mode-700
-  `container-logs/`.
+  missing `startup-errors.log`, captured A's pane with the line tmux wrapped
+  joined by `-J` and the secret masked whole in it, and every piece of the
+  hard-wrapped token and value masked on its own row with none of either
+  left, copied the last 200 lines of the planted transcript (none of the
+  others) masked and without its unterminated line, noted B's, C's and D's
+  panes and transcripts as not there, and wrote every copy mode 600 in a
+  mode-700 `container-logs/`.
 - The verdict is PASS when every check is PASS or SKIPPED. The closing scan
   must also find none of the stub's fake tokens in the outputs.
 
@@ -697,7 +728,7 @@ as "not yet", not as a FAIL.
 | 28 | Automated; the reboot is a container restart (see below) |
 | 29a | Automated. Always runs, also in a dry run and after a blocking failure; adds a host-side scan of the results. It requires a transcript only for each persona this run brought up (A to C in Check 1, D in Check 25) and sent a message to |
 | 29b | `SKIPPED (optional: needs host sudo/iptables)` |
-| Teardown | The container's own logs are copied into `container-logs/` (see [Outputs](#outputs)), then the container is removed. The apps and channels stay for the next run |
+| Teardown | The personas' tmux panes, the container's own logs and the personas' transcript tails are copied into `container-logs/` (see [Outputs](#outputs)), then the container is removed. The apps and channels stay for the next run |
 | HOST | The host is unchanged (see [Isolation](#isolation-from-the-production-bots)) |
 | Closing secrecy scan | Every output is free of tokens and secrets (see [Secrets](#secrets)) |
 
@@ -746,14 +777,20 @@ mode 600.
 | `results.md` | A per-check table with evidence, then one row in the testplan's Results-table format, ready to paste, then the watchdog's peaks under "Memory (the watchdog's peaks)" |
 | `run.log` | Every progress and detail line, redacted |
 | `container.log` | The container's docker logs, redacted |
-| `container-logs/` | The container's own logs, copied out before it is removed or stopped: CSCB's `server.log` with its rotated `server.log.1` …, `startup-errors.log`, `cron.log` and `permission-trail.jsonl`, `boot-start.log` (the output of Check 28's boot start, from `~/cscb-live/`), and agent-director's `errors.log` and `ad-trail.jsonl` (as `agent-director-errors.log` and `agent-director-ad-trail.jsonl`). Each copy redacted whole; each file at most its last 20 MiB, from its first whole line, and without an unterminated last line (one still being written when it was read). `index.txt` says of each file whether it was copied, cut, not there, skipped (a symlink is never followed) or not copied, and when its unterminated last line was left out |
+| `container-logs/` | For each persona A–D (`<key>` is `persona_a` … `persona_d`), first `pane-<key>.txt`, its tmux pane when `tmux ls` in the container lists its session `slack_bot_<key>` (`tmux capture-pane -p -J -S -200`: the last 200 lines of its history and its screen; `-J` joins only the lines tmux wrapped at the pane's width, not the ones Claude Code hard-wraps itself, so a pane is also redacted across those, see [Secrets](#secrets)), at most its last 2 MiB. Then the container's own logs, copied out before it is removed or stopped: CSCB's `server.log` with its rotated `server.log.1` …, `startup-errors.log`, `cron.log` and `permission-trail.jsonl`, `boot-start.log` (the output of Check 28's boot start, from `~/cscb-live/`), and agent-director's `errors.log` and `ad-trail.jsonl` (as `agent-director-errors.log` and `agent-director-ad-trail.jsonl`), each at most its last 20 MiB. Then for each persona `transcript-<key>.jsonl`, the last 200 whole lines of its Claude transcript, the newest regular `*.jsonl` directly in `~/.claude/projects/<slug>/` for its working directory `~/cscb-live/<letter>` (the slug as Claude Code derives it, `-home-testuser-cscb-live-a` …; never a symlink or a subagent's transcript), copied whether or not its session is still there, at most its last 2 MiB and redacted as a pane is. A pane and a transcript tail together tell a tool call waiting on an unanswered permission prompt (the prompt on the pane, no tool result in the transcript) from one that ran and never finished. Each copy redacted whole, from its first whole line within its cap, and without an unterminated last line (one still being written when it was read). `index.txt` says of each file whether it was copied, cut, not there (a persona with no tmux session or no transcript included), skipped (a symlink is never followed) or not copied (a pane not captured because tmux didn't answer included), when its unterminated last line was left out, and how many older lines of a transcript were left out |
 
-The container's logs are copied on every run that started a container,
-whatever its end: a pass, a fail, a signal, a memory watchdog stop,
-`--keep-container` and a dry run. The copy is made once, at Teardown, or
-before the cleanup removes or stops the container when the run ends another
-way. It waits at most 60 s for the copy, and at most 15 s on a memory
-watchdog stop. A file that can't be copied is noted in `index.txt` and in
+The panes, logs and transcript tails are copied on every run that started a
+container, whatever its end: a pass, a fail, a signal, a memory watchdog
+stop, `--keep-container` and a dry run. The copy is made once, at Teardown,
+or before the cleanup removes or stops the container when the run ends
+another way: the panes first (a session dies with the container), then the
+logs, `server.log` first, then the transcript tails. Each file is one
+`docker exec` of a fixed read-only script, its path or session an argument,
+with a 30 s limit, but a tmux one (`tmux ls`, a pane's capture) only 5 s:
+once one times out (a stuck tmux, not one with no server running), no
+further pane is captured, so tmux can't use up the wait before `server.log`
+is copied. The run waits at most 60 s for the whole copy, and at most 15 s on
+a memory watchdog stop. A file that can't be copied is noted in `index.txt` and in
 `run.log` (`container logs: …`), and never changes the verdict. The closing
 secrecy scan covers the copies like every other output.
 

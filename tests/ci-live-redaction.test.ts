@@ -9,10 +9,14 @@
  * run.log, verdict.txt, results.json or results.md, and the scan that closes
  * every run counts what slipped through without ever printing it. A secret
  * is masked from 4 characters up (a 6-digit sign-in code included), in its
- * JSON- and Markdown-escaped forms too, and results are redacted before they
- * are serialised; the scan counts the escaped forms as well. Every
- * secret here is a sentinel-bearing fake built at runtime; captured output is
- * checked with `assertNoLeak`.
+ * escaped forms too (JSON as JavaScript, Python and PHP write it, with `\/`
+ * and `\uXXXX`, JSON inside JSON, and Markdown), and results are redacted
+ * before they are serialised; the scan counts the escaped forms as well, and
+ * a value past ASCII in a file as the latin1 read shows it. A terminal's
+ * text (`redactWrapped`, for a tmux pane Claude Code hard-wraps) also loses
+ * every 10-character fragment of a registered form and every piece of a
+ * value or token split across rows. Every secret here is a sentinel-bearing
+ * fake built at runtime; captured output is checked with `assertNoLeak`.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -28,6 +32,7 @@ import { createRunLog } from '../ci-live/lib/log.ts'
 import {
   countKnownSecrets,
   countTokenShaped,
+  MIN_FRAGMENT_LENGTH,
   MIN_SECRET_LENGTH,
   Redactor,
   REDACTED_SECRET,
@@ -35,7 +40,7 @@ import {
   secretForms,
 } from '../ci-live/lib/redact.ts'
 import { redactDeep, RESULTS_COLUMNS, renderResultsRow, writeResults, type RunSummary } from '../ci-live/lib/results.ts'
-import { describeScan, nodeScanFs, scanOutputs, type ScanFs } from '../ci-live/lib/secrecy-scan.ts'
+import { describeScan, latin1Spellings, nodeScanFs, scanOutputs, type ScanFs } from '../ci-live/lib/secrecy-scan.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, writtenFile } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
@@ -126,9 +131,51 @@ describe('Redactor', () => {
     expect(countKnownSecrets('abc abc', ['abc'])).toBe(0)
   })
 
-  test('secretForms: the value as it is, JSON-escaped and Markdown-cell-escaped, each once', () => {
+  test('secretForms: the value as it is, JSON-escaped, Markdown-cell-escaped, JSON inside JSON, and with / as \\/ and non-ASCII as \\uXXXX (lower- and upper-case hex, and both), each once', () => {
     expect(secretForms('plain-value')).toEqual(['plain-value'])
-    expect(secretForms('a"b\\c|d')).toEqual(['a"b\\c|d', 'a\\"b\\\\c|d', 'a"b\\c\\|d'])
+    expect(secretForms('a"b\\c|d')).toEqual(['a"b\\c|d', 'a\\"b\\\\c|d', 'a"b\\c\\|d', 'a\\\\\\"b\\\\\\\\c|d'])
+    expect(secretForms('a/b-é')).toEqual([
+      'a/b-é',
+      'a\\/b-é',
+      'a/b-\\u00e9',
+      'a/b-\\u00E9',
+      'a\\/b-\\u00e9',
+      'a\\/b-\\u00E9',
+      'a\\\\/b-é',
+      'a/b-\\\\u00e9',
+      'a/b-\\\\u00E9',
+      'a\\\\/b-\\\\u00e9',
+      'a\\\\/b-\\\\u00E9',
+    ])
+    // A character past U+FFFF is escaped as its two surrogates, as JSON encoders write it.
+    expect(secretForms('k😀-long')).toContain('k\\ud83d\\ude00-long')
+  })
+
+  test('a secret holding /, ", \\ and characters past ASCII is masked, and counted by the closing scan, however a JSON encoder wrote it', () => {
+    const tricky = `pw/${LEAK_SENTINEL}"é\\😀|x`
+    const r = redactorWith(tricky)
+    const js = JSON.stringify({ v: tricky })
+    const hex = (text: string, upper: boolean) =>
+      text.replace(/[^\x00-\x7f]/g, (c) => {
+        const h = c.charCodeAt(0).toString(16).padStart(4, '0')
+        return `\\u${upper ? h.toUpperCase() : h}`
+      })
+    const written = {
+      'JavaScript (JSON.stringify)': js,
+      'JSON inside JSON': JSON.stringify({ outer: js }),
+      "Python (json.dumps, ensure_ascii)": hex(js, false),
+      'PHP (json_encode: \\/ and \\uXXXX)': hex(js, false).replace(/\//g, '\\/'),
+      '/ as \\/ only': js.replace(/\//g, '\\/'),
+      'upper-case \\uXXXX': hex(js, true),
+      'upper-case \\uXXXX inside JSON': JSON.stringify({ outer: hex(js, true) }),
+    }
+    const before = scanOutputs([], Object.entries(written).map(([source, text]) => ({ source, text })), r.knownSecrets())
+    expect(before.counts.map((c) => [c.source, c.knownSecrets])).toEqual(Object.keys(written).map((source) => [source, 1]))
+    const out = Object.fromEntries(Object.entries(written).map(([k, text]) => [k, r.redact(text)]))
+    for (const text of Object.values(out)) expect(text).toContain(REDACTED_SECRET)
+    expect(scanOutputs([], Object.entries(out).map(([source, text]) => ({ source, text })), r.knownSecrets()).total).toBe(0)
+    assertNoLeak(out)
+    assertNoLeak(describeScan(before))
   })
 
   test('masks a secret holding ", \\ or | in its JSON- and Markdown-escaped forms too', () => {
@@ -146,6 +193,113 @@ describe('Redactor', () => {
     expect(countTokenShaped(out)).toBe(0)
     expect(countKnownSecrets(out, r.knownSecrets())).toBe(0)
     assertNoLeak(out)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Redactor.redactWrapped: a terminal's text, which Claude Code hard-wraps
+// ---------------------------------------------------------------------------
+
+describe('Redactor.redactWrapped (a tmux pane: Claude Code hard-wraps a long line itself, a line break then indentation or a │ / ⎿ border)', () => {
+  /** A long token no redactor knows (58 characters). */
+  const TOKEN = fakeToken(BOT_TOKEN_PREFIX, '1234567890-ABCDEFGHIJKLMNOPQRSTUVWX')
+  /** A registered value that is not token-shaped, as the Claude gateway key is (56 characters). */
+  const GATEWAY = `gw-key-${LEAK_SENTINEL}-0123456789abcdef0123456789abcd`
+  /** Both masks as one, where a piece may get either (a registered token: a token's mask, or a value's). */
+  const oneMask = (text: string): string => text.replaceAll(REDACTED_TOKEN, '<M>').replaceAll(REDACTED_SECRET, '<M>')
+
+  test('a token split by a row break then indentation, or a "│ " border, is masked in both pieces, even split inside its prefix; the one-text redaction is the control', () => {
+    const r = new Redactor()
+    const text = [`token: ${TOKEN.slice(0, 30)}`, `    ${TOKEN.slice(30)}`, '', `│ inside its prefix: ${TOKEN.slice(0, 2)}`, `│ ${TOKEN.slice(2)}`, ''].join('\n')
+    expect(r.redactWrapped(text)).toBe([`token: ${REDACTED_TOKEN}`, `    ${REDACTED_TOKEN}`, '', `│ inside its prefix: ${REDACTED_TOKEN}`, `│ ${REDACTED_TOKEN}`, ''].join('\n'))
+    // The control: redact alone masks only the first piece of the first, and nothing of the second.
+    const plain = r.redact(text)
+    expect([plain.includes(TOKEN.slice(30)), plain.includes(TOKEN.slice(2))]).toEqual([true, true])
+  })
+
+  test('a registered value that is not token-shaped, split by a row break then a border, is masked in each piece however short (a box\'s right border and trailing spaces too)', () => {
+    const r = redactorWith(GATEWAY)
+    for (const at of [3, 28, GATEWAY.length - 3]) {
+      const text = `│ key: ${GATEWAY.slice(0, at)}   │\n│ ${GATEWAY.slice(at)}   │\n`
+      expect(r.redactWrapped(text)).toBe(`│ key: ${REDACTED_SECRET}   │\n│ ${REDACTED_SECRET}   │\n`)
+      // The control: redact alone leaves both pieces.
+      expect(r.redact(text)).toBe(text)
+    }
+  })
+
+  test('every split of a token, a registered value and a registered token, after indentation, a "│ " or a "  ⎿  ", leaves no piece: each is masked on its row', () => {
+    const registered = fakeToken(APP_TOKEN_PREFIX, 'A0123456789-0123456789abcdef')
+    const r = redactorWith(GATEWAY, registered)
+    let cases = 0
+    for (const value of [TOKEN, GATEWAY, registered]) {
+      for (const lead of ['    ', '│ ', '  ⎿  ']) {
+        for (let at = 1; at < value.length; at++) {
+          const out = r.redactWrapped(`(a) ${value.slice(0, at)}\n${lead}${value.slice(at)}\n(b)\n`)
+          expect(oneMask(out)).toBe(`(a) <M>\n${lead}<M>\n(b)\n`)
+          cases++
+        }
+      }
+    }
+    expect(cases).toBe(3 * (TOKEN.length + GATEWAY.length + registered.length - 3))
+  })
+
+  test('a token or a registered value split over three rows is masked in all three', () => {
+    const r = redactorWith(GATEWAY)
+    const text = `a: ${TOKEN.slice(0, 20)}\n  ${TOKEN.slice(20, 40)}\n  ${TOKEN.slice(40)}\n\nb: ${GATEWAY.slice(0, 12)}\n  ${GATEWAY.slice(12, 24)}\n  ${GATEWAY.slice(24)}\n`
+    const T = REDACTED_TOKEN
+    const S = REDACTED_SECRET
+    expect(r.redactWrapped(text)).toBe(`a: ${T}\n  ${T}\n  ${T}\n\nb: ${S}\n  ${S}\n  ${S}\n`)
+  })
+
+  test(`every fragment of ${MIN_FRAGMENT_LENGTH} or more characters of a registered form (its JSON-escaped one too) is masked wherever it is, a value cut short included; ${MIN_FRAGMENT_LENGTH - 1} are not`, () => {
+    const r = redactorWith(GATEWAY, ESCAPABLE)
+    expect(MIN_FRAGMENT_LENGTH).toBe(10)
+    expect(r.redactWrapped(`cut short: ${GATEWAY.slice(0, 10)}… and ${GATEWAY.slice(5, 25)} end\n`)).toBe(`cut short: ${REDACTED_SECRET}… and ${REDACTED_SECRET} end\n`)
+    const json = JSON.stringify(ESCAPABLE).slice(1, -1)
+    expect(r.redactWrapped(`{"v":"${json.slice(0, 12)}…"}\n`)).toBe(`{"v":"${REDACTED_SECRET}…"}\n`)
+    const nine = `nine: ${GATEWAY.slice(0, 9)}.\n`
+    expect(r.redactWrapped(nine)).toBe(nine)
+  })
+
+  test(`a registered form shorter than ${MIN_FRAGMENT_LENGTH} characters (a sign-in code) is masked whole, even split across rows`, () => {
+    const r = redactorWith('482913')
+    expect(r.redactWrapped('code: 482913\n')).toBe(`code: ${REDACTED_SECRET}\n`)
+    expect(r.redactWrapped('code: 482\n  913\n')).toBe(`code: ${REDACTED_SECRET}\n  ${REDACTED_SECRET}\n`)
+    expect(r.redactWrapped('code: 48291\n')).toBe('code: 48291\n')
+  })
+
+  test('the over-masking, pinned: a row ending with a token takes the next row\'s leading run of token characters with it; an empty row, or a row that starts with another character, stops it', () => {
+    const r = new Redactor()
+    expect(r.redactWrapped(`t: ${TOKEN}\nnext words\n`)).toBe(`t: ${REDACTED_TOKEN}\n${REDACTED_TOKEN} words\n`)
+    expect(r.redactWrapped(`t: ${TOKEN}\n\nnext words\n`)).toBe(`t: ${REDACTED_TOKEN}\n\nnext words\n`)
+    expect(r.redactWrapped(`t: ${TOKEN}\n│      │\nnext words\n`)).toBe(`t: ${REDACTED_TOKEN}\n│      │\nnext words\n`)
+    expect(r.redactWrapped(`t: ${TOKEN}\n(next) words\n`)).toBe(`t: ${REDACTED_TOKEN}\n(next) words\n`)
+  })
+
+  test('text with nothing registered or token-shaped in it is left as it is, its indentation, borders and line breaks included', () => {
+    const text = '╭────╮\n│ a box │\n  ⎿  indented\n\n\tplain  \n'
+    expect(new Redactor().redactWrapped(text)).toBe(text)
+    expect(redactorWith(PASSWORD, GATEWAY).redactWrapped(text)).toBe(text)
+    expect(new Redactor().redactWrapped('')).toBe('')
+  })
+
+  test('what redact masks, it masks too (a value spanning a plain line break included), and it leaves nothing the closing scan would count', () => {
+    const split = `split-${LEAK_SENTINEL}\nsecret-tail`
+    const r = redactorWith(PASSWORD, split)
+    // Each row ends with `;`, not a token character: no row takes the next one's first word with it.
+    const text = `pw ${PASSWORD} ${fakeToken(APP_TOKEN_PREFIX)};\nkey: ${split};\n${Object.values(PREFIXES).map((p, i) => fakeToken(p, `t${i}`)).join(' ')}\n`
+    const out = r.redactWrapped(text)
+    expect(oneMask(out)).toBe(oneMask(r.redact(text)))
+    expect([countTokenShaped(out), countKnownSecrets(out, r.knownSecrets())]).toEqual([0, 0])
+    assertNoLeak(out)
+  })
+
+  test('a secret registered after a pass is masked by the next (the fragments are rebuilt)', () => {
+    const r = new Redactor()
+    const text = `k: ${GATEWAY.slice(0, 20)}\n  ${GATEWAY.slice(20)}\n`
+    expect(r.redactWrapped(text)).toBe(text)
+    r.addSecret(GATEWAY)
+    expect(r.redactWrapped(text)).toBe(`k: ${REDACTED_SECRET}\n  ${REDACTED_SECRET}\n`)
   })
 })
 
@@ -396,6 +550,18 @@ describe('scanOutputs', () => {
     })
     afterEach(() => {
       rmSync(dir, { recursive: true, force: true })
+    })
+
+    test('a file is read as latin1: a registered value with characters past ASCII is counted as its UTF-8 bytes read that way', () => {
+      const secret = `pässwörd-${LEAK_SENTINEL}`
+      writeFileSync(join(dir, 'run.log'), `line ${secret}\n`)
+      const r = redactorWith(secret)
+      expect(scanOutputs([dir], [], r.knownSecrets(), nodeScanFs).counts.map((c) => c.knownSecrets)).toEqual([1])
+      // The control: the file as read holds none of the forms as they are.
+      expect(countKnownSecrets(nodeScanFs.readFile(join(dir, 'run.log')), r.knownSecrets())).toBe(0)
+      // A text passed as it is (the docker logs) is scanned for the forms as they are.
+      expect(scanOutputs([], [{ source: 'docker logs', text: secret }], r.knownSecrets()).total).toBe(1)
+      expect(latin1Spellings(['ascii-only', 'é-x'])).toEqual(['ascii-only', 'é-x', 'Ã©-x'])
     })
 
     test('walks nested directories and finds a planted token', () => {

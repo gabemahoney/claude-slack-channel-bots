@@ -265,13 +265,25 @@ removes the container. It ends with one line per check,
 `VERDICT: PASS` or `VERDICT: FAIL: <check>: <reason>`, and the results
 directory's path. There, `verdict.txt` holds the verdict and `results.md` the
 row to paste into the testplan's Results table. Before the container goes,
-its own logs are copied, redacted, into `container-logs/`: the server log
-(with its rotated generations), `startup-errors.log`, `cron.log`, the
-permission trail, Check 28's `boot-start.log`, and agent-director's errors
-log and trail, each at most its last 20 MiB and whole lines only (an
+the run copies, redacted, into `container-logs/`: first each persona's tmux
+pane (`pane-persona_a.txt` …, `tmux capture-pane -p -J -S -200`, while its
+session lives; tmux gets 5 s, and a stuck one gets no more captures), at
+most its last 2 MiB; then the container's own logs: the server log (with
+its rotated generations), `startup-errors.log`, `cron.log`, the permission
+trail, Check 28's `boot-start.log`, and agent-director's errors log and
+trail, each at most its last 20 MiB; then the last 200 lines of each
+persona's newest Claude transcript (`transcript-persona_a.jsonl` …), at
+most its last 2 MiB. A pane and a transcript are also redacted across the
+lines Claude Code hard-wraps itself, which `-J` doesn't join: every piece
+of a known secret or a token split across rows is masked, and so is every
+10-character fragment of a known secret. All are whole lines only (an
 unterminated last line, perhaps still being written, is left out), with
-`index.txt` saying what was copied, cut or not there. They
-are the place to trace a failed check (`docker/README.md` under "Outputs").
+`index.txt` saying what was copied, cut or not there. They are the place to
+trace a failed check
+(`docker/README.md` under "Outputs"): a pane showing a permission prompt
+and a transcript whose last tool call has no result mean a prompt nobody
+answered; with no prompt on the pane, the call was let through and never
+finished.
 
 The first run installs the four apps and generates their app-level tokens. To
 see provisioning pass on its own first, run
@@ -291,8 +303,9 @@ While a run is going:
   reused after a VM reboot) is removed with a
   `WARNING: removed the stale run lock …` line, and the new command goes on.
 - **Stopping it.** Ctrl-C, closing its terminal or killing its tmux session
-  stops the run cleanly: it copies the container's own logs into
-  `container-logs/`, removes the test container, writes the results so
+  stops the run cleanly: it copies the personas' panes, the container's own
+  logs and the personas' transcript tails into `container-logs/`, removes the test
+  container, writes the results so
   far with the verdict `FAIL: runner: interrupted by <signal>`, releases the
   lock and exits 1. The Notes of the results row say what the cleanup
   actually did, such as a container it could not remove.
