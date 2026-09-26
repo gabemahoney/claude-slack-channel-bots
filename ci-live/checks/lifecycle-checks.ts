@@ -7,6 +7,7 @@
 
 import { isFrom, messageText } from '../lib/human-session.ts'
 import { CONTAINER_HOME } from '../lib/docker.ts'
+import { describeError } from '../lib/errors.ts'
 import { personaEntryFor } from '../lib/live-config.ts'
 import { ROTATED_APP_TOKEN_NAME } from '../lib/personas.ts'
 import { describeScan } from '../lib/secrecy-scan.ts'
@@ -427,10 +428,21 @@ export const check28: CheckDef<CheckContext> = {
     const cDm = ctx.shared.cDm ?? (await human.openDm(ids.bots.c.userId))
     f.expect((await askAndWait(ctx, cDm, 'Reply with the word rebooted.', 'c', 'rebooted')).reply !== null, 'step 7: C did not answer rebooted')
     const m7 = await mark(ctx)
-    await ctx.browser.revokeAppToken(ids.bots.b.appId, oldName)
-    await pause(ctx, 2 * MINUTE)
-    f.expect((await askAndWait(ctx, ids.coordination, `${mention(ctx, 'b')} reply with the word rotated.`, 'b', 'rotated')).reply !== null, 'step 7: B did not answer after the older token was revoked')
-    f.expect((await sinceGrepE(ctx, m7, 'persona-(connection-lost|credentials-refused|slack-unreachable)')).filter((l) => l.includes('(key=persona_b)')).length === 0, "step 7: B's connection was lost or refused")
+    // A failed revocation, whatever threw (a flow step, a Playwright timeout, a closed page, a failed navigation), is a finding,
+    // not a throw: the rest of step 7 and step 8's revert (which clears the pending file) still run. Described, never raw.
+    let revoked = false
+    try {
+      await ctx.browser.revokeAppToken(ids.bots.b.appId, oldName)
+      revoked = true
+    } catch (err) {
+      f.expect(false, `step 7: revoke failed: ${describeError(err)}`)
+      f.note(`Check 28: B's older app-level token (${oldName}) may still be valid: revoke it on B's Basic Information page`)
+    }
+    if (revoked) {
+      await pause(ctx, 2 * MINUTE)
+      f.expect((await askAndWait(ctx, ids.coordination, `${mention(ctx, 'b')} reply with the word rotated.`, 'b', 'rotated')).reply !== null, 'step 7: B did not answer after the older token was revoked')
+      f.expect((await sinceGrepE(ctx, m7, 'persona-(connection-lost|credentials-refused|slack-unreachable)')).filter((l) => l.includes('(key=persona_b)')).length === 0, "step 7: B's connection was lost or refused")
+    }
     await noReloadTalk(ctx, f, [ids.aHome, ids.coordination, cDm, ...[ctx.shared.aDm, ctx.shared.bDm].filter((x): x is string => !!x)], talkFrom)
     f.expect((await lines(ctx, 'tokcount "$S/config.json.pending"'))[0] === '0', 'step 7: token-shaped text in the pending file')
     f.expect((await lines(ctx, 'tokcount "$S"/server.log*'))[0] === '0', 'step 7: token-shaped text in server.log')

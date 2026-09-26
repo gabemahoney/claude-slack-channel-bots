@@ -43,6 +43,10 @@
  * - SIGINT, SIGTERM and SIGHUP all clean up (Playwright's own handlers off),
  *   and the memory watchdog's abort takes the same stop path, closing Chrome
  *   alongside the container's removal rather than after it;
+ * - the container's own logs are copied into the results before every
+ *   removal or stop of the container (a memory watchdog stop waiting for
+ *   them only briefly), once, and sealed before the closing scan, which
+ *   covers them;
  * - the browser is bounded (one Chrome, at most two contexts and two pages,
  *   idle on about:blank between flows and after a sign-in).
  *
@@ -61,6 +65,7 @@ import { basename, delimiter, dirname, join, relative, resolve } from 'node:path
 import { hostAgentDirectorBinary, type BinaryProbe } from '../ci-live/lib/agent-director-binary.ts'
 import { BOOT_DONE_FILE, bootProblem, bootReached, parseBootDone, type BootRecord } from '../ci-live/lib/container-boot.ts'
 import { HELPERS_PATH, TestContainer } from '../ci-live/lib/container.ts'
+import { CONTAINER_LOGS_URGENT_WAIT_MS, CONTAINER_LOGS_WAIT_MS } from '../ci-live/lib/container-logs.ts'
 import {
   assertSafeRunArgs,
   buildExecArgs,
@@ -1165,11 +1170,13 @@ describe('runner wiring (source audit of ci-live/)', () => {
     expect(active.get('cleanup')!.replace(/\s+/g, ' ')).toBe('async () => { await Promise.all([watchdog.stop(), ws.close()]) }')
     expectInOrder(provisionOnly.slice(provisionOnly.indexOf('finally {')), ['signals.setActive(null)', 'await watchdog.stop()', 'stopWatchdog(env, watchdog)', 'await ws.close()'])
     // A run's one cleanup: the watchdog stopped first and awaited last (no line after the results); on a memory stop Chrome closes alongside the container, never after it.
+    // The container's own logs are copied before its removal or stop (a memory stop waits for them only briefly, Chrome already closing).
     expect(main).toContain('const closeChrome = async (): Promise<void> => {\n    await ws.closeBrowser()\n    ended.browserClosed = true\n  }')
     const cleanup = main.slice(...balancedAfter(main, main.indexOf('const cleanup = (cause?: StopCause): Promise<void> =>'), '{', '}'))
     expectInOrder(cleanup, [
       'const watchdogStopped = watchdog.stop()',
       'const chromeClosed = cause?.memory === true ? closeChrome() : Promise.resolve()',
+      'await collectLogs(cause?.memory === true)',
       'ended.container = await container.stopAndRemove(env.options.keepContainer, cause?.memory === true)',
       'await chromeClosed',
       'await ws.close()',
@@ -1184,6 +1191,79 @@ describe('runner wiring (source audit of ci-live/)', () => {
     const workspace = code(join('runtime', 'workspace.ts'))
     expectInOrder(workspace.slice(...balancedAfter(workspace, workspace.indexOf('async close()'), '{', '}')), ['await closeBrowser()', 'for (const p of [human, second])', 'await d?.close()'])
     expectInOrder(workspace.slice(workspace.indexOf('const closeBrowser = async (): Promise<void> =>')), ['const h = host ? await host.catch(() => null) : null', 'launched = null', 'await h?.close()'])
+  })
+
+  test("the container's own logs are copied, once, before every removal or stop of the container (Teardown, --keep-container, a failed start, a run's end, a signal, a memory watchdog stop), and sealed before the closing scan, which covers them", () => {
+    const main = code('main.ts')
+    const runFull = main.slice(...balancedAfter(main, main.indexOf('async function runFull('), '{', '}'))
+    // The one copy per run: its sink in the results dir, the stub's tokens registered first, and its waits (a memory watchdog stop's short one).
+    const collector = objectProperties(runFull.slice(runFull.indexOf('{', runFull.indexOf('const containerLogs = new ContainerLogCollector('))))
+    expect([...collector]).toEqual([
+      ['redactor', 'env.redactor'],
+      ['sink', 'containerLogsSink(env.resultsDir)'],
+      ['log', 'env.log'],
+      // The real cap; only a dry run, whose self-test plants a log over its cap, uses the smaller one.
+      ['maxBytes', 'dry ? DRY_RUN_CONTAINER_LOG_MAX_BYTES : CONTAINER_LOG_MAX_BYTES'],
+    ])
+    expect(runFull).toContain('state.containerLogs = containerLogs')
+    expectInOrder(runFull.slice(...balancedAfter(runFull, runFull.indexOf('const collectLogs = (urgent = false): Promise<void> =>'), '{', '}')), [
+      'registerStubTokens(env, ws)',
+      'return containerLogs.collect(container.container, urgent ? CONTAINER_LOGS_URGENT_WAIT_MS : CONTAINER_LOGS_WAIT_MS)',
+    ])
+    // The two waits are container-logs.ts's, imported and never redeclared here: 60 s, and 15 s on a memory watchdog stop.
+    expect([CONTAINER_LOGS_WAIT_MS, CONTAINER_LOGS_URGENT_WAIT_MS]).toEqual([60_000, 15_000])
+    const logsImport = (/^import \{([^}]*)\} from '\.\/lib\/container-logs\.ts'$/m.exec(main)?.[1] ?? '').split(',').map((s) => s.trim())
+    expect(logsImport).toEqual(expect.arrayContaining(['CONTAINER_LOGS_URGENT_WAIT_MS', 'CONTAINER_LOGS_WAIT_MS']))
+    expect(main).not.toMatch(/\b(const|let|var)\s+CONTAINER_LOGS_(URGENT_)?WAIT_MS\b/)
+    // A signal's deadline leaves the removal its 200 s on top of the copy's wait.
+    expect(main).toContain('const SIGNAL_CLEANUP_MS = 200_000 + CONTAINER_LOGS_WAIT_MS\n')
+    expect(main).toContain('if (current) await withDeadline(current.cleanup(cause), SIGNAL_CLEANUP_MS)')
+    // Only main.ts holds a ContainerRun, and every removal or stop of its container awaits the copy first, in the same block.
+    expect(runnerSources().filter((p) => /\bnew ContainerRun\(/.test(stripComments(readFileSync(p, 'utf-8')))).map((p) => relative(CI_LIVE, p))).toEqual(['main.ts'])
+    const blockStart = (at: number): number => {
+      let depth = 0
+      for (let i = at - 1; i >= 0; i--) {
+        if (main[i] === '}') depth++
+        else if (main[i] === '{' && depth-- === 0) return i + 1
+      }
+      throw new Error('no enclosing block')
+    }
+    const removals = indicesOf(/\bcontainer\.(stopAndRemove|remove)\(/g, main)
+    expect(removals.length).toBe(3)
+    for (const at of removals) {
+      const site = main.slice(at, main.indexOf('\n', at)).trim()
+      expect([site, main.slice(blockStart(at), at).includes('await collectLogs(')]).toEqual([site, true])
+    }
+    // The failed start: the docker logs, the copy, then the removal.
+    expectInOrder(runFull, [
+      "record(runnerRow('container', 'The live image and the test container',",
+      "state.containerLog = await container.logs().catch(() => '')",
+      'await collectLogs()',
+      'await container.stopAndRemove(env.options.keepContainer).catch(() => undefined)',
+    ])
+    // Teardown: copied whether the container is kept (--keep-container) or removed.
+    const removeContainer = runFull.slice(...balancedAfter(runFull, runFull.indexOf('removeContainer: async () =>'), '{', '}'))
+    expectInOrder(removeContainer, ["state.containerLog = await container.logs().catch(() => '')", 'await collectLogs()', 'if (env.options.keepContainer) {', 'return true', 'return container.remove()'])
+    // The run's end: anything not copied yet is copied before the results (a no-op after Teardown's copy).
+    expectInOrder(runFull.slice(runFull.lastIndexOf('await collectLogs()')), ['await collectLogs()', 'await watchdog.sample()', 'await watchdog.stop()', 'return finish(env, ws, state)'])
+    // The dry run plants its fixture logs after the plan's checks (S2 and 29a read the state dir), checks Teardown's copy after it.
+    expectInOrder(runFull, [
+      'await runChecks(PLAN_CHECKS, ctx,',
+      'const logsSeed = dry ? await seedDryRunContainerLogs(tc, env.redactor)',
+      'await runChecks(FINAL_CHECKS, ctx,',
+      'if (logsSeed !== null) record(dryRunContainerLogsCheck(env, logsSeed, containerLogs, t0Logs))',
+    ])
+    // The results: sealed first (no copy lands after the scan), the stub's tokens registered, then the scan over the whole results dir.
+    const finish = main.slice(...balancedAfter(main, main.indexOf('function finish('), '{', '}'))
+    expectInOrder(finish, [
+      'state.finished = true',
+      'state.containerLogs?.seal()',
+      'registerStubTokens(env, ws)',
+      'writeResults(summary, writer, env.redactor)',
+      "const scan = scanOutputs([env.resultsDir], [{ source: 'docker logs', text: state.containerLog }], env.redactor.knownSecrets())",
+      'container logs scanned: ${scan.counts.filter((c) => isInside(c.source, logsDir)).length} file(s) in ${CONTAINER_LOGS_DIR}/',
+    ])
+    expect(finish).toContain('const logsDir = join(env.resultsDir, CONTAINER_LOGS_DIR)')
   })
 
   test('the stopped run\'s note words the container\'s end through describeContainerEnd', () => {

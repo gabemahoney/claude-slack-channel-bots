@@ -4,9 +4,10 @@
  * framework.ts` (skips, blocking, the verdict), `checks/list.ts` (the plan
  * order, the HOST and Teardown checks), `lib/host-state.ts` (the read-only
  * snapshot of the production side of the host), Checks S2, S3 and 29a
- * (`checks/setup-checks.ts`, `checks/lifecycle-checks.ts`) against a fake
- * container, and the pure helpers the live checks build on
- * (`checks/helpers.ts`, `checks/channel-checks.ts`, `checks/context.ts`).
+ * (`checks/setup-checks.ts`, `checks/lifecycle-checks.ts`) and Check 28's
+ * failed revocation against a fake container, and the pure helpers the live
+ * checks build on (`checks/helpers.ts`, `checks/channel-checks.ts`,
+ * `checks/context.ts`).
  *
  * The rules under test:
  * - a failed blocking check skips every later check except the `always`
@@ -33,6 +34,11 @@
  *   falls back to the message text and needs one RAW line of each kind;
  *   `waitTags` polls to a deadline; Check 12's limit search fails on any
  *   line but the known Slack rate-limit ones;
+ * - Check 28: a failed revocation of B's older app-level token, whatever
+ *   threw (a FlowError or any other error, such as Playwright's timeout), is
+ *   the finding "step 7: revoke failed: <the error described>", with a note
+ *   that the token may still be valid; B is not asked for "rotated", and the
+ *   rest of step 7 and step 8's revert still run;
  * - the texts the checks expect match what the package writes (the pending
  *   file header, the preview counts, the reload-applied line, the S3 error).
  *
@@ -69,10 +75,10 @@ import {
   TAG_TIMEOUT_MS,
   waitTags,
 } from '../ci-live/checks/helpers.ts'
-import { check29a, parseCount, parseLeakcount, parsePersonaCounts, personaCountsProblem } from '../ci-live/checks/lifecycle-checks.ts'
+import { check28, check29a, parseCount, parseLeakcount, parsePersonaCounts, personaCountsProblem } from '../ci-live/checks/lifecycle-checks.ts'
 import { FINAL_CHECKS, hostCheck, PLAN_CHECKS, teardownCheck } from '../ci-live/checks/list.ts'
 import { s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
-import type { BrowserDriver, HumanApi } from '../ci-live/lib/browser-types.ts'
+import { FlowError, type BrowserDriver, type HumanApi } from '../ci-live/lib/browser-types.ts'
 import type { ContainerExec } from '../ci-live/lib/container.ts'
 import {
   compareSnapshots,
@@ -956,6 +962,93 @@ describe('Checks 16 and 20 against a scripted A', () => {
     expect([c16.r.status, c16.r.reason]).toEqual(['FAIL', 'the call was not refused; the refusal text is not the expected one; the second user has a DM with A'])
     const c20 = await runWith(check20, [{ done: true, call: REFUSED }])
     expect([c20.r.status, c20.r.reason]).toEqual(['FAIL', 'the call to the second user failed; the result does not name the new DM; the second user has no DM with A'])
+  })
+})
+
+/** Playwright's own timeout error, as a locator or a navigation in a flow throws it. */
+class TimeoutError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'TimeoutError'
+  }
+}
+
+describe("Check 28: a failed revocation of B's older app-level token (step 7)", () => {
+  const B = DRY_RUN_IDS.bots.b
+  const ROTATED_ASK = 'reply with the word rotated.'
+  const MAY_BE_VALID = "Check 28: B's older app-level token (cscb-live) may still be valid: revoke it on B's Basic Information page"
+  /** Step 8's revert (behind the guard) and the clean-up that ends the check. */
+  const REVERT = 'guard || exit 90\ncp ~/cscb-live/config-before-reboot.json "$S/config.json"'
+  const CLEANUP = 'rm -f ~/cscb-live/config-before-reboot.json ~/cscb-live/reboot-log-mark ~/cscb-live/reboot-errors-mark'
+
+  /**
+   * A live context that gets through step 8: the container sets the
+   * start-at-boot marker (`echo BOOT`) and gives a `mark`; every other
+   * command succeeds and prints nothing, and nothing answers in Slack, so the
+   * other steps record their own findings; time is virtual. The browser's
+   * revokeAppToken runs `revoke`, and records how many container scripts had
+   * run by then.
+   */
+  function rebootRun(revoke: () => Promise<void>) {
+    const clock = virtualClock()
+    const session = scriptedHuman(clock)
+    const { container, scripts } = fakeContainer([
+      ['echo BOOT', 'BOOT'],
+      ['', (script) => (script === 'mark' ? '1:0' : '')],
+    ])
+    const revoked: { appId: string; name: string; scriptsBefore: number }[] = []
+    const browser: BrowserDriver = {
+      ...idleBrowser(),
+      revokeAppToken: async (appId, name) => {
+        revoked.push({ appId, name, scriptsBefore: scripts.length })
+        await revoke()
+      },
+    }
+    return { ctx: makeCtx({ mode: 'real', clock, human: session.human, browser, container }), posts: session.posts, scripts, revoked }
+  }
+
+  test.each([
+    [
+      "a FlowError (the flow's own: Slack refused)",
+      () => new FlowError(`revoke: confirm: Slack answered that it can't revoke "cscb-live"`),
+      `FlowError: revoke: confirm: Slack answered that it can't revoke "cscb-live"`,
+    ],
+    [
+      "any other error (Playwright's TimeoutError: its URL query and call log left out)",
+      () =>
+        new TimeoutError(
+          `page.goto: Timeout 30000ms exceeded navigating to https://api.slack.com/apps/${B.appId}/general?t=${LEAK_SENTINEL}\nCall log:\n  - token ${fakeToken(APP_TOKEN_PREFIX, 'old')}`,
+        ),
+      `TimeoutError: page.goto: Timeout 30000ms exceeded navigating to https://api.slack.com/apps/${B.appId}/general?<query>`,
+    ],
+  ])('%s is a finding, not a throw: the token may still be valid, B is not asked for "rotated", and the rest of step 7 and step 8 still run', async (_what, error, described) => {
+    const run = rebootRun(async () => {
+      throw error()
+    })
+    const r = await check28.run(run.ctx)
+    expect(run.revoked.map(({ appId, name }) => [appId, name])).toEqual([[B.appId, 'cscb-live']])
+    expect(r.status).toBe('FAIL')
+    expect((r.reason ?? '').split('; ')).toContain(`step 7: revoke failed: ${described}`)
+    expect(r.notes).toContain(MAY_BE_VALID)
+    expect(run.posts.filter((p) => p.text.includes(ROTATED_ASK))).toEqual([])
+    // After the revocation: the rest of step 7's checks, then step 8's revert, and its clean-up last.
+    const after = run.scripts.slice(run.revoked[0]!.scriptsBefore)
+    expect(after).toContain('tokcount "$S"/server.log*')
+    expect(after).toContain(REVERT)
+    expect(after.at(-1)).toBe(CLEANUP)
+    assertNoLeak(r)
+  })
+
+  test('the control: a revocation that succeeds is followed by the "rotated" ask, with no revoke finding or note', async () => {
+    const run = rebootRun(async () => {})
+    const r = await check28.run(run.ctx)
+    expect(run.revoked.length).toBe(1)
+    expect(r.reason).not.toContain('revoke failed')
+    expect(r.notes).not.toContain(MAY_BE_VALID)
+    expect(run.posts.filter((p) => p.text.includes(ROTATED_ASK)).map((p) => [p.channel, p.text])).toEqual([[COORD, `<@${B.userId}> ${ROTATED_ASK}`]])
+    // B is silent here: that is step 7's own finding.
+    expect((r.reason ?? '').split('; ')).toContain('step 7: B did not answer after the older token was revoked')
+    expect(run.scripts.at(-1)).toBe(CLEANUP)
   })
 })
 

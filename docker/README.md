@@ -198,6 +198,8 @@ runner lives in `ci-live/` and is not part of the npm package.
 9. Packs the working tree (`npm pack --ignore-scripts`), builds
    `cscb-ci-live` and starts the container with its memory and PID caps.
 10. Runs the plan's checks in the plan's order, then Teardown and HOST.
+    Teardown copies the container's own logs into the results (see
+    [Outputs](#outputs)) before it removes the container.
 11. Writes the results, with the watchdog's peaks, and runs the closing
     secrecy scan.
 
@@ -277,7 +279,9 @@ alone while a run is going.
   runner) is removed only when no run of the other mode holds its lock.
 - **Stopping a run.** SIGINT (Ctrl-C), SIGTERM and SIGHUP (a closed terminal
   or a killed tmux session) stop a run the same way: no new container
-  starts, the test container is removed (unless `--keep-container`), D's
+  starts, the container's own logs are copied into the results (see
+  [Outputs](#outputs)), the test container is removed (unless
+  `--keep-container`), D's
   credentials file goes back to `credentials-staged/`, the browser closes,
   and the results so far are written with a `runner` FAIL row and the
   verdict `FAIL: runner: interrupted by <signal>`. Then the runner releases
@@ -367,6 +371,9 @@ It stops the run the way a signal does (see
 
 - **Chrome closes at once**, alongside the container's removal, never after
   it, and without waiting for a flow or a sign-in in progress.
+- **The logs' copy is brief.** The container's own logs are still copied
+  before it is removed or stopped, but the stop waits for the copy at most
+  15 s (see [Outputs](#outputs)).
 - **A kept container is stopped.** With `--keep-container`, the container
   is stopped with `docker stop` (its memory freed) and kept for inspection
   (`docker start` restarts it, `docker rm -f` removes it), not left running.
@@ -476,7 +483,10 @@ How they are handled:
 - **No browser recordings.** No tracing, video or screenshots.
 - **Closing secrecy scan.** After the results are written, the runner counts
   token-shaped strings and known secret values (escaped forms included) in
-  every file of the results directory and in the container's docker logs.
+  every file of the results directory (the copies of the container's own
+  logs in `container-logs/` included) and in the container's docker logs.
+  The run logs how many copies it scanned
+  (`container logs scanned: <n> file(s) in container-logs/`).
   The run fails unless the count is 0, and unless a planted string is found
   (a positive control). Check 29a runs the plan's own leak counts inside the
   container.
@@ -635,6 +645,18 @@ secret store refuses any path under the real one.
   The pre-flight, the install, the setup, S2, S3, 29a, Teardown and HOST run
   for real. Every check that needs the workspace reports
   `SKIPPED (no workspace secrets)`.
+- Before Teardown it plants fixture logs in the container: a `server.log`
+  holding a registered fixture secret and token-shaped text, a rotated
+  `server.log.1` ending in an unterminated line that holds the first half of
+  the secret, a `server.log.2` that is a symlink to A's credentials file,
+  a permission trail holding the secret and a `cron.log` of 1,100,000 bytes.
+  Its `container-logs` row fails unless Teardown's copy masked the secret
+  and the token, copied `server.log.1` without its unterminated last line
+  (noted in `index.txt`), skipped the symlink, cut `cron.log`
+  to its last whole lines within the dry run's 1 MiB cap (a real run's is
+  20 MiB; the smaller one keeps the dry run's results small), noted the
+  missing `startup-errors.log`, and wrote every copy mode 600 in a mode-700
+  `container-logs/`.
 - The verdict is PASS when every check is PASS or SKIPPED. The closing scan
   must also find none of the stub's fake tokens in the outputs.
 
@@ -675,7 +697,7 @@ as "not yet", not as a FAIL.
 | 28 | Automated; the reboot is a container restart (see below) |
 | 29a | Automated. Always runs, also in a dry run and after a blocking failure; adds a host-side scan of the results. It requires a transcript only for each persona this run brought up (A to C in Check 1, D in Check 25) and sent a message to |
 | 29b | `SKIPPED (optional: needs host sudo/iptables)` |
-| Teardown | The container is removed. The apps and channels stay for the next run |
+| Teardown | The container's own logs are copied into `container-logs/` (see [Outputs](#outputs)), then the container is removed. The apps and channels stay for the next run |
 | HOST | The host is unchanged (see [Isolation](#isolation-from-the-production-bots)) |
 | Closing secrecy scan | Every output is free of tokens and secrets (see [Secrets](#secrets)) |
 
@@ -724,6 +746,16 @@ mode 600.
 | `results.md` | A per-check table with evidence, then one row in the testplan's Results-table format, ready to paste, then the watchdog's peaks under "Memory (the watchdog's peaks)" |
 | `run.log` | Every progress and detail line, redacted |
 | `container.log` | The container's docker logs, redacted |
+| `container-logs/` | The container's own logs, copied out before it is removed or stopped: CSCB's `server.log` with its rotated `server.log.1` …, `startup-errors.log`, `cron.log` and `permission-trail.jsonl`, `boot-start.log` (the output of Check 28's boot start, from `~/cscb-live/`), and agent-director's `errors.log` and `ad-trail.jsonl` (as `agent-director-errors.log` and `agent-director-ad-trail.jsonl`). Each copy redacted whole; each file at most its last 20 MiB, from its first whole line, and without an unterminated last line (one still being written when it was read). `index.txt` says of each file whether it was copied, cut, not there, skipped (a symlink is never followed) or not copied, and when its unterminated last line was left out |
+
+The container's logs are copied on every run that started a container,
+whatever its end: a pass, a fail, a signal, a memory watchdog stop,
+`--keep-container` and a dry run. The copy is made once, at Teardown, or
+before the cleanup removes or stops the container when the run ends another
+way. It waits at most 60 s for the copy, and at most 15 s on a memory
+watchdog stop. A file that can't be copied is noted in `index.txt` and in
+`run.log` (`container logs: …`), and never changes the verdict. The closing
+secrecy scan covers the copies like every other output.
 
 Evidence is message timestamps, conversation IDs and redacted server-log
 lines, never a token. The run's first line is `RESULTS_DIR=<dir>`, so an

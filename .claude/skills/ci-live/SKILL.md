@@ -196,8 +196,17 @@ code), and prints its own lines only, with no results dir:
 evidence — message timestamps, conversation IDs and redacted log lines, never
 a token — plus one row in the testplan's Results-table format, ready to
 paste, and the memory watchdog's peaks; `results.json` has them under
-`memory`), `run.log` (redacted, with the `watchdog:` samples) and
-`container.log`. Kept on FAIL; on PASS kept unless `--clean`.
+`memory`), `run.log` (redacted, with the `watchdog:` samples),
+`container.log`, and `container-logs/`: the container's own logs, copied
+before it is removed or stopped on every run (a signal, a memory watchdog
+stop and `--keep-container` included), each redacted and at most its last
+20 MiB, whole lines only (an unterminated last line left out): CSCB's
+`server.log` (with `server.log.1` …), `startup-errors.log`, `cron.log` and
+`permission-trail.jsonl`, Check 28's `boot-start.log`, agent-director's
+`agent-director-errors.log` and `agent-director-ad-trail.jsonl`, and
+`index.txt`, which says which were copied, cut, not there or skipped. To
+trace a failed check, read them there (`grep`, never `cat` a whole file into
+the chat). Kept on FAIL; on PASS kept unless `--clean`.
 
 Exit codes: 0 PASS, 1 FAIL, 2 not runnable.
 

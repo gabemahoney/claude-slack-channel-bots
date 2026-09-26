@@ -166,30 +166,52 @@ document.getElementById('do-generate').onclick = async () => {
   show('token-out', true);
 };
 document.getElementById('done').onclick = () => location.reload();
+let opened = null;
 for (const b of document.querySelectorAll('[data-token-name]')) {
-  b.onclick = () => { document.getElementById('revoke-name').textContent = b.dataset.tokenName; show('revoke-dialog', true); };
+  b.onclick = () => { opened = b; document.getElementById('revoke-name').textContent = b.dataset.tokenName; show('revoke-refused', false); show('revoke-dialog', true); };
 }
+document.getElementById('revoke-done').onclick = () => show('revoke-dialog', false);
 document.getElementById('revoke').onclick = () => show('revoke-confirm', true);
+document.getElementById('revoke-no').onclick = () => show('revoke-confirm', false);
 document.getElementById('revoke-yes').onclick = async () => {
-  await fetch('/fixture/apps/' + appId + '/app-tokens/revoke', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: document.getElementById('revoke-name').textContent }) });
-  location.reload();
+  const r = await fetch('/fixture/apps/' + appId + '/app-tokens/revoke', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: document.getElementById('revoke-name').textContent }) });
+  const j = await r.json();
+  // As the real page does: on success the row goes and both dialogs close; on a failure only the confirmation closes.
+  show('revoke-confirm', false);
+  if (!j.ok) { show('revoke-refused', true); return; }
+  opened.closest('[data-qa^="app_level_tokens_row_"]').remove();
+  show('revoke-dialog', false);
 };`
 
 function generalPage(ws: StubWorkspace, appId: string): Response {
   const app = ws.apps.get(appId)
   if (!app) return new Response('not found', { status: 404 })
-  const tokens = app.appTokens.map((t) => `<li><button type="button" data-token-name="${esc(t.name)}">${esc(t.name)}</button></li>`).join('')
+  const tokens = app.appTokens
+    .map(
+      (t, i) =>
+        `<div data-qa="app_level_tokens_row_${i}"><span><button type="button" data-token-name="${esc(t.name)}">${esc(t.name)}</button></span><span>connections:write</span></div>`,
+    )
+    .join('')
+  // The real page's App-Level Tokens card, token dialog and stacked "Are you sure?" alertdialog, with their data-qa markers.
   return new Response(
     `<!doctype html><html><head><meta charset="utf-8"><title>Basic Information</title></head><body data-app="${esc(appId)}">
-<h1>Basic Information</h1><h2>App-Level Tokens</h2><ul>${tokens}</ul>
-<button type="button" id="gen">Generate Token and Scopes</button>
+<h1>Basic Information</h1>
+<div data-qa="app_level_token_section"><h2>App-Level Tokens</h2>
+<div data-qa="app_level_tokens_table"><h4>Tokens</h4>${tokens}</div>
+<button type="button" id="gen" data-qa="generate_app_level_token">Generate Token and Scopes</button></div>
 <div role="dialog" id="gen-dialog" hidden><label>Token Name <input type="text" id="token-name"></label>
 <button type="button" id="add-scope">Add Scope</button>
 <div id="scope-picker" hidden><select id="scope"><option value="">Choose</option><option value="connections:write">connections:write</option><option value="authorizations:read">authorizations:read</option></select></div>
 <button type="button" id="do-generate">Generate</button>
 <div id="token-out" hidden><label>Token <input type="text" readonly id="token-value"></label><button type="button" id="done">Done</button></div></div>
-<div role="dialog" id="revoke-dialog" hidden><p id="revoke-name"></p><button type="button" id="revoke">Revoke</button>
-<div id="revoke-confirm" hidden><button type="button" id="revoke-yes">Yes, Revoke</button></div></div>
+<div role="dialog" id="revoke-dialog" aria-labelledby="revoke-name" hidden><h1 id="revoke-name"></h1><p>Properties of an app level token</p>
+<p id="revoke-refused" hidden>Can’t revoke this token — it’s still active. Try again.</p>
+<button type="button" id="revoke" data-qa="app_level_token_string_revoke" aria-label="Revoke token">Revoke</button>
+<button type="button" id="revoke-done">Done</button></div>
+<div role="alertdialog" id="revoke-confirm" aria-labelledby="revoke-confirm-title" data-qa="app_level_token_revoke_speedbump" hidden><h1 id="revoke-confirm-title">Are you sure?</h1>
+<p>This will invalidate the token, and any requests using this token will no longer work</p>
+<button type="button" id="revoke-no" data-qa="app_level_token_revoke_speedbump_cancel">No, Go Back</button>
+<button type="button" id="revoke-yes" data-qa="app_level_token_revoke_speedbump_go" aria-label="Yes, I’m Sure">Yes, I’m Sure</button></div>
 <script>${GENERAL_SCRIPT}</script></body></html>`,
     { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } },
   )

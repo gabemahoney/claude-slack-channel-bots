@@ -12,9 +12,18 @@
  * live run owns) → provisioning (real Slack, or the local stub in a dry run)
  * → the test human's session → pack, build, start the container → the plan's
  * checks in order → Teardown and HOST → results (verdict.txt, results.json,
- * results.md, run.log) → the closing secrecy scan of every output. A failure
- * of the session, image build or container start is a FAIL row: HOST, the
- * scan and the results still happen.
+ * results.md, run.log, container.log, container-logs/) → the closing secrecy
+ * scan of every output. A failure of the session, image build or container
+ * start is a FAIL row: HOST, the scan and the results still happen.
+ *
+ * Before the container is removed or stopped, on every path (Teardown, a
+ * failed container start, the cleanup after a signal or the memory
+ * watchdog's stop, --keep-container included), its own logs (CSCB's
+ * server.log and rotated generations, startup-errors.log, cron.log and
+ * permission trail, the boot start's boot-start.log, agent-director's
+ * errors.log and ad-trail.jsonl) are copied, redacted, capped and cut to
+ * whole lines, into container-logs/ (lib/container-logs.ts), once per run. The closing scan covers them; a failure to copy is logged and
+ * changes no verdict. A memory watchdog stop waits for the copy only briefly.
  *
  * `mailbox --latest` and `mailbox --forwarding` are separate: they take no
  * lock, make no results dir and write no run.log; they only read the test
@@ -38,13 +47,15 @@
  * signal while that runs is ignored. The memory watchdog stops a run the same
  * way when the host's working set or Chrome's PSS crosses its limit, with the
  * FAIL row "memory watchdog: <what crossed, the value and the limit>", but
- * it closes Chrome at once, alongside the container's removal (never after
- * it, and without waiting for a driver or a sign-in), and with
- * --keep-container it stops the container (`docker stop`: its memory freed,
- * kept for inspection) instead of leaving it running.
+ * it closes Chrome at once, alongside the copy of the container's logs and
+ * the container's removal (never after it, and without waiting for a driver
+ * or a sign-in), waits for that copy at most CONTAINER_LOGS_URGENT_WAIT_MS,
+ * and with --keep-container it stops the container (`docker stop`: its
+ * memory freed, kept for inspection) instead of leaving it running.
  */
 
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync, readFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
@@ -55,10 +66,22 @@ import { FINAL_CHECKS, PLAN_CHECKS } from './checks/list.ts'
 import { personaEntry } from './lib/apps-state.ts'
 import { parseArgs, UsageError, USAGE, type RunOptions } from './lib/args.ts'
 import type { BrowserDriver, BrowserStats } from './lib/browser-types.ts'
-import { claudeEnvProblem, describeContainerEnd, type ContainerEnd, type ContainerStats } from './lib/docker.ts'
+import type { ContainerExec } from './lib/container.ts'
+import {
+  CONTAINER_LOG_MAX_BYTES,
+  CONTAINER_LOGS_DIR,
+  CONTAINER_LOGS_INDEX,
+  CONTAINER_LOGS_URGENT_WAIT_MS,
+  CONTAINER_LOGS_WAIT_MS,
+  ContainerLogCollector,
+  containerLogsSink,
+  DRY_RUN_CONTAINER_LOG_MAX_BYTES,
+} from './lib/container-logs.ts'
+import { claudeEnvProblem, CONTAINER_CREDENTIALS_DIR, describeContainerEnd, type ContainerEnd, type ContainerStats } from './lib/docker.ts'
 import { describeError, EXIT_FAIL, EXIT_NOT_RUNNABLE, EXIT_PASS } from './lib/errors.ts'
 import { describeSnapshot, procListener, snapshotHost, type HostSnapshot } from './lib/host-state.ts'
 import { HumanSession } from './lib/human-session.ts'
+import { CONTAINER_STATE_DIR } from './lib/live-config.ts'
 import { createProcessRunLog, type RunLog } from './lib/log.ts'
 import {
   addressForms,
@@ -75,7 +98,7 @@ import { dryRunLockFile, hostCredentialsFile, livePathsIn, mountedCredentialsFil
 import { APP_TOKEN_NAME } from './lib/personas.ts'
 import { bunSpawn, minimalChildEnv } from './lib/proc.ts'
 import { chromeTreePss } from './lib/proc-tree.ts'
-import { Redactor } from './lib/redact.ts'
+import { countTokenShaped, REDACTED_SECRET, REDACTED_TOKEN, Redactor } from './lib/redact.ts'
 import { writeResults, type RunSummary } from './lib/results.ts'
 import { isLiveRunnerPid, lockHolder, nodeLockDeps, RunLock } from './lib/run-lock.ts'
 import { describeScan, scanOutputs, scanText } from './lib/secrecy-scan.ts'
@@ -90,8 +113,12 @@ import { openWorkspace, type Workspace } from './runtime/workspace.ts'
 /** The repository root (ci-live's parent). */
 export const REPO_ROOT = resolve(dirname(import.meta.path), '..')
 
-/** How long a signal's cleanup may take (a `docker run` in flight, then `docker rm -f`) before the process exits anyway. */
-const SIGNAL_CLEANUP_MS = 200_000
+/**
+ * How long a signal's cleanup may take (the container's logs copied out, a
+ * `docker run` in flight, then `docker rm -f`) before the process exits
+ * anyway: the copy's wait comes on top of the removal's 200 s.
+ */
+const SIGNAL_CLEANUP_MS = 200_000 + CONTAINER_LOGS_WAIT_MS
 
 const STOP_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const
 
@@ -509,6 +536,127 @@ function dryRunAdoptionEvidence(ws: Workspace, report: ProvisionReport, seeded: 
   )
 }
 
+/** Dry run only: what `seedDryRunContainerLogs` planted, for `dryRunContainerLogsCheck`. */
+interface ContainerLogsSeed {
+  /** A fixture value registered with the redactor (not token-shaped), planted in server.log and the permission trail. */
+  secret: string
+  /** server.log.1's unterminated last line (as a line mid-write): it holds the first half of `secret`, which no redactor knows. */
+  unterminated: string
+}
+
+/** The fixture line every planted server log holds. */
+const DRY_LOG_MARKER = '[slack] dry-run fixture: the container-logs self-test'
+
+/** server.log.1's whole line: all its copy may hold. */
+const DRY_ROTATED_LINE = `${DRY_LOG_MARKER} (a rotated generation)\n`
+
+/** cron.log's fixture: numbered 50-byte lines, 1,100,000 bytes in all, so the dry run's 1 MiB cap cuts it inside a line. */
+const DRY_CRON_LINES = 22_000
+const DRY_CRON_LINE_BYTES = 50
+
+function dryCronLine(n: number): string {
+  return `dry-run fixture cron.log line ${String(n).padStart(9, '0')} .........`
+}
+
+/**
+ * Dry run only, after the plan's checks (S2 and 29a have read the state dir)
+ * and before Teardown copies the container's logs: a server.log holding a
+ * registered fixture secret and a token-shaped string, a rotated
+ * server.log.1 ending in an unterminated line that holds the first half of
+ * the secret, a server.log.2 that is a symlink to A's credentials file, a
+ * permission trail holding the secret, and a cron.log over the dry run's cap.
+ * startup-errors.log stays missing.
+ */
+async function seedDryRunContainerLogs(tc: ContainerExec, redactor: Redactor): Promise<ContainerLogsSeed> {
+  const secret = `dry-run-log-secret-${randomUUID()}`
+  redactor.addSecret(secret)
+  const tokenShaped = `${['xox', 'b-'].join('')}1234567890-1234567890-${'B'.repeat(24)}`
+  const unterminated = `fixture line mid-write: ${secret.slice(0, Math.ceil(secret.length / 2))}`
+  const s = CONTAINER_STATE_DIR
+  await tc.writeFile(`${s}/server.log`, `${DRY_LOG_MARKER}\nfixture secret: ${secret}\nfixture token-shaped text: ${tokenShaped}\n`, '600')
+  await tc.writeFile(`${s}/server.log.1`, `${DRY_ROTATED_LINE}${unterminated}`, '600')
+  await tc.writeFile(`${s}/permission-trail.jsonl`, `${JSON.stringify({ fixture: 'dry-run', raw_error_message: `refused: ${secret}` })}\n`, '600')
+  const r = await tc.exec([
+    'bash',
+    '-c',
+    'set -e; ln -s "$1" "$2"; seq -f "dry-run fixture cron.log line %09.0f ........." 1 "$3" > "$4"',
+    'seed',
+    `${CONTAINER_CREDENTIALS_DIR}/persona_a-credentials.json`,
+    `${s}/server.log.2`,
+    String(DRY_CRON_LINES),
+    `${s}/cron.log`,
+  ])
+  if (r.code !== 0) throw new Error(`the symlinked server.log.2 and the oversized cron.log could not be planted (exit ${r.code})`)
+  return { secret, unterminated }
+}
+
+/**
+ * Dry run only: the copy Teardown made before removing the container. Every
+ * copy mode 600 in a mode-700 container-logs/; server.log and the trail with
+ * the secret and the token-shaped text masked; server.log.1 copied without
+ * its unterminated last line; the symlinked server.log.2 skipped, not
+ * followed; cron.log cut to its last whole lines within the dry run's cap
+ * (the partial line at the cut dropped); startup-errors.log noted as not
+ * there; index.txt noting each.
+ */
+function dryRunContainerLogsCheck(env: RunEnv, seed: ContainerLogsSeed | string, collector: ContainerLogCollector, t0: number): RecordedResult {
+  const title = "Dry run: the container's own logs copied into the results before its removal (redacted, capped, whole lines only, a missing file noted, a symlink skipped)"
+  try {
+    if (typeof seed === 'string') throw new Error(seed)
+    const outcomes = collector.outcomes
+    if (!outcomes) throw new Error("the container's logs were not copied before its removal")
+    const dir = join(env.resultsDir, CONTAINER_LOGS_DIR)
+    const mode = (path: string): number => statSync(path).mode & 0o777
+    const files = readdirSync(dir).sort()
+    if (mode(dir) !== 0o700 || files.some((f) => mode(join(dir, f)) !== 0o600)) throw new Error(`${CONTAINER_LOGS_DIR}/ is not mode 700 with every copy mode 600`)
+    const copy = (name: string): string => readFileSync(join(dir, name), 'utf-8')
+    const outcome = (name: string) => outcomes.find((o) => o.name === name)
+    const server = copy('server.log')
+    const trail = copy('permission-trail.jsonl')
+    const masked = (text: string): boolean => !text.includes(seed.secret) && text.includes(REDACTED_SECRET) && countTokenShaped(text) === 0
+    if (!server.includes(DRY_LOG_MARKER) || !masked(server) || !server.includes(REDACTED_TOKEN) || !masked(trail)) {
+      throw new Error('server.log or the permission trail was not copied with the secret and the token-shaped text masked')
+    }
+    const rotated = outcome('server.log.1')
+    if (copy('server.log.1') !== DRY_ROTATED_LINE || rotated?.status !== 'copied' || rotated.unterminated !== Buffer.byteLength(seed.unterminated)) {
+      throw new Error('the rotated server.log.1 was not copied without its unterminated last line')
+    }
+    if (files.includes('server.log.2') || outcome('server.log.2')?.status !== 'skipped') throw new Error('the symlinked server.log.2 was not skipped')
+    if (outcome('startup-errors.log')?.status !== 'missing') throw new Error('the missing startup-errors.log was not noted as not there')
+    // The cut falls inside a line: the copy starts at the next whole line and keeps every line after it.
+    const total = DRY_CRON_LINES * DRY_CRON_LINE_BYTES
+    const firstWhole = Math.floor((total - DRY_RUN_CONTAINER_LOG_MAX_BYTES - 1) / DRY_CRON_LINE_BYTES) + 2
+    const keptBytes = total - (firstWhole - 1) * DRY_CRON_LINE_BYTES
+    const cron = copy('cron.log')
+    const cronOutcome = outcome('cron.log')
+    const cutRight =
+      cronOutcome?.status === 'copied' && cronOutcome.cut && cronOutcome.cap === DRY_RUN_CONTAINER_LOG_MAX_BYTES && cronOutcome.size === total && cronOutcome.kept === keptBytes
+    if (!cutRight || cron.length !== keptBytes || !cron.startsWith(`${dryCronLine(firstWhole)}\n`) || !cron.endsWith(`${dryCronLine(DRY_CRON_LINES)}\n`)) {
+      throw new Error(`cron.log was not cut to its last whole lines within the dry run's ${DRY_RUN_CONTAINER_LOG_MAX_BYTES}-byte cap`)
+    }
+    const index = copy(CONTAINER_LOGS_INDEX)
+    const noted = ['startup-errors.log: not there', 'cron.log: cut', 'server.log.2: skipped', `server.log.1: copied, ${Buffer.byteLength(DRY_ROTATED_LINE)} bytes; its unterminated last line`]
+    if (noted.some((n) => !index.includes(n))) {
+      throw new Error(`${CONTAINER_LOGS_INDEX} does not note the cut, the missing and the skipped file, and the unterminated last line left out`)
+    }
+    return {
+      id: 'container-logs',
+      title,
+      row: null,
+      durationMs: Date.now() - t0,
+      ...pass([
+        `${files.length} files in ${CONTAINER_LOGS_DIR}/ (dir mode 700, files mode 600): ${files.join(', ')}`,
+        'server.log and permission-trail.jsonl copied with the planted secret and token-shaped text masked; the symlinked server.log.2 skipped, not followed',
+        `server.log.1 copied without its unterminated last line (${Buffer.byteLength(seed.unterminated)} bytes holding the first half of the secret, as a line mid-write)`,
+        `cron.log (${total} bytes) cut to its last ${keptBytes} bytes, from line ${firstWhole}, the first whole line within the dry run's ${DRY_RUN_CONTAINER_LOG_MAX_BYTES}-byte cap (a real run's is ${CONTAINER_LOG_MAX_BYTES})`,
+        `startup-errors.log noted as not there; ${CONTAINER_LOGS_INDEX} lists every file`,
+      ]),
+    }
+  } catch (err) {
+    return runnerRow('container-logs', title, `dry-run container-logs self-test: ${describeError(err)}`, t0)
+  }
+}
+
 async function runProvisionOnly(env: RunEnv, signals: SignalControl): Promise<number> {
   const ws = openWorkspace({ repoRoot: REPO_ROOT, runId: env.runId, redactor: env.redactor, log: env.log }, env.options.dryRun ? 'dry-run' : 'real')
   const watchdog = startWatchdog(env, signals, { container: async () => null, browserStats: () => ws.browserStats() })
@@ -741,6 +889,8 @@ interface RunState {
   interrupted?: string
   /** The run's memory watchdog: stopped, and its peaks recorded, when the results are written. */
   watchdog: MemoryWatchdog | null
+  /** The copy of the container's own logs: sealed when the results are written, so the scan sees every copy. */
+  containerLogs: ContainerLogCollector | null
 }
 
 function runnerRow(id: string, title: string, reason: string, t0: number): RecordedResult {
@@ -771,7 +921,7 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
   const dry = env.options.dryRun
   const mode = dry ? 'dry-run' : 'real'
   const container = new ContainerRun(bunSpawn, env.log, env.runId, REPO_ROOT)
-  const state: RunState = { results: [], runNotes: [], packed: null, hostName: container.name, containerLog: '', finished: false, watchdog: null }
+  const state: RunState = { results: [], runNotes: [], packed: null, hostName: container.name, containerLog: '', finished: false, watchdog: null, containerLogs: null }
   const record = (r: RecordedResult): void => {
     state.results.push(r)
   }
@@ -787,6 +937,22 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
   // From here to the results: a watchdog sample every 30 s (in a dry run too, so it is exercised).
   const watchdog = startWatchdog(env, signals, { container: () => container.stats(), browserStats: () => ws.browserStats() })
   state.watchdog = watchdog
+  const containerLogs = new ContainerLogCollector({
+    redactor: env.redactor,
+    sink: containerLogsSink(env.resultsDir),
+    log: env.log,
+    maxBytes: dry ? DRY_RUN_CONTAINER_LOG_MAX_BYTES : CONTAINER_LOG_MAX_BYTES,
+  })
+  state.containerLogs = containerLogs
+  /**
+   * Copy the container's own logs into the results, once, before it is
+   * removed or stopped (every removal below awaits this first). A memory
+   * watchdog stop waits for it only briefly; a failure is only logged.
+   */
+  const collectLogs = (urgent = false): Promise<void> => {
+    registerStubTokens(env, ws)
+    return containerLogs.collect(container.container, urgent ? CONTAINER_LOGS_URGENT_WAIT_MS : CONTAINER_LOGS_WAIT_MS)
+  }
   // One cleanup, however many callers (the run's end and a signal): they all wait for the same work, as the first caller's cause asks.
   let cleaning: Promise<void> | null = null
   const ended: CleanupEnd = { container: null, browserClosed: false }
@@ -799,8 +965,10 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
       // Settles once a sample in flight has written its line: awaited before the results are written.
       const watchdogStopped = watchdog.stop()
       try {
-        // The memory watchdog's stop closes Chrome at once, alongside the container's removal, never after it.
+        // The memory watchdog's stop closes Chrome at once, alongside the logs' copy and the container's removal, never after them.
         const chromeClosed = cause?.memory === true ? closeChrome() : Promise.resolve()
+        // The container's own logs first (a memory stop waits for them only briefly), then its removal or stop.
+        await collectLogs(cause?.memory === true)
         ended.container = await container.stopAndRemove(env.options.keepContainer, cause?.memory === true)
         if (!dry) restoreDLogged(ws, env.log)
         await chromeClosed
@@ -897,6 +1065,7 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
         if (err instanceof NotRunnableError) throw err
         record(runnerRow('container', 'The live image and the test container', `container setup failed: ${describeError(err)}`, tc))
         state.containerLog = await container.logs().catch(() => '')
+        await collectLogs()
         await container.stopAndRemove(env.options.keepContainer).catch(() => undefined)
         ready = false
       }
@@ -925,6 +1094,8 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
         hostNow,
         removeContainer: async () => {
           state.containerLog = await container.logs().catch(() => '')
+          // Kept or removed, the container's own logs are copied first.
+          await collectLogs()
           if (env.options.keepContainer) {
             state.runNotes.push(`container ${container.name} kept (--keep-container)`)
             return true
@@ -935,12 +1106,18 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
       const needReasons = sessions?.secondSkip ? { 'second-user': sessions.secondSkip } : undefined
       const options = { available, now: () => Date.now(), log: env.log, onResult: record, needReasons }
       await runChecks(PLAN_CHECKS, ctx, { ...options, only: env.options.only })
+      // Dry run only: logs for Teardown's copy to prove itself on, planted after S2 and 29a have read the state dir.
+      const t0Logs = Date.now()
+      const logsSeed = dry ? await seedDryRunContainerLogs(tc, env.redactor).catch((err: unknown) => `planting the container's logs failed: ${describeError(err)}`) : null
       await runChecks(FINAL_CHECKS, ctx, { ...options, only: [] })
+      if (logsSeed !== null) record(dryRunContainerLogsCheck(env, logsSeed, containerLogs, t0Logs))
     } else {
       const hostCtx = { hostBefore, hostNow } as unknown as CheckContext
       await runChecks(FINAL_CHECKS.filter((c) => c.id === 'HOST'), hostCtx, { available: new Set(), only: [], now: () => Date.now(), log: env.log, onResult: record })
     }
     if (dry) state.runNotes.push('dry run: local Slack stub and fixture pages; no workspace secret read')
+    // Copied at Teardown (or at a failed start) already; otherwise now, before the results and their scan.
+    await collectLogs()
     // A last reading (after one in flight), then no more: the peaks are written after the last line.
     await watchdog.sample()
     await watchdog.stop()
@@ -949,6 +1126,11 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
     signals.setActive(null)
     await cleanup()
   }
+}
+
+/** The dry run's stub tokens, registered with the redactor before a copy of the container's logs or the results are written. */
+function registerStubTokens(env: RunEnv, ws: Workspace): void {
+  if (ws.stub) for (const t of ws.stub.workspace.allTokens()) env.redactor.addSecret(t)
 }
 
 /** The scanner finds a runtime-built token-shaped string and (when any is known) a known secret value. */
@@ -962,16 +1144,20 @@ function scanControl(secrets: readonly string[]): boolean {
 /**
  * Write the results and run the closing scan, once; the exit code.
  * `interruption` is the signal handler's call. Both callers have awaited the
- * watchdog's stop, so no watchdog line comes after its peaks or the scan.
+ * watchdog's stop, so no watchdog line comes after its peaks or the scan, and
+ * the copy of the container's logs, or stopped waiting for it: the copy is
+ * sealed here, so nothing of it is written after the scan.
  */
 function finish(env: RunEnv, ws: Workspace, state: RunState, interruption = false): number {
   if (state.finished || (state.interrupted !== undefined && !interruption)) return EXIT_FAIL
   state.finished = true
+  // No copy of the container's logs lands after this: the closing scan must see every output.
+  state.containerLogs?.seal()
   const memory = state.watchdog ? stopWatchdog(env, state.watchdog) : undefined
   const runNotes = [...state.runNotes]
   for (const r of state.results) for (const n of r.notes ?? []) runNotes.push(n)
   if (state.containerLog) writeFileSync(join(env.resultsDir, 'container.log'), env.redactor.redact(state.containerLog), { mode: 0o600 })
-  if (ws.stub) for (const t of ws.stub.workspace.allTokens()) env.redactor.addSecret(t)
+  registerStubTokens(env, ws)
   const results = [...state.results]
   const summary: RunSummary = {
     runId: env.runId,
@@ -986,15 +1172,17 @@ function finish(env: RunEnv, ws: Workspace, state: RunState, interruption = fals
   }
   const writer = { write: (name: string, content: string) => writeFileSync(join(env.resultsDir, name), content, { mode: 0o600 }) }
   writeResults(summary, writer, env.redactor)
-  // The closing secrecy scan: every output of the run, and the container's logs.
+  // The closing secrecy scan: every output of the run (the copies in container-logs/ included), and the container's docker logs.
   const scan = scanOutputs([env.resultsDir], [{ source: 'docker logs', text: state.containerLog }], env.redactor.knownSecrets())
   const scanLines = describeScan(scan)
+  const logsDir = join(env.resultsDir, CONTAINER_LOGS_DIR)
+  scanLines.push(`container logs scanned: ${scan.counts.filter((c) => isInside(c.source, logsDir)).length} file(s) in ${CONTAINER_LOGS_DIR}/`)
   // A positive control: the scanner must see a planted token-shaped string and a known secret.
   const control = scanControl(env.redactor.knownSecrets())
   scanLines.push(`scanner control: ${control ? 'detects planted token-shaped and known-secret strings' : 'FAILED to detect planted strings'}`)
   scanLines.push(`known secret values checked: ${env.redactor.secretCount}`)
   for (const line of scanLines) env.log.info(line)
-  const title = 'Closing secrecy scan of every output (results dir, run.log, docker logs)'
+  const title = "Closing secrecy scan of every output (results dir with the container's copied logs, run.log, docker logs)"
   const scanResult: RecordedResult =
     scan.total === 0 && control
       ? { id: 'secrecy-scan', title, row: null, durationMs: 0, ...pass(scanLines) }
