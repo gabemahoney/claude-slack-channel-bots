@@ -31,10 +31,10 @@ directory lands in `$S` and never in the real `~/.claude/channels/slack/`.
 ## Docker integration suite
 
 Bash scripts that install the packed package, write a persona config and
-start the server in dry run. Three scripts leave dry run: Test 4 runs its
-driver, which spawns under a stub `claude` and starts no server, Test 10
-is the one script that starts a live server, against the loopback Slack stub,
-and Test 11 runs its driver against real tmux, starting no server.
+start the server in dry run. Four scripts leave dry run: Test 4 runs its
+driver, which spawns under a stub `claude` and starts no server, Tests 10
+and 12 start a live server, against the loopback Slack stub, and Test 11
+runs its driver against real tmux, starting no server.
 `/ci` packs
 the package, builds the image from `docker/Dockerfile.test` (on the base in
 `docker/Dockerfile.test.base`, see `docker/README.md`) and runs `tests/runner.sh` inside it. The verdict is
@@ -44,6 +44,11 @@ The scripts run only in that container, never on a dev box or a host with a
 real CSCB install: they write to `~/.claude/channels/slack/`, start a server
 and spawn instances. If docker is not available, report the integration run
 as not done rather than running a script directly.
+
+A check that needs a real agent-director spawn belongs here, never in the
+unit suite, which spawns no real Claude process: Test 12 checks the hook
+paths a launched persona runs (b.cnu SR-8.2), which the unit suite could
+only skip.
 
 ### Layout
 
@@ -62,13 +67,15 @@ tests/
                                    # E13 dry-run leg (SR-8.6): a working_directory change gives one DESTRUCTIVE: line and touches one persona; a port change waits for the restart
     test-10-credentials-change.sh  # E13 (SR-8.3, SR-8.6), live against the Slack stub: a credentials change reconnects one persona on confirmation; handshake failure and refused change; leak counts
     test-11-exact-tmux-targets.sh  # b.1ix: persona dev's raw tmux calls (probe, dialog approver, b.vub kill) touch slack_bot_dev only, never its prefix neighbour slack_bot_dev_2
+    test-12-bot-hook-absoluteness.sh
+                                   # b.cnu SR-8.2, b.2qu, live against the Slack stub: every hook command of an agent-director-launched persona is an absolute path to an existing executable; agent-director's run the user's agent-director install, the reply guard runs the installed package's script
     lib/
       scenario.sh                  # shared helper sourced by Tests 5 onwards (see Scenario helper below)
     fixtures/
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly
       exact-tmux-driver.ts         # Test 11 driver: runs one raw-tmux persona path against real tmux, with a stand-in agent-director
-      stub-claude.sh               # fake `claude` (Tests 4 and 10): prints the dev-channels dialog, fires SessionStart
-      slack-stub-server.ts         # Test 10 loopback Slack stub: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
+      stub-claude.sh               # fake `claude` (Tests 4, 10 and 12): prints the dev-channels dialog, fires SessionStart
+      slack-stub-server.ts         # Tests 10 and 12 loopback Slack stub: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
     .shellcheckrc                  # lets shellcheck follow `source lib/scenario.sh` without -x
     session-leader.test.ts         # bun test, not run by runner.sh
   runner.sh                        # sequential runner (Tests 1-4, then discovery), writes /test-results/verdict.txt
@@ -95,7 +102,7 @@ you change the script, update the testplan. Today that is Tests 1 to 3
 
 A script with no ticket is specified by its header comment, and by its
 driver's where it has one (Test 4 and `fixtures/driver.ts`, Test 11 and
-`fixtures/exact-tmux-driver.ts`). Tests 5 to 11
+`fixtures/exact-tmux-driver.ts`). Tests 5 to 12
 have no testplan ticket: each header comment lists what it checks, and the
 log fragments it expects are taken from `src/` (the function that writes
 each is named in the header or in a constants block near the top), so the
@@ -109,7 +116,7 @@ script (see Live acceptance plan below).
 Every script runs against a persona config written inside the container, never
 a config or credentials file from the host:
 
-- Every `start` but Test 10's runs with `SLACK_DRY_RUN=1`, and every `start`
+- Every `start` but those of Tests 10 and 12 runs with `SLACK_DRY_RUN=1`, and every `start`
   runs with the token environment variables unset. Dry run reads no
   credentials file, so a dry-run script never creates the credentials files
   its config names, and it skips each persona's spawn with a persona-keyed
@@ -127,9 +134,9 @@ a config or credentials file from the host:
   conversion error.
 - Test 4 runs without dry run but opens no Slack connection: its driver builds
   a one-persona config in memory and spawns under a stub `claude`.
-- Tests 5 to 10 each write their own config into their own scratch state dir
-  (see Scenario helper), never the shared one. Test 10 is the one scenario
-  outside dry run (see Slack stub).
+- Tests 5 to 10 and Test 12 each write their own config into their own
+  scratch state dir (see Scenario helper), never the shared one. Tests 10 and
+  12 are the scenarios outside dry run (see Slack stub).
 
 ### Execution model
 
@@ -151,8 +158,9 @@ Test 10's live start runs the server's start sweep (`reconcileOrphans`,
 agent-director row whose persona is not in Test 10's own config (and any row
 with a foreign instance ID or another working directory; a row with no
 persona label is killed when live and kept). Every persona row an earlier
-script left behind is gone after Test 10's start; that is acceptable only
-because the container is ephemeral and the scripts run one at a time.
+script left behind is gone after Test 10's start, and Test 12's live start
+does the same to Test 10's rows; that is acceptable only because the
+container is ephemeral and the scripts run one at a time.
 
 Test 11 starts no server and makes no agent-director row: its driver's
 agent-director is a stand-in, and each case runs its own tmux server (its own
@@ -244,8 +252,8 @@ The contract for a scenario:
 
 `tests/integration/fixtures/slack-stub-server.ts` is a Bun HTTP and WebSocket
 server on 127.0.0.1 that stands in for Slack, because real Slack is not
-reachable in the container. Test 10 starts it in the background and points
-the server at it through the Slack API base URL override, an environment
+reachable in the container. Tests 10 and 12 start it in the background and
+point the server at it through the Slack API base URL override, an environment
 variable for the integration suite only (see Environment Variables in
 `docs/architecture.md`). The server honours it only for an
 `http://127.0.0.1…` or `http://[::1]…` URL, and the stub listens on
@@ -261,9 +269,9 @@ variable for the integration suite only (see Environment Variables in
   the scenario assigned to the token and a token hash, never the token.
 - It has no `bun test` suite of its own; Test 10 exercises it end to end.
 
-Test 10's live start also launches each persona through the real
-agent-director, so it puts `fixtures/stub-claude.sh` first on `PATH` as
-`claude` (as Test 4 does) and stops with `--stop-bots`.
+A live start (Tests 10 and 12) also launches each persona through the real
+agent-director, so the script puts `fixtures/stub-claude.sh` first on `PATH`
+as `claude` (as Test 4 does) and stops with `--stop-bots`.
 
 ### Verdict file format
 
@@ -280,7 +288,7 @@ stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
 
 1. Write the testplan ticket in `testplans/` (the source of truth — describes
    what is being tested and why, in human prose).
-   A self-describing scenario with no ticket (as Tests 5 to 10) skips this
+   A self-describing scenario with no ticket (as Tests 5 to 12) skips this
    step: its header comment lists what it checks, and its expected log
    fragments are taken from `src/` in the header or a constants block.
 2. Add `tests/integration/test-N-<short-name>.sh`, with `N` the next unused
