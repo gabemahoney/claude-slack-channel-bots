@@ -6,7 +6,11 @@
  * `renderPreviewLogLines`, `renderInvalidLogLine` and `isCredentialsBroken`,
  * plus the plan's `configDirsChanged` flag (the agent-director template
  * refresh, SR-8.6 step 5, never rendered) and facts the caller could not
- * gather (`FACT_UNKNOWN`).
+ * gather (`FACT_UNKNOWN`). A changed claude_config_dir (own, inherited from a
+ * changed top-level default, or alongside a destructive modify) that cannot
+ * be resolved, or could not be checked, gets a warning on its line, as an
+ * added persona that cannot come up does (bug b.g57); only such a persona is
+ * asked about.
  *
  * Every function here is pure, so the tests call them directly: configs are
  * resolved from file-form JSON with `parsePersonaConfigBytes` (defaults and
@@ -1000,6 +1004,167 @@ describe('next-launch changes', () => {
       header({ settings: 1 }),
       `server-wide setting ${setting} changed: once applied, it is recorded; no persona inherits it, so no instance is affected.`,
     ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A changed claude_config_dir that cannot be resolved (bug b.g57, E14 merge-prep)
+// ---------------------------------------------------------------------------
+
+describe('a changed claude_config_dir that cannot be resolved warns, as an added persona that cannot come up does', () => {
+  const PROBLEM = 'claude_config_dir cannot be resolved to a real path (ENOENT: a symlink on its path points to nothing)'
+  const FRESH = 'which starts fresh (the conversation is not resumed), instance kept until then'
+
+  /** Facts whose claude_config_dir check answers `answers[key]` and records each persona it is asked about, with its directory. */
+  function configDirFacts(answers: Record<string, string | typeof FACT_UNKNOWN | undefined>, extra: Partial<ChangePlanFacts> = {}) {
+    const asked: [key: string, dir: string | undefined][] = []
+    const f = facts({
+      configDirProblem: (p) => {
+        asked.push([p.key, p.claude_config_dir])
+        return answers[p.key]
+      },
+      ...extra,
+    })
+    return { f, asked }
+  }
+
+  test.each<[string, string | typeof FACT_UNKNOWN | undefined, string]>([
+    ['cannot be resolved', PROBLEM, `; but at that launch it cannot come up: ${PROBLEM}`],
+    ['could not be checked', FACT_UNKNOWN, '; whether it can come up at that launch could not be checked'],
+    ['resolves (the control)', undefined, ''],
+  ])("a persona's own changed claude_config_dir that %s: the warning ends its line; still a next-launch change, counted in place", (_label, answer, warning) => {
+    const newDir = join(root, 'bravo-claude-2')
+    const { f, asked } = configDirFacts({ bravo: answer })
+    const { plan, lines } = preview(edited((c) => (entry(c, 'bravo').claude_config_dir = newDir)), f)
+
+    // Asked about the candidate's persona, with its new directory, and about no other persona.
+    expect(asked).toEqual([['bravo', newDir]])
+    expect(plan.nextLaunch).toEqual([
+      { ...ref('bravo', 1), own: ['claude_config_dir'], inherited: [], ...(answer === undefined ? {} : { configDirUnresolvable: answer }) },
+    ])
+    expect(changePlanCounts(plan)).toEqual(counts({ inPlace: 1 }))
+    expect(destructiveLines(lines)).toEqual([])
+    expect(lines).toEqual([header({ inPlace: 1 }), `persona "bravo" (key=bravo): claude_config_dir changed: takes effect at its next launch, ${FRESH}${warning}.`])
+  })
+
+  test('with stop_hook_bootstrap changed too, the warning follows the joined next-launch effect', () => {
+    const { f } = configDirFacts({ bravo: PROBLEM })
+    const { lines } = preview(
+      edited((c) => {
+        entry(c, 'bravo').claude_config_dir = join(root, 'bravo-claude-2')
+        entry(c, 'bravo').stop_hook_bootstrap = false
+      }),
+      f,
+    )
+
+    expect(lines[1]).toBe(
+      `persona "bravo" (key=bravo): claude_config_dir, stop_hook_bootstrap changed: takes effect at its next launch, ${FRESH}; ` +
+        `but at that launch it cannot come up: ${PROBLEM}.`,
+    )
+  })
+
+  test('no claude_config_dir change, no check: an own stop_hook_bootstrap change, an in-place change and unchanged personas are never asked about', () => {
+    const { f, asked } = configDirFacts({ alpha: PROBLEM, bravo: PROBLEM, charlie: PROBLEM })
+    const { plan, lines } = preview(
+      edited((c) => {
+        entry(c, 'bravo').stop_hook_bootstrap = false
+        entry(c, 'alpha').permission_prompts = 'C0A0001'
+        entry(c, 'alpha').channels = [{ id: 'C0A0001', delivery: 'mentions' }]
+      }),
+      f,
+    )
+
+    expect(asked).toEqual([])
+    expect(plan.nextLaunch.map((p) => p.configDirUnresolvable)).toEqual([undefined])
+    expect(lines.join('\n')).not.toContain('cannot come up')
+  })
+
+  test.each<[string, Record<string, string | typeof FACT_UNKNOWN | undefined>, string]>([
+    ['every inheritor cannot resolve it', { alpha: PROBLEM, charlie: PROBLEM }, `; but at that launch "alpha" (key=alpha), "charlie" (key=charlie) cannot come up: ${PROBLEM}`],
+    [
+      'one cannot resolve it and the other could not be checked',
+      { alpha: PROBLEM, charlie: FACT_UNKNOWN },
+      `; but at that launch "alpha" (key=alpha) cannot come up: ${PROBLEM}; whether "charlie" (key=charlie) can come up at that launch could not be checked`,
+    ],
+    ['it resolves for every inheritor (the control)', {}, ''],
+  ])('a changed top-level claude_config_dir where %s: the warning ends its settings line', (_label, answers, warning) => {
+    const newDefault = join(root, 'claude-default-2')
+    const { f, asked } = configDirFacts(answers)
+    const { plan, lines } = preview(edited((c) => (c.claude_config_dir = newDefault)), f)
+
+    // Each inheritor is asked about, with the new default; bravo keeps its own directory and is not.
+    expect(asked).toEqual([
+      ['alpha', newDefault],
+      ['charlie', newDefault],
+    ])
+    const withAnswer = (key: string, index: number) =>
+      answers[key] === undefined ? ref(key, index) : { ...ref(key, index), configDirUnresolvable: answers[key] }
+    expect(plan.settings).toEqual([{ name: 'claude_config_dir', inheritedBy: [withAnswer('alpha', 0), withAnswer('charlie', 2)] }])
+    expect(changePlanCounts(plan)).toEqual(counts({ settings: 1 }))
+    expect(lines).toEqual([
+      header({ settings: 1 }),
+      `server-wide setting claude_config_dir changed: inherited by "alpha" (key=alpha), "charlie" (key=charlie); takes effect at each one's next launch, ${FRESH}${warning}.`,
+    ])
+  })
+
+  test('the top-level stop_hook_bootstrap line changed alongside never carries the claude_config_dir warning', () => {
+    const { f } = configDirFacts({ alpha: PROBLEM, charlie: PROBLEM })
+    const { plan, lines } = preview(
+      edited((c) => {
+        c.claude_config_dir = join(root, 'claude-default-2')
+        c.stop_hook_bootstrap = false
+      }),
+      f,
+    )
+
+    const stopHook = plan.settings.find((s) => s.name === 'stop_hook_bootstrap')
+    expect(stopHook?.inheritedBy).toEqual([ref('alpha', 0), ref('bravo', 1), ref('charlie', 2)])
+    const stopHookLine = lines.find((l) => l.startsWith('server-wide setting stop_hook_bootstrap'))
+    expect(stopHookLine).toBe(
+      'server-wide setting stop_hook_bootstrap changed: inherited by "alpha" (key=alpha), "bravo" (key=bravo), "charlie" (key=charlie); ' +
+        "takes effect at each one's next launch, instance kept.",
+    )
+    expect(lines.find((l) => l.startsWith('server-wide setting claude_config_dir'))).toEndWith(
+      `; but at that launch "alpha" (key=alpha), "charlie" (key=charlie) cannot come up: ${PROBLEM}.`,
+    )
+  })
+
+  test.each<[string, string | typeof FACT_UNKNOWN | undefined, string]>([
+    ['cannot be resolved', PROBLEM, `; but it cannot come up: ${PROBLEM}`],
+    ['could not be checked', FACT_UNKNOWN, '; whether it can come up could not be checked'],
+    ['resolves (the control)', undefined, ''],
+  ])('a destructive modify whose claude_config_dir changed too and %s: the warning ends its DESTRUCTIVE line', (_label, answer, warning) => {
+    const work = join(root, 'new-work')
+    const newDir = join(root, 'bravo-claude-2')
+    const { f, asked } = configDirFacts({ bravo: answer })
+    const { plan, lines } = preview(
+      edited((c) => {
+        entry(c, 'bravo').working_directory = work
+        entry(c, 'bravo').claude_config_dir = newDir
+      }),
+      f,
+    )
+
+    expect(asked).toEqual([['bravo', newDir]])
+    expect(plan.destructive.map((p) => [p.key, p.configDirUnresolvable])).toEqual([['bravo', answer]])
+    expect(plan.nextLaunch).toEqual([])
+    expect(destructiveLines(lines)).toEqual([
+      `DESTRUCTIVE: persona "bravo" (key=bravo) working_directory changed to ${JSON.stringify(work)}: ` +
+        `its live session will be destroyed, then it is brought up fresh${warning}.`,
+    ])
+  })
+
+  test("a destructive modify whose claude_config_dir did not change is not asked about, whatever the check would say", () => {
+    const { f, asked } = configDirFacts({ bravo: PROBLEM })
+    const { plan } = preview(edited((c) => (entry(c, 'bravo').working_directory = join(root, 'new-work'))), f)
+
+    expect(asked).toEqual([])
+    expect(plan.destructive[0]).not.toHaveProperty('configDirUnresolvable')
+  })
+
+  test('without the fact (a caller that gathers none), nothing warns', () => {
+    const { lines } = preview(edited((c) => (entry(c, 'bravo').claude_config_dir = join(root, 'bravo-claude-2'))))
+    expect(lines.join('\n')).not.toContain('cannot come up')
   })
 })
 

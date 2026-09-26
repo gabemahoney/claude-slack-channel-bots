@@ -13,7 +13,8 @@
  *   loader's keys and its complete example loads through the real loader;
  * - the README's pointers to the setup wizard;
  * - the shipped-text audit (AC 46) over `SHIPPED_TEXTS` (the README, every
- *   file under `skills/`, the whole manifest, the MCP instructions read
+ *   file under `skills/`, the whole manifest, the setup wizard's packaged
+ *   credentials script, the MCP instructions read
  *   through `MCP_INSTRUCTIONS` exported by src/registry.ts, the Slack Reply
  *   Guard's reminder text and the crontable template header): no
  *   first-@mention claim (SR-12), and no term of `FORBIDDEN_TERMS` (the
@@ -274,6 +275,8 @@ const KEY_TABLES: [heading: string, keys: readonly string[]][] = [
 const WIZARD_NAME = 'setup-slack-channel-bots'
 const WIZARD_FILE = `skills/${WIZARD_NAME}/SKILL.md`
 const WIZARD_CREDENTIALS_HEADING = 'Credentials command'
+/** The script the wizard's credentials command runs (`claude-slack-channel-bots credentials`), shipped in the package. */
+const CREDENTIALS_SCRIPT = 'scripts/write-credentials.sh'
 
 /** The inline links in `text`: each target split into its path ('' for a same-file anchor) and its anchor ('' when none). */
 function markdownLinks(text: string): { target: string; path: string; anchor: string }[] {
@@ -618,6 +621,7 @@ const SHIPPED_TEXTS: [name: string, read: () => string][] = [
   ['README.md', () => readRepoFile('README.md')],
   ...shippedSkillFiles().map((rel): [string, () => string] => [rel, () => readRepoFile(rel)]),
   ['slack-app-manifest.yml', () => readRepoFile('slack-app-manifest.yml')],
+  [CREDENTIALS_SCRIPT, () => readRepoFile(CREDENTIALS_SCRIPT)],
   [MCP_INSTRUCTIONS_NAME, mcpInstructionsText],
   [`${REPLY_GUARD_FILE} (reminder text)`, replyGuardReminderText],
   ['CRONTABLE_TEMPLATE_HEADER (src/cron-bootstrap.ts)', crontableHeaderText],
@@ -869,6 +873,10 @@ describe('AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
     expect(SHIPPED_TEXTS.map(([name]) => name)).toContain('skills/EXAMPLE_CLAUDE.md')
   })
 
+  test(`the audit reads ${CREDENTIALS_SCRIPT}, whose prompts and messages the operator sees`, () => {
+    expect(SHIPPED_TEXTS.map(([name]) => name)).toContain(CREDENTIALS_SCRIPT)
+  })
+
   const cases = SHIPPED_TEXTS.flatMap(([name, read]) =>
     FORBIDDEN_TERMS.map((group) => [name, group.name, group.cites, termLabels(group), read, group] as const),
   )
@@ -899,8 +907,7 @@ describe('AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
    * Shipped wording that is deliberately not a hit, each tied to its file and
    * the reason no term matches it. Not exemptions: each line is scanned like
    * any other; these cases pin that the term list leaves them alone. A
-   * RegExp names a line whose text is read from the file (frontmatter
-   * `author:` holds a person's name, which this file doesn't repeat).
+   * RegExp names a line whose text is read from the file.
    */
   const NOT_HITS_BY_DESIGN: [file: string, snippet: string | RegExp, reason: string][] = [
     [SR_1_7_EXCEPTION.file, "## A persona's routing settings were changed by a confirmed change", "E14 decision 12: a persona's channel and DM settings"],
@@ -909,10 +916,8 @@ describe('AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
     [SR_1_7_EXCEPTION.file, 'routinely', 'whole words: "routine" is not "routes"'],
     ['README.md', 'remove any token environment variables you exported for the previous version', "E14 decision 12's upgrade wording: variables are banned by name and export form"],
     ['README.md', 'slack-channel-router', 'the MCP server name; no route term matches it'],
-    [WIZARD_FILE, 'header = "Authorization: Bearer %s"', "the credentials command's curl config line, not a command-line argument"],
+    [CREDENTIALS_SCRIPT, 'header = "Authorization: Bearer %s"', "the credentials script's curl config line, read from curl's stdin, not a command-line argument"],
     [WIZARD_FILE, /^allowed-tools:.*$/m, 'skill frontmatter: a tool list, not an allowlist'],
-    [WIZARD_FILE, /^author:.*$/m, 'E14 decision 12: frontmatter author fields are out of scope; no term matches them'],
-    ['skills/install-cscb/SKILL.md', /^author:.*$/m, 'E14 decision 12: frontmatter author fields are out of scope; no term matches them'],
   ]
 
   test.each(NOT_HITS_BY_DESIGN)('%s: %p is not a hit (%s)', (file, snippet, _reason) => {

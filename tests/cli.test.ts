@@ -1,6 +1,11 @@
 /**
  * cli.test.ts — Coverage for the CLI surface (`start`, `stop`,
- * `clean_restart`) at the createCli factory level, with all I/O injected.
+ * `clean_restart`, `credentials`) at the createCli factory level, with all
+ * I/O injected. `credentials <persona>` finds the persona by name or key in
+ * `config.json` as it stands (never the record) and hands its
+ * `credentials_file` to an injected fake of the credentials-script runner;
+ * the script itself, and the one real run of the CLI through it, are
+ * tests/credentials-command.test.ts's.
  *
  * Persona model (b.av2 SR-8.7, SR-10.2): the CLI reads no Slack token (AC 47,
  * cli leg), takes its settings and persona set from the configuration the
@@ -13,7 +18,9 @@
  * removed for the whole file (restored afterwards), so no case or failure
  * message can see an ambient token. `start`'s daemon is always the injected
  * fake `spawnDaemon`; the only real spawns are the eight tests of the
- * `unknown subcommand` block (and its hidden-subcommand `beforeAll`), which
+ * `unknown subcommand` block (and its hidden-subcommand `beforeAll`) and the
+ * two real-CLI tests of `credentials` (a usage error and an unknown persona,
+ * neither of which reaches the script), which
  * run the CLI script through `runCli` with a built env (PATH, temp HOME, temp
  * SLACK_STATE_DIR and BUN_RUNTIME_TRANSPILER_CACHE_PATH=0). Waits in `start` and
  * `stop` (the daemon startup wait, the SIGTERM and SIGKILL polls) run on the
@@ -40,6 +47,8 @@ import {
 import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 import {
+  CREDENTIALS_SCRIPT_PATH,
+  CREDENTIALS_USAGE,
   DAEMON_FAILURE_LOG_LINES,
   DAEMON_STARTUP_POLL_MS,
   DAEMON_STARTUP_WAIT_MS,
@@ -57,6 +66,7 @@ import { AgentDirectorError, ErrCallTimeout, ErrSpawnNotFound } from '../src/age
 import {
   CONFIG_NOT_REGULAR_FILE_CODE,
   DEFAULT_PERSONA_CONFIG_FS,
+  loadPersonaConfig,
   prePersonaConversionMessage,
   resolveServerConfigPath,
   resolveServerStateDir,
@@ -248,6 +258,10 @@ interface Overrides {
   directorStatus?: (id: string) => Promise<{ state: string } | null>
   directorPause?: (id: string) => Promise<void>
   directorKill?: (id: string) => Promise<void>
+  /** `credentials`' loader of the configuration file; default the real `loadPersonaConfig` with the temp root as home. */
+  loadConfigFile?: (path: string) => PersonaConfig
+  /** The credentials script's exit status the fake runner returns; default 0. */
+  credentialsScriptStatus?: number
 }
 
 interface Bundle {
@@ -268,6 +282,10 @@ interface Bundle {
   serverSignals: string[]
   events: string[]
   initClientCalls: number[]
+  /** Each path `credentials` loaded the configuration file from. */
+  configFileLoads: string[]
+  /** Each credentials file the fake credentials-script runner was given. */
+  credentialsRuns: string[]
   readonly startServerCalled: boolean
 }
 
@@ -293,6 +311,8 @@ function makeDeps(o: Overrides = {}): Bundle {
   const serverSignals: string[] = []
   const events: string[] = []
   const initClientCalls: number[] = []
+  const configFileLoads: string[] = []
+  const credentialsRuns: string[] = []
   let startServerCalled = false
   if (o.serverPid !== undefined) writeFileSync(pidPath, `${o.serverPid}\n`)
   const stateEnv = { SLACK_STATE_DIR: stateDir }
@@ -351,6 +371,16 @@ function makeDeps(o: Overrides = {}): Bundle {
       events.push('loadConfig')
       return o.loadConfig ? o.loadConfig(path) : (o.config ?? opsConfig())
     },
+    loadConfigFile: (path) => {
+      configFileLoads.push(path)
+      events.push('loadConfigFile')
+      return o.loadConfigFile ? o.loadConfigFile(path) : loadPersonaConfig(path, root)
+    },
+    runCredentialsScript: (credentialsFile) => {
+      credentialsRuns.push(credentialsFile)
+      events.push('runCredentialsScript')
+      return o.credentialsScriptStatus ?? 0
+    },
     ...(o.initClient
       ? {
           initClient: async () => {
@@ -378,7 +408,7 @@ function makeDeps(o: Overrides = {}): Bundle {
   return {
     deps, clock, exitCodes, exitTimes, spawnCalls, daemonSpawns, logOpens, closedFds, logInits, loadPaths,
     statusCalls, pauseCalls, killCalls,
-    serverSignals, events, initClientCalls,
+    serverSignals, events, initClientCalls, configFileLoads, credentialsRuns,
     get startServerCalled() { return startServerCalled },
   }
 }
@@ -1907,6 +1937,169 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// credentials <persona> — the setup wizard's credentials command (b.av2 SR-12,
+// SR-1.4 part). The script it runs is tests/credentials-command.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('credentials <persona>', () => {
+  const opsKey = (): string => personaKey(OPS_NAME)
+  const opsCredentials = (): string => join(root, 'personas', opsKey(), 'credentials.json')
+  const handedOver = (name: string, path: string): string => `Credentials file of persona ${renderPersonaRef(name)}: ${path}`
+
+  /** Nothing of the server's side was touched: no record or applied-config read, no daemon, no spawn, no agent-director. */
+  function expectNoServerSide(b: Bundle): void {
+    expect(b.loadPaths).toEqual([])
+    expect(b.daemonSpawns).toEqual([])
+    expect(b.spawnCalls).toEqual([])
+    expect(b.initClientCalls).toEqual([])
+    expect([b.statusCalls, b.pauseCalls, b.killCalls]).toEqual([[], [], []])
+    expect(b.serverSignals).toEqual([])
+  }
+
+  test.each<[string, () => string]>([
+    ['its name', () => OPS_NAME],
+    ['its key', opsKey],
+  ])('found by %s in config.json: names the persona and its file, runs the script for that credentials_file and exits 0 with it', async (_label, target) => {
+    const b = makeDeps()
+
+    await expect(createCli(b.deps).credentials([target()])).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.configFileLoads).toEqual([configPath])
+    expect(b.credentialsRuns).toEqual([opsCredentials()])
+    expect(b.events).toEqual(['loadConfigFile', 'runCredentialsScript'])
+    expect(stderr).toEqual([handedOver(OPS_NAME, opsCredentials())])
+    expect(b.exitCodes).toEqual([0])
+    expectNoServerSide(b)
+    assertNoLeak({ stderr })
+  })
+
+  test.each([1, 2, 130])("the script's exit status %d is the command's", async (status) => {
+    const b = makeDeps({ credentialsScriptStatus: status })
+
+    await expect(createCli(b.deps).credentials([OPS_NAME])).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.credentialsRuns).toEqual([opsCredentials()])
+    expect(b.exitCodes).toEqual([status])
+  })
+
+  test('a ~/ credentials_file reaches the script expanded under the home directory, as the loader expands it', async () => {
+    writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name: OPS_NAME, credentials_file: '~/.config/cscb/ops.json' }, root)] }, root))
+    const b = makeDeps()
+
+    await expect(createCli(b.deps).credentials([OPS_NAME])).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.credentialsRuns).toEqual([join(root, '.config', 'cscb', 'ops.json')])
+    expect(b.exitCodes).toEqual([0])
+  })
+
+  test('the persona comes from config.json as it stands, never the last-applied record: one declared but not yet confirmed is found', async () => {
+    // The record holds only Ops Bot; config.json adds "newbie", not yet confirmed.
+    writeFileSync(recordPath(), readFileSync(configPath))
+    const newbie = makePersona({ name: 'newbie', channels: [{ id: 'C0NEW0001', delivery: 'all' }], permission_prompts: 'C0NEW0001' }, root)
+    writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name: OPS_NAME }, root), newbie] }, root))
+    const b = makeDeps()
+
+    await expect(createCli(b.deps).credentials(['newbie'])).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.configFileLoads).toEqual([configPath])
+    expect(b.credentialsRuns).toEqual([join(root, 'personas', 'newbie', 'credentials.json')])
+    expect(b.exitCodes).toEqual([0])
+    expectNoServerSide(b)
+  })
+
+  test.each<[string, string[]]>([
+    ['no persona', []],
+    ['two personas', [OPS_NAME, 'another']],
+    ['an empty persona', ['']],
+  ])('%s: exit 2 with the usage line; nothing loaded or run', async (_label, args) => {
+    const b = makeDeps()
+
+    await expect(createCli(b.deps).credentials(args)).rejects.toBeInstanceOf(ExitError)
+
+    expect(stderr).toEqual([CREDENTIALS_USAGE])
+    expect(b.exitCodes).toEqual([2])
+    expect(b.configFileLoads).toEqual([])
+    expect(b.credentialsRuns).toEqual([])
+    expectNoServerSide(b)
+  })
+
+  test('no persona has that name or key: exit 1, the declared personas listed, the argument never repeated (a token typed there stays off the screen), nothing run', async () => {
+    const b = makeDeps()
+
+    await expect(createCli(b.deps).credentials([fakeToken(BOT_TOKEN_PREFIX)])).rejects.toBeInstanceOf(ExitError)
+
+    expect(stderr).toEqual([
+      `credentials: no persona in ${configPath} has that name or key; declare it there first (declared: ${renderPersonaRef(OPS_NAME)})`,
+    ])
+    expect(b.exitCodes).toEqual([1])
+    expect(b.credentialsRuns).toEqual([])
+    assertNoLeak({ stderr })
+  })
+
+  test('with no persona declared, the line says declared: none', async () => {
+    writeConfigFile(stateDir, { personas: [] })
+    const b = makeDeps()
+
+    await expect(createCli(b.deps).credentials(['anyone'])).rejects.toBeInstanceOf(ExitError)
+
+    expect(stderr).toEqual([`credentials: no persona in ${configPath} has that name or key; declare it there first (declared: none)`])
+    expect(b.exitCodes).toEqual([1])
+  })
+
+  test.each<[string, () => void]>([
+    ['config.json missing', () => rmSync(configPath)],
+    ['config.json malformed', () => writeFileSync(configPath, '{ "personas": [')],
+    ['a pre-persona config.json', () => writeConfigFile(stateDir, { default_route: { cwd: join(root, 'work') } })],
+    [
+      'a token pasted into config.json under bot_token',
+      () => writeConfigFile(stateDir, { personas: [{ ...makePersona({ name: OPS_NAME }, root), bot_token: fakeToken(BOT_TOKEN_PREFIX) }] }),
+    ],
+  ])("%s: exit 1 with the loader's error naming the file, no token shown, nothing run", async (_label, prepare) => {
+    prepare()
+    const b = makeDeps()
+
+    await expect(createCli(b.deps).credentials([OPS_NAME])).rejects.toBeInstanceOf(ExitError)
+
+    expect(stderr).toHaveLength(1)
+    expect(stderr[0]).toStartWith(`credentials: cannot read the personas in ${configPath}: loadPersonaConfig: `)
+    expect(stderr[0]).toContain(JSON.stringify(configPath))
+    expect(b.exitCodes).toEqual([1])
+    expect(b.credentialsRuns).toEqual([])
+    expectNoServerSide(b)
+    assertNoLeak({ stderr })
+  })
+
+  test('production wiring (static): the configuration file through loadPersonaConfig, the bash runner, and the script shipped beside src/', () => {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    const props = objectProperties(code.slice(code.indexOf('const realDeps: CliDeps =')))
+    expect(props.get('loadConfigFile')).toBe('(path) => loadPersonaConfig(path)')
+    expect(props.get('runCredentialsScript')).toBe('runCredentialsScript')
+    expect(code).toMatch(/spawnSync\('bash', \[CREDENTIALS_SCRIPT_PATH, credentialsFile\], \{ stdio: 'inherit' \}\)/)
+    expect(CREDENTIALS_SCRIPT_PATH).toBe(resolve(import.meta.dir, '..', 'scripts', 'write-credentials.sh'))
+    expect(existsSync(CREDENTIALS_SCRIPT_PATH)).toBe(true)
+  })
+
+  test('the real CLI: `credentials` alone prints the usage line and exits 2', () => {
+    const result = runCli(['credentials'])
+
+    expect(result.status).toBe(2)
+    expect(result.stderr).toBe(`${CREDENTIALS_USAGE}\n`)
+    expect(result.stdout).toBe('')
+  })
+
+  test('the real CLI: a persona config.json does not declare exits 1 before any script runs, leaving the tree as it was', () => {
+    const before = snapshotTree()
+
+    const result = runCli(['credentials', 'nobody'])
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(`credentials: no persona in ${configPath} has that name or key`)
+    expect(result.output).not.toContain('bot_token (')
+    expect(snapshotTree()).toEqual(before)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // unknown subcommand — regression for b.8tm (trail subcommand removed), and
 // the unadvertised reload gesture (b.av2 SR-8.8, AC 74 cli leg)
 // ---------------------------------------------------------------------------
@@ -1979,13 +2172,13 @@ describe('unknown subcommand', () => {
     expect(reloadTermsIn(output)).toEqual([])
   })
 
-  test('AC 74: no arguments exits non-zero with usage listing exactly start, stop and clean_restart, and only --stop-bots, under stop, with no reload wording', () => {
+  test('AC 74: no arguments exits non-zero with usage listing exactly start, stop, clean_restart and credentials, and only --stop-bots, under stop, with no reload wording', () => {
     const result = runCli([])
 
     expect(result.status).not.toBe(0)
     const usage = usageEntries(result.output)
-    expect(usage.synopsis.sort()).toEqual(['clean_restart', 'start', 'stop'])
-    expect(usage.listed.sort()).toEqual(['clean_restart', 'start', 'stop'])
+    expect(usage.synopsis.sort()).toEqual(['clean_restart', 'credentials', 'start', 'stop'])
+    expect(usage.listed.sort()).toEqual(['clean_restart', 'credentials', 'start', 'stop'])
     expect(usage.flags).toEqual({ stop: ['--stop-bots'] })
     expect(usage.unexpected).toEqual([])
     expect(usage.allFlags).toEqual(['--stop-bots'])

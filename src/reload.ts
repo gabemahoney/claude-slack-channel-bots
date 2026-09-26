@@ -396,8 +396,9 @@ export interface ReloadControllerDeps {
    */
   workingDirectoryFs?: Partial<WorkingDirectoryFs>
   /**
-   * The detection tick's claude_config_dir check of an added persona (bug
-   * b.g57): production passes the session manager's pre-launch check
+   * The detection tick's claude_config_dir check of an added persona and of
+   * a persona whose effective claude_config_dir changed (bug b.g57):
+   * production passes the session manager's pre-launch check
    * (`checkLaunchConfigDir`), the one the bring-up controller checks with, so
    * the preview and the bring-up resolve the directory the same way. Default
    * `checkPersonaConfigDir` against `home` and the real file system.
@@ -666,10 +667,12 @@ const UNREADABLE_CONFIRMATION_IDENTITY = 'unreadable'
  *
  * The plan's facts come from what the pass already read, plus the least
  * extra I/O: real paths only for paths written differently in the two
- * configurations, and for each added persona the credentials content check
- * over the bytes already read (none in dry run) and the working-directory
- * check. An unchanged persona is not probed. The bring-up state is asked
- * only for a persona whose credentials changed.
+ * configurations, for each added persona the credentials content check
+ * over the bytes already read (none in dry run), the working-directory
+ * check and the claude_config_dir check, and that claude_config_dir check
+ * for each persona whose effective claude_config_dir changed. An unchanged
+ * persona is not probed. The bring-up state is asked only for a persona
+ * whose credentials changed.
  *
  * Confirmation (b.av2 SR-8.5): each pass first derives the state, then
  * processes `config.json.apply` before refreshing the pending state. The
@@ -812,6 +815,25 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   }
 
   /**
+   * Why a persona whose effective claude_config_dir changed cannot come up
+   * with the new one (bug b.g57): the same check as an added persona's
+   * (`checkConfigDir`, so the preview, the bring-up and the launch resolve
+   * the directory the same way), its `problem` when the directory cannot be
+   * resolved, undefined when it resolves. A check that throws is a fact that
+   * could not be gathered (`FACT_UNKNOWN`). The plan asks only for such a
+   * persona, so no unchanged persona is probed.
+   */
+  function changedConfigDirProblem(persona: Persona): string | FactUnknown | undefined {
+    try {
+      const result = checkConfigDir(persona)
+      return result.ok ? undefined : result.problem
+    } catch (err) {
+      noteFactFailure(`the claude_config_dir of persona ${renderPersonaRef(persona.name, persona.key)}`, err)
+      return FACT_UNKNOWN
+    }
+  }
+
+  /**
    * One pass's pending state. Every credentials file is read and digested at
    * most once, and only outside dry run. The change plan decides whether any
    * credentials changed (`buildChangePlan`), from the digests of this pass's
@@ -878,6 +900,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
         }
       },
       addedCannotComeUp: candidate.kind === 'valid' ? addedCannotComeUp(candidate.config, readCredentials) : undefined,
+      configDirProblem: changedConfigDirProblem,
     }
     const plan = buildChangePlan(applied.config, candidate, facts)
     if (!factFailed) factFailureLatched = false

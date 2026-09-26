@@ -102,6 +102,11 @@
  * sets nothing (a bad value never stops the start); each option builder adds
  * `slackApiUrl` only when given one (a socket's in its `clientOptions`), and
  * the manager passes it to every client it builds.
+ * The E14 merge-prep pass adds the error message on a
+ * `persona-slack-unreachable` start line: a Slack-unreachable outcome
+ * carries its thrown value's message as `describeLogMessage` renders it
+ * (redacted, one line, capped), after the cause, never for a timeout marker;
+ * the cause, the cleared line and a refusal carry none.
  * Time is a fake clock throughout;
  * nothing sleeps (the start-pass cases poll in 1 ms real-time steps only for
  * the real spawn path).
@@ -216,6 +221,7 @@ import {
   botIdentityFromAuthTest,
   classifySlackValidationError,
   type SlackCredentialsRefusedOutcome,
+  type SlackUnreachableOutcome,
   type SlackValidationCheck,
   type SlackValidationFailure,
   type SlackValidationOutcome,
@@ -1527,8 +1533,12 @@ const LEG_KEY = { 'auth.test': 'bot_token', 'socket-mode': 'app_token' } as cons
 /** How each leg's check is named in a cause. */
 const LEG_CHECK_TEXT = { 'auth.test': 'auth.test', 'socket-mode': 'Socket Mode open' } as const
 
-/** The only fields a failure outcome may hold (SR-10.3: nothing else is copied from the error). */
-const OUTCOME_FIELDS = ['kind', 'class', 'check', 'key', 'reason', 'cause', 'slackError', 'status', 'retryAfter']
+/**
+ * The only fields a failure outcome may hold (SR-10.3: nothing else is copied
+ * from the error; `message` is a Slack-unreachable outcome's error message,
+ * redacted by `describeLogMessage`).
+ */
+const OUTCOME_FIELDS = ['kind', 'class', 'check', 'key', 'reason', 'cause', 'slackError', 'status', 'retryAfter', 'message']
 
 /** One scripted Slack answer: a Web API outcome on the `auth.test` leg, a connect outcome on the socket leg. */
 type Scripted = WebApiOutcome | ConnectOutcome
@@ -1599,18 +1609,22 @@ function carriesPlantedSentinel(thrown: unknown): boolean {
 const DNS: Scripted = { kind: 'dns' }
 const UP = 'up' as const
 
-/** A value shaped like a `@slack/web-api` error with `code` and `fields`, its message holding the sentinel. */
+/**
+ * A value shaped like a `@slack/web-api` error with `code` and `fields`, its
+ * message holding the sentinel inside a fake token and a `ticket=` URL
+ * (`sentinelInMessage`), which a logged message keeps only redacted.
+ */
 function libraryShaped(code: string, fields: Record<string, unknown>): Error {
-  return Object.assign(new Error(`library-shaped ${LEAK_SENTINEL}`), { code }, fields)
+  return Object.assign(new Error(`library-shaped ${sentinelInMessage('')}`), { code }, fields)
 }
 
 /**
  * A rejection value whose `code`, `name` and `data` getters throw. They are
- * non-enumerable, so assertNoLeak reaches the sentinel in `message` instead of
- * tripping on a getter.
+ * non-enumerable, so assertNoLeak reaches the sentinel in `message` (inside
+ * `sentinelInMessage`) instead of tripping on a getter.
  */
 function throwingGetters(): object {
-  const value = { message: `boom ${LEAK_SENTINEL}` }
+  const value = { message: `boom ${sentinelInMessage('')}` }
   for (const prop of ['code', 'name', 'data']) {
     Object.defineProperty(value, prop, {
       enumerable: false,
@@ -1647,15 +1661,15 @@ describe('Slack validation classification (both legs, sentinel-bearing errors)',
     ['apps.connections.open returned no URL', { kind: 'no-url' }, 'slack-unreachable', { 'socket-mode': { reason: 'no-url' } }],
     [
       'a plain Error',
-      { kind: 'reject', value: new Error(`boom ${LEAK_SENTINEL}`) },
+      { kind: 'reject', value: new Error(`boom ${sentinelInMessage('')}`) },
       'slack-unreachable',
       { 'auth.test': { reason: 'unknown' }, 'socket-mode': { reason: 'no-url' } },
     ],
     // Only a value named exactly `Error` is the library's no-URL error.
-    ['a TypeError', { kind: 'reject', value: new TypeError(`boom ${LEAK_SENTINEL}`) }, 'slack-unreachable', both({ reason: 'unknown' })],
+    ['a TypeError', { kind: 'reject', value: new TypeError(`boom ${sentinelInMessage('')}`) }, 'slack-unreachable', both({ reason: 'unknown' })],
     [
       'a plain object with only a message',
-      { kind: 'reject', value: { message: `apps.connections.open did not return a URL! ${LEAK_SENTINEL}` } },
+      { kind: 'reject', value: { message: `apps.connections.open did not return a URL! ${sentinelInMessage('')}` } },
       'slack-unreachable',
       both({ reason: 'unknown' }),
     ],
@@ -1666,7 +1680,7 @@ describe('Slack validation classification (both legs, sentinel-bearing errors)',
       'slack-unreachable',
       both({ reason: 'http-status' }),
     ],
-    ['a string rejection value', { kind: 'reject', value: `boom ${LEAK_SENTINEL}` }, 'slack-unreachable', both({ reason: 'unknown' })],
+    ['a string rejection value', { kind: 'reject', value: `boom ${sentinelInMessage('')}` }, 'slack-unreachable', both({ reason: 'unknown' })],
     ['a plain-object rejection value', { kind: 'reject', value: { token: fakeToken(BOT_TOKEN_PREFIX) } }, 'slack-unreachable', both({ reason: 'unknown' })],
     ['a null rejection value', { kind: 'reject', value: null }, 'slack-unreachable', both({ reason: 'unknown' })],
     [
@@ -1702,11 +1716,13 @@ describe('Slack validation classification (both legs, sentinel-bearing errors)',
     ['a PlatformError whose error is empty', { kind: 'platform', error: '' }, 'slack-unreachable', both({ reason: 'unknown' })],
     [
       'a PlatformError whose error is an HTML page (holds the sentinel)',
-      { kind: 'platform', error: `<!DOCTYPE html><html><body>${LEAK_SENTINEL}</body></html>` },
+      { kind: 'platform', error: `<!DOCTYPE html><html><body>${sentinelInMessage('')}</body></html>` },
       'slack-unreachable',
       both({ reason: 'unknown' }),
     ],
-    ['a PlatformError whose error is the bare sentinel', { kind: 'platform', error: LEAK_SENTINEL }, 'slack-unreachable', both({ reason: 'unknown' })],
+    // The library words its message `An API error occurred: <data.error>`, so a
+    // non-code `data.error` reaches the message: a token there is redacted.
+    ['a PlatformError whose error is a token (holds the sentinel)', { kind: 'platform', error: fakeToken(BOT_TOKEN_PREFIX) }, 'slack-unreachable', both({ reason: 'unknown' })],
     [
       'a PlatformError whose error is a lowercase identifier longer than 64 characters',
       { kind: 'platform', error: `invalid_auth_${'x'.repeat(60)}` },
@@ -1715,7 +1731,7 @@ describe('Slack validation classification (both legs, sentinel-bearing errors)',
     ],
     [
       'a PlatformError whose error is not a short lowercase identifier (holds the sentinel)',
-      { kind: 'platform', error: `invalid_auth ${LEAK_SENTINEL}` },
+      { kind: 'platform', error: `invalid_auth ${sentinelInMessage('')}` },
       'slack-unreachable',
       both({ reason: 'unknown' }),
     ],
@@ -1763,6 +1779,19 @@ describe('Slack validation classification (both legs, sentinel-bearing errors)',
       else expect(run.outcome).not.toHaveProperty(field)
     }
     expect(lines.map(classOf)).toEqual([cls, cls])
+    // The cause holds no error text; a Slack-unreachable start line carries the
+    // outcome's redacted message after it, and only a thrown value's message,
+    // never a timeout marker's, becomes one. A refusal carries none.
+    expect(run.outcome.cause).not.toContain('message=')
+    if (run.outcome.kind === 'slack-unreachable') {
+      const { message } = run.outcome
+      expect(lines[0]).toEndWith(message === undefined ? `: ${run.outcome.cause}` : `: ${run.outcome.cause} ${message}`)
+      if (!run.rejected || run.outcome.reason === 'timeout') expect(message).toBeUndefined()
+      if (message !== undefined) expect(message).toStartWith('message="')
+    } else {
+      expect(run.outcome).not.toHaveProperty('message')
+    }
+    expect(lines[1]).not.toContain('message=')
   })
 
   test('a websocket error: the emitted socket-mode error and the start() rejection are both Slack-unreachable', async () => {
@@ -1774,6 +1803,76 @@ describe('Slack validation classification (both legs, sentinel-bearing errors)',
     expect(() => assertNoLeak(run.socketErrors)).toThrow()
     expect(emitted).toMatchObject({ kind: 'slack-unreachable', reason: 'network', key: 'app_token' })
     expect(run.outcome).toMatchObject({ kind: 'slack-unreachable', reason: 'socket-closed', key: 'app_token' })
+  })
+})
+
+describe('persona-slack-unreachable: the start line carries the error message, redacted (E14 merge-prep)', () => {
+  const LEGS: Leg[] = ['auth.test', 'socket-mode']
+
+  /** Classify `value` on `leg` and run the outcome through a tracker: its start line, then its cleared line. */
+  function unreachableLines(value: unknown, leg: Leg): { outcome: SlackUnreachableOutcome; lines: string[] } {
+    const outcome = classifySlackValidationError(value, leg)
+    if (outcome.kind !== 'slack-unreachable') throw new Error(`expected slack-unreachable, got ${outcome.kind}`)
+    const { tracker, lines } = makeTracker()
+    tracker.record(outcome)
+    tracker.record({ kind: 'up' })
+    assertNoLeak({ outcome, lines }, `slack-unreachable via ${leg}`)
+    return { outcome, lines }
+  }
+
+  // Redacted first, then cut at the cap: the placeholders lead, so they survive the cut.
+  const LONG = `${sentinelInMessage('')} ${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)}`
+  test.each<[string, () => unknown, string]>([
+    ['an Error', () => new Error(`connect failed ${sentinelInMessage('')}`), `message="connect failed ${REDACTED_SENTINEL_TAIL}"`],
+    ['a thrown string', () => `socket gone ${sentinelInMessage('')}`, `message="socket gone ${REDACTED_SENTINEL_TAIL}"`],
+    ['a multi-line message', () => new Error(`first line\nsecond ${sentinelInMessage('')}`), `message="first line second ${REDACTED_SENTINEL_TAIL}"`],
+    [
+      'a library request error',
+      () => libraryShaped('slack_webapi_request_error', { original: new Error(`socket hang up ${LEAK_SENTINEL}`) }),
+      `message="library-shaped ${REDACTED_SENTINEL_TAIL}"`,
+    ],
+    ['a message past the cap', () => new Error(LONG), describeLogMessage(LONG)],
+  ])('%s: the start line ends with the cause, then message="…" as describeLogMessage renders it; the token and URL are redacted', (_label, value, expected) => {
+    for (const leg of LEGS) {
+      const { outcome, lines } = unreachableLines(value(), leg)
+      const thrown = value()
+      expect(outcome.message).toBe(expected)
+      expect(outcome.message).toBe(describeLogMessage(typeof thrown === 'string' ? thrown : (thrown as Error).message))
+      expect(outcome.cause).not.toContain('message=')
+      expect(lines[0]).toStartWith(`[slack] ${PERSONA_SLACK_UNREACHABLE}: personas[0] `)
+      expect(lines[0]).toEndWith(`: ${outcome.cause} ${expected}`)
+      expect(lines[0]).toContain(REDACTED_TOKEN_PLACEHOLDER)
+      expect(lines[0]).toContain(REDACTED_URL_PLACEHOLDER)
+      expect(lines[0]).not.toContain('\n')
+      // The cleared line carries no message.
+      expect(lines[1]).toEndWith(`: cleared: Slack answered after being unreachable checking ${LEG_KEY[leg]} via ${outcome.check === 'auth.test' ? 'auth.test' : 'the Socket Mode open'}`)
+    }
+  })
+
+  test.each<[string, Leg, () => unknown]>([
+    ['the WebSocket-phase timeout marker', 'socket-mode', () => new SlackStartTimeoutError()],
+    ['the auth.test timeout marker', 'auth.test', () => new SlackAuthTestTimeoutError()],
+    ['no rejection value (socket closed before hello)', 'socket-mode', () => undefined],
+    ['an Error with an empty message', 'auth.test', () => new Error('')],
+    ['a plain object with no message', 'auth.test', () => ({ token: fakeToken(BOT_TOKEN_PREFIX) })],
+  ])('%s: no message, the start line ends with the cause', (_label, leg, value) => {
+    const { outcome, lines } = unreachableLines(value(), leg)
+    expect(outcome).not.toHaveProperty('message')
+    expect(lines[0]).toEndWith(`: ${outcome.cause}`)
+    expect(lines[0]).not.toContain('message=')
+  })
+
+  test('a refusal carries no message: the credentials-refused line names the Slack error code only', () => {
+    const refused = classifySlackValidationError(
+      libraryShaped('slack_webapi_platform_error', { data: { ok: false, error: 'invalid_auth' } }),
+      'auth.test',
+    )
+    const { tracker, lines } = makeTracker()
+    tracker.record(refused)
+    assertNoLeak({ refused, lines })
+    expect(refused).not.toHaveProperty('message')
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toEndWith(': bot_token refused by auth.test: Slack error invalid_auth')
   })
 })
 
@@ -4545,10 +4644,15 @@ function personaLine(p: BringUpPersona, cls: PersonaDiagnosticClass, cause: stri
   return formatPersonaDiagnostic({ class: cls, name: p.name, key: p.key, index: p.index, path: p.credentials_file, cause })
 }
 
-/** The Slack-unreachable cause of a reconnect's first attempt left retrying; throws (naming only the kind) otherwise. */
+/**
+ * What the `persona-slack-unreachable` start line of a reconnect's first
+ * attempt left retrying carries: its cause, then its redacted message when it
+ * has one. Throws (naming only the kind) otherwise.
+ */
 function retryingCause(outcome: PersonaReconnectOutcome): string {
   if (outcome.kind !== 'retrying') throw new Error(`expected a reconnect left retrying, got ${outcome.kind}`)
-  return outcome.outcome.cause
+  const { cause, message } = outcome.outcome
+  return message === undefined ? cause : `${cause} ${message}`
 }
 
 /** A listener for a reconnect's later outcome, recording what it is told. */

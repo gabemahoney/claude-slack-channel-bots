@@ -37,7 +37,6 @@ const FRONTMATTER_FIELDS = [
   'name:',
   'description:',
   'version:',
-  'author:',
   'license:',
   'user-invocable: true',
   'argument-hint:',

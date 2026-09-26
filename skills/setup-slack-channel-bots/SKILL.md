@@ -2,7 +2,6 @@
 name: setup-slack-channel-bots
 description: Interactive setup wizard for claude-slack-channel-bots — adds personas one at a time (a Slack app from the manifest, its name and avatar, its credentials file written by a terminal command so tokens never enter the chat, its channels and DMs, its entry in config.json), then checks the system prompt, agent-director and legacy hooks and explains how the change takes effect.
 version: 1.0.0
-author: Jeremy Longshore <jeremy@intentsolutions.io>
 license: MIT
 user-invocable: true
 argument-hint: ""
@@ -116,7 +115,7 @@ confirmation applies everything `config.json` holds at that moment.
 
 ### Step 4 — Add a persona
 
-Ask how many personas the operator wants to add, then run 4.1 to 4.9 once for
+Ask how many personas the operator wants to add, then run 4.1 to 4.10 once for
 each. One persona is one Slack app; never share an app or a credentials file
 between personas.
 
@@ -169,7 +168,7 @@ Create one Slack app for this persona from the shipped manifest,
    with `xapp-`.
 
 Tell the operator where both tokens are. Don't ask for them: they go into the
-terminal command in 4.3.
+terminal command in 4.10.
 
 **Reusing an existing app** for this persona: an app created from an earlier
 manifest lacks the `im:write` scope and must gain it and be re-installed. Point
@@ -177,25 +176,14 @@ to the debugging skill's entry "A persona can't open a DM: re-install its app
 to gain `im:write`" (`skills/debug-slack-channel-bots/SKILL.md`) for the steps.
 An app already used by another persona can't be reused.
 
-#### 4.3 Credentials file
+#### 4.3 Credentials file path
 
 Agree the `credentials_file` path: absolute or starting with `~/`, one file
 per persona. Suggest `~/.config/cscb/<key>-credentials.json`. Use the
 persona's key when the name is its own key (4.1); otherwise use a lower-case
-form of the name with only `a-z`, `0-9` and `_`, as keys have, so the path
-needs no quoting. Reject a path another persona already uses, and a path that
-contains a single quote (`'`) or a newline: the credentials command can't hold
-it.
-
-Give the operator the [Credentials command](#credentials-command) with the
-path filled in, and have them run it in their own terminal. After they report
-success, check only that the file exists and has mode 0600:
-
-```bash
-ls -lL "<expanded credentials file path>"
-```
-
-`-rw-------` is mode 0600. Never open the file.
+form of the name with only `a-z`, `0-9` and `_`, as keys have. Reject a path
+another persona already uses. The operator writes the file in 4.10, once the
+persona is declared: the credentials command finds it in `config.json`.
 
 #### 4.4 Working directory
 
@@ -304,8 +292,24 @@ already in the file:
 - no key outside the README's `#### Persona fields` table.
 
 On the operator's approval, append the entry to `personas` in `config.json`,
-keeping every other field and persona unchanged. Then ask whether to add
-another persona.
+keeping every other field and persona unchanged.
+
+#### 4.10 Write its credentials file
+
+Give the operator the [Credentials command](#credentials-command) with the
+persona's name filled in, and have them run it in their own terminal. After
+they report success, check only that the file exists and has mode 0600:
+
+```bash
+ls -lL "<expanded credentials file path>"
+```
+
+`-rw-------` is mode 0600. Never open the file.
+
+On a running server, the preview the server writes after 4.9 first reads
+`is added but cannot come up: credentials file does not exist`. Once the file
+is written the server writes a new preview; the operator confirms only after
+it (Step 9). Then ask whether to add another persona.
 
 ---
 
@@ -467,198 +471,57 @@ lines.
 
 ## Credentials command
 
-The operator runs this in their own terminal (bash or zsh, on linux-x64 or
-darwin-arm64). Never paste a token into the chat. Before handing it over,
-replace `<credentials file path>` on the block's third line with the path from
-4.3, keeping the single quotes; the path is absolute or starts with `~/`, and
-contains no single quote or newline. Nothing else in the block changes. Show
-it as one fenced block, and tell the operator to copy and paste only the lines
-between the fences, not the fence lines. No line is longer than 60
-characters, so a copy from the terminal keeps every line whole, and no line
-ends in a backslash, so the trailing spaces a terminal copy can add to each
-line don't change what runs.
+The operator runs this one line in their own terminal (bash or zsh, on
+linux-x64 or darwin-arm64), once the persona is declared in `config.json`
+(4.9). Never paste a token into the chat. Before handing it over, replace
+`<persona>` with the persona's name as `config.json` declares it, or its key.
+Single-quote a name that holds anything but letters, digits and `_`
+(`'Dev Bot'`); a single quote inside it is written `'\''`.
 
 ```bash
-(
-set +xa
-creds_file='<credentials file path>'
-f='credentials file:'
-cscb_die() {
-  printf '%s\n' "$2" >&2
-  exit "$1"
-}
-case "$creds_file" in
-  "~") creds_file="$HOME" ;;
-  "~/"*) creds_file="$HOME/${creds_file#"~/"}" ;;
-esac
-m="$f the path must be absolute or start with ~/"
-case "$creds_file" in
-  /*[^/]) ;;
-  *) cscb_die 2 "$m and name a file: $creds_file" ;;
-esac
-if [ -d "$creds_file" ]; then
-  cscb_die 2 "$f $creds_file is a directory"
-fi
-command -v curl >/dev/null 2>&1 ||
-  cscb_die 1 'curl: not found; install it, then run again'
-umask 077
-cscb_ask() {
-  while :; do
-    printf '%s' "$1" >&2
-    val='' e=0
-    read "-r$2" val || e=1
-    [ -t 0 ] && [ -z "$2" ] || printf '\n' >&2
-    [ -t 0 ] && [ -n "$2" ] && [ -z "$val" ] &&
-      [ "$e" = 0 ] || return 0
-  done
-}
-cscb_kind() {
-  if [ -L "$creds_file" ]; then kind=L
-  elif [ -e "$creds_file" ]; then kind=e
-  else kind=0
-  fi
-}
-cscb_kind
-had=$kind
-if [ "$had" = 0 ]; then :; else
-  q="$creds_file already exists."
-  cscb_ask "$q Type yes to replace it: " ''
-  [ "$val" = yes ] ||
-    cscb_die 1 "Not replaced: $creds_file is unchanged."
-fi
-p='bot_token (Bot User OAuth Token, starts with xoxb-): '
-cscb_ask "$p" s
-bot=$val
-p='app_token (app-level token, starts with xapp-): '
-cscb_ask "$p" s
-app=$val
-val=''
-bad=0
-cscb_bad() {
-  printf '%s: %s\n' "$1" "$2" >&2
-  bad=1
-}
-c='may hold only letters, digits and dashes'
-r='followed by the rest of the token'
-case "$bot" in
-  '') cscb_bad bot_token empty ;;
-  *[^A-Za-z0-9-]*) cscb_bad bot_token "$c" ;;
-  xoxb-?*) ;;
-  *) cscb_bad bot_token "must start with xoxb- $r" ;;
-esac
-case "$app" in
-  '') cscb_bad app_token empty ;;
-  *[^A-Za-z0-9-]*) cscb_bad app_token "$c" ;;
-  xapp-?*) ;;
-  *) cscb_bad app_token "must start with xapp- $r" ;;
-esac
-[ "$bad" = 0 ] ||
-  cscb_die 1 'Nothing written and nothing sent to Slack.'
-cscb_check() {
-  u="https://slack.com/api/$3"
-  h='header = "Authorization: Bearer %s"\n'
-  resp=$(
-    { printf "$h" "$2" |
-      command curl -q -s -X POST -d '' -m 30 --config - "$u"
-    } 2>/dev/null
-  )
-  rc=$?
-  flat=${resp//[[:space:]]/}
-  err='unexpected response'
-  if [ "$rc" -ne 0 ] || [ -z "$flat" ]; then
-    err='could not reach Slack'
-  fi
-  case "$rc$flat" in
-    0'{"ok":true,'*|0'{"ok":true}'*)
-      printf '%s: ok (%s)\n' "$1" "$3"
-      return 0 ;;
-    0'{"ok":false,'*'"error":"'*)
-      code=${flat#*'"error":"'}
-      code=${code%%'"'*}
-      case "$code" in
-        ''|*[^A-Za-z0-9_.]*) ;;
-        *) err=$code ;;
-      esac ;;
-  esac
-  printf '%s: failed (%s: %s)\n' "$1" "$3" "$err" >&2
-  return 1
-}
-bad=0
-cscb_check bot_token "$bot" auth.test || bad=1
-cscb_check app_token "$app" apps.connections.open ||
-  bad=1
-[ "$bad" = 0 ] || cscb_die 1 'Nothing written.'
-dir=${creds_file%/*}
-[ -n "$dir" ] || dir=/
-mkdir -p "$dir" ||
-  cscb_die 1 "$f cannot create the directory $dir"
-w="$f cannot write $creds_file; nothing written."
-tmp=$(mktemp "$dir/.cscb-credentials.XXXXXXXX") ||
-  cscb_die 1 "$w"
-trap 'rm -f "$tmp"' EXIT
-trap 'rm -f "$tmp"; exit 1' HUP INT TERM
-chmod 600 "$tmp" || cscb_die 1 "$w"
-{
-  printf '{\n  "bot_token": "%s",\n' "$bot"
-  printf '  "app_token": "%s"\n}\n' "$app"
-} 2>/dev/null >| "$tmp" || cscb_die 1 "$w"
-[ -s "$tmp" ] || cscb_die 1 "$w"
-cscb_kind
-ch="$f $creds_file changed; nothing written."
-[ "$kind" = "$had" ] || cscb_die 1 "$ch"
-if [ -d "$creds_file" ]; then cscb_die 1 "$ch"; fi
-mv -f "$tmp" "$creds_file" || cscb_die 1 "$w"
-trap - EXIT HUP INT TERM
-if [ -d "$creds_file" ]; then
-  rm -f "$creds_file/${tmp##*/}"
-  cscb_die 1 "$ch"
-fi
-[ -f "$creds_file" ] && [ -s "$creds_file" ] ||
-  cscb_die 1 "$w"
-s='bot_token and app_token both validated.'
-printf 'Wrote %s with mode 0600. %s\n' "$creds_file" "$s"
-)
+claude-slack-channel-bots credentials <persona>
 ```
 
-What it does:
+Show it as one fenced block with the name filled in, and tell the operator to
+copy only the line between the fences. It is one short line, so a copy from an
+80-column terminal keeps it whole; if a copy arrives split over two lines,
+have the operator type it instead.
 
-- It runs as one subshell, so a failure never closes the operator's shell and
-  no token variable outlives it. The operator pastes the lines between the
-  fences at a prompt; the shell reads the whole block before the first prompt
-  appears. It turns off command tracing and automatic export first.
-- It checks the path, then that `curl` is installed, before asking anything.
-- If the file already exists, it first asks for `yes` to replace it. Anything
-  else, an empty answer included, exits non-zero and leaves the file
-  untouched.
-- It then reads the bot token, then the app-level token, without echo. On a
-  terminal, an empty token answer (a stray Enter) asks again. When standard input
-  isn't a terminal, it reads them one per line in the same order: `yes` (only
-  when the file exists), the bot token, the app token.
-- It checks that neither is empty, that `bot_token` starts with `xoxb-` and
+It finds the persona by name or key in `config.json` as it stands, prints the
+persona and the path of its `credentials_file`, and runs the package's
+credentials script (`scripts/write-credentials.sh`) for that file, on the
+operator's terminal. A persona `config.json` doesn't declare, or a
+`config.json` that can't be loaded, stops it before anything is asked. The
+script:
+
+- Turns off command tracing and automatic export first, then checks the path,
+  then that `curl` is installed, before asking anything.
+- If the file already exists, asks for `yes` to replace it. Anything else, an
+  empty answer included, exits non-zero and leaves the file untouched.
+- Reads the bot token, then the app-level token, without echo. An empty
+  answer (a stray Enter) asks again.
+- Checks that neither is empty, that `bot_token` starts with `xoxb-` and
   `app_token` with `xapp-`, and that each holds only letters, digits and
   dashes. A failure names the key and the rule, and nothing is sent to Slack.
-- It validates `bot_token` with Slack `auth.test` and `app_token` with
+- Validates `bot_token` with Slack `auth.test` and `app_token` with
   `apps.connections.open`, and prints `ok` or Slack's error code for each key
   (`unexpected response` when the code isn't plain letters, digits, `_` and
   `.`). A check passes only when the first field of Slack's reply is
-  `"ok":true`. A check that can't reach Slack (30-second limit) fails and
-  says so. A token reaches `curl` only on its standard input, never in its
-  arguments, and is never printed; `curl -q` ignores the operator's
-  `~/.curlrc`.
-- Only when both pass does it write the file: a JSON object with exactly
+  `"ok":true`. A check that can't reach Slack (30-second limit) fails and says
+  so. A token reaches `curl` only on its standard input, never on a command
+  line, and is never printed; `curl -q` ignores the operator's `~/.curlrc`.
+- Only when both pass, writes the file: a JSON object with exactly
   `bot_token` and `app_token`, mode 0600 from creation whatever the umask,
-  replaced in one step (a temporary file created with `mktemp` beside it,
-  then renamed). The temporary file is removed on any failure or interrupt.
-  If the target changed while the command ran (it appeared, vanished, became
-  or stopped being a symlink, or became a directory, including just before
-  the rename), nothing is written. It creates a missing parent directory,
-  checks that the result is a regular file that isn't empty, and prints the
-  path and mode.
+  replaced in one step (a temporary file created with `mktemp` beside it, then
+  renamed). The temporary file is removed on any failure or interrupt. If the
+  target changed while it ran (it appeared, vanished, became or stopped being
+  a symlink, or became a directory), nothing is written. It creates a missing
+  parent directory, checks that the result is a regular file that isn't
+  empty, and prints `Wrote <path> with mode 0600.`
 - The rename replaces a symlink at the path with a regular file; the file the
-  symlink pointed to keeps the old tokens. If the credentials file is a
-  symlink, fill in the real file's path instead.
+  symlink pointed to keeps the old tokens.
 
-It needs `curl`, `mktemp`, `mkdir`, `chmod`, `mv` and `rm`, and nothing else.
+It needs `curl`, `mktemp`, `mkdir`, `chmod`, `mv` and `rm`.
 
 If validation fails:
 
@@ -684,11 +547,11 @@ takes effect only once the operator confirms it (Step 9, README `## Reload`).
 
 To replace an existing persona's tokens (for example after regenerating them
 in Slack), give the operator the [Credentials command](#credentials-command)
-with that persona's existing `credentials_file` path. It asks before replacing
-the file. If that path is a symlink, use the real file's path (for example
-from `readlink -f`): the command replaces a symlink with a regular file and
-leaves the old tokens in the file it pointed to. On a running server, the server then writes `config.json.pending`
-naming the persona's credentials change; once the operator confirms it by the
-rename (Step 9), only that persona reconnects. No restart is needed. On a
-stopped server, the next start reads the new file as it stands. See the
-README's `## Reload` section.
+with that persona's name. It asks before replacing the file. If the
+persona's `credentials_file` is a symlink, the command replaces the link with
+a regular file and leaves the old tokens in the file it pointed to: tell the
+operator to delete that file by hand afterwards. On a running server, the
+server then writes `config.json.pending` naming the persona's credentials
+change; once the operator confirms it by the rename (Step 9), only that
+persona reconnects. No restart is needed. On a stopped server, the next start
+reads the new file as it stands. See the README's `## Reload` section.

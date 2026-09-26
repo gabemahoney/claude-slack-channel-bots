@@ -38,12 +38,16 @@
  * same way.
  *
  * Secrecy (b.av2 SR-10.3): an outcome never holds the thrown value, its
- * message, stack, body, headers, request config or `original`. The only values
- * copied from an error are the Slack error code (and only when it matches
+ * stack, body, headers, request config or `original`. The only values copied
+ * from an error are the Slack error code (and only when it matches
  * `SLACK_ERROR_CODE_RE`; otherwise nothing is copied and the outcome is
- * Slack-unreachable `unknown`), an HTTP status number and `retryAfter`. Everything else on an outcome — the reason
- * kind, the token key, the check, the class label and the cause text — is
- * built by this module.
+ * Slack-unreachable `unknown`), an HTTP status number, `retryAfter` and, on a
+ * Slack-unreachable outcome only, the error's message rendered redacted by
+ * `describeLogMessage` (`message="…"`: URL-like and token-like text replaced,
+ * on one line, capped at 300 characters; E14 operator decision B1), the one
+ * rendering the other persona error lines use. Everything else on an outcome
+ * — the reason kind, the token key, the check, the class label and the cause
+ * text — is built by this module; the cause never holds error text.
  *
  * Pure module (b.av2 SR-13.1): no module-scope state, timers, I/O, logging,
  * network or environment access. The classifier never throws. The connection
@@ -52,6 +56,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { describeLogMessage } from './persona-connection-errors.ts'
 import { PERSONA_CREDENTIALS_REFUSED, PERSONA_SLACK_UNREACHABLE } from './persona-diagnostics.ts'
 
 // ---------------------------------------------------------------------------
@@ -242,6 +247,14 @@ export interface SlackUnreachableOutcome {
   retryAfter?: number
   /** Single-line cause for the diagnostic line: key, check and reason; no error text. */
   cause: string
+  /**
+   * The thrown value's message (an error's `message`, or a thrown string) as
+   * `describeLogMessage` renders it: `message="…"`, redacted, on one line,
+   * capped. The `persona-slack-unreachable` start line carries it after the
+   * cause. Absent when there was no value or no non-empty message, and for
+   * the `timeout` reason, whose value is CSCB's own marker.
+   */
+  message?: string
 }
 
 /** Slack refused the token: the persona is credentials-broken (b.av2 SR-3.2, SR-6.4). */
@@ -288,10 +301,21 @@ export type SlackValidationOutcome = SlackUpOutcome | SlackValidationFailure
 /**
  * Classify a value thrown (or rejected) by `check` as Slack-unreachable or
  * credentials refused (b.av2 SR-3.2). Accepts any value, never throws, and
- * copies nothing from it but the Slack error code, the HTTP status and
- * `retryAfter` (see the module comment).
+ * copies nothing from it but the Slack error code, the HTTP status,
+ * `retryAfter` and, on a Slack-unreachable outcome other than `timeout`, its
+ * message rendered redacted as `message` (see the module comment).
  */
 export function classifySlackValidationError(error: unknown, check: SlackValidationCheck): SlackValidationFailure {
+  const outcome = classifyThrownValue(error, check)
+  if (outcome.kind === 'slack-unreachable' && outcome.reason !== 'timeout') {
+    const message = describeLogMessage(typeof error === 'string' ? error : readProp(error, 'message'))
+    if (message !== '') outcome.message = message
+  }
+  return outcome
+}
+
+/** `classifySlackValidationError` without the message: the outcome from the value's code and fields. */
+function classifyThrownValue(error: unknown, check: SlackValidationCheck): SlackValidationFailure {
   const code = readProp(error, 'code')
 
   if (code === WEB_API_PLATFORM_ERROR) {

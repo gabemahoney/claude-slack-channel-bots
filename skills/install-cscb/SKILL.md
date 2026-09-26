@@ -2,7 +2,6 @@
 name: install-cscb
 description: Interactive walkthrough that installs or upgrades the system-installed `agent-director` so claude-slack-channel-bots can boot. Drives Epic 2's bun run install-check and per-reason remediation.
 version: 1.0.0
-author: Gabe Mahoney
 license: MIT
 user-invocable: true
 argument-hint: "(no arguments)"

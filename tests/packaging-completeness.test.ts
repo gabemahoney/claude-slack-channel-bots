@@ -36,7 +36,12 @@
  * a non-empty, duplicate-free check on the list. Content audits of shipped text (forbidden terms, the
  * SR-1.7 exception) are later Epics' work (E6/E14), not this file's.
  *
- * Both npm-backed tests share one memoised pack probe per file load. The npm
+ * b.av2 SR-12: the setup wizard's credentials script,
+ * `scripts/write-credentials.sh` (which `claude-slack-channel-bots
+ * credentials` runs), is in the npm pack list, with the same hermetic
+ * companion (the file exists and package.json `files` covers it).
+ *
+ * Every npm-backed test shares one memoised pack probe per file load. The npm
  * child gets a throwaway cache and user config inside the probe's temp dir,
  * so it never reads or writes the real HOME (b.av2 SR-13.2).
  *
@@ -312,6 +317,33 @@ describe('b.av2 AC 27: the debugging skill ships in the package', () => {
 
   test(`AC 27 (hermetic): package.json files covers ${SKILL_REL} and no ! entry excludes it`, () => {
     expect(filesCover(readPkg().files ?? [], SKILL_REL)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 3b. The setup wizard's credentials script ships (b.av2 SR-12)
+// ---------------------------------------------------------------------------
+
+/** The script `claude-slack-channel-bots credentials` runs, from the package root. */
+const CREDENTIALS_SCRIPT_REL = 'scripts/write-credentials.sh'
+
+describe('b.av2 SR-12: the credentials script ships in the package', () => {
+  const probe = packProbe()
+
+  // Same contract as guard 2: skip only when npm is absent; a pack or parse
+  // error is a hard failure.
+  test.skipIf(probe.kind === 'skip')(
+    `the npm pack file list includes ${CREDENTIALS_SCRIPT_REL}`,
+    () => {
+      if (probe.kind === 'error') throw new Error(probe.message)
+      expect(probe.kind === 'ok' ? probe.files : []).toContain(CREDENTIALS_SCRIPT_REL)
+    },
+  )
+
+  // Hermetic companion: guards the script where npm is unavailable.
+  test(`(hermetic) ${CREDENTIALS_SCRIPT_REL} exists and package.json files covers it with no ! entry excluding it`, () => {
+    expect(existsSync(resolve(REPO_ROOT, CREDENTIALS_SCRIPT_REL))).toBe(true)
+    expect(filesCover(readPkg().files ?? [], CREDENTIALS_SCRIPT_REL)).toBe(true)
   })
 })
 

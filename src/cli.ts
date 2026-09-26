@@ -11,22 +11,31 @@
  *                    instance.
  *   clean_restart  — Exit every configured persona's instance, then stop and
  *                    start the server.
+ *   credentials    — `credentials <persona>`: write that persona's
+ *                    credentials file from the operator's terminal, by
+ *                    running the packaged `scripts/write-credentials.sh`
+ *                    (b.av2 SR-12, SR-1.4 part).
  *
- * The CLI takes its settings and persona set from the configuration the
- * server runs (b.av2 SR-8.7): the last-applied record beside the
- * configuration file (`resolveServerConfigPath`) when it exists, otherwise
- * the configuration file (`readAppliedPersonaConfig`). It never writes any
- * reload file, and reads no Slack token: each persona's tokens live in its
- * credentials file, which only the server reads (b.av2 SR-10.2).
+ * `start`, `stop` and `clean_restart` take their settings and persona set from
+ * the configuration the server runs (b.av2 SR-8.7): the last-applied record
+ * beside the configuration file (`resolveServerConfigPath`) when it exists,
+ * otherwise the configuration file (`readAppliedPersonaConfig`).
+ * `credentials` reads the configuration file as it stands
+ * (`loadPersonaConfig`), where a persona being added is declared before any
+ * confirmation. The CLI never writes any reload file, and this process reads
+ * no Slack token and no credentials file (b.av2 SR-10.2): the server reads
+ * each persona's credentials file, and the credentials script, run as a child
+ * on the operator's terminal, reads the tokens at its own no-echo prompts.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { join } from 'path'
+import { join, resolve } from 'path'
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, unlinkSync } from 'fs'
 import { spawn, spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
 import {
+  loadPersonaConfig,
   resolveServerConfigPath,
   resolveServerStateDir,
   type Persona,
@@ -38,7 +47,7 @@ import { ErrSpawnNotFound } from './agent-director-errors.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { getClient } from './agent-director-client.ts'
 import type { Client } from 'agent-director'
-import { personaInstanceId, renderPersonaRef } from './persona-identity.ts'
+import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import { runStartupGate } from './agent-director-startup.ts'
 
 // ---------------------------------------------------------------------------
@@ -63,6 +72,15 @@ export const STOP_KILL_WAIT_MS = 2000
 
 /** Most `server.log` lines `start` repeats when the daemon exits during startup. */
 export const DAEMON_FAILURE_LOG_LINES = 20
+
+/**
+ * The packaged credentials script `credentials` runs (b.av2 SR-12): shipped
+ * in the npm package (package.json `files`) beside `src/`.
+ */
+export const CREDENTIALS_SCRIPT_PATH = resolve(import.meta.dir, '..', 'scripts', 'write-credentials.sh')
+
+/** `credentials`' usage line, printed with exit 2 when it is not given exactly one persona. */
+export const CREDENTIALS_USAGE = 'Usage: claude-slack-channel-bots credentials <persona name or key>'
 
 // ---------------------------------------------------------------------------
 // Daemon child
@@ -139,6 +157,23 @@ export interface CliDeps {
    * for a pre-persona file (b.av2 SR-1.7). Never writes any reload file.
    */
   loadConfig: (path: string) => PersonaConfig
+  /**
+   * The configuration file at `path` as it stands, never the last-applied
+   * record (`loadPersonaConfig` in production): `credentials` finds its
+   * persona there, so a persona declared but not yet confirmed is found.
+   * Throws the loader's error, which names the file and never echoes a
+   * credential value (b.av2 SR-10.3). Reads no credentials file.
+   */
+  loadConfigFile: (path: string) => PersonaConfig
+  /**
+   * Run the packaged credentials script (`CREDENTIALS_SCRIPT_PATH`) with bash
+   * for `credentialsFile`, on this process's terminal (stdio inherited), and
+   * return its exit status: the script reads the tokens at its own no-echo
+   * prompts, so they never pass through this process or any command line.
+   * Returns 1 when the script is missing or bash cannot be run, after
+   * printing why.
+   */
+  runCredentialsScript: (credentialsFile: string) => number
   /**
    * b.qwo: initialize the agent-director Client singleton before any per-persona
    * teardown work. clean_restart / `stop --stop-bots` run in a short-lived CLI
@@ -278,6 +313,8 @@ export interface CliHandlers {
   start: () => Promise<void>
   stop: (opts?: { stopBots?: boolean }) => Promise<void>
   clean_restart: () => Promise<void>
+  /** `credentials <persona>`, given the arguments after the subcommand. */
+  credentials: (args: readonly string[]) => Promise<void>
 }
 
 /**
@@ -758,7 +795,83 @@ export function createCli(deps: CliDeps): CliHandlers {
     console.error('[slack] clean_restart: done')
   }
 
-  return { start, stop, clean_restart }
+  /**
+   * `credentials <persona>` (b.av2 SR-12, SR-1.4 part): find the persona by
+   * name or key (`resolvePersonaTarget`) in the configuration file as it
+   * stands, then run the packaged credentials script for its
+   * `credentials_file` on this terminal and exit with the script's status.
+   * The script asks for the tokens without echo, validates them with Slack
+   * and writes the file with mode 0600 (see `scripts/write-credentials.sh`).
+   *
+   * Exits 2 with the usage line unless given exactly one non-empty argument,
+   * and 1 when the configuration file cannot be loaded (the loader's error,
+   * which names the file) or no persona has that name or key (the line lists
+   * the declared personas and never repeats the argument, in case a token was
+   * typed there). Needs no running server and no agent-director.
+   */
+  async function credentials(args: readonly string[]): Promise<void> {
+    if (args.length !== 1 || args[0] === '') {
+      console.error(CREDENTIALS_USAGE)
+      return deps.exit(2)
+    }
+    const configPath = deps.resolveConfigPath()
+    let config: PersonaConfig
+    try {
+      config = deps.loadConfigFile(configPath)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error(`credentials: cannot read the personas in ${configPath}: ${msg}`)
+      return deps.exit(1)
+    }
+    const persona = resolvePersonaTarget(config, args[0])
+    if (persona === undefined) {
+      const declared = config.personas.map((p) => renderPersonaRef(p.name, p.key)).join(', ')
+      console.error(
+        `credentials: no persona in ${configPath} has that name or key; declare it there first ` +
+          `(declared: ${declared === '' ? 'none' : declared})`,
+      )
+      return deps.exit(1)
+    }
+    console.error(`Credentials file of persona ${renderPersonaRef(persona.name, persona.key)}: ${persona.credentials_file}`)
+    return deps.exit(deps.runCredentialsScript(persona.credentials_file))
+  }
+
+  return { start, stop, clean_restart, credentials }
+}
+
+// ---------------------------------------------------------------------------
+// Production credentials script runner
+// ---------------------------------------------------------------------------
+
+/**
+ * The production `runCredentialsScript`: `bash <CREDENTIALS_SCRIPT_PATH>
+ * <credentialsFile>` with stdio inherited and this process's environment.
+ * While it runs, this process ignores SIGINT and SIGQUIT, as a shell does for
+ * a foreground job: Ctrl-C reaches the script, which removes its temporary
+ * file and exits, and this process then exits with its status instead of
+ * returning the prompt first. A script killed by a signal counts as 1.
+ */
+function runCredentialsScript(credentialsFile: string): number {
+  if (!existsSync(CREDENTIALS_SCRIPT_PATH)) {
+    console.error(
+      `credentials: the credentials script ${CREDENTIALS_SCRIPT_PATH} is missing; reinstall claude-slack-channel-bots`,
+    )
+    return 1
+  }
+  const ignore = (): void => {}
+  process.on('SIGINT', ignore)
+  process.on('SIGQUIT', ignore)
+  try {
+    const result = spawnSync('bash', [CREDENTIALS_SCRIPT_PATH, credentialsFile], { stdio: 'inherit' })
+    if (result.error !== undefined) {
+      console.error(`credentials: could not run bash: ${describeThrownValue(result.error)}`)
+      return 1
+    }
+    return result.status ?? 1
+  } finally {
+    process.off('SIGINT', ignore)
+    process.off('SIGQUIT', ignore)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -815,12 +928,13 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
 if (import.meta.main) {
   const subcommand = process.argv[2]
 
-  if (subcommand !== 'start' && subcommand !== 'stop' && subcommand !== 'clean_restart') {
-    console.error('Usage: cli.ts <start|stop|clean_restart> [flags]')
+  if (subcommand !== 'start' && subcommand !== 'stop' && subcommand !== 'clean_restart' && subcommand !== 'credentials') {
+    console.error('Usage: cli.ts <start|stop|clean_restart|credentials> [flags]')
     console.error('')
     console.error('  start          Validate prerequisites and start the server in the background')
     console.error('  stop           Send SIGTERM to a running server')
     console.error('  clean_restart  Exit all managed sessions, then stop and start the server')
+    console.error("  credentials    <persona name or key>: write that persona's credentials file from this terminal")
     console.error('')
     console.error('stop flags:')
     console.error('  --stop-bots    Gracefully exit all managed bots before stopping the server')
@@ -849,6 +963,8 @@ if (import.meta.main) {
     startServer: async () => { const { main } = await import('./server.ts'); return main() },
     exit: (code) => process.exit(code),
     loadConfig: (path) => readAppliedPersonaConfig(path),
+    loadConfigFile: (path) => loadPersonaConfig(path),
+    runCredentialsScript,
     // b.qwo: install the AD Client singleton via the non-exiting startup gate
     // before teardown. runStartupGate performs Client.create() + setClient() and
     // returns a typed outcome; on failure we throw so the caller (clean_restart /
@@ -874,6 +990,11 @@ if (import.meta.main) {
   } else if (subcommand === 'stop') {
     const stopBots = process.argv.slice(3).includes('--stop-bots')
     cli.stop({ stopBots }).catch((err) => {
+      console.error('[slack] Fatal:', err)
+      process.exit(1)
+    })
+  } else if (subcommand === 'credentials') {
+    cli.credentials(process.argv.slice(3)).catch((err) => {
       console.error('[slack] Fatal:', err)
       process.exit(1)
     })

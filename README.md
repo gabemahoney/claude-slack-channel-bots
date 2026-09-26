@@ -30,7 +30,7 @@ A single HTTP MCP server that runs several independent Claude Code bots, called 
    claude /setup-slack-channel-bots
    ```
 
-   The wizard walks you through one persona at a time: creating and installing the persona's Slack app from `slack-app-manifest.yml`, setting its name and avatar, and inviting it to its channels, which you do in Slack; writing its credentials file, which you do in your terminal; and declaring the persona in `config.json`, which the wizard writes. Tokens go only into the wizard's [credentials command](skills/setup-slack-channel-bots/SKILL.md#credentials-command), which you run in your own terminal, never into the chat. On a running server, the wizard explains how to confirm the pending change (see [Reload](#reload)).
+   The wizard walks you through one persona at a time: creating and installing the persona's Slack app from `slack-app-manifest.yml`, setting its name and avatar, and inviting it to its channels, which you do in Slack; declaring the persona in `config.json`, which the wizard writes; and writing its credentials file, which you do in your terminal. Tokens go only into the wizard's [credentials command](skills/setup-slack-channel-bots/SKILL.md#credentials-command), `claude-slack-channel-bots credentials <persona>`, which you run in your own terminal, never into the chat. On a running server, the wizard explains how to confirm the pending change (see [Reload](#reload)).
 
 4. **Or create your personas by hand:**
 
@@ -305,9 +305,15 @@ Each persona's Slack tokens live in its own credentials file, and `config.json` 
 - The file's content is checked when the persona comes up, not when `config.json` is checked. A missing or malformed file keeps only that persona down (see [Troubleshooting](#troubleshooting)).
 - On a running server, a change to the file waits for confirmation like a `config.json` edit (see [Reload](#reload)).
 
-The setup wizard, `setup-slack-channel-bots`, writes this file for you with its [credentials command](skills/setup-slack-channel-bots/SKILL.md#credentials-command), which you run in your own terminal. The command reads both tokens without echoing them, validates the bot token with Slack `auth.test` and the app token with `apps.connections.open`, and writes the file with mode 0600 only when both pass. It asks before replacing an existing file.
+The setup wizard, `setup-slack-channel-bots`, has you write this file with its [credentials command](skills/setup-slack-channel-bots/SKILL.md#credentials-command), which you run in your own terminal once the persona is declared in `config.json`:
 
-To rotate a persona's tokens, re-run the credentials command for its existing file (see the wizard's [Rotate a persona's tokens](skills/setup-slack-channel-bots/SKILL.md#rotate-a-personas-tokens)), then confirm the pending change (see [Confirming a change](#confirming-a-change)). Only that persona reconnects, and no restart is needed.
+```sh
+claude-slack-channel-bots credentials <persona>
+```
+
+`<persona>` is the persona's name or key. The command finds the persona in `config.json`, reads both tokens without echoing them, validates the bot token with Slack `auth.test` and the app token with `apps.connections.open`, and writes the persona's `credentials_file` with mode 0600 only when both pass. It asks before replacing an existing file. See [`claude-slack-channel-bots credentials`](#claude-slack-channel-bots-credentials).
+
+To rotate a persona's tokens, run the credentials command for it again (see the wizard's [Rotate a persona's tokens](skills/setup-slack-channel-bots/SKILL.md#rotate-a-personas-tokens)), then confirm the pending change (see [Confirming a change](#confirming-a-change)). Only that persona reconnects, and no restart is needed.
 
 Never put a token in `config.json`, a ticket or a chat.
 
@@ -342,6 +348,8 @@ Receiving DMs and replying in an existing DM (a `D…` ID) work without the scop
 
 - **A channel ID:** one of the persona's own `channels`. Everyone in that channel sees the prompts and notices.
 - **`"dm"`:** a DM from the persona's app to its `dm.contact`. It needs `dm.enabled: true` and a `dm.contact`.
+
+Give each persona a destination that no other persona receives every message in, such as its own channel or `"dm"`. Don't give a persona `delivery: all` in another persona's destination channel. A notice is a Slack post like any other: when two personas each receive every message in the other's destination channel and neither persona's instance can take messages, each loses the other's lost-message notices and posts a notice about it, so they keep posting notices about each other until either instance takes messages again (see [Troubleshooting](#troubleshooting)).
 
 [Permission Relay](#permission-relay) covers how prompts are delivered and answered, and [Troubleshooting](#troubleshooting) what happens when Slack refuses a post to the destination.
 
@@ -510,7 +518,8 @@ Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In 
 | `credentials file "<path>" changed: …` | The persona's credentials file changed at the same path. The line names the persona and the path, never a token, and says what applying it does: a persona that is up opens a new connection, then closes the old one; a persona still retrying retries with the new content; a persona down because of its credentials `will be brought up`. |
 | `credentials file "<path>" changed, but it cannot be used (<cause>): …` | The new content is missing, unreadable or invalid, for example `credentials file does not exist`. A persona that is up keeps its current connection, and a persona still retrying keeps retrying with its current content; confirming logs `persona-credentials-change-failed` in `server.log`, and the change stays pending. A persona down because of its credentials stays down, and confirming logs its usual credentials line and leaves nothing pending. Every start reads the file as it stands, so after a restart the persona is down until the file is fixed and the change confirmed. |
 | `claude_config_dir changed: …, which starts fresh (the conversation is not resumed)` | The persona's next launch uses the new config directory and starts a new conversation. The running instance is kept until then. |
-| `… could not be checked.` | The server couldn't check whether an added persona can come up, or whether a persona is down because of its credentials. `server.log` has a `reload: cannot check …` line; report it as a bug. |
+| `…; but at that launch it cannot come up: claude_config_dir cannot be resolved to a real path (<errno>)` | A warning after a changed `claude_config_dir`: the new directory can't be resolved, for example a symlink on its path points to nothing. On a changed top-level `claude_config_dir`, the warning names the inheriting personas it stops; on a `DESTRUCTIVE:` line that also changes the directory, it reads `but it cannot come up`. Confirming still applies the change: at the persona's next launch (at once, for a destructive change) it is held, its Slack connection closed, and it comes up once the directory resolves (`persona-config-dir-unresolvable` in `server.log`). Fix the directory, or the setting, before confirming. A directory that doesn't exist yet but whose parent does is fine. |
+| `… could not be checked.` | The server couldn't check whether an added persona can come up, whether a changed `claude_config_dir` can be resolved, or whether a persona is down because of its credentials. `server.log` has a `reload: cannot check …` line; report it as a bug. |
 | `server-wide setting … inherited by …` | A changed top-level default. The line lists the personas that inherit it. If none does, it says `no persona inherits it, so no instance is affected`. |
 | `server-wide setting … changed: once applied, it is recorded and takes effect at the next server start after that.` | A setting such as `port` or `bind`. It doesn't take effect until the server starts after the change is applied. |
 | `server-wide setting … changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).` | `stop_timeout` or `exit_timeout`. Only the CLI uses them: once the change is applied, the next `stop` or `clean_restart` uses the new value, with no restart needed. |
@@ -598,7 +607,7 @@ A confirmation needs a running server. When the record keeps the server from sta
 
 ## CLI Reference
 
-The `claude-slack-channel-bots` binary exposes three subcommands.
+The `claude-slack-channel-bots` binary exposes four subcommands.
 
 ### `claude-slack-channel-bots start`
 
@@ -685,6 +694,27 @@ Behavior by case:
 - **Server already stopped:** `stop` reports `server is not running`; `start` then brings up a fresh server.
 - **Server fails to start again:** `clean_restart` exits non-zero with `[slack] clean_restart: start failed with exit code <n>`; the reason is in `server.log`.
 - **agent-director unreachable:** teardown fails loudly and the restart is aborted (non-zero exit); no new server is started. The `no spawn row` message appears only when a persona genuinely has no spawn, never when the client failed to reach agent-director.
+
+### `claude-slack-channel-bots credentials`
+
+Writes one persona's credentials file from your terminal. The setup wizard gives you this line (see [Credentials files](#credentials-files)):
+
+```sh
+claude-slack-channel-bots credentials <persona>
+```
+
+`<persona>` is the persona's name or its key, as `config.json` declares it; quote a name with spaces for your shell. The command reads `STATE_DIR/config.json` as it stands, not the last-applied record, so a persona you have just declared is found before you confirm anything. It needs no running server and no agent-director.
+
+It prints `Credentials file of persona "<name>" (key=<key>): <path>`, then runs the package's `scripts/write-credentials.sh` with `bash` for that path, on your terminal:
+
+1. If the file exists, it asks you to type `yes` to replace it. Anything else leaves the file untouched.
+2. It asks for the bot token, then the app-level token, without echoing them. A token goes to `curl` only on its standard input, never on a command line.
+3. It checks both locally (not empty, `xoxb-` / `xapp-`, only letters, digits and dashes), then validates the bot token with Slack `auth.test` and the app token with `apps.connections.open`, printing `bot_token: ok (auth.test)` and `app_token: ok (apps.connections.open)`, or the key and Slack's error code.
+4. Only when both pass, it writes the file, a JSON object with `bot_token` and `app_token`, with mode 0600, replacing it in one step, and prints `Wrote <path> with mode 0600. bot_token and app_token both validated.`
+
+It needs `bash` and `curl`. Exit codes: `0` when the file was written; `2` without exactly one persona (it prints `Usage: claude-slack-channel-bots credentials <persona name or key>`); `1` otherwise, with nothing written. A `config.json` that can't be loaded prints `credentials: cannot read the personas in <path>:` and the loader's error; a name or key no persona has prints `credentials: no persona in <path> has that name or key; declare it there first (declared: …)`, listing the declared personas. Neither asks for a token.
+
+On a running server, a new or replaced credentials file waits for confirmation like a `config.json` edit (see [Reload](#reload)).
 
 ### PID file
 
@@ -1154,9 +1184,9 @@ grep -E '\(key=<key>\)|persona=<key>\b' ~/.claude/channels/slack/server.log
 | Class | Persona | What to do |
 |---|---|---|
 | `persona-credentials-missing`, `-unreadable`, `-invalid` | Stays down | Fix the credentials file, then confirm the pending change; the persona comes up with no restart |
-| `persona-credentials-refused` | Stays down | Put a working token in the credentials file, then confirm the pending change; the persona comes up with no restart. If the fix was made on Slack's side and the tokens are unchanged, nothing is pending: re-save the credentials file with any byte change (a trailing newline is enough), then confirm |
+| `persona-credentials-refused` | Stays down | Put a working token in the credentials file (`claude-slack-channel-bots credentials <persona>`), then confirm the pending change; the persona comes up with no restart. If the fix was made on Slack's side and the tokens are unchanged, nothing is pending: re-save the credentials file with any byte change (a trailing newline is enough), then confirm |
 | `persona-credentials-change-failed` | Keeps running on its old credentials | Fix the credentials file, then confirm the new pending change |
-| `persona-slack-unreachable` | Retries on its own | Nothing; it comes up once Slack answers |
+| `persona-slack-unreachable` | Retries on its own | Nothing; it comes up once Slack answers. If it doesn't, the line that started the episode ends with the failure's message (`message="…"`, URLs and tokens redacted), such as a DNS or connection error: check the host's network and proxy |
 | `persona-directory-*` | Retries on its own | Create or fix the working directory; the persona comes up with no restart |
 | `persona-config-dir-unresolvable` | Retries on its own. Its Slack connection is closed and it receives nothing; its instance and conversation are kept | Remount the drive or fix the symlink behind its `claude_config_dir`; the persona reconnects and resumes its conversation with no restart |
 
@@ -1213,7 +1243,7 @@ The notice names the sender (by display name, or user ID; for a bot or webhook p
 
 - **One notice per lost message.** A persona whose instance can't take messages while its Slack connection is up (restarting, at the restart limit, or with auto-restart off) posts one notice for each message it loses in a busy `delivery: all` channel. With a `"dm"` destination, each notice is a separate DM to its contact.
 - **Held notices are capped.** While the persona can't post to its destination, its notices are held and retried, up to 20 per persona; past that, the oldest is dropped (see "A permission prompt or notice doesn't arrive" above).
-- **Notices reach other personas.** A notice is a Slack post like any other, so a persona with `delivery: all` in the destination channel receives it. When the instances of two personas both can't take messages and each persona receives every message in the other's destination channel, each one's notice is a lost message for the other, so they keep posting notices about each other's notices until one of their instances takes messages again.
+- **Notices reach other personas.** A notice is a Slack post like any other, so a persona with `delivery: all` in the destination channel receives it. When the instances of two personas both can't take messages and each persona receives every message in the other's destination channel, each one's notice is a lost message for the other, so they keep posting notices about each other's notices until one of their instances takes messages again. Give each persona a destination the others don't receive every message in (see [Permission prompts](#permission-prompts)).
 
 | Recovery state in the notice | What it means | What to do |
 |------------------------------|---------------|------------|
@@ -1407,19 +1437,19 @@ After step 1, every CSCB bot is spawned through `client.spawn(...)` with `relay_
 
 ### Upgrading to personas
 
-This major version accepts only the persona configuration format. When you upgrade from an earlier major version:
+This major version accepts only the persona configuration format. When you upgrade from an earlier major version, take these steps in order:
 
-- **Rewrite `config.json` by hand.** A configuration from an earlier major version stops the server at start, with an error that names the offending setting and says the configuration must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](#personas-configjson); the server-wide settings keep their names. The `debug-slack-channel-bots` skill covers this error under "Pre-persona configuration".
-- **Pick persona names whose keys don't start with one another.** If you name the personas after the channels your bots served, a name that is the start of another, such as `horde` beside `horde_admin`, is rejected. Give the shorter one a suffix, such as `horde_main` (see [Persona name and key](#persona-name-and-key)).
-- **Set the reply settings in `config.json`.** Nothing else carries an acknowledgement reaction over: to keep one, set `ack_reaction` as a top-level setting. If you had changed how replies are split, set `reply_chunk_limit` and `reply_chunk_mode` there too. See [Server-wide settings](#server-wide-settings).
-- **Move the tokens into credentials files.** Tokens come only from each persona's credentials file. Create one [credentials file](#credentials-files) per persona, then remove any token environment variables you exported for the previous version.
-- **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona. Re-install the existing app from the current `slack-app-manifest.yml` so it gains the `im:write` scope; the `debug-slack-channel-bots` skill has the steps under "A persona can't open a DM".
-- **Decide who can reach each persona.** Who can reach a persona is decided only by its `channels`, each channel's `delivery` and its `dm.enabled` switch (see [Channel delivery](#channel-delivery) and [Direct messages](#direct-messages-dmenabled)).
-- **Rewrite crontable lines to name personas.** A crontable target that names a channel matches no persona, and the line is logged `unknown-persona` each time it fires. Rewrite each target as a persona's name or key (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)).
-- **Update `/interject` callers to send `persona`.** A request without `persona` is refused with 400, and a successful response holds only `ok` and `persona`. Change every script that calls `/interject`, including host crontab `curl` lines, to name a persona by name or key (see [Interject](#interject)).
-- **Stop the old bots before the first start.** On a host with bots running, follow [First start on a host with running bots](#first-start-on-a-host-with-running-bots) below.
-- **The first start applies `config.json`.** It has no last-applied record yet, so it checks `config.json`, records it and applies it. After that, edits wait until you apply them; see [Reload](#reload).
-- **Expect each bot to start fresh once.** Bot instances created before this version are never resumed, so each persona starts once without its prior conversation. Their agent-director rows are kept, never deleted: no persona reuses their instance IDs. If one is still running at the first start, the start kills it and logs `pre-persona row` in `server.log`.
+1. **Stop the old bots first.** Before you install this version or change `config.json`, stop the earlier version with its bots and check that none is left: follow steps 1–3 of [First start on a host with running bots](#first-start-on-a-host-with-running-bots) below. Then install this version.
+2. **Rewrite `config.json` by hand.** A configuration from an earlier major version stops the server at start, with an error that names the offending setting and says the configuration must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](#personas-configjson); the server-wide settings keep their names. The `debug-slack-channel-bots` skill covers this error under "Pre-persona configuration".
+3. **Pick persona names whose keys don't start with one another.** The configuration check rejects such a pair. If your bots were named `horde`, `horde_admin`, …, don't name a persona `horde` beside `horde_admin`: give the shorter name a suffix, such as `horde_main` (see [Persona name and key](#persona-name-and-key)).
+4. **Set the reply settings in `config.json`.** Nothing else carries an acknowledgement reaction over: to keep one, set `ack_reaction` as a top-level setting. If you had changed how replies are split, set `reply_chunk_limit` and `reply_chunk_mode` there too. See [Server-wide settings](#server-wide-settings).
+5. **Move the tokens into credentials files.** Tokens come only from each persona's credentials file. Create one [credentials file](#credentials-files) per persona, then remove any token environment variables you exported for the previous version.
+6. **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona. Re-install the existing app from the current `slack-app-manifest.yml` so it gains the `im:write` scope; the `debug-slack-channel-bots` skill has the steps under "A persona can't open a DM".
+7. **Decide who can reach each persona.** Who can reach a persona is decided only by its `channels`, each channel's `delivery` and its `dm.enabled` switch (see [Channel delivery](#channel-delivery) and [Direct messages](#direct-messages-dmenabled)).
+8. **Rewrite crontable lines to name personas.** A crontable target that names a channel matches no persona, and the line is logged `unknown-persona` each time it fires. Rewrite each target as a persona's name or key (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)).
+9. **Update `/interject` callers to send `persona`.** A request without `persona` is refused with 400, and a successful response holds only `ok` and `persona`. Change every script that calls `/interject`, including host crontab `curl` lines, to name a persona by name or key (see [Interject](#interject)).
+10. **Start this version** with `claude-slack-channel-bots start`. The first start has no last-applied record yet, so it checks `config.json`, records it and applies it. After that, edits wait until you apply them; see [Reload](#reload).
+11. **Expect each bot to start fresh once.** Bot instances created before this version are never resumed, so each persona starts once without its prior conversation. Their agent-director rows are kept, never deleted: no persona reuses their instance IDs. If one is still running at the first start, the start kills it and logs `pre-persona row` in `server.log`.
 
 #### First start on a host with running bots
 
@@ -1434,7 +1464,7 @@ Stop the earlier version's bots, and check that none is left, before this versio
    agent-director list --label service=cscb
    ```
 3. **Check by hand that no old bot session is left.** As the user that runs the bots, run `tmux ls`. No session named `slack_bot_<name>_<channel ID>` (or `slack_bot_<channel ID>`) may be listed; this version hasn't started, so every `slack_bot_` session is an old bot. If one is, end it by its exact name, `tmux kill-session -t '=<session name>'` (the `=` matches that name only), and run `tmux ls` again.
-4. **Start this version.** Install it, make the changes above (`config.json`, credentials files, Slack apps), then run `claude-slack-channel-bots start`.
+4. **Install this version and go on with the upgrade** from step 2 of [Upgrading to personas](#upgrading-to-personas): `config.json`, credentials files and Slack apps, then `claude-slack-channel-bots start`.
 
 ---
 

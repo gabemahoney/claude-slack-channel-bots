@@ -32,7 +32,11 @@
  *
  * Lines are built with `formatPersonaDiagnostic` (the persona's JSON-quoted
  * name with its key, `personas[i]`, the credentials file path, the cause) from
- * the outcome's own fields only, never error text. Each call returns the
+ * the outcome's own fields only. The one piece of error text is the
+ * `persona-slack-unreachable` start line's: after the cause, the outcome's
+ * `message` (`message="…"`, the error's message already redacted by
+ * `describeLogMessage` in the classifier), when it has one. Cleared, lost and
+ * restored lines carry none. Each call returns the
  * lines it produced; with an injected logger it also emits each exactly once.
  * The module never writes to `console`, `logging.ts` or `startup-errors.log`.
  *
@@ -175,7 +179,8 @@ export function createSlackEpisodeTracker(options: SlackEpisodeTrackerOptions): 
       open = outcome.kind === 'slack-unreachable'
         ? { kind: outcome.kind, class: outcome.class, key: outcome.key, check: outcome.check }
         : { kind: outcome.kind, class: outcome.class, key: outcome.key, check: outcome.check, slackError: outcome.slackError }
-      lines.push(line(outcome.class, outcome.cause))
+      const message = outcome.kind === 'slack-unreachable' && outcome.message !== undefined ? ` ${outcome.message}` : ''
+      lines.push(line(outcome.class, `${outcome.cause}${message}`))
       return lines
     },
     end(reason: string): string[] {

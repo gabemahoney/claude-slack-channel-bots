@@ -10,7 +10,8 @@
  * the wizard's cross-references resolve.
  *
  * Covered elsewhere, not repeated here: the credentials command itself (its
- * section, its one bash block) is run by tests/credentials-command.test.ts.
+ * section's one-line block, the CLI subcommand and the packaged script it
+ * runs) is run by tests/credentials-command.test.ts.
  * The forbidden-term audit over all shipped text (token variable names and
  * export forms, a bearer token on a curl command line, the access-control
  * file, pre-persona keys) lives in tests/shipped-docs.test.ts, which covers
@@ -71,9 +72,10 @@ describe('setup wizard: the per-persona step covers each SR-12 item', () => {
     ['Slack app', 'the avatar, uploaded in the display information', /\bavatar\b[^.]*Display Information/],
     ['Slack app', 'install to the workspace', /Install to Workspace/],
     ['Slack app', 'an existing app re-installed to gain im:write', /re-install[^.]*`im:write`|`im:write`[^.]*re-install/],
-    ['Credentials file', 'credentials file path', /`credentials_file`/],
-    ['Credentials file', 'hand-off to the credentials command', /\]\(#credentials-command\)/],
-    ['Credentials file', 'the file checked for existence and mode 0600 with ls -lL', /exists and has mode 0600[\s\S]*ls -lL "/],
+    ['Credentials file path', 'credentials file path', /`credentials_file`/],
+    ['Write its credentials file', 'hand-off to the credentials command', /\]\(#credentials-command\)/],
+    ['Write its credentials file', 'the file checked for existence and mode 0600 with ls -lL', /exists and has mode 0600[\s\S]*ls -lL "/],
+    ['Write its credentials file', 'on a running server, confirm only after the new preview', /new preview[^.]*confirms only after/],
     ['Channels', 'channel delivery', /`delivery`/],
     ['Channels', 'invite the app to its channels', /\/invite @/],
     ['Direct messages', 'DM contact', /`dm\.contact`/],
@@ -87,15 +89,25 @@ describe('setup wizard: the per-persona step covers each SR-12 item', () => {
     expect(flat(addPersona())).toMatch(/once for each/)
     expect(flat(addPersona())).toMatch(/One persona is one Slack app/)
   })
+
+  test('the credentials file is written after the persona is declared: the command finds the persona in config.json', () => {
+    const titles = headings(addPersona()).map((h) => h.text)
+    const declared = titles.findIndex((t) => titled(4, 'Declare the persona').test(t))
+    const written = titles.findIndex((t) => titled(4, 'Write its credentials file').test(t))
+    expect(declared).toBeGreaterThanOrEqual(0)
+    expect(written).toBeGreaterThan(declared)
+  })
 })
 
 describe('setup wizard: credentials command section', () => {
-  // The section and its one bash block are run by tests/credentials-command.test.ts;
-  // this pins only that the section names both checks and the mode.
+  // The section's one-line block is run end to end by tests/credentials-command.test.ts;
+  // this pins only that the section names the declared persona, both checks, the mode and the packaged script.
   test.each([
+    ['the persona declared in config.json first', /once the persona is declared in `config\.json`/],
     ['bot token checked with auth.test', /`auth\.test`/],
     ['app token checked with apps.connections.open', /`apps\.connections\.open`/],
     ['mode 0600', /mode 0600/],
+    ['the packaged script', /`scripts\/write-credentials\.sh`/],
   ])('## Credentials command carries %s', (_label, pattern) => {
     expect(requiredSection(skill, '## Credentials command', SKILL_FILE)).toMatch(pattern)
   })

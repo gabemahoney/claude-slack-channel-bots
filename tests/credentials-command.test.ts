@@ -1,27 +1,36 @@
 /**
  * credentials-command.test.ts — the setup wizard's credentials command
- * (b.av2 SR-12, SR-1.4 part), run exactly as the skill ships it.
+ * (b.av2 SR-12, SR-1.4 part): `claude-slack-channel-bots credentials
+ * <persona>`, which runs the packaged `scripts/write-credentials.sh` for the
+ * persona's `credentials_file`.
  *
- * The command is the one fenced `bash` block under `## Credentials command`
- * in `skills/setup-slack-channel-bots/SKILL.md`. Each case extracts it by that
- * heading (anything but exactly one `bash` block fails the case), puts a temp
- * path in place of `<credentials file path>` and runs it as a child shell:
+ * Most cases run the script itself, as shipped, for a temp path, as a child
+ * shell (`<shell> scripts/write-credentials.sh <path>`, with `-f` for zsh):
  *
  * - in the case's own `mkdtempSync` directory (removed in `afterEach`), with an
  *   environment of only `PATH`, a temp `HOME` and the proxy variables pointing
- *   at a closed loopback port, and `umask 000` first, so a 0600 file proves
- *   the command sets the mode itself;
+ *   at a closed loopback port, under a small runner that sets `umask 000`
+ *   first, so a 0600 file proves the script sets the mode itself (the runner
+ *   can also run shell code before and after the script, in its own shell);
  * - with `PATH` holding only a temp bin: a stub `curl` that records its argv,
  *   stdin and exported environment per call and answers each Slack method as
  *   the case scripts it, and wrappers for `mkdir`, `mktemp`, `chmod`, `mv` and
  *   `rm` that record their argv (`chmod` also the mode each file had before
  *   it ran), run the case's hook if it set one (to fail the program or change
  *   the target mid-run) and then run the real program by absolute path. No
- *   real network call can happen, and a program the block needs beyond those
+ *   real network call can happen, and a program the script needs beyond those
  *   fails the case ("command not found");
  * - with the inputs piped on stdin in the documented order: `yes` (only when
  *   the target exists), the bot token, the app token. The terminal cases run
  *   it under util-linux `script` instead (skipped when that is absent).
+ *
+ * The wizard's line itself is pinned as shipped (one fenced `bash` block of
+ * one short line under `## Credentials command` in
+ * `skills/setup-slack-channel-bots/SKILL.md`) and run end to end: filled in
+ * as the skill says, padded with the trailing spaces a terminal copy adds,
+ * through the real CLI (`bun src/cli.ts`, as the installed binary runs it)
+ * over a temp state directory, which runs the script with `bash` from `PATH`
+ * (a wrapper recording its argv), so the token is shown to reach no argv.
  *
  * Tokens come from `fakeToken`, so they carry `LEAK_SENTINEL`. Every run's
  * stdout, stderr, recorded argv and curl's environment pass `assertNoLeak`;
@@ -29,9 +38,9 @@
  * leak-checked. The stub and wrappers are generated at runtime and hold no
  * token.
  *
- * zsh rows (the block states it works in bash and zsh) are skipped when zsh
- * is not installed: success, one local rejection, the trailing-space copy,
- * writing and bad paths run under both shells.
+ * zsh rows (the script works under bash and zsh) are skipped when zsh is not
+ * installed: success, one local rejection, writing and bad paths run under
+ * both shells.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -53,7 +62,9 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
+import { CREDENTIALS_SCRIPT_PATH } from '../src/cli.ts'
 import { checkPersonaCredentials } from '../src/persona-credentials.ts'
+import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
@@ -62,39 +73,44 @@ import {
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
 import { requiredSection, splitFences } from './test-helpers/markdown.ts'
+import { makePersona, makePersonaConfigInput, writeConfigFile } from './test-helpers/persona-config.ts'
 
 // ---------------------------------------------------------------------------
-// The block, from the skill
+// The script, and the wizard's line from the skill
 // ---------------------------------------------------------------------------
 
-const SKILL_PATH = join(import.meta.dir, '..', 'skills', 'setup-slack-channel-bots', 'SKILL.md')
+const REPO_ROOT = join(import.meta.dir, '..')
+/** The script as the package ships it (package.json `files`); the CLI's own constant names it. */
+const SCRIPT = join(REPO_ROOT, 'scripts', 'write-credentials.sh')
+const CLI_SOURCE = join(REPO_ROOT, 'src', 'cli.ts')
+const SKILL_PATH = join(REPO_ROOT, 'skills', 'setup-slack-channel-bots', 'SKILL.md')
 const HEADING = '## Credentials command'
-const PATH_LINE = "creds_file='<credentials file path>'"
+const PERSONA_PLACEHOLDER = '<persona>'
 
 /**
- * The body of the one fenced `bash` block in the `## Credentials command`
+ * The one line of the one fenced `bash` block in the `## Credentials command`
  * section. Throws naming what is wrong when the heading is missing, the
- * section holds any other number or kind of fenced block, or the block lacks
- * exactly one path line to substitute, so no case can pass vacuously.
+ * section holds any other number or kind of fenced block, or the block is not
+ * one line holding the placeholder exactly once, so no case can pass
+ * vacuously.
  */
-function credentialsBlock(): string {
+function wizardLine(): string {
   const section = requiredSection(readFileSync(SKILL_PATH, 'utf-8'), HEADING, SKILL_PATH)
   const { blocks } = splitFences(section)
   if (blocks.length !== 1 || blocks[0].info !== 'bash') {
     const found = blocks.map((b) => `\`\`\`${b.info}`).join(', ') || 'none'
     throw new Error(`"${HEADING}" must hold exactly one fenced bash block; found: ${found}`)
   }
-  const pathLines = blocks[0].body.split('\n').filter((line) => line === PATH_LINE)
-  if (pathLines.length !== 1) {
-    throw new Error(`the "${HEADING}" block must hold the line ${PATH_LINE} exactly once; found ${pathLines.length}`)
+  const lines = blocks[0].body.split('\n').filter((line) => line.trim() !== '')
+  if (lines.length !== 1 || lines[0].split(PERSONA_PLACEHOLDER).length !== 2) {
+    throw new Error(`the "${HEADING}" block must be one line holding ${PERSONA_PLACEHOLDER} exactly once; found ${lines.length} lines`)
   }
-  return blocks[0].body
+  return lines[0]
 }
 
-/** The block with `credsPath` in place of the placeholder (no single quote allowed, as the skill says). */
-function commandFor(credsPath: string): string {
-  if (credsPath.includes("'")) throw new Error('commandFor: the path must not contain a single quote')
-  return credentialsBlock().replace(PATH_LINE, () => `creds_file='${credsPath}'`)
+/** The wizard's line with `persona` in place of the placeholder, as the skill fills it in. */
+function lineFor(persona: string): string {
+  return wizardLine().replace(PERSONA_PLACEHOLDER, () => persona)
 }
 
 // ---------------------------------------------------------------------------
@@ -110,7 +126,7 @@ function hostProgram(name: string): string {
 
 const BASH = hostProgram('bash')
 const ZSH = Bun.which('zsh')
-/** The shells the block must work in; zsh is null when not installed, and its rows skip. */
+/** The shells the script must work in; zsh is null when not installed, and its rows skip. */
 const SHELLS: [name: string, path: string | null][] = [
   ['bash', BASH],
   ['zsh', ZSH],
@@ -118,7 +134,7 @@ const SHELLS: [name: string, path: string | null][] = [
 /** The describe title suffix for a shell's rows. */
 const underShell = (name: string) => (name === 'bash' ? '(bash)' : `(${name}; skipped when ${name} is not installed)`)
 /** util-linux `script` (the BSD one takes other flags), or null. */
-const SCRIPT = ((path) =>
+const SCRIPT_UTIL = ((path) =>
   path !== null && spawnSync(path, ['--version'], { encoding: 'utf-8' }).stdout?.includes('util-linux') ? path : null)(
   Bun.which('script'),
 )
@@ -226,7 +242,7 @@ function hook(sb: Sandbox, name: Wrapped, code: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Running the command
+// Running the script
 // ---------------------------------------------------------------------------
 
 interface CurlCall {
@@ -250,12 +266,12 @@ interface Run {
 
 interface RunOptions {
   shell?: string
-  /** Shell code run before the block, in the same shell (for example `set -ax`). */
+  /** Options for the shell running the script, before the script's path (for example `-a`, `-x`). */
+  flags?: string[]
+  /** Shell code the runner runs before the script, in its own shell. */
   prelude?: string
-  /** Shell code run after the block's subshell ends, in the same shell. */
+  /** Shell code the runner runs after the script exits, in its own shell (the runner then exits with the script's status). */
   epilogue?: string
-  /** Appended to every line of the block, as a terminal copy can pad lines with spaces. */
-  pad?: string
 }
 
 function readLines(path: string): string[] {
@@ -267,15 +283,21 @@ function childEnv(sb: Sandbox): Record<string, string> {
   return { PATH: sb.bin, HOME: sb.home, https_proxy: CLOSED_PROXY, HTTPS_PROXY: CLOSED_PROXY, ALL_PROXY: CLOSED_PROXY }
 }
 
-/** Write the script a case runs: `umask 000`, the prelude, the block for `credsPath` (each line padded), the epilogue. */
-function writeScript(sb: Sandbox, credsPath: string, opts: RunOptions): string {
-  const script = join(sb.root, 'credentials-command.sh')
-  const block = commandFor(credsPath)
-    .split('\n')
-    .map((line) => `${line}${opts.pad ?? ''}`)
-    .join('\n')
-  writeFileSync(script, `umask 000\n${opts.prelude ?? ''}\n${block}\n${opts.epilogue ?? ''}\n`)
-  return script
+/**
+ * Write the runner a case starts: `umask 000`, the prelude, then its
+ * arguments as a command (the shell, its flags, the script and the path),
+ * then the epilogue, exiting with the script's status.
+ */
+function writeRunner(sb: Sandbox, opts: RunOptions): string {
+  const runner = join(sb.root, 'run-credentials-script.sh')
+  writeFileSync(runner, `umask 000\n${opts.prelude ?? ''}\n"$@"\ncscb_status=$?\n${opts.epilogue ?? ''}\nexit "$cscb_status"\n`)
+  return runner
+}
+
+/** `<shell> [-f] [flags] <script> <credsPath>`: how the runner starts the script. */
+function scriptCommand(credsPath: string, opts: RunOptions): string[] {
+  const shell = opts.shell ?? BASH
+  return [shell, ...(shell === ZSH ? ['-f'] : []), ...(opts.flags ?? []), SCRIPT, credsPath]
 }
 
 /** What the stub and wrappers recorded. */
@@ -295,11 +317,10 @@ function recorded(sb: Sandbox): Pick<Run, 'curl' | 'calls' | 'premodes'> {
   }
 }
 
-/** Run the block for `credsPath` under `umask 000` with stdin `input`. */
+/** Run the script for `credsPath` under `umask 000` with stdin `input`. */
 function runCommand(sb: Sandbox, credsPath: string, input: string, opts: RunOptions = {}): Run {
-  const shell = opts.shell ?? BASH
-  const script = writeScript(sb, credsPath, opts)
-  const child = spawnSync(shell, shell === ZSH ? ['-f', script] : [script], {
+  const runner = writeRunner(sb, opts)
+  const child = spawnSync(BASH, [runner, ...scriptCommand(credsPath, opts)], {
     cwd: sb.cwd,
     env: childEnv(sb),
     input,
@@ -327,7 +348,7 @@ function expectSafe(run: Run): void {
   })
 }
 
-/** stdin for the command: one value per line. */
+/** stdin for the script: one value per line. */
 function lines(...values: string[]): string {
   return values.map((value) => `${value}\n`).join('')
 }
@@ -342,7 +363,7 @@ function bearer(token: string): string {
  * first (so no `~/.curlrc` is read), `--config -` (the config, so the token,
  * comes from stdin) and the method's URL last. Other flags are not pinned.
  */
-function expectSlackCalls(run: Run): void {
+function expectSlackCalls(run: Pick<Run, 'curl'>): void {
   expect(run.curl).toHaveLength(2)
   const expected: [string, string][] = [
     ['auth.test', bot],
@@ -361,7 +382,7 @@ function modeOf(path: string): number {
   return statSync(path).mode & 0o777
 }
 
-/** Temp files the command left beside the target. */
+/** Temp files the script left beside the target. */
 function leftovers(dir: string): string[] {
   return existsSync(dir) ? readdirSync(dir).filter((name) => name.startsWith(TEMP_PREFIX)) : []
 }
@@ -378,6 +399,7 @@ const APP_OK = 'app_token: ok (apps.connections.open)'
 const mustStart = (key: string, prefix: string) => `${key}: must start with ${prefix} followed by the rest of the token`
 const badChars = (key: string) => `${key}: may hold only letters, digits and dashes`
 const cannotWrite = (path: string) => `credentials file: cannot write ${path}; nothing written.\n`
+const USAGE = 'usage: write-credentials.sh <credentials file path>\n'
 
 let sb: Sandbox
 
@@ -405,26 +427,41 @@ function existing(): { path: string; bytes: Buffer } {
 }
 
 // ---------------------------------------------------------------------------
-// The block as shipped
+// As shipped: the wizard's line and the script
 // ---------------------------------------------------------------------------
 
-describe('credentials command: the block as shipped', () => {
-  test('no line is longer than 60 characters, so a copy from a terminal keeps every line whole', () => {
-    const long = credentialsBlock()
-      .split('\n')
-      .filter((line) => line.length > 60)
-    expect(long).toEqual([])
+describe('credentials command: as shipped', () => {
+  test('the wizard gives one line, the CLI subcommand with the persona, at most 60 characters with a 13-character name, so a copy from an 80-column terminal keeps it whole', () => {
+    expect(wizardLine()).toBe(`claude-slack-channel-bots credentials ${PERSONA_PLACEHOLDER}`)
+    expect(lineFor('x'.repeat(13)).length).toBeLessThanOrEqual(60)
+    expect(wizardLine()).not.toMatch(/\\\s*$/)
   })
 
-  test('no line ends in a backslash, so trailing spaces from a terminal copy cannot break a continuation', () => {
-    const continued = credentialsBlock()
-      .split('\n')
-      .filter((line) => /\\\s*$/.test(line))
-    expect(continued).toEqual([])
+  test('the CLI runs the script this file runs, the one the package ships', () => {
+    expect(CREDENTIALS_SCRIPT_PATH).toBe(SCRIPT)
+    const files: string[] = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8')).files
+    expect(files).toContain('scripts/write-credentials.sh')
   })
 
-  test('curl is called by name through PATH, never by an absolute path', () => {
-    expect(credentialsBlock()).not.toMatch(/\/curl\b/)
+  test('the script turns off tracing and automatic export before anything else runs, and calls curl by name through PATH, never by an absolute path', () => {
+    const code = readFileSync(SCRIPT, 'utf-8')
+      .split('\n')
+      .filter((line) => line.trim() !== '' && !line.trimStart().startsWith('#'))
+    expect(code[0]).toBe('set +xa')
+    expect(code.join('\n')).not.toMatch(/\/curl\b/)
+  })
+})
+
+describe('credentials command: usage', () => {
+  test.each<[string, string[]]>([
+    ['no path', []],
+    ['two paths', ['/a/credentials.json', '/b/credentials.json']],
+  ])('%s: exit 2 with the usage line, before any prompt, nothing done', (_label, args) => {
+    const child = spawnSync(BASH, [SCRIPT, ...args], { cwd: sb.cwd, env: childEnv(sb), input: lines('yes', bot, app), encoding: 'utf-8', timeout: 10_000 })
+    expect(child.status).toBe(2)
+    expect(child.stderr).toBe(USAGE)
+    expect(child.stdout).toBe('')
+    expect(recorded(sb)).toEqual({ curl: [], calls: [], premodes: [] })
   })
 })
 
@@ -478,9 +515,15 @@ describe('credentials command: success', () => {
     expectWritten(run, path)
   })
 
-  test('inherited set -a and set -x: no token in curl environment or a trace', () => {
+  test('started with set -a and set -x on (bash -a -x): no token in curl environment or a trace', () => {
     const path = target()
-    const run = runCommand(sb, path, lines(bot, app), { prelude: 'set -ax' })
+    const run = runCommand(sb, path, lines(bot, app), { flags: ['-a', '-x'] })
+    expectWritten(run, path)
+  })
+
+  test('a path with spaces and a single quote is written as given: it reaches the script as one argument', () => {
+    const path = join(sb.root, "it's a dir", 'p credentials.json')
+    const run = runCommand(sb, path, lines(bot, app))
     expectWritten(run, path)
   })
 
@@ -490,9 +533,9 @@ describe('credentials command: success', () => {
     expectWritten(run, path)
   })
 
-  test.skipIf(ZSH === null)('under zsh with inherited set -a and set -x (skipped when zsh is not installed)', () => {
+  test.skipIf(ZSH === null)('under zsh started with set -a and set -x on (skipped when zsh is not installed)', () => {
     const path = target()
-    const run = runCommand(sb, path, lines(bot, app), { shell: ZSH ?? BASH, prelude: 'set -ax' })
+    const run = runCommand(sb, path, lines(bot, app), { shell: ZSH ?? BASH, flags: ['-a', '-x'] })
     expectWritten(run, path)
   })
 })
@@ -557,7 +600,7 @@ interface TerminalRun {
 }
 
 /**
- * Run the block for `credsPath` on a terminal under util-linux `script`, fed
+ * Run the script for `credsPath` on a terminal under util-linux `script`, fed
  * by `steps`, and leak-check everything it showed, the typescript, curl's
  * argv and environment and the wrapped programs' argv. `timeout -s KILL`
  * bounds the session at 20 s: `script` outlives a plain SIGTERM.
@@ -565,7 +608,8 @@ interface TerminalRun {
 function runOnTerminal(credsPath: string, steps: TerminalStep[]): TerminalRun {
   const typescript = join(sb.root, 'typescript')
   const ttyFile = join(sb.root, 'tty')
-  const script = writeScript(sb, credsPath, { prelude: `'${hostProgram('tty')}' > '${ttyFile}'` })
+  const runner = writeRunner(sb, { prelude: `'${hostProgram('tty')}' > '${ttyFile}'` })
+  const command = [runner, ...scriptCommand(credsPath, {})].map((arg) => `'${arg}'`).join(' ')
   const fed = steps.map((step, i): [TerminalStep, string] => {
     const inputFile = join(sb.root, `in.${i}`)
     writeFileSync(inputFile, step.input)
@@ -573,7 +617,7 @@ function runOnTerminal(credsPath: string, steps: TerminalStep[]): TerminalRun {
   })
   const feed = join(sb.root, 'feed.sh')
   writeFileSync(feed, feeder(fed, typescript, ttyFile))
-  const session = `'${TIMEOUT}' -s KILL 20 '${SCRIPT}' -qfec "'${BASH}' '${script}'" '${typescript}'`
+  const session = `'${TIMEOUT}' -s KILL 20 '${SCRIPT_UTIL}' -qfec "'${BASH}' ${command}" '${typescript}'`
   const child = spawnSync(BASH, ['-c', `exec ${session} < <('${BASH}' '${feed}' 2>/dev/null)`], {
     cwd: sb.cwd,
     env: childEnv(sb),
@@ -598,7 +642,7 @@ function timesShown(output: string, prompt: string): number {
 
 const BOT_PROMPT = 'bot_token (Bot User OAuth Token'
 const APP_PROMPT = 'app_token (app-level token'
-const NO_TERMINAL = SCRIPT === null || TIMEOUT === null
+const NO_TERMINAL = SCRIPT_UTIL === null || TIMEOUT === null
 
 describe('credentials command: on a terminal (skipped without util-linux script and timeout)', () => {
   test.skipIf(NO_TERMINAL)(
@@ -719,26 +763,94 @@ describe('credentials command: local checks stop before any Slack call', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Copied from a terminal: every line padded with trailing spaces
+// The wizard's line, end to end: the real CLI finds the persona and runs the script
 // ---------------------------------------------------------------------------
 
-for (const [shellName, shell] of SHELLS) {
-  describe.skipIf(shell === null)(`credentials command: every line copied with trailing spaces ${underShell(shellName)}`, () => {
-    const pad = '   '
-
-    test('succeeds as unpadded: the same 0600 file, no token printed or in any argv or environment', () => {
-      const path = target()
-      const run = runCommand(sb, path, lines(bot, app), { shell: shell ?? BASH, pad })
-      expectWritten(run, path)
-    })
-
-    test('a local rejection still exits 1 naming the key, no token printed, nothing sent', () => {
-      const path = target()
-      const run = runCommand(sb, path, lines(fakeToken(APP_TOKEN_PREFIX), app), { shell: shell ?? BASH, pad })
-      expectRejected(run, path, [mustStart('bot_token', BOT_TOKEN_PREFIX)])
-    })
-  })
+/**
+ * Put the command's two programs on the sandbox PATH, each recording its argv
+ * in `calls.log` first: `claude-slack-channel-bots`, which runs this
+ * checkout's CLI with bun as the package's bin does, and `bash`, which the CLI
+ * runs the script with, then the host bash.
+ */
+function installCli(): void {
+  const logged = (name: string, run: string) =>
+    `#!${BASH}\n{ printf '%s' '${name}'; for a in "$@"; do printf '\\t%s' "$a"; done; printf '\\n'; } >> '${sb.log}/calls.log'\nexec ${run} "$@"\n`
+  writeFileSync(join(sb.bin, 'claude-slack-channel-bots'), logged('claude-slack-channel-bots', `'${process.execPath}' '${CLI_SOURCE}'`), { mode: 0o755 })
+  writeFileSync(join(sb.bin, 'bash'), logged('bash', `'${BASH}'`), { mode: 0o755 })
 }
+
+/** A state directory whose config.json declares one persona, `name`, with `credentialsFile`. */
+function declare(name: string, credentialsFile: string): string {
+  const stateDir = join(sb.root, 'state-dir')
+  mkdirSync(stateDir)
+  writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name, credentials_file: credentialsFile }, sb.root)] }, sb.root))
+  return stateDir
+}
+
+/** Run `line` as the operator pastes it at a bash prompt (under `umask 000`), with `input` on stdin. */
+function runPasted(line: string, stateDir: string, input: string): Run {
+  installCli()
+  const pasted = join(sb.root, 'pasted.sh')
+  writeFileSync(pasted, `umask 000\n${line}\n`)
+  const child = spawnSync(BASH, [pasted], {
+    cwd: sb.cwd,
+    env: { ...childEnv(sb), SLACK_STATE_DIR: stateDir, BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' },
+    input,
+    encoding: 'utf-8',
+    timeout: 30_000,
+  })
+  return { status: child.status, signal: child.signal, stdout: child.stdout, stderr: child.stderr, ...recorded(sb) }
+}
+
+describe("credentials command: the wizard's line, through the real CLI", () => {
+  test.each<[string, string, string]>([
+    ['a name that is its own key, copied with trailing spaces', 'persona_p', `${lineFor('persona_p')}   `],
+    ['a name with a space, single-quoted as the skill says', 'Dev Bot', lineFor(`'Dev Bot'`)],
+  ])(
+    '%s: the CLI names the persona and its file, runs the script with bash for that path, and the file is written; no token on any command line',
+    (_label, name, line) => {
+      const path = join(sb.home, '.config', 'cscb', 'p-credentials.json')
+      const stateDir = declare(name, '~/.config/cscb/p-credentials.json')
+      const run = runPasted(line, stateDir, lines(bot, app))
+
+      expectSafe(run)
+      expect(run.status).toBe(0)
+      expectSlackCalls(run)
+      expect(run.stdout).toBe(`${BOT_OK}\n${APP_OK}\nWrote ${path} with mode 0600. bot_token and app_token both validated.\n`)
+      expect(run.stderr).toStartWith(`Credentials file of persona ${renderPersonaRef(name, personaKey(name))}: ${path}\n`)
+      expect(modeOf(path)).toBe(0o600)
+      expect(JSON.parse(readFileSync(path, 'utf-8'))).toEqual({ bot_token: bot, app_token: app })
+      // The process list: the command as pasted, then bash running the packaged script for the expanded path.
+      expect(run.calls.slice(0, 2)).toEqual([
+        ['claude-slack-channel-bots', 'credentials', name],
+        ['bash', CREDENTIALS_SCRIPT_PATH, path],
+      ])
+      expect(run.calls.slice(2).map((call) => call[0])).toEqual(['mkdir', 'mktemp', 'chmod', 'mv'])
+      expect(leftovers(dirname(path))).toEqual([])
+    },
+    30_000,
+  )
+
+  test(
+    'a persona config.json does not declare: exit 1 naming the declared ones, before any prompt; no script, no Slack call, no file',
+    () => {
+      const path = join(sb.home, '.config', 'cscb', 'p-credentials.json')
+      const stateDir = declare('persona_p', path)
+      const run = runPasted(lineFor('persona_q'), stateDir, lines(bot, app))
+
+      expectSafe(run)
+      expect(run.status).toBe(1)
+      expect(run.stdout).toBe('')
+      expect(run.stderr).toBe(
+        `credentials: no persona in ${join(stateDir, 'config.json')} has that name or key; declare it there first (declared: ${renderPersonaRef('persona_p')})\n`,
+      )
+      expect(run.curl).toEqual([])
+      expect(run.calls).toEqual([['claude-slack-channel-bots', 'credentials', 'persona_q']])
+      expect(existsSync(path)).toBe(false)
+    },
+    30_000,
+  )
+})
 
 // ---------------------------------------------------------------------------
 // curl missing, or reading the operator's ~/.curlrc

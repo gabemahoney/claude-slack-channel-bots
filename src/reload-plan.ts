@@ -158,6 +158,18 @@ export interface ChangePlanFacts {
    * added persona absent here, or with no causes, is taken to come up.
    */
   addedCannotComeUp?: ReadonlyMap<string, readonly AddedPersonaCause[] | FactUnknown>
+  /**
+   * Why a candidate persona's effective claude_config_dir cannot be resolved
+   * to a real path, as the claude_config_dir check its bring-up and launch
+   * run words it (its `problem`, bug b.g57; production: `checkConfigDir`, the
+   * one the added-persona check uses); undefined when it resolves, a
+   * directory not created yet under a resolvable ancestor included;
+   * `FACT_UNKNOWN` when it could not be checked. Consulted only for a persona
+   * present in both configurations whose effective claude_config_dir changed
+   * (its own, or through the top-level default it inherits; a destructive
+   * modify included). Absent: nothing is known to stop them.
+   */
+  configDirProblem?(persona: Persona): string | FactUnknown | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +211,14 @@ export interface AddedPersonaChange extends ChangePlanPersonaRef {
   cannotComeUp: AddedPersonaCause[] | undefined
 }
 
+/**
+ * Why a persona whose effective claude_config_dir changed cannot come up with
+ * the new one: the claude_config_dir check's problem (`ChangePlanFacts.configDirProblem`),
+ * or `FACT_UNKNOWN` when it could not be checked. Absent when the directory
+ * did not change or resolves.
+ */
+export type ConfigDirUnresolvable = string | FactUnknown
+
 /** A persona whose `name`, `credentials_file` or `working_directory` (by real path) changed: torn down, then brought up. */
 export interface DestructivePersonaChange extends ChangePlanPersonaRef {
   /** The changed settings, in `DESTRUCTIVE_SETTINGS` order. */
@@ -207,6 +227,11 @@ export interface DestructivePersonaChange extends ChangePlanPersonaRef {
   credentials_file: string
   /** The candidate's `working_directory`. */
   working_directory: string
+  /**
+   * Its effective claude_config_dir changed too (by real path) and cannot be
+   * resolved, or could not be checked: the bring-up at apply holds it.
+   */
+  configDirUnresolvable?: ConfigDirUnresolvable
 }
 
 /** A persona with settings applied in place. */
@@ -250,6 +275,19 @@ export interface NextLaunchPersonaChange extends ChangePlanPersonaRef {
   own: NextLaunchSetting[]
   /** Settings that changed through the top-level default it inherits, in `NEXT_LAUNCH_SETTINGS` order. */
   inherited: NextLaunchSetting[]
+  /**
+   * Its claude_config_dir changed (own or inherited) to one that cannot be
+   * resolved, or could not be checked: at its next launch it is held (its
+   * Slack connection closed, its launch waiting until the directory
+   * resolves) instead of coming up.
+   */
+  configDirUnresolvable?: ConfigDirUnresolvable
+}
+
+/** A persona an inherited default reaches: its reference, and for `claude_config_dir` whether the new directory stops it. */
+export interface InheritingPersonaRef extends ChangePlanPersonaRef {
+  /** See `NextLaunchPersonaChange.configDirUnresolvable`; only for `claude_config_dir`. */
+  configDirUnresolvable?: ConfigDirUnresolvable
 }
 
 /** A changed server-wide setting, compared by resolved value (paths by real path). */
@@ -262,7 +300,7 @@ export interface ServerSettingChange {
    * modified, whose value changes through it, in candidate order. Absent for
    * any other setting.
    */
-  inheritedBy?: ChangePlanPersonaRef[]
+  inheritedBy?: InheritingPersonaRef[]
 }
 
 /** The plan of a valid candidate. */
@@ -463,6 +501,13 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
  *   changed, marked own or inherited (see `nextLaunchChanges`);
  * - otherwise unchanged.
  *
+ * A persona whose effective `claude_config_dir` changed (a next-launch change,
+ * own or inherited, or alongside a destructive modify) carries
+ * `configDirUnresolvable` when `facts.configDirProblem` says the new directory
+ * cannot be resolved, or could not be checked: the preview warns about it
+ * as it does for an added persona that cannot come up (bug b.g57). The change
+ * is still applied as previewed.
+ *
  * Server-wide settings are compared by resolved value, paths by real path. A
  * changed `claude_config_dir` or `stop_hook_bootstrap` lists the personas
  * that inherit the change. `noEffectiveChange` holds when nothing but
@@ -512,12 +557,17 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
       setting === 'name' ? before.name !== persona.name : !samePath(before[setting], persona[setting]),
     )
     if (destructive.length > 0) {
-      plan.destructive.push({
+      const change: DestructivePersonaChange = {
         ...ref,
         settings: destructive,
         credentials_file: persona.credentials_file,
         working_directory: persona.working_directory,
-      })
+      }
+      if (!samePath(before.claude_config_dir, persona.claude_config_dir)) {
+        const unresolvable = facts.configDirProblem?.(persona)
+        if (unresolvable !== undefined) change.configDirUnresolvable = unresolvable
+      }
+      plan.destructive.push(change)
       continue
     }
     let changed = false
@@ -540,7 +590,12 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
     }
     const nextLaunch = nextLaunchChanges(before, persona, applied, next, samePath)
     if (nextLaunch.own.length > 0 || nextLaunch.inherited.length > 0) {
-      plan.nextLaunch.push({ ...ref, ...nextLaunch })
+      const change: NextLaunchPersonaChange = { ...ref, ...nextLaunch }
+      if ([...nextLaunch.own, ...nextLaunch.inherited].includes('claude_config_dir')) {
+        const unresolvable = facts.configDirProblem?.(persona)
+        if (unresolvable !== undefined) change.configDirUnresolvable = unresolvable
+      }
+      plan.nextLaunch.push(change)
       changed = true
     }
     if (!changed) plan.unchanged.push(ref)
@@ -554,7 +609,13 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
     }
     const inheritedBy = plan.nextLaunch
       .filter((p) => (p.inherited as readonly string[]).includes(name))
-      .map(({ key, name: personaName, index }) => ({ key, name: personaName, index }))
+      .map(({ key, name: personaName, index, configDirUnresolvable }): InheritingPersonaRef => {
+        const inheriting: InheritingPersonaRef = { key, name: personaName, index }
+        if (name === 'claude_config_dir' && configDirUnresolvable !== undefined) {
+          inheriting.configDirUnresolvable = configDirUnresolvable
+        }
+        return inheriting
+      })
     plan.settings.push({ name, inheritedBy })
   }
 
@@ -647,13 +708,26 @@ function removedLine(p: ChangePlanPersonaRef): string {
   return `${DESTRUCTIVE_PREFIX} ${personaRef(p)} is removed: its live session will be destroyed (its instance is torn down).`
 }
 
+/**
+ * The warning for a changed claude_config_dir that cannot be resolved, worded
+ * like an added persona's (`is added but cannot come up: <cause>`), starting
+ * `; `: `; but <when> it cannot come up: <problem>`, or `; whether it can
+ * come up <when> could not be checked`. Empty when nothing stops it.
+ */
+function configDirWarning(unresolvable: ConfigDirUnresolvable | undefined, when: string): string {
+  if (unresolvable === undefined) return ''
+  const at = when === '' ? '' : ` ${when}`
+  if (unresolvable === FACT_UNKNOWN) return `; whether it can come up${at} could not be checked`
+  return `; but${at} it cannot come up: ${unresolvable}`
+}
+
 function destructiveLine(p: DestructivePersonaChange): string {
   const what = p.settings.map((setting) =>
     setting === 'name' ? 'name changed' : `${setting} changed to ${JSON.stringify(p[setting])}`,
   )
   return (
     `${DESTRUCTIVE_PREFIX} ${personaRef(p)} ${what.join(' and ')}: its live session will be destroyed, ` +
-    'then it is brought up fresh.'
+    `then it is brought up fresh${configDirWarning(p.configDirUnresolvable, '')}.`
   )
 }
 
@@ -711,7 +785,10 @@ function modifiedLine(
     effects.push(`${inPlace.settings.join(', ')} changed: applied in place immediately, instance kept`)
   }
   if (nextLaunch !== undefined && nextLaunch.own.length > 0) {
-    effects.push(`${nextLaunch.own.join(', ')} changed: ${nextLaunchEffect(nextLaunch.own, 'its')}`)
+    const warning = nextLaunch.own.includes('claude_config_dir')
+      ? configDirWarning(nextLaunch.configDirUnresolvable, 'at that launch')
+      : ''
+    effects.push(`${nextLaunch.own.join(', ')} changed: ${nextLaunchEffect(nextLaunch.own, 'its')}${warning}`)
   }
   if (credentials !== undefined) effects.push(credentialsEffect(credentials))
   return effects.length === 0 ? undefined : `${personaRef(ref)}: ${effects.join('; ')}.`
@@ -734,7 +811,28 @@ function settingLine(s: ServerSettingChange): string {
   if (s.inheritedBy === undefined) return `${prefix} ${recorded} and takes effect at the next server start after that.`
   if (s.inheritedBy.length === 0) return `${prefix} ${recorded}; no persona inherits it, so no instance is affected.`
   const who = s.inheritedBy.map((p) => renderPersonaRef(p.name, p.key)).join(', ')
-  return `${prefix} inherited by ${who}; ${nextLaunchEffect([s.name], "each one's")}.`
+  return `${prefix} inherited by ${who}; ${nextLaunchEffect([s.name], "each one's")}${inheritedConfigDirWarnings(s.inheritedBy)}.`
+}
+
+/**
+ * The warnings of a changed top-level `claude_config_dir` for the inheriting
+ * personas it stops, each starting `; `: `; but at that launch <personas>
+ * cannot come up: <problem>` for each distinct problem, then `; whether
+ * <personas> can come up at that launch could not be checked`. Personas are
+ * listed in candidate order. Empty when it stops none.
+ */
+function inheritedConfigDirWarnings(inheritedBy: readonly InheritingPersonaRef[]): string {
+  const byProblem = new Map<string, string[]>()
+  const unknown: string[] = []
+  for (const p of inheritedBy) {
+    if (p.configDirUnresolvable === undefined) continue
+    const ref = renderPersonaRef(p.name, p.key)
+    if (p.configDirUnresolvable === FACT_UNKNOWN) unknown.push(ref)
+    else byProblem.set(p.configDirUnresolvable, [...(byProblem.get(p.configDirUnresolvable) ?? []), ref])
+  }
+  const warnings = [...byProblem].map(([problem, refs]) => `; but at that launch ${refs.join(', ')} cannot come up: ${problem}`)
+  if (unknown.length > 0) warnings.push(`; whether ${unknown.join(', ')} can come up at that launch could not be checked`)
+  return warnings.join('')
 }
 
 /**

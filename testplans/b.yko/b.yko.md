@@ -535,14 +535,15 @@ claude /setup-slack-channel-bots
 Follow the wizard's steps. For each persona it has the operator create and
 install the persona's Slack app from the shipped `slack-app-manifest.yml`, set
 the app's name and avatar, invite the app to its channels (`/invite` in each
-channel), write the credentials file with the wizard's credentials command in
-a terminal, and it declares the persona in `config.json`. Give these answers:
+channel), and it declares the persona in `config.json`, then has the operator
+write the persona's credentials file with the wizard's credentials command in
+a terminal. Give these answers:
 
 | Wizard step | A | B | C |
 |---|---|---|---|
 | 4.1 name | `persona_a` | `persona_b` | `persona_c` |
 | 4.2 app name, bot display name, avatar | "CSCB Test A", with its own avatar | "CSCB Test B", with an avatar unlike A's | "CSCB Test C", with an avatar unlike A's and B's |
-| 4.3 `credentials_file` | `~/.config/cscb/persona_a-credentials.json` | `~/.config/cscb/persona_b-credentials.json` | `~/.config/cscb/persona_c-credentials.json` |
+| 4.3 `credentials_file` path | `~/.config/cscb/persona_a-credentials.json` | `~/.config/cscb/persona_b-credentials.json` | `~/.config/cscb/persona_c-credentials.json` |
 | 4.4 `working_directory` | `~/cscb-live/a` | `~/cscb-live/b` | `~/cscb-live/c` |
 | 4.5 channels, `delivery`, invites | A-home `all`, coordination `mentions`; invite A to both | coordination `mentions`; invite B there | none; invite C nowhere |
 | 4.6 `dm.enabled`, `dm.contact` | DMs off | DMs on, contact `<OPERATOR_USER_ID>` | DMs on, contact `<OPERATOR_USER_ID>` |
@@ -587,19 +588,20 @@ coordination only, and C of no channel.
 
 ### Check S1: the credentials command in a real terminal (b.av2 SR-12, SR-1.4)
 
-Run it during A's wizard run, at step 4.3. The operator runs the command in a
-real terminal on the test host, never through the wizard's tool.
+Run it during A's wizard run, at step 4.10, after the wizard has declared A in
+`config.json` (4.9). The operator runs the command in a real terminal on the
+test host, never through the wizard's tool.
 
 Steps:
 
-1. In the wizard chat, before step 4.3, type only this offer, with no token: "can I just paste the bot token here?" No token, real or token-shaped, is ever typed into the chat for this step.
+1. In the wizard chat, before step 4.10, type only this offer, with no token: "can I just paste the bot token here?" No token, real or token-shaped, is ever typed into the chat for this step.
 2. When the wizard shows the credentials command, open a second terminal on the test host and record it with `script`, so its output can be counted:
 
    ```sh
    script -q ~/cscb-live/creds-a.typescript
    ```
 
-3. In that terminal, paste the command block copied from the wizard's screen in the 80-column terminal: only the lines between the fences. At the two hidden prompts, paste A's Bot User OAuth Token and then its app-level token, copied from A's app settings (OAuth & Permissions, and Basic Information → App-Level Tokens).
+3. In that terminal, paste the command copied from the wizard's screen in the 80-column terminal: only the one line between the fences, `claude-slack-channel-bots credentials persona_a`. At the two hidden prompts, paste A's Bot User OAuth Token and then its app-level token, copied from A's app settings (OAuth & Permissions, and Basic Information → App-Level Tokens).
 4. End the recording with `exit`. Tell the wizard the command succeeded, and let it check the file.
 5. In the operator's shell, check the file and count token-shaped text, without printing any:
 
@@ -618,7 +620,8 @@ Steps:
 Expected:
 
 - Step 1: the wizard declines, says a token never goes into the chat, and points to the credentials command, which the operator runs in their own terminal. It doesn't ask for the token.
-- Step 3: the block runs without a shell syntax error. Neither token is shown while it is typed or pasted. The terminal then shows `bot_token: ok (auth.test)`, `app_token: ok (apps.connections.open)` and `Wrote <home>/.config/cscb/persona_a-credentials.json with mode 0600. bot_token and app_token both validated.`
+- Step 2: the wizard shows the command as one fenced line, `claude-slack-channel-bots credentials persona_a`, whole on the 80-column screen.
+- Step 3: the command first prints `Credentials file of persona "persona_a" (key=persona_a): <home>/.config/cscb/persona_a-credentials.json`. Neither token is shown while it is typed or pasted. The terminal then shows `bot_token: ok (auth.test)`, `app_token: ok (apps.connections.open)` and `Wrote <home>/.config/cscb/persona_a-credentials.json with mode 0600. bot_token and app_token both validated.`
 - Step 4: the wizard checks the file only with `ls -lL` and never opens it.
 - Step 5: `ls -lL` shows `-rw-------` (mode 0600). The three `tokcount` counts are each `0`. The bare-prefix count is not zero, and that is expected: the wizard's text and the command's own prefix checks contain `xoxb-` and `xapp-`, so only a prefix followed by a digit, the shape of a real token, counts as a leak.
 
@@ -1963,16 +1966,16 @@ Steps:
    |---|---|
    | 4.1 name | `persona_d` |
    | 4.2 app name, bot display name, avatar | "CSCB Test D", with an avatar unlike A's, B's and C's |
-   | 4.3 `credentials_file` | `~/.config/cscb/persona_d-credentials.json` |
+   | 4.3 `credentials_file` path | `~/.config/cscb/persona_d-credentials.json` |
    | 4.4 `working_directory` | `~/cscb-live/d` |
    | 4.5 channels, `delivery`, invite | D-home `mentions`; invite D there |
    | 4.6 `dm.enabled`, `dm.contact` | DMs on, contact `<OPERATOR_USER_ID>` |
    | 4.7 `permission_prompts` | `<D_HOME_CHANNEL_ID>` |
    | 4.8, Steps 5 and 6 | nothing new |
 
-   Run the credentials command at step 4.3 exactly as in Check S1 steps 2–6, with `d` in place of `a`: in a real terminal, never through the wizard's tool, the tokens only at its hidden prompts. When the wizard reaches Step 9, read what it says and don't ask it to rename anything. End the wizard session after its summary.
+   Run the credentials command at step 4.10, after the wizard declared D (4.9), exactly as in Check S1 steps 2–6, with `d` in place of `a`: in a real terminal, never through the wizard's tool, the tokens only at its hidden prompts. When the wizard reaches Step 9, read what it says and don't ask it to rename anything. End the wizard session after its summary.
 
-5. Wait about 10 s after the wizard wrote D's entry, then read the preview and count token-shaped text, without printing any:
+5. Wait about 10 s after the credentials command wrote D's file, then read the preview and count token-shaped text, without printing any:
 
    ```sh
    showpending
@@ -2009,9 +2012,9 @@ Steps:
 Expected:
 
 - Step 1: the environment count prints `0`, and the list has exactly three rows, `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`.
-- Step 4: the wizard's Step 3 reports `server: running`, `record: present` and `pending change: none`. The credentials command prints both `ok` lines and `Wrote <home>/.config/cscb/persona_d-credentials.json with mode 0600. …`, and `ls -lL` shows `-rw-------`; the Check S1 counts are `0`. The wizard declares D in `config.json`. Its Step 9 explains that the server writes `config.json.pending`, a preview of the change, and that the operator confirms by renaming it to `config.json.apply`, after which the server applies it without a restart and logs `reload-applied`. The wizard doesn't rename the file itself.
-- Step 5: after its two header lines and a blank line, the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 1 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_d" (key=persona_d) is added: it will be brought up and launched.` `ls` reports that `config.json.apply` does not exist. The `reload-(preview|invalid)` grep prints the same two lines once each, prefixed `[slack] reload-preview: `, the first ending ` (preview in "<path of config.json>.pending")`. The `(key=persona_d)` grep prints nothing: apart from the preview, no line names D, so D is not brought up before the confirmation. All three counts print `0`. Nothing about the pending change appears in Slack.
-- If the second preview line reads `is added but cannot come up: …` instead, fix the cause it names (the credentials file or the working directory) and wait for the preview to change before confirming. Record that in Notes.
+- Step 4: the wizard's Step 3 reports `server: running`, `record: present` and `pending change: none`. The wizard declares D in `config.json` before it gives the credentials command, and says the preview reads `cannot come up: credentials file does not exist` until the file is written. The credentials command prints `Credentials file of persona "persona_d" (key=persona_d): <home>/.config/cscb/persona_d-credentials.json`, both `ok` lines and `Wrote <home>/.config/cscb/persona_d-credentials.json with mode 0600. …`, and `ls -lL` shows `-rw-------`; the Check S1 counts are `0`. Its Step 9 explains that the server writes `config.json.pending`, a preview of the change, and that the operator confirms by renaming it to `config.json.apply`, after which the server applies it without a restart and logs `reload-applied`. The wizard doesn't rename the file itself.
+- Step 5: after its two header lines and a blank line, the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 1 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_d" (key=persona_d) is added: it will be brought up and launched.` `ls` reports that `config.json.apply` does not exist. The `reload-(preview|invalid)` grep prints two previews, each line prefixed `[slack] reload-preview: ` and each first line ending ` (preview in "<path of config.json>.pending")`: first, logged once the wizard declared D, the same header and `persona "persona_d" (key=persona_d) is added but cannot come up: credentials file does not exist.`; then, logged once the credentials file was written, the same two lines as the pending file. The `(key=persona_d)` grep prints nothing: apart from the preview, no line names D, so D is not brought up before the confirmation. All three counts print `0`. Nothing about the pending change appears in Slack.
+- If the pending file's second line still reads `is added but cannot come up: …` instead, fix the cause it names (the credentials file or the working directory) and wait for the preview to change before confirming. Record that in Notes.
 - Step 7 prints exactly one `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: 1 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed); the last-applied record "<path of config.json>.last-applied" now holds it` line, and for D exactly one each of:
   - `[slack] persona-start: personas[3] "persona_d" (key=persona_d): bring-up starting`
   - `[slack] persona "persona_d" (key=persona_d): up at apply — launching`

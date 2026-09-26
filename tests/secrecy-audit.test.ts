@@ -614,6 +614,12 @@ const RAW_ERROR_ALLOWED: { file: string; anchor: string; reason: string }[] = [
   },
   {
     file: 'src/cli.ts',
+    anchor: 'credentials: cannot read the personas in',
+    reason:
+      "the config loader's error (loadPersonaConfig on config.json), which never echoes a credential value (the config leg); the CLI process reads no credentials file and no token",
+  },
+  {
+    file: 'src/cli.ts',
     anchor: 'clean_restart: agent-director initialization failed:',
     reason:
       "the startup gate's failure (StartupGateFailedError: CSCB's message naming versions, paths and the fix) in a short-lived CLI process that reads no credentials",

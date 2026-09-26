@@ -16,8 +16,10 @@
  * (b.av2 SR-8.4) is asserted as the tick writes and logs it: the pending
  * file's body, its logged emission (the same lines, each classed
  * `reload-preview`, once per pending-state change), the INVALID form
- * (`reload-invalid`), an added persona that cannot come up and a fact the
- * tick could not gather. The plan and renderer on their own are
+ * (`reload-invalid`), an added persona that cannot come up, a changed
+ * claude_config_dir (own or the top-level default) that cannot be resolved,
+ * warned about and still applied once confirmed, and a fact the tick could
+ * not gather. The plan and renderer on their own are
  * `reload-preview.test.ts`'s. Confirmation and apply (SR-8.5, SR-8.6): the
  * rename that applies (AC 73), invalid (AC 63), stale (AC 69), malformed,
  * unreadable and undeletable confirmations, step 1's record write and its
@@ -2223,6 +2225,79 @@ describe('the pending-change preview in the pending file and the server log', ()
     expect(h.pendingLines()).toEqual([previewHeader({ added: 1 }), addedLine('delta')])
     expect(run.previewEmissionCount()).toBe(1)
     assertNoLeak(run.captured())
+    expectNoPostNoLeak(run)
+  })
+
+  // Bug b.g57, E14 merge-prep: a confirmed claude_config_dir change to a
+  // directory that cannot be resolved holds the persona at its next launch
+  // (its Slack connection closed, its launch waiting), so the preview warns on
+  // the change's own line, with the added persona's check and wording. It is
+  // a warning, not a refusal: the confirmation still applies the change.
+  const NEXT_LAUNCH_FRESH = 'takes effect at its next launch, which starts fresh (the conversation is not resumed), instance kept until then'
+  test.each<{ label: string; configDir: () => string; warned: boolean }>([
+    { label: 'a symlink pointing to nothing', configDir: () => danglingLink('dangling-config'), warned: true },
+    { label: 'a directory under a symlink pointing to nothing', configDir: () => join(danglingLink('dangling-parent'), 'claude'), warned: true },
+    { label: 'a directory not created yet under an existing ancestor (the control)', configDir: () => join(h.root, 'not-created-yet', 'claude'), warned: false },
+  ])("bug b.g57: a persona's own claude_config_dir changed to $label is previewed with the warning exactly when it cannot be resolved, and the confirmation applies it", async ({ configDir, warned }) => {
+    const { run, personas } = await running(['alpha'])
+    const [alpha] = personas
+    const dir = configDir()
+    const cp = run.checkpoint()
+
+    h.writeConfig(configOf({ ...alpha!, claude_config_dir: dir }))
+    await run.ticks.ticks(3)
+
+    const warning = warned ? `; but at that launch it cannot come up: ${DANGLING_CONFIG_DIR}` : ''
+    expect(h.pendingLines()).toEqual([
+      previewHeader({ inPlace: 1 }),
+      `${personaRef('alpha')}: claude_config_dir changed: ${NEXT_LAUNCH_FRESH}${warning}.`,
+    ])
+    expect(run.since(cp)).toEqual(pendingWritten())
+    // The preview never creates the directory it checks.
+    expect(existsSync(dir)).toBe(false)
+
+    h.confirm()
+    await run.ticks.tick()
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ inPlace: 1 })])
+    expect(h.pendingExists()).toBe(false)
+    expectNoPostNoLeak(run)
+  })
+
+  test('bug b.g57: a changed top-level claude_config_dir that cannot be resolved warns on its settings line, naming every persona that inherits it', async () => {
+    const { run, personas } = await running(['alpha', 'bravo'])
+    const dir = danglingLink('dangling-default')
+    const cp = run.checkpoint()
+
+    h.writeConfig({ ...configOf(...personas), claude_config_dir: dir })
+    await run.ticks.ticks(3)
+
+    const inheritors = `${JSON.stringify('alpha')} (key=${h.key('alpha')}), ${JSON.stringify('bravo')} (key=${h.key('bravo')})`
+    expect(h.pendingLines()).toEqual([
+      previewHeader({ settings: 1 }),
+      `server-wide setting claude_config_dir changed: inherited by ${inheritors}; ` +
+        "takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then; " +
+        `but at that launch ${inheritors} cannot come up: ${DANGLING_CONFIG_DIR}.`,
+    ])
+    expect(run.since(cp)).toEqual(pendingWritten())
+    assertNoLeak(run.captured())
+    expectNoPostNoLeak(run)
+  })
+
+  test("bug b.g57: once the changed claude_config_dir's link target exists, the preview drops the warning", async () => {
+    const { run, personas } = await running(['alpha'])
+    const [alpha] = personas
+    const target = join(h.root, 'config-target')
+    const link = join(h.root, 'config-link')
+    symlinkSync(target, link)
+
+    h.writeConfig(configOf({ ...alpha!, claude_config_dir: link }))
+    await run.ticks.ticks(3)
+    expect(h.pendingLines()![1]).toBe(`${personaRef('alpha')}: claude_config_dir changed: ${NEXT_LAUNCH_FRESH}; but at that launch it cannot come up: ${DANGLING_CONFIG_DIR}.`)
+
+    mkdirSync(target)
+    await run.ticks.ticks(3)
+    expect(h.pendingLines()).toEqual([previewHeader({ inPlace: 1 }), `${personaRef('alpha')}: claude_config_dir changed: ${NEXT_LAUNCH_FRESH}.`])
+    expect(run.previewEmissionCount()).toBe(1)
     expectNoPostNoLeak(run)
   })
 

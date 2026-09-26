@@ -50,7 +50,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    with `dm.contact`) has a *Message lost* notice whose `Recovery:` wording
    says whether a server restart is needed, and `server.log` has a
    `No live session` or `DROP: no _GET_stream` line (see
-   [Other lines you may see](#other-lines-you-may-see)).
+   [Other lines you may see](#other-lines-you-may-see)). Two personas posting
+   *Message lost* notices about each other: see
+   [Two personas post lost-message notices about each other](#two-personas-post-lost-message-notices-about-each-other).
    A quick delivery check when `ack_reaction` is set: the persona adds that
    reaction under its own name once a message reaches its instance, and
    removes it with its first reply to that message. A Slack message with neither the persona's
@@ -331,7 +333,9 @@ running are not affected. See
   call, only `invalid_auth`, `token_revoked`, `account_inactive` and
   `not_authed`.
 - **Fix:** Get a working token from the persona's Slack app and have the
-  operator write it into the credentials file: for `bot_token`, the app's Bot
+  operator write it into the credentials file, in their own terminal, with
+  `claude-slack-channel-bots credentials <persona>` (it asks for both tokens
+  without echo and validates them with Slack first): for `bot_token`, the app's Bot
   User OAuth Token (re-install the app to the workspace if it was uninstalled
   or its token revoked); for `app_token`, an app-level token with the
   `connections:write` scope, with Socket Mode turned on. Then confirm the
@@ -360,6 +364,15 @@ running are not affected. See
   `no bot user ID or bot ID returned`, `unrecognised failure`, or
   `Slack error <code>` for a transient code (`internal_error`, `fatal_error`,
   `service_unavailable`, `request_timeout`, `ratelimited`).
+- **Error message:** when the failure carried one, the line that starts the
+  episode ends with it after the cause, as `message="…"`, for example
+  `network or request error message="A request error occurred: connect ECONNREFUSED …"`.
+  It is redacted as on every other line that carries an error's message:
+  URL-like text reads `<redacted-url>` and token-like text `<redacted-token>`,
+  on one line, cut at 300 characters. The two 10 s timeouts, a socket closed
+  before hello and a missing bot ID carry none, nor does the cleared line.
+  Read it for the reason behind `network or request error` or
+  `unrecognised failure` (DNS, a refused connection, a proxy).
 - **Logged:** once when it starts, and once when it clears with the cause
   `cleared: Slack answered after being unreachable checking <key> via <check>`.
   Nothing per attempt. A hold for the persona's config directory ends it
@@ -490,7 +503,9 @@ running are not affected. See
   and again at each launch (a restart, a retry, or the next launch after a
   confirmed `claude_config_dir` change). For a persona a pending change
   adds, the preview already lists the same cause under `is added but cannot
-  come up` (see [Pending changes](#pending-changes)).
+  come up`, and for a pending change of a persona's `claude_config_dir` (its
+  own or the top-level one it inherits) it warns `but at that launch it
+  cannot come up` (see [Pending changes](#pending-changes)).
 - **What the server does:**
   - The persona is not up and has no Slack connection: found before it
     connects, it never connects; found at a later launch, its Slack
@@ -876,6 +891,24 @@ from `session_restart_delay` and stop after 5 consecutive failures (a
 `SpawnCapReached` notice), and a *Working directory unreachable* notice is
 posted to the persona's `permission_prompts` channel. Restore the directory; if
 restarts were capped, restart the server.
+
+### Two personas post lost-message notices about each other
+
+A lost-message notice is a Slack post like any other, so a persona with
+`delivery: all` in another persona's destination channel receives that
+persona's notices. When two personas each receive every message in the other's
+destination channel and neither persona's instance can take messages, each
+loses the other's notices and posts a *Message lost* notice about each one.
+They keep posting notices about each other until either instance takes
+messages again.
+
+**Fix:** recover either persona's instance, as its notice's `Recovery:` state
+says (see the `No live session` row under
+[Other lines you may see](#other-lines-you-may-see)); the notices stop then. To
+keep it from happening, have the operator give each persona a destination that
+no other persona receives every message in, such as its own channel or `"dm"`,
+and not give a persona `delivery: all` in another persona's `permission_prompts`
+channel.
 
 ### Checking a credentials file's shape
 
@@ -1683,6 +1716,7 @@ settings.
 | `persona "<name>" (key=<key>): <settings> changed: applied in place immediately, instance kept.` | `<settings>` lists one or more of `channels` (a channel added or removed), `delivery` (a kept channel's mode), `permission_prompts`, `dm.enabled`, `dm.contact`. Reordering channels isn't a change. |
 | `…: stop_hook_bootstrap changed: takes effect at its next launch, instance kept.` | The persona's own `stop_hook_bootstrap` changed. The running instance doesn't see it until it is launched again. |
 | `…: claude_config_dir changed: takes effect at its next launch, which starts fresh (the conversation is not resumed), instance kept until then.` | The persona's own `claude_config_dir` changed (by real path). The running instance is kept; its next launch uses the new directory and starts a new conversation. With both settings changed, the line reads `claude_config_dir, stop_hook_bootstrap changed:` with this effect. |
+| `…: claude_config_dir changed: …, instance kept until then; but at that launch it cannot come up: claude_config_dir cannot be resolved to a real path (<errno>).` | A warning: the new directory can't be resolved now, with the same check and wording as an added persona's (`(<errno>: a symlink on its path points to nothing)` for a dangling symlink). It is not a refusal: confirming applies the change, and at the persona's next launch it is held as [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable) (its Slack connection closed, its launch waiting) until the directory resolves. The same warning ends a changed top-level `claude_config_dir` line, naming the inheriting personas it stops (`; but at that launch "<name>" (key=<key>), … cannot come up: …`), and a `DESTRUCTIVE:` line whose persona's `claude_config_dir` changed too (`; but it cannot come up: …`; that persona is held when it is brought up at the confirmation). Fix the directory, or the setting, before confirming. If the check itself failed, the line ends `; whether it can come up at that launch could not be checked` (see the `cannot check` line below). |
 | `…: credentials file "<path>" changed: a new connection opens, then the old one closes, instance kept.` | The credentials file's content changed at the same path, and the persona is up. The line names the persona and the path, never a token. |
 | `…: credentials file "<path>" changed: it has no connection yet, so it retries with the new content, instance kept.` | The same, for a persona still retrying its bring-up (Slack unreachable, its working directory unusable, or held for its `claude_config_dir`, see [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)). |
 | `…: credentials file "<path>" changed: it is broken by its credentials now, so it will be brought up.` | The same, for a persona that is broken by its credentials: its credentials file is missing, unreadable or invalid, or Slack refused its tokens ([`persona-credentials-refused`](#persona-credentials-refused)). |
@@ -1723,14 +1757,15 @@ A configuration change is pending; nothing has been applied. no effective change
 **Logged once.** The same preview goes to `server.log` under
 [`reload-preview`](#reload-preview) (or `reload-invalid`), once each time the
 change differs from the one last logged, not at every check. The file can be
-rewritten without a new log line: if an added persona's directory is created
-later, its line in the file changes, but the log keeps the old one. The file
-is the current preview.
+rewritten without a new log line: if an added persona's directory, or a
+changed `claude_config_dir`, is created later, its line in the file changes,
+but the log keeps the old one. The file is the current preview.
 
 If the check can't gather a fact the preview needs, it logs one line, and the
 preview says that fact `could not be checked` instead of guessing:
 `[slack] reload: cannot check <what>: <error>; the preview says it could not be checked`.
-`<what>` is `whether the added persona "<name>" (key=<key>) can come up` or
+`<what>` is `whether the added persona "<name>" (key=<key>) can come up`,
+`the claude_config_dir of persona "<name>" (key=<key>)` (a changed one) or
 `the bring-up state of persona "<name>" (key=<key>)`. The line is logged once, and again
 only after a check that gathered every fact. It is an internal error: report
 it as a bug.
