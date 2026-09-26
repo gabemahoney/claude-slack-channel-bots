@@ -242,6 +242,31 @@ export function personaLabels(key: string, configDir?: string, home: string = ho
   ]
 }
 
+/**
+ * Claude Code's prompt suggestions, switched off in every persona session
+ * (b.svb, b.f2b). The one place the variable and its value are written.
+ *
+ * Why: at the end of each turn Claude Code starts a background fork that
+ * writes a suggested next prompt. The fork inherits the session, runs the
+ * parent's PreToolUse hooks and is then denied, so agent-director records a
+ * PreToolUse from an idle persona and flips its row from `waiting` to
+ * `working` (b.svb). The stale-`working` recovery (b.f2b) still handles such
+ * rows; this removes their most likely source, so it is needed less often.
+ * An operator attached to the persona's tmux session sees no suggested
+ * prompt.
+ *
+ * Claude Code (2.1.280) reads the variable before its server-side flag and
+ * the `promptSuggestionEnabled` setting: `false` (like `0`, `no`, `off`)
+ * turns suggestions off and the end-of-turn fork is never started.
+ *
+ * A frozen literal: no config field or caller input feeds it, and
+ * `personaSpawnEnv` spreads it last, so no other entry can replace its value.
+ * It holds no secret, so it is safe wherever the spawn environment shows.
+ */
+export const PROMPT_SUGGESTION_OFF_ENV: Readonly<{ CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false' }> = Object.freeze({
+  CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
+})
+
 /** Inputs to `personaSpawnEnv`. */
 export interface PersonaSpawnEnvInput {
   /** Persona key (not the name). */
@@ -258,9 +283,15 @@ export interface PersonaSpawnEnvInput {
 
 /**
  * Spawn-environment values for a persona (b.av2 SR-2.2): `CSCB_PERSONA` and
- * `CLAUDE_MANAGED_CHANNEL` set to the key, `CSCB_CRONTABLE_PATH` always, and
- * `CLAUDE_CONFIG_DIR` only when a directory is configured. No variable name
- * uses agent-director's reserved `AGENT_DIRECTOR_` prefix.
+ * `CLAUDE_MANAGED_CHANNEL` set to the key, `CSCB_CRONTABLE_PATH` always,
+ * `CLAUDE_CONFIG_DIR` only when a directory is configured, and
+ * `PROMPT_SUGGESTION_OFF_ENV` always, last. No variable name uses
+ * agent-director's reserved `AGENT_DIRECTOR_` prefix.
+ *
+ * Every launch of a persona's Claude takes its environment from here: each
+ * spawn passes it as `extra_env`, and agent-director's resume, which takes
+ * only the instance ID, restores the environment stored with the row at its
+ * spawn.
  */
 export function personaSpawnEnv(input: PersonaSpawnEnvInput): Record<string, string> {
   return {
@@ -268,5 +299,6 @@ export function personaSpawnEnv(input: PersonaSpawnEnvInput): Record<string, str
     CSCB_PERSONA: input.key,
     CLAUDE_MANAGED_CHANNEL: input.key,
     CSCB_CRONTABLE_PATH: input.crontablePath,
+    ...PROMPT_SUGGESTION_OFF_ENV,
   }
 }

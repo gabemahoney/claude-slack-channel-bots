@@ -59,6 +59,10 @@
  *     for a persona with a `mentions` channel or DMs on.
  *   - SR-8.6 invariant: every successful spawn call site passes
  *     relay_mode='on'.
+ *   - b.svb / b.f2b: every spawn on every launch path carries
+ *     `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` in `extra_env`, and a
+ *     resume passes only the instance ID (agent-director restores the env
+ *     stored at the row's spawn, modelled in one case).
  *   - Persona notices (b.av2 SR-7.2): spawn failure (generic, dialog-approval
  *     timeout, self-heal failure, restart cap), lost and inconclusive history,
  *     held-until-validated notices (channel and `dm` destinations) and the
@@ -686,8 +690,9 @@ function preSetAllFlags(key: string): void {
 // `service=cscb`, `persona=<key>`, `config_dir=<12 hex of the REAL effective
 // claude_config_dir>` and nothing else (no `channel` label since E3 Task 6),
 // and the env `CSCB_PERSONA` / `CLAUDE_MANAGED_CHANNEL` (the key),
-// `CSCB_CRONTABLE_PATH`, and `CLAUDE_CONFIG_DIR` only when a directory is
-// configured.
+// `CSCB_CRONTABLE_PATH`, `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` (b.svb;
+// every launch path is covered in its own block below), and
+// `CLAUDE_CONFIG_DIR` only when a directory is configured.
 //
 // extra_env always carries CSCB_CRONTABLE_PATH — the resolved, absolute
 // cron_table_path from the config — for every persona, whether or not a
@@ -745,6 +750,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
       CSCB_PERSONA: key,
       CLAUDE_MANAGED_CHANNEL: key,
       CSCB_CRONTABLE_PATH: join(fixtureDir, 'crontab'),
+      CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
     })
     expect(params.claude_args).toBeUndefined()
   })
@@ -759,7 +765,12 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
     await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     const env = spawnCalls[0].extra_env!
-    expect(env).toEqual({ CSCB_PERSONA: 'C', CLAUDE_MANAGED_CHANNEL: 'C', CSCB_CRONTABLE_PATH: cfg.cron_table_path })
+    expect(env).toEqual({
+      CSCB_PERSONA: 'C',
+      CLAUDE_MANAGED_CHANNEL: 'C',
+      CSCB_CRONTABLE_PATH: cfg.cron_table_path,
+      CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
+    })
     expect('CLAUDE_CONFIG_DIR' in env).toBe(false)
     expect(spawnCalls[0].label).toEqual([
       'service=cscb',
@@ -829,6 +840,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
       CSCB_PERSONA: 'C',
       CLAUDE_MANAGED_CHANNEL: 'C',
       CSCB_CRONTABLE_PATH: '/srv/resolved/absolute/crontable.md',
+      CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
     })
   })
 
@@ -847,6 +859,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
       CSCB_PERSONA: 'C',
       CLAUDE_MANAGED_CHANNEL: 'C',
       CSCB_CRONTABLE_PATH: '/srv/resolved/absolute/crontable.md',
+      CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
     })
   })
 })
@@ -987,6 +1000,7 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
       CSCB_PERSONA: 'C0AMDDZEHCY',
       CLAUDE_MANAGED_CHANNEL: 'C0AMDDZEHCY',
       CSCB_CRONTABLE_PATH: cfg.cron_table_path,
+      CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
     })
   })
 
@@ -2383,6 +2397,174 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
       `[slack] spawnForPersona: ${fragment} for ${renderPersonaRef(GUARD_NAME, GUARD_KEY)}${separator}Error code=EIO message=${JSON.stringify(redactedLeakyMessage(`${step} failed`))}`,
     ])
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.svb / b.f2b — Claude Code's prompt suggestions are off in every persona
+// session. Its end-of-turn suggestion fork runs the session's PreToolUse
+// hooks and flips an idle persona's row to `working`, so every spawn a ladder
+// makes carries CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false in `extra_env`.
+// agent-director's resume takes only the instance ID and restores the env it
+// stored with the row at spawn, so a resume passes nothing else.
+// ---------------------------------------------------------------------------
+
+describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
+  type SpawnResult = import('agent-director').SpawnResult
+  const collision = () => cannedErr<SpawnResult>(errInstanceIdCollision())
+  const spawnOk = () => cannedOk<SpawnResult>({ claude_instance_id: 'cscb_C' })
+
+  /** The env var and value every persona launch must run with, written out here, not taken from src. */
+  const VAR = 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION'
+  const OFF = 'false'
+
+  /** One launch path: how to reach it, its result, and how many spawn and resume calls it makes. */
+  interface EnvPath {
+    config?: Partial<Omit<PersonaConfig, 'personas'>>
+    install: (cfg: PersonaConfig, calls: LadderCalls) => StubClient
+    launch?: (cfg: PersonaConfig) => Promise<unknown>
+    expected: unknown
+    spawns: number
+    resumes: number
+  }
+
+  const spawned = { key: 'C', action: 'spawned' } as const
+  const resumed = { key: 'C', action: 'resumed' } as const
+
+  /** A stub whose first spawn collides with an ended row and whose resume rejects with `resumeError`. */
+  function installResumeRejects(cfg: PersonaConfig, calls: LadderCalls, resumeError: Error): StubClient {
+    _setTmuxSessionKiller(async () => {})
+    return installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: personaRow(cfg, 'C', { state: 'ended' }), resumeError })
+  }
+
+  /**
+   * Every way a launch reaches agent-director: the fresh spawn; a resume
+   * (ended, missing, dead waiting and working rows, the restart relaunch);
+   * each replacement spawn (resume_enabled false, cwd and config_dir
+   * mismatches, the retry after ErrSpawnNotFound on the get); the b.vub
+   * self-heal respawn (after the first spawn and after a resume); and each
+   * fresh spawn after a rejected resume, the fresh-after-amnesia one included.
+   */
+  const ENV_PATHS: Array<[string, EnvPath]> = [
+    ['fresh spawn', { install: (_cfg, calls) => installStub({ ...calls }), expected: spawned, spawns: 1, resumes: 0 }],
+    ['resume of an ended row', { install: (cfg, calls) => installResumeEntry('ended', personaRow(cfg, 'C'), calls), expected: resumed, spawns: 1, resumes: 1 }],
+    ['resume of a missing row', { install: (cfg, calls) => installResumeEntry('missing', personaRow(cfg, 'C'), calls), expected: resumed, spawns: 1, resumes: 1 }],
+    ['dead-session recovery from a waiting row', {
+      install: (cfg, calls) => installResumeEntry('waiting (dead session)', personaRow(cfg, 'C'), calls),
+      expected: resumed, spawns: 1, resumes: 1,
+    }],
+    ['dead-session recovery from a working row', {
+      install: (cfg, calls) => installResumeEntry('working (dead session)', personaRow(cfg, 'C'), calls),
+      expected: resumed, spawns: 1, resumes: 1,
+    }],
+    ['restart relaunch (launchSession), resume of an ended row', {
+      install: (cfg, calls) => installResumeEntry('ended', personaRow(cfg, 'C'), calls),
+      launch: (cfg) => launchSession('C', cfg),
+      expected: true, spawns: 1, resumes: 1,
+    }],
+    ['resume_enabled false: kill + delete + fresh spawn', {
+      config: { resume_enabled: false },
+      install: (cfg, calls) => installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: personaRow(cfg, 'C', { state: 'ended' }) }),
+      expected: spawned, spawns: 2, resumes: 0,
+    }],
+    ['live row in another directory (cwd mismatch): kill + delete + fresh spawn', {
+      install: (cfg, calls) =>
+        installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: personaRow(cfg, 'C', { state: 'waiting', cwd: fixtureSubdir('elsewhere') }) }),
+      expected: spawned, spawns: 2, resumes: 0,
+    }],
+    ['ended row with a changed config_dir label: delete + fresh spawn', {
+      install: (cfg, calls) => {
+        const labels = { ...personaRow(cfg, 'C').labels, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome()) }
+        return installResumeEntry('ended', personaRow(cfg, 'C', { labels }), calls)
+      },
+      expected: spawned, spawns: 2, resumes: 0,
+    }],
+    ['ErrSpawnNotFound on the post-collision get: the single retry spawn', {
+      install: (_cfg, calls) => installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getError: errSpawnNotFound() }),
+      expected: spawned, spawns: 2, resumes: 0,
+    }],
+    ['self-heal respawn after ErrTmuxSessionCreate on the first spawn', {
+      install: (_cfg, calls) => {
+        _setTmuxSessionKiller(async () => {})
+        return installStub({ ...calls, spawnQueue: [cannedErr<SpawnResult>(errTmuxSessionCreate('spawn')), spawnOk()] })
+      },
+      expected: spawned, spawns: 2, resumes: 0,
+    }],
+    ['self-heal respawn after ErrTmuxSessionCreate on resume', {
+      install: (cfg, calls) => installResumeRejects(cfg, calls, errTmuxSessionCreate('resume')),
+      expected: spawned, spawns: 2, resumes: 1,
+    }],
+    ['resume ErrJsonlMissing: delete + fresh spawn (fresh after amnesia)', {
+      install: (cfg, calls) => installResumeRejects(cfg, calls, errJsonlMissing()),
+      expected: { key: 'C', action: 'fresh-after-inconclusive-amnesia' }, spawns: 2, resumes: 1,
+    }],
+    ['resume ErrNoSessionId: delete + fresh spawn', {
+      install: (cfg, calls) => installResumeRejects(cfg, calls, errNoSessionId()),
+      expected: spawned, spawns: 2, resumes: 1,
+    }],
+    ['resume ErrSpawnNotResumable: kill + delete + fresh spawn', {
+      install: (cfg, calls) => installResumeRejects(cfg, calls, errSpawnNotResumable()),
+      expected: spawned, spawns: 2, resumes: 1,
+    }],
+    ['resume ErrSpawnNotFound: fresh spawn', {
+      install: (cfg, calls) => installResumeRejects(cfg, calls, errSpawnNotFound()),
+      expected: spawned, spawns: 2, resumes: 1,
+    }],
+  ]
+
+  test.each(ENV_PATHS)('%s: every spawn carries it in extra_env; a resume passes only the instance ID', async (_name, path) => {
+    captureStartupErrors()
+    const { cfg } = labelConfig(path.config)
+    const calls = newLadderCalls()
+    path.install(cfg, calls)
+
+    let result: unknown
+    await withCapturedErr(async () => {
+      result = await (path.launch ?? ((c: PersonaConfig) => spawnForPersona(personaOf(c, 'C'), c)))(cfg)
+    })
+
+    expect(result).toEqual(path.expected)
+    expect(calls.spawnCalls).toHaveLength(path.spawns)
+    expect(calls.resumeCalls).toHaveLength(path.resumes)
+    for (const params of calls.spawnCalls) expect(params.extra_env?.[VAR]).toBe(OFF)
+    for (const params of calls.resumeCalls) expect(params).toEqual({ claude_instance_id: 'cscb_C' })
+  })
+
+  test('a row this version spawned resumes with it: agent-director restores the env stored at the spawn', async () => {
+    captureStartupErrors()
+    const { cfg } = labelConfig()
+    // agent-director's side, modelled: a successful spawn stores its extra_env
+    // with the row; a resume launches with the env stored for its instance ID.
+    const stored = new Map<string, Record<string, string> | undefined>()
+    const launches: Array<{ call: 'spawn' | 'resume'; env: Record<string, string> | undefined }> = []
+    const modelStoredEnv = (stub: StubClient): void => {
+      const spawn = stub.spawn.bind(stub)
+      const resume = stub.resume.bind(stub)
+      stub.spawn = async (params) => {
+        launches.push({ call: 'spawn', env: params.extra_env })
+        const r = await spawn(params)
+        stored.set(String(params.claude_instance_id), params.extra_env)
+        return r
+      }
+      stub.resume = async (params) => {
+        launches.push({ call: 'resume', env: stored.get(params.claude_instance_id) })
+        return resume(params)
+      }
+    }
+
+    // First launch: a fresh spawn creates the row.
+    modelStoredEnv(installStub({ ...newLadderCalls() }))
+    await withCapturedErr(async () => {
+      expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual(spawned)
+    })
+    // The row ends; the next launch meets it and resumes it.
+    modelStoredEnv(installResumeEntry('ended', personaRow(cfg, 'C'), newLadderCalls()))
+    await withCapturedErr(async () => {
+      expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual(resumed)
+    })
+
+    expect(launches.map((l) => l.call)).toEqual(['spawn', 'spawn', 'resume'])
+    for (const launch of launches) expect(launch.env?.[VAR]).toBe(OFF)
   })
 })
 

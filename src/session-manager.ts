@@ -2555,6 +2555,13 @@ function spawnHomeDir(): string {
  * tilde-expanded, absolute cron_table_path from the config) so bots can
  * locate the self-documenting crontable from the env var alone — no config
  * file lookup needed (D-Q2, b.grx decision 3).
+ *
+ * extra_env also always carries `PROMPT_SUGGESTION_OFF_ENV`
+ * (`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, b.svb/b.f2b; see
+ * persona-identity.ts for why). Every spawn in the ladder (the fresh spawn,
+ * the replacement and amnesia spawns, the b.vub self-heal respawn) sends
+ * these params, and a resume restores the env agent-director stored with the
+ * row at its spawn, so every launch of the persona's Claude runs with it.
  */
 function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabel: string): SpawnParams {
   const { key } = persona

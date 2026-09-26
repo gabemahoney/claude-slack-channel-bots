@@ -208,9 +208,11 @@ export function buildTemplateParams(
     claude_args,
     overwrite: true,
     // `extra_env` is omitted: no installation-wide env-var source in today's
-    // config schema. Per-persona CLAUDE_CONFIG_DIR and CSCB_CRONTABLE_PATH are
+    // config schema. Per-persona CLAUDE_CONFIG_DIR and CSCB_CRONTABLE_PATH,
+    // and CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false for every persona, are
     // supplied at spawn time via SpawnParams.extra_env (SR-1.1; see
-    // buildSpawnParams in session-manager.ts, landed in Epic 2).
+    // buildSpawnParams in session-manager.ts, landed in Epic 2). agent-director
+    // stores that env with the row at spawn, and a resume restores it.
   }
 }
 

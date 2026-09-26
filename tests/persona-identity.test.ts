@@ -2,7 +2,8 @@
  * persona-identity.test.ts — persona key rule and derived identifiers.
  *
  * Covers b.av2 SR-2.1 (key rule and fit constraints), SR-2.2 (instance ID,
- * tmux name, labels, spawn env), the effective config-dir set (SR-6.2, SR-8.6
+ * tmux name, labels, spawn env, with Claude Code's prompt suggestions off in
+ * every persona env, b.svb), the effective config-dir set (SR-6.2, SR-8.6
  * step 5), SR-9.1/SR-9.3 (persona target resolution),
  * SR-10.3 (persona-reference rendering) and SR-13.1 (no import side effects),
  * plus the test helper's token matcher (`TOKEN_LIKE` / `isTokenLike`), which
@@ -26,6 +27,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import {
   PERSONA_KEY_MAX_LENGTH,
+  PROMPT_SUGGESTION_OFF_ENV,
   configDirLabelValue,
   effectiveClaudeConfigDirs,
   personaInstanceId,
@@ -256,13 +258,45 @@ describe('personaSpawnEnv', () => {
       CLAUDE_MANAGED_CHANNEL: 'ops_bot',
       CSCB_CRONTABLE_PATH: join(home, 'crontab'),
       CLAUDE_CONFIG_DIR: join(home, 'alt'),
+      CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
     })
   })
 
   test.each([undefined, ''])('omits CLAUDE_CONFIG_DIR entirely when unconfigured (%p)', (claudeConfigDir) => {
     const home = makeTempDir()
     const env = personaSpawnEnv({ key: 'ops_bot', crontablePath: join(home, 'crontab'), claudeConfigDir })
-    expect(Object.keys(env).sort()).toEqual(['CLAUDE_MANAGED_CHANNEL', 'CSCB_CRONTABLE_PATH', 'CSCB_PERSONA'])
+    expect(Object.keys(env).sort()).toEqual([
+      'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION',
+      'CLAUDE_MANAGED_CHANNEL',
+      'CSCB_CRONTABLE_PATH',
+      'CSCB_PERSONA',
+    ])
+  })
+
+  // b.svb / b.f2b: Claude Code's end-of-turn prompt-suggestion fork runs the
+  // session's PreToolUse hooks and flips an idle persona to `working`.
+  describe('prompt suggestions off (PROMPT_SUGGESTION_OFF_ENV)', () => {
+    test('the constant is exactly CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false, and frozen', () => {
+      expect(PROMPT_SUGGESTION_OFF_ENV).toEqual({ CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false' })
+      expect(Object.isFrozen(PROMPT_SUGGESTION_OFF_ENV)).toBe(true)
+      // Module code is strict, so a write to the frozen object throws rather than landing.
+      expect(() => {
+        ;(PROMPT_SUGGESTION_OFF_ENV as Record<string, string>)['CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION'] = 'true'
+      }).toThrow(TypeError)
+      expect(PROMPT_SUGGESTION_OFF_ENV.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION).toBe('false')
+    })
+
+    test.each([
+      ['a config dir and a crontable path', { claudeConfigDir: '/srv/claude-alt', crontablePath: '/srv/crontab' }],
+      ['no config dir', { claudeConfigDir: undefined, crontablePath: '/srv/crontab' }],
+      ['inputs named like the variable', { claudeConfigDir: 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION', crontablePath: 'true' }],
+    ])('every persona env carries it as the literal "false", whatever the inputs (%s)', (_name, input) => {
+      const env = personaSpawnEnv({ key: 'ops_bot', ...input })
+      expect(env['CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION']).toBe('false')
+      // It is spread last: the final key of the env object.
+      expect(Object.keys(env).at(-1)).toBe('CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION')
+      expect(Object.keys(env).filter((k) => k.startsWith('AGENT_DIRECTOR_'))).toEqual([])
+    })
   })
 })
 

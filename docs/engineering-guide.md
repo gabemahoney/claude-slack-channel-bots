@@ -444,6 +444,13 @@ The server still calls tmux itself in four places, until the b.fmk version moves
 - **Reconcile after a kill.** agent-director 0.10.0's `kill` leaves the row's state as it was, so a killed row still reads live until a findMissing sweep runs; a check keyed on that state acts on it again. After the start sweep's pre-persona kills, one findMissing sweep runs (`reconcileKilledPrePersonaRows`, through the shared memoized core `sharedFindMissingSweep`), so a killed row whose session is gone reads `missing` and the next start doesn't kill it again. Don't describe such a kill as happening once: a row whose session survives it is killed again at every start. Add the same sweep after any new kill whose row a later check reads.
 - **Don't add a delete.** The sweep still kills and deletes a row naming an absent persona (agent-director 0.10.0 has no reuse, and a persona added again must start fresh), a wrong instance ID and a wrong `cwd`, even after a failed kill, until the b.fmk version removes those deletes. Don't add another delete to the sweep, and don't delete after a failed kill on any new path.
 
+## Persona Session Environment
+
+A persona's Claude gets its environment only from `personaSpawnEnv` (`src/persona-identity.ts`). `buildSpawnParams` passes it as `extra_env` on every spawn; agent-director's resume takes only the instance ID and restores the env stored with the row at its spawn.
+
+- **Keep prompt suggestions off.** Every persona env ends with `PROMPT_SUGGESTION_OFF_ENV` (`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`). Why: Claude Code's end-of-turn suggestion fork runs the session's PreToolUse hooks and is denied, and agent-director flips the idle persona to `working` (b.svb). The stale-`working` recovery (b.f2b) stays; this only makes it rarer. Don't make it configurable or let another entry replace it.
+- **Add a variable only there.** Give it a fixed name outside agent-director's reserved `AGENT_DIRECTOR_` prefix, and never put a secret in it: the spawn env is on agent-director's command line and stored in its database.
+
 ## Async Patterns
 
 - Use `async/await` throughout — no raw Promises except where explicitly holding connections open (e.g., SSE keep-alive streams)
