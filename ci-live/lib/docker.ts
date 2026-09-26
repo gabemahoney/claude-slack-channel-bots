@@ -3,9 +3,14 @@
  *
  * Pure builders plus one guard, `assertSafeRunArgs`, which every `docker run`
  * passes before it is spawned. It accepts only the flags `buildRunArgs` uses
- * (`-d`, `--init`, `--name`, `--hostname`, `--label`, `--mount`, `--env`/`-e`)
- * in any spelling (`--flag value`, `--flag=value`, `-eVALUE`), then the image
- * and nothing after it, and on top of that:
+ * (`-d`, `--init`, `--name`, `--hostname`, `--label`, `--memory`,
+ * `--memory-swap`, `--pids-limit`, `--mount`, `--env`/`-e`) in any spelling
+ * (`--flag value`, `--flag=value`, `-eVALUE`), then the image and nothing
+ * after it, and on top of that:
+ * - the resource caps are required: `--memory`, `--memory-swap` and
+ *   `--pids-limit`, each once, each a positive bounded value (never `-1` or
+ *   `0`, which mean no limit), and `--memory-swap` equal to `--memory` (no
+ *   swap on top of the cap);
  * - no `--network`/`--net` at all (the default docker network only), never a
  *   published port (the server's 3100 is the container's own), never
  *   `--privileged`, a host namespace (`--pid`, `--ipc`, `--uts`, `--userns`,
@@ -40,6 +45,28 @@ export const CONTAINER_OWNER_LABEL_KEY = 'cscb-live-owner'
 export const CONTAINER_PREFIX = 'cscb-live-'
 export const CONTAINER_USER = 'testuser'
 export const CONTAINER_HOME = '/home/testuser'
+
+/**
+ * The test container's hard memory cap (docker's size syntax). Why 8 GiB: it
+ * runs four persona Claude Code sessions, each a node process plus its MCP
+ * servers and tool children (about 0.5 to 1 GiB each, so 2 to 4 GiB), plus
+ * the bun server, agent-director, tmux and the checks' `docker exec` shells
+ * (a few hundred MiB). 8 GiB is about twice that peak, yet an eighth of the
+ * 64 GiB pod the host's production bots share: an uncapped run once froze the
+ * whole VM. `--memory-swap` gets the same value, so the container has no swap
+ * on top of the cap: past it the kernel OOM-kills inside the container
+ * instead of the host thrashing.
+ */
+export const CONTAINER_MEMORY = '8g'
+
+/**
+ * The test container's process cap. Why 2048: each Claude session runs some
+ * tens of processes (node, MCP servers, shells, git), the server,
+ * agent-director and tmux a few dozen more, so a healthy run stays in the low
+ * hundreds; 2048 leaves ample headroom and still stops a fork or spawn loop
+ * long before it reaches the host.
+ */
+export const CONTAINER_PIDS_LIMIT = 2048
 
 /** Where the container sees its inputs. */
 export const CONTAINER_TARBALL = '/tmp/package.tgz'
@@ -125,6 +152,41 @@ export function parseContainerOwnership(result: { code: number; stdout: string; 
   const l = labels as Record<string, unknown>
   const ours = l[CONTAINER_LABEL_KEY] === '1' && l[CONTAINER_OWNER_LABEL_KEY] === String(ownerPid)
   return ours ? { kind: 'ours', id } : { kind: 'foreign' }
+}
+
+/** How a run's end (`ContainerRun.stopAndRemove`) left its container. */
+export type ContainerEnd =
+  /** No `docker run` was made. */
+  | 'none-started'
+  /** None of this run's is left: removed now, or already gone (or never created). */
+  | 'removed'
+  /** Its removal failed, or its owner could not be proven (see run.log). */
+  | 'not-removed'
+  /** `--keep-container`: left running. */
+  | 'kept-running'
+  /** `--keep-container` on a memory watchdog stop: stopped with `docker stop` (its memory freed), kept for inspection. */
+  | 'kept-stopped'
+  /** `--keep-container` on a memory watchdog stop, but it could not be stopped (see run.log): it may still be running. */
+  | 'stop-failed'
+
+/** The test container's part of a stopped run's note: what its cleanup actually did (`null`: the cleanup did not get that far). */
+export function describeContainerEnd(end: ContainerEnd | null, name: string): string {
+  switch (end) {
+    case null:
+      return `the test container ${name} may still exist (the cleanup did not finish)`
+    case 'none-started':
+      return 'no test container had been started'
+    case 'removed':
+      return 'the test container was removed (or was already gone)'
+    case 'not-removed':
+      return `the test container ${name} could not be removed (see run.log): remove it with docker rm -f ${name}`
+    case 'kept-running':
+      return `the test container ${name} was kept running (--keep-container)`
+    case 'kept-stopped':
+      return `the test container ${name} was stopped with docker stop (its memory freed) and kept for inspection (--keep-container)`
+    case 'stop-failed':
+      return `the test container ${name} was kept (--keep-container) but could not be stopped (see run.log): it may still be running; stop it with docker stop ${name}`
+  }
 }
 
 export interface ClaudeEnv {
@@ -215,6 +277,8 @@ export function buildRunArgs(spec: RunSpec): string[] {
   // --init: docker's init reaps the processes the checks kill (tmux sessions, bot Claudes).
   const args = ['run', '-d', '--init', '--name', spec.name, '--hostname', spec.name, '--label', CONTAINER_LABEL]
   for (const [key, value] of Object.entries(spec.labels ?? {})) args.push('--label', `${key}=${value}`)
+  // The caps every run has (the guard requires them): --memory-swap equal to --memory, so no swap on top.
+  args.push('--memory', CONTAINER_MEMORY, '--memory-swap', CONTAINER_MEMORY, '--pids-limit', String(CONTAINER_PIDS_LIMIT))
   for (const m of spec.mounts) {
     args.push('--mount', `type=bind,source=${m.source},target=${m.target}${m.readOnly ? ',readonly' : ''}`)
   }
@@ -242,7 +306,47 @@ export function realPathOrLexical(path: string): string {
 
 /** The `docker run` flags `buildRunArgs` uses; the guard refuses every other flag. */
 const RUN_BOOLEAN_FLAGS = new Set(['-d', '--detach', '--init'])
-const RUN_VALUE_FLAGS = new Set(['--name', '--hostname', '--label', '--mount', '--env', '-e'])
+const RUN_VALUE_FLAGS = new Set(['--name', '--hostname', '--label', '--memory', '--memory-swap', '--pids-limit', '--mount', '--env', '-e'])
+
+/** The resource caps every `docker run` must set, each once. */
+const RUN_LIMIT_FLAGS = ['--memory', '--memory-swap', '--pids-limit'] as const
+type RunLimitFlag = (typeof RUN_LIMIT_FLAGS)[number]
+
+const MEMORY_UNITS: Record<string, number> = { '': 1, b: 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }
+
+/**
+ * A docker memory size (`8g`, `8192m`, `8589934592`) in bytes, or `null` when
+ * it is not a positive bounded size: `-1` and `0` mean no limit, and anything
+ * else docker could read another way is refused too.
+ */
+export function parseMemorySize(value: string): number | null {
+  const m = /^([1-9][0-9]{0,12})([bkmg]?)$/i.exec(value)
+  if (!m) return null
+  const bytes = Number(m[1]) * (MEMORY_UNITS[(m[2] as string).toLowerCase()] as number)
+  return Number.isSafeInteger(bytes) ? bytes : null
+}
+
+/** A cap's value as a number (bytes, or processes); throws when it is not a positive bounded value. */
+function parseRunLimit(flag: RunLimitFlag, value: string): number {
+  if (flag === '--pids-limit') {
+    if (!/^[1-9][0-9]{0,6}$/.test(value)) throw new Error('docker run --pids-limit needs a positive number of processes (not -1 or 0, which mean no limit)')
+    return Number(value)
+  }
+  const bytes = parseMemorySize(value)
+  if (bytes === null) throw new Error(`docker run ${flag} needs a positive size such as 8g (not -1 or 0, which mean no limit)`)
+  return bytes
+}
+
+/** Every cap set, and the swap cap equal to the memory cap. */
+function checkRunLimits(limits: ReadonlyMap<RunLimitFlag, number>): void {
+  const missing = RUN_LIMIT_FLAGS.filter((flag) => !limits.has(flag))
+  if (missing.length > 0) {
+    throw new Error(`docker run must cap the container with --memory, --memory-swap and --pids-limit (missing: ${missing.join(', ')})`)
+  }
+  if (limits.get('--memory-swap') !== limits.get('--memory')) {
+    throw new Error('docker run --memory-swap must equal --memory (no swap on top of the memory cap)')
+  }
+}
 
 /** Flags refused with their own reason (the rest fall to "not one the runner uses"). */
 const REFUSED_FLAGS: ReadonlyArray<readonly [RegExp, string]> = [
@@ -344,6 +448,7 @@ export function assertSafeRunArgs(args: readonly string[], home: string, realPat
   if (args[0] !== 'run') throw new Error('not a docker run argv')
   const claude = join(home, '.claude')
   const hostClaude = [...new Set([resolve(claude), realPath(claude)])]
+  const limits = new Map<RunLimitFlag, number>()
   let i = 1
   for (; i < args.length; i++) {
     const arg = args[i] as string
@@ -366,9 +471,57 @@ export function assertSafeRunArgs(args: readonly string[], home: string, realPat
     if (value === undefined) throw new Error(`docker run ${flag} needs a value`)
     if (flag === '--mount') checkRunMount(value, hostClaude, realPath)
     if (flag === '--env' || flag === '-e') checkRunEnv(value)
+    const limit = RUN_LIMIT_FLAGS.find((f) => f === flag)
+    if (limit) {
+      // docker lets the last of two win, so a second one could lift the cap.
+      if (limits.has(limit)) throw new Error(`docker run sets ${limit} more than once`)
+      limits.set(limit, parseRunLimit(limit, value))
+    }
   }
   if (i >= args.length) throw new Error('docker run names no image')
   if (i !== args.length - 1) throw new Error('docker run must not pass a command after the image')
+  checkRunLimits(limits)
+}
+
+/** The `docker stats --no-stream --format` the memory watchdog reads: memory use / limit, then the PID count. */
+export const CONTAINER_STATS_FORMAT = '{{.MemUsage}} {{.PIDs}}'
+
+export interface ContainerStats {
+  /** docker's own rendering, such as `1.2GiB / 8GiB`. */
+  memUsage: string
+  memBytes: number
+  limitBytes: number
+  pids: number
+}
+
+/** docker prints memory in binary units (`MiB`), and in decimal ones on some versions (`MB`). */
+const STATS_UNITS: Record<string, number> = {
+  B: 1,
+  KiB: 1024,
+  MiB: 1024 ** 2,
+  GiB: 1024 ** 3,
+  TiB: 1024 ** 4,
+  kB: 1e3,
+  KB: 1e3,
+  MB: 1e6,
+  GB: 1e9,
+  TB: 1e12,
+}
+
+function statsBytes(amount: string, unit: string): number | null {
+  const factor = STATS_UNITS[unit]
+  const n = Number(amount)
+  return factor === undefined || !Number.isFinite(n) ? null : Math.round(n * factor)
+}
+
+/** One line of `docker stats` in `CONTAINER_STATS_FORMAT`, or `null` when it does not parse. */
+export function parseContainerStats(stdout: string): ContainerStats | null {
+  const m = /^([0-9.]+)\s*([A-Za-z]+)\s*\/\s*([0-9.]+)\s*([A-Za-z]+)\s+([0-9]{1,9})$/.exec(stdout.trim())
+  if (!m) return null
+  const memBytes = statsBytes(m[1] as string, m[2] as string)
+  const limitBytes = statsBytes(m[3] as string, m[4] as string)
+  if (memBytes === null || limitBytes === null) return null
+  return { memUsage: `${m[1]}${m[2]} / ${m[3]}${m[4]}`, memBytes, limitBytes, pids: Number(m[5]) }
 }
 
 export function buildExecArgs(

@@ -284,6 +284,31 @@ describe('writeResults', () => {
     assertNoLeak(written)
   })
 
+  test("the memory watchdog's peaks, when the run had one, go into results.json and a section of results.md, redacted", () => {
+    const withMemory = summary({
+      memory: {
+        intervalMs: 30_000,
+        samples: 2,
+        failedSamples: 1,
+        thresholds: { hostWorkingSetBytes: 40, chromePssBytes: 4 },
+        hostMaxBytes: null,
+        peaks: { runnerRss: { value: 1, at: '2026-09-26T12:00:00.000Z' } },
+        abort: null,
+        lines: ['2 samples every 30 s, 1 with a failed reading', `runner RSS peak 1 B (note ${PASSWORD})`],
+      },
+    })
+    const written: Record<string, string> = {}
+    writeResults(withMemory, { write: (name, content) => (written[name] = content) }, redactorWith(PASSWORD))
+    expect(JSON.parse(written['results.json']!).memory.samples).toBe(2)
+    expect(written['results.md']).toEndWith(
+      `## Memory (the watchdog's peaks)\n\n- 2 samples every 30 s, 1 with a failed reading\n- runner RSS peak 1 B (note ${REDACTED_SECRET})\n`,
+    )
+    const without: Record<string, string> = {}
+    writeResults(summary({}), { write: (name, content) => (without[name] = content) }, redactorWith(PASSWORD))
+    expect([without['results.md']!.includes('## Memory'), 'memory' in JSON.parse(without['results.json']!)]).toEqual([false, false])
+    assertNoLeak(written)
+  })
+
   test('redactDeep masks every string at any depth and keeps other values', () => {
     const r = redactorWith(PASSWORD)
     const out = redactDeep({ a: [`x ${PASSWORD}`, 3, null, true], b: { c: fakeToken(BOT_TOKEN_PREFIX) } }, r)

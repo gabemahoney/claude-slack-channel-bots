@@ -4,6 +4,8 @@
  *   bun ci-live/run.ts [--dry-run] [--provision-only] [--stage apps|install|tokens|channels]
  *                      [--only <check ids>] [--keep-container] [--clean] [--create-apps]
  *   bun ci-live/run.ts login [--second]
+ *   bun ci-live/run.ts config-token --rotate
+ *   bun ci-live/run.ts apps --list|--delete-strays
  *   bun ci-live/run.ts mailbox --latest|--forwarding [--show-body]
  *
  * Pure: parses an argv array into options or a usage error. A usage error
@@ -16,7 +18,7 @@ export const STAGES = ['apps', 'install', 'tokens', 'channels'] as const
 export type Stage = (typeof STAGES)[number]
 
 export interface RunOptions {
-  command: 'run' | 'login' | 'mailbox'
+  command: 'run' | 'login' | 'mailbox' | 'config-token' | 'apps'
   dryRun: boolean
   provisionOnly: boolean
   /** Run only this provisioning stage (implies `provisionOnly`). */
@@ -41,12 +43,22 @@ export interface RunOptions {
   mailboxView?: 'latest' | 'forwarding'
   /** `mailbox … --show-body`: print the message's body too. Set only when given. */
   showBody?: boolean
+  /** `config-token --rotate`: rotate the configuration token pair once. Set only for `config-token`. */
+  rotate?: boolean
+  /**
+   * `apps`: list the apps the test human sees at api.slack.com/apps
+   * (`--list`), or also delete the stray test apps (`--delete-strays`). Set
+   * only for `apps`.
+   */
+  appsAction?: 'list' | 'delete-strays'
 }
 
 export const USAGE =
   'usage: bun ci-live/run.ts [--dry-run] [--provision-only] [--stage apps|install|tokens|channels] ' +
   '[--only <check ids, comma-separated>] [--keep-container] [--clean] [--create-apps]\n' +
   '       bun ci-live/run.ts login [--second]\n' +
+  '       bun ci-live/run.ts config-token --rotate\n' +
+  '       bun ci-live/run.ts apps --list|--delete-strays\n' +
   '       bun ci-live/run.ts mailbox --latest|--forwarding [--show-body]'
 
 /** An argument a usage error may repeat: a plain `--flag-name`, nothing that could be a value. */
@@ -82,6 +94,25 @@ export function parseArgs(argv: readonly string[]): RunOptions {
     const rest = argv.slice(1)
     if (rest.length === 1 && rest[0] === '--second') options.second = true
     else if (rest.length > 0) throw new UsageError('login takes no arguments other than --second')
+    return options
+  }
+  if (argv[0] === 'config-token') {
+    options.command = 'config-token'
+    const rest = argv.slice(1)
+    if (rest.length !== 1 || rest[0] !== '--rotate') {
+      throw new UsageError('config-token takes --rotate (rotate the configuration token pair once) and nothing else')
+    }
+    options.rotate = true
+    return options
+  }
+  if (argv[0] === 'apps') {
+    options.command = 'apps'
+    const rest = argv.slice(1)
+    const [action] = rest
+    if (rest.length !== 1 || (action !== '--list' && action !== '--delete-strays')) {
+      throw new UsageError('apps takes --list (the apps in the test workspace) or --delete-strays (also delete the stray test apps), and nothing else')
+    }
+    options.appsAction = action === '--list' ? 'list' : 'delete-strays'
     return options
   }
   if (argv[0] === 'mailbox') {

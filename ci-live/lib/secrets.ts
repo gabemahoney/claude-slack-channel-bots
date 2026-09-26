@@ -3,9 +3,14 @@
  *
  * Rules (b.1cx design, "Secrets & state"):
  * - A secret file, and the directory holding it, must not be group- or
- *   other-accessible; otherwise the run refuses (exit 2) and names the path.
+ *   other-accessible; otherwise the run refuses (exit 2), names the path and
+ *   the `chmod` that fixes it, and says a VM reboot can loosen these modes
+ *   (the pod re-applies its group at boot). The runner never changes a mode
+ *   itself. Before a real run, every loose path is reported at once.
  * - Secrets are written only to mode-600 files in mode-700 directories, via a
- *   temp file in the same directory whose mode is set before the rename.
+ *   temp file in the same directory whose mode is set before the rename; the
+ *   real file system fsyncs the file before the rename and the directory
+ *   after it, so a rewrite (a rotated token pair above all) survives a crash.
  * - Every value read or written is registered with the redactor first.
  * - A dry run reads none of the real files: its store points at a temporary
  *   directory, ignores the environment overrides, and refuses (throws) any
@@ -17,13 +22,16 @@
 
 import {
   chmodSync,
+  closeSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
   statSync,
   unlinkSync,
-  writeFileSync,
+  writeSync,
 } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
@@ -63,6 +71,18 @@ export class SignInCodeNeededError extends NotRunnableError {
   }
 }
 
+/**
+ * A secret file the operator writes is missing or empty (not runnable). The
+ * configuration token's absence is not always fatal: the apps stage goes on
+ * without it when apps.json records every app (provision/apps.ts).
+ */
+export class MissingSecretError extends NotRunnableError {
+  constructor(message: string) {
+    super(message)
+    this.name = 'MissingSecretError'
+  }
+}
+
 /** A dry run tried to touch the real secrets directory. Always a bug in the runner. */
 export class DryRunSecretAccessError extends Error {
   constructor(path: string) {
@@ -95,6 +115,19 @@ export interface SecureFs {
   readdir(path: string): string[]
 }
 
+/** fsync a directory, so a rename in it survives a crash (best effort: some file systems refuse it). */
+function syncDir(dir: string): void {
+  let fd: number | null = null
+  try {
+    fd = openSync(dir, 'r')
+    fsyncSync(fd)
+  } catch {
+    /* ignore: the rename itself has happened */
+  } finally {
+    if (fd !== null) closeSync(fd)
+  }
+}
+
 export const nodeSecureFs: SecureFs = {
   stat(path) {
     try {
@@ -106,9 +139,20 @@ export const nodeSecureFs: SecureFs = {
     }
   },
   readFile: (path) => readFileSync(path, 'utf-8'),
-  writeFile: (path, data, mode) => writeFileSync(path, data, { mode, flag: 'wx' }),
+  writeFile: (path, data, mode) => {
+    const fd = openSync(path, 'wx', mode)
+    try {
+      writeSync(fd, data)
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+  },
   chmod: (path, mode) => chmodSync(path, mode),
-  rename: (from, to) => renameSync(from, to),
+  rename: (from, to) => {
+    renameSync(from, to)
+    syncDir(dirname(to))
+  },
   mkdir: (path, mode) => mkdirSync(path, { mode, recursive: true }),
   unlink: (path) => unlinkSync(path),
   readdir: (path) => readdirSync(path),
@@ -121,12 +165,36 @@ export const nodeSecureFs: SecureFs = {
 /** Group and other permission bits. */
 const GROUP_OTHER_BITS = 0o077
 
-/** A reason `path` is not private, or `null` when it is. */
-export function privacyProblem(st: FileStat, kind: 'file' | 'dir'): string | null {
+/** Why secret modes can be loose on a path the runner wrote private, told with every mode refusal. */
+export const LOOSE_MODES_NOTE =
+  'a VM reboot can loosen these modes, as the pod re-applies its group to the files at boot; the runner never changes them itself'
+
+/** A path as a shell argument: as it is when plain, else single-quoted. */
+function shellArg(path: string): string {
+  return /^[A-Za-z0-9_./~+@%=:,-]+$/.test(path) ? path : `'${path.replace(/'/g, `'\\''`)}'`
+}
+
+/** The mode a secret path should have, as `chmod` takes it. */
+function privateMode(kind: 'file' | 'dir'): string {
+  return kind === 'file' ? '600' : '700'
+}
+
+/** The group and other bits' mode text (with any setgid bit, as a reboot leaves it: `2770`), or `null` when private. */
+function looseMode(st: FileStat): string | null {
+  return (st.mode & GROUP_OTHER_BITS) !== 0 ? (st.mode & 0o7777).toString(8).padStart(3, '0') : null
+}
+
+/**
+ * A reason `path` is not private, or `null` when it is. A loose mode names
+ * the fix (`chmod 600 <file>` / `chmod 700 <dir>`, with `path` when given)
+ * and that a VM reboot can loosen modes.
+ */
+export function privacyProblem(st: FileStat, kind: 'file' | 'dir', path?: string): string | null {
   if (kind === 'file' && !st.isFile) return 'is not a regular file'
   if (kind === 'dir' && !st.isDirectory) return 'is not a directory'
-  if ((st.mode & GROUP_OTHER_BITS) !== 0) {
-    return `is group- or other-accessible (mode ${(st.mode & 0o777).toString(8).padStart(3, '0')}); chmod ${kind === 'file' ? '600' : '700'} it`
+  const mode = looseMode(st)
+  if (mode !== null) {
+    return `is group- or other-accessible (mode ${mode}): run chmod ${privateMode(kind)} ${path === undefined ? 'on it' : shellArg(path)} (${LOOSE_MODES_NOTE})`
   }
   return null
 }
@@ -134,7 +202,7 @@ export function privacyProblem(st: FileStat, kind: 'file' | 'dir'): string | nul
 export function assertPrivate(fs: SecureFs, path: string, kind: 'file' | 'dir'): void {
   const st = fs.stat(path)
   if (!st) throw new NotRunnableError(`${path} does not exist`)
-  const problem = privacyProblem(st, kind)
+  const problem = privacyProblem(st, kind, path)
   if (problem) throw new NotRunnableError(`${path} ${problem}`)
 }
 
@@ -146,8 +214,37 @@ export function ensurePrivateDir(fs: SecureFs, dir: string): void {
     fs.chmod(dir, 0o700)
     return
   }
-  const problem = privacyProblem(st, 'dir')
+  const problem = privacyProblem(st, 'dir', dir)
   if (problem) throw new NotRunnableError(`${dir} ${problem}`)
+}
+
+interface LayoutProblem {
+  path: string
+  kind: 'file' | 'dir'
+  st: FileStat
+}
+
+/**
+ * One message for every path of the layout that is not private: the loose
+ * ones with their modes and the `chmod` commands that fix them all, and any
+ * path of the wrong type.
+ */
+export function layoutProblemsMessage(problems: readonly LayoutProblem[]): string {
+  const [only] = problems
+  if (problems.length === 1 && only) return `${only.path} ${privacyProblem(only.st, only.kind, only.path)}`
+  const loose = problems.filter((p) => looseMode(p.st) !== null && (p.kind === 'file' ? p.st.isFile : p.st.isDirectory))
+  const wrongType = problems.filter((p) => !loose.includes(p))
+  const parts: string[] = []
+  if (loose.length > 0) {
+    const listed = loose.map((p) => `${p.path} (mode ${looseMode(p.st)})`).join(', ')
+    const fixes = (['dir', 'file'] as const).flatMap((kind) => {
+      const paths = loose.filter((p) => p.kind === kind).map((p) => shellArg(p.path))
+      return paths.length > 0 ? [`chmod ${privateMode(kind)} ${paths.join(' ')}`] : []
+    })
+    parts.push(`${loose.length} secret paths are group- or other-accessible: ${listed}. Run ${fixes.join(' && ')} (${LOOSE_MODES_NOTE})`)
+  }
+  for (const p of wrongType) parts.push(`${p.path} ${privacyProblem(p.st, p.kind, p.path)}`)
+  return parts.join('; ')
 }
 
 let tempCounter = 0
@@ -280,9 +377,9 @@ export class SecretStore {
 
   private readSecret(path: string, what: string): string {
     this.touch(path)
-    if (!this.o.fs.stat(path)) throw new NotRunnableError(`${what} is missing: write it to ${path} (mode 600)`)
+    if (!this.o.fs.stat(path)) throw new MissingSecretError(`${what} is missing: write it to ${path} (mode 600)`)
     const value = readPrivateFile(this.o.fs, path).trim()
-    if (value === '') throw new NotRunnableError(`${what} in ${path} is empty`)
+    if (value === '') throw new MissingSecretError(`${what} in ${path} is empty`)
     this.o.redactor.addSecret(value)
     return value
   }
@@ -302,7 +399,11 @@ export class SecretStore {
     return { token, refreshToken }
   }
 
-  /** Rewrite both configuration token files after a rotation (each mode 600, atomically). */
+  /**
+   * Rewrite both configuration token files after a rotation (each mode 600,
+   * atomically, fsynced), the refresh token first: it is the one a lost write
+   * could not replace, since the old one is spent.
+   */
   writeConfigTokens(tokens: { token: string; refreshToken: string }): void {
     this.o.redactor.addSecret(tokens.token)
     this.o.redactor.addSecret(tokens.refreshToken)
@@ -464,27 +565,36 @@ export class SecretStore {
   }
 
   /**
-   * Dry run only: seed the temporary config dir with the stub's secrets, a
-   * live.json and (when given) a mailbox.json pointing at the stub's mailbox.
+   * Dry run only: seed the temporary config dir with the stub's secrets (the
+   * configuration token, its refresh token when given), a live.json and
+   * (when given) a mailbox.json pointing at the stub's mailbox.
    */
-  seedDryRun(seed: { configToken: string; password: string; workspaceDomain: string; testEmail: string; mailbox?: MailboxConfig }): void {
+  seedDryRun(seed: { configToken: string; refreshToken?: string; password: string; workspaceDomain: string; testEmail: string; mailbox?: MailboxConfig }): void {
     if (!this.o.dryRun) throw new Error('seedDryRun is for a dry run only')
     this.ensureConfigDir()
     this.writeSecret(this.paths.configTokenFile, `${seed.configToken}\n`)
+    if (seed.refreshToken) this.writeSecret(this.paths.refreshTokenFile, `${seed.refreshToken}\n`)
     this.writeSecret(this.paths.passwordFile, `${seed.password}\n`)
     this.writeSecret(this.paths.liveJson, `${JSON.stringify({ workspace_domain: seed.workspaceDomain, test_email: seed.testEmail })}\n`)
     if (seed.mailbox) this.writeMailbox(seed.mailbox)
   }
 
-  /** The secrets-bearing directories that must stay private (checked before a real run). */
+  /**
+   * The secrets-bearing directories and files that must stay private,
+   * checked before a real run: every one that is not is reported in one
+   * not-runnable message, with the `chmod` commands that fix them all.
+   */
   assertLayoutPrivate(): void {
-    for (const dir of [this.paths.configDir, this.paths.credentialsDir, this.paths.stagedCredentialsDir]) {
-      this.touch(dir)
-      const st = this.o.fs.stat(dir)
-      if (!st) continue
-      const problem = privacyProblem(st, 'dir')
-      if (problem) throw new NotRunnableError(`${dir} ${problem}`)
+    const problems: LayoutProblem[] = []
+    const check = (path: string, kind: 'file' | 'dir'): FileStat | null => {
+      this.touch(path)
+      const st = this.o.fs.stat(path)
+      if (st && privacyProblem(st, kind) !== null) problems.push({ path, kind, st })
+      return st
     }
+    const credentialDirs = [this.paths.credentialsDir, this.paths.stagedCredentialsDir]
+    check(this.paths.configDir, 'dir')
+    const present = credentialDirs.filter((dir) => check(dir, 'dir')?.isDirectory === true)
     for (const file of [
       this.paths.configTokenFile,
       this.paths.refreshTokenFile,
@@ -494,12 +604,18 @@ export class SecretStore {
       this.paths.liveJson,
       this.paths.mailboxJson,
     ]) {
-      this.touch(file)
-      const st = this.o.fs.stat(file)
-      if (!st) continue
-      const problem = privacyProblem(st, 'file')
-      if (problem) throw new NotRunnableError(`${file} ${problem}`)
+      check(file, 'file')
     }
+    // The personas' credentials files (read later, one at a time).
+    for (const dir of present) {
+      for (const name of this.o.fs.readdir(dir).sort()) {
+        const path = join(dir, name)
+        this.touch(path)
+        const st = this.o.fs.stat(path)
+        if (st?.isFile && looseMode(st) !== null) problems.push({ path, kind: 'file', st })
+      }
+    }
+    if (problems.length > 0) throw new NotRunnableError(layoutProblemsMessage(problems))
   }
 }
 

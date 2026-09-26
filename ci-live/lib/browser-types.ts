@@ -34,6 +34,8 @@ export interface SlackUrls {
   basicInfoPage(appId: string): string
   /** The web client at a conversation. */
   conversation(teamId: string, conversationId: string): string
+  /** The list of the signed-in user's apps (`https://api.slack.com/apps`). */
+  appsList(): string
 }
 
 export type SignInOutcome = 'signed-in' | 'needs-code'
@@ -73,6 +75,34 @@ export interface BrowserDriver {
   /** Save storageState (mode 600) through the secret store. */
   saveState(): Promise<void>
   close(): Promise<void>
+}
+
+/** One row of the apps list page (api.slack.com/apps), as scraped. */
+export interface ListedApp {
+  /** The app ID from the row's link (`A…`). */
+  id: string
+  /** The link's text: the app's name (control characters dropped, capped). */
+  name: string
+  /**
+   * The row's cells (its workspace column among them), each cleaned and
+   * capped, joined by a tab (`ROW_CELL_SEPARATOR`), or `null` when the link
+   * is in no row.
+   */
+  rowText: string | null
+}
+
+/** A browser that can read the apps list page (the `apps` command and the apps stage's unfinished-create check). */
+export interface AppListingBrowser {
+  /** Every app the signed-in user sees at api.slack.com/apps. Throws a `FlowError` when the page shows no list. */
+  listApps(): Promise<ListedApp[]>
+}
+
+/** The one browser's open contexts and pages (the memory watchdog reads them). */
+export interface BrowserStats {
+  contexts: number
+  pages: number
+  /** Pages on about:blank (idle between flows). */
+  idlePages: number
 }
 
 export type { SlackParams, SlackResponse }

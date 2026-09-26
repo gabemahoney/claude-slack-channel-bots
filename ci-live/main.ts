@@ -21,14 +21,27 @@
  * mailbox (rewriting mailbox.json when mail.tm wants a fresh token) and print
  * one message's sender, subject and any confirmation code it holds: the
  * newest message, or the newest Gmail forwarding confirmation with its
- * confirm link.
+ * confirm link. `config-token --rotate` and `apps --list|--delete-strays`
+ * (maintenance.ts) take the real lock but make no results dir either.
+ *
+ * A run (and `--provision-only`) runs the memory watchdog
+ * (lib/memory-watchdog.ts) from its start to its end: a `watchdog:` line in
+ * run.log every 30 s, the peaks at the end (run.log, results.json,
+ * results.md).
  *
  * SIGINT, SIGTERM and SIGHUP (a killed tmux session) all stop the run the
  * same way: no new container is started, the test container is removed
  * (unless --keep-container), D's credentials go back to the staging dir, the
  * browser closes, the results so far are written with a FAIL row
- * "runner: interrupted by <signal>", the lock is released, and the process
- * exits 1. A second signal while that runs is ignored.
+ * "runner: interrupted by <signal>" and a run note saying what the cleanup
+ * actually did, the lock is released, and the process exits 1. A second
+ * signal while that runs is ignored. The memory watchdog stops a run the same
+ * way when the host's working set or Chrome's PSS crosses its limit, with the
+ * FAIL row "memory watchdog: <what crossed, the value and the limit>", but
+ * it closes Chrome at once, alongside the container's removal (never after
+ * it, and without waiting for a driver or a sign-in), and with
+ * --keep-container it stops the container (`docker stop`: its memory freed,
+ * kept for inspection) instead of leaving it running.
  */
 
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
@@ -41,9 +54,9 @@ import { fail, pass, runChecks, verdictOf, type Need, type RecordedResult } from
 import { FINAL_CHECKS, PLAN_CHECKS } from './checks/list.ts'
 import { personaEntry } from './lib/apps-state.ts'
 import { parseArgs, UsageError, USAGE, type RunOptions } from './lib/args.ts'
-import type { BrowserDriver } from './lib/browser-types.ts'
-import { claudeEnvProblem } from './lib/docker.ts'
-import { describeError } from './lib/errors.ts'
+import type { BrowserDriver, BrowserStats } from './lib/browser-types.ts'
+import { claudeEnvProblem, describeContainerEnd, type ContainerEnd, type ContainerStats } from './lib/docker.ts'
+import { describeError, EXIT_FAIL, EXIT_NOT_RUNNABLE, EXIT_PASS } from './lib/errors.ts'
 import { describeSnapshot, procListener, snapshotHost, type HostSnapshot } from './lib/host-state.ts'
 import { HumanSession } from './lib/human-session.ts'
 import { createProcessRunLog, type RunLog } from './lib/log.ts'
@@ -57,25 +70,25 @@ import {
   MailTmClient,
   selectForwardingMessage,
 } from './lib/mailbox.ts'
+import { MemoryWatchdog, readHostCgroup } from './lib/memory-watchdog.ts'
 import { dryRunLockFile, hostCredentialsFile, livePathsIn, mountedCredentialsFile, realRunLockFile, resolveConfigDir } from './lib/paths.ts'
 import { APP_TOKEN_NAME } from './lib/personas.ts'
 import { bunSpawn, minimalChildEnv } from './lib/proc.ts'
+import { chromeTreePss } from './lib/proc-tree.ts'
 import { Redactor } from './lib/redact.ts'
 import { writeResults, type RunSummary } from './lib/results.ts'
-import { isLiveRunnerPid, lockHolder, RunLock } from './lib/run-lock.ts'
+import { isLiveRunnerPid, lockHolder, nodeLockDeps, RunLock } from './lib/run-lock.ts'
 import { describeScan, scanOutputs, scanText } from './lib/secrecy-scan.ts'
 import { isInside, nodeSecureFs, NotRunnableError, SecretStore, SignInCodeNeededError } from './lib/secrets.ts'
 import { realClock } from './lib/wait.ts'
+import { REAL_LOCK_WHAT, runMaintenance } from './maintenance.ts'
+import { appsStateForStrayDeletion, classifyListedApps, deleteStrayApps, testWorkspaceName } from './provision/app-listing.ts'
 import { allValid, runProvisioning, type ProvisionReport } from './provision/index.ts'
 import { ContainerRun, type Packed } from './runtime/container-run.ts'
 import { openWorkspace, type Workspace } from './runtime/workspace.ts'
 
 /** The repository root (ci-live's parent). */
 export const REPO_ROOT = resolve(dirname(import.meta.path), '..')
-
-export const EXIT_PASS = 0
-export const EXIT_FAIL = 1
-export const EXIT_NOT_RUNNABLE = 2
 
 /** How long a signal's cleanup may take (a `docker run` in flight, then `docker rm -f`) before the process exits anyway. */
 const SIGNAL_CLEANUP_MS = 200_000
@@ -112,20 +125,75 @@ function hasVerdict(env: RunEnv): boolean {
 // Signals and the run lock
 // ---------------------------------------------------------------------------
 
-/** What the running command has started, for a signal to stop. */
+/** Why a run is stopped from outside its own flow: a signal, or the memory watchdog. */
+interface StopCause {
+  /** What the log lines name: the signal, or `memory watchdog`. */
+  label: string
+  /** The FAIL row the results get (the verdict is `FAIL: <rowId>: <reason>`). */
+  rowId: string
+  rowTitle: string
+  reason: string
+  /** What stopped the run: the run note's start (what the cleanup actually did follows it). */
+  noteHead: string
+  /**
+   * The memory watchdog's stop: Chrome is closed at once, alongside the
+   * container's removal, and a kept container (--keep-container) is stopped
+   * with `docker stop` rather than left running.
+   */
+  memory: boolean
+}
+
+function signalStop(signal: string): StopCause {
+  return {
+    label: signal,
+    rowId: 'runner',
+    rowTitle: 'The run was interrupted',
+    reason: `interrupted by ${signal}`,
+    noteHead: `interrupted by ${signal}`,
+    memory: false,
+  }
+}
+
+/** The watchdog's stop: its verdict is `FAIL: memory watchdog: <what crossed, the value and the limit>`. */
+function watchdogStop(reason: string): StopCause {
+  return {
+    label: 'memory watchdog',
+    rowId: 'memory watchdog',
+    rowTitle: 'The memory watchdog stopped the run',
+    reason,
+    noteHead: `stopped by the memory watchdog (${reason})`,
+    memory: true,
+  }
+}
+
+/** What a stopped run's cleanup got done: the container's end, and whether the browser closed. */
+interface CleanupEnd {
+  container: ContainerEnd | null
+  browserClosed: boolean
+}
+
+/** A stopped run's note: what stopped it, then what its cleanup actually did. */
+function stopNote(cause: StopCause, ended: CleanupEnd, containerName: string): string {
+  const browser = ended.browserClosed ? (cause.memory ? 'Chrome was closed at once' : 'the browser was closed') : 'the browser may still be open (its close did not finish)'
+  return `${cause.noteHead}; ${describeContainerEnd(ended.container, containerName)}; ${browser}; the results so far written`
+}
+
+/** What the running command has started, for a signal (or the watchdog) to stop. */
 interface Interruptible {
   /** Called first: from here on the command leaves writing the results to `finishInterrupted`. */
-  interrupted?(signal: string): void
-  /** Stop and undo what the command started (container, D's file, browser). */
-  cleanup(): Promise<void>
-  /** Write the results so far, with the interruption as a FAIL row. */
-  finishInterrupted?(signal: string): void
+  interrupted?(cause: StopCause): void
+  /** Stop and undo what the command started (container, D's file, browser), as `cause` asks. */
+  cleanup(cause: StopCause): Promise<void>
+  /** Write the results so far, with the stop as a FAIL row. */
+  finishInterrupted?(cause: StopCause): void
 }
 
 interface SignalControl {
   setActive(active: Interruptible | null): void
   setLock(lock: RunLock | null): void
-  /** When a signal is being handled, never resolves (the handler exits the process); otherwise resolves at once. */
+  /** Stop the run the way a signal does (the memory watchdog's abort). */
+  abort(cause: StopCause): void
+  /** When a stop is being handled, never resolves (the handler exits the process); otherwise resolves at once. */
   waitIfStopping(): Promise<void>
   dispose(): void
 }
@@ -138,37 +206,45 @@ function withDeadline(work: Promise<void>, ms: number): Promise<void> {
   return Promise.race([work, deadline]).finally(() => clearTimeout(timer))
 }
 
+/** What a stop is about to do, for its first log line. */
+function stopActions(cause: StopCause, keep: boolean): string {
+  if (cause.memory) return `closing Chrome at once, ${keep ? 'stopping the kept test container (docker stop)' : 'removing the test container'}`
+  return `${keep ? 'keeping the test container (--keep-container)' : 'removing the test container'}, closing the browser`
+}
+
 function installSignalHandlers(env: RunEnv): SignalControl {
   let active: Interruptible | null = null
   let lock: RunLock | null = null
   let stopping = false
-  const handler = (signal: NodeJS.Signals): void => {
+  /** Stop the run: clean up, write the results so far with the cause's FAIL row, release the lock, exit 1. Once. */
+  const stopRun = (cause: StopCause): void => {
     if (stopping) {
-      env.log.error(`${signal}: already stopping; the cleanup is still running`)
+      env.log.error(`${cause.label}: already stopping; the cleanup is still running`)
       return
     }
     stopping = true
     // The command's own flow may still run on (and clear `active`): act on what was active now.
     const current = active
-    current?.interrupted?.(signal)
+    current?.interrupted?.(cause)
     void (async () => {
-      env.log.error(`${signal}: stopping the run: removing the test container, closing the browser`)
+      env.log.error(`${cause.label}: stopping the run: ${stopActions(cause, env.options.keepContainer)}`)
       try {
-        if (current) await withDeadline(current.cleanup(), SIGNAL_CLEANUP_MS)
+        if (current) await withDeadline(current.cleanup(cause), SIGNAL_CLEANUP_MS)
       } catch (err) {
-        env.log.error(`cleanup after ${signal}: ${describeError(err)}`)
+        env.log.error(`cleanup after ${cause.label}: ${describeError(err)}`)
       }
       try {
-        current?.finishInterrupted?.(signal)
+        current?.finishInterrupted?.(cause)
       } catch (err) {
-        env.log.error(`writing the results after ${signal}: ${describeError(err)}`)
+        env.log.error(`writing the results after ${cause.label}: ${describeError(err)}`)
       }
-      if (!hasVerdict(env)) writeVerdict(env, `FAIL: runner: interrupted by ${signal}`)
+      if (!hasVerdict(env)) writeVerdict(env, `FAIL: ${cause.rowId}: ${cause.reason}`)
       lock?.release()
-      env.log.error(`${signal}: stopped; results in ${env.resultsDir}`)
+      env.log.error(`${cause.label}: stopped; results in ${env.resultsDir}`)
       process.exit(EXIT_FAIL)
     })()
   }
+  const handler = (signal: NodeJS.Signals): void => stopRun(signalStop(signal))
   for (const signal of STOP_SIGNALS) process.on(signal, handler)
   return {
     setActive: (a) => {
@@ -177,6 +253,7 @@ function installSignalHandlers(env: RunEnv): SignalControl {
     setLock: (l) => {
       lock = l
     },
+    abort: stopRun,
     waitIfStopping: () => (stopping ? new Promise<void>(() => {}) : Promise.resolve()),
     dispose: () => {
       for (const signal of STOP_SIGNALS) process.off(signal, handler)
@@ -187,10 +264,51 @@ function installSignalHandlers(env: RunEnv): SignalControl {
 /** The lock of this command's mode: the config dir's for real-mode commands, the temp dir's for a dry run. */
 function acquireRunLock(env: RunEnv): RunLock {
   const uid = process.getuid?.() ?? 0
-  if (env.options.dryRun) return RunLock.acquire(dryRunLockFile(tmpdir(), uid), '/ci-live dry run')
+  const warn = (warning: string): void => env.log.info(warning)
+  if (env.options.dryRun) return RunLock.acquire(dryRunLockFile(tmpdir(), uid), '/ci-live dry run', nodeLockDeps, warn)
   const configDir = resolveConfigDir(process.env, homedir())
   mkdirSync(configDir, { recursive: true, mode: 0o700 })
-  return RunLock.acquire(realRunLockFile(configDir), '/ci-live real-mode command (run, --provision-only or login)')
+  return RunLock.acquire(realRunLockFile(configDir), REAL_LOCK_WHAT, nodeLockDeps, warn)
+}
+
+// ---------------------------------------------------------------------------
+// The memory watchdog
+// ---------------------------------------------------------------------------
+
+/**
+ * Start the run's memory watchdog: the host cgroup, the test container
+ * (when running), Chrome's process tree PSS (the runner's descendants) with
+ * the browser's contexts and pages, and the runner's own RSS. Crossing a limit
+ * stops the run the way a signal does.
+ */
+function startWatchdog(
+  env: RunEnv,
+  signals: SignalControl,
+  sources: { container: () => Promise<ContainerStats | null>; browserStats: () => BrowserStats | null },
+): MemoryWatchdog {
+  const watchdog = new MemoryWatchdog({
+    sources: {
+      host: () => readHostCgroup(),
+      container: sources.container,
+      chrome: () => ({ ...chromeTreePss(process.pid), browser: sources.browserStats() }),
+      runnerRssBytes: () => process.memoryUsage().rss,
+    },
+    log: env.log,
+    onAbort: (reason) => signals.abort(watchdogStop(reason)),
+  })
+  watchdog.start()
+  return watchdog
+}
+
+/**
+ * Stop the watchdog and log its peaks; the report. The caller has awaited
+ * `watchdog.stop()` first, so no sample's line comes after the peaks.
+ */
+function stopWatchdog(env: RunEnv, watchdog: MemoryWatchdog): ReturnType<MemoryWatchdog['report']> {
+  void watchdog.stop()
+  const report = watchdog.report()
+  for (const line of report.lines) env.log.info(`watchdog peaks: ${line}`)
+  return report
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +328,8 @@ async function provision(env: RunEnv, ws: Workspace): Promise<ProvisionReport> {
       // Unique per run, so Check 28's revoke-by-name never meets two tokens of one name.
       appTokenName: `${APP_TOKEN_NAME}-${env.runId}`,
       requireAppsJsonToCreate: !env.options.dryRun && env.options.createApps !== true,
+      // Read only for an unfinished create (apps.json's pending_create).
+      listApps: async () => (await ws.browser()).listApps(),
     },
     env.options.stage,
   )
@@ -295,12 +415,109 @@ async function dryRunFlowSelfTest(env: RunEnv, ws: Workspace): Promise<string[]>
   await browser.revokeAppToken(appId, name)
   if (stub.workspace.apps.get(appId)?.appTokens.some((t) => t.name === name)) throw new Error('dry-run flow self-test: the token was not revoked')
   evidence.push(`app-token flow: generated and revoked ${name}`)
+  evidence.push(await dryRunStraysSelfTest(env, ws))
+  const open = ws.browserStats()
+  if (!open || open.contexts !== 1 || open.pages !== 1 || open.idlePages !== open.pages) {
+    throw new Error('dry-run flow self-test: the browser is not one context with one page, idle on about:blank, after its flows')
+  }
+  evidence.push('browser: one Chrome with 1 context and 1 page, back on about:blank after every flow')
   return evidence
+}
+
+/**
+ * Dry run only: `apps --delete-strays` on the fixture apps list. A stray
+ * "CSCB Test B" (not in apps.json) is deleted with apps.manifest.delete; the
+ * four recorded apps and the "CSCB Test C" of another workspace (from the
+ * unfinished-create seed) are kept.
+ */
+async function dryRunStraysSelfTest(env: RunEnv, ws: Workspace): Promise<string> {
+  const stub = ws.stub
+  if (!stub) return ''
+  const stray = stub.workspace.createApp(ws.manifestFor('b')).id
+  const browser = await ws.browser()
+  const classified = classifyListedApps(await browser.listApps(), appsStateForStrayDeletion(ws.appsFile), await testWorkspaceName(browser))
+  const outcome = await deleteStrayApps({ callManifest: ws.callManifest, appsFile: ws.appsFile, log: env.log }, classified)
+  const recorded = Object.values(ws.appsFile.load().personas).map((p) => p?.app_id)
+  const recordedKept = recorded.length === 4 && recorded.every((id) => id !== undefined && stub.workspace.apps.has(id))
+  const deleted = outcome.deleted.map((a) => a.id)
+  if (deleted.length !== 1 || deleted[0] !== stray || stub.workspace.apps.has(stray) || !recordedKept || outcome.kept.length !== 1) {
+    throw new Error('dry-run strays self-test: apps --delete-strays did not delete exactly the stray, keeping the recorded apps and the other workspace\'s')
+  }
+  return (
+    `apps list: ${classified.length} apps read off the fixture apps page (${classified.filter((c) => c.recordedAs).length} in apps.json); ` +
+    `the stray ${stray} "CSCB Test B" deleted with apps.manifest.delete; the recorded apps and a "CSCB Test C" of another workspace kept`
+  )
+}
+
+/**
+ * Dry run only: the configuration token's rotation on the stub, twice: forced
+ * (as `config-token --rotate` does), then on a manifest call the stub refuses
+ * as `token_expired` (rotated and retried). Each time both files must be
+ * rewritten, mode 600, with the new pair, and the retried call must go
+ * through with the new token.
+ */
+async function dryRunRotationSelfTest(ws: Workspace): Promise<string> {
+  const stub = ws.stub
+  if (!stub) return ''
+  const fs = ws.store.guardedFs()
+  const paths = [ws.store.paths.configTokenFile, ws.store.paths.refreshTokenFile]
+  const saved = (): { token: string; refreshToken: string | null; private: boolean } => {
+    const tokens = ws.store.readConfigTokens()
+    return { ...tokens, private: paths.every((p) => ((fs.stat(p)?.mode ?? 0o777) & 0o777) === 0o600) }
+  }
+  const before = saved()
+  await ws.configTokens.rotateNow()
+  const forced = saved()
+  stub.workspace.expireConfigToken()
+  const appId = ws.appsFile.load().personas.a?.app_id ?? ''
+  const answer = await ws.callManifest('apps.manifest.export', { app_id: appId })
+  const expired = saved()
+  const w = stub.workspace
+  const rotatedTo = (s: ReturnType<typeof saved>, prev: ReturnType<typeof saved>): boolean =>
+    s.private && s.token !== prev.token && s.refreshToken !== prev.refreshToken
+  if (!rotatedTo(forced, before) || !rotatedTo(expired, forced) || expired.token !== w.configToken || expired.refreshToken !== w.refreshToken) {
+    throw new Error('dry-run rotation self-test: a rotation did not rewrite both token files (mode 600) with the new pair')
+  }
+  if (!answer.ok || w.calls.get('tooling.tokens.rotate') !== 2) throw new Error('dry-run rotation self-test: the call refused as token_expired was not rotated and retried')
+  return 'config token: rotated twice on the stub, forced (as config-token --rotate does) and on a token_expired manifest call (retried with the new token); both files rewritten mode 600 each time'
+}
+
+/**
+ * Dry run only: the app "CSCB Test C" that a create made before its run
+ * stopped (apps.json keeps only the pending-create intent), and a same-named
+ * app of another workspace. Provisioning must adopt the first from the apps
+ * list, leave the second alone, and create no second "CSCB Test C".
+ */
+function seedDryRunUnfinishedCreate(ws: Workspace): { made: string; foreign: string } | null {
+  const stub = ws.stub
+  if (!stub) return null
+  const made = stub.workspace.createApp(ws.manifestFor('c')).id
+  const foreign = stub.workspace.createApp(ws.manifestFor('c'), { foreign: true }).id
+  ws.appsFile.save({ version: 1, personas: { c: { pending_create: { started_at: new Date(Date.now() - 60_000).toISOString() } } }, channels: {} })
+  return { made, foreign }
+}
+
+function dryRunAdoptionEvidence(ws: Workspace, report: ProvisionReport, seeded: { made: string; foreign: string }): string {
+  const c = report.apps?.find((o) => o.letter === 'c')
+  const creates = ws.stub?.workspace.calls.get('apps.manifest.create') ?? 0
+  if (c?.action !== 'adopted' || c.appId !== seeded.made) throw new Error('dry-run unfinished-create self-test: provisioning did not adopt the app the unfinished create made')
+  if (creates !== 3) throw new Error(`dry-run unfinished-create self-test: ${creates} apps were created, not the other 3`)
+  if (ws.appsFile.load().personas.c?.pending_create) throw new Error('dry-run unfinished-create self-test: the intent is still in apps.json')
+  return (
+    `unfinished create: apps.json held only the intent for CSCB Test C; of the two such apps on the apps list, ${seeded.made} (the test workspace's) was adopted ` +
+    `and ${seeded.foreign} (another workspace's) left alone; the other 3 apps were created`
+  )
 }
 
 async function runProvisionOnly(env: RunEnv, signals: SignalControl): Promise<number> {
   const ws = openWorkspace({ repoRoot: REPO_ROOT, runId: env.runId, redactor: env.redactor, log: env.log }, env.options.dryRun ? 'dry-run' : 'real')
-  signals.setActive({ cleanup: () => ws.close() })
+  const watchdog = startWatchdog(env, signals, { container: async () => null, browserStats: () => ws.browserStats() })
+  signals.setActive({
+    // ws.close() closes Chrome first, without waiting for a driver or a sign-in in progress.
+    cleanup: async () => {
+      await Promise.all([watchdog.stop(), ws.close()])
+    },
+  })
   try {
     const report = await provision(env, ws)
     if (report.validate && !allValid(report.validate)) {
@@ -311,6 +528,8 @@ async function runProvisionOnly(env: RunEnv, signals: SignalControl): Promise<nu
     return EXIT_PASS
   } finally {
     signals.setActive(null)
+    await watchdog.stop()
+    stopWatchdog(env, watchdog)
     await ws.close()
   }
 }
@@ -518,8 +737,10 @@ interface RunState {
   containerLog: string
   /** The results were written (by the run's end or by a signal). */
   finished: boolean
-  /** The signal being handled: the run's own end then leaves the results to the handler. */
+  /** The stop (a signal, or the memory watchdog) being handled: the run's own end then leaves the results to the handler. */
   interrupted?: string
+  /** The run's memory watchdog: stopped, and its peaks recorded, when the results are written. */
+  watchdog: MemoryWatchdog | null
 }
 
 function runnerRow(id: string, title: string, reason: string, t0: number): RecordedResult {
@@ -550,7 +771,7 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
   const dry = env.options.dryRun
   const mode = dry ? 'dry-run' : 'real'
   const container = new ContainerRun(bunSpawn, env.log, env.runId, REPO_ROOT)
-  const state: RunState = { results: [], runNotes: [], packed: null, hostName: container.name, containerLog: '', finished: false }
+  const state: RunState = { results: [], runNotes: [], packed: null, hostName: container.name, containerLog: '', finished: false, watchdog: null }
   const record = (r: RecordedResult): void => {
     state.results.push(r)
   }
@@ -563,24 +784,42 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
     if (problem) throw new NotRunnableError(problem)
   }
   const ws = openWorkspace({ repoRoot: REPO_ROOT, runId: env.runId, redactor: env.redactor, log: env.log }, mode)
-  // One cleanup, however many callers (the run's end and a signal): they all wait for the same work.
+  // From here to the results: a watchdog sample every 30 s (in a dry run too, so it is exercised).
+  const watchdog = startWatchdog(env, signals, { container: () => container.stats(), browserStats: () => ws.browserStats() })
+  state.watchdog = watchdog
+  // One cleanup, however many callers (the run's end and a signal): they all wait for the same work, as the first caller's cause asks.
   let cleaning: Promise<void> | null = null
-  const cleanup = (): Promise<void> =>
+  const ended: CleanupEnd = { container: null, browserClosed: false }
+  const closeChrome = async (): Promise<void> => {
+    await ws.closeBrowser()
+    ended.browserClosed = true
+  }
+  const cleanup = (cause?: StopCause): Promise<void> =>
     (cleaning ??= (async () => {
-      await container.stopAndRemove(env.options.keepContainer)
-      if (!dry) restoreDLogged(ws, env.log)
-      await ws.close()
-      if (state.packed) rmSync(state.packed.dir, { recursive: true, force: true })
+      // Settles once a sample in flight has written its line: awaited before the results are written.
+      const watchdogStopped = watchdog.stop()
+      try {
+        // The memory watchdog's stop closes Chrome at once, alongside the container's removal, never after it.
+        const chromeClosed = cause?.memory === true ? closeChrome() : Promise.resolve()
+        ended.container = await container.stopAndRemove(env.options.keepContainer, cause?.memory === true)
+        if (!dry) restoreDLogged(ws, env.log)
+        await chromeClosed
+        await ws.close()
+        ended.browserClosed = true
+        if (state.packed) rmSync(state.packed.dir, { recursive: true, force: true })
+      } finally {
+        await watchdogStopped
+      }
     })())
   signals.setActive({
-    interrupted: (signal) => {
-      state.interrupted = signal
+    interrupted: (cause) => {
+      state.interrupted = cause.label
     },
     cleanup,
-    finishInterrupted: (signal) => {
+    finishInterrupted: (cause) => {
       if (state.finished) return
-      state.results.unshift(runnerRow('runner', 'The run was interrupted', `interrupted by ${signal}`, Date.now()))
-      state.runNotes.push(`interrupted by ${signal}; the test container was removed and the results so far written`)
+      state.results.unshift(runnerRow(cause.rowId, cause.rowTitle, cause.reason, Date.now()))
+      state.runNotes.push(stopNote(cause, ended, container.name))
       finish(env, ws, state, true)
     },
   })
@@ -602,9 +841,12 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
     const t0 = Date.now()
     let provisionResult: RecordedResult
     try {
+      const seeded = dry ? seedDryRunUnfinishedCreate(ws) : null
       const report = await provision(env, ws)
       const evidence = Object.entries(report.validate ?? {}).map(([l, v]) => `persona ${l}: bot_token ${v.bot}, app_token ${v.app}`)
       if (dry) {
+        if (seeded) evidence.push(dryRunAdoptionEvidence(ws, report, seeded))
+        evidence.push(await dryRunRotationSelfTest(ws))
         evidence.push(...(await dryRunFlowSelfTest(env, ws)))
         const realDir = resolveConfigDir(process.env, homedir())
         const touchedReal = ws.store.accessed.filter((p) => isInside(p, realDir)).length
@@ -649,6 +891,8 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
         env.log.info(`package: ${state.packed.version} (${state.packed.commit})`)
         await container.buildImage()
         started = await container.start({ tarball: state.packed.tarball, credentialsDir: ws.store.paths.credentialsDir, withClaude: !dry })
+        // The container's first reading, at once.
+        await watchdog.sample()
       } catch (err) {
         if (err instanceof NotRunnableError) throw err
         record(runnerRow('container', 'The live image and the test container', `container setup failed: ${describeError(err)}`, tc))
@@ -697,6 +941,9 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
       await runChecks(FINAL_CHECKS.filter((c) => c.id === 'HOST'), hostCtx, { available: new Set(), only: [], now: () => Date.now(), log: env.log, onResult: record })
     }
     if (dry) state.runNotes.push('dry run: local Slack stub and fixture pages; no workspace secret read')
+    // A last reading (after one in flight), then no more: the peaks are written after the last line.
+    await watchdog.sample()
+    await watchdog.stop()
     return finish(env, ws, state)
   } finally {
     signals.setActive(null)
@@ -712,10 +959,15 @@ function scanControl(secrets: readonly string[]): boolean {
   return shaped && known
 }
 
-/** Write the results and run the closing scan, once; the exit code. `interruption` is the signal handler's call. */
+/**
+ * Write the results and run the closing scan, once; the exit code.
+ * `interruption` is the signal handler's call. Both callers have awaited the
+ * watchdog's stop, so no watchdog line comes after its peaks or the scan.
+ */
 function finish(env: RunEnv, ws: Workspace, state: RunState, interruption = false): number {
   if (state.finished || (state.interrupted !== undefined && !interruption)) return EXIT_FAIL
   state.finished = true
+  const memory = state.watchdog ? stopWatchdog(env, state.watchdog) : undefined
   const runNotes = [...state.runNotes]
   for (const r of state.results) for (const n of r.notes ?? []) runNotes.push(n)
   if (state.containerLog) writeFileSync(join(env.resultsDir, 'container.log'), env.redactor.redact(state.containerLog), { mode: 0o600 })
@@ -730,6 +982,7 @@ function finish(env: RunEnv, ws: Workspace, state: RunState, interruption = fals
     verdict: verdictOf(results),
     results,
     notes: runNotes,
+    memory,
   }
   const writer = { write: (name: string, content: string) => writeFileSync(join(env.resultsDir, name), content, { mode: 0o600 }) }
   writeResults(summary, writer, env.redactor)
@@ -787,6 +1040,7 @@ export async function main(argv: string[]): Promise<number> {
   const redactor = new Redactor()
   redactor.addSecret(process.env.CI_ANTHROPIC_API_KEY)
   if (options.command === 'mailbox') return runMailbox(options, redactor)
+  if (options.command === 'config-token' || options.command === 'apps') return runMaintenance(options, redactor, REPO_ROOT)
   const log = createProcessRunLog(redactor)
   const runId = String(Math.floor(Date.now() / 1000))
   const resultsDir = makeResultsDir(runId)

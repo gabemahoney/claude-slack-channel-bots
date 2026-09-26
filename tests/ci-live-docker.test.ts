@@ -14,15 +14,24 @@
  *   flags, in any spelling, then the image and nothing after it, and a
  *   `--mount` only with the fields the runner writes, each named once, with
  *   no quote or line break;
+ * - the container is capped: `--memory` and `--memory-swap` 8g (equal, so no
+ *   swap on top) and `--pids-limit` 2048; the guard refuses a missing,
+ *   repeated, unlimited (-1, 0) or unparseable cap, swap unequal to memory,
+ *   docker's `-m` alias beside `--memory`, and `--oom-kill-disable`;
+ *   `docker stats` for the memory watchdog parses strictly;
  * - a run's container is `cscb-live-<run id>-<owner PID>`, and the runner
- *   removes it only when `docker inspect` (its ID and labels, never its env)
- *   shows this runner's PID as owner, by that ID;
+ *   removes it (or, kept on a memory watchdog stop, stops it with
+ *   `docker stop`) only when `docker inspect` (its ID and labels, never its
+ *   env) shows this runner's PID as owner, by that ID; a stopped run's note
+ *   says what became of it (`describeContainerEnd`);
  * - the container's Claude key comes from the host's `CI_ANTHROPIC_*`, never
  *   the host's own `ANTHROPIC_*`;
  * - a child process gets only an allowlisted environment: no `SLACK_*`,
  *   `ANTHROPIC_*`, `CI_ANTHROPIC_*` or `CSCB_LIVE_*` value;
- * - one run per mode holds the lock; a stale lock is replaced, and a
- *   leftover container whose runner is alive is never removed;
+ * - one run per mode holds the lock; a stale lock is removed with a WARNING
+ *   naming its path and why it is stale (every command that takes the lock
+ *   passes a sink for it), then replaced, and a leftover container whose
+ *   runner is alive is never removed;
  * - the image's agent-director binary is the host's own, found as its client
  *   finds it (`~/.agent-director/bin` first, then PATH in order), by real
  *   path, and only a regular executable file (`lib/agent-director-binary.ts`);
@@ -31,7 +40,11 @@
  * - every command that changes CSCB, tmux or agent-director runs through
  *   `docker exec` in a `cscb-live-` container; the host runs only the
  *   HOST check's read-only probes, npm pack, git and docker;
- * - SIGINT, SIGTERM and SIGHUP all clean up (Playwright's own handlers off).
+ * - SIGINT, SIGTERM and SIGHUP all clean up (Playwright's own handlers off),
+ *   and the memory watchdog's abort takes the same stop path, closing Chrome
+ *   alongside the container's removal rather than after it;
+ * - the browser is bounded (one Chrome, at most two contexts and two pages,
+ *   idle on about:blank between flows and after a sign-in).
  *
  * Nothing here runs docker: spawns go to a recording fake. The wiring that
  * lives in `ci-live/runtime/` and `ci-live/main.ts` (which load
@@ -56,17 +69,22 @@ import {
   claudeChildEnv,
   claudeEnvProblem,
   CONTAINER_OWNER_LABEL_KEY,
+  CONTAINER_STATS_FORMAT,
   containerName,
+  describeContainerEnd,
   DockerCli,
   INSPECT_OWNER_FORMAT,
   isLiveContainerName,
   parseContainerOwnership,
+  parseContainerStats,
+  parseMemorySize,
+  type ContainerEnd,
   type RunSpec,
 } from '../ci-live/lib/docker.ts'
 import { CHILD_ENV_ALLOWLIST, minimalChildEnv, type ProcResult, type SpawnOptions } from '../ci-live/lib/proc.ts'
 import { isLiveRunnerPid, lockHolder, lockPid, nodeLockDeps, RunLock, type LockDeps } from '../ci-live/lib/run-lock.ts'
 import { NotRunnableError } from '../ci-live/lib/secrets.ts'
-import { balancedAfter, callArguments, callsOf, objectProperties, onlyCallArguments, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
+import { balancedAfter, callArguments, callsOf, indicesOf, objectProperties, onlyCallArguments, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
@@ -137,10 +155,11 @@ function recordingSpawn(result: Partial<ProcResult> = {}) {
 // ---------------------------------------------------------------------------
 
 describe('buildRunArgs and assertSafeRunArgs', () => {
-  test('the run argv: detached with init, named, labelled with its owner, read-only bind mounts, secrets by name only, the image last; the guard accepts it', () => {
+  test('the run argv: detached with init, named, labelled with its owner, capped at 8g of memory with no swap on top and 2048 processes, read-only bind mounts, secrets by name only, the image last; the guard accepts it', () => {
     const args = buildRunArgs(runSpec())
     expect(args).toEqual([
       'run', '-d', '--init', '--name', NAME, '--hostname', NAME, '--label', 'cscb-live=1', '--label', 'cscb-live-owner=4242',
+      '--memory', '8g', '--memory-swap', '8g', '--pids-limit', '2048',
       '--mount', 'type=bind,source=/tmp/pack/package.tgz,target=/tmp/package.tgz,readonly',
       '--mount', `type=bind,source=${HOME}/.config/cscb-test/credentials,target=/home/testuser/.config/cscb,readonly`,
       '--env', 'ANTHROPIC_API_KEY', '--env', 'ANTHROPIC_BASE_URL', '--env', 'ANTHROPIC_MODEL',
@@ -159,7 +178,9 @@ describe('buildRunArgs and assertSafeRunArgs', () => {
     assertNoLeak(args)
   })
 
-  const base = ['run', '-d', '--name', NAME]
+  // The caps every run must set: with them in `base`, each refusal below is for its own rule, not a missing cap.
+  const CAPS = ['--memory', '8g', '--memory-swap', '8g', '--pids-limit', '2048']
+  const base = ['run', '-d', '--name', NAME, ...CAPS]
   const NETWORK = 'docker run uses the default network only (no --network)'
   const PUBLISH = 'docker run must not publish a port'
   const NAMESPACE = 'docker run must not share a host namespace'
@@ -262,6 +283,79 @@ describe('buildRunArgs and assertSafeRunArgs', () => {
     expect(() => assertSafeRunArgs(['exec', NAME, 'id'], HOME, lexical)).toThrow('not a docker run argv')
   })
 
+  // The resource caps: each of the three once, each a positive bounded value, and no swap on top of the memory cap.
+  const MISSING = 'docker run must cap the container with --memory, --memory-swap and --pids-limit (missing: '
+  const MEMORY_SIZE = 'docker run --memory needs a positive size such as 8g (not -1 or 0, which mean no limit)'
+  const SWAP_SIZE = 'docker run --memory-swap needs a positive size such as 8g (not -1 or 0, which mean no limit)'
+  const PIDS = 'docker run --pids-limit needs a positive number of processes (not -1 or 0, which mean no limit)'
+  const SWAP_EQUAL = 'docker run --memory-swap must equal --memory (no swap on top of the memory cap)'
+  const swapPids = ['--memory-swap', '8g', '--pids-limit', '2048']
+  const memPids = ['--memory', '8g', '--pids-limit', '2048']
+  const memSwap = ['--memory', '8g', '--memory-swap', '8g']
+  test.each([
+    ['no cap at all', [], `${MISSING}--memory, --memory-swap, --pids-limit)`],
+    ['no --memory', swapPids, `${MISSING}--memory)`],
+    ['no --memory-swap', memPids, `${MISSING}--memory-swap)`],
+    ['no --pids-limit', memSwap, `${MISSING}--pids-limit)`],
+    // docker lets the last of two win, so a second one could lift the cap.
+    ['--memory twice', ['--memory', '8g', '--memory=64g', ...swapPids], 'docker run sets --memory more than once'],
+    ['--memory-swap twice', ['--memory-swap=8g', ...memSwap, '--pids-limit', '2048'], 'docker run sets --memory-swap more than once'],
+    ['--pids-limit twice, the second unlimited', [...memSwap, '--pids-limit', '2048', '--pids-limit=-1'], 'docker run sets --pids-limit more than once'],
+    // -m is docker's alias for --memory: a second, larger cap under another spelling; --oom-kill-disable lets the container hang at its cap.
+    ["-m 64g alongside --memory (docker's alias for it)", [...CAPS, '-m', '64g'], 'docker run flag -m is not one the runner uses'],
+    ['-m64g (attached) alongside --memory', ['-m64g', ...CAPS], 'docker run flag -m is not one the runner uses'],
+    ['--oom-kill-disable', [...CAPS, '--oom-kill-disable'], 'docker run flag --oom-kill-disable is not one the runner uses'],
+    ['--memory -1 (no limit)', ['--memory', '-1', ...swapPids], MEMORY_SIZE],
+    ['--memory=0 (no limit)', ['--memory=0', ...swapPids], MEMORY_SIZE],
+    ['--memory-swap -1 (unlimited swap)', [...memPids, '--memory-swap', '-1'], SWAP_SIZE],
+    ['--memory-swap=0', [...memPids, '--memory-swap=0'], SWAP_SIZE],
+    ['--pids-limit -1 (no limit)', [...memSwap, '--pids-limit', '-1'], PIDS],
+    ['--pids-limit=0', [...memSwap, '--pids-limit=0'], PIDS],
+    ['--pids-limit 2048.5', [...memSwap, '--pids-limit', '2048.5'], PIDS],
+    ['--pids-limit past 7 digits', [...memSwap, '--pids-limit', '12345678'], PIDS],
+    ['a memory size with a two-letter unit', ['--memory', '8gb', ...swapPids], MEMORY_SIZE],
+    ['a fractional memory size', ['--memory', '1.5g', ...swapPids], MEMORY_SIZE],
+    ['a memory size docker would read in terabytes', ['--memory', '1t', ...swapPids], MEMORY_SIZE],
+    ['an empty --memory=', ['--memory=', ...swapPids], MEMORY_SIZE],
+    ['a memory size past a safe integer of bytes', ['--memory', '9999999999999g', ...swapPids], MEMORY_SIZE],
+    ['a memory size that is no number', ['--memory', 'lots', ...swapPids], MEMORY_SIZE],
+    ['swap above the memory cap', ['--memory', '8g', '--memory-swap', '16g', '--pids-limit', '2048'], SWAP_EQUAL],
+    ['swap below the memory cap', ['--memory', '8g', '--memory-swap', '4g', '--pids-limit', '2048'], SWAP_EQUAL],
+  ])('the guard refuses %s', (_what, caps, reason) => {
+    let err: unknown
+    try {
+      assertSafeRunArgs(['run', '-d', '--name', NAME, ...caps, 'img'], HOME, lexical)
+    } catch (e) {
+      err = e
+    }
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toBe(reason)
+    assertNoLeak(err)
+  })
+
+  test.each([
+    ['joined, with swap equal in bytes (8192m = 8g)', ['--memory=8192m', '--memory-swap=8g', '--pids-limit=2048']],
+    ['bytes and an upper-case unit, and the smallest process cap', ['--memory', '8G', '--memory-swap', '8589934592', '--pids-limit', '1']],
+  ])('the guard accepts the caps %s', (_what, caps) => {
+    expect(() => assertSafeRunArgs(['run', '-d', '--name', NAME, ...caps, 'img'], HOME, lexical)).not.toThrow()
+  })
+
+  test.each([
+    ['8g', 8 * 1024 ** 3],
+    ['8192m', 8 * 1024 ** 3],
+    ['8589934592', 8 * 1024 ** 3],
+    ['512K', 512 * 1024],
+    ['100b', 100],
+    ['0', null],
+    ['-1', null],
+    ['08g', null],
+    ['8gb', null],
+    ['1.5g', null],
+    ['9999999999999g', null],
+  ])('parseMemorySize(%p) is %p', (value, bytes) => {
+    expect(parseMemorySize(value)).toBe(bytes)
+  })
+
   test('the guard checks mounts by their real path: a symlink to ~/.claude, and ~/.claude that is itself a symlink', () => {
     const links: Record<string, string> = { '/tmp/innocent': `${HOME}/.claude`, [`${HOME}/.claude`]: '/data/claude-real' }
     const realPath = (p: string) => links[resolve(p)] ?? resolve(p)
@@ -282,6 +376,26 @@ describe('buildRunArgs and assertSafeRunArgs', () => {
       '--build-arg', 'HOST_UID=1000', '--build-arg', 'HOST_GID=1001', '-t', 'cscb-ci-live:latest', '/repo',
     ])
     expect(() => buildImageArgs({ repoRoot: '/repo', uid: 1000, gid: 1001 })).toThrow('needs the staged agent-director binary dir')
+  })
+})
+
+describe('parseContainerStats (docker stats, for the memory watchdog)', () => {
+  test('the format reads memory use and limit, then the PID count, and nothing else', () => {
+    expect(CONTAINER_STATS_FORMAT).toBe('{{.MemUsage}} {{.PIDs}}')
+  })
+
+  test.each([
+    ['binary units, with the trailing newline', '1.5GiB / 8GiB 42\n', { memUsage: '1.5GiB / 8GiB', memBytes: 1.5 * 1024 ** 3, limitBytes: 8 * 1024 ** 3, pids: 42 }],
+    ['a fractional MiB, rounded to bytes', '812.4MiB / 8GiB 7', { memUsage: '812.4MiB / 8GiB', memBytes: Math.round(812.4 * 1024 ** 2), limitBytes: 8 * 1024 ** 3, pids: 7 }],
+    ["an older docker's decimal units", '512MB / 8GB 3', { memUsage: '512MB / 8GB', memBytes: 512e6, limitBytes: 8e9, pids: 3 }],
+    ['a stopped container', '0B / 0B 0', { memUsage: '0B / 0B', memBytes: 0, limitBytes: 0, pids: 0 }],
+    ['no reading (docker prints dashes)', '-- / -- --', null],
+    ['an unknown unit', '1.5XiB / 8GiB 4', null],
+    ['no PID count', '1.5GiB / 8GiB', null],
+    ['two lines', '1.5GiB / 8GiB 4\n2GiB / 8GiB 5', null],
+    ['nothing', '', null],
+  ])('%s', (_what, stdout, expected) => {
+    expect(parseContainerStats(stdout)).toEqual(expected)
   })
 })
 
@@ -413,6 +527,21 @@ describe('parseContainerOwnership (the owner docker inspect shows for a name)', 
   })
 })
 
+describe("describeContainerEnd (the container's part of a stopped run's note)", () => {
+  // What the cleanup actually did, with the fix for any container it left: never "removed" when it was not.
+  test.each([
+    [null, `the test container ${NAME} may still exist (the cleanup did not finish)`],
+    ['none-started', 'no test container had been started'],
+    ['removed', 'the test container was removed (or was already gone)'],
+    ['not-removed', `the test container ${NAME} could not be removed (see run.log): remove it with docker rm -f ${NAME}`],
+    ['kept-running', `the test container ${NAME} was kept running (--keep-container)`],
+    ['kept-stopped', `the test container ${NAME} was stopped with docker stop (its memory freed) and kept for inspection (--keep-container)`],
+    ['stop-failed', `the test container ${NAME} was kept (--keep-container) but could not be stopped (see run.log): it may still be running; stop it with docker stop ${NAME}`],
+  ] as Array<[ContainerEnd | null, string]>)('%p', (end, note) => {
+    expect(describeContainerEnd(end, NAME)).toBe(note)
+  })
+})
+
 describe('TestContainer', () => {
   test.each(['cscb-live-', 'cscb-ci', 'slack_bot_persona_a', 'cscb-live-UPPER'])('refuses to exec in %p', (name) => {
     const { calls, spawn } = recordingSpawn()
@@ -501,11 +630,12 @@ describe('RunLock', () => {
     expect(state.get(LOCK)).toBe('777\n')
   })
 
-  test('a lock a live runner holds is not runnable, naming its PID and the path, and is left alone', () => {
-    const { deps, state } = lockDeps({ [LOCK]: '777\n' }, [777])
+  test('a lock a live runner holds is not runnable, naming its PID and the path, and is left alone with no warning', () => {
+    const { deps, state } = lockDeps({ [LOCK]: '777\n' }, [777], { isAlive: () => true })
+    const warnings: string[] = []
     const err = (() => {
       try {
-        RunLock.acquire(LOCK, '/ci-live dry run', deps)
+        RunLock.acquire(LOCK, '/ci-live dry run', deps, (w) => warnings.push(w))
       } catch (e) {
         return e as Error
       }
@@ -513,23 +643,29 @@ describe('RunLock', () => {
     })()
     expect(err).toBeInstanceOf(NotRunnableError)
     expect(err.message).toBe(`another /ci-live dry run (PID 777) is in progress and holds ${LOCK}: wait for it to finish`)
-    expect(state.get(LOCK)).toBe('777\n')
+    expect([state.get(LOCK), warnings]).toEqual(['777\n', []])
   })
 
   test.each([
-    ['a dead PID', '777\n'],
-    ['a PID that is no ci-live runner any more', '888\n'],
-    ['text that is no PID', 'garbage'],
-    ['an empty file', ''],
-  ])('a stale lock (%s) is replaced', (_what, content) => {
-    const { deps, state } = lockDeps({ [LOCK]: content }, [])
-    RunLock.acquire(LOCK, 'run', deps)
+    ['a dead PID', '777\n', { isAlive: () => false }, 'its PID 777 is not running'],
+    ['a PID reused by another program, as after a VM reboot', '888\n', { isAlive: () => true }, 'its PID 888 is running but is no /ci-live runner (the PID was reused, as after a VM reboot)'],
+    ['a PID whose liveness the deps cannot tell', '999\n', {}, 'its PID 999 is no live /ci-live runner'],
+    ["this process's own PID", `${ME}\n`, { isAlive: () => true }, `it holds this process's own PID ${ME}`],
+    ['text that is no PID', 'garbage', {}, 'it holds no PID'],
+    ['an empty file', '', {}, 'it holds no PID'],
+  ] as Array<[string, string, Partial<LockDeps>, string]>)('a stale lock (%s) is removed with a WARNING naming the path and why, then replaced', (_what, content, extra, why) => {
+    const { deps, state } = lockDeps({ [LOCK]: content }, [], extra)
+    const warnings: string[] = []
+    RunLock.acquire(LOCK, 'run', deps, (w) => warnings.push(w))
     expect(state.get(LOCK)).toBe(`${ME}\n`)
+    expect(warnings).toEqual([`WARNING: removed the stale run lock ${LOCK}: ${why}`])
   })
 
-  test('a lock that keeps reappearing is not runnable, telling the operator to remove it if no run is in progress', () => {
+  test('a lock that keeps reappearing is not runnable, telling the operator to remove it if no run is in progress; one gone before it was read gets no warning', () => {
     const { deps } = lockDeps({}, [], { createExclusive: () => false, read: () => null })
-    expect(() => RunLock.acquire(LOCK, 'run', deps)).toThrow(`could not take the run lock ${LOCK}: remove it if no /ci-live run is in progress`)
+    const warnings: string[] = []
+    expect(() => RunLock.acquire(LOCK, 'run', deps, (w) => warnings.push(w))).toThrow(`could not take the run lock ${LOCK}: remove it if no /ci-live run is in progress`)
+    expect(warnings).toEqual([])
   })
 
   test('lockHolder names only another live runner', () => {
@@ -590,6 +726,10 @@ describe('RunLock', () => {
       lock.release()
       expect([nodeLockDeps.read(path), readdirSync(dir)]).toEqual([null, []])
       expect(() => nodeLockDeps.unlink(path)).not.toThrow()
+    })
+
+    test("isAlive: this process and PID 1 (another user's when not root: EPERM still means alive) are alive; a PID past Linux's PID_MAX_LIMIT is not", () => {
+      expect([nodeLockDeps.isAlive!(process.pid), nodeLockDeps.isAlive!(1), nodeLockDeps.isAlive!(4_194_305)]).toEqual([true, true, false])
     })
   })
 })
@@ -796,6 +936,13 @@ function code(rel: string): string {
   return stripComments(readFileSync(join(CI_LIVE, rel), 'utf-8'))
 }
 
+/** Every part is in `text`, in this order (by first occurrence). */
+function expectInOrder(text: string, parts: string[]): void {
+  const at = parts.map((s) => text.indexOf(s))
+  expect(parts.filter((_, i) => at[i]! < 0)).toEqual([])
+  expect([...at].sort((a, b) => a - b)).toEqual(at)
+}
+
 describe('runner wiring (source audit of ci-live/)', () => {
   test('the host environment reaches a child only through minimalChildEnv or claudeChildEnv', () => {
     const allowed = [
@@ -853,7 +1000,12 @@ describe('runner wiring (source audit of ci-live/)', () => {
       const first = callArguments(text, m.index!).trim()
       return first.startsWith('[') ? /^\[\s*'([a-z]+)'/.exec(first)?.[1] : /^[A-Za-z]+/.exec(first)?.[0]
     })
-    expect([...new Set(dockerFirst)].sort()).toEqual(['args', 'buildImageArgs', 'image', 'info', 'inspect', 'logs', 'ps', 'restart', 'rm'])
+    expect([...new Set(dockerFirst)].sort()).toEqual(['args', 'buildImageArgs', 'image', 'info', 'inspect', 'logs', 'ps', 'restart', 'rm', 'stats', 'stop'])
+    // The watchdog's one reading: this run's container only, one sample (never a stream), in the fixed format.
+    expect([...text.matchAll(/\[\s*'stats'[^\]]*\]/g)].map((m) => m[0])).toEqual(["['stats', '--no-stream', '--format', CONTAINER_STATS_FORMAT, this.name]"])
+    // The one docker stop (a kept container on a memory watchdog stop): by the inspected ID, with a 10 s grace before docker kills it.
+    expect([...text.matchAll(/\[\s*'stop'[^\]]*\]/g)].map((m) => m[0])).toEqual(["['stop', '-t', String(KEPT_STOP_GRACE_S), owner.id]"])
+    expect(text).toContain('const KEPT_STOP_GRACE_S = 10\n')
   })
 
   test('leftover removal lists only cscb-live=1 containers and removes one only when its name is a live-run name and its runner (or the other mode\'s lock holder) is gone', () => {
@@ -875,7 +1027,7 @@ describe('runner wiring (source audit of ci-live/)', () => {
     expect(main).toContain('await container.removeLeftovers((pid) => isLiveRunnerPid(pid), lockHolder(otherLockFile) === null)')
   })
 
-  test("the run's own container is removed only when docker inspect shows this runner's PID as its owner, by the inspected ID; stopAndRemove goes through remove", () => {
+  test("the run's own container is removed (or, kept on a memory watchdog stop, stopped) only when docker inspect shows this runner's PID as its owner, by the inspected ID; stopAndRemove goes through remove or the kept container's stop", () => {
     const text = code(join('runtime', 'container-run.ts'))
     const bodyOf = (decl: string) => {
       const at = text.indexOf(decl)
@@ -905,8 +1057,11 @@ describe('runner wiring (source audit of ci-live/)', () => {
     // No container left of ours (removed, or none there) is success; a foreign or unknown owner is not.
     inOrder(bodyOf('async remove('), ['const outcome = await this.removeOwn()', "return outcome === 'removed' || outcome === 'absent'"])
     const stop = bodyOf('async stopAndRemove(')
-    inOrder(stop, ['this.stopping = true', 'if (this.pendingStart) await this.pendingStart', 'if (!this.runAttempted) return', 'if (keep) {', 'await this.remove()'])
+    inOrder(stop, ['this.stopping = true', 'if (this.pendingStart) await this.pendingStart', 'if (!this.runAttempted) return', 'if (keep) {', 'if (stopKept) return this.stopKeptContainer()', 'await this.remove()'])
     expect(stop).not.toContain('this.docker')
+    // A kept container is stopped (a memory watchdog stop) only when it is ours, by the inspected ID, as a removal is.
+    inOrder(bodyOf('private async stopOwn('), ['const owner = await this.ownership()', "if (owner.kind !== 'ours') return owner.kind", "this.docker.run(['stop', '-t', String(KEPT_STOP_GRACE_S), owner.id]"])
+    inOrder(bodyOf('private async stopKeptContainer('), ['const outcome = await this.stopOwn()', "return 'kept-stopped'", "if (outcome === 'absent') return 'removed'", "return 'stop-failed'"])
     // Every container inspect names its format: the owner's ID and labels, or the ID alone (a bare inspect prints the env).
     const inspects = runnerSources().flatMap((p) => [...stripComments(readFileSync(p, 'utf-8')).matchAll(/\[\s*'inspect'[^\]]*\]/g)].map((m) => `${relative(CI_LIVE, p)}: ${m[0]}`))
     expect(inspects).toEqual([
@@ -940,17 +1095,161 @@ describe('runner wiring (source audit of ci-live/)', () => {
     ])
   })
 
-  test("signals: Playwright's own handlers are off; the runner's handler for SIGINT, SIGTERM and SIGHUP cleans up, writes the results, releases the lock and exits 1, once", () => {
+  test("signals: Playwright's own handlers are off; SIGINT, SIGTERM and SIGHUP, and the memory watchdog's abort, all go through the one stopRun(cause), which cleans up, writes the results with the cause's FAIL row, releases the lock and exits 1, once", () => {
     const driver = code(join('browser', 'driver.ts'))
+    expect(indicesOf(/\bchromium\.launch\(/g, driver).length).toBe(1)
     const launch = callArguments(driver, driver.indexOf('chromium.launch('))
     for (const flag of ['handleSIGINT: false', 'handleSIGTERM: false', 'handleSIGHUP: false']) expect(launch).toContain(flag)
+    // Only the run (main.ts) and the maintenance commands handle signals.
+    expect(runnerSources().filter((p) => /\bprocess\.(on|once)\(/.test(stripComments(readFileSync(p, 'utf-8')))).map((p) => relative(CI_LIVE, p)).sort()).toEqual(['main.ts', 'maintenance.ts'])
     const main = code('main.ts')
     expect(main).toContain("const STOP_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const")
     expect(main).toContain('for (const signal of STOP_SIGNALS) process.on(signal, handler)')
-    const body = main.slice(...balancedAfter(main, main.indexOf('const handler = (signal: NodeJS.Signals): void =>'), '{', '}'))
-    const order = ['if (stopping) {', 'current.cleanup()', 'current?.finishInterrupted?.(signal)', 'lock?.release()', 'process.exit(EXIT_FAIL)'].map((s) => body.indexOf(s))
-    expect(order.every((i) => i >= 0)).toBe(true)
-    expect([...order].sort((a, b) => a - b)).toEqual(order)
+    expect(main).toContain('const handler = (signal: NodeJS.Signals): void => stopRun(signalStop(signal))')
+    expect(main).toContain('abort: stopRun,')
+    expect(main).toContain('onAbort: (reason) => signals.abort(watchdogStop(reason)),')
+    const stopRun = main.slice(...balancedAfter(main, main.indexOf('const stopRun = (cause: StopCause): void =>'), '{', '}'))
+    expectInOrder(stopRun, [
+      'if (stopping) {',
+      'stopping = true',
+      'current?.interrupted?.(cause)',
+      // The cause reaches the cleanup: a memory watchdog stop closes Chrome at once and stops a kept container.
+      'if (current) await withDeadline(current.cleanup(cause), SIGNAL_CLEANUP_MS)',
+      'current?.finishInterrupted?.(cause)',
+      'if (!hasVerdict(env)) writeVerdict(env, `FAIL: ${cause.rowId}: ${cause.reason}`)',
+      'lock?.release()',
+      'process.exit(EXIT_FAIL)',
+    ])
+    // The verdicts: `FAIL: runner: interrupted by <signal>`, and `FAIL: memory watchdog: <what crossed, its value and the limit>`; only the watchdog's is a memory stop.
+    const cause = (fn: string) => objectProperties(main.slice(main.indexOf('return', main.indexOf(`function ${fn}(`))))
+    expect(['signalStop', 'watchdogStop'].map((fn) => [cause(fn).get('rowId'), cause(fn).get('reason'), cause(fn).get('memory')])).toEqual([
+      ["'runner'", '`interrupted by ${signal}`', 'false'],
+      ["'memory watchdog'", 'reason', 'true'],
+    ])
+    // The maintenance commands: a signal closes the browser, releases the lock and exits 1, but waits for a rotated pair being saved.
+    const maintenance = code('maintenance.ts')
+    expect(maintenance).toContain("const STOP_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const")
+    expectInOrder(maintenance, ['for (const signal of STOP_SIGNALS) process.on(signal, handler)', 'for (const signal of STOP_SIGNALS) process.off(signal, handler)'])
+    expectInOrder(maintenance.slice(...balancedAfter(maintenance, maintenance.indexOf('const stop = async (signal: string): Promise<void> =>'), '{', '}')), [
+      'await ws?.close()',
+      'lock?.release()',
+      'process.exit(EXIT_FAIL)',
+    ])
+    expectInOrder(maintenance.slice(...balancedAfter(maintenance, maintenance.indexOf('const handler = (signal: NodeJS.Signals): void =>'), '{', '}')), [
+      'if (stopping) return',
+      'stopping = true',
+      'if (saving) err(',
+      'else void stop(signal)',
+    ])
+    expectInOrder(maintenance.slice(maintenance.indexOf("if (options.command === 'config-token') {")), ['saving = true', 'await ws.configTokens.rotateNow()', 'finally {', 'saving = false'])
+  })
+
+  test("the memory watchdog reads the host cgroup, the run's container, the runner's Chrome tree and its own RSS; it runs through a run and --provision-only, stops first in their cleanup, and its peaks go into the results", () => {
+    const main = code('main.ts')
+    const sources = objectProperties(main.slice(main.indexOf('sources: {', main.indexOf('new MemoryWatchdog('))))
+    expect([...sources]).toEqual([
+      ['host', '() => readHostCgroup()'],
+      ['container', 'sources.container'],
+      ['chrome', '() => ({ ...chromeTreePss(process.pid), browser: sources.browserStats() })'],
+      ['runnerRssBytes', '() => process.memoryUsage().rss'],
+    ])
+    const starts = callsOf(main, 'startWatchdog').map((at) => callArguments(main, at).replace(/\s+/g, ' ').trim())
+    expect(starts.slice(1)).toEqual([
+      'env, signals, { container: async () => null, browserStats: () => ws.browserStats() }',
+      'env, signals, { container: () => container.stats(), browserStats: () => ws.browserStats() }',
+    ])
+    // --provision-only: a stop closes the browser (Chrome first, in ws.close) alongside the watchdog's stop; its end stops the watchdog before its peaks.
+    const provisionOnly = main.slice(...balancedAfter(main, main.indexOf('async function runProvisionOnly('), '{', '}'))
+    const active = objectProperties(provisionOnly.slice(provisionOnly.indexOf('{', provisionOnly.indexOf('signals.setActive('))))
+    expect([...active.keys()]).toEqual(['cleanup'])
+    expect(active.get('cleanup')!.replace(/\s+/g, ' ')).toBe('async () => { await Promise.all([watchdog.stop(), ws.close()]) }')
+    expectInOrder(provisionOnly.slice(provisionOnly.indexOf('finally {')), ['signals.setActive(null)', 'await watchdog.stop()', 'stopWatchdog(env, watchdog)', 'await ws.close()'])
+    // A run's one cleanup: the watchdog stopped first and awaited last (no line after the results); on a memory stop Chrome closes alongside the container, never after it.
+    expect(main).toContain('const closeChrome = async (): Promise<void> => {\n    await ws.closeBrowser()\n    ended.browserClosed = true\n  }')
+    const cleanup = main.slice(...balancedAfter(main, main.indexOf('const cleanup = (cause?: StopCause): Promise<void> =>'), '{', '}'))
+    expectInOrder(cleanup, [
+      'const watchdogStopped = watchdog.stop()',
+      'const chromeClosed = cause?.memory === true ? closeChrome() : Promise.resolve()',
+      'ended.container = await container.stopAndRemove(env.options.keepContainer, cause?.memory === true)',
+      'await chromeClosed',
+      'await ws.close()',
+      'finally {',
+      'await watchdogStopped',
+    ])
+    // Its end: a last sample, the watchdog stopped (its line in), then the results with the peaks.
+    const runFull = main.slice(...balancedAfter(main, main.indexOf('async function runFull('), '{', '}'))
+    expectInOrder(runFull.slice(runFull.lastIndexOf('await watchdog.sample()')), ['await watchdog.sample()', 'await watchdog.stop()', 'return finish(env, ws, state)'])
+    expectInOrder(main.slice(main.indexOf('function finish(')), ['const memory = state.watchdog ? stopWatchdog(env, state.watchdog) : undefined', 'memory,', 'writeResults(summary'])
+    // The workspace's close closes Chrome first, then waits for the drivers (a sign-in in progress then fails at once).
+    const workspace = code(join('runtime', 'workspace.ts'))
+    expectInOrder(workspace.slice(...balancedAfter(workspace, workspace.indexOf('async close()'), '{', '}')), ['await closeBrowser()', 'for (const p of [human, second])', 'await d?.close()'])
+    expectInOrder(workspace.slice(workspace.indexOf('const closeBrowser = async (): Promise<void> =>')), ['const h = host ? await host.catch(() => null) : null', 'launched = null', 'await h?.close()'])
+  })
+
+  test('the stopped run\'s note words the container\'s end through describeContainerEnd', () => {
+    const main = code('main.ts')
+    expect(main).toContain('return `${cause.noteHead}; ${describeContainerEnd(ended.container, containerName)}; ${browser}; the results so far written`')
+    expect(main).toContain('state.runNotes.push(stopNote(cause, ended, container.name))')
+  })
+
+  test("the browser is bounded: one Chrome with its flags capping memory and renderers, at most two contexts and two pages, a site's own pages closed, every flow's page back on about:blank, a crashed page replaced", () => {
+    const driver = code(join('browser', 'driver.ts'))
+    expect(driver).toContain('export const MAX_CONTEXTS = 2')
+    expect(driver).toContain('export const MAX_PAGES = 2')
+    const args = driver.slice(...balancedAfter(driver, driver.indexOf('= [', driver.indexOf('export const CHROME_ARGS')), '[', ']'))
+    for (const flag of ["'--disable-dev-shm-usage'", "'--js-flags=--max-old-space-size=1024'", "'--renderer-process-limit=2'"]) expect(args).toContain(flag)
+    expect(callArguments(driver, driver.indexOf('chromium.launch('))).toContain('args: [...CHROME_ARGS]')
+    // A context (and its page) only below both limits.
+    const open = driver.slice(...balancedAfter(driver, driver.indexOf('async openDriver('), '{', '}'))
+    expectInOrder(open, ['if (open.contexts >= MAX_CONTEXTS || open.pages >= MAX_PAGES) {', 'throw new Error(', 'this.browser.newContext('])
+    // newPage: the driver's one page, and a crashed one's replacement after it is closed.
+    expect(indicesOf(/\.newPage\(/g, driver).length).toBe(2)
+    expectInOrder(driver.slice(driver.indexOf('private async usablePage(')), ['if (!this.crashed) return this.page', 'await this.page.close()', 'this.page = await this.context.newPage()'])
+    expectInOrder(driver, ["context.on('page', (opened) => {", 'if (opened === this.page || this.opening) return', 'void opened.close()'])
+    expectInOrder(driver.slice(driver.indexOf('private async flow<T>(')), ['return await work(await this.usablePage())', 'finally {', 'await this.idle()'])
+    // The sign-in idles its page too, signed in or failed; only a code prompt stays open, for the code.
+    expectInOrder(driver.slice(...balancedAfter(driver, driver.indexOf('async ensureSignedIn('), '{', '}')), [
+      "let outcome: SignInOutcome = 'signed-in'",
+      'try {',
+      'outcome = await signInWithPassword(',
+      'finally {',
+      "if (outcome !== 'needs-code') await this.idle()",
+    ])
+    for (const method of ['installApp(', 'generateAppToken(', 'revokeAppToken(', 'clickMessageButton(', 'listApps(']) {
+      const body = driver.slice(...balancedAfter(driver, driver.indexOf(`\n  ${method}`), '{', '}'))
+      expect([method, body.trim().startsWith('return this.flow(')]).toEqual([method, true])
+    }
+    // The workspace launches that one Chrome once, and each account's driver is a context in it.
+    const workspace = code(join('runtime', 'workspace.ts'))
+    expect(workspace).toContain("(host ??= import('../browser/driver.ts')")
+    expect(workspace).toContain('const driver = await (await chrome()).openDriver(')
+    expect(indicesOf(/\blaunchDriver\b/g, workspace).length).toBe(0)
+  })
+
+  test("every RunLock.acquire (main.ts's and maintenance.ts's only) passes a warning sink, so a stale lock's removal is never silent; the maintenance commands take the real lock in the resolved config dir", () => {
+    const acquires = runnerSources().flatMap((p) => {
+      const text = stripComments(readFileSync(p, 'utf-8'))
+      return indicesOf(/\bRunLock\.acquire\(/g, text).map((at) => `${relative(CI_LIVE, p)}: ${splitTopLevel(callArguments(text, at)).join(', ')}`)
+    })
+    expect(acquires.sort()).toEqual([
+      "main.ts: dryRunLockFile(tmpdir(), uid), '/ci-live dry run', nodeLockDeps, warn",
+      'main.ts: realRunLockFile(configDir), REAL_LOCK_WHAT, nodeLockDeps, warn',
+      'maintenance.ts: realRunLockFile(configDir), REAL_LOCK_WHAT, nodeLockDeps, err',
+    ])
+    const main = code('main.ts')
+    expect(main).toContain('const warn = (warning: string): void => env.log.info(warning)')
+    const maintenance = code('maintenance.ts')
+    expect(maintenance).toContain('const err = (line: string): void => {\n    process.stderr.write(`${redactor.redact(line)}\\n`)\n  }')
+    expectInOrder(maintenance, ['const configDir = resolveConfigDir(process.env, homedir())', 'lock = RunLock.acquire(realRunLockFile(configDir),', "ws = openWorkspace({ repoRoot, runId: String(Math.floor(Date.now() / 1000)), redactor, log }, 'real')"])
+    // apps --list|--delete-strays: apps.json is checked before Chrome is launched, and read again after the list, before any delete.
+    expectInOrder(maintenance.slice(...balancedAfter(maintenance, maintenance.indexOf('async function appsCommand('), '{', '}')), [
+      "const readState = (): AppsState => (action === 'delete-strays' ? appsStateForStrayDeletion(ws.appsFile) : ws.appsFile.load())",
+      'readState()',
+      'const browser = await ws.browser()',
+      'const listed = await browser.listApps()',
+      'const state = readState()',
+      'await deleteStrayApps({ callManifest: ws.callManifest, appsFile: ws.appsFile, log }, classified)',
+    ])
   })
 
   test('the container is started only after assertSafeRunArgs has passed its argv, with the host home', () => {
@@ -1004,6 +1303,7 @@ describe('runner wiring (source audit of ci-live/)', () => {
     )
     expect(imports.sort()).toEqual([
       `${join('browser', 'app-token.flow.ts')} <- ./common.ts`,
+      `${join('browser', 'apps-list.flow.ts')} <- ./common.ts`,
       `${join('browser', 'common.ts')} <- ../lib/browser-types.ts`,
       `${join('browser', 'install.flow.ts')} <- ./common.ts`,
       `${join('browser', 'login.flow.ts')} <- ./common.ts`,

@@ -30,6 +30,7 @@ const P = {
   session: ['xox', 'c-'].join(''),
   cookie: ['xox', 'd-'].join(''),
   config: ['xoxe', '.xoxp-'].join(''),
+  refresh: ['xox', 'e-'].join(''),
 }
 
 function digits(n: number): string {
@@ -47,6 +48,10 @@ function alnum(n: number): string {
 
 export const STUB_TEAM_ID = 'T0DRYSTUB0'
 export const STUB_HUMAN_ID = 'U0DRYHUMAN'
+/** The stub workspace's name (`auth.test`'s `team`, and the apps list's workspace column). */
+export const STUB_TEAM_NAME = 'CSCB CI Test (stub)'
+/** The workspace a foreign app belongs to on the fixture apps list. */
+export const STUB_OTHER_TEAM_NAME = 'Another Workspace (stub)'
 
 /** Letters and digits of a stub sign-in code: no vowels, so no code spells a word an output could hold. */
 const CODE_CHARS = 'BCDFGHJKLMNPQRSTVWXZ23456789'
@@ -203,6 +208,12 @@ export interface StubApp {
   botUserId: string
   botId: string
   appTokens: { name: string; token: string }[]
+  /**
+   * An app of another workspace the test human also sees on the apps list:
+   * the stub's manifest API (the test workspace's configuration token)
+   * answers `invalid_app_id` for it.
+   */
+  foreign?: boolean
 }
 
 export interface StubChannel {
@@ -227,7 +238,14 @@ export function blockButtons(blocks: unknown[] | undefined): { text: string; act
 }
 
 export class StubWorkspace {
-  readonly configToken = `${P.config}1-${alnum(40)}`
+  /** The app configuration token the manifest API takes now (`tooling.tokens.rotate` replaces it). */
+  configToken = `${P.config}1-${alnum(40)}`
+  /** The refresh token `tooling.tokens.rotate` takes now (spent by a rotation). */
+  refreshToken = `${P.refresh}1-${alnum(40)}`
+  /** Every configuration and refresh token issued (the dry run registers them as known secrets). */
+  private readonly configTokens: string[] = [this.configToken, this.refreshToken]
+  /** The manifest API refuses this token as `token_expired` (`expireConfigToken`). */
+  private expiredToken: string | null = null
   readonly sessionToken = `${P.session}${digits(12)}-${digits(12)}-${alnum(32)}`
   readonly cookie = `${P.cookie}${alnum(48)}`
   readonly apps = new Map<string, StubApp>()
@@ -349,9 +367,24 @@ export class StubWorkspace {
     return false
   }
 
+  /** The current configuration token expires: the manifest API answers `token_expired` for it. */
+  expireConfigToken(): void {
+    this.expiredToken = this.configToken
+  }
+
+  /** `tooling.tokens.rotate`: the refresh token for a new pair; the old pair is spent. */
+  private rotateConfigTokens(refreshToken: string | undefined): SlackResponse {
+    if (refreshToken !== this.refreshToken) return { ok: false, error: 'invalid_refresh_token' }
+    this.configToken = `${P.config}1-${alnum(40)}`
+    this.refreshToken = `${P.refresh}1-${alnum(40)}`
+    this.configTokens.push(this.configToken, this.refreshToken)
+    const iat = Math.floor(Date.now() / 1000)
+    return { ok: true, token: this.configToken, refresh_token: this.refreshToken, team_id: STUB_TEAM_ID, user_id: STUB_HUMAN_ID, iat, exp: iat + 43_200 }
+  }
+
   /** Every token the stub issued (the dry run registers them as known secrets). */
   allTokens(): string[] {
-    const out = [this.configToken, this.sessionToken, this.cookie]
+    const out = [...this.configTokens, this.sessionToken, this.cookie]
     for (const app of this.apps.values()) {
       if (app.botToken) out.push(app.botToken)
       for (const t of app.appTokens) out.push(t.token)
@@ -380,7 +413,7 @@ export class StubWorkspace {
 
   // --- manifest API (configuration token) ---------------------------------
 
-  createApp(manifest: Record<string, unknown>): StubApp {
+  createApp(manifest: Record<string, unknown>, options: { foreign?: boolean } = {}): StubApp {
     this.seq += 1
     const n = String(this.seq).padStart(4, '0')
     const app: StubApp = {
@@ -391,6 +424,7 @@ export class StubWorkspace {
       botUserId: `U0DRYB${n}T`,
       botId: `B0DRYB${n}T`,
       appTokens: [],
+      ...(options.foreign ? { foreign: true } : {}),
     }
     this.apps.set(app.id, app)
     return app
@@ -424,7 +458,9 @@ export class StubWorkspace {
   api(method: string, bearer: string | null, params: Record<string, string>): SlackResponse {
     this.count(method)
     const err = (error: string): SlackResponse => ({ ok: false, error })
+    if (method === 'tooling.tokens.rotate') return this.rotateConfigTokens(params.refresh_token)
     if (method.startsWith('apps.manifest.')) {
+      if (bearer !== null && bearer === this.expiredToken) return err('token_expired')
       if (bearer !== this.configToken) return err('invalid_auth')
       if (method === 'apps.manifest.validate') return { ok: true }
       let manifest: Record<string, unknown> | null = null
@@ -442,8 +478,12 @@ export class StubWorkspace {
         return { ok: true, app_id: app.id, credentials: { client_id: `${digits(10)}.${digits(10)}`, client_secret: alnum(32), signing_secret: alnum(32) } }
       }
       const app = this.apps.get(params.app_id ?? '')
-      if (!app) return err('invalid_app_id')
+      if (!app || app.foreign) return err('invalid_app_id')
       if (method === 'apps.manifest.export') return { ok: true, manifest: app.manifest }
+      if (method === 'apps.manifest.delete') {
+        this.apps.delete(app.id)
+        return { ok: true }
+      }
       if (method === 'apps.manifest.update') {
         if (!manifest) return err('invalid_arguments')
         app.manifest = manifest
@@ -459,7 +499,7 @@ export class StubWorkspace {
     const app = bearer ? this.appByBotToken(bearer) : undefined
     if (!app) return err(bearer ? 'invalid_auth' : 'not_authed')
     if (method === 'auth.test') {
-      return { ok: true, user_id: app.botUserId, bot_id: app.botId, team_id: STUB_TEAM_ID, team: 'CSCB CI Test (stub)', user: 'bot' }
+      return { ok: true, user_id: app.botUserId, bot_id: app.botId, team_id: STUB_TEAM_ID, team: STUB_TEAM_NAME, user: 'bot' }
     }
     if (method === 'bots.info') {
       if (params.bot !== app.botId) return err('bot_not_found')
@@ -477,7 +517,7 @@ export class StubWorkspace {
     const channel = this.channels.get(params.channel ?? '')
     switch (method) {
       case 'auth.test':
-        return { ok: true, user_id: STUB_HUMAN_ID, team_id: STUB_TEAM_ID }
+        return { ok: true, user_id: STUB_HUMAN_ID, team_id: STUB_TEAM_ID, team: STUB_TEAM_NAME }
       case 'conversations.list':
         return {
           ok: true,

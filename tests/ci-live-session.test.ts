@@ -71,6 +71,9 @@ describe('parseArgs', () => {
     [['mailbox', '--forwarding'], { command: 'mailbox', mailboxView: 'forwarding' }],
     [['mailbox', '--latest', '--show-body'], { command: 'mailbox', mailboxView: 'latest', showBody: true }],
     [['mailbox', '--show-body', '--forwarding'], { command: 'mailbox', mailboxView: 'forwarding', showBody: true }],
+    [['config-token', '--rotate'], { command: 'config-token', rotate: true }],
+    [['apps', '--list'], { command: 'apps', appsAction: 'list' }],
+    [['apps', '--delete-strays'], { command: 'apps', appsAction: 'delete-strays' }],
   ])('%j', (argv, expected) => {
     expect(parseArgs(argv)).toEqual({ ...defaults, ...expected } as RunOptions)
   })
@@ -84,8 +87,12 @@ describe('parseArgs', () => {
     ])
   })
 
-  test('the usage names the mailbox command', () => {
-    expect(USAGE.split('\n').at(-1)).toBe('       bun ci-live/run.ts mailbox --latest|--forwarding [--show-body]')
+  test('the usage names the maintenance and mailbox commands', () => {
+    expect(USAGE.split('\n').slice(-3)).toEqual([
+      '       bun ci-live/run.ts config-token --rotate',
+      '       bun ci-live/run.ts apps --list|--delete-strays',
+      '       bun ci-live/run.ts mailbox --latest|--forwarding [--show-body]',
+    ])
   })
 
   test.each([
@@ -107,6 +114,13 @@ describe('parseArgs', () => {
     [['mailbox', '--latest', '--show-body', '--show-body'], 'mailbox takes --show-body only once'],
     [['mailbox', '--latest', '--forwarding', '--latest'], 'mailbox takes --latest only once'],
     [['--latest'], 'unknown argument "--latest"'],
+    [['config-token'], 'config-token takes --rotate (rotate the configuration token pair once) and nothing else'],
+    [['config-token', '--rotate', '--dry-run'], 'config-token takes --rotate (rotate the configuration token pair once) and nothing else'],
+    [['--rotate'], 'unknown argument "--rotate"'],
+    [['apps'], 'apps takes --list (the apps in the test workspace) or --delete-strays (also delete the stray test apps), and nothing else'],
+    [['apps', '--list', '--delete-strays'], 'apps takes --list (the apps in the test workspace) or --delete-strays (also delete the stray test apps), and nothing else'],
+    [['apps', '--dry-run'], 'apps takes --list (the apps in the test workspace) or --delete-strays (also delete the stray test apps), and nothing else'],
+    [['--dry-run', 'apps', '--list'], 'unknown argument #2'],
     [['--dry-run', 'mailbox', '--latest'], 'unknown argument #2'],
   ])('refuses %j', (argv, message) => {
     expect(() => parseArgs(argv)).toThrow(UsageError)

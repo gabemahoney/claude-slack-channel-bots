@@ -2,9 +2,10 @@
  * stub-server.ts — the dry run's local Slack: the Web API (`/api/<method>`),
  * the human session API (`/human-api/<method>`) and fixture HTML pages for
  * the browser flows (sign-in, the emailed-code prompt, install and consent,
- * OAuth & Permissions, Basic Information with App-Level Tokens, and a
- * web-client conversation with a prompt message, whose first load lands on
- * a default channel as the real client's does); and the test mailbox's
+ * OAuth & Permissions, Basic Information with App-Level Tokens, the apps
+ * list with each app's workspace, and a web-client conversation with a
+ * prompt message, whose first load lands on a default channel as the real
+ * client's does); and the test mailbox's
  * mail.tm API (`/mailtm/token`, `/mailtm/messages[/<id>]`,
  * `/mailtm/sources/<id>`), on 127.0.0.1 only.
  *
@@ -14,7 +15,7 @@
  */
 
 import type { SlackUrls } from '../lib/browser-types.ts'
-import { blockButtons, STUB_TEAM_ID, StubWorkspace } from './stub-state.ts'
+import { blockButtons, STUB_OTHER_TEAM_NAME, STUB_TEAM_ID, STUB_TEAM_NAME, StubWorkspace } from './stub-state.ts'
 
 /** What the fixture web client served (the dry run's self-test reads it). */
 export interface StubClientStats {
@@ -191,6 +192,23 @@ function generalPage(ws: StubWorkspace, appId: string): Response {
 <div id="revoke-confirm" hidden><button type="button" id="revoke-yes">Yes, Revoke</button></div></div>
 <script>${GENERAL_SCRIPT}</script></body></html>`,
     { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } },
+  )
+}
+
+/** The apps list (api.slack.com/apps): a row per app, an icon link and a name link, and the app's workspace. */
+function appsListPage(ws: StubWorkspace): Response {
+  const rows = [...ws.apps.values()]
+    .map((app) => {
+      const name = String((app.manifest.display_information as { name?: unknown } | undefined)?.name ?? app.id)
+      const href = `/fixture/apps/${esc(app.id)}/general`
+      const team = app.foreign ? STUB_OTHER_TEAM_NAME : STUB_TEAM_NAME
+      return `<tr><td><a href="${href}" aria-hidden="true"><span class="icon"></span></a> <a href="${href}">${esc(name)}</a></td><td>${esc(team)}</td></tr>`
+    })
+    .join('')
+  return page(
+    'Your Apps',
+    `<h1>Your Apps</h1><a href="/fixture/apps/new" role="button">Create New App</a>
+<table><thead><tr><th>App Name</th><th>Workspace</th></tr></thead><tbody>${rows}</tbody></table>`,
   )
 }
 
@@ -374,6 +392,7 @@ export function startStubServer(options: { domain: string; email: string; passwo
       if (!path.startsWith('/fixture/')) return new Response('not found', { status: 404 })
       if (!signedIn(req)) return redirect('/fixture/sign_in_with_password')
 
+      if (path === '/fixture/apps') return appsListPage(ws)
       if ((m = /^\/fixture\/apps\/([A-Z0-9]+)\/install-on-team$/.exec(path))) {
         return page('Install App', `<h1>Install App</h1><a href="/fixture/oauth/authorize?app=${esc(m[1] as string)}" role="button">Install to CSCB CI Test</a>`)
       }
@@ -410,6 +429,7 @@ export function startStubServer(options: { domain: string; email: string; passwo
     oauthPage: (appId) => `${baseUrl}/fixture/apps/${appId}/oauth`,
     basicInfoPage: (appId) => `${baseUrl}/fixture/apps/${appId}/general`,
     conversation: (teamId, conversationId) => `${baseUrl}/fixture/client/${teamId}/${conversationId}`,
+    appsList: () => `${baseUrl}/fixture/apps`,
   }
   return { workspace: ws, client, baseUrl, apiBase: `${baseUrl}/api/`, mailApiBase: `${baseUrl}/mailtm`, urls, stop: () => server.stop(true) }
 }

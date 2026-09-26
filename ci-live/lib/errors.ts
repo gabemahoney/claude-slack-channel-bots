@@ -1,5 +1,6 @@
 /**
- * errors.ts — describing a thrown value for a log line without leaking.
+ * errors.ts — describing a thrown value for a log line without leaking, and
+ * the runner's exit codes.
  *
  * Browser and network errors can quote a URL (an OAuth redirect with a code
  * in its query) or page text. The description keeps the error's name and the
@@ -18,3 +19,12 @@ export function describeError(err: unknown): string {
   }
   return typeof err === 'string' ? describeError(new Error(err)) : 'non-Error thrown value'
 }
+
+// ---------------------------------------------------------------------------
+// Exit codes
+// ---------------------------------------------------------------------------
+
+export const EXIT_PASS = 0
+export const EXIT_FAIL = 1
+/** The run can't be made (a missing secret, docker down, a refused token …): the reason names the fix. */
+export const EXIT_NOT_RUNNABLE = 2

@@ -7,6 +7,8 @@
  *                      [--only <check ids, comma-separated>] [--keep-container] [--clean]
  *                      [--create-apps]
  *   bun ci-live/run.ts login [--second]
+ *   bun ci-live/run.ts config-token --rotate
+ *   bun ci-live/run.ts apps --list|--delete-strays
  *   bun ci-live/run.ts mailbox --latest|--forwarding [--show-body]
  *
  *   --dry-run          no secret is read: a local stub stands in for Slack, the
@@ -28,6 +30,22 @@
  *                      the terminal if Slack asks) and save the session
  *   login --second     the same for the second workspace user (live.json
  *                      `second_user`)
+ *   config-token --rotate
+ *                      rotate the app configuration token pair once with
+ *                      tooling.tokens.rotate and rewrite both files (mode
+ *                      600); prints only `config token: rotated with
+ *                      tooling.tokens.rotate; both token files rewritten
+ *                      (mode 600)`, or a safe error. Takes the run lock
+ *   apps --list        list every app the test human sees at
+ *                      api.slack.com/apps (read with the saved session): app
+ *                      ID, name, and whether apps.json records it. Takes the
+ *                      run lock
+ *   apps --delete-strays
+ *                      the same, then delete with apps.manifest.delete only
+ *                      the apps named exactly "CSCB Test A"…"D" that apps.json
+ *                      does not record and that belong to the test workspace;
+ *                      prints what it deleted and what it kept. Never deletes
+ *                      a recorded app
  *   mailbox --latest   show the test mailbox's newest message (mailbox.json):
  *                      when it came, its sender and subject, and a
  *                      confirmation code found in it (Gmail's forwarding code
@@ -52,6 +70,12 @@
  * received after the sign-in attempt started) and types it; without a
  * mailbox, or without a code in time, it stops as before (exit 2: run
  * `login` once).
+ *
+ * A run is memory-bounded: the container has hard --memory, --memory-swap and
+ * --pids-limit caps, Chrome is one browser with one page per account, and a
+ * memory watchdog samples every 30 s and stops the run (like a signal, with
+ * the verdict `FAIL: memory watchdog: …`) when the host's working set passes
+ * 40 GiB or Chrome's PSS passes 4 GiB.
  *
  * The full usage is `USAGE` in lib/args.ts, which parses the command line.
  *

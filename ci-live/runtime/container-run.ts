@@ -2,9 +2,13 @@
  * container-run.ts — the throwaway container's life: pack the package under
  * test, build the live image (with the host's agent-director binary staged
  * as a named build context), start the container on the default network with
- * the tarball and the credentials dir mounted read-only, wait for the
- * entrypoint's boot, restart it (Check 28) and wait for that new boot,
- * capture its logs and remove it.
+ * the tarball and the credentials dir mounted read-only and hard memory, swap
+ * and PID caps (`CONTAINER_MEMORY`, `CONTAINER_PIDS_LIMIT`), wait for the
+ * entrypoint's boot, restart it (Check 28) and wait for that new boot, read
+ * its memory use and PID count for the memory watchdog (`docker stats`),
+ * capture its logs and remove it (or, with `--keep-container` on a memory
+ * watchdog stop, stop it with `docker stop`: its memory is freed and it stays
+ * for inspection).
  *
  * Leftover containers of an earlier run (label `cscb-live=1`, and only those)
  * are removed first, except one whose runner (its `cscb-live-owner` PID) is
@@ -15,7 +19,7 @@
  *
  * The run's own container is `cscb-live-<run id>-<PID>` (so two runners
  * started in the same second never share a name), and `remove` and
- * `stopAndRemove` remove it only after `docker inspect` shows its
+ * `stopAndRemove` remove (or stop) it only after `docker inspect` shows its
  * `cscb-live-owner` label is this runner's PID, by the ID inspected.
  */
 
@@ -34,14 +38,20 @@ import {
   claudeChildEnv,
   CONTAINER_CREDENTIALS_DIR,
   CONTAINER_LABEL,
+  CONTAINER_MEMORY,
   CONTAINER_OWNER_LABEL_KEY,
+  CONTAINER_PIDS_LIMIT,
+  CONTAINER_STATS_FORMAT,
   CONTAINER_TARBALL,
   containerName,
   DockerCli,
+  type ContainerEnd,
   INSPECT_OWNER_FORMAT,
   isLiveContainerName,
   parseContainerOwnership,
+  parseContainerStats,
   type ContainerOwnership,
+  type ContainerStats,
 } from '../lib/docker.ts'
 import type { RunLog } from '../lib/log.ts'
 import { minimalChildEnv, type SpawnFn } from '../lib/proc.ts'
@@ -60,6 +70,9 @@ type RemovalOutcome = 'removed' | 'absent' | 'failed' | 'foreign' | 'unknown'
 
 /** How long the entrypoint may take to finish a boot. */
 const BOOT_TIMEOUT_MS = 180_000
+
+/** `docker stop -t`: the seconds a kept container gets to exit before it is killed (a memory watchdog stop). */
+const KEPT_STOP_GRACE_S = 10
 
 export class ContainerRun {
   readonly docker: DockerCli
@@ -186,6 +199,7 @@ export class ContainerRun {
       labels: { [CONTAINER_OWNER_LABEL_KEY]: String(process.pid) },
     })
     assertSafeRunArgs(args, homedir())
+    this.log.info(`container: starting ${this.name} with --memory ${CONTAINER_MEMORY} (--memory-swap the same) and --pids-limit ${CONTAINER_PIDS_LIMIT}`)
     this.runAttempted = true
     const started = this.docker.run(args, { timeoutMs: 120_000, extraEnv: claude.childEnv })
     this.pendingStart = started.catch(() => undefined)
@@ -222,6 +236,23 @@ export class ContainerRun {
     const r = await this.docker.run(['restart', '-t', '20', this.name], { timeoutMs: 180_000 })
     if (r.code !== 0) throw new Error(`docker restart failed (exit ${r.code})`)
     await this.waitBoot(before.boot + 1)
+  }
+
+  /**
+   * This run's container's memory use and PID count (`docker stats`, one
+   * reading), or `null` when it is not running: not started yet, or removed.
+   * Throws when docker fails otherwise or its answer does not parse.
+   */
+  async stats(): Promise<ContainerStats | null> {
+    if (!this.container) return null
+    const r = await this.docker.run(['stats', '--no-stream', '--format', CONTAINER_STATS_FORMAT, this.name], { timeoutMs: 20_000 })
+    if (r.code !== 0) {
+      if (/No such container/i.test(r.stderr)) return null
+      throw new Error(`docker stats failed (exit ${r.code})`)
+    }
+    const stats = parseContainerStats(r.stdout)
+    if (!stats) throw new Error('docker stats printed no memory use and PID count')
+    return stats
   }
 
   async logs(): Promise<string> {
@@ -262,18 +293,47 @@ export class ContainerRun {
   }
 
   /**
-   * Stop for good: no further start, wait for a `docker run` in flight, then
-   * remove the container when one may exist and this runner started it
-   * (unless `keep`). Idempotent.
+   * `docker stop` this runner's container, by the ID inspected, only when
+   * docker shows this runner's PID as its owner: its memory is freed, and it
+   * stays for inspection.
    */
-  async stopAndRemove(keep: boolean): Promise<void> {
+  private async stopOwn(): Promise<'stopped' | 'failed' | ContainerOwnership['kind']> {
+    const owner = await this.ownership()
+    if (owner.kind !== 'ours') return owner.kind
+    const r = await this.docker.run(['stop', '-t', String(KEPT_STOP_GRACE_S), owner.id], { timeoutMs: 60_000 + KEPT_STOP_GRACE_S * 1000 })
+    return r.code === 0 ? 'stopped' : 'failed'
+  }
+
+  /** Stop the kept container (a memory watchdog stop with --keep-container); how it ended. */
+  private async stopKeptContainer(): Promise<ContainerEnd> {
+    const outcome = await this.stopOwn()
+    if (outcome === 'stopped') {
+      this.log.info(`container: ${this.name} stopped with docker stop and kept (--keep-container): start it with docker start ${this.name}, remove it with docker rm -f ${this.name}`)
+      return 'kept-stopped'
+    }
+    if (outcome === 'absent') return 'removed'
+    if (outcome === 'foreign') this.log.error(`container: not stopping ${this.name}: this run did not start it (its cscb-live-owner is not PID ${process.pid})`)
+    if (outcome === 'unknown') this.log.error(`container: could not tell who owns ${this.name} (docker inspect failed); nothing stopped`)
+    if (outcome === 'failed') this.log.error(`container: could not stop ${this.name}: stop it with docker stop ${this.name}`)
+    return 'stop-failed'
+  }
+
+  /**
+   * Stop for good: no further start, wait for a `docker run` in flight, then
+   * remove the container when one may exist and this runner started it.
+   * With `keep` (--keep-container) it is left as it is, or, with
+   * `stopKept` (a memory watchdog stop), stopped with `docker stop` and
+   * kept. Idempotent; how the container ended.
+   */
+  async stopAndRemove(keep: boolean, stopKept = false): Promise<ContainerEnd> {
     this.stopping = true
     if (this.pendingStart) await this.pendingStart
-    if (!this.runAttempted) return
+    if (!this.runAttempted) return 'none-started'
     if (keep) {
+      if (stopKept) return this.stopKeptContainer()
       this.log.info(`container: ${this.name} kept (--keep-container); remove it with docker rm -f ${this.name}`)
-      return
+      return 'kept-running'
     }
-    await this.remove()
+    return (await this.remove()) ? 'removed' : 'not-removed'
   }
 }

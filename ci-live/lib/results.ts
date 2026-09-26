@@ -4,7 +4,9 @@
  * - `results.json`: every check with status, reason, evidence and notes;
  * - `results.md`: a per-check table with evidence, then one row in the
  *   testplan's Results-table format (testplans/b.yko "Results"), ready to
- *   paste: pass, fail or "not run" per column, never a token or a log excerpt.
+ *   paste: pass, fail or "not run" per column, never a token or a log excerpt;
+ *   then the memory watchdog's peaks (`memory` in results.json), when the
+ *   run had a watchdog.
  *
  * Rendering is pure. Every string of the summary passes through the redactor
  * before it is serialised (JSON escaping or a Markdown cell's `\|` would
@@ -13,6 +15,7 @@
  */
 
 import type { RecordedResult } from '../checks/framework.ts'
+import type { WatchdogReport } from './memory-watchdog.ts'
 import type { Redactor } from './redact.ts'
 
 /** The testplan Results table's check columns, in order. */
@@ -32,6 +35,8 @@ export interface RunSummary {
   verdict: string
   results: RecordedResult[]
   notes: string[]
+  /** The memory watchdog's samples, peaks and any abort (absent when the run had no watchdog). */
+  memory?: WatchdogReport
 }
 
 function cell(text: string): string {
@@ -73,6 +78,12 @@ export function renderResultsMarkdown(summary: RunSummary): string {
   lines.push(`|${' --- |'.repeat(RESULTS_COLUMNS.length + 4)}`)
   lines.push(renderResultsRow(summary))
   lines.push('')
+  if (summary.memory) {
+    lines.push('## Memory (the watchdog\'s peaks)')
+    lines.push('')
+    for (const line of summary.memory.lines) lines.push(`- ${line}`)
+    lines.push('')
+  }
   return lines.join('\n')
 }
 

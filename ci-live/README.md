@@ -18,7 +18,8 @@ exception is `hgx`, which takes a value only as an argument (see
   test human, with email and password login and no 2FA.
 - In `~/.config/cscb-test/` (mode 700; `CSCB_LIVE_CONFIG_DIR` overrides it),
   each file mode 600:
-  - `slack_config_token`: the workspace's app configuration token;
+  - `slack_config_token`: the workspace's app configuration token (optional
+    once `apps.json` records the four apps, as it does here: see step 1);
   - `live.json`: the workspace and the test human's email;
   - `test_password`: the test human's password;
   - `apps.json`: the IDs of the four apps "CSCB Test A" to "CSCB Test D",
@@ -43,15 +44,22 @@ personas' credentials files, and creates the public channels `a-home`,
 `coordination` and `d-home` (the plan's A-home and D-home: Slack channel names
 are lowercase). You create no app, token or channel by hand.
 
-See what is there (mode, size and name, never the contents):
+See what is there (mode, size and name, never the contents), the personas'
+credentials files included:
 
 ```sh
-stat -c '%a %s %n' ~/.config/cscb-test ~/.config/cscb-test/*
+stat -c '%a %s %n' ~/.config/cscb-test ~/.config/cscb-test/* ~/.config/cscb-test/credentials*/*
 ```
 
-The runner stops (exit 2) and names the path when the directory or a secret
-file is open to group or others: `chmod 700` the directory, `chmod 600` the
-file.
+The runner stops (exit 2) when the directory, a secret file or a persona's
+credentials file is open to group or others. Its message names each such
+path, its mode, and the `chmod` command(s) that fix them all (`chmod 700` for
+a directory, `chmod 600` for a file): run them, then rerun. The runner never
+changes a mode itself.
+
+A VM reboot can loosen these modes: at boot the pod's `fsGroup` re-applies
+its group to the files. After a reboot, check the modes with the `stat`
+above before a run.
 
 ## 1. The files
 
@@ -60,14 +68,17 @@ built-in `printf`, so the value is never on a command line, in the history or
 in a process list. `umask 077` makes each new file mode 600; a file that
 already existed keeps its old mode.
 
-The refresh token. Without it, every run needs a configuration token less
-than 12 hours old, since each run checks the apps through the manifest API.
-With it, the runner rotates the pair when the token has expired and rewrites
-both files. Write the refresh token issued with the token in
-`slack_config_token` (the same **Generate Token** click shows both). If you no
-longer have it, generate a new pair at <https://api.slack.com/apps> under
-**Your App Configuration Tokens**, for the workspace `cscb-ci-test`, and write
-both:
+The configuration token and its refresh token. A run uses the configuration
+token to check the apps against `slack-app-manifest.yml` through the manifest
+API, and to update a drifted app or create a missing one. Once `apps.json`
+records all four apps, the token is optional: without a usable one, a run
+logs a `WARNING` and reuses the recorded apps unchecked. A configuration
+token lasts 12 hours. With the refresh token, the runner rotates the pair
+when the token has expired and saves both files (mode 600). Write the
+refresh token issued with the token in `slack_config_token` (the same
+**Generate Token** click shows both). If you no longer have it, generate a
+new pair at <https://api.slack.com/apps> under **Your App Configuration
+Tokens**, for the workspace `cscb-ci-test`, and write both:
 
 ```sh
 ( umask 077; IFS= read -rs -p 'App configuration token (not shown): ' v \
@@ -78,6 +89,19 @@ both:
 
 When a run exits 2 naming `slack_config_token`, write a fresh pair the same
 way.
+
+To check that the pair rotates, rotate it once:
+
+```sh
+bun ci-live/run.ts config-token --rotate
+```
+
+It prints
+`config token: rotated with tooling.tokens.rotate; both token files rewritten (mode 600)`.
+It exits 2 when there is no refresh token or Slack refuses it: write a fresh
+pair. It takes the run lock (see step 6), so it doesn't run beside a run.
+Each rotation replaces both tokens, so the `hgx` copies go stale (see
+[A new VM](#a-new-vm)).
 
 To replace `live.json` (the workspace and the test human's email):
 
@@ -253,20 +277,37 @@ foreground calls of at most 9 minutes each, never with a background timer.
 
 While a run is going:
 
-- **One at a time.** A run, `--provision-only` and `login` share one lock,
-  `run.lock` in `~/.config/cscb-test/`. A second one exits 2 and names the
-  PID that holds the lock.
+- **One at a time.** A run, `--provision-only`, `login`,
+  `config-token --rotate` and `apps` share one lock, `run.lock` in
+  `~/.config/cscb-test/`. A second one exits 2 and names the PID that holds
+  the lock. A lock left by a command that died (its PID not running, or
+  reused after a VM reboot) is removed with a
+  `WARNING: removed the stale run lock …` line, and the new command goes on.
 - **Stopping it.** Ctrl-C, closing its terminal or killing its tmux session
   stops the run cleanly: it removes the test container, writes the results so
   far with the verdict `FAIL: runner: interrupted by <signal>`, releases the
-  lock and exits 1.
+  lock and exits 1. The Notes of the results row say what the cleanup
+  actually did, such as a container it could not remove.
+- **Memory.** The container is capped at 8 GiB with no swap and 2048
+  processes, and the run keeps one Chrome with a page per account, idle on
+  `about:blank` between flows. Every 30 s a `watchdog:` line in `run.log`
+  gives the host's working set, the container's memory, Chrome's (PSS) and
+  the runner's (RSS). When the host's working set passes 40 GiB or Chrome
+  passes 4 GiB, the watchdog stops the run the way Ctrl-C does, closing
+  Chrome at once, with the verdict
+  `FAIL: memory watchdog: <what, its value and the limit>`. The peaks are at
+  the end of `results.md`. `docker/README.md` under "Memory bounds" has the
+  details.
 - **Leave the production install alone.** The HOST check fails on any change
   to the host's CSCB (its config, its tmux sessions, its agent-director rows,
   its port 3100), including one you make.
 
 A provisioning stage that meets a transient Slack failure (a timeout, a 5xx,
 a rate limit) stops with "transient: rerun later" and replaces no working
-token: rerun later. In a full run, a failed stage (provisioning, the browser
+token: rerun later. An app create that got no answer stops the run (exit 2)
+too: rerun, and the run finds the app it may have made (see
+[Stray and unfinished apps](#stray-and-unfinished-apps)). In a full run, a
+failed stage (provisioning, the browser
 session, the image build, the container start) is a FAIL row of its own, and
 the run still writes its results and runs the HOST check and the closing
 secrecy scan.
@@ -368,7 +409,9 @@ On the new VM:
    no app and stops (exit 2): the four apps already exist in the workspace,
    and creating them again would make four more with the same names. Pass
    `--create-apps` only when the apps are really gone (see
-   [Retiring the test apps](#retiring-the-test-apps)).
+   [Retiring the test apps](#retiring-the-test-apps)). A copy that doesn't
+   parse, or isn't a JSON object, stops every command that reads it (exit
+   2): copy it again.
 4. Copy `~/.config/cscb-test/mailbox.json` the same way, mode 600 (it holds
    the mailbox's password). The Gmail filter forwards to that mailbox
    whichever VM reads it.
@@ -382,6 +425,71 @@ Each rotation of the configuration token also replaces the refresh token, so
 the `hgx` copies are stale after the first one. After writing a fresh pair,
 replace both copies (`hgx secrets delete --key …`, then their `add` lines
 above again).
+
+## Stray and unfinished apps
+
+A stray is an app named exactly "CSCB Test A" to "CSCB Test D" whose ID
+`apps.json` doesn't record: left by a create whose answer was lost, or by an
+older `apps.json`. See every app the test human has at
+<https://api.slack.com/apps>:
+
+```sh
+bun ci-live/run.ts apps --list
+```
+
+It prints one line per app: its ID, its name, and `in apps.json (persona A)`,
+`NOT in apps.json: a stray test app` or `not in apps.json`, with whether its
+row shows the test workspace. It also names any unfinished create in
+`apps.json` (below), and ends with the number of strays. To delete the
+strays:
+
+```sh
+bun ci-live/run.ts apps --delete-strays
+```
+
+It deletes an app (with `apps.manifest.delete` and the configuration token)
+only when all of these hold:
+
+- its name is exactly "CSCB Test A", "CSCB Test B", "CSCB Test C" or "CSCB
+  Test D";
+- `apps.json`, read again just before the delete, doesn't record its ID;
+- one cell of its row on the apps list, less the app's name, is exactly the
+  test workspace's name;
+- the configuration token exports it under that name, which proves it is the
+  test workspace's.
+
+It keeps every app `apps.json` records, every app of another name, and any
+stray that fails a condition or whose delete Slack refuses, and prints each
+kept stray with the reason. A stray whose export fails, gets no answer or
+gives no manifest name is kept too: nothing proves it is the test
+workspace's. It ends with
+`apps: deleted <n> stray test app(s), kept <m>`, and exits 1 when it kept a
+stray. Both commands take the run lock and read the page in headless Chrome
+with the test human's session.
+
+`apps --delete-strays` deletes nothing, and stops (exit 2) before it starts
+Chrome, when `apps.json` is missing or records no app ID: every test app,
+the ones another VM records included, would then look like a stray. Copy
+`apps.json` from the VM that made the apps first. If `apps.json`, read again
+before a delete, no longer records an app ID, it stops there (exit 2).
+
+An unfinished create: before each app create, a run records the intent
+(`pending_create`, with the time) in the persona's `apps.json` entry, and
+replaces it with the app ID the moment Slack returns it. If a run stops
+between the two, or the create got no answer, the next run looks on the
+apps list for an app of that exact name that `apps.json` doesn't record and
+that the configuration token exports under that name:
+
+| Candidates | The run |
+|---|---|
+| One | Adopts it: records its ID in `apps.json` and checks it like any recorded app |
+| None | Creates the app: the create made none |
+| More than one | Stops (exit 2), naming their IDs. Run `apps --delete-strays`, then rerun: it creates the app anew |
+
+An unrecorded app of that name whose export proves nothing (a Slack error
+other than "no such app", no answer, no manifest name) may be the one the
+create made. Such an app, or an apps list the run can't read, stops
+provisioning: `apps.json` keeps the intent and nothing is created. Rerun.
 
 ## Retiring the test apps
 

@@ -10,11 +10,28 @@
  * The rules under test:
  * - a token travels only in the `Authorization` header, never in a URL,
  *   body, error or log line; errors carry a method and a safe code only;
- * - each app ID is written to apps.json the moment `apps.manifest.create`
- *   returns it, and a rerun creates, installs and generates nothing again;
- * - a create that got no answer is never retried (not runnable: look for a
- *   duplicate first); a real run with no apps.json creates no app unless
- *   `--create-apps`;
+ * - a pending-create intent is written to apps.json before
+ *   `apps.manifest.create`, and the app ID (clearing it) the moment the call
+ *   returns one; a rerun creates, installs and generates nothing again;
+ * - a create that got no answer is never retried (not runnable), and its
+ *   intent is kept: the next run adopts the one unrecorded app of that exact
+ *   name the configuration token exports, creates it when there is none, and
+ *   stops (not runnable) when there are several; a candidate whose export
+ *   proves nothing (another Slack error, no answer) or an apps list that
+ *   can't be read stops the stage with the intent kept and nothing adopted
+ *   or created; a refused create clears it;
+ *   a real run with no apps.json creates no app unless `--create-apps`;
+ * - the configuration token is rotated once when expired, the new pair saved
+ *   (refresh token first) before the retry; a missing or refused token is a
+ *   `ConfigTokenUnavailableError`, which the apps stage survives with a
+ *   warning only when apps.json records all four apps;
+ * - `apps --delete-strays` runs only on an apps.json that is there, parses
+ *   and records an app ID (read again before each delete), and deletes only
+ *   an unrecorded app of an exact test app name whose row has a cell that is
+ *   exactly the test workspace's name, exported under that name by the
+ *   configuration token; an app whose export proves nothing is kept; the
+ *   apps list page's links (`listedAppsFrom`) and the workspace name
+ *   (`testWorkspaceName`) are read strictly;
  * - the create answer's `credentials` block is never stored or logged;
  * - a drifted manifest is updated and the app marked for re-install;
  * - a bot or app-level token is replaced only when Slack refuses it; a
@@ -37,18 +54,28 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { StubWorkspace } from '../ci-live/dry-run/stub-state.ts'
-import { AppsStateFile, emptyAppsState, type AppsState } from '../ci-live/lib/apps-state.ts'
-import type { BrowserDriver, HumanApi } from '../ci-live/lib/browser-types.ts'
+import { AppsStateFile, parseAppsState, type AppsState } from '../ci-live/lib/apps-state.ts'
+import { FlowError, type BrowserDriver, type HumanApi, type ListedApp } from '../ci-live/lib/browser-types.ts'
 import { manifestDrift, parseManifestYaml, personaManifest, type JsonObject } from '../ci-live/lib/manifest.ts'
 import { hostCredentialsFile, livePathsIn } from '../ci-live/lib/paths.ts'
 import { PERSONA_LETTERS, type PersonaLetter } from '../ci-live/lib/personas.ts'
 import { Redactor } from '../ci-live/lib/redact.ts'
 import { isInside, NotRunnableError, SecretStore } from '../ci-live/lib/secrets.ts'
 import { formBody, safeErrorCode, SlackApi, SlackTransportError, type FetchLike, type SlackResponse } from '../ci-live/lib/slack-api.ts'
-import { runAppsStage, AppsStageError, createUnansweredMessage, type AppsStageDeps } from '../ci-live/provision/apps.ts'
+import {
+  appsStateForStrayDeletion,
+  classifyListedApps,
+  deleteStrayApps,
+  describeListedApp,
+  listedAppsFrom,
+  rowShowsWorkspace,
+  testWorkspaceName,
+  type AppLink,
+} from '../ci-live/provision/app-listing.ts'
+import { ambiguousPendingMessage, runAppsStage, AppsStageError, createUnansweredMessage, unverifiedPendingMessage, type AppsStageDeps } from '../ci-live/provision/apps.ts'
 import { runAppTokenStage } from '../ci-live/provision/app-tokens.ts'
 import { BotApi, isTokenRefusal, type AppTokenCheck, type BotCheck } from '../ci-live/provision/bot-api.ts'
-import { ConfigTokenSource } from '../ci-live/provision/config-token.ts'
+import { ConfigTokenSource, ConfigTokenUnavailableError, ROTATED_LINE } from '../ci-live/provision/config-token.ts'
 import { allValid, missingAppsJsonMessage, runProvisioning, stagesToRun, validateCredentials, type ProvisionDeps } from '../ci-live/provision/index.ts'
 import { ProvisionError, runInstallStage, TransientProvisionError } from '../ci-live/provision/install.ts'
 import { memSecureFs } from './test-helpers/ci-live.ts'
@@ -187,10 +214,33 @@ describe('SlackApi.call', () => {
 // The configuration token
 // ---------------------------------------------------------------------------
 
+const REFRESH = fakeToken(BOT_TOKEN_PREFIX.replace('b', 'e'), 'refresh')
+
+/**
+ * A configuration token source over a real-mode SecretStore on memSecureFs
+ * (config dir /cfg), with the token files `seed` holds, a scripted Slack and
+ * a log.
+ */
+function stored(seed: { token?: string; refresh?: string }, ...script: Scripted[]) {
+  const mem = memSecureFs()
+  mem.dirs.set('/cfg', 0o700)
+  const store = new SecretStore({ fs: mem.fs, paths: livePathsIn('/cfg'), env: {}, redactor: new Redactor(), dryRun: false, realConfigDir: '/cfg' })
+  if (seed.token !== undefined) mem.seed(store.paths.configTokenFile, `${seed.token}\n`)
+  if (seed.refresh !== undefined) mem.seed(store.paths.refreshTokenFile, `${seed.refresh}\n`)
+  const f = scriptedFetch(...script)
+  const lines: string[] = []
+  const tokens = new ConfigTokenSource(
+    api(f.fetch),
+    { read: () => store.readConfigTokens(), write: (t) => store.writeConfigTokens(t), tokenPath: store.paths.configTokenFile, refreshTokenPath: store.paths.refreshTokenFile },
+    { info: (m) => lines.push(m) },
+  )
+  const saved = () => [mem.files.get(store.paths.configTokenFile), mem.files.get(store.paths.refreshTokenFile)]
+  return { mem, store, tokens, calls: f.calls, lines, saved }
+}
+
 describe('ConfigTokenSource', () => {
   const TOKEN_PATH = '/cfg/slack_config_token'
   const ROTATED = fakeToken(`${BOT_TOKEN_PREFIX.slice(0, 3)}e.`, 'rotated')
-  const REFRESH = fakeToken(BOT_TOKEN_PREFIX.replace('b', 'e'), 'refresh')
   const NEXT_REFRESH = fakeToken(BOT_TOKEN_PREFIX.replace('b', 'e'), 'next')
 
   function source(refreshToken: string | null, ...script: Scripted[]) {
@@ -224,6 +274,7 @@ describe('ConfigTokenSource', () => {
     expect(s.written).toEqual([{ token: ROTATED, refreshToken: NEXT_REFRESH }])
   })
 
+  // ConfigTokenUnavailableError: not runnable (exit 2), unless the apps stage can do without the token.
   test.each([
     ['an expired token with no refresh token', null, [json({ ok: false, error: 'token_expired' })], 'token_expired', 1],
     ['a refused rotation', REFRESH, [json({ ok: false, error: 'token_expired' }), json({ ok: false, error: 'invalid_refresh_token' })], 'token_expired', 2],
@@ -238,7 +289,7 @@ describe('ConfigTokenSource', () => {
   ])('%s is not runnable, naming the file to refresh and never a value', async (_what, refresh, script, code, calls) => {
     const s = source(refresh, ...script)
     const err = await rejection(s.tokens.call('apps.manifest.export', { app_id: 'A0APP00001' }))
-    expect(err).toBeInstanceOf(NotRunnableError)
+    expect([err instanceof ConfigTokenUnavailableError, err instanceof NotRunnableError]).toEqual([true, true])
     expect(err.message).toBe(`the Slack app configuration token was refused (${code}): write a fresh one to ${TOKEN_PATH} (mode 600)`)
     expect(s.calls.length).toBe(calls)
     assertNoLeak(err)
@@ -248,6 +299,84 @@ describe('ConfigTokenSource', () => {
     const s = source(REFRESH, json({ ok: false, error: 'invalid_manifest' }))
     expect(await s.tokens.call('apps.manifest.create', { manifest: '{}' })).toEqual({ ok: false, error: 'invalid_manifest' })
     expect(s.written).toEqual([])
+  })
+
+  describe('over the secret store (both token files, mode 600)', () => {
+    const ROTATE_OK = json({ ok: true, token: ROTATED, refresh_token: NEXT_REFRESH })
+
+    test.each([
+      ['missing', undefined, 'the Slack app configuration token is missing: write it to /cfg/slack_config_token (mode 600)'],
+      ['empty', '\n', 'the Slack app configuration token in /cfg/slack_config_token is empty'],
+    ])('a %s token file is a ConfigTokenUnavailableError naming the file, and nothing reaches Slack', async (_what, token, message) => {
+      const s = stored({ token }, json({ ok: true }))
+      const err = await rejection(s.tokens.call('apps.manifest.export', { app_id: 'A0APP00001' }))
+      expect([err instanceof ConfigTokenUnavailableError, err.message, s.calls]).toEqual([true, message, []])
+    })
+
+    test('a rotation saves both new tokens, the refresh token first, before the retried call, and logs only that it rotated', async () => {
+      let atRetry: unknown
+      const s = stored({ token: CONFIG_TOKEN, refresh: REFRESH }, json({ ok: false, error: 'token_expired' }), ROTATE_OK, () => {
+        atRetry = [s.saved(), s.mem.ops.filter((op) => op.startsWith('rename ')).map((op) => op.split(' ')[2])]
+        return json({ ok: true, manifest: {} })
+      })
+      expect((await s.tokens.call('apps.manifest.export', { app_id: 'A0APP00001' })).ok).toBe(true)
+      expect(atRetry).toEqual([
+        [
+          { data: `${ROTATED}\n`, mode: 0o600 },
+          { data: `${NEXT_REFRESH}\n`, mode: 0o600 },
+        ],
+        [s.store.paths.refreshTokenFile, s.store.paths.configTokenFile],
+      ])
+      expect([s.calls[2]!.headers.Authorization, s.lines]).toEqual([`Bearer ${ROTATED}`, [ROTATED_LINE]])
+      assertNoLeak(s.lines)
+    })
+
+    test('a new pair that cannot be saved is not runnable (the old refresh token is spent: generate a new pair), and nothing is retried', async () => {
+      const s = stored({ token: CONFIG_TOKEN, refresh: REFRESH }, json({ ok: false, error: 'token_expired' }), ROTATE_OK)
+      s.mem.failNext('rename')
+      const err = await rejection(s.tokens.call('apps.manifest.export', { app_id: 'A0APP00001' }))
+      expect([err instanceof NotRunnableError, err instanceof ConfigTokenUnavailableError]).toEqual([true, false])
+      expect(err.message).toStartWith('tooling.tokens.rotate issued a new token pair, but saving it failed (')
+      expect(err.message).toEndWith(
+        'the old refresh token is spent, so generate a new pair for the test workspace at https://api.slack.com/apps (Your App Configuration Tokens) and write both files (mode 600)',
+      )
+      expect([s.calls.map((c) => c.method), s.lines]).toEqual([['apps.manifest.export', 'tooling.tokens.rotate'], []])
+      assertNoLeak({ err, lines: s.lines })
+    })
+
+    test('a rotation that gets no answer leaves the token refused (ConfigTokenUnavailableError), logged by its kind only', async () => {
+      const s = stored({ token: CONFIG_TOKEN, refresh: REFRESH }, json({ ok: false, error: 'token_expired' }), new TypeError(`down ${NEXT_REFRESH}`))
+      const err = await rejection(s.tokens.call('apps.manifest.export', { app_id: 'A0APP00001' }))
+      expect([err instanceof ConfigTokenUnavailableError, err.message]).toEqual([true, 'the Slack app configuration token was refused (token_expired): write a fresh one to /cfg/slack_config_token (mode 600)'])
+      expect([s.lines, s.saved()]).toEqual([['config token: tooling.tokens.rotate failed: no answer (network)'], [{ data: `${CONFIG_TOKEN}\n`, mode: 0o600 }, { data: `${REFRESH}\n`, mode: 0o600 }]])
+      assertNoLeak({ err, lines: s.lines })
+    })
+
+    // `config-token --rotate`.
+    test('rotateNow rotates once, whatever the token state, and saves both files', async () => {
+      const s = stored({ token: CONFIG_TOKEN, refresh: REFRESH }, ROTATE_OK)
+      await s.tokens.rotateNow()
+      expect(s.calls.map((c) => `${c.method} ${c.headers.Authorization ?? '(no bearer)'}`)).toEqual(['tooling.tokens.rotate (no bearer)'])
+      expect(s.saved()).toEqual([{ data: `${ROTATED}\n`, mode: 0o600 }, { data: `${NEXT_REFRESH}\n`, mode: 0o600 }])
+      expect(s.lines).toEqual([ROTATED_LINE])
+    })
+
+    test.each([
+      ['with no refresh token file', undefined, [json({ ok: true })], 0, 'there is no refresh token to rotate with: write the one issued with the configuration token to /cfg/slack_config_refresh_token (mode 600)'],
+      [
+        'with a refused refresh token',
+        REFRESH,
+        [json({ ok: false, error: 'invalid_refresh_token' })],
+        1,
+        'tooling.tokens.rotate refused the refresh token (invalid_refresh_token): generate a new pair for the test workspace at https://api.slack.com/apps (Your App Configuration Tokens) and write both files (mode 600)',
+      ],
+    ])('rotateNow %s is not runnable, naming the fix, and writes nothing', async (_what, refresh, script, calls, message) => {
+      const s = stored({ token: CONFIG_TOKEN, refresh }, ...script)
+      const err = await rejection(s.tokens.rotateNow())
+      expect([err instanceof NotRunnableError, err.message, s.calls.length]).toEqual([true, message, calls])
+      expect(s.mem.ops.filter((op) => op.startsWith('rename '))).toEqual([])
+      assertNoLeak(err)
+    })
   })
 })
 
@@ -369,6 +498,9 @@ describe('persona manifests', () => {
 // ---------------------------------------------------------------------------
 
 describe('runAppsStage', () => {
+  /** The time a pending-create intent records (the harness's `now`). */
+  const STARTED = '2026-09-26T12:00:00.000Z'
+
   function appsHarness(answer: (method: string, params: Record<string, unknown>) => SlackResponse) {
     const mem = memSecureFs()
     const appsFile = new AppsStateFile(mem.fs, '/cfg/apps.json')
@@ -383,9 +515,24 @@ describe('runAppsStage', () => {
       manifestFor: (l: PersonaLetter) => personaManifest(REPO_MANIFEST, l),
       letters: PERSONA_LETTERS as readonly PersonaLetter[],
       log: { info: (m: string) => lines.push(m), detail: (m: string) => lines.push(m) },
+      now: () => Date.parse(STARTED),
     }
     return { mem, appsFile, calls, lines, deps }
   }
+
+  /** A harness whose apps.json starts as `from`'s ends (a rerun on the same config dir). */
+  function rerunOf(from: { mem: ReturnType<typeof memSecureFs> }, answer: (method: string, params: Record<string, unknown>) => SlackResponse) {
+    const h = appsHarness(answer)
+    h.mem.files.set('/cfg/apps.json', from.mem.files.get('/cfg/apps.json')!)
+    h.mem.dirs.set('/cfg', 0o700)
+    return h
+  }
+
+  /** What apps.json records per persona: its app ID, or its pending create's start time. */
+  const recorded = (state: AppsState) =>
+    Object.entries(state.personas)
+      .map(([l, p]) => `${l}:${p!.app_id ?? `pending ${p!.pending_create?.started_at}`}`)
+      .join(' ')
 
   /** A manifest API: creates hand out A0APPNEW01…, exports answer from `exported` (or app_not_found). */
   function manifestApi(exported: Record<string, JsonObject> = {}, overrides: Record<string, SlackResponse> = {}, created = 0) {
@@ -417,36 +564,40 @@ describe('runAppsStage', () => {
       ['c', 'created', 'A0APPNEW03'],
       ['d', 'created', 'A0APPNEW04'],
     ])
-    // Each create saw every earlier app already in apps.json.
-    expect(h.calls.map((c) => Object.keys(c.recorded.personas).join(''))).toEqual(['', 'a', 'ab', 'abc'])
+    // Each create saw every earlier app already in apps.json, and its own persona's pending-create intent written first.
+    expect(h.calls.map((c) => recorded(c.recorded))).toEqual([
+      `a:pending ${STARTED}`,
+      `a:A0APPNEW01 b:pending ${STARTED}`,
+      `a:A0APPNEW01 b:A0APPNEW02 c:pending ${STARTED}`,
+      `a:A0APPNEW01 b:A0APPNEW02 c:A0APPNEW03 d:pending ${STARTED}`,
+    ])
+    // The write that records an app ID clears its intent.
+    expect(recorded(h.appsFile.load())).toBe('a:A0APPNEW01 b:A0APPNEW02 c:A0APPNEW03 d:A0APPNEW04')
     expect(h.calls.map((c) => c.params.manifest)).toEqual(PERSONA_LETTERS.map((l) => JSON.stringify(personaManifest(REPO_MANIFEST, l))))
     assertNoLeak({ lines: h.lines, outcomes: first, apps: h.mem.files.get('/cfg/apps.json')!.data })
 
     const exported = Object.fromEntries(PERSONA_LETTERS.map((l, i) => [`A0APPNEW0${i + 1}`, personaManifest(REPO_MANIFEST, l)]))
-    const rerun = appsHarness(manifestApi(exported))
-    rerun.mem.files.set('/cfg/apps.json', h.mem.files.get('/cfg/apps.json')!)
-    rerun.mem.dirs.set('/cfg', 0o700)
+    const rerun = rerunOf(h, manifestApi(exported))
     const second = await runAppsStage(rerun.deps)
     expect(second.map((o) => o.action)).toEqual(['reused', 'reused', 'reused', 'reused'])
     expect(rerun.calls.map((c) => c.method)).toEqual(Array(4).fill('apps.manifest.export'))
   })
 
-  test('an app created before a crash is kept: the rerun creates only the rest', async () => {
+  test("a run stopped mid-create keeps the apps created so far and the unfinished create's intent; the rerun finds no such app on the apps list, so it clears the intent and creates only the rest", async () => {
     let creates = 0
     const crashing = appsHarness((method, params) => {
       if (method === 'apps.manifest.create' && ++creates === 2) throw new Error('process killed')
       return manifestApi()(method, params)
     })
     await expect(runAppsStage(crashing.deps)).rejects.toThrow('process killed')
-    expect(crashing.appsFile.load().personas).toEqual({ a: { app_id: 'A0APPNEW01' } })
+    expect(recorded(crashing.appsFile.load())).toBe(`a:A0APPNEW01 b:pending ${STARTED}`)
 
-    const rerun = appsHarness(manifestApi({ A0APPNEW01: personaManifest(REPO_MANIFEST, 'a') }, {}, 1))
-    rerun.mem.files.set('/cfg/apps.json', crashing.mem.files.get('/cfg/apps.json')!)
-    rerun.mem.dirs.set('/cfg', 0o700)
+    const rerun = rerunOf(crashing, manifestApi({ A0APPNEW01: personaManifest(REPO_MANIFEST, 'a') }, {}, 1))
+    rerun.deps.listApps = async () => [{ id: 'A0APPNEW01', name: 'CSCB Test A', rowText: 'CSCB Test A CSCB CI Test' }]
     const outcomes = await runAppsStage(rerun.deps)
     expect(outcomes.map((o) => o.action)).toEqual(['reused', 'created', 'created', 'created'])
     expect(rerun.calls.filter((c) => c.method === 'apps.manifest.create').length).toBe(3)
-    expect(PERSONA_LETTERS.map((l) => rerun.appsFile.load().personas[l]?.app_id)).toEqual(['A0APPNEW01', 'A0APPNEW02', 'A0APPNEW03', 'A0APPNEW04'])
+    expect(recorded(rerun.appsFile.load())).toBe('a:A0APPNEW01 b:A0APPNEW02 c:A0APPNEW03 d:A0APPNEW04')
   })
 
   test('a drifted app is updated with the wanted manifest and marked for re-install', async () => {
@@ -477,11 +628,11 @@ describe('runAppsStage', () => {
     ['an unsafe error code', { a: 'A0APPOLD01' }, { 'apps.manifest.export': { ok: false, error: `x ${APP_TOKEN}` } }, 'apps.manifest.export for CSCB Test A (A0APPOLD01) failed: unknown_error'],
     ['an export with no manifest', { a: 'A0APPOLD01' }, { 'apps.manifest.export': { ok: true } }, 'apps.manifest.export for CSCB Test A (A0APPOLD01) returned no manifest'],
     ['a failed update', { a: 'A0APPOLD01' }, { 'apps.manifest.export': { ok: true, manifest: { display_information: { name: 'x' } } }, 'apps.manifest.update': { ok: false, error: 'invalid_manifest' } }, 'apps.manifest.update for CSCB Test A (A0APPOLD01) failed: invalid_manifest'],
+    // Slack refused the create, so it made nothing: its intent is cleared with it.
     ['a failed create', {}, { 'apps.manifest.create': { ok: false, error: 'invalid_manifest' } }, 'apps.manifest.create for CSCB Test A failed: invalid_manifest'],
-    ['a create with no app ID', {}, { 'apps.manifest.create': { ok: true, app_id: 'nope' } }, 'apps.manifest.create for CSCB Test A returned no app ID'],
-  ] as const)('stops on %s with an AppsStageError naming the method and a safe code', async (_what, recorded, overrides, message) => {
+  ] as const)('stops on %s with an AppsStageError naming the method and a safe code, apps.json as it was', async (_what, saved, overrides, message) => {
     const h = appsHarness(manifestApi({}, overrides as Record<string, SlackResponse>))
-    if ('a' in recorded) h.appsFile.save({ version: 1, personas: { a: { app_id: recorded.a } }, channels: {} })
+    if ('a' in saved) h.appsFile.save({ version: 1, personas: { a: { app_id: saved.a } }, channels: {} })
     const before = h.appsFile.load()
     const err = await rejection(runAppsStage(h.deps))
     expect(err).toBeInstanceOf(AppsStageError)
@@ -490,30 +641,136 @@ describe('runAppsStage', () => {
     assertNoLeak({ err, lines: h.lines })
   })
 
-  // A create that got no answer may have created the app: never retried; the operator looks for a duplicate first.
+  // A create that got no answer may have created the app: never retried, and its intent kept for the next run's search of the apps list.
+  // A refused one (a 4xx) created nothing: its intent is cleared.
+  const KEPT = `a:pending ${STARTED}`
   test.each([
-    ['no answer (network)', new SlackTransportError('apps.manifest.create', 'network'), NotRunnableError, createUnansweredMessage('CSCB Test A', 'network')],
-    ['a timeout', new SlackTransportError('apps.manifest.create', 'timeout'), NotRunnableError, createUnansweredMessage('CSCB Test A', 'timeout')],
-    ['HTTP 502', new SlackTransportError('apps.manifest.create', 'http', 502), NotRunnableError, createUnansweredMessage('CSCB Test A', 'http 502')],
-    ['HTTP 429 left after the retries', new SlackTransportError('apps.manifest.create', 'http', 429), AppsStageError, 'apps.manifest.create for CSCB Test A was refused (HTTP 429); no app was created: rerun later'],
-    ['HTTP 400', new SlackTransportError('apps.manifest.create', 'http', 400), AppsStageError, 'apps.manifest.create for CSCB Test A was refused (HTTP 400); no app was created: rerun later'],
-  ] as const)('a create that fails with %s is tried once, and stops the stage', async (_what, failure, type, message) => {
+    ['no answer (network)', new SlackTransportError('apps.manifest.create', 'network'), NotRunnableError, createUnansweredMessage('CSCB Test A', 'network'), KEPT],
+    ['a timeout', new SlackTransportError('apps.manifest.create', 'timeout'), NotRunnableError, createUnansweredMessage('CSCB Test A', 'timeout'), KEPT],
+    ['HTTP 502', new SlackTransportError('apps.manifest.create', 'http', 502), NotRunnableError, createUnansweredMessage('CSCB Test A', 'http 502'), KEPT],
+    ['HTTP 429 left after the retries', new SlackTransportError('apps.manifest.create', 'http', 429), AppsStageError, 'apps.manifest.create for CSCB Test A was refused (HTTP 429); no app was created: rerun later', ''],
+    ['HTTP 400', new SlackTransportError('apps.manifest.create', 'http', 400), AppsStageError, 'apps.manifest.create for CSCB Test A was refused (HTTP 400); no app was created: rerun later', ''],
+    ['the configuration token refused', new ConfigTokenUnavailableError('the Slack app configuration token was refused (invalid_auth)'), ConfigTokenUnavailableError, 'the Slack app configuration token was refused (invalid_auth)', ''],
+  ] as const)('a create that fails with %s is tried once, and stops the stage', async (_what, failure, type, message, after) => {
     const h = appsHarness((method, params) => {
       if (method === 'apps.manifest.create') throw failure
       return manifestApi()(method, params)
     })
     const err = await rejection(runAppsStage(h.deps))
     expect([err instanceof type, err.message]).toEqual([true, message])
-    expect(h.calls.map((c) => c.method)).toEqual(['apps.manifest.create'])
-    expect([h.appsFile.exists(), h.appsFile.load()]).toEqual([false, emptyAppsState()])
+    expect(h.calls.map((c) => [c.method, recorded(c.recorded)])).toEqual([['apps.manifest.create', KEPT]])
+    expect(recorded(h.appsFile.load())).toBe(after)
     assertNoLeak({ err, lines: h.lines })
   })
 
-  test('the unanswered-create message points at the apps list to check for a duplicate', () => {
+  test('a create answered with no app ID stops the stage and keeps the intent, so the next run looks for the app', async () => {
+    const h = appsHarness(manifestApi({}, { 'apps.manifest.create': { ok: true, app_id: 'nope' } }))
+    const err = await rejection(runAppsStage(h.deps))
+    expect([err instanceof AppsStageError, err.message]).toEqual([
+      true,
+      'apps.manifest.create for CSCB Test A returned no app ID; apps.json keeps the unfinished create, so the next run looks for the app in the apps list',
+    ])
+    expect(recorded(h.appsFile.load())).toBe(KEPT)
+  })
+
+  test('the unanswered-create message says apps.json keeps the unfinished create for the next run, and how to see the apps list first', () => {
     expect(createUnansweredMessage('CSCB Test B', 'timeout')).toBe(
       'apps.manifest.create for CSCB Test B got no answer (timeout), so Slack may have created the app anyway. ' +
-        'Before rerunning, check your apps at https://api.slack.com/apps for a "CSCB Test B" not in apps.json: delete it, or put its app ID in apps.json',
+        'apps.json keeps the unfinished create: the next run looks for an unrecorded "CSCB Test B" in the test workspace\'s apps list ' +
+        'and adopts it (one), creates it (none) or stops (more than one). Rerun, or see the list first with bun ci-live/run.ts apps --list',
     )
+  })
+
+  describe('an unfinished create (a pending-create intent and no app ID in apps.json)', () => {
+    const EARLIER = '2026-09-25T08:00:00.000Z'
+    const C = personaManifest(REPO_MANIFEST, 'c')
+    const row = (id: string, name: string, workspace = 'CSCB CI Test'): ListedApp => ({ id, name, rowText: `${name} ${workspace}` })
+    // Never candidates: another workspace's app of that name (the configuration token can't export it), a near name, and one renamed by hand since.
+    const decoys = [row('A0FOREIGN1', 'CSCB Test C', 'Another Workspace'), row('A0COPY0001', 'CSCB Test C (copy)'), row('A0RENAMED1', 'CSCB Test C')]
+
+    /** `exportFault` answers (or throws for) an app's export in place of the manifest API when it returns an answer. */
+    function pendingHarness(listing: ListedApp[] | undefined, exportFault: (appId: string) => SlackResponse | undefined = () => undefined) {
+      const exported: Record<string, JsonObject> = { A0MADE0001: C, A0MADE0002: C, A0COPY0001: C, A0RENAMED1: personaManifest(REPO_MANIFEST, 'b') }
+      const answer = manifestApi(exported, {}, 0)
+      const h = appsHarness((method, params) => (method === 'apps.manifest.export' && exportFault(String(params.app_id))) || answer(method, params))
+      h.appsFile.save({ version: 1, personas: { c: { pending_create: { started_at: EARLIER } } }, channels: {} })
+      h.deps.letters = ['c']
+      if (listing) h.deps.listApps = async () => listing
+      return h
+    }
+    const creates = (h: { calls: { method: string }[] }) => h.calls.filter((c) => c.method === 'apps.manifest.create').length
+
+    test('one unrecorded app of its exact name that the configuration token manages is adopted: recorded with the intent cleared, then checked like a recorded app; nothing is created', async () => {
+      const h = pendingHarness([...decoys, row('A0MADE0001', 'CSCB Test C')])
+      expect(await runAppsStage(h.deps)).toEqual([{ letter: 'c', appId: 'A0MADE0001', action: 'adopted', drift: [] }])
+      expect([recorded(h.appsFile.load()), creates(h)]).toEqual(['c:A0MADE0001', 0])
+      expect(h.calls.filter((c) => c.params.app_id === 'A0MADE0001').map((c) => c.method)).toEqual(['apps.manifest.export', 'apps.manifest.export'])
+    })
+
+    test('none: the intent is cleared and the app created (with a fresh intent first)', async () => {
+      const h = pendingHarness(decoys)
+      expect((await runAppsStage(h.deps)).map((o) => [o.action, o.appId])).toEqual([['created', 'A0APPNEW01']])
+      const create = h.calls.find((c) => c.method === 'apps.manifest.create')!
+      expect([recorded(create.recorded), recorded(h.appsFile.load()), creates(h)]).toEqual([`c:pending ${STARTED}`, 'c:A0APPNEW01', 1])
+    })
+
+    test('more than one: not runnable, naming them and pointing at apps --delete-strays; nothing is created and the intent kept', async () => {
+      const h = pendingHarness([row('A0MADE0001', 'CSCB Test C'), ...decoys, row('A0MADE0002', 'CSCB Test C')])
+      const err = await rejection(runAppsStage(h.deps))
+      expect([err instanceof NotRunnableError, err.message]).toEqual([true, ambiguousPendingMessage('CSCB Test C', ['A0MADE0001', 'A0MADE0002'])])
+      expect(err.message).toContain('delete the strays with bun ci-live/run.ts apps --delete-strays, then rerun')
+      expect([recorded(h.appsFile.load()), creates(h)]).toEqual([`c:pending ${EARLIER}`, 0])
+    })
+
+    // A candidate the configuration token could not check may be the app the create made: neither adopt another nor create.
+    const INTERNAL_ERROR = 'apps.manifest.export with the configuration token failed: internal_error, which does not say the app is missing'
+    const only = [row('A0MADE0001', 'CSCB Test C')]
+    test.each([
+      ["its only candidate's export answers internal_error", only, () => ({ ok: false, error: 'internal_error' }), unverifiedPendingMessage('CSCB Test C', [{ app: only[0]!, why: INTERNAL_ERROR }])],
+      [
+        "its only candidate's export gets no answer (a transport error)",
+        only,
+        () => {
+          throw new SlackTransportError('apps.manifest.export', 'http', 503)
+        },
+        unverifiedPendingMessage('CSCB Test C', [{ app: only[0]!, why: 'apps.manifest.export with the configuration token got no answer (http 503)' }]),
+      ],
+      [
+        'one candidate checks out and another answers internal_error',
+        [row('A0MADE0001', 'CSCB Test C'), row('A0MADE0002', 'CSCB Test C')],
+        (id: string) => (id === 'A0MADE0002' ? { ok: false, error: 'internal_error' } : undefined),
+        unverifiedPendingMessage('CSCB Test C', [{ app: row('A0MADE0002', 'CSCB Test C'), why: INTERNAL_ERROR }]),
+      ],
+      [
+        'the apps list cannot be read (a FlowError)',
+        async () => {
+          throw new FlowError('the apps list page showed no list')
+        },
+        () => undefined,
+        'apps.json records an unfinished create of "CSCB Test C", and the apps list could not be read (FlowError: the apps list page showed no list): apps.json keeps the unfinished create and nothing was created: rerun',
+      ],
+    ] as Array<[string, ListedApp[] | (() => Promise<ListedApp[]>), (id: string) => SlackResponse | undefined, string]>)(
+      'when %s, the stage stops (AppsStageError): the intent is kept, nothing is adopted or created',
+      async (_what, listing, exportFault, message) => {
+        const h = pendingHarness(Array.isArray(listing) ? listing : undefined, exportFault)
+        if (!Array.isArray(listing)) h.deps.listApps = listing
+        const err = await rejection(runAppsStage(h.deps))
+        expect([err instanceof AppsStageError, err instanceof NotRunnableError, err.message]).toEqual([true, false, message])
+        expect(err.message).toContain('apps.json keeps the unfinished create and nothing was created: rerun')
+        expect([recorded(h.appsFile.load()), creates(h)]).toEqual([`c:pending ${EARLIER}`, 0])
+        assertNoLeak({ err, lines: h.lines })
+      },
+    )
+
+    test('with no apps list to read (a command that has none): not runnable, pointing at apps --list; nothing is created', async () => {
+      const h = pendingHarness(undefined)
+      const err = await rejection(runAppsStage(h.deps))
+      expect([err instanceof NotRunnableError, err.message]).toEqual([
+        true,
+        `apps.json records an unfinished create of "CSCB Test C" (started ${EARLIER}), and this command can't read the apps list to look for it: run bun ci-live/run.ts apps --list`,
+      ])
+      expect([h.calls, recorded(h.appsFile.load())]).toEqual([[], `c:pending ${EARLIER}`])
+    })
   })
 
   test('refuseCreate stops (not runnable) at the first app it would create; recorded apps are still reused', async () => {
@@ -524,6 +781,329 @@ describe('runAppsStage', () => {
     expect([err instanceof NotRunnableError, err.message]).toEqual([true, 'no apps.json: copy it from the old VM'])
     expect(h.calls.map((c) => c.method)).toEqual(['apps.manifest.export'])
     expect(h.lines).toEqual(['apps: CSCB Test A: reused A0APPOLD01'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The apps stage without a usable configuration token
+// ---------------------------------------------------------------------------
+
+describe('the apps stage without a usable configuration token', () => {
+  const RECORDED = { a: 'A0APPOLD01', b: 'A0APPOLD02', c: 'A0APPOLD03', d: 'A0APPOLD04' } as const
+  const EXPIRED = json({ ok: false, error: 'token_expired' })
+
+  /** The apps stage over `stored()`'s token source and secret store, with `letters` recorded in apps.json; the stage logs beside the source. */
+  function tokenHarness(seed: { token?: string; refresh?: string }, script: Scripted[], letters: readonly PersonaLetter[]) {
+    const s = stored(seed, ...script)
+    const appsFile = new AppsStateFile(s.mem.fs, s.store.paths.appsJson)
+    appsFile.save({ version: 1, personas: Object.fromEntries(letters.map((l) => [l, { app_id: RECORDED[l] }])), channels: {} })
+    const appsJson = () => s.mem.files.get(s.store.paths.appsJson)!.data
+    const deps: AppsStageDeps = {
+      callManifest: (method, params) => s.tokens.call(method, params),
+      appsFile,
+      manifestFor: (l) => personaManifest(REPO_MANIFEST, l),
+      letters: PERSONA_LETTERS,
+      log: { info: (m) => s.lines.push(m), detail: (m) => s.lines.push(m) },
+    }
+    return { deps, calls: s.calls, lines: s.lines, appsJson, before: appsJson() }
+  }
+
+  const REFUSED = 'the Slack app configuration token was refused (token_expired): write a fresh one to /cfg/slack_config_token (mode 600)'
+  const CONDITIONS = [
+    ['missing', {}, [], [], 'the Slack app configuration token is missing: write it to /cfg/slack_config_token (mode 600)'],
+    ['expired, with no refresh token', { token: CONFIG_TOKEN }, [EXPIRED], ['apps.manifest.export'], REFUSED],
+    ['expired, its rotation refused', { token: CONFIG_TOKEN, refresh: REFRESH }, [EXPIRED, json({ ok: false, error: 'invalid_refresh_token' })], ['apps.manifest.export', 'tooling.tokens.rotate'], REFUSED],
+  ] as const
+
+  test.each(CONDITIONS)('a configuration token %s, with all four apps in apps.json: a WARNING (never a value), and the recorded apps reused unchecked', async (_what, seed, script, methods, why) => {
+    const h = tokenHarness(seed, [...script], PERSONA_LETTERS)
+    const outcomes = await runAppsStage(h.deps)
+    expect(outcomes).toEqual(PERSONA_LETTERS.map((letter) => ({ letter, appId: RECORDED[letter], action: 'reused', drift: [] })))
+    expect(h.calls.map((c) => c.method)).toEqual([...methods])
+    expect(h.lines.filter((l) => l.startsWith('WARNING:'))).toEqual([
+      `WARNING: apps: the configuration token can't be used (${why}); apps.json records all four apps, so the run reuses them without their export, drift check or update`,
+    ])
+    expect(h.lines.filter((l) => l.startsWith('apps: CSCB Test'))).toEqual(
+      PERSONA_LETTERS.map((l) => `apps: CSCB Test ${l.toUpperCase()}: reused ${RECORDED[l]} (unchecked: no usable configuration token)`),
+    )
+    expect(h.appsJson()).toBe(h.before)
+    assertNoLeak({ lines: h.lines, outcomes })
+  })
+
+  test.each(CONDITIONS)('a configuration token %s, with an app missing from apps.json: not runnable (exit 2), naming the token file, and nothing created', async (_what, seed, script, methods, why) => {
+    const h = tokenHarness(seed, [...script], ['a', 'b', 'c'])
+    const err = await rejection(runAppsStage(h.deps))
+    expect([err instanceof ConfigTokenUnavailableError, err instanceof NotRunnableError, err.message]).toEqual([true, true, why])
+    expect(h.calls.map((c) => c.method)).toEqual([...methods])
+    expect(h.appsJson()).toBe(h.before)
+    assertNoLeak({ err, lines: h.lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The apps list against apps.json (apps --list, apps --delete-strays)
+// ---------------------------------------------------------------------------
+
+describe('the apps list against apps.json', () => {
+  const TEAM = 'CSCB CI Test'
+  const app = (id: string, name: string, rowText: string | null = `${name} ${TEAM}`): ListedApp => ({ id, name, rowText })
+  const STATE: AppsState = { version: 1, personas: { a: { app_id: 'A0APPREC01' }, b: { app_id: 'A0APPREC02' } }, channels: {} }
+
+  test("classifyListedApps: the persona apps.json records it for, the persona whose exact name it has, and whether its row (less its own name) shows the test workspace's name", () => {
+    const listed = [
+      app('A0APPREC01', 'CSCB Test A'),
+      app('A0STRAY001', 'CSCB Test A'),
+      app('A0COPY0001', 'CSCB Test A (copy)'),
+      app('A0LOWER001', 'cscb test b'),
+      app('A0OTHER001', 'CSCB Test C', 'CSCB Test C Another Workspace'),
+      app('A0TEAMNAME', TEAM, `${TEAM} Another Workspace`),
+      app('A0NOROW001', 'CSCB Test D', null),
+    ]
+    const shape = (team: string | null) => classifyListedApps(listed, STATE, team).map((c) => [c.app.id, c.recordedAs, c.namedAs, c.inTestWorkspace])
+    expect(shape(TEAM)).toEqual([
+      ['A0APPREC01', 'a', 'a', true],
+      ['A0STRAY001', null, 'a', true],
+      ['A0COPY0001', null, null, true],
+      ['A0LOWER001', null, null, true],
+      ['A0OTHER001', null, 'c', false],
+      ['A0TEAMNAME', null, null, false],
+      ['A0NOROW001', null, 'd', false],
+    ])
+    expect(shape(null).map(([id, , , where]) => [id, where])).toEqual(listed.map((a) => [a.id, null]))
+  })
+
+  const APP_URL = 'https://api.slack.com/apps/A0APP00001'
+  test.each([
+    [
+      'an icon link (no text) then a name link to the same app: one app, named by the link with text',
+      [
+        { href: APP_URL, text: '', cells: ['', 'CSCB Test A', TEAM] },
+        { href: `${APP_URL}/general?tab=x`, text: 'CSCB Test A', cells: ['', 'CSCB Test A', TEAM] },
+      ],
+      [{ id: 'A0APP00001', name: 'CSCB Test A', rowText: `CSCB Test A\t${TEAM}` }],
+    ],
+    [
+      '/apps/new, an ID-less or look-alike apps link and a link elsewhere: none is an app',
+      [
+        { href: 'https://api.slack.com/apps/new', text: 'Create New App', cells: null },
+        { href: 'https://api.slack.com/apps', text: 'Your Apps', cells: null },
+        { href: 'https://api.slack.com/apps/A0APP00001x', text: 'CSCB Test A', cells: null },
+        { href: 'https://api.slack.com/docs', text: 'Docs', cells: null },
+      ],
+      [],
+    ],
+    [
+      'control characters in the name and cells (a tab or line break never splits a cell), empty cells dropped, a link in no row',
+      [
+        { href: APP_URL, text: 'CSCB\u0000 Test\nA\u007f', cells: ['CSCB Test A', 'CSCB\tCI\r\nTest', '   '] },
+        { href: 'https://api.slack.com/apps/A0APP00002', text: 'CSCB Test B', cells: null },
+      ],
+      [
+        { id: 'A0APP00001', name: 'CSCB Test A', rowText: `CSCB Test A\t${TEAM}` },
+        { id: 'A0APP00002', name: 'CSCB Test B', rowText: null },
+      ],
+    ],
+    [
+      'a name and cells capped at 100 characters, and at most 8 cells',
+      [{ href: APP_URL, text: 'n'.repeat(150), cells: Array(10).fill('c'.repeat(120)) }],
+      [{ id: 'A0APP00001', name: 'n'.repeat(100), rowText: Array(8).fill('c'.repeat(100)).join('\t') }],
+    ],
+  ] as Array<[string, AppLink[], ListedApp[]]>)('listedAppsFrom: %s', (_what, links, expected) => {
+    expect(listedAppsFrom(links)).toEqual(expected)
+  })
+
+  test.each([
+    ['names the team', { ok: true, team: TEAM }, TEAM],
+    ['names no team', { ok: true }, null],
+    ['names a blank team', { ok: true, team: '  ' }, null],
+    ['names a team that is no string', { ok: true, team: 42 }, null],
+    ['is refused', { ok: false, error: 'invalid_auth', team: TEAM }, null],
+  ] as Array<[string, SlackResponse, string | null]>)("testWorkspaceName: the test human's auth.test that %s", async (_what, answer, name) => {
+    const methods: string[] = []
+    const browser = { humanApi: async (): Promise<HumanApi> => ({ call: async (method) => (methods.push(method), answer) }) }
+    expect([await testWorkspaceName(browser), methods]).toEqual([name, ['auth.test']])
+  })
+
+  test.each([
+    ['its own cell', `CSCB Test A\t${TEAM}`, TEAM, true],
+    ['one cell holding the app name and the team', `CSCB Test A ${TEAM}`, TEAM, true],
+    ['the team name spaced differently', `CSCB Test A\t${TEAM}`, `  CSCB  CI Test `, true],
+    ['a longer team name ("CSCB Test" is not "CSCB Test 2")', 'CSCB Test A\tCSCB Test 2', 'CSCB Test', false],
+    ['the team name inside a longer cell', `CSCB Test A\tMy ${TEAM}`, TEAM, false],
+    ['only inside the app name', 'CSCB Test A', 'CSCB Test', false],
+    ['no row', null, TEAM, false],
+  ] as Array<[string, string | null, string, boolean]>)("rowShowsWorkspace: a row of 'CSCB Test A' with the team name as %s", (_what, rowText, team, shown) => {
+    expect(rowShowsWorkspace(app('A0STRAY001', 'CSCB Test A', rowText), team)).toBe(shown)
+  })
+
+  test("describeListedApp: apps --list's line, the ID, the quoted name and what apps.json says of it", () => {
+    const lines = (team: string | null) =>
+      classifyListedApps([app('A0APPREC02', 'CSCB Test B'), app('A0STRAY001', 'CSCB Test A'), app('A0OTHER001', 'Mine', 'Mine Elsewhere')], STATE, team).map(describeListedApp)
+    expect(lines(TEAM)).toEqual([
+      'A0APPREC02  "CSCB Test B"  in apps.json (persona B); test workspace',
+      'A0STRAY001  "CSCB Test A"  NOT in apps.json: a stray test app; test workspace',
+      'A0OTHER001  "Mine"  not in apps.json; not shown in the test workspace',
+    ])
+    expect(lines(null)[1]).toBe('A0STRAY001  "CSCB Test A"  NOT in apps.json: a stray test app')
+  })
+
+  describe('deleteStrayApps', () => {
+    /**
+     * The manifest API: export answers from `exported` (a manifest of that name, or what a function answers or throws; else
+     * invalid_app_id, as for another workspace's app); delete answers ok unless `refuseDelete` holds the ID.
+     */
+    function strayHarness(exported: Record<string, string | (() => SlackResponse)>, refuseDelete: string[] = [], later: AppsState | (() => AppsState) = STATE) {
+      const calls: string[] = []
+      const lines: string[] = []
+      const deps = {
+        callManifest: async (method: string, params: Record<string, unknown>): Promise<SlackResponse> => {
+          const id = String(params.app_id)
+          calls.push(`${method} ${id}`)
+          if (method === 'apps.manifest.export') {
+            const name = exported[id]
+            if (typeof name === 'function') return name()
+            return name ? { ok: true, manifest: { display_information: { name } } } : { ok: false, error: 'invalid_app_id' }
+          }
+          return refuseDelete.includes(id) ? { ok: false, error: 'ratelimited' } : { ok: true }
+        },
+        // apps.json read again just before a delete: `later` is what it holds (or gives, read by read) by then.
+        appsFile: { load: typeof later === 'function' ? later : () => later },
+        log: { info: (m: string) => lines.push(m) },
+      }
+      return { deps, calls, lines }
+    }
+
+    test('deletes only an app named exactly "CSCB Test A"-"D", unrecorded, shown in the test workspace and exported under that name with the configuration token; keeps the rest, saying why', async () => {
+      const listed = [
+        app('A0APPREC01', 'CSCB Test A'),
+        app('A0STRAY001', 'CSCB Test A'),
+        app('A0STRAY002', 'CSCB Test B'),
+        app('A0COPY0001', 'CSCB Test A (copy)'),
+        app('A0OTHER001', 'CSCB Test C', 'CSCB Test C Another Workspace'),
+        app('A0FOREIGN1', 'CSCB Test C'),
+        app('A0RENAMED1', 'CSCB Test D'),
+        app('A0RACED001', 'CSCB Test D'),
+      ]
+      const later: AppsState = { ...STATE, personas: { ...STATE.personas, d: { app_id: 'A0RACED001' } } }
+      const exported = { A0APPREC01: 'CSCB Test A', A0STRAY001: 'CSCB Test A', A0STRAY002: 'CSCB Test B', A0RENAMED1: 'CSCB Test B', A0RACED001: 'CSCB Test D' }
+      const h = strayHarness(exported, ['A0STRAY002'], later)
+      const outcome = await deleteStrayApps(h.deps, classifyListedApps(listed, STATE, TEAM))
+      expect(outcome.deleted.map((a) => a.id)).toEqual(['A0STRAY001'])
+      expect(outcome.kept.map((k) => [k.app.id, k.why])).toEqual([
+        ['A0STRAY002', 'apps.manifest.delete failed: ratelimited'],
+        ['A0OTHER001', 'the app list does not show it in the test workspace'],
+        ['A0FOREIGN1', 'apps.manifest.export with the configuration token failed: invalid_app_id'],
+        ['A0RENAMED1', 'its manifest names another app'],
+        ['A0RACED001', 'apps.json records it'],
+      ])
+      expect(h.calls).toEqual([
+        'apps.manifest.export A0STRAY001',
+        'apps.manifest.delete A0STRAY001',
+        'apps.manifest.export A0STRAY002',
+        'apps.manifest.delete A0STRAY002',
+        'apps.manifest.export A0FOREIGN1',
+        'apps.manifest.export A0RENAMED1',
+      ])
+      expect(h.lines).toContain('apps: deleted stray A0STRAY001 "CSCB Test A" (not in apps.json) with apps.manifest.delete')
+    })
+
+    test('never deletes an app apps.json records, nor any stray while the test workspace name is unknown', async () => {
+      const everyName = PERSONA_LETTERS.map((l, i) => app(`A0APPREC0${i + 1}`, `CSCB Test ${l.toUpperCase()}`))
+      const all: AppsState = { version: 1, personas: Object.fromEntries(PERSONA_LETTERS.map((l, i) => [l, { app_id: `A0APPREC0${i + 1}` }])), channels: {} }
+      const exported = Object.fromEntries(everyName.map((a) => [a.id, a.name]))
+      const recordedOnly = strayHarness(exported, [], all)
+      expect(await deleteStrayApps(recordedOnly.deps, classifyListedApps(everyName, all, TEAM))).toEqual({ deleted: [], kept: [] })
+      const unknownTeam = strayHarness({ A0STRAY001: 'CSCB Test A' })
+      const outcome = await deleteStrayApps(unknownTeam.deps, classifyListedApps([app('A0STRAY001', 'CSCB Test A')], STATE, null))
+      expect(outcome.kept.map((k) => k.why)).toEqual(['the test workspace name is unknown, so its workspace is unproven'])
+      expect([recordedOnly.calls, unknownTeam.calls, outcome.deleted]).toEqual([[], [], []])
+    })
+
+    // An export that proves nothing (neither the app nor "no such app") keeps the stray: it may be a live app.
+    test.each([
+      ['its row shows a longer workspace name ("CSCB CI Test 2")', `CSCB Test A\t${TEAM} 2`, 'CSCB Test A', 'the app list does not show it in the test workspace', []],
+      [
+        'its export answers internal_error',
+        `CSCB Test A\t${TEAM}`,
+        () => ({ ok: false, error: 'internal_error' }),
+        'apps.manifest.export with the configuration token failed: internal_error, which does not say the app is missing',
+        ['apps.manifest.export A0STRAY001'],
+      ],
+      [
+        'its export gets no answer',
+        `CSCB Test A\t${TEAM}`,
+        () => {
+          throw new SlackTransportError('apps.manifest.export', 'timeout')
+        },
+        'apps.manifest.export with the configuration token got no answer (timeout)',
+        ['apps.manifest.export A0STRAY001'],
+      ],
+      [
+        'its export holds no manifest name',
+        `CSCB Test A\t${TEAM}`,
+        () => ({ ok: true, manifest: { display_information: {} } }),
+        'apps.manifest.export with the configuration token returned no manifest name',
+        ['apps.manifest.export A0STRAY001'],
+      ],
+    ] as Array<[string, string, string | (() => SlackResponse), string, string[]]>)('keeps a stray, deleting nothing, when %s', async (_what, rowText, exported, why, calls) => {
+      const h = strayHarness({ A0STRAY001: exported })
+      const outcome = await deleteStrayApps(h.deps, classifyListedApps([app('A0STRAY001', 'CSCB Test A', rowText)], STATE, TEAM))
+      expect([outcome.deleted, outcome.kept.map((k) => [k.app.id, k.why]), h.calls]).toEqual([[], [['A0STRAY001', why]], calls])
+      assertNoLeak(h.lines)
+    })
+
+    test.each([
+      ['no longer parses', () => parseAppsState('not json'), 'apps.json does not parse as JSON: fix it'],
+      [
+        'records no app ID any more',
+        () => parseAppsState(JSON.stringify({ version: 1, personas: { a: { pending_create: { started_at: '2026-09-26T12:00:00.000Z' } } } })),
+        'apps.json records no app ID, so every test app, live ones another VM records included, would look like a stray: apps --delete-strays deletes nothing until apps.json records the apps',
+      ],
+    ] as Array<[string, () => AppsState, string]>)('apps.json is read again before each delete: when by the second stray it %s, not runnable, and nothing more is exported or deleted', async (_what, second, message) => {
+      let loads = 0
+      const h = strayHarness({ A0STRAY001: 'CSCB Test A', A0STRAY002: 'CSCB Test B' }, [], () => (++loads === 1 ? STATE : second()))
+      const err = await rejection(deleteStrayApps(h.deps, classifyListedApps([app('A0STRAY001', 'CSCB Test A'), app('A0STRAY002', 'CSCB Test B')], STATE, TEAM)))
+      expect(err).toBeInstanceOf(NotRunnableError)
+      expect(err.message).toStartWith(message)
+      expect(h.calls).toEqual(['apps.manifest.export A0STRAY001', 'apps.manifest.delete A0STRAY001'])
+    })
+  })
+
+  describe('appsStateForStrayDeletion (apps --delete-strays, before any app is listed)', () => {
+    const PATH = '/cfg/apps.json'
+    const fileWith = (text: string | undefined) => {
+      const mem = memSecureFs()
+      if (text !== undefined) mem.seed(PATH, text)
+      return new AppsStateFile(mem.fs, PATH)
+    }
+
+    test.each([
+      [
+        'is missing',
+        undefined,
+        `${PATH} does not exist, so every test app, live ones another VM records included, would look like a stray: apps --delete-strays deletes nothing without it (copy it from the VM that made the apps; apps --list shows them)`,
+      ],
+      ['does not parse as JSON', 'not json', `${PATH} does not parse as JSON: fix it`],
+      ['is no JSON object', '[]', `${PATH} is not a JSON object: fix it`],
+      [
+        'records no app ID (an unfinished create only)',
+        JSON.stringify({ version: 1, personas: { c: { pending_create: { started_at: '2026-09-26T12:00:00.000Z' } } } }),
+        `${PATH} records no app ID, so every test app, live ones another VM records included, would look like a stray: apps --delete-strays deletes nothing until apps.json records the apps (copy it from the VM that made them; apps --list shows them)`,
+      ],
+    ])('not runnable when apps.json %s', (_what, text, message) => {
+      let err: unknown
+      try {
+        appsStateForStrayDeletion(fileWith(text))
+      } catch (e) {
+        err = e
+      }
+      expect(err).toBeInstanceOf(NotRunnableError)
+      expect((err as Error).message).toStartWith(message)
+    })
+
+    test('apps.json recording an app ID is the state to classify against', () => {
+      expect(appsStateForStrayDeletion(fileWith(JSON.stringify(STATE)))).toEqual(STATE)
+    })
   })
 })
 
@@ -704,6 +1284,18 @@ describe('runProvisioning against the stub workspace', () => {
     expect(rerun.apps!.map((o) => o.action)).toEqual(['reused', 'reused', 'reused', 'reused'])
     expect(h.stub.calls.get('apps.manifest.create')).toBe(4)
     assertNoLeak({ err, lines: h.lines, rerun })
+  })
+
+  test("an unfinished create is resolved from the apps list provisioning is given: the app the lost create made is adopted, another workspace's app of that name is left alone, and only the other three are created", async () => {
+    const h = provisionHarness()
+    const made = h.stub.createApp(personaManifest(REPO_MANIFEST, 'c')).id
+    h.stub.createApp(personaManifest(REPO_MANIFEST, 'c'), { foreign: true })
+    h.appsFile.save({ version: 1, personas: { c: { pending_create: { started_at: '2026-09-25T08:00:00.000Z' } } }, channels: {} })
+    h.deps.listApps = async () => [...h.stub.apps.values()].map((a) => ({ id: a.id, name: String((a.manifest.display_information as JsonObject).name), rowText: null }))
+    const report = await runProvisioning(h.deps, 'apps')
+    expect(report.apps!.map((o) => [o.letter, o.action])).toEqual([['a', 'created'], ['b', 'created'], ['c', 'adopted'], ['d', 'created']])
+    expect([h.appsFile.load().personas.c, h.stub.calls.get('apps.manifest.create')]).toEqual([{ app_id: made }, 3])
+    assertNoLeak({ lines: h.lines, report })
   })
 
   test('validateCredentials reports a missing credentials file as failed, by status only', async () => {

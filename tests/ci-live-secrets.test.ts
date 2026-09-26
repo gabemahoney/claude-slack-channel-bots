@@ -7,7 +7,12 @@
  *
  * The rules under test:
  * - a secret file or its directory that is group- or other-accessible stops
- *   the run (NotRunnableError naming the path, never a value);
+ *   the run (NotRunnableError naming the path, never a value), with the
+ *   `chmod` that fixes it and the note that a VM reboot can loosen modes;
+ *   before a real run every loose path is reported at once, the personas'
+ *   credentials files included, and the runner changes no mode itself;
+ * - a missing or empty secret file is a `MissingSecretError` (the apps stage
+ *   can go on without the configuration token);
  * - a secret is written only as a mode-600 temp file in a mode-700 directory,
  *   renamed over the target, so the target never exists with a wider mode;
  * - every value read or written is registered with the redactor, the second
@@ -17,7 +22,10 @@
  *   privacy check);
  * - a dry run reads nothing under the real config dir: the store refuses any
  *   access there (a name that only starts with `..` is inside it), and its
- *   mailbox.json is the stub's, in the temporary dir.
+ *   mailbox.json is the stub's, in the temporary dir;
+ * - apps.json keeps a pending-create intent only with an ISO start time; a
+ *   file that is there but is no JSON object is not runnable, never read as
+ *   empty (only a missing one loads empty).
  *
  * Every file operation goes through the in-memory `memSecureFs`, except one
  * round trip on the real file system in a mkdtempSync directory. Tokens are
@@ -31,7 +39,7 @@ import { mkdtempSync, readdirSync, rmSync, statSync, chmodSync, mkdirSync } from
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { AppsStateFile, emptyAppsState, parseAppsState, serializeAppsState } from '../ci-live/lib/apps-state.ts'
+import { AppsStateFile, emptyAppsState, MalformedAppsStateError, parseAppsState, recordedAppIds, serializeAppsState } from '../ci-live/lib/apps-state.ts'
 import { parseMailboxFile, type MailboxConfig } from '../ci-live/lib/mailbox.ts'
 import { dryRunLockFile, hostCredentialsFile, livePathsIn, mountedCredentialsFile, realRunLockFile, resolveConfigDir } from '../ci-live/lib/paths.ts'
 import { Redactor, REDACTED_SECRET } from '../ci-live/lib/redact.ts'
@@ -40,6 +48,8 @@ import {
   DryRunSecretAccessError,
   ensurePrivateDir,
   isInside,
+  LOOSE_MODES_NOTE,
+  MissingSecretError,
   nodeSecureFs,
   NotRunnableError,
   privacyProblem,
@@ -94,6 +104,11 @@ function makeStore(options: { env?: Record<string, string | undefined>; dryRun?:
   return { mem, store, redactor, paths }
 }
 
+/** A loose mode's refusal after the path: the mode, the chmod that fixes it and why modes can be loose. */
+function looseRule(mode: string, chmod: string): string {
+  return `is group- or other-accessible (mode ${mode}): run chmod ${chmod} (${LOOSE_MODES_NOTE})`
+}
+
 /** Run `fn` and return what it threw (failing when it returns). */
 function thrown(fn: () => unknown): Error {
   try {
@@ -113,16 +128,22 @@ describe('privacyProblem', () => {
   const dir = (mode: number) => ({ mode, size: 0, isFile: false, isDirectory: true })
 
   test.each([
-    ['a 600 file', file(0o600), 'file', null],
-    ['a 400 file', file(0o400), 'file', null],
-    ['a 700 dir', dir(0o700), 'dir', null],
-    ['a 640 file', file(0o640), 'file', 'is group- or other-accessible (mode 640); chmod 600 it'],
-    ['a 604 file', file(0o604), 'file', 'is group- or other-accessible (mode 604); chmod 600 it'],
-    ['a 755 dir', dir(0o755), 'dir', 'is group- or other-accessible (mode 755); chmod 700 it'],
-    ['a dir where a file is wanted', dir(0o700), 'file', 'is not a regular file'],
-    ['a file where a dir is wanted', file(0o600), 'dir', 'is not a directory'],
-  ] as const)('%s', (_what, st, kind, expected) => {
-    expect(privacyProblem(st, kind)).toBe(expected)
+    ['a 600 file', file(0o600), 'file', undefined, null],
+    ['a 400 file', file(0o400), 'file', undefined, null],
+    ['a 700 dir', dir(0o700), 'dir', undefined, null],
+    ['a 640 file, no path given', file(0o640), 'file', undefined, looseRule('640', '600 on it')],
+    ['a 604 file', file(0o604), 'file', '/cfg/slack_config_token', looseRule('604', '600 /cfg/slack_config_token')],
+    ['a 755 dir', dir(0o755), 'dir', '/cfg', looseRule('755', '700 /cfg')],
+    ['a setgid 2770 dir, as a VM reboot leaves it', dir(0o2770), 'dir', '/cfg', looseRule('2770', '700 /cfg')],
+    ['a path the shell would split, single-quoted', file(0o660), 'file', "/cfg/it's mine", looseRule('660', "600 '/cfg/it'\\''s mine'")],
+    ['a dir where a file is wanted', dir(0o700), 'file', undefined, 'is not a regular file'],
+    ['a file where a dir is wanted', file(0o600), 'dir', undefined, 'is not a directory'],
+  ] as const)('%s', (_what, st, kind, path, expected) => {
+    expect(privacyProblem(st, kind, path)).toBe(expected)
+  })
+
+  test('a loose mode says a VM reboot can loosen modes, and that the runner never changes one itself', () => {
+    expect(LOOSE_MODES_NOTE).toBe('a VM reboot can loosen these modes, as the pod re-applies its group to the files at boot; the runner never changes them itself')
   })
 })
 
@@ -140,9 +161,9 @@ describe('assertPrivate, ensurePrivateDir and readPrivateFile', () => {
     expect(errors.every((e) => e instanceof NotRunnableError)).toBe(true)
     expect(errors.map((e) => e.message)).toEqual([
       '/d/missing does not exist',
-      '/d/secret is group- or other-accessible (mode 644); chmod 600 it',
-      '/wide is group- or other-accessible (mode 750); chmod 700 it',
-      '/wide is group- or other-accessible (mode 750); chmod 700 it',
+      `/d/secret ${looseRule('644', '600 /d/secret')}`,
+      `/wide ${looseRule('750', '700 /wide')}`,
+      `/wide ${looseRule('750', '700 /wide')}`,
     ])
     expect(mem.reads).toEqual([])
     assertNoLeak(errors)
@@ -257,16 +278,17 @@ describe('SecretStore reads', () => {
     expect(h.store.readConfigTokens().refreshToken).toBeNull()
   })
 
+  // A missing or empty file is a MissingSecretError (the apps stage can do without the token); a loose one never is.
   test.each([
-    ['missing', undefined, 0o600, 'the Slack app configuration token is missing: write it to /home/tester/.config/cscb-test/slack_config_token (mode 600)'],
-    ['empty', '  \n', 0o600, 'the Slack app configuration token in /home/tester/.config/cscb-test/slack_config_token is empty'],
-    ['group-readable', CONFIG_TOKEN, 0o640, '/home/tester/.config/cscb-test/slack_config_token is group- or other-accessible (mode 640); chmod 600 it'],
-  ])('a %s config token file is not runnable, and the message holds no value', (_what, content, mode, message) => {
+    ['missing', undefined, 0o600, true, 'the Slack app configuration token is missing: write it to /home/tester/.config/cscb-test/slack_config_token (mode 600)'],
+    ['empty', '  \n', 0o600, true, 'the Slack app configuration token in /home/tester/.config/cscb-test/slack_config_token is empty'],
+    ['group-readable', CONFIG_TOKEN, 0o640, false, `/home/tester/.config/cscb-test/slack_config_token ${looseRule('640', '600 /home/tester/.config/cscb-test/slack_config_token')}`],
+  ])('a %s config token file is not runnable, and the message holds no value', (_what, content, mode, missing, message) => {
     const h = makeStore()
     h.mem.dirs.set(CONFIG_DIR, 0o700)
     if (content !== undefined) h.mem.seed(h.paths.configTokenFile, content, mode)
     const err = thrown(() => h.store.readConfigTokens())
-    expect(err).toBeInstanceOf(NotRunnableError)
+    expect([err instanceof NotRunnableError, err instanceof MissingSecretError]).toEqual([true, missing])
     expect(err.message).toBe(message)
     assertNoLeak(err)
   })
@@ -312,7 +334,7 @@ describe('SecretStore reads', () => {
     test.each([
       ['neither source', { email: second.email, password_env: 'SECOND_PW' }, undefined, "the second user's password is missing: set env SECOND_PW or live.json second_user.password_file"],
       ['a missing file', second, undefined, `the second user's password is missing: write it to ${FILE} (mode 600)`],
-      ['a mode-644 file', second, 0o644, `${FILE} is group- or other-accessible (mode 644); chmod 600 it`],
+      ['a mode-644 file', second, 0o644, `${FILE} ${looseRule('644', `600 ${FILE}`)}`],
     ] as const)('refuses %s with a NotRunnableError naming the variable or file, never a value', (_what, cfg, mode, message) => {
       const h = makeStore()
       h.mem.dirs.set(CONFIG_DIR, 0o700)
@@ -408,13 +430,38 @@ describe('SecretStore reads', () => {
     const wideFile = makeStore()
     wideFile.mem.seed(wideFile.paths.storageState, '{}', 0o644)
     const errors = [thrown(() => wideDir.store.assertLayoutPrivate()), thrown(() => wideFile.store.assertLayoutPrivate())]
+    const [credentialsDir, storageState] = [wideDir.paths.credentialsDir, wideFile.paths.storageState]
     expect(errors.map((e) => e.message)).toEqual([
-      `${wideDir.paths.credentialsDir} is group- or other-accessible (mode 755); chmod 700 it`,
-      `${wideFile.paths.storageState} is group- or other-accessible (mode 644); chmod 600 it`,
+      `${credentialsDir} ${looseRule('755', `700 ${credentialsDir}`)}`,
+      `${storageState} ${looseRule('644', `600 ${storageState}`)}`,
     ])
   })
 
+  test("assertLayoutPrivate reports every loose path at once (the personas' credentials files included) with the chmods that fix them all, then any path of the wrong type; it reads and changes nothing", () => {
+    const h = makeStore({ configDir: '/cfg' })
+    h.mem.seed('/cfg/credentials/persona_a-credentials.json', '{}', 0o640)
+    h.mem.seed('/cfg/credentials/persona_b-credentials.json', '{}', 0o600)
+    h.mem.seed('/cfg/credentials-staged/persona_d-credentials.json', '{}', 0o644)
+    h.mem.seed('/cfg/slack_config_token', CONFIG_TOKEN, 0o660)
+    h.mem.seed('/cfg/playwright-state.json', '{}', 0o600)
+    h.mem.dirs.set('/cfg', 0o2770)
+    h.mem.dirs.set('/cfg/credentials', 0o770)
+    h.mem.dirs.set('/cfg/credentials-staged', 0o700)
+    h.mem.dirs.set('/cfg/test_password', 0o700)
+    const err = thrown(() => h.store.assertLayoutPrivate())
+    expect(err).toBeInstanceOf(NotRunnableError)
+    expect(err.message).toBe(
+      '5 secret paths are group- or other-accessible: /cfg (mode 2770), /cfg/credentials (mode 770), /cfg/slack_config_token (mode 660), ' +
+        '/cfg/credentials/persona_a-credentials.json (mode 640), /cfg/credentials-staged/persona_d-credentials.json (mode 644). ' +
+        'Run chmod 700 /cfg /cfg/credentials && chmod 600 /cfg/slack_config_token /cfg/credentials/persona_a-credentials.json /cfg/credentials-staged/persona_d-credentials.json ' +
+        `(${LOOSE_MODES_NOTE}); /cfg/test_password is not a regular file`,
+    )
+    expect([h.mem.reads, h.mem.ops.filter((op) => op.startsWith('chmod'))]).toEqual([[], []])
+    assertNoLeak(err)
+  })
+
   describe('readMailbox (the test mailbox, mailbox.json)', () => {
+    const MAILBOX = livePathsIn(CONFIG_DIR).mailboxJson
     const MAIL_PASSWORD = `mailpw-${LEAK_SENTINEL}`
     const MAIL_TOKEN = `mailtoken-${LEAK_SENTINEL}`
     const mailbox = (overrides: Record<string, unknown> = {}) =>
@@ -435,8 +482,8 @@ describe('SecretStore reads', () => {
     })
 
     test.each([
-      ['a group-readable file', mailbox(), 0o640, 0o700, 'is group- or other-accessible (mode 640); chmod 600 it', false],
-      ['a world-readable file', mailbox(), 0o604, 0o700, 'is group- or other-accessible (mode 604); chmod 600 it', false],
+      ['a group-readable file', mailbox(), 0o640, 0o700, looseRule('640', `600 ${MAILBOX}`), false],
+      ['a world-readable file', mailbox(), 0o604, 0o700, looseRule('604', `600 ${MAILBOX}`), false],
       ['a file that is not JSON', `{"password": "${MAIL_PASSWORD}"`, 0o600, 0o700, 'is not valid JSON', true],
       ['a file with no password', mailbox({ password: '' }), 0o600, 0o700, 'has no password', true],
       ['a file whose api holds a password', mailbox({ api: `https://u:${MAIL_PASSWORD}@api.mail.tm` }), 0o600, 0o700, 'has an api that is not an https URL', true],
@@ -454,14 +501,14 @@ describe('SecretStore reads', () => {
     test('refuses a mailbox.json in a wide config dir before reading it', () => {
       const h = makeStore()
       h.mem.seed(h.paths.mailboxJson, mailbox(), 0o600, 0o755)
-      expect(thrown(() => h.store.readMailbox()).message).toBe(`${CONFIG_DIR} is group- or other-accessible (mode 755); chmod 700 it`)
+      expect(thrown(() => h.store.readMailbox()).message).toBe(`${CONFIG_DIR} ${looseRule('755', `700 ${CONFIG_DIR}`)}`)
       expect(h.mem.reads).toEqual([])
     })
 
     test('assertLayoutPrivate refuses a world-readable mailbox.json and accepts a mode-600 one', () => {
       const wide = makeStore()
       wide.mem.seed(wide.paths.mailboxJson, mailbox(), 0o644)
-      expect(thrown(() => wide.store.assertLayoutPrivate()).message).toBe(`${wide.paths.mailboxJson} is group- or other-accessible (mode 644); chmod 600 it`)
+      expect(thrown(() => wide.store.assertLayoutPrivate()).message).toBe(`${MAILBOX} ${looseRule('644', `600 ${MAILBOX}`)}`)
       const ok = makeStore()
       ok.mem.seed(ok.paths.mailboxJson, mailbox())
       expect(() => ok.store.assertLayoutPrivate()).not.toThrow()
@@ -487,11 +534,12 @@ describe('SecretStore writes', () => {
     expect(h.mem.ops.some((op) => op.startsWith(`writeFile ${path}`))).toBe(false)
   })
 
-  test('writeConfigTokens rewrites both files (mode 600) and registers the new values', () => {
+  test('writeConfigTokens rewrites both files (mode 600, each through a rename), the refresh token first (the old one is spent), and registers the new values', () => {
     const h = makeStore()
     h.store.writeConfigTokens({ token: CONFIG_TOKEN, refreshToken: REFRESH_TOKEN })
     expect(h.mem.files.get(h.paths.configTokenFile)).toEqual({ data: `${CONFIG_TOKEN}\n`, mode: 0o600 })
     expect(h.mem.files.get(h.paths.refreshTokenFile)).toEqual({ data: `${REFRESH_TOKEN}\n`, mode: 0o600 })
+    expect(h.mem.ops.filter((op) => op.startsWith('rename ')).map((op) => op.split(' ')[2])).toEqual([h.paths.refreshTokenFile, h.paths.configTokenFile])
     expect(h.redactor.secretCount).toBe(2)
   })
 
@@ -592,10 +640,10 @@ describe('dry run: no real secret is touched', () => {
 
   test("a dry run's seed and reads stay in the temporary dir, ignoring the environment the store was not given", () => {
     const h = makeStore({ dryRun: true, configDir: '/tmp/dry/config' })
-    h.store.seedDryRun({ configToken: CONFIG_TOKEN, password: PASSWORD, workspaceDomain: 'cscb-dry-run', testEmail: EMAIL })
-    for (const path of [h.paths.configTokenFile, h.paths.passwordFile, h.paths.liveJson]) expect(h.mem.files.get(path)?.mode).toBe(0o600)
+    h.store.seedDryRun({ configToken: CONFIG_TOKEN, refreshToken: REFRESH_TOKEN, password: PASSWORD, workspaceDomain: 'cscb-dry-run', testEmail: EMAIL })
+    for (const path of [h.paths.configTokenFile, h.paths.refreshTokenFile, h.paths.passwordFile, h.paths.liveJson]) expect(h.mem.files.get(path)?.mode).toBe(0o600)
     expect(h.store.readLiveConfig().workspaceDomain).toBe('cscb-dry-run')
-    expect(h.store.readConfigTokens().token).toBe(CONFIG_TOKEN)
+    expect(h.store.readConfigTokens()).toEqual({ token: CONFIG_TOKEN, refreshToken: REFRESH_TOKEN })
     expect(h.store.readPassword()).toBe(PASSWORD)
     h.store.writeCredentials('a', creds())
     expect(h.store.accessed.length).toBeGreaterThan(0)
@@ -640,7 +688,9 @@ describe('apps.json', () => {
       human_user_id: 'not-a-user',
       personas: {
         a: { app_id: 'A0APP00001', bot_user_id: 'U0BOT00001', bot_id: 'B0BOT00001', needs_reinstall: true, app_token_name: 'cscb-live' },
-        b: { app_id: 'bad', needs_reinstall: 'yes', app_token_name: fakeToken(APP_TOKEN_PREFIX) },
+        b: { app_id: 'bad', needs_reinstall: 'yes', app_token_name: fakeToken(APP_TOKEN_PREFIX), pending_create: { started_at: 'yesterday' } },
+        c: { pending_create: { started_at: '2026-09-26T12:00:00.000Z', note: LEAK_SENTINEL } },
+        d: { pending_create: '2026-09-26T12:00:00Z' },
         e: { app_id: 'A0APP00009' },
       },
       channels: { 'a-home': 'C0CHAN0001', coordination: 'nope', general: 'C0CHAN0009' },
@@ -650,14 +700,51 @@ describe('apps.json', () => {
     expect(state).toEqual({
       version: 1,
       team_id: 'T0TEAM0001',
-      personas: { a: { app_id: 'A0APP00001', bot_user_id: 'U0BOT00001', bot_id: 'B0BOT00001', needs_reinstall: true, app_token_name: 'cscb-live' } },
+      personas: {
+        a: { app_id: 'A0APP00001', bot_user_id: 'U0BOT00001', bot_id: 'B0BOT00001', needs_reinstall: true, app_token_name: 'cscb-live' },
+        c: { pending_create: { started_at: '2026-09-26T12:00:00.000Z' } },
+      },
       channels: { 'a-home': 'C0CHAN0001' },
     })
     assertNoLeak(serializeAppsState(state))
   })
 
-  test.each(['not json', '[]', 'null', '"x"'])('malformed input %p gives an empty state', (text) => {
-    expect(parseAppsState(text)).toEqual(emptyAppsState())
+  test('recordedAppIds maps each recorded app ID to its persona; an unfinished create (no app ID yet) records none', () => {
+    const state = parseAppsState(
+      JSON.stringify({ version: 1, personas: { a: { app_id: 'A0APP00001' }, b: { pending_create: { started_at: '2026-09-26T12:00:00Z' } }, d: { app_id: 'A0APP00004' } } }),
+    )
+    expect([...recordedAppIds(state)]).toEqual([
+      ['A0APP00001', 'a'],
+      ['A0APP00004', 'd'],
+    ])
+  })
+
+  // Read as empty, every app it records would look unrecorded (a stray to delete, an app to create again).
+  const MALFORMED_FIX =
+    ': fix it, or restore it from a backup or from the VM that made the apps. The runner never reads it as empty, since every app it records would then look unrecorded. ' +
+    'Or move it aside: bun ci-live/run.ts apps --list then shows the apps, and a real run with --create-apps creates new ones'
+  test.each([
+    ['text that is no JSON', `not json ${LEAK_SENTINEL}`, 'does not parse as JSON'],
+    ['an empty file', '', 'does not parse as JSON'],
+    ['an array', '[]', 'is not a JSON object'],
+    ['null', 'null', 'is not a JSON object'],
+    ['a string', `"${LEAK_SENTINEL}"`, 'is not a JSON object'],
+  ])('%s is never read as empty: parseAppsState and AppsStateFile.load throw MalformedAppsStateError (not runnable), naming the file and never quoting it', (_what, text, problem) => {
+    const mem = memSecureFs()
+    mem.seed('/cfg/apps.json', text)
+    const errors = [() => parseAppsState(text), () => new AppsStateFile(mem.fs, '/cfg/apps.json').load()].map((read) => {
+      try {
+        read()
+      } catch (err) {
+        return err
+      }
+      throw new Error('expected MalformedAppsStateError')
+    })
+    expect(errors.map((e) => [e instanceof MalformedAppsStateError, e instanceof NotRunnableError, (e as Error).message])).toEqual([
+      [true, true, `apps.json ${problem}${MALFORMED_FIX}`],
+      [true, true, `/cfg/apps.json ${problem}${MALFORMED_FIX}`],
+    ])
+    assertNoLeak(errors)
   })
 
   test('AppsStateFile loads empty when absent, and update writes it privately (temp + rename, mode 600)', () => {

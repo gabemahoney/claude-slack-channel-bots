@@ -1,11 +1,13 @@
 /**
  * run-lock.ts — one /ci-live run at a time per mode.
  *
- * A real-mode command (a run, `--provision-only`, `login`) holds
- * `run.lock` in the config dir; a dry run holds its own lock in the temp dir
+ * A real-mode command (a run, `--provision-only`, `login`, `config-token`,
+ * `apps`) holds `run.lock` in the config dir; a dry run holds its own lock in the temp dir
  * (it never touches the real config dir). The lock file holds the runner's
  * PID. It is created exclusively; one left by a process that is gone (or is
- * no ci-live runner any more: the PID was reused) is stale and is replaced.
+ * no ci-live runner any more: the PID was reused, as after a VM reboot) is
+ * stale: it is removed with a WARNING naming the PID and the path (on the
+ * run log, or stderr for a command that has none), then replaced.
  *
  * The same liveness test decides which leftover containers a run may remove:
  * each container carries its runner's PID in a label, and a container whose
@@ -27,6 +29,8 @@ export interface LockDeps {
   unlink(path: string): void
   /** Is `pid` a live /ci-live runner? */
   isLiveRunner(pid: number): boolean
+  /** Is `pid` a live process at all? Only words the stale-lock warning. */
+  isAlive?(pid: number): boolean
   /** This process's PID. */
   pid: number
 }
@@ -94,6 +98,15 @@ export const nodeLockDeps: LockDeps = {
     }
   },
   isLiveRunner: (pid) => isLiveRunnerPid(pid),
+  isAlive: (pid) => {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (err) {
+      // EPERM: it exists, as another user's process.
+      return (err as NodeJS.ErrnoException).code === 'EPERM'
+    }
+  },
   pid: process.pid,
 }
 
@@ -109,6 +122,23 @@ export function lockHolder(path: string, deps: LockDeps = nodeLockDeps): number 
   return pid !== null && pid !== deps.pid && deps.isLiveRunner(pid) ? pid : null
 }
 
+/** The warning a stale lock's removal gives: the path, and the PID it held and why that is no runner. */
+export function staleLockWarning(path: string, pid: number | null, deps: Pick<LockDeps, 'isAlive' | 'pid'>): string {
+  let why: string
+  if (pid === null) why = 'it holds no PID'
+  else if (pid === deps.pid) why = `it holds this process's own PID ${pid}`
+  else {
+    const alive = deps.isAlive?.(pid)
+    why =
+      alive === false
+        ? `its PID ${pid} is not running`
+        : alive === true
+          ? `its PID ${pid} is running but is no /ci-live runner (the PID was reused, as after a VM reboot)`
+          : `its PID ${pid} is no live /ci-live runner`
+  }
+  return `WARNING: removed the stale run lock ${path}: ${why}`
+}
+
 export class RunLock {
   private released = false
 
@@ -117,14 +147,20 @@ export class RunLock {
     private readonly deps: LockDeps,
   ) {}
 
-  /** Take the lock, replacing a stale one; not runnable when a live runner holds it. */
-  static acquire(path: string, what: string, deps: LockDeps = nodeLockDeps): RunLock {
+  /**
+   * Take the lock, replacing a stale one (with `warn` told which, and why);
+   * not runnable when a live runner holds it.
+   */
+  static acquire(path: string, what: string, deps: LockDeps = nodeLockDeps, warn: (message: string) => void = () => undefined): RunLock {
     for (let attempt = 0; attempt < 2; attempt++) {
       if (deps.createExclusive(path, `${deps.pid}\n`)) return new RunLock(path, deps)
+      const text = deps.read(path)
       const holder = lockHolder(path, deps)
       if (holder !== null) {
         throw new NotRunnableError(`another ${what} (PID ${holder}) is in progress and holds ${path}: wait for it to finish`)
       }
+      // Gone between the create and the read: nothing to remove, nothing to warn about.
+      if (text !== null) warn(staleLockWarning(path, lockPid(text), deps))
       deps.unlink(path)
     }
     throw new NotRunnableError(`could not take the run lock ${path}: remove it if no /ci-live run is in progress`)

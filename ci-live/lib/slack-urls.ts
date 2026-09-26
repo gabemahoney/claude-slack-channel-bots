@@ -13,4 +13,5 @@ export const REAL_SLACK_URLS: SlackUrls = {
   oauthPage: (appId) => `https://api.slack.com/apps/${appId}/oauth`,
   basicInfoPage: (appId) => `https://api.slack.com/apps/${appId}/general`,
   conversation: (teamId, conversationId) => `https://app.slack.com/client/${teamId}/${conversationId}`,
+  appsList: () => 'https://api.slack.com/apps',
 }

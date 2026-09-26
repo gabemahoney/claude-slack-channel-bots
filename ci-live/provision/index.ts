@@ -9,7 +9,7 @@
 
 import type { AppsStateFile } from '../lib/apps-state.ts'
 import type { Stage } from '../lib/args.ts'
-import type { BrowserDriver } from '../lib/browser-types.ts'
+import type { BrowserDriver, ListedApp } from '../lib/browser-types.ts'
 import type { JsonObject } from '../lib/manifest.ts'
 import { appDisplayName, PERSONA_LETTERS, type PersonaLetter } from '../lib/personas.ts'
 import type { SecretStore } from '../lib/secrets.ts'
@@ -37,6 +37,8 @@ export interface ProvisionDeps {
    * another VM) and stops, not runnable.
    */
   requireAppsJsonToCreate?: boolean
+  /** The apps list page (api.slack.com/apps), for the apps stage's unfinished-create check. */
+  listApps?: () => Promise<ListedApp[]>
 }
 
 /** Why a real run with no apps.json creates no app, and what the operator does about it. */
@@ -103,6 +105,7 @@ export async function runProvisioning(deps: ProvisionDeps, stage: Stage | null):
           letters: PERSONA_LETTERS,
           log: deps.log,
           refuseCreate: deps.requireAppsJsonToCreate && !deps.appsFile.exists() ? missingAppsJsonMessage(deps.appsFile.path) : null,
+          listApps: deps.listApps,
         })
         break
       case 'install':
