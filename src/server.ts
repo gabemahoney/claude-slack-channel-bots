@@ -68,11 +68,12 @@ import {
   replySettingsOf,
   MCP_SERVER_NAME,
 } from './config.ts'
-import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import {
   AGENT_DIRECTOR_LIVE_STATES,
   checkLaunchConfigDir,
   deletePersonaInstance,
+  hasPersonaTmuxSession,
   holdLaunchIfConfigDirUnresolvable,
   isLaunchInFlight,
   killPersonaInstance,
@@ -988,40 +989,61 @@ export function _buildKillSessionAdapter(
  * NOT count and does NOT re-enter scheduleRestart on, leaving the next tick free
  * to retry once the turn settles to an idle-like state (waiting/ask_user/
  * check_permission). This does not regress the b.rmy invariant: we never declare
- * `working` dead, only decline to poke it. On any status error we fall through
- * to the reconnect attempt (today's behavior) rather than manufacture a false
- * defer.
+ * a `working` row with a live tmux session dead, only decline to poke it. On
+ * any status error we fall through to the reconnect attempt (today's behavior)
+ * rather than manufacture a false defer.
+ *
+ * b.d61 — the `working` deferral is bounded by the tmux session. A `working`
+ * row is no proof of a live turn: when the persona's tmux session is killed
+ * mid-turn, SessionEnd fires but AD only soft-refreshes the row
+ * (`working → working`), and it stays frozen until a findMissing sweep
+ * reconciles it to `missing`. Deferring on the row alone would repeat on every
+ * tick and the persona would never relaunch. So the `working` branch also
+ * probes the persona's own `slack_bot_<key>` tmux session
+ * (`hasPersonaTmuxSession`, the session manager's prober seam):
+ *   - a launch for the persona is in flight → defer ('transient'): the launch
+ *     owns the session's lifecycle, and a tmux session it has not created yet
+ *     is no proof of death;
+ *   - alive → defer ('transient'), as above;
+ *   - gone → there is no pane to type into: fire the dead-tmux sweep
+ *     (`sweepDeadTmuxChannel`, b.sv7) once and return 'escalate-dead'.
+ *     restart.ts then probes liveness again in the same restart run and, when
+ *     the reconciled row reads dead, takes the kill+relaunch branch at once
+ *     (otherwise a later tick does);
+ *   - the probe throws → defer ('transient'): a failed probe is no proof the
+ *     session is dead (b.rmy).
+ * The deferral therefore lasts only while the persona's tmux session exists.
  *
  * @internal
  */
 export function _buildReconnectSessionAdapter(): (key: string) => Promise<'success' | 'escalate-dead' | 'transient'> {
   // `key` is the persona key.
   return async (key: string) => {
+    let state: string | undefined
     try {
       const claude_instance_id = personaInstanceId(key)
       const st = await withOutageDetection(key, undefined, (client) =>
         client.status({ claude_instance_id }),
       )
-      if (st.state === 'working') {
-        console.error(`[slack] reconnectSession: persona=${key} is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)`)
-        return 'transient'
-      }
+      state = st.state
     } catch {
       // Ignore — proceed to reconnect attempt below (reconnectMcp handles its
       // own status/send-keys errors and outage flagging).
     }
+    if (state === 'working') return workingReconnectVerdict(key)
     // Widened return type (SR-25.1 single counting site): surface the
     // ReconnectOutcome to restart.ts so it can call recordSuccess on the
     // success path. Map main's ReconnectOutcome onto the restart union —
     // 'ok' is the only success signal restart.ts acts on; 'dead-session'
     // and 'failed' are non-success (no recordSuccess, no recordFailure).
     // 'dead-session' maps to 'escalate-dead' (b.9a7-amended): restart.ts does
-    // not re-enter scheduleRestart on it, but the NEXT health-check tick will
-    // — it sees the row still alive && !connected (or dead), and reschedules.
-    // For the dead-tmux escalate-dead case (b.sv7 / Epic t1.tkk.e4), CSCB
-    // recovers ITSELF: we fire the internal sweep wrapper here so the frozen
-    // `working` row reconciles to `missing`, and the next tick sees
-    // alive === false and takes the normal kill+relaunch branch. The external
+    // not re-enter scheduleRestart on it. For the dead-tmux escalate-dead case
+    // (b.sv7 / Epic t1.tkk.e4), CSCB recovers ITSELF: we fire the internal
+    // sweep wrapper here so the frozen `working` row reconciles to `missing`,
+    // and restart.ts probes liveness again in the same restart run (b.d61):
+    // alive === false takes the normal kill+relaunch branch at once. When the
+    // row still reads alive, the NEXT health-check tick sees it still alive
+    // && !connected (or dead) and reschedules. The external
     // ~/startup/find-missing-loop.sh is belt-and-braces only (it may also
     // reconcile the row, but recovery no longer silently depends on it —
     // removing it is a separate operator decision). Not counting here keeps
@@ -1046,6 +1068,38 @@ export function _buildReconnectSessionAdapter(): (key: string) => Promise<'succe
     }
     return 'transient'
   }
+}
+
+/**
+ * b.d61: the reconnect adapter's verdict for a persona whose AD row reads
+ * `working` — defer while a launch for it is in flight or its tmux session is
+ * alive or cannot be probed, sweep and escalate once it is provably gone (see
+ * `_buildReconnectSessionAdapter`). Never throws: `sweepDeadTmuxChannel`
+ * swallows its own failures.
+ */
+async function workingReconnectVerdict(key: string): Promise<'escalate-dead' | 'transient'> {
+  if (isLaunchInFlight(key)) {
+    console.error(`[slack] reconnectSession: persona=${key} is working and a launch for it is in flight — deferring /mcp reconnect to a later tick (b.d61)`)
+    return 'transient'
+  }
+  let tmuxAlive: boolean
+  try {
+    tmuxAlive = await hasPersonaTmuxSession(key)
+  } catch (err) {
+    console.error(
+      `[slack] reconnectSession: persona=${key} is working and its tmux session probe failed: ${describeThrownValue(err)} — deferring /mcp reconnect to a later tick (b.d61/b.rmy)`,
+    )
+    return 'transient'
+  }
+  if (tmuxAlive) {
+    console.error(`[slack] reconnectSession: persona=${key} is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)`)
+    return 'transient'
+  }
+  console.error(
+    `[slack] reconnectSession: persona=${key} is working but its tmux session "${personaTmuxSessionName(key)}" is gone — not deferring; reconciling so the restart relaunches it (b.d61)`,
+  )
+  await sweepDeadTmuxChannel(key, 'working-tmux-gone')
+  return 'escalate-dead'
 }
 
 // ---------------------------------------------------------------------------

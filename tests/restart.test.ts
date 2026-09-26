@@ -912,13 +912,15 @@ describe('backoff integration (SR-29.3)', () => {
   //     record a failure at the reconnect site (single-counting-site pin).
   //
   //     Single-counting-site pin: the reconnect path never calls recordFailure.
-  //     On main, a non-success reconnect outcome ('escalate-dead' or 'transient')
-  //     does NOT re-enter scheduleRestart. For 'escalate-dead' (dead-tmux) the
-  //     adapter upstream fires CSCB's internal reconcileMissingSweep so the frozen
-  //     `working` row reconciles to `missing` and the NEXT health tick takes the
-  //     kill+relaunch branch (Epic t1.tkk.e4 / b.sv7) — recovery is internal, not
-  //     deferred to the external ~/startup/find-missing-loop.sh (belt-and-braces
-  //     only). Whether or not that sweep fires, the reconnect verdict path still
+  //     A non-success reconnect outcome ('escalate-dead' or 'transient') does NOT
+  //     re-enter scheduleRestart. For 'escalate-dead' (dead-tmux) the adapter
+  //     upstream fires CSCB's internal reconcileMissingSweep so the frozen
+  //     `working` row reconciles to `missing`; the same restart run then probes
+  //     liveness again and, when the row reads dead, takes the kill+relaunch
+  //     branch at once (b.d61; a row that still reads alive is left to a later
+  //     tick) — recovery is internal, not deferred to the external
+  //     ~/startup/find-missing-loop.sh (belt-and-braces only; Epic t1.tkk.e4 /
+  //     b.sv7). Whether or not that sweep fires, the reconnect verdict path still
   //     records neither success nor failure: the one and only place a failure is
   //     counted is the launchSession boolean on the dead-session relaunch path.
   //     Recording a failure at the reconnect site too would be a spurious second
@@ -954,8 +956,11 @@ describe('backoff integration (SR-29.3)', () => {
   test('(4b) reconnect result=escalate-dead leaves counter unchanged at reconnect site (single-counting-site pin; no cap accumulation)', async () => {
     // Single-counting-site pin: the reconnect path does NOT call recordFailure.
     // 'escalate-dead' does NOT re-enter scheduleRestart; internal recovery flows
-    // through the adapter's reconcileMissingSweep so the next health tick relaunches
-    // (Epic t1.tkk.e4 / b.sv7). The lone place failures are counted is the
+    // through the adapter's reconcileMissingSweep (Epic t1.tkk.e4 / b.sv7). Here
+    // the liveness re-probe that follows the verdict (b.d61) still reads alive,
+    // so this run relaunches nothing and a later tick retries; the re-probe that
+    // reads dead and relaunches in the same run is pinned in the b.d61 re-probe
+    // block below. The lone place failures are counted is the
     // launchSession boolean on the relaunch path. This test also proves the
     // reconnect path does not erroneously RESET the counter: it pre-seeds one
     // failure and asserts the count remains 1 — so escalate-dead ticks never
@@ -1809,7 +1814,7 @@ describe('restart cap notice goes to the persona destination (b.av2 SR-7.2)', ()
 })
 
 // ---------------------------------------------------------------------------
-// Escalate-dead internal recovery (Epic t1.tkk.e4 / b.sv7) — two-tick relaunch
+// Escalate-dead internal recovery (Epic t1.tkk.e4 / b.sv7, b.d61)
 //
 // The fake-deps tests above inject a fake `reconnectSession` that returns
 // 'escalate-dead' directly, so they never touch the real adapter or the
@@ -1820,9 +1825,11 @@ describe('restart cap notice goes to the persona destination (b.av2 SR-7.2)', ()
 // send-keys failures ('dead-session' → 'escalate-dead') must fire CSCB's OWN
 // memoized reconcileMissingSweep (observed as exactly one findMissing call — the
 // external ~/startup/find-missing-loop.sh is absent by construction, never
-// referenced here). Then, once that sweep has (in production) reconciled the
-// frozen `working` row to `missing`, a SUBSEQUENT tick with the session reported
-// dead takes the normal kill+relaunch branch.
+// referenced here). The restart run then probes liveness again (b.d61): once
+// that sweep has (in production) reconciled the frozen `working` row to
+// `missing`, the re-probe reads it dead and the same run takes the normal
+// kill+relaunch branch; while the row still reads alive, the run relaunches
+// nothing and a SUBSEQUENT tick that sees the session dead does.
 //
 // Seams only — the tmux-server ensurer is stubbed to a no-op so reconnectMcp's
 // self-heal retry never shells out to a real tmux server; no live tmux/fleet is
@@ -1905,7 +1912,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     _resetFindMissingMemo()
   })
 
-  test('tick 1: alive+dead-tmux verdict fires exactly one internal findMissing sweep (no kill/relaunch); tick 2: session dead → kill+relaunch', async () => {
+  test('tick 1: alive+dead-tmux verdict fires exactly one internal findMissing sweep; the re-probe still reads alive (no kill/relaunch); tick 2: session dead → kill+relaunch', async () => {
     const KEY = 'C_DEADTMUX'
     const { deps, findMissingCalls, statusCalls, sendKeysCalls, setAlive } = makeRealAdapterDeps()
     initRestart(deps)
@@ -1917,8 +1924,9 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     await Bun.sleep(WAIT_MS)
 
     // The existing memoized sweep ran exactly once — this is CSCB's own recovery,
-    // not the external loop (absent by construction). The escalate-dead verdict
-    // takes NO relaunch action on this tick.
+    // not the external loop (absent by construction). The liveness re-probe
+    // that follows the escalate-dead verdict (b.d61) still reads alive here (the
+    // sweep did not reconcile the row), so this tick takes NO relaunch action.
     expect(findMissingCalls).toHaveLength(1)
     expect(deps.killSessionCalls).toHaveLength(0)
     expect(deps.launchSessionCalls).toHaveLength(0)
@@ -1930,10 +1938,10 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(KEY)])
     expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C_DEADTMUX', 'cscb_C_DEADTMUX'])
 
-    // --- Tick 2: the sweep has (in production) reconciled the row to `missing`,
-    // so the next tick observes the session dead. The normal kill+relaunch
-    // branch runs. Reset the memo so this tick's semantics don't depend on the
-    // prior sweep's TTL — we are simulating a LATER tick past the memo window.
+    // --- Tick 2: the row has since been reconciled to `missing`, so the next
+    // tick observes the session dead. The normal kill+relaunch branch runs.
+    // Reset the memo so this tick's semantics don't depend on the prior sweep's
+    // TTL — we are simulating a LATER tick past the memo window.
     _resetFindMissingMemo()
     setAlive(false)
     scheduleRestart(KEY, '/cwd/test')
@@ -1941,6 +1949,233 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
 
     expect(deps.killSessionCalls).toEqual([KEY])
     expect(deps.launchSessionCalls).toEqual([KEY])
+  })
+
+  test('b.d61: the sweep reconciles the row before the re-probe → the same run kills and relaunches once, with no second relaunch', async () => {
+    const KEY = 'C_DEADTMUX'
+    const { deps, findMissingCalls, sendKeysCalls } = makeRealAdapterDeps()
+    // The row reads alive until the sweep has run and dead after it (what AD
+    // does for a row whose tmux session is gone).
+    deps.isSessionAlive = async () => findMissingCalls.length === 0
+    initRestart(deps)
+
+    scheduleRestart(KEY, '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    // 'dead-session' → 'escalate-dead': the send-keys reconnect and its retry
+    // failed and the sweep ran once; the re-probe read the row dead, so this
+    // one run killed and relaunched it and armed nothing further.
+    expect(sendKeysCalls).toHaveLength(2)
+    expect(findMissingCalls).toHaveLength(1)
+    expect(deps.killSessionCalls).toEqual([KEY])
+    expect(deps.launchSessionCalls).toEqual([KEY])
+    expect(getFailureCount(KEY)).toBe(0)
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.d61: a persona killed mid-turn is relaunched, not deferred forever.
+//
+// The live Check 7 shape: the persona's tmux session is killed while it is
+// `working`, so its MCP session drops and AD's row stays frozen at `working`
+// until a findMissing sweep reconciles it. The liveness probe and the reconnect
+// adapter are the REAL ones over one stub AD client whose row reads `working`
+// until a findMissing sweep has run and `missing` after it (what AD does for a
+// row whose tmux session is gone). The tmux-session prober reports the
+// persona's session gone. Kill and launch are recording fakes. The restart
+// run's liveness re-probe after the 'escalate-dead' verdict reads the
+// reconciled row, so the relaunch happens in that same run.
+// ---------------------------------------------------------------------------
+
+describe('b.d61: a working persona whose tmux session is gone is relaunched in the same restart run', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-d61-'))
+    _resetFindMissingMemo()
+  })
+
+  afterEach(() => {
+    cancelAllRestartTimers()
+    resetClientForTests()
+    _resetOutageState()
+    _resetTmuxServerEnsurer()
+    _resetTmuxSessionProber()
+    _resetFindMissingMemo()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('alive (working) but disconnected → one findMissing sweep and no send-keys; the re-probe reads the row missing → one kill and one relaunch in that run, and no second relaunch', async () => {
+    const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
+    const KEY = config.personas[0]!.key
+    const sendKeysCalls: SendKeysParams[] = []
+    const findMissingCalls: FindMissingParams[] = []
+    const stub = makeStubClient({
+      statusFn: () => ({ state: findMissingCalls.length > 0 ? 'missing' : 'working' }),
+      sendKeysCalls,
+      findMissingCalls,
+    })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    _setTmuxServerEnsurer(async () => {})
+    _setTmuxSessionProber(async () => false)
+
+    const killSessionCalls: string[] = []
+    const launchSessionCalls: string[] = []
+    initRestart({
+      canRestart: () => true,
+      isSessionAlive: _buildIsSessionAliveAdapter(() => config),
+      isSessionConnected: () => false,
+      hasSessionStream: () => false,
+      reconnectSession: _buildReconnectSessionAdapter(),
+      async killSession(key) { killSessionCalls.push(key) },
+      async launchSession(key) { launchSessionCalls.push(key); return true },
+      getRestartDelay: () => FAST_DELAY_S,
+      isShuttingDown: () => false,
+      onCapReached: () => {},
+    })
+
+    // One restart run: the frozen `working` row reads alive; the reconnect
+    // adapter finds the tmux session gone and sweeps instead of deferring; the
+    // sweep reconciled the row to `missing`, so the re-probe reads dead and the
+    // normal kill + relaunch branch runs at once.
+    scheduleRestart(KEY, config.personas[0]!.working_directory)
+    await Bun.sleep(WAIT_MS)
+
+    expect(findMissingCalls).toHaveLength(1)
+    // Nothing is typed into a pane that no longer exists.
+    expect(sendKeysCalls).toEqual([])
+    expect(killSessionCalls).toEqual([KEY])
+    expect(launchSessionCalls).toEqual([KEY])
+    // The successful launch counts no failure.
+    expect(getFailureCount(KEY)).toBe(0)
+    // The run armed no further timer: nothing relaunches the persona again.
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.d61: the liveness re-probe after an 'escalate-dead' reconnect. The
+// reconnect adapter has already run the findMissing sweep when it answers
+// 'escalate-dead', so the restart run probes liveness once more: a row that now
+// reads dead, or a re-probe that throws (counted as not alive, as the first
+// probe's throw is), goes on to the kill and relaunch in the same run, with the
+// launch's usual accounting; a row that still reads alive is left to a later
+// tick. Shutdown and the not-up gate are asked again after the re-probe, since
+// it is an async agent-director call. The deps are `makeDeps` fakes: the first
+// probe reads alive and the reconnect answers 'escalate-dead'.
+// ---------------------------------------------------------------------------
+
+describe('b.d61: after an escalate-dead reconnect, the restart run probes liveness again', () => {
+  const KEY = 'reprobe_bot'
+  const RELAUNCH = '[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run'
+  const STILL_ALIVE = '[slack] Session still reads alive after escalate-dead — leaving the relaunch to a later tick'
+  /** Every raw console.error argument list, so a leak in an error object shows. */
+  let errArgs: unknown[][]
+  let origConsoleError: typeof console.error
+
+  const lines = () => errArgs.map((args) => args.map(String).join(' '))
+  const linesStarting = (prefix: string) => lines().filter((l) => l.startsWith(prefix) && l.includes(`persona=${KEY}`))
+
+  /**
+   * makeDeps whose first liveness probe reads alive, whose reconnect answers
+   * 'escalate-dead', and whose re-probe runs `reprobe`.
+   */
+  function makeEscalateDeps(reprobe: () => Promise<boolean>, opts: DepsOpts = {}): ReturnType<typeof makeDeps> {
+    const deps = makeDeps(opts)
+    deps.isSessionAlive = async (key) => {
+      deps.isSessionAliveCalls.push(key)
+      return deps.isSessionAliveCalls.length === 1 ? true : reprobe()
+    }
+    deps.reconnectSession = async (key) => {
+      deps.reconnectSessionCalls.push(key)
+      return 'escalate-dead'
+    }
+    return deps
+  }
+
+  beforeEach(() => {
+    errArgs = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+  })
+
+  test.each<[string, () => Promise<boolean>, boolean, string | undefined]>([
+    ['reads dead → the same run kills and relaunches once', async () => false, true, undefined],
+    [
+      'throws → counted as not alive: the same run kills and relaunches once; the failure is logged as its redacted description',
+      async () => {
+        throw Object.assign(new Error(`status refused (${sentinelInMessage('reprobe')})`), { code: 'EIO', note: LEAK_SENTINEL })
+      },
+      true,
+      `[slack] restart: isSessionAlive failed after escalate-dead for persona=${KEY}: Error code=EIO message="status refused (${REDACTED_SENTINEL_TAIL})" at `,
+    ],
+    ['still reads alive → nothing is killed or launched; the relaunch is left to a later tick', async () => true, false, undefined],
+  ])('the re-probe %s', async (_label, reprobe, relaunched, failedLine) => {
+    // A failed launch, so the count shows whether the launch was attempted (the
+    // escalate-dead verdict itself never counts: single counting site).
+    const deps = makeEscalateDeps(reprobe, { launchSessionResult: false })
+    initRestart(deps)
+
+    scheduleRestart(KEY, '/cwd/reprobe')
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
+    expect(deps.reconnectSessionCalls).toEqual([KEY])
+    expect(deps.killSessionCalls).toEqual(relaunched ? [KEY] : [])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual(relaunched ? [KEY] : [])
+    expect(getFailureCount(KEY)).toBe(relaunched ? 1 : 0)
+    // restart.ts re-arms nothing either way: the health-check tick is the retry driver.
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+    expect(linesStarting(RELAUNCH)).toHaveLength(relaunched ? 1 : 0)
+    expect(linesStarting(STILL_ALIVE)).toHaveLength(relaunched ? 0 : 1)
+    const failed = linesStarting('[slack] restart: isSessionAlive failed')
+    expect(failed).toHaveLength(failedLine === undefined ? 0 : 1)
+    if (failedLine !== undefined) expect(failed[0]).toStartWith(failedLine)
+    assertNoLeak({ errArgs })
+  })
+
+  test.each<[string, 'shutdown' | 'not-up', string, number]>([
+    ['the server starts shutting down', 'shutdown', `[slack] Skipping restart — server is shutting down (persona=${KEY})`, 3],
+    ['the persona stops being up', 'not-up', `[slack] Skipping restart for persona=${KEY} — the persona is no longer up; its instance is left as it is`, 4],
+  ])('%s while the re-probe is pending: though the row now reads dead, nothing is killed or launched; the count is unchanged; the skip is logged once', async (_label, flip, skipLine, gateAsks) => {
+    // One failure on record, so a reset or a counted launch would show.
+    recordFailure(KEY)
+    let shuttingDown = false
+    let up = true
+    const asked: string[] = []
+    const deps = makeEscalateDeps(async () => {
+      if (flip === 'shutdown') shuttingDown = true
+      else up = false
+      return false
+    }, { launchSessionResult: false })
+    deps.isShuttingDown = () => shuttingDown
+    deps.canRestart = (key) => { asked.push(key); return up }
+    initRestart(deps)
+
+    scheduleRestart(KEY, '/cwd/reprobe')
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
+    expect(deps.reconnectSessionCalls).toEqual([KEY])
+    // Asked when scheduled, when the timer fired and after the first probe; the
+    // not-up case is asked once more after the re-probe, while shutdown returns
+    // before the gate is asked.
+    expect(asked).toEqual(Array(gateAsks).fill(KEY))
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(KEY)).toBe(1)
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+    expect(lines().filter((l) => l === skipLine)).toHaveLength(1)
+    expect(linesStarting(RELAUNCH)).toEqual([])
+    expect(linesStarting('[slack] Relaunching session')).toEqual([])
   })
 })
 

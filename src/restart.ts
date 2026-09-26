@@ -8,7 +8,8 @@
  * A persona that is not up (broken, or retrying its bring-up; b.av2 SR-6.4)
  * is never restarted: `RestartDeps.canRestart` is asked before a timer is
  * armed, again when it fires (before the liveness probe) and once more after
- * the probe (before any reconnect or kill), so its instance and row are left
+ * the probe (before any reconnect or kill; and after the re-probe that follows
+ * an 'escalate-dead' reconnect, b.d61), so its instance and row are left
  * alone and its failure count is unchanged. `launchSession`'s own gate is the
  * backstop for a flip during the kill.
  * A fired timer's work runs through the per-persona lifecycle serializer
@@ -62,7 +63,9 @@ export interface RestartDeps {
    * bring-up is broken or retrying, or its Slack connection is not serving;
    * b.av2 SR-6.4). Asked when a restart is scheduled, when its timer fires
    * (before `isSessionAlive`) and again after that probe (before
-   * `reconnectSession` or `killSession`): a not-up persona's instance is
+   * `reconnectSession` or `killSession`), and after the second
+   * `isSessionAlive` probe that follows an 'escalate-dead' reconnect (b.d61):
+   * a not-up persona's instance is
    * never killed, reconnected, deleted or launched, and its failure count is
    * left as it is. The server passes the relaunch gate
    * (`createPersonaRelaunchGate`).
@@ -228,7 +231,9 @@ async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise
 /**
  * The work a restart timer does when it fires, run through the serializer:
  * the shutdown and not-up checks, the liveness probe, then a reconnect, or a
- * kill and a launch, and the success or failure accounting.
+ * kill and a launch, and the success or failure accounting. A reconnect whose
+ * verdict is 'escalate-dead' is followed by a second liveness probe; when the
+ * row now reads dead, the same run goes on to the kill and launch (b.d61).
  */
 async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<void> {
   if (d.isShuttingDown()) {
@@ -280,27 +285,35 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
     if (reconnectResult === 'success') {
       // Reconnect succeeded — reset the failure counter and cap latch.
       recordSuccess(key)
+      return
     }
     // Non-success/non-void branches ('escalate-dead', 'transient', or undefined):
     // do NOT recordFailure here. SR-25.1 / single counting site: counting
     // lives only at the launchSession boolean below. restart.ts does not
-    // re-enter scheduleRestart on any of these outcomes — it simply returns.
-    // Post-b.9a7 that is safe: the periodic health-check tick is now the
-    // retry driver. On the next tick the persona is re-observed; if it is
-    // still alive && !connected (or has since gone dead), the tick calls
-    // scheduleRestart again, so a failed/deferred reconnect is retried
-    // without any re-entry here. ('transient' also covers the b.9a7 hazard-2
-    // `working` defer: the tick retries once the turn settles.) For the
-    // dead-tmux 'escalate-dead' case CSCB now recovers itself (b.sv7 / Epic
-    // t1.tkk.e4): the reconnectSession adapter fires the internal memoized
-    // findMissing sweep before returning 'escalate-dead', so the frozen
-    // `working` row reconciles to `missing` and the NEXT tick observes
-    // alive === false and falls through to the kill+relaunch branch below.
-    // The external ~/startup/find-missing-loop.sh is belt-and-braces only —
-    // recovery no longer depends on it, and removing it is a separate
-    // operator decision. Not counting here keeps the failure count tied to
-    // actual launch attempts, not this reconnect site.
-    return
+    // re-enter scheduleRestart on any of these outcomes. Post-b.9a7 that is
+    // safe: the periodic health-check tick is now the retry driver. On the
+    // next tick the persona is re-observed; if it is still alive &&
+    // !connected (or has since gone dead), the tick calls scheduleRestart
+    // again, so a failed/deferred reconnect is retried without any re-entry
+    // here. ('transient' also covers the b.9a7 hazard-2 `working` defer: the
+    // tick retries once the turn settles.) Not counting here keeps the
+    // failure count tied to actual launch attempts, not this reconnect site.
+    //
+    // For the dead-tmux 'escalate-dead' verdicts ('dead-session' from
+    // reconnectMcp, and b.d61's `working` row whose tmux session is gone)
+    // CSCB recovers itself (b.sv7 / Epic t1.tkk.e4): the reconnectSession
+    // adapter fires the internal memoized findMissing sweep before returning,
+    // so the frozen `working` row reconciles to `missing`. b.d61: rather than
+    // wait for the next tick (a full health interval plus another backoff
+    // delay), this run probes liveness again and, when the row now reads
+    // dead, falls through to the kill+relaunch branch below at once, with the
+    // same accounting as any dead-session relaunch. When the row still reads
+    // alive (e.g. the sweep failed or a memoized result predates the kill),
+    // it returns as before and the next tick retries. The external
+    // ~/startup/find-missing-loop.sh is belt-and-braces only — recovery no
+    // longer depends on it, and removing it is a separate operator decision.
+    if (reconnectResult !== 'escalate-dead') return
+    if (!(await reprobeDeadAfterEscalate(d, key))) return
   }
 
   // Kill zombie if needed (ignore errors — session may not exist)
@@ -348,6 +361,41 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
       return
     }
   }
+}
+
+/**
+ * b.d61: after an 'escalate-dead' reconnect verdict (whose adapter already ran
+ * the findMissing sweep), probe the persona's liveness again. Returns true when
+ * the row now reads dead and this restart run should go on to the
+ * kill+relaunch branch; false when it should return as before (the row still
+ * reads alive, so the next tick retries; the server is shutting down; or the
+ * persona is no longer up). The probe is guarded as the first one is: a thrown
+ * probe counts as not alive. Shutdown and the not-up gate are asked after the
+ * probe, since it is an async agent-director call; `killSession`'s
+ * launch-in-flight guard and `launchSession`'s own gate still apply after it.
+ * Records no success or failure.
+ */
+async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<boolean> {
+  let alive: boolean
+  try {
+    alive = await d.isSessionAlive(key)
+  } catch (err) {
+    console.error(`[slack] restart: isSessionAlive failed after escalate-dead for persona=${key}: ${describeThrownValue(err)}`)
+    alive = false
+  }
+
+  if (d.isShuttingDown()) {
+    console.error(`[slack] Skipping restart — server is shutting down (persona=${key})`)
+    return false
+  }
+  if (skipIfNotUp(d, key)) return false
+
+  if (alive) {
+    console.error(`[slack] Session still reads alive after escalate-dead — leaving the relaunch to a later tick for persona=${key}`)
+    return false
+  }
+  console.error(`[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run for persona=${key} (b.d61)`)
+  return true
 }
 
 /**

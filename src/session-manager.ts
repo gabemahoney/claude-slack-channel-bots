@@ -504,6 +504,17 @@ export function _resetTmuxSessionProber(): void {
 }
 
 /**
+ * Probe whether the persona's own tmux session (`slack_bot_<key>`) is alive,
+ * through the tmux-session prober seam above (b.d61: the restart module's
+ * reconnect adapter bounds its `working` deferral with it). The default prober
+ * never rejects; an injected one may, so the caller decides what a failed probe
+ * means.
+ */
+export async function hasPersonaTmuxSession(key: string): Promise<boolean> {
+  return _hasTmuxSession(personaTmuxSessionName(key))
+}
+
+/**
  * Reconnect outcome (b.3ce). `dead-session` means the session is provably
  * unusable — callers should recover via the resume/fresh-spawn path rather than
  * report a bare failure. Two classes of proof qualify:
@@ -993,9 +1004,11 @@ async function reconcileMissingSweep(key: string, logPrefix: string, ref: string
  * recovers itself instead of silently waiting on the external
  * `~/startup/find-missing-loop.sh`: emit an operator-visible log line, then run
  * the existing memoized `reconcileMissingSweep` (b.m4r). The sweep reconciles
- * the frozen `working` row to `missing`, so the NEXT health-check tick observes
- * `alive === false` and takes the normal kill+relaunch branch. The external
- * loop remains belt-and-braces; removing it is a separate operator decision.
+ * the frozen `working` row to `missing`, so the restart run's second liveness
+ * probe (b.d61) observes `alive === false` and takes the normal kill+relaunch
+ * branch at once; if the row still reads alive, a later health-check tick
+ * does. The external loop remains belt-and-braces; removing it is a separate
+ * operator decision.
  *
  * The log line is emitted UNCONDITIONALLY here — before/outside the memoized
  * helper — because a memo hit returns silently and a sweep failure logs only
@@ -1013,7 +1026,7 @@ async function reconcileMissingSweep(key: string, logPrefix: string, ref: string
  */
 export async function sweepDeadTmuxChannel(key: string, verdict: string): Promise<void> {
   console.error(
-    `[slack] escalate-dead: ${keyRef(key)} verdict=${verdict} — tmux session provably dead, triggering internal findMissing reconciliation (next tick relaunches; ~/startup/find-missing-loop.sh is belt-and-braces)`,
+    `[slack] escalate-dead: ${keyRef(key)} verdict=${verdict} — tmux session provably dead, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)`,
   )
   await reconcileMissingSweep(key, 'escalate-dead')
 }

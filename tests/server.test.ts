@@ -23,12 +23,19 @@ import {
   setClientForTests,
   resetClientForTests,
 } from '../src/agent-director-client.ts'
-import { makeStubClient, errTmuxSendKeys } from './test-helpers/agent-director-stub.ts'
+import { makeStubClient, errTmuxSendKeys, holdSpawns, type StubClient } from './test-helpers/agent-director-stub.ts'
 import { _buildIsSessionAliveAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
 import {
   _resetFindMissingMemo,
   _setTmuxServerEnsurer,
   _resetTmuxServerEnsurer,
+  _setTmuxSessionProber,
+  _resetTmuxSessionProber,
+  _setSpawnHomeDir,
+  _resetSpawnHomeDir,
+  _resetInFlightLaunches,
+  isLaunchInFlight,
+  spawnForPersona,
 } from '../src/session-manager.ts'
 import type { FindMissingParams, SendKeysParams, StatusParams } from 'agent-director'
 import type { PersonaConfig } from '../src/config.ts'
@@ -552,6 +559,17 @@ describe('_buildIsSessionAliveAdapter', () => {
 // status probe uses, so the shared stub's `sendKeysCalls` is the observable
 // seam for "was a reconnect attempted", and `sendKeysResult`/`sendKeysError`
 // drive the ok→'success' / dead-session→'escalate-dead' mapping.
+//
+// b.d61: a `working` row whose tmux session is gone (the Claude inside it was
+// killed mid-turn, so AD's row stays frozen at `working`) must not be deferred
+// forever. The `working` branch probes the persona's `slack_bot_<key>` tmux
+// session through the session manager's prober seam (`_setTmuxSessionProber`,
+// installed by the harness so no test shells out to tmux): gone → the dead-tmux
+// sweep and 'escalate-dead'; alive, or a probe that fails → the 'transient'
+// defer, so a live turn is never poked (b.rmy) and a probe error never
+// manufactures a false dead. While a launch for the persona is in flight the
+// `working` row is deferred without a probe: the launch owns the session, and a
+// tmux session it has not created yet is no proof of death.
 // ---------------------------------------------------------------------------
 
 describe('_buildReconnectSessionAdapter', () => {
@@ -559,20 +577,32 @@ describe('_buildReconnectSessionAdapter', () => {
    * Build a stub client wired into BOTH outage-state (which withOutageDetection
    * calls via getClient) and setClientForTests, plus a reconnect adapter. The
    * status probe and reconnectMcp's send-keys both flow through this one client.
+   * `tmux` is what the tmux-session prober reports (default alive); every name
+   * it is asked about lands in `tmuxProbes`. `stub` is the shared client, for a
+   * test that holds a launch's spawn open on it (`holdSpawns`).
    */
   function makeHarness(opts: {
     statusState?: string
     statusThrows?: boolean
     sendKeysThrows?: Error
+    tmux?: 'alive' | 'gone' | 'probe-error'
   }): {
     adapter: (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient'>
     statusCalls: StatusParams[]
     sendKeysCalls: SendKeysParams[]
     findMissingCalls: FindMissingParams[]
+    tmuxProbes: string[]
+    stub: StubClient
   } {
     const statusCalls: StatusParams[] = []
     const sendKeysCalls: SendKeysParams[] = []
     const findMissingCalls: FindMissingParams[] = []
+    const tmuxProbes: string[] = []
+    _setTmuxSessionProber(async (name) => {
+      tmuxProbes.push(name)
+      if (opts.tmux === 'probe-error') throw new Error('tmux probe failed')
+      return opts.tmux !== 'gone'
+    })
     const stub = makeStubClient({
       statusCalls,
       statusFn: () =>
@@ -604,10 +634,16 @@ describe('_buildReconnectSessionAdapter', () => {
       statusCalls,
       sendKeysCalls,
       findMissingCalls,
+      tmuxProbes,
+      stub,
     }
   }
 
+  /** Per-test temp directory (persona paths and the spawn home); removed in afterEach. */
+  let dir: string
+
   beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'server-reconnect-'))
     // The escalate-dead sweep is memoized (b.m4r, 10s TTL). Clear the memo so a
     // sweep from another test can't satisfy this test's findMissing assertion —
     // the TTL setter alone does not clear an already-populated memo entry.
@@ -618,24 +654,86 @@ describe('_buildReconnectSessionAdapter', () => {
     resetClientForTests()
     _resetOutageState()
     _resetTmuxServerEnsurer()
+    _resetTmuxSessionProber()
     _resetFindMissingMemo()
+    _resetInFlightLaunches()
+    _resetSpawnHomeDir()
+    rmSync(dir, { recursive: true, force: true })
   })
 
-  test("(i) AD state 'working' → returns 'transient' and does NOT attempt the send-keys reconnect", async () => {
-    const { adapter, statusCalls, sendKeysCalls, findMissingCalls } = makeHarness({ statusState: 'working' })
+  test.each(['alive', 'probe-error'] as const)("(i) AD state 'working', tmux session %s → returns 'transient' and does NOT attempt the send-keys reconnect or sweep", async (tmux) => {
+    const { adapter, statusCalls, sendKeysCalls, findMissingCalls, tmuxProbes } = makeHarness({ statusState: 'working', tmux })
 
     const result = await adapter('C1')
 
     expect(result).toBe('transient')
+    // The persona's own tmux session was probed (the probe-error row: it ran
+    // and threw, and the throw deferred rather than escalated).
+    expect(tmuxProbes).toEqual(['slack_bot_C1'])
     // The probe ran against the persona's cscb_<key> instance...
     expect(statusCalls).toHaveLength(1)
     expect(statusCalls[0].claude_instance_id).toBe(personaInstanceId('C1'))
     expect(statusCalls[0].claude_instance_id).toBe('cscb_C1')
     // ...but the working-state defer short-circuited before reconnectMcp — no
-    // `/mcp reconnect` was typed into the pane.
+    // `/mcp reconnect` was typed into the pane (b.rmy: a live turn is never
+    // poked; a failed tmux probe is no proof the session is dead).
     expect(sendKeysCalls).toHaveLength(0)
     // b.9a7: the transient path never escalates, so no sweep fires.
     expect(findMissingCalls).toHaveLength(0)
+  })
+
+  test("(i-b) b.d61: AD state 'working' but the persona's tmux session is gone → 'escalate-dead' with one findMissing sweep, and no send-keys reconnect", async () => {
+    // The live Check 7 shape: `tmux kill-session -t slack_bot_<key>` mid-turn
+    // leaves AD's row frozen at `working`. Deferring it as 'transient' would
+    // repeat on every tick and the persona would never relaunch.
+    const { adapter, statusCalls, sendKeysCalls, findMissingCalls, tmuxProbes } = makeHarness({
+      statusState: 'working',
+      tmux: 'gone',
+    })
+
+    const result = await adapter('C1')
+
+    expect(result).toBe('escalate-dead')
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    // The probe asked about the persona's own tmux session.
+    expect(tmuxProbes).toEqual(['slack_bot_C1'])
+    // Nothing is typed into a pane that no longer exists.
+    expect(sendKeysCalls).toHaveLength(0)
+    // The dead-tmux sweep reconciles the frozen row to `missing`, so the
+    // restart run's liveness re-probe reads the session dead and relaunches it
+    // in that same run.
+    expect(findMissingCalls).toHaveLength(1)
+  })
+
+  test("(i-c) b.d61: AD state 'working' while a launch for the persona is in flight → 'transient' with no tmux probe, sweep or send-keys, even with its tmux session gone", async () => {
+    // The launch resolves its unset claude_config_dir against a temp home.
+    mkdirSync(join(dir, 'home', '.claude'), { recursive: true })
+    _setSpawnHomeDir(join(dir, 'home'))
+    const config = makeStandInPersonaConfig({ C1: {} }, dir)
+    // Tmux gone: with nothing in flight this row escalates (i-b).
+    const { adapter, stub, statusCalls, sendKeysCalls, findMissingCalls, tmuxProbes } = makeHarness({
+      statusState: 'working',
+      tmux: 'gone',
+    })
+    // A launch whose tmux session is not created yet: its spawn is held open.
+    const held = holdSpawns(stub)
+    const launch = spawnForPersona(config.personas[0]!, config, false)
+    try {
+      await held.entered('cscb_C1')
+      expect(isLaunchInFlight('C1')).toBe(true)
+
+      const result = await adapter('C1')
+
+      expect(result).toBe('transient')
+      expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+      expect(tmuxProbes).toEqual([])
+      expect(findMissingCalls).toHaveLength(0)
+      expect(sendKeysCalls).toHaveLength(0)
+    } finally {
+      // Settle the held launch before teardown.
+      held.releaseAll()
+      await launch
+    }
   })
 
   test("(ii) non-working live state ('waiting') → reconnect IS attempted, maps ok → 'success'", async () => {
