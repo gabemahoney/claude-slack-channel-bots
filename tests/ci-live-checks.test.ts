@@ -1,0 +1,1143 @@
+/**
+ * ci-live-checks.test.ts — Tests for the /ci-live runner's check framework
+ * and the checks a dry run runs for real (bug b.1cx): `ci-live/checks/
+ * framework.ts` (skips, blocking, the verdict), `checks/list.ts` (the plan
+ * order, the HOST and Teardown checks), `lib/host-state.ts` (the read-only
+ * snapshot of the production side of the host), Checks S2, S3 and 29a
+ * (`checks/setup-checks.ts`, `checks/lifecycle-checks.ts`) against a fake
+ * container, and the pure helpers the live checks build on
+ * (`checks/helpers.ts`, `checks/channel-checks.ts`, `checks/context.ts`).
+ *
+ * The rules under test:
+ * - a failed blocking check skips every later check except the `always`
+ *   ones (29a, Teardown, HOST); a check that throws is a FAIL; the verdict is
+ *   PASS only when nothing failed; a missing need is skipped with the
+ *   runner's reason when it gives one (a second account needing a code);
+ * - a dry run (no workspace) runs exactly the pre-flight, install, setup,
+ *   S2, S3, 29a, Teardown and HOST checks;
+ * - no live check passes against a silent workspace (nothing answers);
+ * - HOST fails on any change to the host's service=cscb rows, CSCB tmux
+ *   sessions, port-3100 listener or config.json hash, and on a probe that
+ *   failed (even the same way twice); its probes only read, on CSCB's own
+ *   agent-director store;
+ * - 29a fails on any token-shaped or credential count, on a host-side scan
+ *   finding, on missing output, and on a persona this run brought up and
+ *   dispatched a message to that has no transcript; an empty or malformed
+ *   count is a parse failure (NaN), never 0, so it never skips a scan or a
+ *   persona's transcript;
+ * - Checks 16 and 20 ask A for the outbound call at most twice: a second ask
+ *   only when A said done but made no new call; A that never says done is a
+ *   FAIL; no call after two asks is Check 16's "not run" (SKIPPED) and a FAIL
+ *   in Check 20; only a call made after the check's baseline is evaluated;
+ * - Check 8 asks for a bug when the RAW prefix lacks user/bot_id; Check 9
+ *   falls back to the message text and needs one RAW line of each kind;
+ *   `waitTags` polls to a deadline; Check 12's limit search fails on any
+ *   line but the known Slack rate-limit ones;
+ * - the texts the checks expect match what the package writes (the pending
+ *   file header, the preview counts, the reload-applied line, the S3 error).
+ *
+ * No docker, network or real host state: the container, the host probes, the
+ * test human's session and the clock are fakes.
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+import { describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
+
+import { parsePersonaConfigBytes } from '../src/config.ts'
+import { checkPersonaTarget } from '../src/registry.ts'
+import { renderAppliedLogLine } from '../src/reload-apply.ts'
+import { PENDING_FILE_HEADER } from '../src/reload-fingerprint.ts'
+import { PENDING_PREVIEW_TITLE, renderChangePlanCounts, type ChangePlanCounts, type ValidChangePlan } from '../src/reload-plan.ts'
+import { check8, check9, expectOneTag, judgeLimitLines, rawShape, tagAttr } from '../ci-live/checks/channel-checks.ts'
+import { DRY_RUN_IDS, liveIdsFrom, type CheckContext } from '../ci-live/checks/context.ts'
+import { callsTo, check16, check20, newCallTo, OUTBOUND_ASKS, outboundNext } from '../ci-live/checks/dm-checks.ts'
+import { Findings, NEED_SKIP_REASONS, runChecks, skipReason, verdictOf, type CheckDef, type CheckResult, type Need } from '../ci-live/checks/framework.ts'
+import {
+  appliedLine,
+  checkPreview,
+  countsText,
+  hasWord,
+  isPrompt,
+  parsePending,
+  PENDING_HEADER,
+  previewHeader,
+  promptState,
+  q,
+  S,
+  TAG_TIMEOUT_MS,
+  waitTags,
+} from '../ci-live/checks/helpers.ts'
+import { check29a, parseCount, parseLeakcount, parsePersonaCounts, personaCountsProblem } from '../ci-live/checks/lifecycle-checks.ts'
+import { FINAL_CHECKS, hostCheck, PLAN_CHECKS, teardownCheck } from '../ci-live/checks/list.ts'
+import { s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
+import type { BrowserDriver, HumanApi } from '../ci-live/lib/browser-types.ts'
+import type { ContainerExec } from '../ci-live/lib/container.ts'
+import {
+  compareSnapshots,
+  describeSnapshot,
+  hostStorePath,
+  parseAdRows,
+  parseListenInodes,
+  parseTmuxSessions,
+  probeFailures,
+  snapshotHost,
+  type HostSnapshot,
+} from '../ci-live/lib/host-state.ts'
+import { HumanSession } from '../ci-live/lib/human-session.ts'
+import { buildLiveConfig, renderConfig } from '../ci-live/lib/live-config.ts'
+import type { ProcResult } from '../ci-live/lib/proc.ts'
+import { RESULTS_COLUMNS } from '../ci-live/lib/results.ts'
+import { emptyAppsState } from '../ci-live/lib/apps-state.ts'
+import { virtualClock } from './test-helpers/ci-live.ts'
+import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+/** A container's answer: its stdout, a partial result, or stdout computed per call from the script. */
+type Reply = Partial<ProcResult> | string | ((script: string) => string)
+
+/** A container whose `sh` answers by the first key its script contains; every script is recorded. */
+function fakeContainer(answers: ReadonlyArray<readonly [string, Reply]>) {
+  const scripts: string[] = []
+  const done = (reply: Reply, script = ''): ProcResult => {
+    const r = typeof reply === 'function' ? reply(script) : reply
+    return { code: 0, stdout: '', stderr: '', timedOut: false, ...(typeof r === 'string' ? { stdout: r } : r) }
+  }
+  const container: ContainerExec = {
+    name: 'cscb-live-1700000000',
+    exec: async () => done(''),
+    sh: async (script) => {
+      scripts.push(script)
+      return done(answers.find(([key]) => script.includes(key))?.[1] ?? '', script)
+    },
+    writeFile: async () => {},
+  }
+  return { container, scripts }
+}
+
+const SNAPSHOT: HostSnapshot = { adRows: ['cscb_prod_a'], tmuxSessions: ['slack_bot_prod_a'], port3100: '4242', configSha256: 'a'.repeat(64) }
+
+function makeCtx(overrides: Partial<CheckContext> = {}): CheckContext {
+  const info: string[] = []
+  return {
+    mode: 'dry-run',
+    runId: '1700000000',
+    container: fakeContainer([]).container,
+    hostName: 'cscb-live-1700000000',
+    clock: virtualClock(),
+    log: { info: (m) => info.push(m), detail: (m) => info.push(m) },
+    runNotes: [],
+    ids: DRY_RUN_IDS,
+    human: null,
+    second: null,
+    browser: null,
+    creds: {
+      moveDIntoMount: () => {},
+      rewriteBAppToken: async () => {},
+      mountedCount: () => 3,
+      bAppTokenName: () => 'cscb-live',
+      setBAppTokenName: () => {},
+    },
+    shared: {},
+    restartContainer: async () => {},
+    hostScan: () => ({ counts: [], total: 0 }),
+    hostBefore: SNAPSHOT,
+    hostNow: async () => ({ ...SNAPSHOT }),
+    removeContainer: async () => true,
+    ...overrides,
+  }
+}
+
+interface CannedMessage {
+  ts: string
+  text: string
+  user: string
+}
+
+/**
+ * The test human's session over a scripted workspace: each post gets the
+ * next `1700000100.00000N` ts; history lists the channel's posts and its
+ * canned messages from `oldest` on (as Slack does); threads are empty.
+ */
+function scriptedHuman(clock: CheckContext['clock'], canned: Record<string, CannedMessage[]> = {}) {
+  let n = 0
+  const posts: { channel: string; text: string; ts: string }[] = []
+  const api: HumanApi = {
+    call: async (method, params = {}) => {
+      const channel = String(params.channel ?? '')
+      if (method === 'chat.postMessage') {
+        const ts = `1700000100.${String(++n).padStart(6, '0')}`
+        posts.push({ channel, text: String(params.text), ts })
+        return { ok: true, ts }
+      }
+      if (method === 'conversations.history') {
+        const all = [...posts.filter((p) => p.channel === channel).map((p) => ({ ...p, user: DRY_RUN_IDS.humanUserId })), ...(canned[channel] ?? [])]
+        return { ok: true, messages: all.filter((m) => m.ts >= String(params.oldest ?? '0')) }
+      }
+      if (method === 'conversations.open') return { ok: true, channel: { id: 'D0DRYDM001' } }
+      return { ok: true, messages: [] }
+    },
+  }
+  return { human: new HumanSession(api, clock), posts }
+}
+
+/** A browser that does nothing (its generated token is a sentinel-bearing fake). */
+function idleBrowser(): BrowserDriver {
+  return {
+    ensureSignedIn: async () => 'signed-in',
+    submitSignInCode: async () => 'signed-in',
+    humanApi: async () => ({ call: async () => ({ ok: true }) }),
+    installApp: async () => fakeToken(BOT_TOKEN_PREFIX, 'idle'),
+    generateAppToken: async () => fakeToken(APP_TOKEN_PREFIX, 'idle'),
+    revokeAppToken: async () => {},
+    clickMessageButton: async () => {},
+    saveState: async () => {},
+    close: async () => {},
+  }
+}
+
+function check(id: string, extra: Partial<CheckDef<null>> & { outcome?: CheckResult | Error } = {}): CheckDef<null> {
+  const { outcome = { status: 'PASS', evidence: [] }, ...rest } = extra
+  return {
+    id,
+    title: `check ${id}`,
+    needs: [],
+    row: id,
+    run: async () => {
+      if (outcome instanceof Error) throw outcome
+      return outcome
+    },
+    ...rest,
+  }
+}
+
+const FAILED: CheckResult = { status: 'FAIL', reason: 'broke', evidence: [] }
+
+// ---------------------------------------------------------------------------
+// The framework
+// ---------------------------------------------------------------------------
+
+describe('skipReason', () => {
+  const all = new Set<Need>(['workspace', 'claude', 'second-user'])
+  test.each([
+    ['a fixed skip, even for an always check', check('x', { skip: 'manual only', always: true }), 'a', [], all, 'manual only'],
+    ['a block', check('x'), 'a', [], all, 'blocked by a'],
+    ['an always check under a block', check('x', { always: true }), 'a', [], all, null],
+    ['a prerequisite under a block', check('x', { prerequisite: true }), 'a', [], all, 'blocked by a'],
+    ['a block before --only', check('x'), 'a', ['y'], all, 'blocked by a'],
+    ['a check --only leaves out', check('x'), null, ['y'], all, 'not selected'],
+    ['a prerequisite --only leaves out', check('x', { prerequisite: true }), null, ['y'], all, null],
+    ['an always check --only leaves out', check('x', { always: true }), null, ['y'], all, null],
+    ['--only before a missing need', check('x', { needs: ['workspace'] }), null, ['y'], new Set<Need>(), 'not selected'],
+    ['a missing workspace', check('x', { needs: ['workspace', 'claude'] }), null, [], new Set<Need>(), NEED_SKIP_REASONS.workspace],
+    ['a missing second user', check('x', { needs: ['workspace', 'second-user'] }), null, [], new Set<Need>(['workspace']), 'no second account'],
+    ['everything available', check('x', { needs: ['workspace'] }), null, ['x'], all, null],
+  ] as const)('%s', (_what, def, blockedBy, only, available, expected) => {
+    expect(skipReason(def, { blockedBy }, { available, only })).toBe(expected)
+  })
+
+  test("the runner's reason for a missing need replaces the default one (a second account that needs a sign-in code), in runChecks too", async () => {
+    const needReasons = { 'second-user': 'second account needs a sign-in code: run login --second' }
+    const needsSecond = check('14', { needs: ['workspace', 'second-user'] })
+    const workspaceOnly = new Set<Need>(['workspace'])
+    expect(skipReason(needsSecond, { blockedBy: null }, { available: workspaceOnly, only: [], needReasons })).toBe(needReasons['second-user'])
+    expect(skipReason(check('2', { needs: ['workspace'] }), { blockedBy: null }, { available: new Set(), only: [], needReasons })).toBe(NEED_SKIP_REASONS.workspace)
+    const [r] = await runChecks([needsSecond], null, { available: workspaceOnly, only: [], now: () => 0, log: { info: () => {} }, needReasons })
+    expect([r!.status, r!.reason]).toEqual(['SKIPPED', needReasons['second-user']])
+  })
+})
+
+describe('runChecks', () => {
+  test('a failed blocking check skips the rest, except always checks; fixed skips stay as they are', async () => {
+    const log: string[] = []
+    const seen: string[] = []
+    let t = 0
+    const results = await runChecks(
+      [check('a', { blocking: true, outcome: FAILED }), check('b'), check('c', { always: true }), check('d', { skip: 'manual only' }), check('e', { needs: ['workspace'] })],
+      null,
+      { available: new Set(), only: [], now: () => (t += 5), log: { info: (m) => log.push(m) }, onResult: (r) => seen.push(r.id) },
+    )
+    expect(results.map((r) => [r.id, r.status, r.reason ?? null])).toEqual([
+      ['a', 'FAIL', 'broke'],
+      ['b', 'SKIPPED', 'blocked by a'],
+      ['c', 'PASS', null],
+      ['d', 'SKIPPED', 'manual only'],
+      ['e', 'SKIPPED', 'blocked by a'],
+    ])
+    expect(seen).toEqual(['a', 'b', 'c', 'd', 'e'])
+    expect(results.map((r) => r.durationMs)).toEqual([5, 5, 5, 5, 5])
+    expect(log).toEqual([
+      'check a: check a',
+      'check a: FAIL (broke)',
+      'check b: SKIPPED (blocked by a)',
+      'check c: check c',
+      'check c: PASS',
+      'check d: SKIPPED (manual only)',
+      'check e: SKIPPED (blocked by a)',
+    ])
+  })
+
+  test('a check that throws is a FAIL with a described error; a failure that is not blocking blocks nothing', async () => {
+    const results = await runChecks(
+      [check('a', { outcome: new TypeError(`bad https://x.invalid/cb?code=${LEAK_SENTINEL}\nstack`) }), check('b', { outcome: FAILED }), check('c')],
+      null,
+      { available: new Set(), only: [], now: () => 0, log: { info: () => {} } },
+    )
+    expect(results.map((r) => [r.id, r.status, r.reason ?? null])).toEqual([
+      ['a', 'FAIL', 'threw TypeError: bad https://x.invalid/cb?<query>'],
+      ['b', 'FAIL', 'broke'],
+      ['c', 'PASS', null],
+    ])
+    assertNoLeak(results)
+  })
+})
+
+describe('verdictOf and Findings', () => {
+  test.each([
+    [[], 'PASS'],
+    [[{ id: '1', status: 'PASS' }, { id: '2', status: 'SKIPPED', reason: 'x' }], 'PASS'],
+    [[{ id: '1', status: 'PASS' }, { id: '5', status: 'FAIL', reason: 'no reply\n in time' }, { id: '6', status: 'FAIL', reason: 'y' }], 'FAIL: 5: no reply in time'],
+    [[{ id: '7', status: 'FAIL' }], 'FAIL: 7: failed'],
+  ] as const)('verdictOf(%j) is %p', (results, verdict) => {
+    expect(verdictOf(results)).toBe(verdict)
+  })
+
+  test('Findings: every failed expectation joins the reason; evidence and notes are kept either way', () => {
+    const ok = new Findings()
+    expect(ok.expect(true, 'never')).toBe(true)
+    ok.add('ts 1.2')
+    ok.note('n')
+    expect(ok.result()).toEqual({ status: 'PASS', evidence: ['ts 1.2'], notes: ['n'] })
+    const bad = new Findings()
+    expect(bad.expect(false, 'first')).toBe(false)
+    bad.expect(false, 'second')
+    bad.add('ts 3.4')
+    expect(bad.result()).toEqual({ status: 'FAIL', reason: 'first; second', evidence: ['ts 3.4'], notes: [] })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The check list
+// ---------------------------------------------------------------------------
+
+describe('the check list', () => {
+  const every = [...PLAN_CHECKS, ...FINAL_CHECKS]
+  const runs = (available: Need[], only: string[] = []) =>
+    every.filter((c) => skipReason(c, { blockedBy: null }, { available: new Set(available), only }) === null).map((c) => c.id)
+
+  test('ids are unique and every Results-table column is filled by exactly one check', () => {
+    expect(new Set(every.map((c) => c.id)).size).toBe(every.length)
+    const rows = PLAN_CHECKS.map((c) => c.row).filter((r) => r !== null)
+    expect([...rows].sort()).toEqual([...RESULTS_COLUMNS].sort())
+  })
+
+  test('a dry run (no workspace, no Claude) runs only the container-side checks, Teardown and HOST', () => {
+    expect(runs([])).toEqual(['preflight', 'install', 'setup', 'S2', 'S3', '29a', 'teardown', 'HOST'])
+  })
+
+  test('without a second account, 14, 16 and 20 are skipped, and S1, 26 and 29b always are', () => {
+    const skipped = every.filter((c) => !runs(['workspace', 'claude']).includes(c.id)).map((c) => c.id)
+    expect(skipped).toEqual(['S1', '14', '16', '20', '26', '29b'])
+  })
+
+  test('--only runs the selection plus the prerequisites and the always checks', () => {
+    expect(runs(['workspace', 'claude'], ['S2'])).toEqual(['preflight', 'install', 'setup', 'S2', '1', '29a', 'teardown', 'HOST'])
+  })
+
+  test('the setup checks and Check 1 are blocking', () => {
+    expect(PLAN_CHECKS.filter((c) => c.blocking).map((c) => c.id)).toEqual(['preflight', 'install', 'setup', '1'])
+  })
+})
+
+describe('HOST and Teardown', () => {
+  test('HOST passes when the host is unchanged, with both snapshots as evidence', async () => {
+    const r = await hostCheck.run(makeCtx())
+    expect(r.status).toBe('PASS')
+    expect(r.evidence).toEqual([`before: ${describeSnapshot(SNAPSHOT)}`, `after: ${describeSnapshot(SNAPSHOT)}`])
+  })
+
+  test('HOST fails naming every change', async () => {
+    const after: HostSnapshot = { adRows: ['cscb_persona_a', 'cscb_prod_a'], tmuxSessions: ['slack_bot_prod_a'], port3100: 'none', configSha256: 'b'.repeat(64) }
+    const r = await hostCheck.run(makeCtx({ hostNow: async () => after }))
+    expect(r.status).toBe('FAIL')
+    expect(r.reason).toBe(
+      'agent-director service=cscb rows [cscb_prod_a] → [cscb_persona_a, cscb_prod_a]; port 3100 listener 4242 → none; host config.json sha256 changed',
+    )
+  })
+
+  test('HOST fails when a probe failed, even the same way before and after (never a vacuous pass)', async () => {
+    const failed: HostSnapshot = { ...SNAPSHOT, adRows: 'agent-director list exit 2', tmuxSessions: 'tmux ls exit 1' }
+    const r = await hostCheck.run(makeCtx({ hostBefore: failed, hostNow: async () => ({ ...failed }) }))
+    expect([r.status, r.reason]).toEqual([
+      'FAIL',
+      'probe failed before the run: agent-director list exit 2; probe failed before the run: tmux ls exit 1; ' +
+        'probe failed after the run: agent-director list exit 2; probe failed after the run: tmux ls exit 1',
+    ])
+    const afterOnly = await hostCheck.run(makeCtx({ hostNow: async () => ({ ...SNAPSHOT, adRows: 'agent-director list: unparsable output' }) }))
+    expect(afterOnly.reason).toStartWith('probe failed after the run: agent-director list: unparsable output; agent-director service=cscb rows')
+    expect([probeFailures(SNAPSHOT), probeFailures(failed)]).toEqual([[], ['agent-director list exit 2', 'tmux ls exit 1']])
+  })
+
+  test('Teardown fails when the container could not be removed', async () => {
+    expect((await teardownCheck.run(makeCtx())).status).toBe('PASS')
+    expect(await teardownCheck.run(makeCtx({ removeContainer: async () => false }))).toMatchObject({ status: 'FAIL', reason: 'the test container could not be removed' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Host state
+// ---------------------------------------------------------------------------
+
+describe('host-state', () => {
+  test('parseListenInodes finds the sockets listening on the port, IPv4 and IPv6', () => {
+    const tcp = [
+      '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode',
+      '   0: 0100007F:0C1C 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 11111 1 0 100 0 0 10 0',
+      '   1: 0100007F:0C1C 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 22222 1 0 20 4 30 10 -1',
+      '   2: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 33333 1 0 100 0 0 10 0',
+      '   3: 00000000000000000000000000000000:0C1C 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 44444 1 0',
+    ].join('\n')
+    expect(parseListenInodes(tcp, 3100)).toEqual(['11111', '44444'])
+    expect(parseListenInodes(tcp, 443)).toEqual([])
+  })
+
+  test.each([
+    ['{"spawns":[{"claude_instance_id":"cscb_b"},{"claude_instance_id":"cscb_a"},{}]}', ['?', 'cscb_a', 'cscb_b']],
+    ['{"spawns":[]}', []],
+    ['{}', null],
+    ['not json', null],
+  ])('parseAdRows(%p)', (stdout, expected) => {
+    expect(parseAdRows(stdout)).toEqual(expected)
+  })
+
+  test("parseTmuxSessions keeps only the host's CSCB sessions", () => {
+    expect(parseTmuxSessions('slack_bot_b\nmain\ncscb_x\n  \nmy_slack_bot_y\nslack_bot_a\n')).toEqual(['cscb_x', 'slack_bot_a', 'slack_bot_b'])
+  })
+
+  function probe(ad: Partial<ProcResult>, tmux: Partial<ProcResult>, config: Buffer | null) {
+    const argv: string[][] = []
+    const read: string[] = []
+    const ports: number[] = []
+    const res = (r: Partial<ProcResult>): ProcResult => ({ code: 0, stdout: '', stderr: '', timedOut: false, ...r })
+    return {
+      argv,
+      read,
+      ports,
+      deps: {
+        run: async (a: readonly string[]) => (argv.push([...a]), res(a[0] === 'tmux' ? tmux : ad)),
+        readFile: (p: string) => (read.push(p), config),
+        listener: (port: number) => (ports.push(port), '4242'),
+      },
+    }
+  }
+
+  test("snapshotHost only reads: agent-director list on CSCB's own store, tmux ls, the port-3100 listener and a hash of the config file", async () => {
+    const config = Buffer.from('{"personas":[]}')
+    const p = probe({ stdout: '{"spawns":[{"claude_instance_id":"cscb_prod_a"}]}' }, { stdout: 'slack_bot_prod_a\nwork\n' }, config)
+    const snap = await snapshotHost(p.deps, '/home/tester')
+    expect(hostStorePath('/home/tester')).toBe('/home/tester/.agent-director/state.db')
+    expect(p.argv).toEqual([
+      ['agent-director', '--store-path', '/home/tester/.agent-director/state.db', 'list', '--label', 'service=cscb'],
+      ['tmux', 'ls', '-F', '#{session_name}'],
+    ])
+    expect([p.read, p.ports]).toEqual([['/home/tester/.claude/channels/slack/config.json'], [3100]])
+    expect(snap).toEqual({
+      adRows: ['cscb_prod_a'],
+      tmuxSessions: ['slack_bot_prod_a'],
+      port3100: '4242',
+      configSha256: createHash('sha256').update(config).digest('hex'),
+    })
+  })
+
+  test.each([
+    ['no tmux server is no session', { code: 1, stderr: 'no server running on /tmp/tmux-1000/default' }, []],
+    ['no tmux socket is no session', { code: 1, stderr: 'error connecting to /run/user/1000/tmux-1000/default (No such file or directory)' }, []],
+    ['another tmux failure is recorded as such', { code: 1, stderr: 'error connecting to /tmp/tmux-1000/default (Permission denied)' }, 'tmux ls exit 1'],
+  ])('snapshotHost: %s', async (_what, tmux, expected) => {
+    const snap = await snapshotHost(probe({ code: 2 }, tmux, null).deps, '/h')
+    expect([snap.tmuxSessions, snap.adRows, snap.configSha256]).toEqual([expected, 'agent-director list exit 2', 'absent'])
+  })
+
+  test('compareSnapshots names each difference, and hashes only by "changed"', () => {
+    expect(compareSnapshots(SNAPSHOT, { ...SNAPSHOT })).toEqual([])
+    expect(compareSnapshots(SNAPSHOT, { ...SNAPSHOT, tmuxSessions: 'tmux ls exit 1', configSha256: 'c'.repeat(64) })).toEqual([
+      'tmux sessions [slack_bot_prod_a] → tmux ls exit 1',
+      'host config.json sha256 changed',
+    ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Checks S2, S3 and 29a against a fake container
+// ---------------------------------------------------------------------------
+
+describe('Check S2', () => {
+  const PASSING: Record<string, string> = {
+    'sha256sum -c': 'package unchanged',
+    '-type f -print | wc -l': '42\n42',
+    'ls -A ~/.config/cscb/': 'persona_a-credentials.json\npersona_b-credentials.json\npersona_c-credentials.json',
+    'ls -A "$S"': 'system-prompt.md\nconfig.json',
+    tokcount: '0',
+    'env | cut': '0',
+  }
+  const run = (changes: Record<string, string> = {}) => s2Check.run(makeCtx({ container: fakeContainer(Object.entries({ ...PASSING, ...changes })).container }))
+
+  test('passes on the plan layout', async () => {
+    expect((await run()).status).toBe('PASS')
+  })
+
+  test.each([
+    ['an extra state file', { 'ls -A "$S"': 'config.json\nsystem-prompt.md\nserver.pid' }, 'the state dir holds more than config.json and system-prompt.md'],
+    ['a changed package file', { 'sha256sum -c': '' }, 'a file of the installed package changed'],
+    ['a file added to the package', { '-type f -print | wc -l': '43\n42' }, 'the package gained or lost files'],
+    ["D's credentials file already mounted", { 'ls -A ~/.config/cscb/': 'persona_a-credentials.json\npersona_b-credentials.json\npersona_c-credentials.json\npersona_d-credentials.json' }, '~/.config/cscb/ holds'],
+    ['a token-shaped line in config.json', { tokcount: '1' }, 'token-shaped lines in config.json: 1'],
+    ['a token variable in the shell', { 'env | cut': '1' }, 'token variables set: 1'],
+  ])('fails on %s', async (_what, changes, reason) => {
+    const r = await run(changes)
+    expect(r.status).toBe('FAIL')
+    expect(r.reason).toContain(reason)
+  })
+})
+
+describe('Check S3', () => {
+  // The refusal as the package under test words it, for the S3 config (B given A's working directory).
+  const loaderError = (() => {
+    const config = buildLiveConfig(DRY_RUN_IDS)
+    config.personas[1]!.working_directory = config.personas[0]!.working_directory
+    try {
+      parsePersonaConfigBytes(renderConfig(config), `${S}/config.json`, S, { home: '/home/testuser' })
+    } catch (err) {
+      return (err as Error).message
+    }
+    throw new Error('the S3 config loaded')
+  })()
+  const scr = '/home/testuser/cscb-live/scratch-state.Ab12Cd'
+  const fields: Record<string, string> = {
+    SCR: scr,
+    WDS: '~/cscb-live/a ~/cscb-live/a ~/cscb-live/c ',
+    exit: '1',
+    SCRLS: 'server.log ',
+    PGREP: '0',
+    ROWS: '0',
+    STATELS: 'config.json system-prompt.md ',
+  }
+  const output = (changes: Record<string, string> = {}, extra = '') =>
+    [
+      ...Object.entries({ ...fields, ...changes }).map(([k, v]) => `${k}=${v}`),
+      `[slack] Server failed to start (exit code 1). From ${scr}/server.log:`,
+      `[slack] Fatal: configuration error — ${loaderError}`,
+      extra,
+    ].join('\n')
+  const run = (out: string) =>
+    s3Check.run(makeCtx({ container: fakeContainer([['preflight.sh check1', 'pre-flight passed (check1)'], ['SLACK_STATE_DIR="$SCR"', out]]).container }))
+
+  test("passes on the package's own refusal of the duplicate working directory", async () => {
+    const r = await run(output())
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+  })
+
+  test.each([
+    ['a start that exited 0', { exit: '0' }, '', 'start exited 0, not 1'],
+    ['a server process left', { PGREP: '1' }, '', 'a server process remains'],
+    ['an agent-director row left', { ROWS: '1' }, '', 'agent-director lists a service=cscb row'],
+    ['a record in the scratch dir', { SCRLS: 'config.json.last-applied server.log' }, '', 'the scratch dir holds a record or a server.pid'],
+    ['a changed state dir', { STATELS: 'config.json server.log system-prompt.md' }, '', 'the state dir changed'],
+    ['a scratch server that started', {}, 'SCRATCH SERVER STARTED - stopping it', 'SCRATCH SERVER STARTED'],
+  ])('fails on %s', async (_what, changes, extra, reason) => {
+    const r = await run(output(changes, extra))
+    expect(r.status).toBe('FAIL')
+    expect(r.reason).toContain(reason)
+  })
+
+  test('fails when the refusal names another problem', async () => {
+    const r = await run(output().replace(loaderError, 'loadPersonaConfig: invalid persona config: something else'))
+    expect(r.status).toBe('FAIL')
+  })
+})
+
+describe('Check 29a', () => {
+  // The script's output; a field set to undefined is left out.
+  const lines = (over: Record<string, string | undefined> = {}, leak: { f?: string[]; t?: string[]; h?: string[] } = {}) =>
+    [
+      ...Object.entries({ TRANSCRIPTS: '0', PENDING: 'absent', TOKF: '0', TOKT: '0', TOKH: '0', WSS: '0', MSG: '0', RURL: '2', RTOK: '1', ...over })
+        .filter(([, v]) => v !== undefined)
+        .map(([k, v]) => `${k}=${v}`),
+      'LEAK-F',
+      ...(leak.f ?? ['tokens checked: 6', `${S}/config.json: 0`, `${S}/server.log: 0`, `${S}/config.json.pending: absent`]),
+      'LEAK-T',
+      ...(leak.t ?? []),
+      'LEAK-H',
+      ...(leak.h ?? ['tokens checked: 6', '/home/testuser/.bash_history: absent']),
+    ].join('\n')
+  const run = (out: string, overrides: Partial<CheckContext> = {}) => check29a.run(makeCtx({ container: fakeContainer([['leakcount', out]]).container, ...overrides }))
+
+  test('passes when every count is zero, the tokens checked match the mounted files, and the host scan is clean', async () => {
+    const r = await run(lines())
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(r.notes).toEqual(['Check 29a placeholders: <redacted-url> 2, <redacted-token> 1'])
+    assertNoLeak(r)
+  })
+
+  test.each([
+    ['a token-shaped line in a state file', lines({ TOKF: '1' }), 'the state files: count 1'],
+    ['a pending file left', lines({ PENDING: 'present' }), 'config.json.pending exists'],
+    ['a ticket URL in server.log', lines({ WSS: '2' }), 'wss:// or ticket= in server.log: count 2'],
+    ['a token in a logged message', lines({ MSG: '1' }), 'message="…" fields: count 1'],
+    ['a credential in a state file', lines({}, { f: ['tokens checked: 6', `${S}/server.log: 1`] }), 'LEAK-F: 1 file(s) hold a credential'],
+    ['fewer tokens checked than the mounted files hold', lines({}, { h: ['tokens checked: 4'] }), 'LEAK-H: tokens checked 4, not 6'],
+    ['no output at all', '', 'persona transcripts: NaN'],
+  ])('fails on %s', async (_what, out, reason) => {
+    const r = await run(out)
+    expect(r.status).toBe('FAIL')
+    expect(r.reason).toContain(reason)
+  })
+
+  test("an empty TRANSCRIPTS count fails as NaN, never 0, and the transcripts' leak scan still runs", async () => {
+    const r = await run(lines({ TRANSCRIPTS: '' }, { t: ['tokens checked: 6', '/home/testuser/.claude/projects/-home-testuser-cscb-live-a/x.jsonl: 1'] }))
+    expect([r.status, r.reason]).toEqual(['FAIL', 'persona transcripts: NaN (the scan printed no count); LEAK-T: 1 file(s) hold a credential'])
+    expect(r.evidence).toContain('persona transcripts: NaN')
+  })
+
+  test.each([
+    ['empty', '', NaN],
+    ['blank', ' \n', NaN],
+    ['zero', '0', 0],
+    ['surrounding whitespace and a newline', ' 42\n', 42],
+    ['a decimal', '1.5', NaN],
+    ['a negative number', '-1', NaN],
+    ['two numbers', '1 2', NaN],
+    ['the missing-field marker', '?', NaN],
+  ])('parseCount(%s) is a whole number or NaN, never 0 for a bad value', (_what, value, expected) => {
+    expect(parseCount(value)).toEqual(expected)
+  })
+
+  describe('a transcript for each persona this run brought up and dispatched a message to', () => {
+    const counts = { PERSONA_a: '1 3', PERSONA_b: '2 1', PERSONA_c: '1 1', PERSONA_d: '0 0' }
+    const real = (over: Record<string, string | undefined>, broughtUp: CheckContext['shared']['broughtUp'], t = ['tokens checked: 6']) =>
+      run(lines({ TRANSCRIPTS: '4', ...counts, ...over }, { t }), { mode: 'real', shared: { broughtUp } })
+
+    test('passes with one per dispatched persona; a persona brought up but never dispatched to needs none, and is noted', async () => {
+      const r = await real({}, ['a', 'b', 'c', 'd'])
+      expect([r.status, r.reason]).toEqual(['PASS', undefined])
+      expect(r.evidence).toContain('persona d: 0 transcript(s), 0 dispatched message(s)')
+      expect(r.notes).toContain('Check 29a: persona d was brought up but no message was dispatched to it, so no transcript is required')
+    })
+
+    test.each([
+      ['a dispatched persona with no transcript', { PERSONA_b: '0 2' }, ['a', 'b', 'c'], 'persona b was brought up and sent 2 message(s), but has no transcript'],
+      ['D brought up by Check 25 with no transcript', { PERSONA_d: '0 1' }, ['a', 'b', 'c', 'd'], 'persona d was brought up and sent 1 message(s), but has no transcript'],
+      ['no count printed for a persona brought up', { PERSONA_c: undefined }, ['c'], 'persona c: no transcript count'],
+      ['an empty count', { PERSONA_a: '' }, ['a'], 'persona a: empty transcript count (PERSONA_a is empty, not "<transcripts> <dispatched>")'],
+      ['a malformed count (one number)', { PERSONA_c: '3' }, ['c'], 'persona c: malformed transcript count (PERSONA_c is not "<transcripts> <dispatched>")'],
+    ] as const)('fails on %s', async (_what, over, broughtUp, reason) => {
+      const r = await real(over, [...broughtUp])
+      expect([r.status, r.reason]).toEqual(['FAIL', reason])
+    })
+
+    test('an empty count is not read as "0 0" (no transcript required): no evidence line and no note for that persona', async () => {
+      const r = await real({ PERSONA_b: '' }, ['a', 'b'])
+      expect([r.status, r.reason]).toEqual(['FAIL', 'persona b: empty transcript count (PERSONA_b is empty, not "<transcripts> <dispatched>")'])
+      expect(r.evidence.filter((l) => /^persona [a-d]:/.test(l))).toEqual(['persona a: 1 transcript(s), 3 dispatched message(s)'])
+      expect((r.notes ?? []).filter((n) => n.includes('persona b'))).toEqual([])
+    })
+
+    test('under --only, a persona not brought up this run needs no transcript', async () => {
+      const r = await real({ TRANSCRIPTS: '0', PERSONA_a: '0 0', PERSONA_b: '0 5', PERSONA_c: '0 5', PERSONA_d: '0 5' }, [], [])
+      expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    })
+
+    test("the transcripts' own leak count still fails it", async () => {
+      const r = await real({}, ['a', 'b', 'c'], ['tokens checked: 6', '/home/testuser/.claude/projects/-home-testuser-cscb-live-a/x.jsonl: 2'])
+      expect([r.status, r.reason]).toEqual(['FAIL', 'LEAK-T: 1 file(s) hold a credential'])
+    })
+
+    test.each([
+      ['two numbers', '2 5', { transcripts: 2, delivered: 5 }],
+      ['whitespace and a trailing newline', ' 0 0\n', { transcripts: 0, delivered: 0 }],
+      ['empty', '', { transcripts: NaN, delivered: NaN }],
+      ['blank', '  \n', { transcripts: NaN, delivered: NaN }],
+      ['one number', '3', { transcripts: NaN, delivered: NaN }],
+      ['three numbers', '1 2 3', { transcripts: NaN, delivered: NaN }],
+      ['a decimal', '1.5 2', { transcripts: NaN, delivered: NaN }],
+      ['a negative count', '1 -2', { transcripts: NaN, delivered: NaN }],
+    ])('parsePersonaCounts(%s): exactly two whole numbers, else both NaN (never 0)', (_what, value, expected) => {
+      expect(parsePersonaCounts(value)).toEqual(expected)
+    })
+
+    test.each([
+      ['no line at all', undefined, 'persona a: no transcript count'],
+      ['an empty value', '', 'persona a: empty transcript count (PERSONA_a is empty, not "<transcripts> <dispatched>")'],
+      ['a blank value', ' \t', 'persona a: empty transcript count (PERSONA_a is empty, not "<transcripts> <dispatched>")'],
+      ['anything else', '3', 'persona a: malformed transcript count (PERSONA_a is not "<transcripts> <dispatched>")'],
+    ])('personaCountsProblem: %s', (_what, value, reason) => {
+      expect(personaCountsProblem('a', value)).toBe(reason)
+    })
+  })
+
+  test('fails on a host-side scan finding, reporting counts only', async () => {
+    const r = await run(lines(), { hostScan: () => ({ counts: [{ source: '/results/run.log', tokenShaped: 1, knownSecrets: 0 }], total: 1 }) })
+    expect(r.status).toBe('FAIL')
+    expect(r.reason).toBe('the host-side scan of the results found 1 token-shaped or secret string(s)')
+    expect(r.evidence).toContain('host: /results/run.log: 1 token-shaped, 0 known-secret')
+  })
+
+  test('parseLeakcount reads the count and each file (a path with ": " in it included)', () => {
+    expect(parseLeakcount(['tokens checked: 6', '/a: 0', '/b: absent', '/odd: name: 3', 'noise'])).toEqual({
+      checked: 6,
+      files: { '/a': '0', '/b': 'absent', '/odd: name': '3' },
+    })
+    expect(parseLeakcount([]).checked).toBe(-1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Live checks against a scripted workspace and container
+// ---------------------------------------------------------------------------
+
+const A = DRY_RUN_IDS.bots.a
+const COORD = DRY_RUN_IDS.coordination
+
+/** A live-run context: the human session over `canned` bot messages, the container answering `answers`. */
+function liveCtx(canned: Record<string, CannedMessage[]>, answers: ReadonlyArray<readonly [string, Reply]>): CheckContext {
+  const clock = virtualClock()
+  return makeCtx({ mode: 'real', clock, human: scriptedHuman(clock, canned).human, container: fakeContainer(answers).container })
+}
+
+describe('Check 8: the persona-post event shape', () => {
+  // A says "posted" in A-home, and its post in coordination is 1700000200.000002.
+  const POST_TS = '1700000200.000002'
+  const canned = {
+    [DRY_RUN_IDS.aHome]: [{ ts: '1700000200.000001', text: 'posted', user: A.userId }],
+    [COORD]: [{ ts: POST_TS, text: `<@${DRY_RUN_IDS.bots.b.userId}> shape check, no reply needed`, user: A.userId }],
+  }
+  const run = (raw: string) =>
+    check8.run(
+      liveCtx(canned, [
+        [`tags b '${POST_TS}'`, `<channel source="slack" chat_id="${COORD}" user_id="${A.userId}" via="mention">`],
+        [`tags a '${POST_TS}'`, ''],
+        ['RAW message event persona=persona_b:', raw],
+        ['dropped message from channel=', `[slack] persona "persona_a" (key=persona_a) dropped message from channel=${COORD} user=${A.userId}: own`],
+        ['mark', '1:0'],
+      ]),
+    )
+
+  test("passes when B's RAW line shows A's bot user or bot ID, A dropped its own post and B got one mention tag", async () => {
+    const r = await run(`[slack] RAW message event persona=persona_b: {"user":"${A.userId}","bot_id":"${A.botId}","text":"shape check","ts":"${POST_TS}"}`)
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(r.notes).toContain(`Check 8 RAW shape: user=${A.userId} bot_id=${A.botId} subtype=absent app_id=absent bot_profile=absent`)
+  })
+
+  test('fails, asking for a bug to be filed, when the RAW prefix was cut before user or bot_id', async () => {
+    const r = await run(`[slack] RAW message event persona=persona_b: {"type":"message","ts":"${POST_TS}","text":"shape check`)
+    expect([r.status, r.reason]).toEqual(['FAIL', 'file a bug: RAW prefix lacks user/bot_id (user=absent, bot_id=absent)'])
+  })
+})
+
+describe('Check 9: one mention is delivered once', () => {
+  const TEXT = 'reply with the word once.'
+  // The human's post is the first post (1700000100.000001); A answers "once" after it.
+  const HUMAN_TS = '1700000100.000001'
+  const raw = (kind: 'message' | 'app_mention', withTs: boolean) =>
+    `[slack] RAW ${kind} event persona=persona_a: {"user":"${DRY_RUN_IDS.humanUserId}","text":"<@${A.userId}> ${TEXT}"${withTs ? `,"ts":"${HUMAN_TS}"` : ''}`
+  const run = (rawLines: string[]) =>
+    check9.run(
+      liveCtx({ [COORD]: [{ ts: '1700000200.000001', text: 'once', user: A.userId }] }, [
+        ['Dispatching to persona', `[slack] Dispatching to persona "persona_a" (key=persona_a) chat_id=${COORD} text=<@${A.userId}> ${TEXT}`],
+        ['persona=persona_a:', rawLines.join('\n')],
+        [`tags a '${HUMAN_TS}'`, `<channel source="slack" chat_id="${COORD}" user_id="${DRY_RUN_IDS.humanUserId}" via="mention">`],
+        ['mark', '1:0'],
+      ]),
+    )
+
+  test('passes on one message and one app_mention RAW line matched by the ts', async () => {
+    const r = await run([raw('message', true), raw('app_mention', true)])
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(r.evidence).toContain('RAW lines matched by ts: one message, one app_mention')
+  })
+
+  test("with the ts cut off the RAW prefix, falls back to the message's text and still needs exactly one of each", async () => {
+    const byText = await run([raw('message', false), raw('app_mention', false)])
+    expect([byText.status, byText.reason]).toEqual(['PASS', undefined])
+    expect(byText.notes).toContain('Check 9: RAW lines matched by ts: message=0 app_mention=0; by the message text: message=1 app_mention=1')
+    const twice = await run([raw('message', false), raw('message', false), raw('app_mention', false)])
+    expect([twice.status, twice.reason]).toEqual(['FAIL', 'RAW lines for the message: message=2 app_mention=1, not one each'])
+  })
+})
+
+describe('Checks 16 and 20: the outbound reply-tool call helpers', () => {
+  test('A is asked at most twice (the plan\'s "ask once more")', () => {
+    expect(OUTBOUND_ASKS).toBe(2)
+  })
+
+  test.each([
+    [1, true, true, 'evaluate'],
+    [1, false, true, 'evaluate'],
+    [1, false, false, 'silent'],
+    [1, true, false, 'ask-again'],
+    [2, true, true, 'evaluate'],
+    [2, false, true, 'evaluate'],
+    [2, false, false, 'silent'],
+    [2, true, false, 'no-call'],
+  ] as const)('outboundNext(asked %p, answered %p, called %p) is %p', (asked, answered, called, next) => {
+    expect(outboundNext(asked, answered, called)).toBe(next)
+  })
+
+  test('callsTo matches the whole ID at the start of a replies line only (U1 is not U12)', () => {
+    const replyLines = [
+      'chat_id=U12 error=false result=Sent 1 message(s) to D012 (the DM with U12)',
+      'chat_id=U1 error=true result=refused',
+      'chat_id=C0DRYAHOME error=false result=asked about chat_id=U1 here',
+      ' chat_id=U1 error=false result=indented',
+      'chat_id=U1error=false result=glued',
+      'chat_id=U1 error=false result=Sent 1 message(s) to D01 (the DM with U1)',
+    ]
+    expect(callsTo(replyLines, 'U1')).toEqual([replyLines[1], replyLines[5]])
+    expect(callsTo(replyLines, 'U12')).toEqual([replyLines[0]])
+    expect(callsTo(replyLines, 'U')).toEqual([])
+    expect(callsTo([], 'U1')).toEqual([])
+  })
+
+  test.each([
+    ['no call at all', 0, [], ''],
+    ['calls to other targets only', 0, ['chat_id=U12 error=false result=a', 'chat_id=C1 error=false result=b'], ''],
+    ["only the call the baseline counted (an earlier check's)", 1, ['chat_id=U1 error=true result=old'], ''],
+    ['a new call after the baseline', 1, ['chat_id=U1 error=true result=old', 'chat_id=C1 error=false result=b', 'chat_id=U1 error=false result=new'], 'chat_id=U1 error=false result=new'],
+    ['the newest of several new calls', 0, ['chat_id=U1 error=true result=first', 'chat_id=U12 error=false result=other', 'chat_id=U1 error=false result=second'], 'chat_id=U1 error=false result=second'],
+    ['a new call to U12 is no new call to U1', 1, ['chat_id=U1 error=true result=old', 'chat_id=U12 error=false result=new'], ''],
+  ])('newCallTo: %s', (_what, before, replyLines, expected) => {
+    expect(newCallTo(before, replyLines, 'U1')).toBe(expected)
+  })
+})
+
+describe('Checks 16 and 20 against a scripted A', () => {
+  const SECOND_ID = 'U0DRYSECND'
+  const NEW_DM = 'D0DRYSECDM'
+  // Check 16's call as `replies a` prints it, with the package's own refusal for A (DMs off) and the second user.
+  const REFUSED = (() => {
+    const config = parsePersonaConfigBytes(renderConfig(buildLiveConfig(DRY_RUN_IDS)), `${S}/config.json`, S, { home: '/home/testuser' })
+    const scope = checkPersonaTarget(config.personas[0]!, SECOND_ID, 'post')
+    if (scope.allowed) throw new Error('A may message the second user')
+    return `chat_id=${SECOND_ID} error=true result=${scope.message}`
+  })()
+  // Check 20's call: the DM opened, one message sent.
+  const SENT = `chat_id=${SECOND_ID} error=false result=Sent 1 message(s) to ${NEW_DM} (the DM with ${SECOND_ID}) [ts: 1700000300.000001]`
+
+  /** What A does on one ask: says done or not, and the `replies a` line of the call it makes, if any. */
+  interface AskStep {
+    done: boolean
+    call?: string
+  }
+
+  /**
+   * A-home, `replies a` and the second user's DMs, scripted per ask: each
+   * human post in A-home is one ask and plays the next step (A's call lands
+   * in `replies a`, then A says done). A successful call opens the DM with
+   * the second user and posts A's message there. `earlier` is what
+   * `replies a` printed before the check (an earlier check's call). Every
+   * message gets the next ts, so A's done belongs to the ask it follows.
+   */
+  function scriptedA(steps: AskStep[], earlier: string[] = []) {
+    const clock = virtualClock()
+    let seq = 0
+    const nextTs = () => `1700000100.${String(++seq).padStart(6, '0')}`
+    const messages: (CannedMessage & { channel: string })[] = []
+    const replyLines = [...earlier]
+    const asks: { text: string; ts: string; done: string | null }[] = []
+    let dmOpen = false
+    const api: HumanApi = {
+      call: async (method, params = {}) => {
+        const channel = String(params.channel ?? '')
+        if (method === 'chat.postMessage') {
+          const ts = nextTs()
+          messages.push({ channel, ts, text: String(params.text), user: DRY_RUN_IDS.humanUserId })
+          if (channel !== DRY_RUN_IDS.aHome) return { ok: true, ts }
+          const step = steps[asks.length] ?? { done: false }
+          if (step.call !== undefined) {
+            replyLines.push(step.call)
+            if (step.call.startsWith(`chat_id=${SECOND_ID} error=false`)) {
+              dmOpen = true
+              messages.push({ channel: NEW_DM, ts: nextTs(), text: 'DMs-on outbound check', user: A.userId })
+            }
+          }
+          const done = step.done ? nextTs() : null
+          if (done) messages.push({ channel, ts: done, text: 'done', user: A.userId })
+          asks.push({ text: String(params.text), ts, done })
+          return { ok: true, ts }
+        }
+        if (method === 'conversations.history') {
+          return { ok: true, messages: messages.filter((m) => m.channel === channel && m.ts >= String(params.oldest ?? '0')) }
+        }
+        if (method === 'conversations.list') return { ok: true, channels: dmOpen ? [{ id: NEW_DM, user: A.userId }] : [] }
+        return { ok: true, messages: [] }
+      },
+    }
+    const { container } = fakeContainer([['', (script) => (script === 'mark' ? '1:0' : script === 'replies a' ? replyLines.join('\n') : '')]])
+    const ctx = makeCtx({ mode: 'real', clock, human: new HumanSession(api, clock), second: { human: new HumanSession(api, clock), userId: SECOND_ID }, container })
+    /** The evidence line each ask should leave. */
+    const askEvidence = () => asks.map((a, i) => `ask ${i + 1}: TS ${a.ts}, ${a.done ? `done ${a.done}` : 'no done from A'}`)
+    return { ctx, asks, askEvidence }
+  }
+
+  async function runWith(check: CheckDef<CheckContext>, steps: AskStep[], earlier: string[] = []) {
+    const a = scriptedA(steps, earlier)
+    const r = await check.run(a.ctx)
+    assertNoLeak(r)
+    return { r, ...a }
+  }
+
+  const BOTH = [
+    ['16', check16, REFUSED],
+    ['20', check20, SENT],
+  ] as const
+
+  test.each(BOTH)('Check %s: A silent on the first ask is one post, then a FAIL', async (_id, check) => {
+    const { r, asks, askEvidence } = await runWith(check, [{ done: false }])
+    expect([r.status, r.reason]).toEqual(['FAIL', `A did not say done and made no reply-tool call to ${SECOND_ID}`])
+    expect(asks.length).toBe(1)
+    expect(r.evidence).toEqual(askEvidence())
+    expect(r.evidence[0]).toEndWith('no done from A')
+  })
+
+  test.each(BOTH)('Check %s: done on the first ask but silent on the second is a FAIL naming the second ask', async (_id, check) => {
+    const { r, asks, askEvidence } = await runWith(check, [{ done: true }, { done: false }])
+    expect([r.status, r.reason]).toEqual(['FAIL', `A did not say done to the second ask and made no reply-tool call to ${SECOND_ID}`])
+    expect(asks.length).toBe(2)
+    expect(r.evidence).toEqual(askEvidence())
+  })
+
+  test.each(BOTH)('Check %s: no call on the first ask, the call on the second: the same ask is posted again and the call is evaluated', async (_id, check, call) => {
+    const { r, asks, askEvidence } = await runWith(check, [{ done: true }, { done: true, call }])
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(asks.length).toBe(2)
+    expect(asks[1]!.text).toBe(asks[0]!.text)
+    expect(r.evidence).toEqual(askEvidence())
+  })
+
+  test.each(BOTH)('Check %s: a call on the first ask is evaluated at once, with no second ask', async (_id, check, call) => {
+    const { r, asks } = await runWith(check, [{ done: true, call }])
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(asks.length).toBe(1)
+  })
+
+  test.each(BOTH)('Check %s: a call without a done is evaluated, not asked for again, and fails on the missing done', async (_id, check, call) => {
+    const { r, asks } = await runWith(check, [{ done: false, call }])
+    expect([r.status, r.reason]).toEqual(['FAIL', 'A did not say done'])
+    expect(asks.length).toBe(1)
+  })
+
+  test('no call after two asks: exactly two posts; Check 16 is SKIPPED "not run" (not a pass) with the ask evidence, Check 20 FAILs', async () => {
+    const c16 = await runWith(check16, [{ done: true }, { done: true }])
+    expect([c16.r.status, c16.r.reason]).toEqual(['SKIPPED', `not run: A made no reply-tool call to ${SECOND_ID} (asked 2 times; the plan records this as "not run", not a pass)`])
+    expect(c16.asks.length).toBe(2)
+    expect(c16.r.evidence).toEqual(c16.askEvidence())
+    expect(c16.r.evidence.length).toBe(2)
+    const c20 = await runWith(check20, [{ done: true }, { done: true }])
+    expect([c20.r.status, c20.r.reason]).toEqual(['FAIL', `A made no reply-tool call to ${SECOND_ID} (asked 2 times)`])
+    expect(c20.asks.length).toBe(2)
+    expect(c20.r.evidence).toEqual(c20.askEvidence())
+  })
+
+  test("Check 20 ignores Check 16's earlier refused call: with no new call it asks twice and FAILs; a new call is the one evaluated", async () => {
+    const none = await runWith(check20, [{ done: true }, { done: true }], [REFUSED])
+    expect([none.r.status, none.r.reason]).toEqual(['FAIL', `A made no reply-tool call to ${SECOND_ID} (asked 2 times)`])
+    expect(none.asks.length).toBe(2)
+    const fresh = await runWith(check20, [{ done: true, call: SENT }], [REFUSED])
+    expect([fresh.r.status, fresh.r.reason]).toEqual(['PASS', undefined])
+    expect(fresh.asks.length).toBe(1)
+  })
+
+  test("the call evaluated must be the check's own: Check 16 fails a sent message, Check 20 fails a refusal", async () => {
+    const c16 = await runWith(check16, [{ done: true, call: SENT }])
+    expect([c16.r.status, c16.r.reason]).toEqual(['FAIL', 'the call was not refused; the refusal text is not the expected one; the second user has a DM with A'])
+    const c20 = await runWith(check20, [{ done: true, call: REFUSED }])
+    expect([c20.r.status, c20.r.reason]).toEqual(['FAIL', 'the call to the second user failed; the result does not name the new DM; the second user has no DM with A'])
+  })
+})
+
+describe('no live check passes against a silent workspace', () => {
+  // A gesture that only undoes its setup passes when the setup never ran: nothing to restore.
+  const UNDO_GESTURES = ['24-teardown']
+  const live = PLAN_CHECKS.filter((c) => c.needs.includes('workspace') && !c.skip && !UNDO_GESTURES.includes(c.id))
+
+  /**
+   * Posts get a ts; history and replies are empty; every container command
+   * succeeds and prints nothing, except `mark`, so a check gets past its
+   * starting mark; time is virtual.
+   */
+  function silentCtx(): CheckContext {
+    const clock = virtualClock()
+    return makeCtx({
+      mode: 'real',
+      clock,
+      human: scriptedHuman(clock).human,
+      second: { human: scriptedHuman(clock).human, userId: 'U0DRYSECND' },
+      browser: idleBrowser(),
+      container: fakeContainer([['', (script) => (script === 'mark' ? '1:0' : '')]]).container,
+    })
+  }
+
+  test.each(live.map((c) => [c.id, c] as const))('Check %s does not PASS (a throw counts as a FAIL)', async (_id, c) => {
+    const all = new Set<Need>(['workspace', 'claude', 'second-user'])
+    const [r] = await runChecks([c], silentCtx(), { available: all, only: [], now: () => 0, log: { info: () => {} } })
+    expect(r!.status).not.toBe('PASS')
+    assertNoLeak(r)
+  })
+
+  test.each(['16', '20'])('Check %s FAILs outright: A never says done, so it is asked once and not again', async (id) => {
+    const r = await PLAN_CHECKS.find((c) => c.id === id)!.run(silentCtx())
+    expect([r.status, r.reason]).toEqual(['FAIL', 'A did not say done and made no reply-tool call to U0DRYSECND'])
+  })
+
+  test('the undo gestures left out pass only with nothing to restore', async () => {
+    for (const id of UNDO_GESTURES) {
+      const r = await PLAN_CHECKS.find((c) => c.id === id)!.run(silentCtx())
+      expect([id, r.status, r.evidence]).toEqual([id, 'PASS', ['nothing to restore: the setup did not run']])
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Texts the checks expect, against the package
+// ---------------------------------------------------------------------------
+
+describe('expected texts match the package', () => {
+  const COUNTS = [{ added: 1 }, { removed: 1, credentials: 1 }, { in_place: 2 }, { settings: 1 }, { destructive: 1 }]
+  const srcCounts = (c: (typeof COUNTS)[number]): ChangePlanCounts => {
+    const x = c as Partial<Record<string, number>>
+    return { added: x.added ?? 0, removed: x.removed ?? 0, destructive: x.destructive ?? 0, inPlace: x.in_place ?? 0, credentials: x.credentials ?? 0, settings: x.settings ?? 0 }
+  }
+  const sized = (n: number) => Array.from({ length: n }, () => ({})) as never[]
+
+  test.each(COUNTS)('counts %j: the preview header and the reload-applied line', (c) => {
+    const counts = srcCounts(c)
+    expect(countsText(c)).toBe(renderChangePlanCounts(counts))
+    expect(previewHeader(c)).toBe(`${PENDING_PREVIEW_TITLE} ${renderChangePlanCounts(counts)}.`)
+    const plan: ValidChangePlan = {
+      valid: true,
+      added: sized(counts.added),
+      removed: sized(counts.removed),
+      destructive: sized(counts.destructive),
+      inPlace: Array.from({ length: counts.inPlace }, (_, i) => ({ key: `k${i}` })) as never[],
+      credentials: sized(counts.credentials),
+      nextLaunch: [],
+      unchanged: [],
+      settings: sized(counts.settings),
+      noEffectiveChange: false,
+      configDirsChanged: false,
+    }
+    expect(appliedLine(c)).toBe(renderAppliedLogLine(plan, `${S}/config.json.last-applied`))
+  })
+
+  test('parsePending splits the pending file the package writes', () => {
+    expect(PENDING_HEADER).toBe(PENDING_FILE_HEADER)
+    const fingerprint = `fingerprint: sha256:${'0'.repeat(64)}`
+    const text = [PENDING_FILE_HEADER, fingerprint, '', previewHeader({ settings: 1 }), 'line two', ''].join('\n')
+    const pending = parsePending(text)
+    expect(pending).toEqual({ header: PENDING_FILE_HEADER, fingerprint, preview: [previewHeader({ settings: 1 }), 'line two'] })
+    const f = new Findings()
+    checkPreview(f, pending!, [previewHeader({ settings: 1 }), 'line two'])
+    expect(f.failures).toEqual([])
+    checkPreview(f, { ...pending!, fingerprint: 'fingerprint: none' }, ['other'])
+    expect(f.failures.length).toBe(2)
+    expect(parsePending('one\ntwo\nnot blank\nfour')).toBeNull()
+    expect(parsePending('short')).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+describe('check helpers', () => {
+  test.each([`it's`, '$(touch /nonexistent/x) `id` $HOME', "'; echo pwned #", 'two\nlines', ''])('q(%p) is one literal shell word', (value) => {
+    const bash = Bun.which('bash')!
+    const r = Bun.spawnSync([bash, '-c', `printf %s ${q(value)}`], { env: { PATH: '/usr/bin:/bin' } })
+    expect([r.exitCode, r.stdout.toString()]).toEqual([0, value])
+  })
+
+  test.each([
+    ['Hello, WORLD!', 'world', true],
+    ['pineapple', 'apple', false],
+    ['a re-run', 'run', false],
+    ['echo: a.b done', 'a.b', true],
+    ['xa.b', 'a.b', false],
+  ])('hasWord(%p, %p) is %p', (text, word, expected) => {
+    expect(hasWord(text, word)).toBe(expected)
+  })
+
+  test.each([
+    [{ ts: '1.000001', text: '*Permission* — Allowed' }, 'allowed', false],
+    [{ ts: '1.000001', text: '*Permission* — Denied by operator' }, 'denied', false],
+    [{ ts: '1.000001', text: 'Bash wants to run', blocks: [{ elements: [{ text: { text: 'Allow' } }, { text: { text: 'Deny' } }] }] }, 'open', true],
+    [{ ts: '1.000001', text: 'permission request: Bash' }, 'other', true],
+    [{ ts: '1.000001', text: 'hello' }, 'other', false],
+  ])('promptState(%j) is %p', (message, state, prompt) => {
+    expect([promptState(message), isPrompt(message)] as unknown[]).toEqual([state, prompt])
+  })
+
+  test('tagAttr, expectOneTag and rawShape read IDs only', () => {
+    const tag = '<channel source="slack" chat_id="C0DRYCOORD" user_id="U0DRYBOTA0" via="broadcast">'
+    expect([tagAttr(tag, 'via'), tagAttr(tag, 'thread_ts')]).toEqual(['broadcast', null])
+    const f = new Findings()
+    expectOneTag(f, [tag], 'tags b TS', { via: 'broadcast', chat_id: 'C0DRYCOORD' }, { user_id: 'U0DRYBOTA0' })
+    expect(f.failures).toEqual([])
+    expectOneTag(f, [tag], 'x', { via: 'mention' }, { user_id: 'U0OTHER000', bot_id: 'B0OTHER000' })
+    expectOneTag(f, [], 'y', {})
+    expect(f.failures).toEqual(['x: via is broadcast, not mention', 'x: the tag\'s author is not U0OTHER000 / B0OTHER000', 'y: expected exactly one tag, found 0'])
+    const token = fakeToken(BOT_TOKEN_PREFIX)
+    const shape = rawShape(`RAW message event persona=persona_b: {"user":"U0A","bot_id":"B0A","bot_profile":{"x":1},"text":"${token}"}`)
+    expect(shape).toEqual({ user: 'U0A', bot_id: 'B0A', subtype: 'absent', app_id: 'absent', bot_profile: 'present' })
+    assertNoLeak(shape)
+  })
+
+  test("judgeLimitLines (Check 12's search): message-text lines are skipped, the known Slack rate-limit lines are notes, anything else fails", () => {
+    const skipped = [
+      '12:[slack] RAW message event persona=persona_b: {"text":"what is the limit of 7 times 6?"}',
+      '13:[slack] Dispatching to persona "persona_a" (key=persona_a) chat_id=C0DRYCOORD text=no limit here',
+    ]
+    const rateLimit = [
+      '20:[WARN]  web-api:WebClient:0 API Call failed due to rate limiting. Will retry in 3 seconds.',
+      '21:[slack] A rate limit was exceeded (url: chat.postMessage, retry-after: 3)',
+      '22:[slack] reactions.add failed: ratelimited',
+    ]
+    const other = ['30:[slack] bot-to-bot loop guard dropped a message', '31:[slack] Slack rate limited: retry-after 3', '32:throttled persona_b', '33:too many messages']
+    expect(judgeLimitLines([...skipped, ...rateLimit, ...other])).toEqual({ failures: other, notes: rateLimit })
+  })
+
+  test('waitTags polls `tags` until it prints, then reads once more a poll later (a late duplicate counts); at the deadline it gives none', async () => {
+    const tag = '<channel source="slack" chat_id="C0DRYCOORD" user_id="U0DRYBOTA0" via="mention">'
+    let calls = 0
+    const answers = ['', '', tag, `${tag}\n${tag}`]
+    const clock = virtualClock()
+    const c = fakeContainer([["tags b '1700000200.000001'", () => answers[calls++] ?? '']])
+    const start = clock.now()
+    expect(await waitTags(makeCtx({ container: c.container, clock }), 'b', '1700000200.000001')).toEqual([tag, tag])
+    expect([calls, clock.now() - start]).toEqual([4, 15_000])
+
+    const silent = virtualClock()
+    const at = silent.now()
+    expect(await waitTags(makeCtx({ clock: silent }), 'b', '1700000200.000001')).toEqual([])
+    expect(silent.now() - at).toBe(TAG_TIMEOUT_MS)
+  })
+
+  test('liveIdsFrom names what apps.json lacks, and gives the IDs when it is complete', () => {
+    expect(liveIdsFrom(emptyAppsState())).toBe(
+      'apps.json is incomplete (persona a, persona b, persona c, persona d, team_id, human_user_id, channels): run the provisioning first',
+    )
+    const full = {
+      version: 1 as const,
+      team_id: DRY_RUN_IDS.teamId,
+      human_user_id: DRY_RUN_IDS.humanUserId,
+      personas: Object.fromEntries(Object.entries(DRY_RUN_IDS.bots).map(([l, b]) => [l, { app_id: b.appId, bot_user_id: b.userId, bot_id: b.botId }])),
+      channels: { 'a-home': DRY_RUN_IDS.aHome, coordination: DRY_RUN_IDS.coordination, 'd-home': DRY_RUN_IDS.dHome },
+    }
+    expect(liveIdsFrom(full)).toEqual(DRY_RUN_IDS)
+    delete (full.personas as Record<string, { bot_id?: string }>).c!.bot_id
+    expect(liveIdsFrom(full)).toBe('apps.json is incomplete (persona c): run the provisioning first')
+  })
+})

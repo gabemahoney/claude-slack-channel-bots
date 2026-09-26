@@ -5,3 +5,11 @@ node_modules/
 *.tgz
 ._*
 .publish-state.json
+# /ci-live: its own dependencies (install with `bun install --ignore-scripts` in ci-live/),
+# and never one of its secret or state files, should a config dir ever point into the repo.
+ci-live/node_modules/
+slack_config_token
+slack_config_refresh_token
+test_password
+playwright-state*.json
+credentials-staged/

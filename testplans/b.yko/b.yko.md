@@ -31,6 +31,14 @@ integration-script transcription and is not a docker integration test.
 `/ci` and `/release-test` never run it: `/release-test` selects only tickets
 whose title starts with "Test ", and this title deliberately does not.
 
+`/ci-live` (`bun ci-live/run.ts`) automates this plan. It runs the checks in
+this order against the test workspace, in a throwaway docker container that
+serves as the test host, and writes a Results row. S1, 26 and 29b stay manual,
+and so do 14, 16 and 20 when no second account is configured. Its deviations
+from the steps below (for example, `config.json` edits instead of the wizard
+in Part 1.5 and Check 25, and a container restart as Check 28's reboot) are
+recorded in its results' Notes. See `docker/README.md` under "/ci-live".
+
 ---
 
 ## AC coverage
@@ -140,7 +148,7 @@ Read this section before every run.
 
 - **Operator-run only**, on a **test Slack workspace**. Never on a workspace that production bots serve.
 - **Never on the production install.** Use a dedicated host or VM whose HOME holds no production CSCB state (`~/.claude/channels/slack/`) and no production `~/.agent-director`. The start sweep kills and deletes every `service=cscb` agent-director row that names no configured persona, so a test server sharing `~/.agent-director` with a production CSCB would destroy the production bots. A dedicated OS user is acceptable only on a host that runs no production CSCB at all: only one CSCB server runs per host (they would both need port 3100).
-- **Never through `/ci` or `/release-test`.** Only the operator runs this plan, by hand.
+- **Never through `/ci` or `/release-test`.** Only the operator runs this plan, by hand, or starts `/ci-live`, which runs it in a throwaway container.
 - **Never type or paste a token** into a chat (the wizard's included), this ticket, the results table, a log or a shell command line. Tokens go only into the wizard's credentials command, at its hidden prompts, in the operator's own terminal (Check S1). Every token check in this plan counts matches and never prints one.
 - **A Linux host with bash.** The plan's commands need GNU/Linux and an interactive bash shell: they read `/proc/<pid>/environ`, and use `stat -c`, `sha256sum`, `history -a`, bash arrays, `jq`, `script`, `tmux` and a user crontab `@reboot` line. Only the optional Check 29b needs `sudo`, `iptables` and `systemd-run`. The pre-flight checks the rest.
 - **The optional Check 29b changes the test host's network for a few minutes**: a firewall rule, limited to the test user's processes and removed by a job scheduled before the rule is added, and an `/etc/hosts` line, removed in the same check and, as a backstop, by a job scheduled before the line is added. Do it only on the test host. Teardown removes both if a terminal dropped mid-check.

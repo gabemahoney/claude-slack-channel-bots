@@ -1,0 +1,137 @@
+/**
+ * apps-state.ts — `apps.json`, the runner's record of the test workspace:
+ * app IDs, bot user IDs, bot IDs, the team ID, the channel IDs and the test
+ * human's user ID. It holds no secret.
+ *
+ * The apps stage writes each app ID the moment `apps.manifest.create`
+ * returns it, so a crash or a rerun never creates a second app for a persona.
+ *
+ * Parsing is tolerant (an unknown or malformed field is dropped, never
+ * echoed); writes are atomic (temp file + rename, mode 600, like every file in
+ * the config dir).
+ */
+
+import type { SecureFs } from './secrets.ts'
+import { writePrivateFile } from './secrets.ts'
+import { CHANNEL_NAMES, PERSONA_LETTERS, type ChannelName, type PersonaLetter } from './personas.ts'
+
+export interface PersonaAppState {
+  app_id?: string
+  bot_user_id?: string
+  bot_id?: string
+  /** Set when the manifest was updated: the install stage re-installs the app. */
+  needs_reinstall?: boolean
+  /** The name of the app-level token in the credentials file (not the token). */
+  app_token_name?: string
+}
+
+export interface AppsState {
+  version: 1
+  team_id?: string
+  human_user_id?: string
+  personas: Partial<Record<PersonaLetter, PersonaAppState>>
+  channels: Partial<Record<ChannelName, string>>
+}
+
+const APP_ID_RE = /^A[A-Z0-9]{6,20}$/
+const USER_ID_RE = /^[UW][A-Z0-9]{6,20}$/
+const BOT_ID_RE = /^B[A-Z0-9]{6,20}$/
+const TEAM_ID_RE = /^T[A-Z0-9]{6,20}$/
+const CHANNEL_ID_RE = /^[CG][A-Z0-9]{6,20}$/
+const TOKEN_NAME_RE = /^[a-z0-9-]{1,48}$/
+
+export function isAppId(v: unknown): v is string {
+  return typeof v === 'string' && APP_ID_RE.test(v)
+}
+export function isUserId(v: unknown): v is string {
+  return typeof v === 'string' && USER_ID_RE.test(v)
+}
+export function isBotId(v: unknown): v is string {
+  return typeof v === 'string' && BOT_ID_RE.test(v)
+}
+export function isTeamId(v: unknown): v is string {
+  return typeof v === 'string' && TEAM_ID_RE.test(v)
+}
+export function isChannelId(v: unknown): v is string {
+  return typeof v === 'string' && CHANNEL_ID_RE.test(v)
+}
+
+export function emptyAppsState(): AppsState {
+  return { version: 1, personas: {}, channels: {} }
+}
+
+/** Parse `apps.json` text. Malformed input yields an empty state; bad fields are dropped. */
+export function parseAppsState(text: string): AppsState {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    return emptyAppsState()
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return emptyAppsState()
+  const r = raw as Record<string, unknown>
+  const state = emptyAppsState()
+  if (isTeamId(r.team_id)) state.team_id = r.team_id
+  if (isUserId(r.human_user_id)) state.human_user_id = r.human_user_id
+  const personas = r.personas && typeof r.personas === 'object' ? (r.personas as Record<string, unknown>) : {}
+  for (const letter of PERSONA_LETTERS) {
+    const p = personas[letter]
+    if (!p || typeof p !== 'object') continue
+    const pr = p as Record<string, unknown>
+    const entry: PersonaAppState = {}
+    if (isAppId(pr.app_id)) entry.app_id = pr.app_id
+    if (isUserId(pr.bot_user_id)) entry.bot_user_id = pr.bot_user_id
+    if (isBotId(pr.bot_id)) entry.bot_id = pr.bot_id
+    if (pr.needs_reinstall === true) entry.needs_reinstall = true
+    if (typeof pr.app_token_name === 'string' && TOKEN_NAME_RE.test(pr.app_token_name)) entry.app_token_name = pr.app_token_name
+    if (Object.keys(entry).length > 0) state.personas[letter] = entry
+  }
+  const channels = r.channels && typeof r.channels === 'object' ? (r.channels as Record<string, unknown>) : {}
+  for (const name of CHANNEL_NAMES) {
+    if (isChannelId(channels[name])) state.channels[name] = channels[name] as string
+  }
+  return state
+}
+
+export function serializeAppsState(state: AppsState): string {
+  return `${JSON.stringify(state, null, 2)}\n`
+}
+
+/** Load/save `apps.json` through the secure fs (the config dir is private). */
+export class AppsStateFile {
+  constructor(
+    private readonly fs: SecureFs,
+    readonly path: string,
+  ) {}
+
+  /** Whether apps.json exists (a missing one on a real run means the apps may exist elsewhere). */
+  exists(): boolean {
+    return this.fs.stat(this.path) !== null
+  }
+
+  load(): AppsState {
+    if (!this.fs.stat(this.path)) return emptyAppsState()
+    return parseAppsState(this.fs.readFile(this.path))
+  }
+
+  save(state: AppsState): void {
+    writePrivateFile(this.fs, this.path, serializeAppsState(state))
+  }
+
+  /** Load, apply `change`, save, and return the saved state. */
+  update(change: (state: AppsState) => void): AppsState {
+    const state = this.load()
+    change(state)
+    this.save(state)
+    return state
+  }
+}
+
+/** The persona's entry, created when missing. */
+export function personaEntry(state: AppsState, letter: PersonaLetter): PersonaAppState {
+  const existing = state.personas[letter]
+  if (existing) return existing
+  const created: PersonaAppState = {}
+  state.personas[letter] = created
+  return created
+}

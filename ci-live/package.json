@@ -1,0 +1,9 @@
+{
+  "name": "cscb-ci-live",
+  "private": true,
+  "type": "module",
+  "description": "The /ci-live runner: a live Slack acceptance run of CSCB in a throwaway docker container. Not part of the npm package.",
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}

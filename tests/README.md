@@ -6,7 +6,7 @@
 |---|---|---|
 | Unit suite | `tests/*.test.ts`, `tests/integration/session-leader.test.ts` | `bun test`, on a dev box |
 | Docker integration suite | `tests/integration/test-*.sh`, `tests/runner.sh`, `docker/` | `/ci`, inside the `cscb-ci` image |
-| Live acceptance plan | `testplans/b.yko/b.yko.md` | an operator, by hand, on a test host and test Slack workspace |
+| Live acceptance plan | `testplans/b.yko/b.yko.md` | an operator, by hand, on a test host and test Slack workspace; or `/ci-live` (`ci-live/`), in a throwaway container against the test workspace |
 
 Conventions for unit tests are in `docs/testing-guide.md`; this file covers how
 to run each kind safely and how the integration suite is laid out.
@@ -323,13 +323,18 @@ host, once, with no tmux, no orchestrator session, and no permission prompts.
 workspace") is the manual acceptance run for personas. It is not part of
 either suite above:
 
-- **Manual, never in CI.** An operator runs it by hand. Neither `/ci` nor
-  `/release-test` runs it: `/release-test` selects only `testplans` tickets
-  whose title starts with "Test ", and this title deliberately does not. Keep
-  it that way.
-- **Test host and test workspace only.** It runs on a test host against a test
-  Slack workspace with three persona apps, never in docker and never on the
-  production install.
+- **Never in `/ci` or `/release-test`.** Neither runs it: `/release-test`
+  selects only `testplans` tickets whose title starts with "Test ", and this
+  title deliberately does not. Keep it that way.
+- **Two ways to run it.** An operator runs it by hand, or `/ci-live`
+  (`bun ci-live/run.ts`) runs it against real Slack in a throwaway container
+  that serves as the test host. `/ci-live` leaves S1, 26 and 29b to the
+  operator (and 14, 16 and 20 when no second account is configured);
+  `docker/README.md` under "/ci-live" lists what it automates and
+  how, and `ci-live/README.md` has its setup.
+- **Test host and test workspace only.** It runs against a test Slack
+  workspace with three persona apps (and a fourth, D, for Part 9), on a test
+  host or in `/ci-live`'s container, never on the production install.
 - **One ordered run.** A single setup, done only from the README, the setup
   wizard and `config.json`, then numbered checks in a fixed order (one
   crash-and-recover cycle, one reboot, a closing secrecy check) and a final
@@ -339,7 +344,11 @@ either suite above:
   acceptance criterion, and the extra live evidence, to the check and step
   that verifies it. A change that adds, moves or renumbers a check updates the
   table in the same edit.
-- **No script.** The transcription rule above doesn't apply: the plan has no
-  integration-script counterpart, and it must not be turned into one. A
-  behaviour the docker suite can check in dry run belongs in a script there
-  instead.
+- **No integration script.** The transcription rule above doesn't apply: the
+  plan has no `tests/integration/` counterpart, and it must not be turned into
+  one. A behaviour the docker suite can check in dry run belongs in a script
+  there instead.
+- **The plan is `/ci-live`'s oracle.** Each check in `ci-live/checks/` asserts
+  its check's Expected list. A change to a check's Steps or Expected, or to
+  the run order, updates the matching check in `ci-live/checks/` in the same
+  edit.

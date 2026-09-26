@@ -7,6 +7,9 @@ allowed-tools: [Bash]
 
 # /ci
 
+This suite never connects to Slack. The live Slack acceptance run against the
+test workspace is `/ci-live` (`.claude/skills/ci-live/SKILL.md`).
+
 ## Procedure
 
 1. `RUN_ID=$(date +%s)`
