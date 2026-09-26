@@ -79,6 +79,7 @@ import {
   errGeneric,
   errInstanceIdCollision,
   errSpawnNotFound,
+  errSpawnNotInteractive,
   errTmuxSendKeys,
   holdSpawns,
   makeStubCallLog,
@@ -2052,6 +2053,86 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     // The successful launch counts no failure.
     expect(getFailureCount(KEY)).toBe(0)
     // The run armed no further timer: nothing relaunches the persona again.
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.dup: a findMissing sweep ends the row just before the reconnect lands.
+//
+// The liveness probe and the reconnect adapter read the persona's row
+// `waiting`; a findMissing sweep (another persona's launch wait starts with
+// one, b.m4r) marks it `missing` just before the `/mcp reconnect` keystrokes
+// land, and agent-director refuses them with ErrSpawnNotInteractive. The probe
+// and the adapter are the REAL ones over one stub AD client; kill and launch
+// are recording fakes. reconnectMcp answers 'dead-session', the adapter
+// escalates, and the re-probe (b.d61) reads the row dead, so the persona is
+// relaunched in that same run. Before the fix the adapter answered
+// 'transient' after a spawn-failure notice, and the persona stayed down until
+// a later tick.
+// ---------------------------------------------------------------------------
+
+describe('b.dup: a persona whose row is ended just before its reconnect lands is relaunched in the same restart run', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-dup-'))
+    _resetFindMissingMemo()
+  })
+
+  afterEach(() => {
+    cancelAllRestartTimers()
+    resetClientForTests()
+    _resetOutageState()
+    _resetTmuxServerEnsurer()
+    _resetFindMissingMemo()
+    setSessionNotifier(undefined)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('REPRO: alive (waiting) but disconnected; the keystrokes are refused (ErrSpawnNotInteractive) → one send-keys and one sweep; the re-probe reads the row missing → one kill and one relaunch in that run; no spawn-failure notice, no failure counted', async () => {
+    const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
+    const KEY = config.personas[0]!.key
+    let rowState = 'waiting'
+    const sendKeysCalls: SendKeysParams[] = []
+    const findMissingCalls: FindMissingParams[] = []
+    const stub = makeStubClient({ statusFn: () => ({ state: rowState }), findMissingCalls })
+    stub.sendKeys = async (params) => {
+      sendKeysCalls.push(params)
+      rowState = 'missing' // a findMissing sweep landed just before the keystrokes
+      throw errSpawnNotInteractive('send-keys')
+    }
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    _setTmuxServerEnsurer(async () => {})
+    const raised: string[] = []
+    setSessionNotifier((key) => { raised.push(key) })
+
+    const killSessionCalls: string[] = []
+    const launchSessionCalls: string[] = []
+    initRestart({
+      canRestart: () => true,
+      isSessionAlive: _buildIsSessionAliveAdapter(() => config),
+      isSessionConnected: () => false,
+      hasSessionStream: () => false,
+      reconnectSession: _buildReconnectSessionAdapter(),
+      async killSession(key) { killSessionCalls.push(key) },
+      async launchSession(key) { launchSessionCalls.push(key); return true },
+      getRestartDelay: () => FAST_DELAY_S,
+      isShuttingDown: () => false,
+      onCapReached: () => {},
+    })
+
+    scheduleRestart(KEY, config.personas[0]!.working_directory)
+    await Bun.sleep(WAIT_MS)
+
+    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(KEY)])
+    expect(findMissingCalls).toHaveLength(1)
+    expect(killSessionCalls).toEqual([KEY])
+    expect(launchSessionCalls).toEqual([KEY])
+    expect(raised).toEqual([])
+    expect(getFailureCount(KEY)).toBe(0)
     expect(isRestartPendingOrActive(KEY)).toBe(false)
   })
 })

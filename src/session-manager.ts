@@ -112,6 +112,7 @@ import {
   ErrCwdNotFound,
   ErrCwdNotADirectory,
   ErrSpawnCapReached,
+  ErrSpawnNotInteractive,
 } from './agent-director-errors.ts'
 import { recordStartupError } from './startup-errors.ts'
 import {
@@ -666,7 +667,9 @@ export async function hasPersonaTmuxSession(key: string): Promise<boolean> {
  * report a bare failure. Two classes of proof qualify:
  *   - the claude PROCESS is provably gone per AD's evidence-based
  *     findMissing + status verdict (waitForWaitingAndReconnect's ended/missing
- *     branch and its timeout branch; b.ecw), or
+ *     branch and its timeout branch; b.ecw), or AD refused reconnectMcp's
+ *     keystrokes because it had ended the row or marked it missing since the
+ *     caller read its state (`ErrSpawnNotInteractive`; b.dup), or
  *   - the tmux SESSION provably doesn't exist (the ErrSpawnNotFound paths where
  *     AD has no row to consult, and reconnectMcp's double-ErrTmuxSendKeys).
  */
@@ -696,6 +699,18 @@ export type WaitReconnectOutcome = ReconnectOutcome | 'not-reconnected' | 'cance
  * for good (post-reboot /tmp wipe) — no amount of send-keys can revive it.
  * Return 'dead-session' so spawnForPersona can fall through to resume/fresh-spawn.
  *
+ * b.dup: agent-director refuses send-keys to a row that is not interactive
+ * with `ErrSpawnNotInteractive` (an `ended` or `missing` row; a `pending` one
+ * too, without allow_pending, but no caller passes one: the restart path's
+ * adapter defers a `pending` row). Every caller read the row `waiting` (or a
+ * stale `working`) just before, so the row was ended or marked missing in
+ * between: SessionEnd fired, or a findMissing sweep (another persona's launch
+ * wait starts with one, b.m4r) found the claude process gone. That process is
+ * gone, so this returns 'dead-session' too, on the first attempt or on the
+ * `ErrTmuxSendKeys` retry, with one log line and no spawn-failure notice: the
+ * caller recovers the persona (the ladder through resume/fresh-spawn, the
+ * restart adapter by escalating it for a relaunch in the same run).
+ *
  * @param key  Persona key: addresses `cscb_<key>` and keys outage flags and notices.
  * @param ref  Log reference; defaults to the key alone.
  */
@@ -715,6 +730,7 @@ export async function reconnectMcp(
     return 'ok'
   } catch (err) {
     if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return 'failed'
+    if (err instanceof ErrSpawnNotInteractive) return reconnectRefusedDeadSession(err, ref)
     if (err instanceof ErrTmuxSendKeys) {
       console.error(
         `[slack] reconnectMcp: ErrTmuxSendKeys for ${ref} — ensuring tmux server exists and retrying send-keys once`,
@@ -726,6 +742,7 @@ export async function reconnectMcp(
         return 'ok'
       } catch (err2) {
         if (err2 instanceof ErrSystemInstallDisappeared || err2 instanceof ErrTmuxNotAvailable) return 'failed'
+        if (err2 instanceof ErrSpawnNotInteractive) return reconnectRefusedDeadSession(err2, ref)
         const e2 = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('send-keys', 'UnknownError', String(err2))
         console.error(`[slack] reconnectMcp: retry after ErrTmuxSendKeys failed for ${ref}: ${describeAgentDirectorFailure(e2)}`)
         if (err2 instanceof ErrTmuxSendKeys) {
@@ -742,6 +759,20 @@ export async function reconnectMcp(
     notifySpawnFailure(key, e)
     return 'failed'
   }
+}
+
+/**
+ * b.dup: reconnectMcp's verdict when agent-director refused its keystrokes
+ * with `ErrSpawnNotInteractive`: the row was ended or marked missing after the
+ * caller read its state, so the claude process is gone. Logs one line (the
+ * error's name and redacted description) and returns 'dead-session'; raises
+ * no notice, since the caller recovers the persona.
+ */
+function reconnectRefusedDeadSession(err: ErrSpawnNotInteractive, ref: string): 'dead-session' {
+  console.error(
+    `[slack] reconnectMcp: send-keys refused for ${ref}: ${describeAgentDirectorFailure(err)} — agent-director ended its row or marked it missing after its state was read (SessionEnd or a findMissing sweep), so its claude process is gone — dead session (b.dup)`,
+  )
+  return 'dead-session'
 }
 
 // ---------------------------------------------------------------------------
@@ -3412,7 +3443,8 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    - ended/missing + resume_enabled → resume; on ErrNoSessionId/
  *      ErrJsonlMissing/ErrJsonlNeverWritten → delete + fresh spawn.
  *    - ended/missing + !resume_enabled → kill + delete + fresh spawn.
- *    - waiting → reconnectMcp; 'dead-session' → resume/fresh-spawn (b.3ce).
+ *    - waiting → reconnectMcp; 'dead-session' → resume/fresh-spawn (b.3ce;
+ *      b.dup: a row ended or marked missing before the keystrokes landed).
  *    - working → waitForWaitingAndReconnect; 'dead-session' → resume/fresh-spawn (b.3ce);
  *      'not-reconnected' or 'cancelled' (its teardown cancelled the wait) →
  *      `not-reconnected` (b.f2b: nothing was typed; `reconnected` only when
@@ -3637,10 +3669,12 @@ async function runPersonaLadder(
     // b.3ce: a 'dead-session' verdict means send-keys can never reach the
     // spawn (tmux session wiped by a reboot while the AD row froze at
     // `waiting`) — recover exactly like the ended/missing states instead of
-    // giving up.
+    // giving up. b.dup: so does a row agent-director ended or marked missing
+    // after the `get` above read it `waiting` (a findMissing sweep, e.g. from
+    // another persona's launch wait, landed before the keystrokes).
     const outcome = await reconnectMcp(key, ref)
     if (outcome === 'dead-session') {
-      console.error(`[slack] spawnForPersona: dead tmux session for ${ref} (state=waiting) — recovering via resume/fresh-spawn`)
+      console.error(`[slack] spawnForPersona: dead session for ${ref} (state=waiting) — recovering via resume/fresh-spawn`)
       return resumeOrFreshSpawn(persona, params, config, isStartup, row, { reconcileMissingFirst: true })
     }
     if (outcome !== 'ok') {
@@ -3658,14 +3692,15 @@ async function runPersonaLadder(
     // transitions and whenever the claude PROCESS is verifiably alive at the
     // deadline (a long turn isn't an error); 'dead-session' when the process is
     // provably gone (ended/missing, or the timeout sweep + status verdict —
-    // b.ecw) or the tmux session provably doesn't exist (spawn-not-found —
-    // b.c3o).
+    // b.ecw; or its reconnect was refused because the row had just been
+    // ended or marked missing — b.dup) or the tmux session provably doesn't
+    // exist (spawn-not-found — b.c3o).
     // b.f2b: the wait can take up to WAIT_FOR_WAITING_TIMEOUT_MS; tell the
     // caller (the start pass lets the launch go on in the background).
     hooks?.onWorkingRowWait?.()
     const outcome = await waitForWaitingAndReconnect(key, config, ref)
     if (outcome === 'dead-session') {
-      console.error(`[slack] spawnForPersona: dead tmux session for ${ref} (state=working) — recovering via resume/fresh-spawn`)
+      console.error(`[slack] spawnForPersona: dead session for ${ref} (state=working) — recovering via resume/fresh-spawn`)
       return resumeOrFreshSpawn(persona, params, config, isStartup, row, { reconcileMissingFirst: true })
     }
     // b.f2b: report the real outcome, not `reconnected`. A wait its persona's

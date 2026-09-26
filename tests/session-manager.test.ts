@@ -62,6 +62,11 @@
  *     `persona-destination-failed` line per episode, retries on the SR-3.2
  *     backoff, delivery in raised order once the cause clears, and the
  *     failure callback run once per notice, not per retry.
+ *   - b.dup: a reconnect whose keystrokes agent-director refuses
+ *     (ErrSpawnNotInteractive) because a findMissing sweep ended the row
+ *     after it was read is a dead session, recovered through resume with no
+ *     `[spawn-failed]` entry or notice, at a launch's `waiting` row (the live
+ *     race: another persona's wait sweeps) and in each reconnect of the wait.
  *   - b.f2b stale `working` rows: how a pane read is classified (a Linux
  *     screen's `●` reply and tool lines are not a spinner; a custom spinner
  *     verb of several words is) and folded into evidence, the restart path's
@@ -6121,6 +6126,240 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     expect(linesWith(errLog, 'reading the pane of persona=C failed')).toHaveLength(row.pane instanceof Error ? 1 : 0)
     expect(linesWith(errLog, failure)).toHaveLength(row.pane instanceof Error ? 1 : 0)
     assertNoLeak({ errLog })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.dup — a findMissing sweep ends a row just before its /mcp reconnect lands
+//
+// agent-director's send-keys refuses an `ended` or `missing` row with
+// ErrSpawnNotInteractive. Another persona's launch wait starts with a
+// findMissing sweep (b.m4r), and that sweep can mark a persona's row
+// `missing` after its ladder read the row `waiting` and before its
+// `/mcp reconnect` keystrokes land (/ci-live run 5, Checks 24-teardown and
+// 28: `find_missing.tick cscb_persona_a waiting→missing`, then
+// `send_keys cscb_persona_a ErrSpawnNotInteractive` 11 ms later). Its claude
+// process is gone, so reconnectMcp answers 'dead-session' and the caller
+// recovers the persona. Before the fix it answered 'failed': a `[spawn-failed]`
+// startup error and a spawn-failure notice, and the persona stayed down until
+// the restart backoff relaunched it.
+//
+// Cases marked REPRO fail on the code before the fix.
+// ---------------------------------------------------------------------------
+
+describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect landed (ErrSpawnNotInteractive)', () => {
+  /** What reconnectMcp logs when agent-director refuses its keystrokes for a row that is no longer interactive. */
+  const REFUSED = 'ErrSpawnNotInteractive message="spawn not interactive — not in pending/waiting state" — agent-director ended its row or marked it missing after its state was read (SessionEnd or a findMissing sweep), so its claude process is gone — dead session (b.dup)'
+
+  /** Personas `A` and `B`, each launch polling every 1 ms. */
+  function raceConfig(): PersonaConfig {
+    return makeStandInPersonaConfig(
+      { A: { working_directory: '/a' }, B: { working_directory: '/b' } },
+      fixtureDir,
+      { agent_director_poll_interval_ms: 1 },
+    )
+  }
+
+  /**
+   * One stub agent-director that keeps each persona's row state. `A`'s row
+   * reads `waiting` though its claude process is gone; `B`'s reads `working`.
+   * Both launches collide. `findMissing` marks `A`'s row `missing` (and `B`'s
+   * turn ends: its row reads `waiting`); `send-keys` refuses an `ended` or
+   * `missing` row with ErrSpawnNotInteractive, as agent-director does; a
+   * `resume` brings the row back `waiting`. `A`'s collision `get` reads its row
+   * at once but answers only after a sweep: `B`'s wait sweeps between `A`'s
+   * read and `A`'s keystrokes.
+   */
+  function installSweepRace(cfg: PersonaConfig): {
+    sendKeysCalls: import('agent-director').SendKeysParams[]
+    resumeCalls: import('agent-director').ResumeParams[]
+  } {
+    const rows = new Map<string, string>([['cscb_A', 'waiting'], ['cscb_B', 'working']])
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    let swept!: () => void
+    const sweep = new Promise<void>((resolve) => { swept = resolve })
+    const stub = installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+      ],
+    })
+    stub.get = async ({ claude_instance_id }) => {
+      const key = claude_instance_id.slice(PERSONA_INSTANCE_ID_PREFIX.length)
+      const row = personaRow(cfg, key, { state: rows.get(claude_instance_id) })
+      if (key === 'A') await sweep
+      return row
+    }
+    stub.findMissing = async () => {
+      rows.set('cscb_A', 'missing')
+      rows.set('cscb_B', 'waiting')
+      swept()
+      return cannedFindMissing({ count: 1, ids: ['cscb_A'] })
+    }
+    stub.status = async ({ claude_instance_id }) =>
+      ({ state: rows.get(claude_instance_id) }) as import('agent-director').StatusResult
+    stub.sendKeys = async (params) => {
+      sendKeysCalls.push(params)
+      const state = rows.get(params.claude_instance_id)
+      if (state === 'ended' || state === 'missing') throw errSpawnNotInteractive('send-keys')
+      return {}
+    }
+    stub.resume = async (params) => {
+      resumeCalls.push(params)
+      rows.set(params.claude_instance_id, 'waiting')
+      return { claude_instance_id: params.claude_instance_id }
+    }
+    return { sendKeysCalls, resumeCalls }
+  }
+
+  test('REPRO (live Checks 24-teardown, 28): B\'s wait sweeps A\'s row to missing after A\'s ladder read it waiting and before A\'s /mcp reconnect lands → A is resumed, not failed: no [spawn-failed] entry, no spawn-failure notice; B reconnects', async () => {
+    const readLog = captureStartupErrors()
+    const cfg = raceConfig()
+    const race = installSweepRace(cfg)
+
+    let results: Array<Awaited<ReturnType<typeof spawnForPersona>>> = []
+    const errLog = await withCapturedErr(async () => {
+      results = await Promise.all([spawnForPersona(personaOf(cfg, 'A'), cfg), spawnForPersona(personaOf(cfg, 'B'), cfg)])
+    })
+
+    expect(results).toEqual([{ key: 'A', action: 'resumed' }, { key: 'B', action: 'reconnected' }])
+    // A's keystrokes were refused once, with no tmux-server retry; B's landed.
+    expect(race.sendKeysCalls.map((c) => c.claude_instance_id).sort()).toEqual(['cscb_A', 'cscb_B'])
+    expect(race.resumeCalls).toEqual([{ claude_instance_id: 'cscb_A' }])
+    expect(readLog()).toBe('')
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, `[slack] reconnectMcp: send-keys refused for "A" (key=A): ${REFUSED}`)).toHaveLength(1)
+    expect(linesWith(errLog, '[slack] spawnForPersona: dead session for "A" (key=A) (state=waiting) — recovering via resume/fresh-spawn')).toHaveLength(1)
+  })
+
+  test('REPRO: reconnectMcp → dead-session on ErrSpawnNotInteractive: one send-keys, no tmux-server retry, no notice, one log line', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    let ensureCalls = 0
+    _setTmuxServerEnsurer(async () => { ensureCalls++ })
+    installStub({ sendKeysCalls, sendKeysError: errSpawnNotInteractive('send-keys') })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await reconnectMcp('C')
+    })
+
+    expect(result).toBe('dead-session')
+    expect(sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C', RECONNECT_TEXT]])
+    expect(ensureCalls).toBe(0)
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, `[slack] reconnectMcp: send-keys refused for persona=C: ${REFUSED}`)).toHaveLength(1)
+  })
+
+  test('REPRO: the tmux-server retry after ErrTmuxSendKeys refused with ErrSpawnNotInteractive (the row was ended meanwhile) → dead-session, no notice', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    let ensureCalls = 0
+    _setTmuxServerEnsurer(async () => { ensureCalls++ })
+    installStub({
+      sendKeysCalls,
+      sendKeysQueue: [
+        cannedErr<import('agent-director').SendKeysResult>(errTmuxSendKeys()),
+        cannedErr<import('agent-director').SendKeysResult>(errSpawnNotInteractive('send-keys')),
+      ],
+    })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await reconnectMcp('C')
+    })
+
+    expect(result).toBe('dead-session')
+    expect(sendKeysCalls).toHaveLength(2)
+    expect(ensureCalls).toBe(1)
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, `[slack] reconnectMcp: send-keys refused for persona=C: ${REFUSED}`)).toHaveLength(1)
+  })
+
+  /**
+   * The wait's three reconnects (b.f2b), each refused because the row was
+   * ended just before: how the stub makes each (`installWorkingRow`), and the
+   * row `get` answers.
+   */
+  const WAIT_RECONNECTS: Array<[string, (cfg: PersonaConfig) => { init: Parameters<typeof installWorkingRow>[1]; opts: StubClientOptions }]> = [
+    ['the row reads waiting at a poll', () => ({ init: { state: 'waiting', pane: IDLE_PANE, stepMs: 1_000 }, opts: {} })],
+    [
+      'the positive-idle rule shows the working row stale',
+      (cfg) => ({ init: { pane: IDLE_PANE, stepMs: 10_000 }, opts: { getResult: workingRowOf(cfg, transcriptOf()) } }),
+    ],
+    [
+      'the row reads waiting at the deadline',
+      () => ({
+        init: { pane: SPINNER_PANE, stepMs: 60_000, state: (r: WorkingRow) => (r.findMissingCalls.length >= 2 ? 'waiting' : 'working') },
+        opts: {},
+      }),
+    ],
+  ]
+
+  test.each(WAIT_RECONNECTS)('REPRO: the wait for a working row reconnects when %s, and the keystrokes are refused (ErrSpawnNotInteractive) → dead-session, no notice', async (_label, make) => {
+    const clock = useFakeNow()
+    _setFindMissingMemoTtlMs(0) // the deadline case: its fresh sweep is the second findMissing
+    const cfg = waitConfig()
+    const { init, opts } = make(cfg)
+    const row = installWorkingRow(clock, init, { ...opts, sendKeysError: errSpawnNotInteractive('send-keys') })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', cfg)
+    })
+
+    expect(result).toBe('dead-session')
+    expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, `[slack] reconnectMcp: send-keys refused for persona=C: ${REFUSED}`)).toHaveLength(1)
+  })
+
+  test('REPRO: the ladder\'s working branch recovers the refused reconnect through resume: resumed, no [spawn-failed] entry, no notice', async () => {
+    const readLog = captureStartupErrors()
+    const clock = useFakeNow()
+    const cfg = waitConfig()
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const row = installWorkingRow(clock, { state: 'waiting', pane: IDLE_PANE, stepMs: 1_000 }, {
+      ...workingCollision(cfg),
+      sendKeysError: errSpawnNotInteractive('send-keys'),
+      resumeCalls,
+    })
+
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    expect(result).toEqual({ key: 'C', action: 'resumed' })
+    expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
+    expect(resumeCalls).toEqual([{ claude_instance_id: 'cscb_C' }])
+    expect(readLog()).toBe('')
+    expect(notices).toEqual([])
+  })
+
+  // Audit, no change: the dialog approver presses Enter through agent-director
+  // only while the row reads `pending`, and treats a failed send-keys as a
+  // no-op. When the row was ended between its status poll and its Enter, the
+  // next poll reads it `missing` and presses Enter through raw tmux instead.
+  test('the dialog approver\'s Enter refused because the row just left pending for missing: the next poll presses Enter through raw tmux; no notice, no startup error', async () => {
+    const readLog = captureStartupErrors()
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const rawEntered: string[] = []
+    _setTmuxCapturePane(async () => DEV_CHANNELS_DIALOG_PANE)
+    _setTmuxSendEnter(async (name) => { rawEntered.push(name) })
+    installStub({
+      sendKeysCalls,
+      sendKeysError: errSpawnNotInteractive('send-keys'),
+      readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
+      statusQueue: [
+        cannedOk({ state: 'pending' }),
+        cannedOk({ state: 'missing' }),
+        cannedOk({ state: 'waiting' }),
+      ],
+    })
+
+    await approvePreSessionDialogs('C', true)
+
+    expect(sendKeysCalls).toEqual([{ claude_instance_id: 'cscb_C', text: '', allow_pending: true }])
+    expect(rawEntered).toEqual(['slack_bot_C'])
+    expect(notices).toEqual([])
+    expect(readLog()).toBe('')
   })
 })
 

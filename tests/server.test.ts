@@ -23,7 +23,7 @@ import {
   setClientForTests,
   resetClientForTests,
 } from '../src/agent-director-client.ts'
-import { cannedGetResult, makeStubClient, errTmuxSendKeys, holdSpawns, type StubClient } from './test-helpers/agent-director-stub.ts'
+import { cannedGetResult, makeStubClient, errSpawnNotInteractive, errTmuxSendKeys, holdSpawns, type StubClient } from './test-helpers/agent-director-stub.ts'
 import { _buildIsSessionAliveAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
 import {
   _resetFindMissingMemo,
@@ -574,7 +574,8 @@ describe('_buildIsSessionAliveAdapter', () => {
 // status probe (nothing is typed blind); a `working` row whose tmux session
 // lives is reconnected only on the positive-idle rule (its pane's idle screen
 // and its transcript's completed turn, unchanged across attempts spanning
-// 60 s). Any other live state falls through to the reconnectMcp send-keys
+// 60 s). b.dup: nor does a `pending` row, whose session has not started.
+// Any other state falls through to the reconnectMcp send-keys
 // attempt. reconnectMcp is a direct module import,
 // but it drives its send-keys through the SAME withOutageDetection client the
 // status probe uses, so the shared stub's `sendKeysCalls` is the observable
@@ -855,6 +856,65 @@ describe('_buildReconnectSessionAdapter', () => {
     // reconcileMissingSweep → exactly ONE client.findMissing({}). No direct new
     // findMissing call site; the memoized helper is the only sweep mechanism.
     expect(findMissingCalls).toHaveLength(1)
+  })
+
+  // b.dup: agent-director refuses send-keys to an `ended` or `missing` row
+  // with ErrSpawnNotInteractive. A findMissing sweep can mark the row missing
+  // after the adapter read it (here `waiting`, or `missing` when the sweep
+  // landed between the liveness probe and the adapter's status read) and
+  // before its keystrokes land. The claude process is gone: reconnectMcp
+  // answers 'dead-session', so the adapter escalates, and the restart run's
+  // re-probe relaunches the persona (restart.test.ts, b.dup). Before the fix:
+  // 'transient' and a spawn-failure notice.
+  test.each(['waiting', 'missing'])("REPRO (b.dup): the row reads %s and the reconnect's keystrokes are refused (ErrSpawnNotInteractive) → 'escalate-dead' with one sweep and one send-keys (no tmux-server retry); no spawn-failure notice", async (state) => {
+    const raised: string[] = []
+    setSessionNotifier((key) => { raised.push(key) })
+    try {
+      const { adapter, sendKeysCalls, findMissingCalls } = makeHarness({ statusState: state, sendKeysThrows: errSpawnNotInteractive('send-keys') })
+
+      const result = await adapter('C1')
+
+      expect(result).toBe('escalate-dead')
+      expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+      expect(findMissingCalls).toHaveLength(1)
+      expect(raised).toEqual([])
+    } finally {
+      setSessionNotifier(undefined)
+    }
+  })
+
+  // b.dup: a `pending` row's session has not started (SessionStart has not
+  // fired). agent-director refuses send-keys to it, and the session connects
+  // its MCP servers once it starts, so nothing is typed: 'transient', and a
+  // later tick retries. Before the fix the adapter typed, the refusal raised
+  // a spawn-failure notice, and it answered 'transient'.
+  test("REPRO (b.dup): a pending row → 'transient' with no send-keys, pane read, tmux probe or sweep, no notice, and one line", async () => {
+    const raised: string[] = []
+    setSessionNotifier((key) => { raised.push(key) })
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    try {
+      const { adapter, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxProbes } = makeHarness({
+        statusState: 'pending',
+        sendKeysThrows: errSpawnNotInteractive('send-keys'),
+      })
+
+      const result = await adapter('C1')
+
+      expect(result).toBe('transient')
+      expect(sendKeysCalls).toEqual([])
+      expect(readPaneCalls).toEqual([])
+      expect(tmuxProbes).toEqual([])
+      expect(findMissingCalls).toHaveLength(0)
+      expect(raised).toEqual([])
+      expect(lines).toEqual([
+        '[slack] reconnectSession: persona=C1 is pending — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; not typing /mcp reconnect, deferring to a later tick (b.dup)',
+      ])
+    } finally {
+      console.error = orig
+      setSessionNotifier(undefined)
+    }
   })
 
   test('(v) the key passed selects the instance: a non-channel-form key probes and reconnects cscb_<key> (b.av2 SR-2.2)', async () => {

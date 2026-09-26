@@ -1072,6 +1072,20 @@ export function _buildKillSessionAdapter(
  * and gives no positive evidence that the row is stale (b.f2b), and is
  * reported once it has lasted `UNPROVEN_IDLE_NOTICE_AFTER_MS`.
  *
+ * b.dup — a row agent-director will not type into. agent-director refuses
+ * send-keys to a row that is not interactive (`ErrSpawnNotInteractive`):
+ *   - `pending` (its session has not started; SessionStart has not fired) →
+ *     defer ('transient'), typing nothing (`deferPendingRow`): the keystrokes
+ *     would be refused, and the session connects its MCP servers on its own
+ *     once it starts.
+ *   - `ended` or `missing` — read here, or reached between this status read
+ *     and the keystrokes (a findMissing sweep, such as the one another
+ *     persona's launch wait starts with, marked the row missing) → the
+ *     refused keystrokes make `reconnectMcp` answer 'dead-session', which
+ *     escalates below: the claude process is gone, and restart.ts's re-probe
+ *     reads the row dead and relaunches the persona in the same run (b.d61).
+ *     No spawn-failure notice is raised.
+ *
  * @param getPersona  The applied persona with a key (production:
  *   `getAppliedPersona`), for locating a `working` row's transcript under its
  *   claude_config_dir; without it only the row's persisted transcript path is
@@ -1110,6 +1124,8 @@ export function _buildReconnectSessionAdapter(
       if (verdict !== 'reconnect') return verdict
     } else if (PROMPT_ROW_STATES.has(state)) {
       return deferPromptRow(key, state)
+    } else if (state === 'pending') {
+      return deferPendingRow(key)
     } else if (state === 'waiting' && (await checkWaitingRowPane(key)) === 'defer') {
       // b.f2b: its pane shows a running turn or a prompt; logged there.
       return 'transient'
@@ -1170,6 +1186,23 @@ function deferPromptRow(key: string, state: string): 'transient' {
     `[slack] reconnectSession: persona=${key} is ${state} — its session waits on a prompt or dialog; not typing /mcp reconnect into it, deferring to a later tick (b.f2b/b.rmy)`,
   )
   notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
+  return 'transient'
+}
+
+/**
+ * b.dup: the reconnect adapter's verdict for a persona whose row reads
+ * `pending` (see `_buildReconnectSessionAdapter`): its session has not
+ * started, so agent-director would refuse the keystrokes
+ * (`ErrSpawnNotInteractive`, which `reconnectMcp` reads as a dead session),
+ * and the session connects its MCP servers on its own once it starts. Types
+ * nothing, raises no notice (a launch whose session never leaves `pending`
+ * raises its own, from its dialog approver), logs the deferral and returns
+ * 'transient'; a later tick retries.
+ */
+function deferPendingRow(key: string): 'transient' {
+  console.error(
+    `[slack] reconnectSession: persona=${key} is pending — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; not typing /mcp reconnect, deferring to a later tick (b.dup)`,
+  )
   return 'transient'
 }
 

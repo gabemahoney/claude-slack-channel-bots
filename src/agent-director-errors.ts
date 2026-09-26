@@ -17,6 +17,9 @@
  *   - ErrCwdNotADirectory       (spawn / persona working directory exists but is not a directory)
  *   - ErrInstanceIdCollision    (spawn / SR-1.4 idempotency)
  *   - ErrSpawnNotFound          (get / status / decide on missing row)
+ *   - ErrSpawnNotInteractive    (send-keys / the row is `ended` or `missing`, or
+ *                               `pending` without allow_pending: reconnectMcp's
+ *                               dead-session verdict, b.dup)
  *   - ErrNoSessionId            (resume / SR-1.3 fallthrough)
  *   - ErrJsonlMissing           (resume / SR-1.3 fallthrough)
  *   - ErrJsonlNeverWritten      (resume / AD 0.10.0 — session never wrote a transcript, so nothing can be lost)
@@ -77,6 +80,7 @@ export {
   ErrCallTimeout,
   ErrInstanceIdCollision,
   ErrSpawnNotFound,
+  ErrSpawnNotInteractive,
   ErrNoSessionId,
   ErrJsonlMissing,
   ErrJsonlNeverWritten,
