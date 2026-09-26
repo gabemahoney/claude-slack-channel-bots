@@ -38,7 +38,7 @@ When reviewing tests, check for:
 - [ ] A postinstall test calls `runPostinstall` only through the `postinstall()` wrapper in `tests/postinstall.test.ts` with a temp `homeDir` (for example from `makeSandbox()`); a call with no `homeDir` links skills into the real `~/.claude/skills` and is a defect
 - [ ] A test that spawns the CLI runs it through `runCli` in `tests/cli.test.ts` (or the same built env: `PATH`, a `mkdtempSync` HOME and `SLACK_STATE_DIR`, and the fixed `BUN_RUNTIME_TRANSPILER_CACHE_PATH=0` so Bun writes no cache under the temp HOME; nothing else from `process.env`) with a time limit, and never reaches a subcommand that acts; a CLI child with the real HOME, the inherited environment or no time limit is a defect
 - [ ] No test sets or relies on a real Slack token: any `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` a suite sets is a fake, restored afterwards, and every token follows the fakes-only rule under Credentials and Leak Checks
-- [ ] Integration scripts and their driver (`tests/integration/*.sh`, `tests/integration/fixtures/driver.ts`) are run only through the `ci` skill in the `cscb-ci` container; a change or instruction that runs them on a host is a defect
+- [ ] Integration scripts and their drivers (`tests/integration/*.sh`, `tests/integration/fixtures/driver.ts`, `tests/integration/fixtures/exact-tmux-driver.ts`) are run only through the `ci` skill in the `cscb-ci` container; a change or instruction that runs them on a host is a defect
 
 ### Patterns
 - [ ] Factory functions used for fixtures (not inline object literals)

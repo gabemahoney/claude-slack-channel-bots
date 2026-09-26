@@ -31,9 +31,10 @@ directory lands in `$S` and never in the real `~/.claude/channels/slack/`.
 ## Docker integration suite
 
 Bash scripts that install the packed package, write a persona config and
-start the server in dry run. Two scripts leave dry run: Test 4 runs its
-driver, which spawns under a stub `claude` and starts no server, and Test 10
-is the one script that starts a live server, against the loopback Slack stub.
+start the server in dry run. Three scripts leave dry run: Test 4 runs its
+driver, which spawns under a stub `claude` and starts no server, Test 10
+is the one script that starts a live server, against the loopback Slack stub,
+and Test 11 runs its driver against real tmux, starting no server.
 `/ci` packs
 the package, builds the image from `docker/Dockerfile.test` (on the base in
 `docker/Dockerfile.test.base`, see `docker/README.md`) and runs `tests/runner.sh` inside it. The verdict is
@@ -60,10 +61,12 @@ tests/
     test-9-reload-destructive-and-server-wide.sh
                                    # E13 dry-run leg (SR-8.6): a working_directory change gives one DESTRUCTIVE: line and touches one persona; a port change waits for the restart
     test-10-credentials-change.sh  # E13 (SR-8.3, SR-8.6), live against the Slack stub: a credentials change reconnects one persona on confirmation; handshake failure and refused change; leak counts
+    test-11-exact-tmux-targets.sh  # b.1ix: persona dev's raw tmux calls (probe, dialog approver, b.vub kill) touch slack_bot_dev only, never its prefix neighbour slack_bot_dev_2
     lib/
       scenario.sh                  # shared helper sourced by Tests 5 onwards (see Scenario helper below)
     fixtures/
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly
+      exact-tmux-driver.ts         # Test 11 driver: runs one raw-tmux persona path against real tmux, with a stand-in agent-director
       stub-claude.sh               # fake `claude` (Tests 4 and 10): prints the dev-channels dialog, fires SessionStart
       slack-stub-server.ts         # Test 10 loopback Slack stub: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
     .shellcheckrc                  # lets shellcheck follow `source lib/scenario.sh` without -x
@@ -91,7 +94,8 @@ you change the script, update the testplan. Today that is Tests 1 to 3
 (`testplans/b.j9i`, `b.3hy`, `b.set`).
 
 A script with no ticket is specified by its header comment, and by its
-driver's where it has one (Test 4 and `fixtures/driver.ts`). Tests 5 to 10
+driver's where it has one (Test 4 and `fixtures/driver.ts`, Test 11 and
+`fixtures/exact-tmux-driver.ts`). Tests 5 to 11
 have no testplan ticket: each header comment lists what it checks, and the
 log fragments it expects are taken from `src/` (the function that writes
 each is named in the header or in a constants block near the top), so the
@@ -145,10 +149,15 @@ unique per script.
 Test 10's live start runs the server's start sweep (`reconcileOrphans`,
 `src/session-manager.ts`), which kills and deletes every `service=cscb`
 agent-director row whose persona is not in Test 10's own config (and any row
-with no persona label, a foreign instance ID or another working directory).
-Every row an earlier script left behind is gone after Test 10's start; that is
-acceptable only because the container is ephemeral and the scripts run one at
-a time.
+with a foreign instance ID or another working directory; a row with no
+persona label is killed when live and kept). Every persona row an earlier
+script left behind is gone after Test 10's start; that is acceptable only
+because the container is ephemeral and the scripts run one at a time.
+
+Test 11 starts no server and makes no agent-director row: its driver's
+agent-director is a stand-in, and each case runs its own tmux server (its own
+`TMUX_TMPDIR` under the scenario's scratch root), so no other script's
+sessions are in its reach.
 
 ### Scenario helper
 

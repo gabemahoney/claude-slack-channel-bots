@@ -20,7 +20,13 @@
  *     `config_dir` label means a fresh spawn instead of a resume (AC 48).
  *   - b.av2 SR-6.3: the fixed instance ID, one launch in flight per persona,
  *     and the start sweep (`reconcileOrphans`) keyed by the `persona` label
- *     (AC 4).
+ *     (AC 4). b.1ix: a pre-persona row (no `persona` label) is kept, never
+ *     deleted, and killed once only when live.
+ *   - b.1ix raw tmux: through the tmux runner seam (`_setTmuxCommandRunner`,
+ *     a failing stand-in by default, so no test reaches a real tmux server),
+ *     the b.vub kill, the approver's raw pane read and Enter and the liveness
+ *     probe target the persona's own session exactly, never a prefix
+ *     neighbour (`slack_bot_dev` / `slack_bot_dev_2`).
  *   - b.av2 SR-6.1 start: `startupSessionManager` with `bringUp` (a persona
  *     not brought up is counted apart; every Slack bring-up runs at once and
  *     only the launches share the pool, in readiness order; a launch that
@@ -93,7 +99,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, existsSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, existsSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import {
@@ -126,6 +132,10 @@ import {
   _setTmuxCapturePane,
   _setTmuxSendEnter,
   _resetTmuxDialogHelpers,
+  _setTmuxCommandRunner,
+  _resetTmuxCommandRunner,
+  hasPersonaTmuxSession,
+  type TmuxCommandRunner,
   _setDialogDeadGracePolls,
   _resetDialogDeadGracePolls,
   _setSpawnHomeDir,
@@ -176,6 +186,7 @@ import {
 } from '../src/session-manager.ts'
 import type { TranscriptReading, TranscriptSnapshot } from '../src/session-transcript.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { stripComments } from './test-helpers/source-audit.ts'
 import {
   _resetLaunchedWithDirs,
   getLaunchedWithDir,
@@ -429,6 +440,10 @@ beforeEach(() => {
   // shell out to real tmux and the timeout verdict stays 'ok' unless a test
   // explicitly drives the dead-session path.
   _setTmuxSessionProber(async () => true)
+  // Every raw tmux call goes through one runner (b.1ix): a failing stand-in,
+  // so a default seam a test reaches (the b.vub kill) never touches a real
+  // tmux server.
+  _setTmuxCommandRunner(async () => ({ code: 1, stdout: '' }))
 })
 
 afterEach(() => {
@@ -441,6 +456,7 @@ afterEach(() => {
   _resetTmuxServerEnsurer()
   _resetTmuxSessionProber()
   _resetTmuxDialogHelpers()
+  _resetTmuxCommandRunner()
   _resetDialogDeadGracePolls()
   _resetOutageState()
   _resetSpawnHomeDir()
@@ -2873,7 +2889,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     return { cfg, home, betaReal }
   }
 
-  test('kills and deletes exactly the rows with no persona label, an absent persona, a wrong instance ID or a wrong cwd; keeps correct rows', async () => {
+  test('kills and deletes exactly the rows with an absent persona, a wrong instance ID or a wrong cwd; kills a live pre-persona row but keeps it; keeps correct rows', async () => {
     const { cfg, home, betaReal } = sweepConfig()
     const alpha = personaOf(cfg, 'alpha')
     const beta = personaOf(cfg, 'beta')
@@ -2892,7 +2908,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
           cannedListRow({}, alpha, home),
           // Kept: the persona's working_directory is a symlink; the row's cwd is its real directory.
           cannedListRow({ cwd: betaReal }, beta, home),
-          // Swept: only the interim `channel` label, no `persona` label.
+          // Pre-persona (only the interim `channel` label, no `persona` label), live: killed, kept.
           cannedListRow({ claude_instance_id: 'cscb_legacy', labels: { service: 'cscb', channel: 'alpha' } }, alpha, home),
           // Swept: names a persona absent from the applied configuration.
           cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed', channel: 'departed' } }, alpha, home),
@@ -2910,12 +2926,13 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     })
 
     expect(listCalls).toEqual([{ label: ['service=cscb'] }])
-    expect(result).toEqual({ found: 4, killed: 4, failed: 0 })
-    const swept = ['cscb_alpha_old', 'cscb_departed', 'cscb_gamma', 'cscb_legacy']
-    expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual(swept)
+    expect(result).toEqual({ found: 3, killed: 3, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 } })
+    const swept = ['cscb_alpha_old', 'cscb_departed', 'cscb_gamma']
+    expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual([...swept, 'cscb_legacy'])
     expect(deleteCalls.map((d) => d.claude_instance_id).sort()).toEqual(swept.map((id) => [id]))
-    // Each row is swept for its own reason, named in the log.
-    expect(errLog).toContain('reconcileOrphans: sweeping row (no persona label) persona=<no persona label> instanceId=cscb_legacy state=waiting — killing and deleting')
+    // Each row is swept for its own reason, named in the log; the pre-persona row is not swept.
+    expect(errLog).toContain('reconcileOrphans: pre-persona row (no persona label) instanceId=cscb_legacy state=waiting')
+    expect(errLog).not.toContain('sweeping row (no persona label)')
     expect(errLog).toContain('reconcileOrphans: sweeping row (absent persona) persona=departed instanceId=cscb_departed state=waiting — killing and deleting')
     expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong instance ID) persona=${renderPersonaRef('alpha', 'alpha')} instanceId=cscb_alpha_old state=waiting — killing and deleting`)
     expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('gamma', 'gamma')} instanceId=cscb_gamma state=waiting cwd=${elsewhere} — killing and deleting`)
@@ -2930,7 +2947,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
   // cwd check to the launch; the other three conditions still apply, to that
   // persona and to every other row in the same sweep.
   test.each([...UNRESOLVABLE_WORKDIRS])(
-    'working directory %s: its row is kept (neither found nor failed) with one deferred-check line; the other conditions still kill and delete',
+    'working directory %s: its row is kept (neither found nor failed) with one deferred-check line; the other conditions still kill and delete, and a pre-persona row is killed but kept',
     async (variant) => {
       const home = useSpawnHome()
       const broken = brokenWorkdir(variant)
@@ -2959,7 +2976,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
             cannedListRow({ claude_instance_id: 'cscb_delta_old', cwd: broken.rowCwd }, delta, home),
             // Swept: an absent persona.
             cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }, alpha, home),
-            // Swept: no persona label.
+            // Pre-persona (no persona label), live: killed, kept.
             cannedListRow({ claude_instance_id: 'cscb_legacy', labels: { service: 'cscb' } }, alpha, home),
             // Kept: a correct row for a resolvable persona.
             cannedListRow({}, alpha, home),
@@ -2974,9 +2991,9 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         result = await reconcileOrphans(cfg)
       })
 
-      expect(result).toEqual({ found: 4, killed: 4, failed: 0 })
-      const swept = ['cscb_delta_old', 'cscb_departed', 'cscb_gamma', 'cscb_legacy']
-      expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual(swept)
+      expect(result).toEqual({ found: 3, killed: 3, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 } })
+      const swept = ['cscb_delta_old', 'cscb_departed', 'cscb_gamma']
+      expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual([...swept, 'cscb_legacy'])
       expect(deleteCalls.map((d) => d.claude_instance_id).sort()).toEqual(swept.map((id) => [id]))
       expect(errLog).toContain(deferredSweepLine('delta', 'delta', broken.workingDirectory))
       expect(countDeferredLines(errLog)).toBe(1)
@@ -2984,7 +3001,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         `reconcileOrphans: sweeping row (wrong instance ID) persona=${renderPersonaRef('delta', 'delta')} instanceId=cscb_delta_old state=waiting — killing and deleting`,
       )
       expect(errLog).toContain('reconcileOrphans: sweeping row (absent persona) persona=departed instanceId=cscb_departed')
-      expect(errLog).toContain('reconcileOrphans: sweeping row (no persona label) persona=<no persona label> instanceId=cscb_legacy')
+      expect(errLog).toContain('reconcileOrphans: pre-persona row (no persona label) instanceId=cscb_legacy')
       expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('gamma', 'gamma')} instanceId=cscb_gamma state=waiting cwd=${elsewhere}`)
       expect(errLog).not.toContain('instanceId=cscb_delta state=')
     },
@@ -3019,7 +3036,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       result = await reconcileOrphans(cfg)
     })
 
-    expect(result).toEqual({ found: 0, killed: 0, failed: 0 })
+    expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
     expect(killCalls).toHaveLength(0)
     expect(deleteCalls).toHaveLength(0)
     expect(errLog).toContain(deferredSweepLine('delta', 'delta', first.workingDirectory))
@@ -3065,7 +3082,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       result = await reconcileOrphans(cfg)
     })
 
-    expect(result).toEqual({ found: 1, killed: 1, failed: 0 })
+    expect(result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
     expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_delta'])
     expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_delta']])
     expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('delta', 'delta')} instanceId=cscb_delta state=waiting cwd=${alphaWork}`)
@@ -3074,8 +3091,8 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
   })
 
   test.each([
-    ['kill', 'killed 1, failed 0', { found: 1, killed: 1, failed: 0 }],
-    ['delete', 'killed 0, failed 1', { found: 1, killed: 0, failed: 1 }],
+    ['kill', 'killed 1, failed 0', { found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } }],
+    ['delete', 'killed 0, failed 1', { found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } }],
   ] as const)('a %s failure records orphan-cleanup; the delete is still attempted (%s)', async (verb, _label, expected) => {
     const readLog = captureStartupErrors()
     const { cfg, home } = sweepConfig()
@@ -3099,6 +3116,83 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     expect(log).toContain(
       `${verb} failed for orphan instanceId=cscb_alpha_old persona=${renderPersonaRef('alpha', 'alpha')}: Err${verb === 'kill' ? 'Kill' : 'Delete'}Broken`,
     )
+  })
+
+  // b.1ix: a pre-persona row (no persona label; a build before personas made
+  // it, with a `cscb_<name>_<channel>` ID) is never deleted, since no launch
+  // reuses its ID. A live one is killed once and kept whether its kill reports
+  // success or fails; an ended or missing one gets no call. A row naming an
+  // absent persona is still killed and deleted, even after a failed kill.
+  describe('pre-persona rows are kept, never deleted (b.1ix)', () => {
+    /** A pre-persona row in `state`: only the `service` and `channel` labels. */
+    const prePersonaRow = (state: string): import('agent-director').ListRow =>
+      cannedListRow({
+        claude_instance_id: `cscb_old_${state}_C0OLD`,
+        state,
+        labels: { service: 'cscb', channel: 'C0OLD' },
+        tmux_session_name: `slack_bot_old_${state}_C0OLD`,
+      })
+
+    test.each([
+      ['reports success', undefined],
+      ['fails', errGeneric('kill', 'ErrKillBroken')],
+    ] as const)('a live pre-persona row whose kill %s: killed once and kept (no delete), the result logged; an absent persona’s row is still killed and deleted', async (_label, killError) => {
+      const readLog = captureStartupErrors()
+      const { cfg } = sweepConfig()
+      const killCalls: import('agent-director').KillParams[] = []
+      const deleteCalls: import('agent-director').DeleteParams[] = []
+      installStub({
+        killCalls,
+        deleteCalls,
+        killError,
+        listResult: {
+          spawns: [
+            prePersonaRow('waiting'),
+            cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }),
+          ],
+        },
+      })
+
+      let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+      const errLog = await withCapturedErr(async () => {
+        result = await reconcileOrphans(cfg)
+      })
+
+      const failed = killError ? 1 : 0
+      expect(result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 1, live: 1, killFailed: failed } })
+      expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_old_waiting_C0OLD', 'cscb_departed'])
+      expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_departed']])
+      expect(errLog).toContain('reconcileOrphans: pre-persona row (no persona label) instanceId=cscb_old_waiting_C0OLD state=waiting tmux_session=slack_bot_old_waiting_C0OLD is live')
+      expect(errLog).toContain(`pre-persona rows kept=1 live=1 kill-failed=${failed}`)
+      const entries = readLog()
+      if (killError) {
+        expect(entries).toContain('kill failed for pre-persona row instanceId=cscb_old_waiting_C0OLD: ErrKillBroken')
+        expect(entries).toContain('row kept, its session may still be running')
+        expect(errLog).not.toContain('kill reported success')
+      } else {
+        expect(errLog).toContain('kill reported success for pre-persona row instanceId=cscb_old_waiting_C0OLD — row kept')
+        expect(entries).not.toContain('pre-persona')
+      }
+    })
+
+    test('every live state is killed once; ended and missing pre-persona rows get no kill, no delete and no line', async () => {
+      const { cfg } = sweepConfig()
+      const killCalls: import('agent-director').KillParams[] = []
+      const deleteCalls: import('agent-director').DeleteParams[] = []
+      const states = [...AGENT_DIRECTOR_LIVE_STATES, 'ended', 'missing']
+      installStub({ killCalls, deleteCalls, listResult: { spawns: states.map(prePersonaRow) } })
+
+      let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+      const errLog = await withCapturedErr(async () => {
+        result = await reconcileOrphans(cfg)
+      })
+
+      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 7, live: 5, killFailed: 0 } })
+      expect(killCalls.map((k) => k.claude_instance_id)).toEqual([...AGENT_DIRECTOR_LIVE_STATES].map((s) => `cscb_old_${s}_C0OLD`))
+      expect(deleteCalls).toHaveLength(0)
+      expect(errLog).not.toContain('cscb_old_ended_C0OLD')
+      expect(errLog).not.toContain('cscb_old_missing_C0OLD')
+    })
   })
 
   test('list failure → recorded + zero counts (no crash)', async () => {
@@ -3266,7 +3360,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
       const sweepLog = await withCapturedErr(async () => {
         sweep = await reconcileOrphans(cfg)
       })
-      expect(sweep).toEqual({ found: 0, killed: 0, failed: 0 })
+      expect(sweep).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
       expect(sweepLog).toContain(deferredSweepLine('C', 'C', broken.workingDirectory))
 
       broken.recreate()
@@ -7222,6 +7316,111 @@ const CWD = '/test/cwd'
 // no spawn-failure notice is raised.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// b.1ix — raw tmux calls address the persona's own session exactly
+// ---------------------------------------------------------------------------
+
+describe('b.1ix: raw tmux calls target the persona’s own session exactly, never a prefix neighbour', () => {
+  /**
+   * A tmux server behind the runner seam: live sessions by name, each pane
+   * showing `pane`. It resolves a target as tmux 3.2a does (checked in the
+   * `/ci` image): `=<name>` is only that exact session and `=<name>:` its
+   * pane, while `=<name>` is no pane target at all; a bare name is the exact
+   * session, else the one session it prefixes (the hazard).
+   */
+  function fakeTmuxServer(sessions: string[], pane: string) {
+    const alive = new Set(sessions)
+    const argvs: string[][] = []
+    const entered: string[] = []
+    const resolve = (target: string, paneTarget: boolean): string | undefined => {
+      if (target.startsWith('=')) {
+        const name = paneTarget ? target.slice(1).replace(/:$/, '') : target.slice(1)
+        if (paneTarget && !target.endsWith(':')) return undefined
+        return alive.has(name) ? name : undefined
+      }
+      const name = target.replace(/:$/, '')
+      if (alive.has(name)) return name
+      const prefixed = [...alive].filter((s) => s.startsWith(name))
+      return prefixed.length === 1 ? prefixed[0] : undefined
+    }
+    const runner: TmuxCommandRunner = async (args) => {
+      argvs.push([...args])
+      const command = args[0]
+      const session = resolve(args[args.indexOf('-t') + 1]!, command === 'capture-pane' || command === 'send-keys')
+      if (session === undefined) return { code: 1, stdout: '' }
+      if (command === 'kill-session') alive.delete(session)
+      if (command === 'send-keys') entered.push(session)
+      return { code: 0, stdout: command === 'capture-pane' ? pane : '' }
+    }
+    return { runner, alive, argvs, entered }
+  }
+
+  const NEIGHBOUR_ONLY = ['slack_bot_dev_2']
+  const BOTH = ['slack_bot_dev', 'slack_bot_dev_2']
+
+  test.each([
+    ['only its prefix neighbour slack_bot_dev_2 exists', NEIGHBOUR_ONLY],
+    ['it and slack_bot_dev_2 both exist', BOTH],
+  ])('the b.vub self-heal kill for persona dev, when %s: kill-session -t =slack_bot_dev, and slack_bot_dev_2 survives', async (_label, sessions) => {
+    const tmux = fakeTmuxServer(sessions, '')
+    _setTmuxCommandRunner(tmux.runner)
+    _resetTmuxSessionKiller()
+    installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_dev' }),
+      ],
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeMultiPersonaConfig([{ name: 'dev', working_directory: '/x' }], fixtureDir)
+
+    expect((await spawnForPersona(personaOf(cfg, 'dev'), cfg)).action).toBe('spawned')
+
+    expect(tmux.argvs).toEqual([['kill-session', '-t', '=slack_bot_dev']])
+    expect([...tmux.alive]).toEqual(['slack_bot_dev_2'])
+  })
+
+  test.each([
+    ['only its prefix neighbour slack_bot_dev_2 exists', NEIGHBOUR_ONLY, [] as string[]],
+    ['it and slack_bot_dev_2 both exist', BOTH, ['slack_bot_dev']],
+  ])('the approver’s raw pane read and Enter for persona dev’s ended row, when %s and every pane shows the dialog: both target =slack_bot_dev:, so slack_bot_dev_2 gets no Enter', async (_label, sessions, entered) => {
+    const tmux = fakeTmuxServer(sessions, DEV_CHANNELS_DIALOG_PANE)
+    _setTmuxCommandRunner(tmux.runner)
+    _resetTmuxDialogHelpers()
+    _setDialogDeadGracePolls(1)
+    installStub({ statusQueue: [cannedOk({ state: 'ended' }), cannedOk({ state: 'waiting' })] })
+
+    await approvePreSessionDialogs('dev', false)
+
+    expect(tmux.argvs).toEqual([
+      ['capture-pane', '-p', '-t', '=slack_bot_dev:'],
+      ...entered.map(() => ['send-keys', '-t', '=slack_bot_dev:', 'Enter']),
+    ])
+    expect(tmux.entered).toEqual(entered)
+  })
+
+  test.each([
+    ['only its prefix neighbour slack_bot_dev_2 exists', false, NEIGHBOUR_ONLY],
+    ['it and slack_bot_dev_2 both exist', true, BOTH],
+  ])('the liveness probe for persona dev, when %s: has-session -t =slack_bot_dev reads alive=%p', async (_label, alive, sessions) => {
+    const tmux = fakeTmuxServer(sessions, '')
+    _setTmuxCommandRunner(tmux.runner)
+    _resetTmuxSessionProber()
+
+    expect(await hasPersonaTmuxSession('dev')).toBe(alive)
+    expect(tmux.argvs).toEqual([['has-session', '-t', '=slack_bot_dev']])
+  })
+
+  test('src/ starts tmux in one place only, the runner, so no raw call can skip its exact targets', () => {
+    const srcDir = join(import.meta.dir, '..', 'src')
+    const tmuxLaunch = /\b(?:spawn|spawnSync|exec|execSync|execFile|execFileSync)\(\s*['"`]tmux['"`]|\bBun\.spawn(?:Sync)?\(\s*\[\s*['"`]tmux['"`]|\$`tmux\b/g
+    const sites = readdirSync(srcDir)
+      .filter((f) => f.endsWith('.ts'))
+      .flatMap((f) => [...stripComments(readFileSync(join(srcDir, f), 'utf-8')).matchAll(tmuxLaunch)].map(() => f))
+    expect(sites).toEqual(['session-manager.ts'])
+  })
+})
+
 describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   // -------------------------------------------------------------------------
   // Site #1 — reconnectMcp → sendKeys
@@ -9434,14 +9633,14 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
       expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'failed' })
     }],
     ['a failed orphan kill', 'orphan-cleanup', 'kill', async (err) => {
-      expect(await reconcileOrphans(installOrphan('killError', err))).toEqual({ found: 1, killed: 1, failed: 0 })
+      expect(await reconcileOrphans(installOrphan('killError', err))).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
     }],
     ['a failed orphan delete', 'orphan-cleanup', 'delete', async (err) => {
-      expect(await reconcileOrphans(installOrphan('deleteError', err))).toEqual({ found: 1, killed: 0, failed: 1 })
+      expect(await reconcileOrphans(installOrphan('deleteError', err))).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
     }],
     ['a failed orphan list', 'orphan-cleanup-list-failed', 'list', async (err) => {
       installStub({ listError: err })
-      expect(await reconcileOrphans(orphanConfig().cfg)).toEqual({ found: 0, killed: 0, failed: 0 })
+      expect(await reconcileOrphans(orphanConfig().cfg)).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
     }],
   ])('%s with a base AgentDirectorError whose errName is token-shaped and whose description holds a URL and a fake token → the %s record names its type and the redacted description once; nothing leaks', async (_label, classLabel, verb, run) => {
     const readLog = captureStartupErrors()

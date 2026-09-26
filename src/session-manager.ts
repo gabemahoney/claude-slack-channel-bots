@@ -43,9 +43,10 @@
  * reply-guard step (the optimistic spawn's steps are undone on a collision).
  *
  * The start sweep (`reconcileOrphans`, b.av2 SR-6.3) lists every
- * `service=cscb` spawn and kills+deletes any with no `persona` label, a
- * persona absent from the applied configuration, an instance ID other than
- * `cscb_<key>`, or a `cwd` other than its persona's working directory. While a
+ * `service=cscb` spawn and kills+deletes any with a persona absent from the
+ * applied configuration, an instance ID other than `cscb_<key>`, or a `cwd`
+ * other than its persona's working directory. A pre-persona row (no `persona`
+ * label) is never deleted: it is kept, and killed only when live (b.1ix). While a
  * persona's working directory cannot be resolved to a real path, neither the
  * sweep nor the collision ladder kills or deletes on `cwd` grounds a row
  * whose `cwd` has no real path either (b.av2 SR-6.4): the sweep defers the
@@ -577,6 +578,75 @@ function remediationHint(error: AgentDirectorError): string {
 }
 
 // ---------------------------------------------------------------------------
+// Raw tmux calls — one runner, exact targets only (b.1ix)
+// ---------------------------------------------------------------------------
+
+/** One `tmux` run: its exit code (`null` when it could not run) and its stdout. */
+export interface TmuxRunResult {
+  code: number | null
+  stdout: string
+}
+
+/**
+ * Runs `tmux <args>` and never rejects. Every raw tmux call in the server goes
+ * through this one runner (the server start, the liveness probe, the dialog
+ * approver's pane read and Enter, and the b.vub orphan kill), so a unit test
+ * can see each argv and no test reaches a real tmux server.
+ */
+export type TmuxCommandRunner = (args: readonly string[]) => Promise<TmuxRunResult>
+
+const defaultRunTmux: TmuxCommandRunner = async (args) => {
+  const { spawn } = await import('child_process')
+  return new Promise<TmuxRunResult>((resolve) => {
+    try {
+      const child = spawn('tmux', [...args], { stdio: ['ignore', 'pipe', 'ignore'] })
+      let stdout = ''
+      child.stdout?.on('data', (d: Buffer) => { stdout += d.toString('utf8') })
+      child.on('error', () => resolve({ code: null, stdout: '' })) // tmux missing
+      child.on('close', (code) => resolve({ code, stdout }))
+    } catch {
+      resolve({ code: null, stdout: '' })
+    }
+  })
+}
+
+let _runTmux: TmuxCommandRunner = defaultRunTmux
+
+/** Test-only seam: override the tmux command runner. */
+export function _setTmuxCommandRunner(fn: TmuxCommandRunner): void {
+  _runTmux = fn
+}
+
+/** Test-only seam: restore the default tmux command runner. */
+export function _resetTmuxCommandRunner(): void {
+  _runTmux = defaultRunTmux
+}
+
+/**
+ * tmux resolves a bare `-t <name>` to the session with that exact name when
+ * there is one, and otherwise to the one session whose name starts with it.
+ * Persona keys can prefix one another (`dev`, `dev_2`), so a bare
+ * `slack_bot_dev` reaches `slack_bot_dev_2` whenever `slack_bot_dev` is gone:
+ * a kill or an Enter would hit the neighbour's bot. A `=` prefix accepts only
+ * the exact name (b.1ix). Verified against tmux 3.2a, the version in the
+ * `/ci` image.
+ *
+ * A session target (`has-session`, `kill-session`) is `=<name>`.
+ */
+function tmuxExactSessionTarget(sessionName: string): string {
+  return `=${sessionName}`
+}
+
+/**
+ * A pane target (`capture-pane`, `send-keys`) is `=<name>:`, the exact
+ * session's active pane: tmux 3.2a refuses `=<name>` as a pane target
+ * ("can't find pane"), even when the session exists.
+ */
+function tmuxExactPaneTarget(sessionName: string): string {
+  return `=${sessionName}:`
+}
+
+// ---------------------------------------------------------------------------
 // reconnectMcp — send `/mcp reconnect <server-name>` via library sendKeys
 // ---------------------------------------------------------------------------
 
@@ -593,16 +663,7 @@ function remediationHint(error: AgentDirectorError): string {
 export type TmuxServerEnsurer = () => Promise<void>
 
 const defaultEnsureTmuxServer: TmuxServerEnsurer = async (): Promise<void> => {
-  const { spawn } = await import('child_process')
-  await new Promise<void>((resolve) => {
-    try {
-      const child = spawn('tmux', ['start-server'], { stdio: 'ignore' })
-      child.on('error', () => resolve()) // tmux missing — best-effort
-      child.on('close', () => resolve())
-    } catch {
-      resolve()
-    }
-  })
+  await _runTmux(['start-server']) // best-effort
 }
 
 let _ensureTmuxServer: TmuxServerEnsurer = defaultEnsureTmuxServer
@@ -621,21 +682,14 @@ export function _resetTmuxServerEnsurer(): void {
  * Probe whether a tmux session with this exact name is alive. Injectable seam
  * so unit tests can drive the b.3ce timeout-liveness verdict without real
  * tmux. Default impl runs `tmux has-session -t =<name>` (the `=` prefix
- * forces exact-name match, not prefix match) and reports exit code 0.
+ * forces exact-name match, not prefix match) and reports exit code 0; tmux
+ * missing reads as dead.
  */
 export type TmuxSessionProber = (sessionName: string) => Promise<boolean>
 
 const defaultHasTmuxSession: TmuxSessionProber = async (sessionName: string): Promise<boolean> => {
-  const { spawn } = await import('child_process')
-  return new Promise<boolean>((resolve) => {
-    try {
-      const child = spawn('tmux', ['has-session', '-t', `=${sessionName}`], { stdio: 'ignore' })
-      child.on('error', () => resolve(false)) // tmux missing — treat as dead
-      child.on('close', (code) => resolve(code === 0))
-    } catch {
-      resolve(false)
-    }
-  })
+  const { code } = await _runTmux(['has-session', '-t', tmuxExactSessionTarget(sessionName)])
+  return code === 0
 }
 
 let _hasTmuxSession: TmuxSessionProber = defaultHasTmuxSession
@@ -843,41 +897,21 @@ export function _resetDialogReadyTimeoutMs(): void {
  * after which AD flips to `waiting`.
  *
  * These two seams shell out to tmux directly, keyed on the deterministic
- * per-persona session name. Injectable so unit tests stay hermetic.
+ * per-persona session name and addressing that session's pane exactly
+ * (`=<name>:`, b.1ix), so a persona whose key prefixes another's never reads
+ * or presses Enter in its neighbour's pane. A session that isn't there reads
+ * as an empty pane. Injectable so unit tests stay hermetic.
  */
 export type TmuxPaneReader = (sessionName: string) => Promise<string>
 export type TmuxEnterSender = (sessionName: string) => Promise<void>
 
-function defaultTmuxCapturePane(sessionName: string): Promise<string> {
-  return (async () => {
-    const { spawn } = await import('child_process')
-    return await new Promise<string>((resolve) => {
-      try {
-        const child = spawn('tmux', ['capture-pane', '-p', '-t', sessionName])
-        let out = ''
-        child.stdout?.on('data', (d: Buffer) => { out += d.toString('utf8') })
-        child.on('error', () => resolve(''))
-        child.on('close', () => resolve(out))
-      } catch {
-        resolve('')
-      }
-    })
-  })()
+async function defaultTmuxCapturePane(sessionName: string): Promise<string> {
+  const { stdout } = await _runTmux(['capture-pane', '-p', '-t', tmuxExactPaneTarget(sessionName)])
+  return stdout
 }
 
-function defaultTmuxSendEnter(sessionName: string): Promise<void> {
-  return (async () => {
-    const { spawn } = await import('child_process')
-    await new Promise<void>((resolve) => {
-      try {
-        const child = spawn('tmux', ['send-keys', '-t', sessionName, 'Enter'], { stdio: 'ignore' })
-        child.on('error', () => resolve())
-        child.on('close', () => resolve())
-      } catch {
-        resolve()
-      }
-    })
-  })()
+async function defaultTmuxSendEnter(sessionName: string): Promise<void> {
+  await _runTmux(['send-keys', '-t', tmuxExactPaneTarget(sessionName), 'Enter'])
 }
 
 let _tmuxCapturePane: TmuxPaneReader = defaultTmuxCapturePane
@@ -999,9 +1033,10 @@ export async function approvePreSessionDialogs(
     //   - Resumed row (state=missing/ended): AD won't touch the pane, but the
     //     dialog IS on screen and blocking SessionStart. Fall back to RAW tmux
     //     (capture-pane + send-keys Enter) keyed on the deterministic session
-    //     name — exactly the `tmux send-keys -t <session> Enter` the operator
-    //     ran by hand in the ticket. Once Enter lands, SessionStart fires and
-    //     AD flips to a live state on the next poll.
+    //     name, addressed exactly (`=<session>:`, b.1ix) — the
+    //     `tmux send-keys -t <session> Enter` the operator ran by hand in the
+    //     ticket. Once Enter lands, SessionStart fires and AD flips to a live
+    //     state on the next poll.
     let needleVisible = false
     if (DIALOG_DEAD_STATES.has(state)) {
       // Raw-tmux fallback (agent-director cannot interact with a dead row).
@@ -2573,28 +2608,28 @@ async function tryKill(key: string): Promise<void> {
 /**
  * Kill a tmux session by its exact name. Injectable seam so unit tests can
  * assert the self-heal path without spawning real processes. Default impl
- * runs `tmux kill-session -t <name>` best-effort.
+ * runs `tmux kill-session -t =<name>` best-effort (tmux missing or the session
+ * absent is ignored).
  *
  * b.vub: the field failure is an orphan tmux session that survives the AD row
  * going `missing` — the AD `client.kill` verb does NOT reap it (observed across
  * dozens of restart cycles). Killing the session directly by its deterministic,
- * per-persona name (`personaTmuxSessionName`) is the only reliable reap, and the
- * name can only ever belong to this persona's spawn, so it is safe.
+ * per-persona name (`personaTmuxSessionName`) is the only reliable reap.
+ *
+ * b.1ix: the target is exact (`=<name>`). A bare name is resolved by prefix
+ * when no session has that exact name, so `slack_bot_dev` would kill persona
+ * `dev_2`'s `slack_bot_dev_2`. The kill is still not ownership-checked: a
+ * session someone made by hand with this exact name is killed too. The b.fmk
+ * CSCB version removes this kill (agent-director's classified spawn and
+ * resume replace it).
  */
 export type TmuxSessionKiller = (sessionName: string) => Promise<void>
 
-let _killTmuxSession: TmuxSessionKiller = async (sessionName: string): Promise<void> => {
-  const { spawn } = await import('child_process')
-  await new Promise<void>((resolve) => {
-    try {
-      const child = spawn('tmux', ['kill-session', '-t', sessionName], { stdio: 'ignore' })
-      child.on('error', () => resolve()) // tmux missing / session absent — best-effort
-      child.on('close', () => resolve())
-    } catch {
-      resolve()
-    }
-  })
+const defaultKillTmuxSession: TmuxSessionKiller = async (sessionName: string): Promise<void> => {
+  await _runTmux(['kill-session', '-t', tmuxExactSessionTarget(sessionName)])
 }
+
+let _killTmuxSession: TmuxSessionKiller = defaultKillTmuxSession
 
 /** Test-only seam: override the tmux-session killer. */
 export function _setTmuxSessionKiller(fn: TmuxSessionKiller): void {
@@ -2603,18 +2638,7 @@ export function _setTmuxSessionKiller(fn: TmuxSessionKiller): void {
 
 /** Test-only seam: restore the default tmux-session killer. */
 export function _resetTmuxSessionKiller(): void {
-  _killTmuxSession = async (sessionName: string): Promise<void> => {
-    const { spawn } = await import('child_process')
-    await new Promise<void>((resolve) => {
-      try {
-        const child = spawn('tmux', ['kill-session', '-t', sessionName], { stdio: 'ignore' })
-        child.on('error', () => resolve())
-        child.on('close', () => resolve())
-      } catch {
-        resolve()
-      }
-    })
-  }
+  _killTmuxSession = defaultKillTmuxSession
 }
 
 /**
@@ -3728,31 +3752,52 @@ async function runPersonaLadder(
 // reconcileOrphans — SR-1.6 startup orphan reconciliation
 // ---------------------------------------------------------------------------
 
+/** What the start sweep did. */
 export interface OrphanReconcileResult {
+  /** Rows swept: each killed, then deleted. Pre-persona rows are never swept. */
   found: number
+  /** Swept rows deleted. */
   killed: number
+  /** Swept rows whose delete failed. */
   failed: number
+  /** Pre-persona rows (no `persona` label), all kept (b.1ix). */
+  prePersona: PrePersonaSweepCounts
+}
+
+/** The start sweep's pre-persona rows (b.1ix): all kept, the live ones killed once. */
+export interface PrePersonaSweepCounts {
+  /** Pre-persona rows listed. Every one is kept. */
+  kept: number
+  /** Those in a live state (`AGENT_DIRECTOR_LIVE_STATES`), each killed once. */
+  live: number
+  /** Live ones whose kill failed. */
+  killFailed: number
+}
+
+/** A start sweep that did nothing (dry run, or a failed list). */
+function emptySweepResult(): OrphanReconcileResult {
+  return { found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } }
 }
 
 /**
- * What the start sweep does with a row (b.av2 SR-6.3, SR-6.4): `sweep` it
- * with a reason, `keep` it, or keep it with its `cwd` check `deferred` to the
- * persona's launch. A row is kept only when it has a `persona` label naming
- * an applied persona, its instance ID is that persona's `cscb_<key>`, and its
- * `cwd` matches the persona's working directory by real path. When that
- * working directory cannot be resolved to a real path (a directory-broken
- * persona) and the row's `cwd` has no real path either or equals the
- * configured path lexically (`cwdCheckDeferred`), the `cwd` condition cannot
- * be evaluated and is deferred; the other three conditions still apply. A row
- * whose `cwd` resolves to an existing directory is swept as `wrong cwd`.
+ * What the start sweep does with a row that has a `persona` label (b.av2
+ * SR-6.3, SR-6.4): `sweep` it with a reason, `keep` it, or keep it with its
+ * `cwd` check `deferred` to the persona's launch. A row is kept only when its
+ * label names an applied persona, its instance ID is that persona's
+ * `cscb_<key>`, and its `cwd` matches the persona's working directory by real
+ * path. When that working directory cannot be resolved to a real path (a
+ * directory-broken persona) and the row's `cwd` has no real path either or
+ * equals the configured path lexically (`cwdCheckDeferred`), the `cwd`
+ * condition cannot be evaluated and is deferred; the other conditions still
+ * apply. A row whose `cwd` resolves to an existing directory is swept as
+ * `wrong cwd`. A row with no `persona` label never gets here: see
+ * `keepPrePersonaRow`.
  */
 function sweepDecision(
   row: ListRow,
   persona: Persona | undefined,
-  personaLabel: string | undefined,
   home: string,
 ): { action: 'sweep'; reason: string } | { action: 'keep' } | { action: 'deferred'; persona: Persona } {
-  if (!personaLabel) return { action: 'sweep', reason: 'no persona label' }
   if (!persona) return { action: 'sweep', reason: 'absent persona' }
   if (row.claude_instance_id !== personaInstanceId(persona.key)) return { action: 'sweep', reason: 'wrong instance ID' }
   const comparison = compareRowToPersona(row, persona, home)
@@ -3762,10 +3807,85 @@ function sweepDecision(
 }
 
 /**
+ * The start sweep's handling of a pre-persona row, one with no `persona`
+ * label (b.1ix; the rows a build that predates personas made, instance IDs
+ * `cscb_<name>_<channel>`): the row is kept, never deleted. Its ID is never a
+ * persona's `cscb_<key>`, so no launch reuses or resumes it, and keeping it is
+ * harmless. A row in a live state is killed once and the kill's result
+ * logged; an `ended` or `missing` row is left alone, with no call and no line.
+ *
+ * Why no delete: agent-director 0.10.0's `kill` can report success while the
+ * session lives on, and a deleted row would leave that session running with
+ * no row to find it by (the incident pattern, at the upgrade to personas the
+ * whole fleet at once). The upgrade runbook stops the old build's bots first
+ * and has an operator confirm with `tmux ls` that none is left.
+ *
+ *   [slack] reconcileOrphans: pre-persona row (no persona label) instanceId=<id> state=<state> tmux_session=<name> is live — killing it; the row is kept (a pre-persona row is never deleted)
+ *   [slack] reconcileOrphans: kill reported success for pre-persona row instanceId=<id> — row kept; a reported success does not prove tmux session <name> is gone
+ *
+ * A failed kill records `orphan-cleanup` (`kill failed for pre-persona row
+ * instanceId=<id>: <errName> message="…"; row kept, its session may still be
+ * running`).
+ */
+async function keepPrePersonaRow(client: Client, row: ListRow, counts: PrePersonaSweepCounts): Promise<void> {
+  counts.kept++
+  if (!AGENT_DIRECTOR_LIVE_STATES.has(row.state)) return
+  counts.live++
+  const id = row.claude_instance_id
+  console.error(
+    `[slack] reconcileOrphans: pre-persona row (no persona label) instanceId=${id} state=${row.state} tmux_session=${row.tmux_session_name} is live — killing it; the row is kept (a pre-persona row is never deleted)`,
+  )
+  try {
+    await client.kill({ claude_instance_id: id })
+  } catch (err) {
+    counts.killFailed++
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('kill', 'UnknownError', String(err))
+    recordStartupError(
+      'orphan-cleanup',
+      `kill failed for pre-persona row instanceId=${id}: ${describeAgentDirectorFailure(e)}; row kept, its session may still be running`,
+    )
+    return
+  }
+  console.error(
+    `[slack] reconcileOrphans: kill reported success for pre-persona row instanceId=${id} — row kept; a reported success does not prove tmux session ${row.tmux_session_name} is gone`,
+  )
+}
+
+/**
+ * Kill, then delete, one row the start sweep swept. A failed kill still
+ * attempts the delete (b.fmk replaces this with no delete after a kill that
+ * didn't succeed). Returns whether the delete succeeded; each failure records
+ * `orphan-cleanup`.
+ */
+async function killAndDeleteSweptRow(client: Client, row: ListRow, displayPersona: string): Promise<boolean> {
+  const id = row.claude_instance_id
+  try {
+    await client.kill({ claude_instance_id: id })
+  } catch (err) {
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('kill', 'UnknownError', String(err))
+    recordStartupError('orphan-cleanup', `kill failed for orphan instanceId=${id} persona=${displayPersona}: ${describeAgentDirectorFailure(e)}`)
+  }
+  try {
+    await client.delete({ claude_instance_id: [id] })
+    return true
+  } catch (err) {
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
+    recordStartupError('orphan-cleanup', `delete failed for orphan instanceId=${id} persona=${displayPersona}: ${describeAgentDirectorFailure(e)}`)
+    return false
+  }
+}
+
+/**
  * Start sweep (b.av2 SR-6.3; formerly SR-1.6): enumerate every `service=cscb`
- * spawn and kill+delete each one that
- *   - has no `persona` label,
- *   - names a persona absent from the applied configuration,
+ * spawn.
+ *
+ * A pre-persona row (no `persona` label) is kept, never deleted, and killed
+ * only when it is live (`keepPrePersonaRow`, b.1ix).
+ *
+ * Every other row is swept, killed and then deleted, when it
+ *   - names a persona absent from the applied configuration (the kill and
+ *     delete stay until b.fmk: agent-director 0.10.0 has no reuse, and a
+ *     persona added again must start fresh),
  *   - has an instance ID other than `cscb_<key>` for its persona, or
  *   - has a `cwd` other than its persona's working directory, by real path
  *     (`compareRowToPersona`).
@@ -3778,16 +3898,18 @@ function sweepDecision(
  *   [slack] reconcileOrphans: persona "<name>" (key=<key>) working_directory="<path>" cannot be resolved to a real path — keeping its rows; the cwd check is deferred to its launch
  *
  * A `channel` label left on a row by an older spawn plays no part. A failed
- * kill still attempts the delete; kill and delete failures record
- * `orphan-cleanup`, a list failure records `orphan-cleanup-list-failed` and
- * does not block startup.
+ * kill of a swept row still attempts the delete; kill and delete failures
+ * record `orphan-cleanup`, a list failure records `orphan-cleanup-list-failed`
+ * and does not block startup. One summary line ends the sweep:
+ *
+ *   [slack] reconcileOrphans: found=<n> killed=<n> failed=<n>; pre-persona rows kept=<n> live=<n> kill-failed=<n>
  */
 export async function reconcileOrphans(
   personaConfig: PersonaConfig,
 ): Promise<OrphanReconcileResult> {
   if (isDryRun()) {
     console.error('[slack] dry-run: skipping orphan reconciliation')
-    return { found: 0, killed: 0, failed: 0 }
+    return emptySweepResult()
   }
 
   const client = getClient()
@@ -3801,22 +3923,22 @@ export async function reconcileOrphans(
       'orphan-cleanup-list-failed',
       `failed to list spawns for orphan reconciliation: ${describeAgentDirectorFailure(e)}`,
     )
-    return { found: 0, killed: 0, failed: 0 }
+    return emptySweepResult()
   }
 
   const personasByKey = new Map(personaConfig.personas.map((p) => [p.key, p]))
   const home = spawnHomeDir()
-
-  let found = 0
-  let killed = 0
-  let failed = 0
-
+  const result = emptySweepResult()
   const deferredLogged = new Set<string>()
 
   for (const row of rows) {
     const personaLabel = row.labels?.[PERSONA_LABEL_KEY]
-    const persona = personaLabel ? personasByKey.get(personaLabel) : undefined
-    const decision = sweepDecision(row, persona, personaLabel, home)
+    if (!personaLabel) {
+      await keepPrePersonaRow(client, row, result.prePersona)
+      continue
+    }
+    const persona = personasByKey.get(personaLabel)
+    const decision = sweepDecision(row, persona, home)
     if (decision.action === 'keep') continue
     if (decision.action === 'deferred') {
       const deferred = decision.persona
@@ -3831,40 +3953,22 @@ export async function reconcileOrphans(
     }
     const { reason } = decision
 
-    found++
+    result.found++
     // The persona reference when the persona exists, else the raw label value.
-    const displayPersona = persona ? personaRef(persona) : (personaLabel || '<no persona label>')
+    const displayPersona = persona ? personaRef(persona) : personaLabel
     const cwdDetail = reason === 'wrong cwd' ? ` cwd=${row.cwd}` : ''
     console.error(
       `[slack] reconcileOrphans: sweeping row (${reason}) persona=${displayPersona} instanceId=${row.claude_instance_id} state=${row.state}${cwdDetail} — killing and deleting`,
     )
-
-    try {
-      await client.kill({ claude_instance_id: row.claude_instance_id })
-    } catch (err) {
-      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('kill', 'UnknownError', String(err))
-      recordStartupError(
-        'orphan-cleanup',
-        `kill failed for orphan instanceId=${row.claude_instance_id} persona=${displayPersona}: ${describeAgentDirectorFailure(e)}`,
-      )
-      // continue to delete attempt
-    }
-
-    try {
-      await client.delete({ claude_instance_id: [row.claude_instance_id] })
-      killed++
-    } catch (err) {
-      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
-      recordStartupError(
-        'orphan-cleanup',
-        `delete failed for orphan instanceId=${row.claude_instance_id} persona=${displayPersona}: ${describeAgentDirectorFailure(e)}`,
-      )
-      failed++
-    }
+    if (await killAndDeleteSweptRow(client, row, displayPersona)) result.killed++
+    else result.failed++
   }
 
-  console.error(`[slack] reconcileOrphans: found=${found} killed=${killed} failed=${failed}`)
-  return { found, killed, failed }
+  const { found, killed, failed, prePersona } = result
+  console.error(
+    `[slack] reconcileOrphans: found=${found} killed=${killed} failed=${failed}; pre-persona rows kept=${prePersona.kept} live=${prePersona.live} kill-failed=${prePersona.killFailed}`,
+  )
+  return result
 }
 
 // ---------------------------------------------------------------------------
