@@ -15,7 +15,13 @@
  * A check that throws is a FAIL with the error's description. Evidence is
  * message timestamps, conversation IDs and redacted log lines, never a token.
  *
- * Pure apart from the injected clock and log.
+ * Optional hooks run around each check that runs (never a skipped one):
+ * `beforeCheck` before its `run`, `afterCheck` after it, whatever its outcome
+ * (a throw included), before its result is recorded. The prompt guard uses
+ * them to know which check is running and to sweep what it left open. A hook
+ * that throws is logged and changes no result.
+ *
+ * Pure apart from the injected clock, log and hooks.
  */
 
 import { describeError } from '../lib/errors.ts'
@@ -72,6 +78,25 @@ export interface RunChecksOptions {
    * second account is configured but needs a sign-in code).
    */
   needReasons?: Partial<Record<Need, string>>
+  /** Called before a check runs (not for a skipped one), and awaited. */
+  beforeCheck?: (check: CheckRef) => void | Promise<void>
+  /** Called after a check ran, whatever its outcome (a throw included), before its result is recorded, and awaited. */
+  afterCheck?: (check: CheckRef, result: CheckResult) => void | Promise<void>
+}
+
+/** What a hook is told about the check. */
+export interface CheckRef {
+  id: string
+  title: string
+}
+
+/** Run a hook; a throw is logged, never a result. */
+async function runHook(options: Pick<RunChecksOptions, 'log'>, check: CheckRef, name: string, hook: () => void | Promise<void>): Promise<void> {
+  try {
+    await hook()
+  } catch (err) {
+    options.log.info(`check ${check.id}: the ${name} hook failed: ${describeError(err)}`)
+  }
 }
 
 export function pass(evidence: string[], notes?: string[]): CheckResult {
@@ -116,11 +141,15 @@ export async function runChecks<Ctx>(
       result = skipped(reason)
     } else {
       options.log.info(`check ${check.id}: ${check.title}`)
+      const ref: CheckRef = { id: check.id, title: check.title }
+      if (options.beforeCheck) await runHook(options, ref, 'beforeCheck', () => options.beforeCheck?.(ref))
       try {
         result = await check.run(ctx)
       } catch (err) {
         result = fail(`threw ${describeError(err)}`, [])
       }
+      const ran = result
+      if (options.afterCheck) await runHook(options, ref, 'afterCheck', () => options.afterCheck?.(ref, ran))
       if (result.status === 'FAIL' && check.blocking) state.blockedBy = check.id
     }
     const recorded: RecordedResult = {

@@ -5,8 +5,10 @@
  * - `results.md`: a per-check table with evidence, then one row in the
  *   testplan's Results-table format (testplans/b.yko "Results"), ready to
  *   paste: pass, fail or "not run" per column, never a token or a log excerpt;
- *   then the memory watchdog's peaks (`memory` in results.json), when the
- *   run had a watchdog.
+ *   then what the prompt guard denied (`promptGuard` in results.json: the
+ *   count, and each denial's check, persona and command), when the run had
+ *   one; then the memory watchdog's peaks (`memory` in results.json), when
+ *   the run had a watchdog.
  *
  * Rendering is pure. Every string of the summary passes through the redactor
  * before it is serialised (JSON escaping or a Markdown cell's `\|` would
@@ -15,6 +17,7 @@
  */
 
 import type { RecordedResult } from '../checks/framework.ts'
+import type { PromptGuardReport } from '../checks/prompt-guard.ts'
 import type { WatchdogReport } from './memory-watchdog.ts'
 import type { Redactor } from './redact.ts'
 
@@ -35,8 +38,20 @@ export interface RunSummary {
   verdict: string
   results: RecordedResult[]
   notes: string[]
+  /** What the prompt guard saw and denied (absent when the run had no guard: no container, or no plan checks). */
+  promptGuard?: PromptGuardReport
   /** The memory watchdog's samples, peaks and any abort (absent when the run had no watchdog). */
   memory?: WatchdogReport
+}
+
+/** results.md's prompt guard section: the count, then one line per denial (its check, persona and command). */
+export function renderPromptGuard(report: PromptGuardReport): string[] {
+  const lines = [
+    `${report.seen} permission prompt(s) seen; ${report.denied} denied, ${report.notDenied} could not be denied. A denial is a note, never a FAIL.`,
+  ]
+  if (report.entries.length > 0) lines.push('')
+  for (const e of report.entries) lines.push(`- ${e.check}, ${e.persona}, ${e.why}: ${e.command} (${e.how})`)
+  return lines
 }
 
 function cell(text: string): string {
@@ -78,6 +93,12 @@ export function renderResultsMarkdown(summary: RunSummary): string {
   lines.push(`|${' --- |'.repeat(RESULTS_COLUMNS.length + 4)}`)
   lines.push(renderResultsRow(summary))
   lines.push('')
+  if (summary.promptGuard) {
+    lines.push('## Prompt guard (prompts no check expected, and prompts a check left open)')
+    lines.push('')
+    lines.push(...renderPromptGuard(summary.promptGuard))
+    lines.push('')
+  }
   if (summary.memory) {
     lines.push('## Memory (the watchdog\'s peaks)')
     lines.push('')

@@ -265,6 +265,9 @@ export const check26: CheckDef<CheckContext> = {
   run: async () => pass([]),
 }
 
+/** Check 27's prompt, as declared to the prompt guard: left open on purpose. */
+export const CHECK27_PROMPT = /removal-prompt\.txt/
+
 export const check27: CheckDef<CheckContext> = {
   id: '27',
   title: 'Check 27: a confirmed removal tears down only that persona (AC 57)',
@@ -280,10 +283,11 @@ export const check27: CheckDef<CheckContext> = {
     const pid = await serverPid(ctx)
     const before = await rows(ctx)
     f.add(`rows before: ${before.map((r) => r.id).join(', ')}`)
-    // Step 2 (optional, run): D raises a prompt that is left unanswered.
+    // Step 2 (optional, run): D raises a prompt that is left unanswered (the prompt guard leaves it open: the check later clicks it to prove it inert).
+    ctx.promptGuard.expect({ persona: 'd', command: CHECK27_PROMPT, leaveOpen: true })
     const tm = await tmark(ctx)
     await human.post(ids.dHome, `${mention(ctx, 'd')} run a shell command that writes the current date to a file named removal-prompt.txt in your working directory.`)
-    const dPrompt = await waitPromptPost(ctx, tm, 'd', 2 * MINUTE)
+    const dPrompt = await waitPromptPost(ctx, tm, 'd', 2 * MINUTE, 1, CHECK27_PROMPT)
     const promptTs = dPrompt?.[0]?.slack_ts
     f.note(`Check 27 step 2: ${promptTs ? `ran (prompt ${promptTs} in D-home)` : 'ran, but D raised no prompt in time'}`)
 
@@ -407,7 +411,8 @@ export const check28: CheckDef<CheckContext> = {
     await waitBringUp(ctx, bmark, ['a', 'b', 'c'])
     const l5 = await since(ctx, bmark)
     f.expect(l5.some((l) => l.includes('[slack] Loaded persona config: 3 persona(s)')), 'step 5: no "Loaded persona config: 3 persona(s)" line')
-    await checkStartLines(ctx, f, bmark, ['a', 'b', 'c'], true)
+    // A persona Slack was unreachable for at the start, up after its bring-up retry and connected in the wait, is a note, not a finding.
+    await checkStartLines(ctx, f, bmark, ['a', 'b', 'c'], true, { acceptRetried: 'Check 28' })
     if (complete?.[0]) f.note(`Check 28 summary: ${complete[0].replace(/^.*complete — /, '')}`)
     const rows5 = await rows(ctx)
     f.expect(rows5.length === 3 && new Set(rows5.map((r) => r.persona)).size === 3, 'step 5: not one row per persona')

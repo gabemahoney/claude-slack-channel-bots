@@ -9,7 +9,7 @@ allowed-tools: [Bash]
 
 The live, pre-deploy acceptance run of CSCB: every `testplans/b.yko` check that can
 be automated, against the **test workspace** only (never a production workspace),
-in a fresh container built from the `/ci` base (`cscb-ci-base:v3`), with the
+in a fresh container built from the `/ci` base (`cscb-ci-base:v4`), with the
 package under test installed the way a customer installs it. The production
 bots on this host are never touched: the container has its own HOME, config,
 tmux, agent-director store and port, runs on the default docker network (no
@@ -69,14 +69,15 @@ installed Google Chrome, headless; no browser download):
 ## Procedure
 
 1. Check docker (`docker info`) and the `/ci` base image (`docker image inspect
-   cscb-ci-base:v3`; if missing, run `/ci` once).
+   cscb-ci-base:v4`; if missing, run `/ci` once).
 2. Gate first: `bun ci-live/run.ts --dry-run`. It reads no secret: a local stub
    stands in for Slack and fixture pages for the sign-in, install and token
    pages. It builds the live image (with the host's agent-director binary; a
    version mismatch with the npm package fails the build, and the reason
    names the fix), runs the pre-flight, the install, the setup, S2, S3 and
-   29a in a real container, then Teardown, the HOST check, and a secrecy
-   scan of every output. Must print `VERDICT: PASS`. It takes about a minute
+   29a in a real container, the prompt guard's self-test (it must deny a
+   stub prompt no check expects), then Teardown, the HOST check, and a
+   secrecy scan of every output. Must print `VERDICT: PASS`. It takes about a minute
    (a few when the image is rebuilt), so run it in the foreground (one Bash
    call, timeout 600000). It has its own lock, so it can run beside a real
    run.
@@ -90,7 +91,12 @@ installed Google Chrome, headless; no browser download):
    Chrome is one browser with one context and one page per account, idle on
    `about:blank` between flows, and a watchdog writes a `watchdog:` line to
    `run.log` every 30 s. It stops the run when the host's working set passes
-   40 GiB or Chrome's process tree PSS passes 4 GiB.
+   40 GiB or Chrome's process tree PSS passes 4 GiB. A prompt guard runs
+   through the checks: it denies (Deny clicked, else `agent-director decide`
+   in the container) any permission prompt no check declared once it is 15 s
+   old, and any prompt a check left open when it ends (Check 27's excepted),
+   so one bot Claude's detour doesn't block its persona for the rest of the
+   run. A denial is a note, not a FAIL.
    - `--provision-only [--stage apps|install|tokens|channels]`: provisioning only.
    - `--only 1,2,5`: run only these checks. The pre-flight, install, setup and
      Check 1 always run, as later checks need their state, and so do 29a,
@@ -177,6 +183,10 @@ installed Google Chrome, headless; no browser download):
      actually did.
    - `NOT RUNNABLE: …` → relay the reason (it names the file or variable to fix).
 
+   After a PASS or a FAIL, also relay each denial listed in `results.md`'s
+   "Prompt guard" section (its check, persona and command): a denial fails
+   nothing, but it shows a bot Claude's detour.
+
 ## Maintenance commands
 
 Each takes the real run lock (never while a run is going), runs in the
@@ -195,7 +205,8 @@ code), and prints its own lines only, with no results dir:
 `verdict.txt`, `results.json`, `results.md` (per-check status, reason and
 evidence — message timestamps, conversation IDs and redacted log lines, never
 a token — plus one row in the testplan's Results-table format, ready to
-paste, and the memory watchdog's peaks; `results.json` has them under
+paste, the prompt guard's denials (check, persona, command) and the memory
+watchdog's peaks; `results.json` has them under `promptGuard` and
 `memory`), `run.log` (redacted, with the `watchdog:` samples),
 `container.log`, and `container-logs/`: copied before the container is
 removed or stopped on every run (a signal, a memory watchdog stop and

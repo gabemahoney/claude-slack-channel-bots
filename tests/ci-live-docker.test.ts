@@ -48,7 +48,13 @@
  *   them only briefly), once, and sealed before the closing scan, which
  *   covers them;
  * - the browser is bounded (one Chrome, at most two contexts and two pages,
- *   idle on about:blank between flows and after a sign-in).
+ *   idle on about:blank between flows and after a sign-in), and its flows run
+ *   one at a time (the prompt guard clicks while a check may);
+ * - the prompt guard runs from the first plan check to the last (its hooks
+ *   around each, stopped before Teardown, halted by a stop's cleanup, its
+ *   report in the results), reaches the container only through the checks'
+ *   helpers, and its one agent-director command, the fallback deny, runs
+ *   behind the plan's `guard`.
  *
  * Nothing here runs docker: spawns go to a recording fake. The wiring that
  * lives in `ci-live/runtime/` and `ci-live/main.ts` (which load
@@ -1303,6 +1309,40 @@ describe('runner wiring (source audit of ci-live/)', () => {
     expect(finish).toContain('const logsDir = join(env.resultsDir, CONTAINER_LOGS_DIR)')
   })
 
+  test("the prompt guard runs from the first plan check to the last: its hooks around each, stopped before Teardown, halted by a stop's cleanup, its report in the results; a real run's clicks go through the test human's own browser and session", () => {
+    const main = code('main.ts')
+    const runFull = main.slice(...balancedAfter(main, main.indexOf('async function runFull('), '{', '}'))
+    expectInOrder(runFull, [
+      'const promptGuard = new PromptGuard(',
+      'containerPromptGuardDeps(guardTarget, { redact: (text) => env.redactor.redact(text), log: (line) => env.log.info(line), note: (line) => state.runNotes.push(line) })',
+      'state.promptGuard = promptGuard',
+      'promptGuard,',
+      'const guardHooks = { beforeCheck: (c: CheckRef) => promptGuard.beforeCheck(c.id), afterCheck: (c: CheckRef) => promptGuard.afterCheck(c.id) }',
+      'promptGuard.start()',
+      'await runChecks(PLAN_CHECKS, ctx, { ...options, ...guardHooks, only: env.options.only })',
+      'if (dry) record(await dryRunPromptGuardSelfTest(env, ws, tc, ids, promptGuard, state.runNotes))',
+      'await promptGuard.stop()',
+      'const logsSeed = dry ? await seedDryRunContainerLogs(tc, env.redactor)',
+      'await runChecks(FINAL_CHECKS, ctx, { ...options, only: [] })',
+    ])
+    expect(indicesOf(/\bpromptGuard\.start\(\)/g, main).length).toBe(1)
+    expect(indicesOf(/\bnew PromptGuard\(/g, main).length).toBe(1)
+    // Only a dry run's target is the stub's browser; a real run's is the test human's.
+    expect(runFull).toContain(
+      'const guardTarget: PromptGuardTarget = dry\n        ? await dryRunGuardTarget(env, ws, tc, ids)\n        : { container: tc, clock: realClock, ids, browser: sessions?.browser ?? null, human: sessions?.human ?? null }',
+    )
+    // A stop's cleanup halts it without waiting (the container and the browser are going), after the watchdog's stop.
+    const cleanup = main.slice(...balancedAfter(main, main.indexOf('const cleanup = (cause?: StopCause): Promise<void> =>'), '{', '}'))
+    expectInOrder(cleanup, ['const watchdogStopped = watchdog.stop()', 'state.promptGuard?.halt()', 'await collectLogs(cause?.memory === true)'])
+    expectInOrder(main.slice(main.indexOf('function finish(')), ['promptGuard: state.promptGuard?.report(),', 'memory,', 'writeResults(summary'])
+    // Its one agent-director command is the fallback deny, behind the plan's guard, through the checks' helpers (ctx.container).
+    const guard = code(join('checks', 'prompt-guard.ts'))
+    expect(indicesOf(/agent-director decide --/g, guard).length).toBe(1)
+    expect(guard).toContain('return `agent-director decide --claude-instance-id ${q(p.instanceId)} --decision deny --request-token ${q(p.token)} --reason ${q(PROMPT_GUARD_DENY_REASON)}`')
+    expect(guard).toContain('const r = await guarded(target, denyScript(p))')
+    expect(guard).not.toMatch(/\bspawn\b|\bBun\.|\.docker\b|tmux|\.container\.(sh|exec|writeFile)\(/)
+  })
+
   test('the stopped run\'s note words the container\'s end through describeContainerEnd', () => {
     const main = code('main.ts')
     expect(main).toContain('return `${cause.noteHead}; ${describeContainerEnd(ended.container, containerName)}; ${browser}; the results so far written`')
@@ -1324,6 +1364,11 @@ describe('runner wiring (source audit of ci-live/)', () => {
     expectInOrder(driver.slice(driver.indexOf('private async usablePage(')), ['if (!this.crashed) return this.page', 'await this.page.close()', 'this.page = await this.context.newPage()'])
     expectInOrder(driver, ["context.on('page', (opened) => {", 'if (opened === this.page || this.opening) return', 'void opened.close()'])
     expectInOrder(driver.slice(driver.indexOf('private async flow<T>(')), ['return await work(await this.usablePage())', 'finally {', 'await this.idle()'])
+    // Flows run one at a time, in call order: each waits for the one before, and lets the next go only after its page is idle, even on a throw.
+    const flow = driver.slice(...balancedAfter(driver, driver.indexOf('private async flow<T>('), '{', '}'))
+    expectInOrder(flow, ['const previous = this.flowing', 'this.flowing = new Promise<void>(', 'await previous', 'return await work(await this.usablePage())', 'await this.idle()', 'done()'])
+    expect(flow).toMatch(/await this\.idle\(\)\s*\}\s*finally\s*\{\s*done\(\)/)
+    expect(driver).toContain('private flowing: Promise<void> = Promise.resolve()')
     // The sign-in idles its page too, signed in or failed; only a code prompt stays open, for the code.
     expectInOrder(driver.slice(...balancedAfter(driver, driver.indexOf('async ensureSignedIn('), '{', '}')), [
       "let outcome: SignInOutcome = 'signed-in'",

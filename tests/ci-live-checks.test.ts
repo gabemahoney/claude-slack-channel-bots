@@ -83,6 +83,9 @@ import {
   CHECK12_PANE_STOP,
   CHECK12_STOP,
   check12,
+  check12Start,
+  CHECK5_PROMPT_1,
+  CHECK5_PROMPT_2,
   check8,
   check9,
   COMPLETE_FIRST_START,
@@ -93,12 +96,27 @@ import {
   typeIntoPane,
 } from '../ci-live/checks/channel-checks.ts'
 import { DRY_RUN_IDS, liveIdsFrom, type CheckContext } from '../ci-live/checks/context.ts'
-import { callsTo, check16, check20, newCallTo, OUTBOUND_ASKS, outboundNext } from '../ci-live/checks/dm-checks.ts'
+import type { CheckPromptGuard, PromptExpectation } from '../ci-live/checks/prompt-guard.ts'
+import {
+  callsTo,
+  check16,
+  check20,
+  check23,
+  CHECK18_PROMPT,
+  CHECK22_PROMPT,
+  CHECK23_B_EXTRA,
+  CHECK23_PROMPT_A,
+  CHECK23_PROMPT_B,
+  newCallTo,
+  OUTBOUND_ASKS,
+  outboundNext,
+} from '../ci-live/checks/dm-checks.ts'
 import { Findings, NEED_SKIP_REASONS, runChecks, skipReason, verdictOf, type CheckDef, type CheckResult, type Need } from '../ci-live/checks/framework.ts'
 import {
   appliedLine,
   checkPreview,
   checkStartLines,
+  commandMatches,
   countsText,
   guardedRestart,
   hasWord,
@@ -108,12 +126,14 @@ import {
   previewHeader,
   promptState,
   q,
+  retriedBringUps,
+  retryFailureClass,
   S,
   START_SUMMARY_END,
   TAG_TIMEOUT_MS,
   waitTags,
 } from '../ci-live/checks/helpers.ts'
-import { check28, check29a, parseCount, parseLeakcount, parsePersonaCounts, personaCountsProblem } from '../ci-live/checks/lifecycle-checks.ts'
+import { check28, CHECK27_PROMPT, check29a, parseCount, parseLeakcount, parsePersonaCounts, personaCountsProblem } from '../ci-live/checks/lifecycle-checks.ts'
 import { FINAL_CHECKS, hostCheck, PLAN_CHECKS, teardownCheck } from '../ci-live/checks/list.ts'
 import { s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
 import { FlowError, type BrowserDriver, type HumanApi } from '../ci-live/lib/browser-types.ts'
@@ -167,6 +187,22 @@ function fakeContainer(answers: ReadonlyArray<readonly [string, Reply]>) {
 
 const SNAPSHOT: HostSnapshot = { adRows: ['cscb_prod_a'], tmuxSessions: ['slack_bot_prod_a'], port3100: '4242', configSha256: 'a'.repeat(64) }
 
+/** A prompt guard that records what a check declares and how often it asks for its leftovers to be denied; it denies `leftovers` of them. */
+function recordingGuard(leftovers = 0): CheckPromptGuard & { expected: PromptExpectation[]; sweeps: number } {
+  const guard = {
+    expected: [] as PromptExpectation[],
+    sweeps: 0,
+    expect: (e: PromptExpectation) => {
+      guard.expected.push(e)
+    },
+    denyLeftovers: async () => {
+      guard.sweeps++
+      return leftovers
+    },
+  }
+  return guard
+}
+
 function makeCtx(overrides: Partial<CheckContext> = {}): CheckContext {
   const info: string[] = []
   return {
@@ -189,6 +225,7 @@ function makeCtx(overrides: Partial<CheckContext> = {}): CheckContext {
       setBAppTokenName: () => {},
     },
     shared: {},
+    promptGuard: recordingGuard(),
     restartContainer: async () => {},
     hostScan: () => ({ counts: [], total: 0 }),
     hostBefore: SNAPSHOT,
@@ -396,6 +433,67 @@ describe('runChecks', () => {
       ['c', 'PASS', null],
     ])
     assertNoLeak(results)
+  })
+
+  test('the hooks run around each check that runs, never a skipped one; afterCheck gets the result (a throw\'s FAIL too) before it is recorded; a hook that throws is logged and changes no result', async () => {
+    const events: string[] = []
+    const log: string[] = []
+    const ran = (id: string, extra: Partial<CheckDef<null>> & { outcome?: CheckResult | Error } = {}): CheckDef<null> => {
+      const def = check(id, extra)
+      return {
+        ...def,
+        run: async (ctx) => {
+          events.push(`run ${id}`)
+          return def.run(ctx)
+        },
+      }
+    }
+    const results = await runChecks(
+      [ran('a'), ran('b', { skip: 'manual only' }), ran('c', { outcome: new Error('boom') }), ran('d'), ran('e', { outcome: FAILED })],
+      null,
+      {
+        available: new Set(),
+        only: [],
+        now: () => 0,
+        log: { info: (m) => log.push(m) },
+        onResult: (r) => events.push(`recorded ${r.id}`),
+        beforeCheck: (c) => {
+          events.push(`before ${c.id} (${c.title})`)
+          if (c.id === 'd') throw new Error('before broke')
+        },
+        afterCheck: async (c, r) => {
+          events.push(`after ${c.id} ${r.status}`)
+          if (c.id === 'e') throw new Error('after broke')
+        },
+      },
+    )
+    expect(events).toEqual([
+      'before a (check a)',
+      'run a',
+      'after a PASS',
+      'recorded a',
+      'recorded b',
+      'before c (check c)',
+      'run c',
+      'after c FAIL',
+      'recorded c',
+      'before d (check d)',
+      'run d',
+      'after d PASS',
+      'recorded d',
+      'before e (check e)',
+      'run e',
+      'after e FAIL',
+      'recorded e',
+    ])
+    expect(results.map((r) => [r.id, r.status, r.reason ?? null])).toEqual([
+      ['a', 'PASS', null],
+      ['b', 'SKIPPED', 'manual only'],
+      ['c', 'FAIL', 'threw Error: boom'],
+      ['d', 'PASS', null],
+      ['e', 'FAIL', 'broke'],
+    ])
+    expect(log.filter((l) => l.includes('hook failed'))).toEqual(['check d: the beforeCheck hook failed: Error: before broke', 'check e: the afterCheck hook failed: Error: after broke'])
   })
 })
 
@@ -1205,6 +1303,23 @@ describe("Check 12: the stop bans nothing, and is lifted once coordination is qu
     expect(section).toContain(`"@CSCB Test A @CSCB Test B ${CHECK12_LIFT}"`)
   })
 
+  test("the start message first tells A who it and B are (persona name and key, bot user IDs), so it doesn't look itself up; the plan's step 1 gives the same text", async () => {
+    const { ctx, posts } = exchange()
+    await check12.run(ctx)
+    const start = posts[0]!
+    expect(start.channel).toBe(DRY_RUN_IDS.aHome)
+    expect(start.text).toBe(check12Start({ coordination: COORD, aUserId: A.userId, bUserId: B.userId }))
+    expect(start.text).toStartWith(
+      `You are persona_a (key=persona_a), bot user ID \`${A.userId}\`. B is persona_b (key=persona_b), bot user ID \`${B.userId}\`. ` +
+        "That is all you need to know about who you are, so don't look it up. In coordination, ",
+    )
+    expect(start.text).toContain(`mentions \`<@${B.userId}>\``)
+    expect(start.text).toContain(`mention you as \`<@${A.userId}>\``)
+    const plan = readFileSync(join(import.meta.dir, '..', 'testplans', 'b.yko', 'b.yko.md'), 'utf-8')
+    const section = plan.slice(plan.indexOf('### Check 12:'), plan.indexOf('## Part 5:')).replace(/\s+/g, ' ')
+    expect(section).toContain(`post: "${check12Start({ coordination: '<COORDINATION_CHANNEL_ID>', aUserId: '<A_BOT_USER_ID>', bUserId: '<B_BOT_USER_ID>' })}"`)
+  })
+
   test('typeIntoPane: Escape first only when interrupting; the text is one literal word', () => {
     expect(typeIntoPane('b', "it's over", false)).toBe(`tmux send-keys -t slack_bot_persona_b -l 'it'\\''s over'; sleep 1; tmux send-keys -t slack_bot_persona_b Enter`)
     expect(typeIntoPane('a', 'stop', true)).toBe(
@@ -1379,9 +1494,9 @@ describe('Check 28 step 5: the start after the reboot waits for every persona to
    * three rows and a running server; nothing answers in Slack, so the other
    * steps record their own findings; time is virtual.
    */
-  function rebootedRun(cAt: number | null) {
+  function rebootedRun(cAt: number | null, lines: readonly (readonly [number, string])[] = startLog(cAt)) {
     const clock = virtualClock()
-    const log = timedLog(clock, startLog(cAt))
+    const log = timedLog(clock, lines)
     const { container } = fakeContainer([
       ['echo BOOT', 'BOOT'],
       ['kill -0', 'running'],
@@ -1400,6 +1515,111 @@ describe('Check 28 step 5: the start after the reboot waits for every persona to
   test('the control: C never connects, which is a finding', async () => {
     const r = await check28.run(rebootedRun(null))
     expect((r.reason ?? '').split('; ').filter((x) => START_FINDING.test(x))).toEqual(['no Session connected line for persona_c'])
+  })
+
+  test("A, Slack unreachable for a moment at the start (run 6), up after its bring-up retry and connected in the wait: no start finding, a note", async () => {
+    const r = await check28.run(rebootedRun(null, retriedStartLog()))
+    expect((r.reason ?? '').split('; ').filter((x) => START_FINDING.test(x))).toEqual([])
+    expect(r.notes).toContain(RETRIED_NOTE)
+    expect(r.notes).toContain(`Check 28 summary: 3 persona(s): 2 resumed, 0 fresh-spawned, 0 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, 0 reconnected, 0 no-op, 0 failed, 1 not brought up, 0 not reconnected`)
+  })
+
+  test('the control: A never comes back, which fails as before (the summary, the failure line, no Session connected line)', async () => {
+    const r = await check28.run(rebootedRun(null, retriedStartLog({ up: false })))
+    const findings = (r.reason ?? '').split('; ').filter((x) => START_FINDING.test(x))
+    expect(findings.map((x) => x.replace(/: \[.*$/, ''))).toEqual(['no Session connected line for persona_a', `the start summary does not end "${START_SUMMARY_END}"`, 'start failure lines'])
+    expect(r.notes).not.toContain(RETRIED_NOTE)
+  })
+})
+
+/** Run 6's cause line, as the plan's note quotes it: the class, then the cause. */
+const RETRIED_NOTE =
+  'Check 28: persona_a was not brought up at the start (persona-slack-unreachable: Slack unreachable checking app_token via the Socket Mode open: WebSocket phase timed out after 10 s), ' +
+  'then was up after its bring-up retry (Slack) and connected: a transient the server recovered from, accepted'
+
+/**
+ * A start from the record as in run 6: Slack is unreachable for A at the
+ * start (its line timestamped, as server.log has it), so the summary counts
+ * it not brought up; B and C connect before the summary. With `up`, A's
+ * cause clears, A is up after its bring-up retry (Slack) and connects after
+ * it (`connected`); `notBroughtUp` is the summary's count; `extra` lines are
+ * added.
+ */
+function retriedStartLog(opts: { up?: boolean; connected?: boolean; notBroughtUp?: number; extra?: [number, string][] } = {}): [number, string][] {
+  const { up = true, connected = true, notBroughtUp = 1, extra = [] } = opts
+  const ref = '"persona_a" (key=persona_a)'
+  const path = 'path="/home/testuser/.config/cscb/persona_a-credentials.json"'
+  const session = (l: PersonaLetter) => `[slack] Session connected: persona "persona_${l}" (key=persona_${l}) cwd="/home/cscb/cscb-live/${l}"`
+  const lines: [number, string][] = [
+    [20, `[slack] Starting from the last-applied record "${S}/config.json.last-applied"`],
+    [20, '[slack] Loaded persona config: 3 persona(s)'],
+    ...(['a', 'b', 'c'] as const).map((l, i): [number, string] => [25, `[slack] persona-start: personas[${i}] "persona_${l}" (key=persona_${l}): bring-up starting`]),
+    [35, `[2026-09-26T19:51:41.070Z] [slack] persona-slack-unreachable: personas[0] ${ref} ${path}: Slack unreachable checking app_token via the Socket Mode open: WebSocket phase timed out after 10 s`],
+    [80, session('b')],
+    [90, session('c')],
+    [100, startSummary(`0 failed, ${notBroughtUp} not brought up, 0 not reconnected`)],
+  ]
+  if (up) {
+    lines.push([105, `[2026-09-26T19:51:46.284Z] [slack] persona-slack-unreachable: personas[0] ${ref} ${path}: cleared: Slack answered after being unreachable checking app_token via the Socket Mode open`])
+    lines.push([105, `[slack] persona ${ref}: up after its bring-up retry (Slack) — launching`])
+    if (connected) lines.push([106, session('a')])
+  }
+  return [...lines, ...extra].sort((x, y) => x[0] - y[0])
+}
+
+describe("the start's lines: a persona not brought up that came up after its bring-up retry (Check 28's acceptRetried)", () => {
+  /** checkStartLines' findings and notes on `lines`, 200 s after the start, with or without Check 28's acceptance. */
+  async function startFindings(lines: [number, string][], accept = true): Promise<{ failures: string[]; notes: string[] }> {
+    const clock = virtualClock()
+    const log = timedLog(clock, lines)
+    log.begin()
+    await clock.sleep(200 * SECOND)
+    const f = new Findings()
+    const ctx = makeCtx({ clock, container: fakeContainer([['', (script) => log.since(script) ?? '']]).container })
+    await checkStartLines(ctx, f, '1:0', ['a', 'b', 'c'], true, accept ? { acceptRetried: 'Check 28' } : {})
+    return { failures: f.failures, notes: f.notes }
+  }
+
+  /** A failure without the log lines it quotes. */
+  const short = (r: { failures: string[]; notes: string[] }) => ({ ...r, failures: r.failures.map((x) => x.replace(/: \[.*$/, '')) })
+
+  test('accepted: the summary counts it not brought up, its Slack-unreachable lines up to the retry are the transient; a note says so', async () => {
+    expect(await startFindings(retriedStartLog())).toEqual({ failures: [], notes: [RETRIED_NOTE] })
+  })
+
+  test('retriedBringUps finds the persona only with its up-after-retry line and a Session connected line after it', () => {
+    const lines = (o: Parameters<typeof retriedStartLog>[0]) => retriedStartLog(o).map(([, l]) => l)
+    expect(retriedBringUps(lines({}), ['a', 'b', 'c']).map((r) => [r.letter, r.via])).toEqual([['a', 'Slack']])
+    expect(retriedBringUps(lines({ connected: false }), ['a', 'b', 'c'])).toEqual([])
+    expect(retriedBringUps(lines({ up: false }), ['a', 'b', 'c'])).toEqual([])
+    // Only a Slack retry is a transient: a directory retry after a reboot is not accepted.
+    expect([retryFailureClass('Slack')?.source, retryFailureClass('directory'), retryFailureClass('credentials')]).toEqual(['\\] persona-slack-unreachable: ', null, null])
+  })
+
+  const START = ['the start summary does not end "0 failed, 0 not brought up, 0 not reconnected"', 'start failure lines']
+
+  test.each([
+    ['without the acceptance (a guarded restart)', retriedStartLog(), false, START],
+    ['it never came back', retriedStartLog({ up: false }), true, ['no Session connected line for persona_a', ...START]],
+    ['up after its retry, but never connected', retriedStartLog({ connected: false }), true, ['no Session connected line for persona_a', ...START]],
+    ['the summary counts two not brought up, only one came back', retriedStartLog({ notBroughtUp: 2 }), true, START],
+    [
+      'up after a directory retry (not a transient)',
+      retriedStartLog().map(([t, l]): [number, string] => [t, l.replace('bring-up retry (Slack)', 'bring-up retry (directory)')]),
+      true,
+      START,
+    ],
+  ] as const)('%s: fails as before', async (_what, lines, accept, failures) => {
+    expect(short(await startFindings([...lines], accept))).toEqual({ failures: [...failures], notes: [] })
+  })
+
+  test.each([
+    ['a credentials line for it', `[slack] persona-credentials-refused: personas[0] "persona_a" (key=persona_a) path="/x": Slack refused the app token`, 30],
+    ['a Slack-unreachable line for it after the retry', `[slack] persona-slack-unreachable: personas[0] "persona_a" (key=persona_a) path="/x": Slack unreachable checking bot_token via auth.test: no answer within 10 s`, 150],
+    ["another persona's Slack-unreachable line", `[slack] persona-slack-unreachable: personas[1] "persona_b" (key=persona_b) path="/x": Slack unreachable checking bot_token via auth.test: no answer within 10 s`, 30],
+  ])('accepted, but %s is still a finding (and the note stays)', async (_what, line, at) => {
+    const r = await startFindings(retriedStartLog({ extra: [[at, line]] }))
+    expect(r).toEqual({ failures: [`start failure lines: ${line}`], notes: [RETRIED_NOTE] })
   })
 })
 
@@ -1442,6 +1662,133 @@ describe('no live check passes against a silent workspace', () => {
       const r = await PLAN_CHECKS.find((c) => c.id === id)!.run(silentCtx())
       expect([id, r.status, r.evidence]).toEqual([id, 'PASS', ['nothing to restore: the setup did not run']])
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The prompts the checks declare to the prompt guard
+// ---------------------------------------------------------------------------
+
+describe('the prompts each check declares to the prompt guard, before it raises them', () => {
+  /** Every check that raises a permission prompt, and what it declares (run 6's list: 5, 18, 22, 23, and 27 left open). */
+  const DECLARED: Record<string, PromptExpectation[]> = {
+    '5': [
+      { persona: 'a', command: CHECK5_PROMPT_1 },
+      { persona: 'a', command: CHECK5_PROMPT_2 },
+    ],
+    '18': [{ persona: 'c', command: CHECK18_PROMPT }],
+    '22': [{ persona: 'b', command: CHECK22_PROMPT }],
+    '23': [
+      { persona: 'a', command: CHECK23_PROMPT_A },
+      { persona: 'b', command: CHECK23_PROMPT_B },
+      { persona: 'b', command: CHECK23_B_EXTRA },
+    ],
+    '27': [{ persona: 'd', command: CHECK27_PROMPT, leaveOpen: true }],
+  }
+  const live = PLAN_CHECKS.filter((c) => c.needs.includes('workspace') && !c.skip)
+
+  /**
+   * A silent workspace (as above) whose declarations, human posts and typing
+   * into a persona's pane are recorded in order; the container answers
+   * `container` first, if given.
+   */
+  function declaringCtx(leftovers = 0, container?: [string, Reply]) {
+    const clock = virtualClock()
+    const events: string[] = []
+    const guard = recordingGuard(leftovers)
+    const record = guard.expect
+    guard.expect = (e) => {
+      events.push(`expect ${e.persona}`)
+      record(e)
+    }
+    const { human } = scriptedHuman(clock)
+    const post = human.post.bind(human)
+    human.post = async (channel, text, thread) => {
+      events.push('post')
+      return post(channel, text, thread)
+    }
+    const answers: [string, Reply][] = [
+      ...(container ? [container] : []),
+      [
+        '',
+        (script) => {
+          if (script.includes('tmux send-keys')) events.push('type')
+          return script === 'mark' ? '1:0' : ''
+        },
+      ],
+    ]
+    const ctx = makeCtx({
+      mode: 'real',
+      clock,
+      human,
+      second: { human: scriptedHuman(clock).human, userId: 'U0DRYSECND' },
+      browser: idleBrowser(),
+      container: fakeContainer(answers).container,
+      promptGuard: guard,
+    })
+    return { ctx, events, guard }
+  }
+
+  test('the checks that raise prompts are the ones run 6 named', () => {
+    expect(Object.keys(DECLARED).sort()).toEqual(['18', '22', '23', '27', '5'])
+    expect(CHECK23_B_EXTRA.test('anything B runs')).toBe(true)
+  })
+
+  test.each(live.map((c) => [c.id, c] as const))('Check %s declares exactly its prompts, all before it posts or types what raises them', async (id, c) => {
+    const { ctx, events, guard } = declaringCtx()
+    await runChecks([c], ctx, { available: new Set<Need>(['workspace', 'claude', 'second-user']), only: [], now: () => 0, log: { info: () => {} } })
+    expect(guard.expected).toEqual(DECLARED[id] ?? [])
+    if (DECLARED[id]) {
+      const raised = events.findIndex((e) => e === 'post' || e === 'type')
+      const declared = events.map((e, i) => (e.startsWith('expect ') ? i : -1)).filter((i) => i >= 0)
+      expect(raised).toBeGreaterThan(Math.max(...declared))
+    }
+  })
+
+  test.each([
+    ['Check 5', CHECK5_PROMPT_1, 'date > permission-check.txt', 'date > permission-check-2.txt'],
+    ['Check 5 (2)', CHECK5_PROMPT_2, 'date > ~/cscb-live/a/permission-check-2.txt', 'date > permission-check.txt'],
+    ['Check 18', CHECK18_PROMPT, 'date > dm-prompt-c.txt', 'ls'],
+    ['Check 22', CHECK22_PROMPT, 'date +%F > "$(pwd)/dm-prompt-b.txt"', 'date > prompt-b.txt'],
+    ['Check 23 (A)', CHECK23_PROMPT_A, '🤖🛠️ *Write*\n`/home/testuser/cscb-live/a/prompt-a.txt`', "env | grep -i -E 'cscb|slack'"],
+    ['Check 27', CHECK27_PROMPT, 'date > removal-prompt.txt', 'pwd'],
+  ])("%s's declared command matches its own prompt, not a detour", (_what, re, own, detour) => {
+    expect([commandMatches(re, own), commandMatches(re, detour)]).toEqual([true, false])
+  })
+})
+
+describe('Check 23: what it raised is denied when it ends, even on an early return or a throw', () => {
+  function silent23(leftovers: number, container?: [string, Reply]) {
+    const clock = virtualClock()
+    const guard = recordingGuard(leftovers)
+    const answers: [string, Reply][] = [...(container ? [container] : []), ['', (script) => (script === 'mark' ? '1:0' : '')]]
+    const ctx = makeCtx({ mode: 'real', clock, human: scriptedHuman(clock).human, browser: idleBrowser(), container: fakeContainer(answers).container, promptGuard: guard })
+    return { ctx, guard }
+  }
+
+  test("an early return (the prompts did not appear) still has the guard deny what it left open, and the denial is noted", async () => {
+    const { ctx, guard } = silent23(2)
+    const r = await check23.run(ctx)
+    expect([r.status, r.reason]).toEqual(['FAIL', 'both prompts did not appear'])
+    expect(guard.sweeps).toBe(1)
+    expect(r.notes).toEqual(["Check 23: 2 prompt(s) it raised were still open at its end; denied (the prompt guard's notes name them)"])
+  })
+
+  test('with nothing left open, no note', async () => {
+    const { ctx, guard } = silent23(0)
+    const r = await check23.run(ctx)
+    expect([guard.sweeps, r.notes]).toEqual([1, []])
+  })
+
+  test('a throw after the post still has the guard deny what it left open, then ends the check', async () => {
+    const { ctx, guard } = silent23(1, [
+      'cscb.chat_post.attempted',
+      () => {
+        throw new Error('container gone')
+      },
+    ])
+    await expect(check23.run(ctx)).rejects.toThrow('container gone')
+    expect(guard.sweeps).toBe(1)
   })
 })
 

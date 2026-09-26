@@ -10,15 +10,15 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director). Built
   lazily once per host. ~1+ GB. No CSCB source inside. Its agent-director is
   the npm package at the range `package.json` declares and the Go binary of
-  the same version (0.10.0 in `v4`; `v3` had 0.7.8). The build takes the
-  GitHub token for agent-director's private release as a BuildKit secret (see
-  [The base build's GitHub token](#the-base-builds-github-token)); `v3`
-  predates that and holds the token in its image history.
+  the same version (0.10.0 in `v4`). The build takes the GitHub token for
+  agent-director's private release as a BuildKit secret (see
+  [The base build's GitHub token](#the-base-builds-github-token)), so no image
+  history holds it.
 - **`cscb-ci:latest`** (built from `docker/Dockerfile.test`, `FROM cscb-ci-base:v4`)
   — adds `docker/entrypoint.sh`, `tests/`, `testplans/`, the `testuser` account,
   and the `ENTRYPOINT`. Built on every `/ci` run; should complete in under 10 s
   on a warm base.
-- **`cscb-ci-live:latest`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v3`)
+- **`cscb-ci-live:latest`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v4`)
   — the `/ci-live` image (see [/ci-live](#ci-live-the-live-slack-acceptance-run)
   below). It adds Claude Code at a pinned version with auto-update off, the
   agent-director the production host runs (see
@@ -69,13 +69,11 @@ GH_TOKEN="$(gh auth token)" docker build --network=host \
   that message: rerun with `--progress=plain` to see which step failed and why.
 - **Check an image by counts only**, never by printing its history:
   `docker history --no-trunc cscb-ci-base:v4 | grep -c GH_TOKEN=` prints `0`.
-- **`v3` predates the secret.** It was built with a `GH_TOKEN` build-arg, so
-  its image history holds the token's value, and so does every image built on
-  it: `cscb-ci-live:latest` while `docker/Dockerfile.live` names `v3`, and the
-  untagged `cscb-ci` and `cscb-ci-live` builds left over from `v3`. It stays
-  for the branches that still name it. Never push, `docker save` or share a
-  `v3`-based image; once nothing names `v3`, remove it and prune the untagged
-  images built on it.
+- **Earlier tags are retired.** Tags before `v4` took the token as a
+  build-arg, so their image history held its value, as did every image built
+  on them. Nothing names them any more; they are removed from the hosts that
+  had them. Never push, `docker save` or share an image built from a
+  build-arg token.
 
 ## Credential env vars passed to the container
 
@@ -243,8 +241,9 @@ runner lives in `ci-live/` and is not part of the npm package.
    configured).
 9. Packs the working tree (`npm pack --ignore-scripts`), builds
    `cscb-ci-live` and starts the container with its memory and PID caps.
-10. Runs the plan's checks in the plan's order, then Teardown and HOST.
-    Teardown copies each persona's tmux pane, the container's own logs and
+10. Runs the plan's checks in the plan's order, with the prompt guard
+    running from the first to the last (see [The prompt guard](#the-prompt-guard)),
+    then Teardown and HOST. Teardown copies each persona's tmux pane, the container's own logs and
     each persona's Claude transcript tail into the results (see
     [Outputs](#outputs)) before it removes the container.
 11. Writes the results, with the watchdog's peaks, and runs the closing
@@ -446,7 +445,7 @@ sampled. `results.json` has them under
 ### The live image's agent-director
 
 The live image pairs CSCB with the agent-director the host's production bots
-run, not the base image's older one:
+run, whichever one the base image was built with:
 
 - It installs the npm package `agent-director` at the range in
   `package.json`, as a customer's install resolves it.
@@ -704,6 +703,15 @@ secret store refuses any path under the real one.
   The pre-flight, the install, the setup, S2, S3, 29a, Teardown and HOST run
   for real. Every check that needs the workspace reports
   `SKIPPED (no workspace secrets)`.
+- Its `prompt-guard` row proves the prompt guard on the stub: after the plan's
+  checks it plants a prompt from A in `a-home` (the stub's message with Allow
+  and Deny buttons in CSCB's shape) and its `cscb.chat_post.attempted` line in
+  the container's permission trail, posted a minute ago, for a command no
+  check declared that holds a registered fixture value. The row fails unless
+  the guard reads it from the trail, clicks Deny in the fixture client (the
+  stub's message then shows "Denied by operator"), and records one denial of
+  persona_a's unexpected prompt, with the value in the command redacted, in
+  its report and as a run note.
 - Before Teardown it plants fixture logs in the container: a `server.log`
   holding a registered fixture secret and token-shaped text, a rotated
   `server.log.1` ending in an unterminated line that holds the first half of
@@ -763,15 +771,15 @@ as "not yet", not as a FAIL.
 | S2, S3 | Automated, also in a dry run |
 | 1 to 6, 8 to 11, 13 | Automated |
 | 7 | Automated. The crash is a guarded `tmux kill-session` of A's session in the container |
-| 12 | Automated. The stop message ends the exchange without banning later posts. If the personas keep posting after it, the runner stops them in their tmux sessions (Escape, then a message). Once coordination is quiet, the runner lifts the stop the way it was given: in coordination, and in the tmux sessions (no Escape) if it typed there, so A and B still post in coordination in later checks |
+| 12 | Automated. The start message first tells A who it and B are (persona name and key, bot user IDs), so A has no reason to look itself up (in run 6 it ran `env` for that, and nobody expected the prompt). The stop message ends the exchange without banning later posts. If the personas keep posting after it, the runner stops them in their tmux sessions (Escape, then a message). Once coordination is quiet, the runner lifts the stop the way it was given: in coordination, and in the tmux sessions (no Escape) if it typed there, so A and B still post in coordination in later checks |
 | 14, 16, 20 | Need a second workspace account (`second_user` in `live.json`); `SKIPPED (no second account)` without one, and `SKIPPED (second account needs a sign-in code: run login --second)` when Slack asks it for an emailed code (its mail doesn't go to the test mailbox). In Checks 16 and 20 the runner asks A for the reply-tool call at most twice: if A never answers, the check fails; if A answers twice without making the call, Check 16 is `SKIPPED (not run: …)`, as the plan says, and Check 20 fails |
-| 15, 17, 19, 21 to 23 | Automated. "Turn A's DMs on" is a confirmed config edit |
+| 15, 17, 19, 21 to 23 | Automated. "Turn A's DMs on" is a confirmed config edit. Check 23 has the prompt guard deny any prompt it raised that is still open when it ends, even after an early return or a throw |
 | 18 | Automated. C's prompt is started by typing into C's tmux session |
 | 24, with its setup and teardown | Automated |
 | 25 | Automated. D is added by a `config.json` edit, not the wizard, and D's credentials file is moved from `credentials-staged/` into the mounted directory while the server runs |
 | 26 | `SKIPPED (optional)` |
 | 27 | Automated, with step 2's optional prompt |
-| 28 | Automated; the reboot is a container restart (see below) |
+| 28 | Automated; the reboot is a container restart (see below). A persona Slack was unreachable for at the start, up after its bring-up retry and connected within the wait, is a note, not a failure |
 | 29a | Automated. Always runs, also in a dry run and after a blocking failure; adds a host-side scan of the results. It requires a transcript only for each persona this run brought up (A to C in Check 1, D in Check 25) and sent a message to |
 | 29b | `SKIPPED (optional: needs host sudo/iptables)` |
 | Teardown | The personas' tmux panes, the container's own logs and the personas' transcript tails are copied into `container-logs/` (see [Outputs](#outputs)), then the container is removed. The apps and channels stay for the next run |
@@ -812,6 +820,65 @@ then up to 6 more for each persona's `Session connected` line, since a
 persona whose launch waits on a `working` row connects after the summary.
 Then it checks the plan's steps 5 to 8.
 
+Right after the restart, Slack can be unreachable for a persona for a moment
+(run 6: A's Socket Mode open timed out after 10 s and answered 5 s later).
+The start then counts that persona in `not brought up`, logs its
+`persona-slack-unreachable` line and, once Slack answers, its `cleared:` line
+and `persona "<name>" (key=<key>): up after its bring-up retry (Slack) —
+launching`. When each persona the summary counts as not brought up did that
+and then connected within the wait, step 5 accepts the summary's
+`0 failed, <n> not brought up, 0 not reconnected` and those personas'
+Slack-unreachable lines up to their retry, and records each in a note. A
+persona that never came back or never connected, a count that doesn't match,
+any other failure line (a credentials one, a later Slack-unreachable one,
+another persona's) and a directory retry still fail the check. A guarded
+restart elsewhere accepts none of it.
+
+### The prompt guard
+
+A bot Claude sometimes runs a command nobody asked for, and its permission
+prompt then waits for an answer that never comes: in run 6, A ran `env` in
+Check 12 to look itself up, and every later check that needed A failed
+behind that prompt. The prompt guard (`ci-live/checks/prompt-guard.ts`)
+denies the prompts no check expects, so one detour can't cascade:
+
+- **Checks declare their prompts.** Before it posts what raises one, a check
+  declares the persona and the command it expects:
+  Check 5 (`permission-check.txt`, `permission-check-2.txt`), Check 18
+  (`dm-prompt-c.txt`), Check 22 (`dm-prompt-b.txt`), Check 23
+  (`prompt-a.txt`, `prompt-b.txt` and any further prompt of B's, which it
+  denies itself) and Check 27 (`removal-prompt.txt`, left open on purpose:
+  it later clicks it to prove it inert). Each check waits for and clicks
+  only its declared prompt, not a detour's.
+- **Every 10 s** the guard reads the new lines of the container's permission
+  trail and groups the prompt posts by request token (a server restart posts
+  an open prompt again: the latest copy is the one clicked). A decide that
+  succeeded (its `result_class` `ok`, or `ErrAlreadyDecided`), a closing
+  message update or a reconciled closure resolves a prompt. A refused decide
+  (`ErrRelayFallenBack`, `ErrInvalidFlags`, an agent-director outage …) and
+  the message update that shows an `ErrRelayFallenBack` refusal leave it
+  open, so the guard still tries to deny it. A prompt whose relay window has
+  elapsed can only be answered at the persona's tmux pane, so neither of the
+  guard's ways can deny it; its note then says it could not be denied, and
+  why.
+- **An unexpected prompt is denied.** An open prompt that the running check
+  did not declare and that is older than 15 s is denied: Deny clicked on its
+  latest copy, or, when the click fails or no copy reached Slack, a guarded
+  `agent-director decide … --decision deny` in the container. The guard
+  leaves the running check's own declared prompts alone.
+- **A check's leftovers are denied when it ends.** Every prompt that appeared
+  while a check ran and is still open when it ends is denied, however young,
+  except one it leaves open on purpose (Check 27's), which is never denied.
+- **A denial is a note, never a FAIL.** Each is a run note naming the check,
+  the persona and the command (through the redactor), and an entry of
+  `promptGuard` in `results.json` and of the "Prompt guard" section of
+  `results.md`. A prompt is denied once; a denial that failed is noted and
+  not retried.
+
+The guard runs from the first plan check to the last, and stops before
+Teardown. Its clicks go through the same browser page as the checks' own,
+one flow at a time.
+
 ### Outputs
 
 Each run writes to `$TMPDIR/cscb-ci-live-<RUN_ID>-XXXXXX` (`/tmp` when
@@ -821,8 +888,8 @@ mode 600.
 | File | Contents |
 |---|---|
 | `verdict.txt` | One line: `PASS`, `FAIL: <check>: <reason>` (`FAIL: memory watchdog: <reason>` when the watchdog stopped the run) or `NOT RUNNABLE: <reason>` |
-| `results.json` | Every check with its status, reason, evidence, notes and duration, and the memory watchdog's report under `memory`: the sample count, the limits, the peaks and any stop reason |
-| `results.md` | A per-check table with evidence, then one row in the testplan's Results-table format, ready to paste, then the watchdog's peaks under "Memory (the watchdog's peaks)" |
+| `results.json` | Every check with its status, reason, evidence, notes and duration, the prompt guard's report under `promptGuard` (the prompts seen, how many were denied, and each denial's check, persona, command and how), and the memory watchdog's report under `memory`: the sample count, the limits, the peaks and any stop reason |
+| `results.md` | A per-check table with evidence, then one row in the testplan's Results-table format, ready to paste, then the prompt guard's denials under "Prompt guard", then the watchdog's peaks under "Memory (the watchdog's peaks)" |
 | `run.log` | Every progress and detail line, redacted |
 | `container.log` | The container's docker logs, redacted |
 | `container-logs/` | For each persona A–D (`<key>` is `persona_a` … `persona_d`), first `pane-<key>.txt`, its tmux pane when `tmux ls` in the container lists its session `slack_bot_<key>` (`tmux capture-pane -p -J -S -200`: the last 200 lines of its history and its screen; `-J` joins only the lines tmux wrapped at the pane's width, not the ones Claude Code hard-wraps itself, so a pane is also redacted across those, see [Secrets](#secrets)), at most its last 2 MiB. Then the container's own logs, copied out before it is removed or stopped: CSCB's `server.log` with its rotated `server.log.1` …, `startup-errors.log`, `cron.log` and `permission-trail.jsonl`, `boot-start.log` (the output of Check 28's boot start, from `~/cscb-live/`), and agent-director's `errors.log` and `ad-trail.jsonl` (as `agent-director-errors.log` and `agent-director-ad-trail.jsonl`), each at most its last 20 MiB. Then for each persona `transcript-<key>.jsonl`, the last 200 whole lines of its Claude transcript, the newest regular `*.jsonl` directly in `~/.claude/projects/<slug>/` for its working directory `~/cscb-live/<letter>` (the slug as Claude Code derives it, `-home-testuser-cscb-live-a` …; never a symlink or a subagent's transcript), copied whether or not its session is still there, at most its last 2 MiB and redacted as a pane is. A pane and a transcript tail together tell a tool call waiting on an unanswered permission prompt (the prompt on the pane, no tool result in the transcript) from one that ran and never finished. Each copy redacted whole, from its first whole line within its cap, and without an unterminated last line (one still being written when it was read). `index.txt` says of each file whether it was copied, cut, not there (a persona with no tmux session or no transcript included), skipped (a symlink is never followed) or not copied (a pane not captured because tmux didn't answer included), when its unterminated last line was left out, and how many older lines of a transcript were left out |

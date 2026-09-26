@@ -93,6 +93,8 @@ class PlaywrightDriver implements LiveBrowserDriver {
   private crashed = false
   /** The driver is opening its own replacement page (not a popup). */
   private opening = false
+  /** Settles when the last flow started has ended (flows run one at a time). */
+  private flowing: Promise<void> = Promise.resolve()
 
   constructor(
     private readonly o: DriverOptions,
@@ -135,12 +137,27 @@ class PlaywrightDriver implements LiveBrowserDriver {
     await this.page.goto(IDLE_URL, { timeout: IDLE_TIMEOUT_MS }).catch(() => undefined)
   }
 
-  /** Run a flow on the page, then idle the page, whatever the flow's outcome. */
+  /**
+   * Run a flow on the page, then idle the page, whatever the flow's outcome.
+   * Flows run one at a time, in call order: the prompt guard clicks a
+   * prompt's Deny while a check may be running a flow of its own on the
+   * same page.
+   */
   private async flow<T>(work: (page: Page) => Promise<T>): Promise<T> {
+    const previous = this.flowing
+    let done = (): void => {}
+    this.flowing = new Promise<void>((resolve) => {
+      done = resolve
+    })
+    await previous
     try {
       return await work(await this.usablePage())
     } finally {
-      await this.idle()
+      try {
+        await this.idle()
+      } finally {
+        done()
+      }
     }
   }
 

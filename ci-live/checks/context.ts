@@ -12,6 +12,7 @@ import type { WorkspaceIds } from '../lib/live-config.ts'
 import type { PersonaLetter } from '../lib/personas.ts'
 import type { ScanReport } from '../lib/secrecy-scan.ts'
 import type { Clock } from '../lib/wait.ts'
+import type { CheckPromptGuard } from './prompt-guard.ts'
 
 export interface PersonaIds {
   userId: string
@@ -113,6 +114,12 @@ export interface CheckContext {
   browser: BrowserDriver | null
   creds: HostCredentials
   shared: SharedState
+  /**
+   * The run's prompt guard (prompt-guard.ts): a check that raises a
+   * permission prompt declares it here before it posts, and the guard denies
+   * any prompt no running check expects.
+   */
+  promptGuard: CheckPromptGuard
   /** `docker restart` of the test container (Check 28's reboot). */
   restartContainer(): Promise<void>
   /** The host-side token scan over the results dir (Check 29a). */

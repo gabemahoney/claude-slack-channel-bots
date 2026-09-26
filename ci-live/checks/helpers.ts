@@ -24,14 +24,17 @@ export const S = CONTAINER_STATE_DIR
 // Container commands
 // ---------------------------------------------------------------------------
 
+/** What the container commands need of a check's context (the prompt guard has only this much). */
+export type InContainer = Pick<CheckContext, 'container'>
+
 /** Run a helper-loaded script; stdout lines (empty lines dropped). Exit status is ignored. */
-export async function lines(ctx: CheckContext, script: string, timeoutMs?: number): Promise<string[]> {
+export async function lines(ctx: InContainer, script: string, timeoutMs?: number): Promise<string[]> {
   const r = await ctx.container.sh(script, { timeoutMs })
   return r.stdout.split('\n').filter((l) => l.trim() !== '')
 }
 
 /** Run a helper-loaded script; its exit code and output. */
-export async function run(ctx: CheckContext, script: string, timeoutMs?: number): Promise<{ code: number; out: string; err: string }> {
+export async function run(ctx: InContainer, script: string, timeoutMs?: number): Promise<{ code: number; out: string; err: string }> {
   const r = await ctx.container.sh(script, { timeoutMs })
   return { code: r.code, out: r.stdout, err: r.stderr }
 }
@@ -97,21 +100,40 @@ export interface PromptPost {
   ok: boolean
   error: unknown
   slack_ts?: string
+  /** The request the prompt is for (one per request; a restart posts an open one again). */
+  request_token?: string
+  /** When the trail recorded the post (RFC 3339). */
+  ts?: string
+  /** The prompt's text as posted: its section block (the tool and the command), else its `text`. */
+  command?: string | null
 }
 
-/** Permission-prompt posts after trail line `tm` (the plan's `posts`, plus the message ts). */
-export async function promptPosts(ctx: CheckContext, tm: number): Promise<PromptPost[]> {
-  const out = await lines(
-    ctx,
-    `[ -e "$TRAIL" ] && tail -n +"$((${tm} + 1))" "$TRAIL" | jq -c 'select(.event == "cscb.chat_post.attempted") | {claude_instance_id, channel, ok, error, slack_ts}'`,
-  )
+/**
+ * The jq projection of one `cscb.chat_post.attempted` line: the plan's `posts`
+ * fields, the message ts, the request token, when it was posted and the
+ * command text (the prompt guard reads the same projection).
+ */
+export const PROMPT_POST_JQ =
+  '{claude_instance_id, channel, ok, error, slack_ts, request_token, ts, command: (([.blocks[]? | select(.type? == "section") | .text.text? // empty] | first) // .text)}'
+
+/** Parse jq's compact output lines, skipping any that don't parse. */
+export function jsonLines<T>(out: readonly string[]): T[] {
   return out.flatMap((l) => {
     try {
-      return [JSON.parse(l) as PromptPost]
+      return [JSON.parse(l) as T]
     } catch {
       return []
     }
   })
+}
+
+/** Permission-prompt posts after trail line `tm` (the plan's `posts`, plus the message ts, token, time and command). */
+export async function promptPosts(ctx: InContainer, tm: number): Promise<PromptPost[]> {
+  const out = await lines(
+    ctx,
+    `[ -e "$TRAIL" ] && tail -n +"$((${tm} + 1))" "$TRAIL" | jq -cR ${q(`fromjson? | select(type == "object" and .event == "cscb.chat_post.attempted") | ${PROMPT_POST_JQ}`)}`,
+  )
+  return jsonLines<PromptPost>(out)
 }
 
 export interface Row {
@@ -128,7 +150,7 @@ export async function rows(ctx: CheckContext): Promise<Row[]> {
 }
 
 /** Run `script` behind the plan's guard; false (and nothing run) when the guard refuses. */
-export async function guarded(ctx: CheckContext, script: string, timeoutMs?: number): Promise<{ ok: boolean; out: string; err: string; code: number }> {
+export async function guarded(ctx: InContainer, script: string, timeoutMs?: number): Promise<{ ok: boolean; out: string; err: string; code: number }> {
   const r = await run(ctx, `guard || exit 90\n${script}`, timeoutMs)
   return { ok: r.code !== 90, out: r.out, err: r.err, code: r.code }
 }
@@ -180,7 +202,7 @@ export async function pause(ctx: CheckContext, ms: number): Promise<void> {
 // Slack side
 // ---------------------------------------------------------------------------
 
-export function needHuman(ctx: CheckContext): HumanSession {
+export function needHuman(ctx: Pick<CheckContext, 'human'>): HumanSession {
   if (!ctx.human) throw new Error('no human session (workspace not available)')
   return ctx.human
 }
@@ -248,7 +270,7 @@ export function promptState(message: SlackMessage): 'allowed' | 'denied' | 'open
 
 /** Click a prompt's button in the web client, then wait for the message to show the decision. */
 export async function clickPrompt(
-  ctx: CheckContext,
+  ctx: Pick<CheckContext, 'browser' | 'ids' | 'human'>,
   channel: string,
   ts: string,
   button: 'Allow' | 'Deny',
@@ -261,12 +283,29 @@ export async function clickPrompt(
   return f.expect(updated !== null, `the prompt ${ts} did not update to ${button === 'Allow' ? '*Permission* — Allowed' : '*Permission* — Denied by operator'}`)
 }
 
-/** Wait for the persona's next permission-prompt post after trail line `tm`. */
-export async function waitPromptPost(ctx: CheckContext, tm: number, letter: PersonaLetter, timeoutMs: number, nth = 1): Promise<PromptPost[] | null> {
+/** True when a prompt's command text (a trail post's, or a Slack message's) matches `command`. */
+export function commandMatches(command: RegExp, text: string | null | undefined): boolean {
+  command.lastIndex = 0
+  return typeof text === 'string' && command.test(text)
+}
+
+/**
+ * Wait for the persona's next permission-prompt post after trail line `tm`;
+ * with `command`, only its posts whose command text matches it (the prompt
+ * the check declared to the prompt guard, not a detour the guard denies).
+ */
+export async function waitPromptPost(
+  ctx: CheckContext,
+  tm: number,
+  letter: PersonaLetter,
+  timeoutMs: number,
+  nth = 1,
+  command?: RegExp,
+): Promise<PromptPost[] | null> {
   const id = `cscb_${personaName(letter)}`
   return waitFor(
     async () => {
-      const posts = (await promptPosts(ctx, tm)).filter((p) => p.claude_instance_id === id)
+      const posts = (await promptPosts(ctx, tm)).filter((p) => p.claude_instance_id === id && (command === undefined || commandMatches(command, p.command)))
       return posts.length >= nth ? posts : null
     },
     { timeoutMs, intervalMs: POLL_MS, clock: ctx.clock },
@@ -394,8 +433,65 @@ export async function waitBringUp(ctx: CheckContext, m: string, letters: readonl
   return ok === true
 }
 
+/**
+ * A persona the start did not bring up that came up through its bring-up
+ * retry: it logged `[slack] persona "<name>" (key=<key>): up after its
+ * bring-up retry (<via>) — launching` (src/persona-bringup-controller.ts)
+ * and, after that, its Session connected line.
+ */
+export interface RetriedBringUp {
+  letter: PersonaLetter
+  /** What the retry waited on: `Slack` or `directory`. */
+  via: string
+  /** Where the up-after-retry line is in the start's lines. */
+  upAt: number
+}
+
+/** The personas among `letters` that came up after their bring-up retry and then connected, in `log` (a start's lines, in order). */
+export function retriedBringUps(log: readonly string[], letters: readonly PersonaLetter[]): RetriedBringUp[] {
+  return letters.flatMap((letter) => {
+    const n = personaName(letter)
+    const up = `[slack] persona "${n}" (key=${n}): up after its bring-up retry (`
+    const upAt = log.findIndex((l) => l.includes(up) && l.trimEnd().endsWith(') — launching'))
+    if (upAt < 0) return []
+    const via = /up after its bring-up retry \(([^)]*)\) — launching/.exec(log[upAt] ?? '')?.[1] ?? ''
+    const connected = log.slice(upAt + 1).some((l) => l.includes(`[slack] Session connected: persona "${n}" (key=${n})`))
+    return connected ? [{ letter, via, upAt }] : []
+  })
+}
+
+/**
+ * The failure-line class a retry of `via` clears, for the ones accepted as a
+ * transient: Slack unreachable for a `Slack` retry (run 6's reboot). None for
+ * another retry (a working directory missing after a reboot is no transient),
+ * and never a credentials class.
+ */
+export function retryFailureClass(via: string): RegExp | null {
+  return via === 'Slack' ? /\] persona-slack-unreachable: / : null
+}
+
+/** Options of `checkStartLines`. */
+export interface StartLineOptions {
+  /**
+   * Accept a persona the start did not bring up when it then came up through
+   * its bring-up retry and connected (`retriedBringUps`; Check 28's reboot,
+   * where Slack can be unreachable for a moment): the summary may count each
+   * in `not brought up`, and that persona's failure lines of its retry's
+   * class, up to its up-after-retry line, are no finding. Each is a note that
+   * starts with this label.
+   */
+  acceptRetried?: string
+}
+
 /** Assert the plan's Part 2.3 expected items on a start's lines since `m`. */
-export async function checkStartLines(ctx: CheckContext, f: Findings, m: string, letters: readonly PersonaLetter[], fromRecord: boolean): Promise<void> {
+export async function checkStartLines(
+  ctx: CheckContext,
+  f: Findings,
+  m: string,
+  letters: readonly PersonaLetter[],
+  fromRecord: boolean,
+  options: StartLineOptions = {},
+): Promise<void> {
   const all = await since(ctx, m)
   const has = (s: string) => all.filter((l) => l.includes(s))
   if (fromRecord) {
@@ -409,12 +505,31 @@ export async function checkStartLines(ctx: CheckContext, f: Findings, m: string,
   })
   const complete = has(`[slack] startupSessionManager: complete — ${letters.length} persona(s):`)
   f.expect(complete.length === 1, `expected one startupSessionManager complete line for ${letters.length} personas, found ${complete.length}`)
-  if (complete[0]) {
-    f.add(complete[0])
-    // The leading space keeps "10 failed, …" from passing as "0 failed, …".
-    f.expect(complete[0].trimEnd().endsWith(` ${START_SUMMARY_END}`), `the start summary does not end "${START_SUMMARY_END}"`)
+  const summary = complete[0]?.trimEnd()
+  // The leading space keeps "10 failed, …" from passing as "0 failed, …".
+  const endsWith = (ending: string) => summary !== undefined && summary.endsWith(` ${ending}`)
+  // A retried persona is accepted only when the summary counts exactly the retried ones as not brought up.
+  const retried = options.acceptRetried === undefined ? [] : retriedBringUps(all, letters).filter((r) => retryFailureClass(r.via) !== null)
+  const acceptRetried = retried.length > 0 && endsWith(`0 failed, ${retried.length} not brought up, 0 not reconnected`)
+  // Then their own failure lines of their retry's class, up to the retry, are the transient it recovered from.
+  const accepted = new Set<number>()
+  if (acceptRetried) {
+    for (const r of retried) {
+      const n = personaName(r.letter)
+      const cls = retryFailureClass(r.via) as RegExp
+      all.forEach((l, i) => {
+        if (i < r.upAt && cls.test(l) && l.includes(` "${n}" (key=${n})`)) accepted.add(i)
+      })
+      const cause = all.find((l, i) => accepted.has(i) && l.includes(` "${n}" (key=${n})`) && !l.includes(': cleared: '))
+      const why = cause ? ` (${cause.replace(/^.*?\] (persona-[a-z-]+): .*?: /, '$1: ')})` : ''
+      f.note(`${options.acceptRetried}: ${n} was not brought up at the start${why}, then was up after its bring-up retry (${r.via}) and connected: a transient the server recovered from, accepted`)
+    }
   }
-  const failures = all.filter((l) => new RegExp(START_FAILURE_RE).test(l))
+  if (summary !== undefined) {
+    f.add(complete[0] as string)
+    f.expect(acceptRetried || endsWith(START_SUMMARY_END), `the start summary does not end "${START_SUMMARY_END}"`)
+  }
+  const failures = all.filter((l, i) => new RegExp(START_FAILURE_RE).test(l) && !accepted.has(i))
   f.expect(failures.length === 0, `start failure lines: ${failures.slice(0, 3).join(' / ')}`)
 }
 

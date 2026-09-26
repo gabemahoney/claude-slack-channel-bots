@@ -64,10 +64,11 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, write
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
-import type { CheckContext, HostCredentials, SecondUser } from './checks/context.ts'
+import type { CheckContext, HostCredentials, LiveIds, SecondUser } from './checks/context.ts'
 import { DRY_RUN_IDS, liveIdsFrom } from './checks/context.ts'
-import { fail, pass, runChecks, verdictOf, type Need, type RecordedResult } from './checks/framework.ts'
+import { fail, pass, runChecks, verdictOf, type CheckRef, type Need, type RecordedResult } from './checks/framework.ts'
 import { FINAL_CHECKS, PLAN_CHECKS } from './checks/list.ts'
+import { containerPromptGuardDeps, PromptGuard, type PromptGuardTarget } from './checks/prompt-guard.ts'
 import { personaEntry } from './lib/apps-state.ts'
 import { parseArgs, UsageError, USAGE, type RunOptions } from './lib/args.ts'
 import type { BrowserDriver, BrowserStats } from './lib/browser-types.ts'
@@ -857,6 +858,100 @@ function dryRunContainerLogsCheck(env: RunEnv, seed: ContainerLogsSeed | string,
   }
 }
 
+/**
+ * Dry run only: the prompt guard's target, its clicks going to the stub (the
+ * fixture client, signed in by provisioning) and its waits reading the stub's
+ * human API. Without them (a sign-in that failed) the guard has no browser,
+ * and the self-test fails.
+ */
+async function dryRunGuardTarget(env: RunEnv, ws: Workspace, tc: ContainerExec, ids: LiveIds): Promise<PromptGuardTarget> {
+  try {
+    const browser = await ws.browser()
+    return { container: tc, clock: realClock, ids, browser, human: new HumanSession(await browser.humanApi(), realClock) }
+  } catch (err) {
+    env.log.error(`dry run: the prompt guard gets no browser: ${describeError(err)}`)
+    return { container: tc, clock: realClock, ids, browser: null, human: null }
+  }
+}
+
+/** The dry run's prompt: A's, for a command no check expects, as CSCB's section block shows it. */
+function dryPromptSection(command: string): string {
+  return `🤖🛠️ *Bash*\n\`${command}\``
+}
+
+/**
+ * Dry run only, after the plan's checks: the prompt guard denies a prompt no
+ * check expects. A fixture prompt from A in a-home (the stub's message with
+ * Allow and Deny buttons in CSCB's shape) and its `cscb.chat_post.attempted`
+ * line in the container's permission trail, posted a minute ago (past the
+ * grace), its command holding a registered fixture value. One read of the
+ * guard must click Deny on it in the fixture client (the stub's message then
+ * shows "Denied by operator"), and record one denial of persona_a's
+ * unexpected prompt, with the command redacted, in its report and as a run
+ * note.
+ */
+async function dryRunPromptGuardSelfTest(env: RunEnv, ws: Workspace, tc: ContainerExec, ids: LiveIds, guard: PromptGuard, runNotes: readonly string[]): Promise<RecordedResult> {
+  const t0 = Date.now()
+  const title = 'Dry run: the prompt guard denies a prompt no check expects (Deny clicked on the stub; a run note and the promptGuard report, the command redacted)'
+  try {
+    const stub = ws.stub
+    if (!stub) throw new Error('no stub')
+    const secret = `dry-run-prompt-secret-${randomUUID()}`
+    env.redactor.addSecret(secret)
+    const command = `env | grep -i -E 'cscb|slack' # ${secret}`
+    const token = randomUUID()
+    const channel = ids.aHome
+    const ts = stub.workspace.addPrompt(channel, ids.bots.a.userId, 'cscb_persona_a', token)
+    const line = {
+      ts: new Date(Date.now() - 60_000).toISOString(),
+      event: 'cscb.chat_post.attempted',
+      claude_instance_id: 'cscb_persona_a',
+      request_token: token,
+      channel,
+      text: '🤖🛠️ permission request: Bash',
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: dryPromptSection(command) } },
+        { type: 'actions', elements: [] },
+      ],
+      ok: true,
+      slack_ts: ts,
+    }
+    // The guard's own loop may read the line first: a note from then on counts.
+    const notesBefore = runNotes.length
+    await tc.writeFile(`${CONTAINER_STATE_DIR}/permission-trail.jsonl`, `${JSON.stringify(line)}\n`, '600')
+    await guard.tick()
+    const denied = stub.workspace.channels.get(channel)?.messages.find((m) => m.ts === ts)?.text === '*Permission* — Denied by operator'
+    if (!denied) throw new Error('the stub prompt was not denied (its message does not show "Denied by operator")')
+    const report = guard.report()
+    const entries = report.entries.filter((e) => e.persona === 'persona_a' && e.why === 'unexpected')
+    const entry = entries[0]
+    if (report.denied !== 1 || entries.length !== 1 || entry?.how !== 'Deny clicked') {
+      throw new Error(`the report does not hold one denial of persona_a's unexpected prompt by a Deny click (denied ${report.denied})`)
+    }
+    const redacted = (text: string): boolean => text.includes(REDACTED_SECRET) && !text.includes(secret)
+    if (!entry.command.startsWith("Bash: env | grep -i -E 'cscb|slack' # ") || !redacted(entry.command)) {
+      throw new Error("the report's command is not the prompt's, with the registered value redacted")
+    }
+    const notes = runNotes.slice(notesBefore).filter((n) => n.startsWith("prompt guard: denied persona_a's unexpected prompt"))
+    if (notes.length !== 1 || !redacted(notes[0] as string) || !(notes[0] as string).endsWith('; Deny clicked')) {
+      throw new Error('no single run note of the denial, with the command redacted')
+    }
+    return {
+      id: 'prompt-guard',
+      title,
+      row: null,
+      durationMs: Date.now() - t0,
+      ...pass([
+        `a stub prompt from persona_a in ${channel} (${ts}) and its trail line, posted a minute ago, for a command no check declared`,
+        `the guard read it from the container's permission trail and clicked Deny in the fixture client: the stub message shows "Denied by operator"`,
+        `report: ${report.seen} seen, ${report.denied} denied (${entry.check}, ${entry.persona}, ${entry.why}: ${entry.command}); one run note, the registered value in the command redacted`,
+      ]),
+    }
+  } catch (err) {
+    return runnerRow('prompt-guard', title, `dry-run prompt guard self-test: ${describeError(err)}`, t0)
+  }
+}
+
 async function runProvisionOnly(env: RunEnv, signals: SignalControl): Promise<number> {
   const ws = openWorkspace({ repoRoot: REPO_ROOT, runId: env.runId, redactor: env.redactor, log: env.log }, env.options.dryRun ? 'dry-run' : 'real')
   const watchdog = startWatchdog(env, signals, { container: async () => null, browserStats: () => ws.browserStats() })
@@ -1091,6 +1186,8 @@ interface RunState {
   watchdog: MemoryWatchdog | null
   /** The copy of the container's own logs: sealed when the results are written, so the scan sees every copy. */
   containerLogs: ContainerLogCollector | null
+  /** The run's prompt guard (from the first plan check to the last): its report goes into the results. */
+  promptGuard: PromptGuard | null
 }
 
 function runnerRow(id: string, title: string, reason: string, t0: number): RecordedResult {
@@ -1121,7 +1218,17 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
   const dry = env.options.dryRun
   const mode = dry ? 'dry-run' : 'real'
   const container = new ContainerRun(bunSpawn, env.log, env.runId, REPO_ROOT)
-  const state: RunState = { results: [], runNotes: [], packed: null, hostName: container.name, containerLog: '', finished: false, watchdog: null, containerLogs: null }
+  const state: RunState = {
+    results: [],
+    runNotes: [],
+    packed: null,
+    hostName: container.name,
+    containerLog: '',
+    finished: false,
+    watchdog: null,
+    containerLogs: null,
+    promptGuard: null,
+  }
   const record = (r: RecordedResult): void => {
     state.results.push(r)
   }
@@ -1164,6 +1271,8 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
     (cleaning ??= (async () => {
       // Settles once a sample in flight has written its line: awaited before the results are written.
       const watchdogStopped = watchdog.stop()
+      // No more reads or denials: the container and the browser are going.
+      state.promptGuard?.halt()
       try {
         // The memory watchdog's stop closes Chrome at once, alongside the logs' copy and the container's removal, never after them.
         const chromeClosed = cause?.memory === true ? closeChrome() : Promise.resolve()
@@ -1274,6 +1383,14 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
     if (ready && started) {
       const tc = started
       const available = new Set<Need>(dry ? [] : ['workspace', 'claude', ...(sessions?.second ? (['second-user'] as const) : [])])
+      // The prompt guard, from the first plan check to the last: it denies the prompts no check expects. A dry run's clicks go to the stub.
+      const guardTarget: PromptGuardTarget = dry
+        ? await dryRunGuardTarget(env, ws, tc, ids)
+        : { container: tc, clock: realClock, ids, browser: sessions?.browser ?? null, human: sessions?.human ?? null }
+      const promptGuard = new PromptGuard(
+        containerPromptGuardDeps(guardTarget, { redact: (text) => env.redactor.redact(text), log: (line) => env.log.info(line), note: (line) => state.runNotes.push(line) }),
+      )
+      state.promptGuard = promptGuard
       const ctx: CheckContext = {
         mode,
         runId: env.runId,
@@ -1288,6 +1405,7 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
         browser: sessions?.browser ?? null,
         creds: hostCredentials(ws),
         shared: {},
+        promptGuard,
         restartContainer: () => container.restart(),
         hostScan: () => scanOutputs([env.resultsDir], [], env.redactor.knownSecrets()),
         hostBefore,
@@ -1305,7 +1423,13 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
       }
       const needReasons = sessions?.secondSkip ? { 'second-user': sessions.secondSkip } : undefined
       const options = { available, now: () => Date.now(), log: env.log, onResult: record, needReasons }
-      await runChecks(PLAN_CHECKS, ctx, { ...options, only: env.options.only })
+      // The guard knows which check runs, and sweeps what each left open when it ends.
+      const guardHooks = { beforeCheck: (c: CheckRef) => promptGuard.beforeCheck(c.id), afterCheck: (c: CheckRef) => promptGuard.afterCheck(c.id) }
+      promptGuard.start()
+      await runChecks(PLAN_CHECKS, ctx, { ...options, ...guardHooks, only: env.options.only })
+      // Dry run only: the guard denies a stub prompt no check expects (before the fixture logs replace the trail).
+      if (dry) record(await dryRunPromptGuardSelfTest(env, ws, tc, ids, promptGuard, state.runNotes))
+      await promptGuard.stop()
       // Dry run only: logs for Teardown's copy to prove itself on, planted after S2 and 29a have read the state dir.
       const t0Logs = Date.now()
       const logsSeed = dry ? await seedDryRunContainerLogs(tc, env.redactor).catch((err: unknown) => `planting the container's logs failed: ${describeError(err)}`) : null
@@ -1368,6 +1492,7 @@ function finish(env: RunEnv, ws: Workspace, state: RunState, interruption = fals
     verdict: verdictOf(results),
     results,
     notes: runNotes,
+    promptGuard: state.promptGuard?.report(),
     memory,
   }
   const writer = { write: (name: string, content: string) => writeFileSync(join(env.resultsDir, name), content, { mode: 0o600 }) }

@@ -29,7 +29,7 @@ exception is `hgx`, which takes a value only as an argument (see
     created on the current VM through mail.tm's API, and its address is also
     in `/tmp/cscb-test-mailbox-address.txt`.
 - On the VM: docker, the `/ci` base image (if
-  `docker image inspect cscb-ci-base:v3` fails, run `/ci` once), Google
+  `docker image inspect cscb-ci-base:v4` fails, run `/ci` once), Google
   Chrome (`google-chrome --version`), bun, and agent-director
   (`agent-director version`). The live image pairs CSCB with this host's
   agent-director binary, so its version must be the one that `package.json`'s
@@ -246,8 +246,9 @@ bun ci-live/run.ts --dry-run
 ```
 
 It reads no secret, needs no Claude credentials, takes about a minute (a few
-when the image is rebuilt) and must end with `VERDICT: PASS`. It has a lock of
-its own, so it can run beside a real run.
+when the image is rebuilt) and must end with `VERDICT: PASS`. Among its rows,
+`prompt-guard` shows the prompt guard denying a fixture prompt no check
+expects. It has a lock of its own, so it can run beside a real run.
 
 ## 6. Run
 
@@ -322,6 +323,15 @@ While a run is going:
 - **Leave the production install alone.** The HOST check fails on any change
   to the host's CSCB (its config, its tmux sessions, its agent-director rows,
   its port 3100), including one you make.
+- **Prompts no check expects.** When a bot Claude runs a command no check
+  asked for, the runner's prompt guard denies its permission prompt after
+  15 s, so the persona isn't left blocked for the rest of the run: it clicks
+  Deny in Slack, or, when that fails, denies the request through
+  agent-director in the container. A prompt a check leaves open when it ends
+  is denied too, except Check 27's, left open on purpose. Each denial is a
+  note in the results row and a line under "Prompt guard" in `results.md`,
+  never a failure. `docker/README.md` under "The prompt guard" has the
+  details.
 
 A provisioning stage that meets a transient Slack failure (a timeout, a 5xx,
 a rate limit) stops with "transient: rerun later" and replaces no working

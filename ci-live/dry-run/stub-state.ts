@@ -575,14 +575,14 @@ export class StubWorkspace {
 
   /**
    * A fixture prompt message with Allow/Deny buttons, their action ids in
-   * CSCB's shape (`perm_<decision>_<instance>_<uuid>`), for the dry run's
-   * click self-test.
+   * CSCB's shape (`perm_<decision>_<instance>_<token>`), for the dry run's
+   * click self-test and its prompt guard self-test (which names the token its
+   * trail line gives).
    */
-  addPrompt(channelId: string, fromUser: string, instanceId = 'cscb_persona_a'): string {
+  addPrompt(channelId: string, fromUser: string, instanceId = 'cscb_persona_a', token: string = randomUUID()): string {
     const channel = this.channels.get(channelId)
     if (!channel) throw new Error('no such stub channel')
     const ts = this.nextTs()
-    const token = randomUUID()
     const button = (text: string, decision: string) => ({ type: 'button', text: { type: 'plain_text', text }, action_id: `perm_${decision}_${instanceId}_${token}` })
     channel.messages.push({
       ts,

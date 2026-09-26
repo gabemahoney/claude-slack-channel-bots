@@ -34,6 +34,8 @@ import {
   pause,
   personaPostsAfter,
   previewHeader,
+  promptPosts,
+  type PromptPost,
   promptState,
   q,
   recorded,
@@ -346,6 +348,14 @@ export const check17: CheckDef<CheckContext> = {
   },
 }
 
+/** The prompts Checks 18, 22 and 23 raise, as declared to the prompt guard (each names its file). */
+export const CHECK18_PROMPT = /dm-prompt-c\.txt/
+export const CHECK22_PROMPT = /dm-prompt-b\.txt/
+export const CHECK23_PROMPT_A = /prompt-a\.txt/
+export const CHECK23_PROMPT_B = /prompt-b\.txt/
+/** B's further prompts for Check 23's task, whatever they run: the check denies them itself. */
+export const CHECK23_B_EXTRA = /[\s\S]*/
+
 export const check18: CheckDef<CheckContext> = {
   id: '18',
   title: "Check 18: C's first prompt opens the DM with its contact (AC 44)",
@@ -361,6 +371,7 @@ export const check18: CheckDef<CheckContext> = {
     else if (before === true) kind = 'rerun'
     else kind = 'not verified'
     f.note(`Check 18: ${kind}`)
+    ctx.promptGuard.expect({ persona: 'c', command: CHECK18_PROMPT })
     const m = await mark(ctx)
     const tm = await tmark(ctx)
     const typed = await guarded(
@@ -368,7 +379,7 @@ export const check18: CheckDef<CheckContext> = {
       `tmux send-keys -t slack_bot_persona_c -l ${q('Run a shell command that writes the current date to a file named dm-prompt-c.txt in your working directory. Do not post anything to Slack.')} && sleep 1 && tmux send-keys -t slack_bot_persona_c Enter`,
     )
     if (!f.expect(typed.ok && typed.code === 0, "could not type into C's session")) return f.result()
-    const posts = await waitPromptPost(ctx, tm, 'c', 3 * MINUTE)
+    const posts = await waitPromptPost(ctx, tm, 'c', 3 * MINUTE, 1, CHECK18_PROMPT)
     if (!f.expect(posts !== null, 'C posted no permission prompt')) return f.result()
     const post = posts![0]!
     f.add(`C prompt post: channel ${post.channel} ts ${post.slack_ts ?? '?'}`)
@@ -518,13 +529,14 @@ export const check22: CheckDef<CheckContext> = {
   async run(ctx) {
     const f = new Findings()
     const bDm = await dmWith(ctx, 'b')
+    ctx.promptGuard.expect({ persona: 'b', command: CHECK22_PROMPT })
     const m = await mark(ctx)
     const tm = await tmark(ctx)
     const t = await needHuman(ctx).post(
       ctx.ids.coordination,
       `${mention(ctx, 'b')} run a shell command that writes the current date to a file named dm-prompt-b.txt in your working directory.`,
     )
-    const posts = await waitPromptPost(ctx, tm, 'b', 2 * MINUTE)
+    const posts = await waitPromptPost(ctx, tm, 'b', 2 * MINUTE, 1, CHECK22_PROMPT)
     if (!f.expect(posts !== null, 'B posted no permission prompt')) return f.result()
     const post = posts![0]!
     f.add(`B prompt: ${post.channel} ${post.slack_ts ?? '?'}`)
@@ -548,50 +560,71 @@ export const check23: CheckDef<CheckContext> = {
   row: '23',
   async run(ctx) {
     const f = new Findings()
-    const ids = ctx.ids
-    const bDm = await dmWith(ctx, 'b')
-    const tm = await tmark(ctx)
-    await needHuman(ctx).post(
-      ids.coordination,
-      `${mention(ctx, 'a')} ${mention(ctx, 'b')} each of you, run a shell command that writes the current date to a file in your working directory: A names it prompt-a.txt, B names it prompt-b.txt.`,
-    )
-    const a = await waitPromptPost(ctx, tm, 'a', 3 * MINUTE)
-    const b = await waitPromptPost(ctx, tm, 'b', 3 * MINUTE)
-    if (!f.expect(a !== null && b !== null, 'both prompts did not appear')) return f.result()
-    const pa = a![0]!
-    const pb = b![0]!
-    f.add(`A prompt ${pa.channel} ${pa.slack_ts ?? '?'}; B prompt ${pb.channel} ${pb.slack_ts ?? '?'}`)
-    f.expect(pa.channel === ids.aHome && pa.ok === true, "A's first prompt post is not ok in A-home")
-    f.expect(pb.channel === bDm && pb.ok === true, "B's first prompt post is not ok in the DM with B")
-    const aMsg = await promptMessage(ctx, ids.aHome, pa.slack_ts)
-    const bMsg = await promptMessage(ctx, bDm, pb.slack_ts)
-    f.expect(aMsg !== null && isFrom(aMsg, bot(ctx, 'a')), "A's prompt is not A's message in A-home")
-    f.expect(bMsg !== null && isFrom(bMsg, bot(ctx, 'b')), "B's prompt is not B's message in the DM")
-    const since0 = String(Math.floor(ctx.clock.now() / 1000) - 300) + '.000000'
-    f.expect((await personaPostsAfter(ctx, ids.aHome, since0)).filter((x) => isFrom(x, bot(ctx, 'b')) && isPrompt(x)).length === 0, 'A-home holds a prompt from B')
-    f.expect((await personaPostsAfter(ctx, bDm, since0)).filter((x) => isFrom(x, bot(ctx, 'a'))).length === 0, 'the DM with B holds a message from A')
-    f.expect((await personaPostsAfter(ctx, ids.coordination, since0)).filter(isPrompt).length === 0, 'a prompt was posted in coordination')
-    if (pb.slack_ts) await clickPrompt(ctx, bDm, pb.slack_ts, 'Deny', f)
-    const aStill = await promptMessage(ctx, ids.aHome, pa.slack_ts)
-    f.expect(aStill !== null && promptState(aStill) === 'open', "A's prompt changed when B's was denied")
-    // Deny any further prompt B raises for this task (up to a minute).
-    const deadline = ctx.clock.now() + MINUTE
-    let seen = b!.length
-    while (ctx.clock.now() < deadline) {
-      const more = (await waitPromptPost(ctx, tm, 'b', 10 * SECOND, seen + 1)) ?? []
-      for (const extra of more.slice(seen)) {
-        if (extra.slack_ts) await clickPrompt(ctx, extra.channel, extra.slack_ts, 'Deny', f)
-        f.note('Check 23: B raised another prompt; denied')
-      }
-      seen = Math.max(seen, more.length)
+    try {
+      await check23Steps(ctx, f)
+    } finally {
+      // A prompt it raised and left open (an early return, a throw) would block its persona for the rest of the run (run 6: B's).
+      const denied = await ctx.promptGuard.denyLeftovers()
+      if (denied > 0) f.note(`Check 23: ${denied} prompt(s) it raised were still open at its end; denied (the prompt guard's notes name them)`)
     }
-    if (pa.slack_ts) await clickPrompt(ctx, ids.aHome, pa.slack_ts, 'Allow', f)
-    const bStill = await promptMessage(ctx, bDm, pb.slack_ts)
-    f.expect(bStill !== null && promptState(bStill) === 'denied', "B's prompt is no longer Denied by operator")
-    f.expect(await waitFile(ctx, '~/cscb-live/a/prompt-a.txt', REPLY_TIMEOUT_MS), 'prompt-a.txt does not exist')
-    f.expect(!(await fileExists(ctx, '~/cscb-live/b/prompt-b.txt')), 'prompt-b.txt exists')
     return f.result()
   },
+}
+
+/** A prompt post's request (its token; a restart posts it again), or its message when the trail has no token. */
+function promptKey(p: PromptPost): string {
+  return p.request_token ?? `${p.channel} ${p.slack_ts ?? ''}`
+}
+
+/** Check 23's steps, which return early when a prompt did not appear; the check's `finally` denies what they left open. */
+async function check23Steps(ctx: CheckContext, f: Findings): Promise<void> {
+  const ids = ctx.ids
+  const bDm = await dmWith(ctx, 'b')
+  ctx.promptGuard.expect({ persona: 'a', command: CHECK23_PROMPT_A })
+  ctx.promptGuard.expect({ persona: 'b', command: CHECK23_PROMPT_B })
+  ctx.promptGuard.expect({ persona: 'b', command: CHECK23_B_EXTRA })
+  const tm = await tmark(ctx)
+  await needHuman(ctx).post(
+    ids.coordination,
+    `${mention(ctx, 'a')} ${mention(ctx, 'b')} each of you, run a shell command that writes the current date to a file in your working directory: A names it prompt-a.txt, B names it prompt-b.txt.`,
+  )
+  const a = await waitPromptPost(ctx, tm, 'a', 3 * MINUTE, 1, CHECK23_PROMPT_A)
+  const b = await waitPromptPost(ctx, tm, 'b', 3 * MINUTE, 1, CHECK23_PROMPT_B)
+  if (!f.expect(a !== null && b !== null, 'both prompts did not appear')) return
+  const pa = a![0]!
+  const pb = b![0]!
+  f.add(`A prompt ${pa.channel} ${pa.slack_ts ?? '?'}; B prompt ${pb.channel} ${pb.slack_ts ?? '?'}`)
+  f.expect(pa.channel === ids.aHome && pa.ok === true, "A's first prompt post is not ok in A-home")
+  f.expect(pb.channel === bDm && pb.ok === true, "B's first prompt post is not ok in the DM with B")
+  const aMsg = await promptMessage(ctx, ids.aHome, pa.slack_ts)
+  const bMsg = await promptMessage(ctx, bDm, pb.slack_ts)
+  f.expect(aMsg !== null && isFrom(aMsg, bot(ctx, 'a')), "A's prompt is not A's message in A-home")
+  f.expect(bMsg !== null && isFrom(bMsg, bot(ctx, 'b')), "B's prompt is not B's message in the DM")
+  const since0 = String(Math.floor(ctx.clock.now() / 1000) - 300) + '.000000'
+  f.expect((await personaPostsAfter(ctx, ids.aHome, since0)).filter((x) => isFrom(x, bot(ctx, 'b')) && isPrompt(x)).length === 0, 'A-home holds a prompt from B')
+  f.expect((await personaPostsAfter(ctx, bDm, since0)).filter((x) => isFrom(x, bot(ctx, 'a'))).length === 0, 'the DM with B holds a message from A')
+  f.expect((await personaPostsAfter(ctx, ids.coordination, since0)).filter(isPrompt).length === 0, 'a prompt was posted in coordination')
+  if (pb.slack_ts) await clickPrompt(ctx, bDm, pb.slack_ts, 'Deny', f)
+  const aStill = await promptMessage(ctx, ids.aHome, pa.slack_ts)
+  f.expect(aStill !== null && promptState(aStill) === 'open', "A's prompt changed when B's was denied")
+  // Deny any further prompt B raises for this task (up to a minute), each request once (a restart posts one again).
+  const done = new Set<string>([promptKey(pb)])
+  const deadline = ctx.clock.now() + MINUTE
+  while (ctx.clock.now() < deadline) {
+    await pause(ctx, 10 * SECOND)
+    for (const extra of (await promptPosts(ctx, tm)).filter((p) => p.claude_instance_id === 'cscb_persona_b' && p.ok === true)) {
+      const key = promptKey(extra)
+      if (done.has(key) || !extra.slack_ts) continue
+      done.add(key)
+      await clickPrompt(ctx, extra.channel, extra.slack_ts, 'Deny', f)
+      f.note('Check 23: B raised another prompt; denied')
+    }
+  }
+  if (pa.slack_ts) await clickPrompt(ctx, ids.aHome, pa.slack_ts, 'Allow', f)
+  const bStill = await promptMessage(ctx, bDm, pb.slack_ts)
+  f.expect(bStill !== null && promptState(bStill) === 'denied', "B's prompt is no longer Denied by operator")
+  f.expect(await waitFile(ctx, '~/cscb-live/a/prompt-a.txt', REPLY_TIMEOUT_MS), 'prompt-a.txt does not exist')
+  f.expect(!(await fileExists(ctx, '~/cscb-live/b/prompt-b.txt')), 'prompt-b.txt exists')
 }
 
 export const DM_CHECKS = [check14, check15, check16, aDmsOn, check17, check18, check19, check20, check21, check22, check23]

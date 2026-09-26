@@ -15,8 +15,10 @@
  * a value past ASCII in a file as the latin1 read shows it. A terminal's
  * text (`redactWrapped`, for a tmux pane Claude Code hard-wraps) also loses
  * every 10-character fragment of a registered form and every piece of a
- * value or token split across rows. Every secret here is a sentinel-bearing
- * fake built at runtime; captured output is checked with `assertNoLeak`.
+ * value or token split across rows. The results' own sections (the prompt
+ * guard's denials, the memory watchdog's peaks) are redacted like the rest.
+ * Every secret here is a sentinel-bearing fake built at runtime; captured
+ * output is checked with `assertNoLeak`.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -39,7 +41,7 @@ import {
   REDACTED_TOKEN,
   secretForms,
 } from '../ci-live/lib/redact.ts'
-import { redactDeep, RESULTS_COLUMNS, renderResultsRow, writeResults, type RunSummary } from '../ci-live/lib/results.ts'
+import { redactDeep, renderPromptGuard, RESULTS_COLUMNS, renderResultsRow, writeResults, type RunSummary } from '../ci-live/lib/results.ts'
 import { describeScan, latin1Spellings, nodeScanFs, scanOutputs, type ScanFs } from '../ci-live/lib/secrecy-scan.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, writtenFile } from './test-helpers/credentials.ts'
 
@@ -460,6 +462,56 @@ describe('writeResults', () => {
     const without: Record<string, string> = {}
     writeResults(summary({}), { write: (name, content) => (without[name] = content) }, redactorWith(PASSWORD))
     expect([without['results.md']!.includes('## Memory'), 'memory' in JSON.parse(without['results.json']!)]).toEqual([false, false])
+    assertNoLeak(written)
+  })
+
+  test("the prompt guard's report, when the run had one, goes into results.json and a section of results.md before the memory's, redacted", () => {
+    const s = summary({
+      promptGuard: {
+        seen: 3,
+        denied: 1,
+        notDenied: 1,
+        entries: [
+          { check: 'check 12', persona: 'persona_a', command: `Bash: env | grep ${PASSWORD}`, why: 'unexpected', how: 'Deny clicked' },
+          { check: 'check 23', persona: 'persona_b', command: 'Bash: date > prompt-b.txt', why: 'left open', how: 'not denied' },
+        ],
+      },
+      memory: {
+        intervalMs: 30_000,
+        samples: 1,
+        failedSamples: 0,
+        thresholds: { hostWorkingSetBytes: 40, chromePssBytes: 4 },
+        hostMaxBytes: null,
+        peaks: {},
+        abort: null,
+        lines: ['1 sample every 30 s'],
+      },
+    })
+    const written: Record<string, string> = {}
+    writeResults(s, { write: (name, content) => (written[name] = content) }, redactorWith(PASSWORD))
+    const json = JSON.parse(written['results.json']!)
+    expect(json.promptGuard).toEqual({
+      seen: 3,
+      denied: 1,
+      notDenied: 1,
+      entries: [
+        { check: 'check 12', persona: 'persona_a', command: `Bash: env | grep ${REDACTED_SECRET}`, why: 'unexpected', how: 'Deny clicked' },
+        { check: 'check 23', persona: 'persona_b', command: 'Bash: date > prompt-b.txt', why: 'left open', how: 'not denied' },
+      ],
+    })
+    expect(written['results.md']).toContain(
+      '## Prompt guard (prompts no check expected, and prompts a check left open)\n\n' +
+        '3 permission prompt(s) seen; 1 denied, 1 could not be denied. A denial is a note, never a FAIL.\n\n' +
+        `- check 12, persona_a, unexpected: Bash: env | grep ${REDACTED_SECRET} (Deny clicked)\n` +
+        '- check 23, persona_b, left open: Bash: date > prompt-b.txt (not denied)\n\n' +
+        "## Memory (the watchdog's peaks)",
+    )
+    expect(renderPromptGuard({ seen: 0, denied: 0, notDenied: 0, entries: [] })).toEqual([
+      '0 permission prompt(s) seen; 0 denied, 0 could not be denied. A denial is a note, never a FAIL.',
+    ])
+    const without: Record<string, string> = {}
+    writeResults(summary({}), { write: (name, content) => (without[name] = content) }, redactorWith(PASSWORD))
+    expect([without['results.md']!.includes('## Prompt guard'), 'promptGuard' in JSON.parse(without['results.json']!)]).toEqual([false, false])
     assertNoLeak(written)
   })
 

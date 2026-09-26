@@ -36,7 +36,7 @@ import { join, resolve, sep } from 'node:path'
 import { countTokenShaped } from './redact.ts'
 import type { ProcResult, SpawnFn } from './proc.ts'
 
-export const BASE_IMAGE = 'cscb-ci-base:v3'
+export const BASE_IMAGE = 'cscb-ci-base:v4'
 export const LIVE_IMAGE = 'cscb-ci-live:latest'
 export const CONTAINER_LABEL_KEY = 'cscb-live'
 export const CONTAINER_LABEL = `${CONTAINER_LABEL_KEY}=1`

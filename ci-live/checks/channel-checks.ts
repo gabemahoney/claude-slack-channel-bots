@@ -20,6 +20,7 @@ import {
   askAndWait,
   bot,
   clickPrompt,
+  commandMatches,
   confirmedEdit,
   fileExists,
   guarded,
@@ -186,6 +187,10 @@ export const check4: CheckDef<CheckContext> = {
   },
 }
 
+/** Check 5's two prompts, as declared to the prompt guard (each names its file). */
+export const CHECK5_PROMPT_1 = /permission-check\.txt/
+export const CHECK5_PROMPT_2 = /permission-check-2\.txt/
+
 export const check5: CheckDef<CheckContext> = {
   id: '5',
   title: "Check 5: permission prompts go to A's destination (AC 28, AC 31)",
@@ -194,9 +199,12 @@ export const check5: CheckDef<CheckContext> = {
   async run(ctx) {
     const f = new Findings()
     const human = needHuman(ctx)
+    ctx.promptGuard.expect({ persona: 'a', command: CHECK5_PROMPT_1 })
+    ctx.promptGuard.expect({ persona: 'a', command: CHECK5_PROMPT_2 })
     const tm = await tmark(ctx)
     const t1 = await human.post(ctx.ids.aHome, 'Run a shell command that writes the current date to a file named permission-check.txt in your working directory.')
-    const p1 = await human.waitForBotMessage(ctx.ids.aHome, bot(ctx, 'a'), t1, (_t, m) => isPrompt(m), REPLY_TIMEOUT_MS)
+    // A's prompt for this file (a detour's prompt is the guard's to deny).
+    const p1 = await human.waitForBotMessage(ctx.ids.aHome, bot(ctx, 'a'), t1, (t, m) => isPrompt(m) && commandMatches(CHECK5_PROMPT_1, t), REPLY_TIMEOUT_MS)
     if (!f.expect(p1 !== null, 'no permission prompt from A in A-home')) return f.result()
     f.add(`prompt 1: ${ctx.ids.aHome} ${p1!.ts}`)
     await clickPrompt(ctx, ctx.ids.aHome, p1!.ts, 'Allow', f)
@@ -204,7 +212,7 @@ export const check5: CheckDef<CheckContext> = {
       ctx.ids.coordination,
       `${mention(ctx, 'a')} run a shell command that writes the current date to a file named permission-check-2.txt in your working directory.`,
     )
-    const p2 = await human.waitForBotMessage(ctx.ids.aHome, bot(ctx, 'a'), t2, (_t, m) => isPrompt(m), REPLY_TIMEOUT_MS)
+    const p2 = await human.waitForBotMessage(ctx.ids.aHome, bot(ctx, 'a'), t2, (t, m) => isPrompt(m) && commandMatches(CHECK5_PROMPT_2, t), REPLY_TIMEOUT_MS)
     if (f.expect(p2 !== null, 'no permission prompt from A in A-home for the coordination request')) {
       f.add(`prompt 2: ${ctx.ids.aHome} ${p2!.ts}`)
       await clickPrompt(ctx, ctx.ids.aHome, p2!.ts, 'Allow', f)
@@ -453,6 +461,22 @@ export const CHECK12_PANE_STOP = 'Stop the arithmetic exchange now. No reply nee
 export const CHECK12_LIFT = 'The arithmetic exchange is over. You may post in coordination again whenever you are asked to. No reply needed.'
 
 /**
+ * Check 12's start message (step 1), posted in A-home. It first tells A who
+ * it and B are (persona name and key, bot user ID), so A has no reason to
+ * look itself up: in run 6 it ran `env` for that, and nobody expected the
+ * prompt. `ids` may be the plan's placeholders.
+ */
+export function check12Start(ids: { coordination: string; aUserId: string; bUserId: string }): string {
+  return (
+    `You are persona_a (key=persona_a), bot user ID \`${ids.aUserId}\`. B is persona_b (key=persona_b), bot user ID \`${ids.bUserId}\`. ` +
+    "That is all you need to know about who you are, so don't look it up. " +
+    `In coordination, chat_id \`${ids.coordination}\`, post a message that mentions \`<@${ids.bUserId}>\` and asks B what 7 times 6 is. ` +
+    `Tell B to mention you as \`<@${ids.aUserId}>\` in every answer. Each time B answers, reply to B in coordination, mentioning it, ` +
+    'with one more short arithmetic question. Keep going until I tell you to stop.'
+  )
+}
+
+/**
  * The script that types `text` into a persona's tmux session and presses
  * Enter. `interrupt` presses Escape first, ending the persona's current turn;
  * without it, text typed mid-turn waits as the persona's next prompt.
@@ -497,12 +521,7 @@ export const check12: CheckDef<CheckContext> = {
     const human = needHuman(ctx)
     const ids = ctx.ids
     const m = await mark(ctx)
-    const start = await human.post(
-      ids.aHome,
-      `In coordination, chat_id \`${ids.coordination}\`, post a message that mentions \`<@${ids.bots.b.userId}>\` and asks B what 7 times 6 is. ` +
-        `Tell B to mention you as \`<@${ids.bots.a.userId}>\` in every answer. Each time B answers, reply to B in coordination, mentioning it, ` +
-        'with one more short arithmetic question. Keep going until I tell you to stop.',
-    )
+    const start = await human.post(ids.aHome, check12Start({ coordination: ids.coordination, aUserId: ids.bots.a.userId, bUserId: ids.bots.b.userId }))
     const mentionsB = (t: string) => t.includes(`<@${ids.bots.b.userId}>`)
     const mentionsA = (t: string) => t.includes(`<@${ids.bots.a.userId}>`)
     const a1 = await human.waitForBotMessage(ids.coordination, bot(ctx, 'a'), start, mentionsB, REPLY_TIMEOUT_MS)
