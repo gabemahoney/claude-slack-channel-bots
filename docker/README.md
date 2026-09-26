@@ -686,7 +686,7 @@ as "not yet", not as a FAIL.
 | S2, S3 | Automated, also in a dry run |
 | 1 to 6, 8 to 11, 13 | Automated |
 | 7 | Automated. The crash is a guarded `tmux kill-session` of A's session in the container |
-| 12 | Automated. If the personas keep posting after the stop message, the runner stops them in their tmux sessions (Escape, then a message) |
+| 12 | Automated. The stop message ends the exchange without banning later posts. If the personas keep posting after it, the runner stops them in their tmux sessions (Escape, then a message). Once coordination is quiet, the runner lifts the stop the way it was given: in coordination, and in the tmux sessions (no Escape) if it typed there, so A and B still post in coordination in later checks |
 | 14, 16, 20 | Need a second workspace account (`second_user` in `live.json`); `SKIPPED (no second account)` without one, and `SKIPPED (second account needs a sign-in code: run login --second)` when Slack asks it for an emailed code (its mail doesn't go to the test mailbox). In Checks 16 and 20 the runner asks A for the reply-tool call at most twice: if A never answers, the check fails; if A answers twice without making the call, Check 16 is `SKIPPED (not run: …)`, as the plan says, and Check 20 fails |
 | 15, 17, 19, 21 to 23 | Automated. "Turn A's DMs on" is a confirmed config edit |
 | 18 | Automated. C's prompt is started by typing into C's tmux session |

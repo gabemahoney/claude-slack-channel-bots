@@ -34,6 +34,15 @@
  *   falls back to the message text and needs one RAW line of each kind;
  *   `waitTags` polls to a deadline; Check 12's limit search fails on any
  *   line but the known Slack rate-limit ones;
+ * - Check 12's stop bans nothing, and once coordination is quiet (and after
+ *   the limit search) the stop is lifted in coordination, and in both
+ *   terminals with no Escape when the stop was typed there; the lift runs
+ *   even when a step after the stop throws, and a lift Slack refuses is a
+ *   note; the plan gives the same texts;
+ * - `tags` and `tagstext` (the container's helpers and the plan's copy, run
+ *   by bash over a fixture transcript) read a delivery from a user entry or,
+ *   when it arrived mid-turn, a `queued_command` attachment (a string prompt
+ *   or content blocks), once, never from the queue entries;
  * - Check 28: a failed revocation of B's older app-level token, whatever
  *   threw (a FlowError or any other error, such as Playwright's timeout), is
  *   the finding "step 7: revoke failed: <the error described>", with a note
@@ -43,20 +52,36 @@
  *   file header, the preview counts, the reload-applied line, the S3 error).
  *
  * No docker, network or real host state: the container, the host probes, the
- * test human's session and the clock are fakes.
+ * test human's session and the clock are fakes; the transcript helpers run
+ * in bash with a temp HOME.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { parsePersonaConfigBytes } from '../src/config.ts'
 import { checkPersonaTarget } from '../src/registry.ts'
 import { renderAppliedLogLine } from '../src/reload-apply.ts'
 import { PENDING_FILE_HEADER } from '../src/reload-fingerprint.ts'
 import { PENDING_PREVIEW_TITLE, renderChangePlanCounts, type ChangePlanCounts, type ValidChangePlan } from '../src/reload-plan.ts'
-import { check8, check9, expectOneTag, judgeLimitLines, rawShape, tagAttr } from '../ci-live/checks/channel-checks.ts'
+import {
+  CHECK12_LIFT,
+  CHECK12_PANE_STOP,
+  CHECK12_STOP,
+  check12,
+  check8,
+  check9,
+  expectOneTag,
+  judgeLimitLines,
+  rawShape,
+  tagAttr,
+  typeIntoPane,
+} from '../ci-live/checks/channel-checks.ts'
 import { DRY_RUN_IDS, liveIdsFrom, type CheckContext } from '../ci-live/checks/context.ts'
 import { callsTo, check16, check20, newCallTo, OUTBOUND_ASKS, outboundNext } from '../ci-live/checks/dm-checks.ts'
 import { Findings, NEED_SKIP_REASONS, runChecks, skipReason, verdictOf, type CheckDef, type CheckResult, type Need } from '../ci-live/checks/framework.ts'
@@ -95,6 +120,7 @@ import { HumanSession } from '../ci-live/lib/human-session.ts'
 import { buildLiveConfig, renderConfig } from '../ci-live/lib/live-config.ts'
 import type { ProcResult } from '../ci-live/lib/proc.ts'
 import { RESULTS_COLUMNS } from '../ci-live/lib/results.ts'
+import { MINUTE } from '../ci-live/lib/wait.ts'
 import { emptyAppsState } from '../ci-live/lib/apps-state.ts'
 import { virtualClock } from './test-helpers/ci-live.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
@@ -965,6 +991,157 @@ describe('Checks 16 and 20 against a scripted A', () => {
   })
 })
 
+describe("Check 12: the stop bans nothing, and is lifted once coordination is quiet", () => {
+  const B = DRY_RUN_IDS.bots.b
+  const MENTIONS = `<@${A.userId}> <@${B.userId}>`
+  const BAN_RE = /do not post|don't post|never post|not post .*again/i
+  /** A delivered mention tag, as `tags` prints it. */
+  const tagFrom = (author: typeof A) => `<channel source="slack" chat_id="${COORD}" user_id="${author.userId}" via="mention">`
+
+  /**
+   * A and B over a workspace whose timestamps follow the virtual clock. The
+   * human's post in A-home sets off the exchange in coordination: A asks, B
+   * answers, three posts each. With `keepPosting`, A posts again at every
+   * read of coordination after the stop until the stop is typed into the
+   * personas' terminals. The container answers `mark`, `tags` (the mention
+   * tag from the other persona) and the Dispatching grep; `fail` names a
+   * script that throws. `events` is every human post and container script,
+   * in order; `refuseLift` has Slack refuse the lift's post.
+   */
+  function exchange(opts: { keepPosting?: boolean; refuseLift?: boolean; fail?: string } = {}) {
+    const clock = virtualClock()
+    let seq = 0
+    const nextTs = () => `${Math.floor(clock.now() / 1000)}.${String(++seq).padStart(6, '0')}`
+    const messages: (CannedMessage & { channel: string })[] = []
+    const events: string[] = []
+    const posts: { channel: string; text: string; ts: string; at: number }[] = []
+    let stopped = false
+    let paneStopped = false
+    const say = (author: typeof A, text: string) => messages.push({ channel: COORD, ts: nextTs(), text, user: author.userId })
+    const api: HumanApi = {
+      call: async (method, params = {}) => {
+        const channel = String(params.channel ?? '')
+        if (method === 'chat.postMessage') {
+          const text = String(params.text)
+          if (opts.refuseLift && text.includes(CHECK12_LIFT)) return { ok: false, error: 'channel_not_found' }
+          const ts = nextTs()
+          messages.push({ channel, ts, text, user: DRY_RUN_IDS.humanUserId })
+          posts.push({ channel, text, ts, at: clock.now() })
+          events.push(`post ${channel} ${text}`)
+          if (channel === DRY_RUN_IDS.aHome) {
+            for (let i = 1; i <= 3; i++) {
+              say(A, `<@${B.userId}> question ${i}`)
+              say(B, `<@${A.userId}> answer ${i}`)
+            }
+          }
+          if (channel === COORD && text.includes(CHECK12_STOP)) stopped = true
+          return { ok: true, ts }
+        }
+        if (method === 'conversations.history') {
+          if (channel === COORD && opts.keepPosting && stopped && !paneStopped) say(A, `<@${B.userId}> one more question`)
+          return { ok: true, messages: messages.filter((m) => m.channel === channel && m.ts >= String(params.oldest ?? '0')) }
+        }
+        return { ok: true, messages: [] }
+      },
+    }
+    const { container } = fakeContainer([
+      [
+        '',
+        (script) => {
+          events.push(`sh ${script}`)
+          if (opts.fail !== undefined && script.includes(opts.fail)) throw new Error(`container: ${opts.fail} failed`)
+          if (script.includes(CHECK12_PANE_STOP)) paneStopped = true
+          if (script === 'mark') return '1:0'
+          if (script.startsWith('tags b ')) return tagFrom(A)
+          if (script.startsWith('tags a ')) return tagFrom(B)
+          if (script.includes('Dispatching to persona')) return `[slack] Dispatching to persona "persona_b" (key=persona_b) chat_id=${COORD} text=…`
+          return ''
+        },
+      ],
+    ])
+    const ctx = makeCtx({ mode: 'real', clock, human: new HumanSession(api, clock), container })
+    return { ctx, events, posts }
+  }
+
+  const liftPost = `post ${COORD} ${MENTIONS} ${CHECK12_LIFT}`
+  const paneScript = (l: 'a' | 'b', text: string, interrupt: boolean) => `sh guard || exit 90\n${typeIntoPane(l, text, interrupt)}`
+  const LIMIT_SEARCH = "sh since '1:0' | grep -inE 'limit|throttl|loop|too many'"
+
+  test('the stop and the lift ban nothing; the lift says A and B may post in coordination again', () => {
+    for (const text of [CHECK12_STOP, CHECK12_PANE_STOP, CHECK12_LIFT]) expect(text).not.toMatch(BAN_RE)
+    expect(CHECK12_LIFT).toContain('You may post in coordination again')
+  })
+
+  test('personas that obey the stop: the stop in coordination, then, once quiet for two minutes and after the limit search, the lift in coordination only', async () => {
+    const { ctx, events, posts } = exchange()
+    const r = await check12.run(ctx)
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    const [start, stop, lift] = posts
+    expect(posts.length).toBe(3)
+    expect([start!.channel, stop!.channel, lift!.channel]).toEqual([DRY_RUN_IDS.aHome, COORD, COORD])
+    expect(stop!.text).toBe(`${MENTIONS} ${CHECK12_STOP}`)
+    expect(lift!.text).toBe(`${MENTIONS} ${CHECK12_LIFT}`)
+    for (const p of posts) expect(p.text).not.toMatch(BAN_RE)
+    expect(lift!.at - stop!.at).toBeGreaterThanOrEqual(2 * MINUTE)
+    expect(events.indexOf(LIMIT_SEARCH)).toBeGreaterThan(events.indexOf(`post ${COORD} ${stop!.text}`))
+    expect(events.indexOf(liftPost)).toBeGreaterThan(events.indexOf(LIMIT_SEARCH))
+    expect(events.filter((e) => e.includes('tmux send-keys'))).toEqual([])
+    expect(r.evidence).toContain(`the stop lifted in coordination: ${lift!.ts}`)
+    assertNoLeak(r)
+  })
+
+  test('personas that keep posting: stopped in both terminals (Escape first), then the lift in coordination and typed into both terminals with no Escape', async () => {
+    const { ctx, events } = exchange({ keepPosting: true })
+    const r = await check12.run(ctx)
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(r.notes).toContain('Check 12: the personas kept posting after the stop message; stopped in their terminals (Escape + message)')
+    const panes = events.filter((e) => e.includes('tmux send-keys'))
+    expect(panes).toEqual([
+      paneScript('a', CHECK12_PANE_STOP, true),
+      paneScript('b', CHECK12_PANE_STOP, true),
+      paneScript('a', CHECK12_LIFT, false),
+      paneScript('b', CHECK12_LIFT, false),
+    ])
+    expect(panes.slice(2).some((e) => e.includes('Escape'))).toBe(false)
+    // The lift follows the terminal stop, the quiet wait and the limit search, and is posted before it is typed.
+    const liftAt = events.indexOf(liftPost)
+    expect(liftAt).toBeGreaterThan(events.indexOf(panes[1]!))
+    expect(liftAt).toBeGreaterThan(events.indexOf(LIMIT_SEARCH))
+    expect(events.indexOf(panes[2]!)).toBeGreaterThan(liftAt)
+  })
+
+  test('a step that throws after the stop still lifts it before the error ends the check', async () => {
+    const { ctx, events } = exchange({ fail: 'grep -inE' })
+    await expect(check12.run(ctx)).rejects.toThrow('container: grep -inE failed')
+    expect(events.at(-1)).toBe(liftPost)
+  })
+
+  test("a lift Slack refuses is a note, not a failure or a throw; the check's result stands", async () => {
+    const { ctx, posts } = exchange({ refuseLift: true })
+    const r = await check12.run(ctx)
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(posts.some((p) => p.text.includes(CHECK12_LIFT))).toBe(false)
+    expect(r.notes).toContain(
+      'Check 12: the lift could not be posted in coordination (HumanCallError: chat.postMessage failed: channel_not_found); a later check may find A or B unwilling to post there',
+    )
+  })
+
+  test("the plan's Check 12 gives the runner's stop, terminal stop and lift texts", () => {
+    const plan = readFileSync(join(import.meta.dir, '..', 'testplans', 'b.yko', 'b.yko.md'), 'utf-8')
+    const section = plan.slice(plan.indexOf('### Check 12:'), plan.indexOf('## Part 5:')).replace(/\s+/g, ' ')
+    expect(section).toContain(`"@CSCB Test A @CSCB Test B ${CHECK12_STOP}"`)
+    expect(section).toContain(`type "${CHECK12_PANE_STOP}"`)
+    expect(section).toContain(`"@CSCB Test A @CSCB Test B ${CHECK12_LIFT}"`)
+  })
+
+  test('typeIntoPane: Escape first only when interrupting; the text is one literal word', () => {
+    expect(typeIntoPane('b', "it's over", false)).toBe(`tmux send-keys -t slack_bot_persona_b -l 'it'\\''s over'; sleep 1; tmux send-keys -t slack_bot_persona_b Enter`)
+    expect(typeIntoPane('a', 'stop', true)).toBe(
+      `tmux send-keys -t slack_bot_persona_a Escape; sleep 1; tmux send-keys -t slack_bot_persona_a -l 'stop'; sleep 1; tmux send-keys -t slack_bot_persona_a Enter`,
+    )
+  })
+})
+
 /** Playwright's own timeout error, as a locator or a navigation in a flow throws it. */
 class TimeoutError extends Error {
   constructor(message: string) {
@@ -1232,5 +1409,92 @@ describe('check helpers', () => {
     expect(liveIdsFrom(full)).toEqual(DRY_RUN_IDS)
     delete (full.personas as Record<string, { bot_id?: string }>).c!.bot_id
     expect(liveIdsFrom(full)).toBe('apps.json is incomplete (persona c): run the provisioning first')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The transcript helpers `tags` and `tagstext`, run by bash over a fixture
+// ---------------------------------------------------------------------------
+
+describe("tags and tagstext over a transcript (the container's helpers and the plan's Part 1.3 copy)", () => {
+  const REPO = join(import.meta.dir, '..')
+  const containerHelpers = readFileSync(join(REPO, 'docker', 'live', 'cscb-live-helpers.sh'), 'utf-8')
+  const planHelpers = (() => {
+    const plan = readFileSync(join(REPO, 'testplans', 'b.yko', 'b.yko.md'), 'utf-8')
+    const start = plan.indexOf("cat > ~/cscb-live-helpers.sh <<'EOF'\n")
+    return plan.slice(start, plan.indexOf('\nEOF\n', start) + 1)
+  })()
+
+  /** The `name() { … }` definition in a helpers file, up to its closing `}` line. */
+  function shellFunction(source: string, name: string): string {
+    const start = source.indexOf(`\n${name}() {\n`)
+    if (start < 0) throw new Error(`no ${name}() in the helpers`)
+    return source.slice(start + 1, source.indexOf('\n}\n', start) + 3)
+  }
+
+  const TS = { idle: '1700000100.000001', midTurn: '1700000100.000002', blocks: '1700000100.000003', userBlocks: '1700000100.000004' }
+  const tag = (ts: string, via: string) => `<channel source="slack" chat_id="${COORD}" user_id="${DRY_RUN_IDS.humanUserId}" ts="${ts}" via="${via}">`
+  const body = (ts: string, via: string, text: string) => `${tag(ts, via)}\n${text}\n</channel>`
+  const midTurn = body(TS.midTurn, 'receive_all', 'Window check two.')
+  /**
+   * One message delivered while A was idle (a user entry), one mid-turn (its
+   * queue entries, then a queued_command attachment with a string prompt),
+   * one mid-turn with content blocks, one user entry with content blocks,
+   * and entries that are no delivery: a tool result, another attachment
+   * type holding a tag, an attachment that is not an object, and A quoting
+   * a tag.
+   */
+  const TRANSCRIPT = [
+    { type: 'user', message: { role: 'user', content: body(TS.idle, 'mention', 'Idle delivery.') } },
+    { type: 'queue-operation', operation: 'enqueue', content: midTurn },
+    { type: 'queue-operation', operation: 'remove', content: midTurn },
+    { type: 'attachment', attachment: { type: 'queued_command', commandMode: 'prompt', prompt: midTurn } },
+    {
+      type: 'attachment',
+      attachment: { type: 'queued_command', commandMode: 'prompt', prompt: [{ type: 'text', text: body(TS.blocks, 'mention', 'Blocks prompt.') }, { type: 'image', source: {} }] },
+    },
+    { type: 'user', message: { role: 'user', content: [{ type: 'text', text: body(TS.userBlocks, 'broadcast', 'Blocks user entry.') }] } },
+    { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }] } },
+    { type: 'attachment', attachment: { type: 'prompt_snapshot', prompt: midTurn } },
+    { type: 'attachment', attachment: 'not an object' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: `I saw ${tag(TS.idle, 'mention')}` }] } },
+  ]
+
+  let home = ''
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'ci-live-tags-'))
+    const dir = join(home, '.claude', 'projects', '-home-testuser-cscb-live-a')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, '0f0f0f0f-session.jsonl'), TRANSCRIPT.map((e) => JSON.stringify(e)).join('\n') + '\n')
+  })
+  afterEach(() => rmSync(home, { recursive: true, force: true }))
+
+  /** Run one helper, defined from `source`, in bash with the fixture home; its output lines. */
+  function helper(source: string, ...args: string[]): string[] {
+    const defs = `${shellFunction(source, 'tags')}\n${shellFunction(source, 'tagstext')}`
+    const r = Bun.spawnSync([Bun.which('bash')!, '-c', `${defs}\n"$@"`, 'helpers', ...args], { env: { HOME: home, PATH: process.env.PATH ?? '/usr/bin:/bin' } })
+    expect(r.stderr.toString()).toBe('')
+    return r.stdout.toString().split('\n').filter((l) => l !== '')
+  }
+
+  const SOURCES = [
+    ['docker/live/cscb-live-helpers.sh', containerHelpers],
+    ["the plan's Part 1.3", planHelpers],
+  ] as const
+
+  test.each(SOURCES)('%s: tags prints one tag per delivery, from a user entry or a queued_command attachment, string or blocks alike', (_where, source) => {
+    expect(helper(source, 'tags', 'a', TS.idle)).toEqual([tag(TS.idle, 'mention')])
+    // Mid-turn: the attachment only, not the queue entries or the prompt snapshot that hold the same text.
+    expect(helper(source, 'tags', 'a', TS.midTurn)).toEqual([tag(TS.midTurn, 'receive_all')])
+    expect(helper(source, 'tags', 'a', TS.blocks)).toEqual([tag(TS.blocks, 'mention')])
+    expect(helper(source, 'tags', 'a', TS.userBlocks)).toEqual([tag(TS.userBlocks, 'broadcast')])
+    expect(helper(source, 'tags', 'a', '1700000100.000009')).toEqual([])
+  })
+
+  test.each(SOURCES)('%s: tagstext finds the tag of a message by its text, in a queued_command attachment too', (_where, source) => {
+    expect(helper(source, 'tagstext', 'a', 'Window check two.')).toEqual([tag(TS.midTurn, 'receive_all')])
+    expect(helper(source, 'tagstext', 'a', 'Blocks prompt.')).toEqual([tag(TS.blocks, 'mention')])
+    expect(helper(source, 'tagstext', 'a', 'Idle delivery.')).toEqual([tag(TS.idle, 'mention')])
+    expect(helper(source, 'tagstext', 'a', 'never sent')).toEqual([])
   })
 })

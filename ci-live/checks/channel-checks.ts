@@ -10,8 +10,9 @@
  */
 
 import { CONTAINER_HOME } from '../lib/docker.ts'
+import { describeError } from '../lib/errors.ts'
 import { isFrom, messageText, notYetOnTransient, tsAfter } from '../lib/human-session.ts'
-import { personaName } from '../lib/personas.ts'
+import { personaName, type PersonaLetter } from '../lib/personas.ts'
 import { waitFor, BRINGUP_TIMEOUT_MS, MINUTE, POLL_MS, REPLY_TIMEOUT_MS, SECOND } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'
 import { Findings, type CheckDef } from './framework.ts'
@@ -434,6 +435,55 @@ export function judgeLimitLines(found: string[]): { failures: string[]; notes: s
   return { failures, notes }
 }
 
+/**
+ * Check 12's stop (step 4), after the two mentions. It ends the exchange and
+ * bans nothing: A and B keep their sessions, and an earlier "do not post in
+ * this channel again" had A answer coordination messages in A-home in
+ * Checks 13 and 21.
+ */
+export const CHECK12_STOP = 'stop the exchange now. No reply needed.'
+
+/** The stop typed into a persona's terminal, after Escape, when the personas kept posting. */
+export const CHECK12_PANE_STOP = 'Stop the arithmetic exchange now. No reply needed.'
+
+/** Step 6's lift, once coordination is quiet: said wherever the stop was said. */
+export const CHECK12_LIFT = 'The arithmetic exchange is over. You may post in coordination again whenever you are asked to. No reply needed.'
+
+/**
+ * The script that types `text` into a persona's tmux session and presses
+ * Enter. `interrupt` presses Escape first, ending the persona's current turn;
+ * without it, text typed mid-turn waits as the persona's next prompt.
+ */
+export function typeIntoPane(letter: PersonaLetter, text: string, interrupt: boolean): string {
+  const session = `slack_bot_persona_${letter}`
+  const escape = interrupt ? `tmux send-keys -t ${session} Escape; sleep 1; ` : ''
+  return `${escape}tmux send-keys -t ${session} -l ${q(text)}; sleep 1; tmux send-keys -t ${session} Enter`
+}
+
+/**
+ * Step 6: lift the stop for A and B the way it reached them: in coordination,
+ * and in their terminals too when the stop was typed there. Never throws: a
+ * lift that fails is a note (the check's result rests on the plan's Expected
+ * items), so the caller can run it from a `finally`.
+ */
+export async function liftCheck12Stop(ctx: CheckContext, f: Findings, inPanes: boolean): Promise<void> {
+  try {
+    const ts = await needHuman(ctx).post(ctx.ids.coordination, `${mention(ctx, 'a')} ${mention(ctx, 'b')} ${CHECK12_LIFT}`)
+    f.add(`the stop lifted in coordination: ${ts}`)
+  } catch (err) {
+    f.note(`Check 12: the lift could not be posted in coordination (${describeError(err)}); a later check may find A or B unwilling to post there`)
+  }
+  if (!inPanes) return
+  for (const l of ['a', 'b'] as const) {
+    try {
+      const typed = await guarded(ctx, typeIntoPane(l, CHECK12_LIFT, false))
+      if (!typed.ok || typed.code !== 0) f.note(`Check 12: the lift could not be typed into ${personaName(l)}'s terminal (exit ${typed.code})`)
+    } catch (err) {
+      f.note(`Check 12: the lift could not be typed into ${personaName(l)}'s terminal (${describeError(err)})`)
+    }
+  }
+}
+
 export const check12: CheckDef<CheckContext> = {
   id: '12',
   title: 'Check 12: two personas converse with no limit (AC 11, AC 18, SR-4.2)',
@@ -483,38 +533,42 @@ export const check12: CheckDef<CheckContext> = {
         f.expect(disp >= 1, `no Dispatching line to ${personaName(letter)} (post ${post.ts})`)
       }
     }
-    // Stop the exchange.
-    const stop = await human.post(ids.coordination, `${mention(ctx, 'a')} ${mention(ctx, 'b')} stop the exchange now. Do not post in this channel again.`)
-    await pause(ctx, 2 * MINUTE)
-    // Posts in coordination after `after`, threads of the whole exchange included; null on a transient Slack failure.
-    const exchangeStart = a1!.ts
-    const quietSince = async (after: string) => {
-      const posts = await notYetOnTransient(() => personaPostsAfter(ctx, ids.coordination, after, exchangeStart))
-      return posts === null ? null : posts.length
-    }
-    const lastAfterStop = await personaPostsAfter(ctx, ids.coordination, stop, exchangeStart)
-    const recentCut = String(Math.floor(ctx.clock.now() / 1000) - 120) + '.000000'
-    if (lastAfterStop.some((p) => tsAfter(p.ts, recentCut))) {
-      f.note('Check 12: the personas kept posting after the stop message; stopped in their terminals (Escape + message)')
-      for (const l of ['a', 'b'] as const) {
-        await guarded(ctx, `tmux send-keys -t slack_bot_persona_${l} Escape; sleep 1; tmux send-keys -t slack_bot_persona_${l} -l ${q('Stop the arithmetic exchange. Do not post in coordination again.')}; sleep 1; tmux send-keys -t slack_bot_persona_${l} Enter`)
+    // Stop the exchange (step 4). From here on the stop is always lifted (step 6), even when a step throws.
+    const stop = await human.post(ids.coordination, `${mention(ctx, 'a')} ${mention(ctx, 'b')} ${CHECK12_STOP}`)
+    let stoppedInPanes = false
+    try {
+      await pause(ctx, 2 * MINUTE)
+      // Posts in coordination after `after`, threads of the whole exchange included; null on a transient Slack failure.
+      const exchangeStart = a1!.ts
+      const quietSince = async (after: string) => {
+        const posts = await notYetOnTransient(() => personaPostsAfter(ctx, ids.coordination, after, exchangeStart))
+        return posts === null ? null : posts.length
       }
+      const lastAfterStop = await personaPostsAfter(ctx, ids.coordination, stop, exchangeStart)
+      const recentCut = String(Math.floor(ctx.clock.now() / 1000) - 120) + '.000000'
+      if (lastAfterStop.some((p) => tsAfter(p.ts, recentCut))) {
+        f.note('Check 12: the personas kept posting after the stop message; stopped in their terminals (Escape + message)')
+        stoppedInPanes = true
+        for (const l of ['a', 'b'] as const) await guarded(ctx, typeIntoPane(l, CHECK12_PANE_STOP, true))
+      }
+      const quiet = await waitFor(
+        async () => {
+          const cut = String(Math.floor(ctx.clock.now() / 1000) - 120) + '.000000'
+          return (await quietSince(cut)) === 0
+        },
+        { timeoutMs: 8 * MINUTE, intervalMs: 20 * SECOND, clock: ctx.clock },
+      )
+      f.expect(quiet === true, 'coordination did not go quiet for two minutes after the stop')
+      const found = await lines(ctx, `since ${q(m)} | grep -inE 'limit|throttl|loop|too many'`)
+      const judged = judgeLimitLines(found)
+      for (const n of judged.notes.slice(0, 5)) f.note(`Check 12 search (Slack rate limit): ${n.slice(0, 200)}`)
+      f.expect(
+        judged.failures.length === 0,
+        `${judged.failures.length} limit/throttle/loop line(s): ${judged.failures.slice(0, 2).map((l) => l.slice(0, 200)).join(' / ')}`,
+      )
+    } finally {
+      await liftCheck12Stop(ctx, f, stoppedInPanes)
     }
-    const quiet = await waitFor(
-      async () => {
-        const cut = String(Math.floor(ctx.clock.now() / 1000) - 120) + '.000000'
-        return (await quietSince(cut)) === 0
-      },
-      { timeoutMs: 8 * MINUTE, intervalMs: 20 * SECOND, clock: ctx.clock },
-    )
-    f.expect(quiet === true, 'coordination did not go quiet for two minutes after the stop')
-    const found = await lines(ctx, `since ${q(m)} | grep -inE 'limit|throttl|loop|too many'`)
-    const judged = judgeLimitLines(found)
-    for (const n of judged.notes.slice(0, 5)) f.note(`Check 12 search (Slack rate limit): ${n.slice(0, 200)}`)
-    f.expect(
-      judged.failures.length === 0,
-      `${judged.failures.length} limit/throttle/loop line(s): ${judged.failures.slice(0, 2).map((l) => l.slice(0, 200)).join(' / ')}`,
-    )
     return f.result()
   },
 }

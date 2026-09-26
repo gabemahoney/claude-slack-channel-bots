@@ -341,21 +341,30 @@ since() {
 }
 
 # tags a|b|c|d TS: every <channel …> tag delivered to that persona for the
-# message with that ts, from the persona's current session transcript.
+# message with that ts, from the persona's current session transcript. A
+# delivered message is a user entry, or, when it arrived while the persona
+# was mid-turn, a queued_command attachment (its prompt a string or content
+# blocks); Claude Code writes one or the other, never both. The
+# queue-operation entries, which hold every message again, are not read.
 tags() {
   local t
   t="$(ls -t ~/.claude/projects/*-cscb-live-"$1"/*.jsonl | head -1)"
-  jq -r 'select(.type == "user") | .message.content
+  jq -r 'if .type == "user" then .message.content
+         elif .type == "attachment" and .attachment.type? == "queued_command" then .attachment.prompt
+         else empty end
          | if type == "string" then . else (.[]? | .text? // empty) end' "$t" \
     | grep -oE '<channel source="slack[^"]*"[^>]*>' | grep -F " ts=\"$2\""
 }
 
 # tagstext a|b|c|d 'TEXT': the tag of every delivered message whose content
-# contains TEXT (for an edited message, whose tag may carry another ts).
+# contains TEXT (for an edited message, whose tag may carry another ts). It
+# reads the same entries as tags.
 tagstext() {
   local t
   t="$(ls -t ~/.claude/projects/*-cscb-live-"$1"/*.jsonl | head -1)"
-  jq -r --arg s "$2" 'select(.type == "user") | .message.content
+  jq -r --arg s "$2" 'if .type == "user" then .message.content
+         elif .type == "attachment" and .attachment.type? == "queued_command" then .attachment.prompt
+         else empty end
          | if type == "string" then . else (.[]? | .text? // empty) end
          | select(contains($s))' "$t" \
     | grep -oE '<channel source="slack[^"]*"[^>]*>'
@@ -721,11 +730,13 @@ here.
 
 The persona's session transcript is the authoritative record of what reached
 the persona. Every delivered Slack message appears in it as a user entry
-whose content starts with a `<channel …>` tag. The count of those tags for a
-message's `<TS>` is its delivery count, and the tag's attributes give its
-`chat_id`, `via` and the author's `user_id` or `bot_id`.
+whose content starts with a `<channel …>` tag, or, when it arrived while the
+persona was mid-turn, as a `queued_command` attachment whose prompt does. The
+count of those tags for a message's `<TS>` is its delivery count, and the
+tag's attributes give its `chat_id`, `via` and the author's `user_id` or
+`bot_id`.
 
-- **Delivered tags:** `tags <persona> <TS>` (Part 1.3). For an edited message, whose tag may not carry the `<TS>` from its link, `tagstext <persona> '<text>'`. Both read only `type == "user"` entries: the transcript also records a queue entry for each incoming message, which would double the count.
+- **Delivered tags:** `tags <persona> <TS>` (Part 1.3). For an edited message, whose tag may not carry the `<TS>` from its link, `tagstext <persona> '<text>'`. Both read only `type == "user"` entries and `queued_command` attachments: the transcript also records a `queue-operation` entry for each incoming message, which would double the count.
 - **Tool calls and tool errors:** `replies <persona>`. Each line is one `reply` call, with its `chat_id`, whether the result was an error, and the result text the server returned. A check picks out its call by target, for example `replies a | grep -F 'chat_id=<SECOND_USER_ID>' | tail -n 1`. A refusal is returned to the persona only, never logged, so the transcript is where it is read. Claude Code may wrap an MCP error's text, so a check matches the expected text with "contains", not as the whole result.
 - **Permission-prompt posts:** `posts <TMARK>`. Each check records a trail mark (`TMARK=$(wc -l < "$TRAIL")`) next to its log mark, and reads only the posts after it.
 - A persona's own account of what it received or what a tool returned is never evidence. Don't ask a persona to quote its tag.
@@ -1113,12 +1124,14 @@ Steps:
 1. Record where the log ends: `MARK=$(mark)`. In A-home, post: "In coordination, chat_id `<COORDINATION_CHANNEL_ID>`, post a message that mentions `<@<B_BOT_USER_ID>>` and asks B what 7 times 6 is. Tell B to mention you as `<@<A_BOT_USER_ID>>` in every answer. Each time B answers, reply to B in coordination, mentioning it, with one more short arithmetic question. Keep going until I tell you to stop."
 2. Work out the `<TS>` of A's first coordination post, and of B's reply to it. Run `tags b <TS of A's post>` and `tags a <TS of B's reply>`.
 3. Let the exchange run until A and B have each posted at least two more times after B's first reply. Take one later post from each and check it with `tags` in the same way.
-4. **Stop the exchange.** In coordination, post "@CSCB Test A @CSCB Test B stop the exchange now. Do not post in this channel again." Wait two minutes and watch coordination.
+4. **Stop the exchange.** In coordination, post "@CSCB Test A @CSCB Test B stop the exchange now. No reply needed." Wait two minutes and watch coordination. Don't word the stop as a ban ("do not post in this channel again"): A and B keep their sessions, and a standing ban has A answer coordination messages in A-home in Checks 13 and 21.
 5. Search this check's log lines for any limit or throttle message:
 
    ```sh
    since "$MARK" | grep -inE 'limit|throttl|loop|too many'
    ```
+
+6. **Lift the stop.** Once coordination has been quiet for two minutes (after the terminal stop below, if it was needed), post in coordination "@CSCB Test A @CSCB Test B The arithmetic exchange is over. You may post in coordination again whenever you are asked to. No reply needed." If you stopped the personas in their terminals, also type that text into each persona's terminal the same way, without pressing Escape first, and press Enter.
 
 Expected:
 
@@ -1133,11 +1146,12 @@ Whether the personas obey the stop message is the bots' behaviour, not the
 server's, so it does not decide this check. If either persona keeps posting
 two minutes after the stop message, end the exchange in each persona's
 terminal: `tmux attach -t slack_bot_persona_a`, press Escape to interrupt the
-current turn, type "Stop the arithmetic exchange. Do not post in coordination
-again." and press Enter, then detach with `Ctrl-b d`; do the same in
+current turn, type "Stop the arithmetic exchange now. No reply needed." and
+press Enter, then detach with `Ctrl-b d`; do the same in
 `slack_bot_persona_b`. Record that in Notes. The check's result rests on the
 Expected items above. The exchange must have stopped (no post in coordination
-for two minutes) before Check 13.
+for two minutes), and the stop must have been lifted (step 6), before Check
+13.
 
 Pass: B receives A's mention once with A's identity and answers as itself,
 and the exchange continues for at least two more turns each with no limit or
@@ -1153,8 +1167,9 @@ every message of all of them in one instance. It also shows b.av2 SR-8.6's
 in-place row live: a confirmed `delivery` change keeps the persona's
 instance, Slack connection and conversation.
 
-State at the start: the Check 12 exchange has stopped. A is receive-all in
-A-home and mentions-only in coordination. The check switches A's coordination
+State at the start: the Check 12 exchange has stopped and its stop has been
+lifted. A is receive-all in A-home and mentions-only in coordination. The
+check switches A's coordination
 `delivery` to `all` with a confirmed edit (Part 2.2), and switches it back
 before it ends, so A is mentions-only in coordination again for Check 21.
 

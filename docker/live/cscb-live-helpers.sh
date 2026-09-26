@@ -54,23 +54,32 @@ since() {
 }
 
 # tags a|b|c|d TS: every <channel …> tag delivered to that persona for the
-# message with that ts, from the persona's current session transcript.
+# message with that ts, from the persona's current session transcript. A
+# delivered message is a user entry, or, when it arrived while the persona
+# was mid-turn, a queued_command attachment (its prompt a string or content
+# blocks); Claude Code writes one or the other, never both. The
+# queue-operation entries, which hold every message again, are not read.
 tags() {
   local t
   t="$(ls -t ~/.claude/projects/*-cscb-live-"$1"/*.jsonl 2>/dev/null | head -1)"
   [ -n "$t" ] || return 0
-  jq -r 'select(.type == "user") | .message.content
+  jq -r 'if .type == "user" then .message.content
+         elif .type == "attachment" and .attachment.type? == "queued_command" then .attachment.prompt
+         else empty end
          | if type == "string" then . else (.[]? | .text? // empty) end' "$t" \
     | grep -oE '<channel source="slack[^"]*"[^>]*>' | grep -F " ts=\"$2\""
 }
 
 # tagstext a|b|c|d 'TEXT': the tag of every delivered message whose content
-# contains TEXT (for an edited message, whose tag may carry another ts).
+# contains TEXT (for an edited message, whose tag may carry another ts). It
+# reads the same entries as tags.
 tagstext() {
   local t
   t="$(ls -t ~/.claude/projects/*-cscb-live-"$1"/*.jsonl 2>/dev/null | head -1)"
   [ -n "$t" ] || return 0
-  jq -r --arg s "$2" 'select(.type == "user") | .message.content
+  jq -r --arg s "$2" 'if .type == "user" then .message.content
+         elif .type == "attachment" and .attachment.type? == "queued_command" then .attachment.prompt
+         else empty end
          | if type == "string" then . else (.[]? | .text? // empty) end
          | select(contains($s))' "$t" \
     | grep -oE '<channel source="slack[^"]*"[^>]*>'
