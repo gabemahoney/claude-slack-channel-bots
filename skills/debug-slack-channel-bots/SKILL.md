@@ -78,7 +78,11 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    name (the `install-cscb` skill covers installing agent-director).
 5. **No class line, but the persona still isn't served?** See
    [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running)
-   and [Other lines you may see](#other-lines-you-may-see).
+   and [Other lines you may see](#other-lines-you-may-see). A *Waiting on a
+   prompt*, *Not connected* or *Not receiving messages* notice at its
+   destination, or a row that reads `working` while the instance sits idle,
+   is covered under
+   [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected).
 6. **A `reply` to a user ID fails with `missing_scope`?** See
    [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite).
    **Permission prompts or notices don't arrive?** Look for a
@@ -932,9 +936,142 @@ for healthy personas. They then register again through the launch's reconnect
 or, failing that, the health check: two consecutive ticks of
 `health_check_interval` (120 s by default), then the restart delay
 (`session_restart_delay`, 60 s by default), about 3–5 minutes with default
-settings. A few refused lines right after a start are
+settings. With `session_restart_delay` 0 the health check reconnects nothing;
+see [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected).
+A few refused lines right after a start are
 normal. If a refused instance keeps reconnecting in a loop while its persona is
 down, report it as a bug, with the persona's lines.
+
+---
+
+## A persona's instance runs but isn't connected
+
+The persona is up and its Claude instance runs, but messages can't reach it,
+so messages sent to it are lost (each with a *Message lost* notice). Usually
+the launch or the health check reconnects it within minutes. When it can't,
+the persona's destination gets one of three notices. At most one of them is
+posted per episode: after one, none is posted again until the instance
+registers with the server again, the health check finds it reachable again,
+or the persona is removed. `server.log` has, when the notice is posted:
+
+```text
+[slack] session-manager: persona=<key> is not connected (<reason>) — raising a not-connected notice (b.f2b)
+```
+
+| Notice | `<reason>` | Why | What to do |
+|---|---|---|---|
+| *Waiting on a prompt* | `blocked-on-prompt` | The instance's terminal shows a permission dialog, a question or another prompt that no one answered, or its row reads `ask_user` or `check_permission`. The server never types into one. | With the operator's say-so, attach (`tmux attach -t slack_bot_<key>`) and answer it; a permission prompt also posted to the persona's destination can be answered there. The instance is reconnected once its turn ends; if it stays disconnected, type `/mcp reconnect slack-channel-router` in it. With `session_restart_delay` 0 the notice says so: if it is still not connected once its turn ends, type that command or restart the server. |
+| *Not connected* | `auto-restart-disabled` | `session_restart_delay` is 0, so nothing will reconnect it. The notice says why it isn't connected (list below). | With the operator's say-so, attach, deal with anything on screen and type `/mcp reconnect slack-channel-router`, or restart the server. |
+| *Not receiving messages* | `auto-restart-disabled` | The instance is connected, but its message stream is gone (`found on two health checks in a row`), and `session_restart_delay` is 0, so nothing will restore it. | As for *Not connected*. |
+
+The *Not connected* notice gives one of these causes:
+
+| Cause in the notice | When |
+|---|---|
+| `its connection has been down on two health checks in a row` | The health check found the instance alive but not connected twice in a row. |
+| `it moved to state <state> while CSCB waited to reconnect it` | At its launch, the row moved to `pending` instead of finishing its turn. A move to `ask_user` or `check_permission` posts *Waiting on a prompt* instead. |
+| `agent-director has no record of its session, though its tmux session is alive` | At its launch, the row vanished while the tmux session lives. |
+| `agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it` | The launch waited 10 minutes and agent-director couldn't answer at the end. |
+| `its agent-director row still read <state> 10 min after launch, and CSCB found no proof it was idle` | The launch waited 10 minutes and the row stayed live (for example `working` with a busy screen, or a transcript that doesn't end with a finished reply). |
+
+To see what the instance shows without touching it:
+
+```sh
+agent-director list --label service=cscb --label persona=<key>
+agent-director read-pane --claude-instance-id cscb_<key>
+agent-director get --claude-instance-id cscb_<key>
+```
+
+`get` shows the row's `claude_session_id`, `cwd` and, once recorded,
+`jsonl_path`: the transcript the server reads (below).
+
+### A row that reads `working` while the instance sits idle
+
+agent-director can keep reporting a row as `working` after the turn has
+ended. The server trusts neither the row nor the screen alone: a turn waiting
+on the API can hold a still screen with no spinner. It reconnects a `working`
+row only when, at every read across 60 s, both of these held and neither
+changed:
+
+- **The screen is idle.** No busy spinner line (such as `✳ Harmonizing… (2m 42s · ↓ 10.1k tokens)`),
+  no `esc to interrupt` or `esc to cancel` hint, no API retry message
+  (`No response from the API after …`, `Rate limit reached · Retrying in …`,
+  `Waiting for API response · will retry in …`, `… · attempt <n>/<m>`), and
+  no prompt or dialog (a numbered option list with its `❯` cursor).
+- **The transcript ends with a completed turn.** Its last conversation entry
+  is Claude's final reply. A prompt, a tool call, a tool result or a queued
+  message means the turn is still open. The server reads only the file's last
+  256 KiB. The file is the row's `jsonl_path` when it names the row's session,
+  else `<claude_config_dir>/projects/<slug>/<claude_session_id>.jsonl`, where
+  `<slug>` is the row's `cwd` with every character other than a letter, digit
+  or `-` replaced by `-`. A transcript that can't be found or read is no sign
+  of idleness.
+
+It never types into a running turn or a prompt.
+
+At a launch (a start, an added persona, a relaunch), the launch waits for the
+row. While the row reads `working` it reads the screen every 5 s, and the
+transcript whenever the screen sits idle:
+
+| Line | Meaning |
+|---|---|
+| `[slack] waitForWaitingAndReconnect: "<name>" (key=<key>) reads working, but its pane has shown the same idle screen (no busy indicator, no prompt) and its transcript has ended with a completed turn, both unchanged, for <N>s — treating the row as stale and reconnecting (b.f2b)` | The stale row is reconnected, whatever `session_restart_delay` is. Look for `Session connected` next. |
+| `[slack] waitForWaitingAndReconnect: "<name>" (key=<key>) reads working and its pane shows an idle screen, but <why> — no idle evidence; still waiting for its working row (b.f2b)` | The screen is idle, but `<why>` is `its transcript "<path>" does not end with a completed turn` or `its transcript can't be read: <reason>`. Logged again only when `<why>` changes. The launch keeps waiting. A transcript that can't be read at all leaves the row to the 10-minute limit. |
+| `[slack] waitForWaitingAndReconnect: "<name>" (key=<key>) reads working and its pane has shown a prompt or dialog for <N>s — blocked on it; not typing into it, still waiting (answer it in tmux session "slack_bot_<key>") (b.f2b)` | A prompt is on screen: the *Waiting on a prompt* notice is posted and the launch keeps waiting. Answer the prompt. |
+| `[slack] waitForWaitingAndReconnect: reading the pane of "<name>" (key=<key>) failed: <error> — no idle evidence from it; still waiting for its working row (b.f2b)` | agent-director couldn't read the screen (logged once per wait). The launch keeps waiting. |
+
+When the wait ends with the instance running and nothing typed, the line ends
+with what happens next. With `session_restart_delay` above 0 it names the
+health check's recovery; with 0 it ends
+`session_restart_delay is 0, so nothing will reconnect it — the not-connected notice reports it (once per episode) (b.f2b)`
+and the *Not connected* notice (or, for a row at `ask_user` or
+`check_permission`, *Waiting on a prompt*) is posted:
+
+| Line starts with | Meaning |
+|---|---|
+| `[slack] waitForWaitingAndReconnect: "<name>" (key=<key>) transitioned to state=<state> — aborting;` | The row moved to `pending`, `ask_user` or `check_permission`. |
+| `[slack] waitForWaitingAndReconnect: spawn not found for "<name>" (key=<key>) but tmux session alive — aborting poll;` | The row vanished; the tmux session lives. |
+| `[slack] waitForWaitingAndReconnect: timed out for "<name>" (key=<key>) after <ms>ms — <reason>, tmux session alive;` | After 10 minutes agent-director couldn't report the row. |
+| `[slack] reconnect: gave up waiting for "<name>" (key=<key>) after <ms>ms — claude process state=<state> (alive);` | After 10 minutes the row was still live. A row that reads `waiting` at that point is reconnected instead. |
+
+Removing the persona (or changing it destructively) with a confirmed change
+cancels its launch's wait at once; see
+[A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
+
+Later, the health check's reconnects check the same way, reading the screen
+(and, when it sits idle, the transcript) once per attempt and keeping what
+they saw across attempts. Before typing into a `waiting` row, they read its
+screen once too:
+
+| Line | Meaning |
+|---|---|
+| `[slack] reconnectSession: persona=<key> is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)` | The screen shows a running turn (a spinner, a busy hint or an API retry message). A later tick retries once it ends. |
+| `[slack] reconnectSession: persona=<key> is working; its pane shows an idle screen (no busy indicator, no prompt) and its transcript ends with a completed turn, both unchanged for <N>s of the 60s needed — deferring /mcp reconnect to a later tick, which reads them again (b.f2b)` | Both look idle; the next attempt comes on the next tick that finds the persona not connected. |
+| `[slack] reconnectSession: persona=<key> reads working, but its pane has shown the same idle screen (no busy indicator, no prompt) and its transcript has ended with a completed turn, both unchanged, for <N>s — treating the row as stale and reconnecting (b.f2b)` | The stale row is reconnected. |
+| `[slack] reconnectSession: persona=<key> is working and its pane shows an idle screen, but <why> — no idle evidence; deferring /mcp reconnect to a later tick (b.f2b/b.rmy)` | The screen is idle, but the transcript doesn't end with a completed turn or can't be read (`<why>`, as at a launch). A later tick retries. |
+| `[slack] reconnectSession: persona=<key> is working and its pane is blank — no idle evidence; deferring /mcp reconnect to a later tick (b.f2b)` | Nothing on screen yet. A later tick retries. |
+| `[slack] reconnectSession: persona=<key> is working and reading its pane failed: <error> — no idle evidence; deferring /mcp reconnect to a later tick (b.f2b/b.rmy)` | agent-director couldn't read the screen. A later tick retries. |
+| `[slack] reconnectSession: persona=<key> is working and its pane shows a prompt or dialog — not typing into it; deferring /mcp reconnect to a later tick (b.f2b/b.rmy)` | A prompt is on screen. |
+| `[slack] reconnectSession: persona=<key> reads working and its pane has shown a prompt or dialog for <N>s — blocked on it; not typing into it, deferring /mcp reconnect to a later tick (answer it in tmux session "slack_bot_<key>") (b.f2b)` | The prompt stayed for 60 s: the *Waiting on a prompt* notice is posted. Answer the prompt. |
+| `[slack] reconnectSession: persona=<key> is <state> — its session waits on a prompt or dialog; not typing /mcp reconnect into it, deferring to a later tick (b.f2b/b.rmy)` | The row reads `ask_user` or `check_permission`: the *Waiting on a prompt* notice is posted. Answer the prompt. |
+| `[slack] reconnectSession: persona=<key> is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick (b.f2b/b.rmy)` | The row reads `waiting`, but the screen shows a turn running. A later tick retries. |
+| `[slack] reconnectSession: persona=<key> is waiting but its pane shows a prompt or dialog — not typing into it; deferring /mcp reconnect to a later tick (answer it in tmux session "slack_bot_<key>") (b.f2b/b.rmy)` | The row reads `waiting`, but a prompt is on screen: the *Waiting on a prompt* notice is posted. Answer the prompt. |
+| `[slack] reconnectSession: persona=<key> is waiting and reading its pane failed: <error> — reconnecting on the waiting row alone (b.f2b)` | agent-director couldn't read the screen; the `waiting` row is enough, and the reconnect goes ahead. |
+| `[slack] reconnectSession: persona=<key> status check failed: <error> — not typing /mcp reconnect blind; deferring to a later tick (b.f2b/b.rmy)` | agent-director couldn't report the row's state, so nothing is typed. A later tick retries; while agent-director stays unreachable the health check reads the persona as dead and relaunches it. |
+
+### At a start: one persona waiting doesn't hold up the others
+
+A launch that meets a `working` row keeps waiting in the background, and the
+start goes on without it: the other personas launch, and the health check and
+the check for pending changes start as usual.
+
+| Line | Meaning |
+|---|---|
+| `[slack] startupSessionManager: "<name>" (key=<key>) is waiting for its working row to settle — the start pass goes on without it; its launch stays in flight in the background (b.f2b)` | Normal. The health check leaves this persona alone until the launch ends. |
+| `[slack] startupSessionManager: complete — <N> persona(s): … <n> not brought up, <m> not reconnected` | The start summary. `not reconnected` counts instances left running without a reconnect (see the lines above). |
+| `[slack] startupSessionManager: <n> persona(s) still waiting in the background for a working row to settle — not counted above; each logs its outcome when it settles (b.f2b)` | Launches still waiting when the summary was logged. |
+| `[slack] startupSessionManager: background launch for "<name>" (key=<key>) settled: <outcome> (b.f2b)` | The launch ended. `reconnected`: the reconnect was typed. `not-reconnected`: the instance was left running without it (the line before says what happens next), or the persona's removal cancelled the wait. A relaunch action (`resumed`, `spawned`, `fresh-after-amnesia` or `fresh-after-inconclusive-amnesia`): the instance had died and was relaunched; for the two amnesia actions, the persona's `[slack] ErrJsonlMissing diagnostic:` lines say whether its conversation history was kept. `deferred`: its `claude_config_dir` stopped resolving, and the persona is held until it does. `failed`: see the persona's spawn-failure lines. |
+| `[slack] startupSessionManager: unexpected error in the background launch for "<name>" (key=<key>): <error>` | An internal error, also recorded as `spawn-failed` in `startup-errors.log`. Report it as a bug, with the persona's lines. |
 
 ---
 
@@ -971,8 +1108,12 @@ validated.
 The server's next check for pending changes waits until every teardown and
 bring-up of the change has settled, which can take minutes: up to 5 when a
 pre-session dialog has to be approved, up to 10 when a leftover instance of
-the persona is still `working`. A teardown also waits for any restart already
-under way for its persona. Meanwhile `config.json.pending` isn't refreshed and
+the persona is still `working` (about 1 when its screen and transcript show
+it idle; see
+[A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected)).
+A teardown also waits for any restart already under way for its persona, but
+not for a launch waiting on a `working` row: it cancels that wait, and nothing
+is typed. Meanwhile `config.json.pending` isn't refreshed and
 no other confirmation is picked up. Stopping the server doesn't wait for it.
 
 **Removed persona.** It is torn down at once, with no graceful wind-down: its
@@ -992,6 +1133,10 @@ guaranteed to be resumed.
 | `[slack] persona teardown of "<name>" (key=<key>): <step> failed: <error>`, any other step | An internal error. The other steps still ran. Report it as a bug. |
 | `[slack] dry-run: persona teardown of "<name>" (key=<key>): skipping the agent-director kill and delete of cscb_<key>` | Dry run: the instance and its row are left alone. |
 | `[slack] Cancelled restart timer for persona=<key>` | A restart that was pending for it was cancelled. |
+| `[slack] waitForWaitingAndReconnect: persona=<key> — cancelling its launch's wait for its working row (b.f2b)` | Its launch was waiting for a `working` row. The wait is cancelled, so the teardown doesn't wait up to 10 minutes for it. |
+| `[slack] waitForWaitingAndReconnect: persona=<key> — its launch in flight will not wait for a working row: any such wait is cancelled at once (b.f2b)` | Its launch was running but not waiting yet; a wait it starts ends at once. |
+| `[slack] waitForWaitingAndReconnect: the wait for "<name>" (key=<key>) was cancelled (its persona is being torn down) — nothing typed (b.f2b)` | The cancelled wait ended with nothing typed; the teardown goes on. |
+| `[slack] persona teardown of "<name>" (key=<key>): cancelling its launch's wait for a working row before its turn failed: <error>` | An internal error in that cancel; the teardown still runs. Report it as a bug. |
 | `[slack] permission-poller: persona=<key>: dropped <n> tracked prompt(s); their Slack messages stay as posted` | Its open prompts are no longer tracked. Their messages stay in Slack, and clicking them does nothing. |
 | `[slack] persona-notifier: persona=<key>: dropped <n> held notice(s), not posted — the persona was torn down` | Notices that were waiting for its Slack client are dropped. |
 | `[slack] persona-destination-hold: hold cancelled — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | Notices that were waiting for its failing destination are dropped. |
@@ -2135,7 +2280,7 @@ Read the row's state with the persona's server-log lines:
 |---|---|---|
 | Live state (`working`, `waiting`, `pending`, `check_permission`, `ask_user`) | The persona is `broken` or `retrying` | Down persona with a live instance: kept, not served. Fix the persona's cause; the instance is picked up when it's up. |
 | Live state | The persona is up, `Session connected: …` | Healthy. |
-| Live state | The persona is up, but no `Session connected` since the start | Waiting to re-register; the health check reconnects it within about 3–5 minutes with default settings. |
+| Live state | The persona is up, but no `Session connected` since the start | Waiting to re-register; the health check reconnects it within about 3–5 minutes with default settings. A `working` row waits for its turn to end, and a prompt on screen or `session_restart_delay` 0 posts a notice instead: see [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected). |
 | `ended`, `missing`, or no row | The persona is up | The instance is dead. Restart and the health check relaunch it; look for `Scheduling restart for persona=<key>` and `Relaunching session`. |
 | `ended`, `missing`, or no row | The persona is down | Nothing to serve; it's launched once the persona comes up. |
 | No row | `persona teardown of … complete` | The persona was removed by a confirmed change; its instance was destroyed. Expected. |

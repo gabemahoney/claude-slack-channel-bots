@@ -32,6 +32,12 @@ import { makeMultiPersonaConfig, makePersonaConfig } from './test-helpers/person
 import type { Persona } from '../src/config.ts'
 import type { PersonaConnectionManager } from '../src/persona-connections.ts'
 import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
+import {
+  _resetNotConnectedEpisodes,
+  forgetNotConnectedEpisode,
+  notifyDisconnectedWithAutoRestartDisabled,
+  setSessionNotifier,
+} from '../src/session-manager.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import {
   createPersonaBringUpController,
@@ -1082,17 +1088,17 @@ describe('persona-keyed work list and streaks (b.av2 SR-6.3)', () => {
 // of a persona missing from its work list (case 12 above).
 // ---------------------------------------------------------------------------
 
-describe('forgetDisconnectedStreak — per-persona teardown (b.av2 SR-6.5)', () => {
-  /** Start the check and wait until `deps` has run `n` tick bodies (bounded by its `maxTicks`). */
-  async function runTicks(deps: ReturnType<typeof makeDeps>, n: number): Promise<void> {
-    initHealthCheck(deps)
-    startHealthCheck(FAST_INTERVAL_S)
-    for (let waited = 0; deps.tickCount() < n && waited < 500; waited++) await Bun.sleep(1)
-    await Bun.sleep(20)  // let the last tick body settle; later ticks stop at maxTicks
-    stopHealthCheck()
-    expect(deps.tickCount()).toBe(n)
-  }
+/** Start the check and wait until `deps` has run `n` tick bodies (bounded by its `maxTicks`). */
+async function runTicks(deps: ReturnType<typeof makeDeps>, n: number): Promise<void> {
+  initHealthCheck(deps)
+  startHealthCheck(FAST_INTERVAL_S)
+  for (let waited = 0; deps.tickCount() < n && waited < 500; waited++) await Bun.sleep(1)
+  await Bun.sleep(20)  // let the last tick body settle; later ticks stop at maxTicks
+  stopHealthCheck()
+  expect(deps.tickCount()).toBe(n)
+}
 
+describe('forgetDisconnectedStreak — per-persona teardown (b.av2 SR-6.5)', () => {
   test('B\'s streak is dropped at once and silently, A\'s is kept; B then leaves the work list (not probed) and is re-added with a fresh streak', async () => {
     const full = workList('persona_a', 'persona_b')
     const onlyA = { persona_a: full.persona_a }
@@ -1128,6 +1134,116 @@ describe('forgetDisconnectedStreak — per-persona teardown (b.av2 SR-6.5)', () 
     // streak) and 3rd (tick 3); B on its 3rd (tick 4), two fresh observations
     // after the forget and the re-add.
     expect(after.scheduleRestartAtConnectedCount).toEqual([1, 3, 3])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.f2b — a launch in flight, the delay-0 not-connected notice, and pending
+// working-row evidence
+//
+// A start launch still waiting in the background for a `working` row (or any
+// launch in flight) owns its session: the tick skips the persona as it skips a
+// pending restart. With session_restart_delay 0, scheduleRestart only logs and
+// returns, so an alive persona the tick would reconnect gets the not-connected
+// notice, worded for why it is undeliverable (the real session-manager
+// notifier here: once per episode, and a healthy tick ends the episode). While the
+// reconnect adapter holds an idle run for a persona's `working` row, one more
+// attempt can find the row stale, so the tick schedules it on the first
+// undeliverable observation instead of the second.
+// ---------------------------------------------------------------------------
+
+describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending working-row evidence', () => {
+  afterEach(() => {
+    setSessionNotifier(undefined)
+    _resetNotConnectedEpisodes()
+  })
+
+  test('a persona whose launch is in flight is skipped like a pending restart (not stat\'d, probed or scheduled), and its streak does not carry across the launch', async () => {
+    //   tick1: not in flight → alive && !connected → streak 1 (connected call 1)
+    //   tick2: in flight     → skipped, streak cleared
+    //   tick3: → fresh streak 1 (call 2); tick4: → streak 2 → scheduled (call 3)
+    const deps = makeDeps({ isSessionAliveResult: true, isSessionConnectedResult: false, maxTicks: 4 })
+    const inFlight = [false, true, false, false]
+    const asked: string[] = []
+    deps.isLaunchInFlight = (key) => inFlight[Math.min(asked.push(key) - 1, inFlight.length - 1)]!
+
+    await runTicks(deps, 4)
+
+    expect(asked).toEqual([KEY, KEY, KEY, KEY])
+    expect(deps.statRouteCalls).toHaveLength(3)
+    expect(deps.isSessionAliveCalls).toHaveLength(3)
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([3])
+  })
+
+  test.each<[string, boolean, DepsOpts, 'disconnected' | 'streamless', string[]]>([
+    ['disabled (session_restart_delay 0), disconnected', true, { isSessionConnectedResult: false }, 'disconnected', [':warning: *Not connected*', 'its connection has been down on two health checks in a row']],
+    ['disabled (session_restart_delay 0), connected with its stream gone', true, { hasSessionStreamResult: false }, 'streamless', [':warning: *Not receiving messages*', 'its message stream is gone']],
+    ['enabled, disconnected', false, { isSessionConnectedResult: false }, 'disconnected', []],
+    ['enabled, connected with its stream gone', false, { hasSessionStreamResult: false }, 'streamless', []],
+  ])('auto-restart %s: the alive persona is scheduled every second tick; with auto-restart disabled each schedule asks for the not-connected notice with the persona and why, raised once for the episode', async (_label, disabled, down, cause, notice) => {
+    const raised: Array<{ key: string; text: string }> = []
+    setSessionNotifier((key, text) => { raised.push({ key, text }) })
+    const deps = makeDeps({ isSessionAliveResult: true, ...down, maxTicks: 6 })
+    deps.isAutoRestartDisabled = () => disabled
+    const asked: Array<[number, string, string]> = []
+    deps.notifyNotConnected = (key, why) => {
+      asked.push([deps.isSessionConnectedCalls.length, key, why])
+      notifyDisconnectedWithAutoRestartDisabled(key, why)
+    }
+
+    await runTicks(deps, 6)
+
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([2, 4, 6])
+    expect(asked).toEqual(disabled ? [[2, KEY, cause], [4, KEY, cause], [6, KEY, cause]] : [])
+    expect(raised.map((n) => n.key)).toEqual(disabled ? [KEY] : [])
+    if (disabled) {
+      const [head, detail] = notice
+      expect(raised[0]!.text).toStartWith(head!)
+      expect(raised[0]!.text).toContain(detail!)
+    }
+  })
+
+  test('a healthy tick, and only a healthy one, ends the persona\'s not-connected episode (endNotConnectedEpisode): a later episode is reported again', async () => {
+    //   ticks 1–2: disconnected → scheduled at tick 2, the notice raised
+    //   tick 3:    healthy      → the episode ends
+    //   ticks 4–5: disconnected → scheduled at tick 5, the notice raised again
+    const raised: Array<{ key: string; text: string }> = []
+    setSessionNotifier((key, text) => { raised.push({ key, text }) })
+    const deps = makeDeps({ isSessionAliveResult: true, connectedSequence: { [KEY]: [false, false, true, false, false] }, maxTicks: 5 })
+    deps.isAutoRestartDisabled = () => true
+    deps.notifyNotConnected = notifyDisconnectedWithAutoRestartDisabled
+    const ended: Array<[number, string]> = []
+    deps.endNotConnectedEpisode = (key) => {
+      ended.push([deps.isSessionConnectedCalls.length, key])
+      forgetNotConnectedEpisode(key)
+    }
+
+    await runTicks(deps, 5)
+
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([2, 5])
+    expect(ended).toEqual([[3, KEY]])
+    expect(raised.map((n) => n.key)).toEqual([KEY, KEY])
+  })
+
+  test.each<[string, boolean, number[]]>([
+    ['pending', true, [1, 2]],
+    ['none', false, [2]],
+  ])('working-row evidence %s: an alive persona not deliverable is scheduled from its first undeliverable tick when evidence is pending, else from its second', async (_label, pending, scheduledAt) => {
+    const deps = makeDeps({ isSessionAliveResult: true, isSessionConnectedResult: false, maxTicks: 2 })
+    deps.hasPendingWorkingRowEvidence = () => pending
+
+    await runTicks(deps, 2)
+
+    expect(deps.scheduleRestartAtConnectedCount).toEqual(scheduledAt)
+  })
+
+  test('pending working-row evidence schedules nothing for a persona that is connected with its stream', async () => {
+    const deps = makeDeps({ isSessionAliveResult: true, maxTicks: 2 })
+    deps.hasPendingWorkingRowEvidence = () => true
+
+    await runTicks(deps, 2)
+
+    expect(deps.scheduleRestartCalls).toEqual([])
   })
 })
 

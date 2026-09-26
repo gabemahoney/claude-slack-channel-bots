@@ -15,7 +15,10 @@
  *      and its pending restart timer is cancelled;
  *   2. a launch still in flight for it (the start pass's, which runs outside
  *      the serializer) is waited for, so the kill below never races a launch
- *      that is bringing the row up;
+ *      that is bringing the row up. A launch waiting for a `working` row to
+ *      settle (up to 10 minutes) has that wait cancelled first (b.f2b: when
+ *      the teardown is submitted, and again here), so it types nothing and
+ *      settles promptly, and the apply is not held up by it (SR-8.6);
  *   3. its Slack connection is stopped (so no further event arrives for it),
  *      then its inbound dedupe store and its ack-tracker entries are dropped;
  *   4. its cached DM destination is forgotten, its held destination notices
@@ -28,8 +31,9 @@
  *      through `withOutageDetection`; a row already gone is success. Its
  *      outage flags are forgotten before these calls (so a success posts no
  *      all-clear) and again after them (so a flag a failing call raised does
- *      not survive). Its restart failure count and health-check streak are
- *      forgotten;
+ *      not survive). Its restart failure count, health-check streak and
+ *      not-connected episode (b.f2b: its notice latch and the restart path's
+ *      idle evidence) are forgotten;
  *   8. its reply-guard record is deleted and its launched-with directory
  *      forgotten (read first), then the Stop-hook launch pass re-evaluates
  *      the persona's configured and launched-with directories against the
@@ -271,12 +275,25 @@ export interface PersonaLifecycleDeps {
   // --- persona teardown ---
   /** Resolves once the launch in flight for the key (if any) settled; never rejects (`whenLaunchSettled`). */
   whenLaunchSettled: (key: string) => Promise<void>
+  /**
+   * Cancel the key's launch wait for a `working` row, if one is running
+   * (b.f2b, `cancelWorkingRowWait`): the wait types nothing and its launch
+   * settles promptly, instead of holding the teardown for up to 10 minutes.
+   * Production always passes it.
+   */
+  cancelLaunchWait?: (key: string) => unknown
   /** Cancel the key's pending restart timer (`cancelRestartTimer`). */
   cancelRestartTimer: (key: string) => unknown
   /** Forget the key's restart failure count and cap latch (`forgetFailures`). */
   forgetFailures: (key: string) => void
   /** Forget the key's health-check disconnected streak (`forgetDisconnectedStreak`). */
   forgetDisconnectedStreak: (key: string) => void
+  /**
+   * End the key's not-connected episode (b.f2b, `forgetNotConnectedEpisode`:
+   * its notice latch and the restart path's idle evidence), so a key added
+   * again starts afresh. Production always passes it.
+   */
+  forgetNotConnectedEpisode?: (key: string) => void
   /** Forget the keys' outage flags silently (`resetAllToHealthy`). */
   resetOutageState: (keys: string[]) => void
   /** Drop the key's tracked permission prompts and wedge state (`forgetPersonaPrompts`). */
@@ -406,25 +423,33 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
   // -------------------------------------------------------------------------
 
   /**
-   * Run when a teardown is submitted, before its serializer turn. For the old
-   * half of a destructive modify (its key still applied after step 1; a
-   * removed persona needs nothing here, the applied-set guard refuses it):
-   * cancel its bring-up state and retries and its pending restart timer now.
-   * Work already queued ahead of the teardown for the key then does nothing:
-   * a restart timer's work finds it not up (the relaunch gate), and a
-   * bring-up retry or its launch finds its entry cancelled. Otherwise that
-   * work would launch the new declaration (the launch paths read the applied
-   * set) only for the teardown to kill it. Both calls are synchronous and run
-   * again, as no-ops, in the teardown's own steps. A failure is logged.
+   * Run when a teardown is submitted, before its serializer turn. For every
+   * teardown (b.f2b): cancel its launch's wait for a `working` row, if one is
+   * running, so neither the teardown nor work queued ahead of it for the key
+   * (a restart that joined that launch) waits it out, up to 10 minutes. For
+   * the old half of a destructive modify (its key still applied after step
+   * 1; a removed persona needs nothing more here, the applied-set guard
+   * refuses it): cancel its bring-up state and retries and its pending
+   * restart timer now. Work already queued ahead of the teardown for the key
+   * then does nothing: a restart timer's work finds it not up (the relaunch
+   * gate), and a bring-up retry or its launch finds its entry cancelled.
+   * Otherwise that work would launch the new declaration (the launch paths
+   * read the applied set) only for the teardown to kill it. Every call is
+   * synchronous and runs again, as a no-op, in the teardown's own steps. A
+   * failure is logged.
    */
   function cancelBeforeTurn(persona: Persona): void {
     const { key } = persona
-    if (!isApplied(key)) return
     const prefix = `[slack] persona teardown of ${renderPersonaRef(persona.name, key)}`
     const cancels: [string, () => unknown][] = [
-      ['cancelling its bring-up retries', () => deps.bringUps.cancel(key)],
-      ['cancelling its restart timer', () => deps.cancelRestartTimer(key)],
+      ["cancelling its launch's wait for a working row", () => deps.cancelLaunchWait?.(key)],
     ]
+    if (isApplied(key)) {
+      cancels.push(
+        ['cancelling its bring-up retries', () => deps.bringUps.cancel(key)],
+        ['cancelling its restart timer', () => deps.cancelRestartTimer(key)],
+      )
+    }
     for (const [what, cancel] of cancels) {
       const failed = (err: unknown) => log(`${prefix}: ${what} before its turn failed: ${describeThrownValue(err)}`)
       try {
@@ -456,6 +481,9 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // teardown waits below.
     await step('cancelling its bring-up retries', () => deps.bringUps.cancel(key))
     await step('cancelling its restart timer', () => deps.cancelRestartTimer(key))
+    // b.f2b: again here, for a wait that started after the teardown was
+    // submitted; the launch then settles promptly.
+    await step("cancelling its launch's wait for a working row", () => deps.cancelLaunchWait?.(key))
     await step('waiting for its launch in flight', () => deps.whenLaunchSettled(key))
 
     // The connection before the routing: an event for the key would create
@@ -489,6 +517,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     if (isApplied(key)) await step('dropping the notices held during its teardown', () => deps.notifier.forget(key))
     await step('forgetting its restart failure count', () => deps.forgetFailures(key))
     await step('forgetting its health-check streak', () => deps.forgetDisconnectedStreak(key))
+    await step('forgetting its not-connected episode', () => deps.forgetNotConnectedEpisode?.(key))
 
     // Read the launched-with dir before the teardown forgets it.
     let launchedWith: string | undefined

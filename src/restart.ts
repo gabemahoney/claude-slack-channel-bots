@@ -296,8 +296,16 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
     // !connected (or has since gone dead), the tick calls scheduleRestart
     // again, so a failed/deferred reconnect is retried without any re-entry
     // here. ('transient' also covers the b.9a7 hazard-2 `working` defer: the
-    // tick retries once the turn settles.) Not counting here keeps the
-    // failure count tied to actual launch attempts, not this reconnect site.
+    // tick retries once the turn settles. b.f2b: it also covers a `working`
+    // row whose idle evidence is still being gathered — the tick then retries
+    // on its first undeliverable observation, and the adapter reconnects the
+    // row once its pane has shown the same idle screen and its transcript has
+    // ended with a completed turn, both unchanged, across attempts — a
+    // `waiting` row whose pane shows a running turn or a prompt, an
+    // `ask_user`/`check_permission` row, which is never typed into, and a
+    // failed status call, which types nothing blind.) Not counting here keeps
+    // the failure count tied to actual launch attempts, not this reconnect
+    // site.
     //
     // For the dead-tmux 'escalate-dead' verdicts ('dead-session' from
     // reconnectMcp, and b.d61's `working` row whose tmux session is gone)

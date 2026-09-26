@@ -71,14 +71,23 @@ import {
 import { personaInstanceId, personaTmuxSessionName, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import {
   AGENT_DIRECTOR_LIVE_STATES,
+  cancelWorkingRowWait,
   checkLaunchConfigDir,
+  checkWaitingRowPane,
+  checkWorkingRowPane,
   deletePersonaInstance,
+  forgetNotConnectedEpisode,
+  forgetWorkingRowEvidence,
+  hasPendingWorkingRowEvidence,
   hasPersonaTmuxSession,
   holdLaunchIfConfigDirUnresolvable,
   isLaunchInFlight,
   killPersonaInstance,
   launchSession,
+  notifyDisconnectedWithAutoRestartDisabled,
+  notifyPersonaNotConnected,
   notifyRestartCapReached,
+  PROMPT_ROW_STATES,
   reconcileOrphans,
   reconnectMcp,
   setConfigDirUnresolvableHook,
@@ -617,6 +626,9 @@ async function handleInitialized(
   // Promote pending → registered (removes from pendingSessionMap internally;
   // the pending stub becomes the registered entry).
   registerSession(realCwd, persona.key, pendingId)
+  // b.f2b: connected again, so its not-connected episode (if any) is over:
+  // its notice latch and the restart path's idle evidence are forgotten.
+  forgetNotConnectedEpisode(persona.key)
 
   // Register MCP session ID for future HTTP request routing
   registerMcpSessionId(pendingId, persona.key)
@@ -986,12 +998,27 @@ export function _buildKillSessionAdapter(
  * exactly the case most likely to look disconnected while healthy, and typing
  * into its pane mid-turn risks corrupting the turn. So DEFER `working`: probe
  * AD state and, if working, return 'transient' — a no-op that restart.ts does
- * NOT count and does NOT re-enter scheduleRestart on, leaving the next tick free
- * to retry once the turn settles to an idle-like state (waiting/ask_user/
- * check_permission). This does not regress the b.rmy invariant: we never declare
- * a `working` row with a live tmux session dead, only decline to poke it. On
- * any status error we fall through to the reconnect attempt (today's behavior)
- * rather than manufacture a false defer.
+ * NOT count and does NOT re-enter scheduleRestart on, leaving a later tick free
+ * to retry once the turn settles to `waiting`. This does not regress the b.rmy
+ * invariant: we never declare a `working` row with a live tmux session dead,
+ * only decline to poke it.
+ *
+ * b.f2b — never type blind. When the status call throws, nothing is known
+ * about the session (it may be mid-turn), so nothing is typed: the failure is
+ * logged and the adapter returns 'transient'; the next tick retries (and
+ * during an agent-director outage the liveness probe reads the persona dead,
+ * so the tick relaunches it instead). Before b.f2b a failed status call fell
+ * through to the reconnect.
+ *
+ * b.f2b — never type into a prompt or dialog. `/mcp reconnect` + Enter typed
+ * into an `ask_user` or `check_permission` session could confirm the dialog's
+ * default, so those states are deferred too ('transient'): the deferral is
+ * logged, and the persona's `blocked-on-prompt` not-connected notice is raised
+ * (once per episode). A later tick reconnects it once the prompt is answered
+ * and its turn ends. A `waiting` row's pane is read once first
+ * (`checkWaitingRowPane`): a running turn or a prompt or dialog on it defers
+ * the same way (a prompt raises the same notice); a failed read does not, as
+ * the `waiting` row is agent-director's own idle signal.
  *
  * b.d61 — the `working` deferral is bounded by the tmux session. A `working`
  * row is no proof of a live turn: when the persona's tmux session is killed
@@ -1004,7 +1031,25 @@ export function _buildKillSessionAdapter(
  *   - a launch for the persona is in flight → defer ('transient'): the launch
  *     owns the session's lifecycle, and a tmux session it has not created yet
  *     is no proof of death;
- *   - alive → defer ('transient'), as above;
+ *   - alive → the positive-idle rule decides (b.f2b, `checkWorkingRowPane`).
+ *     A `working` row can be stale: agent-director may leave it `working`
+ *     after the turn ended, and deferring on it forever would strand the
+ *     persona. Each attempt makes one evidence read (the pane and, when it
+ *     shows an idle screen, the session's transcript, located with the
+ *     persona's claude_config_dir from `getPersona`), and the evidence is kept
+ *     across attempts (they are a tick or more apart): once the pane has shown
+ *     the same idle screen (no busy indicator, no prompt) AND the transcript
+ *     has ended with a completed turn, both unchanged, at every read across
+ *     reads spanning `STALE_WORKING_WINDOW_MS`, the row is stale and the
+ *     adapter goes on to the reconnect below. A busy, changing, blank or
+ *     unreadable pane, an idle one whose transcript doesn't end with a
+ *     completed turn or can't be located or read, or evidence not yet held for
+ *     the window, defers ('transient'), as above; so does a prompt, which is
+ *     never typed into, and which raises the `blocked-on-prompt` notice (once
+ *     per episode) once shown across reads spanning the window. The evidence
+ *     is forgotten when an attempt reads the row in another state or can't
+ *     read it, when a launch for the persona starts, and when it reconnects,
+ *     becomes deliverable again or is torn down;
  *   - gone → there is no pane to type into: fire the dead-tmux sweep
  *     (`sweepDeadTmuxChannel`, b.sv7) once and return 'escalate-dead'.
  *     restart.ts then probes liveness again in the same restart run and, when
@@ -1012,25 +1057,47 @@ export function _buildKillSessionAdapter(
  *     (otherwise a later tick does);
  *   - the probe throws → defer ('transient'): a failed probe is no proof the
  *     session is dead (b.rmy).
- * The deferral therefore lasts only while the persona's tmux session exists.
+ * The deferral therefore lasts only while the persona's tmux session exists
+ * and gives no positive evidence that the row is stale (b.f2b).
  *
+ * @param getPersona  The applied persona with a key (production:
+ *   `getAppliedPersona`), for locating a `working` row's transcript under its
+ *   claude_config_dir; without it only the row's persisted transcript path is
+ *   read.
  * @internal
  */
-export function _buildReconnectSessionAdapter(): (key: string) => Promise<'success' | 'escalate-dead' | 'transient'> {
+export function _buildReconnectSessionAdapter(
+  getPersona?: (key: string) => Persona | undefined,
+): (key: string) => Promise<'success' | 'escalate-dead' | 'transient'> {
   // `key` is the persona key.
   return async (key: string) => {
-    let state: string | undefined
+    let state: string
     try {
       const claude_instance_id = personaInstanceId(key)
       const st = await withOutageDetection(key, undefined, (client) =>
         client.status({ claude_instance_id }),
       )
       state = st.state
-    } catch {
-      // Ignore — proceed to reconnect attempt below (reconnectMcp handles its
-      // own status/send-keys errors and outage flagging).
+    } catch (err) {
+      // b.f2b: nothing is known about the session, so nothing is typed.
+      forgetWorkingRowEvidence(key)
+      console.error(
+        `[slack] reconnectSession: persona=${key} status check failed: ${describeThrownValue(err)} — not typing /mcp reconnect blind; deferring to a later tick (b.f2b/b.rmy)`,
+      )
+      return 'transient'
     }
-    if (state === 'working') return workingReconnectVerdict(key)
+    // b.f2b: the evidence for a `working` row spans consecutive attempts that
+    // read the row `working`; any other reading ends it.
+    if (state !== 'working') forgetWorkingRowEvidence(key)
+    if (state === 'working') {
+      const verdict = await workingReconnectVerdict(key, getPersona)
+      if (verdict !== 'reconnect') return verdict
+    } else if (PROMPT_ROW_STATES.has(state)) {
+      return deferPromptRow(key, state)
+    } else if (state === 'waiting' && (await checkWaitingRowPane(key)) === 'defer') {
+      // b.f2b: its pane shows a running turn or a prompt; logged there.
+      return 'transient'
+    }
     // Widened return type (SR-25.1 single counting site): surface the
     // ReconnectOutcome to restart.ts so it can call recordSuccess on the
     // success path. Map main's ReconnectOutcome onto the restart union —
@@ -1071,13 +1138,38 @@ export function _buildReconnectSessionAdapter(): (key: string) => Promise<'succe
 }
 
 /**
- * b.d61: the reconnect adapter's verdict for a persona whose AD row reads
- * `working` — defer while a launch for it is in flight or its tmux session is
- * alive or cannot be probed, sweep and escalate once it is provably gone (see
- * `_buildReconnectSessionAdapter`). Never throws: `sweepDeadTmuxChannel`
- * swallows its own failures.
+ * b.f2b: the reconnect adapter's verdict for a persona whose row reads
+ * `ask_user` or `check_permission` (see `_buildReconnectSessionAdapter`):
+ * `/mcp reconnect` + Enter could confirm the dialog's default, so nothing is
+ * typed. Logs the deferral, raises the `blocked-on-prompt` not-connected
+ * notice (once per episode) and returns 'transient'. The notice says a later
+ * attempt reconnects the persona once its turn ends: the restart path runs
+ * only with auto-restart on (`scheduleRestart` arms nothing while
+ * `session_restart_delay` is 0).
  */
-async function workingReconnectVerdict(key: string): Promise<'escalate-dead' | 'transient'> {
+function deferPromptRow(key: string, state: string): 'transient' {
+  console.error(
+    `[slack] reconnectSession: persona=${key} is ${state} — its session waits on a prompt or dialog; not typing /mcp reconnect into it, deferring to a later tick (b.f2b/b.rmy)`,
+  )
+  notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
+  return 'transient'
+}
+
+/**
+ * b.d61: the reconnect adapter's verdict for a persona whose AD row reads
+ * `working` — defer while a launch for it is in flight or its tmux session
+ * cannot be probed, sweep and escalate once it is provably gone (see
+ * `_buildReconnectSessionAdapter`). b.f2b: with its tmux session alive the
+ * positive-idle rule decides (`checkWorkingRowPane`, the transcript located
+ * with the persona `getPersona` returns): 'reconnect' once the row is shown
+ * stale, and the adapter goes on to type `/mcp reconnect`; otherwise defer.
+ * Never throws: `sweepDeadTmuxChannel` and `checkWorkingRowPane` swallow
+ * their own failures.
+ */
+async function workingReconnectVerdict(
+  key: string,
+  getPersona: ((key: string) => Persona | undefined) | undefined,
+): Promise<'escalate-dead' | 'transient' | 'reconnect'> {
   if (isLaunchInFlight(key)) {
     console.error(`[slack] reconnectSession: persona=${key} is working and a launch for it is in flight — deferring /mcp reconnect to a later tick (b.d61)`)
     return 'transient'
@@ -1092,8 +1184,10 @@ async function workingReconnectVerdict(key: string): Promise<'escalate-dead' | '
     return 'transient'
   }
   if (tmuxAlive) {
-    console.error(`[slack] reconnectSession: persona=${key} is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)`)
-    return 'transient'
+    // b.f2b: one evidence read (pane, and transcript for an idle pane), folded
+    // into the evidence kept across attempts; `checkWorkingRowPane` logs what
+    // it found (a running turn logs the b.9a7 deferral line).
+    return (await checkWorkingRowPane(key, getPersona?.(key))) === 'reconnect' ? 'reconnect' : 'transient'
   }
   console.error(
     `[slack] reconnectSession: persona=${key} is working but its tmux session "${personaTmuxSessionName(key)}" is gone — not deferring; reconciling so the restart relaunches it (b.d61)`,
@@ -1359,9 +1453,13 @@ export async function main(): Promise<void> {
     isShuttingDown: () => shuttingDown,
     log: (line) => console.error(line),
     whenLaunchSettled,
+    // b.f2b: a teardown cancels a launch's wait for a `working` row rather
+    // than wait it out (up to 10 min).
+    cancelLaunchWait: cancelWorkingRowWait,
     cancelRestartTimer,
     forgetFailures,
     forgetDisconnectedStreak,
+    forgetNotConnectedEpisode,
     resetOutageState: resetAllToHealthy,
     forgetPersonaPrompts,
     forgetAcks: forgetPersonaAcks,
@@ -1572,7 +1670,9 @@ export async function main(): Promise<void> {
       return session?.connected === true
     },
     hasSessionStream,
-    reconnectSession: _buildReconnectSessionAdapter(),
+    // b.f2b: the persona locates a `working` row's transcript (its
+    // claude_config_dir) for the positive-idle rule.
+    reconnectSession: _buildReconnectSessionAdapter(getAppliedPersona),
     killSession: _buildKillSessionAdapter(getAppliedPersona),
     launchSession: async (key) => {
       if (!personaConfig) return false
@@ -1638,6 +1738,10 @@ export async function main(): Promise<void> {
   // collision handling per SR-1.4). The pass returns once every persona is
   // up, broken or retrying; a broken or retrying persona is logged, never
   // posted about, and a retrying one is launched later from its own retry.
+  // b.f2b: it does not wait out a launch that is waiting for a `working` row
+  // to settle (up to 10 min): that launch goes on in the background, in
+  // flight, so one stuck persona does not hold up the health check and the
+  // detection tick for the others.
   // A launch failure raises a notice to the persona's destination. The
   // server stays up. The pass is the reload controller's start bring-up
   // (startupSessionManager over the applied set and the bring-up controller),
@@ -1662,6 +1766,21 @@ export async function main(): Promise<void> {
     // tick can notice connected-but-streamless rows and route them to recovery.
     hasSessionStream,
     isRestartPendingOrActive,
+    // b.f2b: a launch in flight owns its session (a start launch may still be
+    // waiting in the background for a `working` row), so the tick skips it.
+    isLaunchInFlight,
+    // b.f2b: with session_restart_delay 0 scheduleRestart does nothing, so an
+    // alive persona the tick would reconnect gets the not-connected notice
+    // (once per episode, worded for a disconnected or a streamless session)
+    // instead of being left down silently; the episode ends when the tick
+    // finds it deliverable again.
+    isAutoRestartDisabled: () => appliedConfig.session_restart_delay === 0,
+    notifyNotConnected: notifyDisconnectedWithAutoRestartDisabled,
+    endNotConnectedEpisode: forgetNotConnectedEpisode,
+    // b.f2b: while the reconnect adapter holds an idle run for a persona's
+    // `working` row, the next attempt (which can find the row stale and
+    // reconnect it) is scheduled on the first undeliverable tick.
+    hasPendingWorkingRowEvidence,
     isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
     statRoute: _buildStatRouteImpl(),
     scheduleRestart,
@@ -1673,13 +1792,18 @@ export async function main(): Promise<void> {
   })
 
   // INVARIANT: Health check starts only after startupSessionManager() returns.
-  // Promise.allSettled ensures all launches have settled before this point.
+  // By then every start launch has settled, or (b.f2b) is still waiting in the
+  // background for a `working` row: such a launch stays in flight, and the
+  // tick skips a persona whose launch is in flight (`isLaunchInFlight`).
   // Do not move this call earlier in the startup sequence.
   startHealthCheck(personaConfig.health_check_interval)
 
   // INVARIANT (b.av2 SR-8.2): the reload detection tick starts only after the
   // start bring-up pass returns, like the health check; the controller arms
-  // nothing before that. Every 5 s it compares config.json (and, outside dry
+  // nothing before that, so every persona's bring-up has read its credentials
+  // (b.f2b: a launch still waiting in the background for a `working` row does
+  // not hold it up; a teardown of that persona waits for its launch).
+  // Every 5 s it compares config.json (and, outside dry
   // run, the credentials files it references) with what is applied and keeps
   // config.json.pending in step, and applies a change the operator confirmed.
   reload.startDetection()

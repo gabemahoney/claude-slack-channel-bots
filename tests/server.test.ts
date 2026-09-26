@@ -23,7 +23,7 @@ import {
   setClientForTests,
   resetClientForTests,
 } from '../src/agent-director-client.ts'
-import { makeStubClient, errTmuxSendKeys, holdSpawns, type StubClient } from './test-helpers/agent-director-stub.ts'
+import { cannedGetResult, makeStubClient, errTmuxSendKeys, holdSpawns, type StubClient } from './test-helpers/agent-director-stub.ts'
 import { _buildIsSessionAliveAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
 import {
   _resetFindMissingMemo,
@@ -34,11 +34,18 @@ import {
   _setSpawnHomeDir,
   _resetSpawnHomeDir,
   _resetInFlightLaunches,
+  _resetNotConnectedEpisodes,
+  _resetNow,
+  _setNow,
+  STALE_WORKING_WINDOW_MS,
+  hasPendingWorkingRowEvidence,
   isLaunchInFlight,
+  setSessionNotifier,
   spawnForPersona,
 } from '../src/session-manager.ts'
-import type { FindMissingParams, SendKeysParams, StatusParams } from 'agent-director'
-import type { PersonaConfig } from '../src/config.ts'
+import type { FindMissingParams, ReadPaneParams, SendKeysParams, StatusParams } from 'agent-director'
+import { MCP_SERVER_NAME, type Persona, type PersonaConfig } from '../src/config.ts'
+import { resolveJsonlPath } from '../src/cozempic.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
 import { makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import {
@@ -50,6 +57,15 @@ import {
   sentinelInMessage,
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import {
+  IDLE_PANE,
+  PERMISSION_PANE,
+  SPINNER_PANE,
+  TRANSCRIPT_SESSION_ID,
+  endedTurn,
+  writeTranscript,
+} from './test-helpers/working-row-panes.ts'
 
 // ---------------------------------------------------------------------------
 // assertSendable()
@@ -553,8 +569,13 @@ describe('_buildIsSessionAliveAdapter', () => {
 // The adapter probes AD state via withOutageDetection().status() before typing
 // `/mcp reconnect`. If the row is `working` it returns 'transient' WITHOUT
 // attempting the reconnect (hazard 2 / b.rmy: don't type into a session
-// mid-turn). Any other live state, or a status-probe error, falls through to
-// the reconnectMcp send-keys attempt. reconnectMcp is a direct module import,
+// mid-turn). b.f2b: neither does an `ask_user` or `check_permission` row, a
+// `waiting` row whose pane shows a running turn or a dialog, or a failed
+// status probe (nothing is typed blind); a `working` row whose tmux session
+// lives is reconnected only on the positive-idle rule (its pane's idle screen
+// and its transcript's completed turn, unchanged across attempts spanning
+// 60 s). Any other live state falls through to the reconnectMcp send-keys
+// attempt. reconnectMcp is a direct module import,
 // but it drives its send-keys through the SAME withOutageDetection client the
 // status probe uses, so the shared stub's `sendKeysCalls` is the observable
 // seam for "was a reconnect attempted", and `sendKeysResult`/`sendKeysError`
@@ -582,21 +603,31 @@ describe('_buildReconnectSessionAdapter', () => {
    * test that holds a launch's spawn open on it (`holdSpawns`).
    */
   function makeHarness(opts: {
+    /** Read at each status probe, so a test may change it between attempts. */
     statusState?: string
-    statusThrows?: boolean
+    /** When set, each status probe rejects with it instead (read at each probe). */
+    statusError?: Error
     sendKeysThrows?: Error
     tmux?: 'alive' | 'gone' | 'probe-error'
+    /** What every pane read shows (default: the stub's empty pane). */
+    pane?: string
+    /** The transcript fields of the `working` row `get` answers (default: the stub's row, which names no transcript). */
+    row?: { jsonl_path?: string; claude_session_id: string; cwd?: string }
+    /** The adapter's persona lookup (production: `getAppliedPersona`). */
+    getPersona?: (key: string) => Persona | undefined
   }): {
     adapter: (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient'>
     statusCalls: StatusParams[]
     sendKeysCalls: SendKeysParams[]
     findMissingCalls: FindMissingParams[]
+    readPaneCalls: ReadPaneParams[]
     tmuxProbes: string[]
     stub: StubClient
   } {
     const statusCalls: StatusParams[] = []
     const sendKeysCalls: SendKeysParams[] = []
     const findMissingCalls: FindMissingParams[] = []
+    const readPaneCalls: ReadPaneParams[] = []
     const tmuxProbes: string[] = []
     _setTmuxSessionProber(async (name) => {
       tmuxProbes.push(name)
@@ -605,10 +636,7 @@ describe('_buildReconnectSessionAdapter', () => {
     })
     const stub = makeStubClient({
       statusCalls,
-      statusFn: () =>
-        opts.statusThrows
-          ? new Error('AD status probe failed')
-          : { state: opts.statusState ?? 'waiting' },
+      statusFn: () => opts.statusError ?? { state: opts.statusState ?? 'waiting' },
       sendKeysCalls,
       sendKeysError: opts.sendKeysThrows,
       sendKeysResult: opts.sendKeysThrows ? undefined : {},
@@ -616,6 +644,9 @@ describe('_buildReconnectSessionAdapter', () => {
       // flows through this SAME stub client. `findMissingCalls` is the observable
       // seam for "was the memoized sweep triggered".
       findMissingCalls,
+      readPaneCalls,
+      readPaneResults: opts.pane === undefined ? undefined : [{ pane: opts.pane }],
+      getResult: opts.row === undefined ? undefined : cannedGetResult({ claude_instance_id: 'cscb_C1', state: 'working', ...opts.row }),
     })
     _resetOutageState()
     initOutageState({
@@ -629,11 +660,13 @@ describe('_buildReconnectSessionAdapter', () => {
     _setTmuxServerEnsurer(async () => {})
     return {
       // The builder resolves the instance ID from the persona key alone
-      // (b.av2 SR-2.2); it takes no config getter.
-      adapter: _buildReconnectSessionAdapter(),
+      // (b.av2 SR-2.2); its persona lookup only locates a `working` row's
+      // transcript (b.f2b).
+      adapter: _buildReconnectSessionAdapter(opts.getPersona),
       statusCalls,
       sendKeysCalls,
       findMissingCalls,
+      readPaneCalls,
       tmuxProbes,
       stub,
     }
@@ -658,6 +691,9 @@ describe('_buildReconnectSessionAdapter', () => {
     _resetFindMissingMemo()
     _resetInFlightLaunches()
     _resetSpawnHomeDir()
+    // b.f2b: the working-row evidence and notice latches, and the clock seam.
+    _resetNotConnectedEpisodes()
+    _resetNow()
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -753,18 +789,48 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(findMissingCalls).toHaveLength(0)
   })
 
-  test('(iii) status-probe error → falls through to the reconnect attempt (no false transient)', async () => {
-    const { adapter, statusCalls, sendKeysCalls, findMissingCalls } = makeHarness({ statusThrows: true })
+  // b.f2b: a failed status probe says nothing about the session (it may be
+  // mid-turn), so nothing is typed blind: 'transient', and the next tick
+  // retries. Before b.f2b it fell through to the reconnect.
+  test("(iii) status-probe error → 'transient' with no send-keys, pane read or sweep; one token-safe line; it ends the working-row evidence", async () => {
+    const statusError = Object.assign(new Error(`status failed (${sentinelInMessage('reconnect')})`), { code: 'EIO', note: LEAK_SENTINEL })
+    _setNow(createFakeClock().now)
+    const transcript = join(dir, `${TRANSCRIPT_SESSION_ID}.jsonl`)
+    writeTranscript(transcript, endedTurn())
+    const opts: Parameters<typeof makeHarness>[0] = {
+      statusState: 'working',
+      tmux: 'alive',
+      pane: IDLE_PANE,
+      row: { jsonl_path: transcript, claude_session_id: TRANSCRIPT_SESSION_ID },
+    }
+    const { adapter, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls } = makeHarness(opts)
+    // An idle working row first: evidence a later attempt could conclude.
+    expect(await adapter('C1')).toBe('transient')
+    expect(hasPendingWorkingRowEvidence('C1')).toBe(true)
+    opts.statusError = statusError
 
-    const result = await adapter('C1')
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    let result: string | undefined
+    try {
+      result = await adapter('C1')
+    } finally {
+      console.error = orig
+    }
 
-    // The probe threw, but the adapter must NOT manufacture a false defer — it
-    // falls through to reconnectMcp, which here succeeds → 'success'.
-    expect(result).toBe('success')
-    expect(statusCalls).toHaveLength(1)
-    expect(sendKeysCalls).toHaveLength(1)
-    // Fell through to a successful reconnect, not escalate-dead — no sweep.
+    expect(result).toBe('transient')
+    expect(statusCalls).toHaveLength(2)
+    expect(readPaneCalls).toHaveLength(1) // the first attempt's only
+    expect(sendKeysCalls).toHaveLength(0)
     expect(findMissingCalls).toHaveLength(0)
+    expect(hasPendingWorkingRowEvidence('C1')).toBe(false)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(
+      `[slack] reconnectSession: persona=C1 status check failed: Error code=EIO message="status failed (${REDACTED_SENTINEL_TAIL})" at `,
+    )
+    expect(lines[0]).toContain('— not typing /mcp reconnect blind; deferring to a later tick')
+    assertNoLeak({ lines })
   })
 
   test("(iv) reconnectMcp 'dead-session' → 'escalate-dead', firing exactly one memoized findMissing sweep (b.sv7 / Epic t1.tkk.e4)", async () => {
@@ -799,5 +865,131 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(result).toBe('success')
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('ops_bot')])
     expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_ops_bot'])
+  })
+
+  // b.f2b: a `working` row can be stale (agent-director left it `working`
+  // after the turn ended), and deferring on it forever stranded the persona.
+  // With its tmux session alive, each attempt reads the pane once and, for an
+  // idle screen, the transcript the row names; the evidence is kept across
+  // attempts (a tick or more apart, here on a fake clock passed to the
+  // session manager's `_setNow`), and the attempt that finds the same idle
+  // screen and the same transcript, ended with a completed turn, across 60 s
+  // types `/mcp reconnect`. A running turn, and a prompt or dialog
+  // (`ask_user` / `check_permission`, or on a `waiting` row's pane), are
+  // never typed into (b.rmy).
+  describe('b.f2b: a working row\'s evidence, and rows waiting on a prompt', () => {
+    let clock: FakeClock
+    let raised: Array<{ key: string; text: string }>
+
+    beforeEach(() => {
+      clock = createFakeClock()
+      _setNow(clock.now)
+      raised = []
+      setSessionNotifier((key, text) => { raised.push({ key, text }) })
+    })
+
+    afterEach(() => {
+      setSessionNotifier(undefined)
+    })
+
+    /** A finished turn's transcript for C1's row, in the test's directory; the row fields that name it. */
+    function endedTranscript(): { jsonl_path: string; claude_session_id: string } {
+      const path = join(dir, `${TRANSCRIPT_SESSION_ID}.jsonl`)
+      writeTranscript(path, endedTurn())
+      return { jsonl_path: path, claude_session_id: TRANSCRIPT_SESSION_ID }
+    }
+
+    /** Attempt a reconnect of C1 `n` times, `stepMs` apart; the verdicts in order. */
+    async function attempts(adapter: (key: string) => Promise<string>, n: number, stepMs: number): Promise<string[]> {
+      const verdicts: string[] = []
+      for (let i = 0; i < n; i++) {
+        if (i > 0) await clock.advance(stepMs)
+        verdicts.push(await adapter('C1'))
+      }
+      return verdicts
+    }
+
+    test("REPRO: a working row whose pane keeps the same idle screen and whose transcript ends with a completed turn: attempts read C1's own pane and defer with nothing typed until that has held for 60 s, then the attempt types /mcp reconnect → 'success'", async () => {
+      const h = makeHarness({ statusState: 'working', tmux: 'alive', pane: IDLE_PANE, row: endedTranscript() })
+
+      expect(await attempts(h.adapter, 2, 30_000)).toEqual(['transient', 'transient'])
+      expect(h.sendKeysCalls).toEqual([])
+      await clock.advance(30_000)
+      expect(await h.adapter('C1')).toBe('success')
+
+      expect(h.readPaneCalls).toEqual(Array(3).fill({ claude_instance_id: 'cscb_C1', n_lines: 40 }))
+      expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(h.findMissingCalls).toHaveLength(0)
+      expect(raised).toEqual([])
+    })
+
+    test("the persona lookup locates a fresh session's transcript (no persisted path) under the persona's claude_config_dir: reconnected once the evidence has held for 60 s", async () => {
+      const configDir = join(dir, 'persona-claude')
+      const persona = makeStandInPersonaConfig({ C1: { claude_config_dir: configDir } }, dir).personas[0]!
+      const cwd = '/work/c1'
+      const composed = resolveJsonlPath(cwd, TRANSCRIPT_SESSION_ID, configDir)
+      mkdirSync(join(composed, '..'), { recursive: true })
+      writeTranscript(composed, endedTurn())
+      const looked: string[] = []
+      const h = makeHarness({
+        statusState: 'working',
+        tmux: 'alive',
+        pane: IDLE_PANE,
+        row: { claude_session_id: TRANSCRIPT_SESSION_ID, cwd },
+        getPersona: (key) => (looked.push(key), persona),
+      })
+
+      expect(await attempts(h.adapter, 2, STALE_WORKING_WINDOW_MS)).toEqual(['transient', 'success'])
+      expect(looked).toEqual(['C1', 'C1'])
+    })
+
+    test("b.rmy: a working row whose pane shows a running turn is never typed into, however long, though its transcript ends with a completed turn: 'transient' on every attempt", async () => {
+      const h = makeHarness({ statusState: 'working', tmux: 'alive', pane: SPINNER_PANE, row: endedTranscript() })
+
+      expect(await attempts(h.adapter, 5, 60_000)).toEqual(['transient', 'transient', 'transient', 'transient', 'transient'])
+      expect(h.sendKeysCalls).toEqual([])
+    })
+
+    test('an attempt that reads the row in another state ends the evidence: the next working reading starts the 60 s over', async () => {
+      const opts = { statusState: 'working', tmux: 'alive' as const, pane: IDLE_PANE, row: endedTranscript() }
+      const h = makeHarness(opts)
+
+      const verdicts = [await h.adapter('C1')]
+      await clock.advance(30_000)
+      opts.statusState = 'waiting'
+      verdicts.push(await h.adapter('C1')) // reconnected directly
+      await clock.advance(30_000) // 60 s since the first idle read
+      opts.statusState = 'working'
+      verdicts.push(await h.adapter('C1'))
+      await clock.advance(60_000)
+      verdicts.push(await h.adapter('C1'))
+
+      expect(verdicts).toEqual(['transient', 'success', 'transient', 'success'])
+      expect(h.sendKeysCalls).toHaveLength(2)
+    })
+
+    test.each(['ask_user', 'check_permission'])("REPRO: a %s row is never typed into: 'transient' on every attempt with no tmux probe, pane read or send-keys, and one blocked-on-prompt notice for the episode", async (state) => {
+      const h = makeHarness({ statusState: state })
+
+      expect(await attempts(h.adapter, 3, 60_000)).toEqual(['transient', 'transient', 'transient'])
+      expect(h.sendKeysCalls).toEqual([])
+      expect(h.readPaneCalls).toEqual([])
+      expect(h.tmuxProbes).toEqual([])
+      expect(raised.map((n) => n.key)).toEqual(['C1'])
+      expect(raised[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
+      expect(raised[0]!.text).toContain('`tmux attach -t slack_bot_C1`')
+    })
+
+    test.each<[string, string, number]>([
+      ['a running turn', SPINNER_PANE, 0],
+      ['a dialog', PERMISSION_PANE, 1],
+    ])("a waiting row whose pane shows %s is not typed into: 'transient' after one read of C1's pane, and a dialog raises one blocked-on-prompt notice", async (_label, pane, noticeCount) => {
+      const h = makeHarness({ statusState: 'waiting', pane })
+
+      expect(await attempts(h.adapter, 2, 60_000)).toEqual(['transient', 'transient'])
+      expect(h.readPaneCalls).toEqual(Array(2).fill({ claude_instance_id: 'cscb_C1', n_lines: 40 }))
+      expect(h.sendKeysCalls).toEqual([])
+      expect(raised.map((n) => n.key)).toEqual(Array(noticeCount).fill('C1'))
+    })
   })
 })

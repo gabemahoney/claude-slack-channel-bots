@@ -648,6 +648,58 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
 })
 
 // ---------------------------------------------------------------------------
+// Static audit: b.f2b — a stale `working` row must not strand a persona
+//
+// The health check's b.f2b dependencies are optional (a test deps object
+// without them keeps the old behaviour), and so is nothing else that ends a
+// not-connected episode, so only these audits make sure production binds
+// them: the launch-in-flight skip, the delay-0 not-connected notice read from
+// the same restart delay the restart module uses, the pending working-row
+// evidence, the end of the episode on a healthy tick and when the persona's
+// MCP session registers, and the reconnect adapter's persona lookup (without
+// it a fresh session's transcript is never found). What each does is tested in tests/health-check.test.ts and
+// tests/session-manager.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('server.ts wires the b.f2b stale-working-row recovery', () => {
+  test('the health check gets the session manager\'s isLaunchInFlight, hasPendingWorkingRowEvidence, notifyDisconnectedWithAutoRestartDisabled and forgetNotConnectedEpisode, and reads session_restart_delay 0 from the config the restart module reads', () => {
+    const props = onlyCallProps('initHealthCheck')
+    for (const [dep, value] of [
+      ['isLaunchInFlight', 'isLaunchInFlight'],
+      ['hasPendingWorkingRowEvidence', 'hasPendingWorkingRowEvidence'],
+      ['notifyNotConnected', 'notifyDisconnectedWithAutoRestartDisabled'],
+      // A healthy tick ends the persona's not-connected episode.
+      ['endNotConnectedEpisode', 'forgetNotConnectedEpisode'],
+    ] as const) {
+      expect([dep, props.get(dep)]).toEqual([dep, value])
+      expect([value, importSource(SERVER_CODE, value)]).toEqual([value, './session-manager.ts'])
+    }
+    const delay = onlyCallProps('initRestart').get('getRestartDelay')?.match(/^\(\) => (\w+)\.session_restart_delay$/)
+    expect(delay).not.toBeNull()
+    expect(props.get('isAutoRestartDisabled')).toBe(`() => ${delay![1]}.session_restart_delay === 0`)
+  })
+
+  test('the restart module\'s reconnect is the reconnect adapter over the live applied persona lookup, getAppliedPersona, which locates a working row\'s transcript under the persona\'s claude_config_dir', () => {
+    expect(onlyCallProps('initRestart').get('reconnectSession')).toBe('_buildReconnectSessionAdapter(getAppliedPersona)')
+    // The only adapter built (its declaration aside): no reconnect path without the lookup.
+    expect(indicesOf(/(?<![\w.$]|function\s+)_buildReconnectSessionAdapter\s*\(/g, SERVER_CODE)).toHaveLength(1)
+  })
+
+  test('handleInitialized ends the persona\'s not-connected episode once its session is registered: forgetNotConnectedEpisode(persona.key), the session manager\'s, right after registerSession', () => {
+    const decl = SERVER_CODE.search(/\basync\s+function\s+handleInitialized\s*\(/)
+    expect(decl).toBeGreaterThan(-1)
+    const [, paramsEnd] = balancedAfter(SERVER_CODE, decl, '(', ')')
+    const [start, end] = balancedAfter(SERVER_CODE, paramsEnd + 1, '{', '}')
+    const forget = onlyCallOf('forgetNotConnectedEpisode')
+    expect(forget > start && forget < end).toBe(true)
+    expect(onlyCallArgs('forgetNotConnectedEpisode')).toEqual(['persona.key'])
+    const register = onlyCallOf('registerSession')
+    expect(register > start && register < forget).toBe(true)
+    expect(importSource(SERVER_CODE, 'forgetNotConnectedEpisode')).toBe('./session-manager.ts')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Static audit: a persona that is not up is refused service (SR-6.3, SR-6.4)
 //
 // The admission decision, the drop and the up predicate are driven through

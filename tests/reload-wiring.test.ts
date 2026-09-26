@@ -462,9 +462,16 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       ['dryRun', 'isDryRun()'],
       ['isShuttingDown', '() => shuttingDown'],
       ['whenLaunchSettled', 'whenLaunchSettled'],
+      // b.f2b: optional in the deps, so only this pin makes sure a production
+      // teardown cancels a launch's wait for a working row instead of waiting
+      // it out (up to 10 minutes).
+      ['cancelLaunchWait', 'cancelWorkingRowWait'],
       ['cancelRestartTimer', 'cancelRestartTimer'],
       ['forgetFailures', 'forgetFailures'],
       ['forgetDisconnectedStreak', 'forgetDisconnectedStreak'],
+      // b.f2b: optional in the deps, so only this pin makes sure production
+      // ends a torn-down key's not-connected episode (notice latch, pane evidence).
+      ['forgetNotConnectedEpisode', 'forgetNotConnectedEpisode'],
       // The silent per-key reset (never the boot reset of every persona).
       ['resetOutageState', 'resetAllToHealthy'],
       ['forgetPersonaPrompts', 'forgetPersonaPrompts'],
@@ -484,11 +491,13 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     // shadowed by a local declaration of the same name.
     const imports: Record<string, string> = {
       whenLaunchSettled: './session-manager.ts',
+      cancelWorkingRowWait: './session-manager.ts',
       killPersonaInstance: './session-manager.ts',
       deletePersonaInstance: './session-manager.ts',
       cancelRestartTimer: './restart.ts',
       forgetFailures: './backoff.ts',
       forgetDisconnectedStreak: './health-check.ts',
+      forgetNotConnectedEpisode: './session-manager.ts',
       resetAllToHealthy: './outage-state.ts',
       forgetPersonaPrompts: './permission-poller.ts',
       forgetPersonaAcks: './ack-tracker.ts',

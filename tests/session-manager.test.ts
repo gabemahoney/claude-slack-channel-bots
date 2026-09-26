@@ -62,6 +62,16 @@
  *     `persona-destination-failed` line per episode, retries on the SR-3.2
  *     backoff, delivery in raised order once the cause clears, and the
  *     failure callback run once per notice, not per retry.
+ *   - b.f2b stale `working` rows: how a pane read is classified and folded
+ *     into evidence, the restart path's evidence across reconnect attempts
+ *     (`checkWorkingRowPane`), the once-per-episode not-connected notice, the
+ *     wait at a launch reconnecting a stale row within 60 s (never typing into
+ *     a running turn or a prompt) and giving up honestly (`not-reconnected`,
+ *     the notice at `session_restart_delay` 0), and the start pass leaving a
+ *     launch that waits on a `working` row in flight in the background. These
+ *     cases pass a fake clock's `now` to the session manager's clock seam
+ *     (`_setNow`, reset in afterEach) and build their screens and transcripts
+ *     from `tests/test-helpers/working-row-panes.ts`.
  *
  * Most blocks use a stand-in persona keyed by its channel ID
  * (`makeStandInPersonaConfig`), so their `cscb_<channelId>` ids and outage
@@ -129,9 +139,29 @@ import {
   _setConfigDirFs,
   _resetConfigDirFs,
   setConfigDirUnresolvableHook,
+  STALE_WORKING_WINDOW_MS,
+  WAIT_FOR_WAITING_TIMEOUT_MS,
+  _resetNow,
+  _setNow,
+  _resetNotConnectedEpisodes,
+  cancelWorkingRowWait,
+  checkWaitingRowPane,
+  checkWorkingRowPane,
+  classifyWorkingPane,
+  foldWorkingPaneRun,
+  forgetNotConnectedEpisode,
+  hasPendingWorkingRowEvidence,
+  notifyDisconnectedWithAutoRestartDisabled,
+  notifyPersonaNotConnected,
   type ConfigDirUnresolvableHook,
+  type NotConnectedNotice,
   type StartupPersonaOutcome,
+  type UndeliverableCause,
+  type WorkingPaneReading,
+  type WorkingPaneRun,
 } from '../src/session-manager.ts'
+import type { TranscriptReading, TranscriptSnapshot } from '../src/session-transcript.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
   _resetLaunchedWithDirs,
   getLaunchedWithDir,
@@ -170,6 +200,7 @@ import {
   assertNoLeak,
   fakeToken,
   sentinelInMessage,
+  writtenFile,
 } from './test-helpers/credentials.ts'
 import { MCP_SERVER_NAME, type Persona, type PersonaConfig, resolveRealPath } from '../src/config.ts'
 import { PERSONA_INSTANCE_ID_PREFIX, configDirLabelValue, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
@@ -198,9 +229,34 @@ import {
   type CannedResponse,
   type PersonaGetResultOverrides,
   type StubClient,
+  type StubClientOptions,
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
+import {
+  DEV_CHANNELS_DIALOG_PANE,
+  IDLE_PANE,
+  MCP_SERVER_DIALOG_PANE,
+  MODEL_PICKER_PANE,
+  OTHER_IDLE_PANE,
+  PERMISSION_PANE,
+  PLAN_APPROVAL_PANE,
+  QUOTED_DIALOG_PANE,
+  QUOTED_MENU_PANE,
+  SELECT_MENU_PANE,
+  SPINNER_PANE,
+  TRANSCRIPT_SESSION_ID,
+  TRUST_DIALOG_PANE,
+  appendTranscript,
+  endedTurn,
+  promptEntry,
+  queuedPromptEntry,
+  toolResultEntry,
+  toolUseEntry,
+  withLastLine,
+  writeTranscript,
+  type TranscriptEntry,
+} from './test-helpers/working-row-panes.ts'
 import {
   initOutageState,
   getOutageFlags,
@@ -376,6 +432,9 @@ afterEach(() => {
   _resetPreLaunchReplyGuard()
   _resetLaunchedWithDirs()
   _resetConfigDirFs()
+  _resetNotConnectedEpisodes()
+  // b.f2b cases pass a fake clock's `now` to the session manager (`_setNow`).
+  _resetNow()
   setConfigDirUnresolvableHook(undefined)
   setSessionNotifier(undefined)
   installedHold?.cancelAll()
@@ -505,6 +564,15 @@ async function withCapturedErr(fn: () => Promise<void> | void): Promise<string> 
     console.error = orig
   }
   return lines.join('\n')
+}
+
+/**
+ * Poll `cond` in real time, 1 ms steps, for at most `ms`; the caller asserts
+ * afterwards. Only for launches through the real `spawnForPersona`, which
+ * take no fake clock.
+ */
+async function pollUntil(cond: () => boolean, ms = 2_000): Promise<void> {
+  for (let waited = 0; !cond() && waited < ms; waited++) await new Promise((r) => setTimeout(r, 1))
 }
 
 /** Let fire-and-forget notice posts (and their rejection handlers) settle. */
@@ -3847,11 +3915,6 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     return { h, cfg, a, b, lines, order: h.order, bringUp }
   }
 
-  /** Poll `cond` (real time, 1 ms steps) for at most `ms`; the caller asserts afterwards. */
-  async function waitFor(cond: () => boolean, ms = 500): Promise<void> {
-    for (let waited = 0; !cond() && waited < ms; waited++) await new Promise((r) => setTimeout(r, 1))
-  }
-
   // b.av2 SR-6.1: each cause gives A its outcome — credentials-broken is
   // `broken`; directory-broken and Slack-unreachable are `retrying` (their
   // retries run on the persona's own timers, which these cases never fire).
@@ -4018,7 +4081,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     const id = (p: Persona) => `cscb_${p.key}`
     const settle = async (p: Persona, outcome?: Parameters<DeferredConnect['settle']>[0]) => {
       connects.get(p.name)!.settle(outcome)
-      await waitFor(() => f.h.manager.status(p.key)?.state !== 'connecting')
+      await pollUntil(() => f.h.manager.status(p.key)?.state !== 'connecting')
     }
 
     let result!: Awaited<ReturnType<typeof startupSessionManager>>
@@ -4026,20 +4089,20 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
       const start = startupSessionManager(f.cfg, { concurrency: 3, bringUp: f.bringUp })
 
       // Every persona's Slack step starts at once, before any launch.
-      await waitFor(() => f.order.length === names.length)
+      await pollUntil(() => f.order.length === names.length)
       expect(f.order).toEqual(f.h.personas.map((p) => `slack:${p.key}`))
       expect(launched()).toEqual([])
 
       // Ready in the order Delta, (Beta refused), Echo, Alpha, Gamma.
       await settle(delta)
-      await waitFor(() => launched().length === 1)
+      await pollUntil(() => launched().length === 1)
       await settle(beta, { kind: 'platform', error: 'invalid_auth' })
       await settle(echo)
-      await waitFor(() => launched().length === 2)
+      await pollUntil(() => launched().length === 2)
       await settle(alpha)
-      await waitFor(() => launched().length === 3)
+      await pollUntil(() => launched().length === 3)
       await settle(gamma)
-      await waitFor(() => launched().length > 3, 50)
+      await pollUntil(() => launched().length > 3, 50)
 
       // Beta took no slot: the three slots are Delta, Echo and Alpha, all held; Gamma waits.
       expect(launched()).toEqual([id(delta), id(echo), id(alpha)])
@@ -4051,7 +4114,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
 
       // A slot frees: the next ready persona (Gamma) takes it; still at most 3 running.
       held.release(id(echo))
-      await waitFor(() => launched().length === 4)
+      await pollUntil(() => launched().length === 4)
       expect(launched()).toEqual([id(delta), id(echo), id(alpha), id(gamma)])
       expect(held.held()).toEqual([id(delta), id(alpha), id(gamma)])
 
@@ -4094,15 +4157,15 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
       void start.then((r) => { result = r })
 
       // Gamma holds the only slot; Delta queues; Alpha is retrying, Beta broken.
-      await waitFor(() => launched().length === 1)
-      await waitFor(() => launched().length > 1, 50)
+      await pollUntil(() => launched().length === 1)
+      await pollUntil(() => launched().length > 1, 50)
       expect(launched()).toEqual([id(gamma)])
       expect(f.h.manager.status(alpha.key)).toMatchObject({ state: 'retrying', phase: 'bring-up' })
       expect(f.bringUp.state(beta.key)?.outcome).toBe('broken')
 
       // Alpha's retry succeeds: its launch starts at once, beside the held slot.
       await f.h.clock.runNext()
-      await waitFor(() => launched().length === 2)
+      await pollUntil(() => launched().length === 2)
       expect(f.h.manager.status(alpha.key)?.state).toBe('up')
       expect(launched()).toEqual([id(gamma), id(alpha)])
       expect(held.held()).toEqual([id(gamma), id(alpha)])
@@ -4110,15 +4173,15 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
 
       // The pool finishes Gamma then Delta; the pass returns with Alpha's launch still held.
       held.release(id(gamma))
-      await waitFor(() => launched().length === 3)
+      await pollUntil(() => launched().length === 3)
       held.release(id(delta))
-      await waitFor(() => result !== undefined)
+      await pollUntil(() => result !== undefined)
       expect(result).toBeDefined()
       expect(held.held()).toEqual([id(alpha)])
       expect(isLaunchInFlight(alpha.key)).toBe(true)
 
       held.release(id(alpha))
-      await waitFor(() => !isLaunchInFlight(alpha.key))
+      await pollUntil(() => !isLaunchInFlight(alpha.key))
     })
 
     expect(isLaunchInFlight(alpha.key)).toBe(false)
@@ -4162,12 +4225,12 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     let result!: Awaited<ReturnType<typeof startupSessionManager>>
     await withCapturedErr(async () => {
       const start = startupSessionManager(cfg, { concurrency: 3 })
-      await waitFor(() => launched().length === 3)
-      await waitFor(() => launched().length > 3, 50)
+      await pollUntil(() => launched().length === 3)
+      await pollUntil(() => launched().length > 3, 50)
       expect(launched()).toEqual(['cscb_alpha', 'cscb_beta', 'cscb_gamma'])
 
       held.release('cscb_beta')
-      await waitFor(() => launched().length === 4)
+      await pollUntil(() => launched().length === 4)
       expect(launched()).toEqual(['cscb_alpha', 'cscb_beta', 'cscb_gamma', 'cscb_delta'])
       expect(held.held()).toEqual(['cscb_alpha', 'cscb_gamma', 'cscb_delta'])
 
@@ -4344,21 +4407,25 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
 describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session recovery', () => {
   // b.ecw: the timeout branch now keys on the claude PROCESS via a fresh
   // findMissing sweep + one status call, NOT the raw tmux probe. A process
-  // merely mid-long-turn reports a live state and stays 'ok' — the tmux prober
-  // is never consulted on the happy/live path.
-  test('timeout with claude process alive (status working) → ok, tmux NOT probed (long turns are not errors — regression guard)', async () => {
+  // merely mid-long-turn reports a live state and is left alive — the tmux
+  // prober is never consulted on the happy/live path. b.f2b: the outcome is
+  // 'not-reconnected' ('ok' only when `/mcp reconnect` was typed).
+  test('timeout with claude process alive (status working) → not-reconnected, nothing typed, tmux NOT probed (long turns are not errors — regression guard)', async () => {
     _setWaitForWaitingTimeoutMs(30)
     const probed: string[] = []
     _setTmuxSessionProber(async (name) => { probed.push(name); return true })
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     installStub({
       findMissingCalls,
+      sendKeysCalls,
       findMissingResult: cannedFindMissing(), // b.m4r: empty sweep — a genuinely-alive long-turn row is untouched
       statusResult: { state: 'working' } as import('agent-director').StatusResult, // process mid-long-turn
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
-    expect(result).toBe('ok')
+    expect(result).toBe('not-reconnected')
+    expect(sendKeysCalls).toEqual([])
     // b.ecw: the live-status verdict is authoritative — the raw tmux probe is
     // NOT called on this path.
     expect(probed).toEqual([])
@@ -4380,7 +4447,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
-    expect(result).toBe('ok') // status live at timeout → ok
+    expect(result).toBe('not-reconnected') // status live at timeout → left alive, nothing typed (b.f2b)
     // Up-front sweep + fresh timeout sweep = 2 (TTL=0 defeats memo reuse).
     expect(findMissingCalls).toHaveLength(2)
   })
@@ -4414,13 +4481,14 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
   // (no row to reconcile) or any other status error (an AD outage at the deadline).
   // Either way CSCB must NOT manufacture a verdict from the AD gap; it falls back
   // to the raw tmux probe (b.rmy invariant): tmux gone → dead-session, tmux alive
-  // → ok. The poll loop stays `working` and exits on the deadline; only the timeout
+  // → not-reconnected (b.f2b; 'ok' before). The poll loop stays `working` and
+  // exits on the deadline; only the timeout
   // status call throws (TTL=0 makes the timeout sweep bump findMissingCalls to 2,
   // which flips statusFn into its error branch).
   test.each([
     ['ErrSpawnNotFound', () => errSpawnNotFound(), false, 'dead-session'],
-    ['ErrSpawnNotFound', () => errSpawnNotFound(), true, 'ok'],
-    ['generic status error', () => errGeneric('status', 'ErrTimeout'), true, 'ok'],
+    ['ErrSpawnNotFound', () => errSpawnNotFound(), true, 'not-reconnected'],
+    ['generic status error', () => errGeneric('status', 'ErrTimeout'), true, 'not-reconnected'],
     ['generic status error', () => errGeneric('status', 'ErrTimeout'), false, 'dead-session'],
   ] as const)(
     'timeout with %s + tmux %s → %s (tmux fallback)',
@@ -4473,7 +4541,10 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(resumeCalls).toHaveLength(1)
   })
 
-  test('spawnForPersona working branch: timeout + session alive → reconnected (no kill/resume/spawn)', async () => {
+  // b.f2b: the ladder reports the wait's real outcome — `reconnected` only
+  // when `/mcp reconnect` was typed — and launchSession still counts it as a
+  // launch that did not fail (SR-25.1 counting unchanged).
+  test('spawnForPersona working branch: timeout + session alive → not-reconnected, nothing typed (no kill/resume/spawn); launchSession maps it to true', async () => {
     _setWaitForWaitingTimeoutMs(30)
     // The timeout live path decides on the fresh status call alone and never
     // consults tmux; capture the prober to prove it is not called.
@@ -4482,21 +4553,31 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     installStub({
       spawnCalls,
       killCalls,
       resumeCalls,
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      sendKeysCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+      ],
       getResult: personaRow(cfg, 'C', { state: 'working' }),
       statusResult: { state: 'working' } as import('agent-director').StatusResult,
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    expect(result.action).toBe('reconnected')
+    expect(result).toEqual({ key: 'C', action: 'not-reconnected' })
+    expect(sendKeysCalls).toEqual([])
     expect(resumeCalls).toHaveLength(0)
     expect(killCalls).toHaveLength(0)
     expect(spawnCalls).toHaveLength(1) // only the initial colliding spawn
     expect(probed).toEqual([]) // live timeout verdict never consults tmux
+
+    // The restart path's launch over the same row.
+    expect(await launchSession('C', cfg)).toBe(true)
+    expect(sendKeysCalls).toEqual([])
   })
 })
 
@@ -5016,26 +5097,31 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
     expect(probed).toEqual([]) // the ended/missing branch no longer probes tmux
   })
 
-  test('transition to live transient state (ask_user) → ok without probing or recovery (regression guard)', async () => {
+  // b.f2b: a live transient state ends the wait with the session left alive and
+  // nothing typed into its prompt: 'not-reconnected' ('ok' before).
+  test('transition to live transient state (ask_user) → not-reconnected without probing, recovery or typing (regression guard)', async () => {
     const probed: string[] = []
     _setTmuxSessionProber(async (name) => { probed.push(name); return false }) // even a "dead" probe must not matter
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     installStub({
+      sendKeysCalls,
       statusResult: { state: 'ask_user' } as import('agent-director').StatusResult,
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
-    expect(result).toBe('ok')
+    expect(result).toBe('not-reconnected')
+    expect(sendKeysCalls).toEqual([])
     expect(probed).toEqual([]) // live transient states never reach the prober
   })
 
-  test('transition to live transient state (check_permission) → ok, never dead-session', async () => {
+  test('transition to live transient state (check_permission) → not-reconnected, never dead-session', async () => {
     _setTmuxSessionProber(async () => false)
     installStub({
       statusResult: { state: 'check_permission' } as import('agent-director').StatusResult,
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
-    expect(result).toBe('ok')
+    expect(result).toBe('not-reconnected')
   })
 
   test('ErrSpawnNotFound + tmux gone → dead-session', async () => {
@@ -5046,12 +5132,12 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
     expect(result).toBe('dead-session')
   })
 
-  test('ErrSpawnNotFound + tmux alive → ok', async () => {
+  test('ErrSpawnNotFound + tmux alive → not-reconnected (b.f2b; ok before)', async () => {
     _setTmuxSessionProber(async () => true)
     installStub({ statusError: errSpawnNotFound() })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
-    expect(result).toBe('ok')
+    expect(result).toBe('not-reconnected')
   })
 
   test('spawnForPersona working branch: transition to missing + dead tmux → resume recovery instead of misreported ok', async () => {
@@ -5069,6 +5155,977 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(resumeCalls).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.f2b — a stale `working` row must not strand a persona
+//
+// agent-director can leave a persona's row `working` after its turn ended
+// (live Check 24). While the row reads `working`, the wait at a launch
+// (`waitForWaitingAndReconnect`) and the restart path's reconnect attempts
+// (`checkWorkingRowPane`) read the persona's evidence: its pane and, when the
+// pane shows an idle screen, its transcript. The row is stale only on the
+// positive-idle rule: across STALE_WORKING_WINDOW_MS (60 s), every read shows
+// the same idle screen (no spinner, busy hint, API retry row, prompt or
+// dialog) AND the same transcript, unchanged, ending with a completed turn. A
+// live turn, an API retry or stall included, never ends its transcript that
+// way, so it is never typed into, and neither is a prompt or dialog (b.rmy).
+// A `waiting` row's pane is read once before a reconnect
+// (`checkWaitingRowPane`). A wait that ends with the session alive and nothing
+// typed returns 'not-reconnected' and says what happens next; with
+// session_restart_delay 0 it raises the not-connected notice, once per
+// episode, instead of claiming the health check will reconnect it. A teardown
+// cancels a launch's wait (`cancelWorkingRowWait`). The start pass does not
+// wait for a launch that waits on a `working` row.
+//
+// Cases marked REPRO fail on the code before the fix (the stale row was
+// trusted for the full 10 minutes, every give-up returned 'ok' and logged
+// "health-check will reconnect", and the start pass waited for every launch).
+//
+// Virtual time: the wait and the evidence read the session manager's clock
+// seam, so these cases pass a fake clock's `now` (`useFakeNow`; the top-level
+// afterEach resets the seam) and move it themselves: from the stub's status
+// poll, one step per poll, or between reconnect attempts. Only the wait's
+// poll interval runs in real time (1 ms here, or 60 s where a case shows a
+// cancel wakes the wait at once). The start-pass cases that move no time run
+// on the real clock.
+// ---------------------------------------------------------------------------
+
+/** A fake clock whose `now` the session manager's wait and evidence read (`_setNow`). */
+function useFakeNow(): FakeClock {
+  const clock = createFakeClock()
+  _setNow(clock.now)
+  return clock
+}
+
+/** One persona `C` whose wait polls every 1 ms; `overrides` go to the whole config. */
+function waitConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
+  return makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1, ...overrides })
+}
+
+/** A persona's transcript file and the agent-director row fields that name it. */
+interface Transcript {
+  path: string
+  /** The row's persisted `jsonl_path` and its `claude_session_id`. */
+  fields: { jsonl_path: string; claude_session_id: string }
+}
+
+/** Write `entries` (default: a finished turn) to `<fixtureDir>/transcripts/<session id>.jsonl`; the row fields name it. */
+function transcriptOf(entries: TranscriptEntry[] = endedTurn()): Transcript {
+  const path = join(fixtureSubdir('transcripts'), `${TRANSCRIPT_SESSION_ID}.jsonl`)
+  writeTranscript(path, entries)
+  return { path, fields: { jsonl_path: path, claude_session_id: TRANSCRIPT_SESSION_ID } }
+}
+
+/** What a persona's row reads at a status poll: a state, or an Error the poll rejects with. */
+type RowReading = string | Error
+
+/** What a pane read gives: the screen, or an Error the read rejects with. */
+type PaneReading = string | Error
+
+/** Make the stub's pane reads (every persona's) give `pane` from the next read on. */
+function showPane(opts: StubClientOptions, pane: PaneReading): void {
+  opts.readPaneError = pane instanceof Error ? pane : undefined
+  opts.readPaneResults = pane instanceof Error ? undefined : [{ pane }]
+}
+
+/** The pane read of persona `key`'s own instance: its last 40 lines. */
+function paneReadOf(key: string): import('agent-director').ReadPaneParams {
+  return { claude_instance_id: `cscb_${key}`, n_lines: 40 }
+}
+
+/** Persona `C`'s agent-director row reading `working`, naming `transcript` (without one: no transcript). */
+function workingRowOf(cfg: PersonaConfig, transcript?: Transcript): CannedGetResult {
+  return personaRow(cfg, 'C', { state: 'working', ...transcript?.fields })
+}
+
+/** The collision fixture for a launch of `C` onto its `working` row. */
+function workingCollision(cfg: PersonaConfig, transcript?: Transcript): StubClientOptions {
+  return {
+    spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+    getResult: workingRowOf(cfg, transcript),
+  }
+}
+
+/** The stub behind a `working` row, and what was asked of it. */
+interface WorkingRow {
+  stub: StubClient
+  /** The row's reading at each status poll, or a function of the row computing it then. */
+  state: RowReading | ((row: WorkingRow) => RowReading)
+  /** What the pane shows, set at each status poll: a reading, or a function of the clock's time giving it. */
+  pane: PaneReading | ((now: number) => PaneReading)
+  /** How far each status poll moves the fake clock, before it answers. */
+  stepMs: number
+  statusCalls: import('agent-director').StatusParams[]
+  readPaneCalls: import('agent-director').ReadPaneParams[]
+  getCalls: import('agent-director').GetParams[]
+  sendKeysCalls: import('agent-director').SendKeysParams[]
+  findMissingCalls: import('agent-director').FindMissingParams[]
+  spawnCalls: import('agent-director').SpawnParams[]
+}
+
+/**
+ * Install a stub client whose status poll moves `clock` by `row.stepMs`, then
+ * shows `row.pane` and answers `row.state`. `opts` adds the row `get`
+ * answers (`workingRowOf`; the stub's default row names no transcript) and,
+ * for a launch, the ladder's collision fixture (`workingCollision`).
+ */
+function installWorkingRow(
+  clock: FakeClock,
+  init: Pick<WorkingRow, 'pane' | 'stepMs'> & Partial<Pick<WorkingRow, 'state'>>,
+  opts: StubClientOptions = {},
+): WorkingRow {
+  const calls = {
+    statusCalls: [] as WorkingRow['statusCalls'],
+    readPaneCalls: [] as WorkingRow['readPaneCalls'],
+    getCalls: [] as WorkingRow['getCalls'],
+    sendKeysCalls: [] as WorkingRow['sendKeysCalls'],
+    findMissingCalls: [] as WorkingRow['findMissingCalls'],
+    spawnCalls: [] as WorkingRow['spawnCalls'],
+  }
+  const stubOpts: StubClientOptions = { ...opts, ...calls }
+  const stub = installStub(stubOpts)
+  const row: WorkingRow = { stub, state: init.state ?? 'working', pane: init.pane, stepMs: init.stepMs, ...calls }
+  const show = (): void => showPane(stubOpts, typeof row.pane === 'function' ? row.pane(clock.now()) : row.pane)
+  stubOpts.statusFn = () => {
+    const reading = typeof row.state === 'function' ? row.state(row) : row.state
+    return reading instanceof Error ? reading : ({ state: reading } as import('agent-director').StatusResult)
+  }
+  show()
+  const answer = stub.status
+  stub.status = async (params) => {
+    await clock.advance(row.stepMs)
+    show()
+    return answer(params)
+  }
+  return row
+}
+
+/** The captured log's lines that contain `fragment`. */
+function linesWith(log: string, fragment: string): string[] {
+  return log.split('\n').filter((line) => line.includes(fragment))
+}
+
+const RECONNECT_TEXT = `/mcp reconnect ${MCP_SERVER_NAME}`
+
+/** A transcript's identity for the pure fold cases (no file behind it). */
+const SNAPSHOT: TranscriptSnapshot = { path: `/t/${TRANSCRIPT_SESSION_ID}.jsonl`, dev: 1, ino: 7, size: 4_096, mtimeMs: 1_000 }
+
+/** A transcript read that ended with a completed turn, its snapshot `SNAPSHOT` with `change`. */
+function endedReading(change: Partial<TranscriptSnapshot> = {}): { kind: 'ended'; snapshot: TranscriptSnapshot } {
+  return { kind: 'ended', snapshot: { ...SNAPSHOT, ...change } }
+}
+
+describe('b.f2b: reading a working row\'s pane (classifyWorkingPane, foldWorkingPaneRun)', () => {
+  test.each<[string, WorkingPaneReading, string]>([
+    ['a real Claude Code idle screen (the finished turn, its summary line, the empty prompt box)', 'idle', IDLE_PANE],
+    ['a real Claude Code screen mid-turn (the spinner line: glyph, verb, ellipsis)', 'busy', SPINNER_PANE],
+    ['a `*` spinner line (some terminals)', 'busy', withLastLine('* Pondering… (12s)')],
+    ['a `●` spinner line (prefersReducedMotion)', 'busy', withLastLine('● Pondering… (12s · ↓ 1.2k tokens)')],
+    ['a spinner line with no timer (screen-reader mode)', 'busy', withLastLine('✶ Pondering…')],
+    ['"esc to interrupt" (earlier Claude Code versions)', 'busy', withLastLine('  esc to interrupt')],
+    ['a rebound interrupt key', 'busy', withLastLine('  ctrl+c to interrupt')],
+    ['a turn paused on a usage limit', 'busy', withLastLine('  continuing automatically at 3pm · esc to cancel')],
+    ['the no-response retry row', 'busy', withLastLine('  ⎿  No response from the API after 2m · retrying, waiting up to 5m')],
+    ['the no-response retry row\'s second line alone', 'busy', withLastLine('     A proxy or gateway that buffers streaming responses can cause this.')],
+    ['the rate-limit retry row', 'busy', withLastLine('  ⎿  Rate limit reached · Retrying in 7m (resets 3pm)')],
+    ['the waiting-for-response retry row', 'busy', withLastLine('  ⎿  Waiting for API response · will retry in 30s')],
+    ['a retry row\'s attempt counter', 'busy', withLastLine('  ⎿  API Error: 529 Overloaded · attempt 3/10')],
+    ['a reply that mentions a rate limit, a retry and an attempt, with no `·` separator', 'idle', withLastLine('  The rate limit was reached; retrying in 7m would miss it (attempt 2/3 failed).')],
+    ['the spinner text quoted, indented, in a reply', 'idle', withLastLine('  ✳ Harmonizing… (2m 42s)')],
+    ['a tool-permission dialog (boxed, its question and deny option)', 'prompt', PERMISSION_PANE],
+    ['the plan-approval dialog (only its question anchors it)', 'prompt', PLAN_APPROVAL_PANE],
+    ['an AskUserQuestion select menu (only its "Enter to select" footer anchors it)', 'prompt', SELECT_MENU_PANE],
+    ['the /model picker (its "Enter to confirm" footer; the cursor on option 2)', 'prompt', MODEL_PICKER_PANE],
+    ['the folder trust dialog', 'prompt', TRUST_DIALOG_PANE],
+    ['the development channels dialog', 'prompt', DEV_CHANNELS_DIALOG_PANE],
+    ['the MCP server dialog (only its box anchors it)', 'prompt', MCP_SERVER_DIALOG_PANE],
+    ['a dialog under a running turn\'s spinner (the prompt wins)', 'prompt', `${SPINNER_PANE}\n${PERMISSION_PANE}`],
+    ['a reply that quotes a dialog\'s question and options, with no `❯` cursor', 'idle', QUOTED_DIALOG_PANE],
+    ['a reply that quotes a menu with its cursor, but no question, footer or box', 'idle', QUOTED_MENU_PANE],
+    ['a dialog answered long ago, scrolled above the bottom lines', 'idle', `${PERMISSION_PANE}\n${IDLE_PANE}`],
+    ['an empty pane', 'blank', ''],
+    ['only spaces and blank lines', 'blank', '   \n\n  \n'],
+  ])('%s → %s', (_label, reading, pane) => {
+    expect(classifyWorkingPane(pane)).toBe(reading)
+  })
+
+  test('an idle run lasts while the screen (trailing spaces and blank lines aside) and the ended transcript are unchanged; a changed screen starts a new run', () => {
+    const run = foldWorkingPaneRun(undefined, IDLE_PANE, 1_000, endedReading())
+    expect(run).toMatchObject({ reading: 'idle', since: 1_000, transcript: SNAPSHOT })
+    const padded = `${IDLE_PANE.split('\n').map((line) => `${line}   `).join('\n')}\n\n`
+    expect(foldWorkingPaneRun(run, padded, 5_000, endedReading())).toBe(run)
+    expect(foldWorkingPaneRun(run, OTHER_IDLE_PANE, 9_000, endedReading())).toMatchObject({ reading: 'idle', since: 9_000 })
+  })
+
+  test.each<[string, Partial<TranscriptSnapshot>]>([
+    ['it grew', { size: 5_000 }],
+    ['it was written again', { mtimeMs: 2_000 }],
+    ['another file took its path', { ino: 8 }],
+  ])('an idle run whose transcript changed (%s) starts a new run, though the screen did not', (_label, change) => {
+    const run = foldWorkingPaneRun(undefined, IDLE_PANE, 1_000, endedReading())
+    const changed = endedReading(change)
+    expect(foldWorkingPaneRun(run, IDLE_PANE, 5_000, changed)).toMatchObject({ reading: 'idle', since: 5_000, transcript: changed.snapshot })
+  })
+
+  test.each<[string, TranscriptReading | undefined]>([
+    ['does not end with a completed turn', { kind: 'open', snapshot: SNAPSHOT }],
+    ['can\'t be read', { kind: 'unreadable', reason: 'it is empty' }],
+    ['was not read', undefined],
+  ])('an idle pane whose transcript %s is no evidence: it ends the run and starts none', (_label, transcript) => {
+    const run = foldWorkingPaneRun(undefined, IDLE_PANE, 1_000, endedReading())
+    expect(foldWorkingPaneRun(run, IDLE_PANE, 5_000, transcript)).toBeUndefined()
+    expect(foldWorkingPaneRun(undefined, IDLE_PANE, 5_000, transcript)).toBeUndefined()
+  })
+
+  test.each<[string, string | undefined]>([
+    ['a failed read', undefined],
+    ['a running turn', SPINNER_PANE],
+    ['a blank pane', ''],
+  ])('%s ends the run, whatever the transcript: no evidence', (_label, pane) => {
+    const run = foldWorkingPaneRun(undefined, IDLE_PANE, 1_000, endedReading())
+    expect(foldWorkingPaneRun(run, pane, 5_000, endedReading())).toBeUndefined()
+  })
+
+  test('a prompt run lasts across prompt screens that differ, with no transcript read; an idle run and a prompt run never continue each other', () => {
+    const prompt: WorkingPaneRun | undefined = foldWorkingPaneRun(undefined, PERMISSION_PANE, 1_000)
+    expect(prompt).toMatchObject({ reading: 'prompt', since: 1_000 })
+    expect(foldWorkingPaneRun(prompt, SELECT_MENU_PANE, 5_000)).toBe(prompt)
+    expect(foldWorkingPaneRun(prompt, IDLE_PANE, 9_000, endedReading())).toMatchObject({ reading: 'idle', since: 9_000 })
+    const idle = foldWorkingPaneRun(undefined, IDLE_PANE, 1_000, endedReading())
+    expect(foldWorkingPaneRun(idle, PERMISSION_PANE, 9_000, endedReading())).toMatchObject({ reading: 'prompt', since: 9_000 })
+  })
+})
+
+describe('b.f2b: the restart path\'s evidence for a working row across reconnect attempts (checkWorkingRowPane)', () => {
+  let clock: FakeClock
+  beforeEach(() => {
+    clock = useFakeNow()
+  })
+
+  /**
+   * A stub whose pane reads (every persona's) show `first` until `show`
+   * changes it (an Error fails the read), and whose `get` answers a `working`
+   * row with `fields` (default: naming a finished turn's transcript; null:
+   * the stub's default row, which names no transcript).
+   */
+  function paneStub(first: PaneReading, fields: PersonaGetResultOverrides | null = transcriptOf().fields) {
+    const opts: StubClientOptions = { sendKeysCalls: [], readPaneCalls: [], getCalls: [] }
+    if (fields !== null) opts.getResult = cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working', ...fields })
+    showPane(opts, first)
+    installStub(opts)
+    return {
+      show: (pane: PaneReading) => showPane(opts, pane),
+      sendKeysCalls: opts.sendKeysCalls!,
+      readPaneCalls: opts.readPaneCalls!,
+      getCalls: opts.getCalls!,
+    }
+  }
+
+  test('the same idle screen and the same ended transcript on attempts spanning 60 s: defer until then, then reconnect; pending until it concludes, forgotten after; every attempt reads C\'s own pane and row; nothing typed, no notice', async () => {
+    const stub = paneStub(IDLE_PANE)
+    const verdicts: string[] = []
+    const pending: boolean[] = []
+    const attempt = async (): Promise<void> => {
+      verdicts.push(await checkWorkingRowPane('C'))
+      pending.push(hasPendingWorkingRowEvidence('C'))
+    }
+    await attempt()
+    await clock.advance(30_000)
+    await attempt()
+    await clock.advance(STALE_WORKING_WINDOW_MS - 30_000 - 1)
+    await attempt()
+    await clock.advance(1)
+    await attempt()
+    // A later attempt starts afresh.
+    await attempt()
+
+    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect', 'defer'])
+    expect(pending).toEqual([true, true, true, false, true])
+    expect(stub.readPaneCalls).toEqual(Array(5).fill(paneReadOf('C')))
+    expect(stub.getCalls).toEqual(Array(5).fill({ claude_instance_id: 'cscb_C' }))
+    expect(stub.sendKeysCalls).toEqual([])
+    expect(notices).toEqual([])
+  })
+
+  test('a changed screen restarts the window', async () => {
+    const stub = paneStub(IDLE_PANE)
+    const verdicts = [await checkWorkingRowPane('C')]
+    await clock.advance(40_000)
+    stub.show(OTHER_IDLE_PANE)
+    verdicts.push(await checkWorkingRowPane('C'))
+    await clock.advance(30_000) // 70 s since the first read, 30 s of this screen
+    verdicts.push(await checkWorkingRowPane('C'))
+    await clock.advance(30_000)
+    verdicts.push(await checkWorkingRowPane('C'))
+
+    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect'])
+  })
+
+  test('a transcript written to mid-window (the session ran another turn behind the same screen) restarts the window, though it ends with a completed turn again', async () => {
+    const transcript = transcriptOf()
+    paneStub(IDLE_PANE, transcript.fields)
+    const verdicts = [await checkWorkingRowPane('C')]
+    await clock.advance(30_000)
+    appendTranscript(transcript.path, endedTurn())
+    verdicts.push(await checkWorkingRowPane('C'))
+    await clock.advance(30_000) // 60 s since the first read, 30 s of this transcript
+    verdicts.push(await checkWorkingRowPane('C'))
+    await clock.advance(30_000)
+    verdicts.push(await checkWorkingRowPane('C'))
+
+    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect'])
+  })
+
+  test.each<[string, () => PaneReading]>([
+    ['a running turn (its spinner line)', () => SPINNER_PANE],
+    ['a blank pane', () => ''],
+    ['a failed read', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'evidence'))],
+  ])('%s between idle reads ends the evidence: defer, nothing pending, and the window starts over', async (_label, interruption) => {
+    const stub = paneStub(IDLE_PANE)
+    const verdicts: string[] = []
+    let pendingAfter: boolean | undefined
+    const broken = interruption()
+    const errLog = await withCapturedErr(async () => {
+      verdicts.push(await checkWorkingRowPane('C'))
+      await clock.advance(30_000)
+      stub.show(broken)
+      verdicts.push(await checkWorkingRowPane('C'))
+      pendingAfter = hasPendingWorkingRowEvidence('C')
+      await clock.advance(30_000) // 60 s since the first idle read: without the break, it would reconnect here
+      stub.show(IDLE_PANE)
+      verdicts.push(await checkWorkingRowPane('C'))
+      await clock.advance(STALE_WORKING_WINDOW_MS)
+      verdicts.push(await checkWorkingRowPane('C'))
+    })
+
+    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect'])
+    expect(pendingAfter).toBe(false)
+    expect(stub.sendKeysCalls).toEqual([])
+    // A failed read is logged by its errName and redacted message only.
+    const failure = `persona=C is working and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))}`
+    expect(linesWith(errLog, failure)).toHaveLength(broken instanceof Error ? 1 : 0)
+    assertNoLeak({ errLog })
+  })
+
+  test.each<[string, () => PersonaGetResultOverrides | null, string]>([
+    ['the prompt, waiting on the API (a retry or a stall with no spinner)', () => transcriptOf([...endedTurn(), promptEntry('post it in #ops')]).fields, 'does not end with a completed turn'],
+    ['a tool result, waiting on the API', () => transcriptOf([promptEntry(), toolUseEntry(), toolResultEntry()]).fields, 'does not end with a completed turn'],
+    ['a tool call, waiting on its result', () => transcriptOf([promptEntry(), toolUseEntry()]).fields, 'does not end with a completed turn'],
+    ['a prompt queued behind the turn', () => transcriptOf([...endedTurn(), queuedPromptEntry()]).fields, 'does not end with a completed turn'],
+    ['nothing: the row names no transcript', () => null, 'its transcript can\'t be read: its agent-director row names no transcript for its session'],
+    ['nothing: its file is gone', () => { const t = transcriptOf(); rmSync(t.path); return t.fields }, 'opening it failed (ENOENT)'],
+  ])('b.rmy: the same still, idle screen for minutes while the transcript shows %s is no evidence: every attempt defers and logs why, nothing is pending or typed', async (_label, fields, why) => {
+    const stub = paneStub(IDLE_PANE, fields())
+    const verdicts: string[] = []
+    const errLog = await withCapturedErr(async () => {
+      for (let i = 0; i < 4; i++) {
+        if (i > 0) await clock.advance(STALE_WORKING_WINDOW_MS)
+        verdicts.push(await checkWorkingRowPane('C'))
+      }
+    })
+
+    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'defer'])
+    expect(hasPendingWorkingRowEvidence('C')).toBe(false)
+    expect(stub.sendKeysCalls).toEqual([])
+    expect(linesWith(errLog, 'persona=C is working and its pane shows an idle screen, but').filter((line) => line.includes(why))).toHaveLength(4)
+  })
+
+  test('a fresh session\'s row (no persisted transcript path) is read through the transcript composed under the persona\'s claude_config_dir; without the persona nothing is found and the evidence ends', async () => {
+    const configDir = fixtureSubdir('persona-claude')
+    const cwd = '/work/nightly bot'
+    const composed = resolveJsonlPath(cwd, TRANSCRIPT_SESSION_ID, configDir)
+    mkdirSync(join(composed, '..'), { recursive: true })
+    writeTranscript(composed, endedTurn())
+    paneStub(IDLE_PANE, { claude_session_id: TRANSCRIPT_SESSION_ID, cwd })
+    const persona = { claude_config_dir: configDir }
+
+    const verdicts = [await checkWorkingRowPane('C', persona)]
+    await clock.advance(STALE_WORKING_WINDOW_MS)
+    verdicts.push(await checkWorkingRowPane('C', persona))
+    verdicts.push(await checkWorkingRowPane('C'))
+
+    expect(verdicts).toEqual(['defer', 'reconnect', 'defer'])
+    expect(hasPendingWorkingRowEvidence('C')).toBe(false)
+  })
+
+  test('a prompt: every attempt defers and nothing is typed; once shown on attempts spanning 60 s, one blocked-on-prompt notice for the episode; never pending evidence', async () => {
+    const stub = paneStub(PERMISSION_PANE)
+    const verdicts = [await checkWorkingRowPane('C')]
+    expect(notices).toEqual([])
+    for (let i = 0; i < 3; i++) {
+      await clock.advance(STALE_WORKING_WINDOW_MS)
+      verdicts.push(await checkWorkingRowPane('C'))
+    }
+
+    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'defer'])
+    expect(hasPendingWorkingRowEvidence('C')).toBe(false)
+    expect(stub.sendKeysCalls).toEqual([])
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
+    expect(notices[0]!.text).toContain('`tmux attach -t slack_bot_C`')
+  })
+
+  test('forgetNotConnectedEpisode(key) ends only that persona\'s episode: its evidence and notice latch go, another persona\'s stay', async () => {
+    paneStub(IDLE_PANE)
+    await checkWorkingRowPane('K')
+    await checkWorkingRowPane('L')
+    const notice = { reason: 'auto-restart-disabled', cause: 'a test cause' } as const
+    expect([notifyPersonaNotConnected('K', notice), notifyPersonaNotConnected('L', notice)]).toEqual([true, true])
+
+    forgetNotConnectedEpisode('K')
+
+    expect([hasPendingWorkingRowEvidence('K'), hasPendingWorkingRowEvidence('L')]).toEqual([false, true])
+    // K's next episode is reported again; L's is still the same one.
+    expect([notifyPersonaNotConnected('K', notice), notifyPersonaNotConnected('L', notice)]).toEqual([true, false])
+    expect(notices.map((n) => n.key)).toEqual(['K', 'L', 'K'])
+  })
+
+  test('any launch for the persona forgets its evidence: the session it brings up says nothing about the old row', async () => {
+    const cfg = waitConfig()
+    paneStub(IDLE_PANE)
+    await checkWorkingRowPane('C')
+    expect(hasPendingWorkingRowEvidence('C')).toBe(true)
+
+    expect((await spawnForPersona(personaOf(cfg, 'C'), cfg, false)).action).toBe('spawned')
+
+    expect(hasPendingWorkingRowEvidence('C')).toBe(false)
+  })
+})
+
+describe('b.f2b: the restart path\'s check of a waiting row\'s pane before it reconnects (checkWaitingRowPane)', () => {
+  /** A stub whose pane reads show `pane` (an Error fails the read). */
+  function paneOnly(pane: PaneReading): StubClientOptions & { readPaneCalls: import('agent-director').ReadPaneParams[]; sendKeysCalls: import('agent-director').SendKeysParams[] } {
+    const opts = { readPaneCalls: [], sendKeysCalls: [] } as StubClientOptions & { readPaneCalls: import('agent-director').ReadPaneParams[]; sendKeysCalls: import('agent-director').SendKeysParams[] }
+    showPane(opts, pane)
+    installStub(opts)
+    return opts
+  }
+
+  test.each<[string, 'reconnect' | 'defer', () => PaneReading, string | undefined]>([
+    ['an idle screen', 'reconnect', () => IDLE_PANE, undefined],
+    ['a blank pane', 'reconnect', () => '', undefined],
+    ['a running turn (its spinner line)', 'defer', () => SPINNER_PANE, 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
+    ['an API retry row', 'defer', () => withLastLine('  ⎿  Waiting for API response · will retry in 30s'), 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
+    ['a failed read (the waiting row alone decides)', 'reconnect', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'waiting')), `persona=C is waiting and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))} — reconnecting on the waiting row alone`],
+  ])('%s → %s: C\'s own pane read once, nothing typed here, no notice, one line unless it goes ahead plainly', async (_label, verdict, pane, line) => {
+    const opts = paneOnly(pane())
+    let got: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      got = await checkWaitingRowPane('C')
+    })
+
+    expect(got).toBe(verdict)
+    expect(opts.readPaneCalls).toEqual([paneReadOf('C')])
+    expect(opts.sendKeysCalls).toEqual([])
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, 'persona=C is waiting')).toEqual(line === undefined ? [] : [expect.stringContaining(line)])
+    assertNoLeak({ errLog })
+  })
+
+  test('a prompt or dialog → defer on every call and never typed into; one blocked-on-prompt notice for the episode, saying it is reconnected once its turn ends', async () => {
+    const opts = paneOnly(PERMISSION_PANE)
+    let verdicts: string[] = []
+    const errLog = await withCapturedErr(async () => {
+      verdicts = [await checkWaitingRowPane('C'), await checkWaitingRowPane('C')]
+    })
+
+    expect(verdicts).toEqual(['defer', 'defer'])
+    expect(opts.sendKeysCalls).toEqual([])
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
+    expect(notices[0]!.text).toContain('Once its turn ends it is reconnected')
+    expect(linesWith(errLog, 'persona=C is waiting but its pane shows a prompt or dialog — not typing into it')).toHaveLength(2)
+  })
+})
+
+describe('b.f2b: the not-connected notice, once per episode', () => {
+  test.each<[string, NotConnectedNotice, string, string]>([
+    ['blocked on a prompt, auto-restart on', { reason: 'blocked-on-prompt', autoRestartDisabled: false }, ':warning: *Waiting on a prompt*', 'Once its turn ends it is reconnected'],
+    ['blocked on a prompt, session_restart_delay 0', { reason: 'blocked-on-prompt', autoRestartDisabled: true }, ':warning: *Waiting on a prompt*', 'Automatic restarts are disabled'],
+    ['disconnected, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause' }, ':warning: *Not connected*', '(a test cause), and automatic restarts are disabled'],
+    ['connected with its message stream gone, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause', streamless: true }, ':warning: *Not receiving messages*', 'its message stream is gone (a test cause), and automatic restarts are disabled'],
+  ])('%s: raised once, one log line; its first line says what is wrong, the second how to recover; a second call in the episode raises nothing', async (_label, notice, head, detail) => {
+    let raised: boolean[] = []
+    const errLog = await withCapturedErr(() => {
+      raised = [notifyPersonaNotConnected('C', notice), notifyPersonaNotConnected('C', notice)]
+    })
+
+    expect(raised).toEqual([true, false])
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    const [first, second, ...rest] = notices[0]!.text.split('\n')
+    expect(rest).toEqual([])
+    expect(first).toStartWith(head)
+    expect(notices[0]!.text).toContain(detail)
+    expect(second).toContain('`tmux attach -t slack_bot_C`')
+    expect(second).toContain(`\`${RECONNECT_TEXT}\``)
+    expect(linesWith(errLog, `persona=C is not connected (${notice.reason})`)).toHaveLength(1)
+  })
+
+  test.each<[UndeliverableCause | undefined, string, string]>([
+    [undefined, ':warning: *Not connected*', '(its connection has been down on two health checks in a row)'],
+    ['disconnected', ':warning: *Not connected*', '(its connection has been down on two health checks in a row)'],
+    ['streamless', ':warning: *Not receiving messages*', 'its message stream is gone (found on two health checks in a row)'],
+  ])('the health check\'s report (notifyDisconnectedWithAutoRestartDisabled) for cause %s: the notice worded for it, once per episode', (cause, head, detail) => {
+    notifyDisconnectedWithAutoRestartDisabled('C', cause)
+    notifyDisconnectedWithAutoRestartDisabled('C', cause)
+
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(notices[0]!.text).toStartWith(head)
+    expect(notices[0]!.text).toContain(detail)
+  })
+})
+
+describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconnect)', () => {
+  let clock: FakeClock
+  beforeEach(() => {
+    clock = useFakeNow()
+  })
+
+  test.each([60, 0])('REPRO: a stale working row at startup, its pane showing the same idle screen and its transcript ending with a completed turn, both unchanged, is reconnected once that has held for 60 s, not after the 10-minute wait (session_restart_delay %d); every read is of C\'s own pane and row', async (delay) => {
+    const cfg = waitConfig({ session_restart_delay: delay })
+    const row = installWorkingRow(clock, { pane: IDLE_PANE, stepMs: 10_000 }, workingCollision(cfg, transcriptOf()))
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toEqual({ key: 'C', action: 'reconnected' })
+    expect(row.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C', RECONNECT_TEXT]])
+    expect(clock.now()).toBeGreaterThanOrEqual(STALE_WORKING_WINDOW_MS)
+    expect(clock.now()).toBeLessThan(STALE_WORKING_WINDOW_MS + 30_000)
+    expect(row.readPaneCalls.length).toBeGreaterThan(0)
+    expect(row.readPaneCalls).toEqual(row.readPaneCalls.map(() => paneReadOf('C')))
+    // The ladder's collision lookup, then one row read per idle pane for its transcript.
+    expect(row.getCalls).toEqual(Array(row.readPaneCalls.length + 1).fill({ claude_instance_id: 'cscb_C' }))
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, 'treating the row as stale and reconnecting')).toHaveLength(1)
+  })
+
+  test('the wait reads the evidence at most every 5 s, not on each status poll: polled every second, the stale row is reconnected at the read that completes the 60 s', async () => {
+    const cfg = waitConfig()
+    const row = installWorkingRow(clock, { pane: IDLE_PANE, stepMs: 1_000 }, { getResult: workingRowOf(cfg, transcriptOf()) })
+
+    expect(await waitForWaitingAndReconnect('C', cfg)).toBe('ok')
+
+    // Polls at 1 s, 2 s, …, 61 s; reads at 1 s, 6 s, …, 61 s: the run from 1 s concludes at 61 s.
+    expect(clock.now()).toBe(61_000)
+    expect(row.statusCalls).toHaveLength(61)
+    expect(row.readPaneCalls).toHaveLength(13)
+    expect(row.getCalls).toHaveLength(13)
+    expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
+  })
+
+  test('the composed route: a fresh session\'s row (no persisted transcript path) is read through the transcript under the persona\'s claude_config_dir (its spawn home\'s .claude here), and reconnected', async () => {
+    const cfg = waitConfig()
+    const persona = personaOf(cfg, 'C')
+    const configDir = join(ladderHome(), '.claude')
+    const composed = resolveJsonlPath(persona.working_directory, TRANSCRIPT_SESSION_ID, configDir)
+    mkdirSync(join(composed, '..'), { recursive: true })
+    writeTranscript(composed, endedTurn())
+    const row = installWorkingRow(clock, { pane: IDLE_PANE, stepMs: 10_000 }, {
+      getResult: personaRow(cfg, 'C', { state: 'working', claude_session_id: TRANSCRIPT_SESSION_ID }),
+    })
+
+    expect(await waitForWaitingAndReconnect('C', cfg)).toBe('ok')
+    expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
+  })
+
+  test('a running turn mid-window (idle → spinner → idle): nothing is typed until the idle evidence has held for a full window after it', async () => {
+    const cfg = waitConfig()
+    const row = installWorkingRow(clock, {
+      pane: (now) => (now === 35_000 ? SPINNER_PANE : IDLE_PANE),
+      stepMs: 5_000,
+    }, { getResult: workingRowOf(cfg, transcriptOf()) })
+
+    expect(await waitForWaitingAndReconnect('C', cfg)).toBe('ok')
+
+    // Idle from 5 s, the spinner at 35 s, idle again from 40 s: typed at 100 s, not at 65 s.
+    expect(clock.now()).toBe(40_000 + STALE_WORKING_WINDOW_MS)
+    expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
+  })
+
+  test('b.rmy: a stalled turn (an API retry or stall drawn with no spinner) — the same still, idle screen for the whole 10 minutes, its transcript ending with the prompt — is never typed into: not-reconnected, and why is logged once', async () => {
+    const cfg = waitConfig()
+    const row = installWorkingRow(clock, { pane: IDLE_PANE, stepMs: 60_000 }, {
+      getResult: workingRowOf(cfg, transcriptOf([...endedTurn(), promptEntry('post it in #ops')])),
+    })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', cfg)
+    })
+
+    expect(result).toBe('not-reconnected')
+    expect(row.sendKeysCalls).toEqual([])
+    expect(clock.now()).toBeGreaterThanOrEqual(WAIT_FOR_WAITING_TIMEOUT_MS)
+    expect(row.readPaneCalls.length).toBeGreaterThan(5)
+    expect(linesWith(errLog, 'does not end with a completed turn — no idle evidence; still waiting for its working row')).toHaveLength(1)
+  })
+
+  test('REPRO: a row that reads waiting at the deadline is reconnected, not left to the health check', async () => {
+    _setFindMissingMemoTtlMs(0) // the deadline's fresh sweep is the second findMissing
+    const row = installWorkingRow(clock, {
+      pane: SPINNER_PANE,
+      stepMs: 60_000,
+      state: (r) => (r.findMissingCalls.length >= 2 ? 'waiting' : 'working'),
+    })
+
+    const result = await waitForWaitingAndReconnect('C', waitConfig())
+
+    expect(result).toBe('ok')
+    expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
+    expect(clock.now()).toBeGreaterThanOrEqual(WAIT_FOR_WAITING_TIMEOUT_MS)
+  })
+
+  /**
+   * The wait's give-ups with the session alive (tmux alive, the suite's
+   * default prober): how the stub makes each, and the head and detail of the
+   * notice at session_restart_delay 0. The deadline's status call fails only
+   * after the deadline's fresh sweep (memo TTL 0: two sweeps per wait).
+   */
+  const GIVE_UPS: Array<[string, Pick<WorkingRow, 'pane' | 'stepMs' | 'state'>, string, string]> = [
+    ['the deadline, with the row still working and its pane mid-turn', { state: 'working', pane: SPINNER_PANE, stepMs: 60_000 }, ':warning: *Not connected*', '(its agent-director row still read working 10 min after launch, and CSCB found no proof it was idle)'],
+    ['the row moving to ask_user', { state: 'ask_user', pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Waiting on a prompt*', 'Automatic restarts are disabled (`session_restart_delay` is 0)'],
+    ['agent-director losing the row while its tmux session lives', { state: errSpawnNotFound(), pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Not connected*', '(agent-director has no record of its session, though its tmux session is alive)'],
+    [
+      'the deadline\'s status call failing while its tmux session lives (the tmux fallback)',
+      { state: (r) => (r.findMissingCalls.length % 2 === 0 ? errGeneric('status', 'ErrTimeout') : 'working'), pane: SPINNER_PANE, stepMs: 60_000 },
+      ':warning: *Not connected*',
+      '(agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it)',
+    ],
+  ]
+
+  test.each(GIVE_UPS)('REPRO: session_restart_delay 0 and %s → not-reconnected with nothing typed; the log says nothing will reconnect it, and one not-connected notice saying why is raised for the episode', async (_label, init, head, detail) => {
+    _setFindMissingMemoTtlMs(0)
+    const cfg = waitConfig({ session_restart_delay: 0 })
+    const row = installWorkingRow(clock, init)
+
+    const results: string[] = []
+    const errLog = await withCapturedErr(async () => {
+      results.push(await waitForWaitingAndReconnect('C', cfg))
+      // A second give-up in the same episode raises nothing more.
+      results.push(await waitForWaitingAndReconnect('C', cfg))
+    })
+
+    expect(results).toEqual(['not-reconnected', 'not-reconnected'])
+    expect(row.sendKeysCalls).toEqual([])
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(notices[0]!.text).toStartWith(head)
+    expect(notices[0]!.text).toContain(detail)
+    expect(linesWith(errLog, 'session_restart_delay is 0, so nothing will reconnect it — the not-connected notice reports it')).toHaveLength(2)
+    expect(errLog).not.toContain('health-check will')
+    expect(errLog).not.toMatch(/; the health check (recovers|reconnects|reads|schedules) /)
+  })
+
+  test.each(GIVE_UPS)('session_restart_delay 60 and %s → not-reconnected with nothing typed and no notice; the log says what the health check does next', async (_label, init) => {
+    _setFindMissingMemoTtlMs(0)
+    const cfg = waitConfig({ session_restart_delay: 60 })
+    const row = installWorkingRow(clock, init)
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', cfg)
+    })
+
+    expect(result).toBe('not-reconnected')
+    expect(row.sendKeysCalls).toEqual([])
+    expect(notices).toEqual([])
+    expect(errLog).not.toContain('nothing will reconnect it')
+    expect(errLog).toMatch(/; the health check (recovers|reconnects|reads|schedules) /)
+  })
+
+  test.each<[number, string]>([
+    [60, 'Once its turn ends it is reconnected'],
+    [0, 'Automatic restarts are disabled'],
+  ])('a prompt shown for 60 s while the row reads working is never typed into: one log line and one blocked-on-prompt notice (session_restart_delay %d); the wait goes on and reconnects once the row reads waiting', async (delay, wording) => {
+    const cfg = waitConfig({ session_restart_delay: delay })
+    const row = installWorkingRow(clock, {
+      pane: PERMISSION_PANE,
+      stepMs: 20_000,
+      // Answered after 3 minutes: the turn ends and the row reads waiting.
+      state: () => (clock.now() > 3 * 60_000 ? 'waiting' : 'working'),
+    })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', cfg)
+    })
+
+    expect(result).toBe('ok')
+    // Typed once, and only after the row read waiting.
+    expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
+    expect(clock.now()).toBeGreaterThan(3 * 60_000)
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
+    expect(notices[0]!.text).toContain(wording)
+    expect(linesWith(errLog, 'its pane has shown a prompt or dialog')).toHaveLength(1)
+  })
+
+  test.each<[string, () => PaneReading]>([
+    ['a running turn (its spinner line)', () => SPINNER_PANE],
+    ['a blank pane', () => ''],
+    ['an unreadable pane', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'wait'))],
+  ])('b.rmy: %s for the whole 10 minutes is never typed into, though the transcript ends with a completed turn — the wait gives up not-reconnected; a read failure is logged once, token-safe', async (_label, pane) => {
+    const cfg = waitConfig()
+    const row = installWorkingRow(clock, { pane: pane(), stepMs: 30_000 }, { getResult: workingRowOf(cfg, transcriptOf()) })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', cfg)
+    })
+
+    expect(result).toBe('not-reconnected')
+    expect(row.sendKeysCalls).toEqual([])
+    expect(clock.now()).toBeGreaterThanOrEqual(WAIT_FOR_WAITING_TIMEOUT_MS)
+    // Only the wait's first failed read is logged, by its errName and redacted message.
+    const failure = `reading the pane of persona=C failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))}`
+    expect(linesWith(errLog, 'reading the pane of persona=C failed')).toHaveLength(row.pane instanceof Error ? 1 : 0)
+    expect(linesWith(errLog, failure)).toHaveLength(row.pane instanceof Error ? 1 : 0)
+    assertNoLeak({ errLog })
+  })
+})
+
+describe('b.f2b: a teardown cancels a launch\'s wait for a working row (cancelWorkingRowWait)', () => {
+  let clock: FakeClock
+  beforeEach(() => {
+    clock = useFakeNow()
+  })
+
+  test('a running wait, asleep between 60 s polls: cancelled at once — it wakes, types nothing, polls no more, and its launch settles as not-reconnected; a second cancel does nothing', async () => {
+    const cfg = waitConfig({ agent_director_poll_interval_ms: 60_000 })
+    const row = installWorkingRow(clock, { pane: SPINNER_PANE, stepMs: 0 }, workingCollision(cfg))
+
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    let cancels: boolean[] = []
+    const errLog = await withCapturedErr(async () => {
+      const launch = spawnForPersona(personaOf(cfg, 'C'), cfg, false)
+      await pollUntil(() => row.readPaneCalls.length === 1)
+      cancels = [cancelWorkingRowWait('C'), cancelWorkingRowWait('C')]
+      result = await launch
+    })
+
+    expect(cancels).toEqual([true, false])
+    expect(result).toEqual({ key: 'C', action: 'not-reconnected' })
+    expect(isLaunchInFlight('C')).toBe(false)
+    expect(row.statusCalls).toHaveLength(1)
+    expect(row.sendKeysCalls).toEqual([])
+    expect(linesWith(errLog, 'persona=C — cancelling its launch\'s wait for its working row')).toHaveLength(1)
+    expect(linesWith(errLog, `the wait for ${renderPersonaRef('C', 'C')} was cancelled (its persona is being torn down) — nothing typed`)).toHaveLength(1)
+  })
+
+  test('a launch in flight whose wait has not started: the wait it starts is cancelled from its first check (no sweep, poll or read, nothing typed), and the cancel ends with that launch', async () => {
+    const cfg = waitConfig()
+    const row = installWorkingRow(clock, { pane: SPINNER_PANE, stepMs: 0 }, { getResult: workingRowOf(cfg) })
+    const held = holdSpawns(row.stub)
+
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    let cancels: boolean[] = []
+    const errLog = await withCapturedErr(async () => {
+      const launch = spawnForPersona(personaOf(cfg, 'C'), cfg, false)
+      await held.entered('cscb_C')
+      cancels = [cancelWorkingRowWait('C'), cancelWorkingRowWait('C')]
+      held.fail('cscb_C', errInstanceIdCollision())
+      result = await launch
+    })
+
+    expect(cancels).toEqual([true, false])
+    expect(result).toEqual({ key: 'C', action: 'not-reconnected' })
+    expect([row.findMissingCalls, row.statusCalls, row.readPaneCalls, row.sendKeysCalls]).toEqual([[], [], [], []])
+    expect(linesWith(errLog, 'persona=C — its launch in flight will not wait for a working row')).toHaveLength(1)
+    expect(linesWith(errLog, `the wait for ${renderPersonaRef('C', 'C')} was cancelled`)).toHaveLength(1)
+    // Nothing in flight now: nothing to cancel, and a later wait runs as usual.
+    expect(cancelWorkingRowWait('C')).toBe(false)
+    row.state = 'waiting'
+    expect(await waitForWaitingAndReconnect('C', cfg)).toBe('ok')
+  })
+
+  test('no launch in flight: nothing to cancel, and nothing logged', async () => {
+    installStub({})
+    let cancelled: boolean | undefined
+    const errLog = await withCapturedErr(() => {
+      cancelled = cancelWorkingRowWait('C')
+    })
+
+    expect(cancelled).toBe(false)
+    expect(errLog).toBe('')
+  })
+})
+
+/** Rejections no handler took while a start-pass case ran (the listener is removed in its afterEach). */
+let unhandledRejections: unknown[] = []
+const recordUnhandledRejection = (reason: unknown): void => {
+  unhandledRejections.push(reason)
+}
+
+describe('b.f2b: one persona waiting for its working row does not hold up the start pass', () => {
+  afterEach(() => {
+    process.off('unhandledRejection', recordUnhandledRejection)
+  })
+
+  /** Personas A and B; only A's first spawn collides with its `working` row. A's row reads `aState()`, B's `waiting`. */
+  function parkedA(pollMs: number, aState: () => RowReading) {
+    const cfg = makeStandInPersonaConfig(
+      { A: { working_directory: '/x/a' }, B: { working_directory: '/x/b' } },
+      fixtureDir,
+      { agent_director_poll_interval_ms: pollMs },
+    )
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      sendKeysCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: personaRow(cfg, 'A', { state: 'working' }),
+      statusFn: (params) => {
+        const reading = params.claude_instance_id === 'cscb_A' ? aState() : 'waiting'
+        return reading instanceof Error ? reading : ({ state: reading } as import('agent-director').StatusResult)
+      },
+      readPaneResults: [{ pane: SPINNER_PANE }],
+    })
+    return { cfg, sendKeysCalls, ref: renderPersonaRef('A', 'A') }
+  }
+
+  test('REPRO: concurrency 1, A\'s working row stuck mid-turn — A\'s launch is parked (its slot freed, still in flight), B and C launch, and the pass returns counting A apart; A\'s outcome is logged when it settles', async () => {
+    captureStartupErrors()
+    const cfg = makeStandInPersonaConfig(
+      { A: { working_directory: '/x/a' }, B: { working_directory: '/x/b' }, C: { working_directory: '/x/c' } },
+      fixtureDir,
+      { agent_director_poll_interval_ms: 1 },
+    )
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    let aState = 'working'
+    installStub({
+      spawnCalls,
+      sendKeysCalls,
+      // Only A (launched first) collides; B and C spawn fresh.
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: personaRow(cfg, 'A', { state: 'working' }),
+      statusFn: (params) => ({ state: params.claude_instance_id === 'cscb_A' ? aState : 'waiting' }) as import('agent-director').StatusResult,
+      readPaneResults: [{ pane: SPINNER_PANE }],
+    })
+
+    let result: Awaited<ReturnType<typeof startupSessionManager>> | undefined
+    let returnedWhileAWaits = false
+    let aInFlightAtReturn = false
+    const errLog = await withCapturedErr(async () => {
+      const start = startupSessionManager(cfg, { concurrency: 1 })
+      void start.then((r) => { result = r })
+      await pollUntil(() => result !== undefined)
+      returnedWhileAWaits = result !== undefined
+      aInFlightAtReturn = isLaunchInFlight('A')
+      // A's turn ends: its row reads waiting, and its background launch reconnects it.
+      aState = 'waiting'
+      await start
+      await whenLaunchSettled('A')
+    })
+
+    expect(returnedWhileAWaits).toBe(true)
+    expect(aInFlightAtReturn).toBe(true)
+    expect(isLaunchInFlight('A')).toBe(false)
+    expect(spawnCalls.map((p) => p.claude_instance_id)).toEqual(['cscb_A', 'cscb_B', 'cscb_C'])
+    expect(result!.perPersona).toEqual([
+      { key: 'A', action: 'waiting-in-background' },
+      { key: 'B', action: 'spawned' },
+      { key: 'C', action: 'spawned' },
+    ])
+    expect(result!).toMatchObject({ waitingInBackground: 1, succeeded: 2, freshSpawned: 2, reconnected: 0, notReconnected: 0, failed: 0 })
+    expect(sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_A', RECONNECT_TEXT]])
+    const ref = renderPersonaRef('A', 'A')
+    expect(linesWith(errLog, `startupSessionManager: ${ref} is waiting for its working row to settle`)).toHaveLength(1)
+    expect(errLog).toContain('0 reconnected, 0 no-op, 0 failed, 0 not brought up, 0 not reconnected')
+    expect(errLog).toContain('startupSessionManager: 1 persona(s) still waiting in the background for a working row')
+    const settled = `startupSessionManager: background launch for ${ref} settled: reconnected`
+    expect(linesWith(errLog, settled)).toHaveLength(1)
+    expect(errLog.indexOf(settled)).toBeGreaterThan(errLog.indexOf('still waiting in the background'))
+  })
+
+  test('a teardown of A while its start launch is parked cancels the wait, as the persona teardown does before it waits for the launch: the launch settles at once (its 60 s poll sleep cut short) as not-reconnected, typed nothing, and its outcome is logged', async () => {
+    captureStartupErrors()
+    const { cfg, sendKeysCalls, ref } = parkedA(60_000, () => 'working')
+
+    let result: Awaited<ReturnType<typeof startupSessionManager>> | undefined
+    let cancelled: boolean | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await startupSessionManager(cfg, { concurrency: 1 })
+      cancelled = cancelWorkingRowWait('A')
+      await whenLaunchSettled('A')
+      await settleNotices()
+    })
+
+    expect(result!.perPersona).toEqual([{ key: 'A', action: 'waiting-in-background' }, { key: 'B', action: 'spawned' }])
+    expect(cancelled).toBe(true)
+    expect(isLaunchInFlight('A')).toBe(false)
+    expect(sendKeysCalls).toEqual([])
+    expect(linesWith(errLog, `startupSessionManager: background launch for ${ref} settled: not-reconnected`)).toHaveLength(1)
+  })
+
+  test('a parked launch that rejects: one token-safe "unexpected error in the background launch" line and one spawn-failed startup error, no settled line and no unhandled rejection', async () => {
+    const readLog = captureStartupErrors()
+    let aState: RowReading = 'working'
+    const { cfg, sendKeysCalls, ref } = parkedA(1, () => aState)
+    // An injected tmux prober may reject (the default never does): here, once A's row is gone.
+    const probeFailure = Object.assign(new Error(leakyMessage('tmux probe failed', 'parked')), { detail: LEAK_SENTINEL })
+    _setTmuxSessionProber(async () => {
+      throw probeFailure
+    })
+    unhandledRejections = []
+    process.on('unhandledRejection', recordUnhandledRejection)
+
+    let result: Awaited<ReturnType<typeof startupSessionManager>> | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await startupSessionManager(cfg, { concurrency: 1 })
+      aState = errSpawnNotFound()
+      await whenLaunchSettled('A')
+      await settleNotices()
+    })
+
+    expect(result!.perPersona).toEqual([{ key: 'A', action: 'waiting-in-background' }, { key: 'B', action: 'spawned' }])
+    expect(isLaunchInFlight('A')).toBe(false)
+    expect(sendKeysCalls).toEqual([])
+    const lines = linesWith(errLog, 'unexpected error in the background launch')
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(
+      `[slack] startupSessionManager: unexpected error in the background launch for ${ref}: Error message=${JSON.stringify(redactedLeakyMessage('tmux probe failed'))}`,
+    )
+    expect(linesWith(errLog, `background launch for ${ref} settled`)).toEqual([])
+    const entry = onlyStartupEntry(readLog(), 'spawn-failed')
+    expect(entry).toContain(`unexpected error spawning ${ref}: Error message=${JSON.stringify(redactedLeakyMessage('tmux probe failed'))}`)
+    expect(unhandledRejections).toEqual([])
+    assertNoLeak({ errLog, startupErrors: writtenFile(join(fixtureDir, 'state', 'startup-errors.log')) })
+  })
+
+  test('a start launch that joins a launch already waiting on a working row waits with it; when that wait gives up with the session alive, both count it a launch that did not fail, and the summary ends ", 1 not reconnected"', async () => {
+    captureStartupErrors()
+    const clock = useFakeNow()
+    const cfg = waitConfig()
+    // The wait spins without moving time until the start pass has joined it.
+    const row = installWorkingRow(clock, { pane: SPINNER_PANE, stepMs: 0 }, workingCollision(cfg))
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    let restarted: boolean | 'skipped' | undefined
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    try {
+      const restart = launchSession('C', cfg)
+      await pollUntil(() => isLaunchInFlight('C'))
+      const start = startupSessionManager(cfg, { concurrency: 1 })
+      await pollUntil(() => lines.some((l) => l.includes('launch already in flight for')))
+      row.stepMs = 60_000 // now time runs out
+      ;[restarted, result] = await Promise.all([restart, start])
+    } finally {
+      console.error = orig
+    }
+    const errLog = lines.join('\n')
+
+    expect(restarted).toBe(true)
+    expect(row.spawnCalls).toHaveLength(1) // one launch, joined
+    expect(row.sendKeysCalls).toEqual([])
+    expect(result.perPersona).toEqual([{ key: 'C', action: 'not-reconnected' }])
+    expect(result).toMatchObject({ notReconnected: 1, succeeded: 1, reconnected: 0, waitingInBackground: 0, failed: 0 })
+    expect(errLog).toContain('0 reconnected, 0 no-op, 0 failed, 0 not brought up, 1 not reconnected')
+    expect(errLog).not.toContain('still waiting in the background')
   })
 })
 

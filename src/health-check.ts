@@ -2,7 +2,11 @@
  * health-check.ts — Periodic liveness poller for managed Claude Code sessions.
  *
  * On each tick, checks every applied persona and schedules a restart if its
- * session is dead and not already pending/failed. The work list, the
+ * session is dead and not already pending/failed. With auto-restart disabled,
+ * an alive persona it would reconnect is reported through the not-connected
+ * notice instead of being left down silently (b.f2b). A persona whose
+ * `working` row the reconnect adapter is gathering idle evidence for is
+ * scheduled on its first undeliverable tick (b.f2b). The work list, the
  * disconnected streaks, every guard call and the `cwd-unreachable` flag are
  * keyed by persona key (b.av2 SR-6.3); log lines name it as `persona=<key>`.
  * Follows the same pattern as restart.ts: module-scoped state, injectable
@@ -42,6 +46,50 @@ export interface HealthCheckDeps {
    */
   hasSessionStream(key: string): boolean
   isRestartPendingOrActive(key: string): boolean
+  /**
+   * b.f2b: true while a launch for the persona is in flight (production: the
+   * session manager's `isLaunchInFlight`) — a start launch still waiting in
+   * the background for a `working` row to settle, a bring-up retry's launch
+   * or a restart's. The tick skips the persona, as for a pending restart: the
+   * launch owns its session, and its wait reconnects it or reports it.
+   * Absent: no persona is skipped for it.
+   */
+  isLaunchInFlight?(key: string): boolean
+  /**
+   * b.f2b: true when auto-restart is disabled (`session_restart_delay` 0).
+   * `scheduleRestart` then does nothing, so an alive persona the tick finds
+   * not deliverable on two consecutive ticks is also reported through
+   * `notifyNotConnected` rather than left down silently. Absent: false.
+   */
+  isAutoRestartDisabled?(): boolean
+  /**
+   * b.f2b: raise the persona's not-connected notice (production:
+   * `notifyDisconnectedWithAutoRestartDisabled`, once per episode), worded
+   * for `cause`: its MCP session is not connected (`disconnected`), or it is
+   * connected but has no message stream (`streamless`, b.9cj). The episode
+   * ends when its MCP session registers again, when the tick finds it
+   * deliverable again (`endNotConnectedEpisode`) or when it is torn down.
+   */
+  notifyNotConnected?(key: string, cause: 'disconnected' | 'streamless'): void
+  /**
+   * b.f2b: end the persona's not-connected episode (production:
+   * `forgetNotConnectedEpisode`), called on every tick that finds it alive,
+   * connected and with its stream: a later episode is reported again.
+   * Absent: nothing is called.
+   */
+  endNotConnectedEpisode?(key: string): void
+  /**
+   * b.f2b: true while the restart path's reconnect adapter holds an idle run
+   * for the persona's `working` row that one more attempt can conclude
+   * (production: the session manager's `hasPendingWorkingRowEvidence`). The
+   * row may be stale, and each attempt reads its evidence only once, so the tick
+   * schedules the next attempt the first time it finds the persona
+   * undeliverable instead of after two consecutive ticks. HAZARD 1 does not
+   * apply: the evidence exists only for a session already read idle with its
+   * row `working`, and is forgotten as soon as any launch for the persona
+   * starts, so a booting session never has it. Absent: false.
+   */
+  hasPendingWorkingRowEvidence?(key: string): boolean
   /**
    * Returns true when the persona has reached the consecutive-failure cap.
    * Capped personas are skipped on every tick (SR-25.3/25.4) — the tick
@@ -106,12 +154,17 @@ let skippedTicks = 0
  * ticks (chosen over a post-launch grace window because it needs no launch
  * timestamp plumbed in from restart.ts, and resets cleanly through the seams
  * below) means a booting session that connects between ticks is never poked.
+ * b.f2b: the one exception is a persona whose `working` row the reconnect
+ * adapter is gathering idle evidence for (`hasPendingWorkingRowEvidence`),
+ * scheduled on its first undeliverable tick; a launch forgets that evidence,
+ * so it never applies to a booting session.
  *
  * This map leaks nothing across contexts because it is cleared:
  *   - the moment a persona is observed connected (streak reset inline below),
  *   - when a reconnect is scheduled for it (consumed on fire, below),
- *   - when a tick skips it: pending/active restart, at cap, or left out of the
- *     tick's work list by the relaunch gate,
+ *   - when a tick skips it: pending/active restart, a launch in flight
+ *     (b.f2b), at cap, or left out of the tick's work list by the relaunch
+ *     gate,
  *   - by `forgetDisconnectedStreak` when the persona is torn down,
  *   - and wholesale by `_resetHealthCheckState` (the test-reset seam and the
  *     production stop path both call it).
@@ -165,7 +218,9 @@ export function startHealthCheck(intervalSeconds: number): void {
 
       for (const [key, cwd] of Object.entries(personas)) {
         try {
-          if (deps.isRestartPendingOrActive(key)) {
+          // b.f2b: a launch in flight (e.g. a start launch still waiting in the
+          // background for a `working` row) owns the session, like a restart.
+          if (deps.isRestartPendingOrActive(key) || deps.isLaunchInFlight?.(key) === true) {
             // Clear any pending streak: "consecutive" means consecutive
             // *observed* ticks, not observations separated by an entire restart
             // cycle. A stale streak surviving across a restart could otherwise
@@ -221,12 +276,14 @@ export function startHealthCheck(intervalSeconds: number): void {
           // NOTE (b.4vj, larva): a future inbound-delivery retry driver will
           // also poke unreachable sessions. If it lands, reconcile the two poke
           // paths so they don't race on the same persona.
+          // (Read once: b.f2b words the delay-0 notice by it.)
+          const connected = alive && deps.isSessionConnected(key)
           if (!alive) {
             // Dead session: schedule immediately. The disconnected streak is
             // meaningless once the row is not alive, so drop it.
             disconnectedStreak.delete(key)
             deps.scheduleRestart(key, cwd)
-          } else if (!deps.isSessionConnected(key) || !deps.hasSessionStream(key)) {
+          } else if (!connected || !deps.hasSessionStream(key)) {
             // Alive but not deliverable: either MCP-disconnected (b.9a7) OR
             // connected-but-streamless — the SDK silently dropped the
             // `_GET_stream` map entry so messages cannot reach the bot (b.9cj).
@@ -237,18 +294,33 @@ export function startHealthCheck(intervalSeconds: number): void {
             // disconnectedStreak doc comment). scheduleRestart then does the
             // right thing per case — reconnect a disconnected row, or recover a
             // streamless one (restart.ts:155 no longer waves the latter through).
+            //
+            // b.f2b: a reconnect deferred on a `working` row returns
+            // 'transient', and restart.ts never re-enters on it; this tick is
+            // the retry driver. While the adapter holds an idle run for the
+            // row (`hasPendingWorkingRowEvidence`), the next attempt, which
+            // can find the row stale and reconnect it, is scheduled on this
+            // first undeliverable tick rather than after a second.
             const streak = (disconnectedStreak.get(key) ?? 0) + 1
-            if (streak >= 2) {
+            if (streak >= 2 || deps.hasPendingWorkingRowEvidence?.(key) === true) {
               disconnectedStreak.delete(key)
               deps.scheduleRestart(key, cwd)
+              // b.f2b: with auto-restart disabled scheduleRestart only logs and
+              // returns, so nothing would reconnect this persona: report it
+              // (the notice is raised once per episode), worded for why it is
+              // undeliverable.
+              if (deps.isAutoRestartDisabled?.() === true) {
+                deps.notifyNotConnected?.(key, connected ? 'streamless' : 'disconnected')
+              }
             } else {
               disconnectedStreak.set(key, streak)
             }
           } else {
             // Alive, connected, AND stream present — healthy. Reset any pending
             // streak so a transient one-tick blip never accumulates toward the
-            // threshold.
+            // threshold. b.f2b: its not-connected episode, if any, is over.
             disconnectedStreak.delete(key)
+            deps.endNotConnectedEpisode?.(key)
           }
         } catch (err) {
           console.error(`[slack] health-check: error checking persona=${key}: ${describeThrownValue(err)}`)
