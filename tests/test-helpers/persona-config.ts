@@ -145,6 +145,9 @@ export type PersonaSpec = Partial<Omit<Persona, 'index'>>
  * - `stop_hook_bootstrap`: inherited from the resolved top-level value.
  *
  * Throws when two personas share a name or a key, which the loader would reject.
+ * Keys where one starts with the other (`dev`, `dev_2`), which the loader also
+ * rejects, are allowed here, so a test of the server's own exact tmux targets
+ * can build such a pair; so is the default `test_bot_1` beside `test_bot_10`.
  * Pass the test's own `mkdtempSync` directory as `baseDir`; there is no default,
  * so paths never land in the shared OS temp directory.
  */

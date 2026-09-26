@@ -1749,9 +1749,12 @@ export async function main(): Promise<void> {
   })
 
   // b.av2 SR-6.3: the start sweep, BEFORE the trust patch and any spawn.
-  // `service=cscb` spawns with no `persona` label, a persona absent from the
-  // applied config, an instance ID other than `cscb_<key>` or a `cwd` other
-  // than the persona's working directory get killed + deleted.
+  // `service=cscb` spawns naming a persona absent from the applied config, or
+  // with an instance ID other than `cscb_<key>` or a `cwd` other than the
+  // persona's working directory, get killed + deleted. A spawn with no
+  // `persona` label (a pre-persona row, b.1ix) is never deleted: a live one is
+  // killed and kept, and one findMissing sweep after those kills lets a row
+  // whose session is gone read `missing`.
   try {
     await reconcileOrphans(personaConfig)
   } catch (err) {

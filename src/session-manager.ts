@@ -46,7 +46,9 @@
  * `service=cscb` spawn and kills+deletes any with a persona absent from the
  * applied configuration, an instance ID other than `cscb_<key>`, or a `cwd`
  * other than its persona's working directory. A pre-persona row (no `persona`
- * label) is never deleted: it is kept, and killed only when live (b.1ix). While a
+ * label) is never deleted: it is kept, and killed only when live, with one
+ * findMissing sweep after the kills so a killed row reads `missing` once its
+ * session is gone and isn't killed again at the next start (b.1ix). While a
  * persona's working directory cannot be resolved to a real path, neither the
  * sweep nor the collision ladder kills or deletes on `cwd` grounds a row
  * whose `cwd` has no real path either (b.av2 SR-6.4): the sweep defers the
@@ -535,10 +537,13 @@ export function _resetNotConnectedEpisodes(): void {
 /**
  * The not-connected notice body (b.f2b). The first line says what is wrong,
  * so a dry-run log line (which carries only the first line) keeps it; the
- * second says what to do. The notifier adds the persona reference.
+ * second says what to do. The notifier adds the persona reference. The attach
+ * command names the session exactly (`=slack_bot_<key>`, b.1ix): a bare name
+ * would attach to a prefix neighbour's session (`slack_bot_dev_2` for
+ * `slack_bot_dev`) once the persona's own is gone.
  */
 function buildNotConnectedNotice(key: string, notice: NotConnectedNotice): string {
-  const attach = `\`tmux attach -t ${personaTmuxSessionName(key)}\``
+  const attach = `\`tmux attach -t ${tmuxExactSessionTarget(personaTmuxSessionName(key))}\``
   const reconnect = `\`/mcp reconnect ${MCP_SERVER_NAME}\``
   if (notice.reason === 'blocked-on-prompt') {
     const after = notice.autoRestartDisabled
@@ -631,7 +636,8 @@ export function _resetTmuxCommandRunner(): void {
  * the exact name (b.1ix). Verified against tmux 3.2a, the version in the
  * `/ci` image.
  *
- * A session target (`has-session`, `kill-session`) is `=<name>`.
+ * A session target (`has-session`, `kill-session`, and the `attach` command
+ * the not-connected notices give an operator) is `=<name>`.
  */
 function tmuxExactSessionTarget(sessionName: string): string {
   return `=${sessionName}`
@@ -1968,16 +1974,34 @@ export function _resetFindMissingMemo(): void {
  * @param key persona key: the outage key and log context — the sweep itself is whole-store.
  * @param logPrefix distinguishes the call sites in the log line.
  * @param ref log reference; defaults to the key alone.
+ * @returns the sweep's result (this caller's, a shared in-flight one or the
+ *   memoized one), or undefined when the sweep failed.
  */
-async function reconcileMissingSweep(key: string, logPrefix: string, ref: string = keyRef(key)): Promise<void> {
+async function reconcileMissingSweep(key: string, logPrefix: string, ref: string = keyRef(key)): Promise<FindMissingResult | undefined> {
+  return sharedFindMissingSweep(() => withOutageDetection(key, undefined, (client) => client.findMissing({})), logPrefix, ref)
+}
+
+/**
+ * The memo and single-flight core of `reconcileMissingSweep`, shared by every
+ * findMissing caller. `start` makes the call when no sweep is in flight or
+ * memoized: a persona's call through `withOutageDetection`, or the start
+ * sweep's direct call (`reconcileKilledPrePersonaRows`), which acts for no
+ * persona. Never throws; logs as `reconcileMissingSweep` describes.
+ */
+async function sharedFindMissingSweep(
+  start: () => Promise<FindMissingResult>,
+  logPrefix: string,
+  ref: string,
+): Promise<FindMissingResult | undefined> {
   // Memo hit: a recent successful sweep is still within the TTL. Reuse it.
   if (_findMissingLast && Date.now() - _findMissingLast.at < _findMissingMemoTtlMs) {
-    return
+    return _findMissingLast.result
   }
 
   // Single-flight: an in-flight sweep exists — await it rather than starting one.
+  // The async wrapper turns a synchronous throw from `start` into a rejection.
   if (!_findMissingInFlight) {
-    _findMissingInFlight = withOutageDetection(key, undefined, (client) => client.findMissing({}))
+    _findMissingInFlight = (async () => start())()
   }
   const inFlight = _findMissingInFlight
 
@@ -1990,6 +2014,7 @@ async function reconcileMissingSweep(key: string, logPrefix: string, ref: string
       _findMissingInFlight = null
       console.error(`[slack] ${logPrefix}: findMissing sweep for ${ref} — count=${r.count} ids=[${r.ids.join(',')}] unverified=${r.unverified} unverified_ids=[${r.unverified_ids.join(',')}]`)
     }
+    return r
   } catch (err) {
     // Do NOT memoize failures — clear the in-flight slot so the next caller
     // retries. Log and let the caller proceed with today's behavior.
@@ -1998,6 +2023,7 @@ async function reconcileMissingSweep(key: string, logPrefix: string, ref: string
     }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('findMissing', 'UnknownError', String(err))
     console.error(`[slack] ${logPrefix}: findMissing sweep failed for ${ref}: ${describeAgentDirectorFailure(e)} — proceeding`)
+    return undefined
   }
 }
 
@@ -3764,11 +3790,15 @@ export interface OrphanReconcileResult {
   prePersona: PrePersonaSweepCounts
 }
 
-/** The start sweep's pre-persona rows (b.1ix): all kept, the live ones killed once. */
+/**
+ * The start sweep's pre-persona rows (b.1ix): all kept; each live one is
+ * killed at this start, then one findMissing sweep lets a killed row whose
+ * session is gone read `missing`, so a later start doesn't kill it again.
+ */
 export interface PrePersonaSweepCounts {
   /** Pre-persona rows listed. Every one is kept. */
   kept: number
-  /** Those in a live state (`AGENT_DIRECTOR_LIVE_STATES`), each killed once. */
+  /** Those in a live state (`AGENT_DIRECTOR_LIVE_STATES`), each given one kill call at this start. */
   live: number
   /** Live ones whose kill failed. */
   killFailed: number
@@ -3811,8 +3841,16 @@ function sweepDecision(
  * label (b.1ix; the rows a build that predates personas made, instance IDs
  * `cscb_<name>_<channel>`): the row is kept, never deleted. Its ID is never a
  * persona's `cscb_<key>`, so no launch reuses or resumes it, and keeping it is
- * harmless. A row in a live state is killed once and the kill's result
- * logged; an `ended` or `missing` row is left alone, with no call and no line.
+ * harmless. A row in a live state gets one kill call at this start and the
+ * kill's result logged; an `ended` or `missing` row is left alone, with no
+ * call and no line. Returns whether it called `kill`.
+ *
+ * agent-director 0.10.0's `kill` doesn't change the row's state, so a killed
+ * row would still read live at every later start and be killed again each
+ * time. `reconcileOrphans` therefore runs one findMissing sweep after the
+ * kills (`reconcileKilledPrePersonaRows`): a row whose session is gone then
+ * reads `missing`, and later starts leave it alone. A row whose session is
+ * still there stays live and is killed again at the next start.
  *
  * Why no delete: agent-director 0.10.0's `kill` can report success while the
  * session lives on, and a deleted row would leave that session running with
@@ -3827,9 +3865,9 @@ function sweepDecision(
  * instanceId=<id>: <errName> message="…"; row kept, its session may still be
  * running`).
  */
-async function keepPrePersonaRow(client: Client, row: ListRow, counts: PrePersonaSweepCounts): Promise<void> {
+async function keepPrePersonaRow(client: Client, row: ListRow, counts: PrePersonaSweepCounts): Promise<boolean> {
   counts.kept++
-  if (!AGENT_DIRECTOR_LIVE_STATES.has(row.state)) return
+  if (!AGENT_DIRECTOR_LIVE_STATES.has(row.state)) return false
   counts.live++
   const id = row.claude_instance_id
   console.error(
@@ -3844,10 +3882,50 @@ async function keepPrePersonaRow(client: Client, row: ListRow, counts: PrePerson
       'orphan-cleanup',
       `kill failed for pre-persona row instanceId=${id}: ${describeAgentDirectorFailure(e)}; row kept, its session may still be running`,
     )
-    return
+    return true
   }
   console.error(
     `[slack] reconcileOrphans: kill reported success for pre-persona row instanceId=${id} — row kept; a reported success does not prove tmux session ${row.tmux_session_name} is gone`,
+  )
+  return true
+}
+
+/**
+ * After the start sweep's kills of live pre-persona rows (b.1ix), run one
+ * findMissing sweep, so each killed row whose session is gone reads `missing`
+ * and is not killed again at the next start (agent-director 0.10.0's `kill`
+ * leaves the row's state as it was). It runs after a failed kill too: the
+ * session may be gone all the same, and only the sweep would tell.
+ *
+ * It is the memoized, single-flight sweep every findMissing caller shares
+ * (`sharedFindMissingSweep`, b.m4r). The start sweep runs before any launch
+ * and before the health check, so no earlier sweep in this process can be
+ * reused; the launches right after it reuse this one within its TTL. The call
+ * goes to the start sweep's client directly, as its list and kills do: it acts
+ * for no persona, so no persona's outage flag is raised or cleared. Never
+ * throws. The sweep's own line, then one line with the outcome for the killed
+ * rows (`still-live` holds each the sweep did not mark missing, an unverified
+ * one included):
+ *
+ *   [slack] reconcileOrphans: findMissing sweep for killed pre-persona rows — count=<n> ids=[…] unverified=<n> unverified_ids=[…]
+ *   [slack] reconcileOrphans: findMissing after the kills of <n> live pre-persona row(s): missing=<n> [<ids>] still-live=<n> [<ids>] — a row that still reads live is killed again at the next start
+ *
+ * or, when the sweep fails, its failure line and:
+ *
+ *   [slack] reconcileOrphans: findMissing after the kills of <n> live pre-persona row(s) failed — they still read live and are killed again at the next start
+ */
+async function reconcileKilledPrePersonaRows(client: Client, killedIds: string[]): Promise<void> {
+  const head = `[slack] reconcileOrphans: findMissing after the kills of ${killedIds.length} live pre-persona row(s)`
+  const r = await sharedFindMissingSweep(() => client.findMissing({}), 'reconcileOrphans', 'killed pre-persona rows')
+  if (!r) {
+    console.error(`${head} failed — they still read live and are killed again at the next start`)
+    return
+  }
+  const nowMissing = new Set(r.ids)
+  const missing = killedIds.filter((id) => nowMissing.has(id))
+  const stillLive = killedIds.filter((id) => !nowMissing.has(id))
+  console.error(
+    `${head}: missing=${missing.length} [${missing.join(',')}] still-live=${stillLive.length} [${stillLive.join(',')}] — a row that still reads live is killed again at the next start`,
   )
 }
 
@@ -3880,7 +3958,10 @@ async function killAndDeleteSweptRow(client: Client, row: ListRow, displayPerson
  * spawn.
  *
  * A pre-persona row (no `persona` label) is kept, never deleted, and killed
- * only when it is live (`keepPrePersonaRow`, b.1ix).
+ * only when it is live (`keepPrePersonaRow`, b.1ix). When at least one was
+ * killed, one findMissing sweep follows the loop, so a killed row whose
+ * session is gone reads `missing` and the next start leaves it alone
+ * (`reconcileKilledPrePersonaRows`).
  *
  * Every other row is swept, killed and then deleted, when it
  *   - names a persona absent from the applied configuration (the kill and
@@ -3930,11 +4011,12 @@ export async function reconcileOrphans(
   const home = spawnHomeDir()
   const result = emptySweepResult()
   const deferredLogged = new Set<string>()
+  const killedPrePersonaIds: string[] = []
 
   for (const row of rows) {
     const personaLabel = row.labels?.[PERSONA_LABEL_KEY]
     if (!personaLabel) {
-      await keepPrePersonaRow(client, row, result.prePersona)
+      if (await keepPrePersonaRow(client, row, result.prePersona)) killedPrePersonaIds.push(row.claude_instance_id)
       continue
     }
     const persona = personasByKey.get(personaLabel)
@@ -3963,6 +4045,8 @@ export async function reconcileOrphans(
     if (await killAndDeleteSweptRow(client, row, displayPersona)) result.killed++
     else result.failed++
   }
+
+  if (killedPrePersonaIds.length > 0) await reconcileKilledPrePersonaRows(client, killedPrePersonaIds)
 
   const { found, killed, failed, prePersona } = result
   console.error(

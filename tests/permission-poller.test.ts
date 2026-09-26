@@ -651,6 +651,49 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
     expect(outageEmissions).toHaveLength(0)
   })
 
+  // b.1ix: the start sweep keeps a pre-persona row, which can sit in
+  // check_permission for good, so its skip line must not repeat every tick.
+  test('a row with no persona label is logged once while it stays listed, per instance ID; a failed list forgets nothing; a row no longer listed logs again when it comes back', async () => {
+    const logCalls: unknown[][] = []
+    const getCalls: unknown[] = []
+    const unlabelled = (id: string) => cannedListRow({ claude_instance_id: id, state: 'check_permission', labels: { service: 'cscb' } })
+    let spawns = [unlabelled('cscb_old_one'), unlabelled('cscb_old_two')]
+    let listError: Error | undefined
+    const ivl = startPoller(() => ({
+      list: async () => {
+        if (listError) throw listError
+        return { spawns }
+      },
+      get: async (params: unknown) => {
+        getCalls.push(params)
+        return getResult([])
+      },
+    }), { log: (...args) => { logCalls.push(args) } })
+    const skipLines = (id: string) => logLines(logCalls, `spawn ${id} has no persona label — skipping`)
+
+    for (let i = 0; i < 5; i++) await ivl.tick()
+    expect(skipLines('cscb_old_one')).toHaveLength(1)
+    expect(skipLines('cscb_old_two')).toHaveLength(1)
+
+    listError = new Error('list down')
+    await ivl.tick()
+    listError = undefined
+    await ivl.tick()
+    expect(skipLines('cscb_old_one')).toHaveLength(1)
+    expect(skipLines('cscb_old_two')).toHaveLength(1)
+
+    // cscb_old_one leaves check_permission for a tick, then comes back.
+    spawns = [unlabelled('cscb_old_two')]
+    await ivl.tick()
+    spawns = [unlabelled('cscb_old_one'), unlabelled('cscb_old_two')]
+    await ivl.tick()
+    await ivl.tick()
+    expect(skipLines('cscb_old_one')).toHaveLength(2)
+    expect(skipLines('cscb_old_two')).toHaveLength(1)
+    expect(getCalls).toHaveLength(0)
+    expect(slackCalls(stubA, stubB, stubD)).toBe(0)
+  })
+
   test('client unavailable: prompt not posted, logged once across ticks, no live entry or post trail; posts once when the client returns', async () => {
     const logCalls: unknown[][] = []
     const trail = makeTrailCapture()

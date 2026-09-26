@@ -34,7 +34,12 @@ import { homedir } from 'os'
 import { basename, dirname, isAbsolute, join, resolve } from 'path'
 
 import { jsonSyntaxErrorOffset, positionAt } from './json-position.ts'
-import { expandTilde as expandTildeWith, personaKey, renderPersonaRef } from './persona-identity.ts'
+import {
+  expandTilde as expandTildeWith,
+  personaKey,
+  personaTmuxSessionName,
+  renderPersonaRef,
+} from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1221,6 +1226,109 @@ function checkUniqueNamesAndKeys(personas: readonly Persona[]): void {
   })
 }
 
+/**
+ * Whether two persona keys are prefix-related: one starts with the other,
+ * equal keys included. Every name derived from a key is a fixed prefix
+ * followed by the key (the tmux session `slack_bot_<key>`, the agent-director
+ * instance ID `cscb_<key>`, the `persona=<key>` label), so two derived names
+ * of one kind are prefix-related exactly when their keys are. Pure.
+ */
+export function personaKeysPrefixRelated(a: string, b: string): boolean {
+  return a.startsWith(b) || b.startsWith(a)
+}
+
+/** What `suggestNonPrefixingName` appends to a key; later tries number it (`_main_2`, `_main_3`, …). */
+const NON_PREFIXING_NAME_SUFFIX = '_main'
+
+/** The last number `suggestNonPrefixingName` tries (`<key>_main_99`). */
+const NON_PREFIXING_NAME_LAST_TRY = 99
+
+/**
+ * A new name for the persona whose key is `key` that passes both cross-persona
+ * key rules against `others`: its key (`personaKey`) is prefix-related to no
+ * key in `others`, the name equals no key there and its key no name there.
+ * The first of `<key>_main`, `<key>_main_2`, …, `<key>_main_99` that fits, or
+ * undefined when none does. None does when a key in `others` is the start of
+ * every candidate: a proper prefix of `key` (`d` for `dev`), or `key`
+ * followed by the start of `_main` (`dev_`, `dev_m`, …, `dev_main`). A
+ * candidate of up to 40 characters is its own key. Pure.
+ *
+ * @param key     The key of the persona to rename: the shorter of a
+ *   prefix-related pair.
+ * @param others  Every other persona's name and key, without that persona.
+ */
+export function suggestNonPrefixingName(
+  key: string,
+  others: readonly { name: string; key: string }[],
+): string | undefined {
+  for (let n = 1; n <= NON_PREFIXING_NAME_LAST_TRY; n++) {
+    const name = n === 1 ? `${key}${NON_PREFIXING_NAME_SUFFIX}` : `${key}${NON_PREFIXING_NAME_SUFFIX}_${n}`
+    const nameKey = personaKey(name)
+    const fits = others.every(
+      (other) => !personaKeysPrefixRelated(nameKey, other.key) && name !== other.key && nameKey !== other.name,
+    )
+    if (fits) return name
+  }
+  return undefined
+}
+
+const PREFIX_RELATED_KEYS_HINT =
+  "No persona's key may start with another persona's key: rename one of the two so that neither key starts with the other."
+
+/**
+ * The error text, after the later persona's prefix, for two personas whose
+ * keys are prefix-related (and not equal: the unique-key rule runs first).
+ * Names the earlier persona, says which key starts with which and what tmux
+ * would do with the two session names, and suggests a new name for the
+ * persona with the shorter key when `suggestNonPrefixingName` finds one
+ * against every other persona in `personas`.
+ */
+function describePrefixRelatedKeys(earlier: Persona, later: Persona, personas: readonly Persona[]): string {
+  const other = renderIndexedPersonaRef(earlier)
+  const laterIsLonger = later.key.startsWith(earlier.key)
+  const [shorter, longer] = laterIsLonger ? [earlier, later] : [later, earlier]
+  const relation = laterIsLonger
+    ? `key ${later.key} starts with the key of ${other}.`
+    : `key ${later.key} is the start of the key of ${other}.`
+  const shorterSession = personaTmuxSessionName(shorter.key)
+  const why =
+    `tmux matches a session name by its start, so once ${shorterSession} is gone, a command meant for it ` +
+    `(reading its pane, typing into it, ending it) can act on ${personaTmuxSessionName(longer.key)}.`
+  const suggestion = suggestNonPrefixingName(shorter.key, personas.filter((p) => p !== shorter))
+  const example =
+    suggestion === undefined
+      ? ''
+      : ` For example, rename ${renderIndexedPersonaRef(shorter)} to ${renderPersonaRef(suggestion)}.`
+  return `${relation} ${why} ${PREFIX_RELATED_KEYS_HINT}${example}`
+}
+
+/**
+ * No persona's key may be a prefix of another persona's key (b.1ix
+ * follow-up). tmux resolves a session target that names no session exactly
+ * as the start of a longer session name, and agent-director 0.10.0's own
+ * verbs (read-pane, send-keys, kill, the has-session inside resume) pass
+ * `slack_bot_<key>` to tmux bare. With keys `dev` and `dev_2`, once
+ * `slack_bot_dev` is gone, a pane read, keys or a kill meant for `dev` land
+ * in `dev_2`'s session. The instance IDs (`cscb_<key>`) stand in the same
+ * relation, so this one rule covers them too.
+ *
+ * Order: personas are scanned in array order; the first one whose key is
+ * prefix-related to an earlier persona's key is reported, against the
+ * earliest such persona. Runs after `checkUniqueNamesAndKeys`, so equal keys
+ * keep that rule's message. Runs in record mode too: the relation depends on
+ * the names alone, so unlike a shared path it can't arise between an apply
+ * and a start, and a record that has it (written before this rule) stops the
+ * start like any invalid record. No file-system access.
+ */
+function checkPrefixRelatedKeys(personas: readonly Persona[]): void {
+  personas.forEach((later, j) => {
+    for (const earlier of personas.slice(0, j)) {
+      if (!personaKeysPrefixRelated(earlier.key, later.key)) continue
+      throw ruleError(personaEntryStyle(later.name, later.index), describePrefixRelatedKeys(earlier, later, personas))
+    }
+  })
+}
+
 /** The per-persona paths that no two personas may share (b.av2 SR-1.5), in the order they are checked. */
 const UNIQUE_PERSONA_PATH_SETTINGS = ['working_directory', 'credentials_file'] as const
 
@@ -1280,7 +1388,7 @@ export interface ResolvePersonaConfigOptions {
   /**
    * Record mode (b.av2 SR-1.5, record-start part): validate a start's
    * `config.json.last-applied`. Skips only the real-path collision step
-   * (step 8): at a start from the record, two personas sharing a
+   * (step 9): at a start from the record, two personas sharing a
    * `working_directory` or a `credentials_file` are a bring-up failure of each
    * persona involved, not a validation error. Every other rule runs
    * unchanged. Default false.
@@ -1295,7 +1403,7 @@ export interface ResolvePersonaConfigOptions {
 /**
  * Resolve an already-parsed persona configuration: apply defaults, expand
  * paths and validate, throwing on the first violation. It resolves persona
- * paths to real paths for the collision rules (step 8) but never opens, reads,
+ * paths to real paths for the collision rules (step 9) but never opens, reads,
  * creates or writes a file and never requires a path to exist, so the reload
  * path can validate pending content with it.
  *
@@ -1314,12 +1422,15 @@ export interface ResolvePersonaConfigOptions {
  *   7. the cross-persona name/key rule (b.av2 SR-1.5, see
  *      `checkUniqueNamesAndKeys`): no name or key equal to another persona's
  *      name or key;
- *   8. the real-path collision step (b.av2 SR-1.5, see
+ *   8. the prefix-related key rule (b.1ix follow-up, see
+ *      `checkPrefixRelatedKeys`): no key that starts with another persona's
+ *      key;
+ *   9. the real-path collision step (b.av2 SR-1.5, see
  *      `checkRealPathCollisions`): no shared `working_directory`, then no
  *      shared `credentials_file`, compared by `resolveRealPath`. Skipped in
  *      record mode (`options.record`).
  *
- * Steps 7 and 8 run only after every entry has parsed, so a per-entry
+ * Steps 7 to 9 run only after every entry has parsed, so a per-entry
  * violation anywhere is reported before any cross-persona one. Cross-persona
  * errors echo each name involved as written.
  *
@@ -1362,6 +1473,7 @@ export function resolvePersonaConfig(
   // Cross-persona rules (b.av2 SR-1.5), only once every entry has parsed so
   // per-entry violations are reported first.
   checkUniqueNamesAndKeys(personas)
+  checkPrefixRelatedKeys(personas)
   if (options.record !== true) checkRealPathCollisions(personas)
 
   return { ...settings, personas }

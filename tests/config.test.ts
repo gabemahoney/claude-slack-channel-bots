@@ -32,10 +32,12 @@ import {
   MAX_RELOAD_FILE_BYTES,
   parsePersonaConfigBytes,
   PersonaConfigReadError,
+  personaKeysPrefixRelated,
   readPersonaConfigBytes,
   referencedCredentialsPaths,
   resolveServerConfigPath,
   resolveServerStateDir,
+  suggestNonPrefixingName,
   type PersonaConfigFs,
   type PersonaConfigInput,
   type PersonaInput,
@@ -870,6 +872,239 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
+  // b.1ix follow-up: tmux resolves a session target that names no session
+  // exactly as the start of a longer session name, and agent-director
+  // 0.10.0's verbs pass `slack_bot_<key>` bare, so no persona's key may start
+  // with another persona's key. The rule runs after the name/key uniqueness
+  // rule and before the shared-path rule, in record mode too.
+  describe('prefix-related keys (b.1ix follow-up)', () => {
+    const HINT =
+      "No persona's key may start with another persona's key: rename one of the two so that neither key starts with the other."
+
+    /** `personas[i]` plus the b.av2 SR-2.2 reference (JSON-quoted name with its key). */
+    const indexedRef = (index: number, name: string) =>
+      `personas[${index}] ${JSON.stringify(name)} (key=${personaKey(name)})`
+
+    /** Personas in array order, each with its own paths under the temp dir, so only the keys can collide. */
+    const personasOf = (...names: string[]) =>
+      names.map((name, i) =>
+        makePersona({ name, working_directory: join(dir, `p${i}`, 'work'), credentials_file: join(dir, `p${i}`, 'credentials.json') }, dir))
+
+    test('dev then dev_2 is rejected with the full message: both personas, both tmux sessions, the rule and a rename of the shorter', () => {
+      expect(loadError(withPersonas(...personasOf('dev', 'dev_2')))).toBe(
+        `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
+          'personas[1] "dev_2" (key=dev_2): key dev_2 starts with the key of personas[0] "dev" (key=dev). ' +
+          'tmux matches a session name by its start, so once slack_bot_dev is gone, a command meant for it ' +
+          '(reading its pane, typing into it, ending it) can act on slack_bot_dev_2. ' +
+          `${HINT} For example, rename personas[0] "dev" (key=dev) to "dev_main" (key=dev_main).`,
+      )
+    })
+
+    interface PrefixRow {
+      label: string
+      names: string[]
+      /** The reported persona (the later of the pair) and the earlier one it is reported against. */
+      later: number
+      earlier: number
+      /** The relation as the error words it, after the later persona's prefix. */
+      relation: string
+      /** The persona with the shorter key and the one with the longer key. */
+      shorter: number
+      longer: number
+      /** The suggested new name for the shorter one, or undefined when the error gives none. */
+      rename: string | undefined
+    }
+
+    const rows: PrefixRow[] = [
+      {
+        label: 'dev_2 then dev (the later key is the shorter)',
+        names: ['dev_2', 'dev'],
+        later: 1,
+        earlier: 0,
+        relation: 'key dev is the start of the key of personas[0] "dev_2" (key=dev_2).',
+        shorter: 1,
+        longer: 0,
+        rename: 'dev_main',
+      },
+      {
+        label: 'horde then horde_admin',
+        names: ['horde', 'horde_admin'],
+        later: 1,
+        earlier: 0,
+        relation: 'key horde_admin starts with the key of personas[0] "horde" (key=horde).',
+        shorter: 0,
+        longer: 1,
+        rename: 'horde_main',
+      },
+      {
+        label: 'an in-form name and a name whose derived key starts with it ("Dev Bot")',
+        names: ['dev', 'Dev Bot'],
+        later: 1,
+        earlier: 0,
+        relation: `key ${personaKey('Dev Bot')} starts with the key of personas[0] "dev" (key=dev).`,
+        shorter: 0,
+        longer: 1,
+        rename: 'dev_main',
+      },
+      {
+        label: 'the second and third of three (the first unrelated)',
+        names: ['alpha', 'horde', 'horde_admin'],
+        later: 2,
+        earlier: 1,
+        relation: 'key horde_admin starts with the key of personas[1] "horde" (key=horde).',
+        shorter: 1,
+        longer: 2,
+        rename: 'horde_main',
+      },
+      {
+        label: 'the first and third of three',
+        names: ['horde', 'alpha', 'horde_admin'],
+        later: 2,
+        earlier: 0,
+        relation: 'key horde_admin starts with the key of personas[0] "horde" (key=horde).',
+        shorter: 0,
+        longer: 2,
+        rename: 'horde_main',
+      },
+      {
+        label: 'the first pair in array order, when a later key also starts with the shorter one',
+        names: ['dev', 'dev_2', 'dev_3'],
+        later: 1,
+        earlier: 0,
+        relation: 'key dev_2 starts with the key of personas[0] "dev" (key=dev).',
+        shorter: 0,
+        longer: 1,
+        rename: 'dev_main',
+      },
+      {
+        label: 'a suggestion numbered past a key that starts with <key>_main',
+        names: ['dev', 'dev_2', 'dev_main_x'],
+        later: 1,
+        earlier: 0,
+        relation: 'key dev_2 starts with the key of personas[0] "dev" (key=dev).',
+        shorter: 0,
+        longer: 1,
+        rename: 'dev_main_2',
+      },
+      {
+        label: 'no suggestion when another key is a proper prefix of the shorter one',
+        names: ['dev', 'dev_2', 'd'],
+        later: 1,
+        earlier: 0,
+        relation: 'key dev_2 starts with the key of personas[0] "dev" (key=dev).',
+        shorter: 0,
+        longer: 1,
+        rename: undefined,
+      },
+    ]
+
+    test.each(rows)('rejected: $label, naming both personas and no other', ({ names, later, earlier, relation, shorter, longer, rename }) => {
+      const message = loadError(withPersonas(...personasOf(...names)))
+      expect(message).toContain(`Persona config validation error: ${indexedRef(later, names[later]!)}: ${relation} `)
+      expect(message).toContain(indexedRef(earlier, names[earlier]!))
+      names.forEach((_, i) => {
+        if (i !== later && i !== earlier) expect(message).not.toContain(`personas[${i}]`)
+      })
+      const shorterKey = personaKey(names[shorter]!)
+      const longerKey = personaKey(names[longer]!)
+      expect(message).toContain(`once slack_bot_${shorterKey} is gone, a command meant for it`)
+      expect(message).toContain(`can act on slack_bot_${longerKey}. ${HINT}`)
+      if (rename === undefined) {
+        expect(message).toEndWith(HINT)
+        expect(message).not.toContain('For example')
+      } else {
+        expect(message).toEndWith(
+          `${HINT} For example, rename ${indexedRef(shorter, names[shorter]!)} to ${JSON.stringify(rename)} (key=${rename}).`,
+        )
+      }
+    })
+
+    test.each([
+      ['dev_a and dev_b', ['dev_a', 'dev_b']],
+      ['alpha and beta', ['alpha', 'beta']],
+      ['names normalising to the same stem with different hashed keys', ['Ops Bot', 'OPS BOT']],
+      ['horde_main and horde_admin (the suggested rename of horde)', ['horde_main', 'horde_admin', 'horde_apiary']],
+      ['dev_main and dev_2 (the suggested rename of dev)', ['dev_main', 'dev_2']],
+      ['keys sharing a start that neither is (dev_2 and dev_3)', ['dev_2', 'dev_3']],
+    ])('accepted: %s', (_label, names) => {
+      const config = load(withPersonas(...personasOf(...names)))
+      expect(config.personas.map((p) => p.name)).toEqual(names)
+    })
+
+    test.each([
+      ['the same name twice', ['dev', 'dev'], `${indexedRef(1, 'dev')}: name "dev" is duplicated: ${indexedRef(0, 'dev')} has the same name.`],
+      [
+        "an in-form name equal to another persona's derived key",
+        ['Ops Bot', personaKey('Ops Bot')],
+        `${indexedRef(1, personaKey('Ops Bot'))}: key ${personaKey('Ops Bot')} is duplicated: ${indexedRef(0, 'Ops Bot')} has the same key.`,
+      ],
+    ])('equal keys keep the uniqueness message, not the prefix one: %s', (_label, names, reported) => {
+      const message = loadError(withPersonas(...personasOf(...names)))
+      expect(message).toContain(reported)
+      expect(message).not.toContain('starts with')
+      expect(message).not.toContain('is the start of')
+    })
+
+    test.each([
+      {
+        label: 'a later per-entry violation before an earlier prefix pair',
+        build: () => [...personasOf('dev', 'dev_2'), makePersona({ name: 'third_bot', permission_prompts: undefined }, dir)],
+        reported: `${indexedRef(2, 'third_bot')}: permission_prompts`,
+      },
+      {
+        label: 'a later duplicate name before an earlier prefix pair (the uniqueness rule runs over every pair first)',
+        build: () => personasOf('dev', 'dev_2', 'dev_2'),
+        reported: `${indexedRef(2, 'dev_2')}: name "dev_2" is duplicated`,
+      },
+      {
+        label: 'a later prefix pair before an earlier shared working_directory',
+        build: () => [
+          makePersona({ name: 'alpha', working_directory: join(dir, 'shared') }, dir),
+          makePersona({ name: 'beta', working_directory: join(dir, 'shared') }, dir),
+          ...personasOf('dev', 'dev_2'),
+        ],
+        reported: `${indexedRef(3, 'dev_2')}: key dev_2 starts with the key of ${indexedRef(2, 'dev')}.`,
+      },
+    ])('check order: $label', ({ build, reported }) => {
+      const message = loadError(withPersonas(...build()))
+      expect(message).toContain(reported)
+      expect(message.split('Persona config validation error: ')).toHaveLength(2)
+    })
+
+    test('record mode rejects the pair too, with the default-mode error, through parsePersonaConfigBytes and resolvePersonaConfig', () => {
+      const input = withPersonas(...personasOf('horde', 'horde_admin'))
+      const recordPath = join(dir, 'config.json.last-applied')
+      const bytes = Buffer.from(JSON.stringify(input))
+      const messageOf = (run: () => unknown) => {
+        try {
+          run()
+        } catch (err) {
+          assertNoLeak(err, 'rejection')
+          return (err as Error).message
+        }
+        throw new Error('expected the configuration to be rejected')
+      }
+      const record = messageOf(() => parsePersonaConfigBytes(bytes, recordPath, dir, { home, record: true }))
+      const standard = messageOf(() => parsePersonaConfigBytes(bytes, recordPath, dir, { home }))
+      expect(record).toBe(standard)
+      expect(record).toContain(`invalid persona config in "${recordPath}": `)
+      expect(record).toContain(`${indexedRef(1, 'horde_admin')}: key horde_admin starts with the key of ${indexedRef(0, 'horde')}.`)
+      const pure = messageOf(() => resolvePersonaConfig(input, dir, home, { record: true }))
+      expect(record).toEndWith(pure)
+    })
+
+    test('a token-shaped name in a pair is named as written, and nothing else token-like reaches the error', () => {
+      const name = fakeToken(BOT_TOKEN_PREFIX, 'name')
+      const key = personaKey(name)
+      // The in-form name that is the start of the token-shaped name's key.
+      const shorter = key.slice(0, key.indexOf('_'))
+      const message = loadError(withPersonas(...personasOf(shorter, name)), name)
+      expect(message).toContain(`${indexedRef(1, name)}: key ${key} starts with the key of ${indexedRef(0, shorter)}.`)
+      expect(message).toContain(`can act on slack_bot_${key}.`)
+      expect(message).toEndWith(`For example, rename ${indexedRef(0, shorter)} to "${shorter}_main" (key=${shorter}_main).`)
+    })
+  })
+
   // b.av2 SR-1.2 ("No format rule"), E14 Task 0 operator decision A: any
   // non-empty persona name loads, including one shaped like a Slack token, and
   // is printed exactly as written in the persona reference of every error.
@@ -1317,6 +1552,73 @@ describe('describeUnknownKeys (b.av2 SR-10.3)', () => {
     const described = describeUnknownKeys(keys)
     expect(described).toBe(expected)
     assertNoLeak(described)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// personaKeysPrefixRelated / suggestNonPrefixingName (b.1ix follow-up)
+// ---------------------------------------------------------------------------
+
+describe('personaKeysPrefixRelated (b.1ix follow-up)', () => {
+  test.each([
+    ['dev', 'dev_2', true],
+    ['dev_2', 'dev', true],
+    ['horde', 'horde_admin', true],
+    ['dev_2', 'dev_20', true],
+    ['dev', 'dev', true],
+    ['dev_a', 'dev_b', false],
+    ['alpha', 'beta', false],
+    ['ops_bot_1a2b3c4d', 'ops_bot_5e6f7a8b', false],
+  ])('%s and %s: %p, in either order', (a, b, related) => {
+    expect(personaKeysPrefixRelated(a, b)).toBe(related)
+    expect(personaKeysPrefixRelated(b, a)).toBe(related)
+  })
+})
+
+describe('suggestNonPrefixingName (b.1ix follow-up)', () => {
+  /** Persona name-and-key pairs for in-form names, each its own key. */
+  const inForm = (...names: string[]) => names.map((name) => ({ name, key: personaKey(name) }))
+
+  test.each([
+    ['dev beside dev_2', 'dev', inForm('dev_2'), 'dev_main'],
+    ['horde beside the other horde_ keys', 'horde', inForm('general', 'horde_admin', 'horde_apiary'), 'horde_main'],
+    ['a key that starts with <key>_main moves to _main_2', 'dev', inForm('dev_2', 'dev_main_x'), 'dev_main_2'],
+    ['keys starting with <key>_main and <key>_main_2 move to _main_3', 'dev', inForm('dev_2', 'dev_main_x', 'dev_main_2x'), 'dev_main_3'],
+    ['a hashed key beside it', 'dev', [{ name: 'Dev Bot', key: personaKey('Dev Bot') }], 'dev_main'],
+  ])('%s: %s becomes %p', (_label, key, others, expected) => {
+    const suggestion = suggestNonPrefixingName(key, others)
+    expect(suggestion).toBe(expected)
+    for (const other of others) expect(personaKeysPrefixRelated(personaKey(suggestion!), other.key)).toBe(false)
+  })
+
+  test.each([
+    ['another key is a proper prefix of it', 'dev', inForm('d')],
+    ['another key is <key>_main', 'dev', inForm('dev_main')],
+    ['another key is <key>_', 'dev', inForm('dev_')],
+  ])('undefined when %s: every candidate starts with that key', (_label, key, others) => {
+    expect(suggestNonPrefixingName(key, others)).toBeUndefined()
+  })
+
+  test('a candidate over 40 characters is checked by its derived key, and one whose key is another persona\'s name is skipped', () => {
+    const key = 'a'.repeat(38)
+    const first = `${key}_main`
+    // Over 40 characters, so not its own key: it gets a derived key.
+    expect(personaKey(first)).not.toBe(first)
+    expect(suggestNonPrefixingName(key, [])).toBe(first)
+    // A persona named by that derived key: its own key is not prefix-related
+    // to it, so only the name check skips the first candidate.
+    const named = { name: personaKey(first), key: personaKey(personaKey(first)) }
+    expect(personaKeysPrefixRelated(personaKey(first), named.key)).toBe(false)
+    expect(suggestNonPrefixingName(key, [named])).toBe(`${key}_main_2`)
+  })
+
+  test("never proposes a name equal to another persona's key", () => {
+    const key = 'a'.repeat(38)
+    const first = `${key}_main`
+    // A key that is the first candidate as written (not its derived key), so no prefix relation catches it.
+    const other = { name: 'other', key: first }
+    expect(personaKeysPrefixRelated(personaKey(first), other.key)).toBe(false)
+    expect(suggestNonPrefixingName(key, [other])).toBe(`${key}_main_2`)
   })
 })
 

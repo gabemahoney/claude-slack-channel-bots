@@ -1037,7 +1037,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.tmuxProbes).toEqual([])
       expect(raised.map((n) => n.key)).toEqual(['C1'])
       expect(raised[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
-      expect(raised[0]!.text).toContain('`tmux attach -t slack_bot_C1`')
+      expect(raised[0]!.text).toContain('`tmux attach -t =slack_bot_C1`')
     })
 
     // b.f2b: at a non-zero delay nothing else escalates a `working` row whose
@@ -1067,7 +1067,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(raised.map((n) => n.key)).toEqual(['C1'])
       expect(raised[0]!.text).toStartWith(':warning: *Not connected*')
       expect(raised[0]!.text).toContain('its session reads working but CSCB can\'t prove it\'s idle, so it won\'t type into it, and has held back for 10 min')
-      expect(raised[0]!.text).toContain('`tmux attach -t slack_bot_C1`')
+      expect(raised[0]!.text).toContain('`tmux attach -t =slack_bot_C1`')
       expect(raised[0]!.text).not.toContain('Automatic restarts are disabled')
     })
 

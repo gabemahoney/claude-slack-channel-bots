@@ -366,6 +366,15 @@ const unpostedPrompts = new Map<string, UnpostedReason>()
 const wedgeStates = new Map<string, WedgeState>()
 /** Keys of the personas in a not-up skip episode, for its start and end lines (b.av2 SR-6.4). */
 const notUpSkipping = new Set<string>()
+/**
+ * Instance IDs of listed rows with no `persona` label whose skip line has been
+ * logged (b.1ix). The start sweep keeps a pre-persona row, so one can sit in
+ * `check_permission` for good; its line is logged once while it stays listed,
+ * not every tick. An ID a successful list no longer holds (the row left
+ * `check_permission`, or it gained a label) is forgotten, so the row logs
+ * again if it comes back.
+ */
+const noLabelLogged = new Set<string>()
 let pollerHandle: ReturnType<typeof setInterval> | null = null
 let tickInFlight = false
 let skippedTicks = 0
@@ -445,6 +454,7 @@ export function _resetPollerState(): void {
   unpostedPrompts.clear()
   wedgeStates.clear()
   notUpSkipping.clear()
+  noLabelLogged.clear()
   pollerHandle = null
   tickInFlight = false
   skippedTicks = 0
@@ -771,6 +781,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
       logViaDeps(deps, `[slack] permission-poller: list failed: ${describeThrownValue(err)}`)
       return
     }
+    forgetUnlistedNoLabelRows(rows)
 
     const seenComposite = new Set<string>()
     const nonConformingInstanceIds = new Set<string>()
@@ -985,14 +996,17 @@ type RowPersona =
 
 /**
  * Resolve a listed row's persona from its `persona` label (b.av2 SR-7.1). A row
- * with no `persona` label (`no_label`), or one naming no applied persona
- * (`not_applied`), is logged; the caller skips it. The `channel` label is
- * never read.
+ * with no `persona` label (`no_label`) is logged once while it stays listed
+ * (`noLabelLogged`, b.1ix), and one naming no applied persona (`not_applied`)
+ * is logged; the caller skips both. The `channel` label is never read.
  */
 function resolveRowPersona(deps: PollerDeps, row: ListRow): RowPersona {
   const key = row.labels[PERSONA_LABEL_KEY]
   if (!key) {
-    logViaDeps(deps, `[slack] permission-poller: spawn ${row.claude_instance_id} has no persona label — skipping`)
+    if (!noLabelLogged.has(row.claude_instance_id)) {
+      noLabelLogged.add(row.claude_instance_id)
+      logViaDeps(deps, `[slack] permission-poller: spawn ${row.claude_instance_id} has no persona label — skipping`)
+    }
     return { kind: 'no_label' }
   }
   const persona = deps.getPersona(key)
@@ -1001,6 +1015,18 @@ function resolveRowPersona(deps: PollerDeps, row: ListRow): RowPersona {
     return { kind: 'not_applied' }
   }
   return { kind: 'persona', persona }
+}
+
+/**
+ * Forget the logged no-label row of every ID this tick's list doesn't hold
+ * with no `persona` label, so such a row logs again when it is next listed.
+ */
+function forgetUnlistedNoLabelRows(rows: ListRow[]): void {
+  if (noLabelLogged.size === 0) return
+  const listed = new Set(rows.filter((row) => !row.labels[PERSONA_LABEL_KEY]).map((row) => row.claude_instance_id))
+  for (const id of [...noLabelLogged]) {
+    if (!listed.has(id)) noLabelLogged.delete(id)
+  }
 }
 
 /** Log that a listed row names no applied persona; the caller skips it. */

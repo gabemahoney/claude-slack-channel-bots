@@ -135,6 +135,18 @@ Other names get a derived key with a hash; a clash there is still rejected
 when the configuration is checked, as an `INVALID` pending change or a failed
 first start.
 
+Also reject a name whose key starts with an existing persona's key, or is the
+start of one: `dev` beside `dev_2`, `horde` beside `horde_admin`, or `dev`
+beside `"Dev Bot"` (key `dev_bot_…`). The server rejects such a pair, because
+agent-director could act on the wrong persona's tmux session. Keys that only
+share a start, such as `dev_a` and `dev_b`, are fine. When a name clashes
+this way, propose the shorter one with `_main` appended (`horde_main`), or
+`_main_2`, `_main_3`, … if that still starts with, or is the start of,
+another key, and ask for another name if none fits. Rename an existing
+persona only if the operator wants that.
+When the operator names personas after the channels their earlier bots
+served, check every pair of names this way before writing any entry.
+
 #### 4.2 Slack app: create, name, avatar, install
 
 Create one Slack app for this persona from the shipped manifest,
@@ -282,6 +294,7 @@ already in the file:
 
 - the name and key, `working_directory` and `credentials_file` are each
   unique across personas;
+- no persona's key starts with another persona's key (4.1);
 - channel IDs and `dm.contact` match their patterns, and no channel is listed
   twice;
 - `permission_prompts` is one of the persona's channels, or `dm` with DMs on

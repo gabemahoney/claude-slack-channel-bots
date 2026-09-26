@@ -139,6 +139,21 @@ function configOf(...personas: PersonaInput[]): { personas: PersonaInput[] } {
   return { personas }
 }
 
+/**
+ * The loader's rejection of `alpha` then `alpha_2`, whose key starts with
+ * `alpha`'s (the prefix-related key rule, b.1ix follow-up), after the
+ * `Persona config validation error: ` prefix.
+ */
+function prefixRelatedKeysRejection(): string {
+  return (
+    `personas[1] "alpha_2" (key=${h.key('alpha_2')}): key alpha_2 starts with the key of personas[0] "alpha" (key=${h.key('alpha')}). ` +
+    'tmux matches a session name by its start, so once slack_bot_alpha is gone, a command meant for it ' +
+    '(reading its pane, typing into it, ending it) can act on slack_bot_alpha_2. ' +
+    "No persona's key may start with another persona's key: rename one of the two so that neither key starts with the other. " +
+    'For example, rename personas[0] "alpha" (key=alpha) to "alpha_main" (key=alpha_main).'
+  )
+}
+
 /** A symlink `<root>/<name>` to `<root>/<name>-target`, which does not exist; returns the link's path. */
 function danglingLink(name: string): string {
   const link = join(h.root, name)
@@ -480,6 +495,11 @@ describe('a start without a record applies the configuration file or refuses', (
       expected: () => `invalid persona config in "${h.paths.config}": `,
     },
     {
+      label: 'two personas whose keys are prefix-related (alpha and alpha_2, b.1ix follow-up)',
+      bytes: () => JSON.stringify(configOf(h.persona('alpha'), h.persona('alpha_2'))),
+      expected: () => `invalid persona config in "${h.paths.config}": Persona config validation error: ${prefixRelatedKeysRejection()}`,
+    },
+    {
       label: 'a pre-persona file (routes, default_route, default_dm_session): the SR-1.7 conversion message',
       bytes: () => JSON.stringify({ routes: {}, default_route: 'C0OLD', default_dm_session: 'C0OLD' }),
       expected: () => prePersonaConversionMessage('routes'),
@@ -696,6 +716,11 @@ describe('a start with a record runs the record', () => {
       label: 'breaks an SR-1.5 rule record mode keeps (a duplicate name)',
       setUp: () => void h.writeRecord(configOf(h.persona('alpha'), h.persona('alpha', { credentials_file: join(h.root, 'other.json') }))),
       expected: () => `invalid persona config in "${h.paths.lastApplied}": `,
+    },
+    {
+      label: 'breaks the prefix-related key rule, which record mode keeps (alpha and alpha_2, b.1ix follow-up)',
+      setUp: () => void h.writeRecord(configOf(h.persona('alpha'), h.persona('alpha_2'))),
+      expected: () => `invalid persona config in "${h.paths.lastApplied}": Persona config validation error: ${prefixRelatedKeysRejection()}`,
     },
     {
       label: 'has the pre-persona shape',
@@ -1378,6 +1403,13 @@ describe('detection keeps the pending file in step with the config file and appl
         `${JSON.stringify(join(dirname(h.persona('bravo').working_directory), 'link-to-alpha'))} is also the working_directory of ` +
         `personas[0] "alpha" (key=${h.key('alpha')}): its working_directory ${JSON.stringify(alpha.working_directory)} and ` +
         `this one both resolve to ${JSON.stringify(alpha.working_directory)}. Each persona needs its own working_directory.`,
+    },
+    {
+      label: 'adds a persona whose key starts with an applied persona’s key (alpha_2 beside alpha, b.1ix follow-up)',
+      edit: (alpha) => void h.writeConfig(configOf(alpha, h.persona('alpha_2'))),
+      error: () =>
+        `loadPersonaConfig: invalid persona config in "${h.paths.config}": Persona config validation error: ` +
+        prefixRelatedKeysRejection(),
     },
     { label: 'is missing', edit: () => h.deleteConfig(), error: () => `the configuration file "${h.paths.config}" does not exist.` },
     {
@@ -2759,6 +2791,13 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
       error: () =>
         `loadPersonaConfig: invalid persona config in "${h.paths.config}": Persona config validation error: ` +
         prePersonaConversionMessage('routes'),
+    },
+    {
+      label: 'an added persona whose key starts with an applied persona’s key (b.1ix follow-up)',
+      edit: (alpha) => void h.writeConfig(configOf(alpha, h.persona('alpha_2'))),
+      error: () =>
+        `loadPersonaConfig: invalid persona config in "${h.paths.config}": Persona config validation error: ` +
+        prefixRelatedKeysRejection(),
     },
     { label: 'the config file missing', edit: () => h.deleteConfig(), error: () => `the configuration file "${h.paths.config}" does not exist.` },
   ])('AC 63: a confirmed INVALID candidate ($label) applies nothing, deletes the confirmation, logs one reload-invalid line with the full error and rewrites the INVALID preview', async ({ edit, error }) => {

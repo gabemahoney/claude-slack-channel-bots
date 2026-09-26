@@ -21,7 +21,9 @@
  *   - b.av2 SR-6.3: the fixed instance ID, one launch in flight per persona,
  *     and the start sweep (`reconcileOrphans`) keyed by the `persona` label
  *     (AC 4). b.1ix: a pre-persona row (no `persona` label) is kept, never
- *     deleted, and killed once only when live.
+ *     deleted, and killed only when live; one findMissing sweep after the
+ *     kills lets a killed row whose session is gone read `missing`, so the
+ *     next start doesn't kill it again.
  *   - b.1ix raw tmux: through the tmux runner seam (`_setTmuxCommandRunner`,
  *     a failing stand-in by default, so no test reaches a real tmux server),
  *     the b.vub kill, the approver's raw pane read and Enter and the liveness
@@ -3120,9 +3122,11 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
 
   // b.1ix: a pre-persona row (no persona label; a build before personas made
   // it, with a `cscb_<name>_<channel>` ID) is never deleted, since no launch
-  // reuses its ID. A live one is killed once and kept whether its kill reports
-  // success or fails; an ended or missing one gets no call. A row naming an
-  // absent persona is still killed and deleted, even after a failed kill.
+  // reuses its ID. A live one gets one kill call per start and is kept whether
+  // its kill reports success or fails; an ended or missing one gets no call.
+  // One findMissing sweep follows the kills, since agent-director 0.10.0's
+  // kill leaves the row's state as it was. A row naming an absent persona is
+  // still killed and deleted, even after a failed kill.
   describe('pre-persona rows are kept, never deleted (b.1ix)', () => {
     /** A pre-persona row in `state`: only the `service` and `channel` labels. */
     const prePersonaRow = (state: string): import('agent-director').ListRow =>
@@ -3136,15 +3140,17 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     test.each([
       ['reports success', undefined],
       ['fails', errGeneric('kill', 'ErrKillBroken')],
-    ] as const)('a live pre-persona row whose kill %s: killed once and kept (no delete), the result logged; an absent persona’s row is still killed and deleted', async (_label, killError) => {
+    ] as const)('a live pre-persona row whose kill %s: one kill call, kept (no delete), the result logged, then one findMissing sweep; an absent persona’s row is still killed and deleted', async (_label, killError) => {
       const readLog = captureStartupErrors()
       const { cfg } = sweepConfig()
       const killCalls: import('agent-director').KillParams[] = []
       const deleteCalls: import('agent-director').DeleteParams[] = []
+      const callLog: string[] = []
       installStub({
         killCalls,
         deleteCalls,
         killError,
+        callLog,
         listResult: {
           spawns: [
             prePersonaRow('waiting'),
@@ -3164,6 +3170,9 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_departed']])
       expect(errLog).toContain('reconcileOrphans: pre-persona row (no persona label) instanceId=cscb_old_waiting_C0OLD state=waiting tmux_session=slack_bot_old_waiting_C0OLD is live')
       expect(errLog).toContain(`pre-persona rows kept=1 live=1 kill-failed=${failed}`)
+      // The sweep runs after a failed kill too: the session may be gone all the same.
+      expect(callLog).toEqual(['findMissing'])
+      expect(errLog).toContain('reconcileOrphans: findMissing after the kills of 1 live pre-persona row(s): missing=0 [] still-live=1 [cscb_old_waiting_C0OLD]')
       const entries = readLog()
       if (killError) {
         expect(entries).toContain('kill failed for pre-persona row instanceId=cscb_old_waiting_C0OLD: ErrKillBroken')
@@ -3175,12 +3184,21 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       }
     })
 
-    test('every live state is killed once; ended and missing pre-persona rows get no kill, no delete and no line', async () => {
+    test('every live state gets one kill call and all share one findMissing sweep; ended and missing pre-persona rows get no kill, no delete and no line', async () => {
       const { cfg } = sweepConfig()
       const killCalls: import('agent-director').KillParams[] = []
       const deleteCalls: import('agent-director').DeleteParams[] = []
+      const findMissingCalls: import('agent-director').FindMissingParams[] = []
       const states = [...AGENT_DIRECTOR_LIVE_STATES, 'ended', 'missing']
-      installStub({ killCalls, deleteCalls, listResult: { spawns: states.map(prePersonaRow) } })
+      const liveIds = [...AGENT_DIRECTOR_LIVE_STATES].map((s) => `cscb_old_${s}_C0OLD`)
+      installStub({
+        killCalls,
+        deleteCalls,
+        findMissingCalls,
+        // The sweep marks two of the killed rows missing (and a row the start sweep never saw).
+        findMissingResult: cannedFindMissing({ count: 3, ids: [liveIds[1]!, liveIds[3]!, 'cscb_other'].sort() }),
+        listResult: { spawns: states.map(prePersonaRow) },
+      })
 
       let result!: Awaited<ReturnType<typeof reconcileOrphans>>
       const errLog = await withCapturedErr(async () => {
@@ -3188,10 +3206,123 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       })
 
       expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 7, live: 5, killFailed: 0 } })
-      expect(killCalls.map((k) => k.claude_instance_id)).toEqual([...AGENT_DIRECTOR_LIVE_STATES].map((s) => `cscb_old_${s}_C0OLD`))
+      expect(killCalls.map((k) => k.claude_instance_id)).toEqual(liveIds)
       expect(deleteCalls).toHaveLength(0)
+      expect(findMissingCalls).toEqual([{}])
+      const stillLive = liveIds.filter((_, i) => i !== 1 && i !== 3)
+      expect(errLog).toContain(
+        `reconcileOrphans: findMissing after the kills of 5 live pre-persona row(s): missing=2 [${liveIds[1]},${liveIds[3]}] still-live=3 [${stillLive.join(',')}] — a row that still reads live is killed again at the next start`,
+      )
+      // The summary line still ends the sweep.
+      const lines = errLog.trim().split('\n')
+      expect(lines.at(-1)).toContain('reconcileOrphans: found=0 killed=0 failed=0; pre-persona rows kept=7 live=5 kill-failed=0')
       expect(errLog).not.toContain('cscb_old_ended_C0OLD')
       expect(errLog).not.toContain('cscb_old_missing_C0OLD')
+    })
+
+    test.each([
+      ['no pre-persona row', [] as string[]],
+      ['only ended and missing pre-persona rows', ['ended', 'missing']],
+    ])('%s is live: no findMissing sweep and no outcome line (a swept persona row runs none either)', async (_label, states) => {
+      const { cfg } = sweepConfig()
+      const findMissingCalls: import('agent-director').FindMissingParams[] = []
+      installStub({
+        findMissingCalls,
+        listResult: {
+          spawns: [
+            ...states.map(prePersonaRow),
+            cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }),
+          ],
+        },
+      })
+
+      const errLog = await withCapturedErr(async () => {
+        await reconcileOrphans(cfg)
+      })
+
+      expect(findMissingCalls).toHaveLength(0)
+      expect(errLog).not.toContain('findMissing')
+    })
+
+    test.each([
+      ['a generic agent-director error', errGeneric('find-missing', 'ErrFindBroken')],
+      ['agent-director disappeared', new ErrSystemInstallDisappeared('find-missing', '/usr/bin/agent-director')],
+    ])('the findMissing sweep fails (%s): one failure line and an outcome line saying the rows still read live; the start sweep finishes, and no persona’s outage flag or notice is raised', async (_label, findMissingError) => {
+      const { cfg } = sweepConfig()
+      const findMissingCalls: import('agent-director').FindMissingParams[] = []
+      installStub({ findMissingCalls, findMissingError, listResult: { spawns: [prePersonaRow('working')] } })
+
+      let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+      const errLog = await withCapturedErr(async () => {
+        result = await reconcileOrphans(cfg)
+      })
+
+      expect(findMissingCalls).toHaveLength(1)
+      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 } })
+      expect(errLog).toContain('[slack] reconcileOrphans: findMissing sweep failed for killed pre-persona rows:')
+      expect(errLog).toContain(
+        '[slack] reconcileOrphans: findMissing after the kills of 1 live pre-persona row(s) failed — they still read live and are killed again at the next start',
+      )
+      expect(errLog).toContain('pre-persona rows kept=1 live=1 kill-failed=0')
+      for (const key of ['alpha', 'beta', 'gamma']) expect(getOutageFlags(key).size).toBe(0)
+      expect(outageEmissions).toHaveLength(0)
+    })
+
+    // agent-director 0.10.0 modelled: `kill` ends the tmux session but leaves
+    // the row's state as it was, and `findMissing` marks a live row whose
+    // session is gone `missing`. Before b.1ix's follow-up the killed row still
+    // read live at every later start and was killed again each time.
+    test('across two starts: a killed row whose session is gone reads missing after the first start’s sweep and the second start leaves it alone; a row whose session survived its kill is killed again', async () => {
+      const { cfg } = sweepConfig()
+      const gone = prePersonaRow('waiting')
+      const survivor = prePersonaRow('working')
+      const rows = new Map([gone, survivor].map((row) => [row.claude_instance_id, row]))
+      const sessions = new Set([gone.tmux_session_name, survivor.tmux_session_name])
+      const killCalls: string[] = []
+      const findMissingCalls: import('agent-director').FindMissingParams[] = []
+      const stub = installStub()
+      stub.list = async () => ({ spawns: [...rows.values()] })
+      stub.kill = async (params) => {
+        killCalls.push(params.claude_instance_id)
+        // The survivor's kill reports success while its session lives on.
+        if (params.claude_instance_id !== survivor.claude_instance_id) {
+          sessions.delete(rows.get(params.claude_instance_id)!.tmux_session_name)
+        }
+        return {}
+      }
+      stub.findMissing = async (params) => {
+        findMissingCalls.push(params)
+        const ids: string[] = []
+        for (const row of rows.values()) {
+          if (!AGENT_DIRECTOR_LIVE_STATES.has(row.state) || sessions.has(row.tmux_session_name)) continue
+          rows.set(row.claude_instance_id, { ...row, state: 'missing' })
+          ids.push(row.claude_instance_id)
+        }
+        return cannedFindMissing({ count: ids.length, ids: ids.sort() })
+      }
+
+      const firstLog = await withCapturedErr(async () => {
+        await reconcileOrphans(cfg)
+      })
+      expect(killCalls).toEqual([gone.claude_instance_id, survivor.claude_instance_id])
+      expect(findMissingCalls).toHaveLength(1)
+      expect(rows.get(gone.claude_instance_id)!.state).toBe('missing')
+      expect(rows.get(survivor.claude_instance_id)!.state).toBe('working')
+      expect(firstLog).toContain(
+        `findMissing after the kills of 2 live pre-persona row(s): missing=1 [${gone.claude_instance_id}] still-live=1 [${survivor.claude_instance_id}]`,
+      )
+
+      // The next start is a new server process: nothing memoized.
+      _resetFindMissingMemo()
+      killCalls.length = 0
+      const secondLog = await withCapturedErr(async () => {
+        await reconcileOrphans(cfg)
+      })
+      expect(killCalls).toEqual([survivor.claude_instance_id])
+      expect(findMissingCalls).toHaveLength(2)
+      expect(secondLog).not.toContain(`instanceId=${gone.claude_instance_id}`)
+      expect(secondLog).toContain('pre-persona rows kept=2 live=1 kill-failed=0')
+      expect([...rows.keys()]).toEqual([gone.claude_instance_id, survivor.claude_instance_id])
     })
   })
 
@@ -5697,7 +5828,7 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
     expect(stub.sendKeysCalls).toEqual([])
     expect(notices.map((n) => n.key)).toEqual(['C'])
     expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
-    expect(notices[0]!.text).toContain('`tmux attach -t slack_bot_C`')
+    expect(notices[0]!.text).toContain('`tmux attach -t =slack_bot_C`')
   })
 
   test('forgetNotConnectedEpisode(key) ends only that persona\'s episode: its evidence and notice latch go, another persona\'s stay', async () => {
@@ -5785,7 +5916,7 @@ describe('b.f2b: the not-connected notice, once per episode', () => {
     ['a working row whose idleness can\'t be proven, session_restart_delay 0', { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 10 * 60_000 }, ':warning: *Not connected*', 'Automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it on its own'],
     ['disconnected, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause' }, ':warning: *Not connected*', '(a test cause), and automatic restarts are disabled'],
     ['connected with its message stream gone, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause', streamless: true }, ':warning: *Not receiving messages*', 'its message stream is gone (a test cause), and automatic restarts are disabled'],
-  ])('%s: raised once, one log line; its first line says what is wrong, the second how to recover; a second call in the episode raises nothing', async (_label, notice, head, detail) => {
+  ])('%s: raised once, one log line; its first line says what is wrong, the second how to recover (attaching by the exact session name, b.1ix); a second call in the episode raises nothing', async (_label, notice, head, detail) => {
     let raised: boolean[] = []
     const errLog = await withCapturedErr(() => {
       raised = [notifyPersonaNotConnected('C', notice), notifyPersonaNotConnected('C', notice)]
@@ -5797,7 +5928,9 @@ describe('b.f2b: the not-connected notice, once per episode', () => {
     expect(rest).toEqual([])
     expect(first).toStartWith(head)
     expect(notices[0]!.text).toContain(detail)
-    expect(second).toContain('`tmux attach -t slack_bot_C`')
+    expect(second).toContain('`tmux attach -t =slack_bot_C`')
+    // A bare target would attach to a prefix neighbour (`slack_bot_C_2`) once `slack_bot_C` is gone.
+    expect(notices[0]!.text).not.toContain('attach -t slack_bot_')
     expect(second).toContain(`\`${RECONNECT_TEXT}\``)
     expect(linesWith(errLog, `persona=C is not connected (${notice.reason})`)).toHaveLength(1)
   })
@@ -5921,7 +6054,7 @@ describe('b.f2b: a working row whose idleness can\'t be proven is reported (unpr
     expect(notices[0]!.text).toContain(`${UNPROVEN_IDLE_CLAIM}, and has held back for 12 min`)
     expect(notices[0]!.text).toContain('CSCB keeps checking it and reconnects it once its row reads waiting or its screen and transcript prove it idle')
     const [, second] = notices[0]!.text.split('\n')
-    expect(second).toContain('`tmux attach -t slack_bot_C`')
+    expect(second).toContain('`tmux attach -t =slack_bot_C`')
     expect(second).toContain(`\`${RECONNECT_TEXT}\``)
     expect(linesWith(errLog, 'persona=C is not connected (unproven-idle) — raising a not-connected notice')).toHaveLength(1)
   })

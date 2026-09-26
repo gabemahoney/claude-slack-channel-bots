@@ -675,7 +675,7 @@ running are not affected. See
   after the restart has its prompt posted once the destination accepts posts.
 - **Answering a held request:** it can still be answered in the persona's
   terminal. Once agent-director's relay window for the request elapses,
-  Claude asks at the persona's tmux pane (`tmux attach -t slack_bot_<key>`).
+  Claude asks at the persona's tmux pane (`tmux attach -t =slack_bot_<key>`).
   A request answered there is closed, and no prompt is posted for it.
 - **Not this class:** a post Slack refuses for the message itself
   (`invalid_blocks`, `msg_too_long`, `no_text`, …) holds nothing. It logs
@@ -960,7 +960,7 @@ or the persona is removed. `server.log` has, when the notice is posted:
 
 | Notice | `<reason>` | Why | What to do |
 |---|---|---|---|
-| *Waiting on a prompt* | `blocked-on-prompt` | The instance's terminal shows a permission dialog, a question or another prompt that no one answered, or its row reads `ask_user` or `check_permission`. The server never types into one. | With the operator's say-so, attach (`tmux attach -t slack_bot_<key>`) and answer it; a permission prompt also posted to the persona's destination can be answered there. Once it is answered, the server reconnects the instance when it can tell it is idle again (its row reads `waiting`, or its screen and transcript prove it idle); if it stays disconnected, type `/mcp reconnect slack-channel-router` in it. With `session_restart_delay` 0 the notice says so: if it is still not connected once its turn ends, type that command or restart the server. |
+| *Waiting on a prompt* | `blocked-on-prompt` | The instance's terminal shows a permission dialog, a question or another prompt that no one answered, or its row reads `ask_user` or `check_permission`. The server never types into one. | With the operator's say-so, attach (`tmux attach -t =slack_bot_<key>`) and answer it; a permission prompt also posted to the persona's destination can be answered there. Once it is answered, the server reconnects the instance when it can tell it is idle again (its row reads `waiting`, or its screen and transcript prove it idle); if it stays disconnected, type `/mcp reconnect slack-channel-router` in it. With `session_restart_delay` 0 the notice says so: if it is still not connected once its turn ends, type that command or restart the server. |
 | *Not connected* | `auto-restart-disabled` | `session_restart_delay` is 0, so nothing will reconnect it. The notice says why it isn't connected (list below). | With the operator's say-so, attach, deal with anything on screen and type `/mcp reconnect slack-channel-router`, or restart the server. |
 | *Not connected* | `unproven-idle` | At any `session_restart_delay`: the row reads `working`, and the server has held back from it for 10 min from its first deferral because it can't prove the instance idle (below). Its first line says `its session reads working but CSCB can't prove it's idle, so it won't type into it`. | With the operator's say-so, attach and look: let a running turn finish and answer anything on screen; if it sits idle at its prompt, type `/mcp reconnect slack-channel-router` in it. With a delay above 0 the server keeps checking and reconnects it once it can tell it is idle; with 0, restart the server if it stays disconnected. |
 | *Not receiving messages* | `auto-restart-disabled` | The instance is connected, but its message stream is gone (`found on two health checks in a row`), and `session_restart_delay` is 0, so nothing will restore it. | As for *Not connected*. |
@@ -1502,6 +1502,7 @@ other personas come up.
 | `name "<name>" is duplicated: personas[<j>] "<name>" (key=<key>) has the same name. Persona names and keys must be unique.` | Two personas share a name. | Rename one. |
 | `key <key> is duplicated: … has the same key. …` | Two different names map to the same key. | Rename one so the keys differ. |
 | `name "<name>" equals the key of personas[<j>] …. …` / `key <key> equals the name of personas[<j>] …. …` | One persona's name is another's key. | Rename one. |
+| `key <key> starts with the key of personas[<j>] "<name>" (key=<key>). tmux matches a session name by its start, so once slack_bot_<key> is gone, a command meant for it (reading its pane, typing into it, ending it) can act on slack_bot_<key>. No persona's key may start with another persona's key: rename one of the two so that neither key starts with the other. For example, rename personas[<i>] "<name>" (key=<key>) to "<new name>" (key=<new key>).` / `key <key> is the start of the key of personas[<j>] …. …` | One persona's key starts with another's: `dev` and `dev_2`, `horde` and `horde_admin`, or `dev` and `"Dev Bot"` (key `dev_bot_…`). agent-director 0.10.0 finds a persona's tmux session by a name that also matches the start of a longer one, so it could read, type into or end the other persona's session. Checked in the last-applied record too. | Rename one so that neither key starts with the other. The `For example` sentence, when there is one, is a name for the persona with the shorter key that fits every other persona: its key plus `_main` (`_main_2`, … when that is taken). Keys that only share a start, such as `dev_a` and `dev_b`, are fine. For a record, fix `config.json` first, then delete the record. |
 | `working_directory "<path>" is also the working_directory of personas[<j>] …. Each persona needs its own working_directory.` | Two personas share a working directory. Compared by real path, so a symlink to another persona's directory counts; the message then shows both paths and `both resolve to "<real path>"`. | Give each persona its own directory. |
 | `credentials_file "<path>" is also the credentials_file of personas[<j>] …. Each persona needs its own credentials_file.` | Two personas share a credentials file, compared by real path the same way. | One credentials file per persona (one Slack app per persona). |
 
@@ -2302,6 +2303,9 @@ Read the row's state with the persona's server-log lines:
 | No row | `persona teardown of … complete` | The persona was removed by a confirmed change; its instance was destroyed. Expected. |
 | A row | `persona teardown of …: agent-director delete of cscb_<key> failed` | The teardown couldn't delete it. For a removed persona, the next server start removes it; for a destructively modified one, its bring-up replaces it, or may resume it when neither its working directory nor its config directory changed. |
 
-`tmux has-session -t slack_bot_<key>` confirms whether the instance's tmux
-session exists.
+`tmux has-session -t =slack_bot_<key>` confirms whether the instance's tmux
+session exists. Keep the `=`: it matches that exact name only. A bare
+`slack_bot_<key>` also matches another persona's session whose name starts
+with it (`slack_bot_dev_2` for `slack_bot_dev`), so a gone session would read
+as present.
 
