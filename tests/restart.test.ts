@@ -46,6 +46,7 @@ import {
   _resetSpawnHomeDir,
   isLaunchInFlight,
   launchSession as launchPersonaSession,
+  _resetNotConnectedEpisodes,
   notifyRestartCapReached,
   setSessionNotifier,
   _resetPreLaunchReplyGuard,
@@ -2132,6 +2133,86 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
     expect(killSessionCalls).toEqual([KEY])
     expect(launchSessionCalls).toEqual([KEY])
     expect(raised).toEqual([])
+    expect(getFailureCount(KEY)).toBe(0)
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jdc (/ci-live run 6): a persona whose session died while its row read
+// `ask_user` or `check_permission`. agent-director only refreshes the row at
+// SessionEnd, so it keeps reading the prompt state until a findMissing sweep
+// reaps it. The liveness probe and the reconnect adapter are the REAL ones over
+// one stub AD client whose row reads the prompt state until a sweep has run
+// and `missing` after it; the tmux-session prober reports the persona's
+// session gone. Kill and launch are recording fakes. Before the fix the
+// adapter deferred the row as blocked on a prompt on every run and raised a
+// *Waiting on a prompt* notice about the dead session, and nothing relaunched
+// the persona (Checks 24-teardown, 25 and 27 then lost their messages).
+// ---------------------------------------------------------------------------
+
+describe('b.jdc: a persona whose session died under a prompt is relaunched in the same restart run', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-jdc-'))
+    _resetFindMissingMemo()
+    _resetNotConnectedEpisodes()
+  })
+
+  afterEach(() => {
+    cancelAllRestartTimers()
+    resetClientForTests()
+    _resetOutageState()
+    _resetTmuxSessionProber()
+    _resetFindMissingMemo()
+    _resetNotConnectedEpisodes()
+    setSessionNotifier(undefined)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test.each(['ask_user', 'check_permission'])('REPRO: alive (%s) but disconnected, its tmux session gone → one probe of its own session, one findMissing sweep, nothing typed and no Waiting on a prompt notice; the re-probe reads the row missing → one kill and one relaunch in that run, no failure counted', async (state) => {
+    const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
+    const KEY = config.personas[0]!.key
+    const sendKeysCalls: SendKeysParams[] = []
+    const findMissingCalls: FindMissingParams[] = []
+    const stub = makeStubClient({
+      statusFn: () => ({ state: findMissingCalls.length > 0 ? 'missing' : state }),
+      sendKeysCalls,
+      findMissingCalls,
+    })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return false })
+    const raised: string[] = []
+    setSessionNotifier((key) => { raised.push(key) })
+
+    const killSessionCalls: string[] = []
+    const launchSessionCalls: string[] = []
+    initRestart({
+      canRestart: () => true,
+      isSessionAlive: _buildIsSessionAliveAdapter(() => config),
+      isSessionConnected: () => false,
+      hasSessionStream: () => false,
+      reconnectSession: _buildReconnectSessionAdapter(),
+      async killSession(key) { killSessionCalls.push(key) },
+      async launchSession(key) { launchSessionCalls.push(key); return true },
+      getRestartDelay: () => FAST_DELAY_S,
+      isShuttingDown: () => false,
+      onCapReached: () => {},
+    })
+
+    scheduleRestart(KEY, config.personas[0]!.working_directory)
+    await Bun.sleep(WAIT_MS)
+
+    expect(probed).toEqual([`slack_bot_${KEY}`])
+    expect(findMissingCalls).toHaveLength(1)
+    expect(sendKeysCalls).toEqual([])
+    expect(raised).toEqual([])
+    expect(killSessionCalls).toEqual([KEY])
+    expect(launchSessionCalls).toEqual([KEY])
     expect(getFailureCount(KEY)).toBe(0)
     expect(isRestartPendingOrActive(KEY)).toBe(false)
   })

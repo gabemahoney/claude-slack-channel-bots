@@ -73,9 +73,11 @@ import {
   AGENT_DIRECTOR_LIVE_STATES,
   cancelWorkingRowWait,
   checkLaunchConfigDir,
+  checkPromptRowDeferral,
   checkWaitingRowPane,
   checkWorkingRowPane,
   deletePersonaInstance,
+  endPromptRowDeferral,
   endWorkingRowDeferral,
   forgetNotConnectedEpisode,
   forgetWorkingRowEvidence,
@@ -91,7 +93,7 @@ import {
   notifyRestartCapReached,
   PROMPT_ROW_STATES,
   reconcileOrphans,
-  reconnectMcp,
+  reconnectMcpWithCause,
   setConfigDirUnresolvableHook,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
@@ -1016,7 +1018,12 @@ export function _buildKillSessionAdapter(
  * into an `ask_user` or `check_permission` session could confirm the dialog's
  * default, so those states are deferred too ('transient'): the deferral is
  * logged, and the persona's `blocked-on-prompt` not-connected notice is raised
- * (once per episode). Once the prompt is answered, a later tick reconnects it
+ * (once per episode). b.jdc: only while its session may still be waiting on
+ * the prompt. The row keeps its state after the session dies, so the
+ * persona's tmux session is probed first: a gone one is swept and escalated
+ * ('escalate-dead', no notice), and once the deferrals have run for
+ * `PROMPT_ROW_SWEEP_AFTER_MS` each one first sweeps and reads the row again
+ * (`promptRowReconnectVerdict`). Once the prompt is answered, a later tick reconnects it
  * when it can tell the session is idle again (its row reads `waiting`, or the
  * positive-idle rule shows a `working` row stale). A `waiting` row's pane is read once first
  * (`checkWaitingRowPane`): a running turn or a prompt or dialog on it defers
@@ -1084,7 +1091,8 @@ export function _buildKillSessionAdapter(
  *     refused keystrokes make `reconnectMcp` answer 'dead-session', which
  *     escalates below: the claude process is gone, and restart.ts's re-probe
  *     reads the row dead and relaunches the persona in the same run (b.d61).
- *     No spawn-failure notice is raised.
+ *     No spawn-failure notice is raised. Its escalate-dead line has the
+ *     verdict `row-not-interactive` (b.jdc), not a dead tmux session's.
  *
  * @param getPersona  The applied persona with a key (production:
  *   `getAppliedPersona`), for locating a `working` row's transcript under its
@@ -1119,11 +1127,13 @@ export function _buildReconnectSessionAdapter(
       forgetWorkingRowEvidence(key)
       endWorkingRowDeferral(key)
     }
+    // b.jdc: likewise the run of deferrals on a row waiting on a prompt.
+    if (!PROMPT_ROW_STATES.has(state)) endPromptRowDeferral(key)
     if (state === 'working') {
       const verdict = await workingReconnectVerdict(key, getPersona)
       if (verdict !== 'reconnect') return verdict
     } else if (PROMPT_ROW_STATES.has(state)) {
-      return deferPromptRow(key, state)
+      return promptRowReconnectVerdict(key, state)
     } else if (state === 'pending') {
       return deferPendingRow(key)
     } else if (state === 'waiting' && (await checkWaitingRowPane(key)) === 'defer') {
@@ -1148,12 +1158,14 @@ export function _buildReconnectSessionAdapter(
     // removing it is a separate operator decision). Not counting here keeps
     // failures attributed to the launchSession site, which owns the single
     // counting site (SR-25.1).
-    const result = await reconnectMcp(key)
-    if (result === 'ok') return 'success'
-    if (result === 'dead-session') {
+    const result = await reconnectMcpWithCause(key)
+    if (result.outcome === 'ok') return 'success'
+    if (result.outcome === 'dead-session') {
       // b.sv7: trigger the internal memoized findMissing sweep (b.m4r) before
       // returning the verdict. The 'escalate-dead' return value is unchanged
-      // regardless of sweep outcome (the wrapper never throws).
+      // regardless of sweep outcome (the wrapper never throws). b.jdc: the
+      // verdict says what proved the session dead, so the line doesn't claim
+      // a dead tmux session for a refused keystroke (b.dup).
       //
       // Memo-TTL vs. tick-cadence: reconcileMissingSweep's 10s memo TTL is
       // harmless at the ~120s health-check tick cadence — a memoized-stale
@@ -1162,7 +1174,7 @@ export function _buildReconnectSessionAdapter(
       // post-reboot case (b.nk5 — /tmp wiped, ALL personas dead-tmux at once)
       // is served correctly by the single in-flight-shared sweep: one
       // findMissing reconciles the whole store for every escalating persona.
-      await sweepDeadTmuxChannel(key, result)
+      await sweepDeadTmuxChannel(key, result.deadCause === 'row-not-interactive' ? 'row-not-interactive' : 'dead-session')
       return 'escalate-dead'
     }
     return 'transient'
@@ -1170,8 +1182,56 @@ export function _buildReconnectSessionAdapter(
 }
 
 /**
+ * b.jdc: the reconnect adapter's verdict for a persona whose row reads
+ * `ask_user` or `check_permission` (see `_buildReconnectSessionAdapter`).
+ * Nothing is ever typed into such a row (b.rmy). But a session that dies
+ * under a prompt keeps its row in that state (agent-director only refreshes a
+ * row at SessionEnd and leaves reaping to its findMissing sweep), so the row
+ * alone is no proof anyone is waiting on a prompt. Checked in order, the
+ * probe before the notice:
+ *   - a launch for the persona is in flight → 'transient', with no tmux probe
+ *     and no notice: the launch owns the session;
+ *   - its own tmux session is gone (`hasPersonaTmuxSession`, exact target) →
+ *     the dead-tmux sweep (`sweepDeadTmuxChannel`, verdict
+ *     `prompt-row-tmux-gone`) and 'escalate-dead', with no notice: restart.ts
+ *     re-probes and relaunches the persona in the same run (b.d61);
+ *   - alive, or the probe failed (no proof it is dead) → one more deferral on
+ *     the row (`checkPromptRowDeferral`): once the run has lasted
+ *     `PROMPT_ROW_SWEEP_AFTER_MS`, it sweeps and reads the row again, and a
+ *     row now `ended` or `missing` escalates the same way; otherwise
+ *     `deferPromptRow` defers and raises the notice, as before.
+ * Never throws: the sweep and the deferral check swallow their own failures.
+ */
+async function promptRowReconnectVerdict(key: string, state: string): Promise<'escalate-dead' | 'transient'> {
+  if (isLaunchInFlight(key)) {
+    console.error(`[slack] reconnectSession: persona=${key} is ${state} and a launch for it is in flight — deferring to a later tick (b.jdc)`)
+    return 'transient'
+  }
+  let tmuxAlive: boolean
+  try {
+    tmuxAlive = await hasPersonaTmuxSession(key)
+  } catch (err) {
+    console.error(
+      `[slack] reconnectSession: persona=${key} is ${state} and its tmux session probe failed: ${describeThrownValue(err)} — taking the session as alive (b.jdc/b.rmy)`,
+    )
+    tmuxAlive = true
+  }
+  if (!tmuxAlive) {
+    endPromptRowDeferral(key)
+    console.error(
+      `[slack] reconnectSession: persona=${key} is ${state} but its tmux session "${personaTmuxSessionName(key)}" is gone — no prompt is waiting in it; not deferring, reconciling so the restart relaunches it (b.jdc)`,
+    )
+    await sweepDeadTmuxChannel(key, 'prompt-row-tmux-gone')
+    return 'escalate-dead'
+  }
+  if ((await checkPromptRowDeferral(key, state)) === 'escalate') return 'escalate-dead'
+  return deferPromptRow(key, state)
+}
+
+/**
  * b.f2b: the reconnect adapter's verdict for a persona whose row reads
- * `ask_user` or `check_permission` (see `_buildReconnectSessionAdapter`):
+ * `ask_user` or `check_permission` and whose session is not known to be gone
+ * (see `promptRowReconnectVerdict`):
  * `/mcp reconnect` + Enter could confirm the dialog's default, so nothing is
  * typed. Logs the deferral, raises the `blocked-on-prompt` not-connected
  * notice (once per episode) and returns 'transient'. The notice says that,

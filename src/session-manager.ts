@@ -18,8 +18,10 @@
  *      wait for waiting (or, b.f2b, for positive evidence that the row is
  *      stale and the session idle: the same idle pane and the same transcript,
  *      ended with a completed turn, across a window) then reconnect;
- *      pending/check_permission/ask_user →
- *      no-op). Before any resume, a row whose `config_dir` label is missing
+ *      check_permission/ask_user → no-op while the persona's tmux session
+ *      lives, and a findMissing sweep, then resume or spawn once its row reads
+ *      dead, when it is gone (b.jdc); pending → no-op). Nothing is ever typed
+ *      into a prompt. Before any resume, a row whose `config_dir` label is missing
  *      or differs from the persona's current effective claude_config_dir is
  *      deleted and spawned fresh instead (a resume keeps the old config dir).
  *   3. Any other error raises a spawn-failure notice for the persona via
@@ -518,13 +520,16 @@ export function notifyDisconnectedWithAutoRestartDisabled(key: string, cause: Un
  * registered again, the health check found it deliverable again, or it was
  * torn down. Its notice latch is cleared, so a later episode is reported
  * again, and so are the idle evidence the restart path gathered for its
- * `working` row (`checkWorkingRowPane`) and its run of deferrals on that row
- * (`noteWorkingRowDeferral`). Silent; other personas are untouched.
+ * `working` row (`checkWorkingRowPane`), its run of deferrals on that row
+ * (`noteWorkingRowDeferral`) and its run of deferrals on a row waiting on a
+ * prompt (`checkPromptRowDeferral`, b.jdc). Silent; other personas are
+ * untouched.
  */
 export function forgetNotConnectedEpisode(key: string): void {
   notConnectedNoticeRaised.delete(key)
   workingRowPaneRuns.delete(key)
   workingRowDeferredSince.delete(key)
+  promptRowDeferredSince.delete(key)
 }
 
 /** Test-only seam: end every persona's not-connected episode (notice latches, idle evidence and deferral runs). */
@@ -532,6 +537,7 @@ export function _resetNotConnectedEpisodes(): void {
   notConnectedNoticeRaised.clear()
   workingRowPaneRuns.clear()
   workingRowDeferredSince.clear()
+  promptRowDeferredSince.clear()
 }
 
 /**
@@ -778,6 +784,33 @@ export async function reconnectMcp(
   key: string,
   ref: string = keyRef(key),
 ): Promise<ReconnectOutcome> {
+  return (await reconnectMcpWithCause(key, ref)).outcome
+}
+
+/**
+ * What proved a session dead when `reconnectMcp` answered `dead-session`
+ * (b.jdc): `tmux-gone`, both keystrokes failed with `ErrTmuxSendKeys`, so its
+ * tmux session is gone (b.3ce); `row-not-interactive`, agent-director refused
+ * them with `ErrSpawnNotInteractive` because it ended the row or marked it
+ * missing (b.dup), whatever became of its tmux session.
+ */
+export type DeadSessionCause = 'tmux-gone' | 'row-not-interactive'
+
+/** `reconnectMcp`'s outcome, with what proved the session dead for `dead-session` (b.jdc). */
+export interface ReconnectResult {
+  outcome: ReconnectOutcome
+  deadCause?: DeadSessionCause
+}
+
+/**
+ * `reconnectMcp`, also saying what proved the session dead (b.jdc): the
+ * restart path's reconnect adapter words its escalate-dead line by it
+ * (`sweepDeadTmuxChannel`). Same calls, lines and notices as `reconnectMcp`.
+ */
+export async function reconnectMcpWithCause(
+  key: string,
+  ref: string = keyRef(key),
+): Promise<ReconnectResult> {
   const claude_instance_id = personaInstanceId(key)
   console.error(`[slack] reconnecting MCP server "${MCP_SERVER_NAME}": ${ref}`)
   const sendReconnect = (): Promise<unknown> =>
@@ -787,9 +820,9 @@ export async function reconnectMcp(
     }))
   try {
     await sendReconnect()
-    return 'ok'
+    return { outcome: 'ok' }
   } catch (err) {
-    if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return 'failed'
+    if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return { outcome: 'failed' }
     if (err instanceof ErrSpawnNotInteractive) return reconnectRefusedDeadSession(err, ref)
     if (err instanceof ErrTmuxSendKeys) {
       console.error(
@@ -799,25 +832,25 @@ export async function reconnectMcp(
       try {
         await sendReconnect()
         console.error(`[slack] reconnectMcp: retry succeeded after ErrTmuxSendKeys for ${ref}`)
-        return 'ok'
+        return { outcome: 'ok' }
       } catch (err2) {
-        if (err2 instanceof ErrSystemInstallDisappeared || err2 instanceof ErrTmuxNotAvailable) return 'failed'
+        if (err2 instanceof ErrSystemInstallDisappeared || err2 instanceof ErrTmuxNotAvailable) return { outcome: 'failed' }
         if (err2 instanceof ErrSpawnNotInteractive) return reconnectRefusedDeadSession(err2, ref)
         const e2 = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('send-keys', 'UnknownError', String(err2))
         console.error(`[slack] reconnectMcp: retry after ErrTmuxSendKeys failed for ${ref}: ${describeAgentDirectorFailure(e2)}`)
         if (err2 instanceof ErrTmuxSendKeys) {
           // b.3ce: the session is provably gone — signal the caller to recover
           // via resume/fresh-spawn instead of posting a terminal failure.
-          return 'dead-session'
+          return { outcome: 'dead-session', deadCause: 'tmux-gone' }
         }
         notifySpawnFailure(key, e2)
-        return 'failed'
+        return { outcome: 'failed' }
       }
     }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('send-keys', 'UnknownError', String(err))
     console.error(`[slack] reconnectMcp: send-keys failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
     notifySpawnFailure(key, e)
-    return 'failed'
+    return { outcome: 'failed' }
   }
 }
 
@@ -825,14 +858,15 @@ export async function reconnectMcp(
  * b.dup: reconnectMcp's verdict when agent-director refused its keystrokes
  * with `ErrSpawnNotInteractive`: the row was ended or marked missing after the
  * caller read its state, so the claude process is gone. Logs one line (the
- * error's name and redacted description) and returns 'dead-session'; raises
- * no notice, since the caller recovers the persona.
+ * error's name and redacted description) and returns 'dead-session' with the
+ * cause `row-not-interactive`; raises no notice, since the caller recovers
+ * the persona.
  */
-function reconnectRefusedDeadSession(err: ErrSpawnNotInteractive, ref: string): 'dead-session' {
+function reconnectRefusedDeadSession(err: ErrSpawnNotInteractive, ref: string): ReconnectResult {
   console.error(
     `[slack] reconnectMcp: send-keys refused for ${ref}: ${describeAgentDirectorFailure(err)} — agent-director ended its row or marked it missing after its state was read (SessionEnd or a findMissing sweep), so its claude process is gone — dead session (b.dup)`,
   )
-  return 'dead-session'
+  return { outcome: 'dead-session', deadCause: 'row-not-interactive' }
 }
 
 // ---------------------------------------------------------------------------
@@ -1603,13 +1637,7 @@ const workingRowDeferredSince = new Map<string, number>()
  * the line.
  */
 export function noteWorkingRowDeferral(key: string, autoRestartDisabled: boolean): boolean {
-  const now = _now()
-  let since = workingRowDeferredSince.get(key)
-  if (since === undefined) {
-    since = now
-    workingRowDeferredSince.set(key, since)
-  }
-  const heldMs = now - since
+  const heldMs = noteDeferralRun(workingRowDeferredSince, key)
   if (heldMs < _unprovenIdleNoticeAfterMs) return false
   return notifyPersonaNotConnected(key, { reason: 'unproven-idle', autoRestartDisabled, heldMs })
 }
@@ -2056,13 +2084,198 @@ async function sharedFindMissingSweep(
  *
  * @param key the dead-tmux persona's key (log context; the sweep itself is
  *   whole-store, so one in-flight sweep serves the fleet — b.nk5).
- * @param verdict the verdict/context fragment for the log line (e.g. 'dead-session').
+ * @param verdict why the persona was escalated; the log line names it and
+ *   says what it proves (`ESCALATE_DEAD_EVIDENCE`, b.jdc).
  */
-export async function sweepDeadTmuxChannel(key: string, verdict: string): Promise<void> {
+export async function sweepDeadTmuxChannel(key: string, verdict: EscalateDeadVerdict): Promise<void> {
   console.error(
-    `[slack] escalate-dead: ${keyRef(key)} verdict=${verdict} — tmux session provably dead, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)`,
+    `[slack] escalate-dead: ${keyRef(key)} verdict=${verdict} — ${ESCALATE_DEAD_EVIDENCE[verdict]}, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)`,
   )
   await reconcileMissingSweep(key, 'escalate-dead')
+}
+
+/**
+ * Why the restart path's reconnect adapter escalated a persona as dead:
+ * - `dead-session`: `reconnectMcp`'s keystrokes failed twice with
+ *   `ErrTmuxSendKeys`, so its tmux session is gone (b.3ce);
+ * - `row-not-interactive`: agent-director refused them with
+ *   `ErrSpawnNotInteractive`, having ended the row or marked it missing
+ *   (b.dup);
+ * - `working-tmux-gone`: its row reads `working`, but its tmux session is
+ *   gone (b.d61);
+ * - `prompt-row-tmux-gone`: its row reads `ask_user` or `check_permission`,
+ *   but its tmux session is gone (b.jdc).
+ */
+export type EscalateDeadVerdict = 'dead-session' | 'row-not-interactive' | 'working-tmux-gone' | 'prompt-row-tmux-gone'
+
+/**
+ * What each escalate-dead verdict proves, for its log line (b.jdc): only a
+ * gone tmux session is "provably dead"; a refused keystroke proves the row is
+ * no longer interactive, whatever became of its tmux session.
+ */
+const ESCALATE_DEAD_EVIDENCE: Readonly<Record<EscalateDeadVerdict, string>> = {
+  'dead-session': 'tmux session provably dead',
+  'row-not-interactive':
+    'row not interactive (agent-director refused the /mcp reconnect keystrokes: it ended the row or marked it missing, so its claude process is gone)',
+  'working-tmux-gone': 'tmux session provably dead',
+  'prompt-row-tmux-gone': 'tmux session provably dead',
+}
+
+// ---------------------------------------------------------------------------
+// Rows waiting on a prompt whose session may be gone (b.jdc)
+// ---------------------------------------------------------------------------
+
+/**
+ * b.jdc: how long the restart path holds back from a persona whose row reads
+ * `ask_user` or `check_permission` while its tmux session lives, before each
+ * further deferral first runs the memoized findMissing sweep and reads the
+ * row again (`checkPromptRowDeferral`). A session that dies under a prompt
+ * keeps its row in that state: agent-director only refreshes a row at
+ * SessionEnd and leaves reaping to its sweep. A gone tmux session is caught at
+ * once by the tmux probe; this bounds the case the probe can't see, a claude
+ * process gone from a tmux session that is still there. Measured from the
+ * first deferral of the run, on the session manager's clock (`_now`).
+ */
+export const PROMPT_ROW_SWEEP_AFTER_MS = 10 * 60 * 1000
+
+/**
+ * When each persona's current run of deferrals on its `ask_user` or
+ * `check_permission` row began (b.jdc, on the session manager's clock
+ * `_now`): the first time the restart path held back from the row with its
+ * tmux session alive (`checkPromptRowDeferral`). It ends
+ * (`endPromptRowDeferral`) when the row reads another state or its tmux
+ * session is gone, when the row is escalated, when any launch for the persona
+ * starts, and with the persona's not-connected episode
+ * (`forgetNotConnectedEpisode`). A failed status call neither extends nor
+ * ends it.
+ */
+const promptRowDeferredSince = new Map<string, number>()
+
+/**
+ * Start persona `key`'s run in `runs` at its first deferral, and return how
+ * long the run has lasted (ms, on `_now`). Shared by the `working`-row and
+ * prompt-row deferral runs.
+ */
+function noteDeferralRun(runs: Map<string, number>, key: string): number {
+  const now = _now()
+  let since = runs.get(key)
+  if (since === undefined) {
+    since = now
+    runs.set(key, since)
+  }
+  return now - since
+}
+
+/**
+ * b.jdc: end persona `key`'s run of deferrals on its prompt row, so a later
+ * deferral starts a new one. Silent; other personas are untouched.
+ */
+export function endPromptRowDeferral(key: string): void {
+  promptRowDeferredSince.delete(key)
+}
+
+/** A row state that says the persona's claude process is gone: agent-director ended the row or marked it missing. */
+function isDeadRowState(state: string | undefined): boolean {
+  return state === 'ended' || state === 'missing'
+}
+
+/**
+ * b.jdc: run the memoized findMissing sweep (b.m4r), then read persona
+ * `key`'s row state again. Returns that state, or undefined when the read
+ * failed (logged with `logPrefix` and `ref`). A failed sweep logs its own
+ * line, and the row is read anyway. Never throws.
+ */
+async function reconcileAndReadRowState(key: string, logPrefix: string, ref: string): Promise<string | undefined> {
+  await reconcileMissingSweep(key, logPrefix, ref)
+  try {
+    const st = await withOutageDetection(key, undefined, (client) =>
+      client.status({ claude_instance_id: personaInstanceId(key) }),
+    )
+    return st.state
+  } catch (err) {
+    console.error(`[slack] ${logPrefix}: reading the row of ${ref} after the findMissing sweep failed: ${describeAgentDirectorFailure(err)}`)
+    return undefined
+  }
+}
+
+/**
+ * b.jdc — the restart path's check of a persona whose row reads `state`
+ * (`ask_user` or `check_permission`) and whose tmux session is alive, or
+ * could not be probed (the reconnect adapter in `server.ts`, which types
+ * nothing into such a row). Notes one more deferral in the persona's run on
+ * the row (`promptRowDeferredSince`). Once the run has lasted
+ * `PROMPT_ROW_SWEEP_AFTER_MS`, it runs the memoized findMissing sweep and
+ * reads the row again: `ended` or `missing` means the claude process is gone,
+ * so it logs that, ends the run and returns `escalate`, and the adapter
+ * escalates the persona as dead for the restart to relaunch. Otherwise
+ * `defer`: the adapter defers the row and raises its notice, as before.
+ * Never throws.
+ */
+export async function checkPromptRowDeferral(key: string, state: string): Promise<'escalate' | 'defer'> {
+  const heldMs = noteDeferralRun(promptRowDeferredSince, key)
+  if (heldMs < PROMPT_ROW_SWEEP_AFTER_MS) return 'defer'
+  const ref = keyRef(key)
+  const after = await reconcileAndReadRowState(key, 'reconnectSession: prompt row', ref)
+  if (!isDeadRowState(after)) return 'defer'
+  endPromptRowDeferral(key)
+  console.error(
+    `[slack] reconnectSession: ${ref} has read ${state} for ${describeWaitSpan(heldMs)} of deferrals, and after a findMissing sweep its row reads ${after} — its claude process is gone; not deferring, the restart relaunches it (b.jdc)`,
+  )
+  return 'escalate'
+}
+
+/**
+ * b.jdc — the collision ladder's action for persona `persona`'s row read
+ * `state` (`ask_user` or `check_permission`). Nothing is ever typed into such
+ * a row (b.rmy). Its session may be gone, though: a session that dies under a
+ * prompt keeps its row in that state until a findMissing sweep reaps it. So
+ * the ladder probes the persona's own tmux session first (exactly,
+ * `hasPersonaTmuxSession`):
+ * - alive, or the probe failed → no action, as before (`no-op`); the health
+ *   check's restart path reports the prompt if the persona stays disconnected;
+ * - gone → the memoized findMissing sweep, then the row is read again:
+ *   `ended` or `missing` is a dead session, recovered through
+ *   `resumeOrFreshSpawn`; anything else (or a failed read) is left as it is
+ *   (`no-op`), for the restart path to retry.
+ */
+async function launchOnPromptRow(
+  persona: Persona,
+  params: SpawnParams,
+  config: PersonaConfig,
+  isStartup: boolean,
+  ref: string,
+  row: Pick<GetResult, 'cwd' | 'labels'>,
+  state: string,
+): Promise<SpawnPersonaResult> {
+  const { key } = persona
+  let tmuxAlive: boolean
+  try {
+    tmuxAlive = await hasPersonaTmuxSession(key)
+  } catch (err) {
+    console.error(
+      `[slack] spawnForPersona: ${ref} reads ${state} and its tmux session probe failed: ${describeThrownValue(err)} — taking the session as alive (b.jdc/b.rmy)`,
+    )
+    tmuxAlive = true
+  }
+  if (tmuxAlive) {
+    console.error(`[slack] spawnForPersona: no action — state=${state} for ${ref}`)
+    return { key, action: 'no-op' }
+  }
+  console.error(
+    `[slack] spawnForPersona: ${ref} reads ${state} but its tmux session "${personaTmuxSessionName(key)}" is gone — no prompt is waiting in it; reconciling its row before deciding (b.jdc)`,
+  )
+  const after = await reconcileAndReadRowState(key, 'spawnForPersona: prompt row', ref)
+  if (isDeadRowState(after)) {
+    console.error(`[slack] spawnForPersona: dead session for ${ref} (state=${state}) — recovering via resume/fresh-spawn`)
+    return resumeOrFreshSpawn(persona, params, config, isStartup, row)
+  }
+  const next = config.session_restart_delay === 0
+    ? 'session_restart_delay is 0, so nothing retries it before the next server start'
+    : "the health check's restart retries it"
+  console.error(
+    `[slack] spawnForPersona: ${ref}: its tmux session is gone, but its row ${after === undefined ? 'could not be read' : `still reads ${after}`} after the findMissing sweep — no action; ${next} (b.jdc)`,
+  )
+  return { key, action: 'no-op' }
 }
 
 /**
@@ -3507,7 +3720,11 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      `not-reconnected` (b.f2b: nothing was typed; `reconnected` only when
  *      `/mcp reconnect` was). `hooks.onWorkingRowWait` is called as the wait
  *      starts (b.f2b).
- *    - pending/check_permission/ask_user → no-op.
+ *    - check_permission/ask_user → never typed into; the persona's tmux
+ *      session is probed first (b.jdc, `launchOnPromptRow`): alive → no-op;
+ *      gone → findMissing sweep and a re-read, and a row now `ended` or
+ *      `missing` → resume/fresh-spawn (otherwise no-op).
+ *    - pending → no-op.
  *    Every resume first checks the row's `config_dir` label; a missing or
  *    different label means delete + fresh spawn instead (resumeOrFreshSpawn).
  *    A directory that stopped resolving since step 2 keeps the row and
@@ -3546,9 +3763,11 @@ export async function spawnForPersona(
   // b.f2b: the restart path's idle evidence for an earlier `working` row says
   // nothing about the session this launch brings up (and must not let the
   // health check skip its two-tick guard while it boots), and the launch's own
-  // wait, if any, starts its own run of deferrals on the row.
+  // wait, if any, starts its own run of deferrals on the row. b.jdc: nor does
+  // its run of deferrals on a row waiting on a prompt.
   forgetWorkingRowEvidence(key)
   endWorkingRowDeferral(key)
+  endPromptRowDeferral(key)
   const launch = runPersonaLadder(persona, config, isStartup, ref, configDirLabel, hooks)
   inFlightLaunches.set(key, launch)
   try {
@@ -3772,7 +3991,12 @@ async function runPersonaLadder(
     return { key, action: 'reconnected' }
   }
 
-  if (state === 'pending' || state === 'check_permission' || state === 'ask_user') {
+  if (PROMPT_ROW_STATES.has(state)) {
+    // b.jdc: never typed into (b.rmy), but its session may be gone.
+    return launchOnPromptRow(persona, params, config, isStartup, ref, row, state)
+  }
+
+  if (state === 'pending') {
     console.error(`[slack] spawnForPersona: no action — state=${state} for ${ref}`)
     return { key, action: 'no-op' }
   }

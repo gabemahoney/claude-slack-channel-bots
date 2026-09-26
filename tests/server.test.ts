@@ -27,6 +27,7 @@ import { cannedGetResult, makeStubClient, errSpawnNotInteractive, errTmuxSendKey
 import { _buildIsSessionAliveAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
 import {
   _resetFindMissingMemo,
+  _setFindMissingMemoTtlMs,
   _setTmuxServerEnsurer,
   _resetTmuxServerEnsurer,
   _setTmuxSessionProber,
@@ -38,6 +39,7 @@ import {
   _resetNow,
   _setNow,
   STALE_WORKING_WINDOW_MS,
+  forgetNotConnectedEpisode,
   hasPendingWorkingRowEvidence,
   isLaunchInFlight,
   setSessionNotifier,
@@ -592,6 +594,11 @@ describe('_buildIsSessionAliveAdapter', () => {
 // manufactures a false dead. While a launch for the persona is in flight the
 // `working` row is deferred without a probe: the launch owns the session, and a
 // tmux session it has not created yet is no proof of death.
+//
+// b.jdc: an `ask_user` or `check_permission` row is never typed into, but it
+// is probed the same way before it is deferred or reported: a gone tmux
+// session is swept and escalated with no notice, and a live one's deferrals
+// sweep and read the row again from 10 min on (the b.jdc block at the end).
 // ---------------------------------------------------------------------------
 
 describe('_buildReconnectSessionAdapter', () => {
@@ -616,6 +623,8 @@ describe('_buildReconnectSessionAdapter', () => {
     row?: { jsonl_path?: string; claude_session_id: string; cwd?: string }
     /** The adapter's persona lookup (production: `getAppliedPersona`). */
     getPersona?: (key: string) => Persona | undefined
+    /** The state every status probe reads once a findMissing sweep has run (default: `statusState`). */
+    statusAfterSweep?: string
   }): {
     adapter: (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient'>
     statusCalls: StatusParams[]
@@ -637,7 +646,10 @@ describe('_buildReconnectSessionAdapter', () => {
     })
     const stub = makeStubClient({
       statusCalls,
-      statusFn: () => opts.statusError ?? { state: opts.statusState ?? 'waiting' },
+      statusFn: () =>
+        opts.statusError ?? {
+          state: (findMissingCalls.length > 0 ? opts.statusAfterSweep : undefined) ?? opts.statusState ?? 'waiting',
+        },
       sendKeysCalls,
       sendKeysError: opts.sendKeysThrows,
       sendKeysResult: opts.sendKeysThrows ? undefined : {},
@@ -844,10 +856,22 @@ describe('_buildReconnectSessionAdapter', () => {
       sendKeysThrows: errTmuxSendKeys(),
     })
 
-    const result = await adapter('C1')
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    let result: string | undefined
+    try {
+      result = await adapter('C1')
+    } finally {
+      console.error = orig
+    }
 
     // Mapping is byte-for-byte unchanged per b.9a7: dead-session → 'escalate-dead'.
     expect(result).toBe('escalate-dead')
+    // Both keystrokes failed with ErrTmuxSendKeys: the tmux session is gone.
+    expect(lines.filter((l) => l.startsWith('[slack] escalate-dead: persona='))).toEqual([
+      '[slack] escalate-dead: persona=C1 verdict=dead-session — tmux session provably dead, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)',
+    ])
     expect(statusCalls).toHaveLength(1)
     // Two send-keys attempts (original + one self-heal retry) both threw.
     expect(sendKeysCalls).toHaveLength(2)
@@ -866,9 +890,16 @@ describe('_buildReconnectSessionAdapter', () => {
   // answers 'dead-session', so the adapter escalates, and the restart run's
   // re-probe relaunches the persona (restart.test.ts, b.dup). Before the fix:
   // 'transient' and a spawn-failure notice.
-  test.each(['waiting', 'missing'])("REPRO (b.dup): the row reads %s and the reconnect's keystrokes are refused (ErrSpawnNotInteractive) → 'escalate-dead' with one sweep and one send-keys (no tmux-server retry); no spawn-failure notice", async (state) => {
+  // b.jdc (b.dup review): the escalate-dead line says why. Here the tmux
+  // session may well be alive: agent-director refused the keystrokes because
+  // the row is not interactive, so the line must not claim the tmux session is
+  // provably dead (REPRO for the wording: the old line always did).
+  test.each(['waiting', 'missing'])("REPRO (b.dup): the row reads %s and the reconnect's keystrokes are refused (ErrSpawnNotInteractive) → 'escalate-dead' with one sweep and one send-keys (no tmux-server retry); no spawn-failure notice; the escalate-dead line says the row is not interactive", async (state) => {
     const raised: string[] = []
     setSessionNotifier((key) => { raised.push(key) })
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
     try {
       const { adapter, sendKeysCalls, findMissingCalls } = makeHarness({ statusState: state, sendKeysThrows: errSpawnNotInteractive('send-keys') })
 
@@ -878,7 +909,11 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
       expect(findMissingCalls).toHaveLength(1)
       expect(raised).toEqual([])
+      expect(lines.filter((l) => l.startsWith('[slack] escalate-dead: persona='))).toEqual([
+        '[slack] escalate-dead: persona=C1 verdict=row-not-interactive — row not interactive (agent-director refused the /mcp reconnect keystrokes: it ended the row or marked it missing, so its claude process is gone), triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)',
+      ])
     } finally {
+      console.error = orig
       setSessionNotifier(undefined)
     }
   })
@@ -1028,13 +1063,16 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.sendKeysCalls).toHaveLength(2)
     })
 
-    test.each(['ask_user', 'check_permission'])("REPRO: a %s row is never typed into: 'transient' on every attempt with no tmux probe, pane read or send-keys, and one blocked-on-prompt notice for the episode", async (state) => {
+    // b.jdc: each attempt first probes the persona's own tmux session (alive
+    // here); a gone one is swept and escalated instead (the b.jdc block below).
+    test.each(['ask_user', 'check_permission'])("REPRO: a %s row whose tmux session lives is never typed into: 'transient' on every attempt with one probe of C1's own tmux session and no pane read, send-keys or sweep, and one blocked-on-prompt notice for the episode", async (state) => {
       const h = makeHarness({ statusState: state })
 
       expect(await attempts(h.adapter, 3, 60_000)).toEqual(['transient', 'transient', 'transient'])
       expect(h.sendKeysCalls).toEqual([])
       expect(h.readPaneCalls).toEqual([])
-      expect(h.tmuxProbes).toEqual([])
+      expect(h.tmuxProbes).toEqual(Array(3).fill('slack_bot_C1'))
+      expect(h.findMissingCalls).toEqual([])
       expect(raised.map((n) => n.key)).toEqual(['C1'])
       expect(raised[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
       expect(raised[0]!.text).toContain('`tmux attach -t =slack_bot_C1`')
@@ -1096,6 +1134,181 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.readPaneCalls).toEqual(Array(2).fill({ claude_instance_id: 'cscb_C1', n_lines: 40 }))
       expect(h.sendKeysCalls).toEqual([])
       expect(raised.map((n) => n.key)).toEqual(Array(noticeCount).fill('C1'))
+    })
+  })
+
+  // b.jdc (/ci-live run 6): when a persona's session dies while its row reads
+  // `ask_user` or `check_permission`, the row keeps that state: agent-director
+  // only refreshes a row at SessionEnd and leaves reaping to its findMissing
+  // sweep. Deferring on the row alone kept a dead persona "blocked on a
+  // prompt" for good: never relaunched, with a *Waiting on a prompt* notice
+  // about a session that no longer existed. The adapter now probes the
+  // persona's own tmux session first: gone → the dead-tmux sweep and
+  // 'escalate-dead', with no notice; alive (or a probe that fails) → the
+  // deferral and its notice as before, and once the deferrals on the row have
+  // run for 10 min each one first runs the findMissing sweep and reads the row
+  // again, escalating when it reads `missing` or `ended`. Nothing is ever typed
+  // into the row (b.rmy). Attempts run on a fake clock passed to `_setNow`.
+  // Cases marked REPRO fail on the code before the fix.
+  describe('b.jdc: a row waiting on a prompt whose session may be gone', () => {
+    let clock: FakeClock
+    let raised: Array<{ key: string; text: string }>
+    let lines: string[]
+    let realError: typeof console.error
+
+    beforeEach(() => {
+      clock = createFakeClock()
+      _setNow(clock.now)
+      raised = []
+      setSessionNotifier((key, text) => { raised.push({ key, text }) })
+      lines = []
+      realError = console.error
+      console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    })
+
+    afterEach(() => {
+      console.error = realError
+      setSessionNotifier(undefined)
+    })
+
+    /** Attempt a reconnect of C1 at each of `minutes` on the fake clock; the verdicts in order. */
+    async function attemptsAt(adapter: (key: string) => Promise<string>, minutes: readonly number[]): Promise<string[]> {
+      const verdicts: string[] = []
+      for (const minute of minutes) {
+        await clock.advance(minute * 60_000 - clock.now())
+        verdicts.push(await adapter('C1'))
+      }
+      return verdicts
+    }
+
+    /** The adapter's own lines and the escalate-dead line, in order. */
+    function adapterLines(): string[] {
+      return lines.filter((l) => l.startsWith('[slack] reconnectSession: ') || l.startsWith('[slack] escalate-dead: persona='))
+    }
+
+    test.each(['ask_user', 'check_permission'])("REPRO: a %s row whose tmux session is gone → 'escalate-dead' with one probe of C1's own session and one findMissing sweep; nothing typed or read, and no Waiting on a prompt notice", async (state) => {
+      const h = makeHarness({ statusState: state, tmux: 'gone' })
+
+      expect(await h.adapter('C1')).toBe('escalate-dead')
+
+      expect(h.tmuxProbes).toEqual(['slack_bot_C1'])
+      expect(h.findMissingCalls).toHaveLength(1)
+      expect(h.sendKeysCalls).toEqual([])
+      expect(h.readPaneCalls).toEqual([])
+      expect(raised).toEqual([])
+      expect(adapterLines()).toEqual([
+        `[slack] reconnectSession: persona=C1 is ${state} but its tmux session "slack_bot_C1" is gone — no prompt is waiting in it; not deferring, reconciling so the restart relaunches it (b.jdc)`,
+        '[slack] escalate-dead: persona=C1 verdict=prompt-row-tmux-gone — tmux session provably dead, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)',
+      ])
+    })
+
+    test.each([
+      ['ask_user', 'missing'],
+      ['check_permission', 'ended'],
+    ])("REPRO: a %s row whose tmux session lives is deferred with its notice; once the deferrals have run for 10 min the next one runs the findMissing sweep and reads the row again, and %s → 'escalate-dead'; nothing is ever typed", async (state, after) => {
+      const h = makeHarness({ statusState: state, tmux: 'alive', statusAfterSweep: after })
+
+      expect(await attemptsAt(h.adapter, [0, 4, 8])).toEqual(['transient', 'transient', 'transient'])
+      expect(h.findMissingCalls).toEqual([])
+      expect(await attemptsAt(h.adapter, [10])).toEqual(['escalate-dead'])
+
+      expect(h.findMissingCalls).toHaveLength(1)
+      expect(h.tmuxProbes).toEqual(Array(4).fill('slack_bot_C1'))
+      // Each attempt's status read, then the read after the sweep.
+      expect(h.statusCalls).toHaveLength(5)
+      expect(h.sendKeysCalls).toEqual([])
+      expect(h.readPaneCalls).toEqual([])
+      // The prompt was reported once, while its session was alive.
+      expect(raised.map((n) => n.key)).toEqual(['C1'])
+      expect(raised[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
+      expect(adapterLines().at(-1)).toBe(
+        `[slack] reconnectSession: persona=C1 has read ${state} for 10 min of deferrals, and after a findMissing sweep its row reads ${after} — its claude process is gone; not deferring, the restart relaunches it (b.jdc)`,
+      )
+    })
+
+    test('a check_permission row whose tmux session lives and that still reads check_permission after the sweep stays deferred: from 10 min on each deferral sweeps once; one notice for the episode; nothing typed', async () => {
+      // No memo: each attempt here is a tick or more apart.
+      _setFindMissingMemoTtlMs(0)
+      const h = makeHarness({ statusState: 'check_permission', tmux: 'alive' })
+
+      expect(await attemptsAt(h.adapter, [0, 9, 10, 13, 16])).toEqual(Array(5).fill('transient'))
+
+      expect(h.findMissingCalls).toHaveLength(3)
+      expect(h.sendKeysCalls).toEqual([])
+      expect(h.readPaneCalls).toEqual([])
+      expect(raised.map((n) => n.key)).toEqual(['C1'])
+    })
+
+    test("a check_permission row whose tmux probe fails is taken as alive (b.rmy): 'transient' with its notice, no sweep, nothing typed", async () => {
+      const h = makeHarness({ statusState: 'check_permission', tmux: 'probe-error' })
+
+      expect(await h.adapter('C1')).toBe('transient')
+
+      expect(h.tmuxProbes).toEqual(['slack_bot_C1'])
+      expect(h.findMissingCalls).toEqual([])
+      expect(h.sendKeysCalls).toEqual([])
+      expect(raised.map((n) => n.key)).toEqual(['C1'])
+      const [probe, deferral, ...rest] = adapterLines()
+      expect(rest).toEqual([])
+      expect(probe).toStartWith('[slack] reconnectSession: persona=C1 is check_permission and its tmux session probe failed: Error message="tmux probe failed" at ')
+      expect(probe).toEndWith(' — taking the session as alive (b.jdc/b.rmy)')
+      expect(deferral).toBe(
+        '[slack] reconnectSession: persona=C1 is check_permission — its session waits on a prompt or dialog; not typing /mcp reconnect into it, deferring to a later tick (b.f2b/b.rmy)',
+      )
+    })
+
+    test("a check_permission row while a launch for the persona is in flight → 'transient' with no tmux probe, sweep, send-keys or notice, even with its tmux session gone: the launch owns the session", async () => {
+      // The launch resolves its unset claude_config_dir against a temp home.
+      mkdirSync(join(dir, 'home', '.claude'), { recursive: true })
+      _setSpawnHomeDir(join(dir, 'home'))
+      const config = makeStandInPersonaConfig({ C1: {} }, dir)
+      const h = makeHarness({ statusState: 'check_permission', tmux: 'gone' })
+      // A launch whose tmux session is not created yet: its spawn is held open.
+      const held = holdSpawns(h.stub)
+      const launch = spawnForPersona(config.personas[0]!, config, false)
+      try {
+        await held.entered('cscb_C1')
+        expect(isLaunchInFlight('C1')).toBe(true)
+
+        expect(await h.adapter('C1')).toBe('transient')
+
+        expect(h.tmuxProbes).toEqual([])
+        expect(h.findMissingCalls).toEqual([])
+        expect(h.sendKeysCalls).toEqual([])
+        expect(raised).toEqual([])
+        expect(adapterLines()).toEqual([
+          '[slack] reconnectSession: persona=C1 is check_permission and a launch for it is in flight — deferring to a later tick (b.jdc)',
+        ])
+      } finally {
+        // Settle the held launch before teardown.
+        held.releaseAll()
+        await launch
+      }
+    })
+
+    test('an attempt that reads another state ends the run of deferrals on the prompt row: the 10 min start over', async () => {
+      const opts: Parameters<typeof makeHarness>[0] = { statusState: 'check_permission', tmux: 'alive', statusAfterSweep: 'missing' }
+      const h = makeHarness(opts)
+      const verdicts: string[] = []
+      for (const [minute, state] of [[0, 'check_permission'], [6, 'pending'], [9, 'ask_user'], [18, 'ask_user'], [19, 'ask_user']] as const) {
+        opts.statusState = state
+        verdicts.push(...(await attemptsAt(h.adapter, [minute])))
+      }
+
+      expect(verdicts).toEqual(['transient', 'transient', 'transient', 'transient', 'escalate-dead'])
+      expect(h.findMissingCalls).toHaveLength(1)
+      expect(h.sendKeysCalls).toEqual([])
+    })
+
+    test("the persona's not-connected episode ending (its MCP session registered again) ends the run too, and a later episode is reported again", async () => {
+      const h = makeHarness({ statusState: 'check_permission', tmux: 'alive', statusAfterSweep: 'missing' })
+
+      expect(await attemptsAt(h.adapter, [0, 5])).toEqual(['transient', 'transient'])
+      forgetNotConnectedEpisode('C1')
+      expect(await attemptsAt(h.adapter, [6, 15, 16])).toEqual(['transient', 'transient', 'escalate-dead'])
+
+      expect(h.findMissingCalls).toHaveLength(1)
+      expect(raised.map((n) => n.key)).toEqual(['C1', 'C1'])
     })
   })
 })

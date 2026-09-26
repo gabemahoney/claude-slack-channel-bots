@@ -79,6 +79,11 @@
  *     after it was read is a dead session, recovered through resume with no
  *     `[spawn-failed]` entry or notice, at a launch's `waiting` row (the live
  *     race: another persona's wait sweeps) and in each reconnect of the wait.
+ *   - b.jdc: a launch that meets an `ask_user` or `check_permission` row
+ *     probes the persona's own tmux session exactly and, when it is gone,
+ *     sweeps and resumes the persona once its row reads dead; the restart
+ *     path's run of deferrals on such a row (`checkPromptRowDeferral`)
+ *     sweeps from 10 min on; the escalate-dead line is worded by its verdict.
  *   - b.f2b stale `working` rows: how a pane read is classified (a Linux
  *     screen's `●` reply and tool lines are not a spinner; a custom spinner
  *     verb of several words is) and folded into evidence, the restart path's
@@ -173,6 +178,8 @@ import {
   _resetUnprovenIdleNoticeAfterMs,
   _setUnprovenIdleNoticeAfterMs,
   cancelWorkingRowWait,
+  checkPromptRowDeferral,
+  PROMPT_ROW_SWEEP_AFTER_MS,
   checkWaitingRowPane,
   checkWorkingRowPane,
   classifyWorkingPane,
@@ -5468,6 +5475,29 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
     expect(findMissingCalls).toHaveLength(2) // TTL=0 → no reuse, each escalate sweeps
   })
 
+  // b.jdc (b.dup review): the line says what the verdict proves. Only a gone
+  // tmux session is "provably dead"; a refused keystroke (ErrSpawnNotInteractive)
+  // proves the row is no longer interactive, whatever its tmux session. REPRO
+  // for `row-not-interactive`: the old line claimed a dead tmux session for
+  // every verdict.
+  test.each([
+    ['dead-session', 'tmux session provably dead'],
+    ['working-tmux-gone', 'tmux session provably dead'],
+    ['prompt-row-tmux-gone', 'tmux session provably dead'],
+    [
+      'row-not-interactive',
+      'row not interactive (agent-director refused the /mcp reconnect keystrokes: it ended the row or marked it missing, so its claude process is gone)',
+    ],
+  ] as const)('log: verdict=%s says "%s"', async (verdict, evidence) => {
+    installStub({})
+
+    await sweepDeadTmuxChannel('C', verdict)
+
+    expect(errLog.filter((l) => l.startsWith('[slack] escalate-dead: persona='))).toEqual([
+      `[slack] escalate-dead: persona=C verdict=${verdict} — ${evidence}, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)`,
+    ])
+  })
+
   // b.m4r contract pin through the wrapper: a FAILED sweep is not memoized, so
   // the next escalate retries. The wrapper still never throws on the failure.
   test('b.m4r pin: a failed sweep is not memoized → next escalate retries, wrapper never throws', async () => {
@@ -6769,6 +6799,230 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
     expect(rawEntered).toEqual(['slack_bot_C'])
     expect(notices).toEqual([])
     expect(readLog()).toBe('')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jdc — a launch meets a row waiting on a prompt whose session is gone
+//
+// /ci-live run 6: persona A's session was killed while its row read
+// `check_permission`. agent-director only refreshes a row at SessionEnd and
+// leaves reaping to its findMissing sweep, so the row kept that state, and the
+// next server start's ladder logged `spawnForPersona: no action —
+// state=check_permission` and left A down. The ladder now probes the persona's
+// own tmux session (exactly, `=slack_bot_<key>`) before doing nothing: gone →
+// the memoized findMissing sweep, then the row is read again; `missing` or
+// `ended` → a dead session, recovered through resume/fresh-spawn. A live tmux
+// session (or a failed probe) is left alone as before: nothing is ever typed
+// into a prompt (b.rmy).
+//
+// Cases marked REPRO fail on the code before the fix.
+// ---------------------------------------------------------------------------
+
+describe('b.jdc: a launch meets a row waiting on a prompt whose session may be gone', () => {
+  /**
+   * Persona `C`'s colliding spawn meets its row in `state`. Status reads
+   * `state` until a findMissing sweep has run, then `afterSweep`, and
+   * `waiting` once the row is resumed.
+   */
+  function installPromptRow(cfg: PersonaConfig, state: string, afterSweep: string): LadderCalls {
+    const calls = newLadderCalls()
+    installStub({
+      ...calls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: personaRow(cfg, 'C', { state }),
+      statusFn: () => ({
+        state: calls.resumeCalls.length > 0 ? 'waiting' : calls.findMissingCalls.length > 0 ? afterSweep : state,
+      }) as import('agent-director').StatusResult,
+    })
+    return calls
+  }
+
+  test.each(['check_permission', 'ask_user'])('REPRO: a %s row whose tmux session is gone (exact has-session target) → one findMissing sweep, the row reads missing → resumed; nothing typed, no notice, no "no action" line', async (state) => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const calls = installPromptRow(cfg, state, 'missing')
+    // The real prober, over the tmux runner seam: `has-session` fails (gone).
+    const tmuxCalls: string[][] = []
+    _resetTmuxSessionProber()
+    _setTmuxCommandRunner(async (args) => { tmuxCalls.push([...args]); return { code: 1, stdout: '' } })
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toEqual({ key: 'C', action: 'resumed' })
+    expect(tmuxCalls.filter((args) => args[0] === 'has-session')).toEqual([['has-session', '-t', '=slack_bot_C']])
+    expect(calls.findMissingCalls).toHaveLength(1)
+    expect(calls.resumeCalls).toEqual([{ claude_instance_id: 'cscb_C' }])
+    expect(calls.sendKeysCalls).toEqual([])
+    expect(calls.killCalls).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
+    expect(calls.spawnCalls).toHaveLength(1) // the colliding spawn only
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, `[slack] spawnForPersona: "C" (key=C) reads ${state} but its tmux session "slack_bot_C" is gone — no prompt is waiting in it; reconciling its row before deciding (b.jdc)`)).toHaveLength(1)
+    expect(linesWith(errLog, `[slack] spawnForPersona: dead session for "C" (key=C) (state=${state}) — recovering via resume/fresh-spawn`)).toHaveLength(1)
+    expect(errLog).not.toContain('no action')
+  })
+
+  test.each(['check_permission', 'ask_user'])('a %s row whose tmux session lives → no-op after one probe of its own session: no sweep, resume or keystrokes', async (state) => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const calls = installPromptRow(cfg, state, 'missing')
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return true })
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toEqual({ key: 'C', action: 'no-op' })
+    expect(probed).toEqual(['slack_bot_C'])
+    expect(calls.findMissingCalls).toEqual([])
+    expect(calls.resumeCalls).toEqual([])
+    expect(calls.sendKeysCalls).toEqual([])
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, `[slack] spawnForPersona: no action — state=${state} for "C" (key=C)`)).toHaveLength(1)
+  })
+
+  test('a check_permission row whose tmux probe fails is taken as alive (b.rmy) → no-op, no sweep', async () => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const calls = installPromptRow(cfg, 'check_permission', 'missing')
+    _setTmuxSessionProber(async () => { throw new Error('tmux probe failed') })
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toEqual({ key: 'C', action: 'no-op' })
+    expect(calls.findMissingCalls).toEqual([])
+    expect(calls.resumeCalls).toEqual([])
+    const [probe] = linesWith(errLog, 'its tmux session probe failed')
+    expect(probe).toStartWith('[slack] spawnForPersona: "C" (key=C) reads check_permission and its tmux session probe failed: Error message="tmux probe failed" at ')
+    expect(probe).toEndWith(' — taking the session as alive (b.jdc/b.rmy)')
+    expect(linesWith(errLog, '[slack] spawnForPersona: no action — state=check_permission for "C" (key=C)')).toHaveLength(1)
+  })
+
+  test('a check_permission row whose tmux session is gone but that still reads check_permission after the sweep → no-op: nothing resumed, killed or deleted', async () => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const calls = installPromptRow(cfg, 'check_permission', 'check_permission')
+    _setTmuxSessionProber(async () => false)
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toEqual({ key: 'C', action: 'no-op' })
+    expect(calls.findMissingCalls).toHaveLength(1)
+    expect(calls.resumeCalls).toEqual([])
+    expect(calls.killCalls).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
+    expect(calls.sendKeysCalls).toEqual([])
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, '[slack] spawnForPersona: "C" (key=C): its tmux session is gone, but its row still reads check_permission after the findMissing sweep — no action; the health check\'s restart retries it (b.jdc)')).toHaveLength(1)
+  })
+
+  test('the same at session_restart_delay 0: the line says nothing retries it before the next server start', async () => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { session_restart_delay: 0 })
+    installPromptRow(cfg, 'ask_user', 'ask_user')
+    _setTmuxSessionProber(async () => false)
+
+    const errLog = await withCapturedErr(async () => {
+      await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(linesWith(errLog, '[slack] spawnForPersona: "C" (key=C): its tmux session is gone, but its row still reads ask_user after the findMissing sweep — no action; session_restart_delay is 0, so nothing retries it before the next server start (b.jdc)')).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jdc — checkPromptRowDeferral: the restart path's run of deferrals on a
+// row waiting on a prompt whose tmux session lives. From
+// PROMPT_ROW_SWEEP_AFTER_MS (10 min) after the run's first deferral, each
+// deferral runs the memoized findMissing sweep and reads the row again; a row
+// that now reads `ended` or `missing` escalates. On a fake clock passed to
+// `_setNow`; the memo is off so each call a tick apart sweeps.
+// ---------------------------------------------------------------------------
+
+describe('b.jdc: checkPromptRowDeferral', () => {
+  const min = (n: number): number => n * 60_000
+  let clock: FakeClock
+
+  beforeEach(() => {
+    clock = useFakeNow()
+    _setFindMissingMemoTtlMs(0)
+  })
+
+  test('each persona\'s run starts at its first deferral; from 10 min on each deferral sweeps and reads its row again; a row read missing escalates once and ends the run; no notice of its own', async () => {
+    const rows = new Map<string, string>([['cscb_C', 'check_permission'], ['cscb_D', 'ask_user']])
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const statusCalls: import('agent-director').StatusParams[] = []
+    installStub({
+      findMissingCalls,
+      statusCalls,
+      statusFn: ({ claude_instance_id }) => ({ state: rows.get(claude_instance_id) }) as import('agent-director').StatusResult,
+    })
+
+    const verdicts: string[] = []
+    await clock.advance(5_000)
+    verdicts.push(await checkPromptRowDeferral('C', 'check_permission')) // the run starts at 5 s
+    await clock.advance(PROMPT_ROW_SWEEP_AFTER_MS - 1)
+    verdicts.push(await checkPromptRowDeferral('C', 'check_permission'))
+    expect(findMissingCalls).toEqual([])
+    await clock.advance(1)
+    verdicts.push(await checkPromptRowDeferral('C', 'check_permission')) // 10 min: sweeps; still check_permission
+    // Another persona's run is its own.
+    verdicts.push(await checkPromptRowDeferral('D', 'ask_user'))
+    rows.set('cscb_C', 'missing')
+    await clock.advance(min(3))
+    verdicts.push(await checkPromptRowDeferral('C', 'check_permission'))
+    // The escalation ended the run: the next deferral starts a new one.
+    verdicts.push(await checkPromptRowDeferral('C', 'check_permission'))
+
+    expect(PROMPT_ROW_SWEEP_AFTER_MS).toBe(min(10))
+    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'defer', 'escalate', 'defer'])
+    expect(findMissingCalls).toHaveLength(2)
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C', 'cscb_C'])
+    expect(notices).toEqual([])
+  })
+
+  test('a failed read after the sweep defers (no proof the process is gone), with one token-safe line', async () => {
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    installStub({ findMissingCalls, statusError: errGeneric('status', 'ErrStatusBroken', adDescription()) })
+
+    let verdicts: string[] = []
+    const errLog = await withCapturedErr(async () => {
+      verdicts = [await checkPromptRowDeferral('C', 'ask_user')]
+      await clock.advance(min(10))
+      verdicts.push(await checkPromptRowDeferral('C', 'ask_user'))
+    })
+
+    expect(verdicts).toEqual(['defer', 'defer'])
+    expect(findMissingCalls).toHaveLength(1)
+    expect(linesWith(errLog, 'after the findMissing sweep failed')).toEqual([
+      `[slack] reconnectSession: prompt row: reading the row of persona=C after the findMissing sweep failed: ErrStatusBroken message="${REDACTED_AD_DESCRIPTION}"`,
+    ])
+    expect(errLog).not.toContain(LEAK_SENTINEL)
+  })
+
+  test('a launch for the persona ends its run, and so does the end of its not-connected episode', async () => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    installStub({ findMissingCalls, statusResult: { state: 'waiting' } as import('agent-director').StatusResult })
+
+    expect(await checkPromptRowDeferral('C', 'check_permission')).toBe('defer') // the run starts at 0
+    await clock.advance(min(9))
+    await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    await clock.advance(min(2))
+    expect(await checkPromptRowDeferral('C', 'check_permission')).toBe('defer') // a new run starts at 11 min
+    await clock.advance(min(9))
+    forgetNotConnectedEpisode('C')
+    await clock.advance(min(2))
+    expect(await checkPromptRowDeferral('C', 'check_permission')).toBe('defer') // a new run starts at 22 min
+
+    expect(findMissingCalls).toEqual([])
   })
 })
 
