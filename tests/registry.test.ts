@@ -1476,6 +1476,7 @@ describe('download_attachment', () => {
     ['an is_external file on a files.slack.com URL', [{ ...slackFile('F0EXT0001', 'e.txt'), is_external: true }], 'F0EXT0001'],
     ["a mode: 'external' file on a files.slack.com URL", [{ ...slackFile('F0EXT0002', 'e.txt'), mode: 'external' }], 'F0EXT0002'],
     ['an external file with no URL', [{ id: 'F0EXT0003', name: 'e.txt', is_external: true }], 'F0EXT0003'],
+    ['a third-party url_private', [{ id: 'F0EXT0004', name: 'x.txt', url_private: `https://example.com/x.txt${QUERY}` }], 'F0EXT0004'],
     [
       'a third-party URL (malformed file ID → labelled by position)',
       [{ id: 'not/an id', name: 'x.txt', url_private_download: `https://example.com/x.txt${QUERY}` }],
@@ -1520,6 +1521,7 @@ describe('download_attachment', () => {
     ['a lookalike host', 'https://files.slack.com.evil.example/report.txt'],
     ['http: on the Slack host', 'http://files.slack.com/report.txt'],
     ['a non-default port on the Slack host', 'https://files.slack.com:8443/report.txt'],
+    ['a protocol-relative URL on another host', '//evil.example/x'],
   ])('a redirect to %s is refused and never fetched', async (_label, location) => {
     h.fetchHandler = () => redirect(location)
 
@@ -1557,16 +1559,32 @@ describe('download_attachment', () => {
     expectNoUrlQuery(result)
   })
 
-  test('a 3xx with no Location skips the file → "Failed to download any files."', async () => {
-    h.fetchHandler = () => redirect()
+  test.each<[string, (url: string) => Response, string[]]>([
+    ['a 302 with no Location', () => redirect(), [`${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`]],
+    [
+      'a 404 on the first request',
+      () => new Response('not found', { status: 404 }),
+      [`${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`],
+    ],
+    [
+      'a same-origin 302 that then returns 404',
+      (url) =>
+        url.includes('/download/')
+          ? new Response('not found', { status: 404 })
+          : redirect('/files-pri/T0-F0FILE001/download/report.txt'),
+      [`${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`, `${FILES}/files-pri/T0-F0FILE001/download/report.txt`],
+    ],
+  ])('%s skips the file → "Failed to download any files."', async (_label, handler, fetched) => {
+    h.fetchHandler = handler
 
     const result = await download([slackFile('F0FILE001', 'report.txt')])
 
     expect(result.isError).toBeUndefined()
     expect(result.content[0]!.text).toBe('Failed to download any files.')
-    expect(h.fetches).toHaveLength(1)
+    expect(h.fetches.map((f) => f.url)).toEqual(fetched)
     expectTokenOnlySentToSlackFiles()
     expect(readdirSync(h.inboxDir)).toEqual([])
+    expectNoUrlQuery(result)
   })
 
   test('a redirect refusal after an earlier file was written lists the already-downloaded path', async () => {

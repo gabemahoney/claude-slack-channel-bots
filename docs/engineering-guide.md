@@ -105,6 +105,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 - The reply guard never patches the operator's personal `~/.claude/settings.json`. The Stop-hook patcher (`src/stop-hook-bootstrap.ts`) refuses a config directory that resolves there by real path (`isForbiddenHomeClaudeDir`, through `resolveRealPath`), so a symlinked spelling can't slip past; the start pass records `stop-hook-bootstrap-refuse-home` and the launch pass logs it (b.av2 SR-9.4, SR-3.11). Keep that check in front of every Stop-hook write
 - Validate all external input at system boundaries (HTTP endpoints, Slack payloads, config files) before acting on it
 - Error responses to external callers must not expose stack traces, internal paths, or sensitive data — log detail to stderr, return a generic message
+- Send a persona's bot token only to `https://files.slack.com`. A URL taken from a Slack payload (such as a file's `url_private`) gets the Authorization header only if `isSlackHostedFileUrl` accepts it; fetch it with manual redirects and check each redirect target the same way before resending the header
 
 ## Naming Conventions
 
