@@ -49,7 +49,16 @@
  *   that the token may still be valid; B is not asked for "rotated", and the
  *   rest of step 7 and step 8's revert still run;
  * - the texts the checks expect match what the package writes (the pending
- *   file header, the preview counts, the reload-applied line, the S3 error).
+ *   file header, the preview counts, the reload-applied line, the S3 error,
+ *   and the start summary's buckets in their order);
+ * - a start's summary line must end with the current ending, `0 failed, 0 not
+ *   brought up, 0 not reconnected` (b.f2b's last bucket): the ending before
+ *   b.f2b, any non-zero count in it and `10 failed` are findings, and the plan
+ *   quotes the same ending and Check 1's line;
+ * - the guarded restart and Check 28's start after the reboot wait for each
+ *   persona's Session connected line, not only the summary: a persona that
+ *   connects after the summary (parked on a `working` row, b.f2b) is no
+ *   finding, and one that never connects is.
  *
  * No docker, network or real host state: the container, the host probes, the
  * test human's session and the clock are fakes; the transcript helpers run
@@ -76,6 +85,7 @@ import {
   check12,
   check8,
   check9,
+  COMPLETE_FIRST_START,
   expectOneTag,
   judgeLimitLines,
   rawShape,
@@ -88,7 +98,9 @@ import { Findings, NEED_SKIP_REASONS, runChecks, skipReason, verdictOf, type Che
 import {
   appliedLine,
   checkPreview,
+  checkStartLines,
   countsText,
+  guardedRestart,
   hasWord,
   isPrompt,
   parsePending,
@@ -97,6 +109,7 @@ import {
   promptState,
   q,
   S,
+  START_SUMMARY_END,
   TAG_TIMEOUT_MS,
   waitTags,
 } from '../ci-live/checks/helpers.ts'
@@ -120,7 +133,8 @@ import { HumanSession } from '../ci-live/lib/human-session.ts'
 import { buildLiveConfig, renderConfig } from '../ci-live/lib/live-config.ts'
 import type { ProcResult } from '../ci-live/lib/proc.ts'
 import { RESULTS_COLUMNS } from '../ci-live/lib/results.ts'
-import { MINUTE } from '../ci-live/lib/wait.ts'
+import type { PersonaLetter } from '../ci-live/lib/personas.ts'
+import { MINUTE, SECOND } from '../ci-live/lib/wait.ts'
 import { emptyAppsState } from '../ci-live/lib/apps-state.ts'
 import { virtualClock } from './test-helpers/ci-live.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
@@ -248,6 +262,63 @@ function check(id: string, extra: Partial<CheckDef<null>> & { outcome?: CheckRes
 }
 
 const FAILED: CheckResult = { status: 'FAIL', reason: 'broke', evidence: [] }
+
+/**
+ * `since '<mark>'`, alone or piped to one `grep -F -- '<text>'` or
+ * `grep -E -- '<re>'` (as the check helpers write them), over `log`; null for
+ * any other script.
+ */
+function sinceOver(script: string, log: readonly string[]): string | null {
+  const m = /^since '[^']*'(?: \| grep -([FE]) -- '((?:[^']|'\\'')*)')?$/.exec(script)
+  if (!m) return null
+  const pattern = (m[2] ?? '').replace(/'\\''/g, "'")
+  const kept = m[1] === undefined ? log : log.filter((l) => (m[1] === 'F' ? l.includes(pattern) : new RegExp(pattern).test(l)))
+  return kept.join('\n')
+}
+
+/** A start's summary line for three personas, two resumed and one parked, with `ending` after the no-op count. */
+function startSummary(ending: string): string {
+  return (
+    '[slack] startupSessionManager: complete — 3 persona(s): 2 resumed, 0 fresh-spawned, 0 fresh-after-amnesia, ' +
+    `0 fresh-after-inconclusive-amnesia, 0 reconnected, 0 no-op, ${ending}`
+  )
+}
+
+/**
+ * A start from the record, each line with the seconds after the start at which
+ * it is logged. A and B connect before the summary. C's launch waits on a
+ * `working` row (b.f2b), so the summary leaves it out and C connects `cAt` s
+ * after the start (never, when null).
+ */
+function startLog(cAt: number | null, ending = START_SUMMARY_END): [number, string][] {
+  const connected = (l: PersonaLetter) => `[slack] Session connected: persona "persona_${l}" (key=persona_${l}) cwd="/home/cscb/cscb-live/${l}"`
+  return [
+    [20, `[slack] Starting from the last-applied record "${S}/config.json.last-applied"`],
+    [20, '[slack] Loaded persona config: 3 persona(s)'],
+    ...(['a', 'b', 'c'] as const).map((l, i): [number, string] => [25, `[slack] persona-start: personas[${i}] "persona_${l}" (key=persona_${l}): bring-up starting`]),
+    [80, connected('a')],
+    [90, connected('b')],
+    [100, startSummary(ending)],
+    [100, '[slack] startupSessionManager: 1 persona(s) still waiting in the background for a working row to settle — not counted above; each logs its outcome when it settles (b.f2b)'],
+    ...(cAt === null ? [] : [[cAt, connected('c')] as [number, string]]),
+  ]
+}
+
+/**
+ * server.log holding `log`'s lines, each shown once the virtual clock is its
+ * seconds past `begin()` (the start, or the reboot); nothing before.
+ * `since(script)` answers a `since` script as `sinceOver` does.
+ */
+function timedLog(clock: CheckContext['clock'], log: readonly (readonly [number, string])[]) {
+  let at: number | null = null
+  const shown = () => (at === null ? [] : log.filter(([s]) => clock.now() >= at! + s * SECOND).map(([, l]) => l))
+  return {
+    begin: () => {
+      at = clock.now()
+    },
+    since: (script: string) => sinceOver(script, shown()),
+  }
+}
 
 // ---------------------------------------------------------------------------
 // The framework
@@ -1229,6 +1300,109 @@ describe("Check 28: a failed revocation of B's older app-level token (step 7)", 
   })
 })
 
+// ---------------------------------------------------------------------------
+// A start's lines: the summary's ending and the wait for every persona
+// ---------------------------------------------------------------------------
+
+describe("the start's lines: the summary's ending (Part 2.3's Expected items)", () => {
+  /** checkStartLines' findings on a start logged in full: C connected, the summary ending `ending`. */
+  async function findingsFor(ending: string): Promise<string[]> {
+    const clock = virtualClock()
+    const log = timedLog(clock, startLog(155, ending))
+    log.begin()
+    await clock.sleep(155 * SECOND)
+    const f = new Findings()
+    await checkStartLines(makeCtx({ clock, container: fakeContainer([['', (script) => log.since(script) ?? '']]).container }), f, '1:0', ['a', 'b', 'c'], true)
+    return f.failures
+  }
+
+  test(`a summary ending "${START_SUMMARY_END}" is no finding, and the line is evidence`, async () => {
+    expect(await findingsFor(START_SUMMARY_END)).toEqual([])
+  })
+
+  test.each([
+    ['the ending before b.f2b, with no not-reconnected bucket', '0 failed, 0 not brought up'],
+    ['a persona left running but not reconnected', '0 failed, 0 not brought up, 1 not reconnected'],
+    ['a persona not brought up', '0 failed, 1 not brought up, 0 not reconnected'],
+    ['a failed launch', '1 failed, 0 not brought up, 0 not reconnected'],
+    ['ten failed launches (the ending matches whole counts only)', '10 failed, 0 not brought up, 0 not reconnected'],
+  ])('%s is a finding', async (_what, ending) => {
+    expect(await findingsFor(ending)).toEqual([`the start summary does not end "${START_SUMMARY_END}"`])
+  })
+})
+
+describe('the guarded restart waits for every persona to connect, not only for the summary (Part 2.3 step 3)', () => {
+  /** A stop, then a start logged as `startLog(cAt)`; the record matches and nothing is pending; time is virtual. */
+  function restartRun(cAt: number | null) {
+    const clock = virtualClock()
+    const log = timedLog(clock, startLog(cAt))
+    const { container } = fakeContainer([
+      [
+        'claude-slack-channel-bots start',
+        () => {
+          log.begin()
+          return ''
+        },
+      ],
+      ['[ -e "$S/config.json.pending" ]', { code: 1 }],
+      ['', (script) => (script === 'mark' ? '1:0' : (log.since(script) ?? ''))],
+    ])
+    return { ctx: makeCtx({ mode: 'real', clock, container }), clock }
+  }
+
+  test('a persona that connects 55 s after the summary (parked on a working row, b.f2b) is waited for: no finding', async () => {
+    const run = restartRun(155)
+    const at = run.clock.now()
+    const f = new Findings()
+    expect(await guardedRestart(run.ctx, f)).toBe('1:0')
+    expect(f.failures).toEqual([])
+    expect(f.evidence).toEqual([startSummary(START_SUMMARY_END)])
+    expect(run.clock.now() - at).toBeGreaterThanOrEqual(155 * SECOND)
+  })
+
+  test('the control: a persona that never connects is a finding once the bring-up wait runs out', async () => {
+    const f = new Findings()
+    await guardedRestart(restartRun(null).ctx, f)
+    expect(f.failures).toEqual(['guarded restart: the start summary or a Session connected line did not appear in time', 'no Session connected line for persona_c'])
+  })
+})
+
+describe('Check 28 step 5: the start after the reboot waits for every persona to connect, not only for B', () => {
+  const ROWS = ['a', 'b', 'c'].map((l) => `cscb_persona_${l} persona_${l} idle`).join('\n')
+  /** The findings that step 5's start lines give. */
+  const START_FINDING = /^step 5|Session connected line|persona-start line|last-applied record|startupSessionManager complete|start summary|start failure/
+
+  /**
+   * A live context whose reboot (`restartContainer`) starts the server: its
+   * lines are `startLog(cAt)`, timed from the reboot. The container sets the
+   * start-at-boot marker, gives a mark (also as the saved reboot mark), the
+   * three rows and a running server; nothing answers in Slack, so the other
+   * steps record their own findings; time is virtual.
+   */
+  function rebootedRun(cAt: number | null) {
+    const clock = virtualClock()
+    const log = timedLog(clock, startLog(cAt))
+    const { container } = fakeContainer([
+      ['echo BOOT', 'BOOT'],
+      ['kill -0', 'running'],
+      ['', (script) => (script === 'mark' || script === 'cat ~/cscb-live/reboot-log-mark' ? '1:0' : script === 'rows' ? ROWS : (log.since(script) ?? ''))],
+    ])
+    return makeCtx({ mode: 'real', clock, human: scriptedHuman(clock).human, browser: idleBrowser(), container, restartContainer: async () => log.begin() })
+  }
+
+  test('C, parked on a working row (b.f2b), connects 55 s after the summary: step 5 waits for it, so its start lines give no finding', async () => {
+    const r = await check28.run(rebootedRun(155))
+    expect((r.reason ?? '').split('; ').filter((x) => START_FINDING.test(x))).toEqual([])
+    expect(r.evidence).toContain(startSummary(START_SUMMARY_END))
+    expect(r.notes).toContain(`Check 28 summary: 3 persona(s): 2 resumed, 0 fresh-spawned, 0 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, 0 reconnected, 0 no-op, ${START_SUMMARY_END}`)
+  })
+
+  test('the control: C never connects, which is a finding', async () => {
+    const r = await check28.run(rebootedRun(null))
+    expect((r.reason ?? '').split('; ').filter((x) => START_FINDING.test(x))).toEqual(['no Session connected line for persona_c'])
+  })
+})
+
 describe('no live check passes against a silent workspace', () => {
   // A gesture that only undoes its setup passes when the setup never ran: nothing to restore.
   const UNDO_GESTURES = ['24-teardown']
@@ -1301,6 +1475,28 @@ describe('expected texts match the package', () => {
       configDirsChanged: false,
     }
     expect(appliedLine(c)).toBe(renderAppliedLogLine(plan, `${S}/config.json.last-applied`))
+  })
+
+  test("the start summary: the ending the checks expect, and Check 1's line, are the package's buckets in its order", () => {
+    const src = readFileSync(join(import.meta.dir, '..', 'src', 'session-manager.ts'), 'utf-8')
+    const at = src.indexOf('`[slack] startupSessionManager: complete — ')
+    expect(at).toBeGreaterThan(-1)
+    // The summary's template literals joined, each value rendered as 0.
+    const zero = src
+      .slice(at, src.indexOf('`,\n', at) + 1)
+      .replace(/`\s*\+\s*`/g, '')
+      .replace(/^`|`$/g, '')
+      .replace(/\$\{[^}]+\}/g, '0')
+    expect(zero.endsWith(`, ${START_SUMMARY_END}`)).toBe(true)
+    expect(COMPLETE_FIRST_START.replace(/\b3 /g, '0 ')).toBe(zero)
+  })
+
+  test("the plan quotes the same summary: every ending it gives has the not-reconnected bucket, and Check 1 quotes the line", () => {
+    const plan = readFileSync(join(import.meta.dir, '..', 'testplans', 'b.yko', 'b.yko.md'), 'utf-8')
+    const quoted = [...plan.matchAll(/`([^`]*\d+ failed, \d+ not brought up[^`]*)`/g)].map((m) => m[1]!)
+    expect(quoted.filter((x) => !/, \d+ not reconnected$/.test(x))).toEqual([])
+    expect(quoted).toContain(START_SUMMARY_END)
+    expect(quoted).toContain(COMPLETE_FIRST_START)
   })
 
   test('parsePending splits the pending file the package writes', () => {

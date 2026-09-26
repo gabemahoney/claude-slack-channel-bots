@@ -41,6 +41,7 @@ import {
   since,
   sinceGrep,
   sinceGrepE,
+  START_SUMMARY_END,
   tags,
   tmark,
   waitBringUp,
@@ -82,8 +83,10 @@ function replyOk(f: Findings, what: string, reply: { ts: string; reply: unknown 
 // Part 3
 // ---------------------------------------------------------------------------
 
-const COMPLETE_FIRST_START =
-  '[slack] startupSessionManager: complete — 3 persona(s): 0 resumed, 3 fresh-spawned, 0 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, 0 reconnected, 0 no-op, 0 failed, 0 not brought up'
+/** Check 1's summary line, every bucket as the package writes it (the plan quotes it literally). */
+export const COMPLETE_FIRST_START =
+  '[slack] startupSessionManager: complete — 3 persona(s): 0 resumed, 3 fresh-spawned, 0 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, 0 reconnected, 0 no-op, ' +
+  START_SUMMARY_END
 
 export const check1: CheckDef<CheckContext> = {
   id: '1',
@@ -117,7 +120,7 @@ export const check1: CheckDef<CheckContext> = {
       f.expect(connected, `no Session connected line with the cwd for ${n}`)
       if (connected) ctx.shared.broughtUp?.push(l)
     })
-    f.expect(has(COMPLETE_FIRST_START).length === 1, 'the complete line is not "0 resumed, 3 fresh-spawned, … 0 failed, 0 not brought up"')
+    f.expect(log.filter((l) => l.trimEnd().endsWith(COMPLETE_FIRST_START)).length === 1, `the complete line is not "0 resumed, 3 fresh-spawned, … ${START_SUMMARY_END}"`)
     f.expect(log.filter((l) => /\) not brought up:/.test(l)).length === 0, 'a persona was not brought up')
     f.expect(!(await fileExists(ctx, '"$S/config.json.pending"')) && !(await fileExists(ctx, '"$S/config.json.apply"')), 'config.json.pending or .apply exists')
     f.expect(await recorded(ctx), 'config.json and the record differ')

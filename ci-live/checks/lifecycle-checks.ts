@@ -11,7 +11,7 @@ import { describeError } from '../lib/errors.ts'
 import { personaEntryFor } from '../lib/live-config.ts'
 import { ROTATED_APP_TOKEN_NAME } from '../lib/personas.ts'
 import { describeScan } from '../lib/secrecy-scan.ts'
-import { waitFor, BRINGUP_TIMEOUT_MS, MINUTE, POLL_MS, SECOND } from '../lib/wait.ts'
+import { waitFor, MINUTE, POLL_MS, SECOND } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'
 import { Findings, pass, type CheckDef } from './framework.ts'
 import {
@@ -46,6 +46,7 @@ import {
   sinceGrepE,
   tags,
   tmark,
+  waitBringUp,
   waitLog,
   waitPending,
   waitPromptPost,
@@ -401,7 +402,9 @@ export const check28: CheckDef<CheckContext> = {
     f.expect(complete !== null, 'step 5: no start summary within 10 minutes of the reboot')
     const running = await run(ctx, 'kill -0 "$(cat "$S/server.pid")" && echo running')
     f.expect(running.out.includes('running'), 'step 5: the server is not running')
-    await waitLog(ctx, bmark, 'Session connected: persona "persona_b" (key=persona_b)', BRINGUP_TIMEOUT_MS)
+    // Each persona's Session connected line, not only B's: a persona parked on a `working` row (b.f2b)
+    // connects after the summary (about 60 s after, when the row is stale).
+    await waitBringUp(ctx, bmark, ['a', 'b', 'c'])
     const l5 = await since(ctx, bmark)
     f.expect(l5.some((l) => l.includes('[slack] Loaded persona config: 3 persona(s)')), 'step 5: no "Loaded persona config: 3 persona(s)" line')
     await checkStartLines(ctx, f, bmark, ['a', 'b', 'c'], true)

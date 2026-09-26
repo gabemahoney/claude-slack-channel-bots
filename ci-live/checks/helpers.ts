@@ -367,7 +367,20 @@ export function checkPreview(f: Findings, pending: Pending, expect: string[]): v
 
 export const START_FAILURE_RE = '\\) not brought up:|persona-(credentials|directory)-|persona-slack-unreachable'
 
-/** Wait for the start's summary line and a Session connected line per persona, since `m`. */
+/**
+ * How a clean start's `startupSessionManager: complete` line ends: no launch
+ * failed, every persona was brought up, and none was left running but not
+ * reconnected (the last bucket, added by b.f2b). Only this current ending is
+ * accepted: the start under test is always this package's.
+ */
+export const START_SUMMARY_END = '0 failed, 0 not brought up, 0 not reconnected'
+
+/**
+ * Wait for the start's summary line and a Session connected line per persona,
+ * since `m`. The summary alone is not enough: a persona whose launch waits on
+ * a `working` row is parked (b.f2b), left out of the summary's counts, and
+ * connects after it (about 60 s after, when the row is stale).
+ */
 export async function waitBringUp(ctx: CheckContext, m: string, letters: readonly PersonaLetter[], timeoutMs = BRINGUP_TIMEOUT_MS): Promise<boolean> {
   const ok = await waitFor(
     async () => {
@@ -398,7 +411,8 @@ export async function checkStartLines(ctx: CheckContext, f: Findings, m: string,
   f.expect(complete.length === 1, `expected one startupSessionManager complete line for ${letters.length} personas, found ${complete.length}`)
   if (complete[0]) {
     f.add(complete[0])
-    f.expect(complete[0].trimEnd().endsWith('0 failed, 0 not brought up'), 'the start summary does not end "0 failed, 0 not brought up"')
+    // The leading space keeps "10 failed, …" from passing as "0 failed, …".
+    f.expect(complete[0].trimEnd().endsWith(` ${START_SUMMARY_END}`), `the start summary does not end "${START_SUMMARY_END}"`)
   }
   const failures = all.filter((l) => new RegExp(START_FAILURE_RE).test(l))
   f.expect(failures.length === 0, `start failure lines: ${failures.slice(0, 3).join(' / ')}`)

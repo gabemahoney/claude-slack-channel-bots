@@ -762,7 +762,9 @@ the server. The container has no cron, so the runner stands in for both:
   token the last one left.
 
 After the restart, the runner allows up to 10 minutes for the start summary,
-then checks the plan's steps 5 to 8.
+then up to 6 more for each persona's `Session connected` line, since a
+persona whose launch waits on a `working` row connects after the summary.
+Then it checks the plan's steps 5 to 8.
 
 ### Outputs
 
