@@ -1845,9 +1845,13 @@ export async function main(): Promise<void> {
   // its tmux-unresponsive condition (built just below; no retry runs before
   // it exists). b.jg5 SRJ-308: every retry, one skipped for work in flight
   // included, is the condition's onset check with the health check off.
+  // b.jg5 SRJ-309: every stop of a persona's timer, whatever its reason (a
+  // teardown and shutdown included), cancels the condition's alert check
+  // not yet posted while it holds, since the alert says CSCB keeps retrying.
   const retryTimers = createUnavailableRetryController({
     log: (line) => console.error(line),
     onRetryFire: (key, firedAt) => tmuxUnresponsive.onsetAtRetry(key, firedAt),
+    onStopped: (key, reason) => tmuxUnresponsive.cancelAlert(key, reason),
     action: createFullModeRetryAction({
       retry: runRestartRetry,
       appliedPersona: getAppliedPersona,
@@ -1991,13 +1995,16 @@ export async function main(): Promise<void> {
     // than wait it out (up to 10 min).
     cancelLaunchWait: cancelWorkingRowWait,
     cancelRestartTimer,
-    // b.jg5 SRJ-309: with the retry timer stopped, "CSCB keeps retrying" is
-    // no longer true, so the key's tmux-unresponsive alert check is cancelled
-    // with it (at a destructive modify's submit too); its episode is
-    // forgotten at the teardown's turn.
+    // b.jg5 SRJ-309: the stop also cancels the key's tmux-unresponsive alert
+    // check (at a destructive modify's submit too), here as well as through
+    // the controller's stop observer: the observer runs only for a timer the
+    // stop really stopped, and a teardown silences the alert even with none
+    // armed (a failed first arm). The cancel is idempotent and logs only a
+    // check it really cancels, so one line at most. The episode is forgotten
+    // at the teardown's turn.
     stopRetryTimer: (key) => {
       retryTimers.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
-      tmuxUnresponsive.cancelAlert(key)
+      tmuxUnresponsive.cancelAlert(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
     },
     forgetFailures,
     forgetDisconnectedStreak,

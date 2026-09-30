@@ -32,7 +32,9 @@
  *   one. As in `main()`, the controller's per-fire observer (`onRetryFire`)
  *   is the condition's retry onset check (`tmuxUnresponsive.onsetAtRetry`),
  *   called at every fire, one whose retry is skipped included, before the
- *   action.
+ *   action; its stop observer (`onStopped`) is the condition's
+ *   `cancelAlert(key, reason)`, so every real stop of a persona's timer
+ *   cancels its pending alert check.
  * - The restart module is initialised over the configuration
  *   (`initRestart`) with the production adapters: the liveness read
  *   (`_buildIsSessionAliveAdapter` over the applied configuration), the
@@ -57,8 +59,9 @@
  *   (`episodes.close()`: every alert check cancelled, a later condition
  *   start answers `closed`); `teardown(key)` is the teardown's submit: it
  *   stops the persona's timer (`stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`)
- *   and cancels its alert check (`tmuxUnresponsive.cancelAlert(key)`), the
- *   condition kept; `remove(key)` drops the persona from the applied
+ *   and cancels its alert check (`tmuxUnresponsive.cancelAlert(key,
+ *   UNAVAILABLE_RETRY_STOP_TORN_DOWN)`, which logs nothing more when the
+ *   stop observer has already cancelled it), the condition kept; `remove(key)` drops the persona from the applied
  *   configuration.
  * - `stub`: one stub client (`makeStubClient`) with its call log
  *   (`stub.calls`), installed through `installStubSpawnPath` with the spawn
@@ -470,6 +473,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // As main() binds it: every fire, a skipped one included, is the
     // condition's onset check with the health check off.
     onRetryFire: (key, firedAt) => tmuxUnresponsive.onsetAtRetry(key, firedAt),
+    // As main() binds it: every real stop of a persona's timer cancels the
+    // condition's pending alert check, with the stop's reason.
+    onStopped: (key, reason) => tmuxUnresponsive.cancelAlert(key, reason),
     action: (key, attempt) => {
       attempts.push({ key, retry: attempt.retry, causes: attempt.causes, mode: attempt.mode, at: clock.now() })
       return current(key, attempt)
@@ -657,7 +663,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     teardown(key) {
       controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
-      tmuxUnresponsive.cancelAlert(key)
+      tmuxUnresponsive.cancelAlert(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
     },
 
     remove(key) {

@@ -74,6 +74,18 @@
  *   included, before the action runs (b.jg5 SRJ-308: the
  *   `tmux-unresponsive` onset with the health check off). It reads nothing
  *   back and changes nothing here.
+ * - The optional stop observer (`UnavailableRetryDeps.onStopped`) is called
+ *   once per real stop of a persona's timer, with the stop's reason, after
+ *   its stopped line: every `stop`, `stopAll` and `close`, a `stop` answer,
+ *   the condition-end rule's stop, and a timer forgotten because its re-arm
+ *   failed (`UNAVAILABLE_RETRY_STOP_RUN_FAILED`). A no-op call (nothing
+ *   armed), a first arm that failed (no timer ever ran) and a pending-only
+ *   stop that yielded to a full-mode cause are not stops. It runs before a
+ *   stop's hand-off (b.jg5 SRJ-309: the `tmux-unresponsive` alert check is
+ *   cancelled with the timer, since the alert says CSCB keeps retrying, and
+ *   armed again by a later refusal unless the reason is one of
+ *   `UNAVAILABLE_RETRY_TERMINAL_STOPS`). It reads nothing back and changes
+ *   nothing here.
  * - `view(key)`, `isArmed(key)` and `armedKeys()` are read-only queries;
  *   `whenRunSettled(key)` awaits the persona's in-flight run, with its re-arm
  *   or stop, and a stop's hand-off.
@@ -391,6 +403,23 @@ export const UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED = 'the tmux-unrespon
 /** The `tmux-unavailable` condition cleared. */
 export const UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED = 'the tmux-unavailable condition cleared'
 
+/** The stop observer's reason for a timer forgotten because the clock failed at its re-arm (the `retry run failed` line). */
+export const UNAVAILABLE_RETRY_STOP_RUN_FAILED = 'its retry run failed'
+
+/**
+ * The terminal stop reasons (b.jg5 SRJ-309): the persona is going away or the
+ * server is, so no later refusal may bring its retrying back. The
+ * `tmux-unresponsive` condition's `cancelAlert` (`src/persona-episodes.ts`)
+ * never arms the alert check again after a stop for one of these. Every other
+ * stop reason (the cap, not up, a pending-only row read, a failed run, ...)
+ * leaves a later refusal free to arm the timer, and the check, again.
+ */
+export const UNAVAILABLE_RETRY_TERMINAL_STOPS: ReadonlySet<string> = new Set([
+  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
+  UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
+  UNAVAILABLE_RETRY_STOP_SHUTDOWN,
+])
+
 /** A cause kind that is not a short lower-case label is logged as this. */
 const UNNAMED_CAUSE_KIND = 'unnamed'
 
@@ -513,6 +542,16 @@ export interface UnavailableRetryDeps {
    * A throw is swallowed. Absent: nothing is called.
    */
   onRetryFire?: (key: string, firedAt: number) => unknown
+  /**
+   * b.jg5 SRJ-309: called once per real stop of a persona's timer, with the
+   * stop's reason (the stopped line's, or `UNAVAILABLE_RETRY_STOP_RUN_FAILED`
+   * for a timer forgotten because its re-arm failed), after the stopped line
+   * and before any hand-off (production: the `tmux-unresponsive` condition's
+   * `cancelAlert`). Not called for a no-op stop, a first arm that failed or
+   * a pending-only stop that yielded to a full-mode cause. A throw is
+   * swallowed. Absent: nothing is called.
+   */
+  onStopped?: (key: string, reason: string) => unknown
 }
 
 /** A read-only view of one persona's timer. */
@@ -711,14 +750,24 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     entry.dueAt = dueAt
   }
 
-  /** Forget `entry` if it is still current, clearing any timer it holds. Never throws. */
-  function forget(entry: RetryEntry): void {
-    if (!isCurrent(entry)) return
+  /** Forget `entry` if it is still current, clearing any timer it holds. Answers whether it was. Never throws. */
+  function forget(entry: RetryEntry): boolean {
+    if (!isCurrent(entry)) return false
     entries.delete(entry.key)
     try {
       clearTimer(entry)
     } catch {
       /* the entry is gone, so a timer the clock failed to clear fires into a no-op */
+    }
+    return true
+  }
+
+  /** Tell the stop observer of a real stop of persona `key`'s timer. Never throws. */
+  function stopped(key: string, reason: string): void {
+    try {
+      deps.onStopped?.(key, reason)
+    } catch {
+      /* an observer must not change what a stop does */
     }
   }
 
@@ -744,8 +793,9 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     const run = (prior ?? Promise.resolve())
       .then(() => runRetry(entry))
       .catch((err) => {
-        forget(entry)
+        const wasCurrent = forget(entry)
         log(`[slack] unavailable-retry: persona=${entry.key} retry run failed: ${describeThrownValue(err)}`)
+        if (wasCurrent) stopped(entry.key, UNAVAILABLE_RETRY_STOP_RUN_FAILED)
       })
     runs.set(entry.key, run)
     void run.then(() => {
@@ -902,7 +952,10 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     }
   }
 
-  /** Stop `entry`, logging one stopped line naming a pending-only mode and the row read, when given. */
+  /**
+   * Stop `entry`, logging one stopped line naming a pending-only mode and the
+   * row read, when given, then telling the stop observer.
+   */
   function stopEntry(entry: RetryEntry, reason: string, row?: string): void {
     clearTimer(entry)
     entries.delete(entry.key)
@@ -911,6 +964,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     if (row !== undefined) tags.push(`row ${row}`)
     const tagged = tags.length > 0 ? ` (${tags.join(', ')})` : ''
     log(`[slack] unavailable-retry: persona=${entry.key} stopped${tagged} — ${reason}`)
+    stopped(entry.key, reason)
   }
 
   /**

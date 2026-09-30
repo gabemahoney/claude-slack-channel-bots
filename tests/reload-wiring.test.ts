@@ -568,7 +568,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     const stopRetry = (props.get('stopRetryTimer') ?? '').match(
       new RegExp(
         `^\\(?(\\w+)\\)? => \\{ ${retryTimers}\\.stop\\((\\w+), UNAVAILABLE_RETRY_STOP_TORN_DOWN\\);? ` +
-          `${condition}\\.cancelAlert\\((\\w+)\\);? \\}$`,
+          `${condition}\\.cancelAlert\\((\\w+), UNAVAILABLE_RETRY_STOP_TORN_DOWN\\);? \\}$`,
       ),
     )
     expect(stopRetry).not.toBeNull()

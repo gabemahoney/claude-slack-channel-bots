@@ -51,7 +51,9 @@
  * - `start(key, verb, error)` starts the condition (opens the episode, the
  *   first refusal's time from the episodes' clock, one started line, and
  *   the alert check armed) or continues it (the first refusal's time kept,
- *   no line). After the episodes' `close` it does nothing. Its only caller
+ *   no line, and the alert check armed again when a retry-timer stop
+ *   cancelled it; see the alert below). After the episodes' `close` it does
+ *   nothing. Its only caller
  *   is the outage state's reporting point (`src/outage-state.ts`), for a
  *   tmux-touching call's UNAVAILABLE inside a launch or recovery attempt for
  *   the persona; it never throws there.
@@ -66,26 +68,39 @@
  *   skipped for work in flight included), posts it while the health check
  *   is off, at the first fire `TMUX_UNRESPONSIVE_ONSET_FLOOR_MS` or more
  *   after the first refusal. The mode is read from the injected accessor
- *   (the configuration in effect) at each check.
+ *   (the configuration in effect) at each check. Once the episode's alert
+ *   has posted, neither posts the onset in it (one `onset not posted` line
+ *   per episode instead): the alert has said more.
  * - The alert (SRJ-309): one check per episode, armed at the first refusal
  *   on the episodes' clock with the never-early wait (`armNeverEarlyWait`,
  *   `src/ad-settings.ts`) over the injected threshold accessor (the
  *   threshold in effect, read at every fire). It posts once the condition
  *   has lasted strictly longer than the threshold in effect, the minutes
  *   rendered by `wholeMinutes`. It needs no onset. The episode's end, a new
- *   episode, `forget`, `forgetAll`, `close` and `cancelAlert(key)` (a
- *   teardown's submit, once the retry timer is stopped) cancel it; a check
- *   armed for an earlier episode never posts in a later one (the episode
- *   number of `view`).
+ *   episode, `forget`, `forgetAll` and `close` cancel it; a check armed for
+ *   an earlier episode never posts in a later one (the episode number of
+ *   `view`). Its text says CSCB keeps retrying, so it runs only while the
+ *   persona's retry timer does: `cancelAlert(key, stopReason)`, bound in
+ *   `main()` to every stop of the retry timer
+ *   (`UnavailableRetryDeps.onStopped`, `src/unavailable-retry.ts`), cancels
+ *   a check not yet posted while the condition holds, with one line naming
+ *   the stop's reason (an alert already posted stays posted). A later
+ *   refusal in the same episode, which arms the timer again at the reporting
+ *   point before it continues the condition, arms the check again from the
+ *   episode's first refusal (one line), so it posts at once when the
+ *   condition has already lasted longer than the threshold. A stop for a
+ *   terminal reason (`UNAVAILABLE_RETRY_TERMINAL_STOPS`: torn down, not in
+ *   the applied configuration, server shutdown) never arms it again.
  * - `end(key, reason, reading?, options?)` ends a holding condition once:
- *   the recovery (SRJ-310) is posted when the episode's onset was, unless
- *   `options.silent` (a CONFLICT answer ends it; its notice follows); the
- *   episode ends, which cancels the alert check; one ended line names the
- *   reason; and the injected condition-end hook is called once with the
+ *   the recovery (SRJ-310) is posted when the episode's onset or alert was,
+ *   unless `options.silent` (a CONFLICT answer ends it; its notice follows);
+ *   the episode ends, which cancels the alert check; one ended line names
+ *   the reason; and the injected condition-end hook is called once with the
  *   reading the end brings (a tick's or a retry's live reading; `pending`
  *   for a successful `spawn` or `resume`; none for any other tmux-touching
- *   success or GONE). It answers whether the episode's onset had been
- *   posted. On a persona that does not hold it, it does nothing.
+ *   success or GONE). It answers whether either notice had been posted
+ *   (`ended-after-notice`). On a persona that does not hold it, it does
+ *   nothing.
  * - The episodes' `forget(key)` (a teardown), `forgetAll()` and `close()`
  *   drop a holding condition silently, with no post, no line and no hook
  *   call.
@@ -98,7 +113,10 @@
  *
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive started — <verb> failed: <describeAgentDirectorFailure(error)>
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive onset posted — still not answering at <a health tick|a retry>, <s> s after its first refusal
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive onset not posted — its alert already posted
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive alert posted — not answering for <s> s, over its alert threshold of <s> s
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive alert check cancelled — its retry timer stopped: <stop reason>
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive alert check armed again — a new refusal armed its retry timer again
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive ended — <reason text>
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive recovery posted
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive recovery not posted — a silent end (a CONFLICT answer ended it)
@@ -136,6 +154,7 @@ import { armNeverEarlyWait, wholeMinutes } from './ad-settings.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 import { personaTmuxSessionName } from './persona-identity.ts'
+import { UNAVAILABLE_RETRY_TERMINAL_STOPS } from './unavailable-retry.ts'
 
 // ---------------------------------------------------------------------------
 // Kinds (b.jg5 SRJ-1016)
@@ -522,15 +541,16 @@ export const TMUX_UNRESPONSIVE_END_TEXT: Readonly<Record<TmuxUnresponsiveEndReas
 export type TmuxUnresponsiveStartResult = 'started' | 'continued' | 'closed'
 
 /**
- * What `end` did: nothing (`not-holding`), or ended a holding condition whose
- * onset had not been posted (`ended`) or had been (`ended-after-onset`).
+ * What `end` did: nothing (`not-holding`), or ended a holding condition in
+ * whose episode neither the onset nor the alert had been posted (`ended`),
+ * or one of them had (`ended-after-notice`).
  */
-export type TmuxUnresponsiveEndResult = 'not-holding' | 'ended' | 'ended-after-onset'
+export type TmuxUnresponsiveEndResult = 'not-holding' | 'ended' | 'ended-after-notice'
 
 /** Options of an end. */
 export interface TmuxUnresponsiveEndOptions {
   /**
-   * End without the recovery notice even when the onset was posted: the
+   * End without the recovery notice even when the onset or the alert was posted: the
    * answer that ends it is CONFLICT, whose notice follows (b.jg5 SRJ-310).
    */
   silent?: boolean
@@ -585,7 +605,8 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
   /**
    * Start persona `key`'s condition for a refusal `error` from `verb` (one
    * started line; the first refusal's time from the clock), or continue it
-   * while it holds (its first refusal's time kept, no line).
+   * while it holds (its first refusal's time kept, no line; an alert check a
+   * retry-timer stop cancelled in the episode is armed again, with one line).
    */
   start(key: string, verb: AdVerb, error: unknown): TmuxUnresponsiveStartResult
   /** Whether persona `key`'s condition holds. */
@@ -594,11 +615,11 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
   firstRefusalAt(key: string): number | undefined
   /**
    * End persona `key`'s condition for `reason`: when it holds, post the
-   * recovery notice once if the onset was posted (none with
+   * recovery notice once if the onset or the alert was posted (none with
    * `options.silent`), end its episode (which cancels its alert check), log
    * one ended line and call the condition-end hook once with `reading`, and
-   * answer whether the onset had been posted; when it does not hold, answer
-   * `not-holding` and do nothing else.
+   * answer whether either notice had been posted; when it does not hold,
+   * answer `not-holding` and do nothing else.
    */
   end(
     key: string,
@@ -611,8 +632,9 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
    * tick's per-persona work (b.jg5 SRJ-308): with the health check on, post
    * the onset once per episode for every persona whose condition still holds
    * and whose first refusal is strictly before `tickStartedAt` (the tick's
-   * start, in the episodes' clock milliseconds). A condition the tick ended
-   * no longer holds, so gets none. No agent-director call; never throws.
+   * start, in the episodes' clock milliseconds), unless the episode's alert
+   * has posted. A condition the tick ended no longer holds, so gets none. No
+   * agent-director call; never throws.
    */
   onsetAtTick(tickStartedAt: number): void
   /**
@@ -620,15 +642,23 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
    * fire whose retry is skipped for work in flight included (b.jg5 SRJ-308,
    * SRJ-303): with the health check off, post the onset once per episode
    * when the condition holds and `firedAt` is at least
-   * `TMUX_UNRESPONSIVE_ONSET_FLOOR_MS` after its first refusal. Never throws.
+   * `TMUX_UNRESPONSIVE_ONSET_FLOOR_MS` after its first refusal, unless the
+   * episode's alert has posted. Never throws.
    */
   onsetAtRetry(key: string, firedAt: number): void
   /**
-   * Cancel persona `key`'s pending alert check silently, the condition kept
-   * (a teardown's submit, once its retry timer is stopped). Answers whether
-   * one was pending.
+   * Cancel persona `key`'s pending alert check, the condition kept: a stop
+   * of its retry timer, for `stopReason` (production binds it to the retry
+   * controller's `onStopped`, so every stop reason cancels it). Only a check
+   * not yet posted in the episode open now is cancelled; an alert already
+   * posted stays posted. When one is cancelled, one line names `stopReason`
+   * (none when it is absent), and the episode's next refusal arms the check
+   * again (`start`) unless `stopReason` is terminal
+   * (`UNAVAILABLE_RETRY_TERMINAL_STOPS`: torn down, not in the applied
+   * configuration, server shutdown), which never re-arms it. Answers whether one was pending; with no condition
+   * holding (its end has already cancelled the check), false and no line.
    */
-  cancelAlert(key: string): boolean
+  cancelAlert(key: string, stopReason?: string): boolean
 }
 
 /**
@@ -640,6 +670,14 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
   const { episodes } = deps
   /** Each persona's pending alert check: the episode it was armed for and its cancel. */
   const alerts = new Map<string, { episode: number; cancel: () => void }>()
+  /**
+   * The episode whose pending alert check `cancelAlert` cancelled with the
+   * condition kept (a non-terminal stop of the persona's retry timer): the
+   * next refusal in that episode arms it again (`start`).
+   */
+  const rearmable = new Map<string, number>()
+  /** The episode whose onset was held back because its alert had posted: logged once per episode. */
+  const onsetHeld = new Map<string, number>()
 
   function line(key: string, text: string): void {
     safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} ${text}`)
@@ -656,7 +694,8 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
     }
   }
 
-  function cancelAlert(key: string, episode?: number): boolean {
+  /** Cancel the persona's pending alert check (only the one armed for `episode`, when given). Answers whether one was pending. */
+  function cancelPendingAlert(key: string, episode?: number): boolean {
     const pending = alerts.get(key)
     if (pending === undefined || (episode !== undefined && pending.episode !== episode)) return false
     alerts.delete(key)
@@ -664,25 +703,51 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
     return true
   }
 
+  /** Drop the per-episode marks of the persona's `episode` once it closes. */
+  function dropMarks(key: string, episode: number): void {
+    if (rearmable.get(key) === episode) rearmable.delete(key)
+    if (onsetHeld.get(key) === episode) onsetHeld.delete(key)
+  }
+
+  /**
+   * A refusal that continues a holding condition (b.jg5 SRJ-309): when a stop
+   * of the persona's retry timer cancelled the episode's pending alert check
+   * (`cancelAlert`), and the refusal's reporting point has just armed the
+   * timer again (`reportAgentDirectorError` arms before it starts or
+   * continues the condition), arm the check again from the episode's first
+   * refusal, so the alert posts once the condition has lasted longer than
+   * the threshold while CSCB is retrying again. Never throws.
+   */
+  function rearmAlert(key: string): void {
+    const current = episodes.view(key, kind)
+    if (current === undefined || rearmable.get(key) !== current.episode) return
+    rearmable.delete(key)
+    if (alerts.has(key) || current.posted.includes(ALERT_MARK)) return
+    if (armAlert(key)) line(key, 'alert check armed again — a new refusal armed its retry timer again')
+  }
+
   /**
    * Arm the alert check for the persona's episode just begun (b.jg5 SRJ-309):
    * on the episodes' clock, from the first refusal, until the condition has
    * lasted strictly longer than the threshold in effect (the never-early wait
-   * of the threshold plus 1 ms, read at every fire). Never throws: a failed
-   * arm is logged, and the condition holds with no alert check.
+   * of the threshold plus 1 ms, read at every fire). Answers whether it was
+   * armed. Never throws: a failed arm is logged, and the condition holds
+   * with no alert check.
    */
-  function armAlert(key: string): void {
+  function armAlert(key: string): boolean {
     const threshold = deps.alertThresholdMs
-    if (threshold === undefined) return
+    if (threshold === undefined) return false
     try {
       const opened = episodes.view(key, kind)
-      if (opened === undefined) return
+      if (opened === undefined) return false
       const { episode, startedAt } = opened
       const cancel = armNeverEarlyWait(episodes.clock, startedAt, () => threshold() + 1, () => fireAlert(key, episode))
       alerts.set(key, { episode, cancel })
-      episodes.whenClosed(key, kind, () => cancelAlert(key, episode))
+      episodes.whenClosed(key, kind, () => cancelPendingAlert(key, episode))
+      return true
     } catch (err) {
       line(key, `alert check not armed: ${describeThrownValue(err)}`)
+      return false
     }
   }
 
@@ -705,19 +770,34 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
     }
   }
 
-  /** Post the onset once in the persona's open episode; log it when posted. */
+  /**
+   * Post the onset once in the persona's open episode; log it when posted.
+   * Once the episode's alert has posted, the onset is not posted in it (the
+   * alert already said more), and one line per episode says so.
+   */
   function postOnset(key: string, where: string, now: number): void {
-    const startedAt = episodes.view(key, kind)?.startedAt
-    if (startedAt === undefined) return
+    const current = episodes.view(key, kind)
+    if (current === undefined || current.posted.includes(ONSET_MARK)) return
+    if (current.posted.includes(ALERT_MARK)) {
+      if (onsetHeld.get(key) === current.episode) return
+      onsetHeld.set(key, current.episode)
+      line(key, 'onset not posted — its alert already posted')
+      return
+    }
     if (!episodes.post(key, kind, tmuxUnresponsiveOnsetText(key), ONSET_MARK)) return
-    line(key, `onset posted — still not answering at ${where}, ${seconds(now - startedAt)} s after its first refusal`)
+    line(key, `onset posted — still not answering at ${where}, ${seconds(now - current.startedAt)} s after its first refusal`)
   }
 
   return {
     start(key, verb, error) {
-      if (episodes.isOpen(key, kind)) return 'continued'
+      if (episodes.isOpen(key, kind)) {
+        rearmAlert(key)
+        return 'continued'
+      }
       if (episodes.begin(key, kind) === 'closed') return 'closed'
       line(key, `started — ${verb} failed: ${describeAgentDirectorFailure(error)}`)
+      const episode = episodes.view(key, kind)?.episode
+      if (episode !== undefined) episodes.whenClosed(key, kind, () => dropMarks(key, episode))
       armAlert(key)
       return 'started'
     },
@@ -728,19 +808,21 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
 
     end(key, reason, reading, options) {
       if (!episodes.isOpen(key, kind)) return 'not-holding'
-      const onsetPosted = episodes.hasPosted(key, kind, ONSET_MARK)
+      // The recovery follows either notice: the onset, or the alert (which
+      // holds the onset back once it has posted).
+      const noticePosted = episodes.hasPosted(key, kind, ONSET_MARK) || episodes.hasPosted(key, kind, ALERT_MARK)
       const silent = options?.silent === true
-      const recovered = onsetPosted && !silent && episodes.post(key, kind, tmuxUnresponsiveRecoveryText(key), RECOVERY_MARK)
+      const recovered = noticePosted && !silent && episodes.post(key, kind, tmuxUnresponsiveRecoveryText(key), RECOVERY_MARK)
       episodes.end(key, kind)
       line(key, `ended — ${endText(reason)}`)
       if (recovered) line(key, 'recovery posted')
-      else if (onsetPosted && silent) line(key, 'recovery not posted — a silent end (a CONFLICT answer ended it)')
+      else if (noticePosted && silent) line(key, 'recovery not posted — a silent end (a CONFLICT answer ended it)')
       try {
         deps.conditionEnded?.(key, reading)
       } catch {
         /* a failing hook must not change how the condition ended */
       }
-      return onsetPosted ? 'ended-after-onset' : 'ended'
+      return noticePosted ? 'ended-after-notice' : 'ended'
     },
 
     onsetAtTick(tickStartedAt) {
@@ -767,9 +849,17 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
       }
     },
 
-    cancelAlert: (key) => {
+    cancelAlert: (key, stopReason) => {
       try {
-        return cancelAlert(key)
+        // Only the check armed for the episode open now: the condition holds.
+        const episode = episodes.view(key, kind)?.episode
+        if (episode === undefined || !cancelPendingAlert(key, episode)) return false
+        // A terminal stop (torn down, removed, shutdown) never re-arms: a
+        // refusal landing after it (a launch still in flight) must not bring
+        // the alert back for a persona that is going away.
+        if (stopReason === undefined || !UNAVAILABLE_RETRY_TERMINAL_STOPS.has(stopReason)) rearmable.set(key, episode)
+        if (stopReason !== undefined) line(key, `alert check cancelled — its retry timer stopped: ${stopReason}`)
+        return true
       } catch (err) {
         line(key, `alert check cancel failed: ${describeThrownValue(err)}`)
         return false

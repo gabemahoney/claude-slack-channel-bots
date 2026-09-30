@@ -15,10 +15,19 @@
  * the other.
  *
  * The `tmux-unresponsive` condition's own rules, direct over
- * `createTmuxUnresponsiveCondition`: `continued` and `ended-after-onset`, the
+ * `createTmuxUnresponsiveCondition`: `continued` and `ended-after-notice`, the
  * ended line's text per reason (an unknown reason pinned once), a throwing
  * log or condition-end hook swallowed, and `forget`/`forgetAll` dropping a
- * holding condition without calling the hook. Each failure-only line is
+ * holding condition without calling the hook. Its alert check: `cancelAlert`
+ * for a non-terminal stop cancels a pending check (one line, true; a second
+ * call false and silent), and the episode's next `continued` start arms it
+ * again from the first refusal (posting at the next clock turn once the
+ * threshold has passed); a stop in `UNAVAILABLE_RETRY_TERMINAL_STOPS` never
+ * re-arms; a cancel after the alert posted, or with no episode open, cancels
+ * nothing; a closed episode's re-arm mark does not reach the next one. Once
+ * the alert has posted, neither onset check posts the onset (one line per
+ * episode), and `end` answers `ended-after-notice`, posting the recovery
+ * unless silent. Each failure-only line is
  * reached through an injected dep and throws nothing out of its entry: a NaN
  * threshold (`alert check not armed`, the start still succeeding), an alert
  * fire whose post or threshold read throws (`alert check failed`), a clock
@@ -58,7 +67,9 @@ import {
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
+  tmuxUnresponsiveAlertText,
   tmuxUnresponsiveOnsetText,
+  tmuxUnresponsiveRecoveryText,
   type PersonaEpisodeKind,
   type PersonaEpisodeSink,
   type PersonaEpisodesClock,
@@ -73,6 +84,7 @@ import {
   setSessionNotifier,
   type NotConnectedNotice,
 } from '../src/session-manager.ts'
+import { UNAVAILABLE_RETRY_STOP_RUN_FAILED, UNAVAILABLE_RETRY_TERMINAL_STOPS } from '../src/unavailable-retry.ts'
 import { errTmuxUnresponsive } from './test-helpers/agent-director-stub.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
@@ -663,7 +675,14 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
     return `[slack] persona-episodes: persona=${key} ${KIND} ended — ${text}`
   }
 
-  test('start answers started, then continued with the first refusal\'s time kept; end answers ended-after-onset once the onset was posted', async () => {
+  const THRESHOLD_MS = adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
+
+  /** `persona=<key> tmux-unresponsive <text>`: a per-persona condition line. */
+  function personaLine(key: string, text: string): string {
+    return `[slack] persona-episodes: persona=${key} ${KIND} ${text}`
+  }
+
+  test('start answers started, then continued with the first refusal\'s time kept; end answers ended-after-notice once the onset was posted', async () => {
     const condition = buildCondition()
     const err = errTmuxUnresponsive(VERB)
 
@@ -674,7 +693,7 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
     expect(lines).toEqual([startedLine('K', err)])
 
     expect(episodes.post('K', KIND, textOf(KIND, 1))).toBe(true)
-    expect(condition.end('K', TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)).toBe('ended-after-onset')
+    expect(condition.end('K', TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)).toBe('ended-after-notice')
 
     expect(condition.holds('K')).toBe(false)
     expect(hookCalls).toEqual([{ key: 'K', reading: LIVENESS_LIVE }])
@@ -754,18 +773,257 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
   })
 
   // -------------------------------------------------------------------------
+  // The alert check: cancel on a retry-timer stop, re-arm, onset suppression
+  // and the recovery after the alert (b.jg5 SRJ-308, SRJ-309, SRJ-310).
+  // -------------------------------------------------------------------------
+
+  describe('the alert check: cancel, re-arm and what follows the alert', () => {
+    /** The non-terminal stop reason these cases cancel with. */
+    const NON_TERMINAL = UNAVAILABLE_RETRY_STOP_RUN_FAILED
+    const terminalStops = [...UNAVAILABLE_RETRY_TERMINAL_STOPS].map((reason) => [reason] as const)
+
+    function cancelledLine(key: string, reason: string): string {
+      return personaLine(key, `alert check cancelled — its retry timer stopped: ${reason}`)
+    }
+
+    function armedAgainLine(key: string): string {
+      return personaLine(key, 'alert check armed again — a new refusal armed its retry timer again')
+    }
+
+    function onsetHeldLine(key: string): string {
+      return personaLine(key, 'onset not posted — its alert already posted')
+    }
+
+    const alertPost = (key: string): Post => ({ key, text: tmuxUnresponsiveAlertText(key, THRESHOLD_MS) })
+    const recoveryPost = (key: string): Post => ({ key, text: tmuxUnresponsiveRecoveryText(key) })
+    const onsetPost = (key: string): Post => ({ key, text: tmuxUnresponsiveOnsetText(key) })
+
+    /** A condition with the alert check on, at agent-director's default threshold. */
+    function alerting(opts: { healthCheckOn?: () => boolean } = {}): TmuxUnresponsiveCondition {
+      return buildCondition({ alertThresholdMs: () => THRESHOLD_MS, ...opts })
+    }
+
+    /** Start `key`'s condition and move the clock past the threshold, so its alert posts. */
+    async function startUntilAlert(condition: TmuxUnresponsiveCondition, key = 'K'): Promise<void> {
+      expect(condition.start(key, VERB, errTmuxUnresponsive(VERB))).toBe('started')
+      await clock.advance(THRESHOLD_MS + 1)
+      expect(posts).toContainEqual(alertPost(key))
+    }
+
+    test('a non-terminal stop cancels the pending check: one line naming the reason, true; a second cancel answers false and logs nothing; nothing posts past the threshold', async () => {
+      const condition = alerting()
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      await clock.advance(1_000)
+      expect(clock.pendingCount()).toBe(1)
+      const before = lines.length
+
+      expect(condition.cancelAlert('K', NON_TERMINAL)).toBe(true)
+
+      expect(clock.pendingCount()).toBe(0)
+      expect(lines.slice(before)).toEqual([cancelledLine('K', NON_TERMINAL)])
+      expect(condition.cancelAlert('K', NON_TERMINAL)).toBe(false)
+      expect(lines.slice(before)).toHaveLength(1)
+
+      await clock.advance(THRESHOLD_MS * 2)
+      expect(posts).toEqual([])
+      expect(condition.holds('K')).toBe(true)
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended')
+    })
+
+    test('after the cancel, a continued start arms the check again from the first refusal, with one line; the alert posts once the threshold has passed since it', async () => {
+      const condition = alerting()
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      await clock.advance(1_000)
+      condition.cancelAlert('K', NON_TERMINAL)
+      await clock.advance(1_000)
+      const before = lines.length
+
+      expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('continued')
+
+      expect(lines.slice(before)).toEqual([armedAgainLine('K')])
+      expect(clock.pending().map((t) => t.dueAt)).toEqual([START_MS + THRESHOLD_MS + 1])
+      // A further refusal in the episode arms nothing more.
+      expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('continued')
+      expect(lines.slice(before)).toHaveLength(1)
+      expect(clock.pendingCount()).toBe(1)
+
+      await clock.advanceTo(START_MS + THRESHOLD_MS)
+      expect(posts).toEqual([])
+      await clock.advance(1)
+      expect(posts).toEqual([alertPost('K')])
+      expect(lines.at(-1)).toStartWith(personaLine('K', 'alert posted — '))
+
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended-after-notice')
+    })
+
+    test('a check armed again after the threshold has already passed since the first refusal posts at the next clock turn', async () => {
+      const condition = alerting()
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      await clock.advance(1_000)
+      condition.cancelAlert('K', NON_TERMINAL)
+      await clock.advanceTo(START_MS + THRESHOLD_MS * 2)
+      expect(posts).toEqual([])
+
+      expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('continued')
+
+      expect(lines.at(-1)).toBe(armedAgainLine('K'))
+      expect(clock.pendingCount()).toBe(1)
+      await clock.advance(1)
+      expect(posts).toEqual([alertPost('K')])
+      expect(clock.pendingCount()).toBe(0)
+
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended-after-notice')
+    })
+
+    test('a cancel with no stop reason cancels the check and logs nothing; the next refusal still arms it again', () => {
+      const condition = alerting()
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      const before = lines.length
+
+      expect(condition.cancelAlert('K')).toBe(true)
+      expect(lines.slice(before)).toEqual([])
+      expect(clock.pendingCount()).toBe(0)
+
+      expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('continued')
+      expect(lines.slice(before)).toEqual([armedAgainLine('K')])
+      expect(clock.pendingCount()).toBe(1)
+
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+    })
+
+    test.each(terminalStops)('a terminal stop (%s) cancels the check, and a later continued start never arms it again', async (reason) => {
+      const condition = alerting()
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+
+      expect(condition.cancelAlert('K', reason)).toBe(true)
+      expect(lines.at(-1)).toBe(cancelledLine('K', reason))
+      const before = lines.length
+
+      expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('continued')
+
+      expect(lines.slice(before)).toEqual([])
+      expect(clock.pendingCount()).toBe(0)
+      await clock.advance(THRESHOLD_MS * 2)
+      expect(posts).toEqual([])
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended')
+    })
+
+    test('a cancel after the alert has posted cancels nothing: false, no line, the alert stays posted, and a later refusal arms nothing', async () => {
+      const condition = alerting()
+      await startUntilAlert(condition)
+      const before = lines.length
+
+      expect(condition.cancelAlert('K', NON_TERMINAL)).toBe(false)
+      expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('continued')
+
+      expect(lines.slice(before)).toEqual([])
+      expect(clock.pendingCount()).toBe(0)
+      expect(posts).toEqual([alertPost('K')])
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended-after-notice')
+      expect(posts).toEqual([alertPost('K'), recoveryPost('K')])
+    })
+
+    test('a cancel with no episode open answers false and logs nothing, before a start and after an end alike; another persona\'s check is untouched', () => {
+      const condition = alerting()
+
+      expect(condition.cancelAlert('K', NON_TERMINAL)).toBe(false)
+      condition.start('Q', VERB, errTmuxUnresponsive(VERB))
+      expect(condition.cancelAlert('K', NON_TERMINAL)).toBe(false)
+      expect(clock.pendingCount()).toBe(1)
+
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+      const before = lines.length
+      expect(condition.cancelAlert('K', NON_TERMINAL)).toBe(false)
+      expect(lines.slice(before)).toEqual([])
+      expect(clock.pendingCount()).toBe(1)
+
+      condition.end('Q', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+      expect(lines.some((l) => l.includes('alert check cancelled'))).toBe(false)
+    })
+
+    test.each<[string, (c: TmuxUnresponsiveCondition) => void]>([
+      ['end', (c) => void c.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)],
+      ['forget(key)', () => episodes.forget('K')],
+    ])('the re-arm mark is cleared when the episode closes (%s): a new episode arms normally, and its refusals arm no second check', async (_how, close) => {
+      const condition = alerting()
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      condition.cancelAlert('K', NON_TERMINAL)
+      close(condition)
+      expect(condition.holds('K')).toBe(false)
+      await clock.advance(1_000)
+      const before = lines.length
+
+      expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('started')
+      expect(clock.pending().map((t) => t.dueAt)).toEqual([clock.now() + THRESHOLD_MS + 1])
+      expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('continued')
+
+      expect(lines.slice(before).filter((l) => l === armedAgainLine('K'))).toEqual([])
+      expect(clock.pendingCount()).toBe(1)
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+    })
+
+    test.each<[string, boolean, (c: TmuxUnresponsiveCondition, key: string) => void]>([
+      ['a health tick', true, (c) => c.onsetAtTick(clock.now())],
+      ['a retry', false, (c, key) => c.onsetAtRetry(key, clock.now())],
+    ])('after the alert posts, the onset check at %s posts no onset and logs one line per episode', async (_where, healthOn, check) => {
+      const condition = alerting({ healthCheckOn: () => healthOn })
+      await startUntilAlert(condition)
+      const before = lines.length
+
+      check(condition, 'K')
+      check(condition, 'K')
+
+      expect(posts).toEqual([alertPost('K')])
+      expect(lines.slice(before)).toEqual([onsetHeldLine('K')])
+
+      // A new episode whose alert posts logs the line once again.
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+      posts = []
+      await startUntilAlert(condition)
+      const again = lines.length
+      check(condition, 'K')
+      check(condition, 'K')
+      expect(posts).toEqual([alertPost('K')])
+      expect(lines.slice(again)).toEqual([onsetHeldLine('K')])
+      expect(posts).not.toContainEqual(onsetPost('K'))
+
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+    })
+
+    test('an end after the alert alone answers ended-after-notice and posts the recovery, logging it after the ended line', async () => {
+      const condition = alerting()
+      await startUntilAlert(condition)
+
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)).toBe('ended-after-notice')
+
+      expect(posts).toEqual([alertPost('K'), recoveryPost('K')])
+      expect(lines.slice(-2)).toEqual([
+        endedLine('K', TMUX_UNRESPONSIVE_END_TEXT[TMUX_UNRESPONSIVE_END_TICK]),
+        personaLine('K', 'recovery posted'),
+      ])
+      expect(hookCalls).toEqual([{ key: 'K', reading: LIVENESS_LIVE }])
+    })
+
+    test('a silent end after the alert answers ended-after-notice and posts nothing', async () => {
+      const condition = alerting()
+      await startUntilAlert(condition)
+
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB, undefined, { silent: true })).toBe('ended-after-notice')
+
+      expect(posts).toEqual([alertPost('K')])
+      expect(lines.at(-1)).toBe(personaLine('K', 'recovery not posted — a silent end (a CONFLICT answer ended it)'))
+      expect(condition.holds('K')).toBe(false)
+      expect(hookCalls).toEqual([{ key: 'K', reading: undefined }])
+    })
+  })
+
+  // -------------------------------------------------------------------------
   // The failure-only lines: each failure is logged and never throws out of
   // the entry that met it.
   // -------------------------------------------------------------------------
 
   describe('failure-only lines', () => {
-    const THRESHOLD_MS = adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
-
-    /** `persona=<key> tmux-unresponsive <text>`: the prefix of a per-persona failure line. */
-    function personaLine(key: string, text: string): string {
-      return `[slack] persona-episodes: persona=${key} ${KIND} ${text}`
-    }
-
     /** `episodes` with one member replaced, every other member the real one. */
     function episodesWith(overrides: Partial<PersonaEpisodes>): PersonaEpisodes {
       return { ...episodes, ...overrides }

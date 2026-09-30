@@ -291,10 +291,10 @@ export interface PersonaLifecycleDeps {
   /**
    * Stop the key's UNAVAILABLE retry timer (b.jg5 SRJ-305: the retry
    * controller's `stop` with the torn-down reason), called beside
-   * `cancelRestartTimer`; other personas' timers stay armed. Production also
-   * cancels the key's `tmux-unresponsive` alert check silently (b.jg5
-   * SRJ-309: its text says CSCB keeps retrying), its episode kept until
-   * `forgetNoticeEpisodes`.
+   * `cancelRestartTimer`; other personas' timers stay armed. In production
+   * the stop also cancels the key's `tmux-unresponsive` alert check through
+   * the controller's stop observer (b.jg5 SRJ-309: its text says CSCB keeps
+   * retrying), its episode kept until `forgetNoticeEpisodes`.
    */
   stopRetryTimer: (key: string) => unknown
   /** Forget the key's restart failure count and cap latch (`forgetFailures`). */

@@ -36,6 +36,10 @@
  * retry action on stand-in deps. The retry observer (`onRetryFire`, b.jg5
  * SRJ-308) runs on the bare controller too, over a scripted or held action
  * and, for the in-flight skip, the server's retry action on stand-in deps.
+ * The stop observer (`onStopped`, b.jg5 SRJ-309) runs there too, over a
+ * scripted, held or failing-clock action and, for the early stops, the
+ * server's retry action on stand-in deps, with the pin of
+ * `UNAVAILABLE_RETRY_TERMINAL_STOPS` over the exported stop reasons.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -138,10 +142,12 @@ import {
   UNAVAILABLE_RETRY_STOP_RECOVERED,
   UNAVAILABLE_RETRY_STOP_ROW_GONE,
   UNAVAILABLE_RETRY_STOP_ROW_LIVE,
+  UNAVAILABLE_RETRY_STOP_RUN_FAILED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED,
   UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
+  UNAVAILABLE_RETRY_TERMINAL_STOPS,
   unavailableRetryCauseFor,
   type UnavailableRetryAction,
   type UnavailableRetryCause,
@@ -231,13 +237,14 @@ let harness: RecoveryHarness | undefined
 
 /**
  * Build a rig; its action refuses every retry unless `action` is given. The
- * retry observer is passed only when `onRetryFire` is given (else the deps
- * have no such key).
+ * retry observer and the stop observer are each passed only when given (else
+ * the deps have no such key).
  */
 function makeRig(
   action: UnavailableRetryAction = () => ({ kind: 'again' }),
   clock = createFakeClock(),
   onRetryFire?: UnavailableRetryDeps['onRetryFire'],
+  onStopped?: UnavailableRetryDeps['onStopped'],
 ): Rig {
   const lines: string[] = []
   const attempts: RecoveryAttempt[] = []
@@ -249,6 +256,7 @@ function makeRig(
       return action(key, attempt)
     },
     ...(onRetryFire !== undefined ? { onRetryFire } : {}),
+    ...(onStopped !== undefined ? { onStopped } : {}),
   })
   const rig = { clock, controller, lines, attempts }
   rigs.push(rig)
@@ -3732,4 +3740,350 @@ describe('unavailable retry: the retry observer (SRJ-308)', () => {
     assertNoLeak(throwing.lines)
   })
 
+})
+
+// ---------------------------------------------------------------------------
+// The stop observer (`onStopped`, b.jg5 SRJ-309), on the bare controller over
+// a scripted or held action, and, for the early stops, over the server's
+// retry action on stand-in deps
+// ---------------------------------------------------------------------------
+
+/** Every stop reason the module exports. */
+const ALL_STOP_REASONS: readonly string[] = [
+  UNAVAILABLE_RETRY_STOP_RECOVERED,
+  UNAVAILABLE_RETRY_STOP_CAPPED,
+  UNAVAILABLE_RETRY_STOP_NOT_UP,
+  UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
+  UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED,
+  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
+  UNAVAILABLE_RETRY_STOP_SHUTDOWN,
+  UNAVAILABLE_RETRY_STOP_ROW_LIVE,
+  UNAVAILABLE_RETRY_STOP_ROW_GONE,
+  UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED,
+  UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED,
+  UNAVAILABLE_RETRY_STOP_RUN_FAILED,
+]
+
+/** One call a stop-observed run saw: the observer's (key, reason) or a hand-off's (key), each with the last line logged before it. */
+type StopStep =
+  | readonly ['stopped', string, string, string | undefined]
+  | readonly ['hand-off', string, string | undefined]
+
+/** Builds the run's one rig over `action` and `clock`. */
+type StopRigBuilder = (action?: UnavailableRetryAction, clock?: FakeClock) => Rig
+
+/** One run of a stop scenario: its rig builder, its ordered steps, and a hand-off that records itself there. */
+interface StopRun {
+  readonly build: StopRigBuilder
+  readonly steps: StopStep[]
+  handOff(key: string): () => Promise<unknown>
+  rig(): Rig
+}
+
+/**
+ * A run whose rig has no stop observer (`none`), a recording one, or a
+ * recording one that then throws the given error. Its hand-offs record into
+ * the same steps, so the order of a stop's observer and hand-off is kept.
+ */
+function stopRun(observer: 'none' | 'recording' | Error): StopRun {
+  const steps: StopStep[] = []
+  let built: Rig | undefined
+  const onStopped: UnavailableRetryDeps['onStopped'] = observer === 'none'
+    ? undefined
+    : (key, reason) => {
+        steps.push(['stopped', key, reason, built?.lines.at(-1)])
+        if (observer instanceof Error) throw observer
+      }
+  return {
+    steps,
+    build: (action, clock) => {
+      built = makeRig(action, clock, undefined, onStopped)
+      return built
+    },
+    handOff: (key) => async () => { steps.push(['hand-off', key, built?.lines.at(-1)]) },
+    rig: () => {
+      if (built === undefined) throw new Error('stopRun: no rig was built')
+      return built
+    },
+  }
+}
+
+/** Run persona `key`'s due retry to its settled re-arm or stop. */
+async function retryOnce(rig: Rig, key = KEY): Promise<void> {
+  await rig.clock.runNext()
+  await rig.controller.whenRunSettled(key)
+}
+
+/** A stop path: how a run reaches it, and the steps it gives (given the run's rig). */
+interface StopScenario {
+  readonly play: (run: StopRun) => Promise<void>
+  readonly expected: (rig: Rig) => StopStep[]
+}
+
+const [FIRST_CONDITION, FIRST_ENDED] = CONDITION_ENDS[0]!
+
+/** The line a timer forgotten because its re-arm failed logs, as `rig` logged it. */
+function runFailedLine(rig: Rig): string | undefined {
+  return rig.lines.find((line) => line.startsWith(`[slack] unavailable-retry: persona=${KEY} retry run failed: `))
+}
+
+/** The one error a scenario's failing clock throws, so every run of it logs the same line. */
+const CLOCK_REFUSED = new Error('the clock refused')
+
+const STOP_SCENARIOS: ReadonlyArray<readonly [string, StopScenario]> = [
+  ['the cap stop (a stop answer, full mode)', {
+    play: async (r) => {
+      const rig = r.build(() => ({ kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_CAPPED }))
+      rig.controller.arm(KEY, UNAVAILABLE)
+      await retryOnce(rig)
+    },
+    expected: () => [['stopped', KEY, UNAVAILABLE_RETRY_STOP_CAPPED, stoppedLine(KEY, UNAVAILABLE_RETRY_STOP_CAPPED)]],
+  }],
+  ['a full-mode stop answer with a hand-off', {
+    play: async (r) => {
+      const rig = r.build(() => ({ kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_RECOVERED, handOff: r.handOff(KEY) }))
+      rig.controller.arm(KEY, UNAVAILABLE)
+      await retryOnce(rig)
+    },
+    expected: () => [
+      ['stopped', KEY, UNAVAILABLE_RETRY_STOP_RECOVERED, stoppedLine(KEY, UNAVAILABLE_RETRY_STOP_RECOVERED)],
+      ['hand-off', KEY, stoppedLine(KEY, UNAVAILABLE_RETRY_STOP_RECOVERED)],
+    ],
+  }],
+  ['a pending-only stop, the row live out of pending', {
+    play: async (r) => {
+      const rig = r.build(() => ({ kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE, row: 'waiting', yieldsToFullMode: true }))
+      rig.controller.armPendingOnly(KEY)
+      await retryOnce(rig)
+    },
+    expected: () => [['stopped', KEY, UNAVAILABLE_RETRY_STOP_ROW_LIVE, pendingOnlyStoppedLine(KEY, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting')]],
+  }],
+  ['a pending-only stop, the row gone, handed off', {
+    play: async (r) => {
+      const rig = r.build(() => ({ kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_GONE, row: 'ended', handOff: r.handOff(KEY), yieldsToFullMode: true }))
+      rig.controller.armPendingOnly(KEY)
+      await retryOnce(rig)
+    },
+    expected: () => [
+      ['stopped', KEY, UNAVAILABLE_RETRY_STOP_ROW_GONE, pendingOnlyStoppedLine(KEY, UNAVAILABLE_RETRY_STOP_ROW_GONE, 'ended')],
+      ['hand-off', KEY, pendingOnlyStoppedLine(KEY, UNAVAILABLE_RETRY_STOP_ROW_GONE, 'ended')],
+    ],
+  }],
+  ...CONDITION_ENDS.map(([condition, ended]): readonly [string, StopScenario] => [`a condition end (${condition}) while waiting`, {
+    play: async (r) => {
+      const rig = r.build()
+      rig.controller.arm(KEY, UNAVAILABLE)
+      expect(rig.controller.conditionEnded(KEY, condition)).toBe('stopped')
+    },
+    expected: () => [['stopped', KEY, ended, stoppedLine(KEY, ended)]],
+  }]),
+  ['a condition end deferred to a run, applied after its again answer', {
+    play: async (r) => {
+      const rig = r.build((key) => {
+        expect(r.rig().controller.conditionEnded(key, FIRST_CONDITION)).toBe('deferred')
+        return { kind: 'again' }
+      })
+      rig.controller.arm(KEY, UNAVAILABLE)
+      await retryOnce(rig)
+    },
+    expected: () => [['stopped', KEY, FIRST_ENDED, stoppedLine(KEY, FIRST_ENDED)]],
+  }],
+  ['a yielded pending-only stop whose deferred condition end then stops the timer, before the held hand-off', {
+    play: async (r) => {
+      const rig = r.build((key) => {
+        r.rig().controller.arm(key, UNAVAILABLE)
+        r.rig().controller.conditionEnded(key, FIRST_CONDITION)
+        return { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_GONE, row: 'ended', handOff: r.handOff(key), yieldsToFullMode: true }
+      })
+      rig.controller.armPendingOnly(KEY)
+      await retryOnce(rig)
+    },
+    expected: () => [
+      ['stopped', KEY, FIRST_ENDED, stoppedLine(KEY, FIRST_ENDED)],
+      ['hand-off', KEY, stoppedLine(KEY, FIRST_ENDED)],
+    ],
+  }],
+  ['stopAll, over a full-mode and a pending-only timer', {
+    play: async (r) => {
+      const rig = r.build()
+      rig.controller.arm(KEY, UNAVAILABLE)
+      rig.controller.armPendingOnly(OTHER)
+      rig.controller.stopAll(UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+    },
+    expected: () => [
+      ['stopped', KEY, UNAVAILABLE_RETRY_STOP_TORN_DOWN, stoppedLine(KEY, UNAVAILABLE_RETRY_STOP_TORN_DOWN)],
+      ['stopped', OTHER, UNAVAILABLE_RETRY_STOP_TORN_DOWN, pendingOnlyStoppedLine(OTHER, UNAVAILABLE_RETRY_STOP_TORN_DOWN)],
+    ],
+  }],
+  ['close, called twice, then a refused arm', {
+    play: async (r) => {
+      const rig = r.build()
+      rig.controller.arm(KEY, UNAVAILABLE)
+      rig.controller.arm(OTHER, UNAVAILABLE)
+      rig.controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+      rig.controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+      expect(rig.controller.arm(KEY, UNAVAILABLE)).toBe(false)
+    },
+    expected: () => [
+      ['stopped', KEY, UNAVAILABLE_RETRY_STOP_SHUTDOWN, stoppedLine(KEY, UNAVAILABLE_RETRY_STOP_SHUTDOWN)],
+      ['stopped', OTHER, UNAVAILABLE_RETRY_STOP_SHUTDOWN, stoppedLine(OTHER, UNAVAILABLE_RETRY_STOP_SHUTDOWN)],
+    ],
+  }],
+  ['a stop during a run, whose later stop answer (with a hand-off) is dropped', {
+    play: async (r) => {
+      const held = heldAction()
+      const rig = r.build(held.action)
+      rig.controller.arm(KEY, UNAVAILABLE)
+      await rig.clock.runNext()
+      rig.controller.stop(KEY, UNAVAILABLE_RETRY_STOP_NOT_UP)
+      held.answer({ kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_CAPPED, handOff: r.handOff(KEY) })
+      await rig.controller.whenRunSettled(KEY)
+    },
+    expected: () => [['stopped', KEY, UNAVAILABLE_RETRY_STOP_NOT_UP, stoppedLine(KEY, UNAVAILABLE_RETRY_STOP_NOT_UP)]],
+  }],
+  ['the run-failed drop (the clock fails at the re-arm)', {
+    play: async (r) => {
+      const { clock, prime } = throwingClock(CLOCK_REFUSED)
+      const rig = r.build(undefined, clock)
+      rig.controller.arm(KEY, UNAVAILABLE)
+      prime()
+      await retryOnce(rig)
+    },
+    expected: (rig) => [['stopped', KEY, UNAVAILABLE_RETRY_STOP_RUN_FAILED, runFailedLine(rig)]],
+  }],
+]
+
+/** Paths that are not stops: how a run reaches it, and whether persona `KEY` is armed after. */
+const NOT_STOP_SCENARIOS: ReadonlyArray<readonly [string, (run: StopRun) => Promise<void>, boolean]> = [
+  ['a stop, stopAll, a condition end and close that find nothing armed', async (r) => {
+    const rig = r.build()
+    rig.controller.stop(KEY, UNAVAILABLE_RETRY_STOP_RECOVERED)
+    rig.controller.stopAll(UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+    expect(rig.controller.conditionEnded(KEY, FIRST_CONDITION)).toBe('not-armed')
+    rig.controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+  }, false],
+  ['a failed first arm (full mode), then a stop', async (r) => {
+    const { clock, prime } = throwingClock(new Error('the clock refused'))
+    const rig = r.build(undefined, clock)
+    prime()
+    expect(rig.controller.arm(KEY, UNAVAILABLE)).toBe(false)
+    rig.controller.stop(KEY, UNAVAILABLE_RETRY_STOP_RECOVERED)
+  }, false],
+  ['a failed first arm (pending-only), then a stop', async (r) => {
+    const { clock, prime } = throwingClock(new Error('the clock refused'))
+    const rig = r.build(undefined, clock)
+    prime()
+    rig.controller.armPendingOnly(KEY)
+    rig.controller.stop(KEY, UNAVAILABLE_RETRY_STOP_RECOVERED)
+  }, false],
+  ['a condition end kept for a pending row', async (r) => {
+    const rig = r.build()
+    rig.controller.armPendingOnly(KEY)
+    expect(rig.controller.conditionEnded(KEY, FIRST_CONDITION)).toBe('kept')
+  }, true],
+  ['a condition end kept for a kill-failed cause', async (r) => {
+    const rig = r.build()
+    rig.controller.arm(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED })
+    expect(rig.controller.conditionEnded(KEY, FIRST_CONDITION)).toBe('kept')
+  }, true],
+  ...([
+    ['live out of pending', UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'],
+    ['gone', UNAVAILABLE_RETRY_STOP_ROW_GONE, 'ended'],
+  ] as const).map(([what, reason, row]): readonly [string, (run: StopRun) => Promise<void>, boolean] => [
+    `a pending-only stop (the row ${what}) that yields to a full-mode cause armed during its retry`,
+    async (r) => {
+      const rig = r.build((key) => {
+        r.rig().controller.arm(key, UNAVAILABLE)
+        return { kind: 'stop', reason, row, handOff: r.handOff(key), yieldsToFullMode: true }
+      })
+      rig.controller.armPendingOnly(KEY)
+      await retryOnce(rig)
+      expect(rig.controller.view(KEY)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_FULL, refusals: 1 })
+    },
+    true,
+  ]),
+]
+
+/** What a stop-observed rig's timers did, to compare one rig with another. */
+function stopRecord(rig: Rig): unknown {
+  return { lines: rig.lines, attempts: rig.attempts, armed: rig.controller.armedKeys(), view: rig.controller.view(KEY), delays: delays(rig.clock), now: rig.clock.now() }
+}
+
+describe('unavailable retry: the stop observer (SRJ-309)', () => {
+  test.each(ALL_STOP_REASONS.map((reason) => [reason]))('stop(key, "%s") is observed exactly once per stopped timer, with its reason, after its stopped line; a stop that finds nothing armed is not', (reason) => {
+    const run = stopRun('recording')
+    const { controller } = run.build()
+    controller.arm(KEY, UNAVAILABLE)
+    controller.armPendingOnly(OTHER)
+
+    controller.stop(KEY, reason)
+    controller.stop(OTHER, reason)
+    controller.stop(KEY, reason)
+    controller.stop(OTHER, reason)
+
+    expect(run.steps).toEqual([
+      ['stopped', KEY, reason, stoppedLine(KEY, reason)],
+      ['stopped', OTHER, reason, pendingOnlyStoppedLine(OTHER, reason)],
+    ])
+    expect(controller.armedKeys()).toEqual([])
+  })
+
+  test.each(STOP_SCENARIOS)('%s: observed exactly once per stopped timer, with the stop’s reason, after its stopped line and before any hand-off', async (_what, scenario) => {
+    const run = stopRun('recording')
+    await scenario.play(run)
+    const rig = run.rig()
+
+    expect(run.steps).toEqual(scenario.expected(rig))
+    for (const step of run.steps) expect(step.at(-1)).toBeString()
+
+    // Nothing more is observed as time runs on.
+    const seen = run.steps.length
+    await rig.clock.advance(waitMs(refusalsToCeiling()) * 4)
+    expect(run.steps).toHaveLength(seen)
+    expect(rig.clock.pendingCount()).toBe(0)
+  })
+
+  test.each(GATES)('the server’s retry action’s early stop (%s) is observed once, with its reason, after its stopped line', async (_what, overrides, reason) => {
+    const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, overrides)
+    const run = stopRun('recording')
+    const rig = run.build(createFullModeRetryAction(deps))
+    rig.controller.arm(KEY, UNAVAILABLE)
+
+    await retryOnce(rig)
+
+    expect(run.steps).toEqual([['stopped', KEY, reason, stoppedLine(KEY, reason)]])
+    expect(deps.calls).toEqual([])
+  })
+
+  test.each(NOT_STOP_SCENARIOS)('%s is not a stop: the observer is not called', async (_what, play, armedAfter) => {
+    const run = stopRun('recording')
+    await play(run)
+
+    expect(run.steps).toEqual([])
+    expect(run.rig().controller.isArmed(KEY)).toBe(armedAfter)
+  })
+
+  test.each(STOP_SCENARIOS)('%s: an observer that throws is swallowed, and with no observer nothing changes: the lines, retries, timers and hand-offs are the same, with no line of its error', async (_what, scenario) => {
+    const err = Object.assign(new Error(`the observer failed (${sentinelInMessage('stop-observer')})`), { detail: LEAK_SENTINEL })
+    const plain = stopRun('none')
+    const recording = stopRun('recording')
+    const throwing = stopRun(err)
+
+    await scenario.play(plain)
+    await scenario.play(recording)
+    await scenario.play(throwing)
+
+    expect(stopRecord(recording.rig())).toEqual(stopRecord(plain.rig()))
+    expect(stopRecord(throwing.rig())).toEqual(stopRecord(plain.rig()))
+    expect(plain.steps).toEqual(recording.steps.filter(([step]) => step === 'hand-off'))
+    expect(throwing.steps).toEqual(recording.steps)
+    expect(throwing.rig().lines.filter((line) => line.includes('observer'))).toEqual([])
+    assertNoLeak(throwing.rig().lines)
+  })
+
+  test('the terminal-stops pin: UNAVAILABLE_RETRY_TERMINAL_STOPS holds exactly the torn-down, not-applied and shutdown reasons', () => {
+    const terminal = [UNAVAILABLE_RETRY_STOP_TORN_DOWN, UNAVAILABLE_RETRY_STOP_NOT_APPLIED, UNAVAILABLE_RETRY_STOP_SHUTDOWN]
+    expect([...UNAVAILABLE_RETRY_TERMINAL_STOPS].sort()).toEqual([...terminal].sort())
+    expect(ALL_STOP_REASONS.filter((reason) => UNAVAILABLE_RETRY_TERMINAL_STOPS.has(reason)).sort()).toEqual([...terminal].sort())
+  })
 })

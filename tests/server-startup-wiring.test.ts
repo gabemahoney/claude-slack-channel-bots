@@ -1740,10 +1740,11 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
 // condition's onset hooks, mode, alert threshold and alert stops
 //
 // The health check's tick-end hook and clock (`HealthCheckDeps.onTickEnd`,
-// `now`), the retry controller's per-fire observer (`UnavailableRetryDeps.
-// onRetryFire`) and the condition's mode and threshold accessors
-// (`TmuxUnresponsiveConditionDeps.healthCheckOn`, `alertThresholdMs`) are all
-// optional: absent, no onset is ever posted, the mode is "on" and no alert
+// `now`), the retry controller's per-fire and stop observers
+// (`UnavailableRetryDeps.onRetryFire`, `onStopped`) and the condition's mode
+// and threshold accessors (`TmuxUnresponsiveConditionDeps.healthCheckOn`,
+// `alertThresholdMs`) are all optional: absent, no onset is ever posted, a
+// stopped timer leaves its alert check armed, the mode is "on" and no alert
 // check is armed. So a production wiring that dropped one, bound it to a
 // no-op, a local shadow or another instance, read the tick's start on a clock
 // other than the one the first refusal is read on, or copied the mode or the
@@ -1754,7 +1755,7 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
 // the SRJ-1016 describe above. Pinned here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s end and to each retry fire, reads its mode and alert threshold at each check, and cancels its alert only at a teardown\'s timer stop and at shutdown (b.jg5 SRJ-308, SRJ-309, SRJ-210)', () => {
+describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s end and to each retry fire, reads its mode and alert threshold at each check, and cancels its alert only at a retry-timer stop, at a teardown\'s timer stop and at shutdown (b.jg5 SRJ-308, SRJ-309, SRJ-210)', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof PersonaEpisodesModule = 'createTmuxUnresponsiveCondition'
   const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
@@ -1767,6 +1768,8 @@ describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s e
   const TICK_END: keyof HealthCheckDeps = 'onTickEnd'
   const TICK_NOW: keyof HealthCheckDeps = 'now'
   const RETRY_FIRE: keyof UnavailableRetryDeps = 'onRetryFire'
+  const RETRY_STOPPED: keyof UnavailableRetryDeps = 'onStopped'
+  const TORN_DOWN: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_STOP_TORN_DOWN'
   const THRESHOLD_IN_EFFECT: keyof typeof AdSettingsModule = 'adAlertThresholdMsInEffect'
   const INTERVAL: keyof PersonaConfig = 'health_check_interval'
 
@@ -1836,16 +1839,32 @@ describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s e
     expect(indicesOf(new RegExp(`\\b${THRESHOLD_IN_EFFECT}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('the alert is cancelled only by the teardown\'s retry-timer stop (server.ts\'s one cancelAlert call, inside createPersonaLifecycle\'s stopRetryTimer) and by shutdown\'s close of the episodes', () => {
+  test('the retry controller\'s stop observer is the condition\'s alert cancel, given the persona and the stop reason', () => {
+    const condition = constOf(FACTORY)
+    declaredOnce(condition)
+    const hook = onlyCallProps('createUnavailableRetryController').get(RETRY_STOPPED)
+    expect(hook).toBeDefined()
+    // `(key, reason) => <condition>.cancelAlert(key, reason)` (block or
+    // expression body); the parameters' names are free. Only a wrapper: the
+    // condition is declared after the controller is built.
+    const call = `${condition}\\.${CANCEL_ALERT}\\(\\1, \\2\\)`
+    expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
+  })
+
+  test('the alert is cancelled only by the retry controller\'s stop observer and by the lifecycle\'s stopRetryTimer, with the torn-down reason (server.ts\'s two cancelAlert calls)', () => {
     const condition = constOf(FACTORY)
     const cancels = indicesOf(new RegExp(`\\.\\s*${CANCEL_ALERT}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(cancels).toHaveLength(1)
-    const stopRetryTimer = onlyCallProps('createPersonaLifecycle').get('stopRetryTimer')!
-    expect(stopRetryTimer).toMatch(new RegExp(`\\b${condition}\\.${CANCEL_ALERT}\\(`))
-    // That one call lies inside createPersonaLifecycle's argument.
-    const lifecycleAt = onlyCallOf('createPersonaLifecycle')
-    const [argsStart, argsEnd] = balancedAfter(SERVER_CODE, lifecycleAt, '(', ')')
-    expect(cancels[0]! > argsStart && cancels[0]! < argsEnd).toBe(true)
+    expect(cancels).toHaveLength(2)
+    expect(onlyCallProps('createUnavailableRetryController').get(RETRY_STOPPED)).toContain(`${condition}.${CANCEL_ALERT}(`)
+    expect(onlyCallProps('createPersonaLifecycle').get('stopRetryTimer')).toMatch(
+      new RegExp(`\\b${condition}\\.${CANCEL_ALERT}\\((\\w+), ${TORN_DOWN}\\)`),
+    )
+    // One call lies inside each factory's argument.
+    const inside = (factory: string) => {
+      const [start, end] = balancedAfter(SERVER_CODE, onlyCallOf(factory), '(', ')')
+      return cancels.filter((at) => at > start && at < end).length
+    }
+    expect([inside('createUnavailableRetryController'), inside('createPersonaLifecycle')]).toEqual([1, 1])
   })
 })
 
