@@ -70,29 +70,33 @@ If the host is unsupported, the system-installed `agent-director` itself will re
 
 ### Checking your agent-director install
 
-Before starting the server, you can confirm `agent-director` is installed system-wide and meets the declared minimum with:
+Before starting the server, you can confirm `agent-director` is installed system-wide at a version this CSCB release can be installed beside with:
 
 ```sh
 bun run install-check
 ```
 
-The script calls the same discovery + floor-comparison pipeline the startup gate uses (it reads AD's `dist/version-floor.json`, calls `resolveSystemBinary()`, and compares versions via `semver.gte`). It exits 0 on success with a single-line block naming `agent-director`, the absolute resolved binary path, the detected version, and the floor. On failure it writes one of the canonical class labels to stderr and exits non-zero:
+The script finds the system-installed agent-director binary and reads its version, then judges it in two steps: first against the agent-director client's own minimum (`min_binary_version` in the installed client's `dist/version-floor.json`), then against CSCB's Phase 1 floor. `/publish`'s preflight check makes the same decision. There are three outcomes:
 
-- `ad-system-install-not-found` — no agent-director on PATH or at the standard install path. Install AD and retry. The stderr also points at the install-cscb skill for interactive remediation.
-- `ad-system-install-too-old` — AD binary is below the floor. Upgrade AD and retry. The stderr points at the skill.
-- `ad-system-install-unreachable` — AD discovered but the probe could not invoke it (eight `.reason` values exposed verbatim). The stderr points at the skill.
-- `ad-version-floor-unreadable` — `dist/version-floor.json` is missing, malformed, or lacks `min_binary_version`. The remediation is to reinstall `agent-director` from npm; the install-cscb skill cannot fix a corrupt AD package, so this case does NOT append the skill instructions block.
+- **Pass.** The binary meets both. The script exits 0 and prints one block naming `agent-director`, the resolved binary path, the version found and the client's minimum.
+- **Pass with a note.** The binary meets the client's minimum but is below CSCB's Phase 1 floor (the development placeholder `0.0.0-dev` included). The script still exits 0 and prints the same block, followed by a note: the server will not start on this binary until agent-director Phase 1 is installed; see the README section "Switching over to agent-director Phase 1".
+- **Fail.** The script writes one of the class labels below, with its message, to stderr and exits non-zero:
+  - `ad-system-install-not-found` — no agent-director on PATH or at the standard install path. Install AD and retry. The stderr also points at the install-cscb skill for interactive remediation.
+  - `ad-system-install-too-old` — the binary is below the agent-director client's own minimum. The message names the version found, the version the client requires, the binary path and the README section "Switching over to agent-director Phase 1", which is how agent-director is installed for this CSCB release. The stderr points at the skill.
+  - `ad-system-install-unreachable` — the binary's version cannot be read: AD discovered it but the probe could not invoke it, it reported a version that does not parse (reason `unparseable-version`), or the probe failed some other way (reason `other`). The message names the `.reason` value, or for another failure the error's name or type. The stderr points at the skill.
+  - `ad-version-floor-unreadable` — `dist/version-floor.json` is missing or malformed, or its `min_binary_version` is missing or is not a version. The remediation is to check or reinstall the `agent-director` npm package; the install-cscb skill cannot fix a corrupt AD package, so this case does NOT append the skill instructions block.
 
-The script is purely diagnostic — it never prompts, never runs an install command, never fetches the skill. The startup gate enforces the same floor automatically at server boot via AD's `Client.create()`; `install-check` is for operators who want to confirm their setup ahead of time.
+The script is purely diagnostic — it never prompts, never runs an install command, never fetches the skill. At server start the startup gate refuses a binary below the client's minimum or below CSCB's Phase 1 floor (`ad-below-phase1-floor`, see [Startup errors](#startup-errors)), so a binary that passes the install check with its note is still refused at start. `install-check` is for operators who want to confirm their setup ahead of time.
 
 ### Installing the install-cscb skill
 
 If `bun run install-check` (or the startup gate) reports one of the
 `ad-system-install-*` failure classes, you can install the `install-cscb`
 Claude skill for an interactive walkthrough. The skill drives the same
-shared check module but walks you through install/upgrade and a
-per-reason remediation flow for each of the eight
-`ErrSystemInstallUnreachable.reason` values.
+shared check module but walks you through each failure class: install for
+a missing binary, the README section "Switching over to agent-director
+Phase 1" for a too-old one, and a per-reason remediation flow for each of
+the eight `ErrSystemInstallUnreachable.reason` values.
 
 The skill is NOT auto-installed by `bun install` — fetch it manually
 from CSCB's GitHub repo and place it in your local Claude skills
@@ -120,12 +124,14 @@ folder:
    ```
 
 The skill calls `bun run install-check` on each iteration, surfaces
-`agent-director`'s published install/upgrade command verbatim (no
-CSCB-owned install command — AD's documentation is the source of
-truth), prompts before running, and loops until the check passes or
-you decline. The `ad-version-floor-unreadable` class is handled
-separately: the skill prints reinstall-from-npm guidance and does NOT
-loop on it (the skill cannot fix a corrupt AD npm package).
+`agent-director`'s published install command verbatim for a missing
+binary (no CSCB-owned install command — AD's documentation is the source
+of truth), prompts before running, and loops until the check passes or
+you decline. Two classes end the skill instead of looping: for
+`ad-system-install-too-old` it names the README section "Switching over
+to agent-director Phase 1" and runs nothing, and for
+`ad-version-floor-unreadable` it prints reinstall-from-npm guidance (the
+skill cannot fix a corrupt AD npm package).
 
 The published CSCB npm tarball includes `skills/install-cscb/SKILL.md`
 under its `files` array, so the skill source is also available via
@@ -1322,7 +1328,7 @@ Fatal classes you may see:
 - `ad-shim-missing-get-permission` — the installed `agent-director` TS shim's `Client` does not expose `getPermission`. The npm-published package is out of sync with the system-installed binary. Reinstall a matching `agent-director` version and confirm the resolved package actually ships the method.
 - `ad-shim-catalog-incomplete` — the installed `agent-director` TS error catalog is missing one or more of `ErrInvalidFlags`, `ErrPermissionRequestNotFound`, `ErrAmbiguousRequest`, `ErrTmuxKillFailed`, `ErrTmuxUnresponsive`, `ErrTmuxSessionConflict`. The log line lists the missing names. Same remediation as `ad-shim-missing-get-permission`.
 - `ad-shim-decide-drops-token` — the installed `agent-director` dist does not include `--request-token` in its bundled JS, meaning `buildDecide()` would resolve permission clicks against the wrong row. Reinstall a matching `agent-director` version and confirm `buildDecide` carries the flag.
-- `ad-version-floor-unreadable` — `node_modules/agent-director/dist/version-floor.json` could not be read, parsed, or is missing `.min_binary_version`. This is a packaging defect — reinstall `agent-director` from npm. Surfaced by `bun run install-check`; the startup gate itself does not emit this label (it relies on `Client.create()`, which fails differently when the AD package is corrupt).
+- `ad-version-floor-unreadable` — `node_modules/agent-director/dist/version-floor.json` could not be read or parsed, or its `.min_binary_version` is missing or is not a version. This is a packaging defect — reinstall `agent-director` from npm. Surfaced by `bun run install-check`; the startup gate itself does not emit this label (it relies on `Client.create()`, which fails differently when the AD package is corrupt).
 - `ad-same-user` — `~/.agent-director/state.db` is owned by a different UID than the CSCB process. Reinstall agent-director as the correct user or remove the mismatched file.
 - `ad-same-user-stat` — Non-ENOENT stat error on the state DB (permissions, I/O). Investigate the file before re-launching.
 - `ad-template-install` — `client.makeTemplate(...)` rejected the boot-time refresh of the `slack-channel-bot` template. The line names the template and includes agent-director's error name and its description.

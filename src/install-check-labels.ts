@@ -34,13 +34,28 @@ export const AD_BELOW_PHASE1_FLOOR = 'ad-below-phase1-floor'
 export const AD_SHIM_CATALOG_INCOMPLETE = 'ad-shim-catalog-incomplete'
 
 /**
- * Canonical class labels emitted by the install check. The not-found and
- * too-old labels are shared with the startup gate; `AD_BELOW_PHASE1_FLOOR` and
- * `AD_SHIM_CATALOG_INCOMPLETE` are not among them, because only the startup
- * gate writes them.
+ * Class label for a host binary whose version cannot be read: an
+ * `ErrSystemInstallUnreachable` of any reason, a resolved version that does
+ * not parse (reason `unparseable-version`), or any other failure of the
+ * install check's resolver call. Shared with the startup gate.
+ */
+export const AD_SYSTEM_INSTALL_UNREACHABLE = 'ad-system-install-unreachable'
+
+/**
+ * Class label for the installed agent-director client's minimum binary version
+ * (`min_binary_version` in its `dist/version-floor.json`) that cannot be
+ * resolved, read, parsed or used as a version. Written by the install check.
+ */
+export const AD_VERSION_FLOOR_UNREADABLE = 'ad-version-floor-unreadable'
+
+/**
+ * Canonical class labels emitted by the install check. The not-found,
+ * too-old and unreachable labels are shared with the startup gate;
+ * `AD_BELOW_PHASE1_FLOOR` and `AD_SHIM_CATALOG_INCOMPLETE` are not among
+ * them, because only the startup gate writes them.
  */
 export type InstallCheckClassLabel =
   | typeof AD_SYSTEM_INSTALL_NOT_FOUND
   | typeof AD_SYSTEM_INSTALL_TOO_OLD
-  | 'ad-system-install-unreachable'
-  | 'ad-version-floor-unreadable'
+  | typeof AD_SYSTEM_INSTALL_UNREACHABLE
+  | typeof AD_VERSION_FLOOR_UNREADABLE

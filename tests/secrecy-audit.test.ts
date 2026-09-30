@@ -657,11 +657,6 @@ const RAW_ERROR_ALLOWED: { file: string; anchor: string; reason: string }[] = [
     reason: 'a file-system error writing the permission trail',
   },
   {
-    file: 'src/postinstall.ts',
-    anchor: 'agent-director probe failed',
-    reason: "npm postinstall's agent-director install probe (Client.create at install time), run with no config, credentials or persona loaded",
-  },
-  {
     file: 'src/server.ts',
     anchor: 'Error in roots handler',
     reason: "an MCP SDK error from a Claude session's roots handler; no Slack or agent-director call",

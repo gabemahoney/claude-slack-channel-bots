@@ -23,38 +23,28 @@
  * config.json is never touched, whatever its shape; a pre-persona one gets
  * the conversion error when the server starts.
  *
+ * The entry point then runs the agent-director probe
+ * ({@link runAgentDirectorPostinstallProbe}): the install check
+ * (`src/install-check.ts`) once, with one OK line (and the Phase 1 note when
+ * the check carries one) or one warning. It builds no agent-director client
+ * and opens no agent-director store (b.jg5 SRJ-121), and it never fails the
+ * install.
+ *
  * SPDX-License-Identifier: MIT
  */
 
-import { existsSync, lstatSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlinkSync, renameSync, readFileSync } from 'fs'
+import { existsSync, lstatSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlinkSync, renameSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join, resolve } from 'path'
 import { MCP_SERVER_NAME, resolveServerStateDir } from './config.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
+import type { InstallCheckResult } from './install-check.ts'
 
 /** The skills postinstall links into the skills target. */
 const LINKED_SKILLS = ['debug-slack-channel-bots']
 
 /** The retired skill whose link from earlier releases postinstall removes. */
 const RETIRED_SKILL = 'claude-slack-channels-config'
-
-/**
- * Read the agent-director dependency range from the shipping package.json.
- * One source of truth for the AD version requirement; used in the
- * postinstall-probe failure warning to point operators at the right pin.
- */
-export function readAdDependencyRange(): string {
-  const pkgPath = resolve(dirname(import.meta.filename), '..', 'package.json')
-  const raw = readFileSync(pkgPath, 'utf-8')
-  const pkg = JSON.parse(raw) as { dependencies?: Record<string, string> }
-  const range = pkg.dependencies?.['agent-director']
-  if (typeof range !== 'string' || range.length === 0) {
-    throw new Error(
-      `postinstall: package.json dependencies['agent-director'] is missing or empty`,
-    )
-  }
-  return range
-}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -192,42 +182,78 @@ export function runPostinstall(options: PostinstallOptions = {}): void {
   }
 }
 
-/**
- * Best-effort import + Client construction + version() probe. Logs success
- * or a one-line warning; never throws, never exits non-zero.
- *
- * The probe is deliberately wrapped in a top-level try/catch so a missing
- * `agent-director` package (ENOENT during dynamic import) surfaces as a
- * remediation message rather than crashing the postinstall script.
- */
-export async function runAgentDirectorPostinstallProbe(): Promise<void> {
+/** Runs the agent-director install check once (`runInstallCheck` in `src/install-check.ts`). */
+export type PostinstallInstallCheck = () => Promise<InstallCheckResult>
+
+/** Dependencies of {@link runAgentDirectorPostinstallProbe}. */
+export interface AgentDirectorPostinstallProbeDeps {
+  /**
+   * The install check; default: `runInstallCheck` from `src/install-check.ts`
+   * with its own defaults, loaded when the probe runs so a missing or
+   * unloadable agent-director package is one warning, not a failed import of
+   * this module.
+   */
+  runInstallCheck?: PostinstallInstallCheck
+}
+
+/** Where every probe warning points the operator. */
+const INSTALL_CHECK_POINTER = 'run `bun run install-check` for the full diagnosis'
+
+/** The default install check, loaded on first use. */
+async function loadInstallCheck(): Promise<PostinstallInstallCheck> {
+  const { runInstallCheck } = await import('./install-check.ts')
+  return () => runInstallCheck()
+}
+
+/** The install check's result, or the thrown value when it could not run (load or call). */
+async function settleInstallCheck(
+  deps: AgentDirectorPostinstallProbeDeps,
+): Promise<{ ran: true; result: InstallCheckResult } | { ran: false; thrown: unknown }> {
   try {
-    const ad = await import('agent-director')
-    // AD 0.7.0+ exposes an async `Client.create()` factory; the constructor
-    // is protected. Any platform / Bun / subprocess-resolution error fires
-    // here (Err* subclasses + system-install errors) and is caught below.
-    const client = await ad.Client.create({
-      storePath: '~/.agent-director/state.db',
-      createIfMissing: true,
-    })
-    try {
-      // Now that Client.create() has resolved, the binary version is on the
-      // Client itself (binaryVersion getter, AD 0.7.0+). Skip the verb-call
-      // probe — the factory already enforced the floor.
-      const adVersion = client.binaryVersion.replace(/^v/, '')
-      console.log(`postinstall: agent-director ${adVersion} OK`)
-    } finally {
-      try { client.close() } catch { /* defensive */ }
-    }
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err)
-    const adRange = readAdDependencyRange()
-    console.warn(
-      `postinstall warning: agent-director probe failed (${detail}). ` +
-      `Install agent-director (\`bun add agent-director@${adRange}\`) before running ` +
-      `\`claude-slack-channel-bots start\`; the startup gate will fail otherwise.`,
-    )
+    const check = deps.runInstallCheck ?? (await loadInstallCheck())
+    return { ran: true, result: await check() }
+  } catch (thrown) {
+    return { ran: false, thrown }
   }
+}
+
+/**
+ * Best-effort agent-director probe at npm install time (b.jg5 SRJ-121): runs
+ * the install check once and logs what it found. It builds no client, opens
+ * no agent-director store and resolves the host binary only through the
+ * install check.
+ *
+ * - Success: one `postinstall: agent-director <version> OK` line, then one
+ *   `postinstall: note: <note>` line when the check carries the Phase 1 note.
+ * - Failure: one `postinstall warning:` line with the class label and the
+ *   check's own message, pointing at `bun run install-check`.
+ * - A missing or unloadable agent-director package, or a check that throws:
+ *   one `postinstall warning:` line with the thrown value described by
+ *   `describeThrownValue`.
+ *
+ * The probe adds no install, upgrade or `bun add` advice of its own; a
+ * failure line carries the install check's message. Never throws, never
+ * exits and never fails the install.
+ */
+export async function runAgentDirectorPostinstallProbe(deps: AgentDirectorPostinstallProbeDeps = {}): Promise<void> {
+  const settled = await settleInstallCheck(deps)
+  if (!settled.ran) {
+    console.warn(
+      `postinstall warning: the agent-director install check could not run (${describeThrownValue(settled.thrown)}); ` +
+        `${INSTALL_CHECK_POINTER}.`,
+    )
+    return
+  }
+  const { result } = settled
+  if (result.ok) {
+    console.log(`postinstall: agent-director ${result.binaryVersion} OK`)
+    if (result.note !== undefined) console.log(`postinstall: note: ${result.note}`)
+    return
+  }
+  console.warn(
+    `postinstall warning: agent-director install check failed (${result.classLabel}): ${result.message} ` +
+      `The server's startup gate refuses to start until this is resolved; ${INSTALL_CHECK_POINTER}.`,
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -236,11 +262,12 @@ export async function runAgentDirectorPostinstallProbe(): Promise<void> {
 
 if (import.meta.main) {
   runPostinstall()
-  // SR-5.2: best-effort agent-director presence probe. Bun blocks
+  // SR-5.2: best-effort agent-director probe through the install check
+  // (b.jg5 SRJ-121: no client built, no store opened). Bun blocks
   // postinstall by default — this script only runs when the operator has
-  // added claude-slack-channel-bots to `trustedDependencies`. Probe
-  // failures emit a one-line warning but do NOT fail the install; the
-  // real dependency enforcement is the SR-5.1 startup gate at server boot.
+  // added claude-slack-channel-bots to `trustedDependencies`. A failure is
+  // one warning line and does NOT fail the install; the startup gate at
+  // server start is what refuses a binary.
   runAgentDirectorPostinstallProbe().catch(() => {
     // The probe itself swallows all errors and logs a warning; this
     // .catch is a belt-and-suspenders defensive layer for any future

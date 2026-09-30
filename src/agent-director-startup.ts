@@ -68,6 +68,7 @@ import {
   AD_SHIM_CATALOG_INCOMPLETE,
   AD_SYSTEM_INSTALL_NOT_FOUND,
   AD_SYSTEM_INSTALL_TOO_OLD,
+  AD_SYSTEM_INSTALL_UNREACHABLE,
 } from './install-check.ts'
 import { PHASE1_ONLY_ERR_NAMES } from './agent-director-errors.ts'
 import { buildBelowPhase1FloorMessage, buildSystemInstallTooOldMessage, meetsPhase1Floor } from './ad-version-gate.ts'
@@ -404,7 +405,7 @@ export async function runStartupGate(
         ok: false,
         phase: 'construct',
         refusalKind: REFUSAL_KIND_OTHER,
-        classLabel: 'ad-system-install-unreachable',
+        classLabel: AD_SYSTEM_INSTALL_UNREACHABLE,
         message:
           `agent-director system install is unreachable. ` +
           `Reason: ${err.reason}. ` +

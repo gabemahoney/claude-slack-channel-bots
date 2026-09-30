@@ -41,7 +41,8 @@ import {
   PHASE1_HOST_NOTE_PHRASE,
   PHASE1_RUNBOOK_SECTION_TITLE,
 } from '../src/ad-version-gate.ts'
-import type { InstallCheckClassLabel, InstallCheckFailure } from '../src/install-check.ts'
+import type { InstallCheckFailure } from '../src/install-check.ts'
+import { AD_VERSION_FLOOR_UNREADABLE } from '../src/install-check-labels.ts'
 import {
   errSystemInstallNotFound,
   errSystemInstallTooOld,
@@ -180,11 +181,8 @@ describe('scripts/ad-version-check.ts', () => {
     expect(calls).toHaveLength(1)
   })
 
-  // No exported constant holds this label; the type pins it to a real install-check label.
-  const FLOOR_UNREADABLE: InstallCheckClassLabel = 'ad-version-floor-unreadable'
-
   test.each<[string, () => string | InstallCheckFailure, number]>([
-    ['returns its read failure', () => cannedFailureResult(FLOOR_UNREADABLE), 0],
+    ['returns its read failure', () => cannedFailureResult(AD_VERSION_FLOOR_UNREADABLE), 0],
     ['throws', () => { throw new Error('floor read failed') }, 0],
     ['returns a minimum that does not parse', () => DEV_UNPARSEABLE_VERSION, 1],
   ])('a client-minimum reader that %s fails SR-2.5 naming the runbook', async (_name, reader, resolverCalls) => {

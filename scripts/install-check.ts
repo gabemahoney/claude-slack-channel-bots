@@ -6,6 +6,13 @@
  * renders the result to stdout (success) or stderr (failure), and exits
  * with the appropriate code.
  *
+ * Success (exit 0) prints the OK block (binary, version, the client's
+ * minimum). When the binary is below CSCB's Phase 1 floor, the result carries
+ * the Phase 1 note (b.jg5 SRJ-212) and the block ends with it: the server
+ * refuses to start on that binary until agent-director Phase 1 is installed,
+ * see the switch-over runbook section. A binary that meets the floor prints
+ * the block alone.
+ *
  * Appends the manual-skill-install instructions block to every failure
  * class EXCEPT ad-version-floor-unreadable — that case's remediation is
  * "reinstall agent-director from npm," not "install the install skill."
@@ -19,17 +26,22 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { runInstallCheck } from '../src/install-check.ts'
+import { AD_VERSION_FLOOR_UNREADABLE, runInstallCheck } from '../src/install-check.ts'
 import type { InstallCheckResult } from '../src/install-check.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
 
+/** The OK block, then the Phase 1 note when the result carries one. */
 export function renderSuccess(result: InstallCheckResult & { ok: true }): string {
-  return [
+  const lines = [
     'agent-director install check: OK',
     `  binary:  ${result.binaryPath}`,
     `  version: ${result.binaryVersion}`,
     `  floor:   ${result.floor}`,
-  ].join('\n')
+  ]
+  if (result.note !== undefined) {
+    lines.push(`  note:    ${result.note}`)
+  }
+  return lines.join('\n')
 }
 
 export function renderFailure(result: InstallCheckResult & { ok: false }): string {
@@ -55,7 +67,7 @@ export async function main(): Promise<void> {
   // SR-6.3: append the manual-skill-install block to every failure class
   // EXCEPT ad-version-floor-unreadable (the skill can't fix a corrupt AD
   // package; remediation is "reinstall agent-director").
-  if (result.classLabel !== 'ad-version-floor-unreadable') {
+  if (result.classLabel !== AD_VERSION_FLOOR_UNREADABLE) {
     body += renderInstallSkillInstructions()
   }
   process.stderr.write(body + '\n')

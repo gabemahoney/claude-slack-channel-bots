@@ -1,7 +1,8 @@
 /**
  * host-safety.test.ts — Keeps unit tests' child processes away from the real
  * home and any agent-director binary, and checks the `bun test` preload guard
- * (b.jg5 SRJ-1304, SRJ-1301).
+ * (b.jg5 SRJ-1304, SRJ-1301), and audits where production code builds the
+ * client or resolves the host binary (SRJ-121).
  *
  * Sections:
  * - `hostSafeChildEnv`: the environment it builds for a child and each of its
@@ -18,6 +19,14 @@
  *   it with a path entry Bun resolves from the directory the run starts in;
  *   no named import or re-export of a Phase-1-only error class. Each matcher is pinned with
  *   synthetic flagged and allowed sources, then run over the tree.
+ * - SRJ-121's call-site audit over every `*.ts` in `src/` and `scripts/`
+ *   (`CALL_SITE_AUDITS`, the same parser): `Client.create` is reached only in
+ *   the startup gate's module, `runStartupGate` is referenced only there and
+ *   in the CLI, `runAgentDirectorStartupGate` only in the server, and
+ *   agent-director's `resolveSystemBinary` is held as a value only in the
+ *   server, the install check and `/publish`'s check. Each pinned file must
+ *   still hold its site. (That `src/ad-version-gate.ts` never imports
+ *   `./install-check.ts` is pinned in tests/ad-version-gate.test.ts.)
  * - Preload check: the shared `preloadCheckFailures` (the one the preload
  *   guard runs), each failure label (`PRELOAD_CHECK`) pinned with a row.
  * - Preload redirect: the shared, side-effect-free `preloadRedirectedEnv`
@@ -563,9 +572,32 @@ function hostTestFiles(): string[] {
  * (into a `mock.module` factory, say), and other names.
  */
 function discoveryValueFindings(sf: ts.SourceFile): string[] {
-  const findings: string[] = []
-  const flag = (node: ts.Node, what: string): void => {
-    findings.push(finding(sf, node, what))
+  return agentDirectorValueReads(sf, DISCOVERY_NAMES).map((read) => finding(sf, read.node, read.what))
+}
+
+/** One place a file holds an agent-director export as a value (see `agentDirectorValueReads`). */
+interface AgentDirectorValueRead {
+  /** The export read, or undefined when the audit cannot tell which (a computed read, a load it cannot follow, `export *`). */
+  name: string | undefined
+  /**
+   * Where: the import or export specifier, the binding element, the
+   * destructuring-assignment property, the namespace read, or the load or
+   * statement the audit cannot follow.
+   */
+  node: ts.Node
+  what: string
+}
+
+/**
+ * Every place `sf` holds one of `names` from agent-director as a value, and
+ * every read the audit cannot name (see `discoveryValueFindings` for the forms
+ * flagged and allowed). `discoveryValueFindings` is this over
+ * `DISCOVERY_NAMES`; the SRJ-121 call-site audit runs it per name.
+ */
+function agentDirectorValueReads(sf: ts.SourceFile, names: readonly string[]): AgentDirectorValueRead[] {
+  const findings: AgentDirectorValueRead[] = []
+  const flag = (node: ts.Node, what: string, name?: string): void => {
+    findings.push({ name, node, what })
   }
   const namespaces = new Set<string>()
 
@@ -578,7 +610,7 @@ function discoveryValueFindings(sf: ts.SourceFile): string[] {
       if (el.dotDotDotToken !== undefined) continue // a rest copy: collected as a namespace below
       const name = propertyNameText(el.propertyName ?? el.name)
       if (name === undefined && el.propertyName !== undefined) flag(el, 'computed destructuring of agent-director')
-      else if (name !== undefined && DISCOVERY_NAMES.includes(name)) flag(el, `destructuring of ${name} from agent-director`)
+      else if (name !== undefined && names.includes(name)) flag(el, `destructuring of ${name} from agent-director`, name)
     }
   }
 
@@ -594,7 +626,7 @@ function discoveryValueFindings(sf: ts.SourceFile): string[] {
         for (const el of bindings.elements) {
           if (el.isTypeOnly) continue
           const imported = (el.propertyName ?? el.name).text
-          if (DISCOVERY_NAMES.includes(imported)) flag(el, `value import of ${imported} from agent-director`)
+          if (names.includes(imported)) flag(el, `value import of ${imported} from agent-director`, imported)
           if (imported === 'default') namespaces.add(el.name.text)
         }
       }
@@ -607,7 +639,7 @@ function discoveryValueFindings(sf: ts.SourceFile): string[] {
       else {
         for (const el of clause.elements) {
           const exported = (el.propertyName ?? el.name).text
-          if (!el.isTypeOnly && DISCOVERY_NAMES.includes(exported)) flag(el, `value re-export of ${exported} from agent-director`)
+          if (!el.isTypeOnly && names.includes(exported)) flag(el, `value re-export of ${exported} from agent-director`, exported)
         }
       }
     } else if (moduleLoadOf(node) === AGENT_DIRECTOR_MODULE) {
@@ -647,12 +679,12 @@ function discoveryValueFindings(sf: ts.SourceFile): string[] {
 
   // Reads through a namespace or one of its copies.
   forEachNode(sf, (node) => {
-    if (ts.isPropertyAccessExpression(node) && isNamespace(node.expression) && DISCOVERY_NAMES.includes(node.name.text)) {
-      flag(node, `read of ${node.name.text} through the agent-director namespace`)
+    if (ts.isPropertyAccessExpression(node) && isNamespace(node.expression) && names.includes(node.name.text)) {
+      flag(node, `read of ${node.name.text} through the agent-director namespace`, node.name.text)
     } else if (ts.isElementAccessExpression(node) && isNamespace(node.expression)) {
       const name = stringText(node.argumentExpression)
       if (name === undefined) flag(node, 'computed read through the agent-director namespace')
-      else if (DISCOVERY_NAMES.includes(name)) flag(node, `read of ${name} through the agent-director namespace`)
+      else if (names.includes(name)) flag(node, `read of ${name} through the agent-director namespace`, name)
     } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer !== undefined && isNamespace(node.initializer)) {
       checkBindingPattern(node.name)
     } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && isNamespace(node.right)) {
@@ -660,7 +692,7 @@ function discoveryValueFindings(sf: ts.SourceFile): string[] {
       if (!ts.isObjectLiteralExpression(left)) return
       for (const prop of left.properties) {
         const name = ts.isShorthandPropertyAssignment(prop) || ts.isPropertyAssignment(prop) ? propertyNameText(prop.name) : undefined
-        if (name !== undefined && DISCOVERY_NAMES.includes(name)) flag(prop, `destructuring of ${name} from agent-director`)
+        if (name !== undefined && names.includes(name)) flag(prop, `destructuring of ${name} from agent-director`, name)
       }
     }
   })
@@ -925,6 +957,167 @@ function phase1ImportFindings(sf: ts.SourceFile): string[] {
     }
   })
   return findings
+}
+
+// ---------------------------------------------------------------------------
+// Static audit: where Client.create, the startup gate and resolveSystemBinary run (SRJ-121)
+// ---------------------------------------------------------------------------
+
+const SCRIPTS_DIR = join(REPO_ROOT, 'scripts')
+
+/** Whether the identifier `id` sits in a type: a type reference or `typeof` query (through qualified names), or an `implements` clause. */
+function inTypePosition(id: ts.Identifier): boolean {
+  let at: ts.Node = id
+  while (ts.isQualifiedName(at.parent)) at = at.parent
+  const parent = at.parent
+  if (ts.isTypeReferenceNode(parent) || ts.isTypeQueryNode(parent)) return true
+  return ts.isExpressionWithTypeArguments(parent) && ts.isHeritageClause(parent.parent) && parent.parent.token === ts.SyntaxKind.ImplementsKeyword
+}
+
+/**
+ * Whether the identifier `id` reads the local binding it names as a value:
+ * not a declared name (an import, binding element, variable, parameter,
+ * function or property key), not a member name after a `.`, not in a type
+ * (`inTypePosition`). A shorthand property `{ x }` and a local `export { x }`
+ * read `x`.
+ */
+function isValueReference(id: ts.Identifier): boolean {
+  const parent = id.parent
+  if (ts.isShorthandPropertyAssignment(parent)) return parent.name === id
+  if (ts.isExportSpecifier(parent)) return parent.parent.parent.moduleSpecifier === undefined && (parent.propertyName ?? parent.name) === id
+  if (ts.isPropertyAccessExpression(parent)) return parent.expression === id
+  if ((ts.isImportSpecifier(parent) || ts.isBindingElement(parent)) && parent.propertyName === id) return false
+  if (inTypePosition(id)) return false
+  return (parent as { name?: ts.Node }).name !== id
+}
+
+/**
+ * Where `sf` reaches agent-director's `Client.create`. The class is found in
+ * every form `agentDirectorValueReads` finds (a named or aliased import, a
+ * namespace, default-import, `require` or dynamic-import read, destructuring)
+ * and followed through `const X = <Client>` copies. Flagged: reading `create`
+ * on it (called, passed on or bound), destructuring `create` from it, a
+ * computed read on it, any other value use of the class the audit cannot
+ * follow (passed as an argument or in an object, re-exported), and every read
+ * `agentDirectorValueReads` cannot name. Allowed: the class in a type, its
+ * other members, and `create` on anything else.
+ */
+function clientCreateFindings(sf: ts.SourceFile): string[] {
+  const findings: string[] = []
+  const flag = (node: ts.Node, what: string): void => {
+    findings.push(finding(sf, node, what))
+  }
+  const aliases = new Set<string>()
+  const uses: ts.Node[] = []
+  for (const read of agentDirectorValueReads(sf, ['Client'])) {
+    const node = read.node
+    if (read.name === undefined) flag(node, read.what)
+    else if (ts.isImportSpecifier(node) || ts.isShorthandPropertyAssignment(node)) aliases.add(node.name.text)
+    else if (ts.isBindingElement(node) && ts.isIdentifier(node.name)) aliases.add(node.name.text)
+    else if (ts.isPropertyAssignment(node) && ts.isIdentifier(unwrap(node.initializer))) aliases.add((unwrap(node.initializer) as ts.Identifier).text)
+    else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) uses.push(node)
+    else flag(node, `${read.what}: Client in a form the audit cannot follow`)
+  }
+
+  const followed = new Set<ts.Node>()
+  for (let grew = true; grew;) {
+    grew = false
+    forEachNode(sf, (node) => {
+      if (ts.isIdentifier(node) && aliases.has(node.text) && isValueReference(node) && !followed.has(node)) {
+        followed.add(node)
+        uses.push(node)
+      }
+    })
+    for (let use = uses.pop(); use !== undefined; use = uses.pop()) {
+      const outer = outermost(use)
+      const context = outer.parent
+      if (ts.isPropertyAccessExpression(context) && context.expression === outer) {
+        if (context.name.text === 'create') flag(context, 'read of Client.create')
+      } else if (ts.isElementAccessExpression(context) && context.expression === outer) {
+        const member = stringText(context.argumentExpression)
+        if (member === undefined) flag(context, 'computed read on Client')
+        else if (member === 'create') flag(context, 'read of Client.create')
+      } else if (ts.isVariableDeclaration(context) && context.initializer === outer && ts.isIdentifier(context.name)) {
+        if (!aliases.has(context.name.text)) {
+          aliases.add(context.name.text)
+          grew = true
+        }
+      } else if (ts.isVariableDeclaration(context) && context.initializer === outer && ts.isObjectBindingPattern(context.name)) {
+        for (const el of context.name.elements) {
+          const member = el.dotDotDotToken === undefined ? propertyNameText(el.propertyName ?? el.name) : undefined
+          if (member === undefined) flag(el, 'destructuring of Client the audit cannot follow')
+          else if (member === 'create') flag(el, 'destructuring of create from Client')
+        }
+      } else {
+        flag(use, 'Client used as a value the audit cannot follow')
+      }
+    }
+  }
+  return findings
+}
+
+/** Where `sf` holds agent-director's `resolveSystemBinary` as a value (E1's matcher, that name only), plus every read it cannot name. */
+function resolveSystemBinaryFindings(sf: ts.SourceFile): string[] {
+  return agentDirectorValueReads(sf, ['resolveSystemBinary']).map((read) => finding(sf, read.node, read.what))
+}
+
+/**
+ * Where `sf` reaches the function `name` as a value: an identifier that reads
+ * it (`isValueReference`: a call, an argument, a shorthand property), a named
+ * import or export of it (aliased or not, type-only excluded), a member read
+ * `x.name` (a namespace or dynamic import), an element read `x['name']`, and
+ * destructuring it (`{ name }`, `{ name: y }`, `{ 'name': y }`). Not: its own
+ * declaration, an object key, `typeof name`, the name in a string, template
+ * or comment.
+ */
+function nameReferenceFindings(sf: ts.SourceFile, name: string): string[] {
+  const findings: string[] = []
+  forEachNode(sf, (node) => {
+    let hit = false
+    const parent = node.parent
+    if (ts.isIdentifier(node) && node.text === name) {
+      if (ts.isImportSpecifier(parent)) hit = !parent.isTypeOnly && !parent.parent.parent.isTypeOnly
+      else if (ts.isExportSpecifier(parent)) hit = !parent.isTypeOnly && !parent.parent.parent.isTypeOnly
+      else if (ts.isPropertyAccessExpression(parent)) hit = true
+      else if (ts.isBindingElement(parent)) hit = (parent.propertyName ?? parent.name) === node
+      else hit = isValueReference(node)
+    } else if (stringText(node) === name) {
+      hit = (ts.isElementAccessExpression(parent) && parent.argumentExpression === node) || (ts.isBindingElement(parent) && parent.propertyName === node)
+    }
+    if (hit) findings.push(finding(sf, node, `reference to ${name}`))
+  })
+  return findings
+}
+
+/** Every `*.ts` file under `src/` and `scripts/`: the production side SRJ-121's call sites are audited over. */
+function productionFiles(): string[] {
+  return [...filesUnder(SRC_DIR, (path) => path.endsWith('.ts')), ...filesUnder(SCRIPTS_DIR, (path) => path.endsWith('.ts'))].sort()
+}
+
+/**
+ * The SRJ-121 call-site audits: each matcher, and the only files (by
+ * repository path) it may find anything in.
+ *
+ * - `Client.create`: the startup gate's module (its production `createClient`).
+ * - `runStartupGate`: that module and the CLI (`initClient`).
+ * - `runAgentDirectorStartupGate` (declared in that module, which never
+ *   calls it): the server (`main()`).
+ * - `resolveSystemBinary`: the server (`main()` passes it to the runtime
+ *   re-check), the install check (its default resolver) and `/publish`'s
+ *   check (`main()` passes it in).
+ */
+const CALL_SITE_AUDITS: { what: string; audit: (sf: ts.SourceFile) => string[]; files: readonly string[] }[] = [
+  { what: 'Client.create', audit: clientCreateFindings, files: ['src/agent-director-startup.ts'] },
+  { what: 'runStartupGate', audit: (sf) => nameReferenceFindings(sf, 'runStartupGate'), files: ['src/agent-director-startup.ts', 'src/cli.ts'] },
+  { what: 'runAgentDirectorStartupGate', audit: (sf) => nameReferenceFindings(sf, 'runAgentDirectorStartupGate'), files: ['src/server.ts'] },
+  { what: 'resolveSystemBinary', audit: resolveSystemBinaryFindings, files: ['scripts/ad-version-check.ts', 'src/install-check.ts', 'src/server.ts'] },
+]
+
+/** The audit in `CALL_SITE_AUDITS` for `what`. */
+function callSiteAudit(what: string): (sf: ts.SourceFile) => string[] {
+  const entry = CALL_SITE_AUDITS.find((a) => a.what === what)
+  if (entry === undefined) throw new Error(`no call-site audit for ${what}`)
+  return entry.audit
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,6 +1392,125 @@ describe('static audit: no named import or re-export of a Phase-1-only name', ()
     const files = [...filesUnder(SRC_DIR, (path) => SCRIPT_FILE.test(path)), ...filesUnder(TESTS_DIR, (path) => SCRIPT_FILE.test(path))]
     expect(files).toContain(join(SRC_DIR, 'install-check.ts'))
     expect(auditTree(files, phase1ImportFindings)).toEqual([])
+  })
+})
+
+describe('static audit: where Client.create, the startup gate and resolveSystemBinary run (SRJ-121)', () => {
+  const CLIENT_IMPORT = "import { Client } from 'agent-director'"
+  const STARTUP_MODULE = './agent-director-startup.ts'
+  const STARTUP_NS = `import * as startup from '${STARTUP_MODULE}'`
+
+  // [audit, label, source]: each audit's rows name its own function.
+  const flagged: [what: string, label: string, source: string][] = [
+    ['Client.create', 'a direct call', lines(CLIENT_IMPORT, 'await Client.create(opts)')],
+    ['Client.create', 'a call through an aliased import', lines("import { Client as AdClient } from 'agent-director'", 'await AdClient.create(opts)')],
+    ['Client.create', 'a call through a wrapped reference', lines(CLIENT_IMPORT, 'await (Client as any).create(opts)')],
+    ['Client.create', 'a namespace read', lines(AD_NS, 'await ad.Client.create(opts)')],
+    ['Client.create', 'namespace element reads', lines(AD_NS, "await ad['Client']['create'](opts)")],
+    ['Client.create', 'a computed namespace read', lines(AD_NS, 'await ad[key].create(opts)')],
+    ['Client.create', 'a default-import read', lines("import ad from 'agent-director'", 'await ad.Client.create(opts)')],
+    ['Client.create', 'a require read', lines("const ad = require('agent-director')", 'await ad.Client.create(opts)')],
+    ['Client.create', 'a read on a dynamic import', "await (await import('agent-director')).Client.create(opts)"],
+    ['Client.create', 'a destructured dynamic import', lines("const { Client } = await import('agent-director')", 'await Client.create(opts)')],
+    ['Client.create', 'an aliased destructuring from the namespace', lines(AD_NS, 'const { Client: C } = ad', 'await C.create(opts)')],
+    ['Client.create', 'a destructuring assignment from the namespace', lines(AD_NS, 'let C', '({ Client: C } = ad)', 'await C.create(opts)')],
+    ['Client.create', 'const copies of the class', lines(CLIENT_IMPORT, 'const C = Client', 'const D = C', 'await D.create(opts)')],
+    ['Client.create', 'create passed on as a value', lines(CLIENT_IMPORT, 'const deps = { createClient: Client.create }')],
+    ['Client.create', 'create destructured from the class', lines(CLIENT_IMPORT, 'const { create } = Client')],
+    ['Client.create', 'a computed read on the class', lines(CLIENT_IMPORT, 'await Client[key](opts)')],
+    ['Client.create', 'the class passed as an argument', lines(CLIENT_IMPORT, 'makeGate(Client)')],
+    ['Client.create', 'the class in an object', lines(CLIENT_IMPORT, 'makeGate({ Client })')],
+    ['Client.create', 'the class re-exported from agent-director', "export { Client } from 'agent-director'"],
+    ['Client.create', 'the class re-exported locally', lines(CLIENT_IMPORT, 'export { Client }')],
+    ['resolveSystemBinary', 'a named value import', "import { resolveSystemBinary } from 'agent-director'"],
+    ['resolveSystemBinary', 'an aliased value import', "import { resolveSystemBinary as find } from 'agent-director'"],
+    ['resolveSystemBinary', 'a namespace read passed as a value', lines(AD_NS, 'installRecheck({ resolveSystemBinary: ad.resolveSystemBinary })')],
+    ['resolveSystemBinary', 'a namespace element read', lines(AD_NS, "await ad['resolveSystemBinary']()")],
+    ['resolveSystemBinary', 'a computed namespace read', lines(AD_NS, 'await ad[key]()')],
+    ['resolveSystemBinary', 'a read on a dynamic import', "await (await import('agent-director')).resolveSystemBinary()"],
+    ['resolveSystemBinary', 'an aliased destructured dynamic import', "const { resolveSystemBinary: find } = await import('agent-director')"],
+    ['resolveSystemBinary', 'a re-export', "export { resolveSystemBinary } from 'agent-director'"],
+    ['resolveSystemBinary', 'a re-export of the whole module', "export * from 'agent-director'"],
+    ['runStartupGate', 'a direct call', lines(`import { runStartupGate } from '${STARTUP_MODULE}'`, 'await runStartupGate()')],
+    ['runStartupGate', 'an aliased import', `import { runStartupGate as gate } from '${STARTUP_MODULE}'`],
+    ['runStartupGate', 'a namespace read', lines(STARTUP_NS, 'await startup.runStartupGate()')],
+    ['runStartupGate', 'a namespace element read', lines(STARTUP_NS, "await startup['runStartupGate']()")],
+    ['runStartupGate', 'a read on a dynamic import', `await (await import('${STARTUP_MODULE}')).runStartupGate()`],
+    ['runStartupGate', 'an aliased destructured dynamic import', `const { runStartupGate: gate } = await import('${STARTUP_MODULE}')`],
+    ['runStartupGate', 'a string-keyed destructuring', lines(STARTUP_NS, "const { 'runStartupGate': gate } = startup")],
+    ['runStartupGate', 'the function passed on as a value', lines(`import { runStartupGate } from '${STARTUP_MODULE}'`, 'const deps = { initClient: runStartupGate }')],
+    ['runStartupGate', 'a re-export', `export { runStartupGate } from '${STARTUP_MODULE}'`],
+    ['runAgentDirectorStartupGate', 'a direct call', lines(`import { runAgentDirectorStartupGate } from '${STARTUP_MODULE}'`, 'await runAgentDirectorStartupGate()')],
+    ['runAgentDirectorStartupGate', 'a namespace read', lines(STARTUP_NS, 'await startup.runAgentDirectorStartupGate()')],
+  ]
+
+  test.each(flagged)('%s: flags %s', (what, _label, source) => {
+    expect(callSiteAudit(what)(parse(source)).length).toBeGreaterThan(0)
+  })
+
+  const TEXT_ONLY = (name: string): string => lines(
+    `// ${name}()`,
+    `/* await ${name}() */`,
+    `const s = "${name}()"`,
+    `const t = \`${name}()\``,
+    `const r = /${name}\\(\\)/`,
+  )
+
+  const allowed: [what: string, label: string, source: string][] = [
+    ['Client.create', 'a type-only import in types', lines("import type { Client } from 'agent-director'", 'let client: Client | undefined')],
+    ['Client.create', 'a value import used only in types', lines(
+      CLIENT_IMPORT,
+      'let singleton: Client | null = null',
+      'const c = x as Client',
+      "type D = Pick<Client, 'decide'>",
+      'type F = typeof Client.create',
+      'class Fake implements Client {}',
+    )],
+    ['Client.create', 'another member of the class', lines(CLIENT_IMPORT, 'const n = Client.name')],
+    ['Client.create', 'create on anything else', lines("import { Client } from './fake-client.ts'", 'await Client.create(opts)', 'await stub.Client.create(opts)', 'await factory.create(opts)')],
+    ['Client.create', 'other names read through the namespace', lines(AD_NS, 'ad.ErrSystemInstallNotFound.name')],
+    ['Client.create', 'text in strings, templates, regex literals and comments', lines(CLIENT_IMPORT, "// Client.create(opts)", "const s = 'Client.create(opts)'", 'const t = `Client.create()`', 'const r = /Client\\.create\\(/')],
+    ['resolveSystemBinary', 'a type-only import', "import type { ResolveSystemBinaryResult } from 'agent-director'"],
+    ['resolveSystemBinary', 'an injected resolver', lines(
+      'interface Deps { resolveSystemBinary: () => Promise<unknown> }',
+      'await deps.resolveSystemBinary()',
+      'const stubbed = { resolveSystemBinary: stub }',
+      'const settled = await settle(deps.resolveSystemBinary)',
+    )],
+    ['resolveSystemBinary', 'the same name from another module', lines("import { resolveSystemBinary } from './stub.ts'", 'await resolveSystemBinary()')],
+    ['resolveSystemBinary', 'text in strings, templates, regex literals and comments', TEXT_ONLY('resolveSystemBinary')],
+    ['runStartupGate', 'its own declaration', 'export async function runStartupGate() {}'],
+    ['runStartupGate', 'a type-only import in a type query', lines(`import type { runStartupGate } from '${STARTUP_MODULE}'`, 'type Gate = typeof runStartupGate')],
+    ['runStartupGate', 'another name holding it', lines(`import { runAgentDirectorStartupGate } from '${STARTUP_MODULE}'`, 'await runAgentDirectorStartupGate()')],
+    ['runStartupGate', 'an object key', "const labels = { runStartupGate: 'gate' }"],
+    ['runStartupGate', 'text in strings, templates, regex literals and comments', TEXT_ONLY('runStartupGate')],
+    ['runAgentDirectorStartupGate', 'its own declaration', 'export async function runAgentDirectorStartupGate() {}'],
+    ['runAgentDirectorStartupGate', 'text in strings, templates, regex literals and comments', TEXT_ONLY('runAgentDirectorStartupGate')],
+  ]
+
+  test.each(allowed)('%s: allows %s', (what, _label, source) => {
+    expect(callSiteAudit(what)(parse(source))).toEqual([])
+  })
+
+  test('the audited files: every *.ts under src/ and scripts/, the pinned ones included', () => {
+    const files = productionFiles().map((path) => relative(REPO_ROOT, path))
+
+    expect(files).toEqual(expect.arrayContaining(['src/postinstall.ts', 'scripts/install-check.ts', ...CALL_SITE_AUDITS.flatMap((a) => a.files)]))
+    expect(files.every((path) => path.startsWith(`src${sep}`) || path.startsWith(`scripts${sep}`))).toBe(true)
+  })
+
+  test.each(CALL_SITE_AUDITS.map((a) => [a.what, a] as const))('the current tree: %s is reached only in its pinned files, and in each of them', (_what, { audit, files }) => {
+    const pinned = new Set(files)
+    const others = productionFiles().filter((path) => !pinned.has(relative(REPO_ROOT, path)))
+
+    expect(auditTree(others, audit)).toEqual([])
+    expect(files.filter((path) => audit(parseFile(join(REPO_ROOT, path))).length === 0)).toEqual([])
+  })
+
+  test('the current tree: the startup gate module reaches Client.create at one place only', () => {
+    const findings = clientCreateFindings(parseFile(join(SRC_DIR, 'agent-director-startup.ts')))
+
+    expect(findings).toEqual([expect.stringMatching(/: read of Client\.create$/)])
   })
 })
 

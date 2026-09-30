@@ -81,6 +81,7 @@ import {
   AD_SHIM_CATALOG_INCOMPLETE,
   AD_SYSTEM_INSTALL_NOT_FOUND,
   AD_SYSTEM_INSTALL_TOO_OLD,
+  AD_SYSTEM_INSTALL_UNREACHABLE,
 } from '../src/install-check.ts'
 import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE, RUNTIME_RECHECK_PHRASE } from '../src/ad-version-gate.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
@@ -721,7 +722,7 @@ describe('b.jg5 SRJ-103: re-exported error classes', () => {
 // operator exactly which install action to take.
 
 describe('SR-4.2: system-install typed-error branches', () => {
-  test('ErrSystemInstallNotFound → ad-system-install-not-found', async () => {
+  test(`ErrSystemInstallNotFound → ${AD_SYSTEM_INSTALL_NOT_FOUND}`, async () => {
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ error: errSystemInstallNotFound() }),
       statSync: defaultStat,
@@ -746,7 +747,7 @@ describe('SR-4.2: system-install typed-error branches', () => {
   // each is a distinct failure signature that translates directly into the
   // operator-facing remediation step.
 
-  test("ErrSystemInstallUnreachable reason='not-executable' → ad-system-install-unreachable", async () => {
+  test(`ErrSystemInstallUnreachable reason='not-executable' → ${AD_SYSTEM_INSTALL_UNREACHABLE}`, async () => {
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('not-executable') }),
       statSync: defaultStat,
@@ -755,14 +756,14 @@ describe('SR-4.2: system-install typed-error branches', () => {
     })
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
-      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
       expect(outcome.message).toContain('not-executable')
       // SR-4.5: appends the manual-skill-install instructions block.
       expect(outcome.message).toContain('skills/install-cscb/SKILL.md')
     }
   })
 
-  test("ErrSystemInstallUnreachable reason='not-a-regular-file' → ad-system-install-unreachable", async () => {
+  test(`ErrSystemInstallUnreachable reason='not-a-regular-file' → ${AD_SYSTEM_INSTALL_UNREACHABLE}`, async () => {
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('not-a-regular-file') }),
       statSync: defaultStat,
@@ -771,12 +772,12 @@ describe('SR-4.2: system-install typed-error branches', () => {
     })
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
-      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
       expect(outcome.message).toContain('not-a-regular-file')
     }
   })
 
-  test("ErrSystemInstallUnreachable reason='probe-timeout' → ad-system-install-unreachable", async () => {
+  test(`ErrSystemInstallUnreachable reason='probe-timeout' → ${AD_SYSTEM_INSTALL_UNREACHABLE}`, async () => {
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('probe-timeout') }),
       statSync: defaultStat,
@@ -785,12 +786,12 @@ describe('SR-4.2: system-install typed-error branches', () => {
     })
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
-      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
       expect(outcome.message).toContain('probe-timeout')
     }
   })
 
-  test("ErrSystemInstallUnreachable reason='probe-nonzero-exit' → ad-system-install-unreachable", async () => {
+  test(`ErrSystemInstallUnreachable reason='probe-nonzero-exit' → ${AD_SYSTEM_INSTALL_UNREACHABLE}`, async () => {
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('probe-nonzero-exit') }),
       statSync: defaultStat,
@@ -799,12 +800,12 @@ describe('SR-4.2: system-install typed-error branches', () => {
     })
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
-      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
       expect(outcome.message).toContain('probe-nonzero-exit')
     }
   })
 
-  test("ErrSystemInstallUnreachable reason='probe-killed-by-signal' → ad-system-install-unreachable", async () => {
+  test(`ErrSystemInstallUnreachable reason='probe-killed-by-signal' → ${AD_SYSTEM_INSTALL_UNREACHABLE}`, async () => {
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('probe-killed-by-signal') }),
       statSync: defaultStat,
@@ -813,12 +814,12 @@ describe('SR-4.2: system-install typed-error branches', () => {
     })
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
-      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
       expect(outcome.message).toContain('probe-killed-by-signal')
     }
   })
 
-  test("ErrSystemInstallUnreachable reason='unparseable-version' → ad-system-install-unreachable", async () => {
+  test(`ErrSystemInstallUnreachable reason='unparseable-version' → ${AD_SYSTEM_INSTALL_UNREACHABLE}`, async () => {
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('unparseable-version') }),
       statSync: defaultStat,
@@ -827,12 +828,12 @@ describe('SR-4.2: system-install typed-error branches', () => {
     })
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
-      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
       expect(outcome.message).toContain('unparseable-version')
     }
   })
 
-  test("ErrSystemInstallUnreachable reason='spawn-failed' → ad-system-install-unreachable", async () => {
+  test(`ErrSystemInstallUnreachable reason='spawn-failed' → ${AD_SYSTEM_INSTALL_UNREACHABLE}`, async () => {
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('spawn-failed') }),
       statSync: defaultStat,
@@ -841,12 +842,12 @@ describe('SR-4.2: system-install typed-error branches', () => {
     })
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
-      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
       expect(outcome.message).toContain('spawn-failed')
     }
   })
 
-  test("ErrSystemInstallUnreachable reason='other' → ad-system-install-unreachable", async () => {
+  test(`ErrSystemInstallUnreachable reason='other' → ${AD_SYSTEM_INSTALL_UNREACHABLE}`, async () => {
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('other') }),
       statSync: defaultStat,
@@ -855,7 +856,7 @@ describe('SR-4.2: system-install typed-error branches', () => {
     })
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
-      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
       expect(outcome.message).toContain('other')
     }
   })
@@ -1048,7 +1049,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
         error: errSystemInstallUnreachable('unparseable-version', DEV_UNPARSEABLE_VERSION),
       }),
       phase: 'construct',
-      classLabel: 'ad-system-install-unreachable',
+      classLabel: AD_SYSTEM_INSTALL_UNREACHABLE,
       refusalKind: REFUSAL_KIND_OTHER,
       named: ['unparseable-version'],
     },
@@ -1181,7 +1182,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: refusal kind of every other failure branch',
   test.each<[string, Partial<StartupGateDeps>]>([
     ['ad-bun-version-too-old', { createClient: makeStubCreateClient({ error: errBunVersionTooOld() }) }],
     [AD_SYSTEM_INSTALL_NOT_FOUND, { createClient: makeStubCreateClient({ error: errSystemInstallNotFound() }) }],
-    ['ad-system-install-unreachable', { createClient: makeStubCreateClient({ error: errSystemInstallUnreachable() }) }],
+    [AD_SYSTEM_INSTALL_UNREACHABLE, { createClient: makeStubCreateClient({ error: errSystemInstallUnreachable() }) }],
     ['ad-client-construct', { createClient: makeStubCreateClient({ error: new Error('boom') }) }],
     ['ad-shim-missing-get-permission', { probeGetPermission: () => false }],
     [AD_SHIM_CATALOG_INCOMPLETE, { probeErrorCatalog: () => ({ ok: false, missing: ['ErrInvalidFlags'] }) }],

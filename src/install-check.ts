@@ -1,26 +1,41 @@
 /**
- * install-check.ts — SR-5 shared install-check module.
+ * install-check.ts — the agent-director install check (b.jg5 SRJ-212).
  *
- * Source of truth for "is agent-director system-installed at a version
- * meeting AD's declared floor?" — consumed by:
- *   - The `bun run install-check` script (scripts/install-check.ts; Epic 2).
- *   - The install-cscb skill (skills/install-cscb; Epic 3).
+ * Answers "is agent-director installed on this host at a version this CSCB
+ * release can be installed beside?" for:
+ *   - the `bun run install-check` script (`scripts/install-check.ts`);
+ *   - the install-cscb skill (`skills/install-cscb`);
+ *   - the npm postinstall's agent-director probe (`src/postinstall.ts`).
  *
- * The startup gate (Epic 1, agent-director-startup.ts) does NOT call
- * `runInstallCheck()` — AD's own `Client.create()` enforces the same floor
- * against the same `dist/version-floor.json`. The gate imports only the
- * class-label values, which live in the leaf module `install-check-labels.ts`
- * and are re-exported here. `AD_SYSTEM_INSTALL_NOT_FOUND` and
- * `AD_SYSTEM_INSTALL_TOO_OLD` are shared: the gate and this check report
- * them for the same failures. `AD_BELOW_PHASE1_FLOOR` and
- * `AD_SHIM_CATALOG_INCOMPLETE` are defined here but only the startup gate
- * writes them; this check never reports either. CSCB never
- * duplicates the client's floor decision; its own Phase 1 floor lives in
- * `ad-version-gate.ts` (b.jg5 SRJ-203).
+ * {@link runInstallCheck} reads the installed client's minimum binary version
+ * ({@link readClientMinVersion}), makes one call to the injected resolver
+ * (default: the client's own `resolveSystemBinary`; tests pass a stub,
+ * b.jg5 SRJ-121) and applies the one host-version decision,
+ * `decideHostAdVersion` in `src/ad-version-gate.ts`, which `/publish`'s
+ * check `scripts/ad-version-check.ts` shares (b.jg5 SRJ-211). The decision
+ * classifies agent-director errors by name, never `instanceof`:
+ *   - a missing binary, a version that cannot be read (every
+ *     `ErrSystemInstallUnreachable` reason, or a resolved version that does
+ *     not parse, reported with reason `unparseable-version`), a binary below
+ *     the client's minimum, or any other failure fails with its class label;
+ *     the too-old message names the switch-over runbook section and no
+ *     message advises upgrading agent-director;
+ *   - a binary the client accepts but below CSCB's Phase 1 floor (`0.10.0`,
+ *     `0.0.0-dev`) passes with the Phase 1 `note`: the server refuses to start
+ *     on it until agent-director Phase 1 is installed;
+ *   - a binary that meets the floor passes with no note.
+ *
+ * The startup gate (`src/agent-director-startup.ts`) does not call
+ * `runInstallCheck()`; it builds the client with `Client.create()` and applies
+ * CSCB's Phase 1 floor itself, so a binary that passes this check with its
+ * note is still refused at start. The class labels live in the leaf module
+ * `install-check-labels.ts` and are re-exported here. The not-found, too-old
+ * and unreachable labels are shared with the startup gate;
+ * `AD_BELOW_PHASE1_FLOOR` and `AD_SHIM_CATALOG_INCOMPLETE` are written only by
+ * the startup gate, and this check never reports either.
  *
  * {@link readClientMinVersion} (the installed client's `min_binary_version`)
- * is also read by `/publish`'s preflight check, `scripts/ad-version-check.ts`
- * (b.jg5 SRJ-211).
+ * is also read by `/publish`'s check.
  *
  * The module is strictly side-effect-free:
  *   - No process.exit.
@@ -35,19 +50,28 @@
 
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import semver from 'semver'
-import {
-  DEV_SENTINEL_VERSION,
-  ErrSystemInstallNotFound,
-  ErrSystemInstallTooOld,
-  ErrSystemInstallUnreachable,
-  resolveSystemBinary,
-} from 'agent-director'
-import type { UnreachableReason } from 'agent-director'
+import { resolveSystemBinary } from 'agent-director'
+import type { ResolveSystemBinaryResult, UnreachableReason } from 'agent-director'
 
+import {
+  buildInstallCheckPhase1Note,
+  buildSystemInstallTooOldMessage,
+  decideHostAdVersion,
+  HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM,
+  HOST_VERSION_FAIL_CLIENT_MINIMUM_UNREADABLE,
+  HOST_VERSION_FAIL_NOT_FOUND,
+  HOST_VERSION_FAIL_OTHER,
+  HOST_VERSION_FAIL_VERSION_UNREADABLE,
+  HOST_VERSION_OUTCOME_FAIL,
+  HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR,
+  type HostVersionCallResult,
+  type HostVersionFailure,
+} from './ad-version-gate.ts'
 import {
   AD_SYSTEM_INSTALL_NOT_FOUND,
   AD_SYSTEM_INSTALL_TOO_OLD,
+  AD_SYSTEM_INSTALL_UNREACHABLE,
+  AD_VERSION_FLOOR_UNREADABLE,
   type InstallCheckClassLabel,
 } from './install-check-labels.ts'
 
@@ -56,15 +80,22 @@ export {
   AD_SHIM_CATALOG_INCOMPLETE,
   AD_SYSTEM_INSTALL_NOT_FOUND,
   AD_SYSTEM_INSTALL_TOO_OLD,
+  AD_SYSTEM_INSTALL_UNREACHABLE,
+  AD_VERSION_FLOOR_UNREADABLE,
 } from './install-check-labels.ts'
 export type { InstallCheckClassLabel } from './install-check-labels.ts'
 
-/** Success arm: AD is installed, version satisfies the declared floor. */
+/**
+ * Success arm: agent-director is installed at or above the client's minimum
+ * (`floor`). `note` is present only when the binary is below CSCB's Phase 1
+ * floor: the Phase 1 note naming the switch-over runbook section.
+ */
 export interface InstallCheckSuccess {
   ok: true
   binaryPath: string
   binaryVersion: string
   floor: string
+  note?: string
 }
 
 /** Failure arm: one of the four canonical class labels. */
@@ -102,7 +133,7 @@ export function readClientMinVersion(): string | InstallCheckFailure {
   } catch (err) {
     cachedFloor = {
       ok: false,
-      classLabel: 'ad-version-floor-unreadable',
+      classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
         `Could not resolve 'agent-director/dist/version-floor.json' from the installed ` +
         `agent-director package. Reinstall agent-director from npm and retry.`,
@@ -117,7 +148,7 @@ export function readClientMinVersion(): string | InstallCheckFailure {
   } catch (err) {
     cachedFloor = {
       ok: false,
-      classLabel: 'ad-version-floor-unreadable',
+      classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
         `Could not read agent-director's dist/version-floor.json. ` +
         `Reinstall agent-director from npm and retry.`,
@@ -132,7 +163,7 @@ export function readClientMinVersion(): string | InstallCheckFailure {
   } catch (err) {
     cachedFloor = {
       ok: false,
-      classLabel: 'ad-version-floor-unreadable',
+      classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
         `agent-director's dist/version-floor.json failed to parse as JSON. ` +
         `Reinstall agent-director from npm and retry.`,
@@ -145,7 +176,7 @@ export function readClientMinVersion(): string | InstallCheckFailure {
   if (typeof floor !== 'string' || floor.length === 0) {
     cachedFloor = {
       ok: false,
-      classLabel: 'ad-version-floor-unreadable',
+      classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
         `agent-director's dist/version-floor.json is missing the required '.min_binary_version' field ` +
         `(or it is not a non-empty string). Reinstall agent-director from npm and retry.`,
@@ -158,112 +189,166 @@ export function readClientMinVersion(): string | InstallCheckFailure {
   return floor
 }
 
-/**
- * Strip a leading 'v' from a version string, idempotent for inputs that
- * already lack the prefix. AD has historically shipped both forms.
- */
-function stripLeadingV(version: string): string {
-  return version.startsWith('v') ? version.slice(1) : version
+/** agent-director's `resolveSystemBinary`, or a stand-in with its shape. */
+export type InstallCheckResolveSystemBinary = () => Promise<ResolveSystemBinaryResult>
+
+/** Dependencies of {@link runInstallCheck}. */
+export interface InstallCheckDeps {
+  /**
+   * Resolves the host's agent-director binary; default: the client's own
+   * `resolveSystemBinary`. Tests pass a stub (b.jg5 SRJ-121, SRJ-1301).
+   */
+  resolveSystemBinary?: InstallCheckResolveSystemBinary
+}
+
+/** One settled resolver call; a synchronous throw counts as a rejection. Never rejects. */
+async function settleResolve(resolve: InstallCheckResolveSystemBinary): Promise<HostVersionCallResult> {
+  try {
+    return { kind: 'resolved', value: await resolve() }
+  } catch (error) {
+    return { kind: 'rejected', error }
+  }
+}
+
+/** Read one property of any value without throwing (a getter may throw). */
+function readField(value: unknown, key: string): unknown {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined
+  try {
+    return (value as Record<string, unknown>)[key]
+  } catch {
+    return undefined
+  }
+}
+
+/** An `ErrSystemInstallUnreachable` reason: a short lowercase, hyphenated word. */
+const SAFE_REASON_RE = /^[a-z][a-z0-9-]{0,63}$/
+
+/** The reason of a resolved version that does not parse. */
+const UNPARSEABLE_VERSION_REASON: UnreachableReason = 'unparseable-version'
+
+/** The reason of any failure the decision classes as other. */
+const OTHER_REASON: UnreachableReason = 'other'
+
+/** A thrown `ErrSystemInstallUnreachable`'s reason when it is a short safe word, else `other`. */
+function unreachableReason(error: unknown): string {
+  const reason = readField(error, 'reason')
+  return typeof reason === 'string' && SAFE_REASON_RE.test(reason) ? reason : OTHER_REASON
+}
+
+/** A nullable field of a thrown error, as the error carries it, else `null`. */
+function nullableField(error: unknown, key: string): unknown {
+  return readField(error, key) ?? null
+}
+
+/** The `ad-system-install-unreachable` message, built from a path, a reason word and fixed text. */
+function unreachableMessage(binaryPath: string, reason: string): string {
+  return (
+    `agent-director system install at ${binaryPath} is unreachable. ` +
+    `Reason: ${reason}. Diagnose with the install-cscb skill or re-install agent-director.`
+  )
 }
 
 /**
- * Run the full check. See module header for semantics. The result is one of
- * five shapes: success, or one of the four failure class labels.
+ * Map the host-version decision's failure to the install check's failure arm.
+ * `settled` is the resolver call the decision judged; a thrown value's
+ * structural fields fill the detail.
  */
-export async function runInstallCheck(): Promise<InstallCheckResult> {
-  const floorOrFailure = readClientMinVersion()
-  if (typeof floorOrFailure !== 'string') return floorOrFailure
-  const floor = floorOrFailure
-
-  let resolved: { path: string; version: string }
-  try {
-    resolved = await resolveSystemBinary()
-  } catch (err) {
-    if (err instanceof ErrSystemInstallNotFound) {
+function failureResult(failure: HostVersionFailure, settled: HostVersionCallResult): InstallCheckFailure {
+  const thrown = settled.kind === 'rejected'
+  const error = thrown ? settled.error : undefined
+  switch (failure.kind) {
+    case HOST_VERSION_FAIL_NOT_FOUND:
       return {
         ok: false,
         classLabel: AD_SYSTEM_INSTALL_NOT_FOUND,
         message:
           `agent-director not found on PATH or at the standard install path. ` +
           `Install agent-director system-wide and retry.`,
-        detail: { checkedLocations: err.checkedLocations },
+        detail: { checkedLocations: readField(error, 'checkedLocations') },
       }
-    }
-    if (err instanceof ErrSystemInstallTooOld) {
+    case HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM:
       return {
         ok: false,
         classLabel: AD_SYSTEM_INSTALL_TOO_OLD,
-        message:
-          `agent-director system install at ${err.binaryPath} reports version ${err.actualVersion}, ` +
-          `which is below the declared floor ${err.requiredVersion}. Upgrade agent-director and retry.`,
+        message: buildSystemInstallTooOldMessage({
+          foundVersion: failure.foundVersion,
+          requiredVersion: failure.requiredVersion,
+          binaryPath: failure.binaryPath,
+        }),
         detail: {
-          detected: err.actualVersion,
-          required: err.requiredVersion,
-          binaryPath: err.binaryPath,
+          detected: failure.foundVersion,
+          required: failure.requiredVersion,
+          binaryPath: failure.binaryPath,
         },
       }
-    }
-    if (err instanceof ErrSystemInstallUnreachable) {
-      const reason: UnreachableReason = err.reason
+    case HOST_VERSION_FAIL_VERSION_UNREADABLE: {
+      // Thrown: an ErrSystemInstallUnreachable of any reason. Resolved: a
+      // version the client's strict rule cannot parse (a leading `v` included).
+      const reason = thrown ? unreachableReason(error) : UNPARSEABLE_VERSION_REASON
       return {
         ok: false,
-        classLabel: 'ad-system-install-unreachable',
-        message:
-          `agent-director system install at ${err.binaryPath} is unreachable. ` +
-          `Reason: ${reason}. Diagnose with the install-cscb skill or re-install agent-director.`,
+        classLabel: AD_SYSTEM_INSTALL_UNREACHABLE,
+        message: unreachableMessage(failure.binaryPath, reason),
         detail: {
           reason,
-          binaryPath: err.binaryPath,
-          diagnostic: err.diagnostic,
-          exitCode: err.exitCode,
-          signal: err.signal,
+          binaryPath: failure.binaryPath,
+          diagnostic: thrown ? nullableField(error, 'diagnostic') : failure.detail,
+          exitCode: thrown ? nullableField(error, 'exitCode') : null,
+          signal: thrown ? nullableField(error, 'signal') : null,
         },
       }
     }
-    // Non-typed throw — surface verbatim under the unreachable label so
-    // callers have one failure-arm shape to dispatch on.
-    return {
-      ok: false,
-      classLabel: 'ad-system-install-unreachable',
-      message:
-        `agent-director system install probe threw an unexpected error: ` +
-        `${(err as Error).message ?? String(err)}. Re-install agent-director or file a bug.`,
-      detail: { underlying: String(err), reason: 'other' as UnreachableReason },
-    }
+    case HOST_VERSION_FAIL_CLIENT_MINIMUM_UNREADABLE:
+      return {
+        ok: false,
+        classLabel: AD_VERSION_FLOOR_UNREADABLE,
+        message:
+          `agent-director's dist/version-floor.json '.min_binary_version' field is ` +
+          `${JSON.stringify(failure.clientMinimum)}, which is not a version, so the host's ` +
+          `agent-director cannot be checked. Check the agent-director npm package installed with CSCB.`,
+        detail: { minBinaryVersion: failure.clientMinimum },
+      }
+    case HOST_VERSION_FAIL_OTHER:
+      // Token-free: the thrown value's name or type, never its own message.
+      return {
+        ok: false,
+        classLabel: AD_SYSTEM_INSTALL_UNREACHABLE,
+        message:
+          `agent-director system install probe failed unexpectedly: ${failure.description}. ` +
+          `Re-install agent-director or file a bug.`,
+        detail: { underlying: failure.description, reason: OTHER_REASON },
+      }
+  }
+}
+
+/**
+ * Run the full check (b.jg5 SRJ-212); see the module header. Reads the
+ * client minimum (cached), makes one resolver call and applies the shared
+ * host-version decision. The result is success (with the Phase 1 `note` when
+ * the binary is below CSCB's floor) or one of the four failure class labels.
+ * Never throws.
+ */
+export async function runInstallCheck(deps: InstallCheckDeps = {}): Promise<InstallCheckResult> {
+  const floorOrFailure = readClientMinVersion()
+  if (typeof floorOrFailure !== 'string') return floorOrFailure
+  const floor = floorOrFailure
+
+  const settled = await settleResolve(deps.resolveSystemBinary ?? resolveSystemBinary)
+  const outcome = decideHostAdVersion(settled, floor)
+  if (outcome.kind === HOST_VERSION_OUTCOME_FAIL) {
+    return failureResult(outcome.failure, settled)
   }
 
-  const detectedRaw = resolved.version
-
-  // SR-5: sentinel-equality short-circuit. A detected version exactly equal
-  // to DEV_SENTINEL_VERSION passes unconditionally — this is how locally-
-  // built dev binaries (without a real semver) pass the check.
-  if (detectedRaw === DEV_SENTINEL_VERSION) {
-    return {
-      ok: true,
-      binaryPath: resolved.path,
-      binaryVersion: detectedRaw,
-      floor,
-    }
-  }
-
-  const detected = stripLeadingV(detectedRaw)
-  if (!semver.gte(detected, floor)) {
-    return {
-      ok: false,
-      classLabel: AD_SYSTEM_INSTALL_TOO_OLD,
-      message:
-        `agent-director system install at ${resolved.path} reports version ${detectedRaw}, ` +
-        `which is below the declared floor ${floor}. Upgrade agent-director and retry.`,
-      detail: { detected: detectedRaw, required: floor, binaryPath: resolved.path },
-    }
-  }
-
-  return {
+  const success: InstallCheckSuccess = {
     ok: true,
-    binaryPath: resolved.path,
-    binaryVersion: detectedRaw,
+    binaryPath: outcome.binaryPath,
+    binaryVersion: outcome.version,
     floor,
   }
+  if (outcome.kind === HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR) {
+    success.note = buildInstallCheckPhase1Note(outcome.version)
+  }
+  return success
 }
 
 /**

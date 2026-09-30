@@ -8,14 +8,20 @@
  * `<home>/.claude/skills`), the state dir and the MCP config path under one
  * `mkdtempSync` root, removed in afterEach. No call falls back to the OS home.
  * Cases that leave `stateDir` unset control SLACK_STATE_DIR in-process and
- * restore it (and the working directory) in afterEach. The probe's
- * `agent-director` import is replaced with `mock.module` in beforeEach, so no
- * real Client opens `~/.agent-director`.
+ * restore it (and the working directory) in afterEach.
+ *
+ * The agent-director probe (b.jg5 SRJ-121) is driven in process with an
+ * injected install check (`deps.runInstallCheck`) answering canned results
+ * from `tests/test-helpers/install-check-fixtures.ts`, so no case runs the
+ * real install check, resolves the host binary, builds a client or opens an
+ * agent-director store. Every probe case checks that the probe adds no
+ * install, upgrade or `bun add` advice of its own (AC 81); a failure warning
+ * carries the install check's message, which is excluded from that scan.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, afterEach, beforeEach, mock, spyOn } from 'bun:test'
+import { describe, test, expect, afterEach, beforeEach, spyOn } from 'bun:test'
 import {
   chmodSync,
   existsSync,
@@ -33,14 +39,33 @@ import {
 import { tmpdir } from 'os'
 import { join, relative } from 'path'
 import { fileURLToPath } from 'url'
-import * as adNamespace from 'agent-director'
 import {
-  readAdDependencyRange,
   runAgentDirectorPostinstallProbe,
   runPostinstall,
+  type PostinstallInstallCheck,
   type PostinstallOptions,
 } from '../src/postinstall.ts'
 import { MCP_SERVER_NAME, loadPersonaConfig } from '../src/config.ts'
+import {
+  INSTALL_CHECK_PHASE1_NOTE_PHRASE,
+  PHASE1_RUNBOOK_SECTION_TITLE,
+  buildInstallCheckPhase1Note,
+} from '../src/ad-version-gate.ts'
+import {
+  AD_SYSTEM_INSTALL_NOT_FOUND,
+  AD_SYSTEM_INSTALL_TOO_OLD,
+  AD_SYSTEM_INSTALL_UNREACHABLE,
+  AD_VERSION_FLOOR_UNREADABLE,
+} from '../src/install-check-labels.ts'
+import type { InstallCheckResult } from '../src/install-check.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import {
+  DEV_PLACEHOLDER_VERSION,
+  OLD_AD_VERSION,
+  PHASE1_RC_VERSION,
+} from './test-helpers/agent-director-versions.ts'
+import { cannedFailureResult, cannedSuccessResult } from './test-helpers/install-check-fixtures.ts'
+import { UPGRADE_FORMS, type ForbiddenForm } from './test-helpers/upgrade-forms.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -54,13 +79,6 @@ const RETIRED_SKILL = 'claude-slack-channels-config'
 const RETIRED_PACKAGE_PATH = join(PACKAGE_SKILLS, RETIRED_SKILL)
 
 const isRoot = process.getuid?.() === 0
-
-/**
- * agent-director's real exports, copied at import. `mock.module` rewrites the
- * live namespace in place and, under Bun 1.4, `mock.restore()` does not undo
- * it, so the probe tests put this copy back themselves.
- */
-const REAL_AD = { ...adNamespace }
 
 let tempDirs: string[] = []
 let savedStateDirEnv: string | undefined
@@ -663,30 +681,21 @@ describe('running twice', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-5.2: best-effort agent-director probe (agent-director stubbed)
+// SR-5.2 / b.jg5 SRJ-121: the agent-director probe over an injected install check
 // ---------------------------------------------------------------------------
 
-describe('runAgentDirectorPostinstallProbe (SR-5.2)', () => {
-  /** What the stubbed `Client.create` does in the current test. */
-  let createImpl: (opts: unknown) => Promise<unknown>
-  let createCalls: unknown[]
-  let closeCalls: number
+describe('runAgentDirectorPostinstallProbe (SR-5.2, b.jg5 SRJ-121)', () => {
   let warnLines: string[]
   let logLines: string[]
   let warnSpy: ReturnType<typeof spyOn>
   let logSpy: ReturnType<typeof spyOn>
+  /** How many times the injected install check ran in the current test. */
+  let checkCalls: number
 
   beforeEach(() => {
-    createImpl = async () => { throw new Error('probe stub: no create outcome set') }
-    createCalls = []
-    closeCalls = 0
     warnLines = []
     logLines = []
-    const create = async (opts: unknown): Promise<unknown> => {
-      createCalls.push(opts)
-      return createImpl(opts)
-    }
-    mock.module('agent-director', () => ({ ...REAL_AD, Client: { create } }))
+    checkCalls = 0
     warnSpy = spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
       warnLines.push(args.map(String).join(' '))
     })
@@ -698,73 +707,129 @@ describe('runAgentDirectorPostinstallProbe (SR-5.2)', () => {
   afterEach(() => {
     warnSpy.mockRestore()
     logSpy.mockRestore()
-    // Put the real exports back for later files, then restore.
-    mock.module('agent-director', () => REAL_AD)
-    mock.restore()
   })
 
-  test('success: resolves to undefined, logs the binary version without its v prefix once, and closes the client', async () => {
-    createImpl = async () => ({
-      binaryVersion: 'v9.8.7',
-      close: () => { closeCalls++ },
-    })
-
-    await expect(runAgentDirectorPostinstallProbe()).resolves.toBeUndefined()
-
-    expect(createCalls).toHaveLength(1)
-    expect(logLines).toEqual(['postinstall: agent-director 9.8.7 OK'])
-    expect(warnLines).toEqual([])
-    expect(closeCalls).toBe(1)
-  })
-
-  /** The one-warning failure outcome every failing probe shares. */
-  function expectOneRangeWarning(): void {
-    expect(logLines).toEqual([])
-    expect(warnLines).toHaveLength(1)
-    expect(warnLines[0]).toStartWith('postinstall warning: agent-director probe failed (')
-    expect(warnLines[0]).toContain(`bun add agent-director@${readAdDependencyRange()}`)
+  /** An injected install check that counts its calls and answers `result`. */
+  function checkReturning(result: InstallCheckResult): PostinstallInstallCheck {
+    return async () => {
+      checkCalls++
+      return result
+    }
   }
 
-  test.each([
-    ['Client.create rejects', () => { createImpl = async () => { throw new Error('probe stub: create failed') } }],
-    ['the client has no readable binaryVersion', () => { createImpl = async () => ({ close: () => { closeCalls++ } }) }],
-  ] as const)('failure (%s): resolves to undefined with one warning naming the pinned range, and never throws', async (_label, arrange) => {
-    arrange()
+  /** Forbidden forms: the shared upgrade and install-command forms, plus this probe's retired advice. */
+  const PROBE_FORBIDDEN_FORMS: readonly ForbiddenForm[] = [
+    ...UPGRADE_FORMS,
+    ['"Upgrade agent-director" in any case', /upgrade agent-director/i, 'upgrade Agent-Director and retry'],
+    ['`bun add agent-director`', /bun add agent-director/, 'bun add agent-director@^0.7.0'],
+  ]
 
-    await expect(runAgentDirectorPostinstallProbe()).resolves.toBeUndefined()
+  test.each(PROBE_FORBIDDEN_FORMS.map((row) => [row[0], row] as const))(
+    'forbidden form self-check (%s): its pattern matches its sample',
+    (_label, [, pattern, sample]) => {
+      expect(pattern.test(sample)).toBe(true)
+    },
+  )
 
-    expect(createCalls).toHaveLength(1)
-    expectOneRangeWarning()
-  })
-
-  describe('the agent-director module has no Client export', () => {
-    // Replaces the outer stub; the outer afterEach puts REAL_AD back and restores.
-    beforeEach(() => {
-      mock.module('agent-director', () => ({ ...REAL_AD, Client: undefined }))
-    })
-
-    test('failure: resolves to undefined with one warning naming the pinned range, and never throws', async () => {
-      await expect(runAgentDirectorPostinstallProbe()).resolves.toBeUndefined()
-
-      expect(createCalls).toHaveLength(0)
-      expectOneRangeWarning()
-    })
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.s4f: AD-missing warning derives range from package.json (no hard-coding)
-// ---------------------------------------------------------------------------
-
-describe('readAdDependencyRange (b.s4f)', () => {
-  test('returns the range declared in this package.json', () => {
-    const pkgPath = join(import.meta.dir, '..', 'package.json')
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as {
-      dependencies?: Record<string, string>
+  /**
+   * The probe's own text in every captured line carries no install, upgrade
+   * or `bun add` advice (AC 81). `checkMessage`, when given, is the install
+   * check's message a failure warning carries; it must appear in a captured
+   * line and is removed before the scan, so only the probe's own text is
+   * checked.
+   */
+  function expectNoUpgradeAdvice(checkMessage?: string): void {
+    const lines = [...logLines, ...warnLines]
+    expect(lines.length).toBeGreaterThan(0)
+    if (checkMessage !== undefined) {
+      expect(lines.some((line) => line.includes(checkMessage))).toBe(true)
     }
-    const expected = pkg.dependencies?.['agent-director']
+    for (const line of lines) {
+      const own = checkMessage === undefined ? line : line.split(checkMessage).join(' ')
+      const flat = own.replace(/\s+/g, ' ')
+      for (const [label, pattern] of PROBE_FORBIDDEN_FORMS) {
+        expect({ line, form: label, matched: pattern.test(flat) }).toEqual({ line, form: label, matched: false })
+      }
+    }
+  }
 
-    expect(typeof expected).toBe('string')
-    expect(readAdDependencyRange()).toBe(expected as string)
+  test('a success at or above the Phase 1 floor: resolves to undefined, runs the check once and logs the OK line only', async () => {
+    const result = cannedSuccessResult()
+    expect(result.note).toBeUndefined()
+
+    await expect(runAgentDirectorPostinstallProbe({ runInstallCheck: checkReturning(result) })).resolves.toBeUndefined()
+
+    expect(checkCalls).toBe(1)
+    expect(logLines).toEqual([`postinstall: agent-director ${PHASE1_RC_VERSION} OK`])
+    expect(warnLines).toEqual([])
+    expectNoUpgradeAdvice()
+  })
+
+  test.each([
+    ['the last pre-Phase-1 release', OLD_AD_VERSION],
+    ['the dev placeholder', DEV_PLACEHOLDER_VERSION],
+  ] as const)('a success below the Phase 1 floor (%s): logs the OK line, then the note naming the runbook section', async (_label, version) => {
+    const result = cannedSuccessResult({ binaryVersion: version })
+    expect(result.note).toBe(buildInstallCheckPhase1Note(version))
+
+    await expect(runAgentDirectorPostinstallProbe({ runInstallCheck: checkReturning(result) })).resolves.toBeUndefined()
+
+    expect(checkCalls).toBe(1)
+    expect(logLines).toEqual([
+      `postinstall: agent-director ${version} OK`,
+      `postinstall: note: ${buildInstallCheckPhase1Note(version)}`,
+    ])
+    expect(logLines[1]).toContain(INSTALL_CHECK_PHASE1_NOTE_PHRASE)
+    expect(logLines[1]).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+    expect(warnLines).toEqual([])
+    expectNoUpgradeAdvice()
+  })
+
+  test.each([
+    AD_SYSTEM_INSTALL_NOT_FOUND,
+    AD_SYSTEM_INSTALL_TOO_OLD,
+    AD_SYSTEM_INSTALL_UNREACHABLE,
+    AD_VERSION_FLOOR_UNREADABLE,
+  ] as const)('a failure (%s): resolves to undefined with exactly one warning naming the class label and carrying the check message', async (label) => {
+    const result = cannedFailureResult(label)
+
+    await expect(runAgentDirectorPostinstallProbe({ runInstallCheck: checkReturning(result) })).resolves.toBeUndefined()
+
+    expect(checkCalls).toBe(1)
+    expect(logLines).toEqual([])
+    expect(warnLines).toHaveLength(1)
+    expect(warnLines[0]).toStartWith(`postinstall warning: agent-director install check failed (${label}): `)
+    expect(warnLines[0]).toContain(result.message)
+    expect(warnLines[0]).toContain('`bun run install-check`')
+    expectNoUpgradeAdvice(result.message)
+  })
+
+  test('the too-old failure warning names the switch-over runbook section', async () => {
+    const result = cannedFailureResult(AD_SYSTEM_INSTALL_TOO_OLD)
+
+    await runAgentDirectorPostinstallProbe({ runInstallCheck: checkReturning(result) })
+
+    expect(warnLines).toHaveLength(1)
+    expect(warnLines[0]).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+    expectNoUpgradeAdvice(result.message)
+  })
+
+  /** Injected checks that fail to produce a result, each throwing the value it is given. */
+  const THROWING_CHECKS: readonly [label: string, make: (thrown: unknown) => PostinstallInstallCheck, thrown: unknown][] = [
+    ['rejects with an Error', (thrown) => async () => { checkCalls++; throw thrown }, new Error('probe stub: check failed')],
+    ['throws synchronously', (thrown) => () => { checkCalls++; throw thrown }, new Error('probe stub: sync throw')],
+    ['rejects with a non-Error value', (thrown) => async () => { checkCalls++; throw thrown }, 'probe stub: bare string'],
+  ]
+
+  test.each(THROWING_CHECKS)('a check that %s: resolves to undefined with exactly one warning describing the thrown value', async (_label, make, thrown) => {
+    await expect(runAgentDirectorPostinstallProbe({ runInstallCheck: make(thrown) })).resolves.toBeUndefined()
+
+    expect(checkCalls).toBe(1)
+    expect(logLines).toEqual([])
+    expect(warnLines).toEqual([
+      `postinstall warning: the agent-director install check could not run (${describeThrownValue(thrown)}); ` +
+        'run `bun run install-check` for the full diagnosis.',
+    ])
+    expectNoUpgradeAdvice()
   })
 })

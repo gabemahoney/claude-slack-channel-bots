@@ -7,8 +7,10 @@
  * the `ad-below-phase1-floor` message (b.jg5 SRJ-203, SRJ-208, SRJ-1013)
  * and the `ad-system-install-too-old` message for the client's own too-old
  * refusal (b.jg5 SRJ-208), each in a startup and a runtime form, the
- * runtime re-check of the host binary (b.jg5 SRJ-204, SRJ-205) and the
- * host-version decision with its Phase 1 note (b.jg5 SRJ-211).
+ * runtime re-check of the host binary (b.jg5 SRJ-204, SRJ-205), the
+ * host-version decision (b.jg5 SRJ-211, SRJ-212) and the Phase 1 notes its
+ * callers build: {@link buildPhase1HostNote} for `/publish` and
+ * {@link buildInstallCheckPhase1Note} for the install check.
  *
  * The floor check sits beside the agent-director client's own too-old refusal
  * (client minimum 0.7.0) and gates on the version alone. The 0.10.0 client
@@ -25,8 +27,9 @@
  * Host-version decision (b.jg5 SRJ-211, SRJ-212): {@link decideHostAdVersion}
  * judges one settled `resolveSystemBinary()` call against the installed
  * client's minimum (supplied by the caller) and then CSCB's floor: pass,
- * pass below the floor with the Phase 1 note ({@link buildPhase1HostNote},
- * which names the switch-over runbook section), or fail (not found, version
+ * pass below the floor with a Phase 1 note naming the switch-over runbook
+ * section ({@link buildPhase1HostNote} for `/publish`,
+ * {@link buildInstallCheckPhase1Note} for the install check), or fail (not found, version
  * unreadable, below the client minimum, client minimum unreadable, other).
  * Its two callers are `/publish`'s preflight check `scripts/ad-version-check.ts`
  * (gate SR-2.5) and the install check in `src/install-check.ts`. Each
@@ -614,8 +617,9 @@ function hostVersionThrownFailure(error: unknown, clientMinimum: string): HostVe
  * - resolved below the minimum: fails below the client minimum;
  * - resolved at or above the minimum and meeting the floor: pass;
  * - resolved at or above the minimum but below the floor (`0.10.0`, the
- *   client's sentinel `0.0.0-dev`): pass below the floor, which carries the
- *   Phase 1 note ({@link buildPhase1HostNote}).
+ *   client's sentinel `0.0.0-dev`): pass below the floor; each caller
+ *   builds its own Phase 1 note ({@link buildPhase1HostNote} for `/publish`,
+ *   {@link buildInstallCheckPhase1Note} for the install check).
  *
  * Pure: classifies by name, reads fields structurally, never throws.
  */
@@ -669,6 +673,32 @@ export function buildPhase1HostNote(parts: BelowPhase1FloorParts): string {
     `CSCB's Phase 1 floor ${PHASE1_FLOOR_VERSION} (release candidates ${PHASE1_FLOOR_VERSION}-rc.N included): ` +
     `${PHASE1_HOST_NOTE_PHRASE}. It meets the agent-director client's minimum, so it is accepted for now; ` +
     `the host switches over to Phase 1 by the README's runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}".`
+  )
+}
+
+/**
+ * The fixed phrase every install-check Phase 1 note carries (b.jg5 SRJ-212):
+ * the server refuses to start on the binary until agent-director Phase 1 is
+ * installed.
+ */
+export const INSTALL_CHECK_PHASE1_NOTE_PHRASE =
+  'the server refuses to start on it until agent-director Phase 1 is installed'
+
+/**
+ * The install check's Phase 1 note for a host binary that passes below the
+ * floor (b.jg5 SRJ-212): the version found, CSCB's floor, that
+ * {@link INSTALL_CHECK_PHASE1_NOTE_PHRASE}, and the switch-over runbook
+ * section's title ({@link PHASE1_RUNBOOK_SECTION_TITLE}). No upgrade
+ * instruction, no command and no link. Built from a version and fixed text
+ * only. `runInstallCheck` (`src/install-check.ts`) carries it on its success
+ * result; `/publish`'s check uses {@link buildPhase1HostNote} instead.
+ */
+export function buildInstallCheckPhase1Note(foundVersion: string): string {
+  return (
+    `agent-director ${foundVersion} meets the agent-director client's minimum but is below ` +
+    `CSCB's Phase 1 floor ${PHASE1_FLOOR_VERSION} (release candidates ${PHASE1_FLOOR_VERSION}-rc.N included): ` +
+    `${INSTALL_CHECK_PHASE1_NOTE_PHRASE}. ` +
+    `See the README's switch-over runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}".`
   )
 }
 
