@@ -65,9 +65,11 @@ import {
 import { renderInstallSkillInstructions } from './install-skill-pointer.ts'
 import {
   AD_BELOW_PHASE1_FLOOR,
+  AD_SHIM_CATALOG_INCOMPLETE,
   AD_SYSTEM_INSTALL_NOT_FOUND,
   AD_SYSTEM_INSTALL_TOO_OLD,
 } from './install-check.ts'
+import { PHASE1_ONLY_ERR_NAMES } from './agent-director-errors.ts'
 import { buildBelowPhase1FloorMessage, buildSystemInstallTooOldMessage, meetsPhase1Floor } from './ad-version-gate.ts'
 
 // ---------------------------------------------------------------------------
@@ -81,23 +83,52 @@ const AD_STATE_DB_PATH = join(os.homedir(), '.agent-director', 'state.db')
 const SUPPORTED_PLATFORMS = ['linux-x64', 'darwin-arm64'] as const
 
 /**
- * err_names CSCB's runtime branches on. The structural-drift indicator we
- * guard against is whether the `agent-director` dist file ships a class
- * declaration for each — i.e. matches `class <Name> extends ...`. The class
+ * err_names the client's dist must declare a class for. The structural-drift
+ * indicator we guard against is whether the `agent-director` dist file ships
+ * a class declaration for each — i.e. matches `class <Name>\s`. The class
  * declaration is the defining symptom of a shim that's caught up to the
- * bundled Go binary: when one is missing, `instanceof Err<Name>` predicates
- * silently downgrade and the runtime `errorFromEnvelope` falls back to a
- * base `AgentDirectorError` instead of the typed subclass. A bare-identifier
- * match in the dist source is too loose because the shipped shim also
- * carries a metadata array (`{ name: "ErrPermissionRequestNotFound", ... }`)
- * that mentions the names even when the class is absent — so the regex
- * must anchor on `class <Name>\s`.
+ * bundled Go binary: when one is missing, the client's runtime decode path
+ * (`throwFromEnvelope`) cannot build that error's own class and throws
+ * `ErrUnknownErrorName` instead, and CSCB can no longer classify it. A
+ * bare-identifier match in the dist source is too loose because the shipped
+ * shim also carries a metadata array (`{ name: "ErrPermissionRequestNotFound", ... }`)
+ * that mentions the names even when the class is absent — so the match must
+ * anchor on the class declaration.
+ *
+ * The three Phase-1-only names (`PHASE1_ONLY_ERR_NAMES`, b.jg5 SRJ-102) are
+ * required although CSCB recognises those errors by name until the Phase 1
+ * client is adopted (E37): a client without their classes turns a Phase 1
+ * binary's errors into `ErrUnknownErrorName`, which the classifier would
+ * misclassify. The check reads names in the dist text and imports none of
+ * them (SRJ-101 interim rule).
  */
-const REQUIRED_ERR_NAMES = [
+export const REQUIRED_ERR_NAMES = [
   'ErrInvalidFlags',
   'ErrPermissionRequestNotFound',
   'ErrAmbiguousRequest',
+  ...PHASE1_ONLY_ERR_NAMES,
 ] as const
+
+/** Answer of the error-catalogue check: ok, or the required names missing. */
+export type ErrorCatalogCheckResult = { ok: true } | { ok: false; missing: string[] }
+
+/**
+ * Check supplied `agent-director` dist text for a class declaration
+ * (`class <Name>\s`) of every name in {@link REQUIRED_ERR_NAMES}. Pure: reads
+ * nothing and imports nothing. A name that appears only in a metadata entry,
+ * with no class declaration, counts as missing. The missing names are listed
+ * in `REQUIRED_ERR_NAMES` order.
+ */
+export function checkErrorCatalog(distText: string): ErrorCatalogCheckResult {
+  const missing: string[] = []
+  for (const name of REQUIRED_ERR_NAMES) {
+    const re = new RegExp(`class\\s+${name}\\s`)
+    if (!re.test(distText)) {
+      missing.push(name)
+    }
+  }
+  return missing.length === 0 ? { ok: true } : { ok: false, missing }
+}
 
 // ---------------------------------------------------------------------------
 // Private helper: resolve + read the agent-director dist source (memoized)
@@ -156,17 +187,19 @@ export interface StartupGateDeps {
    */
   probeGetPermission: (client: unknown) => boolean
   /**
-   * Probe 2 — verify the AD error catalog includes the err_names CSCB
-   * branches on. Production default reads the resolved `agent-director`
-   * dist file and matches `class <Name>\s` for each required name — the
-   * class-declaration site is the structural symptom of a shim that's
-   * caught up to the bundled Go binary. A behavioral `errorFromEnvelope`
-   * round-trip is unusable (the helper falls back to a base
-   * `AgentDirectorError` with `.errName` copied verbatim from the input),
-   * and a bare-identifier match false-positives on the dist's metadata
-   * array that names err_names even when the class is missing.
+   * Probe 2 — verify the AD error catalog declares a class for every name in
+   * `REQUIRED_ERR_NAMES`. Production default reads the resolved
+   * `agent-director` dist file (memoized) and delegates to
+   * {@link checkErrorCatalog}, which matches `class <Name>\s` for each
+   * required name — the class-declaration site is the structural symptom of
+   * a shim that's caught up to the bundled Go binary. The client's runtime
+   * decode path (`throwFromEnvelope`) turns an err_name it has no class for
+   * into `ErrUnknownErrorName`, so each required class must be declared in
+   * the dist. The check reads the dist text and imports nothing; a
+   * bare-identifier match would false-positive on the dist's metadata array
+   * that names err_names even when the class is missing.
    */
-  probeErrorCatalog: () => { ok: true } | { ok: false; missing: string[] }
+  probeErrorCatalog: () => ErrorCatalogCheckResult
   /**
    * Probe 3 — verify the wrapper Client's `decide()` argv carries
    * `--request-token`. Production default reads the resolved
@@ -200,29 +233,23 @@ const prodDeps: StartupGateDeps = {
   probeGetPermission: (client) =>
     typeof (client as { getPermission?: unknown }).getPermission === 'function',
   probeErrorCatalog: () => {
-    // Static-file probe: the runtime `errorFromEnvelope` helper falls back
-    // to constructing a base `AgentDirectorError` (with `.errName` copied
-    // verbatim from the input) when err_name is absent from `ERROR_TABLE`,
-    // so a behavioral round-trip cannot tell catalog-present from
-    // catalog-absent. A bare-identifier regex is also too loose: the shim
+    // Static-file probe: a client without a required class turns that
+    // error into `ErrUnknownErrorName` on its runtime decode path
+    // (`throwFromEnvelope`), so the class declarations must be present in
+    // the dist. Reading the dist text checks that without importing any of
+    // the names. A bare-identifier regex is too loose: the shim
     // carries a metadata array whose `name: "Err..."` literals match every
     // err_name regardless of whether the class is declared. Anchor instead
     // on `class <Name>\s` — the class declaration site is emitted once per
-    // typed error and is the defining symptom of a caught-up shim.
+    // typed error and is the defining symptom of a caught-up shim. The match
+    // itself is `checkErrorCatalog`'s; this default only reads the dist.
     const src = readAdDistSource()
     if (src instanceof Error) {
       // Surface this as "all required names missing" with a diagnostic
       // detail in the first slot, so the operator sees a complete picture.
       return { ok: false, missing: [`<read-failed: ${src.message}>`, ...REQUIRED_ERR_NAMES] }
     }
-    const missing: string[] = []
-    for (const name of REQUIRED_ERR_NAMES) {
-      const re = new RegExp(`class\\s+${name}\\s`)
-      if (!re.test(src)) {
-        missing.push(name)
-      }
-    }
-    return missing.length === 0 ? { ok: true } : { ok: false, missing }
+    return checkErrorCatalog(src)
   },
   probeDecideArgv: async (_client) => {
     // Static-file probe: grep the resolved agent-director dist for the
@@ -454,12 +481,12 @@ export async function runStartupGate(
       ok: false,
       phase: 'api-surface',
       refusalKind: REFUSAL_KIND_OTHER,
-      classLabel: 'ad-shim-catalog-incomplete',
+      classLabel: AD_SHIM_CATALOG_INCOMPLETE,
       message:
         `agent-director TS error catalog is missing required err_names: ` +
         `${catalogProbe.missing.join(', ')}. ` +
         `Envelopes with these names would surface as the base AgentDirectorError ` +
-        `instead of typed subclasses, breaking CSCB's instanceof Err<Name> branches. ` +
+        `instead of typed subclasses, breaking CSCB's classification of agent-director errors. ` +
         `Run: reinstall a matching 'agent-director' version (confirm the resolved package ships the full catalog).`,
     }
   }

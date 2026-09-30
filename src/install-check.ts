@@ -11,8 +11,9 @@
  * against the same `dist/version-floor.json`. The gate imports only the
  * exported class-label values below. `AD_SYSTEM_INSTALL_NOT_FOUND` and
  * `AD_SYSTEM_INSTALL_TOO_OLD` are shared: the gate and this check report
- * them for the same failures. `AD_BELOW_PHASE1_FLOOR` is defined here but
- * only the startup gate writes it; this check never reports it. CSCB never
+ * them for the same failures. `AD_BELOW_PHASE1_FLOOR` and
+ * `AD_SHIM_CATALOG_INCOMPLETE` are defined here but only the startup gate
+ * writes them; this check never reports either. CSCB never
  * duplicates the client's floor decision; its own Phase 1 floor lives in
  * `ad-version-gate.ts` (b.jg5 SRJ-203).
  *
@@ -56,9 +57,17 @@ export const AD_SYSTEM_INSTALL_TOO_OLD = 'ad-system-install-too-old'
 export const AD_BELOW_PHASE1_FLOOR = 'ad-below-phase1-floor'
 
 /**
+ * Class label for the startup gate's error-catalogue refusal: the client's
+ * dist declares no class for one or more of the error names CSCB requires
+ * (b.jg5 SRJ-102, SRJ-1013). Written by the startup gate.
+ */
+export const AD_SHIM_CATALOG_INCOMPLETE = 'ad-shim-catalog-incomplete'
+
+/**
  * Canonical class labels emitted by the check. The not-found and too-old
- * labels are shared with the startup gate; `AD_BELOW_PHASE1_FLOOR` is not
- * among them, because only the startup gate writes it.
+ * labels are shared with the startup gate; `AD_BELOW_PHASE1_FLOOR` and
+ * `AD_SHIM_CATALOG_INCOMPLETE` are not among them, because only the startup
+ * gate writes them.
  */
 export type InstallCheckClassLabel =
   | typeof AD_SYSTEM_INSTALL_NOT_FOUND

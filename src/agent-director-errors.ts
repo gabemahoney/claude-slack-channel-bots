@@ -1,10 +1,36 @@
 /**
- * agent-director-errors.ts — Re-export of typed Err* subclasses CSCB references.
+ * agent-director-errors.ts — The one import surface for the agent-director
+ * client's error classes CSCB references.
  *
- * Per SR-0.2 the integration must not parse error strings or exit codes; every
- * call site branches on `instanceof` against the typed classes below. This
- * module gives the rest of CSCB a single import surface and a single place to
- * keep the subset list in sync with SRD edits.
+ * An agent-director error's class (GONE, UNAVAILABLE, CONFLICT, UNUSABLE NAME,
+ * CONFIG, ENVIRONMENT, LAUNCH FAILURE, STATE, DIRECTORY, UNCLASSIFIED) is
+ * decided by the classifier in `src/ad-error-class.ts` (b.jg5 SRJ-104). No new
+ * `instanceof` ladder decides a class; existing sites move to the classifier
+ * as later Epics change them. This module re-exports the client's error
+ * classes so the classifier, the rest of CSCB and the tests import them from
+ * one place, and keeps the subset list in sync with SRD edits. Per SR-0.2 CSCB
+ * never parses free-form error message text or exit codes, apart from matching
+ * agent-director's fixed description words, which are kept in
+ * `src/ad-description-phrases.ts`.
+ *
+ * Classes of the tmux-side and unknown-name errors (b.jg5 SRJ-103, SRJ-104):
+ *   - ErrTmuxSendKeys           GONE
+ *   - ErrTmuxCaptureFailed      GONE
+ *   - ErrTmuxSessionCreate      LAUNCH FAILURE
+ *   - ErrUnknownErrorName       decided by its `unknownName`: `ErrInternal` is
+ *                               UNUSABLE NAME when its description carries "the
+ *                               recorded tmux session name" and UNCLASSIFIED
+ *                               otherwise; `ErrConfigMalformed` is CONFIG; any
+ *                               other name is UNAVAILABLE
+ *   - ErrTmuxKillFailed         UNAVAILABLE
+ *   - ErrTmuxUnresponsive       UNAVAILABLE
+ *   - ErrTmuxSessionConflict    CONFLICT
+ *
+ * The first four are re-exported below. The last three are recognised by name
+ * (SRJ-101 interim rule), not imported, re-exported once the Phase 1 client is
+ * adopted (E37): the branch's 0.10.0 client lacks them, and a named import or
+ * re-export of a missing export fails every module that loads it. Their names
+ * are exported below once, as plain strings.
  *
  * Catalog (SR-0.2):
  *   - ErrBunVersionTooOld       (Client constructor / Bun version gate)
@@ -13,6 +39,11 @@
  *   - ErrSystemInstallUnreachable (Client.create / resolveSystemBinary — system binary present but not executable or fails --version)
  *   - ErrSystemInstallDisappeared (any verb / binary gone after valid construction — b.xht)
  *   - ErrTmuxNotAvailable       (spawn / tmux binary not found or not executable)
+ *   - ErrTmuxSessionCreate      (spawn / tmux could not create the session)
+ *   - ErrTmuxSendKeys           (send-keys / the tmux session is gone)
+ *   - ErrTmuxCaptureFailed      (read-pane / the tmux session is gone)
+ *   - ErrUnknownErrorName       (any verb / the binary reported an err_name the
+ *                               client has no class for)
  *   - ErrCwdNotFound            (spawn / persona working directory does not exist on disk)
  *   - ErrCwdNotADirectory       (spawn / persona working directory exists but is not a directory)
  *   - ErrInstanceIdCollision    (spawn / SR-1.4 idempotency)
@@ -44,8 +75,7 @@
  * pause budget, so the class never reaches a CSCB handler.
  *
  * CSCB-synthetic subclasses (NOT emitted by the agent-director library — minted
- * inside CSCB and dispatched through the same instanceof-branching convention so
- * SR-0.2 holds for them too):
+ * inside CSCB and branched on via `instanceof` so SR-0.2 holds for them too):
  *   - ErrSpawnCapReached        (restart backoff / consecutive-failure cap latch)
  *
  * SPDX-License-Identifier: MIT
@@ -66,6 +96,28 @@ export class ErrSpawnCapReached extends AgentDirectorError {
   }
 }
 
+/**
+ * Names of the three errors only the Phase 1 client declares (b.jg5 SRJ-101
+ * interim rule, SRJ-103). They are plain strings: code recognises these errors
+ * by their name and never imports the classes, which the branch's 0.10.0
+ * client lacks. The startup catalogue check, the stub's by-name builders and
+ * the classifier take the names from here. Re-exported as classes once the
+ * Phase 1 client is adopted (E37).
+ */
+export const ERR_TMUX_KILL_FAILED_NAME = 'ErrTmuxKillFailed'
+export const ERR_TMUX_UNRESPONSIVE_NAME = 'ErrTmuxUnresponsive'
+export const ERR_TMUX_SESSION_CONFLICT_NAME = 'ErrTmuxSessionConflict'
+
+/** The three Phase-1-only error names, in one list. */
+export const PHASE1_ONLY_ERR_NAMES = [
+  ERR_TMUX_KILL_FAILED_NAME,
+  ERR_TMUX_UNRESPONSIVE_NAME,
+  ERR_TMUX_SESSION_CONFLICT_NAME,
+] as const
+
+/** One of the three Phase-1-only error names. */
+export type Phase1OnlyErrName = (typeof PHASE1_ONLY_ERR_NAMES)[number]
+
 export {
   AgentDirectorError,
   ErrClientClosed,
@@ -75,6 +127,10 @@ export {
   ErrSystemInstallUnreachable,
   ErrSystemInstallDisappeared,
   ErrTmuxNotAvailable,
+  ErrTmuxSessionCreate,
+  ErrTmuxSendKeys,
+  ErrTmuxCaptureFailed,
+  ErrUnknownErrorName,
   ErrCwdNotFound,
   ErrCwdNotADirectory,
   ErrCallTimeout,

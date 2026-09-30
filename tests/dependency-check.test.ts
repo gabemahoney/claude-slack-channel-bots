@@ -17,6 +17,12 @@
  *      section title, no upgrade instruction, the install-skill block only on
  *      the too-old message.
  *   5. API-surface probes (getPermission / error catalog / decide argv).
+ *   5a. The error-catalogue check (b.jg5 SRJ-102): the pure
+ *      `checkErrorCatalog` over dist text built in the test from
+ *      `REQUIRED_ERR_NAMES`, never the installed client's dist, and a
+ *      probe built from it through the gate and its wrapper.
+ *   5b. The four 0.10.0 error classes `src/agent-director-errors.ts`
+ *      re-exports are the client's own (b.jg5 SRJ-103).
  *   6. Same-user mismatch on ~/.agent-director/state.db.
  *   7. Happy path: gate passes silently and installs the Client into the
  *      module-level singleton via setClient(...).
@@ -38,17 +44,37 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
+  ErrTmuxCaptureFailed as AdErrTmuxCaptureFailed,
+  ErrTmuxSendKeys as AdErrTmuxSendKeys,
+  ErrTmuxSessionCreate as AdErrTmuxSessionCreate,
+  ErrUnknownErrorName as AdErrUnknownErrorName,
+} from 'agent-director'
+
+import {
   runStartupGate,
   runAgentDirectorStartupGate,
+  checkErrorCatalog,
   DEFAULT_STATE_DB_PATH,
   REFUSAL_KIND_BELOW_PHASE1_FLOOR,
   REFUSAL_KIND_CLIENT_TOO_OLD,
   REFUSAL_KIND_OTHER,
+  REQUIRED_ERR_NAMES,
 } from '../src/agent-director-startup.ts'
 import type { StartupGateDeps } from '../src/agent-director-startup.ts'
+import {
+  ERR_TMUX_KILL_FAILED_NAME,
+  ERR_TMUX_SESSION_CONFLICT_NAME,
+  ERR_TMUX_UNRESPONSIVE_NAME,
+  ErrTmuxCaptureFailed,
+  ErrTmuxSendKeys,
+  ErrTmuxSessionCreate,
+  ErrUnknownErrorName,
+  PHASE1_ONLY_ERR_NAMES,
+} from '../src/agent-director-errors.ts'
 import { getClient, resetClientForTests } from '../src/agent-director-client.ts'
 import {
   AD_BELOW_PHASE1_FLOOR,
+  AD_SHIM_CATALOG_INCOMPLETE,
   AD_SYSTEM_INSTALL_NOT_FOUND,
   AD_SYSTEM_INSTALL_TOO_OLD,
 } from '../src/install-check.ts'
@@ -350,31 +376,13 @@ describe('SR-5.1: API surface probes', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Probe 2 — error catalog is missing required err_names
+  // Probe 2 — error catalog is missing required err_names (one missing name
+  // through the pure check: the b.jg5 SRJ-102 describe below)
   // -------------------------------------------------------------------------
 
-  test('probeErrorCatalog reports a single missing name → ad-shim-catalog-incomplete', async () => {
+  test('probeErrorCatalog reports every required name missing → message lists each', async () => {
     const stub = makeStubClient()
-    const outcome = await runStartupGate({
-      ...probeRunDeps(stub),
-      probeGetPermission: () => true,
-      probeErrorCatalog: () => ({ ok: false, missing: ['ErrInvalidFlags'] }),
-      probeDecideArgv: async () => ({ ok: true }),
-    })
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) {
-      expect(outcome.phase).toBe('api-surface')
-      expect(outcome.classLabel).toBe('ad-shim-catalog-incomplete')
-      expect(outcome.message).toContain('ErrInvalidFlags')
-      expect(outcome.message).toContain('reinstall a matching')
-      // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
-      expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
-    }
-  })
-
-  test('probeErrorCatalog reports all three missing → message lists each', async () => {
-    const stub = makeStubClient()
-    const allMissing = ['ErrInvalidFlags', 'ErrPermissionRequestNotFound', 'ErrAmbiguousRequest']
+    const allMissing = [...REQUIRED_ERR_NAMES]
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
       probeGetPermission: () => true,
@@ -383,7 +391,7 @@ describe('SR-5.1: API surface probes', () => {
     })
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
-      expect(outcome.classLabel).toBe('ad-shim-catalog-incomplete')
+      expect(outcome.classLabel).toBe(AD_SHIM_CATALOG_INCOMPLETE)
       for (const name of allMissing) {
         expect(outcome.message).toContain(name)
       }
@@ -600,6 +608,98 @@ describe('SR-5.1: API surface probes', () => {
       }
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-102 — the error-catalogue check over supplied dist text
+// ---------------------------------------------------------------------------
+//
+// The dist text is built here in the shape the shipped client has: a
+// metadata array naming every error, then one class declaration per error.
+// No case reads the installed client's dist or calls the production probe.
+// The three Phase-1-only names are written out once, as the SRD's
+// requirement; every other value comes from `src/`.
+
+/** The Phase-1-only names b.jg5 SRJ-102 requires, as the SRD writes them. */
+const SRD_PHASE1_ONLY_NAMES = ['ErrTmuxKillFailed', 'ErrTmuxUnresponsive', 'ErrTmuxSessionConflict']
+
+/** The Phase-1-only names as `src/` exports them. */
+const PHASE1_ONLY_NAMES = [ERR_TMUX_KILL_FAILED_NAME, ERR_TMUX_UNRESPONSIVE_NAME, ERR_TMUX_SESSION_CONFLICT_NAME]
+
+/**
+ * Dist text declaring a class for every required name except `undeclared`.
+ * With `metadata`, a metadata entry names every required name, declared or
+ * not.
+ */
+function distText(undeclared: readonly string[] = [], { metadata = false } = {}): string {
+  const entries = metadata ? REQUIRED_ERR_NAMES.map((name) => `  { name: "${name}", exitCode: 1 },`) : []
+  const classes = REQUIRED_ERR_NAMES
+    .filter((name) => !undeclared.includes(name))
+    .map((name) => `class ${name} extends AgentDirectorError {\n}`)
+  return ['const ERROR_CATALOG = [', ...entries, '];', ...classes].join('\n')
+}
+
+describe('b.jg5 SRJ-102: checkErrorCatalog over supplied dist text', () => {
+  test('the required names include the SRD\'s three Phase-1-only names, as src/ exports them', () => {
+    expect(PHASE1_ONLY_NAMES).toEqual(SRD_PHASE1_ONLY_NAMES)
+    expect<readonly string[]>(PHASE1_ONLY_ERR_NAMES).toEqual(SRD_PHASE1_ONLY_NAMES)
+    expect(REQUIRED_ERR_NAMES).toEqual(expect.arrayContaining(SRD_PHASE1_ONLY_NAMES))
+  })
+
+  test.each([false, true])('every required name declared (metadata entries: %p) → ok', (metadata) => {
+    expect(checkErrorCatalog(distText([], { metadata }))).toEqual({ ok: true })
+  })
+
+  test.each([...REQUIRED_ERR_NAMES])('%s left out → not ok, missing exactly it', (name) => {
+    expect(checkErrorCatalog(distText([name]))).toEqual({ ok: false, missing: [name] })
+  })
+
+  test.each(PHASE1_ONLY_NAMES)('%s named only in a metadata entry → counts as missing', (name) => {
+    const text = distText([name], { metadata: true })
+    expect(text).toContain(name)
+    expect(checkErrorCatalog(text)).toEqual({ ok: false, missing: [name] })
+  })
+
+  test('all three Phase-1-only names left out → all three listed', () => {
+    expect(checkErrorCatalog(distText(PHASE1_ONLY_NAMES, { metadata: true }))).toEqual({
+      ok: false,
+      missing: PHASE1_ONLY_NAMES,
+    })
+  })
+
+  test('a probe built from the check over text lacking a Phase-1-only name fails the gate at api-surface', async () => {
+    const outcome = await runStartupGate(passingDeps({
+      probeErrorCatalog: () => checkErrorCatalog(distText([ERR_TMUX_SESSION_CONFLICT_NAME], { metadata: true })),
+    }))
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('api-surface')
+      expect(outcome.classLabel).toBe(AD_SHIM_CATALOG_INCOMPLETE)
+      expect(outcome.refusalKind).toBe(REFUSAL_KIND_OTHER)
+      expect(outcome.message).toContain(ERR_TMUX_SESSION_CONFLICT_NAME)
+      expect(outcome.message).toContain('reinstall a matching')
+      // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
+      expect(outcome.message).not.toContain(renderInstallSkillInstructions())
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-103 — the 0.10.0 error classes are the client's own
+// ---------------------------------------------------------------------------
+//
+// The three Phase-1-only classes are recognised by name only and get their
+// identity checks once the Phase 1 client is adopted (E37).
+
+describe('b.jg5 SRJ-103: re-exported error classes', () => {
+  test.each([
+    [AdErrTmuxSendKeys.name, ErrTmuxSendKeys, AdErrTmuxSendKeys],
+    [AdErrTmuxCaptureFailed.name, ErrTmuxCaptureFailed, AdErrTmuxCaptureFailed],
+    [AdErrTmuxSessionCreate.name, ErrTmuxSessionCreate, AdErrTmuxSessionCreate],
+    [AdErrUnknownErrorName.name, ErrUnknownErrorName, AdErrUnknownErrorName],
+  ])('%s from src/agent-director-errors.ts is the client\'s own class', (_name, reExported, own) => {
+    expect(reExported).toBe(own)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1079,7 +1179,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: refusal kind of every other failure branch',
     ['ad-system-install-unreachable', { createClient: makeStubCreateClient({ error: errSystemInstallUnreachable() }) }],
     ['ad-client-construct', { createClient: makeStubCreateClient({ error: new Error('boom') }) }],
     ['ad-shim-missing-get-permission', { probeGetPermission: () => false }],
-    ['ad-shim-catalog-incomplete', { probeErrorCatalog: () => ({ ok: false, missing: ['ErrInvalidFlags'] }) }],
+    [AD_SHIM_CATALOG_INCOMPLETE, { probeErrorCatalog: () => ({ ok: false, missing: ['ErrInvalidFlags'] }) }],
     ['ad-shim-decide-drops-token', { probeDecideArgv: async () => ({ ok: false, detail: 'flag missing' }) }],
     ['ad-same-user', { statSync: () => ({ uid: 7777 }) }],
     ['ad-same-user-stat', { statSync: eacces }],
@@ -1205,6 +1305,19 @@ describe('b.jg5 SRJ-203 / SRJ-1513: runAgentDirectorStartupGate', () => {
     ).rejects.toBeInstanceOf(ExitCalled)
     expect(records.map((r) => r.classLabel)).toEqual([AD_SYSTEM_INSTALL_TOO_OLD])
     expect(exits.length).toBe(1)
+  })
+
+  test.each([...REQUIRED_ERR_NAMES])('dist text lacking %s → one catalogue record naming it, one non-zero exit', async (name) => {
+    await expect(
+      runAgentDirectorStartupGate(passingDeps({
+        probeErrorCatalog: () => checkErrorCatalog(distText([name], { metadata: true })),
+        ...capture,
+      })),
+    ).rejects.toBeInstanceOf(ExitCalled)
+    expect(records.map((r) => r.classLabel)).toEqual([AD_SHIM_CATALOG_INCOMPLETE])
+    expect(records[0]!.message).toContain(name)
+    expect(exits.length).toBe(1)
+    expect(exits[0]).not.toBe(0)
   })
 
   test('PHASE1_RC_VERSION → no record, no exit', async () => {

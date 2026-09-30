@@ -73,17 +73,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-import {
-  AgentDirectorError,
-  ErrInstanceIdCollision,
-  ErrJsonlMissing,
-  ErrJsonlNeverWritten,
-  ErrNoSessionId,
-  ErrSpawnNotFound,
-  ErrSpawnNotResumable,
-  ErrTmuxSendKeys,
-  ErrTmuxSessionCreate,
-} from 'agent-director'
 import type { Client, ListRow, SpawnParams, FindMissingResult, GetResult } from 'agent-director'
 
 import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
@@ -112,6 +101,15 @@ import {
 import { getClient } from './agent-director-client.ts'
 import { setOutageFlag, withOutageDetection, withSpawnDetection } from './outage-state.ts'
 import {
+  AgentDirectorError,
+  ErrInstanceIdCollision,
+  ErrJsonlMissing,
+  ErrJsonlNeverWritten,
+  ErrNoSessionId,
+  ErrSpawnNotFound,
+  ErrSpawnNotResumable,
+  ErrTmuxSendKeys,
+  ErrTmuxSessionCreate,
   ErrSystemInstallDisappeared,
   ErrTmuxNotAvailable,
   ErrCwdNotFound,
