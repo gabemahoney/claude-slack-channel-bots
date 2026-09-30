@@ -11,8 +11,9 @@
  * wrapper (`withOutageDetection`) with the call the site declares, inside an
  * attempt (`runInAttempt`) where the case needs one.
  *
- * - What starts it: each UNAVAILABLE form but `ErrTmuxKillFailed`, from each
- *   tmux-touching call the launch ladder makes, inside the launch; nothing
+ * - What starts it: each UNAVAILABLE form but `ErrTmuxKillFailed` at one of
+ *   the tmux-touching calls the launch ladder makes, every such call met by
+ *   at least one form, inside the launch; nothing
  *   else (the kill-failure cause, read and sweep errors inside an attempt,
  *   kills not of a row read live, calls outside every attempt).
  * - Held apart from the outages: no flag raised or cleared, no onset or
@@ -31,10 +32,10 @@
  *   agent-director's defaults and "over 3 minutes" at AC 80's settings);
  *   every other case builds its texts with the exported builders and its
  *   times from the exported floor and E6's threshold accessor. The log
- *   lines have no exported builder, so the file-local line builders
- *   (`onsetLine`, `alertLine`, `endedLine`, `recoveryLine`, `silentEndLine`)
- *   hold their fixed words; their seconds come from the clock and the
- *   threshold in effect, and the notice cases assert every notice and
+ *   lines have no exported builder, so the recovery harness's line builders
+ *   (`conditionOnsetLine`, `conditionAlertLine`, `conditionEndedLine`,
+ *   `conditionRecoveryLine`, `conditionSilentEndLine`) hold their fixed
+ *   words; their seconds come from the clock and the threshold in effect, and the notice cases assert every notice and
  *   ended line exactly, in order.
  * - The onset (SRJ-308): with the health check on, at the end of the first
  *   health tick that started after the first refusal while the condition
@@ -65,7 +66,6 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import {
   AD_CALL_KILL_ROW_NOT_READ_LIVE,
   AD_CALL_KILL_ROW_READ_LIVE,
-  CSCB_UNKNOWN_ERROR_NAME,
   type AdCall,
 } from '../src/ad-error-class.ts'
 import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
@@ -92,7 +92,7 @@ import {
   type TmuxUnresponsiveEndReason,
 } from '../src/persona-episodes.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
-import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter } from '../src/server.ts'
+import { _buildIsSessionAliveAdapter } from '../src/server.ts'
 import { killPersonaInstance, reconcileOrphans } from '../src/session-manager.ts'
 import {
   runInAttempt,
@@ -105,29 +105,36 @@ import {
 } from '../src/unavailable-retry.ts'
 import {
   cannedErr,
-  cannedGetResult,
   cannedListRow,
   cannedOk,
   cannedStatusResult,
   errCallTimeout,
-  errGeneric,
   errInstanceIdCollision,
   errTmuxCaptureFailed,
   errTmuxKillFailed,
   errTmuxNotAvailable,
   errTmuxSendKeys,
   errTmuxUnresponsive,
-  errTmuxUnresponsiveLaunchTimeout,
-  errTmuxUnresponsiveStillStarting,
   errTmuxUnresponsiveStillStopping,
-  errUnknownErrorName,
   holdSpawns,
-  type PersonaGetResultOverrides,
+  unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
 import type { AdConfigTables } from './test-helpers/ad-settings.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import {
+  collided,
+  conditionAlertLine,
+  conditionEndedLine,
+  conditionEndedLines,
+  conditionLinePrefix,
+  conditionLines,
+  conditionOnsetLine,
+  conditionRecoveryLine,
+  conditionSilentEndLine,
+  conditionStartedLines,
   makeRecoveryHarness,
+  personaOf,
+  retryNow,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoveryNotice,
@@ -159,34 +166,11 @@ function halfFirstWaitMs(): number {
   return (doublingBackoffDelay(UNAVAILABLE_RETRY_BASE_S, 0, UNAVAILABLE_RETRY_CEILING_S) * 1000) / 2
 }
 
-/** Persona `key` of the harness's configuration. */
-function personaOf(h: RecoveryHarness, key: string): Persona {
-  return h.config.personas.find((p) => p.key === key)!
-}
-
-/** The stub answers of a launch whose optimistic spawn collides and whose collision `get` reads `row`. */
-function collided(h: RecoveryHarness, persona: Persona, row: PersonaGetResultOverrides): RecoveryStubScript {
-  return {
-    spawnQueue: [cannedErr(errInstanceIdCollision())],
-    getResult: cannedGetResult(row, persona, h.home),
-  }
-}
-
-/** Persona `key`'s condition started lines. */
-function startedLines(h: RecoveryHarness, key: string): string[] {
-  return h.lines.filter((line) => line.includes(`persona=${key} ${KIND} started`))
-}
-
-/** Persona `key`'s condition ended lines. */
-function endedLines(h: RecoveryHarness, key: string): string[] {
-  return h.lines.filter((line) => line.includes(`persona=${key} ${KIND} ended`))
-}
-
 /** Persona `key`'s condition holds, started once by `verb`, with its first refusal at `at`. */
 function expectHolds(h: RecoveryHarness, key: string, verb: string, at: number): void {
   expect(h.tmuxUnresponsive.holds(key)).toBe(true)
   expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(at)
-  const started = startedLines(h, key)
+  const started = conditionStartedLines(h, key)
   expect(started).toHaveLength(1)
   expect(started[0]).toContain(` — ${verb} failed: `)
 }
@@ -195,8 +179,8 @@ function expectHolds(h: RecoveryHarness, key: string, verb: string, at: number):
 function expectNeverStarted(h: RecoveryHarness, key: string): void {
   expect(h.tmuxUnresponsive.holds(key)).toBe(false)
   expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBeUndefined()
-  expect(startedLines(h, key)).toEqual([])
-  expect(endedLines(h, key)).toEqual([])
+  expect(conditionStartedLines(h, key)).toEqual([])
+  expect(conditionEndedLines(h, key)).toEqual([])
   expect(h.conditionEnds.filter((end) => end.key === key)).toEqual([])
 }
 
@@ -229,16 +213,16 @@ async function refuse(h: RecoveryHarness, key: string, make: (verb: string) => E
 // What starts it (SRJ-307; AC 25, AC 27)
 // ---------------------------------------------------------------------------
 
-/** E4's UNAVAILABLE forms other than `ErrTmuxKillFailed`, each built for the verb that meets it. */
-const UNAVAILABLE_FORMS: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
-  ['ErrTmuxUnresponsive', (verb) => errTmuxUnresponsive(verb)],
-  ['ErrTmuxUnresponsive, still stopping', (verb) => errTmuxUnresponsiveStillStopping(verb)],
-  ['ErrTmuxUnresponsive, still starting', (verb) => errTmuxUnresponsiveStillStarting(verb)],
-  ['ErrTmuxUnresponsive, launch timeout', (verb) => errTmuxUnresponsiveLaunchTimeout(verb)],
-  ['ErrCallTimeout', (verb) => errCallTimeout(verb)],
-  ['an unknown error name from a later binary', () => errUnknownErrorName()],
-  ['a wrapped UnknownError', (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME, 'Error: boom')],
-]
+/** E4's UNAVAILABLE forms of agent-director's own errors other than `ErrTmuxKillFailed`, each built for the verb that meets it. */
+const TMUX_STARTING_FORMS = unavailableForms(
+  'ErrTmuxUnresponsive',
+  'ErrTmuxUnresponsive, still stopping',
+  'ErrTmuxUnresponsive, still starting',
+  'ErrTmuxUnresponsive, launch timeout',
+  'ErrCallTimeout',
+  ['ErrUnknownErrorName', 'an unknown error name from a later binary'],
+  'a wrapped UnknownError',
+)
 
 /** A tmux-touching call the launch ladder makes, and the stub answers that make it meet `err`. */
 interface TmuxSite {
@@ -267,9 +251,16 @@ const TMUX_SITES: readonly TmuxSite[] = [
 ]
 
 describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
-  const cross = UNAVAILABLE_FORMS.flatMap(([what, make]) => TMUX_SITES.map((site) => [what, site.name, make, site] as const))
+  // Every form at one site and every site with at least one form: the shorter
+  // list cycles under the longer. The full form × site matrix is
+  // session-manager's; the by-name classifier is outage-state's.
+  const paired = Array.from({ length: Math.max(TMUX_STARTING_FORMS.length, TMUX_SITES.length) }, (_, i) => {
+    const [what, make] = TMUX_STARTING_FORMS[i % TMUX_STARTING_FORMS.length]!
+    const site = TMUX_SITES[i % TMUX_SITES.length]!
+    return [what, site.name, make, site] as const
+  })
 
-  test.each(cross)('%s at %s inside a launch starts P’s condition at the first refusal’s time; a second refusal keeps it; B’s never starts', async (_what, _site, make, site) => {
+  test.each(paired)('%s at %s inside a launch starts P’s condition at the first refusal’s time; a second refusal keeps it; B’s never starts', async (_what, _site, make, site) => {
     const { h, p, b } = build()
     const firstAt = h.clock.now()
     h.script(site.script(h, personaOf(h, p), make(site.verb)))
@@ -340,10 +331,6 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
   })
 
   test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>, boolean]>([
-    ['the restart path’s kill (after a dead reading), inside a recovery attempt', async (h, key) => {
-      h.script({ killError: errTmuxUnresponsive('kill') })
-      await runInAttempt(key, 'recovery', () => _buildKillSessionAdapter((k) => personaOf(h, k))(key))
-    }, true],
     ['a persona teardown’s kill, even inside a recovery attempt', async (h, key) => {
       const err = errTmuxUnresponsive('kill')
       h.script({ killError: err })
@@ -456,7 +443,19 @@ describe('tmux-unresponsive: held apart from the outages', () => {
 
     expect([...getOutageFlags(p)]).toEqual([raised])
     expect(h.outageNotices).toEqual([{ key: p, text: ONSET_TEMPLATES[raised](dir) }])
+
+    // A later launch whose spawn succeeds clears the flag: the all-clear
+    // names the cwd outage alone, so the condition added nothing to the stretch.
+    await h.advance(halfFirstWaitMs())
+    await h.launch(p)
+
+    expect([...getOutageFlags(p)]).toEqual([])
+    expect(h.outageNotices).toEqual([
+      { key: p, text: ONSET_TEMPLATES[raised](dir) },
+      { key: p, text: ALL_CLEAR_TEMPLATE(new Map([[raised, { detail: dir }]])) },
+    ])
     expect(h.episodeNotices).toEqual([])
+    expectNeverStarted(h, b)
   })
 })
 
@@ -497,7 +496,7 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
 
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(h.tmuxUnresponsive.firstRefusalAt(p)).toBeUndefined()
-    expect(endedLines(h, p)).toHaveLength(1)
+    expect(conditionEndedLines(h, p)).toHaveLength(1)
     expect(h.conditionEnds).toEqual([{ key: p, reading, result }])
     expectNeverStarted(h, b)
     expectNoPostYet(h)
@@ -518,7 +517,7 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
     await wrapped(p, call, outcome)
 
     expectHolds(h, p, 'spawn', at)
-    expect(endedLines(h, p)).toEqual([])
+    expect(conditionEndedLines(h, p)).toEqual([])
     expect(h.conditionEnds).toEqual([])
     expectNeverStarted(h, b)
     expect(h.episodeNotices).toEqual([])
@@ -548,7 +547,7 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(h.stub.calls.resumeCalls).toHaveLength(1)
     expect(h.conditionEnds).toEqual([{ key: p, reading: undefined, result: 'stopped' }])
-    expect(endedLines(h, p)).toHaveLength(1)
+    expect(conditionEndedLines(h, p)).toHaveLength(1)
     expectNeverStarted(h, b)
     expectNoPostYet(h)
   })
@@ -561,7 +560,7 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
     expect(h.tickEnd(p)).toBe('not-holding')
     await wrapped(p, 'spawn', RESOLVES)
 
-    expect(endedLines(h, p)).toHaveLength(1)
+    expect(conditionEndedLines(h, p)).toHaveLength(1)
     expect(h.conditionEnds).toEqual([{ key: p, reading: LIVENESS_LIVE, result: 'stopped' }])
     expectNoPostYet(h)
     expectNeverStarted(h, b)
@@ -579,8 +578,8 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
     expect(secondAt).toBeGreaterThan(firstAt)
     expect(h.tmuxUnresponsive.firstRefusalAt(p)).toBe(secondAt)
     expect(h.episodes.view(p, KIND)!.episode).not.toBe(firstEpisode)
-    expect(startedLines(h, p)).toHaveLength(2)
-    expect(endedLines(h, p)).toHaveLength(1)
+    expect(conditionStartedLines(h, p)).toHaveLength(2)
+    expect(conditionEndedLines(h, p)).toHaveLength(1)
     expectNoPostYet(h)
     expectNeverStarted(h, b)
   })
@@ -604,7 +603,7 @@ describe('tmux-unresponsive: isolation', () => {
 
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expectHolds(h, b, 'spawn', bAt)
-    expect(endedLines(h, b)).toEqual([])
+    expect(conditionEndedLines(h, b)).toEqual([])
     expect(h.conditionEnds.map((end) => end.key)).toEqual([p])
     expectNoPostYet(h)
   })
@@ -662,10 +661,9 @@ function tick(h: RecoveryHarness, live: readonly string[] = []): void {
   h.tickOnset(startedAt)
 }
 
-/** Move the clock to persona `key`'s next retry and run it; resolves with the time it was due. */
+/** Move the clock to persona `key`'s next retry and run it, unsettled; resolves with the time it was due. */
 async function nextRetry(h: RecoveryHarness, key: string): Promise<number> {
-  const due = h.controller.view(key)!.dueAt!
-  await h.advance(due - h.clock.now())
+  const due = await retryNow(h, key, { settle: false })
   expect(h.attempts.at(-1)).toMatchObject({ key, at: due })
   return due
 }
@@ -675,44 +673,9 @@ function retriesOf(h: RecoveryHarness, key: string): number {
   return h.attempts.filter((attempt) => attempt.key === key).length
 }
 
-/** The prefix of every line persona `key`'s condition logs. */
-function linePrefix(key: string): string {
-  return `[slack] persona-episodes: persona=${key} ${KIND} `
-}
-
 /** Persona `key`'s condition lines after its started lines, in order: its notice lines and its ended lines. */
 function noticeAndEndLines(h: RecoveryHarness, key: string): string[] {
-  return h.lines.filter((line) => line.startsWith(linePrefix(key)) && !line.startsWith(`${linePrefix(key)}started`))
-}
-
-/** Whole seconds, rounded down, of `ms`: how the lines give a span. */
-function wholeSeconds(ms: number): number {
-  return Math.floor(ms / 1000)
-}
-
-/** The onset's line: posted at `where`, `sinceMs` after the first refusal. */
-function onsetLine(key: string, where: 'a health tick' | 'a retry', sinceMs: number): string {
-  return `${linePrefix(key)}onset posted — still not answering at ${where}, ${wholeSeconds(sinceMs)} s after its first refusal`
-}
-
-/** The alert's line: posted `lastedMs` after the first refusal, over `thresholdMs`. */
-function alertLine(key: string, lastedMs: number, thresholdMs: number): string {
-  return `${linePrefix(key)}alert posted — not answering for ${wholeSeconds(lastedMs)} s, over its alert threshold of ${wholeSeconds(thresholdMs)} s`
-}
-
-/** The ended line for `reason`. */
-function endedLine(key: string, reason: TmuxUnresponsiveEndReason): string {
-  return `${linePrefix(key)}ended — ${TMUX_UNRESPONSIVE_END_TEXT[reason]}`
-}
-
-/** The recovery's line, after the ended line. */
-function recoveryLine(key: string): string {
-  return `${linePrefix(key)}recovery posted`
-}
-
-/** A silent end's line after an onset, after the ended line. */
-function silentEndLine(key: string): string {
-  return `${linePrefix(key)}recovery not posted — a silent end (a CONFLICT answer ended it)`
+  return conditionLines(h, key).filter((line) => !line.startsWith(`${conditionLinePrefix(key)}started`))
 }
 
 describe('tmux-unresponsive: SRJ-1006’s texts (pin)', () => {
@@ -773,7 +736,7 @@ describe('tmux-unresponsive: the onset with the health check on (SRJ-308; AC 25)
     const tickAt = h.clock.now()
     tick(h)
     expectPosts(h, [onset(p)])
-    const lines = [onsetLine(p, 'a health tick', tickAt - at)]
+    const lines = [conditionOnsetLine(p, 'a health tick', tickAt - at)]
     expect(noticeAndEndLines(h, p)).toEqual(lines)
 
     for (let n = 0; n < 3; n++) {
@@ -800,7 +763,7 @@ describe('tmux-unresponsive: the onset with the health check on (SRJ-308; AC 25)
 
     const firedAt = await nextRetry(h, p)
     expectPosts(h, [onset(p)])
-    expect(noticeAndEndLines(h, p)).toEqual([onsetLine(p, 'a retry', firedAt - at)])
+    expect(noticeAndEndLines(h, p)).toEqual([conditionOnsetLine(p, 'a retry', firedAt - at)])
   })
 })
 
@@ -816,7 +779,7 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
     }
     expect(retriesOf(h, p)).toBeGreaterThan(1)
     expectPosts(h, [onset(p)])
-    const lines = [onsetLine(p, 'a retry', firedAt - at)]
+    const lines = [conditionOnsetLine(p, 'a retry', firedAt - at)]
     expect(noticeAndEndLines(h, p)).toEqual(lines)
 
     for (let n = 0; n < 3; n++) await nextRetry(h, p)
@@ -840,12 +803,12 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
     expect(await nextRetry(h, p)).toBe(due)
     expect(due - at).toBe(FLOOR_MS - shortMs)
     expectPosts(h, shortMs === 0 ? [onset(p)] : [])
-    const lines = shortMs === 0 ? [onsetLine(p, 'a retry', FLOOR_MS)] : []
+    const lines = shortMs === 0 ? [conditionOnsetLine(p, 'a retry', FLOOR_MS)] : []
     expect(noticeAndEndLines(h, p)).toEqual(lines)
 
     const nextAt = await nextRetry(h, p)
     expectPosts(h, [onset(p)])
-    expect(noticeAndEndLines(h, p)).toEqual(shortMs === 0 ? lines : [onsetLine(p, 'a retry', nextAt - at)])
+    expect(noticeAndEndLines(h, p)).toEqual(shortMs === 0 ? lines : [conditionOnsetLine(p, 'a retry', nextAt - at)])
   })
 
   test('a retry skipped because P’s launch is in flight, at or past the floor, posts the onset and makes no agent-director call', async () => {
@@ -866,7 +829,7 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
     expect(h.stub.callCount()).toBe(calls)
     expect(h.controller.isArmed(p)).toBe(true)
     expectPosts(h, [onset(p)])
-    expect(noticeAndEndLines(h, p)).toEqual([onsetLine(p, 'a retry', firedAt - at)])
+    expect(noticeAndEndLines(h, p)).toEqual([conditionOnsetLine(p, 'a retry', firedAt - at)])
 
     hold.fail(personaInstanceId(p), errTmuxUnresponsive('spawn'))
     await launch
@@ -902,7 +865,7 @@ describe('tmux-unresponsive: the alert (SRJ-309; AC 26, AC 80)', () => {
 
     await h.advance(1)
     expectPosts(h, [alert(p, thresholdMs)])
-    const lines = [alertLine(p, h.clock.now() - at, thresholdMs)]
+    const lines = [conditionAlertLine(p, h.clock.now() - at, thresholdMs)]
     expect(h.clock.now() - at).toBe(thresholdMs + 1)
     expect(noticeAndEndLines(h, p)).toEqual(lines)
 
@@ -931,7 +894,7 @@ describe('tmux-unresponsive: the alert (SRJ-309; AC 26, AC 80)', () => {
 
     await h.advance(1)
     expectPosts(h, [alert(p, thresholdMs)])
-    expect(noticeAndEndLines(h, p)).toEqual([alertLine(p, thresholdMs + 1, thresholdMs)])
+    expect(noticeAndEndLines(h, p)).toEqual([conditionAlertLine(p, thresholdMs + 1, thresholdMs)])
   })
 
   test('a condition that ends before the threshold posts no alert and leaves nothing pending', async () => {
@@ -962,7 +925,7 @@ describe('tmux-unresponsive: the recovery (SRJ-310)', () => {
 
     await end(h, p)
     expectPosts(h, [onset(p), recovery(p)])
-    const lines = [onsetLine(p, 'a health tick', tickMs(h)), endedLine(p, reason), recoveryLine(p)]
+    const lines = [conditionOnsetLine(p, 'a health tick', tickMs(h)), conditionEndedLine(p, reason), conditionRecoveryLine(p)]
     expect(h.clock.now() - at).toBe(tickMs(h))
     expect(noticeAndEndLines(h, p)).toEqual(lines)
 
@@ -987,10 +950,10 @@ describe('tmux-unresponsive: the recovery (SRJ-310)', () => {
 
     expectPosts(h, [onset(p), alert(p, thresholdMs), recovery(p)])
     expect(noticeAndEndLines(h, p)).toEqual([
-      onsetLine(p, 'a health tick', tickMs(h)),
-      alertLine(p, thresholdMs + 1, thresholdMs),
-      endedLine(p, TMUX_UNRESPONSIVE_END_TICK),
-      recoveryLine(p),
+      conditionOnsetLine(p, 'a health tick', tickMs(h)),
+      conditionAlertLine(p, thresholdMs + 1, thresholdMs),
+      conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TICK),
+      conditionRecoveryLine(p),
     ])
   })
 
@@ -1004,7 +967,7 @@ describe('tmux-unresponsive: the recovery (SRJ-310)', () => {
     expect(h.tickEnd(p)).toBe('ended')
 
     expectPosts(h, [alert(p, thresholdMs)])
-    expect(noticeAndEndLines(h, p)).toEqual([alertLine(p, thresholdMs + 1, thresholdMs), endedLine(p, TMUX_UNRESPONSIVE_END_TICK)])
+    expect(noticeAndEndLines(h, p)).toEqual([conditionAlertLine(p, thresholdMs + 1, thresholdMs), conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TICK)])
   })
 
   test('a silent end (a CONFLICT answer ends it) posts no recovery after the onset; the condition still ends once', async () => {
@@ -1016,13 +979,13 @@ describe('tmux-unresponsive: the recovery (SRJ-310)', () => {
     expect(h.tmuxUnresponsive.end(p, TMUX_UNRESPONSIVE_END_TMUX_VERB, undefined, { silent: true })).toBe('ended-after-onset')
 
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(endedLines(h, p)).toHaveLength(1)
+    expect(conditionEndedLines(h, p)).toHaveLength(1)
     expect(h.conditionEnds).toEqual([{ key: p, reading: undefined, result: 'stopped' }])
     expectPosts(h, [onset(p)])
     expect(noticeAndEndLines(h, p)).toEqual([
-      onsetLine(p, 'a health tick', tickMs(h)),
-      endedLine(p, TMUX_UNRESPONSIVE_END_TMUX_VERB),
-      silentEndLine(p),
+      conditionOnsetLine(p, 'a health tick', tickMs(h)),
+      conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TMUX_VERB),
+      conditionSilentEndLine(p),
     ])
   })
 
@@ -1031,10 +994,10 @@ describe('tmux-unresponsive: the recovery (SRJ-310)', () => {
     const thresholdMs = adAlertThresholdMsInEffect()
     const episode = [onset(p), alert(p, thresholdMs), recovery(p)]
     const episodeLines = [
-      onsetLine(p, 'a health tick', tickMs(h)),
-      alertLine(p, thresholdMs + 1, thresholdMs),
-      endedLine(p, TMUX_UNRESPONSIVE_END_TICK),
-      recoveryLine(p),
+      conditionOnsetLine(p, 'a health tick', tickMs(h)),
+      conditionAlertLine(p, thresholdMs + 1, thresholdMs),
+      conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TICK),
+      conditionRecoveryLine(p),
     ]
 
     for (let n = 1; n <= 2; n++) {
@@ -1046,7 +1009,7 @@ describe('tmux-unresponsive: the recovery (SRJ-310)', () => {
       expectPosts(h, Array.from({ length: n }, () => episode).flat())
       expect(noticeAndEndLines(h, p)).toEqual(Array.from({ length: n }, () => episodeLines).flat())
     }
-    expect(startedLines(h, p)).toHaveLength(2)
+    expect(conditionStartedLines(h, p)).toHaveLength(2)
   })
 })
 

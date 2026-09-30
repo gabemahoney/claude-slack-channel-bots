@@ -45,7 +45,6 @@ import {
   AD_CALL_KILL_ROW_NOT_READ_LIVE,
   AD_CALL_KILL_ROW_READ_LIVE,
   AD_VERB_KILL,
-  CSCB_UNKNOWN_ERROR_NAME,
   TMUX_TOUCHING_VERBS,
   adCallVerb,
   type AdCall,
@@ -60,7 +59,6 @@ import {
   STUB_INSTANCE_ID,
   errCallTimeout,
   errConfigMalformed,
-  errGeneric,
   errInstanceIdCollision,
   errSpawnNotFound,
   errSystemInstallDisappeared,
@@ -69,12 +67,12 @@ import {
   errTmuxNotAvailable,
   errTmuxSendKeys,
   errTmuxUnresponsive,
-  errUnknownErrorName,
   errUnusableName,
   makeStubCallLog,
   makeStubClient,
   type StubCallLog,
   type StubClientOptions,
+  unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
@@ -1187,29 +1185,23 @@ describe('the declared verb and the tmux-unresponsive condition sink (b.jg5 SRJ-
     return typeof call === 'string' ? call : `kill (row read live: ${call.rowReadLive})`
   }
 
-  /** Both wrappers: the condition rules are the same through each. */
-  const WRAPPERS = [
-    ['withOutageDetection', withOutageDetection],
-    ['withSpawnDetection', withSpawnDetection],
-  ] as const
-  type Wrap = (typeof WRAPPERS)[number][1]
+  type Wrap = typeof withOutageDetection
+  type Row = [string, string, Wrap, AdCall]
 
-  /** One table row per wrapper and declared call: `[wrapper name, call name, wrap, call]`. */
-  function rows(calls: readonly AdCall[]): Array<[string, string, Wrap, AdCall]> {
-    return WRAPPERS.flatMap(([name, wrap]) => calls.map((call): [string, string, Wrap, AdCall] => [name, callName(call), wrap, call]))
+  /**
+   * One table row per declared call through `withOutageDetection`:
+   * `[wrapper name, call name, wrap, call]`. `withSpawnDetection` delegates to
+   * it, so the start and success tables each add one `withSpawnDetection` row.
+   */
+  function rows(calls: readonly AdCall[]): Row[] {
+    return calls.map((call): Row => ['withOutageDetection', callName(call), withOutageDetection, call])
   }
 
   /**
    * The UNAVAILABLE forms other than `ErrTmuxKillFailed` (b.jg5 SRJ-104), each
    * built for the declared verb.
    */
-  const UNAVAILABLE_FORMS: ReadonlyArray<readonly [string, (verb: string) => unknown]> = [
-    ['ErrTmuxUnresponsive', (verb) => errTmuxUnresponsive(verb)],
-    ['ErrCallTimeout', (verb) => errCallTimeout(verb)],
-    ['an ErrUnknownErrorName of an unknown name', () => errUnknownErrorName()],
-    ['CSCB\'s UnknownError wrapper', (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME)],
-    ['a value that is not an agent-director error', () => new Error('not an agent-director error')],
-  ]
+  const TMUX_STARTING_FORMS = unavailableForms('ErrTmuxUnresponsive', 'ErrCallTimeout', 'ErrUnknownErrorName', 'a wrapped UnknownError', 'a plain Error')
 
   /** The GONE answers (b.jg5 SRJ-104). */
   const GONE_FORMS: ReadonlyArray<readonly [string, () => unknown]> = [
@@ -1239,9 +1231,9 @@ describe('the declared verb and the tmux-unresponsive condition sink (b.jg5 SRJ-
     expect([...TMUX_TOUCHING_VERBS].sort()).toEqual(['kill', 'pause', 'read-pane', 'resume', 'send-keys', 'spawn'])
   })
 
-  test.each(rows(TMUX_TOUCHING_CALLS))('%s, tmux-touching %s: each UNAVAILABLE form inside P\'s attempt starts P\'s condition once with the declared verb; no end, no flag, no notice', async (_wrapName, _callName, wrap, call) => {
+  test.each([...rows(TMUX_TOUCHING_CALLS), ['withSpawnDetection', 'spawn', withSpawnDetection, 'spawn'] as Row])('%s, tmux-touching %s: each UNAVAILABLE form inside P\'s attempt starts P\'s condition once with the declared verb; no end, no flag, no notice', async (_wrapName, _callName, wrap, call) => {
     const verb = adCallVerb(call)!
-    for (const [form, build] of UNAVAILABLE_FORMS) {
+    for (const [form, build] of TMUX_STARTING_FORMS) {
       const err = build(verb)
       const { emissions, arms, starts, ends } = makeConditionHarness()
 
@@ -1285,7 +1277,7 @@ describe('the declared verb and the tmux-unresponsive condition sink (b.jg5 SRJ-
     expect(lastError).toEqual({ verb: adCallVerb(call), causeKind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, armed: true })
   })
 
-  test.each(rows(TMUX_TOUCHING_CALLS))('%s, tmux-touching %s: a success ends P\'s condition once, inside P\'s attempt and outside any; no start, the result unchanged, no notice', async (_wrapName, _callName, wrap, call) => {
+  test.each([...rows(TMUX_TOUCHING_CALLS), ['withSpawnDetection', 'resume', withSpawnDetection, 'resume'] as Row])('%s, tmux-touching %s: a success ends P\'s condition once, inside P\'s attempt and outside any; no start, the result unchanged, no notice', async (_wrapName, _callName, wrap, call) => {
     const { emissions, starts, ends } = makeConditionHarness()
 
     const inside = await inAttempt(P1, () => wrap(P1, WORKDIR, call, async () => 'ok'))
@@ -1358,7 +1350,7 @@ describe('the declared verb and the tmux-unresponsive condition sink (b.jg5 SRJ-
     await runInAttempt(P1, 'launch', () => 'done')
     const afterP = await rejectionOf(withOutageDetection, P1, call, err)
 
-    expect([outside, insideQ.result, qInsideP.result, afterP].every((r) => r === err)).toBe(true)
+    expect([outside, insideQ.result, qInsideP.result, afterP]).toEqual([err, err, err, err])
     expect(starts).toEqual([])
     expect(ends).toEqual([])
   })

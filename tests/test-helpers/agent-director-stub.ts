@@ -62,6 +62,8 @@
  *     `{ err_name, err_description }` envelope in `envelope`
  *     (`ErrSchemaMigrationRequired` and `ErrStoreOpen` through
  *     `errUnknownErrorName`).
+ *   - `UNAVAILABLE_FORMS` is the one table of UNAVAILABLE forms (label,
+ *     builder by verb, cause kind); `unavailableForms` picks a subset.
  *   - The description words CSCB matches come from
  *     `src/ad-description-phrases.ts`; the Phase 1 result fields
  *     (`kill_sent`, `launch_started_at`, `liveness_note`, `pre_trust`) are
@@ -201,6 +203,8 @@ import type {
   PreTrust,
 } from '../../src/ad-phase1-types.ts'
 import type { StartupGateDeps } from '../../src/agent-director-startup.ts'
+import { CSCB_UNKNOWN_ERROR_NAME } from '../../src/ad-error-class.ts'
+import { UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE } from '../../src/unavailable-retry.ts'
 import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
 import { makePersona } from './persona-config.ts'
 
@@ -943,6 +947,46 @@ export function errSchemaMismatch(
  */
 export function errInternal(description: string = 'the store could not be read'): ErrUnknownErrorName {
   return errUnknownErrorName('ErrInternal', description)
+}
+
+/**
+ * One UNAVAILABLE form (b.jg5 SRJ-104): its label, its builder for the verb
+ * whose call meets it, and the retry cause kind it arms. A tuple, so a
+ * `test.each` over it names its cases by the label.
+ */
+export type UnavailableForm = readonly [label: string, make: (verb: string) => Error, causeKind: string]
+
+/**
+ * Every UNAVAILABLE form, each built by name: `ErrTmuxUnresponsive` and its
+ * three variants CSCB tells apart, `ErrCallTimeout`, an unknown error name
+ * from a later binary, CSCB's `UnknownError` wrapper, `ErrTmuxKillFailed`
+ * (the kill-failure cause; only a kill answers it) and a plain `Error` (not
+ * an agent-director error). Pick a file's subset with `unavailableForms`.
+ */
+export const UNAVAILABLE_FORMS: readonly UnavailableForm[] = [
+  ['ErrTmuxUnresponsive', (verb) => errTmuxUnresponsive(verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+  ['ErrTmuxUnresponsive, still stopping', (verb) => errTmuxUnresponsiveStillStopping(verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+  ['ErrTmuxUnresponsive, still starting', (verb) => errTmuxUnresponsiveStillStarting(verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+  ['ErrTmuxUnresponsive, launch timeout', (verb) => errTmuxUnresponsiveLaunchTimeout(verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+  ['ErrCallTimeout', (verb) => errCallTimeout(verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+  ['ErrUnknownErrorName', () => errUnknownErrorName(), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+  ['a wrapped UnknownError', (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME, 'Error: boom'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+  ['ErrTmuxKillFailed', () => errTmuxKillFailed(), UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+  ['a plain Error', () => new Error('boom'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+]
+
+/**
+ * The `UNAVAILABLE_FORMS` rows `picks` names, in that order: a label picks its
+ * row as is, and a `[label, as]` pair picks it relabelled `as`. Throws for a
+ * label the table does not have.
+ */
+export function unavailableForms(...picks: ReadonlyArray<string | readonly [label: string, as: string]>): UnavailableForm[] {
+  return picks.map((pick) => {
+    const [label, as] = typeof pick === 'string' ? [pick, pick] : pick
+    const form = UNAVAILABLE_FORMS.find(([l]) => l === label)
+    if (form === undefined) throw new Error(`unavailableForms: no UNAVAILABLE form labelled ${JSON.stringify(label)}`)
+    return [as, form[1], form[2]] as const
+  })
 }
 
 /**

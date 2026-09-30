@@ -133,6 +133,7 @@ import {
   AD_CALL_KILL_ROW_READ_LIVE,
   AD_ERROR_CLASS_ENVIRONMENT,
   adKillCall,
+  type AdKillCall,
   type AdVerb,
   classifyAdError,
   classifyWithInvalidFlagsRecheck,
@@ -2095,19 +2096,36 @@ export function _resetFindMissingMemo(): void {
  * - Short-TTL memo: a caller arriving within `_findMissingMemoTtlMs` of the
  *   last successful sweep reuses that result instead of re-sweeping.
  *
- * Failures are NOT memoized — on error the next caller retries. Error handling
- * mirrors the previous inline call sites: log once and let the caller proceed
- * with today's behavior (fall through to the poll loop / attempt resume anyway).
+ * Failures are NOT memoized — on error the next caller retries. A failure the
+ * arming predicate answers a cause for (b.jg5 SRJ-105, `refusalAt` with verb
+ * `find-missing`, which is not a read verb, so only an UNAVAILABLE answer) is
+ * a refusal: one refusal line, and `FIND_MISSING_REFUSED`, after which the
+ * caller calls nothing more in its attempt. Any other failure, CONFIG and
+ * UNUSABLE NAME included, logs once and lets the caller proceed.
  *
  * @param key persona key: the outage key and log context — the sweep itself is whole-store.
  * @param logPrefix distinguishes the call sites in the log line.
  * @param ref log reference; defaults to the key alone.
  * @returns the sweep's result (this caller's, a shared in-flight one or the
- *   memoized one), or undefined when the sweep failed.
+ *   memoized one), `FIND_MISSING_REFUSED` for a refusal, or undefined when
+ *   the sweep failed otherwise.
  */
-async function reconcileMissingSweep(key: string, logPrefix: string, ref: string = keyRef(key)): Promise<FindMissingResult | undefined> {
+async function reconcileMissingSweep(
+  key: string,
+  logPrefix: string,
+  ref: string = keyRef(key),
+): Promise<FindMissingResult | typeof FIND_MISSING_REFUSED | undefined> {
   return sharedFindMissingSweep(() => withOutageDetection(key, undefined, 'find-missing', (client) => client.findMissing({})), logPrefix, ref, key)
 }
+
+/**
+ * A persona's findMissing sweep that was refused (b.jg5 SRJ-105): the sweep
+ * failed with an error the arming predicate answers a cause for, which for
+ * `find-missing` (not a read verb) is only an UNAVAILABLE answer. The caller
+ * stops its launch or recovery attempt: no resume, kill, delete, launch,
+ * reconnect or dead-session verdict follows.
+ */
+const FIND_MISSING_REFUSED: unique symbol = Symbol('find-missing refused')
 
 /**
  * The memo and single-flight core of `reconcileMissingSweep`, shared by every
@@ -2122,13 +2140,27 @@ async function reconcileMissingSweep(key: string, logPrefix: string, ref: string
  * under the starter's key, and a persona that joined a sweep someone else
  * started (another persona's, or the start sweep's direct call) reports it
  * here under its own key, so sharing the sweep never changes whose timer arms.
+ * For a persona's caller, the starter and each joiner alike, a refused sweep
+ * answers `FIND_MISSING_REFUSED` (b.jg5 SRJ-105); a caller that acts for no
+ * persona only ever gets undefined for a failure.
  */
 async function sharedFindMissingSweep(
   start: () => Promise<FindMissingResult>,
   logPrefix: string,
   ref: string,
+): Promise<FindMissingResult | undefined>
+async function sharedFindMissingSweep(
+  start: () => Promise<FindMissingResult>,
+  logPrefix: string,
+  ref: string,
+  key: string,
+): Promise<FindMissingResult | typeof FIND_MISSING_REFUSED | undefined>
+async function sharedFindMissingSweep(
+  start: () => Promise<FindMissingResult>,
+  logPrefix: string,
+  ref: string,
   key?: string,
-): Promise<FindMissingResult | undefined> {
+): Promise<FindMissingResult | typeof FIND_MISSING_REFUSED | undefined> {
   // Memo hit: a recent successful sweep is still within the TTL. Reuse it.
   if (_findMissingLast && Date.now() - _findMissingLast.at < _findMissingMemoTtlMs) {
     return _findMissingLast.result
@@ -2163,6 +2195,10 @@ async function sharedFindMissingSweep(
     if (_findMissingInFlight === inFlight) {
       _findMissingInFlight = null
     }
+    // b.jg5 SRJ-105: a refused sweep stops the persona's attempt.
+    if (key !== undefined && refusalAt(key, err, 'find-missing', logPrefix, 'findMissing sweep', ref)) {
+      return FIND_MISSING_REFUSED
+    }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('findMissing', 'UnknownError', String(err))
     console.error(`[slack] ${logPrefix}: findMissing sweep failed for ${ref}: ${describeAgentDirectorFailure(e)} — proceeding`)
     return undefined
@@ -2191,11 +2227,10 @@ async function sharedFindMissingSweep(
  * helper — because a memo hit returns silently and a sweep failure logs only
  * the generic failure line; an operator must see that recovery was triggered on
  * every escalate-dead verdict. `reconcileMissingSweep` stays module-private; this
- * wrapper is the only export.
+ * wrapper and `sweepDeadTmuxChannelWithCause` are its only exports.
  *
  * Never throws: `reconcileMissingSweep` already logs and swallows its own
- * failures (and does not memoize them, so the next tick retries), so the caller
- * can await this and return its verdict unchanged regardless of sweep outcome.
+ * failures (and does not memoize them, so the next tick retries).
  *
  * @param key the dead-tmux persona's key (log context; the sweep itself is
  *   whole-store, so one in-flight sweep serves the fleet — b.nk5).
@@ -2203,10 +2238,20 @@ async function sharedFindMissingSweep(
  *   says what it proves (`ESCALATE_DEAD_EVIDENCE`, b.jdc).
  */
 export async function sweepDeadTmuxChannel(key: string, verdict: EscalateDeadVerdict): Promise<void> {
+  await sweepDeadTmuxChannelWithCause(key, verdict)
+}
+
+/**
+ * `sweepDeadTmuxChannel`, also saying whether the sweep was refused (b.jg5
+ * SRJ-105, `FIND_MISSING_REFUSED`). The restart path's reconnect adapter
+ * (`src/server.ts`) then answers `transient` instead of `escalate-dead`, so
+ * the restart run neither re-probes nor kills nor relaunches the persona.
+ */
+export async function sweepDeadTmuxChannelWithCause(key: string, verdict: EscalateDeadVerdict): Promise<{ refused?: true }> {
   console.error(
     `[slack] escalate-dead: ${keyRef(key)} verdict=${verdict} — ${ESCALATE_DEAD_EVIDENCE[verdict]}, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)`,
   )
-  await reconcileMissingSweep(key, 'escalate-dead')
+  return (await reconcileMissingSweep(key, 'escalate-dead')) === FIND_MISSING_REFUSED ? { refused: true } : {}
 }
 
 /**
@@ -2298,10 +2343,15 @@ function isDeadRowState(state: string | undefined): boolean {
  * b.jdc: run the memoized findMissing sweep (b.m4r), then read persona
  * `key`'s row state again. Returns that state, or undefined when the read
  * failed (logged with `logPrefix` and `ref`). A failed sweep logs its own
- * line, and the row is read anyway. Never throws.
+ * line, and the row is read anyway, except a refused one (b.jg5 SRJ-105):
+ * then nothing is read and `FIND_MISSING_REFUSED` is returned. Never throws.
  */
-async function reconcileAndReadRowState(key: string, logPrefix: string, ref: string): Promise<string | undefined> {
-  await reconcileMissingSweep(key, logPrefix, ref)
+async function reconcileAndReadRowState(
+  key: string,
+  logPrefix: string,
+  ref: string,
+): Promise<string | typeof FIND_MISSING_REFUSED | undefined> {
+  if ((await reconcileMissingSweep(key, logPrefix, ref)) === FIND_MISSING_REFUSED) return FIND_MISSING_REFUSED
   try {
     const st = await withOutageDetection(key, undefined, 'status', (client) =>
       client.status({ claude_instance_id: personaInstanceId(key) }),
@@ -2349,15 +2399,18 @@ export async function readPersonaRowState(key: string): Promise<UnavailableRetry
  * `PROMPT_ROW_SWEEP_AFTER_MS`, it runs the memoized findMissing sweep and
  * reads the row again: `ended` or `missing` means the claude process is gone,
  * so it logs that, ends the run and returns `escalate`, and the adapter
- * escalates the persona as dead for the restart to relaunch. Otherwise
- * `defer`: the adapter defers the row and raises its notice, as before.
- * Never throws.
+ * escalates the persona as dead for the restart to relaunch. A refused sweep
+ * (b.jg5 SRJ-105) returns `refused`: the row is not read, and the adapter
+ * answers `transient`, so the restart run kills and launches nothing and
+ * raises no notice. Otherwise `defer`: the adapter defers the row and raises
+ * its notice, as before. Never throws.
  */
-export async function checkPromptRowDeferral(key: string, state: string): Promise<'escalate' | 'defer'> {
+export async function checkPromptRowDeferral(key: string, state: string): Promise<'escalate' | 'defer' | 'refused'> {
   const heldMs = noteDeferralRun(promptRowDeferredSince, key)
   if (heldMs < PROMPT_ROW_SWEEP_AFTER_MS) return 'defer'
   const ref = keyRef(key)
   const after = await reconcileAndReadRowState(key, 'reconnectSession: prompt row', ref)
+  if (after === FIND_MISSING_REFUSED) return 'refused'
   if (!isDeadRowState(after)) return 'defer'
   endPromptRowDeferral(key)
   console.error(
@@ -2378,7 +2431,8 @@ export async function checkPromptRowDeferral(key: string, state: string): Promis
  * - gone → the memoized findMissing sweep, then the row is read again:
  *   `ended` or `missing` is a dead session, recovered through
  *   `resumeOrFreshSpawn`; anything else (or a failed read) is left as it is
- *   (`no-op`), for the restart path to retry.
+ *   (`no-op`), for the restart path to retry. A refused sweep (b.jg5
+ *   SRJ-105) reads nothing and answers `failed`: no resume or launch.
  */
 async function launchOnPromptRow(
   persona: Persona,
@@ -2407,6 +2461,7 @@ async function launchOnPromptRow(
     `[slack] spawnForPersona: ${ref} reads ${state} but its tmux session "${personaTmuxSessionName(key)}" is gone — no prompt is waiting in it; reconciling its row before deciding (b.jdc)`,
   )
   const after = await reconcileAndReadRowState(key, 'spawnForPersona: prompt row', ref)
+  if (after === FIND_MISSING_REFUSED) return { key, action: 'failed' }
   if (isDeadRowState(after)) {
     console.error(`[slack] spawnForPersona: dead session for ${ref} (state=${state}) — recovering via resume/fresh-spawn`)
     return resumeOrFreshSpawn(persona, params, config, isStartup, row)
@@ -2525,6 +2580,8 @@ async function tmuxFallbackVerdict(
  *     UNUSABLE NAME answer is a refusal (`refusalAt`): one line, no notice,
  *     no tmux fallback, never 'dead-session', and 'failed'. At the timeout a
  *     CONFIG or UNUSABLE NAME answer still falls back to the tmux probe.
+ *   - a refused findMissing sweep (b.jg5 SRJ-105), up front or at the
+ *     timeout: its refusal line, then 'failed' with no status read.
  *   - ErrSpawnNotFound branch: keys on the TMUX SESSION by design — no AD row
  *     exists, so there is nothing to reconcile or consult (b.c3o).
  */
@@ -2538,8 +2595,8 @@ export async function waitForWaitingAndReconnect(
 
 /**
  * `waitForWaitingAndReconnect`, also saying whether a `failed` outcome was a
- * refusal (b.jg5 SRJ-105): a read error at the poll or timeout `status`, or
- * a refused reconnect. The ladder records no `spawn-failed` entry for it.
+ * refusal (b.jg5 SRJ-105): a refused findMissing sweep, a read error at the
+ * poll or timeout `status`, or a refused reconnect. The ladder records no `spawn-failed` entry for it.
  */
 async function waitForWaitingAndReconnectWithCause(
   key: string,
@@ -2561,6 +2618,18 @@ async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait): 
   const result = await reconnectMcpWithCause(key, ref)
   if (result.refused) wait.refused = true
   return result.outcome
+}
+
+/**
+ * The wait's answer after a refused findMissing sweep (b.jg5 SRJ-105), which
+ * logged its own refusal line: 'cancelled' for a wait its teardown cancelled
+ * meanwhile, otherwise 'failed' with the refusal noted on `wait`. No status
+ * read, reconnect or 'dead-session' verdict follows.
+ */
+function refusedWaitSweep(ref: string, wait: WorkingRowWait): WaitReconnectOutcome {
+  if (wait.cancelled) return waitCancelled(ref)
+  wait.refused = true
+  return 'failed'
 }
 
 /** `waitForWaitingAndReconnect`'s body, with its cancellable `wait` (b.f2b). */
@@ -2596,10 +2665,14 @@ async function waitForWorkingRow(
   // long-turn guard preserved). Prefer
   // AD's findMissing verb over a CSCB-side tmux reconcile per
   // docs/engineering-guide.md ("Avoiding Duplicated Effort"), mirroring
-  // resumeOrFreshSpawn's reconcileMissingFirst branch. On any findMissing
-  // error, log and fall through to the existing poll loop (today's behavior).
+  // resumeOrFreshSpawn's reconcileMissingFirst branch. On a findMissing
+  // error, log and fall through to the existing poll loop (today's
+  // behavior), except a refused sweep (b.jg5 SRJ-105): nothing more is
+  // called, and the wait answers 'failed' as for a refused status read.
   if (wait.cancelled) return waitCancelled(ref)
-  await reconcileMissingSweep(key, 'waitForWaitingAndReconnect', ref)
+  if ((await reconcileMissingSweep(key, 'waitForWaitingAndReconnect', ref)) === FIND_MISSING_REFUSED) {
+    return refusedWaitSweep(ref, wait)
+  }
 
   while (_now() < deadline) {
     if (wait.cancelled) return waitCancelled(ref)
@@ -2708,8 +2781,11 @@ async function waitForWorkingRow(
   // - any other status error → 'failed', never 'dead-session' (b.jg5 SRJ-105,
   //   below); only a CONFIG or UNUSABLE NAME answer still falls back to the
   //   raw tmux probe, which gives 'dead-session' only for a gone session.
+  // - a refused sweep → 'failed' with no status read (b.jg5 SRJ-105).
   if (wait.cancelled) return waitCancelled(ref)
-  await reconcileMissingSweep(key, 'waitForWaitingAndReconnect: timeout', ref)
+  if ((await reconcileMissingSweep(key, 'waitForWaitingAndReconnect: timeout', ref)) === FIND_MISSING_REFUSED) {
+    return refusedWaitSweep(ref, wait)
+  }
   if (wait.cancelled) return waitCancelled(ref)
   let timeoutState: string
   try {
@@ -3048,13 +3124,13 @@ export async function deletePersonaInstance(key: string): Promise<boolean> {
  * `ErrSpawnNotFound`, and after any other error but a refusal, which is
  * ignored as before; false for a refusal (`refusalAt`: UNAVAILABLE,
  * `ErrTmuxKillFailed` included), after which the caller deletes and launches
- * nothing and answers `failed`. `rowReadLive` declares whether the ladder
- * read the row in a live state (`killPersonaInstance`). The persona
+ * nothing and answers `failed`. `call` declares whether the ladder read the
+ * row in a live state (`AdKillCall`, `killPersonaInstance`). The persona
  * teardown's kill (`killPersonaInstance` itself) is unchanged.
  */
-async function tryKill(key: string, rowReadLive: boolean, ref: string): Promise<boolean> {
+async function tryKill(key: string, call: AdKillCall, ref: string): Promise<boolean> {
   try {
-    await killPersonaInstance(key, rowReadLive)
+    await killPersonaInstance(key, call.rowReadLive)
   } catch (err) {
     if (refusalAt(key, err, 'kill', 'spawnForPersona', 'kill', ref)) return false
     /* any other error: ignored, as before */
@@ -3157,9 +3233,9 @@ async function tryDelete(
  * and run dialog approval. The collision ladder's kill+delete+fresh paths go
  * through here: `resume_enabled: false`, a row whose `cwd` differs from the
  * working directory (b.av2 SR-6.2), and a row whose `config_dir` label is
- * missing or differs before a resume. `rowReadLive` declares whether the
+ * missing or differs before a resume. `killCall` declares whether the
  * ladder read the row in a live state, which makes the kill tmux-touching
- * (b.jg5 glossary).
+ * (b.jg5 glossary, `AdKillCall`).
  *
  * - A refused kill (b.jg5 SRJ-105, `tryKill`) returns `failed`: no delete,
  *   no launch.
@@ -3177,11 +3253,11 @@ async function replaceWithFreshSpawn(
   params: SpawnParams,
   isStartup: boolean,
   ref: string,
-  opts: { kill: boolean; rowReadLive: boolean },
+  opts: { kill: boolean; killCall: AdKillCall },
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   // b.jg5 SRJ-105: a refused kill stops the chain: no delete, no launch.
-  if (opts.kill && !(await tryKill(key, opts.rowReadLive, ref))) return { key, action: 'failed' }
+  if (opts.kill && !(await tryKill(key, opts.killCall, ref))) return { key, action: 'failed' }
   if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
 
   const failed = (err: unknown, what: string): SpawnPersonaResult => {
@@ -3560,10 +3636,10 @@ async function resumeOrFreshSpawn(
   // or `working`, a live state; the other callers read it `ended` or
   // `missing`. A kill below declares which (b.jg5 glossary), except the
   // ErrSpawnNotResumable kill, whose row agent-director has just called live.
-  const rowReadLive = opts?.reconcileMissingFirst === true
+  const killCall = adKillCall(opts?.reconcileMissingFirst === true)
   if (config.resume_enabled === false) {
     console.error(`[slack] spawnForPersona: resume_enabled=false — kill+delete+fresh for ${ref}`)
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true, rowReadLive })
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true, killCall })
   }
 
   // b.4dk: dead-session callers (state=waiting/working with a verified-dead
@@ -3573,13 +3649,18 @@ async function resumeOrFreshSpawn(
   // plan b.93m, t1.93m.hp: degraded-mode guard removed) transitions the dead
   // row to `missing`, letting resume succeed and preserve session history.
   // The ended/missing caller does NOT set reconcileMissingFirst (row already
-  // terminal). On any findMissing error, fall through to attempting resume
-  // anyway — resume was never going to succeed on a still-live row, so the
-  // existing ErrSpawnNotResumable → kill+delete+fresh branch is the correct
-  // (today's) fallback. Prefer AD's findMissing verb over CSCB-side tmux
-  // probing per docs/engineering-guide.md ("Avoiding Duplicated Effort").
+  // terminal). A refused sweep (b.jg5 SRJ-105: UNAVAILABLE, e.g.
+  // ErrCallTimeout) stops the attempt before the resume: a resume of the
+  // still-live row would answer ErrSpawnNotResumable, whose branch kills,
+  // deletes and spawns fresh. The ladder answers failed, and markRefusal adds
+  // `refused`. On any other findMissing error, fall through to attempting
+  // resume anyway (the ErrSpawnNotResumable → kill+delete+fresh branch is the
+  // fallback). Prefer AD's findMissing verb over CSCB-side tmux probing per
+  // docs/engineering-guide.md ("Avoiding Duplicated Effort").
   if (opts?.reconcileMissingFirst) {
-    await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref)
+    if ((await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref)) === FIND_MISSING_REFUSED) {
+      return { key, action: 'failed' }
+    }
   }
 
   // b.av2 SR-6.2: a resume keeps the row's old CLAUDE_CONFIG_DIR, so resume
@@ -3605,7 +3686,7 @@ async function resumeOrFreshSpawn(
         `(${was}, now=${configDir.expectedConfigDirLabel} for claude_config_dir=${persona.claude_config_dir ?? '<default>'}) — ` +
         `not resuming; spawning fresh`,
     )
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: rowReadLive, rowReadLive })
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: killCall.rowReadLive, killCall })
   }
 
   // resume_enabled: attempt resume
@@ -3722,7 +3803,7 @@ async function resumeOrFreshSpawn(
       // (tmux-touching), whichever state the ladder read before. E23
       // (SRJ-710) owns what an ErrSpawnNotResumable means here.
       // b.jg5 SRJ-105: a refused kill stops the chain: no delete, no launch.
-      if (!(await tryKill(key, AD_CALL_KILL_ROW_READ_LIVE.rowReadLive, ref))) return { key, action: 'failed' }
+      if (!(await tryKill(key, AD_CALL_KILL_ROW_READ_LIVE, ref))) return { key, action: 'failed' }
       if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
       try {
         await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
@@ -4236,7 +4317,7 @@ async function runPersonaLadder(
     console.error(
       `[slack] spawnForPersona: ${ref} row cwd=${row.cwd || '<none>'} differs from working_directory=${persona.working_directory} (state=${state}) — replacing the row: kill+delete+fresh`,
     )
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true, rowReadLive: AGENT_DIRECTOR_LIVE_STATES.has(state) })
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true, killCall: adKillCall(AGENT_DIRECTOR_LIVE_STATES.has(state)) })
   }
 
   if (state === 'ended' || state === 'missing') {

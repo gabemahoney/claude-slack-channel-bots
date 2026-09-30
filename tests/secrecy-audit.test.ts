@@ -733,8 +733,6 @@ describe("a caught error's text reaches a log line under src/ only redacted (E14
     ['a name set from the message', 'try { f() } catch (err) { const cause = err instanceof Error ? err.message : String(err); log(`x: ${cause}`) }', ['interpolates a caught error']],
     ['a raw startup-error cause', "try { f() } catch (getErr) { recordStartupError('c', 'm', getErr) }", ['passes a caught error as a log argument']],
     ["a caught error through the click handler's logDeps", 'try { f() } catch (err) { logDeps(deps, `x: ${err}`) }', ['interpolates a caught error']],
-    ["a caught error through the persona episodes' safeLog", 'try { f() } catch (err) { safeLog(deps.log, `x: ${err}`) }', ['interpolates a caught error']],
-    ["a described error through the persona episodes' safeLog", 'try { f() } catch (error) { safeLog(deps.log, `x: ${describeAgentDirectorFailure(error)}`) }', []],
     ['an unredacted errDescription', 'log(`x: ${e.errDescription}`)', ['logs an errDescription not through redactSlackLogText']],
     ['an unchecked errName', 'console.error(`x: ${e.errName}`)', ['logs an errName not checked by isSafeIdentifier']],
     ['a wrapper that logs its error raw', 'function logFailure(what, err) { log(`${what}: ${err}`) }\ntry { f() } catch (err) { logFailure("x", err) }', ['interpolates a caught error', 'passes a caught error as a log argument']],

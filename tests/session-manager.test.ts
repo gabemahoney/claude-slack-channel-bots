@@ -290,7 +290,7 @@ import {
   writtenFile,
 } from './test-helpers/credentials.ts'
 import { MCP_SERVER_NAME, type Persona, type PersonaConfig, resolveRealPath } from '../src/config.ts'
-import { PERSONA_INSTANCE_ID_PREFIX, configDirLabelValue, personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { PERSONA_INSTANCE_ID_PREFIX, configDirLabelValue, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import {
   cannedGetResult,
@@ -317,9 +317,7 @@ import {
   errTmuxUnresponsive,
   errConfigMalformed,
   errUnusableName,
-  errCallTimeout,
   errSchemaMismatch,
-  errTmuxKillFailed,
   errUnknownErrorName,
   holdSpawns,
   makeStubCallLog,
@@ -332,6 +330,7 @@ import {
   type StubClient,
   type StubClientOptions,
   type StubResolveSystemBinaryOutcome,
+  unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
@@ -380,16 +379,13 @@ import {
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
 import { RESTART_FAILURE_CAP, RESTART_OUTCOME_REFUSED, runRestartRetry, type LaunchSessionResult } from '../src/restart.ts'
-import { AD_ERROR_CLASS_UNCLASSIFIED, CSCB_UNKNOWN_ERROR_NAME } from '../src/ad-error-class.ts'
-import { adAlertThresholdMsInEffect } from '../src/ad-settings.ts'
+import { AD_ERROR_CLASS_UNCLASSIFIED } from '../src/ad-error-class.ts'
 import { getFailureCount } from '../src/backoff.ts'
 import {
-  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
-  TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
-  tmuxUnresponsiveOnsetText,
-} from '../src/persona-episodes.ts'
-import {
+  collided,
+  conditionStartedLines,
   makeRecoveryHarness,
+  personaOf as harnessPersona,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoveryStubScript,
@@ -8696,14 +8692,17 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
 
   // -------------------------------------------------------------------------
   // Site #9 — tryKill → kill (tested via spawnForPersona collision path)
-  // kill errors are silently ignored by tryKill, but the outage flag IS raised.
+  // A kill error that is not a refusal (b.jg5 SRJ-105: not UNAVAILABLE) is
+  // ignored by tryKill and the delete follows, but the outage flag IS raised.
   // -------------------------------------------------------------------------
 
-  test('site #9: tryKill kill ErrSystemInstallDisappeared → ad-unreachable, error ignored (no spawn-failure notice)', async () => {
+  test('site #9: tryKill kill ErrSystemInstallDisappeared → ad-unreachable, error ignored: the delete follows (no spawn-failure notice)', async () => {
     // collision → get=ended → resume_enabled=false → kill throws (flag set, ignored)
     // delete also throws so flow terminates without a fresh spawn that would clear the flag
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
+    const calls = newLadderCalls()
     installStub({
+      ...calls,
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
       killError: new ErrSystemInstallDisappeared('kill', BIN),
@@ -8711,6 +8710,9 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
+    expect(calls.killCalls).toHaveLength(1)
+    expect(calls.deleteCalls).toHaveLength(1)
+    expect(calls.spawnCalls).toHaveLength(1) // the colliding spawn only: the failed delete stops the chain
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(notices).toHaveLength(0)
   })
@@ -11254,18 +11256,15 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
 // spawn-failure notice), no outage notice, no `spawn-failed` entry, one
 // refusal line, a `{ failed, refused }` result, `launchSession` answering
 // `'refused'`, a failure count left at 0, and persona B launching as before.
+// After every case, nothing the harness captured leaks a secret
+// (`assertNoLeak`, in each describe's `afterEach`).
 // ---------------------------------------------------------------------------
 
-/** E4's UNAVAILABLE forms but `ErrTmuxKillFailed`, each built for the verb that meets it (by name). */
-const SRJ105_UNAVAILABLE: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
-  ['ErrUnknownErrorName', () => errUnknownErrorName()],
-  ['ErrCallTimeout', (verb) => errCallTimeout(verb)],
-  ['a wrapped UnknownError', (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME, 'Error: boom')],
-  ['ErrTmuxUnresponsive', (verb) => errTmuxUnresponsive(verb)],
-]
+/** E4's UNAVAILABLE forms of agent-director's own errors but `ErrTmuxKillFailed`, each built for the verb that meets it (by name). */
+const SRJ105_UNAVAILABLE = unavailableForms('ErrUnknownErrorName', 'ErrCallTimeout', 'a wrapped UnknownError', 'ErrTmuxUnresponsive')
 
 /** `ErrTmuxKillFailed`, the UNAVAILABLE form only a kill answers. */
-const SRJ105_KILL_FAILED: readonly [string, (verb: string) => Error] = ['ErrTmuxKillFailed', () => errTmuxKillFailed()]
+const SRJ105_KILL_FAILED = unavailableForms('ErrTmuxKillFailed')[0]!
 
 /** The launch and destructive calls a launch made, by verb. */
 interface LaunchVerbCalls {
@@ -11306,22 +11305,9 @@ interface LadderSite {
   readonly calls: LaunchVerbCalls
 }
 
-/** The harness persona `key`. */
-function harnessPersona(h: RecoveryHarness, key: string): Persona {
-  return personaOf(h.config, key)
-}
-
 /** A row for `persona` in its own directory with its current labels (`cannedGetResult` in persona form), with `overrides`. */
 function harnessRow(h: RecoveryHarness, persona: Persona, overrides: PersonaGetResultOverrides): CannedGetResult {
   return cannedGetResult(overrides, persona, h.home)
-}
-
-/** The optimistic spawn collides and then answers `spawns` in order; the collision `get` reads `row`. */
-function collidesOn(h: RecoveryHarness, persona: Persona, row: PersonaGetResultOverrides, ...spawns: Error[]): RecoveryStubScript {
-  return {
-    spawnQueue: [cannedErr(errInstanceIdCollision()), ...spawns.map((e) => cannedErr<import('agent-director').SpawnResult>(e))],
-    getResult: harnessRow(h, persona, row),
-  }
 }
 
 /** `persona`'s row reading `waiting` whose `config_dir` label is missing (b.av2 SR-6.2: never resumed). */
@@ -11353,6 +11339,11 @@ function noResume(h: RecoveryHarness): void {
   h.config.resume_enabled = false
 }
 
+/** Every persona's tmux session is gone (the prober answers false; the file's `afterEach` restores it). */
+function tmuxSessionsGone(): void {
+  _setTmuxSessionProber(async () => false)
+}
+
 /**
  * Each spawn and resume the ladder makes, as the site where the launch meets
  * the error (the verb's own call is the last one).
@@ -11371,49 +11362,49 @@ const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
     script: (_h, _p, err) => ({ spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(err)], getError: errSpawnNotFound() }),
     calls: ladderCallsOf({ spawn: 2 }),
   },
-  { name: 'the resume of an ended row', verb: 'resume', script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
-  { name: 'the resume of a missing row', verb: 'resume', script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'missing' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
+  { name: 'the resume of an ended row', verb: 'resume', script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
+  { name: 'the resume of a missing row', verb: 'resume', script: (h, p, err) => ({ ...collided(h, p, { state: 'missing' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
   {
     name: 'the self-heal spawn after the resume\'s ErrTmuxSessionCreate',
     verb: 'spawn',
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }, err), resumeError: errTmuxSessionCreate('resume') }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errTmuxSessionCreate('resume') }),
     calls: ladderCallsOf({ spawn: 2, resume: 1 }),
   },
   {
     name: 'the fresh spawn after the resume\'s ErrNoSessionId and its delete',
     verb: 'spawn',
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }, err), resumeError: errNoSessionId() }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errNoSessionId() }),
     calls: ladderCallsOf({ spawn: 2, resume: 1, delete: 1 }),
   },
   {
     name: 'the fresh spawn after the resume\'s ErrSpawnNotResumable, its kill and its delete',
     verb: 'spawn',
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }, err), resumeError: errSpawnNotResumable() }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errSpawnNotResumable() }),
     calls: ladderCallsOf({ spawn: 2, resume: 1, kill: 1, delete: 1 }),
   },
   {
     name: 'the fresh spawn after the resume\'s ErrSpawnNotFound',
     verb: 'spawn',
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }, err), resumeError: errSpawnNotFound() }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errSpawnNotFound() }),
     calls: ladderCallsOf({ spawn: 2, resume: 1 }),
   },
   {
     name: 'the fresh spawn of a replacement (resume_enabled false), after its kill and delete',
     verb: 'spawn',
     setup: noResume,
-    script: (h, p, err) => collidesOn(h, p, { state: 'ended' }, err),
+    script: (h, p, err) => collided(h, p, { state: 'ended' }, err),
     calls: ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }),
   },
   {
     name: 'the fresh spawn of a replacement (a row in another directory), after its kill and delete',
     verb: 'spawn',
-    script: (h, p, err) => collidesOn(h, p, elsewhere(h, 'ended'), err),
+    script: (h, p, err) => collided(h, p, elsewhere(h, 'ended'), err),
     calls: ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }),
   },
   {
     name: 'the self-heal spawn of a replacement after its fresh spawn\'s ErrTmuxSessionCreate',
     verb: 'spawn',
-    script: (h, p, err) => collidesOn(h, p, elsewhere(h, 'ended'), errTmuxSessionCreate('spawn'), err),
+    script: (h, p, err) => collided(h, p, elsewhere(h, 'ended'), errTmuxSessionCreate('spawn'), err),
     calls: ladderCallsOf({ spawn: 3, kill: 1, delete: 1 }),
   },
 ]
@@ -11424,26 +11415,26 @@ const KILL_SITES: readonly LadderSite[] = [
     name: 'the kill of a replacement (resume_enabled false)',
     verb: 'kill',
     setup: noResume,
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), killError: err }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), killError: err }),
     calls: ladderCallsOf({ spawn: 1, kill: 1 }),
   },
   {
     name: 'the kill of a replacement (a row in another directory, read waiting)',
     verb: 'kill',
-    script: (h, p, err) => ({ ...collidesOn(h, p, elsewhere(h, 'waiting')), killError: err }),
+    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'waiting')), killError: err }),
     calls: ladderCallsOf({ spawn: 1, kill: 1 }),
   },
   {
     name: 'the kill of a replacement (a row in another directory, read ended)',
     verb: 'kill',
-    script: (h, p, err) => ({ ...collidesOn(h, p, elsewhere(h, 'ended')), killError: err }),
+    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'ended')), killError: err }),
     calls: ladderCallsOf({ spawn: 1, kill: 1 }),
   },
   {
     name: 'the kill of a replacement (a missing config_dir label, after a dead-session verdict on a waiting row)',
     verb: 'kill',
     script: (h, p, err) => ({
-      ...collidesOn(h, p, unlabelledWaitingRow(h, p)),
+      ...collided(h, p, unlabelledWaitingRow(h, p)),
       sendKeysError: errSpawnNotInteractive('send-keys'),
       killError: err,
     }),
@@ -11452,7 +11443,7 @@ const KILL_SITES: readonly LadderSite[] = [
   {
     name: 'the kill after the resume\'s ErrSpawnNotResumable',
     verb: 'kill',
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: err }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: err }),
     calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1 }),
   },
 ]
@@ -11463,25 +11454,25 @@ const DELETE_SITES: readonly LadderSite[] = [
     name: 'the delete of a replacement (resume_enabled false)',
     verb: 'delete',
     setup: noResume,
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), deleteError: err }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), deleteError: err }),
     calls: ladderCallsOf({ spawn: 1, kill: 1, delete: 1 }),
   },
   {
     name: 'the delete of a replacement (a row in another directory)',
     verb: 'delete',
-    script: (h, p, err) => ({ ...collidesOn(h, p, elsewhere(h, 'waiting')), deleteError: err }),
+    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'waiting')), deleteError: err }),
     calls: ladderCallsOf({ spawn: 1, kill: 1, delete: 1 }),
   },
   {
     name: 'the delete after the resume\'s ErrSpawnNotResumable',
     verb: 'delete',
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), deleteError: err }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), deleteError: err }),
     calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1, delete: 1 }),
   },
   {
     name: 'the delete after the resume\'s ErrNoSessionId',
     verb: 'delete',
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), resumeError: errNoSessionId(), deleteError: err }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errNoSessionId(), deleteError: err }),
     calls: ladderCallsOf({ spawn: 1, resume: 1, delete: 1 }),
   },
 ]
@@ -11491,20 +11482,20 @@ const RECONNECT_SITES: readonly LadderSite[] = [
   {
     name: 'the reconnect of a waiting row',
     verb: 'send-keys',
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'waiting' }), sendKeysError: err }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: err }),
     calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }),
   },
   {
     name: 'the reconnect retry after ErrTmuxSendKeys on a waiting row',
     verb: 'send-keys',
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'waiting' }), sendKeysQueue: [cannedErr(errTmuxSendKeys()), cannedErr(err)] }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysQueue: [cannedErr(errTmuxSendKeys()), cannedErr(err)] }),
     calls: ladderCallsOf({ spawn: 1, sendKeys: 2 }),
   },
   {
     name: 'the reconnect of a working row once its wait reads it waiting',
     verb: 'send-keys',
     setup: fastPolls,
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'working' }), statusResult: cannedStatusResult({ state: 'waiting' }), sendKeysError: err }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusResult: cannedStatusResult({ state: 'waiting' }), sendKeysError: err }),
     calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }),
   },
   {
@@ -11512,7 +11503,7 @@ const RECONNECT_SITES: readonly LadderSite[] = [
     verb: 'send-keys',
     setup: fastPolls,
     script: (h, p, err) => ({
-      ...collidesOn(h, p, { state: 'working' }),
+      ...collided(h, p, { state: 'working' }),
       statusResult: cannedStatusResult({ state: 'waiting' }),
       sendKeysQueue: [cannedErr(errTmuxSendKeys()), cannedErr(err)],
     }),
@@ -11537,7 +11528,7 @@ const READ_SITES: readonly LadderSite[] = [
     name: 'the working-row wait\'s poll status',
     verb: 'status',
     setup: fastPolls,
-    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'working' }), statusError: err }),
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusError: err }),
     calls: ladderCallsOf({ spawn: 1 }),
   },
   {
@@ -11549,7 +11540,7 @@ const READ_SITES: readonly LadderSite[] = [
       // fresh sweep (this launch's second) fails.
       const sweepsBefore = h.stub.calls.findMissingCalls.length
       return {
-        ...collidesOn(h, p, { state: 'working' }),
+        ...collided(h, p, { state: 'working' }),
         statusFn: () =>
           h.stub.calls.findMissingCalls.length >= sweepsBefore + 2 ? err : cannedStatusResult({ state: 'working' }),
       }
@@ -11561,6 +11552,59 @@ const READ_SITES: readonly LadderSite[] = [
     verb: 'get',
     script: (h, p, err) => jsonlMissingDiagnosisGets(h, p, cannedErr(err)),
     calls: ladderCallsOf({ spawn: 1, resume: 1 }),
+  },
+]
+
+/** A findMissing sweep of the ladder, with the log prefix of its refusal line. */
+interface SweepSite extends LadderSite {
+  readonly logPrefix: string
+}
+
+/**
+ * The ladder's findMissing sweeps (b.jg5 SRJ-105): an UNAVAILABLE sweep stops
+ * the attempt there. The before-resume sweep of a dead session
+ * (`resumeOrFreshSpawn`), the working-row wait's up-front and timeout sweeps,
+ * and the sweep of a prompt row whose tmux session is gone
+ * (`launchOnPromptRow`).
+ */
+const SWEEP_SITES: readonly SweepSite[] = [
+  {
+    name: 'the before-resume sweep of a waiting row\'s dead session (resumeOrFreshSpawn)',
+    verb: 'find-missing',
+    logPrefix: 'spawnForPersona: before resume',
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: errSpawnNotInteractive('send-keys'), findMissingError: err }),
+    calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }),
+  },
+  {
+    name: 'the working-row wait\'s up-front sweep',
+    verb: 'find-missing',
+    logPrefix: 'waitForWaitingAndReconnect',
+    setup: fastPolls,
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), findMissingError: err }),
+    calls: ladderCallsOf({ spawn: 1 }),
+  },
+  {
+    name: 'the working-row wait\'s timeout sweep',
+    verb: 'find-missing',
+    logPrefix: 'waitForWaitingAndReconnect: timeout',
+    setup: shortWait,
+    // The up-front sweep succeeds and the row reads working at every poll;
+    // the sweep at the deadline fails.
+    script: (h, p, err) => ({
+      ...collided(h, p, { state: 'working' }),
+      statusResult: cannedStatusResult({ state: 'working' }),
+      findMissingQueue: [cannedOk(cannedFindMissing())],
+      findMissingError: err,
+    }),
+    calls: ladderCallsOf({ spawn: 1 }),
+  },
+  {
+    name: 'the sweep of a check_permission row whose tmux session is gone (launchOnPromptRow)',
+    verb: 'find-missing',
+    logPrefix: 'spawnForPersona: prompt row',
+    setup: tmuxSessionsGone,
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'check_permission' }), findMissingError: err }),
+    calls: ladderCallsOf({ spawn: 1 }),
   },
 ]
 
@@ -11590,11 +11634,6 @@ function refusalLines(h: RecoveryHarness, key: string): string[] {
   return h.errors.filter((line) => line.includes(` refused for ${renderPersonaRef(key, key)}: `) && line.endsWith('nothing more is called (b.jg5 SRJ-105)'))
 }
 
-/** The condition's started lines for persona `key`. */
-function conditionStartedLines(h: RecoveryHarness, key: string): string[] {
-  return h.lines.filter((line) => line.includes(`persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} started`))
-}
-
 let srj105Harness: RecoveryHarness | undefined
 
 /** A recovery harness over two personas, P and B, cleaned up after the case. */
@@ -11602,6 +11641,18 @@ function srj105Build(options?: RecoveryHarnessOptions): { h: RecoveryHarness; p:
   const h = (srj105Harness = makeRecoveryHarness(options))
   const [p, b] = h.keys as [string, string]
   return { h, p, b }
+}
+
+/** Each SRJ-105 describe's `afterEach`: nothing the case's harness captured leaks a secret, then the harness is cleaned up. */
+function srj105AfterEach(): void {
+  const h = srj105Harness
+  srj105Harness = undefined
+  if (h === undefined) return
+  try {
+    assertNoLeak(h.captured())
+  } finally {
+    h.cleanup()
+  }
 }
 
 /**
@@ -11641,15 +11692,11 @@ async function expectRefusedAt(site: LadderSite, err: Error, triggerKind: string
   expect(h.controller.isArmed(b)).toBe(false)
   expect(h.triggers.filter((t) => t.key === b)).toEqual([])
   expect(h.notices).toEqual([])
-  assertNoLeak(h.captured())
   return { h, p }
 }
 
 describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
-  afterEach(() => {
-    srj105Harness?.cleanup()
-    srj105Harness = undefined
-  })
+  afterEach(srj105AfterEach)
 
   const spawnCross = SRJ105_UNAVAILABLE.flatMap(([what, make]) =>
     [...SPAWN_AND_RESUME_SITES, ...RECONNECT_SITES].map((site) => [what, site.name, make, site] as const),
@@ -11671,10 +11718,33 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     }
   })
 
+  /** Kill answers that are no refusal (UNCLASSIFIED): ignored, as before. */
+  const KILL_NOT_REFUSED: ReadonlyArray<readonly [string, () => Error]> = [
+    ['an UNCLASSIFIED ErrInternal', () => errInternal()],
+    ['an UNCLASSIFIED ErrKillBroken', () => errGeneric('kill', 'ErrKillBroken')],
+  ]
+
+  const killContrast = KILL_NOT_REFUSED.flatMap(([what, make]) => KILL_SITES.map((site) => [what, site.name, make, site] as const))
+  test.each(killContrast)('contrast: %s at %s is not refused: the delete and a fresh spawn follow; no refusal line, trigger or timer, never counted', async (_what, _site, make, site) => {
+    const { h, p } = srj105Build()
+    site.setup?.(h)
+    h.script(site.script(h, harnessPersona(h, p), make()))
+
+    const result = await h.launch(p)
+
+    expect(result).toEqual({ key: p, action: 'spawned' })
+    expect(ladderCallsMade(h)).toEqual({ ...site.calls, delete: 1, spawn: site.calls.spawn + 1 })
+    expect(refusalLines(h, p)).toEqual([])
+    expect(h.triggers).toEqual([])
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(h.notices).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+  })
+
   test.each(SRJ105_UNAVAILABLE)('the kill after the resume\'s ErrSpawnNotResumable is declared a kill of a row read live: %s there starts P\'s condition (tmux-touching), where the same answer to a kill of a row in another directory read ended starts nothing', async (_what, make) => {
     const { h, p } = srj105Build()
     const persona = harnessPersona(h, p)
-    h.script({ ...collidesOn(h, persona, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: make('kill') })
+    h.script({ ...collided(h, persona, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: make('kill') })
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
 
@@ -11683,10 +11753,11 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     expect(started).toHaveLength(1)
     expect(started[0]).toContain(' — kill failed: ')
 
+    assertNoLeak(h.captured())
     h.cleanup()
     srj105Harness = undefined
     const other = srj105Build()
-    other.h.script({ ...collidesOn(other.h, harnessPersona(other.h, other.p), elsewhere(other.h, 'ended')), killError: make('kill') })
+    other.h.script({ ...collided(other.h, harnessPersona(other.h, other.p), elsewhere(other.h, 'ended')), killError: make('kill') })
     expect(await other.h.launch(other.p)).toStrictEqual({ key: other.p, action: 'failed', refused: true })
     expect(other.h.tmuxUnresponsive.holds(other.p)).toBe(false)
     expect(conditionStartedLines(other.h, other.p)).toEqual([])
@@ -11706,60 +11777,72 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     expect(h.triggers).toEqual([])
   })
 
-  test.each<[string, (h: RecoveryHarness, persona: Persona, err: Error) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined]>([
-    ['the dialog approver\'s pane read', (_h, _p, err) => ({ statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' }))], readPaneError: err }), undefined],
-    [
-      'the dialog approver\'s Enter on a dialog',
-      (_h, _p, err) => ({
+  /** A call whose UNAVAILABLE answer is logged and the launch goes on (no refusal), with the launch's outcome and its keystrokes. */
+  interface PassThroughSite {
+    readonly name: string
+    readonly verb: string
+    script(h: RecoveryHarness, persona: Persona, err: Error): RecoveryStubScript
+    setup?(h: RecoveryHarness): void
+    readonly action: SpawnPersonaResult['action']
+    readonly sendKeys: number
+  }
+
+  const PASS_THROUGH_SITES: readonly PassThroughSite[] = [
+    {
+      name: 'the dialog approver\'s pane read',
+      verb: 'read-pane',
+      script: (_h, _p, err) => ({ statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' }))], readPaneError: err }),
+      action: 'spawned',
+      sendKeys: 0,
+    },
+    {
+      name: 'the dialog approver\'s Enter on a dialog',
+      verb: 'send-keys',
+      script: (_h, _p, err) => ({
         statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' }))],
         readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
         sendKeysError: err,
       }),
-      undefined,
-    ],
-    [
-      'the working-row wait\'s pane read',
-      (h, p, err) => ({ ...collidesOn(h, p, { state: 'working' }), statusResult: cannedStatusResult({ state: 'working' }), readPaneError: err }),
-      (h) => {
+      action: 'spawned',
+      sendKeys: 1,
+    },
+    {
+      name: 'the working-row wait\'s pane read',
+      verb: 'read-pane',
+      script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusResult: cannedStatusResult({ state: 'working' }), readPaneError: err }),
+      setup: (h) => {
         shortWait(h)
         // At a restart delay the wait's give-up raises no not-connected notice.
         h.config.session_restart_delay = 60
       },
-    ],
-  ])('regression: %s answering each UNAVAILABLE form keeps its outcome: logged, the launch goes on, no kill, delete, resume or notice, no spawn-failed entry', async (site, script, setup) => {
-    for (const [, make] of SRJ105_UNAVAILABLE) {
-      const { h, p } = srj105Build()
-      setup?.(h)
-      const err = make(site.includes('Enter') ? 'send-keys' : 'read-pane')
-      h.script(script(h, harnessPersona(h, p), err))
+      action: 'not-reconnected',
+      sendKeys: 0,
+    },
+  ]
 
-      const result = await h.launch(p)
+  const passThroughCross = PASS_THROUGH_SITES.flatMap((site) => SRJ105_UNAVAILABLE.map(([what, make]) => [site.name, what, make, site] as const))
+  test.each(passThroughCross)('regression: %s answering %s keeps its outcome: logged, the launch goes on, no kill, delete, resume or notice, no spawn-failed entry', async (_site, _what, make, site) => {
+    const { h, p } = srj105Build()
+    site.setup?.(h)
+    h.script(site.script(h, harnessPersona(h, p), make(site.verb)))
 
-      expect(result).toEqual({ key: p, action: site.includes('working-row') ? 'not-reconnected' : 'spawned' })
-      const made = ladderCallsMade(h)
-      expect(made).toEqual(ladderCallsOf({ spawn: 1, sendKeys: made.sendKeys }))
-      expect(made.sendKeys).toBe(site.includes('Enter') ? 1 : 0)
-      expect(h.stub.calls.readPaneCalls.length).toBeGreaterThan(0)
-      expect(h.notices).toEqual([])
-      expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
-      expect(refusalLines(h, p)).toEqual([])
-      expect(getFailureCount(p)).toBe(0)
-      assertNoLeak(h.captured())
-      h.cleanup()
-      srj105Harness = undefined
-    }
+    expect(await h.launch(p)).toEqual({ key: p, action: site.action })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: site.sendKeys }))
+    expect(h.stub.calls.readPaneCalls.length).toBeGreaterThan(0)
+    expect(h.notices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(refusalLines(h, p)).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
   })
 })
 
-describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait or the ErrJsonlMissing diagnosis get is handled as UNAVAILABLE', () => {
-  afterEach(() => {
-    srj105Harness?.cleanup()
-    srj105Harness = undefined
-  })
+describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait or the ErrJsonlMissing diagnosis get is handled as UNAVAILABLE, and an UNAVAILABLE findMissing sweep stops the attempt', () => {
+  afterEach(srj105AfterEach)
 
   /** The UNAVAILABLE forms, then an UNCLASSIFIED read error and a store that cannot be opened (UNCLASSIFIED too). */
   const READ_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error, string]> = [
-    ...SRJ105_UNAVAILABLE.map(([what, make]) => [what, make, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE] as const),
+    ...SRJ105_UNAVAILABLE,
     ['an UNCLASSIFIED read error (ErrTimeout)', (verb) => errGeneric(verb, 'ErrTimeout'), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
     ['a store that cannot be opened (ErrSchemaMismatch)', () => errSchemaMismatch(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
   ]
@@ -11772,15 +11855,98 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
     expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
   })
 
+  // A sweep is no read verb: of READ_ERRORS only the UNAVAILABLE forms are a
+  // refusal there (the UNCLASSIFIED ones proceed, below).
+  const sweepCross = SRJ105_UNAVAILABLE.flatMap(([what, make, kind]) => SWEEP_SITES.map((site) => [what, site.name, make, kind, site] as const))
+  test.each(sweepCross)('%s at %s: the attempt stops there: no resume, kill, delete, launch, notice or spawn-failed entry, refused and never counted, and P\'s condition is not started; B launches', async (_what, _site, make, kind, site) => {
+    const { h, p } = await expectRefusedAt(site, make(site.verb), kind)
+    // Both launches (the start pass's and launchSession's) were refused at this sweep.
+    const refusedAt = `[slack] ${site.logPrefix}: findMissing sweep refused for ${renderPersonaRef(p, p)}: `
+    expect(refusalLines(h, p).map((line) => line.startsWith(refusedAt))).toEqual([true, true])
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+  })
+
+  test.each(READ_ERRORS.filter(([, , kind]) => kind === UNAVAILABLE_RETRY_CAUSE_READ_ERROR))('contrast: %s at the before-resume sweep is no refusal: logged, and the resume goes on', async (_what, make) => {
+    const { h, p } = srj105Build()
+    h.script({ ...SWEEP_SITES[0]!.script(h, harnessPersona(h, p), make('find-missing')) })
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'resumed' })
+
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1, resume: 1 }))
+    expect(h.errors.filter((line) => line.startsWith(`[slack] spawnForPersona: before resume: findMissing sweep failed for ${renderPersonaRef(p, p)}: `) && line.endsWith(' — proceeding'))).toHaveLength(1)
+    expect(refusalLines(h, p)).toEqual([])
+    expect(h.triggers).toEqual([])
+    expect(h.controller.isArmed(p)).toBe(false)
+  })
+
+  test.each(SRJ105_UNAVAILABLE)('a persona that joins another\'s in-flight shared sweep gets the same refusal: %s at P\'s prompt-row sweep, which B joined, refuses both under their own keys with one findMissing call; no resume, kill, delete, launch, notice or spawn-failed entry, never counted', async (_what, make, kind) => {
+    const { h, p, b } = srj105Build()
+    const rows = new Map(
+      [p, b].map((key) => {
+        const row = harnessRow(h, harnessPersona(h, key), { state: 'check_permission' })
+        return [row.claude_instance_id, row] as const
+      }),
+    )
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())],
+      getFn: (params) => rows.get(params.claude_instance_id) ?? errSpawnNotFound(),
+    })
+    // Both tmux sessions are gone; B's probe is the second.
+    let bProbed!: () => void
+    const bReachedProbe = new Promise<void>((resolve) => (bProbed = resolve))
+    let probes = 0
+    _setTmuxSessionProber(async () => {
+      if (++probes === 2) bProbed()
+      return false
+    })
+    // P's sweep is held in flight until B has joined it.
+    let sweepStarted!: () => void
+    const pSwept = new Promise<void>((resolve) => (sweepStarted = resolve))
+    let failSweep!: (err: Error) => void
+    const held = new Promise<never>((_resolve, reject) => (failSweep = reject))
+    h.stub.client.findMissing = async (params) => {
+      h.stub.calls.findMissingCalls.push(params)
+      sweepStarted()
+      return held
+    }
+
+    const pLaunch = h.launch(p)
+    await pSwept
+    const bLaunch = h.launch(b)
+    await bReachedProbe
+    // A macrotask turn: B's launch runs on, over resolved stubs only, to the shared sweep.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    failSweep(make('find-missing'))
+
+    expect(await pLaunch).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(await bLaunch).toStrictEqual({ key: b, action: 'failed', refused: true })
+    // One call: B joined P's sweep (a later start would have made a second).
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
+    for (const key of [p, b]) {
+      expect(refusalLines(h, key)).toHaveLength(1)
+      expect(refusalLines(h, key)[0]).toStartWith(`[slack] spawnForPersona: prompt row: findMissing sweep refused for ${renderPersonaRef(key, key)}: `)
+      expect(h.triggers.filter((t) => t.key === key)).toEqual([{ key, kind }])
+      expect(h.controller.isArmed(key)).toBe(true)
+      expect(getFailureCount(key)).toBe(0)
+      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    }
+    expect(h.notices).toEqual([])
+    expect(h.outageNotices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  })
+
   test.each<[string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined, SpawnPersonaResult['action'], Partial<LaunchVerbCalls>]>([
     ['the collision get (the row went away: one retry spawn)', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() }), undefined, 'spawned', { spawn: 2 }],
-    ['the working-row wait\'s poll status (its tmux session alive: not reconnected)', (h, p) => ({ ...collidesOn(h, p, { state: 'working' }), statusError: errSpawnNotFound() }), fastPolls, 'not-reconnected', { spawn: 1 }],
+    ['the working-row wait\'s poll status (its tmux session alive: not reconnected)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusError: errSpawnNotFound() }), fastPolls, 'not-reconnected', { spawn: 1 }],
     [
       'the working-row wait\'s timeout status (the tmux fallback, alive: not reconnected)',
       (h, p) => {
         const sweepsBefore = h.stub.calls.findMissingCalls.length
         return {
-          ...collidesOn(h, p, { state: 'working' }),
+          ...collided(h, p, { state: 'working' }),
           statusFn: () => (h.stub.calls.findMissingCalls.length >= sweepsBefore + 2 ? errSpawnNotFound() : cannedStatusResult({ state: 'working' })),
         }
       },
@@ -11822,27 +11988,20 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
     expect(h.notices.filter((n) => n.key === p && n.text.includes(fetchFailed))).toHaveLength(1)
     expect(onlyStartupEntry(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toContain(fetchFailed)
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
-    assertNoLeak(h.captured())
   })
 })
 
 describe('b.jg5 SRJ-105 with E8\'s refusal marker: a refused kill on a replace path is followed by no delete and no launch, answers \'refused\' and is never counted', () => {
-  afterEach(() => {
-    srj105Harness?.cleanup()
-    srj105Harness = undefined
-  })
+  afterEach(srj105AfterEach)
 
   /** Each replace path, as the stub answers for the launch after the collision; its kill is its first kill. */
   const REPLACE_PATHS: ReadonlyArray<readonly [string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined, Partial<LaunchVerbCalls>]> = [
-    ['resume_enabled false', (h, p) => collidesOn(h, p, { state: 'ended' }), noResume, { spawn: 1, kill: 1 }],
-    ['a row in another directory', (h, p) => collidesOn(h, p, elsewhere(h, 'ended')), undefined, { spawn: 1, kill: 1 }],
-    ['the resume\'s ErrSpawnNotResumable', (h, p) => ({ ...collidesOn(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable() }), undefined, { spawn: 1, resume: 1, kill: 1 }],
+    ['resume_enabled false', (h, p) => collided(h, p, { state: 'ended' }), noResume, { spawn: 1, kill: 1 }],
+    ['a row in another directory', (h, p) => collided(h, p, elsewhere(h, 'ended')), undefined, { spawn: 1, kill: 1 }],
+    ['the resume\'s ErrSpawnNotResumable', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable() }), undefined, { spawn: 1, resume: 1, kill: 1 }],
   ]
 
-  const KILL_REFUSALS: ReadonlyArray<readonly [string, () => Error]> = [
-    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill')],
-    [SRJ105_KILL_FAILED[0], () => errTmuxKillFailed()],
-  ]
+  const KILL_REFUSALS = unavailableForms('ErrTmuxUnresponsive', 'ErrTmuxKillFailed')
 
   const cross = REPLACE_PATHS.flatMap(([path, script, setup, calls]) => KILL_REFUSALS.map(([what, make]) => [path, what, script, setup, calls, make] as const))
 
@@ -11850,115 +12009,23 @@ describe('b.jg5 SRJ-105 with E8\'s refusal marker: a refused kill on a replace p
     const { h, p } = srj105Build()
     const persona = harnessPersona(h, p)
     setup?.(h)
-    h.script({ ...script(h, persona), killError: make() })
+    h.script({ ...script(h, persona), killError: make('kill') })
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf(calls))
 
-    h.script({ ...script(h, persona), killError: make() })
+    h.script({ ...script(h, persona), killError: make('kill') })
     expect(await launchSession(p, h.config)).toBe('refused')
     expect(h.stub.calls.deleteCalls).toEqual([])
 
     // The restart path: its liveness read finds the row dead, its own kill
     // succeeds, and the launch's replacement kill is refused.
-    h.script({ ...script(h, persona), killError: undefined, killQueue: [cannedOk({}), cannedErr(make())], statusResult: cannedStatusResult({ state: 'ended' }) })
+    h.script({ ...script(h, persona), killError: undefined, killQueue: [cannedOk({}), cannedErr(make('kill'))], statusResult: cannedStatusResult({ state: 'ended' }) })
     expect(await runRestartRetry(p, persona.working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
 
     expect(h.stub.calls.deleteCalls).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     expect(h.notices).toEqual([])
     expect(h.capReached).toEqual([])
-    assertNoLeak(h.captured())
-  })
-})
-
-describe('b.jg5 SRJ-105: at most one onset across several ticks (both settings 0)', () => {
-  afterEach(() => {
-    srj105Harness?.cleanup()
-    srj105Harness = undefined
-  })
-
-  /**
-   * P's row as the stub reports it: absent (`ErrSpawnNotFound`, read dead by
-   * the restart path) until a spawn of it succeeds, `waiting` after.
-   */
-  function rowAppearsOnSpawn(h: RecoveryHarness, key: string): void {
-    let spawned = false
-    const client = h.stub.client
-    const spawn = client.spawn.bind(client)
-    client.spawn = async (params) => {
-      const result = await spawn(params)
-      if (params.claude_instance_id === personaInstanceId(key)) spawned = true
-      return result
-    }
-    h.script({ statusFn: () => (spawned ? cannedStatusResult({ state: 'waiting' }) : errSpawnNotFound()) })
-  }
-
-  /** Move the clock to P's next retry, run it and let its launch settle. */
-  async function runNextRetry(h: RecoveryHarness, key: string): Promise<void> {
-    const due = h.controller.view(key)!.dueAt!
-    await h.advance(due - h.clock.now())
-    await h.settle()
-  }
-
-  test('a start-pass spawn that keeps answering ErrTmuxUnresponsive across several retries past the onset floor posts exactly one notice for P, the onset; nothing is counted and no spawn-failure notice is posted', async () => {
-    const { h, p, b } = srj105Build({ alertThresholdMs: false })
-    rowAppearsOnSpawn(h, p)
-    h.script({ spawnError: errTmuxUnresponsive('spawn') })
-    const at = h.clock.now()
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
-    let pastFloor = 0
-    while (pastFloor < 3) {
-      await runNextRetry(h, p)
-      if (h.clock.now() - at >= TMUX_UNRESPONSIVE_ONSET_FLOOR_MS) pastFloor++
-    }
-
-    // Every retry launched again and was refused: no delete, never counted.
-    const retries = h.attempts.filter((a) => a.key === p).length
-    expect(retries).toBeGreaterThanOrEqual(3)
-    expect(h.stub.calls.spawnCalls).toHaveLength(retries + 1)
-    expect(h.stub.calls.deleteCalls).toEqual([])
-    expect(h.episodeNotices).toEqual([{ key: p, text: tmuxUnresponsiveOnsetText(p) }])
-    expect(h.episodeNotices.filter((n) => n.key === b)).toEqual([])
-    expect(h.outageNotices).toEqual([])
-    expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
-    expect(getFailureCount(p)).toBe(0)
-    assertNoLeak(h.captured())
-  })
-
-  test('a start-pass spawn that answers ErrTmuxUnresponsive once and then succeeds posts nothing, however far the clock moves', async () => {
-    const { h, p } = srj105Build({ alertThresholdMs: false })
-    rowAppearsOnSpawn(h, p)
-    h.script({ spawnQueue: [cannedErr(errTmuxUnresponsive('spawn'))] })
-    const at = h.clock.now()
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
-    await runNextRetry(h, p)
-    expect(h.stub.calls.spawnCalls).toHaveLength(2)
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    while (h.controller.isArmed(p)) await runNextRetry(h, p)
-    await h.advance(Math.max(0, at + 2 * TMUX_UNRESPONSIVE_ONSET_FLOOR_MS - h.clock.now()))
-
-    expect(h.episodeNotices).toEqual([])
-    expect(h.outageNotices).toEqual([])
-    expect(h.notices).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
-  })
-
-  test('ErrTmuxKillFailed at a replacement kill posts no tmux-unresponsive notice across retries past the floor and the alert threshold, nor a spawn-failure notice', async () => {
-    const { h, p } = srj105Build({ action: 'scripted' })
-    h.script({ ...collidesOn(h, harnessPersona(h, p), elsewhere(h, 'waiting')), killError: errTmuxKillFailed() })
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
-    await h.advance(2 * adAlertThresholdMsInEffect())
-
-    expect(h.attempts.filter((a) => a.key === p).length).toBeGreaterThan(1)
-    expect(h.stub.calls.deleteCalls).toEqual([])
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(h.episodeNotices).toEqual([])
-    expect(h.notices).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
   })
 })

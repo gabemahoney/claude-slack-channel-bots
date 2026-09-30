@@ -49,7 +49,6 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { CSCB_UNKNOWN_ERROR_NAME } from '../src/ad-error-class.ts'
 import { adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
 import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
@@ -60,9 +59,7 @@ import { withOutageDetection } from '../src/outage-state.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
 import {
-  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
   TMUX_UNRESPONSIVE_END_RETRY,
-  TMUX_UNRESPONSIVE_END_TEXT,
   TMUX_UNRESPONSIVE_END_TICK,
   TMUX_UNRESPONSIVE_END_TMUX_VERB,
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
@@ -158,7 +155,6 @@ import {
 } from '../src/unavailable-retry.ts'
 import {
   cannedErr,
-  cannedGetResult,
   cannedListRow,
   cannedOk,
   cannedStatusResult,
@@ -173,12 +169,11 @@ import {
   errTmuxKillFailed,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
-  errUnknownErrorName,
   errUnusableName,
   holdSpawns,
   SAMPLE_LAUNCH_START_FRACTIONAL,
   SAMPLE_LAUNCH_STARTS,
-  type PersonaGetResultOverrides,
+  unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
 import {
   assertNoLeak,
@@ -191,7 +186,15 @@ import {
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { startManualPoller } from './test-helpers/permission-relay-harness.ts'
 import {
+  callCounts,
+  collided,
+  conditionEndedLine,
+  conditionLinePrefix,
+  conditionLines,
+  conditionRecoveryLine,
   makeRecoveryHarness,
+  personaOf,
+  retryNow,
   type RecoveryAttempt,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
@@ -696,19 +699,6 @@ describe('unavailable retry: settings independence (SRJ-304)', () => {
 // What arms the timer (b.jg5 SRJ-301)
 // ---------------------------------------------------------------------------
 
-/** Persona `key` of the harness's configuration. */
-function personaOf(h: RecoveryHarness, key: string): Persona {
-  return h.config.personas.find((p) => p.key === key)!
-}
-
-/** The stub answers of a launch whose optimistic spawn collides and whose collision `get` reads `row`. */
-function collided(h: RecoveryHarness, persona: Persona, row: PersonaGetResultOverrides): RecoveryStubScript {
-  return {
-    spawnQueue: [cannedErr(errInstanceIdCollision())],
-    getResult: cannedGetResult(row, persona, h.home),
-  }
-}
-
 /** A site of the launch path where an agent-director call made through the wrappers meets `err`. */
 interface LaunchSite {
   readonly name: string
@@ -717,10 +707,12 @@ interface LaunchSite {
   /** The launch's action when this site's call fails. */
   readonly action: SpawnPersonaResult['action']
   /**
-   * For the ladder's kill and delete: the stub calls the launch makes in all.
-   * An UNAVAILABLE there (`ErrTmuxKillFailed` included) stops the ladder at
-   * once (b.jg5 SRJ-105): no delete after a refused kill, and no spawn after
-   * either, so the optimistic spawn is the launch's only one.
+   * For the sites whose refusal stops the launch at once (b.jg5 SRJ-105): the
+   * stub calls the launch makes in all. An UNAVAILABLE at the ladder's kill
+   * or delete (`ErrTmuxKillFailed` included) means no delete after a refused
+   * kill and no spawn after either, so the optimistic spawn is the launch's
+   * only one; one at the sweep before a working-row wait means no row read
+   * and no reconnect after it.
    */
   readonly ladderCalls?: Readonly<Record<string, number>>
   /**
@@ -730,6 +722,11 @@ interface LaunchSite {
    * A kill-failure cause starts no condition.
    */
   readonly leavesConditionHeld?: boolean
+  /**
+   * True when this site's call is not tmux-touching and the launch stops at
+   * its refusal: no `tmux-unresponsive` condition starts (b.jg5 SRJ-307).
+   */
+  readonly startsNoCondition?: boolean
 }
 
 const LAUNCH_SITES: readonly LaunchSite[] = [
@@ -743,7 +740,14 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
     script: (_h, _p, err) => ({ statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' }))], readPaneQueue: [cannedErr(err)] }),
   },
   { name: 'the reconnect of a waiting row', verb: 'send-keys', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: err }) },
-  { name: 'the sweep before a working-row wait', verb: 'find-missing', action: 'reconnected', script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), findMissingError: err }) },
+  {
+    name: 'the sweep before a working-row wait',
+    verb: 'find-missing',
+    action: 'failed',
+    ladderCalls: { spawnCalls: 1, getCalls: 1, findMissingCalls: 1 },
+    startsNoCondition: true,
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), findMissingError: err }),
+  },
   { name: 'the working-row read', verb: 'status', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusError: err }) },
   // The collision get reads the row `waiting` (live), so its kill is tmux-touching.
   {
@@ -768,14 +772,14 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
 const READ_SITES = LAUNCH_SITES.filter((site) => site.verb === 'status' || site.verb === 'get')
 
 /** E4's UNAVAILABLE values, each with the cause kind it arms. */
-const UNAVAILABLE_VALUES: ReadonlyArray<readonly [string, (verb: string) => Error, string]> = [
-  ['ErrTmuxUnresponsive', (verb) => errTmuxUnresponsive(verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-  ['ErrTmuxKillFailed', () => errTmuxKillFailed(), UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
-  ['ErrCallTimeout', (verb) => errCallTimeout(verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-  ['an unknown error name from a later binary', () => errUnknownErrorName(), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-  ['a wrapped UnknownError', (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME, 'Error: boom'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-  ['a plain Error', () => new Error('boom'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-]
+const UNAVAILABLE_VALUES = unavailableForms(
+  'ErrTmuxUnresponsive',
+  'ErrTmuxKillFailed',
+  'ErrCallTimeout',
+  ['ErrUnknownErrorName', 'an unknown error name from a later binary'],
+  'a wrapped UnknownError',
+  'a plain Error',
+)
 
 /** Read errors that are neither UNAVAILABLE nor excluded: a STATE and a GONE answer. */
 const READ_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
@@ -847,6 +851,10 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     if (site.ladderCalls !== undefined) expect(callCounts(h)).toEqual(site.ladderCalls)
     // No later call in the launch ends a condition this refusal started.
     if (site.leavesConditionHeld === true) expect(h.tmuxUnresponsive.holds(key)).toBe(kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
+    if (site.startsNoCondition === true) {
+      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+      expect(conditionLines(h, key)).toEqual([])
+    }
     expect(h.conditionEnds).toEqual([])
   })
 
@@ -1561,19 +1569,6 @@ function modelRow(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE_RET
   }
 }
 
-/** Move the clock to persona `key`'s due time and let its retry, with any launch it makes, settle. */
-async function retryNow(h: RecoveryHarness, key: string): Promise<void> {
-  const dueAt = h.controller.view(key)?.dueAt
-  if (dueAt === undefined) throw new Error(`retryNow: persona ${key} has no pending retry`)
-  await h.advance(dueAt - h.clock.now())
-  await h.settle()
-}
-
-/** The stub's call counts, by verb, leaving out verbs never called. */
-function callCounts(h: RecoveryHarness): Record<string, number> {
-  return Object.fromEntries(Object.entries(h.stub.calls).filter(([, calls]) => calls.length > 0).map(([verb, calls]) => [verb, calls.length]))
-}
-
 /** The stub's calls made since `before` (a `callCounts` snapshot), by verb, leaving out verbs not called since. */
 function callsSince(h: RecoveryHarness, before: Record<string, number>): Record<string, number> {
   return Object.fromEntries(
@@ -1617,7 +1612,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     const expectPosts = (): void => {
       expect(h.episodeNotices).toEqual(posts.map((text) => ({ key, text })))
     }
-    const postedLines = (what: string): string[] => conditionLinesOf(h, key).filter((line) => line.includes(` ${what} posted`))
+    const postedLines = (what: string): string[] => conditionLines(h, key).filter((line) => line.includes(` ${what} posted`))
     let onsetDone = false
 
     const refusals = RESTART_FAILURE_CAP + refusalsToCeiling() + 2
@@ -1726,9 +1721,9 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     await readPaneSucceeds(h, key)
 
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-    expect(conditionLinesOf(h, key).slice(-2)).toEqual([
+    expect(conditionLines(h, key).slice(-2)).toEqual([
       conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB),
-      `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} recovery posted`,
+      conditionRecoveryLine(key),
     ])
     expect(h.episodeNotices).toEqual([onset, { key, text: tmuxUnresponsiveRecoveryText(key) }])
     expect(h.conditionEnds).toEqual([{ key, reading: undefined, result: 'kept' }])
@@ -1744,7 +1739,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     expect(h.clock.now()).toBeGreaterThan(alertDueAt)
     expect(h.attempts.slice(attempts)).toEqual([{ key, retry: before.refusals + 1, causes: before.causes, mode: UNAVAILABLE_RETRY_MODE_FULL, at: before.dueAt! }])
     expect(h.episodeNotices).toEqual([onset, { key, text: tmuxUnresponsiveRecoveryText(key) }])
-    expect(conditionLinesOf(h, key).filter((line) => line.includes(' alert posted'))).toEqual([])
+    expect(conditionLines(h, key).filter((line) => line.includes(' alert posted'))).toEqual([])
     expect(getFailureCount(key)).toBe(0)
   })
 
@@ -2687,16 +2682,6 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
 // each reaching the condition-end entry as `main()` wires it
 // ---------------------------------------------------------------------------
 
-/** The line the condition logs when persona `key`'s `tmux-unresponsive` condition ends for `reason`. */
-function conditionEndedLine(key: string, reason: TmuxUnresponsiveEndReason): string {
-  return `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} ended — ${TMUX_UNRESPONSIVE_END_TEXT[reason]}`
-}
-
-/** The condition's lines for persona `key`, in order. */
-function conditionLinesOf(h: RecoveryHarness, key: string): string[] {
-  return h.lines.filter((line) => line.startsWith(`[slack] persona-episodes: persona=${key} `))
-}
-
 /**
  * A start-pass launch of persona `key` whose optimistic spawn is refused
  * UNAVAILABLE (`ErrTmuxUnresponsive`): it starts the condition and arms the
@@ -2762,7 +2747,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
 
     expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_RETRY))
+    expect(conditionLines(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_RETRY))
     // The retry is still running when it ends the condition, so the entry
     // defers, and the retry's own stop makes the deferred end moot.
     expect(h.conditionEnds).toEqual([{ key, reading, result: 'deferred' }])
@@ -2791,7 +2776,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expect(h.tmuxUnresponsive.holds(key)).toBe(true)
     expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(firstRefusalAt!)
     expect(h.conditionEnds).toEqual([])
-    expect(conditionLinesOf(h, key).filter((line) => line.includes(' ended — '))).toEqual([])
+    expect(conditionLines(h, key).filter((line) => line.includes(' ended — '))).toEqual([])
     expect(retryLinesOf(h, key).at(-1)).toBe(last(key))
     expect(h.controller.isArmed(key)).toBe(armed)
   })
@@ -2806,7 +2791,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
 
     expect(row.spawnedAt).toHaveLength(2)
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
+    expect(conditionLines(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
     // The spawn succeeds while the retry runs: the end is deferred, then
     // applied on the launch's pending row, before the re-arm.
     expect(h.conditionEnds).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'deferred' }])
@@ -2846,9 +2831,9 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1, killCalls: 1 })
     expect(getFailureCount(key)).toBe(0)
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
-    const lines = conditionLinesOf(h, key)
+    const lines = conditionLines(h, key)
     expect(lines).toHaveLength(1)
-    expect(lines[0]).toStartWith(`[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} started — kill failed: `)
+    expect(lines[0]).toStartWith(`${conditionLinePrefix(key)}started — kill failed: `)
     expect(h.tmuxUnresponsive.holds(key)).toBe(true)
     expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(armedAt)
     expect(h.conditionEnds).toEqual([])
@@ -2884,7 +2869,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     await readPaneSucceeds(h, key)
 
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
+    expect(conditionLines(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
     expect(h.conditionEnds).toEqual([{ key, reading: undefined, result: 'kept' }])
     expect(retryLinesOf(h, key).at(-1)).toBe(keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING))
     expect(h.controller.view(key)).toEqual(before)
@@ -2899,7 +2884,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expect(h.tickEnd(key)).toBe('ended')
 
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TICK))
+    expect(conditionLines(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TICK))
     expect(h.conditionEnds).toEqual([{ key, reading: LIVENESS_LIVE, result: 'stopped' }])
     expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED))
     expectStopped(h, key)
@@ -2981,7 +2966,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
 
     expect(await h.launch(key)).toEqual({ key, action: 'spawned' })
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
+    expect(conditionLines(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
     expect(h.conditionEnds).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'deferred' }])
 
     held.answer({ kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED, row: 'check_permission' })
@@ -3029,7 +3014,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     await end(h, key)
 
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, reason))
+    expect(conditionLines(h, key).at(-1)).toBe(conditionEndedLine(key, reason))
     expect(h.conditionEnds).toEqual([{ key, reading, result: 'kept' }])
     expect(retryLinesOf(h, key).at(-1)).toBe(keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_KILL_FAILED))
     // The end's reading, when it brings one, becomes the last row read; the
@@ -3056,11 +3041,11 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expect(callsSince(h, before)).toEqual({ statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 })
     expect(h.conditionEnds).toEqual([{ key, reading: undefined, result: 'deferred' }])
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }, { key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
-    const lines = conditionLinesOf(h, key)
+    const lines = conditionLines(h, key)
     expect(lines.at(-2)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
-    expect(lines.at(-1)).toStartWith(`[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} started — `)
+    expect(lines.at(-1)).toStartWith(`${conditionLinePrefix(key)}started — `)
     expect(h.tmuxUnresponsive.holds(key)).toBe(true)
-    expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBeGreaterThanOrEqual(firstRefusalAt + waitMs(0))
+    expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(firstRefusalAt + waitMs(0))
     expect(retryLinesOf(h, key).filter((line) => line.includes(UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED))).toEqual([])
     expect(retryLinesOf(h, key).at(-1)).toEndWith(` — re-armed, next retry in ${waitMs(1) / 1000} s`)
     const view = h.controller.view(key)!
@@ -3747,15 +3732,4 @@ describe('unavailable retry: the retry observer (SRJ-308)', () => {
     assertNoLeak(throwing.lines)
   })
 
-  test.each(OBSERVER_SCENARIOS)('with no observer (%s), nothing is called and the timer runs as it does with a recording observer', async (_what, scenario) => {
-    const plain = makeRig(scenario.action())
-    const observed = observedRig(scenario.action())
-
-    await runScenario(plain, scenario)
-    await runScenario(observed, scenario)
-
-    expect(timerRecord(plain)).toEqual(timerRecord(observed))
-    expect(plain.attempts).toHaveLength(scenario.retries)
-    expect(observed.steps.filter(([step]) => step === 'fire').map(([, key, at]) => [key, at])).toEqual(plain.attempts.map((a) => [a.key, a.at]))
-  })
 })

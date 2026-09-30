@@ -159,6 +159,16 @@
  *   persona is still armed: the episodes run on the harness clock, so a timer
  *   they armed and left pending fails it too.
  *
+ * Shared case helpers, each over a harness: `personaOf` (a configured
+ * persona), `collided` (the stub answers of a launch whose optimistic spawn
+ * collides), `callCounts` (the stub's calls by verb), `retryNow` (fire a
+ * persona's next retry and settle it), `rowReadsUntilSpawn` (each row reads a
+ * state until its spawn resolves, then `waiting`), and the condition's log
+ * lines: `conditionLinePrefix`, `conditionLines`, `conditionStartedLines`,
+ * `conditionEndedLines` and the line builders `conditionOnsetLine`,
+ * `conditionAlertLine`, `conditionEndedLine`, `conditionRecoveryLine` and
+ * `conditionSilentEndLine`.
+ *
  * Pending-only mode is armed directly (`controller.armPendingOnly`) until
  * covered `pending` rows exist. Later work extends this harness in place.
  *
@@ -175,7 +185,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import type { Client } from 'agent-director'
+import type { Client, SpawnResult } from 'agent-director'
 
 import { adAlertThresholdMsInEffect, adSettingsInEffect, installAdSettings, resetAdSettingsForTests, type AdSettingsInEffect } from '../../src/ad-settings.ts'
 import { _resetBackoffState, isAtCap } from '../../src/backoff.ts'
@@ -186,10 +196,13 @@ import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
 import {
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
+  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
   TMUX_UNRESPONSIVE_END_RETRY,
+  TMUX_UNRESPONSIVE_END_TEXT,
   TMUX_UNRESPONSIVE_END_TICK,
   type PersonaEpisodes,
   type TmuxUnresponsiveCondition,
+  type TmuxUnresponsiveEndReason,
   type TmuxUnresponsiveEndResult,
 } from '../../src/persona-episodes.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
@@ -215,6 +228,7 @@ import {
   createFullModeRetryAction,
   createUnavailableRetryController,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
+  UNAVAILABLE_RETRY_ROW_ABSENT,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   type UnavailableRetryAction,
@@ -226,8 +240,14 @@ import {
 } from '../../src/unavailable-retry.ts'
 import { writeAgentDirectorConfig, type AdConfigInput } from './ad-settings.ts'
 import {
+  cannedErr,
+  cannedGetResult,
+  cannedStatusResult,
+  errInstanceIdCollision,
+  errSpawnNotFound,
   installStubSpawnPath,
   resetStubSpawnPath,
+  type PersonaGetResultOverrides,
   type StubCallLog,
   type StubClientOptions,
   type StubSpawnPath,
@@ -707,4 +727,123 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       }
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// Shared case helpers over a harness
+// ---------------------------------------------------------------------------
+
+/** Persona `key` of the harness's configuration. */
+export function personaOf(h: RecoveryHarness, key: string): Persona {
+  return h.config.personas.find((p) => p.key === key)!
+}
+
+/**
+ * The stub answers of a launch of `persona` whose optimistic spawn collides,
+ * whose collision `get` reads `row` (in the persona's own directory with its
+ * current labels, unless `row` says otherwise), and whose later spawns answer
+ * `spawns` in order.
+ */
+export function collided(h: RecoveryHarness, persona: Persona, row: PersonaGetResultOverrides, ...spawns: Error[]): RecoveryStubScript {
+  return {
+    spawnQueue: [errInstanceIdCollision(), ...spawns].map((err) => cannedErr<SpawnResult>(err)),
+    getResult: cannedGetResult(row, persona, h.home),
+  }
+}
+
+/** The stub's call counts, by verb, leaving out verbs never called. */
+export function callCounts(h: RecoveryHarness): Record<string, number> {
+  return Object.fromEntries(Object.entries(h.stub.calls).filter(([, calls]) => calls.length > 0).map(([verb, calls]) => [verb, calls.length]))
+}
+
+/**
+ * Move the clock to persona `key`'s due time, firing its retry, and (unless
+ * `options.settle` is false) let the retry, with any launch it makes, settle.
+ * Resolves with the due time; throws when no retry is pending.
+ */
+export async function retryNow(h: RecoveryHarness, key: string, options: { settle?: boolean } = {}): Promise<number> {
+  const dueAt = h.controller.view(key)?.dueAt
+  if (dueAt === undefined) throw new Error(`retryNow: persona ${key} has no pending retry`)
+  await h.advance(dueAt - h.clock.now())
+  if (options.settle !== false) await h.settle()
+  return dueAt
+}
+
+/** A row state `cannedStatusResult` reads. */
+export type RecoveryRowState = NonNullable<NonNullable<Parameters<typeof cannedStatusResult>[0]>['state']>
+
+/**
+ * Each persona's row as the stub's `status` reports it: `before` (no row,
+ * `ErrSpawnNotFound`, for `UNAVAILABLE_RETRY_ROW_ABSENT`) until a spawn of
+ * that instance resolves, and `waiting` from then on.
+ */
+export function rowReadsUntilSpawn(h: RecoveryHarness, before: RecoveryRowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT): void {
+  const live = new Set<string>()
+  const client = h.stub.client
+  const spawn = client.spawn.bind(client)
+  client.spawn = async (params) => {
+    const result = await spawn(params)
+    live.add(String(params.claude_instance_id))
+    return result
+  }
+  h.script({
+    statusFn: (params) => {
+      if (live.has(String(params.claude_instance_id))) return cannedStatusResult({ state: 'waiting' })
+      return before === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult({ state: before })
+    },
+  })
+}
+
+// The `tmux-unresponsive` condition's log lines (SRJ-307 to SRJ-310). The
+// lines have no exported builder, so these hold their fixed words; a case
+// gives the seconds from its clock and the threshold in effect.
+
+/** The prefix of every line persona `key`'s condition logs. */
+export function conditionLinePrefix(key: string): string {
+  return `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} `
+}
+
+/** Persona `key`'s condition lines, in order. */
+export function conditionLines(h: RecoveryHarness, key: string): string[] {
+  return h.lines.filter((line) => line.startsWith(conditionLinePrefix(key)))
+}
+
+/** Persona `key`'s condition started lines. */
+export function conditionStartedLines(h: RecoveryHarness, key: string): string[] {
+  return conditionLines(h, key).filter((line) => line.startsWith(`${conditionLinePrefix(key)}started`))
+}
+
+/** Persona `key`'s condition ended lines. */
+export function conditionEndedLines(h: RecoveryHarness, key: string): string[] {
+  return conditionLines(h, key).filter((line) => line.startsWith(`${conditionLinePrefix(key)}ended`))
+}
+
+/** Whole seconds, rounded down, of `ms`: how the lines give a span. */
+function wholeSeconds(ms: number): number {
+  return Math.floor(ms / 1000)
+}
+
+/** The onset's line: posted at `where`, `sinceMs` after the first refusal. */
+export function conditionOnsetLine(key: string, where: 'a health tick' | 'a retry', sinceMs: number): string {
+  return `${conditionLinePrefix(key)}onset posted — still not answering at ${where}, ${wholeSeconds(sinceMs)} s after its first refusal`
+}
+
+/** The alert's line: posted `lastedMs` after the first refusal, over `thresholdMs`. */
+export function conditionAlertLine(key: string, lastedMs: number, thresholdMs: number): string {
+  return `${conditionLinePrefix(key)}alert posted — not answering for ${wholeSeconds(lastedMs)} s, over its alert threshold of ${wholeSeconds(thresholdMs)} s`
+}
+
+/** The ended line for `reason`. */
+export function conditionEndedLine(key: string, reason: TmuxUnresponsiveEndReason): string {
+  return `${conditionLinePrefix(key)}ended — ${TMUX_UNRESPONSIVE_END_TEXT[reason]}`
+}
+
+/** The recovery's line, after the ended line. */
+export function conditionRecoveryLine(key: string): string {
+  return `${conditionLinePrefix(key)}recovery posted`
+}
+
+/** A silent end's line after an onset, after the ended line. */
+export function conditionSilentEndLine(key: string): string {
+  return `${conditionLinePrefix(key)}recovery not posted — a silent end (a CONFLICT answer ended it)`
 }

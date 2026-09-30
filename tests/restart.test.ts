@@ -112,8 +112,8 @@ import {
   errTmuxSendKeys,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
-  errUnknownErrorName,
   holdSpawns,
+  unavailableForms,
   makeStubCallLog,
   makeStubResolveSystemBinary,
   SAMPLE_LAUNCH_START_FRACTIONAL,
@@ -142,9 +142,14 @@ import {
 } from '../src/unavailable-retry.ts'
 import { installAdVersionRecheck, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { makeRecoveryHarness, type RecoveryHarness } from './test-helpers/recovery-harness.ts'
 import {
-  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
+  callCounts,
+  makeRecoveryHarness,
+  retryNow,
+  rowReadsUntilSpawn,
+  type RecoveryHarness,
+} from './test-helpers/recovery-harness.ts'
+import {
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
   tmuxUnresponsiveOnsetText,
 } from '../src/persona-episodes.ts'
@@ -170,6 +175,9 @@ const SLOW_DELAY_S = 9999  // large enough to never fire during a test
 const WAIT_MS = 50         // wait after scheduling; long enough for FAST_DELAY_S to fire
 const CAP_BASE_DELAY_S = 0.001  // 1 ms base for the cap-driving helper below
 const CAP_MARGIN_MS = 40        // margin above each computed backoff delay
+
+/** The restart work's line for a kill it was refused (b.jg5 SRJ-105). */
+const KILL_REFUSED_LINE = (key: string) => `[slack] Session kill refused for persona=${key} — no relaunch; not counted`
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -3394,7 +3402,6 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
   const REFUSED_LINE = (key: string) =>
     `[slack] Session relaunch refused for persona=${key} — not counted; its UNAVAILABLE retry timer owns the persona`
   const FAILED_LINE = (key: string) => `[slack] Session relaunch failed for persona=${key}`
-  const KILL_REFUSED_LINE = (key: string) => `[slack] Session kill refused for persona=${key} — no relaunch; not counted`
 
   /** The controller's armed lines for `key` (one per first arm; a trigger while armed logs none). */
   const armedLines = (key: string) => retryLines.filter((l) => l.startsWith(`[slack] unavailable-retry: persona=${key} armed (`))
@@ -4692,9 +4699,9 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 // relaunch answered UNAVAILABLE. A kill that resolves `KILL_SESSION_REFUSED`
 // ends the run with `RESTART_OUTCOME_REFUSED`: no launch, no success or
 // failure recorded, no `onCapReached`. A kill that resolves nothing, or
-// throws, still goes on to the launch. The kill follows a `dead` reading, so
-// it starts no `tmux-unresponsive` condition (`ErrTmuxKillFailed` included).
-// An UNAVAILABLE `send-keys` in the reconnect is never 'escalate-dead': no
+// throws, still goes on to the launch. (That such a kill starts no
+// `tmux-unresponsive` condition is server.test.ts's `_buildKillSessionAdapter`
+// case.) An UNAVAILABLE `send-keys` in the reconnect is never 'escalate-dead': no
 // re-probe, no kill, no launch. An UNAVAILABLE relaunch is never counted.
 // None of them posts a spawn-failure notice.
 //
@@ -4708,7 +4715,6 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 // ---------------------------------------------------------------------------
 
 describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the restart run launches nothing, counts nothing and posts no spawn-failure notice', () => {
-  const KILL_REFUSED_LINE = (key: string) => `[slack] Session kill refused for persona=${key} — no relaunch; not counted`
 
   describe('RestartDeps.killSession\'s answer', () => {
     const P = 'persona_p'
@@ -4750,7 +4756,6 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
   })
 
   describe('through the real adapters over the stub, on the recovery harness', () => {
-    const KIND = PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE
     let harness: RecoveryHarness | undefined
 
     afterEach(() => {
@@ -4770,32 +4775,6 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
       return { h, p, cwd: h.config.personas[0]!.working_directory }
     }
 
-    /** `status` reads `state` for each persona until a spawn of it succeeds, then `waiting`. */
-    function rowReads(h: RecoveryHarness, state: string): void {
-      const live = new Set<string>()
-      const client = h.stub.client
-      const spawn = client.spawn.bind(client)
-      client.spawn = async (params) => {
-        const result = await spawn(params)
-        live.add(String(params.claude_instance_id))
-        return result
-      }
-      h.script({ statusFn: (params) => cannedStatusResult({ state: live.has(String(params.claude_instance_id)) ? 'waiting' : state }) })
-    }
-
-    /** The stub's call counts, by verb, leaving out verbs never called. */
-    function callCounts(h: RecoveryHarness): Record<string, number> {
-      return Object.fromEntries(Object.entries(h.stub.calls).filter(([, calls]) => calls.length > 0).map(([verb, calls]) => [verb, calls.length]))
-    }
-
-    /** Fire persona `key`'s next retry and settle its run. */
-    async function retryNow(h: RecoveryHarness, key: string): Promise<void> {
-      const dueAt = h.controller.view(key)?.dueAt
-      if (dueAt === undefined) throw new Error(`retryNow: persona ${key} has no pending retry`)
-      await h.advance(dueAt - h.clock.now())
-      await h.settle()
-    }
-
     /** Nothing counted for `key`, no cap notice, no spawn-failure notice and no startup-errors entry. */
     function expectNothingCounted(h: RecoveryHarness, key: string): void {
       expect(getFailureCount(key)).toBe(RESTART_FAILURE_CAP - 1)
@@ -4805,18 +4784,12 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
       expect(h.outageNotices).toEqual([])
     }
 
-    /** E4's UNAVAILABLE forms, each built for the verb that meets it, and the cause each arms. */
-    const UNAVAILABLE_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error, string]> = [
-      ['ErrUnknownErrorName', () => errUnknownErrorName(), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-      ['ErrCallTimeout', (verb) => errCallTimeout(verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-      ['a wrapped UnknownError', (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME, 'Error: boom'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-      ['ErrTmuxUnresponsive', (verb) => errTmuxUnresponsive(verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-      ['ErrTmuxKillFailed', () => errTmuxKillFailed(), UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
-    ]
+    /** E4's UNAVAILABLE forms of agent-director's own errors, each built for the verb that meets it, and the cause each arms. */
+    const UNAVAILABLE_ANSWERS = unavailableForms('ErrUnknownErrorName', 'ErrCallTimeout', 'a wrapped UnknownError', 'ErrTmuxUnresponsive', 'ErrTmuxKillFailed')
 
-    test.each(UNAVAILABLE_ANSWERS)('the kill after a dead reading answers %s → refused: no launch, no recordFailure, no onCapReached; no condition started, nothing posted; the timer is armed (cause %s)', async (_label, make, cause) => {
+    test.each(UNAVAILABLE_ANSWERS)('the kill after a dead reading answers %s → refused: no launch, no recordFailure, no onCapReached; nothing posted; the timer is armed (cause %s)', async (_label, make, cause) => {
       const { h, p, cwd } = build()
-      rowReads(h, 'ended')
+      rowReadsUntilSpawn(h, 'ended')
       h.script({ killError: make('kill') })
 
       expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
@@ -4826,10 +4799,6 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
       expect(h.errors).toContain(KILL_REFUSED_LINE(p))
       expect(h.triggers).toEqual([{ key: p, kind: cause }])
       expectNothingCounted(h, p)
-      // The kill follows a dead reading: it starts no tmux-unresponsive condition.
-      expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-      expect(h.tmuxUnresponsive.firstRefusalAt(p)).toBeUndefined()
-      expect(h.lines.filter((l) => l.includes(`persona=${p} ${KIND} started`))).toEqual([])
       expect(h.episodeNotices).toEqual([])
     })
 
@@ -4838,7 +4807,7 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
       ['an AgentDirectorError of a name no class knows (not UNAVAILABLE)', () => errGeneric('kill', 'ErrKillBroken', 'the kill broke')],
     ])('the kill after a dead reading answers %s → the run still launches P; no refusal', async (_label, make) => {
       const { h, p, cwd } = build()
-      rowReads(h, 'ended')
+      rowReadsUntilSpawn(h, 'ended')
       h.script({ killError: make() })
 
       expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_LAUNCHED)
@@ -4869,7 +4838,7 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
 
     test.each(UNAVAILABLE_ANSWERS)('the relaunch after a dead reading answers %s → refused: no recordFailure, no onCapReached, no spawn-failure notice', async (_label, make, cause) => {
       const { h, p, cwd } = build()
-      rowReads(h, 'ended')
+      rowReadsUntilSpawn(h, 'ended')
       h.script({ spawnError: make('spawn') })
 
       expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
@@ -4885,7 +4854,7 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
 
     test('HO C3 Verify, AC 25: a relaunch that keeps answering ErrTmuxUnresponsive across several retries posts one onset for P and nothing more, and counts nothing', async () => {
       const { h, p, cwd } = build()
-      rowReads(h, 'ended')
+      rowReadsUntilSpawn(h, 'ended')
       h.script({ spawnError: errTmuxUnresponsive('spawn') })
       const firstAt = h.clock.now()
 
@@ -4902,7 +4871,7 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
 
     test('HO C3 Verify, AC 25: a relaunch refused once that succeeds at the next retry posts nothing', async () => {
       const { h, p, cwd } = build()
-      rowReads(h, 'ended')
+      rowReadsUntilSpawn(h, 'ended')
       h.script({ spawnError: errTmuxUnresponsive('spawn') })
 
       expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)

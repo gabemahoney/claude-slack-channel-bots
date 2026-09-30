@@ -108,7 +108,7 @@ import {
   setSessionNotifier,
   spawnForPersona,
   startupSessionManager,
-  sweepDeadTmuxChannel,
+  sweepDeadTmuxChannelWithCause,
   whenLaunchSettled,
 } from './session-manager.ts'
 import { createPersonaNotifier } from './persona-notifier.ts'
@@ -1293,7 +1293,9 @@ export function _buildKillSessionAdapter(
  *     it), when a reconnect is typed, when a launch starts and with the
  *     episode;
  *   - gone → there is no pane to type into: fire the dead-tmux sweep
- *     (`sweepDeadTmuxChannel`, b.sv7) once and return 'escalate-dead'.
+ *     (`sweepDeadTmuxChannelWithCause`, b.sv7) once and return
+ *     'escalate-dead' ('transient' when the sweep was refused, b.jg5
+ *     SRJ-105: nothing is re-probed, killed or relaunched).
  *     restart.ts then probes liveness again in the same restart run and, when
  *     the reconciled row reads dead, takes the kill+relaunch branch at once
  *     (otherwise a later tick does);
@@ -1409,8 +1411,10 @@ export function _buildReconnectSessionAdapter(
       // post-reboot case (b.nk5 — /tmp wiped, ALL personas dead-tmux at once)
       // is served correctly by the single in-flight-shared sweep: one
       // findMissing reconciles the whole store for every escalating persona.
-      await sweepDeadTmuxChannel(key, result.deadCause === 'row-not-interactive' ? 'row-not-interactive' : 'dead-session')
-      return 'escalate-dead'
+      // b.jg5 SRJ-105: a refused sweep stops the restart run: 'transient',
+      // so no re-probe, kill or relaunch follows.
+      const sweep = await sweepDeadTmuxChannelWithCause(key, result.deadCause === 'row-not-interactive' ? 'row-not-interactive' : 'dead-session')
+      return sweep.refused ? 'transient' : 'escalate-dead'
     }
     return 'transient'
   }
@@ -1427,7 +1431,7 @@ export function _buildReconnectSessionAdapter(
  *   - a launch for the persona is in flight → 'transient', with no tmux probe
  *     and no notice: the launch owns the session;
  *   - its own tmux session is gone (`hasPersonaTmuxSession`, exact target) →
- *     the dead-tmux sweep (`sweepDeadTmuxChannel`, verdict
+ *     the dead-tmux sweep (`sweepDeadTmuxChannelWithCause`, verdict
  *     `prompt-row-tmux-gone`) and 'escalate-dead', with no notice: restart.ts
  *     re-probes and relaunches the persona in the same run (b.d61);
  *   - alive, or the probe failed (no proof it is dead) → one more deferral on
@@ -1435,6 +1439,8 @@ export function _buildReconnectSessionAdapter(
  *     `PROMPT_ROW_SWEEP_AFTER_MS`, it sweeps and reads the row again, and a
  *     row now `ended` or `missing` escalates the same way; otherwise
  *     `deferPromptRow` defers and raises the notice, as before.
+ * A refused sweep at either step (b.jg5 SRJ-105) answers 'transient', with
+ * no notice: nothing is re-probed, killed or relaunched.
  * Never throws: the sweep and the deferral check swallow their own failures.
  */
 async function promptRowReconnectVerdict(key: string, state: string): Promise<'escalate-dead' | 'transient'> {
@@ -1456,10 +1462,12 @@ async function promptRowReconnectVerdict(key: string, state: string): Promise<'e
     console.error(
       `[slack] reconnectSession: persona=${key} is ${state} but its tmux session "${personaTmuxSessionName(key)}" is gone — no prompt is waiting in it; not deferring, reconciling so the restart relaunches it (b.jdc)`,
     )
-    await sweepDeadTmuxChannel(key, 'prompt-row-tmux-gone')
-    return 'escalate-dead'
+    const sweep = await sweepDeadTmuxChannelWithCause(key, 'prompt-row-tmux-gone')
+    return sweep.refused ? 'transient' : 'escalate-dead'
   }
-  if ((await checkPromptRowDeferral(key, state)) === 'escalate') return 'escalate-dead'
+  const deferral = await checkPromptRowDeferral(key, state)
+  if (deferral === 'escalate') return 'escalate-dead'
+  if (deferral === 'refused') return 'transient'
   return deferPromptRow(key, state)
 }
 
@@ -1537,7 +1545,9 @@ export function deferPendingRow(key: string, launchStartedAt?: string): 'pending
  * positive-idle rule decides (`checkWorkingRowPane`, the transcript located
  * with the persona `getPersona` returns): 'reconnect' once the row is shown
  * stale, and the adapter goes on to type `/mcp reconnect`; otherwise defer.
- * Never throws: `sweepDeadTmuxChannel` and `checkWorkingRowPane` swallow
+ * A refused sweep (b.jg5 SRJ-105) answers 'transient' instead of
+ * 'escalate-dead'.
+ * Never throws: `sweepDeadTmuxChannelWithCause` and `checkWorkingRowPane` swallow
  * their own failures. A failed tmux probe is noted as a deferral on the row
  * (`noteWorkingRowDeferral`), as `checkWorkingRowPane` notes its own.
  */
@@ -1570,8 +1580,8 @@ async function workingReconnectVerdict(
   console.error(
     `[slack] reconnectSession: persona=${key} is working but its tmux session "${personaTmuxSessionName(key)}" is gone — not deferring; reconciling so the restart relaunches it (b.d61)`,
   )
-  await sweepDeadTmuxChannel(key, 'working-tmux-gone')
-  return 'escalate-dead'
+  const sweep = await sweepDeadTmuxChannelWithCause(key, 'working-tmux-gone')
+  return sweep.refused ? 'transient' : 'escalate-dead'
 }
 
 // ---------------------------------------------------------------------------

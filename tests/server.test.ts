@@ -58,7 +58,6 @@ import {
   errSpawnNotResumable,
   errSystemInstallDisappeared,
   errTmuxCaptureFailed,
-  errTmuxKillFailed,
   errTmuxNotAvailable,
   errTmuxSendKeys,
   errTmuxUnresponsive,
@@ -70,6 +69,7 @@ import {
   SAMPLE_LAUNCH_START_WHOLE,
   type CloseCountingStubClient,
   type StubClient,
+  unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
 import {
   _buildIsSessionAliveAdapter,
@@ -110,13 +110,9 @@ import {
   setSessionNotifier,
   spawnForPersona,
 } from '../src/session-manager.ts'
-import type { ClientOptions, FindMissingParams, KillParams, ReadPaneParams, SendKeysParams, SendKeysResult, StatusParams } from 'agent-director'
+import type { ClientOptions, FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams } from 'agent-director'
 import { KILL_SESSION_REFUSED, type KillSessionResult } from '../src/restart.ts'
-import {
-  runInAttempt,
-  UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
-  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
-} from '../src/unavailable-retry.ts'
+import { runInAttempt } from '../src/unavailable-retry.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
@@ -846,29 +842,42 @@ describe('_buildIsSessionAliveAdapter', () => {
 // description is the client's, so its envelope's marked text is never logged.
 // ---------------------------------------------------------------------------
 
+/** This file's labels for the shared forms whose label it extends. */
+const FORM_LABELS: Readonly<Record<string, string>> = {
+  ErrUnknownErrorName: 'ErrUnknownErrorName (a name from a later binary)',
+  ErrTmuxUnresponsive: 'ErrTmuxUnresponsive (by name)',
+  ErrTmuxKillFailed: 'ErrTmuxKillFailed (by name)',
+}
+
+/** The marked builder of each shared form whose builder takes a description, and whether its described line shows the redacted marker. */
+const MARKED_BUILDERS: Readonly<Record<string, { readonly build: (verb: string) => Error; readonly redacted: boolean }>> = {
+  ErrUnknownErrorName: {
+    build: () => errUnknownErrorName('ErrFromALaterBinary', `a later failure (${sentinelInMessage('unknown-name')})`),
+    redacted: false,
+  },
+  'a wrapped UnknownError': {
+    build: (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME, `Error: boom (${sentinelInMessage('wrapped')})`),
+    redacted: true,
+  },
+  ErrTmuxUnresponsive: {
+    build: (verb) => errTmuxUnresponsive(verb, `tmux did not answer (${sentinelInMessage('unresponsive')})`),
+    redacted: true,
+  },
+}
+
 /** [label, builder (by verb), described line shows the redacted marker, the retry cause kind a kill arms]. */
-const UNAVAILABLE_FORMS: ReadonlyArray<readonly [string, (verb: string) => Error, boolean, string]> = [
-  [
-    'ErrUnknownErrorName (a name from a later binary)',
-    () => errUnknownErrorName('ErrFromALaterBinary', `a later failure (${sentinelInMessage('unknown-name')})`),
-    false,
-    UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
-  ],
-  ['ErrCallTimeout', (verb) => errCallTimeout(verb), false, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-  [
-    'a wrapped UnknownError',
-    (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME, `Error: boom (${sentinelInMessage('wrapped')})`),
-    true,
-    UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
-  ],
-  [
-    'ErrTmuxUnresponsive (by name)',
-    (verb) => errTmuxUnresponsive(verb, `tmux did not answer (${sentinelInMessage('unresponsive')})`),
-    true,
-    UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
-  ],
-  ['ErrTmuxKillFailed (by name)', () => errTmuxKillFailed(), false, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
-]
+const UNAVAILABLE_FORMS: ReadonlyArray<readonly [string, (verb: string) => Error, boolean, string]> = unavailableForms(
+  'ErrUnknownErrorName',
+  'ErrCallTimeout',
+  'a wrapped UnknownError',
+  'ErrTmuxUnresponsive',
+  'ErrTmuxKillFailed',
+).map(([label, build, causeKind]) => [
+  FORM_LABELS[label] ?? label,
+  MARKED_BUILDERS[label]?.build ?? build,
+  MARKED_BUILDERS[label]?.redacted ?? false,
+  causeKind,
+] as const)
 
 /** Every `console.error` argument list `fn` writes, kept unformatted (console restored after). */
 async function capturingErrorArgs<T>(fn: () => Promise<T>): Promise<{ result: T; errArgs: unknown[][] }> {
@@ -954,12 +963,17 @@ describe('_buildReconnectSessionAdapter', () => {
     statusAfterSweep?: string
     /** The `launch_started_at` every status result shows (default: none, the key absent). */
     launchStartedAt?: string
+    /** When set, every findMissing sweep rejects with it. */
+    findMissingError?: Error
   }): {
     adapter: (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient' | 'pending'>
     statusCalls: StatusParams[]
     sendKeysCalls: SendKeysParams[]
     findMissingCalls: FindMissingParams[]
     readPaneCalls: ReadPaneParams[]
+    killCalls: KillParams[]
+    spawnCalls: SpawnParams[]
+    resumeCalls: ResumeParams[]
     tmuxProbes: string[]
     stub: StubClient
   } {
@@ -967,6 +981,9 @@ describe('_buildReconnectSessionAdapter', () => {
     const sendKeysCalls: SendKeysParams[] = []
     const findMissingCalls: FindMissingParams[] = []
     const readPaneCalls: ReadPaneParams[] = []
+    const killCalls: KillParams[] = []
+    const spawnCalls: SpawnParams[] = []
+    const resumeCalls: ResumeParams[] = []
     const tmuxProbes: string[] = []
     _setTmuxSessionProber(async (name) => {
       tmuxProbes.push(name)
@@ -989,7 +1006,11 @@ describe('_buildReconnectSessionAdapter', () => {
       // flows through this SAME stub client. `findMissingCalls` is the observable
       // seam for "was the memoized sweep triggered".
       findMissingCalls,
+      findMissingError: opts.findMissingError,
       readPaneCalls,
+      killCalls,
+      spawnCalls,
+      resumeCalls,
       readPaneResults: opts.pane === undefined ? undefined : [{ pane: opts.pane }],
       getResult: opts.row === undefined ? undefined : cannedGetResult({ claude_instance_id: 'cscb_C1', state: 'working', ...opts.row }),
     })
@@ -1012,6 +1033,9 @@ describe('_buildReconnectSessionAdapter', () => {
       sendKeysCalls,
       findMissingCalls,
       readPaneCalls,
+      killCalls,
+      spawnCalls,
+      resumeCalls,
       tmuxProbes,
       stub,
     }
@@ -1840,6 +1864,107 @@ describe('_buildReconnectSessionAdapter', () => {
 
       expect(h.findMissingCalls).toHaveLength(1)
       expect(raised.map((n) => n.key)).toEqual(['C1', 'C1'])
+    })
+  })
+
+  // b.jg5 SRJ-105: a findMissing sweep on the restart path that is refused
+  // (UNAVAILABLE) answers 'transient' instead of 'escalate-dead', so the
+  // restart run neither re-probes nor kills nor relaunches the persona. The
+  // sweep sites: the dead-session and row-not-interactive escalations after
+  // the reconnect's keystrokes, a `working` or prompt row whose tmux session
+  // is gone (`sweepDeadTmuxChannelWithCause`), and a live prompt row's
+  // deferral from 10 min on (`checkPromptRowDeferral`, which then reads no
+  // row and raises no notice). One described refusal line; nothing leaks. A
+  // sweep failing with another class keeps today's handling: one "proceeding"
+  // line and the verdict as before.
+  describe('b.jg5 SRJ-105: a refused findMissing sweep on the restart path', () => {
+    type SweepSite = {
+      /** The harness options that lead the adapter to the sweep. */
+      opts: () => Parameters<typeof makeHarness>[0]
+      /** The minutes on the fake clock of each attempt; the sweep runs at the last. */
+      minutes: readonly number[]
+      /** The sweep's log prefix. */
+      prefix: string
+      /** The tmux probes, send-keys and notices the attempts make. */
+      tmuxProbes: number
+      sendKeys: number
+      raised: string[]
+    }
+
+    const SWEEP_SITES: ReadonlyArray<readonly [string, SweepSite]> = [
+      ['dead-session (ErrTmuxSendKeys twice)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errTmuxSendKeys() }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, sendKeys: 2, raised: [] }],
+      ['row-not-interactive (ErrSpawnNotInteractive)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errSpawnNotInteractive('send-keys') }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, sendKeys: 1, raised: [] }],
+      ['working-tmux-gone', { opts: () => ({ statusState: 'working', tmux: 'gone' }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 1, sendKeys: 0, raised: [] }],
+      ['prompt-row-tmux-gone', { opts: () => ({ statusState: 'ask_user', tmux: 'gone' }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 1, sendKeys: 0, raised: [] }],
+      ['a live prompt row deferred 10 min', { opts: () => ({ statusState: 'check_permission', tmux: 'alive', statusAfterSweep: 'missing' }), minutes: [0, 10], prefix: 'reconnectSession: prompt row', tmuxProbes: 2, sendKeys: 0, raised: ['C1'] }],
+    ]
+    const WORKING_TMUX_GONE = SWEEP_SITES.find(([label]) => label === 'working-tmux-gone')![1]
+
+    /** The sweep's refusal line for persona C1 under `prefix`. */
+    const sweepRefusedLine = (prefix: string, err: unknown): string =>
+      `[slack] ${prefix}: findMissing sweep refused for persona=C1: ${describeAgentDirectorFailure(err)} — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)`
+
+    /** Run `site`'s attempts for C1 with every sweep failing with `err`, capturing notices and console.error. */
+    async function sweepFailing(site: SweepSite, err: Error) {
+      const clock = createFakeClock()
+      _setNow(clock.now)
+      const raised: string[] = []
+      setSessionNotifier((key) => { raised.push(key) })
+      try {
+        const h = makeHarness({ ...site.opts(), findMissingError: err })
+        const { result: verdicts, errArgs } = await capturingErrorArgs(async () => {
+          const out: string[] = []
+          for (const minute of site.minutes) {
+            await clock.advance(minute * 60_000 - clock.now())
+            out.push(await h.adapter('C1'))
+          }
+          return out
+        })
+        return { ...h, verdicts, lines: stringLines(errArgs), errArgs, raised }
+      } finally {
+        setSessionNotifier(undefined)
+      }
+    }
+
+    /** A refused sweep at `site`: 'transient' at every attempt; one sweep, no row read after it, nothing killed or launched; one refusal line, nothing leaks. */
+    async function expectRefused(site: SweepSite, err: Error, redacted: boolean): Promise<void> {
+      const r = await sweepFailing(site, err)
+
+      expect(r.verdicts).toEqual(site.minutes.map(() => 'transient'))
+      expect(r.findMissingCalls).toHaveLength(1)
+      // One status read per attempt: the row is not read again after the sweep.
+      expect(r.statusCalls).toHaveLength(site.minutes.length)
+      expect(r.tmuxProbes).toHaveLength(site.tmuxProbes)
+      expect(r.sendKeysCalls).toHaveLength(site.sendKeys)
+      expect([r.killCalls, r.spawnCalls, r.resumeCalls]).toEqual([[], [], []])
+      expect(r.raised).toEqual(site.raised)
+      expect(r.lines.filter((l) => l.includes('findMissing sweep refused'))).toEqual([sweepRefusedLine(site.prefix, err)])
+      expect(r.lines.filter((l) => l.includes('findMissing sweep failed'))).toEqual([])
+      if (redacted) expect(r.lines.join('\n')).toContain(REDACTED_SENTINEL_TAIL)
+      assertNoLeak({ errArgs: r.errArgs })
+    }
+
+    const [TMUX_LABEL, TMUX_BUILD, TMUX_REDACTED] = UNAVAILABLE_FORMS.find(([label]) => label === FORM_LABELS.ErrTmuxUnresponsive)!
+
+    test.each(SWEEP_SITES)(`the sweep at %s refused with ${TMUX_LABEL} → 'transient', never 'escalate-dead'; no row read after it, no kill or launch; one described refusal line`, async (_label, site) => {
+      await expectRefused(site, TMUX_BUILD('find-missing'), TMUX_REDACTED)
+    })
+
+    test.each(UNAVAILABLE_FORMS)("the sweep of a working row whose tmux session is gone refused with %s → 'transient'; no kill or launch; one described refusal line, nothing leaks", async (_label, build, redacted) => {
+      await expectRefused(WORKING_TMUX_GONE, build('find-missing'), redacted)
+    })
+
+    test.each(SWEEP_SITES)("contrast: the sweep at %s failing with an UNCLASSIFIED error (ErrInternal) keeps today's handling → 'escalate-dead' at the swept attempt, one 'proceeding' line and no refusal line", async (_label, site) => {
+      const err = errInternal()
+      const r = await sweepFailing(site, err)
+
+      expect(r.verdicts).toEqual([...site.minutes.slice(0, -1).map(() => 'transient'), 'escalate-dead'])
+      expect(r.findMissingCalls).toHaveLength(1)
+      expect([r.killCalls, r.spawnCalls, r.resumeCalls]).toEqual([[], [], []])
+      expect(r.lines.filter((l) => l.includes('findMissing sweep refused'))).toEqual([])
+      expect(r.lines.filter((l) => l.includes('findMissing sweep failed'))).toEqual([
+        `[slack] ${site.prefix}: findMissing sweep failed for persona=C1: ${describeAgentDirectorFailure(err)} — proceeding`,
+      ])
     })
   })
 })

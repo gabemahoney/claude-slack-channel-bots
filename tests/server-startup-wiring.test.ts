@@ -220,6 +220,11 @@ function constOf(call: string): string {
   return decls[0]![1]!
 }
 
+/** `name` is declared exactly once in server.ts (no local shadow, no second instance). */
+function declaredOnce(name: string): void {
+  expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+}
+
 /** Offsets of every plain assignment to `name` (`name = …`, not `==`, not a declaration or property). */
 function assignmentsTo(name: string): Array<{ at: number; value: string }> {
   return [...SERVER_CODE.matchAll(new RegExp(`(?<![\\w.$]|(?:let|const|var)\\s+)${name}\\s*=(?![=>])\\s*([^\\n;]*)`, 'g'))]
@@ -1631,11 +1636,6 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
   const RETRY_CONDITION: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE'
   const LIVE: keyof typeof LivenessReadingModule = 'LIVENESS_LIVE'
 
-  /** `name` is declared exactly once in server.ts (no local shadow, no second instance). */
-  function declaredOnce(name: string): void {
-    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
-  }
-
   test('the condition is built exactly once, in main()\'s own statement list (not at module scope, behind no branch), over the one notice episodes instance, after the retry controller and before the start bring-up, initRestart and initHealthCheck', () => {
     const at = onlyCallOf(FACTORY)
     const condition = constOf(FACTORY)
@@ -1769,11 +1769,6 @@ describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s e
   const RETRY_FIRE: keyof UnavailableRetryDeps = 'onRetryFire'
   const THRESHOLD_IN_EFFECT: keyof typeof AdSettingsModule = 'adAlertThresholdMsInEffect'
   const INTERVAL: keyof PersonaConfig = 'health_check_interval'
-
-  /** `name` is declared exactly once in server.ts (no local shadow, no second instance). */
-  function declaredOnce(name: string): void {
-    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
-  }
 
   test('the health check\'s tick-end hook is the condition\'s tick onset entry, given the tick\'s start, and the tick reads its start on the notice episodes\' own clock', () => {
     const condition = constOf(FACTORY)

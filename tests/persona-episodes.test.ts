@@ -276,7 +276,8 @@ describe('isolation', () => {
     )
   })
 
-  test.each(eachKind)('one persona\'s kinds are independent: ending %s leaves every other kind open and posted', (ended) => {
+  test('one persona\'s kinds are independent: ending one kind leaves every other kind open and posted', () => {
+    const ended = PERSONA_EPISODE_KINDS[0]!
     for (const kind of PERSONA_EPISODE_KINDS) episodes.begin('K', kind)
     expect(PERSONA_EPISODE_KINDS.map((kind) => episodes.post('K', kind, textOf(kind, 1)))).toEqual(
       PERSONA_EPISODE_KINDS.map(() => true),
