@@ -87,7 +87,8 @@
  *   `initOutageState` call before the start bring-up and the restart module;
  *   its action is the full-mode retry action over `runRestartRetry`,
  *   `getAppliedPersona`, the relaunch gate, the restart cap, the restart
- *   module's shutdown flag and `isLaunchInFlight` (SRJ-303); shutdown closes it once, right after `cancelAllRestartTimers`, after the
+ *   module's shutdown flag, `isLaunchInFlight` and the session manager's
+ *   row read `readPersonaRowState` (SRJ-303); shutdown closes it once, right after `cancelAllRestartTimers`, after the
  *   shutting-down flag and before the HTTP server stops.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
@@ -1357,7 +1358,7 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
   // makes sure production binds the real one: a stub in-flight or cap read
   // would still launch over an in-flight launch or past the cap. Only these
   // members are pinned, not the full key set.
-  test('the controller\'s action is the full-mode retry action over the restart module\'s retry entry, the live applied persona lookup, the relaunch gate, the restart cap, the restart module\'s shutdown flag and the session manager\'s isLaunchInFlight', () => {
+  test('the controller\'s action is the full-mode retry action over the restart module\'s retry entry, the live applied persona lookup, the relaunch gate, the restart cap, the restart module\'s shutdown flag, the session manager\'s isLaunchInFlight and its row read (readPersonaRowState)', () => {
     expect(onlyCallProps('createUnavailableRetryController').get('action')!.startsWith('createFullModeRetryAction(')).toBe(true)
     expect(importSource(SERVER_CODE, 'createFullModeRetryAction')).toBe('./unavailable-retry.ts')
     const props = onlyCallProps('createFullModeRetryAction')
@@ -1383,6 +1384,11 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
 
     expect(props.get('isInFlight')).toBe('isLaunchInFlight')
     expect(importSource(SERVER_CODE, 'isLaunchInFlight')).toBe('./session-manager.ts')
+
+    // b.jg5 SRJ-303, SRJ-115: a pending-only retry's row read is the session
+    // manager's, one `status` call through the outage wrapper.
+    expect(props.get('readRow')).toBe('readPersonaRowState')
+    expect(importSource(SERVER_CODE, 'readPersonaRowState')).toBe('./session-manager.ts')
   })
 })
 

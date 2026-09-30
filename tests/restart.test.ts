@@ -25,11 +25,13 @@ import {
   RESTART_OUTCOME_LAUNCH_SKIPPED,
   RESTART_OUTCOME_NOT_INITIALISED,
   RESTART_OUTCOME_NOT_UP,
+  RESTART_OUTCOME_PENDING_DEFERRED,
   RESTART_OUTCOME_RECONNECTED,
   RESTART_OUTCOME_RECONNECT_DEFERRED,
   RESTART_OUTCOME_REFUSED,
   RESTART_OUTCOME_SHUTTING_DOWN,
   type LaunchSessionResult,
+  type ReconnectSessionResult,
   type RestartDeps,
   type RestartRetryOutcome,
 } from '../src/restart.ts'
@@ -123,6 +125,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_MODE_FULL,
   type UnavailableRetryController,
 } from '../src/unavailable-retry.ts'
 import { installAdVersionRecheck, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
@@ -1026,7 +1029,12 @@ describe('backoff integration (SR-29.3)', () => {
     expect(escapingDeps.onCapReachedCalls).toHaveLength(0)
   })
 
-  test('(4c) reconnect result=transient leaves counter unchanged at reconnect site', async () => {
+  // b.jg5 SRJ-303: 'pending' (the row reads `pending`, nothing typed) is a
+  // deferral like 'transient' on the restart timer's path: nothing counted.
+  test.each<[string, 'transient' | 'pending']>([
+    ['transient', 'transient'],
+    ['pending (b.jg5 SRJ-303: a row not started yet)', 'pending'],
+  ])('(4c) reconnect result=%s leaves counter unchanged at reconnect site', async (_label, verdict) => {
     const KEY = 'reconnect_transient_bot'
 
     // Pre-seed a failure so "unchanged" is distinguishable from "reset to 0"
@@ -1037,7 +1045,7 @@ describe('backoff integration (SR-29.3)', () => {
     expect(getFailureCount(KEY)).toBe(1)
 
     const transientDeps = makeDeps({ isSessionAliveResult: true })
-    transientDeps.reconnectSession = async (_key) => 'transient'
+    transientDeps.reconnectSession = async (_key) => verdict
     initRestart(transientDeps)
 
     scheduleRestart(KEY, '/cwd/test')
@@ -1045,6 +1053,8 @@ describe('backoff integration (SR-29.3)', () => {
 
     // Counter unchanged — counting is not done at the reconnect site
     expect(getFailureCount(KEY)).toBe(1)
+    expect(isAtCap(KEY, RESTART_FAILURE_CAP)).toBe(false)
+    expect(transientDeps.onCapReachedCalls).toHaveLength(0)
   })
 
   test('(4d) reconnect throws (undefined result) — counter unchanged at reconnect site', async () => {
@@ -1085,7 +1095,12 @@ describe('backoff integration (SR-29.3)', () => {
   //     re-armed from restart.ts (the tick is the retry driver, not re-entry).
   // -------------------------------------------------------------------------
 
-  test('(6a) b.9a7: alive + reconnect="transient" (working-state defer) does not relaunch or re-arm', async () => {
+  // b.jg5 SRJ-303: a 'pending' deferral (the row not started yet) takes the
+  // same no-op path.
+  test.each<[string, 'transient' | 'pending']>([
+    ['"transient" (working-state defer)', 'transient'],
+    ['"pending" (b.jg5 SRJ-303: a row not started yet)', 'pending'],
+  ])('(6a) b.9a7: alive + reconnect=%s does not relaunch or re-arm', async (_label, verdict) => {
     // Unique to this case (the "transient leaves the counter unchanged" behavior
     // is already pinned by 4c): the working-state defer takes NO recovery action
     // and restart.ts does NOT re-enter scheduleRestart — the tick is the retry
@@ -1094,7 +1109,7 @@ describe('backoff integration (SR-29.3)', () => {
     const deps = makeDeps({ isSessionAliveResult: true })
     deps.reconnectSession = async (key) => {
       deps.reconnectSessionCalls.push(key)
-      return 'transient'
+      return verdict
     }
     initRestart(deps)
 
@@ -3285,6 +3300,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
       waitMs: UNAVAILABLE_RETRY_BASE_S * 1000,
       refusals: 0,
       causes: [cause],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
     })
     expect(clock.pendingCount()).toBe(1)
     expect(retry.isArmed(q.key)).toBe(false)
@@ -3719,9 +3735,10 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
 
   // The row reads live but P is not connected: a reconnect. Its verdict decides
   // the rest; an 'escalate-dead' is followed by a second liveness read.
-  test.each<[string, 'success' | 'escalate-dead' | 'transient' | undefined, boolean, RestartRetryOutcome, number]>([
+  test.each<[string, ReconnectSessionResult, boolean, RestartRetryOutcome, number]>([
     ['the reconnect succeeds → reconnected, a success recorded', 'success', true, RESTART_OUTCOME_RECONNECTED, 0],
     ['the reconnect is transient → reconnect-deferred, nothing counted', 'transient', true, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
+    ['the reconnect answers pending (b.jg5 SRJ-303: the row not started yet) → pending-deferred, nothing counted', 'pending', true, RESTART_OUTCOME_PENDING_DEFERRED, 1],
     ['the reconnect gives no answer → reconnect-deferred, nothing counted', undefined, true, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
     ['escalate-dead and the row still reads live → reconnect-deferred, nothing counted', 'escalate-dead', true, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
     ['escalate-dead and the row now reads dead → a kill and a launch in the same retry, launched', 'escalate-dead', false, RESTART_OUTCOME_LAUNCHED, 0],
@@ -3741,6 +3758,27 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
     expect(deps.killSessionCalls).toEqual(relaunched ? [P] : [])
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual(relaunched ? [P] : [])
     expect(getFailureCount(P)).toBe(count)
+  })
+
+  test('b.jg5 SRJ-303: a pending reconnect logs exactly what a transient one does; only the outcome differs', async () => {
+    const linesFor = async (verdict: 'transient' | 'pending'): Promise<{ outcome: RestartRetryOutcome; lines: string[] }> => {
+      errLines = []
+      const deps = retryDeps({ isSessionAliveResult: true })
+      deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return verdict }
+      initRestart(deps)
+      const outcome = await runRestartRetry(P, CWD, notInFlight)
+      expect(deps.killSessionCalls).toEqual([])
+      expect(deps.launchSessionCalls).toEqual([])
+      return { outcome, lines: [...errLines] }
+    }
+
+    const transient = await linesFor('transient')
+    const pending = await linesFor('pending')
+
+    expect(transient.outcome).toBe(RESTART_OUTCOME_RECONNECT_DEFERRED)
+    expect(pending.outcome).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+    expect(pending.lines).toEqual(transient.lines)
+    expect(pending.lines).toEqual([`[slack] Session alive but disconnected — reconnecting MCP for persona=${P}`])
   })
 
   // The row reads dead: a kill, then a launch, whose answer decides the

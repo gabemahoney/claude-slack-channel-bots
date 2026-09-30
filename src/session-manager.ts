@@ -121,14 +121,16 @@ import {
   ErrCwdNotADirectory,
   ErrSpawnCapReached,
   ErrSpawnNotInteractive,
+  ERR_SPAWN_NOT_FOUND_NAME,
 } from './agent-director-errors.ts'
 import {
   classifyWithInvalidFlagsRecheck,
   describeAdErrorClassification,
+  hasAdErrorName,
   isInvalidFlagsError,
 } from './ad-error-class.ts'
 import { RECHECK_OUTCOME_STOP } from './ad-version-gate.ts'
-import { runInAttempt, type AttemptView } from './unavailable-retry.ts'
+import { runInAttempt, UNAVAILABLE_RETRY_ROW_ABSENT, type AttemptView } from './unavailable-retry.ts'
 import { recordStartupError } from './startup-errors.ts'
 import {
   locateTranscript,
@@ -2220,6 +2222,29 @@ async function reconcileAndReadRowState(key: string, logPrefix: string, ref: str
   } catch (err) {
     console.error(`[slack] ${logPrefix}: reading the row of ${ref} after the findMissing sweep failed: ${describeAgentDirectorFailure(err)}`)
     return undefined
+  }
+}
+
+/**
+ * The UNAVAILABLE retry timer's row read (b.jg5 SRJ-303, SRJ-115): one
+ * `status` call for persona `key`'s row (`cscb_<key>`) through
+ * `withOutageDetection`, with no findMissing sweep before it and no other
+ * call. Answers the row's state as agent-director reports it (`pending`,
+ * `waiting`, `ended`, `missing` …), or `UNAVAILABLE_RETRY_ROW_ABSENT` when
+ * there is no row (`ErrSpawnNotFound`, recognised by name). Every other error
+ * is thrown to the caller; inside a recovery attempt for the persona the
+ * wrapper has already reported it, so a `status` error arms the persona's
+ * retry timer (SRJ-301). Logs nothing.
+ */
+export async function readPersonaRowState(key: string): Promise<string> {
+  try {
+    const st = await withOutageDetection(key, undefined, (client) =>
+      client.status({ claude_instance_id: personaInstanceId(key) }),
+    )
+    return st.state
+  } catch (err) {
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return UNAVAILABLE_RETRY_ROW_ABSENT
+    throw err
   }
 }
 

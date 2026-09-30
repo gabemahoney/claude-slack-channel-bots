@@ -32,6 +32,13 @@
  *     FAILURE or DIRECTORY spawn, or no sink at all, marks nothing
  *     (`launchSession` false); a joiner shares the marker; a start pass with
  *     one UNAVAILABLE persona tallies as before and arms only that persona.
+ *   - b.jg5 SRJ-303 / SRJ-115 the retry timer's row read
+ *     (`readPersonaRowState`): one `status` call for `cscb_<key>` and no
+ *     other, answering each state as is (`pending` included), `absent` for
+ *     `ErrSpawnNotFound` (by name), and any other error rethrown as the same
+ *     value, quietly; through the outage wrapper (flags raised and cleared as
+ *     for any wrapped `status`; an error reported to a recording sink only
+ *     inside a recovery attempt for that persona, with the predicate's cause).
  *   - b.av2 SR-6.2 ladder guards: a row in another directory (by real path) is
  *     killed, deleted and spawned fresh on every path; a missing or changed
  *     `config_dir` label means a fresh spawn instead of a resume (AC 48).
@@ -181,6 +188,7 @@ import {
   setPreLaunchReplyGuard,
   killPersonaInstance,
   deletePersonaInstance,
+  readPersonaRowState,
   whenLaunchSettled,
   ConfigDirUnresolvableError,
   _setConfigDirFs,
@@ -325,6 +333,7 @@ import {
   getOutageFlags,
   setOutageFlag,
   _resetOutageState,
+  type OutageClass,
 } from '../src/outage-state.ts'
 import {
   AgentDirectorError,
@@ -347,9 +356,12 @@ import {
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   createUnavailableRetryController,
+  runInAttempt,
   UNAVAILABLE_RETRY_BASE_S,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_ROW_ABSENT,
+  type AttemptView,
   type UnavailableRetryController,
   type UnavailableRetryTriggerSink,
 } from '../src/unavailable-retry.ts'
@@ -10541,6 +10553,178 @@ describe('killPersonaInstance / deletePersonaInstance: the persona teardown\'s q
     expect([...getOutageFlags(A)]).toEqual(['ad-unreachable'])
     expect(ok.errLog).toBe('')
     expect(notices).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-303, SRJ-115: the UNAVAILABLE retry timer's row read
+//
+// `readPersonaRowState(key)` makes one `status` call for `cscb_<key>` through
+// `withOutageDetection` (no findMissing sweep, no other call) and logs
+// nothing. It answers the row's state as agent-director reports it,
+// `pending` included, or `UNAVAILABLE_RETRY_ROW_ABSENT` for
+// `ErrSpawnNotFound` (by name); any other error reaches the caller as the
+// same value. Being wrapped, its flags move as for any wrapped `status`, and
+// inside a recovery attempt for the persona its error is reported to the
+// installed trigger sink with the arming predicate's cause.
+// ---------------------------------------------------------------------------
+
+describe('readPersonaRowState: the retry timer\'s row read, one status call through the outage wrapper (b.jg5 SRJ-303, SRJ-115)', () => {
+  const B = 'B'
+  const A = 'A'
+
+  /** Every arm the recording sink received: persona key and cause kind. */
+  let armed: Array<{ key: string; kind: string }>
+
+  beforeEach(() => {
+    armed = []
+  })
+
+  /** Re-wire the outage state as the top-level `beforeEach` does, with a sink recording each arm in `armed`. */
+  function installRecordingSink(): void {
+    initOutageState({
+      getClient,
+      notify: (key, text) => { outageEmissions.push({ key, text }) },
+      triggerSink: { arm: (key, cause) => { armed.push({ key, kind: cause.kind }) } },
+    })
+  }
+
+  /** Run the read for B with the startup-errors log and console captured; returns what it resolved or rejected with, and everything captured. */
+  async function readQuietly(read: () => Promise<string> = () => readPersonaRowState(B)): Promise<{ outcome: { ok: string } | { err: unknown }; errLog: string; startupLog: string }> {
+    const readStartupLog = captureStartupErrors()
+    let outcome!: { ok: string } | { err: unknown }
+    const errLog = await withCapturedErr(async () => {
+      try {
+        outcome = { ok: await read() }
+      } catch (err) {
+        outcome = { err }
+      }
+      await settleNotices()
+    })
+    return { outcome, errLog, startupLog: readStartupLog() }
+  }
+
+  /** Nothing was logged, recorded as a startup error or raised as a notice. */
+  function expectQuiet(r: { errLog: string; startupLog: string }): void {
+    expect(r.errLog).toBe('')
+    expect(r.startupLog).toBe('')
+    expect(notices).toEqual([])
+  }
+
+  test.each(['pending', 'waiting', 'working', 'ask_user', 'check_permission', 'ended', 'missing'])('a row reading %s → that state as is, from exactly one status call for cscb_B and no other call; quiet', async (state) => {
+    const calls = makeStubCallLog()
+    installStub({ ...calls, statusResult: { state } })
+
+    const r = await readQuietly()
+
+    expect(r.outcome).toEqual({ ok: state })
+    expect(calls.statusCalls).toEqual([{ claude_instance_id: 'cscb_B' }])
+    expect(stubCallCount(calls)).toBe(1)
+    expectQuiet(r)
+    expect(outageEmissions).toEqual([])
+  })
+
+  test.each<[string, () => Error]>([
+    ['the client\'s ErrSpawnNotFound', () => new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'spawn not found')],
+    ['a base AgentDirectorError named ErrSpawnNotFound', () => errGeneric('status', 'ErrSpawnNotFound', 'spawn not found')],
+  ])('no row (%s) → absent, not an error, after one status call; quiet', async (_label, build) => {
+    const calls = makeStubCallLog()
+    installStub({ ...calls, statusError: build() })
+
+    const r = await readQuietly()
+
+    expect(r.outcome).toEqual({ ok: UNAVAILABLE_RETRY_ROW_ABSENT })
+    expect(stubCallCount(calls)).toBe(1)
+    expectQuiet(r)
+  })
+
+  test.each<[string, () => Error]>([
+    ['an UNAVAILABLE error (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('status')],
+    ['an UNCLASSIFIED error (ErrInternal)', () => errInternal()],
+    ['a base AgentDirectorError whose description carries a fake token', () => errGeneric('status', 'ErrBroken', `status refused (${sentinelInMessage('status')})`)],
+    ['a plain Error', () => new Error(`boom (${sentinelInMessage('plain')})`)],
+  ])('%s propagates to the caller as the same value, with no line, startup error or notice of its own', async (_label, build) => {
+    const err = build()
+    installStub({ statusError: err })
+
+    const r = await readQuietly()
+
+    expect('err' in r.outcome && r.outcome.err).toBe(err)
+    expectQuiet(r)
+    assertNoLeak({ errLog: r.errLog, startupLog: r.startupLog, notices, outageEmissions })
+  })
+
+  test.each<[string, () => Error, OutageClass]>([
+    ['agent-director unreachable', () => new ErrSystemInstallDisappeared('status', '/opt/ad/bin/agent-director'), 'ad-unreachable'],
+    ['tmux not available', () => new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not available'), 'tmux-unavailable'],
+  ])('goes through the outage wrapper: %s raises B\'s %s flag (and rethrows); a later read clears it with B\'s all-clear; A\'s flag is untouched', async (_label, build, flag) => {
+    setOutageFlag(A, 'ad-unreachable', '/opt/ad/bin/agent-director')
+    outageEmissions = []
+    const failure = build()
+    installStub({ statusError: failure })
+
+    const failed = await readQuietly()
+
+    expect('err' in failed.outcome && failed.outcome.err).toBe(failure)
+    expect([...getOutageFlags(B)]).toEqual([flag])
+    expect(outageEmissions.map((e) => e.key)).toEqual([B])
+
+    installStub({ statusResult: { state: 'pending' } })
+    const ok = await readQuietly()
+
+    expect(ok.outcome).toEqual({ ok: 'pending' })
+    expect([...getOutageFlags(B)]).toEqual([])
+    expect(outageEmissions.map((e) => e.key)).toEqual([B, B])
+    expect(outageEmissions[1]!.text).toContain('All clear')
+    expect([...getOutageFlags(A)]).toEqual(['ad-unreachable'])
+    expectQuiet(ok)
+  })
+
+  test.each<[string, () => Error, string]>([
+    ['an UNAVAILABLE error (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['an UNCLASSIFIED error (ErrInternal)', () => errInternal(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+  ])('inside a recovery attempt for B, %s is reported once to the installed sink with its cause (B only) and still propagates; outside any attempt, or inside one for A, nothing is reported', async (_label, build, cause) => {
+    installRecordingSink()
+    const err = build()
+    installStub({ statusError: err })
+
+    // Outside any attempt, and inside an attempt for another persona.
+    const outside = await readQuietly()
+    const otherAttempt = await readQuietly(() => runInAttempt(A, 'recovery', () => readPersonaRowState(B)))
+    expect(armed).toEqual([])
+
+    let attempt: AttemptView | undefined
+    const inside = await readQuietly(() => runInAttempt(B, 'recovery', (view) => {
+      attempt = view
+      return readPersonaRowState(B)
+    }))
+
+    for (const r of [outside, otherAttempt, inside]) expect('err' in r.outcome && r.outcome.err).toBe(err)
+    expect(armed).toEqual([{ key: B, kind: cause }])
+    expect(attempt!.lastError).toEqual({ verb: 'status', causeKind: cause, armed: true })
+    expectQuiet(inside)
+  })
+
+  test('inside a recovery attempt for B, no row (ErrSpawnNotFound) → absent, and nothing is reported to the sink', async () => {
+    installRecordingSink()
+    installStub({ statusError: new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'spawn not found') })
+
+    const r = await readQuietly(() => runInAttempt(B, 'recovery', () => readPersonaRowState(B)))
+
+    expect(r.outcome).toEqual({ ok: UNAVAILABLE_RETRY_ROW_ABSENT })
+    expect(armed).toEqual([])
+    expectQuiet(r)
+  })
+
+  test('inside a recovery attempt for B, a row read that succeeds reports nothing', async () => {
+    installRecordingSink()
+    installStub({ statusResult: { state: 'pending' } })
+
+    const r = await readQuietly(() => runInAttempt(B, 'recovery', () => readPersonaRowState(B)))
+
+    expect(r.outcome).toEqual({ ok: 'pending' })
+    expect(armed).toEqual([])
+    expectQuiet(r)
   })
 })
 

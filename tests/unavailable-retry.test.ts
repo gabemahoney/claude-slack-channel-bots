@@ -1,10 +1,11 @@
 /**
  * unavailable-retry.test.ts — The per-persona UNAVAILABLE retry timer
- * (b.jg5 SRJ-301 code line, SRJ-302, SRJ-303, SRJ-304, SRJ-305).
+ * (b.jg5 SRJ-301 code line, SRJ-302, SRJ-303, SRJ-304, SRJ-305, SRJ-306).
  *
  * The schedule, the never-give-up rule, arming while armed, isolation,
- * again-reasons and `close` run on the bare controller over `createFakeClock`
- * with a scripted action; settings independence runs on `makeRecoveryHarness`
+ * again-reasons and `close`, and the switch to pending-only mode, the last row
+ * read and a condition that ends during a run, run on the bare controller
+ * over `createFakeClock` with a scripted or held action; settings independence runs on `makeRecoveryHarness`
  * with its scripted action and a comment-stripped source audit. What arms the
  * timer (b.jg5 SRJ-301) runs on the harness with the controller as the outage
  * state's trigger sink: real launches through `spawnForPersona` over the
@@ -12,11 +13,13 @@
  * attempt. The shared findMissing sweep runs there too, its one call held
  * open by the test so each caller joins it before it fails.
  * The attempt frames run on the bare context with the controller as the sink.
- * The full-mode action's decisions run over a stand-in retry entry; the
- * full-mode retry end to end (AC 26, the in-flight skip, the row decisions,
- * the serializer wait) and the stop rules that exist now (AC 28) run on the
- * harness's default action, the real restart entry over the production
- * adapters and the stub.
+ * The retry action's decisions, in both modes, run over a stand-in row read
+ * and retry entry; the full-mode retry end to end (AC 26, the in-flight skip,
+ * the row decisions, the serializer wait), the stop rules that exist now
+ * (AC 28), pending-only mode (armed directly, AC 33's timer half) and the
+ * condition-end entry's pending and kill-failure exceptions (called directly,
+ * AC 30's timer half) run on the harness's default action, the real row read
+ * and restart entry over the production adapters and the stub.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -49,10 +52,12 @@ import {
   RESTART_OUTCOME_LAUNCHED,
   RESTART_OUTCOME_NOT_INITIALISED,
   RESTART_OUTCOME_NOT_UP,
+  RESTART_OUTCOME_PENDING_DEFERRED,
   RESTART_OUTCOME_RECONNECT_DEFERRED,
   RESTART_OUTCOME_RECONNECTED,
   RESTART_OUTCOME_REFUSED,
   RESTART_OUTCOME_SHUTTING_DOWN,
+  runRestartRetry,
   scheduleRestart,
   type RestartRetryOutcome,
 } from '../src/restart.ts'
@@ -60,6 +65,7 @@ import { _buildIsSessionAliveAdapter } from '../src/server.ts'
 import {
   _resetConfigDirFs,
   _setConfigDirFs,
+  isLaunchInFlight,
   killPersonaInstance,
   reconcileOrphans,
   sweepDeadTmuxChannel,
@@ -77,24 +83,41 @@ import {
   UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED,
   UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT,
   UNAVAILABLE_RETRY_AGAIN_LAUNCHED,
+  UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED,
   UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED,
   UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED,
+  UNAVAILABLE_RETRY_AGAIN_ROW_PENDING,
   UNAVAILABLE_RETRY_BASE_S,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
+  UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CEILING_S,
+  UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
+  UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
+  UNAVAILABLE_RETRY_KEPT_KILL_FAILED,
+  UNAVAILABLE_RETRY_KEPT_ROW_PENDING,
+  UNAVAILABLE_RETRY_MODE_FULL,
+  UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+  UNAVAILABLE_RETRY_ROW_ABSENT,
+  UNAVAILABLE_RETRY_ROW_PENDING,
   UNAVAILABLE_RETRY_STOP_CAPPED,
   UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED,
   UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
   UNAVAILABLE_RETRY_STOP_NOT_UP,
   UNAVAILABLE_RETRY_STOP_RECOVERED,
+  UNAVAILABLE_RETRY_STOP_ROW_GONE,
+  UNAVAILABLE_RETRY_STOP_ROW_LIVE,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
+  UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED,
+  UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   unavailableRetryCauseFor,
   type UnavailableRetryAction,
   type UnavailableRetryCause,
+  type UnavailableRetryCondition,
   type UnavailableRetryController,
+  type UnavailableRetryMode,
   type UnavailableRetryOutcome,
 } from '../src/unavailable-retry.ts'
 import {
@@ -172,7 +195,7 @@ function makeRig(action: UnavailableRetryAction = () => ({ kind: 'again' }), clo
     clock,
     log: (line) => { lines.push(line) },
     action: (key, attempt) => {
-      attempts.push({ key, retry: attempt.retry, causes: attempt.causes, at: clock.now() })
+      attempts.push({ key, retry: attempt.retry, causes: attempt.causes, mode: attempt.mode, at: clock.now() })
       return action(key, attempt)
     },
   })
@@ -181,16 +204,22 @@ function makeRig(action: UnavailableRetryAction = () => ({ kind: 'again' }), clo
   return rig
 }
 
-/** An action whose answers the test gives, one retry at a time. */
-function heldAction(): { action: UnavailableRetryAction; answer(outcome: UnavailableRetryOutcome): void } {
-  const waiting: Array<(outcome: UnavailableRetryOutcome) => void> = []
+/** An action whose answers (or rejections) the test gives, one retry at a time. */
+function heldAction(): {
+  action: UnavailableRetryAction
+  answer(outcome: UnavailableRetryOutcome): void
+  fail(err: Error): void
+} {
+  const waiting: Array<{ resolve: (outcome: UnavailableRetryOutcome) => void; reject: (err: Error) => void }> = []
+  const next = (): { resolve: (outcome: UnavailableRetryOutcome) => void; reject: (err: Error) => void } => {
+    const held = waiting.shift()
+    if (held === undefined) throw new Error('heldAction: no retry is waiting for an answer')
+    return held
+  }
   return {
-    action: () => new Promise<UnavailableRetryOutcome>((resolve) => { waiting.push(resolve) }),
-    answer: (outcome) => {
-      const next = waiting.shift()
-      if (next === undefined) throw new Error('heldAction: no retry is waiting for an answer')
-      next(outcome)
-    },
+    action: () => new Promise<UnavailableRetryOutcome>((resolve, reject) => { waiting.push({ resolve, reject }) }),
+    answer: (outcome) => next().resolve(outcome),
+    fail: (err) => next().reject(err),
   }
 }
 
@@ -239,7 +268,7 @@ describe('unavailable retry: the schedule', () => {
     controller.arm(KEY, UNAVAILABLE)
 
     expect(delays(clock)).toEqual([waitMs(0)])
-    expect(controller.view(KEY)).toEqual({ phase: 'waiting', dueAt: waitMs(0), waitMs: waitMs(0), refusals: 0, causes: ['unavailable'] })
+    expect(controller.view(KEY)).toEqual({ phase: 'waiting', dueAt: waitMs(0), waitMs: waitMs(0), refusals: 0, causes: ['unavailable'], mode: UNAVAILABLE_RETRY_MODE_FULL })
     expect(attempts).toEqual([])
   })
 
@@ -255,7 +284,7 @@ describe('unavailable retry: the schedule', () => {
       expect(attempts).toHaveLength(n)
       await clock.advance(1)
       expect(attempts).toHaveLength(n + 1)
-      expect(attempts[n]).toEqual({ key: KEY, retry: n + 1, causes: ['unavailable'], at: dueAt })
+      expect(attempts[n]).toEqual({ key: KEY, retry: n + 1, causes: ['unavailable'], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt })
     }
     expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', waitMs: UNAVAILABLE_RETRY_CEILING_S * 1000, refusals: steps })
   })
@@ -431,7 +460,7 @@ describe('unavailable retry: arming while armed', () => {
 
     controller.arm(KEY, { kind: 'status-error' })
     expect(clock.pendingCount()).toBe(0)
-    expect(controller.view(KEY)).toEqual({ phase: 'running', refusals: 0, causes: ['unavailable', 'status-error'] })
+    expect(controller.view(KEY)).toEqual({ phase: 'running', refusals: 0, causes: ['unavailable', 'status-error'], mode: UNAVAILABLE_RETRY_MODE_FULL })
 
     await clock.advance(waitMs(0) / 2)
     const runEnd = clock.now()
@@ -440,7 +469,7 @@ describe('unavailable retry: arming while armed', () => {
 
     expect(clock.pending().map((t) => t.dueAt)).toEqual([runEnd + waitMs(1)])
     await clock.advance(waitMs(1))
-    expect(attempts[1]).toEqual({ key: KEY, retry: 2, causes: ['unavailable', 'status-error'], at: runEnd + waitMs(1) })
+    expect(attempts[1]).toEqual({ key: KEY, retry: 2, causes: ['unavailable', 'status-error'], mode: UNAVAILABLE_RETRY_MODE_FULL, at: runEnd + waitMs(1) })
     held.answer({ kind: 'stop', reason: 'the test is over' })
     await controller.whenRunSettled(KEY)
   })
@@ -458,7 +487,7 @@ describe('unavailable retry: arming while armed', () => {
     held.answer({ kind: 'stop', reason: 'the old run ended' })
     await clock.flush()
     expect(attempts).toHaveLength(2)
-    expect(controller.view(KEY)).toEqual({ phase: 'running', refusals: 0, causes: ['unavailable'] })
+    expect(controller.view(KEY)).toEqual({ phase: 'running', refusals: 0, causes: ['unavailable'], mode: UNAVAILABLE_RETRY_MODE_FULL })
 
     held.answer({ kind: 'again' })
     await controller.whenRunSettled(KEY)
@@ -636,7 +665,7 @@ function armedResult(key: string, action: SpawnPersonaResult['action']): SpawnPe
 function expectArmedOnce(h: RecoveryHarness, key: string, kind: string): void {
   expect(h.triggers).toEqual([{ key, kind }])
   expect(h.controller.armedKeys()).toEqual([key])
-  expect(h.controller.view(key)).toEqual({ phase: 'waiting', dueAt: h.clock.now() + waitMs(0), waitMs: waitMs(0), refusals: 0, causes: [kind] })
+  expect(h.controller.view(key)).toEqual({ phase: 'waiting', dueAt: h.clock.now() + waitMs(0), waitMs: waitMs(0), refusals: 0, causes: [kind], mode: UNAVAILABLE_RETRY_MODE_FULL })
   expect(delays(h.clock)).toEqual([waitMs(0)])
   expect(h.attempts).toEqual([])
 }
@@ -838,7 +867,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     expect(h.attempts).toEqual([])
 
     await h.advance(1)
-    expect(h.attempts).toEqual([{ key, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], at: dueAt }])
+    expect(h.attempts).toEqual([{ key, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt }])
   })
 
   test('a launch that joins one in flight, which then fails UNAVAILABLE, gets the same marked result, and one timer is armed', async () => {
@@ -943,6 +972,7 @@ describe('unavailable retry: a shared findMissing sweep that fails arms each per
         waitMs: waitMs(0),
         refusals: 0,
         causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+        mode: UNAVAILABLE_RETRY_MODE_FULL,
       })
     }
     expect(delays(h.clock)).toEqual([waitMs(0), waitMs(0)])
@@ -1082,14 +1112,30 @@ describe('unavailable retry: an attempt started from a continuation that outlive
 // Again-reasons and close (b.jg5 SRJ-303, SRJ-305) on the bare controller
 // ---------------------------------------------------------------------------
 
-/** The line a retry answered `again` logs: its reason and the next wait, after `refusals` refusals. */
-function reArmedLine(key: string, retry: number, reason: string, refusals: number): string {
-  return `[slack] unavailable-retry: persona=${key} retry ${retry}: ${reason} — re-armed, next retry in ${waitMs(refusals) / 1000} s`
+/** How a re-armed line names the modes: the retry ran pending-only, and the mode the retry switched the timer to. */
+interface ReArmedModes {
+  readonly ranPendingOnly?: boolean
+  readonly switchedTo?: UnavailableRetryMode
 }
 
-/** The line a stopped timer logs. */
-function stoppedLine(key: string, reason: string): string {
-  return `[slack] unavailable-retry: persona=${key} stopped — ${reason}`
+/** The line a retry answered `again` logs: its reason and the next wait, after `refusals` refusals. */
+function reArmedLine(key: string, retry: number, reason: string, refusals: number, modes: ReArmedModes = {}): string {
+  const ran = modes.ranPendingOnly === true ? ` (${UNAVAILABLE_RETRY_MODE_PENDING_ONLY})` : ''
+  const switched = modes.switchedTo !== undefined ? ` in ${modes.switchedTo} mode` : ''
+  return `[slack] unavailable-retry: persona=${key} retry ${retry}${ran}: ${reason} — re-armed${switched}, next retry in ${waitMs(refusals) / 1000} s`
+}
+
+/** The line a stopped timer logs; `tags` are the parenthesised mode and row, when the stop names them. */
+function stoppedLine(key: string, reason: string, ...tags: string[]): string {
+  const tagged = tags.length > 0 ? ` (${tags.join(', ')})` : ''
+  return `[slack] unavailable-retry: persona=${key} stopped${tagged} — ${reason}`
+}
+
+/** The stopped line of a pending-only timer, naming the row its retry read when given. */
+function pendingOnlyStoppedLine(key: string, reason: string, row?: string): string {
+  return row === undefined
+    ? stoppedLine(key, reason, UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
+    : stoppedLine(key, reason, UNAVAILABLE_RETRY_MODE_PENDING_ONLY, `row ${row}`)
 }
 
 describe('unavailable retry: again-reasons and close', () => {
@@ -1144,14 +1190,30 @@ describe('unavailable retry: again-reasons and close', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The full-mode action (b.jg5 SRJ-303, SRJ-305) over a stand-in retry entry
+// The retry action (b.jg5 SRJ-303, SRJ-305), in both modes, over a stand-in
+// row read and retry entry
 // ---------------------------------------------------------------------------
 
-/** Full-mode deps whose retry entry answers `outcome`, recording each call; every gate open unless overridden. */
-function fullModeDeps(outcome: RestartRetryOutcome, overrides: Partial<FullModeRetryDeps> = {}): FullModeRetryDeps & { calls: string[][] } {
+/** Stand-in deps for the retry action: a row read and a retry entry that record each call, every gate open unless overridden. */
+interface StandInDeps extends FullModeRetryDeps {
+  /** Each retry entry call: the key and the working directory. */
+  readonly calls: string[][]
+  /** Each row read: the key, and whether it ran inside a recovery attempt for that key. */
+  readonly reads: Array<readonly [string, boolean]>
+}
+
+/** Stand-in deps whose retry entry answers `outcome` and whose row read answers `row` (or rejects with it, an Error). */
+function fullModeDeps(outcome: RestartRetryOutcome, overrides: Partial<FullModeRetryDeps> = {}, row: string | Error = 'waiting'): StandInDeps {
   const calls: string[][] = []
+  const reads: Array<readonly [string, boolean]> = []
   return {
     calls,
+    reads,
+    readRow: async (key) => {
+      reads.push([key, isInsideAttempt(key)])
+      if (row instanceof Error) throw row
+      return row
+    },
     retry: async (key, cwd) => {
       calls.push([key, cwd])
       return outcome
@@ -1165,7 +1227,11 @@ function fullModeDeps(outcome: RestartRetryOutcome, overrides: Partial<FullModeR
   }
 }
 
-describe('unavailable retry: the full-mode action’s decisions', () => {
+/** The first retry in each mode, as the controller tells the action. */
+const FULL_RETRY = { retry: 1, causes: [], mode: UNAVAILABLE_RETRY_MODE_FULL } as const
+const PENDING_ONLY_RETRY = { retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY } as const
+
+describe('unavailable retry: the retry action’s decisions over stand-ins', () => {
   test.each<[RestartRetryOutcome, UnavailableRetryOutcome]>([
     [RESTART_OUTCOME_ALREADY_CONNECTED, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_RECOVERED }],
     [RESTART_OUTCOME_RECONNECTED, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_RECOVERED }],
@@ -1177,25 +1243,56 @@ describe('unavailable retry: the full-mode action’s decisions', () => {
     [RESTART_OUTCOME_REFUSED, { kind: 'again' }],
     [RESTART_OUTCOME_COUNTED_FAILURE, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED }],
     [RESTART_OUTCOME_RECONNECT_DEFERRED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED }],
-    [RESTART_OUTCOME_LAUNCHED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED }],
+    [RESTART_OUTCOME_PENDING_DEFERRED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, row: UNAVAILABLE_RETRY_ROW_PENDING }],
+    [RESTART_OUTCOME_LAUNCHED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, row: UNAVAILABLE_RETRY_ROW_PENDING, switchToPendingOnly: true }],
     [RESTART_OUTCOME_NOT_INITIALISED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED }],
-  ])('a retry entry answering %s answers %o', async (outcome, answer) => {
+  ])('full mode: a retry entry answering %s answers %o, with no row read', async (outcome, answer) => {
     const deps = fullModeDeps(outcome)
 
-    expect(await createFullModeRetryAction(deps)(KEY, { retry: 1, causes: [] })).toEqual(answer)
+    expect(await createFullModeRetryAction(deps)(KEY, FULL_RETRY)).toEqual(answer)
     expect(deps.calls).toEqual([[KEY, `/work/${KEY}`]])
+    expect(deps.reads).toEqual([])
   })
 
-  test.each<[string, Partial<FullModeRetryDeps>, string]>([
+  test.each<[string, UnavailableRetryOutcome]>([
+    [UNAVAILABLE_RETRY_ROW_PENDING, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, row: UNAVAILABLE_RETRY_ROW_PENDING }],
+    ['waiting', { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE, row: 'waiting' }],
+    ['working', { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE, row: 'working' }],
+    ['check_permission', { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE, row: 'check_permission' }],
+  ])('pending-only: a row read %s answers %o, from the one read inside a recovery attempt and no retry entry call', async (row, answer) => {
+    const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, {}, row)
+
+    expect(await createFullModeRetryAction(deps)(KEY, PENDING_ONLY_RETRY)).toEqual(answer)
+    expect(deps.reads).toEqual([[KEY, true]])
+    expect(deps.calls).toEqual([])
+  })
+
+  test.each(['ended', 'missing', UNAVAILABLE_RETRY_ROW_ABSENT])('pending-only: a row read %s answers a stop whose hand-off, run once, is one retry entry call', async (row) => {
+    const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, {}, row)
+
+    const answer = await createFullModeRetryAction(deps)(KEY, PENDING_ONLY_RETRY)
+
+    expect(answer).toEqual({ kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_GONE, row, handOff: expect.any(Function) })
+    expect(deps.calls).toEqual([])
+    await (answer as { handOff: () => Promise<unknown> }).handOff()
+    expect(deps.calls).toEqual([[KEY, `/work/${KEY}`]])
+    expect(deps.reads).toEqual([[KEY, true]])
+  })
+
+  const GATES: ReadonlyArray<readonly [string, Partial<FullModeRetryDeps>, string]> = [
     ['shutting down (before everything else)', { isShuttingDown: () => true, appliedPersona: () => undefined, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_SHUTDOWN],
     ['not applied (before the up check)', { appliedPersona: () => undefined, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_APPLIED],
     ['not up (before the cap)', { canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_UP],
     ['at the restart cap', { isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_CAPPED],
-  ])('%s stops before the retry entry runs', async (_what, overrides, reason) => {
-    const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, overrides)
+  ]
+  const gatesByMode = [FULL_RETRY, PENDING_ONLY_RETRY].flatMap((attempt) => GATES.map(([what, overrides, reason]) => [attempt.mode, what, overrides, reason, attempt] as const))
 
-    expect(await createFullModeRetryAction(deps)(KEY, { retry: 1, causes: [] })).toEqual({ kind: 'stop', reason })
+  test.each(gatesByMode)('%s mode: %s stops before the row read or the retry entry runs', async (_mode, _what, overrides, reason, attempt) => {
+    const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, overrides, UNAVAILABLE_RETRY_ROW_PENDING)
+
+    expect(await createFullModeRetryAction(deps)(KEY, attempt)).toEqual({ kind: 'stop', reason })
     expect(deps.calls).toEqual([])
+    expect(deps.reads).toEqual([])
   })
 
   test('the entry gets the one in-flight predicate, and a retry entry that rejects rejects the action', async () => {
@@ -1210,8 +1307,32 @@ describe('unavailable retry: the full-mode action’s decisions', () => {
       },
     }))
 
-    await expect(action(KEY, { retry: 1, causes: [] })).rejects.toBe(err)
+    await expect(action(KEY, FULL_RETRY)).rejects.toBe(err)
     expect(given).toBe(isInFlight)
+  })
+
+  test.each<[string, () => boolean]>([
+    ['answers true', () => true],
+    ['throws (counted as in flight)', () => { throw new Error('the in-flight lookup failed') }],
+  ])('pending-only: an in-flight predicate that %s answers a launch-in-flight refusal on a pending row, with no row read and no retry entry call', async (_what, isInFlight) => {
+    const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, { isInFlight }, 'waiting')
+
+    expect(await createFullModeRetryAction(deps)(KEY, PENDING_ONLY_RETRY)).toEqual({
+      kind: 'again',
+      reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT,
+      row: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+    expect(deps.reads).toEqual([])
+    expect(deps.calls).toEqual([])
+  })
+
+  test('pending-only: a row read that rejects rejects the action, with no retry entry call', async () => {
+    const err = errCallTimeout('status')
+    const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, {}, err)
+
+    await expect(createFullModeRetryAction(deps)(KEY, PENDING_ONLY_RETRY)).rejects.toBe(err)
+    expect(deps.reads).toEqual([[KEY, true]])
+    expect(deps.calls).toEqual([])
   })
 })
 
@@ -1228,16 +1349,20 @@ type RowState = NonNullable<NonNullable<Parameters<typeof cannedStatusResult>[0]
 interface RowModel {
   /** The clock time of every spawn call, in order, over every persona. */
   readonly spawnedAt: number[]
+  /** From now on every instance, spawned ones included, reads `state` until its next spawn resolves. */
+  set(state: RowState): void
 }
 
 /**
  * Model each persona's row on the harness stub: `status` reads `initial`
- * until a spawn for that instance resolves, and `waiting` from then on. Every
- * spawn call's clock time is recorded.
+ * (`ErrSpawnNotFound` for `UNAVAILABLE_RETRY_ROW_ABSENT`, no row) until a
+ * spawn for that instance resolves, and `waiting` from then on; `set` starts
+ * that over from another state. Every spawn call's clock time is recorded.
  */
-function modelRow(h: RecoveryHarness, initial: RowState): RowModel {
+function modelRow(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT): RowModel {
   const spawnedAt: number[] = []
   const live = new Set<string>()
+  let before = initial
   const client = h.stub.client
   const spawn = client.spawn.bind(client)
   client.spawn = async (params) => {
@@ -1246,8 +1371,19 @@ function modelRow(h: RecoveryHarness, initial: RowState): RowModel {
     live.add(String(params.claude_instance_id))
     return result
   }
-  h.script({ statusFn: (params) => cannedStatusResult({ state: live.has(String(params.claude_instance_id)) ? 'waiting' : initial }) })
-  return { spawnedAt }
+  h.script({
+    statusFn: (params) => {
+      if (live.has(String(params.claude_instance_id))) return cannedStatusResult({ state: 'waiting' })
+      return before === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult({ state: before })
+    },
+  })
+  return {
+    spawnedAt,
+    set: (state) => {
+      before = state
+      live.clear()
+    },
+  }
 }
 
 /** Move the clock to persona `key`'s due time and let its retry, with any launch it makes, settle. */
@@ -1263,6 +1399,13 @@ function callCounts(h: RecoveryHarness): Record<string, number> {
   return Object.fromEntries(Object.entries(h.stub.calls).filter(([, calls]) => calls.length > 0).map(([verb, calls]) => [verb, calls.length]))
 }
 
+/** The stub's calls made since `before` (a `callCounts` snapshot), by verb, leaving out verbs not called since. */
+function callsSince(h: RecoveryHarness, before: Record<string, number>): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(callCounts(h)).map(([verb, n]) => [verb, n - (before[verb] ?? 0)] as const).filter(([, n]) => n > 0),
+  )
+}
+
 /** Arm `key` now and `other` half a base wait later, so `other`'s retry falls due after `key`'s first. */
 async function armBoth(h: RecoveryHarness, key: string, other: string): Promise<void> {
   h.controller.arm(key, UNAVAILABLE)
@@ -1275,7 +1418,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     if (harness !== undefined) assertNoLeak(harness.captured())
   })
 
-  test('AC 26: with both settings 0, a refused bring-up spawns at each due time and never early, counts nothing past the cap, launches once when the refusal clears, runs on at the next wait, and stops at the next retry with nothing pending', async () => {
+  test('AC 26: with both settings 0, a refused bring-up spawns at each due time and never early, counts nothing past the cap, launches once when the refusal clears, runs on at the next wait in pending-only mode, and its next retry reads the row once and stops with nothing pending', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key] = h.keys as [string]
@@ -1312,32 +1455,46 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     await h.advance(dueAt - h.clock.now())
     await h.settle()
     expect(row.spawnedAt.slice(refusals + 1)).toEqual([dueAt])
-    expect(h.lines).toContain(reArmedLine(key, refusals + 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, refusals + 1))
+    expect(h.lines).toContain(reArmedLine(key, refusals + 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, refusals + 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: dueAt + waitMs(refusals + 1),
       waitMs: waitMs(refusals + 1),
       refusals: refusals + 1,
       causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
     })
-    h.setConnected(key, true)
 
+    // The launch's row now reads `waiting` and the session is not connected:
+    // the pending-only retry reads the row, and nothing else, and stops.
+    const before = callCounts(h)
     await retryNow(h, key)
+    expect(h.attempts.at(-1)).toMatchObject({ key, retry: refusals + 2, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+    expect(h.stub.calls.statusCalls.at(-1)).toMatchObject({ claude_instance_id: personaInstanceId(key) })
     expect(row.spawnedAt).toHaveLength(refusals + 2)
-    expect(h.lines).toContain(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expect(h.lines).toContain(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
     expect(h.controller.isArmed(key)).toBe(false)
     expect(h.clock.pendingCount()).toBe(0)
     expect(getFailureCount(key)).toBe(0)
     expect(h.capReached).toEqual([])
   })
 
-  test.each<[string, RowState, boolean, Record<string, number>, UnavailableRetryOutcome]>([
-    ['live and connected with its stream: nothing left to recover, no launch', 'waiting', true, { statusCalls: 1 }, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_RECOVERED }],
-    ['live and not connected: a reconnect that succeeds, never a spawn, and nothing left to recover', 'waiting', false, { statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 }, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_RECOVERED }],
-    ['pending (live) and not connected: the reconnect defers, never a spawn, and the timer runs on', 'pending', false, { statusCalls: 2 }, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED }],
-    ['ended: a kill and a launch, and the timer runs on', 'ended', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED }],
-    ['missing: a kill and a launch, and the timer runs on', 'missing', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED }],
-  ])('a retry that finds the row %s', async (_what, state, connected, calls, answer) => {
+  /** A full-mode retry that re-arms: its again-reason, and the mode and last row read it leaves. */
+  interface ReArmed {
+    readonly reason: string
+    readonly mode: UnavailableRetryMode
+    readonly lastRow?: string
+  }
+
+  test.each<[string, RowState, boolean, Record<string, number>, string | ReArmed]>([
+    ['live and connected with its stream: nothing left to recover, no launch', 'waiting', true, { statusCalls: 1 }, UNAVAILABLE_RETRY_STOP_RECOVERED],
+    ['live and not connected: a reconnect that succeeds, never a spawn, and nothing left to recover', 'waiting', false, { statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 }, UNAVAILABLE_RETRY_STOP_RECOVERED],
+    ['pending (live) and not connected: the reconnect defers, never a spawn, and the timer runs on in full mode, its last row read pending', 'pending', false, { statusCalls: 2 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
+    ['ended: a kill and a launch, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'ended', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
+    ['missing: a kill and a launch, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'missing', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
+  ])('a retry that finds the row %s', async (_what, state, connected, calls, outcome) => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     modelRow(h, state)
@@ -1348,12 +1505,21 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
 
     expect(callCounts(h)).toEqual(calls)
     expect(h.controller.isArmed(other)).toBe(true)
-    if (answer.kind === 'stop') {
-      expect(h.lines).toContain(stoppedLine(key, answer.reason))
+    if (typeof outcome === 'string') {
+      expect(h.lines).toContain(stoppedLine(key, outcome))
       expect(h.controller.isArmed(key)).toBe(false)
     } else {
-      expect(h.lines).toContain(reArmedLine(key, 1, answer.reason!, 1))
-      expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(1), refusals: 1 })
+      const switchedTo = outcome.mode === UNAVAILABLE_RETRY_MODE_FULL ? undefined : outcome.mode
+      expect(h.lines).toContain(reArmedLine(key, 1, outcome.reason, 1, { switchedTo }))
+      expect(h.controller.view(key)).toEqual({
+        phase: 'waiting',
+        dueAt: h.clock.now() + waitMs(1),
+        waitMs: waitMs(1),
+        refusals: 1,
+        causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+        mode: outcome.mode,
+        ...(outcome.lastRow !== undefined ? { lastRow: outcome.lastRow } : {}),
+      })
     }
     expect(getFailureCount(key)).toBe(0)
   })
@@ -1520,5 +1686,721 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
       stoppedLine(other, UNAVAILABLE_RETRY_STOP_SHUTDOWN),
     ]))
     expect(h.lines.filter((line) => line.includes(`persona=${key} not armed (unavailable`))).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Pending-only mode (b.jg5 SRJ-301, SRJ-303, SRJ-305) on the recovery harness's
+// default action, armed directly (`armPendingOnly`) until covered `pending`
+// rows exist. The pending-row rule's runs and laps are later work: no case
+// here asserts one.
+// ---------------------------------------------------------------------------
+
+/** The line a direct pending-only arm logs. */
+function pendingOnlyArmedLine(key: string): string {
+  return `[slack] unavailable-retry: persona=${key} armed in pending-only mode (${UNAVAILABLE_RETRY_CAUSE_PENDING_ROW}) — first retry in ${waitMs(0) / 1000} s`
+}
+
+/** The line a pending-only retry logs as it starts. */
+function pendingOnlyRetryLine(key: string, retry: number): string {
+  return `[slack] unavailable-retry: persona=${key} retry ${retry} (pending-only) — reading its row`
+}
+
+/** The retry timer's lines for persona `key`, in order. */
+function retryLinesOf(h: RecoveryHarness, key: string): string[] {
+  return h.lines.filter((line) => line.startsWith(`[slack] unavailable-retry: persona=${key} `))
+}
+
+/** Persona `key`'s timer is stopped and nothing is pending on the clock. */
+function expectStopped(h: RecoveryHarness, key: string): void {
+  expect(h.controller.isArmed(key)).toBe(false)
+  expect(h.clock.pendingCount()).toBe(0)
+}
+
+describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301, SRJ-303, SRJ-305)', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test('a row still pending: armed at the base wait, each retry’s only agent-director call is its one row read, and the next wait doubles', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
+
+    h.controller.armPendingOnly(key)
+    expect(retryLinesOf(h, key)).toEqual([pendingOnlyArmedLine(key)])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(0),
+      waitMs: waitMs(0),
+      refusals: 0,
+      causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+      mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+
+    for (const retry of [1, 2]) {
+      const before = callCounts(h)
+      await retryNow(h, key)
+      expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+      expect(h.stub.calls.statusCalls.at(-1)).toEqual({ claude_instance_id: personaInstanceId(key) })
+      expect(retryLinesOf(h, key).slice(-2)).toEqual([
+        pendingOnlyRetryLine(key, retry),
+        reArmedLine(key, retry, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, retry, { ranPendingOnly: true }),
+      ])
+      expect(h.controller.view(key)).toEqual({
+        phase: 'waiting',
+        dueAt: h.clock.now() + waitMs(retry),
+        waitMs: waitMs(retry),
+        refusals: retry,
+        causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+        mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+        lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+      })
+    }
+    expect(h.attempts.map((a) => [a.key, a.mode])).toEqual([[key, UNAVAILABLE_RETRY_MODE_PENDING_ONLY], [key, UNAVAILABLE_RETRY_MODE_PENDING_ONLY]])
+    expect(h.triggers).toEqual([])
+    expect(h.controller.isArmed(other)).toBe(false)
+    expect(getFailureCount(key)).toBe(0)
+  })
+
+  test('a row reported in but not connected (waiting): the retry reads the row, makes no other call (no send-keys, spawn, resume or kill), and the timer stops', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, 'waiting')
+    h.setConnected(key, false)
+    h.controller.armPendingOnly(key)
+
+    await retryNow(h, key)
+
+    expect(callCounts(h)).toEqual({ statusCalls: 1 })
+    expect(retryLinesOf(h, key)).toEqual([
+      pendingOnlyArmedLine(key),
+      pendingOnlyRetryLine(key, 1),
+      pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'),
+    ])
+    expectStopped(h, key)
+  })
+
+  test.each(['ended', 'missing', UNAVAILABLE_RETRY_ROW_ABSENT] as const)('a row read %s: the timer stops, then one run of the restart decision (one kill, one launch), and the timer is done', async (state) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const row = modelRow(h, state)
+    h.controller.armPendingOnly(key)
+    const dueAt = h.controller.view(key)!.dueAt!
+
+    await retryNow(h, key)
+
+    // The row read, then the restart decision's liveness read, kill, spawn
+    // and readiness read.
+    expect(callCounts(h)).toEqual({ statusCalls: 3, killCalls: 1, spawnCalls: 1 })
+    expect(row.spawnedAt).toEqual([dueAt])
+    expect(retryLinesOf(h, key)).toEqual([
+      pendingOnlyArmedLine(key),
+      pendingOnlyRetryLine(key, 1),
+      pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_GONE, state),
+    ])
+    expect(h.triggers).toEqual([])
+    expectStopped(h, key)
+    expect(getFailureCount(key)).toBe(0)
+  })
+
+  test('a refused launch in that restart run arms a fresh full-mode timer through the trigger sink, after the stop', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, 'ended')
+    h.script({ spawnError: errTmuxUnresponsive('spawn') })
+    h.controller.armPendingOnly(key)
+
+    await retryNow(h, key)
+
+    expect(h.stub.calls.spawnCalls).toHaveLength(1)
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    const lines = retryLinesOf(h, key)
+    expect(lines.slice(0, 3)).toEqual([
+      pendingOnlyArmedLine(key),
+      pendingOnlyRetryLine(key, 1),
+      pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_GONE, 'ended'),
+    ])
+    expect(lines.slice(3)).toEqual([expect.stringMatching(new RegExp(`^\\[slack\\] unavailable-retry: persona=${key} armed \\(${UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE}: .* — first retry in ${waitMs(0) / 1000} s$`))])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(0),
+      waitMs: waitMs(0),
+      refusals: 0,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+    })
+    expect(delays(h.clock)).toEqual([waitMs(0)])
+    expect(getFailureCount(key)).toBe(0)
+  })
+
+  test('a full-mode cause while pending-only (a launch refused UNAVAILABLE) promotes the timer to full mode with its due time kept, and the next retry runs the full decision', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
+    h.controller.armPendingOnly(key)
+    const dueAt = h.controller.view(key)!.dueAt!
+    await h.advance(waitMs(0) / 2)
+
+    h.script({ spawnError: errTmuxUnresponsive('spawn') })
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    h.script({ spawnError: undefined })
+
+    expect(retryLinesOf(h, key).slice(1)).toEqual([
+      expect.stringMatching(new RegExp(`^\\[slack\\] unavailable-retry: persona=${key} promoted to full mode \\(${UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE}: .* — its due time is kept$`)),
+    ])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt,
+      waitMs: waitMs(0),
+      refusals: 0,
+      causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([dueAt])
+
+    // The full decision on a pending row: the liveness read and the
+    // reconnect's read, which defers; a pending-only retry would read once.
+    const before = callCounts(h)
+    await retryNow(h, key)
+    expect(h.attempts).toEqual([{ key, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt }])
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2 })
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1))
+    expect(h.controller.view(key)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+  })
+
+  test('a pending-only arm while in full mode leaves the timer in full mode with its due time, logs no line, and the next retry runs the full decision', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
+    h.controller.arm(key, UNAVAILABLE)
+    const dueAt = h.controller.view(key)!.dueAt!
+    await h.advance(waitMs(0) / 2)
+    const linesBefore = h.lines.length
+
+    h.controller.armPendingOnly(key)
+
+    expect(h.lines.slice(linesBefore)).toEqual([])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt,
+      waitMs: waitMs(0),
+      refusals: 0,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([dueAt])
+
+    await retryNow(h, key)
+    expect(h.attempts.map((a) => [a.mode, a.at])).toEqual([[UNAVAILABLE_RETRY_MODE_FULL, dueAt]])
+    expect(callCounts(h)).toEqual({ statusCalls: 2 })
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1))
+  })
+
+  test('a full-mode retry whose launch succeeds leaves the timer in pending-only mode, the wait count carrying on, and its next retry reads only the launch’s row', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const row = modelRow(h, 'missing')
+    h.controller.arm(key, UNAVAILABLE)
+
+    await retryNow(h, key)
+    expect(row.spawnedAt).toHaveLength(1)
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(1),
+      waitMs: waitMs(1),
+      refusals: 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+
+    // The launch's row reads pending: one read, a refusal at the doubled wait.
+    row.set(UNAVAILABLE_RETRY_ROW_PENDING)
+    const before = callCounts(h)
+    await retryNow(h, key)
+    expect(h.attempts.map((a) => a.mode)).toEqual([UNAVAILABLE_RETRY_MODE_FULL, UNAVAILABLE_RETRY_MODE_PENDING_ONLY])
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+    expect(h.stub.calls.statusCalls.at(-1)).toEqual({ claude_instance_id: personaInstanceId(key) })
+    expect(h.lines).toContain(reArmedLine(key, 2, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 2, { ranPendingOnly: true }))
+    expect(h.controller.view(key)).toMatchObject({ dueAt: h.clock.now() + waitMs(2), refusals: 2, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+  })
+
+  test('a pending-only retry that finds the launch in flight makes no agent-director call, keeps its row pending and re-arms at the doubled wait; once the launch settles the next retry reads the row once', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    h.controller.armPendingOnly(key)
+    const hold = holdSpawns(h.stub.client)
+    const launch = h.launch(key)
+    await hold.entered(personaInstanceId(key))
+    const before = h.stub.callCount()
+
+    await h.advance(h.controller.view(key)!.dueAt! - h.clock.now())
+
+    expect(h.stub.callCount()).toBe(before)
+    expect(retryLinesOf(h, key).slice(-2)).toEqual([
+      pendingOnlyRetryLine(key, 1),
+      `[slack] unavailable-retry: persona=${key} retry 1 (pending-only): ${UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT} — re-armed, next retry in ${waitMs(1) / 1000} s`,
+    ])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(1),
+      waitMs: waitMs(1),
+      refusals: 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+      mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+
+    // The launch settles and its row reads waiting (the stub's default): the
+    // next retry's one call is its row read, and the timer stops.
+    hold.release(personaInstanceId(key))
+    expect(await launch).toMatchObject({ key, action: 'spawned' })
+    await h.settle()
+    const settled = callCounts(h)
+    await retryNow(h, key)
+
+    expect(callsSince(h, settled)).toEqual({ statusCalls: 1 })
+    expect(hold.calls).toHaveLength(1)
+    expect(h.attempts.map((a) => [a.retry, a.mode])).toEqual([[1, UNAVAILABLE_RETRY_MODE_PENDING_ONLY], [2, UNAVAILABLE_RETRY_MODE_PENDING_ONLY]])
+    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
+    expectStopped(h, key)
+  })
+
+  test.each<[string, () => Error, string]>([
+    ['UNAVAILABLE (ErrCallTimeout)', () => errCallTimeout('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['a GONE answer (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(undefined, 'status'), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+  ])('a row read that fails with %s is a cause inside the attempt: it promotes the timer to full mode, and the failed retry re-arms at the next wait', async (_what, make, kind) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    h.script({ statusError: make() })
+    h.controller.armPendingOnly(key)
+
+    await retryNow(h, key)
+
+    expect(callCounts(h)).toEqual({ statusCalls: 1 })
+    expect(h.triggers).toEqual([{ key, kind }])
+    expect(retryLinesOf(h, key).slice(1)).toEqual([
+      pendingOnlyRetryLine(key, 1),
+      expect.stringMatching(new RegExp(`^\\[slack\\] unavailable-retry: persona=${key} promoted to full mode \\(${kind}: .* — its due time is kept$`)),
+      expect.stringMatching(new RegExp(`^\\[slack\\] unavailable-retry: persona=${key} retry 1 \\(pending-only\\): the retry failed: .* — re-armed in full mode, next retry in ${waitMs(1) / 1000} s$`)),
+    ])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(1),
+      waitMs: waitMs(1),
+      refusals: 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, kind],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+
+    // The next retry runs the full decision: connected with its stream,
+    // nothing left to recover (a pending-only retry would stop on the row).
+    h.script({ statusError: undefined })
+    h.setConnected(key, true)
+    await retryNow(h, key)
+    expect(h.attempts.map((a) => a.mode)).toEqual([UNAVAILABLE_RETRY_MODE_PENDING_ONLY, UNAVAILABLE_RETRY_MODE_FULL])
+    expect(h.lines).toContain(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expectStopped(h, key)
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>, string, number]>([
+    ['shutdown', async (h) => h.shutdown(), UNAVAILABLE_RETRY_STOP_SHUTDOWN, 0],
+    ['teardown', async (h, key) => h.teardown(key), UNAVAILABLE_RETRY_STOP_TORN_DOWN, 0],
+    ['not up (its next retry)', async (h, key) => {
+      h.setUp(key, false)
+      await retryNow(h, key)
+    }, UNAVAILABLE_RETRY_STOP_NOT_UP, 1],
+  ])('%s still stops a pending-only timer, with no agent-director call', async (_what, drive, reason, retries) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
+    h.controller.armPendingOnly(key)
+
+    await drive(h, key)
+    await h.advance(waitMs(refusalsToCeiling()) * 2)
+
+    expect(h.attempts).toHaveLength(retries)
+    expect(h.stub.callCount()).toBe(0)
+    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, reason))
+    expectStopped(h, key)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The pending and kill-failure exceptions (b.jg5 SRJ-306): the condition-end
+// entry, called directly here as the conditions' owners will call it
+// ---------------------------------------------------------------------------
+
+/** Each condition, with the reason its end stops a timer under. */
+const CONDITION_ENDS: ReadonlyArray<readonly [UnavailableRetryCondition, string]> = [
+  [UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED],
+  [UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE, UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED],
+]
+
+/** The line the condition-end entry logs when an exception keeps the timer. */
+function keptLine(key: string, ended: string, why: string): string {
+  return `[slack] unavailable-retry: persona=${key} kept — ${ended}, but ${why}`
+}
+
+/** Tell the entry each condition ended; each keeps persona `key`'s timer as it was, with one kept line naming `why`. */
+function expectKeptThroughEveryConditionEnd(h: RecoveryHarness, key: string, why: string): void {
+  const before = h.controller.view(key)!
+  for (const [condition, ended] of CONDITION_ENDS) {
+    expect(h.controller.conditionEnded(key, condition)).toBe('kept')
+    expect(h.lines.at(-1)).toBe(keptLine(key, ended, why))
+  }
+  expect(h.controller.view(key)).toEqual(before)
+  expect(h.clock.pending().map((t) => t.dueAt)).toEqual([before.dueAt!])
+}
+
+describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
+    ['armed pending-only directly', async (h, key) => h.controller.armPendingOnly(key)],
+    ['a full-mode retry deferred on the pending row', async (h, key) => {
+      h.controller.arm(key, UNAVAILABLE)
+      await retryNow(h, key)
+    }],
+  ])('with its last row read pending (%s), the condition-end entry keeps the timer with its due time, for either condition', async (_how, arm) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
+    await arm(h, key)
+    expect(h.controller.view(key)?.lastRow).toBe(UNAVAILABLE_RETRY_ROW_PENDING)
+
+    expectKeptThroughEveryConditionEnd(h, key, UNAVAILABLE_RETRY_KEPT_ROW_PENDING)
+  })
+
+  test('once a retry reads the row out of pending, the same entry stops the timer', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const row = modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
+    h.controller.arm(key, UNAVAILABLE)
+    await retryNow(h, key)
+    expectKeptThroughEveryConditionEnd(h, key, UNAVAILABLE_RETRY_KEPT_ROW_PENDING)
+
+    // The next retry reads the row ended and relaunches: the timer runs on,
+    // pending-only, its last row read the launch's pending, so it is kept.
+    row.set('ended')
+    await retryNow(h, key)
+    expect(row.spawnedAt).toHaveLength(1)
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+    expectKeptThroughEveryConditionEnd(h, key, UNAVAILABLE_RETRY_KEPT_ROW_PENDING)
+
+    // A retry that answers a row out of pending records it as the last read.
+    h.setAction(async () => ({ kind: 'again', row: 'waiting' }))
+    await retryNow(h, key)
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: 'waiting' })
+
+    expect(h.controller.conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE)).toBe('stopped')
+    expect(h.lines.at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED))
+    expectStopped(h, key)
+  })
+
+  test.each(CONDITION_ENDS)('with the row not pending and no other cause, the end of %s stops the timer; with no timer armed the entry answers not-armed and logs nothing', async (condition, ended) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    h.controller.arm(key, UNAVAILABLE)
+
+    expect(h.controller.conditionEnded(key, condition)).toBe('stopped')
+    expect(h.lines.at(-1)).toBe(stoppedLine(key, ended))
+    expectStopped(h, key)
+
+    const linesBefore = h.lines.length
+    expect(h.controller.conditionEnded(other, condition)).toBe('not-armed')
+    expect(h.controller.conditionEnded(key, condition)).toBe('not-armed')
+    expect(h.lines.slice(linesBefore)).toEqual([])
+    expect(h.attempts).toEqual([])
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>, string]>([
+    ['a retry that finds nothing left to recover', async (h, key) => {
+      h.setConnected(key, true)
+      await retryNow(h, key)
+    }, UNAVAILABLE_RETRY_STOP_RECOVERED],
+    ['the restart cap', async (h, key) => {
+      for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(key)
+      await retryNow(h, key)
+    }, UNAVAILABLE_RETRY_STOP_CAPPED],
+    ['teardown', async (h, key) => h.teardown(key), UNAVAILABLE_RETRY_STOP_TORN_DOWN],
+    ['shutdown', async (h) => h.shutdown(), UNAVAILABLE_RETRY_STOP_SHUTDOWN],
+  ])('a timer armed by ErrTmuxKillFailed inside a recovery attempt is kept by the condition-end entry, and stopped by %s', async (_rule, stop, reason) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, 'ended')
+    h.script({ killError: errTmuxKillFailed() })
+
+    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_LAUNCHED)
+    await h.settle()
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(0),
+      waitMs: waitMs(0),
+      refusals: 0,
+      causes: [UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+    })
+    expectKeptThroughEveryConditionEnd(h, key, UNAVAILABLE_RETRY_KEPT_KILL_FAILED)
+
+    await stop(h, key)
+
+    expect(h.lines).toContain(stoppedLine(key, reason))
+    expectStopped(h, key)
+  })
+
+  test('a full-mode retry whose kill fails with ErrTmuxKillFailed and whose launch then succeeds stays in full mode, its last row read pending, and the next retry runs the full decision', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, 'ended')
+    h.script({ killError: errTmuxKillFailed() })
+    h.controller.arm(key, UNAVAILABLE)
+
+    await retryNow(h, key)
+
+    expect(callCounts(h)).toEqual({ statusCalls: 2, killCalls: 1, spawnCalls: 1 })
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1))
+    expect(h.lines.filter((line) => line.includes(' in pending-only mode'))).toEqual([])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(1),
+      waitMs: waitMs(1),
+      refusals: 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+    expectKeptThroughEveryConditionEnd(h, key, `${UNAVAILABLE_RETRY_KEPT_ROW_PENDING} and ${UNAVAILABLE_RETRY_KEPT_KILL_FAILED}`)
+
+    // The full decision on the launch's live row, connected with its stream:
+    // one liveness read and nothing left to recover (a pending-only retry
+    // would stop on the row read instead).
+    h.setConnected(key, true)
+    const before = callCounts(h)
+    await retryNow(h, key)
+    expect(h.attempts.map((a) => a.mode)).toEqual([UNAVAILABLE_RETRY_MODE_FULL, UNAVAILABLE_RETRY_MODE_FULL])
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expectStopped(h, key)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The switch to pending-only mode, the last row read and a condition that
+// ends during a run (b.jg5 SRJ-301, SRJ-305, SRJ-306), on the bare controller
+// with a held stand-in action
+// ---------------------------------------------------------------------------
+
+/** What the retry action answers for a full-mode retry whose launch succeeded. */
+const LAUNCHED_ANSWER: UnavailableRetryOutcome = {
+  kind: 'again',
+  reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED,
+  row: UNAVAILABLE_RETRY_ROW_PENDING,
+  switchToPendingOnly: true,
+}
+
+/** A bare rig over a held action whose first retry, armed by `arm`, is running now. */
+async function heldRun(arm: (controller: UnavailableRetryController) => void): Promise<Rig & { held: ReturnType<typeof heldAction> }> {
+  const held = heldAction()
+  const rig = makeRig(held.action)
+  arm(rig.controller)
+  await rig.clock.advance(waitMs(0))
+  expect(rig.controller.view(KEY)?.phase).toBe('running')
+  return { ...rig, held }
+}
+
+const armUnavailable = (controller: UnavailableRetryController): void => controller.arm(KEY, UNAVAILABLE)
+
+describe('unavailable retry: the switch, the last row read and a condition end during a run (SRJ-301, SRJ-306)', () => {
+  test.each<[string, (c: UnavailableRetryController) => void, (c: UnavailableRetryController) => void, UnavailableRetryMode, string[]]>([
+    ['no other cause: the switch is taken', armUnavailable, () => {}, UNAVAILABLE_RETRY_MODE_PENDING_ONLY, [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE]],
+    ['unavailable armed during the run: another cause, so it stays in full mode', armUnavailable, armUnavailable, UNAVAILABLE_RETRY_MODE_FULL, [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE]],
+    ['a kill-failed cause recorded before the run: it stays in full mode', (c) => c.arm(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }), () => {}, UNAVAILABLE_RETRY_MODE_FULL, [UNAVAILABLE_RETRY_CAUSE_KILL_FAILED]],
+  ])('a launched answer with %s; the last row read is pending either way, and the next retry runs in that mode', async (_what, arm, during, mode, causes) => {
+    const { clock, controller, lines, attempts, held } = await heldRun(arm)
+    during(controller)
+
+    held.answer(LAUNCHED_ANSWER)
+    await controller.whenRunSettled(KEY)
+
+    const switchedTo = mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY ? mode : undefined
+    expect(lines.at(-1)).toBe(reArmedLine(KEY, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo }))
+    expect(lines.filter((line) => line.includes('promoted'))).toEqual([])
+    expect(controller.view(KEY)).toEqual({
+      phase: 'waiting',
+      dueAt: clock.now() + waitMs(1),
+      waitMs: waitMs(1),
+      refusals: 1,
+      causes,
+      mode,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+
+    await clock.advance(waitMs(1))
+    expect(attempts.map((a) => a.mode)).toEqual([UNAVAILABLE_RETRY_MODE_FULL, mode])
+    held.answer({ kind: 'stop', reason: 'the test is over' })
+    await controller.whenRunSettled(KEY)
+  })
+
+  test.each<[string, boolean, UnavailableRetryOutcome, string | undefined]>([
+    ['during the run, then an again with no row: the row stays pending, and a condition end keeps the timer', true, { kind: 'again' }, UNAVAILABLE_RETRY_ROW_PENDING],
+    ['during the run, then an again with its own row: the answer’s row wins, and a condition end stops the timer', true, { kind: 'again', row: 'waiting' }, 'waiting'],
+    ['before the run, then an again with no row: the again clears it, and a condition end stops the timer', false, { kind: 'again' }, undefined],
+  ])('armPendingOnly on a full-mode timer %s', async (_what, duringRun, answer, lastRow) => {
+    const { controller, lines, held } = await heldRun((c) => {
+      c.arm(KEY, UNAVAILABLE)
+      if (!duringRun) c.armPendingOnly(KEY)
+    })
+    if (duringRun) controller.armPendingOnly(KEY)
+    expect(controller.view(KEY)?.lastRow).toBe(UNAVAILABLE_RETRY_ROW_PENDING)
+
+    held.answer(answer)
+    await controller.whenRunSettled(KEY)
+
+    const view = controller.view(KEY)!
+    expect(view).toMatchObject({ phase: 'waiting', refusals: 1, causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], mode: UNAVAILABLE_RETRY_MODE_FULL })
+    expect(view.lastRow).toBe(lastRow)
+
+    const [condition, ended] = CONDITION_ENDS[0]!
+    if (lastRow === UNAVAILABLE_RETRY_ROW_PENDING) {
+      expect(controller.conditionEnded(KEY, condition)).toBe('kept')
+      expect(lines.at(-1)).toBe(keptLine(KEY, ended, UNAVAILABLE_RETRY_KEPT_ROW_PENDING))
+      expect(controller.view(KEY)).toEqual(view)
+    } else {
+      expect(controller.conditionEnded(KEY, condition)).toBe('stopped')
+      expect(lines.at(-1)).toBe(stoppedLine(KEY, ended))
+      expect(controller.isArmed(KEY)).toBe(false)
+    }
+  })
+
+  test.each(CONDITION_ENDS)('the end of %s during a run answering launched is deferred with no line, then kept after the answer: one kept line, then the re-armed line in pending-only mode', async (condition, ended) => {
+    const { clock, controller, lines, held } = await heldRun(armUnavailable)
+    const linesBefore = lines.length
+
+    expect(controller.conditionEnded(KEY, condition)).toBe('deferred')
+    expect(lines.slice(linesBefore)).toEqual([])
+    expect(controller.view(KEY)?.phase).toBe('running')
+
+    held.answer(LAUNCHED_ANSWER)
+    await controller.whenRunSettled(KEY)
+
+    expect(lines.slice(linesBefore)).toEqual([
+      keptLine(KEY, ended, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
+      reArmedLine(KEY, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }),
+    ])
+    expect(controller.view(KEY)).toEqual({
+      phase: 'waiting',
+      dueAt: clock.now() + waitMs(1),
+      waitMs: waitMs(1),
+      refusals: 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+    expect(clock.pending().map((t) => t.dueAt)).toEqual([clock.now() + waitMs(1)])
+  })
+
+  test.each<[UnavailableRetryCondition, string, UnavailableRetryOutcome]>([
+    [CONDITION_ENDS[0]![0], CONDITION_ENDS[0]![1], { kind: 'again' }],
+    [CONDITION_ENDS[1]![0], CONDITION_ENDS[1]![1], { kind: 'again', row: 'waiting' }],
+  ])('the end of %s during a run answering %o, with no pending row and no kill-failed cause, stops the timer after the run with the condition’s reason and nothing pending', async (condition, ended, answer) => {
+    const { clock, controller, lines, held } = await heldRun(armUnavailable)
+    const linesBefore = lines.length
+
+    expect(controller.conditionEnded(KEY, condition)).toBe('deferred')
+    held.answer(answer)
+    await controller.whenRunSettled(KEY)
+
+    expect(lines.slice(linesBefore)).toEqual([stoppedLine(KEY, ended)])
+    expect(controller.isArmed(KEY)).toBe(false)
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test.each<[string, (c: UnavailableRetryController) => void, (held: ReturnType<typeof heldAction>) => void, string, boolean]>([
+    ['its row last read pending (armed pending-only), and the run fails', (c) => c.armPendingOnly(KEY), (held) => held.fail(new Error('the retry broke')), UNAVAILABLE_RETRY_KEPT_ROW_PENDING, true],
+    ['a kill-failed cause recorded, and the run answers again', (c) => c.arm(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }), (held) => held.answer({ kind: 'again' }), UNAVAILABLE_RETRY_KEPT_KILL_FAILED, false],
+  ])('a condition end deferred during a run is kept after it with %s: one kept line, then the re-armed line', async (_what, arm, finish, why, ranPendingOnly) => {
+    const { clock, controller, lines, held } = await heldRun(arm)
+    const linesBefore = lines.length
+    const [condition, ended] = CONDITION_ENDS[1]!
+
+    expect(controller.conditionEnded(KEY, condition)).toBe('deferred')
+    finish(held)
+    await controller.whenRunSettled(KEY)
+
+    const ran = ranPendingOnly ? ` (${UNAVAILABLE_RETRY_MODE_PENDING_ONLY})` : ''
+    expect(lines.slice(linesBefore)).toEqual([
+      keptLine(KEY, ended, why),
+      expect.stringMatching(new RegExp(`^\\[slack\\] unavailable-retry: persona=${KEY} retry 1${ran.replace(/[()]/g, '\\$&')}: .* — re-armed, next retry in ${waitMs(1) / 1000} s$`)),
+    ])
+    expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', dueAt: clock.now() + waitMs(1), refusals: 1 })
+  })
+
+  test.each<[string, (c: UnavailableRetryController, held: ReturnType<typeof heldAction>) => void, string]>([
+    ['a stop answer', (_c, held) => held.answer({ kind: 'stop', reason: 'the persona recovered' }), 'the persona recovered'],
+    ['a stop during the run (its again answer dropped)', (c, held) => {
+      c.stop(KEY, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+      held.answer({ kind: 'again' })
+    }, UNAVAILABLE_RETRY_STOP_TORN_DOWN],
+  ])('a condition end deferred during a run is moot after %s: only that stopped line', async (_what, finish, reason) => {
+    const { clock, controller, lines, held } = await heldRun(armUnavailable)
+    const linesBefore = lines.length
+
+    expect(controller.conditionEnded(KEY, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE)).toBe('deferred')
+    finish(controller, held)
+    await controller.whenRunSettled(KEY)
+
+    expect(lines.slice(linesBefore)).toEqual([stoppedLine(KEY, reason)])
+    expect(controller.isArmed(KEY)).toBe(false)
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test('two condition ends during one run answering launched: the latest condition, kept once; the next run applies none', async () => {
+    const { clock, controller, lines, held } = await heldRun(armUnavailable)
+    const linesBefore = lines.length
+
+    expect(controller.conditionEnded(KEY, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE)).toBe('deferred')
+    expect(controller.conditionEnded(KEY, UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE)).toBe('deferred')
+    held.answer(LAUNCHED_ANSWER)
+    await controller.whenRunSettled(KEY)
+
+    expect(lines.slice(linesBefore)).toEqual([
+      keptLine(KEY, UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
+      reArmedLine(KEY, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }),
+    ])
+
+    // The recorded end was applied once and cleared: a later run whose row is
+    // out of pending re-arms with no kept or stopped line.
+    await clock.advance(waitMs(1))
+    const nextBefore = lines.length
+    held.answer({ kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, row: 'waiting' })
+    await controller.whenRunSettled(KEY)
+    expect(lines.slice(nextBefore)).toEqual([reArmedLine(KEY, 2, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 2, { ranPendingOnly: true })])
+    expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', refusals: 2, lastRow: 'waiting' })
+  })
+
+  test('two condition ends during one run answering again with no row: the latest condition’s reason, stopped once', async () => {
+    const { clock, controller, lines, held } = await heldRun(armUnavailable)
+    const linesBefore = lines.length
+
+    expect(controller.conditionEnded(KEY, UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE)).toBe('deferred')
+    expect(controller.conditionEnded(KEY, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE)).toBe('deferred')
+    held.answer({ kind: 'again' })
+    await controller.whenRunSettled(KEY)
+
+    expect(lines.slice(linesBefore)).toEqual([stoppedLine(KEY, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED)])
+    expect(controller.isArmed(KEY)).toBe(false)
+    expect(clock.pendingCount()).toBe(0)
   })
 })

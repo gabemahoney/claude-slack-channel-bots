@@ -100,6 +100,7 @@ import {
   notifyPersonaNotConnected,
   notifyRestartCapReached,
   PROMPT_ROW_STATES,
+  readPersonaRowState,
   reconcileOrphans,
   reconnectMcpWithCause,
   setConfigDirUnresolvableHook,
@@ -1196,9 +1197,11 @@ export function _buildKillSessionAdapter(
  * b.dup — a row agent-director will not type into. agent-director refuses
  * send-keys to a row that is not interactive (`ErrSpawnNotInteractive`):
  *   - `pending` (its session has not started; SessionStart has not fired) →
- *     defer ('transient'), typing nothing (`deferPendingRow`): the keystrokes
+ *     defer ('pending'), typing nothing (`deferPendingRow`): the keystrokes
  *     would be refused, and the session connects its MCP servers on its own
- *     once it starts.
+ *     once it starts. restart.ts treats it as it treats 'transient', and
+ *     answers `RESTART_OUTCOME_PENDING_DEFERRED`, so the UNAVAILABLE retry
+ *     timer knows the row read `pending`.
  *   - `ended` or `missing` — read here, or reached between this status read
  *     and the keystrokes (a findMissing sweep, such as the one another
  *     persona's launch wait starts with, marked the row missing) → the
@@ -1216,7 +1219,7 @@ export function _buildKillSessionAdapter(
  */
 export function _buildReconnectSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
-): (key: string) => Promise<'success' | 'escalate-dead' | 'transient'> {
+): (key: string) => Promise<'success' | 'escalate-dead' | 'transient' | 'pending'> {
   // `key` is the persona key.
   return async (key: string) => {
     let state: string
@@ -1371,13 +1374,13 @@ function deferPromptRow(key: string, state: string): 'transient' {
  * and the session connects its MCP servers on its own once it starts. Types
  * nothing, raises no notice (a launch whose session never leaves `pending`
  * raises its own, from its dialog approver), logs the deferral and returns
- * 'transient'; a later tick retries.
+ * 'pending', a deferral like 'transient'; a later tick retries.
  */
-function deferPendingRow(key: string): 'transient' {
+function deferPendingRow(key: string): 'pending' {
   console.error(
     `[slack] reconnectSession: persona=${key} is pending — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; not typing /mcp reconnect, deferring to a later tick (b.dup)`,
   )
-  return 'transient'
+  return 'pending'
 }
 
 /**
@@ -1662,10 +1665,11 @@ export async function main(): Promise<void> {
   // b.jg5 SRJ-301, SRJ-303, SRJ-305: one UNAVAILABLE retry controller, on the
   // system clock, installed below as the outage state's trigger sink before
   // the start pass (whose launches are the first attempts that can arm it).
-  // A retry reruns the restart path's decision through the restart module's
-  // retry entry, and so through the one per-persona serializer initRestart
-  // gets; it stops on shutdown, a persona no longer applied, not up (the
-  // relaunch gate) or at the restart cap. The gate is built further down and
+  // A full-mode retry reruns the restart path's decision through the restart
+  // module's retry entry, and so through the one per-persona serializer
+  // initRestart gets; a pending-only retry reads the persona's row with the
+  // session manager's row read. Either stops on shutdown, a persona no longer
+  // applied, not up (the relaunch gate) or at the restart cap. The gate is built further down and
   // initRestart runs later still: no statement in between awaits, and no
   // retry falls due before 30 s. Dry run arms nothing, since it makes no
   // agent-director call.
@@ -1678,6 +1682,7 @@ export async function main(): Promise<void> {
       isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
       isShuttingDown: () => shuttingDown,
       isInFlight: isLaunchInFlight,
+      readRow: readPersonaRowState,
     }),
   })
   unavailableRetry = retryTimers

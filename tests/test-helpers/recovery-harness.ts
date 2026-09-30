@@ -10,14 +10,16 @@
  * - `controller`: the server's UNAVAILABLE retry controller
  *   (`createUnavailableRetryController`) on the harness clock. Its log lines
  *   go to `lines`. Its retry action is a delegate: every retry is recorded in
- *   `attempts` (persona key, retry number, cause kinds and the clock time),
- *   then answered by the current action. The default action is
- *   `fullModeAction`, the server's full-mode action
+ *   `attempts` (persona key, retry number, cause kinds, mode and the clock
+ *   time), then answered by the current action. The default action is
+ *   `fullModeAction`, the server's retry action for both modes
  *   (`createFullModeRetryAction`) over the real restart module's retry entry
- *   (`runRestartRetry`), wired as `main()` wires it: the applied-persona
- *   lookup over the live applied set, the relaunch gate below, the restart
- *   cap (`isAtCap` at `RESTART_FAILURE_CAP`), the harness's shutting-down
- *   flag and the session manager's `isLaunchInFlight`. `scriptedAction` is
+ *   (`runRestartRetry`), wired as `main()` wires it: the session manager's
+ *   row read (`readPersonaRowState`, a pending-only retry's one `status`
+ *   call), the applied-persona lookup over the live applied set, the
+ *   relaunch gate below, the restart cap (`isAtCap` at
+ *   `RESTART_FAILURE_CAP`), the harness's shutting-down flag and the session
+ *   manager's `isLaunchInFlight`. `scriptedAction` is
  *   the scripted action: it answers each persona's queued outcomes
  *   (`answer(key, ...outcomes)`) in order and, once they run out, a bare
  *   refusal (`{ kind: 'again' }`). `options.action` replaces the default
@@ -103,8 +105,9 @@
  *   undoing everything, when a timer is still pending on the clock or a
  *   persona is still armed.
  *
- * Later work extends this harness in place (the pending-row rule, the latch
- * and the episodes).
+ * Pending-only mode is armed directly (`controller.armPendingOnly`) until
+ * covered `pending` rows exist. Later work extends this harness in place (the
+ * pending-row rule, the latch and the episodes).
  *
  * Isolation: no top-level `mock.module()`, no real HOME, `~/.agent-director`,
  * tmux or child process. The retry timer runs on the fake clock only; the one
@@ -139,6 +142,7 @@ import {
   isLaunchInFlight,
   launchSession,
   notifyRestartCapReached,
+  readPersonaRowState,
   setSessionNotifier,
   spawnForPersona,
   whenLaunchSettled,
@@ -152,6 +156,7 @@ import {
   type UnavailableRetryAction,
   type UnavailableRetryTriggerSink,
   type UnavailableRetryController,
+  type UnavailableRetryMode,
   type UnavailableRetryOutcome,
 } from '../../src/unavailable-retry.ts'
 import { writeAgentDirectorConfig, type AdConfigInput } from './ad-settings.ts'
@@ -214,6 +219,8 @@ export interface RecoveryAttempt {
   readonly key: string
   readonly retry: number
   readonly causes: readonly string[]
+  /** The mode the retry ran in. */
+  readonly mode: UnavailableRetryMode
   /** The clock time the retry ran at, in ms. */
   readonly at: number
 }
@@ -242,7 +249,7 @@ export interface RecoveryHarness {
   readonly capReached: string[]
   /** The per-persona serializer the restart module runs its work through. */
   readonly serializer: PersonaSerializer
-  /** The server's full-mode retry action over the real restart entry (the default). */
+  /** The server's retry action, for both modes, over the real row read and restart entry (the default). */
   readonly fullModeAction: UnavailableRetryAction
   /** The scripted action (`answer`). */
   readonly scriptedAction: UnavailableRetryAction
@@ -313,6 +320,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const queued = new Map<string, UnavailableRetryOutcome[]>()
   const scripted: UnavailableRetryAction = (key) => queued.get(key)?.shift() ?? SCRIPTED_REFUSAL
   const fullMode = createFullModeRetryAction({
+    readRow: readPersonaRowState,
     retry: runRestartRetry,
     appliedPersona,
     canRelaunch,
@@ -325,7 +333,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     log,
     clock,
     action: (key, attempt) => {
-      attempts.push({ key, retry: attempt.retry, causes: attempt.causes, at: clock.now() })
+      attempts.push({ key, retry: attempt.retry, causes: attempt.causes, mode: attempt.mode, at: clock.now() })
       return current(key, attempt)
     },
   })

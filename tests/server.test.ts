@@ -654,7 +654,7 @@ describe('_buildReconnectSessionAdapter', () => {
     /** The state every status probe reads once a findMissing sweep has run (default: `statusState`). */
     statusAfterSweep?: string
   }): {
-    adapter: (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient'>
+    adapter: (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient' | 'pending'>
     statusCalls: StatusParams[]
     sendKeysCalls: SendKeysParams[]
     findMissingCalls: FindMissingParams[]
@@ -948,10 +948,13 @@ describe('_buildReconnectSessionAdapter', () => {
 
   // b.dup: a `pending` row's session has not started (SessionStart has not
   // fired). agent-director refuses send-keys to it, and the session connects
-  // its MCP servers once it starts, so nothing is typed: 'transient', and a
-  // later tick retries. Before the fix the adapter typed, the refusal raised
-  // a spawn-failure notice, and it answered 'transient'.
-  test("REPRO (b.dup): a pending row → 'transient' with no send-keys, pane read, tmux probe or sweep, no notice, and one line", async () => {
+  // its MCP servers once it starts, so nothing is typed, and a later tick
+  // retries. Before the fix the adapter typed, the refusal raised a
+  // spawn-failure notice, and it answered 'transient'. b.jg5 SRJ-303: the
+  // deferral answers 'pending' (restart.ts treats it as 'transient'), so the
+  // UNAVAILABLE retry timer knows the row read `pending`; the line is as
+  // before.
+  test("REPRO (b.dup), b.jg5 SRJ-303: a pending row → 'pending' with no send-keys, pane read, tmux probe or sweep, no notice, and one line", async () => {
     const raised: string[] = []
     setSessionNotifier((key) => { raised.push(key) })
     const lines: string[] = []
@@ -965,7 +968,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
       const result = await adapter('C1')
 
-      expect(result).toBe('transient')
+      expect(result).toBe('pending')
       expect(sendKeysCalls).toEqual([])
       expect(readPaneCalls).toEqual([])
       expect(tmuxProbes).toEqual([])
@@ -1314,7 +1317,9 @@ describe('_buildReconnectSessionAdapter', () => {
       }
     })
 
-    test('an attempt that reads another state ends the run of deferrals on the prompt row: the 10 min start over', async () => {
+    // b.jg5 SRJ-303: the minute-6 attempt reads `pending`, which the adapter
+    // answers 'pending' (a deferral restart.ts treats as 'transient').
+    test('an attempt that reads another state ends the run of deferrals on the prompt row: the 10 min start over (its pending read answers \'pending\', b.jg5 SRJ-303)', async () => {
       const opts: Parameters<typeof makeHarness>[0] = { statusState: 'check_permission', tmux: 'alive', statusAfterSweep: 'missing' }
       const h = makeHarness(opts)
       const verdicts: string[] = []
@@ -1323,7 +1328,7 @@ describe('_buildReconnectSessionAdapter', () => {
         verdicts.push(...(await attemptsAt(h.adapter, [minute])))
       }
 
-      expect(verdicts).toEqual(['transient', 'transient', 'transient', 'transient', 'escalate-dead'])
+      expect(verdicts).toEqual(['transient', 'pending', 'transient', 'transient', 'escalate-dead'])
       expect(h.findMissingCalls).toHaveLength(1)
       expect(h.sendKeysCalls).toEqual([])
     })

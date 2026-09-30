@@ -89,6 +89,11 @@ export const RESTART_OUTCOME_RECONNECTED = 'reconnected'
  * live): no launch, nothing counted.
  */
 export const RESTART_OUTCOME_RECONNECT_DEFERRED = 'reconnect-deferred'
+/**
+ * The row reads `pending` (its session has not started), so the reconnect
+ * typed nothing and was deferred (`pending`): no launch, nothing counted.
+ */
+export const RESTART_OUTCOME_PENDING_DEFERRED = 'pending-deferred'
 /** The kill and the launch ran and the launch succeeded (a success was recorded). */
 export const RESTART_OUTCOME_LAUNCHED = 'launched'
 /** The launch was refused: its UNAVAILABLE retry timer was armed for it. Not counted. */
@@ -111,6 +116,7 @@ export type RestartWorkOutcome =
   | typeof RESTART_OUTCOME_ALREADY_CONNECTED
   | typeof RESTART_OUTCOME_RECONNECTED
   | typeof RESTART_OUTCOME_RECONNECT_DEFERRED
+  | typeof RESTART_OUTCOME_PENDING_DEFERRED
   | typeof RESTART_OUTCOME_LAUNCHED
   | typeof RESTART_OUTCOME_REFUSED
   | typeof RESTART_OUTCOME_COUNTED_FAILURE
@@ -155,7 +161,10 @@ export interface RestartDeps {
   hasSessionStream(key: string): boolean
   /**
    * Attempt to reconnect the MCP session. Returns a discriminated result so
-   * restart.ts can call recordSuccess on the 'success' path.
+   * restart.ts can call recordSuccess on the 'success' path. `'pending'`: the
+   * row reads `pending`, so nothing was typed and the reconnect is deferred,
+   * as `'transient'` is; the work answers `RESTART_OUTCOME_PENDING_DEFERRED`
+   * for it, so the retry timer knows the row read `pending`.
    *
    * The return type is widened from void: the server.ts adapter already
    * computes reconnectMcp's ReconnectMcpResult union internally and now
@@ -165,7 +174,7 @@ export interface RestartDeps {
    * adapter) is treated as non-success — no recordSuccess, no recordFailure
    * (see comment below on why failure is NOT counted here).
    */
-  reconnectSession(key: string): Promise<'success' | 'escalate-dead' | 'transient' | void>
+  reconnectSession(key: string): Promise<ReconnectSessionResult>
   killSession(key: string): Promise<void>
   /**
    * `cwd` is the persona's working directory. `'skipped'`: the launch was
@@ -196,6 +205,9 @@ export interface RestartDeps {
    */
   serialize?: PersonaSerialize
 }
+
+/** What `RestartDeps.reconnectSession` answers; `void` is a non-success. */
+export type ReconnectSessionResult = 'success' | 'escalate-dead' | 'transient' | 'pending' | void
 
 /**
  * What a restart's launch answers: true launched, false a counted failure,
@@ -437,7 +449,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
       return RESTART_OUTCOME_ALREADY_CONNECTED
     }
     console.error(`[slack] Session alive but disconnected — reconnecting MCP for persona=${key}`)
-    let reconnectResult: 'success' | 'escalate-dead' | 'transient' | void
+    let reconnectResult: ReconnectSessionResult
     try {
       reconnectResult = await d.reconnectSession(key)
     } catch (err) {
@@ -450,7 +462,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
       recordSuccess(key)
       return RESTART_OUTCOME_RECONNECTED
     }
-    // Non-success/non-void branches ('escalate-dead', 'transient', or undefined):
+    // Non-success/non-void branches ('escalate-dead', 'transient', 'pending', or undefined):
     // do NOT recordFailure here. SR-25.1 / single counting site: counting
     // lives only at the launchSession boolean below. restart.ts does not
     // re-enter scheduleRestart on any of these outcomes. Post-b.9a7 that is
@@ -483,6 +495,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // it returns as before and the next tick retries. The external
     // ~/startup/find-missing-loop.sh is belt-and-braces only — recovery no
     // longer depends on it, and removing it is a separate operator decision.
+    if (reconnectResult === 'pending') return RESTART_OUTCOME_PENDING_DEFERRED
     if (reconnectResult !== 'escalate-dead') return RESTART_OUTCOME_RECONNECT_DEFERRED
     const held = await reprobeDeadAfterEscalate(d, key)
     if (held !== undefined) return held
