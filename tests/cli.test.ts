@@ -68,6 +68,7 @@ import {
   REFUSAL_KIND_BELOW_PHASE1_FLOOR,
   REFUSAL_KIND_CLIENT_TOO_OLD,
   REFUSAL_KIND_OTHER,
+  type StartupGateOptions,
   type StartupGateRefusalKind,
 } from '../src/agent-director-startup.ts'
 import { buildBelowPhase1FloorMessage } from '../src/ad-version-gate.ts'
@@ -105,7 +106,14 @@ import {
   writeConfigFile,
 } from './test-helpers/persona-config.ts'
 import { reloadTermsIn } from './test-helpers/reload-terms.ts'
-import { stripComments, objectProperties } from './test-helpers/source-audit.ts'
+import {
+  callArguments,
+  indicesOf,
+  objectProperties,
+  onlyCallArguments,
+  splitTopLevel,
+  stripComments,
+} from './test-helpers/source-audit.ts'
 
 const CLI_SOURCE = resolve(import.meta.dir, '..', 'src', 'cli.ts')
 const TOKEN_VARS = ['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN'] as const
@@ -1879,22 +1887,22 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
   const linesWith = (fragment: string): string[] => stderr.filter((l) => l.includes(fragment)).map((l) => l.split(' at ')[0]!)
 
   // b.jg5 SRJ-203: the error keeps the gate outcome's refusal kind, read from
-  // the error itself (never from its label or message text), and the kind
-  // changes nothing in the printed line: that stays CSCB's own label and
-  // message. The detail is test input; the floor row's is the gate's own.
-  test.each<[StartupGateRefusalKind, string, (binaryPath: string) => string]>([
-    [REFUSAL_KIND_CLIENT_TOO_OLD, AD_SYSTEM_INSTALL_TOO_OLD, (binaryPath) => `agent-director at ${binaryPath} is below the client's minimum`],
-    [
-      REFUSAL_KIND_BELOW_PHASE1_FLOOR,
-      AD_BELOW_PHASE1_FLOOR,
-      (binaryPath) => buildBelowPhase1FloorMessage({ foundVersion: OLD_AD_VERSION, binaryPath }),
-    ],
-    [REFUSAL_KIND_OTHER, AD_SYSTEM_INSTALL_NOT_FOUND, (binaryPath) => `no agent-director system install at ${binaryPath}`],
-  ])('a startup gate failure (StartupGateFailedError, refusal kind %s, label %s) exposes the kind it was built with and prints the gate\'s class label and message on the initialization-failed line; exit 1, no director verb', async (kind, label, detailFor) => {
-    const detail = detailFor(join(root, 'bin', 'agent-director'))
-    const gateError = new StartupGateFailedError(label, detail, kind)
+  // the error itself (never from its label or message text).
+  test.each<[StartupGateRefusalKind, string]>([
+    [REFUSAL_KIND_CLIENT_TOO_OLD, AD_SYSTEM_INSTALL_TOO_OLD],
+    [REFUSAL_KIND_BELOW_PHASE1_FLOOR, AD_BELOW_PHASE1_FLOOR],
+    [REFUSAL_KIND_OTHER, AD_SYSTEM_INSTALL_NOT_FOUND],
+  ])('StartupGateFailedError built with refusal kind %s (label %s) exposes that kind and that label', (kind, label) => {
+    const gateError = new StartupGateFailedError(label, `detail for ${kind}`, kind)
     expect(gateError.refusalKind).toBe(kind)
     expect(gateError.classLabel).toBe(label)
+  })
+
+  // The kind changes nothing in the printed line (it is never read there): the
+  // line is CSCB's own label and message. The detail is the floor gate's own.
+  test('a startup gate failure (StartupGateFailedError) prints the gate\'s class label and message on the initialization-failed line; exit 1, no director verb', async () => {
+    const detail = buildBelowPhase1FloorMessage({ foundVersion: OLD_AD_VERSION, binaryPath: join(root, 'bin', 'agent-director') })
+    const gateError = new StartupGateFailedError(AD_BELOW_PHASE1_FLOOR, detail, REFUSAL_KIND_BELOW_PHASE1_FLOOR)
     const b = makeStopDeps({
       initClient: async () => { throw gateError },
       directorStatus: async () => ({ state: 'waiting' }),
@@ -1903,11 +1911,29 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
 
     expect(stderr.filter((l) => l.includes('initialization failed'))).toEqual([
-      `[slack] stop --stop-bots: agent-director initialization failed: agent-director startup gate failed (${label}): ${detail}`,
+      `[slack] stop --stop-bots: agent-director initialization failed: agent-director startup gate failed (${AD_BELOW_PHASE1_FLOOR}): ${detail}`,
     ])
     expect(b.exitCodes).toEqual([1])
     expect(b.statusCalls).toEqual([])
     assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
+  })
+
+  test('production initClient runs the full startup gate, runStartupGate() with no argument (cli.ts never names the floor-exempt option), and throws StartupGateFailedError with the outcome\'s label, message and refusal kind (static; b.jg5 SRJ-203)', () => {
+    const FLOOR_EXEMPT_OPTION: keyof StartupGateOptions = 'skipPhase1Floor'
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    const initClient = objectProperties(code.slice(code.indexOf('const realDeps: CliDeps ='))).get('initClient')
+    expect(initClient).toBeDefined()
+    expect(onlyCallArguments(initClient!, 'runStartupGate').trim()).toBe('')
+    expect(indicesOf(new RegExp(`\\b${FLOOR_EXEMPT_OPTION}\\b`, 'g'), code)).toEqual([])
+    const outcome = initClient!.match(/\bconst\s+(\w+)\s*=\s*await\s+runStartupGate\s*\(/)?.[1]
+    expect(outcome).toBeDefined()
+    const thrown = indicesOf(/\bnew\s+StartupGateFailedError\s*\(/g, initClient!)
+    expect(thrown).toHaveLength(1)
+    expect(splitTopLevel(callArguments(initClient!, thrown[0]!))).toEqual([
+      `${outcome}.classLabel`,
+      `${outcome}.message`,
+      `${outcome}.refusalKind`,
+    ])
   })
 
   test('an incomplete teardown (TeardownIncompleteError) prints its count and retry advice on the teardown-failed line; the underlying error, carrying fake tokens, is only described, its message redacted; exit 1; nothing logged leaks', async () => {

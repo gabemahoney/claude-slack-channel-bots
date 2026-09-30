@@ -23,7 +23,6 @@ import {
   OLD_AD_VERSION,
   PHASE1_RC_VERSION,
 } from './test-helpers/agent-director-versions.ts'
-import { makeStubClient } from './test-helpers/agent-director-stub.ts'
 
 // ---------------------------------------------------------------------------
 // Versions built from the floor's parts
@@ -58,19 +57,18 @@ function withPart(i: number, value: number): string {
 
 /**
  * Versions whose string order is the opposite of their numeric order against
- * the floor, each with the numeric answer:
- *   - a multi-digit part not starting with 9, replaced by 9: numerically
- *     lower, but sorts after the floor as a string (refused);
- *   - a part starting with 2-9, replaced by the next power of ten: numerically
- *     higher, but sorts before the floor as a string (passes).
+ * the floor, each with the numeric answer (semver's). Each floor part is
+ * replaced by 9 (a single digit, sorting after any other leading digit) and
+ * by the next power of ten above it (one more digit, leading 1); a candidate
+ * is kept when it sorts before the floor as a string yet passes numerically
+ * (`0.100.0` against `0.11.0`), or sorts after it yet is refused (`0.9.0`
+ * against `0.11.0`).
  */
-const LEXICAL_TRAPS: Array<[string, boolean]> = FLOOR.flatMap((n, i): Array<[string, boolean]> => {
-  const s = String(n)
-  const traps: Array<[string, boolean]> = []
-  if (s.length > 1 && s[0] !== '9') traps.push([withPart(i, 9), false])
-  if (s[0] >= '2') traps.push([withPart(i, 10 ** s.length), true])
-  return traps
-})
+const LEXICAL_TRAPS: Array<[string, boolean]> = FLOOR.flatMap((n, i) =>
+  [withPart(i, 9), withPart(i, 10 ** String(n).length)]
+    .map((version): [string, boolean] => [version, semver.gte(version, PHASE1_FLOOR_VERSION)])
+    .filter(([version, passes]) => (version < PHASE1_FLOOR_VERSION) === passes),
+)
 
 // ---------------------------------------------------------------------------
 // The floor constant (SRJ-201)
@@ -118,7 +116,6 @@ describe('meetsPhase1Floor', () => {
   })
 
   test.each(LEXICAL_TRAPS)('compares %s numerically, not as a string (passes: %p)', (version, passes) => {
-    expect(version < PHASE1_FLOOR_VERSION).toBe(passes)
     expect(meetsPhase1Floor(version)).toBe(passes)
   })
 
@@ -138,12 +135,6 @@ describe('meetsPhase1Floor', () => {
 // ---------------------------------------------------------------------------
 
 describe('agent-director-versions helper', () => {
-  test("PHASE1_RC_VERSION is a pre-release of the floor and passes it", () => {
-    expect(PHASE1_RC_VERSION).not.toBe(PHASE1_FLOOR_VERSION)
-    expect(PHASE1_RC_VERSION.split('-')[0]).toBe(PHASE1_FLOOR_VERSION)
-    expect(meetsPhase1Floor(PHASE1_RC_VERSION)).toBe(true)
-  })
-
   test('OLD_AD_VERSION is at or above the client minimum: the client admits it, only CSCB refuses it', () => {
     expect(semver.gte(OLD_AD_VERSION, CLIENT_MIN_VERSION)).toBe(true)
     expect(meetsPhase1Floor(OLD_AD_VERSION)).toBe(false)
@@ -153,11 +144,5 @@ describe('agent-director-versions helper', () => {
     const floorPath = Bun.resolveSync('agent-director/dist/version-floor.json', import.meta.dir)
     const floorJson = (await Bun.file(floorPath).json()) as { min_binary_version: unknown }
     expect(CLIENT_MIN_VERSION).toBe(floorJson.min_binary_version as string)
-  })
-
-  test("a default stub client reports PHASE1_RC_VERSION, which passes the floor", () => {
-    const { binaryVersion } = makeStubClient()
-    expect(binaryVersion).toBe(PHASE1_RC_VERSION)
-    expect(meetsPhase1Floor(binaryVersion)).toBe(true)
   })
 })

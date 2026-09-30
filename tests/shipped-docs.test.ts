@@ -26,9 +26,10 @@
  * - the MCP instructions carry no reload wording (AC 74, SR-8.8);
  * - the two agent-director refusal classes, `ad-below-phase1-floor` and
  *   `ad-system-install-too-old` (b.jg5 SRJ-208): the debugging skill has an
- *   entry per label and README "Startup errors" a line per label, each naming
- *   the switch-over runbook section by its title and carrying no instruction
- *   to upgrade agent-director and no upgrade or install command; no shipped
+ *   entry per label inside its refusal section and README "Startup errors" a
+ *   line per label, each naming the switch-over runbook section by its title;
+ *   neither the refusal section nor a README line carries an upgrade form
+ *   (tests/test-helpers/upgrade-forms.ts, self-checked here); no shipped
  *   Markdown links or anchors into that section, which is not written yet.
  * CHANGELOG.md and docs/ are not shipped descriptions and are not read.
  *
@@ -56,6 +57,7 @@ import {
 } from '../src/config.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import {
+  classHeading,
   findSection,
   flat,
   headingAnchors,
@@ -66,6 +68,7 @@ import {
   splitFences,
 } from './test-helpers/markdown.ts'
 import { RELOAD_TERMS } from './test-helpers/reload-terms.ts'
+import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import { MCP_INSTRUCTIONS } from '../src/registry.ts'
@@ -1205,26 +1208,6 @@ const STARTUP_ERRORS_HEADING = '## Startup errors'
 const REFUSAL_SECTION_TITLE = 'The server refuses the agent-director binary at start'
 
 /**
- * An instruction to upgrade agent-director, or an upgrade or install command
- * (b.jg5 SRJ-208), each with a synthetic string it must match. Checked over
- * text with whitespace collapsed.
- */
-const UPGRADE_FORMS: [label: string, pattern: RegExp, sample: string][] = [
-  ['"Upgrade agent-director"', /\bupgrade\s+agent-director\b/i, 'Upgrade agent-director and retry.'],
-  ['upgrade wording', /\bupgrad(?:e|es|ed|ing)\b/i, 'upgrading the binary fixes it'],
-  ['"upgrade command" or "install command" wording', /\b(?:upgrade|install)\s+command\b/i, 'run the AD-published upgrade command'],
-  ['`install.sh`', /\binstall\.sh\b/, 'run install.sh again'],
-  ['`curl`', /\bcurl\b/, 'curl -fsSL https://example.test/install | sh'],
-  ['package-manager install', /\b(?:bun|npm|pnpm|yarn)\s+(?:add|install|i)\b/, 'bun add agent-director@latest'],
-  ['backticked agent-director command line', /`(?:\$\s*|sudo\s+)?agent-director\s+[^\s`][^`]*`/, 'run `agent-director upgrade`'],
-]
-
-/** The `###` heading naming a class label as a code span, with any title after it. */
-function classHeading(label: string): RegExp {
-  return new RegExp(`^### \`${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\`(?:\\W.*)?$`)
-}
-
-/**
  * The list item in `section` that opens with the label as a code span
  * (`- \`label\` — …`), with any indented continuation lines, whitespace
  * collapsed. Throws naming the label unless exactly one item opens with it.
@@ -1267,13 +1250,6 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
       expect(debugEntry(label)).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
     })
 
-    test.each(REFUSAL_LABELS.flatMap((label) => UPGRADE_FORMS.map(([form, pattern]) => [label, form, pattern] as const)))(
-      'the `%s` entry carries no %s',
-      (label, _form, pattern) => {
-        expect(debugEntry(label)).not.toMatch(pattern)
-      },
-    )
-
     test.each(UPGRADE_FORMS.map(([form, pattern]) => [form, pattern] as const))(
       'the refusal section carries no %s',
       (_form, pattern) => {
@@ -1289,10 +1265,6 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
   })
 
   describe(`README.md "${STARTUP_ERRORS_HEADING}"`, () => {
-    test.each(REFUSAL_LABELS)('lists `%s`', (label) => {
-      expect(readmeItem(label).length).toBeGreaterThan(0)
-    })
-
     test.each(REFUSAL_LABELS)('the `%s` line names the runbook section by its title', (label) => {
       expect(readmeItem(label)).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
     })

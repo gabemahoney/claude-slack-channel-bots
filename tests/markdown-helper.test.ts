@@ -3,7 +3,7 @@
  * use (tests/test-helpers/markdown.ts): headings outside fenced code only,
  * sections ended by the next heading of the same or a higher level, a missing
  * required section throwing with the file and heading named, fences split out
- * by kind, and GitHub-style anchors.
+ * by kind, GitHub-style anchors, and the `###` heading naming a class label.
  *
  * Pure: in-memory strings only, nothing read or written.
  *
@@ -12,7 +12,7 @@
 
 import { describe, expect, test } from 'bun:test'
 
-import { findSection, headingAnchors, headingSlug, headings, requiredSection, sectionRange, splitFences } from './test-helpers/markdown.ts'
+import { classHeading, findSection, headingAnchors, headingSlug, headings, requiredSection, sectionRange, splitFences } from './test-helpers/markdown.ts'
 
 const DOC = [
   '# Title', //                0
@@ -84,5 +84,23 @@ describe('anchors', () => {
 
   test('a repeated heading gets -1, -2 as on GitHub', () => {
     expect(headingAnchors('## Notes\n## Notes\n## Notes')).toEqual(['notes', 'notes-1', 'notes-2'])
+  })
+})
+
+describe('classHeading', () => {
+  test('matches the `###` heading naming the label as a code span, bare or with a title after it', () => {
+    expect(classHeading('a.b-c').test('### `a.b-c`')).toBe(true)
+    expect(classHeading('a.b-c').test('### `a.b-c` — the binary is too old')).toBe(true)
+  })
+
+  test('matches the label literally, at level 3 only, and never a longer label', () => {
+    expect(classHeading('a.b-c').test('### `aXb-c`')).toBe(false)
+    expect(classHeading('a.b-c').test('### `a.b-c-d`')).toBe(false)
+    expect(classHeading('a.b-c').test('## `a.b-c`')).toBe(false)
+    expect(classHeading('a.b-c').test('#### `a.b-c`')).toBe(false)
+  })
+
+  test('finds its section through the Markdown reader', () => {
+    expect(findSection('## Refusals\n### `a.b-c` — title\nbody\n### `other`\nnext', classHeading('a.b-c'))).toBe('body')
   })
 })

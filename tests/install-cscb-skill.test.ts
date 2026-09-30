@@ -23,9 +23,11 @@
  * found by its `###` heading naming the exported label, names the README
  * switch-over runbook section (title from `PHASE1_RUNBOOK_SECTION_TITLE`) and
  * carries no agent-director upgrade or install command and no instruction to
- * run one. The forbidden forms are one `test.each` table, each checked against
- * a synthetic string so a loosened pattern fails. The checks read that branch
- * alone; the not-found branch is a separate `###` section they do not reach.
+ * run one. The forbidden forms are the shared upgrade forms
+ * (tests/test-helpers/upgrade-forms.ts) plus the skill's own offers to run a
+ * command, each checked against a synthetic string so a loosened pattern
+ * fails (the shared rows' self-checks live in shipped-docs.test.ts). The
+ * checks read that branch alone and it never names the not-found label.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -37,7 +39,8 @@ import { resolve } from 'node:path'
 
 import { PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
 import { AD_SYSTEM_INSTALL_NOT_FOUND, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check.ts'
-import { flat, requiredSection, splitFences } from './test-helpers/markdown.ts'
+import { classHeading, flat, requiredSection, splitFences } from './test-helpers/markdown.ts'
+import { type ForbiddenForm, UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 const SKILLS_DIR = resolve(import.meta.dirname, '..', 'skills')
 const SKILL_PATH = resolve(SKILLS_DIR, 'install-cscb', 'SKILL.md')
@@ -180,46 +183,30 @@ describe('install-cscb skill: persona pointer (b.av2 SR-12)', () => {
   })
 })
 
-/** `value` with every RegExp metacharacter escaped, for a pattern built around a label. */
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-/** The `###` heading naming a class label as a code span, with any title after it. */
-function classHeading(label: string): RegExp {
-  return new RegExp(`^### \`${escapeRegExp(label)}\`(?:\\W.*)?$`)
-}
-
 /** The raw body of the `###` branch for a class label; throws naming the file and heading when there is none. */
 function classBranch(label: string): string {
   return requiredSection(skillContent, classHeading(label), SKILL_FILE)
 }
 
 /**
- * The forms an agent-director upgrade or install command, or an offer to run
- * one, takes (b.jg5 SRJ-208, C8), each with a synthetic string it must match.
- * Checked over the branch's text with whitespace collapsed.
+ * The install skill's own forbidden forms (b.jg5 SRJ-208, C8): an offer to run
+ * an upgrade or install command, beyond the shared upgrade forms. Each with a
+ * synthetic string it must match; checked over the branch's text with
+ * whitespace collapsed.
  */
-const FORBIDDEN_TOO_OLD_FORMS: [label: string, pattern: RegExp, sample: string][] = [
-  ['upgrade wording', /\bupgrad(?:e|es|ed|ing)\b/i, 'upgrade manually then continue'],
-  ['"upgrade command" or "install command" wording', /\b(?:upgrade|install)\s+command\b/i, 'Run the AD-published install command?'],
+const RUN_OFFER_FORMS: ForbiddenForm[] = [
   ['command run through Bash', /\b(?:via|through|using|with|in)\s+Bash\b/i, 'run the command via Bash and continue'],
   ['Yes/No offer to run', /\*\*(?:Yes|No)\*\*/, '- **Yes** — run it'],
-  ['`install.sh`', /\binstall\.sh\b/, 'run install.sh from the repo'],
-  ['`curl`', /\bcurl\b/, 'curl -fsSL https://example.test/install | sh'],
-  ['package-manager install', /\b(?:bun|npm|pnpm|yarn)\s+(?:add|install|i)\b/, 'npm install -g agent-director'],
-  ['backticked agent-director command line', /`(?:\$\s*|sudo\s+)?agent-director\s+[^\s`][^`]*`/, 'run `sudo agent-director upgrade --yes`'],
   ['backticked binary-path command line', /`<binary_path>\s+[^\s`][^`]*`/, 'run `<binary_path> version`'],
   ['`<command>` placeholder', /`<command>`/, 'Run it? `<command>`'],
   ['return to Step 1', /\breturn to Step 1\b/i, 'Return to Step 1.'],
 ]
 
+/** Every form the too-old branch must not carry: the shared upgrade forms and the skill's own. */
+const FORBIDDEN_TOO_OLD_FORMS: ForbiddenForm[] = [...UPGRADE_FORMS, ...RUN_OFFER_FORMS]
+
 describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_TOO_OLD} branch names the runbook and runs nothing (b.jg5 SRJ-208)`, () => {
   const branch = () => flat(classBranch(AD_SYSTEM_INSTALL_TOO_OLD))
-
-  test('the branch is found by its heading naming the label', () => {
-    expect(branch().length).toBeGreaterThan(0)
-  })
 
   test('the branch names the README switch-over runbook section by its title', () => {
     expect(branch()).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
@@ -230,7 +217,9 @@ describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_TOO_OLD} branch names the 
     expect(branch()).not.toMatch(pattern)
   })
 
-  test.each(FORBIDDEN_TOO_OLD_FORMS)('self-check: the %s pattern matches its synthetic string', (_label, pattern, sample) => {
+  // The shared upgrade forms are self-checked in shipped-docs.test.ts; these
+  // cover the skill's own rows.
+  test.each(RUN_OFFER_FORMS)('self-check: the %s pattern matches its synthetic string', (_label, pattern, sample) => {
     expect(flat(sample)).toMatch(pattern)
   })
 
@@ -248,21 +237,15 @@ describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_TOO_OLD} branch names the 
     expect(branch()).not.toContain(AD_SYSTEM_INSTALL_NOT_FOUND)
   })
 
-  test(`the ${AD_SYSTEM_INSTALL_NOT_FOUND} branch is its own section, outside the too-old checks`, () => {
-    expect(classBranch(AD_SYSTEM_INSTALL_NOT_FOUND).trim().length).toBeGreaterThan(0)
-    const notFoundHeading = classHeading(AD_SYSTEM_INSTALL_NOT_FOUND)
-    expect(classBranch(AD_SYSTEM_INSTALL_TOO_OLD).split('\n').filter((line) => notFoundHeading.test(line))).toEqual([])
-  })
-
   test('Step 4 says the too-old class ends the skill instead of looping', () => {
     const step4 = section('Loop or exit')
     expect(step4).toContain(AD_SYSTEM_INSTALL_TOO_OLD)
     expect(step4).toMatch(/\bend the skill\b/i)
   })
 
-  test('the frontmatter description promises no upgrade', () => {
+  test('the frontmatter promises no upgrade and names no upgrade or install command', () => {
     const frontmatter = skillContent.slice(0, skillContent.indexOf('\n---\n', 4))
-    expect(frontmatter).not.toMatch(/\bupgrad(?:e|es|ed|ing)\b/i)
+    for (const [, pattern] of UPGRADE_FORMS) expect(frontmatter).not.toMatch(pattern)
   })
 
   test('a missing class heading fails naming the file and the heading', () => {

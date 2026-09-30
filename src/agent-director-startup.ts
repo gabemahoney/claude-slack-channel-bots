@@ -276,7 +276,10 @@ export type StartupGateRefusalKind =
 
 /**
  * Per-step result tag used by the gate to drive a single switch at the call
- * site (production code never inspects this; tests assert on it).
+ * site. Production callers read it: `initClient` in `cli.ts` carries
+ * `classLabel`, `message` and `refusalKind` into `StartupGateFailedError`, and
+ * `refusalKind` exists so callers branch on which check refused (b.jg5
+ * SRJ-902). `phase` is diagnostic; tests assert on it.
  */
 export type StartupGateOutcome =
   | { ok: true; client: unknown; adVersion: string }

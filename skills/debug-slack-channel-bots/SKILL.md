@@ -1513,9 +1513,10 @@ install-skill block.
 ### `ad-system-install-too-old`
 
 The binary is below the agent-director client's own minimum. The line names
-the version found, the version required (the client's minimum, which the
-client reports; it is not CSCB's Phase 1 floor), the binary path, that this
-CSCB release and agent-director Phase 1 are installed together, and the
+the version found, the version the client requires (its minimum, which the
+client reports), that this CSCB release needs CSCB's Phase 1 floor or later
+(release candidates included), the binary path, that this CSCB release and
+agent-director Phase 1 are installed together, and the
 README section "Switching over to agent-director Phase 1". It ends with the
 install-skill block (the `install-cscb` skill's URL, target path and
 command); that skill names the same section and runs nothing for this

@@ -161,6 +161,20 @@ export function headingAnchors(text: string): string[] {
   })
 }
 
+/** `value` with every RegExp metacharacter escaped, so a pattern built around it matches it literally. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * The `###` heading naming a class label as a code span, with any title after
+ * it (`### \`ad-system-install-too-old\` — …`), as a HeadingMatch. The label
+ * is matched literally, and a label that only starts with it does not match.
+ */
+export function classHeading(label: string): RegExp {
+  return new RegExp(`^### \`${escapeRegExp(label)}\`(?:\\W.*)?$`)
+}
+
 /** `text` with every run of whitespace collapsed to one space, so a phrase matches across a line wrap. */
 export function flat(text: string): string {
   return text.replace(/\s+/g, ' ')

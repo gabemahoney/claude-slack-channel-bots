@@ -9,10 +9,12 @@
  * The startup gate (Epic 1, agent-director-startup.ts) does NOT call
  * `runInstallCheck()` — AD's own `Client.create()` enforces the same floor
  * against the same `dist/version-floor.json`. The gate imports only the
- * exported class-label values below (`AD_SYSTEM_INSTALL_NOT_FOUND`,
- * `AD_SYSTEM_INSTALL_TOO_OLD`, `AD_BELOW_PHASE1_FLOOR`), so both report the
- * same labels. CSCB never duplicates the client's floor decision; its own
- * Phase 1 floor lives in `ad-version-gate.ts` (b.jg5 SRJ-203).
+ * exported class-label values below. `AD_SYSTEM_INSTALL_NOT_FOUND` and
+ * `AD_SYSTEM_INSTALL_TOO_OLD` are shared: the gate and this check report
+ * them for the same failures. `AD_BELOW_PHASE1_FLOOR` is defined here but
+ * only the startup gate writes it; this check never reports it. CSCB never
+ * duplicates the client's floor decision; its own Phase 1 floor lives in
+ * `ad-version-gate.ts` (b.jg5 SRJ-203).
  *
  * The module is strictly side-effect-free:
  *   - No process.exit.
@@ -53,7 +55,11 @@ export const AD_SYSTEM_INSTALL_TOO_OLD = 'ad-system-install-too-old'
  */
 export const AD_BELOW_PHASE1_FLOOR = 'ad-below-phase1-floor'
 
-/** Canonical class labels emitted by the check; mirrors the startup gate's. */
+/**
+ * Canonical class labels emitted by the check. The not-found and too-old
+ * labels are shared with the startup gate; `AD_BELOW_PHASE1_FLOOR` is not
+ * among them, because only the startup gate writes it.
+ */
 export type InstallCheckClassLabel =
   | typeof AD_SYSTEM_INSTALL_NOT_FOUND
   | typeof AD_SYSTEM_INSTALL_TOO_OLD
@@ -189,7 +195,7 @@ export async function runInstallCheck(): Promise<InstallCheckResult> {
     if (err instanceof ErrSystemInstallTooOld) {
       return {
         ok: false,
-        classLabel: 'ad-system-install-too-old',
+        classLabel: AD_SYSTEM_INSTALL_TOO_OLD,
         message:
           `agent-director system install at ${err.binaryPath} reports version ${err.actualVersion}, ` +
           `which is below the declared floor ${err.requiredVersion}. Upgrade agent-director and retry.`,
@@ -247,7 +253,7 @@ export async function runInstallCheck(): Promise<InstallCheckResult> {
   if (!semver.gte(detected, floor)) {
     return {
       ok: false,
-      classLabel: 'ad-system-install-too-old',
+      classLabel: AD_SYSTEM_INSTALL_TOO_OLD,
       message:
         `agent-director system install at ${resolved.path} reports version ${detectedRaw}, ` +
         `which is below the declared floor ${floor}. Upgrade agent-director and retry.`,

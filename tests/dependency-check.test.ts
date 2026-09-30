@@ -73,6 +73,8 @@ import {
   PHASE1_RC_VERSION,
 } from './test-helpers/agent-director-versions.ts'
 import { STALE_VERSION } from './test-helpers/install-check-fixtures.ts'
+import { flat } from './test-helpers/markdown.ts'
+import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers for SR-5.1 sub-cases
@@ -607,7 +609,7 @@ describe('SR-5.1: API surface probes', () => {
 // `Client.create()` (production) / `makeStubCreateClient(...)` (tests) is the
 // async factory that surfaces the client's three system-install typed
 // errors: ErrSystemInstallNotFound (no binary on PATH or in standard install
-// path), ErrSystemInstallTooOld (detected binary below floor), and
+// path), ErrSystemInstallTooOld (detected binary below the client's minimum), and
 // ErrSystemInstallUnreachable (binary exists but cannot be invoked
 // successfully — eight reason values). Each must surface as its own
 // classLabel on the construct phase so the startup-errors.log entry tells the
@@ -1004,10 +1006,13 @@ describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
 // b.jg5 SRJ-208 — the two version refusal messages
 // ---------------------------------------------------------------------------
 //
-// Both name the switch-over runbook section by its title and carry no
-// instruction to upgrade agent-director. The too-old message keeps the
-// install-skill block; the floor message has none. Each binary path is a
-// non-default value, so the message shows it is passed through.
+// Both name the switch-over runbook section by its title and carry none of
+// the shared upgrade forms (tests/test-helpers/upgrade-forms.ts): no
+// instruction to upgrade agent-director and no upgrade or install command.
+// Both name the Phase 1 floor; the too-old message also names the client's
+// required version. The too-old message keeps the install-skill block; the
+// floor message has none. Each binary path is a non-default value, so the message shows it is
+// passed through.
 
 describe('b.jg5 SRJ-208: version refusal messages', () => {
   beforeEach(() => {
@@ -1028,16 +1033,16 @@ describe('b.jg5 SRJ-208: version refusal messages', () => {
     {
       name: AD_SYSTEM_INSTALL_TOO_OLD,
       createClient: makeStubCreateClient({ error: tooOld }),
-      named: [tooOld.actualVersion, tooOld.requiredVersion, tooOld.binaryPath],
+      named: [tooOld.actualVersion, tooOld.requiredVersion, PHASE1_FLOOR_VERSION, tooOld.binaryPath],
       carriesSkillBlock: true,
     },
-  ])('$name names the runbook section, both versions and the path, and no upgrade', async ({ name, createClient, named, carriesSkillBlock }) => {
+  ])('$name names the runbook section, the versions (incl. the Phase 1 floor) and the path, and no upgrade form', async ({ name, createClient, named, carriesSkillBlock }) => {
     const outcome = await runStartupGate(passingDeps({ createClient }))
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
       expect(outcome.classLabel).toBe(name)
       expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
-      expect(outcome.message).not.toMatch(/upgrade agent-director/i)
+      for (const [, pattern] of UPGRADE_FORMS) expect(flat(outcome.message)).not.toMatch(pattern)
       for (const text of named) {
         expect(outcome.message).toContain(text)
       }

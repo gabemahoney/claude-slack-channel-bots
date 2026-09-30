@@ -142,10 +142,12 @@ export interface SystemInstallTooOldParts {
 
 /**
  * The `ad-system-install-too-old` message (b.jg5 SRJ-208): the version found,
- * the version required (the client's minimum, taken from the error, not
- * CSCB's Phase 1 floor), the binary path, that this CSCB release and
- * agent-director Phase 1 are installed together, and the switch-over runbook
- * section's title as the way to install agent-director. It carries no
+ * the version the client requires (its minimum, taken from the error), that
+ * this CSCB release needs {@link PHASE1_FLOOR_VERSION} or later (release
+ * candidates included) so the operator does not install a version between
+ * the two and meet the floor refusal next, the binary path, that this CSCB
+ * release and agent-director Phase 1 are installed together, and the
+ * switch-over runbook section's title as the way to install agent-director. It carries no
  * instruction to upgrade agent-director and no install or upgrade command,
  * because the runbook's `state.db` backup and `serve` restarts must come with
  * the install. The install-skill block is not part of this text; the startup
@@ -154,7 +156,9 @@ export interface SystemInstallTooOldParts {
 export function buildSystemInstallTooOldMessage(parts: SystemInstallTooOldParts): string {
   return (
     `agent-director system install is too old: version ${parts.foundVersion} is below ` +
-    `the agent-director client's minimum; version ${parts.requiredVersion} or later is required. ` +
+    `the agent-director client's minimum; version ${parts.requiredVersion} or later is required ` +
+    `by the client, and this CSCB release needs ${PHASE1_FLOOR_VERSION} or later ` +
+    `(release candidates included). ` +
     `Binary at ${parts.binaryPath}. ` +
     `This CSCB release and agent-director Phase 1 are installed together: ` +
     `install agent-director by following the switch-over runbook in the README ` +
