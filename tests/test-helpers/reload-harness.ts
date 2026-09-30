@@ -478,6 +478,7 @@ import {
   createPersonaUpPredicate,
 } from '../../src/persona-start.ts'
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
+import type { LaunchSessionResult } from '../../src/restart.ts'
 import {
   _resetRegistry,
   createSessionServer,
@@ -731,10 +732,12 @@ export interface ReloadLifecycleRecord {
   action?: SpawnPersonaResult['action']
   /**
    * Launch via `restart` only (`run.relaunch`): what the restart module's
-   * `launchSession` answered (`true`, `false`, or `'skipped'` when the
-   * relaunch gate refused it or the launch was deferred), set once resolved.
+   * `launchSession` answered (`true`, `false`, `'skipped'` when the
+   * relaunch gate refused it or the launch was deferred, or `'refused'` when
+   * the launch's UNAVAILABLE retry timer owns the persona, b.jg5 SRJ-301),
+   * set once resolved.
    */
-  restart?: boolean | 'skipped'
+  restart?: LaunchSessionResult
   /**
    * `template-refresh` only, with the real composition: how the refresh
    * settled (`refreshSlackChannelBotTemplate`'s result). Absent for the
@@ -1533,7 +1536,7 @@ export interface ReloadRun {
    * (`h.seedRow(persona, { state: 'ended' })`) to choose the ladder's path.
    * Resolves with the answer. Throws without `opts.realLaunch`.
    */
-  relaunch(name: string): Promise<boolean | 'skipped'>
+  relaunch(name: string): Promise<LaunchSessionResult>
   /** Every session-manager notice raised (spawn failure, restart cap, lost history) with `opts.realLaunch`, by persona key, in order. */
   readonly sessionNotices: ReadonlyArray<{ readonly key: string; readonly text: string }>
   /** Stop detection (`controller.stopDetection()`, which stops `run.ticks`), cancel every bring-up retry and stop every connection. Idempotent. */

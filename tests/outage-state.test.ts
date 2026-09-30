@@ -1,7 +1,12 @@
 /**
  * outage-state.test.ts — SRD §Test plan cases 1-24, plus the
  * tests/getclient-allowlist.txt static audit (case 22) and the
- * resetAllToHealthy call-site audit (case 23 Part A).
+ * resetAllToHealthy call-site audit (case 23 Part A), and the wrappers'
+ * report to the UNAVAILABLE retry timer's trigger sink (b.jg5 SRJ-301).
+ *
+ * The trigger-sink cases install a recording fake sink (no timer) and run
+ * the wrapped call inside a real attempt context (`runInAttempt`); every
+ * agent-director error comes from the stub's builders.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -26,13 +31,38 @@ import {
   resetAllToHealthy,
   withOutageDetection,
   withSpawnDetection,
+  reportAgentDirectorError,
   ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
   type ClassRecord,
   type OutageClass,
 } from '../src/outage-state.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import {
+  STUB_INSTANCE_ID,
+  errCallTimeout,
+  errConfigMalformed,
+  errInstanceIdCollision,
+  errSpawnNotFound,
+  errSystemInstallDisappeared,
+  errTmuxKillFailed,
+  errTmuxNotAvailable,
+  errTmuxUnresponsive,
+  errUnusableName,
+  makeStubCallLog,
+  makeStubClient,
+  type StubCallLog,
+  type StubClientOptions,
+} from './test-helpers/agent-director-stub.ts'
+import {
+  UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
+  UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  runInAttempt,
+  type AttemptErrorRecord,
+  type UnavailableRetryCause,
+} from '../src/unavailable-retry.ts'
+import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import { stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
@@ -676,6 +706,378 @@ describe('persona-keyed notices', () => {
       // Nothing on B's client, and no drop, dry-run, refusal or failure line.
       expect(h.stub(b.key).callLog).toEqual([])
       expect(h.logs).toEqual([])
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-301 — the wrappers report to the retry timer's trigger sink
+// ---------------------------------------------------------------------------
+
+describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorError', () => {
+  /** One `arm` call the recording sink received. */
+  type Arm = { key: string; cause: UnavailableRetryCause }
+
+  /**
+   * A fresh outage state over one stub client (every verb logged in `calls`)
+   * and, unless `sink` is false, a recording trigger sink. `sinkThrows`
+   * makes the sink record and then throw.
+   */
+  function makeSinkHarness(opts: { sink?: boolean; sinkThrows?: boolean; client?: StubClientOptions } = {}): {
+    emissions: Emission[]
+    arms: Arm[]
+    calls: StubCallLog
+  } {
+    const emissions: Emission[] = []
+    const arms: Arm[] = []
+    const calls = makeStubCallLog()
+    const client = makeStubClient({ ...calls, ...opts.client })
+    _resetOutageState()
+    initOutageState({
+      notify: (key, text) => { emissions.push({ key, text }) },
+      getClient: () => client as unknown as Client,
+      ...(opts.sink === false
+        ? {}
+        : {
+            triggerSink: {
+              arm: (key: string, cause: UnavailableRetryCause) => {
+                arms.push({ key, cause })
+                if (opts.sinkThrows) throw new Error('sink failed')
+              },
+            },
+          }),
+    })
+    return { emissions, arms, calls }
+  }
+
+  /** The verbs a wrapped call makes here, each on the default fixture's instance. */
+  const VERBS = {
+    status: { wrap: withOutageDetection, stubError: 'statusError', call: (c: Client) => c.status({ claude_instance_id: STUB_INSTANCE_ID }) },
+    get: { wrap: withOutageDetection, stubError: 'getError', call: (c: Client) => c.get({ claude_instance_id: STUB_INSTANCE_ID }) },
+    list: { wrap: withOutageDetection, stubError: 'listError', call: (c: Client) => c.list({}) },
+    kill: { wrap: withOutageDetection, stubError: 'killError', call: (c: Client) => c.kill({ claude_instance_id: STUB_INSTANCE_ID }) },
+    'read-pane': { wrap: withOutageDetection, stubError: 'readPaneError', call: (c: Client) => c.readPane({ claude_instance_id: STUB_INSTANCE_ID }) },
+    resume: { wrap: withSpawnDetection, stubError: 'resumeError', call: (c: Client) => c.resume({ claude_instance_id: STUB_INSTANCE_ID }) },
+  } as const
+  type Verb = keyof typeof VERBS
+
+  /** Stub options that make `verb` reject with `err`. */
+  function failing(verb: Verb, err: Error): StubClientOptions {
+    return { [VERBS[verb].stubError]: err }
+  }
+
+  /** Run `verb` for `key` through its wrapper and answer what it rejected with (it must reject). */
+  async function rejectionOf(key: string, verb: Verb): Promise<unknown> {
+    const { wrap, call } = VERBS[verb]
+    try {
+      await wrap(key, '/persona/workdir', call)
+    } catch (err) {
+      return err
+    }
+    throw new Error(`${verb} did not reject`)
+  }
+
+  /**
+   * Run `verb` for `key` inside a launch attempt for `attemptKey`, and answer
+   * the rejection and the attempt's last-error record as it was when the call
+   * settled.
+   */
+  async function inAttempt(attemptKey: string, key: string, verb: Verb): Promise<{ rejected: unknown; lastError: AttemptErrorRecord | undefined }> {
+    return runInAttempt(attemptKey, 'launch', async (attempt) => {
+      const rejected = await rejectionOf(key, verb)
+      return { rejected, lastError: attempt.lastError }
+    })
+  }
+
+  test.each([
+    ['UNAVAILABLE from resume (withSpawnDetection)', 'resume', () => errTmuxUnresponsive('resume'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['UNAVAILABLE from read-pane (not a read verb)', 'read-pane', () => errCallTimeout('read-pane'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['UNAVAILABLE from status', 'status', () => errCallTimeout('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['ErrTmuxKillFailed from kill', 'kill', () => errTmuxKillFailed(), UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+    ['a status error (ErrSystemInstallDisappeared)', 'status', () => errSystemInstallDisappeared('status'), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+    ['a get error (a STATE error other than ErrSpawnNotFound)', 'get', () => errInstanceIdCollision(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+    ['a list error', 'list', () => errInstanceIdCollision(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+  ] as const)('inside P\'s attempt, %s calls the sink once with P and the cause; the attempt records it armed', async (_label, verb, build, kind) => {
+    const err = build()
+    const { arms } = makeSinkHarness({ client: failing(verb, err) })
+
+    const { rejected, lastError } = await inAttempt(P1, P1, verb)
+
+    expect(rejected).toBe(err)
+    expect(arms).toHaveLength(1)
+    expect(arms[0]!.key).toBe(P1)
+    expect(arms[0]!.cause.kind).toBe(kind)
+    expect(arms[0]!.cause.error).toBe(err)
+    expect(lastError).toEqual({ verb, causeKind: kind, armed: true })
+  })
+
+  test.each([
+    ['ErrSpawnNotFound from get', 'get', () => errSpawnNotFound()],
+    ['ErrSpawnNotFound from status', 'status', () => errSpawnNotFound()],
+    ['a CONFIG answer from status', 'status', () => errConfigMalformed()],
+    ['an UNUSABLE NAME answer from get', 'get', () => errUnusableName()],
+    ['a STATE error from kill (not a read verb)', 'kill', () => errInstanceIdCollision()],
+    ['an ENVIRONMENT error from resume', 'resume', () => errTmuxNotAvailable(undefined, 'resume')],
+  ] as const)('inside P\'s attempt, a non-arming error (%s) calls no sink; the attempt records it unarmed', async (_label, verb, build) => {
+    const err = build()
+    const { arms } = makeSinkHarness({ client: failing(verb, err) })
+
+    const { rejected, lastError } = await inAttempt(P1, P1, verb)
+
+    expect(rejected).toBe(err)
+    expect(arms).toHaveLength(0)
+    expect(lastError).toEqual({ verb, armed: false })
+  })
+
+  test('a call for P inside Q\'s attempt, or Q\'s call inside P\'s attempt, calls no sink and records nothing in the attempt', async () => {
+    const err = errCallTimeout('status')
+    const { arms } = makeSinkHarness({ client: failing('status', err) })
+
+    const forP = await inAttempt(P2, P1, 'status')
+    const forQ = await inAttempt(P1, P2, 'status')
+
+    expect(forP.rejected).toBe(err)
+    expect(forQ.rejected).toBe(err)
+    expect(arms).toHaveLength(0)
+    expect(forP.lastError).toBeUndefined()
+    expect(forQ.lastError).toBeUndefined()
+  })
+
+  test('a call for P inside Q\'s attempt nested in P\'s arms P only, recorded in P\'s attempt', async () => {
+    const err = errCallTimeout('status')
+    const { arms } = makeSinkHarness({ client: failing('status', err) })
+
+    const lastErrors = await runInAttempt(P1, 'recovery', async (outer) => {
+      const inner = await inAttempt(P2, P1, 'status')
+      return { outer: outer.lastError, inner: inner.lastError }
+    })
+
+    expect(arms.map((a) => a.key)).toEqual([P1])
+    expect(lastErrors.outer).toEqual({ verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, armed: true })
+    expect(lastErrors.inner).toBeUndefined()
+  })
+
+  test('outside any attempt an arming error calls no sink', async () => {
+    const err = errCallTimeout('status')
+    const { arms } = makeSinkHarness({ client: failing('status', err) })
+
+    expect(await rejectionOf(P1, 'status')).toBe(err)
+    expect(arms).toHaveLength(0)
+  })
+
+  test('after P\'s attempt settles, a call for P calls no sink', async () => {
+    const err = errCallTimeout('status')
+    const { arms } = makeSinkHarness({ client: failing('status', err) })
+
+    await runInAttempt(P1, 'launch', () => 'done')
+
+    expect(await rejectionOf(P1, 'status')).toBe(err)
+    expect(arms).toHaveLength(0)
+  })
+
+  test('with no sink installed, an arming error inside P\'s attempt is recorded unarmed and rethrown unchanged', async () => {
+    const err = errTmuxKillFailed()
+    makeSinkHarness({ sink: false, client: failing('kill', err) })
+
+    const { rejected, lastError } = await inAttempt(P1, P1, 'kill')
+
+    expect(rejected).toBe(err)
+    expect(lastError).toEqual({ verb: 'kill', causeKind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, armed: false })
+  })
+
+  test('a sink that throws: the wrapper still rethrows the call\'s own error, and the attempt records it unarmed', async () => {
+    const err = errCallTimeout('status')
+    const { arms } = makeSinkHarness({ sinkThrows: true, client: failing('status', err) })
+
+    const { rejected, lastError } = await inAttempt(P1, P1, 'status')
+
+    expect(rejected).toBe(err)
+    expect(arms).toHaveLength(1)
+    expect(lastError).toEqual({ verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, armed: false })
+  })
+
+  test.each([
+    ['ErrSystemInstallDisappeared from status (arms; raises ad-unreachable)', 'status', () => errSystemInstallDisappeared('status', '/bin/ad')],
+    ['ErrTmuxKillFailed from kill (arms; no flag)', 'kill', () => errTmuxKillFailed()],
+    ['ErrTmuxNotAvailable from resume (no arm; raises tmux-unavailable)', 'resume', () => errTmuxNotAvailable(undefined, 'resume')],
+  ] as const)('%s: the rethrown value, flags and notices are exactly as without a sink or an attempt', async (_label, verb, build) => {
+    const err = build()
+    /** One run: its rejection, P's flags and every notice raised. */
+    async function runWith(sink: boolean, attempt: boolean): Promise<{ rejected: unknown; flags: string[]; emissions: Emission[] }> {
+      const { emissions } = makeSinkHarness({ sink, client: failing(verb, err) })
+      const rejected = attempt ? (await inAttempt(P1, P1, verb)).rejected : await rejectionOf(P1, verb)
+      return { rejected, flags: [...getOutageFlags(P1)].sort(), emissions }
+    }
+
+    const baseline = await runWith(false, false)
+    const withSinkInAttempt = await runWith(true, true)
+    const noSinkInAttempt = await runWith(false, true)
+
+    expect(baseline.rejected).toBe(err)
+    expect(withSinkInAttempt.rejected).toBe(err)
+    expect(noSinkInAttempt.rejected).toBe(err)
+    expect(withSinkInAttempt.flags).toEqual(baseline.flags)
+    expect(noSinkInAttempt.flags).toEqual(baseline.flags)
+    expect(withSinkInAttempt.emissions).toEqual(baseline.emissions)
+    expect(noSinkInAttempt.emissions).toEqual(baseline.emissions)
+  })
+
+  test('the error text reaches no notice and no attempt record (leak check)', async () => {
+    const err = errTmuxUnresponsive('resume', `tmux did not answer (${sentinelInMessage('resume')}); nothing was done`)
+    const { emissions, arms } = makeSinkHarness({ client: failing('resume', err) })
+
+    const { rejected, lastError } = await inAttempt(P1, P1, 'resume')
+
+    expect(rejected).toBe(err)
+    expect(arms).toHaveLength(1)
+    assertNoLeak({ emissions, lastError, kinds: arms.map((a) => a.cause.kind), flags: [...getOutageFlags(P1)] })
+  })
+
+  describe('the client handed to fn', () => {
+    /**
+     * A client whose method reads a private field, so it throws when run
+     * with `this` other than the instance, and answers the `this` it ran on.
+     */
+    class PrivateFieldClient {
+      readonly #calls: string[] = []
+      readonly binaryPath = '/usr/local/bin/agent-director'
+      get calls(): readonly string[] {
+        return this.#calls
+      }
+      async status(params: { claude_instance_id: string }): Promise<{ state: string; self: unknown }> {
+        this.#calls.push(params.claude_instance_id)
+        return { state: 'waiting', self: this }
+      }
+    }
+
+    function installPrivateFieldClient(): PrivateFieldClient {
+      const client = new PrivateFieldClient()
+      _resetOutageState()
+      initOutageState({
+        notify: () => {},
+        getClient: () => client as unknown as Client,
+        triggerSink: { arm: () => {} },
+      })
+      return client
+    }
+
+    test('inside P\'s attempt, a method call reaches the real client with this bound to it, and its result is returned unchanged', async () => {
+      const real = installPrivateFieldClient()
+      const seen: Array<{ binaryPath: string }> = []
+
+      const result = await runInAttempt(P1, 'launch', () =>
+        withOutageDetection(P1, '/cwd', async (c) => {
+          seen.push({ binaryPath: c.binaryPath })
+          return (c as unknown as PrivateFieldClient).status({ claude_instance_id: STUB_INSTANCE_ID })
+        }),
+      )
+
+      expect(result.state).toBe('waiting')
+      expect(result.self).toBe(real)
+      expect(real.calls).toEqual([STUB_INSTANCE_ID])
+      expect(seen).toEqual([{ binaryPath: real.binaryPath }])
+    })
+
+    test('outside any attempt, fn gets the plain client', async () => {
+      const real = installPrivateFieldClient()
+      let handed: unknown
+
+      await withOutageDetection(P1, '/cwd', async (c) => { handed = c })
+
+      expect(handed).toBe(real)
+    })
+
+    test('inside P\'s attempt, a successful call clears the flags as outside one', async () => {
+      makeSinkHarness()
+      setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+
+      const result = await runInAttempt(P1, 'launch', () =>
+        withOutageDetection(P1, '/cwd', (c) => c.status({ claude_instance_id: STUB_INSTANCE_ID })),
+      )
+
+      expect(result.state).toBe('waiting')
+      expect(getOutageFlags(P1).size).toBe(0)
+    })
+  })
+
+  describe('reportAgentDirectorError', () => {
+    test.each([
+      ['UNAVAILABLE from any verb', () => errCallTimeout('kill'), 'kill', UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      ['ErrTmuxKillFailed', () => errTmuxKillFailed(), 'kill', UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+      ['a status error', () => errSystemInstallDisappeared('status'), 'status', UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+    ] as const)('inside P\'s attempt, %s calls the sink once with P and the cause', async (_label, build, verb, kind) => {
+      const err = build()
+      const { arms } = makeSinkHarness()
+
+      const lastError = await runInAttempt(P1, 'recovery', (attempt) => {
+        reportAgentDirectorError(P1, err, verb)
+        return attempt.lastError
+      })
+
+      expect(arms).toHaveLength(1)
+      expect(arms[0]!.key).toBe(P1)
+      expect(arms[0]!.cause.kind).toBe(kind)
+      expect(arms[0]!.cause.error).toBe(err)
+      expect(lastError).toEqual({ verb, causeKind: kind, armed: true })
+    })
+
+    test.each([
+      ['a non-arming error inside P\'s attempt (ErrSpawnNotFound from status)', P1, () => errSpawnNotFound(), 'status'],
+      ['a status error with no verb known', P1, () => errSystemInstallDisappeared('status'), undefined],
+      ['an arming error inside Q\'s attempt', P2, () => errCallTimeout('status'), 'status'],
+    ] as const)('%s calls no sink', async (_label, attemptKey, build, verb) => {
+      const { arms } = makeSinkHarness()
+
+      await runInAttempt(attemptKey, 'recovery', () => {
+        reportAgentDirectorError(P1, build(), verb)
+      })
+
+      expect(arms).toHaveLength(0)
+    })
+
+    test('outside any attempt it calls no sink', () => {
+      const { arms } = makeSinkHarness()
+
+      reportAgentDirectorError(P1, errCallTimeout('status'), 'status')
+
+      expect(arms).toHaveLength(0)
+    })
+
+    test('with no sink installed, it records the error unarmed and does not throw', async () => {
+      makeSinkHarness({ sink: false })
+
+      const lastError = await runInAttempt(P1, 'recovery', (attempt) => {
+        reportAgentDirectorError(P1, errCallTimeout('status'), 'status')
+        return attempt.lastError
+      })
+
+      expect(lastError).toEqual({ verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, armed: false })
+    })
+
+    test('before initOutageState, or with a sink that throws, it does not throw', async () => {
+      _resetOutageState()
+      await runInAttempt(P1, 'recovery', () => {
+        expect(() => reportAgentDirectorError(P1, errCallTimeout('status'), 'status')).not.toThrow()
+      })
+
+      const { arms } = makeSinkHarness({ sinkThrows: true })
+      await runInAttempt(P1, 'recovery', () => {
+        expect(() => reportAgentDirectorError(P1, errCallTimeout('status'), 'status')).not.toThrow()
+      })
+      expect(arms).toHaveLength(1)
+    })
+
+    test('it raises no flag and posts no notice, even for a flag-raising error', async () => {
+      const { emissions, arms } = makeSinkHarness()
+
+      await runInAttempt(P1, 'recovery', () => {
+        reportAgentDirectorError(P1, errSystemInstallDisappeared('status', '/bin/ad'), 'status')
+        reportAgentDirectorError(P1, errTmuxNotAvailable(undefined, 'status'), 'status')
+      })
+
+      expect(arms).toHaveLength(2)
+      expect(getOutageFlags(P1).size).toBe(0)
+      expect(emissions).toHaveLength(0)
     })
   })
 })

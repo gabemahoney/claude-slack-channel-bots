@@ -205,7 +205,7 @@ import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import { createReloadTickDriver } from './reload-timer.ts'
 import { PRODUCTION_SLACK_CLIENT_FACTORY } from './persona-slack-clients.ts'
-import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection } from './outage-state.ts'
+import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection, reportAgentDirectorError } from './outage-state.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -932,6 +932,13 @@ export async function _runCallTimeoutStartStep(
  * tests call it directly to exercise the four SRD § Liveness probe branches
  * without importing the private closure inside main().
  *
+ * Its bare `status` is the one persona call not made through the outage
+ * wrappers, so its error branches report the error themselves
+ * (`reportAgentDirectorError` with the verb `status`): inside a restart run
+ * it arms the persona's retry timer (b.jg5 SRJ-301), and from the health
+ * tick, which runs outside every attempt, it arms nothing. A thrown `status`
+ * still reads dead.
+ *
  * @internal
  */
 export function _buildIsSessionAliveAdapter(
@@ -948,6 +955,9 @@ export function _buildIsSessionAliveAdapter(
       clearOutageFlag(key, 'tmux-unavailable')
       return AGENT_DIRECTOR_LIVE_STATES.has(r.state)
     } catch (err) {
+      // b.jg5 SRJ-301: inside a restart run (a recovery attempt) a status
+      // error arms the persona's retry timer; the reading below is unchanged.
+      reportAgentDirectorError(key, err, 'status')
       if (err instanceof ErrSpawnNotFound) {
         clearOutageFlag(key, 'ad-unreachable')
         clearOutageFlag(key, 'tmux-unavailable')
@@ -1955,7 +1965,9 @@ export async function main(): Promise<void> {
       // collision-then-act). The cwd and session-id arguments from the legacy
       // restart deps are ignored — the persona carries its working directory
       // and AD owns the resume state, not CSCB. A persona that is not up is
-      // skipped (neither success nor failure).
+      // skipped (neither success nor failure); a launch its UNAVAILABLE retry
+      // timer was armed for is passed through as 'refused', which restart.ts
+      // never counts (b.jg5 SRJ-301, SRJ-302).
       return await launchSession(key, personaConfig, { canLaunch: canRelaunch })
     },
     getRestartDelay: () => appliedConfig.session_restart_delay,

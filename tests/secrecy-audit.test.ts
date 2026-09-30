@@ -171,8 +171,6 @@ const EXEMPT: Record<string, string> = {
     "the click handler's emitBlockActionReceived over encoded action IDs and fixed channel and user IDs, captured as trail events; no input holds a token or credentials content",
   'tests/relay-repro.test.ts':
     "the permission relay end to end over makeStubSlack stubs with no leak marker and a stub agent-director whose rows and request tokens are UUIDs; no input holds a Slack token or credentials content",
-  'tests/outage-state.test.ts':
-    "imports the notifier's formatPersonaNotice only to build the expected outage notice text, which CSCB writes; no input holds a token or credentials content",
 }
 
 /** The AC 20 named legs: suites that must call `assertNoLeak`, with their extra content rules. */

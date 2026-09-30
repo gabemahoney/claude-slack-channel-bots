@@ -56,6 +56,11 @@
  * The classifier is pure: no I/O, clock, module state or agent-director call,
  * and it never throws (a throwing property read counts as an absent field).
  *
+ * {@link hasAdErrorName} answers whether a value is an agent-director error of
+ * one given `errName`, for a site that must tell one name from another (a
+ * STATE name's meaning is set per site); {@link isInvalidFlagsError} is its
+ * use for `ErrInvalidFlags`. Never throws.
+ *
  * {@link classifyWithInvalidFlagsRecheck} is the step for a site that gives
  * `ErrInvalidFlags` no meaning (b.jg5 SRJ-104: any site but a plain or reuse
  * spawn): an `ErrInvalidFlags` gets exactly one immediate version re-check
@@ -77,6 +82,7 @@ import {
 } from './ad-version-gate.ts'
 import {
   AgentDirectorError,
+  ERR_SPAWN_NOT_FOUND_NAME,
   ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
@@ -163,7 +169,7 @@ const CLASS_BY_ERR_NAME: ReadonlyMap<string, AdErrorClass> = new Map<string, AdE
   [ERR_TMUX_SESSION_CONFLICT_NAME, AD_ERROR_CLASS_CONFLICT],
   ['ErrTmuxNotAvailable', AD_ERROR_CLASS_ENVIRONMENT],
   ['ErrTmuxSessionCreate', AD_ERROR_CLASS_LAUNCH_FAILURE],
-  ['ErrSpawnNotFound', AD_ERROR_CLASS_STATE],
+  [ERR_SPAWN_NOT_FOUND_NAME, AD_ERROR_CLASS_STATE],
   ['ErrInstanceIdCollision', AD_ERROR_CLASS_STATE],
   ['ErrSpawnNotResumable', AD_ERROR_CLASS_STATE],
   ['ErrSpawnNotInteractive', AD_ERROR_CLASS_STATE],
@@ -229,8 +235,19 @@ export type InvalidFlagsError = AgentDirectorError & { readonly errName: typeof 
  * `errName`. Never throws.
  */
 export function isInvalidFlagsError(value: unknown): value is InvalidFlagsError {
+  return hasAdErrorName(value, ERR_INVALID_FLAGS_NAME)
+}
+
+/**
+ * True when `value` is an agent-director error whose `errName` is `name`
+ * (b.jg5 SRJ-101 interim rule: recognition by name). The one way a site tells
+ * one agent-director error name from another; pass a name constant from
+ * `src/agent-director-errors.ts`. Never throws: a value that is not an
+ * agent-director error, or whose `errName` cannot be read, answers false.
+ */
+export function hasAdErrorName(value: unknown, name: string): boolean {
   try {
-    return isAgentDirectorError(value) && readProp(value, 'errName') === ERR_INVALID_FLAGS_NAME
+    return isAgentDirectorError(value) && readProp(value, 'errName') === name
   } catch {
     return false
   }

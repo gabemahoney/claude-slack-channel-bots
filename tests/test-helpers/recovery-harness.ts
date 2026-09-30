@@ -20,7 +20,25 @@
  * - `stub`: one stub client (`makeStubClient`) with its call log
  *   (`stub.calls`), installed through `installStubSpawnPath` with the spawn
  *   home under the harness's temporary HOME, and handed to the outage state
- *   (`initOutageState`) as its client.
+ *   (`initOutageState`) as its client. The tmux session killer and server
+ *   ensurer the launch path can reach are inert, so no tmux runs.
+ *   `script(knobs)` sets the stub's answers (`StubClientOptions` knobs such
+ *   as `spawnError` or `getQueue`), read at each call.
+ * - `triggers`: the outage state's trigger sink (b.jg5 SRJ-301) is the
+ *   controller, behind a recorder: every trigger an agent-director error
+ *   inside a launch or recovery attempt sends (`{ key, kind }`, the cause
+ *   kind) is recorded here, then armed on the controller. With
+ *   `options.triggerSink: false` no sink is installed: nothing is recorded or
+ *   armed.
+ * - `launch(key)`: a start-pass launch of the configured persona `key`
+ *   through the real `spawnForPersona` (`isStartup` true) over the stub,
+ *   resolving with its `SpawnPersonaResult`. Each persona's working directory
+ *   exists, so a row the stub answers in it is the persona's own.
+ * - `settle()`: awaits every configured persona's launch in flight
+ *   (`whenLaunchSettled`). The spawn path polls in real time (the dialog
+ *   approver's 1 ms steps; it takes no fake clock), so this is the one
+ *   real-time wait: 1 ms steps, bounded by `options.settleMs`, and it throws
+ *   when a launch is still in flight at the bound.
  * - `outageNotices`: the outage state's notices, `{ key, text }`, in order.
  * - `notices`: the session manager's notices (`setSessionNotifier`),
  *   `{ key, text }`, in order.
@@ -45,22 +63,24 @@
  *   a re-arm measured from a run's end lands exactly and a run the test holds
  *   open does not stall the step. Resolves with the number of timers fired.
  * - `captured()`: everything captured, for `assertNoLeak`: the lines, both
- *   notice lists, the startup-errors entries, the attempts and the state
- *   directory as a written file.
+ *   notice lists, the startup-errors entries, the attempts, the triggers and
+ *   the state directory as a written file.
  * - `cleanup()`: stops every retry timer (`stopAll`), then undoes every
  *   install and reset the harness made (the restart module and the failure
- *   counter, the outage state, the session notifier, the stub spawn path and
- *   client, the settings install, `SLACK_STATE_DIR`) and removes the
- *   temporary directory. It throws, after undoing everything, when a timer
- *   is still pending on the clock or a persona is still armed.
+ *   counter, the outage state and its trigger sink, the session notifier,
+ *   the stub spawn path and client with every launch still in flight, the
+ *   findMissing memo, the tmux seams, the settings install,
+ *   `SLACK_STATE_DIR`) and removes the temporary directory. It throws, after
+ *   undoing everything, when a timer is still pending on the clock or a
+ *   persona is still armed.
  *
- * Later work extends this harness in place (a trigger-sink install and a
- * launch driver, the real restart entry as the default action, and the
- * pending-row rule, the latch and the episodes).
+ * Later work extends this harness in place (the real restart entry as the
+ * default action, and the pending-row rule, the latch and the episodes).
  *
  * Isolation: no top-level `mock.module()`, no real HOME, `~/.agent-director`,
- * tmux or child process, and no real timer. Every file sits under one
- * `mkdtempSync` directory.
+ * tmux or child process. The retry timer runs on the fake clock only; the one
+ * real-time wait is `settle()`'s bounded poll for the spawn path. Every file
+ * sits under one `mkdtempSync` directory.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -76,21 +96,41 @@ import { _resetBackoffState } from '../../src/backoff.ts'
 import type { PersonaConfig } from '../../src/config.ts'
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
 import { _resetRestartState, initRestart, type RestartDeps } from '../../src/restart.ts'
-import { setSessionNotifier } from '../../src/session-manager.ts'
+import {
+  _resetFindMissingMemo,
+  _resetTmuxServerEnsurer,
+  _resetTmuxSessionKiller,
+  _setTmuxServerEnsurer,
+  _setTmuxSessionKiller,
+  setSessionNotifier,
+  spawnForPersona,
+  whenLaunchSettled,
+  type SpawnPersonaResult,
+} from '../../src/session-manager.ts'
 import {
   createUnavailableRetryController,
   type UnavailableRetryAction,
+  type UnavailableRetryTriggerSink,
   type UnavailableRetryController,
   type UnavailableRetryOutcome,
 } from '../../src/unavailable-retry.ts'
 import { writeAgentDirectorConfig, type AdConfigInput } from './ad-settings.ts'
-import { installStubSpawnPath, resetStubSpawnPath, type StubSpawnPath } from './agent-director-stub.ts'
+import {
+  installStubSpawnPath,
+  resetStubSpawnPath,
+  type StubCallLog,
+  type StubClientOptions,
+  type StubSpawnPath,
+} from './agent-director-stub.ts'
 import { writtenFile } from './credentials.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
 
 /** Clock flushes `advance` waits at most for the in-flight retry runs, before and after each firing. */
 const DEFAULT_SETTLE_FLUSHES = 20
+
+/** How long `settle` waits at most for the launches in flight, in real ms (1 ms steps). */
+const DEFAULT_SETTLE_MS = 2000
 
 /** What the scripted action answers once a persona's queued outcomes run out: a refusal. */
 const SCRIPTED_REFUSAL: UnavailableRetryOutcome = Object.freeze({ kind: 'again', cause: Object.freeze({ kind: 'unavailable' }) })
@@ -111,6 +151,19 @@ export interface RecoveryHarnessOptions {
   restartDeps?: Partial<RestartDeps>
   /** Clock flushes `advance` waits at most for in-flight runs; `DEFAULT_SETTLE_FLUSHES` when unset. */
   settleFlushes?: number
+  /** Install the controller as the outage state's trigger sink (b.jg5 SRJ-301); true when unset. */
+  triggerSink?: boolean
+  /** Real ms `settle` waits at most for the launches in flight; `DEFAULT_SETTLE_MS` when unset. */
+  settleMs?: number
+}
+
+/** The stub's answer knobs: every `StubClientOptions` field but the capture lists. */
+export type RecoveryStubScript = Omit<StubClientOptions, keyof StubCallLog | 'callLog'>
+
+/** One trigger the outage state sent to the sink: the persona key and the cause kind. */
+export interface RecoveryTrigger {
+  readonly key: string
+  readonly kind: string
 }
 
 /** One retry the controller ran, as the action delegate saw it. */
@@ -141,6 +194,10 @@ export interface RecoveryHarness {
   readonly attempts: RecoveryAttempt[]
   readonly notices: RecoveryNotice[]
   readonly outageNotices: RecoveryNotice[]
+  readonly triggers: RecoveryTrigger[]
+  script(knobs: RecoveryStubScript): void
+  launch(key: string): Promise<SpawnPersonaResult>
+  settle(): Promise<void>
   answer(key: string, ...outcomes: UnavailableRetryOutcome[]): void
   setAction(action: UnavailableRetryAction | undefined): void
   startupErrors(): string[]
@@ -163,7 +220,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const attempts: RecoveryAttempt[] = []
   const notices: RecoveryNotice[] = []
   const outageNotices: RecoveryNotice[] = []
+  const triggers: RecoveryTrigger[] = []
   const settleFlushes = options.settleFlushes ?? DEFAULT_SETTLE_FLUSHES
+  const settleMs = options.settleMs ?? DEFAULT_SETTLE_MS
   const log = (line: string): void => {
     lines.push(line)
   }
@@ -173,6 +232,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     health_check_interval: options.healthCheckInterval ?? 0,
   })
   const keys = config.personas.map((persona) => persona.key)
+  for (const persona of config.personas) mkdirSync(persona.working_directory, { recursive: true })
 
   const queued = new Map<string, UnavailableRetryOutcome[]>()
   const scripted: UnavailableRetryAction = (key) => queued.get(key)?.shift() ?? SCRIPTED_REFUSAL
@@ -190,12 +250,22 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   process.env['SLACK_STATE_DIR'] = stateDir
 
   const stub = installStubSpawnPath(home)
+  _setTmuxSessionKiller(async () => {})
+  _setTmuxServerEnsurer(async () => {})
+  _resetFindMissingMemo()
+  const triggerSink: UnavailableRetryTriggerSink = {
+    arm(key, cause) {
+      triggers.push({ key, kind: cause.kind })
+      controller.arm(key, cause)
+    },
+  }
   _resetOutageState()
   initOutageState({
     notify: (key, text) => {
       outageNotices.push({ key, text })
     },
     getClient: () => stub.client as unknown as Client,
+    ...(options.triggerSink === false ? {} : { triggerSink }),
   })
   setSessionNotifier((key, text) => {
     notices.push({ key, text })
@@ -237,6 +307,18 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     void all
   }
 
+  /** Await every configured persona's launch in flight, in 1 ms real-time steps, for at most `settleMs`. */
+  async function settleLaunches(): Promise<void> {
+    let settled = false
+    const all = Promise.all(keys.map((key) => whenLaunchSettled(key))).then(() => {
+      settled = true
+    })
+    for (let waited = 0; waited < settleMs && !settled; waited++) {
+      await Promise.race([all, new Promise((resolve) => setTimeout(resolve, 1))])
+    }
+    if (!settled) throw new Error(`recovery harness: a launch was still in flight after ${settleMs} ms`)
+  }
+
   function startupErrors(): string[] {
     const path = join(stateDir, 'startup-errors.log')
     if (!existsSync(path)) return []
@@ -255,6 +337,24 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     attempts,
     notices,
     outageNotices,
+    triggers,
+
+    script(knobs) {
+      // The installed stub reads its knobs, at each call, from the object it
+      // records its calls in. Non-enumerable, so `callCount` and a comparison
+      // of `stub.calls` still see only the capture lists.
+      for (const [name, value] of Object.entries(knobs)) {
+        Object.defineProperty(stub.calls, name, { value, writable: true, configurable: true, enumerable: false })
+      }
+    },
+
+    launch(key) {
+      const persona = config.personas.find((p) => p.key === key)
+      if (persona === undefined) throw new Error(`recovery harness: no configured persona ${JSON.stringify(key)}`)
+      return spawnForPersona(persona, config, true)
+    },
+
+    settle: settleLaunches,
 
     answer(key, ...outcomes) {
       queued.set(key, [...(queued.get(key) ?? []), ...outcomes])
@@ -287,6 +387,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       outageNotices: [...outageNotices],
       startupErrors: startupErrors(),
       attempts: [...attempts],
+      triggers: [...triggers],
       stateDir: writtenFile(stateDir),
     }),
 
@@ -299,6 +400,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       _resetOutageState()
       setSessionNotifier(undefined)
       resetStubSpawnPath()
+      _resetTmuxSessionKiller()
+      _resetTmuxServerEnsurer()
+      _resetFindMissingMemo()
       resetAdSettingsForTests()
       if (savedStateDir === undefined) delete process.env['SLACK_STATE_DIR']
       else process.env['SLACK_STATE_DIR'] = savedStateDir

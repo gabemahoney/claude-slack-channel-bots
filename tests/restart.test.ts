@@ -16,6 +16,7 @@ import {
   _resetRestartState,
   isRestartPendingOrActive,
   RESTART_FAILURE_CAP,
+  type LaunchSessionResult,
   type RestartDeps,
 } from '../src/restart.ts'
 import {
@@ -77,24 +78,41 @@ import {
   cannedErr,
   cannedOk,
   cannedGetResult,
+  errCallTimeout,
   errGeneric,
   errInstanceIdCollision,
+  errInvalidFlags,
   errSpawnNotFound,
   errSpawnNotInteractive,
+  errTmuxKillFailed,
   errTmuxSendKeys,
+  errTmuxSessionCreate,
+  errTmuxUnresponsive,
   holdSpawns,
   makeStubCallLog,
+  makeStubResolveSystemBinary,
   type SpawnHold,
   type StubCallLog,
 } from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
-import type { DeleteParams, FindMissingParams, KillParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams } from 'agent-director'
+import type { DeleteParams, FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams } from 'agent-director'
 import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import { stubOpenedDmId, type StubWebMethod } from './test-helpers/slack-stub.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import type { Persona, PersonaConfig } from '../src/config.ts'
+import {
+  createUnavailableRetryController,
+  UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
+  UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  type UnavailableRetryController,
+} from '../src/unavailable-retry.ts'
+import { installAdVersionRecheck, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -114,8 +132,8 @@ type DepsOpts = {
   isSessionAliveResult?: boolean  // default: false (session is dead)
   isSessionConnectedResult?: boolean  // default: false (not yet reconnected)
   hasSessionStreamResult?: boolean  // default: true (stream present — prior semantics)
-  launchSessionResult?: boolean | 'skipped'  // default: true (launch succeeds); 'skipped': the relaunch gate declined
-  launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<boolean | 'skipped'>  // override entire launchSession
+  launchSessionResult?: LaunchSessionResult  // default: true (launch succeeds); 'skipped': the relaunch gate declined
+  launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<LaunchSessionResult>  // override entire launchSession
   killSession?: (key: string) => Promise<void>  // runs after the capture (e.g. the real kill adapter)
   restartDelay?: number           // default: FAST_DELAY_S
   isShuttingDown?: boolean        // default: false
@@ -2369,7 +2387,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
   /** Every `kill` the stub AD client received. */
   let killCalls: KillParams[]
   /** Each result restart received from `launchSession`, in settle order. */
-  let launchResults: Array<{ key: string; ok: boolean | 'skipped' }>
+  let launchResults: Array<{ key: string; ok: LaunchSessionResult }>
   /** Session-manager notices (spawn-failure notices land here). */
   let notices: Array<{ key: string; text: string }>
   /** console.error lines written during the test. */
@@ -2682,7 +2700,7 @@ describe('restart: the reply-guard record holds the effective value before the r
   // are covered against the ladder in session-manager.test.ts.
   test('dead session, ended row, stop_hook_bootstrap false: the record reads false before each relaunch call (the optimistic spawn is undone, then resume)', async () => {
     const { config, a } = setup(false, 'ended')
-    const results: Array<boolean | 'skipped'> = []
+    const results: LaunchSessionResult[] = []
     const deps = makeDeps({
       isSessionAliveResult: false,
       launchSession: async (key) => {
@@ -2756,7 +2774,7 @@ describe('restart: the reply-guard record holds the effective value before the r
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
     setClientForTests(stub as unknown as Client)
-    const results: Array<boolean | 'skipped'> = []
+    const results: LaunchSessionResult[] = []
     initRestart(makeDeps({
       launchSession: async (key) => {
         const ok = await launchPersonaSession(key, applied)
@@ -3171,5 +3189,356 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
       `[slack] killSession (restart adapter): error for persona=${a.key}: ${shown}`,
     ])
     assertNoLeak({ errArgs })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-301, SRJ-302: the restart run is a recovery attempt. Its
+// liveness read, its reconnect (the status read, the pane read and the
+// `/mcp reconnect` send-keys), its kill and its relaunch run inside it, so an
+// UNAVAILABLE outcome from any of them, or a `status` read error, arms the
+// persona's UNAVAILABLE retry timer. A relaunch answered UNAVAILABLE is
+// `'refused'`: the timer owns the persona and restart.ts never counts it, so
+// the cap is never reached on UNAVAILABLE alone. A LAUNCH FAILURE (`false`)
+// still counts and caps.
+//
+// The adapters are server.ts's and the session manager's REAL ones over the
+// stub AD client, and a real retry controller is installed as the outage
+// wrappers' trigger sink (`initOutageState({ triggerSink })`), on a fake clock
+// that is never moved: no retry ever runs, and no real retry timer exists.
+// The restart timer is the file's accepted real one; each run is awaited with
+// a foreground poll until the persona's restart is neither pending nor active.
+// Two personas are configured: P (`alpha_bot`) is restarted and Q
+// (`beta_bot`) never is, so each case shows Q's timer left alone.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry timer, and a refused relaunch is never counted', () => {
+  let dir: string
+  let config: PersonaConfig
+  let p: Persona
+  let q: Persona
+  let clock: FakeClock
+  let retry: UnavailableRetryController
+  /** Every line the retry controller logged. */
+  let retryLines: string[]
+  /** console.error lines written during the test. */
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+  /** Each result restart received from the real launch adapter, in settle order. */
+  let launchResults: LaunchSessionResult[]
+
+  const REFUSED_LINE = (key: string) =>
+    `[slack] Session relaunch refused for persona=${key} — not counted; its UNAVAILABLE retry timer owns the persona`
+  const FAILED_LINE = (key: string) => `[slack] Session relaunch failed for persona=${key}`
+
+  /** The controller's armed lines for `key` (one per first arm; a trigger while armed logs none). */
+  const armedLines = (key: string) => retryLines.filter((l) => l.startsWith(`[slack] unavailable-retry: persona=${key} armed (`))
+
+  /** A plain `Error` (not an agent-director error, so UNAVAILABLE) whose message carries a fake token. */
+  const plainError = () => new Error(`agent-director went away (${sentinelInMessage('unavailable')})`)
+
+  /** Install a stub AD client built from `opts` (status answers `waiting` unless overridden), with the controller as the trigger sink. */
+  function installStub(opts: Parameters<typeof makeStubClient>[0]): void {
+    const stub = makeStubClient({ statusFn: () => ({ state: 'waiting' }), ...opts })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client, triggerSink: retry })
+    setClientForTests(stub as unknown as Client)
+  }
+
+  /** The real launch adapter over the applied config, recording each result restart receives. */
+  const realLaunch = async (key: string): Promise<LaunchSessionResult> => {
+    const ok = await launchPersonaSession(key, config)
+    launchResults.push(ok)
+    return ok
+  }
+
+  /** Schedule one restart of `key` and wait (foreground poll) until its run has finished. */
+  async function runRestart(key: string, ms = 2000): Promise<void> {
+    scheduleRestart(key, config.personas.find((x) => x.key === key)!.working_directory)
+    const deadline = Date.now() + ms
+    while (isRestartPendingOrActive(key) && Date.now() < deadline) await Bun.sleep(5)
+    expect(isRestartPendingOrActive(key)).toBe(false)
+  }
+
+  /** P's timer is armed once, with `cause` only, its first retry `UNAVAILABLE_RETRY_BASE_S` out; Q's is not armed. */
+  function expectArmedOnce(cause: string): void {
+    expect(armedLines(p.key)).toHaveLength(1)
+    expect(retry.armedKeys()).toEqual([p.key])
+    expect(retry.view(p.key)).toEqual({
+      phase: 'waiting',
+      dueAt: UNAVAILABLE_RETRY_BASE_S * 1000,
+      waitMs: UNAVAILABLE_RETRY_BASE_S * 1000,
+      refusals: 0,
+      causes: [cause],
+    })
+    expect(clock.pendingCount()).toBe(1)
+    expect(retry.isArmed(q.key)).toBe(false)
+    expect(armedLines(q.key)).toEqual([])
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-unavailable-'))
+    config = makeMultiPersonaConfig([{ name: 'alpha_bot' }, { name: 'beta_bot' }], dir)
+    ;[p, q] = config.personas as [Persona, Persona]
+    clock = createFakeClock()
+    retryLines = []
+    retry = createUnavailableRetryController({
+      log: (line) => { retryLines.push(line) },
+      // Never reached: the fake clock is never moved.
+      action: () => ({ kind: 'stop', reason: 'test action' }),
+      clock,
+    })
+    launchResults = []
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+    setSessionNotifier(() => {})
+    _resetInFlightLaunches()
+    _resetFindMissingMemo()
+    _setSpawnHomeDir(dir)
+    _setDialogPollIntervalMs(1)
+    _setDialogReadyTimeoutMs(200)
+    _setTmuxCapturePane(async () => '')
+    _setTmuxSendEnter(async () => {})
+    _setTmuxSessionProber(async () => true)
+    _setTmuxServerEnsurer(async () => {})
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    retry.stopAll('test end')
+    cancelAllRestartTimers()
+    resetAdVersionRecheckForTests()
+    _resetInFlightLaunches()
+    _resetFindMissingMemo()
+    resetClientForTests()
+    _resetOutageState()
+    setSessionNotifier(undefined)
+    _resetSpawnHomeDir()
+    _resetDialogPollIntervalMs()
+    _resetDialogReadyTimeoutMs()
+    _resetTmuxDialogHelpers()
+    _resetTmuxSessionProber()
+    _resetTmuxServerEnsurer()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  // Each site answers UNAVAILABLE with each generic value, and the kill with
+  // ErrTmuxKillFailed, the kill-failure cause told apart by name.
+  type Site = 'kill' | 'send-keys' | 'read-pane' | 'spawn'
+  const UNAVAILABLE_VALUES: ReadonlyArray<[string, (verb: string) => Error]> = [
+    ['a plain Error', () => plainError()],
+    ['ErrCallTimeout', (verb) => errCallTimeout(verb)],
+    ['ErrTmuxUnresponsive', (verb) => errTmuxUnresponsive(verb)],
+  ]
+  const SITE_CASES: Array<[Site, string, () => Error, string]> = [
+    ...(['kill', 'send-keys', 'read-pane', 'spawn'] as const).flatMap((site) =>
+      UNAVAILABLE_VALUES.map(([label, make]): [Site, string, () => Error, string] => [site, label, () => make(site), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE]),
+    ),
+    ['kill', 'ErrTmuxKillFailed', () => errTmuxKillFailed(), UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+  ]
+
+  test.each(SITE_CASES)('SRJ-301: the restart run\'s %s answers %s → P\'s retry timer is armed once (cause %s is recorded); Q\'s is left alone', async (site, _label, makeError, cause) => {
+    const err = makeError()
+    const sendKeysCalls: SendKeysParams[] = []
+    const readPaneCalls: ReadPaneParams[] = []
+    const spawnCalls: SpawnParams[] = []
+    const killCalls: KillParams[] = []
+    installStub({
+      sendKeysCalls,
+      readPaneCalls,
+      spawnCalls,
+      killCalls,
+      ...(site === 'kill' ? { killError: err } : {}),
+      ...(site === 'send-keys' ? { sendKeysError: err } : {}),
+      ...(site === 'read-pane' ? { readPaneError: err } : {}),
+      ...(site === 'spawn' ? { spawnError: err } : {}),
+    })
+    // The kill and spawn sites take the dead branch (kill, then relaunch); the
+    // reconnect sites take the alive-but-disconnected branch through the real
+    // reconnect adapter (a `waiting` row: its pane is read, then the keystrokes typed).
+    const reconnectSite = site === 'send-keys' || site === 'read-pane'
+    const deps = makeDeps({
+      isSessionAliveResult: reconnectSite,
+      killSession: site === 'kill' ? _buildKillSessionAdapter() : undefined,
+      launchSession: site === 'spawn' ? realLaunch : undefined,
+    })
+    if (reconnectSite) deps.reconnectSession = _buildReconnectSessionAdapter()
+    initRestart(deps)
+
+    await runRestart(p.key)
+
+    // The failing call was made, addressed to P.
+    const reached: Record<Site, number> = {
+      kill: killCalls.length,
+      'send-keys': sendKeysCalls.length,
+      'read-pane': readPaneCalls.length,
+      spawn: spawnCalls.length,
+    }
+    expect(reached[site]).toBeGreaterThan(0)
+    expectArmedOnce(cause)
+    if (site === 'spawn') expect(launchResults).toEqual(['refused'])
+    // No retry ran, and nothing was counted at the restart counting site.
+    expect(retryLines.filter((l) => l.includes(' retry 1 '))).toEqual([])
+    expect(getFailureCount(p.key)).toBe(0)
+    expect(errLines.filter((l) => l === FAILED_LINE(p.key))).toEqual([])
+    assertNoLeak({ retryLines, errLines })
+  })
+
+  test('SRJ-301: the reconnect adapter\'s status read fails with a non-UNAVAILABLE error → a read-error cause arms P\'s timer once; nothing is typed', async () => {
+    const sendKeysCalls: SendKeysParams[] = []
+    const statusCalls: StatusParams[] = []
+    installStub({ statusFn: undefined, statusError: errGeneric('status', 'ErrStatusBroken', 'the store could not be read'), statusCalls, sendKeysCalls })
+    const deps = makeDeps({ isSessionAliveResult: true })
+    deps.reconnectSession = _buildReconnectSessionAdapter()
+    initRestart(deps)
+
+    await runRestart(p.key)
+
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p.key)])
+    expect(sendKeysCalls).toEqual([])
+    expectArmedOnce(UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
+  })
+
+  // Ruling (a): the liveness adapter's `status` error inside a restart run
+  // arms the timer. Its reading is unchanged in E8 (a thrown status still
+  // reads dead), and the kill and launch that follow are E9's to change, so
+  // these cases assert the arming only.
+  test.each<[string, () => Error, string]>([
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['UNAVAILABLE (ErrCallTimeout)', () => errCallTimeout('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['a read error (an unclassified name)', () => errGeneric('status', 'ErrStatusBroken', 'the store could not be read'), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+  ])('SRJ-301: the liveness adapter\'s status throws %s inside the restart run → P\'s timer is armed once (cause %s); Q\'s is left alone', async (_label, makeError, cause) => {
+    const statusCalls: StatusParams[] = []
+    installStub({ statusFn: undefined, statusError: makeError(), statusCalls })
+    const deps = makeDeps()
+    deps.isSessionAlive = _buildIsSessionAliveAdapter(() => config)
+    initRestart(deps)
+
+    await runRestart(p.key)
+
+    expect(statusCalls[0]!.claude_instance_id).toBe(personaInstanceId(p.key))
+    expectArmedOnce(cause)
+  })
+
+  test('SRJ-301: the liveness adapter\'s status throws ErrSpawnNotFound inside the restart run → nothing is armed (the site keeps its meaning)', async () => {
+    installStub({ statusFn: undefined, statusError: errSpawnNotFound() })
+    const deps = makeDeps()
+    deps.isSessionAlive = _buildIsSessionAliveAdapter(() => config)
+    initRestart(deps)
+
+    await runRestart(p.key)
+
+    expect(retry.armedKeys()).toEqual([])
+    expect(retryLines).toEqual([])
+  })
+
+  test('SRJ-301: the liveness adapter\'s status throws UNAVAILABLE outside any attempt (the health tick\'s call) → nothing is armed; it still reads dead', async () => {
+    installStub({ statusFn: undefined, statusError: errTmuxUnresponsive('status') })
+
+    expect(await _buildIsSessionAliveAdapter(() => config)(p.key)).toBe(false)
+
+    expect(retry.armedKeys()).toEqual([])
+    expect(retryLines).toEqual([])
+  })
+
+  test(`SRJ-302: every relaunch answered UNAVAILABLE is 'refused' — across ${RESTART_FAILURE_CAP + 2} restart runs the failure count stays 0, the cap is never reached and onCapReached never fires; P's timer was armed once`, async () => {
+    const spawnCalls: SpawnParams[] = []
+    installStub({ spawnError: errTmuxUnresponsive('spawn'), spawnCalls })
+    const deps = makeDeps({ launchSession: realLaunch })
+    initRestart(deps)
+
+    const runs = RESTART_FAILURE_CAP + 2
+    for (let i = 0; i < runs; i++) await runRestart(p.key)
+
+    expect(spawnCalls).toHaveLength(runs)
+    expect(launchResults).toEqual(Array(runs).fill('refused'))
+    expect(getFailureCount(p.key)).toBe(0)
+    expect(isAtCap(p.key, RESTART_FAILURE_CAP)).toBe(false)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(errLines.filter((l) => l === REFUSED_LINE(p.key))).toHaveLength(runs)
+    expect(errLines.filter((l) => l === FAILED_LINE(p.key))).toEqual([])
+    // Later triggers while armed keep the first arm's due time.
+    expectArmedOnce(UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
+  })
+
+  test('a relaunch that fails with a LAUNCH FAILURE (ErrTmuxSessionCreate) still answers false: each run counts, the cap is reached and onCapReached fires once; no timer is armed', async () => {
+    installStub({ spawnError: errTmuxSessionCreate('spawn') })
+    const deps = makeDeps({ restartDelay: CAP_BASE_DELAY_S, launchSession: realLaunch })
+    initRestart(deps)
+
+    for (let i = 0; i < RESTART_FAILURE_CAP; i++) await runRestart(p.key)
+
+    expect(launchResults).toEqual(Array(RESTART_FAILURE_CAP).fill(false))
+    expect(getFailureCount(p.key)).toBe(RESTART_FAILURE_CAP)
+    expect(isAtCap(p.key, RESTART_FAILURE_CAP)).toBe(true)
+    expect(deps.onCapReachedCalls).toEqual([p.key])
+    expect(errLines.filter((l) => l === REFUSED_LINE(p.key))).toEqual([])
+    expect(retry.armedKeys()).toEqual([])
+  })
+
+  // The restart counting site alone: `'refused'` from the deps is neither a
+  // success nor a failure, like `'skipped'`, and logs its one line.
+  test('SRJ-302: launchSession=refused is neither a success nor a failure (no reset, no count, no cap) and logs the refused line; a later false launch counts and caps', async () => {
+    for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(p.key)
+    let outcome: LaunchSessionResult = 'refused'
+    const deps = makeDeps({ restartDelay: CAP_BASE_DELAY_S, launchSession: async () => outcome })
+    initRestart(deps)
+
+    // Two refused runs one short of the cap: a counted one would cap it.
+    await runRestart(p.key)
+    await runRestart(p.key)
+
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([p.key, p.key])
+    expect(getFailureCount(p.key)).toBe(RESTART_FAILURE_CAP - 1)
+    expect(isAtCap(p.key, RESTART_FAILURE_CAP)).toBe(false)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(errLines.filter((l) => l === REFUSED_LINE(p.key))).toHaveLength(2)
+    expect(errLines.filter((l) => l === FAILED_LINE(p.key))).toEqual([])
+
+    outcome = false
+    await runRestart(p.key)
+
+    expect(getFailureCount(p.key)).toBe(RESTART_FAILURE_CAP)
+    expect(deps.onCapReachedCalls).toEqual([p.key])
+  })
+
+  // The E8 resume item's restart half: a resume answered ErrInvalidFlags whose
+  // immediate version re-check decided the stop makes the real launch adapter
+  // answer 'skipped', which records no failure. The real re-check is installed
+  // over a stub resolveSystemBinary that answers a version below the floor,
+  // on its own fake clock that is never moved; its stop is recorded, not run.
+  test('E8: the relaunch\'s resume answers ErrInvalidFlags and the version re-check decides the stop → the launch is \'skipped\': no failure is recorded, the count is unchanged, no cap and no timer', async () => {
+    const stops: number[] = []
+    installAdVersionRecheck({
+      resolveSystemBinary: makeStubResolveSystemBinary({ outcomes: [{ version: OLD_AD_VERSION }] }),
+      baselineVersion: PHASE1_RC_VERSION,
+      recordStartupError: () => {},
+      stop: (exitCode) => { stops.push(exitCode) },
+      log: () => {},
+      clock: createFakeClock(),
+    })
+    const resumeCalls: ResumeParams[] = []
+    installStub({
+      spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ state: 'ended' }, p, dir),
+      resumeError: errInvalidFlags('resume'),
+      resumeCalls,
+    })
+    // One failure on record, so a counted launch or a reset would show.
+    recordFailure(p.key)
+    const deps = makeDeps({ launchSession: realLaunch })
+    initRestart(deps)
+
+    await runRestart(p.key)
+
+    expect(resumeCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p.key)])
+    expect(stops).toHaveLength(1)
+    expect(launchResults).toEqual(['skipped'])
+    expect(getFailureCount(p.key)).toBe(1)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(errLines.filter((l) => l === FAILED_LINE(p.key))).toEqual([])
+    expect(errLines.filter((l) => l === REFUSED_LINE(p.key))).toEqual([])
+    expect(retry.armedKeys()).toEqual([])
   })
 })

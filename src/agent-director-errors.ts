@@ -142,6 +142,15 @@ export const ERR_SCHEMA_MISMATCH_NAME = 'ErrSchemaMismatch'
 export const ERR_SCHEMA_MIGRATION_REQUIRED_NAME = 'ErrSchemaMigrationRequired'
 export const ERR_STORE_OPEN_NAME = 'ErrStoreOpen'
 
+/**
+ * `errName` of the error agent-director answers when no row has the instance
+ * id (`get`, `status`, `decide` and the other single-row verbs). Every client
+ * declares its class; the name is kept here for the sites that tell one
+ * agent-director error from another by name (`hasAdErrorName` in
+ * `src/ad-error-class.ts`).
+ */
+export const ERR_SPAWN_NOT_FOUND_NAME = 'ErrSpawnNotFound'
+
 /** The three store-open error names, in one list. */
 export const STORE_OPEN_ERR_NAMES = [
   ERR_SCHEMA_MISMATCH_NAME,

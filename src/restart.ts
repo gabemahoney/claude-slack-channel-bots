@@ -16,6 +16,14 @@
  * (b.av2 SR-6.6, `RestartDeps.serialize`), so it never overlaps a teardown or
  * a bring-up retry's launch for the same persona, and its checks see the
  * state when the work starts.
+ * The work runs as a recovery attempt for the persona (b.jg5 SRJ-301,
+ * `runInAttempt`), adapters included: an UNAVAILABLE outcome from any of its
+ * agent-director calls (the liveness read, the reconnect with its reads, the
+ * kill, the relaunch), or a `status`, `get` or `list` error, arms the
+ * persona's UNAVAILABLE retry timer through the installed trigger sink. A
+ * relaunch the timer now owns answers `'refused'`, which is never counted
+ * toward the cap (SRJ-302): a persona is never given up on for UNAVAILABLE
+ * alone.
  * Isolated from server.ts side effects — injectable deps make it testable.
  *
  * SPDX-License-Identifier: MIT
@@ -29,6 +37,7 @@ import {
 } from './backoff.ts'
 import type { PersonaSerialize } from './persona-serializer.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
+import { runInAttempt } from './unavailable-retry.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -99,9 +108,12 @@ export interface RestartDeps {
   /**
    * `cwd` is the persona's working directory. `'skipped'`: the launch was
    * declined (the persona stopped being up after the last `canRestart`
-   * check), which counts as neither a success nor a failure.
+   * check, or the server is stopping), which counts as neither a success nor
+   * a failure. `'refused'`: the launch failed and its UNAVAILABLE retry timer
+   * was armed for it (b.jg5 SRJ-301), so the timer owns the persona; it
+   * counts as neither either (SRJ-302).
    */
-  launchSession(key: string, cwd: string, sessionId?: string): Promise<boolean | 'skipped'>
+  launchSession(key: string, cwd: string, sessionId?: string): Promise<LaunchSessionResult>
   getRestartDelay(): number
   isShuttingDown(): boolean
   /**
@@ -121,6 +133,13 @@ export interface RestartDeps {
    */
   serialize?: PersonaSerialize
 }
+
+/**
+ * What a restart's launch answers: true launched, false a counted failure,
+ * `'skipped'` declined and `'refused'` handed to the retry timer, neither of
+ * which is counted.
+ */
+export type LaunchSessionResult = boolean | 'skipped' | 'refused'
 
 // ---------------------------------------------------------------------------
 // Module-scoped state
@@ -234,8 +253,14 @@ async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise
  * kill and a launch, and the success or failure accounting. A reconnect whose
  * verdict is 'escalate-dead' is followed by a second liveness probe; when the
  * row now reads dead, the same run goes on to the kill and launch (b.d61).
+ * The whole work is one recovery attempt for the persona (b.jg5 SRJ-301).
  */
 async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<void> {
+  await runInAttempt(key, 'recovery', () => restartWorkSteps(d, key, cwd, sessionId))
+}
+
+/** The steps of `runRestartWork`, inside its recovery attempt. */
+async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<void> {
   if (d.isShuttingDown()) {
     console.error(`[slack] Skipping restart — server is shutting down (persona=${key})`)
     return
@@ -331,7 +356,7 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
 
   console.error(`[slack] Relaunching session for persona=${key} cwd="${cwd}"`)
 
-  let ok: boolean | 'skipped'
+  let ok: LaunchSessionResult
   try {
     ok = await d.launchSession(key, cwd, sessionId)
   } catch (err) {
@@ -340,11 +365,22 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
   }
 
   if (ok === 'skipped') {
-    // Declined, not attempted: the persona stopped being up between the
-    // last `canRestart` check above and the launch, and the launch's own
-    // gate (the same relaunch gate) logged why. The instance was already
-    // killed by then; the failure counter, backoff and cap latch are left
-    // exactly as they were.
+    // Declined: the persona stopped being up between the last `canRestart`
+    // check above and the launch, and the launch's own gate (the same
+    // relaunch gate) logged why; or the launch's version re-check decided
+    // the stop, and the server is stopping. The instance was already killed
+    // by then; the failure counter, backoff and cap latch are left exactly
+    // as they were.
+    return
+  }
+
+  if (ok === 'refused') {
+    // b.jg5 SRJ-302: refused, not failed. The launch met an UNAVAILABLE
+    // outcome (or a read error) that armed the persona's retry timer, which
+    // owns the persona from here. A persona is never given up on for
+    // UNAVAILABLE alone, so the failure counter, backoff and cap latch are
+    // left exactly as they were.
+    console.error(`[slack] Session relaunch refused for persona=${key} — not counted; its UNAVAILABLE retry timer owns the persona`)
     return
   }
 

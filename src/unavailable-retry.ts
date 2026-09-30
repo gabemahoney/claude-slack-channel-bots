@@ -40,11 +40,30 @@
  * is imported. The timer runs whatever the persona's restart delay and
  * health-check interval are, 0 included: this module reads neither.
  *
- * Each controller keeps its own per-persona entries, and there is no
- * module-scope state, so nothing spans two personas or two controllers.
+ * Each controller keeps its own per-persona entries, and no persona state is
+ * kept at module scope, so nothing spans two personas or two controllers.
  * Nothing is armed, read or logged at import or at creation. The clock and
  * timers, the log sink and the retry action are injected; the real clock is
  * the default.
+ *
+ * What arms a timer (b.jg5 SRJ-301). A launch attempt (a run of a persona's
+ * collision ladder, whoever starts it) and a recovery attempt (a run of its
+ * restart work) run through `runInAttempt(key, kind, fn)`, an attempt context
+ * carried by `AsyncLocalStorage` across the attempt's awaits and timers; it
+ * holds the running attempts only. `isInsideAttempt(key)` reads it; an
+ * attempt for another persona, or a call outside every attempt (the health
+ * tick, the permission poller, the JSONL safeguard, the start sweep, a
+ * persona teardown), is not inside one.
+ * `reportAttemptError(key, value, verb, sink)` is the one reporting step,
+ * which the agent-director wrappers and the liveness adapter reach through
+ * `src/outage-state.ts`: inside an attempt for `key`, the arming predicate
+ * `unavailableRetryCauseFor(value, verb)` decides the cause (UNAVAILABLE from
+ * any verb, `ErrTmuxKillFailed` told apart by name; any other `status`, `get`
+ * or `list` error but `ErrSpawnNotFound`, CONFIG and UNUSABLE NAME), the
+ * trigger sink (`UnavailableRetryTriggerSink`, which the controller is) arms
+ * the persona's timer with it, and the innermost attempt records the error as
+ * its last, with whether it armed. A trigger while armed keeps the due time
+ * (`arm` above).
  *
  * Log lines (`[slack] unavailable-retry: persona=<key> …`), one each for
  * armed, retry, re-armed (with the wait), stopped (with the reason),
@@ -58,6 +77,16 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
+
+import {
+  AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+  classifyAdError,
+  hasAdErrorName,
+} from './ad-error-class.ts'
+import { ERR_SPAWN_NOT_FOUND_NAME, ERR_TMUX_KILL_FAILED_NAME } from './agent-director-errors.ts'
 import { doublingBackoffDelay } from './backoff.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
@@ -72,10 +101,19 @@ export const UNAVAILABLE_RETRY_BASE_S = 30
 /** Retry wait ceiling, in seconds (b.jg5 SRJ-302). There is no attempt cap. */
 export const UNAVAILABLE_RETRY_CEILING_S = 300
 
+/** The cause of an UNAVAILABLE outcome from any verb in an attempt (b.jg5 SRJ-301). */
+export const UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE = 'unavailable'
+
+/** The cause of an `ErrTmuxKillFailed` in an attempt: UNAVAILABLE, told apart by name. */
+export const UNAVAILABLE_RETRY_CAUSE_KILL_FAILED = 'kill-failed'
+
+/** The cause of any other `status`, `get` or `list` error in an attempt (b.jg5 SRJ-301, SRJ-105). */
+export const UNAVAILABLE_RETRY_CAUSE_READ_ERROR = 'read-error'
+
 /** A cause kind that is not a short lower-case label is logged as this. */
 const UNNAMED_CAUSE_KIND = 'unnamed'
 
-/** A cause kind as logged: a short lower-case label (`unavailable`, `status-error`). */
+/** A cause kind as logged: a short lower-case label (`unavailable`, `read-error`). */
 const CAUSE_KIND_RE = /^[a-z][a-z0-9-]{0,63}$/
 
 /** What `arm` records when it is given no cause (possible from untyped callers). */
@@ -95,7 +133,7 @@ export type UnavailableRetryClock = PersonaConnectionClock
 export interface UnavailableRetryCause {
   /**
    * A fixed, token-free label for the cause, lower case with hyphens (for
-   * example `unavailable` or `status-error`). Recorded once per timer in the
+   * example `unavailable` or `read-error`). Recorded once per timer in the
    * order first seen; logged as `unnamed` when it is not such a label.
    */
   readonly kind: string
@@ -150,8 +188,18 @@ export interface UnavailableRetryView {
   readonly causes: readonly string[]
 }
 
+/**
+ * Where a trigger inside a launch or recovery attempt is sent (b.jg5
+ * SRJ-301): the persona key and the cause the arming predicate answered. The
+ * controller is one: its `arm` arms the persona's timer with the cause. Must
+ * not throw; a throw is caught by the reporting point and counts as not armed.
+ */
+export interface UnavailableRetryTriggerSink {
+  arm(key: string, cause: UnavailableRetryCause): void
+}
+
 /** The per-persona UNAVAILABLE retry timers of one server. */
-export interface UnavailableRetryController {
+export interface UnavailableRetryController extends UnavailableRetryTriggerSink {
   /**
    * Arm persona `key`'s timer with `cause`. When not armed, its first retry
    * is due `UNAVAILABLE_RETRY_BASE_S` from now and one armed line is logged.
@@ -401,5 +449,183 @@ function describeCause(cause: UnavailableRetryCause): string {
     return 'error' in cause && cause.error !== undefined ? `${kind}: ${describeThrownValue(cause.error)}` : kind
   } catch {
     return kind
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The arming predicate (b.jg5 SRJ-301)
+// ---------------------------------------------------------------------------
+
+/** The verbs whose error inside an attempt is a read error (b.jg5 SRJ-301, SRJ-105). */
+const READ_VERBS: ReadonlySet<string> = new Set(['status', 'get', 'list'])
+
+/**
+ * What arms persona P's retry timer when `value` is thrown by an
+ * agent-director call made with `verb` inside a launch or recovery attempt
+ * for P (b.jg5 SRJ-301), classified by `classifyAdError`:
+ *
+ * - UNAVAILABLE from any verb: an `unavailable` cause, or a `kill-failed`
+ *   cause when the value's name is `ErrTmuxKillFailed`;
+ * - any other `status`, `get` or `list` error: a `read-error` cause, except
+ *   `ErrSpawnNotFound` (each site keeps its meaning) and a CONFIG or UNUSABLE
+ *   NAME answer (each takes its own handling, SRJ-105);
+ * - `undefined` (nothing arms) otherwise.
+ *
+ * The cause carries `value`, which reaches a line only through
+ * `describeThrownValue`. `verb` is agent-director's verb name (`status`,
+ * `get`, `list`, `kill`, `spawn`, `read-pane` …); an unknown verb is never a
+ * read. Never throws.
+ */
+export function unavailableRetryCauseFor(value: unknown, verb: string | undefined): UnavailableRetryCause | undefined {
+  try {
+    const { errorClass } = classifyAdError(value)
+    if (errorClass === AD_ERROR_CLASS_UNAVAILABLE) {
+      const kind = hasAdErrorName(value, ERR_TMUX_KILL_FAILED_NAME)
+        ? UNAVAILABLE_RETRY_CAUSE_KILL_FAILED
+        : UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE
+      return { kind, error: value }
+    }
+    if (verb === undefined || !READ_VERBS.has(verb)) return undefined
+    if (errorClass === AD_ERROR_CLASS_CONFIG || errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) return undefined
+    if (hasAdErrorName(value, ERR_SPAWN_NOT_FOUND_NAME)) return undefined
+    return { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR, error: value }
+  } catch {
+    return undefined
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The attempt context (b.jg5 SRJ-301)
+// ---------------------------------------------------------------------------
+
+/**
+ * A launch attempt (a run of the persona's collision ladder, whoever starts
+ * it) or a recovery attempt (a run of its restart work, with its adapters).
+ */
+export type AttemptKind = 'launch' | 'recovery'
+
+/** The last agent-director error an attempt met. */
+export interface AttemptErrorRecord {
+  /** The verb the failed call was made with, when known. */
+  readonly verb?: string
+  /** The cause kind the arming predicate answered; absent when it answered nothing. */
+  readonly causeKind?: string
+  /** True when the error was sent to a trigger sink, which arms the persona's timer. */
+  readonly armed: boolean
+}
+
+/** A read-only view of one running attempt. */
+export interface AttemptView {
+  readonly key: string
+  readonly kind: AttemptKind
+  /** The last agent-director error met inside this attempt (not inside one nested in it), if any. */
+  readonly lastError: AttemptErrorRecord | undefined
+}
+
+/**
+ * One attempt as the context holds it: its parent is the nearest attempt still
+ * running when it was started, if any.
+ */
+interface AttemptFrame {
+  readonly key: string
+  readonly kind: AttemptKind
+  readonly parent: AttemptFrame | undefined
+  /** False once the attempt's function has settled; a continuation that outlives it is then outside it. */
+  open: boolean
+  lastError: AttemptErrorRecord | undefined
+}
+
+/**
+ * The attempt the current call runs in, carried across awaits, timers and
+ * microtasks by `AsyncLocalStorage` (Bun carries it on the launch path's
+ * awaits, the dialog approver's timer polls included). It holds only the
+ * running attempts' frames, never a persona's state between attempts.
+ */
+const attemptContext = new AsyncLocalStorage<AttemptFrame>()
+
+/**
+ * Run `fn` as a launch or recovery attempt for persona `key`, and settle with
+ * its result. Attempts nest: one started inside another (for the same key or
+ * another) is the innermost for its key while it runs, and an error met in it
+ * is recorded there only. A continuation of `fn` that outlives it (a timer it
+ * set) is outside the attempt.
+ */
+export async function runInAttempt<T>(
+  key: string,
+  kind: AttemptKind,
+  fn: (attempt: AttemptView) => T | Promise<T>,
+): Promise<T> {
+  // Link to the nearest open ancestor: a closed frame is never an innermost
+  // attempt, and skipping it here keeps a timer armed inside an attempt from
+  // retaining the frames that have since closed.
+  let parent = attemptContext.getStore()
+  while (parent !== undefined && !parent.open) parent = parent.parent
+  const frame: AttemptFrame = { key, kind, parent, open: true, lastError: undefined }
+  try {
+    return await attemptContext.run(frame, () => fn(viewOf(frame)))
+  } finally {
+    frame.open = false
+  }
+}
+
+/** A live view of `frame`: its `lastError` reads the frame's current record. */
+function viewOf(frame: AttemptFrame): AttemptView {
+  return {
+    key: frame.key,
+    kind: frame.kind,
+    get lastError() {
+      return frame.lastError
+    },
+  }
+}
+
+/** The innermost running attempt for persona `key` the current call is inside, if any. */
+function innermostFrame(key: string): AttemptFrame | undefined {
+  for (let frame = attemptContext.getStore(); frame !== undefined; frame = frame.parent) {
+    if (frame.open && frame.key === key) return frame
+  }
+  return undefined
+}
+
+/** True when the current call runs inside a launch or recovery attempt for persona `key`. */
+export function isInsideAttempt(key: string): boolean {
+  return innermostFrame(key) !== undefined
+}
+
+/**
+ * Report an agent-director error for persona `key`, thrown by a call made
+ * with `verb` (b.jg5 SRJ-301). Outside an attempt for `key` it does nothing.
+ * Inside one, when the arming predicate answers a cause and `sink` is given,
+ * the sink is called once with `key` and the cause; the innermost attempt
+ * then records the error as its last, armed when the sink returned. Answers
+ * whether the sink armed. Never throws.
+ */
+export function reportAttemptError(
+  key: string,
+  value: unknown,
+  verb: string | undefined,
+  sink: UnavailableRetryTriggerSink | undefined,
+): boolean {
+  try {
+    const frame = innermostFrame(key)
+    if (frame === undefined) return false
+    const cause = unavailableRetryCauseFor(value, verb)
+    let armed = false
+    if (cause !== undefined && sink !== undefined) {
+      try {
+        sink.arm(key, cause)
+        armed = true
+      } catch {
+        /* a failing sink arms nothing; the call's own error is what its caller sees */
+      }
+    }
+    frame.lastError = {
+      ...(verb !== undefined ? { verb } : {}),
+      ...(cause !== undefined ? { causeKind: cause.kind } : {}),
+      armed,
+    }
+    return armed
+  } catch {
+    return false
   }
 }

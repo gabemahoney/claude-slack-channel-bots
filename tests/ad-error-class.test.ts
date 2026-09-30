@@ -42,6 +42,7 @@ import {
   classifyAdError,
   classifyWithInvalidFlagsRecheck,
   describeAdErrorClassification,
+  hasAdErrorName,
   isInvalidFlagsError,
   type AdErrorClass,
   type AdErrorClassification,
@@ -87,6 +88,7 @@ import {
   AgentDirectorError,
   ERR_SCHEMA_MIGRATION_REQUIRED_NAME,
   ERR_SCHEMA_MISMATCH_NAME,
+  ERR_SPAWN_NOT_FOUND_NAME,
   ERR_STORE_OPEN_NAME,
   ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
@@ -935,8 +937,36 @@ describe('isInvalidFlagsError', () => {
     ['an object with that errName', false, () => ({ errName: errInvalidFlags().errName })],
     ['another agent-director error', false, () => errSpawnNotFound()],
     ['undefined', false, () => undefined],
+    ['its errName getter throws', false, () => Object.defineProperty(errInvalidFlags(), 'errName', { get: () => { throw new Error('boom') } })],
   ])('%s → %p', (_label, expected, build) => {
     expect(isInvalidFlagsError(build())).toBe(expected)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// hasAdErrorName
+// ---------------------------------------------------------------------------
+
+describe('hasAdErrorName', () => {
+  test.each<[string, boolean, () => unknown, string]>([
+    ['errSpawnNotFound against ERR_SPAWN_NOT_FOUND_NAME', true, () => errSpawnNotFound(), ERR_SPAWN_NOT_FOUND_NAME],
+    ['errTmuxKillFailed against ERR_TMUX_KILL_FAILED_NAME', true, () => errTmuxKillFailed(), ERR_TMUX_KILL_FAILED_NAME],
+    ['a base error with that errName', true, () => baseError(ERR_SPAWN_NOT_FOUND_NAME), ERR_SPAWN_NOT_FOUND_NAME],
+    ['errSpawnNotFound against another name', false, () => errSpawnNotFound(), ERR_TMUX_KILL_FAILED_NAME],
+    ['errTmuxKillFailed against another name', false, () => errTmuxKillFailed(), ERR_SPAWN_NOT_FOUND_NAME],
+    ['an agent-director error whose name, not errName, matches', false, () => Object.assign(baseError(ERR_INTERNAL), { name: ERR_SPAWN_NOT_FOUND_NAME }), ERR_SPAWN_NOT_FOUND_NAME],
+    ['an Error named for it', false, () => plainErrorNamed(ERR_SPAWN_NOT_FOUND_NAME), ERR_SPAWN_NOT_FOUND_NAME],
+    ['a plain object with a matching errName', false, () => ({ errName: ERR_TMUX_KILL_FAILED_NAME }), ERR_TMUX_KILL_FAILED_NAME],
+    ['undefined', false, () => undefined, ERR_SPAWN_NOT_FOUND_NAME],
+    ['a string of that name', false, () => ERR_SPAWN_NOT_FOUND_NAME, ERR_SPAWN_NOT_FOUND_NAME],
+    ['an errName getter that throws', false, () => Object.defineProperty(errSpawnNotFound(), 'errName', { get: () => { throw new Error('boom') } }), ERR_SPAWN_NOT_FOUND_NAME],
+    ['a proxy whose every trap throws', false, () => new Proxy({}, { get: () => { throw new Error('boom') }, getPrototypeOf: () => { throw new Error('boom') } }), ERR_SPAWN_NOT_FOUND_NAME],
+  ])('%s → %p', (_label, expected, build, name) => {
+    expect(hasAdErrorName(build(), name)).toBe(expected)
+  })
+
+  test('ERR_SPAWN_NOT_FOUND_NAME is the errName of the client\'s ErrSpawnNotFound', () => {
+    expect(errSpawnNotFound().errName).toBe(ERR_SPAWN_NOT_FOUND_NAME)
   })
 })
 

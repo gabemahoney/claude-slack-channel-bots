@@ -17,6 +17,8 @@
  *   - resetAllToHealthy(keys)              — silent wipe (boot-time reset; one key at a teardown)
  *   - withOutageDetection(key, dir, fn)    — AD verb wrapper; raises/clears flags on error/success
  *   - withSpawnDetection(key, dir, fn)     — like withOutageDetection + clears cwd-unreachable on success
+ *   - reportAgentDirectorError(key, err, verb) — report an error to the retry timer's trigger sink
+ *                                            (inside a launch or recovery attempt only; b.jg5 SRJ-301)
  *   - _resetOutageState()                  — test-only state reset
  *
  * Template exports (used by tests):
@@ -34,6 +36,7 @@ import {
   ErrCwdNotADirectory,
 } from './agent-director-errors.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
+import { isInsideAttempt, reportAttemptError, type UnavailableRetryTriggerSink } from './unavailable-retry.ts'
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -68,6 +71,12 @@ export interface OutageStateDeps {
   notify(key: string, text: string): void
   /** Return the singleton AD Client. Same semantics as getClient() in agent-director-client.ts. */
   getClient(): Client
+  /**
+   * Where an agent-director error met inside a launch or recovery attempt is
+   * reported (b.jg5 SRJ-301): production passes the UNAVAILABLE retry
+   * controller. Without it nothing is armed.
+   */
+  triggerSink?: UnavailableRetryTriggerSink
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +240,11 @@ export function resetAllToHealthy(keys: string[]): void {
  *     workingDirectory is undefined, in which case logs loudly and rethrows
  *     WITHOUT raising the flag (defensive carve-out for verb-class drift).
  *   - Other errors → no flag change; rethrow unchanged.
+ * Then, every error is reported (`reportAgentDirectorError`) with the verb
+ * `fn` called, which arms the persona's retry timer when the call ran inside
+ * a launch or recovery attempt for it and the error is a trigger. `fn` must
+ * make its one call on the client it is handed; a `fn` that uses another
+ * client reports no verb, so only an UNAVAILABLE from it arms.
  *
  * On success: clears 'ad-unreachable' and 'tmux-unavailable', returns result.
  *
@@ -245,6 +259,13 @@ export async function withOutageDetection<T>(
     throw new Error(
       'outage-state: withOutageDetection called before initOutageState — caller-site bug',
     )
+  }
+  // Inside a launch or recovery attempt for the persona, the client handed to
+  // `fn` records the verb it is called with, for the report below.
+  let verb: string | undefined
+  if (isInsideAttempt(key)) {
+    const call = fn
+    fn = (client) => call(verbRecordingClient(client, (v) => { verb = v }))
   }
   try {
     const result = await fn(deps.getClient())
@@ -265,8 +286,44 @@ export async function withOutageDetection<T>(
         )
       }
     }
+    reportAgentDirectorError(key, err, verb)
     throw err
   }
+}
+
+/**
+ * reportAgentDirectorError — the one reporting point for an agent-director
+ * error met by persona `key`'s call made with `verb` (b.jg5 SRJ-301). The
+ * wrappers call it for every wrapped call that throws, and the liveness
+ * adapter (whose bare `status` is not wrapped) for its error branches. Inside
+ * a launch or recovery attempt for `key`, an error the arming predicate
+ * answers a cause for is sent once to the installed trigger sink, and the
+ * attempt records it as its last error (`reportAttemptError` in
+ * `src/unavailable-retry.ts`). Outside such an attempt, or with no sink
+ * installed, nothing is armed. Flags and notices are untouched, and it never
+ * throws, so the caller's own handling and rethrow are as without it.
+ */
+export function reportAgentDirectorError(key: string, err: unknown, verb: string | undefined): void {
+  reportAttemptError(key, err, verb, deps?.triggerSink)
+}
+
+/**
+ * `client` with each method call's verb passed to `onVerb` first, as
+ * agent-director names it (`readPane` is `read-pane`). Methods run on
+ * `client` itself, so nothing else about the call changes.
+ */
+function verbRecordingClient(client: Client, onVerb: (verb: string) => void): Client {
+  return new Proxy(client, {
+    get(target, prop) {
+      const value: unknown = Reflect.get(target, prop, target)
+      if (typeof value !== 'function' || typeof prop !== 'string') return value
+      const verb = prop.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)
+      return (...args: unknown[]) => {
+        onVerb(verb)
+        return (value as (...a: unknown[]) => unknown).apply(target, args)
+      }
+    },
+  })
 }
 
 /**

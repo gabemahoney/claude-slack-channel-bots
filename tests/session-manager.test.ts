@@ -19,7 +19,19 @@
  *     one immediate version re-check (the real installed re-check over a
  *     counting stub `resolveSystemBinary` and an unmoved fake clock), logs one
  *     UNCLASSIFIED line and kills, deletes, spawns and resumes nothing more;
- *     an ErrNoSessionId makes no re-check.
+ *     an ErrNoSessionId makes no re-check. A re-check that answers stop posts
+ *     no spawn-failure notice, answers `{ failed, stopping }` and makes
+ *     `launchSession` answer `'skipped'`; a pass or could-not-run keeps the
+ *     notice and a plain `failed` (`launchSession` false).
+ *   - b.jg5 SRJ-301 / SRJ-302 launch attempt: with a trigger sink installed
+ *     through `initOutageState` (a recording sink, or the real
+ *     `createUnavailableRetryController` on a fake clock, stopped in
+ *     afterEach with nothing pending and nothing run), an UNAVAILABLE spawn
+ *     and an UNCLASSIFIED collision `get` arm the persona's timer and mark the
+ *     failed launch refused (`launchSession` answers `'refused'`); a LAUNCH
+ *     FAILURE or DIRECTORY spawn, or no sink at all, marks nothing
+ *     (`launchSession` false); a joiner shares the marker; a start pass with
+ *     one UNAVAILABLE persona tallies as before and arms only that persona.
  *   - b.av2 SR-6.2 ladder guards: a row in another directory (by real path) is
  *     killed, deleted and spawned fresh on every path; a missing or changed
  *     `config_dir` label means a fresh spawn instead of a resume (AC 48).
@@ -265,6 +277,8 @@ import {
   errTmuxSendKeys,
   errTmuxSessionCreate,
   errInvalidFlags,
+  errInternal,
+  errTmuxUnresponsive,
   holdSpawns,
   makeStubCallLog,
   makeStubClient,
@@ -275,6 +289,7 @@ import {
   type PersonaGetResultOverrides,
   type StubClient,
   type StubClientOptions,
+  type StubResolveSystemBinaryOutcome,
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
@@ -320,10 +335,24 @@ import {
   ErrSpawnNotFound,
 } from '../src/agent-director-errors.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
-import { RESTART_FAILURE_CAP } from '../src/restart.ts'
+import { RESTART_FAILURE_CAP, type LaunchSessionResult } from '../src/restart.ts'
 import { AD_ERROR_CLASS_UNCLASSIFIED } from '../src/ad-error-class.ts'
-import { installAdVersionRecheck, RECHECK_OUTCOME_PASS, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
-import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import {
+  installAdVersionRecheck,
+  RECHECK_OUTCOME_COULD_NOT_RUN,
+  RECHECK_OUTCOME_PASS,
+  RECHECK_OUTCOME_STOP,
+  resetAdVersionRecheckForTests,
+} from '../src/ad-version-gate.ts'
+import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import {
+  createUnavailableRetryController,
+  UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  type UnavailableRetryController,
+  type UnavailableRetryTriggerSink,
+} from '../src/unavailable-retry.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -1304,6 +1333,98 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     expect(calls.resumeCalls).toHaveLength(1)
     expect(calls.deleteCalls).toHaveLength(1)
     expect(calls.spawnCalls).toHaveLength(2)
+  })
+
+  // E8 (b.jg5 SRJ-205, SRJ-302): a re-check that decides the stop posts
+  // nothing and ends a launch the restart path does not count; any other
+  // re-check answer keeps today's notice and failed outcome.
+
+  /** Replace the installed re-check with one whose `resolveSystemBinary` answers `outcome`, recorded as the default one is. */
+  function reinstallRecheck(outcome: StubResolveSystemBinaryOutcome): void {
+    resetAdVersionRecheckForTests()
+    installAdVersionRecheck({
+      resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls, outcomes: [outcome] }),
+      baselineVersion: PHASE1_RC_VERSION,
+      recordStartupError: () => {},
+      stop: (exitCode) => { stops.push(exitCode) },
+      log: () => {},
+      clock: createFakeClock(),
+    })
+  }
+
+  /** The `resume failed` lines for persona C in `log`. */
+  function resumeFailedLines(log: string): string[] {
+    return log.split('\n').filter((l) => l.includes(`resume failed for ${renderPersonaRef('C', 'C')}: `))
+  }
+
+  test('the re-check answers stop: no spawn-failure notice, { failed, stopping }, the one UNCLASSIFIED line kept, nothing more killed, deleted or launched', async () => {
+    reinstallRecheck({ version: OLD_AD_VERSION })
+    const invalidFlags = errInvalidFlags('resume')
+    const { cfg, calls } = installEndedRowResumeRejects(invalidFlags)
+
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const log = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(resolveCalls).toHaveLength(1)
+    expect(stops).toHaveLength(1)
+    expect(result).toStrictEqual({ key: 'C', action: 'failed', stopping: true })
+    expect(notices).toEqual([])
+    expect(resumeFailedLines(log)).toEqual([
+      `[slack] spawnForPersona: resume failed for ${renderPersonaRef('C', 'C')}: ` +
+        `class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${invalidFlags.errName} message=${JSON.stringify(invalidFlags.errDescription)} ` +
+        `(after one immediate agent-director version re-check: ${RECHECK_OUTCOME_STOP})`,
+    ])
+    expect(calls.resumeCalls).toHaveLength(1)
+    expect(calls.spawnCalls).toHaveLength(1)
+    expect(calls.killCalls).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
+  })
+
+  test('the re-check answers stop: launchSession answers \'skipped\' (counted toward no failure or cap) and posts nothing', async () => {
+    reinstallRecheck({ version: OLD_AD_VERSION })
+    const { cfg } = installEndedRowResumeRejects(errInvalidFlags('resume'))
+
+    let result: LaunchSessionResult | undefined
+    await withCapturedErr(async () => {
+      result = await launchSession('C', cfg)
+    })
+
+    expect(stops).toHaveLength(1)
+    expect(result).toBe('skipped')
+    expect(notices).toEqual([])
+  })
+
+  test.each([
+    [RECHECK_OUTCOME_PASS, { version: PHASE1_RC_VERSION }],
+    [RECHECK_OUTCOME_COULD_NOT_RUN, { throws: new Error('the resolve failed') }],
+  ] as const)('the re-check answers %s: today\'s spawn-failure notice and a plain failed; launchSession answers false', async (kind, outcome) => {
+    reinstallRecheck(outcome)
+    const { cfg } = installEndedRowResumeRejects(errInvalidFlags('resume'))
+
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const log = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(stops).toEqual([])
+    expect(result).toStrictEqual({ key: 'C', action: 'failed' })
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(resumeFailedLines(log)).toHaveLength(1)
+    expect(resumeFailedLines(log)[0]).toEndWith(`(after one immediate agent-director version re-check: ${kind})`)
+
+    // The restart path's entry: the same answer is a counted failure.
+    resetClientForTests()
+    notices = []
+    installEndedRowResumeRejects(errInvalidFlags('resume'))
+    let launched: LaunchSessionResult | undefined
+    await withCapturedErr(async () => {
+      launched = await launchSession('C', cfg)
+    })
+    expect(launched).toBe(false)
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(resolveCalls).toHaveLength(2)
   })
 })
 
@@ -2693,7 +2814,7 @@ describe('launchSession: the relaunch gate (canLaunch)', () => {
     const f = gateFixture()
     const asked: string[] = []
 
-    let result: boolean | 'skipped' | undefined
+    let result: LaunchSessionResult | undefined
     const errLog = await withCapturedErr(async () => {
       result = await launchSession('C', f.cfg, { canLaunch: (key) => (asked.push(key), false) })
     })
@@ -2711,7 +2832,7 @@ describe('launchSession: the relaunch gate (canLaunch)', () => {
   test('canLaunch true: launched as without a gate — patched once, then spawned; true', async () => {
     const f = gateFixture()
 
-    let result: boolean | 'skipped' | undefined
+    let result: LaunchSessionResult | undefined
     await withCapturedErr(async () => {
       result = await launchSession('C', f.cfg, { canLaunch: () => true })
     })
@@ -2792,7 +2913,7 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
     f.applied([])
     const passed = passStale ? f.cfg : { ...f.cfg, personas: [] }
 
-    let result: boolean | 'skipped' | undefined
+    let result: LaunchSessionResult | undefined
     const errLog = await withCapturedErr(async () => {
       result = await launchSession(GUARD_KEY, passed, { canLaunch: f.canLaunch })
     })
@@ -2812,7 +2933,7 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
   test('control: an applied key through the same gate is patched, guarded and spawned as before; true', async () => {
     const f = appliedFixture()
 
-    let result: boolean | 'skipped' | undefined
+    let result: LaunchSessionResult | undefined
     await withCapturedErr(async () => {
       result = await launchSession(GUARD_KEY, f.cfg, { canLaunch: f.canLaunch })
     })
@@ -2877,7 +2998,7 @@ describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-laun
       ],
       getResult: row,
     })
-    let result: boolean | 'skipped' | undefined
+    let result: LaunchSessionResult | undefined
     const errLog = await withCapturedErr(async () => {
       result = await launchSession(GUARD_KEY, applied)
     })
@@ -3030,6 +3151,232 @@ describe('spawnForPersona: fixed instance ID and one launch in flight per person
 
     expect(again).toEqual({ key: 'C', action: 'spawned' })
     expect(spawnCalls).toHaveLength(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-301 — every collision ladder is a launch attempt. An
+// agent-director error inside it that the arming predicate answers a cause
+// for is sent to the trigger sink installed with `initOutageState`
+// (`triggerSink`; gone with `_resetOutageState` in afterEach), and a `failed`
+// launch whose last error armed the timer carries the refusal marker;
+// `launchSession` answers `'refused'` for it, which the restart path never
+// counts (SRJ-302). The notice and the failed tally are unchanged (E10).
+// ---------------------------------------------------------------------------
+
+describe('launch attempt: the refusal marker and launchSession\'s \'refused\' (b.jg5 SRJ-301, SRJ-302)', () => {
+  /** Every arm the recording sink received: persona key and cause kind. */
+  let armed: Array<{ key: string; kind: string }>
+  /** The controller a case installed as the sink, with its fake clock and log lines; stopped in afterEach. */
+  let retry: { controller: UnavailableRetryController; clock: FakeClock; lines: string[]; runs: string[] } | undefined
+
+  beforeEach(() => {
+    armed = []
+    retry = undefined
+    captureStartupErrors()
+  })
+
+  afterEach(() => {
+    if (retry !== undefined) {
+      retry.controller.stopAll('test teardown')
+      // No retry timer is left behind, and none ever fired.
+      expect(retry.clock.pendingCount()).toBe(0)
+      expect(retry.runs).toEqual([])
+      assertNoLeak({ lines: retry.lines }, 'unavailable-retry controller lines')
+    }
+    retry = undefined
+  })
+
+  /** Re-wire the outage state as `beforeEach` does, with `sink` as its trigger sink. */
+  function installSink(sink: UnavailableRetryTriggerSink): void {
+    initOutageState({
+      getClient,
+      notify: (key, text) => { outageEmissions.push({ key, text }) },
+      triggerSink: sink,
+    })
+  }
+
+  /** A sink that records each arm in `armed`. */
+  function installRecordingSink(): void {
+    installSink({ arm: (key, cause) => { armed.push({ key, kind: cause.kind }) } })
+  }
+
+  /** The real controller on a fake clock as the sink; its retry action records the key and is never reached here. */
+  function installController(): NonNullable<typeof retry> {
+    const clock = createFakeClock()
+    const lines: string[] = []
+    const runs: string[] = []
+    const controller = createUnavailableRetryController({
+      clock,
+      log: (line) => { lines.push(line) },
+      action: (key) => {
+        runs.push(key)
+        return { kind: 'again' }
+      },
+    })
+    retry = { controller, clock, lines, runs }
+    installSink(controller)
+    return retry
+  }
+
+  /**
+   * The fresh spawn's answers: an UNAVAILABLE one arms (and marks), a LAUNCH
+   * FAILURE (ErrTmuxSessionCreate, also after its one self-heal respawn) or
+   * DIRECTORY one does not. Each is built with the stub's builders or the
+   * client's own class.
+   */
+  const SPAWN_ANSWERS: ReadonlyArray<readonly [string, () => Error, boolean]> = [
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('spawn'), true],
+    ['UNAVAILABLE (a plain Error)', () => new Error('boom'), true],
+    ['LAUNCH FAILURE (ErrTmuxSessionCreate)', () => errTmuxSessionCreate('spawn'), false],
+    ['DIRECTORY (ErrCwdNotFound)', () => new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd /x does not exist'), false],
+  ]
+
+  /** Persona C whose every spawn rejects with `build()`; the self-heal's tmux kill is a no-op. */
+  function installSpawnRejects(build: () => Error): { cfg: PersonaConfig; spawnCalls: import('agent-director').SpawnParams[] } {
+    _setTmuxSessionKiller(async () => {})
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls, spawnError: build() })
+    return { cfg: makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir), spawnCalls }
+  }
+
+  test.each(SPAWN_ANSWERS)('the spawn answers %s: the marker iff the timer was armed, for C only', async (_label, build, arms) => {
+    installRecordingSink()
+    const { cfg } = installSpawnRejects(build)
+
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toStrictEqual(arms ? { key: 'C', action: 'failed', refused: true } : { key: 'C', action: 'failed' })
+    expect(armed).toEqual(arms ? [{ key: 'C', kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }] : [])
+  })
+
+  test.each(SPAWN_ANSWERS)('the spawn answers %s: launchSession answers \'refused\' iff the timer was armed, false otherwise', async (_label, build, arms) => {
+    installRecordingSink()
+    const { cfg } = installSpawnRejects(build)
+
+    let result: LaunchSessionResult | undefined
+    await withCapturedErr(async () => {
+      result = await launchSession('C', cfg)
+    })
+
+    expect(result).toBe(arms ? 'refused' : false)
+    expect(armed.map((a) => a.key)).toEqual(arms ? ['C'] : [])
+  })
+
+  test('no trigger sink installed: an UNAVAILABLE spawn arms nothing and carries no marker; launchSession answers false as before', async () => {
+    const { cfg } = installSpawnRejects(() => errTmuxUnresponsive('spawn'))
+
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    let launched: LaunchSessionResult | undefined
+    await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+      launched = await launchSession('C', cfg)
+    })
+
+    expect(result).toStrictEqual({ key: 'C', action: 'failed' })
+    expect(launched).toBe(false)
+  })
+
+  test('a `get` error inside the ladder (the collision read, UNCLASSIFIED) arms a read error, and the failed launch carries the marker', async () => {
+    installRecordingSink()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    installStub({ spawnError: errInstanceIdCollision(), getError: errInternal() })
+
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toStrictEqual({ key: 'C', action: 'failed', refused: true })
+    expect(armed).toEqual([{ key: 'C', kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR }])
+  })
+
+  test('a joining call gets the ladder\'s result, marker included; the timer is armed once', async () => {
+    installRecordingSink()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const held = holdSpawns(installStub({}))
+    const persona = personaOf(cfg, 'C')
+
+    let results!: Awaited<ReturnType<typeof spawnForPersona>>[]
+    const errLog = await withCapturedErr(async () => {
+      const a = spawnForPersona(persona, cfg)
+      const b = spawnForPersona(persona, cfg)
+      await held.entered('cscb_C')
+      held.fail('cscb_C', errTmuxUnresponsive('spawn'))
+      results = await Promise.all([a, b])
+    })
+
+    expect(held.calls).toHaveLength(1)
+    expect(results[0]).toStrictEqual({ key: 'C', action: 'failed', refused: true })
+    expect(results[1]).toBe(results[0])
+    expect(armed).toEqual([{ key: 'C', kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expect(errLog).toContain(`spawnForPersona: launch already in flight for ${renderPersonaRef('C', 'C')} — joining it`)
+  })
+
+  test('a launchSession that joins the start pass\'s refused launch answers \'refused\'; the start pass still tallies it failed', async () => {
+    installRecordingSink()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const held = holdSpawns(installStub({}))
+
+    let startResult!: Awaited<ReturnType<typeof startupSessionManager>>
+    let launched: LaunchSessionResult | undefined
+    await withCapturedErr(async () => {
+      const start = startupSessionManager(cfg, { concurrency: 1 })
+      await held.entered('cscb_C')
+      const restart = launchSession('C', cfg)
+      held.fail('cscb_C', errTmuxUnresponsive('spawn'))
+      ;[startResult, launched] = await Promise.all([start, restart])
+    })
+
+    expect(held.calls).toHaveLength(1)
+    expect(launched).toBe('refused')
+    expect(startResult.failed).toBe(1)
+    expect(startResult.perPersona).toEqual([{ key: 'C', action: 'failed' }])
+    expect(armed.map((a) => a.key)).toEqual(['C'])
+  })
+
+  test('a start pass where one persona\'s spawn answers UNAVAILABLE counts the others as before; the controller on a fake clock arms only that persona, due one base wait on, and runs nothing', async () => {
+    const r = installController()
+    const stub = installStub({})
+    const realSpawn = stub.spawn.bind(stub)
+    stub.spawn = async (params) => {
+      if (params.claude_instance_id === 'cscb_beta') throw errTmuxUnresponsive('spawn')
+      return realSpawn(params)
+    }
+    const cfg = makeMultiPersonaConfig(
+      [
+        { name: 'alpha', working_directory: '/x1' },
+        { name: 'beta', working_directory: '/x2' },
+        { name: 'gamma', working_directory: '/x3' },
+      ],
+      fixtureDir,
+    )
+
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    await withCapturedErr(async () => {
+      result = await startupSessionManager(cfg, { concurrency: 1 })
+    })
+
+    expect(result.succeeded).toBe(2)
+    expect(result.freshSpawned).toBe(2)
+    expect(result.failed).toBe(1)
+    expect(result.perPersona).toEqual([
+      { key: 'alpha', action: 'spawned' },
+      { key: 'beta', action: 'failed' },
+      { key: 'gamma', action: 'spawned' },
+    ])
+    expect(r.controller.armedKeys()).toEqual(['beta'])
+    expect(r.controller.isArmed('alpha')).toBe(false)
+    expect(r.controller.isArmed('gamma')).toBe(false)
+    const view = r.controller.view('beta')
+    expect(view?.phase).toBe('waiting')
+    expect(view?.waitMs).toBe(UNAVAILABLE_RETRY_BASE_S * 1000)
+    expect(view?.dueAt).toBe(r.clock.now() + UNAVAILABLE_RETRY_BASE_S * 1000)
+    expect(view?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE])
+    expect(r.clock.pendingCount()).toBe(1)
   })
 })
 
@@ -3902,7 +4249,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
       const broken = () => !resolved && (point === 'before the launch' || calls.getCalls.length > 0)
       _setConfigDirFs({ realpath: realpathFailingUnder(f.configDir, broken) })
 
-      let result: boolean | 'skipped' | undefined
+      let result: LaunchSessionResult | undefined
       const errLog = await withCapturedErr(async () => {
         result = await launchSession(GUARD_KEY, f.cfg)
       })
@@ -3963,7 +4310,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
       },
     })
 
-    let result: boolean | 'skipped' | undefined
+    let result: LaunchSessionResult | undefined
     const errLog = await withCapturedErr(async () => {
       result = await launchSession(GUARD_KEY, f.cfg)
     })
@@ -4013,7 +4360,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     const errArgs: unknown[][] = []
     const orig = console.error
     console.error = (...args: unknown[]) => { errArgs.push(args) }
-    let result: boolean | 'skipped' | undefined
+    let result: LaunchSessionResult | undefined
     try {
       result = await launchSession(GUARD_KEY, f.cfg)
     } finally {
@@ -7338,7 +7685,7 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
     const lines: string[] = []
     const orig = console.error
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
-    let restarted: boolean | 'skipped' | undefined
+    let restarted: LaunchSessionResult | undefined
     let result!: Awaited<ReturnType<typeof startupSessionManager>>
     try {
       const restart = launchSession('C', cfg)
@@ -9919,7 +10266,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg, { post: [{ kind: 'network' }, { kind: 'network' }], leakMarker: LEAK_SENTINEL })
 
-    let launched: boolean | 'skipped' | undefined
+    let launched: LaunchSessionResult | undefined
     const errLog = await withCapturedErr(async () => {
       launched = await launchSession(NOTICE_KEY, cfg)
       await settleNotices()

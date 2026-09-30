@@ -66,6 +66,11 @@
  * `working` row is left to finish in the background, still in flight, so the
  * pass does not wait for it (b.f2b). A restart (`launchSession`) runs the
  * launch only, and only while the caller's gate says the persona is up.
+ * Every collision ladder runs as a launch attempt for its persona (b.jg5
+ * SRJ-301): an UNAVAILABLE outcome, or a `status`, `get` or `list` error,
+ * inside it arms the persona's retry timer, and a `failed` launch whose last
+ * agent-director error armed it is refused (`SpawnPersonaResult.refused`),
+ * which the restart path never counts.
  *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
@@ -99,7 +104,7 @@ import {
   resolveClaudeConfigDir,
 } from './persona-identity.ts'
 import { getClient } from './agent-director-client.ts'
-import { setOutageFlag, withOutageDetection, withSpawnDetection } from './outage-state.ts'
+import { reportAgentDirectorError, setOutageFlag, withOutageDetection, withSpawnDetection } from './outage-state.ts'
 import {
   AgentDirectorError,
   ErrInstanceIdCollision,
@@ -122,6 +127,8 @@ import {
   describeAdErrorClassification,
   isInvalidFlagsError,
 } from './ad-error-class.ts'
+import { RECHECK_OUTCOME_STOP } from './ad-version-gate.ts'
+import { runInAttempt, type AttemptView } from './unavailable-retry.ts'
 import { recordStartupError } from './startup-errors.ts'
 import {
   locateTranscript,
@@ -2010,7 +2017,7 @@ export function _resetFindMissingMemo(): void {
  *   memoized one), or undefined when the sweep failed.
  */
 async function reconcileMissingSweep(key: string, logPrefix: string, ref: string = keyRef(key)): Promise<FindMissingResult | undefined> {
-  return sharedFindMissingSweep(() => withOutageDetection(key, undefined, (client) => client.findMissing({})), logPrefix, ref)
+  return sharedFindMissingSweep(() => withOutageDetection(key, undefined, (client) => client.findMissing({})), logPrefix, ref, key)
 }
 
 /**
@@ -2019,11 +2026,19 @@ async function reconcileMissingSweep(key: string, logPrefix: string, ref: string
  * memoized: a persona's call through `withOutageDetection`, or the start
  * sweep's direct call (`reconcileKilledPrePersonaRows`), which acts for no
  * persona. Never throws; logs as `reconcileMissingSweep` describes.
+ *
+ * `key` is the calling persona's key, and is absent for a caller that acts for
+ * no persona. A failed sweep is reported to the retry timer once per persona
+ * that met it (b.jg5 SRJ-301): the starter's `withOutageDetection` reports it
+ * under the starter's key, and a persona that joined a sweep someone else
+ * started (another persona's, or the start sweep's direct call) reports it
+ * here under its own key, so sharing the sweep never changes whose timer arms.
  */
 async function sharedFindMissingSweep(
   start: () => Promise<FindMissingResult>,
   logPrefix: string,
   ref: string,
+  key?: string,
 ): Promise<FindMissingResult | undefined> {
   // Memo hit: a recent successful sweep is still within the TTL. Reuse it.
   if (_findMissingLast && Date.now() - _findMissingLast.at < _findMissingMemoTtlMs) {
@@ -2032,6 +2047,7 @@ async function sharedFindMissingSweep(
 
   // Single-flight: an in-flight sweep exists — await it rather than starting one.
   // The async wrapper turns a synchronous throw from `start` into a rejection.
+  const started = !_findMissingInFlight
   if (!_findMissingInFlight) {
     _findMissingInFlight = (async () => start())()
   }
@@ -2048,6 +2064,11 @@ async function sharedFindMissingSweep(
     }
     return r
   } catch (err) {
+    // A joiner's failure is its own: report it under its key, as the starter's
+    // wrapper did under the starter's (b.jg5 SRJ-301).
+    if (!started && key !== undefined) {
+      reportAgentDirectorError(key, err, 'find-missing')
+    }
     // Do NOT memoize failures — clear the in-flight slot so the next caller
     // retries. Log and let the caller proceed with today's behavior.
     if (_findMissingInFlight === inFlight) {
@@ -2634,6 +2655,20 @@ export interface SpawnPersonaResult {
     | 'deferred'
   /** For `deferred`: the claude_config_dir cause (`claude-config-dir` step). */
   deferredBy?: PersonaBringUpFailure
+  /**
+   * The refusal marker, set on a `failed` result only: the launch attempt's
+   * last agent-director error armed the persona's UNAVAILABLE retry timer
+   * (b.jg5 SRJ-301), which now owns the persona. `launchSession` answers
+   * `'refused'` for it, which the restart path never counts (SRJ-302).
+   */
+  refused?: true
+  /**
+   * Set on a `failed` result only: a resume answered `ErrInvalidFlags` and
+   * the immediate version re-check decided the stop, so the server is
+   * stopping. No spawn-failure notice was posted; `launchSession` answers
+   * `'skipped'`, which counts toward no failure or cap.
+   */
+  stopping?: true
 }
 
 // ---------------------------------------------------------------------------
@@ -3316,9 +3351,11 @@ function reportInconclusiveDiagnosis(
  * `ErrInvalidFlags` step (`classifyWithInvalidFlagsRecheck`): one immediate
  * version re-check (a stop it decides ends the process, SRJ-205), class
  * UNCLASSIFIED, and one log line built from the classification's rendered
- * fields. Nothing is deleted, killed or launched because of it; the
- * spawn-failure notice and the `failed` outcome stay until UNCLASSIFIED
- * handling exists (SRJ-105, SRJ-313).
+ * fields. Nothing is deleted, killed or launched because of it. When the
+ * re-check decides the stop, nothing is posted and the `failed` result is
+ * marked `stopping`, which the restart path does not count; after any other
+ * re-check answer the spawn-failure notice and the `failed` outcome stay
+ * until UNCLASSIFIED handling exists (SRJ-105, SRJ-313).
  *
  * @param row  The row returned by the collision `get` (its `labels`).
  */
@@ -3536,6 +3573,8 @@ async function resumeOrFreshSpawn(
         `[slack] spawnForPersona: resume failed for ${ref}: ${describeAdErrorClassification(step.classification)} ` +
           `(after one immediate agent-director version re-check: ${step.recheck.kind})`,
       )
+      // The stop posts nothing to Slack, and a launch it ends is not counted.
+      if (step.recheck.kind === RECHECK_OUTCOME_STOP) return { key, action: 'failed', stopping: true }
       notifySpawnFailure(key, err, isStartup)
       return { key, action: 'failed' }
     }
@@ -3754,6 +3793,12 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    A directory that stopped resolving since step 2 keeps the row and
  *    returns `deferred` instead.
  * 6. Other errors → surface to Slack + (when isStartup) startup-errors.log.
+ * 7. Steps 4 to 6 run as a launch attempt for the key (b.jg5 SRJ-301,
+ *    `runInAttempt`): an agent-director error there that the arming predicate
+ *    answers a cause for arms the persona's retry timer through the installed
+ *    trigger sink, and a `failed` result whose attempt's last agent-director
+ *    error armed it carries the refusal marker (`refused`). A joining call,
+ *    the claude_config_dir deferral and dry run are no attempt.
  *
  * `hooks` belong to the ladder this call starts; a call that joins a launch
  * already in flight gets none of them.
@@ -3792,7 +3837,10 @@ export async function spawnForPersona(
   forgetWorkingRowEvidence(key)
   endWorkingRowDeferral(key)
   endPromptRowDeferral(key)
-  const launch = runPersonaLadder(persona, config, isStartup, ref, configDirLabel, hooks)
+  // b.jg5 SRJ-301: the ladder is a launch attempt; joiners get its result, marker included.
+  const launch = runInAttempt(key, 'launch', async (attempt) =>
+    markRefusal(await runPersonaLadder(persona, config, isStartup, ref, configDirLabel, hooks), attempt),
+  )
   inFlightLaunches.set(key, launch)
   try {
     return await launch
@@ -3803,6 +3851,16 @@ export async function spawnForPersona(
       cancelledLaunchWaits.delete(key)
     }
   }
+}
+
+/**
+ * `result`, with the refusal marker when it is `failed` and the launch
+ * attempt's last agent-director error armed the persona's retry timer (b.jg5
+ * SRJ-301). Any other result is returned as it is.
+ */
+function markRefusal(result: SpawnPersonaResult, attempt: AttemptView): SpawnPersonaResult {
+  if (result.action !== 'failed' || result.refused || attempt.lastError?.armed !== true) return result
+  return { ...result, refused: true }
 }
 
 /** A caller's view into the collision ladder one `spawnForPersona` call starts (b.f2b). */
@@ -4688,21 +4746,25 @@ function createLaunchPool(size: number): <T>(task: () => Promise<T>) => Promise<
  * Returns true on any non-failed action (spawned / resumed / reconnected /
  * not-reconnected / no-op; b.f2b: `not-reconnected` counts as it did when it
  * was reported as `reconnected`, so SR-25.1 counting is unchanged), false on
- * `failed` or when no applied persona has the key, and
+ * `failed` or when no applied persona has the key,
  * `'skipped'` for `deferred` (bug b.g57: its claude_config_dir cannot be
- * resolved; nothing was launched and its row is kept), which counts toward
- * no failure or cap. The richer `SpawnPersonaResult` is collapsed here
+ * resolved; nothing was launched and its row is kept) and for a `failed`
+ * marked `stopping` (a resume's version re-check decided the stop), which
+ * count toward no failure or cap, and `'refused'` for a `failed` carrying the
+ * refusal marker (b.jg5 SRJ-301: its UNAVAILABLE retry timer owns the
+ * persona), which the restart path never counts (SRJ-302). The richer `SpawnPersonaResult` is collapsed here
  * because the restart subsystem only cares about did-it-relaunch.
  */
 export async function launchSession(
   key: string,
   config: PersonaConfig,
   options?: { canLaunch?: (key: string) => boolean },
-): Promise<boolean | 'skipped'> {
+): Promise<boolean | 'skipped' | 'refused'> {
   if (options?.canLaunch && !options.canLaunch(key)) return 'skipped'
   const persona = config.personas.find((p) => p.key === key)
   if (!persona) return false
   const result = await spawnForPersona(persona, config, false)
-  if (result.action === 'deferred') return 'skipped'
+  if (result.action === 'deferred' || result.stopping) return 'skipped'
+  if (result.refused) return 'refused'
   return result.action !== 'failed'
 }
