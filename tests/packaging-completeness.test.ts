@@ -41,9 +41,13 @@
  * credentials` runs), is in the npm pack list, with the same hermetic
  * companion (the file exists and package.json `files` covers it).
  *
- * Every npm-backed test shares one memoised pack probe per file load. The npm
- * child gets a throwaway cache and user config inside the probe's temp dir,
- * so it never reads or writes the real HOME (b.av2 SR-13.2).
+ * Every npm-backed test shares one memoised pack probe per file load. Each npm
+ * child's environment is a direct `hostSafeChildEnv` call (b.jg5 SRJ-1301,
+ * SRJ-1302): the probe's temp dir as HOME, only `npm` and `node` on PATH, and a
+ * throwaway cache and user config inside that dir as extras, so it never reads
+ * or writes the real HOME (b.av2 SR-13.2) and inherits nothing else from the
+ * parent environment. The children stay local: `npm --version` and
+ * `npm pack --dry-run` only.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -56,6 +60,7 @@ import { spawnSync } from 'node:child_process'
 import semver from 'semver'
 import { PERSONA_DIAGNOSTIC_CLASSES } from '../src/persona-diagnostics.ts'
 import { RELOAD_DIAGNOSTIC_CLASSES } from '../src/reload.ts'
+import { HostSafetyError, hostSafeChildEnv, resolveToolDir } from './test-helpers/host-safe-env.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 
@@ -124,6 +129,25 @@ type PackProbe =
   | { kind: 'ok'; files: string[] }
 
 /**
+ * The npm toolchain the children run by name: `npm` is a `#!/usr/bin/env node`
+ * script, so the child's PATH needs `node` as well.
+ */
+const NPM_TOOLS: readonly string[] = ['npm', 'node']
+
+/**
+ * The npm configuration for a child under `probeDir`: a throwaway cache and a
+ * user config that is never created (npm treats a missing user config as
+ * empty, so `~/.npmrc` is never read), and no update-notifier check.
+ */
+function npmConfigExtras(probeDir: string): Record<string, string> {
+  return {
+    npm_config_userconfig: join(probeDir, 'npmrc'),
+    npm_config_cache: join(probeDir, 'cache'),
+    npm_config_update_notifier: 'false',
+  }
+}
+
+/**
  * Ask npm for the authoritative list of files it would pack, evaluated against
  * the real package.json `files` globs. npm writes progress noise to stderr, so
  * we key strictly off stdout + exit status for the file list.
@@ -131,33 +155,43 @@ type PackProbe =
 function npmPackProbe(): PackProbe {
   // npm writes its cache, debug logs and update-notifier stamp under ~/.npm
   // and reads ~/.npmrc by default. Point every npm child at a throwaway dir
-  // for all of these so the test never touches the real HOME.
+  // (its HOME) for all of these so the test never touches the real HOME.
   const probeDir = mkdtempSync(join(tmpdir(), 'cscb-npm-probe-'))
   try {
     return npmPackProbeIn(probeDir)
+  } catch (e) {
+    // A host-safety refusal with npm present (e.g. an agent-director entry in
+    // npm's PATH directory) is a hard failure, never a skip.
+    if (e instanceof HostSafetyError) return { kind: 'error', message: e.message }
+    throw e
   } finally {
     rmSync(probeDir, { recursive: true, force: true })
   }
 }
 
 function npmPackProbeIn(probeDir: string): PackProbe {
-  const env = {
-    ...process.env,
-    HOME: probeDir,
-    // Never created: npm treats a missing user config as empty.
-    npm_config_userconfig: join(probeDir, 'npmrc'),
-    npm_config_cache: join(probeDir, 'cache'),
-    npm_config_update_notifier: 'false',
+  // The toolchain is absent when npm or the node it runs on is not on PATH;
+  // checked first because hostSafeChildEnv refuses a tool it cannot find.
+  if (NPM_TOOLS.some((tool) => resolveToolDir(tool) === undefined)) return { kind: 'skip' }
+  const probe = spawnSync('npm', ['--version'], {
+    encoding: 'utf-8',
+    env: hostSafeChildEnv(probeDir, { tools: NPM_TOOLS, extras: npmConfigExtras(probeDir) }),
+  })
+  // npm and node are on PATH from here on, so the toolchain is present: a
+  // failing `npm --version` (or any failure below) is a real fault that fails
+  // the npm tests loudly, never a reason to skip.
+  if (probe.error || probe.status !== 0) {
+    return {
+      kind: 'error',
+      message: `npm --version failed (status ${probe.status}): ${
+        probe.error?.message ?? probe.stderr ?? '(no stderr)'
+      }`,
+    }
   }
-  const probe = spawnSync('npm', ['--version'], { encoding: 'utf-8', env })
-  if (probe.error || probe.status !== 0) return { kind: 'skip' }
-
-  // npm is present from here on — any failure below is a real packaging fault,
-  // not a reason to skip.
   const res = spawnSync('npm', ['pack', '--dry-run', '--json'], {
     cwd: REPO_ROOT,
     encoding: 'utf-8',
-    env,
+    env: hostSafeChildEnv(probeDir, { tools: NPM_TOOLS, extras: npmConfigExtras(probeDir) }),
     // No packfile is written in --dry-run mode; only the JSON manifest matters.
   })
   if (res.error || res.status !== 0) {

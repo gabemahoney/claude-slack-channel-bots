@@ -25,8 +25,10 @@
  *     test also runs the managed command's quoting
  *   - launched-with dirs reset before and after each test
  *   - the ~/.claude refusal runs in a subprocess with a fake HOME
- *   - the guard runs with an explicit env (never inheriting CSCB_PERSONA)
- *     and a timeout
+ *   - every sh child (the word splitter and the installed guard) gets its
+ *     env from hostSafeChildEnv: a per-test temp HOME, a PATH of the named
+ *     tools only, CSCB_PERSONA only as an explicit extra; the guard also
+ *     runs with a timeout
  *
  * No hard-coded managed command: expectations use the module's
  * managedHookCommand over the test's state dir, and the shape test splits the
@@ -71,6 +73,7 @@ import {
 } from '../src/stop-hook-bootstrap.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import {
   makeMultiPersonaConfig,
   makePersona,
@@ -151,10 +154,10 @@ function captureConsoleError(fn: () => void): string[] {
   }
 }
 
-/** Split a command line into its words with a real shell (each word on its own line). */
+/** Split a command line into its words with a real shell (each word on its own line); `printf` is a shell builtin. */
 function shellWords(command: string): string[] {
   const res = spawnSync('sh', ['-c', `printf '%s\\n' ${command}`], {
-    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
+    env: hostSafeChildEnv(newTempDir(), { tools: ['sh'] }),
     encoding: 'utf-8',
     timeout: 20_000,
   })
@@ -493,11 +496,12 @@ describe('stop-hook-bootstrap and the reply-guard record', () => {
     expect(commands).toEqual([canonical()])
 
     // Run the installed command as Claude Code does: through a shell, with the
-    // instance's CSCB_PERSONA and the Stop-hook JSON on stdin.
+    // instance's CSCB_PERSONA and the Stop-hook JSON on stdin. The guard is a
+    // bash script that reads stdin with cat and parses it with jq.
     const runInstalled = (key: string) => {
       const res = spawnSync('sh', ['-c', commands[0]!], {
         input: JSON.stringify({ transcript_path: NO_REPLY_FIXTURE, stop_hook_active: false }),
-        env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', HOME: newTempDir(), CSCB_PERSONA: key },
+        env: hostSafeChildEnv(newTempDir(), { tools: ['sh', 'bash', 'cat', 'jq'], extras: { CSCB_PERSONA: key } }),
         encoding: 'utf-8',
         timeout: 20_000,
       })

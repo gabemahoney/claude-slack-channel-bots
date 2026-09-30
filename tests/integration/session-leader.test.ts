@@ -15,7 +15,9 @@
  * that reports whether its /proc/self/stat session id equals its own pid, using
  * the SAME stat-parsing logic as src/cli.ts isSessionLeader(). It validates that
  * parsing on a real session leader. It starts NO server and touches no CSCB
- * state — the child prints one line and exits.
+ * state — the child prints one line and exits. Its environment comes from
+ * hostSafeChildEnv (the scratch directory as HOME, only `bun` on PATH), so it
+ * inherits no host HOME, PATH or credential.
  *
  * Linux-only (/proc). Skipped elsewhere.
  *
@@ -26,6 +28,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { hostSafeChildEnv } from '../test-helpers/host-safe-env.ts'
 
 const HAS_PROC = existsSync('/proc/self/stat')
 
@@ -64,11 +67,19 @@ describe('isSessionLeader stat parsing on a real detached child (b.acn)', () => 
         stdin: 'ignore',
         stdout: 'pipe',
         stderr: 'ignore',
+        env: hostSafeChildEnv(scratchDir, { tools: ['bun'] }),
         // @ts-expect-error Bun typings may lag; detached is honored at runtime.
         detached: true,
       })
-      const out = await new Response(child.stdout).text()
-      await child.exited
+      let out: string
+      try {
+        out = await new Response(child.stdout).text()
+        await child.exited
+      } finally {
+        // A detached child is not reaped with this process: kill it if it is
+        // somehow still running.
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      }
       let result: { pid: number; session: number }
       try {
         result = JSON.parse(out.trim())

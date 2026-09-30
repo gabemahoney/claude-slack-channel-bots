@@ -15,7 +15,10 @@
  * must fail here.
  *
  * Isolation (b.av2 SR-13.2): every home and config dir is a mkdtempSync path,
- * removed in afterEach. Nothing touches the real home directory.
+ * removed in afterEach. Nothing touches the real home directory. The
+ * module-import child gets its environment from `hostSafeChildEnv` (b.jg5
+ * SRJ-1301, SRJ-1302): its temp HOME, no PATH entries, and only the extras
+ * it needs, so no Slack variable or host PATH reaches it.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -41,6 +44,7 @@ import {
 } from '../src/persona-identity.ts'
 import { encodePermissionActionId, parsePermissionActionId } from '../src/permission-action-id.ts'
 import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, fakeToken, isTokenLike } from './test-helpers/credentials.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -406,15 +410,17 @@ describe('module import', () => {
   test('importing in a child with a fresh HOME exits 0, prints nothing and leaves HOME empty', () => {
     const home = makeTempDir()
     const modulePath = resolve(import.meta.dir, '../src/persona-identity.ts')
-    const result = Bun.spawnSync(['bun', '-e', `await import(${JSON.stringify(modulePath)})`], {
+    // The child runs this bun by absolute path and needs nothing else on PATH.
+    const result = Bun.spawnSync([process.execPath, '-e', `await import(${JSON.stringify(modulePath)})`], {
       cwd: home,
-      env: {
-        ...process.env,
-        HOME: home,
-        SLACK_STATE_DIR: join(home, 'state'),
-        // Bun's own runtime transpiler cache would otherwise land in $HOME/.bun.
-        BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0',
-      },
+      env: hostSafeChildEnv(home, {
+        tools: [],
+        extras: {
+          SLACK_STATE_DIR: join(home, 'state'),
+          // Bun's own runtime transpiler cache would otherwise land in $HOME/.bun.
+          BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0',
+        },
+      }),
     })
     expect(result.exitCode).toBe(0)
     expect(result.stdout.toString()).toBe('')

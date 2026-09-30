@@ -68,7 +68,6 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
-import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
@@ -121,6 +120,7 @@ import {
   resetStubSpawnPath,
   type StubSpawnPath,
 } from './test-helpers/agent-director-stub.ts'
+import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
 import {
   APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
@@ -502,11 +502,10 @@ describe('start pass: a credentials path that is not a regular file is refused u
     await expectRefusedUnread(arrange)
   })
 
-  const hasMkfifo = spawnSync('mkfifo', ['--version']).status === 0
-  test.skipIf(!hasMkfifo)('a real FIFO (skipped where mkfifo is unavailable)', async () => {
+  test.skipIf(!mkfifoAvailable())('a real FIFO (skipped where mkfifo is unavailable)', async () => {
     await expectRefusedUnread(() => {
       rmSync(a.credentials_file)
-      expect(spawnSync('mkfifo', [a.credentials_file]).status).toBe(0)
+      makeFifo(a.credentials_file)
     })
   })
 })

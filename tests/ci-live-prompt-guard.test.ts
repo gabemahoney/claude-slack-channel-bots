@@ -38,7 +38,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -74,6 +74,7 @@ import { REDACTED_SECRET, REDACTED_TOKEN, Redactor } from '../ci-live/lib/redact
 import { SECOND, type Clock } from '../ci-live/lib/wait.ts'
 import { virtualClock } from './test-helpers/ci-live.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken } from './test-helpers/credentials.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -589,8 +590,12 @@ describe('the prompt guard: serialized work, failed reads and the loop', () => {
 
 describe('promptTrailScript over a fixture trail (bash and jq)', () => {
   let dir = ''
+  // The script's HOME: a directory under `dir`, removed with it.
+  let home = ''
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'ci-live-trail-'))
+    home = join(dir, 'home')
+    mkdirSync(home)
   })
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
@@ -617,7 +622,10 @@ describe('promptTrailScript over a fixture trail (bash and jq)', () => {
   function runScript(from: number, trail: string | null): { out: string[]; code: number } {
     const path = join(dir, 'permission-trail.jsonl')
     if (trail !== null) writeFileSync(path, trail)
-    const r = Bun.spawnSync([Bun.which('bash')!, '-c', `TRAIL=${JSON.stringify(path)}\n${promptTrailScript(from)}`], { env: { PATH: process.env.PATH ?? '/usr/bin:/bin' } })
+    // The script's own tools: bash runs it, wc/head/tail cut the trail, jq projects it.
+    const r = Bun.spawnSync([Bun.which('bash')!, '-c', `TRAIL=${JSON.stringify(path)}\n${promptTrailScript(from)}`], {
+      env: hostSafeChildEnv(home, { tools: ['bash', 'wc', 'head', 'tail', 'jq'] }),
+    })
     return { out: r.stdout.toString().split('\n').filter((l) => l.trim() !== ''), code: r.exitCode ?? -1 }
   }
 

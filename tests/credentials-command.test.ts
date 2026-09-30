@@ -8,8 +8,9 @@
  * shell (`<shell> scripts/write-credentials.sh <path>`, with `-f` for zsh):
  *
  * - in the case's own `mkdtempSync` directory (removed in `afterEach`), with an
- *   environment of only `PATH`, a temp `HOME` and the proxy variables pointing
- *   at a closed loopback port, under a small runner that sets `umask 000`
+ *   environment from `hostSafeChildEnv` (only `PATH`, a temp `HOME`, its own
+ *   `TMUX_TMPDIR` and the proxy variables pointing at a closed loopback port),
+ *   under a small runner that sets `umask 000`
  *   first, so a 0600 file proves the script sets the mode itself (the runner
  *   can also run shell code before and after the script, in its own shell);
  * - with `PATH` holding only a temp bin: a stub `curl` that records its argv,
@@ -73,6 +74,7 @@ import {
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
 import { requiredSection, splitFences } from './test-helpers/markdown.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { makePersona, makePersonaConfigInput, writeConfigFile } from './test-helpers/persona-config.ts'
 
 // ---------------------------------------------------------------------------
@@ -133,11 +135,21 @@ const SHELLS: [name: string, path: string | null][] = [
 ]
 /** The describe title suffix for a shell's rows. */
 const underShell = (name: string) => (name === 'bash' ? '(bash)' : `(${name}; skipped when ${name} is not installed)`)
+/**
+ * Whether `path` is util-linux `script`: its `--version`, run by absolute path
+ * with nothing on `PATH` and a temp HOME removed afterwards.
+ */
+function isUtilLinuxScript(path: string): boolean {
+  const home = mkdtempSync(join(tmpdir(), 'cscb-credentials-probe-'))
+  try {
+    const probe = spawnSync(path, ['--version'], { env: hostSafeChildEnv(home, { tools: [] }), encoding: 'utf-8', timeout: 5_000 })
+    return probe.stdout?.includes('util-linux') ?? false
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+}
 /** util-linux `script` (the BSD one takes other flags), or null. */
-const SCRIPT_UTIL = ((path) =>
-  path !== null && spawnSync(path, ['--version'], { encoding: 'utf-8' }).stdout?.includes('util-linux') ? path : null)(
-  Bun.which('script'),
-)
+const SCRIPT_UTIL = ((path) => (path !== null && isUtilLinuxScript(path) ? path : null))(Bun.which('script'))
 const TIMEOUT = Bun.which('timeout')
 const REAL_CURL = Bun.which('curl')
 const WRAPPED = ['mkdir', 'mktemp', 'chmod', 'mv', 'rm'] as const
@@ -278,10 +290,16 @@ function readLines(path: string): string[] {
   return existsSync(path) ? readFileSync(path, 'utf-8').split('\n').slice(0, -1) : []
 }
 
-/** The child's whole environment: the sandbox PATH and HOME, and every proxy variable closed. */
-function childEnv(sb: Sandbox): Record<string, string> {
-  return { PATH: sb.bin, HOME: sb.home, https_proxy: CLOSED_PROXY, HTTPS_PROXY: CLOSED_PROXY, ALL_PROXY: CLOSED_PROXY }
-}
+/**
+ * Every proxy variable closed: the extras of each child's `hostSafeChildEnv`,
+ * which is given the sandbox HOME and the sandbox bin as the only `PATH`
+ * directory (no tools).
+ */
+const CLOSED_PROXIES: Readonly<Record<string, string>> = Object.freeze({
+  https_proxy: CLOSED_PROXY,
+  HTTPS_PROXY: CLOSED_PROXY,
+  ALL_PROXY: CLOSED_PROXY,
+})
 
 /**
  * Write the runner a case starts: `umask 000`, the prelude, then its
@@ -322,7 +340,7 @@ function runCommand(sb: Sandbox, credsPath: string, input: string, opts: RunOpti
   const runner = writeRunner(sb, opts)
   const child = spawnSync(BASH, [runner, ...scriptCommand(credsPath, opts)], {
     cwd: sb.cwd,
-    env: childEnv(sb),
+    env: hostSafeChildEnv(sb.home, { tools: [], pathDirs: [sb.bin], extras: CLOSED_PROXIES }),
     input,
     encoding: 'utf-8',
     timeout: 10_000,
@@ -457,7 +475,13 @@ describe('credentials command: usage', () => {
     ['no path', []],
     ['two paths', ['/a/credentials.json', '/b/credentials.json']],
   ])('%s: exit 2 with the usage line, before any prompt, nothing done', (_label, args) => {
-    const child = spawnSync(BASH, [SCRIPT, ...args], { cwd: sb.cwd, env: childEnv(sb), input: lines('yes', bot, app), encoding: 'utf-8', timeout: 10_000 })
+    const child = spawnSync(BASH, [SCRIPT, ...args], {
+      cwd: sb.cwd,
+      env: hostSafeChildEnv(sb.home, { tools: [], pathDirs: [sb.bin], extras: CLOSED_PROXIES }),
+      input: lines('yes', bot, app),
+      encoding: 'utf-8',
+      timeout: 10_000,
+    })
     expect(child.status).toBe(2)
     expect(child.stderr).toBe(USAGE)
     expect(child.stdout).toBe('')
@@ -620,7 +644,7 @@ function runOnTerminal(credsPath: string, steps: TerminalStep[]): TerminalRun {
   const session = `'${TIMEOUT}' -s KILL 20 '${SCRIPT_UTIL}' -qfec "'${BASH}' ${command}" '${typescript}'`
   const child = spawnSync(BASH, ['-c', `exec ${session} < <('${BASH}' '${feed}' 2>/dev/null)`], {
     cwd: sb.cwd,
-    env: childEnv(sb),
+    env: hostSafeChildEnv(sb.home, { tools: [], pathDirs: [sb.bin], extras: CLOSED_PROXIES }),
     encoding: 'utf-8',
     timeout: 25_000,
   })
@@ -794,7 +818,11 @@ function runPasted(line: string, stateDir: string, input: string): Run {
   writeFileSync(pasted, `umask 000\n${line}\n`)
   const child = spawnSync(BASH, [pasted], {
     cwd: sb.cwd,
-    env: { ...childEnv(sb), SLACK_STATE_DIR: stateDir, BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' },
+    env: hostSafeChildEnv(sb.home, {
+      tools: [],
+      pathDirs: [sb.bin],
+      extras: { ...CLOSED_PROXIES, SLACK_STATE_DIR: stateDir, BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' },
+    }),
     input,
     encoding: 'utf-8',
     timeout: 30_000,

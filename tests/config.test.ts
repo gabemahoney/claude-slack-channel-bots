@@ -59,6 +59,8 @@ import {
   withoutName,
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
+import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 // ---------------------------------------------------------------------------
 // expandTilde()
@@ -1478,15 +1480,15 @@ function configFsFailsWith(code: string): () => never {
 /** An injected `fstatFile` for a FIFO, socket or device: neither a file nor a directory. */
 const NOT_REGULAR_STATS = () => ({ isFile: () => false, isDirectory: () => false })
 
-const hasMkfifo = spawnSync('mkfifo', ['--version']).status === 0
-
 /**
  * Run `body` in a child `bun` with `config` bound to src/config.ts, bounded at
  * 10 s: a blocking open or read of a FIFO with no writer never returns, so
  * in-process it would hang the whole suite instead of failing the test.
  * `body` prints one JSON line; returns the child and that line parsed.
- * The child gets a built env (b.av2 SR-13.2): PATH, the test's temp `home` as
- * HOME and a state dir under it, so nothing in it falls back to the real home.
+ * The child is Bun by absolute path (`process.execPath`) with its `env` a
+ * direct `hostSafeChildEnv` call (b.av2 SR-13.2, b.jg5 SRJ-1302): the test's
+ * temp `home` as HOME, no tool (so `PATH` names no directory) and a state dir
+ * under `home` as `SLACK_STATE_DIR`; nothing else comes from `process.env`.
  */
 function runConfigChild(body: string, home: string) {
   const modulePath = join(import.meta.dir, '..', 'src', 'config.ts')
@@ -1494,7 +1496,7 @@ function runConfigChild(body: string, home: string) {
   const child = spawnSync(process.execPath, ['-e', script], {
     timeout: 10_000,
     encoding: 'utf-8',
-    env: { PATH: process.env['PATH'], HOME: home, SLACK_STATE_DIR: join(home, 'state') },
+    env: hostSafeChildEnv(home, { tools: [], extras: { SLACK_STATE_DIR: join(home, 'state') } }),
   })
   return { child, out: child.signal === null && child.stdout.trim() !== '' ? JSON.parse(child.stdout.trim()) : undefined }
 }
@@ -1831,9 +1833,9 @@ describe('credentialsFilesToProtect (b.av2 SR-5.2)', () => {
     expect(lines).toEqual([])
   })
 
-  test.skipIf(!hasMkfifo)('a real FIFO config.json with no writer: returns the applied paths at once, never read, descriptor closed (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
+  test.skipIf(!mkfifoAvailable())('a real FIFO config.json with no writer: returns the applied paths at once, never read, descriptor closed (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
     const path = join(dir, 'config.json')
-    expect(spawnSync('mkfifo', [path]).status).toBe(0)
+    makeFifo(path)
     const applied = [{ credentials_file: join(dir, 'applied', 'credentials.json') }]
 
     const { child, out } = runConfigChild(`${CHILD_RECORDING_FS}
@@ -2185,9 +2187,9 @@ describe('start-path primitives (b.av2 SR-8.7, SR-1.5, SR-10.3)', () => {
       expect(calls.map((c) => c.op)).toEqual(['open'])
     })
 
-    test.skipIf(!hasMkfifo)('a real FIFO with no writer: the open does not wait, it is refused unread and closed, and the path loader fails the same way (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
+    test.skipIf(!mkfifoAvailable())('a real FIFO with no writer: the open does not wait, it is refused unread and closed, and the path loader fails the same way (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
       const path = join(dir, 'config.json')
-      expect(spawnSync('mkfifo', [path]).status).toBe(0)
+      makeFifo(path)
 
       const { child, out } = runConfigChild(`${CHILD_RECORDING_FS}
         const outcome = (fn) => { try { fn(); return 'returned' } catch (e) { return { name: e.name, code: e.code, message: e.message } } }

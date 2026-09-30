@@ -24,6 +24,7 @@ import { readFileSync, mkdtempSync, rmSync, writeFileSync, chmodSync, mkdirSync 
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { execFileSync } from 'node:child_process'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 const SCRIPT_ABS = join(REPO_ROOT, 'scripts/publish-promote.sh')
@@ -255,19 +256,31 @@ function runPollIn(
     'exit 0',
   ].join('\n')
 
-  const env = {
-    ...process.env,
-    PATH: `${join(stubDir, 'bin')}:${process.env.PATH}`,
-    SR61_STUB_DIR: runDir,
-    SR61_STUB_VERSION: '9.9.9',
-    SR61_STUB_SUCCEED_AT: String(succeedAt),
-  }
+  // The child's HOME: a temp dir inside runDir, so runPoll's finally removes it.
+  const home = join(runDir, 'home')
+  mkdirSync(home)
 
   let code = 0
   let stdout = ''
   let stderr = ''
   try {
-    const out = execFileSync('bash', ['-c', harness], { env, encoding: 'utf-8', stdio: 'pipe' })
+    // The stub bin dir goes first on PATH (pathDirs), so `npm` and `sleep`
+    // resolve to the stubs ahead of the real ones in the tools' directories.
+    // Named tools: bash (harness + stub shebangs), seq and tr (poll loop),
+    // cat (npm stub). Nothing else is inherited from process.env.
+    const out = execFileSync('bash', ['-c', harness], {
+      env: hostSafeChildEnv(home, {
+        tools: ['bash', 'seq', 'tr', 'cat'],
+        pathDirs: [join(stubDir, 'bin')],
+        extras: {
+          SR61_STUB_DIR: runDir,
+          SR61_STUB_VERSION: '9.9.9',
+          SR61_STUB_SUCCEED_AT: String(succeedAt),
+        },
+      }),
+      encoding: 'utf-8',
+      stdio: 'pipe',
+    })
     stdout = out
   } catch (e: any) {
     code = typeof e.status === 'number' ? e.status : 1

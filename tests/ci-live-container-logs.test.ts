@@ -42,7 +42,9 @@
  * runs the real scripts with bash against a `mkdtempSync` tree standing in
  * for the container's file system (no docker), with a fake `tmux` first on
  * PATH that answers from files in another temp dir (the host's tmux, and its
- * production sessions, are never reached). A caller's wait runs on the
+ * production sessions, are never reached). Every bash child gets its
+ * environment from `hostSafeChildEnv`: a temp HOME, only the tools the
+ * scripts name, and no agent-director on PATH. A caller's wait runs on the
  * shared fake clock. Every secret is a sentinel-bearing fake built at
  * runtime; captured output is checked with `assertNoLeak`.
  *
@@ -108,6 +110,7 @@ import type { ExecOptions } from '../ci-live/lib/container.ts'
 import { CONTAINER_HOME } from '../ci-live/lib/docker.ts'
 import { buildLiveConfig, CONTAINER_STATE_DIR, personaEntryFor, renderConfig } from '../ci-live/lib/live-config.ts'
 import { PERSONA_LETTERS, personaName } from '../ci-live/lib/personas.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import type { ProcResult } from '../ci-live/lib/proc.ts'
 import { Redactor, REDACTED_SECRET, REDACTED_TOKEN } from '../ci-live/lib/redact.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
@@ -218,9 +221,21 @@ function makeTmuxDir(): string {
   return dir
 }
 
-/** The environment a real script runs in here: the fake tmux first on PATH, its temp files in the fake's dir. */
-function scriptEnv(tmux: string): Record<string, string> {
-  return { PATH: `${join(tmux, 'bin')}:/usr/bin:/bin`, FAKE_TMUX: tmux, TMPDIR: tmux, LANG: 'C.UTF-8' }
+/**
+ * The tools the real scripts (and the fake tmux) run by name, for
+ * `hostSafeChildEnv`; the fake tmux's dir goes first on PATH as a `pathDirs`
+ * entry, so every tmux call reaches the fake.
+ */
+const SCRIPT_TOOLS: readonly string[] = ['bash', 'cat', 'head', 'mktemp', 'rm', 'stat', 'tail']
+
+/** The fake tmux's `pathDirs` entry: its `bin`, first on the scripts' PATH. */
+function tmuxBin(tmux: string): string {
+  return join(tmux, 'bin')
+}
+
+/** The extras a real script runs with here: the fake tmux's dir, and its temp files in that dir. */
+function scriptExtras(tmux: string): Record<string, string> {
+  return { FAKE_TMUX: tmux, TMPDIR: tmux, LANG: 'C.UTF-8' }
 }
 
 /** The fake tmux's calls, one argument string per call. */
@@ -241,7 +256,7 @@ function tmuxSessions(tmux: string, panes: Record<string, string | null>): void 
 /**
  * A container whose file system is `root` on the host: every argument under
  * the container home is mapped into it, and the real scripts run with bash,
- * the fake tmux (in `tmux`) first on PATH.
+ * the fake tmux (in `tmux`) first on PATH, under the test's temp `home`.
  */
 function bashContainer(root: string, tmux: string) {
   const calls: ExecCall[] = []
@@ -250,7 +265,11 @@ function bashContainer(root: string, tmux: string) {
     async exec(argv: readonly string[], options?: ExecOptions): Promise<ProcResult> {
       calls.push({ argv, options })
       const mapped = argv.map((a) => (a.startsWith(`${CONTAINER_HOME}/`) ? join(root, a.slice(CONTAINER_HOME.length + 1)) : a))
-      const r = Bun.spawnSync([...mapped], { stdout: 'pipe', stderr: 'pipe', env: scriptEnv(tmux) })
+      const r = Bun.spawnSync([...mapped], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: hostSafeChildEnv(home, { tools: SCRIPT_TOOLS, pathDirs: [tmuxBin(tmux)], extras: scriptExtras(tmux) }),
+      })
       return proc(r.exitCode ?? 1, r.stdout.toString(), false, r.stderr.toString())
     },
   }
@@ -310,13 +329,17 @@ const NONE_NOTED = PERSONA_CAPTURES.length * 2
 
 let root: string
 let tmux: string
+/** Every bash child's HOME: a temp dir the test owns and removes. */
+let home: string
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'ci-live-container-logs-'))
   tmux = makeTmuxDir()
+  home = mkdtempSync(join(tmpdir(), 'ci-live-container-logs-home-'))
 })
 afterEach(() => {
   rmSync(root, { recursive: true, force: true })
   rmSync(tmux, { recursive: true, force: true })
+  rmSync(home, { recursive: true, force: true })
 })
 
 // ---------------------------------------------------------------------------
@@ -398,7 +421,11 @@ describe('the files copied', () => {
 
 describe('reading one file (READ_LOG_SCRIPT with bash, on a temp dir)', () => {
   const read = (path: string, cap: number) => {
-    const r = Bun.spawnSync(['bash', '-c', READ_LOG_SCRIPT, 'read', path, String(cap)], { stdout: 'pipe', stderr: 'pipe' })
+    const r = Bun.spawnSync(['bash', '-c', READ_LOG_SCRIPT, 'read', path, String(cap)], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: hostSafeChildEnv(home, { tools: ['bash', 'head', 'stat', 'tail'], extras: { LANG: 'C.UTF-8' } }),
+    })
     return proc(r.exitCode ?? 1, r.stdout.toString())
   }
 
@@ -539,7 +566,8 @@ describe('rotatedServerLogs', () => {
     writeFileSync(join(root, 'server.log.1'), 'b\n')
     symlinkSync(join(root, 'server.log'), join(root, 'server.log.2'))
     symlinkSync(join(root, 'nowhere'), join(root, 'server.log.3'))
-    const list = (dir: string) => Bun.spawnSync(['bash', '-c', LIST_ROTATED_SCRIPT, 'list', dir], { stdout: 'pipe' })
+    const list = (dir: string) =>
+      Bun.spawnSync(['bash', '-c', LIST_ROTATED_SCRIPT, 'list', dir], { stdout: 'pipe', env: hostSafeChildEnv(home, { tools: ['bash'], extras: { LANG: 'C.UTF-8' } }) })
     const r = list(root)
     expect([r.exitCode, r.stdout.toString()]).toEqual([0, 'server.log.1\nserver.log.2\nserver.log.3\n'])
     const none = list(join(root, 'missing'))
@@ -573,9 +601,20 @@ describe('the pane and transcript scripts', () => {
   })
 
   const run = (argv: readonly string[]): ProcResult => {
-    const r = Bun.spawnSync([...argv], { stdout: 'pipe', stderr: 'pipe', env: scriptEnv(tmux), cwd: root })
+    const r = Bun.spawnSync([...argv], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: hostSafeChildEnv(home, { tools: SCRIPT_TOOLS, pathDirs: [tmuxBin(tmux)], extras: scriptExtras(tmux) }),
+      cwd: root,
+    })
     return proc(r.exitCode ?? 1, r.stdout.toString(), false, r.stderr.toString())
   }
+
+  test("the scripts' tmux is the fake: the first tmux on their PATH is the fake's, never the host's", () => {
+    const r = run(['bash', '-c', 'command -v tmux', 'which'])
+    expect([r.code, r.stdout]).toEqual([0, `${join(tmuxBin(tmux), 'tmux')}\n`])
+    expect(tmuxCalls(tmux)).toEqual([])
+  })
 
   test('CAPTURE_PANE_SCRIPT (bash, the fake tmux): the session checked, its pane captured and printed as a file, at most its last bytes; its temp file removed', () => {
     tmuxSessions(tmux, { slack_bot_persona_a: 'aaaa\nbbbb\ncccc\n' })

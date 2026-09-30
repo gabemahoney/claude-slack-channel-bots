@@ -5,22 +5,33 @@
  * Sections:
  * - `hostSafeChildEnv`: the environment it builds for a child and each of its
  *   refusals (`HostSafetyError.reason`, one of `HOST_SAFETY_REFUSAL`).
+ * - Inherited `TMUX_TMPDIR`: which inherited values `inheritedChildTmuxTmpDir`
+ *   reuses, and a `bun` child that loads the helper again reusing its
+ *   parent's directory.
  * - `runInFakeHome`: refuses the real home before any child starts.
  *
- * Isolation: no case starts a process or writes outside its own `mkdtempSync`
- * root (removed in `afterEach`), except `hostSafeChildEnv`'s one per-process
- * `TMUX_TMPDIR` directory. The real-home cases pass `realHome()` (or a
- * symlink to it made under the root) and are refused before anything under it
- * is looked at. Every `agent-director` entry a case makes is a plain,
- * non-executable file or a dangling symlink. The one case that points
- * `process.env.PATH` at a directory under the root (a fake tool that is never
- * run) has it restored in `afterEach`. The install path and binary name come
- * from the helper.
+ * Isolation: every case writes only under its own `mkdtempSync` root, except
+ * `hostSafeChildEnv`'s one `TMUX_TMPDIR` directory and the few entries the
+ * inherited-`TMUX_TMPDIR` cases must place directly under the OS temp
+ * directory: prefixed entries named after the root (`tempEntry`), new
+ * `mkdtempSync` directories on the bare prefix with a random suffix
+ * (`prefixedTempDir()`), and the bare-prefix directory itself, made only when
+ * absent. Each entry a case made is removed in `afterEach`; a bare-prefix
+ * directory already there is neither touched nor removed. One case
+ * starts a `bun` child (`process.execPath`, environment from
+ * `hostSafeChildEnv` with a HOME under the root) that runs only the helper.
+ * The real-home cases pass `realHome()` (or a symlink to it made under the
+ * root) and are refused before anything under it is looked at. Every
+ * `agent-director` entry a case makes is a plain, non-executable file or a
+ * dangling symlink. `process.env.PATH` and `process.env.TMUX_TMPDIR`, which
+ * some cases point elsewhere, are restored in `afterEach`. The install path,
+ * binary name and `TMUX_TMPDIR` prefix come from the helper.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, delimiter, dirname, join, sep } from 'node:path'
@@ -36,6 +47,7 @@ import {
   type HostSafetyRefusal,
   RESERVED_CHILD_ENV_NAMES,
   hostSafeChildEnv,
+  inheritedChildTmuxTmpDir,
   realHome,
   resolveToolDir,
 } from './test-helpers/host-safe-env.ts'
@@ -45,17 +57,27 @@ import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 // Fixtures
 // ---------------------------------------------------------------------------
 
+const HELPER_PATH = join(import.meta.dir, 'test-helpers', 'host-safe-env.ts')
+
 let root: string
 let savedPath: string | undefined
+let savedTmuxTmpDir: string | undefined
+/** Entries a case placed directly under the OS temp directory; removed in `afterEach`. */
+let outsideRoot: string[]
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'host-safety-test-'))
   savedPath = process.env['PATH']
+  savedTmuxTmpDir = process.env['TMUX_TMPDIR']
+  outsideRoot = []
 })
 
 afterEach(() => {
   if (savedPath === undefined) delete process.env['PATH']
   else process.env['PATH'] = savedPath
+  if (savedTmuxTmpDir === undefined) delete process.env['TMUX_TMPDIR']
+  else process.env['TMUX_TMPDIR'] = savedTmuxTmpDir
+  for (const path of outsideRoot) rmSync(path, { recursive: true, force: true })
   rmSync(root, { recursive: true, force: true })
 })
 
@@ -233,6 +255,94 @@ describe('hostSafeChildEnv', () => {
     const { home, options } = build()
 
     expect(refusalOf(() => hostSafeChildEnv(home, options)).reason).toBe(reason)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Inherited TMUX_TMPDIR
+// ---------------------------------------------------------------------------
+
+describe('inherited TMUX_TMPDIR', () => {
+  /** A path directly under the OS temp directory, named after the case's root; removed in `afterEach`. */
+  function tempEntry(name: string): string {
+    const path = join(tmpdir(), name)
+    outsideRoot.push(path)
+    return path
+  }
+
+  /** A new directory directly under the OS temp directory whose name carries the prefix, as a parent's helper makes it. */
+  function prefixedTempDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), CHILD_TMUX_TMPDIR_PREFIX))
+    outsideRoot.push(dir)
+    return dir
+  }
+
+  test('an inherited TMUX_TMPDIR naming an existing prefixed directory directly under the OS temp directory is reused', () => {
+    const inherited = prefixedTempDir()
+    process.env['TMUX_TMPDIR'] = inherited
+
+    expect(inheritedChildTmuxTmpDir()).toBe(inherited)
+    expect(inheritedChildTmuxTmpDir(inherited)).toBe(inherited)
+  })
+
+  // Each row builds its fixture and returns the inherited value.
+  type NotReusedRow = [label: string, build: () => string | undefined]
+
+  const notReused: NotReusedRow[] = [
+    ['unset', () => undefined],
+    ['empty', () => ''],
+    ['relative', () => `${CHILD_TMUX_TMPDIR_PREFIX}${basename(root)}`],
+    ['an existing directory directly under the OS temp directory without the prefix', () => root],
+    ['a prefixed path directly under the OS temp directory that does not exist', () => tempEntry(`${CHILD_TMUX_TMPDIR_PREFIX}${basename(root)}-missing`)],
+    ['the bare prefix, a directory directly under the OS temp directory', () => {
+      // Made (and later removed) only when absent, so nothing already there is touched.
+      const dir = join(tmpdir(), CHILD_TMUX_TMPDIR_PREFIX)
+      if (!existsSync(dir)) {
+        mkdirSync(dir)
+        outsideRoot.push(dir)
+      }
+      return dir
+    }],
+    ['an existing prefixed directory that is not directly under the OS temp directory', () => dirUnder(`${CHILD_TMUX_TMPDIR_PREFIX}nested`)],
+    ['a prefixed plain file directly under the OS temp directory', () => {
+      const path = tempEntry(`${CHILD_TMUX_TMPDIR_PREFIX}${basename(root)}-file`)
+      writeFileSync(path, '')
+      return path
+    }],
+    ['a prefixed symlink to a directory, directly under the OS temp directory', () => {
+      const path = tempEntry(`${CHILD_TMUX_TMPDIR_PREFIX}${basename(root)}-link`)
+      symlinkSync(dirUnder('link-target'), path)
+      return path
+    }],
+  ]
+
+  test.each(notReused)('an inherited TMUX_TMPDIR that is %s is not reused', (_label, build) => {
+    const value = build()
+    if (value === undefined) delete process.env['TMUX_TMPDIR']
+    else process.env['TMUX_TMPDIR'] = value
+
+    expect(inheritedChildTmuxTmpDir()).toBeUndefined()
+    expect(inheritedChildTmuxTmpDir(value)).toBeUndefined()
+  })
+
+  test('a bun child that loads the helper again hands its own children the parent’s TMUX_TMPDIR', () => {
+    const home = dirUnder('home')
+    const childHome = dirUnder('child-home')
+    const script = `
+      const { hostSafeChildEnv } = await import(${JSON.stringify(HELPER_PATH)});
+      process.stdout.write(JSON.stringify({ inherited: process.env.TMUX_TMPDIR, own: hostSafeChildEnv(${JSON.stringify(childHome)}, { tools: [] }).TMUX_TMPDIR }));
+    `
+    // TMPDIR is passed so the child's OS temp directory is this process's on any host.
+    const child = spawnSync(process.execPath, ['-e', script], {
+      env: hostSafeChildEnv(home, { tools: [], extras: { TMPDIR: tmpdir() } }),
+      encoding: 'utf-8',
+      timeout: 30_000,
+    })
+    const parentDir = hostSafeChildEnv(home, { tools: [] }).TMUX_TMPDIR
+
+    expect(child.stderr).toBe('')
+    expect(child.status).toBe(0)
+    expect(JSON.parse(child.stdout)).toEqual({ inherited: parentDir, own: parentDir })
   })
 })
 

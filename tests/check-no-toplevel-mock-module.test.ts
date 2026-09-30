@@ -7,7 +7,9 @@
  *      → exit 1, violation message on stderr.
  *
  * Uses real spawnSync on the real script — no mock.module() usage, which is
- * exactly the pattern this gate enforces.
+ * exactly the pattern this gate enforces. Each gate child gets its
+ * environment from hostSafeChildEnv: a temp HOME this file owns and removes,
+ * and `bun` as its only named tool.
  *
  * Bug reference: b.5wd — "add CI gate against top-level mock.module() in tests/"
  */
@@ -17,6 +19,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 const SCRIPT = join(REPO_ROOT, 'scripts', 'check-no-toplevel-mock-module.ts')
@@ -26,10 +29,19 @@ const SCRIPT = join(REPO_ROOT, 'scripts', 'check-no-toplevel-mock-module.ts')
 // ---------------------------------------------------------------------------
 
 function runScript(cwd: string): { exitCode: number; stderr: string } {
-  const result = spawnSync('bun', [SCRIPT], { cwd, encoding: 'utf-8' })
-  return {
-    exitCode: result.status ?? 1,
-    stderr: result.stderr ?? '',
+  const childHome = mkdtempSync(join(tmpdir(), 'b5wd-gate-home-'))
+  try {
+    const result = spawnSync('bun', [SCRIPT], {
+      cwd,
+      encoding: 'utf-8',
+      env: hostSafeChildEnv(childHome, { tools: ['bun'] }),
+    })
+    return {
+      exitCode: result.status ?? 1,
+      stderr: result.stderr ?? '',
+    }
+  } finally {
+    rmSync(childHome, { recursive: true, force: true })
   }
 }
 

@@ -22,13 +22,19 @@
  *   - A behavioral test of the SR-7.5 revert logic, extracted into a small bash
  *     harness and exercised against a real temp git repo. It asserts the revert
  *     EFFECT on files (what survives vs. gets reverted), never exact log phrasing.
+ *
+ * Every child process (git and the bash harness) gets its environment from
+ * `hostSafeChildEnv` with the fixture's own temp HOME and
+ * `GIT_CONFIG_NOSYSTEM=1`, so no host git configuration (global or system),
+ * credential or agent-director install reaches it.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
-import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { execFileSync } from 'node:child_process'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 const SCRIPT_REL = 'scripts/publish-promote.sh'
@@ -170,48 +176,66 @@ beforeAll(() => {
   expect(SR75_BLOCK).toContain('git checkout -- ')
 })
 
-let tmpRepo: string
+/**
+ * A throwaway git repo and the temp HOME its child processes run under, both
+ * inside one `mkdtempSync` root the test owns and removes.
+ */
+interface GitFixture {
+  root: string
+  home: string
+  repo: string
+}
 
-/** Initialise a temp git repo with committed package.json + bun.lock. */
-function initRepo(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'sr75-'))
-  const git = (...args: string[]) =>
-    execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe' })
-  git('init', '-q')
-  git('config', 'user.name', 'Test')
-  git('config', 'commit.gpgsign', 'false')
-  // Host-specific: hosts with git identity enforcement (a global pre-commit
-  // hook) refuse `git commit` in a no-remote repo because it resolves to
-  // neither allow-listed identity. Declaring identity.account is the sanctioned
-  // route (repo-local declaration wins first in the resolution order; see
-  // ~/.claude/skills/github-config/SKILL.md), NOT a hook bypass — the hook
-  // still runs and passes. A neutral placeholder email is used so no real
-  // person's address is baked into a checked-in fixture; the hook self-corrects
-  // it (see the retry below). Do not "simplify" either line away or the commit
-  // is refused and beforeAll throws on such hosts.
-  git('config', 'identity.account', 'work')
-  git('config', 'user.email', 'fixture@example.com')
-  writeFileSync(join(dir, 'package.json'), '{"name":"x","version":"1.0.0"}\n')
-  writeFileSync(join(dir, 'bun.lock'), 'LOCK v1\n')
-  writeFileSync(join(dir, 'README.md'), 'clean\n')
-  git('add', '-A')
-  // Retry-once: on identity-enforcing hosts the pre-commit hook sees the
-  // placeholder user.email mismatch a config value, not an env/CLI override,
-  // so per github-config SKILL.md outcome #2 it writes the resolved email into
-  // the repo config and blocks exactly once ("Re-run the commit; it will
-  // pass."). The identical retry then succeeds. On hosts without enforcement
-  // the first commit succeeds and the retry never runs. Do not simplify this
-  // away.
-  try {
-    git('commit', '-q', '-m', 'init')
-  } catch {
-    git('commit', '-q', '-m', 'init')
-  }
-  return dir
+/** The fixture's fake, repo-local commit identity (never a real person). */
+const FIXTURE_USER_NAME = 'Fixture'
+const FIXTURE_USER_EMAIL = 'test@example.invalid'
+
+/**
+ * Extras for every fixture child that runs git: `GIT_CONFIG_NOSYSTEM=1` keeps
+ * the host's system git configuration out, as the temp HOME keeps the global
+ * one out.
+ */
+const FIXTURE_GIT_EXTRAS: Readonly<Record<string, string>> = Object.freeze({ GIT_CONFIG_NOSYSTEM: '1' })
+
+/** Run git in the fixture repo under the fixture's temp HOME; returns stdout. */
+function git(fx: GitFixture, ...args: string[]): string {
+  return execFileSync('git', ['-C', fx.repo, ...args], {
+    encoding: 'utf-8',
+    stdio: 'pipe',
+    env: hostSafeChildEnv(fx.home, { tools: ['git'], extras: FIXTURE_GIT_EXTRAS }),
+  })
 }
 
 /**
- * Run the extracted SR-7.5 logic inside `repoDir`.
+ * Create a temp git repo with committed package.json + bun.lock + README.md.
+ *
+ * git runs under the fixture's empty temp HOME with `GIT_CONFIG_NOSYSTEM=1`,
+ * so no global, per-user or system git configuration loads (no identity, no
+ * hooks path, no signing key). The repo therefore declares its own fake
+ * identity in its local config, and turns signing off explicitly. The one
+ * commit succeeds on the first attempt on any host.
+ */
+function initRepo(): GitFixture {
+  const root = mkdtempSync(join(tmpdir(), 'sr75-'))
+  const fx: GitFixture = { root, home: join(root, 'home'), repo: join(root, 'repo') }
+  mkdirSync(fx.home)
+  mkdirSync(fx.repo)
+  git(fx, 'init', '-q')
+  git(fx, 'config', 'user.name', FIXTURE_USER_NAME)
+  git(fx, 'config', 'user.email', FIXTURE_USER_EMAIL)
+  git(fx, 'config', 'commit.gpgsign', 'false')
+  writeFileSync(join(fx.repo, 'package.json'), '{"name":"x","version":"1.0.0"}\n')
+  writeFileSync(join(fx.repo, 'bun.lock'), 'LOCK v1\n')
+  writeFileSync(join(fx.repo, 'README.md'), 'clean\n')
+  git(fx, 'add', '-A')
+  git(fx, 'commit', '-q', '-m', 'init')
+  return fx
+}
+
+let fixture: GitFixture
+
+/**
+ * Run the extracted SR-7.5 logic inside the fixture repo.
  *
  * `dirtyBeforeStart` names files to dirty BEFORE the START snapshot runs
  * (simulating pre-existing operator dirt); `dirtyAfterStart` names files to
@@ -219,7 +243,7 @@ function initRepo(): string {
  * Returns the harness exit code and the post-run `git diff --name-only`.
  */
 function runSr75(
-  repoDir: string,
+  fx: GitFixture,
   dirtyBeforeStart: string[],
   dirtyAfterStart: string[],
 ): { code: number; dirty: string[] } {
@@ -233,7 +257,7 @@ function runSr75(
   const harness = [
     'set -euo pipefail',
     'NEXT_VERSION=9.9.9',
-    `cd ${JSON.stringify(repoDir)}`,
+    `cd ${JSON.stringify(fx.repo)}`,
     // Start each scenario from a pristine tree (the repo is reused across tests).
     'git checkout -- . 2>/dev/null; git clean -fdq',
     // Pre-existing operator dirt lands BEFORE the START snapshot.
@@ -245,50 +269,64 @@ function runSr75(
     'exit 0',
   ].join('\n')
 
+  // The spliced blocks run git, grep and (in the warning arm) sed by name. git
+  // must be on PATH: the blocks swallow a failed `git diff` (`|| true`).
   let code = 0
   try {
-    execFileSync('bash', ['-c', harness], { stdio: 'pipe' })
+    execFileSync('bash', ['-c', harness], {
+      stdio: 'pipe',
+      env: hostSafeChildEnv(fx.home, { tools: ['bash', 'git', 'grep', 'sed'], extras: FIXTURE_GIT_EXTRAS }),
+    })
   } catch (e: any) {
     code = typeof e.status === 'number' ? e.status : 1
   }
-  const out = execFileSync('git', ['-C', repoDir, 'diff', '--name-only'], {
-    encoding: 'utf-8',
-  })
+  const out = git(fx, 'diff', '--name-only')
   return { code, dirty: out.split('\n').filter(Boolean).sort() }
 }
 
 describe('b.bpp: SR-7.5 post-verify snapshot reverts promote-induced pkg/lock dirt only', () => {
   beforeAll(() => {
-    tmpRepo = initRepo()
+    fixture = initRepo()
   })
   afterAll(() => {
-    // Guard against undefined: if beforeAll's initRepo() ever throws, tmpRepo
-    // stays undefined and an unguarded rmSync(undefined, …) would throw a second,
+    // Guard against undefined: if beforeAll's initRepo() ever throws, fixture
+    // stays undefined and an unguarded rmSync on it would throw a second,
     // misleading cascade failure that masks the real setup error.
-    if (tmpRepo) rmSync(tmpRepo, { recursive: true, force: true })
+    if (fixture) rmSync(fixture.root, { recursive: true, force: true })
+  })
+
+  // Proves the fixture commit was authored by the repo-local fake identity —
+  // nothing rewrote or overrode it (e.g. a commit hook or a GIT_AUTHOR_* /
+  // GIT_COMMITTER_* env override). It does NOT prove that no host git
+  // configuration loaded: repo-local user.* takes precedence over global and
+  // system values, so those would not show here.
+  test('fixture commit carries the repo-local fake identity (not rewritten or overridden)', () => {
+    expect(git(fixture, 'log', '-1', '--format=%an <%ae>').trim()).toBe(
+      `${FIXTURE_USER_NAME} <${FIXTURE_USER_EMAIL}>`,
+    )
   })
 
   test('promote-induced package.json + bun.lock dirt is reverted; exit 0', () => {
-    const { code, dirty } = runSr75(tmpRepo, [], ['package.json', 'bun.lock'])
+    const { code, dirty } = runSr75(fixture, [], ['package.json', 'bun.lock'])
     expect(code).toBe(0)
     expect(dirty).toEqual([]) // both reverted, tree clean
   })
 
   test('pre-existing (dirty-at-start) package.json dirt is NOT reverted; exit 0', () => {
-    const { code, dirty } = runSr75(tmpRepo, ['package.json'], [])
+    const { code, dirty } = runSr75(fixture, ['package.json'], [])
     expect(code).toBe(0)
     expect(dirty).toEqual(['package.json']) // operator dirt survives
   })
 
   test('other-file dirt survives the revert; exit 0', () => {
-    const { code, dirty } = runSr75(tmpRepo, [], ['README.md'])
+    const { code, dirty } = runSr75(fixture, [], ['README.md'])
     expect(code).toBe(0)
     expect(dirty).toEqual(['README.md']) // non-pkg/lock stray untouched
   })
 
   test('mixed: induced lock reverted, pre-existing pkg + other file survive; exit 0', () => {
     const { code, dirty } = runSr75(
-      tmpRepo,
+      fixture,
       ['package.json'],
       ['bun.lock', 'README.md'],
     )

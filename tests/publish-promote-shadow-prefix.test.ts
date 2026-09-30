@@ -20,11 +20,16 @@
  * a tiny bash harness.
  *
  * SAFETY: every scenario runs against a throwaway prefix tree under `mkdtemp`,
- * with `HOME` pointed there and a PATH built from that tree plus `/usr/bin:/bin`
- * only. No test can resolve the operator's real `~/.bun`, `~/.cache/.bun`,
- * `~/.local/bin` or the live global install, and nothing here executes a real
- * `bun install -g` / `bun remove -g` / `bun pm -g trust` — the SR-7.4b tests use
- * a recording stub named `bun` at the front of that PATH.
+ * and every bash child gets its environment from `hostSafeChildEnv`: `HOME` is
+ * that tree, and `PATH` is the tree's own directories (first) plus the
+ * directories of the system tools the harness names (`bun` is never named, but
+ * a named tool's directory, e.g. `/usr/bin`, can also hold the real `bun`).
+ * No test can resolve the operator's real `~/.bun`, `~/.cache/.bun`,
+ * `~/.local/bin` or the live global install. Nothing here executes a real
+ * `bun install -g` / `bun remove -g` / `bun pm -g trust`: the SR-7.4b and
+ * sanitize tests put a recording stub named `bun` in a directory that comes
+ * FIRST on that PATH, so `bun` resolves to the stub — proved by the PATH-order
+ * cases ("the child PATH puts the test directories first").
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
@@ -41,13 +46,22 @@ import {
 import { join, resolve, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
+import { hostSafeChildEnv, type HostSafeChildEnvOptions } from './test-helpers/host-safe-env.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 const PROMOTE_SCRIPT = join(REPO_ROOT, 'scripts/publish-promote.sh')
 const SANITIZE_SCRIPT = join(REPO_ROOT, 'scripts/sanitize-global.sh')
 const PKG = 'claude-slack-channel-bots'
-/** Minimal system PATH tail: enough for readlink/sed/dirname/jq, no real install. */
-const SYSTEM_PATH = '/usr/bin:/bin'
+/**
+ * Tools the helper + SR-7.0 / SR-7.4 harnesses run by name (`command`,
+ * `printf` and `[` are bash builtins). Never `bun`: the shadow checks must see
+ * only the fake prefix tree's `claude-slack-channel-bots`, never a real one.
+ */
+const SHADOW_TOOLS = ['bash', 'readlink', 'dirname', 'sed'] as const
+/** Tools the SR-7.4b harness runs besides the stub `bun` (whose shebang needs bash). */
+const SR74B_TOOLS = ['bash', 'jq'] as const
+/** Tools sanitize-global.sh and its stub `bun` run by name. */
+const SANITIZE_TOOLS = ['bash', 'head', 'tr', 'basename', 'node'] as const
 
 function readPromote(): string {
   return readFileSync(PROMOTE_SCRIPT, 'utf-8')
@@ -133,9 +147,23 @@ interface RunResult {
   stderr: string
 }
 
-/** Run a bash harness with a sandboxed HOME/PATH. Never inherits the real env. */
-function runBash(body: string, env: Record<string, string>): RunResult {
-  const r = spawnSync('bash', ['-c', body], { env, encoding: 'utf-8' })
+/**
+ * `hostSafeChildEnv` options with `tools` REQUIRED: omitting it would fall back
+ * to the helper's default tools (which include `bun`), silently putting their
+ * directories on the harness PATH.
+ */
+type RunBashChild = HostSafeChildEnvOptions & { tools: readonly string[] }
+
+/**
+ * Run a bash harness with `home` as HOME and a host-safe PATH: `child.pathDirs`
+ * (the test's fake-prefix or stub directories) first, then the dirs of
+ * `child.tools`. Never inherits the real env.
+ */
+function runBash(body: string, home: string, child: RunBashChild): RunResult {
+  const r = spawnSync('bash', ['-c', body], {
+    env: hostSafeChildEnv(home, { tools: child.tools, pathDirs: child.pathDirs, extras: child.extras }),
+    encoding: 'utf-8',
+  })
   return { code: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
 }
 
@@ -186,16 +214,40 @@ interface Sr70Opts {
 
 /** Run helpers + SR-7.0 against a sandboxed HOME. */
 function runSr70(home: string, opts: Sr70Opts = {}): RunResult {
-  const env: Record<string, string> = {
-    HOME: home,
-    PATH: [...(opts.pathDirs ?? []), SYSTEM_PATH].join(':'),
-  }
-  if (opts.bunInstall) env.BUN_INSTALL = opts.bunInstall
-  return runBash(['set -euo pipefail', HELPERS, SR70, 'exit 0'].join('\n'), env)
+  return runBash(['set -euo pipefail', HELPERS, SR70, 'exit 0'].join('\n'), home, {
+    tools: SHADOW_TOOLS,
+    pathDirs: opts.pathDirs ?? [],
+    extras: opts.bunInstall ? { BUN_INSTALL: opts.bunInstall } : {},
+  })
 }
 
 afterAll(() => {
   for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true })
+})
+
+// ---------------------------------------------------------------------------
+// Harness environment: the test's directories win on PATH
+// ---------------------------------------------------------------------------
+
+describe('b.r6x harness: the child PATH puts the test directories first', () => {
+  test.each([
+    { harness: 'SR-7.0 / SR-7.4', tools: SHADOW_TOOLS },
+    { harness: 'SR-7.4b', tools: SR74B_TOOLS },
+    { harness: 'sanitize-global.sh', tools: SANITIZE_TOOLS },
+  ])('$harness: the given dirs lead PATH in order and a stub there is what the child runs', ({ tools }) => {
+    const home = makeHome()
+    const stubBin = join(home, 'stub-bin')
+    const shimDir = join(home, '.local/bin')
+    writeExec(join(stubBin, 'bun'), '#!/usr/bin/env bash\nexit 0\n')
+    const r = runBash('printf "%s\\n" "$PATH"; command -v bun', home, {
+      tools,
+      pathDirs: [stubBin, shimDir],
+    })
+    expect(r.code).toBe(0)
+    const [path, bun] = r.stdout.split('\n')
+    expect(path!.split(':').slice(0, 2)).toEqual([stubBin, shimDir])
+    expect(bun).toBe(join(stubBin, 'bun'))
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -446,7 +498,7 @@ describe('b.r6x: SR-7.4 outside-prefix arm reports the shadow and still exits 72
       'exit 0',
     ].join('\n')
 
-    const r = runBash(harness, { HOME: home, PATH: SYSTEM_PATH })
+    const r = runBash(harness, home, { tools: SHADOW_TOOLS })
 
     expect(r.code).toBe(72) // AC-9: exit-code values unchanged
     expect(r.stderr).toContain('SR-7.4')
@@ -471,7 +523,7 @@ describe('b.r6x: SR-7.4 outside-prefix arm reports the shadow and still exits 72
       SR74_ARM,
       'exit 0',
     ].join('\n')
-    const r = runBash(harness, { HOME: home, PATH: SYSTEM_PATH })
+    const r = runBash(harness, home, { tools: SHADOW_TOOLS })
     expect(r.code).toBe(0)
     expect(r.stderr).toBe('')
   })
@@ -569,12 +621,6 @@ function runSr74b(opts: Sr74bOpts = {}): Sr74bRun {
     ].join('\n') + '\n',
   )
 
-  const env: Record<string, string> = {
-    HOME: home,
-    PATH: `${stubBin}:${SYSTEM_PATH}`,
-  }
-  if (opts.stateDirOverride) env.SLACK_STATE_DIR = stateDir
-
   const harness = [
     'set -euo pipefail',
     'NEXT_VERSION=9.9.9',
@@ -583,7 +629,11 @@ function runSr74b(opts: Sr74bOpts = {}): Sr74bRun {
     'exit 0',
   ].join('\n')
 
-  const r = runBash(harness, env)
+  const r = runBash(harness, home, {
+    tools: SR74B_TOOLS,
+    pathDirs: [stubBin],
+    extras: opts.stateDirOverride ? { SLACK_STATE_DIR: stateDir } : {},
+  })
   const lines = readFileSync(log, 'utf-8').split('\n').filter(Boolean)
   return {
     ...r,
@@ -692,11 +742,12 @@ describe('b.r6x AC-5: sanitize-global.sh stays canonical-prefix-scoped and exits
    *
    * Without it the script's runtime sunset check (bun >= 1.3.14 → exit 0 before
    * reading anything) short-circuits on any current host, and an "exits 0"
-   * assertion would pass without the sanitize body ever running. The stub is the
-   * ONLY bun on PATH for these runs — the real bun and the live global install
-   * are unreachable.
+   * assertion would pass without the sanitize body ever running. The stub's
+   * directory comes first on PATH, so `bun` resolves to the stub (proved by the
+   * PATH-order cases) even where a later tool directory also holds the real
+   * bun; the live global install is out of reach under the temp HOME.
    */
-  function sanitizeEnv(home: string, prefix: string): Record<string, string> {
+  function sanitizeChild(home: string, prefix: string): RunBashChild {
     const stubBin = join(home, 'stub-bin')
     writeExec(
       join(stubBin, 'bun'),
@@ -707,13 +758,13 @@ describe('b.r6x AC-5: sanitize-global.sh stays canonical-prefix-scoped and exits
         'exit 0',
       ].join('\n') + '\n',
     )
-    return { HOME: home, BUN_INSTALL: prefix, PATH: `${stubBin}:${SYSTEM_PATH}` }
+    return { tools: SANITIZE_TOOLS, pathDirs: [stubBin], extras: { BUN_INSTALL: prefix } }
   }
 
   test('a poisoned manifest is actually rewritten: both keys removed, exit 0', () => {
     const home = makeHome()
     const prefix = join(home, 'prefix')
-    const env = sanitizeEnv(home, prefix)
+    const child = sanitizeChild(home, prefix)
     const manifest = join(prefix, 'install/global/package.json')
     mkdirSync(dirname(manifest), { recursive: true })
     writeFileSync(
@@ -725,7 +776,7 @@ describe('b.r6x AC-5: sanitize-global.sh stays canonical-prefix-scoped and exits
       ),
     )
 
-    const r = runBash(`bash ${JSON.stringify(SANITIZE_SCRIPT)}`, env)
+    const r = runBash(`bash ${JSON.stringify(SANITIZE_SCRIPT)}`, home, child)
 
     expect(r.code).toBe(0)
     // The sunset check did NOT short-circuit: the body ran and rewrote the file.
@@ -741,7 +792,7 @@ describe('b.r6x AC-5: sanitize-global.sh stays canonical-prefix-scoped and exits
   test('no manifest at all is a silent no-op, exit 0', () => {
     const home = makeHome()
     const prefix = join(home, 'prefix')
-    const r = runBash(`bash ${JSON.stringify(SANITIZE_SCRIPT)}`, sanitizeEnv(home, prefix))
+    const r = runBash(`bash ${JSON.stringify(SANITIZE_SCRIPT)}`, home, sanitizeChild(home, prefix))
     expect(r.code).toBe(0)
     expect(r.stdout).toBe('')
   })
@@ -752,7 +803,7 @@ describe('b.r6x AC-5: sanitize-global.sh stays canonical-prefix-scoped and exits
     const home = makeHome()
     const prefix = join(home, 'prefix')
     const other = join(home, 'other-prefix')
-    const env = sanitizeEnv(home, prefix)
+    const child = sanitizeChild(home, prefix)
     for (const p of [prefix, other]) {
       mkdirSync(join(p, 'install/global'), { recursive: true })
       writeFileSync(
@@ -761,7 +812,7 @@ describe('b.r6x AC-5: sanitize-global.sh stays canonical-prefix-scoped and exits
       )
     }
 
-    expect(runBash(`bash ${JSON.stringify(SANITIZE_SCRIPT)}`, env).code).toBe(0)
+    expect(runBash(`bash ${JSON.stringify(SANITIZE_SCRIPT)}`, home, child).code).toBe(0)
 
     const read = (p: string) =>
       (JSON.parse(readFileSync(join(p, 'install/global/package.json'), 'utf-8')) as {
@@ -856,7 +907,8 @@ describe('b.r6x: a pre-fix-shaped script lacks every surface these tests assert 
         extractSection(PRE_FIX_PHASE7, /^case "\$\{RESOLVED_BIN\}" in/, /^esac$/) + '\nesac',
         'exit 0',
       ].join('\n'),
-      { HOME: home, PATH: SYSTEM_PATH },
+      home,
+      { tools: ['bash'] },
     )
 
     expect(r.code).toBe(72) // AC-9: the exit code is the one thing that matches

@@ -23,6 +23,7 @@ import { readFileSync, writeFileSync, mkdtempSync, rmSync, readdirSync } from 'n
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { execFileSync } from 'node:child_process'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 const SCRIPTS_DIR = join(REPO_ROOT, 'scripts')
@@ -45,10 +46,31 @@ interface RunResult {
   stderr: string
 }
 
-/** Run a bash script, capturing stderr and the exit code (never throws). */
-function runScript(scriptAbs: string, args: string[], cwd: string): RunResult {
+/**
+ * Tools every script run needs: `bash` itself and `basename`, which the SR-99.0
+ * trap calls to name the script in its diagnostic.
+ */
+const SCRIPT_TOOLS = ['bash', 'basename']
+
+/**
+ * Tools the publish-promote.sh precondition paths reach: `dirname` (SCRIPT_DIR),
+ * `git` (repo-root discovery and the dirty-tree snapshot), `grep` (the dirty-file
+ * checks) and `jq` (manifest reads).
+ */
+const PROMOTE_TOOLS = [...SCRIPT_TOOLS, 'dirname', 'git', 'grep', 'jq']
+
+/**
+ * Run a bash script, capturing stderr and the exit code (never throws). The
+ * child gets the suite's temp HOME and a PATH holding only the named tools.
+ */
+function runScript(scriptAbs: string, args: string[], cwd: string, tools: string[] = SCRIPT_TOOLS): RunResult {
   try {
-    execFileSync('bash', [scriptAbs, ...args], { cwd, encoding: 'utf-8', stdio: 'pipe' })
+    execFileSync('bash', [scriptAbs, ...args], {
+      cwd,
+      encoding: 'utf-8',
+      stdio: 'pipe',
+      env: hostSafeChildEnv(childHome, { tools }),
+    })
     return { code: 0, stderr: '' }
   } catch (e: any) {
     return {
@@ -71,11 +93,13 @@ function srCodes(stderr: string): string[] {
 }
 
 let tmpRoot: string
+/** HOME for every child process: a temp dir under tmpRoot, removed with it. */
+let childHome: string
 
 /** A throwaway git repo (no commits needed — nothing here ever commits). */
 function initTempRepo(): string {
   const dir = mkdtempSync(join(tmpRoot, 'repo-'))
-  execFileSync('git', ['init', '-q', dir], { stdio: 'pipe' })
+  execFileSync('git', ['init', '-q', dir], { stdio: 'pipe', env: hostSafeChildEnv(childHome, { tools: ['git'] }) })
   return dir
 }
 
@@ -97,6 +121,7 @@ function copyWithInjectedFailure(scriptName: string, destDir: string): string {
 
 beforeAll(() => {
   tmpRoot = mkdtempSync(join(tmpdir(), 'b-vqy-'))
+  childHome = mkdtempSync(join(tmpRoot, 'home-'))
 })
 afterAll(() => {
   if (tmpRoot) rmSync(tmpRoot, { recursive: true, force: true })
@@ -117,7 +142,7 @@ describe('b.vqy: a guarded SR exit prints its own diagnostic and no SR-99.0', ()
 
   test('publish-promote.sh with no manifest: precondition diagnostic only, no SR-99.0', () => {
     const repo = initTempRepo()
-    const { code, stderr } = runScript(join(SCRIPTS_DIR, 'publish-promote.sh'), [], repo)
+    const { code, stderr } = runScript(join(SCRIPTS_DIR, 'publish-promote.sh'), [], repo, PROMOTE_TOOLS)
     expect(code).toBe(1)
     expect(stderr).toContain('no .publish-state.json')
     expect(countSr99(stderr)).toBe(0)
@@ -130,7 +155,7 @@ describe('b.vqy: a guarded SR exit prints its own diagnostic and no SR-99.0', ()
     // does `|| sr_exit 1` in the script's own shell.
     const repo = initTempRepo()
     writeFileSync(join(repo, '.publish-state.json'), 'not json{')
-    const { code, stderr } = runScript(join(SCRIPTS_DIR, 'publish-promote.sh'), [], repo)
+    const { code, stderr } = runScript(join(SCRIPTS_DIR, 'publish-promote.sh'), [], repo, PROMOTE_TOOLS)
     expect(code).toBe(1)
     expect(stderr).toContain("jq failed to read '.bump_kind'")
     expect(countSr99(stderr)).toBe(0)

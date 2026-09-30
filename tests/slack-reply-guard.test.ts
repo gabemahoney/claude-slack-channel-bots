@@ -10,9 +10,11 @@
  * exit 0. Default setup (b.av2 SR-13.4): every run gets a fresh
  * makeReplyGuardRecordDir state directory holding a `true` record for
  * TEST_KEY, its record directory `<state dir>/reply-guard` as the only
- * argument, and CSCB_PERSONA=TEST_KEY. The child environment is built
- * explicitly (PATH and, unless a case unsets it, CSCB_PERSONA) and never
- * inherits from the test process. Only the record-gate block departs from
+ * argument, and CSCB_PERSONA=TEST_KEY. The child environment is a direct
+ * `hostSafeChildEnv` call (a fresh temp HOME, a PATH of the guard's tools or
+ * of a test-owned shim directory alone, and, unless a case unsets it,
+ * CSCB_PERSONA) and never inherits from the test process. The FIFO record is
+ * made with the shared `makeFifo` helper. Only the record-gate block departs from
  * the default; the retry and missing-jq cases pair their exit 0 with a
  * control on the same setup that exits 2.
  *
@@ -59,6 +61,8 @@ import { tmpdir } from 'node:os'
 import type { PersonaInput } from '../src/config.ts'
 import { PERSONA_KEY_MAX_LENGTH, personaKey } from '../src/persona-identity.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
+import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
 import {
   makeReplyGuardRecordDir,
@@ -92,25 +96,45 @@ interface GuardSetup {
   args: string[]
   /** CSCB_PERSONA in the child; `null` leaves it unset. */
   persona: string | null
-  /** PATH in the child; defaults to the test process's PATH. */
-  path?: string
+  /**
+   * A test-owned shim directory that is the child's whole PATH (no named
+   * tools); without one, PATH holds the directories of GUARD_TOOLS.
+   */
+  shimDir?: string
   /** Kill the child after this many milliseconds; defaults to 20 000. */
   timeoutMs?: number
 }
 
+/**
+ * What the guard runs by name: `bash` (its `/usr/bin/env bash` shebang), `cat`
+ * (the stdin read) and `jq`.
+ */
+const GUARD_TOOLS = ['bash', 'cat', 'jq']
+
+/**
+ * Run the guard once, its environment from `hostSafeChildEnv` over a fresh
+ * temp HOME that is removed after the child exits.
+ */
 function spawnGuard(stdinJson: string, setup: GuardSetup): RunResult {
-  const env: Record<string, string> = { PATH: setup.path ?? process.env.PATH ?? '/usr/bin:/bin' }
-  if (setup.persona !== null) env.CSCB_PERSONA = setup.persona
-  const result = spawnSync(SCRIPT, setup.args, {
-    input: stdinJson,
-    encoding: 'utf-8',
-    env,
-    timeout: setup.timeoutMs ?? 20_000,
-  })
-  return {
-    exitCode: result.status ?? -1,
-    stdout: result.stdout ?? '',
-    stderr: result.stderr ?? '',
+  const home = mkdtempSync(join(tmpdir(), 'srg-home-'))
+  try {
+    const result = spawnSync(SCRIPT, setup.args, {
+      input: stdinJson,
+      encoding: 'utf-8',
+      env: hostSafeChildEnv(home, {
+        tools: setup.shimDir === undefined ? GUARD_TOOLS : [],
+        pathDirs: setup.shimDir === undefined ? [] : [setup.shimDir],
+        extras: setup.persona === null ? {} : { CSCB_PERSONA: setup.persona },
+      }),
+      timeout: setup.timeoutMs ?? 20_000,
+    })
+    return {
+      exitCode: result.status ?? -1,
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? '',
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true })
   }
 }
 
@@ -358,13 +382,13 @@ describe('slack-reply-guard.sh — SR-6.2 exit-code contract', () => {
       expect(r.exitCode).toBe(0)
     })
 
-    test('jq missing from PATH on a delivered no-reply transcript (via-slack-no-reply.jsonl) under a true record → exit 0 with the one-line missing-jq warning; the same run with the full PATH (control) → exit 2', () => {
+    test('jq missing from PATH on a delivered no-reply transcript (via-slack-no-reply.jsonl) under a true record → exit 0 with the one-line missing-jq warning; the same run with the guard tools (jq included) on PATH (control) → exit 2', () => {
       withNoJqPath((shimDir) =>
         withTrueRecord((setup) => {
           const input = harness(join(FIX, 'via-slack-no-reply.jsonl'))
           // The restricted PATH carries the same record, argument and
           // explicit CSCB_PERSONA as the control.
-          const r = spawnGuard(input, { ...setup, path: shimDir })
+          const r = spawnGuard(input, { ...setup, shimDir })
           // The guard's missing-jq warning, exactly: the exit 0 came from the
           // missing-jq branch, not from an earlier failure (bash or cat
           // missing), the record gate or the transcript.
@@ -880,7 +904,7 @@ interface GateCase {
   setup?: (rec: ReplyGuardRecordDir) => GuardSetup
 }
 
-function runGateCase(c: GateCase, opts: { path?: string } = {}): RunResult {
+function runGateCase(c: GateCase, opts: { shimDir?: string } = {}): RunResult {
   const rec = makeReplyGuardRecordDir({
     records: c.records,
     createRecordDir: c.createRecordDir,
@@ -891,7 +915,7 @@ function runGateCase(c: GateCase, opts: { path?: string } = {}): RunResult {
   try {
     c.prepare?.(rec)
     const setup = c.setup?.(rec) ?? defaultSetup(rec)
-    return spawnGuard(harness(join(FIX, GATE_FIXTURE)), { ...setup, path: opts.path ?? setup.path })
+    return spawnGuard(harness(join(FIX, GATE_FIXTURE)), { ...setup, shimDir: opts.shimDir ?? setup.shimDir })
   } finally {
     if (saved === undefined) delete process.env.CSCB_PERSONA
     else process.env.CSCB_PERSONA = saved
@@ -965,19 +989,6 @@ describe('slack-reply-guard.sh — per-persona record gate (b.av2 SR-9.4)', () =
       { createRecordDir: true, prepare: (rec) => mkdirSync(rec.recordPath(TEST_KEY)) },
     ],
     [
-      'the record path is a FIFO with no writer (never opened, so the run does not block)',
-      {
-        createRecordDir: true,
-        prepare: (rec) => {
-          const made = spawnSync('mkfifo', [rec.recordPath(TEST_KEY)])
-          expect(made.status).toBe(0)
-        },
-        // Opening the FIFO would block forever; a short kill turns a
-        // regression into a quick failure (exit code -1).
-        setup: (rec) => ({ ...defaultSetup(rec), timeoutMs: 3_000 }),
-      },
-    ],
-    [
       'CSCB_PERSONA set to ../<name> while <state dir>/<name> holds true (traversal refused)',
       {
         createRecordDir: true,
@@ -1006,13 +1017,31 @@ describe('slack-reply-guard.sh — per-persona record gate (b.av2 SR-9.4)', () =
     expect(r.stdout).toBe('')
   })
 
+  // Split out of the table above so it can be guarded: a real FIFO needs the
+  // `mkfifo` command. Same case and assertions as the table rows.
+  test.skipIf(!mkfifoAvailable())(
+    'no reminder: the record path is a FIFO with no writer (never opened, so the run does not block) → exit 0, silent (skipped when mkfifo is unavailable)',
+    () => {
+      const r = runGateCase({
+        createRecordDir: true,
+        prepare: (rec) => makeFifo(rec.recordPath(TEST_KEY)),
+        // Opening the FIFO would block forever; a short kill turns a
+        // regression into a quick failure (exit code -1).
+        setup: (rec) => ({ ...defaultSetup(rec), timeoutMs: 3_000 }),
+      })
+      expect(r.exitCode).toBe(0)
+      expect(r.stderr).toBe('')
+      expect(r.stdout).toBe('')
+    },
+  )
+
   test('the gate runs before the jq check: a false record with jq missing from PATH → exit 0 with no missing-jq warning', () => {
     withNoJqPath((shimDir) => {
-      const r = runGateCase({ records: { [TEST_KEY]: RECORD_FALSE } }, { path: shimDir })
+      const r = runGateCase({ records: { [TEST_KEY]: RECORD_FALSE } }, { shimDir })
       expect(r.exitCode).toBe(0)
       expect(r.stderr).toBe('')
       // Control: a true record on the same PATH gets the warning.
-      const control = runGateCase({ records: TRUE_RECORD }, { path: shimDir })
+      const control = runGateCase({ records: TRUE_RECORD }, { shimDir })
       expect(control.exitCode).toBe(0)
       expect(control.stderr).toBe(MISSING_JQ_WARNING)
     })

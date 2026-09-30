@@ -103,6 +103,7 @@ import {
   writtenFile,
 } from './test-helpers/credentials.ts'
 import { stubCallCount } from './test-helpers/agent-director-stub.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import {
   makeReloadHarness,
@@ -336,15 +337,16 @@ function fileFailureLine(code: string): string {
 }
 
 /**
- * Run `body` (statements over `h`, a harness under this test's root, and
- * `spawnSync`) in a child `bun` process with a 10 s bound, so a blocking
- * FIFO open fails the test instead of hanging the suite. `body` prints one
- * JSON line; returns it parsed, and the child's stderr.
+ * Run `body` (statements over `h`, a harness under this test's root) in a
+ * child `bun` process with a 10 s bound, so a blocking FIFO open fails the
+ * test instead of hanging the suite. `body` prints one JSON line; returns it
+ * parsed, and the child's stderr. The child starts no process of its own
+ * except `mkfifo`, through `h.makeFifo` (the shared FIFO helper), so `mkfifo`
+ * is its only tool; only cases guarded by `mkfifoAvailable()` call this.
  */
 function runHarnessInChild<T>(body: string): { result: T; stderr: string } {
   const harnessPath = join(import.meta.dir, 'test-helpers', 'reload-harness.ts')
   const script = `
-    const { spawnSync } = await import('node:child_process')
     const { makeReloadHarness } = await import(${JSON.stringify(harnessPath)})
     const h = makeReloadHarness({ parentDir: ${JSON.stringify(h.root)} })
     try {
@@ -356,7 +358,7 @@ function runHarnessInChild<T>(body: string): { result: T; stderr: string } {
   const child = spawnSync(process.execPath, ['-e', script], {
     timeout: 10_000,
     encoding: 'utf-8',
-    env: { PATH: process.env['PATH'], HOME: h.home, SLACK_STATE_DIR: join(h.home, 'state') },
+    env: hostSafeChildEnv(h.home, { tools: ['mkfifo'], extras: { SLACK_STATE_DIR: join(h.home, 'state') } }),
   })
   expect(child.signal).toBeNull()
   expect(child.status).toBe(0)
@@ -1135,7 +1137,7 @@ describe('a record or config file that is not a regular file refuses the start u
         h.materialize(alpha)
         const fifo = ${JSON.stringify(which)} === 'record' ? h.paths.lastApplied : h.paths.config
         if (fifo !== h.paths.config) h.writeConfig({ personas: [alpha] })
-        if (spawnSync('mkfifo', [fifo]).status !== 0) throw new Error('mkfifo failed')
+        h.makeFifo(fifo)
         const run = await h.start()
         console.log(JSON.stringify({ paths: h.paths, outcome: run.outcome, logs: run.logs, records: run.lifecycle.records, writes: run.writes }))
       `)
@@ -4284,13 +4286,15 @@ describe('module import', () => {
       cwd: home,
       timeout: 10_000,
       encoding: 'utf-8',
-      env: {
-        PATH: process.env['PATH'],
-        HOME: home,
-        SLACK_STATE_DIR: join(home, 'state'),
-        // Bun's own runtime transpiler cache would otherwise land in $HOME/.bun.
-        BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0',
-      },
+      // Started by absolute path and runs nothing by name: no tools on PATH.
+      env: hostSafeChildEnv(home, {
+        tools: [],
+        extras: {
+          SLACK_STATE_DIR: join(home, 'state'),
+          // Bun's own runtime transpiler cache would otherwise land in $HOME/.bun.
+          BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0',
+        },
+      }),
     })
 
     expect(child.signal).toBeNull()

@@ -15,7 +15,7 @@
  * The call shape (the only one the host-safety audit accepts): the child
  * process call's `env` option is a direct `hostSafeChildEnv(...)` call.
  *
- *   spawnSync('mkfifo', [path], { env: hostSafeChildEnv(home, { tools: ['mkfifo'] }), timeout: 5_000 })
+ *   spawnSync('bash', [script], { env: hostSafeChildEnv(home, { tools: ['bash', 'grep'] }), timeout: 5_000 })
  *   spawnSync(process.execPath, [CLI_SOURCE], { env: hostSafeChildEnv(home, { tools: [], extras: { SLACK_STATE_DIR: stateDir } }) })
  *   Bun.spawn(['bash', script], { env: hostSafeChildEnv(home, { pathDirs: [stubBin] }) })
  *
@@ -35,13 +35,21 @@
  *   `pathDirs`) it is `EMPTY_CHILD_PATH`, a path that is not a directory, so
  *   no lookup finds anything (an empty `PATH` would make a shell search the
  *   working directory);
- * - `TMUX_TMPDIR`: one `mkdtempSync` directory under the OS temp directory
- *   (`CHILD_TMUX_TMPDIR_PREFIX`), created on the first call in this process
- *   and returned by every later call in it, so a tmux the child starts never
- *   reaches the host's tmux server. It is never removed: a child may still be
- *   running tmux when this process ends, and tmux falls back to `/tmp` (the
- *   host's default socket directory) when `TMUX_TMPDIR` does not exist. That
- *   leaves at most one such directory per process (one per `bun test` run);
+ * - `TMUX_TMPDIR`: one directory under the OS temp directory whose name
+ *   starts with `CHILD_TMUX_TMPDIR_PREFIX`, fixed on the first call in this
+ *   process and returned by every later call in it, so a tmux the child starts
+ *   never reaches the host's tmux server. When this process was itself started
+ *   with such a `TMUX_TMPDIR` (a parent's `hostSafeChildEnv` set it:
+ *   `inheritedChildTmuxTmpDir`), that directory is reused; otherwise one is
+ *   made with `mkdtempSync`. A `bun` child that loads this helper again (a
+ *   harness run in a child, say) therefore hands its own children the parent's
+ *   directory instead of making another. The directory is never removed: a
+ *   child may still be running tmux when this process ends, and tmux falls
+ *   back to `/tmp` (the host's default socket directory) when `TMUX_TMPDIR`
+ *   does not exist. That leaves at most one such directory per `bun test` run
+ *   (one more for each child whose OS temp directory differs from its
+ *   parent's, since only a directory directly under the child's own OS temp
+ *   directory is reused);
  * - `options.extras`, as given. An extra cannot set `HOME`, `PATH`,
  *   `TMUX_TMPDIR`, `TMUX` or `TMUX_PANE` (`RESERVED_CHILD_ENV_NAMES`).
  * Nothing else is copied from `process.env`: no Slack token or other ambient
@@ -68,17 +76,18 @@
  * to the launch-time home only when the passwd file has no entry for the user.
  *
  * Isolation: it starts no process and imports nothing from `agent-director`.
- * It reads only the entries it checks (lstat under `home` and each `PATH`
- * directory) and `/etc/passwd`, and creates nothing under `home`: its only
- * write is the one `TMUX_TMPDIR` directory per process under the OS temp
- * directory. Callers may snapshot their HOME tree around the call.
+ * It reads only the entries it checks (lstat under `home`, each `PATH`
+ * directory and an inherited `TMUX_TMPDIR`) and `/etc/passwd`, and creates
+ * nothing under `home`: its only write is the one `TMUX_TMPDIR` directory
+ * under the OS temp directory, made only when none was inherited. Callers may
+ * snapshot their HOME tree around the call.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { accessSync, constants as fsConstants, lstatSync, mkdtempSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { homedir, tmpdir, userInfo } from 'node:os'
-import { delimiter, isAbsolute, join, resolve } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
 
 // ---------------------------------------------------------------------------
 // agent-director discovery names (written once, here)
@@ -109,7 +118,7 @@ export const EMPTY_CHILD_PATH = '/dev/null'
 /** Names `extras` may not set: the helper's own and tmux's session variables. */
 export const RESERVED_CHILD_ENV_NAMES: readonly string[] = Object.freeze(['HOME', 'PATH', 'TMUX_TMPDIR', 'TMUX', 'TMUX_PANE'])
 
-/** Prefix of the per-process `TMUX_TMPDIR` directory under the OS temp directory. */
+/** Prefix of the `TMUX_TMPDIR` directory's name under the OS temp directory. */
 export const CHILD_TMUX_TMPDIR_PREFIX = 'host-safe-tmux-'
 
 export interface HostSafeChildEnvOptions {
@@ -305,13 +314,37 @@ export function resolveToolDir(tool: string, pathEnv: string | undefined = proce
 let childTmuxTmpDirCache: string | undefined
 
 /**
- * This process's `TMUX_TMPDIR` directory under the OS temp directory: created
- * on the first call, the same one on every later call, never removed (see the
- * module header).
+ * `value` when it names a `TMUX_TMPDIR` a parent's `hostSafeChildEnv` made: an
+ * absolute path directly under the OS temp directory whose name starts with
+ * `CHILD_TMUX_TMPDIR_PREFIX` and is longer than it, naming a directory (not a
+ * symlink) owned by this process's user. Otherwise `undefined`. `value`
+ * defaults to this process's own `TMUX_TMPDIR`.
+ */
+export function inheritedChildTmuxTmpDir(value: string | undefined = process.env['TMUX_TMPDIR']): string | undefined {
+  if (typeof value !== 'string' || !isAbsolute(value)) return undefined
+  const name = basename(value)
+  if (dirname(value) !== tmpdir() || !name.startsWith(CHILD_TMUX_TMPDIR_PREFIX) || name.length <= CHILD_TMUX_TMPDIR_PREFIX.length) {
+    return undefined
+  }
+  try {
+    const st = lstatSync(value)
+    const uid = process.getuid?.()
+    if (!st.isDirectory() || (uid !== undefined && st.uid !== uid)) return undefined
+  } catch {
+    return undefined
+  }
+  return value
+}
+
+/**
+ * This process's `TMUX_TMPDIR` directory under the OS temp directory: the
+ * inherited one (`inheritedChildTmuxTmpDir`) or else a new `mkdtempSync` one,
+ * fixed on the first call, the same one on every later call, never removed
+ * (see the module header).
  */
 function childTmuxTmpDir(): string {
   if (childTmuxTmpDirCache === undefined) {
-    childTmuxTmpDirCache = mkdtempSync(join(tmpdir(), CHILD_TMUX_TMPDIR_PREFIX))
+    childTmuxTmpDirCache = inheritedChildTmuxTmpDir() ?? mkdtempSync(join(tmpdir(), CHILD_TMUX_TMPDIR_PREFIX))
   }
   return childTmuxTmpDirCache
 }

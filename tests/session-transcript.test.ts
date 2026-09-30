@@ -19,7 +19,9 @@
  *   directory: the snapshot (size, mtime, identity) and turn state of a
  *   regular file, only its last `TRANSCRIPT_TAIL_BYTES` read; a missing,
  *   empty or non-regular file is `unreadable` with a fixed reason. A real
- *   FIFO runs in a child `bun` process with a time limit.
+ *   FIFO (made with `tests/test-helpers/fifo.ts`) runs in a child `bun`
+ *   process with a time limit, its environment from `hostSafeChildEnv`
+ *   (HOME the per-test directory, no tool on PATH).
  *
  * Transcript entries come from `tests/test-helpers/working-row-panes.ts`.
  *
@@ -57,6 +59,8 @@ import {
   writeTranscript,
   type TranscriptEntry,
 } from './test-helpers/working-row-panes.ts'
+import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 let dir: string
 
@@ -225,16 +229,17 @@ describe('readTranscriptTurnState', () => {
     expect(readTranscriptTurnState(make())).toEqual({ kind: 'unreadable', reason })
   })
 
-  const hasMkfifo = spawnSync('mkfifo', ['--version']).status === 0
-  test.skipIf(!hasMkfifo)('a real FIFO with no writer: the read does not wait, it is unreadable as not a regular file (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
+  test.skipIf(!mkfifoAvailable())('a real FIFO with no writer: the read does not wait, it is unreadable as not a regular file (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
     const path = join(dir, `${TRANSCRIPT_SESSION_ID}.jsonl`)
-    expect(spawnSync('mkfifo', [path]).status).toBe(0)
+    makeFifo(path)
     const modulePath = join(import.meta.dir, '..', 'src', 'session-transcript.ts')
     const script = `const t = await import(${JSON.stringify(modulePath)})\nconsole.log(JSON.stringify(t.readTranscriptTurnState(${JSON.stringify(path)})))`
+    // The child is started by absolute path (`process.execPath`) and runs
+    // nothing by name, so it needs no tool on PATH.
     const child = spawnSync(process.execPath, ['-e', script], {
       timeout: 10_000,
       encoding: 'utf-8',
-      env: { PATH: process.env['PATH'], HOME: dir, BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' },
+      env: hostSafeChildEnv(dir, { tools: [], extras: { BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' } }),
     })
 
     expect(child.signal).toBeNull()

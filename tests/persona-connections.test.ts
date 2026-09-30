@@ -272,6 +272,8 @@ import {
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { PONG_TIMEOUT_TEXT, outputDuring, socketLogLine, ticketUrl } from './test-helpers/slack-logger-probes.ts'
 import {
   cannedGetResult,
@@ -606,8 +608,6 @@ describe('checkPersonaCredentials: the file is opened once and checked, read and
     return { fs, calls, opened: () => opened }
   }
 
-  const hasMkfifo = spawnSync('mkfifo', ['--version']).status === 0
-
   // Rows: label, arrange (real path or injected ops), expected class and cause, ops made after the open.
   test.each<[string, (persona: BringUpPersona) => Partial<CredentialsFs>, PersonaDiagnosticClass | 'ok', string, FdCall['op'][]]>([
     ['a valid regular file', (persona) => (writeCreds(persona), {}), 'ok', '', ['fstat', 'read', 'close']],
@@ -657,10 +657,10 @@ describe('checkPersonaCredentials: the file is opened once and checked, read and
   // In a child process with a 10 s bound: a blocking open of a FIFO with no
   // writer never returns, so in-process it would hang the whole suite instead
   // of failing this test.
-  test.skipIf(!hasMkfifo)('a real FIFO: the open does not wait for a writer; refused unread and closed (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
+  test.skipIf(!mkfifoAvailable())('a real FIFO: the open does not wait for a writer; refused unread and closed (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
     const persona = makePersona()
     mkdirSync(join(dir, persona.key), { recursive: true })
-    expect(spawnSync('mkfifo', [persona.credentials_file]).status).toBe(0)
+    makeFifo(persona.credentials_file)
     const modulePath = join(import.meta.dir, '..', 'src', 'persona-credentials.ts')
     const script = `
       const { checkPersonaCredentials, DEFAULT_CREDENTIALS_FS: d } = await import(${JSON.stringify(modulePath)})
@@ -675,7 +675,11 @@ describe('checkPersonaCredentials: the file is opened once and checked, read and
       console.log(JSON.stringify({ ok: r.ok, class: r.class, cause: r.cause, ops }))
     `
 
-    const child = spawnSync(process.execPath, ['-e', script], { timeout: 10_000, encoding: 'utf-8', env: { PATH: process.env['PATH'] } })
+    // The child's HOME: under `dir`, which afterEach removes.
+    const childHome = join(dir, 'child-home')
+    mkdirSync(childHome)
+
+    const child = spawnSync(process.execPath, ['-e', script], { timeout: 10_000, encoding: 'utf-8', env: hostSafeChildEnv(childHome, { tools: [] }) })
 
     expect(child.signal).toBeNull()
     expect(JSON.parse(child.stdout.trim())).toEqual({

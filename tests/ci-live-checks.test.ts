@@ -61,8 +61,10 @@
  *   finding, and one that never connects is.
  *
  * No docker, network or real host state: the container, the host probes, the
- * test human's session and the clock are fakes; the transcript helpers run
- * in bash with a temp HOME.
+ * test human's session and the clock are fakes. The bash children (the `q`
+ * quoting check and the transcript helpers) get their environment from
+ * `hostSafeChildEnv`: a temp HOME the test removes and a PATH of the tools
+ * they run.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -158,6 +160,7 @@ import { MINUTE, SECOND } from '../ci-live/lib/wait.ts'
 import { emptyAppsState } from '../ci-live/lib/apps-state.ts'
 import { virtualClock } from './test-helpers/ci-live.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1869,8 +1872,14 @@ describe('expected texts match the package', () => {
 describe('check helpers', () => {
   test.each([`it's`, '$(touch /nonexistent/x) `id` $HOME', "'; echo pwned #", 'two\nlines', ''])('q(%p) is one literal shell word', (value) => {
     const bash = Bun.which('bash')!
-    const r = Bun.spawnSync([bash, '-c', `printf %s ${q(value)}`], { env: { PATH: '/usr/bin:/bin' } })
-    expect([r.exitCode, r.stdout.toString()]).toEqual([0, value])
+    const home = mkdtempSync(join(tmpdir(), 'ci-live-q-'))
+    try {
+      // bash's own directory stays on PATH, so a word q failed to quote would still run its command.
+      const r = Bun.spawnSync([bash, '-c', `printf %s ${q(value)}`], { env: hostSafeChildEnv(home, { tools: ['bash'] }) })
+      expect([r.exitCode, r.stdout.toString()]).toEqual([0, value])
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
   })
 
   test.each([
@@ -2012,10 +2021,13 @@ describe("tags and tagstext over a transcript (the container's helpers and the p
   })
   afterEach(() => rmSync(home, { recursive: true, force: true }))
 
+  /** What `tags` and `tagstext` run by name. */
+  const HELPER_TOOLS = ['bash', 'ls', 'head', 'jq', 'grep']
+
   /** Run one helper, defined from `source`, in bash with the fixture home; its output lines. */
   function helper(source: string, ...args: string[]): string[] {
     const defs = `${shellFunction(source, 'tags')}\n${shellFunction(source, 'tagstext')}`
-    const r = Bun.spawnSync([Bun.which('bash')!, '-c', `${defs}\n"$@"`, 'helpers', ...args], { env: { HOME: home, PATH: process.env.PATH ?? '/usr/bin:/bin' } })
+    const r = Bun.spawnSync([Bun.which('bash')!, '-c', `${defs}\n"$@"`, 'helpers', ...args], { env: hostSafeChildEnv(home, { tools: HELPER_TOOLS }) })
     expect(r.stderr.toString()).toBe('')
     return r.stdout.toString().split('\n').filter((l) => l !== '')
   }

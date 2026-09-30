@@ -27,6 +27,19 @@
  *   - spawnSync for the subprocess, real fs, no mocks
  *   - absolute script path via fileURLToPath so CWD is irrelevant
  *
+ * Child environment (b.jg5): every git and bash child gets its environment from
+ * `hostSafeChildEnv` — the fixture's own temp HOME, a PATH holding only the
+ * named tools' directories, and `GIT_CONFIG_NOSYSTEM=1` (every child here runs
+ * git: the fixture git helper, the audit script, the pre-fix script and the
+ * pre-fix `git show`). Nothing else from the parent environment is inherited,
+ * so no global or system git configuration, identity hook or credential
+ * reaches a child. Fixture commits use a fake repo-local identity with
+ * repo-local `commit.gpgsign false`.
+ *
+ * The temp HOME is its own `audit-home-*` directory in the OS temp dir,
+ * created and removed per fixture and kept OUTSIDE the fixture project
+ * (`audit-fix-*`), so the script never mistakes it for a hive or ticket dir.
+ *
  * Regression sentinel: the test
  *   "finished ticket with no main commit and no closure marker → flagged"
  * FAILS if the flagging logic is removed/broken (script would exit 0) and
@@ -48,6 +61,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 /** Absolute path to the script under test — CWD-independent. */
 const SCRIPT_SRC = fileURLToPath(
@@ -66,16 +80,48 @@ afterEach(() => {
   while (cleanups.length) cleanups.pop()!()
 })
 
-/** git helper that runs in the fixture repo and throws on failure. */
-function git(repo: string, args: string[]): string {
+/**
+ * External commands the audit script (current and every pinned pre-fix
+ * revision) runs by name, plus `bash` itself. The children's PATH holds only
+ * these tools' directories.
+ */
+const AUDIT_SCRIPT_TOOLS: readonly string[] = [
+  'bash',
+  'git',
+  'grep',
+  'awk',
+  'sed',
+  'tr',
+  'head',
+  'basename',
+  'dirname',
+]
+
+/**
+ * Extras for every child that runs git — the fixture git helper, the audit
+ * script runs (current and pre-fix; the script runs git) and the pre-fix
+ * `git show`: `GIT_CONFIG_NOSYSTEM=1` keeps the host's system git configuration
+ * out, as the temp HOME keeps the global one out.
+ */
+const AUDIT_GIT_EXTRAS: Readonly<Record<string, string>> = Object.freeze({ GIT_CONFIG_NOSYSTEM: '1' })
+
+/** Where a fixture git command runs: the child's temp HOME and the repo (cwd). */
+interface GitAt {
+  home: string
+  repo: string
+}
+
+/**
+ * git helper that runs in the fixture repo and throws on failure. The child
+ * sees only the fixture's temp HOME (no global git config or hooks) and
+ * `GIT_CONFIG_NOSYSTEM=1` (no system config either), so commits resolve their
+ * author and committer from the fake repo-local identity `makeFixture` sets.
+ */
+function git(at: GitAt, args: string[]): string {
   const r = spawnSync('git', args, {
-    cwd: repo,
+    cwd: at.repo,
     encoding: 'utf8',
-    // Let the machine's managed git identity hook/helper resolve author &
-    // committer from the repo-local `identity.account` we declare below — do
-    // not force GIT_AUTHOR_*/GIT_COMMITTER_* here or the pre-commit identity
-    // hook rejects the mismatch.
-    env: { ...process.env },
+    env: hostSafeChildEnv(at.home, { tools: ['git'], extras: AUDIT_GIT_EXTRAS }),
   })
   if (r.status !== 0) {
     throw new Error(`git ${args.join(' ')} failed: ${r.stderr}`)
@@ -98,6 +144,8 @@ interface Fixture {
   proj: string
   repo: string
   script: string
+  /** Temp HOME for every child this fixture's test starts (outside `proj`). */
+  home: string
 }
 
 /**
@@ -117,6 +165,9 @@ function makeFixture(opts: {
 }): Fixture {
   const proj = mkdtempSync(join(tmpdir(), 'audit-fix-'))
   cleanups.push(() => rmSync(proj, { recursive: true, force: true }))
+  // Kept outside `proj` so it can never be mistaken for a hive or ticket dir.
+  const home = mkdtempSync(join(tmpdir(), 'audit-home-'))
+  cleanups.push(() => rmSync(home, { recursive: true, force: true }))
 
   const repo = join(proj, opts.repoName ?? 'repo')
   const scriptsDir = join(repo, 'scripts')
@@ -158,41 +209,26 @@ function makeFixture(opts: {
   }
 
   // Scratch git repo with a main branch and at least one commit.
-  git(repo, ['init', '-q'])
-  // Pin a repo-local identity so fixture commits resolve to a sanctioned
-  // account (repo-local `identity.account` wins first in the resolution order;
-  // see ~/.claude/skills/github-config/SKILL.md) — NOT a hook bypass, the
-  // machine's pre-commit identity hook still runs and passes. The neutral
-  // placeholder email keeps a real address out of a checked-in fixture; the
-  // hook self-corrects it on the first commit (see the retry-once below).
-  git(repo, ['config', 'identity.account', 'work'])
-  git(repo, ['config', 'user.name', 'Fixture'])
-  git(repo, ['config', 'user.email', 'fixture@example.com'])
-  git(repo, ['checkout', '-q', '-b', 'main'])
+  const at: GitAt = { home, repo }
+  git(at, ['init', '-q'])
+  // Fake repo-local identity: the child's HOME is the fixture's temp HOME and
+  // system config is off, so no global identity, identity hook or template
+  // hook loads — this repo-local identity alone authors every fixture commit.
+  git(at, ['config', 'user.name', 'Fixture'])
+  git(at, ['config', 'user.email', 'test@example.invalid'])
+  // No signing key is configured under the temp HOME; turn signing off
+  // explicitly so every fixture commit succeeds on any host.
+  git(at, ['config', 'commit.gpgsign', 'false'])
+  git(at, ['checkout', '-q', '-b', 'main'])
   writeFileSync(join(repo, 'README'), 'fixture\n')
-  git(repo, ['add', 'README'])
-  // Retry-once: on identity-enforcing hosts the pre-commit hook sees the
-  // placeholder user.email as a config value (not an env/CLI override), so per
-  // github-config SKILL.md outcome #2 it rewrites the repo's user.email to the
-  // resolved identity and blocks exactly once ("Re-run the commit; it will
-  // pass."). The identical retry then succeeds. On hosts without enforcement
-  // the first commit succeeds and the catch is dead code. Do not simplify away.
-  try {
-    git(repo, ['commit', '-q', '-m', 'initial commit'])
-  } catch {
-    git(repo, ['commit', '-q', '-m', 'initial commit'])
-  }
+  git(at, ['add', 'README'])
+  git(at, ['commit', '-q', '-m', 'initial commit'])
   for (const c of opts.commits ?? []) {
     const msg = c.body ? `${c.subject}\n\n${c.body}` : c.subject
-    // Same retry-once as the initial commit above (see note there).
-    try {
-      git(repo, ['commit', '-q', '--allow-empty', '-m', msg])
-    } catch {
-      git(repo, ['commit', '-q', '--allow-empty', '-m', msg])
-    }
+    git(at, ['commit', '-q', '--allow-empty', '-m', msg])
   }
 
-  return { proj, repo, script }
+  return { proj, repo, script, home }
 }
 
 interface RunResult {
@@ -228,7 +264,7 @@ function incidentalPathBody(): string {
 function runAudit(fx: Fixture): RunResult {
   const r = spawnSync('bash', [fx.script, fx.repo], {
     encoding: 'utf8',
-    env: { ...process.env },
+    env: hostSafeChildEnv(fx.home, { tools: AUDIT_SCRIPT_TOOLS, extras: AUDIT_GIT_EXTRAS }),
   })
   return { status: r.status, stdout: r.stdout, stderr: r.stderr }
 }
@@ -241,7 +277,7 @@ function runAudit(fx: Fixture): RunResult {
 function runAuditNoArg(fx: Fixture): RunResult {
   const r = spawnSync('bash', [fx.script], {
     encoding: 'utf8',
-    env: { ...process.env },
+    env: hostSafeChildEnv(fx.home, { tools: AUDIT_SCRIPT_TOOLS, extras: AUDIT_GIT_EXTRAS }),
   })
   return { status: r.status, stdout: r.stdout, stderr: r.stderr }
 }
@@ -273,7 +309,13 @@ function recoverPreFixScript(
   const realPreFix = spawnSync(
     'git',
     ['show', `${sha}:scripts/audit-finished-tickets.sh`],
-    { cwd: WORKTREE_ROOT, encoding: 'utf8' },
+    {
+      cwd: WORKTREE_ROOT,
+      encoding: 'utf8',
+      // Read-only object lookup in this worktree's history; needs no HOME or
+      // system config, so the fixture's temp HOME and AUDIT_GIT_EXTRAS serve.
+      env: hostSafeChildEnv(fx.home, { tools: ['git'], extras: AUDIT_GIT_EXTRAS }),
+    },
   )
   expect(
     realPreFix.status,
@@ -821,7 +863,7 @@ describe('audit-finished-tickets.sh — branch (b) closure vocabulary (b.fta)', 
     // per-ticket: b.ere absent (laundered) yet b.plt present (flagged).
     const pre = spawnSync('bash', [preFixScript, fx.repo], {
       encoding: 'utf8',
-      env: { ...process.env },
+      env: hostSafeChildEnv(fx.home, { tools: AUDIT_SCRIPT_TOOLS, extras: AUDIT_GIT_EXTRAS }),
     })
     expect(pre.stdout).not.toContain('b.ere')
     expect(pre.stdout).toContain('b.plt')
@@ -979,7 +1021,7 @@ describe("audit-finished-tickets.sh — branch (b) won't-fix spellings & added r
     // reads as stranded work and the gate fails closed on a clean repo.
     const pre = spawnSync('bash', [preFixScript, fx.repo], {
       encoding: 'utf8',
-      env: { ...process.env },
+      env: hostSafeChildEnv(fx.home, { tools: AUDIT_SCRIPT_TOOLS, extras: AUDIT_GIT_EXTRAS }),
     })
     expect(pre.stdout).toContain('b.mqw')
     expect(pre.stdout).toContain('no commit on main lands it')
@@ -1213,7 +1255,7 @@ describe('audit-finished-tickets.sh — out-of-repo closure MARKER (b.jpw AC-3; 
     // → b.inc NOT flagged, exit 0 (clean).
     const pre = spawnSync('bash', [preFixScript, fx.repo], {
       encoding: 'utf8',
-      env: { ...process.env },
+      env: hostSafeChildEnv(fx.home, { tools: AUDIT_SCRIPT_TOOLS, extras: AUDIT_GIT_EXTRAS }),
     })
     expect(pre.stdout).not.toContain('b.inc')
     expect(pre.status).toBe(0)
@@ -1263,7 +1305,7 @@ describe('audit-finished-tickets.sh — Ideas/ top-level bee pass (b.dw7)', () =
     // Pre-fix: Ideas/ top-level is never scanned → b.idb invisible, exit 0 clean.
     const pre = spawnSync('bash', [preFixScript, fx.repo], {
       encoding: 'utf8',
-      env: { ...process.env },
+      env: hostSafeChildEnv(fx.home, { tools: AUDIT_SCRIPT_TOOLS, extras: AUDIT_GIT_EXTRAS }),
     })
     expect(pre.stdout).not.toContain('b.idb')
     expect(pre.status).toBe(0)
@@ -1372,14 +1414,14 @@ describe('audit-finished-tickets.sh — stranded branches', () => {
     })
 
     // Unmerged branch off an earlier point, one commit ahead of main.
-    const firstSha = git(fx.repo, ['rev-list', '--max-parents=0', 'main']).trim()
-    git(fx.repo, ['checkout', '-q', '-b', 'feature/b.brn', firstSha])
-    git(fx.repo, ['commit', '-q', '--allow-empty', '-m', 'wip b.brn on branch'])
+    const firstSha = git(fx, ['rev-list', '--max-parents=0', 'main']).trim()
+    git(fx, ['checkout', '-q', '-b', 'feature/b.brn', firstSha])
+    git(fx, ['commit', '-q', '--allow-empty', '-m', 'wip b.brn on branch'])
 
     // Merged branch: points at a commit that IS reachable from main.
-    const mainSha = git(fx.repo, ['rev-parse', 'main']).trim()
-    git(fx.repo, ['branch', 'feature/b.mrg', mainSha])
-    git(fx.repo, ['checkout', '-q', 'main'])
+    const mainSha = git(fx, ['rev-parse', 'main']).trim()
+    git(fx, ['branch', 'feature/b.mrg', mainSha])
+    git(fx, ['checkout', '-q', 'main'])
 
     const r = runAudit(fx)
     // Unmerged branch flagged...
@@ -1395,10 +1437,10 @@ describe('audit-finished-tickets.sh — stranded branches', () => {
       tickets: [{ id: 'b.kno', hive: 'Bugs', status: 'finished' }],
       commits: [{ subject: 'fix: land b.kno' }],
     })
-    const firstSha = git(fx.repo, ['rev-list', '--max-parents=0', 'main']).trim()
-    git(fx.repo, ['checkout', '-q', '-b', 'no-ticket-feature', firstSha])
-    git(fx.repo, ['commit', '-q', '--allow-empty', '-m', 'orphan work'])
-    git(fx.repo, ['checkout', '-q', 'main'])
+    const firstSha = git(fx, ['rev-list', '--max-parents=0', 'main']).trim()
+    git(fx, ['checkout', '-q', '-b', 'no-ticket-feature', firstSha])
+    git(fx, ['commit', '-q', '--allow-empty', '-m', 'orphan work'])
+    git(fx, ['checkout', '-q', 'main'])
 
     const r = runAudit(fx)
     expect(r.stdout).toContain('no-ticket-feature')
@@ -1414,10 +1456,10 @@ describe('audit-finished-tickets.sh — stranded branches', () => {
       tickets: [{ id: 'b.xyzq', hive: 'Bugs', status: 'finished' }],
       commits: [{ subject: 'fix: land b.xyzq' }], // keep the TICKET pass clean
     })
-    const firstSha = git(fx.repo, ['rev-list', '--max-parents=0', 'main']).trim()
-    git(fx.repo, ['checkout', '-q', '-b', 'FEATURE/B.XYZQ', firstSha])
-    git(fx.repo, ['commit', '-q', '--allow-empty', '-m', 'wip on branch'])
-    git(fx.repo, ['checkout', '-q', 'main'])
+    const firstSha = git(fx, ['rev-list', '--max-parents=0', 'main']).trim()
+    git(fx, ['checkout', '-q', '-b', 'FEATURE/B.XYZQ', firstSha])
+    git(fx, ['commit', '-q', '--allow-empty', '-m', 'wip on branch'])
+    git(fx, ['checkout', '-q', 'main'])
 
     const r = runAudit(fx)
     expect(r.stdout).toContain('FEATURE/B.XYZQ')
@@ -1444,10 +1486,10 @@ describe('audit-finished-tickets.sh — stranded branches', () => {
         },
       ],
     })
-    const firstSha = git(fx.repo, ['rev-list', '--max-parents=0', 'main']).trim()
-    git(fx.repo, ['checkout', '-q', '-b', 'feature/b.idr', firstSha])
-    git(fx.repo, ['commit', '-q', '--allow-empty', '-m', 'wip b.idr on branch'])
-    git(fx.repo, ['checkout', '-q', 'main'])
+    const firstSha = git(fx, ['rev-list', '--max-parents=0', 'main']).trim()
+    git(fx, ['checkout', '-q', '-b', 'feature/b.idr', firstSha])
+    git(fx, ['commit', '-q', '--allow-empty', '-m', 'wip b.idr on branch'])
+    git(fx, ['checkout', '-q', 'main'])
 
     const r = runAudit(fx)
     // The TICKET pass stays clean (legitimate closure marker), so the id is
@@ -1465,10 +1507,10 @@ describe('audit-finished-tickets.sh — stranded branches', () => {
     const fx = makeFixture({
       tickets: [{ id: 'b.wrk', hive: 'Plans', status: 'worker' }],
     })
-    const firstSha = git(fx.repo, ['rev-list', '--max-parents=0', 'main']).trim()
-    git(fx.repo, ['checkout', '-q', '-b', 'b.wrk', firstSha])
-    git(fx.repo, ['commit', '-q', '--allow-empty', '-m', 'ongoing work'])
-    git(fx.repo, ['checkout', '-q', 'main'])
+    const firstSha = git(fx, ['rev-list', '--max-parents=0', 'main']).trim()
+    git(fx, ['checkout', '-q', '-b', 'b.wrk', firstSha])
+    git(fx, ['commit', '-q', '--allow-empty', '-m', 'ongoing work'])
+    git(fx, ['checkout', '-q', 'main'])
 
     const r = runAudit(fx)
     // The branch names a known but non-finished ticket → left alone entirely.
@@ -1535,9 +1577,9 @@ describe('audit-finished-tickets.sh — read-only invariant', () => {
       join(fx.proj, 'Ideas', 'Plans', 'b.ro2', 'b.ro2.md'),
     ]
     const before = {
-      status: git(fx.repo, ['status', '--porcelain']),
-      head: git(fx.repo, ['rev-parse', 'HEAD']),
-      refs: git(fx.repo, ['for-each-ref', '--format=%(refname) %(objectname)']),
+      status: git(fx, ['status', '--porcelain']),
+      head: git(fx, ['rev-parse', 'HEAD']),
+      refs: git(fx, ['for-each-ref', '--format=%(refname) %(objectname)']),
       files: hiveFiles.map((f) => readFileSync(f, 'utf8')),
     }
 
@@ -1545,9 +1587,9 @@ describe('audit-finished-tickets.sh — read-only invariant', () => {
     expect(r.status).not.toBe(0) // it did do its job (flagged stranded work)
 
     const after = {
-      status: git(fx.repo, ['status', '--porcelain']),
-      head: git(fx.repo, ['rev-parse', 'HEAD']),
-      refs: git(fx.repo, ['for-each-ref', '--format=%(refname) %(objectname)']),
+      status: git(fx, ['status', '--porcelain']),
+      head: git(fx, ['rev-parse', 'HEAD']),
+      refs: git(fx, ['for-each-ref', '--format=%(refname) %(objectname)']),
       files: hiveFiles.map((f) => readFileSync(f, 'utf8')),
     }
 
