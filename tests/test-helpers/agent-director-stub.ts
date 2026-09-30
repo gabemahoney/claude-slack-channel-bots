@@ -33,6 +33,34 @@
  * real persona launch path (`spawnForPersona`) to a fresh stub client with
  * the dialog and tmux seams faked and a temp spawn home.
  *
+ * Phase 1 errors and results (b.jg5 SRJ-1303):
+ *   - Every error builder uses the 0.10.0 client's own class, except:
+ *       - `errGeneric`, which builds the base `AgentDirectorError` for any
+ *         `errName`;
+ *       - `errAmbiguousRequest` and `errPermissionRequestNotFound`, which
+ *         build the base `AgentDirectorError` with the error's `errName`
+ *         although 0.10.0 exports a class for each, because the code under
+ *         test recognises both by `errName`;
+ *       - the three for the errors only the Phase 1 client declares
+ *         (`errTmuxUnresponsive*`, `errTmuxKillFailed`,
+ *         `errTmuxSessionConflict`).
+ *     Under the interim rule (b.jg5 SRJ-101) no file names a Phase-1-only
+ *     export in a named import or re-export, since a missing named export
+ *     fails every module that loads it; those three builders build the
+ *     client's base `AgentDirectorError` whose `name` and `errName` are the
+ *     error's name, taken from the string constants in
+ *     `src/agent-director-errors.ts`. Once the Phase 1 client is adopted
+ *     (b.jg5 E37) they switch to its classes.
+ *   - `ErrInternal` and `ErrConfigMalformed` have no class in any client and
+ *     arrive as `ErrUnknownErrorName`; `errInternal`, `errUnusableName`,
+ *     `errConfigMalformed` and `errUnknownErrorName` build that class the
+ *     way the client does, with the name in `unknownName` and the binary's
+ *     `{ err_name, err_description }` envelope in `envelope`.
+ *   - The description words CSCB matches come from
+ *     `src/ad-description-phrases.ts`; the Phase 1 result fields
+ *     (`kill_sent`, `launch_started_at`, `liveness_note`, `pre_trust`) are
+ *     typed by `src/ad-phase1-types.ts`, never imported from `agent-director`.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -44,6 +72,7 @@ import {
   ErrBunVersionTooOld,
   ErrCallTimeout,
   ErrInstanceIdCollision,
+  ErrInvalidFlags,
   ErrJsonlMissing,
   ErrJsonlNeverWritten,
   ErrNoOpenPermissionRequest,
@@ -53,18 +82,24 @@ import {
   ErrRelayModeOff,
   ErrSpawnNotFound,
   ErrSpawnNotInteractive,
+  ErrSpawnNotPausable,
   ErrSpawnNotResumable,
+  ErrSystemInstallDisappeared,
   ErrSystemInstallNotFound,
   ErrSystemInstallTooOld,
   ErrSystemInstallUnreachable,
+  ErrTmuxCaptureFailed,
+  ErrTmuxNotAvailable,
   ErrTmuxSendKeys,
   ErrTmuxSessionCreate,
   ErrTemplateExists,
   ErrTemplateMalformed,
   ErrTemplateNameUnsafe,
+  ErrUnknownErrorName,
 } from 'agent-director'
 import type { UnreachableReason } from 'agent-director'
 import type {
+  ClientOptions,
   DecideParams,
   DecideResult,
   DeleteParams,
@@ -72,12 +107,8 @@ import type {
   FindMissingParams,
   FindMissingResult,
   GetParams,
-  GetResult,
   KillParams,
-  KillResult,
   ListParams,
-  ListResult,
-  ListRow,
   MakeTemplateParams,
   MakeTemplateResult,
   PauseParams,
@@ -85,13 +116,11 @@ import type {
   ReadPaneParams,
   ReadPaneResult,
   ResumeParams,
-  ResumeResult,
   SendKeysParams,
   SendKeysResult,
   SpawnParams,
   SpawnResult,
   StatusParams,
-  StatusResult,
   VersionParams,
   VersionResult,
 } from 'agent-director'
@@ -122,6 +151,40 @@ import {
   personaConfigDirLabelValue,
 } from '../../src/session-manager.ts'
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
+import {
+  ERR_TMUX_KILL_FAILED_NAME,
+  ERR_TMUX_SESSION_CONFLICT_NAME,
+  ERR_TMUX_UNRESPONSIVE_NAME,
+  type Phase1OnlyErrName,
+} from '../../src/agent-director-errors.ts'
+import {
+  CONFLICT_CONFLICTING_LABELS_PHRASE,
+  CONFLICT_DIFFERENT_ID_PHRASE,
+  CONFLICT_LEFTOVER_PHRASE,
+  CONFLICT_NEVER_REPORTED_IN_PHRASE,
+  CONFLICT_NO_PANE_PHRASE,
+  CONFLICT_NO_VALID_ID_PHRASE,
+  CONFLICT_NOT_THIS_LAUNCH_PHRASE,
+  CONFLICT_OWN_ID_PHRASE,
+  CONFLICT_PANE_NOT_FOUND_PHRASE,
+  DIFFERENT_TMUX_SERVER_PHRASE,
+  LAUNCH_TIMEOUT_PHRASE,
+  PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE,
+  STILL_STARTING_PHRASE,
+  STILL_STOPPING_PHRASE,
+  UNUSABLE_RECORDED_NAME_PHRASE,
+} from '../../src/ad-description-phrases.ts'
+import type {
+  LivenessNote,
+  Phase1GetResult,
+  Phase1KillResult,
+  Phase1ListResult,
+  Phase1ListRow,
+  Phase1ResumeResult,
+  Phase1SpawnResult,
+  Phase1StatusResult,
+  PreTrust,
+} from '../../src/ad-phase1-types.ts'
 import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
 import { makePersona } from './persona-config.ts'
 
@@ -145,15 +208,127 @@ export function cannedMakeTemplate(path: string): MakeTemplateResult {
  * four fields are read by the CSCB findMissing-before-resume log line. The
  * default is the empty/zero result (count 0, empty id arrays); tests that need
  * missing rows pass overrides.
+ *
+ * The placement form, `cannedFindMissing({ rows: { <id>: <placement> } })`,
+ * puts each given row id where a sweep would report it: `'ids'` (the row was
+ * marked `missing`), `'unverified_ids'` (its liveness could not be
+ * established) or `'neither'` (the sweep did not judge it, e.g. the row is
+ * inside the host's grace period, or it was found alive). Both id lists are
+ * sorted, as agent-director gives them, and `count` / `unverified` equal
+ * their lengths.
  */
-export function cannedFindMissing(overrides: Partial<FindMissingResult> = {}): FindMissingResult {
+export function cannedFindMissing(placement: FindMissingPlacement): FindMissingResult
+export function cannedFindMissing(overrides?: Partial<FindMissingResult>): FindMissingResult
+export function cannedFindMissing(
+  arg: Partial<FindMissingResult> | FindMissingPlacement = {},
+): FindMissingResult {
+  if ('rows' in arg) {
+    const entries = Object.entries(arg.rows)
+    const ids = entries.filter(([, where]) => where === 'ids').map(([id]) => id).sort()
+    const unverifiedIds = entries.filter(([, where]) => where === 'unverified_ids').map(([id]) => id).sort()
+    return { count: ids.length, ids, unverified: unverifiedIds.length, unverified_ids: unverifiedIds }
+  }
   return {
     count: 0,
     ids: [],
     unverified: 0,
     unverified_ids: [],
-    ...overrides,
+    ...arg,
   }
+}
+
+/** Where a `find-missing` sweep reports a row: marked missing, unverified, or not judged. */
+export type FindMissingRowPlacement = 'ids' | 'unverified_ids' | 'neither'
+
+/** The placement form of `cannedFindMissing`: each row id and where the sweep reports it. */
+export interface FindMissingPlacement {
+  rows: Readonly<Record<string, FindMissingRowPlacement>>
+}
+
+/**
+ * Build a canned `kill` result. `killSent` is the Phase 1 `kill_sent` field
+ * (whether agent-director sent a kill); omit it for a result from a binary
+ * older than Phase 1, which has no such field (the key is then absent).
+ */
+export function cannedKillResult(killSent?: boolean): Phase1KillResult {
+  return killSent === undefined ? {} : { kill_sent: killSent }
+}
+
+/**
+ * Sample launch starts (`launch_started_at`, ADSRD SR-22.2: RFC 3339 UTC with
+ * millisecond precision, the fraction shown only when it is not zero): one
+ * with fractional seconds and one without. For a row with no launch start,
+ * pass `SAMPLE_LAUNCH_START_NONE` (`undefined`): the canned builders then omit
+ * the key.
+ */
+export const SAMPLE_LAUNCH_START_FRACTIONAL = '2026-05-24T12:00:00.123Z'
+export const SAMPLE_LAUNCH_START_WHOLE = '2026-05-24T12:00:00Z'
+export const SAMPLE_LAUNCH_START_NONE = undefined
+
+/** The three sample launch starts by form, for `test.each`. */
+export const SAMPLE_LAUNCH_STARTS: Readonly<Record<'fractional' | 'whole' | 'none', string | undefined>> = {
+  fractional: SAMPLE_LAUNCH_START_FRACTIONAL,
+  whole: SAMPLE_LAUNCH_START_WHOLE,
+  none: SAMPLE_LAUNCH_START_NONE,
+}
+
+/**
+ * The `liveness_note` that latches a persona with the CONFLICT case
+ * "conflicting labels" (b.jg5 SRJ-507). Set it on a `get` or `list` row with
+ * `cannedGetResult({ ..., liveness_note: provenanceNote })` or
+ * `cannedListRow(...)`.
+ */
+export const provenanceNote: LivenessNote = 'provenance_conflict'
+
+/** The `liveness_note` values CSCB knows that must never latch a persona. */
+export const nonLatchingNotes: readonly LivenessNote[] = [
+  'tmux_server_changed',
+  'process_not_seen_session_present',
+  'tmux_session_name_rewritten',
+]
+
+/**
+ * The Phase 1 row fields `cannedGetResult` and `cannedListRow` take as
+ * overrides; given as `undefined`, the key is left out of the row.
+ */
+const PHASE1_ROW_FIELDS = ['launch_started_at', 'liveness_note'] as const
+
+/** Drop the listed keys whose value is `undefined`, so "none" means absent. */
+function omitUndefined<T extends object>(row: T, keys: readonly string[]): T {
+  const rec = row as Record<string, unknown>
+  for (const key of keys) {
+    if (key in rec && rec[key] === undefined) delete rec[key]
+  }
+  return row
+}
+
+/**
+ * Build a canned `status` result (default `{ state: 'waiting' }`). A Phase 1
+ * `status` result carries only `state` and `launch_started_at`, so
+ * `launch_started_at` is its one Phase 1 override; `liveness_note` belongs on
+ * `cannedGetResult` and `cannedListRow`. A `launch_started_at` of `undefined`
+ * omits the key.
+ */
+export function cannedStatusResult(overrides: Partial<Phase1StatusResult> = {}): Phase1StatusResult {
+  return omitUndefined({ state: 'waiting', ...overrides }, ['launch_started_at'])
+}
+
+/**
+ * Build a canned spawn result (plain or reuse). `preTrust` is the Phase 1
+ * `pre_trust` field (`ok`, `skipped`, `failed`); omit it for a result from a
+ * binary older than Phase 1 (the key is then absent).
+ */
+export function cannedSpawnResult(claudeInstanceId: string = 'cscb_test', preTrust?: PreTrust): Phase1SpawnResult {
+  return preTrust === undefined
+    ? { claude_instance_id: claudeInstanceId }
+    : { claude_instance_id: claudeInstanceId, pre_trust: preTrust }
+}
+
+/** Build a canned `resume` result, with `pre_trust` as `cannedSpawnResult` takes it. */
+export function cannedResumeResult(claudeInstanceId: string = 'cscb_test', preTrust?: PreTrust): Phase1ResumeResult {
+  return preTrust === undefined
+    ? { claude_instance_id: claudeInstanceId }
+    : { claude_instance_id: claudeInstanceId, pre_trust: preTrust }
 }
 
 /** Build an ErrBunVersionTooOld (Client-constructor failure mode). */
@@ -209,6 +384,34 @@ export function errSpawnNotFound(): ErrSpawnNotFound {
 /** Build an ErrSpawnNotInteractive (readPane/sendKeys while spawn is still pending). */
 export function errSpawnNotInteractive(verb: string = 'read-pane'): ErrSpawnNotInteractive {
   return new ErrSpawnNotInteractive(verb, 'ErrSpawnNotInteractive', 'spawn not interactive — not in pending/waiting state')
+}
+
+/**
+ * Build an ErrSpawnNotInteractive for a session that is a leftover's: the
+ * session holding the row's name carries an earlier launch's label, so
+ * nothing was sent (default verb `send-keys`).
+ */
+export function errSpawnNotInteractiveLeftover(
+  sessionName: string = STUB_TMUX_SESSION_NAME,
+  verb: string = 'send-keys',
+): ErrSpawnNotInteractive {
+  return new ErrSpawnNotInteractive(
+    verb,
+    'ErrSpawnNotInteractive',
+    `tmux session ${JSON.stringify(sessionName)} is a leftover of an earlier launch of this row (its label carries an earlier launch's token); nothing was sent`,
+  )
+}
+
+/**
+ * Build an ErrSpawnNotInteractive for a `pending` row with no launch start,
+ * which is always refused (default verb `send-keys`).
+ */
+export function errSpawnNotInteractiveNoLaunchStart(verb: string = 'send-keys'): ErrSpawnNotInteractive {
+  return new ErrSpawnNotInteractive(
+    verb,
+    'ErrSpawnNotInteractive',
+    'the pending row has no launch start; nothing was sent',
+  )
 }
 
 /** Build an ErrInstanceIdCollision (spawn / SR-1.4 collision path). */
@@ -276,22 +479,20 @@ export function errAlreadyDecided(): ErrAlreadyDecided {
 }
 
 /**
- * Build an ErrInvalidFlags (decide; missing required flag like
- * `--request-token`). The published `agent-director` library does not yet
- * export a typed subclass for this errName — the paired AD release ships it.
- * Until then, return a base `AgentDirectorError` carrying the right
- * `errName` so the click handler's `err.errName === 'ErrInvalidFlags'` match
- * fires correctly.
+ * Build an ErrInvalidFlags, the client's own class (default verb `decide`: a
+ * missing required flag such as `--request-token`; pass `spawn` or `resume`
+ * for the launch verbs' refusal). Its `errName` is `ErrInvalidFlags`, so a
+ * match on `err.errName` fires as well as `instanceof`.
  */
-export function errInvalidFlags(): AgentDirectorError {
-  return new AgentDirectorError('decide', 'ErrInvalidFlags', 'invalid flags')
+export function errInvalidFlags(verb: string = 'decide'): ErrInvalidFlags {
+  return new ErrInvalidFlags(verb, 'ErrInvalidFlags', 'invalid flags')
 }
 
 /**
  * Build an ErrAmbiguousRequest (decide; defense-in-depth backstop, should be
- * unreachable under contract). Same shape as `errInvalidFlags`: not yet a
- * typed subclass in the published library, so we use the base class with the
- * canonical `errName`.
+ * unreachable under contract). Built as a base `AgentDirectorError` with the
+ * canonical `errName`, not the 0.10.0 client's `ErrAmbiguousRequest` class;
+ * callers match on `errName`.
  */
 export function errAmbiguousRequest(): AgentDirectorError {
   return new AgentDirectorError('decide', 'ErrAmbiguousRequest', 'ambiguous request')
@@ -300,10 +501,12 @@ export function errAmbiguousRequest(): AgentDirectorError {
 /**
  * Build the AD `ErrPermissionRequestNotFound` sentinel returned by the
  * paired-release `get-permission` verb when the row has aged out of AD's
- * store. The published library does not yet export a typed subclass; the
- * poller's `isErrPermissionRequestNotFound` predicate matches on
- * `errName === 'ErrPermissionRequestNotFound'`, so a base `AgentDirectorError`
- * with the right `errName` routes the same way as the real sentinel.
+ * store. The 0.10.0 client exports an `ErrPermissionRequestNotFound` class,
+ * but this builder keeps the base `AgentDirectorError`: the poller's
+ * `isErrPermissionRequestNotFound` predicate matches on
+ * `errName === 'ErrPermissionRequestNotFound'`, so a base error with that
+ * `errName` routes the same way as the client's class; the builder stays
+ * unchanged so its callers behave as before.
  */
 export function errPermissionRequestNotFound(): AgentDirectorError {
   return new AgentDirectorError('get-permission', 'ErrPermissionRequestNotFound', 'permission request not found')
@@ -336,6 +539,335 @@ export function errRelayFallenBack(): ErrRelayFallenBack {
 /** Build an ErrPauseTimeout (pause budget exceeded). */
 export function errPauseTimeout(): ErrPauseTimeout {
   return new ErrPauseTimeout('pause', 'ErrPauseTimeout', 'pause timed out')
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 error builders (b.jg5 SRJ-1303)
+// ---------------------------------------------------------------------------
+
+/** The tmux session name the Phase 1 error builders name by default: the default persona fixture's. */
+export const STUB_TMUX_SESSION_NAME = personaTmuxSessionName('test_bot')
+
+/** The instance id the Phase 1 error builders name by default: the default persona fixture's. */
+export const STUB_INSTANCE_ID = personaInstanceId('test_bot')
+
+/** The default socket path of `errTmuxNotAvailable` / `errTmuxNotAvailableDifferentServer`. */
+export const STUB_TMUX_SOCKET_PATH = '/tmp/tmux-1000/default'
+
+/** The config file path `errConfigMalformed`'s description names. */
+const STUB_AD_CONFIG_PATH = '/home/agent/.agent-director/config.toml'
+
+/**
+ * A Phase-1-only error by name (interim rule, b.jg5 SRJ-101): the 0.10.0
+ * client's base `AgentDirectorError` whose `errName` and `name` are `name`,
+ * so it classifies by name exactly as the Phase 1 class would. Switches to
+ * the Phase 1 client's classes once that client is adopted (b.jg5 E37).
+ */
+function phase1OnlyError(name: Phase1OnlyErrName, verb: string, description: string): AgentDirectorError {
+  const err = new AgentDirectorError(verb, name, description)
+  err.name = name
+  return err
+}
+
+/**
+ * Build an `ErrTmuxUnresponsive` (by name): a tmux call that did not answer
+ * (default verb `resume`; `status` only reads the store and never returns
+ * it). The default description is a call timeout that did nothing; pass
+ * `description` for another. See `errTmuxUnresponsiveLaunchTimeout`,
+ * `errTmuxUnresponsiveStillStopping` and `errTmuxUnresponsiveStillStarting`
+ * for the variants CSCB tells apart.
+ */
+export function errTmuxUnresponsive(
+  verb: string = 'resume',
+  description: string = 'tmux display-message did not answer within 5 s; nothing was done; retry later',
+): AgentDirectorError {
+  return phase1OnlyError(ERR_TMUX_UNRESPONSIVE_NAME, verb, description)
+}
+
+/**
+ * Build an `ErrTmuxUnresponsive` (by name) that ends a launch call as a launch
+ * timeout: its description carries "the session may have been created"
+ * (default verb `spawn`; pass `resume` for a resume).
+ */
+export function errTmuxUnresponsiveLaunchTimeout(
+  verb: string = 'spawn',
+  instanceId: string = STUB_INSTANCE_ID,
+): AgentDirectorError {
+  return phase1OnlyError(
+    ERR_TMUX_UNRESPONSIVE_NAME,
+    verb,
+    `${verb} of ${instanceId}: tmux new-session did not answer within 5 s; ${LAUNCH_TIMEOUT_PHRASE} and the row stays pending; do not retry until get shows the row ended or missing`,
+  )
+}
+
+/**
+ * Build an `ErrTmuxUnresponsive` (by name) for a row that "appears to still be
+ * stopping": it ended less than the stopping window (90 s) ago and its own
+ * session still runs. The description names the quoted session name, as
+ * agent-director's does (default verb `resume`; reuse and
+ * `kill --include-finished` also return it).
+ */
+export function errTmuxUnresponsiveStillStopping(
+  verb: string = 'resume',
+  sessionName: string = STUB_TMUX_SESSION_NAME,
+): AgentDirectorError {
+  return phase1OnlyError(
+    ERR_TMUX_UNRESPONSIVE_NAME,
+    verb,
+    `the agent in tmux session ${JSON.stringify(sessionName)} ${STILL_STOPPING_PHRASE}: its row ended less than the stopping window (90 s) ago; nothing was done; retry later`,
+  )
+}
+
+/**
+ * Build an `ErrTmuxUnresponsive` (by name) for a row that "appears to still be
+ * starting": its own session is younger than the starting-session bound
+ * (300 s). The description names the quoted session name, as
+ * agent-director's does (default verb `resume`; reuse also returns it).
+ */
+export function errTmuxUnresponsiveStillStarting(
+  verb: string = 'resume',
+  sessionName: string = STUB_TMUX_SESSION_NAME,
+): AgentDirectorError {
+  return phase1OnlyError(
+    ERR_TMUX_UNRESPONSIVE_NAME,
+    verb,
+    `the agent in tmux session ${JSON.stringify(sessionName)} ${STILL_STARTING_PHRASE}: the session is younger than the starting-session bound (300 s); nothing was done; retry later`,
+  )
+}
+
+/**
+ * The three `ErrTmuxKillFailed` descriptions:
+ *   - `'outlived-exit-wait'`: a kill was sent and the agent process outlived
+ *     the kill exit wait;
+ *   - `'unverifiable-session-present'`: a kill was sent, the process cannot be
+ *     checked and the labelled session is still there;
+ *   - `'no-session-no-kill'`: no session or pane of this launch was found
+ *     while the process runs, and no kill was sent.
+ */
+export type KillFailedDescription = 'outlived-exit-wait' | 'unverifiable-session-present' | 'no-session-no-kill'
+
+/** Every `KillFailedDescription`, for `test.each`. */
+export const KILL_FAILED_DESCRIPTIONS: readonly KillFailedDescription[] = [
+  'outlived-exit-wait',
+  'unverifiable-session-present',
+  'no-session-no-kill',
+]
+
+/**
+ * Build an `ErrTmuxKillFailed` (by name; verb `kill`) with one of its three
+ * descriptions, each carrying the quoted session name.
+ */
+export function errTmuxKillFailed(
+  sessionName: string = STUB_TMUX_SESSION_NAME,
+  description: KillFailedDescription = 'outlived-exit-wait',
+): AgentDirectorError {
+  const quoted = JSON.stringify(sessionName)
+  const text: Record<KillFailedDescription, string> = {
+    'outlived-exit-wait':
+      `a kill was sent to tmux session ${quoted} and the agent process outlived the kill exit wait (5 s); the row stays live and nothing was marked or deleted`,
+    'unverifiable-session-present':
+      `a kill was sent to tmux session ${quoted}; the agent process cannot be checked and the labelled session is still there; the row stays live`,
+    'no-session-no-kill':
+      `no session or pane of this launch was found (tmux session ${quoted}) while the agent process runs; no kill was sent`,
+  }
+  return phase1OnlyError(ERR_TMUX_KILL_FAILED_NAME, 'kill', text[description])
+}
+
+/**
+ * The `ErrTmuxSessionConflict` cases the stub builds (ADSRD SR-1.4), each
+ * named for its case words; `unrecognised` carries none of them.
+ */
+export type ConflictCase =
+  | 'no-valid-id'
+  | 'different-id'
+  | 'own-id'
+  | 'leftover'
+  | 'plain-spawn-leftover'
+  | 'not-this-launch'
+  | 'pane-not-found'
+  | 'no-pane'
+  | 'conflicting-labels'
+  | 'never-reported-in'
+  | 'unrecognised'
+
+/** Every `ConflictCase`, for `test.each`. */
+export const CONFLICT_CASES: readonly ConflictCase[] = [
+  'no-valid-id',
+  'different-id',
+  'own-id',
+  'leftover',
+  'plain-spawn-leftover',
+  'not-this-launch',
+  'pane-not-found',
+  'no-pane',
+  'conflicting-labels',
+  'never-reported-in',
+  'unrecognised',
+]
+
+/**
+ * Build an `ErrTmuxSessionConflict` (by name) for `conflictCase`. Each
+ * description carries the quoted session name and the case words of ADSRD
+ * SR-1.4 (from `src/ad-description-phrases.ts`), with that table's extras:
+ *   - `not-this-launch` from `kill`: also "this row's own id" and "no kill
+ *     was sent"; from any other verb, only "not this launch's session";
+ *   - `pane-not-found`: also "this row's own id";
+ *   - `no-pane`: "no pane 0.0" with "the agent's pane was not found" and
+ *     "this row's own id";
+ *   - `plain-spawn-leftover`: "left over from an earlier life" with "its label
+ *     names this instance id";
+ *   - `unrecognised`: none of the case words.
+ * No description names a command that ends a session; the `not-this-launch`
+ * kill variant's "no kill was sent" is the one mention of a kill.
+ */
+export function errTmuxSessionConflict(
+  verb: string,
+  conflictCase: ConflictCase,
+  sessionName: string = STUB_TMUX_SESSION_NAME,
+): AgentDirectorError {
+  const session = `tmux session ${JSON.stringify(sessionName)}`
+  const humanMustLook = 'a human must look (see "Operator actions" in the agent-director README)'
+  const text: Record<ConflictCase, string> = {
+    'no-valid-id': `${session} holds the row's session name but carries ${CONFLICT_NO_VALID_ID_PHRASE}; ${humanMustLook}`,
+    'different-id': `${session} holds the row's session name but carries ${CONFLICT_DIFFERENT_ID_PHRASE}; ${humanMustLook}`,
+    'own-id': `${session} carries ${CONFLICT_OWN_ID_PHRASE} but cannot be confirmed as the row's session; ${humanMustLook}`,
+    'leftover': `${session} is ${CONFLICT_LEFTOVER_PHRASE} of this row; ${humanMustLook}`,
+    'plain-spawn-leftover':
+      `${session} is ${CONFLICT_LEFTOVER_PHRASE}: ${PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE}; nothing was written and no row was created; ${humanMustLook}`,
+    'not-this-launch': verb === 'kill'
+      ? `${session} carries ${CONFLICT_OWN_ID_PHRASE} but is ${CONFLICT_NOT_THIS_LAUNCH_PHRASE}; no kill was sent; ${humanMustLook}`
+      : `${session} is ${CONFLICT_NOT_THIS_LAUNCH_PHRASE}; nothing was sent; ${humanMustLook}`,
+    'pane-not-found': `${session} carries ${CONFLICT_OWN_ID_PHRASE}, but ${CONFLICT_PANE_NOT_FOUND_PHRASE}; ${humanMustLook}`,
+    'no-pane':
+      `${session} carries ${CONFLICT_OWN_ID_PHRASE} but has ${CONFLICT_NO_PANE_PHRASE}: ${CONFLICT_PANE_NOT_FOUND_PHRASE}; ${humanMustLook}`,
+    'conflicting-labels': `more than one session carries this launch's label (${session} among them): ${CONFLICT_CONFLICTING_LABELS_PHRASE}; ${humanMustLook}`,
+    'never-reported-in': `the agent in ${session} ${CONFLICT_NEVER_REPORTED_IN_PHRASE}; ${humanMustLook}`,
+    'unrecognised': `${session} could not be matched to the row; ${humanMustLook}`,
+  }
+  return phase1OnlyError(ERR_TMUX_SESSION_CONFLICT_NAME, verb, text[conflictCase])
+}
+
+/**
+ * Build an ErrTmuxNotAvailable (the client's class). With `socketPath`, the
+ * description names that socket as not accessible to this user; without it,
+ * tmux could not be run.
+ */
+export function errTmuxNotAvailable(socketPath?: string, verb: string = 'spawn'): ErrTmuxNotAvailable {
+  const description = socketPath === undefined
+    ? 'tmux binary not available'
+    : `tmux socket ${socketPath} is not accessible to this user`
+  return new ErrTmuxNotAvailable(verb, 'ErrTmuxNotAvailable', description)
+}
+
+/**
+ * Build an ErrTmuxNotAvailable (the client's class) whose description carries
+ * "not the tmux server the agent was launched on": the server on the row's
+ * recorded socket is another one (default verb `resume`; the other
+ * single-row verbs that call tmux, such as `read-pane`, also return it;
+ * `status` only reads the store and never does).
+ */
+export function errTmuxNotAvailableDifferentServer(
+  socketPath: string = STUB_TMUX_SOCKET_PATH,
+  verb: string = 'resume',
+): ErrTmuxNotAvailable {
+  return new ErrTmuxNotAvailable(
+    verb,
+    'ErrTmuxNotAvailable',
+    `the tmux server on socket ${socketPath} is ${DIFFERENT_TMUX_SERVER_PHRASE}; nothing was done`,
+  )
+}
+
+/** Build an ErrTmuxCaptureFailed (the client's class; `read-pane`: the tmux session is gone). */
+export function errTmuxCaptureFailed(
+  sessionName: string = STUB_TMUX_SESSION_NAME,
+  verb: string = 'read-pane',
+): ErrTmuxCaptureFailed {
+  return new ErrTmuxCaptureFailed(
+    verb,
+    'ErrTmuxCaptureFailed',
+    `tmux: capture-pane failed: can't find session: ${sessionName}`,
+  )
+}
+
+/** Build an ErrSpawnNotPausable (the client's class; `pause` of a row that cannot be paused, e.g. `pending`). */
+export function errSpawnNotPausable(verb: string = 'pause'): ErrSpawnNotPausable {
+  return new ErrSpawnNotPausable(verb, 'ErrSpawnNotPausable', 'spawn not pausable in its current state')
+}
+
+/** Build an ErrSystemInstallDisappeared (the client's class; the binary is gone since construction). */
+export function errSystemInstallDisappeared(
+  verb: string = 'status',
+  binaryPath: string = STUB_RESOLVE_DEFAULT_PATH,
+): ErrSystemInstallDisappeared {
+  return new ErrSystemInstallDisappeared(verb, binaryPath)
+}
+
+/**
+ * Build an `ErrUnknownErrorName` the way the client does for an `err_name` it
+ * has no class for: `unknownName` is the name and `envelope` is the binary's
+ * `{ err_name, err_description }`. The client's own `verb` and
+ * `errDescription` stay as it sets them (`''` and its "unknown err_name"
+ * text); the binary's description is only in `envelope.err_description`.
+ */
+export function errUnknownErrorName(
+  unknownName: string = 'ErrFromALaterBinary',
+  description: string = 'an error this client does not know',
+): ErrUnknownErrorName {
+  return new ErrUnknownErrorName(unknownName, { err_name: unknownName, err_description: description })
+}
+
+/**
+ * Build an `ErrInternal`, which has no class in any client: an
+ * `ErrUnknownErrorName` whose `unknownName` is `ErrInternal` and whose
+ * envelope carries `description`.
+ */
+export function errInternal(description: string = 'the store could not be read'): ErrUnknownErrorName {
+  return errUnknownErrorName('ErrInternal', description)
+}
+
+/**
+ * The three recorded-name faults of ADSRD SR-1.4 (an empty name, a control
+ * character, a character tmux stores differently).
+ */
+export type UnusableNameFault = 'empty' | 'control-character' | 'stored-differently'
+
+/** Every `UnusableNameFault`, for `test.each`. */
+export const UNUSABLE_NAME_FAULTS: readonly UnusableNameFault[] = ['empty', 'control-character', 'stored-differently']
+
+/**
+ * Build the unusable-recorded-name `ErrInternal` (an `ErrUnknownErrorName`
+ * whose `unknownName` is `ErrInternal`) for `fault`; each description
+ * carries "the recorded tmux session name".
+ */
+export function errUnusableName(fault: UnusableNameFault = 'empty'): ErrUnknownErrorName {
+  const text: Record<UnusableNameFault, string> = {
+    'empty': `${UNUSABLE_RECORDED_NAME_PHRASE} is empty`,
+    'control-character': `${UNUSABLE_RECORDED_NAME_PHRASE} contains a control character`,
+    'stored-differently': `${UNUSABLE_RECORDED_NAME_PHRASE} contains a character tmux stores differently`,
+  }
+  return errInternal(`${text[fault]}; nothing was done`)
+}
+
+/**
+ * Build an `ErrConfigMalformed`, which has no class in any client: an
+ * `ErrUnknownErrorName` whose `unknownName` is `ErrConfigMalformed` and whose
+ * envelope description names a `[tmux]` key, its value and its safe minimum
+ * in agent-director's form: `config <path>: refused [tmux] values: [tmux]
+ * <key> = <value>, below its safe minimum <minimum> <unit>. A missing key, or
+ * 0, gives the default.` The default is `starting_session_seconds` = 30 below
+ * its safe minimum 60 s; `unit` is agent-director's symbol, `s` (seconds) or
+ * `ms` (milliseconds).
+ */
+export function errConfigMalformed(
+  key: string = 'starting_session_seconds',
+  value: string = '30',
+  minimum: string = '60',
+  unit: string = 's',
+): ErrUnknownErrorName {
+  return errUnknownErrorName(
+    'ErrConfigMalformed',
+    `config ${STUB_AD_CONFIG_PATH}: refused [tmux] values: [tmux] ${key} = ${value}, below its safe minimum ${minimum} ${unit}. A missing key, or 0, gives the default.`,
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -428,13 +960,18 @@ function defaultRowFields(claudeInstanceId: string): {
  * against. Explicit overrides always win, so a negative case can replace
  * `cwd` or `labels` (e.g. drop `persona` or `config_dir`, or carry only an
  * old `channel` label).
+ *
+ * The Phase 1 fields are overrides too: `launch_started_at` (see
+ * `SAMPLE_LAUNCH_STARTS`) and `liveness_note` (`provenanceNote`,
+ * `nonLatchingNotes`). Neither is set by default, and either given as
+ * `undefined` is left out of the row.
  */
-export function cannedListRow(overrides: Partial<ListRow> & { claude_instance_id: string }): ListRow
-export function cannedListRow(overrides: Partial<ListRow>, persona: CannedRowPersona, home: string): ListRow
-export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPersona, home?: string): ListRow {
+export function cannedListRow(overrides: Partial<Phase1ListRow> & { claude_instance_id: string }): Phase1ListRow
+export function cannedListRow(overrides: Partial<Phase1ListRow>, persona: CannedRowPersona, home: string): Phase1ListRow
+export function cannedListRow(overrides: Partial<Phase1ListRow>, persona?: CannedRowPersona, home?: string): Phase1ListRow {
   if (persona) {
     if (home === undefined) throw new Error('cannedListRow: the persona form needs a home')
-    return {
+    return omitUndefined({
       parent_id: undefined,
       state: 'waiting',
       relay_mode: 'on',
@@ -443,9 +980,9 @@ export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPe
       ended_at: null,
       ...personaRowDefaults(persona, home),
       ...overrides,
-    }
+    }, PHASE1_ROW_FIELDS)
   }
-  return {
+  return omitUndefined({
     parent_id: undefined,
     state: 'waiting',
     relay_mode: 'on',
@@ -454,7 +991,7 @@ export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPe
     last_seen_at: '2026-05-24T12:00:00Z',
     ended_at: null,
     ...overrides,
-  } as ListRow
+  } as Phase1ListRow, PHASE1_ROW_FIELDS)
 }
 
 /**
@@ -484,13 +1021,13 @@ export function cannedPermissionRequest(
  * cast inside the poller.
  */
 export type GetResultOverrides =
-  & Partial<GetResult>
+  & Partial<Phase1GetResult>
   & { claude_instance_id: string }
   & { permission_requests?: PermissionRequestRow[] | null }
 
 /** `GetResultOverrides` for the persona form, where `claude_instance_id` defaults to `cscb_<key>`. */
 export type PersonaGetResultOverrides =
-  & Partial<GetResult>
+  & Partial<Phase1GetResult>
   & { permission_requests?: PermissionRequestRow[] | null }
 
 /**
@@ -500,7 +1037,7 @@ export type PersonaGetResultOverrides =
  * `GetResultWithPermissionRequests` at the use site, so the extra field
  * flows through without polluting the upstream type.
  */
-export type CannedGetResult = GetResult & { permission_requests?: PermissionRequestRow[] | null }
+export type CannedGetResult = Phase1GetResult & { permission_requests?: PermissionRequestRow[] | null }
 
 /**
  * Build a canned `GetResult`. Pass `permission_requests` for check_permission
@@ -517,6 +1054,10 @@ export type CannedGetResult = GetResult & { permission_requests?: PermissionRequ
  * `config_dir=<personaConfigDirLabelValue>`; `home` (required) is the home
  * directory the `config_dir` label is computed against. Explicit overrides
  * always win. The stub client's default `get` row uses the no-persona form.
+ *
+ * The Phase 1 fields `launch_started_at` and `liveness_note` are overrides
+ * as on `cannedListRow`: unset by default, and left out when given as
+ * `undefined`.
  */
 export function cannedGetResult(overrides: GetResultOverrides): CannedGetResult
 export function cannedGetResult(
@@ -531,7 +1072,7 @@ export function cannedGetResult(
 ): CannedGetResult {
   if (persona) {
     if (home === undefined) throw new Error('cannedGetResult: the persona form needs a home')
-    return {
+    return omitUndefined({
       parent_id: '',
       state: 'waiting',
       claude_args: [],
@@ -543,9 +1084,9 @@ export function cannedGetResult(
       ended_at: null,
       ...personaRowDefaults(persona, home),
       ...overrides,
-    }
+    }, PHASE1_ROW_FIELDS)
   }
-  return {
+  return omitUndefined({
     parent_id: '',
     state: 'waiting',
     claude_args: [],
@@ -557,7 +1098,7 @@ export function cannedGetResult(
     last_seen_at: '2026-05-24T12:00:00Z',
     ended_at: null,
     ...overrides,
-  } as CannedGetResult
+  } as CannedGetResult, PHASE1_ROW_FIELDS)
 }
 
 /**
@@ -653,8 +1194,15 @@ export const cannedErr = <T>(error: Error): CannedResponse<T> => ({ kind: 'rejec
  *   - `<verb>Result` / `<verb>Error`: single canned response, returned for
  *     every call.
  *   - `<verb>Queue`: an array of `CannedResponse<>` — the stub shifts the
- *     next response off the front on each call. Empty queue throws a marker
- *     error. Mutually exclusive with the `<verb>Result`/`<verb>Error`.
+ *     next response off the front on each call, so N entries answer the
+ *     next N calls in order. While the queue holds an entry it wins; once it
+ *     is empty (dry) the verb falls through to `<verb>Error`, then
+ *     `<verb>Result`, then the verb's default response.
+ *
+ * Verbs with a queue: `spawn`, `status`, `get`, `sendKeys`, `readPane`,
+ * `kill`, `decide`, `resume`, `findMissing`, `list`, `getPermission`.
+ * `statusFn` and `getFn` compute a response per call and take precedence
+ * over every other knob of their verb.
  *
  * Plus capture arrays — `<verb>Calls` — for assertion against call shape.
  */
@@ -677,16 +1225,17 @@ export interface StubClientOptions {
   makeTemplateError?: Error
   makeTemplateCalls?: MakeTemplateParams[]
 
-  // spawn()
-  spawnResult?: SpawnResult
+  // spawn() — a result may carry the Phase 1 `pre_trust` (`cannedSpawnResult`).
+  spawnResult?: Phase1SpawnResult
   spawnError?: Error
-  spawnQueue?: CannedResponse<SpawnResult>[]
+  spawnQueue?: CannedResponse<Phase1SpawnResult>[]
   spawnCalls?: SpawnParams[]
 
-  // status()
-  statusResult?: StatusResult
+  // status() — a result may carry the Phase 1 `launch_started_at`
+  // (`cannedStatusResult`).
+  statusResult?: Phase1StatusResult
   statusError?: Error
-  statusQueue?: CannedResponse<StatusResult>[]
+  statusQueue?: CannedResponse<Phase1StatusResult>[]
   statusCalls?: StatusParams[]
   /**
    * Dynamic status seam (b.m4r). When supplied, takes precedence over
@@ -695,13 +1244,21 @@ export interface StubClientOptions {
    * whether an earlier verb (e.g. the up-front `findMissing` reconcile sweep)
    * has run. Returning an `Error` rejects; returning a `StatusResult` resolves.
    */
-  statusFn?: (params: StatusParams) => StatusResult | Error
+  statusFn?: (params: StatusParams) => Phase1StatusResult | Error
 
-  // get()
-  getResult?: GetResult
+  // get() — a row may carry the Phase 1 `launch_started_at` and
+  // `liveness_note` (`cannedGetResult`).
+  getResult?: Phase1GetResult
   getError?: Error
-  getQueue?: CannedResponse<GetResult>[]
+  getQueue?: CannedResponse<Phase1GetResult>[]
   getCalls?: GetParams[]
+  /**
+   * Computed `get` row, like `statusFn`: when supplied, takes precedence over
+   * `getQueue`/`getError`/`getResult` and computes the row from the current
+   * call params. Returning an `Error` rejects; returning a row resolves.
+   * The call is still recorded in `getCalls`.
+   */
+  getFn?: (params: GetParams) => Phase1GetResult | Error
 
   // sendKeys()
   sendKeysResult?: SendKeysResult
@@ -709,15 +1266,26 @@ export interface StubClientOptions {
   sendKeysQueue?: CannedResponse<SendKeysResult>[]
   sendKeysCalls?: SendKeysParams[]
 
-  // readPane() — FIFO sequence of canned panes; last entry sticks once
-  // consumed. Mutually exclusive with `readPaneError`.
+  // readPane() — `readPaneResults` is a FIFO sequence of canned panes whose
+  // last entry sticks once consumed; `readPaneError` rejects every call and
+  // wins over `readPaneResults`.
   readPaneResults?: ReadPaneResult[]
   readPaneError?: Error
   readPaneCalls?: ReadPaneParams[]
+  /**
+   * Panes or errors in order, one per call (`cannedOk({ pane })` /
+   * `cannedErr(err)`). While it holds an entry it wins over `readPaneError`
+   * and `readPaneResults`. Once dry, the call falls through to
+   * `readPaneError`, then `readPaneResults`, then the empty pane
+   * (`{ pane: '' }`); unlike `readPaneResults`, its last entry does not stick.
+   */
+  readPaneQueue?: CannedResponse<ReadPaneResult>[]
 
-  // kill()
-  killResult?: KillResult
+  // kill() — a result may carry the Phase 1 `kill_sent` (`cannedKillResult`).
+  // Default: `{}` (no `kill_sent`, as from a binary older than Phase 1).
+  killResult?: Phase1KillResult
   killError?: Error
+  killQueue?: CannedResponse<Phase1KillResult>[]
   killCalls?: KillParams[]
 
   // decide()
@@ -726,10 +1294,10 @@ export interface StubClientOptions {
   decideQueue?: CannedResponse<DecideResult>[]
   decideCalls?: DecideParams[]
 
-  // resume()
-  resumeResult?: ResumeResult
+  // resume() — a result may carry the Phase 1 `pre_trust` (`cannedResumeResult`).
+  resumeResult?: Phase1ResumeResult
   resumeError?: Error
-  resumeQueue?: CannedResponse<ResumeResult>[]
+  resumeQueue?: CannedResponse<Phase1ResumeResult>[]
   resumeCalls?: ResumeParams[]
 
   // findMissing() — b.4dk: dead-session recovery runs one findMissing before
@@ -737,6 +1305,7 @@ export interface StubClientOptions {
   // the 0.8.0 zero-transition shape.
   findMissingResult?: FindMissingResult
   findMissingError?: Error
+  findMissingQueue?: CannedResponse<FindMissingResult>[]
   findMissingCalls?: FindMissingParams[]
 
   // delete()
@@ -744,10 +1313,10 @@ export interface StubClientOptions {
   deleteError?: Error
   deleteCalls?: DeleteParams[]
 
-  // list()
-  listResult?: ListResult
+  // list() — rows may carry the Phase 1 fields (`cannedListRow`).
+  listResult?: Phase1ListResult
   listError?: Error
-  listQueue?: CannedResponse<ListResult>[]
+  listQueue?: CannedResponse<Phase1ListResult>[]
   listCalls?: ListParams[]
 
   // pause()
@@ -780,17 +1349,17 @@ export type StubClient = {
   readonly binaryVersion: string
   version(params: VersionParams): Promise<VersionResult>
   makeTemplate(params: MakeTemplateParams): Promise<MakeTemplateResult>
-  spawn(params: SpawnParams): Promise<SpawnResult>
-  status(params: StatusParams): Promise<StatusResult>
-  get(params: GetParams): Promise<GetResult>
+  spawn(params: SpawnParams): Promise<Phase1SpawnResult>
+  status(params: StatusParams): Promise<Phase1StatusResult>
+  get(params: GetParams): Promise<Phase1GetResult>
   sendKeys(params: SendKeysParams): Promise<SendKeysResult>
   readPane(params: ReadPaneParams): Promise<ReadPaneResult>
-  kill(params: KillParams): Promise<KillResult>
+  kill(params: KillParams): Promise<Phase1KillResult>
   decide(params: DecideParams): Promise<DecideResult>
-  resume(params: ResumeParams): Promise<ResumeResult>
+  resume(params: ResumeParams): Promise<Phase1ResumeResult>
   findMissing(params: FindMissingParams): Promise<FindMissingResult>
   delete(params: DeleteParams): Promise<DeleteResult>
-  list(params: ListParams): Promise<ListResult>
+  list(params: ListParams): Promise<Phase1ListResult>
   pause(params: PauseParams): Promise<PauseResult>
   /**
    * Paired-AD-release `get-permission` verb (SR-7.1). Optional on the
@@ -842,13 +1411,13 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
         opts.makeTemplateResult ?? cannedMakeTemplate(`~/.agent-director/templates/${params.name}.toml`)
       )
     },
-    async spawn(params: SpawnParams): Promise<SpawnResult> {
+    async spawn(params: SpawnParams): Promise<Phase1SpawnResult> {
       opts.spawnCalls?.push(params)
       return nextResponse('spawn', opts.spawnQueue, opts.spawnResult, opts.spawnError, {
         claude_instance_id: params.claude_instance_id ?? 'cscb_test',
       })
     },
-    async status(params: StatusParams): Promise<StatusResult> {
+    async status(params: StatusParams): Promise<Phase1StatusResult> {
       opts.callLog?.push('status')
       opts.statusCalls?.push(params)
       if (opts.statusFn) {
@@ -858,8 +1427,13 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       }
       return nextResponse('status', opts.statusQueue, opts.statusResult, opts.statusError, { state: 'waiting' })
     },
-    async get(params: GetParams): Promise<GetResult> {
+    async get(params: GetParams): Promise<Phase1GetResult> {
       opts.getCalls?.push(params)
+      if (opts.getFn) {
+        const r = opts.getFn(params)
+        if (r instanceof Error) throw r
+        return r
+      }
       return nextResponse('get', opts.getQueue, opts.getResult, opts.getError, cannedGetResult({
         claude_instance_id: params.claude_instance_id,
       }))
@@ -870,6 +1444,11 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     },
     async readPane(params: ReadPaneParams): Promise<ReadPaneResult> {
       opts.readPaneCalls?.push(params)
+      const queued = opts.readPaneQueue?.shift()
+      if (queued) {
+        if (queued.kind === 'reject') throw queued.error
+        return queued.value
+      }
       if (opts.readPaneError) throw opts.readPaneError
       const seq = opts.readPaneResults
       if (seq && seq.length > 0) {
@@ -878,16 +1457,15 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       }
       return { pane: '' }
     },
-    async kill(params: KillParams): Promise<KillResult> {
+    async kill(params: KillParams): Promise<Phase1KillResult> {
       opts.killCalls?.push(params)
-      if (opts.killError) throw opts.killError
-      return opts.killResult ?? {}
+      return nextResponse('kill', opts.killQueue, opts.killResult, opts.killError, {})
     },
     async decide(params: DecideParams): Promise<DecideResult> {
       opts.decideCalls?.push(params)
       return nextResponse('decide', opts.decideQueue, opts.decideResult, opts.decideError, {})
     },
-    async resume(params: ResumeParams): Promise<ResumeResult> {
+    async resume(params: ResumeParams): Promise<Phase1ResumeResult> {
       opts.callLog?.push('resume')
       opts.resumeCalls?.push(params)
       return nextResponse('resume', opts.resumeQueue, opts.resumeResult, opts.resumeError, {
@@ -897,15 +1475,20 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     async findMissing(params: FindMissingParams): Promise<FindMissingResult> {
       opts.callLog?.push('findMissing')
       opts.findMissingCalls?.push(params)
-      if (opts.findMissingError) throw opts.findMissingError
-      return opts.findMissingResult ?? cannedFindMissing()
+      return nextResponse(
+        'find-missing',
+        opts.findMissingQueue,
+        opts.findMissingResult,
+        opts.findMissingError,
+        cannedFindMissing(),
+      )
     },
     async delete(params: DeleteParams): Promise<DeleteResult> {
       opts.deleteCalls?.push(params)
       if (opts.deleteError) throw opts.deleteError
       return opts.deleteResult ?? { results: Object.fromEntries(params.claude_instance_id.map((id) => [id, 'ok'])) }
     },
-    async list(params: ListParams): Promise<ListResult> {
+    async list(params: ListParams): Promise<Phase1ListResult> {
       opts.listCalls?.push(params)
       return nextResponse('list', opts.listQueue, opts.listResult, opts.listError, { spawns: [] })
     },
@@ -1098,19 +1681,25 @@ export interface StubCreateClientOptions {
   error?: Error
   /** Resolve with this pre-built stub Client. If omitted, a default stub is created. */
   client?: StubClient
-  /** Capture each createClient call's opts argument here. */
-  calls?: object[]
+  /**
+   * Capture the options each client is built with, one entry per call, in
+   * call order (the error path included), typed as the client's
+   * `ClientOptions` so a test reads e.g. `calls[0].callTimeoutMs` (b.jg5
+   * SRJ-213); a field the caller did not pass is absent.
+   */
+  calls?: ClientOptions[]
 }
 
 /**
  * Build a stub `Client.create`-shaped factory function. Returns a function
- * of shape `(opts: object) => Promise<StubClient>` that either resolves
- * with the supplied stub or rejects with the supplied error. Drives the
- * startup gate's catch ladder (Task 5 / a9) for the three new typed errors.
+ * of shape `(opts: object) => Promise<StubClient>` that records `opts` in
+ * `calls`, then either resolves with the supplied stub or rejects with the
+ * supplied error. Drives the startup gate's catch ladder (Task 5 / a9) for
+ * the three new typed errors.
  */
 export function makeStubCreateClient(opts: StubCreateClientOptions = {}): (clientOpts: object) => Promise<StubClient> {
   return async (clientOpts: object): Promise<StubClient> => {
-    opts.calls?.push(clientOpts)
+    opts.calls?.push(clientOpts as ClientOptions)
     if (opts.error) throw opts.error
     return opts.client ?? makeStubClient()
   }
