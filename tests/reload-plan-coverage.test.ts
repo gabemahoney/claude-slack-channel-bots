@@ -30,6 +30,8 @@ import { join } from 'node:path'
 
 import {
   CHANNEL_ENTRY_KEYS,
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   parsePersonaConfigBytes,
   PERSONA_DM_KEYS,
   PERSONA_ENTRY_KEYS,
@@ -171,6 +173,8 @@ describe('every top-level key the loader accepts is compared', () => {
     claude_config_dir: join(root, 'claude-default'),
     resume_enabled: false,
     agent_director_poll_interval_ms: 2000,
+    // In range: the default plus the lower bound stays well under the upper.
+    agent_director_call_timeout_ms: DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS + MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
     stop_hook_bootstrap: false,
     cron_table_path: join(root, 'other-crontab'),
     cron_log_path: join(root, 'other-cron.log'),

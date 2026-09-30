@@ -802,11 +802,31 @@ function modifiedLine(
  */
 const CLI_RECORD_SETTINGS: ReadonlySet<string> = new Set<string>(['stop_timeout', 'exit_timeout'])
 
+/**
+ * The server-wide settings both the CLI and the running server use
+ * (b.jg5 SRJ-213): the CLI takes a change from the last-applied record as
+ * soon as an apply rewrites it, as it takes `exit_timeout`, and the running
+ * server uses it from its next start.
+ */
+const CLI_RECORD_AND_SERVER_START_SETTINGS: ReadonlySet<string> = new Set<string>([
+  'agent_director_call_timeout_ms',
+])
+
+/**
+ * A changed server-wide setting's preview line, worded by who uses the
+ * setting: only the CLI (`CLI_RECORD_SETTINGS`), both the CLI and the running
+ * server (`CLI_RECORD_AND_SERVER_START_SETTINGS`), or only the server (every
+ * other setting: from the next server start or, for an inherited default, at
+ * each inheriting persona's next launch). Pure.
+ */
 function settingLine(s: ServerSettingChange): string {
   const prefix = `server-wide setting ${s.name} changed:`
   const recorded = 'once applied, it is recorded'
   if (CLI_RECORD_SETTINGS.has(s.name)) {
     return `${prefix} ${recorded}, and the CLI takes it from the record from then on (the running server does not use it).`
+  }
+  if (CLI_RECORD_AND_SERVER_START_SETTINGS.has(s.name)) {
+    return `${prefix} ${recorded}, the CLI takes it from the record from then on, and the running server uses it from its next start.`
   }
   if (s.inheritedBy === undefined) return `${prefix} ${recorded} and takes effect at the next server start after that.`
   if (s.inheritedBy.length === 0) return `${prefix} ${recorded}; no persona inherits it, so no instance is affected.`

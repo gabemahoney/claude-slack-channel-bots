@@ -88,6 +88,7 @@ import { makePersonaConfig } from './test-helpers/persona-config.ts'
 import { configInEffect } from '../src/reload.ts'
 import {
   DEFAULT_REPLY_CHUNK_LIMIT,
+  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   DEFAULT_REPLY_CHUNK_MODE,
   replySettingsOf,
   type PersonaConfig,
@@ -691,6 +692,7 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
         resume_enabled: false,
         stop_hook_bootstrap: false,
         agent_director_poll_interval_ms: 12_345,
+        agent_director_call_timeout_ms: MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
         ack_reaction: 'eyes',
         reply_chunk_limit: 1000,
         reply_chunk_mode: 'length',

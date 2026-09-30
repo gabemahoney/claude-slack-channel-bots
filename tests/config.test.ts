@@ -17,6 +17,10 @@ import { tmpdir } from 'os'
 import { join, relative, resolve } from 'path'
 import { homedir } from 'os'
 import {
+  agentDirectorCallTimeoutMsOf,
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   expandTilde,
   loadPersonaConfig,
   prePersonaConversionMessage,
@@ -258,8 +262,9 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     test('the default input resolves to the makePersonaConfig shape', () => {
       const config = load(makePersonaConfigInput({}, dir))
       expect(config).toEqual(makePersonaConfig({ mcp_config_path: join(home, '.claude', 'slack-mcp.json') }, dir))
-      // A fixed value: makePersonaConfig takes the default from the same constant.
+      // Fixed values: makePersonaConfig takes each default from the same constant.
       expect(config.agent_director_poll_interval_ms).toBe(1000)
+      expect(config.agent_director_call_timeout_ms).toBe(60000)
     })
 
     test('a mentions channel loads', () => {
@@ -380,6 +385,14 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['persona entry bot_token', persona({ bot_token: fakeToken(BOT_TOKEN_PREFIX, 'entry') }), 'bot_token', WHERE.entry, true],
       ['persona entry app_token', persona({ app_token: fakeToken(APP_TOKEN_PREFIX, 'entry') }), 'app_token', WHERE.entry, true],
       ['persona entry route-era cwd (SR-10.2)', persona({ cwd: '/tmp/somewhere' }), 'cwd', WHERE.entry, true],
+      // Server-wide only (b.jg5 SRJ-213): a persona entry cannot set it.
+      [
+        'persona entry server-wide agent_director_call_timeout_ms',
+        persona({ agent_director_call_timeout_ms: DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS }),
+        'agent_director_call_timeout_ms',
+        WHERE.entry,
+        true,
+      ],
       ['dm object', inDm({ relay: true }), 'relay', WHERE.dm, true],
       ['dm object bot_token', inDm({ bot_token: fakeToken(BOT_TOKEN_PREFIX, 'dm') }), 'bot_token', WHERE.dm, true],
       ['dm object app_token', inDm({ app_token: fakeToken(APP_TOKEN_PREFIX, 'dm') }), 'app_token', WHERE.dm, true],
@@ -1242,6 +1255,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         claude_config_dir: '~/cfg',
         resume_enabled: false,
         agent_director_poll_interval_ms: 250,
+        agent_director_call_timeout_ms: MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS + 1,
         stop_hook_bootstrap: false,
         cron_table_path: '~/cron/crontab',
         cron_log_path: '~/cron/cron.log',
@@ -1270,6 +1284,8 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['stop_timeout', 0],
       ['agent_director_poll_interval_ms', 200],
       ['agent_director_poll_interval_ms', 3_600_000],
+      ['agent_director_call_timeout_ms', MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS],
+      ['agent_director_call_timeout_ms', MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS],
       ['cozempic_prescription', 'gentle'],
       ['cozempic_prescription', 'standard'],
       ['system_prompt_mode', 'append'],
@@ -1308,6 +1324,30 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['agent_director_poll_interval_ms', '1000', 'agent_director_poll_interval_ms'],
     ])('%s = %p is rejected, naming %s', (key, value, named) => {
       expect(loadError({ ...makePersonaConfigInput({}, dir), [key]: value })).toContain(named)
+    })
+
+    // b.jg5 SRJ-213: the error names the setting and both bounds of its range,
+    // and never the rejected value (loadError fails if PLACEHOLDER reaches it).
+    test.each([
+      ['below the minimum', MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS - 1],
+      ['above the maximum', MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS + 1],
+      ['zero', 0],
+      ['negative', -MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS],
+      ['a non-integer number', MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS + 0.5],
+      ['a numeric string', String(MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS)],
+      ['a non-numeric string', PLACEHOLDER],
+    ])('agent_director_call_timeout_ms %s (%p) is rejected, naming the setting and its range', (_label, value) => {
+      expect(loadError({ ...makePersonaConfigInput({}, dir), agent_director_call_timeout_ms: value })).toContain(
+        'Persona config validation error: agent_director_call_timeout_ms must be a positive integer in ' +
+          `[${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS}].`,
+      )
+    })
+
+    test('agentDirectorCallTimeoutMsOf returns a configuration\'s value, and the default with no configuration', () => {
+      const config = makePersonaConfig({ agent_director_call_timeout_ms: MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS })
+      expect(agentDirectorCallTimeoutMsOf(config)).toBe(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS)
+      expect(agentDirectorCallTimeoutMsOf(null)).toBe(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS)
+      expect(agentDirectorCallTimeoutMsOf(undefined)).toBe(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS)
     })
   })
 

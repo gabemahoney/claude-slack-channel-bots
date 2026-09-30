@@ -21,6 +21,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS,
   DEFAULT_REPLY_CHUNK_LIMIT,
   DEFAULT_REPLY_CHUNK_MODE,
@@ -111,6 +112,7 @@ export function makePersonaConfig(overrides: Partial<PersonaConfig> = {}, baseDi
     resume_enabled: true,
     stop_hook_bootstrap: true,
     agent_director_poll_interval_ms: DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS,
+    agent_director_call_timeout_ms: DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
     cron_table_path: join(baseDir, 'crontab'),
     cron_log_path: join(baseDir, 'cron.log'),
     reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT,

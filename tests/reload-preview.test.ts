@@ -35,6 +35,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   parsePersonaConfigBytes,
   PERSONA_TOP_LEVEL_KEYS,
   type PersonaConfig,
@@ -1180,6 +1182,14 @@ describe('server-wide settings', () => {
   const cliRecordLine = (name: string) =>
     `server-wide setting ${name} changed: once applied, it is recorded, and the CLI takes it from the record ` +
     'from then on (the running server does not use it).'
+  /**
+   * The line of a setting both the CLI (from the last-applied record) and the
+   * running server (from its next start) read (`agent_director_call_timeout_ms`,
+   * b.jg5 SRJ-213).
+   */
+  const cliRecordAndNextStartLine = (name: string) =>
+    `server-wide setting ${name} changed: once applied, it is recorded, the CLI takes it from the record ` +
+    'from then on, and the running server uses it from its next start.'
 
   // Rows: a setting only the CLI reads (stop and clean_restart take it from the record), and a changed value.
   test.each<[string, number]>([
@@ -1194,8 +1204,26 @@ describe('server-wide settings', () => {
     expect(lines).toEqual([header({ settings: 1 }), cliRecordLine(name)])
   })
 
-  // Rows: every server-wide setting the running server reads and no persona
-  // inherits (all but the CLI's two above and the inheritable
+  // The one setting both the CLI and the running server read: the CLI from the
+  // record from then on, the running server from its next start.
+  const CALL_TIMEOUT = 'agent_director_call_timeout_ms'
+
+  test('a changed agent_director_call_timeout_ms is recorded, the CLI takes it from the record from then on and the running server uses it from its next start; it changes no persona', () => {
+    const { plan, lines } = preview(edited((c) => (c[CALL_TIMEOUT] = MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS)))
+
+    expect(plan).toEqual(
+      planWith({ settings: [{ name: CALL_TIMEOUT }], unchanged: [ref('alpha', 0), ref('bravo', 1), ref('charlie', 2)] }),
+    )
+    expect(changePlanCounts(plan)).toEqual(counts({ settings: 1 }))
+    expect(lines).toEqual([header({ settings: 1 }), cliRecordAndNextStartLine(CALL_TIMEOUT)])
+    // Neither of the other two server-wide wordings: not the CLI-only line
+    // (which says the running server does not use it), not the plain next-start line.
+    expect(lines[1]).not.toBe(cliRecordLine(CALL_TIMEOUT))
+    expect(lines[1]).not.toBe(nextStartLine(CALL_TIMEOUT))
+  })
+
+  // Rows: every server-wide setting only the running server reads and no persona
+  // inherits (all but the CLI's two above, the call timeout and the inheritable
   // claude_config_dir and stop_hook_bootstrap, pinned with their inheritors),
   // and a changed value (made when the test runs: paths are under its root).
   const NEXT_START_ROWS: Array<[string, () => unknown]> = [
@@ -1218,8 +1246,15 @@ describe('server-wide settings', () => {
     ['reply_chunk_mode', () => 'length'],
   ]
 
-  test('the next-start rows, the CLI\'s two and the two inheritable defaults are every server-wide setting (a new one needs its wording decided here)', () => {
-    const covered = [...NEXT_START_ROWS.map(([name]) => name), 'stop_timeout', 'exit_timeout', 'claude_config_dir', 'stop_hook_bootstrap']
+  test('the next-start rows, the CLI\'s two, the call timeout and the two inheritable defaults are every server-wide setting (a new one needs its wording decided here)', () => {
+    const covered = [
+      ...NEXT_START_ROWS.map(([name]) => name),
+      'stop_timeout',
+      'exit_timeout',
+      CALL_TIMEOUT,
+      'claude_config_dir',
+      'stop_hook_bootstrap',
+    ]
     expect(covered.sort()).toEqual(PERSONA_TOP_LEVEL_KEYS.filter((k) => k !== 'personas').sort())
   })
 
@@ -1240,9 +1275,15 @@ describe('server-wide settings', () => {
       (c) => {
         c.stop_timeout = 45
         c.reply_chunk_limit = 2000
+        c[CALL_TIMEOUT] = MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS
         c.bind = '0.0.0.0'
       },
-      [nextStartLine('bind'), cliRecordLine('stop_timeout'), nextStartLine('reply_chunk_limit')],
+      [
+        nextStartLine('bind'),
+        cliRecordLine('stop_timeout'),
+        cliRecordAndNextStartLine(CALL_TIMEOUT),
+        nextStartLine('reply_chunk_limit'),
+      ],
     ],
   ])('%s is a changed setting', (_label, mutate, expected) => {
     const { plan, lines } = preview(edited(mutate))

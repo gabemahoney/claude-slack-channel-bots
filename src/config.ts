@@ -65,6 +65,18 @@ export const MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS = 200
 export const MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS = 3_600_000
 
 /**
+ * Default agent-director call timeout (b.jg5 SRJ-213), milliseconds: the
+ * `callTimeoutMs` of every agent-director client CSCB builds for persona calls.
+ */
+export const DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 60_000
+
+/** Inclusive lower bound on agent_director_call_timeout_ms (b.jg5 SRJ-213). */
+export const MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 1000
+
+/** Inclusive upper bound on agent_director_call_timeout_ms (b.jg5 SRJ-213). */
+export const MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 3_600_000
+
+/**
  * The top-level keys of the pre-persona shape that the loader rejects with
  * the conversion message before any other check (b.av2 SR-1.7), in the order
  * they are looked for.
@@ -90,6 +102,7 @@ const SHARED_TOP_LEVEL_KEYS = [
   'claude_config_dir',
   'resume_enabled',
   'agent_director_poll_interval_ms',
+  'agent_director_call_timeout_ms',
   'stop_hook_bootstrap',
   'cron_table_path',
   'cron_log_path',
@@ -239,6 +252,14 @@ export interface ServerSettingsInput {
    */
   agent_director_poll_interval_ms?: number
   /**
+   * Timeout (ms) of each agent-director call CSCB makes for a persona
+   * (b.jg5 SRJ-213): the `callTimeoutMs` of the server's and the CLI's
+   * persona clients. Must be a positive integer in the closed range
+   * [1000, 3_600_000]; defaults to 60000. Server-wide only: a persona entry
+   * cannot set it.
+   */
+  agent_director_call_timeout_ms?: number
+  /**
    * Path to the cscb_cron crontable file (b.he5 PD-5). Optional: when omitted,
    * defaults to `<config dir>/crontab`, where `<config dir>` is the directory
    * of the config file actually loaded. `~` is expanded and the path resolved
@@ -287,6 +308,8 @@ export interface ServerSettings {
   stop_hook_bootstrap: boolean
   /** Poll interval (ms) for the SR-2.1 permission-relay tick. */
   agent_director_poll_interval_ms: number
+  /** Timeout (ms) of each agent-director persona call (b.jg5 SRJ-213). */
+  agent_director_call_timeout_ms: number
   /**
    * Absolute path to the cscb_cron crontable file (b.he5 PD-5). Always present:
    * defaults to `<config dir>/crontab` when omitted from input.
@@ -426,6 +449,15 @@ export function replySettingsOf(config: PersonaConfig | null | undefined): Reply
   }
 }
 
+/**
+ * The agent-director call timeout of `config` (b.jg5 SRJ-213), in
+ * milliseconds. With no configuration (one that could not be read, or before
+ * the server's start resolves): the default. Pure; does not mutate the input.
+ */
+export function agentDirectorCallTimeoutMsOf(config: ServerSettings | null | undefined): number {
+  return config?.agent_director_call_timeout_ms ?? DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS
+}
+
 // ---------------------------------------------------------------------------
 // Pure functions
 // ---------------------------------------------------------------------------
@@ -453,6 +485,8 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string): Ser
     stop_hook_bootstrap: input.stop_hook_bootstrap ?? true,
     agent_director_poll_interval_ms:
       input.agent_director_poll_interval_ms ?? DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS,
+    agent_director_call_timeout_ms:
+      input.agent_director_call_timeout_ms ?? DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
     cron_table_path: input.cron_table_path ?? resolve(configDir, 'crontab'),
     cron_log_path: input.cron_log_path ?? resolve(configDir, 'cron.log'),
     cron_log_max_bytes: input.cron_log_max_bytes,
@@ -749,7 +783,7 @@ function checkBoolean(value: unknown, key: string, style: RuleStyle): void {
   }
 }
 
-function isPositiveInteger(value: unknown): boolean {
+function isPositiveInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 1
 }
 
@@ -772,23 +806,33 @@ function validateServerTimingsAndModes(config: ServerSettings, style: RuleStyle)
   checkAllowedValue(config.system_prompt_mode, 'system_prompt_mode', ALLOWED_SYSTEM_PROMPT_MODES, style)
 }
 
+/** A positive integer in the closed range [`min`, `max`]; the message names the range, never the value. */
+function checkPositiveIntegerInRange(value: unknown, key: string, min: number, max: number, style: RuleStyle): void {
+  if (isPositiveInteger(value) && value >= min && value <= max) return
+  throw ruleError(style, `${key} must be a positive integer in [${min}, ${max}].`)
+}
+
 /**
  * The server-wide rules that come last: the SR-4.1 poll interval range
- * [200, 3_600_000] and the b.he5 PD-5 cron settings (absent
- * `cron_log_max_bytes` disables pruning).
+ * [200, 3_600_000], the b.jg5 SRJ-213 call timeout range [1000, 3_600_000]
+ * and the b.he5 PD-5 cron settings (absent `cron_log_max_bytes` disables
+ * pruning).
  */
 function validateServerPollAndCron(config: ServerSettings, style: RuleStyle): void {
-  const pollMs = config.agent_director_poll_interval_ms
-  if (
-    !isPositiveInteger(pollMs) ||
-    pollMs < MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS ||
-    pollMs > MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS
-  ) {
-    throw ruleError(
-      style,
-      `agent_director_poll_interval_ms must be a positive integer in [${MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS}, ${MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS}].`,
-    )
-  }
+  checkPositiveIntegerInRange(
+    config.agent_director_poll_interval_ms,
+    'agent_director_poll_interval_ms',
+    MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS,
+    MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS,
+    style,
+  )
+  checkPositiveIntegerInRange(
+    config.agent_director_call_timeout_ms,
+    'agent_director_call_timeout_ms',
+    MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+    MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+    style,
+  )
   checkNonEmptyString(config.cron_table_path, 'cron_table_path', style)
   checkNonEmptyString(config.cron_log_path, 'cron_log_path', style)
   checkOptionalPositiveInteger(config.cron_log_max_bytes, 'cron_log_max_bytes', style)
