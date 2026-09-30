@@ -15,7 +15,9 @@
  * A fired timer's work runs through the per-persona lifecycle serializer
  * (b.av2 SR-6.6, `RestartDeps.serialize`), so it never overlaps a teardown or
  * a bring-up retry's launch for the same persona, and its checks see the
- * state when the work starts.
+ * state when the work starts. The restart timer's work does not ask the
+ * restart cap: a timer fired for a persona already at the cap re-attempts the
+ * launch (a success resets the cap; a further failure is counted).
  * The work runs as a recovery attempt for the persona (b.jg5 SRJ-301,
  * `runInAttempt`), adapters included: an UNAVAILABLE outcome from any of its
  * agent-director calls (the liveness read, the reconnect with its reads, the
@@ -32,7 +34,10 @@
  * included, the pending timer) and no restart timer touched. Its first step,
  * inside its own serialized work, is the caller's in-flight check: while a
  * launch is in flight for the persona it answers `RESTART_OUTCOME_IN_FLIGHT`
- * with no agent-director call.
+ * with no agent-director call. Its second is the restart cap: a retry queued
+ * behind other restart work for the persona, whose counted failure reached
+ * the cap while the retry waited, answers `RESTART_OUTCOME_CAPPED` with no
+ * agent-director call, nothing counted and no notice.
  * Isolated from server.ts side effects — injectable deps make it testable.
  *
  * SPDX-License-Identifier: MIT
@@ -100,7 +105,12 @@ export const RESTART_OUTCOME_LAUNCHED = 'launched'
 export const RESTART_OUTCOME_REFUSED = 'refused'
 /** The launch failed and the failure was counted, below the cap. */
 export const RESTART_OUTCOME_COUNTED_FAILURE = 'counted-failure'
-/** The launch failed, the failure was counted, and the persona is at the restart cap. */
+/**
+ * The persona is at the restart cap: the launch failed and its counted
+ * failure reached or passed the cap; or (retry entry only) the persona was
+ * already at the cap when the retry's serialized work started, so no
+ * agent-director call was made and nothing was counted or notified.
+ */
 export const RESTART_OUTCOME_CAPPED = 'capped'
 /** The launch was declined by its own gate (the persona stopped being up, or the server is stopping). Not counted. */
 export const RESTART_OUTCOME_LAUNCH_SKIPPED = 'launch-skipped'
@@ -353,11 +363,18 @@ async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise
  * timer's (`RestartDeps.serialize`), so it never overlaps a teardown, a
  * bring-up retry's launch or a restart for the persona. Inside that work,
  * first, `isInFlight(key)`: true answers `RESTART_OUTCOME_IN_FLIGHT` with no
- * agent-director call (a check that throws counts as true). Otherwise the
- * restart work runs, as one recovery attempt, with today's accounting, and
- * its outcome is answered. It bypasses only the restart delay and the restart
- * timer: `getRestartDelay` is never read (it runs with delay 0 too) and no
- * restart timer is armed, cleared or needed. Before `initRestart` it answers
+ * agent-director call (a check that throws counts as true). Then the restart
+ * cap: at the cap (an earlier restart work's counted failure reached it while
+ * this retry waited its turn, although the retry timer checked the cap before
+ * calling) it answers `RESTART_OUTCOME_CAPPED` with no agent-director call,
+ * nothing counted and no notice (the cap notice went out with the failure
+ * that reached the cap). Asking it here is enough: failures are counted only
+ * inside the restart work, which the serializer runs one at a time per
+ * persona, so the cap cannot be reached while this retry's own work runs.
+ * Otherwise the restart work runs, as one recovery attempt, with today's
+ * accounting, and its outcome is answered. It bypasses only the restart delay
+ * and the restart timer: `getRestartDelay` is never read (it runs with delay
+ * 0 too) and no restart timer is armed, cleared or needed. Before `initRestart` it answers
  * `RESTART_OUTCOME_NOT_INITIALISED` and logs. Rejects only when the
  * serializer or an unguarded dependency (`isShuttingDown`, `canRestart`,
  * `isSessionConnected`, `hasSessionStream`, `onCapReached`) throws.
@@ -379,6 +396,10 @@ export async function runRestartRetry(
         console.error(`[slack] Restart retry skipped for persona=${key} — a launch is in flight; no agent-director call`)
         return RESTART_OUTCOME_IN_FLIGHT
       }
+      if (isAtCap(key, RESTART_FAILURE_CAP)) {
+        console.error(`[slack] Restart retry skipped for persona=${key} — the persona is at the restart cap; nothing killed or launched`)
+        return RESTART_OUTCOME_CAPPED
+      }
       return runRestartWork(d, key, cwd, undefined)
     })
   } finally {
@@ -399,11 +420,12 @@ function launchInFlight(key: string, isInFlight: (key: string) => boolean): bool
 /**
  * The work a restart timer does when it fires, and a retry reruns, run
  * through the serializer: the shutdown and not-up checks, the liveness probe,
- * then a reconnect, or a kill and a launch, and the success or failure
- * accounting. A reconnect whose verdict is 'escalate-dead' is followed by a
- * second liveness probe; when the row now reads dead, the same run goes on to
- * the kill and launch (b.d61). The whole work is one recovery attempt for the
- * persona (b.jg5 SRJ-301). Answers what it did (`RestartWorkOutcome`).
+ * the not-up check again, then a reconnect, or a kill and a launch, and the
+ * success or failure accounting. A reconnect whose verdict is 'escalate-dead'
+ * is followed by a second liveness probe; when the row now reads dead, the
+ * same run goes on to the kill and launch (b.d61). The restart cap is not
+ * asked here (the retry entry asks it before this work). The whole work is
+ * one recovery attempt for the persona (b.jg5 SRJ-301). Answers what it did (`RestartWorkOutcome`).
  */
 async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<RestartWorkOutcome> {
   return runInAttempt(key, 'recovery', () => restartWorkSteps(d, key, cwd, sessionId))

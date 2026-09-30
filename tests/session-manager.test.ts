@@ -3208,9 +3208,14 @@ describe('launch attempt: the refusal marker and launchSession\'s \'refused\' (b
     })
   }
 
-  /** A sink that records each arm in `armed`. */
+  /** A sink that records each arm in `armed` and answers true (the persona has a timer), as the real controller's `arm` does. */
   function installRecordingSink(): void {
-    installSink({ arm: (key, cause) => { armed.push({ key, kind: cause.kind }) } })
+    installSink({
+      arm: (key, cause) => {
+        armed.push({ key, kind: cause.kind })
+        return true
+      },
+    })
   }
 
   /** The real controller on a fake clock as the sink; its retry action records the key and is never reached here. */
@@ -10580,12 +10585,17 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
     armed = []
   })
 
-  /** Re-wire the outage state as the top-level `beforeEach` does, with a sink recording each arm in `armed`. */
+  /** Re-wire the outage state as the top-level `beforeEach` does, with a sink recording each arm in `armed` and answering true, as the real controller's `arm` does. */
   function installRecordingSink(): void {
     initOutageState({
       getClient,
       notify: (key, text) => { outageEmissions.push({ key, text }) },
-      triggerSink: { arm: (key, cause) => { armed.push({ key, kind: cause.kind }) } },
+      triggerSink: {
+        arm: (key, cause) => {
+          armed.push({ key, kind: cause.kind })
+          return true
+        },
+      },
     })
   }
 

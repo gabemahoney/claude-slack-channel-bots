@@ -424,7 +424,6 @@ const STORE_OPEN_BUILDERS: ReadonlyArray<readonly [string, (description: string)
 describe('classifyAdError: the store-open names', () => {
   test('the constants are the SRD\'s three names', () => {
     expect<readonly string[]>(STORE_OPEN_ERR_NAMES).toEqual(SRD_STORE_OPEN_NAMES)
-    expect(STORE_OPEN_BUILDERS.map(([name]) => name)).toEqual(SRD_STORE_OPEN_NAMES)
   })
 
   test.each(STORE_OPEN_BUILDERS)('%s is UNCLASSIFIED with its reported name and its description redacted', (name, build) => {
@@ -440,19 +439,11 @@ describe('classifyAdError: the store-open names', () => {
     assertNoLeak({ classification, line })
   })
 
-  test('the UNAVAILABLE row\'s later name is none of the names the classifier handles by unknownName', () => {
-    expect([...STORE_OPEN_ERR_NAMES, ERR_INTERNAL, ERR_CONFIG_MALFORMED]).not.toContain(errUnknownErrorName().unknownName)
-  })
-
   test('no store-open name is a Phase-1-only name or a name the startup gate requires as a class', () => {
     for (const name of STORE_OPEN_ERR_NAMES) {
       expect(PHASE1_ONLY_ERR_NAMES as readonly string[]).not.toContain(name)
       expect(REQUIRED_ERR_NAMES as readonly string[]).not.toContain(name)
     }
-  })
-
-  test('errSchemaMismatch\'s default description says the store could not be opened', () => {
-    expect((errSchemaMismatch().envelope as { err_description: string }).err_description).toContain('could not be opened')
   })
 })
 

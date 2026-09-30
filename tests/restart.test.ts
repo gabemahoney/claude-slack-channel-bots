@@ -3338,6 +3338,8 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
   afterEach(() => {
     console.error = origConsoleError
     retry.stopAll('test end')
+    // Checked after the cleanup below, so a failed check never skips it.
+    const pendingAfterStop = clock.pendingCount()
     cancelAllRestartTimers()
     resetAdVersionRecheckForTests()
     _resetInFlightLaunches()
@@ -3352,6 +3354,10 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     _resetTmuxSessionProber()
     _resetTmuxServerEnsurer()
     rmSync(dir, { recursive: true, force: true })
+    // Every case: no retry timer outlives the test, and no line the retry
+    // controller or console.error wrote carries a credential value.
+    expect(pendingAfterStop).toBe(0)
+    assertNoLeak({ retryLines, errLines })
   })
 
   // Each site answers UNAVAILABLE with each generic value, and the kill with
@@ -3413,7 +3419,6 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     expect(retryLines.filter((l) => l.includes(' retry 1 '))).toEqual([])
     expect(getFailureCount(p.key)).toBe(0)
     expect(errLines.filter((l) => l === FAILED_LINE(p.key))).toEqual([])
-    assertNoLeak({ retryLines, errLines })
   })
 
   test('SRJ-301: the reconnect adapter\'s status read fails with a non-UNAVAILABLE error → a read-error cause arms P\'s timer once; nothing is typed', async () => {
@@ -3582,7 +3587,9 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
 // restart timer, so every case here runs with `getRestartDelay` answering 0
 // and calls the entry directly. Its first step, inside its own serialized
 // work, is the caller's in-flight check: while a launch is in flight for P it
-// answers in-flight with no agent-director call.
+// answers in-flight with no agent-director call. Its second is the restart
+// cap: a retry whose turn starts with P at the cap answers capped with no
+// agent-director call, nothing counted and no notice (the cap re-check).
 //
 // Every wait is a microtask flush or a controllable promise; the per-key
 // active-count cases alone fire one real restart timer, the file's accepted
@@ -3593,6 +3600,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
   const P = 'persona_p'
   const CWD = '/cwd/p'
   const skipLine = `[slack] Restart retry skipped for persona=${P} — a launch is in flight; no agent-director call`
+  const capSkipLine = `[slack] Restart retry skipped for persona=${P} — the persona is at the restart cap; nothing killed or launched`
   let errLines: string[]
   let errArgs: unknown[][]
   let origConsoleError: typeof console.error
@@ -3806,7 +3814,9 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
     expect(isRestartPendingOrActive(P)).toBe(false)
   })
 
-  test('counted failures up to RESTART_FAILURE_CAP: the one that reaches it answers capped and fires onCapReached once; one past it answers capped with no second notice', async () => {
+  // The retry past the cap is skipped by the entry's cap re-check: no kill,
+  // no launch, nothing counted and no second notice.
+  test('counted failures up to RESTART_FAILURE_CAP: the one that reaches it answers capped and fires onCapReached once; a retry after it answers capped by the cap re-check, with no kill, no launch, no count and no second notice', async () => {
     for (let i = 0; i < RESTART_FAILURE_CAP - 2; i++) recordFailure(P)
     const deps = retryDeps({ launchSessionResult: false })
     initRestart(deps)
@@ -3817,10 +3827,102 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
     expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_CAPPED)
     expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
     expect(deps.onCapReachedCalls).toEqual([P])
+    expect(deps.killSessionCalls).toEqual([P, P])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P, P])
+    expect(errLines).not.toContain(capSkipLine)
 
     expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_CAPPED)
-    expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP + 1)
+    expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
     expect(deps.onCapReachedCalls).toEqual([P])
+    expect(deps.killSessionCalls).toEqual([P, P])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P, P])
+    expect(errLines.filter((l) => l === capSkipLine)).toHaveLength(1)
+  })
+
+  test('cap re-check: a retry for P already at RESTART_FAILURE_CAP answers capped after the in-flight check, with no shutdown or not-up check, no probe, reconnect, kill or launch, nothing counted, no notice, and one skip line', async () => {
+    for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(P)
+    const asked: string[] = []
+    const deps = retryDeps({ launchSessionResult: false })
+    deps.isShuttingDown = () => { asked.push('shutdown'); return false }
+    deps.canRestart = () => { asked.push('gate'); return true }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_CAPPED)
+
+    expect(inFlightAsked).toEqual([P])
+    expect(asked).toEqual([])
+    expectNoWork(deps)
+    expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+    expect(errLines).toEqual([capSkipLine])
+  })
+
+  test('cap re-check: two retries queued through serialize one failure short of the cap — the first\'s launch fails and answers capped; the second answers capped with no launch (exactly one launch, one notice)', async () => {
+    for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(P)
+    const held = heldLaunches()
+    const serializer = createPersonaSerializer()
+    const deps = retryDeps({ launchSession: held.launch })
+    deps.serialize = (key, op) => serializer.run(key, op)
+    initRestart(deps)
+
+    const first = runRestartRetry(P, CWD, notInFlight)
+    const second = runRestartRetry(P, CWD, notInFlight)
+    await flush()
+    // The first holds P's turn in its launch; the second waits, asking nothing.
+    expect(held.settle).toHaveLength(1)
+    expect(inFlightAsked).toEqual([P])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P])
+
+    held.settle[0]!(false)
+    expect(await first).toBe(RESTART_OUTCOME_CAPPED)
+    expect(await second).toBe(RESTART_OUTCOME_CAPPED)
+
+    expect(inFlightAsked).toEqual([P, P])
+    expect(deps.killSessionCalls).toEqual([P])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P])
+    expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
+    expect(deps.onCapReachedCalls).toEqual([P])
+    expect(errLines.filter((l) => l === capSkipLine)).toHaveLength(1)
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  // The restart timer here is the file's accepted real one (a 16 ms backoff
+  // from four recorded failures at CAP_BASE_DELAY_S), polled until it has
+  // submitted its work behind the gated operation.
+  test('cap re-check: a fired restart timer\'s work queued ahead of a retry one failure short of the cap — the timer\'s launch fails and reaches the cap; the retry then makes no launch and answers capped', async () => {
+    for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(P)
+    const submitted: string[] = []
+    const serializer = createPersonaSerializer()
+    const deps = retryDeps({ restartDelay: CAP_BASE_DELAY_S, launchSessionResult: false })
+    deps.serialize = (key, op) => { submitted.push(key); return serializer.run(key, op) }
+    initRestart(deps)
+
+    // An earlier operation for P holds P's turn while both are queued.
+    const gate = Promise.withResolvers<void>()
+    const earlier = serializer.run(P, () => gate.promise)
+    scheduleRestart(P, CWD)
+    const deadline = Date.now() + 2000
+    while (submitted.length === 0 && Date.now() < deadline) await Bun.sleep(5)
+    expect(submitted).toEqual([P])
+    const retry = runRestartRetry(P, CWD, notInFlight)
+    await flush()
+    expect(submitted).toEqual([P, P])
+    expectNoWork(deps)
+
+    gate.resolve()
+    await earlier
+    expect(await retry).toBe(RESTART_OUTCOME_CAPPED)
+
+    // The timer's work ran first: one kill, one launch, the failure that reached the cap and its one notice.
+    expect(deps.killSessionCalls).toEqual([P])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P])
+    expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
+    expect(deps.onCapReachedCalls).toEqual([P])
+    expect(inFlightAsked).toEqual([P])
+    expect(errLines.filter((l) => l === capSkipLine)).toHaveLength(1)
+    await flush()
+    expect(isRestartPendingOrActive(P)).toBe(false)
   })
 
   // The in-flight check is the first step: nothing else is asked, and a check

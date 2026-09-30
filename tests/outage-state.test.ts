@@ -720,10 +720,12 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
 
   /**
    * A fresh outage state over one stub client (every verb logged in `calls`)
-   * and, unless `sink` is false, a recording trigger sink. `sinkThrows`
-   * makes the sink record and then throw.
+   * and, unless `sink` is false, a recording trigger sink that answers true
+   * (the persona has a timer), as the real controller's `arm` does.
+   * `sinkThrows` makes the sink record and then throw; `sinkAnswer` makes it
+   * record and answer that value instead of true.
    */
-  function makeSinkHarness(opts: { sink?: boolean; sinkThrows?: boolean; client?: StubClientOptions } = {}): {
+  function makeSinkHarness(opts: { sink?: boolean; sinkThrows?: boolean; sinkAnswer?: unknown; client?: StubClientOptions } = {}): {
     emissions: Emission[]
     arms: Arm[]
     calls: StubCallLog
@@ -740,9 +742,11 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
         ? {}
         : {
             triggerSink: {
-              arm: (key: string, cause: UnavailableRetryCause) => {
+              arm: (key: string, cause: UnavailableRetryCause): boolean => {
                 arms.push({ key, cause })
                 if (opts.sinkThrows) throw new Error('sink failed')
+                // A non-boolean answer (void included) reaches the reporting point through this cast.
+                return 'sinkAnswer' in opts ? (opts.sinkAnswer as boolean) : true
               },
             },
           }),
@@ -897,6 +901,22 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
   })
 
   test.each([
+    ['false (nothing armed)', false],
+    ['void (no answer)', undefined],
+    ['a truthy non-boolean', 1],
+  ] as const)('a sink that answers %s: the wrapper rethrows the call\'s own error, and the attempt records it unarmed', async (_label, answer) => {
+    const err = errCallTimeout('status')
+    const { arms } = makeSinkHarness({ sinkAnswer: answer, client: failing('status', err) })
+
+    const { rejected, lastError } = await inAttempt(P1, P1, 'status')
+
+    expect(rejected).toBe(err)
+    expect(arms).toHaveLength(1)
+    expect(arms[0]!.key).toBe(P1)
+    expect(lastError).toEqual({ verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, armed: false })
+  })
+
+  test.each([
     ['ErrSystemInstallDisappeared from status (arms; raises ad-unreachable)', 'status', () => errSystemInstallDisappeared('status', '/bin/ad')],
     ['ErrTmuxKillFailed from kill (arms; no flag)', 'kill', () => errTmuxKillFailed()],
     ['ErrTmuxNotAvailable from resume (no arm; raises tmux-unavailable)', 'resume', () => errTmuxNotAvailable(undefined, 'resume')],
@@ -956,7 +976,7 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
       initOutageState({
         notify: () => {},
         getClient: () => client as unknown as Client,
-        triggerSink: { arm: () => {} },
+        triggerSink: { arm: () => true },
       })
       return client
     }
@@ -1051,6 +1071,21 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
         return attempt.lastError
       })
 
+      expect(lastError).toEqual({ verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, armed: false })
+    })
+
+    test.each([
+      ['false', false],
+      ['void', undefined],
+    ] as const)('with a sink that answers %s, it records the error unarmed', async (_label, answer) => {
+      const { arms } = makeSinkHarness({ sinkAnswer: answer })
+
+      const lastError = await runInAttempt(P1, 'recovery', (attempt) => {
+        reportAgentDirectorError(P1, errCallTimeout('status'), 'status')
+        return attempt.lastError
+      })
+
+      expect(arms).toHaveLength(1)
       expect(lastError).toEqual({ verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, armed: false })
     })
 

@@ -47,8 +47,10 @@
  *   it is kept with its due time and one kept line says why. While the
  *   persona's retry is running, the end is recorded (`deferred`, no line)
  *   and the same rule is applied once the run's answer has set the last row
- *   read and the mode, before the re-arm; a `stop` answer makes it moot. It
- *   has no caller yet: the conditions' owners call it when they end. The
+ *   read and the mode, before the re-arm; a `stop` answer makes it moot,
+ *   but a pending-only stop that yields to a full-mode cause counts as
+ *   `again` here, and when the rule stops the timer the yielded stop's
+ *   hand-off runs after that stop. It has no caller yet: the conditions' owners call it when they end. The
  *   exceptions hold against this entry only; every other stop is unaffected.
  * - `view(key)`, `isArmed(key)` and `armedKeys()` are read-only queries;
  *   `whenRunSettled(key)` awaits the persona's in-flight run, with its re-arm
@@ -66,7 +68,10 @@
  * switched or not), else `pending` when `armPendingOnly` landed during that
  * run, else cleared by the `again`; a failed retry keeps it, and
  * `armPendingOnly` sets it `pending`. A `stop` answer may carry a hand-off,
- * run once, awaited, after the stop.
+ * run once, awaited, after the stop. A pending-only retry's stop that rests
+ * on its row read (`yieldsToFullMode`) is not taken when `arm` recorded a
+ * cause during the run: it counts as `again` in full mode, with no hand-off
+ * (as `mayTakeSwitch` keeps a full-mode cause from being dropped).
  *
  * UNAVAILABLE is never a failure here: the restart module's per-persona
  * failure counter and cap latch (`backoff.ts`) are neither read nor written,
@@ -133,6 +138,10 @@
  * `pending`, a stop with no other call; `ended`, `missing` or no row, a stop
  * that hands the persona to one run of the restart module's retry entry once
  * the timer is stopped, so a refused launch in that run arms a fresh timer.
+ * Either stop yields to a cause `arm` recorded during the retry (another
+ * attempt for the persona met UNAVAILABLE meanwhile): the timer stays armed
+ * in full mode and re-arms at the next wait, naming that cause, and the
+ * hand-off is not run.
  * A read error is a `status` error inside the attempt: it arms the timer
  * with its cause, which promotes it to full mode, and the retry counts as
  * `again`.
@@ -368,6 +377,13 @@ export interface UnavailableRetryCause {
  * - `handOff` (`stop`): run once, awaited, after the timer is stopped (a
  *   pending-only retry that found the row gone hands the persona to one run
  *   of the restart path's decision). A throw or rejection is logged.
+ * - `yieldsToFullMode` (`stop`): true when the stop rests only on a
+ *   pending-only retry's row read (the row live out of `pending`, or gone).
+ *   When the retry ran in pending-only mode and `arm` recorded a cause during
+ *   the run, the stop is not taken: the answer counts as `again` in full
+ *   mode, its `row` becomes the last row read, the re-armed line names that
+ *   cause, and the hand-off is not run, unless a condition end deferred to
+ *   this run then stops the timer (the hand-off then runs after that stop).
  */
 export type UnavailableRetryOutcome =
   | {
@@ -381,6 +397,7 @@ export type UnavailableRetryOutcome =
       readonly reason: string
       readonly row?: string
       readonly handOff?: () => Promise<unknown>
+      readonly yieldsToFullMode?: boolean
     }
 
 /** What the retry action is told about the retry it runs. */
@@ -434,11 +451,14 @@ export interface UnavailableRetryView {
 /**
  * Where a trigger inside a launch or recovery attempt is sent (b.jg5
  * SRJ-301): the persona key and the cause the arming predicate answered. The
- * controller is one: its `arm` arms the persona's timer with the cause. Must
- * not throw; a throw is caught by the reporting point and counts as not armed.
+ * controller is one: its `arm` arms the persona's timer with the cause.
+ * `arm` answers true when the persona has a timer after the call (armed now,
+ * or already armed or running), false when nothing is armed (refused after
+ * `close`, or the first timer could not be set). Must not throw; a throw is
+ * caught by the reporting point and counts as not armed.
  */
 export interface UnavailableRetryTriggerSink {
-  arm(key: string, cause: UnavailableRetryCause): void
+  arm(key: string, cause: UnavailableRetryCause): boolean
 }
 
 /** The per-persona UNAVAILABLE retry timers of one server. */
@@ -452,9 +472,10 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
    * run's switch to pending-only mode is not taken. A missing cause is
    * recorded as `unnamed`. Never throws: if the clock throws while setting
    * the first timer, the persona is forgotten and one arm failed line is
-   * logged.
+   * logged. Answers true when the persona has a timer after the call; false
+   * after `close` and when the first timer could not be set.
    */
-  arm(key: string, cause: UnavailableRetryCause): void
+  arm(key: string, cause: UnavailableRetryCause): boolean
   /**
    * Arm persona `key`'s timer in pending-only mode, for a covered `pending`
    * row (b.jg5 SRJ-303, SRJ-409): the `pending-row` cause is recorded and the
@@ -477,7 +498,10 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
    * `deferred`: once the run's `again` answer (or a failed run) has set the
    * last row read and the mode, the same rule is applied before the re-arm,
    * with its kept or stopped line; a `stop` answer makes it moot (only the
-   * answer's stopped line), as does a stop during the run. Answers what it
+   * answer's stopped line), as does a stop during the run. A pending-only
+   * stop that yields to a full-mode cause armed during the run counts as
+   * `again` here: the rule is applied, and when it stops the timer the
+   * yielded stop's hand-off runs after that stop. Answers what it
    * did; `not-armed`, with no line, when no timer is armed. Every other stop
    * is unaffected by these exceptions.
    */
@@ -649,26 +673,42 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       failure = `the retry failed: ${describeThrownValue(err)}`
     }
     if (!isCurrent(entry)) return
+    // A pending-only stop that rests on the row read yields to a full-mode
+    // cause armed during the run: the timer stays, in full mode, and its
+    // hand-off is held back (run only if a deferred condition end below then
+    // stops the timer).
+    let heldHandOff: (() => Promise<unknown>) | undefined
+    let reason: string
     if (outcome?.kind === 'stop') {
       const handOff = handOffOf(outcome)
-      stopEntry(entry, outcome.reason, rowOf(outcome))
-      if (handOff !== undefined) await runHandOff(entry.key, handOff)
-      return
-    }
-    const answered = outcome?.kind === 'again' ? againReason(outcome) : undefined
-    const unexpected = failure === undefined && outcome?.kind !== 'again' ? 'the retry gave no answer' : undefined
-    const reason = answered ?? failure ?? unexpected ?? entry.runCause ?? NO_CAUSE_GIVEN
-    if (outcome?.kind === 'again') {
-      const row = rowOf(outcome)
-      entry.lastRow = row ?? (entry.pendingArmedInRun ? UNAVAILABLE_RETRY_ROW_PENDING : undefined)
-      if (switchesToPendingOnly(outcome) && mayTakeSwitch(entry)) entry.mode = UNAVAILABLE_RETRY_MODE_PENDING_ONLY
+      if (!mayOverrideStop(entry, mode, outcome)) {
+        stopEntry(entry, outcome.reason, rowOf(outcome))
+        if (handOff !== undefined) await runHandOff(entry.key, handOff)
+        return
+      }
+      heldHandOff = handOff
+      entry.mode = UNAVAILABLE_RETRY_MODE_FULL
+      entry.lastRow = rowOf(outcome) ?? (entry.pendingArmedInRun ? UNAVAILABLE_RETRY_ROW_PENDING : undefined)
+      reason = entry.runCause ?? NO_CAUSE_GIVEN
+    } else {
+      const answered = outcome?.kind === 'again' ? againReason(outcome) : undefined
+      const unexpected = failure === undefined && outcome?.kind !== 'again' ? 'the retry gave no answer' : undefined
+      reason = answered ?? failure ?? unexpected ?? entry.runCause ?? NO_CAUSE_GIVEN
+      if (outcome?.kind === 'again') {
+        const row = rowOf(outcome)
+        entry.lastRow = row ?? (entry.pendingArmedInRun ? UNAVAILABLE_RETRY_ROW_PENDING : undefined)
+        if (switchesToPendingOnly(outcome) && mayTakeSwitch(entry)) entry.mode = UNAVAILABLE_RETRY_MODE_PENDING_ONLY
+      }
     }
     const ended = entry.endedInRun
     entry.runCause = undefined
     entry.fullArmedInRun = false
     entry.pendingArmedInRun = false
     entry.endedInRun = undefined
-    if (ended !== undefined && !applyConditionEnd(entry, ended)) return
+    if (ended !== undefined && !applyConditionEnd(entry, ended)) {
+      if (heldHandOff !== undefined) await runHandOff(entry.key, heldHandOff)
+      return
+    }
     entry.refusals += 1
     const waitMs = waitAfter(entry.refusals)
     schedule(entry, waitMs)
@@ -684,6 +724,16 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
    */
   function mayTakeSwitch(entry: RetryEntry): boolean {
     return !entry.fullArmedInRun && !entry.causes.includes(UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)
+  }
+
+  /**
+   * Whether a run's `stop` answer yields to a full-mode cause (b.jg5 SRJ-301,
+   * SRJ-303): only when the retry ran in pending-only mode, the stop rests on
+   * its row read (`yieldsToFullMode`), and `arm` (full mode) landed during the
+   * run. Then the stop is taken as `again` in full mode.
+   */
+  function mayOverrideStop(entry: RetryEntry, mode: UnavailableRetryMode, outcome: { readonly yieldsToFullMode?: unknown }): boolean {
+    return mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY && entry.fullArmedInRun && yieldsToFullMode(outcome)
   }
 
   /**
@@ -728,12 +778,13 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
   /**
    * Arm persona `key` with `cause` in `mode` (see `arm` and `armPendingOnly`).
    * An armed entry keeps its due time; a full-mode arm promotes a
-   * pending-only entry. Never throws.
+   * pending-only entry. Answers true when the persona has a timer after the
+   * call. Never throws.
    */
-  function armIn(key: string, cause: UnavailableRetryCause, mode: UnavailableRetryMode): void {
+  function armIn(key: string, cause: UnavailableRetryCause, mode: UnavailableRetryMode): boolean {
     if (closedReason !== undefined) {
       log(`[slack] unavailable-retry: persona=${key} not armed (${describeCause(cause)}) — ${closedReason}`)
-      return
+      return false
     }
     const existing = entries.get(key)
     if (existing !== undefined) {
@@ -749,7 +800,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
         existing.mode = UNAVAILABLE_RETRY_MODE_FULL
         log(`[slack] unavailable-retry: persona=${key} promoted to full mode (${description}) — its due time is kept`)
       }
-      return
+      return true
     }
     const entry: RetryEntry = {
       key,
@@ -773,15 +824,16 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     } catch (err) {
       forget(entry)
       log(`[slack] unavailable-retry: persona=${key} arm failed: ${describeThrownValue(err)} — not armed`)
-      return
+      return false
     }
     const inMode = mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY ? ' in pending-only mode' : ''
     log(`[slack] unavailable-retry: persona=${key} armed${inMode} (${description}) — first retry in ${waitMs / 1000} s`)
+    return true
   }
 
   return {
     arm(key, given) {
-      armIn(key, given ?? UNNAMED_CAUSE, UNAVAILABLE_RETRY_MODE_FULL)
+      return armIn(key, given ?? UNNAMED_CAUSE, UNAVAILABLE_RETRY_MODE_FULL)
     },
 
     armPendingOnly(key) {
@@ -910,14 +962,18 @@ export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableR
  * `missing` or absent, a stop whose hand-off is `restart` (one run of the
  * restart path's decision, after the timer is stopped, so that a refused
  * launch in it arms a fresh timer); any other state, live out of `pending`, a
- * stop with no other call.
+ * stop with no other call. Both stops rest on the row read alone
+ * (`yieldsToFullMode`): a full-mode cause armed during the retry overrides
+ * them.
  */
 function pendingOnlyAnswer(row: string, restart: () => Promise<unknown>): UnavailableRetryOutcome {
   if (row === UNAVAILABLE_RETRY_ROW_PENDING) {
     return { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, row }
   }
-  if (GONE_ROW_STATES.has(row)) return { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_GONE, row, handOff: restart }
-  return { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE, row }
+  if (GONE_ROW_STATES.has(row)) {
+    return { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_GONE, row, handOff: restart, yieldsToFullMode: true }
+  }
+  return { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE, row, yieldsToFullMode: true }
 }
 
 /** The in-flight predicate for a pending-only retry: `isInFlight(key)`, with a throw counted as in flight. */
@@ -1041,6 +1097,15 @@ function switchesToPendingOnly(outcome: { readonly switchToPendingOnly?: unknown
   }
 }
 
+/** True when a `stop` answer rests only on a pending-only row read (its field is exactly `true`). Never throws. */
+function yieldsToFullMode(outcome: { readonly yieldsToFullMode?: unknown }): boolean {
+  try {
+    return outcome.yieldsToFullMode === true
+  } catch {
+    return false
+  }
+}
+
 /** A `stop` answer's hand-off, when it gives a function. Never throws. */
 function handOffOf(outcome: { readonly handOff?: unknown }): (() => Promise<unknown>) | undefined {
   try {
@@ -1126,7 +1191,7 @@ export interface AttemptErrorRecord {
   readonly verb?: string
   /** The cause kind the arming predicate answered; absent when it answered nothing. */
   readonly causeKind?: string
-  /** True when the error was sent to a trigger sink, which arms the persona's timer. */
+  /** True when the error was sent to a trigger sink and the sink answered that the persona has a timer. */
   readonly armed: boolean
 }
 
@@ -1213,8 +1278,9 @@ export function isInsideAttempt(key: string): boolean {
  * with `verb` (b.jg5 SRJ-301). Outside an attempt for `key` it does nothing.
  * Inside one, when the arming predicate answers a cause and `sink` is given,
  * the sink is called once with `key` and the cause; the innermost attempt
- * then records the error as its last, armed when the sink returned. Answers
- * whether the sink armed. Never throws.
+ * then records the error as its last, armed when the sink answered true (the
+ * persona has a timer after the call); a sink that answers anything else, or
+ * throws, armed nothing. Answers whether the sink armed. Never throws.
  */
 export function reportAttemptError(
   key: string,
@@ -1229,8 +1295,7 @@ export function reportAttemptError(
     let armed = false
     if (cause !== undefined && sink !== undefined) {
       try {
-        sink.arm(key, cause)
-        armed = true
+        armed = sink.arm(key, cause) === true
       } catch {
         /* a failing sink arms nothing; the call's own error is what its caller sees */
       }

@@ -93,11 +93,15 @@
  *   (`whenRunSettled`), bounded by `options.settleFlushes` clock flushes, so
  *   a re-arm measured from a run's end lands exactly and a run the test holds
  *   open does not stall the step. Resolves with the number of timers fired.
- * - `captured()`: everything captured, for `assertNoLeak`: the lines, both
- *   notice lists, the startup-errors entries, the attempts, the triggers and
- *   the state directory as a written file.
+ * - `errors`: every `console.error` call while the harness is live (the
+ *   session manager's and the restart module's lines), its arguments joined
+ *   with spaces, in order. `console.error` is replaced at build and put back
+ *   by `cleanup()`.
+ * - `captured()`: everything captured, for `assertNoLeak`: the lines, the
+ *   `console.error` lines, both notice lists, the startup-errors entries, the
+ *   attempts, the triggers and the state directory as a written file.
  * - `cleanup()`: stops every retry timer (`stopAll`), then undoes every
- *   install and reset the harness made (the restart module's state and the
+ *   install and reset the harness made (`console.error`, the restart module's state and the
  *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
  *   the stub spawn path and client with every launch still in flight, the
  *   findMissing memo, the tmux seams, the settings install,
@@ -241,6 +245,8 @@ export interface RecoveryHarness {
   readonly stateDir: string
   readonly stub: StubSpawnPath
   readonly lines: string[]
+  /** Every `console.error` line while the harness is live, in order. */
+  readonly errors: string[]
   readonly attempts: RecoveryAttempt[]
   readonly notices: RecoveryNotice[]
   readonly outageNotices: RecoveryNotice[]
@@ -285,6 +291,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   const clock = createFakeClock()
   const lines: string[] = []
+  const errors: string[] = []
   const attempts: RecoveryAttempt[] = []
   const notices: RecoveryNotice[] = []
   const outageNotices: RecoveryNotice[] = []
@@ -340,6 +347,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   const savedStateDir = process.env['SLACK_STATE_DIR']
   process.env['SLACK_STATE_DIR'] = stateDir
+  const savedConsoleError = console.error
+  console.error = (...args: unknown[]) => {
+    errors.push(args.map(String).join(' '))
+  }
 
   const stub = installStubSpawnPath(home)
   _setTmuxSessionKiller(async () => {})
@@ -348,7 +359,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const triggerSink: UnavailableRetryTriggerSink = {
     arm(key, cause) {
       triggers.push({ key, kind: cause.kind })
-      controller.arm(key, cause)
+      return controller.arm(key, cause)
     },
   }
   _resetOutageState()
@@ -435,6 +446,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     stateDir,
     stub,
     lines,
+    errors,
     attempts,
     notices,
     outageNotices,
@@ -511,6 +523,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     captured: () => ({
       lines: [...lines],
+      errors: [...errors],
       notices: [...notices],
       outageNotices: [...outageNotices],
       startupErrors: startupErrors(),
@@ -532,6 +545,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       _resetTmuxServerEnsurer()
       _resetFindMissingMemo()
       resetAdSettingsForTests()
+      console.error = savedConsoleError
       if (savedStateDir === undefined) delete process.env['SLACK_STATE_DIR']
       else process.env['SLACK_STATE_DIR'] = savedStateDir
       rmSync(root, { recursive: true, force: true })
