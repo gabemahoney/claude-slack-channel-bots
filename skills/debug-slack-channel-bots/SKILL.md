@@ -1476,6 +1476,8 @@ registers again with its history. If the new token is refused too, a new
 | `[slack] Starting from the last-applied record "<path>"` or `[slack] No last-applied record: recorded the configuration file "<path>" as "<path>"` | Which configuration a start runs. See [The last-applied record](#the-last-applied-record). |
 | `[slack] agent-director version re-check: the runtime re-check could not run: <description>; the server keeps running and checks again at the next 120 s re-check` | The server's 120 s check of the agent-director binary couldn't run: the binary is missing, unreadable, unreachable, or didn't answer within 30 s. `<description>` says which (an error name such as `ErrSystemInstallUnreachable (reason <reason>, binary at <path>)`, or `no answer within the 30 s time limit`). Nothing changes: the server keeps running and checks again every 120 s. One line per run of failures: the first failure after start, or after a check that passed, logs it, and the failures after it log nothing until a check passes. Nothing goes to `startup-errors.log` or Slack. If the line keeps coming back, check that the agent-director binary is present and executable. If a later check finds a version the server refuses, the server stops as in [Found while the server was running](#found-while-the-server-was-running). |
 | `[slack] agent-director settings: the read of "<path>" was refused: <reason>; <kept> stay in effect until a read is accepted (b.jg5 SRJ-209)` | The server refused agent-director's timing settings file and keeps its last accepted values (`the defaults` at start). One line per run of refused reads. See [agent-director's timing settings](#agent-directors-timing-settings). |
+| `[slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <verb> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the README's switch-over runbook, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)` | Written once per start, before any persona is brought up. The call timeout is at or below the need that agent-director's timing settings give, so an agent-director call can end in an error while its verb still acts. The server still starts and no value changes. Fix: with the operator's say-so, raise the setting in `config.json` and confirm it. See [The call timeout](#the-call-timeout). |
+| `[slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the README's switch-over runbook, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)` | Written once per start, in place of the line above, whatever the setting is. `[pause] timeout_seconds` holds a value that is not used (see below), so `pause`'s wait, and so the need, can't be known. The server still starts and no value changes. Fix: the operator gives it a positive whole number, or removes it for the 30 s default, then checks the setting against the need. See [The call timeout](#the-call-timeout). |
 | `… launch after its bring-up retry failed: …`, `… working-directory retry failed: …`, `… handling its change from up to <outcome> failed: …`, `persona … not brought up: Slack bring-up threw: …`, `persona <step> failed: personas[<i>] …`, `persona-destination-hold: retry of held notices failed for persona=<key>: …`, `persona-destination-hold: notice failure callback threw for persona=<key>: …`, `unhandled rejection (process keeps running): …` | An internal error. The server keeps running. Report it as a bug, with the persona's lines around it. |
 
 ---
@@ -1642,6 +1644,45 @@ nine keys and their defaults.
   fixed, the server picks it up within about 120 s, with no restart.
 - **Who decides:** agent-director's own answers always decide. The server's
   reading of the file never overrides what agent-director does or reports.
+
+### The call timeout
+
+`agent_director_call_timeout_ms` in `config.json` (default 60000 ms) bounds
+how long CSCB waits on each agent-director call it makes for a persona. A call
+that runs past it ends in an error while agent-director may still be carrying
+out the verb. The server takes it from the configuration its start runs;
+`stop --stop-bots` and `clean_restart` take it from the last-applied record
+(else `config.json`), and `stop --stop-bots` uses the default when it can't
+read that configuration.
+
+- **When the server checks it:** once per start, right after it reads
+  agent-director's settings and before any persona is brought up. It writes
+  at most one of the two lines in
+  [Other lines you may see](#other-lines-you-may-see), never refuses to start
+  and changes no value. It doesn't check again until the next start.
+- **How to check:** compare the setting in effect (the last-applied record's
+  value, else `config.json`'s, else 60000) with the need. The need is the
+  largest ceiling among the verbs CSCB calls, computed from the host's
+  `[tmux]` values and, for `pause`, `[pause] timeout_seconds`, plus 15 s. The
+  README section "Sizing the agent-director call timeout", under
+  "Configuration", has the formulas. At agent-director's defaults the need is
+  54000 ms, set by `pause` (9 s plus its 30 s wait, plus 15 s). With
+  `create_timeout_ms` 40000 (with `pending_grace_seconds` 61) it is 60900 ms,
+  set by the launch ceiling that `resume`, a spawn with reuse and a plain
+  spawn share (the line names `resume/spawn-with-reuse/plain-spawn`); with
+  `[pause] timeout_seconds` 60 it is 84000 ms. The setting must be greater
+  than the need.
+- **`[pause] timeout_seconds` values that are not used:** `0`, a negative
+  number, a number above 2^63 − 1, any value that isn't a whole number, or a
+  `pause` that isn't a table. A missing file, table or key means 30 s. `<found>`
+  in the line gives the number, or the kind of value, never the file's text.
+- **Fix:** the operator's. With the operator's say-so, raise
+  `agent_director_call_timeout_ms` in `config.json` above the need and confirm
+  the change (see [Confirming a pending change](#confirming-a-pending-change)).
+  `stop --stop-bots` and `clean_restart` use it at once; the server uses it at
+  its next start or a `clean_restart`. For an unused `[pause] timeout_seconds`,
+  the operator gives it a positive whole number or removes it. This skill
+  never edits `config.toml`.
 
 ---
 

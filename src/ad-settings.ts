@@ -7,7 +7,11 @@
  * `[pause] timeout_seconds` (b.jg5 SRJ-209); the waits derived from the
  * values in effect (G, the alert threshold and B), their whole-minute
  * rendering for notices, and the never-early wait helper that arms a derived
- * wait on an injected clock (b.jg5 SRJ-210). The nine `[tmux]` defaults,
+ * wait on an injected clock (b.jg5 SRJ-210); agent-director's verb ceilings
+ * (ADSRD SR-13.2), the need CSCB's call timeout must exceed, and the startup
+ * check that warns when `agent_director_call_timeout_ms` does not exceed it
+ * (b.jg5 SRJ-213). The need's 15 s margin is named here and nowhere else in
+ * `src/`. The nine `[tmux]` defaults,
  * `[pause] timeout_seconds`'s 30 s and the three minimums are named here and
  * nowhere else: no other module in `src/` defines one, and no CSCB wait
  * holds one as a fixed value.
@@ -88,9 +92,21 @@
  * accessor rather than a number, it reads the wait in effect again at every
  * timer fire, so a value raised while the wait is armed never ends it early.
  *
+ * The ceilings and the need (b.jg5 SRJ-213) are computed exactly from the
+ * `bigint` values in effect, in milliseconds ({@link adVerbCeilingsMs},
+ * {@link adCallTimeoutNeed}): the need is the largest ceiling among the verbs
+ * CSCB calls (every verb but `expire`; `pause` with its configured wait) plus
+ * {@link AD_CALL_TIMEOUT_NEED_MARGIN_MS}, 54 s at the defaults. `main()`
+ * (through `src/server.ts`'s start step) runs {@link checkAdCallTimeoutAtStartup}
+ * once per start, right after {@link installAdSettings} and before the start
+ * pass, never on the 120 s tick: it writes at most one warning line, when the
+ * setting is at or below the need or `[pause] timeout_seconds` holds a value
+ * that is not used, and never stops the start or changes a value.
+ *
  * No side effects at import: nothing is read, armed or logged until
- * {@link installAdSettings}, a reader's `read()` or
- * {@link armNeverEarlyWait} runs. The module makes no agent-director call.
+ * {@link installAdSettings}, a reader's `read()`,
+ * {@link checkAdCallTimeoutAtStartup} or {@link armNeverEarlyWait} runs. The
+ * module makes no agent-director call.
  * It imports neither the agent-director package nor the client,
  * outage-state, notifier or Slack modules.
  *
@@ -102,13 +118,14 @@ import { join } from 'node:path'
 
 import { parse, TomlError } from 'smol-toml'
 
-import { onAdVersionRecheckTick } from './ad-version-gate.ts'
+import { onAdVersionRecheckTick, PHASE1_RUNBOOK_SECTION_TITLE } from './ad-version-gate.ts'
 import {
   FILE_TOO_LARGE_CODE,
   MAX_RELOAD_FILE_SIZE_TEXT,
   PersonaConfigReadError,
   readPersonaConfigBytes,
   type PersonaConfigFs,
+  type ServerSettings,
 } from './config.ts'
 import type { PersonaConnectionClock } from './persona-connections.ts'
 import { MAX_TIMER_DELAY_MS } from './persona-retry-schedule.ts'
@@ -747,4 +764,222 @@ export function armNeverEarlyWait(
       handle = undefined
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// The verb ceilings, the need and the startup call-timeout check (b.jg5 SRJ-213)
+// ---------------------------------------------------------------------------
+
+/**
+ * The need's margin over the largest ceiling, in milliseconds: the store's
+ * 10 s busy timeout and 5 s for starting the CLI, which the ceilings do not
+ * count (b.jg5 SRJ-213).
+ */
+export const AD_CALL_TIMEOUT_NEED_MARGIN_MS = 15_000n
+
+/**
+ * The verbs of agent-director's ceiling table (ADSRD SR-13.2), in table
+ * order, each marked with whether CSCB calls it. `spawn-with-reuse` and
+ * `plain-spawn` share `resume`'s row (a plain spawn's ceiling includes its
+ * pre-spawn scan); `find-missing` and `expire` share the sweep's row. CSCB
+ * never calls `expire`, so it never sets the need. A tie between ceilings
+ * names the earlier verb in this order, so the launch row's need is set by
+ * `resume`; the warning line names that row by all three verbs
+ * ({@link AD_LAUNCH_CEILING_VERBS}).
+ */
+export const AD_CEILING_VERBS = Object.freeze([
+  Object.freeze({ verb: 'kill', cscbCalls: true }),
+  Object.freeze({ verb: 'read-pane', cscbCalls: true }),
+  Object.freeze({ verb: 'send-keys', cscbCalls: true }),
+  Object.freeze({ verb: 'pause', cscbCalls: true }),
+  Object.freeze({ verb: 'resume', cscbCalls: true }),
+  Object.freeze({ verb: 'spawn-with-reuse', cscbCalls: true }),
+  Object.freeze({ verb: 'plain-spawn', cscbCalls: true }),
+  Object.freeze({ verb: 'find-missing', cscbCalls: true }),
+  Object.freeze({ verb: 'expire', cscbCalls: false }),
+] as const)
+
+/** One verb of the ceiling table. */
+export type AdCeilingVerb = (typeof AD_CEILING_VERBS)[number]['verb']
+
+/** The verbs that share ADSRD SR-13.2's launch row; the warning line names that row by all three. */
+export const AD_LAUNCH_CEILING_VERBS: readonly AdCeilingVerb[] = Object.freeze(['resume', 'spawn-with-reuse', 'plain-spawn'])
+
+/**
+ * The ceiling's name in the warning line: `resume/spawn-with-reuse/plain-spawn`
+ * for any verb of the shared launch row, the verb itself otherwise.
+ */
+function ceilingName(verb: AdCeilingVerb): string {
+  return AD_LAUNCH_CEILING_VERBS.includes(verb) ? AD_LAUNCH_CEILING_VERBS.join('/') : verb
+}
+
+/** Each verb's ceiling in milliseconds, exact. */
+export type AdVerbCeilingsMs = Readonly<Record<AdCeilingVerb, bigint>>
+
+/** The larger of two exact values. */
+function maxBigInt(a: bigint, b: bigint): bigint {
+  return a > b ? a : b
+}
+
+/**
+ * Each verb's ceiling in milliseconds (ADSRD SR-13.2), from the values in
+ * effect, with Q, A and C the query, action and create timeouts, W
+ * `pipe_close_wait_ms`, E `kill_exit_wait_ms` and B `sweep_budget_seconds`
+ * (converted to milliseconds):
+ * - `kill`: max(2Q + 2A + E + 4W, 3Q + 2A + 5W)
+ * - `read-pane`: 3Q + A + 4W
+ * - `send-keys`: 3Q + 2A + 5W
+ * - `pause`: 3Q + 2A + 5W, plus `[pause] timeout_seconds` (converted) when it
+ *   is used; without it when the value is not used (its wait is unknown)
+ * - `resume`, `spawn-with-reuse` and `plain-spawn`: max(Q + C + 2A + 4W, 2Q + C + 3W)
+ * - `find-missing` and `expire`: B + Q + W
+ * At the defaults: 12.4, 6.9, 9, 39 (9 + 30), 10.9 and 16.6 s. Pure and
+ * exact: computed on the `bigint` values, so no value E6 can hold loses
+ * precision or wraps.
+ */
+export function adVerbCeilingsMs(values: AdSettingsInEffect): AdVerbCeilingsMs {
+  const {
+    query_timeout_ms: q,
+    action_timeout_ms: a,
+    create_timeout_ms: c,
+    pipe_close_wait_ms: w,
+    kill_exit_wait_ms: e,
+    sweep_budget_seconds: budgetSeconds,
+  } = values.tmux
+  const sendKeys = 3n * q + 2n * a + 5n * w
+  const pauseWait = values.pauseTimeout.kind === 'used' ? values.pauseTimeout.seconds * MS_PER_SECOND : 0n
+  const launch = maxBigInt(q + c + 2n * a + 4n * w, 2n * q + c + 3n * w)
+  const sweep = budgetSeconds * MS_PER_SECOND + q + w
+  return Object.freeze({
+    kill: maxBigInt(2n * q + 2n * a + e + 4n * w, sendKeys),
+    'read-pane': 3n * q + a + 4n * w,
+    'send-keys': sendKeys,
+    pause: sendKeys + pauseWait,
+    resume: launch,
+    'spawn-with-reuse': launch,
+    'plain-spawn': launch,
+    'find-missing': sweep,
+    expire: sweep,
+  })
+}
+
+/**
+ * The need and what sets it: the verb whose ceiling is the largest, or, when
+ * `[pause] timeout_seconds` holds a value that is not used, that value
+ * (E6's token-free description of it), since `pause`'s wait is then unknown.
+ */
+export type AdCallTimeoutNeedSetBy =
+  | { readonly kind: 'verb'; readonly verb: AdCeilingVerb }
+  | { readonly kind: 'unused-pause-value'; readonly found: string }
+
+/** The call timeout's need, in milliseconds, exact, and what sets it. */
+export interface AdCallTimeoutNeed {
+  readonly needMs: bigint
+  readonly setBy: AdCallTimeoutNeedSetBy
+}
+
+/**
+ * The call timeout's need (b.jg5 SRJ-213): the largest ceiling among the
+ * verbs CSCB calls (every verb of {@link AD_CEILING_VERBS} but `expire`),
+ * plus {@link AD_CALL_TIMEOUT_NEED_MARGIN_MS}. A tie names the earlier verb in
+ * table order. When `[pause] timeout_seconds` holds a value that is not used,
+ * `pause` counts without its wait and the need is set by that unused value.
+ * 54 s at the defaults, set by `pause`. Pure and exact.
+ */
+export function adCallTimeoutNeed(values: AdSettingsInEffect): AdCallTimeoutNeed {
+  const ceilings = adVerbCeilingsMs(values)
+  let largest: { verb: AdCeilingVerb; ms: bigint } | undefined
+  for (const { verb, cscbCalls } of AD_CEILING_VERBS) {
+    if (!cscbCalls) continue
+    if (largest === undefined || ceilings[verb] > largest.ms) largest = { verb, ms: ceilings[verb] }
+  }
+  // AD_CEILING_VERBS is a fixed, non-empty list of verbs CSCB calls.
+  const { verb, ms } = largest!
+  const needMs = ms + AD_CALL_TIMEOUT_NEED_MARGIN_MS
+  if (values.pauseTimeout.kind === 'not-used') {
+    return { needMs, setBy: { kind: 'unused-pause-value', found: values.pauseTimeout.found } }
+  }
+  return { needMs, setBy: { kind: 'verb', verb } }
+}
+
+/** The setting the check sizes; typed against the configuration, so a rename fails the typecheck. */
+const CALL_TIMEOUT_SETTING: keyof ServerSettings = 'agent_director_call_timeout_ms'
+
+/**
+ * Whether `callTimeoutMs` is at or below `needMs`, exactly. A value that is
+ * not a number of milliseconds (NaN) counts as at or below: it gets the
+ * warning rather than none.
+ */
+function isAtOrBelow(callTimeoutMs: number, needMs: bigint): boolean {
+  if (Number.isNaN(callTimeoutMs) || callTimeoutMs === Number.NEGATIVE_INFINITY) return true
+  if (callTimeoutMs === Number.POSITIVE_INFINITY) return false
+  // For an integer need, x <= need exactly when ⌈x⌉ <= need.
+  return BigInt(Math.ceil(callTimeoutMs)) <= needMs
+}
+
+/**
+ * The startup check's warning line (b.jg5 SRJ-213), or `undefined` when none
+ * is due: one line when `callTimeoutMs` is at or below the need, or when
+ * `[pause] timeout_seconds` holds a value that is not used (then the line
+ * names that value where it would name the verb, whatever the setting).
+ * `<ceiling>` is the verb that sets the need, or, for the launch row that
+ * `resume`, `spawn-with-reuse` and `plain-spawn` share,
+ * `resume/spawn-with-reuse/plain-spawn` ({@link AD_LAUNCH_CEILING_VERBS}).
+ *
+ *   [slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <ceiling> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the README's switch-over runbook, section "<title>" (b.jg5 SRJ-213)
+ *   [slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the README's switch-over runbook, section "<title>" (b.jg5 SRJ-213)
+ *
+ * The need is in milliseconds, like the setting. `<found>` is E6's token-free
+ * description; the line holds no file text, no string value and no token.
+ * Pure.
+ */
+export function buildAdCallTimeoutWarningLine(callTimeoutMs: number, values: AdSettingsInEffect): string | undefined {
+  const { needMs, setBy } = adCallTimeoutNeed(values)
+  const runbook = `see the README's switch-over runbook, section "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-213)`
+  const head = `${AD_SETTINGS_LOG_PREFIX} ${CALL_TIMEOUT_SETTING} is ${callTimeoutMs}`
+  if (setBy.kind === 'unused-pause-value') {
+    return (
+      `${head}; its need is unknown: [${AD_PAUSE_TABLE}] ${AD_PAUSE_TIMEOUT_KEY} holds ${setBy.found}, a value that is not used, ` +
+      `so pause's wait is not counted and the need without it is ${needMs} ms; ${runbook}`
+    )
+  }
+  if (!isAtOrBelow(callTimeoutMs, needMs)) return undefined
+  return (
+    `${head}, at or below its need of ${needMs} ms ` +
+    `(the ${ceilingName(setBy.verb)} ceiling plus the ${AD_CALL_TIMEOUT_NEED_MARGIN_MS} ms margin): ` +
+    `a call can time out while its verb still acts; ${runbook}`
+  )
+}
+
+/** The startup call-timeout check's dependencies. */
+export interface AdCallTimeoutCheckDeps {
+  /** The server log. */
+  log: (line: string) => void
+  /** The values in effect, `[pause] timeout_seconds` included. Production: {@link adSettingsInEffect}. */
+  valuesInEffect?: () => AdSettingsInEffect
+}
+
+/**
+ * The startup call-timeout check (b.jg5 SRJ-213): computes the need from the
+ * values in effect and writes {@link buildAdCallTimeoutWarningLine}'s line,
+ * if one is due, to `deps.log`. The server runs it once per start, right
+ * after the startup read of agent-director's settings and before the start
+ * pass; it is never run on the 120 s tick. It writes at most one line, never
+ * throws, never exits, changes no value, arms no timer and registers nothing.
+ * Answers the line it wrote, or `undefined`.
+ */
+export function checkAdCallTimeoutAtStartup(callTimeoutMs: number, deps: AdCallTimeoutCheckDeps): string | undefined {
+  let line: string | undefined
+  try {
+    line = buildAdCallTimeoutWarningLine(callTimeoutMs, (deps.valuesInEffect ?? adSettingsInEffect)())
+  } catch {
+    return undefined
+  }
+  if (line === undefined) return undefined
+  try {
+    deps.log(line)
+  } catch {
+    /* non-critical: the log sink failing never stops the start */
+  }
+  return line
 }

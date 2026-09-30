@@ -20,11 +20,31 @@ import {
   setOutageFlag,
 } from '../src/outage-state.ts'
 import {
+  getClient,
   setClientForTests,
   resetClientForTests,
 } from '../src/agent-director-client.ts'
-import { cannedGetResult, makeStubClient, errSpawnNotInteractive, errTmuxSendKeys, holdSpawns, type StubClient } from './test-helpers/agent-director-stub.ts'
-import { _buildIsSessionAliveAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
+import {
+  cannedGetResult,
+  makeStubClient,
+  makeStubCreateClient,
+  errSpawnNotInteractive,
+  errTmuxSendKeys,
+  holdSpawns,
+  type StubClient,
+} from './test-helpers/agent-director-stub.ts'
+import { _buildIsSessionAliveAdapter, _buildReconnectSessionAdapter, _runCallTimeoutStartStep } from '../src/server.ts'
+import { buildPersonaClientOrExit, type PersonaClientDeps } from '../src/agent-director-startup.ts'
+import {
+  DEFAULT_AD_SETTINGS_IN_EFFECT,
+  adCallTimeoutNeed,
+  adSettingsInEffect,
+  buildAdCallTimeoutWarningLine,
+  installAdSettings,
+  resetAdSettingsForTests,
+  type AdSettingsInEffect,
+} from '../src/ad-settings.ts'
+import { writeAgentDirectorConfig } from './test-helpers/ad-settings.ts'
 import {
   _resetFindMissingMemo,
   _setFindMissingMemoTtlMs,
@@ -45,11 +65,17 @@ import {
   setSessionNotifier,
   spawnForPersona,
 } from '../src/session-manager.ts'
-import type { FindMissingParams, ReadPaneParams, SendKeysParams, StatusParams } from 'agent-director'
-import { MCP_SERVER_NAME, type Persona, type PersonaConfig } from '../src/config.ts'
+import type { ClientOptions, FindMissingParams, ReadPaneParams, SendKeysParams, StatusParams } from 'agent-director'
+import {
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MCP_SERVER_NAME,
+  type Persona,
+  type PersonaConfig,
+} from '../src/config.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
-import { makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
+import { makePersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import {
   APP_TOKEN_PREFIX,
   LEAK_SENTINEL,
@@ -1310,5 +1336,114 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.findMissingCalls).toHaveLength(1)
       expect(raised.map((n) => n.key)).toEqual(['C1', 'C1'])
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// _runCallTimeoutStartStep: the persona client's call timeout and the startup
+// warning (b.jg5 SRJ-213)
+// ---------------------------------------------------------------------------
+
+describe('_runCallTimeoutStartStep (b.jg5 SRJ-213)', () => {
+  /** A stub client whose close() counts its calls. */
+  function countingStub(): { client: StubClient; closes: () => number } {
+    let closes = 0
+    const client: StubClient = { ...makeStubClient(), close: () => { closes++ } }
+    return { client, closes: () => closes }
+  }
+
+  /** The values in effect at every default, injected. */
+  const atDefaults = (): AdSettingsInEffect => DEFAULT_AD_SETTINGS_IN_EFFECT
+
+  let gate: ReturnType<typeof countingStub>
+  let persona: ReturnType<typeof countingStub>
+  let built: ClientOptions[]
+  let logs: string[]
+  let startupErrors: string[]
+  let exits: number[]
+  let home: string | undefined
+
+  beforeEach(() => {
+    gate = countingStub()
+    persona = countingStub()
+    built = []
+    logs = []
+    startupErrors = []
+    exits = []
+    // The startup gate's client, installed before the step runs.
+    setClientForTests(gate.client as unknown as Client)
+  })
+
+  afterEach(() => {
+    resetClientForTests()
+    resetAdSettingsForTests()
+    if (home !== undefined) rmSync(home, { recursive: true, force: true })
+    home = undefined
+  })
+
+  /**
+   * Run the step with the production persona-client builder over a stub
+   * `createClient` (recording the options it is given) and recording
+   * startup-error and exit seams. `valuesInEffect` undefined keeps the
+   * production default (the installed reader's values).
+   */
+  function runStep(config: PersonaConfig, valuesInEffect: (() => AdSettingsInEffect) | undefined): Promise<void> {
+    const personaDeps: Partial<PersonaClientDeps> = {
+      createClient: makeStubCreateClient({ client: persona.client, calls: built }),
+      recordStartupError: (classLabel: string) => { startupErrors.push(classLabel) },
+      exit: ((code: number) => { exits.push(code) }) as PersonaClientDeps['exit'],
+    }
+    return _runCallTimeoutStartStep(config, {
+      buildPersonaClient: (callTimeoutMs) => buildPersonaClientOrExit(callTimeoutMs, personaDeps),
+      log: (line) => { logs.push(line) },
+      ...(valuesInEffect !== undefined ? { valuesInEffect } : {}),
+    })
+  }
+
+  /** The persona client was built once with `callTimeoutMs`, installed in place of the gate's client, which was closed once, and the start went on. */
+  function expectPersonaClientInstalled(callTimeoutMs: number): void {
+    expect(built.map((opts) => opts.callTimeoutMs)).toEqual([callTimeoutMs])
+    expect(getClient()).toBe(persona.client as unknown as Client)
+    expect(gate.closes()).toBe(1)
+    expect(persona.closes()).toBe(0)
+    expect(startupErrors).toEqual([])
+    expect(exits).toEqual([])
+  }
+
+  test.each([
+    ['a configured agent_director_call_timeout_ms', { agent_director_call_timeout_ms: MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS }, MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS],
+    ['the default configuration (and no warning at the default settings)', {}, DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS],
+  ] as const)('with %s, the persona client carries that callTimeoutMs and replaces the gate client', async (_label, overrides, expected) => {
+    await expect(runStep(makePersonaConfig(overrides), atDefaults)).resolves.toBeUndefined()
+
+    expectPersonaClientInstalled(expected)
+    expect(logs).toEqual([])
+  })
+
+  test('a setting below the need at the defaults writes exactly one warning line, and the step still builds the client with that setting and resolves with no exit and no startup error', async () => {
+    const belowNeed = Number(adCallTimeoutNeed(DEFAULT_AD_SETTINGS_IN_EFFECT).needMs - 1n)
+    const expectedLine = buildAdCallTimeoutWarningLine(belowNeed, DEFAULT_AD_SETTINGS_IN_EFFECT)
+    expect(expectedLine).toBeDefined()
+
+    await expect(
+      runStep(makePersonaConfig({ agent_director_call_timeout_ms: belowNeed }), atDefaults),
+    ).resolves.toBeUndefined()
+
+    expect(logs).toEqual([expectedLine!])
+    expectPersonaClientInstalled(belowNeed)
+  })
+
+  test("by default the check reads the values the startup read left in effect: [pause] timeout_seconds 60 puts the default setting at or below its need, so the step warns once", async () => {
+    home = mkdtempSync(join(tmpdir(), 'cscb-call-timeout-step-'))
+    writeAgentDirectorConfig(home, { pauseTimeout: 60n })
+    const readerLogs: string[] = []
+    installAdSettings({ home: () => home!, log: (line) => { readerLogs.push(line) } })
+    const expectedLine = buildAdCallTimeoutWarningLine(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, adSettingsInEffect())
+    expect(expectedLine).toBeDefined()
+
+    await expect(runStep(makePersonaConfig(), undefined)).resolves.toBeUndefined()
+
+    expect(logs).toEqual([expectedLine!])
+    expectPersonaClientInstalled(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS)
   })
 })

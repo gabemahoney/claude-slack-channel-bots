@@ -8,7 +8,11 @@
  * settings module. Then the waits derived from the values in effect
  * (b.jg5 SRJ-210, AC 80): G, the alert threshold and B, their accessors at
  * check time, the never-early wait helper beyond the timer maximum and with
- * a getter it reads again at every fire, and whole-minute rendering.
+ * a getter it reads again at every fire, and whole-minute rendering. Then
+ * agent-director's verb ceilings, the call timeout's need and the startup
+ * check that warns when `agent_director_call_timeout_ms` does not exceed it
+ * (b.jg5 SRJ-213, AC 80): each ceiling against its formula written out here,
+ * the need, and the check's one line through a capturing log sink.
  *
  * Every config file is written by `writeAgentDirectorConfig`
  * (`tests/test-helpers/ad-settings.ts`, b.jg5 SRJ-1304) under a
@@ -35,7 +39,12 @@ import { join } from 'node:path'
 
 import {
   AD_ALERT_THRESHOLD_ADDEND_SECONDS,
+  AD_CALL_TIMEOUT_NEED_MARGIN_MS,
+  AD_CEILING_VERBS,
   AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS,
+  AD_LAUNCH_CEILING_VERBS,
+  AD_PAUSE_TABLE,
+  AD_PAUSE_TIMEOUT_KEY,
   AD_SETTING_INTEGER_MAX,
   AD_SETTINGS_LOG_PREFIX,
   AD_SETTINGS_RELATIVE_PATH,
@@ -44,13 +53,16 @@ import {
   AD_WAIT_NEVER_ENDS,
   adAlertThresholdMs,
   adAlertThresholdMsInEffect,
+  adCallTimeoutNeed,
   adGraceMs,
   adGraceMsInEffect,
   adLaunchBoundMs,
   adLaunchBoundMsInEffect,
   adSettingsInEffect,
+  adVerbCeilingsMs,
   armNeverEarlyWait,
   buildAdSettingsRefusedReadLine,
+  checkAdCallTimeoutAtStartup,
   createAdSettingsReader,
   DEFAULT_AD_SETTINGS_IN_EFFECT,
   DIALOG_READY_TIMEOUT_MS,
@@ -59,6 +71,7 @@ import {
   productionAdSettingsHome,
   resetAdSettingsForTests,
   wholeMinutes,
+  type AdCeilingVerb,
   type AdSettingsInEffect,
   type AdSettingsReader,
   type AdSettingsReadOutcome,
@@ -71,9 +84,17 @@ import {
   AD_VERSION_RECHECK_INTERVAL_MS,
   disposeAdVersionRecheck,
   installAdVersionRecheck,
+  PHASE1_RUNBOOK_SECTION_TITLE,
   resetAdVersionRecheckForTests,
 } from '../src/ad-version-gate.ts'
-import { CONFIG_NOT_REGULAR_FILE_CODE, MAX_RELOAD_FILE_BYTES, MAX_RELOAD_FILE_SIZE_TEXT, type PersonaConfigFs } from '../src/config.ts'
+import {
+  CONFIG_NOT_REGULAR_FILE_CODE,
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MAX_RELOAD_FILE_BYTES,
+  MAX_RELOAD_FILE_SIZE_TEXT,
+  type PersonaConfigFs,
+  type ServerSettings,
+} from '../src/config.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
 import {
   AD_SETTING_MINIMUMS,
@@ -1452,7 +1473,319 @@ describe('ad settings: whole minutes, rounded down', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SRD pins: SRJ-209's and SRJ-210's numbers against the exports
+// The verb ceilings (SRJ-213; ADSRD SR-13.2)
+// ---------------------------------------------------------------------------
+
+/** One fresh read of `input` under a new temp HOME: the values in effect after it, which must be accepted. */
+function acceptedValuesOfFile(input: AdConfigInput): AdSettingsInEffect {
+  const rig = makeReaderRig()
+  rig.write(input)
+  expect(rig.read().kind).toBe('accepted')
+  return rig.reader.valuesInEffect()
+}
+
+/** The larger of a list of exact values. */
+function maxOf(values: readonly bigint[]): bigint {
+  return values.reduce((largest, value) => (value > largest ? value : largest))
+}
+
+/**
+ * A verb's ceiling paths (ADSRD SR-13.2), written out here from the record's
+ * Q, A, C, W, E and B; the ceiling is the largest path. `pause` counts its
+ * wait only when `[pause] timeout_seconds` is used.
+ */
+function ceilingPaths(verb: AdCeilingVerb, values: AdSettingsInEffect): bigint[] {
+  const {
+    query_timeout_ms: q,
+    action_timeout_ms: a,
+    create_timeout_ms: c,
+    pipe_close_wait_ms: w,
+    kill_exit_wait_ms: e,
+    sweep_budget_seconds: b,
+  } = values.tmux
+  const pauseWaitMs = values.pauseTimeout.kind === 'used' ? values.pauseTimeout.seconds * MS_PER_SECOND : 0n
+  switch (verb) {
+    case 'kill':
+      return [2n * q + 2n * a + e + 4n * w, 3n * q + 2n * a + 5n * w]
+    case 'read-pane':
+      return [3n * q + a + 4n * w]
+    case 'send-keys':
+      return [3n * q + 2n * a + 5n * w]
+    case 'pause':
+      return [3n * q + 2n * a + 5n * w + pauseWaitMs]
+    case 'resume':
+    case 'spawn-with-reuse':
+    case 'plain-spawn':
+      return [q + c + 2n * a + 4n * w, 2n * q + c + 3n * w]
+    case 'find-missing':
+    case 'expire':
+      return [b * MS_PER_SECOND + q + w]
+  }
+}
+
+/** A verb's ceiling by the formula written out here. */
+function formulaCeiling(verb: AdCeilingVerb, values: AdSettingsInEffect): bigint {
+  return maxOf(ceilingPaths(verb, values))
+}
+
+const CEILING_VERBS: readonly AdCeilingVerb[] = AD_CEILING_VERBS.map(({ verb }) => verb)
+/** The verbs CSCB calls: every verb but `expire` (pinned below). */
+const CSCB_CEILING_VERBS: readonly AdCeilingVerb[] = AD_CEILING_VERBS.filter(({ cscbCalls }) => cscbCalls).map(({ verb }) => verb)
+
+/** The need by the formula written out here: the largest ceiling among the verbs CSCB calls, plus the margin. */
+function formulaNeed(values: AdSettingsInEffect): bigint {
+  return maxOf(CSCB_CEILING_VERBS.map((verb) => formulaCeiling(verb, values))) + AD_CALL_TIMEOUT_NEED_MARGIN_MS
+}
+
+/**
+ * A query timeout above both E - W and 2A + W, so each two-path verb's second
+ * path is the larger: derived from the defaults, never typed.
+ */
+const RAISED_QUERY_TIMEOUT_MS = DEFAULT_TMUX.kill_exit_wait_ms + 2n * DEFAULT_TMUX.action_timeout_ms + DEFAULT_TMUX.pipe_close_wait_ms
+const RAISED_QUERY_IN_EFFECT = inEffect(tmuxWith({ query_timeout_ms: RAISED_QUERY_TIMEOUT_MS }))
+
+/** SRJ-213's worked inputs: `create_timeout_ms` 40000 with the grace period at the minimum it gives (61), and a pause wait of 60. */
+const WORKED_CREATE_TIMEOUT_MS = 40000n
+const WORKED_TMUX = {
+  create_timeout_ms: WORKED_CREATE_TIMEOUT_MS,
+  pending_grace_seconds: pendingGraceMinimumSeconds(WORKED_CREATE_TIMEOUT_MS, DEFAULT_TMUX.pipe_close_wait_ms),
+}
+const WORKED_PAUSE_SECONDS = 60n
+
+const TWO_PATH_VERBS: readonly AdCeilingVerb[] = ['kill', 'resume', 'spawn-with-reuse', 'plain-spawn']
+
+describe('ad settings: the verb ceilings (b.jg5 SRJ-213)', () => {
+  test.each(CEILING_VERBS.map((verb) => [verb]))('%s: its ceiling equals its formula at the defaults, with Q raised and with every value changed', (verb) => {
+    const valueSets = [DEFAULT_AD_SETTINGS_IN_EFFECT, RAISED_QUERY_IN_EFFECT, CHANGED_IN_EFFECT]
+    expect(valueSets.map((values) => adVerbCeilingsMs(values)[verb])).toEqual(valueSets.map((values) => formulaCeiling(verb, values)))
+  })
+
+  test.each(TWO_PATH_VERBS.map((verb) => [verb]))('%s: its first path sets the ceiling at the defaults, its second path with Q raised', (verb) => {
+    const [firstAtDefaults, secondAtDefaults] = ceilingPaths(verb, DEFAULT_AD_SETTINGS_IN_EFFECT)
+    const [firstRaised, secondRaised] = ceilingPaths(verb, RAISED_QUERY_IN_EFFECT)
+    expect([firstAtDefaults! > secondAtDefaults!, secondRaised! > firstRaised!]).toEqual([true, true])
+    expect([adVerbCeilingsMs(DEFAULT_AD_SETTINGS_IN_EFFECT)[verb], adVerbCeilingsMs(RAISED_QUERY_IN_EFFECT)[verb]]).toEqual([firstAtDefaults!, secondRaised!])
+  })
+
+  test.each<[string, AdSettingsInEffect, bigint]>([
+    ['the default wait', DEFAULT_AD_SETTINGS_IN_EFFECT, DEFAULT_PAUSE_SECONDS * MS_PER_SECOND],
+    ['a wait of 60', inEffect(DEFAULT_TMUX, WORKED_PAUSE_SECONDS), WORKED_PAUSE_SECONDS * MS_PER_SECOND],
+    ['an unused value (0): no wait', { tmux: DEFAULT_TMUX, pauseTimeout: { kind: 'not-used', found: String(0n) } }, 0n],
+  ])("pause is send-keys' ceiling plus [pause] timeout_seconds: %s", (_label, values, waitMs) => {
+    const ceilings = adVerbCeilingsMs(values)
+    expect(ceilings.pause - ceilings['send-keys']).toBe(waitMs)
+  })
+
+  test.each<[string, AdSettingsInEffect]>([
+    ['at the defaults', DEFAULT_AD_SETTINGS_IN_EFFECT],
+    ['with Q raised', RAISED_QUERY_IN_EFFECT],
+    ['with create_timeout_ms 40000', inEffect(tmuxWith(WORKED_TMUX))],
+  ])("a plain spawn's ceiling, and a reuse's, equals resume's %s", (_label, values) => {
+    const ceilings = adVerbCeilingsMs(values)
+    expect([ceilings['spawn-with-reuse'], ceilings['plain-spawn']]).toEqual([ceilings.resume, ceilings.resume])
+  })
+
+  test('expire is the one verb CSCB does not call, so it never sets the need', () => {
+    expect(AD_CEILING_VERBS.filter(({ cscbCalls }) => !cscbCalls).map(({ verb }) => verb)).toEqual(['expire'])
+  })
+
+  test('the launch row the warning line names is resume, spawn-with-reuse and plain-spawn, in that order', () => {
+    expect(AD_LAUNCH_CEILING_VERBS).toEqual(['resume', 'spawn-with-reuse', 'plain-spawn'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The need (SRJ-213: the largest ceiling among the verbs CSCB calls, plus the margin)
+// ---------------------------------------------------------------------------
+
+/** A sweep budget whose ceiling is above every other ceiling at the defaults: derived, never typed. */
+const SWEEP_LARGEST_SECONDS = maxOf(CSCB_CEILING_VERBS.map((verb) => formulaCeiling(verb, DEFAULT_AD_SETTINGS_IN_EFFECT))) / MS_PER_SECOND + 1n
+
+/** The four unused forms of `[pause] timeout_seconds` SRJ-213's check names (0 is the SRD's worked input). */
+const UNUSED_PAUSE_FORMS: readonly (readonly [string, AdConfigValue])[] = [
+  ['0', 0n],
+  ['a negative value', -CHANGED_PAUSE_SECONDS],
+  ['a string', String(CHANGED_PAUSE_SECONDS)],
+  ['a float', Number(CHANGED_PAUSE_SECONDS)],
+]
+
+/** `values`' unused pause description; fails the case when the pause value is used. */
+function unusedPauseFound(values: AdSettingsInEffect): string {
+  expect(values.pauseTimeout.kind).toBe('not-used')
+  return values.pauseTimeout.kind === 'not-used' ? values.pauseTimeout.found : ''
+}
+
+describe('ad settings: the call timeout need (b.jg5 SRJ-213)', () => {
+  test.each<[string, () => AdSettingsInEffect, AdCeilingVerb]>([
+    ['at the defaults (no file): pause', () => acceptedValuesOfFile({}), 'pause'],
+    [
+      'create_timeout_ms 40000 and pending_grace_seconds 61, read from the file: resume, whose launch ceiling a reuse and a plain spawn share',
+      () => acceptedValuesOfFile({ tmux: WORKED_TMUX }),
+      'resume',
+    ],
+    ['[pause] timeout_seconds 60, read from the file: pause, with the larger wait', () => acceptedValuesOfFile({ pauseTimeout: WORKED_PAUSE_SECONDS }), 'pause'],
+    ["the sweep's ceiling the largest: find-missing, never expire", () => acceptedValuesOfFile({ tmux: { sweep_budget_seconds: SWEEP_LARGEST_SECONDS } }), 'find-missing'],
+  ])('%s sets it', (_label, valuesOf, verb) => {
+    const values = valuesOf()
+    const need = adCallTimeoutNeed(values)
+    expect(need).toEqual({ needMs: formulaCeiling(verb, values) + AD_CALL_TIMEOUT_NEED_MARGIN_MS, setBy: { kind: 'verb', verb } })
+    expect(need.needMs).toBe(formulaNeed(values))
+  })
+
+  test.each(UNUSED_PAUSE_FORMS)('[pause] timeout_seconds %s, read from the file: the unused value sets it, and pause counts without a wait', (_label, pauseTimeout) => {
+    const values = acceptedValuesOfFile({ pauseTimeout })
+    expect(adCallTimeoutNeed(values)).toEqual({ needMs: formulaNeed(values), setBy: { kind: 'unused-pause-value', found: unusedPauseFound(values) } })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The startup call-timeout check (SRJ-213: one warning line, never a refusal)
+// ---------------------------------------------------------------------------
+
+/** The setting the check sizes, typed against the configuration. */
+const CALL_TIMEOUT_SETTING = 'agent_director_call_timeout_ms' satisfies keyof ServerSettings
+
+/** What one check wrote to a capturing log sink, and what it answered. */
+interface CheckRun {
+  readonly lines: string[]
+  readonly returned: string | undefined
+}
+
+function runCheck(callTimeoutMs: number, values: AdSettingsInEffect): CheckRun {
+  const lines: string[] = []
+  const returned = checkAdCallTimeoutAtStartup(callTimeoutMs, { log: (line) => { lines.push(line) }, valuesInEffect: () => values })
+  return { lines, returned }
+}
+
+/** The ceiling `line` names, as written (`pause`, or `resume/spawn-with-reuse/plain-spawn`), or `undefined` when it names none. */
+function namedCeiling(line: string): string | undefined {
+  return /\(the (\S+) ceiling plus/.exec(line)?.[1]
+}
+
+/** Asserts `run` wrote exactly one line, answered it, and that it names the setting, its value, the need and the runbook; answers the line. */
+function oneLine(run: CheckRun, callTimeoutMs: number, needMs: bigint): string {
+  expect(run.lines).toHaveLength(1)
+  const line = run.lines[0]!
+  expect(run.returned).toBe(line)
+  expect(line.startsWith(`${AD_SETTINGS_LOG_PREFIX} ${CALL_TIMEOUT_SETTING} is ${callTimeoutMs}`)).toBe(true)
+  expect(line).toContain(`${needMs} ms`)
+  expect(line).toContain(`"${PHASE1_RUNBOOK_SECTION_TITLE}"`)
+  return line
+}
+
+/** Asserts `run` wrote exactly one line naming the ceiling `ceiling` and the margin; answers the line. */
+function expectVerbLine(run: CheckRun, callTimeoutMs: number, needMs: bigint, ceiling: string): string {
+  const line = oneLine(run, callTimeoutMs, needMs)
+  expect(namedCeiling(line)).toBe(ceiling)
+  expect(line).toContain(`${AD_CALL_TIMEOUT_NEED_MARGIN_MS} ms`)
+  return line
+}
+
+/** Asserts `run` wrote exactly one line naming the unused pause value and no ceiling. */
+function expectUnusedPauseLine(run: CheckRun, callTimeoutMs: number, needMs: bigint, found: string): void {
+  const line = oneLine(run, callTimeoutMs, needMs)
+  expect(line).toContain(`[${AD_PAUSE_TABLE}] ${AD_PAUSE_TIMEOUT_KEY} holds ${found},`)
+  expect(namedCeiling(line)).toBeUndefined()
+  expect(CEILING_VERBS.filter((verb) => line.includes(`the ${verb} ceiling`))).toEqual([])
+}
+
+/** Runs `body` with `process.exit`, `setTimeout` and `setInterval` spied; answers how often each was called. */
+function withExitAndTimersSpied(body: () => void): { exit: number; setTimeout: number; setInterval: number } {
+  const exit = spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+  const timeout = spyOn(globalThis, 'setTimeout')
+  const interval = spyOn(globalThis, 'setInterval')
+  try {
+    body()
+    return { exit: exit.mock.calls.length, setTimeout: timeout.mock.calls.length, setInterval: interval.mock.calls.length }
+  } finally {
+    for (const spy of [exit, timeout, interval]) spy.mockRestore()
+  }
+}
+
+describe('ad settings: the startup call-timeout check (b.jg5 SRJ-213)', () => {
+  test('at the defaults the imported default gives no line', () => {
+    expect(runCheck(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, DEFAULT_AD_SETTINGS_IN_EFFECT)).toEqual({ lines: [], returned: undefined })
+  })
+
+  test.each<[string, bigint, boolean]>([
+    ['1 ms below the need', -1n, true],
+    ['equal to the need', 0n, true],
+    ['1 ms above the need', 1n, false],
+  ])('at the defaults, a setting %s: one line naming pause, or none above it', (_label, offset, warns) => {
+    const { needMs } = adCallTimeoutNeed(DEFAULT_AD_SETTINGS_IN_EFFECT)
+    const setting = Number(needMs + offset)
+    const run = runCheck(setting, DEFAULT_AD_SETTINGS_IN_EFFECT)
+    if (warns) expectVerbLine(run, setting, needMs, 'pause')
+    else expect(run).toEqual({ lines: [], returned: undefined })
+  })
+
+  test('create_timeout_ms 40000 and pending_grace_seconds 61 with the default setting: one line naming the launch row by all three verbs, never resume alone', () => {
+    const values = acceptedValuesOfFile({ tmux: WORKED_TMUX })
+    const { needMs, setBy } = adCallTimeoutNeed(values)
+    expect(setBy).toEqual({ kind: 'verb', verb: 'resume' })
+    expect(BigInt(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS) <= needMs).toBe(true)
+    const line = expectVerbLine(runCheck(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, values), DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, needMs, AD_LAUNCH_CEILING_VERBS.join('/'))
+    expect(line).not.toContain('the resume ceiling')
+  })
+
+  test.each(UNUSED_PAUSE_FORMS)('[pause] timeout_seconds %s: exactly one line naming the unused value, above the need and at it', (_label, pauseTimeout) => {
+    const values = acceptedValuesOfFile({ pauseTimeout })
+    const found = unusedPauseFound(values)
+    const { needMs } = adCallTimeoutNeed(values)
+    expect(BigInt(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS) > needMs).toBe(true)
+    for (const setting of [DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, Number(needMs)]) {
+      expectUnusedPauseLine(runCheck(setting, values), setting, needMs, found)
+    }
+  })
+
+  test.each<[string, AdConfigInput]>([
+    ['a line naming a verb', { tmux: WORKED_TMUX }],
+    ['a line naming an unused pause value', { pauseTimeout: 0n }],
+  ])('%s, on the installed values: nothing thrown, no exit, no value changed, no timer, nothing run at the 120 s ticks', async (_label, initial) => {
+    const rig = makeTickRig({ initial })
+    const before = adSettingsInEffect()
+    const { needMs } = adCallTimeoutNeed(before)
+    const pendingBefore = rig.clock.pendingCount()
+    const lines: string[] = []
+    const calls = withExitAndTimersSpied(() => {
+      for (const setting of [DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, Number(needMs)]) {
+        expect(() => checkAdCallTimeoutAtStartup(setting, { log: (line) => { lines.push(line) } })).not.toThrow()
+      }
+    })
+    expect(calls).toEqual({ exit: 0, setTimeout: 0, setInterval: 0 })
+    expect(lines).toHaveLength(2)
+    expect(adSettingsInEffect()).toBe(before)
+    expect([rig.readCount(), rig.clock.pendingCount()]).toEqual([1, pendingBefore])
+    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * 2)
+    expect(rig.readCount()).toBe(3)
+    expect(lines).toHaveLength(2)
+    disposeAdVersionRecheck()
+  })
+
+  test('a log sink that throws, or values that cannot be read, never make the check throw', () => {
+    const { needMs } = adCallTimeoutNeed(DEFAULT_AD_SETTINGS_IN_EFFECT)
+    const setting = Number(needMs)
+    const expected = runCheck(setting, DEFAULT_AD_SETTINGS_IN_EFFECT)
+    expect(expected.lines).toHaveLength(1)
+    const throwingLog = { log: () => { throw new Error('stub log sink failure') }, valuesInEffect: () => DEFAULT_AD_SETTINGS_IN_EFFECT }
+    expect(checkAdCallTimeoutAtStartup(setting, throwingLog)).toBe(expected.lines[0]!)
+    const lines: string[] = []
+    const throwingValues = { log: (line: string) => { lines.push(line) }, valuesInEffect: (): AdSettingsInEffect => { throw new Error('stub values failure') } }
+    expect(checkAdCallTimeoutAtStartup(setting, throwingValues)).toBeUndefined()
+    expect(lines).toEqual([])
+  })
+
+  test('a [pause] string value holding a fake token: the line names its kind and holds no token', () => {
+    const values = acceptedValuesOfFile({ pauseTimeout: fakeToken(BOT_TOKEN_PREFIX, 'call-timeout') })
+    const found = unusedPauseFound(values)
+    const run = runCheck(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, values)
+    expectUnusedPauseLine(run, DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, adCallTimeoutNeed(values).needMs, found)
+    assertNoLeak({ run, values })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRD pins: SRJ-209's, SRJ-210's and SRJ-213's numbers against the exports
 // ---------------------------------------------------------------------------
 
 /** One fresh read of a file with `tmux`, under a new temp HOME: its outcome's kind. */
@@ -1462,7 +1795,10 @@ function readKindOf(tmux: Readonly<Partial<Record<AdTmuxKey, AdConfigValue>>>): 
   return rig.read().kind
 }
 
-describe('ad settings: SRD pins (b.jg5 SRJ-209, SRJ-210)', () => {
+/** The ceilings at the defaults. */
+const defaultCeilings = (): ReturnType<typeof adVerbCeilingsMs> => adVerbCeilingsMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
+
+describe('ad settings: SRD pins (b.jg5 SRJ-209, SRJ-210, SRJ-213)', () => {
   test.each<[string, () => unknown, unknown]>([
     ['the settings file path', () => AD_SETTINGS_RELATIVE_PATH, join('.agent-director', 'config.toml')],
     [
@@ -1511,6 +1847,28 @@ describe('ad settings: SRD pins (b.jg5 SRJ-209, SRJ-210)', () => {
     ['359 s in whole minutes', () => wholeMinutes(359_000), 5],
     ['180 s in whole minutes', () => wholeMinutes(180_000), 3],
     ['59.999 s in whole minutes', () => wholeMinutes(59_999), 0],
+    ['the kill ceiling at the defaults: 12.4 s', () => defaultCeilings().kill, 12_400n],
+    ['the read-pane ceiling at the defaults: 6.9 s', () => defaultCeilings()['read-pane'], 6_900n],
+    ['the send-keys ceiling at the defaults: 9 s', () => defaultCeilings()['send-keys'], 9_000n],
+    ['the pause ceiling at the defaults: 9 s plus 30 s', () => defaultCeilings().pause, 39_000n],
+    [
+      'the resume, reuse and plain-spawn ceiling at the defaults: 10.9 s',
+      () => [defaultCeilings().resume, defaultCeilings()['spawn-with-reuse'], defaultCeilings()['plain-spawn']],
+      [10_900n, 10_900n, 10_900n],
+    ],
+    ['the find-missing and expire ceiling at the defaults: 16.6 s', () => [defaultCeilings()['find-missing'], defaultCeilings().expire], [16_600n, 16_600n]],
+    ["the need's margin: 15 s", () => AD_CALL_TIMEOUT_NEED_MARGIN_MS, 15_000n],
+    ['the need at the defaults: 54 s, set by pause', () => adCallTimeoutNeed(DEFAULT_AD_SETTINGS_IN_EFFECT), { needMs: 54_000n, setBy: { kind: 'verb', verb: 'pause' } }],
+    [
+      'the need with create_timeout_ms 40000 and pending_grace_seconds 61: 60.9 s, set by the launch ceiling (resume)',
+      () => adCallTimeoutNeed(acceptedValuesOfFile({ tmux: { create_timeout_ms: 40000n, pending_grace_seconds: 61n } })),
+      { needMs: 60_900n, setBy: { kind: 'verb', verb: 'resume' } },
+    ],
+    [
+      'the need with [pause] timeout_seconds 60: 84 s, set by pause',
+      () => adCallTimeoutNeed(acceptedValuesOfFile({ pauseTimeout: 60n })),
+      { needMs: 84_000n, setBy: { kind: 'verb', verb: 'pause' } },
+    ],
   ])('%s', (_label, actual, expected) => {
     expect(actual()).toEqual(expected)
   })

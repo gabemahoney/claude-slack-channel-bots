@@ -13,7 +13,10 @@
  *      ErrSystemInstallTooOld (the client's own too-old refusal, below its
  *      minimum), ErrSystemInstallUnreachable; other throws surface verbatim.
  *      The factory resolves to a constructed Client (production injects
- *      `Client.create`).
+ *      `Client.create`). `opts` comes from `buildAdClientOptions`, the one
+ *      place the client options are built; `runStartupGate`'s
+ *      `callTimeoutMs` option sets the client's `callTimeoutMs` (b.jg5
+ *      SRJ-213), and without it no key is passed.
  *   3. CSCB's Phase 1 floor (b.jg5 SRJ-203)      — the client's
  *      `binaryVersion` (never its `version()` method, which reports the npm
  *      package's version) must pass `meetsPhase1Floor`; below the floor or
@@ -30,6 +33,14 @@
  *   4. stat ~/.agent-director/state.db           — compare st_uid to
  *      geteuid(). ENOENT passes (the row is created on first verb call);
  *      other stat errors are fatal.
+ *
+ * The persona client (b.jg5 SRJ-213): the server's gate runs before the
+ * configuration is read, so its client has the client's default call
+ * timeout. Once the start has resolved its configuration, the server builds a
+ * second client with the configured `agent_director_call_timeout_ms`
+ * (`buildPersonaClient`, exiting form `buildPersonaClientOrExit`): steps 2
+ * and 3 only, shared with the gate, then installed as the singleton in place
+ * of the gate's client, which is closed once.
  *
  * Each failure mode records to startup-errors.log + stderr via
  * recordStartupError, then exits non-zero. Every failure outcome carries a
@@ -58,6 +69,7 @@ import type { ClientOptions } from 'agent-director'
 import { makeFilteredAdLogger } from './agent-director-logger.ts'
 import { recordStartupError } from './startup-errors.ts'
 import {
+  closeClient as closeInstalledClient,
   DEFAULT_STORE_PATH,
   setClient,
   setClientForTests,
@@ -280,6 +292,25 @@ function mergeDeps(overrides?: Partial<StartupGateDeps>): StartupGateDeps {
   return overrides ? { ...prodDeps, ...overrides } : prodDeps
 }
 
+/**
+ * The options of every agent-director client CSCB builds: the store path,
+ * create-if-missing and the filtered logger (b.brv: AD's per-poll
+ * `SubprocessClient: <verb> ok` success dumps stay out of server.log at
+ * default verbosity; CSCB_AD_VERBOSE restores them; failures and warnings
+ * still pass through), plus `callTimeoutMs` when a call timeout is given
+ * (b.jg5 SRJ-213). With none, no `callTimeoutMs` key is set and the client
+ * uses its own default. The gate's client and the persona client differ only
+ * in that key. The 0.10.0 client fixes the timeout at construction.
+ */
+export function buildAdClientOptions(callTimeoutMs?: number): ClientOptions {
+  return {
+    storePath: DEFAULT_STORE_PATH,
+    createIfMissing: true,
+    logger: makeFilteredAdLogger(console),
+    ...(callTimeoutMs !== undefined ? { callTimeoutMs } : {}),
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Gate implementation
 // ---------------------------------------------------------------------------
@@ -329,6 +360,137 @@ export interface StartupGateOptions {
    * server's start and `clean_restart` always run the floor.
    */
   skipPhase1Floor?: boolean
+  /**
+   * The call timeout, in milliseconds, the gate's client is built with, as
+   * its `callTimeoutMs` (b.jg5 SRJ-213). Absent, no `callTimeoutMs` is passed
+   * and the client uses its own default. The CLI passes the configured value
+   * (it reads its configuration first); the server's gate, run before the
+   * configuration is read, passes none (its version probe may use the
+   * client's default) and later replaces its client with the persona client
+   * ({@link buildPersonaClient}).
+   */
+  callTimeoutMs?: number
+}
+
+/** A failed gate outcome. */
+export type StartupGateFailure = Extract<StartupGateOutcome, { ok: false }>
+
+/**
+ * A construction failure (step 2) as the gate's outcome: the typed catches
+ * for ErrBunVersionTooOld, ErrSystemInstallNotFound, ErrSystemInstallTooOld
+ * and ErrSystemInstallUnreachable, and any other throw as
+ * `ad-client-construct` with its message. Shared by the gate and the persona
+ * client ({@link buildPersonaClient}), so both fail with one label and one
+ * message per cause.
+ */
+function constructFailure(err: unknown): StartupGateFailure {
+  if (err instanceof ErrBunVersionTooOld) {
+    return {
+      ok: false,
+      phase: 'construct',
+      refusalKind: REFUSAL_KIND_OTHER,
+      classLabel: 'ad-bun-version-too-old',
+      message:
+        `agent-director requires Bun >= 1.0.21 but the running runtime is older. ` +
+        `Upgrade Bun (https://bun.sh) and retry. Detail: ${err.errDescription}`,
+    }
+  }
+  if (err instanceof ErrSystemInstallNotFound) {
+    return {
+      ok: false,
+      phase: 'construct',
+      refusalKind: REFUSAL_KIND_OTHER,
+      classLabel: AD_SYSTEM_INSTALL_NOT_FOUND,
+      message:
+        `agent-director system install not found. The startup gate searched ` +
+        `the standard install path and PATH but did not locate the agent-director ` +
+        `binary. Install agent-director (system-wide) and retry.` +
+        renderInstallSkillInstructions(),
+    }
+  }
+  if (err instanceof ErrSystemInstallTooOld) {
+    return {
+      ok: false,
+      phase: 'construct',
+      refusalKind: REFUSAL_KIND_CLIENT_TOO_OLD,
+      classLabel: AD_SYSTEM_INSTALL_TOO_OLD,
+      message:
+        buildSystemInstallTooOldMessage({
+          foundVersion: err.actualVersion,
+          requiredVersion: err.requiredVersion,
+          binaryPath: err.binaryPath,
+        }) + renderInstallSkillInstructions(),
+    }
+  }
+  if (err instanceof ErrSystemInstallUnreachable) {
+    return {
+      ok: false,
+      phase: 'construct',
+      refusalKind: REFUSAL_KIND_OTHER,
+      classLabel: AD_SYSTEM_INSTALL_UNREACHABLE,
+      message:
+        `agent-director system install is unreachable. ` +
+        `Reason: ${err.reason}. ` +
+        `Binary at ${err.binaryPath} could not be invoked successfully. ` +
+        `Diagnose with the install-cscb skill or re-install agent-director.` +
+        renderInstallSkillInstructions(),
+    }
+  }
+  const detail = err instanceof Error ? err.message : String(err)
+  return {
+    ok: false,
+    phase: 'construct',
+    refusalKind: REFUSAL_KIND_OTHER,
+    classLabel: 'ad-client-construct',
+    message: `Unexpected error constructing agent-director Client. Detail: ${detail}`,
+  }
+}
+
+/**
+ * Step 2, shared by the gate and the persona client: build a client with
+ * {@link buildAdClientOptions} through `d.createClient`, and read its
+ * `binaryVersion` (populated during `Client.create()`'s version probe of the
+ * resolved system binary; never the client's `version()` method, whose field
+ * is the npm package's version). A throw becomes {@link constructFailure}'s
+ * outcome; nothing was built, so nothing is closed.
+ */
+async function constructClient(
+  d: StartupGateDeps,
+  callTimeoutMs: number | undefined,
+): Promise<{ ok: true; client: unknown; adVersion: string } | StartupGateFailure> {
+  let client: unknown
+  try {
+    client = await d.createClient(buildAdClientOptions(callTimeoutMs))
+  } catch (err) {
+    return constructFailure(err)
+  }
+  return { ok: true, client, adVersion: (client as { binaryVersion: string }).binaryVersion }
+}
+
+/**
+ * Step 3, shared by the gate and the persona client: CSCB's Phase 1 floor
+ * (b.jg5 SRJ-203) on a client that is not installed yet. `Client.create()`
+ * enforces only the client's own minimum, which sits below the floor and
+ * admits `0.0.0-dev`. Below the floor or unparseable: the client is closed
+ * once and the `ad-below-phase1-floor` outcome is answered; otherwise
+ * `undefined`.
+ */
+function refuseBelowPhase1Floor(d: StartupGateDeps, client: unknown, adVersion: string): StartupGateFailure | undefined {
+  if (meetsPhase1Floor(adVersion)) return undefined
+  // Read everything the message needs before closing the client, so the
+  // message never depends on a getter of a closed client.
+  const message = buildBelowPhase1FloorMessage({
+    foundVersion: adVersion,
+    binaryPath: (client as { binaryPath: string }).binaryPath,
+  })
+  d.closeClient(client)
+  return {
+    ok: false,
+    phase: 'version',
+    refusalKind: REFUSAL_KIND_BELOW_PHASE1_FLOOR,
+    classLabel: AD_BELOW_PHASE1_FLOOR,
+    message,
+  }
 }
 
 /**
@@ -351,103 +513,15 @@ export async function runStartupGate(
   const d = mergeDeps(deps)
 
   // Step 2: construct Client via async factory (Client.create in prod).
-  let client: unknown
-  try {
-    client = await d.createClient({
-      storePath: DEFAULT_STORE_PATH,
-      createIfMissing: true,
-      // b.brv: filter AD's per-poll `SubprocessClient: <verb> ok` success
-      // dumps out of server.log at default verbosity (CSCB_AD_VERBOSE
-      // restores them). Failures/warnings still pass through.
-      logger: makeFilteredAdLogger(console),
-    })
-  } catch (err) {
-    if (err instanceof ErrBunVersionTooOld) {
-      return {
-        ok: false,
-        phase: 'construct',
-        refusalKind: REFUSAL_KIND_OTHER,
-        classLabel: 'ad-bun-version-too-old',
-        message:
-          `agent-director requires Bun >= 1.0.21 but the running runtime is older. ` +
-          `Upgrade Bun (https://bun.sh) and retry. Detail: ${err.errDescription}`,
-      }
-    }
-    if (err instanceof ErrSystemInstallNotFound) {
-      return {
-        ok: false,
-        phase: 'construct',
-        refusalKind: REFUSAL_KIND_OTHER,
-        classLabel: AD_SYSTEM_INSTALL_NOT_FOUND,
-        message:
-          `agent-director system install not found. The startup gate searched ` +
-          `the standard install path and PATH but did not locate the agent-director ` +
-          `binary. Install agent-director (system-wide) and retry.` +
-          renderInstallSkillInstructions(),
-      }
-    }
-    if (err instanceof ErrSystemInstallTooOld) {
-      return {
-        ok: false,
-        phase: 'construct',
-        refusalKind: REFUSAL_KIND_CLIENT_TOO_OLD,
-        classLabel: AD_SYSTEM_INSTALL_TOO_OLD,
-        message:
-          buildSystemInstallTooOldMessage({
-            foundVersion: err.actualVersion,
-            requiredVersion: err.requiredVersion,
-            binaryPath: err.binaryPath,
-          }) + renderInstallSkillInstructions(),
-      }
-    }
-    if (err instanceof ErrSystemInstallUnreachable) {
-      return {
-        ok: false,
-        phase: 'construct',
-        refusalKind: REFUSAL_KIND_OTHER,
-        classLabel: AD_SYSTEM_INSTALL_UNREACHABLE,
-        message:
-          `agent-director system install is unreachable. ` +
-          `Reason: ${err.reason}. ` +
-          `Binary at ${err.binaryPath} could not be invoked successfully. ` +
-          `Diagnose with the install-cscb skill or re-install agent-director.` +
-          renderInstallSkillInstructions(),
-      }
-    }
-    const detail = err instanceof Error ? err.message : String(err)
-    return {
-      ok: false,
-      phase: 'construct',
-      refusalKind: REFUSAL_KIND_OTHER,
-      classLabel: 'ad-client-construct',
-      message: `Unexpected error constructing agent-director Client. Detail: ${detail}`,
-    }
-  }
-
-  // adVersion is sourced directly from the constructed Client: its
-  // `binaryVersion` getter is populated during `Client.create()`'s version
-  // probe of the resolved system binary. Never the client's `version()`
-  // method, whose field is the npm package's version.
-  const adVersion = (client as { binaryVersion: string }).binaryVersion
+  const built = await constructClient(d, options?.callTimeoutMs)
+  if (!built.ok) return built
+  const { client, adVersion } = built
 
   // Step 3: CSCB's Phase 1 floor (b.jg5 SRJ-203), before the client is
-  // installed as the singleton. `Client.create()` enforces only the client's
-  // own minimum, which sits below the floor and admits `0.0.0-dev`.
-  if (options?.skipPhase1Floor !== true && !meetsPhase1Floor(adVersion)) {
-    // Read everything the message needs before closing the client, so the
-    // message never depends on a getter of a closed client.
-    const message = buildBelowPhase1FloorMessage({
-      foundVersion: adVersion,
-      binaryPath: (client as { binaryPath: string }).binaryPath,
-    })
-    d.closeClient(client)
-    return {
-      ok: false,
-      phase: 'version',
-      refusalKind: REFUSAL_KIND_BELOW_PHASE1_FLOOR,
-      classLabel: AD_BELOW_PHASE1_FLOOR,
-      message,
-    }
+  // installed as the singleton.
+  if (options?.skipPhase1Floor !== true) {
+    const refusal = refuseBelowPhase1Floor(d, client, adVersion)
+    if (refusal !== undefined) return refusal
   }
 
   // Construction and the floor passed: install the live Client into the
@@ -559,7 +633,9 @@ export async function runStartupGate(
  * Production entry point: run the gate, log failures, exit non-zero on any
  * non-`ok` outcome. Returns the live `Client` and detected AD version on
  * success. It always runs the full gate, CSCB's Phase 1 floor included: it
- * offers no way to set `skipPhase1Floor`. A failure makes exactly one
+ * offers no way to set `skipPhase1Floor`, nor `callTimeoutMs` (the server
+ * runs it before its configuration is read, and replaces its client with
+ * {@link buildPersonaClientOrExit}'s once the start has resolved it). A failure makes exactly one
  * `recordStartupError` call (the server-log line and the startup-errors entry).
  *
  * Tests should call `runStartupGate(...)` directly so they can inspect the
@@ -574,6 +650,78 @@ export async function runAgentDirectorStartupGate(
     d.recordStartupError(outcome.classLabel, outcome.message)
     d.exit(1) // never returns; the cast below silences TS narrowing
     // unreachable; satisfies TS when exit() is mocked in tests
+    return { client: null, adVersion: '' }
+  }
+  return { client: outcome.client, adVersion: outcome.adVersion }
+}
+
+// ---------------------------------------------------------------------------
+// The persona client: the server's second client, with the call timeout
+// ---------------------------------------------------------------------------
+
+/** The seams of {@link buildPersonaClient} and {@link buildPersonaClientOrExit}. */
+export type PersonaClientDeps = Pick<StartupGateDeps, 'createClient' | 'closeClient' | 'recordStartupError' | 'exit'>
+
+/**
+ * Build the client the server makes its persona calls with, carrying
+ * `callTimeoutMs` (b.jg5 SRJ-213, SRJ-121), and install it as the singleton.
+ *
+ * Why a second client: the 0.10.0 client fixes `callTimeoutMs` at
+ * construction, and the server's gate builds its client before the start has
+ * read the configuration that holds the setting (SRJ-213 lets the gate's
+ * version probe use the client's default). Once the start has resolved its
+ * configuration, this builds a client with the configured value, through the
+ * gate's own construction ({@link buildAdClientOptions}, the same catches)
+ * and E2's Phase 1 floor on its `binaryVersion`. It repeats no API-surface
+ * probe and no same-user check: they cover the installed package and the
+ * store, which the gate has already checked in this process.
+ *
+ * On success the installed client (the gate's) is closed exactly once,
+ * through the singleton module's `closeClient`, and the new client is
+ * installed as the singleton in its place, with no await between the two. Every
+ * consumer reads the singleton at call time (`getClient()`), so nothing keeps
+ * the gate's client past the swap. On a construct failure or a floor refusal
+ * nothing is installed, the built client (if any) is closed, the gate's
+ * client stays in place, and the gate's own outcome (phase, refusal kind,
+ * class label and message) is answered.
+ */
+export async function buildPersonaClient(
+  callTimeoutMs: number,
+  deps?: Partial<PersonaClientDeps>,
+): Promise<{ ok: true; client: unknown; adVersion: string } | StartupGateFailure> {
+  const d = mergeDeps(deps)
+  const built = await constructClient(d, callTimeoutMs)
+  if (!built.ok) return built
+  const refusal = refuseBelowPhase1Floor(d, built.client, built.adVersion)
+  if (refusal !== undefined) return refusal
+
+  // The swap, with no await between its two steps: close the installed
+  // client (the gate's) once and clear the slot, then install the new one.
+  try {
+    closeInstalledClient()
+  } catch {
+    // close() never throws per the library contract; defensive in tests.
+  }
+  setClient(built.client as Client)
+  return built
+}
+
+/**
+ * Production form of {@link buildPersonaClient}, as
+ * {@link runAgentDirectorStartupGate} is of the gate: a failure makes exactly
+ * one `recordStartupError` call (the server-log line and the startup-errors
+ * entry) and exits non-zero. Returns the installed client and its version on
+ * success.
+ */
+export async function buildPersonaClientOrExit(
+  callTimeoutMs: number,
+  deps?: Partial<PersonaClientDeps>,
+): Promise<{ client: unknown; adVersion: string }> {
+  const d = mergeDeps(deps)
+  const outcome = await buildPersonaClient(callTimeoutMs, deps)
+  if (!outcome.ok) {
+    d.recordStartupError(outcome.classLabel, outcome.message)
+    d.exit(1) // never returns; the return below satisfies TS when exit() is mocked in tests
     return { client: null, adVersion: '' }
   }
   return { client: outcome.client, adVersion: outcome.adVersion }

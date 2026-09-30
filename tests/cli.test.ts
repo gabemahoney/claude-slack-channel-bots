@@ -58,6 +58,7 @@ import {
   StartupGateFailedError,
   createCli,
   createDirectorOps,
+  initProductionClient,
   type CliDeps,
   type DaemonSpawnOptions,
   type DirectorClient,
@@ -68,15 +69,20 @@ import {
   REFUSAL_KIND_BELOW_PHASE1_FLOOR,
   REFUSAL_KIND_CLIENT_TOO_OLD,
   REFUSAL_KIND_OTHER,
+  type StartupGateDeps,
   type StartupGateOptions,
   type StartupGateRefusalKind,
 } from '../src/agent-director-startup.ts'
+import { getClient, resetClientForTests } from '../src/agent-director-client.ts'
 import { buildBelowPhase1FloorMessage } from '../src/ad-version-gate.ts'
 import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_NOT_FOUND, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check.ts'
 import {
   CONFIG_NOT_REGULAR_FILE_CODE,
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   DEFAULT_PERSONA_CONFIG_FS,
   loadPersonaConfig,
+  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   prePersonaConversionMessage,
   resolveServerConfigPath,
   resolveServerStateDir,
@@ -97,6 +103,13 @@ import {
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import {
+  errSystemInstallNotFound,
+  errSystemInstallTooOld,
+  makeStubClient,
+  makeStubCreateClient,
+  type StubCreateClientOptions,
+} from './test-helpers/agent-director-stub.ts'
 import { OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import {
@@ -107,7 +120,9 @@ import {
 } from './test-helpers/persona-config.ts'
 import { reloadTermsIn } from './test-helpers/reload-terms.ts'
 import {
+  balancedAfter,
   callArguments,
+  callsOf,
   indicesOf,
   objectProperties,
   onlyCallArguments,
@@ -273,7 +288,8 @@ interface Overrides {
   spawnDaemonError?: Error
   /** Runs after the call is recorded; the default only records (console is never redirected). */
   initLogging?: (path: string) => void
-  initClient?: () => Promise<void>
+  /** Answers each `initClient` call, given the call timeout it received. */
+  initClient?: (callTimeoutMs: number) => Promise<void>
   directorStatus?: (id: string) => Promise<{ state: string } | null>
   directorPause?: (id: string) => Promise<void>
   directorKill?: (id: string) => Promise<void>
@@ -300,6 +316,7 @@ interface Bundle {
   killCalls: string[]
   serverSignals: string[]
   events: string[]
+  /** The call timeout each `initClient` call received, in call order (b.jg5 SRJ-213). */
   initClientCalls: number[]
   /** Each path `credentials` loaded the configuration file from. */
   configFileLoads: string[]
@@ -402,10 +419,10 @@ function makeDeps(o: Overrides = {}): Bundle {
     },
     ...(o.initClient
       ? {
-          initClient: async () => {
-            initClientCalls.push(initClientCalls.length)
+          initClient: async (callTimeoutMs: number) => {
+            initClientCalls.push(callTimeoutMs)
             events.push('initClient')
-            return o.initClient!()
+            return o.initClient!(callTimeoutMs)
           },
         }
       : {}),
@@ -689,16 +706,33 @@ describe('last-applied record (SR-8.7)', () => {
   const gammaId = (): string => personaInstanceId(personaKey(GAMMA.name))
 
   /**
+   * The call timeouts of APPLIED and EDITED (b.jg5 SRJ-213): the setting's
+   * two bounds, so each differs from the other and from the default.
+   */
+  const APPLIED_CALL_TIMEOUT_MS = MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS
+  const EDITED_CALL_TIMEOUT_MS = MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS
+
+  /**
    * The applied configuration: Alpha and Beta with the short timeouts. With
    * stop_timeout 0 a live server gets SIGKILL straight after SIGTERM; with
    * exit_timeout 0 a paused persona is killed at once. Reading the longer
    * values of EDITED instead shows up as no SIGKILL and no kill.
    */
   const APPLIED = (): PersonaConfigInput =>
-    makePersonaConfigInput({ personas: [makePersona(ALPHA, root), makePersona(BETA, root)], stop_timeout: 0, exit_timeout: 0 }, root)
+    makePersonaConfigInput({
+      personas: [makePersona(ALPHA, root), makePersona(BETA, root)],
+      stop_timeout: 0,
+      exit_timeout: 0,
+      agent_director_call_timeout_ms: APPLIED_CALL_TIMEOUT_MS,
+    }, root)
   /** The operator's edit, not yet applied: Beta removed, Gamma added, longer timeouts. */
   const EDITED = (): PersonaConfigInput =>
-    makePersonaConfigInput({ personas: [makePersona(ALPHA, root), makePersona(GAMMA, root)], stop_timeout: 5, exit_timeout: 5 }, root)
+    makePersonaConfigInput({
+      personas: [makePersona(ALPHA, root), makePersona(GAMMA, root)],
+      stop_timeout: 5,
+      exit_timeout: 5,
+      agent_director_call_timeout_ms: EDITED_CALL_TIMEOUT_MS,
+    }, root)
 
   /**
    * `record`: config.json.last-applied holds APPLIED and config.json holds
@@ -784,6 +818,36 @@ describe('last-applied record (SR-8.7)', () => {
       expect(startedServer(b)).toBe(true)
     }
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source})`)
+  })
+
+  // b.jg5 SRJ-213: the CLI's client carries the call timeout of the
+  // configuration the server runs, read before the client is built; with a
+  // record present, the record's, never the edited config.json's.
+  test.each([
+    ...SOURCES.map(([label, source]) => ['clean_restart', label, source, runCleanRestart] as const),
+    ...SOURCES.map(([label, source]) => ['stop --stop-bots', label, source, runStopBots] as const),
+  ])('%s: initClient gets the agent_director_call_timeout_ms of %s, once, after the configuration is read; teardown still runs', async (name, _label, source, run) => {
+    // Precondition: the three values differ, so any wrong source shows.
+    expect(new Set([APPLIED_CALL_TIMEOUT_MS, EDITED_CALL_TIMEOUT_MS, DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS]).size).toBe(3)
+    writeSource(source)
+    const b = makeDeps({
+      serverPid: 4242,
+      isProcessRunning: goneAfterFirstCheck(),
+      loadConfig: appliedLoader,
+      directorStatus: waitingThenEnded(),
+      initClient: async () => { /* gate ok */ },
+    })
+
+    await run(b)
+
+    expect(b.initClientCalls).toEqual([APPLIED_CALL_TIMEOUT_MS])
+    // Every configuration read comes before the client is built.
+    const init = b.events.indexOf('initClient')
+    expect(b.events.slice(0, init)).toContain('loadConfig')
+    expect(b.events.slice(init)).not.toContain('loadConfig')
+    expect([...b.killCalls].sort()).toEqual([alphaId(), betaId()].sort())
+    expect(b.exitCodes).toEqual(name === 'stop --stop-bots' ? [0] : [])
+    assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source}, call timeout)`)
   })
 
   const runStop = (b: Bundle): Promise<void> =>
@@ -898,9 +962,9 @@ describe('last-applied record (SR-8.7)', () => {
   /** `stop`'s one line for a stop_timeout read failure, before the loader's message. */
   const STOP_LOAD_FAILURE_PREFIX = '[slack] stop: could not load the applied configuration — using the default 30s stop_timeout: '
 
-  test('clean_restart with a malformed record: exit 1 naming the record with the deletion hint, no teardown, no fallback to config.json, never starts', async () => {
+  test('clean_restart with a malformed record: exit 1 naming the record with the deletion hint, no client built, no teardown, no fallback to config.json, never starts', async () => {
     writeMalformedRecord()
-    const b = makeDeps({ loadConfig: appliedLoader, directorStatus: waitingThenEnded() })
+    const b = makeDeps({ loadConfig: appliedLoader, directorStatus: waitingThenEnded(), initClient: async () => { /* gate ok */ } })
 
     await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
 
@@ -908,18 +972,20 @@ describe('last-applied record (SR-8.7)', () => {
     expect(stderr).toHaveLength(1)
     expect(stderr[0]!.startsWith('[slack] clean_restart: failed to load config:')).toBe(true)
     expect(stderr[0]).toContain(deletionHint())
+    expect(b.initClientCalls).toEqual([]) // b.jg5 SRJ-213: fatal before any client is built
     expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
     expect(b.spawnCalls).toEqual([])
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, 'clean_restart (malformed record)')
   })
 
-  test('stop --stop-bots with a malformed record: logs the record with the deletion hint, skips teardown (no fallback to config.json), still stops the server', async () => {
+  test('stop --stop-bots with a malformed record: logs the record with the deletion hint, builds its client with the default call timeout, skips teardown (no fallback to config.json), still stops the server', async () => {
     writeMalformedRecord()
     const b = makeDeps({
       serverPid: 4242,
       isProcessRunning: goneAfterFirstCheck(),
       loadConfig: appliedLoader,
       directorStatus: waitingThenEnded(),
+      initClient: async () => { /* gate ok */ },
     })
 
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
@@ -933,6 +999,8 @@ describe('last-applied record (SR-8.7)', () => {
     const stopLine = stderr.filter((l) => l.startsWith(STOP_LOAD_FAILURE_PREFIX))
     expect(stopLine).toHaveLength(1)
     expect(stopLine[0]).toContain(deletionHint())
+    // b.jg5 SRJ-213: the default, never the edited config.json's value.
+    expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
     expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, 'stop --stop-bots (malformed record)')
   })
@@ -1841,14 +1909,14 @@ describe('b.qwo — teardown fails loudly when agent-director is unreachable', (
 })
 
 describe('b.qwo — initClient startup gate', () => {
-  test('clean_restart calls initClient once, before any director verb', async () => {
+  test('clean_restart calls initClient once, with the configuration\'s call timeout, before any director verb', async () => {
     let n = 0
     const b = makeDeps({
       initClient: async () => { /* gate ok */ },
       directorStatus: async () => (++n === 1 ? { state: 'waiting' } : { state: 'ended' }),
     })
     await createCli(b.deps).clean_restart()
-    expect(b.initClientCalls).toEqual([0])
+    expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
     const initIdx = b.events.indexOf('initClient')
     const firstPause = b.events.findIndex((e) => e.startsWith('pause:'))
     expect(initIdx).toBeGreaterThanOrEqual(0)
@@ -1864,6 +1932,24 @@ describe('b.qwo — initClient startup gate', () => {
     expect(b.exitCodes).toContain(1)
     expect(startedServer(b)).toBe(false)
     expect(b.statusCalls).toEqual([])
+  })
+
+  // b.jg5 SRJ-213: an unreadable configuration still builds the client, with
+  // the default call timeout, after the failed read; teardown is skipped and
+  // the stop's exit code is unchanged.
+  test('stop --stop-bots whose configuration cannot be read: the read comes first, then initClient once with the default call timeout; teardown skipped, exit 0', async () => {
+    const b = makeStopDeps({
+      loadConfig: () => { throw new Error('config boom') },
+      initClient: async () => { /* gate ok */ },
+      directorStatus: async () => ({ state: 'waiting' }),
+    })
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expect(b.events.filter((e) => e === 'loadConfig' || e === 'initClient')).toEqual(['loadConfig', 'initClient'])
+    expect(stderr.filter((l) => l.startsWith('[slack] stop --stop-bots: could not load config — skipping bot teardown:'))).toHaveLength(1)
+    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.exitCodes).toEqual([0])
+    assertNoLeak({ stderr, exitCodes: b.exitCodes })
   })
 
   test('stop --stop-bots exits 1 when initClient throws', async () => {
@@ -1918,22 +2004,46 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
   })
 
-  test('production initClient runs the full startup gate, runStartupGate() with no argument (cli.ts never names the floor-exempt option), and throws StartupGateFailedError with the outcome\'s label, message and refusal kind (static; b.jg5 SRJ-203)', () => {
+  test('production initClient is initProductionClient, which runs the full startup gate: runStartupGate(gateDeps, { callTimeoutMs }) and no other option (cli.ts never names the floor-exempt option), and throws StartupGateFailedError with the outcome\'s label, message and refusal kind (static; b.jg5 SRJ-203, SRJ-213)', () => {
     const FLOOR_EXEMPT_OPTION: keyof StartupGateOptions = 'skipPhase1Floor'
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
-    const initClient = objectProperties(code.slice(code.indexOf('const realDeps: CliDeps ='))).get('initClient')
-    expect(initClient).toBeDefined()
-    expect(onlyCallArguments(initClient!, 'runStartupGate').trim()).toBe('')
     expect(indicesOf(new RegExp(`\\b${FLOOR_EXEMPT_OPTION}\\b`, 'g'), code)).toEqual([])
-    const outcome = initClient!.match(/\bconst\s+(\w+)\s*=\s*await\s+runStartupGate\s*\(/)?.[1]
+
+    // The one runStartupGate call in cli.ts is initProductionClient's, passing
+    // its gate seams and an options object holding only its call timeout.
+    const decl = indicesOf(/\bexport\s+async\s+function\s+initProductionClient\s*\(/g, code)
+    expect(decl).toHaveLength(1)
+    const params = splitTopLevel(callArguments(code, decl[0]!)).map((p) => p.match(/^(\w+)/)?.[1])
+    expect(params).toHaveLength(2)
+    const [timeoutParam, gateDepsParam] = params
+    const body = code.slice(...balancedAfter(code, decl[0]!, '{', '}'))
+    expect(callsOf(code, 'runStartupGate')).toHaveLength(1)
+    const gateArgs = splitTopLevel(onlyCallArguments(body, 'runStartupGate'))
+    expect(gateArgs).toHaveLength(2)
+    expect(gateArgs[0]).toBe(gateDepsParam!)
+    expect([...objectProperties(gateArgs[1]!)]).toEqual([['callTimeoutMs', timeoutParam!]])
+
+    const outcome = body.match(/\bconst\s+(\w+)\s*=\s*await\s+runStartupGate\s*\(/)?.[1]
     expect(outcome).toBeDefined()
-    const thrown = indicesOf(/\bnew\s+StartupGateFailedError\s*\(/g, initClient!)
+    const thrown = indicesOf(/\bnew\s+StartupGateFailedError\s*\(/g, body)
     expect(thrown).toHaveLength(1)
-    expect(splitTopLevel(callArguments(initClient!, thrown[0]!))).toEqual([
+    expect(splitTopLevel(callArguments(body, thrown[0]!))).toEqual([
       `${outcome}.classLabel`,
       `${outcome}.message`,
       `${outcome}.refusalKind`,
     ])
+
+    // The entry point's deps wire initClient to it, handing on the call
+    // timeout and no gate seams.
+    const main = indicesOf(/\bif\s*\(\s*import\.meta\.main\s*\)/g, code)
+    expect(main).toHaveLength(1)
+    const mainBlock = code.slice(...balancedAfter(code, main[0]!, '{', '}'))
+    const realDepsAt = mainBlock.indexOf('const realDeps: CliDeps =')
+    expect(realDepsAt).toBeGreaterThanOrEqual(0)
+    const initClient = objectProperties(mainBlock.slice(realDepsAt)).get('initClient')
+    const arrow = initClient?.match(/^\(\s*(\w+)\s*\)\s*=>\s*([\s\S]*)$/)
+    expect(arrow).toBeTruthy()
+    expect(arrow![2]).toBe(`initProductionClient(${arrow![1]})`)
   })
 
   test('an incomplete teardown (TeardownIncompleteError) prints its count and retry advice on the teardown-failed line; the underlying error, carrying fake tokens, is only described, its message redacted; exit 1; nothing logged leaks', async () => {
@@ -1986,6 +2096,61 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     expect(b.exitCodes).toEqual([1])
     expect(b.statusCalls).toEqual([])
     assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// initProductionClient — the production init over the start gate's stubbed
+// seams (b.jg5 SRJ-213); never a real agent-director client
+// ---------------------------------------------------------------------------
+
+describe('initProductionClient', () => {
+  type RecordedClientOptions = NonNullable<StubCreateClientOptions['calls']>
+
+  beforeEach(() => resetClientForTests())
+  afterEach(() => resetClientForTests())
+
+  /** Gate seams that pass every check after construction; `createClient` decides the build. */
+  const gateDeps = (createClient: StartupGateDeps['createClient']): Partial<StartupGateDeps> => ({
+    createClient,
+    probeGetPermission: () => true,
+    probeErrorCatalog: () => ({ ok: true as const }),
+    probeDecideArgv: async () => ({ ok: true as const }),
+    statSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) },
+    geteuid: () => 1000,
+    recordStartupError: () => {},
+    exit: (code) => { throw new ExitError(code) },
+  })
+
+  test('builds the client with the call timeout it is given and installs it as the singleton', async () => {
+    const calls: RecordedClientOptions = []
+    const client = makeStubClient()
+
+    await initProductionClient(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS, gateDeps(makeStubCreateClient({ client, calls })))
+
+    expect(calls.map((c) => c.callTimeoutMs)).toEqual([MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expect(getClient() as unknown).toBe(client)
+    assertNoLeak({ stderr })
+  })
+
+  test.each<[StartupGateRefusalKind, string, () => StubCreateClientOptions]>([
+    [REFUSAL_KIND_CLIENT_TOO_OLD, AD_SYSTEM_INSTALL_TOO_OLD, () => ({ error: errSystemInstallTooOld() })],
+    [REFUSAL_KIND_BELOW_PHASE1_FLOOR, AD_BELOW_PHASE1_FLOOR, () => ({ client: makeStubClient({ binaryVersion: OLD_AD_VERSION }) })],
+    [REFUSAL_KIND_OTHER, AD_SYSTEM_INSTALL_NOT_FOUND, () => ({ error: errSystemInstallNotFound() })],
+  ])('a gate refusal of kind %s (label %s): the client was built with the call timeout, the thrown StartupGateFailedError keeps that kind and label, and no client is installed', async (kind, label, stub) => {
+    const calls: RecordedClientOptions = []
+
+    const err = await initProductionClient(MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS, gateDeps(makeStubCreateClient({ ...stub(), calls })))
+      .then(() => undefined, (e: unknown) => e)
+
+    expect(calls.map((c) => c.callTimeoutMs)).toEqual([MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expect(err).toBeInstanceOf(StartupGateFailedError)
+    const gateError = err as StartupGateFailedError
+    expect(gateError.refusalKind).toBe(kind)
+    expect(gateError.classLabel).toBe(label)
+    expect(gateError.message.startsWith(`agent-director startup gate failed (${label}): `)).toBe(true)
+    expect(() => getClient()).toThrow()
+    assertNoLeak({ stderr, message: gateError.message })
   })
 })
 

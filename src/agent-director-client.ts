@@ -4,8 +4,8 @@
  *
  * Public API:
  *   - getClient(): Client                          — sync cached accessor for the singleton
- *   - setClient(client): void                       — install a pre-built Client (startup gate only)
- *   - closeClient(): void                           — idempotent shutdown for SR-11 Event 11
+ *   - setClient(client): void                       — install a pre-built Client (the startup module only)
+ *   - closeClient(): void                           — idempotent shutdown for SR-11 Event 11 and the persona-client swap (b.jg5 SRJ-213)
  *   - DEFAULT_STORE_PATH / DEFAULT_TEMPLATE_NAME    — paths CSCB pins
  *   - resetClientForTests(): void                   — test-only handle reset
  *
@@ -92,11 +92,16 @@ export function resetClientForTests(): void {
 }
 
 /**
- * Install a pre-built Client into the singleton slot. Called once by the
- * startup gate (src/agent-director-startup.ts) after `await Client.create(opts)`
- * resolves. Production verb call sites never invoke this — they go through
- * `getClient()`. Lexically distinct from `setClientForTests` so the test
- * helper stays grep-discoverable.
+ * Install a pre-built Client into the singleton slot, replacing any installed
+ * one without closing it. Called only from src/agent-director-startup.ts: by
+ * the startup gate after `await Client.create(opts)` resolves, and, in the
+ * server, once more by the persona-client builder (`buildPersonaClient`),
+ * which, once the start has resolved its configuration, closes the gate's
+ * client through `closeClient()` and installs the client carrying the
+ * configured call timeout (b.jg5 SRJ-213). Production verb call sites never invoke this — they go
+ * through `getClient()` at call time, so none keeps a replaced client.
+ * Lexically distinct from `setClientForTests` so the test helper stays
+ * grep-discoverable.
  */
 export function setClient(client: Client): void {
   singleton = client

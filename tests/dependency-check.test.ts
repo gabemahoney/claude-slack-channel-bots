@@ -30,6 +30,11 @@
  *      module-level singleton via setClient(...).
  *   8. `runAgentDirectorStartupGate`: one record call and one exit per
  *      refusal, none on a pass.
+ *   9. The call timeout (b.jg5 SRJ-213, SRJ-121): `runStartupGate`'s
+ *      `callTimeoutMs` option reaches the client's options (absent without
+ *      it), and the server's persona client (`buildPersonaClient`, exiting
+ *      form `buildPersonaClientOrExit`) is built with the value, passes the
+ *      floor, replaces the gate's client and closes it once.
  *
  * Every agent-director version comes from
  * tests/test-helpers/agent-director-versions.ts (or `STALE_VERSION` from
@@ -56,6 +61,8 @@ import {
 import {
   runStartupGate,
   runAgentDirectorStartupGate,
+  buildPersonaClient,
+  buildPersonaClientOrExit,
   checkErrorCatalog,
   DEFAULT_STATE_DB_PATH,
   REFUSAL_KIND_BELOW_PHASE1_FLOOR,
@@ -75,7 +82,12 @@ import {
   ErrUnknownErrorName,
   PHASE1_ONLY_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
-import { getClient, resetClientForTests } from '../src/agent-director-client.ts'
+import { DEFAULT_STORE_PATH, getClient, resetClientForTests } from '../src/agent-director-client.ts'
+import {
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+} from '../src/config.ts'
 import {
   AD_BELOW_PHASE1_FLOOR,
   AD_SHIM_CATALOG_INCOMPLETE,
@@ -95,7 +107,7 @@ import {
   makeStubClient,
   makeStubCreateClient,
 } from './test-helpers/agent-director-stub.ts'
-import type { StubClientOptions } from './test-helpers/agent-director-stub.ts'
+import type { StubClient, StubClientOptions, StubCreateClientOptions } from './test-helpers/agent-director-stub.ts'
 import {
   CLIENT_MIN_VERSION,
   DEV_PLACEHOLDER_VERSION,
@@ -170,6 +182,35 @@ function passingDeps(overrides: Partial<StartupGateDeps> = {}): Partial<StartupG
 /** A client factory resolving with a default stub reporting `binaryVersion`. */
 function clientAt(binaryVersion: string): StartupGateDeps['createClient'] {
   return makeStubCreateClient({ client: makeStubClient({ binaryVersion }) })
+}
+
+/** The options each create call was given, as `makeStubCreateClient` records them. */
+type RecordedClientOptions = NonNullable<StubCreateClientOptions['calls']>
+
+/** The call timeouts the cases pass: the setting's bounds and its default. */
+const CALL_TIMEOUTS_MS = [
+  MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+]
+
+/**
+ * A recorded client's options without `callTimeoutMs`, with the logger
+ * reduced to its method names (each build makes a new filtered logger).
+ */
+function optionsBesideCallTimeout(opts: RecordedClientOptions[number]): Record<string, unknown> {
+  const rest: Record<string, unknown> = { ...opts }
+  delete rest.callTimeoutMs
+  rest.logger = opts.logger === undefined ? undefined : Object.keys(opts.logger).sort()
+  return rest
+}
+
+/** A stub client whose `close()` counts its calls. */
+function closeCountingStub(binaryVersion?: string): { client: StubClient; closes: () => number } {
+  let count = 0
+  const client = makeStubClient(binaryVersion === undefined ? {} : { binaryVersion })
+  client.close = () => { count += 1 }
+  return { client, closes: () => count }
 }
 
 // ---------------------------------------------------------------------------
@@ -950,6 +991,27 @@ describe('SR-4.1: async createClient injection', () => {
       expect(outcome.message).toContain('boom')
     }
   })
+
+  // b.jg5 SRJ-213 / SRJ-121: the CLI's client carries the call timeout through
+  // the gate's option; the server's gate passes none (the client's default).
+  test.each(CALL_TIMEOUTS_MS)('callTimeoutMs %d reaches the one create call; without it the options have no callTimeoutMs key and are otherwise the same', async (ms) => {
+    const withCalls: RecordedClientOptions = []
+    const withoutCalls: RecordedClientOptions = []
+    const withOutcome = await runStartupGate(
+      passingDeps({ createClient: makeStubCreateClient({ calls: withCalls }) }),
+      { callTimeoutMs: ms },
+    )
+    const withoutOutcome = await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ calls: withoutCalls }) }))
+    expect(withOutcome.ok).toBe(true)
+    expect(withoutOutcome.ok).toBe(true)
+    expect(withCalls.length).toBe(1)
+    expect(withoutCalls.length).toBe(1)
+    expect(withCalls[0]!.callTimeoutMs).toBe(ms)
+    expect(Object.hasOwn(withoutCalls[0]!, 'callTimeoutMs')).toBe(false)
+    expect(optionsBesideCallTimeout(withCalls[0]!)).toEqual(optionsBesideCallTimeout(withoutCalls[0]!))
+    expect(withoutCalls[0]!.storePath).toBe(DEFAULT_STORE_PATH)
+    expect(withoutCalls[0]!.logger).toBeDefined()
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1348,5 +1410,178 @@ describe('b.jg5 SRJ-203 / SRJ-1513: runAgentDirectorStartupGate', () => {
     expect(lines[0]).toContain(`[${AD_BELOW_PHASE1_FLOOR}]`)
     expect(lines[0]).toContain(OLD_AD_VERSION)
     expect(lines[0]).toContain(PHASE1_FLOOR_VERSION)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-213 / SRJ-121 — the server's persona client
+// ---------------------------------------------------------------------------
+//
+// The server's gate builds its client before the configuration is read, so
+// it has the client's default call timeout. Once the start has resolved its
+// configuration, `buildPersonaClient` builds a second client with the
+// configured value through the gate's own construction and Phase 1 floor
+// (no API-surface probe, no same-user stat), installs it as the singleton and
+// closes the gate's client once. Each case first runs the real gate over a
+// close-counting stub, then the builder over a different stub, so a closed
+// client is never reinstalled.
+
+describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrExit', () => {
+  class ExitCalled extends Error {
+    constructor(readonly code: number) {
+      super(`exit(${code})`)
+    }
+  }
+
+  let gate: ReturnType<typeof closeCountingStub>
+  let gateCalls: RecordedClientOptions
+  let steps: string[]
+  let closedBySeam: unknown[]
+  let records: { classLabel: string; message: string }[]
+  let exits: number[]
+
+  beforeEach(async () => {
+    resetClientForTests()
+    gate = closeCountingStub()
+    gateCalls = []
+    steps = []
+    closedBySeam = []
+    records = []
+    exits = []
+    const outcome = await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ client: gate.client, calls: gateCalls }) }))
+    expect(outcome.ok).toBe(true)
+    expect(getClient() as unknown).toBe(gate.client)
+  })
+
+  afterEach(() => {
+    resetClientForTests()
+  })
+
+  /**
+   * The builder's deps: `createClient` plus recording seams. The probes and
+   * the stat are not the builder's seams; they are passed anyway (as a
+   * non-literal, so the type allows it) so a builder that reached them
+   * would record the step.
+   */
+  function personaDeps(createClient: StartupGateDeps['createClient']): Partial<StartupGateDeps> {
+    const deps: Partial<StartupGateDeps> = {
+      createClient,
+      closeClient: (client) => { closedBySeam.push(client) },
+      probeGetPermission: () => { steps.push('probe-get-permission'); return true },
+      probeErrorCatalog: () => { steps.push('probe-error-catalog'); return { ok: true } },
+      probeDecideArgv: async () => { steps.push('probe-decide-argv'); return { ok: true } },
+      statSync: (path) => { steps.push(`stat ${path}`); return defaultStat() },
+      geteuid: () => { steps.push('geteuid'); return 1000 },
+      recordStartupError: (classLabel: string, message: string) => { records.push({ classLabel, message }) },
+      exit: (code: number) => {
+        exits.push(code)
+        throw new ExitCalled(code)
+      },
+    }
+    return deps
+  }
+
+  test.each(CALL_TIMEOUTS_MS)('callTimeoutMs %d: built with it, installed, the gate\'s client closed once, no probe and no stat', async (ms) => {
+    const persona = closeCountingStub(LATER_RELEASE)
+    const calls: RecordedClientOptions = []
+    const outcome = await buildPersonaClient(ms, personaDeps(makeStubCreateClient({ client: persona.client, calls })))
+    expect(outcome.ok).toBe(true)
+    if (outcome.ok) {
+      expect(outcome.client).toBe(persona.client)
+      expect(outcome.adVersion).toBe(LATER_RELEASE)
+    }
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.callTimeoutMs).toBe(ms)
+    expect(optionsBesideCallTimeout(calls[0]!)).toEqual(optionsBesideCallTimeout(gateCalls[0]!))
+    expect(getClient() as unknown).toBe(persona.client)
+    expect(gate.closes()).toBe(1)
+    expect(persona.closes()).toBe(0)
+    expect(closedBySeam).toEqual([])
+    expect(steps).toEqual([])
+  })
+
+  test.each([
+    { name: 'OLD_AD_VERSION', version: OLD_AD_VERSION },
+    { name: 'DEV_PLACEHOLDER_VERSION', version: DEV_PLACEHOLDER_VERSION },
+  ])('$name: the gate\'s floor refusal; the built client closed once, nothing installed, the gate\'s client kept open', async ({ version }) => {
+    const persona = closeCountingStub(version)
+    const outcome = await buildPersonaClient(
+      DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+      personaDeps(makeStubCreateClient({ client: persona.client })),
+    )
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('version')
+      expect(outcome.classLabel).toBe(AD_BELOW_PHASE1_FLOOR)
+      expect(outcome.refusalKind).toBe(REFUSAL_KIND_BELOW_PHASE1_FLOOR)
+    }
+    expect(closedBySeam).toEqual([persona.client])
+    expect(getClient() as unknown).toBe(gate.client)
+    expect(gate.closes()).toBe(0)
+    expect(outcome).toEqual(await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ client: persona.client }) })))
+    expect(steps).toEqual([])
+  })
+
+  test.each([
+    { classLabel: 'ad-bun-version-too-old', refusalKind: REFUSAL_KIND_OTHER, error: errBunVersionTooOld() },
+    { classLabel: AD_SYSTEM_INSTALL_NOT_FOUND, refusalKind: REFUSAL_KIND_OTHER, error: errSystemInstallNotFound() },
+    { classLabel: AD_SYSTEM_INSTALL_TOO_OLD, refusalKind: REFUSAL_KIND_CLIENT_TOO_OLD, error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION) },
+    { classLabel: AD_SYSTEM_INSTALL_UNREACHABLE, refusalKind: REFUSAL_KIND_OTHER, error: errSystemInstallUnreachable() },
+    { classLabel: 'ad-client-construct', refusalKind: REFUSAL_KIND_OTHER, error: new Error('boom') },
+  ])('construct error $classLabel: the gate\'s outcome; nothing built, nothing installed, the gate\'s client kept open', async ({ classLabel, refusalKind, error }) => {
+    const outcome = await buildPersonaClient(
+      DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+      personaDeps(makeStubCreateClient({ error })),
+    )
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('construct')
+      expect(outcome.classLabel).toBe(classLabel)
+      expect(outcome.refusalKind).toBe(refusalKind)
+    }
+    expect(outcome).toEqual(await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ error }) })))
+    expect(getClient() as unknown).toBe(gate.client)
+    expect(gate.closes()).toBe(0)
+    expect(closedBySeam).toEqual([])
+    expect(steps).toEqual([])
+  })
+
+  test('OrExit, below the floor: one record with the floor label and version, one non-zero exit, the gate\'s client kept', async () => {
+    const persona = closeCountingStub(OLD_AD_VERSION)
+    await expect(
+      buildPersonaClientOrExit(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, personaDeps(makeStubCreateClient({ client: persona.client }))),
+    ).rejects.toBeInstanceOf(ExitCalled)
+    expect(records.map((r) => r.classLabel)).toEqual([AD_BELOW_PHASE1_FLOOR])
+    expect(records[0]!.message).toContain(OLD_AD_VERSION)
+    expect(records[0]!.message).toContain(PHASE1_FLOOR_VERSION)
+    expect(exits.length).toBe(1)
+    expect(exits[0]).not.toBe(0)
+    expect(getClient() as unknown).toBe(gate.client)
+    expect(gate.closes()).toBe(0)
+  })
+
+  test('OrExit, construct error: one record with the gate\'s label, one non-zero exit', async () => {
+    await expect(
+      buildPersonaClientOrExit(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, personaDeps(makeStubCreateClient({ error: errSystemInstallNotFound() }))),
+    ).rejects.toBeInstanceOf(ExitCalled)
+    expect(records.map((r) => r.classLabel)).toEqual([AD_SYSTEM_INSTALL_NOT_FOUND])
+    expect(exits.length).toBe(1)
+    expect(exits[0]).not.toBe(0)
+  })
+
+  test('OrExit, a pass: no record, no exit; the persona client installed with the call timeout and returned', async () => {
+    const persona = closeCountingStub()
+    const calls: RecordedClientOptions = []
+    const result = await buildPersonaClientOrExit(
+      MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+      personaDeps(makeStubCreateClient({ client: persona.client, calls })),
+    )
+    expect(result.client).toBe(persona.client)
+    expect(result.adVersion).toBe(PHASE1_RC_VERSION)
+    expect(calls.map((c) => c.callTimeoutMs)).toEqual([MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expect(getClient() as unknown).toBe(persona.client)
+    expect(gate.closes()).toBe(1)
+    expect(records).toEqual([])
+    expect(exits).toEqual([])
   })
 })

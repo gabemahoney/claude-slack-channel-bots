@@ -75,6 +75,12 @@
  *   resolution and before the start bring-up; nothing else in server.ts
  *   builds a reader, registers on the re-check's tick, or names the settings
  *   file or the TOML parser.
+ * - b.jg5 SRJ-213: the call-timeout start step (`_runCallTimeoutStartStep`)
+ *   is called once, awaited, in main()'s own statement list (so in dry run
+ *   too), after the startup gate (still called once with no argument), the
+ *   start's configuration resolution and the settings install, and before the
+ *   template install and the start bring-up, with the start-time applied
+ *   config as its only argument; it is on no tick and no timer.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -116,6 +122,8 @@ import type { ShutdownDeadlineDeps } from '../src/shutdown-deadline.ts'
 import { AD_SETTINGS_RELATIVE_PATH } from '../src/ad-settings.ts'
 import type * as AdSettingsModule from '../src/ad-settings.ts'
 import type * as AdVersionGateModule from '../src/ad-version-gate.ts'
+import type * as AdStartupModule from '../src/agent-director-startup.ts'
+import type * as ServerModule from '../src/server.ts'
 
 const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url))
 const SERVER_PATH = join(SRC_DIR, 'server.ts')
@@ -615,6 +623,7 @@ describe('main() installs the runtime agent-director version re-check right afte
     ['the start bring-up (<controller>.runStartBringUp)', (controller) => new RegExp(`\\b${controller}\\s*\\.\\s*runStartBringUp\\s*\\(`, 'g')],
     ['the health check (startHealthCheck)', () => /(?<![\w.$])startHealthCheck\s*\(/g],
     ['the reload detection tick (<controller>.startDetection)', (controller) => new RegExp(`\\b${controller}\\s*\\.\\s*startDetection\\s*\\(`, 'g')],
+    ['the boot template install (installSlackChannelBotTemplate)', () => /(?<![\w.$])installSlackChannelBotTemplate\s*\(/g],
   ])('main() starts %s only if no shutdown has begun: an `if (shuttingDown) return` in main()\'s own statement list after the last await before the call', (_what, callPattern) => {
     const [start, end] = mainBody(SERVER_CODE)
     const calls = indicesOf(callPattern(startResolution(SERVER_CODE).controller), SERVER_CODE)
@@ -766,6 +775,114 @@ describe('main() installs agent-director\'s settings read once, after the startu
     const parser = importSource(AD_SETTINGS_CODE, 'parse')
     expect(parser).toBeDefined()
     expect(indicesOf(new RegExp(`['"\`]${parser}['"\`]`, 'g'), SERVER_CODE)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the call-timeout start step runs once per start, right after
+// the settings read and before the start pass (b.jg5 SRJ-213)
+//
+// What the step does (one startup check, then the persona client built with
+// the setting's value, a warning never stopping the start) is driven through
+// the exported step in tests/server.test.ts, and the check and the need in
+// tests/ad-settings.test.ts. What only server.ts holds is where main() calls
+// the step, with what, and that nothing calls it again.
+// ---------------------------------------------------------------------------
+
+describe('main() runs the call-timeout start step once, after the startup gate, the start\'s configuration resolution and the settings read, and before the template install and the start bring-up, over the start-time config (b.jg5 SRJ-213)', () => {
+  /** The step, the check it runs and the persona-client builder; typed against their modules, so a rename fails the typecheck. */
+  const STEP: keyof typeof ServerModule = '_runCallTimeoutStartStep'
+  const CHECK: keyof typeof AdSettingsModule = 'checkAdCallTimeoutAtStartup'
+  const BUILD: keyof typeof AdStartupModule = 'buildPersonaClientOrExit'
+  const SETTINGS_INSTALL: keyof typeof AdSettingsModule = 'installAdSettings'
+
+  /** Offsets of every code call of the step (its declaration excluded). */
+  const stepCalls = (): number[] =>
+    indicesOf(new RegExp(`(?<![\\w.$]|\\bfunction\\s+)${STEP}\\s*\\(`, 'g'), SERVER_CODE)
+
+  /** Offset of the only call of the step; fails unless there is exactly one. */
+  const stepCall = (): number => {
+    const calls = stepCalls()
+    expect(calls).toHaveLength(1)
+    return calls[0]!
+  }
+
+  /** [start, end) of the step's own body in server.ts. */
+  const stepBody = (): [number, number] => {
+    const decls = indicesOf(new RegExp(`\\bexport\\s+async\\s+function\\s+${STEP}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(decls).toHaveLength(1)
+    const [, paramsEnd] = balancedAfter(SERVER_CODE, decls[0]!, '(', ')')
+    return balancedAfter(SERVER_CODE, paramsEnd, '{', '}')
+  }
+
+  test('server.ts declares the step once and calls it exactly once, awaited, in main()\'s own statement list (behind no branch, so in dry run too); its declaration and that call are its only mentions', () => {
+    expect(indicesOf(new RegExp(`\\b${STEP}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    stepBody()
+    const at = stepCall()
+    expect(insideMain(at)).toBe(true)
+    const awaitAt = SERVER_CODE.slice(0, at).search(/\bawait\s+$/)
+    expect(awaitAt).toBeGreaterThanOrEqual(0)
+    expect(atMainTopLevel(SERVER_CODE, awaitAt)).toBe(true)
+  })
+
+  test('the startup gate is still called exactly once, with no argument, and before the step: its version probe keeps the client\'s default call timeout', () => {
+    expect(onlyCallArguments(SERVER_CODE, 'runAgentDirectorStartupGate').trim()).toBe('')
+    expect(onlyCallOf('runAgentDirectorStartupGate')).toBeLessThan(stepCall())
+  })
+
+  test.each<[string, () => number]>([
+    ['the start resolution (<controller>.resolveStart)', () => startResolution(SERVER_CODE).resolveAt],
+    ['the applied config\'s start assignment (<loaded> = <outcome>.config)', () => startResolution(SERVER_CODE).assignAt],
+    ['the settings install (installAdSettings)', () => onlyCallOf(SETTINGS_INSTALL)],
+  ])('calls it AFTER %s', (_label, anchor) => {
+    expect(stepCall()).toBeGreaterThan(anchor())
+  })
+
+  test.each<[string, () => number[]]>([
+    ['the template install (installSlackChannelBotTemplate)', () => callsOf('installSlackChannelBotTemplate')],
+    ['the start bring-up (<controller>.runStartBringUp)', () => [startResolution(SERVER_CODE).bringUpAt]],
+  ])('calls it BEFORE %s', (_label, anchors) => {
+    const later = anchors()
+    expect(later.length).toBeGreaterThan(0)
+    for (const at of later) expect(stepCall()).toBeLessThan(at)
+  })
+
+  // The start-time applied config: the variable set once, from the start
+  // outcome's config, and never replaced (a confirmed apply replaces the
+  // applied persona set, `<loaded>`, not it). So the step takes the
+  // configuration the start resolved, never a loader, the file or a literal.
+  test('passes one argument, the start-time applied config: a variable whose only assignment is `= <loaded>`, after the start assignment and before the step, and which no declaration initializes', () => {
+    const { loaded, assignAt } = startResolution(SERVER_CODE)
+    const args = splitTopLevel(callArguments(SERVER_CODE, stepCall()))
+    expect(args).toHaveLength(1)
+    const config = args[0]!
+    expect(config).toMatch(/^[A-Za-z_$][\w$]*$/)
+    const assigns = assignmentsTo(config)
+    expect(assigns.map(({ value }) => value)).toEqual([loaded])
+    expect(assigns[0]!.at).toBeGreaterThan(assignAt)
+    expect(assigns[0]!.at).toBeLessThan(stepCall())
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var)\\s+${config}\\b\\s*(?:!?\\s*:[^=;\\n]*)?=(?![=>])`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  test('the step and the check are on no tick and no timer: no tick listener, interval, timeout or microtask in server.ts names the step, the check or the persona-client builder, and the check runs only inside the step', () => {
+    for (const hook of ['onAdVersionRecheckTick', 'setInterval', 'setTimeout', 'queueMicrotask']) {
+      for (const at of callsOf(hook)) {
+        const args = callArguments(SERVER_CODE, at)
+        for (const name of [STEP, CHECK, BUILD]) {
+          expect([hook, name, indicesOf(new RegExp(`\\b${name}\\b`, 'g'), args)]).toEqual([hook, name, []])
+        }
+      }
+    }
+    // The check: one call in server.ts, inside the step's body, which itself
+    // registers nothing on a tick or a timer.
+    const [bodyStart, bodyEnd] = stepBody()
+    const checks = indicesOf(new RegExp(`(?<![\\w.$])${CHECK}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(checks).toHaveLength(1)
+    expect(checks[0]! > bodyStart && checks[0]! < bodyEnd).toBe(true)
+    const body = SERVER_CODE.slice(bodyStart, bodyEnd)
+    for (const hook of ['onAdVersionRecheckTick', 'setInterval', 'setTimeout', 'queueMicrotask', 'installAdVersionRecheck']) {
+      expect([hook, indicesOf(new RegExp(`\\b${hook}\\b`, 'g'), body)]).toEqual([hook, []])
+    }
   })
 })
 

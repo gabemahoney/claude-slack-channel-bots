@@ -72,6 +72,8 @@ import {
   type PersonaConfig,
   type ReplySettings,
   replySettingsOf,
+  agentDirectorCallTimeoutMsOf,
+  type ServerSettings,
   MCP_SERVER_NAME,
 } from './config.ts'
 import { personaInstanceId, personaTmuxSessionName, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
@@ -190,9 +192,9 @@ import {
   type SessionToolDeps,
   type SessionEntry,
 } from './registry.ts'
-import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
+import { buildPersonaClientOrExit, runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck } from './ad-version-gate.ts'
-import { installAdSettings } from './ad-settings.ts'
+import { adSettingsInEffect, checkAdCallTimeoutAtStartup, installAdSettings, type AdSettingsInEffect } from './ad-settings.ts'
 import { armShutdownDeadline } from './shutdown-deadline.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
@@ -868,6 +870,59 @@ process.on('SIGTERM', () => { shutdown('received SIGTERM').catch(() => process.e
 process.on('SIGINT',  () => { shutdown('received SIGINT').catch(() => process.exit(1)) })
 
 // ---------------------------------------------------------------------------
+// _runCallTimeoutStartStep
+// ---------------------------------------------------------------------------
+
+/** The dependencies of {@link _runCallTimeoutStartStep}; production defaults for any omitted. */
+export interface CallTimeoutStartStepDeps {
+  /**
+   * Build the persona client with the call timeout and install it as the
+   * singleton, closing the gate's client. Production:
+   * `buildPersonaClientOrExit`, which on a construct failure or a floor
+   * refusal records one startup error and exits non-zero, as the gate does.
+   */
+  buildPersonaClient: (callTimeoutMs: number) => Promise<unknown>
+  /** The values in effect of agent-director's settings. Production: `adSettingsInEffect`. */
+  valuesInEffect: () => AdSettingsInEffect
+  /** The server log. */
+  log: (line: string) => void
+}
+
+const PRODUCTION_CALL_TIMEOUT_START_STEP_DEPS: CallTimeoutStartStepDeps = {
+  buildPersonaClient: (callTimeoutMs) => buildPersonaClientOrExit(callTimeoutMs),
+  valuesInEffect: adSettingsInEffect,
+  log: (line) => console.error(line),
+}
+
+/**
+ * The call-timeout start step (b.jg5 SRJ-213), which `main()` runs once per
+ * start, right after the startup read of agent-director's settings and before
+ * the template install and the start pass. With `config`, the start-time
+ * configuration the start resolved (the last-applied record, else
+ * `config.json`), it takes `agent_director_call_timeout_ms` (its default when
+ * absent), then:
+ * 1. runs the startup check once (`checkAdCallTimeoutAtStartup`): at most one
+ *    warning line when the setting is at or below the need or
+ *    `[pause] timeout_seconds` holds a value that is not used; a warning
+ *    never stops the start and changes no value;
+ * 2. builds the persona client with that value and installs it as the
+ *    singleton, so every later agent-director call the server makes uses it.
+ *
+ * Exported for tests (`main()` cannot run in one); production passes no deps.
+ *
+ * @internal
+ */
+export async function _runCallTimeoutStartStep(
+  config: ServerSettings,
+  deps: Partial<CallTimeoutStartStepDeps> = {},
+): Promise<void> {
+  const d: CallTimeoutStartStepDeps = { ...PRODUCTION_CALL_TIMEOUT_START_STEP_DEPS, ...deps }
+  const callTimeoutMs = agentDirectorCallTimeoutMsOf(config)
+  checkAdCallTimeoutAtStartup(callTimeoutMs, { log: d.log, valuesInEffect: d.valuesInEffect })
+  await d.buildPersonaClient(callTimeoutMs)
+}
+
+// ---------------------------------------------------------------------------
 // _buildIsSessionAliveAdapter
 // ---------------------------------------------------------------------------
 
@@ -1377,7 +1432,11 @@ export async function main(): Promise<void> {
   // (b.jg5 SRJ-203) before the Client is installed as the singleton, probes
   // the library's API surface, and verifies that the existing
   // ~/.agent-director/state.db (if any) is owned by the current user. Any
-  // failure records to startup-errors.log and exits non-zero.
+  // failure records to startup-errors.log and exits non-zero. The gate runs
+  // before the configuration is read, so its client has the client's default
+  // call timeout; the call-timeout start step below replaces it with the
+  // persona client, built with the configured agent_director_call_timeout_ms,
+  // before any other agent-director call (b.jg5 SRJ-213).
   //
   // b.jg5 SRJ-204: once the gate passes, and before the PID check or any
   // Slack connection, the runtime version re-check is installed from the
@@ -1519,7 +1578,25 @@ export async function main(): Promise<void> {
   // re-check. It reads the file under the server process's HOME, never a
   // HOME from the configuration or a persona. Its outcome never stops the
   // start: a refused read logs one line and leaves the defaults in effect.
+  // The call-timeout check right after reads the values this read left in
+  // effect.
   installAdSettings()
+
+  // b.jg5 SRJ-213: the call timeout. Once, right after the settings read
+  // above and before the boot template install (the first agent-director
+  // call after the start's resolution) and the start pass, in dry run too:
+  // the startup check writes at most one warning when
+  // agent_director_call_timeout_ms is at or below the need the values in
+  // effect give (it never stops the start), then the persona client is built
+  // with the start-time configuration's value and installed in place of the
+  // gate's client, so every later agent-director call the server makes uses
+  // it (a later confirmed apply's value takes effect at the next start). A
+  // construct failure or a floor refusal of that client records one startup
+  // error and exits non-zero, as the gate does.
+  await _runCallTimeoutStartStep(appliedConfig)
+  // A re-check stop may have begun a shutdown during the await above; nothing
+  // more is started.
+  if (shuttingDown) return
 
   // SR-3.2: refresh the slack-channel-bot agent-director template on every
   // boot, after the persona config is set: its memory-read rules cover the

@@ -398,7 +398,7 @@ These top-level fields apply to the whole server. A confirmed change to one take
 | `claude_config_dir` | string | — | Default Claude on-disk config directory for every persona. When a persona has one (its own or this default), its session launches with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the bot authenticates against a specific account. `~` is expanded and the path is resolved to absolute. A persona's own `claude_config_dir` overrides this value. When neither is set, Claude's own default applies. Must be non-empty when set. |
 | `resume_enabled` | boolean | `true` | When `true` (default), a bot whose session died — including after a host reboot or pod resume — comes back with its prior conversation history intact instead of starting fresh. When `false`, the session manager always performs a fresh launch instead of resuming, both on startup and on runtime auto-restart, even when a stored session exists. Set `false` as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on resume (a known regression in v2.1.120). Requires a system-installed `agent-director` ≥ 0.8.0 for reboot recovery to actually restore history. |
 | `agent_director_poll_interval_ms` | number | `1000` | Poll interval (ms) for the agent-director permission relay tick. Must be a positive integer in `[200, 3_600_000]`. Replaces the pre-rename `claude_director_poll_interval_ms` — the old name is rejected at startup. |
-| `agent_director_call_timeout_ms` | number | `60000` | How long (ms) CSCB waits on each agent-director call it makes for its personas, in the server and in `stop --stop-bots` and `clean_restart`. Must be an integer in `[1000, 3_600_000]`; out-of-range values are rejected at load. |
+| `agent_director_call_timeout_ms` | number | `60000` | How long (ms) CSCB waits on each agent-director call it makes for its personas, in the server and in `stop --stop-bots` and `clean_restart`. Must be an integer in `[1000, 3_600_000]`; out-of-range values are rejected at load. It should be greater than the need that agent-director's timing settings give; see [Sizing the agent-director call timeout](#sizing-the-agent-director-call-timeout). |
 | `stop_hook_bootstrap` | boolean | `true` | Default for every persona: whether the persona gets the Slack Reply Guard reminder (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). The value applies per persona, from the persona's first launch after the change is applied (see [Reload](#reload)). A persona's own `stop_hook_bootstrap` overrides this value. Non-boolean values are rejected at startup. |
 | `cron_table_path` | string | `<config dir>/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). Defaults to `crontab` in the directory of the loaded `config.json`. `~` is expanded like other path keys. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. |
 | `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`. `~` is expanded like other path keys. Must be a non-empty string when set. |
@@ -465,6 +465,57 @@ The server reads the table when it starts and every 120 s after that, whatever `
 | `kill_exit_wait_ms` | `5000` |
 
 If the file can't be read or parsed, or a `[tmux]` value is one agent-director refuses (not a whole number, negative, above 2^63 − 1, or below its minimum), the server keeps the last values it accepted (the defaults, if none yet) and writes one line to `server.log`. The `debug-slack-channel-bots` skill explains that line under "agent-director's timing settings". agent-director's own answers always decide; the server's reading of the file never overrides them.
+
+#### Sizing the agent-director call timeout
+
+`agent_director_call_timeout_ms` (default `60000`, an integer in `[1000, 3_600_000]`; see [Server-wide settings](#server-wide-settings)) is how long CSCB waits on each agent-director call it makes for its personas:
+
+- **The server** uses the value from the configuration its start runs: the last-applied record, else `config.json`.
+- **`stop --stop-bots` and `clean_restart`** use the value from the last-applied record, else `config.json`. When `stop --stop-bots` can't read that configuration, it uses the default `60000`.
+
+A call that runs past the timeout ends in an error while agent-director may still be carrying out the verb. So the setting must be greater than its **need**: the largest ceiling among the agent-director verbs CSCB calls, plus a 15 s margin (15000 ms: the store's 10 s busy timeout and 5 s to start agent-director's CLI). Each ceiling is computed from the host's `[tmux]` values in the table above, with these letters:
+
+| Letter | `[tmux]` key |
+|---|---|
+| Q | `query_timeout_ms` |
+| A | `action_timeout_ms` |
+| C | `create_timeout_ms` |
+| W | `pipe_close_wait_ms` |
+| E | `kill_exit_wait_ms` |
+| B | `sweep_budget_seconds` (times 1000, in ms) |
+
+| Verb | Ceiling (ms) | At agent-director's defaults |
+|---|---|---|
+| `kill` | the larger of 2Q + 2A + E + 4W and 3Q + 2A + 5W | 12.4 s |
+| `read-pane` | 3Q + A + 4W | 6.9 s |
+| `send-keys` | 3Q + 2A + 5W | 9 s |
+| `pause` | 3Q + 2A + 5W, plus `[pause] timeout_seconds` (times 1000) | 39 s (9 s + 30 s) |
+| `resume`, a spawn that reuses an instance, and a plain spawn | the larger of Q + C + 2A + 4W and 2Q + C + 3W | 10.9 s |
+| `find-missing` | B + Q + W | 16.6 s |
+| `expire` | B + Q + W | 16.6 s; CSCB never calls it, so it never sets the need |
+
+At agent-director's defaults, `pause` sets the need: its 9 s plus 30 s is 39 s, plus 15 s is 54 s (54000 ms), below the default `60000`. Two more examples:
+
+- `create_timeout_ms` 40000 (with `pending_grace_seconds` at 61, its minimum then): the launch ceiling that `resume`, a reuse and a plain spawn share is 45.9 s, so the need is 60.9 s (60900 ms), above the default, and the line names `resume/spawn-with-reuse/plain-spawn`. Raise the setting above it.
+- `[pause] timeout_seconds` 60: `pause`'s ceiling is 69 s, so the need is 84 s (84000 ms).
+
+`[pause] timeout_seconds` is `pause`'s wait, in the `[pause]` table of the same file. It is 30 s when the file, the table or the key is missing. A positive whole number is used as given. Any other value (`0`, a negative number, a number above 2^63 − 1, a value that isn't a whole number, or a `pause` that isn't a table) is not used: the need then counts `pause` without its wait, and the server reports it.
+
+**The startup warning.** Once per start, right after the server reads agent-director's settings and before any persona is brought up, the server writes one line to `server.log` when the setting is at or below the need:
+
+```text
+[slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <verb> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the README's switch-over runbook, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)
+```
+
+`<verb>` names the row whose ceiling sets the need: its verb, or `resume/spawn-with-reuse/plain-spawn` for the launch row those three share. When `[pause] timeout_seconds` holds a value that is not used, the line is this one instead, whatever the setting is:
+
+```text
+[slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the README's switch-over runbook, section "Switching over to agent-director Phase 1" (b.jg5 SRJ-213)
+```
+
+`<found>` is the number (for example `0`) or the kind of value, never the file's text. At agent-director's defaults, the default `60000` writes no line; a setting of `54000` writes the first line, naming `pause`.
+
+Either way the server still starts, and no value changes. The check runs only at start: a later change to `config.toml` is checked at the next start. To fix it, raise `agent_director_call_timeout_ms` in `config.json` above the need and confirm the change (see [Reload](#reload)). `stop --stop-bots` and `clean_restart` use the new value at once; the server uses it from its next start. For the second line, give `[pause] timeout_seconds` a positive whole number, or remove it for the 30 s default; the next start checks the setting against the need that gives.
 
 ---
 

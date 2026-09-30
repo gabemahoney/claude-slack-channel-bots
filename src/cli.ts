@@ -20,6 +20,11 @@
  * the configuration the server runs (b.av2 SR-8.7): the last-applied record
  * beside the configuration file (`resolveServerConfigPath`) when it exists,
  * otherwise the configuration file (`readAppliedPersonaConfig`).
+ * `stop --stop-bots` and `clean_restart` read it before they initialize the
+ * agent-director client (`initClient`, production `initProductionClient`),
+ * which is built with its `agent_director_call_timeout_ms`, or the default
+ * when `stop --stop-bots` cannot read it (b.jg5 SRJ-213); `clean_restart`
+ * stops on an unreadable configuration before building any client.
  * `credentials` reads the configuration file as it stands
  * (`loadPersonaConfig`), where a persona being added is declared before any
  * confirmation. The CLI never writes any reload file, and this process reads
@@ -35,6 +40,7 @@ import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, sta
 import { spawn, spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
 import {
+  agentDirectorCallTimeoutMsOf,
   loadPersonaConfig,
   resolveServerConfigPath,
   resolveServerStateDir,
@@ -49,7 +55,7 @@ import { getClient } from './agent-director-client.ts'
 import type { Client } from 'agent-director'
 import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import { runStartupGate } from './agent-director-startup.ts'
-import type { StartupGateRefusalKind } from './agent-director-startup.ts'
+import type { StartupGateDeps, StartupGateRefusalKind } from './agent-director-startup.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -179,13 +185,18 @@ export interface CliDeps {
    * b.qwo: initialize the agent-director Client singleton before any per-persona
    * teardown work. clean_restart / `stop --stop-bots` run in a short-lived CLI
    * process that never runs the server startup gate, so getClient() would throw
-   * (the b.qps root cause). Production wires this to the non-exiting
-   * runStartupGate variant; on failure the caller exits loudly (AD-unreachable
-   * is never a silent skip). Optional so tests that install a stub singleton via
-   * setClientForTests can omit it — when absent, callers skip init and use the
-   * already-installed stub.
+   * (the b.qps root cause). Production wires this to {@link initProductionClient},
+   * the non-exiting runStartupGate variant; on failure the caller exits loudly
+   * (AD-unreachable is never a silent skip). Optional so tests that install a
+   * stub singleton via setClientForTests can omit it — when absent, callers
+   * skip init and use the already-installed stub.
+   *
+   * `callTimeoutMs` is the client's call timeout (b.jg5 SRJ-213): the
+   * configuration's `agent_director_call_timeout_ms` (its default when the
+   * configuration omits it), or the default when `stop --stop-bots` could not
+   * read the configuration. Both commands read the configuration before this.
    */
-  initClient?: () => Promise<void>
+  initClient?: (callTimeoutMs: number) => Promise<void>
   /**
    * Query the agent-director state of a persona's instance, addressed by its
    * instance ID (`cscb_<key>`). Returns null only when the row is absent
@@ -619,27 +630,29 @@ export function createCli(deps: CliDeps): CliHandlers {
 
     // Phase 2: gracefully exit managed bots (only for --stop-bots).
     if (opts?.stopBots) {
+      // Config load is best-effort: a config problem (a pre-persona file
+      // included) logs and skips teardown without failing the stop (the server
+      // is already down; b.4dk behavior). It comes before the client's
+      // initialization, which takes its call timeout from it, or the default
+      // when it cannot be read (b.jg5 SRJ-213).
+      let config: PersonaConfig | null = null
+      try {
+        config = deps.loadConfig(deps.resolveConfigPath())
+      } catch (err) {
+        console.error('[slack] stop --stop-bots: could not load config — skipping bot teardown:', err)
+      }
+
       // Phase 2.4 (b.qwo): initialize the AD Client singleton before teardown.
       // Like clean_restart, `stop --stop-bots` runs in a short-lived CLI process
       // that never runs the server startup gate; without init getClient() throws
       // and teardown becomes a silent no-op (the b.qps root cause).
       if (deps.initClient) {
         try {
-          await deps.initClient()
+          await deps.initClient(agentDirectorCallTimeoutMsOf(config))
         } catch (err) {
           console.error(`[slack] stop --stop-bots: agent-director initialization failed: ${describeCliFailure(err)}`)
           deps.exit(1)
         }
-      }
-
-      // Config load is best-effort: a config problem (a pre-persona file
-      // included) logs and skips teardown without failing the stop (the server
-      // is already down; b.4dk behavior).
-      let config: PersonaConfig | null = null
-      try {
-        config = deps.loadConfig(deps.resolveConfigPath())
-      } catch (err) {
-        console.error('[slack] stop --stop-bots: could not load config — skipping bot teardown:', err)
       }
 
       // b.qwo: a teardown failure (AD unreachable) is a LOUD failure — exit
@@ -771,9 +784,10 @@ export function createCli(deps: CliDeps): CliHandlers {
     // explicit init getClient() throws (the b.qps root cause). We use the
     // non-exiting runStartupGate variant so a gate failure surfaces here as a
     // distinct loud non-zero exit rather than a silently skipped teardown.
+    // The client takes the loaded configuration's call timeout (b.jg5 SRJ-213).
     if (deps.initClient) {
       try {
-        await deps.initClient()
+        await deps.initClient(agentDirectorCallTimeoutMsOf(config!))
       } catch (err) {
         fatal('[slack] clean_restart: agent-director initialization failed:', err)
         deps.exit(1)
@@ -930,6 +944,31 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
 }
 
 // ---------------------------------------------------------------------------
+// Production agent-director client initialization
+// ---------------------------------------------------------------------------
+
+/**
+ * The production `initClient` (b.qwo): installs the agent-director Client
+ * singleton through the non-exiting startup gate, `runStartupGate`, which
+ * performs Client.create() + setClient() and returns a typed outcome. The
+ * client is built with `callTimeoutMs` as its call timeout (b.jg5 SRJ-213).
+ * It runs the full gate, CSCB's Phase 1 floor included (b.jg5 SRJ-203). On
+ * failure it throws {@link StartupGateFailedError} with the outcome's class
+ * label, message and refusal kind, so the caller (clean_restart /
+ * `stop --stop-bots`) exits loudly rather than silently skipping teardown.
+ * `gateDeps` overrides the gate's seams (tests); production passes none.
+ */
+export async function initProductionClient(
+  callTimeoutMs: number,
+  gateDeps?: Partial<StartupGateDeps>,
+): Promise<void> {
+  const outcome = await runStartupGate(gateDeps, { callTimeoutMs })
+  if (!outcome.ok) {
+    throw new StartupGateFailedError(outcome.classLabel, outcome.message, outcome.refusalKind)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Top-level entry point
 // ---------------------------------------------------------------------------
 
@@ -974,17 +1013,8 @@ if (import.meta.main) {
     loadConfigFile: (path) => loadPersonaConfig(path),
     runCredentialsScript,
     // b.qwo: install the AD Client singleton via the non-exiting startup gate
-    // before teardown. runStartupGate performs Client.create() + setClient() and
-    // returns a typed outcome; on failure we throw so the caller (clean_restart /
-    // stop --stop-bots) exits loudly rather than silently skipping teardown.
-    // Both run the full gate, CSCB's Phase 1 floor included (b.jg5 SRJ-203);
-    // the thrown error keeps the outcome's refusal kind.
-    initClient: async () => {
-      const outcome = await runStartupGate()
-      if (!outcome.ok) {
-        throw new StartupGateFailedError(outcome.classLabel, outcome.message, outcome.refusalKind)
-      }
-    },
+    // before teardown, with the configuration's call timeout (b.jg5 SRJ-213).
+    initClient: (callTimeoutMs) => initProductionClient(callTimeoutMs),
     directorStatus: directorOps.directorStatus,
     directorPause: directorOps.directorPause,
     directorKill: directorOps.directorKill,
