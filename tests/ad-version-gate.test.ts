@@ -5,9 +5,14 @@
  * log line per run of could-not-run results (b.jg5 SRJ-206, AC 22), the
  * immediate trigger (AC 23's first half) and the version-changed signal;
  * the host-version decision shared by `/publish`'s SR-2.5 check and the
- * install check (b.jg5 SRJ-211, SRJ-212; AC 81), its client-order comparison
- * and its Phase 1 note; and a source audit of the import-cycle fix
- * (`src/install-check-labels.ts`).
+ * install check (b.jg5 SRJ-211, SRJ-212; AC 81), the reason word of a version
+ * that cannot be read (agent-director's own, `UNREACHABLE_REASON_UNKNOWN` for
+ * an absent or unsafe one, `UNREACHABLE_REASON_UNPARSEABLE_VERSION` for a
+ * resolved version that does not parse), its settle step
+ * (`settleHostVersionCall`), the one-line redaction its callers apply
+ * (`redactToOneLine`), its client-order comparison and its Phase 1 note; and
+ * a source audit of the import-cycle fix (`src/install-check-labels.ts`,
+ * every label of which `src/install-check.ts` re-exports).
  *
  * Every version is built from the floor constant's parts or imported from
  * `tests/test-helpers/agent-director-versions.ts`, so a change to
@@ -67,9 +72,13 @@ import {
   RECHECK_OUTCOME_NOT_RUNNING,
   RECHECK_OUTCOME_PASS,
   RECHECK_OUTCOME_STOP,
+  redactToOneLine,
   resetAdVersionRecheckForTests,
   RUNTIME_RECHECK_PHRASE,
+  settleHostVersionCall,
   triggerAdVersionRecheck,
+  UNREACHABLE_REASON_UNKNOWN,
+  UNREACHABLE_REASON_UNPARSEABLE_VERSION,
   type AdVersionChangedListener,
   type AdVersionRecheck,
   type AdVersionRecheckDeps,
@@ -79,14 +88,11 @@ import {
   type HostVersionOutcome,
 } from '../src/ad-version-gate.ts'
 import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
-import {
-  AD_BELOW_PHASE1_FLOOR,
-  AD_SHIM_CATALOG_INCOMPLETE,
-  AD_SYSTEM_INSTALL_NOT_FOUND,
-  AD_SYSTEM_INSTALL_TOO_OLD,
-} from '../src/install-check.ts'
+import * as installCheck from '../src/install-check.ts'
 import * as installCheckLabels from '../src/install-check-labels.ts'
+import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check-labels.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
+import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { recordStartupError } from '../src/startup-errors.ts'
 import {
   errBunVersionTooOld,
@@ -100,6 +106,7 @@ import {
   type StubResolveSystemBinaryOutcome,
 } from './test-helpers/agent-director-stub.ts'
 import {
+  BELOW_CLIENT_MIN_VERSION,
   CLIENT_MIN_VERSION,
   DEV_PLACEHOLDER_VERSION,
   DEV_UNPARSEABLE_VERSION,
@@ -115,7 +122,7 @@ import {
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { STALE_VERSION } from './test-helpers/install-check-fixtures.ts'
+import { STALE_VERSION, UNREACHABLE_REASONS } from './test-helpers/install-check-fixtures.ts'
 import { flat } from './test-helpers/markdown.ts'
 import { importSource, stripComments } from './test-helpers/source-audit.ts'
 import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
@@ -1234,17 +1241,8 @@ describe('runtime re-check: no Slack post (source audit)', () => {
 /** A distinct host binary path per case, so an outcome shows the path it was given is passed through. */
 const hostBinaryPath = (label: string): string => join(tmpdir(), 'cscb-ad-host-version', label, 'agent-director')
 
-/** The core of `version` (a plain release) one step down: one patch below, else the previous minor's (major's) highest-looking release. */
-function coreBelow(version: string): string {
-  const [major, minor, patch] = [semver.major(version), semver.minor(version), semver.patch(version)]
-  return patch > 0 ? v(major, minor, patch - 1) : minor > 0 ? v(major, minor - 1, HIGH) : v(major - 1, HIGH, HIGH)
-}
-
 /** The next patch release after `version`. */
 const coreAbove = (version: string): string => v(semver.major(version), semver.minor(version), semver.patch(version) + 1)
-
-/** A release below the client's minimum. */
-const BELOW_CLIENT_MIN = coreBelow(CLIENT_MIN_VERSION)
 
 /** The client minimum's release candidate: below the minimum in the client's order (a release ranks above its pre-release). */
 const CLIENT_MIN_RC = `${CLIENT_MIN_VERSION}${RC}`
@@ -1267,8 +1265,7 @@ function failureOf(outcome: HostVersionOutcome): HostVersionFailure {
 }
 
 describe('host-version decision: fixtures built from the helper versions', () => {
-  test("BELOW_CLIENT_MIN and CLIENT_MIN_RC are below the client's minimum; MIN_ABOVE_OLD is above OLD_AD_VERSION and below the floor", () => {
-    expect(semver.lt(BELOW_CLIENT_MIN, CLIENT_MIN_VERSION)).toBe(true)
+  test("CLIENT_MIN_RC is below the client's minimum; MIN_ABOVE_OLD is above OLD_AD_VERSION and below the floor", () => {
     expect(semver.lt(CLIENT_MIN_RC, CLIENT_MIN_VERSION)).toBe(true)
     expect(semver.gt(MIN_ABOVE_OLD, OLD_AD_VERSION)).toBe(true)
     expect(meetsPhase1Floor(MIN_ABOVE_OLD)).toBe(false)
@@ -1310,7 +1307,7 @@ describe('host-version decision: passes (SRJ-211)', () => {
 
 describe("host-version decision: below the client's minimum fails (SRJ-211)", () => {
   test.each([
-    ['a resolved release below the minimum', BELOW_CLIENT_MIN],
+    ['a resolved release below the minimum', BELOW_CLIENT_MIN_VERSION],
     ["the minimum's release candidate (below it in the client's order)", CLIENT_MIN_RC],
   ])('%s (%s): fails below the client minimum, carrying found, required and path', (label, version) => {
     const path = hostBinaryPath(`below-min-${label}`)
@@ -1324,7 +1321,7 @@ describe("host-version decision: below the client's minimum fails (SRJ-211)", ()
 
   test("ErrSystemInstallTooOld: fails below the client minimum, carrying the error's found and required versions and path", () => {
     const path = hostBinaryPath('too-old')
-    const error = errSystemInstallTooOld(BELOW_CLIENT_MIN, CLIENT_MIN_VERSION, path)
+    const error = errSystemInstallTooOld(BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, path)
     expect(failureOf(decideHostAdVersion(rejectedWith(error), CLIENT_MIN_VERSION))).toEqual({
       kind: HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM,
       foundVersion: error.actualVersion,
@@ -1335,7 +1332,7 @@ describe("host-version decision: below the client's minimum fails (SRJ-211)", ()
 
   test("ErrSystemInstallTooOld: the error's required version wins over the supplied minimum", () => {
     const path = hostBinaryPath('too-old-required')
-    const error = errSystemInstallTooOld(BELOW_CLIENT_MIN, CLIENT_MIN_VERSION, path)
+    const error = errSystemInstallTooOld(BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, path)
     const failure = failureOf(decideHostAdVersion(rejectedWith(error), MIN_ABOVE_OLD))
     expect(failure.kind).toBe(HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM)
     if (failure.kind === HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM) expect(failure.requiredVersion).toBe(CLIENT_MIN_VERSION)
@@ -1354,13 +1351,41 @@ describe('host-version decision: a version that cannot be read fails (SRJ-211, S
   test.each([
     ['a timed-out probe', errSystemInstallUnreachable('probe-timeout', null, hostBinaryPath('unreachable-timeout'))],
     ['an unparseable version', errSystemInstallUnreachable('unparseable-version', DEV_UNPARSEABLE_VERSION, hostBinaryPath('unreachable-unparseable'))],
-  ])('ErrSystemInstallUnreachable (%s): fails version unreadable, carrying the path and naming the reason', (_label, error) => {
+  ])('ErrSystemInstallUnreachable (%s): fails version unreadable, carrying the path and the reason word', (_label, error) => {
     const failure = failureOf(decideHostAdVersion(rejectedWith(error), CLIENT_MIN_VERSION))
     expect(failure.kind).toBe(HOST_VERSION_FAIL_VERSION_UNREADABLE)
     if (failure.kind === HOST_VERSION_FAIL_VERSION_UNREADABLE) {
       expect(failure.binaryPath).toBe(error.binaryPath)
+      expect(failure.reason).toBe(error.reason)
       expect(failure.detail).toContain(error.reason)
     }
+  })
+
+  test.each([
+    ['no reason', {}],
+    ['an empty reason', { reason: '' }],
+    ['a non-string reason', { reason: 42 }],
+    ['an upper-case reason', { reason: UNREACHABLE_REASONS[0]!.toUpperCase() }],
+    ['a reason with a line break', { reason: `${UNREACHABLE_REASONS[0]}\n${UNREACHABLE_REASONS[1]}` }],
+    ['a reason longer than 64 characters', { reason: UNREACHABLE_REASONS[0]!.padEnd(65, 'x') }],
+    ['a token-bearing reason', { reason: fakeToken(BOT_TOKEN_PREFIX, 'reason') }],
+    ['a reason carrying a fake token and URL', { reason: sentinelInMessage('reason') }],
+  ] as Array<[string, Record<string, unknown>]>)('ErrSystemInstallUnreachable with %s: reason UNREACHABLE_REASON_UNKNOWN, with no credential', (label, fields) => {
+    const path = hostBinaryPath(`unreachable-unknown-${label}`)
+    const unreachable = { errName: errSystemInstallUnreachable().errName, binaryPath: path, ...fields }
+    const failure = failureOf(decideHostAdVersion(rejectedWith(unreachable), CLIENT_MIN_VERSION))
+    expect(failure.kind).toBe(HOST_VERSION_FAIL_VERSION_UNREADABLE)
+    if (failure.kind === HOST_VERSION_FAIL_VERSION_UNREADABLE) {
+      expect(failure.binaryPath).toBe(path)
+      expect(failure.reason).toBe(UNREACHABLE_REASON_UNKNOWN)
+      expect(failure.detail).toContain(UNREACHABLE_REASON_UNKNOWN)
+    }
+    assertNoLeak(failure, label)
+  })
+
+  test("UNREACHABLE_REASON_UNKNOWN is none of agent-director's reasons; UNREACHABLE_REASON_UNPARSEABLE_VERSION is one of them", () => {
+    expect(UNREACHABLE_REASONS).not.toContain(UNREACHABLE_REASON_UNKNOWN)
+    expect(UNREACHABLE_REASONS).toContain(UNREACHABLE_REASON_UNPARSEABLE_VERSION)
   })
 
   test.each([
@@ -1369,12 +1394,13 @@ describe('host-version decision: a version that cannot be read fails (SRJ-211, S
     ['a leading-v form of the release before Phase 1', `v${OLD_AD_VERSION}`],
     ['a +build form of the floor', `${PHASE1_FLOOR_VERSION}+build.1`],
     ['the empty string', ''],
-  ])('a resolved %s (%p): fails version unreadable, carrying the path, never a pass', (label, version) => {
+  ])('a resolved %s (%p): fails version unreadable with reason UNREACHABLE_REASON_UNPARSEABLE_VERSION, carrying the path, never a pass', (label, version) => {
     const path = hostBinaryPath(`unreadable-${label}`)
     const failure = failureOf(decideHostAdVersion(resolvedWith(version, path), CLIENT_MIN_VERSION))
     expect(failure.kind).toBe(HOST_VERSION_FAIL_VERSION_UNREADABLE)
     if (failure.kind === HOST_VERSION_FAIL_VERSION_UNREADABLE) {
       expect(failure.binaryPath).toBe(path)
+      expect(failure.reason).toBe(UNREACHABLE_REASON_UNPARSEABLE_VERSION)
       if (version !== '') expect(failure.detail).toContain(version)
     }
   })
@@ -1383,11 +1409,14 @@ describe('host-version decision: a version that cannot be read fails (SRJ-211, S
     ['no version', undefined],
     ['a numeric version', 11],
     ['a null version', null],
-  ] as Array<[string, unknown]>)('a resolved value with %s: fails version unreadable, carrying the path', (label, version) => {
+  ] as Array<[string, unknown]>)('a resolved value with %s: fails version unreadable with reason UNREACHABLE_REASON_UNPARSEABLE_VERSION, carrying the path', (label, version) => {
     const path = hostBinaryPath(`no-version-${label}`)
     const failure = failureOf(decideHostAdVersion(resolvedWith(version, path), CLIENT_MIN_VERSION))
     expect(failure.kind).toBe(HOST_VERSION_FAIL_VERSION_UNREADABLE)
-    if (failure.kind === HOST_VERSION_FAIL_VERSION_UNREADABLE) expect(failure.binaryPath).toBe(path)
+    if (failure.kind === HOST_VERSION_FAIL_VERSION_UNREADABLE) {
+      expect(failure.binaryPath).toBe(path)
+      expect(failure.reason).toBe(UNREACHABLE_REASON_UNPARSEABLE_VERSION)
+    }
   })
 })
 
@@ -1471,7 +1500,7 @@ describe('host-version decision: install errors are recognised by name', () => {
 
   test.each([
     ['ErrSystemInstallNotFound', errSystemInstallNotFound()],
-    ['ErrSystemInstallTooOld', errSystemInstallTooOld(BELOW_CLIENT_MIN, CLIENT_MIN_VERSION, hostBinaryPath('by-name-too-old'))],
+    ['ErrSystemInstallTooOld', errSystemInstallTooOld(BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, hostBinaryPath('by-name-too-old'))],
     ['ErrSystemInstallUnreachable', errSystemInstallUnreachable('probe-timeout', null, hostBinaryPath('by-name-unreachable'))],
     ['ErrBunVersionTooOld', errBunVersionTooOld()],
   ] as Array<[string, Error & { errName: string }]>)('%s: a plain object carrying only its errName and fields gives the same outcome as the class-built error', (_label, error) => {
@@ -1496,11 +1525,55 @@ describe('host-version decision: every outcome is token-free', () => {
     ['a resolved pass below the floor with a token-bearing path', resolvedWith(OLD_AD_VERSION, `${hostBinaryPath('token-below')}/${sentinelInMessage('below')}`), CLIENT_MIN_VERSION],
     ['a resolved token-bearing unparseable version', resolvedWith(sentinelInMessage('version'), hostBinaryPath('token-version')), CLIENT_MIN_VERSION],
     ['a token-bearing client minimum', resolvedWith(PHASE1_RC_VERSION, hostBinaryPath('token-min')), sentinelInMessage('minimum')],
-    ['ErrSystemInstallTooOld with a token-bearing path', rejectedWith(errSystemInstallTooOld(BELOW_CLIENT_MIN, CLIENT_MIN_VERSION, `${hostBinaryPath('token-too-old')}/${sentinelInMessage('too-old')}`)), CLIENT_MIN_VERSION],
+    ['ErrSystemInstallTooOld with a token-bearing path', rejectedWith(errSystemInstallTooOld(BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, `${hostBinaryPath('token-too-old')}/${sentinelInMessage('too-old')}`)), CLIENT_MIN_VERSION],
     ['ErrSystemInstallUnreachable with a token-bearing path and diagnostic', rejectedWith(errSystemInstallUnreachable('probe-timeout', LEAK_SENTINEL, `${hostBinaryPath('token-unreachable')}/${sentinelInMessage('unreachable')}`)), CLIENT_MIN_VERSION],
     ['an error whose errName is token-shaped', rejectedWith(Object.assign(new Error('stub resolve failure'), { errName: fakeToken(BOT_TOKEN_PREFIX, 'errname') })), CLIENT_MIN_VERSION],
   ] as Array<[string, HostVersionCallResult, string]>)('%s: no credential in the outcome', (label, result, minimum) => {
     assertNoLeak(decideHostAdVersion(result, minimum), label)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Host-version decision: the settle step and the one-line redaction
+// ---------------------------------------------------------------------------
+
+describe('settleHostVersionCall', () => {
+  test('a resolved call settles resolved, carrying the value as given', async () => {
+    const value = { version: PHASE1_RC_VERSION, path: hostBinaryPath('settle-resolved') }
+    const settled = await settleHostVersionCall(() => Promise.resolve(value))
+    expect(settled).toEqual({ kind: 'resolved', value })
+    if (settled.kind === 'resolved') expect(settled.value).toBe(value)
+  })
+
+  test.each([
+    ['a rejection', (error: unknown) => () => Promise.reject(error)],
+    ['a synchronous throw', (error: unknown) => () => { throw error }],
+  ] as Array<[string, (error: unknown) => () => Promise<never>]>)('%s settles rejected, carrying the thrown value; the settle never rejects', async (_label, makeResolve) => {
+    const error = errSystemInstallNotFound()
+    const settled = await settleHostVersionCall(makeResolve(error))
+    expect(settled.kind).toBe('rejected')
+    if (settled.kind === 'rejected') expect(settled.error).toBe(error)
+  })
+
+  test('makes exactly one resolver call', async () => {
+    const calls: Array<object | undefined> = []
+    await settleHostVersionCall(makeStubResolveSystemBinary({ calls }))
+    expect(calls).toHaveLength(1)
+  })
+})
+
+describe('redactToOneLine', () => {
+  test.each([
+    ['a fake token and a URL', `probe failed (${sentinelInMessage('redact')})`, `probe failed (${REDACTED_SENTINEL_TAIL})`],
+    ['a CRLF and a run of line feeds', 'first\r\nsecond\n\n\nthird', 'first second third'],
+    ['Unicode line and paragraph separators', 'first\u2028second\u2029third', 'first second third'],
+    ['a fake token on one line and a URL on the next', `${fakeToken(BOT_TOKEN_PREFIX, 'multi')}\n${sentinelInMessage('multi')}`, `${REDACTED_TOKEN_PLACEHOLDER} ${REDACTED_SENTINEL_TAIL}`],
+    ['plain one-line text', `binary at ${hostBinaryPath('plain')}`, `binary at ${hostBinaryPath('plain')}`],
+  ])('%s: one token-free line', (label, text, expected) => {
+    const line = redactToOneLine(text)
+    expect(line).toBe(expected)
+    expect(line).not.toMatch(/[\r\n\u2028\u2029]/)
+    assertNoLeak(line, label)
   })
 })
 
@@ -1550,7 +1623,7 @@ describe('compareAdVersions', () => {
     ['the version just below the floor against the floor', JUST_BELOW, PHASE1_FLOOR_VERSION],
     ['the floor against a later patch release', PHASE1_FLOOR_VERSION, LATER_PATCH],
     ['a later minor release against a later major release', LATER_MINOR, LATER_MAJOR],
-    ["a release below the client's minimum against the minimum", BELOW_CLIENT_MIN, CLIENT_MIN_VERSION],
+    ["a release below the client's minimum against the minimum", BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION],
   ])('orders %s: -1 one way, 1 the other', (_label, lower, higher) => {
     expect(compareAdVersions(lower, higher)).toBe(-1)
     expect(compareAdVersions(higher, lower)).toBe(1)
@@ -1596,18 +1669,11 @@ describe('buildPhase1HostNote', () => {
   test.each([
     ['the release before Phase 1', OLD_AD_VERSION],
     ["the client's dev sentinel", DEV_PLACEHOLDER_VERSION],
-  ])('for %s (%s): names the found version, the path, the floor, the Phase 1 phrase and the runbook section title', (label, version) => {
+  ])('for %s (%s): names the found version, the path, the floor, the Phase 1 phrase and the runbook section title; no upgrade instruction, no package.json, no command and no link', (label, version) => {
     const { note, path } = noteFor(version, label)
     for (const text of [version, path, PHASE1_FLOOR_VERSION, PHASE1_HOST_NOTE_PHRASE, PHASE1_RUNBOOK_SECTION_TITLE]) {
       expect(note).toContain(text)
     }
-  })
-
-  test.each([
-    ['the release before Phase 1', OLD_AD_VERSION],
-    ["the client's dev sentinel", DEV_PLACEHOLDER_VERSION],
-  ])('for %s (%s): no upgrade instruction, no package.json, no command and no link', (label, version) => {
-    const { note } = noteFor(version, label)
     expect(note.toLowerCase()).not.toContain('upgrade agent-director')
     expect(note).not.toContain('package.json')
     for (const [, pattern] of UPGRADE_FORMS) expect(flat(note)).not.toMatch(pattern)
@@ -1637,17 +1703,11 @@ describe('install-check labels: the import-cycle fix (source audit)', () => {
     expect(code).not.toMatch(/\brequire\s*\(/)
   })
 
-  test('src/install-check.ts re-exports the same label values', () => {
-    expect({
-      AD_BELOW_PHASE1_FLOOR,
-      AD_SHIM_CATALOG_INCOMPLETE,
-      AD_SYSTEM_INSTALL_NOT_FOUND,
-      AD_SYSTEM_INSTALL_TOO_OLD,
-    }).toEqual({
-      AD_BELOW_PHASE1_FLOOR: installCheckLabels.AD_BELOW_PHASE1_FLOOR,
-      AD_SHIM_CATALOG_INCOMPLETE: installCheckLabels.AD_SHIM_CATALOG_INCOMPLETE,
-      AD_SYSTEM_INSTALL_NOT_FOUND: installCheckLabels.AD_SYSTEM_INSTALL_NOT_FOUND,
-      AD_SYSTEM_INSTALL_TOO_OLD: installCheckLabels.AD_SYSTEM_INSTALL_TOO_OLD,
-    })
+  test('src/install-check-labels.ts exports labels to check', () => {
+    expect(Object.keys(installCheckLabels).length).toBeGreaterThan(0)
+  })
+
+  test.each(Object.entries(installCheckLabels))('src/install-check.ts re-exports %s with the same value', (name, value) => {
+    expect({ name, reExported: (installCheck as Record<string, unknown>)[name] }).toEqual({ name, reExported: value })
   })
 })

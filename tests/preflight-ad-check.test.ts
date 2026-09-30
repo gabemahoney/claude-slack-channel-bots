@@ -10,7 +10,8 @@
  * - `scripts/preflight.sh` and `scripts/publish-prepare.sh` are read as text
  *   (comment lines dropped for the code checks); no test runs them.
  * - `.claude/skills/publish/SKILL.md` and `.claude/skills/publish-prepare/SKILL.md`
- *   are read with the markdown helpers.
+ *   are read with the markdown helpers, and so is the SR-2.5 row of the
+ *   failure-mode table in `docs/engineering-guide.md`'s release section.
  *
  * No line the check writes, no SR-2.5 line of the scripts and no SR-2.5 line
  * of either skill advises upgrading agent-director or names `package.json`.
@@ -37,7 +38,6 @@ import {
 } from '../scripts/ad-version-check.ts'
 import {
   buildPhase1HostNote,
-  compareAdVersions,
   PHASE1_HOST_NOTE_PHRASE,
   PHASE1_RUNBOOK_SECTION_TITLE,
 } from '../src/ad-version-gate.ts'
@@ -70,6 +70,8 @@ const PREFLIGHT = 'scripts/preflight.sh'
 const PUBLISH_PREPARE_SCRIPT = 'scripts/publish-prepare.sh'
 const SKILLS = ['.claude/skills/publish/SKILL.md', '.claude/skills/publish-prepare/SKILL.md'] as const
 const EXIT_TABLE_HEADING = '## Exit code → operator recovery'
+const ENGINEERING_GUIDE = 'docs/engineering-guide.md'
+const RELEASE_HEADING = '## Releasing CSCB'
 
 /** The bump kind every run's rerun hint names. */
 const BUMP = 'minor'
@@ -143,10 +145,6 @@ function expectFailure(run: AdVersionCheckRun, named: readonly string[]): void {
 }
 
 describe('scripts/ad-version-check.ts', () => {
-  test('the below-minimum version sits below the client minimum', () => {
-    expect(compareAdVersions(STALE_VERSION, CLIENT_MIN_VERSION)).toBe(-1)
-  })
-
   test.each([
     ['the Phase 1 release candidate passes with no note', PHASE1_RC_VERSION, false],
     ['the release before Phase 1 passes with the note', OLD_AD_VERSION, true],
@@ -295,15 +293,21 @@ describe('SR-2.5 in the scripts and the publish skills', () => {
     expect(preflightFindings(preflight, listedCode)).toEqual([])
   })
 
+  /** The label of the shared form that flags upgrade wording (the first row of `UPGRADE_FORMS`). */
+  const UPGRADE_WORDING_LABEL = UPGRADE_FORMS[0]![0]
+
+  // Each row names the finding only its own check gives. The upgrade-advice
+  // line names the runbook, so only the forbidden-form scan can flag it.
+
   test.each([
-    ['a package.json range read', `AD_RANGE="$(jq -r '.dependencies["agent-director"] // empty' package.json)"`],
-    ['a direct version call', `AD_VERSION="$(agent-director version)"`],
-    ['a semver range check', `node -e "process.exit(require('semver').satisfies(process.env.AD_VERSION, process.env.AD_RANGE) ? 0 : 1)"`],
-    ['upgrade advice', `echo "${SR25_PREFIX}: upgrade the host's agent-director to match the range, then rerun." >&2`],
-    ['a changed exit code', `sr_exit ${AD_VERSION_CHECK_FAIL_EXIT_CODE + 1}`],
-  ])('the preflight audit flags %s put back into SR-2.5', (_name, line) => {
+    ['a package.json range read', `AD_RANGE="$(jq -r '.dependencies["agent-director"] // empty' package.json)"`, "reads package.json's agent-director dependency"],
+    ['a direct version call', `AD_VERSION="$(agent-director version)"`, 'runs `agent-director version`'],
+    ['a semver range check', `node -e "process.exit(require('semver').satisfies(process.env.AD_VERSION, process.env.AD_RANGE) ? 0 : 1)"`, 'calls semver'],
+    ['upgrade advice', `echo "${SR25_PREFIX}: ${PHASE1_RUNBOOK_SECTION_TITLE}; upgrade the host's agent-director to match the range, then rerun." >&2`, `SR-2.5 code: ${UPGRADE_WORDING_LABEL}`],
+    ['a changed exit code', `sr_exit ${AD_VERSION_CHECK_FAIL_EXIT_CODE + 1}`, `,${AD_VERSION_CHECK_FAIL_EXIT_CODE + 1}, not ${AD_VERSION_CHECK_FAIL_EXIT_CODE}`],
+  ])('the preflight audit flags %s put back into SR-2.5', (_name, line, finding) => {
     const mutated = preflight.replace(/^# SR-2\.6\b/m, `${line}\n$&`)
-    expect(preflightFindings(mutated, listedCode)).not.toEqual([])
+    expect(preflightFindings(mutated, listedCode)).toContainEqual(expect.stringContaining(finding))
   })
 
   /** SR-2.5's own diagnostic: the one `echo "SR-2.5 …"` line, written when the check crashes. */
@@ -338,6 +342,17 @@ describe('SR-2.5 in the scripts and the publish skills', () => {
 
   test.each([...SKILLS])('%s: no upgrade line; the SR-2.5 row and note name the runbook, with no upgrade or package.json', (file) => {
     expect(skillFindings(readRepo(file), file)).toEqual([])
+  })
+
+  test("the engineering guide's release-section SR-2.5 row names the runbook section, with no upgrade form and no package.json", () => {
+    const rows = requiredSection(readRepo(ENGINEERING_GUIDE), RELEASE_HEADING, ENGINEERING_GUIDE)
+      .split('\n')
+      .filter((line) => line.startsWith('|') && line.includes(`\`${SR25_PREFIX}\``))
+    expect(rows).toHaveLength(1)
+    const [row] = rows
+    expect(row).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+    expect(forbiddenHits(row!)).toEqual([])
+    expect(row).not.toMatch(UPGRADE_AD)
   })
 
   test.each([

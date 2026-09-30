@@ -48,7 +48,7 @@ import {
   HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR,
   PHASE1_FLOOR_VERSION,
   PHASE1_RUNBOOK_SECTION_TITLE,
-  type HostVersionCallResult,
+  settleHostVersionCall,
   type HostVersionFailure,
 } from '../src/ad-version-gate.ts'
 import { readClientMinVersion, type InstallCheckFailure } from '../src/install-check.ts'
@@ -90,15 +90,6 @@ export interface AdVersionCheckRun {
   readonly exitCode: number
   readonly stdout: readonly string[]
   readonly stderr: readonly string[]
-}
-
-/** One settled resolver call; a synchronous throw counts as a rejection. Never rejects. */
-async function settleResolve(resolve: () => Promise<ResolveSystemBinaryResult>): Promise<HostVersionCallResult> {
-  try {
-    return { kind: 'resolved', value: await resolve() }
-  } catch (error) {
-    return { kind: 'rejected', error }
-  }
 }
 
 /** The client minimum, or `undefined` when it cannot be read (a read failure or a throwing reader). */
@@ -186,7 +177,7 @@ export async function runAdVersionCheck(deps: AdVersionCheckDeps): Promise<AdVer
       ],
     }
   }
-  const outcome = decideHostAdVersion(await settleResolve(deps.resolveSystemBinary), minimum)
+  const outcome = decideHostAdVersion(await settleHostVersionCall(deps.resolveSystemBinary), minimum)
   if (outcome.kind === HOST_VERSION_OUTCOME_FAIL) {
     return {
       exitCode: AD_VERSION_CHECK_FAIL_EXIT_CODE,

@@ -33,8 +33,14 @@
  * unreadable, below the client minimum, client minimum unreadable, other).
  * Its two callers are `/publish`'s preflight check `scripts/ad-version-check.ts`
  * (gate SR-2.5) and the install check in `src/install-check.ts`. Each
- * resolves the host binary and reads the client minimum itself; this module
- * does neither.
+ * reads the client minimum and makes its own resolver call, settled by
+ * {@link settleHostVersionCall}; the decision itself does neither. A version
+ * that cannot be read fails with a short reason word:
+ * agent-director's own reason, {@link UNREACHABLE_REASON_UNPARSEABLE_VERSION}
+ * for a resolved version that does not parse, or
+ * {@link UNREACHABLE_REASON_UNKNOWN} for a reason that is absent or not a
+ * short safe word. The install check copies a thrown error's text fields into
+ * its detail only through {@link redactToOneLine}.
  *
  * Runtime re-check (b.jg5 SRJ-204): every {@link AD_VERSION_RECHECK_INTERVAL_MS}
  * on its own serialized, self-re-arming timer (the `src/reload-timer.ts`
@@ -76,7 +82,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import type { ResolveSystemBinaryResult } from 'agent-director'
+import type { ResolveSystemBinaryResult, UnreachableReason } from 'agent-director'
 
 import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD } from './install-check-labels.ts'
 import { renderInstallSkillInstructions } from './install-skill-pointer.ts'
@@ -326,6 +332,21 @@ const UNKNOWN_FIELD = 'unknown'
 /** An `ErrSystemInstallUnreachable` reason: a short lowercase, hyphenated word. */
 const SAFE_REASON_RE = /^[a-z][a-z0-9-]{0,63}$/
 
+/**
+ * The reason word that stands for an `ErrSystemInstallUnreachable` reason
+ * that is absent or is not a short safe word. Not one of agent-director's own
+ * reasons, so it never passes for one (agent-director's `other` is a reason
+ * the binary check itself gave).
+ */
+export const UNREACHABLE_REASON_UNKNOWN = UNKNOWN_FIELD
+
+/**
+ * The reason word of a version that does not parse: agent-director's own
+ * `unparseable-version` reason, which the host-version decision also gives a
+ * resolved version that does not parse under the client's strict rule.
+ */
+export const UNREACHABLE_REASON_UNPARSEABLE_VERSION: UnreachableReason = 'unparseable-version'
+
 /** The re-check found a passing binary. */
 export const RECHECK_OUTCOME_PASS = 'pass'
 
@@ -369,8 +390,13 @@ export type AdVersionRecheckOutcome =
       readonly description: string
     }
 
-/** Read one property of any value without throwing (a getter may throw). */
-function readField(value: unknown, key: string): unknown {
+/**
+ * Read one property of any value without throwing (a getter may throw):
+ * `undefined` for a non-object, a missing property or a throwing getter.
+ * Shared with the install check (`src/install-check.ts`), which reads a thrown
+ * error's structural fields with it.
+ */
+export function readField(value: unknown, key: string): unknown {
   if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined
   try {
     return (value as Record<string, unknown>)[key]
@@ -393,11 +419,19 @@ function thrownName(value: unknown): string | undefined {
   return stringField(value, 'errName') ?? stringField(value, 'name')
 }
 
-/** A string field (a path or a version) as one token-free line: token- and URL-like text redacted, line breaks collapsed. */
+/**
+ * `text` as one token-free line: token- and URL-like text redacted
+ * (`redactSlackLogText`), each run of line breaks collapsed to one space.
+ * Shared with the install check (`src/install-check.ts`), which passes every
+ * text it copies from a thrown error into its detail through it.
+ */
+export function redactToOneLine(text: string): string {
+  return redactSlackLogText(text).replace(/[\r\n\u2028\u2029]+/g, ' ')
+}
+
+/** A string field (a path or a version) as one token-free line ({@link redactToOneLine}), else {@link UNKNOWN_FIELD}. */
 function safeLine(value: unknown): string {
-  return typeof value === 'string' && value !== ''
-    ? redactSlackLogText(value).replace(/[\r\n\u2028\u2029]+/g, ' ')
-    : UNKNOWN_FIELD
+  return typeof value === 'string' && value !== '' ? redactToOneLine(value) : UNKNOWN_FIELD
 }
 
 /** The install-skill block the too-old entry ends with; empty if it cannot be rendered. */
@@ -421,10 +455,10 @@ function describeCouldNotRun(error: unknown): string {
   return `${name} (reason ${safeReason(error)}, binary at ${safeLine(readField(error, 'binaryPath'))})`
 }
 
-/** An `ErrSystemInstallUnreachable`'s reason when it is a short safe word, else {@link UNKNOWN_FIELD}. */
+/** An `ErrSystemInstallUnreachable`'s reason when it is a short safe word, else {@link UNREACHABLE_REASON_UNKNOWN}. */
 function safeReason(error: unknown): string {
   const reason = readField(error, 'reason')
-  return typeof reason === 'string' && SAFE_REASON_RE.test(reason) ? reason : UNKNOWN_FIELD
+  return typeof reason === 'string' && SAFE_REASON_RE.test(reason) ? reason : UNREACHABLE_REASON_UNKNOWN
 }
 
 /**
@@ -537,6 +571,13 @@ export type HostVersionFailure =
       readonly kind: typeof HOST_VERSION_FAIL_VERSION_UNREADABLE
       /** The resolved binary path. */
       readonly binaryPath: string
+      /**
+       * One short safe word: the unreachable error's reason
+       * ({@link UNREACHABLE_REASON_UNKNOWN} when it is absent or not a safe
+       * word), or {@link UNREACHABLE_REASON_UNPARSEABLE_VERSION} for a
+       * resolved version that does not parse.
+       */
+      readonly reason: string
       /** What was read: the unreachable error's reason, or the version that does not parse. */
       readonly detail: string
     }
@@ -571,6 +612,23 @@ export type HostVersionOutcome =
     }
   | { readonly kind: typeof HOST_VERSION_OUTCOME_FAIL; readonly failure: HostVersionFailure }
 
+/**
+ * Make one `resolveSystemBinary()` call and settle it for
+ * {@link decideHostAdVersion}: the resolved value, or the thrown value (a
+ * synchronous throw counts as a rejection). Never rejects. The one settle
+ * step of both of the decision's callers (`scripts/ad-version-check.ts` and
+ * `src/install-check.ts`).
+ */
+export async function settleHostVersionCall(
+  resolve: () => Promise<ResolveSystemBinaryResult>,
+): Promise<HostVersionCallResult> {
+  try {
+    return { kind: 'resolved', value: await resolve() }
+  } catch (error) {
+    return { kind: 'rejected', error }
+  }
+}
+
 /** A failing outcome. */
 function hostVersionFail(failure: HostVersionFailure): HostVersionOutcome {
   return { kind: HOST_VERSION_OUTCOME_FAIL, failure }
@@ -589,10 +647,12 @@ function hostVersionThrownFailure(error: unknown, clientMinimum: string): HostVe
     }
   }
   if (name === ERR_SYSTEM_INSTALL_UNREACHABLE) {
+    const reason = safeReason(error)
     return {
       kind: HOST_VERSION_FAIL_VERSION_UNREADABLE,
       binaryPath: safeLine(readField(error, 'binaryPath')),
-      detail: `reason ${safeReason(error)}`,
+      reason,
+      detail: `reason ${reason}`,
     }
   }
   return { kind: HOST_VERSION_FAIL_OTHER, description: describeCouldNotRun(error) }
@@ -608,12 +668,14 @@ function hostVersionThrownFailure(error: unknown, clientMinimum: string): HostVe
  * - rejected, read by name: `ErrSystemInstallNotFound` fails not found;
  *   `ErrSystemInstallTooOld` fails below the client minimum, from its
  *   `actualVersion`, `requiredVersion` and `binaryPath`;
- *   `ErrSystemInstallUnreachable` (any reason) fails version unreadable;
+ *   `ErrSystemInstallUnreachable` (any reason) fails version unreadable,
+ *   carrying the reason as a safe word;
  *   any other named error or non-error throw fails other;
  * - resolved, with a minimum that does not parse: fails client minimum
  *   unreadable;
  * - resolved with a version the client's strict rule cannot parse (a leading
- *   `v` included): fails version unreadable;
+ *   `v` included): fails version unreadable, reason
+ *   {@link UNREACHABLE_REASON_UNPARSEABLE_VERSION};
  * - resolved below the minimum: fails below the client minimum;
  * - resolved at or above the minimum and meeting the floor: pass;
  * - resolved at or above the minimum but below the floor (`0.10.0`, the
@@ -636,7 +698,12 @@ export function decideHostAdVersion(result: HostVersionCallResult, clientMinimum
       typeof version === 'string'
         ? `version ${JSON.stringify(safeLine(version))} does not parse as a strict SemVer version`
         : 'no version string'
-    return hostVersionFail({ kind: HOST_VERSION_FAIL_VERSION_UNREADABLE, binaryPath, detail })
+    return hostVersionFail({
+      kind: HOST_VERSION_FAIL_VERSION_UNREADABLE,
+      binaryPath,
+      reason: UNREACHABLE_REASON_UNPARSEABLE_VERSION,
+      detail,
+    })
   }
   if (order < 0) {
     return hostVersionFail({

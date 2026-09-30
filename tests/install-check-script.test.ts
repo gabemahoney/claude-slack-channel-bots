@@ -61,6 +61,7 @@ import {
   cannedSuccessResult,
   SATISFYING_VERSION,
   STALE_VERSION,
+  UNREACHABLE_REASONS,
   type InstallCheckFailure,
   type InstallCheckSuccess,
 } from './test-helpers/install-check-fixtures.ts'
@@ -80,18 +81,6 @@ function scriptFailureBody(result: InstallCheckFailure): string {
 function count(haystack: string, needle: string): number {
   return haystack.split(needle).length - 1
 }
-
-/** Every UnreachableReason; the Record type makes the list exhaustive. */
-const UNREACHABLE_REASONS = Object.keys({
-  'not-executable': true,
-  'not-a-regular-file': true,
-  'probe-timeout': true,
-  'probe-nonzero-exit': true,
-  'probe-killed-by-signal': true,
-  'unparseable-version': true,
-  'spawn-failed': true,
-  other: true,
-} satisfies Record<UnreachableReason, true>) as UnreachableReason[]
 
 /** An unreachable failure of the given reason, message built from the detail. */
 function unreachableResult(reason: UnreachableReason): InstallCheckFailure {
@@ -186,7 +175,7 @@ describe('SR-6: install-check script — failures that end with the install-skil
     expect(body.endsWith(SKILL_BLOCK)).toBe(true)
   })
 
-  test.each(UNREACHABLE_REASONS)(`${AD_SYSTEM_INSTALL_UNREACHABLE} reason='%s': reason verbatim, then the skill block`, (reason) => {
+  test.each([...UNREACHABLE_REASONS])(`${AD_SYSTEM_INSTALL_UNREACHABLE} reason='%s': reason verbatim, then the skill block`, (reason) => {
     const result = unreachableResult(reason)
     const body = scriptFailureBody(result)
     expect(body).toContain(AD_SYSTEM_INSTALL_UNREACHABLE)

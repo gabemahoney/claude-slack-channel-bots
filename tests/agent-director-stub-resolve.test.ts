@@ -5,8 +5,9 @@
  *
  * Covers the no-options default, the ordered `outcomes` queue with its last
  * entry repeating, a `{ throws }` entry rejecting with that exact error, a
- * `{ never: true }` entry staying pending, the `calls` capture, and the three
- * option combinations the factory refuses when the stub is built.
+ * `{ never: true }` entry staying pending, the `calls` capture, the three
+ * option combinations the factory refuses when the stub is built, and the
+ * default path pinned to the canned install-check results' `CANNED_BINARY_PATH`.
  *
  * Every version comes from tests/test-helpers/agent-director-versions.ts.
  * No timer runs: a pending call is shown by racing it against an already
@@ -27,6 +28,7 @@ import {
   OLD_AD_VERSION,
   PHASE1_RC_VERSION,
 } from './test-helpers/agent-director-versions.ts'
+import { CANNED_BINARY_PATH } from './test-helpers/install-check-fixtures.ts'
 
 const PENDING = Symbol('pending')
 
@@ -52,6 +54,10 @@ describe('makeStubResolveSystemBinary', () => {
 
     expect(await resolve()).toEqual({ path: STUB_RESOLVE_DEFAULT_PATH, version: PHASE1_RC_VERSION })
     expect(await resolve()).toEqual({ path: STUB_RESOLVE_DEFAULT_PATH, version: PHASE1_RC_VERSION })
+  })
+
+  test("the default path is the canned install-check results' default path, so a stub run and a canned result agree", () => {
+    expect(STUB_RESOLVE_DEFAULT_PATH).toBe(CANNED_BINARY_PATH)
   })
 
   test('outcomes answer the calls in order, then the last entry answers every later call', async () => {

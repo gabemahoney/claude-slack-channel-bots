@@ -65,7 +65,7 @@ import {
   PHASE1_RC_VERSION,
 } from './test-helpers/agent-director-versions.ts'
 import { cannedFailureResult, cannedSuccessResult } from './test-helpers/install-check-fixtures.ts'
-import { UPGRADE_FORMS, type ForbiddenForm } from './test-helpers/upgrade-forms.ts'
+import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -717,20 +717,6 @@ describe('runAgentDirectorPostinstallProbe (SR-5.2, b.jg5 SRJ-121)', () => {
     }
   }
 
-  /** Forbidden forms: the shared upgrade and install-command forms, plus this probe's retired advice. */
-  const PROBE_FORBIDDEN_FORMS: readonly ForbiddenForm[] = [
-    ...UPGRADE_FORMS,
-    ['"Upgrade agent-director" in any case', /upgrade agent-director/i, 'upgrade Agent-Director and retry'],
-    ['`bun add agent-director`', /bun add agent-director/, 'bun add agent-director@^0.7.0'],
-  ]
-
-  test.each(PROBE_FORBIDDEN_FORMS.map((row) => [row[0], row] as const))(
-    'forbidden form self-check (%s): its pattern matches its sample',
-    (_label, [, pattern, sample]) => {
-      expect(pattern.test(sample)).toBe(true)
-    },
-  )
-
   /**
    * The probe's own text in every captured line carries no install, upgrade
    * or `bun add` advice (AC 81). `checkMessage`, when given, is the install
@@ -747,7 +733,7 @@ describe('runAgentDirectorPostinstallProbe (SR-5.2, b.jg5 SRJ-121)', () => {
     for (const line of lines) {
       const own = checkMessage === undefined ? line : line.split(checkMessage).join(' ')
       const flat = own.replace(/\s+/g, ' ')
-      for (const [label, pattern] of PROBE_FORBIDDEN_FORMS) {
+      for (const [label, pattern] of UPGRADE_FORMS) {
         expect({ line, form: label, matched: pattern.test(flat) }).toEqual({ line, form: label, matched: false })
       }
     }

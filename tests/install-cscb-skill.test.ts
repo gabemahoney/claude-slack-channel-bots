@@ -3,10 +3,13 @@
  *
  * The skill body is interactive markdown driven by Claude — there is no
  * behavioral unit test. But its STRUCTURE is asserted here: frontmatter
- * fields must be present, all eight UnreachableReason branch labels must
- * appear in the body, the ad-version-floor-unreadable handler must be
- * present, and there must be no `default:`-only fallthrough construct
- * that would collapse multiple reasons.
+ * fields must be present, all eight UnreachableReason branch labels
+ * (`UNREACHABLE_REASONS` from tests/test-helpers/install-check-fixtures.ts)
+ * must appear in the body, each of the four install-check class labels
+ * (imported from src/install-check-labels.ts) must be named, the
+ * ad-version-floor-unreadable handler must point at reinstalling, and there
+ * must be no `default:`-only fallthrough construct that would collapse
+ * multiple reasons.
  *
  * This catches accidental deletion of branches or frontmatter drift.
  *
@@ -38,7 +41,13 @@ import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 import { PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
-import { AD_SYSTEM_INSTALL_NOT_FOUND, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check.ts'
+import {
+  AD_SYSTEM_INSTALL_NOT_FOUND,
+  AD_SYSTEM_INSTALL_TOO_OLD,
+  AD_SYSTEM_INSTALL_UNREACHABLE,
+  AD_VERSION_FLOOR_UNREADABLE,
+} from '../src/install-check-labels.ts'
+import { UNREACHABLE_REASONS } from './test-helpers/install-check-fixtures.ts'
 import { classHeading, flat, requiredSection, splitFences } from './test-helpers/markdown.ts'
 import { type ForbiddenForm, UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
@@ -54,17 +63,6 @@ const FRONTMATTER_FIELDS = [
   'user-invocable: true',
   'argument-hint:',
   'allowed-tools:',
-]
-
-const REASON_LABELS = [
-  'not-executable',
-  'not-a-regular-file',
-  'probe-timeout',
-  'probe-nonzero-exit',
-  'probe-killed-by-signal',
-  'unparseable-version',
-  'spawn-failed',
-  'other',
 ]
 
 describe('install-cscb skill: file existence + frontmatter', () => {
@@ -96,7 +94,7 @@ describe('install-cscb skill: file existence + frontmatter', () => {
 })
 
 describe('install-cscb skill: eight named reason branches present', () => {
-  for (const reason of REASON_LABELS) {
+  for (const reason of UNREACHABLE_REASONS) {
     test(`reason label '${reason}' appears in the body`, () => {
       expect(skillContent).toContain(reason)
     })
@@ -104,22 +102,15 @@ describe('install-cscb skill: eight named reason branches present', () => {
 })
 
 describe('install-cscb skill: failure-class handlers', () => {
-  test('ad-system-install-not-found is named', () => {
-    expect(skillContent).toContain('ad-system-install-not-found')
-  })
-
-  test('ad-system-install-too-old is named', () => {
-    expect(skillContent).toContain('ad-system-install-too-old')
-  })
-
-  test('ad-system-install-unreachable is named', () => {
-    expect(skillContent).toContain('ad-system-install-unreachable')
-  })
-
-  test('ad-version-floor-unreadable handler is present and points at reinstall', () => {
-    expect(skillContent).toContain('ad-version-floor-unreadable')
-    // The handler must reference reinstalling agent-director from npm.
-    expect(skillContent.toLowerCase()).toContain('reinstall')
+  // The floor-unreadable handler must also reference reinstalling agent-director from npm.
+  test.each([
+    [AD_SYSTEM_INSTALL_NOT_FOUND, null],
+    [AD_SYSTEM_INSTALL_TOO_OLD, null],
+    [AD_SYSTEM_INSTALL_UNREACHABLE, null],
+    [AD_VERSION_FLOOR_UNREADABLE, 'reinstall'],
+  ])('%s is named (and the body says %p)', (label, alsoSays) => {
+    expect(skillContent).toContain(label)
+    if (alsoSays !== null) expect(skillContent.toLowerCase()).toContain(alsoSays)
   })
 })
 
@@ -136,7 +127,7 @@ describe('install-cscb skill: no default-only fallthrough', () => {
     // legitimate exhaustive switch produces at least one prominent
     // mention per reason. We just sanity-check ≥ 1 here; the per-reason
     // toContain tests above are the load-bearing assertion.
-    for (const reason of REASON_LABELS) {
+    for (const reason of UNREACHABLE_REASONS) {
       const occurrences = (skillContent.match(new RegExp(reason, 'g')) || []).length
       expect(occurrences).toBeGreaterThan(0)
     }

@@ -12,11 +12,18 @@
  *     required versions, the path and the runbook section;
  *   - `ErrSystemInstallNotFound` fails not found;
  *   - `ErrSystemInstallUnreachable`, all eight reasons, fails unreachable
- *     with the reason in `detail`;
+ *     with the reason in `detail`; a reason that is absent or not a short
+ *     safe word is reported as `UNREACHABLE_REASON_UNKNOWN`;
  *   - a resolved version that does not parse (a leading `v` included) fails
- *     unreachable with reason `unparseable-version`;
+ *     unreachable with reason `UNREACHABLE_REASON_UNPARSEABLE_VERSION`;
  *   - any other throw (an `Error`, a non-error, a synchronous throw) fails
- *     unreachable with reason `other`, carrying none of the thrown text;
+ *     unreachable with reason `HOST_VERSION_FAIL_OTHER`, carrying none of the
+ *     thrown text;
+ *   - every text a failure copies from a thrown error (an unreachable error's
+ *     diagnostic and signal, a not-found error's checked locations) or from a
+ *     failed floor read (`underlying`) is one line with its fake token and
+ *     URL redacted; a field of the wrong type is `null` (a non-list of
+ *     checked locations is empty);
  *   - a value carrying only the matching `errName` maps as the class-built
  *     error does (errors are recognised by name);
  *   - a client minimum that is not a version fails floor unreadable;
@@ -25,27 +32,46 @@
  *   - one sweep: no message and no note carries an upgrade instruction or
  *     command (`UPGRADE_FORMS`, and "Upgrade agent-director" in any case).
  *
- * The resolver is always injected (`makeStubResolveSystemBinary`); no module
- * is mocked. The client minimum comes from the floor-cache seam: seeded with
- * `CLIENT_MIN_VERSION` before each case and reset after it. Every version,
- * label and title comes from `src/` or `tests/test-helpers/`.
+ * `readClientMinVersion` over its injected resolver and reader:
+ *   - a readable floor file gives its `min_binary_version` (a string that is
+ *     not a version included), read once from the resolved path;
+ *   - a throwing reader gives the canned floor-unreadable (read) failure; a
+ *     throwing resolver the resolve failure, without reading; a non-`file:`
+ *     URL the read failure, without reading; malformed JSON the parse
+ *     failure; a missing, empty or non-string field (or a non-object
+ *     document) the missing-field failure, with the parsed document; the
+ *     four modes carry four distinct messages. A thrown `Error`'s message is
+ *     `underlying`, one line with its fake token and URL redacted; a thrown
+ *     string's is `null`;
+ *   - a call with any dep injected neither returns nor stores the cached
+ *     floor; an empty deps object uses the cache.
+ *
+ * No module is mocked. The resolver is always injected
+ * (`makeStubResolveSystemBinary`). The client minimum comes from the
+ * floor-cache seam: seeded with `CLIENT_MIN_VERSION` before each case and
+ * reset after it. The not-found, unreachable and floor-read failures are compared whole with
+ * `cannedFailureResult`, so the canned texts stay the source's. Every
+ * version, label, reason word and title comes from `src/` or
+ * `tests/test-helpers/`; every token is a fake from the credentials helper,
+ * and every case that plants one runs `assertNoLeak` over its result.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import semver from 'semver'
-import type { UnreachableReason } from 'agent-director'
 
 import {
   buildInstallCheckPhase1Note,
   buildSystemInstallTooOldMessage,
+  HOST_VERSION_FAIL_OTHER,
   INSTALL_CHECK_PHASE1_NOTE_PHRASE,
-  meetsPhase1Floor,
   PHASE1_RUNBOOK_SECTION_TITLE,
+  UNREACHABLE_REASON_UNKNOWN,
+  UNREACHABLE_REASON_UNPARSEABLE_VERSION,
 } from '../src/ad-version-gate.ts'
 import {
   AD_SYSTEM_INSTALL_NOT_FOUND,
@@ -55,6 +81,7 @@ import {
   type InstallCheckFailure,
   type InstallCheckResolveSystemBinary,
   type InstallCheckResult,
+  readClientMinVersion,
   resetCacheForTests,
   runInstallCheck,
   setFloorForTests,
@@ -67,12 +94,29 @@ import {
   type StubResolveSystemBinaryOptions,
 } from './test-helpers/agent-director-stub.ts'
 import {
+  BELOW_CLIENT_MIN_VERSION,
   CLIENT_MIN_VERSION,
   DEV_PLACEHOLDER_VERSION,
   DEV_UNPARSEABLE_VERSION,
+  FLOOR_SUBPATH,
   OLD_AD_VERSION,
   PHASE1_RC_VERSION,
 } from './test-helpers/agent-director-versions.ts'
+import {
+  assertNoLeak,
+  BOT_TOKEN_PREFIX,
+  fakeToken,
+  REDACTED_SENTINEL_TAIL,
+  sentinelInMessage,
+  sentinelTicketUrl,
+} from './test-helpers/credentials.ts'
+import {
+  cannedFailureResult,
+  makeMalformedFloorJson,
+  makeMissingFieldFloorJson,
+  makeVersionFloorJson,
+  UNREACHABLE_REASONS,
+} from './test-helpers/install-check-fixtures.ts'
 import { flat } from './test-helpers/markdown.ts'
 import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
@@ -82,36 +126,6 @@ import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 /** A distinct host binary path per case, so a result shows the path it was given is passed through. */
 const binaryPath = (label: string): string => join(tmpdir(), 'cscb-install-check', label, 'agent-director')
-
-/** A plain release one step below `version`'s core. */
-function releaseBelow(version: string): string {
-  const [major, minor, patch] = [semver.major(version), semver.minor(version), semver.patch(version)]
-  if (patch > 0) return `${major}.${minor}.${patch - 1}`
-  if (minor > 0) return `${major}.${minor - 1}.${Number.MAX_SAFE_INTEGER}`
-  return `${major - 1}.${Number.MAX_SAFE_INTEGER}.${Number.MAX_SAFE_INTEGER}`
-}
-
-/** A release below the client's minimum. */
-const BELOW_CLIENT_MIN = releaseBelow(CLIENT_MIN_VERSION)
-
-/** Every `ErrSystemInstallUnreachable` reason; the `Record` makes the compiler hold the list complete. */
-const REASON_SET: Record<UnreachableReason, true> = {
-  'not-executable': true,
-  'not-a-regular-file': true,
-  'probe-timeout': true,
-  'probe-nonzero-exit': true,
-  'probe-killed-by-signal': true,
-  'unparseable-version': true,
-  'spawn-failed': true,
-  other: true,
-}
-const REASONS = Object.keys(REASON_SET) as UnreachableReason[]
-
-/** The reason a resolved version that does not parse is reported with. */
-const UNPARSEABLE_VERSION_REASON: UnreachableReason = 'unparseable-version'
-
-/** The reason any other failure is reported with. */
-const OTHER_REASON: UnreachableReason = 'other'
 
 /** Resolved versions the client's strict rule cannot parse. */
 const UNPARSEABLE_VERSIONS: ReadonlyArray<[label: string, version: string]> = [
@@ -131,6 +145,19 @@ function errNameOnly(error: Error): Record<string, unknown> {
   const { name: _name, ...fields } = { ...error } as Record<string, unknown>
   return fields
 }
+
+/** The `errName` agent-director's `ErrSystemInstallUnreachable` and `ErrSystemInstallNotFound` carry. */
+const UNREACHABLE_ERR_NAME = errSystemInstallUnreachable().errName
+const NOT_FOUND_ERR_NAME = errSystemInstallNotFound().errName
+
+/** An unreachable failure's detail with no diagnostic, exit code or signal. */
+const unreachableDetail = (reason: string, path: string): Record<string, unknown> => ({
+  reason,
+  binaryPath: path,
+  diagnostic: null,
+  exitCode: null,
+  signal: null,
+})
 
 /** Run the check with a stub resolver built from `opts`; returns the result and the stub's calls. */
 async function check(
@@ -153,6 +180,61 @@ function seededFloorFailure(detail: Record<string, unknown>): InstallCheckFailur
   return { ok: false, classLabel: AD_VERSION_FLOOR_UNREADABLE, message: 'seeded floor failure', detail }
 }
 
+/** A floor file URL an injected resolver returns, and the path the reader is then given. */
+const FLOOR_PATH = join(tmpdir(), 'cscb-install-check', 'floor', 'version-floor.json')
+const FLOOR_URL = pathToFileURL(FLOOR_PATH).href
+
+/** A reader answering `text` and recording the paths it was given. */
+function readerOf(text: string): { readFile: (path: string) => string; paths: string[] } {
+  const paths: string[] = []
+  return {
+    readFile: (path) => {
+      paths.push(path)
+      return text
+    },
+    paths,
+  }
+}
+
+/** A reader throwing `thrown` and recording the paths it was given. */
+function throwingReader(thrown: unknown): { readFile: (path: string) => string; paths: string[] } {
+  const paths: string[] = []
+  return {
+    readFile: (path) => {
+      paths.push(path)
+      throw thrown
+    },
+    paths,
+  }
+}
+
+/** The floor-unreadable failure of a floor read; throws on a version or another label. */
+function floorFailureOf(result: string | InstallCheckFailure): InstallCheckFailure {
+  if (typeof result === 'string') throw new Error(`expected a floor failure, got the version ${result}`)
+  if (result.classLabel !== AD_VERSION_FLOOR_UNREADABLE) throw new Error(`expected a floor failure, got ${result.classLabel}`)
+  return result
+}
+
+/**
+ * One real `readClientMinVersion` failure per failure mode, each built
+ * through the injected resolver and reader (uncached).
+ */
+const FLOOR_READ_FAILURES: ReadonlyArray<[mode: string, failure: InstallCheckFailure]> = [
+  [
+    'resolve',
+    floorFailureOf(
+      readClientMinVersion({
+        resolveFloorUrl: () => {
+          throw new Error(RAW_THROWN_TEXT)
+        },
+      }),
+    ),
+  ],
+  ['read', floorFailureOf(readClientMinVersion({ resolveFloorUrl: () => FLOOR_URL, readFile: throwingReader(new Error(RAW_THROWN_TEXT)).readFile }))],
+  ['parse', floorFailureOf(readClientMinVersion({ resolveFloorUrl: () => FLOOR_URL, readFile: readerOf(makeMalformedFloorJson()).readFile }))],
+  ['missing-field', floorFailureOf(readClientMinVersion({ resolveFloorUrl: () => FLOOR_URL, readFile: readerOf(makeMissingFieldFloorJson()).readFile }))],
+]
+
 beforeEach(() => {
   resetCacheForTests()
   setFloorForTests(CLIENT_MIN_VERSION)
@@ -160,17 +242,6 @@ beforeEach(() => {
 
 afterEach(() => {
   resetCacheForTests()
-})
-
-describe('fixtures', () => {
-  test('the helper versions sit where the cases need them', () => {
-    expect(semver.lt(BELOW_CLIENT_MIN, CLIENT_MIN_VERSION)).toBe(true)
-    expect(meetsPhase1Floor(PHASE1_RC_VERSION)).toBe(true)
-    for (const version of [OLD_AD_VERSION, DEV_PLACEHOLDER_VERSION, CLIENT_MIN_VERSION]) {
-      expect(meetsPhase1Floor(version)).toBe(false)
-    }
-    expect(REASONS).toHaveLength(8)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -214,44 +285,117 @@ describe('runInstallCheck: a binary below the Phase 1 floor passes with the note
 
 describe('runInstallCheck: below the client minimum fails too old, naming the runbook (SRJ-212)', () => {
   test.each([
-    ['a resolved version below the client minimum', 'resolved', { version: BELOW_CLIENT_MIN, path: binaryPath('resolved-too-old') }],
+    ['a resolved version below the client minimum', 'resolved', { version: BELOW_CLIENT_MIN_VERSION, path: binaryPath('resolved-too-old') }],
     [
       'ErrSystemInstallTooOld',
       'thrown',
-      { throws: errSystemInstallTooOld(BELOW_CLIENT_MIN, CLIENT_MIN_VERSION, binaryPath('thrown-too-old')) },
+      { throws: errSystemInstallTooOld(BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, binaryPath('thrown-too-old')) },
     ],
   ] as const)('%s: too-old label; message names found, required, path and the runbook section', async (_label, kind, opts) => {
     const path = binaryPath(`${kind}-too-old`)
     const failure = failureOf((await check(opts)).result)
     expect(failure.classLabel).toBe(AD_SYSTEM_INSTALL_TOO_OLD)
-    expect(failure.detail).toEqual({ detected: BELOW_CLIENT_MIN, required: CLIENT_MIN_VERSION, binaryPath: path })
+    expect(failure.detail).toEqual({ detected: BELOW_CLIENT_MIN_VERSION, required: CLIENT_MIN_VERSION, binaryPath: path })
     expect(failure.message).toBe(
-      buildSystemInstallTooOldMessage({ foundVersion: BELOW_CLIENT_MIN, requiredVersion: CLIENT_MIN_VERSION, binaryPath: path }),
+      buildSystemInstallTooOldMessage({ foundVersion: BELOW_CLIENT_MIN_VERSION, requiredVersion: CLIENT_MIN_VERSION, binaryPath: path }),
     )
-    for (const part of [BELOW_CLIENT_MIN, CLIENT_MIN_VERSION, path, PHASE1_RUNBOOK_SECTION_TITLE]) {
+    for (const part of [BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, path, PHASE1_RUNBOOK_SECTION_TITLE]) {
       expect(failure.message).toContain(part)
     }
   })
 })
 
 describe('runInstallCheck: ErrSystemInstallNotFound fails not found (SRJ-212)', () => {
-  test('not-found label; detail carries the checked locations', async () => {
+  test('not-found label; detail carries the checked locations; the whole result is the canned not-found failure', async () => {
     const checkedLocations = [{ kind: 'path-lookup' as const, detail: null }]
     const failure = failureOf((await check({ throws: errSystemInstallNotFound(checkedLocations) })).result)
-    expect(failure.classLabel).toBe(AD_SYSTEM_INSTALL_NOT_FOUND)
-    expect(failure.detail).toEqual({ checkedLocations })
+    expect(failure).toEqual(cannedFailureResult(AD_SYSTEM_INSTALL_NOT_FOUND, { detail: { checkedLocations } }))
   })
 })
 
 describe('runInstallCheck: ErrSystemInstallUnreachable, all eight reasons, fails unreachable (SRJ-212)', () => {
-  test.each(REASONS)('reason %s: unreachable label, reason in detail and message', async (reason) => {
+  test.each([...UNREACHABLE_REASONS])('reason %s: the whole result is the canned unreachable failure, naming the reason and path', async (reason) => {
     const path = binaryPath(`unreachable-${reason}`)
     const failure = failureOf((await check({ throws: errSystemInstallUnreachable(reason, null, path) })).result)
-    expect(failure.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
-    expect(failure.detail.reason).toBe(reason)
-    expect(failure.detail.binaryPath).toBe(path)
+    expect(failure).toEqual(cannedFailureResult(AD_SYSTEM_INSTALL_UNREACHABLE, { detail: unreachableDetail(reason, path) }))
     expect(failure.message).toContain(reason)
     expect(failure.message).toContain(path)
+  })
+
+  test.each([
+    ['no reason', {}],
+    ['a token-bearing reason', { reason: fakeToken(BOT_TOKEN_PREFIX, 'reason') }],
+    ['a reason with a line break', { reason: `${UNREACHABLE_REASONS[0]}\n${UNREACHABLE_REASONS[1]}` }],
+  ])('%s: reported as UNREACHABLE_REASON_UNKNOWN, in detail and message, with no credential', async (label, fields) => {
+    const path = binaryPath(`unreachable-unknown-${label.replaceAll(' ', '-')}`)
+    const thrown = { errName: UNREACHABLE_ERR_NAME, binaryPath: path, ...fields }
+    const failure = failureOf(await runInstallCheck({ resolveSystemBinary: () => Promise.reject(thrown) }))
+    expect(failure).toEqual(
+      cannedFailureResult(AD_SYSTEM_INSTALL_UNREACHABLE, { detail: unreachableDetail(UNREACHABLE_REASON_UNKNOWN, path) }),
+    )
+    assertNoLeak(failure, label)
+  })
+})
+
+describe('runInstallCheck: text copied from a thrown error is one token-free line', () => {
+  test("ErrSystemInstallUnreachable: the diagnostic and signal are redacted to one line; the exit code is kept", async () => {
+    const path = binaryPath('unreachable-redacted')
+    const [reason] = UNREACHABLE_REASONS
+    const error = Object.assign(
+      errSystemInstallUnreachable(reason, `probe said (${sentinelInMessage('diagnostic')})\r\nsecond line\n\nthird line`, path),
+      { exitCode: 3, signal: `(${sentinelInMessage('signal')})\u2028after` },
+    )
+    const failure = failureOf((await check({ throws: error })).result)
+    expect(failure).toEqual(
+      cannedFailureResult(AD_SYSTEM_INSTALL_UNREACHABLE, {
+        detail: {
+          reason,
+          binaryPath: path,
+          diagnostic: `probe said (${REDACTED_SENTINEL_TAIL}) second line third line`,
+          exitCode: 3,
+          signal: `(${REDACTED_SENTINEL_TAIL}) after`,
+        },
+      }),
+    )
+    assertNoLeak(failure, 'unreachable')
+  })
+
+  test('ErrSystemInstallUnreachable: a diagnostic or signal that is not a string, or an exit code that is not a number, is null', async () => {
+    const path = binaryPath('unreachable-wrong-types')
+    const [reason] = UNREACHABLE_REASONS
+    const thrown = { errName: UNREACHABLE_ERR_NAME, binaryPath: path, reason, diagnostic: 7, exitCode: '3', signal: { name: 'SIGKILL' } }
+    const failure = failureOf(await runInstallCheck({ resolveSystemBinary: () => Promise.reject(thrown) }))
+    expect(failure).toEqual(cannedFailureResult(AD_SYSTEM_INSTALL_UNREACHABLE, { detail: unreachableDetail(reason, path) }))
+  })
+
+  test("ErrSystemInstallNotFound: each checked location's detail is redacted to one line; its kind is kept", async () => {
+    const error = errSystemInstallNotFound([
+      { kind: 'path-lookup', detail: `/opt/bin:${sentinelInMessage('path')}\n/usr/bin` },
+      { kind: 'standard-install-path', detail: null },
+    ])
+    const failure = failureOf((await check({ throws: error })).result)
+    expect(failure).toEqual(
+      cannedFailureResult(AD_SYSTEM_INSTALL_NOT_FOUND, {
+        detail: {
+          checkedLocations: [
+            { kind: 'path-lookup', detail: `/opt/bin:${REDACTED_SENTINEL_TAIL} /usr/bin` },
+            { kind: 'standard-install-path', detail: null },
+          ],
+        },
+      }),
+    )
+    assertNoLeak(failure, 'not-found')
+  })
+
+  test.each([
+    ['a string', sentinelInMessage('locations')],
+    ['an object', { detail: sentinelInMessage('locations') }],
+    ['missing', undefined],
+  ])('ErrSystemInstallNotFound whose checked locations are %s: an empty list, with no credential', async (label, checkedLocations) => {
+    const thrown = { errName: NOT_FOUND_ERR_NAME, checkedLocations }
+    const failure = failureOf(await runInstallCheck({ resolveSystemBinary: () => Promise.reject(thrown) }))
+    expect(failure).toEqual(cannedFailureResult(AD_SYSTEM_INSTALL_NOT_FOUND, { detail: { checkedLocations: [] } }))
+    assertNoLeak(failure, label)
   })
 })
 
@@ -260,7 +404,7 @@ describe('runInstallCheck: a resolved version that does not parse fails, never p
     const path = binaryPath(`unparseable-${label.replaceAll(' ', '-')}`)
     const failure = failureOf((await check({ version, path })).result)
     expect(failure.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
-    expect(failure.detail.reason).toBe(UNPARSEABLE_VERSION_REASON)
+    expect(failure.detail.reason).toBe(UNREACHABLE_REASON_UNPARSEABLE_VERSION)
     expect(failure.detail.binaryPath).toBe(path)
     expect(failure.detail.exitCode).toBeNull()
     expect(failure.detail.signal).toBeNull()
@@ -285,7 +429,7 @@ describe('runInstallCheck: any other throw fails unreachable with none of its te
   test.each(OTHER_RESOLVERS)('%s: failure, reason other; message and detail omit the thrown text', async (_label, resolve) => {
     const failure = failureOf(await runInstallCheck({ resolveSystemBinary: resolve }))
     expect(failure.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
-    expect(failure.detail.reason).toBe(OTHER_REASON)
+    expect(failure.detail.reason).toBe(HOST_VERSION_FAIL_OTHER)
     expect(failure.message).not.toContain(RAW_THROWN_TEXT)
     expect(JSON.stringify(failure.detail)).not.toContain(RAW_THROWN_TEXT)
   })
@@ -301,8 +445,8 @@ describe('runInstallCheck: any other throw fails unreachable with none of its te
 describe('runInstallCheck: errors are recognised by errName, not class (SRJ-212)', () => {
   test.each([
     ['ErrSystemInstallNotFound', errSystemInstallNotFound([{ kind: 'standard-install-path', detail: null }])],
-    ['ErrSystemInstallTooOld', errSystemInstallTooOld(BELOW_CLIENT_MIN, CLIENT_MIN_VERSION, binaryPath('by-name-too-old'))],
-    ['ErrSystemInstallUnreachable', errSystemInstallUnreachable(REASONS[0], null, binaryPath('by-name-unreachable'))],
+    ['ErrSystemInstallTooOld', errSystemInstallTooOld(BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, binaryPath('by-name-too-old'))],
+    ['ErrSystemInstallUnreachable', errSystemInstallUnreachable(UNREACHABLE_REASONS[0], null, binaryPath('by-name-unreachable'))],
   ])('%s: a value carrying only its errName maps as the class-built error does', async (_label, error) => {
     const lookalike = errNameOnly(error)
     expect(lookalike.errName).toBe((error as { errName?: unknown }).errName)
@@ -344,6 +488,165 @@ describe('runInstallCheck: a client minimum that cannot be used fails floor unre
   })
 })
 
+describe('readClientMinVersion: each failed floor read, over the injected resolver and reader (SRJ-212)', () => {
+  /** The canned read failure's message: the text every other failure mode must differ from. */
+  const READ_FAILURE_MESSAGE = cannedFailureResult(AD_VERSION_FLOOR_UNREADABLE).message
+
+  test('a readable floor file: its min_binary_version, read once from the resolved path', () => {
+    const { readFile, paths } = readerOf(makeVersionFloorJson(OLD_AD_VERSION))
+    expect(readClientMinVersion({ resolveFloorUrl: () => FLOOR_URL, readFile })).toBe(OLD_AD_VERSION)
+    expect(paths).toEqual([FLOOR_PATH])
+  })
+
+  test('a minimum that is a string but not a version: returned as is (runInstallCheck refuses it)', () => {
+    const { readFile } = readerOf(makeVersionFloorJson(DEV_UNPARSEABLE_VERSION))
+    expect(readClientMinVersion({ resolveFloorUrl: () => FLOOR_URL, readFile })).toBe(DEV_UNPARSEABLE_VERSION)
+  })
+
+  test.each([
+    [
+      'an Error whose message holds a fake token, a URL and line breaks',
+      new Error(`read failed (${sentinelInMessage('floor')})\r\nsecond line\n\nthird line`),
+      `read failed (${REDACTED_SENTINEL_TAIL}) second line third line`,
+    ],
+    ['a thrown string (no message)', sentinelInMessage('floor-string'), null],
+  ])('the reader throws %s: the canned floor-unreadable failure, its underlying redacted to one line', (label, thrown, underlying) => {
+    const { readFile, paths } = throwingReader(thrown)
+    const result = readClientMinVersion({ resolveFloorUrl: () => FLOOR_URL, readFile })
+    expect(paths).toEqual([FLOOR_PATH])
+    expect(result).toEqual(cannedFailureResult(AD_VERSION_FLOOR_UNREADABLE, { detail: { underlying } }))
+    assertNoLeak(result, label)
+  })
+
+  test('the default resolver with a throwing reader: the reader is given the installed floor file, and fails as a read', () => {
+    const { readFile, paths } = throwingReader(new Error(sentinelInMessage('floor-default-resolver')))
+    const result = readClientMinVersion({ readFile })
+    expect(paths).toEqual([fileURLToPath(import.meta.resolve(FLOOR_SUBPATH))])
+    expect(result).toEqual(cannedFailureResult(AD_VERSION_FLOOR_UNREADABLE, { detail: { underlying: REDACTED_SENTINEL_TAIL } }))
+    assertNoLeak(result, 'default resolver')
+  })
+
+  test('a resolved URL that is not a file: URL: the canned read failure; the reader is never called', () => {
+    const { readFile, paths } = readerOf(makeVersionFloorJson(CLIENT_MIN_VERSION))
+    const result = readClientMinVersion({ resolveFloorUrl: () => sentinelTicketUrl(), readFile })
+    expect(paths).toHaveLength(0)
+    expect(result).toEqual(cannedFailureResult(AD_VERSION_FLOOR_UNREADABLE, { detail: { underlying: expect.any(String) } }))
+    assertNoLeak(result, 'non-file URL')
+  })
+
+  test.each([
+    [
+      'an Error whose message holds a fake token, a URL and line breaks',
+      new Error(`resolve failed (${sentinelInMessage('resolve')})\nsecond line`),
+      `resolve failed (${REDACTED_SENTINEL_TAIL}) second line`,
+    ],
+    ['a thrown string (no message)', sentinelInMessage('resolve-string'), null],
+  ])('the resolver throws %s: the resolve failure, its underlying redacted to one line; the reader is never called', (label, thrown, underlying) => {
+    const { readFile, paths } = readerOf(makeVersionFloorJson(CLIENT_MIN_VERSION))
+    const failure = floorFailureOf(
+      readClientMinVersion({
+        resolveFloorUrl: () => {
+          throw thrown
+        },
+        readFile,
+      }),
+    )
+    expect(paths).toHaveLength(0)
+    expect(failure.detail).toEqual({ underlying })
+    expect(failure.message).not.toBe(READ_FAILURE_MESSAGE)
+    assertNoLeak(failure, label)
+  })
+
+  test('malformed JSON: the parse failure, its underlying one line; distinct from the read failure', () => {
+    const { readFile } = readerOf(makeMalformedFloorJson())
+    const failure = floorFailureOf(readClientMinVersion({ resolveFloorUrl: () => FLOOR_URL, readFile }))
+    expect(Object.keys(failure.detail)).toEqual(['underlying'])
+    expect(typeof failure.detail.underlying).toBe('string')
+    expect(String(failure.detail.underlying)).not.toMatch(/[\r\n\u2028\u2029]/)
+    expect(failure.message).not.toBe(READ_FAILURE_MESSAGE)
+  })
+
+  test('malformed JSON holding a fake token: the parse failure carries no credential', () => {
+    const { readFile } = readerOf(`{ "min_binary_version": ${sentinelInMessage('parse')}`)
+    const failure = floorFailureOf(readClientMinVersion({ resolveFloorUrl: () => FLOOR_URL, readFile }))
+    assertNoLeak(failure, 'parse')
+  })
+
+  /** Parsed floor documents with no usable `.min_binary_version`. */
+  const UNUSABLE_FLOORS: ReadonlyArray<[label: string, parsed: unknown]> = [
+    ['a missing field', JSON.parse(makeMissingFieldFloorJson())],
+    ['an empty string', { min_binary_version: '' }],
+    ['a number', { min_binary_version: 7 }],
+    ['null', { min_binary_version: null }],
+    ['a JSON null document', null],
+    ['a JSON array document', [CLIENT_MIN_VERSION]],
+  ]
+
+  test.each(UNUSABLE_FLOORS)('%s: the missing-field failure, its detail the parsed document', (_label, parsed) => {
+    const { readFile } = readerOf(JSON.stringify(parsed))
+    const failure = floorFailureOf(readClientMinVersion({ resolveFloorUrl: () => FLOOR_URL, readFile }))
+    expect(failure.detail).toEqual({ parsed })
+    expect(failure.message).not.toBe(READ_FAILURE_MESSAGE)
+  })
+
+  test('the four failure modes (resolve, read, parse, missing field) carry four distinct messages', () => {
+    const messages = FLOOR_READ_FAILURES.map(([, failure]) => failure.message)
+    expect(FLOOR_READ_FAILURES.map(([mode]) => mode)).toEqual(['resolve', 'read', 'parse', 'missing-field'])
+    expect(new Set(messages).size).toBe(messages.length)
+    expect(messages[1]).toBe(READ_FAILURE_MESSAGE)
+  })
+})
+
+describe('readClientMinVersion: a call with an injected dep bypasses the floor cache', () => {
+  /** An injected reader answering `version`'s floor document. */
+  const readFloor = (version: string) => (): string => makeVersionFloorJson(version)
+
+  test('a seeded cache is neither returned nor replaced by a call with an injected reader', () => {
+    // The file-level beforeEach seeds CLIENT_MIN_VERSION.
+    expect(readClientMinVersion({ readFile: readFloor(OLD_AD_VERSION) })).toBe(OLD_AD_VERSION)
+    expect(readClientMinVersion()).toBe(CLIENT_MIN_VERSION)
+  })
+
+  test('a seeded cache is neither returned nor replaced by a call with only an injected resolver', () => {
+    const failure = readClientMinVersion({
+      resolveFloorUrl: () => {
+        throw new Error(RAW_THROWN_TEXT)
+      },
+    })
+    expect(typeof failure).not.toBe('string')
+    expect(readClientMinVersion()).toBe(CLIENT_MIN_VERSION)
+  })
+
+  test('a seeded failure is not returned to a call with an injected reader', () => {
+    const seeded = seededFloorFailure({ underlying: RAW_THROWN_TEXT })
+    setFloorForTests(seeded)
+    expect(readClientMinVersion({ readFile: readFloor(OLD_AD_VERSION) })).toBe(OLD_AD_VERSION)
+    expect(readClientMinVersion()).toBe(seeded)
+  })
+
+  test('after a reset, a failed injected read is not cached: the next no-arg call reads the installed floor file', () => {
+    resetCacheForTests()
+    const failure = readClientMinVersion({ readFile: () => {
+        throw new Error(RAW_THROWN_TEXT)
+      }, })
+    expect(typeof failure).not.toBe('string')
+    expect(readClientMinVersion()).toBe(CLIENT_MIN_VERSION)
+  })
+
+  test('after a reset, a successful injected read is not cached: the next no-arg call reads the installed floor file', () => {
+    resetCacheForTests()
+    expect(readClientMinVersion({ readFile: readFloor(OLD_AD_VERSION) })).toBe(OLD_AD_VERSION)
+    expect(readClientMinVersion()).toBe(CLIENT_MIN_VERSION)
+  })
+
+  test('an empty deps object uses the cache as a no-arg call does', () => {
+    expect(readClientMinVersion({})).toBe(CLIENT_MIN_VERSION)
+    const seeded = seededFloorFailure({})
+    setFloorForTests(seeded)
+    expect(readClientMinVersion({})).toBe(seeded)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // No upgrade instruction anywhere (AC 81)
 // ---------------------------------------------------------------------------
@@ -351,7 +654,7 @@ describe('runInstallCheck: a client minimum that cannot be used fails floor unre
 describe('runInstallCheck: no message and no note advises upgrading agent-director (SRJ-212, AC 81)', () => {
   /** Every case above, as a (floor seed, resolver) pair. */
   const SWEEP: ReadonlyArray<[label: string, floor: string | InstallCheckFailure, resolve: InstallCheckResolveSystemBinary]> = [
-    ...[PHASE1_RC_VERSION, OLD_AD_VERSION, DEV_PLACEHOLDER_VERSION, CLIENT_MIN_VERSION, BELOW_CLIENT_MIN].map(
+    ...[PHASE1_RC_VERSION, OLD_AD_VERSION, DEV_PLACEHOLDER_VERSION, CLIENT_MIN_VERSION, BELOW_CLIENT_MIN_VERSION].map(
       (version): [string, string, InstallCheckResolveSystemBinary] => [
         `resolved ${version}`,
         CLIENT_MIN_VERSION,
@@ -363,9 +666,9 @@ describe('runInstallCheck: no message and no note advises upgrading agent-direct
       CLIENT_MIN_VERSION,
       makeStubResolveSystemBinary({ version }),
     ]),
-    ['ErrSystemInstallTooOld', CLIENT_MIN_VERSION, makeStubResolveSystemBinary({ throws: errSystemInstallTooOld(BELOW_CLIENT_MIN, CLIENT_MIN_VERSION) })],
+    ['ErrSystemInstallTooOld', CLIENT_MIN_VERSION, makeStubResolveSystemBinary({ throws: errSystemInstallTooOld(BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION) })],
     ['ErrSystemInstallNotFound', CLIENT_MIN_VERSION, makeStubResolveSystemBinary({ throws: errSystemInstallNotFound() })],
-    ...REASONS.map((reason): [string, string, InstallCheckResolveSystemBinary] => [
+    ...UNREACHABLE_REASONS.map((reason): [string, string, InstallCheckResolveSystemBinary] => [
       `ErrSystemInstallUnreachable ${reason}`,
       CLIENT_MIN_VERSION,
       makeStubResolveSystemBinary({ throws: errSystemInstallUnreachable(reason) }),
@@ -373,6 +676,11 @@ describe('runInstallCheck: no message and no note advises upgrading agent-direct
     ['a plain Error', CLIENT_MIN_VERSION, makeStubResolveSystemBinary({ throws: new Error(RAW_THROWN_TEXT) })],
     ['a minimum that is not a version', DEV_UNPARSEABLE_VERSION, makeStubResolveSystemBinary()],
     ['a seeded floor failure', seededFloorFailure({}), makeStubResolveSystemBinary()],
+    ...FLOOR_READ_FAILURES.map(([label, failure]): [string, InstallCheckFailure, InstallCheckResolveSystemBinary] => [
+      `a floor ${label} failure`,
+      failure,
+      makeStubResolveSystemBinary(),
+    ]),
   ]
 
   test('every case: no message and no note carries an upgrade form or "Upgrade agent-director"', async () => {

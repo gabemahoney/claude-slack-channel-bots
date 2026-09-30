@@ -9,12 +9,17 @@
  *     floor (`PHASE1_FLOOR_VERSION`); checked when this module loads.
  *   - The re-export of `DEV_SENTINEL_VERSION` from agent-director (tests
  *     MUST import the sentinel from here, never hardcode the string).
+ *   - Every `ErrSystemInstallUnreachable` reason (`UNREACHABLE_REASONS`),
+ *     held complete by the compiler.
  *   - Factory functions for synthetic version-floor JSON documents and
  *     for canned check-result arms. The canned results have the shapes and
  *     texts `runInstallCheck` returns: the success note comes from
  *     `buildInstallCheckPhase1Note` and the too-old message from
  *     `buildSystemInstallTooOldMessage` (startup form), both in
  *     `src/ad-version-gate.ts`; labels come from `src/install-check-labels.ts`.
+ *     The not-found, unreachable and floor-unreadable messages are copies of
+ *     `src/install-check.ts`'s text, pinned by `tests/install-check.test.ts`,
+ *     which compares real results whole with these canned ones.
  *   - A fixture loader that reads files from tests/fixtures/version-floor/.
  *
  * This module has no top-level mock.module() calls — the pretest gate
@@ -74,9 +79,26 @@ export { DEV_SENTINEL_VERSION }
 /**
  * The binary path every canned result reports by default. Same value as the
  * stub resolver's default (`STUB_RESOLVE_DEFAULT_PATH` in
- * `agent-director-stub.ts`, not imported here to keep this helper light).
+ * `agent-director-stub.ts`, not imported here to keep this helper light: the
+ * stub imports the session manager and the persona modules); a case in
+ * `tests/agent-director-stub-resolve.test.ts` pins the two equal.
  */
 export const CANNED_BINARY_PATH = '/usr/local/bin/agent-director'
+
+/** Every `ErrSystemInstallUnreachable` reason; the `Record` makes the compiler hold the set complete. */
+const UNREACHABLE_REASON_SET: Record<UnreachableReason, true> = {
+  'not-executable': true,
+  'not-a-regular-file': true,
+  'probe-timeout': true,
+  'probe-nonzero-exit': true,
+  'probe-killed-by-signal': true,
+  'unparseable-version': true,
+  'spawn-failed': true,
+  other: true,
+}
+
+/** Every `ErrSystemInstallUnreachable` reason agent-director defines, in a fixed order. */
+export const UNREACHABLE_REASONS: readonly UnreachableReason[] = Object.keys(UNREACHABLE_REASON_SET) as UnreachableReason[]
 
 // The constants above must sit where their comments say, against the
 // installed client's minimum and CSCB's floor; fail loudly at load otherwise.

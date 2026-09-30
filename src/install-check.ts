@@ -25,6 +25,12 @@
  *     on it until agent-director Phase 1 is installed;
  *   - a binary that meets the floor passes with no note.
  *
+ * A failure's `detail` keeps the thrown error's structural fields, but every
+ * text in it (a binary's diagnostic output, a signal, a checked location, a
+ * failed read's error message) is one token-free line: token- and URL-like
+ * text redacted and line breaks collapsed by `redactToOneLine`
+ * (`src/ad-version-gate.ts`). The reason word comes from the decision.
+ *
  * The startup gate (`src/agent-director-startup.ts`) does not call
  * `runInstallCheck()`; it builds the client with `Client.create()` and applies
  * CSCB's Phase 1 floor itself, so a binary that passes this check with its
@@ -51,7 +57,7 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { resolveSystemBinary } from 'agent-director'
-import type { ResolveSystemBinaryResult, UnreachableReason } from 'agent-director'
+import type { ResolveSystemBinaryResult } from 'agent-director'
 
 import {
   buildInstallCheckPhase1Note,
@@ -64,6 +70,9 @@ import {
   HOST_VERSION_FAIL_VERSION_UNREADABLE,
   HOST_VERSION_OUTCOME_FAIL,
   HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR,
+  readField,
+  redactToOneLine,
+  settleHostVersionCall,
   type HostVersionCallResult,
   type HostVersionFailure,
 } from './ad-version-gate.ts'
@@ -115,66 +124,100 @@ export type InstallCheckResult = InstallCheckSuccess | InstallCheckFailure
  */
 let cachedFloor: string | InstallCheckFailure | null = null
 
+/** The client's floor file as agent-director's package exports it. */
+const FLOOR_FILE_SPECIFIER = 'agent-director/dist/version-floor.json'
+
+/**
+ * Dependencies of {@link readClientMinVersion}. Tests inject them to reach
+ * each failure path without module mocks.
+ */
+export interface ClientMinVersionDeps {
+  /**
+   * Resolves the floor file's `file:` URL; default: `import.meta.resolve` of
+   * `agent-director/dist/version-floor.json` from this module. A throw is the
+   * could-not-resolve failure; a non-`file:` URL is a read failure.
+   */
+  resolveFloorUrl?: () => string
+  /**
+   * Reads the floor file at a filesystem path as UTF-8 text; default:
+   * `readFileSync(path, 'utf-8')`. A throw is the could-not-read failure.
+   */
+  readFile?: (path: string) => string
+}
+
 /**
  * The installed agent-director client's minimum binary version: read AD's
  * `dist/version-floor.json` via the subpath export and return the
  * `.min_binary_version` value. Returns a pre-built
  * `ad-version-floor-unreadable` failure-arm result on any failure mode
- * (missing file, parse error, missing/non-string field). The value or the
- * failure is cached; {@link resetCacheForTests} and {@link setFloorForTests}
- * reset and seed the cache.
+ * (unresolvable subpath, unreadable file, parse error, missing/non-string
+ * field); a thrown error's message is its `detail.underlying`, as one
+ * token-free line.
+ *
+ * Cache: with no deps (or an empty deps object) the value or the failure is
+ * cached, and later calls return it without re-reading;
+ * {@link resetCacheForTests} and {@link setFloorForTests} reset and seed the
+ * cache. When any dep is injected the call bypasses the cache entirely: it
+ * neither returns a cached value nor stores its own result.
  */
-export function readClientMinVersion(): string | InstallCheckFailure {
-  if (cachedFloor !== null) return cachedFloor
+export function readClientMinVersion(deps: ClientMinVersionDeps = {}): string | InstallCheckFailure {
+  if (deps.resolveFloorUrl === undefined && deps.readFile === undefined) {
+    if (cachedFloor === null) cachedFloor = readFloorFile({})
+    return cachedFloor
+  }
+  return readFloorFile(deps)
+}
+
+/** One uncached read of the floor file; see {@link readClientMinVersion}. */
+function readFloorFile(deps: ClientMinVersionDeps): string | InstallCheckFailure {
+  const resolveFloorUrl = deps.resolveFloorUrl ?? (() => import.meta.resolve(FLOOR_FILE_SPECIFIER))
+  const readFile = deps.readFile ?? ((path: string) => readFileSync(path, 'utf-8'))
 
   let resolved: string
   try {
-    resolved = import.meta.resolve('agent-director/dist/version-floor.json')
+    resolved = resolveFloorUrl()
   } catch (err) {
-    cachedFloor = {
+    return {
       ok: false,
       classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
-        `Could not resolve 'agent-director/dist/version-floor.json' from the installed ` +
+        `Could not resolve '${FLOOR_FILE_SPECIFIER}' from the installed ` +
         `agent-director package. Reinstall agent-director from npm and retry.`,
-      detail: { underlying: (err as Error).message },
+      detail: { underlying: underlyingMessage(err) },
     }
-    return cachedFloor
   }
 
   let raw: string
   try {
-    raw = readFileSync(fileURLToPath(resolved), 'utf-8')
+    raw = readFile(fileURLToPath(resolved))
   } catch (err) {
-    cachedFloor = {
+    return {
       ok: false,
       classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
         `Could not read agent-director's dist/version-floor.json. ` +
         `Reinstall agent-director from npm and retry.`,
-      detail: { underlying: (err as Error).message },
+      detail: { underlying: underlyingMessage(err) },
     }
-    return cachedFloor
   }
 
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
   } catch (err) {
-    cachedFloor = {
+    return {
       ok: false,
       classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
         `agent-director's dist/version-floor.json failed to parse as JSON. ` +
         `Reinstall agent-director from npm and retry.`,
-      detail: { underlying: (err as Error).message },
+      detail: { underlying: underlyingMessage(err) },
     }
-    return cachedFloor
   }
 
   const floor = (parsed as { min_binary_version?: unknown } | null)?.min_binary_version
   if (typeof floor !== 'string' || floor.length === 0) {
-    cachedFloor = {
+    return {
       ok: false,
       classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
@@ -182,10 +225,8 @@ export function readClientMinVersion(): string | InstallCheckFailure {
         `(or it is not a non-empty string). Reinstall agent-director from npm and retry.`,
       detail: { parsed },
     }
-    return cachedFloor
   }
 
-  cachedFloor = floor
   return floor
 }
 
@@ -201,43 +242,36 @@ export interface InstallCheckDeps {
   resolveSystemBinary?: InstallCheckResolveSystemBinary
 }
 
-/** One settled resolver call; a synchronous throw counts as a rejection. Never rejects. */
-async function settleResolve(resolve: InstallCheckResolveSystemBinary): Promise<HostVersionCallResult> {
-  try {
-    return { kind: 'resolved', value: await resolve() }
-  } catch (error) {
-    return { kind: 'rejected', error }
-  }
+/** A text field of a thrown error as one token-free line ({@link redactToOneLine}), else `null`. */
+function safeText(value: unknown): string | null {
+  return typeof value === 'string' ? redactToOneLine(value) : null
 }
 
-/** Read one property of any value without throwing (a getter may throw). */
-function readField(value: unknown, key: string): unknown {
-  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined
+/** A thrown error's `exitCode` when it is a number, else `null`. */
+function safeExitCode(value: unknown): number | null {
+  return typeof value === 'number' ? value : null
+}
+
+/**
+ * An `ErrSystemInstallNotFound`'s `checkedLocations` with each entry's text
+ * as one token-free line (an entry's `detail` is a path or the whole PATH);
+ * an empty list when the field is not a list or cannot be read.
+ */
+function safeCheckedLocations(value: unknown): Array<{ kind: string | null; detail: string | null }> {
+  if (!Array.isArray(value)) return []
   try {
-    return (value as Record<string, unknown>)[key]
+    return value.map((entry: unknown) => ({
+      kind: safeText(readField(entry, 'kind')),
+      detail: safeText(readField(entry, 'detail')),
+    }))
   } catch {
-    return undefined
+    return []
   }
 }
 
-/** An `ErrSystemInstallUnreachable` reason: a short lowercase, hyphenated word. */
-const SAFE_REASON_RE = /^[a-z][a-z0-9-]{0,63}$/
-
-/** The reason of a resolved version that does not parse. */
-const UNPARSEABLE_VERSION_REASON: UnreachableReason = 'unparseable-version'
-
-/** The reason of any failure the decision classes as other. */
-const OTHER_REASON: UnreachableReason = 'other'
-
-/** A thrown `ErrSystemInstallUnreachable`'s reason when it is a short safe word, else `other`. */
-function unreachableReason(error: unknown): string {
-  const reason = readField(error, 'reason')
-  return typeof reason === 'string' && SAFE_REASON_RE.test(reason) ? reason : OTHER_REASON
-}
-
-/** A nullable field of a thrown error, as the error carries it, else `null`. */
-function nullableField(error: unknown, key: string): unknown {
-  return readField(error, key) ?? null
+/** The `underlying` detail of a failed read: the thrown value's message as one token-free line, else `null`. */
+function underlyingMessage(err: unknown): string | null {
+  return safeText(readField(err, 'message'))
 }
 
 /** The `ad-system-install-unreachable` message, built from a path, a reason word and fixed text. */
@@ -251,7 +285,8 @@ function unreachableMessage(binaryPath: string, reason: string): string {
 /**
  * Map the host-version decision's failure to the install check's failure arm.
  * `settled` is the resolver call the decision judged; a thrown value's
- * structural fields fill the detail.
+ * structural fields fill the detail, each text one token-free line
+ * (`redactToOneLine`). The reason word comes from the decision.
  */
 function failureResult(failure: HostVersionFailure, settled: HostVersionCallResult): InstallCheckFailure {
   const thrown = settled.kind === 'rejected'
@@ -264,7 +299,7 @@ function failureResult(failure: HostVersionFailure, settled: HostVersionCallResu
         message:
           `agent-director not found on PATH or at the standard install path. ` +
           `Install agent-director system-wide and retry.`,
-        detail: { checkedLocations: readField(error, 'checkedLocations') },
+        detail: { checkedLocations: safeCheckedLocations(readField(error, 'checkedLocations')) },
       }
     case HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM:
       return {
@@ -284,7 +319,7 @@ function failureResult(failure: HostVersionFailure, settled: HostVersionCallResu
     case HOST_VERSION_FAIL_VERSION_UNREADABLE: {
       // Thrown: an ErrSystemInstallUnreachable of any reason. Resolved: a
       // version the client's strict rule cannot parse (a leading `v` included).
-      const reason = thrown ? unreachableReason(error) : UNPARSEABLE_VERSION_REASON
+      const { reason } = failure
       return {
         ok: false,
         classLabel: AD_SYSTEM_INSTALL_UNREACHABLE,
@@ -292,9 +327,9 @@ function failureResult(failure: HostVersionFailure, settled: HostVersionCallResu
         detail: {
           reason,
           binaryPath: failure.binaryPath,
-          diagnostic: thrown ? nullableField(error, 'diagnostic') : failure.detail,
-          exitCode: thrown ? nullableField(error, 'exitCode') : null,
-          signal: thrown ? nullableField(error, 'signal') : null,
+          diagnostic: thrown ? safeText(readField(error, 'diagnostic')) : failure.detail,
+          exitCode: thrown ? safeExitCode(readField(error, 'exitCode')) : null,
+          signal: thrown ? safeText(readField(error, 'signal')) : null,
         },
       }
     }
@@ -316,7 +351,7 @@ function failureResult(failure: HostVersionFailure, settled: HostVersionCallResu
         message:
           `agent-director system install probe failed unexpectedly: ${failure.description}. ` +
           `Re-install agent-director or file a bug.`,
-        detail: { underlying: failure.description, reason: OTHER_REASON },
+        detail: { underlying: failure.description, reason: HOST_VERSION_FAIL_OTHER },
       }
   }
 }
@@ -333,7 +368,7 @@ export async function runInstallCheck(deps: InstallCheckDeps = {}): Promise<Inst
   if (typeof floorOrFailure !== 'string') return floorOrFailure
   const floor = floorOrFailure
 
-  const settled = await settleResolve(deps.resolveSystemBinary ?? resolveSystemBinary)
+  const settled = await settleHostVersionCall(deps.resolveSystemBinary ?? resolveSystemBinary)
   const outcome = decideHostAdVersion(settled, floor)
   if (outcome.kind === HOST_VERSION_OUTCOME_FAIL) {
     return failureResult(outcome.failure, settled)
