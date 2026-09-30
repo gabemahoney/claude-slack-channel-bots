@@ -16,19 +16,25 @@
  *            the above: agent-director could not report on the persona
  *
  * Only `dead` leads to a kill and a launch. A reading is an object whose
- * `kind` names it, so a `pending` reading can later carry more (its launch
- * start) without changing the consumers of the other three; consumers decide
- * on `livenessKindOf(reading)`.
+ * `kind` names it; consumers decide on `livenessKindOf(reading)`. A `pending`
+ * reading also carries the row's launch start (`launchStartedAt`) when the
+ * `status` result showed one (b.jg5 SRJ-115, SRJ-406): read raw, as
+ * agent-director wrote it, by `pendingLaunchStartOf`. Nothing here parses or
+ * ages it.
  *
  * The row states come from agent-director's spawn state machine (SR-11).
  * `AGENT_DIRECTOR_LIVE_STATES` is kept here, the one list of live states, and
  * re-exported by `src/session-manager.ts`, so the restart and health-check
  * modules can import the readings without loading the session manager.
  *
- * Pure: no I/O, clock, module state or log line.
+ * Pure: no I/O, clock, module state or log line. The `status` result's
+ * launch start field is typed through CSCB's own Phase 1 declarations
+ * (`src/ad-phase1-types.ts`, a type-only import), never through the client.
  *
  * SPDX-License-Identifier: MIT
  */
+
+import type { Phase1StatusResult } from './ad-phase1-types.ts'
 
 // ---------------------------------------------------------------------------
 // Row states (agent-director's spawn state machine, SR-11)
@@ -78,9 +84,14 @@ export interface LiveLivenessReading {
   readonly kind: typeof LIVENESS_LIVE
 }
 
-/** The `pending` reading. */
+/**
+ * The `pending` reading. `launchStartedAt` is the row's launch start as the
+ * `status` result showed it (raw: an RFC 3339 UTC timestamp as agent-director
+ * wrote it, never parsed here), absent when the result showed none.
+ */
 export interface PendingLivenessReading {
   readonly kind: typeof LIVENESS_PENDING
+  readonly launchStartedAt?: string
 }
 
 /** The `dead` reading. */
@@ -102,7 +113,7 @@ export type LivenessReading =
 
 /** The `live` reading, as a value. */
 export const LIVENESS_READING_LIVE: LiveLivenessReading = Object.freeze({ kind: LIVENESS_LIVE })
-/** The `pending` reading, as a value. */
+/** The `pending` reading with no launch start, as a value. */
 export const LIVENESS_READING_PENDING: PendingLivenessReading = Object.freeze({ kind: LIVENESS_PENDING })
 /** The `dead` reading, as a value. */
 export const LIVENESS_READING_DEAD: DeadLivenessReading = Object.freeze({ kind: LIVENESS_DEAD })
@@ -142,4 +153,71 @@ export function livenessKindOf(reading: unknown): LivenessKind {
   } catch {
     return LIVENESS_UNKNOWN
   }
+}
+
+// ---------------------------------------------------------------------------
+// A `pending` row's launch start (b.jg5 SRJ-115, SRJ-406)
+// ---------------------------------------------------------------------------
+
+/**
+ * The launch start a `status` result shows for a `pending` row: its
+ * `launch_started_at`, raw, when the row reads `pending` and the field is a
+ * non-empty string; absent otherwise (no field, `null`, a value that is not a
+ * string, or a row in any other state, whose field is ignored). No parsing or
+ * ageing. Never throws.
+ */
+export function pendingLaunchStartOf(result: Phase1StatusResult | null | undefined): string | undefined {
+  try {
+    if (result === null || result === undefined) return undefined
+    if (result.state !== AGENT_DIRECTOR_PENDING_STATE) return undefined
+    return nonEmptyString(result.launch_started_at)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The `pending` reading carrying `launchStartedAt` (frozen), or
+ * `LIVENESS_READING_PENDING` when there is none.
+ */
+export function pendingLivenessReading(launchStartedAt?: string): PendingLivenessReading {
+  const start = nonEmptyString(launchStartedAt)
+  if (start === undefined) return LIVENESS_READING_PENDING
+  return Object.freeze({ kind: LIVENESS_PENDING, launchStartedAt: start })
+}
+
+/**
+ * The reading for a `status` result: `livenessReadingForState(result.state)`,
+ * with a `pending` reading carrying the row's launch start
+ * (`pendingLaunchStartOf`). Never throws.
+ */
+export function livenessReadingForStatus(result: Phase1StatusResult | null | undefined): LivenessReading {
+  let state: unknown
+  try {
+    state = result?.state
+  } catch {
+    return LIVENESS_READING_UNKNOWN
+  }
+  const reading = livenessReadingForState(state)
+  if (reading.kind !== LIVENESS_PENDING) return reading
+  return pendingLivenessReading(pendingLaunchStartOf(result))
+}
+
+/**
+ * The launch start a probe's answer carries: its `launchStartedAt` when it is
+ * a `pending` reading and that is a non-empty string; absent otherwise. Never
+ * throws.
+ */
+export function launchStartOfReading(reading: unknown): string | undefined {
+  try {
+    if (livenessKindOf(reading) !== LIVENESS_PENDING) return undefined
+    return nonEmptyString((reading as { readonly launchStartedAt?: unknown }).launchStartedAt)
+  } catch {
+    return undefined
+  }
+}
+
+/** `value` when it is a non-empty string, else `undefined`. */
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined
 }

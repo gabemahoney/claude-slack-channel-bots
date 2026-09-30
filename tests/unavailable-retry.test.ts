@@ -43,7 +43,7 @@ import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
-import { LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
+import { LIVENESS_PENDING, LIVENESS_READING_UNKNOWN, type PendingLivenessReading } from '../src/liveness-reading.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
 import {
@@ -68,7 +68,7 @@ import {
   scheduleRestart,
   type RestartRetryOutcome,
 } from '../src/restart.ts'
-import { _buildIsSessionAliveAdapter } from '../src/server.ts'
+import { _buildIsSessionAliveAdapter, deferPendingRow } from '../src/server.ts'
 import {
   _resetConfigDirFs,
   _setConfigDirFs,
@@ -127,6 +127,7 @@ import {
   type UnavailableRetryController,
   type UnavailableRetryMode,
   type UnavailableRetryOutcome,
+  type UnavailableRetryRowRead,
   type UnavailableRetryTriggerSink,
 } from '../src/unavailable-retry.ts'
 import {
@@ -149,6 +150,8 @@ import {
   errUnknownErrorName,
   errUnusableName,
   holdSpawns,
+  SAMPLE_LAUNCH_START_FRACTIONAL,
+  SAMPLE_LAUNCH_STARTS,
   type PersonaGetResultOverrides,
 } from './test-helpers/agent-director-stub.ts'
 import {
@@ -1262,8 +1265,12 @@ interface StandInDeps extends FullModeRetryDeps {
   readonly reads: Array<readonly [string, boolean]>
 }
 
-/** Stand-in deps whose retry entry answers `outcome` and whose row read answers `row` (or rejects with it, an Error). */
-function fullModeDeps(outcome: RestartRetryOutcome, overrides: Partial<FullModeRetryDeps> = {}, row: string | Error = 'waiting'): StandInDeps {
+/**
+ * Stand-in deps whose retry entry answers `outcome` and whose row read answers
+ * `row`: a row state (read as `{ state: row }`), a whole row read, or an Error
+ * it rejects with.
+ */
+function fullModeDeps(outcome: RestartRetryOutcome, overrides: Partial<FullModeRetryDeps> = {}, row: string | UnavailableRetryRowRead | Error = 'waiting'): StandInDeps {
   const calls: string[][] = []
   const reads: Array<readonly [string, boolean]> = []
   return {
@@ -1272,7 +1279,7 @@ function fullModeDeps(outcome: RestartRetryOutcome, overrides: Partial<FullModeR
     readRow: async (key) => {
       reads.push([key, isInsideAttempt(key)])
       if (row instanceof Error) throw row
-      return row
+      return typeof row === 'string' ? { state: row } : row
     },
     retry: async (key, cwd) => {
       calls.push([key, cwd])
@@ -1332,6 +1339,21 @@ describe('unavailable retry: the retry action’s decisions over stand-ins', () 
     const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, {}, row)
 
     expect(await createFullModeRetryAction(deps)(KEY, PENDING_ONLY_RETRY)).toEqual(answer)
+    expect(deps.reads).toEqual([[KEY, true]])
+    expect(deps.calls).toEqual([])
+  })
+
+  test.each(Object.entries(SAMPLE_LAUNCH_STARTS))('pending-only: a pending row read carrying a launch start (%s) answers the same row-pending refusal, and no retry entry call', async (_form, launchStartedAt) => {
+    const row: UnavailableRetryRowRead = launchStartedAt === undefined
+      ? { state: UNAVAILABLE_RETRY_ROW_PENDING }
+      : { state: UNAVAILABLE_RETRY_ROW_PENDING, launchStartedAt }
+    const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, {}, row)
+
+    expect(await createFullModeRetryAction(deps)(KEY, PENDING_ONLY_RETRY)).toEqual({
+      kind: 'again',
+      reason: UNAVAILABLE_RETRY_AGAIN_ROW_PENDING,
+      row: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
     expect(deps.reads).toEqual([[KEY, true]])
     expect(deps.calls).toEqual([])
   })
@@ -1554,7 +1576,11 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
   test.each<[string, RowState, boolean, Record<string, number>, string | ReArmed]>([
     ['live and connected with its stream: nothing left to recover, no launch', 'waiting', true, { statusCalls: 1 }, UNAVAILABLE_RETRY_STOP_RECOVERED],
     ['live and not connected: a reconnect that succeeds, never a spawn, and nothing left to recover', 'waiting', false, { statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 }, UNAVAILABLE_RETRY_STOP_RECOVERED],
-    ['pending (live) and not connected: the reconnect defers, never a spawn, and the timer runs on in full mode, its last row read pending', 'pending', false, { statusCalls: 2 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
+    // A `pending` liveness reading is deferred by the restart work itself
+    // (b.jg5 SRJ-314), whatever the connection shows: its one status read,
+    // and no reconnect (so no second status read), send-keys, kill or spawn.
+    ['pending and not connected: the liveness read defers it, no reconnect and never a spawn, and the timer runs on in full mode, its last row read pending', 'pending', false, { statusCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
+    ['pending and connected with its stream: never nothing left to recover; the liveness read defers it, and the timer runs on in full mode, its last row read pending', 'pending', true, { statusCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
     ['ended: a kill and a launch, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'ended', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
     ['missing: a kill and a launch, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'missing', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
   ])('a retry that finds the row %s', async (_what, state, connected, calls, outcome) => {
@@ -1585,6 +1611,70 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
       })
     }
     expect(getFailureCount(key)).toBe(0)
+  })
+
+  test('with both settings 0, a retry that finds the row pending and the session connected with its stream hands it, with its launch start, to the pending deferral once: no kill, spawn, resume or send-keys, nothing counted, re-armed at the next wait in full mode and kept through either condition end; a following retry that finds it live, connected and with its stream stops the timer', async () => {
+    // The pending deferral wired as main() wires it: the server's
+    // deferPendingRow, given the reading's launch start.
+    const deferred: Array<readonly [string, PendingLivenessReading]> = []
+    const h = (harness = makeRecoveryHarness({
+      restartDeps: {
+        deferPendingRow: (k, reading) => {
+          deferred.push([k, reading])
+          deferPendingRow(k, reading.launchStartedAt)
+        },
+      },
+    }))
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key] = h.keys as [string]
+    let state: RowState = UNAVAILABLE_RETRY_ROW_PENDING
+    h.script({
+      statusFn: () => state === UNAVAILABLE_RETRY_ROW_PENDING
+        ? cannedStatusResult({ state, launch_started_at: SAMPLE_LAUNCH_START_FRACTIONAL })
+        : cannedStatusResult({ state }),
+    })
+    h.setConnected(key, true)
+    // A failure counted beforehand: a success recorded by the retry would
+    // clear it, and a failure would add to it.
+    recordFailure(key)
+    h.controller.arm(key, UNAVAILABLE)
+    const armedAt = h.clock.now()
+
+    await retryNow(h, key)
+
+    expect(h.attempts).toEqual([{ key, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], mode: UNAVAILABLE_RETRY_MODE_FULL, at: armedAt + waitMs(0) }])
+    // Its liveness read, and nothing else: no reconnect read, send-keys,
+    // pane read, kill, spawn or resume.
+    expect(callCounts(h)).toEqual({ statusCalls: 1 })
+    expect(deferred).toEqual([[key, { kind: LIVENESS_PENDING, launchStartedAt: SAMPLE_LAUNCH_START_FRACTIONAL }]])
+    expect(h.errors.filter((line) => line.includes(`persona=${key}`) && line.includes(SAMPLE_LAUNCH_START_FRACTIONAL))).toHaveLength(1)
+    expect(getFailureCount(key)).toBe(1)
+    expect(h.capReached).toEqual([])
+    expect(h.triggers).toEqual([])
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1))
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(1),
+      waitMs: waitMs(1),
+      refusals: 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+    expect(delays(h.clock)).toEqual([waitMs(1)])
+    // E8's condition-end entry (SRJ-306) keeps the timer on the pending row.
+    expectKeptThroughEveryConditionEnd(h, key, UNAVAILABLE_RETRY_KEPT_ROW_PENDING)
+
+    // The session starts: the row reads live, connected with its stream.
+    state = 'waiting'
+    const before = callCounts(h)
+    await retryNow(h, key)
+
+    expect(h.attempts.map((a) => [a.retry, a.mode])).toEqual([[1, UNAVAILABLE_RETRY_MODE_FULL], [2, UNAVAILABLE_RETRY_MODE_FULL]])
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+    expect(deferred).toHaveLength(1)
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expectStopped(h, key)
   })
 
   test('a retry that finds the launch in flight makes no agent-director call and re-arms at the doubled wait; once the launch settles the next retry acts', async () => {
@@ -2027,12 +2117,14 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     })
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([dueAt])
 
-    // The full decision on a pending row: the liveness read and the
-    // reconnect's read, which defers; a pending-only retry would read once.
+    // The full decision on a pending row: its liveness read, which defers it
+    // (b.jg5 SRJ-314), so one status read, as a pending-only retry's row read
+    // would be; the full decision shows in the retry's mode and in its
+    // pending-deferred again-reason (a pending-only retry answers row-pending).
     const before = callCounts(h)
     await retryNow(h, key)
     expect(h.attempts).toEqual([{ key, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt }])
-    expect(callsSince(h, before)).toEqual({ statusCalls: 2 })
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
     expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1))
     expect(h.controller.view(key)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
   })
@@ -2060,9 +2152,12 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     })
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([dueAt])
 
+    // The full decision: its liveness read defers the pending row (b.jg5
+    // SRJ-314), its one status read; it answers pending-deferred, not the
+    // pending-only row-pending.
     await retryNow(h, key)
     expect(h.attempts.map((a) => [a.mode, a.at])).toEqual([[UNAVAILABLE_RETRY_MODE_FULL, dueAt]])
-    expect(callCounts(h)).toEqual({ statusCalls: 2 })
+    expect(callCounts(h)).toEqual({ statusCalls: 1 })
     expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1))
   })
 

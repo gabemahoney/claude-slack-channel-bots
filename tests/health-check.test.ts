@@ -43,7 +43,9 @@ import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import {
   LIVENESS_READING_DEAD,
   LIVENESS_READING_LIVE,
+  LIVENESS_READING_PENDING,
   LIVENESS_READING_UNKNOWN,
+  pendingLivenessReading,
   type LivenessReading,
 } from '../src/liveness-reading.ts'
 import {
@@ -63,6 +65,7 @@ import {
   fakeToken,
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
+import { SAMPLE_LAUNCH_START_WHOLE } from './test-helpers/agent-director-stub.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1380,6 +1383,69 @@ describe('b.jg5 SRJ-314: an unknown reading or a thrown probe skips the persona 
 
     expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
     expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-314 — a `pending` row is never counted healthy
+//
+// A `pending` reading takes the alive branches, but only `live` is healthy. A
+// `pending` row connected with its stream takes the not-deliverable path (the
+// two-tick streak, then scheduleRestart, whose run defers it: pinned in
+// tests/restart.test.ts), never ends the not-connected episode and gets no
+// delay-0 notice, whose "disconnected" or "streamless" wording would be false.
+// A disconnected or streamless `pending` row keeps the alive branch, notice
+// included. Each case runs with and without a launch start on the reading.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-314: a pending row is never counted healthy', () => {
+  const PENDING_READINGS: Array<[string, LivenessReading]> = [
+    ['no launch start', LIVENESS_READING_PENDING],
+    ['a launch start', pendingLivenessReading(SAMPLE_LAUNCH_START_WHOLE)],
+  ]
+
+  /** Deps with auto-restart disabled, recording notices asked for and episodes ended with the connectedness-call count at the time. */
+  function pendingDeps(opts: DepsOpts) {
+    const deps = makeDeps(opts)
+    deps.isAutoRestartDisabled = () => true
+    const notified: Array<[number, string, string]> = []
+    const ended: Array<[number, string]> = []
+    deps.notifyNotConnected = (key, why) => void notified.push([deps.isSessionConnectedCalls.length, key, why])
+    deps.endNotConnectedEpisode = (key) => void ended.push([deps.isSessionConnectedCalls.length, key])
+    return { deps, notified, ended }
+  }
+
+  test.each(PENDING_READINGS)('pending (%s), connected with its stream: scheduled on its second consecutive tick, never its first; no notice; only a live healthy tick between resets the streak and ends the episode', async (_label, pending) => {
+    //   ticks 1–2: pending, deliverable → streak 1, then 2 → scheduled (call 2)
+    //   tick 3:    live, deliverable    → healthy: streak reset, episode ended
+    //   ticks 4–5: pending, deliverable → fresh streak 1, then 2 → scheduled (call 5)
+    // Counted healthy, pending would end the episode each tick and never be
+    // scheduled; read dead, it would be scheduled on every tick from the first.
+    const { deps, notified, ended } = pendingDeps({
+      aliveSequence: { [KEY]: [pending, pending, LIVENESS_READING_LIVE, pending] },
+      maxTicks: 5,
+    })
+
+    await runTicks(deps, 5)
+
+    expect(deps.isSessionConnectedCalls).toHaveLength(5)
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }, { key: KEY, cwd: WD }])
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([2, 5])
+    expect(ended).toEqual([[3, KEY]])
+    expect(notified).toEqual([])
+  })
+
+  test.each(PENDING_READINGS.flatMap(([label, pending]) => [
+    [`${label}, disconnected`, pending, { isSessionConnectedResult: false }, 'disconnected'],
+    [`${label}, connected with its stream gone`, pending, { hasSessionStreamResult: false }, 'streamless'],
+  ] as Array<[string, LivenessReading, DepsOpts, 'disconnected' | 'streamless']>))('pending (%s): the alive branch — scheduled every second tick, each schedule asking for the notice with its true reason, no episode ended', async (_label, pending, down, cause) => {
+    const { deps, notified, ended } = pendingDeps({ ...down, aliveSequence: { [KEY]: [pending] }, maxTicks: 4 })
+
+    await runTicks(deps, 4)
+
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([2, 4])
+    expect(notified).toEqual([[2, KEY, cause], [4, KEY, cause]])
+    expect(ended).toEqual([])
   })
 })
 

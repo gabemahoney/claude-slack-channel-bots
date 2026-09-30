@@ -130,7 +130,12 @@ import {
   isInvalidFlagsError,
 } from './ad-error-class.ts'
 import { RECHECK_OUTCOME_STOP } from './ad-version-gate.ts'
-import { runInAttempt, UNAVAILABLE_RETRY_ROW_ABSENT, type AttemptView } from './unavailable-retry.ts'
+import {
+  runInAttempt,
+  UNAVAILABLE_RETRY_ROW_ABSENT,
+  type AttemptView,
+  type UnavailableRetryRowRead,
+} from './unavailable-retry.ts'
 import { recordStartupError } from './startup-errors.ts'
 import {
   locateTranscript,
@@ -152,7 +157,7 @@ import {
 import { describeDestinationFailureCause } from './persona-destination.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { RESTART_FAILURE_CAP } from './restart.ts'
-import { AGENT_DIRECTOR_LIVE_STATES } from './liveness-reading.ts'
+import { AGENT_DIRECTOR_LIVE_STATES, pendingLaunchStartOf } from './liveness-reading.ts'
 import { isDryRun } from './tokens.ts'
 import { DIALOG_READY_TIMEOUT_MS } from './ad-settings.ts'
 // Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
@@ -2224,21 +2229,25 @@ async function reconcileAndReadRowState(key: string, logPrefix: string, ref: str
  * The UNAVAILABLE retry timer's row read (b.jg5 SRJ-303, SRJ-115): one
  * `status` call for persona `key`'s row (`cscb_<key>`) through
  * `withOutageDetection`, with no findMissing sweep before it and no other
- * call. Answers the row's state as agent-director reports it (`pending`,
+ * call. Answers the row's `state` as agent-director reports it (`pending`,
  * `waiting`, `ended`, `missing` …), or `UNAVAILABLE_RETRY_ROW_ABSENT` when
- * there is no row (`ErrSpawnNotFound`, recognised by name). Every other error
- * is thrown to the caller; inside a recovery attempt for the persona the
- * wrapper has already reported it, so a `status` error arms the persona's
- * retry timer (SRJ-301). Logs nothing.
+ * there is no row (`ErrSpawnNotFound`, recognised by name). On a `pending`
+ * row it also answers the launch start the result shows
+ * (`launchStartedAt`, raw, `pendingLaunchStartOf`; absent when not shown, and
+ * never answered for another state). Every other error is thrown to the
+ * caller; inside a recovery attempt for the persona the wrapper has already
+ * reported it, so a `status` error arms the persona's retry timer (SRJ-301).
+ * Logs nothing.
  */
-export async function readPersonaRowState(key: string): Promise<string> {
+export async function readPersonaRowState(key: string): Promise<UnavailableRetryRowRead> {
   try {
     const st = await withOutageDetection(key, undefined, (client) =>
       client.status({ claude_instance_id: personaInstanceId(key) }),
     )
-    return st.state
+    const launchStartedAt = pendingLaunchStartOf(st)
+    return launchStartedAt === undefined ? { state: st.state } : { state: st.state, launchStartedAt }
   } catch (err) {
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return UNAVAILABLE_RETRY_ROW_ABSENT
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return { state: UNAVAILABLE_RETRY_ROW_ABSENT }
     throw err
   }
 }

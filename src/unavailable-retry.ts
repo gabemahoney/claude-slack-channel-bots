@@ -119,8 +119,10 @@
  * its outcome decides: a persona already connected with its stream, or
  * reconnected, has nothing left to recover (stop); capped, not up, a declined
  * launch or shutting down stop too; a launch in flight, a refused launch, a
- * counted launch failure below the cap, a deferred reconnect (on a `pending`
- * row, recorded as the last row read), a liveness reading of `unknown` (b.jg5
+ * counted launch failure below the cap, a deferred reconnect, a row found
+ * `pending` (by the liveness probe, whatever the session's connection shows,
+ * or by the reconnect's or b.d61's re-probe's read; recorded as the last row
+ * read, and never "nothing left to recover"), a liveness reading of `unknown` (b.jg5
  * SRJ-314; it read no row, so the last row read is kept) and a successful
  * launch retry again at the next wait. A successful launch records the row
  * read `pending` and
@@ -232,6 +234,17 @@ export const UNAVAILABLE_RETRY_ROW_ABSENT = 'absent'
 /** The row state of a launch whose session has not started. */
 export const UNAVAILABLE_RETRY_ROW_PENDING = 'pending'
 
+/**
+ * What the row read answers (b.jg5 SRJ-303, SRJ-115): the row's `state` as
+ * agent-director reports it, or `UNAVAILABLE_RETRY_ROW_ABSENT` when there is
+ * no row, and, on a `pending` row only, its launch start as the `status`
+ * result showed it (raw, never parsed or aged here; absent when not shown).
+ */
+export interface UnavailableRetryRowRead {
+  readonly state: string
+  readonly launchStartedAt?: string
+}
+
 /** The row states that say the persona's claude process is gone. */
 const GONE_ROW_STATES: ReadonlySet<string> = new Set(['ended', 'missing', UNAVAILABLE_RETRY_ROW_ABSENT])
 
@@ -283,7 +296,12 @@ export const UNAVAILABLE_RETRY_AGAIN_LAUNCHED = 'launched'
 /** A full-mode retry that ran before the restart module was initialised, and did nothing. */
 export const UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED = 'restart-not-initialised'
 
-/** A full-mode retry whose reconnect was deferred because the row reads `pending`. */
+/**
+ * A full-mode retry whose run found the row `pending` and deferred it (the
+ * liveness probe read it `pending`, whatever the session's connection showed,
+ * or the reconnect's or b.d61's re-probe's read did): no reconnect, kill or
+ * launch.
+ */
 export const UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED = 'pending-deferred'
 
 /**
@@ -916,11 +934,12 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
 export interface FullModeRetryDeps {
   /**
    * The row read (`readPersonaRowState`): one `status` call for the
-   * persona's row, answering its state or `UNAVAILABLE_RETRY_ROW_ABSENT`, and
-   * throwing any other error. A pending-only retry makes it inside a recovery
-   * attempt for the persona.
+   * persona's row, answering its state or `UNAVAILABLE_RETRY_ROW_ABSENT`, with
+   * a `pending` row's raw launch start when shown (`UnavailableRetryRowRead`),
+   * and throwing any other error. A pending-only retry makes it inside a
+   * recovery attempt for the persona and acts on the state.
    */
-  readRow: (key: string) => Promise<string>
+  readRow: (key: string) => Promise<UnavailableRetryRowRead>
   /**
    * The restart module's retry entry (`runRestartRetry`): the restart path's
    * decision for the persona, through its serializer, without the delay gate,
@@ -970,7 +989,7 @@ export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableR
         return { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, row: UNAVAILABLE_RETRY_ROW_PENDING }
       }
       const row = await runInAttempt(key, 'recovery', () => deps.readRow(key))
-      return pendingOnlyAnswer(row, () => deps.retry(key, cwd, deps.isInFlight))
+      return pendingOnlyAnswer(row.state, () => deps.retry(key, cwd, deps.isInFlight))
     }
     return answerFor(await deps.retry(key, cwd, deps.isInFlight))
   }
@@ -1017,7 +1036,9 @@ function againWith(reason: string | undefined): UnavailableRetryOutcome {
  * What a full-mode retry answers for the retry entry's outcome. A refused
  * launch gives no reason of its own: the UNAVAILABLE outcome that refused it
  * armed the timer during the run, and the re-armed line names that cause. A
- * reconnect deferred on a `pending` row records the row read `pending`. A
+ * run that found the row `pending` and deferred it (b.jg5 SRJ-302, SRJ-305:
+ * a refusal, never "nothing left to recover", even for a session connected
+ * with its stream) records the row read `pending`. A
  * liveness reading of `unknown` (b.jg5 SRJ-314) is a refusal that read no
  * row: the last row read is kept as it is. A successful launch records the row read `pending` too (the launch's row,
  * whether or not the switch is taken) and asks to switch the timer to

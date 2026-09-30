@@ -28,11 +28,15 @@
  * alone.
  * The liveness probe answers one of four readings (b.jg5 SRJ-314,
  * `src/liveness-reading.ts`), and only `dead` leads to the kill and the
- * launch. `live`, and for now `pending`, take the reconnect path. `unknown`
- * (a `status` error the adapter could not read as dead, or a probe that
- * throws) makes the work return with no reconnect, kill, launch or
- * accounting, and call the arm hook (`RestartDeps.armRetryTimer`); so does an
- * `unknown` re-probe after an 'escalate-dead' reconnect (b.d61).
+ * launch. `live` takes the reconnect path. `pending` (the row's session has
+ * not started) is handed to the `pending` deferral
+ * (`RestartDeps.deferPendingRow`) with the row's launch start, whatever the
+ * session's connection shows, and the work returns with no reconnect, kill,
+ * launch or accounting. `unknown` (a `status` error the adapter could not
+ * read as dead, or a probe that throws) makes the work return with no
+ * reconnect, kill, launch or accounting, and call the arm hook
+ * (`RestartDeps.armRetryTimer`); so does an `unknown` re-probe after an
+ * 'escalate-dead' reconnect (b.d61).
  * The work answers an outcome (`RestartWorkOutcome`, one of the
  * `RESTART_OUTCOME_*` labels); the restart timer ignores it. The retry entry,
  * `runRestartRetry`, is how the UNAVAILABLE retry timer's retries rerun the
@@ -64,9 +68,12 @@ import {
   LIVENESS_DEAD,
   LIVENESS_PENDING,
   LIVENESS_UNKNOWN,
+  launchStartOfReading,
   livenessKindOf,
+  pendingLivenessReading,
   type LivenessKind,
   type LivenessReading,
+  type PendingLivenessReading,
 } from './liveness-reading.ts'
 
 // ---------------------------------------------------------------------------
@@ -110,9 +117,14 @@ export const RESTART_OUTCOME_RECONNECTED = 'reconnected'
  */
 export const RESTART_OUTCOME_RECONNECT_DEFERRED = 'reconnect-deferred'
 /**
- * The row reads `pending` (its session has not started), so the reconnect
- * typed nothing and was deferred (`pending`), or b.d61's re-probe after an
- * 'escalate-dead' reconnect read it `pending`: no launch, nothing counted.
+ * The row reads `pending` (its session has not started): the liveness probe
+ * read it `pending` and the work handed it to the `pending` deferral
+ * (`RestartDeps.deferPendingRow`), whatever the session's connection showed
+ * (b.jg5 SRJ-314); or the probe read it `live` and the reconnect adapter's
+ * own read found it `pending`, so the reconnect typed nothing and was
+ * deferred (`pending`); or b.d61's re-probe after an 'escalate-dead'
+ * reconnect read it `pending`. No reconnect, kill or launch, nothing counted.
+ * Never "nothing left to recover" (SRJ-305).
  */
 export const RESTART_OUTCOME_PENDING_DEFERRED = 'pending-deferred'
 /** The kill and the launch ran and the launch succeeded (a success was recorded). */
@@ -184,11 +196,17 @@ export interface RestartDeps {
   canRestart(key: string): boolean
   /**
    * The persona's liveness reading (b.jg5 SRJ-314, `src/liveness-reading.ts`):
-   * `live`, `pending`, `dead` or `unknown`. Only `dead` leads to the kill and
-   * the launch. `live` and, for now, `pending` take the reconnect path;
-   * `unknown`, a probe that throws and an answer that is not a reading all
-   * read `unknown`: the work returns `RESTART_OUTCOME_LIVENESS_UNKNOWN` with
-   * no reconnect, kill, launch or accounting, and calls `armRetryTimer`.
+   * `live`, `pending` (with the row's launch start when the `status` result
+   * showed one), `dead` or `unknown`. Only `dead` leads to the kill and the
+   * launch. `live` takes the reconnect path; `pending` on the work's first
+   * liveness probe goes to `deferPendingRow` and the work returns
+   * `RESTART_OUTCOME_PENDING_DEFERRED` with no reconnect, kill, launch or
+   * accounting (`pending` on the b.d61 re-probe after an 'escalate-dead'
+   * reconnect returns `RESTART_OUTCOME_PENDING_DEFERRED` with its own line
+   * and does not call `deferPendingRow`); `unknown`, a probe that
+   * throws and an answer that is not a reading all read `unknown`: the work
+   * returns `RESTART_OUTCOME_LIVENESS_UNKNOWN` with no reconnect, kill,
+   * launch or accounting, and calls `armRetryTimer`.
    */
   isSessionAlive(key: string): Promise<LivenessReading>
   /** Check if the session already has a live MCP connection in the registry. */
@@ -204,8 +222,9 @@ export interface RestartDeps {
   /**
    * Attempt to reconnect the MCP session. Returns a discriminated result so
    * restart.ts can call recordSuccess on the 'success' path. `'pending'`: the
-   * row reads `pending`, so nothing was typed and the reconnect is deferred,
-   * as `'transient'` is; the work answers `RESTART_OUTCOME_PENDING_DEFERRED`
+   * adapter's own read found the row `pending` (the liveness probe had read
+   * it `live`), so nothing was typed and the reconnect is deferred, as
+   * `'transient'` is; the work answers `RESTART_OUTCOME_PENDING_DEFERRED`
    * for it, so the retry timer knows the row read `pending`.
    *
    * The return type is widened from void: the server.ts adapter already
@@ -258,6 +277,21 @@ export interface RestartDeps {
    * that throws is logged and changes nothing else. Absent: nothing is armed.
    */
   armRetryTimer?(key: string): void
+  /**
+   * The `pending` deferral (b.jg5 SRJ-314; SRJ-409's entry point): called
+   * once with the persona key and its `pending` reading, which carries the
+   * row's launch start when the probe read one (`launchStartedAt`, raw), when
+   * the work's first liveness probe reads `pending`, before the session's
+   * connection is looked at. The work then answers
+   * `RESTART_OUTCOME_PENDING_DEFERRED` with no reconnect, kill, launch or
+   * accounting. The b.d61 re-probe after an 'escalate-dead' reconnect is the
+   * exception: its `pending` answers `RESTART_OUTCOME_PENDING_DEFERRED` with
+   * its own line and does not call this member. Production binds the
+   * server's `deferPendingRow`. A member
+   * that throws is logged and changes nothing else. Absent: nothing is
+   * called, and the work answers the same.
+   */
+  deferPendingRow?(key: string, reading: PendingLivenessReading): void
 }
 
 /** What `RestartDeps.reconnectSession` answers; `void` is a non-success. */
@@ -465,9 +499,10 @@ function launchInFlight(key: string, isInFlight: (key: string) => boolean): bool
  * The work a restart timer does when it fires, and a retry reruns, run
  * through the serializer: the shutdown and not-up checks, the liveness probe,
  * the not-up check again, then, by the reading (b.jg5 SRJ-314), a return with
- * nothing done (`unknown`, a thrown probe included: the arm hook is called),
- * a reconnect (`live`, and for now `pending`), or a kill and a launch
- * (`dead`), and the success or failure accounting. A reconnect whose verdict
+ * nothing done (`unknown`, a thrown probe included: the arm hook is called;
+ * `pending`, whatever the session's connection shows: the `pending` deferral
+ * is called), a reconnect (`live`), or a kill and a launch (`dead`), and the
+ * success or failure accounting. A reconnect whose verdict
  * is 'escalate-dead' is followed by a second liveness probe; only when the
  * row now reads `dead` does the same run go on to the kill and launch
  * (b.d61). The restart cap is not
@@ -509,8 +544,17 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     return RESTART_OUTCOME_LIVENESS_UNKNOWN
   }
 
-  // `live`, and for now `pending`, take the reconnect path; only `dead` falls
-  // through to the kill and the launch.
+  // b.jg5 SRJ-314: the row reads `pending`, so its session has not started.
+  // It goes to the `pending` deferral whatever the session's connection
+  // shows (a connected `pending` row is never "already reconnected"): no
+  // reconnect, kill or launch, nothing counted.
+  if (probe.kind === LIVENESS_PENDING) {
+    deferPending(d, key, probe)
+    return RESTART_OUTCOME_PENDING_DEFERRED
+  }
+
+  // `live` takes the reconnect path; only `dead` falls through to the kill
+  // and the launch.
   if (probe.kind !== LIVENESS_DEAD) {
     // If the session already re-established its MCP connection (e.g. Claude
     // Code refreshed the SSE stream on its own), skip the reconnect. A
@@ -680,23 +724,48 @@ async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<Re
   }
 }
 
-/** One liveness probe's result: its reading's kind, and why it failed when the probe threw. */
+/**
+ * One liveness probe's result: its reading's kind, why it failed when the
+ * probe threw, and a `pending` reading's launch start.
+ */
 interface LivenessProbe {
   readonly kind: LivenessKind
   /** `describeThrownValue` of what the probe threw; absent when it answered. */
   readonly failure?: string
+  /** A `pending` reading's launch start (raw); absent for any other reading, or when it showed none. */
+  readonly launchStartedAt?: string
 }
 
 /**
  * Probe persona `key`'s liveness (b.jg5 SRJ-314): the reading's kind, with a
  * probe that throws, or answers something that is not a reading, read
- * `unknown` (never `dead`). Logs nothing; never rejects.
+ * `unknown` (never `dead`), and a `pending` reading's launch start. Logs
+ * nothing; never rejects.
  */
 async function probeLiveness(d: RestartDeps, key: string): Promise<LivenessProbe> {
+  let reading: LivenessReading
   try {
-    return { kind: livenessKindOf(await d.isSessionAlive(key)) }
+    reading = await d.isSessionAlive(key)
   } catch (err) {
     return { kind: LIVENESS_UNKNOWN, failure: describeThrownValue(err) }
+  }
+  const kind = livenessKindOf(reading)
+  const launchStartedAt = launchStartOfReading(reading)
+  return launchStartedAt === undefined ? { kind } : { kind, launchStartedAt }
+}
+
+/**
+ * Hand persona `key`'s `pending` reading, with the launch start its probe
+ * read, to the `pending` deferral (`RestartDeps.deferPendingRow`) once
+ * (b.jg5 SRJ-314). Absent, nothing is called. A member that throws is
+ * logged; never throws.
+ */
+function deferPending(d: RestartDeps, key: string, probe: LivenessProbe): void {
+  if (d.deferPendingRow === undefined) return
+  try {
+    d.deferPendingRow(key, pendingLivenessReading(probe.launchStartedAt))
+  } catch (err) {
+    console.error(`[slack] restart: the pending deferral failed for persona=${key}: ${describeThrownValue(err)}`)
   }
 }
 

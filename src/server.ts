@@ -148,7 +148,8 @@ import {
   LIVENESS_READING_DEAD,
   LIVENESS_READING_UNKNOWN,
   LIVENESS_UNKNOWN,
-  livenessReadingForState,
+  livenessReadingForStatus,
+  pendingLaunchStartOf,
   type LivenessReading,
 } from './liveness-reading.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
@@ -966,9 +967,10 @@ export async function _runCallTimeoutStartStep(
  * without importing the private closure inside main().
  *
  * It answers one of four readings (b.jg5 SRJ-314, `src/liveness-reading.ts`):
- * a `status` state maps through `livenessReadingForState` (`pending` →
- * `pending`, another live state → `live`, `ended` or `missing` → `dead`, any
- * other state → `unknown`, logged). A `status` error is decided by name
+ * a `status` result maps through `livenessReadingForStatus` (`pending` →
+ * `pending`, carrying the row's raw launch start when the result shows one,
+ * b.jg5 SRJ-115; another live state → `live`, `ended` or `missing` → `dead`,
+ * any other state → `unknown`, logged). A `status` error is decided by name
  * through `src/ad-error-class.ts`:
  *   - `ErrSpawnNotFound` → `dead`; clears `ad-unreachable` and
  *     `tmux-unavailable`, as a state answer does;
@@ -1004,7 +1006,7 @@ export function _buildIsSessionAliveAdapter(
       const r = await getClient().status({ claude_instance_id })
       clearOutageFlag(key, 'ad-unreachable')
       clearOutageFlag(key, 'tmux-unavailable')
-      const reading = livenessReadingForState(r.state)
+      const reading = livenessReadingForStatus(r)
       if (reading.kind === LIVENESS_UNKNOWN) {
         console.error(`[slack] isSessionAlive: status answered a state CSCB does not know for persona=${key} — read as unknown, not dead`)
       }
@@ -1253,11 +1255,16 @@ export function _buildKillSessionAdapter(
  * b.dup — a row agent-director will not type into. agent-director refuses
  * send-keys to a row that is not interactive (`ErrSpawnNotInteractive`):
  *   - `pending` (its session has not started; SessionStart has not fired) →
- *     defer ('pending'), typing nothing (`deferPendingRow`): the keystrokes
- *     would be refused, and the session connects its MCP servers on its own
- *     once it starts. restart.ts treats it as it treats 'transient', and
- *     answers `RESTART_OUTCOME_PENDING_DEFERRED`, so the UNAVAILABLE retry
- *     timer knows the row read `pending`.
+ *     defer ('pending'), typing nothing (`deferPendingRow`, passed the row's
+ *     raw launch start when the result showed one, b.jg5 SRJ-115): the
+ *     keystrokes would be refused, and the session connects its MCP servers
+ *     on its own once it starts. The restart work hands a row its liveness
+ *     probe reads `pending` to `deferPendingRow` itself, before it would
+ *     call this adapter (b.jg5 SRJ-314); this branch covers a row the probe
+ *     read `live` that reads `pending` by this second read. restart.ts
+ *     treats it as it treats 'transient', and answers
+ *     `RESTART_OUTCOME_PENDING_DEFERRED`, so the UNAVAILABLE retry timer
+ *     knows the row read `pending`.
  *   - `ended` or `missing` — read here, or reached between this status read
  *     and the keystrokes (a findMissing sweep, such as the one another
  *     persona's launch wait starts with, marked the row missing) → the
@@ -1279,12 +1286,15 @@ export function _buildReconnectSessionAdapter(
   // `key` is the persona key.
   return async (key: string) => {
     let state: string
+    // b.jg5 SRJ-115: a `pending` row's raw launch start, for `deferPendingRow`.
+    let launchStartedAt: string | undefined
     try {
       const claude_instance_id = personaInstanceId(key)
       const st = await withOutageDetection(key, undefined, (client) =>
         client.status({ claude_instance_id }),
       )
       state = st.state
+      launchStartedAt = pendingLaunchStartOf(st)
     } catch (err) {
       // b.f2b: nothing is known about the session, so nothing is typed.
       forgetWorkingRowEvidence(key)
@@ -1308,7 +1318,7 @@ export function _buildReconnectSessionAdapter(
     } else if (PROMPT_ROW_STATES.has(state)) {
       return promptRowReconnectVerdict(key, state)
     } else if (state === 'pending') {
-      return deferPendingRow(key)
+      return deferPendingRow(key, launchStartedAt)
     } else if (state === 'waiting' && (await checkWaitingRowPane(key)) === 'defer') {
       // b.f2b: its pane shows a running turn or a prompt; logged there.
       return 'transient'
@@ -1423,18 +1433,31 @@ function deferPromptRow(key: string, state: string): 'transient' {
 }
 
 /**
- * b.dup: the reconnect adapter's verdict for a persona whose row reads
- * `pending` (see `_buildReconnectSessionAdapter`): its session has not
- * started, so agent-director would refuse the keystrokes
+ * The `pending` deferral for persona `key` (b.dup; b.jg5 SRJ-314, and the
+ * entry point of SRJ-409's pending-row handling): its row reads `pending`, so
+ * its session has not started. agent-director would refuse keystrokes to it
  * (`ErrSpawnNotInteractive`, which `reconnectMcp` reads as a dead session),
- * and the session connects its MCP servers on its own once it starts. Types
- * nothing, raises no notice (a launch whose session never leaves `pending`
- * raises its own, from its dialog approver), logs the deferral and returns
- * 'pending', a deferral like 'transient'; a later tick retries.
+ * and the session connects its MCP servers on its own once it starts. Two
+ * callers reach it: the restart work, through `RestartDeps.deferPendingRow`
+ * (bound in `main()`), when its liveness probe reads `pending`, whatever the
+ * session's connection shows; and the reconnect adapter, when its own
+ * `status` read finds the row `pending` (see `_buildReconnectSessionAdapter`).
+ * `launchStartedAt` is the row's launch start as that `status` result showed
+ * it (raw, never parsed or aged here; b.jg5 SRJ-115, SRJ-406), absent when it
+ * showed none. Types nothing, kills and launches nothing, counts nothing and
+ * raises no notice (a launch whose session never leaves `pending` raises its
+ * own, from its dialog approver); logs the deferral, naming the launch start
+ * when one was read, and returns 'pending', a deferral like 'transient'. A
+ * later tick or retry reads the row again.
+ *
+ * Exported for tests.
+ *
+ * @internal
  */
-function deferPendingRow(key: string): 'pending' {
+export function deferPendingRow(key: string, launchStartedAt?: string): 'pending' {
+  const launch = launchStartedAt === undefined ? '' : ` (launch started ${launchStartedAt})`
   console.error(
-    `[slack] reconnectSession: persona=${key} is pending — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; not typing /mcp reconnect, deferring to a later tick (b.dup)`,
+    `[slack] Deferring persona=${key}: its row reads pending${launch} — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; no reconnect, kill or launch, nothing counted (b.dup)`,
   )
   return 'pending'
 }
@@ -2039,12 +2062,14 @@ export async function main(): Promise<void> {
   }
 
   // Shared adapter: probes agent-director for the spawn's current state per
-  // SR-11 Event 6a and answers one of four readings (b.jg5 SRJ-314): `pending`;
-  // `live` for another live state; `dead` for a terminal state (ended,
-  // missing), ErrSpawnNotFound or ErrSystemInstallDisappeared; `unknown` for
-  // every other status error and any state CSCB does not know. Only `dead`
-  // leads to a kill and a launch; the restart path arms the persona's retry
-  // timer on `unknown`, and the health tick skips the persona that tick.
+  // SR-11 Event 6a and answers one of four readings (b.jg5 SRJ-314): `pending`,
+  // with the row's raw launch start when shown (SRJ-115); `live` for another
+  // live state; `dead` for a terminal state (ended, missing), ErrSpawnNotFound
+  // or ErrSystemInstallDisappeared; `unknown` for every other status error and
+  // any state CSCB does not know. Only `dead` leads to a kill and a launch;
+  // the restart path hands `pending` to `deferPendingRow` and arms the
+  // persona's retry timer on `unknown`; the health tick never counts
+  // `pending` healthy and skips an `unknown` persona that tick.
   const isSessionAliveAdapter = _buildIsSessionAliveAdapter(() => personaConfig)
 
   // b.9cj: the restart guard and the health-check tick share persona-routing's
@@ -2092,6 +2117,13 @@ export async function main(): Promise<void> {
     // while the timer is armed or running keeps its due time and wait count.
     armRetryTimer: (key) => {
       retryTimers.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
+    },
+    // b.jg5 SRJ-314: a restart run whose liveness reads `pending` hands the
+    // row, with its launch start, to the `pending` deferral, whatever the
+    // session's connection shows; nothing is reconnected, killed, launched or
+    // counted.
+    deferPendingRow: (key, reading) => {
+      deferPendingRow(key, reading.launchStartedAt)
     },
   })
 

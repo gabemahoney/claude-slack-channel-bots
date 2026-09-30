@@ -17,8 +17,14 @@ import {
   LIVENESS_READING_LIVE,
   LIVENESS_READING_PENDING,
   LIVENESS_READING_UNKNOWN,
+  LIVENESS_PENDING,
+  launchStartOfReading,
+  livenessReadingForStatus,
+  pendingLaunchStartOf,
+  pendingLivenessReading,
   type LivenessReading,
 } from '../src/liveness-reading.ts'
+import type { Phase1StatusResult } from '../src/ad-phase1-types.ts'
 import {
   _resetOutageState,
   initOutageState,
@@ -32,6 +38,7 @@ import {
 } from '../src/agent-director-client.ts'
 import {
   cannedGetResult,
+  cannedStatusResult,
   makeCloseCountingStubClient,
   makeStubClient,
   makeStubCreateClient,
@@ -50,10 +57,18 @@ import {
   errUnknownErrorName,
   errUnusableName,
   holdSpawns,
+  SAMPLE_LAUNCH_START_FRACTIONAL,
+  SAMPLE_LAUNCH_START_NONE,
+  SAMPLE_LAUNCH_START_WHOLE,
   type CloseCountingStubClient,
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
-import { _buildIsSessionAliveAdapter, _buildReconnectSessionAdapter, _runCallTimeoutStartStep } from '../src/server.ts'
+import {
+  _buildIsSessionAliveAdapter,
+  _buildReconnectSessionAdapter,
+  _runCallTimeoutStartStep,
+  deferPendingRow,
+} from '../src/server.ts'
 import { buildPersonaClientOrExit, type PersonaClientDeps } from '../src/agent-director-startup.ts'
 import {
   DEFAULT_AD_SETTINGS_IN_EFFECT,
@@ -418,15 +433,104 @@ describe('sanitizeFilename', () => {
 // ErrSpawnNotFound or ErrSystemInstallDisappeared)
 // ---------------------------------------------------------------------------
 
+/** The live states other than `pending`: each reads `live`. */
+const LIVE_NOT_PENDING_STATES = [...AGENT_DIRECTOR_LIVE_STATES].filter((s) => s !== AGENT_DIRECTOR_PENDING_STATE)
+/** A state string CSCB does not know (from a later binary). */
+const UNRECOGNISED_STATE = 'a-state-from-a-later-binary'
+/** Every state other than `pending`, with the reading it gives (b.jg5 SRJ-314). */
+const NOT_PENDING_STATE_READINGS = [
+  ...LIVE_NOT_PENDING_STATES.map((s) => [s, LIVENESS_READING_LIVE] as const),
+  ...[...AGENT_DIRECTOR_DEAD_STATES].map((s) => [s, LIVENESS_READING_DEAD] as const),
+  [UNRECOGNISED_STATE, LIVENESS_READING_UNKNOWN] as const,
+]
+/** The launch starts a `pending` row may show (ADSRD SR-22.2 forms). */
+const LAUNCH_STARTS = [SAMPLE_LAUNCH_START_FRACTIONAL, SAMPLE_LAUNCH_START_WHOLE]
+/** Launch-start field values that are no launch start. */
+const NO_LAUNCH_STARTS: ReadonlyArray<readonly [string, unknown]> = [
+  ['absent', SAMPLE_LAUNCH_START_NONE],
+  ['null', null],
+  ['empty', ''],
+  ['not a string', 42],
+]
+
+// ---------------------------------------------------------------------------
+// A `pending` row's launch start (b.jg5 SRJ-115, SRJ-406): the pure readers
+// the liveness and reconnect adapters use. Read raw, never parsed or aged.
+// ---------------------------------------------------------------------------
+
+describe("liveness-reading: a pending row's launch start (b.jg5 SRJ-115)", () => {
+  /** A `status` result whose `launch_started_at` is `value` (any type; `undefined` omits it). */
+  function statusWith(state: string, value: unknown): Phase1StatusResult {
+    return cannedStatusResult({ state, launch_started_at: value as string | null | undefined })
+  }
+
+  test.each(LAUNCH_STARTS)('a pending result showing launch start %s → read raw; the reading carries it (frozen) and gives it back', (start) => {
+    const result = statusWith(AGENT_DIRECTOR_PENDING_STATE, start)
+
+    expect(pendingLaunchStartOf(result)).toBe(start)
+    const reading = livenessReadingForStatus(result)
+    expect(reading).toEqual({ kind: LIVENESS_PENDING, launchStartedAt: start })
+    expect(Object.isFrozen(reading)).toBe(true)
+    expect(launchStartOfReading(reading)).toBe(start)
+    expect(reading).toEqual(pendingLivenessReading(start))
+  })
+
+  test.each(NO_LAUNCH_STARTS)('a pending result whose launch start is %s → none: the plain pending reading', (_label, value) => {
+    const result = statusWith(AGENT_DIRECTOR_PENDING_STATE, value)
+
+    expect(pendingLaunchStartOf(result)).toBeUndefined()
+    expect(livenessReadingForStatus(result)).toBe(LIVENESS_READING_PENDING)
+  })
+
+  test('a pending result whose launch start cannot be read (a throwing getter) → none, and no throw', () => {
+    const result = Object.defineProperty({ state: AGENT_DIRECTOR_PENDING_STATE }, 'launch_started_at', {
+      get() { throw new Error('boom') },
+    }) as Phase1StatusResult
+
+    expect(pendingLaunchStartOf(result)).toBeUndefined()
+    expect(livenessReadingForStatus(result)).toBe(LIVENESS_READING_PENDING)
+  })
+
+  test.each(NOT_PENDING_STATE_READINGS)('a %s result carrying a launch start → the field is ignored: reads %j with no launch start', (state, expected) => {
+    const result = statusWith(state, SAMPLE_LAUNCH_START_FRACTIONAL)
+
+    expect(pendingLaunchStartOf(result)).toBeUndefined()
+    const reading = livenessReadingForStatus(result)
+    expect(reading).toBe(expected)
+    expect(launchStartOfReading(reading)).toBeUndefined()
+  })
+
+  test('no result, or one whose state cannot be read → no launch start; reads unknown, and no throw', () => {
+    const throwing = Object.defineProperty({}, 'state', { get() { throw new Error('boom') } }) as Phase1StatusResult
+    for (const result of [null, undefined, throwing]) {
+      expect(pendingLaunchStartOf(result)).toBeUndefined()
+      expect(livenessReadingForStatus(result)).toBe(LIVENESS_READING_UNKNOWN)
+    }
+  })
+
+  test('pendingLivenessReading with no launch start, or an empty one → the plain pending reading', () => {
+    expect(pendingLivenessReading()).toBe(LIVENESS_READING_PENDING)
+    expect(pendingLivenessReading('')).toBe(LIVENESS_READING_PENDING)
+  })
+
+  test("launchStartOfReading → only a pending reading's non-empty launch start; anything else gives none", () => {
+    expect(launchStartOfReading(LIVENESS_READING_PENDING)).toBeUndefined()
+    expect(launchStartOfReading({ ...LIVENESS_READING_PENDING, launchStartedAt: '' })).toBeUndefined()
+    expect(launchStartOfReading({ ...LIVENESS_READING_PENDING, launchStartedAt: 42 })).toBeUndefined()
+    for (const other of [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD, LIVENESS_READING_UNKNOWN]) {
+      expect(launchStartOfReading({ ...other, launchStartedAt: SAMPLE_LAUNCH_START_FRACTIONAL })).toBeUndefined()
+    }
+    for (const notAReading of [null, undefined, LIVENESS_PENDING, SAMPLE_LAUNCH_START_FRACTIONAL]) {
+      expect(launchStartOfReading(notAReading)).toBeUndefined()
+    }
+  })
+})
+
 describe('_buildIsSessionAliveAdapter', () => {
   type Emission = { key: string; text: string }
 
-  /** The live states other than `pending`: each reads `live`. */
-  const LIVE_NOT_PENDING_STATES = [...AGENT_DIRECTOR_LIVE_STATES].filter((s) => s !== AGENT_DIRECTOR_PENDING_STATE)
   /** A live state the harness's `status` answers by default. */
   const LIVE_STATE = LIVE_NOT_PENDING_STATES[0]!
-  /** A state string CSCB does not know (from a later binary). */
-  const UNRECOGNISED_STATE = 'a-state-from-a-later-binary'
 
   /** Per-test temp dir: `baseDir` for the stand-in persona fixtures. */
   let baseDir: string
@@ -445,6 +549,8 @@ describe('_buildIsSessionAliveAdapter', () => {
     statusError?: Error,
     statusState: string = LIVE_STATE,
     config: PersonaConfig | null = standIns('C1'),
+    /** The result's `launch_started_at` (any type; `undefined` omits the key). */
+    launchStartedAt?: unknown,
   ): {
     emissions: Emission[]
     statusCalls: StatusParams[]
@@ -459,7 +565,13 @@ describe('_buildIsSessionAliveAdapter', () => {
     })
     const stubOpts = statusError
       ? { statusError, statusCalls }
-      : { statusResult: { state: statusState }, statusCalls }
+      : {
+          statusResult: cannedStatusResult({
+            state: statusState,
+            launch_started_at: launchStartedAt as string | null | undefined,
+          }),
+          statusCalls,
+        }
     setClientForTests(makeStubClient(stubOpts) as unknown as Client)
     // Default persona config: one stand-in persona keyed C1.
     return {
@@ -517,10 +629,8 @@ describe('_buildIsSessionAliveAdapter', () => {
   // is closed, so a state CSCB does not know reads `unknown`, never `dead`.
   // Any state answer clears both flags.
   test.each([
-    ...LIVE_NOT_PENDING_STATES.map((s) => [s, LIVENESS_READING_LIVE] as const),
+    ...NOT_PENDING_STATE_READINGS,
     [AGENT_DIRECTOR_PENDING_STATE, LIVENESS_READING_PENDING] as const,
-    ...[...AGENT_DIRECTOR_DEAD_STATES].map((s) => [s, LIVENESS_READING_DEAD] as const),
-    [UNRECOGNISED_STATE, LIVENESS_READING_UNKNOWN] as const,
   ])('status answers state %s → reads %j and clears both flags', async (state, reading) => {
     const { statusCalls, adapter } = makeHarness(undefined, state)
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
@@ -531,6 +641,36 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(result).toEqual(reading)
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
     expect(getOutageFlags('C1').size).toBe(0)
+  })
+
+  // b.jg5 SRJ-115: a `pending` result's launch start rides on the `pending`
+  // reading, raw; a result with none gives the plain reading, and another
+  // state's field is ignored.
+  test.each(LAUNCH_STARTS)('SRJ-115: a pending result showing launch start %s → a pending reading carrying it raw', async (start) => {
+    const { adapter } = makeHarness(undefined, AGENT_DIRECTOR_PENDING_STATE, standIns('C1'), start)
+
+    const result = await adapter('C1')
+
+    expect(result).toEqual({ ...LIVENESS_READING_PENDING, launchStartedAt: start })
+    expect(launchStartOfReading(result)).toBe(start)
+  })
+
+  test.each(NO_LAUNCH_STARTS)('SRJ-115: a pending result whose launch start is %s → the plain pending reading, carrying none', async (_label, value) => {
+    const { adapter } = makeHarness(undefined, AGENT_DIRECTOR_PENDING_STATE, standIns('C1'), value)
+
+    const result = await adapter('C1')
+
+    expect(result).toEqual(LIVENESS_READING_PENDING)
+    expect(result).not.toHaveProperty('launchStartedAt')
+  })
+
+  test.each(NOT_PENDING_STATE_READINGS)('SRJ-115: a %s result carrying a launch start → reads %j, carrying none', async (state, reading) => {
+    const { adapter } = makeHarness(undefined, state, standIns('C1'), SAMPLE_LAUNCH_START_FRACTIONAL)
+
+    const { result } = await probeCapturingErrors(adapter, 'C1')
+
+    expect(result).toEqual(reading)
+    expect(result).not.toHaveProperty('launchStartedAt')
   })
 
   test('2. ErrSpawnNotFound: status throws → clears ad-unreachable + tmux-unavailable; reads dead', async () => {
@@ -729,6 +869,8 @@ describe('_buildReconnectSessionAdapter', () => {
     getPersona?: (key: string) => Persona | undefined
     /** The state every status probe reads once a findMissing sweep has run (default: `statusState`). */
     statusAfterSweep?: string
+    /** The `launch_started_at` every status result shows (default: none, the key absent). */
+    launchStartedAt?: string
   }): {
     adapter: (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient' | 'pending'>
     statusCalls: StatusParams[]
@@ -751,9 +893,11 @@ describe('_buildReconnectSessionAdapter', () => {
     const stub = makeStubClient({
       statusCalls,
       statusFn: () =>
-        opts.statusError ?? {
+        opts.statusError ??
+        cannedStatusResult({
           state: (findMissingCalls.length > 0 ? opts.statusAfterSweep : undefined) ?? opts.statusState ?? 'waiting',
-        },
+          launch_started_at: opts.launchStartedAt,
+        }),
       sendKeysCalls,
       sendKeysError: opts.sendKeysThrows,
       sendKeysResult: opts.sendKeysThrows ? undefined : {},
@@ -950,6 +1094,41 @@ describe('_buildReconnectSessionAdapter', () => {
     assertNoLeak({ lines })
   })
 
+  // b.jg5 SRJ-115 (Task ruling): the adapter's state read keeps 'transient'
+  // for every status error, ErrSpawnNotFound included (SRJ-105: it keeps each
+  // site's meaning; the next liveness read reads it dead). Nothing is typed,
+  // read or swept, and no error escalates to dead here.
+  test.each([
+    ['ErrSpawnNotFound', () => errSpawnNotFound()],
+    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status')],
+    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed()],
+    ['ErrCallTimeout', () => errCallTimeout('status')],
+    ['ErrTmuxUnresponsive (by name)', () => errTmuxUnresponsive('status')],
+    ['a plain Error', () => new Error('boom')],
+  ])("SRJ-115: %s at the state read → 'transient', never 'escalate-dead'; no send-keys, pane read, tmux probe or sweep; one line", async (_label, build) => {
+    const { adapter, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxProbes } = makeHarness({
+      statusError: build(),
+    })
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    let result: string | undefined
+    try {
+      result = await adapter('C1')
+    } finally {
+      console.error = orig
+    }
+
+    expect(result).toBe('transient')
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(sendKeysCalls).toEqual([])
+    expect(readPaneCalls).toEqual([])
+    expect(tmuxProbes).toEqual([])
+    expect(findMissingCalls).toHaveLength(0)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith('[slack] reconnectSession: persona=C1 status check failed: ')
+  })
+
   test("(iv) reconnectMcp 'dead-session' → 'escalate-dead', firing exactly one memoized findMissing sweep (b.sv7 / Epic t1.tkk.e4)", async () => {
     // Persistent ErrTmuxSendKeys: the first send-keys AND the self-heal retry
     // both fail, so reconnectMcp returns 'dead-session' (b.3ce). The status
@@ -1028,9 +1207,18 @@ describe('_buildReconnectSessionAdapter', () => {
   // retries. Before the fix the adapter typed, the refusal raised a
   // spawn-failure notice, and it answered 'transient'. b.jg5 SRJ-303: the
   // deferral answers 'pending' (restart.ts treats it as 'transient'), so the
-  // UNAVAILABLE retry timer knows the row read `pending`; the line is as
-  // before.
-  test("REPRO (b.dup), b.jg5 SRJ-303: a pending row → 'pending' with no send-keys, pane read, tmux probe or sweep, no notice, and one line", async () => {
+  // UNAVAILABLE retry timer knows the row read `pending`. b.jg5 SRJ-115: the
+  // row's raw launch start, when its status result shows one, is passed to
+  // `deferPendingRow`, and the deferral line names it.
+  /** The deferral line for persona C1, by the launch start it names (`''`: none). */
+  const deferralLine = (launch: string): string =>
+    `[slack] Deferring persona=C1: its row reads pending${launch} — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; no reconnect, kill or launch, nothing counted (b.dup)`
+  const DEFERRAL_CASES: ReadonlyArray<readonly [string, string | undefined, string]> = [
+    ['no launch start', SAMPLE_LAUNCH_START_NONE, ''],
+    ...LAUNCH_STARTS.map((start) => [`launch start ${start}`, start, ` (launch started ${start})`] as const),
+  ]
+
+  test.each(DEFERRAL_CASES)("REPRO (b.dup), b.jg5 SRJ-303/SRJ-115: a pending row showing %s → 'pending' with no send-keys, pane read, tmux probe or sweep, no notice, and one line naming its launch start", async (_label, launchStartedAt, launch) => {
     const raised: string[] = []
     setSessionNotifier((key) => { raised.push(key) })
     const lines: string[] = []
@@ -1038,7 +1226,8 @@ describe('_buildReconnectSessionAdapter', () => {
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
     try {
       const { adapter, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxProbes } = makeHarness({
-        statusState: 'pending',
+        statusState: AGENT_DIRECTOR_PENDING_STATE,
+        launchStartedAt,
         sendKeysThrows: errSpawnNotInteractive('send-keys'),
       })
 
@@ -1050,13 +1239,39 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(tmuxProbes).toEqual([])
       expect(findMissingCalls).toHaveLength(0)
       expect(raised).toEqual([])
-      expect(lines).toEqual([
-        '[slack] reconnectSession: persona=C1 is pending — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; not typing /mcp reconnect, deferring to a later tick (b.dup)',
-      ])
+      expect(lines).toEqual([deferralLine(launch)])
     } finally {
       console.error = orig
       setSessionNotifier(undefined)
     }
+  })
+
+  // b.jg5 SRJ-314: the restart work calls `deferPendingRow` itself (bound in
+  // main()). Called directly it makes no agent-director call (nothing typed,
+  // read or swept), raises no notice, logs its line and answers 'pending'.
+  test.each(DEFERRAL_CASES)("deferPendingRow called directly with %s → 'pending'; no agent-director call, no notice; one line naming its launch start", (_label, launchStartedAt, launch) => {
+    const raised: string[] = []
+    setSessionNotifier((key) => { raised.push(key) })
+    const { statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxProbes } = makeHarness({})
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    let result: string | undefined
+    try {
+      result = deferPendingRow('C1', launchStartedAt)
+    } finally {
+      console.error = orig
+      setSessionNotifier(undefined)
+    }
+
+    expect(result).toBe('pending')
+    expect(statusCalls).toEqual([])
+    expect(sendKeysCalls).toEqual([])
+    expect(readPaneCalls).toEqual([])
+    expect(findMissingCalls).toHaveLength(0)
+    expect(tmuxProbes).toEqual([])
+    expect(raised).toEqual([])
+    expect(lines).toEqual([deferralLine(launch)])
   })
 
   test('(v) the key passed selects the instance: a non-channel-form key probes and reconnects cscb_<key> (b.av2 SR-2.2)', async () => {

@@ -42,7 +42,7 @@ import {
   isAtCap,
   recordFailure,
 } from '../src/backoff.ts'
-import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
+import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter, deferPendingRow } from '../src/server.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import { createPersonaSerializer, type PersonaSerialize } from '../src/persona-serializer.ts'
 import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
@@ -96,6 +96,7 @@ import {
   cannedErr,
   cannedOk,
   cannedGetResult,
+  cannedStatusResult,
   errCallTimeout,
   errConfigMalformed,
   errGeneric,
@@ -112,6 +113,9 @@ import {
   holdSpawns,
   makeStubCallLog,
   makeStubResolveSystemBinary,
+  SAMPLE_LAUNCH_START_FRACTIONAL,
+  SAMPLE_LAUNCH_START_NONE,
+  SAMPLE_LAUNCH_START_WHOLE,
   stubCallCount,
   type SpawnHold,
   type StubCallLog,
@@ -141,7 +145,10 @@ import {
   LIVENESS_READING_LIVE,
   LIVENESS_READING_PENDING,
   LIVENESS_READING_UNKNOWN,
+  LIVENESS_PENDING,
+  pendingLivenessReading,
   type LivenessReading,
+  type PendingLivenessReading,
 } from '../src/liveness-reading.ts'
 
 // ---------------------------------------------------------------------------
@@ -4405,5 +4412,269 @@ describe('b.jg5 SRJ-314: an unknown or thrown liveness probe kills and launches 
       expect(armFailed[0]).toStartWith(`[slack] restart: arming the retry timer failed for persona=${P}: Error message="arm refused (${REDACTED_SENTINEL_TAIL})" at `)
     }
     assertNoLeak({ errArgs })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-115, SRJ-314: a liveness probe that reads `pending` (the row's
+// session has not started) hands the row to the `pending` deferral
+// (`RestartDeps.deferPendingRow`) once, with its reading (the launch start
+// carried), whatever the session's connection shows: connected with its
+// stream (never "already reconnected"), connected but streamless, or
+// disconnected. Nothing is reconnected, killed or launched, no success or
+// failure is recorded, nothing is armed, and the work answers
+// `RESTART_OUTCOME_PENDING_DEFERRED`. The connection is never read. A
+// deferral that throws is logged by its redacted description and changes
+// nothing else; an absent one is skipped with the same outcome. `live` and
+// `dead` are unchanged and never reach the deferral. A row with no launch
+// start is deferred the same way (its latch is E16's). The failure count
+// starts at 1, so a recorded success (a reset) or failure shows.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever the connection shows', () => {
+  const P = 'persona_p'
+  const CWD = '/cwd/p'
+  const DEFER_FAILED = `[slack] restart: the pending deferral failed for persona=${P}`
+  let errLines: string[]
+  let errArgs: unknown[][]
+  let origConsoleError: typeof console.error
+
+  const notInFlight = (): boolean => false
+
+  beforeEach(() => {
+    errLines = []
+    errArgs = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args); errLines.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+  })
+
+  /** P's connection as the registry shows it: [label, connected, stream present]. */
+  const CONNECTIONS: ReadonlyArray<readonly [string, boolean, boolean]> = [
+    ['connected with its stream', true, true],
+    ['connected but streamless', true, false],
+    ['disconnected', false, true],
+  ]
+  const LAUNCH_STARTS: ReadonlyArray<readonly [string, string | undefined]> = [
+    ['with a launch start', SAMPLE_LAUNCH_START_FRACTIONAL],
+    ['with no launch start', SAMPLE_LAUNCH_START_NONE],
+  ]
+  const ENTRIES: ReadonlyArray<'the retry entry' | 'the restart timer'> = ['the retry entry', 'the restart timer']
+
+  /**
+   * The file's deps with a recording `pending` deferral, the probe answering
+   * `reading`, P's connection as given (each read recorded) and launches
+   * failing, so a launch would be counted.
+   */
+  function pendingDeps(reading: LivenessReading, connected: boolean, stream: boolean, restartDelay = 0): {
+    deps: ReturnType<typeof makeDeps>
+    deferred: Array<[string, PendingLivenessReading]>
+    connectionReads: string[]
+  } {
+    const deps = makeDeps({ restartDelay, isSessionAliveResult: reading, launchSessionResult: false })
+    const deferred: Array<[string, PendingLivenessReading]> = []
+    const connectionReads: string[] = []
+    deps.isSessionConnected = (key) => { connectionReads.push(`connected:${key}`); return connected }
+    deps.hasSessionStream = (key) => { connectionReads.push(`stream:${key}`); return stream }
+    deps.deferPendingRow = (key, r) => { deferred.push([key, r]) }
+    return { deps, deferred, connectionReads }
+  }
+
+  /** Nothing reconnected, killed, launched, counted, notified or armed; no restart line beyond the scheduling one. */
+  function expectNothingDone(deps: ReturnType<typeof makeDeps>): void {
+    expect(deps.isSessionAliveCalls).toEqual([P])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  }
+
+  /** The lines other than the restart timer's scheduling line and a deferral failure. */
+  const otherLines = (): string[] =>
+    errLines.filter((l) => !l.startsWith('[slack] Scheduling restart') && !l.startsWith(DEFER_FAILED))
+
+  const DEFER_CASES = ENTRIES.flatMap((entry) =>
+    CONNECTIONS.flatMap(([conn, connected, stream]) =>
+      LAUNCH_STARTS.map(([startLabel, start]) => [entry, conn, startLabel, connected, stream, start] as const)))
+
+  test.each(DEFER_CASES)('through %s, a pending first probe, P %s, %s → the deferral once with the key and the reading; no reconnect, kill or launch; nothing counted or armed; the connection never read; pending-deferred', async (entry, _conn, _startLabel, connected, stream, start) => {
+    recordFailure(P)
+    const reading = pendingLivenessReading(start)
+    const { deps, deferred, connectionReads } = pendingDeps(reading, connected, stream, entry === 'the retry entry' ? 0 : FAST_DELAY_S)
+    initRestart(deps)
+
+    if (entry === 'the retry entry') {
+      expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+    } else {
+      scheduleRestart(P, CWD)
+      await Bun.sleep(WAIT_MS)
+    }
+
+    expect(deferred).toHaveLength(1)
+    const [key, handed] = deferred[0]!
+    expect(key).toBe(P)
+    expect(handed.kind).toBe(LIVENESS_PENDING)
+    expect(handed.launchStartedAt).toBe(start)
+    expect(handed).toEqual(reading)
+    expect(connectionReads).toEqual([])
+    expectNothingDone(deps)
+    expect(otherLines()).toEqual([])
+  })
+
+  // The launch start is read off the probe's reading raw; one that is not a
+  // non-empty string is handed on as none.
+  test.each<[string, unknown, string | undefined]>([
+    ['a whole-second launch start → handed on raw', SAMPLE_LAUNCH_START_WHOLE, SAMPLE_LAUNCH_START_WHOLE],
+    ['an empty launch start → handed on as none', '', undefined],
+    ['a launch start that is not a string → handed on as none', 42, undefined],
+  ])('the probe\'s pending reading carries %s', async (_label, raw, handedStart) => {
+    recordFailure(P)
+    const reading = { kind: LIVENESS_PENDING, launchStartedAt: raw } as unknown as LivenessReading
+    const { deps, deferred } = pendingDeps(reading, true, true)
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+
+    expect(deferred).toEqual([[P, pendingLivenessReading(handedStart)]])
+    expect(deferred[0]![1].launchStartedAt).toBe(handedStart)
+    if (handedStart === undefined) expect(deferred[0]![1]).toEqual(LIVENESS_READING_PENDING)
+    expectNothingDone(deps)
+  })
+
+  test.each(CONNECTIONS)('a deferral that throws, P %s → one redacted line; still no reconnect, kill or launch, nothing counted or armed; pending-deferred', async (_conn, connected, stream) => {
+    recordFailure(P)
+    const { deps, deferred, connectionReads } = pendingDeps(pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL), connected, stream)
+    deps.deferPendingRow = (key, r) => {
+      deferred.push([key, r])
+      throw Object.assign(new Error(`defer refused (${sentinelInMessage('defer')})`), { note: LEAK_SENTINEL })
+    }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+
+    expect(deferred).toHaveLength(1)
+    expect(connectionReads).toEqual([])
+    expectNothingDone(deps)
+    const failed = errLines.filter((l) => l.startsWith(DEFER_FAILED))
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toStartWith(`${DEFER_FAILED}: Error message="defer refused (${REDACTED_SENTINEL_TAIL})" at `)
+    expect(otherLines()).toEqual([])
+    assertNoLeak({ errArgs })
+  })
+
+  test.each(CONNECTIONS)('no deferral member, P %s → nothing called or logged; still no reconnect, kill or launch, nothing counted or armed; pending-deferred', async (_conn, connected, stream) => {
+    recordFailure(P)
+    const { deps, connectionReads } = pendingDeps(pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL), connected, stream)
+    delete deps.deferPendingRow
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+
+    expect(connectionReads).toEqual([])
+    expectNothingDone(deps)
+    expect(errLines).toEqual([])
+  })
+
+  // `live` and `dead` never reach the deferral: a connected `live` row with
+  // its stream is still already-connected, another `live` row is reconnected,
+  // and a `dead` one is killed and launched and counted, as before.
+  test.each<[string, LivenessReading, boolean, boolean, RestartRetryOutcome]>([
+    ['live, connected with its stream → already-connected, no reconnect', LIVENESS_READING_LIVE, true, true, RESTART_OUTCOME_ALREADY_CONNECTED],
+    ['live, connected but streamless → reconnected', LIVENESS_READING_LIVE, true, false, RESTART_OUTCOME_RECONNECTED],
+    ['live, disconnected → reconnected', LIVENESS_READING_LIVE, false, true, RESTART_OUTCOME_RECONNECTED],
+    ['dead → a kill and a launch, the failed launch counted', LIVENESS_READING_DEAD, false, true, RESTART_OUTCOME_COUNTED_FAILURE],
+  ])('%s; the deferral is never called', async (_label, reading, connected, stream, outcome) => {
+    recordFailure(P)
+    const { deps, deferred } = pendingDeps(reading, connected, stream)
+    deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return 'success' }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(outcome)
+
+    expect(deferred).toEqual([])
+    const reconnected = outcome === RESTART_OUTCOME_RECONNECTED
+    const launched = outcome === RESTART_OUTCOME_COUNTED_FAILURE
+    expect(deps.reconnectSessionCalls).toEqual(reconnected ? [P] : [])
+    expect(deps.killSessionCalls).toEqual(launched ? [P] : [])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual(launched ? [P] : [])
+    expect(getFailureCount(P)).toBe(reconnected ? 0 : launched ? 2 : 1)
+    expect(deps.armRetryTimerCalls).toEqual([])
+  })
+
+  // Through the real liveness and reconnect adapters over the stub, with the
+  // deferral bound as `main()` binds it: `status` answers `pending`, with or
+  // without a launch start. One `status` read (the liveness probe's) and no
+  // other agent-director call: no send-keys, kill, spawn or resume. One
+  // deferral line, naming the launch start when there is one.
+  describe('through the real adapters over the stub', () => {
+    let dir: string
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'restart-pending-'))
+    })
+
+    afterEach(() => {
+      resetClientForTests()
+      _resetOutageState()
+      rmSync(dir, { recursive: true, force: true })
+    })
+
+    const REAL_CASES = CONNECTIONS.flatMap(([conn, connected, stream]) =>
+      LAUNCH_STARTS.map(([startLabel, start]) => [conn, startLabel, connected, stream, start] as const))
+
+    test.each(REAL_CASES)('status answers pending, P %s, %s → one status read and no other agent-director call; no kill or launch; nothing counted; one deferral line; pending-deferred', async (_conn, _startLabel, connected, stream, start) => {
+      const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
+      const KEY = config.personas[0]!.key
+      const log = makeStubCallLog()
+      const stub = makeStubClient({ ...log, statusResult: cannedStatusResult({ state: 'pending', launch_started_at: start }) })
+      _resetOutageState()
+      initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+      setClientForTests(stub as unknown as Client)
+
+      recordFailure(KEY)
+      const killSessionCalls: string[] = []
+      const launchSessionCalls: string[] = []
+      const armed: string[] = []
+      const deferred: Array<[string, PendingLivenessReading]> = []
+      initRestart({
+        canRestart: () => true,
+        isSessionAlive: _buildIsSessionAliveAdapter(() => config),
+        isSessionConnected: () => connected,
+        hasSessionStream: () => stream,
+        reconnectSession: _buildReconnectSessionAdapter(),
+        async killSession(key) { killSessionCalls.push(key) },
+        async launchSession(key) { launchSessionCalls.push(key); return false },
+        getRestartDelay: () => 0,
+        isShuttingDown: () => false,
+        onCapReached: () => {},
+        armRetryTimer: (key) => { armed.push(key) },
+        // As main() binds it.
+        deferPendingRow: (key, reading) => {
+          deferred.push([key, reading])
+          deferPendingRow(key, reading.launchStartedAt)
+        },
+      })
+
+      expect(await runRestartRetry(KEY, config.personas[0]!.working_directory, notInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+
+      expect(log.statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(KEY)])
+      expect(stubCallCount(log)).toBe(1)
+      expect(deferred).toEqual([[KEY, pendingLivenessReading(start)]])
+      expect(killSessionCalls).toEqual([])
+      expect(launchSessionCalls).toEqual([])
+      expect(armed).toEqual([])
+      expect(getFailureCount(KEY)).toBe(1)
+      const launch = start === undefined ? '' : ` (launch started ${start})`
+      expect(errLines).toEqual([
+        `[slack] Deferring persona=${KEY}: its row reads pending${launch} — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; no reconnect, kill or launch, nothing counted (b.dup)`,
+      ])
+    })
   })
 })

@@ -34,7 +34,9 @@
  *     one UNAVAILABLE persona tallies as before and arms only that persona.
  *   - b.jg5 SRJ-303 / SRJ-115 the retry timer's row read
  *     (`readPersonaRowState`): one `status` call for `cscb_<key>` and no
- *     other, answering each state as is (`pending` included), `absent` for
+ *     other, answering each state as is (`pending` included), a `pending`
+ *     row's launch start raw and no launch start for any other state or for a
+ *     missing, `null` or empty one, `absent` for
  *     `ErrSpawnNotFound` (by name), and any other error rethrown as the same
  *     value, quietly; through the outage wrapper (flags raised and cleared as
  *     for any wrapped `status`; an error reported to a recording sink only
@@ -271,6 +273,10 @@ import { resetClientForTests, setClientForTests, getClient } from '../src/agent-
 import {
   cannedGetResult,
   cannedListRow,
+  cannedStatusResult,
+  SAMPLE_LAUNCH_START_FRACTIONAL,
+  SAMPLE_LAUNCH_START_NONE,
+  SAMPLE_LAUNCH_START_WHOLE,
   cannedFindMissing,
   cannedOk,
   cannedErr,
@@ -363,8 +369,10 @@ import {
   UNAVAILABLE_RETRY_ROW_ABSENT,
   type AttemptView,
   type UnavailableRetryController,
+  type UnavailableRetryRowRead,
   type UnavailableRetryTriggerSink,
 } from '../src/unavailable-retry.ts'
+import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -10566,9 +10574,13 @@ describe('killPersonaInstance / deletePersonaInstance: the persona teardown\'s q
 //
 // `readPersonaRowState(key)` makes one `status` call for `cscb_<key>` through
 // `withOutageDetection` (no findMissing sweep, no other call) and logs
-// nothing. It answers the row's state as agent-director reports it,
-// `pending` included, or `UNAVAILABLE_RETRY_ROW_ABSENT` for
-// `ErrSpawnNotFound` (by name); any other error reaches the caller as the
+// nothing. It answers `{ state }`: the row's state as agent-director reports
+// it, `pending` included, or `UNAVAILABLE_RETRY_ROW_ABSENT` for
+// `ErrSpawnNotFound` (by name). On a `pending` row only it also answers the
+// launch start the result shows (`launchStartedAt`, raw); a missing, `null`
+// or empty one, or one on another state, gives no `launchStartedAt` key (the
+// cases compare with `toStrictEqual`, so an `undefined` key fails them). Any
+// other error reaches the caller as the
 // same value. Being wrapped, its flags move as for any wrapped `status`, and
 // inside a recovery attempt for the persona its error is reported to the
 // installed trigger sink with the arming predicate's cause.
@@ -10600,9 +10612,9 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
   }
 
   /** Run the read for B with the startup-errors log and console captured; returns what it resolved or rejected with, and everything captured. */
-  async function readQuietly(read: () => Promise<string> = () => readPersonaRowState(B)): Promise<{ outcome: { ok: string } | { err: unknown }; errLog: string; startupLog: string }> {
+  async function readQuietly(read: () => Promise<UnavailableRetryRowRead> = () => readPersonaRowState(B)): Promise<{ outcome: { ok: UnavailableRetryRowRead } | { err: unknown }; errLog: string; startupLog: string }> {
     const readStartupLog = captureStartupErrors()
-    let outcome!: { ok: string } | { err: unknown }
+    let outcome!: { ok: UnavailableRetryRowRead } | { err: unknown }
     const errLog = await withCapturedErr(async () => {
       try {
         outcome = { ok: await read() }
@@ -10621,29 +10633,70 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
     expect(notices).toEqual([])
   }
 
-  test.each(['pending', 'waiting', 'working', 'ask_user', 'check_permission', 'ended', 'missing'])('a row reading %s → that state as is, from exactly one status call for cscb_B and no other call; quiet', async (state) => {
+  /** Every row state agent-director reports: the live ones (`pending` included) and the dead ones. */
+  const EVERY_ROW_STATE: string[] = [...AGENT_DIRECTOR_LIVE_STATES, ...AGENT_DIRECTOR_DEAD_STATES]
+  /** Every row state but `pending`. */
+  const NON_PENDING_ROW_STATES: string[] = EVERY_ROW_STATE.filter((s) => s !== AGENT_DIRECTOR_PENDING_STATE)
+
+  test.each(EVERY_ROW_STATE)('a row reading %s with no launch start → { state } as is (no launchStartedAt key), from exactly one status call for cscb_B and no other call; quiet', async (state) => {
     const calls = makeStubCallLog()
-    installStub({ ...calls, statusResult: { state } })
+    installStub({ ...calls, statusResult: cannedStatusResult({ state, launch_started_at: SAMPLE_LAUNCH_START_NONE }) })
 
     const r = await readQuietly()
 
-    expect(r.outcome).toEqual({ ok: state })
-    expect(calls.statusCalls).toEqual([{ claude_instance_id: 'cscb_B' }])
+    expect(r.outcome).toStrictEqual({ ok: { state } })
+    expect(calls.statusCalls).toEqual([{ claude_instance_id: `${PERSONA_INSTANCE_ID_PREFIX}${B}` }])
     expect(stubCallCount(calls)).toBe(1)
     expectQuiet(r)
     expect(outageEmissions).toEqual([])
   })
 
+  test.each<[string, string]>([
+    ['with fractional seconds', SAMPLE_LAUNCH_START_FRACTIONAL],
+    ['without fractional seconds', SAMPLE_LAUNCH_START_WHOLE],
+  ])('a pending row showing a launch start %s → { state: pending, launchStartedAt } with the launch start raw, from one status call; quiet', async (_label, launchStart) => {
+    const calls = makeStubCallLog()
+    installStub({ ...calls, statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launchStart }) })
+
+    const r = await readQuietly()
+
+    expect(r.outcome).toStrictEqual({ ok: { state: AGENT_DIRECTOR_PENDING_STATE, launchStartedAt: launchStart } })
+    expect(stubCallCount(calls)).toBe(1)
+    expectQuiet(r)
+  })
+
+  test.each<[string, string | null | undefined]>([
+    ['no launch_started_at key', SAMPLE_LAUNCH_START_NONE],
+    ['a null launch_started_at', null],
+    ['an empty launch_started_at', ''],
+  ])('a pending row with %s → { state: pending } and no launchStartedAt key; quiet', async (_label, launchStart) => {
+    installStub({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launchStart }) })
+
+    const r = await readQuietly()
+
+    expect(r.outcome).toStrictEqual({ ok: { state: AGENT_DIRECTOR_PENDING_STATE } })
+    expectQuiet(r)
+  })
+
+  test.each(NON_PENDING_ROW_STATES)('a row reading %s that carries a launch start anyway → { state } only: the launch start is ignored for any state but pending', async (state) => {
+    installStub({ statusResult: cannedStatusResult({ state, launch_started_at: SAMPLE_LAUNCH_START_FRACTIONAL }) })
+
+    const r = await readQuietly()
+
+    expect(r.outcome).toStrictEqual({ ok: { state } })
+    expectQuiet(r)
+  })
+
   test.each<[string, () => Error]>([
     ['the client\'s ErrSpawnNotFound', () => new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'spawn not found')],
     ['a base AgentDirectorError named ErrSpawnNotFound', () => errGeneric('status', 'ErrSpawnNotFound', 'spawn not found')],
-  ])('no row (%s) → absent, not an error, after one status call; quiet', async (_label, build) => {
+  ])('no row (%s) → { state: absent }, not an error, after one status call; quiet', async (_label, build) => {
     const calls = makeStubCallLog()
     installStub({ ...calls, statusError: build() })
 
     const r = await readQuietly()
 
-    expect(r.outcome).toEqual({ ok: UNAVAILABLE_RETRY_ROW_ABSENT })
+    expect(r.outcome).toStrictEqual({ ok: { state: UNAVAILABLE_RETRY_ROW_ABSENT } })
     expect(stubCallCount(calls)).toBe(1)
     expectQuiet(r)
   })
@@ -10679,10 +10732,10 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
     expect([...getOutageFlags(B)]).toEqual([flag])
     expect(outageEmissions.map((e) => e.key)).toEqual([B])
 
-    installStub({ statusResult: { state: 'pending' } })
+    installStub({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_FRACTIONAL }) })
     const ok = await readQuietly()
 
-    expect(ok.outcome).toEqual({ ok: 'pending' })
+    expect(ok.outcome).toStrictEqual({ ok: { state: AGENT_DIRECTOR_PENDING_STATE, launchStartedAt: SAMPLE_LAUNCH_START_FRACTIONAL } })
     expect([...getOutageFlags(B)]).toEqual([])
     expect(outageEmissions.map((e) => e.key)).toEqual([B, B])
     expect(outageEmissions[1]!.text).toContain('All clear')
@@ -10721,18 +10774,18 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
 
     const r = await readQuietly(() => runInAttempt(B, 'recovery', () => readPersonaRowState(B)))
 
-    expect(r.outcome).toEqual({ ok: UNAVAILABLE_RETRY_ROW_ABSENT })
+    expect(r.outcome).toStrictEqual({ ok: { state: UNAVAILABLE_RETRY_ROW_ABSENT } })
     expect(armed).toEqual([])
     expectQuiet(r)
   })
 
   test('inside a recovery attempt for B, a row read that succeeds reports nothing', async () => {
     installRecordingSink()
-    installStub({ statusResult: { state: 'pending' } })
+    installStub({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_FRACTIONAL }) })
 
     const r = await readQuietly(() => runInAttempt(B, 'recovery', () => readPersonaRowState(B)))
 
-    expect(r.outcome).toEqual({ ok: 'pending' })
+    expect(r.outcome).toStrictEqual({ ok: { state: AGENT_DIRECTOR_PENDING_STATE, launchStartedAt: SAMPLE_LAUNCH_START_FRACTIONAL } })
     expect(armed).toEqual([])
     expectQuiet(r)
   })

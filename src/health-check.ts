@@ -4,10 +4,12 @@
  * On each tick, checks every applied persona and schedules a restart if its
  * session reads `dead` and is not already pending/failed. The liveness probe
  * answers one of four readings (b.jg5 SRJ-314): only `dead` schedules the
- * kill-and-launch path at once; `live`, and for now `pending`, take the alive
- * branches; `unknown` (a `status` error, or a probe that threw) skips the
- * persona for the tick, with nothing scheduled or posted, and arms no retry
- * timer. With auto-restart disabled,
+ * kill-and-launch path at once; `live` and `pending` take the alive branches,
+ * but only `live` is ever counted healthy: a `pending` row connected with its
+ * stream takes the not-deliverable path (its session has not started, and the
+ * restart run it schedules defers it); `unknown` (a `status` error, or a
+ * probe that threw) skips the persona for the tick, with nothing scheduled or
+ * posted, and arms no retry timer. With auto-restart disabled,
  * an alive persona it would reconnect is reported through the not-connected
  * notice instead of being left down silently (b.f2b). A persona whose
  * `working` row the reconnect adapter is gathering idle evidence for is
@@ -25,6 +27,7 @@ import { setOutageFlag, clearOutageFlag } from './outage-state.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import {
   LIVENESS_DEAD,
+  LIVENESS_PENDING,
   LIVENESS_UNKNOWN,
   livenessKindOf,
   type LivenessKind,
@@ -40,9 +43,11 @@ export interface HealthCheckDeps {
   /**
    * The persona's liveness reading (b.jg5 SRJ-314, `src/liveness-reading.ts`):
    * `live`, `pending`, `dead` or `unknown`. `dead` schedules the restart at
-   * once; `live` and, for now, `pending` take the alive branches; `unknown`,
-   * a probe that throws and an answer that is not a reading skip the persona
-   * for this tick.
+   * once; `live` and `pending` take the alive branches, and only `live` is
+   * counted healthy (a `pending` row connected with its stream takes the
+   * not-deliverable path, with no not-connected notice); `unknown`, a probe
+   * that throws and an answer that is not a reading skip the persona for this
+   * tick.
    */
   isSessionAlive(key: string): Promise<LivenessReading>
   /**
@@ -301,8 +306,10 @@ export function startHealthCheck(intervalSeconds: number): void {
             console.error(`[slack] health-check: liveness unknown for persona=${key}${failure} — skipping it this tick; not read as dead`)
             continue
           }
-          // `live`, and for now `pending`, take the alive branches below.
+          // `live` and `pending` take the alive branches below; only `live`
+          // is ever counted healthy (b.jg5 SRJ-314).
           const alive = reading !== LIVENESS_DEAD
+          const pending = reading === LIVENESS_PENDING
 
           // b.9a7: a persona can be alive (AD live state — pending, waiting,
           // working, ask_user, check_permission) yet have a dead MCP session.
@@ -310,23 +317,32 @@ export function startHealthCheck(intervalSeconds: number): void {
           // tick (`if (!alive) scheduleRestart`) did nothing for it forever —
           // there was no time-bounded recovery. Route BOTH dead sessions and
           // alive-but-disconnected sessions through scheduleRestart; restart.ts
-          // then does the right thing per case (alive+connected → no-op self-
-          // heal, alive+disconnected → reconnectSession, dead → kill+relaunch).
+          // then does the right thing per case (live+connected → no-op self-
+          // heal, live+disconnected → reconnectSession, pending → the
+          // `pending` deferral, dead → kill+relaunch).
           //
           // NOTE (b.4vj, larva): a future inbound-delivery retry driver will
           // also poke unreachable sessions. If it lands, reconcile the two poke
           // paths so they don't race on the same persona.
           // (Read once: b.f2b words the delay-0 notice by it.)
           const connected = alive && deps.isSessionConnected(key)
+          const deliverable = connected && deps.hasSessionStream(key)
           if (!alive) {
             // Dead session: schedule immediately. The disconnected streak is
             // meaningless once the row is not alive, so drop it.
             disconnectedStreak.delete(key)
             deps.scheduleRestart(key, cwd)
-          } else if (!connected || !deps.hasSessionStream(key)) {
+          } else if (!deliverable || pending) {
             // Alive but not deliverable: either MCP-disconnected (b.9a7) OR
             // connected-but-streamless — the SDK silently dropped the
             // `_GET_stream` map entry so messages cannot reach the bot (b.9cj).
+            //
+            // b.jg5 SRJ-314: a `pending` row is never counted healthy, so one
+            // connected with its stream lands here too: its session has not
+            // started. It takes the same streak, then `scheduleRestart`,
+            // whose run hands it to the `pending` deferral (never relaunched,
+            // never scheduled as dead), and it never ends the not-connected
+            // episode.
             // Both land here and share the SAME two-consecutive-tick guard:
             // HAZARD 1 — a session between registerSession and its stream
             // re-opening is legitimately streamless for a moment and must not be
@@ -348,15 +364,17 @@ export function startHealthCheck(intervalSeconds: number): void {
               // b.f2b: with auto-restart disabled scheduleRestart only logs and
               // returns, so nothing would reconnect this persona: report it
               // (the notice is raised once per episode), worded for why it is
-              // undeliverable.
-              if (deps.isAutoRestartDisabled?.() === true) {
+              // undeliverable. A `pending` row connected with its stream gets
+              // no notice: it is neither disconnected nor streamless, so
+              // either wording would be false.
+              if (!deliverable && deps.isAutoRestartDisabled?.() === true) {
                 deps.notifyNotConnected?.(key, connected ? 'streamless' : 'disconnected')
               }
             } else {
               disconnectedStreak.set(key, streak)
             }
           } else {
-            // Alive, connected, AND stream present — healthy. Reset any pending
+            // `live`, connected, AND stream present — healthy. Reset any pending
             // streak so a transient one-tick blip never accumulates toward the
             // threshold. b.f2b: its not-connected episode, if any, is over.
             disconnectedStreak.delete(key)
