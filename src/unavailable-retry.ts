@@ -1,6 +1,6 @@
 /**
  * unavailable-retry.ts — The per-persona UNAVAILABLE retry timer (b.jg5
- * SRJ-301 code line, SRJ-302, SRJ-304).
+ * SRJ-301 code line, SRJ-302, SRJ-303, SRJ-304, SRJ-305).
  *
  * `createUnavailableRetryController(deps)` builds a controller that keeps at
  * most one retry timer per persona key:
@@ -10,14 +10,19 @@
  *   running its retry, the due time and the wait count stay as they are and
  *   only the cause is recorded. A missing cause is recorded as `unnamed`.
  * - At the due time the injected retry action runs once for the persona. An
- *   `again` answer (a refusal) re-arms the timer at the next wait of the one
- *   sequence, measured from the end of the run: 30, 60, 120, 240, 300, 300 …
- *   s, from `doublingBackoffDelay` over `UNAVAILABLE_RETRY_BASE_S` and
+ *   `again` answer re-arms the timer at the next wait of the one sequence,
+ *   measured from the end of the run: 30, 60, 120, 240, 300, 300 … s, from
+ *   `doublingBackoffDelay` over `UNAVAILABLE_RETRY_BASE_S` and
  *   `UNAVAILABLE_RETRY_CEILING_S`, with no attempt cap (so the retries fall at
  *   30, 90, 210, 450 and 750 s after the arm, then every 300 s). A `stop`
  *   answer stops the timer. An action that throws or rejects, or answers
- *   anything else, counts as `again`, and its failure is named in the
- *   re-armed line.
+ *   anything else, counts as `again`.
+ * - An `again` answer is an outcome of the retry, not a cause: its optional
+ *   `reason` (a short CSCB-written label) is only named in the re-armed line
+ *   and is never recorded. Causes are recorded only through `arm`. The
+ *   re-armed line names the again-reason, else the action's failure (a throw,
+ *   a rejection, or no answer), else the last cause armed during the run,
+ *   else `no cause given`.
  * - If the clock fails while a timer is being set, the persona is forgotten
  *   rather than left armed with no timer: a failed re-arm logs one
  *   `retry run failed` line, a failed first arm logs one `arm failed … — not
@@ -29,7 +34,9 @@
  * - `stop(key, reason)` clears the pending timer and forgets the persona, so
  *   the next `arm` starts again at the first wait. A run in flight when it is
  *   stopped finishes, but its answer is dropped: it neither re-arms nor stops
- *   a later timer. `stopAll(reason)` stops every persona.
+ *   a later timer. `stopAll(reason)` stops every persona. `close(reason)`,
+ *   the server's shutdown, stops every persona and refuses every later `arm`
+ *   (one `not armed` line each), so no timer is pending after it.
  * - `view(key)`, `isArmed(key)` and `armedKeys()` are read-only queries;
  *   `whenRunSettled(key)` awaits the persona's in-flight run, with its re-arm
  *   or stop.
@@ -65,14 +72,36 @@
  * its last, with whether it armed. A trigger while armed keeps the due time
  * (`arm` above).
  *
+ * The full-mode retry action (b.jg5 SRJ-303, SRJ-305). The server's action
+ * is `createFullModeRetryAction(deps)`: at each retry, before any call, the
+ * shutdown flag, the applied-persona lookup, the not-up gate (the relaunch
+ * gate) and the at-cap check each stop the timer with their reason
+ * (`UNAVAILABLE_RETRY_STOP_*`). Otherwise the restart module's retry entry
+ * reruns the restart path's decision, with the one in-flight predicate as its
+ * first step, and its outcome decides: a persona already connected with its
+ * stream, or reconnected, has nothing left to recover (stop); capped, not up,
+ * a declined launch or shutting down stop too; a launch in flight, a refused
+ * launch, a counted launch failure below the cap, a deferred reconnect and a
+ * successful launch retry again at the next wait (the wait count carries on
+ * after a launch; the next retry stops the timer once it finds the persona
+ * connected with its stream). Each `again` carries its again-reason (the
+ * labels under "Again-reasons" below: `launch-in-flight`, `launch-failed`,
+ * `reconnect-deferred`, `launched`, `restart-not-initialised`) for the
+ * re-armed line, except a refused launch, whose line names the UNAVAILABLE
+ * cause that armed during the run. The in-flight skip is still a refusal for the schedule: the wait
+ * doubles. A retry never counts toward the restart cap itself: only a launch
+ * failure the restart work counts does.
+ *
  * Log lines (`[slack] unavailable-retry: persona=<key> …`), one each for
- * armed, retry, re-armed (with the wait), stopped (with the reason),
- * `retry run failed` (the clock failed at a re-arm) and `arm failed … — not
- * armed` (the clock failed at the first arm), go to the injected log only; nothing is posted to Slack. A cause's thrown value
- * and a failed action reach a line only through `describeThrownValue` (its
- * message redacted by `redactSlackLogText`). A cause kind is a fixed label
- * and a stop reason is CSCB-written text; neither carries agent-director
- * failure text.
+ * armed, retry, re-armed (`retry <n>: <reason> — re-armed, next retry in <s>
+ * s`), stopped (with the reason), `retry run failed` (the clock failed at a
+ * re-arm), `arm failed … — not armed` (the clock failed at the first arm) and
+ * `not armed (<cause>) — …` (an arm after `close`), go to the injected log
+ * only; nothing is posted to Slack. A cause's thrown value and a failed
+ * action reach a line only through `describeThrownValue` (its message
+ * redacted by `redactSlackLogText`). A cause kind and an again-reason are
+ * fixed labels (anything else is logged as `unnamed`) and a stop reason is
+ * CSCB-written text; none carries agent-director failure text.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -90,6 +119,7 @@ import { ERR_SPAWN_NOT_FOUND_NAME, ERR_TMUX_KILL_FAILED_NAME } from './agent-dir
 import { doublingBackoffDelay } from './backoff.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
+import type { RestartRetryOutcome } from './restart.ts'
 
 // ---------------------------------------------------------------------------
 // SRJ-302 constants
@@ -110,6 +140,51 @@ export const UNAVAILABLE_RETRY_CAUSE_KILL_FAILED = 'kill-failed'
 /** The cause of any other `status`, `get` or `list` error in an attempt (b.jg5 SRJ-301, SRJ-105). */
 export const UNAVAILABLE_RETRY_CAUSE_READ_ERROR = 'read-error'
 
+// ---------------------------------------------------------------------------
+// Again-reasons: outcomes of a full-mode retry, named in the re-armed line and
+// never recorded as causes
+// ---------------------------------------------------------------------------
+
+/** A full-mode retry that found a launch call in flight for the persona, and made no call (b.jg5 SRJ-302: a refusal). */
+export const UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT = 'launch-in-flight'
+
+/** A full-mode retry whose launch failed and was counted, below the restart cap. */
+export const UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED = 'launch-failed'
+
+/** A full-mode retry whose reconnect of a live row did not succeed or was deferred. */
+export const UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED = 'reconnect-deferred'
+
+/** A full-mode retry whose launch succeeded: the timer runs on at the next wait. */
+export const UNAVAILABLE_RETRY_AGAIN_LAUNCHED = 'launched'
+
+/** A full-mode retry that ran before the restart module was initialised, and did nothing. */
+export const UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED = 'restart-not-initialised'
+
+// ---------------------------------------------------------------------------
+// Stop reasons (b.jg5 SRJ-305)
+// ---------------------------------------------------------------------------
+
+/** A retry found the persona connected with its stream, or its reconnect succeeded. */
+export const UNAVAILABLE_RETRY_STOP_RECOVERED = 'nothing left to recover'
+
+/** The persona is at the restart cap, reached through counted launch failures. */
+export const UNAVAILABLE_RETRY_STOP_CAPPED = 'the persona is at the restart cap'
+
+/** The persona is not up: its bring-up owns it. */
+export const UNAVAILABLE_RETRY_STOP_NOT_UP = 'the persona is not up; its bring-up owns it'
+
+/** The persona is not in the applied configuration. */
+export const UNAVAILABLE_RETRY_STOP_NOT_APPLIED = 'the persona is not in the applied configuration'
+
+/** A retry's relaunch was declined by the launch's own gate. */
+export const UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED = 'its relaunch was declined (the persona is not up, or the server is stopping)'
+
+/** The persona was torn down. */
+export const UNAVAILABLE_RETRY_STOP_TORN_DOWN = 'the persona was torn down'
+
+/** The server is shutting down. */
+export const UNAVAILABLE_RETRY_STOP_SHUTDOWN = 'the server is shutting down'
+
 /** A cause kind that is not a short lower-case label is logged as this. */
 const UNNAMED_CAUSE_KIND = 'unnamed'
 
@@ -119,7 +194,7 @@ const CAUSE_KIND_RE = /^[a-z][a-z0-9-]{0,63}$/
 /** What `arm` records when it is given no cause (possible from untyped callers). */
 const UNNAMED_CAUSE: UnavailableRetryCause = { kind: UNNAMED_CAUSE_KIND }
 
-/** The refusal named in a re-armed line when the answer gave no cause and none was recorded during the run. */
+/** What a re-armed line names when the answer gave no reason, the action did not fail and no cause armed during the run. */
 const NO_CAUSE_GIVEN = 'no cause given'
 
 // ---------------------------------------------------------------------------
@@ -129,7 +204,7 @@ const NO_CAUSE_GIVEN = 'no cause given'
 /** The clock and timers the controller uses (the shared fake clock satisfies it in tests). */
 export type UnavailableRetryClock = PersonaConnectionClock
 
-/** What armed a persona's timer, or what a refused retry met. */
+/** What armed a persona's timer. Recorded only through `arm`. */
 export interface UnavailableRetryCause {
   /**
    * A fixed, token-free label for the cause, lower case with hyphens (for
@@ -141,23 +216,29 @@ export interface UnavailableRetryCause {
   readonly error?: unknown
 }
 
-/** A retry's answer: `again` is a refusal (re-arm at the next wait), `stop` ends the timer. */
+/**
+ * A retry's answer. `again` re-arms at the next wait; its optional `reason`
+ * is an outcome of the retry, not a cause: a short CSCB-written label (lower
+ * case with hyphens, for example `launch-in-flight`), named only in the
+ * re-armed line (as `unnamed` when it is not such a label) and never
+ * recorded. `stop` ends the timer with a CSCB-written reason.
+ */
 export type UnavailableRetryOutcome =
-  | { readonly kind: 'again'; readonly cause?: UnavailableRetryCause }
+  | { readonly kind: 'again'; readonly reason?: string }
   | { readonly kind: 'stop'; readonly reason: string }
 
 /** What the retry action is told about the retry it runs. */
 export interface UnavailableRetryAttempt {
   /** Which retry of this timer this is, from 1. */
   readonly retry: number
-  /** The cause kinds recorded since the arm, in the order first seen. */
+  /** The cause kinds `arm` recorded since the arm, in the order first seen. */
   readonly causes: readonly string[]
 }
 
 /**
- * The retry action: one retry for persona `key`. Answers `again` (a refusal)
- * or `stop` with a CSCB-written reason. A throw or rejection counts as
- * `again`.
+ * The retry action: one retry for persona `key`. Answers `again`, with an
+ * optional again-reason label, or `stop` with a CSCB-written reason. A throw
+ * or rejection counts as `again`.
  */
 export type UnavailableRetryAction = (
   key: string,
@@ -182,9 +263,9 @@ export interface UnavailableRetryView {
   readonly dueAt?: number
   /** The wait that `dueAt` ends, in milliseconds; absent while running. */
   readonly waitMs?: number
-  /** Retries answered `again` (refusals) since the arm. */
+  /** Retries answered `again` since the arm. */
   readonly refusals: number
-  /** The cause kinds recorded since the arm, in the order first seen. */
+  /** The cause kinds `arm` recorded since the arm, in the order first seen. */
   readonly causes: readonly string[]
 }
 
@@ -218,6 +299,12 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
   stop(key: string, reason: string): void
   /** Stop every persona's timer, as `stop` does for each. */
   stopAll(reason: string): void
+  /**
+   * Stop every persona's timer, as `stopAll` does, and refuse every later
+   * `arm` with one not armed line naming `reason` (the server's shutdown).
+   * Nothing is armed again on this controller. Idempotent.
+   */
+  close(reason: string): void
   /** A snapshot of persona `key`'s timer, or `undefined` when not armed. */
   view(key: string): UnavailableRetryView | undefined
   /** True while persona `key` has a timer, waiting or running. */
@@ -244,9 +331,9 @@ interface RetryEntry {
   dueAt: number | undefined
   waitMs: number | undefined
   refusals: number
-  /** Cause kinds recorded since the arm, first seen first. */
+  /** Cause kinds `arm` recorded since the arm, first seen first. */
   readonly causes: string[]
-  /** The description of the last cause recorded during the current run, for the re-armed line. */
+  /** The description of the last cause armed during the current run, for the re-armed line. */
   runCause: string | undefined
 }
 
@@ -260,6 +347,8 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
   const entries = new Map<string, RetryEntry>()
   /** Each persona's latest retry run, until it settles. Kept apart from `entries` so a run outlives a stop. */
   const runs = new Map<string, Promise<void>>()
+  /** Set by `close`: why every later `arm` is refused. */
+  let closedReason: string | undefined
 
   function log(line: string): void {
     try {
@@ -354,14 +443,14 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       stopEntry(entry, outcome.reason)
       return
     }
-    const answered = outcome?.kind === 'again' ? record(entry, outcome.cause) : undefined
+    const answered = outcome?.kind === 'again' ? againReason(outcome) : undefined
     const unexpected = failure === undefined && outcome?.kind !== 'again' ? 'the retry gave no answer' : undefined
-    const refusal = failure ?? unexpected ?? answered ?? entry.runCause ?? NO_CAUSE_GIVEN
+    const reason = answered ?? failure ?? unexpected ?? entry.runCause ?? NO_CAUSE_GIVEN
     entry.runCause = undefined
     entry.refusals += 1
     const waitMs = waitAfter(entry.refusals)
     schedule(entry, waitMs)
-    log(`[slack] unavailable-retry: persona=${entry.key} retry ${retry} refused (${refusal}) — re-armed, next retry in ${waitMs / 1000} s`)
+    log(`[slack] unavailable-retry: persona=${entry.key} retry ${retry}: ${reason} — re-armed, next retry in ${waitMs / 1000} s`)
   }
 
   function stopEntry(entry: RetryEntry, reason: string): void {
@@ -373,6 +462,10 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
   return {
     arm(key, given) {
       const cause = given ?? UNNAMED_CAUSE
+      if (closedReason !== undefined) {
+        log(`[slack] unavailable-retry: persona=${key} not armed (${describeCause(cause)}) — ${closedReason}`)
+        return
+      }
       const existing = entries.get(key)
       if (existing !== undefined) {
         const description = record(existing, cause)
@@ -410,6 +503,12 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       for (const entry of [...entries.values()]) stopEntry(entry, reason)
     },
 
+    close(reason) {
+      if (closedReason !== undefined) return
+      closedReason = reason
+      for (const entry of [...entries.values()]) stopEntry(entry, reason)
+    },
+
     view(key) {
       const entry = entries.get(key)
       if (entry === undefined) return undefined
@@ -429,17 +528,125 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
 }
 
 // ---------------------------------------------------------------------------
+// The full-mode retry action (b.jg5 SRJ-303, SRJ-305)
+// ---------------------------------------------------------------------------
+
+/** Dependencies of `createFullModeRetryAction`, each read at every retry. */
+export interface FullModeRetryDeps {
+  /**
+   * The restart module's retry entry (`runRestartRetry`): the restart path's
+   * decision for the persona, through its serializer, without the delay gate,
+   * with `isInFlight` as its first step.
+   */
+  retry: (key: string, cwd: string, isInFlight: (key: string) => boolean) => Promise<RestartRetryOutcome>
+  /** The applied persona with this key (its working directory), or `undefined` when it is not applied. */
+  appliedPersona: (key: string) => { readonly working_directory: string } | undefined
+  /** The not-up gate (the server's relaunch gate): false while the persona is not up. */
+  canRelaunch: (key: string) => boolean
+  /** Whether the persona is at the restart cap (`isAtCap(key, RESTART_FAILURE_CAP)`). */
+  isAtCap: (key: string) => boolean
+  /** Whether the server is shutting down (the flag `shutdown()` raises). */
+  isShuttingDown: () => boolean
+  /**
+   * The one in-flight predicate: true while work that owns the persona's
+   * session is in flight (today a launch call, `isLaunchInFlight`). A retry
+   * that finds it true makes no agent-director call and is a refusal.
+   */
+  isInFlight: (key: string) => boolean
+}
+
+/**
+ * The full-mode retry action (b.jg5 SRJ-303, SRJ-305; see the module
+ * comment). Before any call, stops on shutdown, a persona not applied, not up
+ * or at the cap, in that order; otherwise runs the retry entry once and
+ * answers from its outcome. A dependency that throws, or an entry that
+ * rejects, rejects the action, which the controller counts as `again`.
+ */
+export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableRetryAction {
+  return async (key) => {
+    if (deps.isShuttingDown()) return stopWith(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+    const persona = deps.appliedPersona(key)
+    if (persona === undefined) return stopWith(UNAVAILABLE_RETRY_STOP_NOT_APPLIED)
+    if (!deps.canRelaunch(key)) return stopWith(UNAVAILABLE_RETRY_STOP_NOT_UP)
+    if (deps.isAtCap(key)) return stopWith(UNAVAILABLE_RETRY_STOP_CAPPED)
+    return answerFor(await deps.retry(key, persona.working_directory, deps.isInFlight))
+  }
+}
+
+function stopWith(reason: string): UnavailableRetryOutcome {
+  return { kind: 'stop', reason }
+}
+
+function againWith(reason: string | undefined): UnavailableRetryOutcome {
+  return reason === undefined ? { kind: 'again' } : { kind: 'again', reason }
+}
+
+/**
+ * What a full-mode retry answers for the retry entry's outcome. A refused
+ * launch gives no reason of its own: the UNAVAILABLE outcome that refused it
+ * armed the timer during the run, and the re-armed line names that cause.
+ */
+function answerFor(outcome: RestartRetryOutcome): UnavailableRetryOutcome {
+  switch (outcome) {
+    case 'already-connected':
+    case 'reconnected':
+      return stopWith(UNAVAILABLE_RETRY_STOP_RECOVERED)
+    case 'capped':
+      return stopWith(UNAVAILABLE_RETRY_STOP_CAPPED)
+    case 'not-up':
+      return stopWith(UNAVAILABLE_RETRY_STOP_NOT_UP)
+    case 'launch-skipped':
+      return stopWith(UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED)
+    case 'shutting-down':
+      return stopWith(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+    case 'in-flight':
+      return againWith(UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT)
+    case 'refused':
+      return againWith(undefined)
+    case 'counted-failure':
+      return againWith(UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED)
+    case 'reconnect-deferred':
+      return againWith(UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED)
+    case 'launched':
+      return againWith(UNAVAILABLE_RETRY_AGAIN_LAUNCHED)
+    case 'not-initialised':
+      return againWith(UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED)
+    default: {
+      const unknown: never = outcome
+      throw new Error(`unknown restart retry outcome: ${String(unknown)}`)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /** A cause's kind as recorded and logged: the label, or `unnamed` when it is not one. */
 function causeKind(cause: UnavailableRetryCause): string {
   try {
-    const kind = cause.kind
-    return typeof kind === 'string' && CAUSE_KIND_RE.test(kind) ? kind : UNNAMED_CAUSE_KIND
+    return labelOf(cause.kind)
   } catch {
     return UNNAMED_CAUSE_KIND
   }
+}
+
+/**
+ * An `again` answer's reason as logged: `undefined` when it gives none, the
+ * label, or `unnamed` when it is not one. Never throws.
+ */
+function againReason(outcome: { readonly reason?: unknown }): string | undefined {
+  try {
+    const reason = outcome.reason
+    return reason === undefined ? undefined : labelOf(reason)
+  } catch {
+    return UNNAMED_CAUSE_KIND
+  }
+}
+
+/** `value` when it is a short lower-case label, else `unnamed`. */
+function labelOf(value: unknown): string {
+  return typeof value === 'string' && CAUSE_KIND_RE.test(value) ? value : UNNAMED_CAUSE_KIND
 }
 
 /** `<kind>`, or `<kind>: <describeThrownValue(error)>` when the cause carries a thrown value. Never throws. */

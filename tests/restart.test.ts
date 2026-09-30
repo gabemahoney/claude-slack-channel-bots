@@ -15,9 +15,23 @@ import {
   cancelRestartTimer,
   _resetRestartState,
   isRestartPendingOrActive,
+  runRestartRetry,
   RESTART_FAILURE_CAP,
+  RESTART_OUTCOME_ALREADY_CONNECTED,
+  RESTART_OUTCOME_CAPPED,
+  RESTART_OUTCOME_COUNTED_FAILURE,
+  RESTART_OUTCOME_IN_FLIGHT,
+  RESTART_OUTCOME_LAUNCHED,
+  RESTART_OUTCOME_LAUNCH_SKIPPED,
+  RESTART_OUTCOME_NOT_INITIALISED,
+  RESTART_OUTCOME_NOT_UP,
+  RESTART_OUTCOME_RECONNECTED,
+  RESTART_OUTCOME_RECONNECT_DEFERRED,
+  RESTART_OUTCOME_REFUSED,
+  RESTART_OUTCOME_SHUTTING_DOWN,
   type LaunchSessionResult,
   type RestartDeps,
+  type RestartRetryOutcome,
 } from '../src/restart.ts'
 import {
   _resetBackoffState,
@@ -91,6 +105,7 @@ import {
   holdSpawns,
   makeStubCallLog,
   makeStubResolveSystemBinary,
+  stubCallCount,
   type SpawnHold,
   type StubCallLog,
 } from './test-helpers/agent-director-stub.ts'
@@ -3540,5 +3555,429 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     expect(errLines.filter((l) => l === FAILED_LINE(p.key))).toEqual([])
     expect(errLines.filter((l) => l === REFUSED_LINE(p.key))).toEqual([])
     expect(retry.armedKeys()).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-303: the retry entry (`runRestartRetry`). The UNAVAILABLE retry
+// timer's full-mode retries rerun the restart work for P: the shutdown and
+// not-up checks, the liveness read, then a reconnect, or a kill and a launch,
+// with today's accounting. The entry bypasses only the restart delay and the
+// restart timer, so every case here runs with `getRestartDelay` answering 0
+// and calls the entry directly. Its first step, inside its own serialized
+// work, is the caller's in-flight check: while a launch is in flight for P it
+// answers in-flight with no agent-director call.
+//
+// Every wait is a microtask flush or a controllable promise; the per-key
+// active-count cases alone fire one real restart timer, the file's accepted
+// real-timer exception.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the delay gate or a restart timer', () => {
+  const P = 'persona_p'
+  const CWD = '/cwd/p'
+  const skipLine = `[slack] Restart retry skipped for persona=${P} — a launch is in flight; no agent-director call`
+  let errLines: string[]
+  let errArgs: unknown[][]
+  let origConsoleError: typeof console.error
+  /** How many times the deps' `getRestartDelay` was read. */
+  let delayReads: number
+  /** Each key the in-flight predicate was asked about. */
+  let inFlightAsked: string[]
+
+  const notInFlight = (key: string): boolean => { inFlightAsked.push(key); return false }
+
+  /** Let every continuation queued so far run (no timer, no real delay). */
+  async function flush(): Promise<void> {
+    for (let i = 0; i < 50; i++) await Promise.resolve()
+  }
+
+  /** The file's deps with the restart delay at 0 (unless `opts` says otherwise), counting its reads. */
+  function retryDeps(opts: DepsOpts = {}): ReturnType<typeof makeDeps> {
+    const deps = makeDeps({ restartDelay: 0, ...opts })
+    const delay = deps.getRestartDelay
+    deps.getRestartDelay = () => { delayReads++; return delay() }
+    return deps
+  }
+
+  /** A launch that stays pending until the test settles it; each call's settle, in call order. */
+  function heldLaunches(): { launch: () => Promise<LaunchSessionResult>; settle: Array<(ok: LaunchSessionResult) => void> } {
+    const settle: Array<(ok: LaunchSessionResult) => void> = []
+    return { settle, launch: () => new Promise<LaunchSessionResult>((res) => { settle.push(res) }) }
+  }
+
+  /** Nothing was probed, reconnected, killed or launched. */
+  function expectNoWork(deps: ReturnType<typeof makeDeps>): void {
+    expect(deps.isSessionAliveCalls).toEqual([])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+  }
+
+  beforeEach(() => {
+    delayReads = 0
+    inFlightAsked = []
+    errLines = []
+    errArgs = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args); errLines.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+  })
+
+  test('before initRestart: answers not-initialised, asks nothing, logs once and leaves P inactive', async () => {
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_NOT_INITIALISED)
+    expect(inFlightAsked).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+    expect(errLines).toEqual([`[slack] runRestartRetry: deps not initialized — skipping the retry for persona=${P}`])
+  })
+
+  test('with the restart delay at 0 scheduleRestart arms nothing, yet the retry kills and launches P at once: it reads no delay and arms no restart timer', async () => {
+    const held = heldLaunches()
+    const order: string[] = []
+    const deps = retryDeps({
+      killSession: async () => { order.push('kill') },
+      launchSession: () => { order.push('launch'); return held.launch() },
+    })
+    initRestart(deps)
+
+    scheduleRestart(P, CWD)
+    expect(isRestartPendingOrActive(P)).toBe(false)
+    expect(delayReads).toBe(1)
+
+    const retry = runRestartRetry(P, CWD, notInFlight)
+    await flush()
+    // The launch is held: P is active, yet no restart timer is pending.
+    expect(order).toEqual(['kill', 'launch'])
+    expect(deps.launchSessionCalls).toEqual([{ key: P, cwd: CWD, sessionId: undefined }])
+    expect(isRestartPendingOrActive(P)).toBe(true)
+    expect(cancelRestartTimer(P)).toBe(false)
+
+    held.settle[0]!(true)
+    expect(await retry).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(isRestartPendingOrActive(P)).toBe(false)
+    expect(delayReads).toBe(1)
+    expect(errLines.filter((l) => l.startsWith('[slack] Scheduling restart'))).toEqual([])
+  })
+
+  test('a restart timer already pending for P is left pending by a retry: neither cleared nor re-armed', async () => {
+    const deps = retryDeps({ restartDelay: SLOW_DELAY_S })
+    initRestart(deps)
+    scheduleRestart(P, CWD)
+    const scheduledLines = () => errLines.filter((l) => l.startsWith('[slack] Scheduling restart'))
+    expect(scheduledLines()).toHaveLength(1)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expect(delayReads).toBe(1)
+    expect(scheduledLines()).toHaveLength(1)
+    expect(isRestartPendingOrActive(P)).toBe(true)
+    expect(cancelRestartTimer(P)).toBe(true)
+  })
+
+  // The failure count starts at 1, so a recorded success or failure would show.
+  test.each<[string, (deps: ReturnType<typeof makeDeps>) => void, RestartRetryOutcome, number]>([
+    ['the server is shutting down', (deps) => { deps.isShuttingDown = () => true }, RESTART_OUTCOME_SHUTTING_DOWN, 0],
+    ['P is not up', (deps) => { deps.canRestart = () => false }, RESTART_OUTCOME_NOT_UP, 0],
+    ['P stops being up during the liveness read', (deps) => {
+      let asked = 0
+      deps.canRestart = () => ++asked === 1
+    }, RESTART_OUTCOME_NOT_UP, 1],
+  ])('%s → no reconnect, kill or launch, nothing counted, and the matching outcome', async (_label, setUp, outcome, probes) => {
+    recordFailure(P)
+    const deps = retryDeps({ isSessionAliveResult: true, launchSessionResult: false })
+    setUp(deps)
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(outcome)
+
+    expect(deps.isSessionAliveCalls).toHaveLength(probes)
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  test('the row reads live and P is connected with its stream → already-connected: no reconnect, kill or launch, nothing counted', async () => {
+    recordFailure(P)
+    const deps = retryDeps({ isSessionAliveResult: true, isSessionConnectedResult: true, hasSessionStreamResult: true })
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_ALREADY_CONNECTED)
+
+    expect(deps.isSessionAliveCalls).toEqual([P])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(P)).toBe(1)
+  })
+
+  // The row reads live but P is not connected: a reconnect. Its verdict decides
+  // the rest; an 'escalate-dead' is followed by a second liveness read.
+  test.each<[string, 'success' | 'escalate-dead' | 'transient' | undefined, boolean, RestartRetryOutcome, number]>([
+    ['the reconnect succeeds → reconnected, a success recorded', 'success', true, RESTART_OUTCOME_RECONNECTED, 0],
+    ['the reconnect is transient → reconnect-deferred, nothing counted', 'transient', true, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
+    ['the reconnect gives no answer → reconnect-deferred, nothing counted', undefined, true, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
+    ['escalate-dead and the row still reads live → reconnect-deferred, nothing counted', 'escalate-dead', true, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
+    ['escalate-dead and the row now reads dead → a kill and a launch in the same retry, launched', 'escalate-dead', false, RESTART_OUTCOME_LAUNCHED, 0],
+  ])('alive but not connected: %s', async (_label, verdict, reprobeAlive, outcome, count) => {
+    recordFailure(P)
+    const deps = retryDeps()
+    const alive = [true, reprobeAlive]
+    deps.isSessionAlive = async (key) => { deps.isSessionAliveCalls.push(key); return alive.shift()! }
+    deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return verdict }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(outcome)
+
+    expect(deps.reconnectSessionCalls).toEqual([P])
+    const relaunched = outcome === RESTART_OUTCOME_LAUNCHED
+    expect(deps.isSessionAliveCalls).toHaveLength(verdict === 'escalate-dead' ? 2 : 1)
+    expect(deps.killSessionCalls).toEqual(relaunched ? [P] : [])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual(relaunched ? [P] : [])
+    expect(getFailureCount(P)).toBe(count)
+  })
+
+  // The row reads dead: a kill, then a launch, whose answer decides the
+  // accounting. The count starts at 1.
+  test.each<[string, LaunchSessionResult, RestartRetryOutcome, number]>([
+    ['the launch succeeds → launched, a success recorded', true, RESTART_OUTCOME_LAUNCHED, 0],
+    ['the launch fails → counted-failure, recordFailure once', false, RESTART_OUTCOME_COUNTED_FAILURE, 2],
+    ['the launch answers UNAVAILABLE → refused, the count unchanged', 'refused', RESTART_OUTCOME_REFUSED, 1],
+    ['the launch is declined by its own gate → launch-skipped, the count unchanged', 'skipped', RESTART_OUTCOME_LAUNCH_SKIPPED, 1],
+  ])('dead: a kill then a launch — %s', async (_label, result, outcome, count) => {
+    recordFailure(P)
+    const order: string[] = []
+    const deps = retryDeps({
+      killSession: async () => { order.push('kill') },
+      launchSession: async () => { order.push('launch'); return result },
+    })
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(outcome)
+
+    expect(order).toEqual(['kill', 'launch'])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(getFailureCount(P)).toBe(count)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  test('counted failures up to RESTART_FAILURE_CAP: the one that reaches it answers capped and fires onCapReached once; one past it answers capped with no second notice', async () => {
+    for (let i = 0; i < RESTART_FAILURE_CAP - 2; i++) recordFailure(P)
+    const deps = retryDeps({ launchSessionResult: false })
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_COUNTED_FAILURE)
+    expect(deps.onCapReachedCalls).toEqual([])
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_CAPPED)
+    expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
+    expect(deps.onCapReachedCalls).toEqual([P])
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_CAPPED)
+    expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP + 1)
+    expect(deps.onCapReachedCalls).toEqual([P])
+  })
+
+  // The in-flight check is the first step: nothing else is asked, and a check
+  // that throws counts as in flight. The thrown error carries a fake token.
+  test.each<[string, boolean]>([
+    ['the in-flight check answers true', false],
+    ['the in-flight check throws (treated as in flight)', true],
+  ])('%s → in-flight: no shutdown or not-up check, no probe, reconnect, kill or launch, nothing counted', async (_label, throws) => {
+    recordFailure(P)
+    const asked: string[] = []
+    const deps = retryDeps({ launchSessionResult: false })
+    deps.isShuttingDown = () => { asked.push('shutdown'); return false }
+    deps.canRestart = () => { asked.push('gate'); return true }
+    initRestart(deps)
+
+    const isInFlight = (key: string): boolean => {
+      inFlightAsked.push(key)
+      if (throws) throw new Error(`in-flight check broke (${sentinelInMessage('in-flight')})`)
+      return true
+    }
+    expect(await runRestartRetry(P, CWD, isInFlight)).toBe(RESTART_OUTCOME_IN_FLIGHT)
+
+    expect(inFlightAsked).toEqual([P])
+    expect(asked).toEqual([])
+    expectNoWork(deps)
+    expect(getFailureCount(P)).toBe(1)
+    expect(isRestartPendingOrActive(P)).toBe(false)
+    if (throws) {
+      expect(errLines).toHaveLength(2)
+      expect(errLines[0]).toStartWith(`[slack] restart retry: in-flight check failed for persona=${P}: Error message="in-flight check broke (${REDACTED_SENTINEL_TAIL})" at `)
+      expect(errLines[0]).toEndWith(' — treated as in flight')
+      expect(errLines[1]).toBe(skipLine)
+    } else {
+      expect(errLines).toEqual([skipLine])
+    }
+    assertNoLeak({ errArgs })
+  })
+
+  test.each<[string, 'none' | 'not-up' | 'in-flight', RestartRetryOutcome]>([
+    ['nothing changes while queued: its turn runs the in-flight check, the gate, the probe, the kill and the launch', 'none', RESTART_OUTCOME_LAUNCHED],
+    ['P stops being up while queued: its turn stops at the not-up check', 'not-up', RESTART_OUTCOME_NOT_UP],
+    ['a launch goes in flight for P while queued: its turn stops at the in-flight check', 'in-flight', RESTART_OUTCOME_IN_FLIGHT],
+  ])('through serialize: the retry waits behind a gated operation for P, asking nothing meanwhile, and runs its checks when its turn starts — %s', async (_label, change, outcome) => {
+    let up = true
+    let launching = false
+    const gateAsked: string[] = []
+    const submitted: string[] = []
+    const serializer = createPersonaSerializer()
+    const deps = retryDeps()
+    deps.canRestart = (key) => { gateAsked.push(key); return up }
+    deps.serialize = (key, op) => { submitted.push(key); return serializer.run(key, op) }
+    initRestart(deps)
+
+    // An earlier operation for P (a teardown, a bring-up retry's launch) holds P's turn.
+    const gate = Promise.withResolvers<void>()
+    const earlier = serializer.run(P, () => gate.promise)
+    const retry = runRestartRetry(P, CWD, (key) => { inFlightAsked.push(key); return launching })
+    await flush()
+
+    expect(submitted).toEqual([P])
+    expect(inFlightAsked).toEqual([])
+    expect(gateAsked).toEqual([])
+    expectNoWork(deps)
+    expect(isRestartPendingOrActive(P)).toBe(true)
+
+    if (change === 'not-up') up = false
+    if (change === 'in-flight') launching = true
+    gate.resolve()
+    await earlier
+    expect(await retry).toBe(outcome)
+
+    expect(inFlightAsked).toEqual([P])
+    if (change === 'none') {
+      expect(gateAsked).toEqual([P, P])
+      expect(deps.killSessionCalls).toEqual([P])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P])
+    } else {
+      expect(gateAsked).toEqual(change === 'not-up' ? [P] : [])
+      expectNoWork(deps)
+    }
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  // P is active while any restart work for it runs: one ending never hides
+  // another. The restart timer here is the file's accepted real one (a 2 ms
+  // backoff from one recorded failure), waited out with `Bun.sleep(WAIT_MS)`.
+  test.each<[string, 'retry' | 'timer']>([
+    ['the retry finishes first: P stays active while the fired restart timer\'s work still runs', 'retry'],
+    ['the fired restart timer\'s work finishes first: P stays active while the retry still runs', 'timer'],
+  ])('per-key active count, a retry and a fired restart timer\'s work running at once for P — %s', async (_label, first) => {
+    recordFailure(P)
+    const held = heldLaunches()
+    const deps = retryDeps({ restartDelay: CAP_BASE_DELAY_S, launchSession: held.launch })
+    initRestart(deps)
+
+    const retry = runRestartRetry(P, CWD, notInFlight)
+    scheduleRestart(P, CWD)
+    await Bun.sleep(WAIT_MS)
+    // Both launches are held: the retry's first, then the timer's.
+    expect(held.settle).toHaveLength(2)
+    const [retryLaunch, timerLaunch] = held.settle as [(ok: LaunchSessionResult) => void, (ok: LaunchSessionResult) => void]
+    expect(isRestartPendingOrActive(P)).toBe(true)
+    expect(cancelRestartTimer(P)).toBe(false)
+
+    if (first === 'retry') {
+      retryLaunch(true)
+      expect(await retry).toBe(RESTART_OUTCOME_LAUNCHED)
+      expect(isRestartPendingOrActive(P)).toBe(true)
+      timerLaunch(true)
+      await flush()
+    } else {
+      timerLaunch(true)
+      await flush()
+      expect(getFailureCount(P)).toBe(0)                 // the timer's work recorded its success
+      expect(isRestartPendingOrActive(P)).toBe(true)
+      retryLaunch(true)
+      expect(await retry).toBe(RESTART_OUTCOME_LAUNCHED)
+    }
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  // The real launch adapter and `isLaunchInFlight` over one stub AD client
+  // whose `spawn` is held (`holdSpawns`), with every other adapter real too,
+  // so any agent-director call the retry made would land in the stub's log.
+  // Every raw-tmux seam is a no-op and every persona path lies under a temp
+  // directory removed in afterEach.
+  describe('a launch call in flight for P, through the real adapters', () => {
+    let dir: string
+    let config: PersonaConfig
+    let a: Persona
+    let log: StubCallLog
+    let hold: SpawnHold
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'restart-retry-'))
+      config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
+      ;[a] = config.personas as [Persona]
+      log = makeStubCallLog()
+      const stub = makeStubClient({ ...log, statusFn: () => ({ state: 'waiting' }) })
+      hold = holdSpawns(stub)
+      _resetOutageState()
+      initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+      setClientForTests(stub as unknown as Client)
+      setSessionNotifier(() => {})
+      _resetInFlightLaunches()
+      _setSpawnHomeDir(dir)
+      _setDialogPollIntervalMs(1)
+      _setDialogReadyTimeoutMs(200)
+      _setTmuxCapturePane(async () => '')
+      _setTmuxSendEnter(async () => {})
+      _setTmuxSessionProber(async () => true)
+      _setTmuxServerEnsurer(async () => {})
+    })
+
+    afterEach(() => {
+      hold.releaseAll()
+      _resetInFlightLaunches()
+      resetClientForTests()
+      _resetOutageState()
+      setSessionNotifier(undefined)
+      _resetSpawnHomeDir()
+      _resetDialogPollIntervalMs()
+      _resetDialogReadyTimeoutMs()
+      _resetTmuxDialogHelpers()
+      _resetTmuxSessionProber()
+      _resetTmuxServerEnsurer()
+      rmSync(dir, { recursive: true, force: true })
+    })
+
+    test('the retry makes no agent-director call at all and answers in-flight; the held launch still completes', async () => {
+      const deps = retryDeps({
+        killSession: _buildKillSessionAdapter(),
+        launchSession: (key) => launchPersonaSession(key, config),
+      })
+      deps.isSessionAlive = _buildIsSessionAliveAdapter(() => config)
+      deps.reconnectSession = _buildReconnectSessionAdapter()
+      initRestart(deps)
+
+      const id = personaInstanceId(a.key)
+      const launch = launchPersonaSession(a.key, config)
+      await hold.entered(id)
+      expect(isLaunchInFlight(a.key)).toBe(true)
+      const before = stubCallCount(log)
+
+      expect(await runRestartRetry(a.key, a.working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_IN_FLIGHT)
+
+      expect(stubCallCount(log)).toBe(before)
+      expect(hold.calls).toHaveLength(1)
+      expect(deps.killSessionCalls).toEqual([])
+      expect(deps.launchSessionCalls).toEqual([])
+      expect(getFailureCount(a.key)).toBe(0)
+
+      hold.release(id)
+      expect(await launch).toBe(true)
+      expect(isLaunchInFlight(a.key)).toBe(false)
+    })
   })
 })

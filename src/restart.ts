@@ -24,12 +24,22 @@
  * relaunch the timer now owns answers `'refused'`, which is never counted
  * toward the cap (SRJ-302): a persona is never given up on for UNAVAILABLE
  * alone.
+ * The work answers an outcome (`RestartWorkOutcome`, one of the
+ * `RESTART_OUTCOME_*` labels); the restart timer ignores it. The retry entry,
+ * `runRestartRetry`, is how the UNAVAILABLE retry timer's retries rerun the
+ * same decision (SRJ-303): through the same serializer, as the same recovery
+ * attempt, with none of `scheduleRestart`'s gates (the restart delay, delay 0
+ * included, the pending timer) and no restart timer touched. Its first step,
+ * inside its own serialized work, is the caller's in-flight check: while a
+ * launch is in flight for the persona it answers `RESTART_OUTCOME_IN_FLIGHT`
+ * with no agent-director call.
  * Isolated from server.ts side effects — injectable deps make it testable.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import {
+  isAtCap,
   recordFailure,
   recordSuccess,
   nextBackoffDelay,
@@ -60,6 +70,58 @@ export const RESTART_FAILURE_CAP = 5
  * toward normal backoff/cap accounting (b.kvq).
  */
 export const HUMAN_TRIGGER_DELAY_CEILING = 5
+
+// ---------------------------------------------------------------------------
+// Outcomes of the restart work and of the retry entry
+// ---------------------------------------------------------------------------
+
+/** The server is shutting down: nothing was probed, reconnected, killed or launched. */
+export const RESTART_OUTCOME_SHUTTING_DOWN = 'shutting-down'
+/** The persona is not up (or not applied): its instance and row were left as they are. */
+export const RESTART_OUTCOME_NOT_UP = 'not-up'
+/** The row reads live and the session is connected with its stream: nothing to do. */
+export const RESTART_OUTCOME_ALREADY_CONNECTED = 'already-connected'
+/** The row read live and the reconnect succeeded (a success was recorded). */
+export const RESTART_OUTCOME_RECONNECTED = 'reconnected'
+/**
+ * The row reads live and the reconnect did not succeed or was deferred
+ * (`transient`, no answer, or `escalate-dead` with the row still reading
+ * live): no launch, nothing counted.
+ */
+export const RESTART_OUTCOME_RECONNECT_DEFERRED = 'reconnect-deferred'
+/** The kill and the launch ran and the launch succeeded (a success was recorded). */
+export const RESTART_OUTCOME_LAUNCHED = 'launched'
+/** The launch was refused: its UNAVAILABLE retry timer was armed for it. Not counted. */
+export const RESTART_OUTCOME_REFUSED = 'refused'
+/** The launch failed and the failure was counted, below the cap. */
+export const RESTART_OUTCOME_COUNTED_FAILURE = 'counted-failure'
+/** The launch failed, the failure was counted, and the persona is at the restart cap. */
+export const RESTART_OUTCOME_CAPPED = 'capped'
+/** The launch was declined by its own gate (the persona stopped being up, or the server is stopping). Not counted. */
+export const RESTART_OUTCOME_LAUNCH_SKIPPED = 'launch-skipped'
+/** Retry entry only: a launch was in flight for the persona, so no agent-director call was made. */
+export const RESTART_OUTCOME_IN_FLIGHT = 'in-flight'
+/** Retry entry only: `initRestart` has not run, so nothing was done. */
+export const RESTART_OUTCOME_NOT_INITIALISED = 'not-initialised'
+
+/** What one run of the restart work answers. The restart timer ignores it. */
+export type RestartWorkOutcome =
+  | typeof RESTART_OUTCOME_SHUTTING_DOWN
+  | typeof RESTART_OUTCOME_NOT_UP
+  | typeof RESTART_OUTCOME_ALREADY_CONNECTED
+  | typeof RESTART_OUTCOME_RECONNECTED
+  | typeof RESTART_OUTCOME_RECONNECT_DEFERRED
+  | typeof RESTART_OUTCOME_LAUNCHED
+  | typeof RESTART_OUTCOME_REFUSED
+  | typeof RESTART_OUTCOME_COUNTED_FAILURE
+  | typeof RESTART_OUTCOME_CAPPED
+  | typeof RESTART_OUTCOME_LAUNCH_SKIPPED
+
+/** What the retry entry (`runRestartRetry`) answers: the work's outcome, or why it did not run. */
+export type RestartRetryOutcome =
+  | RestartWorkOutcome
+  | typeof RESTART_OUTCOME_IN_FLIGHT
+  | typeof RESTART_OUTCOME_NOT_INITIALISED
 
 // ---------------------------------------------------------------------------
 // Types
@@ -125,8 +187,9 @@ export interface RestartDeps {
   /**
    * The per-persona lifecycle serializer's `run` (b.av2 SR-6.6,
    * `persona-serializer.ts`): a fired timer's work (every check, the probe,
-   * reconnect, kill and launch) is submitted through it, so it starts only
-   * after every operation already submitted for the persona has settled.
+   * reconnect, kill and launch), and a retry entry's work with its in-flight
+   * check first, is submitted through it, so it starts only after every
+   * operation already submitted for the persona has settled.
    * Scheduling, backoff, the cap, the `activeLaunches` guard and the
    * human-trigger clamp are not serialized. Without it the work runs at once.
    * Production passes the server's one shared serializer.
@@ -146,8 +209,23 @@ export type LaunchSessionResult = boolean | 'skipped' | 'refused'
 // ---------------------------------------------------------------------------
 
 const pendingRestartTimers = new Map<string, ReturnType<typeof setTimeout>>()
-const activeLaunches = new Set<string>()
+/**
+ * Per persona key, how many restart works (a fired timer's, a retry entry's)
+ * are running or waiting for their serializer turn. A key is active while its
+ * count is above 0, so one work that ends never hides another still running.
+ */
+const activeLaunches = new Map<string, number>()
 let deps: RestartDeps | null = null
+
+function markActive(key: string): void {
+  activeLaunches.set(key, (activeLaunches.get(key) ?? 0) + 1)
+}
+
+function unmarkActive(key: string): void {
+  const count = (activeLaunches.get(key) ?? 0) - 1
+  if (count > 0) activeLaunches.set(key, count)
+  else activeLaunches.delete(key)
+}
 
 // ---------------------------------------------------------------------------
 // initRestart
@@ -222,7 +300,7 @@ export function scheduleRestart(
 
   const timer = setTimeout(async () => {
     pendingRestartTimers.delete(key)
-    activeLaunches.add(key)
+    markActive(key)
 
     try {
       const d = deps
@@ -232,10 +310,11 @@ export function scheduleRestart(
       // for this persona (a teardown, a bring-up retry's launch). Every check
       // below runs when the work starts, not when the timer fired. The
       // `activeLaunches` entry covers the wait, so the health check and the
-      // lost-message path see the restart as active meanwhile.
+      // lost-message path see the restart as active meanwhile. The work's
+      // outcome is not used here.
       await (d.serialize ?? runNow)(key, () => runRestartWork(d, key, cwd, sessionId))
     } finally {
-      activeLaunches.delete(key)
+      unmarkActive(key)
     }
   }, delay * 1000)
 
@@ -247,30 +326,89 @@ async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise
   return operation()
 }
 
+// ---------------------------------------------------------------------------
+// runRestartRetry — the UNAVAILABLE retry timer's entry (b.jg5 SRJ-303)
+// ---------------------------------------------------------------------------
+
 /**
- * The work a restart timer does when it fires, run through the serializer:
- * the shutdown and not-up checks, the liveness probe, then a reconnect, or a
- * kill and a launch, and the success or failure accounting. A reconnect whose
- * verdict is 'escalate-dead' is followed by a second liveness probe; when the
- * row now reads dead, the same run goes on to the kill and launch (b.d61).
- * The whole work is one recovery attempt for the persona (b.jg5 SRJ-301).
+ * Rerun the restart path's decision for persona `key` now, for the
+ * UNAVAILABLE retry timer's full mode (b.jg5 SRJ-303). `cwd` is the persona's
+ * working directory; `isInFlight(key)` is the caller's in-flight check (a
+ * launch call for the persona in flight).
+ *
+ * The key is active (`isRestartPendingOrActive`) while the entry runs. Its
+ * work goes through the same per-persona serializer as a fired restart
+ * timer's (`RestartDeps.serialize`), so it never overlaps a teardown, a
+ * bring-up retry's launch or a restart for the persona. Inside that work,
+ * first, `isInFlight(key)`: true answers `RESTART_OUTCOME_IN_FLIGHT` with no
+ * agent-director call (a check that throws counts as true). Otherwise the
+ * restart work runs, as one recovery attempt, with today's accounting, and
+ * its outcome is answered. It bypasses only the restart delay and the restart
+ * timer: `getRestartDelay` is never read (it runs with delay 0 too) and no
+ * restart timer is armed, cleared or needed. Before `initRestart` it answers
+ * `RESTART_OUTCOME_NOT_INITIALISED` and logs. Rejects only when the
+ * serializer or an unguarded dependency (`isShuttingDown`, `canRestart`,
+ * `isSessionConnected`, `hasSessionStream`, `onCapReached`) throws.
  */
-async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<void> {
-  await runInAttempt(key, 'recovery', () => restartWorkSteps(d, key, cwd, sessionId))
+export async function runRestartRetry(
+  key: string,
+  cwd: string,
+  isInFlight: (key: string) => boolean,
+): Promise<RestartRetryOutcome> {
+  const d = deps
+  if (!d) {
+    console.error(`[slack] runRestartRetry: deps not initialized — skipping the retry for persona=${key}`)
+    return RESTART_OUTCOME_NOT_INITIALISED
+  }
+  markActive(key)
+  try {
+    return await (d.serialize ?? runNow)(key, async (): Promise<RestartRetryOutcome> => {
+      if (launchInFlight(key, isInFlight)) {
+        console.error(`[slack] Restart retry skipped for persona=${key} — a launch is in flight; no agent-director call`)
+        return RESTART_OUTCOME_IN_FLIGHT
+      }
+      return runRestartWork(d, key, cwd, undefined)
+    })
+  } finally {
+    unmarkActive(key)
+  }
+}
+
+/** The retry entry's in-flight check: `isInFlight(key)`, with a throw counted as in flight (logged). */
+function launchInFlight(key: string, isInFlight: (key: string) => boolean): boolean {
+  try {
+    return isInFlight(key)
+  } catch (err) {
+    console.error(`[slack] restart retry: in-flight check failed for persona=${key}: ${describeThrownValue(err)} — treated as in flight`)
+    return true
+  }
+}
+
+/**
+ * The work a restart timer does when it fires, and a retry reruns, run
+ * through the serializer: the shutdown and not-up checks, the liveness probe,
+ * then a reconnect, or a kill and a launch, and the success or failure
+ * accounting. A reconnect whose verdict is 'escalate-dead' is followed by a
+ * second liveness probe; when the row now reads dead, the same run goes on to
+ * the kill and launch (b.d61). The whole work is one recovery attempt for the
+ * persona (b.jg5 SRJ-301). Answers what it did (`RestartWorkOutcome`).
+ */
+async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<RestartWorkOutcome> {
+  return runInAttempt(key, 'recovery', () => restartWorkSteps(d, key, cwd, sessionId))
 }
 
 /** The steps of `runRestartWork`, inside its recovery attempt. */
-async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<void> {
+async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<RestartWorkOutcome> {
   if (d.isShuttingDown()) {
     console.error(`[slack] Skipping restart — server is shutting down (persona=${key})`)
-    return
+    return RESTART_OUTCOME_SHUTTING_DOWN
   }
 
   // b.av2 SR-6.4: the persona stopped being up after this restart was
   // scheduled (e.g. Slack refused a token on a reopen). Leave its instance
   // and its row alone: no liveness probe, reconnect, kill or launch, and
   // no success or failure recorded.
-  if (skipIfNotUp(d, key)) return
+  if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
 
   let alive: boolean
   try {
@@ -285,7 +423,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // the last check before `reconnectSession` or `killSession` touch the
   // instance; `launchSession`'s own gate (`'skipped'` below) covers a flip
   // during the kill.
-  if (skipIfNotUp(d, key)) return
+  if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
 
   if (alive) {
     // If the session already re-established its MCP connection (e.g. Claude
@@ -296,7 +434,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // waved through as "already reconnected".
     if (d.isSessionConnected(key) && d.hasSessionStream(key)) {
       console.error(`[slack] Session already reconnected — skipping restart for persona=${key}`)
-      return
+      return RESTART_OUTCOME_ALREADY_CONNECTED
     }
     console.error(`[slack] Session alive but disconnected — reconnecting MCP for persona=${key}`)
     let reconnectResult: 'success' | 'escalate-dead' | 'transient' | void
@@ -310,7 +448,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     if (reconnectResult === 'success') {
       // Reconnect succeeded — reset the failure counter and cap latch.
       recordSuccess(key)
-      return
+      return RESTART_OUTCOME_RECONNECTED
     }
     // Non-success/non-void branches ('escalate-dead', 'transient', or undefined):
     // do NOT recordFailure here. SR-25.1 / single counting site: counting
@@ -345,8 +483,9 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // it returns as before and the next tick retries. The external
     // ~/startup/find-missing-loop.sh is belt-and-braces only — recovery no
     // longer depends on it, and removing it is a separate operator decision.
-    if (reconnectResult !== 'escalate-dead') return
-    if (!(await reprobeDeadAfterEscalate(d, key))) return
+    if (reconnectResult !== 'escalate-dead') return RESTART_OUTCOME_RECONNECT_DEFERRED
+    const held = await reprobeDeadAfterEscalate(d, key)
+    if (held !== undefined) return held
   }
 
   // Kill zombie if needed (ignore errors — session may not exist)
@@ -371,7 +510,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // the stop, and the server is stopping. The instance was already killed
     // by then; the failure counter, backoff and cap latch are left exactly
     // as they were.
-    return
+    return RESTART_OUTCOME_LAUNCH_SKIPPED
   }
 
   if (ok === 'refused') {
@@ -381,45 +520,49 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // UNAVAILABLE alone, so the failure counter, backoff and cap latch are
     // left exactly as they were.
     console.error(`[slack] Session relaunch refused for persona=${key} — not counted; its UNAVAILABLE retry timer owns the persona`)
-    return
+    return RESTART_OUTCOME_REFUSED
   }
 
   if (ok) {
     // Successful launch — reset consecutive-failure counter and cap latch.
     recordSuccess(key)
-  } else {
-    // Launch failed — increment the failure counter (SINGLE COUNTING SITE:
-    // SR-25.1; counting happens only here at the launchSession boolean).
-    recordFailure(key)
-    console.error(`[slack] Session relaunch failed for persona=${key}`)
-
-    // Once-per-episode cap notification: fires exactly once when the failure
-    // count reaches RESTART_FAILURE_CAP. Subsequent calls return false (latched).
-    if (shouldNotifyCap(key, RESTART_FAILURE_CAP)) {
-      console.error(`[slack] Cap reached for persona=${key} — notifying and stopping restarts`)
-      d.onCapReached(key)
-      // Do NOT schedule another timer — the persona is capped. The
-      // activeLaunches entry is removed in the timer's finally block.
-      // The tick guard (isAtCap in health-check.ts) prevents future ticks
-      // from re-scheduling while capped (SR-25.3/25.4).
-      return
-    }
+    return RESTART_OUTCOME_LAUNCHED
   }
+
+  // Launch failed — increment the failure counter (SINGLE COUNTING SITE:
+  // SR-25.1; counting happens only here at the launchSession boolean).
+  recordFailure(key)
+  console.error(`[slack] Session relaunch failed for persona=${key}`)
+
+  // Once-per-episode cap notification: fires exactly once when the failure
+  // count reaches RESTART_FAILURE_CAP. Subsequent calls return false (latched).
+  if (shouldNotifyCap(key, RESTART_FAILURE_CAP)) {
+    console.error(`[slack] Cap reached for persona=${key} — notifying and stopping restarts`)
+    d.onCapReached(key)
+    // Do NOT schedule another timer — the persona is capped. The
+    // activeLaunches entry is removed in the caller's finally block.
+    // The tick guard (isAtCap in health-check.ts) prevents future ticks
+    // from re-scheduling while capped (SR-25.3/25.4).
+    return RESTART_OUTCOME_CAPPED
+  }
+  // A failure past the cap (its notice already sent this episode) is capped too.
+  return isAtCap(key, RESTART_FAILURE_CAP) ? RESTART_OUTCOME_CAPPED : RESTART_OUTCOME_COUNTED_FAILURE
 }
 
 /**
  * b.d61: after an 'escalate-dead' reconnect verdict (whose adapter already ran
- * the findMissing sweep), probe the persona's liveness again. Returns true when
- * the row now reads dead and this restart run should go on to the
- * kill+relaunch branch; false when it should return as before (the row still
- * reads alive, so the next tick retries; the server is shutting down; or the
- * persona is no longer up). The probe is guarded as the first one is: a thrown
+ * the findMissing sweep), probe the persona's liveness again. Returns
+ * undefined when the row now reads dead and this restart run should go on to
+ * the kill+relaunch branch; otherwise the outcome the run returns with, as
+ * before: `RESTART_OUTCOME_RECONNECT_DEFERRED` (the row still reads alive, so
+ * the next tick retries), `RESTART_OUTCOME_SHUTTING_DOWN` or
+ * `RESTART_OUTCOME_NOT_UP`. The probe is guarded as the first one is: a thrown
  * probe counts as not alive. Shutdown and the not-up gate are asked after the
  * probe, since it is an async agent-director call; `killSession`'s
  * launch-in-flight guard and `launchSession`'s own gate still apply after it.
  * Records no success or failure.
  */
-async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<boolean> {
+async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<RestartWorkOutcome | undefined> {
   let alive: boolean
   try {
     alive = await d.isSessionAlive(key)
@@ -430,16 +573,16 @@ async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<bo
 
   if (d.isShuttingDown()) {
     console.error(`[slack] Skipping restart — server is shutting down (persona=${key})`)
-    return false
+    return RESTART_OUTCOME_SHUTTING_DOWN
   }
-  if (skipIfNotUp(d, key)) return false
+  if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
 
   if (alive) {
     console.error(`[slack] Session still reads alive after escalate-dead — leaving the relaunch to a later tick for persona=${key}`)
-    return false
+    return RESTART_OUTCOME_RECONNECT_DEFERRED
   }
   console.error(`[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run for persona=${key} (b.d61)`)
-  return true
+  return undefined
 }
 
 /**

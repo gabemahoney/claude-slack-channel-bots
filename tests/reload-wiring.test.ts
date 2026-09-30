@@ -38,7 +38,10 @@
  * no `applySteps` override (which would replace that fan-out), and that the
  * restart timers, the connection manager (the deferred socket close after a
  * Web API auth error, b.ujn), the bring-up retries and the lifecycle share
- * one per-persona serializer, and that the refresh gets the server-wide
+ * one per-persona serializer (the UNAVAILABLE retry controller reaches it only
+ * through the restart module's retry entry, never directly), that the
+ * teardown stops a key's UNAVAILABLE retry timer through the one retry
+ * controller main() builds (b.jg5 SRJ-305), and that the refresh gets the server-wide
  * template arguments the boot install wrote (a value captured once at start,
  * never re-read at apply) and the agent-director client. What the default step bodies do with those members
  * is tested in tests/reload-apply.test.ts; what the teardown, the apply
@@ -484,7 +487,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     ])
     // Functions and objects with a parameter name of the source's choosing.
     // (`templateRefresh` is pinned in the test after this one.)
-    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh']
+    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopRetryTimer']
     expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
     for (const [dep, value] of expected) expect([dep, props.get(dep)]).toEqual([dep, value])
 
@@ -506,6 +509,8 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       teardownPersonaReplyGuard: './stop-hook-bootstrap.ts',
       stopHookLaunchPass: './stop-hook-bootstrap.ts',
       runPersonaStorageCheck: './jsonl-persistence-check.ts',
+      createUnavailableRetryController: './unavailable-retry.ts',
+      UNAVAILABLE_RETRY_STOP_TORN_DOWN: './unavailable-retry.ts',
     }
     for (const [name, module] of Object.entries(imports)) {
       expect([name, importSource(SERVER_CODE, name)]).toEqual([name, module])
@@ -544,6 +549,18 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     )
     expect(launchPass).not.toBeNull()
     expect([launchPass![3], launchPass![4]]).toEqual([launchPass![1], launchPass![2]])
+
+    // b.jg5 SRJ-305: the teardown stops the key's UNAVAILABLE retry timer on
+    // the server's one retry controller (the one installed as the outage
+    // state's trigger sink; pinned in tests/server-startup-wiring.test.ts),
+    // with the torn-down reason: not a stub, not the restart timer's cancel,
+    // not another controller, and never every persona's timer.
+    const retryTimers = constOf('createUnavailableRetryController')
+    const stopRetry = (props.get('stopRetryTimer') ?? '').match(
+      new RegExp(`^\\(?(\\w+)\\)? => ${retryTimers}\\.stop\\((\\w+), UNAVAILABLE_RETRY_STOP_TORN_DOWN\\)$`),
+    )
+    expect(stopRetry).not.toBeNull()
+    expect(stopRetry![2]).toBe(stopRetry![1])
 
     // The storage check at apply posts through the persona notifier.
     const storage = (props.get('storageCheck') ?? '').match(new RegExp(`^\\(?(\\w+)\\)? => runPersonaStorageCheck\\((\\w+), ${notifier}\\.notify\\)$`))

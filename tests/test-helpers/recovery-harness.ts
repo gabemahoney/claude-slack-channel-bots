@@ -11,12 +11,42 @@
  *   (`createUnavailableRetryController`) on the harness clock. Its log lines
  *   go to `lines`. Its retry action is a delegate: every retry is recorded in
  *   `attempts` (persona key, retry number, cause kinds and the clock time),
- *   then answered by the current action. The current action is
- *   `options.action`, or else the scripted action: it answers each persona's
- *   queued outcomes (`answer(key, ...outcomes)`) in order and, once they run
- *   out, a refusal (`{ kind: 'again', cause: { kind: 'unavailable' } }`).
- *   `setAction(action)` swaps the current action; `setAction(undefined)`
- *   goes back to the scripted one.
+ *   then answered by the current action. The default action is
+ *   `fullModeAction`, the server's full-mode action
+ *   (`createFullModeRetryAction`) over the real restart module's retry entry
+ *   (`runRestartRetry`), wired as `main()` wires it: the applied-persona
+ *   lookup over the live applied set, the relaunch gate below, the restart
+ *   cap (`isAtCap` at `RESTART_FAILURE_CAP`), the harness's shutting-down
+ *   flag and the session manager's `isLaunchInFlight`. `scriptedAction` is
+ *   the scripted action: it answers each persona's queued outcomes
+ *   (`answer(key, ...outcomes)`) in order and, once they run out, a bare
+ *   refusal (`{ kind: 'again' }`). `options.action` replaces the default
+ *   (`'scripted'` picks the scripted action); `setAction(action)` swaps the
+ *   current action, and `setAction(undefined)` goes back to the full-mode
+ *   one.
+ * - The restart module is initialised over the configuration
+ *   (`initRestart`) with the production adapters: the liveness read
+ *   (`_buildIsSessionAliveAdapter` over the applied configuration), the
+ *   reconnect and kill adapters (`_buildReconnectSessionAdapter`,
+ *   `_buildKillSessionAdapter`, over the applied-persona lookup) and
+ *   `launchSession` over the applied configuration with the relaunch gate as
+ *   `canLaunch`. `getRestartDelay` answers the configuration's
+ *   `session_restart_delay` (0 by default). `onCapReached` records the key in
+ *   `capReached` and then calls `notifyRestartCapReached`, whose notice lands
+ *   in `notices`. `serialize` is `serializer.run`, one real per-persona
+ *   serializer (`createPersonaSerializer`), which a test may hold a turn on.
+ *   `options.restartDeps` replaces any of these.
+ * - The relaunch gate is the real `createPersonaRelaunchGate` over a serving
+ *   connection, with the bring-up outcome `setUp(key, up)` controls (every
+ *   configured persona up at first) and the live applied set (its lines go
+ *   to `lines`). `setConnected(key, connected)` controls whether the
+ *   persona's session is registered as connected with its message stream
+ *   (`isSessionConnected` and `hasSessionStream`; none at first).
+ * - Drivers, each as the server does it: `shutdown()` raises the
+ *   shutting-down flag and closes the controller
+ *   (`close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)`); `teardown(key)` stops the
+ *   persona's timer (`stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`);
+ *   `remove(key)` drops the persona from the applied configuration.
  * - `stub`: one stub client (`makeStubClient`) with its call log
  *   (`stub.calls`), installed through `installStubSpawnPath` with the spawn
  *   home under the harness's temporary HOME, and handed to the outage state
@@ -35,10 +65,12 @@
  *   resolving with its `SpawnPersonaResult`. Each persona's working directory
  *   exists, so a row the stub answers in it is the persona's own.
  * - `settle()`: awaits every configured persona's launch in flight
- *   (`whenLaunchSettled`). The spawn path polls in real time (the dialog
+ *   (`whenLaunchSettled`) and every retry run in flight (`whenRunSettled`),
+ *   with its re-arm or stop. The spawn path polls in real time (the dialog
  *   approver's 1 ms steps; it takes no fake clock), so this is the one
  *   real-time wait: 1 ms steps, bounded by `options.settleMs`, and it throws
- *   when a launch is still in flight at the bound.
+ *   when a launch or a run is still in flight at the bound. A retry whose
+ *   launch goes on past a spawn needs it before the clock moves on.
  * - `outageNotices`: the outage state's notices, `{ key, text }`, in order.
  * - `notices`: the session manager's notices (`setSessionNotifier`),
  *   `{ key, text }`, in order.
@@ -53,10 +85,7 @@
  * - `config` and `keys`: a resolved configuration of `options.personas`
  *   (two personas by default) with `session_restart_delay` and
  *   `health_check_interval` from the options, both 0 by default (SRJ-304).
- *   The restart module is initialised over it (`initRestart`): its delay is
- *   the configuration's, its relaunch gate admits the configured keys, and
- *   every other dependency is an inert stand-in unless `options.restartDeps`
- *   replaces it.
+ *   Every persona is applied at first.
  * - `advance(ms)`: moves the clock `ms` forward one due time at a time.
  *   Before and after each firing it awaits every in-flight retry run
  *   (`whenRunSettled`), bounded by `options.settleFlushes` clock flushes, so
@@ -66,20 +95,21 @@
  *   notice lists, the startup-errors entries, the attempts, the triggers and
  *   the state directory as a written file.
  * - `cleanup()`: stops every retry timer (`stopAll`), then undoes every
- *   install and reset the harness made (the restart module and the failure
- *   counter, the outage state and its trigger sink, the session notifier,
+ *   install and reset the harness made (the restart module's state and the
+ *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
  *   the stub spawn path and client with every launch still in flight, the
  *   findMissing memo, the tmux seams, the settings install,
  *   `SLACK_STATE_DIR`) and removes the temporary directory. It throws, after
  *   undoing everything, when a timer is still pending on the clock or a
  *   persona is still armed.
  *
- * Later work extends this harness in place (the real restart entry as the
- * default action, and the pending-row rule, the latch and the episodes).
+ * Later work extends this harness in place (the pending-row rule, the latch
+ * and the episodes).
  *
  * Isolation: no top-level `mock.module()`, no real HOME, `~/.agent-director`,
  * tmux or child process. The retry timer runs on the fake clock only; the one
- * real-time wait is `settle()`'s bounded poll for the spawn path. Every file
+ * real-time wait is `settle()`'s bounded poll for the spawn path. A retry
+ * never arms the restart module's own (real) timer: its entry bypasses it. Every file
  * sits under one `mkdtempSync` directory.
  *
  * SPDX-License-Identifier: MIT
@@ -92,23 +122,33 @@ import { join } from 'node:path'
 import type { Client } from 'agent-director'
 
 import { adSettingsInEffect, installAdSettings, resetAdSettingsForTests, type AdSettingsInEffect } from '../../src/ad-settings.ts'
-import { _resetBackoffState } from '../../src/backoff.ts'
-import type { PersonaConfig } from '../../src/config.ts'
+import { _resetBackoffState, isAtCap } from '../../src/backoff.ts'
+import type { Persona, PersonaConfig } from '../../src/config.ts'
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
-import { _resetRestartState, initRestart, type RestartDeps } from '../../src/restart.ts'
+import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
+import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
+import { createPersonaRelaunchGate } from '../../src/persona-start.ts'
+import { _resetRestartState, initRestart, RESTART_FAILURE_CAP, runRestartRetry, type RestartDeps } from '../../src/restart.ts'
+import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter } from '../../src/server.ts'
 import {
   _resetFindMissingMemo,
   _resetTmuxServerEnsurer,
   _resetTmuxSessionKiller,
   _setTmuxServerEnsurer,
   _setTmuxSessionKiller,
+  isLaunchInFlight,
+  launchSession,
+  notifyRestartCapReached,
   setSessionNotifier,
   spawnForPersona,
   whenLaunchSettled,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
 import {
+  createFullModeRetryAction,
   createUnavailableRetryController,
+  UNAVAILABLE_RETRY_STOP_SHUTDOWN,
+  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   type UnavailableRetryAction,
   type UnavailableRetryTriggerSink,
   type UnavailableRetryController,
@@ -132,13 +172,16 @@ const DEFAULT_SETTLE_FLUSHES = 20
 /** How long `settle` waits at most for the launches in flight, in real ms (1 ms steps). */
 const DEFAULT_SETTLE_MS = 2000
 
-/** What the scripted action answers once a persona's queued outcomes run out: a refusal. */
-const SCRIPTED_REFUSAL: UnavailableRetryOutcome = Object.freeze({ kind: 'again', cause: Object.freeze({ kind: 'unavailable' }) })
+/** What the scripted action answers once a persona's queued outcomes run out: a bare refusal. */
+const SCRIPTED_REFUSAL: UnavailableRetryOutcome = Object.freeze({ kind: 'again' })
+
+/** The connection status the relaunch gate reads for every persona: serving. */
+const SERVING: PersonaConnectionStatus = Object.freeze({ state: 'up', identity: Object.freeze({ botUserId: 'U0RECOVERY', botId: 'B0RECOVERY' }) })
 
 /** Options of `makeRecoveryHarness`; every one is optional. */
 export interface RecoveryHarnessOptions {
-  /** The retry action; the scripted action when unset. */
-  action?: UnavailableRetryAction
+  /** The retry action: `'scripted'` for the scripted action; the full-mode action when unset. */
+  action?: UnavailableRetryAction | 'scripted'
   /** The personas (`makeMultiPersonaConfig` specs); two default personas when unset. */
   personas?: PersonaSpec[]
   /** `session_restart_delay` in seconds; 0 by default. */
@@ -147,7 +190,7 @@ export interface RecoveryHarnessOptions {
   healthCheckInterval?: number
   /** agent-director's settings file, written under the temporary HOME; none (the defaults) when unset. */
   adSettings?: AdConfigInput
-  /** Restart dependencies that replace the harness's stand-ins. */
+  /** Restart dependencies that replace the harness's production adapters and controls. */
   restartDeps?: Partial<RestartDeps>
   /** Clock flushes `advance` waits at most for in-flight runs; `DEFAULT_SETTLE_FLUSHES` when unset. */
   settleFlushes?: number
@@ -195,11 +238,29 @@ export interface RecoveryHarness {
   readonly notices: RecoveryNotice[]
   readonly outageNotices: RecoveryNotice[]
   readonly triggers: RecoveryTrigger[]
+  /** Keys `onCapReached` was called for, in order. */
+  readonly capReached: string[]
+  /** The per-persona serializer the restart module runs its work through. */
+  readonly serializer: PersonaSerializer
+  /** The server's full-mode retry action over the real restart entry (the default). */
+  readonly fullModeAction: UnavailableRetryAction
+  /** The scripted action (`answer`). */
+  readonly scriptedAction: UnavailableRetryAction
   script(knobs: RecoveryStubScript): void
   launch(key: string): Promise<SpawnPersonaResult>
   settle(): Promise<void>
   answer(key: string, ...outcomes: UnavailableRetryOutcome[]): void
   setAction(action: UnavailableRetryAction | undefined): void
+  /** Whether persona `key`'s bring-up outcome is up (the relaunch gate); true at first. */
+  setUp(key: string, up: boolean): void
+  /** Whether persona `key`'s session is registered as connected with its message stream; false at first. */
+  setConnected(key: string, connected: boolean): void
+  /** The server's shutdown: raise the shutting-down flag and close the controller. */
+  shutdown(): void
+  /** The persona teardown's retry-timer stop. */
+  teardown(key: string): void
+  /** Drop persona `key` from the applied configuration. */
+  remove(key: string): void
   startupErrors(): string[]
   settings(): AdSettingsInEffect
   advance(ms: number): Promise<number>
@@ -234,9 +295,32 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const keys = config.personas.map((persona) => persona.key)
   for (const persona of config.personas) mkdirSync(persona.working_directory, { recursive: true })
 
+  const capReached: string[] = []
+  const applied = new Set(keys)
+  const down = new Set<string>()
+  const connected = new Set<string>()
+  let shuttingDown = false
+  const serializer = createPersonaSerializer()
+
+  const appliedPersona = (key: string): Persona | undefined =>
+    applied.has(key) ? config.personas.find((persona) => persona.key === key) : undefined
+  const appliedConfig = (): PersonaConfig => ({ ...config, personas: config.personas.filter((persona) => applied.has(persona.key)) })
+  const canRelaunch = createPersonaRelaunchGate({ status: () => SERVING }, log, {
+    isUp: (key) => !down.has(key),
+    isApplied: (key) => applied.has(key),
+  })
+
   const queued = new Map<string, UnavailableRetryOutcome[]>()
   const scripted: UnavailableRetryAction = (key) => queued.get(key)?.shift() ?? SCRIPTED_REFUSAL
-  let current: UnavailableRetryAction = options.action ?? scripted
+  const fullMode = createFullModeRetryAction({
+    retry: runRestartRetry,
+    appliedPersona,
+    canRelaunch,
+    isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
+    isShuttingDown: () => shuttingDown,
+    isInFlight: isLaunchInFlight,
+  })
+  let current: UnavailableRetryAction = options.action === 'scripted' ? scripted : (options.action ?? fullMode)
   const controller = createUnavailableRetryController({
     log,
     clock,
@@ -277,18 +361,21 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   _resetRestartState()
   _resetBackoffState()
-  const configured = new Set(keys)
   initRestart({
-    canRestart: (key) => configured.has(key),
-    isSessionAlive: async () => false,
-    isSessionConnected: () => false,
-    hasSessionStream: () => false,
-    reconnectSession: async () => 'transient',
-    killSession: async () => {},
-    launchSession: async () => 'skipped',
+    canRestart: canRelaunch,
+    isSessionAlive: _buildIsSessionAliveAdapter(appliedConfig),
+    isSessionConnected: (key) => connected.has(key),
+    hasSessionStream: (key) => connected.has(key),
+    reconnectSession: _buildReconnectSessionAdapter(appliedPersona),
+    killSession: _buildKillSessionAdapter(appliedPersona),
+    launchSession: (key) => launchSession(key, appliedConfig(), { canLaunch: canRelaunch }),
     getRestartDelay: () => config.session_restart_delay,
-    isShuttingDown: () => false,
-    onCapReached: () => {},
+    isShuttingDown: () => shuttingDown,
+    onCapReached: (key) => {
+      capReached.push(key)
+      notifyRestartCapReached(key)
+    },
+    serialize: serializer.run,
     ...options.restartDeps,
   })
 
@@ -307,16 +394,22 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     void all
   }
 
-  /** Await every configured persona's launch in flight, in 1 ms real-time steps, for at most `settleMs`. */
+  /**
+   * Await every configured persona's launch in flight and every retry run in
+   * flight, in 1 ms real-time steps, for at most `settleMs`.
+   */
   async function settleLaunches(): Promise<void> {
     let settled = false
-    const all = Promise.all(keys.map((key) => whenLaunchSettled(key))).then(() => {
+    const all = Promise.all([
+      ...keys.map((key) => whenLaunchSettled(key)),
+      ...runKeys().map((key) => controller.whenRunSettled(key)),
+    ]).then(() => {
       settled = true
     })
     for (let waited = 0; waited < settleMs && !settled; waited++) {
       await Promise.race([all, new Promise((resolve) => setTimeout(resolve, 1))])
     }
-    if (!settled) throw new Error(`recovery harness: a launch was still in flight after ${settleMs} ms`)
+    if (!settled) throw new Error(`recovery harness: a launch or a retry run was still in flight after ${settleMs} ms`)
   }
 
   function startupErrors(): string[] {
@@ -338,6 +431,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     notices,
     outageNotices,
     triggers,
+    capReached,
+    serializer,
+    fullModeAction: fullMode,
+    scriptedAction: scripted,
 
     script(knobs) {
       // The installed stub reads its knobs, at each call, from the object it
@@ -361,7 +458,30 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     },
 
     setAction(action) {
-      current = action ?? scripted
+      current = action ?? fullMode
+    },
+
+    setUp(key, up) {
+      if (up) down.delete(key)
+      else down.add(key)
+    },
+
+    setConnected(key, isConnected) {
+      if (isConnected) connected.add(key)
+      else connected.delete(key)
+    },
+
+    shutdown() {
+      shuttingDown = true
+      controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+    },
+
+    teardown(key) {
+      controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+    },
+
+    remove(key) {
+      applied.delete(key)
     },
 
     startupErrors,

@@ -86,7 +86,10 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    `startup-errors.log`. One that says `found by a runtime re-check while the
    server was running` is covered under
    [Found while the server was running](#found-while-the-server-was-running).
-5. **No class line, but the persona still isn't served?** See
+5. **The persona's lines show `unavailable-retry` or `Session relaunch refused`?**
+   agent-director refused it and the server retries it on its own. See
+   [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
+   **No class line, but the persona still isn't served?** See
    [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running)
    and [Other lines you may see](#other-lines-you-may-see). A *Waiting on a
    prompt*, *Not connected* or *Not receiving messages* notice at its
@@ -1219,6 +1222,8 @@ guaranteed to be resumed.
 | `[slack] persona teardown of "<name>" (key=<key>): <step> failed: <error>`, any other step | An internal error. The other steps still ran. Report it as a bug. |
 | `[slack] dry-run: persona teardown of "<name>" (key=<key>): skipping the agent-director kill and delete of cscb_<key>` | Dry run: the instance and its row are left alone. |
 | `[slack] Cancelled restart timer for persona=<key>` | A restart that was pending for it was cancelled. |
+| `[slack] unavailable-retry: persona=<key> stopped — the persona was torn down` | Its retries after an agent-director refusal were stopped. |
+| `[slack] persona teardown of "<name>" (key=<key>): stopping its UNAVAILABLE retry timer before its turn failed: <error>` | An internal error in that stop, for a destructively modified persona; the teardown still runs. Report it as a bug. |
 | `[slack] waitForWaitingAndReconnect: persona=<key> — cancelling its launch's wait for its working row (b.f2b)` | Its launch was waiting for a `working` row. The wait is cancelled, so the teardown doesn't wait up to 10 minutes for it. |
 | `[slack] waitForWaitingAndReconnect: persona=<key> — its launch in flight will not wait for a working row: any such wait is cancelled at once (b.f2b)` | Its launch was running but not waiting yet; a wait it starts ends at once. |
 | `[slack] waitForWaitingAndReconnect: the wait for "<name>" (key=<key>) was cancelled (its persona is being torn down) — nothing typed (b.f2b)` | The cancelled wait ended with nothing typed; the teardown goes on. |
@@ -1449,6 +1454,63 @@ registers again with its history. If the new token is refused too, a new
   that started from a Slack message the persona received, and only when it
   hasn't replied with the `reply` tool. A persona that replies, or a turn
   started by a scheduled prompt or `/interject`, gets no reminder.
+
+---
+
+## agent-director refuses a persona: it is retried on its own
+
+When agent-director refuses the calls that bring a persona back (it is
+unreachable, or it answers that it can't act right now), the server doesn't
+count that against the persona's restart limit and doesn't give up on it.
+Instead it retries the persona on its own: 30 s after the refusal, then after
+60, 120 and 240 s more, then every 300 s, for as long as the refusal lasts.
+It does this whatever `session_restart_delay` and `health_check_interval`
+are, `0` included. Each retry reads the persona's state first, never starts a
+second instance over one that is running, and reconnects or relaunches it as
+the restart path would. Once agent-director answers again, the next retry
+brings the persona back, so in the common case there is nothing to do.
+
+The retries stop when a retry finds nothing left to recover (the persona is
+connected again), when the persona reaches the restart limit through failed
+launches, when it stops being up (its own bring-up retry then brings it back),
+when it is removed from the configuration, and when the server stops. The
+retries' own lines go only to the server log.
+
+All of one persona's retry lines (replace `ops_bot` with the key):
+
+```sh
+grep -h -E 'unavailable-retry: persona=ops_bot |Session relaunch refused for persona=ops_bot |Restart retry skipped for persona=ops_bot ' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+```
+
+`<cause>` is `unavailable` (agent-director refused a call), `kill-failed`
+(agent-director could not stop the instance's session) or `read-error`
+(agent-director could not report the persona's state), followed by the
+error (see [The server log](#the-server-log), Error detail).
+
+| Line | Meaning | What to do |
+|---|---|---|
+| `[slack] unavailable-retry: persona=<key> armed (<cause>) — first retry in 30 s` | agent-director refused a call while the persona was being launched or recovered. Its first retry is due in 30 s. A refusal while it is already waiting logs nothing and keeps the time. | Nothing. If it keeps retrying, see below. |
+| `[slack] Session relaunch refused for persona=<key> — not counted; its UNAVAILABLE retry timer owns the persona` | A relaunch was refused by agent-director. It doesn't count toward the restart limit; the retries above take over. | Nothing. |
+| `[slack] unavailable-retry: persona=<key> retry <n> — rerunning its recovery` | Retry `<n>` runs: it reads the persona's state, then reconnects or relaunches it. | Nothing. |
+| `[slack] unavailable-retry: persona=<key> retry <n>: <reason> — re-armed, next retry in <s> s` | The retry didn't finish the recovery; the next is due in `<s>` s. `<reason>`: a `<cause>` as above (agent-director still refuses), `launch-in-flight` (a launch for the persona was already running, so the retry did nothing), `launch-failed` (the relaunch failed and was counted toward the restart limit), `reconnect-deferred` (the instance runs but couldn't be reconnected yet), `launched` (the relaunch succeeded; the next retry checks that the persona is connected, then stops), `restart-not-initialised` (the server was still starting). `the retry failed: <error>`, `the retry gave no answer`, `no cause given` or `unnamed` mean an internal error, and the retries go on. | Nothing while it is agent-director refusing: see below if it never clears. `launch-failed` repeating: read the `Session relaunch failed` and spawn-failure lines for the persona. An internal error that repeats: report it as a bug, with the persona's lines. |
+| `[slack] Restart retry skipped for persona=<key> — a launch is in flight; no agent-director call` | A retry found a launch for the persona already running and made no call. The launch decides the outcome; the retry comes back later. | Nothing. |
+| `[slack] restart retry: in-flight check failed for persona=<key>: <error> — treated as in flight` | An internal error checking for a running launch; the retry made no call and comes back later. | Report it as a bug if it repeats. |
+| `[slack] runRestartRetry: deps not initialized — skipping the retry for persona=<key>` | A retry fell due while the server was still starting; it comes back later. | Nothing, unless it repeats: then report it as a bug. |
+| `[slack] unavailable-retry: persona=<key> stopped — <reason>` | The retries stopped. `nothing left to recover`: the persona is back. `the persona is at the restart cap`: its relaunches failed 5 times in a row (see the `SpawnCapReached` notice); restart the server to retry it. `the persona is not up; its bring-up owns it` or `its relaunch was declined (the persona is not up, or the server is stopping)`: follow its class line (see [Persona diagnostic classes](#persona-diagnostic-classes)). `the persona is not in the applied configuration` or `the persona was torn down`: it was removed. `the server is shutting down`: the server stopped. | As in the meaning. |
+| `[slack] unavailable-retry: persona=<key> not armed (<cause>) — the server is shutting down` | A refusal arrived while the server was stopping; nothing is retried. | Nothing. The next start brings the persona up. |
+| `[slack] unavailable-retry: persona=<key> arm failed: <error> — not armed` or `[slack] unavailable-retry: persona=<key> retry run failed: <error>` | An internal error setting the retry's timer. The retries for the persona stop until agent-director refuses a call for it again. | Report it as a bug, with the persona's lines. |
+
+**It never clears.** The persona keeps retrying with the same `<cause>` every
+300 s. Check that agent-director answers:
+
+```sh
+agent-director version
+```
+
+If it doesn't answer, or answers with an error, agent-director is the
+problem: fix it (the `install-cscb` skill covers installing it), and the next
+retry recovers the persona with no server restart. If it answers normally but
+the retries keep failing, report it as a bug, with the persona's lines.
 
 ---
 

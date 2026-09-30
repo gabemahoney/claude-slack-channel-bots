@@ -12,7 +12,9 @@
  *   removed persona and the old half of a destructive modify alike. In
  *   order:
  *   1. its bring-up retries are cancelled and its bring-up state forgotten,
- *      and its pending restart timer is cancelled;
+ *      its pending restart timer is cancelled and its UNAVAILABLE retry timer
+ *      stopped (b.jg5 SRJ-305; a retry already running finishes first, since
+ *      the teardown waits its serializer turn, and its answer is dropped);
  *   2. a launch still in flight for it (the start pass's, which runs outside
  *      the serializer) is waited for, so the kill below never races a launch
  *      that is bringing the row up. A launch waiting for a `working` row to
@@ -45,8 +47,9 @@
  *   modify (SR-8.6: a `credentials_file` path or `working_directory` change)
  *   keeps its key applied until step 6 brings its new declaration up, so the
  *   applied-set guard does not refuse it. Instead:
- *   - its bring-up state and restart timer are cancelled as soon as the
- *     teardown is submitted, before its serializer turn: work already queued
+ *   - its bring-up state and restart timer are cancelled, and its
+ *     UNAVAILABLE retry timer stopped, as soon as the teardown is submitted,
+ *     before its serializer turn: work already queued
  *     ahead of the teardown for the key (a restart timer's work, a bring-up
  *     retry and its launch) then finds it not up or cancelled and launches
  *     nothing, rather than launching the new declaration only for the
@@ -284,6 +287,12 @@ export interface PersonaLifecycleDeps {
   cancelLaunchWait?: (key: string) => unknown
   /** Cancel the key's pending restart timer (`cancelRestartTimer`). */
   cancelRestartTimer: (key: string) => unknown
+  /**
+   * Stop the key's UNAVAILABLE retry timer (b.jg5 SRJ-305: the retry
+   * controller's `stop` with the torn-down reason), called beside
+   * `cancelRestartTimer`; other personas' timers stay armed.
+   */
+  stopRetryTimer: (key: string) => unknown
   /** Forget the key's restart failure count and cap latch (`forgetFailures`). */
   forgetFailures: (key: string) => void
   /** Forget the key's health-check disconnected streak (`forgetDisconnectedStreak`). */
@@ -430,9 +439,10 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
    * the old half of a destructive modify (its key still applied after step
    * 1; a removed persona needs nothing more here, the applied-set guard
    * refuses it): cancel its bring-up state and retries and its pending
-   * restart timer now. Work already queued ahead of the teardown for the key
-   * then does nothing: a restart timer's work finds it not up (the relaunch
-   * gate), and a bring-up retry or its launch finds its entry cancelled.
+   * restart timer, and stop its UNAVAILABLE retry timer, now. Work already
+   * queued ahead of the teardown for the key then does nothing: a restart
+   * timer's or a retry's work finds it not up (the relaunch gate), and a
+   * bring-up retry or its launch finds its entry cancelled.
    * Otherwise that work would launch the new declaration (the launch paths
    * read the applied set) only for the teardown to kill it. Every call is
    * synchronous and runs again, as a no-op, in the teardown's own steps. A
@@ -448,6 +458,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
       cancels.push(
         ['cancelling its bring-up retries', () => deps.bringUps.cancel(key)],
         ['cancelling its restart timer', () => deps.cancelRestartTimer(key)],
+        ['stopping its UNAVAILABLE retry timer', () => deps.stopRetryTimer(key)],
       )
     }
     for (const [what, cancel] of cancels) {
@@ -481,6 +492,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // teardown waits below.
     await step('cancelling its bring-up retries', () => deps.bringUps.cancel(key))
     await step('cancelling its restart timer', () => deps.cancelRestartTimer(key))
+    await step('stopping its UNAVAILABLE retry timer', () => deps.stopRetryTimer(key))
     // b.f2b: again here, for a wait that started after the teardown was
     // submitted; the launch then settles promptly.
     await step("cancelling its launch's wait for a working row", () => deps.cancelLaunchWait?.(key))

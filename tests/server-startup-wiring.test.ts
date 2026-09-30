@@ -81,6 +81,14 @@
  *   start's configuration resolution and the settings install, and before the
  *   template install and the start bring-up, with the start-time applied
  *   config as its only argument; it is on no tick and no timer.
+ * - b.jg5 SRJ-301 / SRJ-305: one UNAVAILABLE retry controller is built in
+ *   main()'s own statement list on the production clock, held in the one
+ *   module-scope handle, and installed as the trigger sink of the one
+ *   `initOutageState` call before the start bring-up and the restart module;
+ *   its action is the full-mode retry action over `runRestartRetry`,
+ *   `getAppliedPersona`, the relaunch gate, the restart cap, the restart
+ *   module's shutdown flag and `isLaunchInFlight` (SRJ-303); shutdown closes it once, right after `cancelAllRestartTimers`, after the
+ *   shutting-down flag and before the HTTP server stops.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -1254,6 +1262,127 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
     expect(assignments.map((a) => a.value)).toEqual([loaded])
     expect(insideMain(assignments[0]!.at)).toBe(true)
     expect(assignments[0]!.at).toBeGreaterThan(assignAt)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the UNAVAILABLE retry timers (b.jg5 SRJ-301, SRJ-305)
+//
+// A trigger reaches a persona's retry timer only through the controller
+// main() installs as the outage state's trigger sink, so the install must
+// come before the start bring-up's launches (the first attempts that can arm
+// one); shutdown stops every timer. What the controller does (the waits, the
+// stop rules, close refusing later arms) is driven on a fake clock in
+// tests/unavailable-retry.test.ts; the teardown's stop is pinned in
+// tests/reload-wiring.test.ts. Pinned here: placement, and which production
+// function backs each of the full-mode retry action's stop and in-flight
+// reads.
+// ---------------------------------------------------------------------------
+
+describe('main() installs one UNAVAILABLE retry controller as the trigger sink before the start bring-up, and shutdown stops every retry timer (b.jg5 SRJ-301, SRJ-305)', () => {
+  test('the controller is built exactly once, in main()\'s own statement list (not at module scope, behind no branch), on the production clock, and handed to the module-scope handle shutdown reads', () => {
+    const at = onlyCallOf('createUnavailableRetryController')
+    const controller = constOf('createUnavailableRetryController')
+    const decl = SERVER_CODE.search(new RegExp(`\\bconst\\s+${controller}\\s*=\\s*createUnavailableRetryController\\s*\\(`))
+    expect(decl).toBeLessThan(at)
+    expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
+    expect(importSource(SERVER_CODE, 'createUnavailableRetryController')).toBe('./unavailable-retry.ts')
+    expect(indicesOf(/\b(?:let|const|var|function)\s+createUnavailableRetryController\b/g, SERVER_CODE)).toEqual([])
+
+    // The production clock: none given (the controller's default is the
+    // system clock), or the system clock by name.
+    const clock = onlyCallProps('createUnavailableRetryController').get('clock')
+    expect([undefined, 'SYSTEM_PERSONA_CONNECTION_CLOCK']).toContain(clock)
+    if (clock !== undefined) expect(importSource(SERVER_CODE, clock)).toBe('./persona-connections.ts')
+
+    // The one handle shutdown reads: a module-scope `let`, assigned only
+    // this controller, once, in main()'s own statement list after it is built.
+    const handles = [...SERVER_CODE.matchAll(/^let\s+(\w+)\s*:\s*UnavailableRetryController\s*\|\s*undefined\s*$/gm)]
+    expect(handles).toHaveLength(1)
+    const handle = handles[0]![1]!
+    expect(insideMain(handles[0]!.index!)).toBe(false)
+    const assigned = assignmentsTo(handle)
+    expect(assigned.map((a) => a.value)).toEqual([controller])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+    expect(assigned[0]!.at).toBeGreaterThan(at)
+  })
+
+  test('it is the trigger sink of the one initOutageState call, in main()\'s own statement list, after the controller is built and before the start bring-up and the restart module', () => {
+    const controller = constOf('createUnavailableRetryController')
+    const install = onlyCallOf('initOutageState')
+    expect(onlyCallProps('initOutageState').get('triggerSink')).toBe(controller)
+    expect(atMainTopLevel(SERVER_CODE, install)).toBe(true)
+    expect(install).toBeGreaterThan(onlyCallOf('createUnavailableRetryController'))
+    expect(install).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+    expect(install).toBeLessThan(onlyCallOf('initRestart'))
+    // Nothing else names a trigger sink in server.ts.
+    expect(indicesOf(/\btriggerSink\b/g, SERVER_CODE)).toHaveLength(1)
+  })
+
+  test('shutdown stops every retry timer exactly once, with the shutdown reason: after the shutting-down flag is raised, right after cancelAllRestartTimers, and before the HTTP server stops', () => {
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const inShutdown = (at: number) => at > start && at < end
+    const handle = SERVER_CODE.match(/^let\s+(\w+)\s*:\s*UnavailableRetryController\s*\|\s*undefined\s*$/m)![1]!
+
+    const closes = indicesOf(new RegExp(`\\b${handle}\\s*\\?\\.\\s*close\\s*\\(\\s*UNAVAILABLE_RETRY_STOP_SHUTDOWN\\s*\\)`, 'g'), SERVER_CODE)
+    expect(closes).toHaveLength(1)
+    const at = closes[0]!
+    expect(inShutdown(at)).toBe(true)
+    expect(importSource(SERVER_CODE, 'UNAVAILABLE_RETRY_STOP_SHUTDOWN')).toBe('./unavailable-retry.ts')
+    // No other stop of every timer anywhere in server.ts.
+    expect(indicesOf(new RegExp(`\\b${handle}\\s*[?!]?\\.\\s*(?:close|stopAll)\\s*\\(`, 'g'), SERVER_CODE)).toEqual([at])
+    const controller = constOf('createUnavailableRetryController')
+    expect(indicesOf(new RegExp(`\\b${controller}\\s*[?!]?\\.\\s*(?:close|stopAll)\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
+
+    // After the flag is raised (so no launch that meets UNAVAILABLE after it
+    // is mistaken for live work), beside the restart timers' cancel.
+    const raises = indicesOf(/(?<![\w.$])shuttingDown\s*=\s*true\b/g, SERVER_CODE)
+    expect(raises).toHaveLength(1)
+    expect(inShutdown(raises[0]!)).toBe(true)
+    expect(at).toBeGreaterThan(raises[0]!)
+    const cancels = indicesOf(/(?<![\w.$])cancelAllRestartTimers\s*\(\s*\)/g, SERVER_CODE).filter(inShutdown)
+    expect(cancels).toHaveLength(1)
+    expect(SERVER_CODE.slice(balancedAfter(SERVER_CODE, cancels[0]!, '(', ')')[1] + 1, at).replace(/[\s;]/g, '')).toBe('')
+
+    // Before the HTTP server stops, and before shutdown first yields.
+    const httpStops = indicesOf(/\bhttpServer\s*\.\s*stop\s*\(/g, SERVER_CODE).filter(inShutdown)
+    expect(httpStops).toHaveLength(1)
+    expect(at).toBeLessThan(httpStops[0]!)
+    const firstAwait = SERVER_CODE.slice(start, end).search(/\bawait\b/)
+    expect(firstAwait).toBeGreaterThan(-1)
+    expect(at).toBeLessThan(start + firstAwait)
+  })
+
+  // A stub for any of these dependencies type-checks, so only this audit
+  // makes sure production binds the real one: a stub in-flight or cap read
+  // would still launch over an in-flight launch or past the cap. Only these
+  // members are pinned, not the full key set.
+  test('the controller\'s action is the full-mode retry action over the restart module\'s retry entry, the live applied persona lookup, the relaunch gate, the restart cap, the restart module\'s shutdown flag and the session manager\'s isLaunchInFlight', () => {
+    expect(onlyCallProps('createUnavailableRetryController').get('action')!.startsWith('createFullModeRetryAction(')).toBe(true)
+    expect(importSource(SERVER_CODE, 'createFullModeRetryAction')).toBe('./unavailable-retry.ts')
+    const props = onlyCallProps('createFullModeRetryAction')
+
+    expect(props.get('retry')).toBe('runRestartRetry')
+    expect(importSource(SERVER_CODE, 'runRestartRetry')).toBe('./restart.ts')
+
+    // getAppliedPersona reads the holder at call time (pinned in tests/reload-wiring.test.ts).
+    expect(props.get('appliedPersona')).toBe('getAppliedPersona')
+
+    const gate = constOf('createPersonaRelaunchGate')
+    // The gate itself, or a call-time wrapper around it (the gate is declared
+    // after the controller is built).
+    const canRelaunch = props.get('canRelaunch')!
+    expect(canRelaunch === gate || new RegExp(`^\\(?(\\w+)\\)? => ${gate}\\(\\1\\)$`).test(canRelaunch)).toBe(true)
+
+    expect(props.get('isAtCap')).toMatch(/^\(?(\w+)\)? => backoffIsAtCap\(\1, RESTART_FAILURE_CAP\)$/)
+    expect(importSource(SERVER_CODE, 'backoffIsAtCap')).toBe('./backoff.ts')
+    expect(importSource(SERVER_CODE, 'RESTART_FAILURE_CAP')).toBe('./restart.ts')
+
+    expect(props.get('isShuttingDown')).toBeDefined()
+    expect(props.get('isShuttingDown')).toBe(onlyCallProps('initRestart').get('isShuttingDown')!)
+
+    expect(props.get('isInFlight')).toBe('isLaunchInFlight')
+    expect(importSource(SERVER_CODE, 'isLaunchInFlight')).toBe('./session-manager.ts')
   })
 })
 

@@ -1,22 +1,27 @@
 /**
  * unavailable-retry.test.ts — The per-persona UNAVAILABLE retry timer
- * (b.jg5 SRJ-301 code line, SRJ-302, SRJ-304).
+ * (b.jg5 SRJ-301 code line, SRJ-302, SRJ-303, SRJ-304, SRJ-305).
  *
- * The schedule, the never-give-up rule, arming while armed and isolation run
- * on the bare controller over `createFakeClock` with a scripted action;
- * settings independence runs on `makeRecoveryHarness` and a comment-stripped
- * source audit. What arms the timer (b.jg5 SRJ-301) runs on the harness with
- * the controller as the outage state's trigger sink: real launches through
- * `spawnForPersona` over the stub, the arming predicate on its own, and the
- * reads made outside every attempt. The shared findMissing sweep runs there
- * too, its one call held open by the test so each caller joins it before it
- * fails.
+ * The schedule, the never-give-up rule, arming while armed, isolation,
+ * again-reasons and `close` run on the bare controller over `createFakeClock`
+ * with a scripted action; settings independence runs on `makeRecoveryHarness`
+ * with its scripted action and a comment-stripped source audit. What arms the
+ * timer (b.jg5 SRJ-301) runs on the harness with the controller as the outage
+ * state's trigger sink: real launches through `spawnForPersona` over the
+ * stub, the arming predicate on its own, and the reads made outside every
+ * attempt. The shared findMissing sweep runs there too, its one call held
+ * open by the test so each caller joins it before it fails.
  * The attempt frames run on the bare context with the controller as the sink.
+ * The full-mode action's decisions run over a stand-in retry entry; the
+ * full-mode retry end to end (AC 26, the in-flight skip, the row decisions,
+ * the serializer wait) and the stop rules that exist now (AC 28) run on the
+ * harness's default action, the real restart entry over the production
+ * adapters and the stub.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
- * polls, bounded by the harness, and one 0 ms `setTimeout` a frames case sets
- * inside an attempt and awaits.
+ * polls, bounded by the harness (`settle`), and one 0 ms `setTimeout` a
+ * frames case sets inside an attempt and awaits.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -32,7 +37,25 @@ import type { Persona } from '../src/config.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
-import { _resetRestartState, isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from '../src/restart.ts'
+import {
+  _resetRestartState,
+  isRestartPendingOrActive,
+  RESTART_FAILURE_CAP,
+  RESTART_OUTCOME_ALREADY_CONNECTED,
+  RESTART_OUTCOME_CAPPED,
+  RESTART_OUTCOME_COUNTED_FAILURE,
+  RESTART_OUTCOME_IN_FLIGHT,
+  RESTART_OUTCOME_LAUNCH_SKIPPED,
+  RESTART_OUTCOME_LAUNCHED,
+  RESTART_OUTCOME_NOT_INITIALISED,
+  RESTART_OUTCOME_NOT_UP,
+  RESTART_OUTCOME_RECONNECT_DEFERRED,
+  RESTART_OUTCOME_RECONNECTED,
+  RESTART_OUTCOME_REFUSED,
+  RESTART_OUTCOME_SHUTTING_DOWN,
+  scheduleRestart,
+  type RestartRetryOutcome,
+} from '../src/restart.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
 import {
   _resetConfigDirFs,
@@ -43,17 +66,31 @@ import {
   type SpawnPersonaResult,
 } from '../src/session-manager.ts'
 import {
+  createFullModeRetryAction,
   createUnavailableRetryController,
+  type FullModeRetryDeps,
   isInsideAttempt,
   reportAttemptError,
   runInAttempt,
   type AttemptErrorRecord,
   type AttemptView,
+  UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED,
+  UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT,
+  UNAVAILABLE_RETRY_AGAIN_LAUNCHED,
+  UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED,
+  UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED,
   UNAVAILABLE_RETRY_BASE_S,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CEILING_S,
+  UNAVAILABLE_RETRY_STOP_CAPPED,
+  UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED,
+  UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
+  UNAVAILABLE_RETRY_STOP_NOT_UP,
+  UNAVAILABLE_RETRY_STOP_RECOVERED,
+  UNAVAILABLE_RETRY_STOP_SHUTDOWN,
+  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   unavailableRetryCauseFor,
   type UnavailableRetryAction,
   type UnavailableRetryCause,
@@ -128,7 +165,7 @@ let rigs: Rig[] = []
 let harness: RecoveryHarness | undefined
 
 /** Build a rig; its action refuses every retry unless `action` is given. */
-function makeRig(action: UnavailableRetryAction = () => ({ kind: 'again', cause: UNAVAILABLE }), clock = createFakeClock()): Rig {
+function makeRig(action: UnavailableRetryAction = () => ({ kind: 'again' }), clock = createFakeClock()): Rig {
   const lines: string[] = []
   const attempts: RecoveryAttempt[] = []
   const controller = createUnavailableRetryController({
@@ -485,7 +522,7 @@ describe('unavailable retry: isolation', () => {
 
 describe('unavailable retry: settings independence (SRJ-304)', () => {
   test('on the recovery harness with session_restart_delay and health_check_interval 0, an armed persona is retried on the schedule and scheduleRestart arms nothing', async () => {
-    harness = makeRecoveryHarness()
+    harness = makeRecoveryHarness({ action: 'scripted' })
     const h = harness
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
@@ -515,10 +552,15 @@ describe('unavailable retry: settings independence (SRJ-304)', () => {
     expect(retrySource).not.toContain(name)
   })
 
-  test('src/unavailable-retry.ts takes only doublingBackoffDelay from the backoff module and nothing from the restart module', () => {
+  test('src/unavailable-retry.ts takes only doublingBackoffDelay from the backoff module and nothing but types from the restart module', () => {
     const backoffImports = [...retrySource.matchAll(/import\s*\{([^}]*)\}\s*from\s*'\.\/backoff\.ts'/g)].map((m) => m[1]!.split(',').map((s) => s.trim()).filter(Boolean))
     expect(backoffImports).toEqual([['doublingBackoffDelay']])
-    expect(retrySource).not.toMatch(/from\s*'\.\/restart\.ts'/)
+    const restartClauses = [...retrySource.matchAll(/\b(?:import|export)\s+(type\s+)?([^'";=()]*?)\s*from\s*'\.\/restart\.ts'/g)]
+    const valueSpecifiers = restartClauses.flatMap(([, typeOnly, clause]) =>
+      typeOnly !== undefined ? [] : clause!.replace(/[{}]/g, '').split(',').map((s) => s.trim()).filter((s) => s !== '' && !s.startsWith('type ')),
+    )
+    expect(valueSpecifiers).toEqual([])
+    expect(retrySource).not.toMatch(/import\s*'\.\/restart\.ts'|import\s*\(\s*'\.\/restart\.ts'|require\s*\(\s*'\.\/restart\.ts'/)
   })
 })
 
@@ -779,7 +821,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
   })
 
   test('a trigger while armed, midway and 1 ms before the due time, keeps the one due time, and the retry fires at the arm plus the base wait', async () => {
-    const h = (harness = makeRecoveryHarness())
+    const h = (harness = makeRecoveryHarness({ action: 'scripted' }))
     const [key] = h.keys as [string]
     h.script({ spawnError: errTmuxUnresponsive('spawn') })
     const dueAt = h.clock.now() + waitMs(0)
@@ -1033,5 +1075,450 @@ describe('unavailable retry: an attempt started from a continuation that outlive
     expect([...controller.armedKeys()].sort()).toEqual((withOuter ? [OTHER, OUTER] : [OTHER]).sort())
     expect(controller.isArmed(KEY)).toBe(false)
     expect([isInsideAttempt(KEY), isInsideAttempt(OTHER), isInsideAttempt(OUTER)]).toEqual([false, false, false])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Again-reasons and close (b.jg5 SRJ-303, SRJ-305) on the bare controller
+// ---------------------------------------------------------------------------
+
+/** The line a retry answered `again` logs: its reason and the next wait, after `refusals` refusals. */
+function reArmedLine(key: string, retry: number, reason: string, refusals: number): string {
+  return `[slack] unavailable-retry: persona=${key} retry ${retry}: ${reason} — re-armed, next retry in ${waitMs(refusals) / 1000} s`
+}
+
+/** The line a stopped timer logs. */
+function stoppedLine(key: string, reason: string): string {
+  return `[slack] unavailable-retry: persona=${key} stopped — ${reason}`
+}
+
+describe('unavailable retry: again-reasons and close', () => {
+  test.each<[string, unknown, string]>([
+    ['a label', UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT],
+    ['a token-shaped reason', fakeToken(BOT_TOKEN_PREFIX, 'reason'), 'unnamed'],
+    ['a reason that is no string', 42, 'unnamed'],
+  ])('an again answer with %s names it in the re-armed line only; it is never recorded as a cause', async (_what, reason, logged) => {
+    const { clock, controller, lines } = makeRig(() => ({ kind: 'again', reason } as UnavailableRetryOutcome))
+    controller.arm(KEY, UNAVAILABLE)
+    await clock.advance(waitMs(0))
+    await controller.whenRunSettled(KEY)
+
+    expect(lines.at(-1)).toBe(reArmedLine(KEY, 1, logged, 1))
+    expect(controller.view(KEY)).toMatchObject({ refusals: 1, causes: ['unavailable'] })
+    assertNoLeak(lines)
+  })
+
+  test('close stops every persona, refuses every later arm with one not-armed line, leaves nothing pending and fires nothing more', async () => {
+    const { clock, controller, lines, attempts } = makeRig()
+    controller.arm(KEY, UNAVAILABLE)
+    controller.arm(OTHER, UNAVAILABLE)
+
+    controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+    controller.arm(KEY, { kind: 'status-error' })
+    controller.close('closed twice')
+    await clock.advance(waitMs(refusalsToCeiling()) * 4)
+
+    expect(controller.armedKeys()).toEqual([])
+    expect(clock.pendingCount()).toBe(0)
+    expect(attempts).toEqual([])
+    expect(lines.slice(2)).toEqual([
+      stoppedLine(KEY, UNAVAILABLE_RETRY_STOP_SHUTDOWN),
+      stoppedLine(OTHER, UNAVAILABLE_RETRY_STOP_SHUTDOWN),
+      `[slack] unavailable-retry: persona=${KEY} not armed (status-error) — ${UNAVAILABLE_RETRY_STOP_SHUTDOWN}`,
+    ])
+  })
+
+  test('a run in flight at close finishes with its answer dropped: nothing re-arms', async () => {
+    const held = heldAction()
+    const { clock, controller } = makeRig(held.action)
+    controller.arm(KEY, UNAVAILABLE)
+    await clock.advance(waitMs(0))
+
+    controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+    held.answer({ kind: 'again' })
+    await controller.whenRunSettled(KEY)
+
+    expect(controller.isArmed(KEY)).toBe(false)
+    expect(clock.pendingCount()).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The full-mode action (b.jg5 SRJ-303, SRJ-305) over a stand-in retry entry
+// ---------------------------------------------------------------------------
+
+/** Full-mode deps whose retry entry answers `outcome`, recording each call; every gate open unless overridden. */
+function fullModeDeps(outcome: RestartRetryOutcome, overrides: Partial<FullModeRetryDeps> = {}): FullModeRetryDeps & { calls: string[][] } {
+  const calls: string[][] = []
+  return {
+    calls,
+    retry: async (key, cwd) => {
+      calls.push([key, cwd])
+      return outcome
+    },
+    appliedPersona: (key) => (key === KEY ? { working_directory: `/work/${key}` } : undefined),
+    canRelaunch: () => true,
+    isAtCap: () => false,
+    isShuttingDown: () => false,
+    isInFlight: () => false,
+    ...overrides,
+  }
+}
+
+describe('unavailable retry: the full-mode action’s decisions', () => {
+  test.each<[RestartRetryOutcome, UnavailableRetryOutcome]>([
+    [RESTART_OUTCOME_ALREADY_CONNECTED, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_RECOVERED }],
+    [RESTART_OUTCOME_RECONNECTED, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_RECOVERED }],
+    [RESTART_OUTCOME_CAPPED, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_CAPPED }],
+    [RESTART_OUTCOME_NOT_UP, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_NOT_UP }],
+    [RESTART_OUTCOME_LAUNCH_SKIPPED, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED }],
+    [RESTART_OUTCOME_SHUTTING_DOWN, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_SHUTDOWN }],
+    [RESTART_OUTCOME_IN_FLIGHT, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT }],
+    [RESTART_OUTCOME_REFUSED, { kind: 'again' }],
+    [RESTART_OUTCOME_COUNTED_FAILURE, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED }],
+    [RESTART_OUTCOME_RECONNECT_DEFERRED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED }],
+    [RESTART_OUTCOME_LAUNCHED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED }],
+    [RESTART_OUTCOME_NOT_INITIALISED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED }],
+  ])('a retry entry answering %s answers %o', async (outcome, answer) => {
+    const deps = fullModeDeps(outcome)
+
+    expect(await createFullModeRetryAction(deps)(KEY, { retry: 1, causes: [] })).toEqual(answer)
+    expect(deps.calls).toEqual([[KEY, `/work/${KEY}`]])
+  })
+
+  test.each<[string, Partial<FullModeRetryDeps>, string]>([
+    ['shutting down (before everything else)', { isShuttingDown: () => true, appliedPersona: () => undefined, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_SHUTDOWN],
+    ['not applied (before the up check)', { appliedPersona: () => undefined, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_APPLIED],
+    ['not up (before the cap)', { canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_UP],
+    ['at the restart cap', { isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_CAPPED],
+  ])('%s stops before the retry entry runs', async (_what, overrides, reason) => {
+    const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, overrides)
+
+    expect(await createFullModeRetryAction(deps)(KEY, { retry: 1, causes: [] })).toEqual({ kind: 'stop', reason })
+    expect(deps.calls).toEqual([])
+  })
+
+  test('the entry gets the one in-flight predicate, and a retry entry that rejects rejects the action', async () => {
+    const isInFlight = (): boolean => true
+    const err = new Error('the serializer failed')
+    let given: unknown
+    const action = createFullModeRetryAction(fullModeDeps(RESTART_OUTCOME_LAUNCHED, {
+      isInFlight,
+      retry: async (_key, _cwd, predicate) => {
+        given = predicate
+        throw err
+      },
+    }))
+
+    await expect(action(KEY, { retry: 1, causes: [] })).rejects.toBe(err)
+    expect(given).toBe(isInFlight)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The full-mode retry end to end (b.jg5 SRJ-302, SRJ-303, SRJ-305) on the
+// recovery harness's default action: the real restart entry over the
+// production adapters, the relaunch gate and one serializer, against the stub
+// ---------------------------------------------------------------------------
+
+/** A row state the stub's `status` can answer. */
+type RowState = NonNullable<NonNullable<Parameters<typeof cannedStatusResult>[0]>['state']>
+
+/** The stub's rows, as `modelRow` keeps them. */
+interface RowModel {
+  /** The clock time of every spawn call, in order, over every persona. */
+  readonly spawnedAt: number[]
+}
+
+/**
+ * Model each persona's row on the harness stub: `status` reads `initial`
+ * until a spawn for that instance resolves, and `waiting` from then on. Every
+ * spawn call's clock time is recorded.
+ */
+function modelRow(h: RecoveryHarness, initial: RowState): RowModel {
+  const spawnedAt: number[] = []
+  const live = new Set<string>()
+  const client = h.stub.client
+  const spawn = client.spawn.bind(client)
+  client.spawn = async (params) => {
+    spawnedAt.push(h.clock.now())
+    const result = await spawn(params)
+    live.add(String(params.claude_instance_id))
+    return result
+  }
+  h.script({ statusFn: (params) => cannedStatusResult({ state: live.has(String(params.claude_instance_id)) ? 'waiting' : initial }) })
+  return { spawnedAt }
+}
+
+/** Move the clock to persona `key`'s due time and let its retry, with any launch it makes, settle. */
+async function retryNow(h: RecoveryHarness, key: string): Promise<void> {
+  const dueAt = h.controller.view(key)?.dueAt
+  if (dueAt === undefined) throw new Error(`retryNow: persona ${key} has no pending retry`)
+  await h.advance(dueAt - h.clock.now())
+  await h.settle()
+}
+
+/** The stub's call counts, by verb, leaving out verbs never called. */
+function callCounts(h: RecoveryHarness): Record<string, number> {
+  return Object.fromEntries(Object.entries(h.stub.calls).filter(([, calls]) => calls.length > 0).map(([verb, calls]) => [verb, calls.length]))
+}
+
+/** Arm `key` now and `other` half a base wait later, so `other`'s retry falls due after `key`'s first. */
+async function armBoth(h: RecoveryHarness, key: string, other: string): Promise<void> {
+  h.controller.arm(key, UNAVAILABLE)
+  await h.advance(waitMs(0) / 2)
+  h.controller.arm(other, UNAVAILABLE)
+}
+
+describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-302, SRJ-303, SRJ-305)', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test('AC 26: with both settings 0, a refused bring-up spawns at each due time and never early, counts nothing past the cap, launches once when the refusal clears, runs on at the next wait, and stops at the next retry with nothing pending', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key] = h.keys as [string]
+    const row = modelRow(h, 'missing')
+    h.script({ spawnError: errTmuxUnresponsive('spawn') })
+
+    const refusedAt = h.clock.now()
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(row.spawnedAt).toEqual([refusedAt])
+
+    const refusals = RESTART_FAILURE_CAP + refusalsToCeiling() + 2
+    let dueAt = refusedAt
+    for (let n = 0; n < refusals; n++) {
+      dueAt += waitMs(n)
+      await h.advance(dueAt - 1 - h.clock.now())
+      expect(row.spawnedAt).toHaveLength(n + 1)
+      await h.advance(1)
+      await h.settle()
+      expect(row.spawnedAt).toHaveLength(n + 2)
+      expect(row.spawnedAt[n + 1]).toBe(dueAt)
+      // The refused retry re-arms on the refusal it met during its run, at
+      // the next wait of the one sequence.
+      const retry = n + 1
+      const prefix = `[slack] unavailable-retry: persona=${key} retry ${retry}: ${UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE}: `
+      const suffix = ` — re-armed, next retry in ${waitMs(retry) / 1000} s`
+      expect([retry, h.lines.filter((l) => l.startsWith(prefix) && l.endsWith(suffix))]).toEqual([retry, [expect.any(String)]])
+    }
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: dueAt + waitMs(refusals), refusals })
+    expect(getFailureCount(key)).toBe(0)
+    expect(h.capReached).toEqual([])
+
+    h.script({ spawnError: undefined })
+    dueAt += waitMs(refusals)
+    await h.advance(dueAt - h.clock.now())
+    await h.settle()
+    expect(row.spawnedAt.slice(refusals + 1)).toEqual([dueAt])
+    expect(h.lines).toContain(reArmedLine(key, refusals + 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, refusals + 1))
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: dueAt + waitMs(refusals + 1),
+      waitMs: waitMs(refusals + 1),
+      refusals: refusals + 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    })
+    h.setConnected(key, true)
+
+    await retryNow(h, key)
+    expect(row.spawnedAt).toHaveLength(refusals + 2)
+    expect(h.lines).toContain(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expect(h.controller.isArmed(key)).toBe(false)
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(getFailureCount(key)).toBe(0)
+    expect(h.capReached).toEqual([])
+  })
+
+  test.each<[string, RowState, boolean, Record<string, number>, UnavailableRetryOutcome]>([
+    ['live and connected with its stream: nothing left to recover, no launch', 'waiting', true, { statusCalls: 1 }, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_RECOVERED }],
+    ['live and not connected: a reconnect that succeeds, never a spawn, and nothing left to recover', 'waiting', false, { statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 }, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_RECOVERED }],
+    ['pending (live) and not connected: the reconnect defers, never a spawn, and the timer runs on', 'pending', false, { statusCalls: 2 }, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED }],
+    ['ended: a kill and a launch, and the timer runs on', 'ended', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED }],
+    ['missing: a kill and a launch, and the timer runs on', 'missing', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED }],
+  ])('a retry that finds the row %s', async (_what, state, connected, calls, answer) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, state)
+    h.setConnected(key, connected)
+    await armBoth(h, key, other)
+
+    await retryNow(h, key)
+
+    expect(callCounts(h)).toEqual(calls)
+    expect(h.controller.isArmed(other)).toBe(true)
+    if (answer.kind === 'stop') {
+      expect(h.lines).toContain(stoppedLine(key, answer.reason))
+      expect(h.controller.isArmed(key)).toBe(false)
+    } else {
+      expect(h.lines).toContain(reArmedLine(key, 1, answer.reason!, 1))
+      expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(1), refusals: 1 })
+    }
+    expect(getFailureCount(key)).toBe(0)
+  })
+
+  test('a retry that finds the launch in flight makes no agent-director call and re-arms at the doubled wait; once the launch settles the next retry acts', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const hold = holdSpawns(h.stub.client)
+    const launch = h.launch(key)
+    await hold.entered(personaInstanceId(key))
+    h.controller.arm(key, UNAVAILABLE)
+    const before = h.stub.callCount()
+
+    await h.advance(waitMs(0))
+
+    expect(h.stub.callCount()).toBe(before)
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, 1))
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(1), refusals: 1 })
+
+    hold.release(personaInstanceId(key))
+    expect(await launch).toMatchObject({ key, action: 'spawned' })
+    await h.settle()
+    h.setConnected(key, true)
+    const settled = h.stub.calls.statusCalls.length
+    await retryNow(h, key)
+
+    expect(h.stub.calls.statusCalls.length).toBe(settled + 1)
+    expect(hold.calls).toHaveLength(1)
+    expect(h.lines).toContain(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expect(h.controller.isArmed(key)).toBe(false)
+  })
+
+  test('a retry fired while the persona’s serializer turn is held waits, calling nothing, and acts once the turn frees', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    h.setConnected(key, true)
+    const gate = Promise.withResolvers<void>()
+    const turn = h.serializer.run(key, () => gate.promise)
+    h.controller.arm(key, UNAVAILABLE)
+
+    await h.advance(waitMs(0))
+    expect(h.attempts).toHaveLength(1)
+    expect(h.controller.view(key)?.phase).toBe('running')
+    expect(h.stub.callCount()).toBe(0)
+
+    gate.resolve()
+    await turn
+    await h.settle()
+
+    expect(callCounts(h)).toEqual({ statusCalls: 1 })
+    expect(h.lines).toContain(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expect(h.controller.isArmed(key)).toBe(false)
+  })
+})
+
+describe('unavailable retry: the stop rules that exist now on the recovery harness (SRJ-305, AC 28)', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test('the restart cap: each counted launch failure re-arms at the doubled wait until the cap stops the timer, with onCapReached once and its notice', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    const row = modelRow(h, 'missing')
+    h.script({ spawnError: errTmuxSessionCreate('spawn') })
+    h.controller.arm(key, UNAVAILABLE)
+    h.controller.arm(other, UNAVAILABLE)
+    h.setAction(async (k, attempt) => (k === key ? h.fullModeAction(k, attempt) : { kind: 'again' }))
+
+    for (let n = 1; n < RESTART_FAILURE_CAP; n++) {
+      await retryNow(h, key)
+      expect(getFailureCount(key)).toBe(n)
+      expect(h.lines).toContain(reArmedLine(key, n, UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED, n))
+      expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(n), refusals: n })
+    }
+    expect(h.capReached).toEqual([])
+    await retryNow(h, key)
+
+    expect(getFailureCount(key)).toBe(RESTART_FAILURE_CAP)
+    expect(new Set(row.spawnedAt).size).toBe(RESTART_FAILURE_CAP)
+    expect(h.capReached).toEqual([key])
+    expect(h.notices.filter((n) => n.text.includes('automatic restarts suspended'))).toEqual([expect.objectContaining({ key })])
+    expect(h.lines).toContain(stoppedLine(key, UNAVAILABLE_RETRY_STOP_CAPPED))
+    expect(h.controller.isArmed(key)).toBe(false)
+    expect(h.controller.isArmed(other)).toBe(true)
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([h.controller.view(other)!.dueAt!])
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string) => void, string]>([
+    ['not up (its bring-up owns it)', (h, key) => h.setUp(key, false), UNAVAILABLE_RETRY_STOP_NOT_UP],
+    ['out of the applied configuration', (h, key) => h.remove(key), UNAVAILABLE_RETRY_STOP_NOT_APPLIED],
+    ['at the restart cap already', (_h, key) => {
+      for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(key)
+    }, UNAVAILABLE_RETRY_STOP_CAPPED],
+  ])('a persona %s: its next retry stops the timer with no agent-director call; the other persona stays armed, and its retry proceeds', async (_what, drive, reason) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    await armBoth(h, key, other)
+    const otherDue = h.controller.view(other)!.dueAt!
+
+    drive(h, key)
+    await retryNow(h, key)
+
+    expect(h.attempts.map((a) => a.key)).toEqual([key])
+    expect(h.stub.callCount()).toBe(0)
+    expect(h.lines).toContain(stoppedLine(key, reason))
+    expect(h.controller.isArmed(key)).toBe(false)
+    expect(h.controller.view(other)).toMatchObject({ phase: 'waiting', dueAt: otherDue })
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([otherDue])
+
+    h.setConnected(other, true)
+    await retryNow(h, other)
+    expect(h.stub.calls.statusCalls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(other)])
+    expect(h.lines).toContain(stoppedLine(other, UNAVAILABLE_RETRY_STOP_RECOVERED))
+  })
+
+  test('a trigger for a key no longer applied arms it, and its first retry stops it with no agent-director call', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    h.remove(key)
+    h.script({ spawnError: errTmuxUnresponsive('spawn') })
+
+    h.controller.arm(key, UNAVAILABLE)
+    await retryNow(h, key)
+
+    expect(h.attempts).toHaveLength(1)
+    expect(h.stub.callCount()).toBe(0)
+    expect(h.lines).toContain(stoppedLine(key, UNAVAILABLE_RETRY_STOP_NOT_APPLIED))
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test('teardown stops the persona’s timer at once, and it never fires; the other persona stays armed', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    await armBoth(h, key, other)
+    const otherDue = h.controller.view(other)!.dueAt!
+
+    h.teardown(key)
+    await h.advance(otherDue - 1 - h.clock.now())
+
+    expect(h.attempts).toEqual([])
+    expect(h.stub.callCount()).toBe(0)
+    expect(h.lines).toContain(stoppedLine(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN))
+    expect(h.controller.isArmed(key)).toBe(false)
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([otherDue])
+  })
+
+  test('shutdown stops every persona’s timer and arms none again: nothing fires however far the clock goes', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    await armBoth(h, key, other)
+    h.script({ spawnError: errTmuxUnresponsive('spawn') })
+
+    h.shutdown()
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    await h.advance(waitMs(refusalsToCeiling()) * (RESTART_FAILURE_CAP + 2))
+
+    expect(h.attempts).toEqual([])
+    expect(h.controller.armedKeys()).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(h.stub.calls.spawnCalls).toHaveLength(1)
+    expect(h.lines).toEqual(expect.arrayContaining([
+      stoppedLine(key, UNAVAILABLE_RETRY_STOP_SHUTDOWN),
+      stoppedLine(other, UNAVAILABLE_RETRY_STOP_SHUTDOWN),
+    ]))
+    expect(h.lines.filter((line) => line.includes(`persona=${key} not armed (unavailable`))).toHaveLength(1)
   })
 })

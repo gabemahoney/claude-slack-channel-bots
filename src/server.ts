@@ -155,8 +155,16 @@ import {
   cancelAllRestartTimers,
   cancelRestartTimer,
   isRestartPendingOrActive,
+  runRestartRetry,
   RESTART_FAILURE_CAP,
 } from './restart.ts'
+import {
+  createFullModeRetryAction,
+  createUnavailableRetryController,
+  UNAVAILABLE_RETRY_STOP_SHUTDOWN,
+  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
+  type UnavailableRetryController,
+} from './unavailable-retry.ts'
 import {
   buildPersonaWorkList,
   forgetDisconnectedStreak,
@@ -300,6 +308,12 @@ let connections: PersonaConnectionManager | undefined
  * every connection status by the manager's listener, cancelled on shutdown.
  */
 let bringUps: PersonaBringUpController | undefined
+
+/**
+ * The per-persona UNAVAILABLE retry timers (b.jg5 SRJ-301, SRJ-303,
+ * SRJ-305); built in main() before the start pass, closed on shutdown.
+ */
+let unavailableRetry: UnavailableRetryController | undefined
 
 /** The manager's per-persona queries, answering nothing before main() builds it. */
 const connectionView: Pick<PersonaConnectionManager, 'status' | 'webClient' | 'identity'> = {
@@ -785,7 +799,8 @@ let cronScheduler: CronScheduler | null = null
  * b.jg5 SRJ-205). `reason` is named in the shutdown line. It stops every
  * timer the server runs (the permission poller, the health check, the
  * runtime version re-check, the reload detection tick, the cron scheduler,
- * restart, bring-up and destination-hold timers, keep-alives), closes HTTP,
+ * restart, UNAVAILABLE retry, bring-up and destination-hold timers,
+ * keep-alives), closes HTTP,
  * the MCP transports and the persona Slack connections, releases the
  * agent-director client handle, removes the PID file and exits with
  * `exitCode`. It makes no agent-director call: every worker and row is left
@@ -811,6 +826,10 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
     cronScheduler = null
   }
   cancelAllRestartTimers()
+  // b.jg5 SRJ-305: every persona's UNAVAILABLE retry timer stops, and none is
+  // armed again (a launch still in flight that meets UNAVAILABLE arms
+  // nothing), so no retry is pending after this and none fires.
+  unavailableRetry?.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
   // Every persona's bring-up retry (directory re-checks); the manager's Slack
   // retries stop with stopAll() below.
   bringUps?.cancelAll()
@@ -1640,14 +1659,39 @@ export async function main(): Promise<void> {
   // cron scheduler's start() is the ONLY caller of ensure-exists, wired after
   // Bun.serve() below.
 
+  // b.jg5 SRJ-301, SRJ-303, SRJ-305: one UNAVAILABLE retry controller, on the
+  // system clock, installed below as the outage state's trigger sink before
+  // the start pass (whose launches are the first attempts that can arm it).
+  // A retry reruns the restart path's decision through the restart module's
+  // retry entry, and so through the one per-persona serializer initRestart
+  // gets; it stops on shutdown, a persona no longer applied, not up (the
+  // relaunch gate) or at the restart cap. The gate is built further down and
+  // initRestart runs later still: no statement in between awaits, and no
+  // retry falls due before 30 s. Dry run arms nothing, since it makes no
+  // agent-director call.
+  const retryTimers = createUnavailableRetryController({
+    log: (line) => console.error(line),
+    action: createFullModeRetryAction({
+      retry: runRestartRetry,
+      appliedPersona: getAppliedPersona,
+      canRelaunch: (key) => canRelaunch(key),
+      isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
+      isShuttingDown: () => shuttingDown,
+      isInFlight: isLaunchInFlight,
+    }),
+  })
+  unavailableRetry = retryTimers
+
   // Every persona notice goes through the one per-persona notifier: it holds
   // a notice until the persona's client is available and logs instead of
-  // posting in dry run.
+  // posting in dry run. An agent-director error inside a launch or recovery
+  // attempt arms the persona's retry timer through the trigger sink.
   initOutageState({
     notify: (key, text) => {
       void personaNotifier.notify(key, text)
     },
     getClient,
+    triggerSink: retryTimers,
   })
   setSessionNotifier(personaNotifier.notify)
 
@@ -1741,6 +1785,7 @@ export async function main(): Promise<void> {
     // than wait it out (up to 10 min).
     cancelLaunchWait: cancelWorkingRowWait,
     cancelRestartTimer,
+    stopRetryTimer: (key) => retryTimers.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN),
     forgetFailures,
     forgetDisconnectedStreak,
     forgetNotConnectedEpisode,

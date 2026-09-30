@@ -847,7 +847,7 @@ export interface RealLifecycleComposition {
   /**
    * Every call of a dependency the composition got, in call order, as
    * `[member, key]` with the member named as in `PersonaLifecycleDeps`
-   * (`'bringUps.cancel'`, `'cancelRestartTimer'`, `'whenLaunchSettled'`,
+   * (`'bringUps.cancel'`, `'cancelRestartTimer'`, `'stopRetryTimer'`, `'whenLaunchSettled'`,
    * `'connections.stop'`, `'routing.forget'`, `'forgetAcks'`, `'destinations.forget'`,
    * `'destinationHold.cancel'`, `'notifier.forget'`, `'forgetPersonaPrompts'`,
    * `'dropSession'`, `'resetOutageState'`, `'killInstance'`,
@@ -2235,6 +2235,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         log,
         whenLaunchSettled: rec('whenLaunchSettled', (key) => whenLaunchSettled(key)),
         cancelRestartTimer: rec('cancelRestartTimer', () => false),
+        // A recording no-op: the run arms no UNAVAILABLE retry timer.
+        stopRetryTimer: rec('stopRetryTimer'),
         forgetFailures: rec('forgetFailures'),
         forgetDisconnectedStreak: rec('forgetDisconnectedStreak'),
         resetOutageState: (keys) => {

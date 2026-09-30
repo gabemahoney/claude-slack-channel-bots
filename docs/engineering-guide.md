@@ -122,7 +122,7 @@ When a managed session's MCP connection closes, `onsessionclosed` calls `schedul
 
 ### Configuration
 
-`session_restart_delay` in `config.json` sets the delay in seconds before attempting a relaunch. Default is 60. Set to 0 to disable auto-restart entirely — the server will log `Auto-restart disabled (delay=0)` and skip all scheduling for that disconnect.
+`session_restart_delay` in `config.json` sets the delay in seconds before attempting a relaunch. Default is 60. Set to 0 to disable auto-restart entirely — the server will log `Auto-restart disabled (delay=0)` and skip all scheduling for that disconnect. Delay 0 does not disable the UNAVAILABLE retry timer: its retries never read the delay (b.jg5 SRJ-303).
 
 Delay 0 disables restarts, not a launch's own reconnect. The collision ladder still types `/mcp reconnect` into a `waiting` row, and into a `working` row once the positive-idle rule shows it stale (b.f2b, see [Health-Check Poller](#health-check-poller)), whatever the delay: that reconnect is part of the launch. Nothing else reconnects a persona under delay 0, so a persona left running but unreachable is reported, never left down silently (b.f2b). Two paths raise the not-connected notice (`notifyPersonaNotConnected` in `src/session-manager.ts`):
 
@@ -204,6 +204,10 @@ A persona that is not up (its bring-up is broken or retrying, or its Slack conne
 - **Ask the gate after every await, before touching the instance.** The liveness probe is an async agent-director call, and the persona can stop being up while it runs. A new step that awaits before a reconnect, kill or launch gets its own `skipIfNotUp` check after the await.
 - **A refusal records nothing.** Never call `recordFailure` or `recordSuccess` on a not-up skip; the persona's next restart after it comes up counts normally.
 
+#### The UNAVAILABLE retry timer and the counter (b.jg5 SRJ-302, SRJ-303)
+
+The retry timer (`src/unavailable-retry.ts`) never records to the failure counter or reads its backoff: it imports only the stateless `doublingBackoffDelay`. A launch agent-director refused comes back `'refused'` and records nothing, and a retry skipped because a launch is in flight makes no call, so a persona is never capped or given up for UNAVAILABLE alone. The one way a retry reaches the counter is through its own restart work: its launch's failure is counted at the single counting site (`launchSession`'s `false`) like any other, and its successful launch or reconnect calls `recordSuccess`. Keep it that way: a new retry step never calls `recordFailure` itself, and a new refusal outcome returns an uncounted result such as `'refused'`, never `false`.
+
 ### Log Messages
 
 All restart activity is logged to stderr with the `[slack]` prefix. `<key>` is the persona key:
@@ -216,6 +220,10 @@ All restart activity is logged to stderr with the `[slack]` prefix. `<key>` is t
 | `[slack] Session alive but disconnected — reconnecting MCP for persona=<key>` | Alive session; sending `/mcp reconnect` instead of relaunching |
 | `[slack] Relaunching session for persona=<key> cwd="<path>"` | Relaunch attempt starting |
 | `[slack] Session relaunch failed for persona=<key>` | Relaunch failed; failure counter incremented |
+| `[slack] Session relaunch refused for persona=<key> — not counted; its UNAVAILABLE retry timer owns the persona` | The relaunch's attempt met an agent-director error that armed the persona's UNAVAILABLE retry timer (b.jg5 SRJ-301, SRJ-302). Neither success nor failure is recorded; the retry timer retries the persona |
+| `[slack] Restart retry skipped for persona=<key> — a launch is in flight; no agent-director call` | A retry of the UNAVAILABLE retry timer found a launch call in flight for the persona (`runRestartRetry`'s first step). No call is made and nothing is recorded; the timer re-arms at the doubled wait (`launch-in-flight`) |
+| `[slack] restart retry: in-flight check failed for persona=<key>: <error> — treated as in flight` | The retry entry's in-flight check threw (`<error>` through `describeThrownValue`). Treated as a launch in flight: no call, and the timer re-arms |
+| `[slack] runRestartRetry: deps not initialized — skipping the retry for persona=<key>` | A retry fell due before `initRestart` ran. Nothing is done; the timer re-arms (`restart-not-initialised`) |
 | `[slack] Cap reached for persona=<key> — notifying and stopping restarts` | 5th consecutive failure; `SpawnCapReached` notice raised through the notifier, no more timers scheduled |
 | `[slack] health-check: persona=<key> is at cap — skipping tick (SR-25.3/25.4)` | Poller skipped a capped persona on this tick |
 | `[slack] reconnectSession: persona=<key> status check failed: <error> — not typing /mcp reconnect blind; deferring to a later tick (b.f2b/b.rmy)` | The reconnect adapter's status call threw, so nothing is known about the session. Nothing is typed, any idle evidence is dropped, and it returns `'transient'`; the next tick retries (during an agent-director outage the liveness probe reads the persona dead, so the tick relaunches it instead) |
@@ -249,6 +257,18 @@ All restart activity is logged to stderr with the `[slack]` prefix. `<key>` is t
 | `[slack] Not scheduling restart for persona=<key> — the relaunch gate refused it (the persona is not up, or is no longer in the applied configuration)` | `canRestart` refused; no timer armed, nothing recorded |
 | `[slack] Skipping restart for persona=<key> — the persona is no longer up; its instance is left as it is` | `canRestart` refused when the timer's serialized work started (before the liveness probe), right after the probe, or right after the re-probe that follows an `escalate-dead` reconnect; no further probe, reconnect, kill or launch, nothing recorded |
 | `[slack] Cancelled restart timer for persona=<key>` | Pending timer cleared on graceful shutdown, or for one persona by its teardown (`cancelRestartTimer`) |
+
+The UNAVAILABLE retry timer logs its own lines (b.jg5 SRJ-302 to SRJ-305), to the server log only, never to Slack. `<cause>` is the cause kind (`unavailable`, `kill-failed`, `read-error`, or `unnamed` for anything that is not a label), followed by `: <error>` when the cause carries a thrown value; `<error>` is always rendered through `describeThrownValue`:
+
+| Message | Meaning |
+|---|---|
+| `[slack] unavailable-retry: persona=<key> armed (<cause>) — first retry in 30 s` | An agent-director error inside a launch or recovery attempt armed the persona's timer. A trigger while armed logs nothing and keeps the due time |
+| `[slack] unavailable-retry: persona=<key> retry <n> — rerunning its recovery` | Retry `<n>` (from 1) fell due and runs the full-mode action: the pre-call checks, then the restart path's decision without the delay gate |
+| `[slack] unavailable-retry: persona=<key> retry <n>: <reason> — re-armed, next retry in <s> s` | The retry answered again; `<s>` is the next wait (60, 120, 240, then 300). `<reason>` is `launch-in-flight`, `launch-failed` (a counted launch failure below the cap), `reconnect-deferred`, `launched` (the timer runs on after a successful launch), `restart-not-initialised`, the cause armed during the run (a refused launch), `the retry failed: <error>`, `the retry gave no answer`, `no cause given` or `unnamed` |
+| `[slack] unavailable-retry: persona=<key> stopped — <reason>` | The timer stopped and the persona is forgotten. `<reason>` is `nothing left to recover`, `the persona is at the restart cap`, `the persona is not up; its bring-up owns it`, `the persona is not in the applied configuration`, `its relaunch was declined (the persona is not up, or the server is stopping)`, `the persona was torn down` or `the server is shutting down` |
+| `[slack] unavailable-retry: persona=<key> not armed (<cause>) — the server is shutting down` | A trigger after the shutdown closed the controller; nothing is armed |
+| `[slack] unavailable-retry: persona=<key> arm failed: <error> — not armed` | The clock threw while setting the first timer. The persona is forgotten; the next trigger arms it at the first wait |
+| `[slack] unavailable-retry: persona=<key> retry run failed: <error>` | The clock threw while re-arming after a retry. The persona is forgotten; the next trigger arms it at the first wait |
 
 A launch whose collision ladder meets a `working` row waits for it (`waitForWaitingAndReconnect`), and the start pass parks such a launch (b.f2b). These lines name the persona as `<ref>`, `"<name>" (key=<key>)`:
 

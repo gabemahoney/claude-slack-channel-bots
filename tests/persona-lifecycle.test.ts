@@ -17,7 +17,9 @@
  * - serialization behind a restart: the real restart module
  *   (`initRestart` with `serialize`, real `cancelRestartTimer`). Its timer is
  *   a real `setTimeout` (1 ms here; it takes no fake clock), waited for by a
- *   1 ms-step poll;
+ *   1 ms-step poll. Beside it, the real UNAVAILABLE retry controller on a
+ *   fake clock (its `stop` with the torn-down reason as `stopRetryTimer`,
+ *   recorded in the trail), with A's and B's timers armed and never fired;
  * - serialization behind a bring-up retry, the recovery bring-up of a
  *   persona broken by its credentials, and confirmed credentials changes
  *   (the controller's `changeCredentials` called directly, and through the
@@ -70,10 +72,27 @@ import { createPersonaSerializer, type PersonaSerializer } from '../src/persona-
 import type { PersonaBringUpStep } from '../src/persona-start.ts'
 import type { InPlaceApplyInput } from '../src/reload-apply.ts'
 import type { InPlaceSetting } from '../src/reload-plan.ts'
-import { _resetRestartState, cancelAllRestartTimers, cancelRestartTimer, initRestart, isRestartPendingOrActive, scheduleRestart } from '../src/restart.ts'
+import {
+  _resetRestartState,
+  cancelAllRestartTimers,
+  cancelRestartTimer,
+  initRestart,
+  isRestartPendingOrActive,
+  RESTART_OUTCOME_LAUNCHED,
+  runRestartRetry,
+  scheduleRestart,
+} from '../src/restart.ts'
 import { deletePersonaInstance, killPersonaInstance } from '../src/session-manager.ts'
+import {
+  createUnavailableRetryController,
+  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_STOP_SHUTDOWN,
+  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
+  type UnavailableRetryController,
+} from '../src/unavailable-retry.ts'
 import { errGeneric, errSpawnNotFound, makeStubCallLog, makeStubClient, stubCallCount } from './test-helpers/agent-director-stub.ts'
 import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken, writeCredentialsFile } from './test-helpers/credentials.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeConnectionHarness, type ConnectionHarness, type ConnectionHarnessOptions } from './test-helpers/persona-connection-harness.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
@@ -144,7 +163,8 @@ function makeConfig(): PersonaConfig {
 
 /** Dependency names the recorder fixture can make fail. */
 type DepName =
-  | 'bringUps.cancel' | 'bringUps.bringUp' | 'bringUps.state' | 'bringUps.changeCredentials' | 'cancelRestartTimer' | 'cancelLaunchWait' | 'whenLaunchSettled' | 'connections.stop'
+  | 'bringUps.cancel' | 'bringUps.bringUp' | 'bringUps.state' | 'bringUps.changeCredentials' | 'cancelRestartTimer' | 'stopRetryTimer' | 'cancelLaunchWait'
+  | 'whenLaunchSettled' | 'connections.stop'
   | 'routing.forget' | 'forgetAcks' | 'destinations.forget' | 'destinationHold.cancel' | 'notifier.forget' | 'forgetPersonaPrompts'
   | 'dropSession' | 'resetOutageState' | 'killInstance' | 'deleteInstance' | 'forgetFailures'
   | 'forgetDisconnectedStreak' | 'forgetNotConnectedEpisode' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
@@ -282,6 +302,7 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
     log: (line) => void lines.push(line),
     whenLaunchSettled: rec('whenLaunchSettled', byKey, (key: string) => opts.launchInFlight?.(key) ?? Promise.resolve()),
     cancelRestartTimer: rec('cancelRestartTimer', byKey, () => false),
+    stopRetryTimer: rec('stopRetryTimer', byKey, () => undefined),
     cancelLaunchWait: rec('cancelLaunchWait', byKey, () => false),
     forgetFailures: rec('forgetFailures', byKey, () => undefined),
     forgetDisconnectedStreak: rec('forgetDisconnectedStreak', byKey, () => undefined),
@@ -328,7 +349,7 @@ function teardownPrefix(p: Persona): string {
 function teardownTurnTrail(p: Persona, launchPass: string): string[] {
   const k = p.key
   return [
-    `bringUps.cancel:${k}`, `cancelRestartTimer:${k}`, `cancelLaunchWait:${k}`, `whenLaunchSettled:${k}`,
+    `bringUps.cancel:${k}`, `cancelRestartTimer:${k}`, `stopRetryTimer:${k}`, `cancelLaunchWait:${k}`, `whenLaunchSettled:${k}`,
     `connections.stop:${k}`, `routing.forget:${k}`, `forgetAcks:${k}`, `destinations.forget:${k}`, `destinationHold.cancel:${k}`,
     `notifier.forget:${k}`, `forgetPersonaPrompts:${k}`, `dropSession:${k}`,
     `resetOutageState:${k}`, `killInstance:${k}`, `deleteInstance:${k}`, `resetOutageState:${k}`,
@@ -349,14 +370,15 @@ function fullTeardownTrail(p: Persona, launchPass: string): string[] {
 /**
  * The teardown trail for a key still applied when it is submitted (the old
  * half of a destructive modify): its launch's wait, bring-up retries and
- * restart timer cancelled at submit, before its turn, then its turn with its
+ * restart timer cancelled and its UNAVAILABLE retry timer stopped at submit,
+ * before its turn, then its turn with its
  * held notices dropped again right after the agent-director calls.
  */
 function stillAppliedTeardownTrail(p: Persona, launchPass: string): string[] {
   const turn = teardownTurnTrail(p, launchPass)
   const afterAd = turn.lastIndexOf(`resetOutageState:${p.key}`) + 1
   return [
-    `cancelLaunchWait:${p.key}`, `bringUps.cancel:${p.key}`, `cancelRestartTimer:${p.key}`,
+    `cancelLaunchWait:${p.key}`, `bringUps.cancel:${p.key}`, `cancelRestartTimer:${p.key}`, `stopRetryTimer:${p.key}`,
     ...turn.slice(0, afterAd), `notifier.forget:${p.key}`, ...turn.slice(afterAd),
   ]
 }
@@ -501,6 +523,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   test.each<[DepName, string, number]>([
     ['bringUps.cancel', 'cancelling its bring-up retries', 1],
     ['cancelRestartTimer', 'cancelling its restart timer', 1],
+    ['stopRetryTimer', 'stopping its UNAVAILABLE retry timer', 1],
     ['whenLaunchSettled', 'waiting for its launch in flight', 1],
     ['connections.stop', 'stopping its Slack connection', 1],
     ['routing.forget', 'forgetting its inbound dedupe store', 1],
@@ -539,7 +562,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
   test('every step failing: the teardown still resolves, runs each step once and reports all of them', async () => {
     const all: DepName[] = [
-      'bringUps.cancel', 'cancelRestartTimer', 'cancelLaunchWait', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
+      'bringUps.cancel', 'cancelRestartTimer', 'stopRetryTimer', 'cancelLaunchWait', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
       'forgetAcks', 'destinations.forget', 'destinationHold.cancel', 'notifier.forget', 'forgetPersonaPrompts', 'dropSession',
       'resetOutageState', 'killInstance', 'deleteInstance', 'forgetFailures', 'forgetDisconnectedStreak', 'forgetNotConnectedEpisode',
       'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
@@ -549,7 +572,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await f.lifecycle.teardown(f.b)
 
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 22 failed step(s)`)
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 23 failed step(s)`)
     assertNoLeak({ lines: f.lines })
   })
 
@@ -608,9 +631,9 @@ describe('persona teardown of a key still applied (the old half of a destructive
   // at submit while B's turn was held, and the whole trail once it ran.
   test.each<[string, boolean, (f: Fixture) => string[], (f: Fixture, launchPass: string) => string[]]>([
     [
-      'B still applied (a destructive modify\'s old half): its launch\'s wait, bring-up retries and restart timer are cancelled at submit, before its turn; its held notices are dropped again after the agent-director calls',
+      'B still applied (a destructive modify\'s old half): its launch\'s wait, bring-up retries and restart timer are cancelled and its UNAVAILABLE retry timer stopped at submit, before its turn; its held notices are dropped again after the agent-director calls',
       true,
-      (f) => [`cancelLaunchWait:${f.b.key}`, `bringUps.cancel:${f.b.key}`, `cancelRestartTimer:${f.b.key}`],
+      (f) => [`cancelLaunchWait:${f.b.key}`, `bringUps.cancel:${f.b.key}`, `cancelRestartTimer:${f.b.key}`, `stopRetryTimer:${f.b.key}`],
       (f, launchPass) => stillAppliedTeardownTrail(f.b, launchPass),
     ],
     [
@@ -660,21 +683,20 @@ describe('persona teardown of a key still applied (the old half of a destructive
     ['bringUps.cancel', 'cancelling its bring-up retries', 'throws'],
     ['cancelRestartTimer', 'cancelling its restart timer', 'throws'],
     ['cancelRestartTimer', 'cancelling its restart timer', 'rejects'],
+    ['stopRetryTimer', 'stopping its UNAVAILABLE retry timer', 'throws'],
+    ['stopRetryTimer', 'stopping its UNAVAILABLE retry timer', 'rejects'],
     ['cancelLaunchWait', 'cancelling its launch\'s wait for a working row', 'throws'],
   ])('%s failing at submit (%s; it %s): one token-safe "before its turn failed" line, the other early cancels still run, and the whole teardown still runs', async (dep, phrase, how) => {
     // A throw also fails the same step in the teardown's turn; a rejection is overridden for the early call only.
     let calls = 0
+    const rejectFirst = (key: string) => {
+      f.trail.push(`${dep}:${key}`)
+      return calls++ === 0 ? Promise.reject(failure()) : false
+    }
     const f = makeFixture(
       how === 'throws'
         ? { fail: [dep] }
-        : {
-            overrides: {
-              cancelRestartTimer: (key) => {
-                f.trail.push(`cancelRestartTimer:${key}`)
-                return calls++ === 0 ? Promise.reject(failure()) : false
-              },
-            },
-          },
+        : { overrides: dep === 'stopRetryTimer' ? { stopRetryTimer: rejectFirst } : { cancelRestartTimer: rejectFirst } },
     )
     f.applied.push(f.b)
 
@@ -691,18 +713,19 @@ describe('persona teardown of a key still applied (the old half of a destructive
     assertNoLeak({ lines: f.lines })
   })
 
-  test('both early cancels failing: one line each, in order, before the teardown starts', async () => {
-    const f = makeFixture({ fail: ['bringUps.cancel', 'cancelRestartTimer'] })
+  test('every early cancel failing: one line each, in order, before the teardown starts', async () => {
+    const f = makeFixture({ fail: ['bringUps.cancel', 'cancelRestartTimer', 'stopRetryTimer'] })
     f.applied.push(f.b)
 
     await f.lifecycle.teardown(f.b)
 
-    expect(f.lines.slice(0, 3)).toEqual([
+    expect(f.lines.slice(0, 4)).toEqual([
       expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: cancelling its bring-up retries before its turn failed: Error`)}( |$)`)),
       expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: cancelling its restart timer before its turn failed: Error`)}( |$)`)),
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: stopping its UNAVAILABLE retry timer before its turn failed: Error`)}( |$)`)),
       `${teardownPrefix(f.b)}: starting`,
     ])
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 2 failed step(s)`)
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 3 failed step(s)`)
     assertNoLeak({ lines: f.lines })
   })
 
@@ -1990,7 +2013,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
     ])
   })
 
-  describe('behind the restart module (real initRestart with the serializer, real cancelRestartTimer)', () => {
+  describe('behind the restart module (real initRestart with the serializer, real cancelRestartTimer, real UNAVAILABLE retry timers)', () => {
     /**
      * Init the real restart module over `f`'s serializer, recording into
      * `f.trail`: `restart.canRestart:<key>` (the relaunch gate: at scheduling,
@@ -2013,6 +2036,58 @@ describe('persona teardown serialization (SR-6.6)', () => {
       })
     }
 
+    interface RetryTimers {
+      controller: UnavailableRetryController
+      clock: FakeClock
+      /** Every line the controller logged. */
+      lines: string[]
+    }
+
+    /**
+     * `makeFixture` with the real `cancelRestartTimer` and the real UNAVAILABLE
+     * retry controller on a fake clock, as server.ts binds it: `stopRetryTimer`
+     * records `stopRetryTimer:<key>` in the trail, then stops the key's timer
+     * with the torn-down reason. A's and B's timers are armed (their first
+     * retry 30 s away on the fake clock, never reached). Afterwards the
+     * controller is closed and no fake-clock timer is left.
+     */
+    function makeRestartFixture(): { f: Fixture; retry: RetryTimers } {
+      const clock = createFakeClock()
+      const lines: string[] = []
+      const controller = createUnavailableRetryController({
+        log: (line) => void lines.push(line),
+        action: () => {
+          throw new Error('no retry falls due in these cases')
+        },
+        clock,
+      })
+      const f = makeFixture({
+        overrides: {
+          cancelRestartTimer,
+          stopRetryTimer: (key) => {
+            f.trail.push(`stopRetryTimer:${key}`)
+            controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+          },
+        },
+      })
+      for (const p of [f.a, f.b]) controller.arm(p.key, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+      cleanups.push(() => {
+        controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+        expect(clock.pendingCount()).toBe(0)
+        assertNoLeak({ lines })
+      })
+      return { f, retry: { controller, clock, lines } }
+    }
+
+    /** After B's teardown: B's retry timer is gone (stopped once, as torn down) and A's is still armed, its timer the only one pending. */
+    function expectOnlyBRetryStopped(f: Fixture, retry: RetryTimers): void {
+      expect(retry.controller.isArmed(f.b.key)).toBe(false)
+      expect(retry.controller.armedKeys()).toEqual([f.a.key])
+      expect(retry.clock.pendingCount()).toBe(1)
+      const stopped = retry.lines.filter((l) => l.includes(' stopped — '))
+      expect(stopped).toEqual([`[slack] unavailable-retry: persona=${f.b.key} stopped — ${UNAVAILABLE_RETRY_STOP_TORN_DOWN}`])
+    }
+
     const teardownOnly = (f: Fixture) => f.trail.filter((c) => !c.startsWith('restart.'))
     /** The full teardown trail without the recorder for `cancelRestartTimer` (the real one runs here). */
     const expectedTeardown = (f: Fixture) =>
@@ -2021,7 +2096,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
 
     test('a teardown for B submitted while B\'s restart work is running (its launch in progress) starts only once that work settled', async () => {
       const launchGate = Promise.withResolvers<boolean>()
-      const f = makeFixture({ overrides: { cancelRestartTimer } })
+      const { f, retry } = makeRestartFixture()
       initRestartFor(f, () => launchGate.promise)
       scheduleRestart(f.b.key, '/cwd/b')
       await until(() => f.trail.includes(`restart.launchSession:${f.b.key}`))
@@ -2039,11 +2114,63 @@ describe('persona teardown serialization (SR-6.6)', () => {
       expect(teardownOnly(f)).toEqual(expectedTeardown(f))
       expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete`)
       expect(isRestartPendingOrActive(f.b.key)).toBe(false)
+      expectOnlyBRetryStopped(f, retry)
+    })
+
+    // SRJ-305 / SRJ-715: the submit-time stop cannot see an arm that the
+    // in-flight retry's own launch makes afterwards; the turn's stop, which
+    // runs only after that work settled, must catch it.
+    test('a still-applied teardown for B submitted while B\'s runRestartRetry is running (its launch in progress) starts only once that work settled; the launch arms B during the run, and B ends with no retry timer while A stays armed', async () => {
+      const launchGate = Promise.withResolvers<boolean>()
+      const { f, retry } = makeRestartFixture()
+      const k = f.b.key
+      f.applied.push(f.b) // the old half of a destructive modify
+      initRestartFor(f, async () => {
+        const launched = await launchGate.promise
+        // The launch meets an agent-director refusal after the teardown was submitted.
+        f.trail.push(`restart.retryArmed:${k}`)
+        retry.controller.arm(k, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+        return launched
+      })
+      const run = runRestartRetry(k, '/cwd/b', () => false)
+      await until(() => f.trail.includes(`restart.launchSession:${k}`))
+
+      const done = f.lifecycle.teardown(f.b)
+      expect(await settled(done)).toBe(false)
+      expect(await settled(run)).toBe(false)
+      expect(f.lines).toEqual([])
+      // Only the submit-time cancels and stop; the turn waits behind the retry's work.
+      expect(teardownOnly(f)).toEqual([`cancelLaunchWait:${k}`, `bringUps.cancel:${k}`, `stopRetryTimer:${k}`])
+      expect(retry.controller.isArmed(k)).toBe(false)
+
+      launchGate.resolve(true)
+      await done
+      expect(await settled(run)).toBe(true)
+      expect(await run).toBe(RESTART_OUTCOME_LAUNCHED)
+
+      // The turn's first step comes right after the retry's work ended (its launch, then the arm).
+      const armed = f.trail.indexOf(`restart.retryArmed:${k}`)
+      expect(f.trail.indexOf(`restart.launchSession:${k}`)).toBeLessThan(armed)
+      expect(f.trail.slice(armed + 1, armed + 3)).toEqual([`bringUps.cancel:${k}`, `stopRetryTimer:${k}`])
+      expect(teardownOnly(f)).toEqual(
+        stillAppliedTeardownTrail(f.b, `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${k}]`)
+          .filter((c) => !c.startsWith('cancelRestartTimer:')),
+      )
+      expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete`)
+      expect(isRestartPendingOrActive(k)).toBe(false)
+
+      // B's timer: stopped at submit, re-armed by the launch, stopped again at the turn.
+      expect(retry.controller.isArmed(k)).toBe(false)
+      expect(retry.controller.armedKeys()).toEqual([f.a.key])
+      expect(retry.clock.pendingCount()).toBe(1)
+      const stoppedB = `[slack] unavailable-retry: persona=${k} stopped — ${UNAVAILABLE_RETRY_STOP_TORN_DOWN}`
+      expect(retry.lines.filter((l) => l.includes(' stopped — '))).toEqual([stoppedB, stoppedB])
+      expect(retry.lines.filter((l) => l.startsWith(`[slack] unavailable-retry: persona=${k} armed `))).toHaveLength(2)
     })
 
     test('a teardown for B queued behind B\'s fired restart runs after it; the restart work, starting after B left the applied set, is refused by the gate and launches nothing', async () => {
       let bApplied = true
-      const f = makeFixture({ overrides: { cancelRestartTimer } })
+      const { f, retry } = makeRestartFixture()
       initRestartFor(f, async () => true, () => bApplied)
       const blocker = Promise.withResolvers<void>()
       const held = f.serializer.run(f.b.key, () => blocker.promise)
@@ -2065,14 +2192,16 @@ describe('persona teardown serialization (SR-6.6)', () => {
       ])
       expect(teardownOnly(f)).toEqual(expectedTeardown(f))
       expect(isRestartPendingOrActive(k)).toBe(false)
+      expectOnlyBRetryStopped(f, retry)
     })
     // Rows: whether B is still applied (a destructive modify's old half) or removed, and whether its
-    // restart timer is still pending once the teardown is submitted and before its turn.
+    // restart timer is still pending, and its UNAVAILABLE retry timer still armed, once the teardown
+    // is submitted and before its turn.
     test.each<[string, boolean, boolean]>([
-      ['still applied: cancelled at submit, before its turn', true, false],
+      ['still applied: cancelled and stopped at submit, before its turn', true, false],
       ['removed: left for its turn (the relaunch gate refuses its work anyway)', false, true],
-    ])('B\'s pending restart timer, with B %s', async (_label, stillApplied, pendingBeforeTurn) => {
-      const f = makeFixture({ overrides: { cancelRestartTimer } })
+    ])('B\'s pending restart timer and armed UNAVAILABLE retry timer, with B %s', async (_label, stillApplied, pendingBeforeTurn) => {
+      const { f, retry } = makeRestartFixture()
       if (stillApplied) f.applied.push(f.b)
       initRestartFor(f, async () => true, () => true, 60) // a timer that never fires in the test
       scheduleRestart(f.b.key, '/cwd/b')
@@ -2083,6 +2212,8 @@ describe('persona teardown serialization (SR-6.6)', () => {
       const done = f.lifecycle.teardown(f.b)
       await flush()
       expect(isRestartPendingOrActive(f.b.key)).toBe(pendingBeforeTurn)
+      expect(retry.controller.isArmed(f.b.key)).toBe(pendingBeforeTurn)
+      expect(retry.controller.isArmed(f.a.key)).toBe(true)
       expect(f.lines).toEqual([])
 
       blocker.resolve()
@@ -2090,6 +2221,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       await done
       expect(isRestartPendingOrActive(f.b.key)).toBe(false)
       expect(restartOnly(f)).toEqual([`restart.canRestart:${f.b.key}`])
+      expectOnlyBRetryStopped(f, retry)
     })
   })
 

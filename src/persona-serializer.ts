@@ -14,7 +14,9 @@
  * - the work a restart timer does when it fires (`restart.ts`, through
  *   `RestartDeps.serialize`): the shutdown and not-up checks, the liveness
  *   probe, reconnect, kill and launch. Scheduling, backoff, the cap, the
- *   `activeLaunches` guard and the human-trigger clamp are not serialized;
+ *   `activeLaunches` guard and the human-trigger clamp are not serialized.
+ *   The UNAVAILABLE retry timer's retries rerun the same work through the
+ *   same `serialize` (`runRestartRetry`), their in-flight check first;
  * - each bring-up retry attempt, through to the launch it triggers
  *   (`persona-bringup-controller.ts`, through its `serialize` dependency): a
  *   directory re-check with its Slack step and launch, and the launch after a
