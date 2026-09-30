@@ -9,13 +9,18 @@
  * The startup gate (Epic 1, agent-director-startup.ts) does NOT call
  * `runInstallCheck()` — AD's own `Client.create()` enforces the same floor
  * against the same `dist/version-floor.json`. The gate imports only the
- * exported class-label values below. `AD_SYSTEM_INSTALL_NOT_FOUND` and
+ * class-label values, which live in the leaf module `install-check-labels.ts`
+ * and are re-exported here. `AD_SYSTEM_INSTALL_NOT_FOUND` and
  * `AD_SYSTEM_INSTALL_TOO_OLD` are shared: the gate and this check report
  * them for the same failures. `AD_BELOW_PHASE1_FLOOR` and
  * `AD_SHIM_CATALOG_INCOMPLETE` are defined here but only the startup gate
  * writes them; this check never reports either. CSCB never
  * duplicates the client's floor decision; its own Phase 1 floor lives in
  * `ad-version-gate.ts` (b.jg5 SRJ-203).
+ *
+ * {@link readClientMinVersion} (the installed client's `min_binary_version`)
+ * is also read by `/publish`'s preflight check, `scripts/ad-version-check.ts`
+ * (b.jg5 SRJ-211).
  *
  * The module is strictly side-effect-free:
  *   - No process.exit.
@@ -40,40 +45,19 @@ import {
 } from 'agent-director'
 import type { UnreachableReason } from 'agent-director'
 
-/** Class label for "no agent-director system install found"; shared with the startup gate. */
-export const AD_SYSTEM_INSTALL_NOT_FOUND = 'ad-system-install-not-found'
+import {
+  AD_SYSTEM_INSTALL_NOT_FOUND,
+  AD_SYSTEM_INSTALL_TOO_OLD,
+  type InstallCheckClassLabel,
+} from './install-check-labels.ts'
 
-/**
- * Class label for the client's own too-old refusal (`ErrSystemInstallTooOld`,
- * a binary below the client's minimum); shared with the startup gate.
- */
-export const AD_SYSTEM_INSTALL_TOO_OLD = 'ad-system-install-too-old'
-
-/**
- * Class label for CSCB's own Phase 1 floor refusal: a binary the client admits
- * whose version is below `PHASE1_FLOOR_VERSION` or does not parse (b.jg5
- * SRJ-203, SRJ-1013). Written by the startup gate.
- */
-export const AD_BELOW_PHASE1_FLOOR = 'ad-below-phase1-floor'
-
-/**
- * Class label for the startup gate's error-catalogue refusal: the client's
- * dist declares no class for one or more of the error names CSCB requires
- * (b.jg5 SRJ-102, SRJ-1013). Written by the startup gate.
- */
-export const AD_SHIM_CATALOG_INCOMPLETE = 'ad-shim-catalog-incomplete'
-
-/**
- * Canonical class labels emitted by the check. The not-found and too-old
- * labels are shared with the startup gate; `AD_BELOW_PHASE1_FLOOR` and
- * `AD_SHIM_CATALOG_INCOMPLETE` are not among them, because only the startup
- * gate writes them.
- */
-export type InstallCheckClassLabel =
-  | typeof AD_SYSTEM_INSTALL_NOT_FOUND
-  | typeof AD_SYSTEM_INSTALL_TOO_OLD
-  | 'ad-system-install-unreachable'
-  | 'ad-version-floor-unreadable'
+export {
+  AD_BELOW_PHASE1_FLOOR,
+  AD_SHIM_CATALOG_INCOMPLETE,
+  AD_SYSTEM_INSTALL_NOT_FOUND,
+  AD_SYSTEM_INSTALL_TOO_OLD,
+} from './install-check-labels.ts'
+export type { InstallCheckClassLabel } from './install-check-labels.ts'
 
 /** Success arm: AD is installed, version satisfies the declared floor. */
 export interface InstallCheckSuccess {
@@ -101,11 +85,15 @@ export type InstallCheckResult = InstallCheckSuccess | InstallCheckFailure
 let cachedFloor: string | InstallCheckFailure | null = null
 
 /**
- * Read AD's `dist/version-floor.json` via the subpath export and return the
- * `.min_binary_version` value. Returns a pre-built failure-arm result on
- * any failure mode (missing file, parse error, missing/non-string field).
+ * The installed agent-director client's minimum binary version: read AD's
+ * `dist/version-floor.json` via the subpath export and return the
+ * `.min_binary_version` value. Returns a pre-built
+ * `ad-version-floor-unreadable` failure-arm result on any failure mode
+ * (missing file, parse error, missing/non-string field). The value or the
+ * failure is cached; {@link resetCacheForTests} and {@link setFloorForTests}
+ * reset and seed the cache.
  */
-function loadFloor(): string | InstallCheckFailure {
+export function readClientMinVersion(): string | InstallCheckFailure {
   if (cachedFloor !== null) return cachedFloor
 
   let resolved: string
@@ -183,7 +171,7 @@ function stripLeadingV(version: string): string {
  * five shapes: success, or one of the four failure class labels.
  */
 export async function runInstallCheck(): Promise<InstallCheckResult> {
-  const floorOrFailure = loadFloor()
+  const floorOrFailure = readClientMinVersion()
   if (typeof floorOrFailure !== 'string') return floorOrFailure
   const floor = floorOrFailure
 

@@ -20,8 +20,12 @@
 #   14  SR-2.4  npm not authenticated, OR next version already on npm,
 #                OR npm registry is non-canonical (SR-2.4a),
 #                OR 'bun pm whoami' did not succeed (SR-2.4b)
-#   15  SR-2.5  host's agent-director binary missing/broken, OR its version
-#                does not satisfy package.json's declared range
+#   15  SR-2.5  host's agent-director binary missing, OR its version cannot
+#                be read, OR it is below the installed agent-director client's
+#                minimum (OR that minimum cannot be read); every SR-2.5
+#                diagnostic names the switch-over runbook section. A binary at
+#                or above the client's minimum but below CSCB's Phase 1 floor
+#                passes, with an 'SR-2.5 (preflight) NOTE' on stderr.
 #   16  SR-2.6  stranded finished work: a finished bee's fix is neither on main
 #                nor explicitly closed, OR an unmerged branch references a
 #                finished ticket (scripts/audit-finished-tickets.sh exit 1)
@@ -167,22 +171,21 @@ if npm view "claude-slack-channel-bots@${NEXT_VERSION}" version > /dev/null 2>&1
   sr_exit 14
 fi
 
-# SR-2.5 — host's agent-director binary version satisfies package.json's declared range.
-# Skipped when no agent-director dependency is declared (preserves portability for forks).
-if ! AD_RANGE="$(jq -r '.dependencies["agent-director"] // empty' package.json)"; then
-  echo "SR-2.5 (preflight): 'jq -r .dependencies[\"agent-director\"]' on package.json failed — package.json is malformed JSON or jq is broken. Operator recovery: have the operator run 'jq . package.json' to verify the file parses; fix the JSON defect on main, commit, then rerun '/publish ${BUMP_KIND}'." >&2
+# SR-2.5 — the host's agent-director binary against the installed client's
+# minimum and CSCB's Phase 1 floor (b.jg5 SRJ-211), judged by
+# scripts/ad-version-check.ts. It writes its own SR-2.5 line: on a pass, a
+# stdout line (and, below the floor, an 'SR-2.5 (preflight) NOTE' on stderr,
+# passed through unaltered); on a failure, one SR-2.5 diagnostic on stderr and
+# exit 15. Any other non-zero status means the check itself did not run to
+# completion, so this gate writes the diagnostic. The status is captured, so no
+# set -e death can occur here; every failure ends through sr_exit 15.
+AD_CHECK_EXIT=0
+bun scripts/ad-version-check.ts "${BUMP_KIND}" || AD_CHECK_EXIT=$?
+if [ "${AD_CHECK_EXIT}" -ne 0 ]; then
+  if [ "${AD_CHECK_EXIT}" -ne 15 ]; then
+    echo "SR-2.5 (preflight): 'bun scripts/ad-version-check.ts' did not run to completion (exit ${AD_CHECK_EXIT}), so the host's agent-director could not be checked. Operator recovery: report the check's output above verbatim. State of the check is indeterminate; do NOT rerun '/publish ${BUMP_KIND}' until the operator has assessed. The host's agent-director is covered by the switch-over runbook in the README (section \"Switching over to agent-director Phase 1\")." >&2
+  fi
   sr_exit 15
-fi
-if [ -n "${AD_RANGE}" ]; then
-  AD_VERSION="$(agent-director version 2>/dev/null | jq -r '.version // empty' 2>/dev/null || true)"
-  if [ -z "${AD_VERSION}" ]; then
-    echo "SR-2.5 (preflight): 'agent-director version' did not return a parseable version. The host's agent-director binary is missing or broken. Operator recovery: install agent-director matching '${AD_RANGE}' on this host (see ~/.agent-director/ install instructions or run ~/.agent-director/install.sh), then rerun '/publish ${BUMP_KIND}'." >&2
-    sr_exit 15
-  fi
-  if ! AD_VERSION="${AD_VERSION}" AD_RANGE="${AD_RANGE}" node -e "process.exit(require('semver').satisfies(process.env.AD_VERSION, process.env.AD_RANGE) ? 0 : 1)" 2>/dev/null; then
-    echo "SR-2.5 (preflight): host's agent-director ${AD_VERSION} does not satisfy package.json's declared range '${AD_RANGE}'. Releasing now would ship a package that fails on the publisher's own machine. Operator recovery: either (a) upgrade the host's agent-director to a version satisfying '${AD_RANGE}', or (b) edit package.json's declared range to include ${AD_VERSION} and commit before rerunning '/publish ${BUMP_KIND}'." >&2
-    sr_exit 15
-  fi
 fi
 
 # SR-2.6 — no stranded finished work. A bee must not sit in `finished` while its

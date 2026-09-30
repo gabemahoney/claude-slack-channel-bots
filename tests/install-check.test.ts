@@ -76,7 +76,7 @@ afterAll(() => {
 /**
  * Load the install-check module under the active mocks. Resets the floor
  * cache and lets the caller pre-seed a floor or failure-arm result for the
- * loadFloor() short-circuit path.
+ * readClientMinVersion() short-circuit path.
  */
 async function loadCheckModule(
   floor: string | import('../src/install-check.ts').InstallCheckFailure = '0.7.0',

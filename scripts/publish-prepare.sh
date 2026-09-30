@@ -32,7 +32,9 @@
 #   14  SR-2.4  preflight: npm not authenticated, OR next version already on npm,
 #                OR npm registry is non-canonical (SR-2.4a),
 #                OR 'bun pm whoami' did not succeed (SR-2.4b)
-#   15  SR-2.5  preflight: host agent-director missing/broken or version out of range
+#   15  SR-2.5  preflight: host agent-director missing, its version unreadable, or
+#                below the installed agent-director client's minimum (or that
+#                minimum unreadable); names the switch-over runbook section
 #   16  SR-2.6  preflight: stranded finished work (finished ticket not on main and
 #                not explicitly closed, or unmerged branch references a finished ticket)
 #   17  SR-2.6  preflight: the finished-work audit could not run (could not locate the

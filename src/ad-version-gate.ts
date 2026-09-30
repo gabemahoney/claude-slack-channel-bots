@@ -6,18 +6,32 @@
  * switch-over runbook section that CSCB's gate messages point the operator to,
  * the `ad-below-phase1-floor` message (b.jg5 SRJ-203, SRJ-208, SRJ-1013)
  * and the `ad-system-install-too-old` message for the client's own too-old
- * refusal (b.jg5 SRJ-208), each in a startup and a runtime form, and the
- * runtime re-check of the host binary (b.jg5 SRJ-204, SRJ-205).
+ * refusal (b.jg5 SRJ-208), each in a startup and a runtime form, the
+ * runtime re-check of the host binary (b.jg5 SRJ-204, SRJ-205) and the
+ * host-version decision with its Phase 1 note (b.jg5 SRJ-211).
  *
- * This check sits beside the agent-director client's own too-old refusal
+ * The floor check sits beside the agent-director client's own too-old refusal
  * (client minimum 0.7.0) and gates on the version alone. The 0.10.0 client
  * ranks its `0.0.0-dev` sentinel above every version, so `Client.create()`
- * admits it; this module has no such special case and refuses it on its own.
+ * admits it; the floor has no such special case and refuses it on its own.
  *
  * Parse rule mirrors the 0.10.0 client's strict SemVer parser (which the
  * client does not export): `major.minor.patch`, optional `-prerelease`, no
  * leading `v`, no `+build` metadata, no whitespace trimming. A version that
  * does not parse never passes (fail closed). There is no development override.
+ * {@link compareAdVersions} mirrors the client's version order (which it does
+ * not export either), including its sentinel {@link CLIENT_DEV_SENTINEL_VERSION}.
+ *
+ * Host-version decision (b.jg5 SRJ-211, SRJ-212): {@link decideHostAdVersion}
+ * judges one settled `resolveSystemBinary()` call against the installed
+ * client's minimum (supplied by the caller) and then CSCB's floor: pass,
+ * pass below the floor with the Phase 1 note ({@link buildPhase1HostNote},
+ * which names the switch-over runbook section), or fail (not found, version
+ * unreadable, below the client minimum, client minimum unreadable, other).
+ * Its two callers are `/publish`'s preflight check `scripts/ad-version-check.ts`
+ * (gate SR-2.5) and the install check in `src/install-check.ts`. Each
+ * resolves the host binary and reads the client minimum itself; this module
+ * does neither.
  *
  * Runtime re-check (b.jg5 SRJ-204): every {@link AD_VERSION_RECHECK_INTERVAL_MS}
  * on its own serialized, self-re-arming timer (the `src/reload-timer.ts`
@@ -56,14 +70,12 @@
  * disposed flag and the tick- and version-changed-listener registries, cleared by
  * {@link resetAdVersionRecheckForTests}.
  *
- * Later Epics extend this module: E5 adds the host-version decision.
- *
  * SPDX-License-Identifier: MIT
  */
 
 import type { ResolveSystemBinaryResult } from 'agent-director'
 
-import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD } from './install-check.ts'
+import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD } from './install-check-labels.ts'
 import { renderInstallSkillInstructions } from './install-skill-pointer.ts'
 import { describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 import type { PersonaConnectionClock } from './persona-connections.ts'
@@ -96,19 +108,32 @@ export const PHASE1_SWITCH_OVER_INSTRUCTION =
 /** Strict SemVer rule, identical to the 0.10.0 client's parser regex. */
 const STRICT_SEMVER_RE = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/
 
+/**
+ * The agent-director client's development sentinel version. Mirrors the
+ * client's `DEV_SENTINEL_VERSION` (held here as a value so this module keeps
+ * no value import from `agent-director`). The client ranks it above every
+ * version ({@link compareAdVersions}); CSCB's Phase 1 floor refuses it
+ * ({@link meetsPhase1Floor}).
+ */
+export const CLIENT_DEV_SENTINEL_VERSION = '0.0.0-dev'
+
 interface VersionCore {
   readonly major: number
   readonly minor: number
   readonly patch: number
 }
 
+/** A version under the client's strict rule: its core and its pre-release tag, if any. */
+interface StrictVersion extends VersionCore {
+  readonly prerelease: string | null
+}
+
 /**
- * Parse `input` with the client's strict rule and return its
- * major.minor.patch, or `null` when it does not parse. Any pre-release suffix
- * is dropped. Unlike the client, `0.0.0-dev` gets no sentinel treatment: it
- * parses as `0.0.0`.
+ * Parse `input` with the client's strict rule, or return `null` when it does
+ * not parse. Unlike the client, `0.0.0-dev` gets no sentinel treatment: it
+ * parses as `0.0.0` with the pre-release tag `dev`.
  */
-function parseCore(input: string): VersionCore | null {
+function parseStrict(input: string): StrictVersion | null {
   const m = STRICT_SEMVER_RE.exec(input)
   if (m === null) return null
   const major = Number(m[1])
@@ -117,11 +142,50 @@ function parseCore(input: string): VersionCore | null {
   if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(patch)) {
     return null
   }
-  return { major, minor, patch }
+  return { major, minor, patch, prerelease: m[4] ?? null }
+}
+
+/** A version as the client orders it: its sentinel, or a strictly parsed version. */
+type ClientOrderedVersion = { readonly sentinel: true } | ({ readonly sentinel: false } & StrictVersion)
+
+/** Parse `input` as the client does: exactly {@link CLIENT_DEV_SENTINEL_VERSION} is the sentinel. */
+function parseClientVersion(input: string): ClientOrderedVersion | null {
+  if (input === CLIENT_DEV_SENTINEL_VERSION) return { sentinel: true }
+  const parsed = parseStrict(input)
+  return parsed === null ? null : { sentinel: false, ...parsed }
+}
+
+/**
+ * Compare two versions in the agent-director client's own order (the order
+ * its too-old refusal applies against its minimum, b.jg5 SRJ-211): -1, 0 or
+ * 1 as `a` is below, equal to or above `b`, or `null` when either does not
+ * parse under the client's strict rule (a leading `v` included).
+ *
+ * - {@link CLIENT_DEV_SENTINEL_VERSION} ranks above every other version and
+ *   equals itself;
+ * - otherwise major, minor and patch compare numerically, part by part;
+ * - with equal cores, a release ranks above its own pre-release, and two
+ *   pre-release tags compare as strings.
+ */
+export function compareAdVersions(a: string, b: string): -1 | 0 | 1 | null {
+  const pa = parseClientVersion(a)
+  const pb = parseClientVersion(b)
+  if (pa === null || pb === null) return null
+  if (pa.sentinel || pb.sentinel) {
+    if (pa.sentinel && pb.sentinel) return 0
+    return pa.sentinel ? 1 : -1
+  }
+  for (const part of ['major', 'minor', 'patch'] as const) {
+    if (pa[part] !== pb[part]) return pa[part] > pb[part] ? 1 : -1
+  }
+  if (pa.prerelease === pb.prerelease) return 0
+  if (pa.prerelease === null) return 1
+  if (pb.prerelease === null) return -1
+  return pa.prerelease > pb.prerelease ? 1 : -1
 }
 
 const FLOOR_CORE: VersionCore = (() => {
-  const core = parseCore(PHASE1_FLOOR_VERSION)
+  const core = parseStrict(PHASE1_FLOOR_VERSION)
   if (core === null) {
     throw new Error(`ad-version-gate: PHASE1_FLOOR_VERSION ${JSON.stringify(PHASE1_FLOOR_VERSION)} is not a strict SemVer version`)
   }
@@ -138,7 +202,7 @@ const FLOOR_CORE: VersionCore = (() => {
  * refused.
  */
 export function meetsPhase1Floor(version: string): boolean {
-  const core = parseCore(version)
+  const core = parseStrict(version)
   if (core === null) return false
   if (core.major !== FLOOR_CORE.major) return core.major > FLOOR_CORE.major
   if (core.minor !== FLOOR_CORE.minor) return core.minor > FLOOR_CORE.minor
@@ -326,8 +390,8 @@ function thrownName(value: unknown): string | undefined {
   return stringField(value, 'errName') ?? stringField(value, 'name')
 }
 
-/** A path as one token-free line: token- and URL-like text redacted, line breaks collapsed. */
-function safePath(value: unknown): string {
+/** A string field (a path or a version) as one token-free line: token- and URL-like text redacted, line breaks collapsed. */
+function safeLine(value: unknown): string {
   return typeof value === 'string' && value !== ''
     ? redactSlackLogText(value).replace(/[\r\n\u2028\u2029]+/g, ' ')
     : UNKNOWN_FIELD
@@ -351,9 +415,13 @@ function describeCouldNotRun(error: unknown): string {
     return typeof error === 'object' ? 'an error with no readable name' : `a thrown ${typeof error}`
   }
   if (name !== ERR_SYSTEM_INSTALL_UNREACHABLE) return name
+  return `${name} (reason ${safeReason(error)}, binary at ${safeLine(readField(error, 'binaryPath'))})`
+}
+
+/** An `ErrSystemInstallUnreachable`'s reason when it is a short safe word, else {@link UNKNOWN_FIELD}. */
+function safeReason(error: unknown): string {
   const reason = readField(error, 'reason')
-  const safeReason = typeof reason === 'string' && SAFE_REASON_RE.test(reason) ? reason : UNKNOWN_FIELD
-  return `${name} (reason ${safeReason}, binary at ${safePath(readField(error, 'binaryPath'))})`
+  return typeof reason === 'string' && SAFE_REASON_RE.test(reason) ? reason : UNKNOWN_FIELD
 }
 
 /**
@@ -383,7 +451,7 @@ export function decideAdVersionRecheckOutcome(result: AdVersionRecheckCallResult
   }
   if (result.kind === 'resolved') {
     const version = readField(result.value, 'version')
-    const binaryPath = safePath(readField(result.value, 'path'))
+    const binaryPath = safeLine(readField(result.value, 'path'))
     if (typeof version === 'string' && meetsPhase1Floor(version)) {
       return { kind: RECHECK_OUTCOME_PASS, version, binaryPath }
     }
@@ -406,13 +474,202 @@ export function decideAdVersionRecheckOutcome(result: AdVersionRecheckCallResult
           {
             foundVersion: stringField(error, 'actualVersion') ?? UNKNOWN_FIELD,
             requiredVersion: stringField(error, 'requiredVersion') ?? UNKNOWN_FIELD,
-            binaryPath: safePath(readField(error, 'binaryPath')),
+            binaryPath: safeLine(readField(error, 'binaryPath')),
           },
           FOUND_BY_RUNTIME_RECHECK,
         ) + installSkillBlock(),
     }
   }
   return { kind: RECHECK_OUTCOME_COULD_NOT_RUN, description: describeCouldNotRun(error) }
+}
+
+// ---------------------------------------------------------------------------
+// Host-version decision: /publish's preflight and the install check (b.jg5 SRJ-211, SRJ-212)
+// ---------------------------------------------------------------------------
+
+/** The agent-director client's no-binary-found refusal, by name. */
+const ERR_SYSTEM_INSTALL_NOT_FOUND = 'ErrSystemInstallNotFound'
+
+/** The host binary passes: at or above the client's minimum and CSCB's Phase 1 floor. */
+export const HOST_VERSION_OUTCOME_PASS = 'pass'
+
+/**
+ * The host binary passes with the Phase 1 note: at or above the client's
+ * minimum but below CSCB's Phase 1 floor (`0.10.0`, `0.0.0-dev`).
+ */
+export const HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR = 'pass-below-floor'
+
+/** The host binary fails; the outcome's `failure` says why. */
+export const HOST_VERSION_OUTCOME_FAIL = 'fail'
+
+/** No agent-director binary was found (`ErrSystemInstallNotFound`). */
+export const HOST_VERSION_FAIL_NOT_FOUND = 'not-found'
+
+/**
+ * The binary's version cannot be read: an `ErrSystemInstallUnreachable` of
+ * any reason, or a resolved version the client's strict rule cannot parse (a
+ * leading `v` included).
+ */
+export const HOST_VERSION_FAIL_VERSION_UNREADABLE = 'version-unreadable'
+
+/**
+ * The binary is below the client's minimum: an `ErrSystemInstallTooOld`, or
+ * a resolved version below the supplied minimum.
+ */
+export const HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM = 'below-client-minimum'
+
+/** The supplied client minimum does not parse under the client's strict rule, so nothing can be judged. */
+export const HOST_VERSION_FAIL_CLIENT_MINIMUM_UNREADABLE = 'client-minimum-unreadable'
+
+/** Any other failure: another named error or a non-error throw. */
+export const HOST_VERSION_FAIL_OTHER = 'other'
+
+/** One settled `resolveSystemBinary()` call: the resolved path and version, or the thrown value. */
+export type HostVersionCallResult = Exclude<AdVersionRecheckCallResult, { readonly kind: 'timed-out' }>
+
+/** Why the host binary fails the host-version decision. Every field is token-free. */
+export type HostVersionFailure =
+  | { readonly kind: typeof HOST_VERSION_FAIL_NOT_FOUND }
+  | {
+      readonly kind: typeof HOST_VERSION_FAIL_VERSION_UNREADABLE
+      /** The resolved binary path. */
+      readonly binaryPath: string
+      /** What was read: the unreachable error's reason, or the version that does not parse. */
+      readonly detail: string
+    }
+  | {
+      readonly kind: typeof HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM
+      /** The binary's version. */
+      readonly foundVersion: string
+      /** The client's minimum (the error's `requiredVersion`, else the supplied minimum). */
+      readonly requiredVersion: string
+      /** The resolved binary path. */
+      readonly binaryPath: string
+    }
+  | {
+      readonly kind: typeof HOST_VERSION_FAIL_CLIENT_MINIMUM_UNREADABLE
+      /** The supplied minimum, as one token-free line. */
+      readonly clientMinimum: string
+    }
+  | {
+      readonly kind: typeof HOST_VERSION_FAIL_OTHER
+      /** The thrown value's name, or its type when it has no readable name. */
+      readonly description: string
+    }
+
+/** What the host-version decision decides (b.jg5 SRJ-211). */
+export type HostVersionOutcome =
+  | {
+      readonly kind: typeof HOST_VERSION_OUTCOME_PASS | typeof HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR
+      /** The binary's version (it parses under the client's strict rule). */
+      readonly version: string
+      /** The resolved binary path, as one token-free line. */
+      readonly binaryPath: string
+    }
+  | { readonly kind: typeof HOST_VERSION_OUTCOME_FAIL; readonly failure: HostVersionFailure }
+
+/** A failing outcome. */
+function hostVersionFail(failure: HostVersionFailure): HostVersionOutcome {
+  return { kind: HOST_VERSION_OUTCOME_FAIL, failure }
+}
+
+/** What one thrown or rejected `resolveSystemBinary()` value means, read by name. */
+function hostVersionThrownFailure(error: unknown, clientMinimum: string): HostVersionFailure {
+  const name = thrownName(error)
+  if (name === ERR_SYSTEM_INSTALL_NOT_FOUND) return { kind: HOST_VERSION_FAIL_NOT_FOUND }
+  if (name === ERR_SYSTEM_INSTALL_TOO_OLD) {
+    return {
+      kind: HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM,
+      foundVersion: safeLine(readField(error, 'actualVersion')),
+      requiredVersion: safeLine(stringField(error, 'requiredVersion') ?? clientMinimum),
+      binaryPath: safeLine(readField(error, 'binaryPath')),
+    }
+  }
+  if (name === ERR_SYSTEM_INSTALL_UNREACHABLE) {
+    return {
+      kind: HOST_VERSION_FAIL_VERSION_UNREADABLE,
+      binaryPath: safeLine(readField(error, 'binaryPath')),
+      detail: `reason ${safeReason(error)}`,
+    }
+  }
+  return { kind: HOST_VERSION_FAIL_OTHER, description: describeCouldNotRun(error) }
+}
+
+/**
+ * The one host-version decision (b.jg5 SRJ-211; SRJ-212 reuses it): judge one
+ * settled `resolveSystemBinary()` call against the installed client's
+ * minimum (`min_binary_version`, supplied by the caller, never hard-coded
+ * here), in the client's own order ({@link compareAdVersions}), then against
+ * CSCB's Phase 1 floor ({@link meetsPhase1Floor}):
+ *
+ * - rejected, read by name: `ErrSystemInstallNotFound` fails not found;
+ *   `ErrSystemInstallTooOld` fails below the client minimum, from its
+ *   `actualVersion`, `requiredVersion` and `binaryPath`;
+ *   `ErrSystemInstallUnreachable` (any reason) fails version unreadable;
+ *   any other named error or non-error throw fails other;
+ * - resolved, with a minimum that does not parse: fails client minimum
+ *   unreadable;
+ * - resolved with a version the client's strict rule cannot parse (a leading
+ *   `v` included): fails version unreadable;
+ * - resolved below the minimum: fails below the client minimum;
+ * - resolved at or above the minimum and meeting the floor: pass;
+ * - resolved at or above the minimum but below the floor (`0.10.0`, the
+ *   client's sentinel `0.0.0-dev`): pass below the floor, which carries the
+ *   Phase 1 note ({@link buildPhase1HostNote}).
+ *
+ * Pure: classifies by name, reads fields structurally, never throws.
+ */
+export function decideHostAdVersion(result: HostVersionCallResult, clientMinimum: string): HostVersionOutcome {
+  if (result.kind === 'rejected') return hostVersionFail(hostVersionThrownFailure(result.error, clientMinimum))
+  if (parseClientVersion(clientMinimum) === null) {
+    return hostVersionFail({ kind: HOST_VERSION_FAIL_CLIENT_MINIMUM_UNREADABLE, clientMinimum: safeLine(clientMinimum) })
+  }
+  const version = readField(result.value, 'version')
+  const binaryPath = safeLine(readField(result.value, 'path'))
+  const order = typeof version === 'string' ? compareAdVersions(version, clientMinimum) : null
+  if (typeof version !== 'string' || order === null) {
+    const detail =
+      typeof version === 'string'
+        ? `version ${JSON.stringify(safeLine(version))} does not parse as a strict SemVer version`
+        : 'no version string'
+    return hostVersionFail({ kind: HOST_VERSION_FAIL_VERSION_UNREADABLE, binaryPath, detail })
+  }
+  if (order < 0) {
+    return hostVersionFail({
+      kind: HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM,
+      foundVersion: version,
+      requiredVersion: clientMinimum,
+      binaryPath,
+    })
+  }
+  return {
+    kind: meetsPhase1Floor(version) ? HOST_VERSION_OUTCOME_PASS : HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR,
+    version,
+    binaryPath,
+  }
+}
+
+/**
+ * The fixed phrase every Phase 1 host note carries (b.jg5 SRJ-211): this
+ * CSCB release needs agent-director Phase 1 on the host.
+ */
+export const PHASE1_HOST_NOTE_PHRASE = 'this CSCB release needs agent-director Phase 1 on the host'
+
+/**
+ * The Phase 1 note for a host binary that passes below the floor (b.jg5
+ * SRJ-211): the version found and its path, the floor, that
+ * {@link PHASE1_HOST_NOTE_PHRASE}, that the binary meets the client's
+ * minimum so it is accepted, and the switch-over runbook section's title
+ * ({@link PHASE1_RUNBOOK_SECTION_TITLE}). No upgrade instruction, no command
+ * and no link. Built from a version, a path and fixed text only.
+ */
+export function buildPhase1HostNote(parts: BelowPhase1FloorParts): string {
+  return (
+    `The host's agent-director ${parts.foundVersion} (binary at ${parts.binaryPath}) is below ` +
+    `CSCB's Phase 1 floor ${PHASE1_FLOOR_VERSION} (release candidates ${PHASE1_FLOOR_VERSION}-rc.N included): ` +
+    `${PHASE1_HOST_NOTE_PHRASE}. It meets the agent-director client's minimum, so it is accepted for now; ` +
+    `the host switches over to Phase 1 by the README's runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}".`
+  )
 }
 
 // ---------------------------------------------------------------------------
