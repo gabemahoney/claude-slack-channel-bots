@@ -1460,6 +1460,82 @@ describe('b.jg5 SRJ-314: a pending row is never counted healthy', () => {
 })
 
 // ---------------------------------------------------------------------------
+// b.jg5 SRJ-310 rule 2 (tick half) — a live healthy tick ends tmux-unresponsive
+//
+// A tick that finds the persona `live`, connected and with its stream calls
+// `endTmuxUnresponsive(key)` for that persona (production binds it to the
+// condition's end with reason `tick` and the `live` reading; the binding is
+// pinned in tests/server-startup-wiring.test.ts). `pending` (never healthy),
+// `unknown`, a thrown probe, `dead`, and a live session that is disconnected
+// or connected but streamless never call it. Every other case in this file
+// leaves the hook at its default (absent).
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-310: a live, connected tick with its stream ends the persona\'s tmux-unresponsive condition', () => {
+  const P = 'healed_bot'
+  const B = 'other_bot'
+
+  test.each<[string, LivenessReading, boolean]>([
+    ['live but disconnected', LIVENESS_READING_LIVE, false],
+    ['pending, connected with its stream', LIVENESS_READING_PENDING, true],
+  ])('P live, connected and with its stream, beside B %s in the same tick: the hook is called once, for P only', async (_label, bReading, bConnected) => {
+    // B is checked first, so a hook fired with the wrong persona's key would
+    // show B's key.
+    const personas = workList(B, P)
+    const deps = makeDeps({
+      personas,
+      aliveSequence: { [B]: [bReading], [P]: [LIVENESS_READING_LIVE] },
+      connectedSequence: { [B]: [bConnected], [P]: [true] },
+      maxTicks: 1,
+    })
+    const ended: string[] = []
+    deps.endTmuxUnresponsive = (key) => void ended.push(key)
+
+    await runTicks(deps, 1)
+
+    expect(deps.isSessionAliveCalls).toEqual([B, P])
+    expect(ended).toEqual([P])
+  })
+
+  test('the hook is called on every tick that finds the persona live and deliverable, and on no other', async () => {
+    //   tick 1: live, deliverable            → called
+    //   tick 2: pending, deliverable         → not called
+    //   tick 3: live, disconnected           → not called
+    //   tick 4: live, deliverable            → called
+    const deps = makeDeps({
+      aliveSequence: { [KEY]: [LIVENESS_READING_LIVE, LIVENESS_READING_PENDING, LIVENESS_READING_LIVE, LIVENESS_READING_LIVE] },
+      connectedSequence: { [KEY]: [true, true, false, true] },
+      maxTicks: 4,
+    })
+    const ended: Array<[number, string]> = []
+    deps.endTmuxUnresponsive = (key) => void ended.push([deps.isSessionAliveCalls.length, key])
+
+    await runTicks(deps, 4)
+
+    expect(ended).toEqual([[1, KEY], [4, KEY]])
+  })
+
+  test.each<[string, DepsOpts]>([
+    ['pending (no launch start), connected with its stream', { aliveSequence: { [KEY]: [LIVENESS_READING_PENDING] } }],
+    ['pending (a launch start), connected with its stream', { aliveSequence: { [KEY]: [pendingLivenessReading(SAMPLE_LAUNCH_START_WHOLE)] } }],
+    ['unknown', { aliveSequence: { [KEY]: [LIVENESS_READING_UNKNOWN] } }],
+    ['a thrown probe', { aliveSequence: { [KEY]: [new Error('simulated status failure')] } }],
+    ['dead', { aliveSequence: { [KEY]: [LIVENESS_READING_DEAD] } }],
+    ['live but disconnected', { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false }],
+    ['live and connected but streamless', { isSessionAliveResult: LIVENESS_READING_LIVE, hasSessionStreamResult: false }],
+  ])('%s: over two ticks the hook is never called', async (_label, opts) => {
+    const deps = makeDeps({ ...opts, maxTicks: 2 })
+    const ended: string[] = []
+    deps.endTmuxUnresponsive = (key) => void ended.push(key)
+
+    await runTicks(deps, 2)
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
+    expect(ended).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // b.av2 SR-6.3 / SR-6.4 / SR-7.2 / SR-11 — only personas that are up are checked
 //
 // The server builds the tick's work list as

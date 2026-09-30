@@ -124,8 +124,10 @@ import {
   ERR_SPAWN_NOT_FOUND_NAME,
 } from './agent-director-errors.ts'
 import {
+  adKillCall,
   classifyWithInvalidFlagsRecheck,
   describeAdErrorClassification,
+  describeAgentDirectorFailure,
   hasAdErrorName,
   isInvalidFlagsError,
 } from './ad-error-class.ts'
@@ -827,7 +829,7 @@ export async function reconnectMcpWithCause(
   const claude_instance_id = personaInstanceId(key)
   console.error(`[slack] reconnecting MCP server "${MCP_SERVER_NAME}": ${ref}`)
   const sendReconnect = (): Promise<unknown> =>
-    withOutageDetection(key, undefined, (client) => client.sendKeys({
+    withOutageDetection(key, undefined, 'send-keys', (client) => client.sendKeys({
       claude_instance_id,
       text: `/mcp reconnect ${MCP_SERVER_NAME}`,
     }))
@@ -1063,7 +1065,7 @@ export async function approvePreSessionDialogs(
     // 1) Readiness oracle.
     let state: string
     try {
-      const r = await withOutageDetection(key, undefined, (client) => client.status({ claude_instance_id }))
+      const r = await withOutageDetection(key, undefined, 'status', (client) => client.status({ claude_instance_id }))
       state = r.state
     } catch (err) {
       if (err instanceof ErrSpawnNotFound) {
@@ -1106,10 +1108,10 @@ export async function approvePreSessionDialogs(
     } else {
       // Interactive (pending) — drive via agent-director.
       try {
-        const { pane } = await withOutageDetection(key, undefined, (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
+        const { pane } = await withOutageDetection(key, undefined, 'read-pane', (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
         needleVisible = PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))
         if (needleVisible) {
-          await withOutageDetection(key, undefined, (client) => client.sendKeys({ claude_instance_id, text: '', allow_pending: true })) // Enter
+          await withOutageDetection(key, undefined, 'send-keys', (client) => client.sendKeys({ claude_instance_id, text: '', allow_pending: true })) // Enter
         }
       } catch (err) {
         console.error(`[slack] approvePreSessionDialogs: readPane/sendKeys error ${ref}: ${describeThrownValue(err)}`)
@@ -1486,7 +1488,7 @@ async function readWorkingRowEvidence(key: string, configDir: string | undefined
  */
 async function readWorkingPane(key: string): Promise<{ pane: string } | { failure: string }> {
   try {
-    const r = await withOutageDetection(key, undefined, (client) =>
+    const r = await withOutageDetection(key, undefined, 'read-pane', (client) =>
       client.readPane({ claude_instance_id: personaInstanceId(key), n_lines: WORKING_PANE_LINES }))
     return { pane: r.pane }
   } catch (err) {
@@ -1516,7 +1518,7 @@ function transcriptConfigDir(persona: Pick<Persona, 'claude_config_dir'> | undef
 async function readPersonaTranscript(key: string, configDir: string | undefined): Promise<TranscriptReading> {
   let row: GetResult
   try {
-    row = await withOutageDetection(key, undefined, (client) =>
+    row = await withOutageDetection(key, undefined, 'get', (client) =>
       client.get({ claude_instance_id: personaInstanceId(key) }))
   } catch (err) {
     return { kind: 'unreadable', reason: `reading its agent-director row failed: ${describeAgentDirectorFailure(err)}` }
@@ -2019,7 +2021,7 @@ export function _resetFindMissingMemo(): void {
  *   memoized one), or undefined when the sweep failed.
  */
 async function reconcileMissingSweep(key: string, logPrefix: string, ref: string = keyRef(key)): Promise<FindMissingResult | undefined> {
-  return sharedFindMissingSweep(() => withOutageDetection(key, undefined, (client) => client.findMissing({})), logPrefix, ref, key)
+  return sharedFindMissingSweep(() => withOutageDetection(key, undefined, 'find-missing', (client) => client.findMissing({})), logPrefix, ref, key)
 }
 
 /**
@@ -2216,7 +2218,7 @@ function isDeadRowState(state: string | undefined): boolean {
 async function reconcileAndReadRowState(key: string, logPrefix: string, ref: string): Promise<string | undefined> {
   await reconcileMissingSweep(key, logPrefix, ref)
   try {
-    const st = await withOutageDetection(key, undefined, (client) =>
+    const st = await withOutageDetection(key, undefined, 'status', (client) =>
       client.status({ claude_instance_id: personaInstanceId(key) }),
     )
     return st.state
@@ -2242,7 +2244,7 @@ async function reconcileAndReadRowState(key: string, logPrefix: string, ref: str
  */
 export async function readPersonaRowState(key: string): Promise<UnavailableRetryRowRead> {
   try {
-    const st = await withOutageDetection(key, undefined, (client) =>
+    const st = await withOutageDetection(key, undefined, 'status', (client) =>
       client.status({ claude_instance_id: personaInstanceId(key) }),
     )
     const launchStartedAt = pendingLaunchStartOf(st)
@@ -2492,7 +2494,7 @@ async function waitForWorkingRow(
     if (wait.cancelled) return waitCancelled(ref)
     let state: string
     try {
-      const r = await withOutageDetection(key, undefined, (client) => client.status({ claude_instance_id }))
+      const r = await withOutageDetection(key, undefined, 'status', (client) => client.status({ claude_instance_id }))
       state = r.state
     } catch (err) {
       if (wait.cancelled) return waitCancelled(ref)
@@ -2594,7 +2596,7 @@ async function waitForWorkingRow(
   if (wait.cancelled) return waitCancelled(ref)
   let timeoutState: string
   try {
-    const r = await withOutageDetection(key, undefined, (client) => client.status({ claude_instance_id }))
+    const r = await withOutageDetection(key, undefined, 'status', (client) => client.status({ claude_instance_id }))
     timeoutState = r.state
   } catch (err) {
     if (wait.cancelled) return waitCancelled(ref)
@@ -2872,11 +2874,19 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabe
  * own (the wrapper still raises or clears the key's outage flags). Resolves
  * true when the row was there, false when it was already gone
  * (`ErrSpawnNotFound` counts as success); rethrows every other error for the
- * caller to report. For the persona teardown (b.av2 SR-6.5).
+ * caller to report. For the persona teardown (b.av2 SR-6.5), and the
+ * collision ladder's best-effort kill (`tryKill`).
+ *
+ * `rowReadLive` declares whether the caller kills a row it read in a live
+ * state (b.jg5 glossary: only such a kill is tmux-touching). The teardown did
+ * not read the row, so it passes nothing (false); the ladder passes true when
+ * it read the row live.
  */
-export async function killPersonaInstance(key: string): Promise<boolean> {
+export async function killPersonaInstance(key: string, rowReadLive = false): Promise<boolean> {
   try {
-    await withOutageDetection(key, undefined, (client) => client.kill({ claude_instance_id: personaInstanceId(key) }))
+    await withOutageDetection(key, undefined, adKillCall(rowReadLive), (client) =>
+      client.kill({ claude_instance_id: personaInstanceId(key) }),
+    )
     return true
   } catch (err) {
     if (err instanceof ErrSpawnNotFound) return false
@@ -2886,7 +2896,7 @@ export async function killPersonaInstance(key: string): Promise<boolean> {
 
 /** Delete persona `key`'s row (`cscb_<key>`) through `withOutageDetection`; rethrows every error. */
 function deleteInstanceRow(key: string): Promise<unknown> {
-  return withOutageDetection(key, undefined, (client) => client.delete({ claude_instance_id: [personaInstanceId(key)] }))
+  return withOutageDetection(key, undefined, 'delete', (client) => client.delete({ claude_instance_id: [personaInstanceId(key)] }))
 }
 
 /**
@@ -2907,10 +2917,13 @@ export async function deletePersonaInstance(key: string): Promise<boolean> {
   }
 }
 
-/** Best-effort kill — never throws. */
-async function tryKill(key: string): Promise<void> {
+/**
+ * Best-effort kill — never throws. `rowReadLive` declares whether the ladder
+ * read the row in a live state (`killPersonaInstance`).
+ */
+async function tryKill(key: string, rowReadLive: boolean): Promise<void> {
   try {
-    await killPersonaInstance(key)
+    await killPersonaInstance(key, rowReadLive)
   } catch {
     /* ignore */
   }
@@ -2974,7 +2987,7 @@ async function selfHealTmuxCollisionAndRespawn(
     `[slack] spawnForPersona: ErrTmuxSessionCreate for ${ref} — killing orphan tmux session "${sessionName}" and retrying spawn once`,
   )
   await _killTmuxSession(sessionName)
-  return launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
+  return launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
 }
 
 /** Delete the spawn row; surface failures. Returns whether the delete succeeded. */
@@ -3004,7 +3017,9 @@ async function tryDelete(
  * and run dialog approval. The collision ladder's kill+delete+fresh paths go
  * through here: `resume_enabled: false`, a row whose `cwd` differs from the
  * working directory (b.av2 SR-6.2), and a row whose `config_dir` label is
- * missing or differs before a resume.
+ * missing or differs before a resume. `rowReadLive` declares whether the
+ * ladder read the row in a live state, which makes the kill tmux-touching
+ * (b.jg5 glossary).
  *
  * - A failed delete returns `failed` (tryDelete records `spawn-failed` at
  *   startup and raises the spawn-failure notice).
@@ -3019,10 +3034,10 @@ async function replaceWithFreshSpawn(
   params: SpawnParams,
   isStartup: boolean,
   ref: string,
-  opts: { kill: boolean },
+  opts: { kill: boolean; rowReadLive: boolean },
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
-  if (opts.kill) await tryKill(key)
+  if (opts.kill) await tryKill(key, opts.rowReadLive)
   if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
 
   const failed = (err: unknown, what: string): SpawnPersonaResult => {
@@ -3042,7 +3057,7 @@ async function replaceWithFreshSpawn(
   }
 
   try {
-    await launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
+    await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
     console.error(`[slack] spawnForPersona: fresh-spawned (after ${opts.kill ? 'kill+delete' : 'delete'}) for ${ref}`)
     await approvePreSessionDialogs(key, isStartup, ref)
     return { key, action: 'spawned' }
@@ -3164,7 +3179,7 @@ async function diagnoseJsonlMissing(
   const claudeInstanceId = personaInstanceId(key)
   let row: GetResult | undefined
   try {
-    row = await withOutageDetection(key, undefined, (client) =>
+    row = await withOutageDetection(key, undefined, 'get', (client) =>
       client.get({ claude_instance_id: claudeInstanceId }),
     )
   } catch (getErr) {
@@ -3310,24 +3325,6 @@ async function diagnoseJsonlMissing(
 }
 
 /**
- * Token-safe description of a failed agent-director call, for a log line, a
- * startup-error record (passed instead of the error itself) or a line that is
- * also posted as a persona notice: a typed agent-director error's `errName`
- * when it is a short identifier, then its `errDescription` as `message="…"`
- * (`describeLogMessage`: through `redactSlackLogText`, on one line, capped at
- * `MAX_LOGGED_MESSAGE_LENGTH` characters) when it has one; else
- * `describeThrownValue` of the thrown value, which renders the message the
- * same way. Never the raw error object.
- */
-function describeAgentDirectorFailure(err: unknown): string {
-  if (err instanceof AgentDirectorError && isSafeIdentifier(err.errName)) {
-    const message = describeLogMessage(err.errDescription)
-    return message === '' ? err.errName : `${err.errName} ${message}`
-  }
-  return describeThrownValue(err)
-}
-
-/**
  * b.fwu: emit the operator-visible signal for an INCONCLUSIVE ErrJsonlMissing
  * diagnosis — one where we could not determine whether prior history was lost.
  * Follows the 'lost' branch's pattern (recordStartupError guarded by isStartup
@@ -3399,9 +3396,13 @@ async function resumeOrFreshSpawn(
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   const ref = personaRef(persona)
+  // The dead-session callers (reconcileMissingFirst) read the row `waiting`
+  // or `working`, a live state; the other callers read it `ended` or
+  // `missing`. A kill below declares which (b.jg5 glossary).
+  const rowReadLive = opts?.reconcileMissingFirst === true
   if (config.resume_enabled === false) {
     console.error(`[slack] spawnForPersona: resume_enabled=false — kill+delete+fresh for ${ref}`)
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true })
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true, rowReadLive })
   }
 
   // b.4dk: dead-session callers (state=waiting/working with a verified-dead
@@ -3443,13 +3444,13 @@ async function resumeOrFreshSpawn(
         `(${was}, now=${configDir.expectedConfigDirLabel} for claude_config_dir=${persona.claude_config_dir ?? '<default>'}) — ` +
         `not resuming; spawning fresh`,
     )
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: opts?.reconcileMissingFirst === true })
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: rowReadLive, rowReadLive })
   }
 
   // resume_enabled: attempt resume
   console.error(`[slack] spawnForPersona: attempting resume for ${ref}`)
   try {
-    await launchWithReplyGuard(persona, ref, (client) => client.resume({ claude_instance_id: personaInstanceId(key) }))
+    await launchWithReplyGuard(persona, ref, 'resume', (client) => client.resume({ claude_instance_id: personaInstanceId(key) }))
     console.error(`[slack] spawnForPersona: resumed ${ref}`)
     // b.vub: a resumed bot faces the same --dangerously-load-development-channels
     // dialog. Its AD row is still `missing`/`ended` while blocked at the dialog
@@ -3502,7 +3503,7 @@ async function resumeOrFreshSpawn(
       }
       if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
       try {
-        await launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
+        await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: fresh-spawned (after delete) for ${ref}`)
         await approvePreSessionDialogs(key, isStartup, ref)
         // A fresh-spawn that replaced a resume because the transcript was gone
@@ -3546,10 +3547,10 @@ async function resumeOrFreshSpawn(
     if (err instanceof ErrSpawnNotResumable) {
       // Row is non-terminal but resume rejected — defensive: kill + delete + spawn
       console.error(`[slack] spawnForPersona: ErrSpawnNotResumable for ${ref} — kill+delete+fresh`)
-      await tryKill(key)
+      await tryKill(key, rowReadLive)
       if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
       try {
-        await launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
+        await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
         await approvePreSessionDialogs(key, isStartup, ref)
         return { key, action: 'spawned' }
       } catch (err2) {
@@ -3574,7 +3575,7 @@ async function resumeOrFreshSpawn(
       // recovery into action: 'failed'. Mirrors the caller-level retry below.
       console.error(`[slack] spawnForPersona: ErrSpawnNotFound on resume for ${ref} — fresh-spawn`)
       try {
-        await launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
+        await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: fresh-spawned (after ErrSpawnNotFound on resume) for ${ref}`)
         await approvePreSessionDialogs(key, isStartup, ref)
         return { key, action: 'spawned' }
@@ -3718,17 +3719,19 @@ function undoPreLaunchReplyGuard(undo: ReplyGuardUndo | undefined, ref: string):
 
 /**
  * An agent-director call that starts the persona's instance (`client.spawn`
- * or `client.resume`), preceded immediately by the reply-guard steps. Every
+ * or `client.resume`, declared as `verb`), preceded immediately by the
+ * reply-guard steps. Every
  * spawn and resume in the ladder goes through here except the optimistic
  * first spawn, which also undoes the steps when it meets a live instance.
  */
 function launchWithReplyGuard<T>(
   persona: Persona,
   ref: string,
+  verb: 'spawn' | 'resume',
   call: (client: Client) => Promise<T>,
 ): Promise<T> {
   runPreLaunchReplyGuard(persona, ref)
-  return withSpawnDetection(persona.key, persona.working_directory, call)
+  return withSpawnDetection(persona.key, persona.working_directory, verb, call)
 }
 
 /**
@@ -3932,7 +3935,7 @@ async function runPersonaLadder(
   let replyGuardUndo: ReplyGuardUndo | undefined
   try {
     replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
-    const r = await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
+    const r = await withSpawnDetection(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
     console.error(`[slack] spawnForPersona: spawned ${ref} instanceId=${r.claude_instance_id}`)
     await approvePreSessionDialogs(key, isStartup, ref)
     return { key, action: 'spawned' }
@@ -3984,13 +3987,13 @@ async function runPersonaLadder(
   // Collision-handling: get-then-act ---
   let row: GetResult
   try {
-    row = await withOutageDetection(key, undefined, (client) => client.get({ claude_instance_id: personaInstanceId(key) }))
+    row = await withOutageDetection(key, undefined, 'get', (client) => client.get({ claude_instance_id: personaInstanceId(key) }))
   } catch (err) {
     if (err instanceof ErrSpawnNotFound) {
       // Race: row deleted between spawn-collision and get. Retry spawn once.
       console.error(`[slack] spawnForPersona: ErrSpawnNotFound after collision for ${ref} — retrying spawn (single retry)`)
       try {
-        const r = await launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
+        const r = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: retry-spawn succeeded for ${ref} instanceId=${r.claude_instance_id}`)
         await approvePreSessionDialogs(key, isStartup, ref)
         return { key, action: 'spawned' }
@@ -4044,7 +4047,7 @@ async function runPersonaLadder(
     console.error(
       `[slack] spawnForPersona: ${ref} row cwd=${row.cwd || '<none>'} differs from working_directory=${persona.working_directory} (state=${state}) — replacing the row: kill+delete+fresh`,
     )
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true })
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true, rowReadLive: AGENT_DIRECTOR_LIVE_STATES.has(state) })
   }
 
   if (state === 'ended' || state === 'missing') {

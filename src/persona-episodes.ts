@@ -27,9 +27,39 @@
  *
  * Kinds and their posters. One label per row of SRJ-1016's table
  * (`PERSONA_EPISODE_KINDS`). None has a poster yet: `tmux-unresponsive`'s
- * comes with its condition (b.jg5 SRJ-307 to SRJ-310, this Epic); every
- * other kind's begin and end triggers and text come with the Epic that posts
- * it, named on its label below.
+ * episode is begun and ended by its condition (below), and its posts come
+ * with its onset, alert and recovery (b.jg5 E10); every other kind's begin
+ * and end triggers and text come with the Epic that posts it, named on its
+ * label below.
+ *
+ * The `tmux-unresponsive` condition (b.jg5 SRJ-307, SRJ-310).
+ * `createTmuxUnresponsiveCondition(deps)` builds it over one episodes
+ * instance: the condition holds for a persona while its `tmux-unresponsive`
+ * episode is open, and the episode's start time is the first refusal's time.
+ * It is a per-persona condition, not an outage class: it never raises or
+ * clears an outage flag, posts nothing and records no bad-stretch history.
+ *
+ * - `start(key, verb, error)` starts the condition (opens the episode, the
+ *   first refusal's time from the episodes' clock, one started line) or
+ *   continues it (the first refusal's time kept, no line). Its only caller is
+ *   the outage state's reporting point (`src/outage-state.ts`), for a
+ *   tmux-touching call's UNAVAILABLE inside a launch or recovery attempt for
+ *   the persona.
+ * - `holds(key)` and `firstRefusalAt(key)` read it.
+ * - `end(key, reason, reading?)` ends a holding condition once: the episode
+ *   ends, one ended line names the reason, and the injected condition-end
+ *   hook is called once with the reading the end brings (a tick's or a
+ *   retry's live reading; `pending` for a successful `spawn` or `resume`;
+ *   none for any other tmux-touching success or GONE). It
+ *   answers whether the episode's onset had been posted. On a persona that
+ *   does not hold it, it does nothing.
+ * - The episodes' `forget(key)` (a teardown) and `forgetAll()` drop a holding
+ *   condition silently, with no line and no hook call.
+ *
+ * Log lines, to the injected log (a throwing log is swallowed):
+ *
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive started — <verb> failed: <describeAgentDirectorFailure(error)>
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive ended — <reason text>
  *
  * b.f2b's not-connected reasons keep their one shared latch
  * (`notConnectedNoticeRaised` in `src/session-manager.ts`), which this module
@@ -51,6 +81,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { describeAgentDirectorFailure, type AdVerb } from './ad-error-class.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 
@@ -134,7 +165,7 @@ export type PersonaEpisodeSink = (key: string, text: string) => void | Promise<v
 export interface PersonaEpisodesDeps {
   /** Receives each notice a post makes. */
   sink: PersonaEpisodeSink
-  /** Receives each `[slack]` line (the server log): only a sink that throws or rejects. */
+  /** Receives each `[slack]` line (the server log): only a sink that throws or rejects. A throwing log is swallowed. */
   log: (line: string) => void
   /** Clock and timers; `SYSTEM_PERSONA_CONNECTION_CLOCK` by default. */
   clock?: PersonaEpisodesClock
@@ -223,8 +254,8 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
   }
 
   function send(key: string, kind: PersonaEpisodeKind, text: string): void {
-    const failed = (err: unknown) =>
-      deps.log(`[slack] persona-episodes: persona=${key} ${kind} notice failed: ${describeThrownValue(err)}`)
+    const failed = (err: unknown): void =>
+      safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} notice failed: ${describeThrownValue(err)}`)
     try {
       void Promise.resolve(deps.sink(key, text)).catch(failed)
     } catch (err) {
@@ -283,4 +314,146 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
       byKey.clear()
     },
   }
+}
+
+/** Hand `line` to `log`; a throwing log is swallowed, so no caller throws or rejects because of it. */
+function safeLog(log: (line: string) => void, line: string): void {
+  try {
+    log(line)
+  } catch {
+    /* a failing logger must not change what a latch or condition does */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The tmux-unresponsive condition (b.jg5 SRJ-307, SRJ-310)
+// ---------------------------------------------------------------------------
+
+/** End reason: a tmux-touching call for the persona succeeded or answered GONE (SRJ-310 rule 1). */
+export const TMUX_UNRESPONSIVE_END_TMUX_VERB = 'tmux-verb'
+
+/** End reason: a health tick found the persona's row live, not `pending`, connected with its stream (SRJ-310 rule 2). */
+export const TMUX_UNRESPONSIVE_END_TICK = 'tick'
+
+/** End reason: a retry found the persona's row live, not `pending`, connected with its stream (SRJ-310 rule 2). */
+export const TMUX_UNRESPONSIVE_END_RETRY = 'retry'
+
+/** Why a `tmux-unresponsive` condition ended. */
+export type TmuxUnresponsiveEndReason =
+  | typeof TMUX_UNRESPONSIVE_END_TMUX_VERB
+  | typeof TMUX_UNRESPONSIVE_END_TICK
+  | typeof TMUX_UNRESPONSIVE_END_RETRY
+
+/** The text each end reason's ended line carries. */
+export const TMUX_UNRESPONSIVE_END_TEXT: Readonly<Record<TmuxUnresponsiveEndReason, string>> = Object.freeze({
+  [TMUX_UNRESPONSIVE_END_TMUX_VERB]: 'a tmux-touching call succeeded or answered GONE',
+  [TMUX_UNRESPONSIVE_END_TICK]: 'a health tick found its row live and its session connected with its stream',
+  [TMUX_UNRESPONSIVE_END_RETRY]: 'a retry found its row live and its session connected with its stream',
+})
+
+/** What `start` did: started the condition, or continued one already holding. */
+export type TmuxUnresponsiveStartResult = 'started' | 'continued'
+
+/**
+ * What `end` did: nothing (`not-holding`), or ended a holding condition whose
+ * onset had not been posted (`ended`) or had been (`ended-after-onset`).
+ */
+export type TmuxUnresponsiveEndResult = 'not-holding' | 'ended' | 'ended-after-onset'
+
+/**
+ * Where the outage state's wrappers start and end the condition
+ * (`OutageStateDeps.conditionSink`, `src/outage-state.ts`). The condition is
+ * one.
+ */
+export interface TmuxUnresponsiveSink {
+  start(key: string, verb: AdVerb, error: unknown): unknown
+  end(key: string, reason: TmuxUnresponsiveEndReason, reading?: string): unknown
+}
+
+/**
+ * The condition-end hook: called once per end of a holding condition, with
+ * the reading the end brings (a tick's or a retry's live reading, a row state
+ * other than `pending`; `pending` for a successful launch call, `spawn` or
+ * `resume`, whose row its success leaves `pending`), none for any other
+ * tmux-touching success or GONE. Production
+ * binds the retry controller's condition-end entry
+ * (`conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE, reading)`,
+ * b.jg5 SRJ-306).
+ */
+export type TmuxUnresponsiveConditionEndHook = (key: string, reading: string | undefined) => unknown
+
+/** Dependencies of `createTmuxUnresponsiveCondition`. */
+export interface TmuxUnresponsiveConditionDeps {
+  /** The episodes instance whose `tmux-unresponsive` episode is the condition. */
+  episodes: PersonaEpisodes
+  /** Receives the started and ended lines (the server log). A throwing log is swallowed. */
+  log: (line: string) => void
+  /** Called once per end of a holding condition; absent, nothing is called. A throwing hook is swallowed. */
+  conditionEnded?: TmuxUnresponsiveConditionEndHook
+}
+
+/** One server's `tmux-unresponsive` conditions, one per persona key. */
+export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
+  /**
+   * Start persona `key`'s condition for a refusal `error` from `verb` (one
+   * started line; the first refusal's time from the clock), or continue it
+   * while it holds (its first refusal's time kept, no line).
+   */
+  start(key: string, verb: AdVerb, error: unknown): TmuxUnresponsiveStartResult
+  /** Whether persona `key`'s condition holds. */
+  holds(key: string): boolean
+  /** The first refusal's time, in clock milliseconds, while the condition holds; else `undefined`. */
+  firstRefusalAt(key: string): number | undefined
+  /**
+   * End persona `key`'s condition for `reason`: when it holds, end its
+   * episode, log one ended line and call the condition-end hook once with
+   * `reading`, and answer whether the onset had been posted; when it does
+   * not hold, answer `not-holding` and do nothing else.
+   */
+  end(key: string, reason: TmuxUnresponsiveEndReason, reading?: string): TmuxUnresponsiveEndResult
+}
+
+/**
+ * Build one server's `tmux-unresponsive` conditions over `deps.episodes`; see
+ * the module comment. Nothing is read, posted or logged at creation.
+ */
+export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionDeps): TmuxUnresponsiveCondition {
+  const kind = PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE
+  const { episodes } = deps
+
+  return {
+    start(key, verb, error) {
+      if (episodes.isOpen(key, kind)) return 'continued'
+      episodes.begin(key, kind)
+      safeLog(
+        deps.log,
+        `[slack] persona-episodes: persona=${key} ${kind} started — ${verb} failed: ${describeAgentDirectorFailure(error)}`,
+      )
+      return 'started'
+    },
+
+    holds: (key) => episodes.isOpen(key, kind),
+
+    firstRefusalAt: (key) => episodes.view(key, kind)?.startedAt,
+
+    end(key, reason, reading) {
+      if (!episodes.isOpen(key, kind)) return 'not-holding'
+      const onsetPosted = episodes.hasPosted(key, kind)
+      episodes.end(key, kind)
+      safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} ended — ${endText(reason)}`)
+      try {
+        deps.conditionEnded?.(key, reading)
+      } catch {
+        /* a failing hook must not change how the condition ended */
+      }
+      return onsetPosted ? 'ended-after-onset' : 'ended'
+    },
+  }
+}
+
+/** The ended line's text for `reason`; an unknown reason is named as such. Never throws. */
+function endText(reason: unknown): string {
+  return typeof reason === 'string' && Object.hasOwn(TMUX_UNRESPONSIVE_END_TEXT, reason)
+    ? TMUX_UNRESPONSIVE_END_TEXT[reason as TmuxUnresponsiveEndReason]
+    : 'an unnamed reason'
 }

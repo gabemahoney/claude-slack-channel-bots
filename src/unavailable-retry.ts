@@ -41,17 +41,34 @@
  *   a later timer. `stopAll(reason)` stops every persona. `close(reason)`,
  *   the server's shutdown, stops every persona and refuses every later `arm`
  *   (one `not armed` line each), so no timer is pending after it.
- * - `conditionEnded(key, condition)`: the end of `tmux-unresponsive` or the
- *   clearing of `tmux-unavailable` stops the timer, unless its last row read
- *   was `pending` or a `kill-failed` cause is recorded (b.jg5 SRJ-306); then
- *   it is kept with its due time and one kept line says why. While the
- *   persona's retry is running, the end is recorded (`deferred`, no line)
- *   and the same rule is applied once the run's answer has set the last row
- *   read and the mode, before the re-arm; a `stop` answer makes it moot,
+ * - `conditionEnded(key, condition, reading?)`: the end of
+ *   `tmux-unresponsive` or the clearing of `tmux-unavailable` stops the
+ *   timer, unless its last row read was `pending` or a `kill-failed` cause is
+ *   recorded (b.jg5 SRJ-306); then it is kept with its due time and one kept
+ *   line says why. A `reading` the end brings (a health tick or a retry that
+ *   found the row live out of `pending`, connected with its stream, or
+ *   `pending` from a successful launch call) becomes the last row read
+ *   first, so a stale `pending` read does not keep the timer and a launch's
+ *   fresh `pending` row does. While the persona's retry is running, the end and its reading are
+ *   recorded (`deferred`, no line) and the same rule is applied once the
+ *   run's answer has set the last row read and the mode, before the re-arm.
+ *   The row the run's answer carries (a successful launch's `pending` row, a
+ *   row it read) is the later state and wins over the recorded reading, which
+ *   becomes the last row read only when the answer carries no row, or when
+ *   the reading is `pending` (a launch call's end during the run, which the
+ *   run cannot order against its own read; `deferredReadingApplies`). An
+ *   `arm` or `armPendingOnly` that lands later in the same run (a refusal
+ *   that started the condition again) cancels the recorded end and its
+ *   reading, so the timer is not stopped while the condition holds; an end
+ *   that lands after such an arm is recorded and applied as above. A
+ *   `stop` answer makes it moot,
  *   but a pending-only stop that yields to a full-mode cause counts as
  *   `again` here, and when the rule stops the timer the yielded stop's
- *   hand-off runs after that stop. It has no caller yet: the conditions' owners call it when they end. The
- *   exceptions hold against this entry only; every other stop is unaffected.
+ *   hand-off runs after that stop. Its caller is the `tmux-unresponsive`
+ *   condition's end (`createTmuxUnresponsiveCondition` in
+ *   `src/persona-episodes.ts`, bound in `main()`); `tmux-unavailable` has no
+ *   caller yet. The exceptions hold against this entry only; every other
+ *   stop is unaffected.
  * - `view(key)`, `isArmed(key)` and `armedKeys()` are read-only queries;
  *   `whenRunSettled(key)` awaits the persona's in-flight run, with its re-arm
  *   or stop, and a stop's hand-off.
@@ -122,7 +139,10 @@
  * In full mode the restart module's retry entry then reruns the restart
  * path's decision, with the one in-flight predicate as its first step, and
  * its outcome decides: a persona already connected with its stream, or
- * reconnected, has nothing left to recover (stop); capped, not up, a declined
+ * reconnected, has nothing left to recover (stop; a persona already
+ * connected with its stream, whose row read `live`, also ends its
+ * `tmux-unresponsive` condition through the optional end hook,
+ * `FullModeRetryDeps.endTmuxUnresponsive`, b.jg5 SRJ-310); capped, not up, a declined
  * launch or shutting down stop too; a launch in flight, a refused launch, a
  * counted launch failure below the cap, a deferred reconnect, a row found
  * `pending` (by the liveness probe, whatever the session's connection shows,
@@ -148,7 +168,9 @@
  * persona's row (`readRow`, one `status` call) inside a recovery attempt for
  * the persona, and the state decides:
  * still `pending`, a refusal (`row-pending`) with no other call; live out of
- * `pending`, a stop with no other call; `ended`, `missing` or no row, a stop
+ * `pending`, a stop with no other call (and, when the optional connection
+ * and stream probes both answer true, the end hook ends the persona's
+ * `tmux-unresponsive` condition with the row's state as its reading); `ended`, `missing` or no row, a stop
  * that hands the persona to one run of the restart module's retry entry once
  * the timer is stopped, so a refused launch in that run arms a fresh timer.
  * Either stop yields to a cause `arm` recorded during the retry (another
@@ -185,11 +207,13 @@ import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNUSABLE_NAME,
+  AD_READ_VERBS,
   classifyAdError,
   hasAdErrorName,
 } from './ad-error-class.ts'
 import { ERR_SPAWN_NOT_FOUND_NAME, ERR_TMUX_KILL_FAILED_NAME } from './agent-director-errors.ts'
 import { doublingBackoffDelay } from './backoff.ts'
+import { AGENT_DIRECTOR_LIVE_STATES, LIVENESS_LIVE } from './liveness-reading.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 import type { RestartRetryOutcome } from './restart.ts'
@@ -545,14 +569,28 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
    * `deferred`: once the run's `again` answer (or a failed run) has set the
    * last row read and the mode, the same rule is applied before the re-arm,
    * with its kept or stopped line; a `stop` answer makes it moot (only the
-   * answer's stopped line), as does a stop during the run. A pending-only
+   * answer's stopped line), as does a stop during the run. An `arm` or
+   * `armPendingOnly` later in the same run cancels the recorded end and its
+   * reading (the condition started again), so nothing is applied for it; an
+   * end after that arm is recorded again. A pending-only
    * stop that yields to a full-mode cause armed during the run counts as
    * `again` here: the rule is applied, and when it stops the timer the
    * yielded stop's hand-off runs after that stop. Answers what it
    * did; `not-armed`, with no line, when no timer is armed. Every other stop
    * is unaffected by these exceptions.
+   *
+   * `reading` is the row read the end brings, when it came from a health tick
+   * or a retry that found the row live out of `pending` (a row state, or the
+   * `live` reading), or from a successful launch call (`spawn` or `resume`,
+   * whose row it leaves `pending`, so the `pending` exception keeps the
+   * timer; b.jg5 SRJ-305): it becomes the last row read before the rule is
+   * applied, now. While a run is in flight it is applied after the run's
+   * answer has set the last row read, and only when that answer carries no
+   * row of its own or the reading is `pending` (the run's own row is the
+   * later state otherwise). An end with no reading (any other tmux-touching success, or GONE)
+   * leaves the last row read as it is.
    */
-  conditionEnded(key: string, condition: UnavailableRetryCondition): UnavailableRetryConditionEndResult
+  conditionEnded(key: string, condition: UnavailableRetryCondition, reading?: string): UnavailableRetryConditionEndResult
   /**
    * Stop persona `key`'s timer: clear the pending timer and forget the
    * persona, logging one stopped line with `reason` (CSCB-written text).
@@ -606,8 +644,10 @@ interface RetryEntry {
   fullArmedInRun: boolean
   /** True when `armPendingOnly` landed during the current run; cleared once the run's answer is applied. */
   pendingArmedInRun: boolean
-  /** A condition whose end `conditionEnded` was told of during the current run; applied, then cleared, with the run's answer. */
+  /** A condition whose end `conditionEnded` was told of during the current run; applied, then cleared, with the run's answer; cleared by an arm (either mode) later in the run. */
   endedInRun: UnavailableRetryCondition | undefined
+  /** The reading an end told of during the current run brought, if any; applied with the end as `deferredReadingApplies` decides. */
+  endedReadingInRun: string | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -726,6 +766,8 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     // stops the timer).
     let heldHandOff: (() => Promise<unknown>) | undefined
     let reason: string
+    /** The row the run's own answer carries (one it read or left), if any; see `deferredReadingApplies`. */
+    let answerRow: string | undefined
     if (outcome?.kind === 'stop') {
       const handOff = handOffOf(outcome)
       if (!mayOverrideStop(entry, mode, outcome)) {
@@ -735,7 +777,8 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       }
       heldHandOff = handOff
       entry.mode = UNAVAILABLE_RETRY_MODE_FULL
-      entry.lastRow = rowOf(outcome) ?? (entry.pendingArmedInRun ? UNAVAILABLE_RETRY_ROW_PENDING : undefined)
+      answerRow = rowOf(outcome)
+      entry.lastRow = answerRow ?? (entry.pendingArmedInRun ? UNAVAILABLE_RETRY_ROW_PENDING : undefined)
       reason = entry.runCause ?? NO_CAUSE_GIVEN
     } else {
       const answered = outcome?.kind === 'again' ? againReason(outcome) : undefined
@@ -743,6 +786,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       reason = answered ?? failure ?? unexpected ?? entry.runCause ?? NO_CAUSE_GIVEN
       if (outcome?.kind === 'again') {
         const row = rowOf(outcome)
+        answerRow = row
         if (row !== undefined) entry.lastRow = row
         else if (entry.pendingArmedInRun) entry.lastRow = UNAVAILABLE_RETRY_ROW_PENDING
         else if (!keepsLastRow(outcome)) entry.lastRow = undefined
@@ -750,10 +794,15 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       }
     }
     const ended = entry.endedInRun
+    const endedReading = entry.endedReadingInRun
     entry.runCause = undefined
     entry.fullArmedInRun = false
     entry.pendingArmedInRun = false
     entry.endedInRun = undefined
+    entry.endedReadingInRun = undefined
+    if (ended !== undefined && endedReading !== undefined && deferredReadingApplies(answerRow, endedReading)) {
+      entry.lastRow = endedReading
+    }
     if (ended !== undefined && !applyConditionEnd(entry, ended)) {
       if (heldHandOff !== undefined) await runHandOff(entry.key, heldHandOff)
       return
@@ -764,6 +813,27 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     const ran = mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY ? ' (pending-only)' : ''
     const next = entry.mode !== mode ? ` in ${entry.mode} mode` : ''
     log(`[slack] unavailable-retry: persona=${entry.key} retry ${retry}${ran}: ${reason} — re-armed${next}, next retry in ${waitMs / 1000} s`)
+  }
+
+  /**
+   * Whether the reading a condition end deferred to a run brought becomes
+   * the last row read once the run's answer is applied (b.jg5 SRJ-305,
+   * SRJ-306). The run's answer is applied at the run's end, so the row it
+   * carries (`answerRow`: an `again` answer's `row`, such as a successful
+   * launch's `pending` row, or a yielded pending-only stop's row read) wins
+   * over the deferred reading, and the reading applies only when the answer
+   * carries no row of its own (a failed retry, the liveness-unknown `again`,
+   * an `again` without `row`). One exception: a deferred `pending` reading
+   * (only a successful launch call's end brings one) wins over a row the
+   * answer carries, since the run cannot order its own row read against a
+   * launch that ended the condition meanwhile. Keeping the timer on a
+   * `pending` row costs one more retry, which reads the row again and stops
+   * when it is live; dropping it would lose SRJ-305's pending-only watch on
+   * that row, which nothing restores. An end outside a run is not affected:
+   * its reading replaces the last row read at once (`conditionEnded`).
+   */
+  function deferredReadingApplies(answerRow: string | undefined, endedReading: string): boolean {
+    return answerRow === undefined || endedReading === UNAVAILABLE_RETRY_ROW_PENDING
   }
 
   /**
@@ -827,7 +897,8 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
   /**
    * Arm persona `key` with `cause` in `mode` (see `arm` and `armPendingOnly`).
    * An armed entry keeps its due time; a full-mode arm promotes a
-   * pending-only entry. Answers true when the persona has a timer after the
+   * pending-only entry. During a run, an arm cancels a condition end deferred
+   * to that run (`conditionEnded`). Answers true when the persona has a timer after the
    * call. Never throws.
    */
   function armIn(key: string, cause: UnavailableRetryCause, mode: UnavailableRetryMode): boolean {
@@ -842,6 +913,12 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
         existing.runCause = description
         if (mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) existing.pendingArmedInRun = true
         else existing.fullArmedInRun = true
+        // An arm after a condition end deferred to this run is the later
+        // state (a refusal that started the condition again): it cancels that
+        // end, so the timer is not stopped while the condition holds. An end
+        // that lands after this arm is recorded, and applied, as usual.
+        existing.endedInRun = undefined
+        existing.endedReadingInRun = undefined
       }
       if (mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) {
         existing.lastRow = UNAVAILABLE_RETRY_ROW_PENDING
@@ -864,6 +941,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       fullArmedInRun: false,
       pendingArmedInRun: false,
       endedInRun: undefined,
+      endedReadingInRun: undefined,
     }
     entries.set(key, entry)
     const description = record(entry, cause)
@@ -889,13 +967,16 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       armIn(key, PENDING_ROW_CAUSE, UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
     },
 
-    conditionEnded(key, condition) {
+    conditionEnded(key, condition, reading) {
       const entry = entries.get(key)
       if (entry === undefined) return 'not-armed'
+      const row = reading === undefined ? undefined : rowOf({ row: reading })
       if (entry.timer === undefined) {
         entry.endedInRun = condition
+        if (row !== undefined) entry.endedReadingInRun = row
         return 'deferred'
       }
+      if (row !== undefined) entry.lastRow = row
       return applyConditionEnd(entry, condition) ? 'kept' : 'stopped'
     },
 
@@ -972,6 +1053,29 @@ export interface FullModeRetryDeps {
    * refusal; a throw counts as in flight.
    */
   isInFlight: (key: string) => boolean
+  /**
+   * Whether the persona's session is connected (production: its registry
+   * entry with `connected === true`). Read only by a pending-only retry that
+   * read the row live out of `pending`, to decide whether to call
+   * `endTmuxUnresponsive`. Absent: not connected (nothing is ended there).
+   */
+  isSessionConnected?: (key: string) => boolean
+  /**
+   * Whether the persona's session has its message stream (production:
+   * `hasSessionStream`). Read as `isSessionConnected` is. Absent: no stream.
+   */
+  hasSessionStream?: (key: string) => boolean
+  /**
+   * End the persona's `tmux-unresponsive` condition (b.jg5 SRJ-310 rule 2,
+   * retry half), with the live reading the retry found: called when a
+   * full-mode retry finds the persona already connected with its stream on a
+   * `live` reading (`LIVENESS_LIVE`), and when a pending-only retry reads the
+   * row live out of `pending` (its state) with the session connected with its
+   * stream. Production binds the condition's end (reason `retry`). Absent:
+   * nothing is called. A throw is swallowed and changes nothing about the
+   * retry's answer.
+   */
+  endTmuxUnresponsive?: (key: string, reading: string) => void
 }
 
 /**
@@ -1000,9 +1104,39 @@ export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableR
         return { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, row: UNAVAILABLE_RETRY_ROW_PENDING }
       }
       const row = await runInAttempt(key, 'recovery', () => deps.readRow(key))
+      if (isLiveOutOfPending(row.state) && probe(key, deps.isSessionConnected) && probe(key, deps.hasSessionStream)) {
+        endCondition(key, row.state, deps.endTmuxUnresponsive)
+      }
       return pendingOnlyAnswer(row.state, () => deps.retry(key, cwd, deps.isInFlight))
     }
-    return answerFor(await deps.retry(key, cwd, deps.isInFlight))
+    const outcome = await deps.retry(key, cwd, deps.isInFlight)
+    // Since b.jg5 E9, `already-connected` is answered only for a `live`
+    // reading (never `pending`) whose session is connected with its stream.
+    if (outcome === 'already-connected') endCondition(key, LIVENESS_LIVE, deps.endTmuxUnresponsive)
+    return answerFor(outcome)
+  }
+}
+
+/** True when `state` is a live row state other than `pending`. */
+function isLiveOutOfPending(state: string): boolean {
+  return state !== UNAVAILABLE_RETRY_ROW_PENDING && AGENT_DIRECTOR_LIVE_STATES.has(state)
+}
+
+/** An optional probe's answer: exactly true, else false (absent or throwing included). Never throws. */
+function probe(key: string, check: ((key: string) => boolean) | undefined): boolean {
+  try {
+    return check?.(key) === true
+  } catch {
+    return false
+  }
+}
+
+/** Call the optional end hook with the retry's live reading; a throw is swallowed. */
+function endCondition(key: string, reading: string, end: ((key: string, reading: string) => void) | undefined): void {
+  try {
+    end?.(key, reading)
+  } catch {
+    /* ending the condition never changes the retry's answer */
   }
 }
 
@@ -1203,9 +1337,6 @@ function describeCause(cause: UnavailableRetryCause): string {
 // The arming predicate (b.jg5 SRJ-301)
 // ---------------------------------------------------------------------------
 
-/** The verbs whose error inside an attempt is a read error (b.jg5 SRJ-301, SRJ-105). */
-const READ_VERBS: ReadonlySet<string> = new Set(['status', 'get', 'list'])
-
 /**
  * What arms persona P's retry timer when `value` is thrown by an
  * agent-director call made with `verb` inside a launch or recovery attempt
@@ -1220,7 +1351,8 @@ const READ_VERBS: ReadonlySet<string> = new Set(['status', 'get', 'list'])
  *
  * The cause carries `value`, which reaches a line only through
  * `describeThrownValue`. `verb` is agent-director's verb name (`status`,
- * `get`, `list`, `kill`, `spawn`, `read-pane` …); an unknown verb is never a
+ * `get`, `list`, `kill`, `spawn`, `read-pane` …); the read verbs are
+ * `AD_READ_VERBS` (`src/ad-error-class.ts`), and an unknown verb is never a
  * read. Never throws.
  */
 export function unavailableRetryCauseFor(value: unknown, verb: string | undefined): UnavailableRetryCause | undefined {
@@ -1232,7 +1364,7 @@ export function unavailableRetryCauseFor(value: unknown, verb: string | undefine
         : UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE
       return { kind, error: value }
     }
-    if (verb === undefined || !READ_VERBS.has(verb)) return undefined
+    if (verb === undefined || !AD_READ_VERBS.has(verb)) return undefined
     if (errorClass === AD_ERROR_CLASS_CONFIG || errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) return undefined
     if (hasAdErrorName(value, ERR_SPAWN_NOT_FOUND_NAME)) return undefined
     return { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR, error: value }

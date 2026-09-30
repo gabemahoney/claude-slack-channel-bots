@@ -9,9 +9,17 @@
  * `forget` drops only its key's episodes and `forgetAll` every persona's,
  * posting nothing. An episode's start time comes from the injected clock. A
  * sink that throws or rejects is logged once, redacted, and still counts as
- * posted. b.f2b's not-connected latch (`notConnectedNoticeRaised` in
+ * posted. A log that throws is swallowed: no post throws and no rejection
+ * escapes. b.f2b's not-connected latch (`notConnectedNoticeRaised` in
  * `src/session-manager.ts`) is separate: neither latch raises, reads or ends
  * the other.
+ *
+ * The `tmux-unresponsive` condition's own rules, direct over
+ * `createTmuxUnresponsiveCondition`: `continued` and `ended-after-onset`, the
+ * ended line's text per reason (an unknown reason pinned once), a throwing
+ * log or condition-end hook swallowed, and `forget`/`forgetAll` dropping a
+ * holding condition without calling the hook. Its starts and ends through the
+ * outage state are in `tests/tmux-unresponsive.test.ts`.
  *
  * Pure module under test: built over `createFakeClock`, a recording notice
  * sink and a line capture. Kinds come from `PERSONA_EPISODE_KINDS`, so a
@@ -21,15 +29,25 @@
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
+import { describeAgentDirectorFailure } from '../src/ad-error-class.ts'
+import { LIVENESS_LIVE } from '../src/liveness-reading.ts'
 import {
   PERSONA_EPISODE_DEFAULT_MARK,
   PERSONA_EPISODE_KINDS,
   PERSONA_EPISODE_KIND_CONFLICT,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
+  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
+  TMUX_UNRESPONSIVE_END_RETRY,
+  TMUX_UNRESPONSIVE_END_TEXT,
+  TMUX_UNRESPONSIVE_END_TICK,
+  TMUX_UNRESPONSIVE_END_TMUX_VERB,
   createPersonaEpisodes,
+  createTmuxUnresponsiveCondition,
   type PersonaEpisodeKind,
   type PersonaEpisodeSink,
   type PersonaEpisodes,
+  type TmuxUnresponsiveCondition,
+  type TmuxUnresponsiveEndReason,
 } from '../src/persona-episodes.ts'
 import {
   _resetNotConnectedEpisodes,
@@ -38,6 +56,7 @@ import {
   setSessionNotifier,
   type NotConnectedNotice,
 } from '../src/session-manager.ts'
+import { errTmuxUnresponsive } from './test-helpers/agent-director-stub.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 
@@ -374,6 +393,166 @@ describe('a failing sink', () => {
     expect(episodes.post('K', kind, textOf(kind, 2))).toBe(false)
     await clock.flush()
     expect(lines).toHaveLength(1)
+  })
+
+  test.each([
+    ['throws', (() => { throw refusal() }) as PersonaEpisodeSink],
+    ['rejects', (async () => { throw refusal() }) as PersonaEpisodeSink],
+  ])('a sink that %s with a log that throws: post does not throw, no rejection escapes, and the text counts as posted', async (_how, sink) => {
+    const kind = PERSONA_EPISODE_KINDS[0]
+    const rejections: unknown[] = []
+    const onRejection = (reason: unknown) => void rejections.push(reason)
+    process.on('unhandledRejection', onRejection)
+    try {
+      episodes = createPersonaEpisodes({ sink, log: throwingLog, clock })
+      episodes.begin('K', kind)
+
+      expect(episodes.post('K', kind, textOf(kind, 1))).toBe(true)
+      await clock.flush()
+      // One macrotask turn: a rejection left unhandled is reported here.
+      await new Promise((done) => setImmediate(done))
+
+      // Named by position only: an escaped reason could hold the sentinel.
+      expect(rejections.map((_, i) => `rejection ${i}`)).toEqual([])
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toStartWith(`[slack] persona-episodes: persona=K ${kind} notice failed: `)
+      expect(episodes.hasPosted('K', kind)).toBe(true)
+    } finally {
+      process.off('unhandledRejection', onRejection)
+    }
+  })
+})
+
+/** A log that captures the line, then throws. */
+function throwingLog(line: string): void {
+  lines.push(line)
+  throw new Error('log refused')
+}
+
+// ---------------------------------------------------------------------------
+// The tmux-unresponsive condition's own rules (b.jg5 SRJ-307, SRJ-310)
+// ---------------------------------------------------------------------------
+
+describe('the tmux-unresponsive condition\'s own rules', () => {
+  const KIND = PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE
+  const VERB = 'read-pane'
+  let hookCalls: Array<{ key: string; reading: string | undefined }>
+
+  beforeEach(() => {
+    hookCalls = []
+  })
+
+  const recordHook = (key: string, reading: string | undefined): void => {
+    hookCalls.push({ key, reading })
+  }
+
+  /** A condition over `episodes`, logging to the line capture and recording each hook call unless others are given. */
+  function buildCondition(
+    opts: { log?: (line: string) => void; conditionEnded?: (key: string, reading: string | undefined) => unknown } = {},
+  ): TmuxUnresponsiveCondition {
+    return createTmuxUnresponsiveCondition({
+      episodes,
+      log: opts.log ?? ((line) => lines.push(line)),
+      conditionEnded: opts.conditionEnded ?? recordHook,
+    })
+  }
+
+  function startedLine(key: string, err: unknown): string {
+    return `[slack] persona-episodes: persona=${key} ${KIND} started — ${VERB} failed: ${describeAgentDirectorFailure(err)}`
+  }
+
+  function endedLine(key: string, text: string): string {
+    return `[slack] persona-episodes: persona=${key} ${KIND} ended — ${text}`
+  }
+
+  test('start answers started, then continued with the first refusal\'s time kept; end answers ended-after-onset once the onset was posted', async () => {
+    const condition = buildCondition()
+    const err = errTmuxUnresponsive(VERB)
+
+    expect(condition.start('K', VERB, err)).toBe('started')
+    await clock.advance(300)
+    expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('continued')
+    expect(condition.firstRefusalAt('K')).toBe(START_MS)
+    expect(lines).toEqual([startedLine('K', err)])
+
+    expect(episodes.post('K', KIND, textOf(KIND, 1))).toBe(true)
+    expect(condition.end('K', TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)).toBe('ended-after-onset')
+
+    expect(condition.holds('K')).toBe(false)
+    expect(hookCalls).toEqual([{ key: 'K', reading: LIVENESS_LIVE }])
+    expect(condition.end('K', TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)).toBe('not-holding')
+    expect(hookCalls).toHaveLength(1)
+  })
+
+  test('a log that throws breaks neither start nor end: both lines are attempted, the results stand and the hook is called once', () => {
+    const condition = buildCondition({ log: throwingLog })
+    const err = errTmuxUnresponsive(VERB)
+
+    expect(condition.start('K', VERB, err)).toBe('started')
+    expect(condition.holds('K')).toBe(true)
+    expect(condition.start('K', VERB, err)).toBe('continued')
+    expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended')
+
+    expect(condition.holds('K')).toBe(false)
+    expect(lines).toEqual([startedLine('K', err), endedLine('K', TMUX_UNRESPONSIVE_END_TEXT[TMUX_UNRESPONSIVE_END_TMUX_VERB])])
+    expect(hookCalls).toEqual([{ key: 'K', reading: undefined }])
+  })
+
+  test.each<[string, (e: PersonaEpisodes) => void, readonly string[]]>([
+    ['forget(key)', (e) => e.forget('K'), ['K']],
+    ['forgetAll()', (e) => e.forgetAll(), ['K', 'Q']],
+  ])('%s drops a holding condition without calling the hook or logging an ended line; later ends answer not-holding', (_what, drop, dropped) => {
+    const condition = buildCondition()
+    for (const key of ['K', 'Q']) condition.start(key, VERB, errTmuxUnresponsive(VERB))
+    const startedLines = [...lines]
+
+    drop(episodes)
+
+    for (const key of ['K', 'Q']) {
+      expect({ key, holds: condition.holds(key) }).toEqual({ key, holds: !dropped.includes(key) })
+    }
+    expect(hookCalls).toEqual([])
+    expect(lines).toEqual(startedLines)
+    for (const key of dropped) {
+      expect(condition.firstRefusalAt(key)).toBeUndefined()
+      expect(condition.end(key, TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)).toBe('not-holding')
+    }
+    expect(hookCalls).toEqual([])
+  })
+
+  test('a condition-end hook that throws is swallowed: end still answers, the condition is ended and its line logged', () => {
+    let calls = 0
+    const condition = buildCondition({
+      conditionEnded: () => {
+        calls++
+        throw new Error('hook refused')
+      },
+    })
+    condition.start('K', VERB, errTmuxUnresponsive(VERB))
+
+    expect(condition.end('K', TMUX_UNRESPONSIVE_END_RETRY, LIVENESS_LIVE)).toBe('ended')
+
+    expect(calls).toBe(1)
+    expect(condition.holds('K')).toBe(false)
+    expect(lines.at(-1)).toBe(endedLine('K', TMUX_UNRESPONSIVE_END_TEXT[TMUX_UNRESPONSIVE_END_RETRY]))
+    expect(condition.end('K', TMUX_UNRESPONSIVE_END_RETRY, LIVENESS_LIVE)).toBe('not-holding')
+    expect(calls).toBe(1)
+  })
+
+  test.each<[string, TmuxUnresponsiveEndReason, string]>([
+    ...([TMUX_UNRESPONSIVE_END_TMUX_VERB, TMUX_UNRESPONSIVE_END_TICK, TMUX_UNRESPONSIVE_END_RETRY] as const).map(
+      (reason) => [reason, reason, TMUX_UNRESPONSIVE_END_TEXT[reason]] as [string, TmuxUnresponsiveEndReason, string],
+    ),
+    // The one pinned literal: the source's text for a reason it does not name.
+    ['an unknown reason', 'not-a-reason' as TmuxUnresponsiveEndReason, 'an unnamed reason'],
+  ])('ending for %s logs its text on the ended line', (_what, reason, text) => {
+    const condition = buildCondition()
+    condition.start('K', VERB, errTmuxUnresponsive(VERB))
+
+    expect(condition.end('K', reason)).toBe('ended')
+
+    expect(lines.at(-1)).toBe(endedLine('K', text))
+    expect(hookCalls).toEqual([{ key: 'K', reading: undefined }])
   })
 })
 

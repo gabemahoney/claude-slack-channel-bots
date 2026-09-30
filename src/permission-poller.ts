@@ -77,7 +77,6 @@
  */
 
 import {
-  AgentDirectorError,
   ErrSpawnNotFound,
   ErrSystemInstallDisappeared,
   ErrTmuxNotAvailable,
@@ -96,13 +95,12 @@ import type {
   GetPermissionParams,
   GetPermissionResult,
 } from './agent-director-client.ts'
+import { describeAgentDirectorFailure } from './ad-error-class.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { encodePermissionActionId } from './permission-action-id.ts'
 import {
-  describeLogMessage,
   describeSlackCallFailure,
   describeThrownValue,
-  isSafeIdentifier,
 } from './persona-connection-errors.ts'
 import {
   classifySlackError,
@@ -524,20 +522,11 @@ function logViaDeps(deps: PollerDeps, ...args: unknown[]): void {
 }
 
 /**
- * The tail of a failed agent-director call's log line: a typed error's
- * `errName` when it passes `isSafeIdentifier`, then its `errDescription` as
- * `message="…"` (`describeLogMessage`: through `redactSlackLogText`, on one
- * line, capped at `MAX_LOGGED_MESSAGE_LENGTH` characters) when it has one;
- * else `describeThrownValue(err)`, which renders the message the same way.
- * Never the raw `errName` or error object.
+ * The tail of a failed agent-director call's log line
+ * (`describeAgentDirectorFailure`, declared in `src/ad-error-class.ts` beside
+ * the classifier and re-exported here for this module's callers).
  */
-export function describeAgentDirectorFailure(err: unknown): string {
-  if (err instanceof AgentDirectorError && isSafeIdentifier(err.errName)) {
-    const message = describeLogMessage(err.errDescription)
-    return message === '' ? err.errName : `${err.errName} ${message}`
-  }
-  return describeThrownValue(err)
-}
+export { describeAgentDirectorFailure }
 
 /** The injected destination resolver, else the module-level default. */
 function destinationsFor(deps: PollerDeps): PersonaDestinations {
@@ -837,7 +826,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
 
       let got: GetResultWithPermissionRequests
       try {
-        got = (await withOutageDetection(persona.key, undefined, () =>
+        got = (await withOutageDetection(persona.key, undefined, 'get', () =>
           client.get({ claude_instance_id: row.claude_instance_id })
         )) as unknown as GetResultWithPermissionRequests
       } catch (err) {
@@ -912,7 +901,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
     for (const entry of closedEntries) {
       let info: GetPermissionResult
       try {
-        info = await withOutageDetection(entry.personaKey, undefined, () =>
+        info = await withOutageDetection(entry.personaKey, undefined, 'get-permission', () =>
           getPermission(client, { request_token: entry.requestToken })
         )
       } catch (err) {

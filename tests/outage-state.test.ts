@@ -1,11 +1,14 @@
 /**
  * outage-state.test.ts — SRD §Test plan cases 1-24, plus the
  * tests/getclient-allowlist.txt static audit (case 22) and the
- * resetAllToHealthy call-site audit (case 23 Part A), and the wrappers'
- * report to the UNAVAILABLE retry timer's trigger sink (b.jg5 SRJ-301).
+ * resetAllToHealthy call-site audit (case 23 Part A), the wrappers'
+ * report to the UNAVAILABLE retry timer's trigger sink (b.jg5 SRJ-301), and
+ * the declared verb's start and end of the persona's `tmux-unresponsive`
+ * condition (b.jg5 SRJ-307, SRJ-310).
  *
- * The trigger-sink cases install a recording fake sink (no timer) and run
- * the wrapped call inside a real attempt context (`runInAttempt`); every
+ * Every wrapped call declares its verb. The trigger-sink and condition-sink
+ * cases install recording fake sinks (no timer, no episodes) and run the
+ * wrapped call inside a real attempt context (`runInAttempt`); every
  * agent-director error comes from the stub's builders.
  *
  * SPDX-License-Identifier: MIT
@@ -39,15 +42,34 @@ import {
 } from '../src/outage-state.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
+  AD_CALL_KILL_ROW_NOT_READ_LIVE,
+  AD_CALL_KILL_ROW_READ_LIVE,
+  AD_VERB_KILL,
+  CSCB_UNKNOWN_ERROR_NAME,
+  TMUX_TOUCHING_VERBS,
+  adCallVerb,
+  type AdCall,
+  type AdVerb,
+} from '../src/ad-error-class.ts'
+import {
+  TMUX_UNRESPONSIVE_END_TMUX_VERB,
+  type TmuxUnresponsiveEndReason,
+  type TmuxUnresponsiveSink,
+} from '../src/persona-episodes.ts'
+import {
   STUB_INSTANCE_ID,
   errCallTimeout,
   errConfigMalformed,
+  errGeneric,
   errInstanceIdCollision,
   errSpawnNotFound,
   errSystemInstallDisappeared,
+  errTmuxCaptureFailed,
   errTmuxKillFailed,
   errTmuxNotAvailable,
+  errTmuxSendKeys,
   errTmuxUnresponsive,
+  errUnknownErrorName,
   errUnusableName,
   makeStubCallLog,
   makeStubClient,
@@ -87,6 +109,12 @@ type Emission = { key: string; text: string }
 const P1 = 'persona_one'
 const P2 = 'persona_two'
 const P9 = 'persona_nine'
+
+/**
+ * A call no site can declare (the type forbids it): it reaches the reporting
+ * point only through this cast, as an undeclared verb would.
+ */
+const UNDECLARED_CALL = undefined as unknown as AdCall
 
 /**
  * makeHarness — builds a fresh per-test emissions array + `notify` capture.
@@ -350,7 +378,7 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     const { emissions } = makeHarness()
     const err = new ErrSystemInstallDisappeared('spawn', '/bin/ad')
     await expect(
-      withOutageDetection(P1, '/cwd', async (_client) => { throw err })
+      withOutageDetection(P1, '/cwd', 'spawn', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrSystemInstallDisappeared)
     expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
     expect(emissions).toHaveLength(1)
@@ -361,7 +389,7 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     const { emissions } = makeHarness()
     const err = new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found')
     await expect(
-      withOutageDetection(P1, '/foo', async (_client) => { throw err })
+      withOutageDetection(P1, '/foo', 'spawn', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrCwdNotFound)
     expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
     expect(emissions).toHaveLength(1)
@@ -372,7 +400,7 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     const { emissions } = makeHarness()
     const err = new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'not found')
     await expect(
-      withOutageDetection(P1, '/cwd', async (_client) => { throw err })
+      withOutageDetection(P1, '/cwd', 'get', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrSpawnNotFound)
     expect(getOutageFlags(P1).size).toBe(0)
     expect(emissions).toHaveLength(0)
@@ -383,7 +411,7 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
     setOutageFlag(P1, 'tmux-unavailable')
     const before = emissions.length
-    await withOutageDetection(P1, '/cwd', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', 'status', async (_client) => 'ok')
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
     expect(newEmissions[0].text).toMatch(/All clear/)
@@ -398,7 +426,7 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     setOutageFlag(P1, 'tmux-unavailable')
     setOutageFlag(P1, 'cwd-unreachable', '/foo')
     const before = emissions.length
-    await withOutageDetection(P1, '/cwd', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', 'status', async (_client) => 'ok')
     expect(emissions.length).toBe(before) // silent — cwd still set
     expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
     expect(getOutageFlags(P1).has('ad-unreachable')).toBe(false)
@@ -409,7 +437,7 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     const { emissions } = makeHarness()
     setOutageFlag(P1, 'cwd-unreachable', '/foo')
     const before = emissions.length
-    await withOutageDetection(P1, '/cwd', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', 'status', async (_client) => 'ok')
     expect(emissions.length).toBe(before) // silent (only cwd, so clear of ad+tmux is a no-op)
     expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
   })
@@ -420,7 +448,7 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     setOutageFlag(P1, 'tmux-unavailable')
     setOutageFlag(P1, 'cwd-unreachable', '/foo')
     const before = emissions.length
-    await withSpawnDetection(P1, '/foo', async (_client) => 'ok')
+    await withSpawnDetection(P1, '/foo', 'spawn', async (_client) => 'ok')
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
     expect(newEmissions[0].text).toMatch(/All clear/)
@@ -437,7 +465,7 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     const before = emissions.length
     const err = new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found')
     await expect(
-      withSpawnDetection(P1, '/foo', async (_client) => { throw err })
+      withSpawnDetection(P1, '/foo', 'spawn', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrCwdNotFound)
     expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
     expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
@@ -461,19 +489,19 @@ describe('cases 20-21: flap cycles and never-set no-op', () => {
 
     // Throw 1 → onset
     await expect(
-      withOutageDetection(P1, '/cwd', async (_client) => { throw err })
+      withOutageDetection(P1, '/cwd', 'spawn', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrSystemInstallDisappeared)
 
     // Succeed 1 → all-clear
-    await withOutageDetection(P1, '/cwd', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', 'spawn', async (_client) => 'ok')
 
     // Throw 2 → onset
     await expect(
-      withOutageDetection(P1, '/cwd', async (_client) => { throw err })
+      withOutageDetection(P1, '/cwd', 'spawn', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrSystemInstallDisappeared)
 
     // Succeed 2 → all-clear
-    await withOutageDetection(P1, '/cwd', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', 'spawn', async (_client) => 'ok')
 
     expect(emissions).toHaveLength(4)
     expect(emissions[0].text).toMatch(/agent-director unreachable/)  // onset 1
@@ -754,14 +782,19 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
     return { emissions, arms, calls }
   }
 
-  /** The verbs a wrapped call makes here, each on the default fixture's instance. */
+  /**
+   * The verbs a wrapped call makes here, each on the default fixture's
+   * instance, and the call each site declares (the kill is a teardown's, of a
+   * row it did not read live). The declared call, not the client method `fn`
+   * runs, is where the attempt record's verb comes from.
+   */
   const VERBS = {
-    status: { wrap: withOutageDetection, stubError: 'statusError', call: (c: Client) => c.status({ claude_instance_id: STUB_INSTANCE_ID }) },
-    get: { wrap: withOutageDetection, stubError: 'getError', call: (c: Client) => c.get({ claude_instance_id: STUB_INSTANCE_ID }) },
-    list: { wrap: withOutageDetection, stubError: 'listError', call: (c: Client) => c.list({}) },
-    kill: { wrap: withOutageDetection, stubError: 'killError', call: (c: Client) => c.kill({ claude_instance_id: STUB_INSTANCE_ID }) },
-    'read-pane': { wrap: withOutageDetection, stubError: 'readPaneError', call: (c: Client) => c.readPane({ claude_instance_id: STUB_INSTANCE_ID }) },
-    resume: { wrap: withSpawnDetection, stubError: 'resumeError', call: (c: Client) => c.resume({ claude_instance_id: STUB_INSTANCE_ID }) },
+    status: { wrap: withOutageDetection, declared: 'status', stubError: 'statusError', call: (c: Client) => c.status({ claude_instance_id: STUB_INSTANCE_ID }) },
+    get: { wrap: withOutageDetection, declared: 'get', stubError: 'getError', call: (c: Client) => c.get({ claude_instance_id: STUB_INSTANCE_ID }) },
+    list: { wrap: withOutageDetection, declared: 'list', stubError: 'listError', call: (c: Client) => c.list({}) },
+    kill: { wrap: withOutageDetection, declared: AD_CALL_KILL_ROW_NOT_READ_LIVE, stubError: 'killError', call: (c: Client) => c.kill({ claude_instance_id: STUB_INSTANCE_ID }) },
+    'read-pane': { wrap: withOutageDetection, declared: 'read-pane', stubError: 'readPaneError', call: (c: Client) => c.readPane({ claude_instance_id: STUB_INSTANCE_ID }) },
+    resume: { wrap: withSpawnDetection, declared: 'resume', stubError: 'resumeError', call: (c: Client) => c.resume({ claude_instance_id: STUB_INSTANCE_ID }) },
   } as const
   type Verb = keyof typeof VERBS
 
@@ -772,9 +805,9 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
 
   /** Run `verb` for `key` through its wrapper and answer what it rejected with (it must reject). */
   async function rejectionOf(key: string, verb: Verb): Promise<unknown> {
-    const { wrap, call } = VERBS[verb]
+    const { wrap, declared, call } = VERBS[verb]
     try {
-      await wrap(key, '/persona/workdir', call)
+      await wrap(key, '/persona/workdir', declared, call)
     } catch (err) {
       return err
     }
@@ -953,58 +986,23 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
     assertNoLeak({ emissions, lastError, kinds: arms.map((a) => a.cause.kind), flags: [...getOutageFlags(P1)] })
   })
 
-  describe('the client handed to fn', () => {
-    /**
-     * A client whose method reads a private field, so it throws when run
-     * with `this` other than the instance, and answers the `this` it ran on.
-     */
-    class PrivateFieldClient {
-      readonly #calls: string[] = []
-      readonly binaryPath = '/usr/local/bin/agent-director'
-      get calls(): readonly string[] {
-        return this.#calls
-      }
-      async status(params: { claude_instance_id: string }): Promise<{ state: string; self: unknown }> {
-        this.#calls.push(params.claude_instance_id)
-        return { state: 'waiting', self: this }
-      }
-    }
-
-    function installPrivateFieldClient(): PrivateFieldClient {
-      const client = new PrivateFieldClient()
+  describe('the client handed to fn (the verb is declared, so the recording proxy and its cases are retired, not weakened)', () => {
+    test('fn gets the installed client itself, inside P\'s attempt and outside any attempt', async () => {
+      const installed = makeStubClient()
       _resetOutageState()
       initOutageState({
         notify: () => {},
-        getClient: () => client as unknown as Client,
+        getClient: () => installed as unknown as Client,
         triggerSink: { arm: () => true },
       })
-      return client
-    }
+      const handed: unknown[] = []
 
-    test('inside P\'s attempt, a method call reaches the real client with this bound to it, and its result is returned unchanged', async () => {
-      const real = installPrivateFieldClient()
-      const seen: Array<{ binaryPath: string }> = []
+      await runInAttempt(P1, 'launch', () => withOutageDetection(P1, '/cwd', 'status', async (c) => { handed.push(c) }))
+      await withOutageDetection(P1, '/cwd', 'status', async (c) => { handed.push(c) })
+      await runInAttempt(P1, 'recovery', () => withSpawnDetection(P1, '/cwd', 'resume', async (c) => { handed.push(c) }))
 
-      const result = await runInAttempt(P1, 'launch', () =>
-        withOutageDetection(P1, '/cwd', async (c) => {
-          seen.push({ binaryPath: c.binaryPath })
-          return (c as unknown as PrivateFieldClient).status({ claude_instance_id: STUB_INSTANCE_ID })
-        }),
-      )
-
-      expect(result.state).toBe('waiting')
-      expect(result.self).toBe(real)
-      expect(real.calls).toEqual([STUB_INSTANCE_ID])
-      expect(seen).toEqual([{ binaryPath: real.binaryPath }])
-    })
-
-    test('outside any attempt, fn gets the plain client', async () => {
-      const real = installPrivateFieldClient()
-      let handed: unknown
-
-      await withOutageDetection(P1, '/cwd', async (c) => { handed = c })
-
-      expect(handed).toBe(real)
+      expect(handed).toHaveLength(3)
+      for (const c of handed) expect(c).toBe(installed)
     })
 
     test('inside P\'s attempt, a successful call clears the flags as outside one', async () => {
@@ -1012,7 +1010,7 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
       setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
 
       const result = await runInAttempt(P1, 'launch', () =>
-        withOutageDetection(P1, '/cwd', (c) => c.status({ claude_instance_id: STUB_INSTANCE_ID })),
+        withOutageDetection(P1, '/cwd', 'status', (c) => c.status({ claude_instance_id: STUB_INSTANCE_ID })),
       )
 
       expect(result.state).toBe('waiting')
@@ -1022,15 +1020,15 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
 
   describe('reportAgentDirectorError', () => {
     test.each([
-      ['UNAVAILABLE from any verb', () => errCallTimeout('kill'), 'kill', UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-      ['ErrTmuxKillFailed', () => errTmuxKillFailed(), 'kill', UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
-      ['a status error', () => errSystemInstallDisappeared('status'), 'status', UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
-    ] as const)('inside P\'s attempt, %s calls the sink once with P and the cause', async (_label, build, verb, kind) => {
+      ['UNAVAILABLE from any verb', () => errCallTimeout('kill'), AD_CALL_KILL_ROW_NOT_READ_LIVE, 'kill', UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      ['ErrTmuxKillFailed', () => errTmuxKillFailed(), AD_CALL_KILL_ROW_NOT_READ_LIVE, 'kill', UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+      ['a status error', () => errSystemInstallDisappeared('status'), 'status', 'status', UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+    ] as const)('inside P\'s attempt, %s calls the sink once with P and the cause', async (_label, build, declared, verb, kind) => {
       const err = build()
       const { arms } = makeSinkHarness()
 
       const lastError = await runInAttempt(P1, 'recovery', (attempt) => {
-        reportAgentDirectorError(P1, err, verb)
+        reportAgentDirectorError(P1, err, declared)
         return attempt.lastError
       })
 
@@ -1043,13 +1041,13 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
 
     test.each([
       ['a non-arming error inside P\'s attempt (ErrSpawnNotFound from status)', P1, () => errSpawnNotFound(), 'status'],
-      ['a status error with no verb known', P1, () => errSystemInstallDisappeared('status'), undefined],
+      ['a status error with no verb known (a call that is not a declared one)', P1, () => errSystemInstallDisappeared('status'), UNDECLARED_CALL],
       ['an arming error inside Q\'s attempt', P2, () => errCallTimeout('status'), 'status'],
-    ] as const)('%s calls no sink', async (_label, attemptKey, build, verb) => {
+    ] as const)('%s calls no sink', async (_label, attemptKey, build, call) => {
       const { arms } = makeSinkHarness()
 
       await runInAttempt(attemptKey, 'recovery', () => {
-        reportAgentDirectorError(P1, build(), verb)
+        reportAgentDirectorError(P1, build(), call)
       })
 
       expect(arms).toHaveLength(0)
@@ -1114,6 +1112,328 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
       expect(getOutageFlags(P1).size).toBe(0)
       expect(emissions).toHaveLength(0)
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-307, SRJ-310 — the declared verb and the tmux-unresponsive
+// condition sink
+// ---------------------------------------------------------------------------
+
+describe('the declared verb and the tmux-unresponsive condition sink (b.jg5 SRJ-307, SRJ-310)', () => {
+  /** One `start` the recording condition sink received. */
+  type Start = { key: string; verb: AdVerb; error: unknown }
+  /** One `end` the recording condition sink received. */
+  type End = { key: string; reason: TmuxUnresponsiveEndReason }
+  /** One `arm` the recording trigger sink received. */
+  type Arm = { key: string; kind: string }
+
+  /** The persona's working directory every wrapped call here passes. */
+  const WORKDIR = '/persona/workdir'
+
+  /**
+   * A fresh outage state over the default stub client, a recording trigger
+   * sink that answers true, and, unless `conditionSink` is false, a recording
+   * condition sink. `conditionSinkThrows` makes the condition sink record and
+   * then throw.
+   */
+  function makeConditionHarness(opts: { conditionSink?: boolean; conditionSinkThrows?: boolean } = {}): {
+    emissions: Emission[]
+    arms: Arm[]
+    starts: Start[]
+    ends: End[]
+  } {
+    const emissions: Emission[] = []
+    const arms: Arm[] = []
+    const starts: Start[] = []
+    const ends: End[] = []
+    const client = makeStubClient()
+    const conditionSink: TmuxUnresponsiveSink = {
+      start: (key, verb, error) => {
+        starts.push({ key, verb, error })
+        if (opts.conditionSinkThrows) throw new Error('condition sink failed')
+        return 'started'
+      },
+      end: (key, reason) => {
+        ends.push({ key, reason })
+        if (opts.conditionSinkThrows) throw new Error('condition sink failed')
+        return 'ended'
+      },
+    }
+    _resetOutageState()
+    initOutageState({
+      notify: (key, text) => { emissions.push({ key, text }) },
+      getClient: () => client as unknown as Client,
+      triggerSink: {
+        arm: (key, cause) => {
+          arms.push({ key, kind: cause.kind })
+          return true
+        },
+      },
+      ...(opts.conditionSink === false ? {} : { conditionSink }),
+    })
+    return { emissions, arms, starts, ends }
+  }
+
+  /** Each tmux-touching verb as a site declares it: `kill` only as a kill of a row read live. */
+  const TMUX_TOUCHING_CALLS: readonly AdCall[] = [...TMUX_TOUCHING_VERBS].map((verb) =>
+    verb === AD_VERB_KILL ? AD_CALL_KILL_ROW_READ_LIVE : (verb as AdCall),
+  )
+  /** Declared calls that are not tmux-touching, a kill of a row not read live among them. */
+  const OTHER_CALLS: readonly AdCall[] = ['status', 'get', 'list', 'find-missing', 'delete', AD_CALL_KILL_ROW_NOT_READ_LIVE]
+
+  /** A readable name for a declared call. */
+  function callName(call: AdCall): string {
+    return typeof call === 'string' ? call : `kill (row read live: ${call.rowReadLive})`
+  }
+
+  /** Both wrappers: the condition rules are the same through each. */
+  const WRAPPERS = [
+    ['withOutageDetection', withOutageDetection],
+    ['withSpawnDetection', withSpawnDetection],
+  ] as const
+  type Wrap = (typeof WRAPPERS)[number][1]
+
+  /** One table row per wrapper and declared call: `[wrapper name, call name, wrap, call]`. */
+  function rows(calls: readonly AdCall[]): Array<[string, string, Wrap, AdCall]> {
+    return WRAPPERS.flatMap(([name, wrap]) => calls.map((call): [string, string, Wrap, AdCall] => [name, callName(call), wrap, call]))
+  }
+
+  /**
+   * The UNAVAILABLE forms other than `ErrTmuxKillFailed` (b.jg5 SRJ-104), each
+   * built for the declared verb.
+   */
+  const UNAVAILABLE_FORMS: ReadonlyArray<readonly [string, (verb: string) => unknown]> = [
+    ['ErrTmuxUnresponsive', (verb) => errTmuxUnresponsive(verb)],
+    ['ErrCallTimeout', (verb) => errCallTimeout(verb)],
+    ['an ErrUnknownErrorName of an unknown name', () => errUnknownErrorName()],
+    ['CSCB\'s UnknownError wrapper', (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME)],
+    ['a value that is not an agent-director error', () => new Error('not an agent-director error')],
+  ]
+
+  /** The GONE answers (b.jg5 SRJ-104). */
+  const GONE_FORMS: ReadonlyArray<readonly [string, () => unknown]> = [
+    ['ErrTmuxSendKeys', () => errTmuxSendKeys()],
+    ['ErrTmuxCaptureFailed', () => errTmuxCaptureFailed()],
+  ]
+
+  /** Run `call` for `key` through `wrap` with an `fn` that throws `err`; answer what it rejected with (it must reject). */
+  async function rejectionOf(wrap: Wrap, key: string, call: AdCall, err: unknown): Promise<unknown> {
+    try {
+      await wrap(key, WORKDIR, call, async () => { throw err })
+    } catch (rejected) {
+      return rejected
+    }
+    throw new Error(`${callName(call)} did not reject`)
+  }
+
+  /** Run `body` inside a launch attempt for `attemptKey`; answer its result and the attempt's last error as the body settled. */
+  async function inAttempt<T>(attemptKey: string, body: () => Promise<T>): Promise<{ result: T; lastError: AttemptErrorRecord | undefined }> {
+    return runInAttempt(attemptKey, 'launch', async (attempt) => {
+      const result = await body()
+      return { result, lastError: attempt.lastError }
+    })
+  }
+
+  test('pin: the exported tmux-touching verbs are the SRD glossary\'s six', () => {
+    expect([...TMUX_TOUCHING_VERBS].sort()).toEqual(['kill', 'pause', 'read-pane', 'resume', 'send-keys', 'spawn'])
+  })
+
+  test.each(rows(TMUX_TOUCHING_CALLS))('%s, tmux-touching %s: each UNAVAILABLE form inside P\'s attempt starts P\'s condition once with the declared verb; no end, no flag, no notice', async (_wrapName, _callName, wrap, call) => {
+    const verb = adCallVerb(call)!
+    for (const [form, build] of UNAVAILABLE_FORMS) {
+      const err = build(verb)
+      const { emissions, arms, starts, ends } = makeConditionHarness()
+
+      // `fn` calls no client method: the verb can only come from the declaration.
+      const { result: rejected, lastError } = await inAttempt(P1, () => rejectionOf(wrap, P1, call, err))
+
+      expect({ form, rejected: rejected === err }).toEqual({ form, rejected: true })
+      expect({ form, starts: starts.map((s) => ({ key: s.key, verb: s.verb, sameError: s.error === err })) })
+        .toEqual({ form, starts: [{ key: P1, verb, sameError: true }] })
+      expect({ form, ends }).toEqual({ form, ends: [] })
+      expect({ form, arms }).toEqual({ form, arms: [{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }] })
+      expect({ form, lastError }).toEqual({ form, lastError: { verb, causeKind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, armed: true } })
+      expect({ form, flags: [...getOutageFlags(P1)], emissions }).toEqual({ form, flags: [], emissions: [] })
+    }
+  })
+
+  test.each(rows(OTHER_CALLS))('%s, %s (not tmux-touching): an UNAVAILABLE inside P\'s attempt starts nothing and ends nothing; the attempt still records the declared verb', async (_wrapName, _callName, wrap, call) => {
+    const verb = adCallVerb(call)!
+    const err = errCallTimeout(verb)
+    const { arms, starts, ends } = makeConditionHarness()
+
+    const { result: rejected, lastError } = await inAttempt(P1, () => rejectionOf(wrap, P1, call, err))
+
+    expect(rejected).toBe(err)
+    expect(starts).toEqual([])
+    expect(ends).toEqual([])
+    expect(arms).toEqual([{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expect(lastError).toEqual({ verb, causeKind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, armed: true })
+  })
+
+  test.each(rows(TMUX_TOUCHING_CALLS))('%s, tmux-touching %s: ErrTmuxKillFailed inside P\'s attempt starts nothing (the kill-failure cause), and arms as before', async (_wrapName, _callName, wrap, call) => {
+    const err = errTmuxKillFailed()
+    const { arms, starts, ends } = makeConditionHarness()
+
+    const { result: rejected, lastError } = await inAttempt(P1, () => rejectionOf(wrap, P1, call, err))
+
+    expect(rejected).toBe(err)
+    expect(starts).toEqual([])
+    expect(ends).toEqual([])
+    expect(arms).toEqual([{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
+    expect(lastError).toEqual({ verb: adCallVerb(call), causeKind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, armed: true })
+  })
+
+  test.each(rows(TMUX_TOUCHING_CALLS))('%s, tmux-touching %s: a success ends P\'s condition once, inside P\'s attempt and outside any; no start, the result unchanged, no notice', async (_wrapName, _callName, wrap, call) => {
+    const { emissions, starts, ends } = makeConditionHarness()
+
+    const inside = await inAttempt(P1, () => wrap(P1, WORKDIR, call, async () => 'ok'))
+    const endsInside = [...ends]
+    const outside = await wrap(P1, WORKDIR, call, async () => 'ok')
+
+    expect(inside.result).toBe('ok')
+    expect(outside).toBe('ok')
+    expect(endsInside).toEqual([{ key: P1, reason: TMUX_UNRESPONSIVE_END_TMUX_VERB }])
+    expect(ends).toEqual([
+      { key: P1, reason: TMUX_UNRESPONSIVE_END_TMUX_VERB },
+      { key: P1, reason: TMUX_UNRESPONSIVE_END_TMUX_VERB },
+    ])
+    expect(starts).toEqual([])
+    expect(emissions).toEqual([])
+  })
+
+  test.each(rows(OTHER_CALLS))('%s, %s (not tmux-touching): a success ends nothing, inside P\'s attempt or outside any', async (_wrapName, _callName, wrap, call) => {
+    const { starts, ends } = makeConditionHarness()
+
+    const inside = await inAttempt(P1, () => wrap(P1, WORKDIR, call, async () => 'ok'))
+    const outside = await wrap(P1, WORKDIR, call, async () => 'ok')
+
+    expect(inside.result).toBe('ok')
+    expect(outside).toBe('ok')
+    expect(ends).toEqual([])
+    expect(starts).toEqual([])
+  })
+
+  test.each(rows(TMUX_TOUCHING_CALLS))('%s, tmux-touching %s: each GONE answer ends P\'s condition once, inside P\'s attempt and outside any; no start, rethrown unchanged', async (_wrapName, _callName, wrap, call) => {
+    for (const [form, build] of GONE_FORMS) {
+      const err = build()
+      const { emissions, starts, ends } = makeConditionHarness()
+
+      const inside = await inAttempt(P1, () => rejectionOf(wrap, P1, call, err))
+      const outside = await rejectionOf(wrap, P1, call, err)
+
+      expect({ form, inside: inside.result === err, outside: outside === err }).toEqual({ form, inside: true, outside: true })
+      expect({ form, ends }).toEqual({
+        form,
+        ends: [
+          { key: P1, reason: TMUX_UNRESPONSIVE_END_TMUX_VERB },
+          { key: P1, reason: TMUX_UNRESPONSIVE_END_TMUX_VERB },
+        ],
+      })
+      expect({ form, starts, emissions }).toEqual({ form, starts: [], emissions: [] })
+    }
+  })
+
+  test.each(rows(OTHER_CALLS))('%s, %s (not tmux-touching): a GONE answer ends nothing', async (_wrapName, _callName, wrap, call) => {
+    for (const [form, build] of GONE_FORMS) {
+      const err = build()
+      const { starts, ends } = makeConditionHarness()
+
+      const inside = await inAttempt(P1, () => rejectionOf(wrap, P1, call, err))
+      const outside = await rejectionOf(wrap, P1, call, err)
+
+      expect({ form, inside: inside.result === err, outside: outside === err }).toEqual({ form, inside: true, outside: true })
+      expect({ form, starts, ends }).toEqual({ form, starts: [], ends: [] })
+    }
+  })
+
+  test.each(TMUX_TOUCHING_CALLS.map((call) => [callName(call), call] as const))('tmux-touching %s: an UNAVAILABLE outside any attempt, inside Q\'s attempt, or after P\'s attempt settled starts nothing', async (_callName, call) => {
+    const err = errTmuxUnresponsive(adCallVerb(call)!)
+    const { starts, ends } = makeConditionHarness()
+
+    const outside = await rejectionOf(withOutageDetection, P1, call, err)
+    const insideQ = await inAttempt(P2, () => rejectionOf(withOutageDetection, P1, call, err))
+    const qInsideP = await inAttempt(P1, () => rejectionOf(withOutageDetection, P2, call, err))
+    await runInAttempt(P1, 'launch', () => 'done')
+    const afterP = await rejectionOf(withOutageDetection, P1, call, err)
+
+    expect([outside, insideQ.result, qInsideP.result, afterP].every((r) => r === err)).toBe(true)
+    expect(starts).toEqual([])
+    expect(ends).toEqual([])
+  })
+
+  test('a call for P inside Q\'s attempt nested in P\'s starts P\'s condition only', async () => {
+    const err = errTmuxUnresponsive('send-keys')
+    const { starts } = makeConditionHarness()
+
+    await runInAttempt(P1, 'recovery', () => inAttempt(P2, () => rejectionOf(withOutageDetection, P1, 'send-keys', err)))
+
+    expect(starts.map((s) => ({ key: s.key, verb: s.verb }))).toEqual([{ key: P1, verb: 'send-keys' }])
+  })
+
+  test('reportAgentDirectorError inside P\'s attempt: a tmux-touching UNAVAILABLE starts the condition; a status or find-missing one, or an undeclared call, starts nothing', async () => {
+    const { starts, ends } = makeConditionHarness()
+    const touching = errTmuxUnresponsive('read-pane')
+
+    await runInAttempt(P1, 'recovery', () => {
+      reportAgentDirectorError(P1, errCallTimeout('status'), 'status')
+      reportAgentDirectorError(P1, errCallTimeout('find-missing'), 'find-missing')
+      reportAgentDirectorError(P1, errCallTimeout('status'), UNDECLARED_CALL)
+      reportAgentDirectorError(P1, errTmuxKillFailed(), AD_CALL_KILL_ROW_READ_LIVE)
+      reportAgentDirectorError(P1, touching, 'read-pane')
+    })
+
+    expect(starts.map((s) => ({ key: s.key, verb: s.verb, sameError: s.error === touching }))).toEqual([
+      { key: P1, verb: 'read-pane', sameError: true },
+    ])
+    expect(ends).toEqual([])
+  })
+
+  /** One wrapped call's scenario for the unchanged-outcome case below. */
+  type Scenario = readonly [label: string, wrap: Wrap, call: AdCall, build: (() => unknown) | undefined, inAttemptForP: boolean]
+  const SCENARIOS: readonly Scenario[] = [
+    ['UNAVAILABLE from spawn inside P\'s attempt (starts)', withSpawnDetection, 'spawn', () => errTmuxUnresponsive('spawn'), true],
+    ['UNAVAILABLE from status inside P\'s attempt', withOutageDetection, 'status', () => errCallTimeout('status'), true],
+    ['GONE from send-keys (ends)', withOutageDetection, 'send-keys', () => errTmuxSendKeys(), false],
+    ['ErrTmuxNotAvailable from resume inside P\'s attempt (raises tmux-unavailable)', withSpawnDetection, 'resume', () => errTmuxNotAvailable(undefined, 'resume'), true],
+    ['ErrSystemInstallDisappeared from read-pane inside P\'s attempt (raises ad-unreachable)', withOutageDetection, 'read-pane', () => errSystemInstallDisappeared('read-pane', '/bin/ad'), true],
+    ['ErrTmuxKillFailed from a kill of a live row inside P\'s attempt', withOutageDetection, AD_CALL_KILL_ROW_READ_LIVE, () => errTmuxKillFailed(), true],
+    ['a success of resume (ends; clears the flags)', withSpawnDetection, 'resume', undefined, false],
+  ]
+
+  test.each(SCENARIOS)('%s: the rethrown value or result, the flags, the notices and the attempt record are exactly as with no condition sink, or with one that throws', async (_label, wrap, call, build, inAttemptForP) => {
+    const err = build?.()
+    /** One run with the given condition sink: its outcome, P's flags, every notice and the attempt record. */
+    async function runWith(opts: { conditionSink: boolean; conditionSinkThrows?: boolean }): Promise<unknown> {
+      const { emissions, arms } = makeConditionHarness(opts)
+      // Flags up beforehand, so a success's all-clear is part of the outcome.
+      setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+      setOutageFlag(P1, 'cwd-unreachable', WORKDIR)
+      const body = async (): Promise<unknown> =>
+        err === undefined ? { value: await wrap(P1, WORKDIR, call, async () => 'ok') } : { rejectedSame: (await rejectionOf(wrap, P1, call, err)) === err }
+      const { result, lastError } = inAttemptForP ? await inAttempt(P1, body) : { result: await body(), lastError: undefined }
+      return { result, lastError, arms, flags: [...getOutageFlags(P1)].sort(), emissions }
+    }
+
+    const without = await runWith({ conditionSink: false })
+    const withSink = await runWith({ conditionSink: true })
+    const throwingSink = await runWith({ conditionSink: true, conditionSinkThrows: true })
+
+    expect(withSink).toEqual(without)
+    expect(throwingSink).toEqual(without)
+  })
+
+  test('the error text reaches no notice, attempt record or flag, and the sink gets the error value itself (leak check)', async () => {
+    const err = errTmuxUnresponsive('send-keys', `tmux did not answer (${sentinelInMessage('send-keys')}); nothing was done`)
+    const { emissions, starts } = makeConditionHarness()
+
+    const { result: rejected, lastError } = await inAttempt(P1, () => rejectionOf(withOutageDetection, P1, 'send-keys', err))
+
+    expect(rejected).toBe(err)
+    expect(starts).toHaveLength(1)
+    expect(starts[0]!.error).toBe(err)
+    assertNoLeak({ emissions, lastError, starts: starts.map((s) => ({ key: s.key, verb: s.verb })), flags: [...getOutageFlags(P1)] })
   })
 })
 
@@ -1229,7 +1549,7 @@ describe('static audits', () => {
     const adErr = new ErrSystemInstallDisappeared('spawn', '/bin/ad')
     const spawnStub = async () => { throw adErr }
     await expect(
-      withSpawnDetection(P1, '/persona/workdir', spawnStub),
+      withSpawnDetection(P1, '/persona/workdir', 'spawn', spawnStub),
     ).rejects.toThrow(ErrSystemInstallDisappeared)
 
     // Assert: two onsets in order.
@@ -1245,7 +1565,7 @@ describe('static audits', () => {
 
     // Step 3: flip the spawn stub to succeed; withSpawnDetection clears both.
     const successStub = async () => 'ok'
-    const result = await withSpawnDetection(P1, '/persona/workdir', successStub)
+    const result = await withSpawnDetection(P1, '/persona/workdir', 'spawn', successStub)
     expect(result).toBe('ok')
 
     // Exactly one new emission (the all-clear). Three total now.

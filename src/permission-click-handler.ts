@@ -301,7 +301,7 @@ export async function handlePermissionClick(
     decision,
   }
   try {
-    await withOutageDetection(persona.key, undefined, (client) =>
+    await withOutageDetection(persona.key, undefined, 'decide', (client) =>
       decideWithToken(client, {
         claude_instance_id: claudeInstanceId,
         decision,

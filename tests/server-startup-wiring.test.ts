@@ -103,6 +103,15 @@
  *   notifier's `notify` as its sink, and held in the one module-scope handle
  *   assigned in main(); shutdown forgets every episode once, through that
  *   handle, before it first yields.
+ * - b.jg5 SRJ-307 / SRJ-310 / SRJ-306: the one tmux-unresponsive condition is
+ *   built once, in main()'s own statement list, over that episodes instance,
+ *   after the retry controller; it is the condition sink of the one
+ *   `initOutageState` call (beside the trigger sink, before the start
+ *   bring-up); the health check's and the full-mode retry action's
+ *   `endTmuxUnresponsive` hooks end it (with the tick's `live` reading and the
+ *   retry's own reading), the retry action gets the connectedness and stream
+ *   probes the health check reads, and its condition-end hook is the retry
+ *   controller's `conditionEnded` for the tmux-unresponsive condition.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -149,7 +158,17 @@ import type * as ServerModule from '../src/server.ts'
 import type { RestartDeps } from '../src/restart.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
 import type * as PersonaEpisodesModule from '../src/persona-episodes.ts'
-import type { PersonaEpisodes, PersonaEpisodesDeps } from '../src/persona-episodes.ts'
+import type {
+  PersonaEpisodes,
+  PersonaEpisodesDeps,
+  TmuxUnresponsiveCondition,
+  TmuxUnresponsiveConditionDeps,
+} from '../src/persona-episodes.ts'
+import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
+import type { FullModeRetryDeps, UnavailableRetryController } from '../src/unavailable-retry.ts'
+import type * as LivenessReadingModule from '../src/liveness-reading.ts'
+import type { HealthCheckDeps } from '../src/health-check.ts'
+import type { OutageStateDeps } from '../src/outage-state.ts'
 import type * as PersonaConnectionsModule from '../src/persona-connections.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
@@ -1555,6 +1574,147 @@ describe('main() builds the one set of per-persona notice episodes before the st
     const firstAwait = SERVER_CODE.slice(start, end).search(/\bawait\b/)
     expect(firstAwait).toBeGreaterThan(-1)
     expect(at).toBeLessThan(start + firstAwait)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-307 / SRJ-310 / SRJ-306 — the tmux-unresponsive
+// condition's production bindings
+//
+// Every hook that starts or ends the condition is optional with a no-op
+// default (`OutageStateDeps.conditionSink`, `HealthCheckDeps.
+// endTmuxUnresponsive`, `FullModeRetryDeps.endTmuxUnresponsive` and its two
+// probes, `TmuxUnresponsiveConditionDeps.conditionEnded`), so a production
+// wiring that dropped one, bound it to a no-op or a local shadow, built a
+// second condition, or installed the sink after the start pass would
+// type-check and pass every behaviour suite while a refusal started nothing,
+// a healthy tick or retry ended nothing, or an end never reached the retry
+// timer. What each hook does is tested in tests/tmux-unresponsive.test.ts,
+// tests/outage-state.test.ts, tests/health-check.test.ts and
+// tests/unavailable-retry.test.ts; pinned here: the bindings.
+// ---------------------------------------------------------------------------
+
+describe('main() builds the one tmux-unresponsive condition over the notice episodes, installs it as the condition sink before the start pass, and binds the tick\'s and the retry\'s ends to it and its end to the retry controller (b.jg5 SRJ-307, SRJ-310, SRJ-306)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const FACTORY: keyof typeof PersonaEpisodesModule = 'createTmuxUnresponsiveCondition'
+  const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
+  const EPISODES: keyof TmuxUnresponsiveConditionDeps = 'episodes'
+  const CONDITION_ENDED: keyof TmuxUnresponsiveConditionDeps = 'conditionEnded'
+  const END: keyof TmuxUnresponsiveCondition = 'end'
+  const END_TICK: keyof typeof PersonaEpisodesModule = 'TMUX_UNRESPONSIVE_END_TICK'
+  const END_RETRY: keyof typeof PersonaEpisodesModule = 'TMUX_UNRESPONSIVE_END_RETRY'
+  const CONDITION_SINK: keyof OutageStateDeps = 'conditionSink'
+  const TRIGGER_SINK: keyof OutageStateDeps = 'triggerSink'
+  const TICK_HOOK: keyof HealthCheckDeps = 'endTmuxUnresponsive'
+  const RETRY_HOOK: keyof FullModeRetryDeps = 'endTmuxUnresponsive'
+  const RETRY_CONNECTED: keyof FullModeRetryDeps = 'isSessionConnected'
+  const RETRY_STREAM: keyof FullModeRetryDeps = 'hasSessionStream'
+  const TICK_STREAM: keyof HealthCheckDeps = 'hasSessionStream'
+  const CONTROLLER_END: keyof UnavailableRetryController = 'conditionEnded'
+  const RETRY_CONDITION: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE'
+  const LIVE: keyof typeof LivenessReadingModule = 'LIVENESS_LIVE'
+
+  /** `name` is declared exactly once in server.ts (no local shadow, no second instance). */
+  function declaredOnce(name: string): void {
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+  }
+
+  test('the condition is built exactly once, in main()\'s own statement list (not at module scope, behind no branch), over the one notice episodes instance, after the retry controller and before the start bring-up, initRestart and initHealthCheck', () => {
+    const at = onlyCallOf(FACTORY)
+    const condition = constOf(FACTORY)
+    declaredOnce(condition)
+    const decl = SERVER_CODE.search(new RegExp(`\\bconst\\s+${condition}\\s*=\\s*${FACTORY}\\s*\\(`))
+    expect(decl).toBeGreaterThan(-1)
+    expect(decl).toBeLessThan(at)
+    expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
+    expect(importSource(SERVER_CODE, FACTORY)).toBe('./persona-episodes.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+
+    // Over the one episodes instance (so the condition is that instance's
+    // tmux-unresponsive episode, forgotten by a teardown and at shutdown).
+    const episodes = constOf(EPISODES_FACTORY)
+    declaredOnce(episodes)
+    expect(onlyCallProps(FACTORY).get(EPISODES)).toBe(episodes)
+    expect(at).toBeGreaterThan(onlyCallOf(EPISODES_FACTORY))
+
+    // After the controller its end hook reports to; before every path that
+    // can start or end it.
+    expect(at).toBeGreaterThan(onlyCallOf('createUnavailableRetryController'))
+    const { bringUpAt } = startResolution(SERVER_CODE)
+    for (const later of [onlyCallOf('initRestart'), bringUpAt, onlyCallOf('initHealthCheck')]) {
+      expect(at).toBeLessThan(later)
+    }
+  })
+
+  test('it is the condition sink of the one initOutageState call, beside the retry controller\'s trigger sink, in main()\'s own statement list after it is built and before the start bring-up and initRestart', () => {
+    const condition = constOf(FACTORY)
+    const install = onlyCallOf('initOutageState')
+    const props = onlyCallProps('initOutageState')
+    expect(props.get(CONDITION_SINK)).toBe(condition)
+    expect(props.get(TRIGGER_SINK)).toBe(constOf('createUnavailableRetryController'))
+    expect(atMainTopLevel(SERVER_CODE, install)).toBe(true)
+    expect(install).toBeGreaterThan(onlyCallOf(FACTORY))
+    expect(install).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+    expect(install).toBeLessThan(onlyCallOf('initRestart'))
+    // Nothing else names a condition sink in server.ts.
+    expect(indicesOf(new RegExp(`\\b${CONDITION_SINK}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+  })
+
+  test('the health check\'s end hook ends this condition for the persona it is given, with the tick reason and the live reading', () => {
+    const condition = constOf(FACTORY)
+    const hook = onlyCallProps('initHealthCheck').get(TICK_HOOK)
+    expect(hook).toBeDefined()
+    // `(key) => { <condition>.end(key, TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE) }`,
+    // or the same call as an expression body; the parameter's name is free.
+    const call = `${condition}\\.${END}\\(\\1, ${END_TICK}, ${LIVE}\\)`
+    expect(hook).toMatch(new RegExp(`^\\(?(\\w+)\\)? => (?:\\{ ${call};? \\}|${call})$`))
+    expect(importSource(SERVER_CODE, END_TICK)).toBe('./persona-episodes.ts')
+    expect(importSource(SERVER_CODE, LIVE)).toBe('./liveness-reading.ts')
+  })
+
+  test('the full-mode retry action\'s end hook ends this condition for the persona it is given, with the retry reason and the retry\'s own reading, over the connectedness and stream probes the health check reads', () => {
+    const condition = constOf(FACTORY)
+    const props = onlyCallProps('createFullModeRetryAction')
+    const hook = props.get(RETRY_HOOK)
+    expect(hook).toBeDefined()
+    // `(key, reading) => { <condition>.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading) }`,
+    // or the same call as an expression body; the parameters' names are free.
+    const call = `${condition}\\.${END}\\(\\1, ${END_RETRY}, \\2\\)`
+    expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
+    expect(importSource(SERVER_CODE, END_RETRY)).toBe('./persona-episodes.ts')
+
+    // Absent, either probe answers "not connected" and a retry ends nothing:
+    // the registry entry's connected flag, and the one stream probe the
+    // health check also reads.
+    expect(props.get(RETRY_CONNECTED)).toMatch(/^\(?(\w+)\)? => getSessionByPersona\(\1\)\?\.connected === true$/)
+    expect(importSource(SERVER_CODE, 'getSessionByPersona')).toBe('./registry.ts')
+    expect(props.get(RETRY_STREAM)).toBe('hasSessionStream')
+    expect(onlyCallProps('initHealthCheck').get(TICK_STREAM)).toBe(props.get(RETRY_STREAM))
+    expect(importSource(SERVER_CODE, 'hasSessionStream')).toBe('./persona-routing.ts')
+  })
+
+  test('the tick\'s and the retry\'s hooks are the only ends server.ts calls on the condition', () => {
+    const condition = constOf(FACTORY)
+    const ends = indicesOf(new RegExp(`\\b${condition}\\s*[?!]?\\.\\s*${END}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(ends).toHaveLength(2)
+    const tickHook = onlyCallProps('initHealthCheck').get(TICK_HOOK)!
+    const retryHook = onlyCallProps('createFullModeRetryAction').get(RETRY_HOOK)!
+    const endCall = new RegExp(`\\b${condition}\\.${END}\\(`, 'g')
+    expect((tickHook.match(endCall) ?? []).length + (retryHook.match(endCall) ?? []).length).toBe(2)
+  })
+
+  test('the condition\'s end hook is the retry controller\'s condition-end entry, for the persona it is given, the tmux-unresponsive condition and the end\'s reading', () => {
+    const controller = constOf('createUnavailableRetryController')
+    declaredOnce(controller)
+    const hook = onlyCallProps(FACTORY).get(CONDITION_ENDED)
+    expect(hook).toBeDefined()
+    // `(key, reading) => <controller>.conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE, reading)`,
+    // or the same call in a block body; the parameters' names are free.
+    const call = `${controller}\\.${CONTROLLER_END}\\(\\1, ${RETRY_CONDITION}, \\2\\)`
+    expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ (?:return )?${call};? \\}|${call})$`))
+    expect(importSource(SERVER_CODE, RETRY_CONDITION)).toBe('./unavailable-retry.ts')
+    // No other report of a condition's end anywhere in server.ts.
+    expect(indicesOf(new RegExp(`\\.\\s*${CONTROLLER_END}\\s*\\(`, 'g'), SERVER_CODE)).toHaveLength(1)
   })
 })
 

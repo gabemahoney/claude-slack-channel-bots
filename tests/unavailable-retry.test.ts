@@ -1,6 +1,7 @@
 /**
  * unavailable-retry.test.ts — The per-persona UNAVAILABLE retry timer
- * (b.jg5 SRJ-301 code line, SRJ-302, SRJ-303, SRJ-304, SRJ-305, SRJ-306).
+ * (b.jg5 SRJ-301 code line, SRJ-302, SRJ-303, SRJ-304, SRJ-305, SRJ-306), and
+ * the retry's side of the `tmux-unresponsive` condition's end (SRJ-310).
  *
  * The schedule, the never-give-up rule, arming while armed, isolation,
  * again-reasons and `close`, and the switch to pending-only mode, the last row
@@ -20,7 +21,13 @@
  * (AC 28), pending-only mode (armed directly, AC 33's timer half) and the
  * condition-end entry's pending and kill-failure exceptions (called directly,
  * AC 30's timer half) run on the harness's default action, the real row read
- * and restart entry over the production adapters and the stub. What `arm`
+ * and restart entry over the production adapters and the stub. The
+ * `tmux-unresponsive` condition's ends (b.jg5 SRJ-305, SRJ-306, SRJ-310) run
+ * there too, with the condition wired as `main()` wires it: a retry that finds
+ * the persona recovered on its own, one that does not, a launch's successful
+ * spawn, a plain `read-pane` success through the outage wrapper, and a health
+ * tick's end (`tickEnd`, as the harness has no tick), each reaching the
+ * condition-end entry once. What `arm`
  * answers (and so what `reportAttemptError` marks), a stop's failing
  * hand-off, and a pending-only stop that yields to a full-mode cause armed
  * during its retry run on the bare controller, the last over the server's
@@ -43,9 +50,18 @@ import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
-import { LIVENESS_PENDING, LIVENESS_READING_UNKNOWN, type PendingLivenessReading } from '../src/liveness-reading.ts'
+import { LIVENESS_LIVE, LIVENESS_PENDING, LIVENESS_READING_UNKNOWN, type PendingLivenessReading } from '../src/liveness-reading.ts'
+import { withOutageDetection } from '../src/outage-state.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
+import {
+  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
+  TMUX_UNRESPONSIVE_END_RETRY,
+  TMUX_UNRESPONSIVE_END_TEXT,
+  TMUX_UNRESPONSIVE_END_TICK,
+  TMUX_UNRESPONSIVE_END_TMUX_VERB,
+  type TmuxUnresponsiveEndReason,
+} from '../src/persona-episodes.ts'
 import {
   _resetRestartState,
   isRestartPendingOrActive,
@@ -680,6 +696,14 @@ interface LaunchSite {
   script(h: RecoveryHarness, persona: Persona, err: Error): RecoveryStubScript
   /** The launch's action when this site's call fails. */
   readonly action: SpawnPersonaResult['action']
+  /**
+   * True when this site's call is tmux-touching and the launch goes on to a
+   * successful spawn after it fails: the `tmux-unresponsive` condition an
+   * UNAVAILABLE refusal here starts is ended by that spawn, with the launch's
+   * `pending` row as its reading, so the timer is kept (b.jg5 SRJ-305,
+   * SRJ-306, SRJ-310). A kill-failure cause starts no condition.
+   */
+  readonly endedByItsSpawn?: boolean
 }
 
 const LAUNCH_SITES: readonly LaunchSite[] = [
@@ -695,7 +719,8 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
   { name: 'the reconnect of a waiting row', verb: 'send-keys', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: err }) },
   { name: 'the sweep before a working-row wait', verb: 'find-missing', action: 'reconnected', script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), findMissingError: err }) },
   { name: 'the working-row read', verb: 'status', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusError: err }) },
-  { name: 'the kill of a row in another directory', verb: 'kill', action: 'spawned', script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home }), killError: err }) },
+  // The collision get reads the row `waiting` (live), so its kill is tmux-touching.
+  { name: 'the kill of a row in another directory', verb: 'kill', action: 'spawned', endedByItsSpawn: true, script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home }), killError: err }) },
   { name: 'the delete of a row in another directory', verb: 'delete', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home }), deleteError: err }) },
   { name: 'the resume of an ended row', verb: 'resume', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: err }) },
 ]
@@ -724,11 +749,23 @@ function armedResult(key: string, action: SpawnPersonaResult['action']): SpawnPe
   return action === 'failed' ? { key, action, refused: true } : { key, action }
 }
 
-/** Persona `key`'s timer was armed once, just now, at the base wait with `kind`; no other persona's was. */
-function expectArmedOnce(h: RecoveryHarness, key: string, kind: string): void {
+/**
+ * Persona `key`'s timer was armed once, just now, at the base wait with
+ * `kind`; no other persona's was. `lastRow` is the row it last read, when one
+ * is recorded.
+ */
+function expectArmedOnce(h: RecoveryHarness, key: string, kind: string, lastRow?: string): void {
   expect(h.triggers).toEqual([{ key, kind }])
   expect(h.controller.armedKeys()).toEqual([key])
-  expect(h.controller.view(key)).toEqual({ phase: 'waiting', dueAt: h.clock.now() + waitMs(0), waitMs: waitMs(0), refusals: 0, causes: [kind], mode: UNAVAILABLE_RETRY_MODE_FULL })
+  expect(h.controller.view(key)).toEqual({
+    phase: 'waiting',
+    dueAt: h.clock.now() + waitMs(0),
+    waitMs: waitMs(0),
+    refusals: 0,
+    causes: [kind],
+    mode: UNAVAILABLE_RETRY_MODE_FULL,
+    ...(lastRow !== undefined ? { lastRow } : {}),
+  })
   expect(delays(h.clock)).toEqual([waitMs(0)])
   expect(h.attempts).toEqual([])
 }
@@ -757,7 +794,20 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     const result = await h.launch(key)
 
     expect(result).toEqual(armedResult(key, site.action))
-    expectArmedOnce(h, key, kind)
+    // A live-row kill's UNAVAILABLE starts the condition, and the launch's
+    // spawn that follows ends it with its `pending` row: the timer is kept,
+    // its last row read pending (b.jg5 SRJ-305, SRJ-306).
+    const ended = site.endedByItsSpawn === true && kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE
+    expectArmedOnce(h, key, kind, ended ? UNAVAILABLE_RETRY_ROW_PENDING : undefined)
+    if (ended) {
+      expect(h.conditionEnds).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'kept' }])
+      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+      expect(retryLinesOf(h, key).filter((line) => line.includes(' kept — '))).toEqual([
+        keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
+      ])
+    } else {
+      expect(h.conditionEnds).toEqual([])
+    }
   })
 
   const readCross = READ_ERRORS.flatMap(([what, make]) => READ_SITES.map((site) => [what, site.name, make, site] as const))
@@ -2468,6 +2518,401 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
 })
 
 // ---------------------------------------------------------------------------
+// The `tmux-unresponsive` condition's ends and the retry timer (b.jg5 SRJ-305,
+// SRJ-306, SRJ-310) on the recovery harness, both settings 0: a retry that
+// finds the persona recovered on its own, a retry that does not, a launch's
+// successful spawn, a plain tmux-touching success and a health tick's end,
+// each reaching the condition-end entry as `main()` wires it
+// ---------------------------------------------------------------------------
+
+/** The line the condition logs when persona `key`'s `tmux-unresponsive` condition ends for `reason`. */
+function conditionEndedLine(key: string, reason: TmuxUnresponsiveEndReason): string {
+  return `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} ended — ${TMUX_UNRESPONSIVE_END_TEXT[reason]}`
+}
+
+/** The condition's lines for persona `key`, in order. */
+function conditionLinesOf(h: RecoveryHarness, key: string): string[] {
+  return h.lines.filter((line) => line.startsWith(`[slack] persona-episodes: persona=${key} `))
+}
+
+/**
+ * A start-pass launch of persona `key` whose optimistic spawn is refused
+ * UNAVAILABLE (`ErrTmuxUnresponsive`): it starts the condition and arms the
+ * timer in full mode. The stub's spawn answers again afterwards. Resolves with
+ * the first refusal's time.
+ */
+async function refuseLaunch(h: RecoveryHarness, key: string): Promise<number> {
+  h.script({ spawnError: errTmuxUnresponsive('spawn') })
+  const refusedAt = h.clock.now()
+  expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+  h.script({ spawnError: undefined })
+  expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(refusedAt)
+  expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], mode: UNAVAILABLE_RETRY_MODE_FULL })
+  return refusedAt
+}
+
+/** How a case starts persona `key`'s condition and arms its timer. */
+type ConditionArm = (h: RecoveryHarness, key: string) => Promise<void>
+
+/** Full mode: a launch refused UNAVAILABLE (`refuseLaunch`). */
+const FULL_MODE_ARM: ConditionArm = async (h, key) => {
+  await refuseLaunch(h, key)
+}
+
+/**
+ * Pending-only mode: the condition started and the timer armed pending-only,
+ * both directly (pending-only mode is armed directly until covered `pending`
+ * rows exist, and no wired path yet leaves a pending-only timer with the
+ * condition holding).
+ */
+const PENDING_ONLY_ARM: ConditionArm = async (h, key) => {
+  expect(h.tmuxUnresponsive.start(key, 'read-pane', errTmuxUnresponsive('read-pane'))).toBe('started')
+  h.controller.armPendingOnly(key)
+}
+
+/** A plain tmux-touching success for persona `key`, outside every attempt: one `read-pane` through the outage wrapper. */
+function readPaneSucceeds(h: RecoveryHarness, key: string): Promise<unknown> {
+  return withOutageDetection(key, personaOf(h, key).working_directory, 'read-pane', (client) =>
+    client.readPane({ claude_instance_id: personaInstanceId(key), n_lines: 1 }))
+}
+
+describe('unavailable retry: the tmux-unresponsive condition’s ends and the retry timer (SRJ-305, SRJ-306, SRJ-310)', () => {
+  afterEach(() => {
+    if (harness !== undefined) {
+      expect(harness.episodeNotices).toEqual([])
+      assertNoLeak(harness.captured())
+    }
+  })
+
+  test.each<[string, ConditionArm, string, (key: string) => string]>([
+    ['in full mode, whose restart decision finds it already connected (a live reading)', FULL_MODE_ARM, LIVENESS_LIVE, (key) => stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED)],
+    ['in pending-only mode, whose row read finds it live out of pending (waiting)', PENDING_ONLY_ARM, 'waiting', (key) => pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting')],
+  ])('a retry %s, connected with its stream, ends the condition with that reading, and the timer stops', async (_what, arm, reading, stopped) => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key] = h.keys as [string]
+    modelRow(h, 'waiting')
+    await arm(h, key)
+    h.setConnected(key, true)
+    const before = callCounts(h)
+
+    await retryNow(h, key)
+
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_RETRY))
+    // The retry is still running when it ends the condition, so the entry
+    // defers, and the retry's own stop makes the deferred end moot.
+    expect(h.conditionEnds).toEqual([{ key, reading, result: 'deferred' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(stopped(key))
+    expect(retryLinesOf(h, key).filter((line) => line.includes(' kept — '))).toEqual([])
+    expectStopped(h, key)
+  })
+
+  test.each<[string, ConditionArm, RowState, boolean, Record<string, number>, (key: string) => string, boolean]>([
+    ['in full mode reads its row pending, connected with its stream (deferred on the pending row; the timer runs on)', FULL_MODE_ARM, 'pending', true, { statusCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1), true],
+    ['in full mode reads its row live (check_permission) but not connected (its reconnect is deferred, typing nothing; the timer runs on)', FULL_MODE_ARM, 'check_permission', false, { statusCalls: 2 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED, 1), true],
+    ['in pending-only mode reads its row pending, connected with its stream (the timer runs on)', PENDING_ONLY_ARM, 'pending', true, { statusCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }), true],
+    ['in pending-only mode reads its row live (waiting) but not connected (the pending-only row rule stops the timer, not a condition end)', PENDING_ONLY_ARM, 'waiting', false, { statusCalls: 1 }, (key) => pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'), false],
+  ])('a retry that %s leaves the condition holding with its first refusal’s time and never reaches the condition-end entry', async (_what, arm, state, connected, calls, last, armed) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, state)
+    await arm(h, key)
+    const firstRefusalAt = h.tmuxUnresponsive.firstRefusalAt(key)
+    h.setConnected(key, connected)
+    const before = callCounts(h)
+
+    await retryNow(h, key)
+
+    expect(callsSince(h, before)).toEqual(calls)
+    expect(h.tmuxUnresponsive.holds(key)).toBe(true)
+    expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(firstRefusalAt!)
+    expect(h.conditionEnds).toEqual([])
+    expect(conditionLinesOf(h, key).filter((line) => line.includes(' ended — '))).toEqual([])
+    expect(retryLinesOf(h, key).at(-1)).toBe(last(key))
+    expect(h.controller.isArmed(key)).toBe(armed)
+  })
+
+  test('a full-mode retry whose own launch succeeds ends the condition through that spawn, with its pending row: the timer is kept and runs on in pending-only mode, the wait count carrying on', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const row = modelRow(h, 'missing')
+    await refuseLaunch(h, key)
+
+    await retryNow(h, key)
+
+    expect(row.spawnedAt).toHaveLength(2)
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
+    // The spawn succeeds while the retry runs: the end is deferred, then
+    // applied on the launch's pending row, before the re-arm.
+    expect(h.conditionEnds).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'deferred' }])
+    expect(retryLinesOf(h, key).slice(-2)).toEqual([
+      keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
+      reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }),
+    ])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(1),
+      waitMs: waitMs(1),
+      refusals: 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+
+    // The launch's row reads live and its session connects: the next
+    // pending-only retry stops on the row, and with no condition holding the
+    // entry is not called again.
+    h.setConnected(key, true)
+    await retryNow(h, key)
+    expect(h.conditionEnds).toHaveLength(1)
+    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
+    expectStopped(h, key)
+  })
+
+  test('a start-pass launch whose kill of a live row in another directory is refused UNAVAILABLE, and whose spawn then succeeds, keeps the timer with its due time, its last row read the spawn’s pending', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    h.script({ ...collided(h, personaOf(h, key), { cwd: h.home }), killError: errTmuxUnresponsive('kill') })
+    const armedAt = h.clock.now()
+
+    expect(await h.launch(key)).toEqual({ key, action: 'spawned' })
+
+    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    const lines = conditionLinesOf(h, key)
+    expect(lines).toHaveLength(2)
+    expect(lines[0]).toStartWith(`[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} started — kill failed: `)
+    expect(lines[1]).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(h.conditionEnds).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'kept' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING))
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: armedAt + waitMs(0),
+      waitMs: waitMs(0),
+      refusals: 0,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([armedAt + waitMs(0)])
+  })
+
+  /** Persona `key`'s condition holding and its full-mode timer's row last read `pending` by a retry. */
+  async function holdingOnAPendingRow(h: RecoveryHarness, key: string): Promise<NonNullable<ReturnType<UnavailableRetryController['view']>>> {
+    modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
+    await refuseLaunch(h, key)
+    await retryNow(h, key)
+    // The retry's status read succeeded: that alone ends nothing.
+    expect(h.tmuxUnresponsive.holds(key)).toBe(true)
+    const view = h.controller.view(key)!
+    expect(view).toMatchObject({ phase: 'waiting', refusals: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+    return view
+  }
+
+  test('AC 30 (its tmux-unresponsive half): a condition that ends through a successful read-pane while the row was last read pending leaves the timer armed with its due time', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const before = await holdingOnAPendingRow(h, key)
+
+    await readPaneSucceeds(h, key)
+
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
+    expect(h.conditionEnds).toEqual([{ key, reading: undefined, result: 'kept' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING))
+    expect(h.controller.view(key)).toEqual(before)
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([before.dueAt!])
+  })
+
+  test('an end that brings a health tick’s live reading stops the timer even though a retry last read the row pending: the tick’s reading is the latest row read', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    await holdingOnAPendingRow(h, key)
+
+    expect(h.tickEnd(key)).toBe('ended')
+
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TICK))
+    expect(h.conditionEnds).toEqual([{ key, reading: LIVENESS_LIVE, result: 'stopped' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED))
+    expectStopped(h, key)
+  })
+
+  /** Swap in a held action and fire persona `key`'s due retry: the run is in flight, waiting for the test's answer. */
+  async function holdNextRun(h: RecoveryHarness, key: string): Promise<ReturnType<typeof heldAction>> {
+    const held = heldAction()
+    h.setAction(held.action)
+    await h.advance(h.controller.view(key)!.dueAt! - h.clock.now())
+    expect(h.controller.view(key)?.phase).toBe('running')
+    return held
+  }
+
+  test('a health tick’s end during a full-mode retry whose launch then succeeds is deferred with its live reading; the launch’s pending row is the later read, so the timer is kept and runs on in pending-only mode', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const row = modelRow(h, 'missing')
+    await refuseLaunch(h, key)
+    // The retry fires while the persona's serializer turn is held: the
+    // full-mode retry is blocked mid-run.
+    const gate = Promise.withResolvers<void>()
+    const turn = h.serializer.run(key, () => gate.promise)
+    await h.advance(waitMs(0))
+    expect(h.controller.view(key)?.phase).toBe('running')
+
+    expect(h.tickEnd(key)).toBe('ended')
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(h.conditionEnds).toEqual([{ key, reading: LIVENESS_LIVE, result: 'deferred' }])
+
+    gate.resolve()
+    await turn
+    await h.settle()
+
+    // The retry's launch spawns; the condition no longer holds, so its spawn
+    // reaches the condition-end entry no more.
+    expect(row.spawnedAt).toHaveLength(2)
+    expect(h.conditionEnds).toHaveLength(1)
+    expect(retryLinesOf(h, key).filter((line) => line.includes(' kept — '))).toHaveLength(1)
+    expect(retryLinesOf(h, key).slice(-2)).toEqual([
+      keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
+      reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }),
+    ])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(1),
+      waitMs: waitMs(1),
+      refusals: 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+  })
+
+  test.each<[string, (held: ReturnType<typeof heldAction>) => void]>([
+    ['fails', (held) => held.fail(new Error('the retry broke'))],
+    ['answers a liveness reading of unknown (it keeps the last row read)', (held) => held.answer({ kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN, keepsLastRow: true })],
+  ])('a health tick’s end deferred during a retry that %s, after a retry read the row pending: the answer carries no row, so the live reading is the latest row read and the timer stops', async (_what, finish) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    await holdingOnAPendingRow(h, key)
+    const held = await holdNextRun(h, key)
+
+    expect(h.tickEnd(key)).toBe('ended')
+    expect(h.conditionEnds).toEqual([{ key, reading: LIVENESS_LIVE, result: 'deferred' }])
+    finish(held)
+    await h.controller.whenRunSettled(key)
+
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED))
+    expect(retryLinesOf(h, key).filter((line) => line.includes(' kept — '))).toEqual([])
+    expectStopped(h, key)
+  })
+
+  test('a launch’s successful spawn during a retry ends the condition with its pending reading, deferred; it wins over the live row the retry’s answer carries, so the timer is kept', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    await refuseLaunch(h, key)
+    const held = await holdNextRun(h, key)
+
+    expect(await h.launch(key)).toEqual({ key, action: 'spawned' })
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
+    expect(h.conditionEnds).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'deferred' }])
+
+    held.answer({ kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED, row: 'check_permission' })
+    await h.controller.whenRunSettled(key)
+
+    expect(retryLinesOf(h, key).slice(-2)).toEqual([
+      keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
+      reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED, 1),
+    ])
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', refusals: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<unknown>, TmuxUnresponsiveEndReason, string | undefined]>([
+    ['a successful read-pane (no reading)', readPaneSucceeds, TMUX_UNRESPONSIVE_END_TMUX_VERB, undefined],
+    ['a health tick’s live reading', async (h, key) => h.tickEnd(key), TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE],
+  ])('a condition that ends after a kill-failure cause, through %s, leaves the timer armed with its due time', async (_what, end, reason, reading) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, 'ended')
+    // A recovery attempt whose kill fails with ErrTmuxKillFailed and whose
+    // launch is then refused UNAVAILABLE: the kill-failure cause, then the
+    // condition's start.
+    h.script({ killError: errTmuxKillFailed(), spawnError: errTmuxUnresponsive('spawn') })
+    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+    await h.settle()
+    h.script({ killError: undefined, spawnError: undefined })
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }, { key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expect(h.tmuxUnresponsive.holds(key)).toBe(true)
+    const before = h.controller.view(key)!
+    expect(before).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(0),
+      waitMs: waitMs(0),
+      refusals: 0,
+      causes: [UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+    })
+
+    await end(h, key)
+
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(conditionLinesOf(h, key).at(-1)).toBe(conditionEndedLine(key, reason))
+    expect(h.conditionEnds).toEqual([{ key, reading, result: 'kept' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_KILL_FAILED))
+    // The end's reading, when it brings one, becomes the last row read; the
+    // kill-failure cause keeps the timer whatever it reads.
+    expect(h.controller.view(key)).toEqual({ ...before, ...(reading !== undefined ? { lastRow: reading } : {}) })
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([before.dueAt!])
+  })
+
+  test('with both settings 0, a retry whose reconnect read-pane succeeds (the end is deferred) and whose send-keys is then refused UNAVAILABLE leaves the condition holding and the timer re-armed at the next wait; the next retry fires at that due time', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key] = h.keys as [string]
+    modelRow(h, 'waiting')
+    const firstRefusalAt = await refuseLaunch(h, key)
+    h.setConnected(key, false)
+    h.script({ sendKeysError: errTmuxUnresponsive('send-keys') })
+    const before = callCounts(h)
+
+    await retryNow(h, key)
+
+    // The reconnect's read-pane ends the condition while the retry runs (the
+    // end is deferred); its send-keys is refused and starts it again, arming
+    // the timer in the same run, which cancels the deferred end.
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 })
+    expect(h.conditionEnds).toEqual([{ key, reading: undefined, result: 'deferred' }])
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }, { key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    const lines = conditionLinesOf(h, key)
+    expect(lines.at(-2)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
+    expect(lines.at(-1)).toStartWith(`[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} started — `)
+    expect(h.tmuxUnresponsive.holds(key)).toBe(true)
+    expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBeGreaterThanOrEqual(firstRefusalAt + waitMs(0))
+    expect(retryLinesOf(h, key).filter((line) => line.includes(UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED))).toEqual([])
+    expect(retryLinesOf(h, key).at(-1)).toEndWith(` — re-armed, next retry in ${waitMs(1) / 1000} s`)
+    const view = h.controller.view(key)!
+    expect(view).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(1), waitMs: waitMs(1), refusals: 1, mode: UNAVAILABLE_RETRY_MODE_FULL })
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([view.dueAt!])
+
+    // The re-armed timer really fires: the send-keys answers now, the
+    // reconnect succeeds and the retry stops the timer.
+    h.script({ sendKeysError: undefined })
+    const beforeSecond = callCounts(h)
+    await h.advance(waitMs(1) - 1)
+    expect(callsSince(h, beforeSecond)).toEqual({})
+    await retryNow(h, key)
+    expect(callsSince(h, beforeSecond)).toEqual({ statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 })
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expectStopped(h, key)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // The switch to pending-only mode, the last row read and a condition that
 // ends during a run (b.jg5 SRJ-301, SRJ-305, SRJ-306), on the bare controller
 // with a held stand-in action
@@ -2676,6 +3121,72 @@ describe('unavailable retry: the switch, the last row read and a condition end d
     expect(lines.slice(linesBefore)).toEqual([stoppedLine(KEY, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED)])
     expect(controller.isArmed(KEY)).toBe(false)
     expect(clock.pendingCount()).toBe(0)
+  })
+
+  /** Each arm that can land during a full-mode run, with the cause the re-armed line then names. */
+  const ARMS_IN_RUN: ReadonlyArray<readonly [string, (c: UnavailableRetryController) => void, string]> = [
+    ['arm', armUnavailable, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['armPendingOnly', (c) => { c.armPendingOnly(KEY) }, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+  ]
+
+  test.each(ARMS_IN_RUN)('the tmux-unresponsive condition’s end deferred during a full-mode run, then %s in the same run (a refusal that started the condition again): the arm cancels the end, so no kept or stopped line, and the timer is re-armed at the doubled wait', async (_what, armAgain, cause) => {
+    const { clock, controller, lines, held } = await heldRun(armUnavailable)
+    const linesBefore = lines.length
+
+    expect(controller.conditionEnded(KEY, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE)).toBe('deferred')
+    armAgain(controller)
+    held.answer({ kind: 'again' })
+    await controller.whenRunSettled(KEY)
+
+    expect(lines.slice(linesBefore)).toEqual([reArmedLine(KEY, 1, cause, 1)])
+    expect(lines.filter((line) => line.includes(UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED))).toEqual([])
+    expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', dueAt: clock.now() + waitMs(1), waitMs: waitMs(1), refusals: 1, mode: UNAVAILABLE_RETRY_MODE_FULL })
+    expect(delays(clock)).toEqual([waitMs(1)])
+  })
+
+  test('an end deferred with a live reading, then arm, then an end with no reading, in one run on a row last read pending: the arm drops the first end’s reading too, so the second end keeps the timer on the pending row', async () => {
+    const { clock, controller, lines, held } = await heldRun((c) => {
+      c.arm(KEY, UNAVAILABLE)
+      c.armPendingOnly(KEY)
+    })
+    const linesBefore = lines.length
+
+    expect(controller.conditionEnded(KEY, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE, LIVENESS_LIVE)).toBe('deferred')
+    controller.arm(KEY, UNAVAILABLE)
+    expect(controller.conditionEnded(KEY, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE)).toBe('deferred')
+    held.answer({ kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN, keepsLastRow: true })
+    await controller.whenRunSettled(KEY)
+
+    expect(lines.slice(linesBefore)).toEqual([
+      keptLine(KEY, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
+      reArmedLine(KEY, 1, UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN, 1),
+    ])
+    expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', refusals: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+    expect(delays(clock)).toEqual([waitMs(1)])
+  })
+
+  // The mirror: an end that lands after the arm in the same run is still
+  // applied. The pending-only-override and kill-failed orders of the same
+  // mirror are the hand-off describe's cases below.
+  test.each<[string, (c: UnavailableRetryController) => void, (key: string) => string[]]>([
+    ['arm, no row read pending: the end stops the timer', armUnavailable, (key) => [stoppedLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED)]],
+    ['armPendingOnly, the row last read pending: the end keeps the timer', (c) => { c.armPendingOnly(KEY) }, (key) => [
+      keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
+      reArmedLine(key, 1, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, 1),
+    ]],
+  ])('%s in a full-mode run, then the tmux-unresponsive condition’s end in the same run: the end is still applied after the run', async (_what, armAgain, expected) => {
+    const { clock, controller, lines, held } = await heldRun(armUnavailable)
+    const linesBefore = lines.length
+
+    armAgain(controller)
+    expect(controller.conditionEnded(KEY, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE)).toBe('deferred')
+    held.answer({ kind: 'again' })
+    await controller.whenRunSettled(KEY)
+
+    const want = expected(KEY)
+    expect(lines.slice(linesBefore)).toEqual(want)
+    expect(controller.isArmed(KEY)).toBe(want.length > 1)
+    expect(clock.pendingCount()).toBe(want.length > 1 ? 1 : 0)
   })
 })
 

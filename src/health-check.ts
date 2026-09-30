@@ -103,6 +103,16 @@ export interface HealthCheckDeps {
    */
   endNotConnectedEpisode?(key: string): void
   /**
+   * b.jg5 SRJ-310 rule 2 (tick half): end the persona's `tmux-unresponsive`
+   * condition (production: the condition's end, reason `tick`, with the
+   * tick's `live` reading), called on every tick that finds it `live`
+   * (never `pending`), connected and with its stream. A condition that does
+   * not hold is left alone by the callee. A `pending`, `unknown` or `dead`
+   * reading, and a disconnected or streamless session, never call it.
+   * Absent: nothing is called.
+   */
+  endTmuxUnresponsive?(key: string): void
+  /**
    * b.f2b: true while the restart path's reconnect adapter holds an idle run
    * for the persona's `working` row that one more attempt can conclude
    * (production: the session manager's `hasPendingWorkingRowEvidence`). The
@@ -379,8 +389,10 @@ export function startHealthCheck(intervalSeconds: number): void {
             // `live`, connected, AND stream present — healthy. Reset any pending
             // streak so a transient one-tick blip never accumulates toward the
             // threshold. b.f2b: its not-connected episode, if any, is over.
+            // b.jg5 SRJ-310: so is its tmux-unresponsive condition, if it holds.
             disconnectedStreak.delete(key)
             deps.endNotConnectedEpisode?.(key)
+            deps.endTmuxUnresponsive?.(key)
           }
         } catch (err) {
           console.error(`[slack] health-check: error checking persona=${key}: ${describeThrownValue(err)}`)

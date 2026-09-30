@@ -401,7 +401,7 @@ function defaultStatFn(path: string): boolean {
  * single CSCB→AD entry point) so an AD outage is flagged against this persona.
  */
 function defaultGetRow(key: string, claudeInstanceId: string): Promise<GetResult> {
-  return withOutageDetection(key, undefined, (client) =>
+  return withOutageDetection(key, undefined, 'get', (client) =>
     client.get({ claude_instance_id: claudeInstanceId }),
   )
 }

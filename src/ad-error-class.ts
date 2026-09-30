@@ -71,6 +71,22 @@
  * `resumeOrFreshSpawn` (`src/session-manager.ts`) and the `decide` branch of
  * the click handler (`src/permission-click-handler.ts`).
  *
+ * {@link describeAgentDirectorFailure} renders a failed call for a log line by
+ * the same name rule: the `errName` when it is a safe identifier, then the
+ * redacted description.
+ *
+ * Verbs (b.jg5 glossary, SRJ-307, SRJ-310). Every agent-director call made
+ * through the outage wrappers (`src/outage-state.ts`) declares its verb
+ * (`AdCall`): one of `AD_VERBS`, and for `kill` whether the site kills a row
+ * it read live (`AdKillCall`). The tmux-touching verbs are
+ * `TMUX_TOUCHING_VERBS` (`spawn`, plain or reuse, `resume`, `read-pane`,
+ * `send-keys`, `pause`, and `kill` of a live row); {@link isTmuxTouchingCall}
+ * answers for a declared call, a `kill` counting only when declared as a kill
+ * of a row read live. The launch verbs (`spawn`, plain or reuse, and
+ * `resume`) are `AD_LAUNCH_VERBS` ({@link isLaunchCall}). The read verbs
+ * (`status`, `get`, `list`) are `AD_READ_VERBS`. `find-missing`, `delete`, `get-permission` and `decide`
+ * are neither.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -88,7 +104,124 @@ import {
   ERR_TMUX_UNRESPONSIVE_NAME,
   STORE_OPEN_ERR_NAMES,
 } from './agent-director-errors.ts'
-import { isSafeIdentifier, renderLogMessageText } from './persona-connection-errors.ts'
+import {
+  describeLogMessage,
+  describeThrownValue,
+  isSafeIdentifier,
+  renderLogMessageText,
+} from './persona-connection-errors.ts'
+
+// ---------------------------------------------------------------------------
+// Verbs (b.jg5 glossary, SRJ-307, SRJ-310)
+// ---------------------------------------------------------------------------
+
+/** Every agent-director verb a wrapped call declares, as agent-director names it. */
+export const AD_VERBS = [
+  'spawn',
+  'resume',
+  'read-pane',
+  'send-keys',
+  'pause',
+  'kill',
+  'status',
+  'get',
+  'list',
+  'find-missing',
+  'delete',
+  'get-permission',
+  'decide',
+] as const
+
+/** One agent-director verb. */
+export type AdVerb = (typeof AD_VERBS)[number]
+
+/** The `kill` verb. */
+export const AD_VERB_KILL = 'kill'
+
+/**
+ * The tmux-touching verbs (the b.jg5 glossary): `spawn` (plain or reuse),
+ * `resume`, `read-pane`, `send-keys`, `pause`, and `kill` of a live row. A
+ * `kill` call counts only when declared as a kill of a row read live
+ * ({@link isTmuxTouchingCall}).
+ */
+export const TMUX_TOUCHING_VERBS: ReadonlySet<string> = new Set<AdVerb>([
+  'spawn',
+  'resume',
+  'read-pane',
+  'send-keys',
+  'pause',
+  AD_VERB_KILL,
+])
+
+/**
+ * The launch verbs (b.jg5 SRJ-301, SRJ-305): `spawn` (plain or reuse) and
+ * `resume`. A successful launch call leaves its row `pending`
+ * ({@link isLaunchCall}).
+ */
+export const AD_LAUNCH_VERBS: ReadonlySet<string> = new Set<AdVerb>(['spawn', 'resume'])
+
+/** True when the declared call is a launch (`AD_LAUNCH_VERBS`). Never throws. */
+export function isLaunchCall(call: AdCall): boolean {
+  const verb = adCallVerb(call)
+  return verb !== undefined && AD_LAUNCH_VERBS.has(verb)
+}
+
+/** The read verbs (b.jg5 SRJ-301, SRJ-105): `status`, `get` and `list`. */
+export const AD_READ_VERBS: ReadonlySet<string> = new Set<AdVerb>(['status', 'get', 'list'])
+
+/**
+ * A `kill` call as its site declares it: `rowReadLive` is true only when the
+ * site kills a row it read in a live state (a collision ladder's kill of the
+ * row it read live); a kill after a `dead` reading, or a teardown's kill of a
+ * row it did not read, declares false.
+ */
+export interface AdKillCall {
+  readonly verb: typeof AD_VERB_KILL
+  readonly rowReadLive: boolean
+}
+
+/** A wrapped call's declared verb: the verb itself, or a {@link AdKillCall} for `kill`. */
+export type AdCall = Exclude<AdVerb, typeof AD_VERB_KILL> | AdKillCall
+
+/** A kill of a row the site read live. */
+export const AD_CALL_KILL_ROW_READ_LIVE: AdKillCall = Object.freeze({ verb: AD_VERB_KILL, rowReadLive: true })
+
+/** A kill of a row the site did not read live. */
+export const AD_CALL_KILL_ROW_NOT_READ_LIVE: AdKillCall = Object.freeze({ verb: AD_VERB_KILL, rowReadLive: false })
+
+/** The kill declaration for a site that knows whether it read the row live. */
+export function adKillCall(rowReadLive: boolean): AdKillCall {
+  return rowReadLive ? AD_CALL_KILL_ROW_READ_LIVE : AD_CALL_KILL_ROW_NOT_READ_LIVE
+}
+
+/**
+ * The verb of a declared call, as agent-director names it, or `undefined`
+ * when `call` is not a declared call. Never throws.
+ */
+export function adCallVerb(call: AdCall): AdVerb | undefined {
+  try {
+    const verb: unknown = typeof call === 'string' ? call : call.verb
+    return typeof verb === 'string' && (AD_VERBS as readonly string[]).includes(verb) ? (verb as AdVerb) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * True when the declared call is tmux-touching (the b.jg5 glossary): its verb
+ * is in `TMUX_TOUCHING_VERBS`, and a `kill` only when declared as a kill of a
+ * row read live (`rowReadLive` exactly true). Never throws.
+ */
+export function isTmuxTouchingCall(call: AdCall): boolean {
+  try {
+    const verb = adCallVerb(call)
+    if (verb === undefined || !TMUX_TOUCHING_VERBS.has(verb)) return false
+    if (verb !== AD_VERB_KILL) return true
+    return typeof call === 'object' && call !== null && call.rowReadLive === true
+  } catch {
+    return false
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Class labels
@@ -263,6 +396,27 @@ export function describeAdErrorClassification(classification: AdErrorClassificat
   if (classification.reportedName !== undefined) parts.push(`name=${classification.reportedName}`)
   if (classification.message !== undefined) parts.push(`message=${JSON.stringify(classification.message)}`)
   return parts.join(' ')
+}
+
+/**
+ * Token-safe description of a failed agent-director call, for a log line: a
+ * typed agent-director error's `errName` when it is a short identifier, then
+ * its `errDescription` as `message="…"` (`describeLogMessage`: through
+ * `redactSlackLogText`, on one line, capped at `MAX_LOGGED_MESSAGE_LENGTH`
+ * characters) when it has one; else `describeThrownValue(err)`, which renders
+ * the message the same way. Never the raw `errName` or error object. Never
+ * throws.
+ */
+export function describeAgentDirectorFailure(err: unknown): string {
+  try {
+    if (isAgentDirectorError(err) && isSafeIdentifier(err.errName)) {
+      const message = describeLogMessage(err.errDescription)
+      return message === '' ? err.errName : `${err.errName} ${message}`
+    }
+  } catch {
+    /* a throwing property read falls back to the generic describer */
+  }
+  return describeThrownValue(err)
 }
 
 /** The class of an `ErrUnknownErrorName` (or an A-13 value) by `unknownName` and description. */

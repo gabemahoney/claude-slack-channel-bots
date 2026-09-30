@@ -19,7 +19,11 @@
  *   call), the applied-persona lookup over the live applied set, the
  *   relaunch gate below, the restart cap (`isAtCap` at
  *   `RESTART_FAILURE_CAP`), the harness's shutting-down flag and the session
- *   manager's `isLaunchInFlight`. `scriptedAction` is
+ *   manager's `isLaunchInFlight`, and the condition's retry hooks: the
+ *   connection and stream probes (`isSessionConnected` and
+ *   `hasSessionStream`, both over `setConnected`) and `endTmuxUnresponsive`,
+ *   the condition's end with reason `TMUX_UNRESPONSIVE_END_RETRY` and the
+ *   retry's reading. `scriptedAction` is
  *   the scripted action: it answers each persona's queued outcomes
  *   (`answer(key, ...outcomes)`) in order and, once they run out, a bare
  *   refusal (`{ kind: 'again' }`). `options.action` replaces the default
@@ -62,6 +66,26 @@
  *   kind) is recorded here, then armed on the controller. With
  *   `options.triggerSink: false` no sink is installed: nothing is recorded or
  *   armed.
+ * - `episodes` and `tmuxUnresponsive` (b.jg5 SRJ-307, SRJ-310, SRJ-1016):
+ *   one notice-episodes instance (`createPersonaEpisodes`) on the harness
+ *   clock, whose posts land in `episodeNotices` and whose lines go to
+ *   `lines`, and the `tmux-unresponsive` condition over it
+ *   (`createTmuxUnresponsiveCondition`, its started and ended lines to
+ *   `lines`), wired as `main()` wires them: the condition is the outage
+ *   state's condition sink in the same `initOutageState` call as the trigger
+ *   sink, so a tmux-touching call's UNAVAILABLE inside an attempt starts it
+ *   on the harness clock and a tmux-touching success or GONE ends it; each
+ *   end of a holding condition calls the controller's condition-end entry
+ *   (`conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
+ *   reading)`), recorded in `conditionEnds` (`{ key, reading, result }`)
+ *   with what the controller answered. A case reads the condition with
+ *   `tmuxUnresponsive.holds(key)` and `tmuxUnresponsive.firstRefusalAt(key)`.
+ *   With `options.conditionSink: false` the condition is not installed in
+ *   the outage state (the retry hooks and `tickEnd` still reach it).
+ * - `tickEnd(key)`: what a health tick's healthy branch does to the
+ *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
+ *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
+ *   reading (`LIVENESS_LIVE`). The harness has no health tick of its own.
  * - `launch(key)`: a start-pass launch of the configured persona `key`
  *   through the real `spawnForPersona` (`isStartup` true) over the stub,
  *   resolving with its `SpawnPersonaResult`. Each persona's working directory
@@ -74,6 +98,8 @@
  *   when a launch or a run is still in flight at the bound. A retry whose
  *   launch goes on past a spawn needs it before the clock moves on.
  * - `outageNotices`: the outage state's notices, `{ key, text }`, in order.
+ * - `episodeNotices`: the notice episodes' posts, `{ key, text }`, in order
+ *   (production posts them through the persona notifier).
  * - `notices`: the session manager's notices (`setSessionNotifier`),
  *   `{ key, text }`, in order.
  * - `stateDir` and `startupErrors()`: `SLACK_STATE_DIR` points at a
@@ -98,20 +124,23 @@
  *   with spaces, in order. `console.error` is replaced at build and put back
  *   by `cleanup()`.
  * - `captured()`: everything captured, for `assertNoLeak`: the lines, the
- *   `console.error` lines, both notice lists, the startup-errors entries, the
- *   attempts, the triggers and the state directory as a written file.
- * - `cleanup()`: stops every retry timer (`stopAll`), then undoes every
+ *   `console.error` lines, the three notice lists, the startup-errors
+ *   entries, the attempts, the triggers, the condition ends and the state
+ *   directory as a written file.
+ * - `cleanup()`: stops every retry timer (`stopAll`) and forgets every
+ *   episode (`episodes.forgetAll()`), then undoes every
  *   install and reset the harness made (`console.error`, the restart module's state and the
  *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
  *   the stub spawn path and client with every launch still in flight, the
  *   findMissing memo, the tmux seams, the settings install,
  *   `SLACK_STATE_DIR`) and removes the temporary directory. It throws, after
  *   undoing everything, when a timer is still pending on the clock or a
- *   persona is still armed.
+ *   persona is still armed: the episodes run on the harness clock, so a timer
+ *   they armed and left pending fails it too.
  *
  * Pending-only mode is armed directly (`controller.armPendingOnly`) until
  * covered `pending` rows exist. Later work extends this harness in place (the
- * pending-row rule, the latch and the episodes).
+ * pending-row rule, the latch and the episode notices).
  *
  * Isolation: no top-level `mock.module()`, no real HOME, `~/.agent-director`,
  * tmux or child process. The retry timer runs on the fake clock only; the one
@@ -131,8 +160,18 @@ import type { Client } from 'agent-director'
 import { adSettingsInEffect, installAdSettings, resetAdSettingsForTests, type AdSettingsInEffect } from '../../src/ad-settings.ts'
 import { _resetBackoffState, isAtCap } from '../../src/backoff.ts'
 import type { Persona, PersonaConfig } from '../../src/config.ts'
+import { LIVENESS_LIVE } from '../../src/liveness-reading.ts'
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
+import {
+  createPersonaEpisodes,
+  createTmuxUnresponsiveCondition,
+  TMUX_UNRESPONSIVE_END_RETRY,
+  TMUX_UNRESPONSIVE_END_TICK,
+  type PersonaEpisodes,
+  type TmuxUnresponsiveCondition,
+  type TmuxUnresponsiveEndResult,
+} from '../../src/persona-episodes.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
 import { createPersonaRelaunchGate } from '../../src/persona-start.ts'
 import { _resetRestartState, initRestart, RESTART_FAILURE_CAP, runRestartRetry, type RestartDeps } from '../../src/restart.ts'
@@ -155,9 +194,11 @@ import {
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
+  UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   type UnavailableRetryAction,
+  type UnavailableRetryConditionEndResult,
   type UnavailableRetryTriggerSink,
   type UnavailableRetryController,
   type UnavailableRetryMode,
@@ -205,6 +246,8 @@ export interface RecoveryHarnessOptions {
   settleFlushes?: number
   /** Install the controller as the outage state's trigger sink (b.jg5 SRJ-301); true when unset. */
   triggerSink?: boolean
+  /** Install the `tmux-unresponsive` condition as the outage state's condition sink (b.jg5 SRJ-307); true when unset. */
+  conditionSink?: boolean
   /** Real ms `settle` waits at most for the launches in flight; `DEFAULT_SETTLE_MS` when unset. */
   settleMs?: number
 }
@@ -235,6 +278,15 @@ export interface RecoveryNotice {
   readonly text: string
 }
 
+/** One end of a holding `tmux-unresponsive` condition, as the controller's condition-end entry saw it. */
+export interface RecoveryConditionEnd {
+  readonly key: string
+  /** The reading the end brought (a tick's or a retry's), or undefined (a tmux-touching success or GONE). */
+  readonly reading: string | undefined
+  /** What `controller.conditionEnded` answered. */
+  readonly result: UnavailableRetryConditionEndResult
+}
+
 /** What `makeRecoveryHarness` returns; see the module comment. */
 export interface RecoveryHarness {
   readonly clock: FakeClock
@@ -251,6 +303,14 @@ export interface RecoveryHarness {
   readonly notices: RecoveryNotice[]
   readonly outageNotices: RecoveryNotice[]
   readonly triggers: RecoveryTrigger[]
+  /** The notice episodes' posts, in order. */
+  readonly episodeNotices: RecoveryNotice[]
+  /** The notice-episodes instance, on the harness clock. */
+  readonly episodes: PersonaEpisodes
+  /** The `tmux-unresponsive` condition over `episodes`, wired as `main()` wires it. */
+  readonly tmuxUnresponsive: TmuxUnresponsiveCondition
+  /** Every call the condition made to the controller's condition-end entry, in order. */
+  readonly conditionEnds: RecoveryConditionEnd[]
   /** Keys `onCapReached` was called for, in order. */
   readonly capReached: string[]
   /** The per-persona serializer the restart module runs its work through. */
@@ -274,6 +334,8 @@ export interface RecoveryHarness {
   teardown(key: string): void
   /** Drop persona `key` from the applied configuration. */
   remove(key: string): void
+  /** A health tick's end of the condition, as `main()` binds it: reason `tick`, reading `live`. */
+  tickEnd(key: string): TmuxUnresponsiveEndResult
   startupErrors(): string[]
   settings(): AdSettingsInEffect
   advance(ms: number): Promise<number>
@@ -296,6 +358,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const notices: RecoveryNotice[] = []
   const outageNotices: RecoveryNotice[] = []
   const triggers: RecoveryTrigger[] = []
+  const episodeNotices: RecoveryNotice[] = []
+  const conditionEnds: RecoveryConditionEnd[] = []
   const settleFlushes = options.settleFlushes ?? DEFAULT_SETTLE_FLUSHES
   const settleMs = options.settleMs ?? DEFAULT_SETTLE_MS
   const log = (line: string): void => {
@@ -334,6 +398,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
     isShuttingDown: () => shuttingDown,
     isInFlight: isLaunchInFlight,
+    isSessionConnected: (key) => connected.has(key),
+    hasSessionStream: (key) => connected.has(key),
+    endTmuxUnresponsive: (key, reading) => {
+      tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
+    },
   })
   let current: UnavailableRetryAction = options.action === 'scripted' ? scripted : (options.action ?? fullMode)
   const controller = createUnavailableRetryController({
@@ -342,6 +411,25 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     action: (key, attempt) => {
       attempts.push({ key, retry: attempt.retry, causes: attempt.causes, mode: attempt.mode, at: clock.now() })
       return current(key, attempt)
+    },
+  })
+
+  // As main() builds them: the one episodes instance, and the condition over
+  // it, whose every end is reported to the controller's condition-end entry.
+  const episodes = createPersonaEpisodes({
+    sink: (key, text) => {
+      episodeNotices.push({ key, text })
+    },
+    log,
+    clock,
+  })
+  const tmuxUnresponsive = createTmuxUnresponsiveCondition({
+    episodes,
+    log,
+    conditionEnded: (key, reading) => {
+      const result = controller.conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE, reading)
+      conditionEnds.push({ key, reading, result })
+      return result
     },
   })
 
@@ -369,6 +457,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     },
     getClient: () => stub.client as unknown as Client,
     ...(options.triggerSink === false ? {} : { triggerSink }),
+    ...(options.conditionSink === false ? {} : { conditionSink: tmuxUnresponsive }),
   })
   setSessionNotifier((key, text) => {
     notices.push({ key, text })
@@ -451,6 +540,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     notices,
     outageNotices,
     triggers,
+    episodeNotices,
+    episodes,
+    tmuxUnresponsive,
+    conditionEnds,
     capReached,
     serializer,
     fullModeAction: fullMode,
@@ -504,6 +597,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       applied.delete(key)
     },
 
+    tickEnd: (key) => tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE),
+
     startupErrors,
 
     settings: () => adSettingsInEffect(),
@@ -526,14 +621,17 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       errors: [...errors],
       notices: [...notices],
       outageNotices: [...outageNotices],
+      episodeNotices: [...episodeNotices],
       startupErrors: startupErrors(),
       attempts: [...attempts],
       triggers: [...triggers],
+      conditionEnds: [...conditionEnds],
       stateDir: writtenFile(stateDir),
     }),
 
     cleanup() {
       controller.stopAll('the recovery harness is cleaned up')
+      episodes.forgetAll()
       const pendingTimers = clock.pendingCount()
       const armed = controller.armedKeys()
       _resetRestartState()

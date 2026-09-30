@@ -112,7 +112,13 @@ import {
   whenLaunchSettled,
 } from './session-manager.ts'
 import { createPersonaNotifier } from './persona-notifier.ts'
-import { createPersonaEpisodes, type PersonaEpisodes } from './persona-episodes.ts'
+import {
+  createPersonaEpisodes,
+  createTmuxUnresponsiveCondition,
+  TMUX_UNRESPONSIVE_END_RETRY,
+  TMUX_UNRESPONSIVE_END_TICK,
+  type PersonaEpisodes,
+} from './persona-episodes.ts'
 import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
@@ -144,8 +150,14 @@ import {
   ErrSystemInstallDisappeared,
   ErrTmuxNotAvailable,
 } from './agent-director-errors.ts'
-import { AD_ERROR_CLASS_ENVIRONMENT, classifyAdError, hasAdErrorName } from './ad-error-class.ts'
 import {
+  AD_CALL_KILL_ROW_NOT_READ_LIVE,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  classifyAdError,
+  hasAdErrorName,
+} from './ad-error-class.ts'
+import {
+  LIVENESS_LIVE,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_UNKNOWN,
   LIVENESS_UNKNOWN,
@@ -177,6 +189,7 @@ import {
   createFullModeRetryAction,
   createUnavailableRetryController,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   type UnavailableRetryController,
@@ -1155,7 +1168,9 @@ export function _buildKillSessionAdapter(
       return
     }
     try {
-      await withOutageDetection(key, undefined, (client) =>
+      // The restart path kills only after a `dead` reading (b.jg5 E9), so
+      // this kill is not of a row read live: not tmux-touching.
+      await withOutageDetection(key, undefined, AD_CALL_KILL_ROW_NOT_READ_LIVE, (client) =>
         client.kill({ claude_instance_id: personaInstanceId(key) })
       )
     } catch (err) {
@@ -1299,7 +1314,7 @@ export function _buildReconnectSessionAdapter(
     let launchStartedAt: string | undefined
     try {
       const claude_instance_id = personaInstanceId(key)
-      const st = await withOutageDetection(key, undefined, (client) =>
+      const st = await withOutageDetection(key, undefined, 'status', (client) =>
         client.status({ claude_instance_id }),
       )
       state = st.state
@@ -1788,7 +1803,10 @@ export async function main(): Promise<void> {
   // applied, not up (the relaunch gate) or at the restart cap. The gate is built further down and
   // initRestart runs later still: no statement in between awaits, and no
   // retry falls due before 30 s. Dry run arms nothing, since it makes no
-  // agent-director call.
+  // agent-director call. b.jg5 SRJ-310: a retry that finds the persona's row
+  // live out of `pending` with its session connected with its stream ends
+  // its tmux-unresponsive condition (built just below; no retry runs before
+  // it exists).
   const retryTimers = createUnavailableRetryController({
     log: (line) => console.error(line),
     action: createFullModeRetryAction({
@@ -1799,20 +1817,41 @@ export async function main(): Promise<void> {
       isShuttingDown: () => shuttingDown,
       isInFlight: isLaunchInFlight,
       readRow: readPersonaRowState,
+      isSessionConnected: (key) => getSessionByPersona(key)?.connected === true,
+      hasSessionStream,
+      endTmuxUnresponsive: (key, reading) => {
+        tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
+      },
     }),
   })
   unavailableRetry = retryTimers
 
+  // b.jg5 SRJ-307, SRJ-310: the per-persona tmux-unresponsive condition,
+  // held in the notice episodes, apart from the outage flags. The outage
+  // state's wrappers start and end it (installed as its condition sink
+  // below, before the start pass); the health tick and a retry end it too.
+  // Each end is reported once to the retry controller's condition-end entry
+  // (SRJ-306), with the live reading a tick or a retry brings.
+  const tmuxUnresponsive = createTmuxUnresponsiveCondition({
+    episodes: noticeEpisodes,
+    log: (line) => console.error(line),
+    conditionEnded: (key, reading) =>
+      retryTimers.conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE, reading),
+  })
+
   // Every persona notice goes through the one per-persona notifier: it holds
   // a notice until the persona's client is available and logs instead of
   // posting in dry run. An agent-director error inside a launch or recovery
-  // attempt arms the persona's retry timer through the trigger sink.
+  // attempt arms the persona's retry timer through the trigger sink, and a
+  // tmux-touching call's UNAVAILABLE there starts the persona's
+  // tmux-unresponsive condition through the condition sink.
   initOutageState({
     notify: (key, text) => {
       void personaNotifier.notify(key, text)
     },
     getClient,
     triggerSink: retryTimers,
+    conditionSink: tmuxUnresponsive,
   })
   setSessionNotifier(personaNotifier.notify)
 
@@ -2258,6 +2297,11 @@ export async function main(): Promise<void> {
     isAutoRestartDisabled: () => appliedConfig.session_restart_delay === 0,
     notifyNotConnected: notifyDisconnectedWithAutoRestartDisabled,
     endNotConnectedEpisode: forgetNotConnectedEpisode,
+    // b.jg5 SRJ-310: a tick that finds the persona `live`, connected and with
+    // its stream ends its tmux-unresponsive condition, with that reading.
+    endTmuxUnresponsive: (key) => {
+      tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)
+    },
     // b.f2b: while the reconnect adapter holds an idle run for a persona's
     // `working` row, the next attempt (which can find the row stale and
     // reconnect it) is scheduled on the first undeliverable tick.

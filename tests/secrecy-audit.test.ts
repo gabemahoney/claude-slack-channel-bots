@@ -33,7 +33,8 @@
  *    manager, restart, the permission poller and click handler, the persona
  *    notifier and destinations, the health check, the CLI, the template
  *    install, the agent-director error classifier, the agent-director
- *    settings reader and the UNAVAILABLE retry timer), a value import of one
+ *    settings reader, the UNAVAILABLE retry timer and the persona episodes
+ *    with their tmux-unresponsive condition), a value import of one
  *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
  *    config-file writer, the agent-director settings-file writer, the reload,
  *    connection, routing and recovery harnesses, the Slack client factory
@@ -59,8 +60,9 @@
  *    `describeLogMessage` render it as `message="…"`, the
  *    `describeAgentDirectorFailure` copies and `describeRefreshFailure` the
  *    same). In every file under src/, a log call (a console method, or `log`,
- *    `logFailure`, `logViaDeps`, `logDeps`, `recordStartupError` or `fatal`,
- *    bare or on an object) therefore never passes a caught error as an argument,
+ *    `logFailure`, `logViaDeps`, `logDeps`, `safeLog`, `recordStartupError`
+ *    or `fatal`, bare or on an object) therefore never passes a caught error
+ *    as an argument,
  *    interpolates it, reads its message or stack outside a describer call,
  *    hands it to a function that is not a safe describer (`String(err)`),
  *    logs an `errDescription` not through `redactSlackLogText` or an
@@ -128,6 +130,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/ad-error-class\.ts$/, "the agent-director error classifier, whose reported message carries agent-director failure text (an error's description) to log lines"],
   [/^src\/ad-settings\.ts$/, "the agent-director settings reader, which reads agent-director's config.toml and logs a refused read's reason"],
   [/^src\/unavailable-retry\.ts$/, "the UNAVAILABLE retry timer, whose lines can carry agent-director failure text (a cause or a failed retry, described)"],
+  [/^src\/persona-episodes\.ts$/, "the persona episodes and the tmux-unresponsive condition, whose start line carries agent-director failure text (the refusing verb's error, described)"],
 ]
 
 /** Test helpers whose named exports build tokens, credentials or config files, or plant the sentinel. */
@@ -145,7 +148,7 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
   'tests/test-helpers/reload-harness.ts': { makeReloadHarness: 'builds the reload harness' },
   'tests/test-helpers/persona-connection-harness.ts': { makeConnectionHarness: 'builds the connection manager over credentials files' },
   'tests/test-helpers/persona-routing-harness.ts': { makeRoutingHarness: 'builds sentinel-bearing Slack stubs' },
-  'tests/test-helpers/recovery-harness.ts': { makeRecoveryHarness: "builds the recovery harness, which writes agent-director's config.toml and captures the retry timer's and settings reader's lines" },
+  'tests/test-helpers/recovery-harness.ts': { makeRecoveryHarness: "builds the recovery harness, which writes agent-director's config.toml and captures the retry timer's, settings reader's and tmux-unresponsive condition's lines" },
   'tests/test-helpers/slack-stub.ts': { makeStubSlackFactory: 'builds Slack clients from tokens' },
 }
 
@@ -427,11 +430,12 @@ const CONSOLE_METHODS = ['error', 'warn', 'log', 'info', 'debug']
  * Functions whose arguments reach a log line or startup-errors.log verbatim
  * (`recordStartupError` writes an `Error` cause as its name and message),
  * called bare or on an object (`deps.log`, `d.recordStartupError`; the click
- * handler's `logDeps(deps, …)`). A local declaration that passes its last
- * parameter only through a describer is a describing wrapper instead, and its
- * calls are not sinks (`describingWrappers`).
+ * handler's `logDeps(deps, …)`; the persona episodes' `safeLog(deps.log, …)`).
+ * A local declaration that passes its last parameter only through a describer
+ * is a describing wrapper instead, and its calls are not sinks
+ * (`describingWrappers`).
  */
-const SINK_FUNCTIONS = ['log', 'logFailure', 'logViaDeps', 'logDeps', 'recordStartupError', 'fatal']
+const SINK_FUNCTIONS = ['log', 'logFailure', 'logViaDeps', 'logDeps', 'safeLog', 'recordStartupError', 'fatal']
 
 /** A log call: a console method or a sink function, bare or on an object. Built at runtime. */
 const SINK_CALL = new RegExp(
@@ -715,7 +719,9 @@ describe("a caught error's text reaches a log line under src/ only redacted (E14
 
   test('the scan reads every file under src/ and finds the log calls of the Slack and agent-director modules (it is not vacuous)', () => {
     expect(SOURCE_FILES).toEqual(expect.arrayContaining(['src/session-manager.ts', 'src/restart.ts', 'src/persona-connections.ts', 'src/cli.ts', 'src/server.ts']))
-    const counts = ['src/session-manager.ts', 'src/restart.ts', 'src/permission-poller.ts', 'src/persona-lifecycle.ts'].map((file) => logCalls(codeOf(file)).length)
+    const counts = ['src/session-manager.ts', 'src/restart.ts', 'src/permission-poller.ts', 'src/persona-lifecycle.ts', 'src/persona-episodes.ts'].map(
+      (file) => logCalls(codeOf(file)).length,
+    )
     expect(counts.every((n) => n > 0)).toBe(true)
   })
 
@@ -727,6 +733,8 @@ describe("a caught error's text reaches a log line under src/ only redacted (E14
     ['a name set from the message', 'try { f() } catch (err) { const cause = err instanceof Error ? err.message : String(err); log(`x: ${cause}`) }', ['interpolates a caught error']],
     ['a raw startup-error cause', "try { f() } catch (getErr) { recordStartupError('c', 'm', getErr) }", ['passes a caught error as a log argument']],
     ["a caught error through the click handler's logDeps", 'try { f() } catch (err) { logDeps(deps, `x: ${err}`) }', ['interpolates a caught error']],
+    ["a caught error through the persona episodes' safeLog", 'try { f() } catch (err) { safeLog(deps.log, `x: ${err}`) }', ['interpolates a caught error']],
+    ["a described error through the persona episodes' safeLog", 'try { f() } catch (error) { safeLog(deps.log, `x: ${describeAgentDirectorFailure(error)}`) }', []],
     ['an unredacted errDescription', 'log(`x: ${e.errDescription}`)', ['logs an errDescription not through redactSlackLogText']],
     ['an unchecked errName', 'console.error(`x: ${e.errName}`)', ['logs an errName not checked by isSafeIdentifier']],
     ['a wrapper that logs its error raw', 'function logFailure(what, err) { log(`${what}: ${err}`) }\ntry { f() } catch (err) { logFailure("x", err) }', ['interpolates a caught error', 'passes a caught error as a log argument']],
