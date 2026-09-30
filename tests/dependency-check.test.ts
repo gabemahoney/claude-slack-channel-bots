@@ -104,10 +104,12 @@ import {
   errSystemInstallNotFound,
   errSystemInstallTooOld,
   errSystemInstallUnreachable,
+  makeCloseCountingStubClient,
+  makePassingGateDeps,
   makeStubClient,
   makeStubCreateClient,
 } from './test-helpers/agent-director-stub.ts'
-import type { StubClient, StubClientOptions, StubCreateClientOptions } from './test-helpers/agent-director-stub.ts'
+import type { CloseCountingStubClient, StubClient, StubClientOptions, StubCreateClientOptions } from './test-helpers/agent-director-stub.ts'
 import {
   CLIENT_MIN_VERSION,
   DEV_PLACEHOLDER_VERSION,
@@ -162,23 +164,6 @@ const LATER_RELEASE = (() => {
   return `${major}.${minor + 1}.0`
 })()
 
-/**
- * Deps for a run that reaches the gate's end when nothing is overridden:
- * a default stub (`PHASE1_RC_VERSION`), passing probes, ENOENT state.db,
- * UID 1000. Each case overrides the step under test.
- */
-function passingDeps(overrides: Partial<StartupGateDeps> = {}): Partial<StartupGateDeps> {
-  return {
-    createClient: makeStubCreateClient(),
-    ...passingProbes,
-    statSync: defaultStat,
-    geteuid: () => 1000,
-    recordStartupError: noopRecord,
-    exit: noopExit,
-    ...overrides,
-  }
-}
-
 /** A client factory resolving with a default stub reporting `binaryVersion`. */
 function clientAt(binaryVersion: string): StartupGateDeps['createClient'] {
   return makeStubCreateClient({ client: makeStubClient({ binaryVersion }) })
@@ -203,14 +188,6 @@ function optionsBesideCallTimeout(opts: RecordedClientOptions[number]): Record<s
   delete rest.callTimeoutMs
   rest.logger = opts.logger === undefined ? undefined : Object.keys(opts.logger).sort()
   return rest
-}
-
-/** A stub client whose `close()` counts its calls. */
-function closeCountingStub(binaryVersion?: string): { client: StubClient; closes: () => number } {
-  let count = 0
-  const client = makeStubClient(binaryVersion === undefined ? {} : { binaryVersion })
-  client.close = () => { count += 1 }
-  return { client, closes: () => count }
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +691,7 @@ describe('b.jg5 SRJ-102: checkErrorCatalog over supplied dist text', () => {
   })
 
   test('a probe built from the check over text lacking a Phase-1-only name fails the gate at api-surface', async () => {
-    const outcome = await runStartupGate(passingDeps({
+    const outcome = await runStartupGate(makePassingGateDeps({
       probeErrorCatalog: () => checkErrorCatalog(distText([ERR_TMUX_SESSION_CONFLICT_NAME], { metadata: true })),
     }))
     expect(outcome.ok).toBe(false)
@@ -998,10 +975,10 @@ describe('SR-4.1: async createClient injection', () => {
     const withCalls: RecordedClientOptions = []
     const withoutCalls: RecordedClientOptions = []
     const withOutcome = await runStartupGate(
-      passingDeps({ createClient: makeStubCreateClient({ calls: withCalls }) }),
+      makePassingGateDeps({ createClient: makeStubCreateClient({ calls: withCalls }) }),
       { callTimeoutMs: ms },
     )
-    const withoutOutcome = await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ calls: withoutCalls }) }))
+    const withoutOutcome = await runStartupGate(makePassingGateDeps({ createClient: makeStubCreateClient({ calls: withoutCalls }) }))
     expect(withOutcome.ok).toBe(true)
     expect(withoutOutcome.ok).toBe(true)
     expect(withCalls.length).toBe(1)
@@ -1116,7 +1093,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
       named: ['unparseable-version'],
     },
   ])('$name → label and refusal kind', async ({ createClient, phase, classLabel, refusalKind, named }) => {
-    const outcome = await runStartupGate(passingDeps({ createClient }))
+    const outcome = await runStartupGate(makePassingGateDeps({ createClient }))
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
       expect(outcome.phase).toBe(phase)
@@ -1129,7 +1106,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
   })
 
   test('PHASE1_RC_VERSION passes and adVersion equals it', async () => {
-    const outcome = await runStartupGate(passingDeps({ createClient: clientAt(PHASE1_RC_VERSION) }))
+    const outcome = await runStartupGate(makePassingGateDeps({ createClient: clientAt(PHASE1_RC_VERSION) }))
     expect(outcome.ok).toBe(true)
     if (outcome.ok) {
       expect(outcome.adVersion).toBe(PHASE1_RC_VERSION)
@@ -1140,7 +1117,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
     const stub = makeStubClient({ binaryVersion: OLD_AD_VERSION })
     const calls: string[] = []
     const closed: unknown[] = []
-    const outcome = await runStartupGate(passingDeps({
+    const outcome = await runStartupGate(makePassingGateDeps({
       createClient: makeStubCreateClient({ client: stub }),
       closeClient: (client) => { closed.push(client) },
       probeGetPermission: () => { calls.push('p1'); return true },
@@ -1161,7 +1138,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
       versionResult: cannedVersion(PHASE1_RC_VERSION),
       versionCalls,
     })
-    const outcome = await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ client: stub }) }))
+    const outcome = await runStartupGate(makePassingGateDeps({ createClient: makeStubCreateClient({ client: stub }) }))
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
       expect(outcome.refusalKind).toBe(REFUSAL_KIND_BELOW_PHASE1_FLOOR)
@@ -1207,7 +1184,7 @@ describe('b.jg5 SRJ-208: version refusal messages', () => {
       carriesSkillBlock: true,
     },
   ])('$name names the runbook section, the versions (incl. the Phase 1 floor) and the path, and no upgrade form or runtime re-check phrase', async ({ name, createClient, named, carriesSkillBlock }) => {
-    const outcome = await runStartupGate(passingDeps({ createClient }))
+    const outcome = await runStartupGate(makePassingGateDeps({ createClient }))
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
       expect(outcome.classLabel).toBe(name)
@@ -1252,7 +1229,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: refusal kind of every other failure branch',
     ['ad-same-user', { statSync: () => ({ uid: 7777 }) }],
     ['ad-same-user-stat', { statSync: eacces }],
   ])('%s → refusal kind other', async (classLabel, overrides) => {
-    const outcome = await runStartupGate(passingDeps(overrides))
+    const outcome = await runStartupGate(makePassingGateDeps(overrides))
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
       expect(outcome.classLabel).toBe(classLabel)
@@ -1271,7 +1248,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: skipPhase1Floor option', () => {
   })
 
   test.each([OLD_AD_VERSION, DEV_PLACEHOLDER_VERSION])('with the option set, %s passes', async (version) => {
-    const outcome = await runStartupGate(passingDeps({ createClient: clientAt(version) }), { skipPhase1Floor: true })
+    const outcome = await runStartupGate(makePassingGateDeps({ createClient: clientAt(version) }), { skipPhase1Floor: true })
     expect(outcome.ok).toBe(true)
     if (outcome.ok) {
       expect(outcome.adVersion).toBe(version)
@@ -1280,7 +1257,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: skipPhase1Floor option', () => {
 
   test('with the option set, the client\'s too-old refusal still fails with client-too-old', async () => {
     const outcome = await runStartupGate(
-      passingDeps({ createClient: makeStubCreateClient({ error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION) }) }),
+      makePassingGateDeps({ createClient: makeStubCreateClient({ error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION) }) }),
       { skipPhase1Floor: true },
     )
     expect(outcome.ok).toBe(false)
@@ -1292,7 +1269,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: skipPhase1Floor option', () => {
 
   test('with the option set, a probe failure still fails', async () => {
     const outcome = await runStartupGate(
-      passingDeps({ createClient: clientAt(OLD_AD_VERSION), probeGetPermission: () => false }),
+      makePassingGateDeps({ createClient: clientAt(OLD_AD_VERSION), probeGetPermission: () => false }),
       { skipPhase1Floor: true },
     )
     expect(outcome.ok).toBe(false)
@@ -1307,7 +1284,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: skipPhase1Floor option', () => {
     ['empty options', {}],
     ['skipPhase1Floor false', { skipPhase1Floor: false }],
   ])('without the option (%s) the floor applies', async (_label, options) => {
-    const outcome = await runStartupGate(passingDeps({ createClient: clientAt(OLD_AD_VERSION) }), options)
+    const outcome = await runStartupGate(makePassingGateDeps({ createClient: clientAt(OLD_AD_VERSION) }), options)
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
       expect(outcome.refusalKind).toBe(REFUSAL_KIND_BELOW_PHASE1_FLOOR)
@@ -1354,7 +1331,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: runAgentDirectorStartupGate', () => {
 
   test('OLD_AD_VERSION → one record naming the floor label and both versions, one non-zero exit', async () => {
     await expect(
-      runAgentDirectorStartupGate(passingDeps({ createClient: clientAt(OLD_AD_VERSION), ...capture })),
+      runAgentDirectorStartupGate(makePassingGateDeps({ createClient: clientAt(OLD_AD_VERSION), ...capture })),
     ).rejects.toBeInstanceOf(ExitCalled)
     expect(records.length).toBe(1)
     expect(records[0]!.classLabel).toBe(AD_BELOW_PHASE1_FLOOR)
@@ -1366,7 +1343,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: runAgentDirectorStartupGate', () => {
 
   test('client too old → one record with the too-old label', async () => {
     await expect(
-      runAgentDirectorStartupGate(passingDeps({
+      runAgentDirectorStartupGate(makePassingGateDeps({
         createClient: makeStubCreateClient({ error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION) }),
         ...capture,
       })),
@@ -1377,7 +1354,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: runAgentDirectorStartupGate', () => {
 
   test.each([...REQUIRED_ERR_NAMES])('dist text lacking %s → one catalogue record naming it, one non-zero exit', async (name) => {
     await expect(
-      runAgentDirectorStartupGate(passingDeps({
+      runAgentDirectorStartupGate(makePassingGateDeps({
         probeErrorCatalog: () => checkErrorCatalog(distText([name], { metadata: true })),
         ...capture,
       })),
@@ -1389,7 +1366,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: runAgentDirectorStartupGate', () => {
   })
 
   test('PHASE1_RC_VERSION → no record, no exit', async () => {
-    const result = await runAgentDirectorStartupGate(passingDeps({ createClient: clientAt(PHASE1_RC_VERSION), ...capture }))
+    const result = await runAgentDirectorStartupGate(makePassingGateDeps({ createClient: clientAt(PHASE1_RC_VERSION), ...capture }))
     expect(result.adVersion).toBe(PHASE1_RC_VERSION)
     expect(records).toEqual([])
     expect(exits).toEqual([])
@@ -1399,7 +1376,7 @@ describe('b.jg5 SRJ-203 / SRJ-1513: runAgentDirectorStartupGate', () => {
     const logDir = fs.mkdtempSync(join(tmpdir(), 'cscb-dependency-check-'))
     tempDirs.push(logDir)
     await expect(
-      runAgentDirectorStartupGate(passingDeps({
+      runAgentDirectorStartupGate(makePassingGateDeps({
         createClient: clientAt(OLD_AD_VERSION),
         recordStartupError: (classLabel, message) => recordStartupError(classLabel, message, undefined, { logDir }),
         exit: capture.exit,
@@ -1433,7 +1410,7 @@ describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrEx
     }
   }
 
-  let gate: ReturnType<typeof closeCountingStub>
+  let gate: CloseCountingStubClient
   let gateCalls: RecordedClientOptions
   let steps: string[]
   let closedBySeam: unknown[]
@@ -1442,13 +1419,13 @@ describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrEx
 
   beforeEach(async () => {
     resetClientForTests()
-    gate = closeCountingStub()
+    gate = makeCloseCountingStubClient()
     gateCalls = []
     steps = []
     closedBySeam = []
     records = []
     exits = []
-    const outcome = await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ client: gate.client, calls: gateCalls }) }))
+    const outcome = await runStartupGate(makePassingGateDeps({ createClient: makeStubCreateClient({ client: gate.client, calls: gateCalls }) }))
     expect(outcome.ok).toBe(true)
     expect(getClient() as unknown).toBe(gate.client)
   })
@@ -1482,7 +1459,7 @@ describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrEx
   }
 
   test.each(CALL_TIMEOUTS_MS)('callTimeoutMs %d: built with it, installed, the gate\'s client closed once, no probe and no stat', async (ms) => {
-    const persona = closeCountingStub(LATER_RELEASE)
+    const persona = makeCloseCountingStubClient({ binaryVersion: LATER_RELEASE })
     const calls: RecordedClientOptions = []
     const outcome = await buildPersonaClient(ms, personaDeps(makeStubCreateClient({ client: persona.client, calls })))
     expect(outcome.ok).toBe(true)
@@ -1504,7 +1481,7 @@ describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrEx
     { name: 'OLD_AD_VERSION', version: OLD_AD_VERSION },
     { name: 'DEV_PLACEHOLDER_VERSION', version: DEV_PLACEHOLDER_VERSION },
   ])('$name: the gate\'s floor refusal; the built client closed once, nothing installed, the gate\'s client kept open', async ({ version }) => {
-    const persona = closeCountingStub(version)
+    const persona = makeCloseCountingStubClient({ binaryVersion: version })
     const outcome = await buildPersonaClient(
       DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
       personaDeps(makeStubCreateClient({ client: persona.client })),
@@ -1518,7 +1495,7 @@ describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrEx
     expect(closedBySeam).toEqual([persona.client])
     expect(getClient() as unknown).toBe(gate.client)
     expect(gate.closes()).toBe(0)
-    expect(outcome).toEqual(await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ client: persona.client }) })))
+    expect(outcome).toEqual(await runStartupGate(makePassingGateDeps({ createClient: makeStubCreateClient({ client: persona.client }) })))
     expect(steps).toEqual([])
   })
 
@@ -1539,7 +1516,7 @@ describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrEx
       expect(outcome.classLabel).toBe(classLabel)
       expect(outcome.refusalKind).toBe(refusalKind)
     }
-    expect(outcome).toEqual(await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ error }) })))
+    expect(outcome).toEqual(await runStartupGate(makePassingGateDeps({ createClient: makeStubCreateClient({ error }) })))
     expect(getClient() as unknown).toBe(gate.client)
     expect(gate.closes()).toBe(0)
     expect(closedBySeam).toEqual([])
@@ -1547,7 +1524,7 @@ describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrEx
   })
 
   test('OrExit, below the floor: one record with the floor label and version, one non-zero exit, the gate\'s client kept', async () => {
-    const persona = closeCountingStub(OLD_AD_VERSION)
+    const persona = makeCloseCountingStubClient({ binaryVersion: OLD_AD_VERSION })
     await expect(
       buildPersonaClientOrExit(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, personaDeps(makeStubCreateClient({ client: persona.client }))),
     ).rejects.toBeInstanceOf(ExitCalled)
@@ -1570,7 +1547,7 @@ describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrEx
   })
 
   test('OrExit, a pass: no record, no exit; the persona client installed with the call timeout and returned', async () => {
-    const persona = closeCountingStub()
+    const persona = makeCloseCountingStubClient()
     const calls: RecordedClientOptions = []
     const result = await buildPersonaClientOrExit(
       MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,

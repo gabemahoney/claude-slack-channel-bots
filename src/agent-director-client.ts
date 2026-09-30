@@ -12,8 +12,12 @@
  * Construction: AD 0.7.0+ exposes an async `Client.create()` factory; the
  * subprocess constructor is protected and `new Client(...)` is a compile-time
  * TS error. The SR-5.1 startup gate (src/agent-director-startup.ts) awaits
- * `Client.create({ storePath, createIfMissing: true, logger: makeFilteredAdLogger(console) })`
- * and then hands the resolved instance to `setClient()`. Verb call sites pull the
+ * `Client.create()` with the options built by the one options builder in that
+ * module (store path, create-if-missing, the filtered logger, plus
+ * `callTimeoutMs` when a call timeout is given) and hands the resolved
+ * instance to `setClient()`. Once the start has resolved its configuration,
+ * the server's persona client (b.jg5 SRJ-213) replaces the gate's client
+ * through the same `setClient()` path. Verb call sites pull the
  * installed singleton through `getClient()`; calling `getClient()` before the
  * gate has installed a Client throws an internal bug-marker error (it
  * indicates a caller-site bug, not a runtime condition).

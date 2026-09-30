@@ -1336,9 +1336,10 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['a non-integer number', MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS + 0.5],
       ['a numeric string', String(MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS)],
       ['a non-numeric string', PLACEHOLDER],
-    ])('agent_director_call_timeout_ms %s (%p) is rejected, naming the setting and its range', (_label, value) => {
-      expect(loadError({ ...makePersonaConfigInput({}, dir), agent_director_call_timeout_ms: value })).toContain(
-        'Persona config validation error: agent_director_call_timeout_ms must be a positive integer in ' +
+    ])('agent_director_call_timeout_ms %s (%p) is rejected with the full message, naming the setting and its range', (_label, value) => {
+      expect(loadError({ ...makePersonaConfigInput({}, dir), agent_director_call_timeout_ms: value })).toBe(
+        `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
+          'agent_director_call_timeout_ms must be a positive integer in ' +
           `[${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS}].`,
       )
     })

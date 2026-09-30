@@ -884,6 +884,23 @@ describe('main() runs the call-timeout start step once, after the startup gate, 
       expect([hook, indicesOf(new RegExp(`\\b${hook}\\b`, 'g'), body)]).toEqual([hook, []])
     }
   })
+
+  // main() passes the step no deps, so these defaults are what production
+  // runs; tests/server.test.ts drives the step only with injected ones.
+  test('the step\'s production defaults (PRODUCTION_CALL_TIMEOUT_START_STEP_DEPS), declared once and spread first into the step\'s deps: buildPersonaClient hands the call timeout to buildPersonaClientOrExit, valuesInEffect is adSettingsInEffect, log writes to console.error', () => {
+    const decls = indicesOf(/^const\s+PRODUCTION_CALL_TIMEOUT_START_STEP_DEPS\b[^=]*=\s*\{/gm, SERVER_CODE)
+    expect(decls).toHaveLength(1)
+    const props = objectProperties(SERVER_CODE.slice(SERVER_CODE.indexOf('=', decls[0]!)))
+    expect([...props.keys()]).toEqual(['buildPersonaClient', 'valuesInEffect', 'log'])
+    expect(props.get('buildPersonaClient')).toMatch(new RegExp(`^\\(\\s*(\\w+)\\s*\\)\\s*=>\\s*${BUILD}\\(\\s*\\1\\s*\\)$`))
+    const inEffect: keyof typeof AdSettingsModule = 'adSettingsInEffect'
+    expect(props.get('valuesInEffect')).toBe(inEffect)
+    expect(props.get('log')).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
+    expect(assignmentsTo('PRODUCTION_CALL_TIMEOUT_START_STEP_DEPS')).toEqual([])
+
+    const body = SERVER_CODE.slice(...stepBody())
+    expect(body).toMatch(/\{\s*\.\.\.PRODUCTION_CALL_TIMEOUT_START_STEP_DEPS\s*,\s*\.\.\.deps\s*\}/)
+  })
 })
 
 // ---------------------------------------------------------------------------

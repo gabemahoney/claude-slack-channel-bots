@@ -1617,7 +1617,7 @@ function unusedPauseFound(values: AdSettingsInEffect): string {
 
 describe('ad settings: the call timeout need (b.jg5 SRJ-213)', () => {
   test.each<[string, () => AdSettingsInEffect, AdCeilingVerb]>([
-    ['at the defaults (no file): pause', () => acceptedValuesOfFile({}), 'pause'],
+    ['at the defaults (an empty file): pause', () => acceptedValuesOfFile({}), 'pause'],
     [
       'create_timeout_ms 40000 and pending_grace_seconds 61, read from the file: resume, whose launch ceiling a reuse and a plain spawn share',
       () => acceptedValuesOfFile({ tmux: WORKED_TMUX }),

@@ -302,7 +302,7 @@ function mergeDeps(overrides?: Partial<StartupGateDeps>): StartupGateDeps {
  * uses its own default. The gate's client and the persona client differ only
  * in that key. The 0.10.0 client fixes the timeout at construction.
  */
-export function buildAdClientOptions(callTimeoutMs?: number): ClientOptions {
+function buildAdClientOptions(callTimeoutMs?: number): ClientOptions {
   return {
     storePath: DEFAULT_STORE_PATH,
     createIfMissing: true,

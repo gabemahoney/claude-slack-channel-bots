@@ -515,7 +515,11 @@ At agent-director's defaults, `pause` sets the need: its 9 s plus 30 s is 39 s, 
 
 `<found>` is the number (for example `0`) or the kind of value, never the file's text. At agent-director's defaults, the default `60000` writes no line; a setting of `54000` writes the first line, naming `pause`.
 
-Either way the server still starts, and no value changes. The check runs only at start: a later change to `config.toml` is checked at the next start. To fix it, raise `agent_director_call_timeout_ms` in `config.json` above the need and confirm the change (see [Reload](#reload)). `stop --stop-bots` and `clean_restart` use the new value at once; the server uses it from its next start. For the second line, give `[pause] timeout_seconds` a positive whole number, or remove it for the 30 s default; the next start checks the setting against the need that gives.
+Either way the server still starts, and no value changes. The check runs only at start: a later change to `config.toml` is checked at the next start.
+
+To fix it, raise `agent_director_call_timeout_ms` in `config.json` above the need and confirm the change (see [Reload](#reload)). `stop --stop-bots` and `clean_restart` use the new value at once; the server uses it from its next start.
+
+For the second line, give `[pause] timeout_seconds` a positive whole number, or remove it for the 30 s default; the next start checks the setting against the need that gives.
 
 ---
 

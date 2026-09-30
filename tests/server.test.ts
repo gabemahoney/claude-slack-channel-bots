@@ -26,11 +26,13 @@ import {
 } from '../src/agent-director-client.ts'
 import {
   cannedGetResult,
+  makeCloseCountingStubClient,
   makeStubClient,
   makeStubCreateClient,
   errSpawnNotInteractive,
   errTmuxSendKeys,
   holdSpawns,
+  type CloseCountingStubClient,
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
 import { _buildIsSessionAliveAdapter, _buildReconnectSessionAdapter, _runCallTimeoutStartStep } from '../src/server.ts'
@@ -1345,18 +1347,11 @@ describe('_buildReconnectSessionAdapter', () => {
 // ---------------------------------------------------------------------------
 
 describe('_runCallTimeoutStartStep (b.jg5 SRJ-213)', () => {
-  /** A stub client whose close() counts its calls. */
-  function countingStub(): { client: StubClient; closes: () => number } {
-    let closes = 0
-    const client: StubClient = { ...makeStubClient(), close: () => { closes++ } }
-    return { client, closes: () => closes }
-  }
-
   /** The values in effect at every default, injected. */
   const atDefaults = (): AdSettingsInEffect => DEFAULT_AD_SETTINGS_IN_EFFECT
 
-  let gate: ReturnType<typeof countingStub>
-  let persona: ReturnType<typeof countingStub>
+  let gate: CloseCountingStubClient
+  let persona: CloseCountingStubClient
   let built: ClientOptions[]
   let logs: string[]
   let startupErrors: string[]
@@ -1364,8 +1359,8 @@ describe('_runCallTimeoutStartStep (b.jg5 SRJ-213)', () => {
   let home: string | undefined
 
   beforeEach(() => {
-    gate = countingStub()
-    persona = countingStub()
+    gate = makeCloseCountingStubClient()
+    persona = makeCloseCountingStubClient()
     built = []
     logs = []
     startupErrors = []

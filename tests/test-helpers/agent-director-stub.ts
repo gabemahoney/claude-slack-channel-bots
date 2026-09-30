@@ -20,7 +20,9 @@
  * with `PHASE1_RC_VERSION` at `STUB_RESOLVE_DEFAULT_PATH` by default, takes
  * an ordered `outcomes` list (each entry a version, an error to reject with,
  * or a call that never settles; the last entry repeats) and records every
- * call in `calls`.
+ * call in `calls`. `makeCloseCountingStubClient` gives a stub client whose
+ * `close()` counts its calls, and `makePassingGateDeps` the startup-gate
+ * seams of a run that passes every step.
  *
  * The stub does NOT extend `Client` — instantiating the real class would call
  * Bun FFI. Instead it satisfies the structural-typed verb surface CSCB calls,
@@ -185,6 +187,7 @@ import type {
   Phase1StatusResult,
   PreTrust,
 } from '../../src/ad-phase1-types.ts'
+import type { StartupGateDeps } from '../../src/agent-director-startup.ts'
 import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
 import { makePersona } from './persona-config.ts'
 
@@ -1702,6 +1705,50 @@ export function makeStubCreateClient(opts: StubCreateClientOptions = {}): (clien
     opts.calls?.push(clientOpts as ClientOptions)
     if (opts.error) throw opts.error
     return opts.client ?? makeStubClient()
+  }
+}
+
+/** A stub client whose `close()` only counts its calls, with that count. */
+export interface CloseCountingStubClient {
+  client: StubClient
+  /** How many times `client.close()` has been called. */
+  closes(): number
+}
+
+/**
+ * A stub client (`makeStubClient(opts)`) whose `close()` is replaced by a
+ * counter, so a case can check which of two clients was closed and how often.
+ */
+export function makeCloseCountingStubClient(opts: StubClientOptions = {}): CloseCountingStubClient {
+  let count = 0
+  const client = makeStubClient(opts)
+  client.close = () => { count += 1 }
+  return { client, closes: () => count }
+}
+
+/**
+ * Startup-gate seams for a run that passes every step when nothing is
+ * overridden: a default stub client (`makeStubCreateClient()`), the three
+ * API-surface probes passing, an ENOENT state.db stat (the same-user check
+ * passes silently), UID 1000, a startup-error recorder that swallows, and an
+ * `exit` that throws, since a passing run never reaches it. `overrides` wins
+ * over every default.
+ */
+export function makePassingGateDeps(overrides: Partial<StartupGateDeps> = {}): Partial<StartupGateDeps> {
+  return {
+    createClient: makeStubCreateClient(),
+    probeGetPermission: () => true,
+    probeErrorCatalog: () => ({ ok: true as const }),
+    probeDecideArgv: async () => ({ ok: true as const }),
+    statSync: () => {
+      const err: NodeJS.ErrnoException = new Error('ENOENT')
+      err.code = 'ENOENT'
+      throw err
+    },
+    geteuid: () => 1000,
+    recordStartupError: () => { /* swallow */ },
+    exit: (_code: number) => { throw new Error('exit should not be reached in non-failing runStartupGate path') },
+    ...overrides,
   }
 }
 

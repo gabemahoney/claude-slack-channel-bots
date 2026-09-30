@@ -106,6 +106,7 @@ import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
   errSystemInstallNotFound,
   errSystemInstallTooOld,
+  makePassingGateDeps,
   makeStubClient,
   makeStubCreateClient,
   type StubCreateClientOptions,
@@ -790,16 +791,22 @@ describe('last-applied record (SR-8.7)', () => {
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, `stop (${source})`)
   })
 
+  // b.jg5 SRJ-213: the CLI's client carries the call timeout of the
+  // configuration the server runs, read before the client is built; with a
+  // record present, the record's, never the edited config.json's.
   test.each([
     ...SOURCES.map(([label, source]) => ['clean_restart', label, source, runCleanRestart] as const),
     ...SOURCES.map(([label, source]) => ['stop --stop-bots', label, source, runStopBots] as const),
-  ])('%s: persona set and exit_timeout come from %s — exactly cscb_<key> of Alpha and Beta, each paused then killed at once, never Gamma', async (name, _label, source, run) => {
+  ])('%s: persona set, exit_timeout and the client\'s agent_director_call_timeout_ms come from %s — exactly cscb_<key> of Alpha and Beta, each paused then killed at once, never Gamma; initClient gets the call timeout once, after the configuration is read', async (name, _label, source, run) => {
+    // Precondition: the three values differ, so any wrong source shows.
+    expect(new Set([APPLIED_CALL_TIMEOUT_MS, EDITED_CALL_TIMEOUT_MS, DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS]).size).toBe(3)
     writeSource(source)
     const b = makeDeps({
       serverPid: 4242,
       isProcessRunning: goneAfterFirstCheck(),
       loadConfig: appliedLoader,
       directorStatus: waitingThenEnded(),
+      initClient: async () => { /* gate ok */ },
     })
 
     await run(b)
@@ -817,37 +824,11 @@ describe('last-applied record (SR-8.7)', () => {
       expect(b.exitCodes).toEqual([])
       expect(startedServer(b)).toBe(true)
     }
-    assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source})`)
-  })
-
-  // b.jg5 SRJ-213: the CLI's client carries the call timeout of the
-  // configuration the server runs, read before the client is built; with a
-  // record present, the record's, never the edited config.json's.
-  test.each([
-    ...SOURCES.map(([label, source]) => ['clean_restart', label, source, runCleanRestart] as const),
-    ...SOURCES.map(([label, source]) => ['stop --stop-bots', label, source, runStopBots] as const),
-  ])('%s: initClient gets the agent_director_call_timeout_ms of %s, once, after the configuration is read; teardown still runs', async (name, _label, source, run) => {
-    // Precondition: the three values differ, so any wrong source shows.
-    expect(new Set([APPLIED_CALL_TIMEOUT_MS, EDITED_CALL_TIMEOUT_MS, DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS]).size).toBe(3)
-    writeSource(source)
-    const b = makeDeps({
-      serverPid: 4242,
-      isProcessRunning: goneAfterFirstCheck(),
-      loadConfig: appliedLoader,
-      directorStatus: waitingThenEnded(),
-      initClient: async () => { /* gate ok */ },
-    })
-
-    await run(b)
-
     expect(b.initClientCalls).toEqual([APPLIED_CALL_TIMEOUT_MS])
     // Every configuration read comes before the client is built.
-    const init = b.events.indexOf('initClient')
-    expect(b.events.slice(0, init)).toContain('loadConfig')
-    expect(b.events.slice(init)).not.toContain('loadConfig')
-    expect([...b.killCalls].sort()).toEqual([alphaId(), betaId()].sort())
-    expect(b.exitCodes).toEqual(name === 'stop --stop-bots' ? [0] : [])
-    assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source}, call timeout)`)
+    expect(b.events.slice(0, b.events.indexOf('initClient'))).toContain('loadConfig')
+    expect(b.events.slice(b.events.indexOf('initClient'))).not.toContain('loadConfig')
+    assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source})`)
   })
 
   const runStop = (b: Bundle): Promise<void> =>
@@ -2041,9 +2022,7 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     const realDepsAt = mainBlock.indexOf('const realDeps: CliDeps =')
     expect(realDepsAt).toBeGreaterThanOrEqual(0)
     const initClient = objectProperties(mainBlock.slice(realDepsAt)).get('initClient')
-    const arrow = initClient?.match(/^\(\s*(\w+)\s*\)\s*=>\s*([\s\S]*)$/)
-    expect(arrow).toBeTruthy()
-    expect(arrow![2]).toBe(`initProductionClient(${arrow![1]})`)
+    expect(initClient).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*initProductionClient\(\1\)$/)
   })
 
   test('an incomplete teardown (TeardownIncompleteError) prints its count and retry advice on the teardown-failed line; the underlying error, carrying fake tokens, is only described, its message redacted; exit 1; nothing logged leaks', async () => {
@@ -2111,16 +2090,8 @@ describe('initProductionClient', () => {
   afterEach(() => resetClientForTests())
 
   /** Gate seams that pass every check after construction; `createClient` decides the build. */
-  const gateDeps = (createClient: StartupGateDeps['createClient']): Partial<StartupGateDeps> => ({
-    createClient,
-    probeGetPermission: () => true,
-    probeErrorCatalog: () => ({ ok: true as const }),
-    probeDecideArgv: async () => ({ ok: true as const }),
-    statSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) },
-    geteuid: () => 1000,
-    recordStartupError: () => {},
-    exit: (code) => { throw new ExitError(code) },
-  })
+  const gateDeps = (createClient: StartupGateDeps['createClient']): Partial<StartupGateDeps> =>
+    makePassingGateDeps({ createClient, exit: (code) => { throw new ExitError(code) } })
 
   test('builds the client with the call timeout it is given and installs it as the singleton', async () => {
     const calls: RecordedClientOptions = []

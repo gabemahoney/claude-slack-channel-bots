@@ -973,6 +973,7 @@ export function checkAdCallTimeoutAtStartup(callTimeoutMs: number, deps: AdCallT
   try {
     line = buildAdCallTimeoutWarningLine(callTimeoutMs, (deps.valuesInEffect ?? adSettingsInEffect)())
   } catch {
+    /* non-critical: the check never stops the start */
     return undefined
   }
   if (line === undefined) return undefined
