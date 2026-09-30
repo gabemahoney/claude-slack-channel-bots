@@ -68,6 +68,13 @@
  *   and arm no deadline) and makes no agent-director call. main() returns
  *   before `Bun.serve`, the start bring-up, the health check and the
  *   detection tick when a shutdown began during an earlier await.
+ * - b.jg5 SRJ-209: agent-director's timing settings install
+ *   (`installAdSettings`) is called once, with no argument (so the file is
+ *   read under the process's own HOME), in main()'s own statement list with
+ *   its result dropped, after the startup gate and the start's configuration
+ *   resolution and before the start bring-up; nothing else in server.ts
+ *   builds a reader, registers on the re-check's tick, or names the settings
+ *   file or the TOML parser.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -83,7 +90,7 @@
 import { describe, test, expect, afterEach } from 'bun:test'
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, relative } from 'node:path'
+import { basename, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   atMainTopLevel,
@@ -106,6 +113,9 @@ import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
 import type { runAgentDirectorStartupGate, StartupGateOptions } from '../src/agent-director-startup.ts'
 import { AD_VERSION_RECHECK_STOP_EXIT_CODE, type AdVersionRecheckDeps } from '../src/ad-version-gate.ts'
 import type { ShutdownDeadlineDeps } from '../src/shutdown-deadline.ts'
+import { AD_SETTINGS_RELATIVE_PATH } from '../src/ad-settings.ts'
+import type * as AdSettingsModule from '../src/ad-settings.ts'
+import type * as AdVersionGateModule from '../src/ad-version-gate.ts'
 
 const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url))
 const SERVER_PATH = join(SRC_DIR, 'server.ts')
@@ -677,6 +687,85 @@ describe('main() installs the runtime agent-director version re-check right afte
       // A method call (`x.verb(`, `x?.verb(`) or a plain one.
       expect([verb, indicesOf(new RegExp(`(?<![\\w$])${verb}\\s*\\(`, 'g'), code)]).toEqual([verb, []])
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: agent-director's timing settings are read at start, and again
+// only on the version re-check's tick (b.jg5 SRJ-209)
+//
+// What the install does (the startup read, the re-read after each 120 s
+// re-check tick whatever health_check_interval is, none after the re-check's
+// dispose, the file under the process's HOME) is driven through its real
+// module in tests/ad-settings.test.ts. What only server.ts holds is where
+// main() calls it, with what, and that nothing else in server.ts reads the
+// file.
+// ---------------------------------------------------------------------------
+
+describe('main() installs agent-director\'s settings read once, after the startup gate and the start\'s configuration resolution and before the start bring-up, under the process\'s own HOME (b.jg5 SRJ-209)', () => {
+  /** The install; typed against its module, so a rename fails the typecheck. */
+  const INSTALL: keyof typeof AdSettingsModule = 'installAdSettings'
+
+  /**
+   * What would read the settings, or re-read them, other than through the
+   * install: a reader of its own, the reader's production HOME, the file's
+   * path, and a listener of its own on the re-check's tick. Typed against
+   * their modules, so a rename fails the typecheck.
+   */
+  const OTHER_READ_NAMES: ReadonlyArray<keyof typeof AdSettingsModule | keyof typeof AdVersionGateModule> = [
+    'createAdSettingsReader',
+    'productionAdSettingsHome',
+    'AD_SETTINGS_RELATIVE_PATH',
+    'onAdVersionRecheckTick',
+  ]
+
+  /** src/ad-settings.ts with every comment removed. */
+  const AD_SETTINGS_CODE = stripComments(readFileSync(join(SRC_DIR, 'ad-settings.ts'), 'utf-8'))
+
+  test('imports the install from the settings module and declares it nowhere itself; the import and one call are its only mentions', () => {
+    expect(importSource(SERVER_CODE, INSTALL)).toBe('./ad-settings.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${INSTALL}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    // No second install in another form (an alias, a callback, a timer).
+    expect(indicesOf(new RegExp(`\\b${INSTALL}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    onlyCallOf(INSTALL)
+  })
+
+  test('calls it in main()\'s own statement list, behind no branch (so in dry run too), as a statement of its own whose result is dropped', () => {
+    const at = onlyCallOf(INSTALL)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    // Nothing before it on its statement: no binding of the reader it
+    // returns (which could be read again on a timer), no await, no operand.
+    const before = SERVER_CODE.slice(0, at).trimEnd()
+    expect(before).not.toMatch(/(?:[=(,:?&|!+\-*/<>[.]|\b(?:return|await|void|yield|new|typeof|throw|delete))$/)
+  })
+
+  test.each<[string, () => number]>([
+    ['the startup gate (runAgentDirectorStartupGate)', () => onlyCallOf('runAgentDirectorStartupGate')],
+    ['the start resolution (<controller>.resolveStart)', () => startResolution(SERVER_CODE).resolveAt],
+    ['the applied config\'s start assignment (<loaded> = <outcome>.config)', () => startResolution(SERVER_CODE).assignAt],
+  ])('calls it AFTER %s', (_label, anchor) => {
+    expect(onlyCallOf(INSTALL)).toBeGreaterThan(anchor())
+  })
+
+  test('calls it BEFORE the start bring-up (<controller>.runStartBringUp)', () => {
+    expect(onlyCallOf(INSTALL)).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+  })
+
+  test('passes no argument, so the read takes its production dependencies: the file under the server process\'s own HOME, and no HOME, health_check_interval or persona value from the configuration', () => {
+    expect(onlyCallArguments(SERVER_CODE, INSTALL).trim()).toBe('')
+  })
+
+  test('nothing else in server.ts reads the settings: no reader or tick listener of its own, no production HOME, and neither the settings file nor the TOML parser named', () => {
+    for (const name of OTHER_READ_NAMES) {
+      expect([name, indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
+    }
+    for (const path of [AD_SETTINGS_RELATIVE_PATH, basename(AD_SETTINGS_RELATIVE_PATH)]) {
+      expect([path, SERVER_CODE.includes(path)]).toEqual([path, false])
+    }
+    // The parser package is the one the settings module imports its parse from.
+    const parser = importSource(AD_SETTINGS_CODE, 'parse')
+    expect(parser).toBeDefined()
+    expect(indicesOf(new RegExp(`['"\`]${parser}['"\`]`, 'g'), SERVER_CODE)).toEqual([])
   })
 })
 

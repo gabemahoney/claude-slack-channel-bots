@@ -445,6 +445,28 @@ If you change `port` or `bind` in `config.json`, the confirmed change takes effe
 
 ---
 
+### agent-director's timing settings
+
+agent-director keeps its timing settings in the `[tmux]` table of `~/.agent-director/config.toml`. They are agent-director's settings, not CSCB configuration: CSCB only reads them, from the file under the HOME the server runs in.
+
+The server reads the table when it starts and every 120 s after that, whatever `health_check_interval` is (`0` included), so a change on the host is used within 120 s. It applies agent-director's own rule: a missing file, a missing key or `0` means agent-director's default.
+
+| Key | Default |
+|---|---|
+| `pending_grace_seconds` | `60` |
+| `stopping_window_seconds` | `90` |
+| `starting_session_seconds` | `300` |
+| `sweep_budget_seconds` | `15` |
+| `query_timeout_ms` | `1500` |
+| `action_timeout_ms` | `2000` |
+| `create_timeout_ms` | `5000` |
+| `pipe_close_wait_ms` | `100` |
+| `kill_exit_wait_ms` | `5000` |
+
+If the file can't be read or parsed, or a `[tmux]` value is one agent-director refuses (not a whole number, negative, above 2^63 − 1, or below its minimum), the server keeps the last values it accepted (the defaults, if none yet) and writes one line to `server.log`. The `debug-slack-channel-bots` skill explains that line under "agent-director's timing settings". agent-director's own answers always decide; the server's reading of the file never overrides them.
+
+---
+
 ## Reload
 
 Saving `config.json` doesn't change what runs. The server runs the last configuration it applied, and it shows an edit as a pending change until you confirm it (see [Confirming a change](#confirming-a-change)).

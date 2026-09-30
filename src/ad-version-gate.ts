@@ -55,8 +55,8 @@
  * ends the chain, records one startup-errors entry and calls the stop
  * callback with {@link AD_VERSION_RECHECK_STOP_EXIT_CODE} (b.jg5 SRJ-205).
  * After each timed re-check that did not stop, the tick listeners run
- * (b.jg5 SRJ-209; no caller yet: E6 will re-read agent-director's timing
- * settings from this hook).
+ * (b.jg5 SRJ-209: `installAdSettings` in `src/ad-settings.ts` re-reads
+ * agent-director's timing settings from this hook).
  * {@link triggerAdVersionRecheck} re-checks at once and answers with the
  * outcome (b.jg5 SRJ-204). Its caller is the `ErrInvalidFlags` step in
  * `src/ad-error-class.ts` (SRJ-104), which the resume path of
@@ -1232,8 +1232,9 @@ export function disposeAdVersionRecheck(): void {
 
 /**
  * Register a listener run after each timed re-check that did not stop
- * (b.jg5 SRJ-209; no caller yet: E6 will re-read agent-director's timing
- * settings from it). Independent of install order. Returns its unsubscribe.
+ * (b.jg5 SRJ-209: `installAdSettings` in `src/ad-settings.ts` re-reads
+ * agent-director's timing settings from it). Independent of install order.
+ * Returns its unsubscribe.
  */
 export function onAdVersionRecheckTick(listener: AdVersionRecheckTickListener): () => void {
   const entry = { listener }

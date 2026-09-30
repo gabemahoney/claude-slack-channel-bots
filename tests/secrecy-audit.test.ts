@@ -32,13 +32,15 @@
  *    post agent-director and Slack failures: the MCP registry, the session
  *    manager, restart, the permission poller and click handler, the persona
  *    notifier and destinations, the health check, the CLI, the template
- *    install and the agent-director error classifier), a value import of one
- *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
- *    config-file writer, the reload, connection and routing harnesses, the
- *    Slack client factory stub), or sets a stub's `leakMarker`. A suite that
- *    matches but has no secret-bearing surface is listed in `EXEMPT` with its
- *    reason; an exemption that no longer matches such a suite (missing file,
- *    no longer touching, or now calling `assertNoLeak`) fails as stale.
+ *    install, the agent-director error classifier and the agent-director
+ *    settings reader), a value import of one of the `HELPER_SURFACES` helpers
+ *    (the token builders and sentinel, the config-file writer, the
+ *    agent-director settings-file writer, the reload, connection and routing
+ *    harnesses, the Slack client factory stub), or sets a stub's
+ *    `leakMarker`. A suite that matches but has no secret-bearing surface is
+ *    listed in `EXEMPT` with its reason; an exemption that no longer matches
+ *    such a suite (missing file, no longer touching, or now calling
+ *    `assertNoLeak`) fails as stale.
  * 3. Reload harness. A suite that builds `makeReloadHarness` passes a run's
  *    `captured()` artifacts to `assertNoLeak` (the testing guide's Reload
  *    Tests rule), so its logs and every reload file it wrote are checked.
@@ -123,6 +125,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/cli\.ts$/, 'the CLI, which loads the config and logs agent-director failure text'],
   [/^src\/agent-director-template\.ts$/, "the template install and refresh, whose lines and startup error carry agent-director failure text"],
   [/^src\/ad-error-class\.ts$/, "the agent-director error classifier, whose reported message carries agent-director failure text (an error's description) to log lines"],
+  [/^src\/ad-settings\.ts$/, "the agent-director settings reader, which reads agent-director's config.toml and logs a refused read's reason"],
 ]
 
 /** Test helpers whose named exports build tokens, credentials or config files, or plant the sentinel. */
@@ -136,6 +139,7 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
     sentinelTicketUrl: 'plants the leak sentinel in a ticket URL',
   },
   'tests/test-helpers/persona-config.ts': { writeConfigFile: 'writes a config file' },
+  'tests/test-helpers/ad-settings.ts': { writeAgentDirectorConfig: "writes agent-director's config.toml" },
   'tests/test-helpers/reload-harness.ts': { makeReloadHarness: 'builds the reload harness' },
   'tests/test-helpers/persona-connection-harness.ts': { makeConnectionHarness: 'builds the connection manager over credentials files' },
   'tests/test-helpers/persona-routing-harness.ts': { makeRoutingHarness: 'builds sentinel-bearing Slack stubs' },

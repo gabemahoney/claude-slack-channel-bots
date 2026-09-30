@@ -41,6 +41,13 @@
  * credentials` runs), is in the npm pack list, with the same hermetic
  * companion (the file exists and package.json `files` covers it).
  *
+ * b.jg5 SRJ-209: the TOML parser CSCB reads agent-director's settings file
+ * with, `smol-toml`, is a runtime dependency pinned at exactly one version
+ * (no range): `package.json` `dependencies` names it with that exact spec
+ * (never in `devDependencies`), and `bun.lock` records the same spec for the
+ * root workspace and resolves the package to that version. Hermetic: both
+ * files are read from the tree, with no npm call and no child process.
+ *
  * Every npm-backed test shares one memoised pack probe per file load. Each npm
  * child's environment is a direct `hostSafeChildEnv` call (b.jg5 SRJ-1301,
  * SRJ-1302): the probe's temp dir as HOME, only `npm` and `node` on PATH, and a
@@ -76,7 +83,17 @@ const CRON_SRC_FILES = [
   'src/crontable.ts',
 ]
 
-function readPkg(): { version: string; files?: string[] } {
+/** A package.json dependency section: package name → version spec. */
+type DependencyMap = Record<string, string>
+
+function readPkg(): {
+  version: string
+  files?: string[]
+  dependencies?: DependencyMap
+  devDependencies?: DependencyMap
+  optionalDependencies?: DependencyMap
+  peerDependencies?: DependencyMap
+} {
   return JSON.parse(readFileSync(resolve(REPO_ROOT, 'package.json'), 'utf-8'))
 }
 
@@ -423,4 +440,68 @@ describe('b.av2 SR-12: the debugging skill covers every reload diagnostic class'
       expect(skillHasClassHeading(label)).toBe(true)
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// 4. b.jg5 SRJ-209 — the TOML parser is pinned at exactly one version
+// ---------------------------------------------------------------------------
+
+/** The package CSCB parses agent-director's settings file with. */
+const TOML_PARSER = 'smol-toml'
+
+/**
+ * SRJ-209's pin of the third-party parser: the one version, with no range,
+ * that package.json and bun.lock must name. The only place it is written.
+ */
+const TOML_PARSER_PIN = '1.9.0'
+
+/** The package.json (and bun.lock workspace) sections that are not runtime dependencies. */
+const NON_RUNTIME_SECTIONS = ['devDependencies', 'optionalDependencies', 'peerDependencies'] as const
+
+/** The parts of bun.lock this guard reads. */
+interface BunLock {
+  workspaces?: Record<string, Partial<Record<'dependencies' | (typeof NON_RUNTIME_SECTIONS)[number], DependencyMap>>>
+  /** Package name → [`<name>@<version>`, registry, metadata, integrity]. */
+  packages?: Record<string, unknown[]>
+}
+
+/** bun.lock, parsed tolerantly: it is JSONC, with trailing commas. */
+function readBunLock(): BunLock {
+  return Bun.JSONC.parse(readFileSync(resolve(REPO_ROOT, 'bun.lock'), 'utf-8')) as BunLock
+}
+
+/**
+ * Whether `spec` is one exact version and nothing else: a range operator
+ * (`^`, `~`, `>=`, `=`), a wildcard, a space or an alternation (`||`) makes
+ * semver either refuse it or normalise it to a different string.
+ */
+function isExactVersion(spec: string): boolean {
+  return semver.valid(spec) === spec
+}
+
+describe(`b.jg5 SRJ-209: ${TOML_PARSER} is a runtime dependency at exactly its pinned version (hermetic)`, () => {
+  test(`package.json dependencies name ${TOML_PARSER} with the exact spec ${TOML_PARSER_PIN}, no range`, () => {
+    const spec = readPkg().dependencies?.[TOML_PARSER]
+    expect([spec, isExactVersion(spec ?? '')]).toEqual([TOML_PARSER_PIN, true])
+  })
+
+  test.each([...NON_RUNTIME_SECTIONS])(`package.json %s does not name ${TOML_PARSER}`, (section) => {
+    expect(Object.keys(readPkg()[section] ?? {})).not.toContain(TOML_PARSER)
+  })
+
+  test(`bun.lock's root workspace names ${TOML_PARSER} among its dependencies with the same exact spec, and in no other section`, () => {
+    const root = readBunLock().workspaces?.['']
+    expect(root).toBeDefined()
+    const spec = root!.dependencies?.[TOML_PARSER]
+    expect([spec, isExactVersion(spec ?? '')]).toEqual([TOML_PARSER_PIN, true])
+    for (const section of NON_RUNTIME_SECTIONS) {
+      expect([section, Object.keys(root![section] ?? {}).includes(TOML_PARSER)]).toEqual([section, false])
+    }
+  })
+
+  test(`bun.lock resolves ${TOML_PARSER} to exactly the pinned version`, () => {
+    const entry = readBunLock().packages?.[TOML_PARSER]
+    expect(Array.isArray(entry)).toBe(true)
+    expect(entry![0]).toBe(`${TOML_PARSER}@${TOML_PARSER_PIN}`)
+  })
 })

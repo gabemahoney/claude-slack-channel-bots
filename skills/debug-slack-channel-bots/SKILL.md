@@ -1475,6 +1475,7 @@ registers again with its history. If the new token is refused too, a new
 | `[slack] Fatal: last-applied record error — …` | The server couldn't read or validate its last-applied record and exited. See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid). |
 | `[slack] Starting from the last-applied record "<path>"` or `[slack] No last-applied record: recorded the configuration file "<path>" as "<path>"` | Which configuration a start runs. See [The last-applied record](#the-last-applied-record). |
 | `[slack] agent-director version re-check: the runtime re-check could not run: <description>; the server keeps running and checks again at the next 120 s re-check` | The server's 120 s check of the agent-director binary couldn't run: the binary is missing, unreadable, unreachable, or didn't answer within 30 s. `<description>` says which (an error name such as `ErrSystemInstallUnreachable (reason <reason>, binary at <path>)`, or `no answer within the 30 s time limit`). Nothing changes: the server keeps running and checks again every 120 s. One line per run of failures: the first failure after start, or after a check that passed, logs it, and the failures after it log nothing until a check passes. Nothing goes to `startup-errors.log` or Slack. If the line keeps coming back, check that the agent-director binary is present and executable. If a later check finds a version the server refuses, the server stops as in [Found while the server was running](#found-while-the-server-was-running). |
+| `[slack] agent-director settings: the read of "<path>" was refused: <reason>; <kept> stay in effect until a read is accepted (b.jg5 SRJ-209)` | The server refused agent-director's timing settings file and keeps its last accepted values (`the defaults` at start). One line per run of refused reads. See [agent-director's timing settings](#agent-directors-timing-settings). |
 | `… launch after its bring-up retry failed: …`, `… working-directory retry failed: …`, `… handling its change from up to <outcome> failed: …`, `persona … not brought up: Slack bring-up threw: …`, `persona <step> failed: personas[<i>] …`, `persona-destination-hold: retry of held notices failed for persona=<key>: …`, `persona-destination-hold: notice failure callback threw for persona=<key>: …`, `unhandled rejection (process keeps running): …` | An internal error. The server keeps running. Report it as a bug, with the persona's lines around it. |
 
 ---
@@ -1567,6 +1568,76 @@ exit code 1).
 - **Fix:** the same as at start: the operator follows the README section
   "Switching over to agent-director Phase 1", then starts the server again.
   A bot or this skill never changes the agent-director install itself.
+
+---
+
+## agent-director's timing settings
+
+agent-director keeps nine timing settings in the `[tmux]` table of
+`~/.agent-director/config.toml`. The file is agent-director's; CSCB only
+reads it, from the HOME the server process runs in (not a persona's
+directory). The README section "agent-director's timing settings" lists the
+nine keys and their defaults.
+
+- **When the server reads it:** once at start, after the agent-director
+  version check passes and the configuration is loaded, before any persona
+  is brought up, then every 120 s with the binary re-check, whatever
+  `health_check_interval` is (`0` included). A change to the file is used
+  within 120 s, with no restart.
+- **The default rule:** a missing file, a missing key or `0` means
+  agent-director's default for that key. Other tables and keys are ignored,
+  so a misspelt key leaves its default in force.
+- **A refused read.** The server refuses the whole file when:
+  - the server can't find its home directory;
+  - the file exists but can't be read (it's a directory or not a regular
+    file, it's over the server's own 64 KiB limit, or a permission or I/O
+    error), isn't valid UTF-8 (its bytes are never replaced) or isn't valid
+    TOML;
+  - `tmux` is there but isn't a table;
+  - one of the nine keys holds a string, a float (`60.0` included: write
+    whole numbers without a decimal point), or any other non-integer;
+  - one of them is negative;
+  - one of them is larger than 2^63 − 1 (9223372036854775807), the largest
+    whole number agent-director can hold;
+  - `starting_session_seconds` is below 60 or `stopping_window_seconds` is
+    below 30 (after the default rule, so a missing key or `0` is checked as
+    its default);
+  - `pending_grace_seconds` is below its minimum, which depends on two other
+    keys: take `create_timeout_ms` plus `pipe_close_wait_ms`, turn it into
+    whole seconds (rounding up) and add 20; the minimum is that, or 30 if 30
+    is larger. At the defaults it is 30. With `create_timeout_ms` 40000, it
+    is 61, so the default 60 (from a missing key or `0`) is refused too.
+- **What a refused read does:** nothing changes. The server keeps the values
+  of the last read it accepted (the defaults, if it has accepted none since
+  start) and writes one line to `server.log`, at the first refused read. The
+  refused reads after it write nothing; the next accepted read ends the run,
+  so a later refusal logs again. Nothing goes to `startup-errors.log` or
+  Slack, and the server keeps running. The line:
+
+  ```text
+  [slack] agent-director settings: the read of "<path>" was refused: <reason>; <kept> stay in effect until a read is accepted (b.jg5 SRJ-209)
+  ```
+
+  `<path>` is the file the server read (`~/.agent-director/config.toml` when
+  it couldn't find its home directory). `<kept>` is `the defaults` or `the
+  values of the last accepted read`. `<reason>` names the first broken rule,
+  in the key order of the README's table: for example
+  `[tmux] stopping_window_seconds is 10, below its minimum of 30`,
+  `[tmux] query_timeout_ms is not an integer (it is a string)`,
+  `[tmux] action_timeout_ms is too large for agent-director`,
+  `[tmux] pending_grace_seconds is missing, so its default 60 applies, below its minimum of 61, which create_timeout_ms 40000 and pipe_close_wait_ms 100 set`,
+  `it is not valid TOML (at line <L>, column <C>)`,
+  `it is not valid UTF-8`,
+  `it cannot be read (<errno code>)`,
+  `it is larger than the 64 KiB limit` or
+  `the home directory cannot be found`. It never quotes the file's text.
+- **How to check:** read the file at `<path>` and compare the `[tmux]` table
+  with the rules above. The reason names only the first broken rule, so
+  check the others too.
+- **Fix:** the operator's. This skill never edits the file. Once the file is
+  fixed, the server picks it up within 120 s, with no restart.
+- **Who decides:** agent-director's own answers always decide. The server's
+  reading of the file never overrides what agent-director does or reports.
 
 ---
 

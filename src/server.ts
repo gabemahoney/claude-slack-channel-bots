@@ -192,6 +192,7 @@ import {
 } from './registry.ts'
 import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck } from './ad-version-gate.ts'
+import { installAdSettings } from './ad-settings.ts'
 import { armShutdownDeadline } from './shutdown-deadline.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
@@ -798,7 +799,8 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   stopPermissionPoller()
   stopHealthCheck()
   // The runtime version re-check (b.jg5 SRJ-204): its timers are cleared and
-  // a call in flight is never acted on.
+  // a call in flight is never acted on. Its ticks were the only re-reads of
+  // agent-director's timing settings (SRJ-209), so those stop with it.
   disposeAdVersionRecheck()
   // The reload detection tick (b.av2 SR-8.2): no further pending-file check.
   reloadController?.stopDetection()
@@ -1382,8 +1384,11 @@ export async function main(): Promise<void> {
   // gate's result, in the statement right after the gate. Its first re-check
   // runs one interval later, on its own timer, whatever health_check_interval
   // is (0 included), in dry run too. Its baseline is the version the gate
-  // read. A re-check that refuses the binary records one startup-errors
-  // entry, then runs shutdown() with a non-zero exit code; shutdown()
+  // read. After each timed re-check that does not stop, agent-director's
+  // timing settings are read again (b.jg5 SRJ-209; installAdSettings below,
+  // after the start's configuration resolution). A re-check that refuses
+  // the binary records one startup-errors entry, then runs shutdown() with
+  // a non-zero exit code; shutdown()
   // disposes the re-check before its first await, so no stop reaches a
   // shutdown already running, and a rejected shutdown still exits non-zero.
   // No outside party ends such a stop (the CLI's SIGKILL follows only its own
@@ -1504,6 +1509,17 @@ export async function main(): Promise<void> {
   console.error(`[slack] Loaded persona config: ${personaConfig.personas.length} persona(s)`)
   // The start-time applied config (declared before the reload controller).
   appliedConfig = personaConfig
+
+  // b.jg5 SRJ-209: agent-director's timing settings. Read once here, after
+  // the startup gate has passed and the start has resolved its configuration,
+  // and before the boot template install and the start bring-up; in dry run
+  // too. The install also registers the re-read on the version re-check's
+  // 120 s tick, so the file is read again only at those ticks, whatever
+  // health_check_interval is, and never after shutdown() disposes the
+  // re-check. It reads the file under the server process's HOME, never a
+  // HOME from the configuration or a persona. Its outcome never stops the
+  // start: a refused read logs one line and leaves the defaults in effect.
+  installAdSettings()
 
   // SR-3.2: refresh the slack-channel-bot agent-director template on every
   // boot, after the persona config is set: its memory-read rules cover the
