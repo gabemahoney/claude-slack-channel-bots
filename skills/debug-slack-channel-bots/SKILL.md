@@ -82,6 +82,10 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    [The server refuses the agent-director binary at start](#the-server-refuses-the-agent-director-binary-at-start);
    for a missing or unreachable agent-director, the `install-cscb` skill
    covers installing it.
+   **The server was running and has stopped?** Read the latest lines of
+   `startup-errors.log`. One that says `found by a runtime re-check while the
+   server was running` is covered under
+   [Found while the server was running](#found-while-the-server-was-running).
 5. **No class line, but the persona still isn't served?** See
    [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running)
    and [Other lines you may see](#other-lines-you-may-see). A *Waiting on a
@@ -1491,7 +1495,9 @@ they were. For both classes, this CSCB release and agent-director Phase 1
 are installed together, through the README section "Switching over to
 agent-director Phase 1": its `state.db` backup and restarts come with the
 install. Tell the operator to follow that section; a bot or this skill never
-changes the agent-director install itself.
+changes the agent-director install itself. A running server can stop on
+the same two classes; see
+[Found while the server was running](#found-while-the-server-was-running).
 
 ### `ad-below-phase1-floor`
 
@@ -1526,6 +1532,37 @@ class.
   the npm `agent-director` client CSCB depends on accepts.
 - **Fix:** the operator follows the README section "Switching over to
   agent-director Phase 1", then starts the server again.
+
+### Found while the server was running
+
+A running server re-checks the agent-director binary every 120 s, on its own
+timer: `health_check_interval` `0` turns off the health check, not this
+re-check. A binary that fails either check above stops the server with a
+non-zero exit. `startup-errors.log` and `server.log` get one line of the
+same class, `ad-below-phase1-floor` or `ad-system-install-too-old`, in the
+same form as at start, except that it says:
+
+```text
+found by a runtime re-check while the server was running, so the server stopped
+```
+
+in place of the floor entry's "found by the startup check" (for the too-old
+entry, right after the binary path). It still names the versions and the
+binary path, and the too-old entry still ends with the install-skill block.
+`server.log` then shows
+`[slack] Shutting down: the runtime version re-check refused the agent-director binary (see startup-errors.log)`
+and, last, `[slack] Shutdown complete`.
+
+- **Cause:** the binary was swapped, while the server ran, for an older
+  build or one that fails the check (such as a `0.0.0-dev` development
+  build).
+- **What the stop did not do:** the shutdown made no agent-director call. No
+  bot was killed, paused or deleted, and every agent-director row is as it
+  was: the bots keep running, but nothing serves them until the server is
+  back. Nothing was posted to Slack.
+- **Fix:** the same as at start: the operator follows the README section
+  "Switching over to agent-director Phase 1", then starts the server again.
+  A bot or this skill never changes the agent-director install itself.
 
 ---
 

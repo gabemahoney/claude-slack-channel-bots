@@ -15,7 +15,11 @@
  * Beyond `Client` instances, this module also exports `makeStubCreateClient`
  * and `makeStubResolveSystemBinary` — stub factories shaped like
  * `Client.create()` and `resolveSystemBinary()` respectively, used to drive
- * the SR-5.1 startup gate's catch ladder for the three system-install errors.
+ * the SR-5.1 startup gate's catch ladder for the three system-install errors
+ * and the runtime version re-check. `makeStubResolveSystemBinary` resolves
+ * with `PHASE1_RC_VERSION` by default, takes an ordered `outcomes` list (each
+ * entry a version, an error to reject with, or a call that never settles;
+ * the last entry repeats) and records every call in `calls`.
  *
  * The stub does NOT extend `Client` — instantiating the real class would call
  * Bun FFI. Instead it satisfies the structural-typed verb surface CSCB calls,
@@ -1111,36 +1115,79 @@ export function makeStubCreateClient(opts: StubCreateClientOptions = {}): (clien
   }
 }
 
+/** The binary path a stub `resolveSystemBinary` resolves with by default. */
+const STUB_RESOLVE_DEFAULT_PATH = '/usr/local/bin/agent-director'
+
 /**
- * Options for makeStubResolveSystemBinary. Mirrors the canned-result /
- * canned-error pattern.
+ * One answer of a stub `resolveSystemBinary` call:
+ *   - `{ version, path? }` resolves with that version, and with `path` or
+ *     else the builder's `path` option (default
+ *     '/usr/local/bin/agent-director');
+ *   - `{ throws }` rejects with that error;
+ *   - `{ never: true }` returns a promise that never settles.
  */
+export type StubResolveSystemBinaryOutcome =
+  | { version: string; path?: string }
+  | { throws: Error }
+  | { never: true }
+
+/** Options for makeStubResolveSystemBinary. */
 export interface StubResolveSystemBinaryOptions {
-  /** Throw this error instead of resolving. Takes precedence over path/version. */
+  /** Reject every call with this error. Cannot be given with `outcomes`. */
   throws?: Error
-  /** Resolve with this binary path (default: '/usr/local/bin/agent-director'). */
+  /**
+   * Answer the calls in this order, one entry per call; once the list runs
+   * out the last entry answers every later call. Must not be empty, and
+   * cannot be given with `throws` or `version`.
+   */
+  outcomes?: readonly StubResolveSystemBinaryOutcome[]
+  /**
+   * Resolve with this binary path (default: '/usr/local/bin/agent-director').
+   * With `outcomes`, the path of a `{ version }` entry that names none.
+   */
   path?: string
-  /** Resolve with this binary version (default: '0.7.0'). */
+  /** Resolve every call with this binary version (default: `PHASE1_RC_VERSION`). */
   version?: string
-  /** Capture each call's opts argument here. */
+  /** Capture each call's opts argument here, a call that never settles included. */
   calls?: Array<object | undefined>
 }
 
 /**
- * Build a stub `resolveSystemBinary`-shaped factory function. Returns a
- * function of shape `(opts?) => Promise<{path, version}>` that either
- * resolves with the canned `{path, version}` or rejects with the supplied
- * error. Mirrors the AD library's `resolveSystemBinary()` shape.
+ * Build a stub `resolveSystemBinary`-shaped function,
+ * `(opts?) => Promise<{ path, version }>`, mirroring the AD library's
+ * `resolveSystemBinary()`. With no options every call resolves with
+ * `PHASE1_RC_VERSION` (which passes CSCB's Phase 1 floor) at the default
+ * path; `throws` rejects every call; `outcomes` answers the calls in order,
+ * repeating its last entry. Invalid option combinations throw here, when the
+ * stub is built.
  */
 export function makeStubResolveSystemBinary(
   opts: StubResolveSystemBinaryOptions = {},
 ): (resolveOpts?: object) => Promise<{ path: string; version: string }> {
+  const { outcomes } = opts
+  if (outcomes !== undefined) {
+    if (opts.throws !== undefined) {
+      throw new Error('makeStubResolveSystemBinary: give `outcomes` or `throws`, not both')
+    }
+    if (opts.version !== undefined) {
+      throw new Error('makeStubResolveSystemBinary: give `outcomes` or `version`, not both; put the version in an outcome')
+    }
+    if (outcomes.length === 0) {
+      throw new Error('makeStubResolveSystemBinary: `outcomes` must hold at least one entry')
+    }
+  }
+  const defaultPath = opts.path ?? STUB_RESOLVE_DEFAULT_PATH
+  let callIndex = 0
   return async (resolveOpts?: object): Promise<{ path: string; version: string }> => {
     opts.calls?.push(resolveOpts)
-    if (opts.throws) throw opts.throws
-    return {
-      path: opts.path ?? '/usr/local/bin/agent-director',
-      version: opts.version ?? '0.7.0',
+    if (outcomes === undefined) {
+      if (opts.throws) throw opts.throws
+      return { path: defaultPath, version: opts.version ?? PHASE1_RC_VERSION }
     }
+    const outcome = outcomes[Math.min(callIndex, outcomes.length - 1)]!
+    callIndex += 1
+    if ('never' in outcome) return new Promise<never>(() => {})
+    if ('throws' in outcome) throw outcome.throws
+    return { path: outcome.path ?? defaultPath, version: outcome.version }
   }
 }

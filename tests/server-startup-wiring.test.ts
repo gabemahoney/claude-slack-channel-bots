@@ -56,6 +56,13 @@
  *   unhandledRejection install and before the PID check and every later step;
  *   server.ts never names the gate's floor-exempt option, so its start always
  *   runs the Phase 1 floor.
+ * - b.jg5 SRJ-204 / SRJ-205: the runtime agent-director version re-check is
+ *   installed once, in the statement right after the gate, behind no branch
+ *   and with no `health_check_interval` or clock of its own, over the gate's
+ *   version, agent-director's `resolveSystemBinary` and `recordStartupError`;
+ *   its stop runs `shutdown` with the code the re-check passes; `shutdown`
+ *   disposes it, exits with its code (the signals pass none, so 0) and makes
+ *   no agent-director call.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -90,7 +97,9 @@ import {
   stripComments,
 } from './test-helpers/source-audit.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
-import type { StartupGateOptions } from '../src/agent-director-startup.ts'
+import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
+import type { runAgentDirectorStartupGate, StartupGateOptions } from '../src/agent-director-startup.ts'
+import { AD_VERSION_RECHECK_STOP_EXIT_CODE, type AdVersionRecheckDeps } from '../src/ad-version-gate.ts'
 
 const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url))
 const SERVER_PATH = join(SRC_DIR, 'server.ts')
@@ -339,7 +348,11 @@ describe('main() runs the agent-director startup gate before any other work, alw
 
   test('inside main(), only the state and inbox directory creations and the unhandledRejection handler install come before it', () => {
     const [mainStart] = mainBody(SERVER_CODE)
-    const gateStatement = SERVER_CODE.slice(0, gateCall()).search(/\bawait\s+$/)
+    // The gate statement starts at its `await`, or at a single
+    // `const <name> = ` that binds the gate's result (E3 reads its `adVersion`
+    // for the runtime re-check). Only that binding is admitted: any other code
+    // before the gate is still left in `before` and fails the check below.
+    const gateStatement = SERVER_CODE.slice(0, gateCall()).search(/(?:\bconst\s+[A-Za-z_$][\w$]*\s*=\s*)?\bawait\s+$/)
     const before = SERVER_CODE.slice(mainStart, gateStatement)
     // Cut out each expected statement: every `mkdirSync(…)` call and the
     // guarded install `if (!unhandledRejectionHandlerInstalled) { … }`.
@@ -362,6 +375,167 @@ describe('main() runs the agent-director startup gate before any other work, alw
       .sort((a, b) => b[0] - a[0])
       .reduce((text, [from, to]) => text.slice(0, from) + text.slice(to), before)
     expect(rest.replace(/[\s;]/g, '')).toBe('')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the runtime agent-director version re-check (b.jg5 SRJ-204,
+// SRJ-205)
+//
+// What the re-check does (its 120 s timer, each outcome, the stop calling
+// `stop(AD_VERSION_RECHECK_STOP_EXIT_CODE)` once, dispose) is driven through
+// its real module in tests/ad-version-gate.test.ts. What only server.ts holds
+// is where main() installs it, what it is given, and what shutdown does.
+// ---------------------------------------------------------------------------
+
+describe('main() installs the runtime agent-director version re-check right after the startup gate, and shutdown disposes it and makes no agent-director call (b.jg5 SRJ-204, SRJ-205)', () => {
+  /** The gate result's version field; typed against the gate, so a rename fails the typecheck. */
+  const GATE_VERSION_FIELD: keyof Awaited<ReturnType<typeof runAgentDirectorStartupGate>> = 'adVersion'
+
+  /** The options main() passes, and only those: no `clock` (real timers), no interval of its own. */
+  const INSTALL_OPTIONS: ReadonlyArray<keyof AdVersionRecheckDeps> = [
+    'baselineVersion',
+    'log',
+    'recordStartupError',
+    'resolveSystemBinary',
+    'stop',
+  ]
+
+  /** A parameter name at the start of an arrow function: `(x) =>` or `x =>`. */
+  const ARROW_PARAM = /^\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*=>/
+
+  /** The body text of `shutdown()` in server.ts. */
+  const shutdownCode = (): string => SERVER_CODE.slice(...shutdownBody(SERVER_CODE))
+
+  /** Offsets in `code` of every `process.exit(` call. */
+  const exitsIn = (code: string): number[] => indicesOf(/\bprocess\s*\.\s*exit\s*\(/g, code)
+
+  /** Offsets in `code` of every plain `shutdown(` call. */
+  const shutdownCallsIn = (code: string): number[] => indicesOf(/(?<![\w.$])shutdown\s*\(/g, code)
+
+  test('imports installAdVersionRecheck and disposeAdVersionRecheck from the version gate module and resolveSystemBinary from agent-director, and declares none of them itself', () => {
+    expect(importSource(SERVER_CODE, 'installAdVersionRecheck')).toBe('./ad-version-gate.ts')
+    expect(importSource(SERVER_CODE, 'disposeAdVersionRecheck')).toBe('./ad-version-gate.ts')
+    expect(importSource(SERVER_CODE, 'resolveSystemBinary')).toBe('agent-director')
+    expect(importSource(SERVER_CODE, 'recordStartupError')).toBe('./startup-errors.ts')
+    for (const name of ['installAdVersionRecheck', 'disposeAdVersionRecheck', 'resolveSystemBinary', 'recordStartupError']) {
+      expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
+    }
+  })
+
+  test('installs it exactly once, in main()\'s own statement list (behind no branch), in the statement right after the awaited startup gate and before the PID check', () => {
+    const at = onlyCallOf('installAdVersionRecheck')
+    // The import and this call are the only mentions: no second install in
+    // another form (an alias, a callback).
+    expect(indicesOf(/\binstallAdVersionRecheck\b/g, SERVER_CODE)).toHaveLength(2)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    const gate = onlyCallOf('runAgentDirectorStartupGate')
+    expect(at).toBeGreaterThan(gate)
+    // Right after: nothing but the gate call itself sits between the two.
+    const [, gateEnd] = balancedAfter(SERVER_CODE, gate, '(', ')')
+    expect(SERVER_CODE.slice(gateEnd + 1, at).replace(/[\s;]/g, '')).toBe('')
+    const pidChecks = callsOf('checkPidConflict')
+    expect(pidChecks.length).toBeGreaterThan(0)
+    for (const pid of pidChecks) expect(at).toBeLessThan(pid)
+  })
+
+  test('its options are exactly the resolve, the baseline, the record hook, the stop and the log: no clock and nothing that names health_check_interval', () => {
+    const props = onlyCallProps('installAdVersionRecheck')
+    expect([...props.keys()].sort()).toEqual([...INSTALL_OPTIONS])
+    expect(onlyCallArguments(SERVER_CODE, 'installAdVersionRecheck')).not.toMatch(/\bhealth_check_interval\b/)
+  })
+
+  test('its baseline version is the gate\'s result by name: `const <gate> = await runAgentDirectorStartupGate()`, then baselineVersion: <gate>.adVersion', () => {
+    const decls = [...SERVER_CODE.matchAll(/\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*await\s+runAgentDirectorStartupGate\s*\(/g)]
+    expect(decls).toHaveLength(1)
+    expect(onlyCallProps('installAdVersionRecheck').get('baselineVersion')).toBe(`${decls[0]![1]}.${GATE_VERSION_FIELD}`)
+  })
+
+  test('its resolve is agent-director\'s resolveSystemBinary, its record hook recordStartupError and its log the server log', () => {
+    const props = onlyCallProps('installAdVersionRecheck')
+    expect(props.get('resolveSystemBinary')).toBe('resolveSystemBinary')
+    expect(props.get('recordStartupError')).toBe('recordStartupError')
+    expect(props.get('log')).toMatch(/^\((\w+)\) => console\.error\(\1\)$/)
+  })
+
+  // The re-check calls `stop(AD_VERSION_RECHECK_STOP_EXIT_CODE)` (driven in
+  // tests/ad-version-gate.test.ts); this case pins that main()'s stop hands
+  // that code on untouched, to shutdown and to the exit of a rejected shutdown.
+  test('its stop runs shutdown with the exit code the re-check passes (AD_VERSION_RECHECK_STOP_EXIT_CODE, non-zero), and a rejected shutdown still exits with it', () => {
+    expect(AD_VERSION_RECHECK_STOP_EXIT_CODE).not.toBe(0)
+    const stop = onlyCallProps('installAdVersionRecheck').get('stop')
+    expect(stop).toBeDefined()
+    const param = stop!.match(ARROW_PARAM)
+    expect(param).not.toBeNull()
+    const code = param![1]!
+    const calls = shutdownCallsIn(stop!)
+    expect(calls).toHaveLength(1)
+    const args = splitTopLevel(callArguments(stop!, calls[0]!))
+    expect(args).toHaveLength(2)
+    expect(args[1]).toBe(code)
+    // The shutdown promise's rejection is caught with an exit on the same code.
+    const [, callEnd] = balancedAfter(stop!, calls[0]!, '(', ')')
+    expect(stop!.slice(callEnd + 1)).toMatch(/^\s*\.\s*catch\s*\(/)
+    const exits = exitsIn(stop!)
+    expect(exits).toHaveLength(1)
+    expect(splitTopLevel(callArguments(stop!, exits[0]!))).toEqual([code])
+  })
+
+  test('shutdown disposes the re-check exactly once, with no argument, before its first await and before it exits', () => {
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const at = onlyCallOf('disposeAdVersionRecheck')
+    expect(at > start && at < end).toBe(true)
+    expect(onlyCallArguments(SERVER_CODE, 'disposeAdVersionRecheck').trim()).toBe('')
+    // Before shutdown first yields, so no re-check starts while it closes things.
+    const firstAwait = SERVER_CODE.slice(start, end).search(/\bawait\b/)
+    expect(firstAwait).toBeGreaterThan(-1)
+    expect(at).toBeLessThan(start + firstAwait)
+    const exits = exitsIn(SERVER_CODE).filter((exit) => exit > start && exit < end)
+    expect(exits.length).toBeGreaterThan(0)
+    for (const exit of exits) expect(at).toBeLessThan(exit)
+  })
+
+  test('shutdown(reason, exitCode = 0) ends by exiting with its exit code, and exits nowhere else', () => {
+    const decl = SERVER_CODE.search(/\basync\s+function\s+shutdown\s*\(/)
+    expect(decl).toBeGreaterThan(-1)
+    const params = splitTopLevel(callArguments(SERVER_CODE, decl))
+    expect(params).toHaveLength(2)
+    const exitParam = params[1]!.match(/^([A-Za-z_$][\w$]*)\s*(?::\s*number\s*)?=\s*0$/)
+    expect(exitParam).not.toBeNull()
+    const code = shutdownCode()
+    const exits = exitsIn(code)
+    expect(exits).toHaveLength(1)
+    expect(splitTopLevel(callArguments(code, exits[0]!))).toEqual([exitParam![1]])
+    const [, exitEnd] = balancedAfter(code, exits[0]!, '(', ')')
+    expect(code.slice(exitEnd + 1).replace(/[\s;]/g, '')).toBe('')
+  })
+
+  test.each(['SIGTERM', 'SIGINT'])('the %s handler runs shutdown with no non-zero exit code', (signal) => {
+    const handlers = indicesOf(new RegExp(`\\bprocess\\s*\\.\\s*(?:on|once)\\s*\\(\\s*['"]${signal}['"]`, 'g'), SERVER_CODE)
+    expect(handlers).toHaveLength(1)
+    const handler = splitTopLevel(callArguments(SERVER_CODE, handlers[0]!))[1]
+    expect(handler).toBeDefined()
+    const calls = shutdownCallsIn(handler!)
+    expect(calls).toHaveLength(1)
+    const args = splitTopLevel(callArguments(handler!, calls[0]!))
+    // A reason alone (the default exit code 0) or an explicit 0.
+    expect(args.length === 1 || (args.length === 2 && args[1] === '0')).toBe(true)
+  })
+
+  test('shutdown makes no agent-director call: no client, no detection wrapper, no resolve and no verb the stub client records', () => {
+    const code = shutdownCode()
+    for (const name of ['getClient', 'withOutageDetection', 'withSpawnDetection', 'resolveSystemBinary']) {
+      expect([name, indicesOf(new RegExp(`\\b${name}\\s*\\(`, 'g'), code)]).toEqual([name, []])
+    }
+    // The verbs: every key of the stub client's call log, less its `Calls` suffix.
+    const keys = Object.keys(makeStubCallLog())
+    const verbs = keys.map((key) => key.replace(/Calls$/, ''))
+    expect(verbs.length).toBeGreaterThan(0)
+    expect(verbs.every((verb, i) => verb !== keys[i] && verb !== '')).toBe(true)
+    for (const verb of verbs) {
+      // A method call (`x.verb(`, `x?.verb(`) or a plain one.
+      expect([verb, indicesOf(new RegExp(`(?<![\\w$])${verb}\\s*\\(`, 'g'), code)]).toEqual([verb, []])
+    }
   })
 })
 

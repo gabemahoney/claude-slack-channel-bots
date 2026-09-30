@@ -1309,7 +1309,7 @@ Note this covers only `server.log` / `clean_restart.log`. `startup-errors.log` a
 
 CSCB writes startup errors to `~/.claude/channels/slack/startup-errors.log` (override the directory with `SLACK_STATE_DIR`) in addition to stderr. Each entry is a single timestamped line. The file is append-only and never rotated by CSCB — copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` if you want host-level rotation.
 
-The classes in the first list are fatal: the process exits non-zero. The later groups (Slack Reply Guard setup, persona launch and conversation memory) are non-fatal: they are recorded, and the start continues.
+The classes in the first list are fatal: the process exits non-zero. Two of them can also be written while the server runs (see "Found while the server was running" after the list). The later groups (Slack Reply Guard setup, persona launch and conversation memory) are non-fatal: they are recorded, and the start continues.
 
 Fatal classes you may see:
 
@@ -1326,6 +1326,8 @@ Fatal classes you may see:
 - `ad-same-user` — `~/.agent-director/state.db` is owned by a different UID than the CSCB process. Reinstall agent-director as the correct user or remove the mismatched file.
 - `ad-same-user-stat` — Non-ENOENT stat error on the state DB (permissions, I/O). Investigate the file before re-launching.
 - `ad-template-install` — `client.makeTemplate(...)` rejected the boot-time refresh of the `slack-channel-bot` template. The line names the template and includes agent-director's error name and its description.
+
+**Found while the server was running.** `ad-system-install-too-old` and `ad-below-phase1-floor` can also be written by the runtime re-check: while the server runs, it re-checks the agent-director binary every 120 s, whatever `health_check_interval` is (`0` included), and stops with a non-zero exit when the binary fails either check. The entry names the version found, the version required, the binary path and that it was found by a runtime re-check while the server was running, so the server stopped. The stop posts nothing to Slack and leaves every bot and its agent-director row as it was: the bots keep running, but nothing serves them. Follow the README section "Switching over to agent-director Phase 1", then start the server again.
 
 The following classes are **non-fatal**: the Slack Reply Guard's setup pass at server start (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). The guard stays fail-open, so an affected persona gets no reminder, and every other persona and the rest of the start are unaffected. Directory and file failures at a later launch are server-log lines only, never records here.
 

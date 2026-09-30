@@ -21,6 +21,12 @@
  * No Slack client is built and no token is read at module scope (SR-3.1,
  * SR-10.2).
  *
+ * agent-director: `main()` first runs the startup gate
+ * (`agent-director-startup.ts`), then installs the runtime version re-check
+ * (`ad-version-gate.ts`, b.jg5 SRJ-204): every 120 s it re-checks the host
+ * binary, and one that fails the gate stops the server through `shutdown()`
+ * with a non-zero exit (b.jg5 SRJ-205).
+ *
  * Slack: one connection per persona, run by the connection manager
  * (`persona-connections.ts`) and brought up at start through the SR-6.1
  * procedure (`startupSessionManager` → the bring-up controller in
@@ -128,7 +134,7 @@ import {
 import { createPersonaSerializer } from './persona-serializer.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from './persona-lifecycle.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
-import { ErrSpawnNotFound } from 'agent-director'
+import { ErrSpawnNotFound, resolveSystemBinary } from 'agent-director'
 import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
 import { trustBootstrap, trustPatchPersona } from './trust-bootstrap.ts'
@@ -185,6 +191,8 @@ import {
   type SessionEntry,
 } from './registry.ts'
 import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
+import { disposeAdVersionRecheck, installAdVersionRecheck } from './ad-version-gate.ts'
+import { recordStartupError } from './startup-errors.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
 import { createCronLog } from './cron-log.ts'
 import { createCronDispatcher } from './cron-dispatch.ts'
@@ -767,11 +775,27 @@ let shuttingDown = false
 let httpServer: ReturnType<typeof Bun.serve> | null = null
 let cronScheduler: CronScheduler | null = null
 
-async function shutdown(signal: string): Promise<void> {
+/**
+ * The shutdown sequence, reached from SIGTERM / SIGINT (exit code 0) and from
+ * the runtime version re-check's stop (`AD_VERSION_RECHECK_STOP_EXIT_CODE`,
+ * b.jg5 SRJ-205). `reason` is named in the shutdown line. It stops every
+ * timer the server runs (the permission poller, the health check, the
+ * runtime version re-check, the reload detection tick, the cron scheduler,
+ * restart, bring-up and destination-hold timers, keep-alives), closes HTTP,
+ * the MCP transports and the persona Slack connections, releases the
+ * agent-director client handle, removes the PID file and exits with
+ * `exitCode`. It makes no agent-director call: every worker and row is left
+ * as it is, and an apply already under way is not awaited. A second call
+ * while one runs is a no-op.
+ */
+async function shutdown(reason: string, exitCode = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
   stopPermissionPoller()
   stopHealthCheck()
+  // The runtime version re-check (b.jg5 SRJ-204): its timers are cleared and
+  // a call in flight is never acted on.
+  disposeAdVersionRecheck()
   // The reload detection tick (b.av2 SR-8.2): no further pending-file check.
   reloadController?.stopDetection()
   if (cronScheduler) {
@@ -787,7 +811,7 @@ async function shutdown(signal: string): Promise<void> {
   personaDestinationHold.cancelAll()
   stopAllKeepAliveTimers()
 
-  console.error(`[slack] Received ${signal} — shutting down`)
+  console.error(`[slack] Shutting down: ${reason}`)
 
   if (httpServer) {
     console.error('[slack] Stopping HTTP server')
@@ -831,11 +855,11 @@ async function shutdown(signal: string): Promise<void> {
   removePidFile(PID_FILE)
 
   console.error('[slack] Shutdown complete')
-  process.exit(0)
+  process.exit(exitCode)
 }
 
-process.on('SIGTERM', () => { shutdown('SIGTERM').catch(() => process.exit(1)) })
-process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
+process.on('SIGTERM', () => { shutdown('received SIGTERM').catch(() => process.exit(1)) })
+process.on('SIGINT',  () => { shutdown('received SIGINT').catch(() => process.exit(1)) })
 
 // ---------------------------------------------------------------------------
 // _buildIsSessionAliveAdapter
@@ -1348,7 +1372,26 @@ export async function main(): Promise<void> {
   // the library's API surface, and verifies that the existing
   // ~/.agent-director/state.db (if any) is owned by the current user. Any
   // failure records to startup-errors.log and exits non-zero.
-  await runAgentDirectorStartupGate()
+  //
+  // b.jg5 SRJ-204: once the gate passes, and before the PID check or any
+  // Slack connection, the runtime version re-check is installed from the
+  // gate's result, in the statement right after the gate. Its first re-check runs one interval later, on its own
+  // timer, whatever health_check_interval is (0 included), in dry run too.
+  // Its baseline is the version the gate read. A re-check that refuses the
+  // binary records one startup-errors entry, then runs shutdown() with a
+  // non-zero exit code; a shutdown already running makes that a no-op, and a
+  // rejected shutdown still exits non-zero. shutdown() disposes it.
+  const startupGate = await runAgentDirectorStartupGate()
+  installAdVersionRecheck({
+    resolveSystemBinary,
+    baselineVersion: startupGate.adVersion,
+    recordStartupError,
+    stop: (exitCode) => {
+      shutdown('the runtime version re-check refused the agent-director binary (see startup-errors.log)', exitCode)
+        .catch(() => process.exit(exitCode))
+    },
+    log: (line) => console.error(line),
+  })
 
   // Check for an existing server BEFORE any side-effectful startup work —
   // before writePidFile (which would clobber the live server's PID file),

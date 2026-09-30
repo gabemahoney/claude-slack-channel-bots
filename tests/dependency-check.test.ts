@@ -52,7 +52,7 @@ import {
   AD_SYSTEM_INSTALL_NOT_FOUND,
   AD_SYSTEM_INSTALL_TOO_OLD,
 } from '../src/install-check.ts'
-import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
+import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE, RUNTIME_RECHECK_PHRASE } from '../src/ad-version-gate.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
 import { recordStartupError } from '../src/startup-errors.ts'
 import {
@@ -1012,7 +1012,9 @@ describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
 // Both name the Phase 1 floor; the too-old message also names the client's
 // required version. The too-old message keeps the install-skill block; the
 // floor message has none. Each binary path is a non-default value, so the message shows it is
-// passed through.
+// passed through. The startup gate's message is the startup form: it never
+// carries the runtime re-check phrase (b.jg5 SRJ-1013). `outcome.message` is
+// the text runAgentDirectorStartupGate records unchanged.
 
 describe('b.jg5 SRJ-208: version refusal messages', () => {
   beforeEach(() => {
@@ -1036,7 +1038,7 @@ describe('b.jg5 SRJ-208: version refusal messages', () => {
       named: [tooOld.actualVersion, tooOld.requiredVersion, PHASE1_FLOOR_VERSION, tooOld.binaryPath],
       carriesSkillBlock: true,
     },
-  ])('$name names the runbook section, the versions (incl. the Phase 1 floor) and the path, and no upgrade form', async ({ name, createClient, named, carriesSkillBlock }) => {
+  ])('$name names the runbook section, the versions (incl. the Phase 1 floor) and the path, and no upgrade form or runtime re-check phrase', async ({ name, createClient, named, carriesSkillBlock }) => {
     const outcome = await runStartupGate(passingDeps({ createClient }))
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
@@ -1051,6 +1053,7 @@ describe('b.jg5 SRJ-208: version refusal messages', () => {
       } else {
         expect(outcome.message).not.toContain(renderInstallSkillInstructions())
       }
+      expect(outcome.message).not.toContain(RUNTIME_RECHECK_PHRASE)
     }
   })
 })
