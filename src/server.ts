@@ -1333,9 +1333,10 @@ export function _buildReconnectSessionAdapter(
     // (b.sv7 / Epic t1.tkk.e4), CSCB recovers ITSELF: we fire the internal
     // sweep wrapper here so the frozen `working` row reconciles to `missing`,
     // and restart.ts probes liveness again in the same restart run (b.d61):
-    // alive === false takes the normal kill+relaunch branch at once. When the
-    // row still reads alive, the NEXT health-check tick sees it still alive
-    // && !connected (or dead) and reschedules. The external
+    // a re-probe that reads `dead` takes the normal kill+relaunch branch at
+    // once. `pending` or `unknown` leaves the relaunch undone (`unknown` arms
+    // the retry timer). When the row still reads `live`, the NEXT
+    // health-check tick reads it again and reschedules. The external
     // ~/startup/find-missing-loop.sh is belt-and-braces only (it may also
     // reconcile the row, but recovery no longer silently depends on it —
     // removing it is a separate operator decision). Not counting here keeps
@@ -1433,6 +1434,17 @@ function deferPromptRow(key: string, state: string): 'transient' {
 }
 
 /**
+ * A launch start as `deferPendingRow` logs it: timestamp characters only
+ * (digits, `T`, `Z`, `:`, `.`, `+`, `-`), at most 40 of them. agent-director
+ * supplies the value, so one that fails this (a line break that could fake a
+ * `[slack]` line, or any other text) is left out of the line rather than
+ * echoed. Exported for tests.
+ *
+ * @internal
+ */
+export const LAUNCH_START_LOG_RE = /^[0-9TZ:.+-]{1,40}$/
+
+/**
  * The `pending` deferral for persona `key` (b.dup; b.jg5 SRJ-314, and the
  * entry point of SRJ-409's pending-row handling): its row reads `pending`, so
  * its session has not started. agent-director would refuse keystrokes to it
@@ -1447,15 +1459,19 @@ function deferPromptRow(key: string, state: string): 'transient' {
  * showed none. Types nothing, kills and launches nothing, counts nothing and
  * raises no notice (a launch whose session never leaves `pending` raises its
  * own, from its dialog approver); logs the deferral, naming the launch start
- * when one was read, and returns 'pending', a deferral like 'transient'. A
- * later tick or retry reads the row again.
+ * when one was read and it passes `LAUNCH_START_LOG_RE` (anything else is left
+ * out of the line; the value itself stays as carried), and returns 'pending',
+ * a deferral like 'transient'. A later tick or retry reads the row again.
  *
  * Exported for tests.
  *
  * @internal
  */
 export function deferPendingRow(key: string, launchStartedAt?: string): 'pending' {
-  const launch = launchStartedAt === undefined ? '' : ` (launch started ${launchStartedAt})`
+  const launch =
+    typeof launchStartedAt === 'string' && LAUNCH_START_LOG_RE.test(launchStartedAt)
+      ? ` (launch started ${launchStartedAt})`
+      : ''
   console.error(
     `[slack] Deferring persona=${key}: its row reads pending${launch} — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; no reconnect, kill or launch, nothing counted (b.dup)`,
   )

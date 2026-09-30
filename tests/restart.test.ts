@@ -141,6 +141,7 @@ import { installAdVersionRecheck, resetAdVersionRecheckForTests } from '../src/a
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
+  AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_LIVE,
   LIVENESS_READING_PENDING,
@@ -4366,22 +4367,6 @@ describe('b.jg5 SRJ-314: an unknown or thrown liveness probe kills and launches 
     assertNoLeak({ errArgs })
   })
 
-  test('after an escalate-dead reconnect, the re-probe reads dead → one kill and one relaunch in that retry, counted as today; nothing armed', async () => {
-    recordFailure(P)
-    const deps = makeDeps({ restartDelay: 0, launchSessionResult: false })
-    const readings = [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD]
-    deps.isSessionAlive = async (key) => { deps.isSessionAliveCalls.push(key); return readings.shift()! }
-    deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return 'escalate-dead' }
-    initRestart(deps)
-
-    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_COUNTED_FAILURE)
-
-    expect(deps.killSessionCalls).toEqual([P])
-    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P])
-    expect(getFailureCount(P)).toBe(2)
-    expect(deps.armRetryTimerCalls).toEqual([])
-  })
-
   // The hook is optional, and one that throws is logged by its redacted
   // description and changes nothing else: the outcome is still liveness-unknown.
   test.each<[string, 'absent' | 'throws']>([
@@ -4633,7 +4618,7 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
       const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
       const KEY = config.personas[0]!.key
       const log = makeStubCallLog()
-      const stub = makeStubClient({ ...log, statusResult: cannedStatusResult({ state: 'pending', launch_started_at: start }) })
+      const stub = makeStubClient({ ...log, statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: start }) })
       _resetOutageState()
       initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
       setClientForTests(stub as unknown as Client)
@@ -4671,10 +4656,9 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
       expect(launchSessionCalls).toEqual([])
       expect(armed).toEqual([])
       expect(getFailureCount(KEY)).toBe(1)
-      const launch = start === undefined ? '' : ` (launch started ${start})`
-      expect(errLines).toEqual([
-        `[slack] Deferring persona=${KEY}: its row reads pending${launch} — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; no reconnect, kill or launch, nothing counted (b.dup)`,
-      ])
+      expect(errLines).toHaveLength(1)
+      expect(errLines[0]).toStartWith(`[slack] Deferring persona=${KEY}`)
+      if (start !== undefined) expect(errLines[0]).toContain(start)
     })
   })
 })

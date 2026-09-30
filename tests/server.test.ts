@@ -68,6 +68,7 @@ import {
   _buildReconnectSessionAdapter,
   _runCallTimeoutStartStep,
   deferPendingRow,
+  LAUNCH_START_LOG_RE,
 } from '../src/server.ts'
 import { buildPersonaClientOrExit, type PersonaClientDeps } from '../src/agent-director-startup.ts'
 import {
@@ -626,26 +627,37 @@ describe('_buildIsSessionAliveAdapter', () => {
   })
 
   // b.jg5 SRJ-314: `pending` is its own reading (never `live`); the dead list
-  // is closed, so a state CSCB does not know reads `unknown`, never `dead`.
+  // is closed, so a state CSCB does not know reads `unknown`, never `dead`,
+  // and logs one line naming the persona; a known state logs no such line.
   // Any state answer clears both flags.
+  /** The start of the line the probe logs for a state CSCB does not know. */
+  const UNKNOWN_STATE_LINE = 'isSessionAlive: status answered a state CSCB does not know'
   test.each([
     ...NOT_PENDING_STATE_READINGS,
     [AGENT_DIRECTOR_PENDING_STATE, LIVENESS_READING_PENDING] as const,
-  ])('status answers state %s → reads %j and clears both flags', async (state, reading) => {
+  ])('status answers state %s → reads %j and clears both flags; an unknown-state line only for a state CSCB does not know', async (state, reading) => {
     const { statusCalls, adapter } = makeHarness(undefined, state)
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     setOutageFlag('C1', 'tmux-unavailable')
 
-    const { result } = await probeCapturingErrors(adapter, 'C1')
+    const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
 
     expect(result).toEqual(reading)
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
     expect(getOutageFlags('C1').size).toBe(0)
+    const unknownStateLines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.includes(UNKNOWN_STATE_LINE))
+    if (state === UNRECOGNISED_STATE) {
+      expect(unknownStateLines).toHaveLength(1)
+      expect(unknownStateLines[0]).toContain('persona=C1')
+    } else {
+      expect(unknownStateLines).toEqual([])
+    }
   })
 
   // b.jg5 SRJ-115: a `pending` result's launch start rides on the `pending`
   // reading, raw; a result with none gives the plain reading, and another
-  // state's field is ignored.
+  // state's field is ignored. One case each here: the permutations of "no
+  // launch start" and of the other states are the pure readers' (above).
   test.each(LAUNCH_STARTS)('SRJ-115: a pending result showing launch start %s → a pending reading carrying it raw', async (start) => {
     const { adapter } = makeHarness(undefined, AGENT_DIRECTOR_PENDING_STATE, standIns('C1'), start)
 
@@ -655,8 +667,8 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(launchStartOfReading(result)).toBe(start)
   })
 
-  test.each(NO_LAUNCH_STARTS)('SRJ-115: a pending result whose launch start is %s → the plain pending reading, carrying none', async (_label, value) => {
-    const { adapter } = makeHarness(undefined, AGENT_DIRECTOR_PENDING_STATE, standIns('C1'), value)
+  test('SRJ-115: a pending result showing no launch start → the plain pending reading, carrying none', async () => {
+    const { adapter } = makeHarness(undefined, AGENT_DIRECTOR_PENDING_STATE, standIns('C1'), SAMPLE_LAUNCH_START_NONE)
 
     const result = await adapter('C1')
 
@@ -664,12 +676,12 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(result).not.toHaveProperty('launchStartedAt')
   })
 
-  test.each(NOT_PENDING_STATE_READINGS)('SRJ-115: a %s result carrying a launch start → reads %j, carrying none', async (state, reading) => {
-    const { adapter } = makeHarness(undefined, state, standIns('C1'), SAMPLE_LAUNCH_START_FRACTIONAL)
+  test('SRJ-115: a live (not pending) result carrying a launch start → reads live, carrying none', async () => {
+    const { adapter } = makeHarness(undefined, LIVE_STATE, standIns('C1'), SAMPLE_LAUNCH_START_FRACTIONAL)
 
-    const { result } = await probeCapturingErrors(adapter, 'C1')
+    const result = await adapter('C1')
 
-    expect(result).toEqual(reading)
+    expect(result).toEqual(LIVENESS_READING_LIVE)
     expect(result).not.toHaveProperty('launchStartedAt')
   })
 
@@ -1272,6 +1284,56 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(tmuxProbes).toEqual([])
     expect(raised).toEqual([])
     expect(lines).toEqual([deferralLine(launch)])
+  })
+
+  // The launch start comes from agent-director, so the deferral line names it
+  // only when it passes `LAUNCH_START_LOG_RE` (timestamp characters, at most
+  // 40): a line break that could fake a `[slack]` line, an over-long value or
+  // other text is left out of the line, which is otherwise unchanged.
+  /** Timestamp characters only, but longer than the pattern allows. */
+  const OVER_LONG_LAUNCH_START = SAMPLE_LAUNCH_START_WHOLE.repeat(3)
+  const UNLOGGABLE_LAUNCH_STARTS: ReadonlyArray<readonly [string, string, string]> = [
+    // [label, launch start, text that must not reach the output]
+    ['a line break and a fake [slack] line', `${SAMPLE_LAUNCH_START_WHOLE}\n[slack] fake`, '[slack] fake'],
+    ['an over-long value', OVER_LONG_LAUNCH_START, OVER_LONG_LAUNCH_START],
+    ['other characters', `${SAMPLE_LAUNCH_START_WHOLE} <@U000FAKE> hi`, '<@U000FAKE>'],
+  ]
+
+  test('LAUNCH_START_LOG_RE: every sample launch start passes; the unloggable ones fail (the over-long one on length alone)', () => {
+    for (const start of LAUNCH_STARTS) expect(LAUNCH_START_LOG_RE.test(start)).toBe(true)
+    for (const [, start] of UNLOGGABLE_LAUNCH_STARTS) expect(LAUNCH_START_LOG_RE.test(start)).toBe(false)
+    expect(LAUNCH_START_LOG_RE.test(OVER_LONG_LAUNCH_START.slice(0, 40))).toBe(true)
+  })
+
+  test.each(UNLOGGABLE_LAUNCH_STARTS)("deferPendingRow called directly with a launch start holding %s → 'pending'; exactly one line, without the launch part or the injected text", (_label, launchStartedAt, injected) => {
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    let result: string | undefined
+    try {
+      result = deferPendingRow('C1', launchStartedAt)
+    } finally {
+      console.error = orig
+    }
+
+    expect(result).toBe('pending')
+    expect(lines).toEqual([deferralLine('')])
+    expect(lines[0]).not.toContain('\n')
+    expect(lines[0]).not.toContain('launch started')
+    expect(lines[0]).not.toContain(injected)
+  })
+
+  test.each(LAUNCH_STARTS)("deferPendingRow called directly with the valid launch start %s → one line naming it", (start) => {
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    try {
+      deferPendingRow('C1', start)
+    } finally {
+      console.error = orig
+    }
+
+    expect(lines).toEqual([deferralLine(` (launch started ${start})`)])
   })
 
   test('(v) the key passed selects the instance: a non-channel-form key probes and reconnects cscb_<key> (b.av2 SR-2.2)', async () => {

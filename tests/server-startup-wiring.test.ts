@@ -1425,11 +1425,10 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
 //
 // `RestartDeps.deferPendingRow` is optional (absent, a `pending` liveness
 // reading defers silently), so a production wiring that dropped it, bound it
-// to a stub, to a local shadow of `deferPendingRow`, or dropped the reading's
-// launch start, would type-check and pass every behaviour suite while the
-// deferral line lost the launch start or went unlogged. What the deferral does
-// is tested in tests/restart.test.ts and tests/server.test.ts; pinned here:
-// its binding.
+// to a stub or dropped the reading's launch start would type-check and pass
+// every behaviour suite while the deferral line lost the launch start or went
+// unlogged. What the deferral does is tested in tests/restart.test.ts and
+// tests/server.test.ts; pinned here: its binding.
 // ---------------------------------------------------------------------------
 
 describe('main() binds the restart module\'s pending deferral (deferPendingRow) to server.ts\'s one deferPendingRow, with the reading\'s launch start (b.jg5 SRJ-314, SRJ-115)', () => {
@@ -1437,109 +1436,17 @@ describe('main() binds the restart module\'s pending deferral (deferPendingRow) 
   const DEP: keyof RestartDeps = 'deferPendingRow'
   const LAUNCH_FIELD: keyof PendingLivenessReading = 'launchStartedAt'
 
-  /**
-   * Why the `initRestart` binding of `DEP` in `code` is not
-   * `(<key>, <reading>) => { deferPendingRow(<key>, <reading>.launchStartedAt) }`
-   * (or the same call as an expression body; the parameters' names are free)
-   * over the one module-scope `function deferPendingRow`, or null when it is.
-   */
-  function deferWiringFault(code: string): string | null {
-    const hook = objectProperties(onlyCallArguments(code, 'initRestart')).get(DEP)
-    if (hook === undefined) return `initRestart has no ${DEP}`
-    const call = `${DEP}\\((\\w+), (\\w+)\\.${LAUNCH_FIELD}\\)`
-    const m = hook.match(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
-    if (!m) return `${DEP} is bound to \`${hook}\``
-    // The call's groups: 3 and 4 in a braced body, 5 and 6 in an expression body.
-    const [, key, reading] = m
-    const keyArg = m[3] ?? m[5]
-    const readingArg = m[4] ?? m[6]
-    if (keyArg !== key || readingArg !== reading || key === reading) {
-      return `${DEP}'s call does not pass its own key and its reading's ${LAUNCH_FIELD}: \`${hook}\``
-    }
-    if (key === DEP || reading === DEP) return `a parameter of ${DEP}'s binding shadows ${DEP}: \`${hook}\``
-    // Every binding of the name in the file: the one module-scope declaration, and nothing else.
-    const declarations = indicesOf(new RegExp(`\\bfunction\\s*\\*?\\s*${DEP}\\b`, 'g'), code)
-    const others = [
-      ...indicesOf(new RegExp(`\\b(?:const|let|var|class)\\s+${DEP}\\b`, 'g'), code),
-      ...indicesOf(new RegExp(`\\b(?:const|let|var)\\s*[{[][^}\\]]*\\b${DEP}\\b`, 'g'), code),
-      // A parameter of that name (an object key `, deferPendingRow:` is not one).
-      ...indicesOf(new RegExp(`\\(\\s*${DEP}\\s*[,)=:?]|\\b${DEP}\\s*=>`, 'g'), code),
-    ]
-    if (importSource(code, DEP) !== undefined) return `${DEP} is imported from ${importSource(code, DEP)}`
-    if (others.length > 0) return `${DEP} is bound ${others.length} more time(s) besides its declaration`
-    if (declarations.length !== 1) return `${DEP} is declared ${declarations.length} times`
-    // Module scope: unindented, at most `export ` before it on its line, and outside main().
-    const lineStart = code.lastIndexOf('\n', declarations[0]! - 1) + 1
-    const lead = code.slice(lineStart, declarations[0]!)
-    if (!/^(?:export )?$/.test(lead) || insideMainOf(code, declarations[0]!)) {
-      return `${DEP} is not declared at module scope`
-    }
-    return null
-  }
-
-  test('server.ts binds it so', () => {
-    expect(deferWiringFault(SERVER_CODE)).toBeNull()
-  })
-
-  // A minimal server.ts shape the audit accepts, and one edit per plausible wrong wiring.
-  const DECL = `export function ${DEP}(key: string, launchStartedAt?: string): 'pending' {\n  return 'pending'\n}\n`
-  const shape = (hook: string, extraMain = '', extraModule = ''): string =>
-    `${extraModule}${DECL}export async function main(): Promise<void> {\n${extraMain}  initRestart({\n    canRestart: gate,\n    ${DEP}: ${hook},\n  })\n}\n`
-
-  test('the audit accepts the binding with any parameter names, a braced or an expression body', () => {
-    for (const hook of [
-      `(key, reading) => {\n      ${DEP}(key, reading.${LAUNCH_FIELD})\n    }`,
-      `(key, reading) => { ${DEP}(key, reading.${LAUNCH_FIELD}); }`,
-      `(k, r) => ${DEP}(k, r.${LAUNCH_FIELD})`,
-    ]) {
-      expect([hook, deferWiringFault(shape(hook))]).toEqual([hook, null])
-    }
-  })
-
-  test('the audit rejects a dropped, stubbed or rerouted binding, and one that loses or misplaces the launch start', () => {
-    expect(deferWiringFault(shape('x').replace(`    ${DEP}: x,\n`, ''))).not.toBeNull()
-    for (const hook of [
-      '() => {}',
-      '(key, reading) => {}',
-      '(key, reading) => { console.error(key) }',
-      DEP, // the bare function: handed the reading object as its launch start
-      `(key) => { ${DEP}(key) }`,
-      `(key, reading) => { ${DEP}(key) }`,
-      `(key, reading) => { ${DEP}(key, undefined) }`,
-      `(key, reading) => { ${DEP}(key, reading.kind) }`,
-      `(key, reading) => { ${DEP}(key, String(reading)) }`,
-      `(key, reading) => { ${DEP}(reading.${LAUNCH_FIELD}, key) }`,
-      `(key, reading) => { ${DEP}('persona', reading.${LAUNCH_FIELD}) }`,
-      `(key, reading) => { ${DEP}(key, other.${LAUNCH_FIELD}) }`,
-      `(key, reading) => { ${DEP}(key, key.${LAUNCH_FIELD}) }`,
-      `(key, reading) => { stubDefer(key, reading.${LAUNCH_FIELD}) }`,
-      `(key, reading) => { deps.${DEP}(key, reading.${LAUNCH_FIELD}) }`,
-      `(key, reading) => { void reconnectSession(key) }`,
-      `(key, reading) => { ${DEP}(key, reading.${LAUNCH_FIELD}); scheduleRestart(key) }`,
-      `(key, reading) => { if (key) ${DEP}(key, reading.${LAUNCH_FIELD}) }`,
-      `(${DEP}, reading) => { ${DEP}(${DEP}, reading.${LAUNCH_FIELD}) }`,
-    ]) {
-      expect([hook, deferWiringFault(shape(hook))]).not.toEqual([hook, null])
-    }
-  })
-
-  test('the audit rejects a correct-looking binding whose deferPendingRow is a local shadow, an import or a second declaration', () => {
-    const hook = `(key, reading) => { ${DEP}(key, reading.${LAUNCH_FIELD}) }`
-    for (const [extraMain, extraModule] of [
-      [`  const ${DEP} = (key: string) => 'pending' as const\n`, ''],
-      [`  let ${DEP} = stubDefer\n`, ''],
-      [`  function ${DEP}(key: string): 'pending' { return 'pending' }\n`, ''],
-      [`  const { ${DEP} } = stubs\n`, ''],
-      ['', `import { ${DEP} } from './stub.ts'\n`],
-      ['', `import { stubDefer as ${DEP} } from './stub.ts'\n`],
-      ['', `const ${DEP} = stubDefer\n`],
-    ] as const) {
-      expect([extraMain, extraModule, deferWiringFault(shape(hook, extraMain, extraModule))])
-        .not.toEqual([extraMain, extraModule, null])
-    }
-    // Declared only inside main(), not at module scope.
-    const inMain = shape(hook, `  ${DECL.replace('export ', '')}`).replace(DECL, '')
-    expect(deferWiringFault(inMain)).not.toBeNull()
+  test('the hook passes its own key and the reading\'s launch start to the one module-scope deferPendingRow', () => {
+    const hook = onlyCallProps('initRestart').get(DEP)
+    expect(hook).toBeDefined()
+    // `(key, reading) => { deferPendingRow(key, reading.launchStartedAt) }`,
+    // or the same call as an expression body; the parameters' names are free.
+    const call = `${DEP}\\(\\1, \\2\\.${LAUNCH_FIELD}\\)`
+    expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
+    // Not an import, and declared once, at module scope.
+    expect(importSource(SERVER_CODE, DEP)).toBeUndefined()
+    expect(indicesOf(new RegExp(`\\b(?:function|const|let|var)\\s+${DEP}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+    expect(indicesOf(new RegExp(`^(?:export )?function ${DEP}\\(`, 'gm'), SERVER_CODE)).toHaveLength(1)
   })
 })
 

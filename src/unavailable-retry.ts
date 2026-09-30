@@ -106,7 +106,12 @@
  * trigger sink (`UnavailableRetryTriggerSink`, which the controller is) arms
  * the persona's timer with it, and the innermost attempt records the error as
  * its last, with whether it armed. A trigger while armed keeps the due time
- * (`arm` above).
+ * (`arm` above). A second arming path is the restart work's arm hook,
+ * `RestartDeps.armRetryTimer` (wired in `main()`): it arms the persona's
+ * timer with `UNAVAILABLE_RETRY_CAUSE_READ_ERROR` on every `unknown` liveness
+ * reading at the restart work, the re-probe's included, whatever made it
+ * `unknown` (a CONFIG or UNUSABLE NAME answer and a probe that throws
+ * included, which the arming predicate above does not arm on).
  *
  * The retry action (b.jg5 SRJ-303, SRJ-305). The server's action is
  * `createFullModeRetryAction(deps)`, for both modes: at each retry, before
@@ -205,7 +210,13 @@ export const UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE = 'unavailable'
 /** The cause of an `ErrTmuxKillFailed` in an attempt: UNAVAILABLE, told apart by name. */
 export const UNAVAILABLE_RETRY_CAUSE_KILL_FAILED = 'kill-failed'
 
-/** The cause of any other `status`, `get` or `list` error in an attempt (b.jg5 SRJ-301, SRJ-105). */
+/**
+ * The cause of any other `status`, `get` or `list` error in an attempt (b.jg5
+ * SRJ-301, SRJ-105). Also the cause the restart work's arm hook
+ * (`RestartDeps.armRetryTimer`, wired in `main()`) arms with, on every
+ * `unknown` liveness reading at the restart work: CONFIG, UNUSABLE NAME and a
+ * thrown probe included (b.jg5 SRJ-314).
+ */
 export const UNAVAILABLE_RETRY_CAUSE_READ_ERROR = 'read-error'
 
 /** The cause `armPendingOnly` records: a covered `pending` row (b.jg5 SRJ-303, SRJ-409). */

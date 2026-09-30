@@ -1321,12 +1321,13 @@ describe('b.jg5 SRJ-314: an unknown reading or a thrown probe skips the persona 
   const UNSURE: Array<[string, LivenessReading | Error]> = [
     ['an unknown reading', LIVENESS_READING_UNKNOWN],
     ['a thrown probe', new Error('simulated status failure')],
+    ['an answer that is not a reading', true as unknown as LivenessReading],
   ]
 
   test.each(UNSURE.flatMap(([label, answer]) => [
     [`${label}, the session connected with its stream`, answer, {}],
     [`${label}, the session disconnected`, answer, { isSessionConnectedResult: false }],
-  ] as Array<[string, LivenessReading | Error, DepsOpts]>))('%s: over three ticks nothing is scheduled, no notice asked for and no episode ended; connectedness is never probed', async (_label, answer, conn) => {
+  ] as Array<[string, LivenessReading | Error, DepsOpts]>))('%s: over three ticks nothing is scheduled, no notice asked for and no episode ended; connectedness is never probed; each tick logs its skip once, naming the persona', async (_label, answer, conn) => {
     // Were the answer read as dead, tick 1 would schedule; read as alive, a
     // connected session would end its episode each tick and a disconnected
     // one would be scheduled (and noticed, auto-restart disabled) on tick 2.
@@ -1336,8 +1337,11 @@ describe('b.jg5 SRJ-314: an unknown reading or a thrown probe skips the persona 
     const ended: string[] = []
     deps.notifyNotConnected = (key) => void notified.push(key)
     deps.endNotConnectedEpisode = (key) => void ended.push(key)
+    const lines: string[] = []
+    const savedError = console.error
+    console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '))
 
-    await runTicks(deps, 3)
+    try { await runTicks(deps, 3) } finally { console.error = savedError }
 
     expect(deps.isSessionAliveCalls).toEqual([KEY, KEY, KEY])
     expect(deps.scheduleRestartCalls).toEqual([])
@@ -1345,6 +1349,12 @@ describe('b.jg5 SRJ-314: an unknown reading or a thrown probe skips the persona 
     expect(ended).toEqual([])
     expect(deps.isSessionConnectedCalls).toEqual([])
     expect(deps.hasSessionStreamCalls).toEqual([])
+    const skips = lines.filter((line) => line.includes('liveness unknown'))
+    expect(skips).toHaveLength(3)
+    for (const line of skips) {
+      expect(line).toStartWith(`[slack] health-check: liveness unknown for persona=${KEY}`)
+      expect(line).toContain('skipping it this tick')
+    }
   })
 
   test.each(UNSURE)('the streak is cleared by %s: undeliverable, then unsure, then undeliverable schedules nothing; a second undeliverable tick after it schedules', async (_label, answer) => {

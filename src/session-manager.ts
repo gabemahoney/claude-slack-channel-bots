@@ -2094,9 +2094,10 @@ async function sharedFindMissingSweep(
  * `~/startup/find-missing-loop.sh`: emit an operator-visible log line, then run
  * the existing memoized `reconcileMissingSweep` (b.m4r). The sweep reconciles
  * the frozen `working` row to `missing`, so the restart run's second liveness
- * probe (b.d61) observes `alive === false` and takes the normal kill+relaunch
- * branch at once; if the row still reads alive, a later health-check tick
- * does. The external loop remains belt-and-braces; removing it is a separate
+ * probe (b.d61) reads `dead` and takes the normal kill+relaunch branch at
+ * once. A re-probe reading `pending` or `unknown` leaves the relaunch undone
+ * (`unknown` arms the retry timer); if the row still reads `live`, a later
+ * health-check tick does. The external loop remains belt-and-braces; removing it is a separate
  * operator decision.
  *
  * The log line is emitted UNCONDITIONALLY here — before/outside the memoized

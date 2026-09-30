@@ -313,8 +313,9 @@ export function startHealthCheck(intervalSeconds: number): void {
 
           // b.9a7: a persona can be alive (AD live state — pending, waiting,
           // working, ask_user, check_permission) yet have a dead MCP session.
-          // `isSessionAlive` alone stays true for such a row, so the pre-b.9a7
-          // tick (`if (!alive) scheduleRestart`) did nothing for it forever —
+          // `isSessionAlive` alone reads `live` or `pending` for such a row,
+          // so the pre-b.9a7 tick (`if (!alive) scheduleRestart`) did nothing
+          // for it forever —
           // there was no time-bounded recovery. Route BOTH dead sessions and
           // alive-but-disconnected sessions through scheduleRestart; restart.ts
           // then does the right thing per case (live+connected → no-op self-
@@ -349,7 +350,8 @@ export function startHealthCheck(intervalSeconds: number): void {
             // poked mid-boot. Require two CONSECUTIVE ticks before acting (see
             // disconnectedStreak doc comment). scheduleRestart then does the
             // right thing per case — reconnect a disconnected row, or recover a
-            // streamless one (restart.ts:155 no longer waves the latter through).
+            // streamless one (restartWorkSteps' connected-and-stream check in
+            // restart.ts no longer waves the latter through).
             //
             // b.f2b: a reconnect deferred on a `working` row returns
             // 'transient', and restart.ts never re-enters on it; this tick is
