@@ -4,9 +4,10 @@
  *
  * Scope: the settings file's path, table and key names, the defaults and
  * minimums, the read with agent-director's rule, the values in effect and
- * `[pause] timeout_seconds`. T2 (b.jg5 SRJ-210) adds the waits derived from
- * the values in effect; E7 (b.jg5 SRJ-213) adds agent-director's verb
- * ceilings and the call-timeout need. The nine `[tmux]` defaults,
+ * `[pause] timeout_seconds` (b.jg5 SRJ-209); the waits derived from the
+ * values in effect (G, the alert threshold and B), their whole-minute
+ * rendering for notices, and the never-early wait helper that arms a derived
+ * wait on an injected clock (b.jg5 SRJ-210). The nine `[tmux]` defaults,
  * `[pause] timeout_seconds`'s 30 s and the three minimums are named here and
  * nowhere else: no other module in `src/` defines one, and no CSCB wait
  * holds one as a fixed value.
@@ -60,12 +61,36 @@
  * registers the re-read on the version re-check's tick hook
  * (`onAdVersionRecheckTick`, `src/ad-version-gate.ts`), so the file is read
  * again at each 120 s tick, whatever `health_check_interval` is, and never
- * after that re-check's dispose. This module arms no timer of its own.
+ * after that re-check's dispose. The read arms no timer of its own; the only
+ * timers this module arms are those of {@link armNeverEarlyWait}, on the
+ * clock its caller passes.
+ *
+ * The derived waits (b.jg5 SRJ-210), in milliseconds:
+ * - G, the grace period, is `pending_grace_seconds`;
+ * - the alert threshold is the longer of `stopping_window_seconds` and
+ *   `starting_session_seconds`, plus {@link AD_ALERT_THRESHOLD_ADDEND_SECONDS};
+ * - B, CSCB's launch bound, is the later of {@link DIALOG_READY_TIMEOUT_MS}
+ *   (the dialog approver's 300 s cap) and G plus
+ *   {@link AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS}.
+ * At agent-director's defaults they are 60 s, 360 s and 300 s. Each is
+ * computed exactly from the `bigint` values; a result is a millisecond
+ * `number` only when it is at most `Number.MAX_SAFE_INTEGER`, and otherwise
+ * {@link AD_WAIT_NEVER_ENDS} (`Infinity`), never a rounded-down number. So a
+ * consumer compares the time elapsed with the wait (`elapsed >= wait`) at the
+ * moment it checks, and a wait too long for a number never ends early. The
+ * accessors ({@link adGraceMsInEffect}, {@link adAlertThresholdMsInEffect},
+ * {@link adLaunchBoundMsInEffect}) read the values in effect each time they
+ * are called; nothing keeps a copy from the start. A timer longer than
+ * `MAX_TIMER_DELAY_MS` (`src/persona-retry-schedule.ts`) fires almost at
+ * once, so a consumer that arms a derived wait uses
+ * {@link armNeverEarlyWait}, which arms timers no longer than that and runs
+ * its callback only once the clock has reached the deadline.
  *
  * No side effects at import: nothing is read, armed or logged until
- * {@link installAdSettings} or a reader's `read()` runs. The module makes no
- * agent-director call and imports neither the agent-director package nor
- * the client, outage-state, notifier or Slack modules.
+ * {@link installAdSettings}, a reader's `read()` or
+ * {@link armNeverEarlyWait} runs. The module makes no agent-director call.
+ * It imports neither the agent-director package nor the client,
+ * outage-state, notifier or Slack modules.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -83,6 +108,8 @@ import {
   readPersonaConfigBytes,
   type PersonaConfigFs,
 } from './config.ts'
+import type { PersonaConnectionClock } from './persona-connections.ts'
+import { MAX_TIMER_DELAY_MS } from './persona-retry-schedule.ts'
 
 // ---------------------------------------------------------------------------
 // Names, defaults and minimums
@@ -506,4 +533,169 @@ export function resetAdSettingsForTests(): void {
   unsubscribeTick?.()
   unsubscribeTick = undefined
   installedReader = undefined
+}
+
+// ---------------------------------------------------------------------------
+// The derived waits: G, the alert threshold and B (b.jg5 SRJ-210)
+// ---------------------------------------------------------------------------
+
+/**
+ * The dialog approver's cap: how long a fresh spawn may take to leave
+ * `pending` while `src/session-manager.ts` auto-dismisses pre-session
+ * dialogs (300 000 ms). B's floor: B is never shorter than this.
+ */
+export const DIALOG_READY_TIMEOUT_MS = 5 * 60_000
+
+/** The alert threshold's addend, in seconds, over the longer of `stopping_window_seconds` and `starting_session_seconds`. */
+export const AD_ALERT_THRESHOLD_ADDEND_SECONDS = 60n
+
+/** B's addend, in seconds, over G: B is the later of `DIALOG_READY_TIMEOUT_MS` and G plus this. */
+export const AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS = 60n
+
+/**
+ * A derived wait that never ends: one whose exact length in milliseconds is
+ * above `Number.MAX_SAFE_INTEGER`, so no millisecond `number` holds it
+ * exactly. `elapsed >= AD_WAIT_NEVER_ENDS` is false for every elapsed time.
+ */
+export const AD_WAIT_NEVER_ENDS = Number.POSITIVE_INFINITY
+
+const MS_PER_SECOND_NUMBER = 1000
+const MS_PER_MINUTE = 60 * MS_PER_SECOND_NUMBER
+const MAX_EXACT_MS = BigInt(Number.MAX_SAFE_INTEGER)
+
+/** An exact millisecond count as a `number`, or {@link AD_WAIT_NEVER_ENDS} when a `number` cannot hold it exactly. */
+function exactMs(ms: bigint): number {
+  return ms <= MAX_EXACT_MS ? Number(ms) : AD_WAIT_NEVER_ENDS
+}
+
+/** G in milliseconds, exact, as a `bigint`. */
+function graceMsExact(values: AdSettingsInEffect): bigint {
+  return values.tmux.pending_grace_seconds * MS_PER_SECOND
+}
+
+/** G, the grace period, in milliseconds: `pending_grace_seconds` (60 000 at the defaults), or {@link AD_WAIT_NEVER_ENDS}. */
+export function adGraceMs(values: AdSettingsInEffect): number {
+  return exactMs(graceMsExact(values))
+}
+
+/**
+ * The alert threshold in milliseconds: the longer of `stopping_window_seconds`
+ * and `starting_session_seconds`, plus {@link AD_ALERT_THRESHOLD_ADDEND_SECONDS}
+ * (360 000 at the defaults), or {@link AD_WAIT_NEVER_ENDS}.
+ */
+export function adAlertThresholdMs(values: AdSettingsInEffect): number {
+  const { stopping_window_seconds: stopping, starting_session_seconds: starting } = values.tmux
+  const longer = stopping > starting ? stopping : starting
+  return exactMs((longer + AD_ALERT_THRESHOLD_ADDEND_SECONDS) * MS_PER_SECOND)
+}
+
+/**
+ * B, CSCB's launch bound, in milliseconds: the later of
+ * `DIALOG_READY_TIMEOUT_MS` and G plus {@link AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS}
+ * (300 000 at the defaults; 360 000 with `pending_grace_seconds` 300), or
+ * {@link AD_WAIT_NEVER_ENDS}.
+ */
+export function adLaunchBoundMs(values: AdSettingsInEffect): number {
+  const floor = BigInt(DIALOG_READY_TIMEOUT_MS)
+  const fromGrace = graceMsExact(values) + AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS * MS_PER_SECOND
+  return exactMs(fromGrace > floor ? fromGrace : floor)
+}
+
+/** G from the values in effect at the moment of the call ({@link adSettingsInEffect}). */
+export function adGraceMsInEffect(): number {
+  return adGraceMs(adSettingsInEffect())
+}
+
+/** The alert threshold from the values in effect at the moment of the call ({@link adSettingsInEffect}). */
+export function adAlertThresholdMsInEffect(): number {
+  return adAlertThresholdMs(adSettingsInEffect())
+}
+
+/** B from the values in effect at the moment of the call ({@link adSettingsInEffect}). */
+export function adLaunchBoundMsInEffect(): number {
+  return adLaunchBoundMs(adSettingsInEffect())
+}
+
+/**
+ * A duration in milliseconds as whole minutes, rounded down (360 000 gives 6,
+ * 359 000 gives 5), for a notice that states a derived value; the notice text
+ * owns the word "minutes". {@link AD_WAIT_NEVER_ENDS} gives `Infinity`.
+ */
+export function wholeMinutes(ms: number): number {
+  return Math.floor(ms / MS_PER_MINUTE)
+}
+
+// ---------------------------------------------------------------------------
+// The never-early wait helper (b.jg5 SRJ-210)
+// ---------------------------------------------------------------------------
+
+/** The clock and timers {@link armNeverEarlyWait} takes: the timer subset of the persona clock type. */
+export type NeverEarlyWaitClock = Pick<PersonaConnectionClock, 'now' | 'setTimeout' | 'clearTimeout'>
+
+/**
+ * Arm a derived wait of `waitMs` measured from `startMs` (both in the clock's
+ * milliseconds), and run `callback` once when the clock has reached
+ * `startMs + waitMs`. Answers a cancel.
+ *
+ * - At most one timer is pending at a time, and none asks for more than
+ *   `MAX_TIMER_DELAY_MS`: a runtime timer longer than that fires almost at
+ *   once, so a longer wait runs as a chain of timers.
+ * - When a timer fires, the callback runs only if the time elapsed since
+ *   `startMs` (`clock.now() - startMs`) is at least `waitMs`; otherwise the
+ *   helper arms one timer for the time left. The deadline is checked by that
+ *   comparison, never by a sum that could round, so a timer that fires early
+ *   (or a clock that moves back) never runs the callback before the deadline.
+ * - The callback runs from a timer, never during this call, even when the
+ *   deadline has already passed.
+ * - A wait of {@link AD_WAIT_NEVER_ENDS} arms no timer and never runs the
+ *   callback.
+ * - The cancel clears the pending timer and stops the wait; calling it again,
+ *   or after the callback ran, does nothing.
+ *
+ * Throws a `RangeError` for a `startMs` that is not finite or a `waitMs` that
+ * is NaN, before arming anything.
+ */
+export function armNeverEarlyWait(
+  clock: NeverEarlyWaitClock,
+  startMs: number,
+  waitMs: number,
+  callback: () => void,
+): () => void {
+  if (!Number.isFinite(startMs)) throw new RangeError(`never-early wait: the start must be a finite time, got ${startMs}`)
+  if (Number.isNaN(waitMs)) throw new RangeError('never-early wait: the wait must be a number of milliseconds, got NaN')
+
+  let handle: unknown
+  let armed = false
+  let stopped = false
+
+  function arm(): void {
+    const left = waitMs - (clock.now() - startMs)
+    const delay = Math.min(Math.max(Math.ceil(left), 0), MAX_TIMER_DELAY_MS)
+    armed = true
+    handle = clock.setTimeout(onTimer, delay)
+  }
+
+  function onTimer(): void {
+    armed = false
+    handle = undefined
+    if (stopped) return
+    if (clock.now() - startMs >= waitMs) {
+      stopped = true
+      callback()
+      return
+    }
+    arm()
+  }
+
+  if (waitMs !== AD_WAIT_NEVER_ENDS) arm()
+
+  return () => {
+    if (stopped) return
+    stopped = true
+    if (armed) {
+      armed = false
+      clock.clearTimeout(handle)
+      handle = undefined
+    }
+  }
 }

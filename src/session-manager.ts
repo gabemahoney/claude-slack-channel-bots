@@ -144,6 +144,7 @@ import { describeDestinationFailureCause } from './persona-destination.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { RESTART_FAILURE_CAP } from './restart.ts'
 import { isDryRun } from './tokens.ts'
+import { DIALOG_READY_TIMEOUT_MS } from './ad-settings.ts'
 // Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
 import {
   UNATTRIBUTABLE_ZERO_REASON,
@@ -906,8 +907,9 @@ export function _resetDialogPollIntervalMs(): void {
 }
 
 /** Hard cap: how long to wait for a fresh spawn to leave `pending` (reach a
- *  live SessionStart state) while auto-dismissing pre-session dialogs. */
-export const DIALOG_READY_TIMEOUT_MS = 5 * 60_000
+ *  live SessionStart state) while auto-dismissing pre-session dialogs.
+ *  Defined in `src/ad-settings.ts` (B's floor); re-exported here. */
+export { DIALOG_READY_TIMEOUT_MS }
 
 let _dialogReadyTimeoutMs = DIALOG_READY_TIMEOUT_MS
 
