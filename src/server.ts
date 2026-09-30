@@ -231,7 +231,13 @@ import {
 } from './registry.ts'
 import { buildPersonaClientOrExit, runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck } from './ad-version-gate.ts'
-import { adSettingsInEffect, checkAdCallTimeoutAtStartup, installAdSettings, type AdSettingsInEffect } from './ad-settings.ts'
+import {
+  adAlertThresholdMsInEffect,
+  adSettingsInEffect,
+  checkAdCallTimeoutAtStartup,
+  installAdSettings,
+  type AdSettingsInEffect,
+} from './ad-settings.ts'
 import { armShutdownDeadline } from './shutdown-deadline.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
@@ -865,8 +871,11 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // armed again (a launch still in flight that meets UNAVAILABLE arms
   // nothing), so no retry is pending after this and none fires.
   unavailableRetry?.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
-  // b.jg5 SRJ-1016: every persona's notice episodes end silently.
-  personaEpisodes?.forgetAll()
+  // b.jg5 SRJ-1016: every persona's notice episodes end silently, which
+  // cancels every tmux-unresponsive alert check, and none begins again (a
+  // launch still in flight that meets UNAVAILABLE starts no condition), so
+  // nothing is posted and no alert check is pending after this.
+  personaEpisodes?.close()
   // Every persona's bring-up retry (directory re-checks); the manager's Slack
   // retries stop with stopAll() below.
   bringUps?.cancelAll()
@@ -1784,7 +1793,7 @@ export async function main(): Promise<void> {
   // b.jg5 SRJ-1016: the one set of per-persona notice episodes, on the system
   // clock, built before the retry controller and the start pass, so every
   // poster reaches it from the first launch. Its posts go through the persona
-  // notifier. A teardown forgets the key's episodes and shutdown forgets all.
+  // notifier. A teardown forgets the key's episodes and shutdown closes it.
   const noticeEpisodes = createPersonaEpisodes({
     sink: (key, text) => {
       void personaNotifier.notify(key, text)
@@ -1806,9 +1815,11 @@ export async function main(): Promise<void> {
   // agent-director call. b.jg5 SRJ-310: a retry that finds the persona's row
   // live out of `pending` with its session connected with its stream ends
   // its tmux-unresponsive condition (built just below; no retry runs before
-  // it exists).
+  // it exists). b.jg5 SRJ-308: every retry, one skipped for work in flight
+  // included, is the condition's onset check with the health check off.
   const retryTimers = createUnavailableRetryController({
     log: (line) => console.error(line),
+    onRetryFire: (key, firedAt) => tmuxUnresponsive.onsetAtRetry(key, firedAt),
     action: createFullModeRetryAction({
       retry: runRestartRetry,
       appliedPersona: getAppliedPersona,
@@ -1831,12 +1842,19 @@ export async function main(): Promise<void> {
   // state's wrappers start and end it (installed as its condition sink
   // below, before the start pass); the health tick and a retry end it too.
   // Each end is reported once to the retry controller's condition-end entry
-  // (SRJ-306), with the live reading a tick or a retry brings.
+  // (SRJ-306), with the live reading a tick or a retry brings. It posts its
+  // onset, alert and recovery (SRJ-308 to SRJ-310, SRJ-1006) through the
+  // notice episodes: the onset at a health tick, or with
+  // health_check_interval 0 (read from the configuration in effect at each
+  // check) at a retry; the alert against agent-director's threshold in
+  // effect (SRJ-210).
   const tmuxUnresponsive = createTmuxUnresponsiveCondition({
     episodes: noticeEpisodes,
     log: (line) => console.error(line),
     conditionEnded: (key, reading) =>
       retryTimers.conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE, reading),
+    healthCheckOn: () => (personaConfig ?? appliedConfig).health_check_interval !== 0,
+    alertThresholdMs: adAlertThresholdMsInEffect,
   })
 
   // Every persona notice goes through the one per-persona notifier: it holds
@@ -1945,7 +1963,14 @@ export async function main(): Promise<void> {
     // than wait it out (up to 10 min).
     cancelLaunchWait: cancelWorkingRowWait,
     cancelRestartTimer,
-    stopRetryTimer: (key) => retryTimers.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN),
+    // b.jg5 SRJ-309: with the retry timer stopped, "CSCB keeps retrying" is
+    // no longer true, so the key's tmux-unresponsive alert check is cancelled
+    // with it (at a destructive modify's submit too); its episode is
+    // forgotten at the teardown's turn.
+    stopRetryTimer: (key) => {
+      retryTimers.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+      tmuxUnresponsive.cancelAlert(key)
+    },
     forgetFailures,
     forgetDisconnectedStreak,
     forgetNotConnectedEpisode,
@@ -2302,6 +2327,12 @@ export async function main(): Promise<void> {
     endTmuxUnresponsive: (key) => {
       tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)
     },
+    // b.jg5 SRJ-308: each tick body ends with the condition's onset check,
+    // after all of its per-persona work, for every condition whose first
+    // refusal precedes the tick's start, read on the notice episodes' clock
+    // (the one the first refusal's time comes from).
+    now: () => noticeEpisodes.clock.now(),
+    onTickEnd: (tickStartedAt) => tmuxUnresponsive.onsetAtTick(tickStartedAt),
     // b.f2b: while the reconnect adapter holds an idle run for a persona's
     // `working` row, the next attempt (which can find the row stale and
     // reconnect it) is scheduled on the first undeliverable tick.

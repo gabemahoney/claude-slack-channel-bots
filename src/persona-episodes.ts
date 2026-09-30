@@ -22,44 +22,93 @@
  * - `end(key, kind)` ends the open episode silently: a later `begin` opens a
  *   new one, whose post is made again.
  * - `forget(key)` ends every kind's episode of one persona silently (its
- *   teardown); `forgetAll()` ends every episode (shutdown, test reset).
- *   Neither posts anything.
+ *   teardown); `forgetAll()` ends every episode and leaves the instance open
+ *   (the module's one test reset, with no production caller); `close()`, the
+ *   server's shutdown, ends every episode and refuses every later `begin`
+ *   (it answers `closed`), so a launch still running after it opens nothing.
+ *   None posts anything.
+ * - `whenClosed(key, kind, dispose)` runs `dispose` once when the open
+ *   episode closes, by any of the above or a new case: a poster's timer for
+ *   the episode (the `tmux-unresponsive` alert check) is cancelled with it.
+ * - `openKeys(kind)` lists the keys with an open episode of the kind; `clock`
+ *   is the clock the start times come from.
  *
  * Kinds and their posters. One label per row of SRJ-1016's table
- * (`PERSONA_EPISODE_KINDS`). None has a poster yet: `tmux-unresponsive`'s
- * episode is begun and ended by its condition (below), and its posts come
- * with its onset, alert and recovery (b.jg5 E10); every other kind's begin
- * and end triggers and text come with the Epic that posts it, named on its
- * label below.
+ * (`PERSONA_EPISODE_KINDS`). `tmux-unresponsive`'s episode is begun and
+ * ended by its condition (below), which posts its onset, alert and recovery;
+ * every other kind has no poster yet: its begin and end triggers and text
+ * come with the Epic that posts it, named on its label below.
  *
- * The `tmux-unresponsive` condition (b.jg5 SRJ-307, SRJ-310).
+ * The `tmux-unresponsive` condition (b.jg5 SRJ-307 to SRJ-310, SRJ-1006).
  * `createTmuxUnresponsiveCondition(deps)` builds it over one episodes
  * instance: the condition holds for a persona while its `tmux-unresponsive`
  * episode is open, and the episode's start time is the first refusal's time.
  * It is a per-persona condition, not an outage class: it never raises or
- * clears an outage flag, posts nothing and records no bad-stretch history.
+ * clears an outage flag, records no bad-stretch history, never touches the
+ * retry timer or the restart cap, and its only posts are its three notices
+ * (no generic outage onset or all-clear), each at most once per episode:
  *
  * - `start(key, verb, error)` starts the condition (opens the episode, the
- *   first refusal's time from the episodes' clock, one started line) or
- *   continues it (the first refusal's time kept, no line). Its only caller is
- *   the outage state's reporting point (`src/outage-state.ts`), for a
+ *   first refusal's time from the episodes' clock, one started line, and
+ *   the alert check armed) or continues it (the first refusal's time kept,
+ *   no line). After the episodes' `close` it does nothing. Its only caller
+ *   is the outage state's reporting point (`src/outage-state.ts`), for a
  *   tmux-touching call's UNAVAILABLE inside a launch or recovery attempt for
- *   the persona.
+ *   the persona; it never throws there.
  * - `holds(key)` and `firstRefusalAt(key)` read it.
- * - `end(key, reason, reading?)` ends a holding condition once: the episode
- *   ends, one ended line names the reason, and the injected condition-end
- *   hook is called once with the reading the end brings (a tick's or a
- *   retry's live reading; `pending` for a successful `spawn` or `resume`;
- *   none for any other tmux-touching success or GONE). It
- *   answers whether the episode's onset had been posted. On a persona that
- *   does not hold it, it does nothing.
- * - The episodes' `forget(key)` (a teardown) and `forgetAll()` drop a holding
- *   condition silently, with no line and no hook call.
+ * - The onset (SRJ-308): `onsetAtTick(tickStartedAt)`, called once per
+ *   health-tick body after all of the tick's per-persona work, posts it
+ *   while the health check is on for every condition still holding whose
+ *   first refusal precedes the tick's start (a persona the tick skipped
+ *   included; one the tick found healthy has already ended its condition, so
+ *   gets none); `onsetAtRetry(key, firedAt)`,
+ *   called at every fire of the persona's retry timer (a fire whose retry is
+ *   skipped for work in flight included), posts it while the health check
+ *   is off, at the first fire `TMUX_UNRESPONSIVE_ONSET_FLOOR_MS` or more
+ *   after the first refusal. The mode is read from the injected accessor
+ *   (the configuration in effect) at each check.
+ * - The alert (SRJ-309): one check per episode, armed at the first refusal
+ *   on the episodes' clock with the never-early wait (`armNeverEarlyWait`,
+ *   `src/ad-settings.ts`) over the injected threshold accessor (the
+ *   threshold in effect, read at every fire). It posts once the condition
+ *   has lasted strictly longer than the threshold in effect, the minutes
+ *   rendered by `wholeMinutes`. It needs no onset. The episode's end, a new
+ *   episode, `forget`, `forgetAll`, `close` and `cancelAlert(key)` (a
+ *   teardown's submit, once the retry timer is stopped) cancel it; a check
+ *   armed for an earlier episode never posts in a later one (the episode
+ *   number of `view`).
+ * - `end(key, reason, reading?, options?)` ends a holding condition once:
+ *   the recovery (SRJ-310) is posted when the episode's onset was, unless
+ *   `options.silent` (a CONFLICT answer ends it; its notice follows); the
+ *   episode ends, which cancels the alert check; one ended line names the
+ *   reason; and the injected condition-end hook is called once with the
+ *   reading the end brings (a tick's or a retry's live reading; `pending`
+ *   for a successful `spawn` or `resume`; none for any other tmux-touching
+ *   success or GONE). It answers whether the episode's onset had been
+ *   posted. On a persona that does not hold it, it does nothing.
+ * - The episodes' `forget(key)` (a teardown), `forgetAll()` and `close()`
+ *   drop a holding condition silently, with no post, no line and no hook
+ *   call.
+ *
+ * Texts (SRJ-1006; `<session>` the persona's quoted session name,
+ * `"slack_bot_<key>"`, SRJ-1001): `tmuxUnresponsiveOnsetText`,
+ * `tmuxUnresponsiveAlertText` and `tmuxUnresponsiveRecoveryText`.
  *
  * Log lines, to the injected log (a throwing log is swallowed):
  *
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive started — <verb> failed: <describeAgentDirectorFailure(error)>
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive onset posted — still not answering at <a health tick|a retry>, <s> s after its first refusal
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive alert posted — not answering for <s> s, over its alert threshold of <s> s
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive ended — <reason text>
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive recovery posted
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive recovery not posted — a silent end (a CONFLICT answer ended it)
+ *
+ * and, only on a failure: `alert check not armed: <error>`, `alert check
+ * failed: <error>`, `onset check at a retry failed: <error>`, `alert check
+ * cancel failed: <error>` (each after `persona=<key> tmux-unresponsive`),
+ * `[slack] persona-episodes: tmux-unresponsive onset check at a health tick
+ * failed: <error>` and `[slack] persona-episodes: tmux-unresponsive
+ * health-check mode read failed: <error> — taken as on`.
  *
  * b.f2b's not-connected reasons keep their one shared latch
  * (`notConnectedNoticeRaised` in `src/session-manager.ts`), which this module
@@ -71,7 +120,8 @@
  * The notice sink is the persona notifier's post in production (`main()` in
  * `src/server.ts`), which adds the persona prefix and holds a notice until
  * the persona's client is validated. A sink that throws or rejects is logged
- * through the injected log, with the text counted as posted. The clock is
+ * through the injected log, with the text counted as posted; so is a
+ * `whenClosed` disposer that throws (`episode close step failed`). The clock is
  * injected in `PersonaConnectionClock`'s shape (`now`, `setTimeout`,
  * `clearTimeout`; the shared fake clock satisfies it), the real clock by
  * default. No agent-director call, no Slack client and no module-scope
@@ -82,8 +132,10 @@
  */
 
 import { describeAgentDirectorFailure, type AdVerb } from './ad-error-class.ts'
+import { armNeverEarlyWait, wholeMinutes } from './ad-settings.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
+import { personaTmuxSessionName } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // Kinds (b.jg5 SRJ-1016)
@@ -105,7 +157,7 @@ export const PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED = 'launch-start-not-
  */
 export const PERSONA_EPISODE_KIND_KILL_FAILURE = 'kill-failure'
 
-/** `tmux-unresponsive` (SRJ-307 to SRJ-310): from the first refusal until the condition ends. No poster yet (this Epic's condition). */
+/** `tmux-unresponsive` (SRJ-307 to SRJ-310): from the first refusal until the condition ends. Posted by its condition (below). */
 export const PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE = 'tmux-unresponsive'
 
 /** `ad-config-malformed` (SRJ-316): as the `ad-unreachable` outage's episode. No poster yet (b.jg5 E12). */
@@ -165,14 +217,17 @@ export type PersonaEpisodeSink = (key: string, text: string) => void | Promise<v
 export interface PersonaEpisodesDeps {
   /** Receives each notice a post makes. */
   sink: PersonaEpisodeSink
-  /** Receives each `[slack]` line (the server log): only a sink that throws or rejects. A throwing log is swallowed. */
+  /** Receives each `[slack]` line (the server log): only a sink or a close step that throws or rejects. A throwing log is swallowed. */
   log: (line: string) => void
   /** Clock and timers; `SYSTEM_PERSONA_CONNECTION_CLOCK` by default. */
   clock?: PersonaEpisodesClock
 }
 
-/** What `begin` did: opened an episode where none was open, kept the open one, or began a new one for a new case. */
-export type PersonaEpisodeBeginResult = 'begun' | 'kept' | 'new-case'
+/**
+ * What `begin` did: opened an episode where none was open, kept the open one,
+ * began a new one for a new case, or nothing because the instance is closed.
+ */
+export type PersonaEpisodeBeginResult = 'begun' | 'kept' | 'new-case' | 'closed'
 
 /** A read-only view of one persona's open episode of one kind. */
 export interface PersonaEpisodeView {
@@ -188,14 +243,25 @@ export interface PersonaEpisodeView {
 
 /** The latches of one server. */
 export interface PersonaEpisodes {
+  /** The clock the episodes' start times come from; a poster's timers for an episode run on it too. */
+  readonly clock: PersonaEpisodesClock
   /**
    * Open the persona's episode of this kind, or keep the open one. A case
    * that differs from the open episode's begins a new episode; no case, or
-   * the same case, keeps it.
+   * the same case, keeps it. After `close`, opens nothing and answers `closed`.
    */
   begin(key: string, kind: PersonaEpisodeKind, caseLabel?: string): PersonaEpisodeBeginResult
   /** Whether the persona has an open episode of this kind. */
   isOpen(key: string, kind: PersonaEpisodeKind): boolean
+  /** The keys with an open episode of this kind. */
+  openKeys(kind: PersonaEpisodeKind): string[]
+  /**
+   * Run `dispose` once when the persona's open episode of this kind closes,
+   * however it closes (`end`, a new case, `forget`, `forgetAll`, `close`).
+   * Returns false, and keeps nothing, when no episode is open. A throwing
+   * `dispose` is logged and swallowed.
+   */
+  whenClosed(key: string, kind: PersonaEpisodeKind, dispose: () => void): boolean
   /**
    * Hand `text` to the sink once for this mark (`PERSONA_EPISODE_DEFAULT_MARK`
    * when none is given) in the open episode. Returns true when it was handed
@@ -210,8 +276,18 @@ export interface PersonaEpisodes {
   view(key: string, kind: PersonaEpisodeKind): PersonaEpisodeView | undefined
   /** End every kind's episode of the persona silently. */
   forget(key: string): void
-  /** End every episode of every persona silently. */
+  /**
+   * End every episode of every persona silently, leaving the instance open
+   * (a later `begin` opens again). For tests only: the module's one test
+   * reset, which lets a test harness reset between cases without closing
+   * the instance. No production path calls it; shutdown uses `close`.
+   */
   forgetAll(): void
+  /**
+   * The server's shutdown: end every episode silently, as `forgetAll`, and
+   * refuse every later `begin`, so nothing opens, posts or arms after it.
+   */
+  close(): void
 }
 
 /** One open episode. */
@@ -220,6 +296,8 @@ interface OpenEpisode {
   readonly startedAt: number
   readonly caseLabel?: string
   readonly posted: Set<string>
+  /** Run once when the episode closes (`whenClosed`). */
+  readonly disposers: (() => void)[]
 }
 
 // ---------------------------------------------------------------------------
@@ -232,9 +310,29 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
   /** Open episodes by persona key, then by kind. */
   const byKey = new Map<string, Map<PersonaEpisodeKind, OpenEpisode>>()
   let lastEpisode = 0
+  /** Set by `close`: every later `begin` is refused. */
+  let closed = false
 
   function open(key: string, kind: PersonaEpisodeKind): OpenEpisode | undefined {
     return byKey.get(key)?.get(kind)
+  }
+
+  /** Run a closed episode's disposers once each; a throwing one is logged. Never throws. */
+  function dispose(key: string, kind: PersonaEpisodeKind, closing: OpenEpisode): void {
+    for (const disposer of closing.disposers.splice(0)) {
+      try {
+        disposer()
+      } catch (err) {
+        safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} episode close step failed: ${describeThrownValue(err)}`)
+      }
+    }
+  }
+
+  /** Close every episode of every persona silently. */
+  function closeAll(): void {
+    const closing = [...byKey].flatMap(([key, kinds]) => [...kinds].map(([kind, ep]) => ({ key, kind, ep })))
+    byKey.clear()
+    for (const { key, kind, ep } of closing) dispose(key, kind, ep)
   }
 
   function start(key: string, kind: PersonaEpisodeKind, caseLabel: string | undefined): void {
@@ -243,6 +341,7 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
       kinds = new Map()
       byKey.set(key, kinds)
     }
+    const replaced = kinds.get(kind)
     const startedAt = clock.now()
     lastEpisode++
     kinds.set(kind, {
@@ -250,7 +349,9 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
       startedAt,
       ...(caseLabel === undefined ? {} : { caseLabel }),
       posted: new Set(),
+      disposers: [],
     })
+    if (replaced !== undefined) dispose(key, kind, replaced)
   }
 
   function send(key: string, kind: PersonaEpisodeKind, text: string): void {
@@ -264,7 +365,10 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
   }
 
   return {
+    clock,
+
     begin(key, kind, caseLabel) {
+      if (closed) return 'closed'
       const current = open(key, kind)
       if (current === undefined) {
         start(key, kind, caseLabel)
@@ -276,6 +380,15 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
     },
 
     isOpen: (key, kind) => open(key, kind) !== undefined,
+
+    openKeys: (kind) => [...byKey].filter(([, kinds]) => kinds.has(kind)).map(([key]) => key),
+
+    whenClosed(key, kind, disposer) {
+      const current = open(key, kind)
+      if (current === undefined) return false
+      current.disposers.push(disposer)
+      return true
+    },
 
     post(key, kind, text, mark = PERSONA_EPISODE_DEFAULT_MARK) {
       const current = open(key, kind)
@@ -290,8 +403,11 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
 
     end(key, kind) {
       const kinds = byKey.get(key)
-      if (kinds === undefined || !kinds.delete(kind)) return false
+      const current = kinds?.get(kind)
+      if (kinds === undefined || current === undefined) return false
+      kinds.delete(kind)
       if (kinds.size === 0) byKey.delete(key)
+      dispose(key, kind, current)
       return true
     },
 
@@ -307,11 +423,17 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
     },
 
     forget(key) {
+      const kinds = byKey.get(key)
+      if (kinds === undefined) return
       byKey.delete(key)
+      for (const [kind, ep] of kinds) dispose(key, kind, ep)
     },
 
-    forgetAll() {
-      byKey.clear()
+    forgetAll: closeAll,
+
+    close() {
+      closed = true
+      closeAll()
     },
   }
 }
@@ -328,6 +450,51 @@ function safeLog(log: (line: string) => void, line: string): void {
 // ---------------------------------------------------------------------------
 // The tmux-unresponsive condition (b.jg5 SRJ-307, SRJ-310)
 // ---------------------------------------------------------------------------
+
+/**
+ * With the health check off (`health_check_interval` 0), the onset is posted
+ * at the first retry of the persona's retry timer made at least this long
+ * after the first refusal (b.jg5 SRJ-308).
+ */
+export const TMUX_UNRESPONSIVE_ONSET_FLOOR_MS = 120_000
+
+/** `<session>` in SRJ-1006's texts: the persona's quoted session name (SRJ-1001). */
+function quotedSession(key: string): string {
+  return `"${personaTmuxSessionName(key)}"`
+}
+
+/** The onset notice's body for persona `key` (b.jg5 SRJ-1006); the persona notifier adds the persona prefix. */
+export function tmuxUnresponsiveOnsetText(key: string): string {
+  return (
+    `:hourglass_flowing_sand: *Not answering* — agent-director or tmux is not answering for this persona's session ${quotedSession(key)}. ` +
+    'CSCB keeps retrying; nothing is needed yet.'
+  )
+}
+
+/**
+ * The alert notice's body for persona `key` (b.jg5 SRJ-1006), stating
+ * `thresholdMs` (the alert threshold in effect, SRJ-210) in whole minutes,
+ * rounded down (`wholeMinutes`): "over 6 minutes" at agent-director's defaults.
+ */
+export function tmuxUnresponsiveAlertText(key: string, thresholdMs: number): string {
+  return (
+    `:rotating_light: *Still not answering* — this persona has not reached its session ${quotedSession(key)} ` +
+    `for over ${wholeMinutes(thresholdMs)} minutes. CSCB keeps retrying and takes no destructive action. ` +
+    "If this persists, a human should check the host's tmux server and agent-director."
+  )
+}
+
+/** The recovery notice's body for persona `key` (b.jg5 SRJ-1006). */
+export function tmuxUnresponsiveRecoveryText(key: string): string {
+  return `:white_check_mark: *Answering again* — this persona reaches its session ${quotedSession(key)} again.`
+}
+
+/** The onset's mark: the default one, so `hasPosted` with no mark answers whether the onset was posted. */
+const ONSET_MARK = PERSONA_EPISODE_DEFAULT_MARK
+/** The alert's mark. */
+const ALERT_MARK = 'alert'
+/** The recovery's mark. */
+const RECOVERY_MARK = 'recovery'
 
 /** End reason: a tmux-touching call for the persona succeeded or answered GONE (SRJ-310 rule 1). */
 export const TMUX_UNRESPONSIVE_END_TMUX_VERB = 'tmux-verb'
@@ -351,14 +518,23 @@ export const TMUX_UNRESPONSIVE_END_TEXT: Readonly<Record<TmuxUnresponsiveEndReas
   [TMUX_UNRESPONSIVE_END_RETRY]: 'a retry found its row live and its session connected with its stream',
 })
 
-/** What `start` did: started the condition, or continued one already holding. */
-export type TmuxUnresponsiveStartResult = 'started' | 'continued'
+/** What `start` did: started the condition, continued one already holding, or nothing after the episodes' `close` (shutdown). */
+export type TmuxUnresponsiveStartResult = 'started' | 'continued' | 'closed'
 
 /**
  * What `end` did: nothing (`not-holding`), or ended a holding condition whose
  * onset had not been posted (`ended`) or had been (`ended-after-onset`).
  */
 export type TmuxUnresponsiveEndResult = 'not-holding' | 'ended' | 'ended-after-onset'
+
+/** Options of an end. */
+export interface TmuxUnresponsiveEndOptions {
+  /**
+   * End without the recovery notice even when the onset was posted: the
+   * answer that ends it is CONFLICT, whose notice follows (b.jg5 SRJ-310).
+   */
+  silent?: boolean
+}
 
 /**
  * Where the outage state's wrappers start and end the condition
@@ -367,7 +543,7 @@ export type TmuxUnresponsiveEndResult = 'not-holding' | 'ended' | 'ended-after-o
  */
 export interface TmuxUnresponsiveSink {
   start(key: string, verb: AdVerb, error: unknown): unknown
-  end(key: string, reason: TmuxUnresponsiveEndReason, reading?: string): unknown
+  end(key: string, reason: TmuxUnresponsiveEndReason, reading?: string, options?: TmuxUnresponsiveEndOptions): unknown
 }
 
 /**
@@ -390,6 +566,18 @@ export interface TmuxUnresponsiveConditionDeps {
   log: (line: string) => void
   /** Called once per end of a holding condition; absent, nothing is called. A throwing hook is swallowed. */
   conditionEnded?: TmuxUnresponsiveConditionEndHook
+  /**
+   * Whether the health check is on (`health_check_interval` not 0), read from
+   * the configuration in effect at each onset check: on, the onset comes at a
+   * health tick (`onsetAtTick`); off, at a retry (`onsetAtRetry`). Absent: on.
+   */
+  healthCheckOn?: () => boolean
+  /**
+   * The alert threshold in effect, in milliseconds (production: E6's
+   * `adAlertThresholdMsInEffect`), read at the arm and at every check.
+   * Absent: no alert check is armed.
+   */
+  alertThresholdMs?: () => number
 }
 
 /** One server's `tmux-unresponsive` conditions, one per persona key. */
@@ -405,12 +593,42 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
   /** The first refusal's time, in clock milliseconds, while the condition holds; else `undefined`. */
   firstRefusalAt(key: string): number | undefined
   /**
-   * End persona `key`'s condition for `reason`: when it holds, end its
-   * episode, log one ended line and call the condition-end hook once with
-   * `reading`, and answer whether the onset had been posted; when it does
-   * not hold, answer `not-holding` and do nothing else.
+   * End persona `key`'s condition for `reason`: when it holds, post the
+   * recovery notice once if the onset was posted (none with
+   * `options.silent`), end its episode (which cancels its alert check), log
+   * one ended line and call the condition-end hook once with `reading`, and
+   * answer whether the onset had been posted; when it does not hold, answer
+   * `not-holding` and do nothing else.
    */
-  end(key: string, reason: TmuxUnresponsiveEndReason, reading?: string): TmuxUnresponsiveEndResult
+  end(
+    key: string,
+    reason: TmuxUnresponsiveEndReason,
+    reading?: string,
+    options?: TmuxUnresponsiveEndOptions,
+  ): TmuxUnresponsiveEndResult
+  /**
+   * The health tick's onset check, once per tick body, after all of the
+   * tick's per-persona work (b.jg5 SRJ-308): with the health check on, post
+   * the onset once per episode for every persona whose condition still holds
+   * and whose first refusal is strictly before `tickStartedAt` (the tick's
+   * start, in the episodes' clock milliseconds). A condition the tick ended
+   * no longer holds, so gets none. No agent-director call; never throws.
+   */
+  onsetAtTick(tickStartedAt: number): void
+  /**
+   * A retry's onset check, at every fire of persona `key`'s retry timer, a
+   * fire whose retry is skipped for work in flight included (b.jg5 SRJ-308,
+   * SRJ-303): with the health check off, post the onset once per episode
+   * when the condition holds and `firedAt` is at least
+   * `TMUX_UNRESPONSIVE_ONSET_FLOOR_MS` after its first refusal. Never throws.
+   */
+  onsetAtRetry(key: string, firedAt: number): void
+  /**
+   * Cancel persona `key`'s pending alert check silently, the condition kept
+   * (a teardown's submit, once its retry timer is stopped). Answers whether
+   * one was pending.
+   */
+  cancelAlert(key: string): boolean
 }
 
 /**
@@ -420,15 +638,87 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
 export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionDeps): TmuxUnresponsiveCondition {
   const kind = PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE
   const { episodes } = deps
+  /** Each persona's pending alert check: the episode it was armed for and its cancel. */
+  const alerts = new Map<string, { episode: number; cancel: () => void }>()
+
+  function line(key: string, text: string): void {
+    safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} ${text}`)
+  }
+
+  /** The health check's mode in effect; a throwing accessor reads as on. */
+  function healthCheckOn(): boolean {
+    if (deps.healthCheckOn === undefined) return true
+    try {
+      return deps.healthCheckOn()
+    } catch (err) {
+      safeLog(deps.log, `[slack] persona-episodes: ${kind} health-check mode read failed: ${describeThrownValue(err)} — taken as on`)
+      return true
+    }
+  }
+
+  function cancelAlert(key: string, episode?: number): boolean {
+    const pending = alerts.get(key)
+    if (pending === undefined || (episode !== undefined && pending.episode !== episode)) return false
+    alerts.delete(key)
+    pending.cancel()
+    return true
+  }
+
+  /**
+   * Arm the alert check for the persona's episode just begun (b.jg5 SRJ-309):
+   * on the episodes' clock, from the first refusal, until the condition has
+   * lasted strictly longer than the threshold in effect (the never-early wait
+   * of the threshold plus 1 ms, read at every fire). Never throws: a failed
+   * arm is logged, and the condition holds with no alert check.
+   */
+  function armAlert(key: string): void {
+    const threshold = deps.alertThresholdMs
+    if (threshold === undefined) return
+    try {
+      const opened = episodes.view(key, kind)
+      if (opened === undefined) return
+      const { episode, startedAt } = opened
+      const cancel = armNeverEarlyWait(episodes.clock, startedAt, () => threshold() + 1, () => fireAlert(key, episode))
+      alerts.set(key, { episode, cancel })
+      episodes.whenClosed(key, kind, () => cancelAlert(key, episode))
+    } catch (err) {
+      line(key, `alert check not armed: ${describeThrownValue(err)}`)
+    }
+  }
+
+  /** The alert check's fire: post the alert once if the episode it was armed for is still open. Never throws. */
+  function fireAlert(key: string, episode: number): void {
+    try {
+      if (alerts.get(key)?.episode === episode) alerts.delete(key)
+      const current = episodes.view(key, kind)
+      if (current === undefined || current.episode !== episode) return
+      const thresholdMs = deps.alertThresholdMs?.()
+      if (thresholdMs === undefined) return
+      if (!episodes.post(key, kind, tmuxUnresponsiveAlertText(key, thresholdMs), ALERT_MARK)) return
+      line(
+        key,
+        `alert posted — not answering for ${seconds(episodes.clock.now() - current.startedAt)} s, ` +
+          `over its alert threshold of ${seconds(thresholdMs)} s`,
+      )
+    } catch (err) {
+      line(key, `alert check failed: ${describeThrownValue(err)}`)
+    }
+  }
+
+  /** Post the onset once in the persona's open episode; log it when posted. */
+  function postOnset(key: string, where: string, now: number): void {
+    const startedAt = episodes.view(key, kind)?.startedAt
+    if (startedAt === undefined) return
+    if (!episodes.post(key, kind, tmuxUnresponsiveOnsetText(key), ONSET_MARK)) return
+    line(key, `onset posted — still not answering at ${where}, ${seconds(now - startedAt)} s after its first refusal`)
+  }
 
   return {
     start(key, verb, error) {
       if (episodes.isOpen(key, kind)) return 'continued'
-      episodes.begin(key, kind)
-      safeLog(
-        deps.log,
-        `[slack] persona-episodes: persona=${key} ${kind} started — ${verb} failed: ${describeAgentDirectorFailure(error)}`,
-      )
+      if (episodes.begin(key, kind) === 'closed') return 'closed'
+      line(key, `started — ${verb} failed: ${describeAgentDirectorFailure(error)}`)
+      armAlert(key)
       return 'started'
     },
 
@@ -436,11 +726,15 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
 
     firstRefusalAt: (key) => episodes.view(key, kind)?.startedAt,
 
-    end(key, reason, reading) {
+    end(key, reason, reading, options) {
       if (!episodes.isOpen(key, kind)) return 'not-holding'
-      const onsetPosted = episodes.hasPosted(key, kind)
+      const onsetPosted = episodes.hasPosted(key, kind, ONSET_MARK)
+      const silent = options?.silent === true
+      const recovered = onsetPosted && !silent && episodes.post(key, kind, tmuxUnresponsiveRecoveryText(key), RECOVERY_MARK)
       episodes.end(key, kind)
-      safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} ended — ${endText(reason)}`)
+      line(key, `ended — ${endText(reason)}`)
+      if (recovered) line(key, 'recovery posted')
+      else if (onsetPosted && silent) line(key, 'recovery not posted — a silent end (a CONFLICT answer ended it)')
       try {
         deps.conditionEnded?.(key, reading)
       } catch {
@@ -448,7 +742,45 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
       }
       return onsetPosted ? 'ended-after-onset' : 'ended'
     },
+
+    onsetAtTick(tickStartedAt) {
+      try {
+        if (!healthCheckOn()) return
+        const now = episodes.clock.now()
+        for (const key of episodes.openKeys(kind)) {
+          const startedAt = episodes.view(key, kind)?.startedAt
+          if (startedAt !== undefined && startedAt < tickStartedAt) postOnset(key, 'a health tick', now)
+        }
+      } catch (err) {
+        safeLog(deps.log, `[slack] persona-episodes: ${kind} onset check at a health tick failed: ${describeThrownValue(err)}`)
+      }
+    },
+
+    onsetAtRetry(key, firedAt) {
+      try {
+        if (healthCheckOn()) return
+        const startedAt = episodes.view(key, kind)?.startedAt
+        if (startedAt === undefined || firedAt - startedAt < TMUX_UNRESPONSIVE_ONSET_FLOOR_MS) return
+        postOnset(key, 'a retry', firedAt)
+      } catch (err) {
+        line(key, `onset check at a retry failed: ${describeThrownValue(err)}`)
+      }
+    },
+
+    cancelAlert: (key) => {
+      try {
+        return cancelAlert(key)
+      } catch (err) {
+        line(key, `alert check cancel failed: ${describeThrownValue(err)}`)
+        return false
+      }
+    },
   }
+}
+
+/** Whole seconds, rounded down, of a span in milliseconds. */
+function seconds(ms: number): number {
+  return Math.floor(ms / 1000)
 }
 
 /** The ended line's text for `reason`; an unknown reason is named as such. Never throws. */

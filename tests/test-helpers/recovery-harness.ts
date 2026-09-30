@@ -29,7 +29,10 @@
  *   refusal (`{ kind: 'again' }`). `options.action` replaces the default
  *   (`'scripted'` picks the scripted action); `setAction(action)` swaps the
  *   current action, and `setAction(undefined)` goes back to the full-mode
- *   one.
+ *   one. As in `main()`, the controller's per-fire observer (`onRetryFire`)
+ *   is the condition's retry onset check (`tmuxUnresponsive.onsetAtRetry`),
+ *   called at every fire, one whose retry is skipped included, before the
+ *   action.
  * - The restart module is initialised over the configuration
  *   (`initRestart`) with the production adapters: the liveness read
  *   (`_buildIsSessionAliveAdapter` over the applied configuration), the
@@ -49,10 +52,14 @@
  *   persona's session is registered as connected with its message stream
  *   (`isSessionConnected` and `hasSessionStream`; none at first).
  * - Drivers, each as the server does it: `shutdown()` raises the
- *   shutting-down flag and closes the controller
- *   (`close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)`); `teardown(key)` stops the
- *   persona's timer (`stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`);
- *   `remove(key)` drops the persona from the applied configuration.
+ *   shutting-down flag, closes the controller
+ *   (`close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)`) and then the episodes
+ *   (`episodes.close()`: every alert check cancelled, a later condition
+ *   start answers `closed`); `teardown(key)` is the teardown's submit: it
+ *   stops the persona's timer (`stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`)
+ *   and cancels its alert check (`tmuxUnresponsive.cancelAlert(key)`), the
+ *   condition kept; `remove(key)` drops the persona from the applied
+ *   configuration.
  * - `stub`: one stub client (`makeStubClient`) with its call log
  *   (`stub.calls`), installed through `installStubSpawnPath` with the spawn
  *   home under the harness's temporary HOME, and handed to the outage state
@@ -78,14 +85,27 @@
  *   end of a holding condition calls the controller's condition-end entry
  *   (`conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
  *   reading)`), recorded in `conditionEnds` (`{ key, reading, result }`)
- *   with what the controller answered. A case reads the condition with
+ *   with what the controller answered. The condition's mode accessor
+ *   (`healthCheckOn`) reads `health_check_interval` in the configuration in
+ *   effect at each check (0, the default, is off: the onset comes at a retry
+ *   at or past `TMUX_UNRESPONSIVE_ONSET_FLOOR_MS`; `setHealthCheckInterval`
+ *   changes it). Its alert threshold accessor is E6's
+ *   `adAlertThresholdMsInEffect` over the settings in effect below, so a
+ *   start arms an alert check on the harness clock;
+ *   `options.alertThresholdMs` replaces the accessor, and `false` arms none.
+ *   A case reads the condition with
  *   `tmuxUnresponsive.holds(key)` and `tmuxUnresponsive.firstRefusalAt(key)`.
  *   With `options.conditionSink: false` the condition is not installed in
  *   the outage state (the retry hooks and `tickEnd` still reach it).
  * - `tickEnd(key)`: what a health tick's healthy branch does to the
  *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
  *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
- *   reading (`LIVENESS_LIVE`). The harness has no health tick of its own.
+ *   reading (`LIVENESS_LIVE`). `tickOnset(tickStartedAt?)`: what a health
+ *   tick body's end does, as `main()` binds `HealthCheckDeps.onTickEnd`: the
+ *   condition's onset check (`onsetAtTick`) for a tick started at
+ *   `tickStartedAt`, the harness clock's now by default (a condition whose
+ *   first refusal is at that same time gets no onset). The harness has no
+ *   health tick of its own.
  * - `launch(key)`: a start-pass launch of the configured persona `key`
  *   through the real `spawnForPersona` (`isStartup` true) over the stub,
  *   resolving with its `SpawnPersonaResult`. Each persona's working directory
@@ -128,7 +148,8 @@
  *   entries, the attempts, the triggers, the condition ends and the state
  *   directory as a written file.
  * - `cleanup()`: stops every retry timer (`stopAll`) and forgets every
- *   episode (`episodes.forgetAll()`), then undoes every
+ *   episode (`episodes.forgetAll()`, which cancels every alert check), then
+ *   undoes every
  *   install and reset the harness made (`console.error`, the restart module's state and the
  *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
  *   the stub spawn path and client with every launch still in flight, the
@@ -139,8 +160,7 @@
  *   they armed and left pending fails it too.
  *
  * Pending-only mode is armed directly (`controller.armPendingOnly`) until
- * covered `pending` rows exist. Later work extends this harness in place (the
- * pending-row rule, the latch and the episode notices).
+ * covered `pending` rows exist. Later work extends this harness in place.
  *
  * Isolation: no top-level `mock.module()`, no real HOME, `~/.agent-director`,
  * tmux or child process. The retry timer runs on the fake clock only; the one
@@ -157,7 +177,7 @@ import { join } from 'node:path'
 
 import type { Client } from 'agent-director'
 
-import { adSettingsInEffect, installAdSettings, resetAdSettingsForTests, type AdSettingsInEffect } from '../../src/ad-settings.ts'
+import { adAlertThresholdMsInEffect, adSettingsInEffect, installAdSettings, resetAdSettingsForTests, type AdSettingsInEffect } from '../../src/ad-settings.ts'
 import { _resetBackoffState, isAtCap } from '../../src/backoff.ts'
 import type { Persona, PersonaConfig } from '../../src/config.ts'
 import { LIVENESS_LIVE } from '../../src/liveness-reading.ts'
@@ -236,8 +256,19 @@ export interface RecoveryHarnessOptions {
   personas?: PersonaSpec[]
   /** `session_restart_delay` in seconds; 0 by default. */
   sessionRestartDelay?: number
-  /** `health_check_interval` in seconds; 0 by default. */
+  /**
+   * `health_check_interval` in seconds; 0 by default, so the health check is
+   * off and the condition's onset comes at a retry. Any other value turns it
+   * on (the onset comes at `tickOnset`). `setHealthCheckInterval` changes it
+   * later.
+   */
   healthCheckInterval?: number
+  /**
+   * The condition's alert threshold accessor, in ms, read at the arm and at
+   * every check: E6's `adAlertThresholdMsInEffect` (over `adSettings`) when
+   * unset; `false` arms no alert check.
+   */
+  alertThresholdMs?: (() => number) | false
   /** agent-director's settings file, written under the temporary HOME; none (the defaults) when unset. */
   adSettings?: AdConfigInput
   /** Restart dependencies that replace the harness's production adapters and controls. */
@@ -328,14 +359,22 @@ export interface RecoveryHarness {
   setUp(key: string, up: boolean): void
   /** Whether persona `key`'s session is registered as connected with its message stream; false at first. */
   setConnected(key: string, connected: boolean): void
-  /** The server's shutdown: raise the shutting-down flag and close the controller. */
+  /** The server's shutdown: raise the shutting-down flag, close the controller, then close the episodes. */
   shutdown(): void
-  /** The persona teardown's retry-timer stop. */
+  /** The persona teardown's submit: stop the retry timer and cancel the condition's alert check. */
   teardown(key: string): void
   /** Drop persona `key` from the applied configuration. */
   remove(key: string): void
   /** A health tick's end of the condition, as `main()` binds it: reason `tick`, reading `live`. */
   tickEnd(key: string): TmuxUnresponsiveEndResult
+  /**
+   * A health tick body's end, as `main()` binds `HealthCheckDeps.onTickEnd`:
+   * the condition's onset check (`onsetAtTick`) for the tick started at
+   * `tickStartedAt` (the harness clock's now when unset).
+   */
+  tickOnset(tickStartedAt?: number): void
+  /** Set `health_check_interval` in the configuration in effect (0: the health check is off). */
+  setHealthCheckInterval(seconds: number): void
   startupErrors(): string[]
   settings(): AdSettingsInEffect
   advance(ms: number): Promise<number>
@@ -408,6 +447,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const controller = createUnavailableRetryController({
     log,
     clock,
+    // As main() binds it: every fire, a skipped one included, is the
+    // condition's onset check with the health check off.
+    onRetryFire: (key, firedAt) => tmuxUnresponsive.onsetAtRetry(key, firedAt),
     action: (key, attempt) => {
       attempts.push({ key, retry: attempt.retry, causes: attempt.causes, mode: attempt.mode, at: clock.now() })
       return current(key, attempt)
@@ -416,6 +458,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   // As main() builds them: the one episodes instance, and the condition over
   // it, whose every end is reported to the controller's condition-end entry.
+  const alertThresholdMs = options.alertThresholdMs ?? adAlertThresholdMsInEffect
   const episodes = createPersonaEpisodes({
     sink: (key, text) => {
       episodeNotices.push({ key, text })
@@ -431,6 +474,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       conditionEnds.push({ key, reading, result })
       return result
     },
+    healthCheckOn: () => appliedConfig().health_check_interval !== 0,
+    ...(alertThresholdMs === false ? {} : { alertThresholdMs }),
   })
 
   const savedStateDir = process.env['SLACK_STATE_DIR']
@@ -587,10 +632,12 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     shutdown() {
       shuttingDown = true
       controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+      episodes.close()
     },
 
     teardown(key) {
       controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+      tmuxUnresponsive.cancelAlert(key)
     },
 
     remove(key) {
@@ -598,6 +645,12 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     },
 
     tickEnd: (key) => tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE),
+
+    tickOnset: (tickStartedAt = clock.now()) => tmuxUnresponsive.onsetAtTick(tickStartedAt),
+
+    setHealthCheckInterval(seconds) {
+      config.health_check_interval = seconds
+    },
 
     startupErrors,
 

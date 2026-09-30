@@ -113,6 +113,29 @@ export interface HealthCheckDeps {
    */
   endTmuxUnresponsive?(key: string): void
   /**
+   * b.jg5 SRJ-308: called once when each tick body ends, after all of the
+   * tick's per-persona work, with the tick's start time from `now`
+   * (production: the `tmux-unresponsive` condition's `onsetAtTick`, which
+   * makes no agent-director call and checks every condition still holding
+   * whose first refusal precedes that time, so a persona the tick skipped or
+   * left out is still checked, and one the tick found healthy has already
+   * ended its condition). It is called however the body ends: a persona's
+   * work that throws, or a body that exits early, still calls it (a
+   * `finally`). A skipped tick (a body still in flight, or shutting down)
+   * does not call it, nor does a tick whose start time could not be read; a
+   * shutdown that begins during a tick still calls it at that tick's end,
+   * which is harmless because `close()` empties the open conditions. A
+   * throw is logged and never breaks the tick. Absent: nothing is called.
+   */
+  onTickEnd?(tickStartedAt: number): void
+  /**
+   * b.jg5 SRJ-308: the clock a tick's start time is read from, the one the
+   * `onTickEnd` callee compares first-refusal times against (production: the
+   * notice episodes' clock). Read once per tick body, as the body starts.
+   * Absent: the system clock (`Date.now`).
+   */
+  now?(): number
+  /**
    * b.f2b: true while the restart path's reconnect adapter holds an idle run
    * for the persona's `working` row that one more attempt can conclude
    * (production: the session manager's `hasPendingWorkingRowEvidence`). The
@@ -240,6 +263,12 @@ export function startHealthCheck(intervalSeconds: number): void {
     }
     tickInFlight = true
     skippedTicks = 0
+    // b.jg5 SRJ-308: the tick's start time, read before any of its work; the
+    // tick-end hook gets it once the body ends, however it ends. The deps are
+    // captured once so the hook that runs is the one whose clock was read,
+    // even if `initHealthCheck` swaps the deps mid-tick.
+    const tickDeps = deps
+    const tickStartedAt = readTickStart(tickDeps)
     try {
       const personas = deps.getPersonas()
 
@@ -398,10 +427,38 @@ export function startHealthCheck(intervalSeconds: number): void {
           console.error(`[slack] health-check: error checking persona=${key}: ${describeThrownValue(err)}`)
         }
       }
+    } catch (err) {
+      // A throw outside the per-persona work (e.g. `getPersonas`) ends the
+      // tick here: logged, never rethrown, so no unhandled rejection escapes
+      // the interval callback.
+      console.error(`[slack] health-check: the tick failed: ${describeThrownValue(err)}`)
     } finally {
+      // b.jg5 SRJ-308: the onset check runs once the tick's per-persona work
+      // is done, however the body ended (never throws).
+      runTickEndHook(tickDeps, tickStartedAt)
       tickInFlight = false
     }
   }, intervalSeconds * 1000)
+}
+
+/** The tick's start time from `d.now` (the system clock when absent); a throwing clock is logged and reads as none. */
+function readTickStart(d: HealthCheckDeps): number | undefined {
+  try {
+    return d.now === undefined ? Date.now() : d.now()
+  } catch (err) {
+    console.error(`[slack] health-check: the tick's start time could not be read: ${describeThrownValue(err)} — no tick-end hook this tick`)
+    return undefined
+  }
+}
+
+/** Call the tick-end hook of the deps the tick started with, passing the tick's start time. Never throws: a throw is logged. */
+function runTickEndHook(d: HealthCheckDeps, tickStartedAt: number | undefined): void {
+  if (tickStartedAt === undefined) return
+  try {
+    d.onTickEnd?.(tickStartedAt)
+  } catch (err) {
+    console.error(`[slack] health-check: the tick-end hook failed: ${describeThrownValue(err)}`)
+  }
 }
 
 // ---------------------------------------------------------------------------

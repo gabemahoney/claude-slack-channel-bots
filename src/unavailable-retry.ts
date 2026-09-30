@@ -69,6 +69,11 @@
  *   `src/persona-episodes.ts`, bound in `main()`); `tmux-unavailable` has no
  *   caller yet. The exceptions hold against this entry only; every other
  *   stop is unaffected.
+ * - The optional retry observer (`UnavailableRetryDeps.onRetryFire`) is
+ *   called once at every retry, a retry the action skips for work in flight
+ *   included, before the action runs (b.jg5 SRJ-308: the
+ *   `tmux-unresponsive` onset with the health check off). It reads nothing
+ *   back and changes nothing here.
  * - `view(key)`, `isArmed(key)` and `armedKeys()` are read-only queries;
  *   `whenRunSettled(key)` awaits the persona's in-flight run, with its re-arm
  *   or stop, and a stop's hand-off.
@@ -499,6 +504,15 @@ export interface UnavailableRetryDeps {
   action: UnavailableRetryAction
   /** Clock and timers; `SYSTEM_PERSONA_CONNECTION_CLOCK` by default. */
   clock?: UnavailableRetryClock
+  /**
+   * b.jg5 SRJ-308: called once at every retry of a persona's timer, in
+   * either mode, with the clock's time, after its retry line and before its
+   * action runs, so a retry the action skips for work in flight (SRJ-303)
+   * is observed too (production: the `tmux-unresponsive` condition's
+   * `onsetAtRetry`). A timer stopped before its retry runs is not observed.
+   * A throw is swallowed. Absent: nothing is called.
+   */
+  onRetryFire?: (key: string, firedAt: number) => unknown
 }
 
 /** A read-only view of one persona's timer. */
@@ -752,6 +766,11 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
         ? `[slack] unavailable-retry: persona=${entry.key} retry ${retry} (pending-only) — reading its row`
         : `[slack] unavailable-retry: persona=${entry.key} retry ${retry} — rerunning its recovery`,
     )
+    try {
+      deps.onRetryFire?.(entry.key, clock.now())
+    } catch {
+      /* an observer must not change what the retry does */
+    }
     let outcome: UnavailableRetryOutcome | undefined
     let failure: string | undefined
     try {

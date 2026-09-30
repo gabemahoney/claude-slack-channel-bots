@@ -101,8 +101,9 @@
  *   the retry controller, the restart module, the start bring-up and the
  *   health check, on the production clock, with the module-scope persona
  *   notifier's `notify` as its sink, and held in the one module-scope handle
- *   assigned in main(); shutdown forgets every episode once, through that
- *   handle, before it first yields.
+ *   assigned in main(); shutdown closes them once, through that handle,
+ *   before it first yields (every episode ends, every alert check is
+ *   cancelled, and no episode begins again).
  * - b.jg5 SRJ-307 / SRJ-310 / SRJ-306: the one tmux-unresponsive condition is
  *   built once, in main()'s own statement list, over that episodes instance,
  *   after the retry controller; it is the condition sink of the one
@@ -112,6 +113,16 @@
  *   retry's own reading), the retry action gets the connectedness and stream
  *   probes the health check reads, and its condition-end hook is the retry
  *   controller's `conditionEnded` for the tmux-unresponsive condition.
+ * - b.jg5 SRJ-308 / SRJ-309 / SRJ-210: the condition's onset entries are
+ *   bound to the health check's tick-end hook (`onTickEnd`, with the tick's
+ *   start read by `now` on the notice episodes' own clock) and to the retry
+ *   controller's per-fire observer (`onRetryFire`), and are called nowhere
+ *   else; its mode is read at each check from the applied config holder's
+ *   `health_check_interval` (the field `startHealthCheck` starts the tick
+ *   with), and its alert threshold is E6's `adAlertThresholdMsInEffect`
+ *   itself, never a value taken once; its alert is cancelled only by the
+ *   teardown's retry-timer stop (pinned in tests/reload-wiring.test.ts) and
+ *   by shutdown's close of the episodes.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -165,13 +176,14 @@ import type {
   TmuxUnresponsiveConditionDeps,
 } from '../src/persona-episodes.ts'
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
-import type { FullModeRetryDeps, UnavailableRetryController } from '../src/unavailable-retry.ts'
+import type { FullModeRetryDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
 import type * as LivenessReadingModule from '../src/liveness-reading.ts'
 import type { HealthCheckDeps } from '../src/health-check.ts'
 import type { OutageStateDeps } from '../src/outage-state.ts'
 import type * as PersonaConnectionsModule from '../src/persona-connections.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
+import type { PersonaConfig } from '../src/config.ts'
 
 const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url))
 const SERVER_PATH = join(SRC_DIR, 'server.ts')
@@ -1490,15 +1502,18 @@ describe('main() binds the restart module\'s pending deferral (deferPendingRow) 
 // latch to reach) would pass every behaviour suite. What the episodes do is
 // tested in tests/persona-episodes.test.ts and the teardown's forget in
 // tests/persona-lifecycle.test.ts and tests/reload-wiring.test.ts; pinned
-// here: the build, its dependencies and shutdown's forget-all.
+// here: the build, its dependencies and shutdown's close. A forget-all in its
+// place would end every episode but leave a later begin open: a launch still
+// in flight at shutdown could open an episode and arm an alert check after it.
 // ---------------------------------------------------------------------------
 
-describe('main() builds the one set of per-persona notice episodes before the start pass, on the production clock, with the persona notifier as its sink, and shutdown forgets them all (b.jg5 SRJ-1016)', () => {
+describe('main() builds the one set of per-persona notice episodes before the start pass, on the production clock, with the persona notifier as its sink, and shutdown closes them (b.jg5 SRJ-1016, SRJ-309)', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
   const SINK: keyof PersonaEpisodesDeps = 'sink'
   const CLOCK: keyof PersonaEpisodesDeps = 'clock'
   const FORGET_ALL: keyof PersonaEpisodes = 'forgetAll'
+  const CLOSE: keyof PersonaEpisodes = 'close'
   const SYSTEM_CLOCK: keyof typeof PersonaConnectionsModule = 'SYSTEM_PERSONA_CONNECTION_CLOCK'
   const NOTIFIER_FACTORY: keyof typeof PersonaNotifierModule = 'createPersonaNotifier'
   const NOTIFY: keyof PersonaNotifier = 'notify'
@@ -1558,17 +1573,19 @@ describe('main() builds the one set of per-persona notice episodes before the st
     expect(props.get(SINK)).toMatch(new RegExp(`^(?:${notifier}\\.${NOTIFY}|\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call}))$`))
   })
 
-  test('shutdown forgets every episode exactly once, through the handle, before it first yields', () => {
+  test('shutdown closes the episodes exactly once, through the handle, before it first yields, and nothing forgets them all', () => {
     const [start, end] = shutdownBody(SERVER_CODE)
     const handle = SERVER_CODE.match(new RegExp(HANDLE.source, 'm'))![1]!
 
-    const forgets = indicesOf(new RegExp(`\\b${handle}\\s*\\?\\.\\s*${FORGET_ALL}\\s*\\(\\s*\\)`, 'g'), SERVER_CODE)
-    expect(forgets).toHaveLength(1)
-    const at = forgets[0]!
+    const closes = indicesOf(new RegExp(`\\b${handle}\\s*\\?\\.\\s*${CLOSE}\\s*\\(\\s*\\)`, 'g'), SERVER_CODE)
+    expect(closes).toHaveLength(1)
+    const at = closes[0]!
     expect(at > start && at < end).toBe(true)
-    // No other forget-all anywhere in server.ts, through the handle or the instance.
+    // No other close anywhere in server.ts, through the handle or the instance,
+    // and no forget-all (which would leave a later begin open).
     const episodes = constOf(FACTORY)
-    expect(indicesOf(new RegExp(`\\b(?:${handle}|${episodes})\\s*[?!]?\\.\\s*${FORGET_ALL}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([at])
+    expect(indicesOf(new RegExp(`\\b(?:${handle}|${episodes})\\s*[?!]?\\.\\s*${CLOSE}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([at])
+    expect(indicesOf(new RegExp(`\\.\\s*${FORGET_ALL}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
 
     // Before shutdown first yields, so a stalled await never keeps an episode open.
     const firstAwait = SERVER_CODE.slice(start, end).search(/\bawait\b/)
@@ -1715,6 +1732,125 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
     expect(importSource(SERVER_CODE, RETRY_CONDITION)).toBe('./unavailable-retry.ts')
     // No other report of a condition's end anywhere in server.ts.
     expect(indicesOf(new RegExp(`\\.\\s*${CONTROLLER_END}\\s*\\(`, 'g'), SERVER_CODE)).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-308 / SRJ-309 / SRJ-210 — the tmux-unresponsive
+// condition's onset hooks, mode, alert threshold and alert stops
+//
+// The health check's tick-end hook and clock (`HealthCheckDeps.onTickEnd`,
+// `now`), the retry controller's per-fire observer (`UnavailableRetryDeps.
+// onRetryFire`) and the condition's mode and threshold accessors
+// (`TmuxUnresponsiveConditionDeps.healthCheckOn`, `alertThresholdMs`) are all
+// optional: absent, no onset is ever posted, the mode is "on" and no alert
+// check is armed. So a production wiring that dropped one, bound it to a
+// no-op, a local shadow or another instance, read the tick's start on a clock
+// other than the one the first refusal is read on, or copied the mode or the
+// threshold once would type-check and pass every behaviour suite. What each
+// entry does is tested in tests/tmux-unresponsive.test.ts,
+// tests/health-check.test.ts and tests/unavailable-retry.test.ts; the
+// teardown's alert cancel in tests/reload-wiring.test.ts; shutdown's close in
+// the SRJ-1016 describe above. Pinned here: the bindings.
+// ---------------------------------------------------------------------------
+
+describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s end and to each retry fire, reads its mode and alert threshold at each check, and cancels its alert only at a teardown\'s timer stop and at shutdown (b.jg5 SRJ-308, SRJ-309, SRJ-210)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const FACTORY: keyof typeof PersonaEpisodesModule = 'createTmuxUnresponsiveCondition'
+  const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
+  const EPISODES_CLOCK: keyof PersonaEpisodes = 'clock'
+  const ONSET_AT_TICK: keyof TmuxUnresponsiveCondition = 'onsetAtTick'
+  const ONSET_AT_RETRY: keyof TmuxUnresponsiveCondition = 'onsetAtRetry'
+  const CANCEL_ALERT: keyof TmuxUnresponsiveCondition = 'cancelAlert'
+  const MODE: keyof TmuxUnresponsiveConditionDeps = 'healthCheckOn'
+  const THRESHOLD: keyof TmuxUnresponsiveConditionDeps = 'alertThresholdMs'
+  const TICK_END: keyof HealthCheckDeps = 'onTickEnd'
+  const TICK_NOW: keyof HealthCheckDeps = 'now'
+  const RETRY_FIRE: keyof UnavailableRetryDeps = 'onRetryFire'
+  const THRESHOLD_IN_EFFECT: keyof typeof AdSettingsModule = 'adAlertThresholdMsInEffect'
+  const INTERVAL: keyof PersonaConfig = 'health_check_interval'
+
+  /** `name` is declared exactly once in server.ts (no local shadow, no second instance). */
+  function declaredOnce(name: string): void {
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+  }
+
+  test('the health check\'s tick-end hook is the condition\'s tick onset entry, given the tick\'s start, and the tick reads its start on the notice episodes\' own clock', () => {
+    const condition = constOf(FACTORY)
+    declaredOnce(condition)
+    const props = onlyCallProps('initHealthCheck')
+
+    // `(t) => <condition>.onsetAtTick(t)` (block or expression body), or the
+    // entry itself; the parameter's name is free.
+    const call = `${condition}\\.${ONSET_AT_TICK}\\(\\1\\)`
+    expect(props.get(TICK_END)).toMatch(
+      new RegExp(`^(?:${condition}\\.${ONSET_AT_TICK}|\\(?(\\w+)\\)? => (?:\\{ ${call};? \\}|${call}))$`),
+    )
+
+    // The clock the condition reads its first refusal on (the episodes'),
+    // read at each tick: not the system clock by another name, not a value.
+    const episodes = constOf(EPISODES_FACTORY)
+    declaredOnce(episodes)
+    expect(props.get(TICK_NOW)).toMatch(new RegExp(`^\\(\\) => ${episodes}\\.${EPISODES_CLOCK}\\.now\\(\\)$`))
+  })
+
+  test('the retry controller\'s per-fire observer is the condition\'s retry onset entry, given the persona and the fire time', () => {
+    const condition = constOf(FACTORY)
+    declaredOnce(condition)
+    const hook = onlyCallProps('createUnavailableRetryController').get(RETRY_FIRE)
+    expect(hook).toBeDefined()
+    // `(key, firedAt) => <condition>.onsetAtRetry(key, firedAt)` (block or
+    // expression body); the parameters' names are free. Only a wrapper: the
+    // condition is declared after the controller is built.
+    const call = `${condition}\\.${ONSET_AT_RETRY}\\(\\1, \\2\\)`
+    expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
+  })
+
+  test('the two onset entries are called only from those two bindings', () => {
+    const condition = constOf(FACTORY)
+    for (const [entry, binding] of [
+      [ONSET_AT_TICK, onlyCallProps('initHealthCheck').get(TICK_END)!],
+      [ONSET_AT_RETRY, onlyCallProps('createUnavailableRetryController').get(RETRY_FIRE)!],
+    ]) {
+      expect([entry, indicesOf(new RegExp(`\\.\\s*${entry}\\b`, 'g'), SERVER_CODE).length]).toEqual([entry, 1])
+      expect(binding).toContain(`${condition}.${entry}`)
+    }
+  })
+
+  test('the mode is read at each check from the applied config holder\'s health_check_interval (the field startHealthCheck starts the tick with), with the start-time config as the fallback', () => {
+    const mode = onlyCallProps(FACTORY).get(MODE)
+    expect(mode).toBeDefined()
+    // `() => (<holder> ?? <start-time>).health_check_interval !== 0`: read
+    // at call time, never a value or a copy of the holder taken once.
+    const loaded = loadedConfigName(SERVER_CODE)
+    const m = mode!.match(new RegExp(`^\\(\\) => \\(${loaded} \\?\\? (\\w+)\\)\\.${INTERVAL} !== 0$`))
+    expect(m).not.toBeNull()
+    // The fallback is the start-time applied config the bring-up launch and
+    // the restart delay read (pinned in the bring-up describe above).
+    const launch = onlyCallProps('createPersonaBringUpController').get('launch')!
+    expect(launch.match(/\?\? (\w+), false\)$/)![1]).toBe(m![1])
+    expect(m![1]).not.toBe(loaded)
+    // The same field the tick is started with.
+    expect(onlyCallArgs('startHealthCheck')).toEqual([`${loaded}.${INTERVAL}`])
+  })
+
+  test('the alert threshold is E6\'s accessor of the threshold in effect itself, imported from ad-settings, never called (a value taken once) or shadowed in server.ts', () => {
+    expect(onlyCallProps(FACTORY).get(THRESHOLD)).toBe(THRESHOLD_IN_EFFECT)
+    expect(importSource(SERVER_CODE, THRESHOLD_IN_EFFECT)).toBe('./ad-settings.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${THRESHOLD_IN_EFFECT}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(indicesOf(new RegExp(`\\b${THRESHOLD_IN_EFFECT}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  test('the alert is cancelled only by the teardown\'s retry-timer stop (server.ts\'s one cancelAlert call, inside createPersonaLifecycle\'s stopRetryTimer) and by shutdown\'s close of the episodes', () => {
+    const condition = constOf(FACTORY)
+    const cancels = indicesOf(new RegExp(`\\.\\s*${CANCEL_ALERT}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(cancels).toHaveLength(1)
+    const stopRetryTimer = onlyCallProps('createPersonaLifecycle').get('stopRetryTimer')!
+    expect(stopRetryTimer).toMatch(new RegExp(`\\b${condition}\\.${CANCEL_ALERT}\\(`))
+    // That one call lies inside createPersonaLifecycle's argument.
+    const lifecycleAt = onlyCallOf('createPersonaLifecycle')
+    const [argsStart, argsEnd] = balancedAfter(SERVER_CODE, lifecycleAt, '(', ')')
+    expect(cancels[0]! > argsStart && cancels[0]! < argsEnd).toBe(true)
   })
 })
 

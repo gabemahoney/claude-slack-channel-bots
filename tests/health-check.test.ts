@@ -1536,6 +1536,335 @@ describe('b.jg5 SRJ-310: a live, connected tick with its stream ends the persona
 })
 
 // ---------------------------------------------------------------------------
+// b.jg5 SRJ-308 — the tick-end hook (the onset check with the health check on)
+//
+// Each tick body reads its start time from `now` once, before any of its work,
+// and calls `onTickEnd(tickStartedAt)` once when the body ends, after every
+// persona's work (production binds it to the tmux-unresponsive condition's
+// `onsetAtTick`; the binding is pinned in tests/server-startup-wiring.test.ts
+// and the onset's posting in tests/tmux-unresponsive.test.ts). It is called
+// however the body ends: every persona skipped, a persona's work throwing, or
+// the body exiting early through a throw outside the per-persona work (logged
+// as `the tick failed`, never rethrown). The hook called is the one of the
+// deps the tick started with, even if `initHealthCheck` swaps them mid-tick.
+// A tick skipped because a body is still in flight or the server is shutting
+// down reads no start time and calls nothing. A throwing hook is logged and
+// the next tick runs; a throwing `now` is logged and that tick calls no hook.
+// Every other case in this file leaves both deps at their defaults (absent).
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick\'s start time', () => {
+  const TICK_END_FAILED = '[slack] health-check: the tick-end hook failed: '
+  const START_UNREAD = '[slack] health-check: the tick\'s start time could not be read: '
+  const TICK_FAILED = '[slack] health-check: the tick failed: '
+
+  /**
+   * Bind an injected clock and a recording tick-end hook to `deps`. The clock
+   * answers `startTimes` in order, one per read (the last repeats once
+   * exhausted), and records how many tick bodies had begun at each read. The
+   * hook records its argument with the tick bodies begun and liveness probes
+   * made by then.
+   */
+  function withTickEnd(deps: ReturnType<typeof makeDeps>, startTimes: number[]) {
+    const reads: number[] = []
+    const ends: Array<{ tickStartedAt: number; ticks: number; probes: number }> = []
+    deps.now = () => {
+      reads.push(deps.tickCount())
+      return startTimes[Math.min(reads.length - 1, startTimes.length - 1)]!
+    }
+    deps.onTickEnd = (tickStartedAt) => {
+      ends.push({ tickStartedAt, ticks: deps.tickCount(), probes: deps.isSessionAliveCalls.length })
+    }
+    return { reads, ends }
+  }
+
+  /** Run `fn` with console.error captured; answers the lines it logged. */
+  async function capturingErrors(fn: () => Promise<void>): Promise<string[]> {
+    const lines: string[] = []
+    const saved = console.error
+    console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '))
+    try { await fn() } finally { console.error = saved }
+    return lines
+  }
+
+  test('two personas over three ticks: one call per tick body, after both personas\' work, with that tick\'s start time from now; now is read once per body, before its work', async () => {
+    const deps = makeDeps({ personas: workList('persona_a', 'persona_b'), maxTicks: 3 })
+    const { reads, ends } = withTickEnd(deps, [1_000, 2_000, 3_000])
+
+    await runTicks(deps, 3)
+
+    // Read at each body's start, before its work list was even asked for.
+    expect(reads).toEqual([0, 1, 2])
+    // A per-persona hook would show six calls; one before the work, zero probes.
+    expect(ends).toEqual([
+      { tickStartedAt: 1_000, ticks: 1, probes: 2 },
+      { tickStartedAt: 2_000, ticks: 2, probes: 4 },
+      { tickStartedAt: 3_000, ticks: 3, probes: 6 },
+    ])
+    expect(deps.scheduleRestartCalls).toHaveLength(6)
+  })
+
+  test('the hook gets the start time read at the body\'s start, not a time read when the body ends', async () => {
+    // A clock that moves on during the body: were the hook's argument read at
+    // the end, it would show the later value.
+    const deps = makeDeps({ maxTicks: 1 })
+    const { ends } = withTickEnd(deps, [5_000, 9_000])
+    const probe = deps.isSessionAlive
+    deps.isSessionAlive = async (key) => {
+      deps.now!()  // the clock's next read answers 9 000
+      return probe(key)
+    }
+
+    await runTicks(deps, 1)
+
+    expect(ends.map((e) => e.tickStartedAt)).toEqual([5_000])
+  })
+
+  test('with now absent the start time is the system clock\'s, read at the body\'s start', async () => {
+    const deps = makeDeps({ maxTicks: 1 })
+    const ends: number[] = []
+    deps.onTickEnd = (tickStartedAt) => void ends.push(tickStartedAt)
+    const before = Date.now()
+
+    await runTicks(deps, 1)
+
+    expect(ends).toHaveLength(1)
+    expect(ends[0]!).toBeGreaterThanOrEqual(before)
+    expect(ends[0]!).toBeLessThanOrEqual(Date.now())
+  })
+
+  const bindNothing = (_deps: ReturnType<typeof makeDeps>): void => {}
+  test.each<[string, DepsOpts, (deps: ReturnType<typeof makeDeps>) => void]>([
+    ['a restart pending', { isRestartPendingResult: true }, bindNothing],
+    ['a launch in flight', {}, (deps) => { deps.isLaunchInFlight = () => true }],
+    ['at the restart cap', { isAtCapResult: true }, bindNothing],
+    ['an unknown reading', { aliveSequence: { persona_a: [LIVENESS_READING_UNKNOWN], persona_b: [LIVENESS_READING_UNKNOWN] } }, bindNothing],
+  ])('every persona skipped (%s) on each of two ticks: the hook is still called once per tick, with that tick\'s start time', async (_label, opts, bind) => {
+    const deps = makeDeps({ ...opts, personas: workList('persona_a', 'persona_b'), maxTicks: 2 })
+    bind(deps)
+    const { ends } = withTickEnd(deps, [10_000, 20_000])
+
+    await capturingErrors(() => runTicks(deps, 2))
+
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(ends.map((e) => [e.tickStartedAt, e.ticks])).toEqual([[10_000, 1], [20_000, 2]])
+  })
+
+  test('an empty work list (every persona left out by the relaunch gate): the hook is still called once per tick', async () => {
+    const deps = makeDeps({ personas: {}, maxTicks: 2 })
+    const { ends } = withTickEnd(deps, [10_000, 20_000])
+
+    await runTicks(deps, 2)
+
+    expect(deps.statRouteCalls).toEqual([])
+    expect(ends.map((e) => [e.tickStartedAt, e.ticks])).toEqual([[10_000, 1], [20_000, 2]])
+  })
+
+  test('one persona skipped, one checked, in the same tick: the hook is called once for the tick, not per checked persona', async () => {
+    const personas = workList('capped_bot', 'dead_bot')
+    const deps = makeDeps({ personas, maxTicks: 2 })
+    deps.isAtCap = (key) => key === 'capped_bot'
+    const { ends } = withTickEnd(deps, [10_000, 20_000])
+
+    await capturingErrors(() => runTicks(deps, 2))
+
+    expect(deps.scheduleRestartCalls.map((c) => c.key)).toEqual(['dead_bot', 'dead_bot'])
+    expect(ends).toEqual([
+      { tickStartedAt: 10_000, ticks: 1, probes: 1 },
+      { tickStartedAt: 20_000, ticks: 2, probes: 2 },
+    ])
+  })
+
+  test('a persona\'s work throws: the tick logs it, checks the next persona, and still calls the hook once, after both', async () => {
+    const personas = workList('failing_bot', 'dead_bot')
+    const deps = makeDeps({ personas, maxTicks: 2 })
+    const stat = deps.statRoute
+    deps.statRoute = async (cwd) => {
+      if (cwd === personas.failing_bot) throw new Error('simulated stat failure')
+      return stat(cwd)
+    }
+    const { ends } = withTickEnd(deps, [10_000, 20_000])
+
+    const lines = await capturingErrors(() => runTicks(deps, 2))
+
+    expect(lines.filter((l) => l.includes('error checking persona=failing_bot'))).toHaveLength(2)
+    expect(deps.scheduleRestartCalls.map((c) => c.key)).toEqual(['dead_bot', 'dead_bot'])
+    expect(ends).toEqual([
+      { tickStartedAt: 10_000, ticks: 1, probes: 1 },
+      { tickStartedAt: 20_000, ticks: 2, probes: 2 },
+    ])
+  })
+
+  test('getPersonas throws an error carrying fake tokens: one "the tick failed" line describing it, redacted; the hook is still called once with that tick\'s start time; the next tick runs normally; no rejection escapes; nothing leaks', async () => {
+    const deps = makeDeps({ maxTicks: 2 })
+    const { ends } = withTickEnd(deps, [10_000, 20_000])
+    const thrown = Object.assign(new Error(`personas unreadable (${sentinelInMessage('msg')})`), {
+      code: 'EIO',
+      detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
+      note: LEAK_SENTINEL,
+    })
+    const getPersonas = deps.getPersonas
+    deps.getPersonas = () => {
+      const personas = getPersonas()
+      if (deps.tickCount() === 1) throw thrown
+      return personas
+    }
+    // A test-scoped listener; the runner also fails a case that leaves one.
+    const rejections: unknown[] = []
+    const onRejection = (reason: unknown) => void rejections.push(reason)
+    process.on('unhandledRejection', onRejection)
+    let lines: string[]
+    try {
+      lines = await capturingErrors(async () => {
+        await runTicks(deps, 2)
+        // One macrotask turn: a rejection left unhandled is reported here.
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      })
+    } finally {
+      process.off('unhandledRejection', onRejection)
+    }
+
+    // Named by position only: an escaped reason could hold a token.
+    expect(rejections.map((_, i) => `rejection ${i}`)).toEqual([])
+    const failed = lines.filter((l) => l.startsWith(TICK_FAILED))
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toStartWith(
+      `${TICK_FAILED}Error code=EIO message="personas unreadable (${REDACTED_SENTINEL_TAIL})" at `,
+    )
+    // The first body ended before any persona's work; the second (the reset
+    // in-flight guard let it start) checked the persona as usual.
+    expect(ends).toEqual([
+      { tickStartedAt: 10_000, ticks: 1, probes: 0 },
+      { tickStartedAt: 20_000, ticks: 2, probes: 1 },
+    ])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
+    expect(lines.filter((l) => l.startsWith(TICK_END_FAILED) || l.startsWith(START_UNREAD))).toEqual([])
+    assertNoLeak({ lines, notices })
+  })
+
+  test('deps swapped by initHealthCheck mid-tick: the tick calls the hook of the deps it started with, with its start time; the new deps\' hook gets only its own ticks\' start times', async () => {
+    const first = makeDeps()
+    const firstTicks = withTickEnd(first, [10_000])
+    let release: ((reachable: boolean) => void) | undefined
+    first.statRoute = () => new Promise<boolean>((resolve) => { release = resolve })
+    const second = makeDeps({ maxTicks: 1 })
+    const secondTicks = withTickEnd(second, [20_000])
+    initHealthCheck(first)
+
+    await capturingErrors(async () => {
+      startHealthCheck(FAST_INTERVAL_S)
+      // The first body hangs on the first deps' statRoute.
+      for (let waited = 0; release === undefined && waited < 500; waited++) await Bun.sleep(1)
+      expect(first.tickCount()).toBe(1)
+      initHealthCheck(second)
+      release!(true)
+      for (let waited = 0; secondTicks.ends.length === 0 && waited < 500; waited++) await Bun.sleep(1)
+      await Bun.sleep(20)  // later fires stop at the second deps' maxTicks
+      stopHealthCheck()
+    })
+
+    expect(firstTicks.reads).toEqual([0])
+    expect(firstTicks.ends.map((e) => [e.tickStartedAt, e.ticks])).toEqual([[10_000, 1]])
+    expect(secondTicks.reads).toEqual([0])
+    expect(secondTicks.ends.map((e) => [e.tickStartedAt, e.ticks])).toEqual([[20_000, 1]])
+  })
+
+  test('a throwing hook is logged once per tick and never breaks the tick: each tick\'s work is done and the next tick runs', async () => {
+    const deps = makeDeps({ maxTicks: 3 })
+    const { reads } = withTickEnd(deps, [10_000, 20_000, 30_000])
+    const called: number[] = []
+    deps.onTickEnd = (tickStartedAt) => {
+      called.push(tickStartedAt)
+      throw new Error(`simulated hook failure at ${tickStartedAt}`)
+    }
+
+    const lines = await capturingErrors(() => runTicks(deps, 3))
+
+    expect(reads).toHaveLength(3)
+    expect(called).toEqual([10_000, 20_000, 30_000])
+    expect(deps.scheduleRestartCalls).toHaveLength(3)
+    const failures = lines.filter((l) => l.startsWith(TICK_END_FAILED))
+    expect(failures).toHaveLength(3)
+    for (const [i, line] of failures.entries()) expect(line).toContain(`simulated hook failure at ${called[i]}`)
+  })
+
+  test('a throwing now is logged and that tick calls no hook; its work is still done, and the ticks either side call the hook', async () => {
+    const deps = makeDeps({ maxTicks: 3 })
+    const { ends } = withTickEnd(deps, [10_000, 20_000, 30_000])
+    const clock = deps.now!
+    let reads = 0
+    deps.now = () => {
+      const t = clock()
+      if (++reads === 2) throw new Error('simulated clock failure')
+      return t
+    }
+
+    const lines = await capturingErrors(() => runTicks(deps, 3))
+
+    expect(ends.map((e) => [e.tickStartedAt, e.ticks])).toEqual([[10_000, 1], [30_000, 3]])
+    expect(deps.scheduleRestartCalls).toHaveLength(3)
+    const unread = lines.filter((l) => l.startsWith(START_UNREAD))
+    expect(unread).toHaveLength(1)
+    expect(unread[0]).toContain('simulated clock failure')
+    expect(unread[0]).toContain('no tick-end hook this tick')
+    expect(lines.filter((l) => l.startsWith(TICK_END_FAILED))).toEqual([])
+  })
+
+  test('ticks skipped while a body is still in flight read no start time and call no hook; the body in flight calls it once when it ends', async () => {
+    const deps = makeDeps()
+    const { reads, ends } = withTickEnd(deps, [10_000, 20_000])
+    let release: ((reachable: boolean) => void) | undefined
+    deps.statRoute = () => new Promise<boolean>((resolve) => { release = resolve })
+    // Every interval fire asks isShuttingDown first; counting those counts the
+    // fires, the skipped ones included. Shutdown stays off until the hung body
+    // is released, so every fire meanwhile reaches the in-flight guard.
+    let fires = 0
+    let stopping = false
+    deps.isShuttingDown = () => (fires++, stopping)
+    initHealthCheck(deps)
+
+    const lines = await capturingErrors(async () => {
+      startHealthCheck(FAST_INTERVAL_S)
+      // The first body hangs on statRoute; wait for five skipped fires after it.
+      for (let waited = 0; (release === undefined || fires < 6) && waited < 500; waited++) await Bun.sleep(1)
+      expect(deps.tickCount()).toBe(1)
+      expect(reads).toEqual([0])
+      expect(ends).toEqual([])
+      // No further body may start once this one ends.
+      stopping = true
+      release!(true)
+      for (let waited = 0; ends.length === 0 && waited < 500; waited++) await Bun.sleep(1)
+      stopHealthCheck()
+    })
+
+    // The fires were in-flight skips (the fifth logs the guard's warning).
+    expect(lines.filter((l) => l.includes('tick body in flight; skipped 5 consecutive ticks'))).toHaveLength(1)
+    expect(deps.tickCount()).toBe(1)
+    expect(reads).toEqual([0])
+    expect(ends).toEqual([{ tickStartedAt: 10_000, ticks: 1, probes: 1 }])
+    expect(lines.filter((l) => l.startsWith(TICK_END_FAILED) || l.startsWith(START_UNREAD))).toEqual([])
+  })
+
+  test('ticks skipped while shutting down read no start time and call no hook', async () => {
+    const deps = makeDeps({ isShuttingDownResult: true })
+    const { reads, ends } = withTickEnd(deps, [10_000])
+    const shuttingDown = deps.isShuttingDown
+    let fires = 0
+    deps.isShuttingDown = () => (fires++, shuttingDown())
+    initHealthCheck(deps)
+
+    startHealthCheck(FAST_INTERVAL_S)
+    for (let waited = 0; fires < 3 && waited < 500; waited++) await Bun.sleep(1)
+    stopHealthCheck()
+
+    expect(fires).toBeGreaterThanOrEqual(3)
+    expect(deps.tickCount()).toBe(0)
+    expect(reads).toEqual([])
+    expect(ends).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // b.av2 SR-6.3 / SR-6.4 / SR-7.2 / SR-11 — only personas that are up are checked
 //
 // The server builds the tick's work list as

@@ -18,8 +18,21 @@
  * `createTmuxUnresponsiveCondition`: `continued` and `ended-after-onset`, the
  * ended line's text per reason (an unknown reason pinned once), a throwing
  * log or condition-end hook swallowed, and `forget`/`forgetAll` dropping a
- * holding condition without calling the hook. Its starts and ends through the
- * outage state are in `tests/tmux-unresponsive.test.ts`.
+ * holding condition without calling the hook. Each failure-only line is
+ * reached through an injected dep and throws nothing out of its entry: a NaN
+ * threshold (`alert check not armed`, the start still succeeding), an alert
+ * fire whose post or threshold read throws (`alert check failed`), a clock
+ * whose clear throws (`alert check cancel failed`, and at an end `episode
+ * close step failed`), an episodes member that throws in either onset check,
+ * and a throwing health-check mode accessor (taken as on). Its starts and
+ * ends through the outage state are in `tests/tmux-unresponsive.test.ts`.
+ *
+ * Close steps: `whenClosed` runs its step exactly once on every close path
+ * (`end`, a new case, `forget`, `forgetAll`, `close`), answers false and
+ * keeps nothing with no episode open, and a throwing step is logged
+ * (`episode close step failed`) while the others still run. `openKeys` lists
+ * only the kind's open keys; after `close()` every kind's `begin` answers
+ * `closed` and nothing posts.
  *
  * Pure module under test: built over `createFakeClock`, a recording notice
  * sink and a line capture. Kinds come from `PERSONA_EPISODE_KINDS`, so a
@@ -30,6 +43,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
 import { describeAgentDirectorFailure } from '../src/ad-error-class.ts'
+import { DEFAULT_AD_SETTINGS_IN_EFFECT, adAlertThresholdMs } from '../src/ad-settings.ts'
 import { LIVENESS_LIVE } from '../src/liveness-reading.ts'
 import {
   PERSONA_EPISODE_DEFAULT_MARK,
@@ -41,10 +55,13 @@ import {
   TMUX_UNRESPONSIVE_END_TEXT,
   TMUX_UNRESPONSIVE_END_TICK,
   TMUX_UNRESPONSIVE_END_TMUX_VERB,
+  TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
+  tmuxUnresponsiveOnsetText,
   type PersonaEpisodeKind,
   type PersonaEpisodeSink,
+  type PersonaEpisodesClock,
   type PersonaEpisodes,
   type TmuxUnresponsiveCondition,
   type TmuxUnresponsiveEndReason,
@@ -341,6 +358,178 @@ describe('isolation', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Close steps, open keys and close()
+// ---------------------------------------------------------------------------
+
+describe('close steps (whenClosed), openKeys and close()', () => {
+  const kind = PERSONA_EPISODE_KIND_CONFLICT
+  const other = PERSONA_EPISODE_KIND_STUCK_LAUNCH
+
+  test.each<[string, (e: PersonaEpisodes) => void]>([
+    ['end', (e) => e.end('K', kind)],
+    ['a new case in begin', (e) => e.begin('K', kind, 'case-b')],
+    ['forget(key)', (e) => e.forget('K')],
+    ['forgetAll()', (e) => e.forgetAll()],
+    ['close()', (e) => e.close()],
+  ])('a close step runs exactly once when the episode closes by %s, and never again', (_how, closeIt) => {
+    let runs = 0
+    episodes.begin('K', kind, 'case-a')
+    expect(episodes.whenClosed('K', kind, () => runs++)).toBe(true)
+
+    // A kept episode does not close.
+    expect(episodes.begin('K', kind, 'case-a')).toBe('kept')
+    expect(episodes.begin('K', kind)).toBe('kept')
+    expect(runs).toBe(0)
+
+    closeIt(episodes)
+    expect(runs).toBe(1)
+
+    // No later close path runs it again.
+    episodes.begin('K', kind, 'case-c')
+    episodes.end('K', kind)
+    episodes.forget('K')
+    episodes.forgetAll()
+    episodes.close()
+    expect(runs).toBe(1)
+    expect(posts).toEqual([])
+    expect(lines).toEqual([])
+  })
+
+  test.each<[string, (e: PersonaEpisodes) => void, readonly string[]]>([
+    ['end', (e) => e.end('K', kind), ['K']],
+    ['a new case in begin', (e) => e.begin('K', kind, 'case-b'), ['K']],
+    // forget(key) closes every kind of the persona, so K's other kind too.
+    ['forget(key)', (e) => e.forget('K'), ['K', 'K-other']],
+  ])('closing by %s runs only the closed episodes\' close steps: the others stay registered', (_how, closeIt, ran) => {
+    const runs: string[] = []
+    episodes.begin('K', kind, 'case-a')
+    episodes.begin('Q', kind, 'case-a')
+    episodes.begin('K', other)
+    episodes.whenClosed('Q', kind, () => runs.push('Q'))
+    episodes.whenClosed('K', other, () => runs.push('K-other'))
+    episodes.whenClosed('K', kind, () => runs.push('K'))
+
+    closeIt(episodes)
+
+    expect(runs).toEqual([...ran])
+    episodes.forgetAll()
+    expect([...runs].sort()).toEqual(['K', 'K-other', 'Q'])
+  })
+
+  test('whenClosed answers false and registers nothing when no episode is open, and after close()', () => {
+    let runs = 0
+    const count = () => {
+      runs++
+    }
+
+    expect(episodes.whenClosed('K', kind, count)).toBe(false)
+    // An episode of another kind, or another persona's, is not this one.
+    episodes.begin('K', other)
+    episodes.begin('Q', kind)
+    expect(episodes.whenClosed('K', kind, count)).toBe(false)
+
+    // The step asked for before the episode opened is not run when a later one closes.
+    episodes.begin('K', kind)
+    episodes.end('K', kind)
+    episodes.forgetAll()
+    expect(runs).toBe(0)
+
+    episodes.close()
+    expect(episodes.whenClosed('K', kind, count)).toBe(false)
+    expect(runs).toBe(0)
+  })
+
+  test('a close step that throws is logged once, redacted, and every other close step still runs', () => {
+    const runs: string[] = []
+    episodes.begin('K', kind)
+    episodes.whenClosed('K', kind, () => runs.push('first'))
+    episodes.whenClosed('K', kind, () => {
+      runs.push('thrower')
+      throw new Error(`close refused (${sentinelInMessage('close-step')})`)
+    })
+    episodes.whenClosed('K', kind, () => runs.push('last'))
+
+    expect(episodes.end('K', kind)).toBe(true)
+
+    expect(runs).toEqual(['first', 'thrower', 'last'])
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(
+      `[slack] persona-episodes: persona=K ${kind} episode close step failed: Error message="close refused (${REDACTED_SENTINEL_TAIL})"`,
+    )
+    expect(episodes.isOpen('K', kind)).toBe(false)
+  })
+
+  test.each<[string, (e: PersonaEpisodes) => void]>([
+    ['a new case in begin', (e) => e.begin('K', kind, 'case-b')],
+    ['forget(key)', (e) => e.forget('K')],
+    ['forgetAll()', (e) => e.forgetAll()],
+    ['close()', (e) => e.close()],
+  ])('a throwing close step with a throwing log breaks no close by %s', (_how, closeIt) => {
+    episodes = createPersonaEpisodes({ sink: record, log: throwingLog, clock })
+    let after = 0
+    episodes.begin('K', kind, 'case-a')
+    episodes.begin('Q', kind)
+    episodes.whenClosed('K', kind, () => {
+      throw new Error('close refused')
+    })
+    episodes.whenClosed('K', kind, () => after++)
+
+    expect(() => closeIt(episodes)).not.toThrow()
+
+    expect(after).toBe(1)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(`[slack] persona-episodes: persona=K ${kind} episode close step failed: Error `)
+  })
+
+  test('openKeys lists only the keys with an open episode of that kind', () => {
+    for (const k of PERSONA_EPISODE_KINDS) expect({ k, keys: episodes.openKeys(k) }).toEqual({ k, keys: [] })
+
+    episodes.begin('K', kind)
+    episodes.begin('Q', kind)
+    episodes.begin('R', other)
+
+    expect([...episodes.openKeys(kind)].sort()).toEqual(['K', 'Q'])
+    expect(episodes.openKeys(other)).toEqual(['R'])
+    for (const k of PERSONA_EPISODE_KINDS.filter((k) => k !== kind && k !== other)) {
+      expect({ k, keys: episodes.openKeys(k) }).toEqual({ k, keys: [] })
+    }
+
+    episodes.end('Q', kind)
+    expect(episodes.openKeys(kind)).toEqual(['K'])
+    episodes.begin('R', kind)
+    episodes.forget('K')
+    expect(episodes.openKeys(kind)).toEqual(['R'])
+    expect(episodes.openKeys(other)).toEqual(['R'])
+    episodes.end('R', other)
+    expect(episodes.openKeys(other)).toEqual([])
+    expect(episodes.openKeys(kind)).toEqual(['R'])
+  })
+
+  test('after close(), begin answers closed for every kind, opens nothing and posts nothing', () => {
+    for (const k of PERSONA_EPISODE_KINDS) {
+      episodes.begin('K', k)
+      episodes.post('K', k, textOf(k, 1))
+    }
+    const before = posts.length
+
+    episodes.close()
+
+    for (const k of PERSONA_EPISODE_KINDS) {
+      expect({ k, begin: episodes.begin('K', k), newCase: episodes.begin('Q', k, 'case-a') }).toEqual({
+        k,
+        begin: 'closed',
+        newCase: 'closed',
+      })
+      expect({ k, open: episodes.isOpen('K', k), keys: episodes.openKeys(k) }).toEqual({ k, open: false, keys: [] })
+      expect({ k, posted: episodes.post('K', k, textOf(k, 2)) }).toEqual({ k, posted: false })
+      expect(episodes.view('K', k)).toBeUndefined()
+    }
+    expect(posts).toHaveLength(before)
+    expect(lines).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Clock
 // ---------------------------------------------------------------------------
 
@@ -448,12 +637,20 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
 
   /** A condition over `episodes`, logging to the line capture and recording each hook call unless others are given. */
   function buildCondition(
-    opts: { log?: (line: string) => void; conditionEnded?: (key: string, reading: string | undefined) => unknown } = {},
+    opts: {
+      log?: (line: string) => void
+      conditionEnded?: (key: string, reading: string | undefined) => unknown
+      episodes?: PersonaEpisodes
+      healthCheckOn?: () => boolean
+      alertThresholdMs?: () => number
+    } = {},
   ): TmuxUnresponsiveCondition {
     return createTmuxUnresponsiveCondition({
-      episodes,
+      episodes: opts.episodes ?? episodes,
       log: opts.log ?? ((line) => lines.push(line)),
       conditionEnded: opts.conditionEnded ?? recordHook,
+      ...(opts.healthCheckOn === undefined ? {} : { healthCheckOn: opts.healthCheckOn }),
+      ...(opts.alertThresholdMs === undefined ? {} : { alertThresholdMs: opts.alertThresholdMs }),
     })
   }
 
@@ -553,6 +750,212 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
 
     expect(lines.at(-1)).toBe(endedLine('K', text))
     expect(hookCalls).toEqual([{ key: 'K', reading: undefined }])
+  })
+
+  // -------------------------------------------------------------------------
+  // The failure-only lines: each failure is logged and never throws out of
+  // the entry that met it.
+  // -------------------------------------------------------------------------
+
+  describe('failure-only lines', () => {
+    const THRESHOLD_MS = adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
+
+    /** `persona=<key> tmux-unresponsive <text>`: the prefix of a per-persona failure line. */
+    function personaLine(key: string, text: string): string {
+      return `[slack] persona-episodes: persona=${key} ${KIND} ${text}`
+    }
+
+    /** `episodes` with one member replaced, every other member the real one. */
+    function episodesWith(overrides: Partial<PersonaEpisodes>): PersonaEpisodes {
+      return { ...episodes, ...overrides }
+    }
+
+    function refused(what: string): Error {
+      return new Error(`${what} refused (${sentinelInMessage(what)})`)
+    }
+
+    /** The redacted `describeThrownValue` head of `refused(what)`. */
+    function refusedText(what: string): string {
+      return `Error message="${what} refused (${REDACTED_SENTINEL_TAIL})"`
+    }
+
+    /** The fake clock, except that `clearTimeout` clears the timer and then throws. */
+    function clearThenThrowClock(): PersonaEpisodesClock {
+      return {
+        now: () => clock.now(),
+        setTimeout: (callback, delayMs) => clock.setTimeout(callback, delayMs),
+        clearTimeout: (handle) => {
+          clock.clearTimeout(handle)
+          throw refused('clear')
+        },
+      }
+    }
+
+    test('a threshold accessor answering NaN: the arm throws a RangeError, logged as alert check not armed; the start still succeeds and nothing is pending', async () => {
+      const condition = buildCondition({ alertThresholdMs: () => NaN })
+      const err = errTmuxUnresponsive(VERB)
+
+      expect(condition.start('K', VERB, err)).toBe('started')
+
+      expect(condition.holds('K')).toBe(true)
+      expect(clock.pendingCount()).toBe(0)
+      expect(lines).toHaveLength(2)
+      expect(lines[0]).toBe(startedLine('K', err))
+      expect(lines[1]).toStartWith(personaLine('K', 'alert check not armed: RangeError message="'))
+      expect(condition.cancelAlert('K')).toBe(false)
+
+      // No alert ever posts, and the condition still ends normally.
+      await clock.advance(THRESHOLD_MS * 2)
+      expect(posts).toEqual([])
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended')
+      expect(lines).toHaveLength(3)
+    })
+
+    test('an alert fire whose post throws is logged as alert check failed: nothing escapes the fire, nothing is left pending and the condition holds', async () => {
+      const failing = episodesWith({
+        post: () => {
+          throw refused('post')
+        },
+      })
+      const condition = buildCondition({ episodes: failing, alertThresholdMs: () => THRESHOLD_MS })
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      expect(clock.pendingCount()).toBe(1)
+
+      await clock.advance(THRESHOLD_MS + 1)
+
+      expect(clock.pendingCount()).toBe(0)
+      expect(posts).toEqual([])
+      expect(lines.at(-1)).toStartWith(personaLine('K', `alert check failed: ${refusedText('post')}`))
+      expect(lines.filter((l) => l.includes('alert check failed'))).toHaveLength(1)
+      expect(condition.holds('K')).toBe(true)
+      expect(condition.cancelAlert('K')).toBe(false)
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended')
+    })
+
+    test('an alert fire whose threshold read throws is logged as alert check failed, and posts nothing', async () => {
+      // The never-early wait reads the threshold at its arm and at its fire
+      // (a throw there reads as never-ends, so it never fires); the third
+      // read is the alert's own, at the fire, and that one throws.
+      let reads = 0
+      const condition = buildCondition({
+        alertThresholdMs: () => {
+          reads++
+          if (reads >= 3) throw refused('threshold')
+          return THRESHOLD_MS
+        },
+      })
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+
+      await clock.advance(THRESHOLD_MS + 1)
+
+      expect(reads).toBe(3)
+      expect(clock.pendingCount()).toBe(0)
+      expect(posts).toEqual([])
+      expect(lines.at(-1)).toStartWith(personaLine('K', `alert check failed: ${refusedText('threshold')}`))
+      expect(condition.holds('K')).toBe(true)
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+    })
+
+    test('a cancel whose clock throws is logged as alert check cancel failed: cancelAlert answers false, throws nothing, and a later end runs no second cancel', async () => {
+      episodes = createPersonaEpisodes({ sink: record, log: (line) => lines.push(line), clock: clearThenThrowClock() })
+      const condition = buildCondition({ alertThresholdMs: () => THRESHOLD_MS })
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      expect(clock.pendingCount()).toBe(1)
+
+      let answer: boolean | undefined
+      expect(() => {
+        answer = condition.cancelAlert('K')
+      }).not.toThrow()
+
+      expect(answer).toBe(false)
+      expect(clock.pendingCount()).toBe(0)
+      expect(lines.at(-1)).toStartWith(personaLine('K', `alert check cancel failed: ${refusedText('clear')}`))
+      expect(condition.holds('K')).toBe(true)
+      expect(condition.cancelAlert('K')).toBe(false)
+
+      await clock.advance(THRESHOLD_MS * 2)
+      const before = lines.length
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended')
+      expect(lines.slice(before)).toEqual([endedLine('K', TMUX_UNRESPONSIVE_END_TEXT[TMUX_UNRESPONSIVE_END_TMUX_VERB])])
+      expect(posts).toEqual([])
+    })
+
+    test('an end whose alert-check cancel throws is logged as an episode close step failure, and the end still completes', () => {
+      episodes = createPersonaEpisodes({ sink: record, log: (line) => lines.push(line), clock: clearThenThrowClock() })
+      const condition = buildCondition({ alertThresholdMs: () => THRESHOLD_MS })
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)).toBe('ended')
+
+      expect(clock.pendingCount()).toBe(0)
+      expect(condition.holds('K')).toBe(false)
+      expect(lines.at(-2)).toStartWith(personaLine('K', `episode close step failed: ${refusedText('clear')}`))
+      expect(lines.at(-1)).toBe(endedLine('K', TMUX_UNRESPONSIVE_END_TEXT[TMUX_UNRESPONSIVE_END_TICK]))
+      expect(hookCalls).toEqual([{ key: 'K', reading: LIVENESS_LIVE }])
+    })
+
+    test('a health-tick onset check that throws is logged as onset check at a health tick failed, and throws nothing', async () => {
+      const failing = episodesWith({
+        openKeys: () => {
+          throw refused('open-keys')
+        },
+      })
+      const condition = buildCondition({ episodes: failing })
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      await clock.advance(1)
+
+      expect(() => condition.onsetAtTick(clock.now())).not.toThrow()
+
+      expect(posts).toEqual([])
+      expect(lines.at(-1)).toStartWith(
+        `[slack] persona-episodes: ${KIND} onset check at a health tick failed: ${refusedText('open-keys')}`,
+      )
+      expect(condition.holds('K')).toBe(true)
+    })
+
+    test('a retry onset check that throws is logged as onset check at a retry failed, and throws nothing', () => {
+      let failView = false
+      const failing = episodesWith({
+        view: (key, kind) => {
+          if (failView) throw refused('view')
+          return episodes.view(key, kind)
+        },
+      })
+      const condition = buildCondition({ episodes: failing, healthCheckOn: () => false })
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      failView = true
+
+      expect(() => condition.onsetAtRetry('K', START_MS + TMUX_UNRESPONSIVE_ONSET_FLOOR_MS)).not.toThrow()
+
+      expect(posts).toEqual([])
+      expect(lines.at(-1)).toStartWith(personaLine('K', `onset check at a retry failed: ${refusedText('view')}`))
+      expect(condition.holds('K')).toBe(true)
+    })
+
+    test.each<[string, (c: TmuxUnresponsiveCondition) => void, readonly string[]]>([
+      // Taken as on: the tick posts the onset.
+      ['a health tick', (c) => c.onsetAtTick(clock.now()), ['K']],
+      // Taken as on: a retry posts no onset.
+      ['a retry', (c) => c.onsetAtRetry('K', clock.now()), []],
+    ])('a health-check mode accessor that throws at %s is logged and taken as on', async (_where, check, onsetFor) => {
+      const condition = buildCondition({
+        healthCheckOn: () => {
+          throw refused('mode')
+        },
+      })
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      await clock.advance(TMUX_UNRESPONSIVE_ONSET_FLOOR_MS)
+      const before = lines.length
+
+      expect(() => check(condition)).not.toThrow()
+
+      const logged = lines.slice(before)
+      expect(logged[0]).toStartWith(`[slack] persona-episodes: ${KIND} health-check mode read failed: ${refusedText('mode')}`)
+      expect(logged[0]).toEndWith(' — taken as on')
+      expect(logged).toHaveLength(1 + onsetFor.length)
+      expect(posts).toEqual(onsetFor.map((key) => ({ key, text: tmuxUnresponsiveOnsetText(key) })))
+      expect(condition.holds('K')).toBe(true)
+    })
   })
 })
 
