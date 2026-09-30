@@ -56,6 +56,7 @@ import {
   CONFLICT_NO_VALID_ID_PHRASE,
   CONFLICT_OWN_ID_PHRASE,
   CONFLICT_PANE_NOT_FOUND_PHRASE,
+  DIFFERENT_TMUX_SERVER_PHRASE,
   LAUNCH_TIMEOUT_PHRASE,
   PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE,
   STILL_STARTING_PHRASE,
@@ -132,6 +133,7 @@ import {
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
   REDACTED_SENTINEL_TAIL,
   assertNoLeak,
   fakeToken,
@@ -471,6 +473,14 @@ describe('stub builders: shape (SRJ-1303)', () => {
     )
   })
 
+  test('errTmuxNotAvailableDifferentServer carries the different-server phrase and the socket; the socket form of errTmuxNotAvailable does not carry the phrase', () => {
+    const socketPath = '/tmp/tmux-1000/other'
+    const different = errTmuxNotAvailableDifferentServer(socketPath)
+    expect(different.errDescription).toContain(DIFFERENT_TMUX_SERVER_PHRASE)
+    expect(different.errDescription).toContain(socketPath)
+    expect(errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH).errDescription).not.toContain(DIFFERENT_TMUX_SERVER_PHRASE)
+  })
+
   test('errConfigMalformed names a [tmux] key, its value and its minimum', () => {
     const err = errConfigMalformed('launch_timeout_ms', '1500', '2000', 'ms')
     const description = (err.envelope as { err_description: string }).err_description
@@ -524,30 +534,50 @@ describe('classifyAdError: reported name and message', () => {
 
   test('a description carrying a token comes out redacted in every reporting class', async () => {
     const secret = `failed (${sentinelInMessage('desc')})`
-    const classifications = {
-      unclassifiedByEnvelope: classifyAdError(errInternal(secret)),
-      unusableName: classifyAdError(errInternal(`${UNUSABLE_RECORDED_NAME_PHRASE} ${secret}`)),
-      config: classifyAdError(errUnknownErrorName(ERR_CONFIG_MALFORMED, secret)),
-      unclassifiedByErrName: classifyAdError(baseError(ErrSendKeysWhileRelayed.name, secret)),
-      step: (await classifyWithInvalidFlagsRecheck(baseError(errInvalidFlags().errName, secret), recordingTrigger(PASS).trigger))
-        .classification,
-    }
-    for (const c of Object.values(classifications)) {
-      expect(REPORTING_CLASSES).toContain(c.errorClass)
-      expect(c.message).toContain(`(${REDACTED_SENTINEL_TAIL})`)
-    }
-    assertNoLeak({
-      classifications,
-      lines: Object.values(classifications).map((c) => describeAdErrorClassification(c)),
-    })
+    const redacted = `failed (${REDACTED_SENTINEL_TAIL})`
+    // Every error also carries the sentinel bare where nothing is reported: a
+    // `note` property and, on the ErrUnknownErrorName forms, an extra
+    // envelope key.
+    const unknownNamed = (name: string, description: string): ErrUnknownErrorName =>
+      Object.assign(
+        new ErrUnknownErrorName(name, { err_name: name, err_description: description, detail: LEAK_SENTINEL }),
+        { note: LEAK_SENTINEL },
+      )
+    const errNamed = (errName: string): AgentDirectorError =>
+      Object.assign(baseError(errName, secret), { note: LEAK_SENTINEL })
+    const cases = [
+      [classifyAdError(unknownNamed(ERR_INTERNAL, secret)), ERR_INTERNAL, redacted],
+      [
+        classifyAdError(unknownNamed(ERR_INTERNAL, `${UNUSABLE_RECORDED_NAME_PHRASE} ${secret}`)),
+        ERR_INTERNAL,
+        `${UNUSABLE_RECORDED_NAME_PHRASE} ${redacted}`,
+      ],
+      [classifyAdError(unknownNamed(ERR_CONFIG_MALFORMED, secret)), ERR_CONFIG_MALFORMED, redacted],
+      [classifyAdError(errNamed(ErrSendKeysWhileRelayed.name)), ErrSendKeysWhileRelayed.name, redacted],
+      [
+        (await classifyWithInvalidFlagsRecheck(errNamed(errInvalidFlags().errName), recordingTrigger(PASS).trigger)).classification,
+        errInvalidFlags().errName,
+        redacted,
+      ],
+    ] as const
+    const lines = cases.map(([c]) => describeAdErrorClassification(c))
+    expect(cases.map(([c]) => c.errorClass)).toEqual([
+      AD_ERROR_CLASS_UNCLASSIFIED,
+      AD_ERROR_CLASS_UNUSABLE_NAME,
+      AD_ERROR_CLASS_CONFIG,
+      AD_ERROR_CLASS_UNCLASSIFIED,
+      AD_ERROR_CLASS_UNCLASSIFIED,
+    ])
+    for (const [c] of cases) expect(REPORTING_CLASSES).toContain(c.errorClass)
+    expect(lines).toEqual(
+      cases.map(([c, name, message]) => `class=${c.errorClass} name=${name} message=${JSON.stringify(message)}`),
+    )
+    assertNoLeak({ classifications: cases.map(([c]) => c), lines })
   })
 
   test('a multi-line description comes out on one line', () => {
     const { message } = classifyAdError(errInternal('first line\nsecond line\r\nthird line'))
-    expect(message).toBeDefined()
-    expect(message).not.toMatch(/[\r\n]/)
-    expect(message).toContain('first line')
-    expect(message).toContain('third line')
+    expect(message).toBe('first line second line third line')
   })
 
   test('a description longer than MAX_LOGGED_MESSAGE_LENGTH is capped', () => {
@@ -587,6 +617,7 @@ describe('classifyAdError: reported name and message', () => {
   test('the redaction placeholder is what stands in for the token', () => {
     const { message } = classifyAdError(errInternal(`token ${fakeToken(BOT_TOKEN_PREFIX, 'bare')} here`))
     expect(message).toBe(`token ${REDACTED_TOKEN_PLACEHOLDER} here`)
+    assertNoLeak(message)
   })
 })
 

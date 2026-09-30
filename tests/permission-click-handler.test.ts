@@ -1469,11 +1469,6 @@ describe('handlePermissionClick — decide ErrInvalidFlags version re-check (b.j
     return { calls, recheckLogs, stops, startupErrors, clock }
   }
 
-  /** Let every pending microtask (a started, not awaited, re-check) run. */
-  function flushMacrotask(): Promise<void> {
-    return new Promise<void>((resolve) => { setTimeout(resolve, 0) })
-  }
-
   test('ErrInvalidFlags → exactly one re-check; log line, trail result_class, no retry and no render unchanged', async () => {
     await seedLiveEntry({ requestToken: TOKEN_A })
     const recheck = installCountingRecheck()
@@ -1492,7 +1487,7 @@ describe('handlePermissionClick — decide ErrInvalidFlags version re-check (b.j
     // The handler does not wait on the re-check; let it settle (the stub
     // resolve answers on a microtask, the fake clock's time limit never fires)
     // before checking what it did.
-    await flushMacrotask()
+    await recheck.clock.flush()
     // Exactly one immediate re-check, through the installed re-check's one call.
     expect(recheck.calls).toHaveLength(1)
     // The re-check passed: nothing stopped, no startup-errors entry.

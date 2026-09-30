@@ -269,7 +269,6 @@ import {
   makeStubCallLog,
   makeStubClient,
   makeStubResolveSystemBinary,
-  resetStubSpawnPath,
   stubCallCount,
   type CannedGetResult,
   type CannedResponse,
@@ -1254,7 +1253,6 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
 
   afterEach(() => {
     resetAdVersionRecheckForTests()
-    resetStubSpawnPath()
   })
 
   /** A persona `C` whose spawn collides with its `ended` row, so the ladder resumes it and the resume rejects with `resumeError`. */
