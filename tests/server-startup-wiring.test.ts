@@ -1039,9 +1039,10 @@ describe('importing src/server.ts has no side effect (SR-3.1, SR-10.2, SR-13.2)'
     () => {
       home = mkdtempSync(join(tmpdir(), 'cscb-server-import-'))
       const stateDir = join(home, 'state')
-      // The child gets only PATH, HOME and SLACK_STATE_DIR (no token, CSCB_*,
-      // CLAUDE_* or AGENT_DIRECTOR_* variable) and imports server.ts from an
-      // eval script, so server.ts is never the entry point.
+      // The child's env comes from hostSafeChildEnv: only HOME, PATH,
+      // TMUX_TMPDIR, SLACK_STATE_DIR and FAKE_HOME_INPUT_JSON (no token,
+      // CSCB_*, CLAUDE_* or AGENT_DIRECTOR_* variable). It imports server.ts
+      // from an eval script, so server.ts is never the entry point.
       const res = runInFakeHome({
         modulePath: SERVER_PATH,
         call: `process.stdout.write('IMPORTED::' + typeof mod.main + ' LISTENERS::' + process.listenerCount('unhandledRejection') + '\\n')`,

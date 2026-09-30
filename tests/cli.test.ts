@@ -21,7 +21,8 @@
  * `unknown subcommand` block (and its hidden-subcommand `beforeAll`) and the
  * two real-CLI tests of `credentials` (a usage error and an unknown persona,
  * neither of which reaches the script), which
- * run the CLI script through `runCli` with a built env (PATH, temp HOME, temp
+ * run the CLI script through `runCli`, whose env is a direct `hostSafeChildEnv`
+ * call (temp HOME, no PATH directory, its own TMUX_TMPDIR, plus temp
  * SLACK_STATE_DIR and BUN_RUNTIME_TRANSPILER_CACHE_PATH=0). Waits in `start` and
  * `stop` (the daemon startup wait, the SIGTERM and SIGKILL polls) run on the
  * per-test fake clock; none waits in real time.
@@ -87,6 +88,7 @@ import {
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import {
   makeMultiPersonaConfig,
   makePersona,
@@ -2140,16 +2142,22 @@ function usageEntries(output: string): {
 }
 
 /**
- * Run the real CLI script in a child process: a built env (b.av2 SR-13.2):
- * a temp HOME and state dir (the per-test root by default), no token, nothing
- * else from process.env; bounded. Bun's transpiler cache is off, so the child
- * writes nothing under the temp HOME (`.bun/install/cache`) that a tree
- * snapshot would mistake for the CLI's doing.
+ * Run the real CLI script in a child process (b.av2 SR-13.2, b.jg5 SRJ-1302):
+ * its env is a direct `hostSafeChildEnv` call, so the child gets the temp HOME
+ * (the per-test root by default), a PATH naming no directory (Bun is started
+ * by absolute path and the CLI runs nothing by name on these paths), its own
+ * TMUX_TMPDIR, the state dir and nothing else from process.env (no token, no
+ * agent-director install on HOME or PATH); bounded. Bun's transpiler cache is
+ * off, so the child writes nothing under the temp HOME (`.bun/install/cache`)
+ * that a tree snapshot would mistake for the CLI's doing.
  */
 function runCli(args: string[], home = root) {
   const result = spawnSync(process.execPath, [CLI_SOURCE, ...args], {
     encoding: 'utf-8',
-    env: { PATH: process.env['PATH'] ?? '', HOME: home, SLACK_STATE_DIR: join(home, 'state'), BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' },
+    env: hostSafeChildEnv(home, {
+      tools: [],
+      extras: { SLACK_STATE_DIR: join(home, 'state'), BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' },
+    }),
     timeout: 15_000,
   })
   // Spawned, and not killed by the time limit, so `status` is the CLI's own exit code.

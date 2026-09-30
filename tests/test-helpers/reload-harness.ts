@@ -388,12 +388,12 @@
  * session notifier) and captures `console.error`; `h.cleanup()` resets and
  * restores them. No launch is a startup launch, so nothing resolves the
  * state directory from the environment. It
- * spawns nothing but `mkfifo` (in `mkfifoAvailable` and `h.makeFifo`).
+ * spawns nothing itself: `mkfifoAvailable` and `h.makeFifo` start `mkfifo`
+ * through the shared FIFO helper (`fifo.ts`), with a host-safe environment.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { spawnSync } from 'node:child_process'
 import {
   accessSync,
   chmodSync,
@@ -561,6 +561,7 @@ import {
   type WrittenFile,
 } from './credentials.ts'
 import type { FakeClock } from './fake-clock.ts'
+import { makeFifo as makeFifoAt, mkfifoAvailable } from './fifo.ts'
 import { makePersona } from './persona-config.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './persona-connection-harness.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
@@ -604,16 +605,12 @@ export const SLACK_AUTH_REJECTED: StubSlackOptions = Object.freeze({
   authTest: Object.freeze([{ kind: 'platform' as const, error: 'invalid_auth' }]),
 })
 
-let mkfifoProbe: boolean | undefined
-
 /**
- * Whether `mkfifo` is available here (probed once). Guard a real-FIFO case
- * with `test.skipIf(!mkfifoAvailable())`, the reason in the test name.
+ * Whether `mkfifo` is available here (probed once; the shared FIFO helper's
+ * check). Guard a real-FIFO case with `test.skipIf(!mkfifoAvailable())`, the
+ * reason in the test name.
  */
-export function mkfifoAvailable(): boolean {
-  mkfifoProbe ??= spawnSync('mkfifo', ['--version']).status === 0
-  return mkfifoProbe
-}
+export { mkfifoAvailable }
 
 // ---------------------------------------------------------------------------
 // Manual tick driver
@@ -3044,8 +3041,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       const full = inside(path)
       rmSync(full, { recursive: true, force: true })
       mkdirSync(dirname(full), { recursive: true })
-      const made = spawnSync('mkfifo', [full])
-      if (made.status !== 0) throw new Error('reload-harness: mkfifo failed (guard the test with mkfifoAvailable())')
+      makeFifoAt(full)
     },
     pendingExists: () => existsSync(paths.pending),
     readPending: () => readFileIfPresent(paths.pending),
