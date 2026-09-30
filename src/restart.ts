@@ -129,7 +129,11 @@ export const RESTART_OUTCOME_RECONNECT_DEFERRED = 'reconnect-deferred'
 export const RESTART_OUTCOME_PENDING_DEFERRED = 'pending-deferred'
 /** The kill and the launch ran and the launch succeeded (a success was recorded). */
 export const RESTART_OUTCOME_LAUNCHED = 'launched'
-/** The launch was refused: its UNAVAILABLE retry timer was armed for it. Not counted. */
+/**
+ * The launch was refused (its UNAVAILABLE retry timer was armed for it), or
+ * the kill before it was refused (`KILL_SESSION_REFUSED`), so nothing was
+ * launched. Not counted.
+ */
 export const RESTART_OUTCOME_REFUSED = 'refused'
 /** The launch failed and the failure was counted, below the cap. */
 export const RESTART_OUTCOME_COUNTED_FAILURE = 'counted-failure'
@@ -236,7 +240,14 @@ export interface RestartDeps {
    * (see comment below on why failure is NOT counted here).
    */
   reconnectSession(key: string): Promise<ReconnectSessionResult>
-  killSession(key: string): Promise<void>
+  /**
+   * Kill the persona's instance before its launch. `KILL_SESSION_REFUSED`:
+   * the kill met an UNAVAILABLE outcome (b.jg5 SRJ-105, `ErrTmuxKillFailed`
+   * included), so the work launches nothing, records no success or failure
+   * and answers `RESTART_OUTCOME_REFUSED`. Anything else, `undefined`
+   * included, and a kill that throws, means go on to the launch.
+   */
+  killSession(key: string): Promise<KillSessionResult>
   /**
    * `cwd` is the persona's working directory. `'skipped'`: the launch was
    * declined (the persona stopped being up after the last `canRestart`
@@ -296,6 +307,15 @@ export interface RestartDeps {
 
 /** What `RestartDeps.reconnectSession` answers; `void` is a non-success. */
 export type ReconnectSessionResult = 'success' | 'escalate-dead' | 'transient' | 'pending' | void
+
+/** `RestartDeps.killSession`'s report that the kill was refused (b.jg5 SRJ-105): no launch follows. */
+export const KILL_SESSION_REFUSED = 'refused'
+
+/**
+ * What `RestartDeps.killSession` answers: `KILL_SESSION_REFUSED` stops the
+ * work before its launch; `void` (a kill that resolves with nothing) goes on.
+ */
+export type KillSessionResult = void | typeof KILL_SESSION_REFUSED
 
 /**
  * What a restart's launch answers: true launched, false a counted failure,
@@ -505,7 +525,8 @@ function launchInFlight(key: string, isInFlight: (key: string) => boolean): bool
  * success or failure accounting. A reconnect whose verdict
  * is 'escalate-dead' is followed by a second liveness probe; only when the
  * row now reads `dead` does the same run go on to the kill and launch
- * (b.d61). The restart cap is not
+ * (b.d61). A kill that answers `KILL_SESSION_REFUSED` (b.jg5 SRJ-105) ends
+ * the work with `RESTART_OUTCOME_REFUSED`: no launch, nothing counted. The restart cap is not
  * asked here (the retry entry asks it before this work). The whole work is
  * one recovery attempt for the persona (b.jg5 SRJ-301). Answers what it did (`RestartWorkOutcome`).
  */
@@ -621,10 +642,22 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     if (held !== undefined) return held
   }
 
-  // Kill zombie if needed (ignore errors — session may not exist)
+  // Kill the zombie session, if any. A refused kill (`KILL_SESSION_REFUSED`,
+  // b.jg5 SRJ-105) stops the run below with no launch; any other error (a
+  // throw, e.g. the session may not exist) is ignored and the launch follows.
+  let killed: KillSessionResult = undefined
   try {
-    await d.killSession(key)
+    killed = await d.killSession(key)
   } catch { /* ignore */ }
+
+  if (killed === KILL_SESSION_REFUSED) {
+    // b.jg5 SRJ-105: agent-director refused the kill (UNAVAILABLE), so no
+    // launch follows it. Nothing is counted: the failure counter, backoff and
+    // cap latch are left exactly as they were, and the refusal is answered as
+    // the launch's is (SRJ-302).
+    console.error(`[slack] Session kill refused for persona=${key} — no relaunch; not counted`)
+    return RESTART_OUTCOME_REFUSED
+  }
 
   console.error(`[slack] Relaunching session for persona=${key} cwd="${cwd}"`)
 

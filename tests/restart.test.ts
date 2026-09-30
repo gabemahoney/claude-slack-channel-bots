@@ -31,6 +31,8 @@ import {
   RESTART_OUTCOME_RECONNECT_DEFERRED,
   RESTART_OUTCOME_REFUSED,
   RESTART_OUTCOME_SHUTTING_DOWN,
+  KILL_SESSION_REFUSED,
+  type KillSessionResult,
   type LaunchSessionResult,
   type ReconnectSessionResult,
   type RestartDeps,
@@ -110,6 +112,7 @@ import {
   errTmuxSendKeys,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
+  errUnknownErrorName,
   holdSpawns,
   makeStubCallLog,
   makeStubResolveSystemBinary,
@@ -139,6 +142,12 @@ import {
 } from '../src/unavailable-retry.ts'
 import { installAdVersionRecheck, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { makeRecoveryHarness, type RecoveryHarness } from './test-helpers/recovery-harness.ts'
+import {
+  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
+  TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
+  tmuxUnresponsiveOnsetText,
+} from '../src/persona-episodes.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
@@ -172,7 +181,7 @@ type DepsOpts = {
   hasSessionStreamResult?: boolean  // default: true (stream present — prior semantics)
   launchSessionResult?: LaunchSessionResult  // default: true (launch succeeds); 'skipped': the relaunch gate declined
   launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<LaunchSessionResult>  // override entire launchSession
-  killSession?: (key: string) => Promise<void>  // runs after the capture (e.g. the real kill adapter)
+  killSession?: (key: string) => Promise<KillSessionResult>  // runs after the capture (e.g. the real kill adapter); its answer is the kill's
   restartDelay?: number           // default: FAST_DELAY_S
   isShuttingDown?: boolean        // default: false
   onCapReached?: (key: string) => void  // called after the capture (e.g. the real cap-notice function)
@@ -217,7 +226,7 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     },
     async killSession(key) {
       killSessionCalls.push(key)
-      await opts.killSession?.(key)
+      return opts.killSession?.(key)
     },
     async launchSession(key, cwd, sessionId) {
       launchSessionCalls.push({ key, cwd, sessionId })
@@ -3310,18 +3319,27 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
     assertNoLeak({ errArgs, held })
   })
 
-  test.each<[string, () => Error, string]>([
+  // A plain `Error` is no agent-director error, so it classifies UNAVAILABLE
+  // (b.jg5 SRJ-105): the adapter answers the refusal with its "kill refused"
+  // line. A base AgentDirectorError of a name no class knows is not
+  // UNAVAILABLE for a kill: it keeps the "error for persona" line and the
+  // launch goes on.
+  test.each<[string, () => Error, (key: string) => string, KillSessionResult]>([
     [
-      'a plain error with a safe code',
+      'a plain error with a safe code (UNAVAILABLE, b.jg5 SRJ-105) — one "kill refused" line; the adapter answers the refusal',
       () => Object.assign(new Error(`kill refused (${sentinelInMessage('kill')})`), { code: 'ECONNRESET', detail: LEAK_SENTINEL }),
-      `Error code=ECONNRESET message="kill refused (${REDACTED_SENTINEL_TAIL})"`,
+      (key) =>
+        `[slack] killSession (restart adapter): kill refused for persona=${key}: Error code=ECONNRESET message="kill refused (${REDACTED_SENTINEL_TAIL})" — no relaunch follows (b.jg5 SRJ-105)`,
+      KILL_SESSION_REFUSED,
     ],
     [
-      'a base AgentDirectorError whose description carries a fake token',
+      'a base AgentDirectorError whose description carries a fake token — one "error for persona" line; the adapter answers nothing (go on)',
       () => errGeneric('kill', 'ErrKillBroken', `kill refused (${sentinelInMessage('kill', APP_TOKEN_PREFIX)})`),
-      `AgentDirectorError errName=ErrKillBroken message="ErrKillBroken: kill refused (${REDACTED_SENTINEL_TAIL})"`,
+      (key) =>
+        `[slack] killSession (restart adapter): error for persona=${key}: AgentDirectorError errName=ErrKillBroken message="ErrKillBroken: kill refused (${REDACTED_SENTINEL_TAIL})"`,
+      undefined,
     ],
-  ])('AC 20: the kill fails with %s — one "error for persona" line naming the error with its message redacted; no captured argument carries a credential value', async (_label, makeError, shown) => {
+  ])('AC 20: the kill fails with %s; the line names the error with its message redacted; no captured argument carries a credential value', async (_label, makeError, line, answer) => {
     const config = makeMultiPersonaConfig([{ name: 'Alpha Desk' }], dir)
     const [a] = config.personas as [Persona]
     const killCalls: KillParams[] = []
@@ -3329,12 +3347,11 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => failing as unknown as Client })
 
-    await _buildKillSessionAdapter()(a.key)
+    expect(await _buildKillSessionAdapter()(a.key)).toBe(answer)
 
     expect(killCalls.map((k) => k.claude_instance_id)).toEqual([personaInstanceId(a.key)])
-    expect(adapterLines().map((l) => l.split(' at ')[0])).toEqual([
-      `[slack] killSession (restart adapter): error for persona=${a.key}: ${shown}`,
-    ])
+    // The error's stack frames (' at …', up to the line's tail) are left out.
+    expect(adapterLines().map((l) => l.replace(/ at .*?(?= — |$)/, ''))).toEqual([line(a.key)])
     assertNoLeak({ errArgs })
   })
 })
@@ -3377,6 +3394,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
   const REFUSED_LINE = (key: string) =>
     `[slack] Session relaunch refused for persona=${key} — not counted; its UNAVAILABLE retry timer owns the persona`
   const FAILED_LINE = (key: string) => `[slack] Session relaunch failed for persona=${key}`
+  const KILL_REFUSED_LINE = (key: string) => `[slack] Session kill refused for persona=${key} — no relaunch; not counted`
 
   /** The controller's armed lines for `key` (one per first arm; a trigger while armed logs none). */
   const armedLines = (key: string) => retryLines.filter((l) => l.startsWith(`[slack] unavailable-retry: persona=${key} armed (`))
@@ -3492,7 +3510,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     ['kill', 'ErrTmuxKillFailed', () => errTmuxKillFailed(), UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
   ]
 
-  test.each(SITE_CASES)('SRJ-301: the restart run\'s %s answers %s → P\'s retry timer is armed once (cause %s is recorded); Q\'s is left alone', async (site, _label, makeError, cause) => {
+  test.each(SITE_CASES)('SRJ-301: the restart run\'s %s answers %s → P\'s retry timer is armed once (cause %s is recorded); Q\'s is left alone; b.jg5 SRJ-105: a refused kill is followed by no launch', async (site, _label, makeError, cause) => {
     const err = makeError()
     const sendKeysCalls: SendKeysParams[] = []
     const readPaneCalls: ReadPaneParams[] = []
@@ -3532,6 +3550,12 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     expect(reached[site]).toBeGreaterThan(0)
     expectArmedOnce(cause)
     if (site === 'spawn') expect(launchResults).toEqual(['refused'])
+    // b.jg5 SRJ-105: the kill's UNAVAILABLE stops the run before its launch.
+    if (site === 'kill') {
+      expect(deps.launchSessionCalls).toEqual([])
+      expect(spawnCalls).toEqual([])
+      expect(errLines).toContain(KILL_REFUSED_LINE(p.key))
+    }
     // No retry ran, and nothing was counted at the restart counting site.
     expect(retryLines.filter((l) => l.includes(' retry 1 '))).toEqual([])
     expect(getFailureCount(p.key)).toBe(0)
@@ -4659,6 +4683,240 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
       expect(errLines).toHaveLength(1)
       expect(errLines[0]).toStartWith(`[slack] Deferring persona=${KEY}`)
       if (start !== undefined) expect(errLines[0]).toContain(start)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-105 (AC 25, HO C3 Verify): the restart run's kill, reconnect and
+// relaunch answered UNAVAILABLE. A kill that resolves `KILL_SESSION_REFUSED`
+// ends the run with `RESTART_OUTCOME_REFUSED`: no launch, no success or
+// failure recorded, no `onCapReached`. A kill that resolves nothing, or
+// throws, still goes on to the launch. The kill follows a `dead` reading, so
+// it starts no `tmux-unresponsive` condition (`ErrTmuxKillFailed` included).
+// An UNAVAILABLE `send-keys` in the reconnect is never 'escalate-dead': no
+// re-probe, no kill, no launch. An UNAVAILABLE relaunch is never counted.
+// None of them posts a spawn-failure notice.
+//
+// The RestartDeps cases run on the file's `makeDeps` through the retry entry
+// (`runRestartRetry`) with the delay at 0. The adapter cases run on
+// `makeRecoveryHarness`: the real liveness, reconnect, kill and launch
+// adapters over the stub, the retry timer and the episodes on its fake
+// clock, no alert check (`alertThresholdMs: false`), and every captured line
+// checked with `assertNoLeak`. P has `RESTART_FAILURE_CAP - 1` failures on
+// record, so one counted failure would reach the cap.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the restart run launches nothing, counts nothing and posts no spawn-failure notice', () => {
+  const KILL_REFUSED_LINE = (key: string) => `[slack] Session kill refused for persona=${key} — no relaunch; not counted`
+
+  describe('RestartDeps.killSession\'s answer', () => {
+    const P = 'persona_p'
+    const CWD = '/cwd/p'
+    let errLines: string[]
+    let origConsoleError: typeof console.error
+
+    beforeEach(() => {
+      errLines = []
+      origConsoleError = console.error
+      console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+    })
+
+    afterEach(() => {
+      console.error = origConsoleError
+      cancelAllRestartTimers()
+      assertNoLeak({ errLines })
+    })
+
+    test.each<[string, (key: string) => Promise<KillSessionResult>, boolean]>([
+      ['resolves KILL_SESSION_REFUSED → the run stops', async () => KILL_SESSION_REFUSED, false],
+      ['resolves nothing → the run goes on', async () => undefined, true],
+      ['throws → the run goes on', async () => { throw new Error('the kill broke') }, true],
+    ])('a kill after a dead reading that %s to the launch (a failed launch counted and capped) or not (refused, nothing counted)', async (_label, killSession, goesOn) => {
+      for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(P)
+      const deps = makeDeps({ restartDelay: 0, killSession, launchSessionResult: false })
+      initRestart(deps)
+
+      expect(await runRestartRetry(P, CWD, () => false)).toBe(goesOn ? RESTART_OUTCOME_CAPPED : RESTART_OUTCOME_REFUSED)
+
+      expect(deps.isSessionAliveCalls).toEqual([P])
+      expect(deps.killSessionCalls).toEqual([P])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual(goesOn ? [P] : [])
+      expect(getFailureCount(P)).toBe(goesOn ? RESTART_FAILURE_CAP : RESTART_FAILURE_CAP - 1)
+      expect(deps.onCapReachedCalls).toEqual(goesOn ? [P] : [])
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(errLines.filter((l) => l === KILL_REFUSED_LINE(P))).toHaveLength(goesOn ? 0 : 1)
+    })
+  })
+
+  describe('through the real adapters over the stub, on the recovery harness', () => {
+    const KIND = PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE
+    let harness: RecoveryHarness | undefined
+
+    afterEach(() => {
+      const h = harness
+      harness = undefined
+      if (h === undefined) return
+      assertNoLeak(h.captured())
+      h.cleanup()
+      expect(h.clock.pendingCount()).toBe(0)
+    })
+
+    /** A harness with no alert check; P first, its failure count one short of the cap. */
+    function build(): { h: RecoveryHarness; p: string; cwd: string } {
+      const h = (harness = makeRecoveryHarness({ alertThresholdMs: false }))
+      const p = h.keys[0]!
+      for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(p)
+      return { h, p, cwd: h.config.personas[0]!.working_directory }
+    }
+
+    /** `status` reads `state` for each persona until a spawn of it succeeds, then `waiting`. */
+    function rowReads(h: RecoveryHarness, state: string): void {
+      const live = new Set<string>()
+      const client = h.stub.client
+      const spawn = client.spawn.bind(client)
+      client.spawn = async (params) => {
+        const result = await spawn(params)
+        live.add(String(params.claude_instance_id))
+        return result
+      }
+      h.script({ statusFn: (params) => cannedStatusResult({ state: live.has(String(params.claude_instance_id)) ? 'waiting' : state }) })
+    }
+
+    /** The stub's call counts, by verb, leaving out verbs never called. */
+    function callCounts(h: RecoveryHarness): Record<string, number> {
+      return Object.fromEntries(Object.entries(h.stub.calls).filter(([, calls]) => calls.length > 0).map(([verb, calls]) => [verb, calls.length]))
+    }
+
+    /** Fire persona `key`'s next retry and settle its run. */
+    async function retryNow(h: RecoveryHarness, key: string): Promise<void> {
+      const dueAt = h.controller.view(key)?.dueAt
+      if (dueAt === undefined) throw new Error(`retryNow: persona ${key} has no pending retry`)
+      await h.advance(dueAt - h.clock.now())
+      await h.settle()
+    }
+
+    /** Nothing counted for `key`, no cap notice, no spawn-failure notice and no startup-errors entry. */
+    function expectNothingCounted(h: RecoveryHarness, key: string): void {
+      expect(getFailureCount(key)).toBe(RESTART_FAILURE_CAP - 1)
+      expect(h.capReached).toEqual([])
+      expect(h.notices).toEqual([])
+      expect(h.startupErrors()).toEqual([])
+      expect(h.outageNotices).toEqual([])
+    }
+
+    /** E4's UNAVAILABLE forms, each built for the verb that meets it, and the cause each arms. */
+    const UNAVAILABLE_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error, string]> = [
+      ['ErrUnknownErrorName', () => errUnknownErrorName(), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      ['ErrCallTimeout', (verb) => errCallTimeout(verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      ['a wrapped UnknownError', (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME, 'Error: boom'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      ['ErrTmuxUnresponsive', (verb) => errTmuxUnresponsive(verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      ['ErrTmuxKillFailed', () => errTmuxKillFailed(), UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+    ]
+
+    test.each(UNAVAILABLE_ANSWERS)('the kill after a dead reading answers %s → refused: no launch, no recordFailure, no onCapReached; no condition started, nothing posted; the timer is armed (cause %s)', async (_label, make, cause) => {
+      const { h, p, cwd } = build()
+      rowReads(h, 'ended')
+      h.script({ killError: make('kill') })
+
+      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+
+      expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
+      expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+      expect(h.errors).toContain(KILL_REFUSED_LINE(p))
+      expect(h.triggers).toEqual([{ key: p, kind: cause }])
+      expectNothingCounted(h, p)
+      // The kill follows a dead reading: it starts no tmux-unresponsive condition.
+      expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+      expect(h.tmuxUnresponsive.firstRefusalAt(p)).toBeUndefined()
+      expect(h.lines.filter((l) => l.includes(`persona=${p} ${KIND} started`))).toEqual([])
+      expect(h.episodeNotices).toEqual([])
+    })
+
+    test.each<[string, () => Error]>([
+      ['ErrSpawnNotFound (regression)', () => errSpawnNotFound()],
+      ['an AgentDirectorError of a name no class knows (not UNAVAILABLE)', () => errGeneric('kill', 'ErrKillBroken', 'the kill broke')],
+    ])('the kill after a dead reading answers %s → the run still launches P; no refusal', async (_label, make) => {
+      const { h, p, cwd } = build()
+      rowReads(h, 'ended')
+      h.script({ killError: make() })
+
+      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_LAUNCHED)
+      await h.settle()
+
+      expect(h.stub.calls.killCalls).toHaveLength(1)
+      expect(h.stub.spawnedIds()).toEqual([personaInstanceId(p)])
+      expect(getFailureCount(p)).toBe(0)
+      expect(h.errors).not.toContain(KILL_REFUSED_LINE(p))
+      expect(h.triggers).toEqual([])
+      expect(h.notices).toEqual([])
+    })
+
+    test.each(UNAVAILABLE_ANSWERS)('the reconnect\'s send-keys on a live row answers %s → no escalate-dead, no re-probe, no kill, no launch; nothing counted, no spawn-failure notice', async (_label, make, cause) => {
+      const { h, p, cwd } = build()
+      h.script({ statusFn: () => cannedStatusResult({ state: 'waiting' }), sendKeysError: make('send-keys') })
+
+      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_RECONNECT_DEFERRED)
+
+      // The liveness read and the reconnect adapter's own read: no re-probe,
+      // no sweep, no kill, no spawn or resume.
+      expect(h.stub.calls.statusCalls).toHaveLength(2)
+      expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
+      expect(Object.keys(callCounts(h)).sort()).toEqual(['readPaneCalls', 'sendKeysCalls', 'statusCalls'])
+      expect(h.triggers).toEqual([{ key: p, kind: cause }])
+      expectNothingCounted(h, p)
+    })
+
+    test.each(UNAVAILABLE_ANSWERS)('the relaunch after a dead reading answers %s → refused: no recordFailure, no onCapReached, no spawn-failure notice', async (_label, make, cause) => {
+      const { h, p, cwd } = build()
+      rowReads(h, 'ended')
+      h.script({ spawnError: make('spawn') })
+
+      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+      await h.settle()
+
+      expect(h.stub.calls.killCalls).toHaveLength(1)
+      expect(h.stub.calls.spawnCalls).toHaveLength(1)
+      expect(h.stub.spawnedIds()).toEqual([personaInstanceId(p)])
+      expect(h.triggers).toEqual([{ key: p, kind: cause }])
+      expect(h.errors).not.toContain(KILL_REFUSED_LINE(p))
+      expectNothingCounted(h, p)
+    })
+
+    test('HO C3 Verify, AC 25: a relaunch that keeps answering ErrTmuxUnresponsive across several retries posts one onset for P and nothing more, and counts nothing', async () => {
+      const { h, p, cwd } = build()
+      rowReads(h, 'ended')
+      h.script({ spawnError: errTmuxUnresponsive('spawn') })
+      const firstAt = h.clock.now()
+
+      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+      // Retries until twice the onset floor has passed since the first refusal.
+      while (h.clock.now() - firstAt < 2 * TMUX_UNRESPONSIVE_ONSET_FLOOR_MS) await retryNow(h, p)
+
+      expect(h.attempts.length).toBeGreaterThan(2)
+      expect(h.stub.calls.spawnCalls).toHaveLength(h.attempts.length + 1)
+      expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+      expect(h.episodeNotices).toEqual([{ key: p, text: tmuxUnresponsiveOnsetText(p) }])
+      expectNothingCounted(h, p)
+    })
+
+    test('HO C3 Verify, AC 25: a relaunch refused once that succeeds at the next retry posts nothing', async () => {
+      const { h, p, cwd } = build()
+      rowReads(h, 'ended')
+      h.script({ spawnError: errTmuxUnresponsive('spawn') })
+
+      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+      expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+      h.script({ spawnError: undefined })
+      await retryNow(h, p)
+
+      expect(h.attempts).toHaveLength(1)
+      expect(h.stub.calls.spawnCalls).toHaveLength(2)
+      expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+      expect(getFailureCount(p)).toBe(0)
+      expect(h.episodeNotices).toEqual([])
+      expect(h.notices).toEqual([])
+      expect(h.outageNotices).toEqual([])
     })
   })
 })

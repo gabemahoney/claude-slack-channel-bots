@@ -717,13 +717,19 @@ interface LaunchSite {
   /** The launch's action when this site's call fails. */
   readonly action: SpawnPersonaResult['action']
   /**
-   * True when this site's call is tmux-touching and the launch goes on to a
-   * successful spawn after it fails: the `tmux-unresponsive` condition an
-   * UNAVAILABLE refusal here starts is ended by that spawn, with the launch's
-   * `pending` row as its reading, so the timer is kept (b.jg5 SRJ-305,
-   * SRJ-306, SRJ-310). A kill-failure cause starts no condition.
+   * For the ladder's kill and delete: the stub calls the launch makes in all.
+   * An UNAVAILABLE there (`ErrTmuxKillFailed` included) stops the ladder at
+   * once (b.jg5 SRJ-105): no delete after a refused kill, and no spawn after
+   * either, so the optimistic spawn is the launch's only one.
    */
-  readonly endedByItsSpawn?: boolean
+  readonly ladderCalls?: Readonly<Record<string, number>>
+  /**
+   * True when this site's call is tmux-touching and nothing after it in the
+   * launch touches tmux: the `tmux-unresponsive` condition an UNAVAILABLE
+   * refusal here starts still holds when the launch returns (b.jg5 SRJ-307).
+   * A kill-failure cause starts no condition.
+   */
+  readonly leavesConditionHeld?: boolean
 }
 
 const LAUNCH_SITES: readonly LaunchSite[] = [
@@ -740,8 +746,21 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
   { name: 'the sweep before a working-row wait', verb: 'find-missing', action: 'reconnected', script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), findMissingError: err }) },
   { name: 'the working-row read', verb: 'status', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusError: err }) },
   // The collision get reads the row `waiting` (live), so its kill is tmux-touching.
-  { name: 'the kill of a row in another directory', verb: 'kill', action: 'spawned', endedByItsSpawn: true, script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home }), killError: err }) },
-  { name: 'the delete of a row in another directory', verb: 'delete', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home }), deleteError: err }) },
+  {
+    name: 'the kill of a row in another directory',
+    verb: 'kill',
+    action: 'failed',
+    ladderCalls: { spawnCalls: 1, getCalls: 1, killCalls: 1 },
+    leavesConditionHeld: true,
+    script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home }), killError: err }),
+  },
+  {
+    name: 'the delete of a row in another directory',
+    verb: 'delete',
+    action: 'failed',
+    ladderCalls: { spawnCalls: 1, getCalls: 1, killCalls: 1, deleteCalls: 1 },
+    script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home }), deleteError: err }),
+  },
   { name: 'the resume of an ended row', verb: 'resume', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: err }) },
 ]
 
@@ -824,20 +843,11 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     const result = await h.launch(key)
 
     expect(result).toEqual(armedResult(key, site.action))
-    // A live-row kill's UNAVAILABLE starts the condition, and the launch's
-    // spawn that follows ends it with its `pending` row: the timer is kept,
-    // its last row read pending (b.jg5 SRJ-305, SRJ-306).
-    const ended = site.endedByItsSpawn === true && kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE
-    expectArmedOnce(h, key, kind, ended ? UNAVAILABLE_RETRY_ROW_PENDING : undefined)
-    if (ended) {
-      expect(h.conditionEnds).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'kept' }])
-      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-      expect(retryLinesOf(h, key).filter((line) => line.includes(' kept — '))).toEqual([
-        keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
-      ])
-    } else {
-      expect(h.conditionEnds).toEqual([])
-    }
+    expectArmedOnce(h, key, kind)
+    if (site.ladderCalls !== undefined) expect(callCounts(h)).toEqual(site.ladderCalls)
+    // No later call in the launch ends a condition this refusal started.
+    if (site.leavesConditionHeld === true) expect(h.tmuxUnresponsive.holds(key)).toBe(kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
+    expect(h.conditionEnds).toEqual([])
   })
 
   const readCross = READ_ERRORS.flatMap(([what, make]) => READ_SITES.map((site) => [what, site.name, make, site] as const))
@@ -2566,8 +2576,10 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
     expect(h.attempts).toEqual([])
   })
 
-  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>, string]>([
-    ['a retry that finds nothing left to recover', async (h, key) => {
+  test.each<[string, (h: RecoveryHarness, key: string, row: RowModel) => Promise<void>, string]>([
+    ['a retry that finds nothing left to recover', async (h, key, row) => {
+      // The persona came back on its own: its row reads live and connected.
+      row.set('waiting')
       h.setConnected(key, true)
       await retryNow(h, key)
     }, UNAVAILABLE_RETRY_STOP_RECOVERED],
@@ -2577,14 +2589,18 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
     }, UNAVAILABLE_RETRY_STOP_CAPPED],
     ['teardown', async (h, key) => h.teardown(key), UNAVAILABLE_RETRY_STOP_TORN_DOWN],
     ['shutdown', async (h) => h.shutdown(), UNAVAILABLE_RETRY_STOP_SHUTDOWN],
-  ])('a timer armed by ErrTmuxKillFailed inside a recovery attempt is kept by the condition-end entry, and stopped by %s', async (_rule, stop, reason) => {
+  ])('a timer armed by ErrTmuxKillFailed inside a recovery attempt (refused: no launch follows, nothing counted) is kept by the condition-end entry, and stopped by %s', async (_rule, stop, reason) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
-    modelRow(h, 'ended')
+    const row = modelRow(h, 'ended')
     h.script({ killError: errTmuxKillFailed() })
 
-    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_LAUNCHED)
+    // b.jg5 SRJ-105: the refused kill stops the restart work before its launch.
+    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
     await h.settle()
+    expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
+    expect(row.spawnedAt).toEqual([])
+    expect(getFailureCount(key)).toBe(0)
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
@@ -2596,30 +2612,54 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
     })
     expectKeptThroughEveryConditionEnd(h, key, UNAVAILABLE_RETRY_KEPT_KILL_FAILED)
 
-    await stop(h, key)
+    await stop(h, key, row)
 
     expect(h.lines).toContain(stoppedLine(key, reason))
     expectStopped(h, key)
   })
 
-  test('a full-mode retry whose kill fails with ErrTmuxKillFailed and whose launch then succeeds stays in full mode, its last row read pending, and the next retry runs the full decision', async () => {
+  test('a full-mode retry whose kill fails with ErrTmuxKillFailed launches nothing and stays in full mode; a later retry whose launch succeeds stays in full mode too, its last row read pending, and the next retry runs the full decision', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
-    modelRow(h, 'ended')
+    const row = modelRow(h, 'ended')
     h.script({ killError: errTmuxKillFailed() })
     h.controller.arm(key, UNAVAILABLE)
 
     await retryNow(h, key)
 
-    expect(callCounts(h)).toEqual({ statusCalls: 2, killCalls: 1, spawnCalls: 1 })
+    // b.jg5 SRJ-105: the refused kill stops the run before its launch, so the
+    // row was read once and nothing was spawned or counted.
+    expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
+    expect(row.spawnedAt).toEqual([])
+    expect(getFailureCount(key)).toBe(0)
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
-    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1))
-    expect(h.lines.filter((line) => line.includes(' in pending-only mode'))).toEqual([])
+    // A refusal gives no again-reason: the re-armed line names the cause.
+    expect(retryLinesOf(h, key).at(-1)).toStartWith(`[slack] unavailable-retry: persona=${key} retry 1: ${UNAVAILABLE_RETRY_CAUSE_KILL_FAILED}`)
+    expect(retryLinesOf(h, key).at(-1)).toEndWith(` — re-armed, next retry in ${waitMs(1) / 1000} s`)
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: h.clock.now() + waitMs(1),
       waitMs: waitMs(1),
       refusals: 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+    })
+
+    // The next retry's kill answers and its launch succeeds: the kill-failure
+    // cause recorded before keeps the timer out of pending-only mode.
+    h.script({ killError: undefined })
+    await retryNow(h, key)
+
+    expect(callCounts(h)).toEqual({ statusCalls: 3, killCalls: 2, spawnCalls: 1 })
+    expect(row.spawnedAt).toHaveLength(1)
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 2, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 2))
+    expect(h.lines.filter((line) => line.includes(' in pending-only mode'))).toEqual([])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(2),
+      waitMs: waitMs(2),
+      refusals: 2,
       causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
       mode: UNAVAILABLE_RETRY_MODE_FULL,
       lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
@@ -2632,7 +2672,7 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
     h.setConnected(key, true)
     const before = callCounts(h)
     await retryNow(h, key)
-    expect(h.attempts.map((a) => a.mode)).toEqual([UNAVAILABLE_RETRY_MODE_FULL, UNAVAILABLE_RETRY_MODE_FULL])
+    expect(h.attempts.map((a) => a.mode)).toEqual([UNAVAILABLE_RETRY_MODE_FULL, UNAVAILABLE_RETRY_MODE_FULL, UNAVAILABLE_RETRY_MODE_FULL])
     expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
     expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
     expectStopped(h, key)
@@ -2794,23 +2834,25 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expectStopped(h, key)
   })
 
-  test('a start-pass launch whose kill of a live row in another directory is refused UNAVAILABLE, and whose spawn then succeeds, keeps the timer with its due time, its last row read the spawn’s pending', async () => {
-    const h = (harness = makeRecoveryHarness())
+  test('a start-pass launch whose kill of a live row in another directory is refused UNAVAILABLE stops there (no delete, no spawn), answers refused, leaves the condition holding and arms the timer at the base wait, with no row read and no condition end', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key] = h.keys as [string]
     h.script({ ...collided(h, personaOf(h, key), { cwd: h.home }), killError: errTmuxUnresponsive('kill') })
     const armedAt = h.clock.now()
 
-    expect(await h.launch(key)).toEqual({ key, action: 'spawned' })
+    // b.jg5 SRJ-105: the refused kill stops the ladder at once.
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
 
-    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1, killCalls: 1 })
+    expect(getFailureCount(key)).toBe(0)
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
     const lines = conditionLinesOf(h, key)
-    expect(lines).toHaveLength(2)
+    expect(lines).toHaveLength(1)
     expect(lines[0]).toStartWith(`[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} started — kill failed: `)
-    expect(lines[1]).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
-    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-    expect(h.conditionEnds).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'kept' }])
-    expect(retryLinesOf(h, key).at(-1)).toBe(keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING))
+    expect(h.tmuxUnresponsive.holds(key)).toBe(true)
+    expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(armedAt)
+    expect(h.conditionEnds).toEqual([])
+    expect(retryLinesOf(h, key).filter((line) => line.includes(' kept — '))).toEqual([])
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: armedAt + waitMs(0),
@@ -2818,7 +2860,6 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
       refusals: 0,
       causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
       mode: UNAVAILABLE_RETRY_MODE_FULL,
-      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
     })
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([armedAt + waitMs(0)])
   })
@@ -2959,22 +3000,28 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
   ])('a condition that ends after a kill-failure cause, through %s, leaves the timer armed with its due time', async (_what, end, reason, reading) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
-    modelRow(h, 'ended')
-    // A recovery attempt whose kill fails with ErrTmuxKillFailed and whose
-    // launch is then refused UNAVAILABLE: the kill-failure cause, then the
-    // condition's start.
-    h.script({ killError: errTmuxKillFailed(), spawnError: errTmuxUnresponsive('spawn') })
+    const row = modelRow(h, 'ended')
+    // A recovery attempt whose kill fails with ErrTmuxKillFailed: the
+    // kill-failure cause, with no launch after it (b.jg5 SRJ-105).
+    h.script({ killError: errTmuxKillFailed() })
     expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
     await h.settle()
-    h.script({ killError: undefined, spawnError: undefined })
+    expect(row.spawnedAt).toEqual([])
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    // Its retry's kill answers and its launch is refused UNAVAILABLE: the
+    // condition's start, with the kill-failure cause still recorded.
+    h.script({ killError: undefined, spawnError: errTmuxUnresponsive('spawn') })
+    await retryNow(h, key)
+    h.script({ spawnError: undefined })
+    expect(row.spawnedAt).toHaveLength(1)
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }, { key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
     expect(h.tmuxUnresponsive.holds(key)).toBe(true)
     const before = h.controller.view(key)!
     expect(before).toEqual({
       phase: 'waiting',
-      dueAt: h.clock.now() + waitMs(0),
-      waitMs: waitMs(0),
-      refusals: 0,
+      dueAt: h.clock.now() + waitMs(1),
+      waitMs: waitMs(1),
+      refusals: 1,
       causes: [UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
       mode: UNAVAILABLE_RETRY_MODE_FULL,
     })

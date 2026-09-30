@@ -244,7 +244,7 @@ const UNAVAILABLE_FORMS: ReadonlyArray<readonly [string, (verb: string) => Error
 interface TmuxSite {
   readonly name: string
   readonly verb: string
-  script(h: RecoveryHarness, persona: Persona, err: Error, make: (verb: string) => Error): RecoveryStubScript
+  script(h: RecoveryHarness, persona: Persona, err: Error): RecoveryStubScript
 }
 
 const TMUX_SITES: readonly TmuxSite[] = [
@@ -257,11 +257,12 @@ const TMUX_SITES: readonly TmuxSite[] = [
   },
   { name: 'the reconnect of a waiting row', verb: 'send-keys', script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: err }) },
   {
-    // The row is `waiting` (read live) in another directory; its delete fails
-    // too, so no later launch call touches tmux in this launch.
+    // The row is `waiting` (read live) in another directory. The refused kill
+    // stops the ladder at once (b.jg5 SRJ-105): no delete and no spawn follow,
+    // so no later launch call touches tmux in this launch.
     name: 'the replacement kill of a row read live in another directory',
     verb: 'kill',
-    script: (h, p, err, make) => ({ ...collided(h, p, { cwd: h.home, state: 'waiting' }), killError: err, deleteError: make('delete') }),
+    script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home, state: 'waiting' }), killError: err }),
   },
 ]
 
@@ -271,7 +272,7 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
   test.each(cross)('%s at %s inside a launch starts P’s condition at the first refusal’s time; a second refusal keeps it; B’s never starts', async (_what, _site, make, site) => {
     const { h, p, b } = build()
     const firstAt = h.clock.now()
-    h.script(site.script(h, personaOf(h, p), make(site.verb), make))
+    h.script(site.script(h, personaOf(h, p), make(site.verb)))
 
     await h.launch(p)
 

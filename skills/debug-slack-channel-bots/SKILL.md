@@ -86,7 +86,7 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    `startup-errors.log`. One that says `found by a runtime re-check while the
    server was running` is covered under
    [Found while the server was running](#found-while-the-server-was-running).
-5. **The persona's lines show `unavailable-retry` or `Session relaunch refused`?**
+5. **The persona's lines show `unavailable-retry`, `Session relaunch refused`, `Session kill refused` or `no spawn-failure notice; nothing more is called`?**
    agent-director refused it and the server retries it on its own. See
    [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
    **No class line, but the persona still isn't served?** See
@@ -1092,7 +1092,7 @@ once the server has held back from it for 10 min:
 |---|---|
 | `[slack] waitForWaitingAndReconnect: "<name>" (key=<key>) transitioned to state=<state> — aborting;` | The row moved to `pending`, `ask_user` or `check_permission`. |
 | `[slack] waitForWaitingAndReconnect: spawn not found for "<name>" (key=<key>) but tmux session alive — aborting poll;` | The row vanished; the tmux session lives. |
-| `[slack] waitForWaitingAndReconnect: timed out for "<name>" (key=<key>) after <ms>ms — <reason>, tmux session alive;` | After 10 minutes agent-director couldn't report the row. |
+| `[slack] waitForWaitingAndReconnect: timed out for "<name>" (key=<key>) after <ms>ms — <reason>, tmux session alive;` | After 10 minutes agent-director had no row for the persona (`spawn not found`) or answered with a configuration or session-name error (`status error …`), and its tmux session lives. When agent-director couldn't report the row for any other reason, the line is `waitForWaitingAndReconnect: timeout: status read refused for …` instead (see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)). |
 | `[slack] reconnect: gave up waiting for "<name>" (key=<key>) after <ms>ms — claude process state=<state> (alive);` | After 10 minutes the row was still live. A row that reads `waiting` at that point is reconnected instead. |
 
 Removing the persona (or changing it destructively) with a confirmed change
@@ -1540,6 +1540,9 @@ registers again with its history. If the new token is refused too, a new
 When agent-director refuses the calls that bring a persona back (it is
 unreachable, or it answers that it can't act right now), the server doesn't
 count that against the persona's restart limit and doesn't give up on it.
+A refusal posts no `Spawn failure:` notice and writes no `spawn-failed`
+entry to `startup-errors.log`. The launch or restart that met it stops
+there, and nothing more is killed or launched in it.
 Instead it retries the persona on its own: 30 s after the refusal, then after
 60, 120 and 240 s more, then every 300 s, for as long as the refusal lasts.
 It does this whatever `session_restart_delay` and `health_check_interval`
@@ -1561,7 +1564,7 @@ retries' own lines go only to the server log.
 All of one persona's retry lines (replace `ops_bot` with the key):
 
 ```sh
-grep -h -E 'unavailable-retry: persona=ops_bot |Session relaunch refused for persona=ops_bot |Restart retry skipped for persona=ops_bot ' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+grep -h -E 'unavailable-retry: persona=ops_bot |Session relaunch refused for persona=ops_bot |Session kill refused for persona=ops_bot |refused for persona=ops_bot: |refused for "[^"]*" \(key=ops_bot\)|Restart retry skipped for persona=ops_bot ' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
 ```
 
 `<cause>` is `unavailable` (agent-director refused a call), `kill-failed`
@@ -1573,6 +1576,9 @@ error (see [The server log](#the-server-log), Error detail).
 |---|---|---|
 | `[slack] unavailable-retry: persona=<key> armed (<cause>) — first retry in 30 s` | agent-director refused a call while the persona was being launched or recovered, or a restart couldn't read the persona's state (`read-error`). Its first retry is due in 30 s. A refusal while it is already waiting logs nothing and keeps the time. | Nothing. If it keeps retrying, see below. |
 | `[slack] Session relaunch refused for persona=<key> — not counted; its UNAVAILABLE retry timer owns the persona` | A relaunch was refused by agent-director. It doesn't count toward the restart limit; the retries above take over. | Nothing. |
+| `[slack] <step>: <call> refused for "<name>" (key=<key>): <error> — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)` | While the persona was being launched, agent-director refused a call (`<call>` names it, such as `spawn`, `resume`, `kill`, `delete`, `collision get` or `send-keys`), or couldn't report the persona's state (`status read`, or `ErrJsonlMissing diagnosis get`: the read of the persona's old row before replacing a missing transcript). The launch stops there with no `Spawn failure:` notice, no `spawn-failed` entry and nothing counted; nothing is deleted, killed or launched after it. After `ErrJsonlMissing diagnosis get` there is also no `jsonl-diagnosis-inconclusive` entry and no uncertainty warning to the persona: nothing was diagnosed. The retries above take over. The restart path's reconnect logs the same line with `persona=<key>` in place of the name, `reconnectMcp: send-keys refused for persona=<key>: <error> — …`: agent-director refused its keystrokes and the reconnect is not done. A `send-keys refused` line naming `ErrSpawnNotInteractive` and ending `dead session (b.dup)` is not a refusal: the persona's session is gone and it is recovered. | Nothing. If it keeps happening, see **It never clears** below. |
+| `[slack] killSession (restart adapter): kill refused for persona=<key>: <error> — no relaunch follows (b.jg5 SRJ-105)` | A restart's kill of the persona's old session was refused by agent-director, or agent-director couldn't stop the session. The next line follows. | Nothing. |
+| `[slack] Session kill refused for persona=<key> — no relaunch; not counted` | The restart stopped at the refused kill: nothing was relaunched and nothing counts toward the restart limit. The retries above take over. | Nothing. If it keeps happening, see **It never clears** below. |
 | `[slack] unavailable-retry: persona=<key> retry <n> — rerunning its recovery` | Retry `<n>` runs: it reads the persona's state, then reconnects or relaunches it. | Nothing. |
 | `[slack] unavailable-retry: persona=<key> retry <n> (pending-only) — reading its row` | Retry `<n>` runs after a relaunch: it only reads the persona's state, and types nothing and launches nothing. | Nothing. |
 | `[slack] unavailable-retry: persona=<key> retry <n>[ (pending-only)]: <reason> — re-armed[ in <mode> mode], next retry in <s> s` | The retry didn't finish the recovery; the next is due in `<s>` s. ` (pending-only)`: the retry only read the state. ` in pending-only mode`: the next retries only read the state; ` in full mode`: they recover the persona again. `<reason>`: a `<cause>` as above (agent-director still refuses), `launch-in-flight` (a launch for the persona was already running, so the retry did nothing; with or without ` (pending-only)`), `launch-failed` (the relaunch failed and was counted toward the restart limit), `reconnect-deferred` (the instance runs but couldn't be reconnected yet), `pending-deferred` (the instance is still starting, so nothing was typed), `launched` (the relaunch succeeded; the next retries only read the state until the new session has started, unless agent-director refused another call during that retry or a kill failed, when they recover the persona again), `row-pending` (the instance is still starting), `restart-not-initialised` (the server was still starting), `liveness-unknown` (agent-director couldn't report the persona's state, so nothing was done; see [agent-director can't report a persona's state](#agent-director-cant-report-a-personas-state)). A `<cause>` after ` (pending-only)`, with ` in full mode`: agent-director refused another call for the persona while the retry read its state, so the retries go on and the next one recovers the persona again, whatever the state read. `the retry failed: <error>` after ` (pending-only)`: agent-director couldn't report the state; it is usually followed by ` in full mode`, and the next retry recovers the persona again. `the retry failed: <error>`, `the retry gave no answer`, `no cause given` or `unnamed` mean an internal error, and the retries go on. | Nothing while it is agent-director refusing: see below if it never clears. `launch-failed` repeating: read the `Session relaunch failed` and spawn-failure lines for the persona. An internal error that repeats: report it as a bug, with the persona's lines. |

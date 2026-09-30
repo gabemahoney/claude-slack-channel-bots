@@ -153,7 +153,9 @@ import {
 import {
   AD_CALL_KILL_ROW_NOT_READ_LIVE,
   AD_ERROR_CLASS_ENVIRONMENT,
+  AD_VERB_KILL,
   classifyAdError,
+  describeAgentDirectorFailure,
   hasAdErrorName,
 } from './ad-error-class.ts'
 import {
@@ -183,11 +185,14 @@ import {
   cancelRestartTimer,
   isRestartPendingOrActive,
   runRestartRetry,
+  KILL_SESSION_REFUSED,
   RESTART_FAILURE_CAP,
+  type KillSessionResult,
 } from './restart.ts'
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
+  unavailableRetryCauseFor,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
@@ -1156,13 +1161,18 @@ export function _buildStatRouteImpl(deps?: {
  * would (`holdLaunchIfConfigDirUnresolvable`); the launch that follows is then
  * refused by the relaunch gate (`'skipped'`), counting no failure.
  *
+ * b.jg5 SRJ-105: a kill that meets an UNAVAILABLE outcome (by name,
+ * `ErrTmuxKillFailed` included) answers `KILL_SESSION_REFUSED`, and the
+ * restart work launches nothing and counts nothing. Every other kill error is
+ * ignored as before, and the launch follows.
+ *
  * @param getPersona  The applied persona with a key (production:
  *   `getAppliedPersona`); without it the directory is not checked here.
  * @internal
  */
 export function _buildKillSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
-): (key: string) => Promise<void> {
+): (key: string) => Promise<KillSessionResult> {
   // `key` is the persona key.
   return async (key: string) => {
     if (isLaunchInFlight(key)) {
@@ -1185,6 +1195,14 @@ export function _buildKillSessionAdapter(
     } catch (err) {
       if (err instanceof ErrSpawnNotFound) return
       if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return
+      // b.jg5 SRJ-105: an UNAVAILABLE kill (`ErrTmuxKillFailed` included),
+      // classified by name, is a refusal: the restart work launches nothing.
+      if (unavailableRetryCauseFor(err, AD_VERB_KILL) !== undefined) {
+        console.error(
+          `[slack] killSession (restart adapter): kill refused for persona=${key}: ${describeAgentDirectorFailure(err)} — no relaunch follows (b.jg5 SRJ-105)`,
+        )
+        return KILL_SESSION_REFUSED
+      }
       console.error(`[slack] killSession (restart adapter): error for persona=${key}: ${describeThrownValue(err)}`)
     }
   }

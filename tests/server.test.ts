@@ -8,7 +8,11 @@ import {
   sanitizeFilename,
 } from '../src/lib.ts'
 import type { Client } from 'agent-director'
-import { CSCB_UNKNOWN_ERROR_NAME } from '../src/ad-error-class.ts'
+import {
+  AD_CALL_KILL_ROW_READ_LIVE,
+  CSCB_UNKNOWN_ERROR_NAME,
+  describeAgentDirectorFailure,
+} from '../src/ad-error-class.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
@@ -30,6 +34,7 @@ import {
   initOutageState,
   getOutageFlags,
   setOutageFlag,
+  withOutageDetection,
 } from '../src/outage-state.ts'
 import {
   getClient,
@@ -37,6 +42,7 @@ import {
   resetClientForTests,
 } from '../src/agent-director-client.ts'
 import {
+  cannedErr,
   cannedGetResult,
   cannedStatusResult,
   makeCloseCountingStubClient,
@@ -49,8 +55,10 @@ import {
   errSchemaMismatch,
   errSpawnNotFound,
   errSpawnNotInteractive,
+  errSpawnNotResumable,
   errSystemInstallDisappeared,
   errTmuxCaptureFailed,
+  errTmuxKillFailed,
   errTmuxNotAvailable,
   errTmuxSendKeys,
   errTmuxUnresponsive,
@@ -65,6 +73,7 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import {
   _buildIsSessionAliveAdapter,
+  _buildKillSessionAdapter,
   _buildReconnectSessionAdapter,
   _runCallTimeoutStartStep,
   deferPendingRow,
@@ -101,7 +110,14 @@ import {
   setSessionNotifier,
   spawnForPersona,
 } from '../src/session-manager.ts'
-import type { ClientOptions, FindMissingParams, ReadPaneParams, SendKeysParams, StatusParams } from 'agent-director'
+import type { ClientOptions, FindMissingParams, KillParams, ReadPaneParams, SendKeysParams, SendKeysResult, StatusParams } from 'agent-director'
+import { KILL_SESSION_REFUSED, type KillSessionResult } from '../src/restart.ts'
+import {
+  runInAttempt,
+  UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
+  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+} from '../src/unavailable-retry.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
@@ -822,6 +838,59 @@ describe('_buildIsSessionAliveAdapter', () => {
 })
 
 // ---------------------------------------------------------------------------
+// b.jg5 SRJ-105: the UNAVAILABLE forms the restart adapters meet (E10's five).
+// Each is built by name for the verb its call uses. Where the builder takes a
+// description it carries the leak marker inside a fake token and a `ticket=`
+// URL (`sentinelInMessage`), which a described line redacts; `redacted` says
+// the described line shows the redaction. An `ErrUnknownErrorName`'s own
+// description is the client's, so its envelope's marked text is never logged.
+// ---------------------------------------------------------------------------
+
+/** [label, builder (by verb), described line shows the redacted marker, the retry cause kind a kill arms]. */
+const UNAVAILABLE_FORMS: ReadonlyArray<readonly [string, (verb: string) => Error, boolean, string]> = [
+  [
+    'ErrUnknownErrorName (a name from a later binary)',
+    () => errUnknownErrorName('ErrFromALaterBinary', `a later failure (${sentinelInMessage('unknown-name')})`),
+    false,
+    UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  ],
+  ['ErrCallTimeout', (verb) => errCallTimeout(verb), false, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+  [
+    'a wrapped UnknownError',
+    (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME, `Error: boom (${sentinelInMessage('wrapped')})`),
+    true,
+    UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  ],
+  [
+    'ErrTmuxUnresponsive (by name)',
+    (verb) => errTmuxUnresponsive(verb, `tmux did not answer (${sentinelInMessage('unresponsive')})`),
+    true,
+    UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  ],
+  ['ErrTmuxKillFailed (by name)', () => errTmuxKillFailed(), false, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+]
+
+/** Every `console.error` argument list `fn` writes, kept unformatted (console restored after). */
+async function capturingErrorArgs<T>(fn: () => Promise<T>): Promise<{ result: T; errArgs: unknown[][] }> {
+  const errArgs: unknown[][] = []
+  const orig = console.error
+  console.error = (...args: unknown[]) => { errArgs.push(args) }
+  try {
+    return { result: await fn(), errArgs }
+  } finally {
+    console.error = orig
+  }
+}
+
+/** The lines `errArgs` holds, each argument a string (a raw error or object fails). */
+function stringLines(errArgs: unknown[][]): string[] {
+  return errArgs.map((args) => {
+    for (const a of args) expect(typeof a).toBe('string')
+    return args.join(' ')
+  })
+}
+
+// ---------------------------------------------------------------------------
 // _buildReconnectSessionAdapter (b.9a7 — working-state defer gate)
 //
 // The adapter probes AD state via withOutageDetection().status() before typing
@@ -872,6 +941,8 @@ describe('_buildReconnectSessionAdapter', () => {
     /** When set, each status probe rejects with it instead (read at each probe). */
     statusError?: Error
     sendKeysThrows?: Error
+    /** Errors the send-keys calls answer in turn, before `sendKeysThrows` or success. */
+    sendKeysErrors?: Error[]
     tmux?: 'alive' | 'gone' | 'probe-error'
     /** What every pane read shows (default: the stub's empty pane). */
     pane?: string
@@ -913,6 +984,7 @@ describe('_buildReconnectSessionAdapter', () => {
       sendKeysCalls,
       sendKeysError: opts.sendKeysThrows,
       sendKeysResult: opts.sendKeysThrows ? undefined : {},
+      sendKeysQueue: opts.sendKeysErrors?.map((e) => cannedErr<SendKeysResult>(e)),
       // The escalate-dead sweep (reconcileMissingSweep → client.findMissing({}))
       // flows through this SAME stub client. `findMissingCalls` is the observable
       // seam for "was the memoized sweep triggered".
@@ -1175,6 +1247,79 @@ describe('_buildReconnectSessionAdapter', () => {
     // reconcileMissingSweep → exactly ONE client.findMissing({}). No direct new
     // findMissing call site; the memoized helper is the only sweep mechanism.
     expect(findMissingCalls).toHaveLength(1)
+  })
+
+  // b.jg5 SRJ-105: an UNAVAILABLE `send-keys` (at the first try, or at the
+  // retry after ErrTmuxSendKeys) is a refusal: 'transient', never
+  // 'escalate-dead', no sweep and no spawn-failure notice. One refusal line
+  // describes the error (never the raw value); nothing leaks.
+  /** reconnectMcp's refusal line for persona C1, for the call `what`. */
+  const sendKeysRefusedLine = (what: string, err: unknown): string =>
+    `[slack] reconnectMcp: ${what} refused for persona=C1: ${describeAgentDirectorFailure(err)} — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)`
+
+  /** Run the adapter for C1 over `opts`, capturing notices and console.error. */
+  async function reconnectCapturing(opts: Parameters<typeof makeHarness>[0]) {
+    const raised: string[] = []
+    setSessionNotifier((key) => { raised.push(key) })
+    try {
+      const h = makeHarness(opts)
+      const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
+      return { ...h, result, errArgs, raised }
+    } finally {
+      setSessionNotifier(undefined)
+    }
+  }
+
+  test.each(UNAVAILABLE_FORMS)("SRJ-105: send-keys refused with %s → 'transient', never 'escalate-dead'; one send-keys, no sweep, no spawn-failure notice; one described refusal line, nothing leaks", async (_label, build, redacted) => {
+    const err = build('send-keys')
+
+    const { result, errArgs, raised, sendKeysCalls, findMissingCalls } = await reconnectCapturing({ statusState: 'waiting', sendKeysThrows: err })
+
+    expect(result).toBe('transient')
+    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(findMissingCalls).toHaveLength(0)
+    expect(raised).toEqual([])
+    const lines = stringLines(errArgs)
+    expect(lines.filter((l) => l.startsWith('[slack] reconnectMcp:'))).toEqual([sendKeysRefusedLine('send-keys', err)])
+    expect(lines.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
+    if (redacted) expect(lines.join('\n')).toContain(REDACTED_SENTINEL_TAIL)
+    assertNoLeak({ errArgs })
+  })
+
+  test.each(UNAVAILABLE_FORMS)("SRJ-105: ErrTmuxSendKeys, then the retry refused with %s → 'transient', never 'escalate-dead'; two send-keys, no sweep, no spawn-failure notice; one described refusal line, nothing leaks", async (_label, build, redacted) => {
+    const err = build('send-keys')
+
+    const { result, errArgs, raised, sendKeysCalls, findMissingCalls } = await reconnectCapturing({
+      statusState: 'waiting',
+      sendKeysErrors: [errTmuxSendKeys(), err],
+    })
+
+    expect(result).toBe('transient')
+    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1'), personaInstanceId('C1')])
+    expect(findMissingCalls).toHaveLength(0)
+    expect(raised).toEqual([])
+    const lines = stringLines(errArgs)
+    expect(lines.filter((l) => l.includes(' refused for persona=C1'))).toEqual([
+      sendKeysRefusedLine('retry send-keys after ErrTmuxSendKeys', err),
+    ])
+    expect(lines.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
+    if (redacted) expect(lines.join('\n')).toContain(REDACTED_SENTINEL_TAIL)
+    assertNoLeak({ errArgs })
+  })
+
+  // Another class keeps today's handling: an UNCLASSIFIED send-keys error
+  // (not UNAVAILABLE) still raises the spawn-failure notice and answers
+  // 'transient', with no refusal line (the contrast that shows the notice
+  // spy above is live).
+  test("SRJ-105 contrast: send-keys answering an UNCLASSIFIED error (ErrInternal) keeps today's handling → 'transient' with one spawn-failure notice and no refusal line", async () => {
+    const { result, errArgs, raised, findMissingCalls } = await reconnectCapturing({ statusState: 'waiting', sendKeysThrows: errInternal() })
+
+    expect(result).toBe('transient')
+    expect(findMissingCalls).toHaveLength(0)
+    expect(raised).toEqual(['C1'])
+    const lines = stringLines(errArgs)
+    expect(lines.filter((l) => l.includes(' refused for '))).toEqual([])
+    expect(lines.filter((l) => l.startsWith('[slack] reconnectMcp: send-keys failed for persona=C1: '))).toHaveLength(1)
   })
 
   // b.dup: agent-director refuses send-keys to an `ended` or `missing` row
@@ -1696,6 +1841,222 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.findMissingCalls).toHaveLength(1)
       expect(raised.map((n) => n.key)).toEqual(['C1', 'C1'])
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// _buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-105)
+//
+// The restart work's kill adapter, run inside a recovery attempt for the
+// persona as `runRestartWork` runs it. An UNAVAILABLE kill (by name,
+// `ErrTmuxKillFailed` included) answers `KILL_SESSION_REFUSED` with one
+// described line, so the restart work launches nothing; success and
+// `ErrSpawnNotFound` answer nothing ("go on"); the outage-class branches and
+// every other class keep today's handling (go on). The kill follows a `dead`
+// reading, so it is declared as not of a row read live: not tmux-touching, it
+// never starts (or, on success, ends) the `tmux-unresponsive` condition. The
+// outage state's trigger and condition sinks are spies.
+// ---------------------------------------------------------------------------
+
+describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-105)', () => {
+  let dir: string
+  let killCalls: KillParams[]
+  let triggers: Array<{ key: string; kind: string }>
+  let starts: Array<{ key: string; verb: string }>
+  let ends: string[]
+  let emissions: Array<{ key: string; text: string }>
+
+  /** The adapter's refusal line for persona C1. */
+  const refusedLine = (err: unknown): string =>
+    `[slack] killSession (restart adapter): kill refused for persona=C1: ${describeAgentDirectorFailure(err)} — no relaunch follows (b.jg5 SRJ-105)`
+
+  /** Install a stub whose `kill` answers `killError` (default: success), with spy sinks. */
+  function install(killError?: Error): StubClient {
+    const stub = makeStubClient({ killCalls, killError })
+    _resetOutageState()
+    initOutageState({
+      notify: (key, text) => { emissions.push({ key, text }) },
+      getClient: () => stub as unknown as Client,
+      triggerSink: { arm: (key, cause) => { triggers.push({ key, kind: cause.kind }); return true } },
+      conditionSink: {
+        start: (key, verb) => { starts.push({ key, verb }) },
+        end: (key) => { ends.push(key) },
+      },
+    })
+    setClientForTests(stub as unknown as Client)
+    return stub
+  }
+
+  /** Run the adapter for `key` inside a recovery attempt, capturing console.error. */
+  function killInAttempt(
+    key: string = 'C1',
+    getPersona?: (key: string) => Persona | undefined,
+  ): Promise<{ result: KillSessionResult; errArgs: unknown[][] }> {
+    return capturingErrorArgs(() => runInAttempt(key, 'recovery', () => _buildKillSessionAdapter(getPersona)(key)))
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'server-kill-'))
+    killCalls = []
+    triggers = []
+    starts = []
+    ends = []
+    emissions = []
+  })
+
+  afterEach(() => {
+    resetClientForTests()
+    _resetOutageState()
+    _resetInFlightLaunches()
+    _resetSpawnHomeDir()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test.each(UNAVAILABLE_FORMS)('kill refused with %s → KILL_SESSION_REFUSED; one kill, one described refusal line; the timer is armed, no condition starts, nothing posted or leaked', async (_label, build, redacted, causeKind) => {
+    const err = build('kill')
+    install(err)
+
+    const { result, errArgs } = await killInAttempt()
+
+    expect(result).toBe(KILL_SESSION_REFUSED)
+    expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    const lines = stringLines(errArgs)
+    expect(lines).toEqual([refusedLine(err)])
+    if (redacted) expect(lines[0]).toContain(REDACTED_SENTINEL_TAIL)
+    expect(triggers).toEqual([{ key: 'C1', kind: causeKind }])
+    expect(starts).toEqual([])
+    expect(ends).toEqual([])
+    expect(emissions).toEqual([])
+    expect(getOutageFlags('C1').size).toBe(0)
+    assertNoLeak({ errArgs, emissions })
+  })
+
+  // Non-vacuity for "no condition starts": the same refusal from a kill
+  // declared of a row read live, in the same attempt, does start it. The
+  // adapter's declaration (not read live) is what keeps it from starting.
+  test('control: ErrTmuxUnresponsive from a kill declared of a row read live starts the condition; the adapter\'s kill of the same error does not', async () => {
+    const err = errTmuxUnresponsive('kill')
+    install(err)
+
+    await runInAttempt('C1', 'recovery', () =>
+      expect(withOutageDetection('C1', undefined, AD_CALL_KILL_ROW_READ_LIVE, () => Promise.reject(err))).rejects.toBe(err),
+    )
+    expect(starts).toEqual([{ key: 'C1', verb: 'kill' }])
+
+    const { result } = await killInAttempt()
+    expect(result).toBe(KILL_SESSION_REFUSED)
+    expect(starts).toHaveLength(1)
+  })
+
+  test('kill succeeds → answers nothing (go on); no line, nothing armed; no condition started or ended (not tmux-touching)', async () => {
+    install()
+
+    const { result, errArgs } = await killInAttempt()
+
+    expect(result).toBeUndefined()
+    expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(errArgs).toEqual([])
+    expect(triggers).toEqual([])
+    expect(starts).toEqual([])
+    expect(ends).toEqual([])
+  })
+
+  test('kill answers ErrSpawnNotFound → answers nothing (go on); no line, nothing armed, no condition', async () => {
+    install(errSpawnNotFound())
+
+    const { result, errArgs } = await killInAttempt()
+
+    expect(result).toBeUndefined()
+    expect(killCalls).toHaveLength(1)
+    expect(errArgs).toEqual([])
+    expect(triggers).toEqual([])
+    expect(starts).toEqual([])
+  })
+
+  // The outage-class branches are unchanged: the flag is raised by the
+  // wrapper and the adapter goes on, with no refusal line.
+  test.each([
+    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('kill'), 'ad-unreachable'],
+    ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill'), 'tmux-unavailable'],
+  ] as const)('kill answers %s → answers nothing (go on); its outage flag is raised; no refusal line, no condition', async (_label, build, flag) => {
+    install(build())
+
+    const { result, errArgs } = await killInAttempt()
+
+    expect(result).toBeUndefined()
+    expect(killCalls).toHaveLength(1)
+    expect(getOutageFlags('C1').has(flag)).toBe(true)
+    expect(stringLines(errArgs).filter((l) => l.includes('kill refused'))).toEqual([])
+    expect(starts).toEqual([])
+  })
+
+  // Every other class keeps today's handling: one "error for persona" line
+  // and the launch follows (nothing answered); a kill is no read, so nothing
+  // is armed either.
+  test.each([
+    ['an UNCLASSIFIED ErrInternal', () => errInternal()],
+    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed()],
+    ['an UNUSABLE NAME ErrInternal', () => errUnusableName()],
+    ['a STATE name (ErrSpawnNotResumable)', () => errSpawnNotResumable()],
+    ['a GONE name (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(undefined, 'kill')],
+  ])("kill answers %s → today's handling: answers nothing (go on) with one error line; nothing armed, no condition", async (_label, build) => {
+    const err = build()
+    install(err)
+
+    const { result, errArgs } = await killInAttempt()
+
+    expect(result).toBeUndefined()
+    expect(killCalls).toHaveLength(1)
+    expect(stringLines(errArgs)).toEqual([
+      `[slack] killSession (restart adapter): error for persona=C1: ${describeThrownValue(err)}`,
+    ])
+    expect(triggers).toEqual([])
+    expect(starts).toEqual([])
+    assertNoLeak({ errArgs })
+  })
+
+  // The guards run first and are unchanged: with a kill that would be
+  // refused, a launch in flight or an unresolvable claude_config_dir still
+  // skips the kill and answers nothing.
+  test('launch in flight: no kill (the skip line only) and nothing answered, even with a kill that would be refused', async () => {
+    mkdirSync(join(dir, 'home', '.claude'), { recursive: true })
+    _setSpawnHomeDir(join(dir, 'home'))
+    const config = makeStandInPersonaConfig({ C1: {} }, dir)
+    const stub = install(errTmuxUnresponsive('kill'))
+    const held = holdSpawns(stub)
+    const launch = spawnForPersona(config.personas[0]!, config, false)
+    try {
+      await held.entered(personaInstanceId('C1'))
+      expect(isLaunchInFlight('C1')).toBe(true)
+
+      const { result, errArgs } = await killInAttempt()
+
+      expect(result).toBeUndefined()
+      expect(killCalls).toEqual([])
+      expect(stringLines(errArgs)).toEqual([
+        '[slack] killSession (restart adapter): launch already in flight for persona=C1 — not killing',
+      ])
+    } finally {
+      held.releaseAll()
+      await launch
+    }
+  })
+
+  test('claude_config_dir cannot be resolved: no kill and nothing answered, even with a kill that would be refused', async () => {
+    const dangling = join(dir, 'dangling-config')
+    symlinkSync(join(dir, 'nowhere'), dangling)
+    const persona = makeStandInPersonaConfig({ C1: { claude_config_dir: dangling } }, dir).personas[0]!
+    install(errTmuxUnresponsive('kill'))
+
+    const { result, errArgs } = await killInAttempt('C1', (k) => (k === 'C1' ? persona : undefined))
+
+    expect(result).toBeUndefined()
+    expect(killCalls).toEqual([])
+    const lines = stringLines(errArgs)
+    expect(lines).toContain(
+      '[slack] killSession (restart adapter): persona=C1 claude_config_dir cannot be resolved to a real path — not killing; its row is kept',
+    )
+    expect(lines.filter((l) => l.includes('kill refused'))).toEqual([])
   })
 })
 

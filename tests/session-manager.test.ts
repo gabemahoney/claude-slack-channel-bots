@@ -32,6 +32,27 @@
  *     FAILURE or DIRECTORY spawn, or no sink at all, marks nothing
  *     (`launchSession` false); a joiner shares the marker; a start pass with
  *     one UNAVAILABLE persona tallies as before and arms only that persona.
+ *   - b.jg5 SRJ-105 (AC 25), on `makeRecoveryHarness`: every spawn, resume,
+ *     replacement kill and delete, and reconnect keystroke (first try and the
+ *     `ErrTmuxSendKeys` retry) of the ladder, fed `ErrUnknownErrorName`,
+ *     `ErrCallTimeout`, a wrapped `UnknownError`, `ErrTmuxUnresponsive` and
+ *     (at kills and deletes) `ErrTmuxKillFailed`, makes no kill, delete or
+ *     launch after it and no dead-session resume, posts no spawn-failure
+ *     notice, records no `spawn-failed` entry, answers `{ failed, refused }`
+ *     (`launchSession` `'refused'`) and is never counted; B launches as
+ *     before. The read-error row: the collision `get` and the working-row
+ *     wait's poll and timeout `status`, fed those forms, an UNCLASSIFIED read
+ *     error and a store that cannot be opened, likewise, and start no
+ *     condition; `ErrSpawnNotFound` keeps each site's meaning, and only a
+ *     CONFIG or UNUSABLE NAME answer still reaches the timeout's tmux
+ *     fallback. E8's hatch note: a refused kill on each replace path is
+ *     followed by no delete or launch, also through the restart path's retry
+ *     (`runRestartRetry`), with the failure count at 0. The
+ *     `ErrSpawnNotResumable` kill is declared a kill of a row read live. The
+ *     approver's pane read and Enter, the working-row pane read and the
+ *     persona teardown's kill keep their outcomes. At most one onset across
+ *     several retries past the floor; none for a refusal that clears, or for
+ *     `ErrTmuxKillFailed`.
  *   - b.jg5 SRJ-303 / SRJ-115 the retry timer's row read
  *     (`readPersonaRowState`): one `status` call for `cscb_<key>` and no
  *     other, answering each state as is (`pending` included), a `pending`
@@ -219,6 +240,7 @@ import {
   notifyPersonaNotConnected,
   type ConfigDirUnresolvableHook,
   type NotConnectedNotice,
+  type SpawnPersonaResult,
   type StartupPersonaOutcome,
   type UndeliverableCause,
   type WorkingPaneReading,
@@ -268,7 +290,7 @@ import {
   writtenFile,
 } from './test-helpers/credentials.ts'
 import { MCP_SERVER_NAME, type Persona, type PersonaConfig, resolveRealPath } from '../src/config.ts'
-import { PERSONA_INSTANCE_ID_PREFIX, configDirLabelValue, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { PERSONA_INSTANCE_ID_PREFIX, configDirLabelValue, personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import {
   cannedGetResult,
@@ -293,6 +315,12 @@ import {
   errInvalidFlags,
   errInternal,
   errTmuxUnresponsive,
+  errConfigMalformed,
+  errUnusableName,
+  errCallTimeout,
+  errSchemaMismatch,
+  errTmuxKillFailed,
+  errUnknownErrorName,
   holdSpawns,
   makeStubCallLog,
   makeStubClient,
@@ -350,8 +378,22 @@ import {
   ErrSpawnNotFound,
 } from '../src/agent-director-errors.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
-import { RESTART_FAILURE_CAP, type LaunchSessionResult } from '../src/restart.ts'
-import { AD_ERROR_CLASS_UNCLASSIFIED } from '../src/ad-error-class.ts'
+import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
+import { RESTART_FAILURE_CAP, RESTART_OUTCOME_REFUSED, runRestartRetry, type LaunchSessionResult } from '../src/restart.ts'
+import { AD_ERROR_CLASS_UNCLASSIFIED, CSCB_UNKNOWN_ERROR_NAME } from '../src/ad-error-class.ts'
+import { adAlertThresholdMsInEffect } from '../src/ad-settings.ts'
+import { getFailureCount } from '../src/backoff.ts'
+import {
+  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
+  TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
+  tmuxUnresponsiveOnsetText,
+} from '../src/persona-episodes.ts'
+import {
+  makeRecoveryHarness,
+  type RecoveryHarness,
+  type RecoveryHarnessOptions,
+  type RecoveryStubScript,
+} from './test-helpers/recovery-harness.ts'
 import {
   installAdVersionRecheck,
   RECHECK_OUTCOME_COULD_NOT_RUN,
@@ -364,6 +406,7 @@ import {
   createUnavailableRetryController,
   runInAttempt,
   UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_ROW_ABSENT,
@@ -5376,19 +5419,22 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(probed).toEqual([]) // process verdict is authoritative; tmux never consulted
   })
 
-  // b.ecw: at the TIMEOUT CALL AD reports a status error — either ErrSpawnNotFound
-  // (no row to reconcile) or any other status error (an AD outage at the deadline).
-  // Either way CSCB must NOT manufacture a verdict from the AD gap; it falls back
-  // to the raw tmux probe (b.rmy invariant): tmux gone → dead-session, tmux alive
-  // → not-reconnected (b.f2b; 'ok' before). The poll loop stays `working` and
-  // exits on the deadline; only the timeout
-  // status call throws (TTL=0 makes the timeout sweep bump findMissingCalls to 2,
-  // which flips statusFn into its error branch).
+  // b.ecw: at the TIMEOUT CALL AD reports a status error that still falls back
+  // to the raw tmux probe (b.rmy invariant): ErrSpawnNotFound (no row to
+  // reconcile, E18 owns it), and a CONFIG or UNUSABLE NAME answer, which keep
+  // this handling until E12 and E16 build their rows. tmux gone →
+  // dead-session, tmux alive → not-reconnected (b.f2b; 'ok' before). Any other
+  // read error no longer reaches the probe (b.jg5 SRJ-105, the case after
+  // this one). The poll loop stays `working` and exits on the deadline; only
+  // the timeout status call throws (TTL=0 makes the timeout sweep bump
+  // findMissingCalls to 2, which flips statusFn into its error branch).
   test.each([
     ['ErrSpawnNotFound', () => errSpawnNotFound(), false, 'dead-session'],
     ['ErrSpawnNotFound', () => errSpawnNotFound(), true, 'not-reconnected'],
-    ['generic status error', () => errGeneric('status', 'ErrTimeout'), true, 'not-reconnected'],
-    ['generic status error', () => errGeneric('status', 'ErrTimeout'), false, 'dead-session'],
+    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), true, 'not-reconnected'],
+    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), false, 'dead-session'],
+    ['an UNUSABLE NAME answer', () => errUnusableName(), true, 'not-reconnected'],
+    ['an UNUSABLE NAME answer', () => errUnusableName(), false, 'dead-session'],
   ] as const)(
     'timeout with %s + tmux %s → %s (tmux fallback)',
     async (_label, errorFactory, tmuxAlive, expected) => {
@@ -5411,6 +5457,129 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
       expect(probed).toEqual(['slack_bot_C']) // fell back to tmux
     },
   )
+
+  // b.jg5 SRJ-105: any other read error at the TIMEOUT CALL (an UNCLASSIFIED
+  // `ErrTimeout` here, an UNAVAILABLE one alike) is handled as UNAVAILABLE:
+  // 'failed', whatever tmux shows. It never reaches the tmux probe, so it can
+  // never give 'dead-session', and it types nothing and posts no notice.
+  test.each([true, false])('b.jg5 SRJ-105: timeout with an UNCLASSIFIED status error (ErrTimeout) + tmux alive=%p → failed, tmux NOT probed, nothing typed, no notice', async (tmuxAlive) => {
+    _setWaitForWaitingTimeoutMs(30)
+    _setFindMissingMemoTtlMs(0)
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return tmuxAlive })
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      findMissingCalls,
+      sendKeysCalls,
+      findMissingResult: cannedFindMissing(),
+      statusFn: () =>
+        findMissingCalls.length >= 2
+          ? errGeneric('status', 'ErrTimeout')
+          : ({ state: 'working' } as import('agent-director').StatusResult),
+    })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', cfg)
+    })
+
+    expect(result).toBe('failed')
+    expect(probed).toEqual([])
+    expect(sendKeysCalls).toEqual([])
+    expect(findMissingCalls).toHaveLength(2)
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, 'waitForWaitingAndReconnect: timeout: status read refused for persona=C')).toHaveLength(1)
+  })
+
+  // b.jg5 SRJ-105: ErrSystemInstallDisappeared and ErrTmuxNotAvailable at the
+  // TIMEOUT CALL take the poll loop's early 'failed' (one rule at both reads):
+  // never the tmux fallback, never 'dead-session', and not a refusal.
+  const TIMEOUT_EARLY_FAILED_ERRORS = [
+    ['ErrSystemInstallDisappeared', () => new ErrSystemInstallDisappeared('status', '/usr/bin/agent-director')],
+    ['ErrTmuxNotAvailable', () => new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not available')],
+  ] as const
+
+  test.each(TIMEOUT_EARLY_FAILED_ERRORS)('b.jg5 SRJ-105: timeout with %s → failed, tmux NOT probed, nothing typed, not refused', async (_label, errorFactory) => {
+    _setWaitForWaitingTimeoutMs(30)
+    _setFindMissingMemoTtlMs(0)
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return false }) // gone: the fallback would say dead-session
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      findMissingCalls,
+      sendKeysCalls,
+      findMissingResult: cannedFindMissing(),
+      statusFn: () =>
+        findMissingCalls.length >= 2 ? errorFactory() : ({ state: 'working' } as import('agent-director').StatusResult),
+    })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', cfg)
+    })
+
+    expect(result).toBe('failed')
+    expect(probed).toEqual([])
+    expect(sendKeysCalls).toEqual([])
+    expect(findMissingCalls).toHaveLength(2) // the deadline's read decided, not the poll
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, 'status read refused for persona=C')).toEqual([])
+  })
+
+  // The ladder's working branch treats both reads alike: 'failed', no
+  // dead-session recovery (no kill, delete, resume or launch), no tmux probe,
+  // not refused, and one `spawn-failed` "reconnect failed (state=working)"
+  // entry at a startup launch.
+  test.each(
+    TIMEOUT_EARLY_FAILED_ERRORS.flatMap(([label, errorFactory]) =>
+      (['poll', 'timeout'] as const).map((read) => [label, read, errorFactory] as const),
+    ),
+  )('b.jg5 SRJ-105: spawnForPersona working branch, %s at the wait\'s %s status read → failed, no probe, no kill/delete/resume/launch, one spawn-failed entry', async (_label, read, errorFactory) => {
+    const readLog = captureStartupErrors()
+    _setWaitForWaitingTimeoutMs(30)
+    _setFindMissingMemoTtlMs(0)
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return false })
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const killCalls: import('agent-director').KillParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+    // The poll read fails at once; the timeout read fails only after the
+    // deadline's fresh sweep (this launch's second).
+    const failsAt = read === 'poll' ? 1 : 2
+    installStub({
+      findMissingCalls,
+      spawnCalls,
+      killCalls,
+      deleteCalls,
+      resumeCalls,
+      sendKeysCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: personaRow(cfg, 'C', { state: 'working' }),
+      findMissingResult: cannedFindMissing(),
+      statusFn: () =>
+        findMissingCalls.length >= failsAt ? errorFactory() : ({ state: 'working' } as import('agent-director').StatusResult),
+    })
+
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    expect(result).toEqual({ key: 'C', action: 'failed' }) // no refusal marker
+    expect(findMissingCalls).toHaveLength(failsAt)
+    expect(probed).toEqual([])
+    expect(sendKeysCalls).toEqual([])
+    expect(killCalls).toEqual([])
+    expect(deleteCalls).toEqual([])
+    expect(resumeCalls).toEqual([])
+    expect(spawnCalls).toHaveLength(1) // only the initial colliding spawn
+    expect(onlyStartupEntry(readLog(), 'spawn-failed')).toEndWith(`] [spawn-failed] reconnect failed for ${renderPersonaRef('C', 'C')} (state=working)`)
+  })
 
   // b.ecw: the poll loop's ended/missing branch aborts early. `statusFn` flips to
   // `missing` on the FIRST poll after the up-front sweep (findMissingCalls >= 1),
@@ -6928,8 +7097,11 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     ['the row moving to ask_user', { state: 'ask_user', pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Waiting on a prompt*', 'Automatic restarts are disabled (`session_restart_delay` is 0)', undefined],
     ['agent-director losing the row while its tmux session lives', { state: errSpawnNotFound(), pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Not connected*', '(agent-director has no record of its session, though its tmux session is alive)', undefined],
     [
-      'the deadline\'s status call failing while its tmux session lives (the tmux fallback)',
-      { state: (r) => (r.findMissingCalls.length % 2 === 0 ? errGeneric('status', 'ErrTimeout') : 'working'), pane: SPINNER_PANE, stepMs: 60_000 },
+      // Only a CONFIG or UNUSABLE NAME answer still reaches the tmux fallback
+      // (until E12 and E16); any other read error is a refusal (b.jg5
+      // SRJ-105, the case after these).
+      'the deadline\'s status call failing with a CONFIG answer while its tmux session lives (the tmux fallback)',
+      { state: (r) => (r.findMissingCalls.length % 2 === 0 ? errConfigMalformed() : 'working'), pane: SPINNER_PANE, stepMs: 60_000 },
       ':warning: *Not connected*',
       '(agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it)',
       undefined,
@@ -6982,6 +7154,36 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     }
     expect(errLog).not.toContain('nothing will reconnect it')
     expect(errLog).toMatch(/; the health check (recovers|reconnects|reads|schedules) /)
+  })
+
+  test.each([0, 60])('b.jg5 SRJ-105: session_restart_delay %d and the deadline\'s status call failing with an UNCLASSIFIED error (ErrTimeout) while its tmux session lives → failed, never the tmux fallback: nothing typed, no notice for the deadline\'s read (only the poll\'s unproven-idle one, once), one refusal line per wait', async (delay) => {
+    _setFindMissingMemoTtlMs(0)
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return true })
+    const cfg = waitConfig({ session_restart_delay: delay })
+    const row = installWorkingRow(clock, {
+      state: (r) => (r.findMissingCalls.length % 2 === 0 ? errGeneric('status', 'ErrTimeout') : 'working'),
+      pane: SPINNER_PANE,
+      stepMs: 60_000,
+    })
+
+    const results: string[] = []
+    const errLog = await withCapturedErr(async () => {
+      results.push(await waitForWaitingAndReconnect('C', cfg))
+      results.push(await waitForWaitingAndReconnect('C', cfg))
+    })
+
+    expect(results).toEqual(['failed', 'failed'])
+    expect(row.sendKeysCalls).toEqual([])
+    expect(probed).toEqual([])
+    // The polls held back from the `working` row for 10 min, which raises the
+    // unproven-idle notice once for the episode; the deadline's failed read
+    // adds no notice (not the tmux fallback's "could not report its state").
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(notices[0]!.text).toContain(UNPROVEN_IDLE_CLAIM)
+    expect(notices[0]!.text).not.toContain('could not report its state')
+    expect(linesWith(errLog, 'waitForWaitingAndReconnect: timeout: status read refused for persona=C')).toHaveLength(2)
+    expect(errLog).not.toContain('nothing will reconnect it')
   })
 
   test.each<[number, string]>([
@@ -9191,7 +9393,9 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // b.fwu case (a): the diagnostic get() rejects → the row cannot be consulted,
   // so we cannot classify loss vs never-created. Must not throw; the amnesia
   // fresh-spawn still completes, now bucketed as the dedicated
-  // 'fresh-after-inconclusive-amnesia' action.
+  // 'fresh-after-inconclusive-amnesia' action. b.jg5 SRJ-105: only an answer
+  // that is not a read error reaches it (`ErrSpawnNotFound`, a CONFIG answer,
+  // an UNUSABLE NAME answer); here an UNUSABLE NAME answer.
   test('inconclusive (a): diagnostic row fetch fails → no throw, fresh-after-inconclusive-amnesia', async () => {
     captureStartupErrors()
     const spawnCalls: import('agent-director').SpawnParams[] = []
@@ -9211,7 +9415,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     let getCalls = 0
     stub.get = async (params) => {
       getCalls++
-      if (getCalls >= 2) throw errGeneric('get', 'ErrSpawnGone')
+      if (getCalls >= 2) throw errUnusableName()
       return personaRowsGet(cfg, { state: 'ended' })(params)
     }
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
@@ -9232,7 +9436,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 
   // (a) row-fetch failure, driven through startupSessionManager so the counter
   // is observable. The diagnostic get() (second get) rejects; the collision
-  // recovery get() (first) succeeds so the amnesia path is reached at all.
+  // recovery get() (first) succeeds so the amnesia path is reached at all. The
+  // diagnostic get answers CONFIG, which is not a read error (b.jg5 SRJ-105).
   test('inconclusive (a) via startup: row fetch fails → counter + jsonl-diagnosis-inconclusive record', async () => {
     const readLog = captureStartupErrors()
     const stub = installStub({
@@ -9246,7 +9451,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     let getCalls = 0
     stub.get = async (params) => {
       getCalls++
-      if (getCalls >= 2) throw errGeneric('get', 'ErrSpawnGone')
+      if (getCalls >= 2) throw errConfigMalformed()
       return personaRowsGet(cfg, { state: 'ended' })(params)
     }
     const result = await startupSessionManager(cfg, { concurrency: 1 })
@@ -9259,23 +9464,111 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(log).toContain('could not fetch the agent-director row')
   })
 
-  // AC 20 (b.av2 SR-10.3): the row-fetch failure is named by
-  // describeAgentDirectorFailure — an agent-director error's errName and
-  // redacted description when the errName is a short identifier, else
-  // describeThrownValue (type, safe code, redacted message, frames) — in the
-  // log line, startup-errors.log and the persona notice alike; never the
-  // thrown value's raw message or description, which carry fake tokens here.
+  /**
+   * Stub an ErrJsonlMissing launch of CH: the collision get (the first get)
+   * reads an `ended` row, the resume answers ErrJsonlMissing(`jsonlDescription`)
+   * and the diagnostic get (every later get) throws `makeErr()`. Records the
+   * spawns and deletes in `calls`.
+   */
+  function installDiagnosisGetFailure(
+    cfg: PersonaConfig,
+    makeErr: () => unknown,
+    calls: { spawnCalls: import('agent-director').SpawnParams[]; deleteCalls: import('agent-director').DeleteParams[] },
+    jsonlDescription?: string,
+  ): void {
+    const stub = installStub({
+      spawnCalls: calls.spawnCalls,
+      deleteCalls: calls.deleteCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      resumeError: errJsonlMissing(jsonlDescription),
+    })
+    let getCalls = 0
+    stub.get = async (params) => {
+      getCalls++
+      if (getCalls >= 2) throw makeErr()
+      return personaRowsGet(cfg, { state: 'ended' })(params)
+    }
+  }
+
+  /** Run `fn` with console.error captured as argument lists; restores it after. */
+  async function withErrArgs(fn: () => Promise<void>): Promise<unknown[][]> {
+    const errArgs: unknown[][] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    try {
+      await fn()
+    } finally {
+      console.error = orig
+    }
+    return errArgs
+  }
+
   const quoted = (text: string): string => `message=${JSON.stringify(text)}`
+  /**
+   * How describeAgentDirectorFailure names an `ErrUnknownErrorName` (the form
+   * a CONFIG or UNUSABLE NAME answer takes): its errName and the client's own
+   * description; the envelope's description is not shown.
+   */
+  const unknownNameShown = (err: { errName: string; errDescription: string }): string =>
+    `${err.errName} ${quoted(err.errDescription)}`
+
+  // AC 20 (b.av2 SR-10.3): a row-fetch failure that is not a read error
+  // (b.jg5 SRJ-105: `ErrSpawnNotFound`, a CONFIG answer, an UNUSABLE NAME
+  // answer) reaches the inconclusive report, where it is named by
+  // describeAgentDirectorFailure — an agent-director error's errName and
+  // redacted description when the errName is a short identifier — in the log
+  // line, startup-errors.log and the persona notice alike; never the thrown
+  // value's raw message, description or envelope, which carry fake tokens here.
+  const leakyConfig = (): unknown => errUnknownErrorName('ErrConfigMalformed', adDescription())
+  const leakyUnusableName = (): unknown => errInternal(`${UNUSABLE_RECORDED_NAME_PHRASE} is empty; ${adDescription()}`)
+  test.each<[string, () => unknown, string]>([
+    [
+      'a typed subclass (ErrSpawnNotFound)',
+      () => new ErrSpawnNotFound('get', 'ErrSpawnNotFound', leakyMessage('gone', 'sub')),
+      `ErrSpawnNotFound ${quoted(redactedLeakyMessage('gone'))}`,
+    ],
+    [
+      'a CONFIG answer whose envelope description holds a URL and a fake token',
+      leakyConfig,
+      unknownNameShown(leakyConfig() as { errName: string; errDescription: string }),
+    ],
+    [
+      'an UNUSABLE NAME answer whose envelope description holds a URL and a fake token',
+      leakyUnusableName,
+      unknownNameShown(leakyUnusableName() as { errName: string; errDescription: string }),
+    ],
+  ])('AC 20: row fetch fails with %s → named with its redacted message in the line, startup-errors.log and notice', async (_label, makeErr, shown) => {
+    const readLog = captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    installDiagnosisGetFailure(cfg, makeErr, { spawnCalls: [], deleteCalls: [] })
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const errArgs = await withErrArgs(async () => {
+      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    })
+
+    expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
+    const reasonOf = (text: string): string | undefined =>
+      /could not fetch the agent-director row \((.*?)\); AD reported/.exec(text)?.[1]?.split(' at ')[0]
+    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.includes('could not fetch the agent-director row'))
+    expect(lines.map(reasonOf)).toEqual([shown])
+    expect(reasonOf(readLog())).toBe(shown)
+    expect(notices.map((n) => reasonOf(n.text)).filter((r) => r !== undefined)).toEqual([shown])
+    assertNoLeak({ errArgs, startupErrorsLog: readLog(), notices })
+  })
+
+  // AC 20 with b.jg5 SRJ-105: every other row-fetch failure is a read error,
+  // so the diagnostic get is refused. The refusal line names each shape by
+  // describeAgentDirectorFailure (redacted, on one line: a two-line errName
+  // cannot inject a line), and nothing is posted: no inconclusive notice, no
+  // jsonl-diagnosis-inconclusive or spawn-failed entry, no delete, no spawn.
   test.each<[string, () => unknown, string]>([
     [
       'a base AgentDirectorError',
       () => errGeneric('get', 'ErrSpawnGone', leakyMessage('gone', 'desc')),
       `ErrSpawnGone ${quoted(redactedLeakyMessage('gone'))}`,
-    ],
-    [
-      'a typed subclass (ErrSpawnNotFound)',
-      () => new ErrSpawnNotFound('get', 'ErrSpawnNotFound', leakyMessage('gone', 'sub')),
-      `ErrSpawnNotFound ${quoted(redactedLeakyMessage('gone'))}`,
     ],
     [
       // The error's message is `<errName>: <description>`; the token-shaped
@@ -9295,71 +9588,55 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       `Error code=ECONNRESET ${quoted(redactedLeakyMessage('socket'))}`,
     ],
     ['a rejected string', () => leakyMessage('down', 'str'), `string ${quoted(redactedLeakyMessage('down'))}`],
-  ])('AC 20: row fetch fails with %s → named with its redacted message in the line, startup-errors.log and notice', async (_label, makeErr, shown) => {
+  ])('AC 20 (b.jg5 SRJ-105): row fetch refused with %s → the refusal line names it redacted on one line; no notice, no startup entry, no delete, no spawn', async (_label, makeErr, shown) => {
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    const stub = installStub({
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
-      ],
-      resumeError: errJsonlMissing(),
-    })
-    let getCalls = 0
-    stub.get = async (params) => {
-      getCalls++
-      if (getCalls >= 2) throw makeErr()
-      return personaRowsGet(cfg, { state: 'ended' })(params)
-    }
-    const errArgs: unknown[][] = []
-    const orig = console.error
-    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    const persona = personaOf(cfg, CH)
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installDiagnosisGetFailure(cfg, makeErr, { spawnCalls, deleteCalls })
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    try {
-      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    } finally {
-      console.error = orig
-    }
+    const errArgs = await withErrArgs(async () => {
+      result = await spawnForPersona(persona, cfg, true)
+    })
 
-    expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
-    const reasonOf = (text: string): string | undefined =>
-      /could not fetch the agent-director row \((.*?)\); AD reported/.exec(text)?.[1]?.split(' at ')[0]
-    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.includes('could not fetch the agent-director row'))
-    expect(lines.map(reasonOf)).toEqual([shown])
-    expect(reasonOf(readLog())).toBe(shown)
-    expect(notices.map((n) => reasonOf(n.text)).filter((r) => r !== undefined)).toEqual([shown])
-    assertNoLeak({ errArgs, startupErrorsLog: readLog(), notices })
+    expect(result).toStrictEqual({ key: persona.key, action: 'failed' })
+    const prefix = `[slack] spawnForPersona: ErrJsonlMissing diagnosis get refused for ${renderPersonaRef(persona.name, persona.key)}: `
+    const suffix = ' — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)'
+    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(prefix))
+    expect(lines).toHaveLength(1)
+    const line = lines[0]!
+    expect(line).not.toContain('\n')
+    expect(line.endsWith(suffix)).toBe(true)
+    expect(line.slice(prefix.length, -suffix.length).split(' at ')[0]).toBe(shown)
+    expect(notices).toEqual([])
+    const log = readLog()
+    expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
+    expect(errArgs.flat().map(String).filter((l) => l.includes('could not fetch the agent-director row'))).toEqual([])
+    expect(deleteCalls).toEqual([])
+    expect(spawnCalls).toHaveLength(1) // the colliding optimistic spawn only
+    assertNoLeak({ errArgs, startupErrorsLog: log, notices })
   })
 
-  // AC 20 (E13 Director decision 16): when the row fetch fails and
-  // ErrJsonlMissing gave no enumerated paths, its description is echoed as
-  // "AD reported: …" only after redactSlackLogText, in the log line, the
+  // AC 20 (E13 Director decision 16): when the row fetch fails with an answer
+  // that is not a read error (here UNUSABLE NAME) and ErrJsonlMissing gave no
+  // enumerated paths, its description is echoed as "AD reported: …" only
+  // after redactSlackLogText, in the log line, the
   // jsonl-diagnosis-inconclusive record and the persona notice; the record's
   // cause is describeAgentDirectorFailure: the error's name and the same
   // redacted description as `message="…"`.
   test('AC 20: row fetch fails and ErrJsonlMissing\'s description holds a URL and a fake token → "AD reported:" carries it redacted in the line, the record and the notice; nothing leaks', async () => {
     const readLog = captureStartupErrors()
-    const stub = installStub({
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
-      ],
-      resumeError: errJsonlMissing(adDescription()),
-    })
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    let getCalls = 0
-    stub.get = async (params) => {
-      getCalls++
-      if (getCalls >= 2) throw errGeneric('get', 'ErrSpawnGone')
-      return personaRowsGet(cfg, { state: 'ended' })(params)
-    }
+    installDiagnosisGetFailure(cfg, () => errUnusableName(), { spawnCalls: [], deleteCalls: [] }, adDescription())
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
     const errLog = await withCapturedErr(async () => {
       result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
     })
 
     expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
-    const reported = `could not fetch the agent-director row (ErrSpawnGone message="oops"); AD reported: ${REDACTED_AD_DESCRIPTION}`
+    const reported = `could not fetch the agent-director row (${unknownNameShown(errUnusableName())}); AD reported: ${REDACTED_AD_DESCRIPTION}`
     expect(errLog.split('\n').filter((l) => l.includes(reported))).toHaveLength(1)
     const entry = onlyStartupEntry(readLog(), 'jsonl-diagnosis-inconclusive')
     expect(entry).toContain(reported)
@@ -10956,5 +11233,732 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     expect(text.split(REDACTED_URL_PLACEHOLDER)).toHaveLength(2)
     expect(text.split(REDACTED_TOKEN_PLACEHOLDER)).toHaveLength(2)
     assertNoLeak({ text, logs: h.logs, notices })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-105: UNAVAILABLE and read errors in the collision ladder (AC 25)
+//
+// Every case runs on `makeRecoveryHarness` (both settings 0): the real retry
+// controller is the trigger sink, so a refusal arms P's timer and the failed
+// launch carries the refusal marker, and the `tmux-unresponsive` condition is
+// installed as `main()` installs it. Launches go through the real
+// `spawnForPersona` as the start pass makes them (`h.launch`, so a
+// `spawn-failed` startup-errors entry would be written), then once more
+// through `launchSession`. Errors come from E4's by-name stub builders.
+//
+// At every site the refused call is the last launch or destructive call: the
+// stub's `spawn`, `resume`, `kill`, `delete` and `send-keys` counts are
+// exact, so a kill, delete or launch after the refusal (or a dead-session
+// resume) fails the case. Each case also asserts no session-manager notice (a
+// spawn-failure notice), no outage notice, no `spawn-failed` entry, one
+// refusal line, a `{ failed, refused }` result, `launchSession` answering
+// `'refused'`, a failure count left at 0, and persona B launching as before.
+// ---------------------------------------------------------------------------
+
+/** E4's UNAVAILABLE forms but `ErrTmuxKillFailed`, each built for the verb that meets it (by name). */
+const SRJ105_UNAVAILABLE: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
+  ['ErrUnknownErrorName', () => errUnknownErrorName()],
+  ['ErrCallTimeout', (verb) => errCallTimeout(verb)],
+  ['a wrapped UnknownError', (verb) => errGeneric(verb, CSCB_UNKNOWN_ERROR_NAME, 'Error: boom')],
+  ['ErrTmuxUnresponsive', (verb) => errTmuxUnresponsive(verb)],
+]
+
+/** `ErrTmuxKillFailed`, the UNAVAILABLE form only a kill answers. */
+const SRJ105_KILL_FAILED: readonly [string, (verb: string) => Error] = ['ErrTmuxKillFailed', () => errTmuxKillFailed()]
+
+/** The launch and destructive calls a launch made, by verb. */
+interface LaunchVerbCalls {
+  spawn: number
+  resume: number
+  kill: number
+  delete: number
+  sendKeys: number
+}
+
+/** `LaunchVerbCalls` with every verb 0 but those in `calls`. */
+function ladderCallsOf(calls: Partial<LaunchVerbCalls>): LaunchVerbCalls {
+  return { spawn: 0, resume: 0, kill: 0, delete: 0, sendKeys: 0, ...calls }
+}
+
+/** The launch and destructive calls the harness's stub received. */
+function ladderCallsMade(h: RecoveryHarness): LaunchVerbCalls {
+  const c = h.stub.calls
+  return {
+    spawn: c.spawnCalls.length,
+    resume: c.resumeCalls.length,
+    kill: c.killCalls.length,
+    delete: c.deleteCalls.length,
+    sendKeys: c.sendKeysCalls.length,
+  }
+}
+
+/** A site of the collision ladder where the launch of `persona` meets `err`. */
+interface LadderSite {
+  readonly name: string
+  /** The verb of the refused call. */
+  readonly verb: string
+  /** Stub answers that make one launch meet `err` here; called before each launch. */
+  script(h: RecoveryHarness, persona: Persona, err: Error): RecoveryStubScript
+  /** Configuration or seams the site needs, set once before the first launch. */
+  setup?(h: RecoveryHarness): void
+  /** Every launch and destructive call one such launch makes, the refused one included. */
+  readonly calls: LaunchVerbCalls
+}
+
+/** The harness persona `key`. */
+function harnessPersona(h: RecoveryHarness, key: string): Persona {
+  return personaOf(h.config, key)
+}
+
+/** A row for `persona` in its own directory with its current labels (`cannedGetResult` in persona form), with `overrides`. */
+function harnessRow(h: RecoveryHarness, persona: Persona, overrides: PersonaGetResultOverrides): CannedGetResult {
+  return cannedGetResult(overrides, persona, h.home)
+}
+
+/** The optimistic spawn collides and then answers `spawns` in order; the collision `get` reads `row`. */
+function collidesOn(h: RecoveryHarness, persona: Persona, row: PersonaGetResultOverrides, ...spawns: Error[]): RecoveryStubScript {
+  return {
+    spawnQueue: [cannedErr(errInstanceIdCollision()), ...spawns.map((e) => cannedErr<import('agent-director').SpawnResult>(e))],
+    getResult: harnessRow(h, persona, row),
+  }
+}
+
+/** `persona`'s row reading `waiting` whose `config_dir` label is missing (b.av2 SR-6.2: never resumed). */
+function unlabelledWaitingRow(h: RecoveryHarness, persona: Persona): PersonaGetResultOverrides {
+  const labels: Record<string, string> = { ...harnessRow(h, persona, { state: 'waiting' }).labels }
+  delete labels['config_dir']
+  return { state: 'waiting', labels }
+}
+
+/** A row in another directory (the harness home), reading `state`. */
+function elsewhere(h: RecoveryHarness, state: string): PersonaGetResultOverrides {
+  return { cwd: h.home, state }
+}
+
+/** The working-row wait polls every 1 ms. */
+function fastPolls(h: RecoveryHarness): void {
+  h.config.agent_director_poll_interval_ms = 1
+}
+
+/** The working-row wait gives up after 30 ms and re-sweeps at its deadline (memo TTL 0), polling every 1 ms. */
+function shortWait(h: RecoveryHarness): void {
+  fastPolls(h)
+  _setWaitForWaitingTimeoutMs(30)
+  _setFindMissingMemoTtlMs(0)
+}
+
+/** `resume_enabled: false`: every row found is replaced (kill, delete, fresh spawn). */
+function noResume(h: RecoveryHarness): void {
+  h.config.resume_enabled = false
+}
+
+/**
+ * Each spawn and resume the ladder makes, as the site where the launch meets
+ * the error (the verb's own call is the last one).
+ */
+const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
+  { name: 'the first spawn', verb: 'spawn', script: (_h, _p, err) => ({ spawnError: err }), calls: ladderCallsOf({ spawn: 1 }) },
+  {
+    name: 'the self-heal retry spawn after the first spawn\'s ErrTmuxSessionCreate',
+    verb: 'spawn',
+    script: (_h, _p, err) => ({ spawnQueue: [cannedErr(errTmuxSessionCreate('spawn')), cannedErr(err)] }),
+    calls: ladderCallsOf({ spawn: 2 }),
+  },
+  {
+    name: 'the retry spawn after the collision get\'s ErrSpawnNotFound',
+    verb: 'spawn',
+    script: (_h, _p, err) => ({ spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(err)], getError: errSpawnNotFound() }),
+    calls: ladderCallsOf({ spawn: 2 }),
+  },
+  { name: 'the resume of an ended row', verb: 'resume', script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
+  { name: 'the resume of a missing row', verb: 'resume', script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'missing' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
+  {
+    name: 'the self-heal spawn after the resume\'s ErrTmuxSessionCreate',
+    verb: 'spawn',
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }, err), resumeError: errTmuxSessionCreate('resume') }),
+    calls: ladderCallsOf({ spawn: 2, resume: 1 }),
+  },
+  {
+    name: 'the fresh spawn after the resume\'s ErrNoSessionId and its delete',
+    verb: 'spawn',
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }, err), resumeError: errNoSessionId() }),
+    calls: ladderCallsOf({ spawn: 2, resume: 1, delete: 1 }),
+  },
+  {
+    name: 'the fresh spawn after the resume\'s ErrSpawnNotResumable, its kill and its delete',
+    verb: 'spawn',
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }, err), resumeError: errSpawnNotResumable() }),
+    calls: ladderCallsOf({ spawn: 2, resume: 1, kill: 1, delete: 1 }),
+  },
+  {
+    name: 'the fresh spawn after the resume\'s ErrSpawnNotFound',
+    verb: 'spawn',
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }, err), resumeError: errSpawnNotFound() }),
+    calls: ladderCallsOf({ spawn: 2, resume: 1 }),
+  },
+  {
+    name: 'the fresh spawn of a replacement (resume_enabled false), after its kill and delete',
+    verb: 'spawn',
+    setup: noResume,
+    script: (h, p, err) => collidesOn(h, p, { state: 'ended' }, err),
+    calls: ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }),
+  },
+  {
+    name: 'the fresh spawn of a replacement (a row in another directory), after its kill and delete',
+    verb: 'spawn',
+    script: (h, p, err) => collidesOn(h, p, elsewhere(h, 'ended'), err),
+    calls: ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }),
+  },
+  {
+    name: 'the self-heal spawn of a replacement after its fresh spawn\'s ErrTmuxSessionCreate',
+    verb: 'spawn',
+    script: (h, p, err) => collidesOn(h, p, elsewhere(h, 'ended'), errTmuxSessionCreate('spawn'), err),
+    calls: ladderCallsOf({ spawn: 3, kill: 1, delete: 1 }),
+  },
+]
+
+/** The kill before each replacement: nothing is deleted or launched after it. */
+const KILL_SITES: readonly LadderSite[] = [
+  {
+    name: 'the kill of a replacement (resume_enabled false)',
+    verb: 'kill',
+    setup: noResume,
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), killError: err }),
+    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
+  },
+  {
+    name: 'the kill of a replacement (a row in another directory, read waiting)',
+    verb: 'kill',
+    script: (h, p, err) => ({ ...collidesOn(h, p, elsewhere(h, 'waiting')), killError: err }),
+    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
+  },
+  {
+    name: 'the kill of a replacement (a row in another directory, read ended)',
+    verb: 'kill',
+    script: (h, p, err) => ({ ...collidesOn(h, p, elsewhere(h, 'ended')), killError: err }),
+    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
+  },
+  {
+    name: 'the kill of a replacement (a missing config_dir label, after a dead-session verdict on a waiting row)',
+    verb: 'kill',
+    script: (h, p, err) => ({
+      ...collidesOn(h, p, unlabelledWaitingRow(h, p)),
+      sendKeysError: errSpawnNotInteractive('send-keys'),
+      killError: err,
+    }),
+    calls: ladderCallsOf({ spawn: 1, sendKeys: 1, kill: 1 }),
+  },
+  {
+    name: 'the kill after the resume\'s ErrSpawnNotResumable',
+    verb: 'kill',
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: err }),
+    calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1 }),
+  },
+]
+
+/** The delete in each replacement: nothing is launched after it. */
+const DELETE_SITES: readonly LadderSite[] = [
+  {
+    name: 'the delete of a replacement (resume_enabled false)',
+    verb: 'delete',
+    setup: noResume,
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), deleteError: err }),
+    calls: ladderCallsOf({ spawn: 1, kill: 1, delete: 1 }),
+  },
+  {
+    name: 'the delete of a replacement (a row in another directory)',
+    verb: 'delete',
+    script: (h, p, err) => ({ ...collidesOn(h, p, elsewhere(h, 'waiting')), deleteError: err }),
+    calls: ladderCallsOf({ spawn: 1, kill: 1, delete: 1 }),
+  },
+  {
+    name: 'the delete after the resume\'s ErrSpawnNotResumable',
+    verb: 'delete',
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), deleteError: err }),
+    calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1, delete: 1 }),
+  },
+  {
+    name: 'the delete after the resume\'s ErrNoSessionId',
+    verb: 'delete',
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'ended' }), resumeError: errNoSessionId(), deleteError: err }),
+    calls: ladderCallsOf({ spawn: 1, resume: 1, delete: 1 }),
+  },
+]
+
+/** The reconnect's keystrokes, first try and the retry after ErrTmuxSendKeys: never 'dead-session' (no resume). */
+const RECONNECT_SITES: readonly LadderSite[] = [
+  {
+    name: 'the reconnect of a waiting row',
+    verb: 'send-keys',
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'waiting' }), sendKeysError: err }),
+    calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }),
+  },
+  {
+    name: 'the reconnect retry after ErrTmuxSendKeys on a waiting row',
+    verb: 'send-keys',
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'waiting' }), sendKeysQueue: [cannedErr(errTmuxSendKeys()), cannedErr(err)] }),
+    calls: ladderCallsOf({ spawn: 1, sendKeys: 2 }),
+  },
+  {
+    name: 'the reconnect of a working row once its wait reads it waiting',
+    verb: 'send-keys',
+    setup: fastPolls,
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'working' }), statusResult: cannedStatusResult({ state: 'waiting' }), sendKeysError: err }),
+    calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }),
+  },
+  {
+    name: 'the reconnect retry after ErrTmuxSendKeys on a working row its wait reads waiting',
+    verb: 'send-keys',
+    setup: fastPolls,
+    script: (h, p, err) => ({
+      ...collidesOn(h, p, { state: 'working' }),
+      statusResult: cannedStatusResult({ state: 'waiting' }),
+      sendKeysQueue: [cannedErr(errTmuxSendKeys()), cannedErr(err)],
+    }),
+    calls: ladderCallsOf({ spawn: 1, sendKeys: 2 }),
+  },
+]
+
+/**
+ * The reads of the ladder (b.jg5 SRJ-105's read-error row): the collision
+ * `get`, the working-row wait's poll and timeout `status`, and the
+ * ErrJsonlMissing diagnosis `get` (SRJ-114), made after the resume and before
+ * its delete and fresh spawn.
+ */
+const READ_SITES: readonly LadderSite[] = [
+  {
+    name: 'the collision get',
+    verb: 'get',
+    script: (_h, _p, err) => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: err }),
+    calls: ladderCallsOf({ spawn: 1 }),
+  },
+  {
+    name: 'the working-row wait\'s poll status',
+    verb: 'status',
+    setup: fastPolls,
+    script: (h, p, err) => ({ ...collidesOn(h, p, { state: 'working' }), statusError: err }),
+    calls: ladderCallsOf({ spawn: 1 }),
+  },
+  {
+    name: 'the working-row wait\'s timeout status',
+    verb: 'status',
+    setup: shortWait,
+    script: (h, p, err) => {
+      // The row reads working at every poll; the status after the deadline's
+      // fresh sweep (this launch's second) fails.
+      const sweepsBefore = h.stub.calls.findMissingCalls.length
+      return {
+        ...collidesOn(h, p, { state: 'working' }),
+        statusFn: () =>
+          h.stub.calls.findMissingCalls.length >= sweepsBefore + 2 ? err : cannedStatusResult({ state: 'working' }),
+      }
+    },
+    calls: ladderCallsOf({ spawn: 1 }),
+  },
+  {
+    name: 'the ErrJsonlMissing diagnosis get',
+    verb: 'get',
+    script: (h, p, err) => jsonlMissingDiagnosisGets(h, p, cannedErr(err)),
+    calls: ladderCallsOf({ spawn: 1, resume: 1 }),
+  },
+]
+
+/**
+ * The optimistic spawn collides, the collision `get` reads an `ended` row, its
+ * resume answers ErrJsonlMissing, and the diagnosis `get` answers `diagnosis`.
+ */
+function jsonlMissingDiagnosisGets(
+  h: RecoveryHarness,
+  persona: Persona,
+  diagnosis: CannedResponse<CannedGetResult>,
+): RecoveryStubScript {
+  return {
+    spawnQueue: [cannedErr(errInstanceIdCollision())],
+    getQueue: [cannedOk(harnessRow(h, persona, { state: 'ended' })), diagnosis],
+    resumeError: errJsonlMissing(),
+  }
+}
+
+/** Every knob `script` set, cleared: the stub's defaults again. */
+function clearedScript(script: RecoveryStubScript): RecoveryStubScript {
+  return Object.fromEntries(Object.keys(script).map((knob) => [knob, undefined]))
+}
+
+/** The refusal lines `refusalAt` logged for persona `key`. */
+function refusalLines(h: RecoveryHarness, key: string): string[] {
+  return h.errors.filter((line) => line.includes(` refused for ${renderPersonaRef(key, key)}: `) && line.endsWith('nothing more is called (b.jg5 SRJ-105)'))
+}
+
+/** The condition's started lines for persona `key`. */
+function conditionStartedLines(h: RecoveryHarness, key: string): string[] {
+  return h.lines.filter((line) => line.includes(`persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} started`))
+}
+
+let srj105Harness: RecoveryHarness | undefined
+
+/** A recovery harness over two personas, P and B, cleaned up after the case. */
+function srj105Build(options?: RecoveryHarnessOptions): { h: RecoveryHarness; p: string; b: string } {
+  const h = (srj105Harness = makeRecoveryHarness(options))
+  const [p, b] = h.keys as [string, string]
+  return { h, p, b }
+}
+
+/**
+ * Launch P as the start pass does, with `site` meeting `err`; assert the
+ * refusal's outcome (see the section comment); then launch it again through
+ * `launchSession`, and launch B over the stub's defaults.
+ */
+async function expectRefusedAt(site: LadderSite, err: Error, triggerKind: string): Promise<{ h: RecoveryHarness; p: string }> {
+  const { h, p, b } = srj105Build()
+  const persona = harnessPersona(h, p)
+  site.setup?.(h)
+  const script = site.script(h, persona, err)
+  h.script(script)
+
+  const result = await h.launch(p)
+
+  expect(result).toStrictEqual({ key: p, action: 'failed', refused: true })
+  expect(ladderCallsMade(h)).toEqual(site.calls)
+  expect(h.notices).toEqual([])
+  expect(h.outageNotices).toEqual([])
+  expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  expect(refusalLines(h, p)).toHaveLength(1)
+  expect(h.triggers).toEqual([{ key: p, kind: triggerKind }])
+  expect(h.controller.isArmed(p)).toBe(true)
+  expect(getFailureCount(p)).toBe(0)
+
+  // The restart path's launch meets the same refusal: 'refused', never counted.
+  h.script(site.script(h, persona, err))
+  expect(await launchSession(p, h.config)).toBe('refused')
+  expect(getFailureCount(p)).toBe(0)
+  expect(h.notices).toEqual([])
+  expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+
+  // B's launch is unaffected.
+  h.script(clearedScript(script))
+  expect(await h.launch(b)).toEqual({ key: b, action: 'spawned' })
+  expect(h.controller.isArmed(b)).toBe(false)
+  expect(h.triggers.filter((t) => t.key === b)).toEqual([])
+  expect(h.notices).toEqual([])
+  assertNoLeak(h.captured())
+  return { h, p }
+}
+
+describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
+  afterEach(() => {
+    srj105Harness?.cleanup()
+    srj105Harness = undefined
+  })
+
+  const spawnCross = SRJ105_UNAVAILABLE.flatMap(([what, make]) =>
+    [...SPAWN_AND_RESUME_SITES, ...RECONNECT_SITES].map((site) => [what, site.name, make, site] as const),
+  )
+  test.each(spawnCross)('%s at %s: no kill, delete or launch after it, never dead-session, no notice or spawn-failed entry, refused and never counted; B launches', async (_what, _site, make, site) => {
+    await expectRefusedAt(site, make(site.verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
+  })
+
+  const killCross = [...SRJ105_UNAVAILABLE, SRJ105_KILL_FAILED].flatMap(([what, make]) =>
+    [...KILL_SITES, ...DELETE_SITES].map((site) => [what, site.name, make, site] as const),
+  )
+  test.each(killCross)('%s at %s: no delete or launch after it, no notice or spawn-failed entry, refused and never counted; B launches', async (what, _site, make, site) => {
+    const kind = what === SRJ105_KILL_FAILED[0] ? UNAVAILABLE_RETRY_CAUSE_KILL_FAILED : UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE
+    const { h, p } = await expectRefusedAt(site, make(site.verb), kind)
+    // AC 64's half: ErrTmuxKillFailed never starts the condition.
+    if (what === SRJ105_KILL_FAILED[0]) {
+      expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+      expect(conditionStartedLines(h, p)).toEqual([])
+    }
+  })
+
+  test.each(SRJ105_UNAVAILABLE)('the kill after the resume\'s ErrSpawnNotResumable is declared a kill of a row read live: %s there starts P\'s condition (tmux-touching), where the same answer to a kill of a row in another directory read ended starts nothing', async (_what, make) => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    h.script({ ...collidesOn(h, persona, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: make('kill') })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+    const started = conditionStartedLines(h, p)
+    expect(started).toHaveLength(1)
+    expect(started[0]).toContain(' — kill failed: ')
+
+    h.cleanup()
+    srj105Harness = undefined
+    const other = srj105Build()
+    other.h.script({ ...collidesOn(other.h, harnessPersona(other.h, other.p), elsewhere(other.h, 'ended')), killError: make('kill') })
+    expect(await other.h.launch(other.p)).toStrictEqual({ key: other.p, action: 'failed', refused: true })
+    expect(other.h.tmuxUnresponsive.holds(other.p)).toBe(false)
+    expect(conditionStartedLines(other.h, other.p)).toEqual([])
+  })
+
+  test.each([...SRJ105_UNAVAILABLE, SRJ105_KILL_FAILED])('regression: the persona teardown\'s kill (killPersonaInstance, which the ladder\'s kill wraps) answering %s still rethrows it unchanged, quietly: no line, delete, notice, startup-errors entry or trigger', async (_what, make) => {
+    const { h, p } = srj105Build()
+    const err = make('kill')
+    h.script({ killError: err })
+
+    await expect(killPersonaInstance(p)).rejects.toBe(err)
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ kill: 1 }))
+    expect(h.errors).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(h.triggers).toEqual([])
+  })
+
+  test.each<[string, (h: RecoveryHarness, persona: Persona, err: Error) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined]>([
+    ['the dialog approver\'s pane read', (_h, _p, err) => ({ statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' }))], readPaneError: err }), undefined],
+    [
+      'the dialog approver\'s Enter on a dialog',
+      (_h, _p, err) => ({
+        statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' }))],
+        readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
+        sendKeysError: err,
+      }),
+      undefined,
+    ],
+    [
+      'the working-row wait\'s pane read',
+      (h, p, err) => ({ ...collidesOn(h, p, { state: 'working' }), statusResult: cannedStatusResult({ state: 'working' }), readPaneError: err }),
+      (h) => {
+        shortWait(h)
+        // At a restart delay the wait's give-up raises no not-connected notice.
+        h.config.session_restart_delay = 60
+      },
+    ],
+  ])('regression: %s answering each UNAVAILABLE form keeps its outcome: logged, the launch goes on, no kill, delete, resume or notice, no spawn-failed entry', async (site, script, setup) => {
+    for (const [, make] of SRJ105_UNAVAILABLE) {
+      const { h, p } = srj105Build()
+      setup?.(h)
+      const err = make(site.includes('Enter') ? 'send-keys' : 'read-pane')
+      h.script(script(h, harnessPersona(h, p), err))
+
+      const result = await h.launch(p)
+
+      expect(result).toEqual({ key: p, action: site.includes('working-row') ? 'not-reconnected' : 'spawned' })
+      const made = ladderCallsMade(h)
+      expect(made).toEqual(ladderCallsOf({ spawn: 1, sendKeys: made.sendKeys }))
+      expect(made.sendKeys).toBe(site.includes('Enter') ? 1 : 0)
+      expect(h.stub.calls.readPaneCalls.length).toBeGreaterThan(0)
+      expect(h.notices).toEqual([])
+      expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+      expect(refusalLines(h, p)).toEqual([])
+      expect(getFailureCount(p)).toBe(0)
+      assertNoLeak(h.captured())
+      h.cleanup()
+      srj105Harness = undefined
+    }
+  })
+})
+
+describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait or the ErrJsonlMissing diagnosis get is handled as UNAVAILABLE', () => {
+  afterEach(() => {
+    srj105Harness?.cleanup()
+    srj105Harness = undefined
+  })
+
+  /** The UNAVAILABLE forms, then an UNCLASSIFIED read error and a store that cannot be opened (UNCLASSIFIED too). */
+  const READ_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error, string]> = [
+    ...SRJ105_UNAVAILABLE.map(([what, make]) => [what, make, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE] as const),
+    ['an UNCLASSIFIED read error (ErrTimeout)', (verb) => errGeneric(verb, 'ErrTimeout'), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+    ['a store that cannot be opened (ErrSchemaMismatch)', () => errSchemaMismatch(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+  ]
+
+  const cross = READ_ERRORS.flatMap(([what, make, kind]) => READ_SITES.map((site) => [what, site.name, make, kind, site] as const))
+  test.each(cross)('%s at %s: no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, and P\'s condition is not started; B launches', async (_what, _site, make, kind, site) => {
+    const { h, p } = await expectRefusedAt(site, make(site.verb), kind)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
+  })
+
+  test.each<[string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined, SpawnPersonaResult['action'], Partial<LaunchVerbCalls>]>([
+    ['the collision get (the row went away: one retry spawn)', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() }), undefined, 'spawned', { spawn: 2 }],
+    ['the working-row wait\'s poll status (its tmux session alive: not reconnected)', (h, p) => ({ ...collidesOn(h, p, { state: 'working' }), statusError: errSpawnNotFound() }), fastPolls, 'not-reconnected', { spawn: 1 }],
+    [
+      'the working-row wait\'s timeout status (the tmux fallback, alive: not reconnected)',
+      (h, p) => {
+        const sweepsBefore = h.stub.calls.findMissingCalls.length
+        return {
+          ...collidesOn(h, p, { state: 'working' }),
+          statusFn: () => (h.stub.calls.findMissingCalls.length >= sweepsBefore + 2 ? errSpawnNotFound() : cannedStatusResult({ state: 'working' })),
+        }
+      },
+      shortWait,
+      'not-reconnected',
+      { spawn: 1 },
+    ],
+    [
+      'the ErrJsonlMissing diagnosis get (the row went away: inconclusive, delete and fresh spawn)',
+      (h, p) => jsonlMissingDiagnosisGets(h, p, cannedErr(errSpawnNotFound())),
+      undefined,
+      'fresh-after-inconclusive-amnesia',
+      { spawn: 2, resume: 1, delete: 1 },
+    ],
+  ])('regression: ErrSpawnNotFound at %s keeps its meaning; nothing is refused', async (_site, script, setup, action, calls) => {
+    const { h, p } = srj105Build()
+    setup?.(h)
+    h.script(script(h, harnessPersona(h, p)))
+
+    expect(await h.launch(p)).toEqual({ key: p, action })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf(calls))
+    expect(refusalLines(h, p)).toEqual([])
+    expect(h.triggers).toEqual([])
+    expect(h.controller.isArmed(p)).toBe(false)
+  })
+
+  // The refusal cases' "no notice, no inconclusive entry" is only evidence if
+  // the harness captures that notice and entry: ErrSpawnNotFound at the
+  // diagnosis get still posts the one inconclusive notice and writes the one
+  // jsonl-diagnosis-inconclusive entry, both naming the failed row fetch.
+  test('regression: ErrSpawnNotFound at the ErrJsonlMissing diagnosis get still posts the inconclusive notice and writes the jsonl-diagnosis-inconclusive entry the harness captures', async () => {
+    const { h, p } = srj105Build()
+    h.script(jsonlMissingDiagnosisGets(h, harnessPersona(h, p), cannedErr(errSpawnNotFound())))
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'fresh-after-inconclusive-amnesia' })
+
+    const fetchFailed = 'could not fetch the agent-director row (ErrSpawnNotFound'
+    expect(h.notices.filter((n) => n.key === p && n.text.includes(fetchFailed))).toHaveLength(1)
+    expect(onlyStartupEntry(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toContain(fetchFailed)
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    assertNoLeak(h.captured())
+  })
+})
+
+describe('b.jg5 SRJ-105 with E8\'s refusal marker: a refused kill on a replace path is followed by no delete and no launch, answers \'refused\' and is never counted', () => {
+  afterEach(() => {
+    srj105Harness?.cleanup()
+    srj105Harness = undefined
+  })
+
+  /** Each replace path, as the stub answers for the launch after the collision; its kill is its first kill. */
+  const REPLACE_PATHS: ReadonlyArray<readonly [string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined, Partial<LaunchVerbCalls>]> = [
+    ['resume_enabled false', (h, p) => collidesOn(h, p, { state: 'ended' }), noResume, { spawn: 1, kill: 1 }],
+    ['a row in another directory', (h, p) => collidesOn(h, p, elsewhere(h, 'ended')), undefined, { spawn: 1, kill: 1 }],
+    ['the resume\'s ErrSpawnNotResumable', (h, p) => ({ ...collidesOn(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable() }), undefined, { spawn: 1, resume: 1, kill: 1 }],
+  ]
+
+  const KILL_REFUSALS: ReadonlyArray<readonly [string, () => Error]> = [
+    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill')],
+    [SRJ105_KILL_FAILED[0], () => errTmuxKillFailed()],
+  ]
+
+  const cross = REPLACE_PATHS.flatMap(([path, script, setup, calls]) => KILL_REFUSALS.map(([what, make]) => [path, what, script, setup, calls, make] as const))
+
+  test.each(cross)('%s, its kill answering %s: { failed, refused } from spawnForPersona, \'refused\' from launchSession, and the restart path\'s retry answers refused with the failure count still 0', async (_path, _what, script, setup, calls, make) => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    setup?.(h)
+    h.script({ ...script(h, persona), killError: make() })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf(calls))
+
+    h.script({ ...script(h, persona), killError: make() })
+    expect(await launchSession(p, h.config)).toBe('refused')
+    expect(h.stub.calls.deleteCalls).toEqual([])
+
+    // The restart path: its liveness read finds the row dead, its own kill
+    // succeeds, and the launch's replacement kill is refused.
+    h.script({ ...script(h, persona), killError: undefined, killQueue: [cannedOk({}), cannedErr(make())], statusResult: cannedStatusResult({ state: 'ended' }) })
+    expect(await runRestartRetry(p, persona.working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+    expect(h.notices).toEqual([])
+    expect(h.capReached).toEqual([])
+    assertNoLeak(h.captured())
+  })
+})
+
+describe('b.jg5 SRJ-105: at most one onset across several ticks (both settings 0)', () => {
+  afterEach(() => {
+    srj105Harness?.cleanup()
+    srj105Harness = undefined
+  })
+
+  /**
+   * P's row as the stub reports it: absent (`ErrSpawnNotFound`, read dead by
+   * the restart path) until a spawn of it succeeds, `waiting` after.
+   */
+  function rowAppearsOnSpawn(h: RecoveryHarness, key: string): void {
+    let spawned = false
+    const client = h.stub.client
+    const spawn = client.spawn.bind(client)
+    client.spawn = async (params) => {
+      const result = await spawn(params)
+      if (params.claude_instance_id === personaInstanceId(key)) spawned = true
+      return result
+    }
+    h.script({ statusFn: () => (spawned ? cannedStatusResult({ state: 'waiting' }) : errSpawnNotFound()) })
+  }
+
+  /** Move the clock to P's next retry, run it and let its launch settle. */
+  async function runNextRetry(h: RecoveryHarness, key: string): Promise<void> {
+    const due = h.controller.view(key)!.dueAt!
+    await h.advance(due - h.clock.now())
+    await h.settle()
+  }
+
+  test('a start-pass spawn that keeps answering ErrTmuxUnresponsive across several retries past the onset floor posts exactly one notice for P, the onset; nothing is counted and no spawn-failure notice is posted', async () => {
+    const { h, p, b } = srj105Build({ alertThresholdMs: false })
+    rowAppearsOnSpawn(h, p)
+    h.script({ spawnError: errTmuxUnresponsive('spawn') })
+    const at = h.clock.now()
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+    let pastFloor = 0
+    while (pastFloor < 3) {
+      await runNextRetry(h, p)
+      if (h.clock.now() - at >= TMUX_UNRESPONSIVE_ONSET_FLOOR_MS) pastFloor++
+    }
+
+    // Every retry launched again and was refused: no delete, never counted.
+    const retries = h.attempts.filter((a) => a.key === p).length
+    expect(retries).toBeGreaterThanOrEqual(3)
+    expect(h.stub.calls.spawnCalls).toHaveLength(retries + 1)
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.episodeNotices).toEqual([{ key: p, text: tmuxUnresponsiveOnsetText(p) }])
+    expect(h.episodeNotices.filter((n) => n.key === b)).toEqual([])
+    expect(h.outageNotices).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(getFailureCount(p)).toBe(0)
+    assertNoLeak(h.captured())
+  })
+
+  test('a start-pass spawn that answers ErrTmuxUnresponsive once and then succeeds posts nothing, however far the clock moves', async () => {
+    const { h, p } = srj105Build({ alertThresholdMs: false })
+    rowAppearsOnSpawn(h, p)
+    h.script({ spawnQueue: [cannedErr(errTmuxUnresponsive('spawn'))] })
+    const at = h.clock.now()
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+    await runNextRetry(h, p)
+    expect(h.stub.calls.spawnCalls).toHaveLength(2)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    while (h.controller.isArmed(p)) await runNextRetry(h, p)
+    await h.advance(Math.max(0, at + 2 * TMUX_UNRESPONSIVE_ONSET_FLOOR_MS - h.clock.now()))
+
+    expect(h.episodeNotices).toEqual([])
+    expect(h.outageNotices).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  test('ErrTmuxKillFailed at a replacement kill posts no tmux-unresponsive notice across retries past the floor and the alert threshold, nor a spawn-failure notice', async () => {
+    const { h, p } = srj105Build({ action: 'scripted' })
+    h.script({ ...collidesOn(h, harnessPersona(h, p), elsewhere(h, 'waiting')), killError: errTmuxKillFailed() })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+    await h.advance(2 * adAlertThresholdMsInEffect())
+
+    expect(h.attempts.filter((a) => a.key === p).length).toBeGreaterThan(1)
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(h.episodeNotices).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
   })
 })
