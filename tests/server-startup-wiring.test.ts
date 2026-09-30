@@ -60,9 +60,11 @@
  *   installed once, in the statement right after the gate, behind no branch
  *   and with no `health_check_interval` or clock of its own, over the gate's
  *   version, agent-director's `resolveSystemBinary` and `recordStartupError`;
- *   its stop runs `shutdown` with the code the re-check passes; `shutdown`
- *   disposes it, exits with its code (the signals pass none, so 0) and makes
- *   no agent-director call.
+ *   its stop first arms the shutdown deadline (`armShutdownDeadline`, with
+ *   the stop's code, `process.exit` and no clock or deadline override; AC
+ *   21), then runs `shutdown` with the code the re-check passes; `shutdown`
+ *   disposes it, exits with its code (the signals pass none, so 0, and arm no
+ *   deadline) and makes no agent-director call.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -100,6 +102,7 @@ import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
 import type { runAgentDirectorStartupGate, StartupGateOptions } from '../src/agent-director-startup.ts'
 import { AD_VERSION_RECHECK_STOP_EXIT_CODE, type AdVersionRecheckDeps } from '../src/ad-version-gate.ts'
+import type { ShutdownDeadlineDeps } from '../src/shutdown-deadline.ts'
 
 const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url))
 const SERVER_PATH = join(SRC_DIR, 'server.ts')
@@ -401,6 +404,12 @@ describe('main() installs the runtime agent-director version re-check right afte
     'stop',
   ]
 
+  /**
+   * The options the stop passes to armShutdownDeadline, and only those: no
+   * `clock` (real timers) and no `deadlineMs` (the module's constant).
+   */
+  const ARM_OPTIONS: ReadonlyArray<keyof ShutdownDeadlineDeps> = ['exit', 'exitCode', 'log']
+
   /** A parameter name at the start of an arrow function: `(x) =>` or `x =>`. */
   const ARROW_PARAM = /^\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*=>/
 
@@ -479,6 +488,47 @@ describe('main() installs the runtime agent-director version re-check right afte
     const exits = exitsIn(stop!)
     expect(exits).toHaveLength(1)
     expect(splitTopLevel(callArguments(stop!, exits[0]!))).toEqual([code])
+  })
+
+  // No outside party ends a re-check stop (the CLI's SIGKILL follows only its
+  // own stop), so the stop arms the fallback exit before it runs shutdown.
+  // What the deadline does is driven in tests/shutdown-deadline.test.ts; this
+  // case pins that only this stop arms it, first, with the stop's code, the
+  // real exit and the module's own clock and deadline.
+  test('its stop arms the shutdown deadline first (SRJ-205, AC 21): the one armShutdownDeadline call, from shutdown-deadline.ts, with the stop\'s exit code, process.exit, the server log and no clock or deadline override; the signals and shutdown arm none', () => {
+    expect(importSource(SERVER_CODE, 'armShutdownDeadline')).toBe('./shutdown-deadline.ts')
+    expect(indicesOf(/\b(?:let|const|var|function)\s+armShutdownDeadline\b/g, SERVER_CODE)).toEqual([])
+    // The import and the one call are its only mentions: no alias, no second arm.
+    expect(indicesOf(/\barmShutdownDeadline\b/g, SERVER_CODE)).toHaveLength(2)
+    onlyCallOf('armShutdownDeadline')
+
+    const stop = onlyCallProps('installAdVersionRecheck').get('stop')
+    expect(stop).toBeDefined()
+    const code = stop!.match(ARROW_PARAM)![1]!
+    // The first statement of the stop's body, behind no branch, so it runs
+    // before the stop's shutdown call.
+    const body = stop!.slice(...balancedAfter(stop!, stop!.indexOf('=>'), '{', '}'))
+    expect(body.trimStart()).toMatch(/^armShutdownDeadline\s*\(/)
+    const arms = indicesOf(/(?<![\w.$])armShutdownDeadline\s*\(/g, stop!)
+    expect(arms).toHaveLength(1)
+    const shutdowns = shutdownCallsIn(stop!)
+    expect(shutdowns).toHaveLength(1)
+    expect(arms[0]!).toBeLessThan(shutdowns[0]!)
+
+    const args = splitTopLevel(callArguments(stop!, arms[0]!))
+    expect(args).toHaveLength(1)
+    const props = objectProperties(args[0]!)
+    expect([...props.keys()].sort()).toEqual([...ARM_OPTIONS])
+    expect(props.get('exitCode')).toBe(code)
+    expect(props.get('exit')).toMatch(/^process\s*\.\s*exit(?:\s*\.\s*bind\s*\(\s*process\s*\))?$/)
+    expect(props.get('log')).toMatch(/^\((\w+)\) => console\.error\(\1\)$/)
+
+    for (const signal of ['SIGTERM', 'SIGINT']) {
+      const handlers = indicesOf(new RegExp(`\\bprocess\\s*\\.\\s*(?:on|once)\\s*\\(\\s*['"]${signal}['"]`, 'g'), SERVER_CODE)
+      expect(handlers).toHaveLength(1)
+      expect([signal, indicesOf(/\barmShutdownDeadline\b/g, callArguments(SERVER_CODE, handlers[0]!))]).toEqual([signal, []])
+    }
+    expect(indicesOf(/\barmShutdownDeadline\b/g, shutdownCode())).toEqual([])
   })
 
   test('shutdown disposes the re-check exactly once, with no argument, before its first await and before it exits', () => {

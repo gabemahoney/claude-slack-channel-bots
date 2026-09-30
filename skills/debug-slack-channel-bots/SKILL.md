@@ -1552,7 +1552,8 @@ entry, right after the binary path). It still names the versions and the
 binary path, and the too-old entry still ends with the install-skill block.
 `server.log` then shows
 `[slack] Shutting down: the runtime version re-check refused the agent-director binary (see startup-errors.log)`
-and, last, `[slack] Shutdown complete`.
+and, last, `[slack] Shutdown complete` (or, if the shutdown hung,
+`[slack] Shutdown did not complete within 30 s — exiting with code 1`).
 
 - **Cause:** the binary was swapped, while the server ran, for an older
   build or one that fails the check (such as a `0.0.0-dev` development

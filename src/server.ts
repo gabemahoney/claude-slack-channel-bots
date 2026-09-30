@@ -192,6 +192,7 @@ import {
 } from './registry.ts'
 import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck } from './ad-version-gate.ts'
+import { armShutdownDeadline } from './shutdown-deadline.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
 import { createCronLog } from './cron-log.ts'
@@ -786,7 +787,9 @@ let cronScheduler: CronScheduler | null = null
  * agent-director client handle, removes the PID file and exits with
  * `exitCode`. It makes no agent-director call: every worker and row is left
  * as it is, and an apply already under way is not awaited. A second call
- * while one runs is a no-op.
+ * while one runs is a no-op. Its awaits have no deadline of their own; a
+ * re-check stop is bounded by the deadline `main()` arms before calling it
+ * (`shutdown-deadline.ts`).
  */
 async function shutdown(reason: string, exitCode = 0): Promise<void> {
   if (shuttingDown) return
@@ -1380,13 +1383,17 @@ export async function main(): Promise<void> {
   // Its baseline is the version the gate read. A re-check that refuses the
   // binary records one startup-errors entry, then runs shutdown() with a
   // non-zero exit code; a shutdown already running makes that a no-op, and a
-  // rejected shutdown still exits non-zero. shutdown() disposes it.
+  // rejected shutdown still exits non-zero. shutdown() disposes it. No outside
+  // party ends such a stop (the CLI's SIGKILL follows only its own stop), so
+  // an unref'd deadline (shutdown-deadline.ts) is armed first: a shutdown
+  // that hangs still exits with the same non-zero code (b.jg5 SRJ-205).
   const startupGate = await runAgentDirectorStartupGate()
   installAdVersionRecheck({
     resolveSystemBinary,
     baselineVersion: startupGate.adVersion,
     recordStartupError,
     stop: (exitCode) => {
+      armShutdownDeadline({ exitCode, exit: process.exit.bind(process), log: (line) => console.error(line) })
       shutdown('the runtime version re-check refused the agent-director binary (see startup-errors.log)', exitCode)
         .catch(() => process.exit(exitCode))
     },
