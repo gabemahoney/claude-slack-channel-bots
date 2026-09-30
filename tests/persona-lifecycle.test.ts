@@ -82,6 +82,7 @@ import {
   runRestartRetry,
   scheduleRestart,
 } from '../src/restart.ts'
+import { LIVENESS_READING_DEAD } from '../src/liveness-reading.ts'
 import { deletePersonaInstance, killPersonaInstance } from '../src/session-manager.ts'
 import {
   createUnavailableRetryController,
@@ -2023,7 +2024,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
     function initRestartFor(f: Fixture, launch: () => Promise<boolean>, up: () => boolean = () => true, delaySeconds = 0.001): void {
       initRestart({
         canRestart: (key) => { f.trail.push(`restart.canRestart:${key}`); return up() },
-        isSessionAlive: async () => false,
+        isSessionAlive: async () => LIVENESS_READING_DEAD,
         isSessionConnected: () => false,
         hasSessionStream: () => true,
         reconnectSession: async () => undefined,

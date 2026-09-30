@@ -41,6 +41,12 @@ import {
 } from '../src/session-manager.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import {
+  LIVENESS_READING_DEAD,
+  LIVENESS_READING_LIVE,
+  LIVENESS_READING_UNKNOWN,
+  type LivenessReading,
+} from '../src/liveness-reading.ts'
+import {
   createPersonaBringUpController,
   type PersonaBringUpController,
 } from '../src/persona-bringup-controller.ts'
@@ -96,7 +102,12 @@ function workList(...names: string[]): Record<string, string> {
 // ---------------------------------------------------------------------------
 
 type DepsOpts = {
-  isSessionAliveResult?: boolean     // default: false (session is dead)
+  isSessionAliveResult?: LivenessReading  // default: LIVENESS_READING_DEAD (b.jg5 SRJ-314)
+  // b.jg5 SRJ-314: per-persona scripted liveness answers, consumed
+  // one-per-isSessionAlive call like connectedSequence (the last repeats once
+  // exhausted). An `Error` entry is thrown instead of answered. Takes
+  // precedence over isSessionAliveResult and throwOnKey for that persona.
+  aliveSequence?: Record<string, Array<LivenessReading | Error>>
   isRestartPendingResult?: boolean   // simulates: timer scheduled, not yet fired
   isActiveLaunchingResult?: boolean  // simulates: launchSession actively in progress
   isAtCapResult?: boolean            // default: false; set true to simulate a capped persona
@@ -157,6 +168,7 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
   const scheduleRestartAtStreamCount: number[] = []
   const connectedCallCount = new Map<string, number>()
   const streamCallCount = new Map<string, number>()
+  const aliveCallCount = new Map<string, number>()
   let pendingCallCount = 0
   let atCapCallCount = 0
   let ticks = 0
@@ -173,10 +185,18 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
 
     async isSessionAlive(key) {
       isSessionAliveCalls.push(key)
+      const n = (aliveCallCount.get(key) ?? 0) + 1
+      aliveCallCount.set(key, n)
+      const seq = opts.aliveSequence?.[key]
+      if (seq && seq.length > 0) {
+        const answer = seq[Math.min(n - 1, seq.length - 1)]!
+        if (answer instanceof Error) throw answer
+        return answer
+      }
       if (opts.throwOnKey === key) {
         throw new Error(`simulated error for persona=${key}`)
       }
-      return opts.isSessionAliveResult ?? false
+      return opts.isSessionAliveResult ?? LIVENESS_READING_DEAD
     },
     isSessionConnected(key) {
       isSessionConnectedCalls.push(key)
@@ -265,7 +285,7 @@ beforeEach(() => {
 
 describe('startHealthCheck', () => {
   test('1. normal dead-session detection — scheduleRestart called for dead session', async () => {
-    const deps = makeDeps()  // isSessionAlive defaults to false; statRoute defaults to true
+    const deps = makeDeps()  // isSessionAlive reads dead by default; statRoute defaults to true
     initHealthCheck(deps)
 
     startHealthCheck(FAST_INTERVAL_S)
@@ -296,8 +316,8 @@ describe('startHealthCheck', () => {
     expect(deps.scheduleRestartCalls).toHaveLength(0)
   })
 
-  test('3. skip alive — isSessionAlive returns true → scheduleRestart never called', async () => {
-    const deps = makeDeps({ isSessionAliveResult: true })
+  test('3. skip alive — isSessionAlive reads live → scheduleRestart never called', async () => {
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     initHealthCheck(deps)
 
     startHealthCheck(FAST_INTERVAL_S)
@@ -310,7 +330,7 @@ describe('startHealthCheck', () => {
     const deps = makeDeps({
       personas: workList('failing_bot', 'dead_bot'),
       throwOnKey: 'failing_bot',
-      isSessionAliveResult: false,
+      isSessionAliveResult: LIVENESS_READING_DEAD,
     })
     initHealthCheck(deps)
 
@@ -325,17 +345,33 @@ describe('startHealthCheck', () => {
   // (type, safe code, message through `redactSlackLogText`, frames), never the
   // error itself. The message carries the leak marker only inside a fake token
   // and a `ticket=` URL, both of which redaction replaces. Every console.error
-  // argument is kept unformatted, so a raw error fails the leak check.
-  test('AC 20: a persona check throws an error carrying fake tokens — one "error checking" line naming its type, code and redacted message; the other persona is still restarted; nothing leaks', async () => {
-    const deps = makeDeps({ personas: workList('failing_bot', 'dead_bot'), maxTicks: 1 })
+  // argument is kept unformatted, so a raw error fails the leak check. b.jg5
+  // SRJ-314: a throwing liveness probe no longer reaches that catch; its line
+  // is the tick's `liveness unknown` skip, which describes the error the same
+  // way.
+  test.each<[string, 'statRoute' | 'isSessionAlive', string]>([
+    ['the working-directory stat', 'statRoute', '[slack] health-check: error checking persona=failing_bot: '],
+    ['the liveness probe (read as unknown)', 'isSessionAlive', '[slack] health-check: liveness unknown for persona=failing_bot (isSessionAlive failed: '],
+  ])('AC 20: %s throws an error carrying fake tokens — one line naming its type, code and redacted message; the other persona is still restarted; nothing leaks', async (_label, site, prefix) => {
+    const personas = workList('failing_bot', 'dead_bot')
+    const deps = makeDeps({ personas, maxTicks: 1 })
+    const thrown = Object.assign(new Error(`status failed (${sentinelInMessage('msg')})`), {
+      code: 'EIO',
+      detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
+      note: LEAK_SENTINEL,
+    })
     const alive = deps.isSessionAlive
-    deps.isSessionAlive = async (key) => {
-      if (key !== 'failing_bot') return alive(key)
-      throw Object.assign(new Error(`status failed (${sentinelInMessage('msg')})`), {
-        code: 'EIO',
-        detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
-        note: LEAK_SENTINEL,
-      })
+    const stat = deps.statRoute
+    if (site === 'isSessionAlive') {
+      deps.isSessionAlive = async (key) => {
+        if (key !== 'failing_bot') return alive(key)
+        throw thrown
+      }
+    } else {
+      deps.statRoute = async (cwd) => {
+        if (cwd !== personas.failing_bot) return stat(cwd)
+        throw thrown
+      }
     }
     initHealthCheck(deps)
     const errArgs: unknown[][] = []
@@ -349,11 +385,11 @@ describe('startHealthCheck', () => {
     }
 
     expect(deps.scheduleRestartCalls.map((c) => c.key)).toEqual(['dead_bot'])
-    const lines = errArgs.filter((args) => String(args[0]).includes('error checking'))
+    const lines = errArgs.filter((args) => String(args[0]).includes('persona=failing_bot'))
     expect(lines).toHaveLength(1)
     expect(lines[0]).toHaveLength(1)
     expect(String(lines[0]![0])).toStartWith(
-      `[slack] health-check: error checking persona=failing_bot: Error code=EIO message="status failed (${REDACTED_SENTINEL_TAIL})" at `,
+      `${prefix}Error code=EIO message="status failed (${REDACTED_SENTINEL_TAIL})" at `,
     )
     assertNoLeak({ errArgs, notices })
   })
@@ -384,7 +420,7 @@ describe('startHealthCheck', () => {
   // The unit-level guarantee is that initHealthCheck() alone does NOT start the
   // poller — the poller only starts when startHealthCheck() is explicitly called.
   test('T26: initHealthCheck alone does not start poller — isSessionAlive not called until startHealthCheck is invoked', async () => {
-    const deps = makeDeps({ isSessionAliveResult: false })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD })
     initHealthCheck(deps)
 
     // Deliberately do NOT call startHealthCheck — simulate the window between
@@ -396,7 +432,7 @@ describe('startHealthCheck', () => {
   })
 
   test('T26: poller starts immediately once startHealthCheck is called after writeSessions phase', async () => {
-    const deps = makeDeps({ isSessionAliveResult: true })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     initHealthCheck(deps)
 
     // Simulate the writeSessions phase completing — then start health check
@@ -418,7 +454,7 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
     setOutageFlag(KEY, 'cwd-unreachable', WD)
     expect(getOutageFlags(KEY).has('cwd-unreachable')).toBe(true)
 
-    const deps = makeDeps({ statRouteResult: true, isSessionAliveResult: true })
+    const deps = makeDeps({ statRouteResult: true, isSessionAliveResult: LIVENESS_READING_LIVE })
     initHealthCheck(deps)
 
     startHealthCheck(FAST_INTERVAL_S)
@@ -435,8 +471,8 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
   test('(b) statRoute returns false → cwd-unreachable raised under the persona key with its working directory', async () => {
     expect(getOutageFlags(KEY).has('cwd-unreachable')).toBe(false)
 
-    // isSessionAliveResult: true so scheduleRestart is NOT called — isolates statRoute effect
-    const deps = makeDeps({ statRouteResult: false, isSessionAliveResult: true })
+    // A `live` reading, so scheduleRestart is NOT called — isolates statRoute effect
+    const deps = makeDeps({ statRouteResult: false, isSessionAliveResult: LIVENESS_READING_LIVE })
     initHealthCheck(deps)
 
     startHealthCheck(FAST_INTERVAL_S)
@@ -450,8 +486,8 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
     expect(notices).toEqual([{ key: KEY, text: ONSET_TEMPLATES['cwd-unreachable'](WD) }])
   })
 
-  test('(c) scheduleRestart is called when isSessionAlive returns false', async () => {
-    const deps = makeDeps({ statRouteResult: true, isSessionAliveResult: false })
+  test('(c) scheduleRestart is called when isSessionAlive reads dead', async () => {
+    const deps = makeDeps({ statRouteResult: true, isSessionAliveResult: LIVENESS_READING_DEAD })
     initHealthCheck(deps)
 
     startHealthCheck(FAST_INTERVAL_S)
@@ -550,7 +586,7 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
     // re-schedule restarts. The tick logs a message and continues past the persona.
     const deps = makeDeps({
       isAtCapResult: true,
-      isSessionAliveResult: false,  // would trigger restart if not capped
+      isSessionAliveResult: LIVENESS_READING_DEAD,  // would trigger restart if not capped
     })
     initHealthCheck(deps)
 
@@ -570,7 +606,7 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
   test('SR-25.3: non-capped persona proceeds — dead session triggers scheduleRestart', async () => {
     const deps = makeDeps({
       isAtCapResult: false,
-      isSessionAliveResult: false,
+      isSessionAliveResult: LIVENESS_READING_DEAD,
     })
     initHealthCheck(deps)
 
@@ -603,7 +639,7 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
 
       async isSessionAlive(key) {
         isSessionAliveCalls.push(key)
-        return false  // both personas are dead
+        return LIVENESS_READING_DEAD  // both personas are dead
       },
       isSessionConnected(_key) {
         return true
@@ -653,7 +689,7 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
 //
 // Before b.9a7 the tick did `if (!alive) scheduleRestart(...)`, so a persona in
 // an AD live state (e.g. `waiting`) whose MCP session was disconnected
-// (isSessionAlive === true, isSessionConnected === false) was NEVER scheduled
+// (isSessionAlive reads live, isSessionConnected === false) was NEVER scheduled
 // for recovery by any periodic mechanism — the gap was unbounded. The fix routes
 // alive-but-disconnected rows through scheduleRestart, but only after TWO
 // consecutive disconnected observations (design decision 2: the freshly-launched
@@ -668,7 +704,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // scheduleRestart is NEVER called for this persona. Post-fix it is called —
     // and specifically on the SECOND disconnected observation (the debounce
     // covers the freshly-launched, not-yet-connected window, AC 6).
-    const deps = makeDeps({ isSessionAliveResult: true, isSessionConnectedResult: false })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false })
     initHealthCheck(deps)
 
     startHealthCheck(FAST_INTERVAL_S)
@@ -693,7 +729,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // the `disconnectedStreak.delete` on the connected branch, the leading false
     // would carry forward and the post-reset false would fire on the 2nd call.
     const deps = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       connectedSequence: { [KEY]: [false, true, false, true] },
     })
     initHealthCheck(deps)
@@ -714,7 +750,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // fire, so fires land on the 2nd, 4th, 6th... disconnected observation —
     // never on consecutive observations. This exercises the `disconnectedStreak
     // .delete` on the schedule branch.
-    const deps = makeDeps({ isSessionAliveResult: true, isSessionConnectedResult: false })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false })
     initHealthCheck(deps)
 
     startHealthCheck(FAST_INTERVAL_S)
@@ -733,7 +769,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // persona entirely — even when alive && !connected. This is the existing
     // isRestartPendingOrActive skip; it must cover the new reconnect path too.
     const deps = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       isSessionConnectedResult: false,
       isRestartPendingResult: true,
     })
@@ -751,7 +787,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // AC 6: a launch in progress is the freshly-launched window; the tick must
     // not poke it. isActiveLaunchingResult drives isRestartPendingOrActive true.
     const deps = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       isSessionConnectedResult: false,
       isActiveLaunchingResult: true,
     })
@@ -766,10 +802,10 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
 
   test('4c. dead session still schedules immediately on the FIRST tick (no debounce regression)', async () => {
     // The two-tick debounce applies ONLY to the alive-but-disconnected path. A
-    // dead session (isSessionAlive false) must still schedule on the first tick,
+    // dead session (isSessionAlive reads dead) must still schedule on the first tick,
     // as before b.9a7. isSessionConnected is irrelevant on the dead path — the
     // fire happens with connected-call-count 0 (never probed).
-    const deps = makeDeps({ isSessionAliveResult: false, isSessionConnectedResult: false })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD, isSessionConnectedResult: false })
     initHealthCheck(deps)
 
     startHealthCheck(FAST_INTERVAL_S)
@@ -788,7 +824,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // the connectedness probe.
     const deps = makeDeps({
       isAtCapResult: true,
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       isSessionConnectedResult: false,
     })
     initHealthCheck(deps)
@@ -808,7 +844,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // observation after reset does NOT immediately fire (it would if the old
     // streak leaked as 1).
     const deps1 = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       // exactly one disconnected observation then connected — leaves streak at 1
       connectedSequence: { [KEY]: [false, true] },
     })
@@ -826,7 +862,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // Fresh run: one disconnected observation then connected. If the streak had
     // leaked (still 1), this single false would reach 2 and fire. It must not.
     const deps2 = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       connectedSequence: { [KEY]: [false, true] },
     })
     initHealthCheck(deps2)
@@ -848,7 +884,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // so the very first post-skip disconnected tick (call 2) would reach 2 and
     // fire at connected-call-count 2. Asserting 3 pins the fix.
     const deps = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       isSessionConnectedResult: false,
       pendingSequence: [false, true, false, false],  // last (false) repeats
     })
@@ -872,7 +908,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     //   tick3: cap=false → !connected → fresh streak=1 (call 2)
     //   tick4: cap=false → !connected → streak=2 → FIRE (call 3)
     const deps = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       isSessionConnectedResult: false,
       atCapSequence: [false, true, false, false],  // last (false) repeats
     })
@@ -903,7 +939,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     const [DROP, STAY] = Object.keys(full)
     const onlyStay = { [STAY]: full[STAY] }
     const deps = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       connectedSequence: { [DROP]: [false], [STAY]: [true] },
       personasSequence: [full, onlyStay, full, full],  // last (full) repeats
     })
@@ -944,7 +980,7 @@ describe('b.9cj connected-but-streamless tick recovery', () => {
     // the SECOND streamless observation (shares the b.9a7 debounce for the
     // freshly-launched, stream-not-yet-open window).
     const deps = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       isSessionConnectedResult: true,   // connected …
       hasSessionStreamResult: false,    // … but streamless
     })
@@ -965,7 +1001,7 @@ describe('b.9cj connected-but-streamless tick recovery', () => {
     // scheduled. Prove it also RESETS the streak: a lone streamless blip
     // followed by a stream-present tick never reaches two consecutive.
     const deps = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       isSessionConnectedResult: true,
       // false (streak→1), true (reset), false (fresh streak→1), true (reset) …
       streamSequence: { [KEY]: [false, true, false, true] },
@@ -990,7 +1026,7 @@ describe('b.9cj connected-but-streamless tick recovery', () => {
     // share the same debounced branch and streak map. hasSessionStreamResult is
     // set false here only to prove it is irrelevant when disconnected.
     const deps = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       isSessionConnectedResult: false,   // disconnected — first operand short-circuits
       hasSessionStreamResult: false,     // would also route here, but is never reached
     })
@@ -1031,7 +1067,7 @@ describe('persona-keyed work list and streaks (b.av2 SR-6.3)', () => {
     const personas = buildPersonaWorkList(config)
     expect(personas).toEqual({ [a.key]: a.working_directory, [b.key]: b.working_directory })
 
-    const deps = makeDeps({ personas, isSessionAliveResult: false, maxTicks: 1 })
+    const deps = makeDeps({ personas, isSessionAliveResult: LIVENESS_READING_DEAD, maxTicks: 1 })
     initHealthCheck(deps)
     startHealthCheck(FAST_INTERVAL_S)
     await Bun.sleep(WAIT_MS)
@@ -1067,7 +1103,7 @@ describe('persona-keyed work list and streaks (b.av2 SR-6.3)', () => {
     const personas = workList('persona_a', 'persona_b')
     const deps = makeDeps({
       personas,
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       connectedSequence: { persona_a: [false], persona_b: [true, false] },
       maxTicks: 2,
     })
@@ -1103,7 +1139,7 @@ describe('forgetDisconnectedStreak — per-persona teardown (b.av2 SR-6.5)', () 
   test('B\'s streak is dropped at once and silently, A\'s is kept; B then leaves the work list (not probed) and is re-added with a fresh streak', async () => {
     const full = workList('persona_a', 'persona_b')
     const onlyA = { persona_a: full.persona_a }
-    const disconnected = { isSessionAliveResult: true, isSessionConnectedResult: false }
+    const disconnected = { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false }
 
     // One tick: both alive-but-disconnected, so each has a streak of 1.
     const before = makeDeps({ ...disconnected, personas: full, maxTicks: 1 })
@@ -1163,7 +1199,7 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
     //   tick1: not in flight → alive && !connected → streak 1 (connected call 1)
     //   tick2: in flight     → skipped, streak cleared
     //   tick3: → fresh streak 1 (call 2); tick4: → streak 2 → scheduled (call 3)
-    const deps = makeDeps({ isSessionAliveResult: true, isSessionConnectedResult: false, maxTicks: 4 })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false, maxTicks: 4 })
     const inFlight = [false, true, false, false]
     const asked: string[] = []
     deps.isLaunchInFlight = (key) => inFlight[Math.min(asked.push(key) - 1, inFlight.length - 1)]!
@@ -1184,7 +1220,7 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
   ])('auto-restart %s: the alive persona is scheduled every second tick; with auto-restart disabled each schedule asks for the not-connected notice with the persona and why, raised once for the episode', async (_label, disabled, down, cause, notice) => {
     const raised: Array<{ key: string; text: string }> = []
     setSessionNotifier((key, text) => { raised.push({ key, text }) })
-    const deps = makeDeps({ isSessionAliveResult: true, ...down, maxTicks: 6 })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, ...down, maxTicks: 6 })
     deps.isAutoRestartDisabled = () => disabled
     const asked: Array<[number, string, string]> = []
     deps.notifyNotConnected = (key, why) => {
@@ -1208,7 +1244,7 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
     const raised: Array<{ key: string; text: string }> = []
     setSessionNotifier((key, text) => { raised.push({ key, text }) })
     expect(notifyPersonaNotConnected(KEY, { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 10 * 60_000 })).toBe(true)
-    const deps = makeDeps({ isSessionAliveResult: true, isSessionConnectedResult: false, maxTicks: 4 })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false, maxTicks: 4 })
     deps.isAutoRestartDisabled = () => true
     let asked = 0
     deps.notifyNotConnected = (key, why) => {
@@ -1230,7 +1266,7 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
     //   ticks 4–5: disconnected → scheduled at tick 5, the notice raised again
     const raised: Array<{ key: string; text: string }> = []
     setSessionNotifier((key, text) => { raised.push({ key, text }) })
-    const deps = makeDeps({ isSessionAliveResult: true, connectedSequence: { [KEY]: [false, false, true, false, false] }, maxTicks: 5 })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, connectedSequence: { [KEY]: [false, false, true, false, false] }, maxTicks: 5 })
     deps.isAutoRestartDisabled = () => true
     deps.notifyNotConnected = notifyDisconnectedWithAutoRestartDisabled
     const ended: Array<[number, string]> = []
@@ -1250,7 +1286,7 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
     ['pending', true, [1, 2]],
     ['none', false, [2]],
   ])('working-row evidence %s: an alive persona not deliverable is scheduled from its first undeliverable tick when evidence is pending, else from its second', async (_label, pending, scheduledAt) => {
-    const deps = makeDeps({ isSessionAliveResult: true, isSessionConnectedResult: false, maxTicks: 2 })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false, maxTicks: 2 })
     deps.hasPendingWorkingRowEvidence = () => pending
 
     await runTicks(deps, 2)
@@ -1259,12 +1295,91 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
   })
 
   test('pending working-row evidence schedules nothing for a persona that is connected with its stream', async () => {
-    const deps = makeDeps({ isSessionAliveResult: true, maxTicks: 2 })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, maxTicks: 2 })
     deps.hasPendingWorkingRowEvidence = () => true
 
     await runTicks(deps, 2)
 
     expect(deps.scheduleRestartCalls).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-314 — an `unknown` reading, or a probe that threw, skips the tick
+//
+// Only `dead` schedules a restart. An `unknown` reading (a `status` error
+// agent-director could not answer) or a thrown probe skips the persona for the
+// tick: nothing is scheduled, no not-connected notice is asked for, the
+// episode is not ended, and its disconnected streak is cleared, as every skip
+// clears it (ruling (b)). The tick has no retry-timer hook, so it arms nothing.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-314: an unknown reading or a thrown probe skips the persona for the tick', () => {
+  const UNSURE: Array<[string, LivenessReading | Error]> = [
+    ['an unknown reading', LIVENESS_READING_UNKNOWN],
+    ['a thrown probe', new Error('simulated status failure')],
+  ]
+
+  test.each(UNSURE.flatMap(([label, answer]) => [
+    [`${label}, the session connected with its stream`, answer, {}],
+    [`${label}, the session disconnected`, answer, { isSessionConnectedResult: false }],
+  ] as Array<[string, LivenessReading | Error, DepsOpts]>))('%s: over three ticks nothing is scheduled, no notice asked for and no episode ended; connectedness is never probed', async (_label, answer, conn) => {
+    // Were the answer read as dead, tick 1 would schedule; read as alive, a
+    // connected session would end its episode each tick and a disconnected
+    // one would be scheduled (and noticed, auto-restart disabled) on tick 2.
+    const deps = makeDeps({ ...conn, aliveSequence: { [KEY]: [answer] }, maxTicks: 3 })
+    deps.isAutoRestartDisabled = () => true
+    const notified: string[] = []
+    const ended: string[] = []
+    deps.notifyNotConnected = (key) => void notified.push(key)
+    deps.endNotConnectedEpisode = (key) => void ended.push(key)
+
+    await runTicks(deps, 3)
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY, KEY])
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(notified).toEqual([])
+    expect(ended).toEqual([])
+    expect(deps.isSessionConnectedCalls).toEqual([])
+    expect(deps.hasSessionStreamCalls).toEqual([])
+  })
+
+  test.each(UNSURE)('the streak is cleared by %s: undeliverable, then unsure, then undeliverable schedules nothing; a second undeliverable tick after it schedules', async (_label, answer) => {
+    //   tick1: live, !connected → streak 1 (connected call 1)
+    //   tick2: unsure           → skipped, streak cleared (not probed)
+    //   tick3: live, !connected → fresh streak 1 (call 2) — nothing scheduled
+    //   tick4: live, !connected → streak 2 → scheduled (call 3)
+    // A streak kept across tick 2 would schedule at call 2 (tick 3).
+    const deps = makeDeps({
+      isSessionConnectedResult: false,
+      aliveSequence: { [KEY]: [LIVENESS_READING_LIVE, answer, LIVENESS_READING_LIVE] },
+      maxTicks: 4,
+    })
+
+    await runTicks(deps, 4)
+
+    expect(deps.isSessionAliveCalls).toHaveLength(4)
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([3])
+  })
+
+  test.each(UNSURE)('%s for one persona in a tick: the other persona, read dead, is still scheduled in the same tick', async (_label, answer) => {
+    const personas = workList('unsure_bot', 'dead_bot')
+    const deps = makeDeps({ personas, aliveSequence: { unsure_bot: [answer] }, maxTicks: 1 })
+
+    await runTicks(deps, 1)
+
+    expect(deps.isSessionAliveCalls).toEqual(['unsure_bot', 'dead_bot'])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: 'dead_bot', cwd: personas.dead_bot! }])
+  })
+
+  test.each(UNSURE)('%s on one tick, then dead on the next: the restart is scheduled at once on the dead tick', async (_label, answer) => {
+    const deps = makeDeps({ aliveSequence: { [KEY]: [answer, LIVENESS_READING_DEAD] }, maxTicks: 2 })
+
+    await runTicks(deps, 2)
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
   })
 })
 
@@ -1365,7 +1480,7 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
     let expectedDone = 0
     let done = 0
     initHealthCheck({
-      isSessionAlive: async (key) => (calls.alive.push(key), false),
+      isSessionAlive: async (key) => (calls.alive.push(key), LIVENESS_READING_DEAD),
       isSessionConnected: () => false,
       hasSessionStream: () => false,
       isRestartPendingOrActive: (key) => (calls.pending.push(key), false),

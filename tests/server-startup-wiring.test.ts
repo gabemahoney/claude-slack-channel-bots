@@ -88,7 +88,9 @@
  *   its action is the full-mode retry action over `runRestartRetry`,
  *   `getAppliedPersona`, the relaunch gate, the restart cap, the restart
  *   module's shutdown flag, `isLaunchInFlight` and the session manager's
- *   row read `readPersonaRowState` (SRJ-303); shutdown closes it once, right after `cancelAllRestartTimers`, after the
+ *   row read `readPersonaRowState` (SRJ-303); the restart module's arm hook
+ *   (`armRetryTimer`) arms it with the read-error cause (SRJ-314); shutdown
+ *   closes it once, right after `cancelAllRestartTimers`, after the
  *   shutting-down flag and before the HTTP server stops.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
@@ -1277,7 +1279,7 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
 // tests/unavailable-retry.test.ts; the teardown's stop is pinned in
 // tests/reload-wiring.test.ts. Pinned here: placement, and which production
 // function backs each of the full-mode retry action's stop and in-flight
-// reads.
+// reads, and what the restart module's arm hook arms.
 // ---------------------------------------------------------------------------
 
 describe('main() installs one UNAVAILABLE retry controller as the trigger sink before the start bring-up, and shutdown stops every retry timer (b.jg5 SRJ-301, SRJ-305)', () => {
@@ -1389,6 +1391,24 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
     // manager's, one `status` call through the outage wrapper.
     expect(props.get('readRow')).toBe('readPersonaRowState')
     expect(importSource(SERVER_CODE, 'readPersonaRowState')).toBe('./session-manager.ts')
+  })
+
+  // b.jg5 SRJ-314: the restart module's arm hook is optional (absent, nothing
+  // is armed), so a production wiring that dropped it, or bound it to a stub
+  // or another controller, would type-check and pass every behaviour suite
+  // while an `unknown` liveness reading armed no retry. What the hook's call
+  // does is tested in tests/restart.test.ts; pinned here: its binding.
+  test('the restart module\'s arm hook (armRetryTimer) arms this controller for the persona it is given, with the read-error cause (b.jg5 SRJ-314, SRJ-301)', () => {
+    const controller = constOf('createUnavailableRetryController')
+    const hook = onlyCallProps('initRestart').get('armRetryTimer')
+    expect(hook).toBeDefined()
+    // `(key) => { <controller>.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR }) }`,
+    // or the same call as an expression body; the parameter's name is free.
+    const arm = `${controller}\\.arm\\(\\1, \\{ kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR \\}\\)`
+    expect(hook).toMatch(new RegExp(`^\\(?(\\w+)\\)? => (?:\\{ ${arm};? \\}|${arm})$`))
+    expect(importSource(SERVER_CODE, 'UNAVAILABLE_RETRY_CAUSE_READ_ERROR')).toBe('./unavailable-retry.ts')
+    // The controller is built before the restart module is initialised.
+    expect(onlyCallOf('createUnavailableRetryController')).toBeLessThan(onlyCallOf('initRestart'))
   })
 })
 

@@ -46,6 +46,7 @@ import {
   isRestartPendingOrActive,
   RESTART_FAILURE_CAP,
 } from '../src/restart.ts'
+import { LIVENESS_READING_LIVE } from '../src/liveness-reading.ts'
 import { recordFailure } from '../src/backoff.ts'
 import { consumeAck } from '../src/ack-tracker.ts'
 import type { Persona } from '../src/config.ts'
@@ -473,7 +474,7 @@ describe('b.9cj hasSessionStream over the real registry', () => {
     let reconnectCalls = 0
     initRestart({
       ...makeRestartDeps({ restartDelayS: FAST_DELAY_S }),
-      async isSessionAlive() { return true },
+      async isSessionAlive() { return LIVENESS_READING_LIVE },
       isSessionConnected() { return true },
       hasSessionStream,
       async reconnectSession() { reconnectCalls++; return 'success' },

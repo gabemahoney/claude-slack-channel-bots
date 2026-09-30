@@ -8,11 +8,17 @@ import {
   sanitizeFilename,
 } from '../src/lib.ts'
 import type { Client } from 'agent-director'
+import { CSCB_UNKNOWN_ERROR_NAME } from '../src/ad-error-class.ts'
 import {
-  ErrSpawnNotFound,
-  ErrSystemInstallDisappeared,
-  ErrTmuxNotAvailable,
-} from '../src/agent-director-errors.ts'
+  AGENT_DIRECTOR_DEAD_STATES,
+  AGENT_DIRECTOR_LIVE_STATES,
+  AGENT_DIRECTOR_PENDING_STATE,
+  LIVENESS_READING_DEAD,
+  LIVENESS_READING_LIVE,
+  LIVENESS_READING_PENDING,
+  LIVENESS_READING_UNKNOWN,
+  type LivenessReading,
+} from '../src/liveness-reading.ts'
 import {
   _resetOutageState,
   initOutageState,
@@ -29,8 +35,20 @@ import {
   makeCloseCountingStubClient,
   makeStubClient,
   makeStubCreateClient,
+  errCallTimeout,
+  errConfigMalformed,
+  errGeneric,
+  errInternal,
+  errSchemaMismatch,
+  errSpawnNotFound,
   errSpawnNotInteractive,
+  errSystemInstallDisappeared,
+  errTmuxCaptureFailed,
+  errTmuxNotAvailable,
   errTmuxSendKeys,
+  errTmuxUnresponsive,
+  errUnknownErrorName,
+  errUnusableName,
   holdSpawns,
   type CloseCountingStubClient,
   type StubClient,
@@ -395,11 +413,20 @@ describe('sanitizeFilename', () => {
 })
 
 // ---------------------------------------------------------------------------
-// _buildIsSessionAliveAdapter (SRD § Liveness probe, Epic 2 Task 1)
+// _buildIsSessionAliveAdapter (SRD § Liveness probe, Epic 2 Task 1; b.jg5
+// SRJ-314: four readings, and a `status` error never reads dead unless it is
+// ErrSpawnNotFound or ErrSystemInstallDisappeared)
 // ---------------------------------------------------------------------------
 
 describe('_buildIsSessionAliveAdapter', () => {
   type Emission = { key: string; text: string }
+
+  /** The live states other than `pending`: each reads `live`. */
+  const LIVE_NOT_PENDING_STATES = [...AGENT_DIRECTOR_LIVE_STATES].filter((s) => s !== AGENT_DIRECTOR_PENDING_STATE)
+  /** A live state the harness's `status` answers by default. */
+  const LIVE_STATE = LIVE_NOT_PENDING_STATES[0]!
+  /** A state string CSCB does not know (from a later binary). */
+  const UNRECOGNISED_STATE = 'a-state-from-a-later-binary'
 
   /** Per-test temp dir: `baseDir` for the stand-in persona fixtures. */
   let baseDir: string
@@ -416,12 +443,12 @@ describe('_buildIsSessionAliveAdapter', () => {
   /** Build per-test emission capture + stub client + outage-state harness. */
   function makeHarness(
     statusError?: Error,
-    statusState?: string,
+    statusState: string = LIVE_STATE,
     config: PersonaConfig | null = standIns('C1'),
   ): {
     emissions: Emission[]
     statusCalls: StatusParams[]
-    adapter: (channelId: string) => Promise<boolean>
+    adapter: (key: string) => Promise<LivenessReading>
   } {
     const emissions: Emission[] = []
     const statusCalls: StatusParams[] = []
@@ -432,7 +459,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     })
     const stubOpts = statusError
       ? { statusError, statusCalls }
-      : { statusResult: { state: statusState ?? 'waiting' }, statusCalls }
+      : { statusResult: { state: statusState }, statusCalls }
     setClientForTests(makeStubClient(stubOpts) as unknown as Client)
     // Default persona config: one stand-in persona keyed C1.
     return {
@@ -442,14 +469,29 @@ describe('_buildIsSessionAliveAdapter', () => {
     }
   }
 
+  /** Probe `key` with every console.error argument list captured (kept unformatted). */
+  async function probeCapturingErrors(
+    adapter: (key: string) => Promise<LivenessReading>,
+    key: string,
+  ): Promise<{ result: LivenessReading; errArgs: unknown[][] }> {
+    const errArgs: unknown[][] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    try {
+      return { result: await adapter(key), errArgs }
+    } finally {
+      console.error = orig
+    }
+  }
+
   afterEach(() => {
     resetClientForTests()
     _resetOutageState()
     rmSync(baseDir, { recursive: true, force: true })
   })
 
-  test('1. alive: status returns live state → clears ad-unreachable + tmux-unavailable; returns true', async () => {
-    const { emissions, statusCalls, adapter } = makeHarness(undefined, 'waiting')
+  test('1. alive: status returns a live state → clears ad-unreachable + tmux-unavailable; reads live', async () => {
+    const { emissions, statusCalls, adapter } = makeHarness(undefined, LIVE_STATE)
     // Pre-raise both flags so the clears are observable
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     setOutageFlag('C1', 'tmux-unavailable')
@@ -457,7 +499,7 @@ describe('_buildIsSessionAliveAdapter', () => {
 
     const result = await adapter('C1')
 
-    expect(result).toBe(true)
+    expect(result).toEqual(LIVENESS_READING_LIVE)
     // b.av2 SR-2.2: the probe addresses the persona's cscb_<key> instance.
     expect(statusCalls).toHaveLength(1)
     expect(statusCalls[0].claude_instance_id).toBe(personaInstanceId('C1'))
@@ -471,17 +513,35 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(newEmissions[0].text).toContain('tmux-unavailable')
   })
 
-  test('2. ErrSpawnNotFound: status throws → clears ad-unreachable + tmux-unavailable; returns false', async () => {
-    const { emissions, statusCalls, adapter } = makeHarness(
-      new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'spawn not found'),
-    )
+  // b.jg5 SRJ-314: `pending` is its own reading (never `live`); the dead list
+  // is closed, so a state CSCB does not know reads `unknown`, never `dead`.
+  // Any state answer clears both flags.
+  test.each([
+    ...LIVE_NOT_PENDING_STATES.map((s) => [s, LIVENESS_READING_LIVE] as const),
+    [AGENT_DIRECTOR_PENDING_STATE, LIVENESS_READING_PENDING] as const,
+    ...[...AGENT_DIRECTOR_DEAD_STATES].map((s) => [s, LIVENESS_READING_DEAD] as const),
+    [UNRECOGNISED_STATE, LIVENESS_READING_UNKNOWN] as const,
+  ])('status answers state %s → reads %j and clears both flags', async (state, reading) => {
+    const { statusCalls, adapter } = makeHarness(undefined, state)
+    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
+    setOutageFlag('C1', 'tmux-unavailable')
+
+    const { result } = await probeCapturingErrors(adapter, 'C1')
+
+    expect(result).toEqual(reading)
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(getOutageFlags('C1').size).toBe(0)
+  })
+
+  test('2. ErrSpawnNotFound: status throws → clears ad-unreachable + tmux-unavailable; reads dead', async () => {
+    const { emissions, statusCalls, adapter } = makeHarness(errSpawnNotFound())
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     setOutageFlag('C1', 'tmux-unavailable')
     const before = emissions.length
 
     const result = await adapter('C1')
 
-    expect(result).toBe(false)
+    expect(result).toEqual(LIVENESS_READING_DEAD)
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     expect(getOutageFlags('C1').size).toBe(0)
     const newEmissions = emissions.slice(before)
@@ -491,15 +551,13 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(newEmissions[0].text).toContain('tmux-unavailable')
   })
 
-  test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; returns false', async () => {
+  test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; reads dead', async () => {
     const binaryPath = '/home/horde/.agent-director/bin/agent-director'
-    const { emissions, statusCalls, adapter } = makeHarness(
-      new ErrSystemInstallDisappeared('status', binaryPath),
-    )
+    const { emissions, statusCalls, adapter } = makeHarness(errSystemInstallDisappeared('status', binaryPath))
 
     const result = await adapter('C1')
 
-    expect(result).toBe(false)
+    expect(result).toEqual(LIVENESS_READING_DEAD)
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
     expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(false)
@@ -509,14 +567,12 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions[0].text).toContain(binaryPath)
   })
 
-  test('4. ErrTmuxNotAvailable: status throws → sets tmux-unavailable (no detail); returns false', async () => {
-    const { emissions, statusCalls, adapter } = makeHarness(
-      new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not found'),
-    )
+  test('4. ErrTmuxNotAvailable: status throws → sets tmux-unavailable (no detail); reads unknown, not dead', async () => {
+    const { emissions, statusCalls, adapter } = makeHarness(errTmuxNotAvailable(undefined, 'status'))
 
     const result = await adapter('C1')
 
-    expect(result).toBe(false)
+    expect(result).toEqual(LIVENESS_READING_UNKNOWN)
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(true)
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(false)
@@ -527,11 +583,38 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions[0].text).not.toContain('undefined')
   })
 
-  test('5. each persona is probed by its own key: cscb_<key> for the key passed (b.av2 SR-2.2)', async () => {
-    const { statusCalls, adapter } = makeHarness(undefined, 'waiting', standIns('C1', 'C2'))
+  // b.jg5 SRJ-314: every other `status` error reads `unknown`, never `dead`,
+  // and raises no outage flag here (a CONFIG answer's `ad-config-malformed`
+  // outage is E12's). One log line, from the catch-all.
+  test.each([
+    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed()],
+    ['ErrCallTimeout', () => errCallTimeout('status')],
+    ['ErrTmuxUnresponsive (by name)', () => errTmuxUnresponsive('status')],
+    ['ErrInternal (an unknown name)', () => errInternal()],
+    ['a wrapped UnknownError', () => errGeneric('status', CSCB_UNKNOWN_ERROR_NAME, 'Error: boom')],
+    ['a name from a later binary', () => errUnknownErrorName()],
+    ['a plain Error', () => new Error('boom')],
+    ['another STATE name (ErrSpawnNotInteractive)', () => errSpawnNotInteractive('status')],
+    ['an UNUSABLE NAME ErrInternal', () => errUnusableName()],
+    ['a store agent-director cannot open (ErrSchemaMismatch)', () => errSchemaMismatch()],
+    ['a GONE name (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(undefined, 'status')],
+  ])('%s: status throws → reads unknown, not dead; no flag, nothing posted, one log line', async (_label, build) => {
+    const { emissions, statusCalls, adapter } = makeHarness(build())
 
-    expect(await adapter('C2')).toBe(true)
-    expect(await adapter('C1')).toBe(true)
+    const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
+
+    expect(result).toEqual(LIVENESS_READING_UNKNOWN)
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(getOutageFlags('C1').size).toBe(0)
+    expect(emissions).toHaveLength(0)
+    expect(errArgs).toHaveLength(1)
+  })
+
+  test('5. each persona is probed by its own key: cscb_<key> for the key passed (b.av2 SR-2.2)', async () => {
+    const { statusCalls, adapter } = makeHarness(undefined, LIVE_STATE, standIns('C1', 'C2'))
+
+    expect(await adapter('C2')).toEqual(LIVENESS_READING_LIVE)
+    expect(await adapter('C1')).toEqual(LIVENESS_READING_LIVE)
 
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([
       personaInstanceId('C2'),
@@ -539,24 +622,24 @@ describe('_buildIsSessionAliveAdapter', () => {
     ])
   })
 
-  test('6. unknown key: returns false without a status call and without touching outage flags', async () => {
-    const { emissions, statusCalls, adapter } = makeHarness(undefined, 'waiting')
+  test('6. unknown key: reads dead without a status call and without touching outage flags', async () => {
+    const { emissions, statusCalls, adapter } = makeHarness(undefined, LIVE_STATE)
     setOutageFlag('C9', 'ad-unreachable', '/bin/ad')
     const before = emissions.length
 
     const result = await adapter('C9')
 
-    expect(result).toBe(false)
+    expect(result).toEqual(LIVENESS_READING_DEAD)
     expect(statusCalls).toHaveLength(0)
     // No probe ran, so nothing was cleared and no all-clear was posted.
     expect(getOutageFlags('C9').has('ad-unreachable')).toBe(true)
     expect(emissions.slice(before)).toHaveLength(0)
   })
 
-  test('7. no persona config (MCP_HOST/MCP_PORT fallback): returns false without a status call', async () => {
-    const { statusCalls, adapter } = makeHarness(undefined, 'waiting', null)
+  test('7. no persona config (MCP_HOST/MCP_PORT fallback): reads dead without a status call', async () => {
+    const { statusCalls, adapter } = makeHarness(undefined, LIVE_STATE, null)
 
-    expect(await adapter('C1')).toBe(false)
+    expect(await adapter('C1')).toEqual(LIVENESS_READING_DEAD)
     expect(statusCalls).toHaveLength(0)
   })
 
@@ -565,24 +648,17 @@ describe('_buildIsSessionAliveAdapter', () => {
   // frames), never the error itself. The message carries the leak marker only
   // inside a fake token and a `ticket=` URL, both of which redaction replaces.
   // Every console.error argument is kept unformatted, so a raw error fails the check.
-  test('AC 20: any other status error carrying fake tokens → one "status error" line naming its type, code and redacted message; returns false, no flag, nothing leaks', async () => {
+  test('AC 20: any other status error carrying fake tokens → one "status error" line naming its type, code and redacted message; reads unknown, no flag, nothing leaks', async () => {
     const statusError = Object.assign(new Error(`status failed (${sentinelInMessage('msg')})`), {
       code: 'EIO',
       detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
       note: LEAK_SENTINEL,
     })
     const { emissions, adapter } = makeHarness(statusError)
-    const errArgs: unknown[][] = []
-    const orig = console.error
-    console.error = (...args: unknown[]) => { errArgs.push(args) }
-    let result: boolean | undefined
-    try {
-      result = await adapter('C1')
-    } finally {
-      console.error = orig
-    }
 
-    expect(result).toBe(false)
+    const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
+
+    expect(result).toEqual(LIVENESS_READING_UNKNOWN)
     expect(getOutageFlags('C1').size).toBe(0)
     expect(errArgs).toHaveLength(1)
     expect(errArgs[0]).toHaveLength(1)

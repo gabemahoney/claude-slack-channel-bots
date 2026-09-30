@@ -23,6 +23,7 @@ import {
   RESTART_OUTCOME_IN_FLIGHT,
   RESTART_OUTCOME_LAUNCHED,
   RESTART_OUTCOME_LAUNCH_SKIPPED,
+  RESTART_OUTCOME_LIVENESS_UNKNOWN,
   RESTART_OUTCOME_NOT_INITIALISED,
   RESTART_OUTCOME_NOT_UP,
   RESTART_OUTCOME_PENDING_DEFERRED,
@@ -90,17 +91,21 @@ import {
   initOutageState,
 } from '../src/outage-state.ts'
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import { CSCB_UNKNOWN_ERROR_NAME } from '../src/ad-error-class.ts'
 import {
   cannedErr,
   cannedOk,
   cannedGetResult,
   errCallTimeout,
+  errConfigMalformed,
   errGeneric,
   errInstanceIdCollision,
   errInvalidFlags,
   errSpawnNotFound,
   errSpawnNotInteractive,
+  errSystemInstallDisappeared,
   errTmuxKillFailed,
+  errTmuxNotAvailable,
   errTmuxSendKeys,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
@@ -131,6 +136,13 @@ import {
 import { installAdVersionRecheck, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import {
+  LIVENESS_READING_DEAD,
+  LIVENESS_READING_LIVE,
+  LIVENESS_READING_PENDING,
+  LIVENESS_READING_UNKNOWN,
+  type LivenessReading,
+} from '../src/liveness-reading.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -147,7 +159,7 @@ const CAP_MARGIN_MS = 40        // margin above each computed backoff delay
 // ---------------------------------------------------------------------------
 
 type DepsOpts = {
-  isSessionAliveResult?: boolean  // default: false (session is dead)
+  isSessionAliveResult?: LivenessReading  // default: LIVENESS_READING_DEAD (session is dead)
   isSessionConnectedResult?: boolean  // default: false (not yet reconnected)
   hasSessionStreamResult?: boolean  // default: true (stream present — prior semantics)
   launchSessionResult?: LaunchSessionResult  // default: true (launch succeeds); 'skipped': the relaunch gate declined
@@ -164,12 +176,14 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
   launchSessionCalls: Array<{ key: string; cwd: string; sessionId: string | undefined }>
   reconnectSessionCalls: string[]
   onCapReachedCalls: string[]
+  armRetryTimerCalls: string[]
 } {
   const isSessionAliveCalls: string[] = []
   const killSessionCalls: string[] = []
   const launchSessionCalls: Array<{ key: string; cwd: string; sessionId: string | undefined }> = []
   const reconnectSessionCalls: string[] = []
   const onCapReachedCalls: string[] = []
+  const armRetryTimerCalls: string[] = []
 
   return {
     isSessionAliveCalls,
@@ -177,11 +191,12 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     launchSessionCalls,
     reconnectSessionCalls,
     onCapReachedCalls,
+    armRetryTimerCalls,
 
     canRestart: () => true,
     async isSessionAlive(key) {
       isSessionAliveCalls.push(key)
-      return opts.isSessionAliveResult ?? false
+      return opts.isSessionAliveResult ?? LIVENESS_READING_DEAD
     },
     isSessionConnected(_key) {
       return opts.isSessionConnectedResult ?? false
@@ -206,6 +221,9 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     onCapReached: (key) => {
       onCapReachedCalls.push(key)
       opts.onCapReached?.(key)
+    },
+    armRetryTimer: (key) => {
+      armRetryTimerCalls.push(key)
     },
   }
 }
@@ -268,7 +286,7 @@ describe('scheduleRestart', () => {
   })
 
   test('3. timer fires, session already alive — reconnectSession called, launchSession NOT called', async () => {
-    const deps = makeDeps({ isSessionAliveResult: true })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     initRestart(deps)
 
     scheduleRestart('test_bot_1', '/cwd/test')
@@ -281,7 +299,7 @@ describe('scheduleRestart', () => {
   })
 
   test('3b. session alive but reconnectSession throws — does not propagate, launchSession NOT called', async () => {
-    const deps = makeDeps({ isSessionAliveResult: true })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     let reconnectCalled = false
     deps.reconnectSession = async () => {
       reconnectCalled = true
@@ -300,12 +318,18 @@ describe('scheduleRestart', () => {
   // as its description (type, safe code, message through `redactSlackLogText`,
   // frames), never the error itself. The thrown error carries fake tokens in
   // its message (with a `ticket=` URL) and properties, and every console.error
-  // argument is kept unformatted.
-  test.each<[string, 'isSessionAlive' | 'reconnectSession' | 'launchSession', DepsOpts, string]>([
-    ['isSessionAlive throws', 'isSessionAlive', {}, 'isSessionAlive failed'],
-    ['reconnectSession throws (session alive)', 'reconnectSession', { isSessionAliveResult: true }, 'reconnectSession failed'],
-    ['launchSession throws', 'launchSession', {}, 'launchSession threw'],
-  ])('AC 20: %s with an error carrying fake tokens — one line naming its type, code and redacted message; nothing leaks', async (_label, dep, opts, phrase) => {
+  // argument is kept unformatted. A thrown liveness probe reads `unknown`
+  // (b.jg5 SRJ-314): its line is the unknown line naming the failure, nothing
+  // is killed or launched, and the arm hook is called once.
+  const describedFailure = (dep: string) => `Error code=EIO message="${dep} refused (${REDACTED_SENTINEL_TAIL})" at `
+  test.each<[string, 'isSessionAlive' | 'reconnectSession' | 'launchSession', DepsOpts, string, string, string[], string[]]>([
+    ['isSessionAlive throws', 'isSessionAlive', {}, 'isSessionAlive failed',
+      `[slack] Liveness unknown for persona=test_bot_1 (isSessionAlive failed: ${describedFailure('isSessionAlive')}`, [], ['test_bot_1']],
+    ['reconnectSession throws (session alive)', 'reconnectSession', { isSessionAliveResult: LIVENESS_READING_LIVE }, 'reconnectSession failed',
+      `[slack] restart: reconnectSession failed for persona=test_bot_1: ${describedFailure('reconnectSession')}`, [], []],
+    ['launchSession throws', 'launchSession', {}, 'launchSession threw',
+      `[slack] restart: launchSession threw for persona=test_bot_1: ${describedFailure('launchSession')}`, ['test_bot_1'], []],
+  ])('AC 20: %s with an error carrying fake tokens — one line naming its type, code and redacted message; nothing leaks', async (_label, dep, opts, phrase, linePrefix, kills, armed) => {
     const deps = makeDeps(opts)
     deps[dep] = async () => {
       throw Object.assign(new Error(`${dep} refused (${sentinelInMessage('msg')})`), {
@@ -328,9 +352,11 @@ describe('scheduleRestart', () => {
     const lines = errArgs.filter((args) => String(args[0]).includes(phrase))
     expect(lines).toHaveLength(1)
     expect(lines[0]).toHaveLength(1)
-    expect(String(lines[0]![0])).toStartWith(
-      `[slack] restart: ${phrase} for persona=test_bot_1: Error code=EIO message="${dep} refused (${REDACTED_SENTINEL_TAIL})" at `,
-    )
+    expect(String(lines[0]![0])).toStartWith(linePrefix)
+    expect(deps.killSessionCalls).toEqual(kills)
+    // The launchSession row replaces the recording launch; no other row launches.
+    if (dep !== 'launchSession') expect(deps.launchSessionCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual(armed)
     assertNoLeak({ errArgs })
   })
 
@@ -375,7 +401,7 @@ describe('scheduleRestart', () => {
   // be waved through — it proceeds to recovery.
   test('b.9cj: alive + connected + stream present — skips reconnect (already-healed guard holds)', async () => {
     const deps = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       isSessionConnectedResult: true,
       hasSessionStreamResult: true,
     })
@@ -396,7 +422,7 @@ describe('scheduleRestart', () => {
     // return and never recovered. Post-fix the guard also requires the stream,
     // so recovery proceeds: alive → reconnectSession is called.
     const deps = makeDeps({
-      isSessionAliveResult: true,
+      isSessionAliveResult: LIVENESS_READING_LIVE,
       isSessionConnectedResult: true,
       hasSessionStreamResult: false,
     })
@@ -411,7 +437,7 @@ describe('scheduleRestart', () => {
   })
 
   test('4. timer fires, session dead — killSession then launchSession called', async () => {
-    const deps = makeDeps({ isSessionAliveResult: false })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD })
     initRestart(deps)
 
     scheduleRestart('test_bot_1', '/cwd/test')
@@ -738,8 +764,8 @@ describe('isRestartPendingOrActive', () => {
     // but before the first await (isSessionAlive). During that gap,
     // isRestartPendingOrActive returned false even though a restart was in progress.
     // The fix moves activeLaunches.add immediately after pendingRestartTimers.delete.
-    let aliveResolve!: (alive: boolean) => void
-    const alivePromise = new Promise<boolean>((res) => { aliveResolve = res })
+    let aliveResolve!: (reading: LivenessReading) => void
+    const alivePromise = new Promise<LivenessReading>((res) => { aliveResolve = res })
 
     const deps: RestartDeps = {
       canRestart: () => true,
@@ -763,7 +789,7 @@ describe('isRestartPendingOrActive', () => {
     // Before the fix this returned false; after the fix it must return true.
     expect(isRestartPendingOrActive('test_bot_1')).toBe(true)
 
-    aliveResolve(false) // avoid dangling promise
+    aliveResolve(LIVENESS_READING_DEAD) // avoid dangling promise
     await Bun.sleep(1)  // let finally block run
   })
 })
@@ -981,7 +1007,7 @@ describe('backoff integration (SR-29.3)', () => {
     expect(getFailureCount(KEY)).toBe(1)
 
     // Now simulate alive=true with reconnect returning 'success'
-    const reconnectDeps = makeDeps({ isSessionAliveResult: true })
+    const reconnectDeps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     reconnectDeps.reconnectSession = async (_key) => 'success'
     initRestart(reconnectDeps)
 
@@ -1014,7 +1040,7 @@ describe('backoff integration (SR-29.3)', () => {
     expect(getFailureCount(KEY)).toBe(1)
 
     // Simulate alive=true with reconnect returning 'escalate-dead'
-    const escapingDeps = makeDeps({ isSessionAliveResult: true })
+    const escapingDeps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     escapingDeps.reconnectSession = async (_key) => 'escalate-dead'
     initRestart(escapingDeps)
 
@@ -1044,7 +1070,7 @@ describe('backoff integration (SR-29.3)', () => {
     await Bun.sleep(WAIT_MS)
     expect(getFailureCount(KEY)).toBe(1)
 
-    const transientDeps = makeDeps({ isSessionAliveResult: true })
+    const transientDeps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     transientDeps.reconnectSession = async (_key) => verdict
     initRestart(transientDeps)
 
@@ -1067,7 +1093,7 @@ describe('backoff integration (SR-29.3)', () => {
     await Bun.sleep(WAIT_MS)
     expect(getFailureCount(KEY)).toBe(1)
 
-    const throwingDeps = makeDeps({ isSessionAliveResult: true })
+    const throwingDeps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     throwingDeps.reconnectSession = async (_key) => {
       throw new Error('sendKeys failed')
     }
@@ -1106,7 +1132,7 @@ describe('backoff integration (SR-29.3)', () => {
     // and restart.ts does NOT re-enter scheduleRestart — the tick is the retry
     // driver. This asserts the observable no-op side of the defer contract.
     const KEY = 'defer_9a7_bot'
-    const deps = makeDeps({ isSessionAliveResult: true })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     deps.reconnectSession = async (key) => {
       deps.reconnectSessionCalls.push(key)
       return verdict
@@ -1128,7 +1154,7 @@ describe('backoff integration (SR-29.3)', () => {
 
   test('(6b) b.9a7: repeated reconnect failures never consume the cap (single counting site)', async () => {
     const KEY = 'retry_9a7_bot'
-    const deps = makeDeps({ isSessionAliveResult: true })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     // Every reconnect attempt fails (throws → undefined result). Simulate the
     // tick re-driving scheduleRestart many times over.
     deps.reconnectSession = async (key) => {
@@ -1313,13 +1339,13 @@ describe('not-up guard: a persona that is not up is never restarted (b.av2 SR-6.
     cancelAllRestartTimers()
   })
 
-  test.each<[string, boolean]>([
-    ['its session dead (the kill + relaunch branch)', false],
-    ['its session alive (the reconnect branch)', true],
-  ])('a restart scheduled while up, whose persona is no longer up when the timer fires, probes, reconnects, kills and launches nothing; its count and cap latch are unchanged; the skip is logged — %s', async (_label, alive) => {
+  test.each<[string, LivenessReading]>([
+    ['its session dead (the kill + relaunch branch)', LIVENESS_READING_DEAD],
+    ['its session alive (the reconnect branch)', LIVENESS_READING_LIVE],
+  ])('a restart scheduled while up, whose persona is no longer up when the timer fires, probes, reconnects, kills and launches nothing; its count and cap latch are unchanged; the skip is logged — %s', async (_label, reading) => {
     // One failure short of the cap: a counted failure would cap and notify.
     for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(KEY)
-    const deps = makeGatedDeps({ isSessionAliveResult: alive, launchSessionResult: false })
+    const deps = makeGatedDeps({ isSessionAliveResult: reading, launchSessionResult: false })
     initRestart(deps)
 
     scheduleRestart(KEY, '/cwd/notup')
@@ -1349,7 +1375,7 @@ describe('not-up guard: a persona that is not up is never restarted (b.av2 SR-6.
     scheduleRestart(KEY, '/cwd/notup')
     await waitForTimer(KEY)
     expect(deps.isSessionAliveCalls).toEqual([KEY])
-    if (alive) {
+    if (reading === LIVENESS_READING_LIVE) {
       expect(deps.reconnectSessionCalls).toEqual([KEY])
       expect(deps.launchSessionCalls).toEqual([])
       expect(getFailureCount(KEY)).toBe(RESTART_FAILURE_CAP - 1)
@@ -1361,10 +1387,11 @@ describe('not-up guard: a persona that is not up is never restarted (b.av2 SR-6.
     }
   })
 
-  test.each<[string, boolean]>([
-    ['the probe answers dead (the kill + relaunch branch)', false],
-    ['the probe answers alive and disconnected (the reconnect branch)', true],
-  ])('the persona stops being up while the liveness probe is pending: once the probe settles nothing is reconnected, killed or launched; its count and cap latch are unchanged; the skip is logged once — %s', async (_label, alive) => {
+  test.each<[string, LivenessReading]>([
+    ['the probe answers dead (the kill + relaunch branch)', LIVENESS_READING_DEAD],
+    ['the probe answers alive and disconnected (the reconnect branch)', LIVENESS_READING_LIVE],
+    ['the probe answers unknown (b.jg5 SRJ-314: the not-up skip comes first, so the arm hook is not called)', LIVENESS_READING_UNKNOWN],
+  ])('the persona stops being up while the liveness probe is pending: once the probe settles nothing is reconnected, killed or launched; its count and cap latch are unchanged; the skip is logged once — %s', async (_label, reading) => {
     // One failure short of the cap: a counted failure would cap and notify.
     for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(KEY)
     const deps = makeGatedDeps({ launchSessionResult: false })
@@ -1374,7 +1401,7 @@ describe('not-up guard: a persona that is not up is never restarted (b.av2 SR-6.
       deps.isSessionAlive = (key) => {
         deps.isSessionAliveCalls.push(key)
         entered()
-        return new Promise<boolean>((res) => { settleProbe = () => res(alive) })
+        return new Promise<LivenessReading>((res) => { settleProbe = () => res(reading) })
       }
     })
     initRestart(deps)
@@ -1401,6 +1428,7 @@ describe('not-up guard: a persona that is not up is never restarted (b.av2 SR-6.
     expect(getFailureCount(KEY)).toBe(RESTART_FAILURE_CAP - 1)
     expect(isAtCap(KEY, RESTART_FAILURE_CAP)).toBe(false)
     expect(deps.onCapReachedCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual([])
     expect(isRestartPendingOrActive(KEY)).toBe(false)
     expect(errLines.filter((l) => l === skipLine(KEY))).toHaveLength(1)
     expect(linesFor(KEY, '[slack] Session alive but disconnected')).toEqual([])
@@ -1890,7 +1918,7 @@ describe('restart cap notice goes to the persona destination (b.av2 SR-7.2)', ()
 describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
   /**
    * Build restart deps whose `reconnectSession` is the REAL adapter, plus a
-   * mutable `alive` flag so a test can flip liveness between simulated ticks.
+   * mutable liveness reading so a test can flip it between simulated ticks.
    * The stub client is shared by the adapter's status probe and reconnectMcp's
    * send-keys (both flow through withOutageDetection's getClient), and its
    * findMissing capture is the observable seam for "the sweep ran".
@@ -1903,9 +1931,9 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     findMissingCalls: FindMissingParams[]
     statusCalls: StatusParams[]
     sendKeysCalls: SendKeysParams[]
-    setAlive: (v: boolean) => void
+    setAlive: (v: LivenessReading) => void
   } {
-    let alive = true
+    let alive: LivenessReading = LIVENESS_READING_LIVE
     const killSessionCalls: string[] = []
     const launchSessionCalls: string[] = []
     const findMissingCalls: FindMissingParams[] = []
@@ -1948,7 +1976,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
       isShuttingDown: () => false,
       onCapReached: () => {},
     }
-    return { deps, findMissingCalls, statusCalls, sendKeysCalls, setAlive: (v: boolean) => { alive = v } }
+    return { deps, findMissingCalls, statusCalls, sendKeysCalls, setAlive: (v: LivenessReading) => { alive = v } }
   }
 
   beforeEach(() => {
@@ -1969,7 +1997,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
 
     // --- Tick 1: row still looks alive; the real adapter runs reconnectMcp,
     // which returns 'dead-session' → 'escalate-dead', firing the internal sweep.
-    setAlive(true)
+    setAlive(LIVENESS_READING_LIVE)
     scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
@@ -1993,7 +2021,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     // Reset the memo so this tick's semantics don't depend on the prior sweep's
     // TTL — we are simulating a LATER tick past the memo window.
     _resetFindMissingMemo()
-    setAlive(false)
+    setAlive(LIVENESS_READING_DEAD)
     scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
@@ -2006,7 +2034,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     const { deps, findMissingCalls, sendKeysCalls } = makeRealAdapterDeps()
     // The row reads alive until the sweep has run and dead after it (what AD
     // does for a row whose tmux session is gone).
-    deps.isSessionAlive = async () => findMissingCalls.length === 0
+    deps.isSessionAlive = async () => (findMissingCalls.length === 0 ? LIVENESS_READING_LIVE : LIVENESS_READING_DEAD)
     initRestart(deps)
 
     scheduleRestart(KEY, '/cwd/test')
@@ -2102,6 +2130,78 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     // The successful launch counts no failure.
     expect(getFailureCount(KEY)).toBe(0)
     // The run armed no further timer: nothing relaunches the persona again.
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+  // b.jg5 SRJ-314 (AC 37, HO C12): the real liveness adapter over the stub
+  // reads a `status` error `unknown` unless it is ErrSpawnNotFound or
+  // ErrSystemInstallDisappeared, at the first probe and at b.d61's re-probe
+  // alike. `unknown` kills and launches nothing, counts nothing and calls the
+  // arm hook once; the two dead errors still relaunch in that run.
+  const STATUS_ERRORS: ReadonlyArray<[string, () => Error, boolean]> = [
+    ['a plain Error', () => new Error('status blew up'), false],
+    ['ErrCallTimeout', () => errCallTimeout('status'), false],
+    ['a wrapped UnknownError', () => errGeneric('status', CSCB_UNKNOWN_ERROR_NAME, 'Error: boom'), false],
+    ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed(), false],
+    ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'status'), false],
+    ['ErrSpawnNotFound', () => errSpawnNotFound(), true],
+    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status'), true],
+  ]
+  const PROBES: ReadonlyArray<['first probe' | 're-probe']> = [['first probe'], ['re-probe']]
+  const STATUS_ERROR_CASES = PROBES.flatMap(([probe]) => STATUS_ERRORS.map(([label, build, dead]) => [probe, label, build, dead] as const))
+
+  test.each(STATUS_ERROR_CASES)('b.jg5 SRJ-314: the %s\'s status answers %s → dead: %p (a kill and a relaunch only when dead; unknown arms the hook once and counts nothing)', async (probe, _label, build, dead) => {
+    const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
+    const KEY = config.personas[0]!.key
+    const sendKeysCalls: SendKeysParams[] = []
+    const findMissingCalls: FindMissingParams[] = []
+    const statusCalls: StatusParams[] = []
+    // First probe: status fails at once. Re-probe: the row reads `working`
+    // (the reconnect adapter finds the tmux session gone and sweeps) until
+    // the sweep, and status fails after it.
+    const stub = makeStubClient({
+      statusFn: () => (probe === 'first probe' || findMissingCalls.length > 0 ? build() : { state: 'working' }),
+      statusCalls,
+      sendKeysCalls,
+      findMissingCalls,
+    })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    _setTmuxServerEnsurer(async () => {})
+    _setTmuxSessionProber(async () => false)
+
+    // One failure on record, so a reset or a counted launch would show.
+    recordFailure(KEY)
+    const killSessionCalls: string[] = []
+    const launchSessionCalls: string[] = []
+    const armed: string[] = []
+    initRestart({
+      canRestart: () => true,
+      isSessionAlive: _buildIsSessionAliveAdapter(() => config),
+      isSessionConnected: () => false,
+      hasSessionStream: () => false,
+      reconnectSession: _buildReconnectSessionAdapter(),
+      async killSession(key) { killSessionCalls.push(key) },
+      async launchSession(key) { launchSessionCalls.push(key); return false },
+      getRestartDelay: () => FAST_DELAY_S,
+      isShuttingDown: () => false,
+      onCapReached: () => {},
+      armRetryTimer: (key) => { armed.push(key) },
+    })
+
+    scheduleRestart(KEY, config.personas[0]!.working_directory)
+    await Bun.sleep(WAIT_MS)
+
+    // The first probe, the reconnect adapter's read and the re-probe (the
+    // first-probe case stops, or goes straight to the kill, after one).
+    expect(statusCalls).toHaveLength(probe === 'first probe' ? 1 : 3)
+    expect(findMissingCalls).toHaveLength(probe === 'first probe' ? 0 : 1)
+    expect(sendKeysCalls).toEqual([])
+    expect(killSessionCalls).toEqual(dead ? [KEY] : [])
+    expect(launchSessionCalls).toEqual(dead ? [KEY] : [])
+    // A failed launch counts; an unknown run counts nothing and resets nothing.
+    expect(getFailureCount(KEY)).toBe(dead ? 2 : 1)
+    expect(armed).toEqual(dead ? [] : [KEY])
     expect(isRestartPendingOrActive(KEY)).toBe(false)
   })
 })
@@ -2269,19 +2369,23 @@ describe('b.jdc: a persona whose session died under a prompt is relaunched in th
 // ---------------------------------------------------------------------------
 // b.d61: the liveness re-probe after an 'escalate-dead' reconnect. The
 // reconnect adapter has already run the findMissing sweep when it answers
-// 'escalate-dead', so the restart run probes liveness once more: a row that now
-// reads dead, or a re-probe that throws (counted as not alive, as the first
-// probe's throw is), goes on to the kill and relaunch in the same run, with the
-// launch's usual accounting; a row that still reads alive is left to a later
-// tick. Shutdown and the not-up gate are asked again after the re-probe, since
-// it is an async agent-director call. The deps are `makeDeps` fakes: the first
-// probe reads alive and the reconnect answers 'escalate-dead'.
+// 'escalate-dead', so the restart run probes liveness once more: only a row
+// that now reads `dead` goes on to the kill and relaunch in the same run, with
+// the launch's usual accounting. A row that still reads `live`, or reads
+// `pending`, is left to a later tick; a re-probe that reads `unknown` or throws
+// (b.jg5 SRJ-314: never read as dead) relaunches nothing, counts nothing and
+// calls the arm hook. Shutdown and the not-up gate are asked again after the
+// re-probe, since it is an async agent-director call. The deps are `makeDeps`
+// fakes: the first probe reads `live` and the reconnect answers 'escalate-dead'.
 // ---------------------------------------------------------------------------
 
 describe('b.d61: after an escalate-dead reconnect, the restart run probes liveness again', () => {
   const KEY = 'reprobe_bot'
   const RELAUNCH = '[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run'
-  const STILL_ALIVE = '[slack] Session still reads alive after escalate-dead — leaving the relaunch to a later tick'
+  const STILL_ALIVE = `[slack] Session still reads alive after escalate-dead — leaving the relaunch to a later tick for persona=${KEY}`
+  const PENDING = `[slack] Session reads pending after escalate-dead — its session has not started; no relaunch in this restart run for persona=${KEY}`
+  const UNKNOWN = `[slack] Liveness unknown after escalate-dead for persona=${KEY}`
+  const NOTHING_COUNTED = ' — no relaunch in this restart run; nothing counted'
   /** Every raw console.error argument list, so a leak in an error object shows. */
   let errArgs: unknown[][]
   let origConsoleError: typeof console.error
@@ -2290,14 +2394,14 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
   const linesStarting = (prefix: string) => lines().filter((l) => l.startsWith(prefix) && l.includes(`persona=${KEY}`))
 
   /**
-   * makeDeps whose first liveness probe reads alive, whose reconnect answers
+   * makeDeps whose first liveness probe reads `live`, whose reconnect answers
    * 'escalate-dead', and whose re-probe runs `reprobe`.
    */
-  function makeEscalateDeps(reprobe: () => Promise<boolean>, opts: DepsOpts = {}): ReturnType<typeof makeDeps> {
+  function makeEscalateDeps(reprobe: () => Promise<LivenessReading>, opts: DepsOpts = {}): ReturnType<typeof makeDeps> {
     const deps = makeDeps(opts)
     deps.isSessionAlive = async (key) => {
       deps.isSessionAliveCalls.push(key)
-      return deps.isSessionAliveCalls.length === 1 ? true : reprobe()
+      return deps.isSessionAliveCalls.length === 1 ? LIVENESS_READING_LIVE : reprobe()
     }
     deps.reconnectSession = async (key) => {
       deps.reconnectSessionCalls.push(key)
@@ -2317,20 +2421,25 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
     cancelAllRestartTimers()
   })
 
-  test.each<[string, () => Promise<boolean>, boolean, string | undefined]>([
-    ['reads dead → the same run kills and relaunches once', async () => false, true, undefined],
+  test.each<[string, () => Promise<LivenessReading>, boolean, string, string]>([
+    ['reads dead → the same run kills and relaunches once', async () => LIVENESS_READING_DEAD, true, RELAUNCH, ''],
     [
-      'throws → counted as not alive: the same run kills and relaunches once; the failure is logged as its redacted description',
+      'throws → b.jg5 SRJ-314: read unknown, never dead: nothing is killed or launched, nothing counted, the arm hook is called once; the failure is logged as its redacted description',
       async () => {
         throw Object.assign(new Error(`status refused (${sentinelInMessage('reprobe')})`), { code: 'EIO', note: LEAK_SENTINEL })
       },
-      true,
-      `[slack] restart: isSessionAlive failed after escalate-dead for persona=${KEY}: Error code=EIO message="status refused (${REDACTED_SENTINEL_TAIL})" at `,
+      false,
+      `${UNKNOWN} (isSessionAlive failed: Error code=EIO message="status refused (${REDACTED_SENTINEL_TAIL})" at `,
+      KEY,
     ],
-    ['still reads alive → nothing is killed or launched; the relaunch is left to a later tick', async () => true, false, undefined],
-  ])('the re-probe %s', async (_label, reprobe, relaunched, failedLine) => {
-    // A failed launch, so the count shows whether the launch was attempted (the
-    // escalate-dead verdict itself never counts: single counting site).
+    ['reads unknown → b.jg5 SRJ-314: nothing is killed or launched, nothing counted, the arm hook is called once', async () => LIVENESS_READING_UNKNOWN, false, `${UNKNOWN}${NOTHING_COUNTED}`, KEY],
+    ['reads pending → its session has not started: nothing is killed or launched, nothing counted, nothing armed', async () => LIVENESS_READING_PENDING, false, PENDING, ''],
+    ['still reads alive → nothing is killed or launched; the relaunch is left to a later tick', async () => LIVENESS_READING_LIVE, false, STILL_ALIVE, ''],
+  ])('the re-probe %s', async (_label, reprobe, relaunched, line, armedKey) => {
+    // One failure on record and a failed launch, so the count shows whether the
+    // launch was attempted, and a reset would show too (the escalate-dead
+    // verdict itself never counts: single counting site).
+    recordFailure(KEY)
     const deps = makeEscalateDeps(reprobe, { launchSessionResult: false })
     initRestart(deps)
 
@@ -2341,14 +2450,14 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
     expect(deps.reconnectSessionCalls).toEqual([KEY])
     expect(deps.killSessionCalls).toEqual(relaunched ? [KEY] : [])
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual(relaunched ? [KEY] : [])
-    expect(getFailureCount(KEY)).toBe(relaunched ? 1 : 0)
+    expect(getFailureCount(KEY)).toBe(relaunched ? 2 : 1)
+    expect(deps.armRetryTimerCalls).toEqual(armedKey === '' ? [] : [armedKey])
     // restart.ts re-arms nothing either way: the health-check tick is the retry driver.
     expect(isRestartPendingOrActive(KEY)).toBe(false)
-    expect(linesStarting(RELAUNCH)).toHaveLength(relaunched ? 1 : 0)
-    expect(linesStarting(STILL_ALIVE)).toHaveLength(relaunched ? 0 : 1)
-    const failed = linesStarting('[slack] restart: isSessionAlive failed')
-    expect(failed).toHaveLength(failedLine === undefined ? 0 : 1)
-    if (failedLine !== undefined) expect(failed[0]).toStartWith(failedLine)
+    // Exactly one of the re-probe's lines, and it is this case's.
+    const reprobeLines = [RELAUNCH, STILL_ALIVE, PENDING, UNKNOWN].flatMap((prefix) => linesStarting(prefix))
+    expect(reprobeLines).toHaveLength(1)
+    expect(reprobeLines[0]).toStartWith(line)
     assertNoLeak({ errArgs })
   })
 
@@ -2364,7 +2473,7 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
     const deps = makeEscalateDeps(async () => {
       if (flip === 'shutdown') shuttingDown = true
       else up = false
-      return false
+      return LIVENESS_READING_DEAD
     }, { launchSessionResult: false })
     deps.isShuttingDown = () => shuttingDown
     deps.canRestart = (key) => { asked.push(key); return up }
@@ -2732,7 +2841,7 @@ describe('restart: the reply-guard record holds the effective value before the r
     const { config, a } = setup(false, 'ended')
     const results: LaunchSessionResult[] = []
     const deps = makeDeps({
-      isSessionAliveResult: false,
+      isSessionAliveResult: LIVENESS_READING_DEAD,
       launchSession: async (key) => {
         const ok = await launchPersonaSession(key, config)
         results.push(ok)
@@ -2757,7 +2866,7 @@ describe('restart: the reply-guard record holds the effective value before the r
 
   test('live session: the restart reconnects through the real adapter — no launch, no reply-guard step, no record', async () => {
     const { a } = setup(true, 'gone')
-    const deps = makeDeps({ isSessionAliveResult: true })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     deps.reconnectSession = _buildReconnectSessionAdapter()
     initRestart(deps)
 
@@ -3396,7 +3505,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     // reconnect adapter (a `waiting` row: its pane is read, then the keystrokes typed).
     const reconnectSite = site === 'send-keys' || site === 'read-pane'
     const deps = makeDeps({
-      isSessionAliveResult: reconnectSite,
+      isSessionAliveResult: reconnectSite ? LIVENESS_READING_LIVE : LIVENESS_READING_DEAD,
       killSession: site === 'kill' ? _buildKillSessionAdapter() : undefined,
       launchSession: site === 'spawn' ? realLaunch : undefined,
     })
@@ -3425,7 +3534,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     const sendKeysCalls: SendKeysParams[] = []
     const statusCalls: StatusParams[] = []
     installStub({ statusFn: undefined, statusError: errGeneric('status', 'ErrStatusBroken', 'the store could not be read'), statusCalls, sendKeysCalls })
-    const deps = makeDeps({ isSessionAliveResult: true })
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     deps.reconnectSession = _buildReconnectSessionAdapter()
     initRestart(deps)
 
@@ -3437,24 +3546,35 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
   })
 
   // Ruling (a): the liveness adapter's `status` error inside a restart run
-  // arms the timer. Its reading is unchanged in E8 (a thrown status still
-  // reads dead), and the kill and launch that follow are E9's to change, so
-  // these cases assert the arming only.
+  // arms the timer (E8's adapter report). b.jg5 SRJ-314: the error reads
+  // `unknown`, never dead, so the run kills and launches nothing, counts
+  // nothing, and calls the arm hook once besides.
   test.each<[string, () => Error, string]>([
     ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
     ['UNAVAILABLE (ErrCallTimeout)', () => errCallTimeout('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
     ['a read error (an unclassified name)', () => errGeneric('status', 'ErrStatusBroken', 'the store could not be read'), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
-  ])('SRJ-301: the liveness adapter\'s status throws %s inside the restart run → P\'s timer is armed once (cause %s); Q\'s is left alone', async (_label, makeError, cause) => {
+  ])('b.jg5 SRJ-301, SRJ-314: the liveness adapter\'s status throws %s inside the restart run → P\'s timer is armed once (cause %s), the arm hook is called once and nothing is killed, launched or counted; Q\'s is left alone', async (_label, makeError, cause) => {
     const statusCalls: StatusParams[] = []
-    installStub({ statusFn: undefined, statusError: makeError(), statusCalls })
+    const killCalls: KillParams[] = []
+    const spawnCalls: SpawnParams[] = []
+    installStub({ statusFn: undefined, statusError: makeError(), statusCalls, killCalls, spawnCalls })
+    // One failure on record, so a counted launch or a reset would show.
+    recordFailure(p.key)
     const deps = makeDeps()
     deps.isSessionAlive = _buildIsSessionAliveAdapter(() => config)
     initRestart(deps)
 
     await runRestart(p.key)
 
-    expect(statusCalls[0]!.claude_instance_id).toBe(personaInstanceId(p.key))
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p.key)])
     expectArmedOnce(cause)
+    expect(deps.armRetryTimerCalls).toEqual([p.key])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(killCalls).toEqual([])
+    expect(spawnCalls).toEqual([])
+    expect(getFailureCount(p.key)).toBe(1)
   })
 
   test('SRJ-301: the liveness adapter\'s status throws ErrSpawnNotFound inside the restart run → nothing is armed (the site keeps its meaning)', async () => {
@@ -3467,12 +3587,16 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
 
     expect(retry.armedKeys()).toEqual([])
     expect(retryLines).toEqual([])
+    // It reads dead: the kill and the launch run, and the arm hook is not called.
+    expect(deps.killSessionCalls).toEqual([p.key])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([p.key])
+    expect(deps.armRetryTimerCalls).toEqual([])
   })
 
-  test('SRJ-301: the liveness adapter\'s status throws UNAVAILABLE outside any attempt (the health tick\'s call) → nothing is armed; it still reads dead', async () => {
+  test('SRJ-301: the liveness adapter\'s status throws UNAVAILABLE outside any attempt (the health tick\'s call) → nothing is armed; b.jg5 SRJ-314: it reads unknown, never dead', async () => {
     installStub({ statusFn: undefined, statusError: errTmuxUnresponsive('status') })
 
-    expect(await _buildIsSessionAliveAdapter(() => config)(p.key)).toBe(false)
+    expect(await _buildIsSessionAliveAdapter(() => config)(p.key)).toBe(LIVENESS_READING_UNKNOWN)
 
     expect(retry.armedKeys()).toEqual([])
     expect(retryLines).toEqual([])
@@ -3712,7 +3836,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
     }, RESTART_OUTCOME_NOT_UP, 1],
   ])('%s → no reconnect, kill or launch, nothing counted, and the matching outcome', async (_label, setUp, outcome, probes) => {
     recordFailure(P)
-    const deps = retryDeps({ isSessionAliveResult: true, launchSessionResult: false })
+    const deps = retryDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, launchSessionResult: false })
     setUp(deps)
     initRestart(deps)
 
@@ -3729,7 +3853,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
 
   test('the row reads live and P is connected with its stream → already-connected: no reconnect, kill or launch, nothing counted', async () => {
     recordFailure(P)
-    const deps = retryDeps({ isSessionAliveResult: true, isSessionConnectedResult: true, hasSessionStreamResult: true })
+    const deps = retryDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: true, hasSessionStreamResult: true })
     initRestart(deps)
 
     expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_ALREADY_CONNECTED)
@@ -3743,18 +3867,18 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
 
   // The row reads live but P is not connected: a reconnect. Its verdict decides
   // the rest; an 'escalate-dead' is followed by a second liveness read.
-  test.each<[string, ReconnectSessionResult, boolean, RestartRetryOutcome, number]>([
-    ['the reconnect succeeds → reconnected, a success recorded', 'success', true, RESTART_OUTCOME_RECONNECTED, 0],
-    ['the reconnect is transient → reconnect-deferred, nothing counted', 'transient', true, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
-    ['the reconnect answers pending (b.jg5 SRJ-303: the row not started yet) → pending-deferred, nothing counted', 'pending', true, RESTART_OUTCOME_PENDING_DEFERRED, 1],
-    ['the reconnect gives no answer → reconnect-deferred, nothing counted', undefined, true, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
-    ['escalate-dead and the row still reads live → reconnect-deferred, nothing counted', 'escalate-dead', true, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
-    ['escalate-dead and the row now reads dead → a kill and a launch in the same retry, launched', 'escalate-dead', false, RESTART_OUTCOME_LAUNCHED, 0],
-  ])('alive but not connected: %s', async (_label, verdict, reprobeAlive, outcome, count) => {
+  test.each<[string, ReconnectSessionResult, LivenessReading, RestartRetryOutcome, number]>([
+    ['the reconnect succeeds → reconnected, a success recorded', 'success', LIVENESS_READING_LIVE, RESTART_OUTCOME_RECONNECTED, 0],
+    ['the reconnect is transient → reconnect-deferred, nothing counted', 'transient', LIVENESS_READING_LIVE, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
+    ['the reconnect answers pending (b.jg5 SRJ-303: the row not started yet) → pending-deferred, nothing counted', 'pending', LIVENESS_READING_LIVE, RESTART_OUTCOME_PENDING_DEFERRED, 1],
+    ['the reconnect gives no answer → reconnect-deferred, nothing counted', undefined, LIVENESS_READING_LIVE, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
+    ['escalate-dead and the row still reads live → reconnect-deferred, nothing counted', 'escalate-dead', LIVENESS_READING_LIVE, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
+    ['escalate-dead and the row now reads dead → a kill and a launch in the same retry, launched', 'escalate-dead', LIVENESS_READING_DEAD, RESTART_OUTCOME_LAUNCHED, 0],
+  ])('alive but not connected: %s', async (_label, verdict, reprobe, outcome, count) => {
     recordFailure(P)
     const deps = retryDeps()
-    const alive = [true, reprobeAlive]
-    deps.isSessionAlive = async (key) => { deps.isSessionAliveCalls.push(key); return alive.shift()! }
+    const readings = [LIVENESS_READING_LIVE, reprobe]
+    deps.isSessionAlive = async (key) => { deps.isSessionAliveCalls.push(key); return readings.shift()! }
     deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return verdict }
     initRestart(deps)
 
@@ -3771,7 +3895,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
   test('b.jg5 SRJ-303: a pending reconnect logs exactly what a transient one does; only the outcome differs', async () => {
     const linesFor = async (verdict: 'transient' | 'pending'): Promise<{ outcome: RestartRetryOutcome; lines: string[] }> => {
       errLines = []
-      const deps = retryDeps({ isSessionAliveResult: true })
+      const deps = retryDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
       deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return verdict }
       initRestart(deps)
       const outcome = await runRestartRetry(P, CWD, notInFlight)
@@ -4119,5 +4243,167 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
       expect(await launch).toBe(true)
       expect(isLaunchInFlight(a.key)).toBe(false)
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-314 (AC 37, HO C12): only a `dead` reading leads to a kill and a
+// launch. A liveness probe that reads `unknown`, throws, or answers something
+// that is not a reading, at the first probe or at b.d61's re-probe after an
+// 'escalate-dead' reconnect, reconnects, kills and launches nothing, records
+// no success or failure, answers `RESTART_OUTCOME_LIVENESS_UNKNOWN` and calls
+// the arm hook (`RestartDeps.armRetryTimer`, a recording double here) once
+// with the key. A re-probe that reads `pending` relaunches nothing and arms
+// nothing. Each case runs through the retry entry (`runRestartRetry`, called
+// directly with the delay at 0) and, where the outcome is not needed, through
+// the restart timer (the file's `Bun.sleep(WAIT_MS)` wait). The failure count
+// starts at 1, so a recorded success (a reset) or failure shows.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-314: an unknown or thrown liveness probe kills and launches nothing, counts nothing and calls the arm hook', () => {
+  const P = 'persona_p'
+  const CWD = '/cwd/p'
+  const UNKNOWN_LINE = `[slack] Liveness unknown for persona=${P}`
+  const NOTHING_DONE = ' — no reconnect, kill or launch; nothing counted'
+  let errLines: string[]
+  let errArgs: unknown[][]
+  let origConsoleError: typeof console.error
+
+  const notInFlight = (): boolean => false
+  /** A probe failure whose message and properties carry fake tokens. */
+  const probeError = () =>
+    Object.assign(new Error(`status refused (${sentinelInMessage('probe')})`), { code: 'EIO', note: LEAK_SENTINEL })
+  const probeFailure = `(isSessionAlive failed: Error code=EIO message="status refused (${REDACTED_SENTINEL_TAIL})" at `
+
+  beforeEach(() => {
+    errLines = []
+    errArgs = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args); errLines.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+  })
+
+  /** Nothing was reconnected, killed or launched, and the failure count is still 1. */
+  function expectNothingDone(deps: ReturnType<typeof makeDeps>): void {
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  }
+
+  // A live row with P connected and its stream would answer already-connected,
+  // and a dead one would kill and launch: P is neither connected nor streaming,
+  // so any reading other than `unknown` would act.
+  const FIRST_PROBES: ReadonlyArray<[string, () => Promise<LivenessReading>, string]> = [
+    ['reads unknown', async () => LIVENESS_READING_UNKNOWN, `${UNKNOWN_LINE}${NOTHING_DONE}`],
+    ['throws', async () => { throw probeError() }, `${UNKNOWN_LINE} ${probeFailure}`],
+    ['answers something that is not a reading (a boolean)', async () => true as unknown as LivenessReading, `${UNKNOWN_LINE}${NOTHING_DONE}`],
+  ]
+  const ENTRIES: ReadonlyArray<['the retry entry' | 'the restart timer']> = [['the retry entry'], ['the restart timer']]
+  const FIRST_PROBE_CASES = ENTRIES.flatMap(([entry]) => FIRST_PROBES.map(([label, probe, line]) => [entry, label, probe, line] as const))
+
+  test.each(FIRST_PROBE_CASES)('through %s, the first probe %s → no reconnect, kill or launch; nothing counted; the arm hook is called once with the key; one unknown line', async (entry, _label, probe, line) => {
+    recordFailure(P)
+    const deps = makeDeps({ restartDelay: entry === 'the retry entry' ? 0 : FAST_DELAY_S, launchSessionResult: false })
+    deps.isSessionAlive = async (key) => { deps.isSessionAliveCalls.push(key); return probe() }
+    initRestart(deps)
+
+    if (entry === 'the retry entry') {
+      expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_LIVENESS_UNKNOWN)
+    } else {
+      scheduleRestart(P, CWD)
+      await Bun.sleep(WAIT_MS)
+    }
+
+    expect(deps.isSessionAliveCalls).toEqual([P])
+    expectNothingDone(deps)
+    expect(deps.armRetryTimerCalls).toEqual([P])
+    const unknownLines = errLines.filter((l) => l.startsWith(UNKNOWN_LINE))
+    expect(unknownLines).toHaveLength(1)
+    expect(unknownLines[0]).toStartWith(line)
+    if (!line.includes('isSessionAlive failed')) expect(unknownLines[0]).toBe(line)
+    expect(errLines.filter((l) => l.startsWith('[slack] Relaunching session'))).toEqual([])
+    assertNoLeak({ errArgs })
+  })
+
+  // b.d61's re-probe, through the retry entry so its outcome shows (the
+  // restart timer's path is pinned in the b.d61 re-probe describe above).
+  test.each<[string, () => Promise<LivenessReading>, RestartRetryOutcome, boolean]>([
+    ['reads unknown → liveness-unknown: no kill, no relaunch, nothing counted, the arm hook called once', async () => LIVENESS_READING_UNKNOWN, RESTART_OUTCOME_LIVENESS_UNKNOWN, true],
+    ['throws → liveness-unknown: no kill, no relaunch, nothing counted, the arm hook called once', async () => { throw probeError() }, RESTART_OUTCOME_LIVENESS_UNKNOWN, true],
+    ['reads pending → pending-deferred: no kill, no relaunch, nothing counted, nothing armed', async () => LIVENESS_READING_PENDING, RESTART_OUTCOME_PENDING_DEFERRED, false],
+  ])('after an escalate-dead reconnect, the re-probe %s', async (_label, reprobe, outcome, armed) => {
+    recordFailure(P)
+    const deps = makeDeps({ restartDelay: 0, launchSessionResult: false })
+    deps.isSessionAlive = async (key) => {
+      deps.isSessionAliveCalls.push(key)
+      return deps.isSessionAliveCalls.length === 1 ? LIVENESS_READING_LIVE : reprobe()
+    }
+    deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return 'escalate-dead' }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(outcome)
+
+    expect(deps.isSessionAliveCalls).toEqual([P, P])
+    expect(deps.reconnectSessionCalls).toEqual([P])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.armRetryTimerCalls).toEqual(armed ? [P] : [])
+    assertNoLeak({ errArgs })
+  })
+
+  test('after an escalate-dead reconnect, the re-probe reads dead → one kill and one relaunch in that retry, counted as today; nothing armed', async () => {
+    recordFailure(P)
+    const deps = makeDeps({ restartDelay: 0, launchSessionResult: false })
+    const readings = [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD]
+    deps.isSessionAlive = async (key) => { deps.isSessionAliveCalls.push(key); return readings.shift()! }
+    deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return 'escalate-dead' }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_COUNTED_FAILURE)
+
+    expect(deps.killSessionCalls).toEqual([P])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P])
+    expect(getFailureCount(P)).toBe(2)
+    expect(deps.armRetryTimerCalls).toEqual([])
+  })
+
+  // The hook is optional, and one that throws is logged by its redacted
+  // description and changes nothing else: the outcome is still liveness-unknown.
+  test.each<[string, 'absent' | 'throws']>([
+    ['absent: nothing is armed and nothing more is logged', 'absent'],
+    ['throws: one redacted line, and nothing else changes', 'throws'],
+  ])('the arm hook %s', async (_label, hook) => {
+    recordFailure(P)
+    const deps = makeDeps({ restartDelay: 0, isSessionAliveResult: LIVENESS_READING_UNKNOWN })
+    if (hook === 'absent') {
+      delete deps.armRetryTimer
+    } else {
+      deps.armRetryTimer = (key) => {
+        deps.armRetryTimerCalls.push(key)
+        throw Object.assign(new Error(`arm refused (${sentinelInMessage('arm')})`), { note: LEAK_SENTINEL })
+      }
+    }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_LIVENESS_UNKNOWN)
+
+    expectNothingDone(deps)
+    expect(deps.armRetryTimerCalls).toEqual(hook === 'absent' ? [] : [P])
+    const armFailed = errLines.filter((l) => l.startsWith(`[slack] restart: arming the retry timer failed for persona=${P}`))
+    if (hook === 'absent') {
+      expect(armFailed).toEqual([])
+    } else {
+      expect(armFailed).toHaveLength(1)
+      expect(armFailed[0]).toStartWith(`[slack] restart: arming the retry timer failed for persona=${P}: Error message="arm refused (${REDACTED_SENTINEL_TAIL})" at `)
+    }
+    assertNoLeak({ errArgs })
   })
 })

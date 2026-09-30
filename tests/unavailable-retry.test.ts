@@ -15,7 +15,8 @@
  * The attempt frames run on the bare context with the controller as the sink.
  * The retry action's decisions, in both modes, run over a stand-in row read
  * and retry entry; the full-mode retry end to end (AC 26, the in-flight skip,
- * the row decisions, the serializer wait), the stop rules that exist now
+ * the row decisions, the serializer wait, a liveness `status` error read
+ * `unknown` with the arm hook wired as `main()` wires it), the stop rules that exist now
  * (AC 28), pending-only mode (armed directly, AC 33's timer half) and the
  * condition-end entry's pending and kill-failure exceptions (called directly,
  * AC 30's timer half) run on the harness's default action, the real row read
@@ -42,6 +43,7 @@ import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
+import { LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
 import {
@@ -54,6 +56,7 @@ import {
   RESTART_OUTCOME_IN_FLIGHT,
   RESTART_OUTCOME_LAUNCH_SKIPPED,
   RESTART_OUTCOME_LAUNCHED,
+  RESTART_OUTCOME_LIVENESS_UNKNOWN,
   RESTART_OUTCOME_NOT_INITIALISED,
   RESTART_OUTCOME_NOT_UP,
   RESTART_OUTCOME_PENDING_DEFERRED,
@@ -87,6 +90,7 @@ import {
   UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED,
   UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT,
   UNAVAILABLE_RETRY_AGAIN_LAUNCHED,
+  UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN,
   UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED,
   UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED,
   UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED,
@@ -850,7 +854,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     }],
     ['the health tick’s liveness read', async (h, key) => {
       h.script({ statusError: errCallTimeout('status') })
-      expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toBe(false)
+      expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
       return h.stub.calls.statusCalls.length
     }],
     ['the start sweep’s list', async (h) => {
@@ -1310,6 +1314,7 @@ describe('unavailable retry: the retry action’s decisions over stand-ins', () 
     [RESTART_OUTCOME_PENDING_DEFERRED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, row: UNAVAILABLE_RETRY_ROW_PENDING }],
     [RESTART_OUTCOME_LAUNCHED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, row: UNAVAILABLE_RETRY_ROW_PENDING, switchToPendingOnly: true }],
     [RESTART_OUTCOME_NOT_INITIALISED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED }],
+    [RESTART_OUTCOME_LIVENESS_UNKNOWN, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN, keepsLastRow: true }],
   ])('full mode: a retry entry answering %s answers %o, with no row read', async (outcome, answer) => {
     const deps = fullModeDeps(outcome)
 
@@ -1630,6 +1635,64 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     expect(callCounts(h)).toEqual({ statusCalls: 1 })
     expect(h.lines).toContain(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
     expect(h.controller.isArmed(key)).toBe(false)
+  })
+
+  test.each<[string, () => Error]>([
+    ['a plain Error', () => new Error('boom')],
+    ['ErrCallTimeout', () => errCallTimeout('status')],
+    ['a CONFIG answer', () => errConfigMalformed()],
+  ])('a retry whose liveness status answers %s reads unknown: its status call and nothing else, re-armed at the next wait with the last row read kept, never stopped and nothing counted past the cap; once status answers ended the next retry kills and launches once', async (_what, make) => {
+    // The arm hook wired as main() wires it: the read-error cause on the controller.
+    const hooked: string[] = []
+    const h = (harness = makeRecoveryHarness({
+      restartDeps: {
+        armRetryTimer: (k) => {
+          hooked.push(k)
+          harness!.controller.arm(k, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
+        },
+      },
+    }))
+    const [key] = h.keys as [string]
+    let answer: RowState | Error = 'pending'
+    h.script({
+      statusFn: () => {
+        if (h.stub.calls.spawnCalls.length > 0) return cannedStatusResult({ state: 'waiting' })
+        return answer instanceof Error ? answer : cannedStatusResult({ state: answer })
+      },
+    })
+    h.controller.arm(key, UNAVAILABLE)
+
+    // The first retry reads the row pending: its last row read is pending.
+    await retryNow(h, key)
+    expect(h.controller.view(key)).toMatchObject({ refusals: 1, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+
+    answer = make()
+    const last = RESTART_FAILURE_CAP + 2
+    for (let retry = 2; retry <= last; retry++) {
+      const before = callCounts(h)
+      await retryNow(h, key)
+      expect([retry, callsSince(h, before)]).toEqual([retry, { statusCalls: 1 }])
+      expect(h.lines).toContain(reArmedLine(key, retry, UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN, retry))
+      // The arm hook called during the retry keeps the retry's own backoff.
+      expect(h.controller.view(key)).toMatchObject({
+        phase: 'waiting',
+        dueAt: h.clock.now() + waitMs(retry),
+        waitMs: waitMs(retry),
+        refusals: retry,
+        mode: UNAVAILABLE_RETRY_MODE_FULL,
+        lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+      })
+    }
+    expect(hooked).toEqual(Array<string>(last - 1).fill(key))
+    expect(getFailureCount(key)).toBe(0)
+    expect(h.capReached).toEqual([])
+
+    answer = 'ended'
+    const before = callCounts(h)
+    await retryNow(h, key)
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, killCalls: 1, spawnCalls: 1 })
+    expect(h.lines).toContain(reArmedLine(key, last + 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, last + 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
+    expect(getFailureCount(key)).toBe(0)
   })
 })
 
@@ -2372,6 +2435,7 @@ describe('unavailable retry: the switch, the last row read and a condition end d
     ['during the run, then an again with no row: the row stays pending, and a condition end keeps the timer', true, { kind: 'again' }, UNAVAILABLE_RETRY_ROW_PENDING],
     ['during the run, then an again with its own row: the answer’s row wins, and a condition end stops the timer', true, { kind: 'again', row: 'waiting' }, 'waiting'],
     ['before the run, then an again with no row: the again clears it, and a condition end stops the timer', false, { kind: 'again' }, undefined],
+    ['before the run, then an again with no row that keeps the last row read (a liveness reading of unknown): the row stays pending, and a condition end keeps the timer', false, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN, keepsLastRow: true }, UNAVAILABLE_RETRY_ROW_PENDING],
   ])('armPendingOnly on a full-mode timer %s', async (_what, duringRun, answer, lastRow) => {
     const { controller, lines, held } = await heldRun((c) => {
       c.arm(KEY, UNAVAILABLE)

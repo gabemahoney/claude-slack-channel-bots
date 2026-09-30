@@ -2,7 +2,12 @@
  * health-check.ts — Periodic liveness poller for managed Claude Code sessions.
  *
  * On each tick, checks every applied persona and schedules a restart if its
- * session is dead and not already pending/failed. With auto-restart disabled,
+ * session reads `dead` and is not already pending/failed. The liveness probe
+ * answers one of four readings (b.jg5 SRJ-314): only `dead` schedules the
+ * kill-and-launch path at once; `live`, and for now `pending`, take the alive
+ * branches; `unknown` (a `status` error, or a probe that threw) skips the
+ * persona for the tick, with nothing scheduled or posted, and arms no retry
+ * timer. With auto-restart disabled,
  * an alive persona it would reconnect is reported through the not-connected
  * notice instead of being left down silently (b.f2b). A persona whose
  * `working` row the reconnect adapter is gathering idle evidence for is
@@ -18,6 +23,13 @@
 import type { PersonaConfig } from './config.ts'
 import { setOutageFlag, clearOutageFlag } from './outage-state.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
+import {
+  LIVENESS_DEAD,
+  LIVENESS_UNKNOWN,
+  livenessKindOf,
+  type LivenessKind,
+  type LivenessReading,
+} from './liveness-reading.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,12 +37,19 @@ import { describeThrownValue } from './persona-connection-errors.ts'
 
 /** Health-check dependencies. Every `key` is a persona key. */
 export interface HealthCheckDeps {
-  isSessionAlive(key: string): Promise<boolean>
+  /**
+   * The persona's liveness reading (b.jg5 SRJ-314, `src/liveness-reading.ts`):
+   * `live`, `pending`, `dead` or `unknown`. `dead` schedules the restart at
+   * once; `live` and, for now, `pending` take the alive branches; `unknown`,
+   * a probe that throws and an answer that is not a reading skip the persona
+   * for this tick.
+   */
+  isSessionAlive(key: string): Promise<LivenessReading>
   /**
    * Returns true when the persona's MCP session is currently connected
    * (registry entry with `connected === true`). Used to catch the
    * alive-but-disconnected stranding (b.9a7): a row in an AD live state whose
-   * MCP transport is gone is `isSessionAlive === true` but
+   * MCP transport is gone reads alive (`live` or `pending`) but
    * `isSessionConnected === false`, and without this the tick would never act.
    * Wraps the `isSessionConnected` adapter that `main()` in src/server.ts
    * passes to `initHealthCheck` (registry entry with `connected === true`).
@@ -163,7 +182,8 @@ let skippedTicks = 0
  *   - the moment a persona is observed connected (streak reset inline below),
  *   - when a reconnect is scheduled for it (consumed on fire, below),
  *   - when a tick skips it: pending/active restart, a launch in flight
- *     (b.f2b), at cap, or left out of the tick's work list by the relaunch
+ *     (b.f2b), at cap, a liveness reading of `unknown` or a probe that threw
+ *     (b.jg5 SRJ-314), or left out of the tick's work list by the relaunch
  *     gate,
  *   - by `forgetDisconnectedStreak` when the persona is torn down,
  *   - and wholesale by `_resetHealthCheckState` (the test-reset seam and the
@@ -262,7 +282,27 @@ export function startHealthCheck(intervalSeconds: number): void {
             setOutageFlag(key, 'cwd-unreachable', cwd)
           }
 
-          const alive = await deps.isSessionAlive(key)
+          // b.jg5 SRJ-314: the probe answers a reading. `unknown` (a `status`
+          // error agent-director could not answer, or a probe that threw) is
+          // never read as dead: the persona is skipped this tick, with no
+          // restart scheduled, nothing posted and no episode ended. Its
+          // streak is cleared, as every skip clears it. The tick arms no
+          // retry timer.
+          let reading: LivenessKind
+          let failure = ''
+          try {
+            reading = livenessKindOf(await deps.isSessionAlive(key))
+          } catch (err) {
+            reading = LIVENESS_UNKNOWN
+            failure = ` (isSessionAlive failed: ${describeThrownValue(err)})`
+          }
+          if (reading === LIVENESS_UNKNOWN) {
+            disconnectedStreak.delete(key)
+            console.error(`[slack] health-check: liveness unknown for persona=${key}${failure} — skipping it this tick; not read as dead`)
+            continue
+          }
+          // `live`, and for now `pending`, take the alive branches below.
+          const alive = reading !== LIVENESS_DEAD
 
           // b.9a7: a persona can be alive (AD live state — pending, waiting,
           // working, ask_user, check_permission) yet have a dead MCP session.

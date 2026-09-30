@@ -26,6 +26,13 @@
  * relaunch the timer now owns answers `'refused'`, which is never counted
  * toward the cap (SRJ-302): a persona is never given up on for UNAVAILABLE
  * alone.
+ * The liveness probe answers one of four readings (b.jg5 SRJ-314,
+ * `src/liveness-reading.ts`), and only `dead` leads to the kill and the
+ * launch. `live`, and for now `pending`, take the reconnect path. `unknown`
+ * (a `status` error the adapter could not read as dead, or a probe that
+ * throws) makes the work return with no reconnect, kill, launch or
+ * accounting, and call the arm hook (`RestartDeps.armRetryTimer`); so does an
+ * `unknown` re-probe after an 'escalate-dead' reconnect (b.d61).
  * The work answers an outcome (`RestartWorkOutcome`, one of the
  * `RESTART_OUTCOME_*` labels); the restart timer ignores it. The retry entry,
  * `runRestartRetry`, is how the UNAVAILABLE retry timer's retries rerun the
@@ -53,6 +60,14 @@ import {
 import type { PersonaSerialize } from './persona-serializer.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { runInAttempt } from './unavailable-retry.ts'
+import {
+  LIVENESS_DEAD,
+  LIVENESS_PENDING,
+  LIVENESS_UNKNOWN,
+  livenessKindOf,
+  type LivenessKind,
+  type LivenessReading,
+} from './liveness-reading.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -96,7 +111,8 @@ export const RESTART_OUTCOME_RECONNECTED = 'reconnected'
 export const RESTART_OUTCOME_RECONNECT_DEFERRED = 'reconnect-deferred'
 /**
  * The row reads `pending` (its session has not started), so the reconnect
- * typed nothing and was deferred (`pending`): no launch, nothing counted.
+ * typed nothing and was deferred (`pending`), or b.d61's re-probe after an
+ * 'escalate-dead' reconnect read it `pending`: no launch, nothing counted.
  */
 export const RESTART_OUTCOME_PENDING_DEFERRED = 'pending-deferred'
 /** The kill and the launch ran and the launch succeeded (a success was recorded). */
@@ -114,6 +130,13 @@ export const RESTART_OUTCOME_COUNTED_FAILURE = 'counted-failure'
 export const RESTART_OUTCOME_CAPPED = 'capped'
 /** The launch was declined by its own gate (the persona stopped being up, or the server is stopping). Not counted. */
 export const RESTART_OUTCOME_LAUNCH_SKIPPED = 'launch-skipped'
+/**
+ * The liveness probe (or b.d61's re-probe) read `unknown`, or threw
+ * (b.jg5 SRJ-314): agent-director could not report on the persona. No
+ * reconnect, kill or launch, nothing counted; the arm hook
+ * (`RestartDeps.armRetryTimer`) was called for the persona.
+ */
+export const RESTART_OUTCOME_LIVENESS_UNKNOWN = 'liveness-unknown'
 /** Retry entry only: a launch was in flight for the persona, so no agent-director call was made. */
 export const RESTART_OUTCOME_IN_FLIGHT = 'in-flight'
 /** Retry entry only: `initRestart` has not run, so nothing was done. */
@@ -132,6 +155,7 @@ export type RestartWorkOutcome =
   | typeof RESTART_OUTCOME_COUNTED_FAILURE
   | typeof RESTART_OUTCOME_CAPPED
   | typeof RESTART_OUTCOME_LAUNCH_SKIPPED
+  | typeof RESTART_OUTCOME_LIVENESS_UNKNOWN
 
 /** What the retry entry (`runRestartRetry`) answers: the work's outcome, or why it did not run. */
 export type RestartRetryOutcome =
@@ -158,7 +182,15 @@ export interface RestartDeps {
    * (`createPersonaRelaunchGate`).
    */
   canRestart(key: string): boolean
-  isSessionAlive(key: string): Promise<boolean>
+  /**
+   * The persona's liveness reading (b.jg5 SRJ-314, `src/liveness-reading.ts`):
+   * `live`, `pending`, `dead` or `unknown`. Only `dead` leads to the kill and
+   * the launch. `live` and, for now, `pending` take the reconnect path;
+   * `unknown`, a probe that throws and an answer that is not a reading all
+   * read `unknown`: the work returns `RESTART_OUTCOME_LIVENESS_UNKNOWN` with
+   * no reconnect, kill, launch or accounting, and calls `armRetryTimer`.
+   */
+  isSessionAlive(key: string): Promise<LivenessReading>
   /** Check if the session already has a live MCP connection in the registry. */
   isSessionConnected(key: string): boolean
   /**
@@ -215,6 +247,17 @@ export interface RestartDeps {
    * Production passes the server's one shared serializer.
    */
   serialize?: PersonaSerialize
+  /**
+   * The arm hook (b.jg5 SRJ-314, SRJ-301): called once with the persona key
+   * on every `RESTART_OUTCOME_LIVENESS_UNKNOWN` return of the restart work,
+   * the re-probe's included, so the persona's UNAVAILABLE retry timer is
+   * armed even for a reading the adapter's own report does not arm on (a
+   * CONFIG answer, a probe that throws). Production arms the timer through
+   * its controller with the `read-error` cause; a call while the timer is
+   * armed or running its retry keeps its due time and wait count. A hook
+   * that throws is logged and changes nothing else. Absent: nothing is armed.
+   */
+  armRetryTimer?(key: string): void
 }
 
 /** What `RestartDeps.reconnectSession` answers; `void` is a non-success. */
@@ -421,10 +464,13 @@ function launchInFlight(key: string, isInFlight: (key: string) => boolean): bool
 /**
  * The work a restart timer does when it fires, and a retry reruns, run
  * through the serializer: the shutdown and not-up checks, the liveness probe,
- * the not-up check again, then a reconnect, or a kill and a launch, and the
- * success or failure accounting. A reconnect whose verdict is 'escalate-dead'
- * is followed by a second liveness probe; when the row now reads dead, the
- * same run goes on to the kill and launch (b.d61). The restart cap is not
+ * the not-up check again, then, by the reading (b.jg5 SRJ-314), a return with
+ * nothing done (`unknown`, a thrown probe included: the arm hook is called),
+ * a reconnect (`live`, and for now `pending`), or a kill and a launch
+ * (`dead`), and the success or failure accounting. A reconnect whose verdict
+ * is 'escalate-dead' is followed by a second liveness probe; only when the
+ * row now reads `dead` does the same run go on to the kill and launch
+ * (b.d61). The restart cap is not
  * asked here (the retry entry asks it before this work). The whole work is
  * one recovery attempt for the persona (b.jg5 SRJ-301). Answers what it did (`RestartWorkOutcome`).
  */
@@ -445,13 +491,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // no success or failure recorded.
   if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
 
-  let alive: boolean
-  try {
-    alive = await d.isSessionAlive(key)
-  } catch (err) {
-    console.error(`[slack] restart: isSessionAlive failed for persona=${key}: ${describeThrownValue(err)}`)
-    alive = false
-  }
+  const probe = await probeLiveness(d, key)
 
   // Asked again after the liveness probe: it is an async agent-director
   // call, and the persona may have stopped being up while it ran. This is
@@ -460,7 +500,18 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // during the kill.
   if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
 
-  if (alive) {
+  // b.jg5 SRJ-314: agent-director could not report on the persona (a
+  // `status` error, or a probe that threw). Never read as dead: no
+  // reconnect, kill or launch, nothing counted, and the retry timer is armed.
+  if (probe.kind === LIVENESS_UNKNOWN) {
+    console.error(`[slack] Liveness unknown for persona=${key}${probeFailure(probe)} — no reconnect, kill or launch; nothing counted`)
+    armOnUnknown(d, key)
+    return RESTART_OUTCOME_LIVENESS_UNKNOWN
+  }
+
+  // `live`, and for now `pending`, take the reconnect path; only `dead` falls
+  // through to the kill and the launch.
+  if (probe.kind !== LIVENESS_DEAD) {
     // If the session already re-established its MCP connection (e.g. Claude
     // Code refreshed the SSE stream on its own), skip the reconnect. A
     // session is only truly healed when it is connected AND its standalone
@@ -512,10 +563,12 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // so the frozen `working` row reconciles to `missing`. b.d61: rather than
     // wait for the next tick (a full health interval plus another backoff
     // delay), this run probes liveness again and, when the row now reads
-    // dead, falls through to the kill+relaunch branch below at once, with the
-    // same accounting as any dead-session relaunch. When the row still reads
-    // alive (e.g. the sweep failed or a memoized result predates the kill),
-    // it returns as before and the next tick retries. The external
+    // `dead`, falls through to the kill+relaunch branch below at once, with
+    // the same accounting as any dead-session relaunch. When the row still
+    // reads live or `pending` (e.g. the sweep failed or a memoized result
+    // predates the kill), it returns as before and the next tick retries;
+    // when the re-probe reads `unknown` (b.jg5 SRJ-314), it returns with no
+    // relaunch and the arm hook is called. The external
     // ~/startup/find-missing-loop.sh is belt-and-braces only — recovery no
     // longer depends on it, and removing it is a separate operator decision.
     if (reconnectResult === 'pending') return RESTART_OUTCOME_PENDING_DEFERRED
@@ -588,24 +641,21 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
 /**
  * b.d61: after an 'escalate-dead' reconnect verdict (whose adapter already ran
  * the findMissing sweep), probe the persona's liveness again. Returns
- * undefined when the row now reads dead and this restart run should go on to
- * the kill+relaunch branch; otherwise the outcome the run returns with, as
- * before: `RESTART_OUTCOME_RECONNECT_DEFERRED` (the row still reads alive, so
- * the next tick retries), `RESTART_OUTCOME_SHUTTING_DOWN` or
- * `RESTART_OUTCOME_NOT_UP`. The probe is guarded as the first one is: a thrown
- * probe counts as not alive. Shutdown and the not-up gate are asked after the
+ * undefined only when the row now reads `dead` and this restart run should go
+ * on to the kill+relaunch branch; otherwise the outcome the run returns with,
+ * with no relaunch (b.jg5 SRJ-314): `RESTART_OUTCOME_RECONNECT_DEFERRED` (the
+ * row still reads `live`, so the next tick retries),
+ * `RESTART_OUTCOME_PENDING_DEFERRED` (the row reads `pending`: its session
+ * has not started), `RESTART_OUTCOME_LIVENESS_UNKNOWN` (the re-probe read
+ * `unknown` or threw: agent-director could not report on the persona, and the
+ * arm hook is called), `RESTART_OUTCOME_SHUTTING_DOWN` or
+ * `RESTART_OUTCOME_NOT_UP`. Shutdown and the not-up gate are asked after the
  * probe, since it is an async agent-director call; `killSession`'s
  * launch-in-flight guard and `launchSession`'s own gate still apply after it.
  * Records no success or failure.
  */
 async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<RestartWorkOutcome | undefined> {
-  let alive: boolean
-  try {
-    alive = await d.isSessionAlive(key)
-  } catch (err) {
-    console.error(`[slack] restart: isSessionAlive failed after escalate-dead for persona=${key}: ${describeThrownValue(err)}`)
-    alive = false
-  }
+  const probe = await probeLiveness(d, key)
 
   if (d.isShuttingDown()) {
     console.error(`[slack] Skipping restart — server is shutting down (persona=${key})`)
@@ -613,12 +663,60 @@ async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<Re
   }
   if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
 
-  if (alive) {
-    console.error(`[slack] Session still reads alive after escalate-dead — leaving the relaunch to a later tick for persona=${key}`)
-    return RESTART_OUTCOME_RECONNECT_DEFERRED
+  switch (probe.kind) {
+    case LIVENESS_DEAD:
+      console.error(`[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run for persona=${key} (b.d61)`)
+      return undefined
+    case LIVENESS_UNKNOWN:
+      console.error(`[slack] Liveness unknown after escalate-dead for persona=${key}${probeFailure(probe)} — no relaunch in this restart run; nothing counted`)
+      armOnUnknown(d, key)
+      return RESTART_OUTCOME_LIVENESS_UNKNOWN
+    case LIVENESS_PENDING:
+      console.error(`[slack] Session reads pending after escalate-dead — its session has not started; no relaunch in this restart run for persona=${key}`)
+      return RESTART_OUTCOME_PENDING_DEFERRED
+    default:
+      console.error(`[slack] Session still reads alive after escalate-dead — leaving the relaunch to a later tick for persona=${key}`)
+      return RESTART_OUTCOME_RECONNECT_DEFERRED
   }
-  console.error(`[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run for persona=${key} (b.d61)`)
-  return undefined
+}
+
+/** One liveness probe's result: its reading's kind, and why it failed when the probe threw. */
+interface LivenessProbe {
+  readonly kind: LivenessKind
+  /** `describeThrownValue` of what the probe threw; absent when it answered. */
+  readonly failure?: string
+}
+
+/**
+ * Probe persona `key`'s liveness (b.jg5 SRJ-314): the reading's kind, with a
+ * probe that throws, or answers something that is not a reading, read
+ * `unknown` (never `dead`). Logs nothing; never rejects.
+ */
+async function probeLiveness(d: RestartDeps, key: string): Promise<LivenessProbe> {
+  try {
+    return { kind: livenessKindOf(await d.isSessionAlive(key)) }
+  } catch (err) {
+    return { kind: LIVENESS_UNKNOWN, failure: describeThrownValue(err) }
+  }
+}
+
+/** ` (isSessionAlive failed: <why>)` for a probe that threw, else empty: the part of an unknown line that names the failure. */
+function probeFailure(probe: LivenessProbe): string {
+  return probe.failure === undefined ? '' : ` (isSessionAlive failed: ${probe.failure})`
+}
+
+/**
+ * Call the arm hook (`RestartDeps.armRetryTimer`) for persona `key` once, on
+ * an `unknown` reading (b.jg5 SRJ-314). Absent, nothing is armed. A hook that
+ * throws is logged; never throws.
+ */
+function armOnUnknown(d: RestartDeps, key: string): void {
+  if (d.armRetryTimer === undefined) return
+  try {
+    d.armRetryTimer(key)
+  } catch (err) {
+    console.error(`[slack] restart: arming the retry timer failed for persona=${key}: ${describeThrownValue(err)}`)
+  }
 }
 
 /**

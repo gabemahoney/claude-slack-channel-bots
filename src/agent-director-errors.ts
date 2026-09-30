@@ -151,6 +151,15 @@ export const ERR_STORE_OPEN_NAME = 'ErrStoreOpen'
  */
 export const ERR_SPAWN_NOT_FOUND_NAME = 'ErrSpawnNotFound'
 
+/**
+ * `errName` of the error the client raises when its agent-director binary is
+ * gone after the client was built (any verb; b.xht). Every client declares
+ * its class; the name is kept here for the sites that tell it apart by name
+ * (`hasAdErrorName`), such as the liveness adapter, where it reads dead
+ * (b.jg5 SRJ-314).
+ */
+export const ERR_SYSTEM_INSTALL_DISAPPEARED_NAME = 'ErrSystemInstallDisappeared'
+
 /** The three store-open error names, in one list. */
 export const STORE_OPEN_ERR_NAMES = [
   ERR_SCHEMA_MISMATCH_NAME,

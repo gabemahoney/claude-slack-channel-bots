@@ -17,7 +17,8 @@
  *   before the call is recorded, so a test can put the send in an ordered log,
  *   hold it open or make it fail (a throwing hook: not recorded);
  * - the real restart and backoff state, with `initRestart` given
- *   `makeRestartDeps`: a session is never alive, launches are recorded in
+ *   `makeRestartDeps`: every liveness probe answers the `dead` reading
+ *   (`LIVENESS_READING_DEAD`, src/liveness-reading.ts), launches are recorded in
  *   `h.launches`, and the restart delay is read from `h.restartDelayS` at call
  *   time. `launchSession` replaces the launch outcome (hold a launch open to
  *   keep the persona in flight);
@@ -85,6 +86,7 @@ import type { PersonaDestinationHold } from '../../src/persona-destination-hold.
 import type { LostMessageState } from '../../src/lost-message.ts'
 import { createSessionServer, registerSession, _resetRegistry, type SessionEntry, type SessionToolDeps } from '../../src/registry.ts'
 import { initRestart, _resetRestartState, type RestartDeps } from '../../src/restart.ts'
+import { LIVENESS_READING_DEAD } from '../../src/liveness-reading.ts'
 import { _resetBackoffState } from '../../src/backoff.ts'
 import { _resetAckTracker, consumeAck } from '../../src/ack-tracker.ts'
 import {
@@ -227,14 +229,14 @@ export interface RestartFakeOptions {
   launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<boolean>
 }
 
-/** Restart deps whose session is never alive and whose launches are recorded in `launches`. */
+/** Restart deps whose session always reads `dead` and whose launches are recorded in `launches`. */
 export function makeRestartDeps(opts: RestartFakeOptions = {}): RestartDeps & { launches: LaunchCall[] } {
   const launches: LaunchCall[] = []
   const delay = opts.restartDelayS ?? FAST_RESTART_DELAY_S
   return {
     launches,
     canRestart: () => true,
-    isSessionAlive: async () => false,
+    isSessionAlive: async () => LIVENESS_READING_DEAD,
     isSessionConnected: () => false,
     hasSessionStream: () => false,
     reconnectSession: async () => 'success',

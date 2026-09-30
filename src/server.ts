@@ -78,7 +78,6 @@ import {
 } from './config.ts'
 import { personaInstanceId, personaTmuxSessionName, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import {
-  AGENT_DIRECTOR_LIVE_STATES,
   cancelWorkingRowWait,
   checkLaunchConfigDir,
   checkPromptRowDeferral,
@@ -138,7 +137,20 @@ import { createPersonaSerializer } from './persona-serializer.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from './persona-lifecycle.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound, resolveSystemBinary } from 'agent-director'
-import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
+import {
+  ERR_SPAWN_NOT_FOUND_NAME,
+  ERR_SYSTEM_INSTALL_DISAPPEARED_NAME,
+  ErrSystemInstallDisappeared,
+  ErrTmuxNotAvailable,
+} from './agent-director-errors.ts'
+import { AD_ERROR_CLASS_ENVIRONMENT, classifyAdError, hasAdErrorName } from './ad-error-class.ts'
+import {
+  LIVENESS_READING_DEAD,
+  LIVENESS_READING_UNKNOWN,
+  LIVENESS_UNKNOWN,
+  livenessReadingForState,
+  type LivenessReading,
+} from './liveness-reading.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
 import { trustBootstrap, trustPatchPersona } from './trust-bootstrap.ts'
 import { runJsonlPersistenceSafeguard, runPersonaStorageCheck } from './jsonl-persistence-check.ts'
@@ -162,6 +174,7 @@ import {
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
+  UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   type UnavailableRetryController,
@@ -947,53 +960,95 @@ export async function _runCallTimeoutStartStep(
 // ---------------------------------------------------------------------------
 
 /**
- * _buildIsSessionAliveAdapter — test-only factory for the tick-path liveness
- * probe. Production code wires this via main() as `isSessionAliveAdapter`;
- * tests call it directly to exercise the four SRD § Liveness probe branches
+ * _buildIsSessionAliveAdapter — test-only factory for the liveness probe the
+ * health tick, the restart path and b.d61's re-probe share. Production code
+ * wires this via main() as `isSessionAliveAdapter`; tests call it directly
  * without importing the private closure inside main().
+ *
+ * It answers one of four readings (b.jg5 SRJ-314, `src/liveness-reading.ts`):
+ * a `status` state maps through `livenessReadingForState` (`pending` →
+ * `pending`, another live state → `live`, `ended` or `missing` → `dead`, any
+ * other state → `unknown`, logged). A `status` error is decided by name
+ * through `src/ad-error-class.ts`:
+ *   - `ErrSpawnNotFound` → `dead`; clears `ad-unreachable` and
+ *     `tmux-unavailable`, as a state answer does;
+ *   - `ErrSystemInstallDisappeared` → `dead`; raises `ad-unreachable` with its
+ *     binary path;
+ *   - `ErrTmuxNotAvailable` (ENVIRONMENT) → `unknown`; raises
+ *     `tmux-unavailable`;
+ *   - any other thrown value (a CONFIG answer, each UNAVAILABLE form,
+ *     `ErrCallTimeout`, CSCB's `UnknownError` wrapper, `ErrInternal`, a name
+ *     CSCB does not know, a value that is not an agent-director error) →
+ *     `unknown`, with one log line: a `status` error is never read as dead.
+ * A key not in the persona config (or no config) reads `dead` with no
+ * `status` call; the relaunch gate refuses such a key before any kill or
+ * launch.
  *
  * Its bare `status` is the one persona call not made through the outage
  * wrappers, so its error branches report the error themselves
  * (`reportAgentDirectorError` with the verb `status`): inside a restart run
  * it arms the persona's retry timer (b.jg5 SRJ-301), and from the health
- * tick, which runs outside every attempt, it arms nothing. A thrown `status`
- * still reads dead.
+ * tick, which runs outside every attempt, it arms nothing.
  *
  * @internal
  */
 export function _buildIsSessionAliveAdapter(
   getPersonaConfig: () => PersonaConfig | null | undefined,
-): (key: string) => Promise<boolean> {
+): (key: string) => Promise<LivenessReading> {
   // `key` is the persona key.
   return async (key: string) => {
     const config = getPersonaConfig()
-    if (!config?.personas.some((p) => p.key === key)) return false
+    if (!config?.personas.some((p) => p.key === key)) return LIVENESS_READING_DEAD
     const claude_instance_id = personaInstanceId(key)
     try {
       const r = await getClient().status({ claude_instance_id })
       clearOutageFlag(key, 'ad-unreachable')
       clearOutageFlag(key, 'tmux-unavailable')
-      return AGENT_DIRECTOR_LIVE_STATES.has(r.state)
+      const reading = livenessReadingForState(r.state)
+      if (reading.kind === LIVENESS_UNKNOWN) {
+        console.error(`[slack] isSessionAlive: status answered a state CSCB does not know for persona=${key} — read as unknown, not dead`)
+      }
+      return reading
     } catch (err) {
       // b.jg5 SRJ-301: inside a restart run (a recovery attempt) a status
-      // error arms the persona's retry timer; the reading below is unchanged.
+      // error arms the persona's retry timer, whatever the reading below.
       reportAgentDirectorError(key, err, 'status')
-      if (err instanceof ErrSpawnNotFound) {
-        clearOutageFlag(key, 'ad-unreachable')
-        clearOutageFlag(key, 'tmux-unavailable')
-        return false
-      }
-      if (err instanceof ErrSystemInstallDisappeared) {
-        setOutageFlag(key, 'ad-unreachable', err.binaryPath)
-        return false
-      }
-      if (err instanceof ErrTmuxNotAvailable) {
-        setOutageFlag(key, 'tmux-unavailable')
-        return false
-      }
-      console.error(`[slack] isSessionAlive: status error for persona=${key}: ${describeThrownValue(err)}`)
-      return false
+      return statusErrorReading(key, err)
     }
+  }
+}
+
+/**
+ * The liveness adapter's reading for a `status` error (b.jg5 SRJ-314), with
+ * its outage flags; see `_buildIsSessionAliveAdapter`. Decided by name
+ * through `src/ad-error-class.ts`. Only `ErrSpawnNotFound` and
+ * `ErrSystemInstallDisappeared` read `dead`.
+ */
+function statusErrorReading(key: string, err: unknown): LivenessReading {
+  if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+    clearOutageFlag(key, 'ad-unreachable')
+    clearOutageFlag(key, 'tmux-unavailable')
+    return LIVENESS_READING_DEAD
+  }
+  if (hasAdErrorName(err, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME)) {
+    setOutageFlag(key, 'ad-unreachable', binaryPathOf(err))
+    return LIVENESS_READING_DEAD
+  }
+  if (classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
+    setOutageFlag(key, 'tmux-unavailable')
+    return LIVENESS_READING_UNKNOWN
+  }
+  console.error(`[slack] isSessionAlive: status error for persona=${key}: ${describeThrownValue(err)} — read as unknown, not dead`)
+  return LIVENESS_READING_UNKNOWN
+}
+
+/** The `binaryPath` an `ErrSystemInstallDisappeared` carries, when it is a string. Never throws. */
+function binaryPathOf(err: unknown): string | undefined {
+  try {
+    const path = (err as { readonly binaryPath?: unknown }).binaryPath
+    return typeof path === 'string' ? path : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -1124,10 +1179,11 @@ export function _buildKillSessionAdapter(
  *
  * b.f2b — never type blind. When the status call throws, nothing is known
  * about the session (it may be mid-turn), so nothing is typed: the failure is
- * logged and the adapter returns 'transient'; the next tick retries (and
- * during an agent-director outage the liveness probe reads the persona dead,
- * so the tick relaunches it instead). Before b.f2b a failed status call fell
- * through to the reconnect.
+ * logged and the adapter returns 'transient'; the next tick retries. In the
+ * liveness probe (b.jg5 SRJ-314) only `ErrSpawnNotFound` and
+ * `ErrSystemInstallDisappeared` read dead; every other `status` error reads
+ * `unknown`, so nothing kills or relaunches the persona on it. Before b.f2b a
+ * failed status call fell through to the reconnect.
  *
  * b.f2b — never type into a prompt or dialog. `/mcp reconnect` + Enter typed
  * into an `ask_user` or `check_permission` session could confirm the dialog's
@@ -1983,9 +2039,12 @@ export async function main(): Promise<void> {
   }
 
   // Shared adapter: probes agent-director for the spawn's current state per
-  // SR-11 Event 6a. Any AGENT_DIRECTOR_LIVE_STATES value → alive; terminal
-  // states (ended, missing) and ErrSpawnNotFound → dead. Other errors fall
-  // back to "dead" defensively — health-check will retry.
+  // SR-11 Event 6a and answers one of four readings (b.jg5 SRJ-314): `pending`;
+  // `live` for another live state; `dead` for a terminal state (ended,
+  // missing), ErrSpawnNotFound or ErrSystemInstallDisappeared; `unknown` for
+  // every other status error and any state CSCB does not know. Only `dead`
+  // leads to a kill and a launch; the restart path arms the persona's retry
+  // timer on `unknown`, and the health tick skips the persona that tick.
   const isSessionAliveAdapter = _buildIsSessionAliveAdapter(() => personaConfig)
 
   // b.9cj: the restart guard and the health-check tick share persona-routing's
@@ -2027,6 +2086,13 @@ export async function main(): Promise<void> {
     // b.av2 SR-6.6: a fired timer's work waits its turn behind any lifecycle
     // operation for the persona.
     serialize: personaLifecycle.run,
+    // b.jg5 SRJ-314, SRJ-301: a restart run whose liveness reads `unknown`
+    // (at its probe or b.d61's re-probe) arms the persona's UNAVAILABLE retry
+    // timer on the controller built above, with the read-error cause. An arm
+    // while the timer is armed or running keeps its due time and wait count.
+    armRetryTimer: (key) => {
+      retryTimers.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
+    },
   })
 
   // b.av2 SR-6.3: the start sweep, BEFORE the trust patch and any spawn.

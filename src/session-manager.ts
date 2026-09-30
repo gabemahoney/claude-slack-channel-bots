@@ -152,6 +152,7 @@ import {
 import { describeDestinationFailureCause } from './persona-destination.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { RESTART_FAILURE_CAP } from './restart.ts'
+import { AGENT_DIRECTOR_LIVE_STATES } from './liveness-reading.ts'
 import { isDryRun } from './tokens.ts'
 import { DIALOG_READY_TIMEOUT_MS } from './ad-settings.ts'
 // Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
@@ -170,17 +171,11 @@ import { resolve as resolvePath } from 'node:path'
 // ---------------------------------------------------------------------------
 
 /**
- * Live states per SR-11 (agent-director Spawn state machine). Terminal states
- * (`ended`, `missing`) and the typed `ErrSpawnNotFound` rejection from
- * `client.status(...)` are treated as dead by callers.
+ * Live states per SR-11 (agent-director Spawn state machine), kept in
+ * `src/liveness-reading.ts` beside the liveness readings (b.jg5 SRJ-314) and
+ * re-exported here.
  */
-export const AGENT_DIRECTOR_LIVE_STATES: ReadonlySet<string> = new Set([
-  'pending',
-  'waiting',
-  'working',
-  'ask_user',
-  'check_permission',
-])
+export { AGENT_DIRECTOR_LIVE_STATES }
 
 /** The CSCB-shipped template name (mirrors agent-director-client). */
 const TEMPLATE_NAME = 'slack-channel-bot'
@@ -2350,7 +2345,7 @@ async function tmuxFallbackVerdict(
       key,
       config,
       `[slack] waitForWaitingAndReconnect: timed out for ${ref} after ${_waitForWaitingTimeoutMs}ms — ${reason}, tmux session alive`,
-      'the health check recovers it (b.9a7): during an AD outage the adapter reports alive=false and the tick restarts it; once AD recovers with the row live, the tick sees alive && !connected -> scheduleRestart -> reconnect',
+      'the health check recovers it (b.9a7): while a status error reads unknown the tick skips the persona (no restart); a missing row reads dead and the tick relaunches it; once AD answers with the row live, the tick sees alive && !connected -> scheduleRestart -> reconnect',
       {
         reason: 'auto-restart-disabled',
         cause: `agent-director could not report its state when CSCB stopped waiting for it, ${describeWaitSpan(_waitForWaitingTimeoutMs)} after launching it`,

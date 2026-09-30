@@ -55,6 +55,7 @@ import { join } from 'node:path'
 
 import type { Persona } from '../src/config.ts'
 import { _resetHealthCheckState, buildPersonaWorkList, initHealthCheck, startHealthCheck } from '../src/health-check.ts'
+import { LIVENESS_READING_DEAD } from '../src/liveness-reading.ts'
 import { _resetOutageState, getOutageFlags, initOutageState } from '../src/outage-state.ts'
 import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
 import { createPersonaBringUpController, type PersonaBringUpController } from '../src/persona-bringup-controller.ts'
@@ -456,16 +457,17 @@ describe('composePersonaStatusListeners: every listener runs; the result rejects
 // ---------------------------------------------------------------------------
 
 /**
- * Start the real health check over `getPersonas` with every session dead, so
- * each persona in a tick's work list is scheduled. Ticks run one at a time:
- * `tick()` lets exactly one more tick body run and waits for it.
+ * Start the real health check over `getPersonas` with every session reading
+ * `dead` (`LIVENESS_READING_DEAD`), so each persona in a tick's work list is
+ * scheduled. Ticks run one at a time: `tick()` lets exactly one more tick
+ * body run and waits for it.
  */
 function startTicks(getPersonas: () => Record<string, string>) {
   let allowed = 0
   let ticks = 0
   const calls = { stat: [] as string[], alive: [] as string[], scheduled: [] as string[] }
   initHealthCheck({
-    isSessionAlive: async (key) => (calls.alive.push(key), false),
+    isSessionAlive: async (key) => (calls.alive.push(key), LIVENESS_READING_DEAD),
     isSessionConnected: () => false,
     hasSessionStream: () => false,
     isRestartPendingOrActive: () => false,

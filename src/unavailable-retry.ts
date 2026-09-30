@@ -66,7 +66,9 @@
  * which keeps its due time. The last row read is the `row` of the latest
  * `again` answer (`pending` for a launch that succeeded, the launch's row,
  * switched or not), else `pending` when `armPendingOnly` landed during that
- * run, else cleared by the `again`; a failed retry keeps it, and
+ * run, else kept as it is when the answer sets `keepsLastRow` (the
+ * liveness-unknown `again`, which read no row), else cleared by the `again`;
+ * a failed retry keeps it, and
  * `armPendingOnly` sets it `pending`. A `stop` answer may carry a hand-off,
  * run once, awaited, after the stop. A pending-only retry's stop that rests
  * on its row read (`yieldsToFullMode`) is not taken when `arm` recorded a
@@ -118,14 +120,16 @@
  * reconnected, has nothing left to recover (stop); capped, not up, a declined
  * launch or shutting down stop too; a launch in flight, a refused launch, a
  * counted launch failure below the cap, a deferred reconnect (on a `pending`
- * row, recorded as the last row read) and a successful launch retry again at
- * the next wait. A successful launch records the row read `pending` and
+ * row, recorded as the last row read), a liveness reading of `unknown` (b.jg5
+ * SRJ-314; it read no row, so the last row read is kept) and a successful
+ * launch retry again at the next wait. A successful launch records the row
+ * read `pending` and
  * switches the timer to pending-only mode, the wait count carrying on,
  * unless another cause armed during that retry or a `kill-failed` cause is
  * recorded. Each `again` carries its again-reason
  * (the labels under "Again-reasons" below: `launch-in-flight`,
  * `launch-failed`, `reconnect-deferred`, `pending-deferred`, `launched`,
- * `restart-not-initialised`) for the re-armed line, except a refused launch,
+ * `restart-not-initialised`, `liveness-unknown`) for the re-armed line, except a refused launch,
  * whose line names the UNAVAILABLE cause that armed during the run. The
  * in-flight skip is still a refusal for the schedule: the wait doubles. A
  * retry never counts toward the restart cap itself: only a launch failure
@@ -282,6 +286,13 @@ export const UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED = 'restart-not-init
 /** A full-mode retry whose reconnect was deferred because the row reads `pending`. */
 export const UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED = 'pending-deferred'
 
+/**
+ * A full-mode retry whose liveness read `unknown` (b.jg5 SRJ-314, SRJ-302: a
+ * refusal): agent-director could not report on the persona, so nothing was
+ * done and no row was read.
+ */
+export const UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN = 'liveness-unknown'
+
 /** A pending-only retry that read the row still `pending` (b.jg5 SRJ-302: a refusal). */
 export const UNAVAILABLE_RETRY_AGAIN_ROW_PENDING = 'row-pending'
 
@@ -371,8 +382,11 @@ export interface UnavailableRetryCause {
  *   left the row in (`pending` after a launch that succeeded). An `again`
  *   answer's `row` becomes the timer's last row read; an `again` answer
  *   without one leaves it `pending` when `armPendingOnly` landed during the
- *   run, and clears it otherwise. A `stop` answer's is named in the stopped
- *   line.
+ *   run, keeps it as it is when the answer `keepsLastRow`, and clears it
+ *   otherwise. A `stop` answer's is named in the stopped line.
+ * - `keepsLastRow` (`again`): true when the retry read no row (a liveness
+ *   reading of `unknown`, b.jg5 SRJ-314), so an answer without `row` keeps
+ *   the timer's last row read instead of clearing it.
  * - `switchToPendingOnly` (`again`): true switches the timer to pending-only
  *   mode, the wait count carrying on (a full-mode retry whose launch
  *   succeeded), unless `arm` recorded a cause during the run or a
@@ -394,6 +408,7 @@ export type UnavailableRetryOutcome =
       readonly reason?: string
       readonly row?: string
       readonly switchToPendingOnly?: boolean
+      readonly keepsLastRow?: boolean
     }
   | {
       readonly kind: 'stop'
@@ -699,7 +714,9 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       reason = answered ?? failure ?? unexpected ?? entry.runCause ?? NO_CAUSE_GIVEN
       if (outcome?.kind === 'again') {
         const row = rowOf(outcome)
-        entry.lastRow = row ?? (entry.pendingArmedInRun ? UNAVAILABLE_RETRY_ROW_PENDING : undefined)
+        if (row !== undefined) entry.lastRow = row
+        else if (entry.pendingArmedInRun) entry.lastRow = UNAVAILABLE_RETRY_ROW_PENDING
+        else if (!keepsLastRow(outcome)) entry.lastRow = undefined
         if (switchesToPendingOnly(outcome) && mayTakeSwitch(entry)) entry.mode = UNAVAILABLE_RETRY_MODE_PENDING_ONLY
       }
     }
@@ -1001,7 +1018,8 @@ function againWith(reason: string | undefined): UnavailableRetryOutcome {
  * launch gives no reason of its own: the UNAVAILABLE outcome that refused it
  * armed the timer during the run, and the re-armed line names that cause. A
  * reconnect deferred on a `pending` row records the row read `pending`. A
- * successful launch records the row read `pending` too (the launch's row,
+ * liveness reading of `unknown` (b.jg5 SRJ-314) is a refusal that read no
+ * row: the last row read is kept as it is. A successful launch records the row read `pending` too (the launch's row,
  * whether or not the switch is taken) and asks to switch the timer to
  * pending-only mode; the controller takes the switch only when no other
  * cause armed during the run and no `kill-failed` cause is recorded.
@@ -1038,6 +1056,10 @@ function answerFor(outcome: RestartRetryOutcome): UnavailableRetryOutcome {
       }
     case 'not-initialised':
       return againWith(UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED)
+    case 'liveness-unknown':
+      // b.jg5 SRJ-302, SRJ-305: a refusal, never "nothing left to recover".
+      // It read no row, so the last row read is kept as it is.
+      return { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN, keepsLastRow: true }
     default: {
       const unknown: never = outcome
       throw new Error(`unknown restart retry outcome: ${String(unknown)}`)
@@ -1095,6 +1117,15 @@ function rowOf(outcome: { readonly row?: unknown }): string | undefined {
 function switchesToPendingOnly(outcome: { readonly switchToPendingOnly?: unknown }): boolean {
   try {
     return outcome.switchToPendingOnly === true
+  } catch {
+    return false
+  }
+}
+
+/** True when an `again` answer keeps the timer's last row read (its field is exactly `true`). Never throws. */
+function keepsLastRow(outcome: { readonly keepsLastRow?: unknown }): boolean {
+  try {
+    return outcome.keepsLastRow === true
   } catch {
     return false
   }
