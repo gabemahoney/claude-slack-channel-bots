@@ -679,7 +679,9 @@ export type NeverEarlyWaitLength = number | (() => number)
  *   pending until the callback runs or the wait is cancelled, even while it
  *   answers {@link AD_WAIT_NEVER_ENDS}, so a later lower value can end it.
  * - The cancel clears the pending timer and stops the wait; calling it again,
- *   or after the callback ran, does nothing.
+ *   or after the callback ran, does nothing. A getter that calls the cancel
+ *   while it runs at a fire stops the wait the same way: the callback does
+ *   not run and no timer is armed after it.
  *
  * Throws a `RangeError`, before arming anything, for a `startMs` that is not
  * finite, a fixed `waitMs` that is NaN or a getter whose first value (read
@@ -724,6 +726,8 @@ export function armNeverEarlyWait(
     handle = undefined
     if (stopped) return
     const currentWaitMs = waitInEffect()
+    // The getter may have called the cancel while it ran.
+    if (stopped) return
     if (clock.now() - startMs >= currentWaitMs) {
       stopped = true
       callback()

@@ -1206,6 +1206,37 @@ describe('ad settings: armNeverEarlyWait arming', () => {
     expect(fired).toBe(1)
     expect(clock.pendingCount()).toBe(0)
   })
+
+  test('a getter whose deadline already passed at the arm: the callback does not run during the arm, and runs once from the next timer', async () => {
+    const wait = adGraceMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
+    const clock = trackedClock()
+    await clock.advance(wait * 2)
+    let fired = 0
+    armNeverEarlyWait(clock, 0, () => wait, () => { fired += 1 })
+    expect(fired).toBe(0)
+    expect(clock.pendingCount()).toBe(1)
+    await clock.runNext()
+    expect(fired).toBe(1)
+    expect(clock.pendingCount()).toBe(0)
+    await clock.advance(MAX_TIMER_DELAY_MS)
+    expect(fired).toBe(1)
+  })
+
+  test('a getter that throws at the arm: the error propagates out of the arm and nothing is armed', async () => {
+    const clock = trackedClock()
+    const failure = new Error('stub wait getter failure at the arm')
+    let fired = 0
+    let caught: unknown
+    try {
+      armNeverEarlyWait(clock, clock.now(), () => { throw failure }, () => { fired += 1 })
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBe(failure)
+    expect(clock.pendingCount()).toBe(0)
+    await clock.advance(MAX_TIMER_DELAY_MS)
+    expect(fired).toBe(0)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1306,6 +1337,50 @@ describe('ad settings: armNeverEarlyWait with a getter, read at every fire', () 
     wait.set(DEFAULT_GRACE_MS)
     await clock.runNext()
     expect(firedAt).toEqual([nextTimer!.dueAt])
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test('cancel mid-chain with a getter at AD_WAIT_NEVER_ENDS: no timer pending after it and the callback never runs', async () => {
+    const clock = trackedClock()
+    const wait = steeredWait(AD_WAIT_NEVER_ENDS)
+    const firedAt: number[] = []
+    const cancel = armNeverEarlyWait(clock, clock.now(), wait.get, () => { firedAt.push(clock.now()) })
+    await clock.runNext()
+    await clock.runNext()
+    expect(clock.pendingCount()).toBe(1)
+    cancel()
+    expect(clock.pendingCount()).toBe(0)
+    wait.set(DEFAULT_GRACE_MS)
+    await clock.advance(MAX_TIMER_DELAY_MS * 3)
+    expect(firedAt).toEqual([])
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test.each<[string, () => number, boolean]>([
+    ['the deadline already passed at that fire', () => DEFAULT_GRACE_MS, true],
+    ['the deadline not yet passed at that fire', hugeGraceMs, false],
+  ])('a getter that calls the cancel while it runs at a fire, %s: the callback never runs and no timer is left pending', async (_label, waitAtFire, deadlinePassed) => {
+    const waitMs = waitAtFire()
+    const clock = trackedClock()
+    const start = clock.now()
+    let calls = 0
+    let cancel: () => void = () => {}
+    const getter = (): number => {
+      calls += 1
+      if (calls === 2) cancel()
+      return waitMs
+    }
+    const firedAt: number[] = []
+    cancel = armNeverEarlyWait(clock, start, getter, () => { firedAt.push(clock.now()) })
+    expect([calls, clock.pendingCount()]).toEqual([1, 1])
+    await clock.runNext()
+    expect(calls).toBe(2)
+    expect(clock.now() - start >= waitMs).toBe(deadlinePassed)
+    expect(firedAt).toEqual([])
+    expect(clock.pendingCount()).toBe(0)
+    await clock.advance(waitMs)
+    expect(firedAt).toEqual([])
+    expect(calls).toBe(2)
     expect(clock.pendingCount()).toBe(0)
   })
 
