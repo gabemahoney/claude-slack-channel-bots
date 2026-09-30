@@ -10,24 +10,21 @@
  *   - Malformed dist/version-floor.json produces ad-version-floor-unreadable.
  *   - Missing .min_binary_version field produces ad-version-floor-unreadable.
  *
- * Mocking strategy: NO mock.module — use the test-only seam
- * `setFloorForTests()` on the install-check module to pre-populate the floor
- * cache with synthetic values (or pre-built failure-arm results), and stub
- * the AD-side `resolveSystemBinary()` by re-routing via a module-local
- * factory function the test wires in.
- *
- * To wire the resolveSystemBinary stub without mock.module we DO have to
- * intercept the AD module — but ONLY install-check.ts imports that name,
- * and the intercept is contained to this test file's beforeEach. mock.restore
- * in afterEach unwinds it; importantly, we do NOT mock `node:fs`, so other
- * test files reading files are unaffected.
+ * Mocking strategy: the floor comes from the test-only seam
+ * `setFloorForTests()` on the install-check module (a synthetic floor or a
+ * pre-built failure-arm result). `resolveSystemBinary()` is stubbed by a
+ * `mock.module('agent-director')` scoped to `beforeEach`, built over a copy
+ * of the client's real exports. Under Bun 1.4, `mock.restore()` does not undo
+ * a `mock.module` rewrite of the live namespace, so `afterEach` puts the copy
+ * back before `mock.restore()`, and `afterAll` asserts every live export is
+ * the client's own again. `node:fs` is not mocked.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 
-import * as realAd from 'agent-director'
+import * as adNamespace from 'agent-director'
 
 import {
   errSystemInstallNotFound,
@@ -41,18 +38,39 @@ import {
 } from './test-helpers/install-check-fixtures.ts'
 import type { UnreachableReason } from 'agent-director'
 
+/**
+ * agent-director's real exports, copied at import. `mock.module` rewrites the
+ * live namespace in place and, under Bun 1.4, `mock.restore()` does not undo
+ * it, so each case's stub is built over this copy and the copy is put back.
+ */
+const REAL_AD = { ...adNamespace }
+
 let resolveStub: () => Promise<{ path: string; version: string }>
 
 beforeEach(() => {
   resolveStub = async () => ({ path: '/usr/local/bin/agent-director', version: SATISFYING_VERSION })
   mock.module('agent-director', () => ({
-    ...realAd,
+    ...REAL_AD,
     resolveSystemBinary: () => resolveStub(),
   }))
 })
 
 afterEach(() => {
+  mock.module('agent-director', () => REAL_AD)
   mock.restore()
+})
+
+afterAll(() => {
+  // A later file calling the un-injected runInstallCheck() must reach the
+  // client's own exports, not this file's stub. Every live export is compared
+  // by identity (Object.is) with the copy taken at import, by key, so no
+  // export is named or called here.
+  const live = new Map(Object.entries(adNamespace))
+  const replaced = Object.entries(REAL_AD)
+    .filter(([key, value]) => !live.has(key) || !Object.is(live.get(key), value))
+    .map(([key]) => key)
+  expect(replaced).toEqual([])
+  expect(live.size).toBe(Object.keys(REAL_AD).length)
 })
 
 /**

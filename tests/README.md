@@ -13,7 +13,7 @@ to run each kind safely and how the integration suite is laid out.
 
 ## Running the unit suite
 
-Run `bun test` with a scratch HOME and state directory, and with the token
+Run `bun test` from the repository root with a scratch HOME and state directory, and with the token
 environment variables and `CSCB_PERSONA` unset, so nothing can fall back to the
 real config or credentials:
 
@@ -22,11 +22,37 @@ S=$(mktemp -d) && env -u SLACK_BOT_TOKEN -u SLACK_APP_TOKEN -u CSCB_PERSONA \
   HOME=$S SLACK_STATE_DIR=$S/state bun test <files>
 ```
 
-Omit `<files>` to run the whole suite. The tests build their own temp homes
-and fake credentials (see Isolation in `docs/testing-guide.md`); the scratch
-environment is a second guard, so a regression that reaches for the home
-directory lands in `$S` and never in the real `~/.claude/channels/slack/`.
-`bun test` does not run the bash scripts under `tests/integration/`.
+Omit `<files>` to run the whole suite. `bun test` does not run the bash
+scripts under `tests/integration/`.
+
+Always run `bun test` from the repository root. Bun reads `bunfig.toml` from
+the working directory, so only there does it load the host-safety preload guard
+(`tests/test-helpers/host-safety-preload.ts`, set in the root `bunfig.toml`),
+before any test file; run from `tests/` or elsewhere, there is no guard. It points HOME and
+`SLACK_STATE_DIR` at a fresh temp directory, drops every PATH directory that
+holds an `agent-director` binary and unsets `TMUX`; the rules tests follow on
+top of it are in `docs/testing-guide.md`. The tests also build their own temp
+homes and fake credentials (see Isolation in that guide).
+
+Keep the scratch environment anyway. Bun fixes `os.homedir()` to the HOME
+`bun test` started with, so `src/` code that calls `homedir()` directly still
+sees the start-up HOME after the preload has changed `HOME`. Started with
+`HOME=$S`, such a path lands in `$S` and never in the real
+`~/.claude/channels/slack/` or `~/.agent-director/`.
+
+Install a development tree's dependencies with lifecycle scripts disabled:
+
+```sh
+bun install --ignore-scripts
+```
+
+CSCB's own `postinstall` is for an operator's install: it links the
+debugging skill into `~/.claude/skills/` under the real HOME and may write
+skeleton files under `~/.claude/channels/slack/`. With scripts disabled,
+`scripts/fixup-bun-cache.ts` (the other half of `postinstall`, which restores
+files bun's extraction dropped from `node_modules/`) does not run either; run
+`bun scripts/fixup-bun-cache.ts` by hand from the repo root when a dependency
+is missing files.
 
 ## Docker integration suite
 

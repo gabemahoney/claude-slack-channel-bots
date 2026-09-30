@@ -121,6 +121,13 @@ export const RESERVED_CHILD_ENV_NAMES: readonly string[] = Object.freeze(['HOME'
 /** Prefix of the `TMUX_TMPDIR` directory's name under the OS temp directory. */
 export const CHILD_TMUX_TMPDIR_PREFIX = 'host-safe-tmux-'
 
+/**
+ * Prefix of the temp HOME the `bun test` preload guard
+ * (`tests/test-helpers/host-safety-preload.ts`) makes under the OS temp
+ * directory, one per run.
+ */
+export const PRELOAD_HOME_PREFIX = 'host-safety-preload-home-'
+
 export interface HostSafeChildEnvOptions {
   /**
    * Tools the child runs by name; each one's directory on the current `PATH`
@@ -340,9 +347,11 @@ export function inheritedChildTmuxTmpDir(value: string | undefined = process.env
  * This process's `TMUX_TMPDIR` directory under the OS temp directory: the
  * inherited one (`inheritedChildTmuxTmpDir`) or else a new `mkdtempSync` one,
  * fixed on the first call, the same one on every later call, never removed
- * (see the module header).
+ * (see the module header). `hostSafeChildEnv` hands it to every child, and the
+ * `bun test` preload guard sets its own `TMUX_TMPDIR` to it, so a run makes
+ * one such directory.
  */
-function childTmuxTmpDir(): string {
+export function childTmuxTmpDir(): string {
   if (childTmuxTmpDirCache === undefined) {
     childTmuxTmpDirCache = inheritedChildTmuxTmpDir() ?? mkdtempSync(join(tmpdir(), CHILD_TMUX_TMPDIR_PREFIX))
   }

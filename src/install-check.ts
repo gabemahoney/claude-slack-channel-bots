@@ -6,10 +6,12 @@
  *   - The `bun run install-check` script (scripts/install-check.ts; Epic 2).
  *   - The install-cscb skill (skills/install-cscb; Epic 3).
  *
- * The startup gate (Epic 1, agent-director-startup.ts) does NOT call this
- * module — AD's own `Client.create()` enforces the same floor against the
- * same `dist/version-floor.json`, so there are two callers that drive the
- * same enforcement path. CSCB never duplicates the floor decision.
+ * The startup gate (Epic 1, agent-director-startup.ts) does NOT call
+ * `runInstallCheck()` — AD's own `Client.create()` enforces the same floor
+ * against the same `dist/version-floor.json`. The gate imports only the
+ * exported `AD_SYSTEM_INSTALL_NOT_FOUND` label, so both report the same
+ * `ad-system-install-not-found` class label. CSCB never duplicates the
+ * floor decision.
  *
  * The module is strictly side-effect-free:
  *   - No process.exit.
@@ -34,9 +36,12 @@ import {
 } from 'agent-director'
 import type { UnreachableReason } from 'agent-director'
 
+/** Class label for "no agent-director system install found"; shared with the startup gate. */
+export const AD_SYSTEM_INSTALL_NOT_FOUND = 'ad-system-install-not-found'
+
 /** Canonical class labels emitted by the check; mirrors the startup gate's. */
 export type InstallCheckClassLabel =
-  | 'ad-system-install-not-found'
+  | typeof AD_SYSTEM_INSTALL_NOT_FOUND
   | 'ad-system-install-too-old'
   | 'ad-system-install-unreachable'
   | 'ad-version-floor-unreadable'
@@ -160,7 +165,7 @@ export async function runInstallCheck(): Promise<InstallCheckResult> {
     if (err instanceof ErrSystemInstallNotFound) {
       return {
         ok: false,
-        classLabel: 'ad-system-install-not-found',
+        classLabel: AD_SYSTEM_INSTALL_NOT_FOUND,
         message:
           `agent-director not found on PATH or at the standard install path. ` +
           `Install agent-director system-wide and retry.`,

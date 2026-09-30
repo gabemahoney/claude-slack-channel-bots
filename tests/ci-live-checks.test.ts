@@ -644,8 +644,9 @@ describe('host-state', () => {
     const p = probe({ stdout: '{"spawns":[{"claude_instance_id":"cscb_prod_a"}]}' }, { stdout: 'slack_bot_prod_a\nwork\n' }, config)
     const snap = await snapshotHost(p.deps, '/home/tester')
     expect(hostStorePath('/home/tester')).toBe('/home/tester/.agent-director/state.db')
+    // b.jg5 SRJ-1301: the HOST check's probes are exactly these two whole argvs, in order; a changed or extra probe fails.
     expect(p.argv).toEqual([
-      ['agent-director', '--store-path', '/home/tester/.agent-director/state.db', 'list', '--label', 'service=cscb'],
+      ['agent-director', '--store-path', hostStorePath('/home/tester'), 'list', '--label', 'service=cscb'],
       ['tmux', 'ls', '-F', '#{session_name}'],
     ])
     expect([p.read, p.ports]).toEqual([['/home/tester/.claude/channels/slack/config.json'], [3100]])

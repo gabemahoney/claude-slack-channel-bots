@@ -1081,7 +1081,7 @@ describe('runner wiring (source audit of ci-live/)', () => {
     ])
   })
 
-  test('no host command starts, stops or kills CSCB, tmux or agent-director: those appear only in the checks, which reach the container only', () => {
+  test("no host command starts, stops or kills CSCB, tmux or agent-director: those appear only in the checks, which reach the container only; the HOST check's two read-only probes are the only host-side agent-director and tmux argv (b.jg5 SRJ-1301's one exception)", () => {
     const failures: string[] = []
     const argvLiterals: string[] = []
     let checkFiles = 0
@@ -1114,6 +1114,7 @@ describe('runner wiring (source audit of ci-live/)', () => {
     }
     expect(failures).toEqual([])
     // The checks do kill tmux sessions (Checks 7, 12, 24), in the container; on the host only the HOST check's two read-only probes run.
+    // b.jg5 SRJ-1301: these two argv are the one exception to "no host-side agent-director or tmux"; exact equality, so a third fails.
     expect(checkFiles).toBeGreaterThan(0)
     expect(argvLiterals).toEqual([
       `${join('lib', 'host-state.ts')}: ['agent-director', '--store-path', hostStorePath(home), 'list', '--label', 'service=cscb']`,

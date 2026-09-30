@@ -52,6 +52,7 @@ import {
   setClientForTests,
 } from './agent-director-client.ts'
 import { renderInstallSkillInstructions } from './install-skill-pointer.ts'
+import { AD_SYSTEM_INSTALL_NOT_FOUND } from './install-check.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -291,7 +292,7 @@ export async function runStartupGate(
       return {
         ok: false,
         phase: 'construct',
-        classLabel: 'ad-system-install-not-found',
+        classLabel: AD_SYSTEM_INSTALL_NOT_FOUND,
         message:
           `agent-director system install not found. The startup gate searched ` +
           `the standard install path and PATH but did not locate the agent-director ` +
