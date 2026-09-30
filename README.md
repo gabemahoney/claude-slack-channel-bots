@@ -449,7 +449,7 @@ If you change `port` or `bind` in `config.json`, the confirmed change takes effe
 
 agent-director keeps its timing settings in the `[tmux]` table of `~/.agent-director/config.toml`. They are agent-director's settings, not CSCB configuration: CSCB only reads them, from the file under the HOME the server runs in.
 
-The server reads the table when it starts and every 120 s after that, whatever `health_check_interval` is (`0` included), so a change on the host is used within 120 s. It applies agent-director's own rule: a missing file, a missing key or `0` means agent-director's default.
+The server reads the table when it starts and every 120 s after that, whatever `health_check_interval` is (`0` included), so a change on the host is used within about 120 s (each read follows the binary re-check, which runs 120 s after the previous one ends and can take up to its 30 s time limit). It applies agent-director's own rule: a missing file, a missing key or `0` means agent-director's default.
 
 | Key | Default |
 |---|---|

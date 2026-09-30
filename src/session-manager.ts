@@ -908,9 +908,8 @@ export function _resetDialogPollIntervalMs(): void {
 
 /** Hard cap: how long to wait for a fresh spawn to leave `pending` (reach a
  *  live SessionStart state) while auto-dismissing pre-session dialogs.
- *  Defined in `src/ad-settings.ts` (B's floor); re-exported here. */
-export { DIALOG_READY_TIMEOUT_MS }
-
+ *  `DIALOG_READY_TIMEOUT_MS` (`src/ad-settings.ts`, B's floor) unless a test
+ *  overrides it. */
 let _dialogReadyTimeoutMs = DIALOG_READY_TIMEOUT_MS
 
 /** Test-only seam: override the ready cap. */

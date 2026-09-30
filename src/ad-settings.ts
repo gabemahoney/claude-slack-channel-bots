@@ -84,7 +84,9 @@
  * `MAX_TIMER_DELAY_MS` (`src/persona-retry-schedule.ts`) fires almost at
  * once, so a consumer that arms a derived wait uses
  * {@link armNeverEarlyWait}, which arms timers no longer than that and runs
- * its callback only once the clock has reached the deadline.
+ * its callback only once the clock has reached the deadline. Given an
+ * accessor rather than a number, it reads the wait in effect again at every
+ * timer fire, so a value raised while the wait is armed never ends it early.
  *
  * No side effects at import: nothing is read, armed or logged until
  * {@link installAdSettings}, a reader's `read()` or
@@ -633,43 +635,85 @@ export function wholeMinutes(ms: number): number {
 export type NeverEarlyWaitClock = Pick<PersonaConnectionClock, 'now' | 'setTimeout' | 'clearTimeout'>
 
 /**
+ * A derived wait's length in milliseconds: a fixed `number`, or a getter that
+ * answers the length in effect each time it is called (for example
+ * {@link adLaunchBoundMsInEffect}).
+ */
+export type NeverEarlyWaitLength = number | (() => number)
+
+/**
  * Arm a derived wait of `waitMs` measured from `startMs` (both in the clock's
- * milliseconds), and run `callback` once when the clock has reached
- * `startMs + waitMs`. Answers a cancel.
+ * milliseconds), and run `callback` once when the time elapsed since `startMs`
+ * has reached the wait in effect. Answers a cancel.
  *
+ * `waitMs` is a fixed number or a getter. A getter is called once while
+ * arming and again at every timer fire, so each check and each re-arm uses
+ * the value in effect at that moment, never a copy from the arm (b.jg5
+ * SRJ-210):
+ * - When a timer fires, the callback runs only if `clock.now() - startMs` is
+ *   at least the wait in effect. The deadline is checked by that comparison,
+ *   never by a sum that could round, so a timer that fires early (or a clock
+ *   that moves back) never runs the callback before the deadline, and a wait
+ *   raised while armed never ends at the old, shorter deadline.
+ * - Otherwise the helper arms one timer for the smaller of the time left under
+ *   the wait in effect and `MAX_TIMER_DELAY_MS`; while the wait in effect is
+ *   {@link AD_WAIT_NEVER_ENDS}, it arms one timer of `MAX_TIMER_DELAY_MS`.
+ * - The helper is not told when the getter's value changes. A wait lowered
+ *   between fires is seen at the next fire: the callback runs then if the
+ *   lowered deadline has passed, and otherwise the next timer ends at the
+ *   lowered deadline. So a lowered wait ends no later than the next fire, at
+ *   most `MAX_TIMER_DELAY_MS` after it was lowered, and the helper never polls
+ *   more often than the waits in effect require.
+ * - A getter that answers NaN at a fire (or throws there) is taken as
+ *   {@link AD_WAIT_NEVER_ENDS} for that fire: nothing is thrown from the
+ *   timer and nothing is logged, and the helper checks again at the next
+ *   fire. The getter should answer a number every time; NaN is only caught
+ *   at the arm (below).
  * - At most one timer is pending at a time, and none asks for more than
  *   `MAX_TIMER_DELAY_MS`: a runtime timer longer than that fires almost at
  *   once, so a longer wait runs as a chain of timers.
- * - When a timer fires, the callback runs only if the time elapsed since
- *   `startMs` (`clock.now() - startMs`) is at least `waitMs`; otherwise the
- *   helper arms one timer for the time left. The deadline is checked by that
- *   comparison, never by a sum that could round, so a timer that fires early
- *   (or a clock that moves back) never runs the callback before the deadline.
- * - The callback runs from a timer, never during this call, even when the
- *   deadline has already passed.
- * - A wait of {@link AD_WAIT_NEVER_ENDS} arms no timer and never runs the
- *   callback.
+ * - The callback runs at most once, from a timer, never during this call,
+ *   even when the deadline has already passed.
+ * - A fixed wait of {@link AD_WAIT_NEVER_ENDS} arms no timer and never runs
+ *   the callback, since it cannot change. A getter always keeps one timer
+ *   pending until the callback runs or the wait is cancelled, even while it
+ *   answers {@link AD_WAIT_NEVER_ENDS}, so a later lower value can end it.
  * - The cancel clears the pending timer and stops the wait; calling it again,
  *   or after the callback ran, does nothing.
  *
- * Throws a `RangeError` for a `startMs` that is not finite or a `waitMs` that
- * is NaN, before arming anything.
+ * Throws a `RangeError`, before arming anything, for a `startMs` that is not
+ * finite, a fixed `waitMs` that is NaN or a getter whose first value (read
+ * while arming) is NaN. A getter that throws while arming throws out of this
+ * call, before anything is armed.
  */
 export function armNeverEarlyWait(
   clock: NeverEarlyWaitClock,
   startMs: number,
-  waitMs: number,
+  waitMs: NeverEarlyWaitLength,
   callback: () => void,
 ): () => void {
   if (!Number.isFinite(startMs)) throw new RangeError(`never-early wait: the start must be a finite time, got ${startMs}`)
-  if (Number.isNaN(waitMs)) throw new RangeError('never-early wait: the wait must be a number of milliseconds, got NaN')
+  const initialWaitMs = typeof waitMs === 'function' ? waitMs() : waitMs
+  if (Number.isNaN(initialWaitMs)) throw new RangeError('never-early wait: the wait must be a number of milliseconds, got NaN')
 
   let handle: unknown
   let armed = false
   let stopped = false
 
-  function arm(): void {
-    const left = waitMs - (clock.now() - startMs)
+  /** The wait in effect at a fire; NaN or a throw from a getter reads as never-ends. */
+  function waitInEffect(): number {
+    if (typeof waitMs !== 'function') return waitMs
+    let current: number
+    try {
+      current = waitMs()
+    } catch {
+      return AD_WAIT_NEVER_ENDS
+    }
+    return Number.isNaN(current) ? AD_WAIT_NEVER_ENDS : current
+  }
+
+  function arm(currentWaitMs: number): void {
+    const left = currentWaitMs - (clock.now() - startMs)
     const delay = Math.min(Math.max(Math.ceil(left), 0), MAX_TIMER_DELAY_MS)
     armed = true
     handle = clock.setTimeout(onTimer, delay)
@@ -679,15 +723,16 @@ export function armNeverEarlyWait(
     armed = false
     handle = undefined
     if (stopped) return
-    if (clock.now() - startMs >= waitMs) {
+    const currentWaitMs = waitInEffect()
+    if (clock.now() - startMs >= currentWaitMs) {
       stopped = true
       callback()
       return
     }
-    arm()
+    arm(currentWaitMs)
   }
 
-  if (waitMs !== AD_WAIT_NEVER_ENDS) arm()
+  if (typeof waitMs === 'function' || initialWaitMs !== AD_WAIT_NEVER_ENDS) arm(initialWaitMs)
 
   return () => {
     if (stopped) return

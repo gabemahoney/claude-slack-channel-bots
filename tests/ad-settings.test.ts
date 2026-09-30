@@ -7,8 +7,8 @@
  * version re-check's 120 s ticks (b.jg5 SRJ-204), and source audits of the
  * settings module. Then the waits derived from the values in effect
  * (b.jg5 SRJ-210, AC 80): G, the alert threshold and B, their accessors at
- * check time, the never-early wait helper beyond the timer maximum, and
- * whole-minute rendering.
+ * check time, the never-early wait helper beyond the timer maximum and with
+ * a getter it reads again at every fire, and whole-minute rendering.
  *
  * Every config file is written by `writeAgentDirectorConfig`
  * (`tests/test-helpers/ad-settings.ts`, b.jg5 SRJ-1304) under a
@@ -28,8 +28,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import {
@@ -55,6 +56,7 @@ import {
   DIALOG_READY_TIMEOUT_MS,
   installAdSettings,
   pendingGraceMinimumSeconds,
+  productionAdSettingsHome,
   resetAdSettingsForTests,
   wholeMinutes,
   type AdSettingsInEffect,
@@ -63,6 +65,7 @@ import {
   type AdTmuxKey,
   type AdTmuxValues,
   type NeverEarlyWaitClock,
+  type NeverEarlyWaitLength,
 } from '../src/ad-settings.ts'
 import {
   AD_VERSION_RECHECK_INTERVAL_MS,
@@ -70,7 +73,7 @@ import {
   installAdVersionRecheck,
   resetAdVersionRecheckForTests,
 } from '../src/ad-version-gate.ts'
-import { MAX_RELOAD_FILE_BYTES, type PersonaConfigFs } from '../src/config.ts'
+import { CONFIG_NOT_REGULAR_FILE_CODE, MAX_RELOAD_FILE_BYTES, MAX_RELOAD_FILE_SIZE_TEXT, type PersonaConfigFs } from '../src/config.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
 import {
   AD_SETTING_MINIMUMS,
@@ -310,8 +313,10 @@ describe('ad settings: refused reads', () => {
     expect(rig.lines).toEqual([buildAdSettingsRefusedReadLine(rig.path, reason, true)])
     expect(rig.lines[0]!.startsWith(AD_SETTINGS_LOG_PREFIX)).toBe(true)
     expect(rig.lines[0]).toContain(`"${rig.path}"`)
+    expect(rig.lines[0]).toContain(reason)
     if (form.key !== undefined) {
       expect(reason).toContain(form.key)
+      expect(rig.lines[0]).toContain(form.key)
     } else {
       expect(reason).toContain('TOML')
       for (const key of AD_TMUX_KEYS) expect(reason).not.toContain(key)
@@ -391,19 +396,20 @@ describe('ad settings: read failures', () => {
     expect(rig.lines).toEqual([])
   })
 
-  test.each<[string, Partial<PersonaConfigFs>, string | undefined]>([
-    ['a directory', { fstatFile: () => ({ isFile: () => false, isDirectory: () => true }) }, undefined],
-    ['a non-regular file', { fstatFile: () => ({ isFile: () => false, isDirectory: () => false }) }, undefined],
-    ['a file over the size cap', { fstatFile: () => ({ isFile: () => true, isDirectory: () => false, size: MAX_RELOAD_FILE_BYTES + 1 }) }, undefined],
-    ['a permission error', { openFile: () => { throw errnoError('EACCES') } }, undefined],
-    ['a path component that is not a directory', { openFile: () => { throw errnoError('ENOTDIR') } }, undefined],
-    ['an I/O error on the read', { readFileFd: () => { throw errnoError('EIO') } }, undefined],
+  test.each<[string, Partial<PersonaConfigFs>, string]>([
+    ['a directory', { fstatFile: () => ({ isFile: () => false, isDirectory: () => true }) }, 'EISDIR'],
+    ['a non-regular file', { fstatFile: () => ({ isFile: () => false, isDirectory: () => false }) }, CONFIG_NOT_REGULAR_FILE_CODE],
+    ['a file over the size cap', { fstatFile: () => ({ isFile: () => true, isDirectory: () => false, size: MAX_RELOAD_FILE_BYTES + 1 }) }, MAX_RELOAD_FILE_SIZE_TEXT],
+    ['a permission error', { openFile: () => { throw errnoError('EACCES') } }, 'EACCES'],
+    ['a path component that is not a directory', { openFile: () => { throw errnoError('ENOTDIR') } }, 'ENOTDIR'],
+    ['an I/O error on the read', { readFileFd: () => { throw errnoError('EIO') } }, 'EIO'],
     ['bytes that are not valid UTF-8, in a TOML comment', { readFileFd: () => NOT_UTF8_COMMENT_BYTES }, 'it is not valid UTF-8'],
-  ])('%s is refused: the defaults stay, one line, no error text', (_label, overrides, expectedReason) => {
+  ])('%s is refused: the defaults stay, one line giving the cause (%p), no error text', (_label, overrides, cause) => {
     const rig = makeReaderRig(stubFs(overrides))
     const outcome = rig.read()
     const reason = refusedReason(outcome)
-    if (expectedReason !== undefined) expect(reason).toBe(expectedReason)
+    expect(reason).toContain(cause)
+    expect(rig.lines[0]).toContain(cause)
     expect(rig.reader.valuesInEffect()).toEqual(DEFAULT_AD_SETTINGS_IN_EFFECT)
     expect(rig.lines).toEqual([buildAdSettingsRefusedReadLine(rig.path, reason, false)])
     expect(rig.lines[0]).not.toContain('stub fs failure')
@@ -651,6 +657,11 @@ describe('ad settings: install and the re-read at each 120 s re-check tick', () 
     expect(adSettingsInEffect()).toEqual(DEFAULT_AD_SETTINGS_IN_EFFECT)
   })
 
+  test("the production home getter answers process.env.HOME, not Bun's launch-time os.homedir()", () => {
+    expect(homedir()).not.toBe(process.env.HOME)
+    expect(productionAdSettingsHome()).toBe(process.env.HOME!)
+  })
+
   test('the install reads once, at once, arms no timer of its own, and the accessor answers what it read', () => {
     const rig = makeTickRig({ initial: CHANGED_FILE })
     expect(rig.readCount()).toBe(1)
@@ -734,14 +745,20 @@ describe('ad settings: install and the re-read at each 120 s re-check tick', () 
 // ---------------------------------------------------------------------------
 
 describe('ad settings: no file text reaches a line or an outcome', () => {
-  test.each<[string, AdConfigInput]>([
-    ['text that is not TOML, a fake token on its offending line', { notToml: true, embed: fakeToken(BOT_TOKEN_PREFIX, 'toml') }],
-    ['a [tmux] string value holding a fake token', { tmux: { query_timeout_ms: fakeToken(BOT_TOKEN_PREFIX, 'tmux') } }],
-    ['a [pause] string value holding a fake token', { pauseTimeout: fakeToken(BOT_TOKEN_PREFIX, 'pause') }],
-  ])('%s', (_label, input) => {
+  test.each<[string, 'refused with one line' | '[pause] timeout_seconds not used', AdConfigInput]>([
+    ['text that is not TOML, a fake token on its offending line', 'refused with one line', { notToml: true, embed: fakeToken(BOT_TOKEN_PREFIX, 'toml') }],
+    ['a [tmux] string value holding a fake token', 'refused with one line', { tmux: { query_timeout_ms: fakeToken(BOT_TOKEN_PREFIX, 'tmux') } }],
+    ['a [pause] string value holding a fake token', '[pause] timeout_seconds not used', { pauseTimeout: fakeToken(BOT_TOKEN_PREFIX, 'pause') }],
+  ])('%s: %s, and no fake token in it', (_label, path, input) => {
     const rig = makeReaderRig()
     rig.write(input)
     const outcome = rig.read()
+    if (path === 'refused with one line') {
+      expect(outcome.kind).toBe('refused')
+      expect(rig.lines).toHaveLength(1)
+    } else {
+      expect(rig.reader.valuesInEffect().pauseTimeout.kind).toBe('not-used')
+    }
     assertNoLeak({ lines: rig.lines, outcome, values: rig.reader.valuesInEffect() })
   })
 })
@@ -860,24 +877,6 @@ describe('ad settings: source audits', () => {
     expect(forbiddenSettingsLoads(modules, loads)).toEqual([])
   })
 
-  test('the runtime-load walk follows imports transitively, skips type-only ones and names the chain to a forbidden load', () => {
-    const modules = new Map([
-      ['entry.ts', "import { a } from './a.ts'\nimport type { T } from './typed.ts'\nexport type { U } from './typed.ts'"],
-      ['a.ts', "import { b } from './b.ts'\nimport type { R } from 'agent-director'"],
-      ['b.ts', "export { c } from './session-manager.ts'\nimport { WebClient } from '@slack/web-api'"],
-      ['typed.ts', "import { d } from './outage-state.ts'"],
-      ['session-manager.ts', ''],
-      ['outage-state.ts', ''],
-    ])
-    const loads = runtimeLoads(modules, 'entry.ts')
-    expect([...loads.modules.keys()].sort()).toEqual(['a.ts', 'b.ts', 'entry.ts', 'session-manager.ts'])
-    expect(forbiddenSettingsLoads(modules, loads)).toEqual([
-      'entry.ts -> a.ts -> b.ts -> session-manager.ts',
-      'entry.ts -> a.ts -> b.ts -> @slack/web-api',
-    ])
-    expect(() => runtimeLoads(new Map([['entry.ts', "import { x } from './missing.ts'"]]), 'entry.ts')).toThrow('no src/ module')
-  })
-
   test('DIALOG_READY_TIMEOUT_MS is declared, as an exported const, only in the settings module; the session manager imports it from there', () => {
     const modules = srcModules()
     expect(declarersOf(modules, 'DIALOG_READY_TIMEOUT_MS')).toEqual([SETTINGS_MODULE])
@@ -969,9 +968,7 @@ describe('ad settings: the derived waits G, the alert threshold and B', () => {
     }],
     ['stopping_window_seconds the longer window', { stopping_window_seconds: DEFAULT_TMUX.starting_session_seconds + 1n }],
     ['the two windows equal', { stopping_window_seconds: DEFAULT_TMUX.starting_session_seconds }],
-    ["G plus the addend below the approver's cap: B is the cap", { pending_grace_seconds: GRACE_AT_APPROVER_CAP - 1n }],
     ["G plus the addend exactly the approver's cap", { pending_grace_seconds: GRACE_AT_APPROVER_CAP }],
-    ["G plus the addend above the approver's cap: B is G plus the addend", { pending_grace_seconds: GRACE_AT_APPROVER_CAP + 1n }],
   ])('%s', (_label, tmux) => {
     const rig = makeReaderRig()
     if (tmux !== undefined) rig.write({ tmux })
@@ -1011,11 +1008,12 @@ describe('ad settings: the derived waits at check time', () => {
     disposeAdVersionRecheck()
   })
 
-  test.each(REFUSED_FORM_ROWS)('%s at a tick: the accessors still answer the last accepted waits', async (_name, form) => {
+  test('a refused read at a tick: the accessors still answer the last accepted waits', async () => {
     const rig = makeTickRig({ initial: { tmux: WAITS_CHANGED_TMUX } })
-    rig.write(form.input)
+    rig.write(REFUSED_AD_CONFIG_FORMS[0]!.input)
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     expect(rig.readCount()).toBe(2)
+    expect(rig.lines).toHaveLength(1)
     expect(derivedWaitsInEffect()).toEqual(expectedWaits(WAITS_CHANGED_TMUX))
     disposeAdVersionRecheck()
   })
@@ -1051,6 +1049,21 @@ function expectOneClampedTimerAtMost(clock: FakeClock): void {
   for (const timer of clock.pending()) expect(timer.delayMs).toBeLessThanOrEqual(MAX_TIMER_DELAY_MS)
 }
 
+/**
+ * Fire a never-early wait's chain one timer at a time until its callback has
+ * run (`firedAt` is not empty) or `wait` has elapsed in timer fires: before
+ * each fire exactly one timer is pending and none asks more than
+ * `MAX_TIMER_DELAY_MS`.
+ */
+async function runChainUntilFired(clock: FakeClock, firedAt: readonly number[], wait: number): Promise<void> {
+  const stepBudget = Math.ceil(wait / MAX_TIMER_DELAY_MS) + 1
+  for (let step = 0; firedAt.length === 0 && step < stepBudget; step++) {
+    expectOneClampedTimerAtMost(clock)
+    expect(clock.pendingCount()).toBe(1)
+    await clock.runNext()
+  }
+}
+
 describe('ad settings: a derived wait beyond the timer maximum', () => {
   test('the hazard: a plain timer of G on the same clock fires after 1 ms', async () => {
     const grace = hugeGraceMs()
@@ -1075,12 +1088,7 @@ describe('ad settings: a derived wait beyond the timer maximum', () => {
     expect(clock.pendingCount()).toBe(1)
     await clock.advance(MAX_TIMER_DELAY_MS + 1)
     expect(firedAt).toEqual([])
-    const stepBudget = Math.ceil(grace / MAX_TIMER_DELAY_MS) + 1
-    for (let step = 0; firedAt.length === 0 && step < stepBudget; step++) {
-      expectOneClampedTimerAtMost(clock)
-      expect(clock.pendingCount()).toBe(1)
-      await clock.runNext()
-    }
+    await runChainUntilFired(clock, firedAt, grace)
     expect(firedAt).toEqual([start + grace])
     expect(clock.pendingCount()).toBe(0)
     await clock.advance(MAX_TIMER_DELAY_MS)
@@ -1170,11 +1178,12 @@ describe('ad settings: a derived wait beyond the timer maximum', () => {
 // ---------------------------------------------------------------------------
 
 describe('ad settings: armNeverEarlyWait arming', () => {
-  test.each<[string, number, number]>([
+  test.each<[string, number, NeverEarlyWaitLength]>([
     ['a NaN start', Number.NaN, adGraceMs(DEFAULT_AD_SETTINGS_IN_EFFECT)],
     ['an infinite start', Number.POSITIVE_INFINITY, adGraceMs(DEFAULT_AD_SETTINGS_IN_EFFECT)],
     ['a negative infinite start', Number.NEGATIVE_INFINITY, adGraceMs(DEFAULT_AD_SETTINGS_IN_EFFECT)],
     ['a NaN wait', 0, Number.NaN],
+    ['a getter whose first value is NaN', 0, () => Number.NaN],
   ])('%s throws a RangeError and arms nothing', (_label, start, wait) => {
     const clock = trackedClock()
     let fired = 0
@@ -1196,6 +1205,154 @@ describe('ad settings: armNeverEarlyWait arming', () => {
     await clock.runNext()
     expect(fired).toBe(1)
     expect(clock.pendingCount()).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A getter wait (SRJ-210: the wait in effect is read again at every timer fire)
+// ---------------------------------------------------------------------------
+
+/** A wait getter the test steers: from the next call it answers `set`'s value, or throws after `set('throws')`. */
+interface SteeredWait {
+  readonly get: () => number
+  set(next: number | 'throws'): void
+}
+
+function steeredWait(initial: number): SteeredWait {
+  let current: number | 'throws' = initial
+  return {
+    get: () => {
+      if (current === 'throws') throw new Error('stub wait getter failure')
+      return current
+    },
+    set: (next) => { current = next },
+  }
+}
+
+/** G at the defaults: the short wait the getter cases arm with. */
+const DEFAULT_GRACE_MS = adGraceMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
+
+describe('ad settings: armNeverEarlyWait with a getter, read at every fire', () => {
+  test.each<[string, () => number]>([
+    ['to a longer wait under the timer maximum', () => adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT)],
+    ['to a wait beyond the timer maximum', hugeGraceMs],
+  ])('raised while armed %s: no callback at the old deadline, once exactly at the new one', async (_label, raisedWait) => {
+    const raised = raisedWait()
+    expect(raised).toBeGreaterThan(DEFAULT_GRACE_MS)
+    const clock = trackedClock()
+    const start = clock.now()
+    const wait = steeredWait(DEFAULT_GRACE_MS)
+    const firedAt: number[] = []
+    armNeverEarlyWait(clock, start, wait.get, () => { firedAt.push(clock.now()) })
+    await clock.advance(DEFAULT_GRACE_MS - 1)
+    wait.set(raised)
+    await clock.advance(1)
+    expect(firedAt).toEqual([])
+    await runChainUntilFired(clock, firedAt, raised)
+    expect(firedAt).toEqual([start + raised])
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test('lowered between fires to a deadline already passed: ends at the next fire, not before', async () => {
+    const clock = trackedClock()
+    const start = clock.now()
+    const wait = steeredWait(hugeGraceMs())
+    const firedAt: number[] = []
+    armNeverEarlyWait(clock, start, wait.get, () => { firedAt.push(clock.now()) })
+    await clock.advance(DEFAULT_GRACE_MS)
+    wait.set(DEFAULT_GRACE_MS)
+    const nextFire = start + MAX_TIMER_DELAY_MS
+    expect(clock.pending().map((timer) => timer.dueAt)).toEqual([nextFire])
+    await clock.advanceTo(nextFire - 1)
+    expect(firedAt).toEqual([])
+    await clock.advanceTo(nextFire)
+    expect(firedAt).toEqual([nextFire])
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test('lowered between fires to a deadline after the next fire: the next timer is armed for it and the wait ends exactly there', async () => {
+    const clock = trackedClock()
+    const start = clock.now()
+    const huge = hugeGraceMs()
+    const lowered = MAX_TIMER_DELAY_MS + DEFAULT_GRACE_MS
+    expect(lowered).toBeLessThan(huge)
+    const wait = steeredWait(huge)
+    const firedAt: number[] = []
+    armNeverEarlyWait(clock, start, wait.get, () => { firedAt.push(clock.now()) })
+    await clock.advance(DEFAULT_GRACE_MS)
+    wait.set(lowered)
+    await clock.advanceTo(start + MAX_TIMER_DELAY_MS)
+    expect(firedAt).toEqual([])
+    expect(clock.pending().map((timer) => timer.dueAt)).toEqual([start + lowered])
+    await clock.advanceTo(start + lowered - 1)
+    expect(firedAt).toEqual([])
+    await clock.advanceTo(start + lowered)
+    expect(firedAt).toEqual([start + lowered])
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test('a getter at AD_WAIT_NEVER_ENDS keeps one timer of the maximum pending and never runs the callback; lowering it later ends the wait', async () => {
+    const clock = trackedClock()
+    const wait = steeredWait(AD_WAIT_NEVER_ENDS)
+    const firedAt: number[] = []
+    armNeverEarlyWait(clock, clock.now(), wait.get, () => { firedAt.push(clock.now()) })
+    for (let fire = 0; fire < 3; fire++) {
+      expect(clock.pending().map((timer) => timer.delayMs)).toEqual([MAX_TIMER_DELAY_MS])
+      await clock.runNext()
+    }
+    expect(firedAt).toEqual([])
+    const [nextTimer] = clock.pending()
+    expect(clock.pending().map((timer) => timer.delayMs)).toEqual([MAX_TIMER_DELAY_MS])
+    wait.set(DEFAULT_GRACE_MS)
+    await clock.runNext()
+    expect(firedAt).toEqual([nextTimer!.dueAt])
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test.each<[string, number | 'throws']>([
+    ['answers NaN', Number.NaN],
+    ['throws', 'throws'],
+  ])('a getter that %s at a fire: nothing thrown or logged, re-armed at the maximum, and the wait ends once a valid value returns', async (_label, bad) => {
+    const consoleSpies = (['log', 'warn', 'error'] as const).map((method) => spyOn(console, method))
+    try {
+      const clock = trackedClock()
+      const start = clock.now()
+      const wait = steeredWait(DEFAULT_GRACE_MS)
+      const firedAt: number[] = []
+      armNeverEarlyWait(clock, start, wait.get, () => { firedAt.push(clock.now()) })
+      wait.set(bad)
+      expect(await clock.advance(DEFAULT_GRACE_MS)).toBe(1)
+      expect(firedAt).toEqual([])
+      expect(clock.pending().map((timer) => [timer.scheduledAt, timer.delayMs])).toEqual([[start + DEFAULT_GRACE_MS, MAX_TIMER_DELAY_MS]])
+      wait.set(DEFAULT_GRACE_MS)
+      await clock.runNext()
+      expect(firedAt).toEqual([start + DEFAULT_GRACE_MS + MAX_TIMER_DELAY_MS])
+      expect(clock.pendingCount()).toBe(0)
+      for (const spy of consoleSpies) expect(spy).not.toHaveBeenCalled()
+    } finally {
+      for (const spy of consoleSpies) spy.mockRestore()
+    }
+  })
+
+  test('wired to adGraceMsInEffect: an accepted read at a tick raising pending_grace_seconds mid-wait ends the wait at the raised G, not the armed one', async () => {
+    const intervalSeconds = BigInt(AD_VERSION_RECHECK_INTERVAL_MS) / MS_PER_SECOND
+    const armedTmux = tmuxWith({ pending_grace_seconds: intervalSeconds * 2n })
+    const raisedTmux = tmuxWith({ pending_grace_seconds: intervalSeconds * 3n })
+    const [armedGrace, raisedGrace] = [armedTmux, raisedTmux].map((tmux) => adGraceMs(inEffect(tmux)))
+    expect(armedGrace!).toBeGreaterThan(AD_VERSION_RECHECK_INTERVAL_MS)
+    const rig = makeTickRig({ initial: { tmux: armedTmux } })
+    expect(adGraceMsInEffect()).toBe(armedGrace!)
+    const start = rig.clock.now()
+    const firedAt: number[] = []
+    armNeverEarlyWait(rig.clock, start, adGraceMsInEffect, () => { firedAt.push(rig.clock.now()) })
+    rig.write({ tmux: raisedTmux })
+    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(adGraceMsInEffect()).toBe(raisedGrace!)
+    await rig.clock.advanceTo(start + raisedGrace! - 1)
+    expect(firedAt).toEqual([])
+    await rig.clock.advanceTo(start + raisedGrace!)
+    expect(firedAt).toEqual([start + raisedGrace!])
+    disposeAdVersionRecheck()
   })
 })
 

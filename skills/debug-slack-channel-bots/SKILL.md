@@ -1582,8 +1582,11 @@ nine keys and their defaults.
 - **When the server reads it:** once at start, after the agent-director
   version check passes and the configuration is loaded, before any persona
   is brought up, then every 120 s with the binary re-check, whatever
-  `health_check_interval` is (`0` included). A change to the file is used
-  within 120 s, with no restart.
+  `health_check_interval` is (`0` included). Each read follows the binary
+  re-check, and the next re-check starts 120 s after the previous one ends,
+  so reads are 120 s plus the re-check's run time apart (up to its 30 s time
+  limit when the binary doesn't answer). A change to the file is used within
+  about 120 s, with no restart.
 - **The default rule:** a missing file, a missing key or `0` means
   agent-director's default for that key. Other tables and keys are ignored,
   so a misspelt key leaves its default in force.
@@ -1628,14 +1631,15 @@ nine keys and their defaults.
   `[tmux] pending_grace_seconds is missing, so its default 60 applies, below its minimum of 61, which create_timeout_ms 40000 and pipe_close_wait_ms 100 set`,
   `it is not valid TOML (at line <L>, column <C>)`,
   `it is not valid UTF-8`,
-  `it cannot be read (<errno code>)`,
+  `it cannot be read (<errno code, or "not a regular file">)` (or bare
+  `it cannot be read` when the failure has no errno code),
   `it is larger than the 64 KiB limit` or
   `the home directory cannot be found`. It never quotes the file's text.
 - **How to check:** read the file at `<path>` and compare the `[tmux]` table
   with the rules above. The reason names only the first broken rule, so
   check the others too.
 - **Fix:** the operator's. This skill never edits the file. Once the file is
-  fixed, the server picks it up within 120 s, with no restart.
+  fixed, the server picks it up within about 120 s, with no restart.
 - **Who decides:** agent-director's own answers always decide. The server's
   reading of the file never overrides what agent-director does or reports.
 
