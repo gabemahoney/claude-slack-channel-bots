@@ -13,6 +13,9 @@
  *   4. CSCB's Phase 1 floor on the client's `binaryVersion` (b.jg5 SRJ-203,
  *      SRJ-1513), the refusal kind every failure carries, and the
  *      floor-exempt `skipPhase1Floor` option.
+ *   4a. The floor and too-old refusal messages (b.jg5 SRJ-208): the runbook
+ *      section title, no upgrade instruction, the install-skill block only on
+ *      the too-old message.
  *   5. API-surface probes (getPermission / error catalog / decide argv).
  *   6. Same-user mismatch on ~/.agent-director/state.db.
  *   7. Happy path: gate passes silently and installs the Client into the
@@ -49,7 +52,8 @@ import {
   AD_SYSTEM_INSTALL_NOT_FOUND,
   AD_SYSTEM_INSTALL_TOO_OLD,
 } from '../src/install-check.ts'
-import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
+import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
+import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
 import { recordStartupError } from '../src/startup-errors.ts'
 import {
   cannedVersion,
@@ -627,23 +631,8 @@ describe('SR-4.2: system-install typed-error branches', () => {
     }
   })
 
-  test('ErrSystemInstallTooOld → ad-system-install-too-old (message carries detected + required versions)', async () => {
-    const outcome = await runStartupGate({
-      createClient: makeStubCreateClient({ error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION) }),
-      statSync: defaultStat,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) {
-      expect(outcome.phase).toBe('construct')
-      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_TOO_OLD)
-      expect(outcome.message).toContain(STALE_VERSION)
-      expect(outcome.message).toContain(CLIENT_MIN_VERSION)
-      // SR-4.5: appends the manual-skill-install instructions block.
-      expect(outcome.message).toContain('skills/install-cscb/SKILL.md')
-    }
-  })
+  // ErrSystemInstallTooOld's label, phase and message are covered in the
+  // b.jg5 SRJ-203 floor matrix and the SRJ-208 refusal-message cases below.
 
   // ErrSystemInstallUnreachable: one test per reason value. The 8 reasons are
   // the full closed-with-escape-hatch enum from AD's UnreachableReason type;
@@ -969,16 +958,6 @@ describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
     }
   })
 
-  test('floor refusal message names the binary path', async () => {
-    const binaryPath = '/opt/agent-director/bin/agent-director'
-    const stub = makeStubClient({ binaryVersion: OLD_AD_VERSION, binaryPath })
-    const outcome = await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ client: stub }) }))
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) {
-      expect(outcome.message).toContain(binaryPath)
-    }
-  })
-
   test('PHASE1_RC_VERSION passes and adVersion equals it', async () => {
     const outcome = await runStartupGate(passingDeps({ createClient: clientAt(PHASE1_RC_VERSION) }))
     expect(outcome.ok).toBe(true)
@@ -1018,6 +997,56 @@ describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
       expect(outcome.refusalKind).toBe(REFUSAL_KIND_BELOW_PHASE1_FLOOR)
     }
     expect(versionCalls).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-208 — the two version refusal messages
+// ---------------------------------------------------------------------------
+//
+// Both name the switch-over runbook section by its title and carry no
+// instruction to upgrade agent-director. The too-old message keeps the
+// install-skill block; the floor message has none. Each binary path is a
+// non-default value, so the message shows it is passed through.
+
+describe('b.jg5 SRJ-208: version refusal messages', () => {
+  beforeEach(() => {
+    resetClientForTests()
+  })
+
+  const binaryPath = join(tmpdir(), 'cscb-dependency-check', 'agent-director')
+  const floorStub = makeStubClient({ binaryVersion: OLD_AD_VERSION, binaryPath })
+  const tooOld = errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, binaryPath)
+
+  test.each([
+    {
+      name: AD_BELOW_PHASE1_FLOOR,
+      createClient: makeStubCreateClient({ client: floorStub }),
+      named: [floorStub.binaryVersion, PHASE1_FLOOR_VERSION, floorStub.binaryPath],
+      carriesSkillBlock: false,
+    },
+    {
+      name: AD_SYSTEM_INSTALL_TOO_OLD,
+      createClient: makeStubCreateClient({ error: tooOld }),
+      named: [tooOld.actualVersion, tooOld.requiredVersion, tooOld.binaryPath],
+      carriesSkillBlock: true,
+    },
+  ])('$name names the runbook section, both versions and the path, and no upgrade', async ({ name, createClient, named, carriesSkillBlock }) => {
+    const outcome = await runStartupGate(passingDeps({ createClient }))
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe(name)
+      expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+      expect(outcome.message).not.toMatch(/upgrade agent-director/i)
+      for (const text of named) {
+        expect(outcome.message).toContain(text)
+      }
+      if (carriesSkillBlock) {
+        expect(outcome.message).toContain(renderInstallSkillInstructions())
+      } else {
+        expect(outcome.message).not.toContain(renderInstallSkillInstructions())
+      }
+    }
   })
 })
 

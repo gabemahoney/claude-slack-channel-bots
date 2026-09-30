@@ -4,8 +4,9 @@
  * Role: holds the one named Phase 1 floor constant (b.jg5 SRJ-201), the floor
  * comparison over a version string (b.jg5 SRJ-202), the title of the README
  * switch-over runbook section that CSCB's gate messages point the operator to,
- * and the startup gate's `ad-below-phase1-floor` message (b.jg5 SRJ-203,
- * SRJ-208, SRJ-1013).
+ * the startup gate's `ad-below-phase1-floor` message (b.jg5 SRJ-203,
+ * SRJ-208, SRJ-1013) and the `ad-system-install-too-old` message for the
+ * client's own too-old refusal (b.jg5 SRJ-208).
  *
  * This check sits beside the agent-director client's own too-old refusal
  * (client minimum 0.7.0) and gates on the version alone. The 0.10.0 client
@@ -126,5 +127,37 @@ export function buildBelowPhase1FloorMessage(parts: BelowPhase1FloorParts): stri
     `(release candidates ${PHASE1_FLOOR_VERSION}-rc.N included). ` +
     `Binary at ${parts.binaryPath}; found by the startup check. ` +
     `Note: ${PHASE1_SWITCH_OVER_INSTRUCTION} (section "${PHASE1_RUNBOOK_SECTION_TITLE}").`
+  )
+}
+
+/** Token-free parts of the client's own too-old refusal (`ErrSystemInstallTooOld`). */
+export interface SystemInstallTooOldParts {
+  /** The binary's version as the error reports it (`actualVersion`). */
+  readonly foundVersion: string
+  /** The agent-director client's minimum as the error reports it (`requiredVersion`). */
+  readonly requiredVersion: string
+  /** The resolved binary path the error reports. */
+  readonly binaryPath: string
+}
+
+/**
+ * The `ad-system-install-too-old` message (b.jg5 SRJ-208): the version found,
+ * the version required (the client's minimum, taken from the error, not
+ * CSCB's Phase 1 floor), the binary path, that this CSCB release and
+ * agent-director Phase 1 are installed together, and the switch-over runbook
+ * section's title as the way to install agent-director. It carries no
+ * instruction to upgrade agent-director and no install or upgrade command,
+ * because the runbook's `state.db` backup and `serve` restarts must come with
+ * the install. The install-skill block is not part of this text; the startup
+ * gate appends it. Built from versions, a path and fixed text only.
+ */
+export function buildSystemInstallTooOldMessage(parts: SystemInstallTooOldParts): string {
+  return (
+    `agent-director system install is too old: version ${parts.foundVersion} is below ` +
+    `the agent-director client's minimum; version ${parts.requiredVersion} or later is required. ` +
+    `Binary at ${parts.binaryPath}. ` +
+    `This CSCB release and agent-director Phase 1 are installed together: ` +
+    `install agent-director by following the switch-over runbook in the README ` +
+    `(section "${PHASE1_RUNBOOK_SECTION_TITLE}").`
   )
 }

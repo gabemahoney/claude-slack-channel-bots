@@ -1,6 +1,6 @@
 ---
 name: install-cscb
-description: Interactive walkthrough that installs or upgrades the system-installed `agent-director` so claude-slack-channel-bots can boot. Drives Epic 2's bun run install-check and per-reason remediation.
+description: Interactive walkthrough that diagnoses the system-installed `agent-director` so claude-slack-channel-bots can boot. Runs bun run install-check and walks the operator through the fix for each failure class; for a too-old install it names the README switch-over runbook and runs nothing.
 version: 1.0.0
 license: MIT
 user-invocable: true
@@ -14,6 +14,8 @@ Diagnose and fix a broken or missing `agent-director` system install so
 `claude-slack-channel-bots` (CSCB) can boot. This skill is the interactive
 counterpart to the diagnostic `bun run install-check` script — same shared
 check module, but with a guided remediation loop for each failure class.
+For an install that is too old, the skill names the README's switch-over
+runbook instead of running anything.
 
 ## When to invoke
 
@@ -91,24 +93,22 @@ command must be visible:
 If the user declines to proceed at any point, exit non-zero with a
 one-line summary: "Aborted by user — agent-director still not installed."
 
-### `ad-system-install-too-old` — agent-director below floor
+### `ad-system-install-too-old` — agent-director below the client's minimum
 
-Same flow as `ad-system-install-not-found` but with the upgrade command
-instead of the install command. Surface the detected version and the
-required floor from the stderr block so the user understands what they
-are upgrading from and to.
+Show the user the detected version and the required version from the
+stderr block, and the binary path.
 
-Prompt:
+Then tell the user:
 
 > agent-director is installed but at version `<detected>`, below the
-> required floor `<required>`. Run the AD-published upgrade command?
-> `<command>`
->
-> - **Yes** — run the command via Bash and continue.
-> - **No** — upgrade manually then continue.
+> required version `<required>`. This CSCB release and agent-director
+> Phase 1 are installed together: install agent-director by following the
+> README section "Switching over to agent-director Phase 1".
 
-- **Yes**: run via Bash. Return to Step 1.
-- **No**: wait for manual upgrade. Return to Step 1.
+Offer no command and run nothing for this class: the runbook's steps
+(including its `state.db` backup and restarts) must come with the
+install. Do not ask whether to run one. Exit without returning to
+Step 1; the user re-invokes the skill after completing the runbook.
 
 ### `ad-system-install-unreachable` — exhaustive reason switch
 
@@ -195,6 +195,11 @@ the AD package is intact before re-invoking the skill.
 After each remediation step, re-run Step 1. The skill keeps looping
 until the check passes (print the success output and go to Step 5) or the
 user declines to proceed (exit non-zero with the abort summary).
+
+Two classes end the skill instead of looping: `ad-system-install-too-old`
+(the user follows the README runbook, then re-invokes the skill) and
+`ad-version-floor-unreadable` (the user verifies the npm package, then
+re-invokes the skill).
 
 ## Step 5 — Next steps
 

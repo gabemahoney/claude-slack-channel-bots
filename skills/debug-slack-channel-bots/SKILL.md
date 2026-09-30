@@ -77,7 +77,11 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    start-time check failed, most often the agent-director startup gate
    (agent-director missing, too old or unreachable). Those failures are also
    recorded in `startup-errors.log`: read its latest lines and fix what they
-   name (the `install-cscb` skill covers installing agent-director).
+   name. An agent-director binary refused as too old or below CSCB's Phase 1
+   floor is covered under
+   [The server refuses the agent-director binary at start](#the-server-refuses-the-agent-director-binary-at-start);
+   for a missing or unreachable agent-director, the `install-cscb` skill
+   covers installing it.
 5. **No class line, but the persona still isn't served?** See
    [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running)
    and [Other lines you may see](#other-lines-you-may-see). A *Waiting on a
@@ -1467,6 +1471,60 @@ registers again with its history. If the new token is refused too, a new
 | `[slack] Fatal: last-applied record error — …` | The server couldn't read or validate its last-applied record and exited. See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid). |
 | `[slack] Starting from the last-applied record "<path>"` or `[slack] No last-applied record: recorded the configuration file "<path>" as "<path>"` | Which configuration a start runs. See [The last-applied record](#the-last-applied-record). |
 | `… launch after its bring-up retry failed: …`, `… working-directory retry failed: …`, `… handling its change from up to <outcome> failed: …`, `persona … not brought up: Slack bring-up threw: …`, `persona <step> failed: personas[<i>] …`, `persona-destination-hold: retry of held notices failed for persona=<key>: …`, `persona-destination-hold: notice failure callback threw for persona=<key>: …`, `unhandled rejection (process keeps running): …` | An internal error. The server keeps running. Report it as a bug, with the persona's lines around it. |
+
+---
+
+## The server refuses the agent-director binary at start
+
+The startup gate reads the version of the system-installed `agent-director`
+binary before anything else runs. A binary that is too old stops the start:
+`start` prints its `Server failed to start` block, and the refusal is one
+timestamped line in `startup-errors.log` and the same line in `server.log`:
+
+```text
+[<timestamp>] [<class>] <message>
+```
+
+Nothing was launched, killed or deleted, no persona was brought up, and
+nothing was posted to Slack. Running agent-director instances are left as
+they were. For both classes, this CSCB release and agent-director Phase 1
+are installed together, through the README section "Switching over to
+agent-director Phase 1": its `state.db` backup and restarts come with the
+install. Tell the operator to follow that section; a bot or this skill never
+changes the agent-director install itself.
+
+### `ad-below-phase1-floor`
+
+The binary is below CSCB's Phase 1 floor. The line names the version found,
+the version required (the Phase 1 release or later, its release candidates
+included), the binary path, that the startup check found it, and the README
+section "Switching over to agent-director Phase 1". It has no
+install-skill block.
+
+- **Cause:** the binary passed the agent-director client's own minimum but
+  predates agent-director Phase 1. A development build that reports the
+  placeholder version `0.0.0-dev` is below the floor too and is refused the
+  same way. A build that reports the bare version `dev` does not reach this
+  check: the version does not parse, so the client refuses it first as
+  `ad-system-install-unreachable` (reason `unparseable-version`).
+- **Fix:** the operator follows the README section "Switching over to
+  agent-director Phase 1", then starts the server again.
+
+### `ad-system-install-too-old`
+
+The binary is below the agent-director client's own minimum. The line names
+the version found, the version required (the client's minimum, which the
+client reports; it is not CSCB's Phase 1 floor), the binary path, that this
+CSCB release and agent-director Phase 1 are installed together, and the
+README section "Switching over to agent-director Phase 1". It ends with the
+install-skill block (the `install-cscb` skill's URL, target path and
+command); that skill names the same section and runs nothing for this
+class.
+
+- **Cause:** the system-installed binary is older than the minimum that
+  the npm `agent-director` client CSCB depends on accepts.
+- **Fix:** the operator follows the README section "Switching over to
+  agent-director Phase 1", then starts the server again.
 
 ---
 

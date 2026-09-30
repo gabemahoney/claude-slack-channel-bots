@@ -68,7 +68,7 @@ import {
   AD_SYSTEM_INSTALL_NOT_FOUND,
   AD_SYSTEM_INSTALL_TOO_OLD,
 } from './install-check.ts'
-import { buildBelowPhase1FloorMessage, meetsPhase1Floor } from './ad-version-gate.ts'
+import { buildBelowPhase1FloorMessage, buildSystemInstallTooOldMessage, meetsPhase1Floor } from './ad-version-gate.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -362,10 +362,11 @@ export async function runStartupGate(
         refusalKind: REFUSAL_KIND_CLIENT_TOO_OLD,
         classLabel: AD_SYSTEM_INSTALL_TOO_OLD,
         message:
-          `agent-director system install is too old. ` +
-          `Detected version ${err.actualVersion} is below the required floor ${err.requiredVersion} ` +
-          `(binary at ${err.binaryPath}). Upgrade agent-director and retry.` +
-          renderInstallSkillInstructions(),
+          buildSystemInstallTooOldMessage({
+            foundVersion: err.actualVersion,
+            requiredVersion: err.requiredVersion,
+            binaryPath: err.binaryPath,
+          }) + renderInstallSkillInstructions(),
       }
     }
     if (err instanceof ErrSystemInstallUnreachable) {

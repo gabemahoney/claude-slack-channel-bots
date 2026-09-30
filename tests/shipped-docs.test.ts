@@ -23,7 +23,13 @@
  *   exemption is the debugging skill's SR-1.7 entry (`AUDIT_EXCEPTIONS`);
  * - the README's receiving section (SR-12, SR-4.4): its table's row for each
  *   `via` value shows that value, and both injected kinds' rows show none;
- * - the MCP instructions carry no reload wording (AC 74, SR-8.8).
+ * - the MCP instructions carry no reload wording (AC 74, SR-8.8);
+ * - the two agent-director refusal classes, `ad-below-phase1-floor` and
+ *   `ad-system-install-too-old` (b.jg5 SRJ-208): the debugging skill has an
+ *   entry per label and README "Startup errors" a line per label, each naming
+ *   the switch-over runbook section by its title and carrying no instruction
+ *   to upgrade agent-director and no upgrade or install command; no shipped
+ *   Markdown links or anchors into that section, which is not written yet.
  * CHANGELOG.md and docs/ are not shipped descriptions and are not read.
  *
  * Reads repo files resolved from this file's location, so the working
@@ -63,6 +69,8 @@ import { RELOAD_TERMS } from './test-helpers/reload-terms.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import { MCP_INSTRUCTIONS } from '../src/registry.ts'
+import { PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
+import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check.ts'
 import {
   DESTRUCTIVE_PREFIX,
   DESTRUCTIVE_SETTINGS,
@@ -1179,5 +1187,147 @@ describe('AC 74: the MCP instructions carry no reload wording (SR-8.8)', () => {
   test.each(RELOAD_TERMS.map((term) => [String(term), term] as const))('%s is absent', (_label, term) => {
     const text = mcpInstructionsText()
     expect(typeof term === 'string' ? text.includes(term) : term.test(text)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The agent-director refusal classes point to the switch-over runbook (b.jg5 SRJ-208)
+// ---------------------------------------------------------------------------
+
+/** The two startup refusal classes for an agent-director binary that is too old. */
+const REFUSAL_LABELS: string[] = [AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD]
+
+const DEBUG_SKILL_FILE = 'skills/debug-slack-channel-bots/SKILL.md'
+const INSTALL_SKILL_FILE = 'skills/install-cscb/SKILL.md'
+const STARTUP_ERRORS_HEADING = '## Startup errors'
+
+/** The debugging skill's section holding the refusal entries, which its triage points to. */
+const REFUSAL_SECTION_TITLE = 'The server refuses the agent-director binary at start'
+
+/**
+ * An instruction to upgrade agent-director, or an upgrade or install command
+ * (b.jg5 SRJ-208), each with a synthetic string it must match. Checked over
+ * text with whitespace collapsed.
+ */
+const UPGRADE_FORMS: [label: string, pattern: RegExp, sample: string][] = [
+  ['"Upgrade agent-director"', /\bupgrade\s+agent-director\b/i, 'Upgrade agent-director and retry.'],
+  ['upgrade wording', /\bupgrad(?:e|es|ed|ing)\b/i, 'upgrading the binary fixes it'],
+  ['"upgrade command" or "install command" wording', /\b(?:upgrade|install)\s+command\b/i, 'run the AD-published upgrade command'],
+  ['`install.sh`', /\binstall\.sh\b/, 'run install.sh again'],
+  ['`curl`', /\bcurl\b/, 'curl -fsSL https://example.test/install | sh'],
+  ['package-manager install', /\b(?:bun|npm|pnpm|yarn)\s+(?:add|install|i)\b/, 'bun add agent-director@latest'],
+  ['backticked agent-director command line', /`(?:\$\s*|sudo\s+)?agent-director\s+[^\s`][^`]*`/, 'run `agent-director upgrade`'],
+]
+
+/** The `###` heading naming a class label as a code span, with any title after it. */
+function classHeading(label: string): RegExp {
+  return new RegExp(`^### \`${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\`(?:\\W.*)?$`)
+}
+
+/**
+ * The list item in `section` that opens with the label as a code span
+ * (`- \`label\` — …`), with any indented continuation lines, whitespace
+ * collapsed. Throws naming the label unless exactly one item opens with it.
+ */
+function labelItem(section: string, label: string, where: string): string {
+  const lines = section.split('\n')
+  const starts = lines.flatMap((line, i) => (line.startsWith(`- \`${label}\``) ? [i] : []))
+  if (starts.length !== 1) throw new Error(`${where}: ${starts.length} list items open with \`${label}\`, expected 1`)
+  const item = [lines[starts[0]]]
+  for (const line of lines.slice(starts[0] + 1)) {
+    if (!/^\s+\S/.test(line)) break
+    item.push(line)
+  }
+  return flat(item.join('\n'))
+}
+
+describe('the agent-director refusal classes name the switch-over runbook (b.jg5 SRJ-208)', () => {
+  const debugSkill = readRepoFile(DEBUG_SKILL_FILE)
+  const readme = readRepoFile('README.md')
+  const runbookAnchor = headingSlug(PHASE1_RUNBOOK_SECTION_TITLE)
+  const debugEntry = (label: string) => flat(requiredSection(debugSkill, classHeading(label), DEBUG_SKILL_FILE))
+  const readmeItem = (label: string) =>
+    labelItem(requiredSection(readme, STARTUP_ERRORS_HEADING, 'README.md'), label, `README.md "${STARTUP_ERRORS_HEADING}"`)
+
+  describe(DEBUG_SKILL_FILE, () => {
+    test.each(REFUSAL_LABELS)('has a `###` entry headed by `%s`', (label) => {
+      expect(headings(debugSkill).filter((h) => classHeading(label).test(h.text))).toHaveLength(1)
+    })
+
+    test.each(REFUSAL_LABELS)('the `%s` entry sits under the refusal section', (label) => {
+      const parent = sectionRange(debugSkill, `## ${REFUSAL_SECTION_TITLE}`)
+      const entry = sectionRange(debugSkill, classHeading(label))
+      expect(parent).toBeDefined()
+      expect(entry).toBeDefined()
+      expect(entry!.start).toBeGreaterThan(parent!.start)
+      expect(entry!.end).toBeLessThanOrEqual(parent!.end)
+    })
+
+    test.each(REFUSAL_LABELS)('the `%s` entry names the runbook section by its title', (label) => {
+      expect(debugEntry(label)).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+    })
+
+    test.each(REFUSAL_LABELS.flatMap((label) => UPGRADE_FORMS.map(([form, pattern]) => [label, form, pattern] as const)))(
+      'the `%s` entry carries no %s',
+      (label, _form, pattern) => {
+        expect(debugEntry(label)).not.toMatch(pattern)
+      },
+    )
+
+    test.each(UPGRADE_FORMS.map(([form, pattern]) => [form, pattern] as const))(
+      'the refusal section carries no %s',
+      (_form, pattern) => {
+        expect(flat(requiredSection(debugSkill, `## ${REFUSAL_SECTION_TITLE}`, DEBUG_SKILL_FILE))).not.toMatch(pattern)
+      },
+    )
+
+    test('the triage points to the refusal section by an anchor that resolves', () => {
+      const anchor = headingSlug(REFUSAL_SECTION_TITLE)
+      expect(markdownLinks(debugSkill).filter((link) => link.path === '').map((link) => link.anchor)).toContain(anchor)
+      expect(headingAnchors(debugSkill)).toContain(anchor)
+    })
+  })
+
+  describe(`README.md "${STARTUP_ERRORS_HEADING}"`, () => {
+    test.each(REFUSAL_LABELS)('lists `%s`', (label) => {
+      expect(readmeItem(label).length).toBeGreaterThan(0)
+    })
+
+    test.each(REFUSAL_LABELS)('the `%s` line names the runbook section by its title', (label) => {
+      expect(readmeItem(label)).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+    })
+
+    test.each(REFUSAL_LABELS.flatMap((label) => UPGRADE_FORMS.map(([form, pattern]) => [label, form, pattern] as const)))(
+      'the `%s` line carries no %s',
+      (label, _form, pattern) => {
+        expect(readmeItem(label)).not.toMatch(pattern)
+      },
+    )
+  })
+
+  // The runbook section is written by a later Epic; until then nothing may
+  // link or anchor into it. When it lands, replace this with a resolution check.
+  test.each(['README.md', DEBUG_SKILL_FILE, INSTALL_SKILL_FILE])('%s has no link or anchor into the runbook section', (file) => {
+    const text = readRepoFile(file)
+    expect(markdownLinks(text).filter((link) => link.anchor === runbookAnchor).map((link) => link.target)).toEqual([])
+    expect(text).not.toContain(`#${runbookAnchor}`)
+  })
+
+  test.each(UPGRADE_FORMS)('self-check: the %s pattern matches its synthetic string', (_form, pattern, sample) => {
+    expect(flat(sample)).toMatch(pattern)
+  })
+
+  test('self-check: no pattern matches the runbook pointer itself', () => {
+    const pointer = flat(`Follow the README section "${PHASE1_RUNBOOK_SECTION_TITLE}" to install agent-director, then start the server again.`)
+    expect(UPGRADE_FORMS.filter(([, pattern]) => pattern.test(pointer)).map(([form]) => form)).toEqual([])
+  })
+
+  test('self-check: a README item missing its label fails naming the label', () => {
+    expect(() => labelItem('- `other-class` — text', AD_BELOW_PHASE1_FLOOR, 'fixture')).toThrow(`0 list items open with \`${AD_BELOW_PHASE1_FLOOR}\``)
+  })
+
+  test('self-check: a README item takes its indented continuation lines and stops at the next item', () => {
+    const fixture = `- \`${AD_BELOW_PHASE1_FLOOR}\` — first\n  second\n- \`next\` — third`
+    expect(labelItem(fixture, AD_BELOW_PHASE1_FLOOR, 'fixture')).toBe(`- \`${AD_BELOW_PHASE1_FLOOR}\` — first second`)
   })
 })
