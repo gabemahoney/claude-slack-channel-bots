@@ -7,10 +7,11 @@
  * builder for (`ErrCwdNotFound`, `ErrCwdNotADirectory`,
  * `ErrSendKeysWhileRelayed`) is built with `new` on the 0.10.0 client's own
  * class, imported through `src/agent-director-errors.ts`, its `errName` taken
- * from the class name. The three Phase-1-only
+ * from the class name. The three Phase-1-only names and the three store-open
  * names come from `src/agent-director-errors.ts` as strings; no class of
  * theirs is imported. Class labels come from `src/ad-error-class.ts`, the
- * description words from `src/ad-description-phrases.ts` and the cap from
+ * description words, the survivor pattern and `survivorPids` from
+ * `src/ad-description-phrases.ts` and the cap from
  * `src/persona-connection-errors.ts`.
  *
  * The step's re-check is either an injected recording trigger or E3's
@@ -47,21 +48,30 @@ import {
   type AdVersionRecheckTrigger,
 } from '../src/ad-error-class.ts'
 import {
+  CONFLICT_ANOTHER_STORE_PHRASE,
   CONFLICT_CONFLICTING_LABELS_PHRASE,
   CONFLICT_DIFFERENT_ID_PHRASE,
   CONFLICT_LEFTOVER_PHRASE,
   CONFLICT_NEVER_REPORTED_IN_PHRASE,
   CONFLICT_NOT_THIS_LAUNCH_PHRASE,
-  CONFLICT_NO_PANE_PHRASE,
   CONFLICT_NO_VALID_ID_PHRASE,
   CONFLICT_OWN_ID_PHRASE,
   CONFLICT_PANE_NOT_FOUND_PHRASE,
   DIFFERENT_TMUX_SERVER_PHRASE,
   LAUNCH_TIMEOUT_PHRASE,
+  NEVER_DELETE_ROW_PHRASE,
+  NEW_ROW_ENDED_PHRASE,
+  NO_KILL_SENT_PHRASE,
+  NOTHING_WRITTEN_PHRASE,
+  PANE_NOT_ADOPTED_PHRASE,
   PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE,
+  PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE,
+  RETRY_KILL_LATER_PHRASE,
   STILL_STARTING_PHRASE,
   STILL_STOPPING_PHRASE,
+  SURVIVOR_PID_PATTERN,
   UNUSABLE_RECORDED_NAME_PHRASE,
+  survivorPids,
 } from '../src/ad-description-phrases.ts'
 import {
   RECHECK_OUTCOME_COULD_NOT_RUN,
@@ -75,6 +85,9 @@ import {
 import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
 import {
   AgentDirectorError,
+  ERR_SCHEMA_MIGRATION_REQUIRED_NAME,
+  ERR_SCHEMA_MISMATCH_NAME,
+  ERR_STORE_OPEN_NAME,
   ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
@@ -83,7 +96,9 @@ import {
   ErrSendKeysWhileRelayed,
   ErrUnknownErrorName,
   PHASE1_ONLY_ERR_NAMES,
+  STORE_OPEN_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
+import { REQUIRED_ERR_NAMES } from '../src/agent-director-startup.ts'
 import { AD_BELOW_PHASE1_FLOOR } from '../src/install-check.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
 import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
@@ -91,6 +106,8 @@ import {
   CONFLICT_CASES,
   KILL_FAILED_DESCRIPTIONS,
   STUB_RESOLVE_DEFAULT_PATH,
+  STUB_SURVIVOR_PIDS,
+  STUB_TMUX_SESSION_ID,
   STUB_TMUX_SESSION_NAME,
   STUB_TMUX_SOCKET_PATH,
   UNUSABLE_NAME_FAULTS,
@@ -103,6 +120,7 @@ import {
   errJsonlMissing,
   errJsonlNeverWritten,
   errNoSessionId,
+  errSchemaMismatch,
   errSpawnNotFound,
   errSpawnNotInteractive,
   errSpawnNotInteractiveLeftover,
@@ -128,6 +146,7 @@ import {
   makeStubResolveSystemBinary,
   stubCallCount,
   type ConflictCase,
+  type ConflictOptions,
   type StubResolveSystemBinaryOutcome,
 } from './test-helpers/agent-director-stub.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
@@ -232,6 +251,22 @@ const ROWS: readonly Row[] = [
     AD_ERROR_CLASS_CONFLICT,
   ]),
   ['errTmuxSessionConflict (kill, not-this-launch)', () => errTmuxSessionConflict('kill', 'not-this-launch'), AD_ERROR_CLASS_CONFLICT],
+  ['errTmuxSessionConflict (kill, never-reported-in)', () => errTmuxSessionConflict('kill', 'never-reported-in'), AD_ERROR_CLASS_CONFLICT],
+  ...(['different-id', 'another-store'] as const).map((c): Row => [
+    `errTmuxSessionConflict (spawn, ${c}, plain spawn)`,
+    () => errTmuxSessionConflict('spawn', c, STUB_TMUX_SESSION_NAME, { plainSpawn: true }),
+    AD_ERROR_CLASS_CONFLICT,
+  ]),
+  [
+    'errTmuxSessionConflict (read-pane, pane-not-found, not adopted)',
+    () => errTmuxSessionConflict('read-pane', 'pane-not-found', STUB_TMUX_SESSION_NAME, { notAdopted: true }),
+    AD_ERROR_CLASS_CONFLICT,
+  ],
+  [
+    'errTmuxSessionConflict (spawn, conflicting-labels, scan)',
+    () => errTmuxSessionConflict('spawn', 'conflicting-labels', STUB_TMUX_SESSION_NAME, { scan: true }),
+    AD_ERROR_CLASS_CONFLICT,
+  ],
   // UNUSABLE NAME
   ...UNUSABLE_NAME_FAULTS.map((f): Row => [`errUnusableName (${f})`, () => errUnusableName(f), AD_ERROR_CLASS_UNUSABLE_NAME]),
   // CONFIG
@@ -261,6 +296,17 @@ const ROWS: readonly Row[] = [
   ['ErrCwdNotADirectory', () => clientError(ErrCwdNotADirectory, 'spawn', 'cwd not a directory'), AD_ERROR_CLASS_DIRECTORY],
   // UNCLASSIFIED
   ['errInternal without the phrase', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED],
+  ['errSchemaMismatch', () => errSchemaMismatch(), AD_ERROR_CLASS_UNCLASSIFIED],
+  [
+    `errUnknownErrorName with ${ERR_SCHEMA_MIGRATION_REQUIRED_NAME}`,
+    () => errUnknownErrorName(ERR_SCHEMA_MIGRATION_REQUIRED_NAME, 'the store needs the install script\'s migration'),
+    AD_ERROR_CLASS_UNCLASSIFIED,
+  ],
+  [
+    `errUnknownErrorName with ${ERR_STORE_OPEN_NAME}`,
+    () => errUnknownErrorName(ERR_STORE_OPEN_NAME, 'the store could not be opened'),
+    AD_ERROR_CLASS_UNCLASSIFIED,
+  ],
   ['errSystemInstallDisappeared', () => errSystemInstallDisappeared(), AD_ERROR_CLASS_UNCLASSIFIED],
   [
     'ErrSendKeysWhileRelayed (a name CSCB gives no handling)',
@@ -335,6 +381,10 @@ describe('classifyAdError: ErrInternal by its envelope description', () => {
     ['ErrInternal upper-cased', ERR_INTERNAL.toUpperCase()],
     ['ErrConfigMalformed lower-cased', ERR_CONFIG_MALFORMED.toLowerCase()],
     ['ErrConfigMalformed upper-cased', ERR_CONFIG_MALFORMED.toUpperCase()],
+    ...STORE_OPEN_ERR_NAMES.flatMap((name) => [
+      [`${name} lower-cased`, name.toLowerCase()],
+      [`${name} upper-cased`, name.toUpperCase()],
+    ]),
   ])('an unknownName that is %s is UNAVAILABLE', (_label, unknownName) => {
     expect(classifyAdError(errUnknownErrorName(unknownName, UNUSABLE_RECORDED_NAME_PHRASE))).toEqual({
       errorClass: AD_ERROR_CLASS_UNAVAILABLE,
@@ -342,15 +392,65 @@ describe('classifyAdError: ErrInternal by its envelope description', () => {
   })
 })
 
-describe('classifyAdError: A-13 (a client class named ErrInternal or ErrConfigMalformed)', () => {
+describe('classifyAdError: A-13 (a client class named ErrInternal, ErrConfigMalformed or a store-open name)', () => {
   test.each([
     ['ErrInternal without the phrase', ERR_INTERNAL, 'the store could not be read', AD_ERROR_CLASS_UNCLASSIFIED],
     ['ErrInternal with the phrase', ERR_INTERNAL, `${UNUSABLE_RECORDED_NAME_PHRASE} is empty`, AD_ERROR_CLASS_UNUSABLE_NAME],
     ['ErrConfigMalformed', ERR_CONFIG_MALFORMED, 'config refused', AD_ERROR_CLASS_CONFIG],
+    ...STORE_OPEN_ERR_NAMES.map((name) => [name, name, 'the store could not be opened', AD_ERROR_CLASS_UNCLASSIFIED] as const),
   ] as const)('a base error whose errName is %s classifies as the ErrUnknownErrorName form', (_label, name, description, expected) => {
     const byErrName = classifyAdError(baseError(name, description))
     expect(byErrName.errorClass).toBe(expected)
     expect(byErrName).toEqual(classifyAdError(errUnknownErrorName(name, description)))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The store-open names (b.jg5 SRJ-104; A-32, Q-15)
+// ---------------------------------------------------------------------------
+
+/** The three store-open names as the SRD spells them, the wire names the Phase 1 CLI returns. */
+const SRD_STORE_OPEN_NAMES = ['ErrSchemaMismatch', 'ErrSchemaMigrationRequired', 'ErrStoreOpen']
+
+/** Each store-open name with the stub call that builds it around a description. */
+const STORE_OPEN_BUILDERS: ReadonlyArray<readonly [string, (description: string) => ErrUnknownErrorName]> = [
+  [ERR_SCHEMA_MISMATCH_NAME, (description) => errSchemaMismatch(description)],
+  [ERR_SCHEMA_MIGRATION_REQUIRED_NAME, (description) => errUnknownErrorName(ERR_SCHEMA_MIGRATION_REQUIRED_NAME, description)],
+  [ERR_STORE_OPEN_NAME, (description) => errUnknownErrorName(ERR_STORE_OPEN_NAME, description)],
+]
+
+describe('classifyAdError: the store-open names', () => {
+  test('the constants are the SRD\'s three names', () => {
+    expect<readonly string[]>(STORE_OPEN_ERR_NAMES).toEqual(SRD_STORE_OPEN_NAMES)
+    expect(STORE_OPEN_BUILDERS.map(([name]) => name)).toEqual(SRD_STORE_OPEN_NAMES)
+  })
+
+  test.each(STORE_OPEN_BUILDERS)('%s is UNCLASSIFIED with its reported name and its description redacted', (name, build) => {
+    const classification = classifyAdError(build(`store not opened (${sentinelInMessage('store')})`))
+    const expected: AdErrorClassification = {
+      errorClass: AD_ERROR_CLASS_UNCLASSIFIED,
+      reportedName: name,
+      message: `store not opened (${REDACTED_SENTINEL_TAIL})`,
+    }
+    expect(classification).toEqual(expected)
+    const line = describeAdErrorClassification(classification)
+    expect(line).toBe(`class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${name} message=${JSON.stringify(expected.message)}`)
+    assertNoLeak({ classification, line })
+  })
+
+  test('the UNAVAILABLE row\'s later name is none of the names the classifier handles by unknownName', () => {
+    expect([...STORE_OPEN_ERR_NAMES, ERR_INTERNAL, ERR_CONFIG_MALFORMED]).not.toContain(errUnknownErrorName().unknownName)
+  })
+
+  test('no store-open name is a Phase-1-only name or a name the startup gate requires as a class', () => {
+    for (const name of STORE_OPEN_ERR_NAMES) {
+      expect(PHASE1_ONLY_ERR_NAMES as readonly string[]).not.toContain(name)
+      expect(REQUIRED_ERR_NAMES as readonly string[]).not.toContain(name)
+    }
+  })
+
+  test('errSchemaMismatch\'s default description says the store could not be opened', () => {
+    expect((errSchemaMismatch().envelope as { err_description: string }).err_description).toContain('could not be opened')
   })
 })
 
@@ -389,10 +489,9 @@ describe('classifyAdError: recognised by errName', () => {
 // Builder shape (SRJ-1303)
 // ---------------------------------------------------------------------------
 
-/** Every CONFLICT case word, and the plain spawn's extra wording. */
+/** Every CONFLICT case word, and every word ADSRD SR-1.4 sets beside one. */
 const CONFLICT_WORDS: readonly string[] = [
   CONFLICT_CONFLICTING_LABELS_PHRASE,
-  CONFLICT_NO_PANE_PHRASE,
   CONFLICT_PANE_NOT_FOUND_PHRASE,
   CONFLICT_NOT_THIS_LAUNCH_PHRASE,
   CONFLICT_LEFTOVER_PHRASE,
@@ -400,61 +499,205 @@ const CONFLICT_WORDS: readonly string[] = [
   CONFLICT_OWN_ID_PHRASE,
   CONFLICT_NO_VALID_ID_PHRASE,
   CONFLICT_DIFFERENT_ID_PHRASE,
+  CONFLICT_ANOTHER_STORE_PHRASE,
   PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE,
+  PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE,
+  NEW_ROW_ENDED_PHRASE,
+  NOTHING_WRITTEN_PHRASE,
+  PANE_NOT_ADOPTED_PHRASE,
+  NO_KILL_SENT_PHRASE,
 ]
 
-/** The words each case carries from a verb other than `kill` (ADSRD SR-1.4 with its extras). */
+/** The words each case carries from a verb other than `kill` and with no options (ADSRD SR-1.4 with its extras). */
 const CASE_WORDS: Readonly<Record<ConflictCase, readonly string[]>> = {
   'no-valid-id': [CONFLICT_NO_VALID_ID_PHRASE],
   'different-id': [CONFLICT_DIFFERENT_ID_PHRASE],
+  'another-store': [CONFLICT_ANOTHER_STORE_PHRASE],
   'own-id': [CONFLICT_OWN_ID_PHRASE],
   'leftover': [CONFLICT_LEFTOVER_PHRASE],
-  'plain-spawn-leftover': [CONFLICT_LEFTOVER_PHRASE, PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE],
+  'scan-leftover': [CONFLICT_LEFTOVER_PHRASE, NOTHING_WRITTEN_PHRASE],
+  'duplicate-session-leftover': [CONFLICT_LEFTOVER_PHRASE, PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE, NEW_ROW_ENDED_PHRASE],
   'not-this-launch': [CONFLICT_NOT_THIS_LAUNCH_PHRASE],
   'pane-not-found': [CONFLICT_PANE_NOT_FOUND_PHRASE, CONFLICT_OWN_ID_PHRASE],
-  'no-pane': [CONFLICT_NO_PANE_PHRASE, CONFLICT_PANE_NOT_FOUND_PHRASE, CONFLICT_OWN_ID_PHRASE],
   'conflicting-labels': [CONFLICT_CONFLICTING_LABELS_PHRASE],
-  'never-reported-in': [CONFLICT_NEVER_REPORTED_IN_PHRASE],
+  'never-reported-in': [CONFLICT_NEVER_REPORTED_IN_PHRASE, CONFLICT_OWN_ID_PHRASE, NO_KILL_SENT_PHRASE],
   'unrecognised': [],
 }
 
-/** The kill variant's one mention of a kill (SRJ-1303). */
-const NO_KILL_SENT = 'no kill was sent'
+/** The two cases whose session must not be ended: they point to no "Operator actions" (ADSRD SR-1.4; SRJ-1004). */
+const NO_POINTER_CASES: readonly ConflictCase[] = ['different-id', 'another-store']
 
 /** A session name other than the default, to show the builders carry the one they are given. */
 const OTHER_SESSION_NAME = `${STUB_TMUX_SESSION_NAME}_other`
+
+/**
+ * The `list --tmux-session-name` line naming `sessionName`: agent-director
+ * puts it in every CONFLICT message, including the two with no "Operator
+ * actions" pointer (handoff; SRJ-1303).
+ */
+function listLineFor(sessionName: string): string {
+  return `list --tmux-session-name ${JSON.stringify(sessionName)}`
+}
 
 function wordsIn(description: string): string[] {
   return CONFLICT_WORDS.filter((w) => description.includes(w)).sort()
 }
 
-describe('stub builders: shape (SRJ-1303)', () => {
-  test.each([...KILL_FAILED_DESCRIPTIONS])('errTmuxKillFailed (%s) carries the quoted session name, verb kill', (d) => {
-    const err = errTmuxKillFailed(OTHER_SESSION_NAME, d)
-    expect(err.verb).toBe('kill')
-    expect(err.errDescription).toContain(JSON.stringify(OTHER_SESSION_NAME))
-  })
+/**
+ * The description with the one allowed "no kill was sent" removed: any other
+ * mention of a kill in a CONFLICT description names a command that ends a
+ * session (SRJ-507).
+ */
+function withoutNoKillSent(description: string): string {
+  return description.replace(NO_KILL_SENT_PHRASE, '')
+}
 
-  test('the three errTmuxKillFailed descriptions differ', () => {
+/** The builder calls the options argument selects, with the words each carries and whether it points to "Operator actions". */
+const CONFLICT_VARIANTS: ReadonlyArray<readonly [label: string, verb: string, c: ConflictCase, options: ConflictOptions, words: readonly string[], pointer: boolean]> = [
+  [
+    'different-id, plain spawn',
+    'spawn',
+    'different-id',
+    { plainSpawn: true },
+    [CONFLICT_DIFFERENT_ID_PHRASE, PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE, NEW_ROW_ENDED_PHRASE],
+    false,
+  ],
+  [
+    'another-store, plain spawn',
+    'spawn',
+    'another-store',
+    { plainSpawn: true },
+    [CONFLICT_ANOTHER_STORE_PHRASE, PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE, NEW_ROW_ENDED_PHRASE],
+    false,
+  ],
+  [
+    'pane-not-found, not adopted',
+    'read-pane',
+    'pane-not-found',
+    { notAdopted: true },
+    [CONFLICT_PANE_NOT_FOUND_PHRASE, CONFLICT_OWN_ID_PHRASE, PANE_NOT_ADOPTED_PHRASE],
+    true,
+  ],
+  [
+    'conflicting-labels, scan',
+    'spawn',
+    'conflicting-labels',
+    { scan: true },
+    [CONFLICT_CONFLICTING_LABELS_PHRASE, NOTHING_WRITTEN_PHRASE],
+    true,
+  ],
+]
+
+/** Each option key with the cases it applies to (SRJ-1303). */
+const OPTION_CASES: ReadonlyArray<readonly [keyof ConflictOptions, readonly ConflictCase[]]> = [
+  ['plainSpawn', ['different-id', 'another-store']],
+  ['notAdopted', ['pane-not-found']],
+  ['scan', ['conflicting-labels']],
+]
+
+describe('stub builders: shape (SRJ-1303)', () => {
+  test.each([...KILL_FAILED_DESCRIPTIONS])(
+    'errTmuxKillFailed (%s) carries the quoted session name, verb kill, "retry kill later" and "never delete this row"',
+    (d) => {
+      const err = errTmuxKillFailed(OTHER_SESSION_NAME, d)
+      expect(err.verb).toBe('kill')
+      expect(err.errDescription).toContain(JSON.stringify(OTHER_SESSION_NAME))
+      expect(err.errDescription).toContain(RETRY_KILL_LATER_PHRASE)
+      expect(err.errDescription).toContain(NEVER_DELETE_ROW_PHRASE)
+    },
+  )
+
+  test('the four errTmuxKillFailed descriptions differ', () => {
     const texts = KILL_FAILED_DESCRIPTIONS.map((d) => errTmuxKillFailed(STUB_TMUX_SESSION_NAME, d).errDescription)
+    expect(texts).toHaveLength(4)
     expect(new Set(texts).size).toBe(KILL_FAILED_DESCRIPTIONS.length)
   })
+
+  test.each(KILL_FAILED_DESCRIPTIONS.map((d) => [d, d === 'pane-process-survived'] as const))(
+    'SURVIVOR_PID_PATTERN on the errTmuxKillFailed (%s) description matches: %p',
+    (d, matches) => {
+      expect(SURVIVOR_PID_PATTERN.test(errTmuxKillFailed(STUB_TMUX_SESSION_NAME, d).errDescription)).toBe(matches)
+    },
+  )
+
+  test.each([
+    ['the default pid', undefined, STUB_SURVIVOR_PIDS],
+    ['one pid', [4194401], [4194401]],
+    ['two pids, in the order given', [4194403, 4194402], [4194403, 4194402]],
+  ] as const)('the survivor description built with %s names each pid once, in order', (_label, pids, expected) => {
+    const description = errTmuxKillFailed(STUB_TMUX_SESSION_NAME, 'pane-process-survived', pids).errDescription
+    expect(survivorPids(description)).toEqual([...expected])
+  })
+
+  test.each(KILL_FAILED_DESCRIPTIONS.filter((d) => d !== 'pane-process-survived'))(
+    'errTmuxKillFailed (%s) ignores the pids it is given and names none',
+    (d) => {
+      expect(survivorPids(errTmuxKillFailed(STUB_TMUX_SESSION_NAME, d, [4194401, 4194402]).errDescription)).toEqual([])
+    },
+  )
 
   test.each([...CONFLICT_CASES])('errTmuxSessionConflict (%s) carries the verb, the quoted name and exactly its case words', (c) => {
     const err = errTmuxSessionConflict('resume', c, OTHER_SESSION_NAME)
     expect(err.verb).toBe('resume')
     expect(err.errDescription).toContain(JSON.stringify(OTHER_SESSION_NAME))
     expect(wordsIn(err.errDescription)).toEqual([...CASE_WORDS[c]].sort())
-    expect(err.errDescription).not.toMatch(/kill/i)
+    expect(withoutNoKillSent(err.errDescription)).not.toMatch(/kill/i)
+  })
+
+  test.each([...CONFLICT_CASES])('errTmuxSessionConflict (%s) gives the list --tmux-session-name line naming the session', (c) => {
+    expect(errTmuxSessionConflict('resume', c, OTHER_SESSION_NAME).errDescription).toContain(listLineFor(OTHER_SESSION_NAME))
+  })
+
+  test.each(CONFLICT_CASES.map((c) => [c, !NO_POINTER_CASES.includes(c)] as const))(
+    'errTmuxSessionConflict (%s) points to "Operator actions": %p',
+    (c, pointer) => {
+      expect(errTmuxSessionConflict('resume', c).errDescription.includes('Operator actions')).toBe(pointer)
+    },
+  )
+
+  test.each([...NO_POINTER_CASES])(
+    'errTmuxSessionConflict (%s) says the session must not be ended and gives the list --tmux-session-name line',
+    (c) => {
+      const { errDescription } = errTmuxSessionConflict('resume', c, OTHER_SESSION_NAME)
+      expect(errDescription).toContain('must not be ended')
+      expect(errDescription).toContain(listLineFor(OTHER_SESSION_NAME))
+    },
+  )
+
+  test('errTmuxSessionConflict (scan-leftover) names the session\'s tmux id and says no row was ended', () => {
+    const { errDescription } = errTmuxSessionConflict('spawn', 'scan-leftover', OTHER_SESSION_NAME)
+    expect(errDescription).toContain(STUB_TMUX_SESSION_ID)
+    expect(errDescription).not.toMatch(/ended/)
   })
 
   test('errTmuxSessionConflict (kill, not-this-launch) also carries this row\'s own id and "no kill was sent"', () => {
     const err = errTmuxSessionConflict('kill', 'not-this-launch', OTHER_SESSION_NAME)
     expect(err.verb).toBe('kill')
     expect(err.errDescription).toContain(JSON.stringify(OTHER_SESSION_NAME))
-    expect(wordsIn(err.errDescription)).toEqual([CONFLICT_NOT_THIS_LAUNCH_PHRASE, CONFLICT_OWN_ID_PHRASE].sort())
-    expect(err.errDescription).toContain(NO_KILL_SENT)
-    expect(err.errDescription.replace(NO_KILL_SENT, '')).not.toMatch(/kill/i)
+    expect(wordsIn(err.errDescription)).toEqual([CONFLICT_NOT_THIS_LAUNCH_PHRASE, CONFLICT_OWN_ID_PHRASE, NO_KILL_SENT_PHRASE].sort())
+    expect(err.errDescription).toContain(listLineFor(OTHER_SESSION_NAME))
+    expect(withoutNoKillSent(err.errDescription)).not.toMatch(/kill/i)
+  })
+
+  test.each(CONFLICT_VARIANTS)(
+    'errTmuxSessionConflict (%s) carries the quoted name and exactly its words',
+    (_label, verb, c, options, words, pointer) => {
+      const err = errTmuxSessionConflict(verb, c, OTHER_SESSION_NAME, options)
+      expect(err.verb).toBe(verb)
+      expect(err.errDescription).toContain(JSON.stringify(OTHER_SESSION_NAME))
+      expect(wordsIn(err.errDescription)).toEqual([...words].sort())
+      expect(err.errDescription).toContain(listLineFor(OTHER_SESSION_NAME))
+      expect(err.errDescription.includes('Operator actions')).toBe(pointer)
+      expect(withoutNoKillSent(err.errDescription)).not.toMatch(/kill/i)
+    },
+  )
+
+  test.each(
+    OPTION_CASES.flatMap(([key, cases]) =>
+      CONFLICT_CASES.filter((c) => !cases.includes(c)).map((c) => [key, c] as const),
+    ),
+  )('errTmuxSessionConflict with %s on %s throws', (key, c) => {
+    expect(() => errTmuxSessionConflict('spawn', c, STUB_TMUX_SESSION_NAME, { [key]: true })).toThrow(key)
   })
 
   test.each([
@@ -497,6 +740,7 @@ describe('stub builders: shape (SRJ-1303)', () => {
   test.each([
     ['errInternal', () => errInternal('the store could not be read'), ERR_INTERNAL, 'the store could not be read'],
     ['errUnknownErrorName', () => errUnknownErrorName('ErrFromALaterBinary', 'later words'), 'ErrFromALaterBinary', 'later words'],
+    ['errSchemaMismatch', () => errSchemaMismatch('store words'), ERR_SCHEMA_MISMATCH_NAME, 'store words'],
   ] as const)('%s puts the name and description where the client does', (_label, build, name, description) => {
     const err = build()
     const envelope = { err_name: name, err_description: description }
@@ -507,6 +751,38 @@ describe('stub builders: shape (SRJ-1303)', () => {
     expect(err.envelope).toEqual(envelope)
     expect(err.verb).toBe(asClientBuildsIt.verb)
     expect(err.errDescription).toBe(asClientBuildsIt.errDescription)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The survivor-naming form
+// ---------------------------------------------------------------------------
+
+describe('SURVIVOR_PID_PATTERN and survivorPids (b.jg5 SRJ-702)', () => {
+  test('SURVIVOR_PID_PATTERN has no flags, so .test() keeps no state between calls', () => {
+    expect(SURVIVOR_PID_PATTERN.flags).toBe('')
+  })
+
+  test('two .test() calls in a row on "pid 4242" both match', () => {
+    expect(SURVIVOR_PID_PATTERN.test('pid 4242')).toBe(true)
+    expect(SURVIVOR_PID_PATTERN.test('pid 4242')).toBe(true)
+  })
+
+  test.each(['pids 12', 'rapid 12', 'pid', 'pid x', 'a kill was sent'])(
+    'SURVIVOR_PID_PATTERN does not match %p',
+    (text) => {
+      expect(SURVIVOR_PID_PATTERN.test(text)).toBe(false)
+    },
+  )
+
+  test('survivorPids lists every named pid in order, the same on two calls in a row', () => {
+    const description = 'the kill left survivors: pid 11, pid 22 still run'
+    expect(survivorPids(description)).toEqual([11, 22])
+    expect(survivorPids(description)).toEqual([11, 22])
+  })
+
+  test('survivorPids is empty when no pid is named in the form', () => {
+    expect(survivorPids('rapid 12; pids 13')).toEqual([])
   })
 })
 

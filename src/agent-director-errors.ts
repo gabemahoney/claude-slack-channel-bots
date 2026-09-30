@@ -20,8 +20,10 @@
  *   - ErrUnknownErrorName       decided by its `unknownName`: `ErrInternal` is
  *                               UNUSABLE NAME when its description carries "the
  *                               recorded tmux session name" and UNCLASSIFIED
- *                               otherwise; `ErrConfigMalformed` is CONFIG; any
- *                               other name is UNAVAILABLE
+ *                               otherwise; `ErrConfigMalformed` is CONFIG;
+ *                               `ErrSchemaMismatch`, `ErrSchemaMigrationRequired`
+ *                               and `ErrStoreOpen` are UNCLASSIFIED; any other
+ *                               name is UNAVAILABLE
  *   - ErrTmuxKillFailed         UNAVAILABLE
  *   - ErrTmuxUnresponsive       UNAVAILABLE
  *   - ErrTmuxSessionConflict    CONFLICT
@@ -30,7 +32,9 @@
  * (SRJ-101 interim rule), not imported, re-exported once the Phase 1 client is
  * adopted (E37): the branch's 0.10.0 client lacks them, and a named import or
  * re-export of a missing export fails every module that loads it. Their names
- * are exported below once, as plain strings.
+ * are exported below once, as plain strings. So are the three store-open
+ * `unknownName`s (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`,
+ * `ErrStoreOpen`), which no client declares as a class.
  *
  * Catalog (SR-0.2):
  *   - ErrBunVersionTooOld       (Client constructor / Bun version gate)
@@ -120,6 +124,30 @@ export const PHASE1_ONLY_ERR_NAMES = [
 
 /** One of the three Phase-1-only error names. */
 export type Phase1OnlyErrName = (typeof PHASE1_ONLY_ERR_NAMES)[number]
+
+/**
+ * `unknownName`s of the three errors agent-director's CLI answers when it
+ * cannot open its store (b.jg5 SRJ-104, A-32, Q-15): a schema the binary does
+ * not match or a missing or malformed store id (`ErrSchemaMismatch`), a store
+ * that still needs the install script's migration
+ * (`ErrSchemaMigrationRequired`), and a store it cannot open at all
+ * (`ErrStoreOpen`). They are outside agent-director's error catalogue, so
+ * every client, the Phase 1 client included, delivers them as
+ * `ErrUnknownErrorName`; the classifier recognises them by that name and
+ * answers UNCLASSIFIED. No client declares a class of these names, so they are
+ * not in `PHASE1_ONLY_ERR_NAMES`, whose names the startup gate requires as
+ * classes in the client.
+ */
+export const ERR_SCHEMA_MISMATCH_NAME = 'ErrSchemaMismatch'
+export const ERR_SCHEMA_MIGRATION_REQUIRED_NAME = 'ErrSchemaMigrationRequired'
+export const ERR_STORE_OPEN_NAME = 'ErrStoreOpen'
+
+/** The three store-open error names, in one list. */
+export const STORE_OPEN_ERR_NAMES = [
+  ERR_SCHEMA_MISMATCH_NAME,
+  ERR_SCHEMA_MIGRATION_REQUIRED_NAME,
+  ERR_STORE_OPEN_NAME,
+] as const
 
 export {
   AgentDirectorError,

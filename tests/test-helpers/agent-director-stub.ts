@@ -53,11 +53,15 @@
  *     error's name, taken from the string constants in
  *     `src/agent-director-errors.ts`. Once the Phase 1 client is adopted
  *     (b.jg5 E37) they switch to its classes.
- *   - `ErrInternal` and `ErrConfigMalformed` have no class in any client and
- *     arrive as `ErrUnknownErrorName`; `errInternal`, `errUnusableName`,
- *     `errConfigMalformed` and `errUnknownErrorName` build that class the
- *     way the client does, with the name in `unknownName` and the binary's
- *     `{ err_name, err_description }` envelope in `envelope`.
+ *   - `ErrInternal`, `ErrConfigMalformed` and the three store-open names
+ *     (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`, `ErrStoreOpen`)
+ *     have no class in any client and arrive as `ErrUnknownErrorName`;
+ *     `errInternal`, `errUnusableName`, `errConfigMalformed`,
+ *     `errSchemaMismatch` and `errUnknownErrorName` build that class the way
+ *     the client does, with the name in `unknownName` and the binary's
+ *     `{ err_name, err_description }` envelope in `envelope`
+ *     (`ErrSchemaMigrationRequired` and `ErrStoreOpen` through
+ *     `errUnknownErrorName`).
  *   - The description words CSCB matches come from
  *     `src/ad-description-phrases.ts`; the Phase 1 result fields
  *     (`kill_sent`, `launch_started_at`, `liveness_note`, `pre_trust`) are
@@ -154,27 +158,36 @@ import {
 } from '../../src/session-manager.ts'
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
 import {
+  ERR_SCHEMA_MISMATCH_NAME,
   ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
   type Phase1OnlyErrName,
 } from '../../src/agent-director-errors.ts'
 import {
+  CONFLICT_ANOTHER_STORE_PHRASE,
   CONFLICT_CONFLICTING_LABELS_PHRASE,
   CONFLICT_DIFFERENT_ID_PHRASE,
   CONFLICT_LEFTOVER_PHRASE,
   CONFLICT_NEVER_REPORTED_IN_PHRASE,
-  CONFLICT_NO_PANE_PHRASE,
   CONFLICT_NO_VALID_ID_PHRASE,
   CONFLICT_NOT_THIS_LAUNCH_PHRASE,
   CONFLICT_OWN_ID_PHRASE,
   CONFLICT_PANE_NOT_FOUND_PHRASE,
   DIFFERENT_TMUX_SERVER_PHRASE,
   LAUNCH_TIMEOUT_PHRASE,
+  NEVER_DELETE_ROW_PHRASE,
+  NEW_ROW_ENDED_PHRASE,
+  NO_KILL_SENT_PHRASE,
+  NOTHING_WRITTEN_PHRASE,
+  PANE_NOT_ADOPTED_PHRASE,
   PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE,
+  PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE,
+  RETRY_KILL_LATER_PHRASE,
   STILL_STARTING_PHRASE,
   STILL_STOPPING_PHRASE,
   UNUSABLE_RECORDED_NAME_PHRASE,
+  survivorPids,
 } from '../../src/ad-description-phrases.ts'
 import type {
   LivenessNote,
@@ -639,39 +652,71 @@ export function errTmuxUnresponsiveStillStarting(
 }
 
 /**
- * The three `ErrTmuxKillFailed` descriptions:
+ * The four `ErrTmuxKillFailed` descriptions:
  *   - `'outlived-exit-wait'`: a kill was sent and the agent process outlived
  *     the kill exit wait;
+ *   - `'pane-process-survived'`: a kill was sent and another process of the
+ *     labelled session's panes outlived it, each such process named as
+ *     `pid <n>` (the survivor-naming form `SURVIVOR_PID_PATTERN` matches);
  *   - `'unverifiable-session-present'`: a kill was sent, the process cannot be
  *     checked and the labelled session is still there;
  *   - `'no-session-no-kill'`: no session or pane of this launch was found
  *     while the process runs, and no kill was sent.
  */
-export type KillFailedDescription = 'outlived-exit-wait' | 'unverifiable-session-present' | 'no-session-no-kill'
+export type KillFailedDescription =
+  | 'outlived-exit-wait'
+  | 'pane-process-survived'
+  | 'unverifiable-session-present'
+  | 'no-session-no-kill'
 
 /** Every `KillFailedDescription`, for `test.each`. */
 export const KILL_FAILED_DESCRIPTIONS: readonly KillFailedDescription[] = [
   'outlived-exit-wait',
+  'pane-process-survived',
   'unverifiable-session-present',
   'no-session-no-kill',
 ]
 
 /**
- * Build an `ErrTmuxKillFailed` (by name; verb `kill`) with one of its three
- * descriptions, each carrying the quoted session name.
+ * The pids `errTmuxKillFailed`'s `'pane-process-survived'` description names
+ * by default: one fake pid, above Linux's largest pid (2^22), so it can never
+ * be a real process.
+ */
+export const STUB_SURVIVOR_PIDS: readonly number[] = [4194400]
+
+/**
+ * Build an `ErrTmuxKillFailed` (by name; verb `kill`) with one of its four
+ * descriptions, each carrying the quoted session name, "retry kill later" and
+ * "never delete this row". Only `'pane-process-survived'` names a pid: each of
+ * `pids` (one or more) as `pid <n>`, joined with ", "; the other three ignore
+ * `pids` and name none. The builder checks its own text with `survivorPids`
+ * and throws when the pids it names are not exactly `pids` (none for the
+ * other three).
  */
 export function errTmuxKillFailed(
   sessionName: string = STUB_TMUX_SESSION_NAME,
   description: KillFailedDescription = 'outlived-exit-wait',
+  pids: readonly number[] = STUB_SURVIVOR_PIDS,
 ): AgentDirectorError {
   const quoted = JSON.stringify(sessionName)
+  const tail = `${RETRY_KILL_LATER_PHRASE}; ${NEVER_DELETE_ROW_PHRASE}`
+  const named = pids.map((pid) => `pid ${pid}`).join(', ')
   const text: Record<KillFailedDescription, string> = {
     'outlived-exit-wait':
-      `a kill was sent to tmux session ${quoted} and the agent process outlived the kill exit wait (5 s); the row stays live and nothing was marked or deleted`,
+      `a kill was sent to tmux session ${quoted} and the agent process outlived the kill exit wait (5 s); the row stays live and nothing was marked; ${tail}`,
+    'pane-process-survived':
+      `a kill was sent to tmux session ${quoted} and the agent process exited, but another process of the labelled session's panes outlived it (${named}); the row stays live; ${tail}`,
     'unverifiable-session-present':
-      `a kill was sent to tmux session ${quoted}; the agent process cannot be checked and the labelled session is still there; the row stays live`,
+      `a kill was sent to tmux session ${quoted}; the agent process cannot be checked and the labelled session is still there; the row stays live; ${tail}`,
     'no-session-no-kill':
-      `no session or pane of this launch was found (tmux session ${quoted}) while the agent process runs; no kill was sent`,
+      `no session or pane of this launch was found (tmux session ${quoted}) while the agent process runs; ${NO_KILL_SENT_PHRASE}; ${tail}`,
+  }
+  const expected = description === 'pane-process-survived' ? [...pids] : []
+  if (description === 'pane-process-survived' && pids.length === 0) {
+    throw new Error("errTmuxKillFailed: 'pane-process-survived' names one or more pids")
+  }
+  if (JSON.stringify(survivorPids(text[description])) !== JSON.stringify(expected)) {
+    throw new Error(`errTmuxKillFailed (${description}): the description does not name exactly the pids ${JSON.stringify(expected)}`)
   }
   return phase1OnlyError(ERR_TMUX_KILL_FAILED_NAME, 'kill', text[description])
 }
@@ -683,12 +728,13 @@ export function errTmuxKillFailed(
 export type ConflictCase =
   | 'no-valid-id'
   | 'different-id'
+  | 'another-store'
   | 'own-id'
   | 'leftover'
-  | 'plain-spawn-leftover'
+  | 'scan-leftover'
+  | 'duplicate-session-leftover'
   | 'not-this-launch'
   | 'pane-not-found'
-  | 'no-pane'
   | 'conflicting-labels'
   | 'never-reported-in'
   | 'unrecognised'
@@ -697,55 +743,113 @@ export type ConflictCase =
 export const CONFLICT_CASES: readonly ConflictCase[] = [
   'no-valid-id',
   'different-id',
+  'another-store',
   'own-id',
   'leftover',
-  'plain-spawn-leftover',
+  'scan-leftover',
+  'duplicate-session-leftover',
   'not-this-launch',
   'pane-not-found',
-  'no-pane',
   'conflicting-labels',
   'never-reported-in',
   'unrecognised',
 ]
 
 /**
+ * The variants of `errTmuxSessionConflict` the positional form cannot select.
+ * Each is valid on its own cases only:
+ *   - `plainSpawn`: `different-id` or `another-store` met by a plain spawn at
+ *     "duplicate session";
+ *   - `notAdopted`: `pane-not-found` after a lost create reply whose pane was
+ *     not adopted;
+ *   - `scan`: `conflicting-labels` from the pre-spawn scan.
+ */
+export type ConflictOptions = {
+  readonly plainSpawn?: boolean
+  readonly notAdopted?: boolean
+  readonly scan?: boolean
+}
+
+/** The cases each `ConflictOptions` key may be set on. */
+const CONFLICT_OPTION_CASES: Readonly<Record<keyof ConflictOptions, readonly ConflictCase[]>> = {
+  plainSpawn: ['different-id', 'another-store'],
+  notAdopted: ['pane-not-found'],
+  scan: ['conflicting-labels'],
+}
+
+/** The fake tmux session id `scan-leftover` names beside the quoted session name. */
+export const STUB_TMUX_SESSION_ID = '$7'
+
+/**
  * Build an `ErrTmuxSessionConflict` (by name) for `conflictCase`. Each
  * description carries the quoted session name and the case words of ADSRD
- * SR-1.4 (from `src/ad-description-phrases.ts`), with that table's extras:
+ * SR-1.4 (from `src/ad-description-phrases.ts`), with that table's extras,
+ * and ends with the `list --tmux-session-name` line naming the session:
+ * agent-director puts that line in every CONFLICT message.
+ *   - `different-id` and `another-store`: that the session is another row's
+ *     (another store's) agent and must not be ended; these two alone do not
+ *     point to "Operator actions". With `{ plainSpawn: true }`, also "its
+ *     label does not name this instance id" and "the new row was ended";
+ *   - `scan-leftover` (the pre-spawn scan's refusal): "left over from an
+ *     earlier life", the session's tmux id and "nothing was written and no
+ *     row was created";
+ *   - `duplicate-session-leftover` (a plain spawn at "duplicate session"):
+ *     "its label names this instance id", "left over from an earlier life"
+ *     and "the new row was ended";
  *   - `not-this-launch` from `kill`: also "this row's own id" and "no kill
  *     was sent"; from any other verb, only "not this launch's session";
- *   - `pane-not-found`: also "this row's own id";
- *   - `no-pane`: "no pane 0.0" with "the agent's pane was not found" and
- *     "this row's own id";
- *   - `plain-spawn-leftover`: "left over from an earlier life" with "its label
- *     names this instance id";
+ *   - `pane-not-found`: also "this row's own id"; with
+ *     `{ notAdopted: true }`, also "the agent's pane was not adopted";
+ *   - `conflicting-labels`: with `{ scan: true }`, also "nothing was written
+ *     and no row was created";
+ *   - `never-reported-in`: also "this row's own id" and "no kill was sent";
  *   - `unrecognised`: none of the case words.
- * No description names a command that ends a session; the `not-this-launch`
- * kill variant's "no kill was sent" is the one mention of a kill.
+ * Every other description also points a human to "Operator actions". No
+ * description names a command that ends a session; "no kill was sent" is the
+ * one mention of a kill. An option set on a case it does not apply to throws.
  */
 export function errTmuxSessionConflict(
   verb: string,
   conflictCase: ConflictCase,
   sessionName: string = STUB_TMUX_SESSION_NAME,
+  options: ConflictOptions = {},
 ): AgentDirectorError {
-  const session = `tmux session ${JSON.stringify(sessionName)}`
+  for (const key of Object.keys(CONFLICT_OPTION_CASES) as (keyof ConflictOptions)[]) {
+    if (options[key] === true && !CONFLICT_OPTION_CASES[key].includes(conflictCase)) {
+      throw new Error(`errTmuxSessionConflict: option ${key} does not apply to case ${conflictCase}`)
+    }
+  }
+  const quoted = JSON.stringify(sessionName)
+  const session = `tmux session ${quoted}`
   const humanMustLook = 'a human must look (see "Operator actions" in the agent-director README)'
+  const listLine = `agent-director list --tmux-session-name ${quoted} shows the rows that name it`
+  const plainSpawnExtras = options.plainSpawn === true
+    ? `; ${PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE}; ${NEW_ROW_ENDED_PHRASE}`
+    : ''
   const text: Record<ConflictCase, string> = {
-    'no-valid-id': `${session} holds the row's session name but carries ${CONFLICT_NO_VALID_ID_PHRASE}; ${humanMustLook}`,
-    'different-id': `${session} holds the row's session name but carries ${CONFLICT_DIFFERENT_ID_PHRASE}; ${humanMustLook}`,
-    'own-id': `${session} carries ${CONFLICT_OWN_ID_PHRASE} but cannot be confirmed as the row's session; ${humanMustLook}`,
-    'leftover': `${session} is ${CONFLICT_LEFTOVER_PHRASE} of this row; ${humanMustLook}`,
-    'plain-spawn-leftover':
-      `${session} is ${CONFLICT_LEFTOVER_PHRASE}: ${PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE}; nothing was written and no row was created; ${humanMustLook}`,
+    'no-valid-id': `${session} holds the row's session name but carries ${CONFLICT_NO_VALID_ID_PHRASE}; ${humanMustLook}; ${listLine}`,
+    'different-id':
+      `${session} holds the row's session name but carries ${CONFLICT_DIFFERENT_ID_PHRASE}${plainSpawnExtras}; it is another row's agent and must not be ended; ${listLine}`,
+    'another-store':
+      `${session} holds the row's session name but its label was written by ${CONFLICT_ANOTHER_STORE_PHRASE}${plainSpawnExtras}; it is that store's agent and must not be ended; ${listLine}`,
+    'own-id': `${session} carries ${CONFLICT_OWN_ID_PHRASE} but cannot be confirmed as the row's session; ${humanMustLook}; ${listLine}`,
+    'leftover': `${session} is ${CONFLICT_LEFTOVER_PHRASE} of this row; ${humanMustLook}; ${listLine}`,
+    'scan-leftover':
+      `the pre-spawn scan found ${session} (tmux id ${STUB_TMUX_SESSION_ID}) ${CONFLICT_LEFTOVER_PHRASE} of this instance id; ${NOTHING_WRITTEN_PHRASE}; ${humanMustLook}; ${listLine}`,
+    'duplicate-session-leftover':
+      `${session} holds the session name and ${PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE}: it is ${CONFLICT_LEFTOVER_PHRASE}; ${NEW_ROW_ENDED_PHRASE}; ${humanMustLook}; ${listLine}`,
     'not-this-launch': verb === 'kill'
-      ? `${session} carries ${CONFLICT_OWN_ID_PHRASE} but is ${CONFLICT_NOT_THIS_LAUNCH_PHRASE}; no kill was sent; ${humanMustLook}`
-      : `${session} is ${CONFLICT_NOT_THIS_LAUNCH_PHRASE}; nothing was sent; ${humanMustLook}`,
-    'pane-not-found': `${session} carries ${CONFLICT_OWN_ID_PHRASE}, but ${CONFLICT_PANE_NOT_FOUND_PHRASE}; ${humanMustLook}`,
-    'no-pane':
-      `${session} carries ${CONFLICT_OWN_ID_PHRASE} but has ${CONFLICT_NO_PANE_PHRASE}: ${CONFLICT_PANE_NOT_FOUND_PHRASE}; ${humanMustLook}`,
-    'conflicting-labels': `more than one session carries this launch's label (${session} among them): ${CONFLICT_CONFLICTING_LABELS_PHRASE}; ${humanMustLook}`,
-    'never-reported-in': `the agent in ${session} ${CONFLICT_NEVER_REPORTED_IN_PHRASE}; ${humanMustLook}`,
-    'unrecognised': `${session} could not be matched to the row; ${humanMustLook}`,
+      ? `${session} carries ${CONFLICT_OWN_ID_PHRASE} but is ${CONFLICT_NOT_THIS_LAUNCH_PHRASE}; ${NO_KILL_SENT_PHRASE}; ${humanMustLook}; ${listLine}`
+      : `${session} is ${CONFLICT_NOT_THIS_LAUNCH_PHRASE}; nothing was sent; ${humanMustLook}; ${listLine}`,
+    'pane-not-found': options.notAdopted === true
+      ? `${session} carries ${CONFLICT_OWN_ID_PHRASE}, but ${CONFLICT_PANE_NOT_FOUND_PHRASE}: ${PANE_NOT_ADOPTED_PHRASE}; ${humanMustLook}; ${listLine}`
+      : `${session} carries ${CONFLICT_OWN_ID_PHRASE}, but ${CONFLICT_PANE_NOT_FOUND_PHRASE}; ${humanMustLook}; ${listLine}`,
+    'conflicting-labels': options.scan === true
+      ? `the pre-spawn scan for ${session} found an agent-director label value set at the server, global or global-window scope: ${CONFLICT_CONFLICTING_LABELS_PHRASE}; ${NOTHING_WRITTEN_PHRASE}; ${humanMustLook}; ${listLine}`
+      : `more than one session carries this launch's label (${session} among them): ${CONFLICT_CONFLICTING_LABELS_PHRASE}; ${humanMustLook}; ${listLine}`,
+    'never-reported-in':
+      `the agent in ${session} carries ${CONFLICT_OWN_ID_PHRASE} but ${CONFLICT_NEVER_REPORTED_IN_PHRASE}; ${NO_KILL_SENT_PHRASE}; ${humanMustLook}; ${listLine}`,
+    'unrecognised': `${session} could not be matched to the row; ${humanMustLook}; ${listLine}`,
   }
   return phase1OnlyError(ERR_TMUX_SESSION_CONFLICT_NAME, verb, text[conflictCase])
 }
@@ -817,6 +921,19 @@ export function errUnknownErrorName(
   description: string = 'an error this client does not know',
 ): ErrUnknownErrorName {
   return new ErrUnknownErrorName(unknownName, { err_name: unknownName, err_description: description })
+}
+
+/**
+ * Build an `ErrSchemaMismatch`, which has no class in any client: an
+ * `ErrUnknownErrorName` whose `unknownName` is `ErrSchemaMismatch` and whose
+ * envelope carries `description`, by default that the store could not be
+ * opened. `ErrSchemaMigrationRequired` and `ErrStoreOpen` are built with
+ * `errUnknownErrorName`.
+ */
+export function errSchemaMismatch(
+  description: string = 'the store could not be opened: its schema does not match this binary; nothing was done',
+): ErrUnknownErrorName {
+  return errUnknownErrorName(ERR_SCHEMA_MISMATCH_NAME, description)
 }
 
 /**

@@ -9,12 +9,23 @@
  * (`tests/test-helpers/agent-director-stub.ts`) take the words from here
  * (SRJ-1303), and the error classifier (`src/ad-error-class.ts`; b.jg5
  * SRJ-104) matches `UNUSABLE_RECORDED_NAME_PHRASE` from here; later Epics
- * (E11, E13, E28) will match the others from here too.
+ * (E11, E13, E20, E28) will match the others from here too.
  *
- * This module holds words only. It defines no order in which the CONFLICT
- * case words are checked; that order (b.jg5 SRJ-507) belongs to the code that
- * resolves a CONFLICT case, and the order of the declarations below means
- * nothing.
+ * The CONFLICT case words number nine (b.jg5 SRJ-507), "another
+ * agent-director store" among them. The other description words below (the
+ * plain spawn's label wordings, "the new row was ended", "nothing was written
+ * and no row was created", "the agent's pane was not adopted", "retry kill
+ * later", "never delete this row", "no kill was sent") are not case phrases:
+ * each rides beside a case phrase or on a kill failure.
+ *
+ * Besides words, this module holds one pattern and its one helper: the
+ * survivor-naming form of a kill failure (`SURVIVOR_PID_PATTERN`, b.jg5
+ * SRJ-702, SRJ-1303) and `survivorPids`, which lists the pids a description
+ * names in that form. No other module defines the form.
+ *
+ * It defines no order in which the CONFLICT case words are checked; that
+ * order (b.jg5 SRJ-507) belongs to the code that resolves a CONFLICT case, and
+ * the order of the declarations below means nothing.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -32,9 +43,6 @@ export const UNUSABLE_RECORDED_NAME_PHRASE = 'the recorded tmux session name'
 
 /** CONFLICT case "conflicting labels". */
 export const CONFLICT_CONFLICTING_LABELS_PHRASE = 'conflicting labels'
-
-/** CONFLICT case "no pane 0.0". */
-export const CONFLICT_NO_PANE_PHRASE = 'no pane 0.0'
 
 /** CONFLICT case "the agent's pane was not found". */
 export const CONFLICT_PANE_NOT_FOUND_PHRASE = "the agent's pane was not found"
@@ -57,12 +65,63 @@ export const CONFLICT_NO_VALID_ID_PHRASE = 'no valid instance id'
 /** CONFLICT case "a different instance id". */
 export const CONFLICT_DIFFERENT_ID_PHRASE = 'a different instance id'
 
+/** CONFLICT case "another agent-director store": the session's label was written by another store. */
+export const CONFLICT_ANOTHER_STORE_PHRASE = 'another agent-director store'
+
+// ---------------------------------------------------------------------------
+// Words beside a CONFLICT case phrase (b.jg5 SRJ-507, SRJ-1303; not case phrases)
+// ---------------------------------------------------------------------------
+
 /**
- * The plain spawn's extra wording beside "left over from an earlier life".
- * Not a case phrase: that description's case is "left over from an earlier
- * life".
+ * Written by a plain spawn beside "left over from an earlier life" for the
+ * leftover it meets at "duplicate session". Not a case phrase: that
+ * description's case is "left over from an earlier life".
  */
 export const PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE = 'its label names this instance id'
+
+/** Written by a plain spawn beside "a different instance id" or "another agent-director store" for the holder it meets at "duplicate session". */
+export const PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE = 'its label does not name this instance id'
+
+/** Written by a plain spawn whose "duplicate session" refusal ended the new row. */
+export const NEW_ROW_ENDED_PHRASE = 'the new row was ended'
+
+/** Written by the pre-spawn scan's refusal, which leaves no row behind. */
+export const NOTHING_WRITTEN_PHRASE = 'nothing was written and no row was created'
+
+/** Written by the pane verbs beside "the agent's pane was not found" when a lost create reply's pane was not adopted. */
+export const PANE_NOT_ADOPTED_PHRASE = "the agent's pane was not adopted"
+
+/** Written by `kill` beside "not this launch's session" and "never reported in", and by a kill failure that sent none. */
+export const NO_KILL_SENT_PHRASE = 'no kill was sent'
+
+// ---------------------------------------------------------------------------
+// Kill failure (b.jg5 SRJ-702, SRJ-1303)
+// ---------------------------------------------------------------------------
+
+/** Written by `kill` in every `ErrTmuxKillFailed` description. */
+export const RETRY_KILL_LATER_PHRASE = 'retry kill later'
+
+/** Written by `kill` in every `ErrTmuxKillFailed` description. */
+export const NEVER_DELETE_ROW_PHRASE = 'never delete this row'
+
+/**
+ * The survivor-naming form (b.jg5 SRJ-702, SRJ-1303): the word "pid", a
+ * space, then a number. An `ErrTmuxKillFailed` description that matches names
+ * a process of the labelled session's panes that outlived the kill. It has no
+ * `g` flag, so `.test()` keeps no state between calls. The form is a working
+ * default, to be checked against the release candidate's kill-failure
+ * descriptions.
+ */
+export const SURVIVOR_PID_PATTERN = /\bpid (\d+)/
+
+/**
+ * Every pid `description` names in the survivor-naming form, in the order it
+ * names them; empty when it names none.
+ */
+export function survivorPids(description: string): number[] {
+  const everyMatch = new RegExp(SURVIVOR_PID_PATTERN.source, 'g')
+  return Array.from(description.matchAll(everyMatch), (match) => Number(match[1]))
+}
 
 // ---------------------------------------------------------------------------
 // Different tmux server (b.jg5 E11)

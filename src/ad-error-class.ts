@@ -7,9 +7,10 @@
  *
  *   GONE            ErrTmuxSendKeys, ErrTmuxCaptureFailed
  *   UNAVAILABLE     ErrTmuxUnresponsive, ErrTmuxKillFailed, ErrCallTimeout;
- *                   an ErrUnknownErrorName whose `unknownName` is neither
- *                   ErrInternal nor ErrConfigMalformed (a Phase 1 name
- *                   included); an AgentDirectorError whose `errName` is
+ *                   an ErrUnknownErrorName whose `unknownName` is none of
+ *                   ErrInternal, ErrConfigMalformed, ErrSchemaMismatch,
+ *                   ErrSchemaMigrationRequired and ErrStoreOpen (a Phase 1
+ *                   name included); an AgentDirectorError whose `errName` is
  *                   UnknownError (CSCB's own wrapper); any value that is not
  *                   an AgentDirectorError
  *   CONFLICT        ErrTmuxSessionConflict
@@ -24,18 +25,23 @@
  *                   ErrJsonlNeverWritten, ErrInvalidFlags (its meaning is set
  *                   per call site)
  *   DIRECTORY       ErrCwdNotFound, ErrCwdNotADirectory
- *   UNCLASSIFIED    every other ErrInternal, ErrSystemInstallDisappeared and
- *                   every other agent-director error name
+ *   UNCLASSIFIED    every other ErrInternal; ErrSchemaMismatch,
+ *                   ErrSchemaMigrationRequired and ErrStoreOpen (a store
+ *                   agent-director cannot open, A-32);
+ *                   ErrSystemInstallDisappeared and every other
+ *                   agent-director error name
  *
  * Recognition is by name (b.jg5 SRJ-101 interim rule): the value's `errName`,
  * and for an `ErrUnknownErrorName` its `unknownName` and the envelope's
  * `err_description`; never the value's `name`. The three Phase-1-only names
- * come from `src/agent-director-errors.ts` as strings, and nothing here
- * imports their classes, which the branch's 0.10.0 client lacks. Only the
- * base `AgentDirectorError` is tested by class. `ErrInternal` and
- * `ErrConfigMalformed` arrive as `ErrUnknownErrorName`; a value whose own
- * `errName` is one of them is classified the same way, its description taken
- * from `errDescription` (Assumption A-13).
+ * and the three store-open names come from `src/agent-director-errors.ts` as
+ * strings, and nothing here imports the Phase-1-only classes, which the
+ * branch's 0.10.0 client lacks. Only the base `AgentDirectorError` is tested
+ * by class. `ErrInternal`, `ErrConfigMalformed` and the three store-open names
+ * arrive as `ErrUnknownErrorName`, matched exactly (a differently cased name
+ * is any other name); a value whose own `errName` is one of them is
+ * classified the same way, its description taken from `errDescription`
+ * (Assumption A-13).
  *
  * An UNCLASSIFIED, UNUSABLE_NAME or CONFIG classification carries the
  * reported name (`unknownName` for an `ErrUnknownErrorName`, else `errName`)
@@ -74,6 +80,7 @@ import {
   ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
+  STORE_OPEN_ERR_NAMES,
 } from './agent-director-errors.ts'
 import { isSafeIdentifier, renderLogMessageText } from './persona-connection-errors.ts'
 
@@ -132,6 +139,9 @@ const ERR_INTERNAL_NAME = 'ErrInternal'
 /** `unknownName` of a malformed agent-director config (no class in any client). */
 const ERR_CONFIG_MALFORMED_NAME = 'ErrConfigMalformed'
 
+/** `unknownName`s of a store agent-director cannot open (A-32; Q-15): UNCLASSIFIED. */
+const STORE_OPEN_NAMES: ReadonlySet<unknown> = new Set<unknown>(STORE_OPEN_ERR_NAMES)
+
 /** `errName` of CSCB's own wrapper around a thrown value that was not an agent-director error. */
 export const CSCB_UNKNOWN_ERROR_NAME = 'UnknownError'
 
@@ -140,9 +150,9 @@ const ERR_INVALID_FLAGS_NAME = 'ErrInvalidFlags'
 
 /**
  * The class of each agent-director error name the table names directly.
- * `ErrInternal`, `ErrConfigMalformed`, `ErrUnknownErrorName` and CSCB's
- * `UnknownError` are decided in {@link classifyAdError}; any other name is
- * UNCLASSIFIED.
+ * `ErrInternal`, `ErrConfigMalformed`, the three store-open names,
+ * `ErrUnknownErrorName` and CSCB's `UnknownError` are decided in
+ * {@link classifyAdError}; any other name is UNCLASSIFIED.
  */
 const CLASS_BY_ERR_NAME: ReadonlyMap<string, AdErrorClass> = new Map<string, AdErrorClass>([
   ['ErrTmuxSendKeys', AD_ERROR_CLASS_GONE],
@@ -199,7 +209,7 @@ export function classifyAdError(value: unknown): AdErrorClassification {
     if (errName === ERR_UNKNOWN_ERROR_NAME) {
       return classifyUnknownName(readProp(value, 'unknownName'), readProp(readProp(value, 'envelope'), 'err_description'))
     }
-    if (errName === ERR_INTERNAL_NAME || errName === ERR_CONFIG_MALFORMED_NAME) {
+    if (errName === ERR_INTERNAL_NAME || errName === ERR_CONFIG_MALFORMED_NAME || STORE_OPEN_NAMES.has(errName)) {
       return classifyUnknownName(errName, readProp(value, 'errDescription'))
     }
     if (errName === CSCB_UNKNOWN_ERROR_NAME) return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
@@ -245,6 +255,7 @@ function classifyUnknownName(unknownName: unknown, description: unknown): AdErro
     return reported(unusable ? AD_ERROR_CLASS_UNUSABLE_NAME : AD_ERROR_CLASS_UNCLASSIFIED, unknownName, description)
   }
   if (unknownName === ERR_CONFIG_MALFORMED_NAME) return reported(AD_ERROR_CLASS_CONFIG, unknownName, description)
+  if (STORE_OPEN_NAMES.has(unknownName)) return reported(AD_ERROR_CLASS_UNCLASSIFIED, unknownName, description)
   return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
 }
 
