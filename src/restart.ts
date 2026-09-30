@@ -207,10 +207,11 @@ export interface RestartDeps {
    * The per-persona lifecycle serializer's `run` (b.av2 SR-6.6,
    * `persona-serializer.ts`): a fired timer's work (every check, the probe,
    * reconnect, kill and launch), and a retry entry's work with its in-flight
-   * check first, is submitted through it, so it starts only after every
-   * operation already submitted for the persona has settled.
-   * Scheduling, backoff, the cap, the `activeLaunches` guard and the
-   * human-trigger clamp are not serialized. Without it the work runs at once.
+   * check and then the restart cap first, is submitted through it, so it
+   * starts only after every operation already submitted for the persona has
+   * settled. Scheduling, backoff, the cap (apart from the retry entry's own
+   * check), the `activeLaunches` guard and the human-trigger clamp are not
+   * serialized. Without it the work runs at once.
    * Production passes the server's one shared serializer.
    */
   serialize?: PersonaSerialize

@@ -70,8 +70,10 @@
  * `armPendingOnly` sets it `pending`. A `stop` answer may carry a hand-off,
  * run once, awaited, after the stop. A pending-only retry's stop that rests
  * on its row read (`yieldsToFullMode`) is not taken when `arm` recorded a
- * cause during the run: it counts as `again` in full mode, with no hand-off
- * (as `mayTakeSwitch` keeps a full-mode cause from being dropped).
+ * cause during the run: it counts as `again` in full mode (as `mayTakeSwitch`
+ * keeps a full-mode cause from being dropped), with no hand-off unless a
+ * condition end deferred to that run then stops the timer (the hand-off then
+ * runs after that stop).
  *
  * UNAVAILABLE is never a failure here: the restart module's per-persona
  * failure counter and cap latch (`backoff.ts`) are neither read nor written,
@@ -141,7 +143,8 @@
  * Either stop yields to a cause `arm` recorded during the retry (another
  * attempt for the persona met UNAVAILABLE meanwhile): the timer stays armed
  * in full mode and re-arms at the next wait, naming that cause, and the
- * hand-off is not run.
+ * hand-off is not run, unless a condition end deferred to that run then
+ * stops the timer (the hand-off then runs after that stop).
  * A read error is a `status` error inside the attempt: it arms the timer
  * with its cause, which promotes it to full mode, and the retry counts as
  * `again`.
