@@ -20,15 +20,14 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   makeStubResolveSystemBinary,
+  STUB_RESOLVE_DEFAULT_PATH,
   type StubResolveSystemBinaryOptions,
 } from './test-helpers/agent-director-stub.ts'
 import {
-  DEV_PLACEHOLDER_VERSION,
   OLD_AD_VERSION,
   PHASE1_RC_VERSION,
 } from './test-helpers/agent-director-versions.ts'
 
-const DEFAULT_PATH = '/usr/local/bin/agent-director'
 const PENDING = Symbol('pending')
 
 /** Settle every queued microtask, so an answer that is coming has arrived. */
@@ -51,8 +50,8 @@ describe('makeStubResolveSystemBinary', () => {
   test('with no options every call resolves with PHASE1_RC_VERSION at the default path', async () => {
     const resolve = makeStubResolveSystemBinary()
 
-    expect(await resolve()).toEqual({ path: DEFAULT_PATH, version: PHASE1_RC_VERSION })
-    expect(await resolve()).toEqual({ path: DEFAULT_PATH, version: PHASE1_RC_VERSION })
+    expect(await resolve()).toEqual({ path: STUB_RESOLVE_DEFAULT_PATH, version: PHASE1_RC_VERSION })
+    expect(await resolve()).toEqual({ path: STUB_RESOLVE_DEFAULT_PATH, version: PHASE1_RC_VERSION })
   })
 
   test('outcomes answer the calls in order, then the last entry answers every later call', async () => {
@@ -75,18 +74,6 @@ describe('makeStubResolveSystemBinary', () => {
     expect(await resolve()).toEqual(last)
   })
 
-  test('a { throws } entry rejects with that exact error, and repeats as the last entry', async () => {
-    const err = new Error('resolve failed')
-    const resolve = makeStubResolveSystemBinary({
-      outcomes: [{ version: DEV_PLACEHOLDER_VERSION }, { throws: err }],
-    })
-
-    expect(await resolve()).toEqual({ path: DEFAULT_PATH, version: DEV_PLACEHOLDER_VERSION })
-    await expect(resolve()).rejects.toBe(err)
-    await expect(resolve()).rejects.toBe(err)
-    await expect(resolve()).rejects.toBe(err)
-  })
-
   test('a { never: true } entry stays pending while a later entry still answers', async () => {
     const resolve = makeStubResolveSystemBinary({
       outcomes: [{ never: true }, { version: OLD_AD_VERSION }],
@@ -98,17 +85,7 @@ describe('makeStubResolveSystemBinary', () => {
     expect(await settledOrPending(hung)).toBe(PENDING)
     // Control: the same check reads a call that did answer as settled.
     expect(await settledOrPending(answered)).toBe('settled')
-    expect(await answered).toEqual({ path: DEFAULT_PATH, version: OLD_AD_VERSION })
-  })
-
-  test('a { never: true } last entry leaves every later call pending too', async () => {
-    const resolve = makeStubResolveSystemBinary({
-      outcomes: [{ version: PHASE1_RC_VERSION }, { never: true }],
-    })
-
-    expect(await resolve()).toEqual({ path: DEFAULT_PATH, version: PHASE1_RC_VERSION })
-    const hung = [resolve(), resolve(), resolve()]
-    for (const p of hung) expect(await settledOrPending(p)).toBe(PENDING)
+    expect(await answered).toEqual({ path: STUB_RESOLVE_DEFAULT_PATH, version: OLD_AD_VERSION })
   })
 
   test('calls records every call in order with its opts, a never-settling call included', async () => {

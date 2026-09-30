@@ -16,7 +16,10 @@
  *   code, then calls `exit(exitCode)`, once;
  * - the timer handle is unref'd when it has an `unref` (the real timers do;
  *   a fake clock's handle may not), so the deadline never keeps alive a
- *   process that would otherwise exit;
+ *   process that would otherwise exit. Such an exit (a shutdown hung on a
+ *   promise with no open handle behind it) carries code 0 unless the caller
+ *   has set `process.exitCode`; `main()`'s re-check stop sets it to the same
+ *   code before it runs the shutdown;
  * - cancel clears the timer; it is idempotent, and a cancel after expiry does
  *   nothing.
  *
@@ -30,7 +33,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
+import type { PersonaConnectionClock } from './persona-connections.ts'
 
 /**
  * The time from the start of a shutdown to the fallback exit: 30 s, the CLI
@@ -44,6 +47,12 @@ export const SHUTDOWN_DEADLINE_MS = 30_000
 
 /** The timers the deadline arms (the shared fake clock satisfies it in tests). */
 export type ShutdownDeadlineClock = Pick<PersonaConnectionClock, 'setTimeout' | 'clearTimeout'>
+
+/** The real timers. */
+const REAL_TIMER_CLOCK: ShutdownDeadlineClock = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+}
 
 /** Dependencies of {@link armShutdownDeadline}. */
 export interface ShutdownDeadlineDeps {
@@ -81,7 +90,7 @@ function unrefHandle(handle: unknown): void {
 
 /** Arm the fallback exit; see the module comment. Returns its cancel function. */
 export function armShutdownDeadline(deps: ShutdownDeadlineDeps): CancelShutdownDeadline {
-  const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
+  const clock = deps.clock ?? REAL_TIMER_CLOCK
   const deadlineMs = deps.deadlineMs ?? SHUTDOWN_DEADLINE_MS
   let settled = false
 

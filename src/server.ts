@@ -789,7 +789,8 @@ let cronScheduler: CronScheduler | null = null
  * as it is, and an apply already under way is not awaited. A second call
  * while one runs is a no-op. Its awaits have no deadline of their own; a
  * re-check stop is bounded by the deadline `main()` arms before calling it
- * (`shutdown-deadline.ts`).
+ * (`shutdown-deadline.ts`), and exits with its code even when the process
+ * runs out of work first, because that stop sets `process.exitCode`.
  */
 async function shutdown(reason: string, exitCode = 0): Promise<void> {
   if (shuttingDown) return
@@ -1378,15 +1379,22 @@ export async function main(): Promise<void> {
   //
   // b.jg5 SRJ-204: once the gate passes, and before the PID check or any
   // Slack connection, the runtime version re-check is installed from the
-  // gate's result, in the statement right after the gate. Its first re-check runs one interval later, on its own
-  // timer, whatever health_check_interval is (0 included), in dry run too.
-  // Its baseline is the version the gate read. A re-check that refuses the
-  // binary records one startup-errors entry, then runs shutdown() with a
-  // non-zero exit code; a shutdown already running makes that a no-op, and a
-  // rejected shutdown still exits non-zero. shutdown() disposes it. No outside
-  // party ends such a stop (the CLI's SIGKILL follows only its own stop), so
-  // an unref'd deadline (shutdown-deadline.ts) is armed first: a shutdown
-  // that hangs still exits with the same non-zero code (b.jg5 SRJ-205).
+  // gate's result, in the statement right after the gate. Its first re-check
+  // runs one interval later, on its own timer, whatever health_check_interval
+  // is (0 included), in dry run too. Its baseline is the version the gate
+  // read. A re-check that refuses the binary records one startup-errors
+  // entry, then runs shutdown() with a non-zero exit code; shutdown()
+  // disposes the re-check before its first await, so no stop reaches a
+  // shutdown already running, and a rejected shutdown still exits non-zero.
+  // No outside party ends such a stop (the CLI's SIGKILL follows only its own
+  // stop), so the stop first arms an unref'd deadline (shutdown-deadline.ts)
+  // and sets process.exitCode to its code: a shutdown that hangs with a
+  // handle still open is ended by the deadline, and one that hangs with no
+  // handle open lets the process run out of work and exit on its own, with
+  // that same non-zero code (b.jg5 SRJ-205). The signals leave exitCode as
+  // it is. The stop can come while main() is still starting up; main()
+  // checks shuttingDown after its awaits and starts nothing more once a
+  // shutdown has begun.
   const startupGate = await runAgentDirectorStartupGate()
   installAdVersionRecheck({
     resolveSystemBinary,
@@ -1394,6 +1402,7 @@ export async function main(): Promise<void> {
     recordStartupError,
     stop: (exitCode) => {
       armShutdownDeadline({ exitCode, exit: process.exit.bind(process), log: (line) => console.error(line) })
+      process.exitCode = exitCode
       shutdown('the runtime version re-check refused the agent-director binary (see startup-errors.log)', exitCode)
         .catch(() => process.exit(exitCode))
     },
@@ -1503,6 +1512,10 @@ export async function main(): Promise<void> {
   // semantics. Fatal startup error on failure. A confirmed apply's step 5
   // refreshes its memory-read rules and keeps the rest of what this wrote.
   const installedTemplate = await installSlackChannelBotTemplate(personaConfig)
+  // A re-check stop may have begun a shutdown during the await above; it has
+  // already stopped what it found, so nothing more is started (no poller,
+  // no Bun.serve, no scheduler).
+  if (shuttingDown) return
 
   // Initialize message archive if configured. Name lookups run on the
   // receiving persona's own client (b.av2 SR-4.1).
@@ -1917,11 +1930,17 @@ export async function main(): Promise<void> {
   // server stays up. The pass is the reload controller's start bring-up
   // (startupSessionManager over the applied set and the bring-up controller),
   // so it runs exactly the applied persona set.
+  // No bring-up (no Slack connection, no launch) once a shutdown has begun.
+  if (shuttingDown) return
   try {
     await reload.runStartBringUp()
   } catch (err) {
     console.error(`[slack] Warning: session startup failed — continuing: ${describeThrownValue(err)}`)
   }
+
+  // shutdown() stops the health check and the detection tick; neither is
+  // started after it has begun.
+  if (shuttingDown) return
 
   // Initialize and start the health-check poller.
   initHealthCheck({

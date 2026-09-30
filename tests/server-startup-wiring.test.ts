@@ -62,9 +62,12 @@
  *   version, agent-director's `resolveSystemBinary` and `recordStartupError`;
  *   its stop first arms the shutdown deadline (`armShutdownDeadline`, with
  *   the stop's code, `process.exit` and no clock or deadline override; AC
- *   21), then runs `shutdown` with the code the re-check passes; `shutdown`
- *   disposes it, exits with its code (the signals pass none, so 0, and arm no
- *   deadline) and makes no agent-director call.
+ *   21) and sets `process.exitCode` to that code (nothing else in server.ts
+ *   names it), then runs `shutdown` with the code the re-check passes;
+ *   `shutdown` disposes it, exits with its code (the signals pass none, so 0,
+ *   and arm no deadline) and makes no agent-director call. main() returns
+ *   before `Bun.serve`, the start bring-up, the health check and the
+ *   detection tick when a shutdown began during an earlier await.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -413,6 +416,32 @@ describe('main() installs the runtime agent-director version re-check right afte
   /** A parameter name at the start of an arrow function: `(x) =>` or `x =>`. */
   const ARROW_PARAM = /^\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*=>/
 
+  /**
+   * Whether the code at `offset` in the block body `body` starts one of that
+   * block's own statements, run on every pass: inside no nested bracket, and
+   * not the brace-less body of an `if`, `else`, `while` or `for`. String and
+   * template literals are blanked first, so a bracket inside one (a log
+   * line's "(see …)") never counts.
+   */
+  function statementOfBlock(body: string, offset: number): boolean {
+    const code = body.replace(/'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`/g, (lit) => `"${' '.repeat(lit.length - 2)}"`)
+    const before = code.slice(0, offset)
+    let depth = 0
+    for (const ch of before) {
+      if ('({['.includes(ch)) depth++
+      else if (')}]'.includes(ch)) depth--
+    }
+    if (depth !== 0) return false
+    const prior = before.trimEnd()
+    if (/\belse$/.test(prior)) return false
+    if (!prior.endsWith(')')) return true
+    // After a `)`: refuse it when that closes a branch or loop header.
+    for (const header of indicesOf(/\b(?:if|while|for)\s*\(/g, prior)) {
+      if (balancedAfter(code, header, '(', ')')[1] === prior.length - 1) return false
+    }
+    return true
+  }
+
   /** The body text of `shutdown()` in server.ts. */
   const shutdownCode = (): string => SERVER_CODE.slice(...shutdownBody(SERVER_CODE))
 
@@ -529,6 +558,68 @@ describe('main() installs the runtime agent-director version re-check right afte
       expect([signal, indicesOf(/\barmShutdownDeadline\b/g, callArguments(SERVER_CODE, handlers[0]!))]).toEqual([signal, []])
     }
     expect(indicesOf(/\barmShutdownDeadline\b/g, shutdownCode())).toEqual([])
+  })
+
+  // A shutdown that hangs on a promise with no open handle behind it lets the
+  // process run out of work and exit on its own, before the unref'd deadline
+  // can fire; that exit carries `process.exitCode`. So the stop sets it to its
+  // own code before it runs shutdown, and nothing else in server.ts touches it
+  // (a signal's shutdown exits 0 through `shutdown`'s own exit).
+  test('its stop sets process.exitCode to the stop\'s exit code, as a statement of its body, before its shutdown call; nothing else in server.ts names process.exitCode', () => {
+    const exitCodeRefs = indicesOf(/\bprocess\s*\.\s*exitCode\b/g, SERVER_CODE)
+    expect(exitCodeRefs).toHaveLength(1)
+    const [argsStart, argsEnd] = balancedAfter(SERVER_CODE, onlyCallOf('installAdVersionRecheck'), '(', ')')
+    expect(exitCodeRefs[0]! > argsStart && exitCodeRefs[0]! < argsEnd).toBe(true)
+
+    const stop = onlyCallProps('installAdVersionRecheck').get('stop')
+    expect(stop).toBeDefined()
+    const code = stop!.match(ARROW_PARAM)![1]!
+    const [bodyStart, bodyEnd] = balancedAfter(stop!, stop!.indexOf('=>'), '{', '}')
+    const body = stop!.slice(bodyStart, bodyEnd)
+    const sets = [...body.matchAll(/\bprocess\s*\.\s*exitCode\s*=(?!=)\s*([^;\s]+)/g)]
+    expect(sets).toHaveLength(1)
+    expect(sets[0]![1]).toBe(code)
+    expect(statementOfBlock(body, sets[0]!.index!)).toBe(true)
+    const shutdowns = shutdownCallsIn(body)
+    expect(shutdowns).toHaveLength(1)
+    expect(sets[0]!.index!).toBeLessThan(shutdowns[0]!)
+
+    for (const signal of ['SIGTERM', 'SIGINT']) {
+      const handlers = indicesOf(new RegExp(`\\bprocess\\s*\\.\\s*(?:on|once)\\s*\\(\\s*['"]${signal}['"]`, 'g'), SERVER_CODE)
+      expect(handlers).toHaveLength(1)
+      expect([signal, indicesOf(/\bexitCode\b/g, callArguments(SERVER_CODE, handlers[0]!))]).toEqual([signal, []])
+    }
+    expect(indicesOf(/\bprocess\s*\.\s*exitCode\b/g, shutdownCode())).toEqual([])
+  })
+
+  // The stop can come while main() is still starting up (the re-check's
+  // timer is armed before the PID check). shutdown() stops what it finds, so
+  // main() must not start the HTTP server, the start bring-up, the health
+  // check or the detection tick once a shutdown has begun. main() can only
+  // observe that after it resumes from an await, so each of those calls needs
+  // an `if (shuttingDown) return` between the last await before it and the
+  // call. Every `await` in main()'s text counts, a closure's included, so the
+  // rule errs strict.
+  test.each<[string, (controller: string) => RegExp]>([
+    ['the HTTP server (Bun.serve)', () => /\bBun\s*\.\s*serve\s*\(/g],
+    ['the start bring-up (<controller>.runStartBringUp)', (controller) => new RegExp(`\\b${controller}\\s*\\.\\s*runStartBringUp\\s*\\(`, 'g')],
+    ['the health check (startHealthCheck)', () => /(?<![\w.$])startHealthCheck\s*\(/g],
+    ['the reload detection tick (<controller>.startDetection)', (controller) => new RegExp(`\\b${controller}\\s*\\.\\s*startDetection\\s*\\(`, 'g')],
+  ])('main() starts %s only if no shutdown has begun: an `if (shuttingDown) return` in main()\'s own statement list after the last await before the call', (_what, callPattern) => {
+    const [start, end] = mainBody(SERVER_CODE)
+    const calls = indicesOf(callPattern(startResolution(SERVER_CODE).controller), SERVER_CODE)
+    expect(calls).toHaveLength(1)
+    const at = calls[0]!
+    expect(at > start && at < end).toBe(true)
+    // The call's own `await`, when it has one, is not an await before it.
+    const own = SERVER_CODE.slice(start, at).match(/\bawait\s*$/)
+    const callStart = own ? at - own[0].length : at
+    const awaits = indicesOf(/\bawait\b/g, SERVER_CODE).filter((a) => a > start && a < callStart)
+    expect(awaits.length).toBeGreaterThan(0)
+    const lastAwait = awaits[awaits.length - 1]!
+    const guards = indicesOf(/\bif\s*\(\s*shuttingDown\s*\)\s*return\b/g, SERVER_CODE)
+      .filter((g) => g > lastAwait && g < callStart && atMainTopLevel(SERVER_CODE, g))
+    expect(guards.length).toBeGreaterThan(0)
   })
 
   test('shutdown disposes the re-check exactly once, with no argument, before its first await and before it exits', () => {

@@ -17,9 +17,10 @@
  * `Client.create()` and `resolveSystemBinary()` respectively, used to drive
  * the SR-5.1 startup gate's catch ladder for the three system-install errors
  * and the runtime version re-check. `makeStubResolveSystemBinary` resolves
- * with `PHASE1_RC_VERSION` by default, takes an ordered `outcomes` list (each
- * entry a version, an error to reject with, or a call that never settles;
- * the last entry repeats) and records every call in `calls`.
+ * with `PHASE1_RC_VERSION` at `STUB_RESOLVE_DEFAULT_PATH` by default, takes
+ * an ordered `outcomes` list (each entry a version, an error to reject with,
+ * or a call that never settles; the last entry repeats) and records every
+ * call in `calls`.
  *
  * The stub does NOT extend `Client` — instantiating the real class would call
  * Bun FFI. Instead it satisfies the structural-typed verb surface CSCB calls,
@@ -1116,13 +1117,13 @@ export function makeStubCreateClient(opts: StubCreateClientOptions = {}): (clien
 }
 
 /** The binary path a stub `resolveSystemBinary` resolves with by default. */
-const STUB_RESOLVE_DEFAULT_PATH = '/usr/local/bin/agent-director'
+export const STUB_RESOLVE_DEFAULT_PATH = '/usr/local/bin/agent-director'
 
 /**
  * One answer of a stub `resolveSystemBinary` call:
  *   - `{ version, path? }` resolves with that version, and with `path` or
  *     else the builder's `path` option (default
- *     '/usr/local/bin/agent-director');
+ *     {@link STUB_RESOLVE_DEFAULT_PATH});
  *   - `{ throws }` rejects with that error;
  *   - `{ never: true }` returns a promise that never settles.
  */
@@ -1142,7 +1143,7 @@ export interface StubResolveSystemBinaryOptions {
    */
   outcomes?: readonly StubResolveSystemBinaryOutcome[]
   /**
-   * Resolve with this binary path (default: '/usr/local/bin/agent-director').
+   * Resolve with this binary path (default: {@link STUB_RESOLVE_DEFAULT_PATH}).
    * With `outcomes`, the path of a `{ version }` entry that names none.
    */
   path?: string

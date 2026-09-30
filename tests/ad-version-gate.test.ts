@@ -35,12 +35,9 @@ import {
   AD_VERSION_RECHECK_STOP_EXIT_CODE,
   AD_VERSION_RECHECK_TIME_LIMIT_MS,
   buildAdVersionRecheckCouldNotRunLine,
-  buildBelowPhase1FloorMessage,
-  buildSystemInstallTooOldMessage,
   createAdVersionRecheck,
   decideAdVersionRecheckOutcome,
   disposeAdVersionRecheck,
-  FOUND_BY_RUNTIME_RECHECK,
   installAdVersionRecheck,
   meetsPhase1Floor,
   onAdVersionChanged,
@@ -81,7 +78,14 @@ import {
   OLD_AD_VERSION,
   PHASE1_RC_VERSION,
 } from './test-helpers/agent-director-versions.ts'
-import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
+import {
+  assertNoLeak,
+  BOT_TOKEN_PREFIX,
+  fakeToken,
+  LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
+  sentinelInMessage,
+} from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { STALE_VERSION } from './test-helpers/install-check-fixtures.ts'
 import { flat } from './test-helpers/markdown.ts'
@@ -537,6 +541,23 @@ describe('runtime re-check: a re-check that cannot run changes nothing', () => {
     expect(rig.stops).toHaveLength(0)
     expectNextRecheckArmed(rig)
   })
+
+  test.each([
+    ['a thrown string', sentinelInMessage('thrown-string')],
+    ['a thrown null', null],
+    ['a plain object with no name', { detail: LEAK_SENTINEL }],
+    ['an error whose errName is token-shaped', Object.assign(new Error('stub resolve failure'), { errName: fakeToken(BOT_TOKEN_PREFIX, 'errname') })],
+  ] as Array<[string, unknown]>)('a rejection with %s: could-not-run, one token-free line, one timer re-armed', async (_label, rejection) => {
+    const rig = makeRecheckRig({ resolveSystemBinary: () => Promise.reject(rejection) })
+    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(rig.events).toEqual(['call', 'tick'])
+    expect(rig.records).toHaveLength(0)
+    expect(rig.stops).toHaveLength(0)
+    expectNextRecheckArmed(rig)
+    expect(rig.logs).toHaveLength(1)
+    expect(rig.logs[0]!.startsWith(AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX)).toBe(true)
+    assertNoLeak(rig.logs, 'logs')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -544,7 +565,7 @@ describe('runtime re-check: a re-check that cannot run changes nothing', () => {
 // ---------------------------------------------------------------------------
 
 describe('runtime re-check: a stop happens once, record before stop', () => {
-  test('after a pass then a below-floor answer, further advances call nothing and record and stop are not called again', async () => {
+  test('after a pass then a below-floor answer, further advances call nothing and record and stop are not called again (no tick on the stopping re-check)', async () => {
     const rig = makeRecheckRig({ outcomes: [{ version: PHASE1_RC_VERSION }, { version: OLD_AD_VERSION, path: binaryPathFor('stop-once') }] })
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * 2)
     expect(rig.events).toEqual(['call', 'tick', 'call', 'record', 'stop'])
@@ -651,13 +672,20 @@ describe('runtime re-check: time limit', () => {
 // ---------------------------------------------------------------------------
 
 describe('runtime re-check: dispose', () => {
-  test('before any tick: nothing runs after any advance, dispose is idempotent and a later start arms nothing', async () => {
+  test.each([
+    ['before the first tick', 0, []],
+    ['after one tick', 1, ['call', 'tick']],
+  ] as Array<[string, number, RecheckEvent[]]>)('%s: nothing runs (no call, no tick) after any advance, dispose is idempotent and a later start arms nothing', async (_label, intervals, before) => {
     const rig = makeRecheckRig()
+    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * intervals)
+    expect(rig.events).toEqual(before)
     rig.recheck.dispose()
     expect(rig.clock.pendingCount()).toBe(0)
     rig.recheck.dispose()
+    rig.recheck.start()
+    expect(rig.clock.pendingCount()).toBe(0)
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * 5)
-    expect(rig.events).toEqual([])
+    expect(rig.events).toEqual(before)
     expect(rig.clock.pendingCount()).toBe(0)
   })
 
@@ -671,38 +699,54 @@ describe('runtime re-check: dispose', () => {
     expect(rig.events).toEqual([])
   })
 
-  test('during a call in flight: a later below-floor answer records, stops and ticks nothing, and no timer is left', async () => {
+  test.each([
+    ['timed', true],
+    ['triggered', false],
+  ])('during a %s call in flight: any waiter answers not-running before the call settles; the later below-floor answer records, stops, logs, ticks and signals nothing; no timer is left', async (label, timed) => {
     const answer = deferredAnswer()
     const rig = makeRecheckRig({ resolveSystemBinary: () => answer.promise })
-    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    const waiters: Array<ReturnType<AdVersionRecheck['trigger']>> = []
+    if (timed) await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    else waiters.push(rig.recheck.trigger())
+    const answers = trackAnswers(waiters)
     expect(rig.events).toEqual(['call'])
     rig.recheck.dispose()
     expect(rig.clock.pendingCount()).toBe(0)
-    answer.resolve({ version: OLD_AD_VERSION, path: binaryPathFor('disposed-in-flight') })
     await rig.clock.flush()
+    expect(answers).toEqual(waiters.map(() => NOT_RUNNING))
+    answer.resolve({ version: OLD_AD_VERSION, path: binaryPathFor(`disposed-${label}`) })
+    await rig.clock.flush()
+    expect(answers).toEqual(waiters.map(() => NOT_RUNNING))
+    expectNothingAfterTheCall(rig)
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * 3)
-    expect(rig.events).toEqual(['call'])
-    expect(rig.clock.pendingCount()).toBe(0)
+    expectNothingAfterTheCall(rig)
   })
 
-  test('a trigger joined to a timed check whose call never settles: dispose answers it not-running at once; nothing is re-armed and no tick runs', async () => {
+  test.each([
+    ['joined to a timed check', true, 1, 1],
+    ['two triggers', false, 2, 0],
+  ])('%s waiting on a call that never settles: dispose answers every waiter not-running at once, with no clock advance; nothing is re-armed, fired, logged, ticked or signalled, even well past the interval and the limit; a later trigger answers not-running without a call', async (_label, timed, triggers, firedBefore) => {
     const rig = makeRecheckRig({ outcomes: [{ never: true }] })
-    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
-    expect(rig.events).toEqual(['call'])
-    const answers = trackAnswers([rig.recheck.trigger()])
+    if (timed) {
+      await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+      expect(rig.events).toEqual(['call'])
+    }
+    const answers = trackAnswers(Array.from({ length: triggers }, () => rig.recheck.trigger()))
     expect(rig.callCount()).toBe(1)
     await rig.clock.flush()
-    expect(answers).toEqual([undefined])
+    expect(answers).toEqual(Array.from({ length: triggers }, () => undefined))
     const now = rig.clock.now()
-    const firedBefore = rig.clock.firedCount()
+    expect(rig.clock.firedCount()).toBe(firedBefore)
     rig.recheck.dispose()
     await rig.clock.flush()
-    expect(answers).toEqual([NOT_RUNNING])
+    expect(answers).toEqual(Array.from({ length: triggers }, () => NOT_RUNNING))
     expect(rig.clock.now()).toBe(now)
     expectNothingAfterTheCall(rig)
     await rig.clock.advance(WELL_PAST_INTERVAL_AND_LIMIT)
     expectNothingAfterTheCall(rig)
     expect(rig.clock.firedCount()).toBe(firedBefore)
+    expect(await rig.recheck.trigger()).toEqual(NOT_RUNNING)
+    expect(rig.callCount()).toBe(1)
   })
 })
 
@@ -727,32 +771,12 @@ describe('runtime re-check: tick hook', () => {
     expect(armedAtTick).toEqual([1, 1, 1])
   })
 
-  test('not on a stopping tick', async () => {
-    const rig = makeRecheckRig({ outcomes: [{ version: PHASE1_RC_VERSION }, { version: OLD_AD_VERSION, path: binaryPathFor('tick-stop') }] })
-    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * 2)
-    expect(rig.events).toEqual(['call', 'tick', 'call', 'record', 'stop'])
-    expect(rig.tickCount()).toBe(1)
-  })
-
-  test('not after dispose', async () => {
-    const rig = makeRecheckRig()
-    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
-    expect(rig.tickCount()).toBe(1)
-    rig.recheck.dispose()
-    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * 3)
-    expect(rig.tickCount()).toBe(1)
-  })
-
-  test('a throwing listener is logged once per tick, later listeners still run and the next tick still arms', async () => {
+  test.each([
+    ['throws', () => { throw new Error('stub listener failure') }],
+    ['rejects', () => Promise.reject(new Error('stub listener rejection'))],
+  ] as Array<[string, AdVersionRecheckTickListener]>)('a listener that %s is logged once per tick, later listeners still run and the next tick still arms', async (_label, failing) => {
     const after: number[] = []
-    const rig = makeRecheckRig({
-      tickListeners: [
-        () => {
-          throw new Error('stub listener failure')
-        },
-        () => { after.push(1) },
-      ],
-    })
+    const rig = makeRecheckRig({ tickListeners: [failing, () => { after.push(1) }] })
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     expect(rig.logs).toHaveLength(1)
     expect(after).toHaveLength(1)
@@ -761,13 +785,6 @@ describe('runtime re-check: tick hook', () => {
     expect(rig.callCount()).toBe(2)
     expect(rig.logs).toHaveLength(2)
     expect(after).toHaveLength(2)
-  })
-
-  test('a rejecting listener is logged once and the next tick still arms', async () => {
-    const rig = makeRecheckRig({ tickListeners: [() => Promise.reject(new Error('stub listener rejection'))] })
-    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
-    expect(rig.logs).toHaveLength(1)
-    expectNextRecheckArmed(rig)
     expect(rig.records).toHaveLength(0)
     expect(rig.stops).toHaveLength(0)
   })
@@ -811,7 +828,7 @@ describe('runtime re-check: module-level install, dispose and tick registration'
     expect(calls).toHaveLength(1)
   })
 
-  test('dispose clears the timer and is idempotent; an install after dispose is a logged no-op', async () => {
+  test('dispose clears the timer and is idempotent; the trigger then answers not-running and calls nothing; an install after dispose is a logged no-op', async () => {
     const clock = createFakeClock()
     const calls: Array<object | undefined> = []
     installAdVersionRecheck(installDeps(clock, [], calls))
@@ -823,6 +840,7 @@ describe('runtime re-check: module-level install, dispose and tick registration'
     expect(installAdVersionRecheck(installDeps(laterClock, laterLogs, calls))).toBeUndefined()
     expect(laterLogs).toHaveLength(1)
     expect(laterClock.pendingCount()).toBe(0)
+    expect(await triggerAdVersionRecheck()).toEqual(NOT_RUNNING)
     await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * 2)
     expect(calls).toHaveLength(0)
   })
@@ -1069,41 +1087,6 @@ describe('runtime re-check: trigger', () => {
     expect(rig.callCount()).toBe(0)
     expect(rig.clock.pendingCount()).toBe(0)
   })
-
-  test('dispose during a triggered call: the waiter answers not-running before the call settles; the later below-floor answer records, stops, logs and ticks nothing; no timer is left', async () => {
-    const answer = deferredAnswer()
-    const rig = makeRecheckRig({ resolveSystemBinary: () => answer.promise })
-    const answers = trackAnswers([rig.recheck.trigger()])
-    rig.recheck.dispose()
-    expect(rig.clock.pendingCount()).toBe(0)
-    await rig.clock.flush()
-    expect(answers).toEqual([NOT_RUNNING])
-    answer.resolve({ version: OLD_AD_VERSION, path: binaryPathFor('disposed-trigger') })
-    await rig.clock.flush()
-    expect(answers).toEqual([NOT_RUNNING])
-    expectNothingAfterTheCall(rig)
-    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * 2)
-    expectNothingAfterTheCall(rig)
-  })
-
-  test('dispose while two triggers wait on a call that never settles: both answer not-running at once, with no clock advance; nothing runs afterwards', async () => {
-    const rig = makeRecheckRig({ outcomes: [{ never: true }] })
-    const answers = trackAnswers([rig.recheck.trigger(), rig.recheck.trigger()])
-    expect(rig.callCount()).toBe(1)
-    await rig.clock.flush()
-    expect(answers).toEqual([undefined, undefined])
-    rig.recheck.dispose()
-    await rig.clock.flush()
-    expect(answers).toEqual([NOT_RUNNING, NOT_RUNNING])
-    expect(rig.clock.now()).toBe(0)
-    expect(rig.clock.firedCount()).toBe(0)
-    expectNothingAfterTheCall(rig)
-    await rig.clock.advance(WELL_PAST_INTERVAL_AND_LIMIT)
-    expectNothingAfterTheCall(rig)
-    expect(rig.clock.firedCount()).toBe(0)
-    expect(await rig.recheck.trigger()).toEqual(NOT_RUNNING)
-    expect(rig.callCount()).toBe(1)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1169,37 +1152,6 @@ describe('runtime re-check: module-level trigger and version-changed registratio
     expect(await triggerAdVersionRecheck()).toEqual({ kind: RECHECK_OUTCOME_NOT_RUNNING })
   })
 
-  test('after dispose, the trigger answers not-running and calls nothing', async () => {
-    const calls: Array<object | undefined> = []
-    installAdVersionRecheck(installDeps(createFakeClock(), [], calls))
-    disposeAdVersionRecheck()
-    expect(await triggerAdVersionRecheck()).toEqual({ kind: RECHECK_OUTCOME_NOT_RUNNING })
-    expect(calls).toHaveLength(0)
-  })
-
-  test('dispose while the trigger waits on a call that never settles: the trigger answers not-running at once; nothing is armed, logged or ticked afterwards', async () => {
-    const clock = createFakeClock()
-    const calls: Array<object | undefined> = []
-    const logs: string[] = []
-    const ticks: number[] = []
-    onAdVersionRecheckTick(() => { ticks.push(1) })
-    installAdVersionRecheck(installDeps(clock, logs, calls, [{ never: true }]))
-    const answers = trackAnswers([triggerAdVersionRecheck()])
-    expect(calls).toHaveLength(1)
-    await clock.flush()
-    expect(answers).toEqual([undefined])
-    disposeAdVersionRecheck()
-    await clock.flush()
-    expect(answers).toEqual([NOT_RUNNING])
-    expect(clock.now()).toBe(0)
-    expect(clock.pendingCount()).toBe(0)
-    await clock.advance(WELL_PAST_INTERVAL_AND_LIMIT)
-    expect(calls).toHaveLength(1)
-    expect(clock.firedCount()).toBe(0)
-    expect(logs).toEqual([])
-    expect(ticks).toEqual([])
-  })
-
   test('the trigger re-checks the installed re-check at once; listeners registered before or after install run in order; an unsubscribe removes only its own', async () => {
     const heard: Array<[string, string, string]> = []
     const unsubscribeA = onAdVersionChanged((previousVersion, newVersion) => { heard.push(['a', previousVersion, newVersion]) })
@@ -1216,41 +1168,6 @@ describe('runtime re-check: module-level trigger and version-changed registratio
     await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     expect(calls).toHaveLength(2)
     expect(heard).toEqual([['a', BASELINE_VERSION, LATER_PATCH], ['b', BASELINE_VERSION, LATER_PATCH], ['b', LATER_PATCH, LATER_MINOR]])
-  })
-
-  test('resetAdVersionRecheckForTests clears the version-changed and tick listeners: after it, a timed pass at a new version runs neither', async () => {
-    const heard: string[] = []
-    onAdVersionChanged(() => { heard.push('changed before reset') })
-    onAdVersionRecheckTick(() => { heard.push('tick before reset') })
-    resetAdVersionRecheckForTests()
-    const clock = createFakeClock()
-    const calls: Array<object | undefined> = []
-    const installed = installAdVersionRecheck(installDeps(clock, [], calls, [{ version: LATER_PATCH }]))
-    await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
-    expect(calls).toHaveLength(1)
-    expect(installed?.lastVersionSeen()).toBe(LATER_PATCH)
-    expect(heard).toEqual([])
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Runtime refusal messages (b.jg5 SRJ-205, SRJ-208, SRJ-1013)
-// ---------------------------------------------------------------------------
-
-describe('runtime refusal messages', () => {
-  const floorParts = { foundVersion: OLD_AD_VERSION, binaryPath: binaryPathFor('message-floor') }
-  const tooOldParts = { foundVersion: STALE_VERSION, requiredVersion: CLIENT_MIN_VERSION, binaryPath: binaryPathFor('message-too-old') }
-
-  test.each([
-    ['ad-below-phase1-floor', buildBelowPhase1FloorMessage(floorParts, FOUND_BY_RUNTIME_RECHECK), buildBelowPhase1FloorMessage(floorParts)],
-    ['ad-system-install-too-old', buildSystemInstallTooOldMessage(tooOldParts, FOUND_BY_RUNTIME_RECHECK), buildSystemInstallTooOldMessage(tooOldParts)],
-  ])('%s: the runtime form carries the runtime phrase and the startup (default) form does not', (_label, runtime, startup) => {
-    expect(runtime).toContain(RUNTIME_RECHECK_PHRASE)
-    expect(startup).not.toContain(RUNTIME_RECHECK_PHRASE)
-    for (const message of [runtime, startup]) {
-      expect(message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
-      expect(message).not.toContain(renderInstallSkillInstructions())
-    }
   })
 })
 

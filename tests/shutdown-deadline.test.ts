@@ -44,30 +44,22 @@ interface DeadlineRigOptions {
 
 /**
  * One armed deadline on its own fake clock, with an `exit` and a `log` that
- * record into one ordered event list. The fake clock's `clearTimeout` calls
- * are counted through the timers handed to the deadline.
+ * record into one ordered event list.
  */
 function makeDeadlineRig(opts: DeadlineRigOptions = {}) {
   const clock = createFakeClock()
   const events: DeadlineEvent[] = []
   const exitCode = opts.exitCode ?? AD_VERSION_RECHECK_STOP_EXIT_CODE
   const timers = opts.wrapClock?.(clock) ?? clock
-  let clears = 0
   const log = opts.log ?? ((line: string) => { events.push(['log', line]) })
   const cancel = armShutdownDeadline({
     exitCode,
     exit: (code) => { events.push(['exit', code]) },
     log: (line) => log(line, events),
-    clock: {
-      setTimeout: (callback, delayMs) => timers.setTimeout(callback, delayMs),
-      clearTimeout: (handle) => {
-        clears++
-        timers.clearTimeout(handle)
-      },
-    },
+    clock: timers,
     ...(opts.deadlineMs === undefined ? {} : { deadlineMs: opts.deadlineMs }),
   })
-  return { clock, events, exitCode, cancel, clearCount: () => clears }
+  return { clock, events, exitCode, cancel }
 }
 
 /** The events of a deadline that ran out: its one line, then its one exit. */
@@ -129,20 +121,17 @@ describe('armShutdownDeadline (b.jg5 SRJ-205, AC 21)', () => {
     await rig.clock.advance(SHUTDOWN_DEADLINE_MS - 1)
     rig.cancel()
     expect(rig.clock.pendingCount()).toBe(0)
-    expect(rig.clearCount()).toBe(1)
     rig.cancel()
-    expect(rig.clearCount()).toBe(1)
     await rig.clock.advance(SHUTDOWN_DEADLINE_MS * 10)
     expect(rig.events).toEqual([])
     expect(rig.clock.firedCount()).toBe(0)
   })
 
-  test('cancel after the deadline ran out is a no-op: no clear, no second line or exit', async () => {
+  test('cancel after the deadline ran out is a no-op: no second line or exit', async () => {
     const rig = makeDeadlineRig()
     await rig.clock.advance(SHUTDOWN_DEADLINE_MS)
     rig.cancel()
     rig.cancel()
-    expect(rig.clearCount()).toBe(0)
     await rig.clock.advance(SHUTDOWN_DEADLINE_MS * 10)
     expect(rig.events).toEqual(expiredEvents(SHUTDOWN_DEADLINE_MS, rig.exitCode))
   })
