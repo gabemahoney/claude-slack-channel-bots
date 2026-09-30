@@ -27,11 +27,18 @@
  * {@link decideAdVersionRecheckOutcome} maps the settled call to one outcome:
  * pass (the version becomes the last version seen), stop (below the floor or
  * unparseable: `ad-below-phase1-floor`; the client's too-old refusal:
- * `ad-system-install-too-old`) or could not run (nothing changes). A stop
+ * `ad-system-install-too-old`) or could not run (nothing changes; the first
+ * of each run of them writes one server-log line, b.jg5 SRJ-206). A stop
  * ends the chain, records one startup-errors entry and calls the stop
  * callback with {@link AD_VERSION_RECHECK_STOP_EXIT_CODE} (b.jg5 SRJ-205).
- * After each timed re-check that did not stop, the tick listeners run (the
- * hook agent-director's timing settings are re-read from; b.jg5 SRJ-209).
+ * After each timed re-check that did not stop, the tick listeners run
+ * (b.jg5 SRJ-209; no caller yet: E6 will re-read agent-director's timing
+ * settings from this hook).
+ * {@link triggerAdVersionRecheck} re-checks at once and answers with the
+ * outcome (b.jg5 SRJ-204; no caller yet: E4's classifier will route
+ * `ErrInvalidFlags` to it), and {@link onAdVersionChanged} listeners hear of
+ * each passing re-check whose version differs from the last version seen (no
+ * consumer yet: E23 will end `ErrInvalidFlags` holds on it, SRJ-207).
  * `main()` (`src/server.ts`) installs it through {@link installAdVersionRecheck}
  * right after the startup gate passes, and `shutdown()` disposes it through
  * {@link disposeAdVersionRecheck}.
@@ -43,7 +50,7 @@
  * `install-skill-pointer.ts`, which reads CSCB's own `package.json` once, at
  * its first render). Nothing is armed, read or logged at import or at
  * {@link createAdVersionRecheck}; the module-level state is a handle, a
- * disposed flag and the tick-listener registry, cleared by
+ * disposed flag and the tick- and version-changed-listener registries, cleared by
  * {@link resetAdVersionRecheckForTests}.
  *
  * Later Epics extend this module: E5 adds the host-version decision.
@@ -319,7 +326,7 @@ function thrownName(value: unknown): string | undefined {
 /** A path as one token-free line: token- and URL-like text redacted, line breaks collapsed. */
 function safePath(value: unknown): string {
   return typeof value === 'string' && value !== ''
-    ? redactSlackLogText(value).replace(/[\r\n]+/g, ' ')
+    ? redactSlackLogText(value).replace(/[\r\n\u2028\u2029]+/g, ' ')
     : UNKNOWN_FIELD
 }
 
@@ -427,6 +434,45 @@ export const AD_VERSION_RECHECK_TIME_LIMIT_MS = 30_000
 /** The exit code of a server stopped by the runtime re-check (b.jg5 SRJ-205). */
 export const AD_VERSION_RECHECK_STOP_EXIT_CODE = 1
 
+/**
+ * The start of the one server-log line a run of could-not-run re-checks
+ * writes (b.jg5 SRJ-206, SRJ-1014). {@link buildAdVersionRecheckCouldNotRunLine}
+ * builds the whole line.
+ */
+export const AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX =
+  '[slack] agent-director version re-check: the runtime re-check could not run: '
+
+/**
+ * The one server-log line written at the first could-not-run re-check after
+ * start or after a passing re-check (b.jg5 SRJ-206): it names the runtime
+ * re-check, the failure's token-free `description` (from
+ * {@link decideAdVersionRecheckOutcome}) and that the server keeps running and
+ * checks again at the next {@link AD_VERSION_RECHECK_INTERVAL_MS} re-check.
+ * Built from the description and fixed text only.
+ */
+export function buildAdVersionRecheckCouldNotRunLine(description: string): string {
+  return (
+    `${AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX}${description}; ` +
+    `the server keeps running and checks again at the next ${AD_VERSION_RECHECK_INTERVAL_MS / 1000} s re-check`
+  )
+}
+
+/** A trigger's answer when no re-check is running: none installed, not started, disposed or already stopped. */
+export const RECHECK_OUTCOME_NOT_RUNNING = 'not-running'
+
+/**
+ * What a triggered re-check answers (b.jg5 SRJ-204, SRJ-104, SRJ-207): the
+ * outcome it acted on (passed with the version, stopped, could not run), or
+ * {@link RECHECK_OUTCOME_NOT_RUNNING} when no call was made or, at once, when
+ * the re-check was disposed while the check it joined was in flight.
+ */
+export type AdVersionRecheckTriggerAnswer =
+  | AdVersionRecheckOutcome
+  | { readonly kind: typeof RECHECK_OUTCOME_NOT_RUNNING }
+
+/** The one not-running answer. */
+const NOT_RUNNING_ANSWER: AdVersionRecheckTriggerAnswer = Object.freeze({ kind: RECHECK_OUTCOME_NOT_RUNNING })
+
 /** The timers the re-check arms (the shared fake clock satisfies it in tests). */
 export type AdVersionRecheckClock = Pick<PersonaConnectionClock, 'setTimeout' | 'clearTimeout'>
 
@@ -441,6 +487,14 @@ const REAL_TIMER_CLOCK: AdVersionRecheckClock = {
  * Not awaited: a returned promise's rejection is logged.
  */
 export type AdVersionRecheckTickListener = () => void | Promise<void>
+
+/**
+ * Runs when a passing re-check (timed or triggered) finds a version that
+ * differs from the last version seen, with that previous version and the new
+ * one (b.jg5 SRJ-204's first row, SRJ-207). Not awaited: a returned promise's
+ * rejection is logged.
+ */
+export type AdVersionChangedListener = (previousVersion: string, newVersion: string) => void | Promise<void>
 
 /** Dependencies of {@link createAdVersionRecheck}. */
 export interface AdVersionRecheckDeps {
@@ -458,16 +512,30 @@ export interface AdVersionRecheckDeps {
   clock?: AdVersionRecheckClock
   /** The tick listeners, read at each tick; none by default. */
   tickListeners?: () => readonly AdVersionRecheckTickListener[]
+  /** The version-changed listeners, read at each version change; none by default. */
+  versionChangedListeners?: () => readonly AdVersionChangedListener[]
 }
 
 /** A runtime re-check built by {@link createAdVersionRecheck}. */
 export interface AdVersionRecheck {
   /** Arm the first re-check, one interval from now; runs nothing at once. Single-use. */
   start(): void
-  /** End the chain: clear every timer; a call in flight is never acted on. Idempotent. */
+  /**
+   * End the chain: clear every timer; a call in flight is never acted on and
+   * every trigger waiting on it answers {@link RECHECK_OUTCOME_NOT_RUNNING} at
+   * once, without waiting for the call. Idempotent.
+   */
   dispose(): void
   /** The version of the last passing re-check, else the baseline. */
   lastVersionSeen(): string
+  /**
+   * Re-check at once (b.jg5 SRJ-204) and answer with the outcome acted on.
+   * Joins a call in flight (timed or triggered) instead of making a second
+   * one; leaves the next timed re-check's due time alone; runs no tick
+   * listener. Answers {@link RECHECK_OUTCOME_NOT_RUNNING} with no call before
+   * `start`, after `dispose` or after a stop. Never rejects.
+   */
+  trigger(): Promise<AdVersionRecheckTriggerAnswer>
 }
 
 /** A timer handle, boxed so any value the clock returns (even `undefined`) is a handle. */
@@ -482,9 +550,26 @@ interface TimerBox {
  *   one call under {@link AD_VERSION_RECHECK_TIME_LIMIT_MS} and feeds
  *   {@link decideAdVersionRecheckOutcome}; the next is armed
  *   {@link AD_VERSION_RECHECK_INTERVAL_MS} after it ends, so one timer is
- *   pending between re-checks and two calls are never in flight.
- * - Pass: the version becomes the last version seen. Could not run: nothing
- *   changes and nothing is logged.
+ *   pending between re-checks and no two checks are acted on at once: at
+ *   most one call is awaited. A call past its time limit is abandoned (it
+ *   may still be running when a later check makes the next call) and its
+ *   answer is ignored.
+ * - `trigger` runs one re-check at once through the same call, decision,
+ *   failure run and stop path (b.jg5 SRJ-204). It and the timer share one
+ *   check in flight: a trigger during a timed or triggered check joins it,
+ *   and a timed re-check that comes due during a triggered check joins it
+ *   too (then arms the next and runs the tick listeners as usual). Either way
+ *   one call is made and its outcome is acted on once. A trigger never moves
+ *   the pending timer and runs no tick listener.
+ * - Pass: the failure run ends; when the version differs from the last
+ *   version seen, it becomes the last version seen and then each
+ *   version-changed listener runs once, in order, with the previous and the
+ *   new version (b.jg5 SRJ-207's signal); a listener that throws or rejects
+ *   is logged as one token-free line and the rest still run.
+ * - Could not run: nothing changes, except that the first one after start or
+ *   after a pass writes {@link buildAdVersionRecheckCouldNotRunLine} to the
+ *   server log (b.jg5 SRJ-206). The rest of the run write nothing. Never a
+ *   startup-errors entry.
  * - Stop: the chain ends, then `recordStartupError` is called once with the
  *   class and message, then `stop` once with
  *   {@link AD_VERSION_RECHECK_STOP_EXIT_CODE}. Nothing more runs.
@@ -499,9 +584,14 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
   let lastVersionSeen = deps.baselineVersion
   let started = false
   let ended = false
+  /** Set by the first could-not-run after start or after a pass; cleared by every pass (b.jg5 SRJ-206). */
+  let inFailureRun = false
   let timer: TimerBox | undefined
   let limitTimer: TimerBox | undefined
-  let inFlight: Promise<AdVersionRecheckCallResult> | undefined
+  /** The one check in flight (call, decision and action), shared by the timer and every trigger. */
+  let inFlight: Promise<AdVersionRecheckTriggerAnswer> | undefined
+  /** Answers the check in flight not-running at once; set while {@link inFlight} is. */
+  let answerInFlightNotRunning: (() => void) | undefined
 
   function log(line: string): void {
     try {
@@ -515,14 +605,21 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
     if (box !== undefined) clock.clearTimeout(box.handle)
   }
 
-  /** End the chain: no timer pending, no call in flight acted on, nothing re-armed. */
+  /**
+   * End the chain: no timer pending, nothing re-armed, and a check in flight
+   * answers not-running to every waiter at once, without waiting for its
+   * call, whose later answer is never acted on.
+   */
   function endChain(): void {
     ended = true
     clearTimer(timer)
     timer = undefined
     clearTimer(limitTimer)
     limitTimer = undefined
+    const answerNotRunning = answerInFlightNotRunning
     inFlight = undefined
+    answerInFlightNotRunning = undefined
+    answerNotRunning?.()
   }
 
   function arm(): void {
@@ -536,12 +633,14 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
   }
 
   /**
-   * The one `resolveSystemBinary()` call in flight, started if there is none,
-   * settled at the latest at the time limit. Never rejects.
+   * One `resolveSystemBinary()` call, settled at the latest at the time
+   * limit. Never rejects. Only {@link runCheck} calls it, so at most one call
+   * is awaited at a time. A call past its time limit is abandoned, not ended:
+   * it may still be running when a later check makes the next call, and its
+   * answer is ignored.
    */
   function callUnderTimeLimit(): Promise<AdVersionRecheckCallResult> {
-    if (inFlight !== undefined) return inFlight
-    const call = new Promise<AdVersionRecheckCallResult>((resolve) => {
+    return new Promise<AdVersionRecheckCallResult>((resolve) => {
       const box: TimerBox = { handle: undefined }
       let settled = false
       const finish = (result: AdVersionRecheckCallResult): void => {
@@ -551,7 +650,6 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
           limitTimer = undefined
           clock.clearTimeout(box.handle)
         }
-        if (inFlight === call) inFlight = undefined
         resolve(result)
       }
       limitTimer = box
@@ -570,8 +668,75 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
         (rejected: unknown) => finish({ kind: 'rejected', error: rejected }),
       )
     })
-    inFlight = call
-    return call
+  }
+
+  /**
+   * The check in flight, started if there is none: one call, then its
+   * outcome decided and acted on once. Answers not-running at once when the
+   * chain ends while the call runs (see {@link endChain}); the call's later
+   * answer is then ignored. Never rejects.
+   */
+  function runCheck(): Promise<AdVersionRecheckTriggerAnswer> {
+    if (inFlight !== undefined) return inFlight
+    let answer: (value: AdVersionRecheckTriggerAnswer) => void = () => {}
+    const check = new Promise<AdVersionRecheckTriggerAnswer>((resolve) => {
+      answer = resolve
+    })
+    inFlight = check
+    answerInFlightNotRunning = () => answer(NOT_RUNNING_ANSWER)
+    void callUnderTimeLimit().then((result) => {
+      if (inFlight === check) {
+        inFlight = undefined
+        answerInFlightNotRunning = undefined
+      }
+      if (ended) {
+        answer(NOT_RUNNING_ANSWER) // already answered by endChain; a no-op
+        return
+      }
+      const outcome = decideAdVersionRecheckOutcome(result)
+      actOnOutcome(outcome)
+      answer(outcome)
+    })
+    return check
+  }
+
+  /** Act on one decided outcome: pass, could not run or stop (see {@link createAdVersionRecheck}). Never throws. */
+  function actOnOutcome(outcome: AdVersionRecheckOutcome): void {
+    if (outcome.kind === RECHECK_OUTCOME_STOP) {
+      stopServer(outcome.classLabel, outcome.message)
+      return
+    }
+    if (outcome.kind === RECHECK_OUTCOME_COULD_NOT_RUN) {
+      if (inFailureRun) return
+      inFailureRun = true
+      log(buildAdVersionRecheckCouldNotRunLine(outcome.description))
+      return
+    }
+    inFailureRun = false
+    if (outcome.version === lastVersionSeen) return
+    const previousVersion = lastVersionSeen
+    lastVersionSeen = outcome.version
+    runVersionChangedListeners(previousVersion, outcome.version)
+  }
+
+  /** Log a version-changed listener that threw or rejected, as one token-free line. */
+  function logVersionChangedListenerFailure(err: unknown): void {
+    log(`[slack] agent-director version re-check: a version-changed listener failed: ${describeThrownValue(err)}; the re-check carries on`)
+  }
+
+  function runVersionChangedListeners(previousVersion: string, newVersion: string): void {
+    const listeners = deps.versionChangedListeners?.() ?? []
+    for (const listener of listeners) {
+      if (ended) return
+      try {
+        const returned = listener(previousVersion, newVersion)
+        if (returned !== undefined && typeof (returned as { then?: unknown }).then === 'function') {
+          ;(returned as Promise<void>).then(undefined, (err: unknown) => logVersionChangedListenerFailure(err))
+        }
+      } catch (err) {
+        logVersionChangedListenerFailure(err)
+      }
+    }
   }
 
   function stopServer(classLabel: AdVersionRecheckStopClass, message: string): void {
@@ -608,16 +773,13 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
     }
   }
 
-  /** One timed re-check, then the next arm and the tick listeners unless it stopped or was disposed. Never rejects. */
+  /**
+   * One timed re-check (joining a triggered check in flight), then the next
+   * arm and the tick listeners unless it stopped or was disposed. Never rejects.
+   */
   async function runTimedRecheck(): Promise<void> {
-    const result = await callUnderTimeLimit()
+    await runCheck()
     if (ended) return
-    const outcome = decideAdVersionRecheckOutcome(result)
-    if (outcome.kind === RECHECK_OUTCOME_STOP) {
-      stopServer(outcome.classLabel, outcome.message)
-      return
-    }
-    if (outcome.kind === RECHECK_OUTCOME_PASS) lastVersionSeen = outcome.version
     arm()
     runTickListeners()
   }
@@ -641,6 +803,10 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
     lastVersionSeen() {
       return lastVersionSeen
     },
+    trigger() {
+      if (!started || ended) return Promise.resolve(NOT_RUNNING_ANSWER)
+      return runCheck()
+    },
   }
 }
 
@@ -661,14 +827,22 @@ function registeredTickListeners(): readonly AdVersionRecheckTickListener[] {
   return [...tickListenerEntries].map((entry) => entry.listener)
 }
 
+/** Registered version-changed listeners, in registration order; one entry per registration. */
+const versionChangedListenerEntries = new Set<{ readonly listener: AdVersionChangedListener }>()
+
+function registeredVersionChangedListeners(): readonly AdVersionChangedListener[] {
+  return [...versionChangedListenerEntries].map((entry) => entry.listener)
+}
+
 /**
- * Build and start the server's runtime re-check with the registered tick
- * listeners (b.jg5 SRJ-204). `main()` calls it once, right after the startup
- * gate passes. A second install, or one after {@link disposeAdVersionRecheck},
- * is a logged no-op returning the installed handle (or `undefined`).
+ * Build and start the server's runtime re-check with the registered tick and
+ * version-changed listeners (b.jg5 SRJ-204). `main()` calls it once, right
+ * after the startup gate passes. A second install, or one after
+ * {@link disposeAdVersionRecheck}, is a logged no-op returning the installed
+ * handle (or `undefined`).
  */
 export function installAdVersionRecheck(
-  deps: Omit<AdVersionRecheckDeps, 'tickListeners'>,
+  deps: Omit<AdVersionRecheckDeps, 'tickListeners' | 'versionChangedListeners'>,
 ): AdVersionRecheck | undefined {
   if (recheckDisposed) {
     deps.log('[slack] agent-director version re-check: install after dispose — ignoring (the server is shutting down)')
@@ -678,7 +852,11 @@ export function installAdVersionRecheck(
     deps.log('[slack] agent-director version re-check: already installed — ignoring the second install')
     return installedRecheck
   }
-  const recheck = createAdVersionRecheck({ ...deps, tickListeners: registeredTickListeners })
+  const recheck = createAdVersionRecheck({
+    ...deps,
+    tickListeners: registeredTickListeners,
+    versionChangedListeners: registeredVersionChangedListeners,
+  })
   installedRecheck = recheck
   recheck.start()
   return recheck
@@ -686,8 +864,9 @@ export function installAdVersionRecheck(
 
 /**
  * Dispose the installed re-check (`shutdown()` calls it): its timers are
- * cleared, a call in flight is never acted on and no later install arms
- * anything. Idempotent; a no-op when nothing is installed.
+ * cleared, a call in flight is never acted on, a trigger waiting on it
+ * answers not-running at once and no later install arms anything.
+ * Idempotent; a no-op when nothing is installed.
  */
 export function disposeAdVersionRecheck(): void {
   recheckDisposed = true
@@ -696,7 +875,8 @@ export function disposeAdVersionRecheck(): void {
 
 /**
  * Register a listener run after each timed re-check that did not stop
- * (b.jg5 SRJ-209). Independent of install order. Returns its unsubscribe.
+ * (b.jg5 SRJ-209; no caller yet: E6 will re-read agent-director's timing
+ * settings from it). Independent of install order. Returns its unsubscribe.
  */
 export function onAdVersionRecheckTick(listener: AdVersionRecheckTickListener): () => void {
   const entry = { listener }
@@ -707,12 +887,44 @@ export function onAdVersionRecheckTick(listener: AdVersionRecheckTickListener): 
 }
 
 /**
- * @internal Test-only: dispose any installed re-check and clear the
- * module-level state (the handle, the disposed flag, every tick listener).
+ * Re-check the host binary at once on the installed re-check (b.jg5 SRJ-204;
+ * no caller yet: E4's classifier will route `ErrInvalidFlags` here, SRJ-104)
+ * and answer with the outcome it
+ * acted on: passed (with the version), stopped, could not run, or
+ * {@link RECHECK_OUTCOME_NOT_RUNNING} when none is installed, it was disposed
+ * or it already stopped. Joins a check in flight; leaves the 120 s timer's
+ * due time alone; runs no tick listener. Never throws or rejects.
+ */
+export function triggerAdVersionRecheck(): Promise<AdVersionRecheckTriggerAnswer> {
+  if (installedRecheck === undefined) return Promise.resolve(NOT_RUNNING_ANSWER)
+  return installedRecheck.trigger()
+}
+
+/**
+ * Register a listener run when a passing re-check (timed or triggered) finds
+ * a version that differs from the last version seen, with the previous and
+ * the new version (b.jg5 SRJ-204's first row; no consumer yet: E23 will end
+ * `ErrInvalidFlags` holds on it, SRJ-207).
+ * Listeners run in registration order. Independent of install order. Returns
+ * its unsubscribe.
+ */
+export function onAdVersionChanged(listener: AdVersionChangedListener): () => void {
+  const entry = { listener }
+  versionChangedListenerEntries.add(entry)
+  return () => {
+    versionChangedListenerEntries.delete(entry)
+  }
+}
+
+/**
+ * @internal Test-only: dispose any installed re-check (a trigger waiting on
+ * its check in flight answers not-running) and clear the module-level state
+ * (the handle, the disposed flag, every tick and version-changed listener).
  */
 export function resetAdVersionRecheckForTests(): void {
   installedRecheck?.dispose()
   installedRecheck = undefined
   recheckDisposed = false
   tickListenerEntries.clear()
+  versionChangedListenerEntries.clear()
 }
