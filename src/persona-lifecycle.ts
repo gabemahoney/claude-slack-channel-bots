@@ -33,9 +33,10 @@
  *      through `withOutageDetection`; a row already gone is success. Its
  *      outage flags are forgotten before these calls (so a success posts no
  *      all-clear) and again after them (so a flag a failing call raised does
- *      not survive). Its restart failure count, health-check streak and
+ *      not survive). Its restart failure count, health-check streak,
  *      not-connected episode (b.f2b: its notice latch and the restart path's
- *      idle evidence) are forgotten;
+ *      idle evidence) and notice episodes of every kind (b.jg5 SRJ-1016) are
+ *      forgotten, silently;
  *   8. its reply-guard record is deleted and its launched-with directory
  *      forgotten (read first), then the Stop-hook launch pass re-evaluates
  *      the persona's configured and launched-with directories against the
@@ -303,6 +304,12 @@ export interface PersonaLifecycleDeps {
    * again starts afresh. Production always passes it.
    */
   forgetNotConnectedEpisode?: (key: string) => void
+  /**
+   * End the key's notice episodes of every kind silently (b.jg5 SRJ-1016:
+   * the episodes instance's `forget`), run beside `forgetNotConnectedEpisode`
+   * after its launch in flight settled; other personas' episodes stay open.
+   */
+  forgetNoticeEpisodes: (key: string) => unknown
   /** Forget the keys' outage flags silently (`resetAllToHealthy`). */
   resetOutageState: (keys: string[]) => void
   /** Drop the key's tracked permission prompts and wedge state (`forgetPersonaPrompts`). */
@@ -530,6 +537,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     await step('forgetting its restart failure count', () => deps.forgetFailures(key))
     await step('forgetting its health-check streak', () => deps.forgetDisconnectedStreak(key))
     await step('forgetting its not-connected episode', () => deps.forgetNotConnectedEpisode?.(key))
+    await step('forgetting its notice episodes', () => deps.forgetNoticeEpisodes(key))
 
     // Read the launched-with dir before the teardown forgets it.
     let launchedWith: string | undefined

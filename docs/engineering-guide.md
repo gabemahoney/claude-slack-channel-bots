@@ -364,6 +364,17 @@ A persona's destination is its `permission_prompts` channel or its DM with `dm.c
 - **Keep it side-effect-free and cancel it at shutdown.** `server.ts` builds it at module scope with no Slack call and no timer; timers start only when a notice is held. `shutdown()` calls `personaDestinationHold.cancelAll()`. Code that removes a persona calls `cancel(key)` beside `personaDestinations.forget(key)`, as the persona teardown in `src/persona-lifecycle.ts` does.
 - **Don't log destination failures per attempt.** The hold logs one `persona-destination-failed` line when an episode starts and one when it clears; that is the diagnostic. A poster logs only a failure the hold doesn't retry: a payload error about the message itself (`MESSAGE_PAYLOAD_ERRORS`). Why: a retry every 300 s for days would otherwise flood the log, as for bring-up retries.
 
+### Latch a New Per-Persona Notice Kind in persona-episodes.ts
+
+A per-persona notice that posts once per episode keeps its latch in `src/persona-episodes.ts`, the server's one instance built in `main()`.
+
+- **Add a kind there, never a flag in the site module.** Declare a `PERSONA_EPISODE_KIND_*` label, add it to `PERSONA_EPISODE_KINDS`, and have the poster call `begin`, `post` and `end` on the instance it is handed. A kind with a case (a new case begins a new episode) passes it to `begin`; a kind with two texts gives each its own mark in `post`.
+- **It is not an `OutageClass`.** The classes in `src/outage-state.ts` are outage flags with their own onset and all-clear notices; a notice kind never becomes one.
+- **The not-connected reasons are the exception.** b.f2b's not-connected notices keep their one shared latch (`notConnectedNoticeRaised` in `src/session-manager.ts`, through `notifyPersonaNotConnected`); `persona-episodes.ts` neither reads nor writes it.
+- **Post through the instance, not the notifier.** Its sink is the persona notifier, so a notice still goes through the hold above.
+
+Why: one place begins, ends and forgets every episode, so a persona teardown forgets all of that persona's episodes in one step (`forgetNoticeEpisodes`) and shutdown forgets them all (`forgetAll()`), with no latch left in a site module to go stale or post for a torn-down persona.
+
 ### Report Delivery Failures Only to the Persona's Destination
 
 Report a message that couldn't be delivered (the lost-message notice) only to the persona's permission-prompt destination, through the notifier. Never post a server message in the conversation the message came from, channel or DM, to report a delivery failure. When that conversation is also the destination, the destination's one notice is the only post there; it goes there because it is the destination, never because the message came from there. Why: a persona may pass as a person in a shared channel, and a server message there would give it away. The rule binds future delivery or queueing work too (for example b.4vj, guaranteed inbound delivery): report saved, queued or undeliverable messages to the destination as well.

@@ -112,6 +112,7 @@ import {
   whenLaunchSettled,
 } from './session-manager.ts'
 import { createPersonaNotifier } from './persona-notifier.ts'
+import { createPersonaEpisodes, type PersonaEpisodes } from './persona-episodes.ts'
 import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
@@ -329,6 +330,12 @@ let bringUps: PersonaBringUpController | undefined
  * SRJ-305); built in main() before the start pass, closed on shutdown.
  */
 let unavailableRetry: UnavailableRetryController | undefined
+
+/**
+ * The per-persona notice episodes (b.jg5 SRJ-1016); built in main() before
+ * the start pass, every episode forgotten on shutdown.
+ */
+let personaEpisodes: PersonaEpisodes | undefined
 
 /** The manager's per-persona queries, answering nothing before main() builds it. */
 const connectionView: Pick<PersonaConnectionManager, 'status' | 'webClient' | 'identity'> = {
@@ -815,7 +822,7 @@ let cronScheduler: CronScheduler | null = null
  * timer the server runs (the permission poller, the health check, the
  * runtime version re-check, the reload detection tick, the cron scheduler,
  * restart, UNAVAILABLE retry, bring-up and destination-hold timers,
- * keep-alives), closes HTTP,
+ * keep-alives), forgets every persona's notice episodes, closes HTTP,
  * the MCP transports and the persona Slack connections, releases the
  * agent-director client handle, removes the PID file and exits with
  * `exitCode`. It makes no agent-director call: every worker and row is left
@@ -845,6 +852,8 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // armed again (a launch still in flight that meets UNAVAILABLE arms
   // nothing), so no retry is pending after this and none fires.
   unavailableRetry?.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+  // b.jg5 SRJ-1016: every persona's notice episodes end silently.
+  personaEpisodes?.forgetAll()
   // Every persona's bring-up retry (directory re-checks); the manager's Slack
   // retries stop with stopAll() below.
   bringUps?.cancelAll()
@@ -1757,6 +1766,18 @@ export async function main(): Promise<void> {
   // cron scheduler's start() is the ONLY caller of ensure-exists, wired after
   // Bun.serve() below.
 
+  // b.jg5 SRJ-1016: the one set of per-persona notice episodes, on the system
+  // clock, built before the retry controller and the start pass, so every
+  // poster reaches it from the first launch. Its posts go through the persona
+  // notifier. A teardown forgets the key's episodes and shutdown forgets all.
+  const noticeEpisodes = createPersonaEpisodes({
+    sink: (key, text) => {
+      void personaNotifier.notify(key, text)
+    },
+    log: (line) => console.error(line),
+  })
+  personaEpisodes = noticeEpisodes
+
   // b.jg5 SRJ-301, SRJ-303, SRJ-305: one UNAVAILABLE retry controller, on the
   // system clock, installed below as the outage state's trigger sink before
   // the start pass (whose launches are the first attempts that can arm it).
@@ -1889,6 +1910,7 @@ export async function main(): Promise<void> {
     forgetFailures,
     forgetDisconnectedStreak,
     forgetNotConnectedEpisode,
+    forgetNoticeEpisodes: (key) => noticeEpisodes.forget(key),
     resetOutageState: resetAllToHealthy,
     forgetPersonaPrompts,
     forgetAcks: forgetPersonaAcks,

@@ -487,7 +487,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     ])
     // Functions and objects with a parameter name of the source's choosing.
     // (`templateRefresh` is pinned in the test after this one.)
-    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopRetryTimer']
+    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopRetryTimer', 'forgetNoticeEpisodes']
     expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
     for (const [dep, value] of expected) expect([dep, props.get(dep)]).toEqual([dep, value])
 
@@ -511,6 +511,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       runPersonaStorageCheck: './jsonl-persistence-check.ts',
       createUnavailableRetryController: './unavailable-retry.ts',
       UNAVAILABLE_RETRY_STOP_TORN_DOWN: './unavailable-retry.ts',
+      createPersonaEpisodes: './persona-episodes.ts',
     }
     for (const [name, module] of Object.entries(imports)) {
       expect([name, importSource(SERVER_CODE, name)]).toEqual([name, module])
@@ -561,6 +562,19 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     )
     expect(stopRetry).not.toBeNull()
     expect(stopRetry![2]).toBe(stopRetry![1])
+
+    // b.jg5 SRJ-1016: the teardown silently forgets the key's notice
+    // episodes on the server's one episodes instance (its shutdown wiring is
+    // pinned in tests/server-startup-wiring.test.ts): not a stub, not another
+    // instance or module's forget, not a local shadow of the instance, and
+    // never every persona's episodes.
+    const noticeEpisodes = constOf('createPersonaEpisodes')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${noticeEpisodes}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+    const forgetEpisodes = (props.get('forgetNoticeEpisodes') ?? '').match(
+      new RegExp(`^\\(?(\\w+)\\)? => ${noticeEpisodes}\\.forget\\((\\w+)\\)$`),
+    )
+    expect(forgetEpisodes).not.toBeNull()
+    expect(forgetEpisodes![2]).toBe(forgetEpisodes![1])
 
     // The storage check at apply posts through the persona notifier.
     const storage = (props.get('storageCheck') ?? '').match(new RegExp(`^\\(?(\\w+)\\)? => runPersonaStorageCheck\\((\\w+), ${notifier}\\.notify\\)$`))

@@ -14,6 +14,8 @@
  *   (`resetAllToHealthy`) and the real notifier, destination resolver and
  *   destination hold (`makeNotifierHarness`, fake clock);
  * - the ack-reaction entries: the real ack tracker's `forgetPersonaAcks`;
+ * - the notice episodes (b.jg5 SRJ-1016): a real `createPersonaEpisodes`
+ *   instance on a fake clock, its `forget` as `forgetNoticeEpisodes`;
  * - serialization behind a restart: the real restart module
  *   (`initRestart` with `serialize`, real `cancelRestartTimer`). Its timer is
  *   a real `setTimeout` (1 ms here; it takes no fake clock), waited for by a
@@ -57,6 +59,7 @@ import {
 } from '../src/persona-bringup-controller.ts'
 import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
 import { credentialsDigest, readCredentialsFile } from '../src/persona-credentials.ts'
+import { createPersonaEpisodes, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE, PERSONA_EPISODE_KINDS } from '../src/persona-episodes.ts'
 import {
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
@@ -168,7 +171,7 @@ type DepName =
   | 'whenLaunchSettled' | 'connections.stop'
   | 'routing.forget' | 'forgetAcks' | 'destinations.forget' | 'destinationHold.cancel' | 'notifier.forget' | 'forgetPersonaPrompts'
   | 'dropSession' | 'resetOutageState' | 'killInstance' | 'deleteInstance' | 'forgetFailures'
-  | 'forgetDisconnectedStreak' | 'forgetNotConnectedEpisode' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
+  | 'forgetDisconnectedStreak' | 'forgetNotConnectedEpisode' | 'forgetNoticeEpisodes' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
   | 'storageCheck' | 'launch' | 'connections.reconnectCredentials' | 'connections.replaceRetryTokens'
 
 /** Dependencies whose production form returns a promise: their failure is a rejection, the others' a throw. */
@@ -308,6 +311,7 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
     forgetFailures: rec('forgetFailures', byKey, () => undefined),
     forgetDisconnectedStreak: rec('forgetDisconnectedStreak', byKey, () => undefined),
     forgetNotConnectedEpisode: rec('forgetNotConnectedEpisode', byKey, () => undefined),
+    forgetNoticeEpisodes: rec('forgetNoticeEpisodes', byKey, () => undefined),
     resetOutageState: rec('resetOutageState', (keys: string[]) => keys.join(','), () => undefined),
     forgetPersonaPrompts: rec('forgetPersonaPrompts', byKey, () => 0),
     dropSession: rec('dropSession', byKey, async () => false),
@@ -354,7 +358,7 @@ function teardownTurnTrail(p: Persona, launchPass: string): string[] {
     `connections.stop:${k}`, `routing.forget:${k}`, `forgetAcks:${k}`, `destinations.forget:${k}`, `destinationHold.cancel:${k}`,
     `notifier.forget:${k}`, `forgetPersonaPrompts:${k}`, `dropSession:${k}`,
     `resetOutageState:${k}`, `killInstance:${k}`, `deleteInstance:${k}`, `resetOutageState:${k}`,
-    `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`, `forgetNotConnectedEpisode:${k}`,
+    `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`, `forgetNotConnectedEpisode:${k}`, `forgetNoticeEpisodes:${k}`,
     `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPass}`,
   ]
 }
@@ -540,6 +544,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['forgetFailures', 'forgetting its restart failure count', 1],
     ['forgetDisconnectedStreak', 'forgetting its health-check streak', 1],
     ['forgetNotConnectedEpisode', 'forgetting its not-connected episode', 1],
+    ['forgetNoticeEpisodes', 'forgetting its notice episodes', 1],
     ['replyGuard.launchedWithDir', 'reading its launched-with directory', 1],
     ['replyGuard.teardown', 'deleting its reply-guard record', 1],
     ['replyGuard.launchPass', 're-evaluating the Stop hook in its config directories', 1],
@@ -566,14 +571,14 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
       'bringUps.cancel', 'cancelRestartTimer', 'stopRetryTimer', 'cancelLaunchWait', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
       'forgetAcks', 'destinations.forget', 'destinationHold.cancel', 'notifier.forget', 'forgetPersonaPrompts', 'dropSession',
       'resetOutageState', 'killInstance', 'deleteInstance', 'forgetFailures', 'forgetDisconnectedStreak', 'forgetNotConnectedEpisode',
-      'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
+      'forgetNoticeEpisodes', 'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
     ]
     const f = makeFixture({ fail: all })
 
     await f.lifecycle.teardown(f.b)
 
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 23 failed step(s)`)
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 24 failed step(s)`)
     assertNoLeak({ lines: f.lines })
   })
 
@@ -619,6 +624,68 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(consumeAck(b, 'D0BETADM01', '1700000000.000200')).toBe(false)
     expect(consumeAck(a, 'C0SHARED01', '1700000000.000100')).toBe(true)
     expect(consumeAck(a, 'C0ALPHA001', '1700000000.000300')).toBe(true)
+  })
+
+  // Rows: how forgetting B's notice episodes fails (the step's production form returns nothing, but a rejection is awaited too).
+  test.each<['throws' | 'rejects']>([['throws'], ['rejects']])('b.jg5 SRJ-1016: forgetting B\'s notice episodes %s: its step is logged token-safely by its own phrase, every other step still runs, and the teardown completes with one failed step', async (how) => {
+    const f = makeFixture({
+      overrides: {
+        forgetNoticeEpisodes: (key) => {
+          f.trail.push(`forgetNoticeEpisodes:${key}`)
+          if (how === 'rejects') return Promise.reject(failure())
+          throw failure()
+        },
+      },
+    })
+
+    await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
+
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.lines.slice(1)).toEqual([
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: forgetting its notice episodes failed: Error`)}( |$)`)),
+      `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
+    ])
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test('b.jg5 SRJ-1016: over the real notice episodes, tearing B down ends every kind\'s episode of B silently (nothing posted or logged), so B added again begins afresh, and leaves A\'s episodes and posted marks untouched', async () => {
+    const clock = createFakeClock()
+    const posts: Array<{ key: string; text: string }> = []
+    const episodeLogs: string[] = []
+    const episodes = createPersonaEpisodes({
+      sink: (key, text) => void posts.push({ key, text }),
+      log: (line) => void episodeLogs.push(line),
+      clock,
+    })
+    const f = makeFixture({ overrides: { forgetNoticeEpisodes: (key) => episodes.forget(key) } })
+    const [a, b] = [f.a.key, f.b.key]
+    for (const kind of PERSONA_EPISODE_KINDS) {
+      episodes.begin(a, kind, 'case-1')
+      episodes.begin(b, kind, 'case-1')
+    }
+    expect(episodes.post(a, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE, 'alpha notice')).toBe(true)
+    expect(episodes.post(b, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE, 'beta notice')).toBe(true)
+    const aViews = PERSONA_EPISODE_KINDS.map((kind) => episodes.view(a, kind))
+    const postsBefore = posts.length
+
+    await f.lifecycle.teardown(f.b)
+    await flush()
+
+    // Every other step still ran, in order (the real forget records no trail entry).
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => c !== `forgetNoticeEpisodes:${b}`))
+    expect(f.lines).toEqual([`${teardownPrefix(f.b)}: starting`, `${teardownPrefix(f.b)}: complete`])
+    expect(posts.length).toBe(postsBefore)
+    expect(episodeLogs).toEqual([])
+    for (const kind of PERSONA_EPISODE_KINDS) expect(episodes.isOpen(b, kind)).toBe(false)
+    expect(PERSONA_EPISODE_KINDS.map((kind) => episodes.view(a, kind))).toEqual(aViews)
+    expect(episodes.hasPosted(a, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE)).toBe(true)
+    expect(episodes.post(a, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE, 'alpha notice')).toBe(false)
+
+    // B added again: its first episode of the kind begins afresh and posts again.
+    expect(episodes.begin(b, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE, 'case-1')).toBe('begun')
+    expect(episodes.post(b, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE, 'beta notice')).toBe(true)
+    expect(posts.slice(postsBefore)).toEqual([{ key: b, text: 'beta notice' }])
+    expect(clock.pendingCount()).toBe(0)
   })
 })
 
@@ -864,8 +931,9 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
 
     const id = personaInstanceId(r.f.b.key)
     expect(r.adOrder).toEqual([`kill:${id}`, `delete:${id}`])
-    expect(r.f.trail.slice(-6)).toEqual([
+    expect(r.f.trail.slice(-7)).toEqual([
       `forgetFailures:${r.f.b.key}`, `forgetDisconnectedStreak:${r.f.b.key}`, `forgetNotConnectedEpisode:${r.f.b.key}`,
+      `forgetNoticeEpisodes:${r.f.b.key}`,
       `replyGuard.launchedWithDir:${r.f.b.key}`, `replyGuard.teardown:${r.f.b.key}`,
       `replyGuard.launchPass:${launchPassOf(r.f, undefined)}`,
     ])

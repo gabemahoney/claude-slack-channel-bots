@@ -852,7 +852,7 @@ export interface RealLifecycleComposition {
    * `'destinationHold.cancel'`, `'notifier.forget'`, `'forgetPersonaPrompts'`,
    * `'dropSession'`, `'resetOutageState'`, `'killInstance'`,
    * `'deleteInstance'`, `'forgetFailures'`, `'forgetDisconnectedStreak'`,
-   * `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
+   * `'forgetNoticeEpisodes'`, `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
    * `'replyGuard.launchPass'`, `'storageCheck'`, `'bringUps.bringUp'`,
    * `'bringUps.changeCredentials'`, `'connections.reconnectCredentials'`,
    * `'connections.replaceRetryTokens'`, `'launch'`) plus `'outage-notice'`
@@ -2239,6 +2239,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         stopRetryTimer: rec('stopRetryTimer'),
         forgetFailures: rec('forgetFailures'),
         forgetDisconnectedStreak: rec('forgetDisconnectedStreak'),
+        // A recording no-op: the run opens no notice episode.
+        forgetNoticeEpisodes: rec('forgetNoticeEpisodes'),
         resetOutageState: (keys) => {
           for (const key of keys) calls.push(['resetOutageState', key])
         },

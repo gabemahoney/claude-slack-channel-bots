@@ -95,8 +95,14 @@
  * - b.jg5 SRJ-314 / SRJ-115: the restart module's pending deferral
  *   (`deferPendingRow`) is bound to server.ts's one module-scope
  *   `deferPendingRow` (no import, local shadow or second declaration), passed
- *   the persona's key and the reading's `launchStartedAt`; the audit is shown
- *   to reject plausible wrong wirings.
+ *   the persona's key and the reading's `launchStartedAt`.
+ * - b.jg5 SRJ-1016: the one set of per-persona notice episodes is built once,
+ *   imported from the episodes module, in main()'s own statement list, before
+ *   the retry controller, the restart module, the start bring-up and the
+ *   health check, on the production clock, with the module-scope persona
+ *   notifier's `notify` as its sink, and held in the one module-scope handle
+ *   assigned in main(); shutdown forgets every episode once, through that
+ *   handle, before it first yields.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -142,6 +148,11 @@ import type * as AdStartupModule from '../src/agent-director-startup.ts'
 import type * as ServerModule from '../src/server.ts'
 import type { RestartDeps } from '../src/restart.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
+import type * as PersonaEpisodesModule from '../src/persona-episodes.ts'
+import type { PersonaEpisodes, PersonaEpisodesDeps } from '../src/persona-episodes.ts'
+import type * as PersonaConnectionsModule from '../src/persona-connections.ts'
+import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
+import type { PersonaNotifier } from '../src/persona-notifier.ts'
 
 const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url))
 const SERVER_PATH = join(SRC_DIR, 'server.ts')
@@ -1447,6 +1458,103 @@ describe('main() binds the restart module\'s pending deferral (deferPendingRow) 
     expect(importSource(SERVER_CODE, DEP)).toBeUndefined()
     expect(indicesOf(new RegExp(`\\b(?:function|const|let|var)\\s+${DEP}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
     expect(indicesOf(new RegExp(`^(?:export )?function ${DEP}\\(`, 'gm'), SERVER_CODE)).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-1016 — the one set of per-persona notice episodes
+//
+// The episodes' clock is optional (absent, the system clock) and any sink
+// type-checks, so a production wiring on a fake clock, with a sink that
+// bypasses the persona notifier, built twice (two latches for one episode),
+// behind a branch or after the start pass (a first launch's notice with no
+// latch to reach) would pass every behaviour suite. What the episodes do is
+// tested in tests/persona-episodes.test.ts and the teardown's forget in
+// tests/persona-lifecycle.test.ts and tests/reload-wiring.test.ts; pinned
+// here: the build, its dependencies and shutdown's forget-all.
+// ---------------------------------------------------------------------------
+
+describe('main() builds the one set of per-persona notice episodes before the start pass, on the production clock, with the persona notifier as its sink, and shutdown forgets them all (b.jg5 SRJ-1016)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
+  const SINK: keyof PersonaEpisodesDeps = 'sink'
+  const CLOCK: keyof PersonaEpisodesDeps = 'clock'
+  const FORGET_ALL: keyof PersonaEpisodes = 'forgetAll'
+  const SYSTEM_CLOCK: keyof typeof PersonaConnectionsModule = 'SYSTEM_PERSONA_CONNECTION_CLOCK'
+  const NOTIFIER_FACTORY: keyof typeof PersonaNotifierModule = 'createPersonaNotifier'
+  const NOTIFY: keyof PersonaNotifier = 'notify'
+
+  /** The one module-scope `let <handle>: PersonaEpisodes | undefined` shutdown reads. */
+  const HANDLE = /^let\s+(\w+)\s*:\s*PersonaEpisodes\s*\|\s*undefined\s*$/gm
+
+  test('the instance is built exactly once, in main()\'s own statement list (not at module scope, behind no branch), before the retry controller, initRestart, the start bring-up and initHealthCheck, and handed to the module-scope handle shutdown reads', () => {
+    const at = onlyCallOf(FACTORY)
+    const episodes = constOf(FACTORY)
+    const decl = SERVER_CODE.search(new RegExp(`\\bconst\\s+${episodes}\\s*=\\s*${FACTORY}\\s*\\(`))
+    expect(decl).toBeGreaterThan(-1)
+    expect(decl).toBeLessThan(at)
+    expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
+    expect(importSource(SERVER_CODE, FACTORY)).toBe('./persona-episodes.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+
+    // Before every poster can reach it: the retry controller (whose retries
+    // post), the restart module, the start bring-up (the first launches) and
+    // the health check.
+    const { bringUpAt } = startResolution(SERVER_CODE)
+    for (const later of [onlyCallOf('createUnavailableRetryController'), onlyCallOf('initRestart'), bringUpAt, onlyCallOf('initHealthCheck')]) {
+      expect(at).toBeLessThan(later)
+    }
+
+    // The one handle shutdown reads: a module-scope `let`, assigned only this
+    // instance, once, in main()'s own statement list, after it is built and
+    // before the start bring-up.
+    const handles = [...SERVER_CODE.matchAll(HANDLE)]
+    expect(handles).toHaveLength(1)
+    expect(insideMain(handles[0]!.index!)).toBe(false)
+    const assigned = assignmentsTo(handles[0]![1]!)
+    expect(assigned.map((a) => a.value)).toEqual([episodes])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+    expect(assigned[0]!.at).toBeGreaterThan(at)
+    expect(assigned[0]!.at).toBeLessThan(bringUpAt)
+  })
+
+  test('its clock is the production default and its sink is the module-scope persona notifier\'s notify', () => {
+    const props = onlyCallProps(FACTORY)
+
+    // The production clock: none given (the factory's default is the system
+    // clock), or the system clock by name.
+    const clock = props.get(CLOCK)
+    expect<Array<string | undefined>>([undefined, SYSTEM_CLOCK]).toContain(clock)
+    if (clock !== undefined) expect(importSource(SERVER_CODE, clock)).toBe('./persona-connections.ts')
+
+    // The one persona notifier, the module-scope const the outage state and
+    // the session manager's notices also go through; not a local of main().
+    const notifier = constOf(NOTIFIER_FACTORY)
+    expect(insideMain(onlyCallOf(NOTIFIER_FACTORY))).toBe(false)
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${notifier}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+
+    // `<notifier>.notify`, or `(key, text) => { void <notifier>.notify(key, text) }`
+    // or the same call as an expression body; the parameters' names are free.
+    const call = `(?:void )?${notifier}\\.${NOTIFY}\\(\\1, \\2\\)`
+    expect(props.get(SINK)).toMatch(new RegExp(`^(?:${notifier}\\.${NOTIFY}|\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call}))$`))
+  })
+
+  test('shutdown forgets every episode exactly once, through the handle, before it first yields', () => {
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const handle = SERVER_CODE.match(new RegExp(HANDLE.source, 'm'))![1]!
+
+    const forgets = indicesOf(new RegExp(`\\b${handle}\\s*\\?\\.\\s*${FORGET_ALL}\\s*\\(\\s*\\)`, 'g'), SERVER_CODE)
+    expect(forgets).toHaveLength(1)
+    const at = forgets[0]!
+    expect(at > start && at < end).toBe(true)
+    // No other forget-all anywhere in server.ts, through the handle or the instance.
+    const episodes = constOf(FACTORY)
+    expect(indicesOf(new RegExp(`\\b(?:${handle}|${episodes})\\s*[?!]?\\.\\s*${FORGET_ALL}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([at])
+
+    // Before shutdown first yields, so a stalled await never keeps an episode open.
+    const firstAwait = SERVER_CODE.slice(start, end).search(/\bawait\b/)
+    expect(firstAwait).toBeGreaterThan(-1)
+    expect(at).toBeLessThan(start + firstAwait)
   })
 })
 
