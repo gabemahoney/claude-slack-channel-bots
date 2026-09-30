@@ -2,33 +2,57 @@
  * dependency-check.test.ts — SR-5.1 startup-gate sub-case matrix.
  *
  * Exercises src/agent-director-startup.ts via the dep-injection seam — never
- * touches the real Bun FFI or the real ~/.agent-director/state.db. Covers:
+ * touches the real Bun FFI or the real ~/.agent-director/state.db, and never
+ * calls the production `createClient`. Covers:
  *
  *   1. ErrBunVersionTooOld at Client construction (Bun-version gate).
  *   2. ErrSystemInstallNotFound / ErrSystemInstallTooOld /
- *      ErrSystemInstallUnreachable from `Client.create` (AD 0.7.0 system-
- *      install discovery trio).
+ *      ErrSystemInstallUnreachable from `Client.create` (the client's
+ *      system-install discovery errors).
  *   3. Non-typed construct-step throws surface verbatim.
- *   4. API-surface probes (getPermission / error catalog / decide argv).
- *   5. Same-user mismatch on ~/.agent-director/state.db.
- *   6. Happy path: gate passes silently and installs the Client into the
+ *   4. CSCB's Phase 1 floor on the client's `binaryVersion` (b.jg5 SRJ-203,
+ *      SRJ-1513), the refusal kind every failure carries, and the
+ *      floor-exempt `skipPhase1Floor` option.
+ *   5. API-surface probes (getPermission / error catalog / decide argv).
+ *   6. Same-user mismatch on ~/.agent-director/state.db.
+ *   7. Happy path: gate passes silently and installs the Client into the
  *      module-level singleton via setClient(...).
+ *   8. `runAgentDirectorStartupGate`: one record call and one exit per
+ *      refusal, none on a pass.
+ *
+ * Every agent-director version comes from
+ * tests/test-helpers/agent-director-versions.ts (or `STALE_VERSION` from
+ * install-check-fixtures.ts); labels and kinds come from `src/`.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 
 import * as fs from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
   runStartupGate,
+  runAgentDirectorStartupGate,
   DEFAULT_STATE_DB_PATH,
+  REFUSAL_KIND_BELOW_PHASE1_FLOOR,
+  REFUSAL_KIND_CLIENT_TOO_OLD,
+  REFUSAL_KIND_OTHER,
 } from '../src/agent-director-startup.ts'
+import type { StartupGateDeps } from '../src/agent-director-startup.ts'
 import { getClient, resetClientForTests } from '../src/agent-director-client.ts'
-import { AD_SYSTEM_INSTALL_NOT_FOUND } from '../src/install-check.ts'
 import {
+  AD_BELOW_PHASE1_FLOOR,
+  AD_SYSTEM_INSTALL_NOT_FOUND,
+  AD_SYSTEM_INSTALL_TOO_OLD,
+} from '../src/install-check.ts'
+import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
+import { recordStartupError } from '../src/startup-errors.ts'
+import {
+  cannedVersion,
   errBunVersionTooOld,
   errSystemInstallNotFound,
   errSystemInstallTooOld,
@@ -36,6 +60,15 @@ import {
   makeStubClient,
   makeStubCreateClient,
 } from './test-helpers/agent-director-stub.ts'
+import type { StubClientOptions } from './test-helpers/agent-director-stub.ts'
+import {
+  CLIENT_MIN_VERSION,
+  DEV_PLACEHOLDER_VERSION,
+  DEV_UNPARSEABLE_VERSION,
+  OLD_AD_VERSION,
+  PHASE1_RC_VERSION,
+} from './test-helpers/agent-director-versions.ts'
+import { STALE_VERSION } from './test-helpers/install-check-fixtures.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers for SR-5.1 sub-cases
@@ -72,6 +105,34 @@ const passingProbes = {
   probeGetPermission: () => true,
   probeErrorCatalog: () => ({ ok: true as const }),
   probeDecideArgv: async () => ({ ok: true as const }),
+}
+
+/** The release after the floor's minor, built from the floor constant. */
+const LATER_RELEASE = (() => {
+  const [major, minor] = PHASE1_FLOOR_VERSION.split('.').map(Number)
+  return `${major}.${minor + 1}.0`
+})()
+
+/**
+ * Deps for a run that reaches the gate's end when nothing is overridden:
+ * a default stub (`PHASE1_RC_VERSION`), passing probes, ENOENT state.db,
+ * UID 1000. Each case overrides the step under test.
+ */
+function passingDeps(overrides: Partial<StartupGateDeps> = {}): Partial<StartupGateDeps> {
+  return {
+    createClient: makeStubCreateClient(),
+    ...passingProbes,
+    statSync: defaultStat,
+    geteuid: () => 1000,
+    recordStartupError: noopRecord,
+    exit: noopExit,
+    ...overrides,
+  }
+}
+
+/** A client factory resolving with a default stub reporting `binaryVersion`. */
+function clientAt(binaryVersion: string): StartupGateDeps['createClient'] {
+  return makeStubCreateClient({ client: makeStubClient({ binaryVersion }) })
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +179,7 @@ describe('SR-5.1: Client constructor failure modes', () => {
 
 describe('SR-5.1: same-user check', () => {
   test('UID mismatch → ok=false, classLabel=ad-same-user', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ client: stub }),
       ...passingProbes,
@@ -140,7 +201,7 @@ describe('SR-5.1: same-user check', () => {
   })
 
   test('ENOENT on state.db → silent pass (first-run case)', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ client: stub }),
       ...passingProbes,
@@ -153,7 +214,7 @@ describe('SR-5.1: same-user check', () => {
   })
 
   test('non-ENOENT stat error → ok=false, classLabel=ad-same-user-stat', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const eacces = (): { uid: number } => {
       const err: NodeJS.ErrnoException = new Error('EACCES')
       err.code = 'EACCES'
@@ -177,7 +238,7 @@ describe('SR-5.1: same-user check', () => {
   })
 
   test('geteuid undefined → defensive warning + pass (no exit)', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const warnings: { classLabel: string; message: string }[] = []
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ client: stub }),
@@ -200,7 +261,7 @@ describe('SR-5.1: same-user check', () => {
 
 describe('SR-5.1: happy path', () => {
   test('valid binary + ENOENT state.db → ok=true', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ client: stub }),
       ...passingProbes,
@@ -211,12 +272,12 @@ describe('SR-5.1: happy path', () => {
     })
     expect(outcome.ok).toBe(true)
     if (outcome.ok) {
-      expect(outcome.adVersion).toBe('0.7.0')
+      expect(outcome.adVersion).toBe(PHASE1_RC_VERSION)
     }
   })
 
   test('UID match on state.db → ok=true', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ client: stub }),
       ...passingProbes,
@@ -263,7 +324,7 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('probeGetPermission returns false → ad-shim-missing-get-permission', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
       probeGetPermission: () => false,
@@ -287,7 +348,7 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('probeErrorCatalog reports a single missing name → ad-shim-catalog-incomplete', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
       probeGetPermission: () => true,
@@ -306,7 +367,7 @@ describe('SR-5.1: API surface probes', () => {
   })
 
   test('probeErrorCatalog reports all three missing → message lists each', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const allMissing = ['ErrInvalidFlags', 'ErrPermissionRequestNotFound', 'ErrAmbiguousRequest']
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
@@ -328,7 +389,7 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('probeDecideArgv reports drop → ad-shim-decide-drops-token', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const detail = "dist (node_modules/agent-director/dist/index.js) does not include the literal '--request-token'"
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
@@ -352,7 +413,7 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('probe-1 failure short-circuits before probes 2 and 3', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const calls: string[] = []
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
@@ -374,7 +435,7 @@ describe('SR-5.1: API surface probes', () => {
   })
 
   test('probe-2 failure short-circuits before probe 3', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const calls: string[] = []
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
@@ -400,7 +461,7 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('probe-1 failure closes client exactly once', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     let closeCount = 0
     await runStartupGate({
       createClient: makeStubCreateClient({ client: stub }),
@@ -419,7 +480,7 @@ describe('SR-5.1: API surface probes', () => {
   })
 
   test('probe-2 failure closes client exactly once', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     let closeCount = 0
     await runStartupGate({
       createClient: makeStubCreateClient({ client: stub }),
@@ -438,7 +499,7 @@ describe('SR-5.1: API surface probes', () => {
   })
 
   test('probe-3 failure closes client exactly once', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     let closeCount = 0
     await runStartupGate({
       createClient: makeStubCreateClient({ client: stub }),
@@ -461,7 +522,7 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('all three probes pass + ENOENT state.db → ok=true', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
       probeGetPermission: () => true,
@@ -470,7 +531,7 @@ describe('SR-5.1: API surface probes', () => {
     })
     expect(outcome.ok).toBe(true)
     if (outcome.ok) {
-      expect(outcome.adVersion).toBe('0.7.0')
+      expect(outcome.adVersion).toBe(PHASE1_RC_VERSION)
     }
   })
 
@@ -512,7 +573,7 @@ describe('SR-5.1: API surface probes', () => {
   test.skipIf(!shimDecideDropsToken())(
     'production-default probeDecideArgv rejects stale shipped shim (FAILS-BEFORE-FIX)',
     async () => {
-      const stub = makeStubClient({ binaryVersion: '0.7.0' })
+      const stub = makeStubClient()
       const outcome = await runStartupGate({
         createClient: makeStubCreateClient({ client: stub }),
         statSync: defaultStat,
@@ -536,12 +597,12 @@ describe('SR-5.1: API surface probes', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-4.2 — AD 0.7.0 system-install discovery typed-error branches
+// SR-4.2 — system-install discovery typed-error branches
 // ---------------------------------------------------------------------------
 //
 // `Client.create()` (production) / `makeStubCreateClient(...)` (tests) is the
-// async factory that surfaces the three new typed errors introduced in AD
-// 0.7.0: ErrSystemInstallNotFound (no binary on PATH or in standard install
+// async factory that surfaces the client's three system-install typed
+// errors: ErrSystemInstallNotFound (no binary on PATH or in standard install
 // path), ErrSystemInstallTooOld (detected binary below floor), and
 // ErrSystemInstallUnreachable (binary exists but cannot be invoked
 // successfully — eight reason values). Each must surface as its own
@@ -568,7 +629,7 @@ describe('SR-4.2: system-install typed-error branches', () => {
 
   test('ErrSystemInstallTooOld → ad-system-install-too-old (message carries detected + required versions)', async () => {
     const outcome = await runStartupGate({
-      createClient: makeStubCreateClient({ error: errSystemInstallTooOld('0.5.0', '0.7.0') }),
+      createClient: makeStubCreateClient({ error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION) }),
       statSync: defaultStat,
       recordStartupError: noopRecord,
       exit: noopExit,
@@ -576,9 +637,9 @@ describe('SR-4.2: system-install typed-error branches', () => {
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
       expect(outcome.phase).toBe('construct')
-      expect(outcome.classLabel).toBe('ad-system-install-too-old')
-      expect(outcome.message).toContain('0.5.0')
-      expect(outcome.message).toContain('0.7.0')
+      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_TOO_OLD)
+      expect(outcome.message).toContain(STALE_VERSION)
+      expect(outcome.message).toContain(CLIENT_MIN_VERSION)
       // SR-4.5: appends the manual-skill-install instructions block.
       expect(outcome.message).toContain('skills/install-cscb/SKILL.md')
     }
@@ -725,7 +786,7 @@ describe('SR-4.1: async createClient injection', () => {
   })
 
   test('createClient is awaited exactly once on success', async () => {
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const calls: object[] = []
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ client: stub, calls }),
@@ -743,7 +804,7 @@ describe('SR-4.1: async createClient injection', () => {
     // Tag the stub with a sentinel field so we can prove identity-equality
     // against whatever getClient() returns post-gate. The structural-typed
     // StubClient permits extra fields at the use site.
-    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const stub = makeStubClient()
     const taggedStub = stub as typeof stub & { __sentinel: 'unique' }
     taggedStub.__sentinel = 'unique'
     const outcome = await runStartupGate({
@@ -761,7 +822,9 @@ describe('SR-4.1: async createClient injection', () => {
   })
 
   test('success-arm adVersion sourced from client.binaryVersion', async () => {
-    const stub = makeStubClient({ binaryVersion: '1.2.3' })
+    // A later release than the floor's candidate, so the pass-through value
+    // differs from the stub's default.
+    const stub = makeStubClient({ binaryVersion: LATER_RELEASE })
     const outcome = await runStartupGate({
       createClient: makeStubCreateClient({ client: stub }),
       ...passingProbes,
@@ -772,7 +835,7 @@ describe('SR-4.1: async createClient injection', () => {
     })
     expect(outcome.ok).toBe(true)
     if (outcome.ok) {
-      expect(outcome.adVersion).toBe('1.2.3')
+      expect(outcome.adVersion).toBe(LATER_RELEASE)
     }
   })
 
@@ -841,5 +904,293 @@ describe('SR-4.4 / Epic AC #7: non-TTY behavior identical to TTY', () => {
         writable: true,
       })
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-203 / SRJ-1513 — CSCB's Phase 1 floor in runStartupGate
+// ---------------------------------------------------------------------------
+//
+// The floor runs after construction, on the client's `binaryVersion`, and
+// before the client is installed as the singleton. The client's own too-old
+// refusal and its unparseable-version refusal stay construction failures with
+// their own labels and kinds.
+
+describe('b.jg5 SRJ-203 / SRJ-1513: Phase 1 floor in runStartupGate', () => {
+  beforeEach(() => {
+    resetClientForTests()
+  })
+
+  test.each([
+    {
+      name: 'OLD_AD_VERSION passes construction, fails the floor',
+      createClient: clientAt(OLD_AD_VERSION),
+      phase: 'version',
+      classLabel: AD_BELOW_PHASE1_FLOOR,
+      refusalKind: REFUSAL_KIND_BELOW_PHASE1_FLOOR,
+      named: [OLD_AD_VERSION, PHASE1_FLOOR_VERSION],
+    },
+    {
+      name: 'DEV_PLACEHOLDER_VERSION is refused by CSCB\'s own comparison',
+      createClient: clientAt(DEV_PLACEHOLDER_VERSION),
+      phase: 'version',
+      classLabel: AD_BELOW_PHASE1_FLOOR,
+      refusalKind: REFUSAL_KIND_BELOW_PHASE1_FLOOR,
+      named: [DEV_PLACEHOLDER_VERSION, PHASE1_FLOOR_VERSION],
+    },
+    {
+      name: 'the client\'s own too-old refusal',
+      createClient: makeStubCreateClient({ error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION) }),
+      phase: 'construct',
+      classLabel: AD_SYSTEM_INSTALL_TOO_OLD,
+      refusalKind: REFUSAL_KIND_CLIENT_TOO_OLD,
+      named: [STALE_VERSION, CLIENT_MIN_VERSION],
+    },
+    {
+      name: 'the client\'s unparseable-version refusal (DEV_UNPARSEABLE_VERSION)',
+      createClient: makeStubCreateClient({
+        error: errSystemInstallUnreachable('unparseable-version', DEV_UNPARSEABLE_VERSION),
+      }),
+      phase: 'construct',
+      classLabel: 'ad-system-install-unreachable',
+      refusalKind: REFUSAL_KIND_OTHER,
+      named: ['unparseable-version'],
+    },
+  ])('$name → label and refusal kind', async ({ createClient, phase, classLabel, refusalKind, named }) => {
+    const outcome = await runStartupGate(passingDeps({ createClient }))
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe(phase)
+      expect(outcome.classLabel).toBe(classLabel)
+      expect(outcome.refusalKind).toBe(refusalKind)
+      for (const text of named) {
+        expect(outcome.message).toContain(text)
+      }
+    }
+  })
+
+  test('floor refusal message names the binary path', async () => {
+    const binaryPath = '/opt/agent-director/bin/agent-director'
+    const stub = makeStubClient({ binaryVersion: OLD_AD_VERSION, binaryPath })
+    const outcome = await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ client: stub }) }))
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.message).toContain(binaryPath)
+    }
+  })
+
+  test('PHASE1_RC_VERSION passes and adVersion equals it', async () => {
+    const outcome = await runStartupGate(passingDeps({ createClient: clientAt(PHASE1_RC_VERSION) }))
+    expect(outcome.ok).toBe(true)
+    if (outcome.ok) {
+      expect(outcome.adVersion).toBe(PHASE1_RC_VERSION)
+    }
+  })
+
+  test('floor refusal: no probe, no stat, closeClient once, no singleton installed', async () => {
+    const stub = makeStubClient({ binaryVersion: OLD_AD_VERSION })
+    const calls: string[] = []
+    const closed: unknown[] = []
+    const outcome = await runStartupGate(passingDeps({
+      createClient: makeStubCreateClient({ client: stub }),
+      closeClient: (client) => { closed.push(client) },
+      probeGetPermission: () => { calls.push('p1'); return true },
+      probeErrorCatalog: () => { calls.push('p2'); return { ok: true } },
+      probeDecideArgv: async () => { calls.push('p3'); return { ok: true } },
+      statSync: () => { calls.push('stat'); return defaultStat() },
+    }))
+    expect(outcome.ok).toBe(false)
+    expect(calls).toEqual([])
+    expect(closed).toEqual([stub])
+    expect(() => getClient()).toThrow()
+  })
+
+  test('the floor reads binaryVersion, never version()', async () => {
+    const versionCalls: NonNullable<StubClientOptions['versionCalls']> = []
+    const stub = makeStubClient({
+      binaryVersion: OLD_AD_VERSION,
+      versionResult: cannedVersion(PHASE1_RC_VERSION),
+      versionCalls,
+    })
+    const outcome = await runStartupGate(passingDeps({ createClient: makeStubCreateClient({ client: stub }) }))
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.refusalKind).toBe(REFUSAL_KIND_BELOW_PHASE1_FLOOR)
+    }
+    expect(versionCalls).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-203 / SRJ-1513 — every other failure carries refusal kind `other`
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-203 / SRJ-1513: refusal kind of every other failure branch', () => {
+  beforeEach(() => {
+    resetClientForTests()
+  })
+
+  const eacces = (): { uid: number } => {
+    const err: NodeJS.ErrnoException = new Error('EACCES')
+    err.code = 'EACCES'
+    throw err
+  }
+
+  test.each<[string, Partial<StartupGateDeps>]>([
+    ['ad-bun-version-too-old', { createClient: makeStubCreateClient({ error: errBunVersionTooOld() }) }],
+    [AD_SYSTEM_INSTALL_NOT_FOUND, { createClient: makeStubCreateClient({ error: errSystemInstallNotFound() }) }],
+    ['ad-system-install-unreachable', { createClient: makeStubCreateClient({ error: errSystemInstallUnreachable() }) }],
+    ['ad-client-construct', { createClient: makeStubCreateClient({ error: new Error('boom') }) }],
+    ['ad-shim-missing-get-permission', { probeGetPermission: () => false }],
+    ['ad-shim-catalog-incomplete', { probeErrorCatalog: () => ({ ok: false, missing: ['ErrInvalidFlags'] }) }],
+    ['ad-shim-decide-drops-token', { probeDecideArgv: async () => ({ ok: false, detail: 'flag missing' }) }],
+    ['ad-same-user', { statSync: () => ({ uid: 7777 }) }],
+    ['ad-same-user-stat', { statSync: eacces }],
+  ])('%s → refusal kind other', async (classLabel, overrides) => {
+    const outcome = await runStartupGate(passingDeps(overrides))
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe(classLabel)
+      expect(outcome.refusalKind).toBe(REFUSAL_KIND_OTHER)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-203 / SRJ-1513 — the floor-exempt option
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-203 / SRJ-1513: skipPhase1Floor option', () => {
+  beforeEach(() => {
+    resetClientForTests()
+  })
+
+  test.each([OLD_AD_VERSION, DEV_PLACEHOLDER_VERSION])('with the option set, %s passes', async (version) => {
+    const outcome = await runStartupGate(passingDeps({ createClient: clientAt(version) }), { skipPhase1Floor: true })
+    expect(outcome.ok).toBe(true)
+    if (outcome.ok) {
+      expect(outcome.adVersion).toBe(version)
+    }
+  })
+
+  test('with the option set, the client\'s too-old refusal still fails with client-too-old', async () => {
+    const outcome = await runStartupGate(
+      passingDeps({ createClient: makeStubCreateClient({ error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION) }) }),
+      { skipPhase1Floor: true },
+    )
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_TOO_OLD)
+      expect(outcome.refusalKind).toBe(REFUSAL_KIND_CLIENT_TOO_OLD)
+    }
+  })
+
+  test('with the option set, a probe failure still fails', async () => {
+    const outcome = await runStartupGate(
+      passingDeps({ createClient: clientAt(OLD_AD_VERSION), probeGetPermission: () => false }),
+      { skipPhase1Floor: true },
+    )
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe('ad-shim-missing-get-permission')
+      expect(outcome.refusalKind).toBe(REFUSAL_KIND_OTHER)
+    }
+  })
+
+  test.each([
+    ['no options', undefined],
+    ['empty options', {}],
+    ['skipPhase1Floor false', { skipPhase1Floor: false }],
+  ])('without the option (%s) the floor applies', async (_label, options) => {
+    const outcome = await runStartupGate(passingDeps({ createClient: clientAt(OLD_AD_VERSION) }), options)
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.refusalKind).toBe(REFUSAL_KIND_BELOW_PHASE1_FLOOR)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-203 / SRJ-1513 — runAgentDirectorStartupGate records and exits
+// ---------------------------------------------------------------------------
+//
+// The wrapper always runs the floor. The exit hook throws to stop control,
+// as production's `process.exit` does.
+
+describe('b.jg5 SRJ-203 / SRJ-1513: runAgentDirectorStartupGate', () => {
+  class ExitCalled extends Error {
+    constructor(readonly code: number) {
+      super(`exit(${code})`)
+    }
+  }
+
+  let records: { classLabel: string; message: string }[]
+  let exits: number[]
+  let tempDirs: string[]
+
+  beforeEach(() => {
+    resetClientForTests()
+    records = []
+    exits = []
+    tempDirs = []
+  })
+
+  afterEach(() => {
+    for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  const capture: Pick<StartupGateDeps, 'recordStartupError' | 'exit'> = {
+    recordStartupError: (classLabel: string, message: string) => { records.push({ classLabel, message }) },
+    exit: (code: number) => {
+      exits.push(code)
+      throw new ExitCalled(code)
+    },
+  }
+
+  test('OLD_AD_VERSION → one record naming the floor label and both versions, one non-zero exit', async () => {
+    await expect(
+      runAgentDirectorStartupGate(passingDeps({ createClient: clientAt(OLD_AD_VERSION), ...capture })),
+    ).rejects.toBeInstanceOf(ExitCalled)
+    expect(records.length).toBe(1)
+    expect(records[0]!.classLabel).toBe(AD_BELOW_PHASE1_FLOOR)
+    expect(records[0]!.message).toContain(OLD_AD_VERSION)
+    expect(records[0]!.message).toContain(PHASE1_FLOOR_VERSION)
+    expect(exits.length).toBe(1)
+    expect(exits[0]).not.toBe(0)
+  })
+
+  test('client too old → one record with the too-old label', async () => {
+    await expect(
+      runAgentDirectorStartupGate(passingDeps({
+        createClient: makeStubCreateClient({ error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION) }),
+        ...capture,
+      })),
+    ).rejects.toBeInstanceOf(ExitCalled)
+    expect(records.map((r) => r.classLabel)).toEqual([AD_SYSTEM_INSTALL_TOO_OLD])
+    expect(exits.length).toBe(1)
+  })
+
+  test('PHASE1_RC_VERSION → no record, no exit', async () => {
+    const result = await runAgentDirectorStartupGate(passingDeps({ createClient: clientAt(PHASE1_RC_VERSION), ...capture }))
+    expect(result.adVersion).toBe(PHASE1_RC_VERSION)
+    expect(records).toEqual([])
+    expect(exits).toEqual([])
+  })
+
+  test('real recordStartupError writes one startup-errors.log entry with the floor label and both versions', async () => {
+    const logDir = fs.mkdtempSync(join(tmpdir(), 'cscb-dependency-check-'))
+    tempDirs.push(logDir)
+    await expect(
+      runAgentDirectorStartupGate(passingDeps({
+        createClient: clientAt(OLD_AD_VERSION),
+        recordStartupError: (classLabel, message) => recordStartupError(classLabel, message, undefined, { logDir }),
+        exit: capture.exit,
+      })),
+    ).rejects.toBeInstanceOf(ExitCalled)
+    const lines = fs.readFileSync(join(logDir, 'startup-errors.log'), 'utf-8').split('\n').filter((l) => l.length > 0)
+    expect(lines.length).toBe(1)
+    expect(lines[0]).toContain(`[${AD_BELOW_PHASE1_FLOOR}]`)
+    expect(lines[0]).toContain(OLD_AD_VERSION)
+    expect(lines[0]).toContain(PHASE1_FLOOR_VERSION)
   })
 })

@@ -51,6 +51,11 @@
  *   `onLeftUp` dropping the persona's registered session.
  * - SR-5.2: the file guard handed to the session tools protects every persona
  *   credentials file, as the reload controller lists them.
+ * - b.jg5 SRJ-203 (AC 20): the agent-director startup gate is called once,
+ *   awaited, with no argument, after only the directory creations and the
+ *   unhandledRejection install and before the PID check and every later step;
+ *   server.ts never names the gate's floor-exempt option, so its start always
+ *   runs the Phase 1 floor.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -76,6 +81,7 @@ import {
   indicesOf,
   insideMain as insideMainOf,
   loadedConfigName,
+  mainBody,
   objectProperties,
   onlyCallArguments,
   shutdownBody,
@@ -84,6 +90,7 @@ import {
   stripComments,
 } from './test-helpers/source-audit.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
+import type { StartupGateOptions } from '../src/agent-director-startup.ts'
 
 const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url))
 const SERVER_PATH = join(SRC_DIR, 'server.ts')
@@ -290,6 +297,71 @@ describe('main() installs the unhandledRejection handler before any persona conn
     const [install] = indicesOf(INSTALL, SERVER_CODE)
     expect(install).toBeDefined()
     expect(install!).toBeLessThan(onlyCallOf(anchor))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the agent-director startup gate runs first (b.jg5 SRJ-203)
+// ---------------------------------------------------------------------------
+
+describe('main() runs the agent-director startup gate before any other work, always with the Phase 1 floor (b.jg5 SRJ-203, AC 20)', () => {
+  /** The gate's floor-exempt option; typed against the gate's options, so a rename fails the typecheck. */
+  const FLOOR_EXEMPT_OPTION: keyof StartupGateOptions = 'skipPhase1Floor'
+
+  /** Offset of the only `runAgentDirectorStartupGate(` call; fails unless there is exactly one. */
+  const gateCall = (): number => onlyCallOf('runAgentDirectorStartupGate')
+
+  test('imports runAgentDirectorStartupGate from the startup module and calls it exactly once, awaited, in main()\'s own statement list, with no argument', () => {
+    expect(importSource(SERVER_CODE, 'runAgentDirectorStartupGate')).toBe('./agent-director-startup.ts')
+    const at = gateCall()
+    const awaitAt = SERVER_CODE.slice(0, at).search(/\bawait\s+$/)
+    expect(awaitAt).toBeGreaterThanOrEqual(0)
+    expect(atMainTopLevel(SERVER_CODE, awaitAt)).toBe(true)
+    expect(onlyCallArguments(SERVER_CODE, 'runAgentDirectorStartupGate').trim()).toBe('')
+  })
+
+  test('server.ts never names the floor-exempt option and never calls runStartupGate, so the server\'s start always runs the Phase 1 floor', () => {
+    expect(indicesOf(new RegExp(`\\b${FLOOR_EXEMPT_OPTION}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(callsOf('runStartupGate')).toEqual([])
+  })
+
+  test.each([
+    ['the PID check', 'checkPidConflict'],
+    ['the start resolution', 'resolveStart'],
+    ['the connection manager', 'createPersonaConnectionManager'],
+    ['Bun.serve', 'Bun\\.serve'],
+    ['the start bring-up', 'runStartBringUp'],
+  ])('calls it BEFORE %s', (_label, anchor) => {
+    const later = callsOf(anchor)
+    expect(later.length).toBeGreaterThan(0)
+    for (const at of later) expect(gateCall()).toBeLessThan(at)
+  })
+
+  test('inside main(), only the state and inbox directory creations and the unhandledRejection handler install come before it', () => {
+    const [mainStart] = mainBody(SERVER_CODE)
+    const gateStatement = SERVER_CODE.slice(0, gateCall()).search(/\bawait\s+$/)
+    const before = SERVER_CODE.slice(mainStart, gateStatement)
+    // Cut out each expected statement: every `mkdirSync(…)` call and the
+    // guarded install `if (!unhandledRejectionHandlerInstalled) { … }`.
+    const cuts: Array<[number, number]> = []
+    const dirs: string[] = []
+    for (const at of indicesOf(/\bmkdirSync\s*\(/g, before)) {
+      const [argsStart, argsEnd] = balancedAfter(before, at, '(', ')')
+      dirs.push(splitTopLevel(before.slice(argsStart, argsEnd))[0]!)
+      cuts.push([at, argsEnd + 1])
+    }
+    const guards = indicesOf(/\bif\s*\(\s*!\s*unhandledRejectionHandlerInstalled\s*\)\s*\{/g, before)
+    expect(guards).toHaveLength(1)
+    const [, guardEnd] = balancedAfter(before, guards[0]!, '{', '}')
+    const guardBlock = before.slice(guards[0]!, guardEnd + 1)
+    expect(indicesOf(/\bprocess\.on\s*\(\s*['"]unhandledRejection['"]\s*,\s*createUnhandledRejectionHandler\s*\(/g, guardBlock)).toHaveLength(1)
+    cuts.push([guards[0]!, guardEnd + 1])
+
+    expect(dirs.sort()).toEqual(['INBOX_DIR', 'STATE_DIR'])
+    const rest = cuts
+      .sort((a, b) => b[0] - a[0])
+      .reduce((text, [from, to]) => text.slice(0, from) + text.slice(to), before)
+    expect(rest.replace(/[\s;]/g, '')).toBe('')
   })
 })
 

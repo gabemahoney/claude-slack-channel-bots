@@ -65,6 +65,14 @@ import {
 } from '../src/cli.ts'
 import { AgentDirectorError, ErrCallTimeout, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
 import {
+  REFUSAL_KIND_BELOW_PHASE1_FLOOR,
+  REFUSAL_KIND_CLIENT_TOO_OLD,
+  REFUSAL_KIND_OTHER,
+  type StartupGateRefusalKind,
+} from '../src/agent-director-startup.ts'
+import { buildBelowPhase1FloorMessage } from '../src/ad-version-gate.ts'
+import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_NOT_FOUND, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check.ts'
+import {
   CONFIG_NOT_REGULAR_FILE_CODE,
   DEFAULT_PERSONA_CONFIG_FS,
   loadPersonaConfig,
@@ -88,6 +96,7 @@ import {
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import {
   makeMultiPersonaConfig,
@@ -1869,20 +1878,36 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
   /** The stderr lines holding `fragment`, each cut before its first stack frame. */
   const linesWith = (fragment: string): string[] => stderr.filter((l) => l.includes(fragment)).map((l) => l.split(' at ')[0]!)
 
-  test('a startup gate failure (StartupGateFailedError) prints the gate\'s class label and message on the initialization-failed line; exit 1, no director verb', async () => {
-    const detail = 'agent-director 0.9.0 is older than the required 0.10.0; run `bun add agent-director@^0.10.0`'
+  // b.jg5 SRJ-203: the error keeps the gate outcome's refusal kind, read from
+  // the error itself (never from its label or message text), and the kind
+  // changes nothing in the printed line: that stays CSCB's own label and
+  // message. The detail is test input; the floor row's is the gate's own.
+  test.each<[StartupGateRefusalKind, string, (binaryPath: string) => string]>([
+    [REFUSAL_KIND_CLIENT_TOO_OLD, AD_SYSTEM_INSTALL_TOO_OLD, (binaryPath) => `agent-director at ${binaryPath} is below the client's minimum`],
+    [
+      REFUSAL_KIND_BELOW_PHASE1_FLOOR,
+      AD_BELOW_PHASE1_FLOOR,
+      (binaryPath) => buildBelowPhase1FloorMessage({ foundVersion: OLD_AD_VERSION, binaryPath }),
+    ],
+    [REFUSAL_KIND_OTHER, AD_SYSTEM_INSTALL_NOT_FOUND, (binaryPath) => `no agent-director system install at ${binaryPath}`],
+  ])('a startup gate failure (StartupGateFailedError, refusal kind %s, label %s) exposes the kind it was built with and prints the gate\'s class label and message on the initialization-failed line; exit 1, no director verb', async (kind, label, detailFor) => {
+    const detail = detailFor(join(root, 'bin', 'agent-director'))
+    const gateError = new StartupGateFailedError(label, detail, kind)
+    expect(gateError.refusalKind).toBe(kind)
+    expect(gateError.classLabel).toBe(label)
     const b = makeStopDeps({
-      initClient: async () => { throw new StartupGateFailedError('ad-version-too-old', detail) },
+      initClient: async () => { throw gateError },
       directorStatus: async () => ({ state: 'waiting' }),
     })
 
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
 
     expect(stderr.filter((l) => l.includes('initialization failed'))).toEqual([
-      `[slack] stop --stop-bots: agent-director initialization failed: agent-director startup gate failed (ad-version-too-old): ${detail}`,
+      `[slack] stop --stop-bots: agent-director initialization failed: agent-director startup gate failed (${label}): ${detail}`,
     ])
     expect(b.exitCodes).toEqual([1])
     expect(b.statusCalls).toEqual([])
+    assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
   })
 
   test('an incomplete teardown (TeardownIncompleteError) prints its count and retry advice on the teardown-failed line; the underlying error, carrying fake tokens, is only described, its message redacted; exit 1; nothing logged leaks', async () => {

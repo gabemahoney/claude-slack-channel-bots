@@ -1342,9 +1342,12 @@ export async function main(): Promise<void> {
 
   // SR-5.1: agent-director startup gate.
   // Runs before any other CSCB work — imports the library, constructs the
-  // singleton Client, performs the version probe, and verifies that the
-  // existing ~/.agent-director/state.db (if any) is owned by the current
-  // user. Any failure records to startup-errors.log and exits non-zero.
+  // Client (whose construction probes the binary's version and applies the
+  // client's own minimum), refuses a binary below CSCB's Phase 1 floor
+  // (b.jg5 SRJ-203) before the Client is installed as the singleton, probes
+  // the library's API surface, and verifies that the existing
+  // ~/.agent-director/state.db (if any) is owned by the current user. Any
+  // failure records to startup-errors.log and exits non-zero.
   await runAgentDirectorStartupGate()
 
   // Check for an existing server BEFORE any side-effectful startup work —

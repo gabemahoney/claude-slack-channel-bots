@@ -9,9 +9,10 @@
  * The startup gate (Epic 1, agent-director-startup.ts) does NOT call
  * `runInstallCheck()` — AD's own `Client.create()` enforces the same floor
  * against the same `dist/version-floor.json`. The gate imports only the
- * exported `AD_SYSTEM_INSTALL_NOT_FOUND` label, so both report the same
- * `ad-system-install-not-found` class label. CSCB never duplicates the
- * floor decision.
+ * exported class-label values below (`AD_SYSTEM_INSTALL_NOT_FOUND`,
+ * `AD_SYSTEM_INSTALL_TOO_OLD`, `AD_BELOW_PHASE1_FLOOR`), so both report the
+ * same labels. CSCB never duplicates the client's floor decision; its own
+ * Phase 1 floor lives in `ad-version-gate.ts` (b.jg5 SRJ-203).
  *
  * The module is strictly side-effect-free:
  *   - No process.exit.
@@ -39,10 +40,23 @@ import type { UnreachableReason } from 'agent-director'
 /** Class label for "no agent-director system install found"; shared with the startup gate. */
 export const AD_SYSTEM_INSTALL_NOT_FOUND = 'ad-system-install-not-found'
 
+/**
+ * Class label for the client's own too-old refusal (`ErrSystemInstallTooOld`,
+ * a binary below the client's minimum); shared with the startup gate.
+ */
+export const AD_SYSTEM_INSTALL_TOO_OLD = 'ad-system-install-too-old'
+
+/**
+ * Class label for CSCB's own Phase 1 floor refusal: a binary the client admits
+ * whose version is below `PHASE1_FLOOR_VERSION` or does not parse (b.jg5
+ * SRJ-203, SRJ-1013). Written by the startup gate.
+ */
+export const AD_BELOW_PHASE1_FLOOR = 'ad-below-phase1-floor'
+
 /** Canonical class labels emitted by the check; mirrors the startup gate's. */
 export type InstallCheckClassLabel =
   | typeof AD_SYSTEM_INSTALL_NOT_FOUND
-  | 'ad-system-install-too-old'
+  | typeof AD_SYSTEM_INSTALL_TOO_OLD
   | 'ad-system-install-unreachable'
   | 'ad-version-floor-unreadable'
 

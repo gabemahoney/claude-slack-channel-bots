@@ -2,8 +2,10 @@
  * ad-version-gate.ts — CSCB's own Phase 1 floor for the agent-director binary.
  *
  * Role: holds the one named Phase 1 floor constant (b.jg5 SRJ-201), the floor
- * comparison over a version string (b.jg5 SRJ-202) and the title of the README
- * switch-over runbook section that CSCB's gate messages point the operator to.
+ * comparison over a version string (b.jg5 SRJ-202), the title of the README
+ * switch-over runbook section that CSCB's gate messages point the operator to,
+ * and the startup gate's `ad-below-phase1-floor` message (b.jg5 SRJ-203,
+ * SRJ-208, SRJ-1013).
  *
  * This check sits beside the agent-director client's own too-old refusal
  * (client minimum 0.7.0) and gates on the version alone. The 0.10.0 client
@@ -39,6 +41,14 @@ export const PHASE1_FLOOR_VERSION = '0.11.0'
  * takes the title from this constant.
  */
 export const PHASE1_RUNBOOK_SECTION_TITLE = 'Switching over to agent-director Phase 1'
+
+/**
+ * The operator instruction every `ad-below-phase1-floor` entry carries
+ * (b.jg5 SRJ-1013). It names the switch-over runbook and gives no instruction
+ * to upgrade agent-director (b.jg5 SRJ-208).
+ */
+export const PHASE1_SWITCH_OVER_INSTRUCTION =
+  'this CSCB release requires agent-director Phase 1 or later: follow the switch-over runbook in the README'
 
 /** Strict SemVer rule, identical to the 0.10.0 client's parser regex. */
 const STRICT_SEMVER_RE = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/
@@ -90,4 +100,31 @@ export function meetsPhase1Floor(version: string): boolean {
   if (core.major !== FLOOR_CORE.major) return core.major > FLOOR_CORE.major
   if (core.minor !== FLOOR_CORE.minor) return core.minor > FLOOR_CORE.minor
   return core.patch >= FLOOR_CORE.patch
+}
+
+/** Token-free parts of a startup-gate floor refusal. */
+export interface BelowPhase1FloorParts {
+  /** The binary's version as the client reported it (`binaryVersion`). */
+  readonly foundVersion: string
+  /** The resolved binary path the client runs. */
+  readonly binaryPath: string
+}
+
+/**
+ * The startup gate's `ad-below-phase1-floor` message (b.jg5 SRJ-203,
+ * SRJ-1013): the version found, the version required (the floor or later,
+ * its release candidates included), the binary path, that the startup check
+ * found it, {@link PHASE1_SWITCH_OVER_INSTRUCTION} and the runbook section's
+ * title. It carries no instruction to upgrade agent-director, no install or
+ * upgrade command and no install-skill block (b.jg5 SRJ-208). Built from
+ * versions, a path and fixed text only.
+ */
+export function buildBelowPhase1FloorMessage(parts: BelowPhase1FloorParts): string {
+  return (
+    `agent-director version ${parts.foundVersion} is below CSCB's Phase 1 floor: ` +
+    `version ${PHASE1_FLOOR_VERSION} or later is required ` +
+    `(release candidates ${PHASE1_FLOOR_VERSION}-rc.N included). ` +
+    `Binary at ${parts.binaryPath}; found by the startup check. ` +
+    `Note: ${PHASE1_SWITCH_OVER_INSTRUCTION} (section "${PHASE1_RUNBOOK_SECTION_TITLE}").`
+  )
 }

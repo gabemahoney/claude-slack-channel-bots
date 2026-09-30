@@ -49,6 +49,7 @@ import { getClient } from './agent-director-client.ts'
 import type { Client } from 'agent-director'
 import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import { runStartupGate } from './agent-director-startup.ts'
+import type { StartupGateRefusalKind } from './agent-director-startup.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -211,10 +212,17 @@ export interface CliDeps {
  * throws it. Its message is the gate's own class label and message
  * (`runStartupGate`), which CSCB builds and which name versions, paths and the
  * fix, never a token, so a failure line prints it rather than only describing
- * the error: it is the operator's diagnosis.
+ * the error: it is the operator's diagnosis. `refusalKind` is the gate
+ * outcome's refusal kind (`client-too-old`, `below-phase1-floor`, `other`),
+ * so a caller branches on which check refused, never on the class label or
+ * the message text (b.jg5 SRJ-203).
  */
 export class StartupGateFailedError extends Error {
-  constructor(readonly classLabel: string, detail: string) {
+  constructor(
+    readonly classLabel: string,
+    detail: string,
+    readonly refusalKind: StartupGateRefusalKind,
+  ) {
     super(`agent-director startup gate failed (${classLabel}): ${detail}`)
     this.name = 'StartupGateFailedError'
   }
@@ -969,10 +977,12 @@ if (import.meta.main) {
     // before teardown. runStartupGate performs Client.create() + setClient() and
     // returns a typed outcome; on failure we throw so the caller (clean_restart /
     // stop --stop-bots) exits loudly rather than silently skipping teardown.
+    // Both run the full gate, CSCB's Phase 1 floor included (b.jg5 SRJ-203);
+    // the thrown error keeps the outcome's refusal kind.
     initClient: async () => {
       const outcome = await runStartupGate()
       if (!outcome.ok) {
-        throw new StartupGateFailedError(outcome.classLabel, outcome.message)
+        throw new StartupGateFailedError(outcome.classLabel, outcome.message, outcome.refusalKind)
       }
     },
     directorStatus: directorOps.directorStatus,

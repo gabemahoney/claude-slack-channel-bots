@@ -10,9 +10,17 @@
  *      module-load-error branch below).
  *   2. await d.createClient(opts)                — typed catches for
  *      ErrBunVersionTooOld, ErrSystemInstallNotFound,
- *      ErrSystemInstallTooOld, ErrSystemInstallUnreachable; other throws
- *      surface verbatim. The factory resolves to a constructed Client
- *      (production injects `Client.create`).
+ *      ErrSystemInstallTooOld (the client's own too-old refusal, below its
+ *      minimum), ErrSystemInstallUnreachable; other throws surface verbatim.
+ *      The factory resolves to a constructed Client (production injects
+ *      `Client.create`).
+ *   3. CSCB's Phase 1 floor (b.jg5 SRJ-203)      — the client's
+ *      `binaryVersion` (never its `version()` method, which reports the npm
+ *      package's version) must pass `meetsPhase1Floor`; below the floor or
+ *      unparseable is refused as `ad-below-phase1-floor`. The check runs
+ *      before the client is installed as the singleton: a refused client is
+ *      closed once and never installed. `runStartupGate`'s `skipPhase1Floor`
+ *      option leaves this step out; the client's too-old refusal still runs.
  *   3.5. API surface probes (SR-6.1 publish-skew defense)  — short-circuit,
  *      run in order: probeGetPermission (ad-shim-missing-get-permission) →
  *      probeErrorCatalog (ad-shim-catalog-incomplete) → probeDecideArgv
@@ -24,8 +32,11 @@
  *      other stat errors are fatal.
  *
  * Each failure mode records to startup-errors.log + stderr via
- * recordStartupError, then exits non-zero. The gate is tested through the
- * `deps` injection seam — production callers omit it, tests pass overrides.
+ * recordStartupError, then exits non-zero. Every failure outcome carries a
+ * refusal kind (`client-too-old`, `below-phase1-floor`, `other`) so callers
+ * branch on the refusal itself, never on a class label or message text.
+ * The gate is tested through the `deps` injection seam — production callers
+ * omit it, tests pass overrides.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -52,7 +63,12 @@ import {
   setClientForTests,
 } from './agent-director-client.ts'
 import { renderInstallSkillInstructions } from './install-skill-pointer.ts'
-import { AD_SYSTEM_INSTALL_NOT_FOUND } from './install-check.ts'
+import {
+  AD_BELOW_PHASE1_FLOOR,
+  AD_SYSTEM_INSTALL_NOT_FOUND,
+  AD_SYSTEM_INSTALL_TOO_OLD,
+} from './install-check.ts'
+import { buildBelowPhase1FloorMessage, meetsPhase1Floor } from './ad-version-gate.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -240,13 +256,49 @@ function mergeDeps(overrides?: Partial<StartupGateDeps>): StartupGateDeps {
 // Gate implementation
 // ---------------------------------------------------------------------------
 
+/** Refusal kind: the client's own too-old refusal (`ErrSystemInstallTooOld`). */
+export const REFUSAL_KIND_CLIENT_TOO_OLD = 'client-too-old'
+
+/** Refusal kind: CSCB's Phase 1 floor refused the binary (b.jg5 SRJ-203). */
+export const REFUSAL_KIND_BELOW_PHASE1_FLOOR = 'below-phase1-floor'
+
+/** Refusal kind: every other gate failure. */
+export const REFUSAL_KIND_OTHER = 'other'
+
+/**
+ * Which check refused a failed gate. Callers branch on this, never on the
+ * class label or message text (b.jg5 SRJ-203, SRJ-902).
+ */
+export type StartupGateRefusalKind =
+  | typeof REFUSAL_KIND_CLIENT_TOO_OLD
+  | typeof REFUSAL_KIND_BELOW_PHASE1_FLOOR
+  | typeof REFUSAL_KIND_OTHER
+
 /**
  * Per-step result tag used by the gate to drive a single switch at the call
  * site (production code never inspects this; tests assert on it).
  */
 export type StartupGateOutcome =
   | { ok: true; client: unknown; adVersion: string }
-  | { ok: false; phase: 'construct' | 'version' | 'api-surface' | 'same-user' | 'unexpected'; classLabel: string; message: string }
+  | {
+      ok: false
+      phase: 'construct' | 'version' | 'api-surface' | 'same-user' | 'unexpected'
+      refusalKind: StartupGateRefusalKind
+      classLabel: string
+      message: string
+    }
+
+/** Behaviour options for {@link runStartupGate}. */
+export interface StartupGateOptions {
+  /**
+   * Leave CSCB's Phase 1 floor check out (b.jg5 SRJ-203). Defaults to false:
+   * the floor runs. It changes nothing else: the client's own too-old
+   * refusal, the API-surface probes and the same-user check still run. Only
+   * `stop --stop-bots`'s client initialization is meant to set it; the
+   * server's start and `clean_restart` always run the floor.
+   */
+  skipPhase1Floor?: boolean
+}
 
 /**
  * Run the SR-5.1 startup sequence without exiting. The dispatcher
@@ -263,6 +315,7 @@ export type StartupGateOutcome =
  */
 export async function runStartupGate(
   deps?: Partial<StartupGateDeps>,
+  options?: StartupGateOptions,
 ): Promise<StartupGateOutcome> {
   const d = mergeDeps(deps)
 
@@ -282,6 +335,7 @@ export async function runStartupGate(
       return {
         ok: false,
         phase: 'construct',
+        refusalKind: REFUSAL_KIND_OTHER,
         classLabel: 'ad-bun-version-too-old',
         message:
           `agent-director requires Bun >= 1.0.21 but the running runtime is older. ` +
@@ -292,6 +346,7 @@ export async function runStartupGate(
       return {
         ok: false,
         phase: 'construct',
+        refusalKind: REFUSAL_KIND_OTHER,
         classLabel: AD_SYSTEM_INSTALL_NOT_FOUND,
         message:
           `agent-director system install not found. The startup gate searched ` +
@@ -304,7 +359,8 @@ export async function runStartupGate(
       return {
         ok: false,
         phase: 'construct',
-        classLabel: 'ad-system-install-too-old',
+        refusalKind: REFUSAL_KIND_CLIENT_TOO_OLD,
+        classLabel: AD_SYSTEM_INSTALL_TOO_OLD,
         message:
           `agent-director system install is too old. ` +
           `Detected version ${err.actualVersion} is below the required floor ${err.requiredVersion} ` +
@@ -316,6 +372,7 @@ export async function runStartupGate(
       return {
         ok: false,
         phase: 'construct',
+        refusalKind: REFUSAL_KIND_OTHER,
         classLabel: 'ad-system-install-unreachable',
         message:
           `agent-director system install is unreachable. ` +
@@ -329,22 +386,44 @@ export async function runStartupGate(
     return {
       ok: false,
       phase: 'construct',
+      refusalKind: REFUSAL_KIND_OTHER,
       classLabel: 'ad-client-construct',
       message: `Unexpected error constructing agent-director Client. Detail: ${detail}`,
     }
   }
 
-  // Construction succeeded: install the live Client into the module-level
-  // singleton so subsequent `getClient()` call sites resolve to it.
-  setClient(client as Client)
-
-  // adVersion is sourced directly from the constructed Client; AD 0.7.0
-  // exposes `binaryVersion` as a readonly getter populated during
-  // `Client.create()`'s version probe of the resolved system binary.
+  // adVersion is sourced directly from the constructed Client: its
+  // `binaryVersion` getter is populated during `Client.create()`'s version
+  // probe of the resolved system binary. Never the client's `version()`
+  // method, whose field is the npm package's version.
   const adVersion = (client as { binaryVersion: string }).binaryVersion
 
-  // Step 3.5: API surface probes. `Client.create()` confirms the AD binary
-  // meets the required floor, but published agent-director npm packages
+  // Step 3: CSCB's Phase 1 floor (b.jg5 SRJ-203), before the client is
+  // installed as the singleton. `Client.create()` enforces only the client's
+  // own minimum, which sits below the floor and admits `0.0.0-dev`.
+  if (options?.skipPhase1Floor !== true && !meetsPhase1Floor(adVersion)) {
+    // Read everything the message needs before closing the client, so the
+    // message never depends on a getter of a closed client.
+    const message = buildBelowPhase1FloorMessage({
+      foundVersion: adVersion,
+      binaryPath: (client as { binaryPath: string }).binaryPath,
+    })
+    d.closeClient(client)
+    return {
+      ok: false,
+      phase: 'version',
+      refusalKind: REFUSAL_KIND_BELOW_PHASE1_FLOOR,
+      classLabel: AD_BELOW_PHASE1_FLOOR,
+      message,
+    }
+  }
+
+  // Construction and the floor passed: install the live Client into the
+  // module-level singleton so subsequent `getClient()` call sites resolve to it.
+  setClient(client as Client)
+
+  // Step 3.5: API surface probes. The version checks above confirm the AD
+  // binary's version, but published agent-director npm packages
   // have shipped a stale TS shim that drops methods (getPermission), drops
   // CLI flags (--request-token in buildDecide), and misses err_names in the
   // catalog. Each of those silently breaks CSCB at click-handling time. The
@@ -355,6 +434,7 @@ export async function runStartupGate(
     return {
       ok: false,
       phase: 'api-surface',
+      refusalKind: REFUSAL_KIND_OTHER,
       classLabel: 'ad-shim-missing-get-permission',
       message:
         `agent-director Client is missing the 'getPermission' method. ` +
@@ -369,6 +449,7 @@ export async function runStartupGate(
     return {
       ok: false,
       phase: 'api-surface',
+      refusalKind: REFUSAL_KIND_OTHER,
       classLabel: 'ad-shim-catalog-incomplete',
       message:
         `agent-director TS error catalog is missing required err_names: ` +
@@ -385,6 +466,7 @@ export async function runStartupGate(
     return {
       ok: false,
       phase: 'api-surface',
+      refusalKind: REFUSAL_KIND_OTHER,
       classLabel: 'ad-shim-decide-drops-token',
       message:
         `agent-director shim's decide() does not pass --request-token to the CLI: ${argvProbe.detail} ` +
@@ -412,6 +494,7 @@ export async function runStartupGate(
       return {
         ok: false,
         phase: 'same-user',
+        refusalKind: REFUSAL_KIND_OTHER,
         classLabel: 'ad-same-user',
         message:
           `${AD_STATE_DB_PATH} is owned by UID ${stat.uid} but this process is running as UID ${expectedUid}. ` +
@@ -429,6 +512,7 @@ export async function runStartupGate(
     return {
       ok: false,
       phase: 'same-user',
+      refusalKind: REFUSAL_KIND_OTHER,
       classLabel: 'ad-same-user-stat',
       message:
         `Failed to stat ${AD_STATE_DB_PATH}: OS error ${code ?? 'unknown'}. ` +
@@ -442,7 +526,9 @@ export async function runStartupGate(
 /**
  * Production entry point: run the gate, log failures, exit non-zero on any
  * non-`ok` outcome. Returns the live `Client` and detected AD version on
- * success.
+ * success. It always runs the full gate, CSCB's Phase 1 floor included: it
+ * offers no way to set `skipPhase1Floor`. A failure makes exactly one
+ * `recordStartupError` call (the server-log line and the startup-errors entry).
  *
  * Tests should call `runStartupGate(...)` directly so they can inspect the
  * raw outcome without mocking `exit`.
