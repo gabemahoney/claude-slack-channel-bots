@@ -14,10 +14,22 @@
  *   so strings, regex literals and comments never count: no value import of
  *   `Client` / `resolveSystemBinary` from `agent-director`; every child
  *   process call's `env` is a direct `hostSafeChildEnv` call; no file imports
- *   the preload guard and `bunfig.toml` loads it; no named import or
- *   re-export of a Phase-1-only error class. Each matcher is pinned with
+ *   the preload guard and both `bunfig.toml` files (root and `tests/`) load
+ *   it with a path entry Bun resolves from the directory the run starts in;
+ *   no named import or re-export of a Phase-1-only error class. Each matcher is pinned with
  *   synthetic flagged and allowed sources, then run over the tree.
- * - Preload check, then the un-injected gate checks: one case checks that the
+ * - Preload check: the shared `preloadCheckFailures` (the one the preload
+ *   guard runs), each failure label (`PRELOAD_CHECK`) pinned with a row.
+ * - Preload redirect: the shared, side-effect-free `preloadRedirectedEnv`
+ *   on dirty inherited environments (a `PATH` directory holding an
+ *   `agent-director` file or dangling symlink, duplicate, empty, relative and
+ *   `.` entries, `TMUX` / `TMUX_PANE` set, a foreign `TMUX_TMPDIR`, a stray
+ *   `SLACK_STATE_DIR` or HOME), each output asserted exactly and passing the
+ *   check.
+ * - A non-normalized `TMPDIR` (`/tmp//`, `/tmp/.`, `/tmp/../tmp`), in a
+ *   `bun` child started with it: `osTempDir()` normalizes it, and
+ *   `TMUX_TMPDIR` reuse, the check and the redirect still hold.
+ * - Un-injected gate checks: one case checks that the
  *   preload guard applied (HOME, PATH, `TMUX`, `TMUX_PANE`, `TMUX_TMPDIR`,
  *   `SLACK_STATE_DIR`) and only then calls `runStartupGate()`
  *   and `runInstallCheck()` with their defaults, which must fail as not found.
@@ -31,17 +43,19 @@
  * absent. Each entry a case made is removed in `afterEach`; a bare-prefix
  * directory already there is neither touched nor removed. One case
  * starts a `bun` child (`process.execPath`, environment from
- * `hostSafeChildEnv` with a HOME under the root) that runs only the helper.
+ * `hostSafeChildEnv` with a HOME under the root) that runs only the helper;
+ * the `TMPDIR` cases start one such child each.
  * The real-home cases pass `realHome()` (or a symlink to it made under the
  * root) and are refused before anything under it is looked at. Every
  * `agent-director` entry a case makes is a plain, non-executable file or a
  * dangling symlink. `process.env.PATH` and `process.env.TMUX_TMPDIR`, which
  * some cases point elsewhere, are restored in `afterEach`. The install path,
  * binary name and `TMUX_TMPDIR` prefix come from the helper. The audits only
- * read repository files (none under `node_modules`). The preload-check
- * synthetic cases make prefixed HOME directories directly under the OS temp
+ * read repository files (none under `node_modules`). The preload-check,
+ * redirect and `TMPDIR` cases make prefixed HOME directories directly under the OS temp
  * directory (`preloadTempHome()`) and one `CHILD_TMUX_TMPDIR_PREFIX`
- * directory there (another fenced `TMUX_TMPDIR`), removed in `afterEach`; they
+ * directory there per case that needs another fenced `TMUX_TMPDIR`, removed
+ * in `afterEach`; they
  * reuse the process's own `TMUX_TMPDIR` (`childTmuxTmpDir()`) and never set a
  * `TMUX` value in `process.env`. The preload check
  * and the gate calls start no process: the check is `lstat`s, and with the
@@ -55,7 +69,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, delimiter, dirname, join, relative, resolve, sep } from 'node:path'
 import ts from 'typescript'
 import {
   AGENT_DIRECTOR_BINARY_NAME,
@@ -68,14 +82,20 @@ import {
   HostSafetyError,
   type HostSafeChildEnvOptions,
   type HostSafetyRefusal,
+  PRELOAD_CHECK,
+  PRELOAD_ENV_NAMES,
   PRELOAD_HOME_PREFIX,
+  PRELOAD_STATE_DIR_PATH,
+  type PreloadCheckFailure,
+  type PreloadEnv,
   RESERVED_CHILD_ENV_NAMES,
   childTmuxTmpDir,
-  dirHoldsAgentDirector,
-  homeHoldsAgentDirectorInstall,
   hostSafeChildEnv,
   inheritedChildTmuxTmpDir,
-  isRealHome,
+  isUnder,
+  osTempDir,
+  preloadCheckFailures,
+  preloadRedirectedEnv,
   realHome,
   resolveToolDir,
 } from './test-helpers/host-safe-env.ts'
@@ -128,11 +148,6 @@ function plainFile(path: string): void {
 function fakeToolFile(path: string): void {
   mkdirSync(dirname(path), { recursive: true })
   writeFileSync(path, '#!/bin/sh\nexit 1\n', { mode: 0o755 })
-}
-
-/** Whether `dir` is `parent` or lies under it. */
-function isUnder(dir: string, parent: string): boolean {
-  return dir === parent || dir.startsWith(parent.endsWith(sep) ? parent : parent + sep)
 }
 
 /** Every entry under `dir` with its kind, size and mtime, plus `dir`'s own mtime. */
@@ -204,7 +219,7 @@ describe('hostSafeChildEnv', () => {
 
     expect(second).toBe(first)
     expect(statSync(first).isDirectory()).toBe(true)
-    expect(dirname(first)).toBe(tmpdir())
+    expect(dirname(first)).toBe(osTempDir())
     expect(basename(first).startsWith(CHILD_TMUX_TMPDIR_PREFIX)).toBe(true)
     expect(isUnder(first, home)).toBe(false)
     expect(isUnder(first, realHome())).toBe(false)
@@ -387,7 +402,8 @@ describe('runInFakeHome', () => {
     const modulePath = join(root, 'marker-module.ts')
     writeFileSync(modulePath, `require('node:fs').writeFileSync(${JSON.stringify(marker)}, '')\n`)
 
-    expect(() => runInFakeHome({ modulePath, call: '', input: null, home: realHome(), stateDir: dirUnder('state') })).toThrow()
+    // runInFakeHome's own refusal, not hostSafeChildEnv's (which would come later).
+    expect(() => runInFakeHome({ modulePath, call: '', input: null, home: realHome(), stateDir: dirUnder('state') })).toThrow(/^runInFakeHome: .*not the real home/)
     expect(existsSync(marker)).toBe(false)
   })
 })
@@ -402,6 +418,8 @@ const TEST_HELPERS_DIR = join(TESTS_DIR, 'test-helpers')
 const SRC_DIR = join(REPO_ROOT, 'src')
 const PRELOAD_PATH = join(TEST_HELPERS_DIR, 'host-safety-preload.ts')
 const BUNFIG_PATH = join(REPO_ROOT, 'bunfig.toml')
+/** The bunfig a `bun test` started in `tests/` reads (Bun reads one only from its working directory). */
+const TESTS_BUNFIG_PATH = join(TESTS_DIR, 'bunfig.toml')
 
 const AGENT_DIRECTOR_MODULE = 'agent-director'
 /** Names a test may not hold as values from agent-director: they find and run the real binary. */
@@ -850,16 +868,21 @@ function importsOfFile(sf: ts.SourceFile, path: string, target: string): string[
   return findings
 }
 
+/** Whether a preload entry is a path to Bun: `./…`, `../…` or absolute (a bare `a/b.ts` is looked up as a package and not found). */
+const PRELOAD_PATH_ENTRY = /^(?:\.{1,2}\/|\/)/
+
 /**
- * Why the `bunfig.toml` text `toml` (in `baseDir`) does not load `preload`
- * before the tests: its `[test]` table's `preload` (a string or a list) must
- * name it, relative to `baseDir`. An empty list means it does.
+ * Why the `bunfig.toml` text `toml`, read by a `bun test` started in
+ * `baseDir`, does not load `preload` before the tests: its `[test]` table's
+ * `preload` (a string or a list) must name it with a path entry
+ * (`PRELOAD_PATH_ENTRY`) that resolves to it from `baseDir` (Bun resolves a
+ * relative preload against the working directory, not the bunfig's own).
  */
 function bunfigPreloadFindings(toml: string, baseDir: string, preload: string): string[] {
   const config = Bun.TOML.parse(toml) as { test?: { preload?: unknown } }
   const entries = config.test?.preload
   const list = typeof entries === 'string' ? [entries] : Array.isArray(entries) ? entries : []
-  if (list.some((entry) => typeof entry === 'string' && resolve(baseDir, entry) === preload)) return []
+  if (list.some((entry) => typeof entry === 'string' && PRELOAD_PATH_ENTRY.test(entry) && resolve(baseDir, entry) === preload)) return []
   return [`[test] preload does not name ${relative(baseDir, preload)}`]
 }
 
@@ -1059,8 +1082,8 @@ describe('static audit: every child process call’s env is a direct hostSafeChi
     const files = hostTestFiles()
     expect(auditTree(files, (sf) => childProcessAudit(sf).findings)).toEqual([])
     expect(files.reduce((sum, path) => sum + childProcessAudit(parseFile(path)).calls, 0)).toBeGreaterThan(0)
-    // This file's one child (the inherited-TMUX_TMPDIR case) is found and accepted.
-    expect(childProcessAudit(parseFile(join(TESTS_DIR, 'host-safety.test.ts')))).toEqual({ calls: 1, findings: [] })
+    // This file's two children (the inherited-TMUX_TMPDIR and TMPDIR cases) are found and accepted.
+    expect(childProcessAudit(parseFile(join(TESTS_DIR, 'host-safety.test.ts')))).toEqual({ calls: 2, findings: [] })
   })
 
   test('the audited files: every test file bun runs, node_modules excluded, and every test helper', () => {
@@ -1108,6 +1131,8 @@ describe('static audit: the preload guard', () => {
     ['an empty [test] preload', '[test]\npreload = []'],
     ['a top-level preload (bun run’s, not bun test’s)', 'preload = ["./tests/test-helpers/host-safety-preload.ts"]'],
     ['a preload under [run]', '[run]\npreload = ["./tests/test-helpers/host-safety-preload.ts"]'],
+    ['a bare path (Bun looks it up as a package)', '[test]\npreload = ["tests/test-helpers/host-safety-preload.ts"]'],
+    ['a path relative to tests/ (read from the root, it names nothing)', '[test]\npreload = ["./test-helpers/host-safety-preload.ts"]'],
   ]
 
   test.each(bunfigFlagged)('a bunfig.toml with %s does not load it', (_label, toml) => {
@@ -1117,16 +1142,24 @@ describe('static audit: the preload guard', () => {
   const bunfigAllowed: [label: string, toml: string][] = [
     ['a [test] preload list naming it', '[test]\npreload = ["./tests/test-helpers/host-safety-preload.ts"]'],
     ['a [test] preload string naming it', '[test]\npreload = "./tests/test-helpers/host-safety-preload.ts"'],
-    ['a [test] preload list naming it after another', '[test]\npreload = ["./tests/other-preload.ts", "tests/test-helpers/host-safety-preload.ts"]'],
+    ['a [test] preload list naming it after another', '[test]\npreload = ["./tests/other-preload.ts", "./tests/test-helpers/host-safety-preload.ts"]'],
+    ['a [test] preload naming it by absolute path', `[test]\npreload = [${JSON.stringify(PRELOAD_PATH)}]`],
   ]
 
   test.each(bunfigAllowed)('a bunfig.toml with %s loads it', (_label, toml) => {
     expect(bunfigPreloadFindings(toml, REPO_ROOT, PRELOAD_PATH)).toEqual([])
   })
 
-  test('the current tree: bunfig.toml’s [test] preload names it and no file in the repository imports it', () => {
+  test('a tests/ bunfig.toml naming it relative to tests/ loads it for a run started there', () => {
+    const toml = '[test]\npreload = ["./test-helpers/host-safety-preload.ts"]'
+    expect(bunfigPreloadFindings(toml, TESTS_DIR, PRELOAD_PATH)).toEqual([])
+    expect(bunfigPreloadFindings('[test]\npreload = ["./tests/test-helpers/host-safety-preload.ts"]', TESTS_DIR, PRELOAD_PATH).length).toBeGreaterThan(0)
+  })
+
+  test('the current tree: both bunfig.toml files’ [test] preload name it and no file in the repository imports it', () => {
     expect(existsSync(PRELOAD_PATH)).toBe(true)
     expect(bunfigPreloadFindings(readFileSync(BUNFIG_PATH, 'utf-8'), REPO_ROOT, PRELOAD_PATH)).toEqual([])
+    expect(bunfigPreloadFindings(readFileSync(TESTS_BUNFIG_PATH, 'utf-8'), TESTS_DIR, PRELOAD_PATH)).toEqual([])
     const files = filesUnder(REPO_ROOT, (path) => SCRIPT_FILE.test(path))
     expect(files).toContain(join(TESTS_DIR, 'host-safety.test.ts'))
     expect(auditTree(files, (sf, path) => importsOfFile(sf, path, PRELOAD_PATH))).toEqual([])
@@ -1173,114 +1206,23 @@ describe('static audit: no named import or re-export of a Phase-1-only name', ()
 // Preload check, then the un-injected gate checks
 // ---------------------------------------------------------------------------
 
-/** Why an environment is not one the preload guard produced (`preloadCheckFailures`). */
-const PRELOAD_CHECK = Object.freeze({
-  homeNotAbsolute: 'home-not-absolute',
-  homeNotPreloadTemp: 'home-not-preload-temp',
-  homeNotDirectory: 'home-not-directory',
-  realHome: 'real-home',
-  homeHoldsInstall: 'home-holds-install',
-  pathUnset: 'path-unset',
-  pathEntryNotAbsolute: 'path-entry-not-absolute',
-  pathDirHoldsAgentDirector: 'path-dir-holds-agent-director',
-  tmuxSet: 'tmux-set',
-  tmuxPaneSet: 'tmux-pane-set',
-  tmuxTmpDirNotFenced: 'tmux-tmpdir-not-fenced',
-  tmuxTmpDirNotProcess: 'tmux-tmpdir-not-process',
-  stateDirUnset: 'state-dir-unset',
-  stateDirNotUnderHome: 'state-dir-not-under-home',
-} as const)
-
-type PreloadCheckFailure = (typeof PRELOAD_CHECK)[keyof typeof PRELOAD_CHECK]
-
-/** The variables the preload guard sets or unsets, as `preloadCheckFailures` reads them. */
-type PreloadEnv = {
-  HOME?: string
-  PATH?: string
-  TMUX?: string
-  TMUX_PANE?: string
-  TMUX_TMPDIR?: string
-  SLACK_STATE_DIR?: string
+/** A new prefixed HOME directly under the OS temp directory, as the preload makes it; removed in `afterEach`. */
+function preloadTempHome(): string {
+  const dir = mkdtempSync(join(osTempDir(), PRELOAD_HOME_PREFIX))
+  outsideRoot.push(dir)
+  return dir
 }
 
 /**
- * Why `env` is not an environment the preload guard produced, or `[]` when it
- * is. HOME must be an absolute, real directory (not a symlink) directly under
- * the OS temp directory whose name carries `PRELOAD_HOME_PREFIX`, not the real
- * home (passwd or launch-time) nor under it, and hold no agent-director
- * install; it need not be empty (every test file shares it). Every `PATH`
- * entry must be absolute and hold no `agent-director` entry. `TMUX` and
- * `TMUX_PANE` must be unset. `TMUX_TMPDIR` must be a directory
- * `inheritedChildTmuxTmpDir` accepts and this process's one
- * (`childTmuxTmpDir()`). `SLACK_STATE_DIR` must be set and non-empty (unset,
- * the state-directory resolvers fall back to the launch-time home) and the
- * state directory it names (made absolute, as the resolvers do) must lie strictly under
- * HOME. Only `lstat`s (none under the real home: a HOME that is or lies
- * under it fails before any): it starts no process.
+ * An environment the check passes, as the preload builds it: a new prefixed
+ * HOME, a clean absolute PATH, no TMUX / TMUX_PANE, this process's
+ * `TMUX_TMPDIR` and a state directory under the new HOME.
  */
-function preloadCheckFailures(env: PreloadEnv): PreloadCheckFailure[] {
-  const failures: PreloadCheckFailure[] = []
-  const home = env.HOME
-  if (home === undefined || !isAbsolute(home)) failures.push(PRELOAD_CHECK.homeNotAbsolute)
-  else {
-    const name = basename(home)
-    if (dirname(home) !== tmpdir() || !name.startsWith(PRELOAD_HOME_PREFIX) || name.length <= PRELOAD_HOME_PREFIX.length) {
-      failures.push(PRELOAD_CHECK.homeNotPreloadTemp)
-    }
-    // The real home (or a path under it) is refused before anything under it is looked at.
-    if (isRealHome(home) || isUnder(resolve(home), realHome())) failures.push(PRELOAD_CHECK.realHome)
-    else {
-      let isDirectory = false
-      try {
-        isDirectory = lstatSync(home).isDirectory()
-      } catch {
-        isDirectory = false
-      }
-      if (!isDirectory) failures.push(PRELOAD_CHECK.homeNotDirectory)
-      if (homeHoldsAgentDirectorInstall(home)) failures.push(PRELOAD_CHECK.homeHoldsInstall)
-    }
-  }
-  const path = env.PATH
-  if (path === undefined) failures.push(PRELOAD_CHECK.pathUnset)
-  else {
-    for (const dir of path.split(delimiter)) {
-      if (dir === '' || !isAbsolute(dir)) failures.push(PRELOAD_CHECK.pathEntryNotAbsolute)
-      else if (dirHoldsAgentDirector(dir)) failures.push(PRELOAD_CHECK.pathDirHoldsAgentDirector)
-    }
-  }
-  if (env.TMUX !== undefined) failures.push(PRELOAD_CHECK.tmuxSet)
-  if (env.TMUX_PANE !== undefined) failures.push(PRELOAD_CHECK.tmuxPaneSet)
-  const tmuxTmpDir = env.TMUX_TMPDIR
-  if (tmuxTmpDir === undefined || inheritedChildTmuxTmpDir(tmuxTmpDir) !== tmuxTmpDir) failures.push(PRELOAD_CHECK.tmuxTmpDirNotFenced)
-  else if (tmuxTmpDir !== childTmuxTmpDir()) failures.push(PRELOAD_CHECK.tmuxTmpDirNotProcess)
-  const stateDir = env.SLACK_STATE_DIR
-  if (stateDir === undefined || stateDir === '') failures.push(PRELOAD_CHECK.stateDirUnset)
-  else {
-    const resolved = resolve(stateDir)
-    if (home === undefined || !isAbsolute(home) || resolved === resolve(home) || !isUnder(resolved, resolve(home))) {
-      failures.push(PRELOAD_CHECK.stateDirNotUnderHome)
-    }
-  }
-  return failures
+function preloadEnv(home: string = preloadTempHome()): PreloadEnv {
+  return { HOME: home, PATH: dirUnder('bin'), TMUX_TMPDIR: childTmuxTmpDir(), SLACK_STATE_DIR: join(home, 'state') }
 }
 
 describe('preload check', () => {
-  /** A new prefixed HOME directly under the OS temp directory, as the preload makes it; removed in `afterEach`. */
-  function preloadTempHome(): string {
-    const dir = mkdtempSync(join(tmpdir(), PRELOAD_HOME_PREFIX))
-    outsideRoot.push(dir)
-    return dir
-  }
-
-  /**
-   * An environment the check passes, as the preload builds it: a new prefixed
-   * HOME, a clean absolute PATH, no TMUX / TMUX_PANE, this process's
-   * `TMUX_TMPDIR` and a state directory under the new HOME.
-   */
-  function preloadEnv(home: string = preloadTempHome()): PreloadEnv {
-    return { HOME: home, PATH: dirUnder('bin'), TMUX_TMPDIR: childTmuxTmpDir(), SLACK_STATE_DIR: join(home, 'state') }
-  }
-
   /** `preloadEnv()` with `name` removed. */
   function preloadEnvWithout(name: keyof PreloadEnv): PreloadEnv {
     const env = preloadEnv()
@@ -1398,6 +1340,189 @@ describe('preload check', () => {
     for (const [label, failure, build] of own) {
       expect({ label, failures: preloadCheckFailures(build()) }).toEqual({ label, failures: [failure] })
     }
+  })
+})
+
+describe('preload redirect (preloadRedirectedEnv)', () => {
+  /** A directory under the root holding a plain, non-executable `agent-director` file. */
+  function dirWithAgentDirectorFile(name: string): string {
+    const dir = dirUnder(name)
+    plainFile(join(dir, AGENT_DIRECTOR_BINARY_NAME))
+    return dir
+  }
+
+  /** A directory under the root holding a dangling `agent-director` symlink. */
+  function dirWithDanglingAgentDirector(name: string): string {
+    const dir = dirUnder(name)
+    symlinkSync(join(root, 'no-such-target'), join(dir, AGENT_DIRECTOR_BINARY_NAME))
+    return dir
+  }
+
+  const path = (...entries: string[]): string => entries.join(delimiter)
+
+  // Each row builds its fixture under the case's root and returns the inherited
+  // environment and the PATH the redirect must produce from it.
+  type RedirectRow = [label: string, build: () => { inherited: PreloadEnv; expectedPath: string }]
+
+  const rows: RedirectRow[] = [
+    ['a clean inherited PATH is kept as is', () => {
+      const [a, b] = [dirUnder('a'), dirUnder('b')]
+      return { inherited: { PATH: path(a, b) }, expectedPath: path(a, b) }
+    }],
+    ['a directory holding an agent-director file is dropped', () => {
+      const [a, b] = [dirUnder('a'), dirUnder('b')]
+      return { inherited: { PATH: path(a, dirWithAgentDirectorFile('ad'), b) }, expectedPath: path(a, b) }
+    }],
+    ['a directory holding a dangling agent-director symlink is dropped', () => {
+      const a = dirUnder('a')
+      return { inherited: { PATH: path(dirWithDanglingAgentDirector('ad-link'), a) }, expectedPath: a }
+    }],
+    ['duplicate entries keep their first place only', () => {
+      const [a, b] = [dirUnder('a'), dirUnder('b')]
+      return { inherited: { PATH: path(a, b, a, b) }, expectedPath: path(a, b) }
+    }],
+    ['empty entries (leading, doubled, trailing) are dropped', () => {
+      const [a, b] = [dirUnder('a'), dirUnder('b')]
+      return { inherited: { PATH: path('', a, '', b, '') }, expectedPath: path(a, b) }
+    }],
+    ['relative entries are dropped', () => {
+      const a = dirUnder('a')
+      return { inherited: { PATH: path('bin', a, join('node_modules', '.bin')) }, expectedPath: a }
+    }],
+    ['a . entry is dropped', () => {
+      const a = dirUnder('a')
+      return { inherited: { PATH: path('.', a, '.') }, expectedPath: a }
+    }],
+    ['no entry left gives EMPTY_CHILD_PATH', () => ({
+      inherited: { PATH: path('.', '', dirWithAgentDirectorFile('ad'), dirWithDanglingAgentDirector('ad-link'), 'bin') },
+      expectedPath: EMPTY_CHILD_PATH,
+    })],
+    ['an unset PATH gives EMPTY_CHILD_PATH', () => ({ inherited: {}, expectedPath: EMPTY_CHILD_PATH })],
+    ['TMUX and TMUX_PANE set are unset', () => {
+      const a = dirUnder('a')
+      return { inherited: { PATH: a, TMUX: `${join(root, 'tmux-socket')},1,0`, TMUX_PANE: '%0' }, expectedPath: a }
+    }],
+    ['a foreign TMUX_TMPDIR is replaced by the fenced one', () => {
+      const a = dirUnder('a')
+      return { inherited: { PATH: a, TMUX_TMPDIR: dirUnder('foreign-tmux') }, expectedPath: a }
+    }],
+    ['a stray SLACK_STATE_DIR is replaced by the state directory under the new HOME', () => {
+      const a = dirUnder('a')
+      return { inherited: { PATH: a, SLACK_STATE_DIR: dirUnder('stray-state') }, expectedPath: a }
+    }],
+    ['a stray HOME is replaced by the new HOME', () => {
+      const a = dirUnder('a')
+      return { inherited: { PATH: a, HOME: dirUnder('stray-home') }, expectedPath: a }
+    }],
+    ['everything dirty at once', () => {
+      const [a, b] = [dirUnder('a'), dirUnder('b')]
+      return {
+        inherited: {
+          HOME: dirUnder('stray-home'),
+          PATH: path('', '.', a, dirWithAgentDirectorFile('ad'), 'bin', a, dirWithDanglingAgentDirector('ad-link'), b, ''),
+          TMUX: `${join(root, 'tmux-socket')},1,0`,
+          TMUX_PANE: '%0',
+          TMUX_TMPDIR: dirUnder('foreign-tmux'),
+          SLACK_STATE_DIR: dirUnder('stray-state'),
+        },
+        expectedPath: path(a, b),
+      }
+    }],
+  ]
+
+  test.each(rows)('%s', (_label, build) => {
+    const { inherited, expectedPath } = build()
+    const home = preloadTempHome()
+    const fenced = childTmuxTmpDir()
+
+    const redirected = preloadRedirectedEnv(inherited, home, fenced)
+
+    // Exactly these names: TMUX and TMUX_PANE are absent, so the preload deletes them.
+    expect(redirected).toStrictEqual({
+      HOME: home,
+      PATH: expectedPath,
+      TMUX_TMPDIR: fenced,
+      SLACK_STATE_DIR: join(home, PRELOAD_STATE_DIR_PATH),
+    })
+    // What the redirect produces is what the shared check accepts.
+    expect(preloadCheckFailures(redirected)).toEqual([])
+  })
+
+  test('changes nothing: not the inherited environment, not process.env, not the file system', () => {
+    const inherited: PreloadEnv = {
+      PATH: path('.', dirUnder('a'), dirWithAgentDirectorFile('ad'), ''),
+      TMUX: `${join(root, 'tmux-socket')},1,0`,
+      TMUX_PANE: '%0',
+      TMUX_TMPDIR: dirUnder('foreign-tmux'),
+      SLACK_STATE_DIR: dirUnder('stray-state'),
+    }
+    const inheritedBefore = { ...inherited }
+    const processBefore = Object.fromEntries(PRELOAD_ENV_NAMES.map((name) => [name, process.env[name]]))
+    const home = preloadTempHome()
+    const rootBefore = treeSnapshot(root)
+    const homeBefore = treeSnapshot(home)
+
+    preloadRedirectedEnv(inherited, home, childTmuxTmpDir())
+
+    expect(inherited).toStrictEqual(inheritedBefore)
+    expect(Object.fromEntries(PRELOAD_ENV_NAMES.map((name) => [name, process.env[name]]))).toStrictEqual(processBefore)
+    expect(treeSnapshot(root)).toEqual(rootBefore)
+    expect(treeSnapshot(home)).toEqual(homeBefore)
+  })
+})
+
+describe('a non-normalized OS temp directory (TMPDIR)', () => {
+  // Each value names the OS temp directory, spelled so that the raw
+  // os.tmpdir() differs from its normalized form. The checks run in a bun
+  // child started with that TMPDIR: in this process os.tmpdir() stops
+  // following process.env.TMPDIR once a test file has replaced process.env.
+  const spellings: [label: string, spell: (dir: string) => string][] = [
+    ['with a doubled trailing separator', (dir) => `${dir}${sep}${sep}`],
+    ['with a trailing /.', (dir) => `${dir}${sep}.`],
+    ['through .. and back', (dir) => `${dir}${sep}..${sep}${basename(dir)}`],
+  ]
+
+  test.each(spellings)('%s: osTempDir() normalizes it, and TMUX_TMPDIR reuse, the preload check and the redirect still hold', (_label, spell) => {
+    const normalized = osTempDir()
+    const spelled = spell(normalized)
+    const inherited = mkdtempSync(join(normalized, CHILD_TMUX_TMPDIR_PREFIX))
+    outsideRoot.push(inherited)
+    const home = preloadTempHome()
+    const bin = dirUnder('bin')
+    const checkEnv = { HOME: home, PATH: bin, SLACK_STATE_DIR: join(home, 'state') }
+    const dirtyEnv = { PATH: ['.', bin, ''].join(delimiter), TMUX: `${join(root, 'tmux-socket')},1,0`, TMUX_PANE: '%0' }
+    const script = `
+      const { tmpdir } = await import('node:os');
+      const h = await import(${JSON.stringify(HELPER_PATH)});
+      const home = ${JSON.stringify(home)};
+      const fenced = h.childTmuxTmpDir();
+      process.stdout.write(JSON.stringify({
+        rawIsNormalized: tmpdir() === h.osTempDir(),
+        normalized: h.osTempDir(),
+        reused: h.inheritedChildTmuxTmpDir(${JSON.stringify(inherited)}),
+        fencedIsInherited: fenced === process.env.TMUX_TMPDIR,
+        check: h.preloadCheckFailures({ ...${JSON.stringify(checkEnv)}, TMUX_TMPDIR: fenced }),
+        redirect: h.preloadCheckFailures(h.preloadRedirectedEnv(${JSON.stringify(dirtyEnv)}, home, fenced)),
+      }));
+    `
+    const child = spawnSync(process.execPath, ['-e', script], {
+      env: hostSafeChildEnv(dirUnder('child-home'), { tools: [], extras: { TMPDIR: spelled } }),
+      encoding: 'utf-8',
+      timeout: 30_000,
+    })
+
+    expect(child.stderr).toBe('')
+    expect(child.status).toBe(0)
+    expect(JSON.parse(child.stdout)).toEqual({
+      // The child's raw os.tmpdir() is the non-normalized spelling (Bun strips one trailing separator).
+      rawIsNormalized: false,
+      normalized,
+      reused: inherited,
+      // The parent's fenced TMUX_TMPDIR is reused, not a second one made.
+      fencedIsInherited: true,
+      check: [],
+      redirect: [],
+    })
   })
 })
 

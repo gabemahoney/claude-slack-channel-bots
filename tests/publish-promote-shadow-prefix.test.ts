@@ -29,7 +29,7 @@
  * `bun install -g` / `bun remove -g` / `bun pm -g trust`: the SR-7.4b and
  * sanitize tests put a recording stub named `bun` in a directory that comes
  * FIRST on that PATH, so `bun` resolves to the stub — proved by the PATH-order
- * cases ("the child PATH puts the test directories first").
+ * case ("the child PATH puts the test directories first").
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
@@ -230,17 +230,16 @@ afterAll(() => {
 // ---------------------------------------------------------------------------
 
 describe('b.r6x harness: the child PATH puts the test directories first', () => {
-  test.each([
-    { harness: 'SR-7.0 / SR-7.4', tools: SHADOW_TOOLS },
-    { harness: 'SR-7.4b', tools: SR74B_TOOLS },
-    { harness: 'sanitize-global.sh', tools: SANITIZE_TOOLS },
-  ])('$harness: the given dirs lead PATH in order and a stub there is what the child runs', ({ tools }) => {
+  // One case: every harness below builds its child PATH with the same helper
+  // (runBash → hostSafeChildEnv), whatever its tool list, so the ordering is
+  // proven once, with the SR-7.0 tools.
+  test('the given dirs lead PATH in order and a stub there is what the child runs', () => {
     const home = makeHome()
     const stubBin = join(home, 'stub-bin')
     const shimDir = join(home, '.local/bin')
     writeExec(join(stubBin, 'bun'), '#!/usr/bin/env bash\nexit 0\n')
     const r = runBash('printf "%s\\n" "$PATH"; command -v bun', home, {
-      tools,
+      tools: SHADOW_TOOLS,
       pathDirs: [stubBin, shimDir],
     })
     expect(r.code).toBe(0)

@@ -27,6 +27,7 @@ import {
   DEFAULT_STATE_DB_PATH,
 } from '../src/agent-director-startup.ts'
 import { getClient, resetClientForTests } from '../src/agent-director-client.ts'
+import { AD_SYSTEM_INSTALL_NOT_FOUND } from '../src/install-check.ts'
 import {
   errBunVersionTooOld,
   errSystemInstallNotFound,
@@ -558,7 +559,7 @@ describe('SR-4.2: system-install typed-error branches', () => {
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
       expect(outcome.phase).toBe('construct')
-      expect(outcome.classLabel).toBe('ad-system-install-not-found')
+      expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_NOT_FOUND)
       expect(outcome.message).toContain('agent-director')
       // SR-4.5: appends the manual-skill-install instructions block.
       expect(outcome.message).toContain('skills/install-cscb/SKILL.md')

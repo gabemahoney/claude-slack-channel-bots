@@ -105,11 +105,11 @@ describe('SR-5: typed-error mapping', () => {
     resolveStub = async () => {
       throw errSystemInstallNotFound()
     }
-    const { runInstallCheck } = await loadCheckModule('0.7.0')
+    const { runInstallCheck, AD_SYSTEM_INSTALL_NOT_FOUND } = await loadCheckModule('0.7.0')
     const result = await runInstallCheck()
     expect(result.ok).toBe(false)
     if (!result.ok) {
-      expect(result.classLabel).toBe('ad-system-install-not-found')
+      expect(result.classLabel).toBe(AD_SYSTEM_INSTALL_NOT_FOUND)
     }
   })
 

@@ -75,6 +75,14 @@
  * run started with is never handed to a child either. `realHome()` falls back
  * to the launch-time home only when the passwd file has no entry for the user.
  *
+ * The `bun test` preload guard's redirect and check live here too, so the
+ * guard and the host-safety test share one implementation:
+ * `preloadRedirectedEnv(inherited, home, tmuxTmpDir)` computes the guard's
+ * variables (`PRELOAD_ENV_NAMES`) without side effects, and
+ * `preloadCheckFailures(env)` lists what is wrong with them (labels in
+ * `PRELOAD_CHECK`). "Directly under the OS temp directory" always means
+ * directly under `osTempDir()`, the normalized `os.tmpdir()`.
+ *
  * Isolation: it starts no process and imports nothing from `agent-director`.
  * It reads only the entries it checks (lstat under `home`, each `PATH`
  * directory and an inherited `TMUX_TMPDIR`) and `/etc/passwd`, and creates
@@ -87,7 +95,7 @@
 
 import { accessSync, constants as fsConstants, lstatSync, mkdtempSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { homedir, tmpdir, userInfo } from 'node:os'
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 
 // ---------------------------------------------------------------------------
 // agent-director discovery names (written once, here)
@@ -286,6 +294,21 @@ export function isRealHome(dir: string): boolean {
 }
 
 /**
+ * The OS temp directory (`os.tmpdir()`, read at call time) made absolute and
+ * normalized, so `TMPDIR=/tmp//` or `TMPDIR=/tmp/.` names the same directory
+ * as `TMPDIR=/tmp`. Every "directly under the OS temp directory" comparison
+ * uses it: a path built with `join` is normalized, the raw `tmpdir()` is not.
+ */
+export function osTempDir(): string {
+  return resolve(tmpdir())
+}
+
+/** Whether `path` is `parent` or lies under it (both compared as given). */
+export function isUnder(path: string, parent: string): boolean {
+  return path === parent || path.startsWith(parent.endsWith(sep) ? parent : parent + sep)
+}
+
+/**
  * The absolute entries of a `PATH` value, in order. Empty and relative
  * entries are dropped: a lookup resolves them against the working directory.
  */
@@ -330,7 +353,7 @@ let childTmuxTmpDirCache: string | undefined
 export function inheritedChildTmuxTmpDir(value: string | undefined = process.env['TMUX_TMPDIR']): string | undefined {
   if (typeof value !== 'string' || !isAbsolute(value)) return undefined
   const name = basename(value)
-  if (dirname(value) !== tmpdir() || !name.startsWith(CHILD_TMUX_TMPDIR_PREFIX) || name.length <= CHILD_TMUX_TMPDIR_PREFIX.length) {
+  if (dirname(value) !== osTempDir() || !name.startsWith(CHILD_TMUX_TMPDIR_PREFIX) || name.length <= CHILD_TMUX_TMPDIR_PREFIX.length) {
     return undefined
   }
   try {
@@ -353,7 +376,7 @@ export function inheritedChildTmuxTmpDir(value: string | undefined = process.env
  */
 export function childTmuxTmpDir(): string {
   if (childTmuxTmpDirCache === undefined) {
-    childTmuxTmpDirCache = inheritedChildTmuxTmpDir() ?? mkdtempSync(join(tmpdir(), CHILD_TMUX_TMPDIR_PREFIX))
+    childTmuxTmpDirCache = inheritedChildTmuxTmpDir() ?? mkdtempSync(join(osTempDir(), CHILD_TMUX_TMPDIR_PREFIX))
   }
   return childTmuxTmpDirCache
 }
@@ -423,4 +446,135 @@ export function hostSafeChildEnv(home: string, options: HostSafeChildEnvOptions 
     PATH: unique.length === 0 ? EMPTY_CHILD_PATH : unique.join(delimiter),
     TMUX_TMPDIR: childTmuxTmpDir(),
   }
+}
+
+// ---------------------------------------------------------------------------
+// The bun test preload guard: its redirect and its check
+// ---------------------------------------------------------------------------
+
+/** The variables the preload guard sets or unsets, and nothing else. */
+export const PRELOAD_ENV_NAMES = Object.freeze(['HOME', 'PATH', 'TMUX', 'TMUX_PANE', 'TMUX_TMPDIR', 'SLACK_STATE_DIR'] as const)
+
+export type PreloadEnvName = (typeof PRELOAD_ENV_NAMES)[number]
+
+/** Where the preload guard points `SLACK_STATE_DIR`, relative to the new HOME: the server's default state directory. */
+export const PRELOAD_STATE_DIR_PATH = join('.claude', 'channels', 'slack')
+
+/** The preload guard's variables; a missing name is unset. */
+export type PreloadEnv = { [Name in PreloadEnvName]?: string }
+
+/** What the redirect and the check read: the guard's variables, or a whole environment such as `process.env`. */
+export type PreloadEnvSource = Readonly<PreloadEnv> | Readonly<NodeJS.ProcessEnv>
+
+/**
+ * The preload guard's variables after the redirect, computed from the
+ * `inherited` environment, the new `home` and the fenced `tmuxTmpDir`. Pure:
+ * it changes nothing (not `inherited`, not `process.env`), writes nothing and
+ * starts no process; its only reads are the `lstat`s of
+ * `dirHoldsAgentDirector`. The result holds exactly:
+ * - `HOME`: `home`;
+ * - `PATH`: the absolute entries of the inherited `PATH`
+ *   (`absolutePathEntries`: empty and relative entries, `.` among them, are
+ *   dropped because a lookup resolves them against the working directory), in
+ *   order, duplicates dropped, without every directory that holds an
+ *   `agent-director` entry (`dirHoldsAgentDirector`, a dangling symlink
+ *   included); `EMPTY_CHILD_PATH` when no entry is left;
+ * - `TMUX_TMPDIR`: `tmuxTmpDir`;
+ * - `SLACK_STATE_DIR`: `<home>/PRELOAD_STATE_DIR_PATH`
+ *   (`<home>/.claude/channels/slack`), the server's default state directory
+ *   under the new HOME.
+ * `TMUX` and `TMUX_PANE` are absent (unset). Nothing else is read from
+ * `inherited`.
+ */
+export function preloadRedirectedEnv(inherited: PreloadEnvSource, home: string, tmuxTmpDir: string): PreloadEnv {
+  const dirs = [...new Set(absolutePathEntries(inherited.PATH))].filter((dir) => !dirHoldsAgentDirector(dir))
+  return {
+    HOME: home,
+    PATH: dirs.length === 0 ? EMPTY_CHILD_PATH : dirs.join(delimiter),
+    TMUX_TMPDIR: tmuxTmpDir,
+    SLACK_STATE_DIR: join(home, PRELOAD_STATE_DIR_PATH),
+  }
+}
+
+/** Why an environment is not one the preload guard produced (`preloadCheckFailures`). */
+export const PRELOAD_CHECK = Object.freeze({
+  homeNotAbsolute: 'home-not-absolute',
+  homeNotPreloadTemp: 'home-not-preload-temp',
+  homeNotDirectory: 'home-not-directory',
+  realHome: 'real-home',
+  homeHoldsInstall: 'home-holds-install',
+  pathUnset: 'path-unset',
+  pathEntryNotAbsolute: 'path-entry-not-absolute',
+  pathDirHoldsAgentDirector: 'path-dir-holds-agent-director',
+  tmuxSet: 'tmux-set',
+  tmuxPaneSet: 'tmux-pane-set',
+  tmuxTmpDirNotFenced: 'tmux-tmpdir-not-fenced',
+  tmuxTmpDirNotProcess: 'tmux-tmpdir-not-process',
+  stateDirUnset: 'state-dir-unset',
+  stateDirNotUnderHome: 'state-dir-not-under-home',
+} as const)
+
+export type PreloadCheckFailure = (typeof PRELOAD_CHECK)[keyof typeof PRELOAD_CHECK]
+
+/**
+ * Why `env` is not an environment the preload guard produced, or `[]` when it
+ * is. The preload guard throws when this is not empty, and the host-safety
+ * test runs it on the live environment. HOME must be an absolute, real
+ * directory (not a symlink) directly under the OS temp directory
+ * (`osTempDir()`) whose name carries `PRELOAD_HOME_PREFIX`, not the real home
+ * (passwd or launch-time) nor under it, and hold no agent-director install; it
+ * need not be empty (every test file shares it). `PATH` must be set and every
+ * entry absolute and holding no `agent-director` entry. `TMUX` and
+ * `TMUX_PANE` must be unset. `TMUX_TMPDIR` must be a directory
+ * `inheritedChildTmuxTmpDir` accepts and this process's one
+ * (`childTmuxTmpDir()`). `SLACK_STATE_DIR` must be set and non-empty (unset,
+ * the state-directory resolvers fall back to the launch-time home) and the
+ * directory it names (made absolute, as the resolvers do) must lie strictly
+ * under HOME. Only `lstat`s (none under the real home: a HOME that is or lies
+ * under it fails before any): it starts no process.
+ */
+export function preloadCheckFailures(env: PreloadEnvSource): PreloadCheckFailure[] {
+  const failures: PreloadCheckFailure[] = []
+  const home = env.HOME
+  if (home === undefined || !isAbsolute(home)) failures.push(PRELOAD_CHECK.homeNotAbsolute)
+  else {
+    const name = basename(home)
+    if (dirname(home) !== osTempDir() || !name.startsWith(PRELOAD_HOME_PREFIX) || name.length <= PRELOAD_HOME_PREFIX.length) {
+      failures.push(PRELOAD_CHECK.homeNotPreloadTemp)
+    }
+    // The real home (or a path under it) is refused before anything under it is looked at.
+    if (isRealHome(home) || isUnder(resolve(home), realHome())) failures.push(PRELOAD_CHECK.realHome)
+    else {
+      let isDirectory = false
+      try {
+        isDirectory = lstatSync(home).isDirectory()
+      } catch {
+        isDirectory = false
+      }
+      if (!isDirectory) failures.push(PRELOAD_CHECK.homeNotDirectory)
+      if (homeHoldsAgentDirectorInstall(home)) failures.push(PRELOAD_CHECK.homeHoldsInstall)
+    }
+  }
+  const path = env.PATH
+  if (path === undefined) failures.push(PRELOAD_CHECK.pathUnset)
+  else {
+    for (const dir of path.split(delimiter)) {
+      if (dir === '' || !isAbsolute(dir)) failures.push(PRELOAD_CHECK.pathEntryNotAbsolute)
+      else if (dirHoldsAgentDirector(dir)) failures.push(PRELOAD_CHECK.pathDirHoldsAgentDirector)
+    }
+  }
+  if (env.TMUX !== undefined) failures.push(PRELOAD_CHECK.tmuxSet)
+  if (env.TMUX_PANE !== undefined) failures.push(PRELOAD_CHECK.tmuxPaneSet)
+  const tmuxTmpDir = env.TMUX_TMPDIR
+  if (tmuxTmpDir === undefined || inheritedChildTmuxTmpDir(tmuxTmpDir) !== tmuxTmpDir) failures.push(PRELOAD_CHECK.tmuxTmpDirNotFenced)
+  else if (tmuxTmpDir !== childTmuxTmpDir()) failures.push(PRELOAD_CHECK.tmuxTmpDirNotProcess)
+  const stateDir = env.SLACK_STATE_DIR
+  if (stateDir === undefined || stateDir === '') failures.push(PRELOAD_CHECK.stateDirUnset)
+  else {
+    const resolved = resolve(stateDir)
+    if (home === undefined || !isAbsolute(home) || resolved === resolve(home) || !isUnder(resolved, resolve(home))) {
+      failures.push(PRELOAD_CHECK.stateDirNotUnderHome)
+    }
+  }
+  return failures
 }

@@ -13,7 +13,7 @@ to run each kind safely and how the integration suite is laid out.
 
 ## Running the unit suite
 
-Run `bun test` from the repository root with a scratch HOME and state directory, and with the token
+Run `bun test` with a scratch HOME and state directory, and with the token
 environment variables and `CSCB_PERSONA` unset, so nothing can fall back to the
 real config or credentials:
 
@@ -25,10 +25,14 @@ S=$(mktemp -d) && env -u SLACK_BOT_TOKEN -u SLACK_APP_TOKEN -u CSCB_PERSONA \
 Omit `<files>` to run the whole suite. `bun test` does not run the bash
 scripts under `tests/integration/`.
 
-Always run `bun test` from the repository root. Bun reads `bunfig.toml` from
-the working directory, so only there does it load the host-safety preload guard
-(`tests/test-helpers/host-safety-preload.ts`, set in the root `bunfig.toml`),
-before any test file; run from `tests/` or elsewhere, there is no guard. It points HOME and
+Run `bun test` from the repository root or from `tests/`, nowhere else. Bun
+reads only the `bunfig.toml` in the directory `bun test` starts in (it does
+not search upward), and only `bunfig.toml` and `tests/bunfig.toml` load the
+host-safety preload guard (`tests/test-helpers/host-safety-preload.ts`) before
+any test file; started in `tests/<subdir>/` or elsewhere, the run has no
+guard. Bun resolves a relative preload path against the directory the run
+starts in, so each file names the guard relative to its own directory, with an
+entry starting `./`, `../` or `/`. The guard points HOME and
 `SLACK_STATE_DIR` at a fresh temp directory, drops every PATH directory that
 holds an `agent-director` binary and unsets `TMUX`; the rules tests follow on
 top of it are in `docs/testing-guide.md`. The tests also build their own temp
