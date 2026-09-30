@@ -117,6 +117,7 @@ import {
   personaConfigDirLabelValue,
 } from '../../src/session-manager.ts'
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
+import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
 import { makePersona } from './persona-config.ts'
 
 // ---------------------------------------------------------------------------
@@ -655,6 +656,10 @@ export const cannedErr = <T>(error: Error): CannedResponse<T> => ({ kind: 'rejec
 export interface StubClientOptions {
   // Client surface getters added in AD 0.7.0
   binaryPath?: string
+  /**
+   * The binary version the stub reports (default: `PHASE1_RC_VERSION`, which
+   * passes CSCB's Phase 1 floor; b.jg5 SRJ-1303).
+   */
   binaryVersion?: string
 
   // version()
@@ -818,7 +823,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       return opts.binaryPath ?? '/usr/local/bin/agent-director'
     },
     get binaryVersion(): string {
-      return opts.binaryVersion ?? '0.7.0'
+      return opts.binaryVersion ?? PHASE1_RC_VERSION
     },
     async version(params: VersionParams): Promise<VersionResult> {
       opts.versionCalls?.push(params)
