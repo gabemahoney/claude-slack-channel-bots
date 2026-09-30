@@ -1,0 +1,339 @@
+/**
+ * ad-error-class.ts — The one classifier of agent-director errors (b.jg5
+ * SRJ-104), and the `ErrInvalidFlags` step beside it.
+ *
+ * {@link classifyAdError} maps any value thrown by an agent-director call to
+ * exactly one class:
+ *
+ *   GONE            ErrTmuxSendKeys, ErrTmuxCaptureFailed
+ *   UNAVAILABLE     ErrTmuxUnresponsive, ErrTmuxKillFailed, ErrCallTimeout;
+ *                   an ErrUnknownErrorName whose `unknownName` is neither
+ *                   ErrInternal nor ErrConfigMalformed (a Phase 1 name
+ *                   included); an AgentDirectorError whose `errName` is
+ *                   UnknownError (CSCB's own wrapper); any value that is not
+ *                   an AgentDirectorError
+ *   CONFLICT        ErrTmuxSessionConflict
+ *   UNUSABLE_NAME   an ErrInternal whose description carries "the recorded
+ *                   tmux session name" (`UNUSABLE_RECORDED_NAME_PHRASE`)
+ *   CONFIG          ErrConfigMalformed
+ *   ENVIRONMENT     ErrTmuxNotAvailable
+ *   LAUNCH_FAILURE  ErrTmuxSessionCreate
+ *   STATE           ErrSpawnNotFound, ErrInstanceIdCollision,
+ *                   ErrSpawnNotResumable, ErrSpawnNotInteractive,
+ *                   ErrSpawnNotPausable, ErrNoSessionId, ErrJsonlMissing,
+ *                   ErrJsonlNeverWritten, ErrInvalidFlags (its meaning is set
+ *                   per call site)
+ *   DIRECTORY       ErrCwdNotFound, ErrCwdNotADirectory
+ *   UNCLASSIFIED    every other ErrInternal, ErrSystemInstallDisappeared and
+ *                   every other agent-director error name
+ *
+ * Recognition is by name (b.jg5 SRJ-101 interim rule): the value's `errName`,
+ * and for an `ErrUnknownErrorName` its `unknownName` and the envelope's
+ * `err_description`; never the value's `name`. The three Phase-1-only names
+ * come from `src/agent-director-errors.ts` as strings, and nothing here
+ * imports their classes, which the branch's 0.10.0 client lacks. Only the
+ * base `AgentDirectorError` is tested by class. `ErrInternal` and
+ * `ErrConfigMalformed` arrive as `ErrUnknownErrorName`; a value whose own
+ * `errName` is one of them is classified the same way, its description taken
+ * from `errDescription` (Assumption A-13).
+ *
+ * An UNCLASSIFIED, UNUSABLE_NAME or CONFIG classification carries the
+ * reported name (`unknownName` for an `ErrUnknownErrorName`, else `errName`)
+ * only when `isSafeIdentifier` accepts it, and the message (the envelope's
+ * `err_description` for an `ErrUnknownErrorName`, else `errDescription`)
+ * rendered by `renderLogMessageText`: through `redactSlackLogText`, on one
+ * line, capped at `MAX_LOGGED_MESSAGE_LENGTH`. An unsafe name is absent,
+ * never reported raw; no placeholder stands in for it.
+ * {@link describeAdErrorClassification} renders a classification for a log
+ * line from those fields only.
+ *
+ * The classifier is pure: no I/O, clock, module state or agent-director call,
+ * and it never throws (a throwing property read counts as an absent field).
+ *
+ * {@link classifyWithInvalidFlagsRecheck} is the step for a site that gives
+ * `ErrInvalidFlags` no meaning (b.jg5 SRJ-104: any site but a plain or reuse
+ * spawn): an `ErrInvalidFlags` gets exactly one immediate version re-check
+ * through `triggerAdVersionRecheck` (`src/ad-version-gate.ts`, b.jg5 SRJ-204;
+ * injectable) and answers UNCLASSIFIED with the re-check's answer; any other
+ * value answers its pure class with no re-check. A stop the re-check decides
+ * ends the process as the re-check defines. Its callers: the resume path of
+ * `resumeOrFreshSpawn` (`src/session-manager.ts`) and the `decide` branch of
+ * the click handler (`src/permission-click-handler.ts`).
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+import { UNUSABLE_RECORDED_NAME_PHRASE } from './ad-description-phrases.ts'
+import {
+  RECHECK_OUTCOME_COULD_NOT_RUN,
+  triggerAdVersionRecheck,
+  type AdVersionRecheckTriggerAnswer,
+} from './ad-version-gate.ts'
+import {
+  AgentDirectorError,
+  ERR_TMUX_KILL_FAILED_NAME,
+  ERR_TMUX_SESSION_CONFLICT_NAME,
+  ERR_TMUX_UNRESPONSIVE_NAME,
+} from './agent-director-errors.ts'
+import { isSafeIdentifier, renderLogMessageText } from './persona-connection-errors.ts'
+
+// ---------------------------------------------------------------------------
+// Class labels
+// ---------------------------------------------------------------------------
+
+/** GONE: the tmux session is gone. */
+export const AD_ERROR_CLASS_GONE = 'GONE'
+/** UNAVAILABLE: agent-director or tmux could not answer; nothing destructive follows. */
+export const AD_ERROR_CLASS_UNAVAILABLE = 'UNAVAILABLE'
+/** CONFLICT: a tmux session conflict. */
+export const AD_ERROR_CLASS_CONFLICT = 'CONFLICT'
+/** UNUSABLE NAME: the row's recorded tmux session name cannot be used. */
+export const AD_ERROR_CLASS_UNUSABLE_NAME = 'UNUSABLE_NAME'
+/** CONFIG: agent-director's config file is malformed. */
+export const AD_ERROR_CLASS_CONFIG = 'CONFIG'
+/** ENVIRONMENT: tmux is not available. */
+export const AD_ERROR_CLASS_ENVIRONMENT = 'ENVIRONMENT'
+/** LAUNCH FAILURE: tmux could not create the session. */
+export const AD_ERROR_CLASS_LAUNCH_FAILURE = 'LAUNCH_FAILURE'
+/** STATE: the row's state refused the verb; its meaning is set per call site. */
+export const AD_ERROR_CLASS_STATE = 'STATE'
+/** DIRECTORY: the persona's working directory is missing or not a directory. */
+export const AD_ERROR_CLASS_DIRECTORY = 'DIRECTORY'
+/** UNCLASSIFIED: an agent-director error CSCB gives no handling. */
+export const AD_ERROR_CLASS_UNCLASSIFIED = 'UNCLASSIFIED'
+
+/** Every class label, in the order of b.jg5 SRJ-104's table. */
+export const AD_ERROR_CLASSES = [
+  AD_ERROR_CLASS_GONE,
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+  AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_LAUNCH_FAILURE,
+  AD_ERROR_CLASS_STATE,
+  AD_ERROR_CLASS_DIRECTORY,
+  AD_ERROR_CLASS_UNCLASSIFIED,
+] as const
+
+/** One class label. */
+export type AdErrorClass = (typeof AD_ERROR_CLASSES)[number]
+
+// ---------------------------------------------------------------------------
+// Names
+// ---------------------------------------------------------------------------
+
+/** `errName` of the client's error for an `err_name` it has no class for. */
+const ERR_UNKNOWN_ERROR_NAME = 'ErrUnknownErrorName'
+
+/** `unknownName` of an agent-director internal error (no class in any client). */
+const ERR_INTERNAL_NAME = 'ErrInternal'
+
+/** `unknownName` of a malformed agent-director config (no class in any client). */
+const ERR_CONFIG_MALFORMED_NAME = 'ErrConfigMalformed'
+
+/** `errName` of CSCB's own wrapper around a thrown value that was not an agent-director error. */
+export const CSCB_UNKNOWN_ERROR_NAME = 'UnknownError'
+
+/** `errName` of the error agent-director returns for flags this binary does not accept. */
+const ERR_INVALID_FLAGS_NAME = 'ErrInvalidFlags'
+
+/**
+ * The class of each agent-director error name the table names directly.
+ * `ErrInternal`, `ErrConfigMalformed`, `ErrUnknownErrorName` and CSCB's
+ * `UnknownError` are decided in {@link classifyAdError}; any other name is
+ * UNCLASSIFIED.
+ */
+const CLASS_BY_ERR_NAME: ReadonlyMap<string, AdErrorClass> = new Map<string, AdErrorClass>([
+  ['ErrTmuxSendKeys', AD_ERROR_CLASS_GONE],
+  ['ErrTmuxCaptureFailed', AD_ERROR_CLASS_GONE],
+  [ERR_TMUX_UNRESPONSIVE_NAME, AD_ERROR_CLASS_UNAVAILABLE],
+  [ERR_TMUX_KILL_FAILED_NAME, AD_ERROR_CLASS_UNAVAILABLE],
+  ['ErrCallTimeout', AD_ERROR_CLASS_UNAVAILABLE],
+  [ERR_TMUX_SESSION_CONFLICT_NAME, AD_ERROR_CLASS_CONFLICT],
+  ['ErrTmuxNotAvailable', AD_ERROR_CLASS_ENVIRONMENT],
+  ['ErrTmuxSessionCreate', AD_ERROR_CLASS_LAUNCH_FAILURE],
+  ['ErrSpawnNotFound', AD_ERROR_CLASS_STATE],
+  ['ErrInstanceIdCollision', AD_ERROR_CLASS_STATE],
+  ['ErrSpawnNotResumable', AD_ERROR_CLASS_STATE],
+  ['ErrSpawnNotInteractive', AD_ERROR_CLASS_STATE],
+  ['ErrSpawnNotPausable', AD_ERROR_CLASS_STATE],
+  ['ErrNoSessionId', AD_ERROR_CLASS_STATE],
+  ['ErrJsonlMissing', AD_ERROR_CLASS_STATE],
+  ['ErrJsonlNeverWritten', AD_ERROR_CLASS_STATE],
+  [ERR_INVALID_FLAGS_NAME, AD_ERROR_CLASS_STATE],
+  ['ErrCwdNotFound', AD_ERROR_CLASS_DIRECTORY],
+  ['ErrCwdNotADirectory', AD_ERROR_CLASS_DIRECTORY],
+])
+
+// ---------------------------------------------------------------------------
+// Classifier
+// ---------------------------------------------------------------------------
+
+/** What {@link classifyAdError} answers for one thrown value. */
+export interface AdErrorClassification {
+  /** The value's class. */
+  readonly errorClass: AdErrorClass
+  /**
+   * UNCLASSIFIED, UNUSABLE_NAME and CONFIG only: the reported name
+   * (`unknownName` of an `ErrUnknownErrorName`, else `errName`), present only
+   * when `isSafeIdentifier` accepts it.
+   */
+  readonly reportedName?: string
+  /**
+   * UNCLASSIFIED, UNUSABLE_NAME and CONFIG only: the message (the envelope's
+   * `err_description` of an `ErrUnknownErrorName`, else `errDescription`)
+   * rendered by `renderLogMessageText`, present only when that is not empty.
+   */
+  readonly message?: string
+}
+
+/**
+ * The class of any value thrown by an agent-director call (b.jg5 SRJ-104);
+ * see the module comment. Pure; never throws.
+ */
+export function classifyAdError(value: unknown): AdErrorClassification {
+  try {
+    if (!isAgentDirectorError(value)) return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
+    const errName = readProp(value, 'errName')
+    if (errName === ERR_UNKNOWN_ERROR_NAME) {
+      return classifyUnknownName(readProp(value, 'unknownName'), readProp(readProp(value, 'envelope'), 'err_description'))
+    }
+    if (errName === ERR_INTERNAL_NAME || errName === ERR_CONFIG_MALFORMED_NAME) {
+      return classifyUnknownName(errName, readProp(value, 'errDescription'))
+    }
+    if (errName === CSCB_UNKNOWN_ERROR_NAME) return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
+    const errorClass = typeof errName === 'string' ? CLASS_BY_ERR_NAME.get(errName) : undefined
+    if (errorClass !== undefined) return { errorClass }
+    return reported(AD_ERROR_CLASS_UNCLASSIFIED, errName, readProp(value, 'errDescription'))
+  } catch {
+    return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
+  }
+}
+
+/** An agent-director error whose `errName` is `ErrInvalidFlags`. */
+export type InvalidFlagsError = AgentDirectorError & { readonly errName: typeof ERR_INVALID_FLAGS_NAME }
+
+/**
+ * True when `value` is an agent-director `ErrInvalidFlags`, recognised by its
+ * `errName`. Never throws.
+ */
+export function isInvalidFlagsError(value: unknown): value is InvalidFlagsError {
+  try {
+    return isAgentDirectorError(value) && readProp(value, 'errName') === ERR_INVALID_FLAGS_NAME
+  } catch {
+    return false
+  }
+}
+
+/**
+ * One line for a log: `class=<class>[ name=<reported name>][ message="<message>"]`,
+ * from the classification's own fields only (the message JSON-quoted, as
+ * `describeLogMessage` quotes it). Never throws.
+ */
+export function describeAdErrorClassification(classification: AdErrorClassification): string {
+  const parts = [`class=${classification.errorClass}`]
+  if (classification.reportedName !== undefined) parts.push(`name=${classification.reportedName}`)
+  if (classification.message !== undefined) parts.push(`message=${JSON.stringify(classification.message)}`)
+  return parts.join(' ')
+}
+
+/** The class of an `ErrUnknownErrorName` (or an A-13 value) by `unknownName` and description. */
+function classifyUnknownName(unknownName: unknown, description: unknown): AdErrorClassification {
+  if (unknownName === ERR_INTERNAL_NAME) {
+    const unusable = typeof description === 'string' && description.includes(UNUSABLE_RECORDED_NAME_PHRASE)
+    return reported(unusable ? AD_ERROR_CLASS_UNUSABLE_NAME : AD_ERROR_CLASS_UNCLASSIFIED, unknownName, description)
+  }
+  if (unknownName === ERR_CONFIG_MALFORMED_NAME) return reported(AD_ERROR_CLASS_CONFIG, unknownName, description)
+  return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
+}
+
+/** A classification carrying the reported name (when safe) and the rendered message (when not empty). */
+function reported(errorClass: AdErrorClass, name: unknown, description: unknown): AdErrorClassification {
+  const message = renderLogMessageText(description)
+  return {
+    errorClass,
+    ...(isSafeIdentifier(name) ? { reportedName: name } : {}),
+    ...(message !== '' ? { message } : {}),
+  }
+}
+
+/** True when `value` is an instance of the client's base error class. Never throws. */
+function isAgentDirectorError(value: unknown): value is AgentDirectorError {
+  try {
+    return value instanceof AgentDirectorError
+  } catch {
+    return false
+  }
+}
+
+/** `obj[prop]`, or `undefined` when `obj` is not an object or the read throws. */
+function readProp(obj: unknown, prop: string): unknown {
+  if ((typeof obj !== 'object' && typeof obj !== 'function') || obj === null) return undefined
+  try {
+    return (obj as Record<string, unknown>)[prop]
+  } catch {
+    return undefined
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The ErrInvalidFlags step
+// ---------------------------------------------------------------------------
+
+/** An immediate version re-check: `triggerAdVersionRecheck`'s shape. */
+export type AdVersionRecheckTrigger = () => Promise<AdVersionRecheckTriggerAnswer>
+
+/** The could-not-run description of a re-check whose trigger threw or rejected (token-free, fixed text). */
+export const TRIGGER_FAILED_DESCRIPTION = 'the version re-check trigger failed'
+
+/** What {@link classifyWithInvalidFlagsRecheck} answers. */
+export interface AdErrorStepAnswer {
+  /** UNCLASSIFIED for an `ErrInvalidFlags`; otherwise {@link classifyAdError}'s answer. */
+  readonly classification: AdErrorClassification
+  /**
+   * The re-check's answer (pass, stop, could not run, not running); present
+   * only for an `ErrInvalidFlags`. A trigger that throws or rejects counts as
+   * could not run.
+   */
+  readonly recheck?: AdVersionRecheckTriggerAnswer
+}
+
+/** What {@link classifyWithInvalidFlagsRecheck} answers for an `ErrInvalidFlags`: the re-check's answer is always present. */
+export interface AdInvalidFlagsStepAnswer extends AdErrorStepAnswer {
+  readonly recheck: AdVersionRecheckTriggerAnswer
+}
+
+/**
+ * The `ErrInvalidFlags` step for a site that gives `ErrInvalidFlags` no
+ * meaning (b.jg5 SRJ-104, SRJ-204): for an `ErrInvalidFlags`, await exactly
+ * one immediate version re-check through `trigger` (default: the installed
+ * re-check's `triggerAdVersionRecheck`) and answer UNCLASSIFIED with the
+ * re-check's answer, whatever it is; for any other value, answer its pure
+ * class with no re-check. Never throws or rejects.
+ */
+export async function classifyWithInvalidFlagsRecheck(
+  value: InvalidFlagsError,
+  trigger?: AdVersionRecheckTrigger,
+): Promise<AdInvalidFlagsStepAnswer>
+export async function classifyWithInvalidFlagsRecheck(
+  value: unknown,
+  trigger?: AdVersionRecheckTrigger,
+): Promise<AdErrorStepAnswer>
+export async function classifyWithInvalidFlagsRecheck(
+  value: unknown,
+  trigger: AdVersionRecheckTrigger = triggerAdVersionRecheck,
+): Promise<AdErrorStepAnswer> {
+  if (!isInvalidFlagsError(value)) return { classification: classifyAdError(value) }
+  let recheck: AdVersionRecheckTriggerAnswer
+  try {
+    recheck = await trigger()
+  } catch {
+    recheck = { kind: RECHECK_OUTCOME_COULD_NOT_RUN, description: TRIGGER_FAILED_DESCRIPTION }
+  }
+  // UNCLASSIFIED carries the reported name (`errName`) and the rendered `errDescription`.
+  return {
+    classification: reported(AD_ERROR_CLASS_UNCLASSIFIED, readProp(value, 'errName'), readProp(value, 'errDescription')),
+    recheck,
+  }
+}

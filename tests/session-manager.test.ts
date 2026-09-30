@@ -15,6 +15,11 @@
  *     drives the documented branch. Collision fixtures build their row for
  *     the persona under test (`personaRow`), so its `cwd` and `config_dir`
  *     label match and each case stays on the path it tests.
+ *   - b.jg5 SRJ-104: a `resume` rejecting with ErrInvalidFlags makes exactly
+ *     one immediate version re-check (the real installed re-check over a
+ *     counting stub `resolveSystemBinary` and an unmoved fake clock), logs one
+ *     UNCLASSIFIED line and kills, deletes, spawns and resumes nothing more;
+ *     an ErrNoSessionId makes no re-check.
  *   - b.av2 SR-6.2 ladder guards: a row in another directory (by real path) is
  *     killed, deleted and spawned fresh on every path; a missing or changed
  *     `config_dir` label means a fresh spawn instead of a resume (AC 48).
@@ -259,9 +264,12 @@ import {
   errSpawnNotInteractive,
   errTmuxSendKeys,
   errTmuxSessionCreate,
+  errInvalidFlags,
   holdSpawns,
   makeStubCallLog,
   makeStubClient,
+  makeStubResolveSystemBinary,
+  resetStubSpawnPath,
   stubCallCount,
   type CannedGetResult,
   type CannedResponse,
@@ -314,6 +322,9 @@ import {
 } from '../src/agent-director-errors.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { RESTART_FAILURE_CAP } from '../src/restart.ts'
+import { AD_ERROR_CLASS_UNCLASSIFIED } from '../src/ad-error-class.ts'
+import { installAdVersionRecheck, RECHECK_OUTCOME_PASS, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
+import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -1209,6 +1220,92 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(spawnCalls).toHaveLength(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-104 — ErrInvalidFlags from resume: one immediate re-check, UNCLASSIFIED
+// ---------------------------------------------------------------------------
+//
+// The real re-check (`installAdVersionRecheck`) runs over a counting stub
+// `resolveSystemBinary` and a fake clock that is never moved, so every call
+// recorded is the immediate re-check the resume path triggered. The notice
+// and the failed outcome are not asserted: UNCLASSIFIED handling is E8's and
+// E12's.
+
+describe('collision ladder: ErrInvalidFlags on resume makes one version re-check, then is UNCLASSIFIED (b.jg5 SRJ-104)', () => {
+  /** Every `resolveSystemBinary` call the installed re-check made, by its opts. */
+  let resolveCalls: Array<object | undefined>
+  /** The exit codes the re-check stopped with. */
+  let stops: number[]
+
+  beforeEach(() => {
+    resolveCalls = []
+    stops = []
+    installAdVersionRecheck({
+      resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls }),
+      baselineVersion: PHASE1_RC_VERSION,
+      recordStartupError: () => {},
+      stop: (exitCode) => { stops.push(exitCode) },
+      log: () => {},
+      clock: createFakeClock(),
+    })
+  })
+
+  afterEach(() => {
+    resetAdVersionRecheckForTests()
+    resetStubSpawnPath()
+  })
+
+  /** A persona `C` whose spawn collides with its `ended` row, so the ladder resumes it and the resume rejects with `resumeError`. */
+  function installEndedRowResumeRejects(resumeError: Error) {
+    const calls = {
+      spawnCalls: [] as import('agent-director').SpawnParams[],
+      resumeCalls: [] as import('agent-director').ResumeParams[],
+      killCalls: [] as import('agent-director').KillParams[],
+      deleteCalls: [] as import('agent-director').DeleteParams[],
+    }
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    installStub({
+      ...calls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      resumeError,
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
+    })
+    return { cfg, calls }
+  }
+
+  test('ErrInvalidFlags: exactly one resolveSystemBinary call with no clock advance, one UNCLASSIFIED line, no kill, delete, fresh spawn or second resume', async () => {
+    const invalidFlags = errInvalidFlags('resume')
+    const { cfg, calls } = installEndedRowResumeRejects(invalidFlags)
+    const log = await withCapturedErr(async () => {
+      await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+    expect(resolveCalls).toHaveLength(1)
+    expect(stops).toEqual([])
+    const lines = log.split('\n').filter((l) => l.includes(`resume failed for ${renderPersonaRef('C', 'C')}: `))
+    expect(lines).toEqual([
+      `[slack] spawnForPersona: resume failed for ${renderPersonaRef('C', 'C')}: ` +
+        `class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${invalidFlags.errName} message=${JSON.stringify(invalidFlags.errDescription)} ` +
+        `(after one immediate agent-director version re-check: ${RECHECK_OUTCOME_PASS})`,
+    ])
+    expect(calls.resumeCalls).toHaveLength(1)
+    expect(calls.spawnCalls).toHaveLength(1)
+    expect(calls.killCalls).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
+  })
+
+  test('ErrNoSessionId: no re-check call; delete + fresh spawn as before', async () => {
+    const { cfg, calls } = installEndedRowResumeRejects(errNoSessionId())
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    expect(resolveCalls).toHaveLength(0)
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(calls.resumeCalls).toHaveLength(1)
+    expect(calls.deleteCalls).toHaveLength(1)
+    expect(calls.spawnCalls).toHaveLength(2)
   })
 })
 

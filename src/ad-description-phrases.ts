@@ -6,9 +6,10 @@
  * here so CSCB matches exactly what agent-director writes in an error's
  * description. CSCB only looks for them in a description it has received;
  * none is ever used to build a command. The stub's error builders
- * (`tests/test-helpers/agent-director-stub.ts`) take the words from here now
- * (SRJ-1303); the error classifier (`src/ad-error-class.ts`, E4 T3; b.jg5
- * SRJ-104) and later Epics (E11, E13, E28) will match them from here too.
+ * (`tests/test-helpers/agent-director-stub.ts`) take the words from here
+ * (SRJ-1303), and the error classifier (`src/ad-error-class.ts`; b.jg5
+ * SRJ-104) matches `UNUSABLE_RECORDED_NAME_PHRASE` from here; later Epics
+ * (E11, E13, E28) will match the others from here too.
  *
  * This module holds words only. It defines no order in which the CONFLICT
  * case words are checked; that order (b.jg5 SRJ-507) belongs to the code that

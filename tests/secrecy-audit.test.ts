@@ -31,9 +31,9 @@
  *    lifecycle, redaction and reload modules, plus the modules that log or
  *    post agent-director and Slack failures: the MCP registry, the session
  *    manager, restart, the permission poller and click handler, the persona
- *    notifier and destinations, the health check, the CLI and the template
- *    install), a value import of one of the
- *    `HELPER_SURFACES` helpers (the token builders and sentinel, the
+ *    notifier and destinations, the health check, the CLI, the template
+ *    install and the agent-director error classifier), a value import of one
+ *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
  *    config-file writer, the reload, connection and routing harnesses, the
  *    Slack client factory stub), or sets a stub's `leakMarker`. A suite that
  *    matches but has no secret-bearing surface is listed in `EXEMPT` with its
@@ -56,8 +56,8 @@
  *    `describeLogMessage` render it as `message="…"`, the
  *    `describeAgentDirectorFailure` copies and `describeRefreshFailure` the
  *    same). In every file under src/, a log call (a console method, or `log`,
- *    `logFailure`, `logViaDeps`, `recordStartupError` or `fatal`, bare or on
- *    an object) therefore never passes a caught error as an argument,
+ *    `logFailure`, `logViaDeps`, `logDeps`, `recordStartupError` or `fatal`,
+ *    bare or on an object) therefore never passes a caught error as an argument,
  *    interpolates it, reads its message or stack outside a describer call,
  *    hands it to a function that is not a safe describer (`String(err)`),
  *    logs an `errDescription` not through `redactSlackLogText` or an
@@ -122,6 +122,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/health-check\.ts$/, 'the health check, whose lines carry agent-director failure text'],
   [/^src\/cli\.ts$/, 'the CLI, which loads the config and logs agent-director failure text'],
   [/^src\/agent-director-template\.ts$/, "the template install and refresh, whose lines and startup error carry agent-director failure text"],
+  [/^src\/ad-error-class\.ts$/, "the agent-director error classifier, whose reported message carries agent-director failure text (an error's description) to log lines"],
 ]
 
 /** Test helpers whose named exports build tokens, credentials or config files, or plant the sentinel. */
@@ -420,11 +421,12 @@ const CONSOLE_METHODS = ['error', 'warn', 'log', 'info', 'debug']
 /**
  * Functions whose arguments reach a log line or startup-errors.log verbatim
  * (`recordStartupError` writes an `Error` cause as its name and message),
- * called bare or on an object (`deps.log`, `d.recordStartupError`). A local
- * declaration that passes its last parameter only through a describer is a
- * describing wrapper instead, and its calls are not sinks (`describingWrappers`).
+ * called bare or on an object (`deps.log`, `d.recordStartupError`; the click
+ * handler's `logDeps(deps, …)`). A local declaration that passes its last
+ * parameter only through a describer is a describing wrapper instead, and its
+ * calls are not sinks (`describingWrappers`).
  */
-const SINK_FUNCTIONS = ['log', 'logFailure', 'logViaDeps', 'recordStartupError', 'fatal']
+const SINK_FUNCTIONS = ['log', 'logFailure', 'logViaDeps', 'logDeps', 'recordStartupError', 'fatal']
 
 /** A log call: a console method or a sink function, bare or on an object. Built at runtime. */
 const SINK_CALL = new RegExp(
@@ -724,6 +726,7 @@ describe("a caught error's text reaches a log line under src/ only redacted (E14
     ['String(err)', 'try { f() } catch (err) { log(`x: ${String(err)}`) }', ['passes a caught error to a function that is not a describer (e.g. String(err))']],
     ['a name set from the message', 'try { f() } catch (err) { const cause = err instanceof Error ? err.message : String(err); log(`x: ${cause}`) }', ['interpolates a caught error']],
     ['a raw startup-error cause', "try { f() } catch (getErr) { recordStartupError('c', 'm', getErr) }", ['passes a caught error as a log argument']],
+    ["a caught error through the click handler's logDeps", 'try { f() } catch (err) { logDeps(deps, `x: ${err}`) }', ['interpolates a caught error']],
     ['an unredacted errDescription', 'log(`x: ${e.errDescription}`)', ['logs an errDescription not through redactSlackLogText']],
     ['an unchecked errName', 'console.error(`x: ${e.errName}`)', ['logs an errName not checked by isSafeIdentifier']],
     ['a wrapper that logs its error raw', 'function logFailure(what, err) { log(`${what}: ${err}`) }\ntry { f() } catch (err) { logFailure("x", err) }', ['interpolates a caught error', 'passes a caught error as a log argument']],

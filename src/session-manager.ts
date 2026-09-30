@@ -117,6 +117,11 @@ import {
   ErrSpawnCapReached,
   ErrSpawnNotInteractive,
 } from './agent-director-errors.ts'
+import {
+  classifyWithInvalidFlagsRecheck,
+  describeAdErrorClassification,
+  isInvalidFlagsError,
+} from './ad-error-class.ts'
 import { recordStartupError } from './startup-errors.ts'
 import {
   locateTranscript,
@@ -3306,6 +3311,14 @@ function reportInconclusiveDiagnosis(
  * JSONL diagnosis or amnesia action runs. `resume_enabled: false` never
  * reaches the guard: it already kills, deletes and spawns fresh.
  *
+ * b.jg5 SRJ-104: a `resume` that answers `ErrInvalidFlags` goes through the
+ * `ErrInvalidFlags` step (`classifyWithInvalidFlagsRecheck`): one immediate
+ * version re-check (a stop it decides ends the process, SRJ-205), class
+ * UNCLASSIFIED, and one log line built from the classification's rendered
+ * fields. Nothing is deleted, killed or launched because of it; the
+ * spawn-failure notice and the `failed` outcome stay until UNCLASSIFIED
+ * handling exists (SRJ-105, SRJ-313).
+ *
  * @param row  The row returned by the collision `get` (its `labels`).
  */
 async function resumeOrFreshSpawn(
@@ -3512,6 +3525,18 @@ async function resumeOrFreshSpawn(
         notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
+    }
+    if (isInvalidFlagsError(err)) {
+      // b.jg5 SRJ-104: the resume site gives ErrInvalidFlags no meaning: one
+      // immediate version re-check, then UNCLASSIFIED. The line is built from
+      // the classification's rendered fields, never from the error itself.
+      const step = await classifyWithInvalidFlagsRecheck(err)
+      console.error(
+        `[slack] spawnForPersona: resume failed for ${ref}: ${describeAdErrorClassification(step.classification)} ` +
+          `(after one immediate agent-director version re-check: ${step.recheck.kind})`,
+      )
+      notifySpawnFailure(key, err, isStartup)
+      return { key, action: 'failed' }
     }
     if (
       err instanceof ErrSystemInstallDisappeared ||

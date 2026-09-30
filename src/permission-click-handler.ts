@@ -19,6 +19,12 @@
  * retries nor touches the session — it repaints the prompt message to say the
  * answer must now be given at the pane (b.qi1).
  *
+ * `ErrInvalidFlags` from `decide` is logged once and not retried, and it
+ * starts one immediate agent-director version re-check through the
+ * `ErrInvalidFlags` step in `src/ad-error-class.ts` (b.jg5 SRJ-204, SRJ-104).
+ * The re-check is started, not awaited: the Slack interactive ack waits on
+ * this handler's return, so awaiting it would delay the ack (SRJ-122).
+ *
  * Clicks resolve through the receiving persona (b.av2 SR-7.1): the persona
  * whose connection received the click. Its key keys the outage state around
  * `decide`, and the verdict update and the relay-fallen-back repaint go
@@ -39,6 +45,7 @@
 
 import type { WebClient } from '@slack/web-api'
 
+import { classifyWithInvalidFlagsRecheck, type AdVersionRecheckTrigger } from './ad-error-class.ts'
 import { decideWithToken } from './agent-director-client.ts'
 import {
   AgentDirectorError,
@@ -84,6 +91,13 @@ export interface ClickDeps {
   emitTrail?: (
     partial: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown },
   ) => void
+  /**
+   * The immediate agent-director version re-check a `decide` answering
+   * `ErrInvalidFlags` runs (b.jg5 SRJ-204, SRJ-104). Defaults to
+   * `triggerAdVersionRecheck` (`src/ad-version-gate.ts`). Tests inject a
+   * counting stub.
+   */
+  recheckAdVersion?: AdVersionRecheckTrigger
 }
 
 function logDeps(deps: ClickDeps, ...args: unknown[]): void {
@@ -366,6 +380,16 @@ export async function handlePermissionClick(
     }
     if (err instanceof AgentDirectorError && err.errName === 'ErrInvalidFlags') {
       logDeps(deps, `[slack] permission-click: ErrInvalidFlags from decide for ${claudeInstanceId} (request_token=${requestToken})`)
+      // b.jg5 SRJ-204, SRJ-104: the ErrInvalidFlags step — one immediate
+      // version re-check (a stop it decides ends the process), class
+      // UNCLASSIFIED. The line above, the trail event, the no-retry and the
+      // return value stay as they are (SRJ-122).
+      //
+      // Started, not awaited: the router acks the Slack interactive payload
+      // only after this handler returns, and a slow re-check (up to its time
+      // limit) would hold that ack past Slack's window (SRJ-122). The step
+      // never rejects; the `.catch` only guards against an unhandled rejection.
+      void classifyWithInvalidFlagsRecheck(err, deps.recheckAdVersion).catch(() => {})
       return true
     }
     // ErrAmbiguousRequest is a defense-in-depth backstop per SR-4.4; under

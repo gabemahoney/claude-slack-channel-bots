@@ -130,14 +130,25 @@ export function describeThrownValue(value: unknown): string {
  * it. Never throws.
  */
 export function describeLogMessage(text: unknown): string {
+  const rendered = renderLogMessageText(text)
+  return rendered === '' ? '' : `message=${JSON.stringify(rendered)}`
+}
+
+/**
+ * The text `describeLogMessage` quotes, unquoted: a non-empty string `text`
+ * through `redactSlackLogText`, every line break collapsed to one space,
+ * trimmed and cut to `MAX_LOGGED_MESSAGE_LENGTH` characters (ending in `…`
+ * when cut); the empty string for anything else, or when the rendering
+ * throws. The agent-director error classifier (`src/ad-error-class.ts`)
+ * carries a message in this form. Never throws.
+ */
+export function renderLogMessageText(text: unknown): string {
   try {
     if (typeof text !== 'string' || text.trim() === '') return ''
     const flat = redactSlackLogText(text).split(LINE_BREAK_RE).join(' ').trim()
-    const capped =
-      flat.length > MAX_LOGGED_MESSAGE_LENGTH
-        ? flat.slice(0, MAX_LOGGED_MESSAGE_LENGTH - TRUNCATION_MARK.length) + TRUNCATION_MARK
-        : flat
-    return `message=${JSON.stringify(capped)}`
+    return flat.length > MAX_LOGGED_MESSAGE_LENGTH
+      ? flat.slice(0, MAX_LOGGED_MESSAGE_LENGTH - TRUNCATION_MARK.length) + TRUNCATION_MARK
+      : flat
   } catch {
     return ''
   }

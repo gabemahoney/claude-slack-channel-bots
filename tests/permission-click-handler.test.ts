@@ -22,6 +22,12 @@
  *     repaint + no markHandled + no retry (b.qi1).
  *   - ErrInvalidFlags / ErrAmbiguousRequest → log + no retry + no
  *     chat.update (SR-4.4).
+ *   - ErrInvalidFlags additionally makes exactly one immediate agent-director
+ *     version re-check (b.jg5 SRJ-204, SRJ-104), after its log line; its log
+ *     line, trail result_class, no-retry and no-render are unchanged
+ *     (SRJ-122). The handler starts the re-check and does not wait on it
+ *     (a re-check that never settles does not hold the click's return, so
+ *     the Slack ack is not delayed). No other decide error makes a re-check.
  *   - Unknown decide error → log + no chat.update (SR-4.4).
  *   - Sibling independence: clicking one of two siblings on the same spawn
  *     leaves the sibling's entry / messageTs untouched (SR-4.5).
@@ -70,6 +76,13 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable, type Client, type DecideParams, type DecideResult } from 'agent-director'
 import { handlePermissionClick, type ClickDeps } from '../src/permission-click-handler.ts'
+import type { AdVersionRecheckTrigger } from '../src/ad-error-class.ts'
+import {
+  AD_VERSION_RECHECK_TIME_LIMIT_MS,
+  RECHECK_OUTCOME_NOT_RUNNING,
+  installAdVersionRecheck,
+  resetAdVersionRecheckForTests,
+} from '../src/ad-version-gate.ts'
 import { encodePermissionActionId } from '../src/permission-action-id.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { personaKeyFromActionId } from './test-helpers/action-id-key.ts'
@@ -90,7 +103,11 @@ import {
   errGeneric,
   errInvalidFlags,
   errRelayFallenBack,
+  makeStubResolveSystemBinary,
+  type StubResolveSystemBinaryOutcome,
 } from './test-helpers/agent-director-stub.ts'
+import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeStubSlack, openedDm, type StubSlack } from './test-helpers/slack-stub.ts'
 import {
@@ -270,6 +287,7 @@ afterEach(() => {
   stopPermissionPoller()
   _resetPollerState()
   _resetOutageState()
+  resetAdVersionRecheckForTests()
   rmSync(h.dir, { recursive: true, force: true })
 })
 
@@ -1407,6 +1425,192 @@ describe('trail events — cscb.ad_decide.attempted', () => {
     const idxInv = trail.events.indexOf(invoked!)
     const idxDec = trail.events.indexOf(decided!)
     expect(idxInv).toBeLessThan(idxDec)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-204, SRJ-104, SRJ-122 — decide ErrInvalidFlags makes one
+// immediate agent-director version re-check; everything else is unchanged
+// ---------------------------------------------------------------------------
+
+describe('handlePermissionClick — decide ErrInvalidFlags version re-check (b.jg5 SRJ-204, SRJ-104, SRJ-122)', () => {
+  const USER = 'U_OPERATOR'
+
+  /**
+   * Install the real runtime re-check (the default `ClickDeps.recheckAdVersion`
+   * path, `triggerAdVersionRecheck`) over a stub `resolveSystemBinary` whose
+   * every call lands in `calls`. By default the stub answers with the
+   * baseline version, so a triggered re-check passes; `outcomes` scripts the
+   * stub's answers instead (e.g. a call that never settles). The fake clock
+   * moves only when a test advances it, so no timed re-check runs unless a
+   * test asks. `resetAdVersionRecheckForTests` in `afterEach` removes it.
+   */
+  function installCountingRecheck(outcomes?: readonly StubResolveSystemBinaryOutcome[]): {
+    calls: Array<object | undefined>
+    recheckLogs: string[]
+    stops: number[]
+    startupErrors: string[]
+    clock: FakeClock
+  } {
+    const calls: Array<object | undefined> = []
+    const recheckLogs: string[] = []
+    const stops: number[] = []
+    const startupErrors: string[] = []
+    const clock = createFakeClock()
+    const installed = installAdVersionRecheck({
+      resolveSystemBinary: makeStubResolveSystemBinary({ calls, outcomes }),
+      baselineVersion: PHASE1_RC_VERSION,
+      recordStartupError: (classLabel) => { startupErrors.push(classLabel) },
+      stop: (code) => { stops.push(code) },
+      log: (line) => { recheckLogs.push(line) },
+      clock,
+    })
+    expect(installed).toBeDefined()
+    return { calls, recheckLogs, stops, startupErrors, clock }
+  }
+
+  /** Let every pending microtask (a started, not awaited, re-check) run. */
+  function flushMacrotask(): Promise<void> {
+    return new Promise<void>((resolve) => { setTimeout(resolve, 0) })
+  }
+
+  test('ErrInvalidFlags → exactly one re-check; log line, trail result_class, no retry and no render unchanged', async () => {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const recheck = installCountingRecheck()
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub({ throwOn: errInvalidFlags() })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const logs: unknown[][] = []
+
+    const result = await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit, log: (...args: unknown[]) => logs.push(args) }),
+      { channel: CHANNEL_A, messageTs: 'TS', user: USER },
+    )
+
+    expect(result).toBe(true)
+    // The handler does not wait on the re-check; let it settle (the stub
+    // resolve answers on a microtask, the fake clock's time limit never fires)
+    // before checking what it did.
+    await flushMacrotask()
+    // Exactly one immediate re-check, through the installed re-check's one call.
+    expect(recheck.calls).toHaveLength(1)
+    // The re-check passed: nothing stopped, no startup-errors entry.
+    expect(recheck.stops).toHaveLength(0)
+    expect(recheck.startupErrors).toHaveLength(0)
+    // Today's one log line, word for word.
+    expect(logs).toEqual([[
+      `[slack] permission-click: ErrInvalidFlags from decide for ${h.instanceA} (request_token=${TOKEN_A})`,
+    ]])
+    // Trail result_class unchanged; no raw message.
+    const decided = trail.events.filter(e => e.event === 'cscb.ad_decide.attempted')
+    expect(decided).toHaveLength(1)
+    expect(decided[0]!['result_class']).toBe('ErrInvalidFlags')
+    expect('raw_error_message' in decided[0]!).toBe(false)
+    // No retry.
+    expect(decide.calls).toHaveLength(1)
+    // No render and no markHandled.
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(h.stubB.calls.update).toHaveLength(0)
+    expect(trail.events.filter(e => e.event === 'cscb.chat_update.attempted')).toHaveLength(0)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
+  })
+
+  test('ErrInvalidFlags with ClickDeps.recheckAdVersion → the injected trigger runs once, after the log line', async () => {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const installed = installCountingRecheck()
+    const decide = makeDecideStub({ throwOn: errInvalidFlags() })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const order: string[] = []
+    const recheckAdVersion: AdVersionRecheckTrigger = async () => {
+      order.push('recheck')
+      return { kind: RECHECK_OUTCOME_NOT_RUNNING }
+    }
+
+    const result = await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ recheckAdVersion, log: () => { order.push('log') } }),
+    )
+
+    expect(result).toBe(true)
+    expect(order).toEqual(['log', 'recheck'])
+    // The injected trigger replaces the default: the installed re-check is not called.
+    expect(installed.calls).toHaveLength(0)
+    expect(decide.calls).toHaveLength(1)
+  })
+
+  /**
+   * Bun's own per-test time limit for the never-settles case. The handler
+   * returns within a few ms when it does not wait on the re-check; if it did
+   * wait, the awaited call would never settle (the fake clock is not moved
+   * until after it returns), and this limit fails the test instead of letting
+   * it hang the run. It is the runner's bound, not a timer the test races.
+   */
+  const NEVER_SETTLES_TEST_LIMIT_MS = 1000
+
+  test('ErrInvalidFlags with a re-check whose call never settles (default path) → the handler still returns true at once (SRJ-122: the ack is not held)', async () => {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    // The production default: no ClickDeps.recheckAdVersion, so the step
+    // triggers the installed re-check, whose one resolve call never settles.
+    const recheck = installCountingRecheck([{ never: true }])
+    const decide = makeDecideStub({ throwOn: errInvalidFlags() })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+
+    const result = await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ log: () => { /* swallow */ } }),
+    )
+
+    // The handler returned while the re-check's call is still pending and
+    // the clock has not moved: it did not wait on the re-check.
+    expect(result).toBe(true)
+    expect(recheck.clock.now()).toBe(0)
+    expect(recheck.clock.firedCount()).toBe(0)
+    expect(recheck.calls).toHaveLength(1)
+    expect(recheck.stops).toHaveLength(0)
+    expect(decide.calls).toHaveLength(1)
+
+    // The call's time limit on the injected clock ends the hung call: only
+    // that limit timer fires (the timed re-check is due later), no second
+    // call is made and nothing stops.
+    const fired = await recheck.clock.advance(AD_VERSION_RECHECK_TIME_LIMIT_MS)
+    expect(fired).toBe(1)
+    expect(recheck.calls).toHaveLength(1)
+    expect(recheck.stops).toHaveLength(0)
+    expect(recheck.startupErrors).toHaveLength(0)
+    expect(decide.calls).toHaveLength(1)
+  }, { timeout: NEVER_SETTLES_TEST_LIMIT_MS })
+
+  test.each([
+    ['ErrAmbiguousRequest', () => errAmbiguousRequest()],
+    ['ErrAlreadyDecided', () => errAlreadyDecided()],
+    ['ErrRelayFallenBack', () => errRelayFallenBack()],
+    ['a generic AgentDirectorError', () => errGeneric('decide', 'ErrSomethingElse')],
+    ['a non-AgentDirectorError', () => new Error('network timeout')],
+  ] as Array<[string, () => Error]>)('%s → no re-check', async (_label, build) => {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const recheck = installCountingRecheck()
+    const decide = makeDecideStub({ throwOn: build() })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    let injectedCalls = 0
+
+    const result = await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ log: () => { /* swallow */ } }),
+    )
+    // The injected seam must stay silent too.
+    await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({
+        recheckAdVersion: async () => { injectedCalls++; return { kind: RECHECK_OUTCOME_NOT_RUNNING } },
+        log: () => { /* swallow */ },
+      }),
+    )
+
+    expect(result).toBe(true)
+    expect(recheck.calls).toHaveLength(0)
+    expect(injectedCalls).toBe(0)
+    expect(decide.calls).toHaveLength(2)
   })
 })
 

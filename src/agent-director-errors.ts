@@ -51,6 +51,9 @@
  *   - ErrSpawnNotInteractive    (send-keys / the row is `ended` or `missing`, or
  *                               `pending` without allow_pending: reconnectMcp's
  *                               dead-session verdict, b.dup)
+ *   - ErrSendKeysWhileRelayed   (send-keys / the row sits on a relayed permission
+ *                               prompt; UNCLASSIFIED under SRJ-104: CSCB gives it
+ *                               no handling)
  *   - ErrNoSessionId            (resume / SR-1.3 fallthrough)
  *   - ErrJsonlMissing           (resume / SR-1.3 fallthrough)
  *   - ErrJsonlNeverWritten      (resume / AD 0.10.0 — session never wrote a transcript, so nothing can be lost)
@@ -137,6 +140,7 @@ export {
   ErrInstanceIdCollision,
   ErrSpawnNotFound,
   ErrSpawnNotInteractive,
+  ErrSendKeysWhileRelayed,
   ErrNoSessionId,
   ErrJsonlMissing,
   ErrJsonlNeverWritten,

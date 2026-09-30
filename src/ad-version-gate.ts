@@ -35,10 +35,13 @@
  * (b.jg5 SRJ-209; no caller yet: E6 will re-read agent-director's timing
  * settings from this hook).
  * {@link triggerAdVersionRecheck} re-checks at once and answers with the
- * outcome (b.jg5 SRJ-204; no caller yet: E4's classifier will route
- * `ErrInvalidFlags` to it), and {@link onAdVersionChanged} listeners hear of
- * each passing re-check whose version differs from the last version seen (no
- * consumer yet: E23 will end `ErrInvalidFlags` holds on it, SRJ-207).
+ * outcome (b.jg5 SRJ-204). Its caller is the `ErrInvalidFlags` step in
+ * `src/ad-error-class.ts` (SRJ-104), which the resume path of
+ * `resumeOrFreshSpawn` (`src/session-manager.ts`) and the click handler's
+ * `decide` (`src/permission-click-handler.ts`) run on an `ErrInvalidFlags`.
+ * {@link onAdVersionChanged} listeners hear of each passing re-check whose
+ * version differs from the last version seen (no consumer yet: E23 will end
+ * `ErrInvalidFlags` holds on it, SRJ-207).
  * `main()` (`src/server.ts`) installs it through {@link installAdVersionRecheck}
  * right after the startup gate passes, and `shutdown()` disposes it through
  * {@link disposeAdVersionRecheck}.
@@ -887,10 +890,12 @@ export function onAdVersionRecheckTick(listener: AdVersionRecheckTickListener): 
 }
 
 /**
- * Re-check the host binary at once on the installed re-check (b.jg5 SRJ-204;
- * no caller yet: E4's classifier will route `ErrInvalidFlags` here, SRJ-104)
- * and answer with the outcome it
- * acted on: passed (with the version), stopped, could not run, or
+ * Re-check the host binary at once on the installed re-check (b.jg5 SRJ-204)
+ * and answer with the outcome it acted on. Called by the `ErrInvalidFlags`
+ * step in `src/ad-error-class.ts` (SRJ-104) for an `ErrInvalidFlags` from the
+ * resume path of `resumeOrFreshSpawn` (`src/session-manager.ts`) and from the
+ * click handler's `decide` (`src/permission-click-handler.ts`). The answer:
+ * passed (with the version), stopped, could not run, or
  * {@link RECHECK_OUTCOME_NOT_RUNNING} when none is installed, it was disposed
  * or it already stopped. Joins a check in flight; leaves the 120 s timer's
  * due time alone; runs no tick listener. Never throws or rejects.
