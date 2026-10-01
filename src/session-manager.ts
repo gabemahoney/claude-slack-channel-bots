@@ -85,12 +85,15 @@
  * An UNUSABLE NAME answer to either read latches the persona with the state
  * unreadable. A read that latched answers `latched`, and the caller calls
  * nothing more for the persona: no `send-keys`, kill, delete or launch, and
- * no hand-off to the `pending` deferral or the pending-only retry. The
- * working-pane read
+ * no hand-off to the `pending` deferral or the pending-only retry. Every
+ * `read-pane` of a persona's own row outside the dialog approver goes
+ * through the shared read-pane (`readPersonaOwnPane`, b.jg5 SRJ-117; the
+ * outcome and its class in `src/pane-read.ts`). Its working-pane use
  * (`readWorkingPane`, the launch wait's evidence read and the restart
- * path's `working`- and `waiting`-row checks) latches on an UNUSABLE NAME
- * answer too, with the state its caller last read, and its caller ends with
- * nothing typed.
+ * path's `working`- and `waiting`-row checks) latches on a CONFLICT answer,
+ * with the refused operation "P's next check or recovery", and on an
+ * UNUSABLE NAME answer, each with the state its caller last read; a latched
+ * persona is not read, and its caller ends with nothing typed.
  *
  * Both row checks go through `compareRowToPersona`. At most one launch per
  * persona is in flight (b.av2 SR-6.3): a concurrent call for the same key
@@ -228,6 +231,19 @@ import {
   isInvalidFlagsError,
 } from './ad-error-class.ts'
 import { RECHECK_OUTCOME_STOP } from './ad-version-gate.ts'
+import {
+  FULL_PANE_READ_LINES,
+  PANE_READ_CONFLICT,
+  PANE_READ_LATCHED,
+  PANE_READ_NOT_READ_LATCHED,
+  PANE_READ_PANE,
+  PANE_READ_UNUSABLE_NAME,
+  paneReadFailureOf,
+  type PaneReadConflict,
+  type PaneReadFailure,
+  type PaneReadOutcome,
+  type PaneReadUnusableName,
+} from './pane-read.ts'
 import {
   CONFLICT_LATCH_SET_LATCHED,
   CONFLICT_LATCH_SET_RELATCHED,
@@ -674,9 +690,10 @@ export type SessionConflictLatch = Pick<ConflictLatch, 'isLatched' | 'record' | 
  * installed (unit tests, the integration driver) no persona is latched, so no
  * launch is held back, and a CONFLICT at a ladder spawn or resume still takes
  * the CONFLICT row's no-action path and answers `latched` (`conflictAt`), as
- * does an UNUSABLE NAME answer at any site that latches on it
+ * does a CONFLICT at the shared read-pane (`readPersonaOwnPane`), an
+ * UNUSABLE NAME answer at any site that latches on it
  * (`unusableNameAt`, `readPersonaOwnRow`, `applyOwnRowStatusStep`,
- * `readWorkingPane`), and a latch decision of the row-read rule at an
+ * `readPersonaOwnPane`), and a latch decision of the row-read rule at an
  * own-row read (`readPersonaOwnRow`, `applyOwnRowStatusStep`: a `pending`
  * row with no launch start, or a latching note) when a configured-persona
  * query counts the key.
@@ -1437,6 +1454,108 @@ export async function readPersonaOwnRowStatus(key: string, at: OwnRowReadSite): 
   return launchStartedAt === undefined
     ? { kind: OWN_ROW_STATUS_STATE, state: result.state }
     : { kind: OWN_ROW_STATUS_STATE, state: result.state, launchStartedAt }
+}
+
+// ---------------------------------------------------------------------------
+// The shared read-pane of a persona's own row (b.jg5 SRJ-117)
+// ---------------------------------------------------------------------------
+
+/** What `readPersonaOwnPane` is asked to read, and for whom. */
+export interface PersonaPaneReadRequest {
+  /** Trailing pane lines to read (`FULL_PANE_READ_LINES` at a full read). */
+  readonly nLines: number
+  /**
+   * The row state the calling path last read (b.jg5 SRJ-501), which a latch
+   * set on the read's CONFLICT or UNUSABLE NAME answer records.
+   */
+  readonly lastRead: LatchRowState
+  /** A short site label, the head of the reader's latch line. */
+  readonly site: string
+}
+
+/**
+ * The shared read-pane of persona `key`'s own row (`cscb_<key>`, b.jg5
+ * SRJ-117): one `readPane` through `withOutageDetection`, declaring the
+ * `read-pane` verb (tmux-touching: inside an attempt an UNAVAILABLE starts
+ * `tmux-unresponsive` and a pane or GONE ends it, and ENVIRONMENT and CONFIG
+ * raise their outages, all in the wrapper), with `claude_instance_id` and
+ * `n_lines` only. Answers the read's outcome (`src/pane-read.ts`):
+ *
+ *   - a persona already latched (`personaLatchedNow`, b.jg5 SRJ-502) gets no
+ *     call and answers latched with no cause;
+ *   - a CONFLICT latches the persona through the latch's CONFLICT entry
+ *     (`setFromConflict`) with the refused operation "P's next check or
+ *     recovery" and `request.lastRead` (b.jg5 SRJ-501), and answers latched
+ *     with the CONFLICT as its cause;
+ *   - an UNUSABLE NAME latches it through the unusable-name entry
+ *     (`latchOnUnusableName`: refused operation "none", `request.lastRead`,
+ *     b.jg5 SRJ-512), and answers latched with it as its cause;
+ *   - every other outcome (a pane, GONE, absent, CONFIG, ENVIRONMENT,
+ *     UNAVAILABLE, UNCLASSIFIED) is returned unchanged for the caller to
+ *     handle.
+ *
+ * With no latch installed a CONFLICT or UNUSABLE NAME still answers latched
+ * with nothing latched, as the latch's entries do elsewhere (`conflictAt`,
+ * `unusableNameAt`). The reader posts nothing and counts nothing, and makes
+ * no further call after a latch. One line per latch it sets (no token: the
+ * answer through the redacting describer):
+ *
+ *   [slack] <site>: pane read refused for persona=<key>: <failure> — CONFLICT: <outcome>; nothing is typed and nothing more is called for it (b.jg5 SRJ-105, SRJ-501)
+ *   [slack] <site>: pane read refused for persona=<key>: <failure> — UNUSABLE NAME: <outcome>; nothing is typed and nothing more is called for it (b.jg5 SRJ-105, SRJ-512)
+ *
+ * Never throws.
+ */
+export async function readPersonaOwnPane(key: string, request: PersonaPaneReadRequest): Promise<PaneReadOutcome> {
+  if (personaLatchedNow(key)) return PANE_READ_NOT_READ_LATCHED
+  let failure: PaneReadFailure
+  try {
+    const result = await withOutageDetection(key, undefined, 'read-pane', (client) =>
+      client.readPane({ claude_instance_id: personaInstanceId(key), n_lines: request.nLines }),
+    )
+    return { kind: PANE_READ_PANE, pane: result.pane }
+  } catch (err) {
+    failure = paneReadFailureOf(err)
+  }
+  if (failure.kind === PANE_READ_CONFLICT) {
+    logPaneReadLatch(key, request, failure, latchOnConflict(key, failure.error, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, request.lastRead))
+    return { kind: PANE_READ_LATCHED, cause: failure }
+  }
+  if (failure.kind === PANE_READ_UNUSABLE_NAME) {
+    logPaneReadLatch(key, request, failure, latchOnUnusableName(key, failure.error, request.lastRead))
+    return { kind: PANE_READ_LATCHED, cause: failure }
+  }
+  return failure
+}
+
+/** `readPersonaOwnPane`'s one line for a latch it set (`outcome`: what became of the latch). */
+function logPaneReadLatch(
+  key: string,
+  request: PersonaPaneReadRequest,
+  cause: PaneReadConflict | PaneReadUnusableName,
+  outcome: string,
+): void {
+  const [label, srj] = cause.kind === PANE_READ_CONFLICT ? ['CONFLICT', 'SRJ-501'] : ['UNUSABLE NAME', 'SRJ-512']
+  console.error(
+    `[slack] ${request.site}: pane read refused for ${keyRef(key)}: ${cause.description} — ${label}: ${outcome}; ` +
+      `nothing is typed and nothing more is called for it (b.jg5 SRJ-105, ${srj})`,
+  )
+}
+
+/**
+ * Latch persona `key` on the thrown CONFLICT `err` through the installed
+ * latch's CONFLICT entry (`setFromConflict`, b.jg5 SRJ-501) with `operation`
+ * and `rowState`. Answers the latch line's outcome text: the set's outcome,
+ * that no latch is installed, or that latching failed and what it threw.
+ * Logs nothing; never throws.
+ */
+function latchOnConflict(key: string, err: unknown, operation: RefusedOperation, rowState: LatchRowState): string {
+  const latch = conflictLatch
+  if (latch === undefined) return LATCH_OUTCOME_NO_LATCH
+  try {
+    return conflictSetOutcomeText(latch.setFromConflict(key, err, { refusedOperation: operation, rowState }))
+  } catch (setErr) {
+    return `latching the persona failed: ${describeThrownValue(setErr)}`
+  }
 }
 
 /**
@@ -2830,18 +2949,7 @@ function approverLatchRowState(verb: ApproverVerb): LatchRowState {
  */
 function approverLatchOnConflict(ctx: ApproverContext, verb: ApproverVerb, err: unknown): string {
   ctx.run.stopRequested ??= APPROVER_STOP_LATCHED
-  const latch = conflictLatch
-  if (latch === undefined) return LATCH_OUTCOME_NO_LATCH
-  try {
-    return conflictSetOutcomeText(
-      latch.setFromConflict(ctx.key, err, {
-        refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
-        rowState: approverLatchRowState(verb),
-      }),
-    )
-  } catch (setErr) {
-    return `latching the persona failed: ${describeThrownValue(setErr)}`
-  }
+  return latchOnConflict(ctx.key, err, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, approverLatchRowState(verb))
 }
 
 // ---------------------------------------------------------------------------
@@ -2954,9 +3062,6 @@ export function _setUnprovenIdleNoticeAfterMs(ms: number): void {
 export function _resetUnprovenIdleNoticeAfterMs(): void {
   _unprovenIdleNoticeAfterMs = UNPROVEN_IDLE_NOTICE_AFTER_MS
 }
-
-/** Trailing pane lines read from a `working` row (as `approvePreSessionDialogs` reads). */
-const WORKING_PANE_LINES = 40
 
 /** The pane's last lines with text: Claude Code's prompt box, footer and any dialog are drawn there. */
 const WORKING_PANE_BOTTOM_LINES = 12
@@ -3160,8 +3265,12 @@ export function foldWorkingPaneRun(
 interface WorkingRowRead {
   /** The pane; undefined when the read failed, or when the persona latched. */
   pane: string | undefined
-  /** Why the pane read failed (`describeAgentDirectorFailure`, token-safe); set only then. */
-  paneFailure?: string
+  /**
+   * The pane read's failure outcome (`src/pane-read.ts`: its class and its
+   * token-safe description); set only when the read failed and latched
+   * nothing.
+   */
+  paneFailure?: PaneReadFailure
   /** The session's transcript, read only when the pane shows an idle screen. */
   transcript?: TranscriptReading
   /**
@@ -3209,14 +3318,15 @@ function latchedAfterOwnRowRead(key: string, site: string, what: string, ref: st
 }
 
 /**
- * Read persona `key`'s pane (`readWorkingPane`, whose UNUSABLE NAME answer
- * latches the persona with `lastRead`, the row state the calling path last
- * read) and, only when it shows an idle screen, its transcript
+ * Read persona `key`'s pane (`readWorkingPane`, whose CONFLICT or UNUSABLE
+ * NAME answer latches the persona with `lastRead`, the row state the calling
+ * path last read) and, only when it shows an idle screen, its transcript
  * (`readPersonaTranscript`), for one evidence read (b.f2b). After each of
  * the two reads it asks whether the persona is latched (`personaLatchedNow`,
  * or a read that latched it), and then answers `WORKING_ROW_READ_LATCHED`
  * with nothing more read (b.jg5 SRJ-502), carrying the state the transcript
- * `get` read when it was made. Never throws.
+ * `get` read when it was made. A failed pane read that latched nothing is
+ * carried as its outcome (`paneFailure`). Never throws.
  */
 async function readWorkingRowEvidence(
   key: string,
@@ -3224,8 +3334,8 @@ async function readWorkingRowEvidence(
   lastRead: LatchRowState,
 ): Promise<WorkingRowRead> {
   const read = await readWorkingPane(key, lastRead)
-  if ('latched' in read || personaLatchedNow(key)) return WORKING_ROW_READ_LATCHED
-  if ('failure' in read) return { pane: undefined, paneFailure: read.failure }
+  if (read.kind === PANE_READ_LATCHED || personaLatchedNow(key)) return WORKING_ROW_READ_LATCHED
+  if (read.kind !== PANE_READ_PANE) return { pane: undefined, paneFailure: read }
   if (classifyWorkingPane(read.pane) !== 'idle') return { pane: read.pane }
   const { transcript, rowRead } = await readPersonaTranscript(key, configDir)
   const tracked = rowRead === undefined ? {} : { rowRead }
@@ -3235,31 +3345,23 @@ async function readWorkingRowEvidence(
   return { pane: read.pane, transcript, ...tracked }
 }
 
-/** `readWorkingPane`'s answer when its `read-pane` latched the persona (b.jg5 SRJ-512). */
-type WorkingPaneLatched = { readonly latched: true }
-
 /**
- * Read the last lines of persona `key`'s pane (b.f2b): the pane, or the
- * failure as `describeAgentDirectorFailure` renders it (token-safe). b.jg5
- * SRJ-117, SRJ-512: an UNUSABLE NAME answer latches the persona
- * (`unusableNameAt`) with `lastRead`, the row state the calling path last
- * read (the launch wait's last read, or the `working` or `waiting` state
- * the restart path's check was called for), and answers `latched`: the
- * caller ends what it was doing with nothing typed. Every other failure is
- * the failure, as before. Never throws.
+ * Read the last `FULL_PANE_READ_LINES` lines of persona `key`'s pane (b.f2b)
+ * through the shared read-pane of its own row (`readPersonaOwnPane`, b.jg5
+ * SRJ-117), answering its outcome. A CONFLICT or UNUSABLE NAME answer
+ * latches the persona with `lastRead`, the row state the calling path last
+ * read (the launch wait's last read, or the `working` or `waiting` state the
+ * restart path's check was called for), and a persona already latched is not
+ * read: either way the outcome is latched, and the caller ends what it was
+ * doing with nothing typed (b.jg5 SRJ-501, SRJ-502, SRJ-512). Never throws.
  */
-async function readWorkingPane(
-  key: string,
-  lastRead: LatchRowState,
-): Promise<{ pane: string } | { failure: string } | WorkingPaneLatched> {
-  try {
-    const r = await withOutageDetection(key, undefined, 'read-pane', (client) =>
-      client.readPane({ claude_instance_id: personaInstanceId(key), n_lines: WORKING_PANE_LINES }))
-    return { pane: r.pane }
-  } catch (err) {
-    if (await unusableNameAt(key, err, lastRead, 'readWorkingPane', 'pane read', keyRef(key))) return { latched: true }
-    return { failure: describeAgentDirectorFailure(err) }
-  }
+async function readWorkingPane(key: string, lastRead: LatchRowState): Promise<PaneReadOutcome> {
+  return readPersonaOwnPane(key, { nLines: FULL_PANE_READ_LINES, lastRead, site: 'readWorkingPane' })
+}
+
+/** A failed pane read's class for the end of a log line (the description is rendered where the line names the failure). */
+function paneReadClassNote(failure: PaneReadFailure): string {
+  return `read-pane class=${failure.errorClass}`
 }
 
 /**
@@ -3371,8 +3473,9 @@ interface WorkingPaneWatch {
  * evidence ends the run; the wait's first pane failure and each new
  * transcript reason are logged, and the wait goes on as before.
  * `latched` when the persona is latched after the read's pane or transcript
- * read (b.jg5 SRJ-502, `WorkingRowRead.latched`; a pane read's UNUSABLE NAME
- * answer latches it with the wait's last read, b.jg5 SRJ-117, SRJ-512):
+ * read (b.jg5 SRJ-502, `WorkingRowRead.latched`; a pane read's CONFLICT or
+ * UNUSABLE NAME answer latches it with the wait's last read, b.jg5 SRJ-117,
+ * SRJ-501, SRJ-512, and a latched persona's pane is not read):
  * nothing is logged, folded or reported, and the wait ends with nothing
  * typed. The state the transcript `get` read, when it was made, becomes the
  * wait's last read (`wait.lastRead`, b.jg5 SRJ-501).
@@ -3398,7 +3501,7 @@ async function staleWorkingRowIsIdle(
   if (read.paneFailure !== undefined && !watch.readFailureLogged) {
     watch.readFailureLogged = true
     console.error(
-      `[slack] waitForWaitingAndReconnect: reading the pane of ${ref} failed: ${read.paneFailure} — no idle evidence from it; still waiting for its working row (b.f2b)`,
+      `[slack] waitForWaitingAndReconnect: reading the pane of ${ref} failed: ${read.paneFailure.description} — no idle evidence from it; still waiting for its working row (${paneReadClassNote(read.paneFailure)}; b.f2b)`,
     )
   }
   const note = transcriptNoEvidence(read.transcript)
@@ -3512,12 +3615,14 @@ export type WorkingRowPaneVerdict = 'reconnect' | 'defer'
  * per episode), so a row whose idleness can never be proven is not held back
  * from silently. `reconnect` ends the run. A live turn never ends its
  * transcript with a completed turn, so it is never taken for idle (b.rmy).
- * A persona latched during the evidence read (its pane read answered
- * UNUSABLE NAME, b.jg5 SRJ-117, SRJ-512, which latches it with the row
- * state `working`; its transcript `get` read a `provenance_conflict` note or
- * answered UNUSABLE NAME, b.jg5 SRJ-114; or it was latched elsewhere)
- * answers `defer` with its run forgotten, no deferral noted, no
- * not-connected notice and nothing typed (b.jg5 SRJ-502).
+ * A persona latched before or during the evidence read (its pane read
+ * answered CONFLICT or UNUSABLE NAME, b.jg5 SRJ-117, SRJ-501, SRJ-512,
+ * which latches it with the row state `working`; its transcript `get` read a
+ * `provenance_conflict` note or answered UNUSABLE NAME, b.jg5 SRJ-114; or it
+ * was latched elsewhere, and a latched persona's pane is not read) answers
+ * `defer` with its run forgotten, no deferral noted, no not-connected notice
+ * and nothing typed (b.jg5 SRJ-502). Every other failed pane read defers as
+ * an unreadable pane.
  * Logs one line per call; never throws.
  */
 export async function checkWorkingRowPane(
@@ -3558,8 +3663,9 @@ async function workingRowPaneVerdict(
   }
   if (read.pane === undefined) {
     workingRowPaneRuns.delete(key)
+    const failure = read.paneFailure
     console.error(
-      `[slack] reconnectSession: ${ref} is working and reading its pane failed: ${read.paneFailure} — no idle evidence; deferring /mcp reconnect to a later tick (b.f2b/b.rmy)`,
+      `[slack] reconnectSession: ${ref} is working and reading its pane failed: ${failure?.description ?? 'no pane was read'} — no idle evidence; deferring /mcp reconnect to a later tick (${failure === undefined ? '' : `${paneReadClassNote(failure)}; `}b.f2b/b.rmy)`,
     )
     return 'defer'
   }
@@ -3617,9 +3723,10 @@ function logNoWorkingRowEvidence(ref: string, reading: WorkingPaneReading, trans
  * before the reconnect adapter types `/mcp reconnect`: one pane read. A pane
  * that shows a running turn (`busy`) defers; so does a prompt or dialog,
  * which is never typed into and raises the `blocked-on-prompt` not-connected
- * notice (once per episode). b.jg5 SRJ-117, SRJ-512: a pane read that
- * answers UNUSABLE NAME latches the persona with the row state `waiting`
- * (`readWorkingPane`) and defers, never `reconnect`, with no notice, so the
+ * notice (once per episode). b.jg5 SRJ-117, SRJ-501, SRJ-512: a pane read
+ * that answers CONFLICT or UNUSABLE NAME latches the persona with the row
+ * state `waiting` (`readWorkingPane`), and a latched persona's pane is not
+ * read; either way it defers, never `reconnect`, with no notice, so the
  * adapter types nothing. Anything else, any other failed read included, lets
  * the reconnect go ahead: the `waiting` row is agent-director's own idle
  * signal. Logs a line for each deferral and for a failed read; never throws.
@@ -3628,12 +3735,12 @@ export async function checkWaitingRowPane(key: string): Promise<WorkingRowPaneVe
   const ref = keyRef(key)
   // The adapter called this for a row it has just read `waiting`.
   const read = await readWorkingPane(key, latchRowStateRead('waiting'))
-  if ('latched' in read) {
+  if (read.kind === PANE_READ_LATCHED) {
     console.error(`[slack] reconnectSession: ${ref} is waiting and is latched — deferring; nothing typed (b.jg5 SRJ-502)`)
     return 'defer'
   }
-  if ('failure' in read) {
-    console.error(`[slack] reconnectSession: ${ref} is waiting and reading its pane failed: ${read.failure} — reconnecting on the waiting row alone (b.f2b)`)
+  if (read.kind !== PANE_READ_PANE) {
+    console.error(`[slack] reconnectSession: ${ref} is waiting and reading its pane failed: ${read.description} — reconnecting on the waiting row alone (${paneReadClassNote(read)}; b.f2b)`)
     return 'reconnect'
   }
   const reading = classifyWorkingPane(read.pane)

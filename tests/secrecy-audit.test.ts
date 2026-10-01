@@ -136,6 +136,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/persona-episodes\.ts$/, "the persona episodes and the tmux-unresponsive condition, whose start line carries agent-director failure text (the refusing verb's error, described)"],
   [/^src\/outage-state\.ts$/, "the outage flags and their notices, whose ad-config-malformed onset carries agent-director's description (its error's message) to Slack"],
   [/^src\/conflict-latch\.ts$/, "the conflict latch, whose latch and relatch lines and stored record carry text from agent-director's CONFLICT description (the quoted session and the description, redacted)"],
+  [/^src\/pane-read\.ts$/, "the read-pane outcome, whose failure outcomes carry the described agent-director failure text (redacted) to the callers' log lines"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
 ]
 
@@ -416,6 +417,15 @@ describe('every suite that touches config, credentials or reload calls assertNoL
       (file) => SUITES.includes(file) && touchReasons(file).some((r) => r.includes('src/conflict-latch.ts')),
     )
     expect(exemptForLatch).toEqual([])
+  })
+
+  // b.jg5 SRJ-117: a read-pane failure outcome carries the described agent-director failure to its callers' log lines.
+  test('src/pane-read.ts is a source surface: its mapper touches, its constants alone do not, and its suite leak-checks with no exemption', () => {
+    const suite = 'tests/pane-read.test.ts'
+    expect(touchReasonsOf(suite, "import { paneReadFailureOf } from '../src/pane-read.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { FULL_PANE_READ_LINES, PANE_READ_GONE } from '../src/pane-read.ts'")).toEqual([])
+    expect(touchReasons(suite).some((r) => r.includes('src/pane-read.ts'))).toBe(true)
+    expect([callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([true, false])
   })
 
   test("each suite that builds the reload harness leak-checks a run's captured() artifacts", () => {

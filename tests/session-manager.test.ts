@@ -111,6 +111,23 @@
  *     post; B launches. Controls: a phrase-less `ErrInternal` keeps E12's
  *     UNCLASSIFIED handling, and the persona teardown's kill and delete
  *     rethrow and latch nothing.
+ *   - b.jg5 SRJ-117 (E18), with SRJ-501, SRJ-502 and SRJ-512, on
+ *     `makeRecoveryHarness`: the shared read-pane of a persona's own row
+ *     (`readPersonaOwnPane`) makes exactly one `read-pane` of `cscb_<key>`
+ *     with the given line count (`FULL_PANE_READ_LINES` at every full read)
+ *     and no other verb or raw tmux call; a pane, GONE, absent, UNAVAILABLE
+ *     (each `read-pane` form of `UNAVAILABLE_FORMS`), UNCLASSIFIED,
+ *     ENVIRONMENT (P's `tmux-unavailable` raised once) and CONFIG (P's
+ *     `ad-config-malformed` raised once, never GONE) are returned unchanged
+ *     with the classifier's class and the redacted description; a CONFLICT
+ *     (each `LIVENESS_PANE_CONFLICT_CASE_ROWS` row, with its site's recorded
+ *     state) latches P once with "P's next check or recovery", and an
+ *     UNUSABLE NAME (each fault) with "none", each with one post and no
+ *     further call; a latched P is not read. Controls: no latch installed,
+ *     a latch whose set or latched query throws, another persona's reads.
+ *     At `readWorkingPane`'s three callers a CONFLICT of the site's rows
+ *     latches P with the site's state and nothing is typed. A failed pane
+ *     read's line at those callers closes with its `read-pane` class.
  *   - b.jg5 SRJ-513, SRJ-1020 (E16 T2), with SRJ-114's and SRJ-115's sites,
  *     on `makeRecoveryHarness`: a configured persona's own row reading
  *     `pending` with no launch start (`LAUNCH_START_CASE_ROWS`: absent,
@@ -398,6 +415,8 @@ import {
   setConfiguredPersonaQuery,
   readPersonaOwnRow,
   readPersonaOwnRowStatus,
+  readPersonaOwnPane,
+  type PersonaPaneReadRequest,
   OWN_ROW_READ_ROW,
   OWN_ROW_STATUS_ABSENT,
   OWN_ROW_STATUS_LATCHED,
@@ -484,6 +503,7 @@ import {
   errJsonlNeverWritten,
   errSpawnNotFound,
   errSpawnNotResumable,
+  errTmuxCaptureFailed,
   errGeneric,
   errSpawnNotInteractive,
   errSpawnNotInteractiveLeftover,
@@ -517,6 +537,8 @@ import {
   type StubClientOptions,
   type StubResolveSystemBinaryOutcome,
   unavailableForms,
+  UNAVAILABLE_FORMS,
+  UNUSABLE_NAME_FAULTS,
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
@@ -569,7 +591,34 @@ import {
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
 import { RESTART_FAILURE_CAP, RESTART_OUTCOME_REFUSED, runRestartRetry, type LaunchSessionResult } from '../src/restart.ts'
-import { AD_ERROR_CLASS_UNCLASSIFIED, describeAdErrorClassification, describeAgentDirectorFailure } from '../src/ad-error-class.ts'
+import {
+  AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_GONE,
+  AD_ERROR_CLASS_LAUNCH_FAILURE,
+  AD_ERROR_CLASS_STATE,
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+  describeAdErrorClassification,
+  describeAgentDirectorFailure,
+} from '../src/ad-error-class.ts'
+import {
+  FULL_PANE_READ_LINES,
+  PANE_READ_ABSENT,
+  PANE_READ_CONFIG,
+  PANE_READ_CONFLICT,
+  PANE_READ_ENVIRONMENT,
+  PANE_READ_GONE,
+  PANE_READ_LATCHED,
+  PANE_READ_NOT_READ_LATCHED,
+  PANE_READ_PANE,
+  PANE_READ_UNAVAILABLE,
+  PANE_READ_UNCLASSIFIED,
+  PANE_READ_UNUSABLE_NAME,
+  type PaneReadOutcome,
+} from '../src/pane-read.ts'
 import type { UnclassifiedErrorSink } from '../src/persona-episodes.ts'
 import { getFailureCount } from '../src/backoff.ts'
 import {
@@ -593,9 +642,11 @@ import {
   LAUNCH_START_AND_NOTE_ROW,
   LAUNCH_START_CASE_ROWS,
   LAUNCH_START_NON_LATCHING_ROWS,
+  LIVENESS_PANE_CONFLICT_CASE_ROWS,
   UNUSABLE_NAME_CASE_ROWS,
   expectedConflictNotice,
   expectedLatchRecord,
+  livenessPaneConflictRowsAt,
   type ConflictCaseRow,
   type LaunchStartCaseRow,
   type LaunchStartCaseRowOf,
@@ -614,6 +665,7 @@ import {
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
   REFUSED_OPERATION_BRING_UP,
+  REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
   REFUSED_OPERATION_NONE,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
@@ -6939,9 +6991,14 @@ function showPane(opts: StubClientOptions, pane: PaneReading): void {
   opts.readPaneResults = pane instanceof Error ? undefined : [{ pane }]
 }
 
-/** The pane read of persona `key`'s own instance: its last 40 lines. */
+/** The pane read of persona `key`'s own instance: its last `FULL_PANE_READ_LINES` lines (b.jg5 SRJ-117). */
 function paneReadOf(key: string): import('agent-director').ReadPaneParams {
-  return { claude_instance_id: `cscb_${key}`, n_lines: 40 }
+  return { claude_instance_id: personaInstanceId(key), n_lines: FULL_PANE_READ_LINES }
+}
+
+/** The class note a failed pane read's line closes with (`read-pane class=<CLASS>`), for an answer of class `errorClass`. */
+function paneReadClassNote(errorClass: string): string {
+  return `(read-pane class=${errorClass}; `
 }
 
 /** Persona `C`'s agent-director row reading `working`, naming `transcript` (without one: no transcript). */
@@ -7231,9 +7288,12 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
     expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect'])
     expect(pendingAfter).toBe(false)
     expect(stub.sendKeysCalls).toEqual([])
-    // A failed read is logged by its errName and redacted message only.
+    // A failed read is logged by its errName and redacted message only, with
+    // its read-pane class (a name CSCB gives no handling: UNCLASSIFIED).
     const failure = `persona=C is working and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))}`
-    expect(linesWith(errLog, failure)).toHaveLength(broken instanceof Error ? 1 : 0)
+    const failed = linesWith(errLog, failure)
+    expect(failed).toHaveLength(broken instanceof Error ? 1 : 0)
+    for (const line of failed) expect(line).toEndWith(`${paneReadClassNote(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b/b.rmy)`)
     assertNoLeak({ errLog })
   })
 
@@ -7338,7 +7398,8 @@ describe('b.f2b: the restart path\'s check of a waiting row\'s pane before it re
     ['a running turn (its spinner line)', 'defer', () => SPINNER_PANE, 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
     ['a running turn with a custom spinner verb of several words', 'defer', () => CUSTOM_VERB_SPINNER_PANE, 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
     ['an API retry row', 'defer', () => withLastLine('  ⎿  Waiting for API response · will retry in 30s'), 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
-    ['a failed read (the waiting row alone decides)', 'reconnect', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'waiting')), `persona=C is waiting and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))} — reconnecting on the waiting row alone`],
+    // A name CSCB gives no handling: the line closes with its read-pane class, UNCLASSIFIED.
+    ['a failed read (the waiting row alone decides)', 'reconnect', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'waiting')), `persona=C is waiting and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))} — reconnecting on the waiting row alone ${paneReadClassNote(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b)`],
   ])('%s → %s: C\'s own pane read once, nothing typed here, no notice, one line unless it goes ahead plainly', async (_label, verdict, pane, line) => {
     const opts = paneOnly(pane())
     let got: string | undefined
@@ -7931,10 +7992,13 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     expect(result).toBe('not-reconnected')
     expect(row.sendKeysCalls).toEqual([])
     expect(clock.now()).toBeGreaterThanOrEqual(WAIT_FOR_WAITING_TIMEOUT_MS)
-    // Only the wait's first failed read is logged, by its errName and redacted message.
+    // Only the wait's first failed read is logged, by its errName and redacted
+    // message, closing with its read-pane class (UNCLASSIFIED).
     const failure = `reading the pane of persona=C failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))}`
     expect(linesWith(errLog, 'reading the pane of persona=C failed')).toHaveLength(row.pane instanceof Error ? 1 : 0)
-    expect(linesWith(errLog, failure)).toHaveLength(row.pane instanceof Error ? 1 : 0)
+    const failed = linesWith(errLog, failure)
+    expect(failed).toHaveLength(row.pane instanceof Error ? 1 : 0)
+    for (const line of failed) expect(line).toEndWith(`${paneReadClassNote(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b)`)
     assertNoLeak({ errLog })
   })
 })
@@ -16917,7 +16981,7 @@ describe('b.jg5 SRJ-117, SRJ-512, SRJ-502: an UNUSABLE NAME answer at a working-
     }
 
     expect(order).toEqual([...before, 'findMissing', 'status', 'readPane'])
-    expect(h.stub.calls.readPaneCalls).toEqual([{ claude_instance_id: personaInstanceId(p), n_lines: 40 }])
+    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
     expect(waitLatchedLines(h)).toHaveLength(1)
     expect(hasPendingWorkingRowEvidence(p)).toBe(false)
     expectLatchedOnce(h, p, unusableNameLatch(p, row, WORKING_READ))
@@ -16960,6 +17024,459 @@ describe('b.jg5 SRJ-117, SRJ-512, SRJ-502: an UNUSABLE NAME answer at a working-
     expect(order).toEqual(['readPane'])
     expect(h.errors.filter((line) => line.startsWith(`[slack] reconnectSession: persona=${p} is waiting and is latched — deferring; nothing typed`))).toHaveLength(1)
     expectLatchedOnce(h, p, unusableNameLatch(p, row, WAITING_READ))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-117 (with SRJ-501, SRJ-502, SRJ-512; E18): the shared read-pane
+// of a persona's own row (`readPersonaOwnPane`), which `readWorkingPane`
+// calls for the launch wait's evidence read, `checkWorkingRowPane` and
+// `checkWaitingRowPane`.
+//
+// One read is exactly one `read-pane` of `cscb_<key>` with the line count it
+// is given (`FULL_PANE_READ_LINES` at a full read), and no other verb or raw
+// tmux call (a recording prober and raw runner, `recordEveryCall`). A pane,
+// GONE, absent, UNAVAILABLE, UNCLASSIFIED, ENVIRONMENT (which raises P's
+// `tmux-unavailable` once, in the wrapper) and CONFIG (which raises P's
+// `ad-config-malformed` once and is never GONE) are returned unchanged, with
+// the classifier's class and the redacted description, and latch nothing.
+// A CONFLICT, each liveness pane row of the case table
+// (`LIVENESS_PANE_CONFLICT_CASE_ROWS`) with its site's recorded state,
+// latches P once through the latch's CONFLICT entry with "P's next check or
+// recovery" and that state, posts one notice after the holds and makes no
+// further call; an UNUSABLE NAME answer (each fault) latches P through the
+// unusable-name entry with the refused operation "none" and the state given.
+// A P already latched is not read. Controls: with no latch installed, or a
+// latch whose set throws, CONFLICT and UNUSABLE NAME still answer latched
+// and the reader never throws; another persona's reads and latch are
+// untouched. At the three callers, a CONFLICT of the site's rows latches P
+// with the site's state and nothing is typed: `checkWorkingRowPane` and
+// `checkWaitingRowPane` defer, the launch wait ends latched. Every case runs
+// on `makeRecoveryHarness` (the real latch installed as `main()` installs
+// it, a recording notice sink); `srj105AfterEach` runs `assertNoLeak` over
+// what it captured, and the file's `afterEach` clears the latch install and
+// the session notifier.
+// ---------------------------------------------------------------------------
+
+/** The site label the direct cases give the shared reader. */
+const PANE_READ_TEST_SITE = 'paneReadTest'
+
+/** The site label `readWorkingPane` gives the shared reader (its three callers' reads). */
+const READ_WORKING_PANE_SITE = 'readWorkingPane'
+
+/** A full read of P's own row by the direct cases, recording `lastRead` on a latch. */
+function fullPaneRead(lastRead: LatchRowState): PersonaPaneReadRequest {
+  return { nLines: FULL_PANE_READ_LINES, lastRead, site: PANE_READ_TEST_SITE }
+}
+
+/** The SRJ each latch kind's reader line cites. */
+const PANE_LATCH_SRJ = { 'CONFLICT': 'SRJ-501', 'UNUSABLE NAME': 'SRJ-512' } as const
+
+/** A latch the shared reader sets: on a CONFLICT or an UNUSABLE NAME answer. */
+type PaneLatchKind = keyof typeof PANE_LATCH_SRJ
+
+/** The shared reader's latch lines of `kind` for persona `key` at `site`, in `lines`. */
+function paneReadLatchLinesOf(lines: readonly string[], key: string, kind: PaneLatchKind, site: string): string[] {
+  return lines.filter(
+    (line) =>
+      line.startsWith(`[slack] ${site}: pane read refused for persona=${key}: `) &&
+      line.includes(` — ${kind}: `) &&
+      line.endsWith(`; nothing is typed and nothing more is called for it (b.jg5 SRJ-105, ${PANE_LATCH_SRJ[kind]})`),
+  )
+}
+
+/** Every latch line the shared reader logged, at any site, for any persona. */
+function allPaneReadLatchLines(h: RecoveryHarness): string[] {
+  return h.errors.filter((line) => line.includes(': pane read refused for persona='))
+}
+
+/**
+ * A CONFLICT latch from the liveness pane row `row` at `site`: "P's next
+ * check or recovery" (imported, not read from the row) and the row's
+ * recorded state, its notice, and one reader line saying P latched.
+ */
+function paneConflictLatch(p: string, row: ConflictCaseRow, site: string): ExpectedLatch {
+  return {
+    ...conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, row.rowState),
+    lines: (h, key) => paneReadLatchLinesOf(h.errors, key, 'CONFLICT', site),
+  }
+}
+
+/** An "unusable recorded name" latch from `row` at `site` with the state `rowState`, and one reader line saying P latched. */
+function paneUnusableNameLatch(p: string, row: UnusableNameCaseRow, rowState: LatchRowState, site: string): ExpectedLatch {
+  return {
+    ...unusableNameLatch(p, row, rowState),
+    lines: (h, key) => paneReadLatchLinesOf(h.errors, key, 'UNUSABLE NAME', site),
+  }
+}
+
+/** The failure outcome the reader answers for `err` of `kind`: the class given and the redacting describer's text. */
+function paneFailure(kind: string, errorClass: string, err: unknown): PaneReadOutcome {
+  return { kind, errorClass, description: describeAgentDirectorFailure(err) } as PaneReadOutcome
+}
+
+/** The latched outcome the reader answers for a latching `err` of `kind`: the answer kept as its cause. */
+function paneLatchedBy(kind: string, errorClass: string, err: unknown): PaneReadOutcome {
+  return { kind: PANE_READ_LATCHED, cause: { kind, errorClass, description: describeAgentDirectorFailure(err), error: err } } as PaneReadOutcome
+}
+
+/**
+ * One read and nothing else: `order` (every stub verb and raw tmux call)
+ * holds only P's `readPane`, made with the full-read count; nothing latched,
+ * posted or logged as a latch.
+ */
+function expectOneQuietRead(h: RecoveryHarness, order: readonly string[], p: string): void {
+  expect(order).toEqual(['readPane'])
+  expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
+  expect(h.stub.callCount()).toBe(1)
+  expectNoNoteLatch(h)
+  expect(h.notices).toEqual([])
+  expect(allPaneReadLatchLines(h)).toEqual([])
+}
+
+/** The stub's UNAVAILABLE forms a `read-pane` can answer (every one but the kill-only `ErrTmuxKillFailed`). */
+const PANE_UNAVAILABLE_FORMS = UNAVAILABLE_FORMS.filter(([, , cause]) => cause !== UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)
+
+/** The outage class an ENVIRONMENT answer raises (b.jg5 SRJ-311). */
+const TMUX_UNAVAILABLE_CLASS: OutageClass = 'tmux-unavailable'
+
+/** The outage class a CONFIG answer raises (b.jg5 SRJ-316). */
+const AD_CONFIG_MALFORMED_CLASS: OutageClass = 'ad-config-malformed'
+
+/** The liveness pane row of the case table each control takes: the first. */
+const FIRST_LIVENESS_PANE_ROW = LIVENESS_PANE_CONFLICT_CASE_ROWS[0]!
+
+/** The UNUSABLE NAME row of the `read-pane` site kind for each fault the stub builds. */
+const PANE_UNUSABLE_NAME_ROWS = UNUSABLE_NAME_FAULTS.map((fault) => {
+  const row = unusableNameRowsAt('read-pane').find((r) => r.fault === fault)
+  if (row === undefined) throw new Error(`no read-pane UNUSABLE NAME row for ${fault}`)
+  return row
+})
+
+/** The two answers the reader latches on, each with a builder, its kind, its class and its line's kind. */
+const PANE_LATCHING_ANSWERS: ReadonlyArray<readonly [string, () => Error, string, string, PaneLatchKind]> = [
+  ['a CONFLICT', () => FIRST_LIVENESS_PANE_ROW.build(), PANE_READ_CONFLICT, AD_ERROR_CLASS_CONFLICT, 'CONFLICT'],
+  ['an UNUSABLE NAME', () => PANE_UNUSABLE_NAME_ROWS[0]!.build(), PANE_READ_UNUSABLE_NAME, AD_ERROR_CLASS_UNUSABLE_NAME, 'UNUSABLE NAME'],
+]
+
+describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-512: the shared read-pane of a persona\'s own row (readPersonaOwnPane): one read-pane, every outcome but CONFLICT and UNUSABLE NAME returned unchanged, and those two latch the persona', () => {
+  afterEach(srj105AfterEach)
+
+  test('a pane: one read-pane of P\'s own row with the full-read line count, answered as the pane; no other verb and no raw tmux call; nothing latched or posted', async () => {
+    const { h, p } = srj105Build()
+    h.script({ readPaneResults: [{ pane: IDLE_PANE }] })
+    const order = await recordEveryCall(h, p)
+
+    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual({ kind: PANE_READ_PANE, pane: IDLE_PANE })
+
+    expectOneQuietRead(h, order, p)
+  })
+
+  test.each<[string, () => Error, string, string]>([
+    ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(), PANE_READ_GONE, AD_ERROR_CLASS_GONE],
+    ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), PANE_READ_ABSENT, AD_ERROR_CLASS_STATE],
+    ['UNCLASSIFIED: an ErrInternal not naming the recorded tmux session name', () => errInternal(), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED],
+    ['UNCLASSIFIED: a name CSCB gives no handling (ErrNotHandled)', () => errGeneric('read-pane', 'ErrNotHandled'), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED],
+    ['UNCLASSIFIED: a store that cannot be opened (ErrSchemaMismatch)', () => errSchemaMismatch(), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED],
+    ['UNCLASSIFIED: ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('read-pane'), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED],
+    ['UNCLASSIFIED: a STATE name other than ErrSpawnNotFound (ErrSpawnNotInteractive)', () => errSpawnNotInteractive('read-pane'), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_STATE],
+    ['UNCLASSIFIED: a LAUNCH FAILURE name (ErrTmuxSessionCreate)', () => errTmuxSessionCreate('read-pane'), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_LAUNCH_FAILURE],
+  ])('%s: returned unchanged, with the classifier\'s class and the redacted description; one read-pane and nothing else; nothing latched or posted', async (_label, build, kind, errorClass) => {
+    const { h, p } = srj105Build()
+    const err = build()
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+
+    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(paneFailure(kind, errorClass, err))
+
+    expectOneQuietRead(h, order, p)
+  })
+
+  test.each(PANE_UNAVAILABLE_FORMS)('UNAVAILABLE (%s): returned unchanged as UNAVAILABLE; one read-pane and nothing else; no outage raised, nothing latched or posted', async (_label, make) => {
+    const { h, p } = srj105Build()
+    const err = make('read-pane')
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+
+    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(paneFailure(PANE_READ_UNAVAILABLE, AD_ERROR_CLASS_UNAVAILABLE, err))
+
+    expectOneQuietRead(h, order, p)
+    expect([...getOutageFlags(p)]).toEqual([])
+    expect(h.outageNotices).toEqual([])
+  })
+
+  test.each(SRJ311_ENVIRONMENT.map(([what, make, onset]) => [what, make, onset] as const))('ENVIRONMENT (%s): returned unchanged as ENVIRONMENT; P\'s tmux-unavailable raised once with its onset, B\'s untouched; one read-pane and nothing else; nothing latched', async (_what, make, onset) => {
+    const { h, p, b } = srj105Build()
+    const err = make('read-pane')
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+
+    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(paneFailure(PANE_READ_ENVIRONMENT, AD_ERROR_CLASS_ENVIRONMENT, err))
+
+    expectOneQuietRead(h, order, p)
+    expect([...getOutageFlags(p)]).toEqual([TMUX_UNAVAILABLE_CLASS])
+    expect([...getOutageFlags(b)]).toEqual([])
+    expect(h.outageNotices).toEqual([{ key: p, text: onset }])
+  })
+
+  test('CONFIG (ErrConfigMalformed): returned unchanged as CONFIG, never GONE; P\'s ad-config-malformed raised once with its onset and one raise line, B\'s untouched; one read-pane and nothing else; nothing latched', async () => {
+    const { h, p, b } = srj105Build()
+    const err = errConfigMalformed()
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+
+    const read = await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))
+
+    expect(read).toStrictEqual(paneFailure(PANE_READ_CONFIG, AD_ERROR_CLASS_CONFIG, err))
+    expect(read.kind).not.toBe(PANE_READ_GONE)
+    expectOneQuietRead(h, order, p)
+    expect([...getOutageFlags(p)]).toEqual([AD_CONFIG_MALFORMED_CLASS])
+    expect([...getOutageFlags(b)]).toEqual([])
+    expect(h.outageNotices).toEqual([{ key: p, text: adConfigMalformedOnset(err) }])
+    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(1)
+  })
+
+  test.each(LIVENESS_PANE_CONFLICT_CASE_ROWS.map((row) => [row.name, row] as const))('CONFLICT at %s: answered latched with the CONFLICT as its cause; P latched once through the CONFLICT entry with the row\'s case, "P\'s next check or recovery" and the site\'s recorded state; one notice after the holds; that read is the only call, raw tmux included; a later read of P makes no call; B is not latched', async (_name, row) => {
+    const { h, p, b } = srj105Build()
+    const err = row.build()
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+
+    expect(await readPersonaOwnPane(p, fullPaneRead(row.rowState))).toStrictEqual({
+      kind: PANE_READ_LATCHED,
+      cause: { kind: PANE_READ_CONFLICT, errorClass: AD_ERROR_CLASS_CONFLICT, description: describeAgentDirectorFailure(err), error: err },
+    })
+
+    expect(order).toEqual(['readPane'])
+    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
+    expectLatchedOnce(h, p, paneConflictLatch(p, row, PANE_READ_TEST_SITE))
+    expect(h.latch.record(p)?.refusedOperation).toBe(REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY)
+    expect(h.latch.record(p)?.rowState).toEqual(row.rowState)
+
+    // Latched now: the next read of P is not made, and nothing more is set or posted.
+    expect(await readPersonaOwnPane(p, fullPaneRead(row.rowState))).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
+    expect(order).toEqual(['readPane'])
+    expect(h.latchEvents).toHaveLength(ONE_LATCH_STEPS.length)
+    expect(h.episodeNotices).toHaveLength(1)
+    expect(h.latch.isLatched(b)).toBe(false)
+  })
+
+  const unusableCross = PANE_UNUSABLE_NAME_ROWS.flatMap((row) =>
+    [WORKING_READ, WAITING_READ].map((lastRead) => [row.fault, describeLatchRowState(lastRead), row, lastRead] as const),
+  )
+  test.each(unusableCross)('UNUSABLE NAME (%s) with the state last read %s: answered latched with it as its cause; P latched once through the unusable-name entry, refused operation "none" and that state; one SRJ-1019 post; that read is the only call, raw tmux included; a later read makes no call', async (_fault, _state, row, lastRead) => {
+    const { h, p } = srj105Build()
+    const err = row.build()
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+
+    expect(await readPersonaOwnPane(p, fullPaneRead(lastRead))).toStrictEqual({
+      kind: PANE_READ_LATCHED,
+      cause: { kind: PANE_READ_UNUSABLE_NAME, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, description: describeAgentDirectorFailure(err), error: err },
+    })
+
+    expect(order).toEqual(['readPane'])
+    expectLatchedOnce(h, p, paneUnusableNameLatch(p, row, lastRead, PANE_READ_TEST_SITE))
+    expect(h.latch.record(p)?.refusedOperation).toBe(REFUSED_OPERATION_NONE)
+
+    expect(await readPersonaOwnPane(p, fullPaneRead(lastRead))).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
+    expect(order).toEqual(['readPane'])
+    expect(h.latchEvents).toHaveLength(ONE_LATCH_STEPS.length)
+  })
+
+  test('a P already latched (elsewhere): no read-pane call and no other call, answered latched with no cause; nothing set or posted; B\'s read is made as before', async () => {
+    const { h, p, b } = srj105Build()
+    const elsewhere = installLatchElsewhere()
+    elsewhere.latch.set(p, LATCHED_ELSEWHERE)
+    h.script({ readPaneResults: [{ pane: IDLE_PANE }] })
+    const order = await recordEveryCall(h, p)
+
+    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
+
+    expect(order).toEqual([])
+    expect(h.stub.callCount()).toBe(0)
+    expect(allPaneReadLatchLines(h)).toEqual([])
+    expectLatchedElsewhereOnly(h, p, elsewhere)
+
+    expect(await readPersonaOwnPane(b, fullPaneRead(WORKING_READ))).toStrictEqual({ kind: PANE_READ_PANE, pane: IDLE_PANE })
+    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(b)])
+    expect(elsewhere.latch.isLatched(b)).toBe(false)
+  })
+
+  test('an installed latch whose latched query throws is taken as latched: no call, answered latched with no cause, and the reader does not throw', async () => {
+    const { h, p } = srj105Build()
+    setConflictLatch({
+      isLatched: () => {
+        throw new Error('latch query broken')
+      },
+      record: () => undefined,
+      set: () => CONFLICT_LATCH_SET_LATCHED,
+      setFromConflict: () => undefined,
+    })
+    const order = await recordEveryCall(h, p)
+
+    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
+
+    expect(order).toEqual([])
+    expect(allPaneReadLatchLines(h)).toEqual([])
+  })
+
+  test.each(PANE_LATCHING_ANSWERS)('control: with no latch installed, %s still answers latched with it as its cause and latches nothing; its one line says no latch is installed; nothing posted; the next read is made again', async (_what, build, kind, errorClass, lineKind) => {
+    const { h, p } = srj105Build()
+    setConflictLatch(undefined)
+    const err = build()
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+
+    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(paneLatchedBy(kind, errorClass, err))
+
+    expect(order).toEqual(['readPane'])
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(h.latchEvents).toEqual([])
+    expect(h.episodeNotices).toEqual([])
+    expect(h.notices).toEqual([])
+    const lines = paneReadLatchLinesOf(h.errors, p, lineKind, PANE_READ_TEST_SITE)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(` — ${lineKind}: no latch is installed, so nothing is latched; `)
+
+    // Nothing holds P back: the next read is made.
+    await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))
+    expect(order).toEqual(['readPane', 'readPane'])
+  })
+
+  test.each(PANE_LATCHING_ANSWERS)('control: an installed latch whose set throws: %s still answers latched with no throw and nothing more called; its one line names the failure', async (_what, build, kind, errorClass, lineKind) => {
+    const { h, p } = srj105Build()
+    const sets: string[] = []
+    setConflictLatch({
+      isLatched: () => false,
+      record: () => undefined,
+      set: (key) => {
+        sets.push(key)
+        throw new Error('latch store broken')
+      },
+      setFromConflict: (key) => {
+        sets.push(key)
+        throw new Error('latch store broken')
+      },
+    })
+    const err = build()
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+
+    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(paneLatchedBy(kind, errorClass, err))
+
+    expect(order).toEqual(['readPane'])
+    expect(sets).toEqual([p])
+    const lines = paneReadLatchLinesOf(h.errors, p, lineKind, PANE_READ_TEST_SITE)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(` — ${lineKind}: latching the persona failed: `)
+    expect(lines[0]).toContain('latch store broken')
+    expect(h.notices).toEqual([])
+  })
+
+  test('control: P latched by a CONFLICT at its read leaves B alone: B\'s read is one read-pane of B\'s own row, answered as its pane; B is not latched and nothing is set for it', async () => {
+    const { h, p, b } = srj105Build()
+    const row = FIRST_LIVENESS_PANE_ROW
+    h.script({ readPaneQueue: [cannedErr(row.build()), cannedOk({ pane: SPINNER_PANE })] })
+
+    expect((await readPersonaOwnPane(p, fullPaneRead(row.rowState))).kind).toBe(PANE_READ_LATCHED)
+    expect(await readPersonaOwnPane(b, fullPaneRead(WORKING_READ))).toStrictEqual({ kind: PANE_READ_PANE, pane: SPINNER_PANE })
+
+    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p), paneReadOf(b)])
+    expect(h.stub.callCount()).toBe(2)
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect(h.latch.isLatched(b)).toBe(false)
+    expect(h.latchEvents.filter((event) => event.key === b)).toEqual([])
+    expect(h.episodeNotices.map((n) => n.key)).toEqual([p])
+  })
+
+  test('no secret reaches a line, an outcome or a post: an UNUSABLE NAME and an UNCLASSIFIED answer whose descriptions carry a token are rendered redacted', async () => {
+    const { h, p, b } = srj105Build()
+    const token = fakeToken(BOT_TOKEN_PREFIX)
+    h.script({
+      readPaneQueue: [
+        cannedErr(errInternal(`${UNUSABLE_RECORDED_NAME_PHRASE} is empty; token ${token}`)),
+        cannedErr(errGeneric('read-pane', 'ErrNotHandled', `boom ${token}`)),
+      ],
+    })
+
+    const latched = await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))
+    const unclassified = await readPersonaOwnPane(b, fullPaneRead(WORKING_READ))
+
+    expect(latched.kind).toBe(PANE_READ_LATCHED)
+    expect(unclassified.kind).toBe(PANE_READ_UNCLASSIFIED)
+    // The outcomes keep the thrown value only as `error`; their descriptions are redacted.
+    const descriptions = [
+      latched.kind === PANE_READ_LATCHED ? latched.cause?.description : undefined,
+      unclassified.kind === PANE_READ_UNCLASSIFIED ? unclassified.description : undefined,
+    ]
+    // The UNCLASSIFIED answer's message is quoted, its token redacted.
+    expect(descriptions[1]).toContain(REDACTED_TOKEN_PLACEHOLDER)
+    expect(paneReadLatchLinesOf(h.errors, p, 'UNUSABLE NAME', PANE_READ_TEST_SITE)).toHaveLength(1)
+    expect(h.episodeNotices.map((n) => n.key)).toEqual([p])
+    assertNoLeak({ descriptions, errors: h.errors, episodeNotices: h.episodeNotices })
+  })
+})
+
+describe('b.jg5 SRJ-117, SRJ-501, SRJ-502: a CONFLICT from the pane read at each of readWorkingPane\'s three callers latches the persona with the state its caller last read; nothing is typed', () => {
+  afterEach(srj105AfterEach)
+
+  test.each(livenessPaneConflictRowsAt('working-row verdict').map((row) => [row.name, row] as const))('the restart path\'s working-row check (checkWorkingRowPane), its pane read answering %s: defer, P latched once with "P\'s next check or recovery" and working; no transcript get, nothing typed, no evidence pending, no notice', async (_name, row) => {
+    const { h, p } = srj105Build()
+    h.script({ readPaneError: row.build() })
+    const order = await recordEveryCall(h, p)
+
+    expect(await checkWorkingRowPane(p, harnessPersona(h, p))).toBe('defer')
+
+    expect(order).toEqual(['readPane'])
+    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
+    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
+    expect(h.errors.filter((line) => line.startsWith(`[slack] reconnectSession: persona=${p} is working and is latched — deferring; `))).toHaveLength(1)
+    expectLatchedOnce(h, p, paneConflictLatch(p, row, READ_WORKING_PANE_SITE))
+  })
+
+  test.each(livenessPaneConflictRowsAt('waiting-row check').map((row) => [row.name, row] as const))('the restart path\'s waiting-row check (checkWaitingRowPane), its pane read answering %s: defer, never reconnect; P latched once with "P\'s next check or recovery" and waiting; nothing typed, no notice', async (_name, row) => {
+    const { h, p } = srj105Build()
+    h.script({ readPaneError: row.build() })
+    const order = await recordEveryCall(h, p)
+
+    expect(await checkWaitingRowPane(p)).toBe('defer')
+
+    expect(order).toEqual(['readPane'])
+    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
+    expect(h.errors.filter((line) => line.startsWith(`[slack] reconnectSession: persona=${p} is waiting and is latched — deferring; nothing typed`))).toHaveLength(1)
+    expectLatchedOnce(h, p, paneConflictLatch(p, row, READ_WORKING_PANE_SITE))
+  })
+
+  const waitCross = WAIT_ENTRIES.flatMap(([entry, before]) =>
+    livenessPaneConflictRowsAt('launch wait evidence read').map((row) => [entry, row.name, before, row] as const),
+  )
+  test.each(waitCross)('the working-row wait entered by %s, its evidence pane read answering %s: P latched once with "P\'s next check or recovery" and the state its poll read (working); the wait ends latched with no further call, though the next poll would read waiting; nothing typed, no not-connected notice', async (_entry, _name, before, row) => {
+    const { h, p, b } = srj105Build()
+    fastPolls(h)
+    const script: RecoveryStubScript = {
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getResult: harnessRow(h, harnessPersona(h, p), { state: 'working' }),
+      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
+      statusResult: cannedStatusResult({ state: 'waiting' }),
+      readPaneError: row.build(),
+    }
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    if (before.length === 0) {
+      expect(await waitForWaitingAndReconnect(p, h.config)).toBe(WAIT_OUTCOME_LATCHED)
+    } else {
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+    }
+
+    expect(order).toEqual([...before, 'findMissing', 'status', 'readPane'])
+    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
+    expect(waitLatchedLines(h)).toHaveLength(1)
+    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
+    expectLatchedOnce(h, p, paneConflictLatch(p, row, READ_WORKING_PANE_SITE))
+
+    if (before.length > 0) await expectLaunchedByNoPath(h, p, b, script)
   })
 })
 

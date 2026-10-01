@@ -12,9 +12,12 @@
  *     identifier and the option set;
  *   - `site`: the site kind that meets the refusal ({@link ConflictCaseSite}):
  *     a plain spawn, a reuse spawn, a `resume`, a pane verb or a kill (named
- *     by its verb), or one of the dialog approver's calls
+ *     by its verb), one of the dialog approver's calls
  *     ({@link ApproverSite}, `approver <verb>`; select those rows with
- *     {@link isApproverSite} or take {@link APPROVER_CONFLICT_CASE_ROWS});
+ *     {@link isApproverSite} or take {@link APPROVER_CONFLICT_CASE_ROWS}),
+ *     or one of the liveness checks' `read-pane` sites
+ *     ({@link LivenessPaneSite}; select those rows with
+ *     {@link isLivenessPaneSite} or take {@link LIVENESS_PANE_CONFLICT_CASE_ROWS});
  *   - `verb`, `stubCase`, `options`, `sessionName`, and `build`, a thunk that
  *     builds the error through the stub's `errTmuxSessionConflict` with them;
  *   - `latchCase`: the case `src/conflict-latch.ts` recognises (SRJ-507);
@@ -52,6 +55,21 @@
  * and the state `pending`, which the lap's `status` read gave before the
  * pane verb. The approver's `status` reads only the store and answers no
  * CONFLICT, so it has no CONFLICT row.
+ *
+ * The liveness checks' `read-pane` CONFLICT rows (E18; b.jg5 SRJ-117,
+ * SRJ-501), {@link LIVENESS_PANE_CONFLICT_CASE_ROWS}: three site kinds
+ * ({@link LivenessPaneSite}, {@link LIVENESS_PANE_SITES}; select their rows
+ * with {@link isLivenessPaneSite} or {@link livenessPaneConflictRowsAt}):
+ * b.d61's working-row verdict, b.f2b's waiting-row check and the launch
+ * wait's evidence read, each reading P's own row through the shared reader.
+ * Each site has one row per stub CONFLICT case the approver's `read-pane`
+ * rows cover (built from those rows, so the two stay in step): "the agent's
+ * pane was not found", with and without "the agent's pane was not adopted",
+ * "not this launch's session" and "conflicting labels". Each records the
+ * refused operation "P's next check or recovery" and the state the site's
+ * path last read ({@link LIVENESS_PANE_SITE_ROW_STATE}): `working` at the
+ * working-row verdict and at the launch wait's evidence read (the wait's
+ * poll read `working`), `waiting` at the waiting-row check.
  *
  * Other exports (E13 T2):
  *   - {@link expectedConflictNotice}: the expected notice for any case,
@@ -115,9 +133,7 @@
  *     quoted session and the description), {@link expectedLatchRecord} of
  *     `src/conflict-latch.ts`'s `unusableNameSetInput(key, build(), rowState)`.
  *     Compare a latch's `record(key)` with it whole (`toEqual`).
- * The dialog approver's rows land here (E17); the reconnect's `send-keys`
- * and a reuse spawn get none yet (E19, E22), and E30 adds the re-check
- * columns.
+ * The dialog approver's rows land here (E17).
  *
  * The expected latch records (SRJ-501), for any test that checks what a
  * hold-case latch holds (the server, restart, health-check, unavailable-retry
@@ -200,14 +216,6 @@
  * pre-persona row (`cscb_<key>` of {@link LAUNCH_START_PRE_PERSONA_KEY},
  * labelled `service=cscb` only, not configured). Whether P's row is
  * "covered" (SRJ-409, E28) is no column: the decision never asks.
- *
- * Columns added later: E14 adds the `provenance_conflict` note latch's rows
- * (P's bring-up, no builder call); E30 adds the re-check's action
- * and its still-latched and cleared answers (SRJ-505), with a plain-spawn row
- * per row state step 1 can read, and the unusable-name rows' re-check
- * (`status` only) and `ErrSpawnNotFound` clear columns, and the launch-start
- * rows' re-check (`status` only) and their `ErrSpawnNotFound`, `ended` or
- * `missing` and `waiting` clear columns.
  *
  * There is no "no pane 0.0" row: that case is withdrawn (rev 17; SRJ-507).
  *
@@ -338,15 +346,49 @@ export function isApproverSite(site: string): site is ApproverSite {
   return Object.hasOwn(APPROVER_SITE_VERB, site)
 }
 
+/**
+ * One of the liveness checks' `read-pane` sites of persona P's own row as a
+ * site kind (b.jg5 SRJ-117's E18 columns): b.d61's working-row verdict
+ * (`checkWorkingRowPane`), b.f2b's waiting-row check (`checkWaitingRowPane`)
+ * and the launch wait's evidence read (`staleWorkingRowIsIdle`), each through
+ * the shared reader of P's own row (`readPersonaOwnPane`).
+ */
+export type LivenessPaneSite = 'working-row verdict' | 'waiting-row check' | 'launch wait evidence read'
+
+const WORKING = latchRowStateRead('working')
+const WAITING = latchRowStateRead('waiting')
+
+/**
+ * The row state each liveness pane site records for a CONFLICT (b.jg5
+ * SRJ-501: the state the calling path last read): `working` for the
+ * working-row verdict and the launch wait's evidence read (the wait's poll
+ * read `working`), `waiting` for the waiting-row check.
+ */
+export const LIVENESS_PANE_SITE_ROW_STATE: Readonly<Record<LivenessPaneSite, LatchRowState>> = Object.freeze({
+  'working-row verdict': WORKING,
+  'waiting-row check': WAITING,
+  'launch wait evidence read': WORKING,
+})
+
+/** Every liveness pane site kind, in SRJ-117's column order. */
+export const LIVENESS_PANE_SITES: readonly LivenessPaneSite[] = Object.freeze(
+  Object.keys(LIVENESS_PANE_SITE_ROW_STATE) as LivenessPaneSite[],
+)
+
+/** Whether `site` is one of the liveness checks' `read-pane` site kinds. */
+export function isLivenessPaneSite(site: string): site is LivenessPaneSite {
+  return Object.hasOwn(LIVENESS_PANE_SITE_ROW_STATE, site)
+}
+
 /** A pane verb or a kill whose CONFLICT refuses P's next check or recovery, as a site kind. */
 type PaneOrKillSite = 'kill' | 'read-pane' | 'send-keys' | 'pause'
 
 /**
  * The site kind that meets a CONFLICT row's refusal: a plain spawn, a reuse
- * spawn, a `resume`, a pane verb or a kill (by its verb), or one of the dialog
- * approver's pane verbs.
+ * spawn, a `resume`, a pane verb or a kill (by its verb), one of the dialog
+ * approver's pane verbs, or one of the liveness checks' `read-pane` sites.
  */
-export type ConflictCaseSite = 'plain spawn' | 'reuse spawn' | 'resume' | PaneOrKillSite | ApproverSite
+export type ConflictCaseSite = 'plain spawn' | 'reuse spawn' | 'resume' | PaneOrKillSite | ApproverSite | LivenessPaneSite
 
 /** One refusal and what latching a persona on it records. */
 export interface ConflictCaseRow {
@@ -577,8 +619,6 @@ const SPAWN_VERB = 'spawn'
 
 const ENDED = latchRowStateRead('ended')
 const PENDING = latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)
-const WAITING = latchRowStateRead('waiting')
-const WORKING = latchRowStateRead('working')
 const ASK_USER = latchRowStateRead('ask_user')
 const CHECK_PERMISSION = latchRowStateRead('check_permission')
 
@@ -634,6 +674,43 @@ const approverPane = (
   o?: ConflictOptions,
 ): ConflictCaseRow => row(`approver ${verb}`, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, verb, c, l, PENDING, o)
 
+/**
+ * The dialog approver's pane verbs on a `pending` row (E17): P's next check
+ * or recovery, recorded `pending`. `send-keys` on a `pending` row answers a
+ * leftover with `ErrSpawnNotInteractive`, so only `read-pane` (more than one
+ * leftover) has a not-this-launch row.
+ */
+const APPROVER_ROWS: readonly ConflictCaseRow[] = [
+  approverPane('read-pane', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND),
+  approverPane('read-pane', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND, { notAdopted: true }),
+  approverPane('read-pane', 'not-this-launch', LATCH_CASE_NOT_THIS_LAUNCH),
+  approverPane('read-pane', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS),
+  approverPane('send-keys', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND),
+  approverPane('send-keys', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND, { notAdopted: true }),
+  approverPane('send-keys', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS),
+]
+
+/**
+ * The liveness checks' `read-pane` CONFLICT rows (E18; b.jg5 SRJ-117,
+ * SRJ-501): for each liveness pane site, one row per stub CONFLICT case the
+ * approver's `read-pane` rows cover (the same case, option set and latch
+ * case), each refusing P's next check or recovery and recording the state
+ * the site's path last read ({@link LIVENESS_PANE_SITE_ROW_STATE}).
+ */
+const LIVENESS_PANE_ROWS: readonly ConflictCaseRow[] = LIVENESS_PANE_SITES.flatMap((site) =>
+  APPROVER_ROWS.filter((approverRow) => approverRow.verb === 'read-pane').map((approverRow) =>
+    row(
+      site,
+      REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+      'read-pane',
+      approverRow.stubCase,
+      approverRow.latchCase,
+      LIVENESS_PANE_SITE_ROW_STATE[site],
+      approverRow.options,
+    ),
+  ),
+)
+
 /** Every CONFLICT latch row, for `test.each`. */
 export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   // A plain spawn: the pre-spawn scan's refusals (nothing written, no row).
@@ -673,23 +750,26 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   paneOrKill('read-pane', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, PENDING),
   paneOrKill('kill', 'never-reported-in', LATCH_CASE_NEVER_REPORTED_IN, PENDING),
   paneOrKill('kill', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, WORKING),
-  // The dialog approver's pane verbs on a `pending` row (E17): P's next
-  // check or recovery, recorded `pending`. `send-keys` on a `pending` row
-  // answers a leftover with `ErrSpawnNotInteractive`, so only `read-pane`
-  // (more than one leftover) has a not-this-launch row.
-  approverPane('read-pane', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND),
-  approverPane('read-pane', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND, { notAdopted: true }),
-  approverPane('read-pane', 'not-this-launch', LATCH_CASE_NOT_THIS_LAUNCH),
-  approverPane('read-pane', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS),
-  approverPane('send-keys', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND),
-  approverPane('send-keys', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND, { notAdopted: true }),
-  approverPane('send-keys', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS),
+  // The dialog approver's pane verbs on a `pending` row (E17).
+  ...APPROVER_ROWS,
+  // The liveness checks' `read-pane` sites (E18).
+  ...LIVENESS_PANE_ROWS,
 ])
 
 /** The dialog approver's CONFLICT rows of {@link CONFLICT_CASE_ROWS} (its `read-pane` and `send-keys`), for `test.each`. */
 export const APPROVER_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
   CONFLICT_CASE_ROWS.filter((caseRow) => isApproverSite(caseRow.site)),
 )
+
+/** The liveness checks' `read-pane` CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E18), for `test.each`. */
+export const LIVENESS_PANE_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
+  CONFLICT_CASE_ROWS.filter((caseRow) => isLivenessPaneSite(caseRow.site)),
+)
+
+/** The liveness pane CONFLICT rows of one site kind, for `test.each`. */
+export function livenessPaneConflictRowsAt(site: LivenessPaneSite): readonly ConflictCaseRow[] {
+  return LIVENESS_PANE_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === site)
+}
 
 // ---------------------------------------------------------------------------
 // The expected latch record of a hold case (b.jg5 SRJ-501)
