@@ -22,17 +22,49 @@
  *     path last read for a pane verb or a kill, unreadable where the path
  *     could not read it.
  *
- * Columns added later: E13's T2 adds the CONFLICT notice `src/conflict-latch.ts`
- * builds for the row (SRJ-1004); E14 adds the `provenance_conflict` note
- * latch's rows (P's bring-up, no builder call); E16 adds the "unusable
- * recorded name" and "launch start not recorded" rows; E30 adds the
- * re-check's action and its still-latched and cleared answers (SRJ-505),
- * with a plain-spawn row per row state step 1 can read.
+ * Columns filled here (E13 T2, the CONFLICT notice, SRJ-1004):
+ *   - `notice`: the {@link ExpectedConflictNotice} for the row's case, quoted
+ *     session and description: its `lines` in SRJ-1004's order, its `text`
+ *     (the lines joined), and `carries`, the flags for the lines it must
+ *     carry: the pointer to "Operator actions", the must-not-be-ended line
+ *     (`row` for "a different instance id", `store` for "another
+ *     agent-director store", `none` otherwise), the `list` line and the
+ *     human-only line.
+ *
+ * Unrecognised text and "never reported in", which carry no case sentence,
+ * are rows of the table (a `resume`'s unrecognised answer and a `kill`'s
+ * never-reported-in answer); every `ConflictLatchCase` has at least one row.
+ *
+ * Other exports (E13 T2):
+ *   - {@link expectedConflictNotice}: the expected notice for any case,
+ *     session and description (none: no description line), assembled from
+ *     the fixed lines and the case sentences `src/conflict-latch.ts` exports
+ *     (`CONFLICT_NOTICE_*`, `CONFLICT_CASE_SENTENCES`), with the description
+ *     rendered as a record holds it (`renderLogMessageText`) and both it and
+ *     the session name escaped once for Slack (`escapeSlackControlCharacters`).
+ *     It never calls `conflictNoticeText`, so it is an independent check of it;
+ *   - {@link SESSION_ENDING_COMMAND_FORMS} and {@link sessionEndingCommandsIn}:
+ *     the session-ending command forms of ADSRD SR-1.4 that SRJ-1001 lists
+ *     (`kill` named as a command to run, `pause`, `--include-finished`,
+ *     `tmux kill-session`, `tmux kill-server`), as patterns, and the names of
+ *     the forms a text matches. None matches agent-director's own "no kill was
+ *     sent", "retry kill later" or "never delete this row". E16's, E29's and
+ *     E36's text checks reuse them;
+ *   - {@link cscbOwnLines}: a CONFLICT notice's lines without agent-director's
+ *     quoted description line (found by `CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD`),
+ *     so a check over CSCB's own words lets the quoted description through.
+ *
+ * Columns added later: E14 adds the `provenance_conflict` note latch's rows
+ * (P's bring-up, no builder call); E16 adds the "unusable recorded name" and
+ * "launch start not recorded" rows; E30 adds the re-check's action and its
+ * still-latched and cleared answers (SRJ-505), with a plain-spawn row per row
+ * state step 1 can read.
  *
  * There is no "no pane 0.0" row: that case is withdrawn (rev 17; SRJ-507).
  *
  * No case word, notice text or session name is written here: the words reach
- * a row only through the stub, and the session name is the stub's
+ * a row only through the stub, the notice's texts only through
+ * `src/conflict-latch.ts`'s exports, and the session name is the stub's
  * `STUB_TMUX_SESSION_NAME` (`personaTmuxSessionName`). No Phase-1-only export
  * is named, and no `mock.module()` is used.
  *
@@ -41,6 +73,19 @@
 
 import { AGENT_DIRECTOR_PENDING_STATE } from '../../src/liveness-reading.ts'
 import {
+  CONFLICT_CASE_SENTENCES,
+  CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE,
+  CONFLICT_NOTICE_CASE_SENTENCE_LEAD,
+  CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD,
+  CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL,
+  CONFLICT_NOTICE_DIFFERENT_ID_MUST_NOT_END_LINE,
+  CONFLICT_NOTICE_FIRST_LINE_HEAD,
+  CONFLICT_NOTICE_FIRST_LINE_TAIL,
+  CONFLICT_NOTICE_HUMAN_ONLY_LINE,
+  CONFLICT_NOTICE_LINE_SEPARATOR,
+  CONFLICT_NOTICE_LIST_LINE_HEAD,
+  CONFLICT_NOTICE_LIST_LINE_TAIL,
+  CONFLICT_NOTICE_POINTER_LINE,
   LATCH_CASE_ANOTHER_STORE,
   LATCH_CASE_CONFLICTING_LABELS,
   LATCH_CASE_DIFFERENT_ID,
@@ -58,10 +103,14 @@ import {
   REFUSED_OPERATION_RESUME,
   REFUSED_OPERATION_REUSE_SPAWN,
   latchRowStateRead,
+  takesUnrecognisedHandling,
+  type ConflictCaseWithSentence,
   type ConflictLatchCase,
   type LatchRowState,
   type RefusedOperation,
 } from '../../src/conflict-latch.ts'
+import { renderLogMessageText } from '../../src/persona-connection-errors.ts'
+import { escapeSlackControlCharacters } from '../../src/slack-text-escape.ts'
 import {
   STUB_TMUX_SESSION_NAME,
   errTmuxSessionConflict,
@@ -89,6 +138,151 @@ export interface ConflictCaseRow {
   readonly refusedOperation: RefusedOperation
   /** The row state the latch records on this path. */
   readonly rowState: LatchRowState
+  /** The CONFLICT notice for the row's case, quoted session and description (SRJ-1004). */
+  readonly notice: ExpectedConflictNotice
+}
+
+// ---------------------------------------------------------------------------
+// The expected CONFLICT notice (b.jg5 SRJ-1004)
+// ---------------------------------------------------------------------------
+
+/** Which must-not-be-ended line a notice carries: another row's, another store's, or none. */
+export type MustNotEndLine = 'row' | 'store' | 'none'
+
+/** The lines a CONFLICT notice must carry besides its first line and its description line. */
+export interface ConflictNoticeCarries {
+  /** The pointer to agent-director's README "Operator actions": every case but "a different instance id". */
+  readonly pointer: boolean
+  /** "a different instance id": `row`, in place of the pointer; "another agent-director store": `store`, before the pointer. */
+  readonly mustNotEnd: MustNotEndLine
+  /** The `list` line: every case. */
+  readonly list: boolean
+  /** The human-only line: every case. */
+  readonly humanOnly: boolean
+}
+
+/** One expected CONFLICT notice body (the persona notifier adds the prefix). */
+export interface ExpectedConflictNotice {
+  /** Its lines, in SRJ-1004's order. */
+  readonly lines: readonly string[]
+  /** The lines joined by `CONFLICT_NOTICE_LINE_SEPARATOR`. */
+  readonly text: string
+  /** The flags for the lines it must carry. */
+  readonly carries: ConflictNoticeCarries
+  /** The case sentence in its first line; `undefined` for unrecognised text and "never reported in". */
+  readonly caseSentence: string | undefined
+  /** Its description line; `undefined` when there is no description. */
+  readonly descriptionLine: string | undefined
+}
+
+/** What an expected notice is built from: a CONFLICT latch's case, its quoted session (as the record holds it) and its description, if any. */
+export interface ExpectedConflictNoticeSource {
+  readonly latchCase: ConflictLatchCase
+  readonly sessionName: string
+  readonly description?: string
+}
+
+/** The flags SRJ-1004 sets for a case. */
+function carriesFor(latchCase: ConflictLatchCase): ConflictNoticeCarries {
+  const mustNotEnd: MustNotEndLine =
+    latchCase === LATCH_CASE_DIFFERENT_ID ? 'row' : latchCase === LATCH_CASE_ANOTHER_STORE ? 'store' : 'none'
+  return Object.freeze({ pointer: latchCase !== LATCH_CASE_DIFFERENT_ID, mustNotEnd, list: true, humanOnly: true })
+}
+
+/**
+ * The CONFLICT notice SRJ-1004 gives for `source`, assembled line by line
+ * from `src/conflict-latch.ts`'s exported fixed lines and case sentences:
+ * the first line (`"<session>"`, with the case sentence unless the case takes
+ * the unrecognised-text wording), the description line (left out when the
+ * rendered description is empty), the must-not-be-ended line and the pointer
+ * as `carries` says, the `list` line (`<name>` without quotes) and the
+ * human-only line. The session name and the rendered description are escaped
+ * once for Slack.
+ */
+export function expectedConflictNotice(source: ExpectedConflictNoticeSource): ExpectedConflictNotice {
+  const name = escapeSlackControlCharacters(source.sessionName)
+  const caseSentence = takesUnrecognisedHandling(source.latchCase)
+    ? undefined
+    : CONFLICT_CASE_SENTENCES[source.latchCase as ConflictCaseWithSentence]
+  const rendered = renderLogMessageText(source.description)
+  const descriptionLine =
+    rendered === ''
+      ? undefined
+      : CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD + escapeSlackControlCharacters(rendered) + CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL
+  const carries = carriesFor(source.latchCase)
+  const lines = [
+    CONFLICT_NOTICE_FIRST_LINE_HEAD +
+      `"${name}"` +
+      (caseSentence === undefined ? '' : CONFLICT_NOTICE_CASE_SENTENCE_LEAD + caseSentence) +
+      CONFLICT_NOTICE_FIRST_LINE_TAIL,
+    ...(descriptionLine === undefined ? [] : [descriptionLine]),
+    ...(carries.mustNotEnd === 'row' ? [CONFLICT_NOTICE_DIFFERENT_ID_MUST_NOT_END_LINE] : []),
+    ...(carries.mustNotEnd === 'store' ? [CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE] : []),
+    ...(carries.pointer ? [CONFLICT_NOTICE_POINTER_LINE] : []),
+    CONFLICT_NOTICE_LIST_LINE_HEAD + name + CONFLICT_NOTICE_LIST_LINE_TAIL,
+    CONFLICT_NOTICE_HUMAN_ONLY_LINE,
+  ]
+  return Object.freeze({
+    lines: Object.freeze(lines),
+    text: lines.join(CONFLICT_NOTICE_LINE_SEPARATOR),
+    carries,
+    caseSentence,
+    descriptionLine,
+  })
+}
+
+/**
+ * CSCB's own lines of a CONFLICT notice: its lines without agent-director's
+ * quoted description line, the one that opens with
+ * `CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD`.
+ */
+export function cscbOwnLines(notice: string): string[] {
+  return notice
+    .split(CONFLICT_NOTICE_LINE_SEPARATOR)
+    .filter((line) => !line.startsWith(CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD))
+}
+
+// ---------------------------------------------------------------------------
+// Session-ending command forms (ADSRD SR-1.4; b.jg5 SRJ-1001)
+// ---------------------------------------------------------------------------
+
+/** One session-ending command form: what it names and the pattern that finds it. */
+export interface SessionEndingCommandForm {
+  readonly name: string
+  /** Not global, so it keeps no `lastIndex` between tests. */
+  readonly pattern: RegExp
+}
+
+/** Imperative verbs that put a command to run after them. */
+const RUN_VERBS = String.raw`(?:run|use|type|execute|issue|invoke)`
+
+/** `verb` named as a command: `agent-director <verb>`, a code span opening with it, `<verb>` with an option or a pid, or a run verb before it. */
+function commandFormOf(verb: string): RegExp {
+  return new RegExp(
+    String.raw`\bagent-director\s+${verb}\b|\x60\s*${verb}\b|\b${verb}\s+(?:-|\d)|\b${RUN_VERBS}\s+(?:the\s+|a\s+)?\x60?\s*${verb}\b`,
+    'i',
+  )
+}
+
+/**
+ * The commands that end a session as ADSRD SR-1.4 defines one, as SRJ-1001
+ * lists them for the CONFLICT, unusable-name, launch-start and stuck-launch
+ * posts: `kill` named as a command to run (so agent-director's "no kill was
+ * sent" and "retry kill later" are no hit), `pause` in any form,
+ * `--include-finished` (with or without its dashes), `tmux kill-session` and
+ * `tmux kill-server`.
+ */
+export const SESSION_ENDING_COMMAND_FORMS: readonly SessionEndingCommandForm[] = Object.freeze([
+  Object.freeze({ name: 'kill as a command', pattern: commandFormOf('kill') }),
+  Object.freeze({ name: 'pause', pattern: /\bpause\b/i }),
+  Object.freeze({ name: '--include-finished', pattern: /include-finished/i }),
+  Object.freeze({ name: 'tmux kill-session', pattern: /\bkill-session\b/i }),
+  Object.freeze({ name: 'tmux kill-server', pattern: /\bkill-server\b/i }),
+])
+
+/** The names of the session-ending command forms `text` matches, in table order; empty when none does. */
+export function sessionEndingCommandsIn(text: string): string[] {
+  return SESSION_ENDING_COMMAND_FORMS.filter((form) => form.pattern.test(text)).map((form) => form.name)
 }
 
 /** The verb of a spawn, plain or with `--reuse-finished`. */
@@ -119,16 +313,18 @@ function row(
   const variant = Object.keys(options).filter((key) => options[key as keyof ConflictOptions] === true)
   const label = OPERATION_LABEL[refusedOperation] ?? verb
   const sessionName = STUB_TMUX_SESSION_NAME
+  const build = () => errTmuxSessionConflict(verb, stubCase, sessionName, options)
   return Object.freeze({
     name: `${label}: ${stubCase}${variant.length === 0 ? '' : ` (${variant.join(', ')})`}`,
     verb,
     stubCase,
     options,
     sessionName,
-    build: () => errTmuxSessionConflict(verb, stubCase, sessionName, options),
+    build,
     latchCase,
     refusedOperation,
     rowState,
+    notice: expectedConflictNotice({ latchCase, sessionName, description: build().errDescription }),
   })
 }
 

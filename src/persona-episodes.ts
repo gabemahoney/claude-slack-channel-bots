@@ -37,6 +37,8 @@
  * (`PERSONA_EPISODE_KINDS`). `tmux-unresponsive`'s episode is begun and
  * ended by its condition (below), which posts its onset, alert and recovery;
  * `unclassified-error`'s by its episodes (below), which post its one alert;
+ * CONFLICT's is begun by the conflict latch's notice reaction
+ * (`src/conflict-latch.ts`), which posts its one notice per episode;
  * every other kind has no poster yet: its begin and end triggers and text
  * come with the Epic that posts it, named on its label below.
  *
@@ -262,7 +264,15 @@ import {
 // Kinds (b.jg5 SRJ-1016)
 // ---------------------------------------------------------------------------
 
-/** CONFLICT (SRJ-506): from the latch being set until it clears; a new case begins a new episode. No poster yet (b.jg5 E13). */
+/**
+ * CONFLICT (SRJ-506, SRJ-508): from the latch being set until it clears; a
+ * new case begins a new episode. Posted by the conflict latch's notice
+ * reaction (`createConflictNoticeObserver`, bound in `main()` by
+ * `bindConflictNotice`, `src/conflict-latch.ts`): a latch or a relatch with a
+ * new case begins the episode with its case and posts the CONFLICT notice
+ * once; the same case keeps it and posts nothing. Its end, at the latch's
+ * clear, is E30's.
+ */
 export const PERSONA_EPISODE_KIND_CONFLICT = 'conflict'
 
 /** Unusable recorded name (SRJ-512): from the latch being set until it clears. No poster yet (b.jg5 E16). */

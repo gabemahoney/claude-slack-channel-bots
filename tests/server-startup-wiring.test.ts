@@ -155,6 +155,15 @@
  *   manager's `isLaunchInFlight`; the full-mode retry action's `isInFlight`
  *   and the health check's `isLaunchInFlight` both get it, and nothing else
  *   names it (no no-op, other predicate or local shadow).
+ * - b.jg5 SRJ-501 / SRJ-508: the one per-persona latch is built once,
+ *   imported from the latch module, in main()'s own statement list, after the
+ *   notice episodes and before the retry controller and the start pass, with
+ *   the server log as its only dependency (it is held in server memory: no
+ *   option loads it, no statement of main() seeds it and the latch module
+ *   imports no file-system module); its CONFLICT notice is bound once, in
+ *   main()'s own statement list before the retry controller and the start
+ *   pass, to that latch and the one notice episodes instance, and nothing
+ *   else in server.ts adds a set observer.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -200,6 +209,8 @@ import type * as AdStartupModule from '../src/agent-director-startup.ts'
 import type * as ServerModule from '../src/server.ts'
 import type { RestartDeps } from '../src/restart.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
+import type * as ConflictLatchModule from '../src/conflict-latch.ts'
+import type { ConflictLatch, ConflictLatchDeps } from '../src/conflict-latch.ts'
 import type * as PersonaEpisodesModule from '../src/persona-episodes.ts'
 import type {
   PersonaEpisodes,
@@ -2228,6 +2239,107 @@ describe('main() builds the one unclassified-error episodes instance over the no
     expect(calls(RETRY_STOPPED_ENTRY)).toHaveLength(1)
     expect(onlyCallProps('initRestart').get(CAP_REACHED)).toContain(`${unclassified}.${END}(`)
     expect(onlyCallProps('createUnavailableRetryController').get(RETRY_STOPPED)).toContain(`${unclassified}.${RETRY_STOPPED_ENTRY}(`)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-501 / SRJ-508 — the one per-persona latch and its
+// CONFLICT notice binding
+//
+// Nothing makes main() build the latch or bind its notice, and any episodes
+// object with `begin` and `post` type-checks as the binding's target. So a
+// production wiring that dropped the build or the binding, built a second
+// latch (one a launch sets, another the notice watches), built or bound it
+// after the start pass (a first launch's CONFLICT with no latch, or no
+// notice, to reach), bound the notice twice (two posts in one episode) or to
+// episodes other than the one instance (which a teardown never forgets and
+// shutdown never closes), or seeded the latch from a file (SRJ-501: it is
+// held in server memory only) would pass every behaviour suite. What the
+// latch and its notice do is tested in tests/conflict-latch.test.ts; pinned
+// here: the build and the binding.
+// ---------------------------------------------------------------------------
+
+describe('main() builds the one per-persona latch, in server memory only, before the start pass, and binds its CONFLICT notice once to the one set of notice episodes (b.jg5 SRJ-501, SRJ-508)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatch'
+  const BIND: keyof typeof ConflictLatchModule = 'bindConflictNotice'
+  const OBSERVER_FACTORY: keyof typeof ConflictLatchModule = 'createConflictNoticeObserver'
+  const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
+  const LOG: keyof ConflictLatchDeps = 'log'
+  const ADD_OBSERVER: keyof ConflictLatch = 'addSetObserver'
+  const SET: keyof ConflictLatch = 'set'
+  const SET_FROM_CONFLICT: keyof ConflictLatch = 'setFromConflict'
+
+  const LATCH_PATH = join(SRC_DIR, 'conflict-latch.ts')
+
+  /** Every path that can launch, and so meet a CONFLICT: the retry controller's retries, the restart module, the start bring-up and the health check. */
+  function startPass(): number[] {
+    return [
+      onlyCallOf('createUnavailableRetryController'),
+      onlyCallOf('initRestart'),
+      startResolution(SERVER_CODE).bringUpAt,
+      onlyCallOf('initHealthCheck'),
+    ]
+  }
+
+  test('the latch is built exactly once, in main()\'s own statement list (not at module scope, behind no branch), after the notice episodes and before the retry controller and the start pass', () => {
+    const at = onlyCallOf(FACTORY)
+    const latch = constOf(FACTORY)
+    declaredOnce(latch)
+    const decl = SERVER_CODE.search(new RegExp(`\\bconst\\s+${latch}\\s*=\\s*${FACTORY}\\s*\\(`))
+    expect(decl).toBeGreaterThan(-1)
+    expect(decl).toBeLessThan(at)
+    expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
+    expect(importSource(SERVER_CODE, FACTORY)).toBe('./conflict-latch.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+
+    expect(at).toBeGreaterThan(onlyCallOf(EPISODES_FACTORY))
+    for (const later of startPass()) expect(at).toBeLessThan(later)
+  })
+
+  test('its only dependency is the server log: no option loads latch state from anywhere', () => {
+    const props = onlyCallProps(FACTORY)
+    expect([...props.keys()]).toEqual([LOG])
+    expect(props.get(LOG)).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+  })
+
+  test('its CONFLICT notice is bound exactly once, in main()\'s own statement list after the build and before the retry controller and the start pass, to the latch and the one notice episodes instance; nothing else in server.ts adds a set observer', () => {
+    const at = onlyCallOf(BIND)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(importSource(SERVER_CODE, BIND)).toBe('./conflict-latch.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${BIND}\\b`, 'g'), SERVER_CODE)).toEqual([])
+
+    expect(onlyCallArgs(BIND)).toEqual([constOf(FACTORY), constOf(EPISODES_FACTORY)])
+    expect(at).toBeGreaterThan(onlyCallOf(FACTORY))
+    for (const later of startPass()) expect(at).toBeLessThan(later)
+
+    // No second binding by hand: the notice's observer is built only inside
+    // the binding, and no set observer is added in server.ts.
+    expect(callsOf(OBSERVER_FACTORY)).toEqual([])
+    expect(indicesOf(new RegExp(`\\.\\s*${ADD_OBSERVER}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build and its binding, and the latch module imports no file-system module', () => {
+    const latch = constOf(FACTORY)
+
+    // No seed: no statement in main()'s own list records a latch.
+    const sets = indicesOf(new RegExp(`\\b${latch}\\s*[?!]?\\.\\s*(?:${SET}|${SET_FROM_CONFLICT})\\s*\\(`, 'g'), SERVER_CODE)
+    for (const set of sets) expect(atMainTopLevel(SERVER_CODE, set)).toBe(false)
+
+    // Named only at its build and as the binding's first argument.
+    const named = indicesOf(new RegExp(`\\b${latch}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(2)
+    const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${latch}\\b`))!
+    expect(named[0]).toBe(decl.index! + decl[0].length - latch.length)
+    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf(BIND), '(', ')')
+    expect(named[1]! >= open && named[1]! < close).toBe(true)
+
+    // The factory itself reads no file: the latch module imports no
+    // file-system module and opens no file through Bun.
+    const latchCode = stripComments(readFileSync(LATCH_PATH, 'utf-8'))
+    expect(indicesOf(/\bfrom\s*['"](?:node:)?fs(?:\/promises)?['"]/g, latchCode)).toEqual([])
+    expect(indicesOf(/\brequire\s*\(/g, latchCode)).toEqual([])
+    expect(indicesOf(/\bBun\s*\.\s*file\s*\(/g, latchCode)).toEqual([])
   })
 })
 

@@ -46,16 +46,37 @@
  * unchanged (SRJ-506), and answers which ({@link ConflictLatchSetOutcome});
  * `setFromConflict` builds the record from a thrown CONFLICT value. Every set
  * calls each set observer once with the key, the outcome and the record, so
- * the CONFLICT notice and the holds react without this module importing
- * them. `forget(key)` drops one persona's latch silently: no post, no
- * observer call, no line. There is no forget-all.
+ * the CONFLICT notice and the holds react to it. `forget(key)` drops one
+ * persona's latch silently: no post, no observer call, no line. There is no
+ * forget-all.
+ *
+ * The CONFLICT notice (SRJ-1004, SRJ-508): {@link conflictNoticeText} builds
+ * its body from a CONFLICT latch's record, from the exported fixed lines
+ * (`CONFLICT_NOTICE_*`) and the case sentences
+ * ({@link CONFLICT_CASE_SENTENCES}). Its set observer
+ * ({@link createConflictNoticeObserver}, bound by {@link bindConflictNotice}
+ * in `main()`) begins or keeps the persona's CONFLICT episode in the server's
+ * notice episodes (`src/persona-episodes.ts`), with the record's case, and
+ * posts the notice there at most once per episode: a latch posts once, a
+ * relatch with a new case begins a new episode and posts once more, and a
+ * same-case set posts nothing. The post goes through the episodes' sink, the
+ * persona notifier, which adds the persona prefix. The quoted description is
+ * redacted and capped as the record holds it, then escaped once for Slack
+ * (`escapeSlackControlCharacters`); so is the session name. Log lines stay
+ * unescaped.
+ *
+ * The recovery notice (SRJ-1005): {@link conflictRecoveryText},
+ * {@link holdRecoveryText} and {@link latchRecoveryText} build it for either
+ * latch kind ({@link LatchKind}) and one of five reasons
+ * ({@link LatchRecoveryReason}); nothing here posts it (see its section).
  *
  * Where later Epics plug in: E14's `provenance_conflict` note latch, E16's
  * two hold latches and their triggers, and the sites E17 to E22 and E29
- * convert all latch through `set` or `setFromConflict`; T2's notice and
- * E16's hold notices are set observers; E30's re-check and its timer read the
- * record and relatch through `set`; E31's `clear-latch` clears through the
- * clear E30 adds.
+ * convert all latch through `set` or `setFromConflict`; E16's hold notices
+ * are set observers beside the CONFLICT notice's; E30's re-check and its
+ * timer read the record and relatch through `set`, and post the recovery
+ * notice when a latch clears; E31's `clear-latch` clears through the clear
+ * E30 adds.
  *
  * Log lines, to the injected log (a throwing log is swallowed):
  *
@@ -93,8 +114,10 @@ import {
   isSafeIdentifier,
   renderLogMessageText,
 } from './persona-connection-errors.ts'
+import { PERSONA_EPISODE_KIND_CONFLICT, type PersonaEpisodes } from './persona-episodes.ts'
 import { personaTmuxSessionName } from './persona-identity.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
+import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 
 // ---------------------------------------------------------------------------
 // Cases (b.jg5 SRJ-501, SRJ-507, SRJ-512, SRJ-513)
@@ -522,4 +545,335 @@ function safeLog(log: (line: string) => void, line: string): void {
   } catch {
     /* a failing logger must not change what the latch does */
   }
+}
+
+// ---------------------------------------------------------------------------
+// The CONFLICT notice (b.jg5 SRJ-1004)
+// ---------------------------------------------------------------------------
+
+/** The first line up to `<session>`. */
+export const CONFLICT_NOTICE_FIRST_LINE_HEAD =
+  ":no_entry: *Held: tmux session conflict* — agent-director will not act on this persona's tmux session "
+
+/** Between `<session>` and the case sentence, for a recognised case. */
+export const CONFLICT_NOTICE_CASE_SENTENCE_LEAD = ': '
+
+/** The first line after `<session>` (or after the case sentence). */
+export const CONFLICT_NOTICE_FIRST_LINE_TAIL =
+  '. CSCB takes no action for this persona until the conflict clears, and messages sent to it meanwhile are lost.'
+
+/** The description line up to agent-director's description. */
+export const CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD = 'agent-director said: "'
+
+/** The description line after agent-director's description. */
+export const CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL = '"'
+
+/** The pointer line: every case but "a different instance id", "another agent-director store" included. */
+export const CONFLICT_NOTICE_POINTER_LINE =
+  'What to do: a human follows the "Operator actions" section of agent-director\'s README for this session.'
+
+/** "a different instance id": in place of the pointer line. */
+export const CONFLICT_NOTICE_DIFFERENT_ID_MUST_NOT_END_LINE =
+  'This session belongs to another agent-director row and must not be ended.'
+
+/** "another agent-director store": before the pointer line (HO rev 15). */
+export const CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE =
+  'This session belongs to another agent-director store and must not be ended.'
+
+/** The list line up to `<name>`. */
+export const CONFLICT_NOTICE_LIST_LINE_HEAD =
+  'To see which agent-director rows record the session name, run `agent-director list --tmux-session-name '
+
+/** The list line after `<name>`. */
+export const CONFLICT_NOTICE_LIST_LINE_TAIL =
+  '` on the command line (over MCP, list ignores that filter).'
+
+/** The human-only line (SRJ-1001). */
+export const CONFLICT_NOTICE_HUMAN_ONLY_LINE =
+  'This is for a human only: no bot, including any persona that sees this post, may act on it.'
+
+/** What separates the notice's lines. */
+export const CONFLICT_NOTICE_LINE_SEPARATOR = '\n'
+
+/** A recognised case that has a case sentence: every one but "never reported in", which takes the unrecognised-text wording (SRJ-507). */
+export type ConflictCaseWithSentence = Exclude<RecognisedConflictCase, typeof LATCH_CASE_NEVER_REPORTED_IN>
+
+/**
+ * SRJ-1004's case sentence for each recognised case. Unrecognised text and
+ * "never reported in" have none ({@link conflictCaseSentence}). Both
+ * leftover descriptions, the pre-spawn scan's and the "duplicate session"
+ * one, are the one case {@link LATCH_CASE_LEFTOVER}, so both get its sentence.
+ */
+export const CONFLICT_CASE_SENTENCES: Readonly<Record<ConflictCaseWithSentence, string>> = Object.freeze({
+  [LATCH_CASE_OWN_ID]:
+    "this persona's own session still runs on its finished agent-director row past agent-director's stopping window and starting-session bound, or its worker process still runs after that session has gone; the worker may be hung or running on a row wrongly marked finished, and the conversation stays resumable",
+  [LATCH_CASE_LEFTOVER]:
+    "a session left over from an earlier launch of this persona holds the name or, renamed, still carries this persona's agent-director label, and ending it is a human's decision",
+  [LATCH_CASE_NOT_THIS_LAUNCH]:
+    "a session left over from an earlier launch of this persona is there; CSCB will not act on it, and ending it is a human's decision",
+  [LATCH_CASE_NO_VALID_ID]: 'a session with no valid agent-director label holds the name; CSCB never touches it',
+  [LATCH_CASE_DIFFERENT_ID]: "another agent-director row's session holds the name; CSCB never touches it",
+  [LATCH_CASE_PANE_NOT_FOUND]:
+    "the worker's recorded pane is not there (it is gone, it was respawned with another program, or it could not be adopted), or the one session left over from an earlier launch of this persona has no pane agent-director can find, and a human should look",
+  [LATCH_CASE_CONFLICTING_LABELS]:
+    'two sessions carry this launch\'s agent-director label, or an agent-director label value is set at the server, global or global-window scope; nothing automatic is safe, and a human must look',
+  [LATCH_CASE_ANOTHER_STORE]:
+    'a worker of another agent-director store sharing this tmux server holds the name; CSCB never touches it',
+})
+
+/** The case sentence for `latchCase`, or `undefined` for unrecognised text and "never reported in" (and for a hold case). Pure. */
+export function conflictCaseSentence(latchCase: LatchCase): string | undefined {
+  return Object.hasOwn(CONFLICT_CASE_SENTENCES, latchCase)
+    ? CONFLICT_CASE_SENTENCES[latchCase as ConflictCaseWithSentence]
+    : undefined
+}
+
+/** What the CONFLICT notice is built from: a CONFLICT latch's record. */
+export interface ConflictNoticeSource {
+  /** The quoted session's name, without quotes (the record's, already redacted). */
+  readonly sessionName: string
+  /** A CONFLICT case or unrecognised text; never a hold case. */
+  readonly latchCase: ConflictLatchCase
+  /** agent-director's description as the record holds it; absent, the description line is left out. */
+  readonly description?: string
+}
+
+/**
+ * `<session>` in a Slack text: the session's name, rendered as the record
+ * stores it (`renderLogMessageText`: redacted, on one line, capped; a no-op
+ * on a record's name), escaped for Slack, between double quotes.
+ */
+function slackQuotedSession(sessionName: string): string {
+  return `"${slackName(sessionName)}"`
+}
+
+/** `<name>`: the session's name without quotes, rendered as {@link slackQuotedSession} renders it. */
+function slackName(sessionName: string): string {
+  return escapeSlackControlCharacters(renderLogMessageText(sessionName))
+}
+
+/**
+ * The CONFLICT notice's body for a CONFLICT latch's record (b.jg5 SRJ-1004);
+ * the persona notifier adds the persona prefix. Its lines, joined by
+ * {@link CONFLICT_NOTICE_LINE_SEPARATOR}:
+ *
+ *   1. the first line, with the case sentence for a recognised case and
+ *      none for unrecognised text or "never reported in";
+ *   2. `agent-director said: "<description>"`, the description redacted and
+ *      capped (`renderLogMessageText`, the record's form, so a no-op on a
+ *      record's description) and then escaped once for Slack
+ *      (`escapeSlackControlCharacters`); left out when there is none (the
+ *      `provenance_conflict` note latch's form, SRJ-1004 hatch A2);
+ *   3. the pointer line, or for "a different instance id" its
+ *      must-not-be-ended line in place of it, or for "another agent-director
+ *      store" its must-not-be-ended line and then the pointer line;
+ *   4. the list line, naming the session without its quotes;
+ *   5. the human-only line.
+ *
+ * The session name is text CSCB did not write, so it is escaped for Slack
+ * too, in the first line and the list line. No line of CSCB's own names a
+ * session-ending command, a label option or anything SRJ-1001 forbids. Pure.
+ */
+export function conflictNoticeText(source: ConflictNoticeSource): string {
+  const session = slackQuotedSession(source.sessionName)
+  const sentence = conflictCaseSentence(source.latchCase)
+  const lines = [
+    CONFLICT_NOTICE_FIRST_LINE_HEAD +
+      session +
+      (sentence === undefined ? '' : CONFLICT_NOTICE_CASE_SENTENCE_LEAD + sentence) +
+      CONFLICT_NOTICE_FIRST_LINE_TAIL,
+  ]
+  const description = renderLogMessageText(source.description)
+  if (description !== '') {
+    lines.push(
+      CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD +
+        escapeSlackControlCharacters(description) +
+        CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL,
+    )
+  }
+  if (source.latchCase === LATCH_CASE_DIFFERENT_ID) {
+    lines.push(CONFLICT_NOTICE_DIFFERENT_ID_MUST_NOT_END_LINE)
+  } else {
+    if (source.latchCase === LATCH_CASE_ANOTHER_STORE) lines.push(CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE)
+    lines.push(CONFLICT_NOTICE_POINTER_LINE)
+  }
+  lines.push(CONFLICT_NOTICE_LIST_LINE_HEAD + slackName(source.sessionName) + CONFLICT_NOTICE_LIST_LINE_TAIL)
+  lines.push(CONFLICT_NOTICE_HUMAN_ONLY_LINE)
+  return lines.join(CONFLICT_NOTICE_LINE_SEPARATOR)
+}
+
+// ---------------------------------------------------------------------------
+// The recovery notice (b.jg5 SRJ-1005)
+//
+// Built here, posted elsewhere: E30's re-check and clear post it (every
+// reason but "cleared by hand"), and E31's `clear-latch` posts it with
+// "cleared by hand"; nothing in this module posts it. Two no-post rules
+// before a clear are E30's to enforce: a "not this launch's session" latch
+// posts none when its finished-row retry is made or relatches P, only when
+// that retry clears it (`LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED`); a
+// latch whose refused operation is a spawn posts none when step 1 finds no
+// row and the spawn is retried or that retry is refused, only when the retry
+// clears it (`LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED`).
+// ---------------------------------------------------------------------------
+
+/** A CONFLICT latch: a CONFLICT case or unrecognised text ("Conflict cleared"). */
+export const LATCH_KIND_CONFLICT = 'conflict'
+/** A hold latch: "unusable recorded name" or "launch start not recorded" ("Hold cleared"). */
+export const LATCH_KIND_HOLD = 'hold'
+
+/** Which recovery heading a latch takes. */
+export type LatchKind = typeof LATCH_KIND_CONFLICT | typeof LATCH_KIND_HOLD
+
+/** The latch kind of `latchCase`. Pure. */
+export function latchKindOf(latchCase: LatchCase): LatchKind {
+  return isHoldLatchCase(latchCase) ? LATCH_KIND_HOLD : LATCH_KIND_CONFLICT
+}
+
+/** Reason `its agent-director row reads <state>`. */
+export const LATCH_RECOVERY_REASON_KIND_ROW_READS = 'row-reads'
+/** Reason `its agent-director row is gone`. */
+export const LATCH_RECOVERY_REASON_KIND_ROW_GONE = 'row-gone'
+/** Reason `a retry of the refused operation was not refused`. */
+export const LATCH_RECOVERY_REASON_KIND_RETRY_NOT_REFUSED = 'retry-not-refused'
+/** Reason `its row finished and a relaunch was not refused`. */
+export const LATCH_RECOVERY_REASON_KIND_RELAUNCH_NOT_REFUSED = 'relaunch-not-refused'
+/** Reason `cleared by hand` (E31's `clear-latch`). */
+export const LATCH_RECOVERY_REASON_KIND_CLEARED_BY_HAND = 'cleared-by-hand'
+
+/** Why a latch cleared: one of SRJ-1005's five reasons, the state-bearing one with its state. */
+export type LatchRecoveryReason =
+  | { readonly kind: typeof LATCH_RECOVERY_REASON_KIND_ROW_READS; readonly state: string }
+  | { readonly kind: typeof LATCH_RECOVERY_REASON_KIND_ROW_GONE }
+  | { readonly kind: typeof LATCH_RECOVERY_REASON_KIND_RETRY_NOT_REFUSED }
+  | { readonly kind: typeof LATCH_RECOVERY_REASON_KIND_RELAUNCH_NOT_REFUSED }
+  | { readonly kind: typeof LATCH_RECOVERY_REASON_KIND_CLEARED_BY_HAND }
+
+/** `its agent-director row reads <state>`, as a value. */
+export function latchRecoveryReasonRowReads(state: string): LatchRecoveryReason {
+  return Object.freeze({ kind: LATCH_RECOVERY_REASON_KIND_ROW_READS, state })
+}
+/** `its agent-director row is gone`, as a value. */
+export const LATCH_RECOVERY_REASON_ROW_GONE: LatchRecoveryReason = Object.freeze({ kind: LATCH_RECOVERY_REASON_KIND_ROW_GONE })
+/** `a retry of the refused operation was not refused`, as a value. */
+export const LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED: LatchRecoveryReason = Object.freeze({
+  kind: LATCH_RECOVERY_REASON_KIND_RETRY_NOT_REFUSED,
+})
+/** `its row finished and a relaunch was not refused`, as a value. */
+export const LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED: LatchRecoveryReason = Object.freeze({
+  kind: LATCH_RECOVERY_REASON_KIND_RELAUNCH_NOT_REFUSED,
+})
+/** `cleared by hand`, as a value. */
+export const LATCH_RECOVERY_REASON_CLEARED_BY_HAND: LatchRecoveryReason = Object.freeze({
+  kind: LATCH_RECOVERY_REASON_KIND_CLEARED_BY_HAND,
+})
+
+/** The state-bearing reason's text up to `<state>`. */
+export const LATCH_RECOVERY_REASON_ROW_READS_HEAD = 'its agent-director row reads '
+
+/** The fixed text of each reason without a state. */
+export const LATCH_RECOVERY_REASON_TEXTS: Readonly<
+  Record<Exclude<LatchRecoveryReason['kind'], typeof LATCH_RECOVERY_REASON_KIND_ROW_READS>, string>
+> = Object.freeze({
+  [LATCH_RECOVERY_REASON_KIND_ROW_GONE]: 'its agent-director row is gone',
+  [LATCH_RECOVERY_REASON_KIND_RETRY_NOT_REFUSED]: 'a retry of the refused operation was not refused',
+  [LATCH_RECOVERY_REASON_KIND_RELAUNCH_NOT_REFUSED]: 'its row finished and a relaunch was not refused',
+  [LATCH_RECOVERY_REASON_KIND_CLEARED_BY_HAND]: 'cleared by hand',
+})
+
+/**
+ * `<reason>` for a Slack text. The state is agent-director's text, so it is
+ * rendered as a quoted description is (redacted, on one line, capped) and
+ * escaped for Slack; a state agent-director reports (`ended`, `missing`, …)
+ * is unchanged by both. Pure.
+ */
+export function latchRecoveryReasonText(reason: LatchRecoveryReason): string {
+  return reason.kind === LATCH_RECOVERY_REASON_KIND_ROW_READS
+    ? LATCH_RECOVERY_REASON_ROW_READS_HEAD + escapeSlackControlCharacters(renderLogMessageText(reason.state))
+    : LATCH_RECOVERY_REASON_TEXTS[reason.kind]
+}
+
+/** The CONFLICT recovery notice up to `<session>`. */
+export const CONFLICT_RECOVERY_HEAD = ":white_check_mark: *Conflict cleared* — the hold on this persona's tmux session "
+/** The CONFLICT recovery notice between `<session>` and `<reason>`. */
+export const CONFLICT_RECOVERY_REASON_LEAD = ' is cleared ('
+/** The hold recovery notice up to `<reason>`. */
+export const HOLD_RECOVERY_HEAD =
+  ":white_check_mark: *Hold cleared* — the hold on this persona's agent-director row is cleared ("
+/** Both recovery notices after `<reason>`. */
+export const LATCH_RECOVERY_TAIL = '). CSCB is recovering this persona again.'
+
+/**
+ * The recovery notice's body for a CONFLICT latch on the quoted session
+ * `sessionName` (the record's, without quotes) cleared for `reason`
+ * (b.jg5 SRJ-1005); the persona notifier adds the persona prefix. Pure.
+ */
+export function conflictRecoveryText(sessionName: string, reason: LatchRecoveryReason): string {
+  return (
+    CONFLICT_RECOVERY_HEAD +
+    slackQuotedSession(sessionName) +
+    CONFLICT_RECOVERY_REASON_LEAD +
+    latchRecoveryReasonText(reason) +
+    LATCH_RECOVERY_TAIL
+  )
+}
+
+/** The recovery notice's body for an "unusable recorded name" or "launch start not recorded" latch cleared for `reason` (b.jg5 SRJ-1005). Pure. */
+export function holdRecoveryText(reason: LatchRecoveryReason): string {
+  return HOLD_RECOVERY_HEAD + latchRecoveryReasonText(reason) + LATCH_RECOVERY_TAIL
+}
+
+/**
+ * The recovery notice's body for a latch of `kind` cleared for `reason`:
+ * {@link conflictRecoveryText} on `sessionName` for a CONFLICT latch,
+ * {@link holdRecoveryText} for a hold (which names no session). Pure.
+ */
+export function latchRecoveryText(kind: LatchKind, reason: LatchRecoveryReason, sessionName: string): string {
+  return kind === LATCH_KIND_HOLD ? holdRecoveryText(reason) : conflictRecoveryText(sessionName, reason)
+}
+
+// ---------------------------------------------------------------------------
+// The CONFLICT notice's episode (b.jg5 SRJ-508, SRJ-1016)
+// ---------------------------------------------------------------------------
+
+/** What the notice reaction uses of the server's notice episodes. */
+export type ConflictNoticeEpisodes = Pick<PersonaEpisodes, 'begin' | 'post'>
+
+/**
+ * The CONFLICT notice's set observer over `episodes` (b.jg5 SRJ-508): for a
+ * set with a CONFLICT case or unrecognised text,
+ *
+ *   - a latch (`latched`) or a relatch with a new case (`relatched`) begins
+ *     P's CONFLICT episode with the record's case, or keeps the open one when
+ *     its case is the same, and posts {@link conflictNoticeText} in it at most
+ *     once: a new case's episode is new, so it posts once more;
+ *   - a same-case set (`same-case`) keeps the episode and posts nothing.
+ *
+ * A hold case is E16's, with its own episodes: this observer ignores it. The
+ * post goes through the episodes' sink (the persona notifier), never
+ * straight to Slack, and reads no other notice's latch, b.f2b's
+ * `unproven-idle` and `blocked-on-prompt` included, so none holds it back.
+ * After the episodes' `close` (shutdown) it opens and posts nothing. It ends
+ * no episode: the clear is E30's, and a teardown's `forget` ends it.
+ */
+export function createConflictNoticeObserver(episodes: ConflictNoticeEpisodes): ConflictLatchSetObserver {
+  return ({ key, outcome, record }) => {
+    if (outcome === CONFLICT_LATCH_SET_SAME_CASE) return
+    const latchCase = record.latchCase
+    if (isHoldLatchCase(latchCase)) return
+    if (episodes.begin(key, PERSONA_EPISODE_KIND_CONFLICT, latchCase) === 'closed') return
+    episodes.post(
+      key,
+      PERSONA_EPISODE_KIND_CONFLICT,
+      conflictNoticeText({ sessionName: record.sessionName, latchCase, description: record.description }),
+    )
+  }
+}
+
+/**
+ * Bind the CONFLICT notice to `latch`: adds {@link createConflictNoticeObserver}
+ * over `episodes` as a set observer. Answers the observer's removal. `main()`
+ * binds the server's one latch to its one set of notice episodes.
+ */
+export function bindConflictNotice(latch: Pick<ConflictLatch, 'addSetObserver'>, episodes: ConflictNoticeEpisodes): () => void {
+  return latch.addSetObserver(createConflictNoticeObserver(episodes))
 }

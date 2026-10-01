@@ -122,6 +122,7 @@ import {
   UNCLASSIFIED_ERROR_END_CAPPED,
   type PersonaEpisodes,
 } from './persona-episodes.ts'
+import { bindConflictNotice, createConflictLatch } from './conflict-latch.ts'
 import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
@@ -1881,6 +1882,15 @@ export async function main(): Promise<void> {
     log: (line) => console.error(line),
   })
   personaEpisodes = noticeEpisodes
+
+  // b.jg5 SRJ-501, SRJ-508: the server's one per-persona latch, in memory
+  // only (nothing is loaded from a file), built before the start pass so it
+  // exists before any launch can meet a CONFLICT. Its CONFLICT notice is
+  // bound to the notice episodes: a latch, or a relatch with a new case,
+  // begins the persona's CONFLICT episode and posts the notice once through
+  // the persona notifier; the same case posts nothing.
+  const conflictLatch = createConflictLatch({ log: (line) => console.error(line) })
+  bindConflictNotice(conflictLatch, noticeEpisodes)
 
   // b.jg5 SRJ-313, SRJ-1009: each persona's unclassified-error episode, held
   // in the notice episodes (so a teardown forgets it and shutdown closes it).
