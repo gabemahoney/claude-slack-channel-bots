@@ -85,9 +85,10 @@
  *   failed (`UNAVAILABLE_RETRY_STOP_RUN_FAILED`). A no-op call (nothing
  *   armed), a first arm that failed (no timer ever ran) and a pending-only
  *   stop that yielded to a full-mode cause are not stops. It runs before a
- *   stop's hand-off (b.jg5 SRJ-309: the `tmux-unresponsive` alert check is
- *   cancelled with the timer, since the alert says CSCB keeps retrying, and
- *   armed again by a later refusal unless the reason is one of
+ *   stop's hand-off (b.jg5 SRJ-305, SRJ-308, SRJ-309: the
+ *   `tmux-unresponsive` onset is held back and its alert check cancelled with
+ *   the timer, since both say CSCB keeps retrying, and a later refusal
+ *   allows the onset and arms the check again unless the reason is one of
  *   `UNAVAILABLE_RETRY_TERMINAL_STOPS`; b.jg5 SRJ-313: the persona's
  *   unclassified-error episode ends on `UNAVAILABLE_RETRY_STOP_RECOVERED`
  *   and `UNAVAILABLE_RETRY_STOP_ROW_LIVE` only). It reads nothing back and
@@ -475,9 +476,11 @@ export const UNAVAILABLE_RETRY_STOP_RUN_FAILED = 'its retry run failed'
  * The terminal stop reasons (b.jg5 SRJ-309): the persona is going away or the
  * server is, so no later refusal may bring its retrying back. The
  * `tmux-unresponsive` condition's `cancelAlert` (`src/persona-episodes.ts`)
- * never arms the alert check again after a stop for one of these. Every other
+ * never arms the alert check again, and never lets the onset post again in
+ * the episode, after a stop for one of these (SRJ-305, SRJ-308). Every other
  * stop reason (the cap, not up, a pending-only row read, a failed run, ...)
- * leaves a later refusal free to arm the timer, and the check, again.
+ * leaves a later refusal free to arm the timer, and the check, again, and to
+ * allow the onset again.
  */
 export const UNAVAILABLE_RETRY_TERMINAL_STOPS: ReadonlySet<string> = new Set([
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
@@ -612,7 +615,8 @@ export interface UnavailableRetryDeps {
    * stop's reason (the stopped line's, or `UNAVAILABLE_RETRY_STOP_RUN_FAILED`
    * for a timer forgotten because its re-arm failed), after the stopped line
    * and before any hand-off. Production binds two consumers in one observer:
-   * the `tmux-unresponsive` condition's `cancelAlert`, then the
+   * the `tmux-unresponsive` condition's `cancelAlert` (which holds the
+   * condition's onset back and cancels its pending alert check), then the
    * unclassified-error episodes' `retryStopped` (b.jg5 SRJ-313), which ends
    * the persona's episode only for `UNAVAILABLE_RETRY_STOP_RECOVERED` and
    * `UNAVAILABLE_RETRY_STOP_ROW_LIVE`. Each

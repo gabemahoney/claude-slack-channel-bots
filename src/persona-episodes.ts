@@ -52,9 +52,10 @@
  * - `start(key, verb, error)` starts the condition (opens the episode, the
  *   first refusal's time from the episodes' clock, one started line, and
  *   the alert check armed) or continues it (the first refusal's time kept,
- *   no line, and the alert check armed again when a retry-timer stop
- *   cancelled it; see the alert below). After the episodes' `close` it does
- *   nothing. Its only caller
+ *   no line, the onset allowed again when a non-terminal retry-timer stop
+ *   held it back, and the alert check armed again when a retry-timer stop
+ *   cancelled it; see the onset and the alert below). After the episodes'
+ *   `close` it does nothing. Its only caller
  *   is the outage state's reporting point (`src/outage-state.ts`), for a
  *   tmux-touching call's UNAVAILABLE inside a launch or recovery attempt for
  *   the persona; it never throws there.
@@ -71,7 +72,24 @@
  *   after the first refusal. The mode is read from the injected accessor
  *   (the configuration in effect) at each check. Once the episode's alert
  *   has posted, neither posts the onset in it (one `onset not posted` line
- *   per episode instead): the alert has said more.
+ *   per episode instead): the alert has said more. The onset says CSCB is
+ *   retrying, so neither posts it either while the persona's retry timer is
+ *   stopped (SRJ-305): every stop reported to `cancelAlert(key, stopReason)`
+ *   while the condition holds, whatever its reason and whether or not an
+ *   alert check was pending, marks the episode stopped (one `onset not
+ *   posted` line per episode while the mark holds the onset back; the
+ *   alert-held line takes precedence once the alert has posted). A later
+ *   refusal in the episode (`start` continuing it, whose reporting point has
+ *   just armed the timer again) clears the mark, so the onset may post again
+ *   on the usual terms; a terminal stop's mark
+ *   (`UNAVAILABLE_RETRY_TERMINAL_STOPS`: torn down, not in the applied
+ *   configuration, server shutdown) is never cleared in its episode, so no
+ *   onset posts in it after such a stop. Only a refusal clears the mark: an
+ *   arm of the timer that is not a refusal (the health tick's
+ *   `armMissingRetryTimer`, `src/health-check.ts`, or an arm for an
+ *   ENVIRONMENT answer) clears nothing, and the
+ *   condition never reads whether the timer is armed. The episode's close
+ *   drops the mark, so a new episode starts with none.
  * - The alert (SRJ-309): one check per episode, armed at the first refusal
  *   on the episodes' clock with the never-early wait (`armNeverEarlyWait`,
  *   `src/ad-settings.ts`) over the injected threshold accessor (the
@@ -83,15 +101,19 @@
  *   `view`). Its text says CSCB keeps retrying, so it runs only while the
  *   persona's retry timer does: `cancelAlert(key, stopReason)`, bound in
  *   `main()` to every stop of the retry timer
- *   (`UnavailableRetryDeps.onStopped`, `src/unavailable-retry.ts`), cancels
- *   a check not yet posted while the condition holds, with one line naming
- *   the stop's reason (an alert already posted stays posted). A later
+ *   (`UnavailableRetryDeps.onStopped`, `src/unavailable-retry.ts`), records
+ *   the stop for the onset (above) and cancels a check not yet posted while
+ *   the condition holds, with one line naming the stop's reason (an alert
+ *   already posted stays posted). A later
  *   refusal in the same episode, which arms the timer again at the reporting
  *   point before it continues the condition, arms the check again from the
  *   episode's first refusal (one line), so it posts at once when the
  *   condition has already lasted longer than the threshold. A stop for a
  *   terminal reason (`UNAVAILABLE_RETRY_TERMINAL_STOPS`: torn down, not in
- *   the applied configuration, server shutdown) never arms it again.
+ *   the applied configuration, server shutdown) never arms it again, nor
+ *   lets a later refusal in the episode arm it again, even when an earlier
+ *   non-terminal stop had already cancelled it (the terminal stop withdraws
+ *   that re-arm).
  * - `end(key, reason, reading?, options?)` ends a holding condition once:
  *   the recovery (SRJ-310) is posted when the episode's onset or alert was,
  *   unless `options.silent` (a CONFLICT answer ends it; its notice follows);
@@ -115,6 +137,7 @@
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive started — <verb> failed: <describeAgentDirectorFailure(error)>
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive onset posted — still not answering at <a health tick|a retry>, <s> s after its first refusal
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive onset not posted — its alert already posted
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive onset not posted — its retry timer stopped and no refusal has re-armed it
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive alert posted — not answering for <s> s, over its alert threshold of <s> s
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive alert check cancelled — its retry timer stopped: <stop reason>
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive alert check armed again — a new refusal armed its retry timer again
@@ -684,8 +707,10 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
   /**
    * Start persona `key`'s condition for a refusal `error` from `verb` (one
    * started line; the first refusal's time from the clock), or continue it
-   * while it holds (its first refusal's time kept, no line; an alert check a
-   * retry-timer stop cancelled in the episode is armed again, with one line).
+   * while it holds (its first refusal's time kept, no line; a non-terminal
+   * retry-timer stop's hold on the episode's onset is lifted, and an alert
+   * check a retry-timer stop cancelled in the episode is armed again, with
+   * one line).
    */
   start(key: string, verb: AdVerb, error: unknown): TmuxUnresponsiveStartResult
   /** Whether persona `key`'s condition holds. */
@@ -712,8 +737,9 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
    * the onset once per episode for every persona whose condition still holds
    * and whose first refusal is strictly before `tickStartedAt` (the tick's
    * start, in the episodes' clock milliseconds), unless the episode's alert
-   * has posted. A condition the tick ended no longer holds, so gets none. No
-   * agent-director call; never throws.
+   * has posted or a stop of the persona's retry timer holds it back
+   * (`cancelAlert`). A condition the tick ended no longer holds, so gets
+   * none. No agent-director call; never throws.
    */
   onsetAtTick(tickStartedAt: number): void
   /**
@@ -722,20 +748,30 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
    * SRJ-303): with the health check off, post the onset once per episode
    * when the condition holds and `firedAt` is at least
    * `TMUX_UNRESPONSIVE_ONSET_FLOOR_MS` after its first refusal, unless the
-   * episode's alert has posted. Never throws.
+   * episode's alert has posted or a stop of the persona's retry timer holds
+   * it back (`cancelAlert`). Never throws.
    */
   onsetAtRetry(key: string, firedAt: number): void
   /**
-   * Cancel persona `key`'s pending alert check, the condition kept: a stop
-   * of its retry timer, for `stopReason` (production binds it to the retry
-   * controller's `onStopped`, so every stop reason cancels it). Only a check
+   * A stop of persona `key`'s retry timer, for `stopReason`, the condition
+   * kept (production binds it to the retry controller's `onStopped`, so
+   * every stop reason reaches it). While the condition holds, the stop is
+   * recorded for its episode whatever its reason, whether or not a check is
+   * pending: the onset is held back until the episode's next refusal
+   * (`start`), or for the rest of the episode when `stopReason` is terminal
+   * (`UNAVAILABLE_RETRY_TERMINAL_STOPS`); an absent `stopReason` is a
+   * non-terminal stop. Then it cancels the pending alert check. Only a check
    * not yet posted in the episode open now is cancelled; an alert already
    * posted stays posted. When one is cancelled, one line names `stopReason`
    * (none when it is absent), and the episode's next refusal arms the check
    * again (`start`) unless `stopReason` is terminal
    * (`UNAVAILABLE_RETRY_TERMINAL_STOPS`: torn down, not in the applied
-   * configuration, server shutdown), which never re-arms it. Answers whether one was pending; with no condition
-   * holding (its end has already cancelled the check), false and no line.
+   * configuration, server shutdown), which never re-arms it. A terminal
+   * stop also withdraws the re-arm an earlier non-terminal stop left in the
+   * episode (its check already cancelled, so none is pending now), so no
+   * later refusal in the episode arms the check again. Answers whether one
+   * was pending; with no condition holding (its end has already cancelled
+   * the check), false and no line.
    */
   cancelAlert(key: string, stopReason?: string): boolean
 }
@@ -752,11 +788,22 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
   /**
    * The episode whose pending alert check `cancelAlert` cancelled with the
    * condition kept (a non-terminal stop of the persona's retry timer): the
-   * next refusal in that episode arms it again (`start`).
+   * next refusal in that episode arms it again (`start`), unless a terminal
+   * stop in the episode has withdrawn it first.
    */
   const rearmable = new Map<string, number>()
   /** The episode whose onset was held back because its alert had posted: logged once per episode. */
   const onsetHeld = new Map<string, number>()
+  /**
+   * The episode in which a stop of the persona's retry timer
+   * (`cancelAlert`) holds the onset back, and whether that stop was terminal
+   * (`UNAVAILABLE_RETRY_TERMINAL_STOPS`): a refusal continuing the episode
+   * (`start`) clears a non-terminal mark; a terminal one stays for the
+   * episode.
+   */
+  const timerStopped = new Map<string, { episode: number; terminal: boolean }>()
+  /** The episode whose onset was held back because its retry timer was stopped: logged once per episode. */
+  const onsetHeldStopped = new Map<string, number>()
 
   function line(key: string, text: string): void {
     safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} ${text}`)
@@ -786,6 +833,31 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
   function dropMarks(key: string, episode: number): void {
     if (rearmable.get(key) === episode) rearmable.delete(key)
     if (onsetHeld.get(key) === episode) onsetHeld.delete(key)
+    if (timerStopped.get(key)?.episode === episode) timerStopped.delete(key)
+    if (onsetHeldStopped.get(key) === episode) onsetHeldStopped.delete(key)
+  }
+
+  /**
+   * Record a stop of the persona's retry timer for its open `episode`
+   * (b.jg5 SRJ-305, SRJ-308): the onset is held back from now on. A terminal
+   * stop is kept terminal: a later non-terminal stop in the episode never
+   * weakens it.
+   */
+  function markTimerStopped(key: string, episode: number, terminal: boolean): void {
+    const prior = timerStopped.get(key)
+    const wasTerminal = prior?.episode === episode && prior.terminal
+    timerStopped.set(key, { episode, terminal: terminal || wasTerminal })
+  }
+
+  /**
+   * A refusal that continues a holding condition (b.jg5 SRJ-305, SRJ-308):
+   * the refusal's reporting point has just armed the persona's retry timer
+   * again, so a non-terminal stop no longer holds the episode's onset back.
+   * A terminal stop's mark stays.
+   */
+  function clearNonTerminalStop(key: string, episode: number): void {
+    const mark = timerStopped.get(key)
+    if (mark !== undefined && mark.episode === episode && !mark.terminal) timerStopped.delete(key)
   }
 
   /**
@@ -852,7 +924,10 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
   /**
    * Post the onset once in the persona's open episode; log it when posted.
    * Once the episode's alert has posted, the onset is not posted in it (the
-   * alert already said more), and one line per episode says so.
+   * alert already said more), and one line per episode says so. While a stop
+   * of the persona's retry timer holds the episode's onset back (no refusal
+   * since a non-terminal stop, or any terminal stop), it is not posted
+   * either (it says CSCB is retrying), and one line per episode says so.
    */
   function postOnset(key: string, where: string, now: number): void {
     const current = episodes.view(key, kind)
@@ -863,6 +938,12 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
       line(key, 'onset not posted — its alert already posted')
       return
     }
+    if (timerStopped.get(key)?.episode === current.episode) {
+      if (onsetHeldStopped.get(key) === current.episode) return
+      onsetHeldStopped.set(key, current.episode)
+      line(key, 'onset not posted — its retry timer stopped and no refusal has re-armed it')
+      return
+    }
     if (!episodes.post(key, kind, tmuxUnresponsiveOnsetText(key), ONSET_MARK)) return
     line(key, `onset posted — still not answering at ${where}, ${seconds(now - current.startedAt)} s after its first refusal`)
   }
@@ -870,6 +951,8 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
   return {
     start(key, verb, error) {
       if (episodes.isOpen(key, kind)) {
+        const open = episodes.view(key, kind)?.episode
+        if (open !== undefined) clearNonTerminalStop(key, open)
         rearmAlert(key)
         return 'continued'
       }
@@ -932,11 +1015,18 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
       try {
         // Only the check armed for the episode open now: the condition holds.
         const episode = episodes.view(key, kind)?.episode
-        if (episode === undefined || !cancelPendingAlert(key, episode)) return false
+        if (episode === undefined) return false
         // A terminal stop (torn down, removed, shutdown) never re-arms: a
         // refusal landing after it (a launch still in flight) must not bring
-        // the alert back for a persona that is going away.
-        if (stopReason === undefined || !UNAVAILABLE_RETRY_TERMINAL_STOPS.has(stopReason)) rearmable.set(key, episode)
+        // the onset or the alert back for a persona that is going away.
+        const terminal = stopReason !== undefined && UNAVAILABLE_RETRY_TERMINAL_STOPS.has(stopReason)
+        // Every stop holds the onset back, a pending alert check or not.
+        markTimerStopped(key, episode, terminal)
+        // A terminal stop also withdraws a re-arm an earlier non-terminal
+        // stop left for the episode, whose check it already cancelled.
+        if (terminal && rearmable.get(key) === episode) rearmable.delete(key)
+        if (!cancelPendingAlert(key, episode)) return false
+        if (!terminal) rearmable.set(key, episode)
         if (stopReason !== undefined) line(key, `alert check cancelled — its retry timer stopped: ${stopReason}`)
         return true
       } catch (err) {

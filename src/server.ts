@@ -1928,7 +1928,9 @@ export async function main(): Promise<void> {
   // included, is the condition's onset check with the health check off.
   // b.jg5 SRJ-309: every stop of a persona's timer, whatever its reason (a
   // teardown and shutdown included), cancels the condition's alert check
-  // not yet posted while it holds, since the alert says CSCB keeps retrying.
+  // not yet posted while it holds, since the alert says CSCB keeps retrying;
+  // b.jg5 SRJ-305, SRJ-308: the same call holds the condition's onset back
+  // until a later refusal (never again after a terminal stop).
   // b.jg5 SRJ-311, SRJ-312: the same healthy-row observation (a live row out
   // of `pending`, connected with its stream) also clears the persona's
   // `tmux-unavailable` outage, with that reading, which the cleared-flag

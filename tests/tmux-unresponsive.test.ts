@@ -35,7 +35,8 @@
  *   lines have no exported builder, so the recovery harness's line builders
  *   (`conditionOnsetLine`, `conditionAlertLine`, `conditionEndedLine`,
  *   `conditionRecoveryLine`, `conditionSilentEndLine`) and this file's
- *   (`onsetHeldLine`, `alertCancelledLine`, `alertRearmedLine`) hold their
+ *   (`onsetHeldLine`, `alertCancelledLine`, `alertRearmedLine`,
+ *   `onsetStoppedLine`, and the health tick's `tickArmingLine`) hold their
  *   fixed words; their seconds come from the clock and the threshold in effect, and the notice cases assert every notice and
  *   ended line exactly, in order.
  * - The onset (SRJ-308): with the health check on, at the end of the first
@@ -52,7 +53,16 @@
  *   teardown) cancels a pending alert check with one line naming the stop;
  *   an alert already posted stays. A later refusal in the episode arms the
  *   check again from the first refusal (one line), unless the stop was
- *   terminal (`UNAVAILABLE_RETRY_TERMINAL_STOPS`).
+ *   terminal (`UNAVAILABLE_RETRY_TERMINAL_STOPS`); a teardown after a not-up
+ *   stop that already cancelled the check withdraws that re-arm.
+ * - The onset and the retry timer (SRJ-305, SRJ-308; AC 28): while a stop
+ *   of P's timer (the restart cap, not up) holds, no tick and no retry past
+ *   the floor posts the onset (one `onset not posted` line per episode); a
+ *   later refusal lets the next one post it. An arm that is not a refusal
+ *   (the health tick's `armMissingRetryTimer`, an ENVIRONMENT trigger)
+ *   allows nothing. After a removal, a teardown or the shutdown it never
+ *   posts, and a later non-terminal stop does not weaken that; the mark ends
+ *   with its episode.
  * - The recovery (SRJ-310): one at the end, after an onset or an alert;
  *   none at a silent end or an end with neither. A new episode posts all
  *   three again; a teardown and the shutdown post nothing more.
@@ -64,7 +74,9 @@
  * `ALL_CLEAR_TEMPLATE`).
  *
  * No retry timer is real: the clock is the harness's fake clock, and the
- * only real-time waits are the spawn path's bounded 1 ms polls.
+ * only real-time waits are the spawn path's bounded 1 ms polls and, in the
+ * `armMissingRetryTimer` case, one real health tick's interval (`healthTick`,
+ * bounded; the tick's start is read from the fake clock).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -80,7 +92,8 @@ import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_
 import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
-import { LIVENESS_LIVE, LIVENESS_READING_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
+import { _resetHealthCheckState, initHealthCheck, startHealthCheck, stopHealthCheck, type HealthCheckDeps } from '../src/health-check.ts'
+import { LIVENESS_LIVE, LIVENESS_READING_DEAD, LIVENESS_READING_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
 import {
   ALL_CLEAR_TEMPLATE,
   getOutageFlags,
@@ -106,6 +119,7 @@ import { killPersonaInstance, reconcileOrphans } from '../src/session-manager.ts
 import {
   runInAttempt,
   UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CEILING_S,
@@ -113,6 +127,7 @@ import {
   UNAVAILABLE_RETRY_STOP_CAPPED,
   UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
   UNAVAILABLE_RETRY_STOP_NOT_UP,
+  UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   UNAVAILABLE_RETRY_TERMINAL_STOPS,
@@ -1374,6 +1389,315 @@ describe('tmux-unresponsive: the alert and the retry timer’s stops (SRJ-309)',
 
     expectPosts(h, [])
     expect(noticeAndEndLines(h, p)).toEqual([alertCancelledLine(p, stop.reason)])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The onset and the retry timer's stops (SRJ-305, SRJ-308; AC 28)
+// ---------------------------------------------------------------------------
+
+/** The line when a stop of the persona's retry timer holds its onset back: once per episode. */
+function onsetStoppedLine(key: string): string {
+  return `${conditionLinePrefix(key)}onset not posted — its retry timer stopped and no refusal has re-armed it`
+}
+
+/** The health tick's line when it arms the retry timer of a persona held off on `tmux-unavailable` (`armMissingRetryTimer`). */
+function tickArmingLine(key: string): string {
+  return `[slack] health-check: persona=${key} has its tmux-unavailable outage raised with no retry timer — arming one`
+}
+
+/** The `tmux-unavailable` outage's onset for persona `key`. */
+function tmuxUnavailableOnset(key: string): RecoveryNotice {
+  return { key, text: ONSET_TEMPLATES['tmux-unavailable']() }
+}
+
+/**
+ * Raise persona `key`'s `tmux-unavailable` outage the way any call outside
+ * every attempt does: a `status` answering ENVIRONMENT (`ErrTmuxNotAvailable`).
+ * Its trigger arms the persona's retry timer with the ENVIRONMENT cause when
+ * none is armed (b.jg5 SRJ-311): an arm that is not a refusal of the
+ * condition.
+ */
+async function raiseTmuxUnavailable(key: string): Promise<void> {
+  await wrapped(key, 'status', { rejects: () => errTmuxNotAvailable(undefined, 'status') })
+  expect([...getOutageFlags(key)]).toEqual(['tmux-unavailable'])
+}
+
+/**
+ * One real health tick (`startHealthCheck`, `src/health-check.ts`) over
+ * persona `key` alone, which it reads `dead`, with the deps the cases need
+ * bound as `main()` binds them: the retry deps over the harness's controller
+ * (`isRetryArmed` is its `isArmed`; `armRetryTimer` arms it with
+ * `UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT`), so a persona held off on its raised
+ * `tmux-unavailable` outage with no timer armed gets one
+ * (`armMissingRetryTimer`); the restart cap over `isAtCap`; the tick-end hook
+ * the condition's onset check (`tickOnset`); and the tick's start read from
+ * the harness clock. The interval is real, so the wait for the one tick body
+ * is bounded, and every later firing is skipped as shutting down. Resolves
+ * with the keys the tick scheduled a restart for.
+ */
+async function healthTick(h: RecoveryHarness, key: string): Promise<string[]> {
+  const ended = Promise.withResolvers<void>()
+  const scheduled: string[] = []
+  let bodies = 0
+  const deps: HealthCheckDeps = {
+    getPersonas: () => ({ [key]: personaOf(h, key).working_directory }),
+    isShuttingDown: () => bodies > 0,
+    now: () => {
+      bodies++
+      return h.clock.now()
+    },
+    isSessionAlive: async () => LIVENESS_READING_DEAD,
+    isSessionConnected: () => false,
+    hasSessionStream: () => false,
+    isRestartPendingOrActive: () => false,
+    isLaunchInFlight: () => false,
+    isAtCap: (k) => isAtCap(k, RESTART_FAILURE_CAP),
+    statRoute: async () => true,
+    scheduleRestart: (k) => void scheduled.push(k),
+    isRetryArmed: (k) => h.controller.isArmed(k),
+    armRetryTimer: (k) => {
+      h.controller.arm(k, { kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT })
+    },
+    onTickEnd: (tickStartedAt) => {
+      h.tickOnset(tickStartedAt)
+      ended.resolve()
+    },
+  }
+  initHealthCheck(deps)
+  const bound = setTimeout(() => ended.reject(new Error('healthTick: no tick body ended within 1 s')), 1000)
+  try {
+    startHealthCheck(0.001)
+    await ended.promise
+  } finally {
+    clearTimeout(bound)
+    stopHealthCheck()
+    _resetHealthCheckState()
+  }
+  expect(bodies).toBe(1)
+  return scheduled
+}
+
+describe('tmux-unresponsive: the onset and the retry timer’s stops (SRJ-305, SRJ-308; AC 28)', () => {
+  test.each<[string, TimerStop]>([
+    ['the restart cap', STOP_AT_CAP],
+    ['the persona not up', STOP_NOT_UP],
+  ])('with the health check on, while P’s retry timer is stopped by %s the ticks post no onset (one line); after a later refusal re-arms the timer the next tick posts it, once; B’s onset is untouched', async (_what, stop) => {
+    const { h, p, b } = build(TICK_MODE)
+    const thresholdMs = adAlertThresholdMsInEffect()
+    const at = await refuse(h, p)
+    expect(await refuse(h, b)).toBe(at)
+    await stop.drive(h, p)
+
+    for (let n = 0; n < 3; n++) {
+      await h.advance(tickMs(h))
+      tick(h)
+    }
+
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+    expect(h.controller.isArmed(p)).toBe(false)
+    expectPosts(h, [onset(b)])
+    expect(noticeAndEndLines(h, p)).toEqual([alertCancelledLine(p, stop.reason), onsetStoppedLine(p)])
+
+    await refuse(h, p)
+    expect(h.controller.isArmed(p)).toBe(true)
+    await h.advance(tickMs(h))
+    const tickAt = h.clock.now()
+    tick(h)
+
+    expectPosts(h, [onset(b), onset(p)])
+    const lines = [
+      alertCancelledLine(p, stop.reason),
+      onsetStoppedLine(p),
+      alertRearmedLine(p),
+      conditionOnsetLine(p, 'a health tick', tickAt - at),
+    ]
+    expect(noticeAndEndLines(h, p)).toEqual(lines)
+
+    await h.advance(tickMs(h))
+    tick(h)
+    expect(h.clock.now() - at).toBeLessThan(thresholdMs)
+    expectPosts(h, [onset(b), onset(p)])
+    expect(noticeAndEndLines(h, p)).toEqual(lines)
+  })
+
+  test.each<[string, TimerStop]>([
+    ['a removal from the applied configuration', STOP_NOT_APPLIED],
+    ['a teardown’s submit (teardown(key), the condition kept)', STOP_TORN_DOWN],
+  ])('with the health check on, after P’s retry timer is stopped by %s no tick posts its onset, not even after a later refusal arms the timer again', async (_what, stop) => {
+    const { h, p, b } = build(TICK_MODE)
+    const thresholdMs = adAlertThresholdMsInEffect()
+    const at = await refuse(h, p)
+    expect(await refuse(h, b)).toBe(at)
+    await stop.drive(h, p)
+
+    await h.advance(tickMs(h))
+    tick(h)
+    expectPosts(h, [onset(b)])
+    const lines = [alertCancelledLine(p, stop.reason), onsetStoppedLine(p)]
+    expect(noticeAndEndLines(h, p)).toEqual(lines)
+
+    // A refusal landing after it (a launch still in flight) arms the timer again.
+    await refuse(h, p)
+    expect(h.controller.isArmed(p)).toBe(true)
+    for (let n = 0; n < 3; n++) {
+      await h.advance(tickMs(h))
+      tick(h)
+    }
+
+    expect(h.clock.now() - at).toBeLessThan(thresholdMs)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+    expect(h.tmuxUnresponsive.firstRefusalAt(p)).toBe(at)
+    expectPosts(h, [onset(b)])
+    expect(noticeAndEndLines(h, p)).toEqual(lines)
+  })
+
+  test('a later non-terminal stop never weakens a teardown’s: after the teardown, a refusal, a not-up stop and another refusal, no tick posts the onset', async () => {
+    const { h, p } = build(TICK_MODE)
+    const at = await refuse(h, p)
+    await STOP_TORN_DOWN.drive(h, p)
+
+    await h.advance(halfFirstWaitMs())
+    await refuse(h, p)
+    await STOP_NOT_UP.drive(h, p)
+    expect(h.stops.filter((s) => s.key === p).map((s) => s.reason)).toEqual([UNAVAILABLE_RETRY_STOP_TORN_DOWN, UNAVAILABLE_RETRY_STOP_NOT_UP])
+    await refuse(h, p)
+    expect(h.controller.isArmed(p)).toBe(true)
+
+    for (let n = 0; n < 3; n++) {
+      await h.advance(tickMs(h))
+      tick(h)
+    }
+
+    expect(h.clock.now() - at).toBeLessThan(adAlertThresholdMsInEffect())
+    expect(h.tmuxUnresponsive.firstRefusalAt(p)).toBe(at)
+    expectPosts(h, [])
+    expect(noticeAndEndLines(h, p)).toEqual([alertCancelledLine(p, UNAVAILABLE_RETRY_STOP_TORN_DOWN), onsetStoppedLine(p)])
+  })
+
+  test('a teardown after a not-up stop that already cancelled P’s alert check withdraws its re-arm: a later refusal arms the retry timer but neither the check nor the onset, and past the threshold nothing posts', async () => {
+    const { h, p } = build(TICK_MODE)
+    const thresholdMs = adAlertThresholdMsInEffect()
+    const at = await refuse(h, p)
+    await STOP_NOT_UP.drive(h, p)
+    await STOP_TORN_DOWN.drive(h, p)
+
+    await h.advance(halfFirstWaitMs())
+    await refuse(h, p)
+    expect(h.controller.isArmed(p)).toBe(true)
+    expect(h.tmuxUnresponsive.firstRefusalAt(p)).toBe(at)
+
+    await h.advance(at + 2 * thresholdMs - h.clock.now())
+    tick(h)
+
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+    expectPosts(h, [])
+    // No `alert check armed again` line: the not-up cancel, then the held onset.
+    expect(noticeAndEndLines(h, p)).toEqual([alertCancelledLine(p, UNAVAILABLE_RETRY_STOP_NOT_UP), onsetStoppedLine(p)])
+  })
+
+  test('with the health check on, the shutdown’s stop of P’s retry timer leaves no onset to post: no later tick posts it, and a later refusal opens nothing', async () => {
+    const { h, p } = build(TICK_MODE)
+    await refuse(h, p)
+
+    h.shutdown()
+
+    expect(h.stops).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_SHUTDOWN }])
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(h.tmuxUnresponsive.start(p, 'spawn', errTmuxUnresponsive('spawn'))).toBe('closed')
+    for (let n = 0; n < 3; n++) {
+      await h.advance(tickMs(h))
+      tick(h)
+    }
+    expectPosts(h, [])
+    expect(noticeAndEndLines(h, p)).toEqual([alertCancelledLine(p, UNAVAILABLE_RETRY_STOP_SHUTDOWN)])
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test('the health tick’s own arm of P’s stopped timer (armMissingRetryTimer, its tmux-unavailable outage raised) is not a refusal: that tick and later ones post no onset; a later refusal does, at the next tick', async () => {
+    const { h, p, b } = build({ ...TICK_MODE, alertThresholdMs: false })
+    const at = await refuse(h, p)
+    await raiseTmuxUnavailable(p)
+    await STOP_NOT_UP.drive(h, p)
+    // Up again, so the tick's work list holds P (a not-up persona is left out of it).
+    h.setUp(p, true)
+
+    await h.advance(tickMs(h))
+    expect(await healthTick(h, p)).toEqual([])
+
+    expect(h.errors.filter((line) => line === tickArmingLine(p))).toHaveLength(1)
+    expect(h.controller.view(p)).toMatchObject({ phase: 'waiting', causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT] })
+    expect(h.episodeNotices).toEqual([])
+    // No alert check: the stop is recorded with none pending.
+    expect(noticeAndEndLines(h, p)).toEqual([onsetStoppedLine(p)])
+
+    // The tick-armed timer's retry runs, and a later tick finds it armed.
+    await nextRetry(h, p)
+    await h.advance(tickMs(h))
+    expect(await healthTick(h, p)).toEqual([])
+    expect(h.errors.filter((line) => line === tickArmingLine(p))).toHaveLength(1)
+    expect(h.episodeNotices).toEqual([])
+    expect(noticeAndEndLines(h, p)).toEqual([onsetStoppedLine(p)])
+
+    await refuse(h, p)
+    await h.advance(tickMs(h))
+    const tickAt = h.clock.now()
+    expect(await healthTick(h, p)).toEqual([])
+
+    expect(h.episodeNotices).toEqual([onset(p)])
+    expect(noticeAndEndLines(h, p)).toEqual([onsetStoppedLine(p), conditionOnsetLine(p, 'a health tick', tickAt - at)])
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(p)])
+    expect(h.tmuxUnresponsive.firstRefusalAt(p)).toBe(at)
+    expectNeverStarted(h, b)
+  })
+
+  test('with the health check off, a retry past the floor fired by a timer armed again after a not-up stop with no refusal (an ENVIRONMENT trigger) posts no onset; after a later refusal the next retry posts it', async () => {
+    const { h, p, b } = build(RETRY_MODE)
+    const at = await refuse(h, p)
+    await STOP_NOT_UP.drive(h, p)
+    h.setUp(p, true)
+
+    await raiseTmuxUnavailable(p)
+    expect(h.controller.view(p)).toMatchObject({ phase: 'waiting', causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT] })
+    while (h.controller.view(p)!.dueAt! - at < FLOOR_MS) await nextRetry(h, p)
+    const firedAt = await nextRetry(h, p)
+    expect(firedAt - at).toBeGreaterThanOrEqual(FLOOR_MS)
+    await nextRetry(h, p)
+
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+    expect(h.episodeNotices).toEqual([])
+    expect(noticeAndEndLines(h, p)).toEqual([onsetStoppedLine(p)])
+
+    await refuse(h, p)
+    const onsetAt = await nextRetry(h, p)
+
+    expect(h.episodeNotices).toEqual([onset(p)])
+    expect(noticeAndEndLines(h, p)).toEqual([onsetStoppedLine(p), conditionOnsetLine(p, 'a retry', onsetAt - at)])
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(p)])
+    expectNeverStarted(h, b)
+  })
+
+  test('the stop mark ends with its episode: after a not-up stop and the condition’s end, a new episode’s first tick posts its onset', async () => {
+    const { h, p } = build(TICK_MODE)
+    await refuse(h, p)
+    await STOP_NOT_UP.drive(h, p)
+    await h.advance(tickMs(h))
+    tick(h)
+    expect(h.tickEnd(p)).toBe('ended')
+    expectPosts(h, [])
+
+    await h.advance(halfFirstWaitMs())
+    const secondAt = await refuse(h, p)
+    await h.advance(tickMs(h))
+    tick(h)
+
+    expectPosts(h, [onset(p)])
+    expect(noticeAndEndLines(h, p)).toEqual([
+      alertCancelledLine(p, UNAVAILABLE_RETRY_STOP_NOT_UP),
+      onsetStoppedLine(p),
+      conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TICK),
+      conditionOnsetLine(p, 'a health tick', h.clock.now() - secondAt),
+    ])
   })
 })
 

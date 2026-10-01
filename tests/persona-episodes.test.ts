@@ -23,11 +23,19 @@
  * call false and silent), and the episode's next `continued` start arms it
  * again from the first refusal (posting at the next clock turn once the
  * threshold has passed); a stop in `UNAVAILABLE_RETRY_TERMINAL_STOPS` never
- * re-arms; a cancel after the alert posted, or with no episode open, cancels
+ * re-arms, and one that follows a not-up stop which already cancelled the
+ * check (answering false) withdraws that stop's re-arm; a cancel after the alert posted, or with no episode open, cancels
  * nothing; a closed episode's re-arm mark does not reach the next one. Once
  * the alert has posted, neither onset check posts the onset (one line per
  * episode), and `end` answers `ended-after-notice`, posting the recovery
- * unless silent. Each failure-only line is
+ * unless silent. Its onset while the retry timer is stopped (b.jg5 SRJ-305,
+ * SRJ-308): every stop reported to `cancelAlert` (the cap, not up, no reason
+ * at all; a pending alert check or none) holds the onset back at a tick and
+ * at a retry, with one `onset not posted` line per episode, until a
+ * `continued` start clears it; a terminal stop holds it for the rest of the
+ * episode, a later non-terminal stop not weakening it; the alert-held line
+ * takes precedence; another persona and a new episode post normally; and the
+ * alert check's cancel and re-arm lines are unchanged. Each failure-only line is
  * reached through an injected dep and throws nothing out of its entry: a NaN
  * threshold (`alert check not armed`, the start still succeeding), an alert
  * fire whose post or threshold read throws (`alert check failed`), a clock
@@ -749,6 +757,11 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
     return `[slack] persona-episodes: persona=${key} ${KIND} ${text}`
   }
 
+  /** The line when a stop of the persona's retry timer holds its onset back: once per episode. */
+  function stoppedLine(key: string): string {
+    return personaLine(key, 'onset not posted — its retry timer stopped and no refusal has re-armed it')
+  }
+
   test('start answers started, then continued with the first refusal\'s time kept; end answers ended-after-notice once the onset was posted', async () => {
     const condition = buildCondition()
     const err = errTmuxUnresponsive(VERB)
@@ -975,6 +988,25 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
       expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended')
     })
 
+    test.each(terminalStops)('a terminal stop (%s) after a not-up stop that already cancelled the check answers false and withdraws its re-arm: a later refusal arms nothing, and past the threshold neither the alert nor the onset posts', async (reason) => {
+      const condition = alerting({ healthCheckOn: () => true })
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      const before = lines.length
+
+      expect(condition.cancelAlert('K', UNAVAILABLE_RETRY_STOP_NOT_UP)).toBe(true)
+      expect(condition.cancelAlert('K', reason)).toBe(false)
+      expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('continued')
+
+      expect(clock.pendingCount()).toBe(0)
+      await clock.advanceTo(START_MS + THRESHOLD_MS * 2)
+      condition.onsetAtTick(clock.now())
+
+      expect(posts).toEqual([])
+      // No `alert check armed again` line: only the not-up cancel and the held onset.
+      expect(lines.slice(before)).toEqual([cancelledLine('K', UNAVAILABLE_RETRY_STOP_NOT_UP), stoppedLine('K')])
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended')
+    })
+
     test('a cancel after the alert has posted cancels nothing: false, no line, the alert stays posted, and a later refusal arms nothing', async () => {
       const condition = alerting()
       await startUntilAlert(condition)
@@ -1082,6 +1114,255 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
       expect(lines.at(-1)).toBe(personaLine('K', 'recovery not posted — a silent end (a CONFLICT answer ended it)'))
       expect(condition.holds('K')).toBe(false)
       expect(hookCalls).toEqual([{ key: 'K', reading: undefined }])
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // The onset while the persona's retry timer is stopped (b.jg5 SRJ-305,
+  // SRJ-308): every stop holds it back until a later refusal; a terminal
+  // stop for the rest of the episode.
+  // -------------------------------------------------------------------------
+
+  describe('the onset while the retry timer is stopped', () => {
+    const terminalStops = [...UNAVAILABLE_RETRY_TERMINAL_STOPS]
+    const NON_TERMINAL_STOPS = [UNAVAILABLE_RETRY_STOP_CAPPED, UNAVAILABLE_RETRY_STOP_NOT_UP].map((reason) => [reason] as const)
+
+    const onsetPost = (key: string): Post => ({ key, text: tmuxUnresponsiveOnsetText(key) })
+
+    /** The two onset checks: a health tick (health check on) and a retry past the floor (health check off). */
+    const checks: ReadonlyArray<readonly [string, boolean, (c: TmuxUnresponsiveCondition, key: string) => void]> = [
+      ['a health tick', true, (c) => c.onsetAtTick(clock.now())],
+      ['a retry', false, (c, key) => c.onsetAtRetry(key, clock.now())],
+    ]
+
+    function onsetPostedLine(key: string, where: string): string {
+      return personaLine(key, `onset posted — still not answering at ${where}, `)
+    }
+
+    /** Start `key`'s condition and move the clock to the onset floor, so either check would post the onset. */
+    async function startPastFloor(condition: TmuxUnresponsiveCondition, key = 'K'): Promise<void> {
+      expect(condition.start(key, VERB, errTmuxUnresponsive(VERB))).toBe('started')
+      await clock.advance(TMUX_UNRESPONSIVE_ONSET_FLOOR_MS)
+    }
+
+    function refuse(condition: TmuxUnresponsiveCondition, key = 'K'): void {
+      expect(condition.start(key, VERB, errTmuxUnresponsive(VERB))).toBe('continued')
+    }
+
+    test.each(NON_TERMINAL_STOPS)('with the health check on, a stop (%s) with the alert check pending holds the tick\'s onset back, one line, until a refusal; the alert check\'s cancel and re-arm lines are unchanged', async (reason) => {
+      const condition = buildCondition({ alertThresholdMs: () => THRESHOLD_MS, healthCheckOn: () => true })
+      await startPastFloor(condition)
+      const before = lines.length
+
+      expect(condition.cancelAlert('K', reason)).toBe(true)
+      condition.onsetAtTick(clock.now())
+      condition.onsetAtTick(clock.now())
+
+      expect(posts).toEqual([])
+      expect(lines.slice(before)).toEqual([
+        personaLine('K', `alert check cancelled — its retry timer stopped: ${reason}`),
+        stoppedLine('K'),
+      ])
+      expect(clock.pendingCount()).toBe(0)
+
+      refuse(condition)
+      expect(lines.at(-1)).toBe(personaLine('K', 'alert check armed again — a new refusal armed its retry timer again'))
+      expect(clock.pendingCount()).toBe(1)
+      condition.onsetAtTick(clock.now())
+
+      expect(posts).toEqual([onsetPost('K')])
+      expect(lines.at(-1)).toStartWith(onsetPostedLine('K', 'a health tick'))
+      expect(lines.filter((l) => l === stoppedLine('K'))).toHaveLength(1)
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)).toBe('ended-after-notice')
+    })
+
+    test.each(NON_TERMINAL_STOPS)('with the health check off, a retry past the floor after a stop (%s) posts no onset, one line, until a refusal', async (reason) => {
+      const condition = buildCondition({ healthCheckOn: () => false })
+      await startPastFloor(condition)
+      const before = lines.length
+
+      condition.cancelAlert('K', reason)
+      condition.onsetAtRetry('K', clock.now())
+      await clock.advance(TMUX_UNRESPONSIVE_ONSET_FLOOR_MS)
+      condition.onsetAtRetry('K', clock.now())
+
+      expect(posts).toEqual([])
+      expect(lines.slice(before)).toEqual([stoppedLine('K')])
+
+      refuse(condition)
+      condition.onsetAtRetry('K', clock.now())
+
+      expect(posts).toEqual([onsetPost('K')])
+      expect(lines.at(-1)).toStartWith(onsetPostedLine('K', 'a retry'))
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_RETRY)).toBe('ended-after-notice')
+    })
+
+    test.each(checks)('a stop with no alert check pending still holds the onset back at %s: cancelAlert answers false and the stop itself logs nothing', async (where, healthOn, check) => {
+      // No threshold accessor: no alert check is ever armed.
+      const condition = buildCondition({ healthCheckOn: () => healthOn })
+      await startPastFloor(condition)
+      const before = lines.length
+
+      expect(condition.cancelAlert('K', UNAVAILABLE_RETRY_STOP_CAPPED)).toBe(false)
+      expect(lines.slice(before)).toEqual([])
+      check(condition, 'K')
+
+      expect(posts).toEqual([])
+      expect(lines.slice(before)).toEqual([stoppedLine('K')])
+
+      refuse(condition)
+      check(condition, 'K')
+      expect(posts).toEqual([onsetPost('K')])
+      expect(lines.at(-1)).toStartWith(onsetPostedLine('K', where))
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+    })
+
+    test.each(checks)('a cancel with no stop reason is a non-terminal stop at %s: it holds the onset back, and a refusal lets it post', async (where, healthOn, check) => {
+      const condition = buildCondition({ healthCheckOn: () => healthOn })
+      await startPastFloor(condition)
+
+      condition.cancelAlert('K')
+      check(condition, 'K')
+      expect(posts).toEqual([])
+      expect(lines.at(-1)).toBe(stoppedLine('K'))
+
+      refuse(condition)
+      check(condition, 'K')
+      expect(posts).toEqual([onsetPost('K')])
+      expect(lines.at(-1)).toStartWith(onsetPostedLine('K', where))
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+    })
+
+    test.each(terminalStops.flatMap((reason) => checks.map(([where, healthOn, check]) => [reason, where, healthOn, check] as const)))(
+      'after a terminal stop (%s), no refusal lets the onset post at %s in the episode: one line, the alert check cancelled and never armed again',
+      async (reason, _where, healthOn, check) => {
+        const condition = buildCondition({ alertThresholdMs: () => THRESHOLD_MS, healthCheckOn: () => healthOn })
+        await startPastFloor(condition)
+        const before = lines.length
+
+        expect(condition.cancelAlert('K', reason)).toBe(true)
+        check(condition, 'K')
+        refuse(condition)
+        check(condition, 'K')
+        refuse(condition)
+        await clock.advance(TMUX_UNRESPONSIVE_ONSET_FLOOR_MS)
+        check(condition, 'K')
+
+        expect(posts).toEqual([])
+        expect(clock.pendingCount()).toBe(0)
+        expect(lines.slice(before)).toEqual([
+          personaLine('K', `alert check cancelled — its retry timer stopped: ${reason}`),
+          stoppedLine('K'),
+        ])
+        expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended')
+      },
+    )
+
+    test.each<[string, string | undefined]>([
+      [UNAVAILABLE_RETRY_STOP_CAPPED, UNAVAILABLE_RETRY_STOP_CAPPED],
+      ['no stop reason', undefined],
+    ])('a terminal stop is not weakened by a later non-terminal stop (%s): a refusal still lets no onset post', async (_what, later) => {
+      const condition = buildCondition()
+      await startPastFloor(condition)
+
+      condition.cancelAlert('K', UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+      condition.cancelAlert('K', later)
+      refuse(condition)
+      condition.onsetAtTick(clock.now())
+
+      expect(posts).toEqual([])
+      expect(lines.at(-1)).toBe(stoppedLine('K'))
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+    })
+
+    test('the stopped line is logged once per episode, a second stop after a refusal included; a new episode logs it again', async () => {
+      const condition = buildCondition()
+      await startPastFloor(condition)
+
+      condition.cancelAlert('K', UNAVAILABLE_RETRY_STOP_CAPPED)
+      condition.onsetAtTick(clock.now())
+      refuse(condition)
+      condition.cancelAlert('K', UNAVAILABLE_RETRY_STOP_NOT_UP)
+      condition.onsetAtTick(clock.now())
+      condition.onsetAtTick(clock.now())
+
+      expect(posts).toEqual([])
+      expect(lines.filter((l) => l === stoppedLine('K'))).toHaveLength(1)
+
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+      await startPastFloor(condition)
+      condition.cancelAlert('K', UNAVAILABLE_RETRY_STOP_CAPPED)
+      condition.onsetAtTick(clock.now())
+      expect(posts).toEqual([])
+      expect(lines.filter((l) => l === stoppedLine('K'))).toHaveLength(2)
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+    })
+
+    test.each<[string, string]>([
+      [UNAVAILABLE_RETRY_STOP_CAPPED, UNAVAILABLE_RETRY_STOP_CAPPED],
+      [UNAVAILABLE_RETRY_STOP_TORN_DOWN, UNAVAILABLE_RETRY_STOP_TORN_DOWN],
+    ])('once the alert has posted, a later stop (%s) leaves the alert-held line in place of the stopped line', async (_what, reason) => {
+      const condition = buildCondition({ alertThresholdMs: () => THRESHOLD_MS })
+      condition.start('K', VERB, errTmuxUnresponsive(VERB))
+      await clock.advance(THRESHOLD_MS + 1)
+      expect(posts).toEqual([{ key: 'K', text: tmuxUnresponsiveAlertText('K', THRESHOLD_MS) }])
+      const before = lines.length
+
+      expect(condition.cancelAlert('K', reason)).toBe(false)
+      condition.onsetAtTick(clock.now())
+      condition.onsetAtTick(clock.now())
+
+      expect(lines.slice(before)).toEqual([personaLine('K', 'onset not posted — its alert already posted')])
+      expect(posts).toHaveLength(1)
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB, undefined, { silent: true })
+    })
+
+    test('a stop after the onset has posted changes nothing: no further post and no stopped line', async () => {
+      const condition = buildCondition()
+      await startPastFloor(condition)
+      condition.onsetAtTick(clock.now())
+      expect(posts).toEqual([onsetPost('K')])
+      const before = lines.length
+
+      condition.cancelAlert('K', UNAVAILABLE_RETRY_STOP_CAPPED)
+      condition.onsetAtTick(clock.now())
+
+      expect(posts).toEqual([onsetPost('K')])
+      expect(lines.slice(before)).toEqual([])
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended-after-notice')
+    })
+
+    test('a stop holds back only its own persona\'s onset: another persona\'s tick posts it', async () => {
+      const condition = buildCondition()
+      condition.start('Q', VERB, errTmuxUnresponsive(VERB))
+      await startPastFloor(condition)
+
+      condition.cancelAlert('K', UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+      condition.onsetAtTick(clock.now())
+
+      expect(posts).toEqual([onsetPost('Q')])
+      expect(lines).toContain(stoppedLine('K'))
+      expect(lines).not.toContain(stoppedLine('Q'))
+      for (const key of ['K', 'Q']) condition.end(key, TMUX_UNRESPONSIVE_END_TMUX_VERB)
+    })
+
+    test.each<[string, (c: TmuxUnresponsiveCondition) => void]>([
+      ['end', (c) => void c.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)],
+      ['forget(key)', () => episodes.forget('K')],
+    ])('a terminal stop\'s mark does not reach the next episode (closed by %s): its tick posts the onset', async (_how, close) => {
+      const condition = buildCondition()
+      await startPastFloor(condition)
+      condition.cancelAlert('K', UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+      close(condition)
+      expect(condition.holds('K')).toBe(false)
+
+      await startPastFloor(condition)
+      condition.onsetAtTick(clock.now())
+
+      expect(posts).toEqual([onsetPost('K')])
+      expect(lines.at(-1)).toStartWith(onsetPostedLine('K', 'a health tick'))
+      expect(lines).not.toContain(stoppedLine('K'))
+      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
     })
   })
 
