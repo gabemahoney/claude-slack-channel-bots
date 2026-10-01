@@ -14543,7 +14543,11 @@ describe('b.jg5 SRJ-120: a pending row a findMissing run put in neither list was
 // goes on, except the row of the starter's next-step key; a
 // `provenance_conflict` note there latches that persona (SRJ-114). Another
 // caller's row, the row of a key the applied set does not hold, and a row in
-// `ids` or in neither list get no `get`. The `get`s are made all at once,
+// `ids` or in neither list get no `get`. A persona already latched when the
+// run is done (a latched query that throws counts as latched) is skipped: no
+// `get`, no relatch and no post, and the run's line lists it as skipped in
+// its place; an already-latched caller still gets `FIND_MISSING_LATCHED`.
+// The `get`s are made all at once,
 // and their line lists the personas in `unverified_ids` order. A failed `get`
 // of the caller's own row refuses the caller (the describe after these);
 // another persona's failed `get` is only logged. A persona latched by such a
@@ -14566,7 +14570,7 @@ function getIds(h: RecoveryHarness): string[] {
   return h.stub.calls.getCalls.map((c) => c.claude_instance_id)
 }
 
-/** What the one line of a run's post-run gets lists: `persona=<key> <read|latched|absent|refused (…)>, …`. */
+/** What the one line of a run's post-run gets lists: `persona=<key> <read|latched|absent|refused (…)|skipped (latched)>, …`. */
 function postRunReadsOf(h: RecoveryHarness): string {
   const marker = ' — one get of each configured persona\'s own row in unverified_ids: '
   const lines = h.errors.filter((line) => line.includes(marker) && line.endsWith(' (b.jg5 SRJ-120)'))
@@ -14582,6 +14586,48 @@ function postRunGetRefusalLines(h: RecoveryHarness, logPrefix: string, ref: stri
 /** Every refusal line (b.jg5 SRJ-105) the harness captured, at any site, for any persona. */
 function everyRefusalLine(h: RecoveryHarness): string[] {
   return h.errors.filter((line) => line.endsWith(' — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)'))
+}
+
+/** The CONFLICT case-table row a launch meets to latch a persona before a run; its case is not the note's. */
+const PRE_RUN_LATCH_ROW = conflictRowsFor('spawn')[0]!
+
+/** What the harness's latch and notice sinks hold, and how many `get`s were made, at one point of a case. */
+interface LatchSnapshot {
+  readonly records: ReadonlyMap<string, ReturnType<RecoveryHarness['latch']['record']>>
+  readonly latchEvents: RecoveryHarness['latchEvents']
+  readonly episodeNotices: RecoveryHarness['episodeNotices']
+  readonly notices: RecoveryHarness['notices']
+  readonly gets: number
+}
+
+/**
+ * Latch each of `keys` before a run, as a CONFLICT at its launch latches it
+ * (`PRE_RUN_LATCH_ROW`), and answer what the harness then holds.
+ */
+async function latchBeforeRun(h: RecoveryHarness, ...keys: string[]): Promise<LatchSnapshot> {
+  for (const key of keys) {
+    h.script({ spawnQueue: [cannedErr(PRE_RUN_LATCH_ROW.build())] })
+    expect(await h.launch(key)).toStrictEqual({ key, action: 'latched' })
+    expect(h.latch.record(key)?.latchCase).toBe(PRE_RUN_LATCH_ROW.latchCase)
+  }
+  return {
+    records: new Map(keys.map((key) => [key, h.latch.record(key)])),
+    latchEvents: [...h.latchEvents],
+    episodeNotices: [...h.episodeNotices],
+    notices: [...h.notices],
+    gets: getIds(h).length,
+  }
+}
+
+/** Since `before`, no latched persona was relatched or posted to: each record, the latch events and every notice are as they were. */
+function expectNoRelatch(h: RecoveryHarness, before: LatchSnapshot): void {
+  for (const [key, record] of before.records) {
+    expect(h.latch.isLatched(key)).toBe(true)
+    expect(h.latch.record(key)).toStrictEqual(record)
+  }
+  expect(h.latchEvents).toEqual([...before.latchEvents])
+  expect(h.episodeNotices).toEqual([...before.episodeNotices])
+  expect(h.notices).toEqual([...before.notices])
 }
 
 /** The two callers of the demo: an ordinary run (no answer) and a bypassing run (`FIND_MISSING_LATCHED` once P latched). */
@@ -14737,6 +14783,83 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     expect(getIds(h)).toEqual([personaInstanceId(b)])
     expectNoteLatchedOnce(h, b, ENDED_READ)
     expect(h.latch.isLatched(p)).toBe(false)
+  })
+
+  test('an already-latched persona is skipped: B, latched by a CONFLICT at its launch, has its own row with the note listed before P\'s in a run made for P: no get of B\'s row, B\'s latch record and case unchanged and nothing posted; P\'s listed row still gets its get; the run\'s line lists B as skipped in its place', async () => {
+    const { h, p, b } = srj105Build()
+    const before = await latchBeforeRun(h, b)
+    scriptNotedRows(h, new Map([[b, { liveness_note: provenanceNote }]]))
+    const result: import('agent-director').FindMissingResult = { count: 0, ids: [], unverified: 2, unverified_ids: [personaInstanceId(b), personaInstanceId(p)] }
+    h.script({ findMissingResult: result })
+
+    expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toEqual(result)
+
+    expect(getIds(h).slice(before.gets)).toEqual([personaInstanceId(p)])
+    expectNoRelatch(h, before)
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(postRunReadsOf(h)).toBe(`persona=${b} skipped (latched), persona=${p} read`)
+  })
+
+  test('a latched query that throws for B counts as latched: B\'s listed row with the note gets no get and no latch call; P\'s listed row still gets its get, and P\'s caller gets the run\'s result', async () => {
+    const { h, p, b } = srj105Build()
+    // The harness's latch is read-only, so the case installs one of its own
+    // whose latched query throws for B, as main() installs the server's latch.
+    const own = createConflictLatch({ log: () => {} })
+    const sets: string[] = []
+    setConflictLatch({
+      isLatched: (key) => {
+        if (key === b) throw new Error('latch query broken')
+        return own.isLatched(key)
+      },
+      record: (key) => own.record(key),
+      set: (key, input) => {
+        sets.push(key)
+        return own.set(key, input)
+      },
+      setFromConflict: (key, value, fields) => {
+        sets.push(key)
+        return own.setFromConflict(key, value, fields)
+      },
+    })
+    scriptNotedRows(h, new Map([[b, { liveness_note: provenanceNote }]]))
+    const result = unverifiedRowsOf(p, b)
+    h.script({ findMissingResult: result })
+
+    expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toEqual(result)
+
+    expect(getIds(h)).toEqual([personaInstanceId(p)])
+    expect(sets).toEqual([])
+    expect(own.record(b)).toBeUndefined()
+    expect(postRunReadsOf(h)).toBe(`persona=${p} read, persona=${b} skipped (latched)`)
+    expect(h.notices).toEqual([])
+  })
+
+  test('every listed configured persona already latched (P and B, by CONFLICTs at their launches), each own row with the note: the run makes no get at all, relatches and posts nothing, and its line still lists each as skipped; P\'s caller gets FIND_MISSING_LATCHED', async () => {
+    const { h, p, b } = srj105Build()
+    const before = await latchBeforeRun(h, p, b)
+    scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }], [b, { liveness_note: provenanceNote }]]))
+    h.script({ findMissingResult: unverifiedRowsOf(p, b) })
+
+    expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toBe(FIND_MISSING_LATCHED)
+
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    expect(getIds(h).slice(before.gets)).toEqual([])
+    expectNoRelatch(h, before)
+    expect(postRunReadsOf(h)).toBe(`persona=${p} skipped (latched), persona=${b} skipped (latched)`)
+  })
+
+  test('an already-latched caller (P, latched by a CONFLICT at its launch) whose own row is listed: no get of P\'s row and the caller gets FIND_MISSING_LATCHED; B\'s listed row still gets its get', async () => {
+    const { h, p, b } = srj105Build()
+    const before = await latchBeforeRun(h, p)
+    scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
+    h.script({ findMissingResult: unverifiedRowsOf(p, b) })
+
+    expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toBe(FIND_MISSING_LATCHED)
+
+    expect(getIds(h).slice(before.gets)).toEqual([personaInstanceId(b)])
+    expectNoRelatch(h, before)
+    expect(h.latch.isLatched(b)).toBe(false)
+    expect(postRunReadsOf(h)).toBe(`persona=${p} skipped (latched), persona=${b} read`)
   })
 
   // b.jg5 SRJ-114, SRJ-105: the post-run get of the caller's own row is a get

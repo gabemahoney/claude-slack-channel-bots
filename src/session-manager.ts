@@ -2733,8 +2733,8 @@ export function _resetFindMissingMemo(): void {
  *   and joins a run in flight; a bypassing run always makes a new call.
  * - After a run the server makes (not a memo reuse), each configured
  *   persona's own row listed in `unverified_ids` is read with one `get`
- *   (except `opts.nextStepGetKey`'s), and only a `provenance_conflict` note
- *   there latches.
+ *   (except `opts.nextStepGetKey`'s and an already-latched persona's), and
+ *   only a `provenance_conflict` note there latches.
  *
  * Failures are never memoized. A failure the arming predicate answers a cause
  * for (b.jg5 SRJ-105, `refusalAt` with verb `find-missing`, which is not a
@@ -2831,7 +2831,9 @@ export const FIND_MISSING_LATCHED: unique symbol = Symbol('find-missing latched'
  * alike) goes on, each configured persona's own row listed in
  * `unverified_ids` is read with one `get` through the shared own-row read
  * (`readPersonaOwnRow`), except the row of the starter's
- * `opts.nextStepGetKey`. A memo hit makes no `get`. When the `get` of a
+ * `opts.nextStepGetKey` and the row of a persona already latched then
+ * (`personaLatchedNow`), which is skipped with no `get` and no latch call.
+ * A memo hit makes no `get`. When the `get` of a
  * persona caller's own row failed with an error other than
  * `ErrSpawnNotFound`, that caller, the starter or a joiner, handles it as a
  * `get` at an SRJ-114 site (`postRunGetRefusal`, b.jg5 SRJ-105, SRJ-114): a
@@ -3061,6 +3063,10 @@ function configuredPersonaKeyOfRowId(id: unknown): string | undefined {
  * the shared own-row read (`readPersonaOwnRow`, through
  * `withOutageDetection` for that persona, whatever persona the run was made
  * for), all at once, and the run waits for every one of them to settle.
+ * A listed persona that is already latched when the keys are built
+ * (`personaLatchedNow`; a latched query that throws counts as latched) is
+ * skipped: no `get`, no latch call, nothing in the answer; its own caller
+ * still stops on the latch (`latchedOr`).
  * SRJ-114's rule applies at each read: only a `provenance_conflict` note on
  * the persona's own row latches it, and the read logs its note lines
  * (`<logPrefix>: post-sweep get for persona=<key>: …`). A `get` answering
@@ -3068,17 +3074,18 @@ function configuredPersonaKeyOfRowId(id: unknown): string | undefined {
  * in the answer (`refusedReads`) for that persona's own caller to handle
  * (`postRunGetRefusal`); for every other caller it is only listed in the
  * line below. Neither ever fails the run, is memoized as a failure or stops
- * the other `get`s. No `get` is made for any other id. When at least one row
- * was read, one line lists the personas read, in `unverified_ids` order, and
- * what each read answered (persona references only; a refused read carries
- * the redacting describer's text):
+ * the other `get`s. No `get` is made for any other id. When at least one
+ * listed persona was read or skipped, one line lists every one of them, in
+ * `unverified_ids` order, with what its read answered or that it was skipped
+ * (persona references only; a refused read carries the redacting
+ * describer's text):
  *
- *   [slack] <logPrefix>: after the <run> — one get of each configured persona's own row in unverified_ids: persona=<key> <read|latched|absent|refused (<failure>)>, … (b.jg5 SRJ-120)
+ *   [slack] <logPrefix>: after the <run> — one get of each configured persona's own row in unverified_ids: persona=<key> <read|latched|absent|refused (<failure>)|skipped (latched)>, … (b.jg5 SRJ-120)
  *
  * where `<run>` is `findMissing sweep for <ref>` or `bypassing findMissing
- * sweep for <ref>`. Answers the personas whose read latched
- * (`OwnRowRead.latched`) and the personas whose read failed, each with its
- * error. Never throws.
+ * sweep for <ref>`. No line is logged when no configured persona is listed.
+ * Answers the personas whose read latched (`OwnRowRead.latched`) and the
+ * personas whose read failed, each with its error. Never throws.
  */
 async function readListedPersonaRows(
   result: FindMissingResult,
@@ -3088,19 +3095,24 @@ async function readListedPersonaRows(
 ): Promise<PostRunReads> {
   const latchedKeys = new Set<string>()
   const refusedReads = new Map<string, unknown>()
-  const read: string[] = []
+  // One entry per listed configured persona, in `unverified_ids` order: what
+  // its `get` answered, or that it was skipped because it was already latched.
+  const entries: string[] = []
   try {
-    const keys: string[] = []
+    const listed: { readonly key: string; readonly skipped: boolean }[] = []
     for (const id of result.unverified_ids ?? []) {
       const key = configuredPersonaKeyOfRowId(id)
-      if (key === undefined || key === nextStepGetKey || keys.includes(key)) continue
-      keys.push(key)
+      if (key === undefined || key === nextStepGetKey || listed.some((l) => l.key === key)) continue
+      // An already-latched persona gets no `get` (a latched query that throws counts as latched).
+      listed.push({ key, skipped: personaLatchedNow(key) })
     }
+    const toRead = listed.filter((l) => !l.skipped).map((l) => l.key)
     const settled = await Promise.allSettled(
-      keys.map((key) => readPersonaOwnRow(key, { site: logPrefix, what: 'post-sweep get' })),
+      toRead.map((key) => readPersonaOwnRow(key, { site: logPrefix, what: 'post-sweep get' })),
     )
+    const entryOf = new Map<string, string>()
     settled.forEach((outcome, i) => {
-      const key = keys[i]
+      const key = toRead[i]
       if (outcome.status === 'rejected') {
         // Not reached (`readPersonaOwnRow` never throws); that persona is left out of the line.
         console.error(`[slack] ${logPrefix}: after the ${run} — the post-sweep gets failed: ${describeThrownValue(outcome.reason)} (b.jg5 SRJ-120)`)
@@ -3109,21 +3121,25 @@ async function readListedPersonaRows(
       const ownRead = outcome.value
       if (ownRead.kind === OWN_ROW_READ_ROW) {
         if (ownRead.latched) latchedKeys.add(key)
-        read.push(`${keyRef(key)} ${ownRead.latched ? 'latched' : 'read'}`)
+        entryOf.set(key, `${keyRef(key)} ${ownRead.latched ? 'latched' : 'read'}`)
       } else if (ownRead.kind === OWN_ROW_READ_ABSENT) {
-        read.push(`${keyRef(key)} absent`)
+        entryOf.set(key, `${keyRef(key)} absent`)
       } else {
         refusedReads.set(key, ownRead.error)
-        read.push(`${keyRef(key)} refused (${describeAgentDirectorFailure(ownRead.error)})`)
+        entryOf.set(key, `${keyRef(key)} refused (${describeAgentDirectorFailure(ownRead.error)})`)
       }
     })
+    for (const { key, skipped } of listed) {
+      const entry = skipped ? `${keyRef(key)} skipped (latched)` : entryOf.get(key)
+      if (entry !== undefined) entries.push(entry)
+    }
   } catch (err) {
     // Not reached (nothing above throws); a throw ends the reads with what was read.
     console.error(`[slack] ${logPrefix}: after the ${run} — the post-sweep gets failed: ${describeThrownValue(err)} (b.jg5 SRJ-120)`)
   }
-  if (read.length > 0) {
+  if (entries.length > 0) {
     console.error(
-      `[slack] ${logPrefix}: after the ${run} — one get of each configured persona's own row in unverified_ids: ${read.join(', ')} (b.jg5 SRJ-120)`,
+      `[slack] ${logPrefix}: after the ${run} — one get of each configured persona's own row in unverified_ids: ${entries.join(', ')} (b.jg5 SRJ-120)`,
     )
   }
   return { latchedKeys, refusedReads }
@@ -3136,7 +3152,8 @@ async function readListedPersonaRows(
  * and ordinary callers arriving while it is in flight join it. After it, each
  * configured persona's own row listed in `unverified_ids` is read with one
  * `get` (`readListedPersonaRows`), except `nextStepGetKey`'s, the row the
- * caller's own next step reads with a `get`. Exactly these runs bypass, and
+ * caller's own next step reads with a `get`, and the row of a persona already
+ * latched then, which is skipped with no `get`. Exactly these runs bypass, and
  * this is their one entry:
  *
  * - the live-row sequence's runs (b.jg5 SRJ-705) and an old-life wait's runs
@@ -5714,7 +5731,7 @@ async function keepPrePersonaRow(client: Client, row: ListRow, counts: PrePerson
  * outage flag is raised or cleared by the call. As after any run the server
  * makes, each configured persona's own row listed in `unverified_ids` is then
  * read with one `get` through that persona's `withOutageDetection`
- * (`readListedPersonaRows`), and only a `provenance_conflict` note there
+ * (`readListedPersonaRows`; an already-latched persona is skipped), and only a `provenance_conflict` note there
  * latches. Never throws.
  *
  * Each killed row is read with `readFindMissingRow` and the state the start
