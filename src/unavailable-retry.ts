@@ -169,9 +169,18 @@
  *
  * The retry action (b.jg5 SRJ-303, SRJ-305). The server's action is
  * `createFullModeRetryAction(deps)`, for both modes: at each retry, before
- * any call, the shutdown flag, the applied-persona lookup, the not-up gate
- * (the relaunch gate) and the at-cap check each stop the timer with their
- * reason (`UNAVAILABLE_RETRY_STOP_*`).
+ * any call, the shutdown flag, the applied-persona lookup, the optional
+ * latched query (b.jg5 SRJ-303: no attempt while the persona is latched), the
+ * not-up gate (the relaunch gate) and the at-cap check each stop the timer
+ * with their reason (`UNAVAILABLE_RETRY_STOP_*`).
+ *
+ * The latch (b.jg5 SRJ-305, SRJ-502). When a persona latches, whatever the
+ * case, its timer stops through `stop` with `UNAVAILABLE_RETRY_STOP_LATCHED`
+ * (`main()`'s latch hold), in either mode and whatever its causes: the
+ * condition-end entry's `pending` and kill-failure exceptions never keep a
+ * latched persona's timer. A timer armed after the latch stops at its first
+ * retry on the latched query, with no agent-director call, and a full-mode
+ * retry whose restart work answers `latched` stops the same way.
  *
  * In full mode the restart module's retry entry then reruns the restart
  * path's decision, with the one in-flight predicate as its first step, and
@@ -229,7 +238,10 @@
  * `hand-off after the stop failed`, `retry run failed` (the clock failed at
  * a re-arm), `arm failed … — not armed` (the clock failed at the first arm)
  * and `not armed (<cause>) — …` (an arm after `close`), go to the injected
- * log only; nothing is posted to Slack. A cause's thrown value and a failed
+ * log only; nothing is posted to Slack. The server's retry action
+ * (`createFullModeRetryAction`) logs one line of its own, to the server log
+ * (`latched query failed: <thrown> — taken as latched`), when its latched
+ * query throws. A cause's thrown value and a failed
  * action reach a line only through `describeThrownValue` (its message
  * redacted by `redactSlackLogText`). A cause kind, an again-reason and a row
  * state are labels (anything else is logged as `unnamed`) and a stop reason
@@ -475,6 +487,18 @@ export const UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED = 'the tmux-unavail
 
 /** The stop observer's reason for a timer forgotten because the clock failed at its re-arm (the `retry run failed` line). */
 export const UNAVAILABLE_RETRY_STOP_RUN_FAILED = 'its retry run failed'
+
+/**
+ * The persona latched, whatever the case (b.jg5 SRJ-305, SRJ-502): the
+ * latch's hold stops its timer through `stop` (never the condition-end
+ * entry, so neither SRJ-306 exception keeps it), and a retry that finds it
+ * latched, before any call, stops with it too. Not terminal (not in
+ * `UNAVAILABLE_RETRY_TERMINAL_STOPS`): a later refusal may arm the timer
+ * again; while the persona is latched that timer stops at its first retry,
+ * and once its latch is gone (the latch's `forget`) it runs as usual. A
+ * re-check that clears a latch is not built.
+ */
+export const UNAVAILABLE_RETRY_STOP_LATCHED = 'the persona is latched'
 
 /**
  * The terminal stop reasons (b.jg5 SRJ-309): the persona is going away or the
@@ -1203,6 +1227,18 @@ export interface FullModeRetryDeps {
   /** Whether the server is shutting down (the flag `shutdown()` raises). */
   isShuttingDown: () => boolean
   /**
+   * The latched query (b.jg5 SRJ-303, SRJ-305; production: the server's
+   * latch's `isLatched`): a retry, in either mode, that finds the persona
+   * latched makes no agent-director call and stops the timer with
+   * `UNAVAILABLE_RETRY_STOP_LATCHED`, so a timer armed after the latch (a
+   * latch-time read error, an ENVIRONMENT answer from any verb) stops at its
+   * first fire. An answer of exactly `true` is latched, and so is a query
+   * that throws (fail safe: the same stop, with one line naming the persona
+   * and what it threw); any other answer is not. Absent: no persona is
+   * latched.
+   */
+  isLatched?: (key: string) => boolean
+  /**
    * The one in-flight predicate: true while work that owns the persona's
    * session is in flight (today a launch call, `isLaunchInFlight`). A retry
    * in either mode that finds it true makes no agent-director call and is a
@@ -1238,13 +1274,14 @@ export interface FullModeRetryDeps {
 /**
  * The server's retry action, for both modes (b.jg5 SRJ-303, SRJ-305; see
  * the module comment). Before any call, in either mode, stops on shutdown, a
- * persona not applied, not up or at the cap, in that order. Then, in full
+ * persona not applied, latched, not up or at the cap, in that order. Then, in full
  * mode, runs the retry entry once and answers from its outcome; in
  * pending-only mode, answers a `launch-in-flight` refusal with no call when
  * the in-flight predicate answers true or throws, else reads the row inside
  * a recovery attempt for the persona and answers from its state
- * (`pendingOnlyAnswer`). A dependency that throws (but the in-flight
- * predicate),
+ * (`pendingOnlyAnswer`). A latched query that throws counts as latched
+ * (logged, with what it threw). A dependency that throws (but the in-flight
+ * predicate and the latched query),
  * an entry that rejects, or a row read that throws rejects the action, which
  * the controller counts as `again`.
  */
@@ -1253,6 +1290,7 @@ export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableR
     if (deps.isShuttingDown()) return stopWith(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
     const persona = deps.appliedPersona(key)
     if (persona === undefined) return stopWith(UNAVAILABLE_RETRY_STOP_NOT_APPLIED)
+    if (latched(key, deps.isLatched)) return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
     if (!deps.canRelaunch(key)) return stopWith(UNAVAILABLE_RETRY_STOP_NOT_UP)
     if (deps.isAtCap(key)) return stopWith(UNAVAILABLE_RETRY_STOP_CAPPED)
     const cwd = persona.working_directory
@@ -1317,6 +1355,26 @@ function pendingOnlyAnswer(row: string, restart: () => Promise<unknown>): Unavai
   return { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE, row, yieldsToFullMode: true }
 }
 
+/**
+ * The optional latched query for persona `key`: exactly `true` is latched;
+ * absent is not; a query that throws counts as latched (fail safe, b.jg5
+ * SRJ-502), with one `[slack] unavailable-retry: persona=<key> …` line
+ * naming what it threw (`describeThrownValue`). Never throws.
+ */
+function latched(key: string, isLatched: ((key: string) => boolean) | undefined): boolean {
+  if (isLatched === undefined) return false
+  try {
+    return isLatched(key) === true
+  } catch (err) {
+    try {
+      console.error(`[slack] unavailable-retry: persona=${key} the latched query failed: ${describeThrownValue(err)} — taken as latched; no agent-director call`)
+    } catch {
+      /* a failing logger never changes the answer */
+    }
+    return true
+  }
+}
+
 /** The in-flight predicate for a pending-only retry: `isInFlight(key)`, with a throw counted as in flight. */
 function inFlight(key: string, isInFlight: (key: string) => boolean): boolean {
   try {
@@ -1360,6 +1418,9 @@ function answerFor(outcome: RestartRetryOutcome): UnavailableRetryOutcome {
       return stopWith(UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED)
     case 'shutting-down':
       return stopWith(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+    case 'latched':
+      // b.jg5 SRJ-305: the persona is latched, or latched during this retry.
+      return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
     case 'in-flight':
       return againWith(UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT)
     case 'refused':

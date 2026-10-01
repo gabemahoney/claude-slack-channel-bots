@@ -21,6 +21,7 @@ import {
   RESTART_OUTCOME_CAPPED,
   RESTART_OUTCOME_COUNTED_FAILURE,
   RESTART_OUTCOME_IN_FLIGHT,
+  RESTART_OUTCOME_LATCHED,
   RESTART_OUTCOME_LAUNCHED,
   RESTART_OUTCOME_LAUNCH_SKIPPED,
   RESTART_OUTCOME_LIVENESS_UNKNOWN,
@@ -79,6 +80,14 @@ import {
   spawnForPersona,
   type ConfigDirUnresolvableHook,
 } from '../src/session-manager.ts'
+import {
+  conflictNoticeText,
+  createConflictLatch,
+  LATCH_CASE_LEFTOVER,
+  latchRowStateRead,
+  REFUSED_OPERATION_PLAIN_SPAWN,
+  type ConflictLatch,
+} from '../src/conflict-latch.ts'
 import { createPersonaBringUpController, type PersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { PERSONA_CONFIG_DIR_UNRESOLVABLE } from '../src/persona-diagnostics.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
@@ -113,6 +122,7 @@ import {
   errTmuxKillFailed,
   errTmuxNotAvailable,
   errTmuxSendKeys,
+  errTmuxSessionConflict,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
   holdSpawns,
@@ -4963,3 +4973,563 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-502 — the restart path holds back for a latched persona
+//
+// While P is latched, a scheduled restart or a human-triggered restart request
+// arms no timer (its latched query is asked before every other gate, and one
+// line says no restart was scheduled), and the one gate at the start of the
+// restart work (before the liveness read) answers `RESTART_OUTCOME_LATCHED`
+// for the UNAVAILABLE retry entry (before its in-flight and cap checks) and
+// for a restart timer armed before P latched: nothing is probed, reconnected,
+// killed or launched, nothing is counted, the cap state is left as it was and
+// nothing is armed. A launch that latches P (a CONFLICT at its spawn, which
+// the session manager answers as 'skipped') ends the run latched, counted
+// nothing. No automated path's recorded calls then include a kill of P (AC
+// 46). Another persona restarts as before. Every line is leak-checked.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona', () => {
+  const LATCHED_SKIP_LINE = (key: string) =>
+    `[slack] Skipping restart for persona=${key} — the persona is latched; no agent-director call, nothing recorded (b.jg5 SRJ-502)`
+  const LATCHED_AT_LAUNCH_LINE = (key: string) =>
+    `[slack] Session relaunch for persona=${key} ended latched — not counted; nothing more is done for it`
+  /** agent-director's CONFLICT (by name): the pre-spawn scan found a session left over from an earlier life. */
+  const conflict = () => errTmuxSessionConflict('spawn', 'scan-leftover')
+
+  describe('over the file\'s deps', () => {
+    const P = 'persona_p'
+    const Q = 'persona_q'
+    const CWD: Record<string, string> = { [P]: '/cwd/p', [Q]: '/cwd/q' }
+    let errLines: string[]
+    let origConsoleError: typeof console.error
+    let latch: ConflictLatch
+    /** Each serialized work's outcome, in order. */
+    let outcomes: Array<{ key: string; outcome: unknown }>
+
+    beforeEach(() => {
+      errLines = []
+      outcomes = []
+      origConsoleError = console.error
+      console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+      latch = createConflictLatch({ log: (line) => { errLines.push(line) } })
+    })
+
+    afterEach(() => {
+      console.error = origConsoleError
+      cancelAllRestartTimers()
+      assertNoLeak({ errLines })
+    })
+
+    /** Latch `key` as a refused plain spawn latches it. */
+    function latchPersona(key: string): void {
+      latch.setFromConflict(key, conflict(), { refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: latchRowStateRead('ended') })
+    }
+
+    /**
+     * The file's deps over a dead row, P's launch failing (a counted one would
+     * show in P's failure count) and Q's succeeding, with the latched query over
+     * the case's latch and a serializer that records each work's outcome.
+     */
+    function latchedDeps(opts: DepsOpts = {}): ReturnType<typeof makeDeps> {
+      const deps = makeDeps({ launchSession: async (key) => key !== P, ...opts })
+      deps.isLatched = (key) => latch.isLatched(key)
+      deps.serialize = async <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
+        const outcome = await operation()
+        outcomes.push({ key, outcome })
+        return outcome
+      }
+      return deps
+    }
+
+    /** scheduleRestart's line for a latched persona (b.jg5 SRJ-502): no timer armed. */
+    const NOT_SCHEDULING_LINE = (key: string) =>
+      `[slack] Not scheduling restart for persona=${key} — the persona is latched; no timer armed (b.jg5 SRJ-502)`
+
+    /** The two scheduleRestart entries: a scheduled restart and a human-triggered restart request. */
+    const SCHEDULE_ENTRIES: Array<[string, { humanTrigger: true } | undefined]> = [
+      ['a scheduled restart', undefined],
+      ['a human-triggered restart request', { humanTrigger: true }],
+    ]
+
+    /**
+     * Record, by key, each read of the delay setting, the shutdown flag and the
+     * relaunch gate, the gates scheduleRestart asks after the latched query.
+     */
+    function recordGates(deps: ReturnType<typeof makeDeps>): string[] {
+      const asked: string[] = []
+      const [delay, shutdown, gate] = [deps.getRestartDelay, deps.isShuttingDown, deps.canRestart]
+      deps.getRestartDelay = () => { asked.push('delay'); return delay() }
+      deps.isShuttingDown = () => { asked.push('shutdown'); return shutdown() }
+      deps.canRestart = (key) => { asked.push(`gate:${key}`); return gate(key) }
+      return asked
+    }
+
+    // P's one recorded failure keeps its backoff (20 ms) inside WAIT_MS.
+    test.each(SCHEDULE_ENTRIES)('%s for latched P arms no timer: one not-scheduling line and nothing else for P, the delay, shutdown and relaunch gates never asked, no probe, reconnect, kill or launch, nothing counted, the cap state unchanged; Q beside it restarts as before', async (_label, opts) => {
+      recordFailure(P)
+      latchPersona(P)
+      const deps = latchedDeps()
+      const asked = recordGates(deps)
+      initRestart(deps)
+      const from = errLines.length
+
+      scheduleRestart(P, CWD[P]!, undefined, opts)
+
+      expect(isRestartPendingOrActive(P)).toBe(false)
+      expect(asked).toEqual([])
+      expect(errLines.slice(from)).toEqual([NOT_SCHEDULING_LINE(P)])
+      await Bun.sleep(WAIT_MS)
+
+      scheduleRestart(Q, CWD[Q]!, undefined, opts)
+      expect(isRestartPendingOrActive(Q)).toBe(true)
+      await Bun.sleep(WAIT_MS)
+
+      expect(outcomes).toEqual([{ key: Q, outcome: RESTART_OUTCOME_LAUNCHED }])
+      expect(deps.isSessionAliveCalls).toEqual([Q])
+      expect(deps.reconnectSessionCalls).toEqual([])
+      expect(deps.killSessionCalls).toEqual([Q])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([Q])
+      expect(getFailureCount(P)).toBe(1)
+      expect(getFailureCount(Q)).toBe(0)
+      expect(deps.onCapReachedCalls).toEqual([])
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(isRestartPendingOrActive(P)).toBe(false)
+      // Since the latch was set, the not-scheduling line is the only line naming P.
+      expect(errLines.slice(from).filter((l) => l.includes(`persona=${P}`))).toEqual([NOT_SCHEDULING_LINE(P)])
+      expect(errLines.filter((l) => l.includes(`persona=${Q}`) && l.includes('latched'))).toEqual([])
+    })
+
+    test('the UNAVAILABLE retry entry (runRestartRetry) for latched P answers latched: no probe, reconnect, kill or launch, nothing counted, the cap state unchanged, nothing armed; Q beside it restarts as before', async () => {
+      recordFailure(P)
+      latchPersona(P)
+      const deps = latchedDeps()
+      initRestart(deps)
+
+      await runRestartRetry(P, CWD[P]!, () => false)
+      await runRestartRetry(Q, CWD[Q]!, () => false)
+
+      expect(outcomes).toEqual([{ key: P, outcome: RESTART_OUTCOME_LATCHED }, { key: Q, outcome: RESTART_OUTCOME_LAUNCHED }])
+      expect(deps.isSessionAliveCalls).toEqual([Q])
+      expect(deps.reconnectSessionCalls).toEqual([])
+      expect(deps.killSessionCalls).toEqual([Q])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([Q])
+      expect(getFailureCount(P)).toBe(1)
+      expect(deps.onCapReachedCalls).toEqual([])
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(isRestartPendingOrActive(P)).toBe(false)
+      expect(errLines.filter((l) => l === LATCHED_SKIP_LINE(P))).toHaveLength(1)
+      expect(errLines.filter((l) => l.startsWith(`[slack] Not scheduling restart for persona=${P}`))).toEqual([])
+      expect(errLines.filter((l) => l.includes(`persona=${Q}`) && l.includes('latched'))).toEqual([])
+    })
+
+    test.each(SCHEDULE_ENTRIES)('%s armed for P before P latches is left pending: a later request while latched logs the not-scheduling line and leaves it as it is; when it fires its work answers latched with no probe, reconnect, kill or launch, nothing counted', async (_label, opts) => {
+      recordFailure(P)
+      const deps = latchedDeps()
+      initRestart(deps)
+
+      scheduleRestart(P, CWD[P]!, undefined, opts)
+      expect(isRestartPendingOrActive(P)).toBe(true)
+      latchPersona(P)
+      const from = errLines.length
+      scheduleRestart(P, CWD[P]!, undefined, opts)
+
+      expect(errLines.slice(from)).toEqual([NOT_SCHEDULING_LINE(P)])
+      expect(isRestartPendingOrActive(P)).toBe(true)
+      await Bun.sleep(WAIT_MS)
+
+      expect(outcomes).toEqual([{ key: P, outcome: RESTART_OUTCOME_LATCHED }])
+      expect(deps.isSessionAliveCalls).toEqual([])
+      expect(deps.reconnectSessionCalls).toEqual([])
+      expect(deps.killSessionCalls).toEqual([])
+      expect(deps.launchSessionCalls).toEqual([])
+      expect(getFailureCount(P)).toBe(1)
+      expect(deps.onCapReachedCalls).toEqual([])
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(isRestartPendingOrActive(P)).toBe(false)
+      expect(errLines.filter((l) => l.startsWith('[slack] Scheduling restart for persona='))).toHaveLength(1)
+      expect(errLines.filter((l) => l === LATCHED_SKIP_LINE(P))).toHaveLength(1)
+      expect(errLines.filter((l) => l === NOT_SCHEDULING_LINE(P))).toHaveLength(1)
+    })
+
+    test('the retry entry for latched P, at the cap and with a launch in flight, answers latched first: the in-flight, shutdown and not-up checks are never asked, nothing is done, and the skip line is its only line', async () => {
+      for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(P)
+      latchPersona(P)
+      const asked: string[] = []
+      const deps = latchedDeps()
+      deps.isShuttingDown = () => { asked.push('shutdown'); return false }
+      deps.canRestart = () => { asked.push('gate'); return true }
+      initRestart(deps)
+      const from = errLines.length
+
+      const outcome = await runRestartRetry(P, CWD[P]!, () => { asked.push('in-flight'); return true })
+
+      expect(outcome).toBe(RESTART_OUTCOME_LATCHED)
+      expect(asked).toEqual([])
+      expect(deps.isSessionAliveCalls).toEqual([])
+      expect(deps.killSessionCalls).toEqual([])
+      expect(deps.launchSessionCalls).toEqual([])
+      expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
+      expect(deps.onCapReachedCalls).toEqual([])
+      expect(errLines.slice(from)).toEqual([LATCHED_SKIP_LINE(P)])
+    })
+
+    test('a restart run whose launch latches P (a CONFLICT, answered as skipped) answers latched: one kill before the launch and nothing after it, nothing counted, no cap notice, no restart timer; a later retry or scheduled restart makes no attempt', async () => {
+      recordFailure(P)
+      const deps = latchedDeps({
+        launchSession: async (key) => {
+          latchPersona(key)
+          return 'skipped'
+        },
+      })
+      initRestart(deps)
+
+      expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_LATCHED)
+
+      expect(latch.isLatched(P)).toBe(true)
+      expect(deps.isSessionAliveCalls).toEqual([P])
+      expect(deps.killSessionCalls).toEqual([P])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P])
+      expect(getFailureCount(P)).toBe(1)
+      expect(deps.onCapReachedCalls).toEqual([])
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(isRestartPendingOrActive(P)).toBe(false)
+      expect(errLines.filter((l) => l === LATCHED_AT_LAUNCH_LINE(P))).toHaveLength(1)
+      expect(errLines.filter((l) => l.startsWith('[slack] Scheduling restart'))).toEqual([])
+
+      // AC 46: no later automated attempt probes, kills or launches P; a
+      // scheduled restart arms no timer at all.
+      expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_LATCHED)
+      scheduleRestart(P, CWD[P]!)
+      expect(isRestartPendingOrActive(P)).toBe(false)
+      await Bun.sleep(WAIT_MS)
+
+      expect(outcomes.map((o) => o.outcome)).toEqual([RESTART_OUTCOME_LATCHED, RESTART_OUTCOME_LATCHED])
+      expect(errLines.filter((l) => l === NOT_SCHEDULING_LINE(P))).toHaveLength(1)
+      expect(errLines.filter((l) => l === LATCHED_SKIP_LINE(P))).toHaveLength(1)
+      expect(errLines.filter((l) => l.startsWith('[slack] Scheduling restart'))).toEqual([])
+      expect(deps.isSessionAliveCalls).toEqual([P])
+      expect(deps.killSessionCalls).toEqual([P])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P])
+      expect(getFailureCount(P)).toBe(1)
+    })
+
+    test('a launch declined by its own gate (skipped) while P is not latched still answers launch-skipped, with the latched query present', async () => {
+      recordFailure(P)
+      const deps = latchedDeps({ launchSessionResult: 'skipped', launchSession: undefined })
+      initRestart(deps)
+
+      expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_LAUNCH_SKIPPED)
+
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P])
+      expect(getFailureCount(P)).toBe(1)
+      expect(errLines.filter((l) => l === LATCHED_AT_LAUNCH_LINE(P))).toEqual([])
+    })
+
+    // A latched query that throws counts as latched (fail safe): the same
+    // gates answer latched with no agent-director call and nothing recorded,
+    // and the one line names what it threw (redacted). The thrown error
+    // carries a fake token in its message and the bare sentinel in a field
+    // CSCB never reads.
+    const queryBroke = () => Object.assign(new Error(`latched query broke (${sentinelInMessage('latched')})`), { note: LEAK_SENTINEL })
+    const THROWN_PREFIX = `(the latched query failed: Error message="latched query broke (${REDACTED_SENTINEL_TAIL})" at `
+    /** P's latched query throws; Q's answers false. */
+    const throwingForP = (key: string): boolean => {
+      if (key === P) throw queryBroke()
+      return false
+    }
+    /** The lines naming P's thrown latched query, each checked against `prefix` and `suffix`. */
+    function expectThrownQueryLine(prefix: string, suffix: string): void {
+      const matching = errLines.filter((l) => l.startsWith(prefix))
+      expect(matching).toHaveLength(1)
+      expect(matching[0]).toStartWith(`${prefix}${THROWN_PREFIX}`)
+      expect(matching[0]).toEndWith(suffix)
+    }
+
+    test.each(SCHEDULE_ENTRIES)('%s for P whose latched query throws arms no timer (fail safe): one not-scheduling line naming what it threw and nothing else for P, the delay, shutdown and relaunch gates never asked, no probe, reconnect, kill or launch, nothing counted; Q beside it restarts as before', async (_label, opts) => {
+      recordFailure(P)
+      const deps = latchedDeps()
+      deps.isLatched = throwingForP
+      const asked = recordGates(deps)
+      initRestart(deps)
+      const from = errLines.length
+
+      scheduleRestart(P, CWD[P]!, undefined, opts)
+
+      expect(isRestartPendingOrActive(P)).toBe(false)
+      expect(asked).toEqual([])
+      expect(errLines.slice(from)).toHaveLength(1)
+      await Bun.sleep(WAIT_MS)
+
+      scheduleRestart(Q, CWD[Q]!, undefined, opts)
+      await Bun.sleep(WAIT_MS)
+
+      expect(outcomes).toEqual([{ key: Q, outcome: RESTART_OUTCOME_LAUNCHED }])
+      expect(deps.isSessionAliveCalls).toEqual([Q])
+      expect(deps.reconnectSessionCalls).toEqual([])
+      expect(deps.killSessionCalls).toEqual([Q])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([Q])
+      expect(getFailureCount(P)).toBe(1)
+      expect(getFailureCount(Q)).toBe(0)
+      expect(deps.onCapReachedCalls).toEqual([])
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(isRestartPendingOrActive(P)).toBe(false)
+      expectThrownQueryLine(
+        `[slack] Not scheduling restart for persona=${P} — the persona is latched `,
+        ' — taken as latched); no timer armed (b.jg5 SRJ-502)',
+      )
+      expect(errLines.filter((l) => l.includes(`persona=${P}`))).toHaveLength(1)
+      expect(errLines.filter((l) => l.includes(`persona=${Q}`) && l.includes('latched'))).toEqual([])
+    })
+
+    test('the UNAVAILABLE retry entry (runRestartRetry) for P whose latched query throws answers latched (fail safe): no probe, reconnect, kill or launch, nothing counted, nothing armed, one skip line naming what it threw; Q beside it restarts as before', async () => {
+      recordFailure(P)
+      const deps = latchedDeps()
+      deps.isLatched = throwingForP
+      initRestart(deps)
+
+      await runRestartRetry(P, CWD[P]!, () => false)
+      await runRestartRetry(Q, CWD[Q]!, () => false)
+
+      expect(outcomes).toEqual([{ key: P, outcome: RESTART_OUTCOME_LATCHED }, { key: Q, outcome: RESTART_OUTCOME_LAUNCHED }])
+      expect(deps.isSessionAliveCalls).toEqual([Q])
+      expect(deps.reconnectSessionCalls).toEqual([])
+      expect(deps.killSessionCalls).toEqual([Q])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([Q])
+      expect(getFailureCount(P)).toBe(1)
+      expect(getFailureCount(Q)).toBe(0)
+      expect(deps.onCapReachedCalls).toEqual([])
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(isRestartPendingOrActive(P)).toBe(false)
+      expectThrownQueryLine(
+        `[slack] Skipping restart for persona=${P} — the persona is latched `,
+        ' — taken as latched); no agent-director call, nothing recorded (b.jg5 SRJ-502)',
+      )
+      expect(errLines.filter((l) => l.includes(`persona=${Q}`) && l.includes('latched'))).toEqual([])
+    })
+
+    test('a scheduled restart armed for P before its latched query starts throwing is left pending: a later request logs the not-scheduling line naming what it threw; when it fires its work answers latched (fail safe) with no probe, reconnect, kill or launch, nothing counted', async () => {
+      recordFailure(P)
+      let broken = false
+      const deps = latchedDeps()
+      deps.isLatched = (key) => {
+        if (broken) throw queryBroke()
+        return latch.isLatched(key)
+      }
+      initRestart(deps)
+
+      scheduleRestart(P, CWD[P]!)
+      expect(isRestartPendingOrActive(P)).toBe(true)
+      broken = true
+      scheduleRestart(P, CWD[P]!)
+      expect(isRestartPendingOrActive(P)).toBe(true)
+      await Bun.sleep(WAIT_MS)
+
+      expect(outcomes).toEqual([{ key: P, outcome: RESTART_OUTCOME_LATCHED }])
+      expect(deps.isSessionAliveCalls).toEqual([])
+      expect(deps.reconnectSessionCalls).toEqual([])
+      expect(deps.killSessionCalls).toEqual([])
+      expect(deps.launchSessionCalls).toEqual([])
+      expect(getFailureCount(P)).toBe(1)
+      expect(deps.onCapReachedCalls).toEqual([])
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(isRestartPendingOrActive(P)).toBe(false)
+      expectThrownQueryLine(
+        `[slack] Not scheduling restart for persona=${P} — the persona is latched `,
+        ' — taken as latched); no timer armed (b.jg5 SRJ-502)',
+      )
+      expectThrownQueryLine(
+        `[slack] Skipping restart for persona=${P} — the persona is latched `,
+        ' — taken as latched); no agent-director call, nothing recorded (b.jg5 SRJ-502)',
+      )
+    })
+
+    test('the retry entry for P whose latched query throws, at the cap and with a launch in flight, answers latched first: the in-flight, shutdown and not-up checks are never asked, nothing is done, and the skip line is its only line', async () => {
+      for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(P)
+      const asked: string[] = []
+      const deps = latchedDeps()
+      deps.isLatched = throwingForP
+      deps.isShuttingDown = () => { asked.push('shutdown'); return false }
+      deps.canRestart = () => { asked.push('gate'); return true }
+      initRestart(deps)
+      const from = errLines.length
+
+      const outcome = await runRestartRetry(P, CWD[P]!, () => { asked.push('in-flight'); return true })
+
+      expect(outcome).toBe(RESTART_OUTCOME_LATCHED)
+      expect(asked).toEqual([])
+      expect(deps.isSessionAliveCalls).toEqual([])
+      expect(deps.reconnectSessionCalls).toEqual([])
+      expect(deps.killSessionCalls).toEqual([])
+      expect(deps.launchSessionCalls).toEqual([])
+      expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
+      expect(deps.onCapReachedCalls).toEqual([])
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(errLines.slice(from)).toHaveLength(1)
+      expectThrownQueryLine(
+        `[slack] Skipping restart for persona=${P} — the persona is latched `,
+        ' — taken as latched); no agent-director call, nothing recorded (b.jg5 SRJ-502)',
+      )
+    })
+
+    test('a restart run whose launch answers skipped and whose latched query then throws answers latched (fail safe): one kill before the launch and nothing after it, nothing counted, no cap notice, no restart timer, one line naming what it threw', async () => {
+      recordFailure(P)
+      let launched = false
+      const deps = latchedDeps({
+        launchSession: async () => {
+          launched = true
+          return 'skipped'
+        },
+      })
+      // The gate before the liveness read finds P not latched; the check after the launch throws.
+      deps.isLatched = (key) => {
+        if (launched) throw queryBroke()
+        return false
+      }
+      initRestart(deps)
+
+      expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_LATCHED)
+
+      expect(deps.isSessionAliveCalls).toEqual([P])
+      expect(deps.reconnectSessionCalls).toEqual([])
+      expect(deps.killSessionCalls).toEqual([P])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P])
+      expect(getFailureCount(P)).toBe(1)
+      expect(deps.onCapReachedCalls).toEqual([])
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(isRestartPendingOrActive(P)).toBe(false)
+      expectThrownQueryLine(
+        `[slack] Session relaunch for persona=${P} ended latched `,
+        ' — taken as latched) — not counted; nothing more is done for it',
+      )
+      expect(errLines.filter((l) => l.startsWith('[slack] Skipping restart'))).toEqual([])
+      expect(errLines.filter((l) => l.startsWith('[slack] Scheduling restart'))).toEqual([])
+    })
+  })
+
+  describe('through the real adapters over the stub, on the recovery harness', () => {
+    let harness: RecoveryHarness | undefined
+
+    afterEach(() => {
+      const h = harness
+      harness = undefined
+      if (h === undefined) return
+      assertNoLeak(h.captured())
+      h.cleanup()
+      expect(h.clock.pendingCount()).toBe(0)
+    })
+
+    test('a relaunch whose spawn answers a CONFLICT latches P (a plain spawn, the row as read then), counts nothing, posts no spawn-failure notice and arms or schedules nothing; no later restart reaches agent-director for P, while Q restarts as before', async () => {
+      const h = (harness = makeRecoveryHarness({ alertThresholdMs: false }))
+      const [p, q] = [h.keys[0]!, h.keys[1]!]
+      const cwdOf = (key: string): string => h.config.personas.find((persona) => persona.key === key)!.working_directory
+      for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(p)
+      rowReadsUntilSpawn(h, 'ended')
+      h.script({ spawnError: conflict() })
+
+      expect(await runRestartRetry(p, cwdOf(p), isLaunchInFlight)).toBe(RESTART_OUTCOME_LATCHED)
+      await h.settle()
+
+      const record = h.latch.record(p)
+      expect(record).toMatchObject({
+        latchCase: LATCH_CASE_LEFTOVER,
+        refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN,
+        rowState: latchRowStateRead('ended'),
+      })
+      // The harness's latch, wired as main() wires it: the set, then the three holds, then the one CONFLICT post.
+      expect(h.latchEvents.map((event) => (event.step === 'hold' ? [event.step, event.key, event.hold] : [event.step, event.key]))).toEqual([
+        ['set', p],
+        ['hold', p, 'retry timer stop'],
+        ['hold', p, 'tmux-unresponsive end'],
+        ['hold', p, 'unclassified-error end'],
+        ['notice', p],
+      ])
+      expect(h.episodeNotices).toEqual([
+        { key: p, text: conflictNoticeText({ sessionName: record!.sessionName, latchCase: LATCH_CASE_LEFTOVER, description: record!.description }) },
+      ])
+      expect(h.stub.calls.killCalls).toHaveLength(1)
+      expect(h.stub.calls.spawnCalls).toHaveLength(1)
+      expect(h.stub.calls.resumeCalls).toEqual([])
+      expect(h.stub.calls.deleteCalls).toEqual([])
+      expect(getFailureCount(p)).toBe(RESTART_FAILURE_CAP - 1)
+      expect(h.capReached).toEqual([])
+      expect(h.notices).toEqual([])
+      expect(h.startupErrors()).toEqual([])
+      expect(h.triggers).toEqual([])
+      expect(h.controller.armedKeys()).toEqual([])
+      expect(isRestartPendingOrActive(p)).toBe(false)
+
+      // AC 46: with the stub answering again, a later retry for P still makes no call.
+      h.script({ spawnError: undefined })
+      const before = callCounts(h)
+      expect(await runRestartRetry(p, cwdOf(p), isLaunchInFlight)).toBe(RESTART_OUTCOME_LATCHED)
+      expect(callCounts(h)).toEqual(before)
+      // A scheduled restart for P arms no timer.
+      scheduleRestart(p, cwdOf(p))
+      expect(isRestartPendingOrActive(p)).toBe(false)
+      expect(h.errors.filter((line) => line.startsWith(`[slack] Not scheduling restart for persona=${p} `))).toEqual([
+        `[slack] Not scheduling restart for persona=${p} — the persona is latched; no timer armed (b.jg5 SRJ-502)`,
+      ])
+      expect(callCounts(h)).toEqual(before)
+
+      // Q, not latched, is killed and relaunched as before.
+      expect(await runRestartRetry(q, cwdOf(q), isLaunchInFlight)).toBe(RESTART_OUTCOME_LAUNCHED)
+      await h.settle()
+      expect(h.latch.isLatched(q)).toBe(false)
+      expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p), personaInstanceId(q)])
+      expect(h.stub.spawnedIds()).toEqual([personaInstanceId(p), personaInstanceId(q)])
+      expect(getFailureCount(q)).toBe(0)
+      expect(h.latchEvents).toHaveLength(5)
+      expect(h.episodeNotices).toHaveLength(1)
+    })
+
+    test('a latched query that throws for P (fail safe): the retry entry answers latched with no stub call for P and nothing counted, logging what it threw; Q restarts as before', async () => {
+      const h = (harness = makeRecoveryHarness({
+        alertThresholdMs: false,
+        restartDeps: {
+          isLatched: (key) => {
+            if (key === h.keys[0]) throw Object.assign(new Error(`latch store unreadable (${sentinelInMessage('latched')})`), { note: LEAK_SENTINEL })
+            return false
+          },
+        },
+      }))
+      const [p, q] = [h.keys[0]!, h.keys[1]!]
+      const cwdOf = (key: string): string => h.config.personas.find((persona) => persona.key === key)!.working_directory
+      recordFailure(p)
+      rowReadsUntilSpawn(h, 'ended')
+
+      expect(await runRestartRetry(p, cwdOf(p), isLaunchInFlight)).toBe(RESTART_OUTCOME_LATCHED)
+      await h.settle()
+
+      expect(callCounts(h)).toEqual({})
+      expect(getFailureCount(p)).toBe(1)
+      expect(h.capReached).toEqual([])
+      expect(h.notices).toEqual([])
+      expect(h.startupErrors()).toEqual([])
+      expect(h.triggers).toEqual([])
+      expect(h.controller.armedKeys()).toEqual([])
+      expect(isRestartPendingOrActive(p)).toBe(false)
+      const skip = h.errors.filter((line) => line.startsWith(`[slack] Skipping restart for persona=${p} `))
+      expect(skip).toHaveLength(1)
+      expect(skip[0]).toStartWith(
+        `[slack] Skipping restart for persona=${p} — the persona is latched (the latched query failed: Error message="latch store unreadable (${REDACTED_SENTINEL_TAIL})" at `,
+      )
+      expect(skip[0]).toEndWith(' — taken as latched); no agent-director call, nothing recorded (b.jg5 SRJ-502)')
+
+      // Q, whose query answers false, is killed and relaunched as before.
+      expect(await runRestartRetry(q, cwdOf(q), isLaunchInFlight)).toBe(RESTART_OUTCOME_LAUNCHED)
+      await h.settle()
+      expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(q)])
+      expect(h.stub.spawnedIds()).toEqual([personaInstanceId(q)])
+      expect(callsFor(h, p)).toBe(0)
+      expect(getFailureCount(q)).toBe(0)
+    })
+  })
+})
+
+/** Every stub call made for persona `key`'s instance, over every verb. */
+function callsFor(h: RecoveryHarness, key: string): number {
+  const id = personaInstanceId(key)
+  return (Object.values(h.stub.calls).flat() as Array<{ claude_instance_id?: unknown }>).filter((params) => params?.claude_instance_id === id).length
+}

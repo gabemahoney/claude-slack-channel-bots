@@ -49,12 +49,31 @@
  * Recovery: each reason ("row reads" over every live and dead state) under
  * both latch kinds, with no line matching either list.
  *
- * Pure module under test: one `createConflictLatch` per test over a line
- * capture and a recording observer; `afterEach` runs `assertNoLeak` over
- * every line, event and record captured, and over every notice post. The
- * notice cases build `createPersonaEpisodes` over `createFakeClock` with a
- * recording sink; `afterEach` checks no timer is pending and clears the
- * session-manager notifier and its not-connected latch. No `mock.module()`.
+ * AC 46's automated half (SRJ-502, on `makeRecoveryHarness` with both
+ * settings 0): P latches through the launch driver at a plain-spawn row and
+ * at a `resume` row; then a new launch, the retry entry, a scheduled restart,
+ * a human-triggered restart request, the retry timer (armed after the latch,
+ * over several waits) and a health tick with the latched query bound make no
+ * kill, spawn, resume or delete for P (the tick reads its liveness only), and
+ * the latch posts exactly one CONFLICT notice and no spawn-failure notice;
+ * Q's run of each path is asserted call for call. The restart module's delay
+ * accessor answers a non-zero delay (the setting 0 arms no restart timer), and
+ * the restart timer and the health interval, which take no clock, are fired
+ * by hand from a captured callback, so no real timer runs. A failing
+ * latch-time `status` read (UNAVAILABLE, and UNCLASSIFIED) proves the order:
+ * the read before any set, then the set, the three holds in order and the
+ * notice, by which P's timer, `tmux-unresponsive` condition and
+ * unclassified episode are all closed, and nothing fires for P afterwards.
+ *
+ * Pure module under test, except the recovery-harness cases: one
+ * `createConflictLatch` per test over a line capture and a recording
+ * observer; `afterEach` runs `assertNoLeak` over every line, event and record
+ * captured, over every notice post and over each harness's `captured()`,
+ * then cleans the harness up (which throws on a pending timer) and resets the
+ * health check. The notice cases build `createPersonaEpisodes` over
+ * `createFakeClock` with a recording sink; `afterEach` checks no timer is
+ * pending and clears the session-manager notifier and its not-connected
+ * latch. No `mock.module()`.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -162,14 +181,46 @@ import {
   AGENT_DIRECTOR_PENDING_STATE,
 } from '../src/liveness-reading.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
-import { createPersonaEpisodes, PERSONA_EPISODE_KIND_CONFLICT, type PersonaEpisodes } from '../src/persona-episodes.ts'
-import { personaTmuxSessionName } from '../src/persona-identity.ts'
-import { _resetNotConnectedEpisodes, notifyPersonaNotConnected, setSessionNotifier, type NotConnectedNotice } from '../src/session-manager.ts'
+import {
+  createPersonaEpisodes,
+  PERSONA_EPISODE_KIND_CONFLICT,
+  TMUX_UNRESPONSIVE_END_LATCHED,
+  UNCLASSIFIED_ERROR_END_LATCHED,
+  type PersonaEpisodes,
+} from '../src/persona-episodes.ts'
+import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
+import type { PersonaSerialize, PersonaSerializer } from '../src/persona-serializer.ts'
+import { getFailureCount, isAtCap } from '../src/backoff.ts'
+import { _resetHealthCheckState, initHealthCheck, startHealthCheck, stopHealthCheck } from '../src/health-check.ts'
+import {
+  isRestartPendingOrActive,
+  RESTART_FAILURE_CAP,
+  RESTART_OUTCOME_LATCHED,
+  RESTART_OUTCOME_LAUNCHED,
+  runRestartRetry,
+  scheduleRestart,
+} from '../src/restart.ts'
+import { _buildIsSessionAliveAdapter } from '../src/server.ts'
+import {
+  _resetNotConnectedEpisodes,
+  isLaunchInFlight,
+  notifyPersonaNotConnected,
+  setSessionNotifier,
+  type NotConnectedNotice,
+} from '../src/session-manager.ts'
+import {
+  UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_CEILING_S,
+  UNAVAILABLE_RETRY_STOP_LATCHED,
+} from '../src/unavailable-retry.ts'
 import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   CONFLICT_CASES,
+  cannedStatusResult,
   errGeneric,
+  errInternal,
   errSpawnNotFound,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
@@ -192,6 +243,18 @@ import {
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import {
+  collided,
+  conditionEndedLine,
+  conditionRecoveryLine,
+  makeRecoveryHarness,
+  personaOf,
+  unclassifiedEndedLine,
+  unclassifiedStartedLine,
+  unclassifiedStartedLines,
+  type RecoveryHarness,
+  type RecoveryStubScript,
+} from './test-helpers/recovery-harness.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1241,5 +1304,339 @@ describe('the recovery notice', () => {
     const sessionName = 'ses<s>&n'
     expect(conflictRecoveryText(sessionName, LATCH_RECOVERY_REASON_ROW_GONE).includes(JSON.stringify(escapeSlackControlCharacters(sessionName)))).toBe(true)
     assertNoLeak([reasonText])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 46's automated half, on the recovery harness (SRJ-502, SRJ-501, SRJ-508)
+// ---------------------------------------------------------------------------
+
+/** Every recovery harness of this test, leak-checked and cleaned up in `afterEach`. */
+let harnesses: RecoveryHarness[] = []
+
+afterEach(() => {
+  const built = harnesses
+  harnesses = []
+  _resetHealthCheckState()
+  for (const h of built) {
+    assertNoLeak(h.captured())
+    h.cleanup()
+  }
+})
+
+/** The restart delay the restart module reads; never waited out: a case fires the restart timer by hand. */
+const RESTART_DELAY_S = 1
+
+interface AutomatedPathsRun {
+  readonly h: RecoveryHarness
+  /** Each restart work's outcome, as its serialized turn answered it, in order. */
+  readonly outcomes: Array<readonly [string, unknown]>
+  /** Mark persona `key`'s row dead: its `status` reads `ended` until its next spawn resolves, then `waiting`. */
+  readonly killRow: (key: string) => void
+}
+
+/**
+ * A recovery harness with both settings 0, every persona's row read `ended`
+ * until a spawn of it resolves (`waiting` from then on), and the restart
+ * module's serialized turns recorded. The restart module's delay accessor
+ * answers `RESTART_DELAY_S`, so `scheduleRestart` arms its timer (with the
+ * setting 0 it arms none); the configuration keeps `session_restart_delay` 0.
+ */
+function makeAutomatedPathsRun(): AutomatedPathsRun {
+  const outcomes: Array<readonly [string, unknown]> = []
+  let serializer: PersonaSerializer | undefined
+  const serialize: PersonaSerialize = (key, operation) =>
+    serializer!.run(key, async () => {
+      const outcome = await operation()
+      outcomes.push([key, outcome])
+      return outcome
+    })
+  const h = makeRecoveryHarness({ restartDeps: { getRestartDelay: () => RESTART_DELAY_S, serialize } })
+  harnesses.push(h)
+  serializer = h.serializer
+  const live = new Set<string>()
+  const spawn = h.stub.client.spawn.bind(h.stub.client)
+  h.stub.client.spawn = async (params) => {
+    const result = await spawn(params)
+    live.add(String(params.claude_instance_id))
+    return result
+  }
+  h.script({ statusFn: (params) => cannedStatusResult({ state: live.has(String(params.claude_instance_id)) ? 'waiting' : 'ended' }) })
+  return { h, outcomes, killRow: (key) => live.delete(personaInstanceId(key)) }
+}
+
+/** Persona `key`'s calls in the stub's log, by verb, leaving out verbs with none. */
+function callsFor(h: RecoveryHarness, key: string): Record<string, number> {
+  const id = personaInstanceId(key)
+  return Object.fromEntries(
+    Object.entries(h.stub.calls)
+      .map(([verb, calls]) => [verb, (calls as Array<{ claude_instance_id?: unknown }>).filter((c) => c.claude_instance_id === id).length] as const)
+      .filter(([, count]) => count > 0),
+  )
+}
+
+/** The calls `after` holds beyond `before`, by verb, leaving out verbs with none. */
+function callsSince(after: Record<string, number>, before: Record<string, number>): Record<string, number> {
+  return Object.fromEntries(Object.entries(after).map(([verb, n]) => [verb, n - (before[verb] ?? 0)] as const).filter(([, n]) => n > 0))
+}
+
+/**
+ * Run `arm` with the global `kind` swapped for a recorder and answer the
+ * callbacks it set, never scheduled: the restart timer and the health
+ * interval take no clock, so a case fires them by hand and no real timer runs.
+ */
+function armedTimers(kind: 'setTimeout' | 'setInterval', arm: () => void): Array<() => unknown> {
+  const g = globalThis as unknown as Record<string, unknown>
+  const saved = g[kind]
+  const callbacks: Array<() => unknown> = []
+  g[kind] = (callback: () => unknown) => {
+    callbacks.push(callback)
+    return 0
+  }
+  try {
+    arm()
+  } finally {
+    g[kind] = saved
+  }
+  return callbacks
+}
+
+/** Run `arm`, which sets exactly one timer through the global `kind` (`armedTimers`), and answer that timer's callback. */
+function captureTimer(kind: 'setTimeout' | 'setInterval', arm: () => void): () => Promise<void> {
+  const callbacks = armedTimers(kind, arm)
+  if (callbacks.length !== 1) throw new Error(`expected one ${kind}, got ${callbacks.length}`)
+  return async () => {
+    await callbacks[0]()
+  }
+}
+
+describe('AC 46: no automated path kills, launches or recovers a latched persona (recovery harness)', () => {
+  const plainSpawnRow = rowWhere(
+    (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.latchCase === LATCH_CASE_LEFTOVER && row.rowState !== LATCH_ROW_STATE_NO_ROW,
+  )
+  const resumeRow = rowWhere((row) => row.refusedOperation === REFUSED_OPERATION_RESUME && row.latchCase === LATCH_CASE_OWN_ID)
+  /** How each row latches P through the launch driver: its first spawn refused, or the resume of its `ended` row. */
+  const LATCH_ROWS: ReadonlyArray<readonly [string, ConflictCaseRow, (h: RecoveryHarness, key: string) => RecoveryStubScript]> = [
+    ['a plain spawn', plainSpawnRow, () => ({ spawnError: plainSpawnRow.build() })],
+    ['a resume', resumeRow, (h, key) => ({ ...collided(h, personaOf(h, key), { state: 'ended' }), resumeError: resumeRow.build() })],
+  ]
+  /** The stub's launch answers back to their defaults (the row reads stay). */
+  const CLEARED: RecoveryStubScript = { spawnError: undefined, spawnQueue: undefined, getResult: undefined, resumeError: undefined }
+  /** One relaunch of a dead row: its liveness read, the kill, the spawn and the launch's own read. */
+  const RELAUNCH = { statusCalls: 2, killCalls: 1, spawnCalls: 1 }
+
+  /** The latch's reaction to one set of P, as `latchEvents` reads it: the set, the three holds in order, then the notice. */
+  const oneLatch = (key: string) => [
+    ['set', key],
+    ['hold', key, 'retry timer stop'],
+    ['hold', key, 'tmux-unresponsive end'],
+    ['hold', key, 'unclassified-error end'],
+    ['notice', key],
+  ]
+  const latchSteps = (h: RecoveryHarness) =>
+    h.latchEvents.map((event) => (event.step === 'hold' ? [event.step, event.key, event.hold] : [event.step, event.key]))
+
+  test.each(LATCH_ROWS)('P latched at %s: a new launch, the retry entry, a scheduled restart, a human-triggered restart, the retry timer and the health tick make no kill, spawn, resume or delete for P; one CONFLICT post; Q\'s paths reach the stub as before', async (_label, row, latchScript) => {
+    const { h, outcomes, killRow } = makeAutomatedPathsRun()
+    const [p, q] = h.keys as [string, string]
+    const cwdOf = (key: string): string => personaOf(h, key).working_directory
+
+    h.script(latchScript(h, p))
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    expect(h.latch.record(p)).toMatchObject({
+      sessionName: row.sessionName,
+      latchCase: row.latchCase,
+      refusedOperation: row.refusedOperation,
+      rowState: row.rowState,
+    })
+    h.script(CLEARED)
+    const pAtLatch = callsFor(h, p)
+    const qCalls: Array<readonly [string, Record<string, number>]> = []
+    /** Drive `path` for P, then for Q with its row dead, recording what Q's run called. */
+    async function drive(name: string, path: (key: string) => Promise<unknown>): Promise<void> {
+      await path(p)
+      await h.settle()
+      killRow(q)
+      const before = callsFor(h, q)
+      await path(q)
+      await h.settle()
+      qCalls.push([name, callsSince(callsFor(h, q), before)])
+    }
+
+    /**
+     * Schedule a restart for `key` (`opts` as given): for latched P, no timer is
+     * armed and the one line saying so is logged; for Q, its one timer is fired.
+     */
+    const notScheduledLines: string[][] = []
+    async function scheduleFor(key: string, opts?: { humanTrigger: true }): Promise<void> {
+      const from = h.errors.length
+      const timers = armedTimers('setTimeout', () => scheduleRestart(key, cwdOf(key), undefined, opts))
+      if (key !== p) {
+        expect(timers).toHaveLength(1)
+        await timers[0]!()
+        return
+      }
+      expect(timers).toEqual([])
+      expect(isRestartPendingOrActive(p)).toBe(false)
+      notScheduledLines.push(h.errors.slice(from).filter((line) => line.includes(`persona=${p}`)))
+    }
+
+    const launched: unknown[] = []
+    await drive('a new launch', async (key) => launched.push(await h.launch(key)))
+    await drive('the retry entry', (key) => runRestartRetry(key, cwdOf(key), isLaunchInFlight))
+    await drive('a scheduled restart', (key) => scheduleFor(key))
+    await drive('a human-triggered restart', (key) => scheduleFor(key, { humanTrigger: true }))
+    // Each request for P logged the not-scheduling line once, and nothing else naming P.
+    const notScheduling = `[slack] Not scheduling restart for persona=${p} — the persona is latched; no timer armed (b.jg5 SRJ-502)`
+    expect(notScheduledLines).toEqual([[notScheduling], [notScheduling]])
+    const attemptsBefore = h.attempts.length
+    await drive('the retry timer', async (key) => {
+      h.controller.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
+      await h.advance(4 * UNAVAILABLE_RETRY_CEILING_S * 1000)
+    })
+
+    // The health tick, its latched query bound as main() binds it; both rows read dead.
+    const scheduled: string[] = []
+    initHealthCheck({
+      isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
+      isSessionConnected: () => false,
+      hasSessionStream: () => false,
+      isRestartPendingOrActive,
+      isLaunchInFlight,
+      isLatched: (key) => h.latch.isLatched(key),
+      isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
+      statRoute: async () => true,
+      scheduleRestart: (key) => {
+        scheduled.push(key)
+      },
+      isShuttingDown: () => false,
+      getPersonas: () => Object.fromEntries(h.keys.map((key) => [key, cwdOf(key)])),
+      endTmuxUnresponsive: (key) => {
+        h.tickEnd(key)
+      },
+      onTickEnd: (startedAt) => h.tickOnset(startedAt),
+      now: h.clock.now,
+    })
+    killRow(q)
+    const qBeforeTick = callsFor(h, q)
+    await captureTimer('setInterval', () => startHealthCheck(1))()
+    stopHealthCheck()
+    qCalls.push(['the health tick', callsSince(callsFor(h, q), qBeforeTick)])
+
+    // P: since the latch, only the tick's liveness read; never a kill of its instance.
+    expect(callsSince(callsFor(h, p), pAtLatch)).toEqual({ statusCalls: 1 })
+    expect(h.stub.calls.killCalls.filter((call) => call.claude_instance_id === personaInstanceId(p))).toEqual([])
+    expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
+    // P's only serialized work is the retry entry's, answered latched; neither restart request armed a timer for it.
+    expect(outcomes).toEqual([
+      [p, RESTART_OUTCOME_LATCHED],
+      ...[1, 2, 3, 4].map(() => [q, RESTART_OUTCOME_LAUNCHED] as const),
+    ])
+    expect(isRestartPendingOrActive(p)).toBe(false)
+    // P's timer fired once and stopped as latched, with no call; Q's ran its relaunch, then read its row live out of pending.
+    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual([[p, 1], [q, 1], [q, 2]])
+    expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(h.controller.armedKeys()).toEqual([])
+    expect(scheduled).toEqual([q])
+    expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 0])
+
+    // One latch, one CONFLICT post, no spawn-failure notice or spawn-failed entry.
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(h.latch.isLatched(q)).toBe(false)
+
+    // Q, beside it, still reaches the stub on every path.
+    expect(qCalls).toEqual([
+      ['a new launch', { spawnCalls: 1, statusCalls: 1 }],
+      ['the retry entry', RELAUNCH],
+      ['a scheduled restart', RELAUNCH],
+      ['a human-triggered restart', RELAUNCH],
+      ['the retry timer', { ...RELAUNCH, statusCalls: RELAUNCH.statusCalls + 1 }],
+      ['the health tick', { statusCalls: 1 }],
+    ])
+  })
+
+  test.each([
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', (): Error => errTmuxUnresponsive('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, false],
+    // A read verb's UNCLASSIFIED answer arms with the read-error cause.
+    ['UNCLASSIFIED (ErrInternal)', (): Error => errInternal(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR, true],
+  ] as const)('a latch-time status read answering %s: read, then set, then the holds, then the notice; no retry timer, tmux-unresponsive condition or unclassified episode is left open for P', async (_label, readError, cause, opensEpisode) => {
+    const { h } = makeAutomatedPathsRun()
+    const [p, q] = h.keys as [string, string]
+
+    // P's condition holds and its timer is armed: a launch whose spawn tmux did not answer.
+    h.script({ spawnError: errTmuxUnresponsive('spawn') })
+    expect((await h.launch(p)).action).toBe('failed')
+    expect([h.tmuxUnresponsive.holds(p), h.controller.isArmed(p)]).toEqual([true, true])
+
+    // Then a launch whose first spawn answers a CONFLICT; nothing was read before it, so one status read follows.
+    const err = readError()
+    const atRead: unknown[] = []
+    h.script({
+      spawnError: plainSpawnRow.build(),
+      statusFn: () => {
+        atRead.push({ latchSteps: h.latchEvents.length, latched: h.latch.isLatched(p) })
+        return err
+      },
+    })
+    const atNotice: unknown[] = []
+    const post = h.episodeNotices.push.bind(h.episodeNotices)
+    h.episodeNotices.push = (...notices) => {
+      atNotice.push({
+        armed: h.controller.isArmed(p),
+        conditionHolds: h.tmuxUnresponsive.holds(p),
+        episodeOpen: h.unclassifiedErrorOpen(p),
+        latched: h.latch.isLatched(p),
+      })
+      return post(...notices)
+    }
+    const triggersBefore = h.triggers.length
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+
+    // Read: before any set, and its error reached the timer and (UNCLASSIFIED) the episode.
+    expect(atRead).toEqual([{ latchSteps: 0, latched: false }])
+    expect(h.triggers.slice(triggersBefore)).toEqual([{ key: p, kind: cause }])
+    expect(unclassifiedStartedLines(h, p)).toEqual(opensEpisode ? [unclassifiedStartedLine(p, err)] : [])
+    // Set, with the read's state (unreadable), then the holds in order, then the notice.
+    expect(h.latch.record(p)).toMatchObject({ refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: LATCH_ROW_STATE_UNREADABLE })
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.stops).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(h.lines.includes(conditionEndedLine(p, TMUX_UNRESPONSIVE_END_LATCHED))).toBe(true)
+    expect(h.lines.includes(conditionRecoveryLine(p))).toBe(false)
+    expect(h.lines.includes(unclassifiedEndedLine(p, UNCLASSIFIED_ERROR_END_LATCHED))).toBe(opensEpisode)
+    // By the notice every hold had run.
+    expect(atNotice).toEqual([{ armed: false, conditionHolds: false, episodeOpen: false, latched: true }])
+    expect(h.episodeNotices).toEqual([{ key: p, text: plainSpawnRow.notice.text }])
+
+    // Nothing is left to fire for P: several waits on, no attempt and no call.
+    const pCalls = callsFor(h, p)
+    await h.advance(4 * UNAVAILABLE_RETRY_CEILING_S * 1000)
+    expect([h.attempts, callsFor(h, p), h.controller.armedKeys(), h.clock.pendingCount()]).toEqual([[], pCalls, [], 0])
+    expect(h.notices).toEqual([])
+    expect(callsFor(h, q)).toEqual({})
+  })
+
+  test('a second harness starts with no latch: P latched in the first, cleaned up, is unlatched in the second, with no latch events, and its launch spawns', async () => {
+    const { h: h1 } = makeAutomatedPathsRun()
+    // Cleaned up here, so out of the afterEach list; leak-checked as afterEach would.
+    harnesses = harnesses.filter((h) => h !== h1)
+    const p = h1.keys[0]!
+    h1.script({ spawnError: plainSpawnRow.build() })
+    expect(await h1.launch(p)).toEqual({ key: p, action: 'latched' })
+    expect(h1.latch.isLatched(p)).toBe(true)
+    assertNoLeak(h1.captured())
+    h1.cleanup()
+
+    const { h: h2 } = makeAutomatedPathsRun()
+    expect(h2.keys[0]).toBe(p)
+    expect(h2.latch.isLatched(p)).toBe(false)
+    expect(h2.latchEvents).toEqual([])
+    expect(await h2.launch(p)).toEqual({ key: p, action: 'spawned' })
+    expect(h2.stub.calls.spawnCalls.length).toBe(1)
+    expect(h2.latch.isLatched(p)).toBe(false)
+    expect(h2.latchEvents).toEqual([])
   })
 })

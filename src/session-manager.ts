@@ -40,6 +40,18 @@
  *      `dead-session` verdict, and no further kill, delete or launch. An
  *      UNCLASSIFIED outcome has also been reported to the persona's
  *      unclassified-error episode (`src/persona-episodes.ts`).
+ *   4. A CONFLICT (`ErrTmuxSessionConflict`, b.jg5 SRJ-105, SRJ-501) at any
+ *      spawn or resume the ladder makes (the first spawn, its self-heal
+ *      spawn, the retry spawn after the collision `get` found no row, the
+ *      spawn after `resume` found none, every delete-then-spawn branch, and
+ *      the resume) takes the CONFLICT row (`conflictAt`): the persona latches
+ *      through the installed latch (`setConflictLatch`) with the refused
+ *      operation "plain spawn" or "resume" and the row state the path last
+ *      read before the call (one latch-time `status` read when it read
+ *      nothing), and the ladder answers `latched`: no notice from here, no
+ *      `spawn-failed` entry, nothing counted, and no kill, delete or further
+ *      launch. A latched persona is not launched at all: `spawnForPersona`
+ *      answers `latched` with no agent-director call (b.jg5 SRJ-502).
  *
  * Both row checks go through `compareRowToPersona`. At most one launch per
  * persona is in flight (b.av2 SR-6.3): a concurrent call for the same key
@@ -147,6 +159,7 @@ import {
 import {
   AD_CALL_KILL_ROW_READ_LIVE,
   AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_CONFLICT,
   AD_ERROR_CLASS_ENVIRONMENT,
   adKillCall,
   type AdKillCall,
@@ -159,6 +172,17 @@ import {
   isInvalidFlagsError,
 } from './ad-error-class.ts'
 import { RECHECK_OUTCOME_STOP } from './ad-version-gate.ts'
+import {
+  LATCH_ROW_STATE_NO_ROW,
+  LATCH_ROW_STATE_UNREADABLE,
+  REFUSED_OPERATION_PLAIN_SPAWN,
+  REFUSED_OPERATION_RESUME,
+  latchRowStateRead,
+  type ConflictLatch,
+  type ConflictLatchRecord,
+  type LatchRowState,
+  type RefusedOperation,
+} from './conflict-latch.ts'
 import {
   runInAttempt,
   unavailableRetryCauseFor,
@@ -531,6 +555,179 @@ function logRefusal(site: string, what: string, ref: string, described: string):
   console.error(
     `[slack] ${site}: ${what} refused for ${ref}: ${described} — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)`,
   )
+}
+
+// ---------------------------------------------------------------------------
+// The latch (b.jg5 SRJ-501, SRJ-502)
+// ---------------------------------------------------------------------------
+
+/** What the session manager uses of the server's one latch (`src/conflict-latch.ts`). */
+export type SessionConflictLatch = Pick<ConflictLatch, 'isLatched' | 'record' | 'setFromConflict'>
+
+/**
+ * The installed latch. Production installs the server's one latch
+ * (`createConflictLatch`, built in `main()`) before the start pass. With none
+ * installed (unit tests, the integration driver) no persona is latched, so no
+ * launch is held back, and a CONFLICT at a ladder spawn or resume still takes
+ * the CONFLICT row's no-action path and answers `latched` (`conflictAt`).
+ */
+let conflictLatch: SessionConflictLatch | undefined
+
+/** Install the server's latch (production: `main()`), or remove it with undefined. */
+export function setConflictLatch(latch: SessionConflictLatch | undefined): void {
+  conflictLatch = latch
+}
+
+/** The case the latched gate logs when it cannot read the persona's latch record. */
+const LATCH_CASE_UNKNOWN = 'unknown'
+
+/**
+ * What the latched gate (`spawnForPersona`, b.jg5 SRJ-502) read of persona
+ * `key`'s latch: `undefined` when no latch is installed or the latch answers
+ * not latched; otherwise the case to log (the record's, or
+ * `LATCH_CASE_UNKNOWN` when the record cannot be read) and, when a latch
+ * query threw, `describeThrownValue` of what it threw.
+ */
+interface LatchGateReading {
+  readonly latchCase: string
+  readonly failure?: string
+}
+
+/**
+ * Read persona `key`'s latch for the latched gate (`LatchGateReading`). Fails
+ * safe: an `isLatched` that throws counts as latched (case unknown), and so
+ * does a latched persona whose `record` throws or answers nothing. Logs
+ * nothing (the gate logs one line); never throws.
+ */
+function latchGateReadingOf(key: string): LatchGateReading | undefined {
+  const latch = conflictLatch
+  if (latch === undefined) return undefined
+  let latched: boolean
+  try {
+    latched = latch.isLatched(key) === true
+  } catch (err) {
+    return { latchCase: LATCH_CASE_UNKNOWN, failure: `the latched query failed: ${describeThrownValue(err)}` }
+  }
+  if (!latched) return undefined
+  try {
+    const record: ConflictLatchRecord | undefined = latch.record(key)
+    return { latchCase: record?.latchCase ?? LATCH_CASE_UNKNOWN }
+  } catch (err) {
+    return { latchCase: LATCH_CASE_UNKNOWN, failure: `its latch record could not be read: ${describeThrownValue(err)}` }
+  }
+}
+
+/**
+ * The row state a launch site last read before its refused call (b.jg5
+ * SRJ-501): the state read, or no row (the read answered `ErrSpawnNotFound`).
+ * `NOTHING_READ` when the path read nothing before it (the first spawn and
+ * its self-heal spawn): the CONFLICT row then makes the one latch-time
+ * `status` read (`latchTimeRowState`). A state is never re-read after a
+ * write the path made since (a delete, a kill, a sweep): only the last read
+ * counts.
+ */
+type LastRowRead = LatchRowState | typeof NOTHING_READ
+
+/** The path read nothing of the row before its refused call (`LastRowRead`). */
+const NOTHING_READ = undefined
+
+/**
+ * The latch-time `status` read (b.jg5 SRJ-501), for a CONFLICT at a site
+ * whose path read nothing before the refused call: one `status` call for
+ * persona `key`'s row through `withOutageDetection`, inside the launch
+ * attempt (so its UNAVAILABLE or read error arms the persona's retry timer
+ * and its UNCLASSIFIED answer opens the unclassified-error episode, which the
+ * latch's holds then stop and end). The state read; no row for
+ * `ErrSpawnNotFound` (recognised by name); unreadable for any other error,
+ * which counts as live. Logs nothing; never throws.
+ */
+async function latchTimeRowState(key: string): Promise<LatchRowState> {
+  try {
+    const st = await withOutageDetection(key, undefined, 'status', (client) =>
+      client.status({ claude_instance_id: personaInstanceId(key) }),
+    )
+    return latchRowStateRead(st.state)
+  } catch (err) {
+    return hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME) ? LATCH_ROW_STATE_NO_ROW : LATCH_ROW_STATE_UNREADABLE
+  }
+}
+
+/**
+ * b.jg5 SRJ-105, SRJ-501, SRJ-111, SRJ-113: the CONFLICT row of the ladder's
+ * refusal handling, at every spawn and `resume` the collision ladder makes.
+ * `err` was thrown by that call for persona `key`. It is the row's only when
+ * the classifier (`classifyAdError`, by name) answers CONFLICT
+ * (`ErrTmuxSessionConflict`); for any other value it answers `undefined`
+ * and the site goes on as before.
+ *
+ * For a CONFLICT it latches the persona through the installed latch's
+ * `setFromConflict` with
+ * `operation` (a plain spawn or a `resume`) and the row state: `lastRead`,
+ * the state the path last read before the refused call, or, when it read
+ * nothing (`NOTHING_READ`), exactly one latch-time `status` read
+ * (`latchTimeRowState`). The latch's set observers then run, holds before the
+ * notice (`main()`). Then it logs one line (`what` names the call) saying
+ * the persona latched, or, when `setFromConflict` threw, that latching it
+ * failed and what it threw. It answers `latched`: no spawn-failure notice, no
+ * `spawn-failed` entry, nothing counted, and the caller kills, deletes and
+ * launches nothing more. With no latch installed it makes no read, sets
+ * nothing, logs the one line saying so, and still answers `latched`. Never
+ * throws.
+ */
+async function conflictAt(
+  key: string,
+  err: unknown,
+  operation: RefusedOperation,
+  lastRead: LastRowRead,
+  what: string,
+  ref: string,
+): Promise<SpawnPersonaResult | undefined> {
+  if (classifyAdError(err).errorClass !== AD_ERROR_CLASS_CONFLICT) return undefined
+  const latch = conflictLatch
+  if (latch === undefined) {
+    logConflict(what, ref, err, 'no latch is installed, so nothing is latched')
+    return { key, action: 'latched' }
+  }
+  const rowState = lastRead ?? (await latchTimeRowState(key))
+  try {
+    latch.setFromConflict(key, err, { refusedOperation: operation, rowState })
+  } catch (setErr) {
+    logConflict(what, ref, err, `latching the persona failed: ${describeThrownValue(setErr)}`)
+    return { key, action: 'latched' }
+  }
+  logConflict(what, ref, err, 'the persona latched')
+  return { key, action: 'latched' }
+}
+
+/**
+ * `conflictAt`'s one line for a CONFLICT at `what` for `ref`, with `outcome`
+ * (what became of the latch), logged once the latch is set or has failed.
+ */
+function logConflict(what: string, ref: string, err: unknown, outcome: string): void {
+  console.error(
+    `[slack] spawnForPersona: ${what} refused for ${ref}: ${describeAgentDirectorFailure(err)} — CONFLICT: ${outcome}; ` +
+      `no spawn-failure notice; nothing more is called (b.jg5 SRJ-105, SRJ-501)`,
+  )
+}
+
+/**
+ * The refusal handling of a spawn or `resume` the collision ladder makes
+ * (b.jg5 SRJ-105): the CONFLICT row first (`conflictAt`, which latches the
+ * persona and answers `latched`, with the refused operation "plain spawn"
+ * for a spawn and "resume" for a resume, and `lastRead` as its row state),
+ * then the refusal rows (`refusalAt`, which answers `failed`). `undefined`
+ * for any other value, which the site handles as before. Never throws.
+ */
+async function launchRefusalAt(
+  key: string,
+  err: unknown,
+  verb: 'spawn' | 'resume',
+  what: string,
+  ref: string,
+  lastRead: LastRowRead,
+): Promise<SpawnPersonaResult | undefined> {
+  const operation = verb === 'resume' ? REFUSED_OPERATION_RESUME : REFUSED_OPERATION_PLAIN_SPAWN
+  return (await conflictAt(key, err, operation, lastRead, what, ref)) ?? refusalAt(key, err, verb, 'spawnForPersona', what, ref)
 }
 
 /**
@@ -1954,6 +2151,12 @@ interface WorkingRowWait {
    * ladder records no `spawn-failed` entry for it.
    */
   refused?: true
+  /**
+   * b.jg5 SRJ-501: the row state the wait's last `status` read gave (no row
+   * for `ErrSpawnNotFound`), for a CONFLICT at the resume or spawn the ladder
+   * makes after a `dead-session` verdict. Absent until a read answers.
+   */
+  lastRead?: LatchRowState
 }
 
 /** The running wait of each persona whose launch waits for a `working` row (b.f2b); at most one per persona, like its launch. */
@@ -2514,7 +2717,8 @@ async function launchOnPromptRow(
   if (after === FIND_MISSING_REFUSED) return { key, action: 'failed' }
   if (isDeadRowState(after)) {
     console.error(`[slack] spawnForPersona: dead session for ${ref} (state=${state}) — recovering via resume/fresh-spawn`)
-    return resumeOrFreshSpawn(persona, params, config, isStartup, row)
+    // b.jg5 SRJ-501: the re-read after the sweep is the path's last read.
+    return resumeOrFreshSpawn(persona, params, config, isStartup, row, { lastRead: latchRowStateRead(after) })
   }
   const next = config.session_restart_delay === 0
     ? 'session_restart_delay is 0, so nothing retries it before the next server start'
@@ -2650,17 +2854,20 @@ export async function waitForWaitingAndReconnect(
  * `waitForWaitingAndReconnect`, also saying whether a `failed` outcome was a
  * refusal (b.jg5 SRJ-105): a refused findMissing sweep, a read error at the
  * poll or timeout `status`, or a refused reconnect. The ladder records no `spawn-failed` entry for it.
+ * `lastRead` is the row state the wait's last `status` read gave (b.jg5
+ * SRJ-501), absent when none answered.
  */
 async function waitForWaitingAndReconnectWithCause(
   key: string,
   config: PersonaConfig,
   ref: string,
-): Promise<{ outcome: WaitReconnectOutcome; refused?: true }> {
+): Promise<{ outcome: WaitReconnectOutcome; refused?: true; lastRead?: LatchRowState }> {
   const wait: WorkingRowWait = { cancelled: cancelledLaunchWaits.has(key), wake: () => {} }
   workingRowWaits.set(key, wait)
   try {
     const outcome = await waitForWorkingRow(key, config, ref, wait)
-    return outcome === 'failed' && wait.refused ? { outcome, refused: true } : { outcome }
+    const lastRead = wait.lastRead === undefined ? {} : { lastRead: wait.lastRead }
+    return outcome === 'failed' && wait.refused ? { outcome, refused: true, ...lastRead } : { outcome, ...lastRead }
   } finally {
     if (workingRowWaits.get(key) === wait) workingRowWaits.delete(key)
   }
@@ -2733,9 +2940,11 @@ async function waitForWorkingRow(
     try {
       const r = await withOutageDetection(key, undefined, 'status', (client) => client.status({ claude_instance_id }))
       state = r.state
+      wait.lastRead = latchRowStateRead(state)
     } catch (err) {
       if (wait.cancelled) return waitCancelled(ref)
       if (err instanceof ErrSpawnNotFound) {
+        wait.lastRead = LATCH_ROW_STATE_NO_ROW
         // b.c3o: spawn-not-found means the AD row is gone — same class as
         // `missing`. Only the tmux session's actual existence decides the
         // verdict, mirroring the timeout branch's own ErrSpawnNotFound
@@ -2847,9 +3056,11 @@ async function waitForWorkingRow(
   try {
     const r = await withOutageDetection(key, undefined, 'status', (client) => client.status({ claude_instance_id }))
     timeoutState = r.state
+    wait.lastRead = latchRowStateRead(timeoutState)
   } catch (err) {
     if (wait.cancelled) return waitCancelled(ref)
     if (err instanceof ErrSpawnNotFound) {
+      wait.lastRead = LATCH_ROW_STATE_NO_ROW
       return tmuxFallbackVerdict(key, config, ref, 'spawn not found')
     }
     // b.jg5 SRJ-105, SRJ-311: a read error never reaches the tmux fallback,
@@ -2942,6 +3153,17 @@ export interface SpawnPersonaResult {
      * `'skipped'`, so it counts toward no restart failure or cap.
      */
     | 'deferred'
+    /**
+     * b.jg5 SRJ-501, SRJ-502: the persona is latched. Either a spawn or
+     * `resume` the collision ladder made answered CONFLICT, so the persona
+     * latched (`conflictAt`), or it was already latched when the launch was
+     * asked for, so no agent-director call was made at all. Not a failure:
+     * never counted, no spawn-failure notice, no `spawn-failed` entry, and
+     * nothing is killed, deleted or launched after it. `launchSession` maps
+     * it to `'skipped'` (SRJ-1015), and the start pass counts it neither as
+     * failed nor as succeeded.
+     */
+    | 'latched'
   /** For `deferred`: the claude_config_dir cause (`claude-config-dir` step). */
   deferredBy?: PersonaBringUpFailure
   /**
@@ -3306,8 +3528,11 @@ async function tryDelete(
  * - cwd errors return `failed` quietly, and so does a refusal (an
  *   ENVIRONMENT, CONFIG or UNCLASSIFIED answer included,
  *   `ErrSystemInstallDisappeared` too, b.jg5 SRJ-313), with one line;
- *   any other error records `spawn-failed` at startup and raises the
- *   spawn-failure notice.
+ *   a CONFLICT at the fresh spawn or the self-heal spawn latches the
+ *   persona with the refused operation "plain spawn" and `opts.lastRead`,
+ *   the row state the ladder read before the kill and delete, and returns
+ *   `latched` (b.jg5 SRJ-501, `conflictAt`); any other error records
+ *   `spawn-failed` at startup and raises the spawn-failure notice.
  * - Success returns `spawned`.
  */
 async function replaceWithFreshSpawn(
@@ -3315,18 +3540,18 @@ async function replaceWithFreshSpawn(
   params: SpawnParams,
   isStartup: boolean,
   ref: string,
-  opts: { kill: boolean; killCall: AdKillCall },
+  opts: { kill: boolean; killCall: AdKillCall; lastRead: LatchRowState },
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   // b.jg5 SRJ-105: a refused kill stops the chain: no delete, no launch.
   if (opts.kill && !(await tryKill(key, opts.killCall, ref))) return { key, action: 'failed' }
   if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
 
-  const failed = (err: unknown, what: string): SpawnPersonaResult => {
+  const failed = async (err: unknown, what: string): Promise<SpawnPersonaResult> => {
     if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
       return { key, action: 'failed' }
     }
-    const refused = refusalAt(key, err, 'spawn', 'spawnForPersona', what, ref)
+    const refused = await launchRefusalAt(key, err, 'spawn', what, ref, opts.lastRead)
     if (refused) return refused
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
     console.error(`[slack] spawnForPersona: ${what} failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
@@ -3453,6 +3678,7 @@ async function diagnoseJsonlMissing(
   config: PersonaConfig,
   err: ErrJsonlMissing,
   isStartup: boolean,
+  read: { lastRead?: LatchRowState },
 ): Promise<'lost' | 'never-created' | 'inconclusive' | RefusedSiteResult> {
   const { key } = persona
   const ref = personaRef(persona)
@@ -3463,12 +3689,15 @@ async function diagnoseJsonlMissing(
   const adCandidates = parseJsonlMissingCandidates(err.errDescription ?? '')
 
   // --- 2. Fetch the row we are about to delete (best-effort). -------------
+  // b.jg5 SRJ-501: this get is the path's last read of the row before the
+  // spawn that follows the delete, so `read.lastRead` records what it gave.
   const claudeInstanceId = personaInstanceId(key)
   let row: GetResult | undefined
   try {
     row = await withOutageDetection(key, undefined, 'get', (client) =>
       client.get({ claude_instance_id: claudeInstanceId }),
     )
+    read.lastRead = latchRowStateRead(row.state)
   } catch (getErr) {
     // b.jg5 SRJ-105/SRJ-114: a read error on this get is a refusal (the get
     // runs inside the launch attempt, so it arms the retry timer; `get` is
@@ -3476,6 +3705,7 @@ async function diagnoseJsonlMissing(
     // no startup entry; the caller deletes nothing and launches nothing.
     const refused = refusalAt(key, getErr, 'get', 'spawnForPersona', 'ErrJsonlMissing diagnosis get', ref)
     if (refused) return refused
+    read.lastRead = hasAdErrorName(getErr, ERR_SPAWN_NOT_FOUND_NAME) ? LATCH_ROW_STATE_NO_ROW : LATCH_ROW_STATE_UNREADABLE
     // (a) Row already gone (ErrSpawnNotFound), or an UNUSABLE NAME answer —
     // cannot enrich or classify. Inconclusive: we could not consult
     // the row at all, so we do NOT know whether history was lost. Report it
@@ -3685,6 +3915,15 @@ function reportInconclusiveDiagnosis(
  * follows"), `ErrSystemInstallDisappeared` included, is a refusal through
  * `refusalAt`, at the resume and at each spawn after it.
  *
+ * b.jg5 SRJ-501, SRJ-113, SRJ-111: a CONFLICT at the resume, or at any
+ * spawn after it, latches the persona (`conflictAt`), with the refused
+ * operation "resume" or "plain spawn" and the row state the path last read
+ * before that call: `opts.lastRead` (the caller's last read: the collision
+ * `get`'s state, the working-row wait's last `status`, or the prompt row's
+ * re-read), or, for the spawn after `ErrJsonlMissing`, what its diagnosis
+ * `get` read. It answers `latched`: nothing is killed, deleted or launched
+ * after it.
+ *
  * @param row  The row returned by the collision `get` (its `labels`).
  */
 async function resumeOrFreshSpawn(
@@ -3693,18 +3932,19 @@ async function resumeOrFreshSpawn(
   config: PersonaConfig,
   isStartup: boolean,
   row: Pick<GetResult, 'cwd' | 'labels'>,
-  opts?: { reconcileMissingFirst?: boolean },
+  opts: { reconcileMissingFirst?: boolean; lastRead: LatchRowState },
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   const ref = personaRef(persona)
+  const { lastRead } = opts
   // The dead-session callers (reconcileMissingFirst) read the row `waiting`
   // or `working`, a live state; the other callers read it `ended` or
   // `missing`. A kill below declares which (b.jg5 glossary), except the
   // ErrSpawnNotResumable kill, whose row agent-director has just called live.
-  const killCall = adKillCall(opts?.reconcileMissingFirst === true)
+  const killCall = adKillCall(opts.reconcileMissingFirst === true)
   if (config.resume_enabled === false) {
     console.error(`[slack] spawnForPersona: resume_enabled=false — kill+delete+fresh for ${ref}`)
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true, killCall })
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true, killCall, lastRead })
   }
 
   // b.4dk: dead-session callers (state=waiting/working with a verified-dead
@@ -3723,7 +3963,7 @@ async function resumeOrFreshSpawn(
   // resume anyway (the ErrSpawnNotResumable → kill+delete+fresh branch is the
   // fallback). Prefer AD's findMissing verb over CSCB-side tmux probing per
   // docs/engineering-guide.md ("Avoiding Duplicated Effort").
-  if (opts?.reconcileMissingFirst) {
+  if (opts.reconcileMissingFirst) {
     if ((await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref)) === FIND_MISSING_REFUSED) {
       return { key, action: 'failed' }
     }
@@ -3752,7 +3992,7 @@ async function resumeOrFreshSpawn(
         `(${was}, now=${configDir.expectedConfigDirLabel} for claude_config_dir=${persona.claude_config_dir ?? '<default>'}) — ` +
         `not resuming; spawning fresh`,
     )
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: killCall.rowReadLive, killCall })
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: killCall.rowReadLive, killCall, lastRead })
   }
 
   // resume_enabled: attempt resume
@@ -3780,7 +4020,7 @@ async function resumeOrFreshSpawn(
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
           return { key, action: 'failed' }
         }
-        const refused = refusalAt(key, err2, 'spawn', 'spawnForPersona', 'self-heal spawn after ErrTmuxSessionCreate', ref)
+        const refused = await launchRefusalAt(key, err2, 'spawn', 'self-heal spawn after ErrTmuxSessionCreate', ref, lastRead)
         if (refused) return refused
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
@@ -3806,8 +4046,10 @@ async function resumeOrFreshSpawn(
       // delete, no launch; the ladder answers failed and markRefusal adds
       // `refused`.
       let jsonlDiagnosis: 'lost' | 'never-created' | 'inconclusive' | undefined
+      // b.jg5 SRJ-501: the diagnosis `get`, when made, is the last read before the spawn below.
+      const diagnosisRead: { lastRead?: LatchRowState } = {}
       if (err instanceof ErrJsonlMissing) {
-        const diagnosis = await diagnoseJsonlMissing(persona, config, err, isStartup)
+        const diagnosis = await diagnoseJsonlMissing(persona, config, err, isStartup, diagnosisRead)
         if (typeof diagnosis === 'object') return diagnosis
         jsonlDiagnosis = diagnosis
       }
@@ -3842,7 +4084,7 @@ async function resumeOrFreshSpawn(
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
           return { key, action: 'failed' }
         }
-        const refused = refusalAt(key, err2, 'spawn', 'spawnForPersona', 'fresh spawn after delete', ref)
+        const refused = await launchRefusalAt(key, err2, 'spawn', 'fresh spawn after delete', ref, diagnosisRead.lastRead ?? lastRead)
         if (refused) return refused
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: fresh spawn after delete failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
@@ -3869,7 +4111,7 @@ async function resumeOrFreshSpawn(
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
           return { key, action: 'failed' }
         }
-        const refused = refusalAt(key, err2, 'spawn', 'spawnForPersona', 'fresh spawn', ref)
+        const refused = await launchRefusalAt(key, err2, 'spawn', 'fresh spawn', ref, lastRead)
         if (refused) return refused
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         if (isStartup) recordStartupError('spawn-failed', `fresh spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
@@ -3892,7 +4134,8 @@ async function resumeOrFreshSpawn(
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
           return { key, action: 'failed' }
         }
-        const refused = refusalAt(key, err2, 'spawn', 'spawnForPersona', 'fresh spawn after ErrSpawnNotFound on resume', ref)
+        // b.jg5 SRJ-501: `resume` is not a read, so the last read is still the caller's.
+        const refused = await launchRefusalAt(key, err2, 'spawn', 'fresh spawn after ErrSpawnNotFound on resume', ref, lastRead)
         if (refused) return refused
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: fresh spawn after ErrSpawnNotFound on resume failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
@@ -3927,7 +4170,9 @@ async function resumeOrFreshSpawn(
     }
     // b.jg5 SRJ-104, SRJ-105: `ErrSystemInstallDisappeared` is UNCLASSIFIED
     // (its wrapper has raised `ad-unreachable`), a refusal like the others.
-    const refused = refusalAt(key, err, 'resume', 'spawnForPersona', 'resume', ref)
+    // b.jg5 SRJ-113: a CONFLICT latches the persona (refused operation
+    // "resume"); never a kill.
+    const refused = await launchRefusalAt(key, err, 'resume', 'resume', ref, lastRead)
     if (refused) return refused
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('resume', 'UnknownError', String(err))
     console.error(`[slack] spawnForPersona: resume failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
@@ -4095,6 +4340,10 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    key is in flight, a second call joins it and receives its result instead
  *    of starting a second ladder. The start's worker pool and the restart
  *    module's `launchSession` both come through here. Keys are independent.
+ * 1a. The latched gate (b.jg5 SRJ-502): a persona the installed latch
+ *    (`setConflictLatch`) holds latched answers `latched` before any other
+ *    step, with one log line naming its case, and nothing else runs. A call
+ *    joining a launch already in flight still gets that launch's result.
  * 2. Pre-launch claude_config_dir check (bug b.g57, `checkLaunchConfigDir`),
  *    dry run included: when the directory cannot be resolved to a real path,
  *    nothing else runs (no trust patch, no reply-guard step, no
@@ -4137,13 +4386,16 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    different label means delete + fresh spawn instead (resumeOrFreshSpawn).
  *    A directory that stopped resolving since step 2 keeps the row and
  *    returns `deferred` instead.
- * 6. Other errors → surface to Slack + (when isStartup) startup-errors.log.
+ * 6. A CONFLICT at any spawn or resume above latches the persona and
+ *    answers `latched` (b.jg5 SRJ-501, `conflictAt`); other errors → surface
+ *    to Slack + (when isStartup) startup-errors.log, except a refusal.
  * 7. Steps 4 to 6 run as a launch attempt for the key (b.jg5 SRJ-301,
  *    `runInAttempt`): an agent-director error there that the arming predicate
  *    answers a cause for arms the persona's retry timer through the installed
  *    trigger sink, and a `failed` result whose attempt's last agent-director
  *    error armed it carries the refusal marker (`refused`). A joining call,
- *    the claude_config_dir deferral and dry run are no attempt.
+ *    the latched gate, the claude_config_dir deferral and dry run are no
+ *    attempt.
  *
  * `hooks` belong to the ladder this call starts; a call that joins a launch
  * already in flight gets none of them.
@@ -4160,6 +4412,19 @@ export async function spawnForPersona(
   if (inFlight) {
     console.error(`[slack] spawnForPersona: launch already in flight for ${ref} — joining it`)
     return inFlight
+  }
+
+  // b.jg5 SRJ-502: a latched persona is not launched, whoever asks (the start
+  // pass, the bring-up controller, an apply's bring-up, a restart, a retry):
+  // no trust patch, no reply-guard step, no config-dir hold and no
+  // agent-director call. A latch that cannot be read counts as latched.
+  const latched = latchGateReadingOf(key)
+  if (latched !== undefined) {
+    const why = latched.failure === undefined ? 'it is latched' : `${latched.failure} — taken as latched`
+    console.error(
+      `[slack] spawnForPersona: not launching ${ref} — ${why} (case=${latched.latchCase}); no agent-director call (b.jg5 SRJ-502)`,
+    )
+    return { key, action: 'latched' }
   }
 
   const configDir = checkLaunchConfigDir(persona)
@@ -4269,7 +4534,8 @@ async function runPersonaLadder(
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
           return { key, action: 'failed' }
         }
-        const refused = refusalAt(key, err2, 'spawn', 'spawnForPersona', 'self-heal spawn after ErrTmuxSessionCreate', ref)
+        // b.jg5 SRJ-501: nothing of the row was read before this spawn.
+        const refused = await launchRefusalAt(key, err2, 'spawn', 'self-heal spawn after ErrTmuxSessionCreate', ref, NOTHING_READ)
         if (refused) return refused
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
@@ -4280,7 +4546,11 @@ async function runPersonaLadder(
     } else if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
       return { key, action: 'failed' }
     } else {
-      const refused = refusalAt(key, err, 'spawn', 'spawnForPersona', 'spawn', ref)
+      // b.jg5 SRJ-111: a CONFLICT (the pre-spawn scan's, or one after
+      // "duplicate session") latches the persona with the refused operation
+      // "plain spawn"; nothing of the row was read before this first spawn,
+      // so the latch-time `status` read gives its state.
+      const refused = await launchRefusalAt(key, err, 'spawn', 'spawn', ref, NOTHING_READ)
       if (refused) return refused
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
       console.error(`[slack] spawnForPersona: spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
@@ -4307,7 +4577,8 @@ async function runPersonaLadder(
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
           return { key, action: 'failed' }
         }
-        const refused = refusalAt(key, err2, 'spawn', 'spawnForPersona', 'retry-spawn', ref)
+        // b.jg5 SRJ-501: the collision `get` read no row.
+        const refused = await launchRefusalAt(key, err2, 'spawn', 'retry-spawn', ref, LATCH_ROW_STATE_NO_ROW)
         if (refused) return refused
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: retry-spawn also failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
@@ -4329,6 +4600,9 @@ async function runPersonaLadder(
 
   const { state } = row
   console.error(`[slack] spawnForPersona: collision resolved, state=${state} for ${ref}`)
+  // b.jg5 SRJ-501: the collision `get` is the path's last read until a later
+  // read replaces it (the working-row wait's, the prompt row's re-read).
+  const lastRead = latchRowStateRead(state)
 
   // b.av2 SR-6.2: a row in another directory (by real path) is never resumed,
   // reconnected or waited on, whatever its state and resume_enabled: kill,
@@ -4352,11 +4626,15 @@ async function runPersonaLadder(
     console.error(
       `[slack] spawnForPersona: ${ref} row cwd=${row.cwd || '<none>'} differs from working_directory=${persona.working_directory} (state=${state}) — replacing the row: kill+delete+fresh`,
     )
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true, killCall: adKillCall(AGENT_DIRECTOR_LIVE_STATES.has(state)) })
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, {
+      kill: true,
+      killCall: adKillCall(AGENT_DIRECTOR_LIVE_STATES.has(state)),
+      lastRead,
+    })
   }
 
   if (state === 'ended' || state === 'missing') {
-    return resumeOrFreshSpawn(persona, params, config, isStartup, row)
+    return resumeOrFreshSpawn(persona, params, config, isStartup, row, { lastRead })
   }
 
   if (state === 'waiting') {
@@ -4371,7 +4649,7 @@ async function runPersonaLadder(
     const { outcome, refused } = await reconnectMcpWithCause(key, ref)
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForPersona: dead session for ${ref} (state=waiting) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(persona, params, config, isStartup, row, { reconcileMissingFirst: true })
+      return resumeOrFreshSpawn(persona, params, config, isStartup, row, { reconcileMissingFirst: true, lastRead })
     }
     if (outcome !== 'ok') {
       console.error(`[slack] spawnForPersona: reconnect failed for ${ref}`)
@@ -4397,10 +4675,13 @@ async function runPersonaLadder(
     // b.f2b: the wait can take up to WAIT_FOR_WAITING_TIMEOUT_MS; tell the
     // caller (the start pass lets the launch go on in the background).
     hooks?.onWorkingRowWait?.()
-    const { outcome, refused } = await waitForWaitingAndReconnectWithCause(key, config, ref)
+    const { outcome, refused, lastRead: waitRead } = await waitForWaitingAndReconnectWithCause(key, config, ref)
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForPersona: dead session for ${ref} (state=working) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(persona, params, config, isStartup, row, { reconcileMissingFirst: true })
+      return resumeOrFreshSpawn(persona, params, config, isStartup, row, {
+        reconcileMissingFirst: true,
+        lastRead: waitRead ?? lastRead,
+      })
     }
     // b.f2b: report the real outcome, not `reconnected`. A wait its persona's
     // teardown cancelled typed nothing either, and its session is left to
@@ -4885,6 +5166,10 @@ export async function startupSessionManager(
         noop++
         succeeded++
         break
+      case 'latched':
+        // b.jg5 SRJ-502, SRJ-1015: not a failure and not a launch, so neither
+        // failed nor succeeded. The summary line has no `latched` count yet.
+        break
       case 'spawned':
       default:
         freshSpawned++
@@ -5092,7 +5377,9 @@ function createLaunchPool(size: number): <T>(task: () => Promise<T>) => Promise<
  * was reported as `reconnected`, so SR-25.1 counting is unchanged), false on
  * `failed` or when no applied persona has the key,
  * `'skipped'` for `deferred` (bug b.g57: its claude_config_dir cannot be
- * resolved; nothing was launched and its row is kept) and for a `failed`
+ * resolved; nothing was launched and its row is kept), for `latched` (b.jg5
+ * SRJ-502, SRJ-1015: the persona is latched, or latched at this launch;
+ * nothing more was launched, and the latch stops its retry timer) and for a `failed`
  * marked `stopping` (a resume's version re-check decided the stop), which
  * count toward no failure or cap, and `'refused'` for a `failed` carrying the
  * refusal marker (b.jg5 SRJ-301: its UNAVAILABLE retry timer owns the
@@ -5108,7 +5395,8 @@ export async function launchSession(
   const persona = config.personas.find((p) => p.key === key)
   if (!persona) return false
   const result = await spawnForPersona(persona, config, false)
-  if (result.action === 'deferred' || result.stopping) return 'skipped'
+  // b.jg5 SRJ-1015: a latched persona records nothing; the latch stops its retry timer.
+  if (result.action === 'deferred' || result.action === 'latched' || result.stopping) return 'skipped'
   if (result.refused) return 'refused'
   return result.action !== 'failed'
 }

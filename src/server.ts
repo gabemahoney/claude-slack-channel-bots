@@ -103,6 +103,7 @@ import {
   reconcileOrphans,
   reconnectMcpWithCause,
   setConfigDirUnresolvableHook,
+  setConflictLatch,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setSessionNotifier,
@@ -117,12 +118,14 @@ import {
   createTmuxUnresponsiveCondition,
   createUnclassifiedErrorEpisodes,
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  TMUX_UNRESPONSIVE_END_LATCHED,
   TMUX_UNRESPONSIVE_END_RETRY,
   TMUX_UNRESPONSIVE_END_TICK,
   UNCLASSIFIED_ERROR_END_CAPPED,
+  UNCLASSIFIED_ERROR_END_LATCHED,
   type PersonaEpisodes,
 } from './persona-episodes.ts'
-import { bindConflictNotice, createConflictLatch } from './conflict-latch.ts'
+import { bindConflictLatchHolds, bindConflictNotice, createConflictLatch } from './conflict-latch.ts'
 import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
@@ -200,6 +203,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
+  UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   type UnavailableRetryController,
@@ -1889,8 +1893,33 @@ export async function main(): Promise<void> {
   // bound to the notice episodes: a latch, or a relatch with a new case,
   // begins the persona's CONFLICT episode and posts the notice once through
   // the persona notifier; the same case posts nothing.
+  // b.jg5 SRJ-305, SRJ-310, SRJ-313, SRJ-502: its holds are bound first, so
+  // they run before the notice on every set: the persona's retry timer stops
+  // through the controller's `stop` with the latch's reason (never the
+  // condition-end entry, whose `pending` and kill-failure exceptions do not
+  // apply to a latch), its tmux-unresponsive condition ends silently (no
+  // recovery notice; the CONFLICT notice follows) and its unclassified-error
+  // episode ends. The three are built below; no latch can be set before the
+  // start pass, by which time they exist.
   const conflictLatch = createConflictLatch({ log: (line) => console.error(line) })
+  bindConflictLatchHolds(
+    conflictLatch,
+    {
+      stopRetryTimer: (key) => retryTimers.stop(key, UNAVAILABLE_RETRY_STOP_LATCHED),
+      endTmuxUnresponsive: (key) => {
+        tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_LATCHED, undefined, { silent: true })
+      },
+      endUnclassifiedError: (key) => {
+        unclassifiedErrors.end(key, UNCLASSIFIED_ERROR_END_LATCHED)
+      },
+    },
+    (line) => console.error(line),
+  )
   bindConflictNotice(conflictLatch, noticeEpisodes)
+  // b.jg5 SRJ-501, SRJ-502: the collision ladder latches through it on a
+  // CONFLICT at a spawn or resume, and launches no latched persona. The
+  // restart work, the retry action and the health tick ask it below.
+  setConflictLatch(conflictLatch)
 
   // b.jg5 SRJ-313, SRJ-1009: each persona's unclassified-error episode, held
   // in the notice episodes (so a teardown forgets it and shutdown closes it).
@@ -1930,7 +1959,7 @@ export async function main(): Promise<void> {
   // module's retry entry, and so through the one per-persona serializer
   // initRestart gets; a pending-only retry reads the persona's row with the
   // session manager's row read. Either stops on shutdown, a persona no longer
-  // applied, not up (the relaunch gate) or at the restart cap. The gate is built further down and
+  // applied, latched, not up (the relaunch gate) or at the restart cap. The gate is built further down and
   // initRestart runs later still: no statement in between awaits, and no
   // retry falls due before 30 s. Dry run arms nothing, since it makes no
   // agent-director call. b.jg5 SRJ-310: a retry that finds the persona's row
@@ -1975,6 +2004,8 @@ export async function main(): Promise<void> {
       canRelaunch: (key) => canRelaunch(key),
       isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
       isShuttingDown: () => shuttingDown,
+      // b.jg5 SRJ-303, SRJ-305: a retry of a latched persona makes no call and stops the timer.
+      isLatched: (key) => conflictLatch.isLatched(key),
       isInFlight: isPersonaWorkInFlight,
       readRow: readPersonaRowState,
       isSessionConnected: (key) => getSessionByPersona(key)?.connected === true,
@@ -2407,6 +2438,9 @@ export async function main(): Promise<void> {
     deferPendingRow: (key, reading) => {
       deferPendingRow(key, reading.launchStartedAt)
     },
+    // b.jg5 SRJ-502: a latched persona's restart work (a fired timer, a
+    // retry, a human-triggered restart) makes no agent-director call.
+    isLatched: (key) => conflictLatch.isLatched(key),
   })
 
   // b.av2 SR-6.3: the start sweep, BEFORE the trust patch and any spawn.
@@ -2496,6 +2530,9 @@ export async function main(): Promise<void> {
     // background for a `working` row), so the tick still reads the persona
     // but makes no attempt for it.
     isLaunchInFlight: isPersonaWorkInFlight,
+    // b.jg5 SRJ-315, SRJ-502: a latched persona is still read, but the tick
+    // makes no attempt for it.
+    isLatched: (key) => conflictLatch.isLatched(key),
     // b.jg5 SRJ-311: a persona held off on its `tmux-unavailable` outage that
     // the tick does not find healthy, with no retry timer on the controller
     // built above (a retry can stop with the flag still raised), gets one

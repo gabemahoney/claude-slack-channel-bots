@@ -65,6 +65,17 @@
  * (`escapeSlackControlCharacters`); so is the session name. Log lines stay
  * unescaped.
  *
+ * The holds (SRJ-305, SRJ-310, SRJ-313, SRJ-502): a second set observer
+ * ({@link createConflictLatchHoldObserver}, bound by
+ * {@link bindConflictLatchHolds} in `main()` before the notice) stops the
+ * persona's retry timer, ends its `tmux-unresponsive` condition silently and
+ * ends its unclassified-error episode on every set, through the injected
+ * {@link ConflictLatchHolds}. What else a latch holds back is asked of the
+ * latch where it happens: the collision ladder (`src/session-manager.ts`,
+ * which latches on a CONFLICT at a spawn or resume and launches no latched
+ * persona), the restart work, the retry action and the health tick, each
+ * through `isLatched`.
+ *
  * The recovery notice (SRJ-1005): {@link conflictRecoveryText},
  * {@link holdRecoveryText} and {@link latchRecoveryText} build it for either
  * latch kind ({@link LatchKind}) and one of five reasons
@@ -83,6 +94,7 @@
  *   [slack] conflict-latch: persona=<key> latched — case=<case> session="<name>" refused=<operation> state=<state>[ message="<description>"]
  *   [slack] conflict-latch: persona=<key> relatched — case=<case> (was <case>) session="<name>" refused=<operation> state=<state>[ message="<description>"]
  *   [slack] conflict-latch: persona=<key> set observer failed: <error>
+ *   [slack] conflict-latch: persona=<key> hold failed (<hold>): <error>
  *
  * where `<state>` is {@link describeLatchRowState}'s rendering. A same-case
  * set logs nothing. No line carries a token: the session name and the
@@ -876,4 +888,68 @@ export function createConflictNoticeObserver(episodes: ConflictNoticeEpisodes): 
  */
 export function bindConflictNotice(latch: Pick<ConflictLatch, 'addSetObserver'>, episodes: ConflictNoticeEpisodes): () => void {
   return latch.addSetObserver(createConflictNoticeObserver(episodes))
+}
+
+// ---------------------------------------------------------------------------
+// The holds (b.jg5 SRJ-305, SRJ-310, SRJ-313, SRJ-502)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a latch holds back at once for the persona, each given its key.
+ * `main()` binds them to the server's retry controller, its
+ * `tmux-unresponsive` condition and its unclassified-error episodes.
+ */
+export interface ConflictLatchHolds {
+  /** Stop the persona's retry timer with the latch's stop reason, through the controller's `stop` (SRJ-305: "P latches, whatever the case"). */
+  stopRetryTimer(key: string): void
+  /** End the persona's `tmux-unresponsive` condition silently: no recovery notice (SRJ-310). */
+  endTmuxUnresponsive(key: string): void
+  /** End the persona's unclassified-error episode with the latch's end reason (SRJ-313). */
+  endUnclassifiedError(key: string): void
+}
+
+/**
+ * The holds' set observer (b.jg5 SRJ-502): on every set, a latch, a relatch
+ * and a same-case set alike and whatever the case, it stops the persona's
+ * retry timer, then ends its `tmux-unresponsive` condition silently, then
+ * ends its unclassified-error episode, in that order. A same-case set runs
+ * them too: a refusal met while P was already latched (the latch-time
+ * `status` read's error included) may have armed the timer again. Each hold
+ * is isolated: one that throws is logged to `log` and the next still runs.
+ * Bound before the CONFLICT notice ({@link bindConflictLatchHolds}), so every
+ * hold is done by the time the notice is posted.
+ */
+export function createConflictLatchHoldObserver(
+  holds: ConflictLatchHolds,
+  log: (line: string) => void,
+): ConflictLatchSetObserver {
+  const steps: ReadonlyArray<readonly [string, (key: string) => void]> = [
+    ['retry timer stop', (key) => holds.stopRetryTimer(key)],
+    ['tmux-unresponsive end', (key) => holds.endTmuxUnresponsive(key)],
+    ['unclassified-error end', (key) => holds.endUnclassifiedError(key)],
+  ]
+  return ({ key }) => {
+    for (const [name, step] of steps) {
+      try {
+        step(key)
+      } catch (thrown) {
+        safeLog(log, `[slack] conflict-latch: persona=${key} hold failed (${name}): ${describeThrownValue(thrown)}`)
+      }
+    }
+  }
+}
+
+/**
+ * Bind the holds to `latch` as a set observer
+ * ({@link createConflictLatchHoldObserver}). Answers the observer's removal.
+ * Observers run in the order they were added, so `main()` binds the holds
+ * before the CONFLICT notice ({@link bindConflictNotice}): the timer is
+ * stopped and both episodes are ended before the notice is posted.
+ */
+export function bindConflictLatchHolds(
+  latch: Pick<ConflictLatch, 'addSetObserver'>,
+  holds: ConflictLatchHolds,
+  log: (line: string) => void,
+): () => void {
+  return latch.addSetObserver(createConflictLatchHoldObserver(holds, log))
 }

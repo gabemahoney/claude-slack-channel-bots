@@ -76,6 +76,21 @@
  * `onCapReached`, the teardown's forget) and a new episode alerting again;
  * the stop observer once per stop; and nothing armed or opened outside an
  * attempt.
+ * The latch (b.jg5 SRJ-305, SRJ-313, SRJ-502) runs on the harness with the
+ * latch composed as `main()` composes it (its holds, then the CONFLICT
+ * notice): a retry's launch answering CONFLICT stops P's timer with the
+ * latch's reason while the other persona's keeps its schedule; a start-pass
+ * launch's CONFLICT stops a timer armed in full mode (the kill-failure cause
+ * included) or pending-only; a failing latch-time `status` read's arm, and an
+ * UNCLASSIFIED one's episode, do not outlive the latch; a timer armed after
+ * the latch stops at its first fire with no call; and the latch ends an open
+ * unclassified-error episode before its alert. The retry action's latched
+ * gate and the restart work's `latched` outcome are rows of the stand-in
+ * tables. A latched query that throws counts as latched (SRJ-502, fail
+ * safe): the retry action's query, in both modes, over stand-ins and through
+ * the bare controller (its one line, then the stop line), and the restart
+ * work's query on the harness, each with no call and the other persona's
+ * retry untouched.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -94,6 +109,14 @@ import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_
 import { ERR_SCHEMA_MISMATCH_NAME, ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
+import {
+  CONFLICT_LATCH_SET_LATCHED,
+  LATCH_CASE_LEFTOVER,
+  LATCH_ROW_STATE_NO_ROW,
+  LATCH_ROW_STATE_UNREADABLE,
+  REFUSED_OPERATION_PLAIN_SPAWN,
+  type LatchRowState,
+} from '../src/conflict-latch.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
 import { LIVENESS_LIVE, LIVENESS_PENDING, LIVENESS_READING_UNKNOWN, type PendingLivenessReading } from '../src/liveness-reading.ts'
 import {
@@ -109,7 +132,7 @@ import {
 } from '../src/outage-state.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
-import { personaInstanceId } from '../src/persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
 import {
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
   TMUX_UNRESPONSIVE_END_RETRY,
@@ -121,6 +144,7 @@ import {
   tmuxUnresponsiveRecoveryText,
   UNCLASSIFIED_ERROR_END_CAPPED,
   UNCLASSIFIED_ERROR_END_CONDITION_ENDED,
+  UNCLASSIFIED_ERROR_END_LATCHED,
   UNCLASSIFIED_ERROR_END_RECOVERED,
   UNCLASSIFIED_ERROR_END_ROW_LIVE,
   unclassifiedErrorAlertText,
@@ -135,6 +159,7 @@ import {
   RESTART_OUTCOME_CAPPED,
   RESTART_OUTCOME_COUNTED_FAILURE,
   RESTART_OUTCOME_IN_FLIGHT,
+  RESTART_OUTCOME_LATCHED,
   RESTART_OUTCOME_LAUNCH_SKIPPED,
   RESTART_OUTCOME_LAUNCHED,
   RESTART_OUTCOME_LIVENESS_UNKNOWN,
@@ -194,6 +219,7 @@ import {
   UNAVAILABLE_RETRY_ROW_ABSENT,
   UNAVAILABLE_RETRY_ROW_PENDING,
   UNAVAILABLE_RETRY_STOP_CAPPED,
+  UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED,
   UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
   UNAVAILABLE_RETRY_STOP_NOT_UP,
@@ -236,6 +262,7 @@ import {
   errTmuxKillFailed,
   errTmuxNotAvailable,
   errTmuxNotAvailableDifferentServer,
+  errTmuxSessionConflict,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
   errUnusableName,
@@ -252,6 +279,7 @@ import {
   REDACTED_SENTINEL_TAIL,
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
+import { expectedConflictNotice } from './test-helpers/conflict-cases.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { startManualPoller } from './test-helpers/permission-relay-harness.ts'
 import {
@@ -1496,8 +1524,10 @@ const PENDING_ONLY_RETRY = { retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_
 
 /** The retry action's early stops, before any call, in order: each gate's stand-in overrides and its stop reason. */
 const GATES: ReadonlyArray<readonly [string, Partial<FullModeRetryDeps>, string]> = [
-  ['shutting down (before everything else)', { isShuttingDown: () => true, appliedPersona: () => undefined, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_SHUTDOWN],
-  ['not applied (before the up check)', { appliedPersona: () => undefined, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_APPLIED],
+  ['shutting down (before everything else)', { isShuttingDown: () => true, appliedPersona: () => undefined, isLatched: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_SHUTDOWN],
+  ['not applied (before the latched check)', { appliedPersona: () => undefined, isLatched: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_APPLIED],
+  // b.jg5 SRJ-303, SRJ-305: no attempt while P is latched; the timer stops instead.
+  ['latched (before the up check)', { isLatched: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_LATCHED],
   ['not up (before the cap)', { canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_UP],
   ['at the restart cap', { isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_CAPPED],
 ]
@@ -1510,6 +1540,7 @@ describe('unavailable retry: the retry action’s decisions over stand-ins', () 
     [RESTART_OUTCOME_NOT_UP, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_NOT_UP }],
     [RESTART_OUTCOME_LAUNCH_SKIPPED, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED }],
     [RESTART_OUTCOME_SHUTTING_DOWN, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_SHUTDOWN }],
+    [RESTART_OUTCOME_LATCHED, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_LATCHED }],
     [RESTART_OUTCOME_IN_FLIGHT, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT }],
     [RESTART_OUTCOME_REFUSED, { kind: 'again' }],
     [RESTART_OUTCOME_COUNTED_FAILURE, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED }],
@@ -3856,6 +3887,7 @@ const ALL_STOP_REASONS: readonly string[] = [
   UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED,
   UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED,
   UNAVAILABLE_RETRY_STOP_RUN_FAILED,
+  UNAVAILABLE_RETRY_STOP_LATCHED,
 ]
 
 /** One call a stop-observed run saw: the observer's (key, reason) or a hand-off's (key), each with the last line logged before it. */
@@ -5767,5 +5799,413 @@ describe('unavailable retry: the unclassified-error episode’s ends and the sto
     expect(h.episodeNotices).toEqual([])
     expect(getFailureCount(key)).toBe(0)
     expectUntouchedEpisode(h, other)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The latch's holds on the timer and the unclassified-error episode (b.jg5
+// SRJ-305, SRJ-313, SRJ-502), on the recovery harness with both settings 0:
+// the latch composed as `main()` composes it (the holds, then the notice)
+// ---------------------------------------------------------------------------
+
+/** A plain spawn's CONFLICT for persona `key`: its session left over from an earlier life ("duplicate session"). */
+function conflictFor(key: string): ReturnType<typeof errTmuxSessionConflict> {
+  return errTmuxSessionConflict('spawn', 'duplicate-session-leftover', personaTmuxSessionName(key))
+}
+
+/** The CONFLICT notice `conflictFor(key)` posts to persona `key`'s destination. */
+function conflictNotice(key: string, err: ReturnType<typeof conflictFor>): { key: string; text: string } {
+  const notice = expectedConflictNotice({ latchCase: LATCH_CASE_LEFTOVER, sessionName: personaTmuxSessionName(key), description: err.errDescription })
+  return { key, text: notice.text }
+}
+
+/** Every stub call made for persona `key`'s instance, over every verb. */
+function callsOf(h: RecoveryHarness, key: string): number {
+  const id = personaInstanceId(key)
+  return (Object.values(h.stub.calls).flat() as Array<{ claude_instance_id?: unknown }>).filter((params) => params?.claude_instance_id === id).length
+}
+
+/**
+ * Persona `key` latched once, at a plain spawn, on `err`, recording
+ * `rowState`; on that set the three holds ran, in order, before its one
+ * CONFLICT notice; it is not armed, and nothing failed or was counted: no
+ * spawn-failure notice, no startup-errors entry, no failure, no cap.
+ */
+function expectLatchedOnce(h: RecoveryHarness, key: string, err: ReturnType<typeof conflictFor>, rowState: LatchRowState): void {
+  expect(h.latch.isLatched(key)).toBe(true)
+  expect(h.latch.record(key)).toMatchObject({
+    sessionName: personaTmuxSessionName(key),
+    latchCase: LATCH_CASE_LEFTOVER,
+    refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN,
+    rowState,
+  })
+  const steps = h.latchEvents.filter((event) => event.key === key).map((event) =>
+    event.step === 'set' ? [event.step, event.outcome] : event.step === 'hold' ? [event.step, event.hold] : [event.step, event.text])
+  expect(steps).toEqual([
+    ['set', CONFLICT_LATCH_SET_LATCHED],
+    ['hold', 'retry timer stop'],
+    ['hold', 'tmux-unresponsive end'],
+    ['hold', 'unclassified-error end'],
+    ['notice', conflictNotice(key, err).text],
+  ])
+  expect(h.episodeNotices.filter((notice) => notice.key === key)).toEqual([conflictNotice(key, err)])
+  expect(h.controller.isArmed(key)).toBe(false)
+  expect(h.notices).toEqual([])
+  expect(h.startupErrors()).toEqual([])
+  expect(getFailureCount(key)).toBe(0)
+  expect(h.capReached).toEqual([])
+}
+
+/** How a case arms persona `key`'s timer before the latch: full mode with a cause, or pending-only. */
+const ARMED_MODES: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => void]> = [
+  ['in full mode (an UNAVAILABLE cause)', (h, key) => { h.controller.arm(key, UNAVAILABLE) }],
+  // SRJ-306's exceptions keep such a timer through a condition end; never through a latch.
+  ['in full mode (the kill-failure cause)', (h, key) => { h.controller.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }) }],
+  ['in pending-only mode', (h, key) => { h.controller.armPendingOnly(key) }],
+]
+
+/** The latch-time `status` read's failures: what it answers, and whether that opens P's unclassified-error episode. */
+const LATCH_TIME_READS: ReadonlyArray<readonly [string, () => Error, boolean]> = [
+  ['UNAVAILABLE (ErrCallTimeout)', () => errCallTimeout('status'), false],
+  ['UNCLASSIFIED (ErrInternal)', () => errInternal(), true],
+]
+
+describe('unavailable retry: a latch stops the timer and ends the unclassified-error episode (SRJ-305, SRJ-313, SRJ-502)', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test('a retry whose launch answers CONFLICT latches P and stops its timer with the latch’s reason, nothing pending for P; past several backoff waits nothing fires or is called for P, and the other persona’s timer keeps its schedule', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const refusal = errCallTimeout('spawn')
+    h.script({ spawnError: refusal })
+    const armedAt = h.clock.now()
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    await h.advance(waitMs(0) / 2)
+    const otherArmedAt = h.clock.now()
+    expect(await h.launch(other)).toEqual({ key: other, action: 'failed', refused: true })
+    expect(h.controller.armedKeys()).toEqual([key, other])
+    const otherView = h.controller.view(other)
+
+    // P's first retry: its liveness read finds no row, so it launches; the spawn answers CONFLICT.
+    const err = conflictFor(key)
+    h.script({ spawnError: err })
+    const before = callCounts(h)
+    expect(await retryNow(h, key)).toBe(armedAt + waitMs(0))
+    h.script({ spawnError: refusal })
+
+    // The liveness read, the kill of the dead reading and the spawn; after the
+    // CONFLICT no kill, delete, resume or second spawn (at most a status read).
+    const since = callsSince(h, before)
+    expect(since).toMatchObject({ killCalls: 1, spawnCalls: 1 })
+    expect(Object.keys(since).sort()).toEqual(['killCalls', 'spawnCalls', 'statusCalls'])
+    expectLatchedOnce(h, key, err, LATCH_ROW_STATE_NO_ROW)
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_LATCHED))
+    expect(h.controller.view(key)).toBeUndefined()
+    expect(h.controller.view(other)).toEqual(otherView)
+
+    const pCalls = callsOf(h, key)
+    const pAttempts = h.attempts.filter((attempt) => attempt.key === key).length
+    let otherDue = otherArmedAt
+    for (let n = 0; n < 4; n++) {
+      otherDue += waitMs(n)
+      expect(await retryNow(h, other)).toBe(otherDue)
+      expect([n, h.controller.view(other)]).toEqual([n, expect.objectContaining({ phase: 'waiting', dueAt: otherDue + waitMs(n + 1), refusals: n + 1 })])
+    }
+    expect(otherDue - armedAt).toBeGreaterThan(waitMs(0) + waitMs(1) + waitMs(2))
+    expect(callsOf(h, key)).toBe(pCalls)
+    expect(h.attempts.filter((attempt) => attempt.key === key)).toHaveLength(pAttempts)
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(h.controller.armedKeys()).toEqual([other])
+    expect(h.clock.pendingCount()).toBe(1)
+    expect(h.latch.isLatched(other)).toBe(false)
+  })
+
+  test.each(ARMED_MODES)('a start-pass launch answering CONFLICT while P’s timer is armed %s stops it with the latch’s reason; nothing fires for P however far the clock goes', async (_mode, arm) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    arm(h, key)
+    await h.advance(waitMs(0) / 2)
+    const err = conflictFor(key)
+    h.script({ spawnError: err })
+
+    expect(await h.launch(key)).toEqual({ key, action: 'latched' })
+
+    expect(callCounts(h)).toEqual({ spawnCalls: 1, statusCalls: 1 })
+    expectLatchedOnce(h, key, err, LATCH_ROW_STATE_NO_ROW)
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.advance(10 * UNAVAILABLE_RETRY_CEILING_S * 1000)
+    expect(h.attempts).toEqual([])
+    expect(callCounts(h)).toEqual({ spawnCalls: 1, statusCalls: 1 })
+    expectUntouchedEpisode(h, other)
+  })
+
+  test.each(LATCH_TIME_READS)('a start-pass launch’s first spawn answers CONFLICT and the latch-time status read answers %s: P latches with an unreadable row, the timer that read armed is stopped with nothing pending, and no episode stays open', async (_what, make, opensEpisode) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    const readErr = make()
+    const err = conflictFor(key)
+    h.script({ spawnError: err, statusError: readErr })
+
+    expect(await h.launch(key)).toEqual({ key, action: 'latched' })
+
+    expect(callCounts(h)).toEqual({ spawnCalls: 1, statusCalls: 1 })
+    expectLatchedOnce(h, key, err, LATCH_ROW_STATE_UNREADABLE)
+    // The read ran inside the launch attempt, so it armed P's timer; the latch's hold stopped it.
+    expect(h.triggers.map((trigger) => trigger.key)).toEqual([key])
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(h.unclassifiedErrorOpen(key)).toBe(false)
+    expect(unclassifiedLines(h, key)).toEqual(opensEpisode
+      ? [unclassifiedStartedLine(key, readErr), unclassifiedEndedLine(key, UNCLASSIFIED_ERROR_END_LATCHED)]
+      : [])
+
+    await h.advance(2 * adAlertThresholdMsInEffect())
+    expect(h.attempts).toEqual([])
+    expect(callCounts(h)).toEqual({ spawnCalls: 1, statusCalls: 1 })
+    expect(h.episodeNotices).toEqual([conflictNotice(key, err)])
+    expectUntouchedEpisode(h, other)
+  })
+
+  test.each(ARMED_MODES)('a timer armed for P after the latch %s stops at its first fire with the latch’s reason and no agent-director call', async (_mode, arm) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const err = conflictFor(key)
+    h.script({ spawnError: err })
+    expect(await h.launch(key)).toEqual({ key, action: 'latched' })
+    expectLatchedOnce(h, key, err, LATCH_ROW_STATE_NO_ROW)
+    expect(h.stops).toEqual([])
+
+    arm(h, key)
+    const before = callCounts(h)
+    const due = await retryNow(h, key)
+
+    expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, at: due })])
+    expect(callsSince(h, before)).toEqual({})
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(retryLinesOf(h, key).at(-1)).toContain(` — ${UNAVAILABLE_RETRY_STOP_LATCHED}`)
+    expect(h.controller.isArmed(key)).toBe(false)
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.advance(10 * UNAVAILABLE_RETRY_CEILING_S * 1000)
+    expect(h.attempts).toHaveLength(1)
+    expect(h.episodeNotices).toEqual([conflictNotice(key, err)])
+    expectUntouchedEpisode(h, other)
+  })
+
+  test('P’s retries meet ErrInternal, so its episode is open; a later retry refused with CONFLICT ends it with the latch’s reason, and past the alert threshold in effect no unclassified alert posts: one CONFLICT post, nothing counted', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const unclassified = errInternal()
+    const armedAt = await unclassifiedLaunch(h, key, unclassified)
+    const thresholdMs = adAlertThresholdMsInEffect()
+    const alert = alertRetry(armedAt, thresholdMs)
+    // At least one retry meets ErrInternal, and the CONFLICT retry still comes before the alert's.
+    expect(alert.retry).toBeGreaterThan(2)
+    for (let n = 0; n < alert.retry - 2; n++) await retryNow(h, key)
+    expect(h.unclassifiedErrorOpen(key)).toBe(true)
+    expect(h.episodeNotices).toEqual([])
+
+    const err = conflictFor(key)
+    h.script({ spawnError: err })
+    const conflictAt = await retryNow(h, key)
+
+    expect(conflictAt).toBeLessThan(alert.dueAt)
+    expectLatchedOnce(h, key, err, LATCH_ROW_STATE_NO_ROW)
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(h.unclassifiedErrorOpen(key)).toBe(false)
+    expect(unclassifiedLines(h, key)).toEqual([
+      unclassifiedStartedLine(key, unclassified),
+      unclassifiedEndedLine(key, UNCLASSIFIED_ERROR_END_LATCHED),
+    ])
+
+    const attempts = h.attempts.length
+    await h.advance(armedAt + 2 * thresholdMs - h.clock.now())
+    expect(h.attempts).toHaveLength(attempts)
+    expect(h.episodeNotices).toEqual([conflictNotice(key, err)])
+    expect(unclassifiedLines(h, key)).toHaveLength(2)
+    expect(h.clock.pendingCount()).toBe(0)
+    expectNeverDestructive(h, key)
+    expectUntouchedEpisode(h, other)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A latched query that throws counts as latched (b.jg5 SRJ-502, fail safe):
+// the retry action's own query, in both modes, over stand-ins and through the
+// bare controller; and the restart work's query, on the recovery harness
+// ---------------------------------------------------------------------------
+
+/** The thrown latched query's error: a fake token in its message, the bare sentinel in a field CSCB never reads. */
+function latchedQueryBroke(): Error {
+  return Object.assign(new Error(`latched query broke (${sentinelInMessage('latched')})`), { note: LEAK_SENTINEL })
+}
+
+/** KEY's latched query throws; OTHER's answers false. */
+function throwingForKey(key: string): boolean {
+  if (key === KEY) throw latchedQueryBroke()
+  return false
+}
+
+/** The retry action's line for KEY's thrown latched query begins with this (then its stack frames). */
+const LATCHED_QUERY_FAILED_PREFIX =
+  `[slack] unavailable-retry: persona=${KEY} the latched query failed: Error message="latched query broke (${REDACTED_SENTINEL_TAIL})" at `
+/** …and ends with this. */
+const LATCHED_QUERY_FAILED_SUFFIX = ' — taken as latched; no agent-director call'
+
+/** The first retry for persona `key` in each mode, and how a bare controller arms it. */
+const LATCHED_QUERY_MODES = [
+  [UNAVAILABLE_RETRY_MODE_FULL, FULL_RETRY, (c: UnavailableRetryController, key: string) => { c.arm(key, UNAVAILABLE) }, (key: string) => stoppedLine(key, UNAVAILABLE_RETRY_STOP_LATCHED)],
+  [UNAVAILABLE_RETRY_MODE_PENDING_ONLY, PENDING_ONLY_RETRY, (c: UnavailableRetryController, key: string) => { c.armPendingOnly(key) }, (key: string) => pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_LATCHED)],
+] as const
+
+describe('unavailable retry: a latched query that throws counts as latched (SRJ-502, fail safe)', () => {
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+
+  beforeEach(() => {
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    assertNoLeak({ errLines })
+  })
+
+  /** Stand-ins over both personas, KEY's latched query throwing, recording which later gates were asked. */
+  function throwingQueryDeps(asked: string[]): StandInDeps {
+    return fullModeDeps(RESTART_OUTCOME_LAUNCHED, {
+      isLatched: throwingForKey,
+      appliedPersona: (key) => ({ working_directory: `/work/${key}` }),
+      canRelaunch: (key) => { asked.push(`up ${key}`); return true },
+      isAtCap: (key) => { asked.push(`cap ${key}`); return false },
+      isInFlight: (key) => { asked.push(`in-flight ${key}`); return false },
+    }, UNAVAILABLE_RETRY_ROW_PENDING)
+  }
+
+  test.each(LATCHED_QUERY_MODES)('%s mode, over stand-ins: KEY stops with the latch’s reason before the up and cap checks, the row read and the retry entry, logging one line naming what the query threw; OTHER’s retry runs as before', async (mode, attempt) => {
+    const asked: string[] = []
+    const deps = throwingQueryDeps(asked)
+    const action = createFullModeRetryAction(deps)
+
+    expect(await action(KEY, attempt)).toEqual({ kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_LATCHED })
+
+    expect(asked).toEqual([])
+    expect(deps.calls).toEqual([])
+    expect(deps.reads).toEqual([])
+    expect(errLines).toHaveLength(1)
+    expect(errLines[0]).toStartWith(LATCHED_QUERY_FAILED_PREFIX)
+    expect(errLines[0]).toEndWith(LATCHED_QUERY_FAILED_SUFFIX)
+
+    const answer = await action(OTHER, attempt)
+    if (mode === UNAVAILABLE_RETRY_MODE_FULL) {
+      expect(answer).toMatchObject({ kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED })
+      expect(deps.calls).toEqual([[OTHER, `/work/${OTHER}`]])
+      expect(deps.reads).toEqual([])
+    } else {
+      expect(answer).toMatchObject({ kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_ROW_PENDING })
+      expect(deps.calls).toEqual([])
+      expect(deps.reads).toEqual([[OTHER, true]])
+    }
+    expect(asked).toEqual([`up ${OTHER}`, `cap ${OTHER}`, ...(mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY ? [`in-flight ${OTHER}`] : [])])
+    expect(errLines).toHaveLength(1)
+  })
+
+  test.each(LATCHED_QUERY_MODES)('%s mode, through the bare controller: KEY’s timer logs the query’s line, then its usual stopped line, and is observed stopped once with the latch’s reason; nothing more fires for KEY, and OTHER stays armed', async (_mode, _attempt, arm, stopLine) => {
+    const asked: string[] = []
+    const deps = throwingQueryDeps(asked)
+    const run = stopRun('recording')
+    const rig = run.build(createFullModeRetryAction(deps))
+    // One ordered list: the action's console line and the controller's lines.
+    console.error = (...args: unknown[]) => {
+      const line = args.map(String).join(' ')
+      errLines.push(line)
+      rig.lines.push(line)
+    }
+    arm(rig.controller, KEY)
+    await rig.clock.advance(waitMs(0) / 2)
+    arm(rig.controller, OTHER)
+
+    await retryOnce(rig, KEY)
+
+    const keyLines = rig.lines.filter((line) => line.startsWith(`[slack] unavailable-retry: persona=${KEY} `))
+    expect(keyLines.at(-1)).toBe(stopLine(KEY))
+    expect(keyLines.at(-2)).toStartWith(LATCHED_QUERY_FAILED_PREFIX)
+    expect(keyLines.at(-2)).toEndWith(LATCHED_QUERY_FAILED_SUFFIX)
+    expect(keyLines.filter((line) => line.includes('the latched query failed'))).toHaveLength(1)
+    expect(run.steps).toEqual([['stopped', KEY, UNAVAILABLE_RETRY_STOP_LATCHED, stopLine(KEY)]])
+    expect(rig.controller.isArmed(KEY)).toBe(false)
+    expect(deps.calls).toEqual([])
+    expect(deps.reads).toEqual([])
+    expect(asked).toEqual([])
+
+    // OTHER's retry, due later, runs as before and is not stopped.
+    expect(rig.attempts.map((a) => a.key)).toEqual([KEY])
+    await retryOnce(rig, OTHER)
+    expect(rig.attempts.map((a) => a.key)).toEqual([KEY, OTHER])
+    expect(rig.controller.isArmed(OTHER)).toBe(true)
+    expect([...deps.calls.map(([key]) => key), ...deps.reads.map(([key]) => key)]).toEqual([OTHER])
+    expect(run.steps).toHaveLength(1)
+    expect(errLines).toHaveLength(1)
+  })
+})
+
+describe('unavailable retry: a restart work whose latched query throws stops the timer (SRJ-502, fail safe), on the harness', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test('a full-mode retry whose restart work’s latched query throws for P stops P’s timer with the latch’s reason: no agent-director call, nothing counted, one skip line naming what it threw; the other persona’s timer keeps its schedule', async () => {
+    const h = (harness = makeRecoveryHarness({
+      restartDeps: {
+        isLatched: (key) => {
+          if (key === h.keys[0]) throw latchedQueryBroke()
+          return false
+        },
+      },
+    }))
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    h.controller.arm(key, UNAVAILABLE)
+    await h.advance(waitMs(0) / 2)
+    h.controller.arm(other, UNAVAILABLE)
+    const otherView = h.controller.view(other)
+
+    const before = callCounts(h)
+    await retryNow(h, key)
+
+    expect(callsSince(h, before)).toEqual({})
+    expect(callsOf(h, key)).toBe(0)
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_LATCHED))
+    expect(h.controller.isArmed(key)).toBe(false)
+    const skip = h.errors.filter((line) => line.startsWith(`[slack] Skipping restart for persona=${key} `))
+    expect(skip).toHaveLength(1)
+    expect(skip[0]).toStartWith(
+      `[slack] Skipping restart for persona=${key} — the persona is latched (the latched query failed: Error message="latched query broke (${REDACTED_SENTINEL_TAIL})" at `,
+    )
+    expect(skip[0]).toEndWith(' — taken as latched); no agent-director call, nothing recorded (b.jg5 SRJ-502)')
+    expectNeverDestructive(h, key)
+    expect(h.latch.isLatched(key)).toBe(false)
+
+    // The other persona's timer was not touched, and its retry still runs.
+    expect(h.controller.view(other)).toEqual(otherView)
+    const attempts = h.attempts.length
+    await retryNow(h, other)
+    expect(h.attempts).toHaveLength(attempts + 1)
+    expect(h.attempts.at(-1)).toMatchObject({ key: other })
+    expect(callsOf(h, other)).toBeGreaterThan(0)
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(callsOf(h, key)).toBe(0)
   })
 })

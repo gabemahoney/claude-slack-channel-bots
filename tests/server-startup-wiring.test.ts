@@ -164,6 +164,20 @@
  *   main()'s own statement list before the retry controller and the start
  *   pass, to that latch and the one notice episodes instance, and nothing
  *   else in server.ts adds a set observer.
+ * - b.jg5 SRJ-502 / SRJ-305 / SRJ-310 / SRJ-313 / SRJ-315: the latch's holds
+ *   are bound once (`bindConflictLatchHolds`), in main()'s own statement list,
+ *   to that latch and the server log, before its notice is bound (so they run
+ *   before the notice) and before the start pass; they are exactly the retry
+ *   controller's `stop` with `UNAVAILABLE_RETRY_STOP_LATCHED`, the
+ *   tmux-unresponsive condition's silent `end` with
+ *   `TMUX_UNRESPONSIVE_END_LATCHED` and the unclassified-error episodes'
+ *   `end` with `UNCLASSIFIED_ERROR_END_LATCHED`. The latch is installed in
+ *   the session manager once (`setConflictLatch`), after both bindings and
+ *   before the retry controller and the start pass, with no await before the
+ *   holds' targets are built; its `isLatched` is bound, as a call-time read,
+ *   into the full-mode retry action, `initRestart` and `initHealthCheck`, and
+ *   the latch is named nowhere else. The condition's three ends and the
+ *   unclassified episodes' two ends are each located in their binding.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -210,7 +224,7 @@ import type * as ServerModule from '../src/server.ts'
 import type { RestartDeps } from '../src/restart.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
 import type * as ConflictLatchModule from '../src/conflict-latch.ts'
-import type { ConflictLatch, ConflictLatchDeps } from '../src/conflict-latch.ts'
+import type { ConflictLatch, ConflictLatchDeps, ConflictLatchHolds } from '../src/conflict-latch.ts'
 import type * as PersonaEpisodesModule from '../src/persona-episodes.ts'
 import type {
   PersonaEpisodes,
@@ -223,6 +237,7 @@ import type {
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
 import type { FullModeRetryDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
 import type * as LivenessReadingModule from '../src/liveness-reading.ts'
+import type * as SessionManagerModule from '../src/session-manager.ts'
 import type { HealthCheckDeps } from '../src/health-check.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
 import type { OutageClass, OutageStateDeps } from '../src/outage-state.ts'
@@ -274,6 +289,26 @@ function declaredOnce(name: string): void {
 /** A pattern for the call pattern `call` as the one statement of a `try` whose `catch` swallows (its body empty once comments are stripped). */
 function isolated(call: string): string {
   return `try \\{ ${call};? \\} catch(?: \\(\\w+\\))? \\{ \\}`
+}
+
+/** The latch's holds binder (b.jg5 SRJ-502); renaming it fails the typecheck. */
+const BIND_LATCH_HOLDS: keyof typeof ConflictLatchModule = 'bindConflictLatchHolds'
+/** The latch's three holds (b.jg5 SRJ-305, SRJ-310, SRJ-313); renaming one fails the typecheck. */
+const HOLD_STOP_RETRY: keyof ConflictLatchHolds = 'stopRetryTimer'
+const HOLD_END_TMUX: keyof ConflictLatchHolds = 'endTmuxUnresponsive'
+const HOLD_END_UNCLASSIFIED: keyof ConflictLatchHolds = 'endUnclassifiedError'
+
+/**
+ * b.jg5 SRJ-502: the holds object main() binds to the latch, as its
+ * properties (name → value text). Fails unless the binder is called exactly
+ * once, with three arguments (the latch, the holds, the log), and its second
+ * is an object literal.
+ */
+function latchHoldProps(): Map<string, string> {
+  const args = onlyCallArgs(BIND_LATCH_HOLDS)
+  expect(args).toHaveLength(3)
+  expect(args[1]!.startsWith('{')).toBe(true)
+  return objectProperties(args[1]!)
 }
 
 /** The retry action's in-flight member (b.jg5 SRJ-301); renaming it fails the typecheck. */
@@ -1847,14 +1882,16 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
     expect(importSource(SERVER_CODE, 'hasSessionStream')).toBe('./persona-routing.ts')
   })
 
-  test('the tick\'s and the retry\'s hooks are the only ends server.ts calls on the condition', () => {
+  test('the tick\'s and the retry\'s hooks and the latch\'s silent-end hold (b.jg5 SRJ-310, SRJ-502) are the only ends server.ts calls on the condition, one each', () => {
     const condition = constOf(FACTORY)
     const ends = indicesOf(new RegExp(`\\b${condition}\\s*[?!]?\\.\\s*${END}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(ends).toHaveLength(2)
+    expect(ends).toHaveLength(3)
     const tickHook = onlyCallProps('initHealthCheck').get(TICK_HOOK)!
     const retryHook = onlyCallProps('createFullModeRetryAction').get(RETRY_HOOK)!
+    // What the hold's end passes is pinned in the latch holds' describe below.
+    const latchHold = latchHoldProps().get(HOLD_END_TMUX)!
     const endCall = new RegExp(`\\b${condition}\\.${END}\\(`, 'g')
-    expect((tickHook.match(endCall) ?? []).length + (retryHook.match(endCall) ?? []).length).toBe(2)
+    expect([tickHook, retryHook, latchHold].map((hook) => (hook.match(endCall) ?? []).length)).toEqual([1, 1, 1])
   })
 
   test('the condition\'s end hook is the retry controller\'s condition-end entry, for the persona it is given, the tmux-unresponsive condition and the end\'s reading', () => {
@@ -2230,14 +2267,26 @@ describe('main() builds the one unclassified-error episodes instance over the no
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+(?:notifyRestartCapReached|${END_CAPPED})\\b`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('the instance is named only at its build, as the sink, in the stop observer and in onCapReached: its end and stop entries are called from those bindings alone, and server.ts reports to it directly nowhere', () => {
+  test('the instance is named only at its build, as the sink, in the stop observer, in onCapReached and in the latch\'s unclassified hold (b.jg5 SRJ-502): its end and stop entries are called from those bindings alone, and server.ts reports to it directly nowhere', () => {
     const unclassified = constOf(FACTORY)
-    expect(indicesOf(new RegExp(`\\b${unclassified}\\b`, 'g'), SERVER_CODE)).toHaveLength(4)
+    const named = indicesOf(new RegExp(`\\b${unclassified}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(5)
+    // Each use located: the declaration, and one inside each binding (the
+    // latch's hold names it before its declaration, as a call-time read).
+    const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${unclassified}\\b`))!
+    expect(named).toContain(decl.index! + decl[0].length - unclassified.length)
+    const within = (call: string) => {
+      const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf(call), '(', ')')
+      return named.filter((at) => at > open && at < close).length
+    }
+    expect([within('initOutageState'), within('createUnavailableRetryController'), within('initRestart'), within(BIND_LATCH_HOLDS)]).toEqual([1, 1, 1, 1])
+
     const calls = (entry: string) => indicesOf(new RegExp(`\\b${unclassified}\\s*[?!]?\\.\\s*${entry}\\s*\\(`, 'g'), SERVER_CODE)
     expect(calls(REPORT)).toEqual([])
-    expect(calls(END)).toHaveLength(1)
+    expect(calls(END)).toHaveLength(2)
     expect(calls(RETRY_STOPPED_ENTRY)).toHaveLength(1)
     expect(onlyCallProps('initRestart').get(CAP_REACHED)).toContain(`${unclassified}.${END}(`)
+    expect(latchHoldProps().get(HOLD_END_UNCLASSIFIED)).toContain(`${unclassified}.${END}(`)
     expect(onlyCallProps('createUnavailableRetryController').get(RETRY_STOPPED)).toContain(`${unclassified}.${RETRY_STOPPED_ENTRY}(`)
   })
 })
@@ -2319,20 +2368,31 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(indicesOf(new RegExp(`\\.\\s*${ADD_OBSERVER}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build and its binding, and the latch module imports no file-system module', () => {
+  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build, its two bindings, its install and its three latched queries, and the latch module imports no file-system module', () => {
     const latch = constOf(FACTORY)
 
-    // No seed: no statement in main()'s own list records a latch.
+    // No seed: no statement in main()'s own list records a latch, and nothing
+    // in server.ts calls a set entry on it at all.
     const sets = indicesOf(new RegExp(`\\b${latch}\\s*[?!]?\\.\\s*(?:${SET}|${SET_FROM_CONFLICT})\\s*\\(`, 'g'), SERVER_CODE)
     for (const set of sets) expect(atMainTopLevel(SERVER_CODE, set)).toBe(false)
+    expect(sets).toEqual([])
 
-    // Named only at its build and as the binding's first argument.
+    // Named only at its build, then once inside each of: the holds' binding
+    // and the notice's binding (b.jg5 SRJ-502, SRJ-508), the session
+    // manager's install, and the retry action's, the restart module's and the
+    // health check's latched queries (their forms are pinned in the describe
+    // below).
     const named = indicesOf(new RegExp(`\\b${latch}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(2)
+    expect(named).toHaveLength(7)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${latch}\\b`))!
     expect(named[0]).toBe(decl.index! + decl[0].length - latch.length)
-    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf(BIND), '(', ')')
-    expect(named[1]! >= open && named[1]! < close).toBe(true)
+    const within = (call: string) => {
+      const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf(call), '(', ')')
+      return named.filter((at) => at >= open && at < close).length
+    }
+    expect(
+      [BIND_LATCH_HOLDS, BIND, 'setConflictLatch', 'createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map(within),
+    ).toEqual([1, 1, 1, 1, 1, 1])
 
     // The factory itself reads no file: the latch module imports no
     // file-system module and opens no file through Bun.
@@ -2340,6 +2400,163 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(indicesOf(/\bfrom\s*['"](?:node:)?fs(?:\/promises)?['"]/g, latchCode)).toEqual([])
     expect(indicesOf(/\brequire\s*\(/g, latchCode)).toEqual([])
     expect(indicesOf(/\bBun\s*\.\s*file\s*\(/g, latchCode)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-502 / SRJ-305 / SRJ-310 / SRJ-313 / SRJ-315 — what
+// the latch holds back: its hold observer, its install in the session
+// manager and its latched query
+//
+// Every one of these bindings is optional or takes any body: absent, the
+// session manager has no latch (a CONFLICT logs one line and nothing is
+// latched for later launches to ask), the restart work, the retry action and
+// the health tick read every persona as not latched (each attempts again for
+// a latched persona), and a latch leaves its retry timer running, its
+// tmux-unresponsive condition open (a recovery posted later, or never) and its
+// unclassified-error episode open. Observers run in the order they are added,
+// so holds bound after the notice would post the CONFLICT notice with the
+// timer still armed. A production wiring that dropped one, bound it twice,
+// bound it to a no-op, the wrong reason or the condition-end entry (whose
+// SRJ-306 exceptions must not apply to a latch), or installed the latch after
+// the start pass would type-check and pass every behaviour suite. What each
+// does is tested in tests/conflict-latch.test.ts, tests/session-manager.test.ts,
+// tests/restart.test.ts, tests/unavailable-retry.test.ts and
+// tests/health-check.test.ts; pinned here: the bindings.
+// ---------------------------------------------------------------------------
+
+describe('main() binds the latch\'s holds before its CONFLICT notice, installs the latch in the session manager before the start pass, and binds its latched query into the retry action, the restart work and the health tick (b.jg5 SRJ-502, SRJ-305, SRJ-310, SRJ-313, SRJ-315)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatch'
+  const BIND_NOTICE: keyof typeof ConflictLatchModule = 'bindConflictNotice'
+  const HOLD_OBSERVER_FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatchHoldObserver'
+  const IS_LATCHED: keyof ConflictLatch = 'isLatched'
+  const RETRY_LATCHED: keyof FullModeRetryDeps = 'isLatched'
+  const RESTART_LATCHED: keyof RestartDeps = 'isLatched'
+  const TICK_LATCHED: keyof HealthCheckDeps = 'isLatched'
+  const STOP: keyof UnavailableRetryController = 'stop'
+  const CONDITION_END: keyof TmuxUnresponsiveCondition = 'end'
+  const EPISODE_END: keyof UnclassifiedErrorEpisodes = 'end'
+  const STOP_LATCHED: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_STOP_LATCHED'
+  const TMUX_END_LATCHED: keyof typeof PersonaEpisodesModule = 'TMUX_UNRESPONSIVE_END_LATCHED'
+  const UNCLASSIFIED_END_LATCHED: keyof typeof PersonaEpisodesModule = 'UNCLASSIFIED_ERROR_END_LATCHED'
+  const INSTALL: keyof typeof SessionManagerModule = 'setConflictLatch'
+
+  /** Every path that can launch, and so latch or meet a latched persona: the retry controller's retries, the restart module, the start bring-up and the health check. */
+  function startPass(): number[] {
+    return [
+      onlyCallOf('createUnavailableRetryController'),
+      onlyCallOf('initRestart'),
+      startResolution(SERVER_CODE).bringUpAt,
+      onlyCallOf('initHealthCheck'),
+    ]
+  }
+
+  /** `(key) => <call>` or `(key) => { <call> }`, `<call>` given `\1` for the parameter, whose name is free. */
+  function oneKeyArrow(call: string): RegExp {
+    return new RegExp(`^\\(?(\\w+)\\)? => (?:\\{ ${call};? \\}|${call})$`)
+  }
+
+  /** `name` is imported from `module` and declared nowhere in server.ts. */
+  function importedOnly(name: string, module: string): void {
+    expect(importSource(SERVER_CODE, name)).toBe(module)
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)).toEqual([])
+  }
+
+  test('the holds are bound exactly once, in main()\'s own statement list, to the one latch with the server log, after the latch is built and BEFORE its CONFLICT notice is bound (set observers run in the order they are added), and before the start pass; server.ts builds no hold observer by hand', () => {
+    const at = onlyCallOf(BIND_LATCH_HOLDS)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    importedOnly(BIND_LATCH_HOLDS, './conflict-latch.ts')
+
+    const [latch, , log] = onlyCallArgs(BIND_LATCH_HOLDS)
+    expect(latch).toBe(constOf(FACTORY))
+    expect(log).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+
+    expect(at).toBeGreaterThan(onlyCallOf(FACTORY))
+    expect(at).toBeLessThan(onlyCallOf(BIND_NOTICE))
+    for (const later of startPass()) expect(at).toBeLessThan(later)
+
+    expect(callsOf(HOLD_OBSERVER_FACTORY)).toEqual([])
+  })
+
+  test('the holds are exactly three: the retry timer stop, the silent end of tmux-unresponsive and the end of the unclassified-error episode', () => {
+    expect([...latchHoldProps().keys()].sort()).toEqual([HOLD_STOP_RETRY, HOLD_END_TMUX, HOLD_END_UNCLASSIFIED].sort())
+  })
+
+  test('the retry-timer hold stops the persona\'s timer on the one retry controller through its stop entry, with the latch\'s own stop reason, never through the condition-end entry (b.jg5 SRJ-305)', () => {
+    const controller = constOf('createUnavailableRetryController')
+    declaredOnce(controller)
+    const hold = latchHoldProps().get(HOLD_STOP_RETRY)
+    expect(hold).toMatch(oneKeyArrow(`${controller}\\.${STOP}\\(\\1, ${STOP_LATCHED}\\)`))
+    expect(hold).not.toContain('conditionEnded')
+    importedOnly(STOP_LATCHED, './unavailable-retry.ts')
+    // The latch's reason is named only by its import and this hold.
+    expect(indicesOf(new RegExp(`\\b${STOP_LATCHED}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+  })
+
+  test('the tmux-unresponsive hold ends the one condition silently (no recovery notice), for the persona it is given, with the latch\'s end reason and no reading (b.jg5 SRJ-310)', () => {
+    const condition = constOf('createTmuxUnresponsiveCondition')
+    declaredOnce(condition)
+    const hold = latchHoldProps().get(HOLD_END_TMUX)
+    expect(hold).toMatch(oneKeyArrow(`${condition}\\.${CONDITION_END}\\(\\1, ${TMUX_END_LATCHED}, undefined, \\{ silent: true \\}\\)`))
+    importedOnly(TMUX_END_LATCHED, './persona-episodes.ts')
+    expect(indicesOf(new RegExp(`\\b${TMUX_END_LATCHED}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    // The hold's is server.ts's only silent end.
+    expect(indicesOf(/\bsilent\s*:/g, SERVER_CODE)).toHaveLength(1)
+  })
+
+  test('the unclassified hold ends the persona\'s episode on the one unclassified-error episodes instance, with the latch\'s end reason (b.jg5 SRJ-313)', () => {
+    const unclassified = constOf('createUnclassifiedErrorEpisodes')
+    declaredOnce(unclassified)
+    const hold = latchHoldProps().get(HOLD_END_UNCLASSIFIED)
+    expect(hold).toMatch(oneKeyArrow(`${unclassified}\\.${EPISODE_END}\\(\\1, ${UNCLASSIFIED_END_LATCHED}\\)`))
+    importedOnly(UNCLASSIFIED_END_LATCHED, './persona-episodes.ts')
+    expect(indicesOf(new RegExp(`\\b${UNCLASSIFIED_END_LATCHED}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+  })
+
+  test('the latch is installed in the session manager exactly once (nothing uninstalls it), in main()\'s own statement list, after its holds and its notice are bound and before the retry controller and the start pass', () => {
+    const at = onlyCallOf(INSTALL)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    importedOnly(INSTALL, './session-manager.ts')
+    expect(onlyCallArgs(INSTALL)).toEqual([constOf(FACTORY)])
+
+    expect(at).toBeGreaterThan(onlyCallOf(BIND_LATCH_HOLDS))
+    expect(at).toBeGreaterThan(onlyCallOf(BIND_NOTICE))
+    for (const later of startPass()) expect(at).toBeLessThan(later)
+  })
+
+  // The holds name the retry controller, the condition and the unclassified
+  // episodes, all built after the latch is installed: a hold run before they
+  // exist would throw (and be logged) and hold nothing back. Only a launch
+  // can latch, and none starts before main() first yields.
+  test('no statement awaits between the latch\'s install and the build of the last of the holds\' targets', () => {
+    const install = onlyCallOf(INSTALL)
+    const built = ['createUnavailableRetryController', 'createTmuxUnresponsiveCondition', 'createUnclassifiedErrorEpisodes'].map(onlyCallOf)
+    const last = Math.max(...built)
+    expect(last).toBeGreaterThan(install)
+    expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(install, last))).toEqual([])
+  })
+
+  test('the latched query is bound exactly once into each of the full-mode retry action, the restart work and the health tick, as a call-time read of the one latch\'s isLatched for the key it is given', () => {
+    const latch = constOf(FACTORY)
+    declaredOnce(latch)
+    const query = oneKeyArrow(`${latch}\\.${IS_LATCHED}\\(\\1\\)`)
+    expect(onlyCallProps('createFullModeRetryAction').get(RETRY_LATCHED)).toMatch(query)
+    expect(onlyCallProps('initRestart').get(RESTART_LATCHED)).toMatch(query)
+    expect(onlyCallProps('initHealthCheck').get(TICK_LATCHED)).toMatch(query)
+
+    // No other latched member or query anywhere in server.ts: one of each
+    // inside each of the three calls.
+    const members = indicesOf(new RegExp(`\\b${IS_LATCHED}\\s*:`, 'g'), SERVER_CODE)
+    const queries = indicesOf(new RegExp(`\\.\\s*${IS_LATCHED}\\s*\\(`, 'g'), SERVER_CODE)
+    for (const offsets of [members, queries]) {
+      expect(offsets).toHaveLength(3)
+      const within = (call: string) => {
+        const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf(call), '(', ')')
+        return offsets.filter((at) => at > open && at < close).length
+      }
+      expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map(within)).toEqual([1, 1, 1])
+    }
   })
 })
 

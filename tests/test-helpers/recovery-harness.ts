@@ -18,7 +18,8 @@
  *   row read (`readPersonaRowState`, a pending-only retry's one `status`
  *   call), the applied-persona lookup over the live applied set, the
  *   relaunch gate below, the restart cap (`isAtCap` at
- *   `RESTART_FAILURE_CAP`), the harness's shutting-down flag and the session
+ *   `RESTART_FAILURE_CAP`), the harness's shutting-down flag, the latch's
+ *   latched query (`latch` below) and the session
  *   manager's `isLaunchInFlight`, and the condition's retry hooks: the
  *   connection and stream probes (`isSessionConnected` and
  *   `hasSessionStream`, both over `setConnected`) and `endTmuxUnresponsive`,
@@ -57,7 +58,8 @@
  *   the re-probe's included, arms the persona's timer on the controller with
  *   `UNAVAILABLE_RETRY_CAUSE_READ_ERROR`, straight to the controller (it is
  *   not recorded in `triggers`); an arm while the timer is armed or running
- *   keeps its due time. `options.restartDeps` replaces any of these.
+ *   keeps its due time. `isLatched` is the latch's latched query (`latch`
+ *   below). `options.restartDeps` replaces any of these.
  * - The relaunch gate is the real `createPersonaRelaunchGate` over a serving
  *   connection, with the bring-up outcome `setUp(key, up)` controls (every
  *   configured persona up at first) and the live applied set (its lines go
@@ -143,6 +145,33 @@
  *   otherwise the alert lands in `episodeNotices`; their lines go to
  *   `lines`. `unclassifiedErrorOpen(key)` reads whether the persona's
  *   episode is open; nothing sets it by hand.
+ * - `latch` and `latchEvents` (b.jg5 SRJ-501, SRJ-502, SRJ-508): one latch
+ *   per harness (`createConflictLatch`, its lines to `lines`), composed as
+ *   `main()` composes it: installed in the session manager
+ *   (`setConflictLatch`), so a CONFLICT at a collision-ladder spawn or
+ *   `resume` latches the persona (a `launch` answers `latched`) and a latched
+ *   persona's launch makes no agent-director call; its latched query bound
+ *   into the full-mode retry action (`isLatched`: a retry of a latched
+ *   persona stops with `UNAVAILABLE_RETRY_STOP_LATCHED`, no call) and into
+ *   the restart deps (`RestartDeps.isLatched`: the restart work answers
+ *   `latched`, no call); and its set observers in `main()`'s order: the
+ *   holds (`bindConflictLatchHolds`) and then the CONFLICT notice
+ *   (`bindConflictNotice`) over `episodes`, whose post lands in
+ *   `episodeNotices`. On every set the holds run in order, each isolated:
+ *   the timer's stop (`controller.stop(key,
+ *   UNAVAILABLE_RETRY_STOP_LATCHED)`, so a real stop shows in `stops`), the
+ *   condition's silent end (`tmuxUnresponsive.end(key,
+ *   TMUX_UNRESPONSIVE_END_LATCHED, undefined, { silent: true })`: no recovery
+ *   post; a holding condition's end shows in `conditionEnds`) and the
+ *   unclassified-error episode's end (`end(key,
+ *   UNCLASSIFIED_ERROR_END_LATCHED)`). `latch` is read-only: `isLatched(key)`
+ *   and `record(key)`. `latchEvents` holds, in order, each set as the
+ *   observers see it (`{ step: 'set', key, outcome, record }`, recorded by an
+ *   observer added before the holds), each hold as it is called (`{ step:
+ *   'hold', key, hold }`) and each CONFLICT notice posted (`{ step: 'notice',
+ *   key, text }`), so a case can read that every hold ran before the notice.
+ *   The harness has no health tick, so `HealthCheckDeps.isLatched` is not
+ *   bound here; a tick case binds `latch.isLatched` itself.
  * - `tickEnd(key)`: what a health tick's healthy branch does to the
  *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
  *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
@@ -154,7 +183,8 @@
  *   health tick of its own.
  * - `launch(key)`: a start-pass launch of the configured persona `key`
  *   through the real `spawnForPersona` (`isStartup` true) over the stub,
- *   resolving with its `SpawnPersonaResult`. Each persona's working directory
+ *   resolving with its `SpawnPersonaResult` (`latched` for a CONFLICT at a
+ *   ladder spawn or `resume`, and for a persona already latched). Each persona's working directory
  *   exists, so a row the stub answers in it is the persona's own.
  * - `settle()`: awaits every configured persona's launch in flight
  *   (`whenLaunchSettled`) and every retry run in flight (`whenRunSettled`),
@@ -192,12 +222,14 @@
  * - `captured()`: everything captured, for `assertNoLeak`: the lines, the
  *   `console.error` lines, the three notice lists, the startup-errors
  *   entries, the attempts, the triggers, the condition ends, the outage
- *   clears, the stops and the state directory as a written file.
+ *   clears, the stops, the latch events and the state directory as a written
+ *   file.
  * - `cleanup()`: stops every retry timer (`stopAll`) and forgets every
  *   episode (`episodes.forgetAll()`, which cancels every alert check), then
  *   undoes every
  *   install and reset the harness made (`console.error`, the restart module's state and the
  *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
+ *   the session manager's latch install and the latch's set observers,
  *   the stub spawn path and client with every launch still in flight, the
  *   findMissing memo, the tmux seams, the settings install,
  *   `SLACK_STATE_DIR`) and removes the temporary directory. It throws, after
@@ -241,6 +273,15 @@ import type { Client, SpawnResult } from 'agent-director'
 import { adAlertThresholdMsInEffect, adSettingsInEffect, installAdSettings, resetAdSettingsForTests, type AdSettingsInEffect } from '../../src/ad-settings.ts'
 import { _resetBackoffState, isAtCap } from '../../src/backoff.ts'
 import type { Persona, PersonaConfig } from '../../src/config.ts'
+import {
+  bindConflictLatchHolds,
+  bindConflictNotice,
+  createConflictLatch,
+  type ConflictLatch,
+  type ConflictLatchRecord,
+  type ConflictLatchSetOutcome,
+  type ConflictNoticeEpisodes,
+} from '../../src/conflict-latch.ts'
 import { LIVENESS_LIVE } from '../../src/liveness-reading.ts'
 import { classifyAdError, describeAdErrorClassification } from '../../src/ad-error-class.ts'
 import { _resetOutageState, clearOutageFlag, initOutageState, type OutageClass } from '../../src/outage-state.ts'
@@ -252,10 +293,12 @@ import {
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
   PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  TMUX_UNRESPONSIVE_END_LATCHED,
   TMUX_UNRESPONSIVE_END_RETRY,
   TMUX_UNRESPONSIVE_END_TEXT,
   TMUX_UNRESPONSIVE_END_TICK,
   UNCLASSIFIED_ERROR_END_CAPPED,
+  UNCLASSIFIED_ERROR_END_LATCHED,
   type PersonaEpisodes,
   type TmuxUnresponsiveCondition,
   type TmuxUnresponsiveEndReason,
@@ -276,6 +319,7 @@ import {
   launchSession,
   notifyRestartCapReached,
   readPersonaRowState,
+  setConflictLatch,
   setSessionNotifier,
   spawnForPersona,
   whenLaunchSettled,
@@ -289,6 +333,7 @@ import {
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_ROW_ABSENT,
+  UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   type UnavailableRetryAction,
@@ -411,6 +456,27 @@ export interface RecoveryStop {
   readonly reason: string
 }
 
+/** The three holds a latch runs, by the names the hold observer logs them under, in its order. */
+export type RecoveryLatchHold = 'retry timer stop' | 'tmux-unresponsive end' | 'unclassified-error end'
+
+/**
+ * One step of a latch's reaction, in the order it happened: the set itself
+ * (as the latch's set observers see it), each hold as it is called, and each
+ * CONFLICT notice the notice reaction posted.
+ */
+export type RecoveryLatchEvent =
+  | {
+      readonly step: 'set'
+      readonly key: string
+      readonly outcome: ConflictLatchSetOutcome
+      readonly record: ConflictLatchRecord
+    }
+  | { readonly step: 'hold'; readonly key: string; readonly hold: RecoveryLatchHold }
+  | { readonly step: 'notice'; readonly key: string; readonly text: string }
+
+/** The harness's latch, read-only: the latched query and the record. */
+export type RecoveryLatchView = Pick<ConflictLatch, 'isLatched' | 'record'>
+
 /** What `makeRecoveryHarness` returns; see the module comment. */
 export interface RecoveryHarness {
   readonly clock: FakeClock
@@ -443,6 +509,10 @@ export interface RecoveryHarness {
   readonly stops: RecoveryStop[]
   /** Whether persona `key`'s unclassified-error episode is open (read-only). */
   unclassifiedErrorOpen(key: string): boolean
+  /** The harness's one latch, read-only (`isLatched`, `record`); composed as `main()` composes it. */
+  readonly latch: RecoveryLatchView
+  /** Every latch set, hold and CONFLICT notice post, in order. */
+  readonly latchEvents: RecoveryLatchEvent[]
   /** The per-persona serializer the restart module runs its work through. */
   readonly serializer: PersonaSerializer
   /** The server's retry action, for both modes, over the real row read and restart entry (the default). */
@@ -537,6 +607,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     canRelaunch,
     isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
     isShuttingDown: () => shuttingDown,
+    // As main() binds it (b.jg5 SRJ-303, SRJ-305): a retry of a latched
+    // persona makes no call and stops the timer.
+    isLatched: (key) => latch.isLatched(key),
     isInFlight: isLaunchInFlight,
     isSessionConnected: (key) => connected.has(key),
     hasSessionStream: (key) => connected.has(key),
@@ -609,6 +682,43 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `persona=${key}: ${text}`),
   })
 
+  // As main() builds it (b.jg5 SRJ-501, SRJ-502, SRJ-508): one latch per
+  // harness, its lines to `lines`. A recorder observer first (it only records
+  // the set in `latchEvents`), then, in main()'s order, the holds (the timer's
+  // stop with the latch's reason, the condition's silent end, the
+  // unclassified-error episode's end), then the CONFLICT notice over the
+  // episodes, so every hold is done before the notice is posted. The
+  // session manager's installer comes with the other installs below.
+  const latchEvents: RecoveryLatchEvent[] = []
+  const latch = createConflictLatch({ log })
+  const hold = (key: string, name: RecoveryLatchHold): void => {
+    latchEvents.push({ step: 'hold', key, hold: name })
+  }
+  const unbindLatch = [
+    latch.addSetObserver(({ key, outcome, record }) => {
+      latchEvents.push({ step: 'set', key, outcome, record })
+    }),
+    bindConflictLatchHolds(
+      latch,
+      {
+        stopRetryTimer: (key) => {
+          hold(key, 'retry timer stop')
+          controller.stop(key, UNAVAILABLE_RETRY_STOP_LATCHED)
+        },
+        endTmuxUnresponsive: (key) => {
+          hold(key, 'tmux-unresponsive end')
+          tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_LATCHED, undefined, { silent: true })
+        },
+        endUnclassifiedError: (key) => {
+          hold(key, 'unclassified-error end')
+          unclassifiedErrors.end(key, UNCLASSIFIED_ERROR_END_LATCHED)
+        },
+      },
+      log,
+    ),
+    bindConflictNotice(latch, recordingNoticeEpisodes(episodes, (key, text) => latchEvents.push({ step: 'notice', key, text }))),
+  ]
+
   const savedStateDir = process.env['SLACK_STATE_DIR']
   process.env['SLACK_STATE_DIR'] = stateDir
   const savedConsoleError = console.error
@@ -647,6 +757,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   setSessionNotifier((key, text) => {
     notices.push({ key, text })
   })
+  // As main() installs it, before any launch: the collision ladder latches
+  // through it and launches no latched persona.
+  setConflictLatch(latch)
 
   resetAdSettingsForTests()
   if (options.adSettings !== undefined) writeAgentDirectorConfig(home, options.adSettings)
@@ -687,6 +800,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     armRetryTimer: (key) => {
       controller.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
     },
+    // As main() binds it (b.jg5 SRJ-502): a latched persona's restart work
+    // makes no agent-director call.
+    isLatched: (key) => latch.isLatched(key),
     ...options.restartDeps,
   })
 
@@ -751,6 +867,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     capReached,
     stops,
     unclassifiedErrorOpen: (key) => unclassifiedErrors.isOpen(key),
+    latch: Object.freeze({ isLatched: (key: string) => latch.isLatched(key), record: (key: string) => latch.record(key) }),
+    latchEvents,
     serializer,
     fullModeAction: fullMode,
     scriptedAction: scripted,
@@ -842,6 +960,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       conditionEnds: [...conditionEnds],
       outageClears: [...outageClears],
       stops: [...stops],
+      latchEvents: [...latchEvents],
       stateDir: writtenFile(stateDir),
     }),
 
@@ -854,6 +973,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       _resetBackoffState()
       _resetOutageState()
       setSessionNotifier(undefined)
+      setConflictLatch(undefined)
+      for (const unbind of unbindLatch) unbind()
       resetStubSpawnPath()
       _resetTmuxSessionKiller()
       _resetTmuxServerEnsurer()
@@ -868,6 +989,25 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
           `recovery harness: ${pendingTimers} timer(s) still pending and ${armed.length} persona(s) still armed after stopAll`,
         )
       }
+    },
+  }
+}
+
+/**
+ * What the CONFLICT notice reaction gets: `episodes`' own `begin` and `post`,
+ * with each post that went out (a CONFLICT notice) also handed to `posted`
+ * once the episodes' sink has it. Nothing else changes.
+ */
+function recordingNoticeEpisodes(
+  episodes: PersonaEpisodes,
+  posted: (key: string, text: string) => void,
+): ConflictNoticeEpisodes {
+  return {
+    begin: (key, kind, caseLabel) => episodes.begin(key, kind, caseLabel),
+    post: (key, kind, text, mark) => {
+      const sent = episodes.post(key, kind, text, mark)
+      if (sent) posted(key, text)
+      return sent
     },
   }
 }

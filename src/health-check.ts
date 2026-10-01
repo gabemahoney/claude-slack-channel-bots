@@ -22,8 +22,8 @@
  * itself never clears it.
  * A persona with a restart pending or active, or at the cap, is skipped
  * before any read. A persona with a no-attempt reason (`noAttemptReason`:
- * work in flight for it, or its `tmux-unavailable` outage raised; b.jg5
- * SRJ-315, SRJ-311) is still read: the working-directory check runs, and its
+ * it is latched, b.jg5 SRJ-502; work in flight for it; or its
+ * `tmux-unavailable` outage raised; b.jg5 SRJ-315, SRJ-311) is still read: the working-directory check runs, and its
  * liveness, connection and stream are read, so a healthy one takes the
  * healthy branch. Any other reading clears its streak, with no
  * `scheduleRestart` and no not-connected notice: the tick makes no attempt
@@ -100,6 +100,17 @@ export interface HealthCheckDeps {
    * tick (logged), before any read. Absent: nothing is in flight.
    */
   isLaunchInFlight?(key: string): boolean
+  /**
+   * b.jg5 SRJ-315, SRJ-502: true while the persona is latched (production:
+   * the server's latch's `isLatched`). A no-attempt reason, checked first:
+   * the tick still runs the working-directory check and reads the persona's
+   * liveness, connection and stream, and a healthy one takes the healthy
+   * branch, but for any other reading it never calls `scheduleRestart`,
+   * `notifyNotConnected` or `armRetryTimer` for it. Only an answer of exactly
+   * `true` is latched; a throw ends the persona's work for the tick (logged),
+   * before any read. Absent: no persona is latched.
+   */
+  isLatched?(key: string): boolean
   /**
    * b.jg5 SRJ-311: true while the persona has a retry timer, waiting or
    * running (production: the retry controller's `isArmed`). Read only for a
@@ -266,9 +277,10 @@ let skippedTicks = 0
  *     reading of `unknown` or a probe that threw (b.jg5 SRJ-314), or left out
  *     of the tick's work list by the relaunch gate,
  *   - when a tick that has a no-attempt reason for it (`noAttemptReason`:
- *     work in flight, b.f2b, or `tmux-unavailable` raised, b.jg5 SRJ-315)
- *     reads it anything but healthy: the tick makes no attempt for it, and
- *     the work in flight or the outage's retry owns it meanwhile,
+ *     latched, b.jg5 SRJ-502; work in flight, b.f2b; or `tmux-unavailable`
+ *     raised, b.jg5 SRJ-315) reads it anything but healthy: the tick makes
+ *     no attempt for it, and a human, the work in flight or the outage's
+ *     retry owns it meanwhile,
  *   - by `forgetDisconnectedStreak` when the persona is torn down,
  *   - and wholesale by `_resetHealthCheckState` (the test-reset seam and the
  *     production stop path both call it).
@@ -281,7 +293,10 @@ const disconnectedStreak = new Map<string, number>()
 
 /**
  * Why the tick makes no attempt of its own for a persona this tick (b.jg5
- * SRJ-315): `in-flight`, work in flight for it (`isLaunchInFlight`), or
+ * SRJ-315): `latched`, the persona is latched (`isLatched`, b.jg5 SRJ-502:
+ * a human decides, so no automated attempt is made, and with no retry timer
+ * armed for it none is armed here either), `in-flight`, work in flight for
+ * it (`isLaunchInFlight`), or
  * `tmux-unavailable`, its `tmux-unavailable` outage raised (b.jg5 SRJ-311:
  * its retry timer is then its only attempt, one per backoff interval; a tick
  * that finds it not healthy with no timer armed arms one,
@@ -289,7 +304,7 @@ const disconnectedStreak = new Map<string, number>()
  * new reason is one more member here and one more check in
  * `noAttemptReason`.
  */
-type NoAttemptReason = 'in-flight' | 'tmux-unavailable'
+type NoAttemptReason = 'latched' | 'in-flight' | 'tmux-unavailable'
 
 /**
  * The persona's no-attempt reason for this tick, the first that holds, or
@@ -298,6 +313,7 @@ type NoAttemptReason = 'in-flight' | 'tmux-unavailable'
  * logs it and ends the persona's work for the tick).
  */
 function noAttemptReason(d: HealthCheckDeps, key: string): NoAttemptReason | null {
+  if (d.isLatched?.(key) === true) return 'latched'
   if (d.isLaunchInFlight?.(key) === true) return 'in-flight'
   if (getOutageFlags(key).has('tmux-unavailable')) return 'tmux-unavailable'
   return null
@@ -421,10 +437,11 @@ export function startHealthCheck(intervalSeconds: number): void {
             continue
           }
 
-          // b.jg5 SRJ-315: decided once, before any read. With a reason (work
-          // in flight, which owns the session and whose wait reconnects or
-          // reports it, b.f2b; or `tmux-unavailable` raised, whose retry timer
-          // is the persona's only attempt, SRJ-311), the persona is still
+          // b.jg5 SRJ-315: decided once, before any read. With a reason (the
+          // persona latched, which a human decides, SRJ-502; work in flight,
+          // which owns the session and whose wait reconnects or reports it,
+          // b.f2b; or `tmux-unavailable` raised, whose retry timer is the
+          // persona's only attempt, SRJ-311), the persona is still
           // read below, so one that recovered on its own takes the healthy
           // branch (clearing the outage and ending `tmux-unresponsive`), but
           // the tick schedules nothing and posts no not-connected notice.

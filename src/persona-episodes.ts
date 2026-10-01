@@ -118,7 +118,8 @@
  *   that re-arm).
  * - `end(key, reason, reading?, options?)` ends a holding condition once:
  *   the recovery (SRJ-310) is posted when the episode's onset or alert was,
- *   unless `options.silent` (a CONFLICT answer ends it; its notice follows);
+ *   unless `options.silent` (a CONFLICT answer ends it; its notice follows:
+ *   `main()`'s latch hold ends it so, with `TMUX_UNRESPONSIVE_END_LATCHED`);
  *   the episode ends, which cancels the alert check; one ended line names
  *   the reason; and the injected condition-end hook is called once with the
  *   reading the end brings (a tick's or a retry's live reading; `pending`
@@ -193,7 +194,8 @@
  *   ended or missing, or found none, and handed the persona to the restart
  *   path's decision). Every other stop (not up, not applied, launch skipped,
  *   run failed and the rest) leaves it open: `main()` ends it at the restart
- *   cap, and a teardown or shutdown drops it through `forget` or `close`.
+ *   cap and when the persona latches (`UNCLASSIFIED_ERROR_END_LATCHED`), and
+ *   a teardown or shutdown drops it through `forget` or `close`.
  *   A later report begins a new episode, whose alert is posted again. The
  *   episodes' `forget(key)` (a teardown), `forgetAll()` and `close()` drop it
  *   silently with nothing left pending.
@@ -647,17 +649,26 @@ export const TMUX_UNRESPONSIVE_END_TICK = 'tick'
 /** End reason: a retry found the persona's row live, not `pending`, connected with its stream (SRJ-310 rule 2). */
 export const TMUX_UNRESPONSIVE_END_RETRY = 'retry'
 
+/**
+ * End reason: the persona latched (b.jg5 SRJ-310, SRJ-502). `main()`'s latch
+ * hold ends the condition with it, silently (`options.silent`): no recovery
+ * notice, since the CONFLICT notice follows.
+ */
+export const TMUX_UNRESPONSIVE_END_LATCHED = 'latched'
+
 /** Why a `tmux-unresponsive` condition ended. */
 export type TmuxUnresponsiveEndReason =
   | typeof TMUX_UNRESPONSIVE_END_TMUX_VERB
   | typeof TMUX_UNRESPONSIVE_END_TICK
   | typeof TMUX_UNRESPONSIVE_END_RETRY
+  | typeof TMUX_UNRESPONSIVE_END_LATCHED
 
 /** The text each end reason's ended line carries. */
 export const TMUX_UNRESPONSIVE_END_TEXT: Readonly<Record<TmuxUnresponsiveEndReason, string>> = Object.freeze({
   [TMUX_UNRESPONSIVE_END_TMUX_VERB]: 'a tmux-touching call succeeded or answered GONE',
   [TMUX_UNRESPONSIVE_END_TICK]: 'a health tick found its row live and its session connected with its stream',
   [TMUX_UNRESPONSIVE_END_RETRY]: 'a retry found its row live and its session connected with its stream',
+  [TMUX_UNRESPONSIVE_END_LATCHED]: 'the persona latched',
 })
 
 /** What `start` did: started the condition, continued one already holding, or nothing after the episodes' `close` (shutdown). */
@@ -1108,6 +1119,12 @@ export const UNCLASSIFIED_ERROR_END_ROW_GONE = 'a retry read its row ended or go
 /** End reason: the persona reached the restart cap (b.jg5 SRJ-313). */
 export const UNCLASSIFIED_ERROR_END_CAPPED = 'the persona reached the restart cap'
 
+/**
+ * End reason: the persona latched (b.jg5 SRJ-313, SRJ-502); `main()`'s latch
+ * hold ends the episode with it, whatever the latch's case.
+ */
+export const UNCLASSIFIED_ERROR_END_LATCHED = 'the persona latched'
+
 /** Why an unclassified-error episode ended. */
 export type UnclassifiedErrorEndReason =
   | typeof UNCLASSIFIED_ERROR_END_RECOVERED
@@ -1115,6 +1132,7 @@ export type UnclassifiedErrorEndReason =
   | typeof UNCLASSIFIED_ERROR_END_CONDITION_ENDED
   | typeof UNCLASSIFIED_ERROR_END_ROW_GONE
   | typeof UNCLASSIFIED_ERROR_END_CAPPED
+  | typeof UNCLASSIFIED_ERROR_END_LATCHED
 
 /** What the alert quotes: the classifier's reported name (a safe identifier) and rendered message. */
 export type UnclassifiedErrorQuote = Pick<AdErrorClassification, 'reportedName' | 'message'>
