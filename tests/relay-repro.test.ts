@@ -73,6 +73,7 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeStubSlack, type StubSlack } from './test-helpers/slack-stub.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
 import {
   makePersonaClients,
   posts,
@@ -338,5 +339,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     expect(allUpdates.every((u) => u.channel === CHANNEL_CH)).toBe(true)
     expect([...posts(stubA), ...allUpdates].some((c) => c.channel === WORK_CH)).toBe(false)
     expect(slackCalls(stubB)).toBe(0)
+    // Nothing the relay posted, updated or sent to agent-director holds a token.
+    assertNoLeak({ posts: posts(stubA), updates: allUpdates, decideCalls, getPermissionCalls })
   })
 })

@@ -140,18 +140,19 @@
  * `src/outage-state.ts`: inside an attempt for `key`, the arming predicate
  * `unavailableRetryCauseFor(value, verb)` decides the cause (UNAVAILABLE from
  * any verb, `ErrTmuxKillFailed` told apart by name; ENVIRONMENT from any
- * verb; any other `status`, `get` or `list` error but `ErrSpawnNotFound`,
- * CONFIG and UNUSABLE NAME), the trigger sink (`UnavailableRetryTriggerSink`,
- * which the controller is) arms the persona's timer with it, and the
- * innermost attempt records the error as its last, with whether it armed.
- * The ENVIRONMENT cause (`ErrTmuxNotAvailable`, b.jg5 SRJ-311) arms the
+ * verb; CONFIG from any verb; any other `status`, `get` or `list` error but
+ * `ErrSpawnNotFound` and UNUSABLE NAME), the trigger sink
+ * (`UnavailableRetryTriggerSink`, which the controller is) arms the persona's
+ * timer with it, and the innermost attempt records the error as its last,
+ * with whether it armed. The ENVIRONMENT cause (`ErrTmuxNotAvailable`, b.jg5
+ * SRJ-311) and the CONFIG cause (`ErrConfigMalformed`, SRJ-316) arm the
  * persona's timer outside an attempt for it too; no other cause does. A
  * trigger while armed keeps the due time (`arm` above). A second arming path is the restart work's arm hook,
  * `RestartDeps.armRetryTimer` (wired in `main()`): it arms the persona's
  * timer with `UNAVAILABLE_RETRY_CAUSE_READ_ERROR` on every `unknown` liveness
  * reading at the restart work, the re-probe's included, whatever made it
- * `unknown` (a CONFIG or UNUSABLE NAME answer and a probe that throws
- * included, which the arming predicate above does not arm on). A third is
+ * `unknown` (an UNUSABLE NAME answer and a probe that throws included, which
+ * the arming predicate above does not arm on). A third is
  * the health tick's (`HealthCheckDeps.armRetryTimer`, wired in `main()`): a
  * persona held off on its `tmux-unavailable` outage that the tick does not
  * find healthy, with no timer armed, is armed with
@@ -276,11 +277,35 @@ export const UNAVAILABLE_RETRY_CAUSE_KILL_FAILED = 'kill-failed'
 export const UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT = 'environment'
 
 /**
+ * The cause of a CONFIG answer (`ErrConfigMalformed`, an
+ * `ErrUnknownErrorName` recognised by name) from any verb for the persona
+ * (b.jg5 SRJ-301, SRJ-316, SRJ-105), in or out of an attempt, as the
+ * ENVIRONMENT cause arms: the persona is retried on its timer whatever
+ * `session_restart_delay` and `health_check_interval` are. Never counted, and
+ * it never starts or continues the `tmux-unresponsive` condition (SRJ-307:
+ * only UNAVAILABLE does).
+ */
+export const UNAVAILABLE_RETRY_CAUSE_CONFIG = 'config'
+
+/**
+ * The causes that arm the persona's timer in any context
+ * (`reportAttemptError`): ENVIRONMENT (b.jg5 SRJ-311) and CONFIG (SRJ-316).
+ * Every other cause arms only inside a launch or recovery attempt for the
+ * persona.
+ */
+export const UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES: ReadonlySet<string> = new Set<string>([
+  UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
+  UNAVAILABLE_RETRY_CAUSE_CONFIG,
+])
+
+/**
  * The cause of any other `status`, `get` or `list` error in an attempt (b.jg5
- * SRJ-301, SRJ-105). Also the cause the restart work's arm hook
- * (`RestartDeps.armRetryTimer`, wired in `main()`) arms with, on every
- * `unknown` liveness reading at the restart work: CONFIG, UNUSABLE NAME and a
- * thrown probe included (b.jg5 SRJ-314).
+ * SRJ-301, SRJ-105), CONFIG excepted (its own cause, above). Also the cause
+ * the restart work's arm hook (`RestartDeps.armRetryTimer`, wired in
+ * `main()`) arms with, on every `unknown` liveness reading at the restart
+ * work: UNUSABLE NAME and a thrown probe included (b.jg5 SRJ-314); a CONFIG
+ * `status` has armed the CONFIG cause first through the reporting point, and
+ * a trigger while armed keeps the due time.
  */
 export const UNAVAILABLE_RETRY_CAUSE_READ_ERROR = 'read-error'
 
@@ -1447,13 +1472,17 @@ function describeCause(cause: UnavailableRetryCause): string {
  *   (`UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT`, SRJ-311). It is decided before
  *   the read-error rule, so a `status`, `get` or `list` answering it records
  *   this cause, not `read-error`;
+ * - CONFIG (`ErrConfigMalformed`) from any verb, `kill` and the read verbs
+ *   included: a `config` cause (`UNAVAILABLE_RETRY_CAUSE_CONFIG`, SRJ-316),
+ *   also decided before the read-error rule;
  * - any other `status`, `get` or `list` error: a `read-error` cause, except
- *   `ErrSpawnNotFound` (each site keeps its meaning) and a CONFIG or UNUSABLE
- *   NAME answer (each takes its own handling, SRJ-105);
+ *   `ErrSpawnNotFound` (each site keeps its meaning) and an UNUSABLE NAME
+ *   answer (its own handling, SRJ-105);
  * - `undefined` (nothing arms) otherwise.
  *
- * The ENVIRONMENT cause arms in any context; every other cause arms only
- * inside a launch or recovery attempt for P (`reportAttemptError`).
+ * The ENVIRONMENT and CONFIG causes (`UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES`)
+ * arm in any context; every other cause arms only inside a launch or
+ * recovery attempt for P (`reportAttemptError`).
  *
  * The cause carries `value`, which reaches a line only through
  * `describeThrownValue`. `verb` is agent-director's verb name (`status`,
@@ -1471,8 +1500,9 @@ export function unavailableRetryCauseFor(value: unknown, verb: string | undefine
       return { kind, error: value }
     }
     if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) return { kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, error: value }
+    if (errorClass === AD_ERROR_CLASS_CONFIG) return { kind: UNAVAILABLE_RETRY_CAUSE_CONFIG, error: value }
     if (verb === undefined || !AD_READ_VERBS.has(verb)) return undefined
-    if (errorClass === AD_ERROR_CLASS_CONFIG || errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) return undefined
+    if (errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) return undefined
     if (hasAdErrorName(value, ERR_SPAWN_NOT_FOUND_NAME)) return undefined
     return { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR, error: value }
   } catch {
@@ -1582,10 +1612,11 @@ export function isInsideAttempt(key: string): boolean {
  * Report an agent-director error for persona `key`, thrown by a call made
  * with `verb` (b.jg5 SRJ-301, SRJ-311). When the arming predicate answers a
  * cause and `sink` is given, the sink is called once with `key` and the
- * cause, inside an attempt for `key`, and for the ENVIRONMENT cause
- * (`UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT`) in any context too: inside another
- * persona's attempt or outside every attempt (the health tick, the permission
- * poller and click handler, the JSONL safeguard, a teardown's kill). A stray
+ * cause, inside an attempt for `key`, and for the ENVIRONMENT and CONFIG
+ * causes (`UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES`, b.jg5 SRJ-311, SRJ-316) in
+ * any context too: inside another persona's attempt or outside every attempt
+ * (the health tick, the permission poller and click handler, the JSONL
+ * safeguard, a teardown's kill). A stray
  * arm there (a torn-down persona, one not applied or not up) stops at its
  * first retry through the action's stop checks, with no agent-director call.
  * Outside an attempt for `key`, any other cause arms nothing. Inside one,
@@ -1603,7 +1634,7 @@ export function reportAttemptError(
   try {
     const frame = innermostFrame(key)
     const cause = unavailableRetryCauseFor(value, verb)
-    if (frame === undefined && cause?.kind !== UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT) return false
+    if (frame === undefined && (cause === undefined || !UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES.has(cause.kind))) return false
     let armed = false
     if (cause !== undefined && sink !== undefined) {
       try {

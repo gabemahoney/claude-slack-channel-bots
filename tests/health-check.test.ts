@@ -27,8 +27,12 @@ import {
   resetAllToHealthy,
   ONSET_TEMPLATES,
   ALL_CLEAR_TEMPLATE,
+  adConfigMalformedOnset,
 } from '../src/outage-state.ts'
-import { _buildStatRouteImpl } from '../src/server.ts'
+import type { Client } from 'agent-director'
+import { _buildIsSessionAliveAdapter, _buildStatRouteImpl } from '../src/server.ts'
+import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
+import { personaInstanceId } from '../src/persona-identity.ts'
 import { _resetBackoffState } from '../src/backoff.ts'
 import { makeMultiPersonaConfig, makePersonaConfig } from './test-helpers/persona-config.ts'
 import type { Persona } from '../src/config.ts'
@@ -43,6 +47,7 @@ import {
 } from '../src/session-manager.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import {
+  AGENT_DIRECTOR_DEAD_STATES,
   LIVENESS_LIVE,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_LIVE,
@@ -68,7 +73,13 @@ import {
   fakeToken,
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
-import { SAMPLE_LAUNCH_START_WHOLE } from './test-helpers/agent-director-stub.ts'
+import {
+  SAMPLE_LAUNCH_START_WHOLE,
+  cannedStatusResult,
+  errConfigMalformed,
+  errSpawnNotFound,
+  makeStubClient,
+} from './test-helpers/agent-director-stub.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1670,6 +1681,97 @@ describe('b.jg5 SRJ-312: a live, connected tick with its stream clears the perso
     expect(getOutageFlags(P).has('tmux-unavailable')).toBe(true)
     expect(notices).toEqual([{ key: P, text: ONSET_TEMPLATES['tmux-unavailable']() }])
     expect(cleared).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-312, SRJ-314, SRJ-316 — a CONFIG answer at the health tick
+//
+// On the tick's path only the real liveness adapter raises and clears
+// `ad-config-malformed`, so these cases plug `_buildIsSessionAliveAdapter`
+// over the stub client into the deps' liveness read. A CONFIG answer
+// (`ErrConfigMalformed`) reads `unknown`, so the tick skips P (SRJ-314): one
+// onset for the episode, nothing scheduled and no not-connected notice
+// (SRJ-316). A `status` that succeeds, or that answers `ErrSpawnNotFound`,
+// clears it with one all-clear listing the bare class (SRJ-312). B, read dead
+// beside P, is scheduled on every tick and never flagged.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-316: a CONFIG answer at the health tick', () => {
+  const P = 'config_bot'
+  const B = 'other_bot'
+  const CONFIG = errConfigMalformed()
+  const ONSET = adConfigMalformedOnset(CONFIG)
+  const ALL_CLEAR = ALL_CLEAR_TEMPLATE(new Map([['ad-config-malformed', { detail: undefined }]]))
+  const DEAD_ROW = cannedStatusResult({ state: [...AGENT_DIRECTOR_DEAD_STATES][0]! })
+
+  afterEach(() => {
+    resetClientForTests()
+  })
+
+  /**
+   * The file's deps, their liveness read the real adapter over a stub client:
+   * P's `status` answers `pAnswers` in order (the last repeats), B's reads a
+   * dead row. Auto-restart disabled, recording each not-connected notice asked for.
+   */
+  function configDeps(pAnswers: Array<Error | ReturnType<typeof cannedStatusResult>>, opts: DepsOpts) {
+    const config = makeMultiPersonaConfig([{ name: P }, { name: B }], baseDir)
+    let pCalls = 0
+    setClientForTests(makeStubClient({
+      statusFn: ({ claude_instance_id }) => claude_instance_id === personaInstanceId(P)
+        ? pAnswers[Math.min(pCalls++, pAnswers.length - 1)]!
+        : DEAD_ROW,
+    }) as unknown as Client)
+    const adapter = _buildIsSessionAliveAdapter(() => config)
+    const personas = buildPersonaWorkList(config)
+    const deps = makeDeps({ personas, ...opts })
+    deps.isSessionAlive = (key) => {
+      deps.isSessionAliveCalls.push(key)
+      return adapter(key)
+    }
+    deps.isAutoRestartDisabled = () => true
+    const notified: string[] = []
+    deps.notifyNotConnected = (key) => void notified.push(key)
+    return { deps, notified, personas }
+  }
+
+  test('CONFIG on every tick: one onset for P and its flag kept raised, nothing scheduled for P, no not-connected notice; B, read dead, is scheduled on each tick with no flag', async () => {
+    // P's session is disconnected: read live, tick 2 would schedule P and ask
+    // for the notice (auto-restart disabled); read dead, tick 1 would.
+    const { deps, notified, personas } = configDeps([CONFIG], { connectedSequence: { [P]: [false] }, maxTicks: 3 })
+
+    const lines = await capturingErrors(() => runTicks(deps, 3))
+
+    expect(deps.isSessionAliveCalls).toEqual([P, B, P, B, P, B])
+    const scheduledB = { key: B, cwd: personas[B]! }
+    expect(deps.scheduleRestartCalls).toEqual([scheduledB, scheduledB, scheduledB])
+    expect(notified).toEqual([])
+    expect(deps.isSessionConnectedCalls).toEqual([])
+    expect(notices).toEqual([{ key: P, text: ONSET }])
+    expect([...getOutageFlags(P)]).toEqual(['ad-config-malformed'])
+    expect([...getOutageFlags(B)]).toEqual([])
+    expect(lines.filter((line) => line.startsWith(`[slack] health-check: liveness unknown for persona=${P}`))).toHaveLength(3)
+    assertNoLeak({ lines, notices })
+  })
+
+  test.each<[string, Error | ReturnType<typeof cannedStatusResult>, boolean]>([
+    ['a status that succeeds with P live, connected and with its stream', cannedStatusResult(), false],
+    ['a status answering ErrSpawnNotFound', errSpawnNotFound(), true],
+  ])('with the flag raised by a CONFIG tick, %s on the next tick clears it with one all-clear', async (_label, answer, readDead) => {
+    const { deps, notified, personas } = configDeps([CONFIG, answer], { maxTicks: 2 })
+
+    const lines = await capturingErrors(() => runTicks(deps, 2))
+
+    expect(deps.isSessionAliveCalls).toEqual([P, B, P, B])
+    expect([...getOutageFlags(P)]).toEqual([])
+    expect(notices).toEqual([{ key: P, text: ONSET }, { key: P, text: ALL_CLEAR }])
+    // Nothing for P on the CONFIG tick; a dead reading after the clear schedules at once.
+    const scheduledB = { key: B, cwd: personas[B]! }
+    expect(deps.scheduleRestartCalls).toEqual(
+      readDead ? [scheduledB, { key: P, cwd: personas[P]! }, scheduledB] : [scheduledB, scheduledB],
+    )
+    expect(notified).toEqual([])
+    assertNoLeak({ lines, notices })
   })
 })
 

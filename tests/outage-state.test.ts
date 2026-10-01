@@ -6,7 +6,11 @@
  * the declared verb's start and end of the persona's `tmux-unresponsive`
  * condition (b.jg5 SRJ-307, SRJ-310), and the `tmux-unavailable` onset a
  * re-bound socket gets (b.jg5 SRJ-1021: one pin case holds its text; every
- * other case compares with the exported builder).
+ * other case compares with the exported builder), and the
+ * `ad-config-malformed` outage a CONFIG answer raises: its raise, clear,
+ * report and onset (b.jg5 SRJ-316, SRJ-312, SRJ-1018: one pin case holds
+ * the onset's text; every other case compares with the exported template
+ * over the classifier's rendered message).
  *
  * Every wrapped call declares its verb. The trigger-sink and condition-sink
  * cases install recording fake sinks (no timer, no episodes) and run the
@@ -16,7 +20,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
@@ -39,6 +43,9 @@ import {
   reportAgentDirectorError,
   ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
+  OUTAGE_CLASS_ORDER,
+  adConfigMalformedOnset,
+  raiseAdConfigMalformed,
   raiseTmuxUnavailable,
   tmuxServerChangedOnset,
   type ClassRecord,
@@ -54,6 +61,8 @@ import {
   AD_VERBS,
   TMUX_TOUCHING_VERBS,
   adCallVerb,
+  classifyAdError,
+  describeAdErrorClassification,
   type AdCall,
   type AdVerb,
 } from '../src/ad-error-class.ts'
@@ -68,6 +77,7 @@ import {
   errCallTimeout,
   errConfigMalformed,
   errInstanceIdCollision,
+  errInternal,
   errSpawnNotFound,
   errSpawnNotResumable,
   errSystemInstallDisappeared,
@@ -77,14 +87,17 @@ import {
   errTmuxNotAvailableDifferentServer,
   errTmuxSendKeys,
   errTmuxUnresponsive,
+  errUnknownErrorName,
   errUnusableName,
   makeStubCallLog,
   makeStubClient,
+  makeStubResolveSystemBinary,
   type StubCallLog,
   type StubClientOptions,
   unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
 import {
+  UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
@@ -94,7 +107,11 @@ import {
   type AttemptErrorRecord,
   type UnavailableRetryCause,
 } from '../src/unavailable-retry.ts'
-import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { APP_TOKEN_PREFIX, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { MAX_LOGGED_MESSAGE_LENGTH, describeThrownValue } from '../src/persona-connection-errors.ts'
+import { RECHECK_OUTCOME_PASS, createAdVersionRecheck } from '../src/ad-version-gate.ts'
+import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import { stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
@@ -553,7 +570,7 @@ describe('cases 20-21: flap cycles and never-set no-op', () => {
 // ---------------------------------------------------------------------------
 
 describe('persona-keyed notices', () => {
-  const ALL_CLASSES: OutageClass[] = ['ad-unreachable', 'tmux-unavailable', 'cwd-unreachable']
+  const ALL_CLASSES: readonly OutageClass[] = OUTAGE_CLASS_ORDER
 
   test('onset and all-clear texts name no route or channel and carry no persona reference (the notifier adds it)', () => {
     const texts = [
@@ -865,6 +882,10 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
     ['ENVIRONMENT from resume', 'resume', () => errTmuxNotAvailable(undefined, 'resume'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['ENVIRONMENT from kill', 'kill', () => errTmuxNotAvailable(undefined, 'kill'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['ENVIRONMENT from status (the ENVIRONMENT cause, not read-error)', 'status', () => errTmuxNotAvailable(undefined, 'status'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['a CONFIG answer from status (the CONFIG cause, not read-error; b.jg5 SRJ-316)', 'status', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer from get (the CONFIG cause, not read-error)', 'get', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer from kill (not a read verb)', 'kill', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer from resume (withSpawnDetection; not a read verb)', 'resume', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
   ] as const)('inside P\'s attempt, %s calls the sink once with P and the cause; the attempt records it armed', async (_label, verb, build, kind) => {
     const err = build()
     const { arms } = makeSinkHarness({ client: failing(verb, err) })
@@ -882,7 +903,6 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
   test.each([
     ['ErrSpawnNotFound from get', 'get', () => errSpawnNotFound()],
     ['ErrSpawnNotFound from status', 'status', () => errSpawnNotFound()],
-    ['a CONFIG answer from status', 'status', () => errConfigMalformed()],
     ['an UNUSABLE NAME answer from get', 'get', () => errUnusableName()],
     ['a STATE error from kill (not a read verb)', 'kill', () => errInstanceIdCollision()],
     ['a STATE error from resume (not a read verb; ENVIRONMENT now arms, b.jg5 SRJ-311)', 'resume', () => errSpawnNotResumable()],
@@ -984,6 +1004,7 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
     ['ErrSystemInstallDisappeared from status (arms; raises ad-unreachable)', 'status', () => errSystemInstallDisappeared('status', '/bin/ad')],
     ['ErrTmuxKillFailed from kill (arms; no flag)', 'kill', () => errTmuxKillFailed()],
     ['ErrTmuxNotAvailable from resume (arms the ENVIRONMENT cause; raises tmux-unavailable)', 'resume', () => errTmuxNotAvailable(undefined, 'resume')],
+    ['a CONFIG answer from status (arms the CONFIG cause; raises ad-config-malformed)', 'status', () => errConfigMalformed()],
   ] as const)('%s: the rethrown value, flags and notices are exactly as without a sink or an attempt', async (_label, verb, build) => {
     const err = build()
     /** One run: its rejection, P's flags and every notice raised. */
@@ -1137,9 +1158,10 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
       await runInAttempt(P1, 'recovery', () => {
         reportAgentDirectorError(P1, errSystemInstallDisappeared('status', '/bin/ad'), 'status')
         reportAgentDirectorError(P1, errTmuxNotAvailable(undefined, 'status'), 'status')
+        reportAgentDirectorError(P1, errConfigMalformed(), 'status')
       })
 
-      expect(arms).toHaveLength(2)
+      expect(arms).toHaveLength(3)
       expect(getOutageFlags(P1).size).toBe(0)
       expect(emissions).toHaveLength(0)
     })
@@ -1424,6 +1446,7 @@ describe('the declared verb and the tmux-unresponsive condition sink (b.jg5 SRJ-
     ['ErrTmuxNotAvailable from resume inside P\'s attempt (raises tmux-unavailable)', withSpawnDetection, 'resume', () => errTmuxNotAvailable(undefined, 'resume'), true],
     ['ErrSystemInstallDisappeared from read-pane inside P\'s attempt (raises ad-unreachable)', withOutageDetection, 'read-pane', () => errSystemInstallDisappeared('read-pane', '/bin/ad'), true],
     ['ErrTmuxKillFailed from a kill of a live row inside P\'s attempt', withOutageDetection, AD_CALL_KILL_ROW_READ_LIVE, () => errTmuxKillFailed(), true],
+    ['a CONFIG answer from spawn inside P\'s attempt (raises ad-config-malformed)', withSpawnDetection, 'spawn', () => errConfigMalformed(), true],
     ['a success of resume (ends; clears the flags)', withSpawnDetection, 'resume', undefined, false],
   ]
 
@@ -1566,6 +1589,19 @@ function allClearOf(history: ReadonlyArray<readonly [OutageClass, string | undef
   return ALL_CLEAR_TEMPLATE(new Map<OutageClass, ClassRecord>(history.map(([cls, detail]) => [cls, { detail }])))
 }
 
+/** Where a call runs: inside an attempt for P, inside another persona's (Q's) attempt, outside every attempt. */
+type Context = 'inside P\'s attempt' | 'inside Q\'s attempt' | 'outside any attempt'
+const CONTEXTS: readonly Context[] = ['inside P\'s attempt', 'inside Q\'s attempt', 'outside any attempt']
+
+/** Run `body` in `context`; answer its result and the last error of the attempt it ran in (none outside). */
+async function runIn<T>(context: Context, body: () => Promise<T> | T): Promise<{ result: T; lastError: AttemptErrorRecord | undefined }> {
+  if (context === 'outside any attempt') return { result: await body(), lastError: undefined }
+  return runInAttempt(context === 'inside P\'s attempt' ? P1 : P2, 'launch', async (attempt) => {
+    const result = await body()
+    return { result, lastError: attempt.lastError }
+  })
+}
+
 describe('what clears tmux-unavailable (b.jg5 SRJ-312: AC 27, AC 36)', () => {
   test('pin: the calls the not-tmux-touching rows below run over include every one the SRD names (status, get, list, find-missing, delete, kill of a row not read live)', () => {
     expect(NON_CLEARING_CALLS).toEqual(expect.arrayContaining(
@@ -1680,19 +1716,6 @@ describe('ENVIRONMENT is reported (b.jg5 SRJ-301, SRJ-311): from any verb for P,
     ['a socket not accessible', (verb) => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH, verb), () => ONSET_TEMPLATES['tmux-unavailable']()],
     ['the different-server form', (verb) => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, verb), tmuxServerChangedOnset],
   ]
-
-  /** Where the call runs: inside an attempt for P, inside another persona's attempt, outside every attempt. */
-  type Context = 'inside P\'s attempt' | 'inside Q\'s attempt' | 'outside any attempt'
-  const CONTEXTS: readonly Context[] = ['inside P\'s attempt', 'inside Q\'s attempt', 'outside any attempt']
-
-  /** Run `body` in `context`; answer its result and the last error of the attempt it ran in (none outside). */
-  async function runIn<T>(context: Context, body: () => Promise<T> | T): Promise<{ result: T; lastError: AttemptErrorRecord | undefined }> {
-    if (context === 'outside any attempt') return { result: await body(), lastError: undefined }
-    return runInAttempt(context === 'inside P\'s attempt' ? P1 : P2, 'launch', async (attempt) => {
-      const result = await body()
-      return { result, lastError: attempt.lastError }
-    })
-  }
 
   /** Every declared call through withOutageDetection, and the launch calls through withSpawnDetection. */
   const ENVIRONMENT_ROWS: WrapRow[] = [
@@ -2019,16 +2042,18 @@ describe('the cleared-flag observer (b.jg5 SRJ-305, SRJ-311)', () => {
     expect([...getOutageFlags(P2)]).toEqual(['tmux-unavailable'])
   })
 
-  test('each class\'s real clear is told with its class: a launch success over all three calls it in clear order, the reading on tmux-unavailable only', async () => {
+  test('each class\'s real clear is told with its class: a launch success over all four calls it in clear order, the reading on tmux-unavailable only', async () => {
     const { cleared } = makeRecordingHarness()
     setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
     setOutageFlag(P1, 'tmux-unavailable')
     setOutageFlag(P1, 'cwd-unreachable', WRAP_WORKDIR)
+    raiseAdConfigMalformed(P1, errConfigMalformed())
 
     await withSpawnDetection(P1, WRAP_WORKDIR, 'resume', async () => 'ok')
 
     expect(cleared).toEqual([
       { key: P1, cls: 'ad-unreachable', reading: undefined },
+      { key: P1, cls: 'ad-config-malformed', reading: undefined },
       { key: P1, cls: 'tmux-unavailable', reading: UNAVAILABLE_RETRY_ROW_PENDING },
       { key: P1, cls: 'cwd-unreachable', reading: undefined },
     ])
@@ -2094,6 +2119,494 @@ describe('the cleared-flag observer (b.jg5 SRJ-305, SRJ-311)', () => {
 
     expect(getOutageFlags(P1).size).toBe(0)
     expect(emissions.at(-1)).toEqual({ key: P1, text: allClearOf([['tmux-unavailable', undefined]]) })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-316, SRJ-312, SRJ-1018, SRJ-301 — the ad-config-malformed outage
+// a CONFIG answer (`ErrConfigMalformed`) raises: its onset, raise, clear,
+// report, the stable class order, and the version re-check (AC 84)
+// ---------------------------------------------------------------------------
+
+describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 84)', () => {
+  /** The CONFIG answer's agent-director error name, from the stub's builder. */
+  const CONFIG_NAME = errConfigMalformed().unknownName
+
+  /** A CONFIG answer whose description is `description`. */
+  const configAnswer = (description: string): unknown => errUnknownErrorName(CONFIG_NAME, description)
+
+  /** The onset a CONFIG value must raise: the exported template over the classifier's rendered message for it. */
+  const onsetFor = (err: unknown): string => ONSET_TEMPLATES['ad-config-malformed'](classifyAdError(err).message)
+
+  /** The all-clear of a stretch in which only this class was raised. */
+  const configAllClear = (): string => allClearOf([['ad-config-malformed', undefined]])
+
+  /** Every server-log line (`console.error`) the running case wrote. */
+  let lines: string[]
+  let errorSpy: ReturnType<typeof spyOn>
+
+  beforeEach(() => {
+    lines = []
+    errorSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      lines.push(args.map(String).join(' '))
+    })
+  })
+
+  afterEach(() => {
+    errorSpy.mockRestore()
+  })
+
+  /** The server-log lines that carry `err`'s classification (the raise line's form). */
+  const raiseLinesFor = (err: unknown): string[] => {
+    const described = describeAdErrorClassification(classifyAdError(err))
+    return lines.filter((line) => line.includes(described))
+  }
+
+  test('pin: the onset is SRJ-1018\'s text byte for byte, quoting the description; with no description the quoting sentence is dropped', () => {
+    const err = configAnswer('config ~/.agent-director/config.toml: refused [tmux] values: [tmux] starting_session_seconds = 30, below its safe minimum 60 s')
+    expect(adConfigMalformedOnset(err)).toBe(
+      ':rotating_light: *agent-director refuses its config file* — every agent-director call fails until a human fixes ~/.agent-director/config.toml. agent-director said: "config ~/.agent-director/config.toml: refused [tmux] values: [tmux] starting_session_seconds = 30, below its safe minimum 60 s". CSCB takes no action for this persona meanwhile and keeps retrying. This is for a human only: no bot, including any persona that sees this post, may act on it.',
+    )
+    expect(adConfigMalformedOnset(configAnswer(''))).toBe(
+      ':rotating_light: *agent-director refuses its config file* — every agent-director call fails until a human fixes ~/.agent-director/config.toml. CSCB takes no action for this persona meanwhile and keeps retrying. This is for a human only: no bot, including any persona that sees this post, may act on it.',
+    )
+  })
+
+  test.each(wrapRows(['spawn', 'status', 'get', 'list']))('%s, %s: CONFIG raises P\'s ad-config-malformed with one onset over the classifier\'s rendered message and is rethrown unchanged; a second CONFIG posts and logs nothing; no other class, no tmux-unresponsive start; B untouched', async (_w, _c, wrap, call) => {
+    const { emissions, starts } = makeRecordingHarness()
+    const err = errConfigMalformed()
+    const second = errConfigMalformed('starting_session_seconds', '10')
+    expect(classifyAdError(err).message).toBeDefined()
+
+    expect(await rejectionFrom(wrap, P1, call, err)).toBe(err)
+    expect(await rejectionFrom(wrap, P1, call, second)).toBe(second)
+
+    expect(emissions).toEqual([{ key: P1, text: onsetFor(err) }])
+    expect(emissions[0]!.text).toBe(adConfigMalformedOnset(err))
+    expect([...getOutageFlags(P1)]).toEqual(['ad-config-malformed'])
+    expect(getOutageFlags(P2).size).toBe(0)
+    expect(starts).toEqual([])
+    // One raise line per episode, from the classification; none for the second CONFIG.
+    expect(raiseLinesFor(err)).toHaveLength(1)
+    expect(raiseLinesFor(second)).toEqual([])
+    assertNoLeak({ emissions, lines, flags: [...getOutageFlags(P1)] })
+  })
+
+  /** The one server-log line a failed onset post for persona `key` writes. */
+  const onsetFailureLine = (key: string, failure: unknown): string =>
+    `[slack] outage-state: onset notice for persona=${key} failed: ${describeThrownValue(failure)} — the flag stays raised; the notice counts as posted`
+
+  /** The server-log lines that report a failed onset post (any persona). */
+  const onsetFailureLines = (): string[] => lines.filter((line) => line.includes('outage-state: onset notice for persona='))
+
+  /** How a notify can fail: it throws the failure, or answers a promise that rejects with it. */
+  const NOTIFY_FAILURES: ReadonlyArray<readonly [form: string, fail: (failure: Error) => unknown]> = [
+    ['a notify that throws', (failure) => { throw failure }],
+    ['a notify whose promise rejects', (failure) => Promise.reject(failure)],
+  ]
+
+  /** A failure whose message carries a fake token and URL, so the failure line is leak-checked. */
+  const notifyFailure = (): Error => new Error(`slack post failed (${sentinelInMessage('notify')})`)
+
+  /**
+   * A fresh outage state whose notify records every call and then fails as
+   * `fail` does, with a recording trigger sink.
+   */
+  function makeFailingNotifyHarness(fail: (failure: Error) => unknown, failure: Error): { calls: Emission[]; arms: RecordedArm[] } {
+    const calls: Emission[] = []
+    const arms: RecordedArm[] = []
+    const client = makeStubClient()
+    _resetOutageState()
+    initOutageState({
+      notify: (key, text) => {
+        calls.push({ key, text })
+        return fail(failure)
+      },
+      getClient: () => client as unknown as Client,
+      triggerSink: { arm: (key: string, cause: UnavailableRetryCause) => { arms.push({ key, kind: cause.kind, error: cause.error }); return true } },
+    })
+    return { calls, arms }
+  }
+
+  /** Let every queued promise reaction (a rejected notify's handler) run. */
+  const settle = (): Promise<void> => new Promise((done) => setTimeout(done, 0))
+
+  test.each(NOTIFY_FAILURES.flatMap(([form, fail]) => wrapRows(['status', 'spawn']).map(([w, c, wrap, call]) => [form, w, c, wrap, call, fail] as const)))('%s, %s, %s: one failure line, the flag stays raised, the wrapper reports and rethrows the original CONFIG value; a second CONFIG calls notify not at all', async (_form, _w, _c, wrap, call, fail) => {
+    const failure = notifyFailure()
+    const { calls, arms } = makeFailingNotifyHarness(fail, failure)
+    const err = errConfigMalformed()
+    const second = errConfigMalformed('starting_session_seconds', '10')
+
+    expect(await rejectionFrom(wrap, P1, call, err)).toBe(err)
+    await settle()
+
+    expect(calls).toEqual([{ key: P1, text: onsetFor(err) }])
+    expect(onsetFailureLines()).toEqual([onsetFailureLine(P1, failure)])
+    expect([...getOutageFlags(P1)]).toEqual(['ad-config-malformed'])
+    expect(arms.map((a) => ({ key: a.key, kind: a.kind, same: a.error === err }))).toEqual([{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG, same: true }])
+    expect(raiseLinesFor(err)).toHaveLength(1)
+
+    // The onset counts as posted: the next CONFIG is deduped, reported and rethrown, and notify is not called.
+    expect(await rejectionFrom(wrap, P1, call, second)).toBe(second)
+    await settle()
+
+    expect(calls).toHaveLength(1)
+    expect(onsetFailureLines()).toHaveLength(1)
+    expect(raiseLinesFor(second)).toEqual([])
+    expect([...getOutageFlags(P1)]).toEqual(['ad-config-malformed'])
+    expect(arms.map((a) => a.error === second)).toEqual([false, true])
+    assertNoLeak({ calls, lines })
+  })
+
+  test.each(NOTIFY_FAILURES)('raiseAdConfigMalformed, %s: never throws, logs one failure line, leaves the flag raised', async (_form, fail) => {
+    const failure = notifyFailure()
+    const { calls } = makeFailingNotifyHarness(fail, failure)
+    const err = errConfigMalformed()
+
+    expect(() => raiseAdConfigMalformed(P1, err)).not.toThrow()
+    await settle()
+
+    expect(calls).toEqual([{ key: P1, text: onsetFor(err) }])
+    expect(onsetFailureLines()).toEqual([onsetFailureLine(P1, failure)])
+    expect([...getOutageFlags(P1)]).toEqual(['ad-config-malformed'])
+    expect(raiseLinesFor(err)).toHaveLength(1)
+    assertNoLeak({ calls, lines })
+  })
+
+  /** `REDACTED_SENTINEL_TAIL` as the onset shows it: its placeholders' `<` and `>` escaped. */
+  const ESCAPED_SENTINEL_TAIL = REDACTED_SENTINEL_TAIL.split('<').join('&lt;').split('>').join('&gt;')
+
+  /**
+   * Descriptions agent-director may give, and what the onset and the
+   * server-log raise line must show for each. The onset escapes Slack's
+   * control characters after redaction, flattening and the cap; the raise
+   * line quotes the redacted text unescaped.
+   */
+  const DESCRIPTIONS: ReadonlyArray<readonly [label: string, description: string, check: (onset: string, raiseLine: string) => void]> = [
+    [
+      'carrying fake tokens and a URL: redacted in place, the placeholders escaped in the onset only',
+      `refused (${sentinelInMessage('config')}) and (${sentinelInMessage('config-app', APP_TOKEN_PREFIX)})`,
+      (onset, raiseLine) => {
+        expect(ESCAPED_SENTINEL_TAIL).toBe('&lt;redacted-token&gt; &lt;redacted-url&gt;')
+        expect(onset).toContain(` agent-director said: "refused (${ESCAPED_SENTINEL_TAIL}) and (${ESCAPED_SENTINEL_TAIL})".`)
+        expect(onset).not.toContain(REDACTED_SENTINEL_TAIL)
+        expect(raiseLine).toContain(`message="refused (${REDACTED_SENTINEL_TAIL}) and (${REDACTED_SENTINEL_TAIL})"`)
+        expect(raiseLine).not.toContain('&lt;')
+      },
+    ],
+    [
+      'carrying <!channel>, <@U…> and &: escaped in the onset so the post renders them as text and pings no one; unescaped in the raise line',
+      'fix <!channel> and <@U0123ABCD> & <!here|here> > soon',
+      (onset, raiseLine) => {
+        expect(onset).toContain(' agent-director said: "fix &lt;!channel&gt; and &lt;@U0123ABCD&gt; &amp; &lt;!here|here&gt; &gt; soon".')
+        expect(onset).not.toMatch(/<[!@]/)
+        expect(raiseLine).toContain('message="fix <!channel> and <@U0123ABCD> & <!here|here> > soon"')
+        expect(raiseLine).not.toMatch(/&(amp|lt|gt);/)
+      },
+    ],
+    [
+      'already holding entities: escaped again, so the post shows them as written',
+      'value &lt;60&gt; &amp; up',
+      (onset, raiseLine) => {
+        expect(onset).toContain(' agent-director said: "value &amp;lt;60&amp;gt; &amp;amp; up".')
+        expect(raiseLine).toContain('message="value &lt;60&gt; &amp; up"')
+      },
+    ],
+    [
+      'of only < characters, longer than MAX_LOGGED_MESSAGE_LENGTH: capped first, then escaped, so no entity is cut',
+      '<'.repeat(MAX_LOGGED_MESSAGE_LENGTH + 100),
+      (onset, raiseLine) => {
+        expect(onset).toContain(` agent-director said: "${'&lt;'.repeat(MAX_LOGGED_MESSAGE_LENGTH - 1)}…".`)
+        expect(raiseLine).toContain(`message="${'<'.repeat(MAX_LOGGED_MESSAGE_LENGTH - 1)}…"`)
+      },
+    ],
+    [
+      'spread over several lines: on one line',
+      'line one\nline two\r\nline three',
+      (onset) => {
+        expect(onset).toContain('line one line two line three')
+        expect(onset).not.toMatch(/[\r\n\u2028\u2029]/)
+      },
+    ],
+    [
+      `longer than MAX_LOGGED_MESSAGE_LENGTH: capped`,
+      'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH + 100),
+      (onset) => {
+        expect(onset).toContain('x'.repeat(MAX_LOGGED_MESSAGE_LENGTH - 10))
+        expect(onset).not.toContain('x'.repeat(MAX_LOGGED_MESSAGE_LENGTH))
+      },
+    ],
+    [
+      'missing (empty): the onset with no quoting sentence',
+      '',
+      (onset) => expect(onset).toBe(ONSET_TEMPLATES['ad-config-malformed']()),
+    ],
+    [
+      'only whitespace: the onset with no quoting sentence',
+      '  \n ',
+      (onset) => expect(onset).toBe(ONSET_TEMPLATES['ad-config-malformed']()),
+    ],
+  ]
+
+  test.each(DESCRIPTIONS)('a description %s; the raised onset is the exported onset for the value; nothing leaks', async (_label, description, check) => {
+    const { emissions } = makeRecordingHarness()
+    const err = configAnswer(description)
+
+    expect(await rejectionFrom(withOutageDetection, P1, 'status', err)).toBe(err)
+
+    expect(emissions).toEqual([{ key: P1, text: onsetFor(err) }])
+    expect(emissions[0]!.text).toBe(adConfigMalformedOnset(err))
+    const raiseLines = raiseLinesFor(err)
+    expect(raiseLines).toHaveLength(1)
+    check(emissions[0]!.text, raiseLines[0]!)
+    assertNoLeak({ emissions, lines })
+  })
+
+  test.each(wrapRows(EVERY_DECLARED_CALL))('%s, %s: a success clears it with one all-clear listing the bare class and not the description; the observer is told; a second success posts nothing', async (_w, _c, wrap, call) => {
+    const { emissions, cleared } = makeRecordingHarness()
+    const err = configAnswer(`refused (${sentinelInMessage('config')}) [tmux] starting_session_seconds = 30`)
+    await rejectionFrom(withOutageDetection, P1, 'status', err)
+    raiseAdConfigMalformed(P2, errConfigMalformed())
+    const before = emissions.length
+
+    expect(await wrap(P1, WRAP_WORKDIR, call, async () => 'ok')).toBe('ok')
+    await wrap(P1, WRAP_WORKDIR, call, async () => 'ok')
+
+    expect(emissions.slice(before)).toEqual([{ key: P1, text: configAllClear() }])
+    expect(emissions.at(-1)!.text).not.toContain(classifyAdError(err).message!)
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect([...getOutageFlags(P2)]).toEqual(['ad-config-malformed'])
+    expect(cleared).toEqual([{ key: P1, cls: 'ad-config-malformed', reading: undefined }])
+    assertNoLeak({ emissions, lines })
+  })
+
+  test.each(WRAPPERS)('%s: with ad-unreachable also raised, one success clears both with one all-clear in the exported class order', async (_w, wrap) => {
+    const { emissions } = makeRecordingHarness()
+    await rejectionFrom(wrap, P1, 'status', errConfigMalformed())
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    const before = emissions.length
+
+    await wrap(P1, WRAP_WORKDIR, 'get', async () => 'ok')
+
+    expect(emissions.slice(before)).toEqual([
+      { key: P1, text: allClearOf([['ad-unreachable', '/bin/ad'], ['ad-config-malformed', undefined]]) },
+    ])
+    const text = emissions.at(-1)!.text
+    const positions = OUTAGE_CLASS_ORDER.filter((cls) => cls === 'ad-unreachable' || cls === 'ad-config-malformed').map((cls) => text.indexOf(cls))
+    expect(positions.every((at) => at >= 0)).toBe(true)
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions)
+    expect(getOutageFlags(P1).size).toBe(0)
+  })
+
+  test.each(wrapRows(NON_CLEARING_CALLS))('%s, %s (not tmux-touching): with tmux-unavailable also raised, a success clears ad-config-malformed silently and tmux-unavailable stays; a later tmux-touching success posts one all-clear over both', async (_w, _c, wrap, call) => {
+    const { emissions } = makeRecordingHarness()
+    await rejectionFrom(withOutageDetection, P1, 'status', errConfigMalformed())
+    setOutageFlag(P1, 'tmux-unavailable')
+    const before = emissions.length
+
+    await wrap(P1, WRAP_WORKDIR, call, async () => 'ok')
+
+    expect(emissions.length).toBe(before)
+    expect([...getOutageFlags(P1)]).toEqual(['tmux-unavailable'])
+
+    await withOutageDetection(P1, WRAP_WORKDIR, 'read-pane', async () => 'ok')
+    expect(emissions.slice(before)).toEqual([
+      { key: P1, text: allClearOf([['tmux-unavailable', undefined], ['ad-config-malformed', undefined]]) },
+    ])
+    expect(getOutageFlags(P1).size).toBe(0)
+  })
+
+  /** Error answers that must never clear it, each built for the declared verb, with the notices each posts by itself. */
+  const ERROR_ANSWERS: ReadonlyArray<readonly [label: string, build: (verb: string) => unknown, posts: () => string[]]> = [
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', (verb) => errTmuxUnresponsive(verb), () => []],
+    ['UNAVAILABLE (ErrCallTimeout)', (verb) => errCallTimeout(verb), () => []],
+    ['GONE (ErrTmuxSendKeys)', () => errTmuxSendKeys(), () => []],
+    ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(), () => []],
+    ['ErrSpawnNotFound', () => errSpawnNotFound(), () => []],
+    ['ENVIRONMENT (raises tmux-unavailable)', (verb) => errTmuxNotAvailable(undefined, verb), () => [ONSET_TEMPLATES['tmux-unavailable']()]],
+    ['UNCLASSIFIED (ErrInternal)', () => errInternal(), () => []],
+  ]
+
+  test.each(wrapRows(['status', 'get', 'list', 'send-keys', 'spawn']))('%s, %s: no error answer clears it; none posts an all-clear', async (_w, _c, wrap, call) => {
+    const verb = adCallVerb(call)!
+    for (const [form, build, posts] of ERROR_ANSWERS) {
+      const { emissions, cleared } = makeRecordingHarness()
+      await rejectionFrom(withOutageDetection, P1, 'status', errConfigMalformed())
+      const before = emissions.length
+      const err = build(verb)
+
+      expect({ form, same: (await rejectionFrom(wrap, P1, call, err)) === err }).toEqual({ form, same: true })
+
+      expect({ form, raised: getOutageFlags(P1).has('ad-config-malformed') }).toEqual({ form, raised: true })
+      expect({ form, posted: emissions.slice(before).map((e) => e.text) }).toEqual({ form, posted: posts() })
+      expect({ form, cleared }).toEqual({ form, cleared: [] })
+    }
+  })
+
+  test('AC 84: with it raised, a version re-check that passes leaves it raised and posts nothing; no wrapped call is version or help', async () => {
+    const { emissions, cleared } = makeRecordingHarness()
+    await rejectionFrom(withOutageDetection, P1, 'status', errConfigMalformed())
+    const clock = createFakeClock()
+    const records: string[] = []
+    const stops: number[] = []
+    const recheckLog: string[] = []
+    const recheck = createAdVersionRecheck({
+      resolveSystemBinary: makeStubResolveSystemBinary(),
+      baselineVersion: PHASE1_RC_VERSION,
+      recordStartupError: (classLabel) => { records.push(classLabel) },
+      stop: (exitCode) => { stops.push(exitCode) },
+      log: (line) => { recheckLog.push(line) },
+      clock,
+    })
+    recheck.start()
+    const answer = await recheck.trigger().finally(() => recheck.dispose())
+
+    expect(answer.kind).toBe(RECHECK_OUTCOME_PASS)
+    expect(clock.pendingCount()).toBe(0)
+    expect({ records, stops }).toEqual({ records: [], stops: [] })
+    expect([...getOutageFlags(P1)]).toEqual(['ad-config-malformed'])
+    expect(emissions).toHaveLength(1)
+    expect(cleared).toEqual([])
+    // CSCB never wraps `version` or `help`, so no wrapped success can be one of them.
+    expect(EVERY_DECLARED_CALL.map(adCallVerb)).not.toContain('version')
+    expect(EVERY_DECLARED_CALL.map(adCallVerb)).not.toContain('help')
+  })
+
+  /** Every declared call through withOutageDetection, and the launch calls through withSpawnDetection. */
+  const CONFIG_ROWS: WrapRow[] = [
+    ...EVERY_DECLARED_CALL.map((call): WrapRow => ['withOutageDetection', declaredName(call), withOutageDetection, call]),
+    ['withSpawnDetection', 'spawn', withSpawnDetection, 'spawn'],
+    ['withSpawnDetection', 'resume', withSpawnDetection, 'resume'],
+  ]
+
+  test.each(CONFIG_ROWS)('%s, %s: CONFIG, in each context, reports the CONFIG cause once for P and raises P\'s flag with one onset; B gets nothing; no condition start', async (_w, _c, wrap, call) => {
+    const verb = adCallVerb(call)!
+    for (const context of CONTEXTS) {
+      const err = errConfigMalformed()
+      const { emissions, arms, starts } = makeRecordingHarness()
+
+      const { result: rejected, lastError } = await runIn(context, () => rejectionFrom(wrap, P1, call, err))
+
+      const at = { context }
+      expect({ ...at, same: rejected === err }).toEqual({ ...at, same: true })
+      expect({ ...at, arms: arms.map((a) => ({ key: a.key, kind: a.kind, same: a.error === err })) })
+        .toEqual({ ...at, arms: [{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG, same: true }] })
+      expect({ ...at, flags: [...getOutageFlags(P1)], b: [...getOutageFlags(P2)] }).toEqual({ ...at, flags: ['ad-config-malformed'], b: [] })
+      expect({ ...at, emissions }).toEqual({ ...at, emissions: [{ key: P1, text: onsetFor(err) }] })
+      // SRJ-307: only UNAVAILABLE starts tmux-unresponsive, never CONFIG.
+      expect({ ...at, starts }).toEqual({ ...at, starts: [] })
+      // Inside P's attempt the attempt records it armed (the launch is refused, never counted).
+      const expected = context === 'inside P\'s attempt' ? { verb, causeKind: UNAVAILABLE_RETRY_CAUSE_CONFIG, armed: true } : undefined
+      expect({ ...at, lastError }).toEqual({ ...at, lastError: expected })
+    }
+  })
+
+  test.each([...CONTEXTS])('through reportAgentDirectorError (the liveness adapter\'s bare status), %s: reports the CONFIG cause once for P; no flag, no notice', async (context) => {
+    const err = errConfigMalformed()
+    const { emissions, arms, starts } = makeRecordingHarness()
+
+    const { lastError } = await runIn(context, () => reportAgentDirectorError(P1, err, 'status'))
+
+    expect(arms.map((a) => ({ key: a.key, kind: a.kind, same: a.error === err }))).toEqual([{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG, same: true }])
+    expect({ flags: getOutageFlags(P1).size + getOutageFlags(P2).size, emissions, starts }).toEqual({ flags: 0, emissions: [], starts: [] })
+    const expected = context === 'inside P\'s attempt' ? { verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_CONFIG, armed: true } : undefined
+    expect(lastError).toEqual(expected)
+  })
+
+  test.each([...CONTEXTS])('with no sink installed, %s: nothing is reported; the flag, onset and rethrow are as with one', async (context) => {
+    const err = errConfigMalformed()
+    const { emissions } = makeRecordingHarness({ sink: false })
+
+    const { result: rejected, lastError } = await runIn(context, () => rejectionFrom(withSpawnDetection, P1, 'resume', err))
+    const direct = await runIn(context, () => reportAgentDirectorError(P1, err, 'status'))
+
+    expect(rejected).toBe(err)
+    expect([...getOutageFlags(P1)]).toEqual(['ad-config-malformed'])
+    expect(emissions).toEqual([{ key: P1, text: onsetFor(err) }])
+    const recorded = (v: string) => context === 'inside P\'s attempt' ? { verb: v, causeKind: UNAVAILABLE_RETRY_CAUSE_CONFIG, armed: false } : undefined
+    expect(lastError).toEqual(recorded('resume'))
+    expect(direct.lastError).toEqual(recorded('status'))
+  })
+
+  test('raiseAdConfigMalformed: raises P\'s flag with the onset for the value, records no detail, logs one raise line; a second raise posts and logs nothing; before initOutageState it does nothing', () => {
+    const { emissions } = makeRecordingHarness()
+    const err = errConfigMalformed()
+
+    raiseAdConfigMalformed(P1, err)
+    raiseAdConfigMalformed(P1, errConfigMalformed('starting_session_seconds', '5'))
+
+    expect(emissions).toEqual([{ key: P1, text: onsetFor(err) }])
+    expect(raiseLinesFor(err)).toHaveLength(1)
+    clearOutageFlag(P1, 'ad-config-malformed')
+    expect(emissions.slice(1)).toEqual([{ key: P1, text: configAllClear() }])
+
+    _resetOutageState()
+    expect(() => raiseAdConfigMalformed(P1, err)).not.toThrow()
+    expect(getOutageFlags(P1).size).toBe(0)
+  })
+
+  test('setOutageFlag with this class records no detail: the all-clear lists the bare class', () => {
+    const { emissions } = makeRecordingHarness()
+
+    setOutageFlag(P1, 'ad-config-malformed', 'agent-director text that must not reach the all-clear')
+    clearOutageFlag(P1, 'ad-config-malformed')
+
+    expect(emissions.at(-1)).toEqual({ key: P1, text: configAllClear() })
+  })
+
+  test('resetAllToHealthy wipes it silently (no all-clear, no observer call); the next CONFIG is a fresh onset', async () => {
+    const { emissions, cleared } = makeRecordingHarness()
+    const err = errConfigMalformed()
+    await rejectionFrom(withOutageDetection, P1, 'status', err)
+
+    resetAllToHealthy([P1])
+
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect(emissions).toHaveLength(1)
+    expect(cleared).toEqual([])
+
+    await rejectionFrom(withOutageDetection, P1, 'get', err)
+    expect(emissions).toEqual([{ key: P1, text: onsetFor(err) }, { key: P1, text: onsetFor(err) }])
+  })
+
+  test('flap: CONFIG → success → CONFIG → success gives onset, all-clear, onset, all-clear; a raise line per episode', async () => {
+    const { emissions } = makeRecordingHarness()
+    const err = errConfigMalformed()
+
+    await rejectionFrom(withOutageDetection, P1, 'status', err)
+    await withOutageDetection(P1, WRAP_WORKDIR, 'status', async () => 'ok')
+    await rejectionFrom(withSpawnDetection, P1, 'spawn', err)
+    await withSpawnDetection(P1, WRAP_WORKDIR, 'spawn', async () => 'ok')
+
+    expect(emissions.map((e) => e.text)).toEqual([onsetFor(err), configAllClear(), onsetFor(err), configAllClear()])
+    expect(raiseLinesFor(err)).toHaveLength(2)
+  })
+})
+
+describe('the stable class order (b.jg5 SRJ-1018)', () => {
+  test('every OutageClass appears exactly once in OUTAGE_CLASS_ORDER, which is read-only', () => {
+    // ONSET_TEMPLATES is a Record over OutageClass, so its keys are every member.
+    expect<string[]>([...OUTAGE_CLASS_ORDER].sort()).toEqual(Object.keys(ONSET_TEMPLATES).sort())
+    expect(new Set(OUTAGE_CLASS_ORDER).size).toBe(OUTAGE_CLASS_ORDER.length)
+    expect(Object.isFrozen(OUTAGE_CLASS_ORDER)).toBe(true)
+  })
+
+  test.each([
+    ['in the exported order', [...OUTAGE_CLASS_ORDER]],
+    ['in reverse order', [...OUTAGE_CLASS_ORDER].reverse()],
+  ] as const)('raised %s, the one all-clear lists every class in the exported order', (_label, raiseOrder) => {
+    const { emissions } = makeRecordingHarness()
+    for (const cls of raiseOrder) {
+      if (cls === 'ad-config-malformed') raiseAdConfigMalformed(P1, errConfigMalformed())
+      else setOutageFlag(P1, cls)
+    }
+    for (const cls of raiseOrder) clearOutageFlag(P1, cls)
+
+    const text = emissions.at(-1)!.text
+    expect(emissions).toHaveLength(OUTAGE_CLASS_ORDER.length + 1)
+    const positions = OUTAGE_CLASS_ORDER.map((cls) => text.indexOf(cls))
+    expect(positions.every((at) => at >= 0)).toBe(true)
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions)
   })
 })
 

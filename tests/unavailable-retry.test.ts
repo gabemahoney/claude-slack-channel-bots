@@ -54,6 +54,14 @@
  * the recovery. A kill of the last session on a socket followed by answers
  * from an exiting tmux server (AD handoff rev 23) runs there too, once with
  * `ErrTmuxNotAvailable` and once with `ErrTmuxUnresponsive`.
+ * CONFIG (`ErrConfigMalformed`, b.jg5 SRJ-316, SRJ-301, SRJ-305, AC 84) runs
+ * on the harness with both settings 0 and the arm hook bound as `main()`
+ * binds it: what arms the timer in a start-pass launch and outside every
+ * attempt, a trigger while armed, AC 84 end to end (a persona up and
+ * connected, and a launch that met it: one onset, no kill, delete or launch
+ * while it lasts, nothing counted, the retries on the backoff, and the
+ * bring-up with one all-clear once calls succeed), and a clear of the outage
+ * that leaves the timer armed.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -73,7 +81,17 @@ import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, rec
 import type { Persona } from '../src/config.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
 import { LIVENESS_LIVE, LIVENESS_PENDING, LIVENESS_READING_UNKNOWN, type PendingLivenessReading } from '../src/liveness-reading.ts'
-import { ALL_CLEAR_TEMPLATE, clearOutageFlag, getOutageFlags, ONSET_TEMPLATES, setOutageFlag, tmuxServerChangedOnset, withOutageDetection } from '../src/outage-state.ts'
+import {
+  adConfigMalformedOnset,
+  ALL_CLEAR_TEMPLATE,
+  clearOutageFlag,
+  getOutageFlags,
+  ONSET_TEMPLATES,
+  setOutageFlag,
+  tmuxServerChangedOnset,
+  withOutageDetection,
+  type OutageClass,
+} from '../src/outage-state.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
 import {
@@ -136,6 +154,7 @@ import {
   UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED,
   UNAVAILABLE_RETRY_AGAIN_ROW_PENDING,
   UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
@@ -917,9 +936,19 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     ['ErrTmuxNotAvailable from delete', () => errTmuxNotAvailable(undefined, 'delete'), 'delete', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['ErrTmuxNotAvailable (the re-bound socket) from resume', () => errTmuxNotAvailableDifferentServer(), 'resume', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['ErrTmuxNotAvailable with no verb known', () => errTmuxNotAvailable(), undefined, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    // b.jg5 SRJ-316, SRJ-301: CONFIG is its own cause from any verb, decided
+    // before the read-error rule, so the read verbs record it too.
+    ['a CONFIG answer from get', () => errConfigMalformed(), 'get', UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer from status', () => errConfigMalformed(), 'status', UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer from list', () => errConfigMalformed(), 'list', UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer from spawn', () => errConfigMalformed(), 'spawn', UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer from kill', () => errConfigMalformed(), 'kill', UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer from delete', () => errConfigMalformed(), 'delete', UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer from send-keys', () => errConfigMalformed(), 'send-keys', UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer from find-missing', () => errConfigMalformed(), 'find-missing', UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['a CONFIG answer with no verb known', () => errConfigMalformed(), undefined, UNAVAILABLE_RETRY_CAUSE_CONFIG],
     ['ErrSpawnNotFound from get', () => errSpawnNotFound(), 'get', undefined],
     ['ErrSpawnNotFound from status', () => errSpawnNotFound(), 'status', undefined],
-    ['a CONFIG answer from get', () => errConfigMalformed(), 'get', undefined],
     ['an UNUSABLE NAME answer from status', () => errUnusableName(), 'status', undefined],
     ['a STATE answer from read-pane', () => errSpawnNotInteractive('read-pane'), 'read-pane', undefined],
     ['a DIRECTORY answer from spawn', () => new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found'), 'spawn', undefined],
@@ -1577,8 +1606,10 @@ interface RowModel {
  * (`ErrSpawnNotFound` for `UNAVAILABLE_RETRY_ROW_ABSENT`, no row) until a
  * spawn for that instance resolves, and `waiting` from then on; `set` starts
  * that over from another state. Every spawn call's clock time is recorded.
+ * While `refuse`, when given, answers an error, every `status` answers that
+ * error instead.
  */
-function modelRow(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT): RowModel {
+function modelRow(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT, refuse?: () => Error | undefined): RowModel {
   const spawnedAt: number[] = []
   const live = new Set<string>()
   let before = initial
@@ -1592,6 +1623,8 @@ function modelRow(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE_RET
   }
   h.script({
     statusFn: (params) => {
+      const refused = refuse?.()
+      if (refused !== undefined) return refused
       if (live.has(String(params.claude_instance_id))) return cannedStatusResult({ state: 'waiting' })
       return before === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult({ state: before })
     },
@@ -4830,5 +4863,358 @@ describe('unavailable retry: a kill of the last session on a socket, then answer
     expect(h.stub.calls.deleteCalls).toEqual([])
     expect(h.notices).toEqual([])
     expectUntouched(h, other)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// CONFIG (`ErrConfigMalformed`, b.jg5 SRJ-316, SRJ-301, SRJ-305, AC 84) on the
+// recovery harness, both settings 0, the arm hook bound as `main()` binds it:
+// what arms the timer in a start-pass launch and outside every attempt, a
+// trigger while armed, AC 84 end to end (a persona up and connected, and a
+// launch that met CONFIG), and a clear of the outage that is not a timer
+// stop. The `pending`-row and C21 halves of SRJ-316's Test line are later
+// work; these cases assert no kill of any kind while calls answer CONFIG.
+// ---------------------------------------------------------------------------
+
+/** The `ad-config-malformed` class, typed against `OutageClass`. */
+const AD_CONFIG_MALFORMED: OutageClass = 'ad-config-malformed'
+
+/** The `ad-config-malformed` onset for the thrown CONFIG value `err`, as the outage state posts it. */
+function configOnset(key: string, err: unknown): { key: string; text: string } {
+  return { key, text: adConfigMalformedOnset(err) }
+}
+
+/** The single all-clear of a bad stretch that held only `ad-config-malformed`: the bare class. */
+function configAllClear(key: string): { key: string; text: string } {
+  return { key, text: ALL_CLEAR_TEMPLATE(new Map([[AD_CONFIG_MALFORMED, { detail: undefined }]])) }
+}
+
+/** The stub's error knob for every verb CSCB wraps but `status` (the row model answers it), each set to `err`. */
+function everyVerbButStatusAnswers(err: Error | undefined): RecoveryStubScript {
+  return {
+    spawnError: err,
+    resumeError: err,
+    getError: err,
+    listError: err,
+    killError: err,
+    deleteError: err,
+    findMissingError: err,
+    readPaneError: err,
+    sendKeysError: err,
+    pauseError: err,
+    decideError: err,
+    getPermissionError: err,
+  }
+}
+
+/** agent-director refusing its config file on the harness stub. */
+interface ConfigRefusal {
+  /** The one CONFIG value every call answers. */
+  readonly err: Error
+  /** The persona rows behind it, read once the file is fixed. */
+  readonly row: RowModel
+  /** The file is fixed: every call answers, and `status` reads the modelled row. */
+  fix(): void
+}
+
+/**
+ * Every agent-director call, for every persona, answers CONFIG (one
+ * `errConfigMalformed` value): `status` through the row model over `initial`,
+ * every other wrapped verb through its error knob. `version` is never wrapped
+ * and stays as it is.
+ */
+function refuseConfig(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT): ConfigRefusal {
+  const err = errConfigMalformed()
+  let refusing = true
+  const row = modelRow(h, initial, () => (refusing ? err : undefined))
+  h.script(everyVerbButStatusAnswers(err))
+  return {
+    err,
+    row,
+    fix: () => {
+      refusing = false
+      h.script(everyVerbButStatusAnswers(undefined))
+    },
+  }
+}
+
+/**
+ * A start-pass launch of persona `key` whose optimistic spawn answers `err`
+ * (CONFIG): refused, one onset, P's timer armed at the base wait with the
+ * CONFIG cause. Resolves with the arm's time.
+ */
+async function configLaunch(h: RecoveryHarness, key: string, err: Error): Promise<number> {
+  const armedAt = h.clock.now()
+  expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+  expect(h.outageNotices).toEqual([configOnset(key, err)])
+  expect(h.controller.view(key)).toEqual({
+    phase: 'waiting',
+    dueAt: armedAt + waitMs(0),
+    waitMs: waitMs(0),
+    refusals: 0,
+    causes: [UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    mode: UNAVAILABLE_RETRY_MODE_FULL,
+  })
+  return armedAt
+}
+
+/** The outage state's raise lines for persona `key`'s `ad-config-malformed` (one per episode). */
+function configRaisedLines(h: RecoveryHarness, key: string): string[] {
+  return h.errors.filter((line) => line.startsWith(`[slack] outage-state: ${AD_CONFIG_MALFORMED} raised for persona=${key}: `))
+}
+
+/**
+ * No action was taken for persona `key` because of CONFIG: no kill or delete
+ * call, nothing counted and no cap reached, no spawn-failure notice, no
+ * startup entry, and no `tmux-unresponsive` condition or post.
+ */
+function expectNoActionTaken(h: RecoveryHarness, key: string): void {
+  expect(h.stub.calls.killCalls).toEqual([])
+  expect(h.stub.calls.deleteCalls).toEqual([])
+  expect(getFailureCount(key)).toBe(0)
+  expect(isAtCap(key, RESTART_FAILURE_CAP)).toBe(false)
+  expect(h.capReached).toEqual([])
+  expect(h.notices).toEqual([])
+  expect(h.startupErrors()).toEqual([])
+  expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+  expect(conditionLines(h, key)).toEqual([])
+  expect(h.episodeNotices).toEqual([])
+}
+
+/**
+ * Drive persona `key`'s `retries` retries from `armedAt` while every call
+ * answers CONFIG: each fires exactly at its due time from the backoff, with
+ * nothing run or called 1 ms before it; each makes its liveness `status` call
+ * and nothing else, reads `unknown` and re-arms at the doubled wait, its
+ * causes the CONFIG trigger and the arm hook's read error. Resolves with the
+ * last retry's due time.
+ */
+async function retriesRefusedByConfig(h: RecoveryHarness, key: string, armedAt: number, retries: number): Promise<number> {
+  let dueAt = armedAt
+  for (let n = 0; n < retries; n++) {
+    dueAt += waitMs(n)
+    const before = callCounts(h)
+    await h.advance(dueAt - 1 - h.clock.now())
+    expect([n, h.attempts.length, callsSince(h, before)]).toEqual([n, n, {}])
+    await h.advance(1)
+    await h.settle()
+    expect([n, h.attempts.at(-1)]).toEqual([n, expect.objectContaining({ key, retry: n + 1, mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt })])
+    expect([n, callsSince(h, before)]).toEqual([n, { statusCalls: 1 }])
+    expect([n, retryLinesOf(h, key).at(-1)]).toEqual([n, reArmedLine(key, n + 1, UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN, n + 1)])
+    expect([n, h.controller.view(key)]).toEqual([n, {
+      phase: 'waiting',
+      dueAt: dueAt + waitMs(n + 1),
+      waitMs: waitMs(n + 1),
+      refusals: n + 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_CONFIG, UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+    }])
+  }
+  return dueAt
+}
+
+describe('unavailable retry: CONFIG arms from any verb in any context, takes no action, is never counted, is retried only on the backoff, and its clear stops no timer (SRJ-316, SRJ-301, SRJ-305, AC 84)', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test('a start-pass launch whose spawn answers ErrConfigMalformed is refused and arms that persona’s timer once at the base wait with the CONFIG cause: one onset, the flag raised, no other call, nothing counted, no spawn-failure notice or spawn-failed entry; the other persona is untouched', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    const err = errConfigMalformed()
+    h.script({ spawnError: err })
+
+    await configLaunch(h, key, err)
+
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_CONFIG)
+    expect(callCounts(h)).toEqual({ spawnCalls: 1 })
+    expect([...getOutageFlags(key)]).toEqual([AD_CONFIG_MALFORMED])
+    expect(configRaisedLines(h, key)).toHaveLength(1)
+    expectNoActionTaken(h, key)
+    expectUntouched(h, other)
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string, err: Error) => Promise<void>, Record<string, number>]>([
+    ['the health tick’s liveness read (status), which still reads unknown', async (h, key, err) => {
+      h.script({ statusError: err })
+      expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
+    }, { statusCalls: 1 }],
+    ['a persona teardown’s kill', async (h, key, err) => {
+      h.script({ killError: err })
+      await expect(killPersonaInstance(key)).rejects.toBe(err)
+    }, { killCalls: 1 }],
+    ['a plain read-pane through the outage wrapper', async (h, key, err) => {
+      h.script({ readPaneError: err })
+      await expect(readPaneSucceeds(h, key)).rejects.toBe(err)
+    }, { readPaneCalls: 1 }],
+  ])('ErrConfigMalformed from %s, made outside every attempt, raises the outage and arms that persona’s timer once at the base wait with the CONFIG cause; the other persona is untouched', async (_site, run, calls) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    const err = errConfigMalformed()
+    expect(isInsideAttempt(key)).toBe(false)
+
+    await run(h, key, err)
+
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_CONFIG)
+    expect(callCounts(h)).toEqual(calls)
+    expect(h.outageNotices).toEqual([configOnset(key, err)])
+    expect([...getOutageFlags(key)]).toEqual([AD_CONFIG_MALFORMED])
+    expect(getFailureCount(key)).toBe(0)
+    expectUntouched(h, other)
+  })
+
+  test('a CONFIG trigger while armed, midway and 1 ms before the due time, keeps the one due time and posts nothing more, and the retry fires at the arm plus the base wait', async () => {
+    const h = (harness = makeRecoveryHarness({ action: 'scripted' }))
+    const [key, other] = h.keys as [string, string]
+    const err = errConfigMalformed()
+    h.script({ spawnError: err, readPaneError: err, statusError: err })
+    const dueAt = (await configLaunch(h, key, err)) + waitMs(0)
+
+    await h.advance(waitMs(0) / 2)
+    await expect(readPaneSucceeds(h, key)).rejects.toBe(err)
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([dueAt])
+
+    await h.advance(dueAt - 1 - h.clock.now())
+    expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([dueAt])
+    expect(h.triggers).toEqual([1, 2, 3].map(() => ({ key, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG })))
+    expect(h.outageNotices).toEqual([configOnset(key, err)])
+    expect(configRaisedLines(h, key)).toHaveLength(1)
+    expect(h.attempts).toEqual([])
+
+    await h.advance(1)
+    expect(h.attempts).toEqual([{ key, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_CONFIG], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt }])
+    expectUntouched(h, other)
+  })
+
+  test('AC 84, a persona up: with both settings 0, P up and connected with its stream, then every call answering ErrConfigMalformed, gives exactly one onset across retries past the restart cap, each only at its due time from the backoff; no kill, delete, spawn or resume, nothing counted, no other post; once agent-director reads its config again, the next retry finds P live and connected, the status success clears the outage with one all-clear, and the timer stops', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    const config = refuseConfig(h, 'waiting')
+    h.setConnected(key, true)
+
+    // A health tick's liveness read meets it first, outside every attempt.
+    const armedAt = h.clock.now()
+    expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_CONFIG)
+
+    const retries = RESTART_FAILURE_CAP + 2
+    let dueAt = await retriesRefusedByConfig(h, key, armedAt, retries)
+
+    expect(h.outageNotices).toEqual([configOnset(key, config.err)])
+    expect(configRaisedLines(h, key)).toHaveLength(1)
+    expect(h.triggers.every((t) => t.key === key && t.kind === UNAVAILABLE_RETRY_CAUSE_CONFIG)).toBe(true)
+    expect(h.stub.calls.spawnCalls).toEqual([])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expectNoActionTaken(h, key)
+    expectUntouched(h, other)
+
+    config.fix()
+    dueAt += waitMs(retries)
+    const before = callCounts(h)
+    expect(await retryNow(h, key)).toBe(dueAt)
+
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+    expect(h.outageNotices).toEqual([configOnset(key, config.err), configAllClear(key)])
+    expect(getOutageFlags(key).size).toBe(0)
+    // The clear of this class never reaches the condition-end entry.
+    expect(h.outageClears).toEqual([])
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expectStopped(h, key)
+    expect(h.stub.calls.spawnCalls).toEqual([])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expectNoActionTaken(h, key)
+    expectUntouched(h, other)
+  })
+
+  test('AC 84, a launch that met it: with both settings 0, a start-pass launch whose spawn answers ErrConfigMalformed, with every later call answering it too, gives one onset and no kill, delete, spawn or resume but that launch across retries past the restart cap, nothing counted; once agent-director reads its config again, the next retry brings P up with one all-clear listing the class, and the timer stops only at the retry that finds nothing left to recover', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    const config = refuseConfig(h, 'missing')
+    const armedAt = await configLaunch(h, key, config.err)
+    expect(config.row.spawnedAt).toEqual([armedAt])
+
+    const retries = RESTART_FAILURE_CAP + 2
+    let dueAt = await retriesRefusedByConfig(h, key, armedAt, retries)
+
+    expect(config.row.spawnedAt).toEqual([armedAt])
+    expect(h.stub.calls.spawnCalls).toHaveLength(1)
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(h.outageNotices).toEqual([configOnset(key, config.err)])
+    expect(configRaisedLines(h, key)).toHaveLength(1)
+    expectNoActionTaken(h, key)
+    expectUntouched(h, other)
+
+    // The file is fixed: the next retry reads the row missing (the status
+    // success clears the outage), and the restart path kills and launches.
+    config.fix()
+    dueAt += waitMs(retries)
+    const before = callCounts(h)
+    expect(await retryNow(h, key)).toBe(dueAt)
+
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, killCalls: 1, spawnCalls: 1 })
+    expect(config.row.spawnedAt).toEqual([armedAt, dueAt])
+    expect(h.outageNotices).toEqual([configOnset(key, config.err), configAllClear(key)])
+    expect(getOutageFlags(key).size).toBe(0)
+    expect(h.outageClears).toEqual([])
+    // The launch's pending row keeps the timer, now pending-only.
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, retries + 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, retries + 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+
+    // The next retry reads the row live: nothing left to recover.
+    const launched = callCounts(h)
+    await retryNow(h, key)
+    expect(callsSince(h, launched)).toEqual({ statusCalls: 1 })
+    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
+    expectStopped(h, key)
+    expect(h.outageNotices).toHaveLength(2)
+    expect(getFailureCount(key)).toBe(0)
+    expect(h.capReached).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expectUntouched(h, other)
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
+    ['a successful read-pane through the outage wrapper', async (h, key) => {
+      h.script({ readPaneError: undefined })
+      await readPaneSucceeds(h, key)
+    }],
+    ['the liveness read’s successful status', async (h, key) => {
+      h.script({ statusError: undefined, statusResult: cannedStatusResult({ state: 'waiting' }) })
+      await _buildIsSessionAliveAdapter(() => h.config)(key)
+    }],
+    ['the liveness read’s status answering ErrSpawnNotFound', async (h, key) => {
+      h.script({ statusError: errSpawnNotFound() })
+      await _buildIsSessionAliveAdapter(() => h.config)(key)
+    }],
+  ])('a clear is not a stop: %s clears the outage with one all-clear and leaves the timer armed with its due time, and the next retry still runs at it', async (_what, clear) => {
+    const h = (harness = makeRecoveryHarness({ action: 'scripted' }))
+    const [key] = h.keys as [string]
+    const err = errConfigMalformed()
+    h.script({ spawnError: err, readPaneError: err, statusError: err })
+    await configLaunch(h, key, err)
+    await h.advance(waitMs(0) / 2)
+    const before = h.controller.view(key)!
+    const retryLines = retryLinesOf(h, key)
+
+    await clear(h, key)
+
+    expect(h.outageNotices).toEqual([configOnset(key, err), configAllClear(key)])
+    expect(getOutageFlags(key).size).toBe(0)
+    expect(h.outageClears).toEqual([])
+    expect(retryLinesOf(h, key)).toEqual(retryLines)
+    expect(h.controller.view(key)).toEqual(before)
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([before.dueAt!])
+
+    await h.advance(before.dueAt! - 1 - h.clock.now())
+    expect(h.attempts).toEqual([])
+    await h.advance(1)
+    expect(h.attempts).toEqual([{ key, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_CONFIG], mode: UNAVAILABLE_RETRY_MODE_FULL, at: before.dueAt! }])
   })
 })

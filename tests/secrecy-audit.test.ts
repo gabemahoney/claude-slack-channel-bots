@@ -33,8 +33,9 @@
  *    manager, restart, the permission poller and click handler, the persona
  *    notifier and destinations, the health check, the CLI, the template
  *    install, the agent-director error classifier, the agent-director
- *    settings reader, the UNAVAILABLE retry timer and the persona episodes
- *    with their tmux-unresponsive condition), a value import of one
+ *    settings reader, the UNAVAILABLE retry timer, the persona episodes
+ *    with their tmux-unresponsive condition and the outage state, whose
+ *    config-file onset quotes agent-director), a value import of one
  *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
  *    config-file writer, the agent-director settings-file writer, the reload,
  *    connection, routing and recovery harnesses, the Slack client factory
@@ -131,6 +132,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/ad-settings\.ts$/, "the agent-director settings reader, which reads agent-director's config.toml and logs a refused read's reason"],
   [/^src\/unavailable-retry\.ts$/, "the UNAVAILABLE retry timer, whose lines can carry agent-director failure text (a cause or a failed retry, described)"],
   [/^src\/persona-episodes\.ts$/, "the persona episodes and the tmux-unresponsive condition, whose start line carries agent-director failure text (the refusing verb's error, described)"],
+  [/^src\/outage-state\.ts$/, "the outage flags and their notices, whose ad-config-malformed onset carries agent-director's description (its error's message) to Slack"],
 ]
 
 /** Test helpers whose named exports build tokens, credentials or config files, or plant the sentinel. */
@@ -168,12 +170,8 @@ const EXEMPT: Record<string, string> = {
     "a source-text audit of src/server.ts plus the pure configInEffect and replySettingsOf over makePersonaConfig fixtures; it reads no credentials and runs no reload controller",
   'tests/persona-identity.test.ts':
     "fake tokens are inputs to the test helper's TOKEN_LIKE / isTokenLike matcher table, whose results are booleans; nothing is logged, thrown or written",
-  'tests/approve-trust-folder-dialog.test.ts':
-    "drives the session manager's pre-session dialog approval over stub agent-director rows and scripted tmux pane text, none of which holds a token; it reads no config or credentials and builds no Slack client",
   'tests/block-action-received.test.ts':
     "the click handler's emitBlockActionReceived over encoded action IDs and fixed channel and user IDs, captured as trail events; no input holds a token or credentials content",
-  'tests/relay-repro.test.ts':
-    "the permission relay end to end over makeStubSlack stubs with no leak marker and a stub agent-director whose rows and request tokens are UUIDs; no input holds a Slack token or credentials content",
 }
 
 /** The AC 20 named legs: suites that must call `assertNoLeak`, with their extra content rules. */

@@ -151,6 +151,7 @@ import {
 } from './agent-director-errors.ts'
 import {
   AD_CALL_KILL_ROW_NOT_READ_LIVE,
+  AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_VERB_KILL,
   classifyAdError,
@@ -254,7 +255,7 @@ import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import { createReloadTickDriver } from './reload-timer.ts'
 import { PRODUCTION_SLACK_CLIENT_FACTORY } from './persona-slack-clients.ts'
-import { initOutageState, setOutageFlag, clearOutageFlag, raiseTmuxUnavailable, resetAllToHealthy, withOutageDetection, reportAgentDirectorError } from './outage-state.ts'
+import { initOutageState, setOutageFlag, clearOutageFlag, raiseAdConfigMalformed, raiseTmuxUnavailable, resetAllToHealthy, withOutageDetection, reportAgentDirectorError } from './outage-state.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1007,24 +1008,31 @@ export async function _runCallTimeoutStartStep(
  * a `status` result maps through `livenessReadingForStatus` (`pending` →
  * `pending`, carrying the row's raw launch start when the result shows one,
  * b.jg5 SRJ-115; another live state → `live`, `ended` or `missing` → `dead`,
- * any other state → `unknown`, logged), and clears `ad-unreachable`. It
+ * any other state → `unknown`, logged), and clears `ad-unreachable` and
+ * `ad-config-malformed` (b.jg5 SRJ-312: agent-director loaded its config and
+ * read the store). It
  * never clears `tmux-unavailable` (b.jg5 SRJ-312): a `status` is not
  * tmux-touching, so neither its success nor its `ErrSpawnNotFound` shows tmux
  * answering; only a tmux-touching success or GONE (the outage wrappers), or a
  * check that finds the row live and connected with its stream (the health
  * tick's healthy branch, a retry's healthy row), clears it. A `status` error
  * is decided by name through `src/ad-error-class.ts`:
- *   - `ErrSpawnNotFound` → `dead`; clears `ad-unreachable`, as a state
- *     answer does;
+ *   - `ErrSpawnNotFound` → `dead`; clears `ad-unreachable` and
+ *     `ad-config-malformed`, as a state answer does;
  *   - `ErrSystemInstallDisappeared` → `dead`; raises `ad-unreachable` with its
  *     binary path;
  *   - `ErrTmuxNotAvailable` (ENVIRONMENT) → `unknown`; raises
  *     `tmux-unavailable` through `raiseTmuxUnavailable` with the error, which
  *     posts SRJ-1021's onset for the re-bound-socket form;
- *   - any other thrown value (a CONFIG answer, each UNAVAILABLE form,
- *     `ErrCallTimeout`, CSCB's `UnknownError` wrapper, `ErrInternal`, a name
- *     CSCB does not know, a value that is not an agent-director error) →
- *     `unknown`, with one log line: a `status` error is never read as dead.
+ *   - a CONFIG answer (`ErrConfigMalformed`) → `unknown`; raises
+ *     `ad-config-malformed` through `raiseAdConfigMalformed` with the error
+ *     (b.jg5 SRJ-316: its one onset per episode, and its raise line), and
+ *     logs the shared line below at every read;
+ *   - any other thrown value (each UNAVAILABLE form, `ErrCallTimeout`,
+ *     CSCB's `UnknownError` wrapper, `ErrInternal`, a name CSCB does not
+ *     know, a value that is not an agent-director error) → `unknown`, with
+ *     one log line: a `status` error is never read as dead.
+ * Every error but `ErrSpawnNotFound` leaves `ad-config-malformed` as it was.
  * A key not in the persona config (or no config) reads `dead` with no
  * `status` call; the relaunch gate refuses such a key before any kill or
  * launch.
@@ -1034,8 +1042,8 @@ export async function _runCallTimeoutStartStep(
  * (`reportAgentDirectorError` with the verb `status`): inside a restart run
  * it arms the persona's retry timer (b.jg5 SRJ-301), and from the health
  * tick, which runs outside every attempt, it arms nothing, except for an
- * ENVIRONMENT answer, which arms the persona's timer in any context (b.jg5
- * SRJ-311).
+ * ENVIRONMENT or CONFIG answer, which arms the persona's timer in any context
+ * (b.jg5 SRJ-311, SRJ-316).
  *
  * @internal
  */
@@ -1050,8 +1058,10 @@ export function _buildIsSessionAliveAdapter(
     try {
       const r = await getClient().status({ claude_instance_id })
       // b.jg5 SRJ-312: a `status` is not tmux-touching, so its success never
-      // clears `tmux-unavailable`; it clears `ad-unreachable` only.
+      // clears `tmux-unavailable`. It reads agent-director's store, so it
+      // clears `ad-unreachable` and `ad-config-malformed`.
       clearOutageFlag(key, 'ad-unreachable')
+      clearOutageFlag(key, 'ad-config-malformed')
       const reading = livenessReadingForStatus(r)
       if (reading.kind === LIVENESS_UNKNOWN) {
         console.error(`[slack] isSessionAlive: status answered a state CSCB does not know for persona=${key} — read as unknown, not dead`)
@@ -1075,7 +1085,9 @@ export function _buildIsSessionAliveAdapter(
 function statusErrorReading(key: string, err: unknown): LivenessReading {
   if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
     // b.jg5 SRJ-312: agent-director answered, but tmux did not; `tmux-unavailable` stays raised.
+    // It loaded its config and read the store, so `ad-config-malformed` clears.
     clearOutageFlag(key, 'ad-unreachable')
+    clearOutageFlag(key, 'ad-config-malformed')
     return LIVENESS_READING_DEAD
   }
   if (hasAdErrorName(err, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME)) {
@@ -1087,6 +1099,9 @@ function statusErrorReading(key: string, err: unknown): LivenessReading {
     raiseTmuxUnavailable(key, err)
     return LIVENESS_READING_UNKNOWN
   }
+  // b.jg5 SRJ-316: a CONFIG answer raises `ad-config-malformed` (once per
+  // episode) and still reads `unknown`, with the shared line below.
+  if (classifyAdError(err).errorClass === AD_ERROR_CLASS_CONFIG) raiseAdConfigMalformed(key, err)
   console.error(`[slack] isSessionAlive: status error for persona=${key}: ${describeThrownValue(err)} — read as unknown, not dead`)
   return LIVENESS_READING_UNKNOWN
 }
@@ -1172,13 +1187,16 @@ export function _buildStatRouteImpl(deps?: {
  * would (`holdLaunchIfConfigDirUnresolvable`); the launch that follows is then
  * refused by the relaunch gate (`'skipped'`), counting no failure.
  *
- * b.jg5 SRJ-105, SRJ-311: a kill that meets an UNAVAILABLE outcome (by name,
- * `ErrTmuxKillFailed` included) or an ENVIRONMENT answer
- * (`ErrTmuxNotAvailable`, which also raises `tmux-unavailable` and arms the
- * persona's retry timer through the outage wrapper) answers
+ * b.jg5 SRJ-105, SRJ-110, SRJ-311, SRJ-316: a kill that meets an
+ * UNAVAILABLE outcome (by name, `ErrTmuxKillFailed` included), an
+ * ENVIRONMENT answer (`ErrTmuxNotAvailable`, which also raises
+ * `tmux-unavailable` and arms the persona's retry timer through the outage
+ * wrapper) or a CONFIG answer (`ErrConfigMalformed`, which the wrapper turns
+ * into the `ad-config-malformed` outage and an armed retry timer) answers
  * `KILL_SESSION_REFUSED`, decided by the arming predicate
  * (`unavailableRetryCauseFor`, by name through `src/ad-error-class.ts`), and
  * the restart work launches nothing and counts nothing: the refused outcome.
+ * The kill is not repeated.
  * `ErrSpawnNotFound` and `ErrSystemInstallDisappeared` resolve with nothing,
  * as before, and every other kill error is ignored as before; the launch
  * follows.
@@ -1212,9 +1230,10 @@ export function _buildKillSessionAdapter(
     } catch (err) {
       if (err instanceof ErrSpawnNotFound) return
       if (err instanceof ErrSystemInstallDisappeared) return
-      // b.jg5 SRJ-105, SRJ-311: an UNAVAILABLE kill (`ErrTmuxKillFailed`
-      // included) or an ENVIRONMENT kill (`ErrTmuxNotAvailable`), classified
-      // by name, is a refusal: the restart work launches nothing.
+      // b.jg5 SRJ-105, SRJ-311, SRJ-316: an UNAVAILABLE kill
+      // (`ErrTmuxKillFailed` included), an ENVIRONMENT kill
+      // (`ErrTmuxNotAvailable`) or a CONFIG kill (`ErrConfigMalformed`),
+      // classified by name, is a refusal: the restart work launches nothing.
       if (unavailableRetryCauseFor(err, AD_VERB_KILL) !== undefined) {
         console.error(
           `[slack] killSession (restart adapter): kill refused for persona=${key}: ${describeAgentDirectorFailure(err)} — no relaunch follows (b.jg5 SRJ-105)`,

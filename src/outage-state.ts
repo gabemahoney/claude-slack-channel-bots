@@ -1,8 +1,10 @@
 /**
  * outage-state.ts — Persona-keyed outage-flag state machine + notice emit surface.
  *
- * Tracks three orthogonal outage classes per persona (b.av2 SR-6.3), keyed by
- * persona key, and emits onset / all-clear notices via the injected `notify`
+ * Tracks four orthogonal outage classes per persona (b.av2 SR-6.3; b.jg5
+ * SRJ-316 adds `ad-config-malformed`), keyed by persona key, in the exported
+ * stable order `OUTAGE_CLASS_ORDER`, and emits onset / all-clear notices via
+ * the injected `notify`
  * hook, which production wires to the per-persona notifier
  * (`src/persona-notifier.ts`): the notice goes to that persona's destination
  * and the notifier adds the persona reference (b.av2 SR-7.2). The module is
@@ -17,26 +19,41 @@
  *                                            SRJ-1021's onset for the re-bound-socket form
  *                                            (isDifferentTmuxServerError), today's otherwise;
  *                                            records no detail (b.jg5 SRJ-1021)
+ *   - raiseAdConfigMalformed(key, err)     — the one raise entry for ad-config-malformed (a CONFIG
+ *                                            answer, `ErrConfigMalformed`): emits SRJ-1018's onset
+ *                                            quoting the classifier's rendered message, records no
+ *                                            detail, logs one raise line (b.jg5 SRJ-316, SRJ-1018)
  *   - clearOutageFlag(key, cls, reading?)  — lower flag; emits all-clear when set empties;
- *                                            a real clear is told to the cleared-flag observer
+ *                                            a real clear is told to the cleared-flag observer;
+ *                                            a real ad-config-malformed clear logs one line
  *   - resetAllToHealthy(keys)              — silent wipe (boot-time reset; one key at a teardown);
  *                                            tells the observer nothing
  *   - withOutageDetection(key, dir, call, fn) — AD verb wrapper; raises/clears flags on error/success;
  *                                            `call` is the verb `fn` calls, declared by the site;
  *                                            clears tmux-unavailable only on a tmux-touching
- *                                            success or GONE (b.jg5 SRJ-312)
+ *                                            success or GONE, and ad-config-malformed only on a
+ *                                            success (b.jg5 SRJ-312)
  *   - withSpawnDetection(key, dir, call, fn)  — like withOutageDetection + clears cwd-unreachable on success
  *   - reportAgentDirectorError(key, err, call) — report an error to the retry timer's trigger sink
  *                                            (inside a launch or recovery attempt, and for
- *                                            ENVIRONMENT in any context; b.jg5 SRJ-301, SRJ-311)
- *                                            and start or continue the persona's tmux-unresponsive
- *                                            condition (b.jg5 SRJ-307)
+ *                                            ENVIRONMENT and CONFIG in any context; b.jg5 SRJ-301,
+ *                                            SRJ-311, SRJ-316) and start or continue the persona's
+ *                                            tmux-unresponsive condition (b.jg5 SRJ-307)
  *   - _resetOutageState()                  — test-only state reset
  *
  * Template exports (used by tests):
+ *   - OUTAGE_CLASS_ORDER                   — the stable class order (read-only)
  *   - ONSET_TEMPLATES
  *   - tmuxServerChangedOnset()             — SRJ-1021's onset for the re-bound socket
+ *   - adConfigMalformedOnset(err)          — SRJ-1018's onset for a thrown CONFIG value
  *   - ALL_CLEAR_TEMPLATE
+ *
+ * `ad-config-malformed` (b.jg5 SRJ-316) is handled as `ad-unreachable` is:
+ * the same destination, one onset (its one alert per episode: the flag is
+ * its once-per-episode latch, so the `ad-config-malformed` kind in
+ * `src/persona-episodes.ts` never posts) and one all-clear, which lists the
+ * bare class: agent-director's description appears only in the onset. No
+ * action is taken because of it; the retry timer retries the persona.
  *
  * The `tmux-unresponsive` condition (b.jg5 SRJ-307, SRJ-310) is a
  * per-persona condition kept in `src/persona-episodes.ts`, not an
@@ -51,14 +68,17 @@
 
 import type { Client } from 'agent-director'
 import {
+  AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_GONE,
   adCallVerb,
   classifyAdError,
+  describeAdErrorClassification,
   isDifferentTmuxServerError,
   isLaunchCall,
   isTmuxTouchingCall,
   type AdCall,
+  type AdErrorClassification,
   type AdVerb,
 } from './ad-error-class.ts'
 import {
@@ -66,7 +86,8 @@ import {
   ErrCwdNotFound,
   ErrCwdNotADirectory,
 } from './agent-director-errors.ts'
-import { describeThrownValue } from './persona-connection-errors.ts'
+import { describeThrownValue, renderLogMessageText } from './persona-connection-errors.ts'
+import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 import { TMUX_UNRESPONSIVE_END_TMUX_VERB, type TmuxUnresponsiveSink } from './persona-episodes.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
@@ -82,7 +103,10 @@ import {
 // ---------------------------------------------------------------------------
 
 /** Union of all outage classifications. No 'healthy' member — absence == healthy. */
-export type OutageClass = 'ad-unreachable' | 'cwd-unreachable' | 'tmux-unavailable'
+export type OutageClass = 'ad-unreachable' | 'cwd-unreachable' | 'tmux-unavailable' | 'ad-config-malformed'
+
+/** The `ad-config-malformed` class (b.jg5 SRJ-316): agent-director refuses its config file. */
+const AD_CONFIG_MALFORMED: OutageClass = 'ad-config-malformed'
 
 /**
  * Detail record for a single outage class in a bad stretch.
@@ -130,8 +154,11 @@ export interface OutageStateDeps {
    * that read the row live (the health tick's healthy branch, a retry's
    * healthy row). Called after the state change and any all-clear notice. A
    * clear of a flag not raised, and `resetAllToHealthy` (boot, teardown),
-   * never call it. Production binds it in `main()` so a `tmux-unavailable`
-   * clear reaches the retry timer's condition-end entry. A throw is swallowed.
+   * never call it. It is told every class's clear, `ad-config-malformed`
+   * included. Production binds it in `main()` so a `tmux-unavailable` clear,
+   * and only that class's, reaches the retry timer's condition-end entry: an
+   * `ad-config-malformed` clear stops no timer (b.jg5 SRJ-305 gives that
+   * outage no stop). A throw is swallowed.
    * Absent: nothing is called.
    */
   onFlagCleared?: (key: string, cls: OutageClass, reading?: string) => void
@@ -162,19 +189,29 @@ function entryFor(key: string): PersonaEntry {
 // Notice templates
 // ---------------------------------------------------------------------------
 
-/** Stable iteration order for the all-clear template. */
-const STABLE_CLASS_ORDER: OutageClass[] = [
+/**
+ * OUTAGE_CLASS_ORDER — the stable class order: every `OutageClass`, once, in
+ * the order the all-clear lists the resolved classes (b.jg5 SRJ-1018:
+ * `ad-config-malformed` after `tmux-unavailable`). Read-only; tests and
+ * persona-keyed audits iterate it.
+ */
+export const OUTAGE_CLASS_ORDER: readonly OutageClass[] = Object.freeze([
   'ad-unreachable',
   'cwd-unreachable',
   'tmux-unavailable',
-]
+  AD_CONFIG_MALFORMED,
+])
 
 /**
  * ONSET_TEMPLATES — one template function per outage class.
  * The optional `detail` parameter carries class-specific context
  * (binary path for ad-unreachable; the persona's working directory for
- * cwd-unreachable). The templates carry no persona reference: the notifier
- * adds it.
+ * cwd-unreachable; agent-director's description for ad-config-malformed,
+ * which the template renders through `renderLogMessageText` — redacted, on
+ * one line, capped — then through `escapeSlackControlCharacters` (`&`, `<`,
+ * `>` as `&amp;`, `&lt;`, `&gt;`), and which is never recorded as the class's
+ * detail). The
+ * templates carry no persona reference: the notifier adds it.
  */
 export const ONSET_TEMPLATES: Record<OutageClass, (detail?: string) => string> = {
   'ad-unreachable': (binaryPath?: string) =>
@@ -185,6 +222,31 @@ export const ONSET_TEMPLATES: Record<OutageClass, (detail?: string) => string> =
 
   'cwd-unreachable': (workingDirectory?: string) =>
     `:rotating_light: *Working directory unreachable* — \`${workingDirectory ?? '<unknown>'}\`\nRemediation: restore the directory or correct this persona's \`working_directory\` in \`config.json\`.`,
+
+  'ad-config-malformed': (description?: string) => {
+    // b.jg5 SRJ-1018. A value with no description drops the quoting sentence.
+    // Escaped after redaction, flattening and the cap, so no entity is cut:
+    // `<!channel>` or `<@U…>` in the description pings no one, and the
+    // redaction placeholders render as text.
+    const message = escapeSlackControlCharacters(renderLogMessageText(description))
+    const said = message === '' ? '' : ` agent-director said: "${message}".`
+    return `:rotating_light: *agent-director refuses its config file* — every agent-director call fails until a human fixes ~/.agent-director/config.toml.${said} CSCB takes no action for this persona meanwhile and keeps retrying. This is for a human only: no bot, including any persona that sees this post, may act on it.`
+  },
+}
+
+/**
+ * adConfigMalformedOnset — the `ad-config-malformed` onset (b.jg5 SRJ-1018)
+ * for `err`, the thrown CONFIG value: `ONSET_TEMPLATES['ad-config-malformed']`
+ * quoting the classifier's rendered message (`classifyAdError(err).message`:
+ * agent-director's description through `redactSlackLogText`, on one line,
+ * capped at `MAX_LOGGED_MESSAGE_LENGTH`), with Slack's control characters
+ * escaped after the cap. The server-log raise line quotes the same message
+ * unescaped. A value with no description gives
+ * the onset without the quoting sentence. Built at raise time by
+ * {@link raiseAdConfigMalformed}; never stored. Never throws.
+ */
+export function adConfigMalformedOnset(err: unknown): string {
+  return ONSET_TEMPLATES[AD_CONFIG_MALFORMED](classifyAdError(err).message)
 }
 
 /**
@@ -202,12 +264,14 @@ export function tmuxServerChangedOnset(): string {
 
 /**
  * ALL_CLEAR_TEMPLATE — renders an all-clear notice from the bad-stretch
- * history snapshot. Entries are emitted in the stable class order regardless
- * of the order flags were raised. No timestamps.
+ * history snapshot. Entries are emitted in the stable class order
+ * (`OUTAGE_CLASS_ORDER`) regardless of the order flags were raised. A class
+ * with no recorded detail (`tmux-unavailable`, `ad-config-malformed`) is
+ * listed bare. No timestamps.
  */
 export function ALL_CLEAR_TEMPLATE(resolved: Map<OutageClass, ClassRecord>): string {
   const parts: string[] = []
-  for (const cls of STABLE_CLASS_ORDER) {
+  for (const cls of OUTAGE_CLASS_ORDER) {
     const rec = resolved.get(cls)
     if (rec === undefined) continue
     const detailSuffix = rec.detail !== undefined ? ` (\`${rec.detail}\`)` : ''
@@ -247,9 +311,13 @@ export function getOutageFlags(key: string): ReadonlySet<OutageClass> {
  *
  * State mutates BEFORE the emit so a synchronous throw in `notify`
  * cannot cause double-emission on the next observation.
+ *
+ * `ad-config-malformed` is raised through {@link raiseAdConfigMalformed}; a
+ * `detail` given here for it renders in the onset only and is never recorded,
+ * so the all-clear lists the bare class.
  */
 export function setOutageFlag(key: string, cls: OutageClass, detail?: string): void {
-  raiseFlag(key, cls, detail, () => ONSET_TEMPLATES[cls](detail))
+  raiseFlag(key, cls, cls === AD_CONFIG_MALFORMED ? undefined : detail, () => ONSET_TEMPLATES[cls](detail))
 }
 
 /**
@@ -270,18 +338,92 @@ export function raiseTmuxUnavailable(key: string, err: unknown): void {
 }
 
 /**
+ * raiseAdConfigMalformed — the one raise entry for `ad-config-malformed`
+ * (b.jg5 SRJ-316, SRJ-1018), for every site that raises it on a CONFIG answer
+ * (`ErrConfigMalformed`, decided by the caller through `src/ad-error-class.ts`
+ * by name): the wrappers and the liveness adapter's bare `status`. `err` is
+ * the thrown value. The flag is set first, then one server-log line names
+ * the persona and the classification (`describeAdErrorClassification`: the
+ * reported name and the rendered message, no token), then the onset
+ * (`adConfigMalformedOnset(err)`) is emitted. No detail is recorded, so the
+ * all-clear lists the bare class. Same-flag dedupe as `setOutageFlag`: while
+ * the flag is raised, a second CONFIG answer logs and posts nothing.
+ *
+ * The onset goes out through {@link notifyIsolated}: a `notify` that throws
+ * or rejects is logged once and the onset counts as posted (the flag stays
+ * raised, so it is not posted again this episode), and this entry never
+ * throws. A wrapper raising it from its catch block therefore still reports
+ * the CONFIG value (`reportAgentDirectorError`, which arms the retry timer)
+ * and rethrows that value, not the notify failure.
+ */
+export function raiseAdConfigMalformed(key: string, err: unknown): void {
+  raiseFlag(
+    key,
+    AD_CONFIG_MALFORMED,
+    undefined,
+    () => adConfigMalformedOnset(err),
+    () => logAdConfigMalformedRaised(key, classifyAdError(err)),
+    notifyIsolated,
+  )
+}
+
+/**
+ * Post `text` to persona `key` through `deps.notify` without letting it throw
+ * or reject: a synchronous throw, or a returned promise that rejects, is
+ * logged once (`describeThrownValue`) and otherwise ignored, so the notice
+ * counts as posted (the precedent of `src/persona-episodes.ts`). Never throws.
+ */
+function notifyIsolated(key: string, text: string): void {
+  const logFailure = (failure: unknown): void => {
+    console.error(
+      `[slack] outage-state: onset notice for persona=${key} failed: ${describeThrownValue(failure)} — the flag stays raised; the notice counts as posted`,
+    )
+  }
+  try {
+    const pending: unknown = deps?.notify(key, text)
+    if (pending instanceof Promise) pending.catch(logFailure)
+  } catch (failure) {
+    logFailure(failure)
+  }
+}
+
+/**
+ * The `ad-config-malformed` raise line (b.jg5 SRJ-1014), built from the
+ * classification's own fields only (`describeAdErrorClassification`: the
+ * class, the reported name when safe, the rendered message), never from the
+ * thrown value.
+ */
+function logAdConfigMalformedRaised(key: string, classification: AdErrorClassification): void {
+  console.error(
+    `[slack] outage-state: ad-config-malformed raised for persona=${key}: ${describeAdErrorClassification(classification)} — no action is taken; the retry timer retries the persona (b.jg5 SRJ-316)`,
+  )
+}
+
+/**
  * Raise `cls` for persona `key` with `detail` recorded for the all-clear, and
  * emit the onset `onset` renders. Same-flag re-raise is a silent no-op
- * (dedupe); state mutates before the emit.
+ * (dedupe); state mutates before the emit. `onRaised`, when given, runs once
+ * on a real raise, after the state change and before the emit. The onset is
+ * emitted through `post` when given, else `deps.notify` directly (so a
+ * synchronous throw there reaches the caller).
  */
-function raiseFlag(key: string, cls: OutageClass, detail: string | undefined, onset: () => string): void {
+function raiseFlag(
+  key: string,
+  cls: OutageClass,
+  detail: string | undefined,
+  onset: () => string,
+  onRaised?: () => void,
+  post?: (key: string, text: string) => void,
+): void {
   if (!deps) return
   const entry = entryFor(key)
   if (entry.flags.has(cls)) return // same-flag dedupe
   // Mutate state BEFORE emit (SR-V-2.x state-before-emit contract).
   entry.flags.add(cls)
   entry.badStretchClasses.set(cls, { detail })
-  deps.notify(key, onset())
+  onRaised?.()
+  if (post !== undefined) post(key, onset())
+  else deps.notify(key, onset())
 }
 
 /**
@@ -294,6 +436,12 @@ function raiseFlag(key: string, cls: OutageClass, detail: string | undefined, on
  * a real clear (the flag was raised) is told to the cleared-flag observer
  * (`OutageStateDeps.onFlagCleared`) with `reading`: the row reading a check
  * that found the row live brings (b.jg5 SRJ-305), absent otherwise.
+ *
+ * A real `ad-config-malformed` clear logs one server-log line naming the
+ * persona (b.jg5 SRJ-1014) after the state change and before any all-clear.
+ * Its callers clear it only on an answer that shows agent-director read its
+ * store: a wrapped call's success, and the liveness adapter's `status`
+ * success or `ErrSpawnNotFound` (b.jg5 SRJ-312).
  */
 export function clearOutageFlag(key: string, cls: OutageClass, reading?: string): void {
   if (!deps) return
@@ -302,6 +450,11 @@ export function clearOutageFlag(key: string, cls: OutageClass, reading?: string)
   if (!entry.flags.has(cls)) return // same-state dedupe
   // Mutate state BEFORE emit.
   entry.flags.delete(cls)
+  if (cls === AD_CONFIG_MALFORMED) {
+    console.error(
+      `[slack] outage-state: ad-config-malformed cleared for persona=${key} — agent-director read its store again (b.jg5 SRJ-312)`,
+    )
+  }
   if (entry.flags.size === 0 && entry.badStretchClasses.size > 0) {
     // Snapshot history and reset BEFORE the notify call.
     const snapshot = new Map(entry.badStretchClasses)
@@ -354,11 +507,18 @@ export function resetAllToHealthy(keys: string[]): void {
  *     workingDirectory, the persona's working directory) UNLESS
  *     workingDirectory is undefined, in which case logs loudly and rethrows
  *     WITHOUT raising the flag (defensive carve-out for verb-class drift).
+ *   - CONFIG (`ErrConfigMalformed`, by class through `src/ad-error-class.ts`)
+ *     from any declared verb, in or out of an attempt → raises
+ *     'ad-config-malformed' through `raiseAdConfigMalformed` with the error
+ *     (b.jg5 SRJ-316)
  *   - Other errors → no flag change; rethrow unchanged.
+ * No error answer clears 'ad-config-malformed': not `ErrSpawnNotFound`, not
+ * GONE (b.jg5 SRJ-312).
  * Then, every error is reported (`reportAgentDirectorError`) with the
  * declared call, which arms the persona's retry timer when the call ran
  * inside a launch or recovery attempt for it and the error is a trigger, or
- * the error is ENVIRONMENT (in any context, b.jg5 SRJ-311), and, inside such
+ * the error is ENVIRONMENT or CONFIG (in any context, b.jg5 SRJ-311,
+ * SRJ-316), and, inside such
  * an attempt, starts or continues its `tmux-unresponsive` condition when the
  * call is tmux-touching and the error is UNAVAILABLE (not
  * `ErrTmuxKillFailed`). A GONE answer (`ErrTmuxSendKeys`,
@@ -369,6 +529,8 @@ export function resetAllToHealthy(keys: string[]): void {
  *
  * On success (b.jg5 SRJ-312):
  *   - 'ad-unreachable' clears on any call;
+ *   - 'ad-config-malformed' clears on any call: every wrapped verb reads
+ *     agent-director's store (`version` and `help` are never wrapped);
  *   - 'tmux-unavailable' clears only when the declared call is tmux-touching
  *     (`isTmuxTouchingCall`: `spawn`, plain or reuse, `resume`, `read-pane`,
  *     `send-keys`, `pause`, and a `kill` only when declared as a kill of a
@@ -400,6 +562,7 @@ export async function withOutageDetection<T>(
   try {
     const result = await fn(deps.getClient())
     clearOutageFlag(key, 'ad-unreachable')
+    clearOutageFlag(key, AD_CONFIG_MALFORMED)
     if (isTmuxTouchingCall(call)) {
       // A launch's success leaves its row `pending`: both ends bring that reading.
       const reading = isLaunchCall(call) ? UNAVAILABLE_RETRY_ROW_PENDING : undefined
@@ -413,6 +576,8 @@ export async function withOutageDetection<T>(
       setOutageFlag(key, 'ad-unreachable', err.binaryPath)
     } else if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
       raiseTmuxUnavailable(key, err)
+    } else if (errorClass === AD_ERROR_CLASS_CONFIG) {
+      raiseAdConfigMalformed(key, err)
     } else if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
       if (workingDirectory !== undefined) {
         setOutageFlag(key, 'cwd-unreachable', workingDirectory)
@@ -439,20 +604,21 @@ export async function withOutageDetection<T>(
  * and two unwrapped calls for their own errors: the liveness adapter's bare
  * `status` and the shared findMissing sweep's `find-missing`.
  *
- * - An ENVIRONMENT answer (`ErrTmuxNotAvailable`) from any verb, `kill`
- *   included, is sent once to the installed trigger sink with the
- *   ENVIRONMENT cause in any context: inside an attempt for `key`, inside
+ * - An ENVIRONMENT answer (`ErrTmuxNotAvailable`) or a CONFIG answer
+ *   (`ErrConfigMalformed`) from any verb, `kill` included, is sent once to
+ *   the installed trigger sink with its cause (ENVIRONMENT, b.jg5 SRJ-311;
+ *   CONFIG, SRJ-316) in any context: inside an attempt for `key`, inside
  *   another persona's attempt, or outside every attempt
  *   (`reportAttemptError` in `src/unavailable-retry.ts`).
  * - Inside a launch or recovery attempt for `key`, any other error the
  *   arming predicate answers a cause for is sent once to the trigger sink,
- *   and the attempt records the error (ENVIRONMENT included) as its last,
- *   so a launch it ends is refused and never counted.
+ *   and the attempt records the error (ENVIRONMENT and CONFIG included) as
+ *   its last, so a launch it ends is refused and never counted.
  * - Inside such an attempt, when the call is tmux-touching
  *   (`isTmuxTouchingCall`) and the arming predicate answers the UNAVAILABLE
- *   cause (never the kill-failure or ENVIRONMENT cause), the installed
- *   condition sink starts or continues the persona's `tmux-unresponsive`
- *   condition.
+ *   cause (never the kill-failure, ENVIRONMENT or CONFIG cause), the
+ *   installed condition sink starts or continues the persona's
+ *   `tmux-unresponsive` condition.
  *
  * With no sink installed, nothing is armed or started. Flags and notices are
  * untouched, and it never throws, so the caller's own handling and rethrow
@@ -468,7 +634,7 @@ export function reportAgentDirectorError(key: string, err: unknown, call: AdCall
  * Start or continue persona `key`'s `tmux-unresponsive` condition for `err`
  * from `call`, when the call ran inside an attempt for `key`, is
  * tmux-touching and the arming predicate answers the UNAVAILABLE cause (so
- * never for ENVIRONMENT, b.jg5 SRJ-307). Never throws.
+ * never for ENVIRONMENT or CONFIG, b.jg5 SRJ-307). Never throws.
  */
 function startTmuxUnresponsive(key: string, err: unknown, call: AdCall, verb: AdVerb | undefined): void {
   try {

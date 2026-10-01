@@ -179,7 +179,12 @@ export const PERSONA_EPISODE_KIND_KILL_FAILURE = 'kill-failure'
 /** `tmux-unresponsive` (SRJ-307 to SRJ-310): from the first refusal until the condition ends. Posted by its condition (below). */
 export const PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE = 'tmux-unresponsive'
 
-/** `ad-config-malformed` (SRJ-316): as the `ad-unreachable` outage's episode. No poster yet (b.jg5 E12). */
+/**
+ * `ad-config-malformed` (SRJ-316, SRJ-1016): as the `ad-unreachable` outage's
+ * episode. Its once-per-episode latch is the `ad-config-malformed` outage
+ * flag in `src/outage-state.ts` (raised by `raiseAdConfigMalformed`, which
+ * posts its one onset), so this kind never posts and opens no episode here.
+ */
 export const PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED = 'ad-config-malformed'
 
 /** `ErrInvalidFlags` hold: as SRJ-207 states. No poster yet (b.jg5 E23). */

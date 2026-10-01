@@ -26,10 +26,12 @@
  *      deleted and spawned fresh instead (a resume keeps the old config dir).
  *   3. Any other error raises a spawn-failure notice for the persona via
  *      `notifySpawnFailure` (through the per-persona notifier) and is logged,
- *      except a refusal (b.jg5 SRJ-105, `refusalAt`): an UNAVAILABLE or
- *      ENVIRONMENT (`ErrTmuxNotAvailable`, SRJ-311) outcome at any spawn,
- *      resume, kill, delete or reconnect keystroke, or a read error (an
- *      ENVIRONMENT answer included) at the collision `get` or the working-row
+ *      except a refusal (b.jg5 SRJ-105, `refusalAt`): an UNAVAILABLE,
+ *      ENVIRONMENT (`ErrTmuxNotAvailable`, SRJ-311) or CONFIG
+ *      (`ErrConfigMalformed`, SRJ-316: the wrapper has raised the
+ *      `ad-config-malformed` outage) outcome at any spawn, resume, kill,
+ *      delete or reconnect keystroke, or a read error (an ENVIRONMENT or a
+ *      CONFIG answer included) at the collision `get` or the working-row
  *      wait's `status`. It is logged once and stops the ladder with `failed`:
  *      no notice, no `spawn-failed` entry, no `dead-session` verdict, and no
  *      further kill, delete or launch.
@@ -74,8 +76,8 @@
  * pass does not wait for it (b.f2b). A restart (`launchSession`) runs the
  * launch only, and only while the caller's gate says the persona is up.
  * Every collision ladder runs as a launch attempt for its persona (b.jg5
- * SRJ-301): an UNAVAILABLE or ENVIRONMENT outcome, or a `status`, `get` or
- * `list` error, inside it arms the persona's retry timer, and a `failed`
+ * SRJ-301): an UNAVAILABLE, ENVIRONMENT or CONFIG outcome, or a `status`,
+ * `get` or `list` error, inside it arms the persona's retry timer, and a `failed`
  * launch whose last agent-director error armed it is refused
  * (`SpawnPersonaResult.refused`), which the restart path never counts.
  *
@@ -111,7 +113,14 @@ import {
   resolveClaudeConfigDir,
 } from './persona-identity.ts'
 import { getClient } from './agent-director-client.ts'
-import { raiseTmuxUnavailable, reportAgentDirectorError, setOutageFlag, withOutageDetection, withSpawnDetection } from './outage-state.ts'
+import {
+  raiseAdConfigMalformed,
+  raiseTmuxUnavailable,
+  reportAgentDirectorError,
+  setOutageFlag,
+  withOutageDetection,
+  withSpawnDetection,
+} from './outage-state.ts'
 import {
   AgentDirectorError,
   ErrInstanceIdCollision,
@@ -132,6 +141,7 @@ import {
 } from './agent-director-errors.ts'
 import {
   AD_CALL_KILL_ROW_READ_LIVE,
+  AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_ENVIRONMENT,
   adKillCall,
   type AdKillCall,
@@ -472,15 +482,17 @@ export function notifyRestartCapReached(key: string): void {
 type RefusedSiteResult = { key: string; action: 'failed' }
 
 /**
- * b.jg5 SRJ-105, SRJ-311: the one handling of a refusal at the launch and
- * recovery sites. `err` was thrown by an agent-director call made with `verb`
- * for persona `key`. It is a refusal when the arming predicate
+ * b.jg5 SRJ-105, SRJ-311, SRJ-316: the one handling of a refusal at the
+ * launch and recovery sites. `err` was thrown by an agent-director call made
+ * with `verb` for persona `key`. It is a refusal when the arming predicate
  * (`unavailableRetryCauseFor`, which classifies by name through
  * `src/ad-error-class.ts`) answers a cause for it: UNAVAILABLE from any verb
  * (`ErrTmuxKillFailed` included), ENVIRONMENT (`ErrTmuxNotAvailable`) from
  * any verb (`kill` included: nothing is killed, deleted or respawned because
- * of it), and from a `status`, `get` or `list` any error but
- * `ErrSpawnNotFound`, a CONFIG answer and an UNUSABLE NAME answer.
+ * of it), CONFIG (`ErrConfigMalformed`) from any verb (SRJ-105's CONFIG row:
+ * no action, nothing counted, never 'dead'; the wrapper has already raised
+ * the `ad-config-malformed` outage), and from a `status`, `get` or `list` any
+ * error but `ErrSpawnNotFound` and an UNUSABLE NAME answer.
  * The same rule arms the retry timer, so the site's decision and the arming
  * decision cannot drift apart.
  *
@@ -855,9 +867,10 @@ export type WaitReconnectOutcome = ReconnectOutcome | 'not-reconnected' | 'cance
  * caller recovers the persona (the ladder through resume/fresh-spawn, the
  * restart adapter by escalating it for a relaunch in the same run).
  *
- * b.jg5 SRJ-105, SRJ-311: an UNAVAILABLE or ENVIRONMENT
- * (`ErrTmuxNotAvailable`) answer to the keystrokes, at the first attempt or
- * the `ErrTmuxSendKeys` retry, is a refusal (`refusalAt`): one log line, no
+ * b.jg5 SRJ-105, SRJ-311, SRJ-316: an UNAVAILABLE, ENVIRONMENT
+ * (`ErrTmuxNotAvailable`) or CONFIG (`ErrConfigMalformed`) answer to the
+ * keystrokes, at the first attempt or the `ErrTmuxSendKeys` retry, is a
+ * refusal (`refusalAt`): one log line, no
  * spawn-failure notice, no further try, and 'failed' (never 'dead-session');
  * `reconnectMcpWithCause` marks it `refused`, so the ladder records no
  * `spawn-failed` entry for it.
@@ -887,7 +900,7 @@ export interface ReconnectResult {
   deadCause?: DeadSessionCause
   /**
    * Set on a `failed` outcome only: the keystrokes met a refusal (b.jg5
-   * SRJ-105, SRJ-311, `refusalAt`: UNAVAILABLE or ENVIRONMENT), at the first try or the
+   * SRJ-105, SRJ-311, SRJ-316, `refusalAt`: UNAVAILABLE, ENVIRONMENT or CONFIG), at the first try or the
    * `ErrTmuxSendKeys` retry. No spawn-failure notice was raised, and the
    * ladder records no `spawn-failed` entry for it.
    */
@@ -928,8 +941,8 @@ export async function reconnectMcpWithCause(
       } catch (err2) {
         if (err2 instanceof ErrSystemInstallDisappeared) return { outcome: 'failed' }
         if (err2 instanceof ErrSpawnNotInteractive) return reconnectRefusedDeadSession(err2, ref)
-        // b.jg5 SRJ-105, SRJ-311: an UNAVAILABLE or ENVIRONMENT retry is a
-        // refusal: no notice, never 'dead-session'.
+        // b.jg5 SRJ-105, SRJ-311, SRJ-316: an UNAVAILABLE, ENVIRONMENT or
+        // CONFIG retry is a refusal: no notice, never 'dead-session'.
         if (refusalAt(key, err2, 'send-keys', 'reconnectMcp', 'retry send-keys after ErrTmuxSendKeys', ref)) {
           return { outcome: 'failed', refused: true }
         }
@@ -944,8 +957,9 @@ export async function reconnectMcpWithCause(
         return { outcome: 'failed' }
       }
     }
-    // b.jg5 SRJ-105, SRJ-311: an UNAVAILABLE or ENVIRONMENT `send-keys` is a
-    // refusal: no notice, never 'dead-session', no `spawn-failed` entry.
+    // b.jg5 SRJ-105, SRJ-311, SRJ-316: an UNAVAILABLE, ENVIRONMENT or CONFIG
+    // `send-keys` is a refusal: no notice, never 'dead-session', no
+    // `spawn-failed` entry.
     if (refusalAt(key, err, 'send-keys', 'reconnectMcp', 'send-keys', ref)) return { outcome: 'failed', refused: true }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('send-keys', 'UnknownError', String(err))
     console.error(`[slack] reconnectMcp: send-keys failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
@@ -2103,11 +2117,11 @@ export function _resetFindMissingMemo(): void {
  *
  * Failures are NOT memoized — on error the next caller retries. A failure the
  * arming predicate answers a cause for (b.jg5 SRJ-105, `refusalAt` with verb
- * `find-missing`, which is not a read verb, so an UNAVAILABLE or an
- * ENVIRONMENT answer) is a refusal: one refusal line, and
+ * `find-missing`, which is not a read verb, so an UNAVAILABLE, an
+ * ENVIRONMENT or a CONFIG answer) is a refusal: one refusal line, and
  * `FIND_MISSING_REFUSED`, after which the caller calls nothing more in its
- * attempt. Any other failure, CONFIG and
- * UNUSABLE NAME included, logs once and lets the caller proceed.
+ * attempt. Any other failure, UNUSABLE NAME included, logs once and lets the
+ * caller proceed.
  *
  * @param key persona key: the outage key and log context — the sweep itself is whole-store.
  * @param logPrefix distinguishes the call sites in the log line.
@@ -2127,8 +2141,8 @@ async function reconcileMissingSweep(
 /**
  * A persona's findMissing sweep that was refused (b.jg5 SRJ-105): the sweep
  * failed with an error the arming predicate answers a cause for, which for
- * `find-missing` (not a read verb) is an UNAVAILABLE or an ENVIRONMENT
- * answer. The caller
+ * `find-missing` (not a read verb) is an UNAVAILABLE, an ENVIRONMENT or a
+ * CONFIG answer. The caller
  * stops its launch or recovery attempt: no resume, kill, delete, launch,
  * reconnect or dead-session verdict follows.
  */
@@ -2150,7 +2164,9 @@ const FIND_MISSING_REFUSED: unique symbol = Symbol('find-missing refused')
  * A joiner whose sweep failed with ENVIRONMENT (`ErrTmuxNotAvailable`, by
  * class through `src/ad-error-class.ts`) also raises its own
  * 'tmux-unavailable' before that report, as the starter's wrapper does for
- * the starter (b.jg5 SRJ-311): same onset, same-flag dedupe.
+ * the starter (b.jg5 SRJ-311): same onset, same-flag dedupe. A joiner whose
+ * sweep failed with CONFIG (`ErrConfigMalformed`) raises its own
+ * 'ad-config-malformed' the same way (b.jg5 SRJ-316).
  * For a persona's caller, the starter and each joiner alike, a refused sweep
  * answers `FIND_MISSING_REFUSED` (b.jg5 SRJ-105); a caller that acts for no
  * persona only ever gets undefined for a failure.
@@ -2199,9 +2215,13 @@ async function sharedFindMissingSweep(
     // A joiner's failure is its own: raise and report it under its key, as the
     // starter's wrapper did under the starter's (b.jg5 SRJ-301, SRJ-311).
     if (!started && key !== undefined) {
-      if (classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
+      const { errorClass } = classifyAdError(err)
+      if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
         // b.jg5 SRJ-1021: the raising error picks the onset.
         raiseTmuxUnavailable(key, err)
+      } else if (errorClass === AD_ERROR_CLASS_CONFIG) {
+        // b.jg5 SRJ-316: one outage per persona that met the answer.
+        raiseAdConfigMalformed(key, err)
       }
       reportAgentDirectorError(key, err, 'find-missing')
     }
@@ -2589,13 +2609,15 @@ async function tmuxFallbackVerdict(
  *     keyed on the process); only a provably-gone process returns
  *     'dead-session'. On ErrSpawnNotFound it falls back to the raw tmux
  *     probe (b.rmy invariant).
- *   - read errors (b.jg5 SRJ-105, SRJ-311), at the poll and at the timeout
- *     `status` alike: ErrSystemInstallDisappeared returns 'failed' quietly;
- *     any other error but ErrSpawnNotFound, a CONFIG and an UNUSABLE NAME
- *     answer, an ENVIRONMENT answer (ErrTmuxNotAvailable) included, is a
- *     refusal (`refusalAt`): one line, no notice, no `spawn-failed` entry, no
- *     tmux fallback, never 'dead-session', and 'failed'. At the timeout a
- *     CONFIG or UNUSABLE NAME answer still falls back to the tmux probe.
+ *   - read errors (b.jg5 SRJ-105, SRJ-311, SRJ-316), at the poll and at the
+ *     timeout `status` alike: ErrSystemInstallDisappeared returns 'failed'
+ *     quietly; any other error but ErrSpawnNotFound and an UNUSABLE NAME
+ *     answer, an ENVIRONMENT answer (ErrTmuxNotAvailable) and a CONFIG
+ *     answer (ErrConfigMalformed, whose wrapper raised `ad-config-malformed`)
+ *     included, is a refusal (`refusalAt`): one line, no notice, no
+ *     `spawn-failed` entry, no tmux fallback, never 'dead-session', and
+ *     'failed'. At the timeout an UNUSABLE NAME answer still falls back to
+ *     the tmux probe.
  *   - a refused findMissing sweep (b.jg5 SRJ-105), up front or at the
  *     timeout: its refusal line, then 'failed' with no status read.
  *   - ErrSpawnNotFound branch: keys on the TMUX SESSION by design — no AD row
@@ -2718,9 +2740,10 @@ async function waitForWorkingRow(
       if (isInstallGone(err)) {
         return 'failed'
       }
-      // b.jg5 SRJ-105, SRJ-311: any other read error (but a CONFIG or
-      // UNUSABLE NAME answer), an ENVIRONMENT answer included, is a refusal:
-      // no notice, no `spawn-failed` entry, nothing more is called.
+      // b.jg5 SRJ-105, SRJ-311, SRJ-316: any other read error (but an
+      // UNUSABLE NAME answer), an ENVIRONMENT and a CONFIG answer included,
+      // is a refusal: no notice, no `spawn-failed` entry, nothing more is
+      // called.
       if (refusalAt(key, err, 'status', 'waitForWaitingAndReconnect', 'status read', ref)) {
         wait.refused = true
         return 'failed'
@@ -2796,8 +2819,9 @@ async function waitForWorkingRow(
   //   the poll loop's ErrSpawnNotFound branch: alive → 'not-reconnected', gone
   //   → 'dead-session'.
   // - any other status error → 'failed', never 'dead-session' (b.jg5 SRJ-105,
-  //   below); only a CONFIG or UNUSABLE NAME answer still falls back to the
-  //   raw tmux probe, which gives 'dead-session' only for a gone session.
+  //   below), a CONFIG answer included (SRJ-316: no tmux fallback); only an
+  //   UNUSABLE NAME answer still falls back to the raw tmux probe, which
+  //   gives 'dead-session' only for a gone session.
   // - a refused sweep → 'failed' with no status read (b.jg5 SRJ-105).
   if (wait.cancelled) return waitCancelled(ref)
   if ((await reconcileMissingSweep(key, 'waitForWaitingAndReconnect: timeout', ref)) === FIND_MISSING_REFUSED) {
@@ -2816,8 +2840,8 @@ async function waitForWorkingRow(
     // b.jg5 SRJ-105, SRJ-311: a read error never reaches the tmux fallback,
     // so it can never give 'dead-session'. ErrSystemInstallDisappeared takes
     // the poll loop's early 'failed', so the two reads share one rule; any
-    // other read error, an ENVIRONMENT answer included, is a refusal and
-    // never probes tmux.
+    // other read error, an ENVIRONMENT and a CONFIG answer included, is a
+    // refusal and never probes tmux (b.jg5 SRJ-316).
     if (isInstallGone(err)) {
       return 'failed'
     }
@@ -2825,8 +2849,8 @@ async function waitForWorkingRow(
       wait.refused = true
       return 'failed'
     }
-    // A CONFIG or UNUSABLE NAME answer keeps its earlier handling (the tmux
-    // probe fallback) until its own row is built.
+    // An UNUSABLE NAME answer keeps its earlier handling (the tmux probe
+    // fallback) until its own row is built.
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('status', 'UnknownError', String(err))
     return tmuxFallbackVerdict(key, config, ref, `status error ${describeAgentDirectorFailure(e)}`)
   }
@@ -3141,8 +3165,9 @@ export async function deletePersonaInstance(key: string): Promise<boolean> {
  * go on to its delete and launch (b.jg5 SRJ-105): true after a success or
  * `ErrSpawnNotFound`, and after any other error but a refusal, which is
  * ignored as before; false for a refusal (`refusalAt`: UNAVAILABLE,
- * `ErrTmuxKillFailed` included, or ENVIRONMENT, `ErrTmuxNotAvailable`, b.jg5
- * SRJ-311), after which the caller deletes and launches nothing and answers
+ * `ErrTmuxKillFailed` included, ENVIRONMENT, `ErrTmuxNotAvailable`, b.jg5
+ * SRJ-311, or CONFIG, `ErrConfigMalformed`, SRJ-110, SRJ-316), after which
+ * the caller deletes and launches nothing and answers
  * `failed`. `call` declares whether the ladder read the
  * row in a live state (`AdKillCall`, `killPersonaInstance`). The persona
  * teardown's kill (`killPersonaInstance` itself) is unchanged.
@@ -3220,8 +3245,9 @@ async function selfHealTmuxCollisionAndRespawn(
 
 /**
  * Delete the spawn row; surface failures. Returns whether the delete
- * succeeded. A refusal (b.jg5 SRJ-105, SRJ-311: UNAVAILABLE or ENVIRONMENT)
- * returns false with one line and no notice or `spawn-failed` entry.
+ * succeeded. A refusal (b.jg5 SRJ-105, SRJ-311, SRJ-316: UNAVAILABLE,
+ * ENVIRONMENT or CONFIG) returns false with one line and no notice or
+ * `spawn-failed` entry.
  */
 async function tryDelete(
   key: string,
@@ -3235,8 +3261,8 @@ async function tryDelete(
     if (err instanceof ErrSystemInstallDisappeared) {
       return false
     }
-    // b.jg5 SRJ-105, SRJ-311: an UNAVAILABLE or ENVIRONMENT delete stops the
-    // chain with no notice and no entry.
+    // b.jg5 SRJ-105, SRJ-311, SRJ-316: an UNAVAILABLE, ENVIRONMENT or CONFIG
+    // delete stops the chain with no notice and no entry.
     if (refusalAt(key, err, 'delete', 'tryDelete', 'delete', ref)) return false
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
     console.error(`[slack] tryDelete: failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
@@ -3264,7 +3290,8 @@ async function tryDelete(
  * - `ErrTmuxSessionCreate` on the fresh spawn takes the b.vub self-heal
  *   (kill the orphan tmux session by name, retry the spawn once).
  * - `ErrSystemInstallDisappeared` and cwd errors return `failed` quietly,
- *   and so does a refusal (an ENVIRONMENT answer included), with one line;
+ *   and so does a refusal (an ENVIRONMENT or CONFIG answer included), with
+ *   one line;
  *   any other error records `spawn-failed` at startup and raises the
  *   spawn-failure notice.
  * - Success returns `spawned`.
@@ -3397,8 +3424,9 @@ function localStatNote(path: string): string {
  * started_at are still available. Never throws.
  *
  * b.jg5 SRJ-105/SRJ-114: the row `get` is a read site. When it fails with a
- * refusal (`refusalAt` with verb `get`: any error but `ErrSpawnNotFound`, a
- * CONFIG answer and an UNUSABLE NAME answer), the diagnosis answers the
+ * refusal (`refusalAt` with verb `get`: any error but `ErrSpawnNotFound` and
+ * an UNUSABLE NAME answer, a CONFIG answer included, b.jg5 SRJ-316), the
+ * diagnosis answers the
  * refusal result instead of a verdict: no inconclusive notice, no startup
  * entry, and the caller must delete nothing and launch nothing.
  *
@@ -3438,8 +3466,8 @@ async function diagnoseJsonlMissing(
     // no startup entry; the caller deletes nothing and launches nothing.
     const refused = refusalAt(key, getErr, 'get', 'spawnForPersona', 'ErrJsonlMissing diagnosis get', ref)
     if (refused) return refused
-    // (a) Row already gone (ErrSpawnNotFound), or a CONFIG or UNUSABLE NAME
-    // answer — cannot enrich or classify. Inconclusive: we could not consult
+    // (a) Row already gone (ErrSpawnNotFound), or an UNUSABLE NAME answer —
+    // cannot enrich or classify. Inconclusive: we could not consult
     // the row at all, so we do NOT know whether history was lost. Report it
     // as uncertainty, not reassurance.
     const adDetail = adCandidates.length
@@ -3670,7 +3698,8 @@ async function resumeOrFreshSpawn(
   // row to `missing`, letting resume succeed and preserve session history.
   // The ended/missing caller does NOT set reconcileMissingFirst (row already
   // terminal). A refused sweep (b.jg5 SRJ-105: UNAVAILABLE, e.g.
-  // ErrCallTimeout, or ENVIRONMENT, ErrTmuxNotAvailable) stops the attempt
+  // ErrCallTimeout, ENVIRONMENT, ErrTmuxNotAvailable, or CONFIG,
+  // ErrConfigMalformed, SRJ-316) stops the attempt
   // before the resume: a resume of the still-live row would answer
   // ErrSpawnNotResumable, whose branch kills, deletes and spawns fresh. The ladder answers failed, and markRefusal adds
   // `refused`. On any other findMissing error, fall through to attempting
@@ -4296,7 +4325,8 @@ async function runPersonaLadder(
     if (err instanceof ErrSystemInstallDisappeared) {
       return { key, action: 'failed' }
     }
-    // b.jg5 SRJ-105, SRJ-311: a read error, an ENVIRONMENT answer included, is a refusal.
+    // b.jg5 SRJ-105, SRJ-311, SRJ-316: a read error, an ENVIRONMENT and a
+    // CONFIG answer included, is a refusal.
     const refused = refusalAt(key, err, 'get', 'spawnForPersona', 'collision get', ref)
     if (refused) return refused
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('get', 'UnknownError', String(err))
@@ -4353,8 +4383,8 @@ async function runPersonaLadder(
     }
     if (outcome !== 'ok') {
       console.error(`[slack] spawnForPersona: reconnect failed for ${ref}`)
-      // b.jg5 SRJ-105, SRJ-311: a refused reconnect (UNAVAILABLE or
-      // ENVIRONMENT) records no `spawn-failed` entry.
+      // b.jg5 SRJ-105, SRJ-311, SRJ-316: a refused reconnect (UNAVAILABLE,
+      // ENVIRONMENT or CONFIG) records no `spawn-failed` entry.
       if (isStartup && !refused) recordStartupError('spawn-failed', `reconnect failed for ${ref} (state=waiting)`)
       return { key, action: 'failed' }
     }
@@ -4385,9 +4415,9 @@ async function runPersonaLadder(
     if (outcome === 'not-reconnected' || outcome === 'cancelled') return { key, action: 'not-reconnected' }
     if (outcome !== 'ok') {
       console.error(`[slack] spawnForPersona: reconnect failed for ${ref}`)
-      // b.jg5 SRJ-105, SRJ-311: a refusal (a read error in the wait, an
-      // ENVIRONMENT answer included, or a refused reconnect) records no
-      // `spawn-failed` entry.
+      // b.jg5 SRJ-105, SRJ-311, SRJ-316: a refusal (a read error in the
+      // wait, an ENVIRONMENT or a CONFIG answer included, or a refused
+      // reconnect) records no `spawn-failed` entry.
       if (isStartup && !refused) recordStartupError('spawn-failed', `reconnect failed for ${ref} (state=working)`)
       return { key, action: 'failed' }
     }

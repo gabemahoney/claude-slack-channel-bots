@@ -16,6 +16,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { escapeSlackControlCharacters } from './slack-text-escape.ts'
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -96,11 +98,7 @@ const STATE_WORDING: Record<LostMessageState, string> = {
  * line breaks folded to spaces, so the label stays on the notice's first line.
  */
 function escapeSenderLabel(label: string): string {
-  return label
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\s*[\r\n]+\s*/g, ' ')
+  return escapeSlackControlCharacters(label).replace(/\s*[\r\n]+\s*/g, ' ')
 }
 
 /**

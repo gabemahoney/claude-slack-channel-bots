@@ -283,7 +283,9 @@ export interface RestartDeps {
    * on every `RESTART_OUTCOME_LIVENESS_UNKNOWN` return of the restart work,
    * the re-probe's included, so the persona's UNAVAILABLE retry timer is
    * armed even for a reading the adapter's own report does not arm on (a
-   * CONFIG answer, a probe that throws). Production arms the timer through
+   * probe that throws, or a `status` answer in a state CSCB does not know;
+   * a CONFIG answer is armed by the report itself, in any context, b.jg5
+   * SRJ-316). Production arms the timer through
    * its controller with the `read-error` cause; a call while the timer is
    * armed or running its retry keeps its due time and wait count. A hook
    * that throws is logged and changes nothing else. Absent: nothing is armed.

@@ -43,6 +43,7 @@ import {
   cannedOk,
   makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -248,6 +249,8 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
     expect(capturedSessions).toEqual(['slack_bot_C'])
     const log = readLog()
     expect(log).toContain('[dev-channels-approve-spawn-died]')
+    // Neither the recorded startup error nor any call made holds a token.
+    assertNoLeak({ log, sendKeysCalls, capturedSessions })
   })
 
   // -------------------------------------------------------------------------

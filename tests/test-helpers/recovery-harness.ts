@@ -48,7 +48,12 @@
  *   `capReached` and then calls `notifyRestartCapReached`, whose notice lands
  *   in `notices`. `serialize` is `serializer.run`, one real per-persona
  *   serializer (`createPersonaSerializer`), which a test may hold a turn on.
- *   `options.restartDeps` replaces any of these.
+ *   `armRetryTimer`, the arm hook, is bound as `main()` binds it (b.jg5
+ *   SRJ-314, SRJ-301): every `unknown` liveness reading at the restart work,
+ *   the re-probe's included, arms the persona's timer on the controller with
+ *   `UNAVAILABLE_RETRY_CAUSE_READ_ERROR`, straight to the controller (it is
+ *   not recorded in `triggers`); an arm while the timer is armed or running
+ *   keeps its due time. `options.restartDeps` replaces any of these.
  * - The relaunch gate is the real `createPersonaRelaunchGate` over a serving
  *   connection, with the bring-up outcome `setUp(key, up)` controls (every
  *   configured persona up at first) and the live applied set (its lines go
@@ -76,8 +81,9 @@
  *   controller, behind a recorder: every trigger an agent-director error
  *   inside a launch or recovery attempt sends (`{ key, kind }`, the cause
  *   kind) is recorded here, then armed on the controller; an ENVIRONMENT
- *   answer (`ErrTmuxNotAvailable`) from any call for a persona, in or out of
- *   an attempt, is sent too (b.jg5 SRJ-311). With
+ *   answer (`ErrTmuxNotAvailable`) or a CONFIG answer (`ErrConfigMalformed`)
+ *   from any call for a persona, in or out of an attempt, is sent too (b.jg5
+ *   SRJ-311, SRJ-316). With
  *   `options.triggerSink: false` no sink is installed: nothing is recorded or
  *   armed.
  * - `outageClears` (b.jg5 SRJ-305, SRJ-306, SRJ-311): the outage state's
@@ -246,6 +252,7 @@ import {
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
+  UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_ROW_ABSENT,
@@ -591,6 +598,13 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       notifyRestartCapReached(key)
     },
     serialize: serializer.run,
+    // As main() binds it (b.jg5 SRJ-314, SRJ-301): every `unknown` liveness
+    // reading at the restart work arms the persona's timer on the controller
+    // with the read-error cause, straight to the controller (not through the
+    // trigger sink, so it is not recorded in `triggers`).
+    armRetryTimer: (key) => {
+      controller.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
+    },
     ...options.restartDeps,
   })
 

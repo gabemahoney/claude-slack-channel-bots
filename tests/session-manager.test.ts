@@ -43,9 +43,14 @@
  *     before. The read-error row: the collision `get` and the working-row
  *     wait's poll and timeout `status`, fed those forms, an UNCLASSIFIED read
  *     error and a store that cannot be opened, likewise, and start no
- *     condition; `ErrSpawnNotFound` keeps each site's meaning, and only a
- *     CONFIG or UNUSABLE NAME answer still reaches the timeout's tmux
- *     fallback. E8's hatch note: a refused kill on each replace path is
+ *     condition; `ErrSpawnNotFound` keeps each site's meaning, and only an
+ *     UNUSABLE NAME answer still reaches the timeout's tmux fallback.
+ *     SRJ-105's CONFIG row (b.jg5 SRJ-316): every one of those sites, and
+ *     each findMissing sweep, fed `ErrConfigMalformed`, is refused the same
+ *     way, arms P's timer with the CONFIG cause, starts no condition, never
+ *     reaches the tmux fallback or the inconclusive report, and raises P's
+ *     `ad-config-malformed` with one onset. E8's hatch note: a refused kill
+ *     (UNAVAILABLE or CONFIG) on each replace path is
  *     followed by no delete or launch, also through the restart path's retry
  *     (`runRestartRetry`), with the failure count at 0. The
  *     `ErrSpawnNotResumable` kill is declared a kill of a row read live. The
@@ -370,6 +375,7 @@ import {
   ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
   tmuxServerChangedOnset,
+  adConfigMalformedOnset,
   _resetOutageState,
   type OutageClass,
 } from '../src/outage-state.ts'
@@ -407,6 +413,7 @@ import {
   createUnavailableRetryController,
   runInAttempt,
   UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
@@ -5423,18 +5430,17 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
 
   // b.ecw: at the TIMEOUT CALL AD reports a status error that still falls back
   // to the raw tmux probe (b.rmy invariant): ErrSpawnNotFound (no row to
-  // reconcile, E18 owns it), and a CONFIG or UNUSABLE NAME answer, which keep
-  // this handling until E12 and E16 build their rows. tmux gone →
-  // dead-session, tmux alive → not-reconnected (b.f2b; 'ok' before). Any other
-  // read error no longer reaches the probe (b.jg5 SRJ-105, the case after
-  // this one). The poll loop stays `working` and exits on the deadline; only
-  // the timeout status call throws (TTL=0 makes the timeout sweep bump
-  // findMissingCalls to 2, which flips statusFn into its error branch).
+  // reconcile, E18 owns it), and an UNUSABLE NAME answer, which keeps this
+  // handling until E16 builds its row. tmux gone → dead-session, tmux alive →
+  // not-reconnected (b.f2b; 'ok' before). Any other read error, a CONFIG
+  // answer included (b.jg5 SRJ-316), no longer reaches the probe (b.jg5
+  // SRJ-105, the cases after this one). The poll loop stays `working` and
+  // exits on the deadline; only the timeout status call throws (TTL=0 makes
+  // the timeout sweep bump findMissingCalls to 2, which flips statusFn into
+  // its error branch).
   test.each([
     ['ErrSpawnNotFound', () => errSpawnNotFound(), false, 'dead-session'],
     ['ErrSpawnNotFound', () => errSpawnNotFound(), true, 'not-reconnected'],
-    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), true, 'not-reconnected'],
-    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), false, 'dead-session'],
     ['an UNUSABLE NAME answer', () => errUnusableName(), true, 'not-reconnected'],
     ['an UNUSABLE NAME answer', () => errUnusableName(), false, 'dead-session'],
   ] as const)(
@@ -5493,6 +5499,43 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(findMissingCalls).toHaveLength(2)
     expect(notices).toEqual([])
     expect(linesWith(errLog, 'waitForWaitingAndReconnect: timeout: status read refused for persona=C')).toHaveLength(1)
+  })
+
+  // b.jg5 SRJ-105's CONFIG row, SRJ-316: a CONFIG answer at the TIMEOUT CALL
+  // is a refusal whatever tmux shows: 'failed' with one refusal line, never
+  // the tmux fallback (so never 'dead-session' and never 'not-reconnected'),
+  // nothing typed, no not-connected or spawn-failure notice, and C's
+  // ad-config-malformed outage raised by the wrapper with one onset.
+  test.each([true, false])('b.jg5 SRJ-105, SRJ-316: timeout with a CONFIG answer (ErrConfigMalformed) + tmux alive=%p → failed and refused (one refusal line), tmux NOT probed, nothing typed, no notice, one ad-config-malformed onset', async (tmuxAlive) => {
+    _setWaitForWaitingTimeoutMs(30)
+    _setFindMissingMemoTtlMs(0)
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return tmuxAlive })
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const err = errConfigMalformed()
+    installStub({
+      findMissingCalls,
+      sendKeysCalls,
+      findMissingResult: cannedFindMissing(),
+      statusFn: () =>
+        findMissingCalls.length >= 2 ? err : ({ state: 'working' } as import('agent-director').StatusResult),
+    })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', cfg)
+    })
+
+    expect(result).toBe('failed')
+    expect(probed).toEqual([])
+    expect(sendKeysCalls).toEqual([])
+    expect(findMissingCalls).toHaveLength(2) // the deadline's read decided, not the poll
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, 'waitForWaitingAndReconnect: timeout: status read refused for persona=C')).toHaveLength(1)
+    expect([...getOutageFlags('C')]).toEqual(['ad-config-malformed'])
+    expect(outageEmissions).toEqual([{ key: 'C', text: adConfigMalformedOnset(err) }])
   })
 
   // b.jg5 SRJ-105: ErrSystemInstallDisappeared at the TIMEOUT CALL takes the
@@ -7214,11 +7257,11 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     ['the row moving to ask_user', { state: 'ask_user', pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Waiting on a prompt*', 'Automatic restarts are disabled (`session_restart_delay` is 0)', undefined],
     ['agent-director losing the row while its tmux session lives', { state: errSpawnNotFound(), pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Not connected*', '(agent-director has no record of its session, though its tmux session is alive)', undefined],
     [
-      // Only a CONFIG or UNUSABLE NAME answer still reaches the tmux fallback
-      // (until E12 and E16); any other read error is a refusal (b.jg5
-      // SRJ-105, the case after these).
-      'the deadline\'s status call failing with a CONFIG answer while its tmux session lives (the tmux fallback)',
-      { state: (r) => (r.findMissingCalls.length % 2 === 0 ? errConfigMalformed() : 'working'), pane: SPINNER_PANE, stepMs: 60_000 },
+      // Only an UNUSABLE NAME answer still reaches the tmux fallback (until
+      // E16); any other read error, a CONFIG answer included (b.jg5 SRJ-316),
+      // is a refusal (b.jg5 SRJ-105, the case after these).
+      'the deadline\'s status call failing with an UNUSABLE NAME answer while its tmux session lives (the tmux fallback)',
+      { state: (r) => (r.findMissingCalls.length % 2 === 0 ? errUnusableName() : 'working'), pane: SPINNER_PANE, stepMs: 60_000 },
       ':warning: *Not connected*',
       '(agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it)',
       undefined,
@@ -7273,13 +7316,24 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     expect(errLog).toMatch(/; the health check (recovers|reconnects|reads|schedules) /)
   })
 
-  test.each([0, 60])('b.jg5 SRJ-105: session_restart_delay %d and the deadline\'s status call failing with an UNCLASSIFIED error (ErrTimeout) while its tmux session lives → failed, never the tmux fallback: nothing typed, no notice for the deadline\'s read (only the poll\'s unproven-idle one, once), one refusal line per wait', async (delay) => {
+  /**
+   * The deadline's status errors that are a refusal, each with the outage it
+   * raises for C: an UNCLASSIFIED error raises none; a CONFIG answer raises
+   * `ad-config-malformed` (b.jg5 SRJ-316), once for the episode.
+   */
+  const DEADLINE_REFUSALS: ReadonlyArray<readonly [string, () => Error, OutageClass[]]> = [
+    ['an UNCLASSIFIED error (ErrTimeout)', () => errGeneric('status', 'ErrTimeout'), []],
+    ['a CONFIG answer (ErrConfigMalformed, b.jg5 SRJ-316)', () => errConfigMalformed(), ['ad-config-malformed']],
+  ]
+
+  test.each(DEADLINE_REFUSALS.flatMap(([what, make, flags]) => [0, 60].map((delay) => [delay, what, make, flags] as const)))('b.jg5 SRJ-105: session_restart_delay %d and the deadline\'s status call failing with %s while its tmux session lives → failed, never the tmux fallback: nothing typed, no notice for the deadline\'s read (only the poll\'s unproven-idle one, once), one refusal line per wait', async (delay, _what, make, flags) => {
     _setFindMissingMemoTtlMs(0)
     const probed: string[] = []
     _setTmuxSessionProber(async (name) => { probed.push(name); return true })
     const cfg = waitConfig({ session_restart_delay: delay })
+    const err = make()
     const row = installWorkingRow(clock, {
-      state: (r) => (r.findMissingCalls.length % 2 === 0 ? errGeneric('status', 'ErrTimeout') : 'working'),
+      state: (r) => (r.findMissingCalls.length % 2 === 0 ? err : 'working'),
       pane: SPINNER_PANE,
       stepMs: 60_000,
     })
@@ -7301,6 +7355,14 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     expect(notices[0]!.text).not.toContain('could not report its state')
     expect(linesWith(errLog, 'waitForWaitingAndReconnect: timeout: status read refused for persona=C')).toHaveLength(2)
     expect(errLog).not.toContain('nothing will reconnect it')
+    // The second wait's successful polls clear the outage the first raised
+    // (b.jg5 SRJ-312), so each wait's CONFIG read posts its own onset, with
+    // one all-clear listing the bare class between them.
+    expect([...getOutageFlags('C')]).toEqual(flags)
+    const allClear = ALL_CLEAR_TEMPLATE(new Map(flags.map((cls) => [cls, { detail: undefined }])))
+    expect(outageEmissions).toEqual(
+      flags.length === 0 ? [] : [adConfigMalformedOnset(err), allClear, adConfigMalformedOnset(err)].map((text) => ({ key: 'C', text })),
+    )
   })
 
   test.each<[number, string]>([
@@ -9560,7 +9622,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // (a) row-fetch failure, driven through startupSessionManager so the counter
   // is observable. The diagnostic get() (second get) rejects; the collision
   // recovery get() (first) succeeds so the amnesia path is reached at all. The
-  // diagnostic get answers CONFIG, which is not a read error (b.jg5 SRJ-105).
+  // diagnostic get answers UNUSABLE NAME, which is not a read error (b.jg5
+  // SRJ-105).
   test('inconclusive (a) via startup: row fetch fails → counter + jsonl-diagnosis-inconclusive record', async () => {
     const readLog = captureStartupErrors()
     const stub = installStub({
@@ -9574,7 +9637,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     let getCalls = 0
     stub.get = async (params) => {
       getCalls++
-      if (getCalls >= 2) throw errConfigMalformed()
+      if (getCalls >= 2) throw errUnusableName()
       return personaRowsGet(cfg, { state: 'ended' })(params)
     }
     const result = await startupSessionManager(cfg, { concurrency: 1 })
@@ -9585,6 +9648,36 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(log).toContain('jsonl-diagnosis-inconclusive')
     // Detail names WHICH condition: the row could not be fetched.
     expect(log).toContain('could not fetch the agent-director row')
+  })
+
+  // b.jg5 SRJ-105's CONFIG row, SRJ-114, SRJ-316: a CONFIG answer at the
+  // diagnostic get is a refusal, not an inconclusive diagnosis: the start pass
+  // counts the persona failed and in neither amnesia counter, writes no
+  // jsonl-diagnosis-inconclusive or spawn-failed entry, deletes nothing and
+  // spawns nothing fresh, posts no notice, and the wrapper raises CH's
+  // ad-config-malformed outage with one onset.
+  test('b.jg5 SRJ-105, SRJ-316: inconclusive (a) via startup with a CONFIG answer at the row fetch → refused: no amnesia counter, no jsonl-diagnosis-inconclusive record, no delete or fresh spawn, no notice, one ad-config-malformed onset', async () => {
+    const readLog = captureStartupErrors()
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    const err = errConfigMalformed()
+    installDiagnosisGetFailure(cfg, () => err, { spawnCalls, deleteCalls })
+
+    const result = await startupSessionManager(cfg, { concurrency: 1 })
+
+    expect(result.perPersona).toEqual([{ key: CH, action: 'failed' }])
+    expect(result.failed).toBe(1)
+    expect(result.freshAfterInconclusiveAmnesia).toBe(0)
+    expect(result.freshAfterAmnesia).toBe(0)
+    expect(deleteCalls).toEqual([])
+    expect(spawnCalls).toHaveLength(1) // the colliding optimistic spawn only
+    const log = readLog()
+    expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
+    expect(notices).toEqual([])
+    expect([...getOutageFlags(CH)]).toEqual(['ad-config-malformed'])
+    expect(outageEmissions).toEqual([{ key: CH, text: adConfigMalformedOnset(err) }])
   })
 
   /**
@@ -9639,8 +9732,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     `${err.errName} ${quoted(err.errDescription)}`
 
   // AC 20 (b.av2 SR-10.3): a row-fetch failure that is not a read error
-  // (b.jg5 SRJ-105: `ErrSpawnNotFound`, a CONFIG answer, an UNUSABLE NAME
-  // answer) reaches the inconclusive report, where it is named by
+  // (b.jg5 SRJ-105: `ErrSpawnNotFound`, an UNUSABLE NAME answer) reaches the
+  // inconclusive report, where it is named by
   // describeAgentDirectorFailure — an agent-director error's errName and
   // redacted description when the errName is a short identifier — in the log
   // line, startup-errors.log and the persona notice alike; never the thrown
@@ -9652,11 +9745,6 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       'a typed subclass (ErrSpawnNotFound)',
       () => new ErrSpawnNotFound('get', 'ErrSpawnNotFound', leakyMessage('gone', 'sub')),
       `ErrSpawnNotFound ${quoted(redactedLeakyMessage('gone'))}`,
-    ],
-    [
-      'a CONFIG answer whose envelope description holds a URL and a fake token',
-      leakyConfig,
-      unknownNameShown(leakyConfig() as { errName: string; errDescription: string }),
     ],
     [
       'an UNUSABLE NAME answer whose envelope description holds a URL and a fake token',
@@ -9683,11 +9771,19 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   })
 
   // AC 20 with b.jg5 SRJ-105: every other row-fetch failure is a read error,
-  // so the diagnostic get is refused. The refusal line names each shape by
+  // and a CONFIG answer has its own refusal row (SRJ-316), so the diagnostic
+  // get is refused. The refusal line names each shape by
   // describeAgentDirectorFailure (redacted, on one line: a two-line errName
   // cannot inject a line), and nothing is posted: no inconclusive notice, no
   // jsonl-diagnosis-inconclusive or spawn-failed entry, no delete, no spawn.
+  // Only the CONFIG answer raises an outage: its onset, which quotes the
+  // description redacted, is leak-checked with the rest.
   test.each<[string, () => unknown, string]>([
+    [
+      'a CONFIG answer whose envelope description holds a URL and a fake token (b.jg5 SRJ-316)',
+      leakyConfig,
+      unknownNameShown(leakyConfig() as { errName: string; errDescription: string }),
+    ],
     [
       'a base AgentDirectorError',
       () => errGeneric('get', 'ErrSpawnGone', leakyMessage('gone', 'desc')),
@@ -9739,7 +9835,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(errArgs.flat().map(String).filter((l) => l.includes('could not fetch the agent-director row'))).toEqual([])
     expect(deleteCalls).toEqual([])
     expect(spawnCalls).toHaveLength(1) // the colliding optimistic spawn only
-    assertNoLeak({ errArgs, startupErrorsLog: log, notices })
+    expect(outageEmissions.map((e) => e.key)).toEqual(makeErr === leakyConfig ? [CH] : [])
+    assertNoLeak({ errArgs, startupErrorsLog: log, notices, outageEmissions })
   })
 
   // AC 20 (E13 Director decision 16): when the row fetch fails with an answer
@@ -11856,12 +11953,20 @@ function srj105AfterEach(): void {
  * Launch P as the start pass does, with `site` meeting `err`; assert the
  * refusal's outcome (see the section comment); then launch it again through
  * `launchSession`, and launch B over the stub's defaults. Without `onsetText`
- * the outage state posts nothing. With it (an ENVIRONMENT answer, b.jg5
- * SRJ-311), P's `tmux-unavailable` flag is raised by the first launch with one
- * onset reading exactly `onsetText` (the onset the raising error's form picks,
- * b.jg5 SRJ-1021), and is still raised at the end.
+ * the outage state posts nothing. With it, P's `outageClass` flag is raised by
+ * the first launch with one onset reading exactly `onsetText`, and is still
+ * raised at the end, B's never: an
+ * ENVIRONMENT answer raises `tmux-unavailable` (b.jg5 SRJ-311; the onset the
+ * raising error's form picks, SRJ-1021), a CONFIG answer
+ * `ad-config-malformed` (SRJ-316, SRJ-1018).
  */
-async function expectRefusedAt(site: LadderSite, err: Error, triggerKind: string, onsetText?: string): Promise<{ h: RecoveryHarness; p: string }> {
+async function expectRefusedAt(
+  site: LadderSite,
+  err: Error,
+  triggerKind: string,
+  onsetText?: string,
+  outageClass: OutageClass = 'tmux-unavailable',
+): Promise<{ h: RecoveryHarness; p: string }> {
   const { h, p, b } = srj105Build()
   const persona = harnessPersona(h, p)
   site.setup?.(h)
@@ -11878,7 +11983,7 @@ async function expectRefusedAt(site: LadderSite, err: Error, triggerKind: string
   } else {
     expect(h.outageNotices.map((n) => n.key)).toEqual([p])
     expect(h.outageNotices[0]!.text).toBe(onsetText)
-    expect(getOutageFlags(p).has('tmux-unavailable')).toBe(true)
+    expect(getOutageFlags(p).has(outageClass)).toBe(true)
   }
   expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
   expect(refusalLines(h, p)).toHaveLength(1)
@@ -11900,8 +12005,8 @@ async function expectRefusedAt(site: LadderSite, err: Error, triggerKind: string
   expect(h.triggers.filter((t) => t.key === b)).toEqual([])
   expect(h.notices).toEqual([])
   if (onsetText !== undefined) {
-    expect(getOutageFlags(p).has('tmux-unavailable')).toBe(true)
-    expect(getOutageFlags(b).has('tmux-unavailable')).toBe(false)
+    expect(getOutageFlags(p).has(outageClass)).toBe(true)
+    expect(getOutageFlags(b).has(outageClass)).toBe(false)
   }
   return { h, p }
 }
@@ -12223,7 +12328,11 @@ describe('b.jg5 SRJ-105 with E8\'s refusal marker: a refused kill on a replace p
     ['the resume\'s ErrSpawnNotResumable', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable() }), undefined, { spawn: 1, resume: 1, kill: 1 }],
   ]
 
-  const KILL_REFUSALS = unavailableForms('ErrTmuxUnresponsive', 'ErrTmuxKillFailed')
+  /** The kill refusals: the UNAVAILABLE forms, and a CONFIG answer (b.jg5 SRJ-105's CONFIG row, SRJ-110, SRJ-316). */
+  const KILL_REFUSALS: ReadonlyArray<readonly [string, (verb: string) => Error, string]> = [
+    ...unavailableForms('ErrTmuxUnresponsive', 'ErrTmuxKillFailed'),
+    ['a CONFIG answer (ErrConfigMalformed, b.jg5 SRJ-316)', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
+  ]
 
   const cross = REPLACE_PATHS.flatMap(([path, script, setup, calls]) => KILL_REFUSALS.map(([what, make]) => [path, what, script, setup, calls, make] as const))
 
@@ -12351,6 +12460,114 @@ describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladd
       }
     }
     expect(h.outageNotices).toHaveLength(onsetText === undefined ? 0 : 2)
+    expect(h.notices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-105's CONFIG row, SRJ-316: a CONFIG answer (`ErrConfigMalformed`)
+// at the collision ladder, the reconnect, the working-row wait and the
+// findMissing sweeps
+//
+// "No action, nothing counted, never 'dead'; the retry timer is armed." Every
+// site of the SRJ-105 cases above, fed the stub's CONFIG answer, is a refusal
+// through `expectRefusedAt`: the stub's call counts are exact (no kill, delete,
+// resume or launch after it, never a dead-session resume), no spawn-failure
+// notice, no `spawn-failed` entry, one refusal line, P's timer armed with the
+// CONFIG cause, `launchSession` answering 'refused', the failure count left at
+// 0, and B launching. On top of that, P's `ad-config-malformed` outage is
+// raised by the wrapper with one onset (SRJ-1018's, built by `src/` from the
+// thrown value) and one raise line per onset, and CONFIG never starts P's
+// `tmux-unresponsive` condition (SRJ-307). A read site never reaches the tmux
+// fallback, and the ErrJsonlMissing diagnosis get writes no inconclusive entry.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-105, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the collision ladder, the reconnect, the working-row wait and the findMissing sweeps is a refusal: no action, never counted, never dead, P\'s timer armed with the CONFIG cause, one ad-config-malformed onset', () => {
+  afterEach(srj105AfterEach)
+
+  /** The `ad-config-malformed` raise lines logged for persona `key`. */
+  function raiseLines(h: RecoveryHarness, key: string): string[] {
+    return h.errors.filter((line) => line.startsWith(`[slack] outage-state: ad-config-malformed raised for persona=${key}: `))
+  }
+
+  /**
+   * What every CONFIG refusal adds to `expectRefusedAt`'s checks: P holds the
+   * `ad-config-malformed` flag only, its condition was never started, every
+   * outage notice was P's onset (one per raise, each with its raise line; a
+   * later launch's successful wrapped call may clear the flag and post the
+   * all-clear before its own CONFIG raises it again), and B holds no flag.
+   */
+  function expectConfigOutageOnly(h: RecoveryHarness, p: string, onset: string): void {
+    const [, b] = h.keys as [string, string]
+    expect([...getOutageFlags(p)]).toEqual(['ad-config-malformed'])
+    expect([...getOutageFlags(b)]).toEqual([])
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+    expect(h.outageNotices.every((n) => n.key === p)).toBe(true)
+    const onsets = h.outageNotices.filter((n) => n.text === onset)
+    expect(onsets.length).toBeGreaterThanOrEqual(1)
+    expect(raiseLines(h, p)).toHaveLength(onsets.length)
+    expect(raiseLines(h, b)).toEqual([])
+  }
+
+  const ACTION_SITES = [...SPAWN_AND_RESUME_SITES, ...KILL_SITES, ...DELETE_SITES, ...RECONNECT_SITES]
+  test.each(ACTION_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-105, SRJ-316: CONFIG at %s: nothing destructive after it, never dead-session, no notice or spawn-failed entry, refused and never counted, P armed with the CONFIG cause, one ad-config-malformed onset, P\'s condition not started; B launches', async (_name, site) => {
+    const err = errConfigMalformed()
+    const onset = adConfigMalformedOnset(err)
+    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_CONFIG, onset, 'ad-config-malformed')
+    expectConfigOutageOnly(h, p, onset)
+  })
+
+  test.each(READ_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-105, SRJ-114, SRJ-115, SRJ-316: CONFIG at %s: no tmux probe, no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, P armed with the CONFIG cause, one ad-config-malformed onset; B launches', async (_name, site) => {
+    // Every tmux session reads gone: a tmux fallback would give dead-session
+    // and a resume, which the exact call counts would catch.
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => {
+      probed.push(name)
+      return false
+    })
+    const err = errConfigMalformed()
+    const onset = adConfigMalformedOnset(err)
+    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_CONFIG, onset, 'ad-config-malformed')
+    expect(probed).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expectConfigOutageOnly(h, p, onset)
+  })
+
+  test.each(SWEEP_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-105, SRJ-316: CONFIG at %s: the sweep is refused and the attempt stops there: no resume, kill, delete, launch, notice or spawn-failed entry, refused and never counted, P armed with the CONFIG cause, one ad-config-malformed onset; B launches', async (_name, site) => {
+    const err = errConfigMalformed()
+    const onset = adConfigMalformedOnset(err)
+    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_CONFIG, onset, 'ad-config-malformed')
+    // Both launches (the start pass's and launchSession's) were refused at this sweep.
+    const refusedAt = `[slack] ${site.logPrefix}: findMissing sweep refused for ${renderPersonaRef(p, p)}: `
+    expect(refusalLines(h, p).map((line) => line.startsWith(refusedAt))).toEqual([true, true])
+    expectConfigOutageOnly(h, p, onset)
+  })
+
+  // A joiner's sweep failure is its own (SRJ-301): with CONFIG it raises its
+  // own `ad-config-malformed`, as P's wrapper does for P.
+  test('b.jg5 SRJ-105, SRJ-316: CONFIG at P\'s prompt-row sweep, which B joined: one findMissing call; each persona raises its own ad-config-malformed (one onset and one raise line each), is armed once with the CONFIG cause, and nothing destructive follows for either', async () => {
+    const { h, p, b } = srj105Build()
+    const err = errConfigMalformed()
+    const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, err)
+
+    expect(pResult).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(bResult).toStrictEqual({ key: b, action: 'failed', refused: true })
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
+    for (const key of [p, b]) {
+      expect(refusalLines(h, key)).toHaveLength(1)
+      expect(h.triggers.filter((t) => t.key === key)).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG }])
+      expect(h.controller.isArmed(key)).toBe(true)
+      expect(getFailureCount(key)).toBe(0)
+      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+      expect(conditionStartedLines(h, key)).toEqual([])
+      expect([...getOutageFlags(key)]).toEqual(['ad-config-malformed'])
+      expect(h.outageNotices.filter((n) => n.key === key).map((n) => n.text)).toEqual([adConfigMalformedOnset(err)])
+      expect(raiseLines(h, key)).toHaveLength(1)
+    }
+    expect(h.outageNotices).toHaveLength(2)
     expect(h.notices).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
   })

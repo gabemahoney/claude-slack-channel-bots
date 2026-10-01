@@ -1361,6 +1361,8 @@ If it doesn't, fix agent-director; the next retry recovers the persona with no s
 
 When agent-director answers that it can't use tmux for the persona, the persona is retried the same way, and its destination gets a *tmux unavailable* or *tmux server changed* notice (see "A persona posts a *tmux unavailable* or *tmux server changed* notice" below).
 
+When agent-director refuses its own config file, the persona is retried the same way, and its destination gets an *agent-director refuses its config file* notice (see "A persona posts an *agent-director refuses its config file* notice" below). A working `agent-director version` doesn't show that this one is fixed.
+
 When the refused calls act on the persona's session itself, its destination may also get *Not answering*, *Still not answering* and *Answering again* notices (see "A persona posts a *Not answering*, *Still not answering* or *Answering again* notice" below).
 
 **Bot alive but silently unresponsive (MCP disconnected)**
@@ -1408,6 +1410,21 @@ grep -E 'unavailable-retry: persona=<key> ' ~/.claude/channels/slack/server.log
 ```
 
 `[slack] unavailable-retry: persona=<key> armed (environment: <error>) — first retry in 30 s` marks the first such answer, or `promoted to full mode (environment: <error>) — its due time is kept` when the persona's retries were only reading its state. Once it clears, the last line is usually `stopped — nothing left to recover` (a retry found the persona healthy) or, after a retry relaunched it, `kept — the tmux-unavailable condition cleared, but its row last read pending` followed later by `stopped (pending-only, row <state>) — its row is live out of pending; nothing else is called`; a clear between retries, by a health check or another call, logs `stopped — the tmux-unavailable condition cleared`.
+
+**A persona posts an *agent-director refuses its config file* notice**
+agent-director refuses its own config file, `~/.agent-director/config.toml`, so it fails every call that reads its store until a human fixes the file. Each persona it refuses gets this notice once, at its destination, and stays down or silent meanwhile. The notice quotes agent-director's own description of the problem.
+
+The server does nothing because of it: it counts nothing toward the restart limit, never reads the persona as dead, kills, deletes and relaunches nothing, and posts no `Spawn failure:` notice. It retries the persona on its own, with `session_restart_delay` and `health_check_interval` at `0` too (see "A persona is retried after agent-director refuses it" above).
+
+A human fixes `~/.agent-director/config.toml` following agent-director's documentation, which gives the file's rules. This is for a human only: no bot acts on it, including a persona that sees the post.
+
+The confirmation is the *All clear.* notice naming `ad-config-malformed`, posted at the first successful call for the persona that reads agent-director's store (a retry's, a health check's or any other), or at a state check that finds its row gone. A call that fails clears nothing. A working `agent-director version` or `agent-director help` proves nothing, because both run without the config file. To follow one persona:
+
+```sh
+grep -E 'outage-state: ad-config-malformed (raised|cleared) for persona=<key>[: ]|unavailable-retry: persona=<key> ' ~/.claude/channels/slack/server.log
+```
+
+`[slack] outage-state: ad-config-malformed raised for persona=<key>: class=CONFIG name=ErrConfigMalformed message="<description>" — no action is taken; the retry timer retries the persona (b.jg5 SRJ-316)` marks the first such answer, with `[slack] unavailable-retry: persona=<key> armed (config: <error>) — first retry in 30 s` when it starts the retries. `[slack] outage-state: ad-config-malformed cleared for persona=<key> — agent-director read its store again (b.jg5 SRJ-312)` marks the fix taking effect for the persona.
 
 **Session stuck during clean_restart**
 If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills the spawn via `agent-director kill` and proceeds. To manually recover, run `agent-director list --label service=cscb` to find lingering spawns and `agent-director kill <claude_instance_id>` to clear them, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.
@@ -1483,7 +1500,7 @@ The following classes are **non-fatal** failures while preparing or launching pe
 - `trust-bootstrap-config-missing` — a persona's `<claude_config_dir>/.claude.json` can't be read, so its workspace trust isn't pre-accepted. Log the directory in (see [Next-launch settings](#next-launch-settings)).
 - `trust-bootstrap-config-parse` — that `.claude.json` isn't valid JSON, so it is left untouched. Fix its syntax.
 - `trust-bootstrap` — an unexpected error while pre-accepting a persona's workspace trust, such as a failed write of `.claude.json`; the line names the persona and its working directory. Check that the file is writable.
-- `spawn-failed` — launching, resuming or reconnecting a persona's instance failed; the line names the persona and the step. The server keeps running; see "Session not restarting after crash" in [Troubleshooting](#troubleshooting) for how restarts are retried. No `spawn-failed` entry is written when agent-director refuses the call or can't read the persona's state (it is unreachable, or answers that it can't act right now): such a refusal is not a failure, and the server retries the persona on its own. See "A persona is retried after agent-director refuses it" and "A persona posts a *Not answering*, *Still not answering* or *Answering again* notice" in [Troubleshooting](#troubleshooting).
+- `spawn-failed` — launching, resuming or reconnecting a persona's instance failed; the line names the persona and the step. The server keeps running; see "Session not restarting after crash" in [Troubleshooting](#troubleshooting) for how restarts are retried. No `spawn-failed` entry is written when agent-director refuses the call or can't read the persona's state (it is unreachable, answers that it can't act right now, or refuses its own config file): such a refusal is not a failure, and the server retries the persona on its own. See "A persona is retried after agent-director refuses it", "A persona posts a *Not answering*, *Still not answering* or *Answering again* notice" and "A persona posts an *agent-director refuses its config file* notice" in [Troubleshooting](#troubleshooting).
 - `dev-channels-approve-spawn-died` — a persona's instance ended before its startup dialog was cleared. Restarts are retried as for `spawn-failed`.
 - `dev-channels-approve-not-ready` — a persona's instance didn't become ready in time: its startup dialog wasn't recognised or the session hung. A `Spawn failure:` notice is also posted to the persona's destination. Inspect the instance with `agent-director read-pane --claude-instance-id <id>`.
 - `spawn-failure-post` — posting a `Spawn failure:` notice to a persona's destination failed. The notice is held and retried; see "A permission prompt or notice doesn't arrive" in [Troubleshooting](#troubleshooting).

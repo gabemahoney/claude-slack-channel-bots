@@ -37,6 +37,11 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 - `config.json` names only paths and holds no tokens. If a value in it starts
   with `xoxb-` or `xapp-`, don't display it; tell the operator a token has been
   pasted into the configuration and must be moved to a credentials file.
+- NEVER edit, or offer to edit, agent-director's config file
+  (`~/.agent-director/config.toml`). An *agent-director refuses its config
+  file* notice is for a human only (see
+  **agent-director refuses its config file** under
+  [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)).
 
 ---
 
@@ -102,6 +107,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    A *tmux unavailable* or *tmux server changed* notice is covered under
    **tmux isn't available** in
    [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
+   An *agent-director refuses its config file* notice, or an
+   `outage-state: ad-config-malformed` line, is covered under
+   **agent-director refuses its config file** in the same section.
 6. **A `reply` to a user ID fails with `missing_scope`?** See
    [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite).
    **Permission prompts or notices don't arrive?** Look for a
@@ -1583,7 +1591,8 @@ grep -h -E 'unavailable-retry: persona=ops_bot |health-check: persona=ops_bot ha
 
 `<cause>` is `unavailable` (agent-director refused a call), `kill-failed`
 (agent-director could not stop the instance's session), `environment`
-(agent-director answered that tmux isn't available, `ErrTmuxNotAvailable`)
+(agent-director answered that tmux isn't available, `ErrTmuxNotAvailable`),
+`config` (agent-director refuses its own config file, `ErrConfigMalformed`)
 or `read-error` (agent-director could not report the persona's state),
 followed by the error (see [The server log](#the-server-log), Error detail).
 
@@ -1629,13 +1638,56 @@ retry with no call; one started by a removal's own kill or delete is stopped
 by the removal itself, so it never retries a persona whose settings changed
 and is coming up again.
 
+**agent-director refuses its config file.** When agent-director answers any
+call for a persona with `ErrConfigMalformed`, it refuses its own config file,
+`~/.agent-director/config.toml`, and fails every call that reads its store
+until a human fixes the file. The persona's destination gets one
+*agent-director refuses its config file* notice, which quotes
+agent-director's description of the problem, and the persona's retries start
+with the `config` cause, even when nothing was launching or recovering it (a
+health check, a permission prompt or a removal met it). The quoted
+description is shown as text: a mention or link in it notifies no one. A
+later answer of the same kind while the notice holds posts nothing.
+
+The server does nothing because of it: nothing counts toward the restart
+limit, the persona is never read as dead (its state reads unknown), nothing
+is killed, deleted or relaunched, no `Spawn failure:` notice is posted and no
+`spawn-failed` entry is written. Every launch or restart step that meets it
+stops there with its `refused` line (below). The retries go on at their
+backoff whatever `session_restart_delay` and `health_check_interval` are, `0`
+included.
+
+The fix is a human's: a human fixes `~/.agent-director/config.toml`
+following agent-director's documentation, which gives the file's rules. This
+skill never edits that file, never offers to, and describes no edit to it; no
+bot acts on the notice, including a persona that sees the post. Read-only
+checks only: the persona's lines below.
+
+The notice clears at the first successful call for the persona that reads
+agent-director's store (a retry's, a health check's or any other), or a state
+check told the persona's row is gone: its destination then gets an *All
+clear.* notice naming `ad-config-malformed` (once nothing else is wrong for
+the persona). A call that fails, for any reason, clears nothing. A working
+`agent-director version` or `agent-director help` proves nothing, because
+both run without the config file; the *All clear.* is the confirmation. Its
+clear doesn't stop the retries: they stop by their own rules (usually
+`stopped — nothing left to recover` at the next retry).
+
 | Line | Meaning | What to do |
 |---|---|---|
-| `[slack] unavailable-retry: persona=<key> armed (<cause>) — first retry in 30 s` | agent-director refused a call while the persona was being launched or recovered, answered any call for it with `ErrTmuxNotAvailable` (`environment`, at any time), or a restart couldn't read the persona's state (`read-error`). Its first retry is due in 30 s. A refusal while it is already waiting logs nothing and keeps the time. | Nothing. If it keeps retrying, see below. |
+| `[slack] outage-state: ad-config-malformed raised for persona=<key>: class=CONFIG name=ErrConfigMalformed message="<description>" — no action is taken; the retry timer retries the persona (b.jg5 SRJ-316)` | agent-director refused its config file for a call for the persona; the notice was posted. Logged once per notice. `<description>` is agent-director's own words (redacted, on one line, shortened when long); ` message="…"` is absent when it gave none. | A human fixes the file, following agent-director's documentation. Nothing for a bot to do. |
+| `[slack] outage-state: ad-config-malformed cleared for persona=<key> — agent-director read its store again (b.jg5 SRJ-312)` | A call for the persona that reads agent-director's store worked (or a state check found its row gone), so the fix has taken effect for the persona. The *All clear.* follows when nothing else is wrong for it. | Nothing. |
+| `[slack] outage-state: onset notice for persona=<key> failed: <error> — the flag stays raised; the notice counts as posted` | Posting the *agent-director refuses its config file* notice failed, so the persona's destination did not get it. It is not posted again while the file is refused; the retries start as usual. | Check the persona's destination (see [`persona-destination-failed`](#persona-destination-failed)). The human fix of the file is the same. |
+| `[slack] unavailable-retry: persona=<key> armed (config: <error>) — first retry in 30 s` | The retries started with the `config` cause. | Nothing. |
+| `[slack] isSessionAlive: status error for persona=<key>: <error> — read as unknown, not dead` | With `ErrConfigMalformed` in `<error>`, logged at every state check while the file is refused, beside the one `raised` line above. | Nothing beyond the human fix. |
+
+| Line | Meaning | What to do |
+|---|---|---|
+| `[slack] unavailable-retry: persona=<key> armed (<cause>) — first retry in 30 s` | agent-director refused a call while the persona was being launched or recovered, answered any call for it with `ErrTmuxNotAvailable` (`environment`, at any time) or `ErrConfigMalformed` (`config`, at any time), or a restart couldn't read the persona's state (`read-error`). Its first retry is due in 30 s. A refusal while it is already waiting logs nothing and keeps the time. | Nothing. If it keeps retrying, see below. |
 | `[slack] health-check: persona=<key> has its tmux-unavailable outage raised with no retry timer — arming one` | The persona's *tmux unavailable* or *tmux server changed* notice still holds, a health check found it not running, still starting, disconnected or not receiving messages, and nothing was retrying it (its earlier retries stopped: it wasn't up at a retry, its relaunch was declined, or the retry failed internally). The health check starts the retries; `[slack] unavailable-retry: persona=<key> armed (environment) — first retry in 30 s` follows. The health check itself still restarts and reconnects nothing. | Nothing; the retries take over. If the persona isn't up, the first retry stops with `the persona is not up; its bring-up owns it`: follow its class line (see [Persona diagnostic classes](#persona-diagnostic-classes)). For tmux itself, see **tmux isn't available** above and **It never clears** below. |
 | `[slack] Session relaunch refused for persona=<key> — not counted; its UNAVAILABLE retry timer owns the persona` | A relaunch was refused by agent-director. It doesn't count toward the restart limit; the retries above take over. | Nothing. |
-| `[slack] <step>: <call> refused for "<name>" (key=<key>): <error> — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)` | While the persona was being launched, agent-director refused a call (`<call>` names it, such as `spawn`, `resume`, `kill`, `delete`, `collision get`, `send-keys` or `findMissing sweep`), or couldn't report the persona's state (`status read`, or `ErrJsonlMissing diagnosis get`: the read of the persona's old row before replacing a missing transcript). The launch stops there with no `Spawn failure:` notice, no `spawn-failed` entry and nothing counted; nothing is deleted, killed or launched after it. After `ErrJsonlMissing diagnosis get` there is also no `jsonl-diagnosis-inconclusive` entry and no uncertainty warning to the persona: nothing was diagnosed. The retries above take over. The restart path's reconnect logs the same line with `persona=<key>` in place of the name, `reconnectMcp: send-keys refused for persona=<key>: <error> — …`: agent-director refused its keystrokes and the reconnect is not done. A refused `findMissing sweep` on the restart path logs `escalate-dead: findMissing sweep refused for persona=<key>: <error> — …` (after its `escalate-dead:` line) or `reconnectSession: prompt row: findMissing sweep refused for persona=<key>: <error> — …`: the restart does nothing more this time (nothing is checked again, stopped or relaunched, and no notice is posted). A `send-keys refused` line naming `ErrSpawnNotInteractive` and ending `dead session (b.dup)` is not a refusal: the persona's session is gone and it is recovered. | Nothing. If it keeps happening, see **It never clears** below. |
-| `[slack] killSession (restart adapter): kill refused for persona=<key>: <error> — no relaunch follows (b.jg5 SRJ-105)` | A restart's kill of the persona's old session was refused by agent-director, agent-director couldn't stop the session, or it answered that tmux isn't available (`ErrTmuxNotAvailable`). The next line follows. | Nothing. For `ErrTmuxNotAvailable`, see **tmux isn't available** above. |
+| `[slack] <step>: <call> refused for "<name>" (key=<key>): <error> — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)` | While the persona was being launched, agent-director refused a call (`<call>` names it, such as `spawn`, `resume`, `kill`, `delete`, `collision get`, `send-keys` or `findMissing sweep`), or couldn't report the persona's state (`status read`, or `ErrJsonlMissing diagnosis get`: the read of the persona's old row before replacing a missing transcript). An `<error>` naming `ErrConfigMalformed` is agent-director refusing its config file (see **agent-director refuses its config file** above). The launch stops there with no `Spawn failure:` notice, no `spawn-failed` entry and nothing counted; nothing is deleted, killed or launched after it. After `ErrJsonlMissing diagnosis get` there is also no `jsonl-diagnosis-inconclusive` entry and no uncertainty warning to the persona: nothing was diagnosed. The retries above take over. The restart path's reconnect logs the same line with `persona=<key>` in place of the name, `reconnectMcp: send-keys refused for persona=<key>: <error> — …`: agent-director refused its keystrokes and the reconnect is not done. A refused `findMissing sweep` on the restart path logs `escalate-dead: findMissing sweep refused for persona=<key>: <error> — …` (after its `escalate-dead:` line) or `reconnectSession: prompt row: findMissing sweep refused for persona=<key>: <error> — …`: the restart does nothing more this time (nothing is checked again, stopped or relaunched, and no notice is posted). A `send-keys refused` line naming `ErrSpawnNotInteractive` and ending `dead session (b.dup)` is not a refusal: the persona's session is gone and it is recovered. | Nothing. If it keeps happening, see **It never clears** below. |
+| `[slack] killSession (restart adapter): kill refused for persona=<key>: <error> — no relaunch follows (b.jg5 SRJ-105)` | A restart's kill of the persona's old session was refused by agent-director, agent-director couldn't stop the session, it answered that tmux isn't available (`ErrTmuxNotAvailable`), or it refused its config file (`ErrConfigMalformed`). The kill is not tried again, and the next line follows. | Nothing. For `ErrTmuxNotAvailable`, see **tmux isn't available** above; for `ErrConfigMalformed`, **agent-director refuses its config file** above. |
 | `[slack] Session kill refused for persona=<key> — no relaunch; not counted` | The restart stopped at the refused kill: nothing was relaunched and nothing counts toward the restart limit. The retries above take over. | Nothing. If it keeps happening, see **It never clears** below. |
 | `[slack] unavailable-retry: persona=<key> retry <n> — rerunning its recovery` | Retry `<n>` runs: it reads the persona's state, then reconnects or relaunches it. | Nothing. |
 | `[slack] unavailable-retry: persona=<key> retry <n> (pending-only) — reading its row` | Retry `<n>` runs after a relaunch: it only reads the persona's state, and types nothing and launches nothing. | Nothing. |
@@ -1655,7 +1707,9 @@ and is coming up again.
 | `[slack] unavailable-retry: persona=<key> arm failed: <error> — not armed` or `[slack] unavailable-retry: persona=<key> retry run failed: <error>` | An internal error setting the retry's timer. The retries for the persona stop until agent-director refuses a call for it again. A relaunch whose refusal logged `arm failed` counts toward the restart limit, since nothing retries it. | Report it as a bug, with the persona's lines. |
 
 **It never clears.** The persona keeps retrying with the same `<cause>` every
-300 s. Check that agent-director answers:
+300 s. With the `config` cause, see **agent-director refuses its config
+file** above instead: a working `version` proves nothing there. Otherwise,
+check that agent-director answers:
 
 ```sh
 agent-director version
@@ -1695,9 +1749,10 @@ the persona to the retries above (`armed (<cause>)`, then the
 `liveness-unknown` reason), so once agent-director answers again the persona
 is recovered with no server restart. `<cause>` is `unavailable` when
 agent-director timed out, couldn't be reached or gave an error the server
-doesn't know, and `read-error` for any other error (a configuration or
-internal error, for example), a state the server doesn't know, or a check
-that itself failed. Only a state that shows the instance is gone (`ended`,
+doesn't know, `config` when it refused its config file (`ErrConfigMalformed`,
+which also posts a notice: see **agent-director refuses its config file**
+above), and `read-error` for any other error (an internal error, for
+example), a state the server doesn't know, or a check that itself failed. Only a state that shows the instance is gone (`ended`,
 `missing`, no row, or the agent-director binary gone) leads to a relaunch.
 
 All of one persona's lines of this kind (replace `ops_bot` with the key):
@@ -1708,7 +1763,7 @@ grep -h -E 'persona=ops_bot( |:|$)' "$STATE"/server.log.* "$STATE"/server.log 2>
 
 | Line | Meaning | What to do |
 |---|---|---|
-| `[slack] isSessionAlive: status error for persona=<key>: <error> — read as unknown, not dead` | agent-director answered the state check with an error (see [The server log](#the-server-log), Error detail): it timed out, was unreachable, reported an internal or configuration error, or gave an error the server doesn't know. The persona's state is read as unknown. | Nothing while it passes. If it repeats, see **It keeps reading unknown** below. |
+| `[slack] isSessionAlive: status error for persona=<key>: <error> — read as unknown, not dead` | agent-director answered the state check with an error (see [The server log](#the-server-log), Error detail): it timed out, was unreachable, reported an internal or configuration error, or gave an error the server doesn't know. The persona's state is read as unknown. For `ErrConfigMalformed` (agent-director refuses its config file) the line comes at every check, and the notice and its one `outage-state: ad-config-malformed raised` line come with the first. | Nothing while it passes. For `ErrConfigMalformed`, see **agent-director refuses its config file** above. If it repeats otherwise, see **It keeps reading unknown** below. |
 | `[slack] isSessionAlive: status answered a state CSCB does not know for persona=<key> — read as unknown, not dead` | agent-director reported a row state this server version doesn't know. Read as unknown, never as dead. | If it repeats, the installed agent-director may be newer than this server expects: report it as a bug, with the persona's lines and `agent-director version`. |
 | `[slack] health-check: liveness unknown for persona=<key>[ (isSessionAlive failed: <error>)] — skipping it this tick; not read as dead` | The health check couldn't learn the persona's state (` (isSessionAlive failed: <error>)` when the check itself failed), so it skipped the persona for this check: nothing restarted, nothing posted. It counts as a fresh start for the two-checks-in-a-row rule. | Nothing. The next check tries again. |
 | `[slack] Liveness unknown for persona=<key>[ (isSessionAlive failed: <error>)] — no reconnect, kill or launch; nothing counted` | A restart couldn't learn the persona's state, so it did nothing and counted nothing. The persona's retries take over (`unavailable-retry: persona=<key> armed (<cause>) …`, `<cause>` as above, unless they were already waiting). | Nothing while the retries run. |
@@ -1727,7 +1782,9 @@ agent-director get --claude-instance-id cscb_<key>
 
 If agent-director doesn't answer, or answers with an error, fix it (the
 `install-cscb` skill covers installing it); the next retry recovers the
-persona with no server restart. If it answers normally but the lines keep
+persona with no server restart. An error naming `ErrConfigMalformed` is
+agent-director refusing its config file: see **agent-director refuses its
+config file** above, and don't edit the file. If it answers normally but the lines keep
 coming, report it as a bug, with the persona's lines.
 
 ---

@@ -33,8 +33,10 @@ import {
   ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
   _resetOutageState,
+  adConfigMalformedOnset,
   initOutageState,
   getOutageFlags,
+  raiseAdConfigMalformed,
   setOutageFlag,
   tmuxServerChangedOnset,
   withOutageDetection,
@@ -117,8 +119,9 @@ import {
 } from '../src/session-manager.ts'
 import type { ClientOptions, FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams } from 'agent-director'
 import { KILL_SESSION_REFUSED, type KillSessionResult } from '../src/restart.ts'
-import { UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, isInsideAttempt, runInAttempt } from '../src/unavailable-retry.ts'
+import { UNAVAILABLE_RETRY_CAUSE_CONFIG, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, isInsideAttempt, runInAttempt } from '../src/unavailable-retry.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
@@ -846,11 +849,120 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions).toEqual([{ key: 'C1', text: onset() }])
   })
 
-  // b.jg5 SRJ-314: every other `status` error reads `unknown`, never `dead`,
-  // and raises no outage flag here (a CONFIG answer's `ad-config-malformed`
-  // outage is E12's). One log line, from the catch-all.
+  // b.jg5 SRJ-316, SRJ-314: a CONFIG answer (`ErrConfigMalformed`, decided by
+  // name) reads `unknown`, never `dead`, and raises `ad-config-malformed` for
+  // the persona with the exported onset for that error: one onset per
+  // episode, so a second CONFIG probe posts nothing. The CONFIG cause arms the
+  // persona's timer in any context, so each probe reports it once, inside or
+  // outside an attempt for the persona. The error's description carries the
+  // leak marker (inside a fake token and a `ticket=` URL), which the onset
+  // shows redacted and then Slack-escaped.
   test.each([
-    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed()],
+    ['outside any attempt', false],
+    ['inside a recovery attempt for the persona', true],
+  ] as const)('b.jg5 SRJ-316: status throws a CONFIG answer (ErrConfigMalformed) %s → reads unknown, not dead; ad-config-malformed raised with its onset, posted once; the CONFIG cause reported once per probe; a second CONFIG posts nothing; nothing leaks', async (_label, inside) => {
+    const err = errConfigMalformed('starting_session_seconds', sentinelInMessage('status-config'))
+    const { emissions, statusCalls, triggers, adapter } = makeHarness(err)
+    const probe = () => (inside
+      ? runInAttempt('C1', 'recovery', () => probeCapturingErrors(adapter, 'C1'))
+      : probeCapturingErrors(adapter, 'C1'))
+    const raiseLines = (errArgs: unknown[][]) => stringLines(errArgs).filter((l) => l.includes('ad-config-malformed raised for persona=C1'))
+    const statusErrorLines = (errArgs: unknown[][]) => stringLines(errArgs).filter((l) => l.startsWith('[slack] isSessionAlive: status error for persona=C1: '))
+
+    const first = await probe()
+
+    expect(first.result).toEqual(LIVENESS_READING_UNKNOWN)
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
+    expect(emissions).toEqual([{ key: 'C1', text: adConfigMalformedOnset(err) }])
+    // The quoted description is redacted, then Slack-escaped (b.jg5 SRJ-1018):
+    // the placeholders render as text, never as a raw `<…>` Slack would parse.
+    const escapedTail = escapeSlackControlCharacters(REDACTED_SENTINEL_TAIL)
+    expect(escapedTail).not.toBe(REDACTED_SENTINEL_TAIL)
+    expect(emissions[0]!.text).toContain(`starting_session_seconds = ${escapedTail}, below its safe minimum`)
+    expect(emissions[0]!.text).not.toContain(REDACTED_SENTINEL_TAIL)
+    expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_CONFIG, inside }])
+    expect(raiseLines(first.errArgs)).toHaveLength(1)
+    expect(statusErrorLines(first.errArgs)).toHaveLength(1)
+    expect(first.errArgs).toHaveLength(2)
+
+    const second = await probe()
+
+    expect(second.result).toEqual(LIVENESS_READING_UNKNOWN)
+    expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
+    expect(emissions).toHaveLength(1)
+    expect(triggers).toEqual([
+      { key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_CONFIG, inside },
+      { key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_CONFIG, inside },
+    ])
+    expect(raiseLines(second.errArgs)).toEqual([])
+    expect(statusErrorLines(second.errArgs)).toHaveLength(1)
+    assertNoLeak({ errArgs: [...first.errArgs, ...second.errArgs], emissions })
+  })
+
+  /** Raise `ad-config-malformed` for C1 through the production raise entry (its raise line captured, not printed). */
+  const raiseConfigOutage = () => capturingErrorArgs(async () => raiseAdConfigMalformed('C1', errConfigMalformed()))
+
+  /** The all-clear the bare `ad-config-malformed` class posts when it clears alone (no detail recorded). */
+  const configAllClear = (): string => ALL_CLEAR_TEMPLATE(new Map([['ad-config-malformed', {}]]))
+
+  // b.jg5 SRJ-312: a `status` that shows agent-director loaded its config and
+  // read its store clears `ad-config-malformed`: a state answer, and
+  // `ErrSpawnNotFound`. With it the only raised class, one all-clear lists
+  // the bare class; with `tmux-unavailable` also raised (a `status` never
+  // clears that one) the clear is silent. The reading is unchanged.
+  test.each([
+    ['a successful status (a live state)', undefined, LIVENESS_READING_LIVE],
+    ['ErrSpawnNotFound', errSpawnNotFound, LIVENESS_READING_DEAD],
+  ].flatMap(([label, build, reading]) => [
+    [label, build, reading, false],
+    [label, build, reading, true],
+  ] as const) as ReadonlyArray<readonly [string, (() => Error) | undefined, LivenessReading, boolean]>)('b.jg5 SRJ-312: with ad-config-malformed raised, status answers %s → clears it (one clear line); reads %j; tmux-unavailable also raised: %p (then it stays raised and no all-clear, else one all-clear listing the bare class)', async (_label, build, reading, withTmux) => {
+    const { emissions, cleared, adapter } = makeHarness(build?.())
+    await raiseConfigOutage()
+    if (withTmux) setOutageFlag('C1', 'tmux-unavailable')
+    const before = emissions.length
+
+    const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
+
+    expect(result).toEqual(reading)
+    expect(cleared).toEqual([{ key: 'C1', cls: 'ad-config-malformed' }])
+    expect(stringLines(errArgs).filter((l) => l.includes('ad-config-malformed cleared for persona=C1'))).toHaveLength(1)
+    if (withTmux) {
+      expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
+      expect(emissions.slice(before)).toEqual([])
+    } else {
+      expect(getOutageFlags('C1').size).toBe(0)
+      expect(emissions.slice(before)).toEqual([{ key: 'C1', text: configAllClear() }])
+    }
+  })
+
+  // b.jg5 SRJ-312: no other `status` error shows agent-director read its
+  // store, so none clears `ad-config-malformed`; each keeps its own reading.
+  test.each([
+    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status'), LIVENESS_READING_DEAD],
+    ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'status'), LIVENESS_READING_UNKNOWN],
+    ...unavailableForms('ErrCallTimeout', 'ErrTmuxUnresponsive', 'ErrUnknownErrorName').map(
+      ([label, build]) => [`${label} (UNAVAILABLE)`, () => build('status'), LIVENESS_READING_UNKNOWN] as const,
+    ),
+    ['ErrInternal', () => errInternal(), LIVENESS_READING_UNKNOWN],
+  ] as ReadonlyArray<readonly [string, () => Error, LivenessReading]>)('b.jg5 SRJ-312: with ad-config-malformed raised, status throws %s → ad-config-malformed stays raised: no clear, no clear line, no all-clear; reads %j', async (_label, build, reading) => {
+    const { emissions, cleared, adapter } = makeHarness(build())
+    await raiseConfigOutage()
+    const before = emissions.length
+
+    const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
+
+    expect(result).toEqual(reading)
+    expect(getOutageFlags('C1').has('ad-config-malformed')).toBe(true)
+    expect(cleared).toEqual([])
+    expect(stringLines(errArgs).filter((l) => l.includes('ad-config-malformed cleared'))).toEqual([])
+    expect(emissions.slice(before).map((e) => e.text)).not.toContain(configAllClear())
+  })
+
+  // b.jg5 SRJ-314: every other `status` error reads `unknown`, never `dead`,
+  // and raises no outage flag here. One log line, from the catch-all.
+  test.each([
     ['ErrCallTimeout', () => errCallTimeout('status')],
     ['ErrTmuxUnresponsive (by name)', () => errTmuxUnresponsive('status')],
     ['ErrInternal (an unknown name)', () => errInternal()],
@@ -861,7 +973,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     ['an UNUSABLE NAME ErrInternal', () => errUnusableName()],
     ['a store agent-director cannot open (ErrSchemaMismatch)', () => errSchemaMismatch()],
     ['a GONE name (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(undefined, 'status')],
-  ])('%s: status throws → reads unknown, not dead; no flag, nothing posted, one log line; outside any attempt nothing is armed (only ENVIRONMENT arms there, b.jg5 SRJ-311)', async (_label, build) => {
+  ])('%s: status throws → reads unknown, not dead; no flag, nothing posted, one log line; outside any attempt nothing is armed (only ENVIRONMENT and CONFIG arm there, b.jg5 SRJ-311, SRJ-316)', async (_label, build) => {
     const { emissions, statusCalls, triggers, adapter } = makeHarness(build())
 
     const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
@@ -1309,7 +1421,6 @@ describe('_buildReconnectSessionAdapter', () => {
   test.each([
     ['ErrSpawnNotFound', () => errSpawnNotFound()],
     ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status')],
-    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed()],
     ['ErrCallTimeout', () => errCallTimeout('status')],
     ['ErrTmuxUnresponsive (by name)', () => errTmuxUnresponsive('status')],
     ['a plain Error', () => new Error('boom')],
@@ -1335,6 +1446,26 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(findMissingCalls).toHaveLength(0)
     expect(lines).toHaveLength(1)
     expect(lines[0]).toStartWith('[slack] reconnectSession: persona=C1 status check failed: ')
+  })
+
+  // b.jg5 SRJ-115, SRJ-316: a CONFIG answer at the state read is the same
+  // 'transient' with nothing typed, read or swept; the outage wrapper also
+  // raises `ad-config-malformed`, which adds its one raise line.
+  test("SRJ-115, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the state read → 'transient', never 'escalate-dead'; no send-keys, pane read, tmux probe or sweep; ad-config-malformed raised; the status-check line and one raise line", async () => {
+    const { result, errArgs, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxProbes, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({
+      statusError: errConfigMalformed(),
+    })
+
+    expect(result).toBe('transient')
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect([sendKeysCalls, readPaneCalls, tmuxProbes, killCalls, spawnCalls, resumeCalls]).toEqual([[], [], [], [], [], []])
+    expect(findMissingCalls).toHaveLength(0)
+    expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
+    const lines = stringLines(errArgs)
+    expect(lines.filter((l) => l.startsWith('[slack] reconnectSession: persona=C1 status check failed: '))).toHaveLength(1)
+    expect(lines.filter((l) => l.includes('ad-config-malformed raised for persona=C1'))).toHaveLength(1)
+    expect(lines).toHaveLength(2)
+    assertNoLeak({ errArgs })
   })
 
   test("(iv) reconnectMcp 'dead-session' → 'escalate-dead', firing exactly one memoized findMissing sweep (b.sv7 / Epic t1.tkk.e4)", async () => {
@@ -1428,6 +1559,33 @@ describe('_buildReconnectSessionAdapter', () => {
     ])
     expect(lines.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
     if (redacted) expect(lines.join('\n')).toContain(REDACTED_SENTINEL_TAIL)
+    assertNoLeak({ errArgs })
+  })
+
+  // b.jg5 SRJ-105, SRJ-316: a CONFIG `send-keys` (at the first try, or at the
+  // retry after ErrTmuxSendKeys) is the same refusal: 'transient', never
+  // 'escalate-dead', no sweep, kill or launch and no spawn-failure notice.
+  // The outage wrapper raises `ad-config-malformed`.
+  test.each([
+    ['at the first try', 'send-keys', (err: Error) => ({ sendKeysThrows: err }), 1],
+    ['at the retry after ErrTmuxSendKeys', 'retry send-keys after ErrTmuxSendKeys', (err: Error) => ({ sendKeysErrors: [errTmuxSendKeys(), err] }), 2],
+  ] as const)("SRJ-105, SRJ-316: send-keys answers a CONFIG answer (ErrConfigMalformed) %s → 'transient', never 'escalate-dead'; no sweep, kill or launch, no spawn-failure notice; one described refusal line; ad-config-malformed raised; nothing leaks", async (_label, what, sendKeys, sends) => {
+    const err = errConfigMalformed('starting_session_seconds', sentinelInMessage('send-keys-config'))
+
+    const { result, errArgs, raised, sendKeysCalls, findMissingCalls, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({
+      statusState: 'waiting',
+      ...sendKeys(err),
+    })
+
+    expect(result).toBe('transient')
+    expect(sendKeysCalls).toHaveLength(sends)
+    expect(findMissingCalls).toHaveLength(0)
+    expect([killCalls, spawnCalls, resumeCalls]).toEqual([[], [], []])
+    expect(raised).toEqual([])
+    expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
+    const lines = stringLines(errArgs)
+    expect(lines.filter((l) => l.includes(' refused for persona=C1'))).toEqual([sendKeysRefusedLine(what, err)])
+    expect(lines.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
     assertNoLeak({ errArgs })
   })
 
@@ -2077,7 +2235,9 @@ describe('_buildReconnectSessionAdapter', () => {
 // `ErrTmuxKillFailed` included) answers `KILL_SESSION_REFUSED` with one
 // described line, so the restart work launches nothing; so does an
 // ENVIRONMENT kill (`ErrTmuxNotAvailable`, b.jg5 SRJ-311), which also raises
-// `tmux-unavailable`; success and `ErrSpawnNotFound` answer nothing ("go
+// `tmux-unavailable`, and a CONFIG kill (`ErrConfigMalformed`, b.jg5
+// SRJ-316), which also raises `ad-config-malformed`; success and
+// `ErrSpawnNotFound` answer nothing ("go
 // on"); `ErrSystemInstallDisappeared` and every other class keep today's
 // handling (go on). The kill follows a `dead`
 // reading, so it is declared as not of a row read live: not tmux-touching, it
@@ -2227,6 +2387,31 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
     assertNoLeak({ errArgs, emissions })
   })
 
+  // b.jg5 SRJ-316, SRJ-110, SRJ-105: a CONFIG kill is a refusal, so the
+  // restart work launches nothing after it, and the kill is not repeated. The
+  // wrapper raises `ad-config-malformed` (its onset, quoting the redacted
+  // description) and arms the timer once with the CONFIG cause; CONFIG never
+  // starts the `tmux-unresponsive` condition (SRJ-307).
+  test('b.jg5 SRJ-316: kill answers a CONFIG answer (ErrConfigMalformed) → KILL_SESSION_REFUSED with no second kill; one described refusal line; ad-config-malformed raised with its onset; the timer armed once with the config cause; no condition; nothing leaks', async () => {
+    const err = errConfigMalformed('starting_session_seconds', sentinelInMessage('kill-config'))
+    install(err)
+
+    const { result, errArgs } = await killInAttempt()
+
+    expect(result).toBe(KILL_SESSION_REFUSED)
+    expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    const lines = stringLines(errArgs)
+    expect(lines.filter((l) => l.includes('kill refused'))).toEqual([refusedLine(err)])
+    expect(lines.filter((l) => l.includes('ad-config-malformed raised for persona=C1'))).toHaveLength(1)
+    expect(lines).toHaveLength(2)
+    expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
+    expect(emissions).toEqual([{ key: 'C1', text: adConfigMalformedOnset(err) }])
+    expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_CONFIG }])
+    expect(starts).toEqual([])
+    expect(ends).toEqual([])
+    assertNoLeak({ errArgs, emissions })
+  })
+
   // The `ad-unreachable` branch is unchanged: the flag is raised by the
   // wrapper and the adapter goes on, with no refusal line.
   test.each([
@@ -2248,7 +2433,6 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
   // is armed either.
   test.each([
     ['an UNCLASSIFIED ErrInternal', () => errInternal()],
-    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed()],
     ['an UNUSABLE NAME ErrInternal', () => errUnusableName()],
     ['a STATE name (ErrSpawnNotResumable)', () => errSpawnNotResumable()],
     ['a GONE name (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(undefined, 'kill')],
