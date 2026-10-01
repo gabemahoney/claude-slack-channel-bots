@@ -73,6 +73,27 @@
  *     (`restarting`): the key sets `h.heldOnInvalidFlags`, `h.killFailed`
  *     and `h.sequenceOrWaitRunning` (seeded by the options of the same names,
  *     with persona names), which production leaves unbound;
+ *   - in flight for P (the read gate's `isWorkInFlight`): as `main()` binds
+ *     the one shared in-flight predicate, one of the harness's own restart
+ *     launches in flight (`h.isLaunchInFlight`), or the key in
+ *     `h.workInFlight` (seeded by `workInFlight`, with persona names), work
+ *     in flight that is not a launch (a later Epic's sequence or wait step);
+ *   - the one lost-message row read (`readRowLiveness`), only with the
+ *     `rowRead` option; without it the routing gets no read and makes none.
+ *     Each persona's answer is scripted in `h.rowReadScripts` (by key, read at
+ *     call time, seeded from `rowRead` by persona name): a reading from
+ *     src/liveness-reading.ts (`pending`, `live`, `dead` for no row,
+ *     `unknown`), or `ROW_READ_REJECTS`, a rejection whose message carries
+ *     the leak sentinel only through `sentinelInMessage`
+ *     (`ROW_READ_REJECTION_MESSAGE`; `ROW_READ_REJECTION_REDACTED` once
+ *     redacted) and whose `detail` carries it bare. An unscripted persona
+ *     answers `UNSCRIPTED_ROW_READING` (`dead`, as the restart deps' probe).
+ *     A script's `during` runs, awaited, after the read is recorded and
+ *     before it settles (to latch P or raise an outage during the read, or
+ *     hold the read open). Every read is recorded at its start in
+ *     `h.rowReads` (its key) and in `h.readOrder` (`read:<key>`), which also
+ *     gets `notice:<key>` for every notice the routing raises, so a case sees
+ *     each read's place relative to the notices;
  * - the server-wide reply settings source (`getReplySettings`, as src/server.ts
  *   passes its start-time settings): it returns the `ackReaction` option and
  *   the default chunking, so by default there is no ack reaction and a
@@ -128,7 +149,7 @@ import {
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
 import { createSessionServer, registerSession, _resetRegistry, type SessionEntry, type SessionToolDeps } from '../../src/registry.ts'
 import { initRestart, _resetRestartState, type RestartDeps } from '../../src/restart.ts'
-import { LIVENESS_READING_DEAD } from '../../src/liveness-reading.ts'
+import { LIVENESS_READING_DEAD, type LivenessReading } from '../../src/liveness-reading.ts'
 import { _resetBackoffState } from '../../src/backoff.ts'
 import { _resetAckTracker, consumeAck } from '../../src/ack-tracker.ts'
 import {
@@ -140,7 +161,7 @@ import {
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
 import { makeStubSlack, type StubSlack, type StubSlackOptions } from './slack-stub.ts'
 import { makePersonaClients, posts, type PersonaClients } from './permission-relay-harness.ts'
-import { LEAK_SENTINEL, sentinelInMessage } from './credentials.ts'
+import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './credentials.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 
@@ -169,6 +190,51 @@ export { LOST_MESSAGE_STATES }
 export function stateOf(text: string | undefined): LostMessageState | 'none' | 'several' {
   const found = LOST_MESSAGE_STATES.filter((s) => (text ?? '').includes(STATE_WORDING[s]))
   return found.length === 1 ? found[0]! : found.length === 0 ? 'none' : 'several'
+}
+
+// ---------------------------------------------------------------------------
+// The lost-message row read (b.jg5 SRJ-1011)
+// ---------------------------------------------------------------------------
+
+/** A scripted row read that rejects (see `ROW_READ_REJECTION_MESSAGE`). */
+export const ROW_READ_REJECTS = 'rejects'
+
+/** What one scripted row read answers: a reading from src/liveness-reading.ts, or a rejection. */
+export type RowReadAnswer = LivenessReading | typeof ROW_READ_REJECTS
+
+/**
+ * Runs, awaited, after a scripted read of persona `key` is recorded and
+ * before it settles: latch P, raise an outage or hold the read open.
+ */
+export type RowReadDuring = (h: RoutingHarness, key: string) => void | Promise<void>
+
+/** One persona's scripted row read. */
+export interface RowReadScript {
+  answer: RowReadAnswer
+  during?: RowReadDuring
+}
+
+/** What a persona with no script answers: the `dead` reading (no row), as the restart deps' probe. */
+export const UNSCRIPTED_ROW_READING: LivenessReading = LIVENESS_READING_DEAD
+
+/**
+ * The message of a scripted rejection's error: the leak sentinel only inside
+ * a fake token and a ticket URL (`sentinelInMessage`), the shapes
+ * `redactSlackLogText` removes.
+ */
+export const ROW_READ_REJECTION_MESSAGE = `status read failed (${sentinelInMessage('row-read')})`
+
+/** `ROW_READ_REJECTION_MESSAGE` as a log line keeps it once redacted. */
+export const ROW_READ_REJECTION_REDACTED = `status read failed (${REDACTED_SENTINEL_TAIL})`
+
+/** The error a scripted rejection throws: its message as above, its `detail` the bare sentinel (never to be logged). */
+function rowReadRejection(): Error {
+  return Object.assign(new Error(ROW_READ_REJECTION_MESSAGE), { detail: LEAK_SENTINEL })
+}
+
+/** A script, from an answer alone or a whole script. */
+function toRowReadScript(value: RowReadAnswer | RowReadScript): RowReadScript {
+  return typeof value === 'object' && 'answer' in value ? value : { answer: value }
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +437,20 @@ export interface RoutingHarnessOptions {
   killFailed?: readonly string[]
   /** Names with a live-row sequence or old-life wait step running first (`h.sequenceOrWaitRunning`, `restarting`). */
   sequenceOrWaitRunning?: readonly string[]
+  /**
+   * Names with work in flight that is not a launch first (`h.workInFlight`),
+   * read by the routing's in-flight gate beside the harness's own launches
+   * in flight (b.jg5 SRJ-1011).
+   */
+  workInFlight?: readonly string[]
+  /**
+   * Give the routing its lost-message row read (b.jg5 SRJ-1011), scripted
+   * per persona name: an answer, or a script with a `during` callback (see
+   * the file comment). `{}` binds the read with every persona unscripted
+   * (`UNSCRIPTED_ROW_READING`). Absent, as by default: no read is bound, so
+   * none is made.
+   */
+  rowRead?: Readonly<Record<string, RowReadAnswer | RowReadScript>>
 }
 
 /** One notice the routing raised: the persona key and the body, without the notifier's persona prefix. */
@@ -421,6 +501,14 @@ export interface RoutingHarness {
   killFailed: Set<string>
   /** Keys with a live-row sequence or old-life wait step running (`restarting`), read at call time. */
   sequenceOrWaitRunning: Set<string>
+  /** Keys with work in flight that is not a launch, read by the in-flight gate at call time. */
+  workInFlight: Set<string>
+  /** Each persona's scripted row read, by key, read at call time (with the `rowRead` option). */
+  rowReadScripts: Map<string, RowReadScript>
+  /** The key of every row read the routing made, in order, recorded at the read's start. */
+  rowReads: string[]
+  /** `read:<key>` at each row read's start and `notice:<key>` for each notice the routing raised, in order. */
+  readOrder: string[]
   /** Restart delay (seconds) the restart deps report, read at call time. */
   restartDelayS: number
   /** Archive writes started through the seam. */
@@ -601,6 +689,10 @@ export function makeRoutingHarness(
     heldOnInvalidFlags: keySet(opts.heldOnInvalidFlags),
     killFailed: keySet(opts.killFailed),
     sequenceOrWaitRunning: keySet(opts.sequenceOrWaitRunning),
+    workInFlight: keySet(opts.workInFlight),
+    rowReadScripts: new Map(Object.entries(opts.rowRead ?? {}).map(([name, v]) => [byName(name).persona.key, toRowReadScript(v)])),
+    rowReads: [],
+    readOrder: [],
     restartDelayS: opts.restartDelayS ?? FAST_RESTART_DELAY_S,
     archiveWrites: [],
     receive: (event, names, ack) => routing.receive(
@@ -644,6 +736,18 @@ export function makeRoutingHarness(
     const client = webClientFor(key)
     return client ? createNameResolver(client as unknown as NameResolverWebClient).resolveUserName(userId) : userId
   }
+  // The one lost-message row read (b.jg5 SRJ-1011), only with `rowRead`:
+  // recorded at its start, then the script's `during`, then its answer.
+  const readRowLiveness: PersonaRoutingDeps['readRowLiveness'] = opts.rowRead === undefined
+    ? undefined
+    : async (key) => {
+      h.rowReads.push(key)
+      h.readOrder.push(`read:${key}`)
+      const script = h.rowReadScripts.get(key) ?? { answer: UNSCRIPTED_ROW_READING }
+      if (script.during) await script.during(h, key)
+      if (script.answer === ROW_READ_REJECTS) throw rowReadRejection()
+      return script.answer
+    }
   const routing = createPersonaRouting({
     getPersonaConfig: () => {
       h.order.push('config')
@@ -662,6 +766,7 @@ export function makeRoutingHarness(
     getReplySettings,
     notify: (key, text, options) => {
       h.notices.push({ key, text })
+      h.readOrder.push(`notice:${key}`)
       return notify(key, text, options)
     },
     log,
@@ -675,6 +780,10 @@ export function makeRoutingHarness(
     isHeldOnInvalidFlags: (key) => h.heldOnInvalidFlags.has(key),
     isKillFailed: (key) => h.killFailed.has(key),
     isSequenceOrWaitRunning: (key) => h.sequenceOrWaitRunning.has(key),
+    // As main() binds the shared in-flight predicate (today a launch call),
+    // plus the non-launch work a case marks.
+    isWorkInFlight: (key) => h.isLaunchInFlight(key) || h.workInFlight.has(key),
+    readRowLiveness,
   })
 
   initRestart(restartDeps)

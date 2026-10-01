@@ -1675,7 +1675,7 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
     (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.stubCase === 'scan-leftover' && row.rowState === LATCH_ROW_STATE_NO_ROW,
   )
 
-  test('a CONFLICT at P’s spawn latches P; a message lost then reports held for a human with its exported wording at P’s destination, asks for no restart and makes no call, and nothing fires for P afterwards; Q’s lost message reports its own state', async () => {
+  test('a CONFLICT at P’s spawn latches P; a message lost then reports held for a human with its exported wording at P’s destination, asks for no restart and makes no call, and nothing fires for P afterwards; Q’s lost message reports its own state after its one row read', async () => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
     expect(h.config.session_restart_delay).toBe(0)
@@ -1684,6 +1684,7 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
     expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
     expect(h.latch.isLatched(p)).toBe(true)
     const afterLatch = callCounts(h)
+    const personaCountsAfterLatch = personaCallCounts(h, p)
 
     const lost = await h.loseMessage(p)
 
@@ -1707,18 +1708,23 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
     await h.advance(4 * UNAVAILABLE_RETRY_CEILING_S * 1000)
     expect([h.attempts, callCounts(h), h.clock.pendingCount(), isRestartPendingOrActive(p)]).toEqual([[], afterLatch, 0, false])
 
-    // Q is not latched: its message reports the state that applies to it at the delay 0.
+    // Q is not latched: its message reports the state that applies to it at
+    // the delay 0. States 1 to 5 are clear for Q and nothing is in flight, so
+    // its message makes the routing's one row read (SRJ-1011), a `status` of
+    // Q's instance, which reads no row (dead), not `pending`.
     expect(await h.loseMessage(q)).toEqual({
       state: 'auto-restart-disabled',
       notice: expect.stringContaining(STATE_WORDING['auto-restart-disabled']),
       restartRequested: false,
       restartPending: false,
-      calls: {},
+      calls: { statusCalls: 1 },
     })
     expect(h.slack(q).calls.postMessage).toHaveLength(1)
     expect(h.slack(p).calls.postMessage).toHaveLength(1)
     expect(h.latch.isLatched(q)).toBe(false)
-    expect(personaCallCounts(h, q)).toEqual({})
+    expect(personaCallCounts(h, q)).toEqual({ statusCalls: 1 })
+    // The latched P's own calls are still those of its launch.
+    expect(personaCallCounts(h, p)).toEqual(personaCountsAfterLatch)
   })
 })
 

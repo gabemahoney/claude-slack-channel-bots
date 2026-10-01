@@ -52,6 +52,17 @@
  * nothing is awaited between the connected check and the send (b.9cj), with
  * microtask flips and no timing sleeps.
  *
+ * The lost-message row read (b.jg5 SRJ-1011; the harness's `rowRead`
+ * option): its gating and isolation in the pipeline. No read for a message
+ * that is delivered, dropped, a duplicate or for a key outside the applied
+ * set; exactly one read, with P's key, before P's notice, when states 1 to 5
+ * are clear and nothing is in flight; none in states 1 to 5 or while a
+ * launch, an approver, a sequence or other work is in flight for P; one read
+ * per persona for a message lost on two connections, a failing read for one
+ * leaving the other unchanged; and a rejecting read never escaping the
+ * pipeline, its line redacted. The read's answers and their effects on the
+ * state are owned by tests/inbound-recovery-drop-branch.test.ts.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -71,7 +82,13 @@ import {
   type SessionEntry,
 } from '../src/registry.ts'
 import { consumeAck } from '../src/ack-tracker.ts'
-import { initRestart, isRestartPendingOrActive } from '../src/restart.ts'
+import { initRestart, isRestartPendingOrActive, scheduleRestart } from '../src/restart.ts'
+import { LIVENESS_READING_PENDING } from '../src/liveness-reading.ts'
+import { HOLD_LATCH_CASES, LATCH_ROW_STATE_UNREADABLE, REFUSED_OPERATION_NONE } from '../src/conflict-latch.ts'
+import { raiseTmuxUnavailable } from '../src/outage-state.ts'
+import { createPersonaUpPredicate } from '../src/persona-start.ts'
+import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
+import { errTmuxNotAvailable, errTmuxUnresponsive } from './test-helpers/agent-director-stub.ts'
 import { openArchiveDatabase } from '../src/message-archive.ts'
 import { dryRunPersonaIdentity } from '../src/persona-connections.ts'
 import type { Persona } from '../src/config.ts'
@@ -93,12 +110,16 @@ import { buildTempArchiveDb } from './test-helpers/archive-db.ts'
 import { REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import {
   NEVER_FIRE_RESTART_DELAY_S,
+  ROW_READ_REJECTS,
+  ROW_READ_REJECTION_REDACTED,
   makeRestartDeps,
   makeRoutingHarness,
   resetRoutingState,
+  stateOf,
   waitFor,
   type RoutingHarness,
   type RoutingHarnessOptions,
+  type RowReadAnswer,
 } from './test-helpers/persona-routing-harness.ts'
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
@@ -891,6 +912,168 @@ describe('lost message: notice at the persona\'s destination and recovery keyed 
     expect(isRestartPendingOrActive(other.persona.key)).toBe(false)
     await waitFor(() => h.launches.length > 0)
     expect(h.launches).toEqual([{ key: lost.persona.key, cwd: lost.persona.working_directory }])
+    assertNoLeak(captured(h))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The lost-message row read (b.jg5 SRJ-1011): made only for a lost message, at
+// most once, only once states 1 to 5 are ruled out and nothing is in flight
+// for P, and never breaking another persona's run. What each answer gives is
+// owned by tests/inbound-recovery-drop-branch.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('lost-message row read: gating and isolation in the pipeline (b.jg5 SRJ-1011)', () => {
+  /** B's `mentions`-only channel. */
+  const CM = 'C0MENTONL1'
+  /** A connection that serves, so only the bring-up outcome decides whether a persona is up. */
+  const SERVING: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0SERVING', botId: 'B0SERVING' } }
+
+  /** A: `all` in CA (its destination) and CS. B: `all` in CB (its destination) and CS, `mentions` in CM. */
+  const readSpecs = (): PersonaSpec[] => [
+    { name: 'Alpha Bot', channels: [{ id: CA, delivery: 'all' }, { id: CS, delivery: 'all' }] },
+    { name: 'Beta Bot', channels: [{ id: CB, delivery: 'all' }, { id: CS, delivery: 'all' }, { id: CM, delivery: 'mentions' }] },
+  ]
+
+  /** No sessions, a restart delay that never fires, and the row read bound (every persona unscripted unless `opts` scripts it). */
+  function readHarness(opts: RoutingHarnessOptions = {}): Harness {
+    return makeHarness(readSpecs(), { sessions: [], restartDelayS: NEVER_FIRE_RESTART_DELAY_S, rowRead: {}, ...opts })
+  }
+
+  test.each<[string, readonly string[], (h: Harness) => Promise<void>, boolean]>([
+    ['a message delivered to B', ['Beta Bot'], (h) => h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot']), false],
+    ['a message the decision drops (no mention of B in its `mentions` channel)', [], (h) => h.receive(makeChannelMessage({ channel: CM }), ['Beta Bot']), false],
+    [
+      'a duplicate of a lost message (only the first is lost and read for)',
+      [],
+      async (h) => {
+        const event = makeChannelMessage({ channel: CB })
+        await h.receive(event, ['Beta Bot'])
+        await h.receive(event, ['Beta Bot'])
+      },
+      true,
+    ],
+    ['a message for a key outside the applied set', [], (h) => h.receiveKeys(makeChannelMessage({ channel: CB }), ['ghost_key']), false],
+  ])('no read is made for %s', async (_label, sessions, act, oneLost) => {
+    const h = readHarness({ sessions, rowRead: { 'Beta Bot': LIVENESS_READING_PENDING } })
+    const B = h.p('Beta Bot').persona.key
+
+    await act(h)
+
+    expect(h.rowReads).toEqual(oneLost ? [B] : [])
+    expect(h.notices.map((n) => n.key)).toEqual(oneLost ? [B] : [])
+    assertNoLeak(captured(h))
+  })
+
+  test('a lost message with states 1 to 5 clear and nothing in flight makes exactly one read, with P\'s key, before P\'s notice; a `pending` answer reports session-starting and asks for no restart', async () => {
+    const h = readHarness({ rowRead: { 'Beta Bot': LIVENESS_READING_PENDING } })
+    const B = h.p('Beta Bot').persona.key
+
+    await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
+
+    expect(h.rowReads).toEqual([B])
+    expect(h.readOrder).toEqual([`read:${B}`, `notice:${B}`])
+    expect(h.allPosts()).toEqual([lostNoticePost(h, 'Beta Bot', CB, 'stub-user', 'session-starting')])
+    expect(isRestartPendingOrActive(B)).toBe(false)
+    expect(h.restartAsks).toEqual([])
+    assertNoLeak(captured(h))
+  })
+
+  test.each<[LostMessageState, string, RoutingHarnessOptions, (h: Harness, key: string, notUp: Set<string>) => void]>([
+    ['not-up', 'its bring-up outcome is not up', {}, (_h, key, notUp) => { notUp.add(key) }],
+    [
+      'held-for-human',
+      `it is latched (${HOLD_LATCH_CASES[0]})`,
+      {},
+      (h, key) => { h.latch.set(key, { latchCase: HOLD_LATCH_CASES[0], refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE }) },
+    ],
+    ['cannot-launch', 'it is held on ErrInvalidFlags', {}, (h, key) => { h.heldOnInvalidFlags.add(key) }],
+    ['kill-failed', 'its kill failed', {}, (h, key) => { h.killFailed.add(key) }],
+    [
+      'not-answering',
+      'its tmux-unresponsive condition holds',
+      {},
+      (h, key) => { expect(h.tmuxUnresponsive.start(key, 'resume', errTmuxUnresponsive('resume'))).toBe('started') },
+    ],
+    ['not-answering', 'its tmux-unavailable outage is raised', { outageState: true }, (_h, key) => { raiseTmuxUnavailable(key, errTmuxNotAvailable()) }],
+  ])('state %s (%s): no read is made, the notice reports that state and no restart is asked for', async (state, _label, opts, set) => {
+    const notUp = new Set<string>()
+    const isUp = createPersonaUpPredicate({ status: () => SERVING }, { isUp: (key) => !notUp.has(key) })
+    const h = readHarness({ ...opts, isPersonaUp: isUp, rowRead: { 'Beta Bot': LIVENESS_READING_PENDING } })
+    const B = h.p('Beta Bot').persona.key
+    set(h, B, notUp)
+
+    await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
+
+    expect(h.rowReads).toEqual([])
+    expect(h.notices.map((n) => [n.key, stateOf(n.text)])).toEqual([[B, state]])
+    expect(isRestartPendingOrActive(B)).toBe(false)
+    expect(h.restartAsks).toEqual([])
+    assertNoLeak(captured(h))
+  })
+
+  test.each<[string, (h: Harness, key: string, approver: Set<string>) => Promise<void> | void, LostMessageState]>([
+    [
+      'a restart launch of P held open (the launch-running input and the shared in-flight predicate)',
+      async (h, key) => {
+        h.restartDelayS = 0.005
+        scheduleRestart(key, h.p('Beta Bot').persona.working_directory, undefined, { humanTrigger: true })
+        await waitFor(() => h.isLaunchInFlight(key))
+        expect(h.isLaunchInFlight(key)).toBe(true)
+      },
+      'session-starting',
+    ],
+    ['a dialog approver of P running, with no launch in flight (the launch-or-approver input alone)', (_h, key, approver) => { approver.add(key) }, 'session-starting'],
+    ['a live-row sequence or old-life wait step running for P', (h, key) => { h.sequenceOrWaitRunning.add(key) }, 'restarting'],
+    ['other work in flight for P that is not a launch (the shared in-flight predicate alone)', (h, key) => { h.workInFlight.add(key) }, 'starting-now'],
+  ])('work in flight makes no read: %s; the notice reports the state that applies without it', async (_label, set, state) => {
+    const approver = new Set<string>()
+    const h: Harness = readHarness({
+      rowRead: { 'Beta Bot': LIVENESS_READING_PENDING },
+      launchSession: () => new Promise<boolean>(() => {}),
+      isLaunchOrApproverRunning: (key) => h.isLaunchInFlight(key) || approver.has(key),
+    })
+    const B = h.p('Beta Bot').persona.key
+    await set(h, B, approver)
+
+    await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
+
+    expect(h.rowReads).toEqual([])
+    expect(h.notices.map((n) => [n.key, stateOf(n.text)])).toEqual([[B, state]])
+    assertNoLeak(captured(h))
+  })
+
+  test.each<[string, RowReadAnswer, LostMessageState]>([
+    ['A\'s read answers `pending`', LIVENESS_READING_PENDING, 'session-starting'],
+    ['A\'s read rejects', ROW_READ_REJECTS, 'starting-now'],
+  ])('one message lost on two connections makes one read per persona with its own key (%s), and B\'s read, state and notice are the same either way', async (_label, aAnswer, aState) => {
+    const h = readHarness({ rowRead: { 'Alpha Bot': aAnswer, 'Beta Bot': LIVENESS_READING_PENDING } })
+    const [A, B] = h.keys(['Alpha Bot', 'Beta Bot']) as [string, string]
+
+    await receiveOnEach(h, makeChannelMessage({ channel: CS }))
+
+    expect(h.rowReads).toEqual([A, B])
+    expect(h.readOrder).toEqual([`read:${A}`, `notice:${A}`, `read:${B}`, `notice:${B}`])
+    expect(h.postsTo(CA)).toEqual([lostNoticePost(h, 'Alpha Bot', CA, 'stub-user', aState)])
+    expect(h.postsTo(CB)).toEqual([lostNoticePost(h, 'Beta Bot', CB, 'stub-user', 'session-starting')])
+    expect(h.postsTo(CS)).toEqual([])
+    expect(isRestartPendingOrActive(A)).toBe(aState === 'starting-now')
+    expect(isRestartPendingOrActive(B)).toBe(false)
+    assertNoLeak(captured(h))
+  })
+
+  test('a rejecting read never escapes the pipeline: A\'s notice is still posted, and the one line it writes names A and keeps the error\'s message redacted', async () => {
+    const h = readHarness({ rowRead: { 'Alpha Bot': ROW_READ_REJECTS } })
+    const A = h.p('Alpha Bot').persona
+
+    await h.receive(makeChannelMessage({ channel: CS }), ['Alpha Bot'])
+
+    expect(h.rowReads).toEqual([A.key])
+    const failed = linesWithText(h, ROW_READ_REJECTION_REDACTED)
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toContain(renderPersonaRef(A.name, A.key))
+    expect(lines(h, 'error handling event')).toEqual([])
+    expect(h.allPosts()).toEqual([lostNoticePost(h, 'Alpha Bot', CA, 'stub-user', 'starting-now')])
     assertNoLeak(captured(h))
   })
 })

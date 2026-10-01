@@ -1337,13 +1337,13 @@ The notice reports the first state that applies, in the table's order.
 | `not up` | The persona stopped being up (broken or retrying) while the message was being handled, so no restart was started. A persona that isn't up receives no new messages, so this appears only in that short window. Its instance is launched once the persona recovers. | Fix the persona's cause (see "A persona doesn't come up or doesn't answer"), then resend once it's back. |
 | `held for a human` | The persona is held until a human resolves a problem with its tmux session or agent-director row, so no restart was started. | Follow the persona's hold notice (see "A persona posts a *Held: tmux session conflict* notice" below), then resend once it's back. |
 | `not answering` | agent-director or tmux is not answering for the persona, tmux is not available for it, or agent-director refuses its config file. The server keeps retrying the persona on its own; no restart was started. | Follow the persona's own notice (see "A persona posts a *Not answering*, *Still not answering* or *Answering again* notice", "A persona posts a *tmux unavailable* or *tmux server changed* notice" and "A persona posts an *agent-director refuses its config file* notice" below), then resend once it's back. |
-| `starting` | A launch of the persona's session is running and its session has not come up yet, so no restart was started. | Resend once the persona is up. |
+| `starting` | The persona's session is starting but has not come up yet, so no restart was started: a launch of it is running, or the server checked with agent-director once, when it found the message lost, and the session was still starting. A check that fails never reports `starting`. | Resend once the persona is up. |
 | `restarting` | A restart of the persona's instance was already under way. | Resend the message (or ask the sender to) once the persona is back. |
 | `auto-restart disabled` | `session_restart_delay` is `0`, so no restart was started. A persona the server is already retrying on its own (see "A persona is retried after agent-director refuses it" below) comes back when a retry succeeds; otherwise a server restart recovers it. | If the persona isn't being retried, restart the server; resend once it's back. |
 | `restart limit reached` | The persona is capped; automatic restarts are suspended. | Restart the server to clear the limit, then resend. |
 | `starting now` | The lost message triggered a fast restart (the backoff delay is clamped down to 5 seconds, never raised). | Resend in a moment, once the persona is back. |
 
-`starting` and `starting now` differ: `starting` means a launch was already running and the message started nothing; `starting now` means the message itself started a restart.
+`starting` and `starting now` differ: `starting` means the session was already starting and the message started nothing; `starting now` means the message itself started a restart.
 
 A `starting now` restart still counts each failed launch toward the backoff/cap, and a restart already pending or active is not stacked.
 

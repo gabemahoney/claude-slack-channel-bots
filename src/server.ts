@@ -387,8 +387,9 @@ let personaLatch: Pick<ConflictLatch, 'isLatched'> | undefined
 /**
  * b.jg5 SRJ-315: true while work is in flight for the persona (today only a
  * launch call, `isLaunchInFlight`). Today this one predicate serves the retry
- * timer (`isInFlight`), the health tick (`isLaunchInFlight`) and the session
- * disconnect handler (`restartDisconnectedPersona`). They need not stay
+ * timer (`isInFlight`), the health tick (`isLaunchInFlight`), the session
+ * disconnect handler (`restartDisconnectedPersona`) and the lost-message
+ * routing's read gate (`isWorkInFlight`, b.jg5 SRJ-1011). They need not stay
  * equal: a running dialog approver counts as in flight for the tick but never
  * blocks a retry (SRJ-303, SRJ-401). What must hold is that the tick never
  * attempts over work that holds back the retry timer.
@@ -416,6 +417,14 @@ function armEnvironmentRetryTimer(key: string): void {
  * Undefined before then, when no condition holds.
  */
 let personaTmuxUnresponsive: Pick<TmuxUnresponsiveCondition, 'holds'> | undefined
+
+/**
+ * The liveness adapter main() builds (`_buildIsSessionAliveAdapter`, the one
+ * instance the restart path and the health tick also receive), for the
+ * lost-message row read (b.jg5 SRJ-115, SRJ-1011); set in main() before the
+ * start bring-up pass. Undefined before then, when no read is made.
+ */
+let personaRowLiveness: ((key: string) => Promise<LivenessReading>) | undefined
 
 /** The manager's per-persona queries, answering nothing before main() builds it. */
 const connectionView: Pick<PersonaConnectionManager, 'status' | 'webClient' | 'identity'> = {
@@ -841,6 +850,19 @@ const personaRouting = createPersonaRouting({
   isLatched: (key) => personaLatch?.isLatched(key) ?? false,
   isTmuxUnresponsive: (key) => personaTmuxUnresponsive?.holds(key) ?? false,
   isLaunchOrApproverRunning: (key) => isLaunchInFlight(key),
+  // b.jg5 SRJ-1011: the lost-message read gate's "in flight for P" is the one
+  // shared in-flight predicate the retry timer and the health tick receive,
+  // so the in-flight work later Epics add to it (E17's approver, E21's and
+  // E27's sequences and wait steps) reaches the gate through it.
+  isWorkInFlight: isPersonaWorkInFlight,
+  // b.jg5 SRJ-115, SRJ-1011: the lost-message read is the liveness adapter's
+  // one `status` for P (no new getClient() site), read at call time; before
+  // main() builds the adapter no read is made and the answer is `unknown`,
+  // which leaves session-starting out. It runs outside any launch or
+  // recovery attempt, so an UNAVAILABLE or UNCLASSIFIED answer arms nothing
+  // and opens no episode, while ENVIRONMENT and CONFIG raise their outages
+  // and arm the retry timer as from any verb (SRJ-105, SRJ-1501).
+  readRowLiveness: (key) => personaRowLiveness?.(key) ?? Promise.resolve(LIVENESS_READING_UNKNOWN),
   // Left unbound until their Epics bind them, so they answer false:
   // isHeldOnInvalidFlags (E23), isKillFailed (E20, E27) and
   // isSequenceOrWaitRunning (E21, E27).
@@ -1153,6 +1175,15 @@ export async function _runCallTimeoutStartStep(
  * reported to the persona's unclassified-error episode (b.jg5 SRJ-313), but
  * `ErrSystemInstallDisappeared` is not: it keeps its `dead` reading (SRJ-105,
  * SRJ-314). From the health tick nothing is reported.
+ *
+ * The same instance is the persona routing's lost-message row read (b.jg5
+ * SRJ-115, SRJ-1011), made from the Slack event path, outside any launch or
+ * recovery attempt, as the health tick's is: an UNAVAILABLE or UNCLASSIFIED
+ * answer arms no retry timer and opens no unclassified-error episode, and,
+ * `status` not being tmux-touching, no answer starts a `tmux-unresponsive`
+ * condition; an ENVIRONMENT or CONFIG answer raises its outage and arms the
+ * retry timer, and `ErrSystemInstallDisappeared` raises `ad-unreachable` and
+ * reads `dead` (SRJ-105, SRJ-1501).
  *
  * @internal
  */
@@ -2542,6 +2573,10 @@ export async function main(): Promise<void> {
   // persona's retry timer on `unknown`; the health tick never counts
   // `pending` healthy and skips an `unknown` persona that tick.
   const isSessionAliveAdapter = _buildIsSessionAliveAdapter(() => personaConfig)
+  // b.jg5 SRJ-115, SRJ-1011: the persona routing's lost-message row read is
+  // this same instance, set before the start bring-up pass opens any
+  // persona's connection.
+  personaRowLiveness = isSessionAliveAdapter
 
   // b.9cj: the restart guard and the health-check tick share persona-routing's
   // stream-presence probe (`hasSessionStream`), the same `_GET_stream` check

@@ -19,8 +19,9 @@
  *   call), the applied-persona lookup over the live applied set, the
  *   relaunch gate below, the restart cap (`isAtCap` at
  *   `RESTART_FAILURE_CAP`), the harness's shutting-down flag, the latch's
- *   latched query (`latch` below) and the session
- *   manager's `isLaunchInFlight`, and the condition's retry hooks: the
+ *   latched query (`latch` below) and the shared in-flight predicate
+ *   (`isPersonaWorkInFlight`, as `main()`'s: today the session manager's
+ *   `isLaunchInFlight`), and the condition's retry hooks: the
  *   connection and stream probes (`isSessionConnected` and
  *   `hasSessionStream`, both over `setConnected`) and `endTmuxUnresponsive`,
  *   the condition's end with reason `TMUX_UNRESPONSIVE_END_RETRY` and the
@@ -42,7 +43,9 @@
  *   Every call to it is recorded first in `stops` (`{ key, reason }`).
  * - The restart module is initialised over the configuration
  *   (`initRestart`) with the production adapters: the liveness read
- *   (`_buildIsSessionAliveAdapter` over the applied configuration), the
+ *   (`_buildIsSessionAliveAdapter` over the applied configuration, one
+ *   instance, as `main()`'s `isSessionAliveAdapter`, which the lost-message
+ *   driver's row read is too), the
  *   reconnect and kill adapters (`_buildReconnectSessionAdapter`,
  *   `_buildKillSessionAdapter`, over the applied-persona lookup) and
  *   `launchSession` over the applied configuration with the relaunch gate as
@@ -220,10 +223,21 @@
  *   `holds`; `isLaunchOrApproverRunning` is the session manager's
  *   `isLaunchInFlight` (a launch call awaits its dialog approver); the
  *   restart guards and `scheduleRestart` are the restart module the harness
- *   initialised, and the outage flags are the outage state's. The members
- *   later Epics bind (held on `ErrInvalidFlags`, kill-failed, a sequence or
- *   wait step running) are left unbound, as in production, and so are the
- *   one `status` read and the in-flight gate, which E15's second Task adds.
+ *   initialised, and the outage flags are the outage state's. The read gate's
+ *   in-flight member (`isWorkInFlight`) is the shared in-flight predicate the
+ *   full-mode retry action receives, and the one row read
+ *   (`readRowLiveness`) is the harness's liveness adapter, the restart deps'
+ *   default `isSessionAlive` (b.jg5 SRJ-1011, SRJ-115); a
+ *   `restartDeps.isSessionAlive` replacement does not reach it. So when states
+ *   1 to 5 are clear and nothing is in flight for the persona, the message
+ *   makes one stub `status` call (in `calls` and in `stub.calls.status`),
+ *   outside any launch or recovery attempt, answered by the stub's `status`
+ *   knobs (`script({ statusResult })`, `statusQueue`, `statusError` or
+ *   `statusFn`; e.g. `cannedStatusResult({ state: 'pending' })` for state 6);
+ *   while a launch's spawn is held open (`holdSpawns(stub.client)` and a
+ *   `launch(key)` not yet settled) a launch is in flight and no read is made.
+ *   The members later Epics bind (held on `ErrInvalidFlags`, kill-failed, a
+ *   sequence or wait step running) are left unbound, as in production.
  *   Each persona has its own Slack stub (`slack(key)`, leak marker on) as its
  *   client and bot identity; the routing's `notify` records each notice in
  *   `lostMessageNotices` (`{ key, text }`, the body without the persona
@@ -713,6 +727,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   }
   const canRelaunch = createPersonaRelaunchGate({ status: () => SERVING }, log, upQuery)
 
+  // As main()'s `isPersonaWorkInFlight` (b.jg5 SRJ-315, SRJ-1011): the one
+  // shared in-flight predicate (today a launch call, `isLaunchInFlight`),
+  // which the full-mode retry action and the driver's read gate both receive.
+  const isPersonaWorkInFlight = (key: string): boolean => isLaunchInFlight(key)
+
   const queued = new Map<string, UnavailableRetryOutcome[]>()
   const scripted: UnavailableRetryAction = (key) => queued.get(key)?.shift() ?? SCRIPTED_REFUSAL
   const fullMode = createFullModeRetryAction({
@@ -725,7 +744,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // As main() binds it (b.jg5 SRJ-303, SRJ-305): a retry of a latched
     // persona makes no call and stops the timer.
     isLatched: (key) => latch.isLatched(key),
-    isInFlight: isLaunchInFlight,
+    isInFlight: isPersonaWorkInFlight,
     isSessionConnected: (key) => connected.has(key),
     hasSessionStream: (key) => connected.has(key),
     endTmuxUnresponsive: (key, reading) => {
@@ -886,9 +905,12 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   _resetRestartState()
   _resetBackoffState()
+  // As main()'s `isSessionAliveAdapter`: one liveness adapter over the applied
+  // configuration, the restart path's read and the driver's lost-message read.
+  const isSessionAliveAdapter = _buildIsSessionAliveAdapter(appliedConfig)
   const restartDeps: RestartDeps = {
     canRestart: canRelaunch,
-    isSessionAlive: _buildIsSessionAliveAdapter(appliedConfig),
+    isSessionAlive: isSessionAliveAdapter,
     isSessionConnected: (key) => connected.has(key),
     hasSessionStream: (key) => connected.has(key),
     reconnectSession: _buildReconnectSessionAdapter(appliedPersona),
@@ -994,8 +1016,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const slackClientFor = (key: string): WebClient | undefined => slackStubs.get(key)?.web as unknown as WebClient | undefined
 
   /**
-   * The driver's routing, built once, bound as `main()` binds it. E15's
-   * second Task adds the routing's one `status` read and its in-flight gate;
+   * The driver's routing, built once, bound as `main()` binds it, its one
+   * lost-message row read and its in-flight gate included (b.jg5 SRJ-1011);
    * the members later Epics bind stay unbound, as in production.
    */
   function driver(): LostMessageDriver {
@@ -1022,6 +1044,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       isLatched: (key) => latch.isLatched(key),
       isTmuxUnresponsive: (key) => tmuxUnresponsive.holds(key),
       isLaunchOrApproverRunning: (key) => isLaunchInFlight(key),
+      // As main() binds them (b.jg5 SRJ-1011, SRJ-115): the read gate's
+      // "in flight for P" is the shared in-flight predicate, and the one row
+      // read is the harness's liveness adapter, so it shows as a stub `status`.
+      isWorkInFlight: isPersonaWorkInFlight,
+      readRowLiveness: isSessionAliveAdapter,
     })
     lostMessageDriver = { routing, hold }
     return lostMessageDriver

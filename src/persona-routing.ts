@@ -53,10 +53,14 @@
  *    decides the state, the first that applies, from whether P is up, whether
  *    P is latched (held for a human), whether P is not answering (its
  *    `tmux-unresponsive` condition holds, or its `tmux-unavailable` or
- *    `ad-config-malformed` outage is raised), whether a launch for P is
- *    running (starting), and the restart guards. A P in any state but
- *    "starting now" is never restarted from here. Nothing is posted in the
- *    source conversation, and the message text is never in the notice.
+ *    `ad-config-malformed` outage is raised), whether P's row reads `pending`
+ *    (a launch for P is running, or the one row read below answered
+ *    `pending`: starting), and the restart guards. When none of states 1 to 5
+ *    applies and nothing is in flight for P, one row read of P is made (the
+ *    injected `readRowLiveness`), and the state is decided again after it.
+ *    A P in any state but "starting now" is never restarted from here (b.jg5
+ *    SRJ-1501). Nothing is posted in the source conversation, and the message
+ *    text is never in the notice.
  *
  * The ack reaction's name comes from the server-wide `ack_reaction` setting
  * (b.av2 SR-1.6); with it absent, no persona reacts or records an entry.
@@ -69,7 +73,8 @@
  * lost-message state inputs are injected through `createPersonaRouting`. The
  * session lookup comes from the registry, the restart guards from the restart
  * and backoff modules and the outage flags from the outage state, so tests
- * drive their real state. This module never calls agent-director.
+ * drive their real state. This module makes no agent-director call itself;
+ * its one lost-message row read is injected (`readRowLiveness`).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -96,8 +101,16 @@ import { getSessionByPersona } from './registry.ts'
 import { isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from './restart.ts'
 import { isAtCap } from './backoff.ts'
 import { trackAck } from './ack-tracker.ts'
-import { buildLostMessageNotice, decideLostMessageState, firesHumanTriggeredRestart } from './lost-message.ts'
+import {
+  buildLostMessageNotice,
+  decideEarlyLostMessageState,
+  decideLostMessageState,
+  firesHumanTriggeredRestart,
+  type EarlyLostMessageQueries,
+} from './lost-message.ts'
 import { getOutageFlags } from './outage-state.ts'
+import { LIVENESS_PENDING, livenessKindOf, type LivenessReading } from './liveness-reading.ts'
+import { describeAgentDirectorFailure } from './ad-error-class.ts'
 import type { PersonaNotify } from './persona-notifier.ts'
 
 // ---------------------------------------------------------------------------
@@ -206,6 +219,25 @@ export interface PersonaRoutingDeps {
    * `session-starting`.
    */
   isSequenceOrWaitRunning?(key: string): boolean
+  /**
+   * Whether anything is in flight for persona P (b.jg5 SRJ-1011, "in flight
+   * for P"; production: the server's one shared in-flight predicate, the one
+   * the health tick and the retry timer receive). While it answers true the
+   * lost-message row read is not made. Absent: nothing counts as in flight.
+   */
+  isWorkInFlight?(key: string): boolean
+  /**
+   * One read of persona P's row, answering one of the four liveness readings
+   * (b.jg5 SRJ-314, SRJ-1011; production: the liveness adapter main() builds,
+   * whose `status` is made outside any launch or recovery attempt here; the
+   * answer is read with `livenessKindOf`, so a value that is not a reading
+   * counts as `unknown`). Made
+   * at most once per lost message, only when none of states 1 to 5 applies
+   * and nothing is in flight for P; a `pending` reading is the
+   * `session-starting` input, and any other reading, or a rejection, leaves
+   * that state out. Absent: no read is made.
+   */
+  readRowLiveness?(key: string): Promise<LivenessReading>
 }
 
 /** A persona-routing instance. */
@@ -459,15 +491,35 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
    * `held-for-human`); whether P is not answering (`not-answering`: its
    * `tmux-unresponsive` condition holds, or its `tmux-unavailable` or
    * `ad-config-malformed` outage flag is raised; an unclassified-error
-   * episode is not consulted); whether a launch for P is running
-   * (`isLaunchOrApproverRunning`, `session-starting`); and P's real restart
-   * guards (pending, auto-restart disabled, cap). The held-on-invalid-flags,
-   * kill-failed and sequence/wait members are asked too, when supplied.
-   * Schedule a human-triggered restart of P in `cwd` only when the
-   * state is `starting-now`, and raise one lost-message notice naming
-   * `senderLabel` and the state at P's destination. Nothing is posted in the
-   * source conversation. The notice is awaited so it is issued before
-   * dispatch returns; a failing sink is logged, never thrown.
+   * episode is not consulted); whether P's row reads `pending`
+   * (`session-starting`: a launch for P is running,
+   * `isLaunchOrApproverRunning`, or the one row read answered `pending`);
+   * and P's real restart guards (pending, auto-restart disabled, cap). The
+   * held-on-invalid-flags, kill-failed and sequence/wait members are asked
+   * too, when supplied.
+   *
+   * The read gate (b.jg5 SRJ-1011): one row read of P (`readRowLiveness`) is
+   * made only when none of states 1 to 5 applies (asked through the same
+   * helper the decision asks first), no launch or approver for P runs, no
+   * live-row sequence or old-life wait step runs for P and nothing is in
+   * flight for P (`isWorkInFlight`). Never more than one read, no retry, no
+   * timer. The read is outside any launch or recovery attempt (see
+   * `readRowOnce`).
+   *
+   * Decide again after the read: the state is decided once, after the read,
+   * over fresh answers to every query, so a latch or outage that began during
+   * the read, or that the read raised itself, reports state 2 or 5.
+   *
+   * The no-restart rule (b.jg5 SRJ-1501): a human-triggered restart of P in
+   * `cwd` is scheduled only when that final state fires one
+   * (`firesHumanTriggeredRestart`: `starting-now` only), so none fires in
+   * states 2 to 6; in state 6 it would be a launch over the `pending` row.
+   * Nothing is awaited between the final decision and `scheduleRestart`, so
+   * messages lost together schedule at most one restart. Then one
+   * lost-message notice naming `senderLabel` and the state is raised at P's
+   * destination. Nothing is posted in the source conversation. The notice is
+   * awaited so it is issued before dispatch returns; a failing sink is
+   * logged, never thrown.
    */
   async function handleLostMessage(
     persona: Persona,
@@ -476,18 +528,18 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     config: PersonaRoutingConfig,
   ): Promise<void> {
     const key = persona.key
+    const early = earlyQueries(key)
+    const rowReadPending = shouldReadRow(key, early) ? await readRowOnce(persona) : false
+    // The final decision: every query is asked afresh here, after the read.
     const state = decideLostMessageState({
-      isNotUp: () => deps.isPersonaUp?.(key) === false,
-      isLatched: () => deps.isLatched?.(key) === true,
-      isHeldOnInvalidFlags: () => deps.isHeldOnInvalidFlags?.(key) === true,
-      isKillFailed: () => deps.isKillFailed?.(key) === true,
-      isNotAnswering: () => isNotAnswering(key),
+      ...early,
       isSequenceOrWaitRunning: () => deps.isSequenceOrWaitRunning?.(key) === true,
-      isRowPending: () => deps.isLaunchOrApproverRunning?.(key) === true,
+      isRowPending: () => rowReadPending || deps.isLaunchOrApproverRunning?.(key) === true,
       isRestartPending: () => isRestartPendingOrActive(key),
       isAutoRestartDisabled: () => config.session_restart_delay === 0,
       isAtRestartLimit: () => isAtCap(key, RESTART_FAILURE_CAP),
     })
+    // Nothing is awaited between the decision above and this call.
     if (firesHumanTriggeredRestart(state)) scheduleRestart(key, cwd, undefined, { humanTrigger: true })
     try {
       await deps.notify(persona.key, buildLostMessageNotice(senderLabel, state))
@@ -496,6 +548,61 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
         `[slack] persona-routing: lost-message notice for persona ${renderPersonaRef(persona.name, persona.key)} ` +
         `failed: ${describeThrownValue(err)}`,
       )
+    }
+  }
+
+  /**
+   * The queries of states 1 to 5 (b.jg5 SRJ-1011) for persona `key`, each
+   * asked at call time, so the gate and the final decision both read fresh
+   * answers.
+   */
+  function earlyQueries(key: string): EarlyLostMessageQueries {
+    return {
+      isNotUp: () => deps.isPersonaUp?.(key) === false,
+      isLatched: () => deps.isLatched?.(key) === true,
+      isHeldOnInvalidFlags: () => deps.isHeldOnInvalidFlags?.(key) === true,
+      isKillFailed: () => deps.isKillFailed?.(key) === true,
+      isNotAnswering: () => isNotAnswering(key),
+    }
+  }
+
+  /**
+   * The read gate (b.jg5 SRJ-1011): true when the row read is injected, none
+   * of states 1 to 5 applies (`decideEarlyLostMessageState`), no launch or
+   * approver for P runs, no live-row sequence or old-life wait step runs for
+   * P, and nothing is in flight for P.
+   */
+  function shouldReadRow(key: string, early: EarlyLostMessageQueries): boolean {
+    if (deps.readRowLiveness === undefined) return false
+    if (decideEarlyLostMessageState(early) !== undefined) return false
+    if (deps.isLaunchOrApproverRunning?.(key) === true) return false
+    if (deps.isSequenceOrWaitRunning?.(key) === true) return false
+    return deps.isWorkInFlight?.(key) !== true
+  }
+
+  /**
+   * The one row read of P for a lost message (b.jg5 SRJ-1011): true when it
+   * answers `pending` (the `session-starting` input). Any other reading
+   * (`live`, `dead`, `unknown`) leaves that state out, and so does a
+   * rejection, which is caught, logged once with its description redacted
+   * (`describeAgentDirectorFailure`) and never thrown. The read is outside
+   * any launch or recovery attempt (b.jg5 SRJ-105, SRJ-115): the reader
+   * decides what its answer raises or arms, and this module only reads the
+   * reading. The restart path's own read still keeps any launch off a
+   * `pending` row after a failed read here.
+   */
+  async function readRowOnce(persona: Persona): Promise<boolean> {
+    const read = deps.readRowLiveness
+    if (read === undefined) return false
+    try {
+      const reading = await read(persona.key)
+      return livenessKindOf(reading) === LIVENESS_PENDING
+    } catch (err) {
+      deps.log(
+        `[slack] persona-routing: lost-message row read for persona ${renderPersonaRef(persona.name, persona.key)} ` +
+        `failed — session-starting left out: ${describeAgentDirectorFailure(err)}`,
+      )
+      return false
     }
   }
 

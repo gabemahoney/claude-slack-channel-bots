@@ -127,7 +127,7 @@ import {
 } from '../src/conflict-latch.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
 import { LIVENESS_LIVE, LIVENESS_PENDING, LIVENESS_READING_UNKNOWN, type PendingLivenessReading } from '../src/liveness-reading.ts'
-import { STATE_WORDING, type LostMessageState } from '../src/lost-message.ts'
+import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../src/lost-message.ts'
 import {
   adConfigMalformedOnset,
   ALL_CLEAR_TEMPLATE,
@@ -6129,19 +6129,28 @@ describe('unavailable retry: a restart work whose latched query throws stops the
 // `auto-restart-disabled`, so the delay 0 also checks the order.
 // ---------------------------------------------------------------------------
 
+/** States 1 to 5 of SRJ-1011: those that apply before the lost-message row read is made. */
+const EARLY_LOST_MESSAGE_STATES: readonly LostMessageState[] = LOST_MESSAGE_STATES.slice(0, LOST_MESSAGE_STATES.indexOf('session-starting'))
+
 /**
  * Lose one message for persona `key` through the driver: it reports `state`
- * with its exported wording, asks the restart module for no restart, leaves
- * none pending and makes no agent-director call.
+ * with its exported wording, asks the restart module for no restart and
+ * leaves none pending. Nothing is in flight for the persona in these cases,
+ * so in states 1 to 5 it makes no agent-director call, and in any later
+ * state exactly one: the routing's row read, a `status` of the persona's own
+ * instance (b.jg5 SRJ-1011).
  */
 async function expectLostMessageReports(h: RecoveryHarness, key: string, state: LostMessageState): Promise<void> {
+  const read = !EARLY_LOST_MESSAGE_STATES.includes(state)
+  const statusBefore = h.stub.calls.statusCalls.length
   expect([key, await h.loseMessage(key)]).toEqual([key, {
     state,
     notice: expect.stringContaining(STATE_WORDING[state]),
     restartRequested: false,
     restartPending: false,
-    calls: {},
+    calls: read ? { statusCalls: 1 } : {},
   }])
+  expect(h.stub.calls.statusCalls.slice(statusBefore)).toEqual(read ? [{ claude_instance_id: personaInstanceId(key) }] : [])
 }
 
 describe('unavailable retry: a message lost while P’s tmux-unavailable or ad-config-malformed outage is raised reports not answering, with no restart (SRJ-1011, SRJ-311, SRJ-316, AC 36, AC 68)', () => {
@@ -6196,9 +6205,16 @@ describe('unavailable retry: a message lost while P’s tmux-unavailable or ad-c
     expect(h.unclassifiedErrorOpen(key)).toBe(true)
     expect(getOutageFlags(key).size).toBe(0)
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    const timer = h.controller.view(key)
+    const triggers = h.triggers.length
 
+    // The message's one row read answers the same error, outside any attempt
+    // (SRJ-1011, hatch A2): a failed read, so not state 6, and it arms
+    // nothing: the timer keeps its due time and no trigger is sent.
     await expectLostMessageReports(h, key, 'auto-restart-disabled')
 
+    expect(h.controller.view(key)).toEqual(timer)
+    expect(h.triggers).toHaveLength(triggers)
     expect(h.unclassifiedErrorOpen(key)).toBe(true)
     expectNeverDestructive(h, key)
   })

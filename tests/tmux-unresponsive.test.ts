@@ -107,7 +107,7 @@ import { doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '.
 import type { Persona } from '../src/config.ts'
 import { _resetHealthCheckState, initHealthCheck, startHealthCheck, stopHealthCheck, type HealthCheckDeps } from '../src/health-check.ts'
 import { LIVENESS_LIVE, LIVENESS_READING_DEAD, LIVENESS_READING_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
-import { STATE_WORDING, type LostMessageState } from '../src/lost-message.ts'
+import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../src/lost-message.ts'
 import {
   ALL_CLEAR_TEMPLATE,
   getOutageFlags,
@@ -1863,19 +1863,28 @@ describe('tmux-unresponsive: a CONFLICT ends it silently (SRJ-310, SRJ-502)', ()
 // branch, bound as `main()` binds it, both settings 0
 // ---------------------------------------------------------------------------
 
+/** States 1 to 5 of SRJ-1011: those that apply before the lost-message row read is made. */
+const EARLY_LOST_MESSAGE_STATES: readonly LostMessageState[] = LOST_MESSAGE_STATES.slice(0, LOST_MESSAGE_STATES.indexOf('session-starting'))
+
 /**
  * Lose one message for persona `key` through the driver: it reports `state`
- * with its exported wording, asks the restart module for no restart, leaves
- * none pending and makes no agent-director call.
+ * with its exported wording, asks the restart module for no restart and
+ * leaves none pending. Nothing is in flight for the persona in these cases,
+ * so in states 1 to 5 it makes no agent-director call, and in any later
+ * state exactly one: the routing's row read, a `status` of the persona's own
+ * instance (b.jg5 SRJ-1011).
  */
 async function expectLostMessageReports(h: RecoveryHarness, key: string, state: LostMessageState): Promise<void> {
+  const read = !EARLY_LOST_MESSAGE_STATES.includes(state)
+  const statusBefore = h.stub.calls.statusCalls.length
   expect([key, await h.loseMessage(key)]).toEqual([key, {
     state,
     notice: expect.stringContaining(STATE_WORDING[state]),
     restartRequested: false,
     restartPending: false,
-    calls: {},
+    calls: read ? { statusCalls: 1 } : {},
   }])
+  expect(h.stub.calls.statusCalls.slice(statusBefore)).toEqual(read ? [{ claude_instance_id: personaInstanceId(key) }] : [])
 }
 
 describe('tmux-unresponsive: a lost message reads the holds query (SRJ-1011, SRJ-307)', () => {

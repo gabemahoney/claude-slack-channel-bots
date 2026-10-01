@@ -154,9 +154,11 @@
  *   server.ts.
  * - b.jg5 SRJ-315: one named in-flight predicate, a module-scope function
  *   declared once, wraps the session manager's `isLaunchInFlight`; the
- *   full-mode retry action's `isInFlight` and the health check's
- *   `isLaunchInFlight` both get it, the session-disconnect handler calls it,
- *   and nothing else names it (no no-op, other predicate or local shadow).
+ *   full-mode retry action's `isInFlight`, the health check's
+ *   `isLaunchInFlight` and the persona routing's read-gate member
+ *   `isWorkInFlight` (b.jg5 SRJ-1011) all get it, the session-disconnect
+ *   handler calls it, and nothing else names it (no no-op, other predicate or
+ *   local shadow).
  * - b.jg5 SRJ-501 / SRJ-508: the one per-persona latch is built once,
  *   imported from the latch module, in main()'s own statement list, after the
  *   notice episodes and before the retry controller and the start pass, with
@@ -193,7 +195,13 @@
  *   holds query), both before the start bring-up; its launch-running query is
  *   the session manager's `isLaunchInFlight`, not the shared in-flight
  *   predicate; the held-on-invalid-flags, kill-failed and sequence/wait
- *   inputs are unbound.
+ *   inputs are unbound. Its read gate's in-flight member (`isWorkInFlight`)
+ *   is the shared in-flight predicate, and its one row read
+ *   (`readRowLiveness`) is the one liveness adapter main() builds
+ *   (`_buildIsSessionAliveAdapter`, built once, the restart module's and the
+ *   health tick's `isSessionAlive`), read at call time through a module-scope
+ *   holder assigned it once in main() before the start bring-up, answering
+ *   `unknown` (never `pending`) before then (b.jg5 SRJ-1011, SRJ-115).
  * - b.jg5 SRJ-311: the session-disconnect handler schedules the restart only
  *   while the persona's `tmux-unavailable` outage is not raised; with it
  *   raised it schedules none and, in order, does nothing more when the
@@ -417,9 +425,11 @@ function withinCall(offsets: number[], at: number): number {
  * (see moduleFunction) whose one parameter is its key and whose whole body is
  * `return isLaunchInFlight(<key>)` (no no-op, no other predicate); no other
  * function, arrow or binding in server.ts is such a wrapper (no second
- * predicate); the name is named exactly four times: its declaration, the
- * retry action's `isInFlight`, the health tick's `isLaunchInFlight` and one
- * call in the session-disconnect handler (b.jg5 SRJ-311); and
+ * predicate); the name is named exactly five times: its declaration, the
+ * retry action's `isInFlight`, the health tick's `isLaunchInFlight`, one
+ * call in the session-disconnect handler (b.jg5 SRJ-311) and the persona
+ * routing's read-gate member `isWorkInFlight`, bound to the bare name (b.jg5
+ * SRJ-1011); and
  * `isLaunchInFlight` is the session manager's import, declared nowhere in
  * server.ts. Returns the predicate's name.
  */
@@ -442,16 +452,18 @@ function sharedInFlightPredicate(): string {
   ]
   expect(wrappers).toEqual([at])
 
-  // Named by the retry action, the health tick and the disconnect handler,
-  // once each, and nowhere else.
+  // Named by the retry action, the health tick, the disconnect handler and
+  // the persona routing's read gate, once each, and nowhere else.
   const named = indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)
-  expect(named).toHaveLength(4)
+  expect(named).toHaveLength(5)
   expect(named[0]).toBe(SERVER_CODE.indexOf(name!, at))
   expect(withinCall(named, onlyCallOf('createFullModeRetryAction'))).toBe(1)
   expect(onlyCallProps('initHealthCheck').get(TICK_IN_FLIGHT_MEMBER)).toBe(name)
   expect(withinCall(named, onlyCallOf('initHealthCheck'))).toBe(1)
   const handler = moduleFunction(DISCONNECT_HANDLER)
   expect(named.filter((offset) => offset > handler.start && offset < handler.end)).toHaveLength(1)
+  expect(onlyCallProps('createPersonaRouting').get(ROUTING_WORK_IN_FLIGHT)).toBe(name)
+  expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
 
   expect(importSource(SERVER_CODE, 'isLaunchInFlight')).toBe('./session-manager.ts')
   expect(indicesOf(/\b(?:let|const|var|function)\s+isLaunchInFlight\b/g, SERVER_CODE)).toEqual([])
@@ -468,6 +480,11 @@ function assignmentsTo(name: string): Array<{ at: number; value: string }> {
 function insideMain(offset: number): boolean {
   return insideMainOf(SERVER_CODE, offset)
 }
+
+/** The persona routing's read-gate in-flight member (b.jg5 SRJ-1011); renaming it fails the typecheck. */
+const ROUTING_WORK_IN_FLIGHT: keyof PersonaRoutingDeps = 'isWorkInFlight'
+/** The persona routing's lost-message row read (b.jg5 SRJ-1011, SRJ-115); renaming it fails the typecheck. */
+const ROUTING_ROW_READ: keyof PersonaRoutingDeps = 'readRowLiveness'
 
 /** The persona routing's latched member (b.jg5 SRJ-1011, SRJ-502); renaming it fails the typecheck. */
 const ROUTING_LATCHED: keyof PersonaRoutingDeps = 'isLatched'
@@ -2825,7 +2842,9 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   // approver), not the shared in-flight predicate main() builds for the retry
   // action and the health tick (b.jg5 SRJ-315), which later Epics widen with
   // work that must report `restarting` instead. Both still resolve to the one
-  // isLaunchInFlight (see sharedInFlightPredicate).
+  // isLaunchInFlight (see sharedInFlightPredicate). The shared predicate is
+  // named in the routing's call only as its read gate's in-flight member
+  // (E15 T2; see the read-gate describe below).
   test('the launch-running query is the session manager\'s isLaunchInFlight for the key it is given, separate from the shared in-flight predicate (state 6, starting)', () => {
     const binding = onlyCallProps('createPersonaRouting').get(LAUNCH_RUNNING)
     expect(binding).toBeDefined()
@@ -2834,7 +2853,8 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     // manager's import, declared nowhere in server.ts.
     const shared = sharedInFlightPredicate()
     expect(binding).not.toContain(shared)
-    expect(indicesOf(new RegExp(`\\b${shared}\\b`, 'g'), SERVER_CODE.slice(...balancedAfter(SERVER_CODE, onlyCallOf('createPersonaRouting'), '(', ')')))).toEqual([])
+    const props = onlyCallProps('createPersonaRouting')
+    expect([...props].filter(([, value]) => new RegExp(`\\b${shared}\\b`).test(value)).map(([member]) => member)).toEqual([ROUTING_WORK_IN_FLIGHT])
   })
 
   test('the held-on-invalid-flags, kill-failed and sequence/wait inputs are unbound: absent from the routing\'s call and named nowhere in server.ts (their Epics, E23, E20, E21 and E27, update this pin)', () => {
@@ -2843,8 +2863,99 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
       expect(props.has(member)).toBe(false)
       expect(indicesOf(new RegExp(`\\b${member}\\b`, 'g'), SERVER_CODE)).toEqual([])
     }
-    // The three bound inputs are present (each pinned above).
-    for (const member of [ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING]) expect(props.has(member)).toBe(true)
+    // The bound inputs are present (each pinned above or in the read-gate describe below).
+    for (const member of [ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ]) expect(props.has(member)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-1011, SRJ-115, SRJ-315 — the persona routing's
+// lost-message read gate and its one row read
+//
+// Both members are optional: absent, nothing counts as in flight and no read
+// is made. A wiring that dropped the read, or bound it to a copy taken at
+// import (before main() builds the adapter), would type-check and pass every
+// behaviour suite while a message lost on a `pending` row reported a later
+// state and fired a restart over the row; one that bound the gate to a second
+// in-flight predicate would read the row while work the retry timer and the
+// health tick count as in flight runs, and miss what later Epics add to the
+// shared one (E17, E21, E27); and one that built a second adapter, or called
+// the client itself, would read the row outside the one adapter's raise and
+// clear rules (E9, E11, E12) and what later Epics add there (E16, E24). The
+// routing is built at module scope and the adapter in main(), so the read
+// goes through a module-scope holder at call time. What the routing does with
+// the read is tested in tests/persona-routing.test.ts and through the
+// recovery harness's lost-message driver; pinned here: the bindings.
+// ---------------------------------------------------------------------------
+
+describe('server.ts binds the persona routing\'s read gate to the shared in-flight predicate and its one row read to the one liveness adapter main() builds, read at call time through a module-scope holder (b.jg5 SRJ-1011, SRJ-115, SRJ-315)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const ADAPTER: keyof typeof ServerModule = '_buildIsSessionAliveAdapter'
+  const RESTART_ALIVE: keyof RestartDeps = 'isSessionAlive'
+  const TICK_ALIVE: keyof HealthCheckDeps = 'isSessionAlive'
+  const UNKNOWN: keyof typeof LivenessReadingModule = 'LIVENESS_READING_UNKNOWN'
+
+  /** The offsets of every build of the liveness adapter in server.ts, its declaration aside. */
+  function adapterBuilds(): number[] {
+    return indicesOf(new RegExp(`(?<![\\w.$]|function\\s+)${ADAPTER}\\s*\\(`, 'g'), SERVER_CODE)
+  }
+
+  /** The routing's row-read binding, `(key) => <holder>?.(key) ?? Promise.resolve(<unknown>)`; returns the holder's name. */
+  function rowReadHolder(): string {
+    const binding = onlyCallProps('createPersonaRouting').get(ROUTING_ROW_READ)
+    expect(binding).toBeDefined()
+    const form = binding!.match(new RegExp(`^\\(?(\\w+)\\)? => (\\w+)\\?\\.\\(\\1\\) \\?\\? Promise\\.resolve\\(${UNKNOWN}\\)$`))
+    expect(form).not.toBeNull()
+    return form![2]!
+  }
+
+  test('the read gate\'s in-flight member is the shared in-flight predicate, bound by its bare name: the very binding the full-mode retry action\'s isInFlight and the health tick\'s isLaunchInFlight get, no second predicate (see sharedInFlightPredicate)', () => {
+    const shared = sharedInFlightPredicate()
+    expect([
+      onlyCallProps('createPersonaRouting').get(ROUTING_WORK_IN_FLIGHT),
+      onlyCallProps('createFullModeRetryAction').get(RETRY_IN_FLIGHT_MEMBER),
+      onlyCallProps('initHealthCheck').get(TICK_IN_FLIGHT_MEMBER),
+    ]).toEqual([shared, shared, shared])
+  })
+
+  test('the liveness adapter is built exactly once, in main()\'s own statement list, as one const that the restart module\'s and the health tick\'s isSessionAlive both get', () => {
+    const builds = adapterBuilds()
+    expect(builds).toHaveLength(1)
+    expect(atMainTopLevel(SERVER_CODE, builds[0]!)).toBe(true)
+    const adapter = constOf(ADAPTER)
+    declaredOnce(adapter)
+    expect([onlyCallProps('initRestart').get(RESTART_ALIVE), onlyCallProps('initHealthCheck').get(TICK_ALIVE)]).toEqual([adapter, adapter])
+  })
+
+  test('the row read reads that one adapter at call time, through a module-scope holder declared once with no initializer and assigned the adapter exactly once, in main()\'s own statement list, after its build and before the start bring-up; before then the read answers the unknown reading, never pending, and the holder is named nowhere else', () => {
+    const holder = rowReadHolder()
+    expect(importSource(SERVER_CODE, UNKNOWN)).toBe('./liveness-reading.ts')
+
+    declaredOnce(holder)
+    const decls = [...SERVER_CODE.matchAll(new RegExp(`^let\\s+${holder}\\s*:(.+)$`, 'gm'))]
+    expect(decls).toHaveLength(1)
+    expect(insideMain(decls[0]!.index!)).toBe(false)
+    // No initializer: once the type's arrows are set aside, no `=` is left.
+    expect(decls[0]![1]!.replace(/=>/g, '')).not.toContain('=')
+
+    const adapter = constOf(ADAPTER)
+    const assigned = assignmentsTo(holder)
+    expect(assigned.map((a) => a.value)).toEqual([adapter])
+    const at = assigned[0]!.at
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(at).toBeGreaterThan(adapterBuilds()[0]!)
+    expect(at).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+
+    // Its declaration, that assignment and the routing's member.
+    expect(indicesOf(new RegExp(`\\b${holder}\\b`, 'g'), SERVER_CODE)).toHaveLength(3)
+  })
+
+  test('the routing\'s call reaches agent-director only through that holder: it names no client and builds no adapter (no new getClient() site)', () => {
+    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf('createPersonaRouting'), '(', ')')
+    const call = SERVER_CODE.slice(open, close)
+    expect(indicesOf(/\bgetClient\b/g, call)).toEqual([])
+    expect(indicesOf(new RegExp(`\\b${ADAPTER}\\b`, 'g'), call)).toEqual([])
+    expect(indicesOf(new RegExp(`\\b${rowReadHolder()}\\b`, 'g'), call)).toHaveLength(1)
   })
 })
 
