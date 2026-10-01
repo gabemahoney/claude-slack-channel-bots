@@ -156,9 +156,9 @@
  *   declared once, wraps the session manager's `isLaunchInFlight`; the
  *   full-mode retry action's `isInFlight`, the health check's
  *   `isLaunchInFlight` and the persona routing's read-gate member
- *   `isWorkInFlight` (b.jg5 SRJ-1011) all get it, the session-disconnect
- *   handler calls it, and nothing else names it (no no-op, other predicate or
- *   local shadow).
+ *   `isWorkInFlight` (b.jg5 SRJ-1011) all get it, the `tmux-unavailable`
+ *   retry check's production deps bind it (b.jg5 SRJ-311), and nothing else
+ *   names it (no no-op, other predicate or local shadow).
  * - b.jg5 SRJ-501 / SRJ-508: the one per-persona latch is built once,
  *   imported from the latch module, in main()'s own statement list, after the
  *   notice episodes and before the retry controller and the start pass, with
@@ -202,14 +202,18 @@
  *   health tick's `isSessionAlive`), read at call time through a module-scope
  *   holder assigned it once in main() before the start bring-up, answering
  *   `unknown` (never `pending`) before then (b.jg5 SRJ-1011, SRJ-115).
- * - b.jg5 SRJ-311: the session-disconnect handler schedules the restart only
- *   while the persona's `tmux-unavailable` outage is not raised; with it
- *   raised it schedules none and, in order, does nothing more when the
- *   persona's retry timer (on the one retry controller's handle) is armed,
- *   arms nothing when the persona is latched (through the routing's latch
- *   holder) or has work in flight (the shared predicate) or no controller
- *   exists, and otherwise arms the timer through the health tick's arm path
- *   (`armEnvironmentRetryTimer`); each branch logs one line.
+ * - b.jg5 SRJ-311: the one session-disconnect handler is built once, at
+ *   module scope, by `_buildRestartDisconnectedPersona` over the
+ *   `tmux-unavailable` retry check's one set of production deps (spread
+ *   first, nothing overriding it), `getAppliedPersona`, the restart module's
+ *   `scheduleRestart` and its shutdown flag, and only the session close and
+ *   the SSE abort call it; those deps are exactly the outage flag, the one
+ *   retry controller's `isArmed` through its handle, the one latch through
+ *   the routing's holder, the shared in-flight predicate, the health tick's
+ *   arm path (`armEnvironmentRetryTimer`) and the server log; the routing's
+ *   `armRetryTimerIfMissing` does nothing while shutting down and otherwise
+ *   asks the same check (`armMissingTmuxUnavailableRetry`) over the same
+ *   deps. The routing's call binds exactly its pinned members.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -253,6 +257,7 @@ import type * as AdSettingsModule from '../src/ad-settings.ts'
 import type * as AdVersionGateModule from '../src/ad-version-gate.ts'
 import type * as AdStartupModule from '../src/agent-director-startup.ts'
 import type * as ServerModule from '../src/server.ts'
+import type { RestartDisconnectedPersonaDeps, TmuxUnavailableRetryDeps } from '../src/server.ts'
 import type { RestartDeps } from '../src/restart.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
 import type * as ConflictLatchModule from '../src/conflict-latch.ts'
@@ -401,8 +406,38 @@ function moduleFunction(name: string): { at: number; params: string[]; start: nu
   return { at, params, start, end, body: SERVER_CODE.slice(start, end) }
 }
 
-/** The session-disconnect handler (b.jg5 SRJ-311): private to server.ts, so named by string. */
+/** The one production session-disconnect handler (b.jg5 SRJ-311): private to server.ts, so named by string. */
 const DISCONNECT_HANDLER = 'restartDisconnectedPersona'
+
+/** The `tmux-unavailable` retry check's deps type (b.jg5 SRJ-311), as imported above. */
+const CHECK_DEPS_TYPE = 'TmuxUnavailableRetryDeps'
+/** The check's latched and in-flight members (b.jg5 SRJ-311, SRJ-502, SRJ-315); renaming one fails the typecheck. */
+const CHECK_LATCHED: keyof TmuxUnavailableRetryDeps = 'isLatched'
+const CHECK_IN_FLIGHT: keyof TmuxUnavailableRetryDeps = 'isWorkInFlight'
+
+/**
+ * b.jg5 SRJ-311: the production deps of the `tmux-unavailable` retry check,
+ * the one module-scope `const <name>: TmuxUnavailableRetryDeps = { … }`
+ * outside main(), declared once (no second set). Returns its name, its
+ * object literal's [start, end) (braces excluded) and its properties.
+ */
+function retryCheckDeps(): { name: string; start: number; end: number; props: Map<string, string> } {
+  const decls = [...SERVER_CODE.matchAll(new RegExp(`^const\\s+(\\w+)\\s*:\\s*${CHECK_DEPS_TYPE}\\s*=\\s*\\{`, 'gm'))]
+  expect(decls).toHaveLength(1)
+  const name = decls[0]![1]!
+  declaredOnce(name)
+  expect(insideMain(decls[0]!.index!)).toBe(false)
+  const [start, end] = balancedAfter(SERVER_CODE, decls[0]!.index!, '{', '}')
+  return { name, start, end, props: objectProperties(SERVER_CODE.slice(start - 1)) }
+}
+
+/** [start, end) of the body of server.ts's one module-scope `export function <name>(…)`, braces excluded. */
+function exportedFunctionBody(name: string): [number, number] {
+  const decls = indicesOf(new RegExp(`^export\\s+function\\s+${name}\\s*\\(`, 'gm'), SERVER_CODE)
+  expect(decls).toHaveLength(1)
+  const paramsEnd = balancedAfter(SERVER_CODE, decls[0]!, '(', ')')[1]
+  return balancedAfter(SERVER_CODE, paramsEnd + 1, '{', '}')
+}
 
 /** server.ts's one ENVIRONMENT arm path (b.jg5 SRJ-311): private to server.ts, so named by string. */
 const ENVIRONMENT_ARM = 'armEnvironmentRetryTimer'
@@ -426,10 +461,11 @@ function withinCall(offsets: number[], at: number): number {
  * `return isLaunchInFlight(<key>)` (no no-op, no other predicate); no other
  * function, arrow or binding in server.ts is such a wrapper (no second
  * predicate); the name is named exactly five times: its declaration, the
- * retry action's `isInFlight`, the health tick's `isLaunchInFlight`, one
- * call in the session-disconnect handler (b.jg5 SRJ-311) and the persona
- * routing's read-gate member `isWorkInFlight`, bound to the bare name (b.jg5
- * SRJ-1011); and
+ * retry action's `isInFlight`, the health tick's `isLaunchInFlight`, the
+ * `tmux-unavailable` retry check's production deps' `isWorkInFlight` (the
+ * session-disconnect handler's and the routing's arm, b.jg5 SRJ-311) and the
+ * persona routing's read-gate member `isWorkInFlight`, each bound to the bare
+ * name (b.jg5 SRJ-1011); and
  * `isLaunchInFlight` is the session manager's import, declared nowhere in
  * server.ts. Returns the predicate's name.
  */
@@ -452,7 +488,7 @@ function sharedInFlightPredicate(): string {
   ]
   expect(wrappers).toEqual([at])
 
-  // Named by the retry action, the health tick, the disconnect handler and
+  // Named by the retry action, the health tick, the retry check's deps and
   // the persona routing's read gate, once each, and nowhere else.
   const named = indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)
   expect(named).toHaveLength(5)
@@ -460,8 +496,9 @@ function sharedInFlightPredicate(): string {
   expect(withinCall(named, onlyCallOf('createFullModeRetryAction'))).toBe(1)
   expect(onlyCallProps('initHealthCheck').get(TICK_IN_FLIGHT_MEMBER)).toBe(name)
   expect(withinCall(named, onlyCallOf('initHealthCheck'))).toBe(1)
-  const handler = moduleFunction(DISCONNECT_HANDLER)
-  expect(named.filter((offset) => offset > handler.start && offset < handler.end)).toHaveLength(1)
+  const check = retryCheckDeps()
+  expect(check.props.get(CHECK_IN_FLIGHT)).toBe(name)
+  expect(named.filter((offset) => offset > check.start && offset < check.end)).toHaveLength(1)
   expect(onlyCallProps('createPersonaRouting').get(ROUTING_WORK_IN_FLIGHT)).toBe(name)
   expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
 
@@ -503,17 +540,18 @@ const ROUTING_TMUX_UNRESPONSIVE: keyof PersonaRoutingDeps = 'isTmuxUnresponsive'
  * never a second one), after that instance is built and before the start
  * bring-up (the first time a persona can connect and lose a message); and it
  * is named nowhere else (its declaration, that assignment and the member),
- * but in each module-scope function in `readers`, which reads it exactly once,
- * as the same call-time query for its own first parameter,
- * `<holder>?.<query>(<key>)` (the latch's: the session-disconnect handler,
- * b.jg5 SRJ-311, SRJ-502). Returns the holder's name and the [start, end) of
- * its assignment.
+ * but once in each member in `checkReaders` of the `tmux-unavailable` retry
+ * check's production deps (see retryCheckDeps), each the same call-time
+ * query for its own parameter, `(key) => <holder>?.<query>(key) === true`
+ * (the latch's: the check's `isLatched`, which the session-disconnect handler
+ * and the routing's arm ask, b.jg5 SRJ-311, SRJ-502). Returns the holder's
+ * name and the [start, end) of its assignment.
  */
 function routingHolder(
   member: keyof PersonaRoutingDeps,
   query: string,
   instance: string,
-  readers: string[] = [],
+  checkReaders: Array<keyof TmuxUnavailableRetryDeps> = [],
 ): { holder: string; at: number; end: number } {
   const binding = onlyCallProps('createPersonaRouting').get(member)
   expect(binding).toBeDefined()
@@ -536,13 +574,14 @@ function routingHolder(
   expect(at).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
 
   const named = indicesOf(new RegExp(`\\b${holder}\\b`, 'g'), SERVER_CODE)
-  for (const reader of readers) {
-    const { params, start, end } = moduleFunction(reader)
-    const reads = named.filter((offset) => offset > start && offset < end)
-    expect(reads).toHaveLength(1)
-    expect(SERVER_CODE.slice(reads[0]!)).toMatch(new RegExp(`^${holder}\\?\\.${query}\\(${params[0]}\\)`))
+  if (checkReaders.length > 0) {
+    const check = retryCheckDeps()
+    for (const reader of checkReaders) {
+      expect([reader, check.props.get(reader)]).toEqual([reader, expect.stringMatching(new RegExp(`^\\(?(\\w+)\\)? => ${holder}\\?\\.${query}\\(\\1\\) === true$`))])
+    }
+    expect(named.filter((offset) => offset > check.start && offset < check.end)).toHaveLength(checkReaders.length)
   }
-  expect(named).toHaveLength(3 + readers.length)
+  expect(named).toHaveLength(3 + checkReaders.length)
   return { holder, at, end: at + assigned[0]![0].length }
 }
 
@@ -1784,7 +1823,7 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
   // raised was never attempted again. What the tick does with them is tested
   // in tests/health-check.test.ts; pinned here: their bindings. The arm is
   // server.ts's one ENVIRONMENT arm path (armEnvironmentRetryTimer), which the
-  // session-disconnect handler also calls (b.jg5 SRJ-311).
+  // tmux-unavailable retry check's production deps also bind (b.jg5 SRJ-311).
   test('the health check\'s retry-timer read (isRetryArmed) is this controller\'s isArmed, and its arm (armRetryTimer) is server.ts\'s one ENVIRONMENT arm path, armEnvironmentRetryTimer, which arms this controller, through its one module-scope handle, for the persona it is given, with the environment cause (b.jg5 SRJ-311, SRJ-301)', () => {
     // Tied to src by type: renaming any of these fails the typecheck.
     const TICK_READ: keyof HealthCheckDeps = 'isRetryArmed'
@@ -1823,13 +1862,16 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
     // The one arm path: the ENVIRONMENT cause is named only by its import and
     // this function; server.ts's only other arm is the restart module's
     // read-error hook (pinned above); and the function is named only at its
-    // declaration, the tick's binding and the session-disconnect handler's
-    // call (b.jg5 SRJ-311; pinned in the handler's describe).
+    // declaration, the tick's binding and the tmux-unavailable retry check's
+    // production deps' `armRetryTimer` (b.jg5 SRJ-311, which the
+    // session-disconnect handler and the routing's arm decide through).
     expect(indicesOf(new RegExp(`\\b${CAUSE}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
     const arms = indicesOf(new RegExp(`\\.\\s*${ARM}\\s*\\(`, 'g'), SERVER_CODE)
     expect(arms).toHaveLength(2)
     expect(withinCall(arms, onlyCallOf('initRestart'))).toBe(1)
     expect(indicesOf(new RegExp(`\\b${ENVIRONMENT_ARM}\\b`, 'g'), SERVER_CODE)).toHaveLength(3)
+    const CHECK_ARM: keyof TmuxUnavailableRetryDeps = 'armRetryTimer'
+    expect(retryCheckDeps().props.get(CHECK_ARM)).toBe(ENVIRONMENT_ARM)
     // The retry module's own cause: imported, never declared or shadowed here.
     expect(importSource(SERVER_CODE, CAUSE)).toBe('./unavailable-retry.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${CAUSE}\\b`, 'g'), SERVER_CODE)).toEqual([])
@@ -2609,7 +2651,7 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(withinAt(adapter)).toBe(1)
     expect(onlyCallProps('createPersonaLifecycle').get('forgetConflictLatch')).toContain(`${latch}.`)
     // The tenth: the routing holder's one assignment, the bare latch.
-    const routing = routingHolder(ROUTING_LATCHED, IS_LATCHED, latch, [DISCONNECT_HANDLER])
+    const routing = routingHolder(ROUTING_LATCHED, IS_LATCHED, latch, [CHECK_LATCHED])
     expect(named.filter((offset) => offset > routing.at && offset < routing.end)).toHaveLength(1)
 
     // The factory itself reads no file: the latch module imports no
@@ -2744,7 +2786,7 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(install, last))).toEqual([])
   })
 
-  test('five latched queries and one read: the latched query is bound exactly once into each of the full-mode retry action, the restart work, the reconnect adapter (its second argument, after the persona lookup) and the health tick, as a call-time read of the one latch\'s isLatched for the key it is given, and once into the persona routing, through its module-scope holder of that one latch (b.jg5 SRJ-1011), which the session-disconnect handler also asks once (b.jg5 SRJ-311)', () => {
+  test('five latched queries and one read: the latched query is bound exactly once into each of the full-mode retry action, the restart work, the reconnect adapter (its second argument, after the persona lookup) and the health tick, as a call-time read of the one latch\'s isLatched for the key it is given, and once into the persona routing, through its module-scope holder of that one latch (b.jg5 SRJ-1011), which the tmux-unavailable retry check\'s production deps also ask once (b.jg5 SRJ-311)', () => {
     const latch = constOf(LATCH_FACTORY)
     declaredOnce(latch)
     const query = oneKeyArrow(`${latch}\\.${IS_LATCHED}\\(\\1\\)`)
@@ -2759,31 +2801,39 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     // b.jg5 SRJ-1011: the persona routing, built at module scope before the
     // latch exists, reads it through its holder, whose one assignment is this
     // same latch (no second latch, no copy; see routingHolder). The
-    // session-disconnect handler reads the same holder once, for its own key.
-    routingHolder(ROUTING_LATCHED, IS_LATCHED, latch, [DISCONNECT_HANDLER])
+    // tmux-unavailable retry check's production deps read the same holder
+    // once, for the key they are given.
+    routingHolder(ROUTING_LATCHED, IS_LATCHED, latch, [CHECK_LATCHED])
 
     // No other latched member or query anywhere in server.ts: one member
-    // inside each of the three calls in main() and one inside the module-scope
-    // routing's call, and one query inside each of the three calls, the
-    // reconnect adapter's build (the one inside the restart module's call),
-    // the routing's call and the session-disconnect handler. Outside main(),
-    // `isLatched:` is otherwise only a parameter's type annotation (the
-    // reconnect adapter's latched gate), no binding.
+    // inside each of the three calls in main(), one inside the module-scope
+    // routing's call and one in the retry check's production deps, and one
+    // query inside each of the three calls, the reconnect adapter's build
+    // (the one inside the restart module's call), the routing's call and the
+    // retry check's deps, which the check itself asks once (its `deps`
+    // parameter's, b.jg5 SRJ-311). Outside main(), `isLatched:` is otherwise only a
+    // parameter's type annotation (the reconnect adapter's latched gate), no
+    // binding.
     const within = withinCall
     const allMembers = indicesOf(new RegExp(`\\b${IS_LATCHED}\\s*:`, 'g'), SERVER_CODE)
     const members = allMembers.filter(insideMain)
     expect(members).toHaveLength(3)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => within(members, onlyCallOf(call)))).toEqual([1, 1, 1])
     const outside = allMembers.filter((offset) => !insideMain(offset))
-    expect(outside).toHaveLength(2)
+    const check = retryCheckDeps()
+    const inCheck = (offsets: number[]) => offsets.filter((offset) => offset > check.start && offset < check.end).length
+    expect(outside).toHaveLength(3)
     expect(within(outside, onlyCallOf('createPersonaRouting'))).toBe(1)
+    expect(inCheck(outside)).toBe(1)
     expect(within(outside, SERVER_CODE.search(/\bfunction\s+reconnectLatchedAt\s*\(/))).toBe(1)
     const queries = indicesOf(new RegExp(`\\.\\s*${IS_LATCHED}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(queries).toHaveLength(6)
+    expect(queries).toHaveLength(7)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => within(queries, onlyCallOf(call)))).toEqual([1, 2, 1, 1])
     expect(within(queries, onlyReconnectAdapterBuild())).toBe(1)
-    const handler = moduleFunction(DISCONNECT_HANDLER)
-    expect(queries.filter((offset) => offset > handler.start && offset < handler.end)).toHaveLength(1)
+    expect(inCheck(queries)).toBe(1)
+    const CHECK: keyof typeof ServerModule = 'armMissingTmuxUnavailableRetry'
+    const [checkStart, checkEnd] = exportedFunctionBody(CHECK)
+    expect(queries.filter((offset) => offset > checkStart && offset < checkEnd)).toHaveLength(1)
   })
 })
 
@@ -2817,7 +2867,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   test('the latched query reads the one latch at call time, through a module-scope holder assigned that latch once in main(), before the start bring-up (state 2, held for a human)', () => {
     const latch = constOf(LATCH_FACTORY)
     declaredOnce(latch)
-    const { at } = routingHolder(ROUTING_LATCHED, IS_LATCHED, latch, [DISCONNECT_HANDLER])
+    const { at } = routingHolder(ROUTING_LATCHED, IS_LATCHED, latch, [CHECK_LATCHED])
     // After the latch is built (the one the collision ladder sets), and before
     // every path that can launch, and so latch.
     expect(at).toBeGreaterThan(onlyCallOf(LATCH_FACTORY))
@@ -2865,6 +2915,17 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     }
     // The bound inputs are present (each pinned above or in the read-gate describe below).
     for (const member of [ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ]) expect(props.has(member)).toBe(true)
+  })
+
+  // A new routing input (one reading the unclassified-error episode, say)
+  // fails here until it is pinned like the others.
+  test('the routing\'s call binds exactly these members, no more', () => {
+    const MEMBERS: Array<keyof PersonaRoutingDeps> = [
+      'getPersonaConfig', 'getBotIdentity', 'clientFor', 'resolveUserName', 'archive', 'getReplySettings', 'notify', 'log',
+      'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
+      'armRetryTimerIfMissing',
+    ]
+    expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
 })
 
@@ -2960,153 +3021,118 @@ describe('server.ts binds the persona routing\'s read gate to the shared in-flig
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-311 — a session disconnect while `tmux-unavailable`
-// is raised
+// Static audit: b.jg5 SRJ-311 — the session-disconnect handler's and the
+// lost-message routing's `tmux-unavailable` retry check: production bindings
 //
 // While a persona's `tmux-unavailable` outage is raised, the only attempts
-// made for it are its retry timer's, one per backoff interval (SRJ-311), so
-// the session-disconnect handler (`restartDisconnectedPersona`, reached from
-// a registered session's close and its SSE abort) never schedules a restart
-// then. With no timer armed (a retry that stopped as not up, on a declined
-// launch or on a failed run leaves the flag raised with none), it arms one
-// with the ENVIRONMENT cause through the same arm path the health tick uses
-// for such a persona (`armEnvironmentRetryTimer`), unless the persona is
-// latched (the one latch, SRJ-502) or has work in flight (the shared
-// in-flight predicate, SRJ-315); the handler's arm does not wait for a tick,
-// so a retry comes even with `health_check_interval` 0. The handler is
-// private to server.ts and reads the retry timers and the latch through the
-// module-scope holders only main() assigns, so it cannot be driven from a
-// unit test; a handler that dropped, reordered or loosened one of its
-// branches would pass every behaviour suite. What an arm does is tested in
-// tests/unavailable-retry.test.ts. Pinned here: with the flag not raised it
-// schedules the restart as before; with it raised it asks, in order, an armed
-// timer (nothing more), the latch and the in-flight predicate (nothing armed),
-// a missing controller (nothing armed), and otherwise arms the timer; each
-// branch logs one line, and none can reach `scheduleRestart`.
+// made for it are its retry timer's (SRJ-311), and a raised flag with no
+// timer (a retry that stopped as not up, on a declined launch or on a failed
+// run) must still get one. The session-disconnect handler and the routing's
+// `armRetryTimerIfMissing` both decide through `armMissingTmuxUnavailableRetry`
+// over one set of production deps. What the handler and the check do with
+// their deps is tested in tests/session-disconnect.test.ts, and what the
+// routing's arm does through the real controller in
+// tests/unavailable-retry.test.ts; both inject their deps, so a production
+// wiring that built a second handler, overrode a check member, bound a deps
+// member to a constant, a copy or a second latch, predicate or controller,
+// or dropped the routing's shutdown guard would pass them. Pinned here: the
+// one handler's build and its two callers, the deps' members, and the
+// routing's arm binding.
 // ---------------------------------------------------------------------------
 
-describe('the session-disconnect handler schedules a restart only while the persona\'s tmux-unavailable outage is not raised; with it raised it schedules none, and arms the retry timer (the health tick\'s arm path) only when none is armed and the persona is neither latched nor has work in flight (b.jg5 SRJ-311)', () => {
+describe('the session-disconnect handler and the routing\'s retry-timer arm decide through one tmux-unavailable retry check over one set of production deps: the outage flag, the one controller, the one latch, the shared in-flight predicate and the one ENVIRONMENT arm path (b.jg5 SRJ-311)', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
+  const BUILD: keyof typeof ServerModule = '_buildRestartDisconnectedPersona'
+  const CHECK: keyof typeof ServerModule = 'armMissingTmuxUnavailableRetry'
+  const ROUTING_ARM: keyof PersonaRoutingDeps = 'armRetryTimerIfMissing'
   const GET_FLAGS: keyof typeof OutageStateModule = 'getOutageFlags'
   const IS_ARMED: keyof UnavailableRetryController = 'isArmed'
   const IS_LATCHED: keyof ConflictLatch = 'isLatched'
+  const CHECK_MEMBERS: Array<keyof TmuxUnavailableRetryDeps> = [
+    'isTmuxUnavailable', 'isRetryArmed', CHECK_LATCHED, CHECK_IN_FLIGHT, 'armRetryTimer', 'log',
+  ]
+  const HANDLER_MEMBERS: Array<Exclude<keyof RestartDisconnectedPersonaDeps, keyof TmuxUnavailableRetryDeps>> = [
+    'getPersona', 'scheduleRestart', 'isShuttingDown',
+  ]
 
-  interface Guard {
-    /** Offset of the `if` in the body. */
-    at: number
-    /** The condition, whitespace collapsed. */
-    cond: string
-    /** The block's text, braces excluded. */
-    block: string
-    /** Offset just past the block's closing brace. */
-    end: number
+  /** The restart module's shutdown-flag binding, `() => <flag>`; returns the flag's name. */
+  function shutdownFlag(): string {
+    const binding = onlyCallProps('initRestart').get('isShuttingDown')
+    const flag = binding?.match(/^\(\) => (\w+)$/)?.[1]
+    expect(flag).toBeDefined()
+    declaredOnce(flag!)
+    expect(insideMain(SERVER_CODE.search(new RegExp(`\\blet\\s+${flag}\\b`)))).toBe(false)
+    return flag!
   }
 
-  /** The handler's key parameter, its body text, and the `if` statements at the top level of its body, in order (each must have a braced block). */
-  function handler(): { key: string; body: string; guards: Guard[] } {
-    const { params, body } = moduleFunction(DISCONNECT_HANDLER)
-    const blank = blankLiterals(body)
-    const guards: Guard[] = []
-    for (const m of blank.matchAll(/\bif\s*\(/g)) {
-      const before = blank.slice(0, m.index!)
-      const depth = (before.match(/[{(\[]/g) ?? []).length - (before.match(/[})\]]/g) ?? []).length
-      if (depth !== 0) continue
-      const [condStart, condEnd] = balancedAfter(body, m.index!, '(', ')')
-      expect(blank.slice(condEnd + 1).trimStart().startsWith('{')).toBe(true)
-      const [blockStart, blockEnd] = balancedAfter(body, condEnd, '{', '}')
-      guards.push({
-        at: m.index!,
-        cond: body.slice(condStart, condEnd).replace(/\s+/g, ' ').trim(),
-        block: body.slice(blockStart, blockEnd),
-        end: blockEnd + 1,
-      })
-    }
-    return { key: params[0]!, body, guards }
-  }
+  test('the handler is built once, at module scope, as the one const restartDisconnectedPersona, over the production deps spread first (no member after it overrides one), getAppliedPersona, the restart module\'s scheduleRestart and the restart module\'s shutdown flag, each read at call time; its only callers are the session close and the SSE abort', () => {
+    const builds = indicesOf(new RegExp(`(?<![\\w.$]|function\\s+)${BUILD}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(builds).toHaveLength(1)
+    expect(insideMain(builds[0]!)).toBe(false)
+    expect(constOf(BUILD)).toBe(DISCONNECT_HANDLER)
+    declaredOnce(DISCONNECT_HANDLER)
+    expect(importSource(SERVER_CODE, BUILD)).toBeUndefined()
+    expect(indicesOf(new RegExp(`\\b${BUILD}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
 
-  /** A block that logs one line and returns, and does nothing else (literals blanked, so the line's text is free). */
-  const LOG_AND_RETURN = /^console\.error\(\s*\);? return;?$/
+    const args = splitTopLevel(callArguments(SERVER_CODE, builds[0]!))
+    expect(args).toHaveLength(1)
+    const parts = splitTopLevel(args[0]!.slice(...balancedAfter(args[0]!, 0, '{', '}')))
+    expect(parts[0]).toBe(`...${retryCheckDeps().name}`)
+    const props = objectProperties(`{ ${parts.slice(1).join(', ')} }`)
+    expect([...props.keys()].sort()).toEqual([...HANDLER_MEMBERS].sort())
+    expect(props.get('getPersona')).toBe('getAppliedPersona')
+    expect(importSource(SERVER_CODE, 'getAppliedPersona')).toBeUndefined()
+    expect(props.get('scheduleRestart')).toMatch(/^(?:scheduleRestart|\((\w+), (\w+)\) => scheduleRestart\(\1, \2\))$/)
+    expect(importSource(SERVER_CODE, 'scheduleRestart')).toBe('./restart.ts')
+    expect(props.get('isShuttingDown')).toBe(`() => ${shutdownFlag()}`)
 
-  /** `text` with its literals blanked and its whitespace collapsed. */
-  function shape(text: string): string {
-    return blankLiterals(text).replace(/\s+/g, ' ').trim()
-  }
+    // Named at its declaration and in the two session-close paths, with their `via`.
+    expect(indicesOf(new RegExp(`\\b${DISCONNECT_HANDLER}\\b`, 'g'), SERVER_CODE)).toHaveLength(3)
+    const calls = callsOf(DISCONNECT_HANDLER).map((at) => splitTopLevel(callArguments(SERVER_CODE, at)))
+    expect(calls.map((callArgs) => callArgs[1]).sort()).toEqual(["' (SSE abort)'", "''"])
+    for (const callArgs of calls) expect(callArgs).toHaveLength(2)
+  })
 
-  test('with the tmux-unavailable flag not raised, it schedules the restart for the persona in its working directory and returns, right after the not-applied guard; that is its only scheduleRestart, so none is reachable while the flag is raised', () => {
-    const { key, body, guards } = handler()
-    const persona = body.match(new RegExp(`\\bconst\\s+(\\w+)\\s*=\\s*getAppliedPersona\\(${key}\\)`))![1]!
-    expect(guards.slice(0, 2).map((g) => g.cond)).toEqual([
-      `!${persona}`,
-      `!${GET_FLAGS}(${key}).has('${TMUX_UNAVAILABLE_CLASS}')`,
-    ])
+  test('the production deps are exactly the six members, each read at call time: the outage state\'s tmux-unavailable flag, the one retry controller\'s isArmed through its handle, the one latch through the routing\'s holder (=== true), the shared in-flight predicate, the one ENVIRONMENT arm path and the server log; nothing else names them but the handler\'s build and the routing\'s arm', () => {
+    const { name, props } = retryCheckDeps()
+    expect([...props.keys()].sort()).toEqual([...CHECK_MEMBERS].sort())
+
+    expect(props.get('isTmuxUnavailable')).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${GET_FLAGS}\\(\\1\\)\\.has\\('${TMUX_UNAVAILABLE_CLASS}'\\)$`))
     expect(importSource(SERVER_CODE, GET_FLAGS)).toBe('./outage-state.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${GET_FLAGS}\\b`, 'g'), SERVER_CODE)).toEqual([])
-    // The flag is read once.
-    expect(indicesOf(new RegExp(`\\b${GET_FLAGS}\\b`, 'g'), body)).toHaveLength(1)
 
-    // Its block: the restart, then return; nothing else.
-    const block = guards[1]!.block
-    expect(shape(block)).toMatch(/^scheduleRestart\([^()]*\);? return;?$/)
-    expect(splitTopLevel(callArguments(block, block.search(/\bscheduleRestart\s*\(/)))).toEqual([key, `${persona}.working_directory`])
-    expect(importSource(SERVER_CODE, 'scheduleRestart')).toBe('./restart.ts')
+    // The handle is assigned only the one controller (pinned in the controller's describe).
+    expect(props.get('isRetryArmed')).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${retryHandle()}\\?\\.${IS_ARMED}\\(\\1\\)$`))
+    routingHolder(ROUTING_LATCHED, IS_LATCHED, constOf(LATCH_FACTORY), [CHECK_LATCHED])
+    expect(props.get(CHECK_IN_FLIGHT)).toBe(sharedInFlightPredicate())
+    expect(props.get('armRetryTimer')).toBe(ENVIRONMENT_ARM)
+    expect(props.get('log')).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
 
-    // The handler's only scheduleRestart is that one.
-    const schedules = indicesOf(/\bscheduleRestart\s*\(/g, body)
-    expect(schedules).toHaveLength(1)
-    expect(schedules[0]).toBeGreaterThan(guards[1]!.at)
-    expect(schedules[0]).toBeLessThan(guards[1]!.end)
+    // Its declaration, the handler build's spread and the routing's arm.
+    expect(indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)).toHaveLength(3)
+    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf('createPersonaRouting'), '(', ')')
+    expect(indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE.slice(open, close))).toHaveLength(1)
   })
 
-  test('with the flag raised it asks, in order: the one retry controller\'s armed timer for the persona, the one latch (through the routing\'s holder), the shared in-flight predicate, and whether the controller exists; each of those branches logs one line saying no restart is scheduled and returns, arming nothing', () => {
-    const { key, body, guards } = handler()
-    const latchHolder = routingHolder(ROUTING_LATCHED, IS_LATCHED, constOf(LATCH_FACTORY), [DISCONNECT_HANDLER]).holder
-    const predicate = sharedInFlightPredicate()
+  test('the routing\'s armRetryTimerIfMissing does nothing while shutting down (the restart module\'s flag, asked first), else asks the check for the key it is given over the production deps, with the lost-message arm line; the check is called nowhere else but in the handler\'s builder', () => {
+    const binding = onlyCallProps('createPersonaRouting').get(ROUTING_ARM)
+    expect(binding).toBeDefined()
+    const flag = shutdownFlag()
+    const shape = blankLiterals(binding!).replace(/\s+/g, ' ').trim()
+    expect(shape).toMatch(new RegExp(`^\\(?(\\w+)\\)? => \\{ if \\(${flag}\\) return;? ${CHECK}\\([^()]*\\);? \\}$`))
+    const key = shape.match(/^\(?(\w+)\)?/)![1]!
+    const args = splitTopLevel(callArguments(binding!, binding!.indexOf(`${CHECK}(`)))
+    expect(args.slice(0, 2)).toEqual([key, retryCheckDeps().name])
+    expect(args[2]).toBe(`\`[slack] Lost message: persona=\${${key}} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)\``)
 
-    // The armed read: once, on the one retry controller's handle (assigned
-    // only that controller; see the controller's describe), between the flag
-    // guard and the first branch, at the top level of the body.
-    const reads = [...body.matchAll(new RegExp(`\\bconst\\s+(\\w+)\\s*=\\s*${retryHandle()}\\?\\.${IS_ARMED}\\(${key}\\)`, 'g'))]
-    expect(reads).toHaveLength(1)
-    expect(indicesOf(new RegExp(`\\.${IS_ARMED}\\(`, 'g'), body)).toHaveLength(1)
-    const armed = reads[0]![1]!
-    const readAt = reads[0]!.index!
-    expect(readAt).toBeGreaterThan(guards[1]!.end)
-    expect(readAt).toBeLessThan(guards[2]!.at)
-
-    // Exactly these branches, in this order, and no other top-level guard: a
-    // missing controller (`isArmed` answers undefined) is told apart from
-    // "not armed" (exactly false) only after the latch and in-flight checks.
-    expect(guards.slice(2).map((g) => g.cond)).toEqual([
-      `${armed} === true`,
-      `${latchHolder}?.${IS_LATCHED}(${key}) === true`,
-      `${predicate}(${key})`,
-      `${armed} !== false`,
-    ])
-
-    // Each: one log line, then return; no restart, no arm.
-    const lines = ['its retry timer recovers it', 'and is latched', 'with work in flight', 'and no retry controller']
-    guards.slice(2).forEach((g, i) => {
-      expect(shape(g.block)).toMatch(LOG_AND_RETURN)
-      expect(g.block).toContain('no restart scheduled')
-      expect(g.block).toContain(lines[i]!)
-      expect(g.block).not.toContain(ENVIRONMENT_ARM)
-    })
-  })
-
-  test('otherwise (the controller answers not armed) it logs one line and arms the timer through armEnvironmentRetryTimer, the health tick\'s arm path, as the body\'s last statement; it arms nowhere else, calls no controller arm directly, and returns only from its guards', () => {
-    const { key, body, guards } = handler()
-    const last = guards[guards.length - 1]!
-    expect(shape(body.slice(last.end))).toMatch(new RegExp(`^console\\.error\\(\\s*\\);? ${ENVIRONMENT_ARM}\\(${key}\\);?$`))
-    expect(body.slice(last.end)).toContain('no restart scheduled; arming one')
-
-    // The one arm, outside every guard; no direct controller arm.
-    expect(indicesOf(new RegExp(`\\b${ENVIRONMENT_ARM}\\b`, 'g'), body)).toHaveLength(1)
-    expect(indicesOf(/\.\s*arm\s*\(/g, body)).toEqual([])
-
-    // One return per guard (six), each its block's last statement.
-    expect(guards).toHaveLength(6)
-    expect(indicesOf(/\breturn\b/g, blankLiterals(body))).toHaveLength(6)
-    for (const g of guards) expect(shape(g.block)).toMatch(/\breturn;?$/)
+    // The check: its declaration, the builder's call and the routing's.
+    expect(importSource(SERVER_CODE, CHECK)).toBeUndefined()
+    const named = indicesOf(new RegExp(`\\b${CHECK}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(3)
+    const [bodyStart, bodyEnd] = exportedFunctionBody(BUILD)
+    expect(named.filter((offset) => offset > bodyStart && offset < bodyEnd)).toHaveLength(1)
+    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf('createPersonaRouting'), '(', ')')
+    expect(named.filter((offset) => offset > open && offset < close)).toHaveLength(1)
   })
 })
 

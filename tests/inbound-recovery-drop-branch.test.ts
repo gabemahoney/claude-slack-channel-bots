@@ -1,9 +1,11 @@
 /**
  * inbound-recovery-drop-branch.test.ts — lost messages (b.av2 SR-4.6, SR-7.3,
  * SR-7.2 part; b.kvq and b.9cj recovery, keyed per persona). The AC 26
- * verifier: run `bun test -t "AC 26"` for its cases; the AC 68 verifier (no
- * human-triggered restart in states 2 to 6, b.jg5 SRJ-1501): `bun test -t
- * "AC 68"`.
+ * verifier: run `bun test tests/inbound-recovery-drop-branch.test.ts -t
+ * "AC 26"` for its cases; the AC 68 verifier (no human-triggered restart in
+ * states 2 to 6, b.jg5 SRJ-1501): `bun test
+ * tests/inbound-recovery-drop-branch.test.ts -t "AC 68"`. Name this file:
+ * a bare `-t` also matches other files' "AC 26" and "AC 68" cases.
  *
  * A Slack message that qualifies for persona P but finds no live,
  * stream-bearing session (no session, a disconnected one, or one that has lost
@@ -94,8 +96,9 @@ import {
 } from '../src/restart.ts'
 import { recordFailure, isAtCap } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
-import { STATE_WORDING, type LostMessageState } from '../src/lost-message.ts'
+import type { LostMessageState } from '../src/lost-message.ts'
 import {
+  AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_LIVE,
   LIVENESS_READING_PENDING,
@@ -125,7 +128,7 @@ import {
   type OutageClass,
 } from '../src/outage-state.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { createPersonaRelaunchGate, createPersonaUpPredicate } from '../src/persona-start.ts'
+import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
 import {
   makeAppMention,
@@ -161,6 +164,7 @@ import {
   stateOf,
   waitFor,
   LOST_MESSAGE_STATES,
+  LOST_STATE_SETUPS,
   NEVER_FIRE_RESTART_DELAY_S,
   ROW_READ_REJECTS,
   ROW_READ_REJECTION_REDACTED,
@@ -168,7 +172,12 @@ import {
   type RoutingHarnessOptions,
   type RowReadAnswer,
 } from './test-helpers/persona-routing-harness.ts'
-import { makeRecoveryHarness, type RecoveryHarness, type RecoveryHarnessOptions } from './test-helpers/recovery-harness.ts'
+import {
+  expectLostMessageReports,
+  makeRecoveryHarness,
+  type RecoveryHarness,
+  type RecoveryHarnessOptions,
+} from './test-helpers/recovery-harness.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -221,12 +230,6 @@ type Harness = RoutingHarness & {
   beta: Persona
   /** Deliver `event` to the receiving persona key(s), as the socket handler does. */
   deliver(event: unknown, keys: string | readonly string[]): Promise<void>
-  /** Keys whose bring-up outcome is not `up`, read by the up check at call time (with `upCheck` or `notUp`). */
-  notUp: Set<string>
-  /** Every key the routing asked the up check about, in order. */
-  upAsks: string[]
-  /** The bring-up outcomes the up check reads (`isUp`), for a relaunch gate over the same state. */
-  outcomes: { isUp(key: string): boolean }
   /** Keys whose dialog approver is running (with `approver`): read with the harness's launches in flight as state 6's input. */
   approverRunning: Set<string>
 }
@@ -237,14 +240,15 @@ interface HarnessOptions {
   sessionRestartDelay?: number
   restartDelayS?: number
   launchSession?: RoutingHarnessOptions['launchSession']
+  /** Hold every restart launch open until teardown (the harness's `holdLaunches`), keeping the persona in flight. */
+  holdLaunches?: boolean
   alphaStub?: StubSlackOptions
   resolveUserName?: RoutingHarnessOptions['resolveUserName']
   notify?: RoutingHarnessOptions['notify']
   /**
-   * Give the routing the up check: the real `createPersonaUpPredicate` over
-   * a connection that serves for every persona and a bring-up outcome that
-   * is `up` except for the keys in `h.notUp`. Without it (and without
-   * `notUp`) the routing has no up check.
+   * Give the routing the harness's up check (the real up predicate, not up
+   * for the keys in `h.notUp`, asks recorded in `h.upAsks`). Without it (and
+   * without `notUp`) the routing has no up check.
    */
   upCheck?: boolean
   /**
@@ -274,8 +278,6 @@ const SERVING: PersonaConnectionStatus = { state: 'up', identity: { botUserId: '
 let dir: string
 /** Every harness a case built (cleaned up and leak-checked in teardown). */
 let harnesses: RoutingHarness[] = []
-/** Launches held open by a case; released in teardown. */
-let heldLaunches: Array<(ok: boolean) => void> = []
 /** Server-log lines the modules wrote (restart.ts, the outage state), captured and leak-checked in teardown. */
 let consoleLines: string[] = []
 let consoleSpy: ReturnType<typeof spyOn> | undefined
@@ -291,11 +293,6 @@ function makeRecovery(options: RecoveryHarnessOptions = {}): RecoveryHarness {
 
 function makeHarness(opts: HarnessOptions = {}): Harness {
   const streamless = opts.branch === 'streamless'
-  const notUp = new Set<string>()
-  const upAsks: string[] = []
-  const outcomes = { isUp: (key: string) => !notUp.has(key) }
-  const isUp = createPersonaUpPredicate({ status: () => SERVING }, outcomes)
-  const withUpCheck = opts.upCheck === true || opts.notUp !== undefined
   const approverRunning = new Set<string>()
   const h = makeRoutingHarness(
     [
@@ -319,15 +316,12 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
       overrides: { session_restart_delay: opts.sessionRestartDelay ?? 60 },
       restartDelayS: opts.restartDelayS ?? FAST_DELAY_S,
       launchSession: opts.launchSession,
+      holdLaunches: opts.holdLaunches,
       stubOptions: opts.alphaStub ? { alpha: opts.alphaStub } : undefined,
       resolveUserName: opts.resolveUserName,
       notify: opts.notify,
-      isPersonaUp: withUpCheck
-        ? (key) => {
-          upAsks.push(key)
-          return isUp(key)
-        }
-        : undefined,
+      upCheck: opts.upCheck,
+      notUp: opts.notUp,
       outageState: opts.outageState,
       isLaunchOrApproverRunning: opts.approver === true
         ? (key) => h.isLaunchInFlight(key) || approverRunning.has(key)
@@ -336,24 +330,15 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     },
   )
   const [beta, alpha] = h.config!.personas as [Persona, Persona]
-  for (const key of h.keys(opts.notUp ?? [])) notUp.add(key)
   const harness = Object.assign(h, {
     alpha,
     beta,
     deliver: (event: unknown, keys: string | readonly string[]) =>
       h.receiveKeys(event, typeof keys === 'string' ? [keys] : keys),
-    notUp,
-    upAsks,
-    outcomes,
     approverRunning,
   })
   harnesses.push(harness)
   return harness
-}
-
-/** A launch outcome that stays pending until teardown, keeping the persona in flight. */
-function holdLaunchOpen(): Promise<boolean> {
-  return new Promise<boolean>((resolve) => { heldLaunches.push(resolve) })
 }
 
 /** The conversation alpha's notices go to for `destination`. */
@@ -437,7 +422,6 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'lost-message-drop-branch-'))
   harnesses = []
   recoveries = []
-  heldLaunches = []
   consoleLines = []
   consoleSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
     consoleLines.push(args.map(String).join(' '))
@@ -458,8 +442,9 @@ afterEach(async () => {
     }
     for (const h of harnesses) h.hold.cancelAll()
     // Let a held launch settle while restart.ts still has its deps.
-    for (const release of heldLaunches) release(true)
-    if (heldLaunches.length > 0) await Bun.sleep(1)
+    let released = 0
+    for (const h of harnesses) released += h.releaseLaunches()
+    if (released > 0) await Bun.sleep(1)
     // Every log line, post and notice the module produced is free of token material.
     assertNoLeak([...harnesses.map((h) => h.captured()), consoleLines])
   } finally {
@@ -659,44 +644,12 @@ function inputOpts(...names: InputName[]): HarnessOptions {
 // ===========================================================================
 
 /**
- * How each recovery state is arranged for the next lost message on the
- * no-session branch, the launches there are once it is handled, and whether a
- * restart of alpha is pending or active right after it (one arranged before
- * the message, or the message's own).
+ * Arrange alpha in `state` for the next lost message on the no-session
+ * branch, as the shared table (`LOST_STATE_SETUPS`) arranges it, its launches
+ * in its working directory.
  */
-const STATE_SETUPS: Record<LostMessageState, { opts: HarnessOptions; arrange(h: Harness): Promise<void> | void; launches: number; pending: boolean }> = {
-  // Alpha's bring-up outcome is not up while a message still reaches it;
-  // restart.ts itself would launch (fast delay) if it were asked.
-  'not-up': { opts: { notUp: ['alpha'] }, arrange: () => {}, launches: 0, pending: false },
-  'held-for-human': { opts: {}, arrange: (h) => INPUTS['latched on a CONFLICT'].set(h, h.alpha.key), launches: 0, pending: false },
-  'cannot-launch': { opts: {}, arrange: (h) => INPUTS['held on ErrInvalidFlags'].set(h, h.alpha.key), launches: 0, pending: false },
-  'kill-failed': { opts: {}, arrange: (h) => INPUTS['kill failed'].set(h, h.alpha.key), launches: 0, pending: false },
-  'not-answering': { opts: {}, arrange: (h) => INPUTS['tmux-unresponsive holds'].set(h, h.alpha.key), launches: 0, pending: false },
-  // A restart's launch of alpha is in flight and held open: it reads as a
-  // launch running (production: `isLaunchInFlight`), and a stacked launch
-  // would make two.
-  'session-starting': {
-    opts: { launchSession: holdLaunchOpen },
-    arrange: async (h) => {
-      scheduleRestart(h.alpha.key, h.alpha.working_directory, undefined, { humanTrigger: true })
-      await waitFor(() => h.launches.length === 1)
-      expect(h.launches).toHaveLength(1)
-      expect(h.isLaunchInFlight(h.alpha.key)).toBe(true)
-    },
-    launches: 1,
-    pending: true,
-  },
-  // A restart of alpha whose timer has not fired.
-  'restarting': { opts: {}, arrange: (h) => INPUTS['a pending restart'].set(h, h.alpha.key), launches: 0, pending: true },
-  'starting-now': { opts: {}, arrange: () => {}, launches: 1, pending: true },
-  // restart.ts itself would launch (nonzero restart delay) if it were asked.
-  'auto-restart-disabled': { opts: { sessionRestartDelay: 0 }, arrange: () => {}, launches: 0, pending: false },
-  'restart-limit-reached': {
-    opts: {},
-    arrange: (h) => { for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(h.alpha.key) },
-    launches: 0,
-    pending: false,
-  },
+function arrangeState(h: Harness, state: LostMessageState): Promise<void> | void {
+  return LOST_STATE_SETUPS[state].arrange(h, h.alpha.key, h.alpha.working_directory)
 }
 
 describe('AC 26: the notice reports the recovery state', () => {
@@ -705,9 +658,9 @@ describe('AC 26: the notice reports the recovery state', () => {
   test.each(table)(
     'AC 26, AC 68: state %s, a %s destination: one notice at the destination naming the sender and that state\'s wording only, nothing in the source; a restart is asked for only when starting now',
     async (state, destination) => {
-      const setup = STATE_SETUPS[state]
+      const setup = LOST_STATE_SETUPS[state]
       const h = makeHarness({ destination, ...setup.opts })
-      await setup.arrange(h)
+      await arrangeState(h, state)
       const asksBefore = h.restartAsks.length
 
       await h.deliver(messageIn(SHARED), h.alpha.key)
@@ -934,9 +887,11 @@ describe('b.jg5 SRJ-1011: the first state that applies is reported', () => {
 // nothing in flight for P, the routing makes one row read of P (the
 // harness's scripted `readRowLiveness`). A `pending` answer is state 6, which
 // comes before every restart guard: no restart is asked for, scheduled or
-// launched (SRJ-1501). A launch or dialog approver running is state 6 with no
-// read. A `live` reading or no row (`dead`) is not `pending`: the state is the
-// next that applies.
+// launched (SRJ-1501; AC 68, state 6 from the read). A `live` reading or no
+// row (`dead`) is not `pending`: the state is the next that applies, here
+// starting now, AC 68's control. A launch running is state 6 with no read
+// (the AC 68 describe); a dialog approver running, likewise (the order pairs
+// above, and the read gate in tests/persona-routing.test.ts).
 // ===========================================================================
 
 /** No fake-clock timer is left: the destination hold's and the episodes'. */
@@ -972,29 +927,10 @@ describe('b.jg5 SRJ-1011 state 6 by the read: a row reading `pending` reports se
     expectNoFakeTimerLeft(h)
   })
 
-  test.each<[string, (h: Harness) => Promise<void> | void, HarnessOptions]>([
-    ['a restart launch of alpha held open', (h) => STATE_SETUPS['session-starting'].arrange(h), STATE_SETUPS['session-starting'].opts],
-    ['a dialog approver of alpha running', (h) => INPUTS['a dialog approver running'].set(h, h.alpha.key), inputOpts('a dialog approver running')],
-  ])('%s: session starting with no read and no restart asked for', async (_label, arrange, opts) => {
-    // A read, had one been made, would answer live, which is no state-6 input.
-    const h = makeHarness({ ...opts, rowRead: { alpha: LIVENESS_READING_LIVE } })
-    await arrange(h)
-    const asksBefore = h.restartAsks.length
-    const launchesBefore = h.launches.length
-
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'session-starting' })
-    expect(h.rowReads).toEqual([])
-    expect(h.restartAsks.slice(asksBefore)).toEqual([])
-    await Bun.sleep(WAIT_MS)
-    expect(h.launches).toHaveLength(launchesBefore)
-  })
-
   test.each<[string, RowReadAnswer]>([
     ['a live reading', LIVENESS_READING_LIVE],
     ['no row (the dead reading)', LIVENESS_READING_DEAD],
-  ])('%s is not `pending`: one read, then starting now with one restart and one launch', async (_label, answer) => {
+  ])('AC 68 control: %s is not `pending`: one read, then starting now, which asks the relaunch gate once and launches once', async (_label, answer) => {
     const h = makeHarness({ rowRead: { alpha: answer } })
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
@@ -1044,6 +980,8 @@ describe('b.jg5 SRJ-1011: a failed row read leaves state 6 out', () => {
     if (answer === ROW_READ_REJECTS) {
       expect(failedLines).toHaveLength(1)
       expect(failedLines[0]).toContain(renderPersonaRef(h.alpha.name, h.alpha.key))
+      // The thrown value's type, then its redacted message.
+      expect(failedLines[0]).toContain(`Error message="${ROW_READ_REJECTION_REDACTED}"`)
     } else {
       expect(failedLines).toEqual([])
     }
@@ -1058,8 +996,9 @@ describe('b.jg5 SRJ-1011: a failed row read leaves state 6 out', () => {
 // b.jg5 SRJ-1011 (Task ruling: decide again after the read) — states 1 to 5
 // are decided again over fresh answers once the read settles, so a latch or
 // an outage that begins while the read runs gives state 2 or 5, whatever
-// the read answers. A live-row sequence or old-life wait step running for P
-// answers `restarting` with no read (SRJ-706). Two messages lost together,
+// the read answers. (A live-row sequence or old-life wait step running for
+// P answers `restarting` with no read, SRJ-706: the read gate in
+// tests/persona-routing.test.ts.) Two messages lost together,
 // both reads in flight at once, schedule one restart: nothing is awaited
 // between the final decision and `scheduleRestart`.
 // ===========================================================================
@@ -1093,20 +1032,6 @@ describe('b.jg5 SRJ-1011: the state is decided again after the read', () => {
     expectNoFakeTimerLeft(h)
   })
 
-  test('SRJ-706: a live-row sequence running for alpha, its row read scripted `pending`: restarting, with no read and no restart asked for', async () => {
-    const h = makeHarness({ rowRead: { alpha: LIVENESS_READING_PENDING } })
-    INPUTS['a live-row sequence running'].set(h, h.alpha.key)
-
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'restarting' })
-    expect(h.rowReads).toEqual([])
-    expect(h.restartAsks).toEqual([])
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
-    await Bun.sleep(WAIT_MS)
-    expect(h.launches).toEqual([])
-  })
-
   test('two messages lost together for alpha, both reads in flight at once and answering live: exactly one restart is scheduled; one notice says starting now, the other restarting', async () => {
     // Each read waits until both have started, so both decisions follow both reads.
     let started = 0
@@ -1115,7 +1040,7 @@ describe('b.jg5 SRJ-1011: the state is decided again after the read', () => {
     const during = async (): Promise<void> => {
       started += 1
       if (started === 2) bothStarted()
-      await Promise.race([both, Bun.sleep(1000)])
+      await both
     }
     const h = makeHarness({ restartDelayS: SLOW_DELAY_S, rowRead: { alpha: { answer: LIVENESS_READING_LIVE, during } } })
 
@@ -1137,31 +1062,27 @@ describe('b.jg5 SRJ-1011: the state is decided again after the read', () => {
 
 // ===========================================================================
 // AC 68 (b.jg5 SRJ-1501, the b.av2 SR-4.6 amendment) — the verifier: run
-// `bun test -t "AC 68"`. In each of states 2 to 6 (state 6 both from a
-// launch running and from the read), arranged as the state table arranges
-// it, with the restart module able to launch (fast delay) and its relaunch
-// gate recording every ask, a lost message asks for, schedules and launches
-// nothing. The row read is bound in every row; where it would answer live
-// (a restart's input) only the early state keeps it from being made. The
-// control, `starting-now`, launches once.
+// `bun test tests/inbound-recovery-drop-branch.test.ts -t "AC 68"` (a bare
+// `-t "AC 68"` also matches b.av2's AC 68 cases in reload-apply.test.ts).
+// In each of states 2 to 6 (state 6 from a launch
+// running here; from the read, and the `starting-now` control, which
+// launches once, in the state-6-by-read describe above), arranged as the
+// shared state table (`LOST_STATE_SETUPS`) arranges it, with the restart
+// module able to launch (fast delay) and its relaunch gate recording every
+// ask, a lost message asks for, schedules and launches nothing. The row read
+// is bound in every row and would answer live (a restart's input): only the
+// early state keeps it from being made.
 // ===========================================================================
 
 describe('AC 68: no human-triggered restart fires in states 2 to 6 (b.jg5 SRJ-1501)', () => {
-  type Row = [label: string, state: LostMessageState, opts: HarnessOptions, arrange: (h: Harness) => Promise<void> | void, reads: number]
-  const rows: Row[] = [
-    ...NO_RESTART_STATES.map((state): Row => [
-      state === 'session-starting' ? 'session-starting (a launch running)' : state,
-      state,
-      { ...STATE_SETUPS[state].opts, rowRead: { alpha: LIVENESS_READING_LIVE } },
-      (h) => STATE_SETUPS[state].arrange(h),
-      0,
-    ]),
-    ['session-starting (the row read answers pending)', 'session-starting', { rowRead: { alpha: LIVENESS_READING_PENDING } }, () => {}, 1],
-  ]
+  const rows = NO_RESTART_STATES.map((state): [string, LostMessageState] => [
+    state === 'session-starting' ? 'session-starting (a launch running)' : state,
+    state,
+  ])
 
-  test.each(rows)('AC 68: %s: the message asks the relaunch gate nothing, schedules nothing and launches nothing', async (_label, state, opts, arrange, reads) => {
-    const h = makeHarness(opts)
-    await arrange(h)
+  test.each(rows)('AC 68: %s: no read, and the message asks the relaunch gate nothing, schedules nothing and launches nothing', async (_label, state) => {
+    const h = makeHarness({ ...LOST_STATE_SETUPS[state].opts, rowRead: { alpha: LIVENESS_READING_LIVE } })
+    await arrangeState(h, state)
     const asksBefore = h.restartAsks.length
     const launchesBefore = h.launches.length
     const pendingBefore = isRestartPendingOrActive(h.alpha.key)
@@ -1169,24 +1090,11 @@ describe('AC 68: no human-triggered restart fires in states 2 to 6 (b.jg5 SRJ-15
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
     expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
-    expect(h.rowReads).toHaveLength(reads)
+    expect(h.rowReads).toEqual([])
     expect(h.restartAsks.slice(asksBefore)).toEqual([])
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(pendingBefore)
     await Bun.sleep(WAIT_MS) // a restart the message scheduled would have launched by now
     expect(h.launches).toHaveLength(launchesBefore)
-  })
-
-  test('AC 68 control: starting now, the read answering live, asks the relaunch gate once and launches once', async () => {
-    const h = makeHarness({ rowRead: { alpha: LIVENESS_READING_LIVE } })
-
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
-    expect(h.rowReads).toEqual([h.alpha.key])
-    expect(h.restartAsks).toEqual([h.alpha.key])
-    await waitFor(() => h.launches.length > 0)
-    await Bun.sleep(WAIT_MS)
-    expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
   })
 })
 
@@ -1204,14 +1112,6 @@ describe('AC 68: no human-triggered restart fires in states 2 to 6 (b.jg5 SRJ-15
 // settings are 0 unless a case says otherwise, so a failed read reports
 // auto-restart disabled.
 // ===========================================================================
-
-/** What `loseMessage` resolves with when persona P's message reports `state` with no restart asked for or pending. */
-function lostWithoutRestart(state: LostMessageState, calls: Record<string, number>) {
-  return { state, notice: expect.stringContaining(STATE_WORDING[state]), restartRequested: false, restartPending: false, calls }
-}
-
-/** One `status` of persona `key`'s own instance, nothing else. */
-const ONE_STATUS = { statusCalls: 1 }
 
 /** Nothing raised or armed for `key`: no outage flag, no trigger, no armed timer, no condition, no episode, no fake-clock timer. */
 function expectNothingRaisedOrArmed(h: RecoveryHarness, key: string): void {
@@ -1231,19 +1131,18 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     const hold = holdSpawns(h.stub.client)
     const launch = h.launch(key)
     await hold.entered(id)
-    h.script({ statusResult: cannedStatusResult({ state: 'pending' }) })
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
 
-    expect(await h.loseMessage(key)).toEqual(lostWithoutRestart('session-starting', {}))
+    // A launch running is state 6 with no read.
+    await expectLostMessageReports(h, key, 'session-starting', { calls: {} })
 
     // The spawn returns; the launch's approver reads the row `pending` until its cap, and the launch returns.
     hold.release(id)
     await launch
     await h.settle()
-    const statusBefore = h.stub.calls.statusCalls.length
     const spawnsBefore = h.stub.calls.spawnCalls.length
 
-    expect(await h.loseMessage(key)).toEqual(lostWithoutRestart('session-starting', ONE_STATUS))
-    expect(h.stub.calls.statusCalls.slice(statusBefore)).toEqual([{ claude_instance_id: id }])
+    await expectLostMessageReports(h, key, 'session-starting')
     expect(h.stub.calls.spawnCalls).toHaveLength(spawnsBefore)
     expectNothingRaisedOrArmed(h, key)
   })
@@ -1252,11 +1151,11 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [key] = h.keys as [string]
     const id = personaInstanceId(key)
-    h.script({ statusQueue: [cannedErr(errInternal()), cannedOk(cannedStatusResult({ state: 'pending' }))] })
+    h.script({ statusQueue: [cannedErr(errInternal()), cannedOk(cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }))] })
 
-    const lost = await h.loseMessage(key)
+    const lost = await expectLostMessageReports(h, key, 'starting-now', { restartRequested: true })
 
-    expect(lost).toEqual({ ...lostWithoutRestart('starting-now', ONE_STATUS), restartRequested: true, restartPending: true })
+    expect(lost.restartPending).toBe(true)
     await waitFor(() => !isRestartPendingOrActive(key), 1000)
     expect(isRestartPendingOrActive(key)).toBe(false)
     expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: id }, { claude_instance_id: id }])
@@ -1273,7 +1172,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     const [key, other] = h.keys as [string, string]
     h.script({ statusError: make() })
 
-    expect(await h.loseMessage(key)).toEqual(lostWithoutRestart('not-answering', ONE_STATUS))
+    await expectLostMessageReports(h, key, 'not-answering', { calls: { statusCalls: 1 } })
 
     expect([...getOutageFlags(key)]).toEqual([flag])
     expect(h.triggers).toEqual([{ key, kind: cause }])
@@ -1295,7 +1194,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     const [key] = h.keys as [string]
     h.script({ statusError: make('status') })
 
-    expect(await h.loseMessage(key)).toEqual(lostWithoutRestart('auto-restart-disabled', ONE_STATUS))
+    await expectLostMessageReports(h, key, 'auto-restart-disabled')
 
     expectNothingRaisedOrArmed(h, key)
   })
@@ -1308,7 +1207,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     const [key] = h.keys as [string]
     h.script({ statusError: make() })
 
-    expect(await h.loseMessage(key)).toEqual(lostWithoutRestart('auto-restart-disabled', ONE_STATUS))
+    await expectLostMessageReports(h, key, 'auto-restart-disabled')
 
     expectNothingRaisedOrArmed(h, key)
   })
@@ -1318,7 +1217,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     const [key] = h.keys as [string]
     h.script({ statusError: errSystemInstallDisappeared('status') })
 
-    expect(await h.loseMessage(key)).toEqual(lostWithoutRestart('auto-restart-disabled', ONE_STATUS))
+    await expectLostMessageReports(h, key, 'auto-restart-disabled')
 
     expect([...getOutageFlags(key)]).toEqual(['ad-unreachable'])
     expect(h.triggers).toEqual([])
@@ -1351,7 +1250,7 @@ describe('not up: a lost message for a persona that is not up starts no restart'
       // message asked it for a restart, and it refused with a line.
       const gateLines: string[] = []
       const deps = makeRestartDeps({ restartDelayS: FAST_DELAY_S })
-      deps.canRestart = createPersonaRelaunchGate({ status: () => SERVING }, (line) => { gateLines.push(line) }, h.outcomes)
+      deps.canRestart = createPersonaRelaunchGate({ status: () => SERVING }, (line) => { gateLines.push(line) }, h.upOutcomes)
       initRestart(deps)
 
       for (let i = 0; i < 3; i++) await h.deliver(messageIn(SHARED, `message ${i} ${MESSAGE_MARKER}`), h.alpha.key)
@@ -1424,9 +1323,8 @@ describe('not up: a lost message for a persona that is not up starts no restart'
   // if an absent check counted as not up. This one row shows an up persona
   // still falls through to a later restart-guard state.
   test('alpha up through the up check and at the restart-failure cap: the notice says restart limit reached and nothing launches', async () => {
-    const setup = STATE_SETUPS['restart-limit-reached']
-    const h = makeHarness({ ...setup.opts, upCheck: true })
-    await setup.arrange(h)
+    const h = makeHarness({ ...LOST_STATE_SETUPS['restart-limit-reached'].opts, upCheck: true })
+    await arrangeState(h, 'restart-limit-reached')
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
@@ -1630,7 +1528,7 @@ describe('b.kvq (3) second message while restart pending/active does not stack a
   test('while the first message\'s launch is actively in flight, a new message reports session starting and does not stack another launch', async () => {
     // Hold launchSession open so the persona is in activeLaunches (not just a
     // pending timer) when the second message arrives.
-    const h = makeHarness({ restartDelayS: FAST_DELAY_S, launchSession: holdLaunchOpen })
+    const h = makeHarness({ restartDelayS: FAST_DELAY_S, holdLaunches: true })
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
     await waitFor(() => h.launches.length > 0) // timer fired; launchSession is now awaiting

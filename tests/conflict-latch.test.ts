@@ -230,7 +230,6 @@ import {
   AGENT_DIRECTOR_LIVE_STATES,
   AGENT_DIRECTOR_PENDING_STATE,
 } from '../src/liveness-reading.ts'
-import { STATE_WORDING } from '../src/lost-message.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import {
@@ -312,6 +311,7 @@ import {
   collided,
   conditionEndedLine,
   conditionRecoveryLine,
+  expectLostMessageReports,
   makeRecoveryHarness,
   personaCallCounts,
   personaOf,
@@ -1686,17 +1686,9 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
     const afterLatch = callCounts(h)
     const personaCountsAfterLatch = personaCallCounts(h, p)
 
-    const lost = await h.loseMessage(p)
-
     // Ignoring the latch would report the delay 0's auto-restart disabled; a
     // restart request is seen even though the latched restart module arms none.
-    expect(lost).toEqual({
-      state: 'held-for-human',
-      notice: expect.stringContaining(STATE_WORDING['held-for-human']),
-      restartRequested: false,
-      restartPending: false,
-      calls: {},
-    })
+    const lost = await expectLostMessageReports(h, p, 'held-for-human')
     const persona = personaOf(h, p)
     expect(posts(h.slack(p)).map((post) => [post.channel, post.text])).toEqual([
       [persona.permission_prompts, formatPersonaNotice(persona, lost.notice)],
@@ -1712,13 +1704,7 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
     // the delay 0. States 1 to 5 are clear for Q and nothing is in flight, so
     // its message makes the routing's one row read (SRJ-1011), a `status` of
     // Q's instance, which reads no row (dead), not `pending`.
-    expect(await h.loseMessage(q)).toEqual({
-      state: 'auto-restart-disabled',
-      notice: expect.stringContaining(STATE_WORDING['auto-restart-disabled']),
-      restartRequested: false,
-      restartPending: false,
-      calls: { statusCalls: 1 },
-    })
+    await expectLostMessageReports(h, q, 'auto-restart-disabled')
     expect(h.slack(q).calls.postMessage).toHaveLength(1)
     expect(h.slack(p).calls.postMessage).toHaveLength(1)
     expect(h.latch.isLatched(q)).toBe(false)

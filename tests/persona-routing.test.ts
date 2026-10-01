@@ -85,10 +85,8 @@ import { consumeAck } from '../src/ack-tracker.ts'
 import { initRestart, isRestartPendingOrActive, scheduleRestart } from '../src/restart.ts'
 import { LIVENESS_READING_PENDING } from '../src/liveness-reading.ts'
 import { HOLD_LATCH_CASES, LATCH_ROW_STATE_UNREADABLE, REFUSED_OPERATION_NONE } from '../src/conflict-latch.ts'
-import { raiseTmuxUnavailable } from '../src/outage-state.ts'
-import { createPersonaUpPredicate } from '../src/persona-start.ts'
-import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
-import { errTmuxNotAvailable, errTmuxUnresponsive } from './test-helpers/agent-director-stub.ts'
+import { raiseAdConfigMalformed, raiseTmuxUnavailable } from '../src/outage-state.ts'
+import { errConfigMalformed, errTmuxNotAvailable, errTmuxUnresponsive } from './test-helpers/agent-director-stub.ts'
 import { openArchiveDatabase } from '../src/message-archive.ts'
 import { dryRunPersonaIdentity } from '../src/persona-connections.ts'
 import type { Persona } from '../src/config.ts'
@@ -109,6 +107,8 @@ import { posts, slackCalls } from './test-helpers/permission-relay-harness.ts'
 import { buildTempArchiveDb } from './test-helpers/archive-db.ts'
 import { REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import {
+  LOST_MESSAGE_STATES,
+  LOST_STATE_SETUPS,
   NEVER_FIRE_RESTART_DELAY_S,
   ROW_READ_REJECTS,
   ROW_READ_REJECTION_REDACTED,
@@ -117,6 +117,7 @@ import {
   resetRoutingState,
   stateOf,
   waitFor,
+  type LostStateOptions,
   type RoutingHarness,
   type RoutingHarnessOptions,
   type RowReadAnswer,
@@ -926,8 +927,6 @@ describe('lost message: notice at the persona\'s destination and recovery keyed 
 describe('lost-message row read: gating and isolation in the pipeline (b.jg5 SRJ-1011)', () => {
   /** B's `mentions`-only channel. */
   const CM = 'C0MENTONL1'
-  /** A connection that serves, so only the bring-up outcome decides whether a persona is up. */
-  const SERVING: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0SERVING', botId: 'B0SERVING' } }
 
   /** A: `all` in CA (its destination) and CS. B: `all` in CB (its destination) and CS, `mentions` in CM. */
   const readSpecs = (): PersonaSpec[] => [
@@ -979,8 +978,8 @@ describe('lost-message row read: gating and isolation in the pipeline (b.jg5 SRJ
     assertNoLeak(captured(h))
   })
 
-  test.each<[LostMessageState, string, RoutingHarnessOptions, (h: Harness, key: string, notUp: Set<string>) => void]>([
-    ['not-up', 'its bring-up outcome is not up', {}, (_h, key, notUp) => { notUp.add(key) }],
+  test.each<[LostMessageState, string, RoutingHarnessOptions, (h: Harness, key: string) => void]>([
+    ['not-up', 'its bring-up outcome is not up', {}, (h, key) => { h.notUp.add(key) }],
     [
       'held-for-human',
       `it is latched (${HOLD_LATCH_CASES[0]})`,
@@ -997,11 +996,9 @@ describe('lost-message row read: gating and isolation in the pipeline (b.jg5 SRJ
     ],
     ['not-answering', 'its tmux-unavailable outage is raised', { outageState: true }, (_h, key) => { raiseTmuxUnavailable(key, errTmuxNotAvailable()) }],
   ])('state %s (%s): no read is made, the notice reports that state and no restart is asked for', async (state, _label, opts, set) => {
-    const notUp = new Set<string>()
-    const isUp = createPersonaUpPredicate({ status: () => SERVING }, { isUp: (key) => !notUp.has(key) })
-    const h = readHarness({ ...opts, isPersonaUp: isUp, rowRead: { 'Beta Bot': LIVENESS_READING_PENDING } })
+    const h = readHarness({ ...opts, upCheck: true, rowRead: { 'Beta Bot': LIVENESS_READING_PENDING } })
     const B = h.p('Beta Bot').persona.key
-    set(h, B, notUp)
+    set(h, B)
 
     await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
 
@@ -1026,7 +1023,7 @@ describe('lost-message row read: gating and isolation in the pipeline (b.jg5 SRJ
     ['a dialog approver of P running, with no launch in flight (the launch-or-approver input alone)', (_h, key, approver) => { approver.add(key) }, 'session-starting'],
     ['a live-row sequence or old-life wait step running for P', (h, key) => { h.sequenceOrWaitRunning.add(key) }, 'restarting'],
     ['other work in flight for P that is not a launch (the shared in-flight predicate alone)', (h, key) => { h.workInFlight.add(key) }, 'starting-now'],
-  ])('work in flight makes no read: %s; the notice reports the state that applies without it', async (_label, set, state) => {
+  ])('work in flight makes no read: %s; the notice reports the state that applies without it, and only starting now asks for a restart', async (_label, set, state) => {
     const approver = new Set<string>()
     const h: Harness = readHarness({
       rowRead: { 'Beta Bot': LIVENESS_READING_PENDING },
@@ -1035,11 +1032,15 @@ describe('lost-message row read: gating and isolation in the pipeline (b.jg5 SRJ
     })
     const B = h.p('Beta Bot').persona.key
     await set(h, B, approver)
+    const asksBefore = h.restartAsks.length
 
     await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
 
     expect(h.rowReads).toEqual([])
     expect(h.notices.map((n) => [n.key, stateOf(n.text)])).toEqual([[B, state]])
+    // SRJ-1501: session starting (a launch or approver running) and
+    // restarting (SRJ-706) ask the relaunch gate nothing.
+    expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [B] : [])
     assertNoLeak(captured(h))
   })
 
@@ -1072,8 +1073,144 @@ describe('lost-message row read: gating and isolation in the pipeline (b.jg5 SRJ
     const failed = linesWithText(h, ROW_READ_REJECTION_REDACTED)
     expect(failed).toHaveLength(1)
     expect(failed[0]).toContain(renderPersonaRef(A.name, A.key))
+    // The thrown value's type, then its redacted message.
+    expect(failed[0]).toContain(`Error message="${ROW_READ_REJECTION_REDACTED}"`)
     expect(lines(h, 'error handling event')).toEqual([])
     expect(h.allPosts()).toEqual([lostNoticePost(h, 'Alpha Bot', CA, 'stub-user', 'starting-now')])
+    assertNoLeak(captured(h))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The missing retry timer (b.jg5 SRJ-311): a lost message whose final state
+// is `not-answering` with P's `tmux-unavailable` outage raised asks the
+// routing's `armRetryTimerIfMissing` for P, once, after the decision; never
+// for the tmux-unresponsive condition or `ad-config-malformed` alone, never
+// in another state, never for another persona's flag, and never as a restart
+// (SRJ-1501). The member here records the key (`h.retryTimerArms`) and arms
+// nothing; what production arms is tested on the recovery harness.
+// ---------------------------------------------------------------------------
+
+describe('lost message: the missing retry timer is armed only for not answering with tmux-unavailable raised (b.jg5 SRJ-311)', () => {
+  /** A: `all` in CA (its destination) and CS. B: `all` in CB (its destination) and CS. */
+  const armSpecs = (): PersonaSpec[] => [
+    { name: 'Alpha Bot', channels: [{ id: CA, delivery: 'all' }, { id: CS, delivery: 'all' }] },
+    { name: 'Beta Bot', channels: [{ id: CB, delivery: 'all' }, { id: CS, delivery: 'all' }] },
+  ]
+
+  /** No sessions, the outage state installed, the arm member recording, and the needs of a shared-table state (`LOST_STATE_SETUPS`). */
+  function armHarness(needs: LostStateOptions = {}, opts: RoutingHarnessOptions = {}): Harness {
+    return makeHarness(armSpecs(), {
+      sessions: [],
+      outageState: true,
+      armRetryTimer: true,
+      upCheck: needs.upCheck,
+      holdLaunches: needs.holdLaunches,
+      overrides: needs.sessionRestartDelay === undefined ? undefined : { session_restart_delay: needs.sessionRestartDelay },
+      ...opts,
+    })
+  }
+
+  /** Every harness a case built; a launch one holds open settles in teardown, while restart.ts still has its deps. */
+  const armHarnesses: Harness[] = []
+  const track = (h: Harness): Harness => {
+    armHarnesses.push(h)
+    return h
+  }
+  afterEach(() => {
+    for (const h of armHarnesses.splice(0)) h.releaseLaunches()
+  })
+
+  const raiseUnavailable = (key: string) => { raiseTmuxUnavailable(key, errTmuxNotAvailable()) }
+  const raiseMalformed = (key: string) => { raiseAdConfigMalformed(key, errConfigMalformed()) }
+  const startUnresponsive = (h: Harness, key: string) => {
+    expect(h.tmuxUnresponsive.start(key, 'resume', errTmuxUnresponsive('resume'))).toBe('started')
+  }
+
+  test.each<[string, (h: Harness, key: string) => void, boolean]>([
+    ['tmux-unavailable raised', (_h, key) => raiseUnavailable(key), true],
+    ['tmux-unavailable raised and the tmux-unresponsive condition holding', (h, key) => { raiseUnavailable(key); startUnresponsive(h, key) }, true],
+    ['tmux-unavailable and ad-config-malformed both raised', (_h, key) => { raiseUnavailable(key); raiseMalformed(key) }, true],
+    ['only the tmux-unresponsive condition holding', (h, key) => startUnresponsive(h, key), false],
+    ['only ad-config-malformed raised', (_h, key) => raiseMalformed(key), false],
+  ])('not answering from %s: the arm is asked once for P: %p; no restart is asked for or pending', async (_label, set, armed) => {
+    const h = track(armHarness({}, { restartDelayS: NEVER_FIRE_RESTART_DELAY_S }))
+    const B = h.p('Beta Bot').persona.key
+    set(h, B)
+
+    await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
+
+    expect(h.notices.map((n) => [n.key, stateOf(n.text)])).toEqual([[B, 'not-answering']])
+    expect(h.retryTimerArms).toEqual(armed ? [B] : [])
+    expect(h.restartAsks).toEqual([])
+    expect(isRestartPendingOrActive(B)).toBe(false)
+    assertNoLeak(captured(h))
+  })
+
+  test('tmux-unavailable raised while the row read runs (the state decided again after it): the arm is asked once for P, after the read', async () => {
+    const h = track(armHarness({}, {
+      restartDelayS: NEVER_FIRE_RESTART_DELAY_S,
+      rowRead: { 'Beta Bot': { answer: LIVENESS_READING_PENDING, during: (_hh, key) => raiseUnavailable(key) } },
+    }))
+    const B = h.p('Beta Bot').persona.key
+
+    await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
+
+    expect(h.rowReads).toEqual([B])
+    expect(h.notices.map((n) => [n.key, stateOf(n.text)])).toEqual([[B, 'not-answering']])
+    expect(h.retryTimerArms).toEqual([B])
+    expect(h.restartAsks).toEqual([])
+    assertNoLeak(captured(h))
+  })
+
+  // States 1 to 4 come before not answering, so P's flag is raised too; in
+  // the later states it cannot be (P would be not answering), so another
+  // persona's (A's) is.
+  const OTHER_STATES = LOST_MESSAGE_STATES.filter((s) => s !== 'not-answering')
+  const EARLIER = LOST_MESSAGE_STATES.slice(0, LOST_MESSAGE_STATES.indexOf('not-answering'))
+
+  test.each(OTHER_STATES.map((s): [LostMessageState, string] => [s, EARLIER.includes(s) ? 'P\'s' : 'another persona\'s']))(
+    'state %s with %s tmux-unavailable raised: the arm is never asked',
+    async (state) => {
+      const setup = LOST_STATE_SETUPS[state]
+      const h = track(armHarness(setup.opts))
+      const [A, B] = h.keys(['Alpha Bot', 'Beta Bot']) as [string, string]
+      await setup.arrange(h, B, h.p('Beta Bot').persona.working_directory)
+      raiseUnavailable(EARLIER.includes(state) ? B : A)
+
+      await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
+
+      expect(h.notices.map((n) => [n.key, stateOf(n.text)])).toEqual([[B, state]])
+      expect(h.retryTimerArms).toEqual([])
+    },
+  )
+
+  test('one message lost on both connections with only A\'s tmux-unavailable raised: the arm is asked for A only; B starts now', async () => {
+    const h = track(armHarness({}, { restartDelayS: NEVER_FIRE_RESTART_DELAY_S }))
+    const [A, B] = h.keys(['Alpha Bot', 'Beta Bot']) as [string, string]
+    raiseUnavailable(A)
+
+    await receiveOnEach(h, makeChannelMessage({ channel: CS }))
+
+    expect(h.notices.map((n) => [n.key, stateOf(n.text)])).toEqual([[A, 'not-answering'], [B, 'starting-now']])
+    expect(h.retryTimerArms).toEqual([A])
+    expect(h.restartAsks).toEqual([B])
+    expect(isRestartPendingOrActive(A)).toBe(false)
+    assertNoLeak(captured(h))
+  })
+
+  test('with no arm member bound, not answering from tmux-unavailable still posts its notice, writes no error line and asks for no restart', async () => {
+    const h = track(armHarness({}, { restartDelayS: NEVER_FIRE_RESTART_DELAY_S, armRetryTimer: false }))
+    const B = h.p('Beta Bot').persona.key
+    raiseUnavailable(B)
+
+    await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
+
+    expect(h.allPosts()).toEqual([lostNoticePost(h, 'Beta Bot', CB, 'stub-user', 'not-answering')])
+    expect(h.retryTimerArms).toEqual([])
+    expect(lines(h, 'error handling event')).toEqual([])
+    expect(h.restartAsks).toEqual([])
+    expect(isRestartPendingOrActive(B)).toBe(false)
     assertNoLeak(captured(h))
   })
 })

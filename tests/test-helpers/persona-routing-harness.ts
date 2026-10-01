@@ -23,7 +23,8 @@
  *   is scheduled and when its timer fires) in `h.restartAsks`, and the restart
  *   delay is read from `h.restartDelayS` at call time. `launchSession`
  *   replaces the launch outcome (hold a launch open to keep the persona in
- *   flight: it then reads as a launch running);
+ *   flight: it then reads as a launch running); `holdLaunches` holds every
+ *   launch's outcome open until `h.releaseLaunches()` settles them;
  * - the real persona notifier as the injected `notify`, built by
  *   `makeNotifierStack` (tests/test-helpers/persona-notifier.ts) over the
  *   same `clientFor` and stubs and the applied config (`h.config`, read at
@@ -40,8 +41,14 @@
  *   persona's client from `clientFor`, or the user ID when the persona has no
  *   client (`h.clients.setUnavailable`); the `resolveUserName` option
  *   replaces it;
- * - the up predicate (`isPersonaUp`), only when the caller passes one, so by
- *   default every persona counts as up;
+ * - the up predicate (`isPersonaUp`), only when the caller passes one or asks
+ *   for the up check (`upCheck`, or `notUp` with persona names), so by
+ *   default every persona counts as up. The up check is the real
+ *   `createPersonaUpPredicate` over a connection that serves for every
+ *   persona and a bring-up outcome that is `up` except for the keys in
+ *   `h.notUp` (read at call time; `h.upOutcomes` is that outcome, for a
+ *   relaunch gate over the same state); every key it is asked about is
+ *   recorded in `h.upAsks`;
  * - the lost-message state inputs (b.jg5 SRJ-1011), each composed as `main()`
  *   binds it and asked with the persona key at call time:
  *   - latched (`held-for-human`): `h.latch`, one real latch instance built by
@@ -94,6 +101,10 @@
  *     `h.rowReads` (its key) and in `h.readOrder` (`read:<key>`), which also
  *     gets `notice:<key>` for every notice the routing raises, so a case sees
  *     each read's place relative to the notices;
+ *   - the missing-retry-timer arm (`armRetryTimerIfMissing`, b.jg5 SRJ-311),
+ *     only with the `armRetryTimer` option: a recording member that adds the
+ *     key to `h.retryTimerArms` and arms nothing; without it the member is
+ *     absent, as a caller that does not wire it leaves it;
  * - the server-wide reply settings source (`getReplySettings`, as src/server.ts
  *   passes its start-time settings): it returns the `ackReaction` option and
  *   the default chunking, so by default there is no ack reaction and a
@@ -148,9 +159,19 @@ import {
 } from '../../src/persona-episodes.ts'
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
 import { createSessionServer, registerSession, _resetRegistry, type SessionEntry, type SessionToolDeps } from '../../src/registry.ts'
-import { initRestart, _resetRestartState, type RestartDeps } from '../../src/restart.ts'
+import {
+  initRestart,
+  isRestartPendingOrActive,
+  scheduleRestart,
+  _resetRestartState,
+  RESTART_FAILURE_CAP,
+  type RestartDeps,
+} from '../../src/restart.ts'
 import { LIVENESS_READING_DEAD, type LivenessReading } from '../../src/liveness-reading.ts'
-import { _resetBackoffState } from '../../src/backoff.ts'
+import { _resetBackoffState, recordFailure } from '../../src/backoff.ts'
+import { LATCH_ROW_STATE_NO_ROW, REFUSED_OPERATION_PLAIN_SPAWN } from '../../src/conflict-latch.ts'
+import { createPersonaUpPredicate } from '../../src/persona-start.ts'
+import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
 import { _resetAckTracker, consumeAck } from '../../src/ack-tracker.ts'
 import {
   archiveSlackMessage,
@@ -164,12 +185,17 @@ import { makePersonaClients, posts, type PersonaClients } from './permission-rel
 import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './credentials.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
+import { errTmuxUnresponsive } from './agent-director-stub.ts'
+import { conflictForPersona } from './conflict-cases.ts'
 
 /** Default restart delay (seconds): the restart timer fires within a few ms. */
 export const FAST_RESTART_DELAY_S = 0.005
 
 /** A restart delay (seconds) that never fires during a test. */
 export const NEVER_FIRE_RESTART_DELAY_S = 9999
+
+/** A connection that serves, so only the bring-up outcome decides whether a persona is up. */
+const SERVING_CONNECTION: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0SERVING', botId: 'B0SERVING' } }
 
 // ---------------------------------------------------------------------------
 // Lost-message recovery states
@@ -190,6 +216,115 @@ export { LOST_MESSAGE_STATES }
 export function stateOf(text: string | undefined): LostMessageState | 'none' | 'several' {
   const found = LOST_MESSAGE_STATES.filter((s) => (text ?? '').includes(STATE_WORDING[s]))
   return found.length === 1 ? found[0]! : found.length === 0 ? 'none' : 'several'
+}
+
+/**
+ * What a recovery state needs of the harness it is arranged on: the up check
+ * (`upCheck`, so `arrange` can take P's bring-up outcome off `up`), every
+ * restart launch held open (`holdLaunches`, released by
+ * `h.releaseLaunches()`), and the server-wide `session_restart_delay` (0:
+ * auto-restart disabled). A caller's own harness wrapper takes these three
+ * and hands them to `makeRoutingHarness` (the delay through `overrides`).
+ */
+export interface LostStateOptions {
+  upCheck?: boolean
+  holdLaunches?: boolean
+  sessionRestartDelay?: number
+}
+
+/** How one recovery state is arranged for P's next lost message, and what follows once it is handled. */
+export interface LostStateSetup {
+  /** Harness options the state needs (see `LostStateOptions`), merged over the caller's. */
+  opts: LostStateOptions
+  /**
+   * Put persona `key`, whose launches run in `cwd`, in the state, through the
+   * harness's real inputs, on a harness whose restart delay fires fast (so a
+   * wrongly scheduled restart would launch). Throws when the input did not
+   * take.
+   */
+  arrange(h: RoutingHarness, key: string, cwd: string): Promise<void> | void
+  /** Whether a restart of P is pending or active right after the message (one arranged before it, or its own). */
+  pending: boolean
+  /** The launches there are once the message is handled, each of P in `cwd`. */
+  launches: number
+}
+
+/** Throws `what` unless `ok`: an arrangement whose input did not take. */
+function arranged(ok: boolean, what: string): void {
+  if (!ok) throw new Error(`lost-message state arrangement failed: ${what}`)
+}
+
+/**
+ * The one per-state table for a lost message's recovery state (b.jg5
+ * SRJ-1011, SRJ-1501): each state of `LOST_MESSAGE_STATES` arranged through
+ * the harness's real inputs, with what it leaves. Only `starting-now`
+ * schedules a restart from the message; `session-starting`'s launch and
+ * `restarting`'s timer were arranged before it.
+ */
+export const LOST_STATE_SETUPS: Readonly<Record<LostMessageState, LostStateSetup>> = {
+  // Bug b.g57: P's bring-up outcome is not up while its connection still
+  // delivers the message, through the real up predicate.
+  'not-up': {
+    opts: { upCheck: true },
+    arrange: (h, key) => { h.notUp.add(key) },
+    pending: false,
+    launches: 0,
+  },
+  // E13's set entry, on a CONFLICT.
+  'held-for-human': {
+    opts: {},
+    arrange: (h, key) => {
+      h.latch.setFromConflict(key, conflictForPersona(key), { refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: LATCH_ROW_STATE_NO_ROW })
+      arranged(h.latch.isLatched(key), 'P is not latched')
+    },
+    pending: false,
+    launches: 0,
+  },
+  'cannot-launch': { opts: {}, arrange: (h, key) => { h.heldOnInvalidFlags.add(key) }, pending: false, launches: 0 },
+  'kill-failed': { opts: {}, arrange: (h, key) => { h.killFailed.add(key) }, pending: false, launches: 0 },
+  // E10's entry: a refusal from a tmux-touching verb starts the condition.
+  'not-answering': {
+    opts: {},
+    arrange: (h, key) => {
+      arranged(h.tmuxUnresponsive.start(key, 'resume', errTmuxUnresponsive('resume')) === 'started', 'the condition did not start')
+    },
+    pending: false,
+    launches: 0,
+  },
+  // A restart's launch of P in flight and held open: a launch running
+  // (production: `isLaunchInFlight`). A stacked launch would make two.
+  'session-starting': {
+    opts: { holdLaunches: true },
+    arrange: async (h, key, cwd) => {
+      scheduleRestart(key, cwd)
+      await waitFor(() => h.launches.length === 1)
+      arranged(h.launches.length === 1 && h.isLaunchInFlight(key), 'no launch of P in flight')
+    },
+    pending: true,
+    launches: 1,
+  },
+  // A restart of P whose timer never fires; restart.ts can launch again after.
+  'restarting': {
+    opts: {},
+    arrange: (h, key, cwd) => {
+      const delay = h.restartDelayS
+      h.restartDelayS = NEVER_FIRE_RESTART_DELAY_S
+      scheduleRestart(key, cwd)
+      h.restartDelayS = delay
+      arranged(isRestartPendingOrActive(key), 'no restart of P pending')
+    },
+    pending: true,
+    launches: 0,
+  },
+  'starting-now': { opts: {}, arrange: () => {}, pending: true, launches: 1 },
+  // restart.ts itself would launch (a nonzero restart delay) if it were asked.
+  'auto-restart-disabled': { opts: { sessionRestartDelay: 0 }, arrange: () => {}, pending: false, launches: 0 },
+  'restart-limit-reached': {
+    opts: {},
+    arrange: (_h, key) => { for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(key) },
+    pending: false,
+    launches: 0,
+  },
 }
 
 // ---------------------------------------------------------------------------
@@ -417,8 +552,24 @@ export interface RoutingHarnessOptions {
   dedupeClock?: PersonaRoutingDeps['dedupeClock']
   /** Replaces the routing's `notify` (default: the real notifier, `h.notifier.notify`); calls are still recorded in `h.notices`. */
   notify?: PersonaRoutingDeps['notify']
-  /** The routing's up predicate (b.av2 SR-6.4, bug b.g57); absent, as by default, every persona counts as up. */
+  /** The routing's up predicate (b.av2 SR-6.4, bug b.g57); absent, as by default (and without `upCheck`), every persona counts as up. */
   isPersonaUp?: PersonaRoutingDeps['isPersonaUp']
+  /**
+   * Bind the up check (see the file comment): the real up predicate, not up
+   * for the keys in `h.notUp`, each ask recorded in `h.upAsks`. `isPersonaUp`
+   * replaces it.
+   */
+  upCheck?: boolean
+  /** Names whose bring-up outcome is not up first (`h.notUp`); implies `upCheck`. */
+  notUp?: readonly string[]
+  /** Hold every restart launch's outcome open until `h.releaseLaunches()` (ignored when `launchSession` is given). */
+  holdLaunches?: boolean
+  /**
+   * Bind the routing's `armRetryTimerIfMissing` (b.jg5 SRJ-311) as a member
+   * that records each key in `h.retryTimerArms` and arms nothing. Absent, as
+   * by default: the member is absent.
+   */
+  armRetryTimer?: boolean
   /**
    * Install the real outage state (`initOutageState`) with a recording sink
    * (`h.outageNotices`) and no agent-director client, so a raise or clear
@@ -509,6 +660,16 @@ export interface RoutingHarness {
   rowReads: string[]
   /** `read:<key>` at each row read's start and `notice:<key>` for each notice the routing raised, in order. */
   readOrder: string[]
+  /** Keys whose bring-up outcome is not up, read by the up check at call time (with `upCheck` or `notUp`). */
+  notUp: Set<string>
+  /** Every key the up check was asked about, in order (with `upCheck` or `notUp`). */
+  upAsks: string[]
+  /** The bring-up outcome the up check reads (`up` unless the key is in `notUp`), for a relaunch gate over the same state. */
+  upOutcomes: { isUp(key: string): boolean }
+  /** Settle every launch outcome held open (`holdLaunches`) as `ok`; returns how many were held. */
+  releaseLaunches(ok?: boolean): number
+  /** Every key `armRetryTimerIfMissing` was asked to arm, in order (with `armRetryTimer`). */
+  retryTimerArms: string[]
   /** Restart delay (seconds) the restart deps report, read at call time. */
   restartDelayS: number
   /** Archive writes started through the seam. */
@@ -602,7 +763,26 @@ export function makeRoutingHarness(
     handle.sessionCwd = session.cwd
   }
 
-  const restartDeps = makeRestartDeps({ restartDelayS: () => h.restartDelayS, launchSession: opts.launchSession })
+  // `holdLaunches`: every launch outcome pending until `h.releaseLaunches()`.
+  const heldLaunches: Array<(ok: boolean) => void> = []
+  const holdLaunch = (): Promise<boolean> => new Promise<boolean>((resolve) => { heldLaunches.push(resolve) })
+  const restartDeps = makeRestartDeps({
+    restartDelayS: () => h.restartDelayS,
+    launchSession: opts.launchSession ?? (opts.holdLaunches === true ? holdLaunch : undefined),
+  })
+
+  // The up check, as main() builds it: a connection that serves for every
+  // persona, so only the bring-up outcome (read at call time) decides.
+  const notUp = new Set<string>()
+  const upOutcomes = { isUp: (key: string) => !notUp.has(key) }
+  const isUp = createPersonaUpPredicate({ status: () => SERVING_CONNECTION }, upOutcomes)
+  const upAsks: string[] = []
+  const upCheck: PersonaRoutingDeps['isPersonaUp'] = opts.upCheck === true || opts.notUp !== undefined
+    ? (key) => {
+      upAsks.push(key)
+      return isUp(key)
+    }
+    : undefined
 
   // The lost-message state inputs (b.jg5 SRJ-1011), as main() builds them:
   // one latch, bare; one episodes instance on its own fake clock with the
@@ -693,6 +873,15 @@ export function makeRoutingHarness(
     rowReadScripts: new Map(Object.entries(opts.rowRead ?? {}).map(([name, v]) => [byName(name).persona.key, toRowReadScript(v)])),
     rowReads: [],
     readOrder: [],
+    notUp,
+    upAsks,
+    upOutcomes,
+    releaseLaunches: (ok = true) => {
+      const held = heldLaunches.splice(0)
+      for (const settle of held) settle(ok)
+      return held.length
+    },
+    retryTimerArms: [],
     restartDelayS: opts.restartDelayS ?? FAST_RESTART_DELAY_S,
     archiveWrites: [],
     receive: (event, names, ack) => routing.receive(
@@ -771,7 +960,7 @@ export function makeRoutingHarness(
     },
     log,
     dedupeClock: opts.dedupeClock,
-    isPersonaUp: opts.isPersonaUp,
+    isPersonaUp: opts.isPersonaUp ?? upCheck,
     // As main() binds them, each asked with the persona key at call time.
     isLatched: (key) => h.latch.isLatched(key),
     isTmuxUnresponsive: (key) => h.tmuxUnresponsive.holds(key),
@@ -784,8 +973,10 @@ export function makeRoutingHarness(
     // plus the non-launch work a case marks.
     isWorkInFlight: (key) => h.isLaunchInFlight(key) || h.workInFlight.has(key),
     readRowLiveness,
+    ...(opts.armRetryTimer === true ? { armRetryTimerIfMissing: (key: string) => { h.retryTimerArms.push(key) } } : {}),
   })
 
+  for (const key of keySet(opts.notUp)) notUp.add(key)
   initRestart(restartDeps)
   return h
 }

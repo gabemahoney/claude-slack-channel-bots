@@ -127,7 +127,6 @@ import {
 } from '../src/conflict-latch.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
 import { LIVENESS_LIVE, LIVENESS_PENDING, LIVENESS_READING_UNKNOWN, type PendingLivenessReading } from '../src/liveness-reading.ts'
-import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../src/lost-message.ts'
 import {
   adConfigMalformedOnset,
   ALL_CLEAR_TEMPLATE,
@@ -298,6 +297,7 @@ import {
   conditionLines,
   conditionRecoveryLine,
   adConfigMalformedRaiseLines,
+  expectLostMessageReports,
   makeRecoveryHarness,
   personaCallCounts,
   personaOf,
@@ -6129,30 +6129,6 @@ describe('unavailable retry: a restart work whose latched query throws stops the
 // `auto-restart-disabled`, so the delay 0 also checks the order.
 // ---------------------------------------------------------------------------
 
-/** States 1 to 5 of SRJ-1011: those that apply before the lost-message row read is made. */
-const EARLY_LOST_MESSAGE_STATES: readonly LostMessageState[] = LOST_MESSAGE_STATES.slice(0, LOST_MESSAGE_STATES.indexOf('session-starting'))
-
-/**
- * Lose one message for persona `key` through the driver: it reports `state`
- * with its exported wording, asks the restart module for no restart and
- * leaves none pending. Nothing is in flight for the persona in these cases,
- * so in states 1 to 5 it makes no agent-director call, and in any later
- * state exactly one: the routing's row read, a `status` of the persona's own
- * instance (b.jg5 SRJ-1011).
- */
-async function expectLostMessageReports(h: RecoveryHarness, key: string, state: LostMessageState): Promise<void> {
-  const read = !EARLY_LOST_MESSAGE_STATES.includes(state)
-  const statusBefore = h.stub.calls.statusCalls.length
-  expect([key, await h.loseMessage(key)]).toEqual([key, {
-    state,
-    notice: expect.stringContaining(STATE_WORDING[state]),
-    restartRequested: false,
-    restartPending: false,
-    calls: read ? { statusCalls: 1 } : {},
-  }])
-  expect(h.stub.calls.statusCalls.slice(statusBefore)).toEqual(read ? [{ claude_instance_id: personaInstanceId(key) }] : [])
-}
-
 describe('unavailable retry: a message lost while P’s tmux-unavailable or ad-config-malformed outage is raised reports not answering, with no restart (SRJ-1011, SRJ-311, SRJ-316, AC 36, AC 68)', () => {
   test.each<[string, () => Error, OutageClass, string]>([
     ['ErrTmuxNotAvailable (tmux-unavailable)', () => errTmuxNotAvailable(), 'tmux-unavailable', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
@@ -6217,5 +6193,135 @@ describe('unavailable retry: a message lost while P’s tmux-unavailable or ad-c
     expect(h.triggers).toHaveLength(triggers)
     expect(h.unclassifiedErrorOpen(key)).toBe(true)
     expectNeverDestructive(h, key)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A lost message arms a missing retry timer (b.jg5 SRJ-311, SRJ-1501): the
+// driver's `armRetryTimerIfMissing`, bound as `main()` binds it, both
+// settings 0, so no health tick and no restart would ever attempt for P.
+// ---------------------------------------------------------------------------
+
+describe('unavailable retry: a message lost in not answering with P’s tmux-unavailable outage raised and no retry timer arms one, never a restart (SRJ-311, SRJ-1501)', () => {
+  /** The driver's arm lines for persona `key` since `from` (the one line `armRetryTimerIfMissing` logs when it arms). */
+  const armLinesSince = (h: RecoveryHarness, key: string, from: number): string[] =>
+    h.errors.slice(from).filter((line) => line.startsWith(`[slack] Lost message: persona=${key} `))
+
+  /**
+   * P's bring-up refused with `make()` raises `flag` and arms its timer with
+   * `cause`; P then stops being up, so its retry stops as not up with the flag
+   * still raised; P is up again, with no timer and nothing pending.
+   */
+  async function stoppedWithFlagRaised(h: RecoveryHarness, key: string, make: () => Error, flag: OutageClass, cause: string): Promise<void> {
+    h.script({ spawnError: make() })
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expectArmedOnce(h, key, cause)
+    h.setUp(key, false)
+    await retryNow(h, key)
+    expect(h.lines).toContain(stoppedLine(key, UNAVAILABLE_RETRY_STOP_NOT_UP))
+    h.setUp(key, true)
+    expect([...getOutageFlags(key)]).toEqual([flag])
+    expectStopped(h, key)
+  }
+
+  test('raised with no timer (its retry stopped as not up): a message lost while P is not up arms nothing; once P is up, the message reports not answering, asks for no restart, makes no call, and arms P’s timer once at the base wait with the ENVIRONMENT cause, straight to the controller, with one line; a second, with that timer armed, arms nothing new; the other persona is untouched', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    await stoppedWithFlagRaised(h, key, () => errTmuxNotAvailable(), 'tmux-unavailable', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)
+    const triggers = h.triggers.length
+    const errorsBefore = h.errors.length
+
+    // Only a message lost in not answering arms: P not up reports not up and arms nothing.
+    h.setUp(key, false)
+    await expectLostMessageReports(h, key, 'not-up')
+    expect(h.controller.armedKeys()).toEqual([])
+    h.setUp(key, true)
+
+    await expectLostMessageReports(h, key, 'not-answering')
+
+    expect(h.controller.armedKeys()).toEqual([key])
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(0), refusals: 0, causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT] })
+    expect(delays(h.clock)).toEqual([waitMs(0)])
+    expect(h.triggers).toHaveLength(triggers)
+    expect(armLinesSince(h, key, errorsBefore)).toHaveLength(1)
+    expect(isRestartPendingOrActive(key)).toBe(false)
+
+    const timer = h.controller.view(key)
+    const errorsAfterArm = h.errors.length
+    await expectLostMessageReports(h, key, 'not-answering')
+    expect(h.controller.view(key)).toEqual(timer)
+    expect(delays(h.clock)).toEqual([waitMs(0)])
+    expect(armLinesSince(h, key, errorsAfterArm)).toEqual([])
+
+    expect([...getOutageFlags(other)]).toEqual([])
+    expect(h.controller.isArmed(other)).toBe(false)
+    h.teardown(key)
+    expectStopped(h, key)
+  })
+
+  test('ad-config-malformed raised alone with no timer: the message reports not answering and arms nothing through this path', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    await stoppedWithFlagRaised(h, key, () => errConfigMalformed(), AD_CONFIG_MALFORMED, UNAVAILABLE_RETRY_CAUSE_CONFIG)
+    const errorsBefore = h.errors.length
+
+    await expectLostMessageReports(h, key, 'not-answering')
+
+    expect(h.controller.armedKeys()).toEqual([])
+    expect(armLinesSince(h, key, errorsBefore)).toEqual([])
+    expectStopped(h, key)
+  })
+
+  test('raised while a launch for P is in flight, no timer: the message reports not answering and arms nothing', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const id = personaInstanceId(key)
+    const hold = holdSpawns(h.stub.client)
+    const launch = h.launch(key)
+    await hold.entered(id)
+    setOutageFlag(key, 'tmux-unavailable')
+    expect(isLaunchInFlight(key)).toBe(true)
+    const errorsBefore = h.errors.length
+
+    await expectLostMessageReports(h, key, 'not-answering')
+
+    expect(h.controller.armedKeys()).toEqual([])
+    expect(armLinesSince(h, key, errorsBefore)).toEqual([])
+    hold.release(id)
+    await launch
+    await h.settle()
+    expect(h.controller.armedKeys()).toEqual([])
+    expectStopped(h, key)
+  })
+
+  test('raised while P is latched, no timer: the message reports held for a human and arms nothing', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    h.script({ spawnError: conflictForPersona(key), statusError: errSpawnNotFound() })
+    expect(await h.launch(key)).toEqual({ key, action: 'latched' })
+    setOutageFlag(key, 'tmux-unavailable')
+    const errorsBefore = h.errors.length
+
+    await expectLostMessageReports(h, key, 'held-for-human')
+
+    expect(h.controller.armedKeys()).toEqual([])
+    expect(armLinesSince(h, key, errorsBefore)).toEqual([])
+    expectStopped(h, key)
+  })
+
+  // Positive control for `restartRequested`: at the delay 0 the restart module
+  // arms nothing, so only the harness's record of the latched-query ask can
+  // show a request; a direct `scheduleRestart` must appear there.
+  test('positive control, delay 0: a direct scheduleRestart for P is recorded in restartAsks, with no restart pending', () => {
+    const h = (harness = makeRecoveryHarness())
+    expect(h.config.session_restart_delay).toBe(0)
+    const [key] = h.keys as [string]
+    const before = h.restartAsks.length
+
+    scheduleRestart(key, personaOf(h, key).working_directory)
+
+    expect(h.restartAsks.slice(before)).toEqual([key])
+    expect(isRestartPendingOrActive(key)).toBe(false)
   })
 })

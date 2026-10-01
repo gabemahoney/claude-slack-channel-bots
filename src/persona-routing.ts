@@ -59,7 +59,9 @@
  *    applies and nothing is in flight for P, one row read of P is made (the
  *    injected `readRowLiveness`), and the state is decided again after it.
  *    A P in any state but "starting now" is never restarted from here (b.jg5
- *    SRJ-1501). Nothing is posted in the source conversation, and the message
+ *    SRJ-1501). A P reported "not answering" with its `tmux-unavailable`
+ *    outage raised has its retry timer armed when it has none (the injected
+ *    `armRetryTimerIfMissing`, b.jg5 SRJ-311). Nothing is posted in the source conversation, and the message
  *    text is never in the notice.
  *
  * The ack reaction's name comes from the server-wide `ack_reaction` setting
@@ -238,6 +240,17 @@ export interface PersonaRoutingDeps {
    * that state out. Absent: no read is made.
    */
   readRowLiveness?(key: string): Promise<LivenessReading>
+  /**
+   * b.jg5 SRJ-311: arm persona P's retry timer when its `tmux-unavailable`
+   * outage is raised and it has none (production: the server's one check,
+   * shared with the session-disconnect handler, which arms only when no
+   * timer is armed, P is not latched and nothing is in flight for P, and
+   * logs one line when it arms). Asked only when a lost message's final
+   * state is `not-answering` and P's `tmux-unavailable` flag is raised, after
+   * the state is decided; it never schedules a restart (SRJ-1501). Absent:
+   * nothing is armed.
+   */
+  armRetryTimerIfMissing?(key: string): void
 }
 
 /** A persona-routing instance. */
@@ -515,7 +528,13 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
    * (`firesHumanTriggeredRestart`: `starting-now` only), so none fires in
    * states 2 to 6; in state 6 it would be a launch over the `pending` row.
    * Nothing is awaited between the final decision and `scheduleRestart`, so
-   * messages lost together schedule at most one restart. Then one
+   * messages lost together schedule at most one restart.
+   *
+   * The missing retry timer (b.jg5 SRJ-311): when the final state is
+   * `not-answering` and P's `tmux-unavailable` flag is raised,
+   * `armRetryTimerIfMissing` is asked for P, so a P whose retry stopped with
+   * the flag still raised is retried even with `health_check_interval` 0.
+   * That arm is the outage's own retry, never a restart. Then one
    * lost-message notice naming `senderLabel` and the state is raised at P's
    * destination. Nothing is posted in the source conversation. The notice is
    * awaited so it is issued before dispatch returns; a failing sink is
@@ -541,6 +560,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     })
     // Nothing is awaited between the decision above and this call.
     if (firesHumanTriggeredRestart(state)) scheduleRestart(key, cwd, undefined, { humanTrigger: true })
+    if (state === 'not-answering' && getOutageFlags(key).has('tmux-unavailable')) deps.armRetryTimerIfMissing?.(key)
     try {
       await deps.notify(persona.key, buildLostMessageNotice(senderLabel, state))
     } catch (err) {

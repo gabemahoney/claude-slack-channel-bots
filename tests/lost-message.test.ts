@@ -110,9 +110,12 @@ function recordingQueries(trueFor: readonly Query[], provided: readonly Query[] 
 }
 
 describe('decideLostMessageState: the first state that applies, in SRJ-1011\'s order (b.jg5 SRJ-1011, SRJ-1509)', () => {
-  test.each(QUERY_ORDER.map((q, i) => [q, STATE_FOR[q], i] as const))(
-    '%s and every later input true gives %s, asking only the inputs up to it',
-    (_q, state, i) => {
+  // The seqWait row is SRJ-706: a sequence or wait step running while the
+  // row reads pending gives restarting, and the row is never asked.
+  const srj706 = (q: Query) => (q === 'seqWait' ? ' (SRJ-706: never session-starting over a pending row)' : '')
+  test.each(QUERY_ORDER.map((q, i) => [q, STATE_FOR[q], srj706(q), i] as const))(
+    '%s and every later input true gives %s, asking only the inputs up to it%s',
+    (_q, state, _note, i) => {
       const r = recordingQueries(QUERY_ORDER.slice(i))
       expect(decideLostMessageState(r.queries)).toBe(state)
       expect(r.asked).toEqual(QUERY_ORDER.slice(0, i + 1))
@@ -129,12 +132,6 @@ describe('decideLostMessageState: the first state that applies, in SRJ-1011\'s o
     const r = recordingQueries([q])
     expect(decideLostMessageState(r.queries)).toBe('restarting')
     expect(r.asked).toEqual(QUERY_ORDER.slice(0, QUERY_ORDER.indexOf(q) + 1))
-  })
-
-  test('SRJ-706: a sequence or wait step running while the row reads pending gives restarting, never session-starting', () => {
-    const r = recordingQueries(['seqWait', 'rowPending'])
-    expect(decideLostMessageState(r.queries)).toBe('restarting')
-    expect(r.asked).not.toContain('rowPending')
   })
 })
 

@@ -387,9 +387,10 @@ let personaLatch: Pick<ConflictLatch, 'isLatched'> | undefined
 /**
  * b.jg5 SRJ-315: true while work is in flight for the persona (today only a
  * launch call, `isLaunchInFlight`). Today this one predicate serves the retry
- * timer (`isInFlight`), the health tick (`isLaunchInFlight`), the session
- * disconnect handler (`restartDisconnectedPersona`) and the lost-message
- * routing's read gate (`isWorkInFlight`, b.jg5 SRJ-1011). They need not stay
+ * timer (`isInFlight`), the health tick (`isLaunchInFlight`), the
+ * `tmux-unavailable` retry check (`armMissingTmuxUnavailableRetry`, for the
+ * session disconnect handler and the lost-message routing) and the
+ * lost-message routing's read gate (`isWorkInFlight`, b.jg5 SRJ-1011). They need not stay
  * equal: a running dialog approver counts as in flight for the tick but never
  * blocks a retry (SRJ-303, SRJ-401). What must hold is that the tick never
  * attempts over work that holds back the retry timer.
@@ -403,9 +404,10 @@ function isPersonaWorkInFlight(key: string): boolean {
  * ENVIRONMENT cause, the `tmux-unavailable` outage's own class, on the
  * controller main() builds (read at call time; nothing is armed before it
  * exists). The one arm path for a persona held off on that outage with no
- * timer: the health tick's `armRetryTimer` and the session disconnect handler
- * both call it. An arm while the timer is armed or running keeps its due time
- * and wait count.
+ * timer: the health tick's `armRetryTimer` and the `tmux-unavailable` retry
+ * check (`armMissingTmuxUnavailableRetry`, for the session disconnect handler
+ * and the lost-message routing) both call it. An arm while the timer is armed
+ * or running keeps its due time and wait count.
  */
 function armEnvironmentRetryTimer(key: string): void {
   unavailableRetry?.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT })
@@ -561,61 +563,185 @@ const sessionToolDeps: SessionToolDeps = {
 // ---------------------------------------------------------------------------
 
 /**
+ * Which branch {@link armMissingTmuxUnavailableRetry} took for a persona
+ * (b.jg5 SRJ-311), the first that applies:
+ *   - `not-raised`: its `tmux-unavailable` outage is not raised; nothing done;
+ *   - `retry-armed`: its retry timer is armed (waiting or running); nothing done;
+ *   - `latched`: it is latched; nothing armed;
+ *   - `in-flight`: work is in flight for it; nothing armed;
+ *   - `no-controller`: there is no retry controller to ask (`isRetryArmed`
+ *     answered neither true nor false); nothing armed;
+ *   - `armed`: none of the above, and its retry timer was armed.
+ */
+export type TmuxUnavailableRetryBranch =
+  | 'not-raised'
+  | 'retry-armed'
+  | 'latched'
+  | 'in-flight'
+  | 'no-controller'
+  | 'armed'
+
+/** The dependencies of {@link armMissingTmuxUnavailableRetry}, each asked at call time. */
+export interface TmuxUnavailableRetryDeps {
+  /** Whether the persona's `tmux-unavailable` outage flag is raised. */
+  isTmuxUnavailable(key: string): boolean
+  /**
+   * Whether the persona has a retry timer, waiting or running (production:
+   * the retry controller's `isArmed`); `undefined` when there is no
+   * controller. Only exactly `false` lets a timer be armed.
+   */
+  isRetryArmed(key: string): boolean | undefined
+  /** Whether the persona is latched (production: the server's one latch). Only exactly `true` counts. */
+  isLatched(key: string): boolean
+  /** Whether work is in flight for the persona (production: `isPersonaWorkInFlight`). */
+  isWorkInFlight(key: string): boolean
+  /** Arm the persona's retry timer with the ENVIRONMENT cause (production: `armEnvironmentRetryTimer`). */
+  armRetryTimer(key: string): void
+  /** Writes one log line. */
+  log(line: string): void
+}
+
+/**
+ * b.jg5 SRJ-311: while persona `key`'s `tmux-unavailable` outage is raised,
+ * the only attempt made for it is its retry timer's, one per backoff
+ * interval, whatever `session_restart_delay` and `health_check_interval`
+ * are. A raised flag does not guarantee a timer: a retry that stopped as not
+ * up, on a declined launch or on a failed run leaves the flag raised with
+ * none, and then nothing would ever attempt for it. So when the flag is
+ * raised, no timer is armed (`isRetryArmed` answers exactly false), the
+ * persona is not latched and nothing is in flight for it, this logs
+ * `armLine` and arms its timer; otherwise it does nothing. The armed read is
+ * made once, before the latch and in-flight checks. Answers the branch it
+ * took. It never schedules a restart: arming the timer is the outage's own
+ * retry, not a human-triggered restart (SRJ-1501). The session-disconnect
+ * handler (`_buildRestartDisconnectedPersona`) and the lost-message routing
+ * (`armRetryTimerIfMissing`) both decide through it.
+ */
+export function armMissingTmuxUnavailableRetry(
+  key: string,
+  deps: TmuxUnavailableRetryDeps,
+  armLine: string,
+): TmuxUnavailableRetryBranch {
+  if (!deps.isTmuxUnavailable(key)) return 'not-raised'
+  const armed = deps.isRetryArmed(key)
+  if (armed === true) return 'retry-armed'
+  if (deps.isLatched(key) === true) return 'latched'
+  if (deps.isWorkInFlight(key)) return 'in-flight'
+  if (armed !== false) return 'no-controller'
+  deps.log(armLine)
+  deps.armRetryTimer(key)
+  return 'armed'
+}
+
+/**
+ * The production dependencies of {@link armMissingTmuxUnavailableRetry}: the
+ * outage state's flag, the retry controller and the latch through the
+ * holders main() sets (read at call time: before main() builds them there is
+ * no controller and no persona is latched), the shared in-flight predicate
+ * and the one ENVIRONMENT arm path.
+ */
+const tmuxUnavailableRetryDeps: TmuxUnavailableRetryDeps = {
+  isTmuxUnavailable: (key) => getOutageFlags(key).has('tmux-unavailable'),
+  isRetryArmed: (key) => unavailableRetry?.isArmed(key),
+  isLatched: (key) => personaLatch?.isLatched(key) === true,
+  isWorkInFlight: isPersonaWorkInFlight,
+  armRetryTimer: armEnvironmentRetryTimer,
+  log: (line) => console.error(line),
+}
+
+/** The dependencies of {@link _buildRestartDisconnectedPersona}. */
+export interface RestartDisconnectedPersonaDeps extends TmuxUnavailableRetryDeps {
+  /** The applied persona with this key, read at call time; undefined when there is none. */
+  getPersona(key: string): Persona | undefined
+  /** Schedule a restart of the persona in its working directory (production: `restart.ts`'s `scheduleRestart`). */
+  scheduleRestart(key: string, cwd: string): void
+  /** Whether the server is shutting down (production: the flag `shutdown()` raises). */
+  isShuttingDown(): boolean
+}
+
+/**
+ * _buildRestartDisconnectedPersona — the session-disconnect handler over its
+ * dependencies; `server.ts` builds the one production instance,
+ * `restartDisconnectedPersona`, bound to the real holders at call time.
+ *
  * A registered session for persona `key` closed: log it and schedule a
  * restart of that persona in its working directory. `via` qualifies the log
- * line (e.g. ` (SSE abort)`).
+ * line (e.g. ` (SSE abort)`). A key that is not an applied persona gets one
+ * line and nothing more.
+ *
+ * While the server is shutting down (the HTTP server's stop aborts every MCP
+ * stream, which lands here), it logs one skip line, the one
+ * `scheduleRestart` logs then, and does nothing more: no restart, no arm.
  *
  * b.jg5 SRJ-311: while the persona's `tmux-unavailable` outage is raised, the
  * retry timer's retries, one per backoff interval, are the only attempts made
  * for it, so no restart is ever scheduled here, and one line says what was
- * done instead:
+ * done instead (`armMissingTmuxUnavailableRetry` decides):
  *   - its retry timer is armed: nothing more;
- *   - it is latched (the server's one latch) or work is in flight for it
- *     (`isPersonaWorkInFlight`, the predicate the health tick and the retry
- *     timer use): nothing is armed;
- *   - otherwise, with no timer armed (the controller's `isArmed` answers
- *     exactly false; a retry that stopped as not up, on a declined launch or
- *     on a failed run leaves the flag raised with none), its timer is armed
- *     with the ENVIRONMENT cause (`armEnvironmentRetryTimer`, the health
- *     tick's arm path), so a retry comes even with `session_restart_delay` 0
- *     and `health_check_interval` 0.
- * Each is asked here, at arm time, through the holders main() sets.
+ *   - it is latched or work is in flight for it: nothing is armed;
+ *   - there is no retry controller: nothing is armed;
+ *   - otherwise its timer is armed with the ENVIRONMENT cause, so a retry
+ *     comes even with `session_restart_delay` 0 and `health_check_interval` 0.
+ *
+ * @internal
  */
-function restartDisconnectedPersona(key: string, via: string): void {
-  const persona = getAppliedPersona(key)
-  if (!persona) {
-    console.error(`[slack] Session disconnected${via}: persona=${key} is not an applied persona`)
-    return
+export function _buildRestartDisconnectedPersona(
+  deps: RestartDisconnectedPersonaDeps,
+): (key: string, via: string) => void {
+  return (key, via) => {
+    const persona = deps.getPersona(key)
+    if (!persona) {
+      deps.log(`[slack] Session disconnected${via}: persona=${key} is not an applied persona`)
+      return
+    }
+    const ref = renderPersonaRef(persona.name, persona.key)
+    deps.log(`[slack] Session disconnected${via}: persona ${ref} cwd="${persona.working_directory}"`)
+    if (deps.isShuttingDown()) {
+      deps.log(`[slack] Skipping restart — server is shutting down (persona=${key})`)
+      return
+    }
+    const head = `[slack] Session disconnected${via}: persona ${ref} has its tmux-unavailable outage raised`
+    const branch = armMissingTmuxUnavailableRetry(
+      key,
+      deps,
+      `${head} with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`,
+    )
+    switch (branch) {
+      case 'not-raised':
+        // Session-id resume is owned by agent-director (SR-1.3); launchSession
+        // relaunches the persona in its own working directory.
+        deps.scheduleRestart(key, persona.working_directory)
+        return
+      case 'retry-armed':
+        deps.log(`${head} — no restart scheduled; its retry timer recovers it (b.jg5 SRJ-311)`)
+        return
+      case 'latched':
+        deps.log(`${head} and is latched — no restart scheduled, no retry timer armed (b.jg5 SRJ-311, SRJ-502)`)
+        return
+      case 'in-flight':
+        deps.log(`${head} with work in flight — no restart scheduled, no retry timer armed (b.jg5 SRJ-311, SRJ-315)`)
+        return
+      case 'no-controller':
+        deps.log(`${head} and no retry controller — no restart scheduled, no retry timer armed (b.jg5 SRJ-311)`)
+        return
+      case 'armed':
+        return
+    }
   }
-  const ref = renderPersonaRef(persona.name, persona.key)
-  console.error(`[slack] Session disconnected${via}: persona ${ref} cwd="${persona.working_directory}"`)
-  if (!getOutageFlags(key).has('tmux-unavailable')) {
-    // Session-id resume is owned by agent-director (SR-1.3); launchSession
-    // relaunches the persona in its own working directory.
-    scheduleRestart(key, persona.working_directory)
-    return
-  }
-  const head = `[slack] Session disconnected${via}: persona ${ref} has its tmux-unavailable outage raised`
-  const armed = unavailableRetry?.isArmed(key)
-  if (armed === true) {
-    console.error(`${head} — no restart scheduled; its retry timer recovers it (b.jg5 SRJ-311)`)
-    return
-  }
-  if (personaLatch?.isLatched(key) === true) {
-    console.error(`${head} and is latched — no restart scheduled, no retry timer armed (b.jg5 SRJ-311, SRJ-502)`)
-    return
-  }
-  if (isPersonaWorkInFlight(key)) {
-    console.error(`${head} with work in flight — no restart scheduled, no retry timer armed (b.jg5 SRJ-311, SRJ-315)`)
-    return
-  }
-  if (armed !== false) {
-    console.error(`${head} and no retry controller — no restart scheduled, no retry timer armed (b.jg5 SRJ-311)`)
-    return
-  }
-  console.error(`${head} with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`)
-  armEnvironmentRetryTimer(key)
 }
+
+/**
+ * The one session-disconnect handler, reached from a registered session's
+ * close and its SSE abort (see `_buildRestartDisconnectedPersona`), over the
+ * applied-persona lookup, `restart.ts`'s `scheduleRestart`, the shutdown flag
+ * and the production `tmuxUnavailableRetryDeps`, each read at call time.
+ */
+const restartDisconnectedPersona = _buildRestartDisconnectedPersona({
+  ...tmuxUnavailableRetryDeps,
+  getPersona: getAppliedPersona,
+  scheduleRestart: (key, cwd) => scheduleRestart(key, cwd),
+  isShuttingDown: () => shuttingDown,
+})
 
 /**
  * Drop the session registered for persona `key` (`dropPersonaSession`: the
@@ -845,8 +971,8 @@ const personaRouting = createPersonaRouting({
   // before then no persona is latched and no condition holds. A launch call
   // awaits its dialog approver, so a launch in flight covers the approver
   // too (E17 widens this binding if its approver runs outside the launch
-  // call). This is not the shared in-flight predicate main() builds for the
-  // retry timer and the health tick.
+  // call). This is not the shared in-flight predicate (the module-scope
+  // isPersonaWorkInFlight) the retry timer and the health tick receive.
   isLatched: (key) => personaLatch?.isLatched(key) ?? false,
   isTmuxUnresponsive: (key) => personaTmuxUnresponsive?.holds(key) ?? false,
   isLaunchOrApproverRunning: (key) => isLaunchInFlight(key),
@@ -863,6 +989,21 @@ const personaRouting = createPersonaRouting({
   // and opens no episode, while ENVIRONMENT and CONFIG raise their outages
   // and arm the retry timer as from any verb (SRJ-105, SRJ-1501).
   readRowLiveness: (key) => personaRowLiveness?.(key) ?? Promise.resolve(LIVENESS_READING_UNKNOWN),
+  // b.jg5 SRJ-311: a message lost in `not-answering` while P's
+  // tmux-unavailable outage is raised arms P's retry timer when none is
+  // armed, P is not latched and nothing is in flight for it: the same check
+  // the session-disconnect handler makes, over the same holders, read at
+  // call time. It never schedules a restart (SRJ-1501). While the server is
+  // shutting down it arms nothing and logs nothing: shutdown has closed the
+  // retry controller, which would refuse the arm.
+  armRetryTimerIfMissing: (key) => {
+    if (shuttingDown) return
+    armMissingTmuxUnavailableRetry(
+      key,
+      tmuxUnavailableRetryDeps,
+      `[slack] Lost message: persona=${key} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`,
+    )
+  },
   // Left unbound until their Epics bind them, so they answer false:
   // isHeldOnInvalidFlags (E23), isKillFailed (E20, E27) and
   // isSequenceOrWaitRunning (E21, E27).
