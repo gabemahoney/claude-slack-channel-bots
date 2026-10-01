@@ -78,6 +78,7 @@ import {
 } from './config.ts'
 import { personaInstanceId, personaTmuxSessionName, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import {
+  applyOwnRowStatusStep,
   cancelWorkingRowWait,
   checkLaunchConfigDir,
   checkPromptRowDeferral,
@@ -1316,6 +1317,14 @@ export async function _runCallTimeoutStartStep(
  * `status` call; the relaunch gate refuses such a key before any kill or
  * launch.
  *
+ * After its own call it applies the session manager's own-row `status` step
+ * (`applyOwnRowStatusStep`, b.jg5 SRJ-115) to the answer: an UNUSABLE NAME
+ * answer latches the persona (b.jg5 SRJ-512; it is never reported as an
+ * unclassified error, and arms nothing), and so does a latch decision of the
+ * row-read rule over a returned result. An answer that latched the persona
+ * reads `unknown` (`livenessLatchedReading`), so the restart work, the
+ * health tick and the lost-message routing ask the latch next.
+ *
  * Its bare `status` is the one persona call not made through the outage
  * wrappers, so its error branches report the error themselves
  * (`reportAgentDirectorError` with the verb `status`): inside a restart run
@@ -1330,7 +1339,9 @@ export async function _runCallTimeoutStartStep(
  *
  * The same instance is the persona routing's lost-message row read (b.jg5
  * SRJ-115, SRJ-1011), made from the Slack event path, outside any launch or
- * recovery attempt, as the health tick's is: an UNAVAILABLE or UNCLASSIFIED
+ * recovery attempt, as the health tick's is; a read there that latched the
+ * persona makes the lost message report it held for a human, with no
+ * restart, since the routing decides its states again after the read. An UNAVAILABLE or UNCLASSIFIED
  * answer arms no retry timer and opens no unclassified-error episode, and,
  * `status` not being tmux-touching, no answer starts a `tmux-unresponsive`
  * condition; an ENVIRONMENT or CONFIG answer raises its outage and arms the
@@ -1354,6 +1365,9 @@ export function _buildIsSessionAliveAdapter(
       // clears `ad-unreachable` and `ad-config-malformed`.
       clearOutageFlag(key, 'ad-unreachable')
       clearOutageFlag(key, 'ad-config-malformed')
+      // b.jg5 SRJ-115: the own-row rules over this answer; a read that
+      // latched the persona reads `unknown`.
+      if (applyOwnRowStatusStep(key, { result: r }, LIVENESS_STATUS_SITE)) return livenessLatchedReading()
       const reading = livenessReadingForStatus(r)
       if (reading.kind === LIVENESS_UNKNOWN) {
         console.error(`[slack] isSessionAlive: status answered a state CSCB does not know for persona=${key} — read as unknown, not dead`)
@@ -1368,9 +1382,26 @@ export function _buildIsSessionAliveAdapter(
       reportAgentDirectorError(key, err, 'status', {
         reportUnclassified: !hasAdErrorName(err, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME),
       })
+      // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer latches the persona
+      // (the own-row `status` step) and reads `unknown`, never `dead`.
+      if (applyOwnRowStatusStep(key, { thrown: err }, LIVENESS_STATUS_SITE)) return livenessLatchedReading()
       return statusErrorReading(key, err)
     }
   }
+}
+
+/** Who reads, in the own-row `status` step's lines for the liveness adapter's read. */
+const LIVENESS_STATUS_SITE = { site: 'isSessionAlive', what: 'status' } as const
+
+/**
+ * The liveness adapter's reading for a `status` answer that latched the
+ * persona (b.jg5 SRJ-115, SRJ-502): `unknown`, never `dead` or `live`; the
+ * step logged the one line. The restart work and the health tick then ask
+ * the latch and stop; the lost-message routing decides its states again and
+ * reports the latched persona as held for a human (b.jg5 SRJ-1011).
+ */
+function livenessLatchedReading(): LivenessReading {
+  return LIVENESS_READING_UNKNOWN
 }
 
 /**
@@ -1671,13 +1702,28 @@ export function _buildKillSessionAdapter(
  *     No spawn-failure notice is raised. Its escalate-dead line has the
  *     verdict `row-not-interactive` (b.jdc), not a dead tmux session's.
  *
- * b.jg5 SRJ-502 — never type into a latched persona. The reads above are
- * awaited, and a launch outside the restart serializer can latch the persona
- * while they run, after the restart work's own latched check. So the latch
- * (`isLatched`) is asked once more right before `/mcp reconnect` is typed: a
- * latched persona, or a query that throws (fail safe), gets nothing typed and
- * one line naming it, and the adapter answers 'transient', which restart.ts
- * neither counts nor escalates to a kill (`RESTART_OUTCOME_RECONNECT_DEFERRED`).
+ * b.jg5 SRJ-115, SRJ-512 — the state read applies the session manager's
+ * own-row `status` step (`applyOwnRowStatusStep`) after its own call: an
+ * UNUSABLE NAME answer, or a latch decision of the row-read rule over the
+ * result, latches the persona, and the adapter answers 'transient' with
+ * nothing typed (`reconnectLatchedByRead`). The `working` and `waiting`
+ * rows' pane reads (`checkWorkingRowPane`, `checkWaitingRowPane`) latch on
+ * an UNUSABLE NAME answer too and defer, so nothing is typed after them.
+ * (The lost-message row read is the liveness adapter's,
+ * `_buildIsSessionAliveAdapter`, which applies the same step; not this one.)
+ *
+ * b.jg5 SRJ-502 — never type into a latched persona, nor read its pane. The
+ * reads above are awaited, and a launch outside the restart serializer can
+ * latch the persona while they run, after the restart work's own latched
+ * check. So the latch (`isLatched`, `reconnectLatchedAt`) is asked again after
+ * each awaited step that a further call follows: right after the state read,
+ * before any branch on the state (so no pane read, tmux probe, sweep or
+ * notice follows it); in the `working` and prompt-row verdicts, right after
+ * the tmux probe, before the pane read or the sweep; and right before
+ * `/mcp reconnect` is typed. A latched persona, or a query that throws (fail
+ * safe), gets nothing more done and one line naming it, and the adapter
+ * answers 'transient', which restart.ts neither counts nor escalates to a
+ * kill (`RESTART_OUTCOME_RECONNECT_DEFERRED`).
  *
  * @param getPersona  The applied persona with a key (production:
  *   `getAppliedPersona`), for locating a `working` row's transcript under its
@@ -1701,9 +1747,15 @@ export function _buildReconnectSessionAdapter(
       const st = await withOutageDetection(key, undefined, 'status', (client) =>
         client.status({ claude_instance_id }),
       )
+      // b.jg5 SRJ-115: the own-row rules over this answer; a read that
+      // latched the persona types nothing.
+      if (applyOwnRowStatusStep(key, { result: st }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead(key)
       state = st.state
       launchStartedAt = pendingLaunchStartOf(st)
     } catch (err) {
+      // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer latches the persona
+      // (the own-row `status` step); nothing is typed.
+      if (applyOwnRowStatusStep(key, { thrown: err }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead(key)
       // b.f2b: nothing is known about the session, so nothing is typed.
       forgetWorkingRowEvidence(key)
       console.error(
@@ -1711,6 +1763,11 @@ export function _buildReconnectSessionAdapter(
       )
       return 'transient'
     }
+    // b.jg5 SRJ-502: the state read is awaited, and the persona may have
+    // latched elsewhere meanwhile; a latched persona gets no pane read, tmux
+    // probe, sweep or notice, and nothing typed.
+    const latchedNow = (): boolean => reconnectLatchedAt(key, isLatched)
+    if (latchedNow()) return 'transient'
     // b.f2b: the evidence for a `working` row spans consecutive attempts that
     // read the row `working`; any other reading ends it, and the run of
     // deferrals on the row with it.
@@ -1721,10 +1778,10 @@ export function _buildReconnectSessionAdapter(
     // b.jdc: likewise the run of deferrals on a row waiting on a prompt.
     if (!PROMPT_ROW_STATES.has(state)) endPromptRowDeferral(key)
     if (state === 'working') {
-      const verdict = await workingReconnectVerdict(key, getPersona)
+      const verdict = await workingReconnectVerdict(key, getPersona, latchedNow)
       if (verdict !== 'reconnect') return verdict
     } else if (PROMPT_ROW_STATES.has(state)) {
-      return promptRowReconnectVerdict(key, state)
+      return promptRowReconnectVerdict(key, state, latchedNow)
     } else if (state === 'pending') {
       return deferPendingRow(key, launchStartedAt)
     } else if (state === 'waiting' && (await checkWaitingRowPane(key)) === 'defer') {
@@ -1763,7 +1820,7 @@ export function _buildReconnectSessionAdapter(
     // restart serializer (e.g. the start pass's) may have latched the persona
     // meanwhile. Ask the latch right before typing: a latched persona (or a
     // query that throws: fail safe) gets nothing typed, 'transient'.
-    if (reconnectLatchedAt(key, isLatched)) return 'transient'
+    if (latchedNow()) return 'transient'
     const result = await reconnectMcpWithCause(key)
     if (result.outcome === 'ok') return 'success'
     if (result.outcome === 'dead-session') {
@@ -1790,9 +1847,26 @@ export function _buildReconnectSessionAdapter(
   }
 }
 
+/** Who reads, in the own-row `status` step's lines for the reconnect adapter's state read. */
+const RECONNECT_STATUS_SITE = { site: 'reconnectSession', what: 'status check' } as const
+
 /**
- * The reconnect adapter's latched gate (b.jg5 SRJ-502), asked right before
- * `/mcp reconnect` is typed: true, after logging one line naming the persona,
+ * The reconnect adapter's answer for a state read that latched the persona
+ * (b.jg5 SRJ-115, SRJ-502, SRJ-512): its `working`-row evidence is
+ * forgotten, nothing is typed (the step logged the one line), and the
+ * adapter answers 'transient', which restart.ts neither counts nor escalates
+ * to a kill.
+ */
+function reconnectLatchedByRead(key: string): 'transient' {
+  forgetWorkingRowEvidence(key)
+  return 'transient'
+}
+
+/**
+ * The reconnect adapter's latched gate (b.jg5 SRJ-502), asked after its
+ * state read, after the tmux probe of a `working` or prompt row, and right
+ * before `/mcp reconnect` is typed: true, after logging one line naming the
+ * persona,
  * when `isLatched` answers exactly `true` for persona `key` or throws (fail
  * safe: the line names what it threw); false when it answers anything else or
  * is absent. Never throws.
@@ -1821,6 +1895,9 @@ function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) |
  * probe before the notice:
  *   - a launch for the persona is in flight → 'transient', with no tmux probe
  *     and no notice: the launch owns the session;
+ *   - latched by the time the tmux probe answers (`latchedNow`, the
+ *     adapter's `reconnectLatchedAt` for the persona; b.jg5 SRJ-502) →
+ *     'transient', with no sweep, no deferral noted and no notice;
  *   - its own tmux session is gone (`hasPersonaTmuxSession`, exact target) →
  *     the dead-tmux sweep (`sweepDeadTmuxChannelWithCause`, verdict
  *     `prompt-row-tmux-gone`) and 'escalate-dead', with no notice: restart.ts
@@ -1842,7 +1919,11 @@ function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) |
  * no notice: nothing is re-probed, killed or relaunched.
  * Never throws: the sweep and the deferral check swallow their own failures.
  */
-async function promptRowReconnectVerdict(key: string, state: string): Promise<'escalate-dead' | 'transient'> {
+async function promptRowReconnectVerdict(
+  key: string,
+  state: string,
+  latchedNow: () => boolean,
+): Promise<'escalate-dead' | 'transient'> {
   if (isLaunchInFlight(key)) {
     console.error(`[slack] reconnectSession: persona=${key} is ${state} and a launch for it is in flight — deferring to a later tick (b.jdc)`)
     return 'transient'
@@ -1856,6 +1937,8 @@ async function promptRowReconnectVerdict(key: string, state: string): Promise<'e
     )
     tmuxAlive = true
   }
+  // b.jg5 SRJ-502: latched during the probe → no sweep, no deferral, no notice.
+  if (latchedNow()) return 'transient'
   if (!tmuxAlive) {
     endPromptRowDeferral(key)
     console.error(
@@ -1947,7 +2030,9 @@ export function deferPendingRow(key: string, launchStartedAt?: string): 'pending
  * with the persona `getPersona` returns): 'reconnect' once the row is shown
  * stale, and the adapter goes on to type `/mcp reconnect`; otherwise defer.
  * A refused sweep (b.jg5 SRJ-105) answers 'transient' instead of
- * 'escalate-dead'.
+ * 'escalate-dead'. A persona latched by the time the tmux probe answers
+ * (`latchedNow`, the adapter's `reconnectLatchedAt` for the persona; b.jg5
+ * SRJ-502) gets no pane read and no sweep: 'transient'.
  * Never throws: `sweepDeadTmuxChannelWithCause` and `checkWorkingRowPane` swallow
  * their own failures. A failed tmux probe is noted as a deferral on the row
  * (`noteWorkingRowDeferral`), as `checkWorkingRowPane` notes its own.
@@ -1955,6 +2040,7 @@ export function deferPendingRow(key: string, launchStartedAt?: string): 'pending
 async function workingReconnectVerdict(
   key: string,
   getPersona: ((key: string) => Persona | undefined) | undefined,
+  latchedNow: () => boolean,
 ): Promise<'escalate-dead' | 'transient' | 'reconnect'> {
   if (isLaunchInFlight(key)) {
     console.error(`[slack] reconnectSession: persona=${key} is working and a launch for it is in flight — deferring /mcp reconnect to a later tick (b.d61)`)
@@ -1972,6 +2058,8 @@ async function workingReconnectVerdict(
     noteWorkingRowDeferral(key, false)
     return 'transient'
   }
+  // b.jg5 SRJ-502: latched during the probe → no pane read and no sweep.
+  if (latchedNow()) return 'transient'
   if (tmuxAlive) {
     // b.f2b: one evidence read (pane, and transcript for an idle pane), folded
     // into the evidence kept across attempts; `checkWorkingRowPane` logs what
@@ -2231,18 +2319,20 @@ export async function main(): Promise<void> {
   })
   personaEpisodes = noticeEpisodes
 
-  // b.jg5 SRJ-501, SRJ-508: the server's one per-persona latch, in memory
-  // only (nothing is loaded from a file), built before the start pass so it
-  // exists before any launch can meet a CONFLICT. Its CONFLICT notice is
-  // bound to the notice episodes: a latch, or a relatch with a new case,
-  // begins the persona's CONFLICT episode and posts the notice once through
-  // the persona notifier; the same case posts nothing.
+  // b.jg5 SRJ-501, SRJ-508, SRJ-1016: the server's one per-persona latch, in
+  // memory only (nothing is loaded from a file), built before the start pass
+  // so it exists before any launch can latch a persona. Its one notice
+  // reaction is bound to the notice episodes and posts every latch kind's
+  // notice: a latch, or a relatch with a new case, ends the persona's open
+  // episodes of the other latch kinds silently, begins the episode of its own
+  // kind (CONFLICT, or the unusable-recorded-name hold) and posts that kind's
+  // notice once through the persona notifier; the same case posts nothing.
   // b.jg5 SRJ-305, SRJ-310, SRJ-313, SRJ-502: its holds are bound first, so
   // they run before the notice on every set: the persona's retry timer stops
   // through the controller's `stop` with the latch's reason (never the
   // condition-end entry, whose `pending` and kill-failure exceptions do not
   // apply to a latch), its tmux-unresponsive condition ends silently (no
-  // recovery notice; the CONFLICT notice follows) and its unclassified-error
+  // recovery notice; the latch's notice follows) and its unclassified-error
   // episode ends. The three are built below; no latch can be set before the
   // start pass, by which time they exist.
   const conflictLatch = createConflictLatch({ log: (line) => console.error(line) })

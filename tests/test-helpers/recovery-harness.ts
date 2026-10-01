@@ -1318,9 +1318,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 }
 
 /**
- * What the CONFLICT notice reaction gets: `episodes`' own `begin` and `post`,
- * with each post that went out (a CONFLICT notice) also handed to `posted`
- * once the episodes' sink has it. Nothing else changes.
+ * What the latch's notice reaction gets: `episodes`' own `begin`, `post` and
+ * `end` (the reaction's silent end of the other latch kinds' episodes on a
+ * set, b.jg5 SRJ-512), with each post that went out (a CONFLICT or a hold
+ * notice) also handed to `posted` once the episodes' sink has it. Nothing
+ * else changes.
  */
 function recordingNoticeEpisodes(
   episodes: PersonaEpisodes,
@@ -1328,6 +1330,7 @@ function recordingNoticeEpisodes(
 ): ConflictNoticeEpisodes {
   return {
     begin: (key, kind, caseLabel) => episodes.begin(key, kind, caseLabel),
+    end: (key, kind) => episodes.end(key, kind),
     post: (key, kind, text, mark) => {
       const sent = episodes.post(key, kind, text, mark)
       if (sent) posted(key, text)

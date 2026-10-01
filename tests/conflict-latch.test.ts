@@ -45,7 +45,41 @@
  * same-case set posts nothing, a new case posts once more, another persona
  * posts only for itself, a hold case, a closed instance and an unbound
  * observer post nothing, and a b.f2b `unproven-idle` or `blocked-on-prompt`
- * notice already raised for the persona suppresses nothing (AC 41).
+ * notice already raised for the persona suppresses nothing (AC 41). A hold
+ * case opens no CONFLICT episode and posts no CONFLICT notice: each hold
+ * opens its own episode kind, and the unusable-name hold posts SRJ-1019.
+ *
+ * The unusable recorded name (SRJ-512, SRJ-1019, SRJ-508, SRJ-1016; AC 77,
+ * AC 85), over the helper's `UNUSABLE_NAME_CASE_ROWS`. One pin case (the
+ * file's only literal block for this text) checks SRJ-1019 word for word
+ * against the builder; every other case compares with the rows' `notice`.
+ * Per fault: the latch posts the row's notice once, with the instance id,
+ * the description rendered (redacted, capped) and quoted, the "Operator
+ * actions" title (read from the stub) and the human-only sentence; CSCB's
+ * own text (`cscbOwnText`) names no session-ending command and nothing of
+ * `CSCB_OWN_LINE_FORBIDDEN`. A sentinel-bearing description is redacted and
+ * an overlong one capped; through `makeNotifierHarness` the persona's own
+ * stub gets `formatPersonaNotice(persona, notice)` at its destination. Per
+ * row: the record (the case, "none", the row's state, `slack_bot_<key>`, the
+ * description) and the matching set input; a quoted session is recorded by
+ * SRJ-501's rule; an `ErrInternal` without the phrase, and other values,
+ * latch nothing. Episode: the first latch posts once under the unusable-name
+ * kind, a second UNUSABLE NAME posts nothing, a relatch from a CONFLICT posts
+ * once and a relatch back posts SRJ-1004 once (each ending the other kind's
+ * episode silently), and a not-connected notice suppresses nothing.
+ *
+ * SRJ-512's automated half (SRJ-502, on `makeRecoveryHarness`, both settings
+ * 0): P latches from `resume`'s UNUSABLE NAME, and in a second harness from
+ * the working-row evidence `read-pane`; then a new launch, the retry entry,
+ * a scheduled and a human-triggered restart and the retry timer make no
+ * tmux-touching call (`tmuxTouchingCallsIn`) or delete for P's instance and
+ * no raw tmux seam call (`recordRawTmux`) for P's session, count nothing,
+ * and leave exactly one post, SRJ-1019; Q's paths reach the stub as before.
+ * A message lost for P so latched reports `held-for-human` with no call and
+ * no restart; Q's reports its own state. The UNCLASSIFIED control: an
+ * `ErrInternal` without the phrase at the same `resume` latches nothing,
+ * posts no hold notice and takes E12's handling (the unclassified episode,
+ * the UNCLASSIFIED cause armed, nothing counted).
  * Recovery: each reason ("row reads" over every live and dead state) under
  * both latch kinds, with no line matching either list.
  *
@@ -116,7 +150,7 @@
  * observer; `afterEach` runs `assertNoLeak` over every line, event and record
  * captured, over every notice post and over each harness's `captured()`,
  * then cleans the harness up (which throws on a pending timer) and resets the
- * health check. The notice cases build `createPersonaEpisodes` over
+ * health check and the raw tmux seams a case recorded. The notice cases build `createPersonaEpisodes` over
  * `createFakeClock` with a recording sink; `afterEach` checks no timer is
  * pending and clears the session-manager notifier and its not-connected
  * latch. No `mock.module()`.
@@ -125,8 +159,12 @@
  */
 
 import { afterEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
+  UNUSABLE_RECORDED_NAME_PHRASE,
   CONFLICT_ANOTHER_STORE_PHRASE,
   CONFLICT_CONFLICTING_LABELS_PHRASE,
   CONFLICT_DIFFERENT_ID_PHRASE,
@@ -200,6 +238,8 @@ import {
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
   REFUSED_OPERATION_REUSE_SPAWN,
+  UNUSABLE_NAME_NOTICE_HEAD,
+  UNUSABLE_NAME_NOTICE_REASON,
   bindConflictNotice,
   conflictCaseSentence,
   conflictNoticeText,
@@ -216,9 +256,13 @@ import {
   recogniseConflictCase,
   rowStateCountsAsLive,
   takesUnrecognisedHandling,
+  isUnusableNameError,
+  unusableNameNoticeText,
+  unusableNameSetInput,
   type ConflictLatch,
   type ConflictLatchCase,
   type ConflictLatchConflictFields,
+  type ConflictLatchRecord,
   type ConflictLatchSetEvent,
   type ConflictLatchSetInput,
   type LatchKind,
@@ -235,6 +279,8 @@ import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import {
   createPersonaEpisodes,
   PERSONA_EPISODE_KIND_CONFLICT,
+  PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED,
+  PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME,
   TMUX_UNRESPONSIVE_END_LATCHED,
   UNCLASSIFIED_ERROR_END_LATCHED,
   type PersonaEpisodes,
@@ -255,6 +301,14 @@ import { _buildIsSessionAliveAdapter } from '../src/server.ts'
 import { decideOwnRowRead, ROW_READ_NO_DECISION, type RowReadRow } from '../src/row-read-rules.ts'
 import {
   _resetNotConnectedEpisodes,
+  _resetTmuxCommandRunner,
+  _resetTmuxDialogHelpers,
+  _resetTmuxSessionProber,
+  _setTmuxCapturePane,
+  _setTmuxCommandRunner,
+  _setTmuxSendEnter,
+  _setTmuxSessionKiller,
+  _setTmuxSessionProber,
   isLaunchInFlight,
   notifyPersonaNotConnected,
   OWN_ROW_READ_ROW,
@@ -266,6 +320,7 @@ import {
 import {
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_CEILING_S,
   UNAVAILABLE_RETRY_STOP_LATCHED,
 } from '../src/unavailable-retry.ts'
@@ -286,18 +341,28 @@ import {
   nonLatchingNotes,
   provenanceNote,
   STUB_TMUX_SESSION_NAME,
+  UNUSABLE_NAME_FAULTS,
   unknownNote,
+  type UnusableNameFault,
 } from './test-helpers/agent-director-stub.ts'
 import {
   CONFLICT_CASE_ROWS,
   SESSION_ENDING_COMMAND_FORMS,
+  UNUSABLE_NAME_CASE_ROWS,
+  UNUSABLE_NAME_SITES,
   cscbOwnLines,
+  cscbOwnText,
   expectedConflictNotice,
   sessionEndingCommandsIn,
+  tmuxTouchingCallCounts,
+  tmuxTouchingCallsIn,
   type ConflictCaseRow,
+  type UnusableNameCaseRow,
+  type UnusableNameSite,
 } from './test-helpers/conflict-cases.ts'
 import {
   BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
   REDACTED_SENTINEL_TAIL,
   assertNoLeak,
   fakeToken,
@@ -305,6 +370,8 @@ import {
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { posts } from './test-helpers/permission-relay-harness.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
 import {
   callCounts,
   callCountsSince,
@@ -856,14 +923,19 @@ interface NoticeRun extends LatchRun {
 /** Every notice run of this test, checked in `afterEach`. */
 let noticeRuns: NoticeRun[] = []
 
-/** One latch with the CONFLICT notice bound to a real episodes instance over a fake clock and a recording sink. */
-function makeNoticeRun(): NoticeRun {
+/**
+ * One latch with the latch notices bound to a real episodes instance over a
+ * fake clock and a recording sink, which also hands each post to `forward`
+ * when given (a case's persona notifier).
+ */
+function makeNoticeRun(forward?: (key: string, text: string) => void): NoticeRun {
   const run = makeLatchRun()
   const clock = createFakeClock()
   const posts: Array<readonly [string, string]> = []
   const episodes = createPersonaEpisodes({
     sink: (key, text) => {
       posts.push([key, text])
+      forward?.(key, text)
     },
     log: (line) => run.lines.push(line),
     clock,
@@ -1280,13 +1352,22 @@ describe('the CONFLICT notice\'s episode', () => {
     assertNoLeak(notConnectedPosts)
   })
 
-  test('a hold case opens no CONFLICT episode and posts nothing', () => {
+  test('a hold case opens no CONFLICT episode and posts no CONFLICT notice: each hold opens its own kind, and the unusable-name hold posts SRJ-1019', () => {
     const run = makeNoticeRun()
-    for (const latchCase of HOLD_LATCH_CASES) {
-      run.latch.set(KEY, { latchCase, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE })
+    const description = UNUSABLE_NAME_CASE_ROWS[0]!.description
+    const holds = [
+      [KEY, LATCH_CASE_UNUSABLE_RECORDED_NAME, PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME],
+      [OTHER, LATCH_CASE_LAUNCH_START_NOT_RECORDED, PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED],
+    ] as const
+    expect(new Set(holds.map(([, latchCase]) => latchCase))).toEqual(new Set(HOLD_LATCH_CASES))
+    for (const [key, latchCase] of holds) {
+      run.latch.set(key, { latchCase, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE, description })
     }
-    expect(run.posts).toEqual([])
-    expect(run.episodes.isOpen(KEY, PERSONA_EPISODE_KIND_CONFLICT)).toBe(false)
+    for (const [key, , kind] of holds) {
+      expect([key, run.episodes.isOpen(key, PERSONA_EPISODE_KIND_CONFLICT), run.episodes.isOpen(key, kind)]).toEqual([key, false, true])
+    }
+    expect(run.posts.filter(([key]) => key === KEY)).toEqual([[KEY, unusableNameNoticeText(KEY, description)]])
+    expect(run.posts.filter(([, text]) => text.startsWith(CONFLICT_NOTICE_FIRST_LINE_HEAD))).toEqual([])
   })
 
   test('after the episodes close (shutdown) a latch opens and posts nothing; an unbound reaction posts nothing', () => {
@@ -1359,6 +1440,222 @@ describe('the recovery notice', () => {
 })
 
 // ---------------------------------------------------------------------------
+// The unusable recorded name: trigger, record, SRJ-1019's notice and its
+// episode (SRJ-512, SRJ-1019, SRJ-508, SRJ-1016; AC 77, AC 85)
+// ---------------------------------------------------------------------------
+
+/** The unusable-name row of the helper's table at `site` for `fault`; throws when there is none. */
+function unusableRow(site: UnusableNameSite, fault: UnusableNameFault): UnusableNameCaseRow {
+  const found = UNUSABLE_NAME_CASE_ROWS.find((row) => row.site === site && row.fault === fault)
+  if (found === undefined) throw new Error(`no unusable-name row for ${site}: ${fault}`)
+  return found
+}
+
+/** `test.each` rows over the unusable-name table: the row name, then the row. */
+const UNUSABLE_ROWS = UNUSABLE_NAME_CASE_ROWS.map((row) => [row.name, row] as const)
+
+/** Latch `key` on a row's UNUSABLE NAME with the row's row state. */
+const latchUnusable = (latch: ConflictLatch, key: string, row: UnusableNameCaseRow, rowState: LatchRowState = row.rowState) =>
+  latch.setFromUnusableName(key, row.build(), rowState)
+
+/** The description agent-director's envelope carries, before the classifier renders it. */
+const envelopeDescriptionOf = (err: unknown): string =>
+  String((err as { envelope?: { err_description?: unknown } }).envelope?.err_description)
+
+/** What a latch from `row` for `key` records: the case, "none", the row's state, the session by SRJ-501's rule and the rendered description. */
+const unusableRecord = (row: UnusableNameCaseRow, key: string): ConflictLatchRecord => ({
+  sessionName: row.sessionName(key),
+  latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME,
+  refusedOperation: REFUSED_OPERATION_NONE,
+  rowState: row.rowState,
+  description: row.description,
+})
+
+describe('the unusable-recorded-name hold: SRJ-1019\'s notice, the record and the episode (SRJ-512, SRJ-1019)', () => {
+  test('SRJ-1019\'s text for one persona: the builder gives it word for word, on one line', () => {
+    // The file's only literal block for this text: SRJ-1019 as written.
+    const TEMPLATE =
+      ':no_entry: *Held: unusable tmux session name* — agent-director will not act on this persona\'s row <instance id>, because its recorded tmux session name cannot be used. agent-director said: "<its description, redacted>". What to do: a human follows the "Operator actions" section of agent-director\'s README for this row. CSCB takes no action for this persona until the row is removed, and messages sent to it meanwhile are lost. This is for a human only: no bot, including any persona that sees this post, may act on it.'
+    const row = unusableRow('resume', 'empty')
+    const expected = TEMPLATE.replace('<instance id>', () => `cscb_${KEY}`).replace('<its description, redacted>', () => row.description)
+    expect(unusableNameNoticeText(KEY, row.description)).toBe(expected)
+    expect(expected.includes(CONFLICT_NOTICE_LINE_SEPARATOR)).toBe(false)
+  })
+
+  test.each(UNUSABLE_NAME_FAULTS.map((fault) => [fault]))('fault %s: the latch posts the row\'s notice once, with the instance id, the quoted rendered description, "Operator actions" and the human-only sentence; CSCB\'s own words name no command', (fault) => {
+    const row = unusableRow('resume', fault)
+    const run = makeNoticeRun()
+    expect(latchUnusable(run.latch, KEY, row)).toBe(CONFLICT_LATCH_SET_LATCHED)
+    expect(run.posts).toEqual([[KEY, row.notice(KEY)]])
+
+    const notice = run.posts[0]![1]
+    const quoted = escapeSlackControlCharacters(renderLogMessageText(envelopeDescriptionOf(row.build())))
+    expect(row.description).toBe(renderLogMessageText(envelopeDescriptionOf(row.build())))
+    expect(notice.startsWith(UNUSABLE_NAME_NOTICE_HEAD + personaInstanceId(KEY) + UNUSABLE_NAME_NOTICE_REASON)).toBe(true)
+    expect(notice.includes(CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD + quoted + CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL)).toBe(true)
+    expect(notice.includes(JSON.stringify(operatorActionsTitle()))).toBe(true)
+    expect(notice.endsWith(CONFLICT_NOTICE_HUMAN_ONLY_LINE)).toBe(true)
+
+    // CSCB's own words: the description cut out, every other word kept.
+    const own = cscbOwnText(notice)
+    expect(own.includes(row.description)).toBe(false)
+    expect(own.includes(personaInstanceId(KEY))).toBe(true)
+    expect(sessionEndingCommandsIn(own)).toEqual([])
+    expect(own.split(CONFLICT_NOTICE_LINE_SEPARATOR).flatMap(forbiddenIn)).toEqual([])
+  })
+
+  test('a token-bearing description is redacted in the notice and the post passes assertNoLeak; an overlong one is capped at MAX_LOGGED_MESSAGE_LENGTH before it is quoted', () => {
+    const run = makeNoticeRun()
+    const secret = `${UNUSABLE_RECORDED_NAME_PHRASE} is empty (${sentinelInMessage('u')}); nothing was done`
+    expect(run.latch.setFromUnusableName(KEY, errInternal(secret), ENDED)).toBe(CONFLICT_LATCH_SET_LATCHED)
+    expect(run.posts.map(([, text]) => text.includes(escapeSlackControlCharacters(`(${REDACTED_SENTINEL_TAIL})`)))).toEqual([true])
+    assertNoLeak(run.posts)
+
+    const long = `${UNUSABLE_RECORDED_NAME_PHRASE} is empty ${'x'.repeat(2 * MAX_LOGGED_MESSAGE_LENGTH)}`
+    run.latch.setFromUnusableName(OTHER, errInternal(long), ENDED)
+    const capped = renderLogMessageText(long)
+    expect(capped.length).toBe(MAX_LOGGED_MESSAGE_LENGTH)
+    expect(run.latch.record(OTHER)?.description).toBe(capped)
+    expect(run.posts[1]).toEqual([OTHER, unusableNameNoticeText(OTHER, capped)])
+    expect(run.posts[1]![1].includes(long)).toBe(false)
+  })
+
+  test('posted through the persona notifier, the persona\'s own stub receives the notice under the persona prefix at its destination; the other persona\'s stub receives nothing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'conflict-latch-notifier-'))
+    try {
+      const config = makeMultiPersonaConfig([{}, {}], dir)
+      const [persona, other] = config.personas as [(typeof config.personas)[number], (typeof config.personas)[number]]
+      const notifier = makeNotifierHarness(config, { leakMarker: LEAK_SENTINEL })
+      const sent: Array<Promise<void>> = []
+      const run = makeNoticeRun((key, text) => {
+        sent.push(notifier.notifier.notify(key, text))
+      })
+      const row = unusableRow('read-pane', 'stored-differently')
+      latchUnusable(run.latch, persona.key, row)
+      await Promise.all(sent)
+      expect(notifier.posts(persona.key)).toEqual([
+        { channel: persona.permission_prompts, text: formatPersonaNotice(persona, unusableNameNoticeText(persona.key, row.description)) },
+      ])
+      expect(notifier.posts(other.key)).toEqual([])
+      expect(notifier.clock.pendingCount()).toBe(0)
+      assertNoLeak([notifier.allPosts(), notifier.logs])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test.each(UNUSABLE_ROWS)('%s: the latch records the case, "none", the path\'s row state, slack_bot_<key> and the rendered description; the set input matches; a second persona reads not latched', (_name, row) => {
+    const run = makeLatchRun()
+    expect(isUnusableNameError(row.build())).toBe(true)
+    expect(latchUnusable(run.latch, KEY, row)).toBe(CONFLICT_LATCH_SET_LATCHED)
+    expect(run.latch.record(KEY)).toEqual(unusableRecord(row, KEY))
+    expect(unusableNameSetInput(KEY, row.build(), row.rowState)).toEqual(unusableRecord(row, KEY))
+    expect([run.latch.isLatched(OTHER), run.latch.record(OTHER)]).toEqual([false, undefined])
+  })
+
+  test('the table covers every site T1 wires for every fault; the plain spawn alone takes its state from the latch-time read', () => {
+    expect(UNUSABLE_NAME_CASE_ROWS.map((row) => [row.site, row.fault])).toEqual(
+      UNUSABLE_NAME_SITES.flatMap((site) => UNUSABLE_NAME_FAULTS.map((fault) => [site, fault])),
+    )
+    expect(UNUSABLE_NAME_CASE_ROWS.filter((row) => row.latchTimeRead).map((row) => row.site)).toEqual(
+      UNUSABLE_NAME_FAULTS.map((): UnusableNameSite => 'plain spawn'),
+    )
+  })
+
+  test('a description that quotes a session records that session (SRJ-501\'s rule)', () => {
+    const run = makeLatchRun()
+    const quoted = personaTmuxSessionName(OTHER)
+    const err = errInternal(`${UNUSABLE_RECORDED_NAME_PHRASE} ${JSON.stringify(quoted)} is empty; nothing was done`)
+    run.latch.setFromUnusableName(KEY, err, ENDED)
+    expect(run.latch.record(KEY)?.sessionName).toBe(quoted)
+  })
+
+  test.each([
+    ['an ErrInternal without the phrase', (): unknown => errInternal()],
+    ['the phrase in another error name', (): unknown => errUnknownErrorName('ErrFromALaterBinary', `${UNUSABLE_RECORDED_NAME_PHRASE} is empty`)],
+    ['a CONFLICT', (): unknown => rowWhere((row) => row.latchCase === LATCH_CASE_OWN_ID).build()],
+    ['a plain Error carrying the phrase', (): unknown => new Error(`${UNUSABLE_RECORDED_NAME_PHRASE} is empty`)],
+  ] as const)('%s is no UNUSABLE NAME: setFromUnusableName latches nothing, posts nothing and is silent', (_label, build) => {
+    const run = makeNoticeRun()
+    expect(isUnusableNameError(build())).toBe(false)
+    expect(unusableNameSetInput(KEY, build(), ENDED)).toBeUndefined()
+    expect(run.latch.setFromUnusableName(KEY, build(), ENDED)).toBeUndefined()
+    expect([run.latch.isLatched(KEY), run.lines, run.events, run.posts]).toEqual([false, [], [], []])
+  })
+})
+
+describe('the unusable-recorded-name notice\'s episode (SRJ-508, SRJ-1016)', () => {
+  const first = unusableRow('resume', 'empty')
+  const second = unusableRow('read-pane', 'control-character')
+  const conflictRow = rowWhere((row) => row.latchCase === LATCH_CASE_OWN_ID)
+  const kindsOpen = (run: NoticeRun, key: string) => [
+    run.episodes.isOpen(key, PERSONA_EPISODE_KIND_CONFLICT),
+    run.episodes.isOpen(key, PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME),
+  ]
+
+  test('the first latch posts once under the unusable-name kind; a second UNUSABLE NAME for P posts nothing and keeps the record; another persona posts for itself', () => {
+    const run = makeNoticeRun()
+    expect(latchUnusable(run.latch, KEY, first)).toBe(CONFLICT_LATCH_SET_LATCHED)
+    const record = run.latch.record(KEY)
+    const episode = run.episodes.view(KEY, PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME)
+    expect(episode?.caseLabel).toBe(LATCH_CASE_UNUSABLE_RECORDED_NAME)
+    expect(kindsOpen(run, KEY)).toEqual([false, true])
+
+    expect(latchUnusable(run.latch, KEY, second)).toBe(CONFLICT_LATCH_SET_SAME_CASE)
+    expect(run.latch.record(KEY)).toBe(record)
+    expect(run.episodes.view(KEY, PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME)?.episode).toBe(episode?.episode)
+
+    latchUnusable(run.latch, OTHER, second)
+    expect(run.posts).toEqual([
+      [KEY, first.notice(KEY)],
+      [OTHER, second.notice(OTHER)],
+    ])
+  })
+
+  test('P latched on a CONFLICT relatches on an UNUSABLE NAME with one new post, the record replaced; a relatch back to that CONFLICT posts SRJ-1004 once more; each relatch ends the other kind\'s episode silently', () => {
+    const run = makeNoticeRun()
+    expect(latchOnRow(run.latch, KEY, conflictRow)).toBe(CONFLICT_LATCH_SET_LATCHED)
+    expect(kindsOpen(run, KEY)).toEqual([true, false])
+
+    expect(latchUnusable(run.latch, KEY, first)).toBe(CONFLICT_LATCH_SET_RELATCHED)
+    expect(run.latch.record(KEY)).toEqual(unusableRecord(first, KEY))
+    expect(kindsOpen(run, KEY)).toEqual([false, true])
+    expect(run.posts).toEqual([
+      [KEY, conflictRow.notice.text],
+      [KEY, first.notice(KEY)],
+    ])
+
+    expect(latchOnRow(run.latch, KEY, conflictRow)).toBe(CONFLICT_LATCH_SET_RELATCHED)
+    expect(kindsOpen(run, KEY)).toEqual([true, false])
+    expect(latchUnusable(run.latch, KEY, first)).toBe(CONFLICT_LATCH_SET_RELATCHED)
+    expect(run.posts).toEqual([
+      [KEY, conflictRow.notice.text],
+      [KEY, first.notice(KEY)],
+      [KEY, conflictRow.notice.text],
+      [KEY, first.notice(KEY)],
+    ])
+  })
+
+  test.each([
+    ['unproven-idle', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 600_000 }],
+    ['blocked-on-prompt', { reason: 'blocked-on-prompt', autoRestartDisabled: false }],
+  ] as const)('a persona already given the %s not-connected notice still gets the unusable-name post once', (_reason, notConnected: NotConnectedNotice) => {
+    const notConnectedPosts: Array<readonly [string, string]> = []
+    setSessionNotifier((key, text) => {
+      notConnectedPosts.push([key, text])
+    })
+    expect(notifyPersonaNotConnected(KEY, notConnected)).toBe(true)
+
+    const run = makeNoticeRun()
+    latchUnusable(run.latch, KEY, first)
+    latchUnusable(run.latch, KEY, second)
+    expect(run.posts).toEqual([[KEY, first.notice(KEY)]])
+    expect(notConnectedPosts.map(([key]) => key)).toEqual([KEY])
+    assertNoLeak(notConnectedPosts)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // AC 46's automated half, on the recovery harness (SRJ-502, SRJ-501, SRJ-508)
 // ---------------------------------------------------------------------------
 
@@ -1369,6 +1666,10 @@ afterEach(() => {
   const built = harnesses
   harnesses = []
   _resetHealthCheckState()
+  // The raw tmux seams a case records (`recordRawTmux`); the harness puts back the killer and the ensurer.
+  _resetTmuxCommandRunner()
+  _resetTmuxSessionProber()
+  _resetTmuxDialogHelpers()
   for (const h of built) {
     try {
       assertNoLeak(h.captured())
@@ -1387,6 +1688,8 @@ interface AutomatedPathsRun {
   readonly outcomes: Array<readonly [string, unknown]>
   /** Mark persona `key`'s row dead: its `status` reads `ended` until its next spawn resolves, then `waiting`. */
   readonly killRow: (key: string) => void
+  /** Persona `key`'s row reads `working` from now on, whatever its spawns answer. */
+  readonly readWorking: (key: string) => void
 }
 
 /**
@@ -1409,14 +1712,25 @@ function makeAutomatedPathsRun(): AutomatedPathsRun {
   harnesses.push(h)
   serializer = h.serializer
   const live = new Set<string>()
+  const working = new Set<string>()
   const spawn = h.stub.client.spawn.bind(h.stub.client)
   h.stub.client.spawn = async (params) => {
     const result = await spawn(params)
     live.add(String(params.claude_instance_id))
     return result
   }
-  h.script({ statusFn: (params) => cannedStatusResult({ state: live.has(String(params.claude_instance_id)) ? 'waiting' : 'ended' }) })
-  return { h, outcomes, killRow: (key) => live.delete(personaInstanceId(key)) }
+  h.script({
+    statusFn: (params) => {
+      const id = String(params.claude_instance_id)
+      return cannedStatusResult({ state: working.has(id) ? 'working' : live.has(id) ? 'waiting' : 'ended' })
+    },
+  })
+  return {
+    h,
+    outcomes,
+    killRow: (key) => live.delete(personaInstanceId(key)),
+    readWorking: (key) => working.add(personaInstanceId(key)),
+  }
 }
 
 /**
@@ -1449,6 +1763,101 @@ function captureTimer(kind: 'setTimeout' | 'setInterval', arm: () => void): () =
   }
 }
 
+/** The stub's launch answers back to their defaults (the row reads stay). */
+const CLEARED: RecoveryStubScript = { spawnError: undefined, spawnQueue: undefined, getResult: undefined, resumeError: undefined, readPaneError: undefined }
+
+/** One relaunch of a dead row: its liveness read, the kill, the spawn and the launch's own read. */
+const RELAUNCH = { statusCalls: 2, killCalls: 1, spawnCalls: 1 }
+
+/** The latch's reaction to one set of P, as `latchSteps` reads it: the set, the three holds in order, then the notice. */
+const oneLatch = (key: string) => [
+  ['set', key],
+  ['hold', key, 'retry timer stop'],
+  ['hold', key, 'tmux-unresponsive end'],
+  ['hold', key, 'unclassified-error end'],
+  ['notice', key],
+]
+const latchSteps = (h: RecoveryHarness) =>
+  h.latchEvents.map((event) => (event.step === 'hold' ? [event.step, event.key, event.hold] : [event.step, event.key]))
+
+/** The one line a restart request for latched persona `key` logs instead of arming a timer. */
+const notSchedulingLine = (key: string) =>
+  `[slack] Not scheduling restart for persona=${key} — the persona is latched; no timer armed (b.jg5 SRJ-502)`
+
+/** What `driveEveryPath` saw. */
+interface EveryPathRun {
+  /** Each new launch's answer: P's, then Q's. */
+  readonly launched: unknown[]
+  /** What Q's run of each path called, by path name. */
+  readonly qCalls: Array<readonly [string, Record<string, number>]>
+  /** The lines naming P that each restart request for P logged. */
+  readonly notScheduledLines: string[][]
+  /** How many retry attempts were recorded before the retry timer's path. */
+  readonly attemptsBefore: number
+}
+
+/**
+ * Drive, for latched P and then for Q with its row dead, a new launch, the
+ * retry entry, a scheduled restart, a human-triggered restart request and
+ * the retry timer (armed, then over several waits), recording what Q's run
+ * of each path called. A restart request for P arms no timer; Q's one timer
+ * is fired by hand.
+ */
+async function driveEveryPath({ h, killRow }: AutomatedPathsRun): Promise<EveryPathRun> {
+  const [p, q] = h.keys as [string, string]
+  const cwdOf = (key: string): string => personaOf(h, key).working_directory
+  const qCalls: Array<readonly [string, Record<string, number>]> = []
+  /** Drive `path` for P, then for Q with its row dead, recording what Q's run called. */
+  async function drive(name: string, path: (key: string) => Promise<unknown>): Promise<void> {
+    await path(p)
+    await h.settle()
+    killRow(q)
+    const before = personaCallCounts(h, q)
+    await path(q)
+    await h.settle()
+    qCalls.push([name, callCountsSince(personaCallCounts(h, q), before)])
+  }
+
+  /**
+   * Schedule a restart for `key` (`opts` as given): for latched P, no timer is
+   * armed and the one line saying so is logged; for Q, its one timer is fired.
+   */
+  const notScheduledLines: string[][] = []
+  async function scheduleFor(key: string, opts?: { humanTrigger: true }): Promise<void> {
+    const from = h.errors.length
+    const timers = armedTimers('setTimeout', () => scheduleRestart(key, cwdOf(key), undefined, opts))
+    if (key !== p) {
+      expect(timers).toHaveLength(1)
+      await timers[0]!()
+      return
+    }
+    expect(timers).toEqual([])
+    expect(isRestartPendingOrActive(p)).toBe(false)
+    notScheduledLines.push(h.errors.slice(from).filter((line) => line.includes(`persona=${p}`)))
+  }
+
+  const launched: unknown[] = []
+  await drive('a new launch', async (key) => launched.push(await h.launch(key)))
+  await drive('the retry entry', (key) => runRestartRetry(key, cwdOf(key), isLaunchInFlight))
+  await drive('a scheduled restart', (key) => scheduleFor(key))
+  await drive('a human-triggered restart', (key) => scheduleFor(key, { humanTrigger: true }))
+  const attemptsBefore = h.attempts.length
+  await drive('the retry timer', async (key) => {
+    h.controller.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
+    await h.advance(4 * UNAVAILABLE_RETRY_CEILING_S * 1000)
+  })
+  return { launched, qCalls, notScheduledLines, attemptsBefore }
+}
+
+/** What Q's run of each `driveEveryPath` path calls: Q is unlatched, so each reaches the stub. */
+const Q_CALLS_ON_EVERY_PATH = [
+  ['a new launch', { spawnCalls: 1, statusCalls: 1 }],
+  ['the retry entry', RELAUNCH],
+  ['a scheduled restart', RELAUNCH],
+  ['a human-triggered restart', RELAUNCH],
+  ['the retry timer', { ...RELAUNCH, statusCalls: RELAUNCH.statusCalls + 1 }],
+] as const
+
 describe('AC 46: no automated path kills, launches or recovers a latched persona (recovery harness)', () => {
   const plainSpawnRow = rowWhere(
     (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.latchCase === LATCH_CASE_LEFTOVER && row.rowState !== LATCH_ROW_STATE_NO_ROW,
@@ -1459,24 +1868,9 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
     ['a plain spawn', plainSpawnRow, () => ({ spawnError: plainSpawnRow.build() })],
     ['a resume', resumeRow, (h, key) => ({ ...collided(h, personaOf(h, key), { state: 'ended' }), resumeError: resumeRow.build() })],
   ]
-  /** The stub's launch answers back to their defaults (the row reads stay). */
-  const CLEARED: RecoveryStubScript = { spawnError: undefined, spawnQueue: undefined, getResult: undefined, resumeError: undefined }
-  /** One relaunch of a dead row: its liveness read, the kill, the spawn and the launch's own read. */
-  const RELAUNCH = { statusCalls: 2, killCalls: 1, spawnCalls: 1 }
-
-  /** The latch's reaction to one set of P, as `latchEvents` reads it: the set, the three holds in order, then the notice. */
-  const oneLatch = (key: string) => [
-    ['set', key],
-    ['hold', key, 'retry timer stop'],
-    ['hold', key, 'tmux-unresponsive end'],
-    ['hold', key, 'unclassified-error end'],
-    ['notice', key],
-  ]
-  const latchSteps = (h: RecoveryHarness) =>
-    h.latchEvents.map((event) => (event.step === 'hold' ? [event.step, event.key, event.hold] : [event.step, event.key]))
-
   test.each(LATCH_ROWS)('P latched at %s: a new launch, the retry entry, a scheduled restart, a human-triggered restart, the retry timer and the health tick make no kill, spawn, resume or delete for P; one CONFLICT post; Q\'s paths reach the stub as before', async (_label, row, latchScript) => {
-    const { h, outcomes, killRow } = makeAutomatedPathsRun()
+    const run = makeAutomatedPathsRun()
+    const { h, outcomes, killRow } = run
     const [p, q] = h.keys as [string, string]
     const cwdOf = (key: string): string => personaOf(h, key).working_directory
 
@@ -1490,49 +1884,9 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
     })
     h.script(CLEARED)
     const pAtLatch = personaCallCounts(h, p)
-    const qCalls: Array<readonly [string, Record<string, number>]> = []
-    /** Drive `path` for P, then for Q with its row dead, recording what Q's run called. */
-    async function drive(name: string, path: (key: string) => Promise<unknown>): Promise<void> {
-      await path(p)
-      await h.settle()
-      killRow(q)
-      const before = personaCallCounts(h, q)
-      await path(q)
-      await h.settle()
-      qCalls.push([name, callCountsSince(personaCallCounts(h, q), before)])
-    }
-
-    /**
-     * Schedule a restart for `key` (`opts` as given): for latched P, no timer is
-     * armed and the one line saying so is logged; for Q, its one timer is fired.
-     */
-    const notScheduledLines: string[][] = []
-    async function scheduleFor(key: string, opts?: { humanTrigger: true }): Promise<void> {
-      const from = h.errors.length
-      const timers = armedTimers('setTimeout', () => scheduleRestart(key, cwdOf(key), undefined, opts))
-      if (key !== p) {
-        expect(timers).toHaveLength(1)
-        await timers[0]!()
-        return
-      }
-      expect(timers).toEqual([])
-      expect(isRestartPendingOrActive(p)).toBe(false)
-      notScheduledLines.push(h.errors.slice(from).filter((line) => line.includes(`persona=${p}`)))
-    }
-
-    const launched: unknown[] = []
-    await drive('a new launch', async (key) => launched.push(await h.launch(key)))
-    await drive('the retry entry', (key) => runRestartRetry(key, cwdOf(key), isLaunchInFlight))
-    await drive('a scheduled restart', (key) => scheduleFor(key))
-    await drive('a human-triggered restart', (key) => scheduleFor(key, { humanTrigger: true }))
+    const { launched, qCalls, notScheduledLines, attemptsBefore } = await driveEveryPath(run)
     // Each request for P logged the not-scheduling line once, and nothing else naming P.
-    const notScheduling = `[slack] Not scheduling restart for persona=${p} — the persona is latched; no timer armed (b.jg5 SRJ-502)`
-    expect(notScheduledLines).toEqual([[notScheduling], [notScheduling]])
-    const attemptsBefore = h.attempts.length
-    await drive('the retry timer', async (key) => {
-      h.controller.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
-      await h.advance(4 * UNAVAILABLE_RETRY_CEILING_S * 1000)
-    })
+    expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
 
     // The health tick, its latched query bound as main() binds it; both rows read dead.
     const scheduled: string[] = []
@@ -1587,14 +1941,7 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
     expect(h.latch.isLatched(q)).toBe(false)
 
     // Q, beside it, still reaches the stub on every path.
-    expect(qCalls).toEqual([
-      ['a new launch', { spawnCalls: 1, statusCalls: 1 }],
-      ['the retry entry', RELAUNCH],
-      ['a scheduled restart', RELAUNCH],
-      ['a human-triggered restart', RELAUNCH],
-      ['the retry timer', { ...RELAUNCH, statusCalls: RELAUNCH.statusCalls + 1 }],
-      ['the health tick', { statusCalls: 1 }],
-    ])
+    expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH, ['the health tick', { statusCalls: 1 }]])
   })
 
   test.each([
@@ -1711,6 +2058,159 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
     expect(personaCallCounts(h, q)).toEqual({ statusCalls: 1 })
     // The latched P's own calls are still those of its launch.
     expect(personaCallCounts(h, p)).toEqual(personaCountsAfterLatch)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRJ-512, SRJ-502: an UNUSABLE NAME from `resume` and from the working-row
+// evidence `read-pane` latches P once, posts SRJ-1019 once, and is followed
+// by no tmux-touching call, raw tmux call, delete or counted failure on any
+// automated path; a lost message then reports held for a human (AC 68, AC 77)
+// ---------------------------------------------------------------------------
+
+/** One raw tmux seam call: the seam and what it targeted (a session name, or the runner's arguments joined). */
+interface RawTmuxCall {
+  readonly seam: string
+  readonly target: string
+}
+
+/**
+ * Replace every raw tmux seam of the session manager (the command runner,
+ * the session prober, the pane reader, the Enter sender and the session
+ * killer) with a recorder that runs nothing; `afterEach` and the harness's
+ * `cleanup()` put them back. Answers the recorded calls, in order.
+ */
+function recordRawTmux(): RawTmuxCall[] {
+  const calls: RawTmuxCall[] = []
+  const record = (seam: string, target: string) => calls.push({ seam, target })
+  _setTmuxCommandRunner(async (args) => {
+    record('runner', args.join(' '))
+    return { code: 1, stdout: '' }
+  })
+  _setTmuxSessionProber(async (name) => {
+    record('prober', name)
+    return false
+  })
+  _setTmuxCapturePane(async (name) => {
+    record('capture-pane', name)
+    return ''
+  })
+  _setTmuxSendEnter(async (name) => {
+    record('send-enter', name)
+  })
+  _setTmuxSessionKiller(async (name) => {
+    record('killer', name)
+  })
+  return calls
+}
+
+/** The instance id a stub call's params name, if any. */
+const instanceOf = (params: unknown): unknown => (params as { claude_instance_id?: unknown } | undefined)?.claude_instance_id
+
+/**
+ * Each way an UNUSABLE NAME latches P through the launch driver: the row
+ * whose answer it is, and the stub answers that bring P's launch there.
+ * `resume`: the optimistic spawn collides, the collision `get` reads `ended`
+ * and the `resume` answers it. The working-row evidence `read-pane`: the
+ * optimistic spawn collides, the collision `get` reads a live `working` row,
+ * so the launch waits for it; the wait's `status` reads `working` (the case
+ * makes P's row read so) and its evidence read, the pane read, answers it.
+ */
+const UNUSABLE_LATCH_WAYS: ReadonlyArray<readonly [string, UnusableNameCaseRow, (h: RecoveryHarness, key: string) => RecoveryStubScript]> = [
+  ['resume', unusableRow('resume', 'empty'), (h, key) => ({ ...collided(h, personaOf(h, key), { state: 'ended' }), resumeError: unusableRow('resume', 'empty').build() })],
+  [
+    'the working-row evidence read-pane',
+    unusableRow('read-pane', 'control-character'),
+    (h, key) => ({ ...collided(h, personaOf(h, key), { state: 'working' }), readPaneError: unusableRow('read-pane', 'control-character').build() }),
+  ],
+]
+
+describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pane holds P for a human on every automated path (recovery harness)', () => {
+  test.each(UNUSABLE_LATCH_WAYS)('P latched by %s: one SRJ-1019 post; then a new launch, the retry entry, a scheduled and a human-triggered restart and the retry timer make no tmux-touching call, raw tmux call or delete for P and count nothing; Q\'s paths reach the stub as before', async (_label, row, latchScript) => {
+    const run = makeAutomatedPathsRun()
+    const { h, outcomes } = run
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [p, q] = h.keys as [string, string]
+    const session = personaTmuxSessionName(p)
+    const raw = recordRawTmux()
+    run.readWorking(p)
+
+    h.script(latchScript(h, p))
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    expect(h.latch.record(p)).toEqual(unusableRecord(row, p))
+    h.script(CLEARED)
+    const touchingAtLatch = tmuxTouchingCallCounts(h.stub.calls)
+    const rawAtLatch = raw.length
+
+    const { launched, qCalls, notScheduledLines, attemptsBefore } = await driveEveryPath(run)
+
+    // Nothing tmux-touching, raw or deleting reached P after the latch.
+    expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
+    expect(raw.slice(rawAtLatch).filter((call) => call.target.includes(session))).toEqual([])
+    expect(h.stub.calls.deleteCalls.filter((call) => instanceOf(call) === personaInstanceId(p))).toEqual([])
+    // Each path stopped for P: the launch and the retry entry answered latched, no restart timer, the retry timer stopped latched.
+    expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
+    expect(outcomes).toEqual([
+      [p, RESTART_OUTCOME_LATCHED],
+      ...[1, 2, 3, 4].map(() => [q, RESTART_OUTCOME_LAUNCHED] as const),
+    ])
+    expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
+    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual([[p, 1], [q, 1], [q, 2]])
+    expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect([h.controller.armedKeys(), isRestartPendingOrActive(p)]).toEqual([[], false])
+    // Nothing counted, no spawn-failure notice or spawn-failed entry, one latch and exactly one post: SRJ-1019.
+    expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 0])
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice(p) }])
+    expect(h.latch.isLatched(q)).toBe(false)
+    // Q, beside it, still reaches the stub on every path.
+    expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH])
+  })
+
+  test.each(UNUSABLE_LATCH_WAYS)('P latched by %s: a message lost then reports held for a human with its exported wording at P\'s destination, with no status read and no restart; Q\'s lost message reports its own state', async (_label, row, latchScript) => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    expect(h.config.session_restart_delay).toBe(0)
+    const [p, q] = h.keys as [string, string]
+    // P's row reads working (the read-pane way's evidence read is then made); Q's reads no row.
+    h.script({
+      ...latchScript(h, p),
+      statusFn: (params) => (params.claude_instance_id === personaInstanceId(p) ? cannedStatusResult({ state: 'working' }) : errSpawnNotFound()),
+    })
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    expect(h.latch.record(p)).toEqual(unusableRecord(row, p))
+    const pCallsAtLatch = personaCallCounts(h, p)
+
+    const lost = await expectLostMessageReports(h, p, 'held-for-human')
+    const persona = personaOf(h, p)
+    expect(posts(h.slack(p)).map((post) => [post.channel, post.text])).toEqual([[persona.permission_prompts, formatPersonaNotice(persona, lost.notice)]])
+    expect(h.restartAsks.filter((key) => key === p)).toEqual([])
+    expect([isRestartPendingOrActive(p), personaCallCounts(h, p)]).toEqual([false, pCallsAtLatch])
+    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice(p) }])
+
+    await expectLostMessageReports(h, q, 'auto-restart-disabled')
+    expect(h.latch.isLatched(q)).toBe(false)
+  })
+
+  test('UNCLASSIFIED control: an ErrInternal without the phrase from the same resume latches nothing, posts no hold notice and takes the unclassified handling', async () => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p] = h.keys as [string]
+    const err = errInternal()
+    h.script({ ...collided(h, personaOf(h, p), { state: 'ended' }), resumeError: err })
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'failed', refused: true })
+
+    // No latch and no hold notice.
+    expect([h.latch.isLatched(p), h.latchEvents, h.episodeNotices]).toEqual([false, [], []])
+    // E12's handling: the unclassified episode opens, the timer is armed with the UNCLASSIFIED cause, nothing is counted or noticed, and nothing more is called.
+    expect(unclassifiedLines(h, p)).toEqual([unclassifiedStartedLine(p, err)])
+    expect(h.unclassifiedErrorOpen(p)).toBe(true)
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+    expect([getFailureCount(p), h.notices, h.startupErrors()]).toEqual([0, [], []])
+    expect(personaCallCounts(h, p)).toEqual({ spawnCalls: 1, getCalls: 1, resumeCalls: 1 })
   })
 })
 

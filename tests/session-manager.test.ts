@@ -40,7 +40,8 @@
  *     exactly once and arms once; outside an attempt nothing is reported.
  *     The `errGeneric` cases whose point is a launch failure use the LAUNCH
  *     FAILURE answer (`ErrTmuxSessionCreate`), and a findMissing rejection
- *     the launch proceeds past is an UNUSABLE NAME answer.
+ *     the launch proceeds past is an UNUSABLE NAME answer (a sweep is not a
+ *     verb on the persona's own row, so it latches no one).
  *   - b.jg5 SRJ-301 / SRJ-302 launch attempt: with a trigger sink installed
  *     through `initOutageState` (a recording sink, or the real
  *     `createUnavailableRetryController` on a fake clock, stopped in
@@ -61,8 +62,8 @@
  *     before. The read-error row: the collision `get` and the working-row
  *     wait's poll and timeout `status`, fed those forms, an UNCLASSIFIED read
  *     error and a store that cannot be opened, likewise, and start no
- *     condition; `ErrSpawnNotFound` keeps each site's meaning, and only an
- *     UNUSABLE NAME answer still reaches the timeout's tmux fallback.
+ *     condition; `ErrSpawnNotFound` keeps each site's meaning, and is the
+ *     only answer that still reaches the timeout's tmux fallback.
  *     SRJ-105's CONFIG row (b.jg5 SRJ-316): every one of those sites, and
  *     each findMissing sweep, fed `ErrConfigMalformed`, is refused the same
  *     way, arms P's timer with the CONFIG cause, starts no condition, never
@@ -92,6 +93,24 @@
  *     by the holds. With no latch installed a CONFLICT still answers
  *     `latched` and latches nothing; a latch the gate cannot read is taken as
  *     latched; a latch whose set throws still answers `latched`.
+ *   - b.jg5 SRJ-105's UNUSABLE NAME row, SRJ-512 (E16), on
+ *     `makeRecoveryHarness`: an UNUSABLE NAME answer, each fault of the
+ *     case table's rows for the site (`UNUSABLE_NAME_CASE_ROWS`), at every
+ *     ladder spawn and `resume`, at the ladder's kill and delete, at the
+ *     working-pane read (the launch wait's evidence read, `checkWorkingRowPane`
+ *     → `defer`, `checkWaitingRowPane` → `defer`, never `reconnect`), at the
+ *     shared own-row `status` read (its four answers; the wait's poll and
+ *     timeout, `reconcileAndReadRowState`, the retry timer's row read, the
+ *     latch-time read, which records unreadable and reads once) and at E14's
+ *     shared own-row `get` read (the collision `get`, the ErrJsonlMissing
+ *     diagnosis `get`, the transcript `get`, the post-run `get` after
+ *     `unverified_ids`) latches P with "unusable recorded name", "none" and
+ *     the state its path last read; nothing is called after it, raw tmux
+ *     included; nothing counted, no spawn-failure notice, `spawn-failed`
+ *     entry, `tmux-unresponsive` onset or unclassified episode; one SRJ-1019
+ *     post; B launches. Controls: a phrase-less `ErrInternal` keeps E12's
+ *     UNCLASSIFIED handling, and the persona teardown's kill and delete
+ *     rethrow and latch nothing.
  *   - b.jg5 SRJ-303 / SRJ-115 the retry timer's row read
  *     (`readPersonaRowState`): one `status` call for `cscb_<key>` and no
  *     other, answering each state as is (`pending` included), a `pending`
@@ -291,7 +310,12 @@ import {
   _resetConfiguredPersonaQuery,
   setConfiguredPersonaQuery,
   readPersonaOwnRow,
+  readPersonaOwnRowStatus,
   OWN_ROW_READ_ROW,
+  OWN_ROW_STATUS_ABSENT,
+  OWN_ROW_STATUS_LATCHED,
+  OWN_ROW_STATUS_REFUSED,
+  OWN_ROW_STATUS_STATE,
   WAIT_OUTCOME_LATCHED,
   type OwnRowReadSite,
   type SessionConflictLatch,
@@ -461,6 +485,7 @@ import {
   makeRecoveryHarness,
   personaOf as harnessPersona,
   recordCallOrder,
+  retryNow,
   unclassifiedLinePrefix,
   unclassifiedStartedLine,
   unclassifiedStartedLines,
@@ -469,17 +494,28 @@ import {
   type RecoveryRowState,
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
-import { CONFLICT_CASE_ROWS, expectedConflictNotice, type ConflictCaseRow } from './test-helpers/conflict-cases.ts'
+import {
+  CONFLICT_CASE_ROWS,
+  UNUSABLE_NAME_CASE_ROWS,
+  expectedConflictNotice,
+  type ConflictCaseRow,
+  type UnusableNameCaseRow,
+  type UnusableNameSite,
+} from './test-helpers/conflict-cases.ts'
 import {
   CONFLICT_LATCH_SET_LATCHED,
   LATCH_CASE_CONFLICTING_LABELS,
+  LATCH_CASE_UNUSABLE_RECORDED_NAME,
   LATCH_ROW_STATE_KIND_NO_ROW,
   LATCH_ROW_STATE_KIND_READ,
   LATCH_ROW_STATE_NO_ROW,
+  LATCH_ROW_STATE_UNREADABLE,
   REFUSED_OPERATION_BRING_UP,
+  REFUSED_OPERATION_NONE,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
   createConflictLatch,
+  describeLatchRowState,
   latchRowStateRead,
   type ConflictLatchSetInput,
   type LatchRowState,
@@ -504,6 +540,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_ROW_ABSENT,
+  UNAVAILABLE_RETRY_STOP_LATCHED,
   type AttemptView,
   type UnavailableRetryController,
   type UnavailableRetryRowRead,
@@ -5590,19 +5627,17 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
 
   // b.ecw: at the TIMEOUT CALL AD reports a status error that still falls back
   // to the raw tmux probe (b.rmy invariant): ErrSpawnNotFound (no row to
-  // reconcile, E18 owns it), and an UNUSABLE NAME answer, which keeps this
-  // handling until E16 builds its row. tmux gone → dead-session, tmux alive →
-  // not-reconnected (b.f2b; 'ok' before). Any other read error, a CONFIG
-  // answer included (b.jg5 SRJ-316), no longer reaches the probe (b.jg5
-  // SRJ-105, the cases after this one). The poll loop stays `working` and
-  // exits on the deadline; only the timeout status call throws (TTL=0 makes
-  // the timeout sweep bump findMissingCalls to 2, which flips statusFn into
-  // its error branch).
+  // reconcile, E18 owns it), the only one left. tmux gone → dead-session,
+  // tmux alive → not-reconnected (b.f2b; 'ok' before). Any other read error,
+  // a CONFIG answer included (b.jg5 SRJ-316), no longer reaches the probe
+  // (b.jg5 SRJ-105, the cases after this one), and an UNUSABLE NAME answer
+  // latches the persona instead (b.jg5 SRJ-512, the case after this one). The
+  // poll loop stays `working` and exits on the deadline; only the timeout
+  // status call throws (TTL=0 makes the timeout sweep bump findMissingCalls
+  // to 2, which flips statusFn into its error branch).
   test.each([
     ['ErrSpawnNotFound', () => errSpawnNotFound(), false, 'dead-session'],
     ['ErrSpawnNotFound', () => errSpawnNotFound(), true, 'not-reconnected'],
-    ['an UNUSABLE NAME answer', () => errUnusableName(), true, 'not-reconnected'],
-    ['an UNUSABLE NAME answer', () => errUnusableName(), false, 'dead-session'],
   ] as const)(
     'timeout with %s + tmux %s → %s (tmux fallback)',
     async (_label, errorFactory, tmuxAlive, expected) => {
@@ -5625,6 +5660,48 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
       expect(probed).toEqual(['slack_bot_C']) // fell back to tmux
     },
   )
+
+  // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer at the TIMEOUT CALL
+  // latches C (the state unreadable: the read that met it read none) and
+  // ends the wait latched whatever tmux shows: never the tmux fallback, so
+  // never 'dead-session' or 'not-reconnected'; nothing typed, no notice, no
+  // further call, one UNUSABLE NAME line.
+  test.each([true, false])('b.jg5 SRJ-105, SRJ-512: timeout with an UNUSABLE NAME answer + tmux alive=%p → latched (C latched, its state unreadable), tmux NOT probed, nothing typed, no notice, nothing called after the read', async (tmuxAlive) => {
+    _setWaitForWaitingTimeoutMs(30)
+    _setFindMissingMemoTtlMs(0)
+    const latch = createConflictLatch({ log: () => {} })
+    setConflictLatch(latch)
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return tmuxAlive })
+    const calls = makeStubCallLog()
+    let statusAfterLatch = 0
+    installStub({
+      ...calls,
+      findMissingResult: cannedFindMissing(),
+      statusFn: () => {
+        if (latch.isLatched('C')) statusAfterLatch++
+        return calls.findMissingCalls.length >= 2 ? errUnusableName() : ({ state: 'working' } as import('agent-director').StatusResult)
+      },
+    })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', cfg)
+    })
+
+    expect(result).toBe(WAIT_OUTCOME_LATCHED)
+    expect(probed).toEqual([])
+    expect(calls.sendKeysCalls).toEqual([])
+    expect(calls.findMissingCalls).toHaveLength(2) // the deadline's read decided, not the poll
+    expect(statusAfterLatch).toBe(0)
+    expect(latch.record('C')).toMatchObject({ latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE })
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, 'waitForWaitingAndReconnect: timeout: status read for persona=C: ')).toHaveLength(1)
+    expect(linesWith(errLog, ' — UNUSABLE NAME: the persona latched; ')).toHaveLength(1)
+    expect(linesWith(errLog, 'refused for persona=C')).toEqual([])
+    assertNoLeak({ errLog, notices })
+  })
 
   // b.jg5 SRJ-105: any other read error at the TIMEOUT CALL (an UNCLASSIFIED
   // `ErrTimeout` here, an UNAVAILABLE one alike) is handled as UNAVAILABLE:
@@ -7424,11 +7501,12 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     ['the row moving to ask_user', { state: 'ask_user', pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Waiting on a prompt*', 'Automatic restarts are disabled (`session_restart_delay` is 0)', undefined],
     ['agent-director losing the row while its tmux session lives', { state: errSpawnNotFound(), pane: IDLE_PANE, stepMs: 1_000 }, ':warning: *Not connected*', '(agent-director has no record of its session, though its tmux session is alive)', undefined],
     [
-      // Only an UNUSABLE NAME answer still reaches the tmux fallback (until
-      // E16); any other read error, a CONFIG answer included (b.jg5 SRJ-316),
-      // is a refusal (b.jg5 SRJ-105, the case after these).
-      'the deadline\'s status call failing with an UNUSABLE NAME answer while its tmux session lives (the tmux fallback)',
-      { state: (r) => (r.findMissingCalls.length % 2 === 0 ? errUnusableName() : 'working'), pane: SPINNER_PANE, stepMs: 60_000 },
+      // Only ErrSpawnNotFound at the deadline still reaches the tmux fallback;
+      // any other read error, a CONFIG answer included (b.jg5 SRJ-316), is a
+      // refusal (b.jg5 SRJ-105, the case after these), and an UNUSABLE NAME
+      // answer latches the persona (b.jg5 SRJ-512, the case after that).
+      'the deadline\'s status call answering ErrSpawnNotFound while its tmux session lives (the tmux fallback)',
+      { state: (r) => (r.findMissingCalls.length % 2 === 0 ? errSpawnNotFound() : 'working'), pane: SPINNER_PANE, stepMs: 60_000 },
       ':warning: *Not connected*',
       '(agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it)',
       undefined,
@@ -7530,6 +7608,72 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     expect(outageEmissions).toEqual(
       flags.length === 0 ? [] : [adConfigMalformedOnset(err), allClear, adConfigMalformedOnset(err)].map((text) => ({ key: 'C', text })),
     )
+  })
+
+  // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer at the deadline's status
+  // call latches C (unreadable) and ends the wait latched: never the tmux
+  // fallback, nothing typed, and no notice for the deadline's read (only the
+  // poll's unproven-idle one at delay 0, as for a refusal); nothing is called
+  // after the read. A pane read answering UNUSABLE NAME on the first poll
+  // latches C with the state the poll read (working) and ends the wait there,
+  // though the next poll would read waiting: no further poll, nothing typed.
+  test.each([0, 60])('b.jg5 SRJ-105, SRJ-512: session_restart_delay %d and the deadline\'s status call answering UNUSABLE NAME while its tmux session lives → latched, never the tmux fallback: C latched (unreadable), nothing typed, tmux not probed, no call after the read', async (delay) => {
+    _setFindMissingMemoTtlMs(0)
+    const latch = createConflictLatch({ log: () => {} })
+    setConflictLatch(latch)
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return true })
+    const row = installWorkingRow(clock, {
+      state: (r) => (r.findMissingCalls.length % 2 === 0 ? errUnusableName('stored-differently') : 'working'),
+      pane: SPINNER_PANE,
+      stepMs: 60_000,
+    })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', waitConfig({ session_restart_delay: delay }))
+    })
+
+    expect(result).toBe(WAIT_OUTCOME_LATCHED)
+    expect(row.sendKeysCalls).toEqual([])
+    expect(probed).toEqual([])
+    expect(row.findMissingCalls).toHaveLength(2)
+    const statusCallsAtLatch = row.statusCalls.length
+    expect(latch.record('C')).toMatchObject({ latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, rowState: LATCH_ROW_STATE_UNREADABLE })
+    expect(notices.filter((n) => n.text.includes('could not report its state'))).toEqual([])
+    expect(linesWith(errLog, ' — UNUSABLE NAME: the persona latched; ')).toHaveLength(1)
+    expect(linesWith(errLog, 'refused for persona=C')).toEqual([])
+    // A later wait for the latched persona makes no call at all.
+    expect(await waitForWaitingAndReconnect('C', waitConfig({ session_restart_delay: delay }))).toBe(WAIT_OUTCOME_LATCHED)
+    expect(row.statusCalls).toHaveLength(statusCallsAtLatch)
+    expect(row.findMissingCalls).toHaveLength(2)
+    assertNoLeak({ errLog, notices })
+  })
+
+  test('b.jg5 SRJ-117, SRJ-512: the first poll\'s pane read answering UNUSABLE NAME latches C with the state that poll read (working) and ends the wait latched: no second poll though the row would read waiting, no transcript get, nothing typed, no notice', async () => {
+    const latch = createConflictLatch({ log: () => {} })
+    setConflictLatch(latch)
+    const row = installWorkingRow(clock, {
+      state: (r) => (r.statusCalls.length > 1 ? 'waiting' : 'working'),
+      pane: errUnusableName('control-character'),
+      stepMs: 1_000,
+    })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', waitConfig())
+    })
+
+    expect(result).toBe(WAIT_OUTCOME_LATCHED)
+    expect(row.statusCalls).toHaveLength(1)
+    expect(row.readPaneCalls).toEqual([paneReadOf('C')])
+    expect(row.getCalls).toEqual([])
+    expect(row.sendKeysCalls).toEqual([])
+    expect(latch.record('C')).toMatchObject({ latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, refusedOperation: REFUSED_OPERATION_NONE, rowState: latchRowStateRead('working') })
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, '[slack] readWorkingPane: pane read refused for persona=C: ')).toHaveLength(1)
+    expect(linesWith(errLog, 'reading the pane of persona=C failed')).toEqual([])
+    assertNoLeak({ errLog, notices })
   })
 
   test.each<[number, string]>([
@@ -9745,42 +9889,33 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(text).not.toContain('could not determine whether my prior')
   })
 
-  // --- Classification triad: inconclusive (row fetch fails) ---------------
-  // b.fwu case (a): the diagnostic get() rejects → the row cannot be consulted,
-  // so we cannot classify loss vs never-created. Must not throw; the amnesia
-  // fresh-spawn still completes, now bucketed as the dedicated
-  // 'fresh-after-inconclusive-amnesia' action. b.jg5 SRJ-105: only
-  // `ErrSpawnNotFound` (an absent row) and an UNUSABLE NAME answer reach it;
-  // every other error at that get, a CONFIG answer included (b.jg5 SRJ-316),
-  // is a refusal; here an UNUSABLE NAME answer.
-  test('inconclusive (a): diagnostic row fetch fails → no throw, fresh-after-inconclusive-amnesia', async () => {
+  // --- Classification triad: inconclusive (row fetch finds no row) --------
+  // b.fwu case (a): the diagnostic get() finds no row → the row cannot be
+  // consulted, so we cannot classify loss vs never-created. Must not throw;
+  // the amnesia fresh-spawn still completes, now bucketed as the dedicated
+  // 'fresh-after-inconclusive-amnesia' action. b.jg5 SRJ-105, SRJ-114: only
+  // `ErrSpawnNotFound` (the row is absent) reaches it; every other error at
+  // that get, a CONFIG answer included (b.jg5 SRJ-316), is a refusal, and an
+  // UNUSABLE NAME answer latches the persona (b.jg5 SRJ-512; the AC 20 case
+  // below).
+  test('inconclusive (a): the diagnostic row fetch finds no row (ErrSpawnNotFound) → no throw, fresh-after-inconclusive-amnesia', async () => {
     captureStartupErrors()
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     // First get() (collision recovery) returns ended; second get() (diagnostic)
-    // rejects. Drive this by flipping the stub's get after the first call.
-    const stub = installStub({
-      spawnCalls,
-      deleteCalls,
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
-      ],
-      resumeError: errJsonlMissing(),
-    })
+    // finds no row.
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     let getCalls = 0
-    stub.get = async (params) => {
+    installDiagnosisGetFailure(cfg, () => {
       getCalls++
-      if (getCalls >= 2) throw errUnusableName()
-      return personaRowsGet(cfg, { state: 'ended' })(params)
-    }
+      return errSpawnNotFound()
+    }, { spawnCalls, deleteCalls })
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
 
     expect(result.action).toBe('fresh-after-inconclusive-amnesia')
     expect(deleteCalls).toHaveLength(1) // delete+fresh policy unchanged
     expect(spawnCalls).toHaveLength(2)
-    expect(getCalls).toBeGreaterThanOrEqual(2)
+    expect(getCalls).toBe(1) // the diagnostic get, after the collision get
   })
 
   // ==========================================================================
@@ -9791,35 +9926,22 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // (jsonl-diagnosis-inconclusive with a condition-specific detail).
   // ==========================================================================
 
-  // (a) row-fetch failure, driven through startupSessionManager so the counter
-  // is observable. The diagnostic get() (second get) rejects; the collision
-  // recovery get() (first) succeeds so the amnesia path is reached at all. The
-  // diagnostic get answers UNUSABLE NAME, which is not a read error (b.jg5
-  // SRJ-105).
-  test('inconclusive (a) via startup: row fetch fails → counter + jsonl-diagnosis-inconclusive record', async () => {
+  // (a) row-fetch finds no row, driven through startupSessionManager so the
+  // counter is observable. The diagnostic get() (second get) answers
+  // ErrSpawnNotFound; the collision recovery get() (first) succeeds so the
+  // amnesia path is reached at all.
+  test('inconclusive (a) via startup: the row fetch finds no row (ErrSpawnNotFound) → counter + jsonl-diagnosis-inconclusive record', async () => {
     const readLog = captureStartupErrors()
-    const stub = installStub({
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
-      ],
-      resumeError: errJsonlMissing(),
-    })
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    let getCalls = 0
-    stub.get = async (params) => {
-      getCalls++
-      if (getCalls >= 2) throw errUnusableName()
-      return personaRowsGet(cfg, { state: 'ended' })(params)
-    }
+    installDiagnosisGetFailure(cfg, () => errSpawnNotFound(), { spawnCalls: [], deleteCalls: [] })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
     expect(result.freshAfterAmnesia).toBe(0)
-    const log = readLog()
-    expect(log).toContain('jsonl-diagnosis-inconclusive')
-    // Detail names WHICH condition: the row could not be fetched.
-    expect(log).toContain('could not fetch the agent-director row')
+    const entry = onlyStartupEntry(readLog(), 'jsonl-diagnosis-inconclusive')
+    // Detail names WHICH condition: the row is absent.
+    expect(entry).toContain('the agent-director row is absent (ErrSpawnNotFound)')
+    expect(entry).not.toContain('could not fetch the agent-director row')
   })
 
   // b.jg5 SRJ-105's CONFIG row, SRJ-114, SRJ-316: a CONFIG answer at the
@@ -9903,33 +10025,49 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   const unknownNameShown = (err: { errName: string; errDescription: string }): string =>
     `${err.errName} ${quoted(err.errDescription)}`
 
-  // AC 20 (b.av2 SR-10.3): a row-fetch failure that is not a read error
-  // (b.jg5 SRJ-105: an UNUSABLE NAME answer) reaches the inconclusive report,
-  // where it is named by describeAgentDirectorFailure — an agent-director
-  // error's errName and redacted description when the errName is a short
-  // identifier — in the log line, startup-errors.log and the persona notice
-  // alike; never the thrown value's raw message, description or envelope,
-  // which carry fake tokens here.
+  // AC 20 (b.av2 SR-10.3) with b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME
+  // answer at the row fetch is no read error and reaches no inconclusive
+  // report: it latches the persona, so no diagnosis is reported (no
+  // inconclusive line, record or notice) and nothing is deleted or spawned.
+  // Its one UNUSABLE NAME line names it by describeAgentDirectorFailure — an
+  // agent-director error's errName and redacted description when the errName
+  // is a short identifier — and the latch's record holds the classification's
+  // redacted description; never the thrown value's raw message, description
+  // or envelope, which carry fake tokens here.
   const leakyConfig = (): unknown => errUnknownErrorName('ErrConfigMalformed', adDescription())
   const leakyUnusableName = (): unknown => errInternal(`${UNUSABLE_RECORDED_NAME_PHRASE} is empty; ${adDescription()}`)
-  test('AC 20: row fetch fails with an UNUSABLE NAME answer whose envelope description holds a URL and a fake token → named with its redacted message in the line, startup-errors.log and notice', async () => {
+  test('AC 20, b.jg5 SRJ-512: row fetch answers UNUSABLE NAME whose envelope description holds a URL and a fake token → latched, no diagnosis reported: its one UNUSABLE NAME line names it redacted, the latch record holds the redacted description; no delete, spawn, notice or startup entry; nothing leaks', async () => {
     const readLog = captureStartupErrors()
+    const latchLines: string[] = []
+    const latch = createConflictLatch({ log: (line) => latchLines.push(line) })
+    setConflictLatch(latch)
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    installDiagnosisGetFailure(cfg, leakyUnusableName, { spawnCalls: [], deleteCalls: [] })
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installDiagnosisGetFailure(cfg, leakyUnusableName, { spawnCalls, deleteCalls })
     const shown = unknownNameShown(leakyUnusableName() as { errName: string; errDescription: string })
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
     const errArgs = await withErrArgs(async () => {
       result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
     })
 
-    expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
-    const reasonOf = (text: string): string | undefined =>
-      /could not fetch the agent-director row \((.*?)\); AD reported/.exec(text)?.[1]?.split(' at ')[0]
-    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.includes('could not fetch the agent-director row'))
-    expect(lines.map(reasonOf)).toEqual([shown])
-    expect(reasonOf(readLog())).toBe(shown)
-    expect(notices.map((n) => reasonOf(n.text)).filter((r) => r !== undefined)).toEqual([shown])
-    assertNoLeak({ errArgs, startupErrorsLog: readLog(), notices })
+    expect(result).toStrictEqual({ key: CH, action: 'latched' })
+    const prefix = `[slack] spawnForPersona: ErrJsonlMissing diagnosis get for ${renderPersonaRef(personaOf(cfg, CH).name, CH)}: `
+    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(prefix))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).not.toContain('\n')
+    expect(lines[0]!.slice(prefix.length).split(' — UNUSABLE NAME: ')[0]!.split(' at ')[0]).toBe(shown)
+    expect(lines[0]).toEndWith(' — UNUSABLE NAME: the persona latched; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)')
+    const record = latch.record(CH)
+    expect(record).toMatchObject({ latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE })
+    expect(record?.description).toContain(REDACTED_URL_PLACEHOLDER)
+    expect(record?.description).toContain(REDACTED_TOKEN_PLACEHOLDER)
+    expect(errArgs.flat().map(String).filter((l) => l.includes('could not fetch the agent-director row'))).toEqual([])
+    expect(spawnCalls).toHaveLength(1) // the colliding optimistic spawn only
+    expect(deleteCalls).toEqual([])
+    expect(notices).toEqual([])
+    expect(readLog()).toBe('')
+    assertNoLeak({ errArgs, startupErrorsLog: readLog(), notices, latchLines, record })
   })
 
   // AC 20 with b.jg5 SRJ-114: `ErrSpawnNotFound` at the diagnosis get reads
@@ -10029,24 +10167,24 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     assertNoLeak({ errArgs, startupErrorsLog: log, notices, outageEmissions })
   })
 
-  // AC 20 (E13 Director decision 16): when the row fetch fails with an answer
-  // that is not a read error (here UNUSABLE NAME) and ErrJsonlMissing gave no
-  // enumerated paths, its description is echoed as "AD reported: …" only
-  // after redactSlackLogText, in the log line, the
+  // AC 20 (E13 Director decision 16): when the row fetch finds no row (the
+  // inconclusive path's one answer, ErrSpawnNotFound) and ErrJsonlMissing
+  // gave no enumerated paths, its description is echoed as "AD reported: …"
+  // only after redactSlackLogText, in the log line, the
   // jsonl-diagnosis-inconclusive record and the persona notice; the record's
   // cause is describeAgentDirectorFailure: the error's name and the same
   // redacted description as `message="…"`.
-  test('AC 20: row fetch fails and ErrJsonlMissing\'s description holds a URL and a fake token → "AD reported:" carries it redacted in the line, the record and the notice; nothing leaks', async () => {
+  test('AC 20: the row fetch finds no row and ErrJsonlMissing\'s description holds a URL and a fake token → "AD reported:" carries it redacted in the line, the record and the notice; nothing leaks', async () => {
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    installDiagnosisGetFailure(cfg, () => errUnusableName(), { spawnCalls: [], deleteCalls: [] }, adDescription())
+    installDiagnosisGetFailure(cfg, () => errSpawnNotFound(), { spawnCalls: [], deleteCalls: [] }, adDescription())
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
     const errLog = await withCapturedErr(async () => {
       result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
     })
 
     expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
-    const reported = `could not fetch the agent-director row (${unknownNameShown(errUnusableName())}); AD reported: ${REDACTED_AD_DESCRIPTION}`
+    const reported = `the agent-director row is absent (ErrSpawnNotFound); AD reported: ${REDACTED_AD_DESCRIPTION}`
     expect(errLog.split('\n').filter((l) => l.includes(reported))).toHaveLength(1)
     const entry = onlyStartupEntry(readLog(), 'jsonl-diagnosis-inconclusive')
     expect(entry).toContain(reported)
@@ -12506,8 +12644,9 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
   })
 
   // The UNCLASSIFIED read errors at this sweep are refused (b.jg5 SRJ-313's
-  // describe below); an UNUSABLE NAME answer is still no refusal there.
-  test('contrast: an UNUSABLE NAME answer at the before-resume sweep is no refusal: logged, and the resume goes on', async () => {
+  // describe below); an UNUSABLE NAME answer is still no refusal there, and,
+  // the sweep being no verb on P's own row, latches no one (b.jg5 SRJ-512).
+  test('contrast: an UNUSABLE NAME answer at the before-resume sweep is no refusal and latches no one: logged, and the resume goes on', async () => {
     const { h, p } = srj105Build()
     h.script({ ...SWEEP_SITES[0]!.script(h, harnessPersona(h, p), errUnusableName()) })
 
@@ -12520,6 +12659,8 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
     expect(h.triggers).toEqual([])
     expect(h.controller.isArmed(p)).toBe(false)
     expect(h.unclassifiedErrorOpen(p)).toBe(false)
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(h.latchEvents).toEqual([])
   })
 
   test.each<[string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined, SpawnPersonaResult['action'], Partial<LaunchVerbCalls>]>([
@@ -13075,7 +13216,7 @@ interface LatchSite {
   /** Configuration or seams the site needs, set before the launch. */
   setup?(h: RecoveryHarness): void
   /** Stub answers that make P's launch meet `err` here; a site that reads nothing answers the latch-time read with `row`'s state. */
-  script(h: RecoveryHarness, persona: Persona, err: Error, row: ConflictCaseRow): RecoveryStubScript
+  script(h: RecoveryHarness, persona: Persona, err: Error, row: Pick<ConflictCaseRow, 'rowState'>): RecoveryStubScript
   /** Every launch and destructive call the launch makes, the refused one included. */
   readonly calls: LaunchVerbCalls
   /** The `get` and `status` reads the path makes before the refused call. */
@@ -14893,6 +15034,48 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     expect(getIds(h)).toHaveLength(2)
   })
 
+  // b.jg5 SRJ-512 (E14's hatch note): an UNUSABLE NAME answer at the post-run
+  // get of the caller's own row is no refusal: it latches P, the run's line
+  // lists P latched, and P's caller stops (FIND_MISSING_LATCHED); B's listed
+  // row is read all the same and B latches nothing.
+  test.each(unusableNameRowsAt('get').map((row) => [row.name, row] as const))('the post-run get of the caller\'s (P\'s) own row answering UNUSABLE NAME (%s): P latched (unreadable) with one post, the caller gets FIND_MISSING_LATCHED, no refusal line; B\'s listed row is still read and B is not latched', async (_name, row) => {
+    const { h, p, b } = srj105Build()
+    const pId = personaInstanceId(p)
+    h.script({
+      findMissingResult: unverifiedRowsOf(p, b),
+      getFn: (params) => (params.claude_instance_id === pId ? row.build() : harnessRow(h, harnessPersona(h, b), { state: 'ended' })),
+    })
+
+    expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toBe(FIND_MISSING_LATCHED)
+
+    expect([...getIds(h)].sort()).toEqual([pId, personaInstanceId(b)].sort())
+    expect(postRunReadsOf(h)).toBe(`persona=${p} latched, persona=${b} read`)
+    expect(everyRefusalLine(h)).toEqual([])
+    expect(unusableNameLinesOf(h, p)).toHaveLength(1)
+    expectUnusableNameLatchedOnce(h, p, row, LATCH_ROW_STATE_UNREADABLE)
+    expect(h.latch.isLatched(b)).toBe(false)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+  })
+
+  // The read's own answer stops the caller, not only the latch's query: with
+  // no latch installed nothing is latched, and the caller still stops.
+  test('with no latch installed, the post-run get of the caller\'s (P\'s) own row answering UNUSABLE NAME still stops the caller (FIND_MISSING_LATCHED), latching nothing; its line says no latch is installed', async () => {
+    const { h, p } = srj105Build()
+    setConflictLatch(undefined)
+    const pId = personaInstanceId(p)
+    h.script({ findMissingResult: unverifiedRowsOf(p), getFn: (params) => (params.claude_instance_id === pId ? errUnusableName() : errSpawnNotFound()) })
+
+    expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toBe(FIND_MISSING_LATCHED)
+
+    expect(getIds(h)).toEqual([pId])
+    expect(postRunReadsOf(h)).toBe(`persona=${p} latched`)
+    expect(everyRefusalLine(h)).toEqual([])
+    const lines = unusableNameLinesOf(h, p)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(' — UNUSABLE NAME: no latch is installed, so nothing is latched; ')
+    expectNoNoteLatch(h)
+  })
+
   test('the post-run get of another persona\'s (B\'s) own row failing (UNAVAILABLE) is only logged: P\'s caller gets the run\'s result; no refusal line for either persona; the run\'s line lists B refused', async () => {
     const { h, p, b } = srj105Build()
     const bId = personaInstanceId(b)
@@ -15067,8 +15250,11 @@ describe('b.jg5 SRJ-120, SRJ-502: a persona latched by a run\'s get stops its ca
 // (`FIND_MISSING_REFUSED`): one refusal line, its retry timer armed with the
 // cause, nothing counted, and no resume, kill, delete or launch. A joiner's
 // attempt sees the error under its own key (b.jg5 SRJ-301), since the get
-// ran in the starter's. An UNUSABLE NAME answer lets the caller go on.
-// Another persona's failed get only shows in the run's line (above).
+// ran in the starter's. An UNUSABLE NAME answer is no failed read: it latches
+// the persona (b.jg5 SRJ-512, unreadable), whose caller then stops
+// (`FIND_MISSING_LATCHED`): no refusal line, nothing armed or counted, and
+// no resume, kill, delete or launch. Another persona's failed get only shows
+// in the run's line (above).
 // ---------------------------------------------------------------------------
 
 describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row stops the caller\'s attempt', () => {
@@ -15082,32 +15268,55 @@ describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row
   // The b.4dk path: a waiting row whose reconnect found its session dead runs
   // the sweep before `resume`; its run lists P's own row, and the post-run
   // get of that row fails.
-  test.each<[string, () => Error, SpawnPersonaResult['action'], boolean, Partial<LaunchVerbCalls>]>([
-    [`${callTimeoutLabel} (UNAVAILABLE): refused, no resume, kill, delete or spawn`, () => callTimeout('get'), 'failed', true, { spawn: 1, sendKeys: 2 }],
-    ['an UNUSABLE NAME answer: no refusal, the resume goes on', () => errUnusableName(), 'resumed', false, { spawn: 1, sendKeys: 2, resume: 1 }],
-  ])('the b.4dk path (the sweep before resume), P\'s own post-run get answering %s', async (_label, err, action, refused, calls) => {
-    const { h, p } = srj105Build()
-    const persona = harnessPersona(h, p)
-    h.script({
+  /** The b.4dk path's stub answers: a waiting row whose reconnect finds its session dead, its run listing P's own row, and P's post-run get answering `err`. */
+  function b4dkPostRunGet(h: RecoveryHarness, p: string, err: Error): RecoveryStubScript {
+    return {
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(harnessRow(h, persona, { state: 'waiting' })), cannedErr(err())],
+      getQueue: [cannedOk(harnessRow(h, harnessPersona(h, p), { state: 'waiting' })), cannedErr(err)],
       sendKeysError: errTmuxSendKeys(),
       findMissingResult: unverifiedRowsOf(p),
-    })
+    }
+  }
+
+  test(`the b.4dk path (the sweep before resume), P's own post-run get answering ${callTimeoutLabel} (UNAVAILABLE): refused, no resume, kill, delete or spawn`, async () => {
+    const { h, p } = srj105Build()
+    h.script(b4dkPostRunGet(h, p, callTimeout('get')))
     const order = recordCallOrder(h)
 
-    expect(await h.launch(p)).toStrictEqual(refused ? { key: p, action, refused: true } : { key: p, action })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
 
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf(calls))
-    expect(order.slice(order.indexOf('findMissing'), order.indexOf('findMissing') + 2)).toEqual(['findMissing', 'get'])
-    expect(postRunGetRefusalLines(h, 'spawnForPersona: before resume', renderPersonaRef(p, p))).toHaveLength(refused ? 1 : 0)
-    expect(everyRefusalLine(h)).toHaveLength(refused ? 1 : 0)
-    expect(h.triggers).toEqual(refused ? [{ key: p, kind: callTimeoutKind }] : [])
-    expect(h.controller.isArmed(p)).toBe(refused)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 2 }))
+    expect(order.slice(order.indexOf('findMissing'))).toEqual(['findMissing', 'get'])
+    expect(postRunGetRefusalLines(h, 'spawnForPersona: before resume', renderPersonaRef(p, p))).toHaveLength(1)
+    expect(everyRefusalLine(h)).toHaveLength(1)
+    expect(h.triggers).toEqual([{ key: p, kind: callTimeoutKind }])
+    expect(h.controller.isArmed(p)).toBe(true)
     expect(getFailureCount(p)).toBe(0)
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(h.notices).toEqual([])
     expectNoNoteLatch(h)
+  })
+
+  // b.jg5 SRJ-512 at E14's get after unverified_ids: the UNUSABLE NAME row is
+  // a latch, not a refusal, and the resume does not go on.
+  test.each(unusableNameRowsAt('get').map((row) => [row.name, row] as const))('the b.4dk path (the sweep before resume), P\'s own post-run get answering UNUSABLE NAME (%s): P latched (unreadable), the launch answers latched with no resume, kill, delete or spawn after the get; no refusal line, nothing armed or counted; one post', async (_name, row) => {
+    const { h, p, b } = srj105Build()
+    const script = b4dkPostRunGet(h, p, row.build())
+    h.script(script)
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 2 }))
+    expect(order.slice(order.indexOf('findMissing'))).toEqual(['findMissing', 'get'])
+    expect(postRunGetRefusalLines(h, 'spawnForPersona: before resume', renderPersonaRef(p, p))).toEqual([])
+    expect(everyRefusalLine(h)).toEqual([])
+    expect(h.triggers).toEqual([])
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(unusableNameLinesOf(h, p)).toHaveLength(1)
+    expectUnusableNameLatchedOnce(h, p, row, LATCH_ROW_STATE_UNREADABLE)
+
+    await expectLaunchedByNoPath(h, p, b, script)
   })
 
   test(`a joiner (B) whose own post-run get answers ${callTimeoutLabel} (UNAVAILABLE): P started the prompt-row sweep and B joined it; one findMissing call; B is refused under its own key (its attempt sees the error: armed once with the cause, never counted, no tmux-unresponsive condition) with no resume, kill, delete or launch; P, whose own get read its row, goes on (no-op: its row still reads check_permission)`, async () => {
@@ -15130,5 +15339,693 @@ describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row
     expect(conditionStartedLines(h, b)).toEqual([])
     expect(h.notices).toEqual([])
     expectNoNoteLatch(h)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-105's UNUSABLE NAME row, SRJ-512, SRJ-501, SRJ-502 (E16): an
+// UNUSABLE NAME answer (an `ErrInternal` naming "the recorded tmux session
+// name") from a verb on P's own row latches P with "unusable recorded name",
+// the refused operation "none" and the row state its path last read (a
+// `status` or `get` that itself answered records unreadable; a path that read
+// nothing makes the one latch-time `status` read). At every site the session
+// manager wires: the collision ladder's spawns and `resume` and its kill and
+// delete in a delete-then-spawn chain, the working-pane read (the launch
+// wait's evidence read, `checkWorkingRowPane`, `checkWaitingRowPane`), the
+// shared own-row `status` read and its sites (the wait's poll and timeout
+// reads, `reconcileAndReadRowState`, the retry timer's row read, the
+// latch-time read) and E14's shared own-row `get` read at its callers (the
+// collision `get`, the ErrJsonlMissing diagnosis `get`, the transcript `get`
+// and the post-run `get` after `unverified_ids`, the last in the find-missing
+// describes above). Nothing is called after the answer: no delete, kill,
+// spawn, `resume`, pane read, keystroke or raw tmux call; no spawn-failure
+// notice, `spawn-failed` entry or counted failure; no `tmux-unresponsive`
+// onset and no unclassified-error episode; one SRJ-1019 post after the holds.
+// Each case iterates `UNUSABLE_NAME_CASE_ROWS` for its site kind
+// (`tests/test-helpers/conflict-cases.ts`), so every fault the stub builds is
+// met at every site. Controls: a phrase-less `ErrInternal` keeps E12's
+// UNCLASSIFIED handling, the persona teardown's kill and delete still rethrow
+// and latch nothing, and B launches beside a latched P. Every case runs on
+// `makeRecoveryHarness` (its latch and configured-persona query installed as
+// `main()` installs them); `srj105AfterEach` runs `assertNoLeak` over what it
+// captured, and the file's `afterEach` clears the session notifier, the latch
+// install and the configured-persona query.
+// ---------------------------------------------------------------------------
+
+/** The case-table rows of one site kind: one per fault the stub builds. */
+function unusableNameRowsAt(site: UnusableNameSite): readonly UnusableNameCaseRow[] {
+  return UNUSABLE_NAME_CASE_ROWS.filter((row) => row.site === site)
+}
+
+/** The session manager's UNUSABLE NAME lines for persona `key` (one per answer it met), at a launch (`"P" (key=P)`) or a check (`persona=P`). */
+function unusableNameLinesOf(h: RecoveryHarness, key: string): string[] {
+  return h.errors.filter(
+    (line) =>
+      line.includes(' — UNUSABLE NAME: ') &&
+      (line.includes(` for ${renderPersonaRef(key, key)}: `) || line.includes(` for persona=${key}: `)) &&
+      line.endsWith('(b.jg5 SRJ-105, SRJ-512)'),
+  )
+}
+
+/**
+ * P latched once on `row`'s answer: its record (the row's case, "none",
+ * `rowState`, the session and the classification's description), the set and
+ * the three holds before the one SRJ-1019 post, one UNUSABLE NAME line, and
+ * nothing counted, posted as a spawn failure (only the `noticesBefore` the
+ * path posted before the answer), recorded `spawn-failed`, armed, refused,
+ * started as `tmux-unresponsive` or reported to the unclassified-error
+ * episode.
+ */
+function expectUnusableNameLatchedOnce(
+  h: RecoveryHarness,
+  p: string,
+  row: UnusableNameCaseRow,
+  rowState: LatchRowState,
+  noticesBefore = 0,
+): void {
+  expect(h.latch.isLatched(p)).toBe(true)
+  expect(h.latch.record(p)).toStrictEqual({
+    sessionName: row.sessionName(p),
+    latchCase: row.latchCase,
+    refusedOperation: row.refusedOperation,
+    rowState,
+    description: row.description,
+  })
+  expect(h.latchEvents.map((event) => [event.step, event.key])).toEqual(ONE_LATCH_STEPS.map((step) => [step, p]))
+  expect(h.latchEvents[0]).toMatchObject({ step: 'set', key: p, outcome: CONFLICT_LATCH_SET_LATCHED })
+  expect(h.episodeNotices).toEqual([{ key: p, text: row.notice(p) }])
+  expect(h.notices.map((n) => n.key)).toEqual(Array.from({ length: noticesBefore }, () => p))
+  expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  expect(getFailureCount(p)).toBe(0)
+  expect(h.controller.isArmed(p)).toBe(false)
+  expect(h.triggers).toEqual([])
+  expect(refusalLines(h, p)).toEqual([])
+  expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+  expect(conditionStartedLines(h, p)).toEqual([])
+  expect(unclassifiedStartedLines(h, p)).toEqual([])
+  expect(h.unclassifiedErrorOpen(p)).toBe(false)
+  const lines = unusableNameLinesOf(h, p)
+  expect(lines).toHaveLength(1)
+  expect(lines[0]).toContain(' — UNUSABLE NAME: the persona latched; ')
+}
+
+/**
+ * Record every raw tmux call into `order` (the call order `recordCallOrder`
+ * keeps), as `tmux <what>`: the b.vub session kill, the server ensurer, the
+ * session probe (answering `alive`), and the dialog approver's pane capture
+ * and Enter. The file's `afterEach` puts every seam back.
+ */
+function recordRawTmux(order: string[], alive: boolean): void {
+  _setTmuxSessionKiller(async () => {
+    order.push('tmux kill-session')
+  })
+  _setTmuxServerEnsurer(async () => {
+    order.push('tmux ensure-server')
+  })
+  _setTmuxSessionProber(async () => {
+    order.push('tmux has-session')
+    return alive
+  })
+  _setTmuxCapturePane(async () => {
+    order.push('tmux capture-pane')
+    return ''
+  })
+  _setTmuxSendEnter(async () => {
+    order.push('tmux send-enter')
+  })
+}
+
+/**
+ * Every agent-director and raw tmux call from now on, in call order: the
+ * stub's verbs (`recordCallOrder`) and the raw tmux seams (`recordRawTmux`),
+ * the session probe answering as the one in place does for P now.
+ */
+async function recordEveryCall(h: RecoveryHarness, p: string): Promise<string[]> {
+  const alive = await hasPersonaTmuxSession(p)
+  const order = recordCallOrder(h)
+  recordRawTmux(order, alive)
+  return order
+}
+
+/** A spawn, `resume`, kill or delete of the collision ladder where P's launch meets an UNUSABLE NAME answer. */
+interface UnusableLadderSite extends Omit<LatchSite, 'verb'> {
+  /** The site kind of `UNUSABLE_NAME_CASE_ROWS` whose rows it meets. */
+  readonly kind: UnusableNameSite
+  /** The stub client's method for the refused call. */
+  readonly verb: 'spawn' | 'resume' | 'kill' | 'delete'
+}
+
+/** The kill of each delete-then-spawn chain: nothing is deleted or launched after it. */
+const UNUSABLE_KILL_SITES: readonly UnusableLadderSite[] = [
+  {
+    name: 'the kill of a replacement (resume_enabled false, an ended row)',
+    kind: 'ladder kill',
+    verb: 'kill',
+    setup: noResume,
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), killError: err }),
+    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
+    reads: { get: 1, status: 0 },
+    lastRead: ENDED_READ,
+  },
+  {
+    name: 'the kill of a replacement (a row in another directory read waiting)',
+    kind: 'ladder kill',
+    verb: 'kill',
+    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'waiting')), killError: err }),
+    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
+    reads: { get: 1, status: 0 },
+    lastRead: WAITING_READ,
+  },
+  {
+    name: 'the kill of a replacement (a row in another directory read ended)',
+    kind: 'ladder kill',
+    verb: 'kill',
+    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'ended')), killError: err }),
+    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
+    reads: { get: 1, status: 0 },
+    lastRead: ENDED_READ,
+  },
+  {
+    name: 'the kill of a replacement (a waiting row with no config_dir label, after its reconnect\'s dead-session verdict)',
+    kind: 'ladder kill',
+    verb: 'kill',
+    script: (h, p, err) => ({ ...collided(h, p, unlabelledWaitingRow(h, p)), sendKeysError: errSpawnNotInteractive('send-keys'), killError: err }),
+    calls: ladderCallsOf({ spawn: 1, sendKeys: 1, kill: 1 }),
+    reads: { get: 1, status: 0 },
+    lastRead: WAITING_READ,
+  },
+  {
+    name: 'the kill after the resume\'s ErrSpawnNotResumable (an ended row)',
+    kind: 'ladder kill',
+    verb: 'kill',
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: err }),
+    calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1 }),
+    reads: { get: 1, status: 0 },
+    lastRead: ENDED_READ,
+  },
+]
+
+/** The delete of each delete-then-spawn chain: nothing is launched after it. */
+const UNUSABLE_DELETE_SITES: readonly UnusableLadderSite[] = [
+  {
+    name: 'the delete of a replacement (resume_enabled false, an ended row), after its kill',
+    kind: 'ladder delete',
+    verb: 'delete',
+    setup: noResume,
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), deleteError: err }),
+    calls: ladderCallsOf({ spawn: 1, kill: 1, delete: 1 }),
+    reads: { get: 1, status: 0 },
+    lastRead: ENDED_READ,
+  },
+  {
+    name: 'the delete of a replacement (a row in another directory read waiting), after its kill',
+    kind: 'ladder delete',
+    verb: 'delete',
+    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'waiting')), deleteError: err }),
+    calls: ladderCallsOf({ spawn: 1, kill: 1, delete: 1 }),
+    reads: { get: 1, status: 0 },
+    lastRead: WAITING_READ,
+  },
+  {
+    name: 'the delete of a replacement (an ended row with no config_dir label)',
+    kind: 'ladder delete',
+    verb: 'delete',
+    script: (h, p, err) => ({ ...collided(h, p, unlabelledRow(h, p, 'ended')), deleteError: err }),
+    calls: ladderCallsOf({ spawn: 1, delete: 1 }),
+    reads: { get: 1, status: 0 },
+    lastRead: ENDED_READ,
+  },
+  {
+    name: 'the delete after the resume\'s ErrSpawnNotResumable and its kill (an ended row)',
+    kind: 'ladder delete',
+    verb: 'delete',
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), deleteError: err }),
+    calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1, delete: 1 }),
+    reads: { get: 1, status: 0 },
+    lastRead: ENDED_READ,
+  },
+  {
+    name: 'the delete after the resume\'s ErrNoSessionId (an ended row)',
+    kind: 'ladder delete',
+    verb: 'delete',
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errNoSessionId(), deleteError: err }),
+    calls: ladderCallsOf({ spawn: 1, resume: 1, delete: 1 }),
+    reads: { get: 1, status: 0 },
+    lastRead: ENDED_READ,
+  },
+  {
+    name: 'the delete after the resume\'s ErrJsonlMissing and its diagnosis get (reading missing after the collision get read ended)',
+    kind: 'ladder delete',
+    verb: 'delete',
+    script: (h, p, err) => ({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk(harnessRow(h, p, { state: 'ended' })), cannedOk(harnessRow(h, p, { state: 'missing' }))],
+      resumeError: errJsonlMissing(),
+      deleteError: err,
+    }),
+    calls: ladderCallsOf({ spawn: 1, resume: 1, delete: 1 }),
+    reads: { get: 2, status: 0 },
+    lastRead: MISSING_READ,
+    // The inconclusive diagnosis (no message archive) reports before the delete.
+    noticesBefore: 1,
+  },
+]
+
+/** Every ladder site: each spawn (`plain spawn`) and `resume` of E13's CONFLICT sites, and each kill and delete above. */
+const UNUSABLE_LADDER_SITES: readonly UnusableLadderSite[] = [
+  ...LATCH_SPAWN_SITES.map((site) => ({ ...site, kind: 'plain spawn' as const })),
+  ...LATCH_RESUME_SITES.map((site) => ({ ...site, kind: 'resume' as const })),
+  ...UNUSABLE_KILL_SITES,
+  ...UNUSABLE_DELETE_SITES,
+]
+
+/** Each ladder site crossed with every row of its site kind. */
+const UNUSABLE_LADDER_CROSS = UNUSABLE_LADDER_SITES.flatMap((site) =>
+  unusableNameRowsAt(site.kind).map((row) => [site.name, row.fault, site, row] as const),
+)
+
+describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a spawn, resume, kill or delete of the collision ladder latches the persona; nothing else is done for it', () => {
+  afterEach(srj105AfterEach)
+
+  test.each(UNUSABLE_LADDER_CROSS)('%s answering UNUSABLE NAME (%s): latched with "unusable recorded name", "none" and the state the path last read (one latch-time status read only where it read nothing); the refused call is the last, raw tmux included; one post after the holds; nothing counted, posted as a spawn failure, armed or started; then no launch path reaches agent-director; B launches', async (_site, _fault, site, row) => {
+    const { h, p, b } = srj105Build()
+    const persona = harnessPersona(h, p)
+    site.setup?.(h)
+    const script = site.script(h, persona, row.build(), row)
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    const latchTimeReads = site.lastRead === undefined ? 1 : 0
+    expect(ladderCallsMade(h)).toEqual(site.calls)
+    expect(h.stub.calls.getCalls).toHaveLength(site.reads.get)
+    expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual(Array(site.reads.status + latchTimeReads).fill(personaInstanceId(p)))
+    expect(order.slice(order.lastIndexOf(site.verb))).toEqual([site.verb, ...(latchTimeReads === 1 ? ['status'] : [])])
+    expectUnusableNameLatchedOnce(h, p, row, site.lastRead ?? row.rowState, site.noticesBefore)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  // SRJ-1015: launchSession answers 'skipped' for a launch that latches on an
+  // UNUSABLE NAME answer, as for a CONFLICT: never counted, no spawn-failure
+  // notice. One site of each kind.
+  test.each(UNUSABLE_LADDER_SITES.filter((site, i, all) => all.findIndex((s) => s.kind === site.kind) === i).map((site) => [site.kind, site] as const))('b.jg5 SRJ-1015: launchSession whose launch meets UNUSABLE NAME at the first %s site answers \'skipped\': P latched, nothing counted, no spawn-failure notice, one post', async (_kind, site) => {
+    const { h, p } = srj105Build()
+    const row = unusableNameRowsAt(site.kind)[0]!
+    site.setup?.(h)
+    h.script(site.script(h, harnessPersona(h, p), row.build(), row))
+
+    expect(await launchSession(p, h.config)).toBe('skipped')
+
+    expect(h.latch.record(p)?.latchCase).toBe(row.latchCase)
+    expect(ladderCallsMade(h)).toEqual(site.calls)
+    expect(getFailureCount(p)).toBe(0)
+    expect(h.notices).toHaveLength(site.noticesBefore ?? 0)
+    expect(h.episodeNotices.filter((n) => n.key === p)).toEqual([{ key: p, text: row.notice(p) }])
+  })
+
+  test('b.jg5 SRJ-502, SRJ-1015: a persona latched on an UNUSABLE NAME answer during the start pass is listed latched and counted neither failed nor succeeded, with no spawn-failed entry; B is counted', async () => {
+    const { h, p, b } = srj105Build()
+    const row = unusableNameRowsAt('plain spawn')[0]!
+    const pId = personaInstanceId(p)
+    h.script({
+      spawnQueue: [cannedErr(row.build())],
+      statusFn: (params) => (params.claude_instance_id === pId ? errSpawnNotFound() : cannedStatusResult()),
+    })
+
+    const result = await startupSessionManager(h.config, { concurrency: 1 })
+
+    expect(result.perPersona).toEqual([
+      { key: p, action: 'latched' },
+      { key: b, action: 'spawned' },
+    ])
+    expect(result.failed).toBe(0)
+    expect(result.succeeded).toBe(1)
+    expectUnusableNameLatchedOnce(h, p, row, LATCH_ROW_STATE_NO_ROW)
+  })
+})
+
+/** How the working-row wait's evidence read is reached: directly, or through the launch's collision ladder. */
+const PANE_WAIT_CROSS = WAIT_ENTRIES.flatMap(([entry, before]) => unusableNameRowsAt('read-pane').map((row) => [entry, row.fault, before, row] as const))
+
+describe('b.jg5 SRJ-117, SRJ-512, SRJ-502: an UNUSABLE NAME answer at a working-pane read latches the persona with the state its caller last read; nothing is typed', () => {
+  afterEach(srj105AfterEach)
+
+  test.each(PANE_WAIT_CROSS)('the working-row wait entered by %s, its evidence pane read answering UNUSABLE NAME (%s): P latched with the state its poll read (working); the wait ends latched with no further call, though the next poll would read waiting; nothing typed, no not-connected notice', async (_entry, _fault, before, row) => {
+    const { h, p, b } = srj105Build()
+    fastPolls(h)
+    const script: RecoveryStubScript = {
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getResult: harnessRow(h, harnessPersona(h, p), { state: 'working' }),
+      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
+      statusResult: cannedStatusResult({ state: 'waiting' }),
+      readPaneError: row.build(),
+    }
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    if (before.length === 0) {
+      expect(await waitForWaitingAndReconnect(p, h.config)).toBe(WAIT_OUTCOME_LATCHED)
+    } else {
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+    }
+
+    expect(order).toEqual([...before, 'findMissing', 'status', 'readPane'])
+    expect(h.stub.calls.readPaneCalls).toEqual([{ claude_instance_id: personaInstanceId(p), n_lines: 40 }])
+    expect(waitLatchedLines(h)).toHaveLength(1)
+    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
+    expectUnusableNameLatchedOnce(h, p, row, WORKING_READ)
+
+    if (before.length > 0) await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  test.each(unusableNameRowsAt('read-pane').map((row) => [row.fault, row] as const))('the restart path\'s working-row check (checkWorkingRowPane), its pane read answering UNUSABLE NAME (%s): defer, P latched with the row read working; no transcript get, nothing typed, no evidence pending, no notice', async (_fault, row) => {
+    const { h, p } = srj105Build()
+    h.script({ readPaneError: row.build() })
+    const order = await recordEveryCall(h, p)
+
+    expect(await checkWorkingRowPane(p, harnessPersona(h, p))).toBe('defer')
+
+    expect(order).toEqual(['readPane'])
+    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
+    expect(h.errors.filter((line) => line.startsWith(`[slack] reconnectSession: persona=${p} is working and is latched — deferring; `))).toHaveLength(1)
+    expectUnusableNameLatchedOnce(h, p, row, WORKING_READ)
+  })
+
+  test.each(unusableNameRowsAt('get').map((row) => [row.fault, row] as const))('the restart path\'s working-row check (checkWorkingRowPane), its transcript get after an idle pane answering UNUSABLE NAME (%s): defer, P latched with the state unreadable; nothing typed, no evidence pending, no notice', async (_fault, row) => {
+    const { h, p } = srj105Build()
+    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getError: row.build() })
+    const order = await recordEveryCall(h, p)
+
+    expect(await checkWorkingRowPane(p, harnessPersona(h, p))).toBe('defer')
+
+    expect(order).toEqual(['readPane', 'get'])
+    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
+    expectUnusableNameLatchedOnce(h, p, row, LATCH_ROW_STATE_UNREADABLE)
+  })
+
+  test.each(unusableNameRowsAt('read-pane').map((row) => [row.fault, row] as const))('the restart path\'s waiting-row check (checkWaitingRowPane), its pane read answering UNUSABLE NAME (%s): defer, never reconnect; P latched with the row read waiting; nothing typed, no notice', async (_fault, row) => {
+    const { h, p } = srj105Build()
+    h.script({ readPaneError: row.build() })
+    const order = await recordEveryCall(h, p)
+
+    expect(await checkWaitingRowPane(p)).toBe('defer')
+
+    expect(order).toEqual(['readPane'])
+    expect(h.errors.filter((line) => line.startsWith(`[slack] reconnectSession: persona=${p} is waiting and is latched — deferring; nothing typed`))).toHaveLength(1)
+    expectUnusableNameLatchedOnce(h, p, row, WAITING_READ)
+  })
+})
+
+/** Who reads, for the shared `status` read's direct cases. */
+const STATUS_READ_SITE: OwnRowReadSite = { site: 'test', what: 'own-row status read' }
+
+/** A `status` site of the session manager where P's launch meets the answer, its stub answers and the calls it makes. */
+interface StatusSite {
+  readonly name: string
+  setup?(h: RecoveryHarness): void
+  script(h: RecoveryHarness, persona: Persona, err: Error): RecoveryStubScript
+  readonly calls: LaunchVerbCalls
+}
+
+const UNUSABLE_STATUS_SITES: readonly StatusSite[] = [
+  {
+    name: 'the working-row wait\'s poll status',
+    setup: fastPolls,
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusError: err }),
+    calls: ladderCallsOf({ spawn: 1 }),
+  },
+  {
+    name: 'the working-row wait\'s timeout status (every poll read working)',
+    setup: shortWait,
+    script: (h, p, err) => {
+      const sweepsBefore = h.stub.calls.findMissingCalls.length
+      return {
+        ...collided(h, p, { state: 'working' }),
+        readPaneResults: [{ pane: SPINNER_PANE }],
+        statusFn: () => (h.stub.calls.findMissingCalls.length >= sweepsBefore + 2 ? err : cannedStatusResult({ state: 'working' })),
+      }
+    },
+    calls: ladderCallsOf({ spawn: 1 }),
+  },
+  {
+    name: 'the re-read after the sweep of a check_permission row whose tmux session is gone (reconcileAndReadRowState)',
+    setup: tmuxSessionsGone,
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'check_permission' }), statusError: err }),
+    calls: ladderCallsOf({ spawn: 1 }),
+  },
+]
+
+describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and an UNUSABLE NAME answer at each of its sites', () => {
+  afterEach(srj105AfterEach)
+
+  test.each<[string, RecoveryStubScript, Awaited<ReturnType<typeof readPersonaOwnRowStatus>>]>([
+    [
+      'a pending row showing its launch start: state, with the launch start raw',
+      { statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_FRACTIONAL }) },
+      { kind: OWN_ROW_STATUS_STATE, state: AGENT_DIRECTOR_PENDING_STATE, launchStartedAt: SAMPLE_LAUNCH_START_FRACTIONAL },
+    ],
+    ['a waiting row: state, with no launch start key', { statusResult: cannedStatusResult({ state: 'waiting' }) }, { kind: OWN_ROW_STATUS_STATE, state: 'waiting' }],
+    ['no row (ErrSpawnNotFound): absent', { statusError: errSpawnNotFound() }, { kind: OWN_ROW_STATUS_ABSENT }],
+  ])('%s, from one status call of P\'s own row; nothing latched or posted', async (_label, script, expected) => {
+    const { h, p } = srj105Build()
+    h.script(script)
+
+    expect(await readPersonaOwnRowStatus(p, STATUS_READ_SITE)).toStrictEqual(expected)
+
+    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.callCount()).toBe(1)
+    expectNoNoteLatch(h)
+  })
+
+  test('any other error (UNAVAILABLE ErrTmuxUnresponsive): refused, carrying the same value; nothing latched or posted', async () => {
+    const { h, p } = srj105Build()
+    const err = errTmuxUnresponsive('status')
+    h.script({ statusError: err })
+
+    const read = await readPersonaOwnRowStatus(p, STATUS_READ_SITE)
+
+    expect(read.kind).toBe(OWN_ROW_STATUS_REFUSED)
+    expect(read.kind === OWN_ROW_STATUS_REFUSED && read.error).toBe(err)
+    expect(h.stub.callCount()).toBe(1)
+    expectNoNoteLatch(h)
+  })
+
+  test.each(unusableNameRowsAt('status').map((row) => [row.fault, row] as const))('an UNUSABLE NAME answer (%s): latched, with the state unreadable; P latched once from that one call, one post', async (_fault, row) => {
+    const { h, p } = srj105Build()
+    h.script({ statusError: row.build() })
+
+    expect(await readPersonaOwnRowStatus(p, STATUS_READ_SITE)).toStrictEqual({ kind: OWN_ROW_STATUS_LATCHED, rowState: LATCH_ROW_STATE_UNREADABLE })
+
+    expect(h.stub.callCount()).toBe(1)
+    expectUnusableNameLatchedOnce(h, p, row, LATCH_ROW_STATE_UNREADABLE)
+  })
+
+  const statusCross = UNUSABLE_STATUS_SITES.flatMap((site) => unusableNameRowsAt('status').map((row) => [site.name, row.fault, site, row] as const))
+  test.each(statusCross)('a launch whose %s answers UNUSABLE NAME (%s): latched, P latched with the state unreadable; that read is the last call, raw tmux included: no tmux fallback, no resume, nothing typed; then no launch path reaches agent-director; B launches', async (_site, _fault, site, row) => {
+    const { h, p, b } = srj105Build()
+    site.setup?.(h)
+    const script = site.script(h, harnessPersona(h, p), row.build())
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order.at(-1)).toBe('status')
+    expect(ladderCallsMade(h)).toEqual(site.calls)
+    expectUnusableNameLatchedOnce(h, p, row, LATCH_ROW_STATE_UNREADABLE)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  test.each(unusableNameRowsAt('status').map((row) => [row.fault, row] as const))('the retry timer\'s row read (readPersonaRowState) answering UNUSABLE NAME (%s): the state as the latch recorded it (unreadable), P latched; a pending-only retry makes that one call and stops with the latch\'s reason, handing nothing on', async (_fault, row) => {
+    const { h, p } = srj105Build()
+    h.script({ statusError: row.build() })
+    h.controller.armPendingOnly(p)
+
+    await retryNow(h, p)
+
+    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.callCount()).toBe(1)
+    expect(h.stops.filter((stop) => stop.key === p).map((stop) => stop.reason)).toEqual([UNAVAILABLE_RETRY_STOP_LATCHED])
+    expect(h.restartAsks).toEqual([])
+    expectUnusableNameLatchedOnce(h, p, row, LATCH_ROW_STATE_UNREADABLE)
+
+    // The read itself answers the recorded state, with no further call.
+    expect(await readPersonaRowState(p)).toStrictEqual({ state: describeLatchRowState(LATCH_ROW_STATE_UNREADABLE) })
+    expect(h.stub.callCount()).toBe(2)
+    expect(h.latch.record(p)?.rowState).toEqual(LATCH_ROW_STATE_UNREADABLE)
+    expect(h.episodeNotices).toHaveLength(1)
+  })
+
+  // The latch-time read (b.jg5 SRJ-501) answering UNUSABLE NAME records
+  // unreadable and makes no second read: that answer's own latch stands, so a
+  // CONFLICT that asked for it posts no CONFLICT notice, and a spawn's
+  // UNUSABLE NAME that asked for it sets nothing more.
+  test.each(unusableNameRowsAt('status').map((row) => [row.fault, row] as const))('a CONFLICT at the first spawn whose latch-time read answers UNUSABLE NAME (%s): one status read; P latched with "unusable recorded name", unreadable, and only the SRJ-1019 post; the CONFLICT line says the read\'s latch stands', async (_fault, row) => {
+    const { h, p, b } = srj105Build()
+    const script: RecoveryStubScript = { spawnError: conflictRowsFor('spawn')[0]!.build(), statusError: row.build() }
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(['spawn', 'status'])
+    const conflictLines = conflictLinesIn(h.errors, p)
+    expect(conflictLines).toHaveLength(1)
+    expect(conflictLines[0]).toContain(' — CONFLICT: the latch-time status read latched the persona, so that latch stands; ')
+    expectUnusableNameLatchedOnce(h, p, row, LATCH_ROW_STATE_UNREADABLE)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  test.each(unusableNameRowsAt('status').map((row) => [row.fault, row] as const))('an UNUSABLE NAME at the first spawn whose latch-time read answers UNUSABLE NAME too (%s): one status read; the read\'s latch (unreadable, its own description) stands and nothing more is set; one post', async (_fault, row) => {
+    const { h, p, b } = srj105Build()
+    const spawnRow = unusableNameRowsAt('plain spawn').find((r) => r.fault !== row.fault)!
+    const script: RecoveryStubScript = { spawnError: spawnRow.build(), statusError: row.build() }
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(['spawn', 'status'])
+    const lines = unusableNameLinesOf(h, p)
+    expect(lines).toHaveLength(2)
+    expect(lines[1]).toContain(' — UNUSABLE NAME: the latch-time status read latched the persona, so that latch stands; ')
+    expect(h.latch.record(p)).toStrictEqual({
+      sessionName: row.sessionName(p),
+      latchCase: row.latchCase,
+      refusedOperation: row.refusedOperation,
+      rowState: LATCH_ROW_STATE_UNREADABLE,
+      description: row.description,
+    })
+    expect(h.latchEvents.map((event) => event.step)).toEqual([...ONE_LATCH_STEPS])
+    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice(p) }])
+    expect(getFailureCount(p)).toBe(0)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+})
+
+/** A `get` of P's own row through E14's shared read, where P's launch meets the answer. */
+interface GetSite {
+  readonly name: string
+  setup?(h: RecoveryHarness): void
+  script(h: RecoveryHarness, persona: Persona, err: Error): RecoveryStubScript
+  readonly calls: LaunchVerbCalls
+  readonly reads: { readonly get: number; readonly status: number }
+}
+
+const UNUSABLE_GET_SITES: readonly GetSite[] = [
+  {
+    name: 'the collision get',
+    script: (_h, _p, err) => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: err }),
+    calls: ladderCallsOf({ spawn: 1 }),
+    reads: { get: 1, status: 0 },
+  },
+  {
+    name: 'the ErrJsonlMissing diagnosis get (no diagnosis is reported)',
+    script: (h, p, err) => jsonlMissingDiagnosisGets(h, p, cannedErr(err)),
+    calls: ladderCallsOf({ spawn: 1, resume: 1 }),
+    reads: { get: 2, status: 0 },
+  },
+  {
+    // The wait's first poll reads working and its pane idle, so it reads the
+    // transcript; every later poll would read waiting.
+    name: 'the transcript get of the working-row wait (an idle pane)',
+    setup: fastPolls,
+    script: (h, p, err) => ({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk(harnessRow(h, p, { state: 'working' })), cannedErr(err)],
+      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
+      statusResult: cannedStatusResult({ state: 'waiting' }),
+      readPaneResults: [{ pane: IDLE_PANE }],
+    }),
+    calls: ladderCallsOf({ spawn: 1 }),
+    reads: { get: 2, status: 1 },
+  },
+]
+
+describe('b.jg5 SRJ-114, SRJ-105, SRJ-512: an UNUSABLE NAME answer at E14\'s shared own-row get read latches the persona and its caller stops', () => {
+  afterEach(srj105AfterEach)
+
+  const getCross = UNUSABLE_GET_SITES.flatMap((site) => unusableNameRowsAt('get').map((row) => [site.name, row.fault, site, row] as const))
+  test.each(getCross)('%s answering UNUSABLE NAME (%s): latched, P latched with the state unreadable; that get is the last call, raw tmux included; no diagnosis, spawn-failure notice or startup entry; then no launch path reaches agent-director; B launches', async (_site, _fault, site, row) => {
+    const { h, p, b } = srj105Build()
+    site.setup?.(h)
+    const script = site.script(h, harnessPersona(h, p), row.build())
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order.at(-1)).toBe('get')
+    expect(ladderCallsMade(h)).toEqual(site.calls)
+    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual(Array(site.reads.get).fill(personaInstanceId(p)))
+    expect(h.stub.calls.statusCalls).toHaveLength(site.reads.status)
+    const log = h.startupErrors().join('\n')
+    expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(h.errors.filter((line) => line.includes('could not fetch the agent-director row'))).toEqual([])
+    expectUnusableNameLatchedOnce(h, p, row, LATCH_ROW_STATE_UNREADABLE)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+})
+
+describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrInternal keeps E12\'s UNCLASSIFIED handling, and the persona teardown latches nothing', () => {
+  afterEach(srj105AfterEach)
+
+  test('a phrase-less ErrInternal at the resume of an ended row: refused as UNCLASSIFIED (one refusal line, P armed with the UNCLASSIFIED cause, reported to P\'s unclassified-error episode), never latched; B launches', async () => {
+    const site = SPAWN_AND_RESUME_SITES.find((s) => s.name === 'the resume of an ended row')!
+    const { h, p } = await expectRefusedAt(site, errInternal(), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED)
+
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(h.latchEvents).toEqual([])
+    expect(unusableNameLinesOf(h, p)).toEqual([])
+    expect(h.unclassifiedErrorOpen(p)).toBe(true)
+  })
+
+  test('a phrase-less ErrInternal at the shared own-row status read: refused, carrying the same value; never latched', async () => {
+    const { h, p } = srj105Build()
+    const err = errInternal()
+    h.script({ statusError: err })
+
+    const read = await readPersonaOwnRowStatus(p, STATUS_READ_SITE)
+
+    expect(read.kind === OWN_ROW_STATUS_REFUSED && read.error).toBe(err)
+    expectNoNoteLatch(h)
+    expect(unusableNameLinesOf(h, p)).toEqual([])
+  })
+
+  test('a phrase-less ErrInternal at the waiting-row check\'s pane read: reconnect on the waiting row alone, as for any failed read; never latched', async () => {
+    const { h, p } = srj105Build()
+    h.script({ readPaneError: errInternal() })
+
+    expect(await checkWaitingRowPane(p)).toBe('reconnect')
+
+    expectNoNoteLatch(h)
+    expect(unusableNameLinesOf(h, p)).toEqual([])
+  })
+
+  test.each<[string, UnusableNameSite, (key: string) => Promise<boolean>, keyof RecoveryStubScript]>([
+    ['killPersonaInstance', 'ladder kill', (key) => killPersonaInstance(key), 'killError'],
+    ['deletePersonaInstance', 'ladder delete', (key) => deletePersonaInstance(key), 'deleteError'],
+  ])('the persona teardown\'s %s answering UNUSABLE NAME still rethrows the same value and latches nothing: no set, no post, no UNUSABLE NAME line', async (_name, kind, call, knob) => {
+    const { h, p } = srj105Build()
+    const err = unusableNameRowsAt(kind)[0]!.build()
+    h.script({ [knob]: err })
+
+    let thrown: unknown
+    try {
+      await call(p)
+    } catch (e) {
+      thrown = e
+    }
+
+    expect(thrown).toBe(err)
+    expectNoNoteLatch(h)
+    expect(unusableNameLinesOf(h, p)).toEqual([])
+    expect(h.notices).toEqual([])
   })
 })

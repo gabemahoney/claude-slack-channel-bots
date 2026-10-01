@@ -37,8 +37,11 @@
  * (`PERSONA_EPISODE_KINDS`). `tmux-unresponsive`'s episode is begun and
  * ended by its condition (below), which posts its onset, alert and recovery;
  * `unclassified-error`'s by its episodes (below), which post its one alert;
- * CONFLICT's is begun by the conflict latch's notice reaction
- * (`src/conflict-latch.ts`), which posts its one notice per episode;
+ * CONFLICT's and `unusable-recorded-name`'s are begun by the conflict latch's
+ * one notice reaction (`src/conflict-latch.ts`), which posts each kind's one
+ * notice per episode and, when it begins one, ends the persona's open
+ * episodes of the other latch kinds silently (it begins
+ * `launch-start-not-recorded`'s too, but posts nothing in it yet);
  * every other kind has no poster yet: its begin and end triggers and text
  * come with the Epic that posts it, named on its label below.
  *
@@ -272,15 +275,28 @@ import {
  * reaction (`createConflictNoticeObserver`, bound in `main()` by
  * `bindConflictNotice`, `src/conflict-latch.ts`): a latch or a relatch with a
  * new case begins the episode with its case and posts the CONFLICT notice
- * once; the same case keeps it and posts nothing. Its end, at the latch's
- * clear, is E30's.
+ * once; the same case keeps it and posts nothing; a latch of a hold case ends
+ * it silently. Its end, at the latch's clear, is E30's.
  */
 export const PERSONA_EPISODE_KIND_CONFLICT = 'conflict'
 
-/** Unusable recorded name (SRJ-512): from the latch being set until it clears. No poster yet (b.jg5 E16). */
+/**
+ * Unusable recorded name (SRJ-512, SRJ-1019): from the latch being set until
+ * it clears. Posted by the conflict latch's notice reaction
+ * (`createConflictNoticeObserver`, bound in `main()` by `bindConflictNotice`,
+ * `src/conflict-latch.ts`): a latch, or a relatch from another case, begins
+ * the episode and posts SRJ-1019 once; a latch of another kind ends it
+ * silently. Its end, at the latch's clear, is E30's.
+ */
 export const PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME = 'unusable-recorded-name'
 
-/** Launch start not recorded (SRJ-513): from the latch being set until it clears. No poster yet (b.jg5 E16). */
+/**
+ * Launch start not recorded (SRJ-513, SRJ-1020): from the latch being set
+ * until it clears. Begun by the conflict latch's notice reaction
+ * (`createConflictNoticeObserver`, `src/conflict-latch.ts`), which ends it
+ * silently on a latch of another kind; it posts nothing yet (SRJ-1020's text
+ * is a row of that module's `HOLD_NOTICES` still to be built).
+ */
 export const PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED = 'launch-start-not-recorded'
 
 /**

@@ -50,9 +50,53 @@
  *     the forms a text matches. None matches agent-director's own "no kill was
  *     sent", "retry kill later" or "never delete this row". E16's, E29's and
  *     E36's text checks reuse them;
- *   - {@link cscbOwnLines}: a CONFLICT notice's lines without agent-director's
- *     quoted description line (found by `CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD`),
- *     so a check over CSCB's own words lets the quoted description through.
+ *   - {@link cscbOwnLines}: a notice's lines with agent-director's quoted
+ *     description taken out, so a check over CSCB's own words lets the quoted
+ *     description through. Two forms: a CONFLICT notice's description line
+ *     (SRJ-1004; the line that opens with `CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD`)
+ *     is dropped whole; a description quoted inside a sentence (SRJ-1019's
+ *     one-line notice) is cut out of its line, its frame and every CSCB word
+ *     kept ({@link withoutInlineDescription}). {@link cscbOwnText} joins the
+ *     lines back.
+ *
+ * Unusable-name rows (E16 T1, SRJ-512 and SRJ-1019), {@link UNUSABLE_NAME_CASE_ROWS}:
+ * one row per fault in the stub's `UNUSABLE_NAME_FAULTS` for each verb site
+ * kind T1 wires ({@link UNUSABLE_NAME_SITES}: `resume`, a plain spawn, the
+ * ladder's kill, the ladder's delete, `read-pane`, `status`, `get`). Columns
+ * ({@link UnusableNameCaseRow}):
+ *   - `name` (`<site>: <fault>`), `site`, `verb` (the agent-director verb
+ *     that answers), `fault`, and `build`, a thunk building the stub's
+ *     `errUnusableName(fault)`;
+ *   - `latchCase` and `refusedOperation`: "unusable recorded name" and
+ *     "none" (`LATCH_CASE_UNUSABLE_RECORDED_NAME`, `REFUSED_OPERATION_NONE`);
+ *   - `rowState`: the row state the path records. A `status` or a `get`
+ *     that itself answers UNUSABLE NAME records unreadable. The others
+ *     record the state the path last read: `ended` for `resume` and for the
+ *     ladder's kill and delete (the finished-row path, a `resume` answering
+ *     `ErrSpawnNotResumable` for the kill), `working` for `read-pane` (the
+ *     launch wait's evidence read and `checkWorkingRowPane`). The plain spawn
+ *     is the first spawn, which read nothing before it, so its state comes
+ *     from the one latch-time `status` read (`latchTimeRead: true`); the row
+ *     expects no row, so a case arranges that read to answer
+ *     `ErrSpawnNotFound`;
+ *   - `latchTimeRead`: true when the recorded state comes from the latch-time
+ *     `status` read rather than from a read the path made before the call;
+ *   - `description`: the classification's message (`classifyAdError(...)
+ *     .message`: redacted, on one line, capped), which the record holds;
+ *   - `notice(key)`: the SRJ-1019 notice for persona `key`, built by
+ *     `unusableNameNoticeText(key, description)` (its instance id from
+ *     `personaInstanceId`); `sessionName(key)`: the session the record holds,
+ *     `personaTmuxSessionName(key)` (the stub's descriptions quote none).
+ * The approver's and the reconnect's `send-keys` and a reuse spawn get no row
+ * here (E17, E19, E22).
+ *
+ * The tmux-touching verbs (SRJ-502), {@link TMUX_TOUCHING_STUB_VERBS} and
+ * {@link tmuxTouchingCallsIn}: `resume`, `spawn` in both forms (plain and
+ * `--reuse-finished`, both logged in `spawnCalls`), `read-pane`, `send-keys`,
+ * `kill` and `pause`, each with its stub call-log list, and the calls a stub
+ * log holds for them ({@link tmuxTouchingCallCounts} takes the log's lengths
+ * first, so a case can ask only for the calls made since). A test filters
+ * the stub's call log through these and never types the list itself.
  *
  * Per-persona CONFLICT helpers (shared by the recovery-harness cases, so no
  * test file keeps its own copy):
@@ -66,17 +110,19 @@
  *     persona's session name and the error's description.
  *
  * Columns added later: E14 adds the `provenance_conflict` note latch's rows
- * (P's bring-up, no builder call); E16 adds the "unusable recorded name" and
- * "launch start not recorded" rows; E30 adds the re-check's action and its
- * still-latched and cleared answers (SRJ-505), with a plain-spawn row per row
- * state step 1 can read.
+ * (P's bring-up, no builder call); E16 T2 adds the "launch start not
+ * recorded" rows and their SRJ-1020 notice; E30 adds the re-check's action
+ * and its still-latched and cleared answers (SRJ-505), with a plain-spawn row
+ * per row state step 1 can read, and the unusable-name rows' re-check
+ * (`status` only) and `ErrSpawnNotFound` clear columns.
  *
  * There is no "no pane 0.0" row: that case is withdrawn (rev 17; SRJ-507).
  *
  * No case word, notice text or session name is written here: the words reach
  * a row only through the stub, the notice's texts only through
  * `src/conflict-latch.ts`'s exports, and the session name is the stub's
- * `STUB_TMUX_SESSION_NAME` or, for a persona, `personaTmuxSessionName(key)`.
+ * `STUB_TMUX_SESSION_NAME` or, for a persona, `personaTmuxSessionName(key)`
+ * (its instance id `personaInstanceId(key)`).
  * No Phase-1-only export
  * is named, and no `mock.module()` is used.
  *
@@ -108,27 +154,39 @@ import {
   LATCH_CASE_OWN_ID,
   LATCH_CASE_PANE_NOT_FOUND,
   LATCH_CASE_UNRECOGNISED,
+  LATCH_CASE_UNUSABLE_RECORDED_NAME,
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
   REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+  REFUSED_OPERATION_NONE,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
   REFUSED_OPERATION_REUSE_SPAWN,
+  UNUSABLE_NAME_NOTICE_DESCRIPTION_END,
+  UNUSABLE_NAME_NOTICE_POINTER,
+  UNUSABLE_NAME_NOTICE_REASON,
+  UNUSABLE_NAME_NOTICE_SEPARATOR,
   latchRowStateRead,
   takesUnrecognisedHandling,
+  unusableNameNoticeText,
   type ConflictCaseWithSentence,
   type ConflictLatchCase,
   type LatchRowState,
   type RefusedOperation,
 } from '../../src/conflict-latch.ts'
+import { classifyAdError } from '../../src/ad-error-class.ts'
 import { renderLogMessageText } from '../../src/persona-connection-errors.ts'
 import { personaTmuxSessionName } from '../../src/persona-identity.ts'
 import { escapeSlackControlCharacters } from '../../src/slack-text-escape.ts'
 import {
   STUB_TMUX_SESSION_NAME,
+  UNUSABLE_NAME_FAULTS,
   errTmuxSessionConflict,
+  errUnusableName,
   type ConflictCase,
   type ConflictOptions,
+  type StubCallLog,
+  type UnusableNameFault,
 } from './agent-director-stub.ts'
 
 /** One refusal and what latching a persona on it records. */
@@ -245,14 +303,54 @@ export function expectedConflictNotice(source: ExpectedConflictNoticeSource): Ex
 }
 
 /**
- * CSCB's own lines of a CONFLICT notice: its lines without agent-director's
- * quoted description line, the one that opens with
- * `CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD`.
+ * Where SRJ-1019's notice opens its quoted description, inside its first
+ * sentence: the reason, then `agent-director said: "`.
+ */
+const INLINE_DESCRIPTION_OPEN = UNUSABLE_NAME_NOTICE_REASON + CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD
+
+/**
+ * Where SRJ-1019's notice closes its quoted description: the closing quote,
+ * the sentence's end, the separator and the pointer sentence.
+ */
+const INLINE_DESCRIPTION_CLOSE =
+  CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL +
+  UNUSABLE_NAME_NOTICE_DESCRIPTION_END +
+  UNUSABLE_NAME_NOTICE_SEPARATOR +
+  UNUSABLE_NAME_NOTICE_POINTER
+
+/**
+ * `line` with a description quoted inside a sentence cut out (SRJ-1019's
+ * form): everything between the first {@link INLINE_DESCRIPTION_OPEN} and
+ * the last {@link INLINE_DESCRIPTION_CLOSE} after it is removed, the frame
+ * itself and every other word kept. A line without that frame is returned
+ * as it is.
+ */
+export function withoutInlineDescription(line: string): string {
+  const open = line.indexOf(INLINE_DESCRIPTION_OPEN)
+  if (open === -1) return line
+  const start = open + INLINE_DESCRIPTION_OPEN.length
+  const close = line.lastIndexOf(INLINE_DESCRIPTION_CLOSE)
+  if (close < start) return line
+  return line.slice(0, start) + line.slice(close)
+}
+
+/**
+ * CSCB's own lines of a notice: its lines without agent-director's quoted
+ * description. A CONFLICT notice's description line (the one that opens with
+ * `CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD`) is dropped; a description quoted
+ * inside a sentence (SRJ-1019) is cut out of its line
+ * ({@link withoutInlineDescription}).
  */
 export function cscbOwnLines(notice: string): string[] {
   return notice
     .split(CONFLICT_NOTICE_LINE_SEPARATOR)
     .filter((line) => !line.startsWith(CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD))
+    .map(withoutInlineDescription)
+}
+
+/** {@link cscbOwnLines} joined back by `CONFLICT_NOTICE_LINE_SEPARATOR`: CSCB's own text of a notice. */
+export function cscbOwnText(notice: string): string {
+  return cscbOwnLines(notice).join(CONFLICT_NOTICE_LINE_SEPARATOR)
 }
 
 // ---------------------------------------------------------------------------
@@ -410,3 +508,153 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   paneOrKill('kill', 'never-reported-in', LATCH_CASE_NEVER_REPORTED_IN, PENDING),
   paneOrKill('kill', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, WORKING),
 ])
+
+// ---------------------------------------------------------------------------
+// The unusable recorded name (b.jg5 SRJ-512, SRJ-1019)
+// ---------------------------------------------------------------------------
+
+/** A verb site kind E16 T1 wires for an UNUSABLE NAME answer. */
+export type UnusableNameSite =
+  | 'resume'
+  | 'plain spawn'
+  | 'ladder kill'
+  | 'ladder delete'
+  | 'read-pane'
+  | 'status'
+  | 'get'
+
+/** The agent-director verb each site kind calls. */
+const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Object.freeze({
+  'resume': 'resume',
+  'plain spawn': SPAWN_VERB,
+  'ladder kill': 'kill',
+  'ladder delete': 'delete',
+  'read-pane': 'read-pane',
+  'status': 'status',
+  'get': 'get',
+})
+
+/** Every site kind of {@link UnusableNameSite}, in row order. */
+export const UNUSABLE_NAME_SITES: readonly UnusableNameSite[] = Object.freeze(
+  Object.keys(UNUSABLE_NAME_SITE_VERB) as UnusableNameSite[],
+)
+
+/** One UNUSABLE NAME answer at one site kind and what latching a persona on it records and posts. */
+export interface UnusableNameCaseRow {
+  /** Readable row name for `test.each`: `<site>: <fault>`. */
+  readonly name: string
+  /** The verb site kind that meets the answer. */
+  readonly site: UnusableNameSite
+  /** The agent-director verb that answers. */
+  readonly verb: string
+  /** The stub's recorded-name fault. */
+  readonly fault: UnusableNameFault
+  /** Builds the error through the stub's `errUnusableName(fault)`. */
+  readonly build: () => ReturnType<typeof errUnusableName>
+  /** "unusable recorded name". */
+  readonly latchCase: typeof LATCH_CASE_UNUSABLE_RECORDED_NAME
+  /** "none": the re-check reads only `status`. */
+  readonly refusedOperation: typeof REFUSED_OPERATION_NONE
+  /** The row state the latch records on this path. */
+  readonly rowState: LatchRowState
+  /** True when `rowState` comes from the one latch-time `status` read (the path read nothing before its call). */
+  readonly latchTimeRead: boolean
+  /** The classification's message (redacted, one line, capped): the record's description. */
+  readonly description: string
+  /** The session the record holds for persona `key`. */
+  readonly sessionName: (key: string) => string
+  /** The SRJ-1019 notice body for persona `key` (the persona notifier adds the prefix). */
+  readonly notice: (key: string) => string
+}
+
+/** The state each non-read site kind's path last read before its call (see the header). */
+const UNUSABLE_NAME_LAST_READ: Readonly<Record<UnusableNameSite, LatchRowState>> = Object.freeze({
+  'resume': ENDED,
+  'plain spawn': LATCH_ROW_STATE_NO_ROW,
+  'ladder kill': ENDED,
+  'ladder delete': ENDED,
+  'read-pane': WORKING,
+  'status': LATCH_ROW_STATE_UNREADABLE,
+  'get': LATCH_ROW_STATE_UNREADABLE,
+})
+
+function unusableNameRow(site: UnusableNameSite, fault: UnusableNameFault): UnusableNameCaseRow {
+  const build = () => errUnusableName(fault)
+  const message = classifyAdError(build()).message
+  if (message === undefined) throw new Error(`conflict-cases: errUnusableName('${fault}') has no classification message`)
+  return Object.freeze({
+    name: `${site}: ${fault}`,
+    site,
+    verb: UNUSABLE_NAME_SITE_VERB[site],
+    fault,
+    build,
+    latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME,
+    refusedOperation: REFUSED_OPERATION_NONE,
+    rowState: UNUSABLE_NAME_LAST_READ[site],
+    latchTimeRead: site === 'plain spawn',
+    description: message,
+    sessionName: (key: string) => personaTmuxSessionName(key),
+    notice: (key: string) => unusableNameNoticeText(key, message),
+  })
+}
+
+/** Every UNUSABLE NAME row: each fault of `UNUSABLE_NAME_FAULTS` at each site kind, for `test.each`. */
+export const UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
+  UNUSABLE_NAME_SITES.flatMap((site) => UNUSABLE_NAME_FAULTS.map((fault) => unusableNameRow(site, fault))),
+)
+
+// ---------------------------------------------------------------------------
+// The tmux-touching verbs (HO C24; ADSRD SR-1.4; b.jg5 SRJ-502)
+// ---------------------------------------------------------------------------
+
+/** One tmux-touching verb and the stub call-log list that records its calls. */
+export interface TmuxTouchingStubVerb {
+  readonly verb: string
+  readonly log: keyof StubCallLog
+}
+
+/**
+ * The agent-director verbs that touch tmux, with the stub's call-log list of
+ * each: `resume`, `spawn` in both forms (plain and `--reuse-finished`, both
+ * in `spawnCalls`), `read-pane`, `send-keys`, `kill` and `pause`. HO C24
+ * says no tmux-touching call is made for an unusable recorded name, and
+ * ADSRD SR-1.4 is where agent-director names these verbs as the ones that
+ * reach tmux; a `kill` counts here whatever row it was declared for, so a
+ * test's "no tmux-touching call" check is never weaker than SRJ-502's.
+ */
+export const TMUX_TOUCHING_STUB_VERBS: readonly TmuxTouchingStubVerb[] = Object.freeze([
+  Object.freeze({ verb: 'resume', log: 'resumeCalls' }),
+  Object.freeze({ verb: SPAWN_VERB, log: 'spawnCalls' }),
+  Object.freeze({ verb: 'read-pane', log: 'readPaneCalls' }),
+  Object.freeze({ verb: 'send-keys', log: 'sendKeysCalls' }),
+  Object.freeze({ verb: 'kill', log: 'killCalls' }),
+  Object.freeze({ verb: 'pause', log: 'pauseCalls' }),
+] as const)
+
+/** One tmux-touching call a stub log recorded: its verb and the params it was given. */
+export interface TmuxTouchingCall {
+  readonly verb: string
+  readonly params: unknown
+}
+
+/**
+ * The tmux-touching calls `log` recorded, verb by verb in
+ * {@link TMUX_TOUCHING_STUB_VERBS}' order (each verb's calls in call order);
+ * empty when there is none. Pass `from`, the log's lengths taken earlier with
+ * {@link tmuxTouchingCallCounts}, to get only the calls made since.
+ */
+export function tmuxTouchingCallsIn(
+  log: StubCallLog,
+  from?: Readonly<Partial<Record<keyof StubCallLog, number>>>,
+): TmuxTouchingCall[] {
+  return TMUX_TOUCHING_STUB_VERBS.flatMap(({ verb, log: list }) =>
+    (log[list] as readonly unknown[]).slice(from?.[list] ?? 0).map((params) => ({ verb, params })),
+  )
+}
+
+/** How many calls each tmux-touching verb's list in `log` holds now, for {@link tmuxTouchingCallsIn}'s `from`. */
+export function tmuxTouchingCallCounts(log: StubCallLog): Partial<Record<keyof StubCallLog, number>> {
+  return Object.fromEntries(
+    TMUX_TOUCHING_STUB_VERBS.map(({ log: list }) => [list, (log[list] as readonly unknown[]).length]),
+  )
+}

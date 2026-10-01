@@ -309,14 +309,27 @@ type NoAttemptReason = 'latched' | 'in-flight' | 'tmux-unavailable'
 /**
  * The persona's no-attempt reason for this tick, the first that holds, or
  * `null` when the tick may attempt. Decided once per persona per tick,
- * before any read. A throw from a dep propagates (the per-persona `catch`
- * logs it and ends the persona's work for the tick).
+ * before any read; only `latched` is asked again after the tick's liveness
+ * read (`latchedAfterRead`), since that read may latch the persona. A throw
+ * from a dep propagates (the per-persona `catch` logs it and ends the
+ * persona's work for the tick).
  */
 function noAttemptReason(d: HealthCheckDeps, key: string): NoAttemptReason | null {
   if (d.isLatched?.(key) === true) return 'latched'
   if (d.isLaunchInFlight?.(key) === true) return 'in-flight'
   if (getOutageFlags(key).has('tmux-unavailable')) return 'tmux-unavailable'
   return null
+}
+
+/**
+ * The latched no-attempt reason asked again after the tick's liveness read
+ * (b.jg5 SRJ-502, SRJ-512): true when `isLatched` answers exactly `true`,
+ * since the read itself may have latched the persona. A throw propagates, as
+ * from `noAttemptReason` (the per-persona `catch` logs it and ends the
+ * persona's work for the tick).
+ */
+function latchedAfterRead(d: HealthCheckDeps, key: string): boolean {
+  return d.isLatched?.(key) === true
 }
 
 /**
@@ -445,8 +458,7 @@ export function startHealthCheck(intervalSeconds: number): void {
           // read below, so one that recovered on its own takes the healthy
           // branch (clearing the outage and ending `tmux-unresponsive`), but
           // the tick schedules nothing and posts no not-connected notice.
-          const reason = noAttemptReason(deps, key)
-          const holdOff = reason !== null
+          let reason = noAttemptReason(deps, key)
 
           if (await deps.statRoute(cwd)) {
             clearOutageFlag(key, 'cwd-unreachable')
@@ -468,6 +480,12 @@ export function startHealthCheck(intervalSeconds: number): void {
             reading = LIVENESS_UNKNOWN
             failure = ` (isSessionAlive failed: ${describeThrownValue(err)})`
           }
+          // b.jg5 SRJ-502, SRJ-512: the tick's own liveness read may have
+          // latched the persona (an UNUSABLE NAME answer); its latched
+          // no-attempt reason is asked again after the read, so the tick
+          // schedules nothing for it.
+          if (reason !== 'latched' && latchedAfterRead(deps, key)) reason = 'latched'
+          const holdOff = reason !== null
           if (reading === LIVENESS_UNKNOWN) {
             disconnectedStreak.delete(key)
             console.error(`[slack] health-check: liveness unknown for persona=${key}${failure} — skipping it this tick; not read as dead`)

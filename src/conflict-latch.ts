@@ -44,7 +44,8 @@
  * `main()`. `set` latches a persona, relatches it with a different case
  * (replacing the record), or, with the same case, keeps it with the record
  * unchanged (SRJ-506), and answers which ({@link ConflictLatchSetOutcome});
- * `setFromConflict` builds the record from a thrown CONFLICT value. Every set
+ * `setFromConflict` builds the record from a thrown CONFLICT value, and
+ * `setFromUnusableName` from a thrown UNUSABLE NAME value. Every set
  * calls each set observer once with the key, the outcome and the record, so
  * the CONFLICT notice and the holds react to it. `forget(key)` drops one
  * persona's latch silently: no post, no observer call, no line. The persona
@@ -52,17 +53,34 @@
  * launch in flight settled and right before it forgets the persona's notice
  * episodes, which ends the CONFLICT episode with it. There is no forget-all.
  *
- * The CONFLICT notice (SRJ-1004, SRJ-508): {@link conflictNoticeText} builds
- * its body from a CONFLICT latch's record, from the exported fixed lines
- * (`CONFLICT_NOTICE_*`) and the case sentences
- * ({@link CONFLICT_CASE_SENTENCES}). Its set observer
+ * The unusable recorded name (SRJ-512): {@link isUnusableNameError} tells
+ * an UNUSABLE NAME value by the classifier, and {@link unusableNameSetInput}
+ * builds its `set` input: the case "unusable recorded name", the refused
+ * operation "none", the row state the caller gives, the classification's
+ * message as the description and the session quoted in it. Its triggers are
+ * in `src/session-manager.ts` (the collision ladder's spawns, `resume`, kill
+ * and delete, the shared own-row `status` and `get` reads and their step,
+ * and the working-pane read) and the liveness and reconnect adapters in
+ * `src/server.ts`, which apply the session manager's own-row `status` step.
+ * Later sites latch through the same entry: the dialog approver (E17), the
+ * reconnect's keystrokes and the prompt rows' pane reads (E19), the restart
+ * path's kill (E20), the reuse spawn (E22) and the re-check's relatch (E30).
+ *
+ * The notices (SRJ-1004, SRJ-1019, SRJ-508, SRJ-1016): {@link conflictNoticeText}
+ * builds the CONFLICT notice's body from a CONFLICT latch's record, from the
+ * exported fixed lines (`CONFLICT_NOTICE_*`) and the case sentences
+ * ({@link CONFLICT_CASE_SENTENCES}); {@link unusableNameNoticeText} builds
+ * SRJ-1019's from the persona's key and the record's description, from the
+ * exported fixed parts (`UNUSABLE_NAME_NOTICE_*`). One set observer
  * ({@link createConflictNoticeObserver}, bound by {@link bindConflictNotice}
- * in `main()`) begins or keeps the persona's CONFLICT episode in the server's
- * notice episodes (`src/persona-episodes.ts`), with the record's case, and
- * posts the notice there at most once per episode: a latch posts once, a
- * relatch with a new case begins a new episode and posts once more, and a
+ * in `main()`) dispatches by latch kind: it ends the persona's open episodes
+ * of the other latch kinds silently, then begins or keeps its episode of the
+ * record's kind in the server's notice episodes (`src/persona-episodes.ts`),
+ * the CONFLICT episode with the record's case, and posts that kind's notice
+ * there at most once per episode ({@link HOLD_NOTICES} for a hold case): a
+ * latch posts once, a relatch with a new case posts once more, and a
  * same-case set posts nothing. The post goes through the episodes' sink, the
- * persona notifier, which adds the persona prefix. The quoted description is
+ * persona notifier, which adds the persona prefix. A quoted description is
  * redacted and capped as the record holds it, then escaped once for Slack
  * (`escapeSlackControlCharacters`); so is the session name. Log lines stay
  * unescaped.
@@ -74,8 +92,8 @@
  * ends its unclassified-error episode on every set, through the injected
  * {@link ConflictLatchHolds}. What else a latch holds back is asked of the
  * latch where it happens: the collision ladder (`src/session-manager.ts`,
- * which latches on a CONFLICT at a spawn or resume and launches no latched
- * persona), the restart work, the retry action and the health tick, each
+ * which latches on a CONFLICT or an UNUSABLE NAME at a spawn or resume and
+ * launches no latched persona), the restart work, the retry action and the health tick, each
  * through `isLatched`.
  *
  * The recovery notice (SRJ-1005): {@link conflictRecoveryText},
@@ -83,13 +101,12 @@
  * latch kind ({@link LatchKind}) and one of five reasons
  * ({@link LatchRecoveryReason}); nothing here posts it (see its section).
  *
- * Where later Epics plug in: E14's `provenance_conflict` note latch, E16's
- * two hold latches and their triggers, and the sites E17 to E22 and E29
- * convert all latch through `set` or `setFromConflict`; E16's hold notices
- * are set observers beside the CONFLICT notice's; E30's re-check and its
- * timer read the record and relatch through `set`, and post the recovery
- * notice when a latch clears; E31's `clear-latch` clears through the clear
- * E30 adds.
+ * Where later Epics plug in: the "launch start not recorded" latch's trigger
+ * and its notice's text (a row of {@link HOLD_NOTICES}), and the sites E17
+ * to E22 and E29 convert, all latch through `set`, `setFromConflict` or
+ * `setFromUnusableName`; E30's re-check and its timer read the record and
+ * relatch through `set`, and post the recovery notice when a latch clears;
+ * E31's `clear-latch` clears through the clear E30 adds.
  *
  * Log lines, to the injected log (a throwing log is swallowed):
  *
@@ -109,7 +126,12 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { classifyAdError, conflictDescriptionOf, AD_ERROR_CLASS_CONFLICT } from './ad-error-class.ts'
+import {
+  classifyAdError,
+  conflictDescriptionOf,
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+} from './ad-error-class.ts'
 import {
   CONFLICT_ANOTHER_STORE_PHRASE,
   CONFLICT_CONFLICTING_LABELS_PHRASE,
@@ -128,8 +150,14 @@ import {
   isSafeIdentifier,
   renderLogMessageText,
 } from './persona-connection-errors.ts'
-import { PERSONA_EPISODE_KIND_CONFLICT, type PersonaEpisodes } from './persona-episodes.ts'
-import { personaTmuxSessionName } from './persona-identity.ts'
+import {
+  PERSONA_EPISODE_KIND_CONFLICT,
+  PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED,
+  PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME,
+  type PersonaEpisodeKind,
+  type PersonaEpisodes,
+} from './persona-episodes.ts'
+import { personaInstanceId, personaTmuxSessionName } from './persona-identity.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 
@@ -157,9 +185,9 @@ export const LATCH_CASE_DIFFERENT_ID = 'different-id'
 export const LATCH_CASE_ANOTHER_STORE = 'another-store'
 /** A CONFLICT whose description carries none of the case words. */
 export const LATCH_CASE_UNRECOGNISED = 'unrecognised'
-/** Hold case "unusable recorded name" (SRJ-512): no trigger here (E16). */
+/** Hold case "unusable recorded name" (SRJ-512): set by `setFromUnusableName` ({@link unusableNameSetInput}). */
 export const LATCH_CASE_UNUSABLE_RECORDED_NAME = 'unusable-recorded-name'
-/** Hold case "launch start not recorded" (SRJ-513): no trigger here (E16). */
+/** Hold case "launch start not recorded" (SRJ-513): no trigger yet. */
 export const LATCH_CASE_LAUNCH_START_NOT_RECORDED = 'launch-start-not-recorded'
 
 /**
@@ -186,7 +214,7 @@ export type RecognisedConflictCase = (typeof CONFLICT_CASE_ORDER)[number]['latch
 /** A CONFLICT latch's case: a recognised case or unrecognised text. */
 export type ConflictLatchCase = RecognisedConflictCase | typeof LATCH_CASE_UNRECOGNISED
 
-/** The two hold cases, declared here; E16 builds their triggers, notices and episodes. */
+/** The two hold cases: each posts its own notice under its own episode kind ({@link HOLD_NOTICES}). */
 export const HOLD_LATCH_CASES = Object.freeze([
   LATCH_CASE_UNUSABLE_RECORDED_NAME,
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
@@ -431,6 +459,14 @@ export interface ConflictLatch {
    * of any other class.
    */
   setFromConflict(key: string, value: unknown, fields: ConflictLatchConflictFields): ConflictLatchSetOutcome | undefined
+  /**
+   * `set` with the record built from a thrown value that classifies as
+   * UNUSABLE NAME ({@link unusableNameSetInput}): the case "unusable recorded
+   * name", the refused operation "none", `rowState`, the classification's
+   * message as the description and the session quoted in it. Answers
+   * `undefined`, and does nothing, for a value of any other class.
+   */
+  setFromUnusableName(key: string, value: unknown, rowState: LatchRowState): ConflictLatchSetOutcome | undefined
   /** Whether `key` is latched. */
   isLatched(key: string): boolean
   /** `key`'s record, or `undefined` when it is not latched. */
@@ -498,6 +534,11 @@ export function createConflictLatch(deps: ConflictLatchDeps): ConflictLatch {
       })
     },
 
+    setFromUnusableName(key, value, rowState) {
+      const input = unusableNameSetInput(key, value, rowState)
+      return input === undefined ? undefined : set(key, input)
+    },
+
     isLatched: (key) => records.has(key),
 
     record: (key) => records.get(key),
@@ -558,6 +599,50 @@ function safeLog(log: (line: string) => void, line: string): void {
     log(line)
   } catch {
     /* a failing logger must not change what the latch does */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The unusable recorded name (b.jg5 SRJ-512)
+// ---------------------------------------------------------------------------
+
+/**
+ * True when `value` classifies as UNUSABLE NAME (b.jg5 SRJ-104: an
+ * `ErrInternal` whose description carries "the recorded tmux session name"),
+ * decided by the classifier (`classifyAdError`, by name). For a site that
+ * must branch before it knows the row state to record. Every other
+ * `ErrInternal` is UNCLASSIFIED and answers false (SRJ-313). Pure; never
+ * throws.
+ */
+export function isUnusableNameError(value: unknown): boolean {
+  return classifyAdError(value).errorClass === AD_ERROR_CLASS_UNUSABLE_NAME
+}
+
+/**
+ * What `set` takes for persona `key` meeting the thrown `value` (b.jg5
+ * SRJ-501, SRJ-512), when `value` classifies as UNUSABLE NAME: the case
+ * "unusable recorded name", the refused operation "none" (its re-check reads
+ * only `status`), `rowState`, the classification's message as the
+ * description (already redacted, on one line and capped by the classifier)
+ * and the session quoted in that message (`conflictSessionName`, else
+ * `slack_bot_<key>`). `undefined` for a value of any other class, which
+ * latches nothing. The latch's `setFromUnusableName` sets it; a holder of
+ * only `set` (the session manager) passes it to `set`. Pure; never throws.
+ */
+export function unusableNameSetInput(
+  key: string,
+  value: unknown,
+  rowState: LatchRowState,
+): ConflictLatchSetInput | undefined {
+  const classification = classifyAdError(value)
+  if (classification.errorClass !== AD_ERROR_CLASS_UNUSABLE_NAME) return undefined
+  const description = classification.message
+  return {
+    latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME,
+    refusedOperation: REFUSED_OPERATION_NONE,
+    rowState,
+    sessionName: conflictSessionName(description, key),
+    ...(description === undefined ? {} : { description }),
   }
 }
 
@@ -717,6 +802,57 @@ export function conflictNoticeText(source: ConflictNoticeSource): string {
 }
 
 // ---------------------------------------------------------------------------
+// The unusable-recorded-name notice (b.jg5 SRJ-1019)
+// ---------------------------------------------------------------------------
+
+/** The notice up to `<instance id>`. */
+export const UNUSABLE_NAME_NOTICE_HEAD =
+  ":no_entry: *Held: unusable tmux session name* — agent-director will not act on this persona's row "
+
+/** Between `<instance id>` and the quoted description. */
+export const UNUSABLE_NAME_NOTICE_REASON =
+  ', because its recorded tmux session name cannot be used. '
+
+/** After the quoted description (whose closing quote is `CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL`). */
+export const UNUSABLE_NAME_NOTICE_DESCRIPTION_END = '.'
+
+/** The pointer sentence: to the "Operator actions" section, for this row. */
+export const UNUSABLE_NAME_NOTICE_POINTER =
+  'What to do: a human follows the "Operator actions" section of agent-director\'s README for this row.'
+
+/** What CSCB does meanwhile. */
+export const UNUSABLE_NAME_NOTICE_HOLD =
+  'CSCB takes no action for this persona until the row is removed, and messages sent to it meanwhile are lost.'
+
+/** What separates the notice's sentences: it is one line. */
+export const UNUSABLE_NAME_NOTICE_SEPARATOR = ' '
+
+/**
+ * The unusable-recorded-name notice's body for persona `key` (b.jg5
+ * SRJ-1019); the persona notifier adds the persona prefix. One line:
+ * {@link UNUSABLE_NAME_NOTICE_HEAD}, the instance id `cscb_<key>`,
+ * {@link UNUSABLE_NAME_NOTICE_REASON}, `agent-director said: "<description>".`
+ * (the latch record's description, rendered by `renderLogMessageText`, a
+ * no-op on a record's, then escaped once for Slack), the pointer, the hold
+ * sentence and the human-only sentence (`CONFLICT_NOTICE_HUMAN_ONLY_LINE`),
+ * joined by single spaces. Names no command. Pure.
+ */
+export function unusableNameNoticeText(key: string, description: string | undefined): string {
+  return [
+    UNUSABLE_NAME_NOTICE_HEAD +
+      personaInstanceId(key) +
+      UNUSABLE_NAME_NOTICE_REASON +
+      CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD +
+      escapeSlackControlCharacters(renderLogMessageText(description)) +
+      CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL +
+      UNUSABLE_NAME_NOTICE_DESCRIPTION_END,
+    UNUSABLE_NAME_NOTICE_POINTER,
+    UNUSABLE_NAME_NOTICE_HOLD,
+    CONFLICT_NOTICE_HUMAN_ONLY_LINE,
+  ].join(UNUSABLE_NAME_NOTICE_SEPARATOR)
+}
+
+// ---------------------------------------------------------------------------
 // The recovery notice (b.jg5 SRJ-1005)
 //
 // Built here, posted elsewhere: E30's re-check and clear post it (every
@@ -846,45 +982,96 @@ export function latchRecoveryText(kind: LatchKind, reason: LatchRecoveryReason, 
 }
 
 // ---------------------------------------------------------------------------
-// The CONFLICT notice's episode (b.jg5 SRJ-508, SRJ-1016)
+// The latch notices' episodes (b.jg5 SRJ-508, SRJ-1016)
 // ---------------------------------------------------------------------------
 
-/** What the notice reaction uses of the server's notice episodes. */
-export type ConflictNoticeEpisodes = Pick<PersonaEpisodes, 'begin' | 'post'>
+/**
+ * What the notice reaction uses of the server's notice episodes: `begin` and
+ * `post`, and `end` for the silent cross-kind end.
+ */
+export type ConflictNoticeEpisodes = Pick<PersonaEpisodes, 'begin' | 'post' | 'end'>
+
+/** One hold case's notice: its episode kind and its text builder (absent: the case posts nothing yet). */
+export interface HoldNotice {
+  readonly episodeKind: PersonaEpisodeKind
+  /** The notice's body for persona `key`'s latch record; the persona notifier adds the prefix. Pure. */
+  readonly text?: (key: string, record: ConflictLatchRecord) => string
+}
 
 /**
- * The CONFLICT notice's set observer over `episodes` (b.jg5 SRJ-508): for a
- * set with a CONFLICT case or unrecognised text,
+ * Each hold case's notice (b.jg5 SRJ-508, SRJ-1016): its own episode kind
+ * and, once built, its text. "unusable recorded name" posts SRJ-1019
+ * ({@link unusableNameNoticeText}); "launch start not recorded" has its
+ * episode kind but no text yet (SRJ-1020), so its latch posts nothing.
+ */
+export const HOLD_NOTICES: Readonly<Record<HoldLatchCase, HoldNotice>> = Object.freeze({
+  [LATCH_CASE_UNUSABLE_RECORDED_NAME]: Object.freeze({
+    episodeKind: PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME,
+    text: (key: string, record: ConflictLatchRecord) => unusableNameNoticeText(key, record.description),
+  }),
+  [LATCH_CASE_LAUNCH_START_NOT_RECORDED]: Object.freeze({
+    episodeKind: PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED,
+  }),
+})
+
+/**
+ * The notice episode kind of each latch kind, one per kind: CONFLICT (every
+ * CONFLICT case and unrecognised text), then each hold case's.
+ */
+export const LATCH_NOTICE_EPISODE_KINDS: readonly PersonaEpisodeKind[] = Object.freeze([
+  PERSONA_EPISODE_KIND_CONFLICT,
+  ...HOLD_LATCH_CASES.map((latchCase) => HOLD_NOTICES[latchCase].episodeKind),
+])
+
+/** The notice episode kind of `latchCase`: its hold notice's, else CONFLICT's. Pure. */
+export function latchNoticeEpisodeKindOf(latchCase: LatchCase): PersonaEpisodeKind {
+  return isHoldLatchCase(latchCase) ? HOLD_NOTICES[latchCase].episodeKind : PERSONA_EPISODE_KIND_CONFLICT
+}
+
+/**
+ * The latch notices' set observer over `episodes` (b.jg5 SRJ-508,
+ * SRJ-1016), dispatching by the record's latch kind:
  *
- *   - a latch (`latched`) or a relatch with a new case (`relatched`) begins
- *     P's CONFLICT episode with the record's case, or keeps the open one when
- *     its case is the same, and posts {@link conflictNoticeText} in it at most
- *     once: a new case's episode is new, so it posts once more;
+ *   - a latch (`latched`) or a relatch with a new case (`relatched`) first
+ *     ends P's open episodes of the other latch kinds silently (`end`: no
+ *     recovery post), so a later relatch back to one of them posts once more
+ *     (SRJ-512, SRJ-513); then
+ *       - for a CONFLICT case or unrecognised text, it begins P's CONFLICT
+ *         episode with the record's case, or keeps the open one when its
+ *         case is the same, and posts {@link conflictNoticeText} in it at
+ *         most once: a new case's episode is new, so it posts once more;
+ *       - for a hold case, it begins (or keeps) P's episode of that case's
+ *         kind ({@link HOLD_NOTICES}) and posts that case's text in it at
+ *         most once; a case with no text yet posts nothing. SRJ-1004 is
+ *         never posted for a hold case;
  *   - a same-case set (`same-case`) keeps the episode and posts nothing.
  *
- * A hold case is E16's, with its own episodes: this observer ignores it. The
- * post goes through the episodes' sink (the persona notifier), never
+ * Every post goes through the episodes' sink (the persona notifier), never
  * straight to Slack, and reads no other notice's latch, b.f2b's
  * `unproven-idle` and `blocked-on-prompt` included, so none holds it back.
- * After the episodes' `close` (shutdown) it opens and posts nothing. It ends
- * no episode: the clear is E30's, and a teardown's `forget` ends it.
+ * After the episodes' `close` (shutdown) it opens and posts nothing. The
+ * clear's end of an episode is E30's, and a teardown's `forget` ends them.
  */
 export function createConflictNoticeObserver(episodes: ConflictNoticeEpisodes): ConflictLatchSetObserver {
   return ({ key, outcome, record }) => {
     if (outcome === CONFLICT_LATCH_SET_SAME_CASE) return
     const latchCase = record.latchCase
-    if (isHoldLatchCase(latchCase)) return
-    if (episodes.begin(key, PERSONA_EPISODE_KIND_CONFLICT, latchCase) === 'closed') return
-    episodes.post(
-      key,
-      PERSONA_EPISODE_KIND_CONFLICT,
-      conflictNoticeText({ sessionName: record.sessionName, latchCase, description: record.description }),
-    )
+    const kind = latchNoticeEpisodeKindOf(latchCase)
+    for (const other of LATCH_NOTICE_EPISODE_KINDS) {
+      if (other !== kind) episodes.end(key, other)
+    }
+    if (episodes.begin(key, kind, latchCase) === 'closed') return
+    if (isHoldLatchCase(latchCase)) {
+      const text = HOLD_NOTICES[latchCase].text
+      if (text !== undefined) episodes.post(key, kind, text(key, record))
+      return
+    }
+    episodes.post(key, kind, conflictNoticeText({ sessionName: record.sessionName, latchCase, description: record.description }))
   }
 }
 
 /**
- * Bind the CONFLICT notice to `latch`: adds {@link createConflictNoticeObserver}
+ * Bind the latch notices to `latch`: adds {@link createConflictNoticeObserver}
  * over `episodes` as a set observer. Answers the observer's removal. `main()`
  * binds the server's one latch to its one set of notice episodes.
  */
@@ -918,7 +1105,7 @@ export interface ConflictLatchHolds {
  * them too: a refusal met while P was already latched (the latch-time
  * `status` read's error included) may have armed the timer again. Each hold
  * is isolated: one that throws is logged to `log` and the next still runs.
- * Bound before the CONFLICT notice ({@link bindConflictLatchHolds}), so every
+ * Bound before the latch's notice ({@link bindConflictLatchHolds}), so every
  * hold is done by the time the notice is posted.
  */
 export function createConflictLatchHoldObserver(
@@ -945,7 +1132,7 @@ export function createConflictLatchHoldObserver(
  * Bind the holds to `latch` as a set observer
  * ({@link createConflictLatchHoldObserver}). Answers the observer's removal.
  * Observers run in the order they were added, so `main()` binds the holds
- * before the CONFLICT notice ({@link bindConflictNotice}): the timer is
+ * before the latch's notice ({@link bindConflictNotice}): the timer is
  * stopped and both episodes are ended before the notice is posted.
  */
 export function bindConflictLatchHolds(

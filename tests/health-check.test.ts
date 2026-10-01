@@ -43,8 +43,13 @@ import {
   forgetNotConnectedEpisode,
   notifyDisconnectedWithAutoRestartDisabled,
   notifyPersonaNotConnected,
+  setConflictLatch,
   setSessionNotifier,
 } from '../src/session-manager.ts'
+import { bindConflictNotice, createConflictLatch, type ConflictLatch } from '../src/conflict-latch.ts'
+import { createPersonaEpisodes } from '../src/persona-episodes.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { UNUSABLE_NAME_CASE_ROWS } from './test-helpers/conflict-cases.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
@@ -77,6 +82,7 @@ import {
   SAMPLE_LAUNCH_START_WHOLE,
   cannedStatusResult,
   errConfigMalformed,
+  errInternal,
   errSpawnNotFound,
   makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
@@ -2846,5 +2852,163 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
     expect(h.clock.pendingCount()).toBe(pendingBefore)
     expect(launches).toEqual([])
     assertNoLeak({ lines, managerLines: h.lines, calls })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-502, SRJ-512 — a tick whose own liveness read latches P
+//
+// The real liveness adapter applies the own-row `status` step, so an UNUSABLE
+// NAME answer from P's row latches P through the installed latch (whose
+// notice reaction, bound as `main()` binds it over a real episodes instance,
+// posts SRJ-1019 once per episode) and reads `unknown`: the tick skips P,
+// schedules nothing and asks for no not-connected notice. P is still read on
+// each later tick, as a latched persona is (SRJ-315); each read meets the same
+// case again, which posts nothing more. The tick asks the latch again after
+// its own read, so P latched while the read ran (here by another path, the
+// read itself answering dead) is not scheduled either. A phrase-less
+// `ErrInternal` latches no one and keeps E9's skip on `unknown`. B beside P,
+// read dead, is scheduled on every tick. `startHealthCheck` takes no clock,
+// so the ticks run on the file's short real interval (`runTicks`, bounded by
+// `maxTicks`).
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-512: a tick whose own liveness read latches P', () => {
+  const P = 'unusable_bot'
+  const B = 'other_bot'
+  const DEAD_ROW = cannedStatusResult({ state: [...AGENT_DIRECTOR_DEAD_STATES][0]! })
+  /** The first `status` row of the unusable-name table (every fault is covered at the adapter, in tests/server.test.ts). */
+  const ROW = UNUSABLE_NAME_CASE_ROWS.find((row) => row.site === 'status')!
+
+  let latch: ConflictLatch
+  let unbindNotice: () => void
+  /** The latch's and the episodes' own lines. */
+  let latchLines: string[]
+  /** Every notice the episodes' sink received. */
+  let posts: Array<{ key: string; text: string }>
+
+  beforeEach(() => {
+    latchLines = []
+    posts = []
+    latch = createConflictLatch({ log: (line) => { latchLines.push(line) } })
+    unbindNotice = bindConflictNotice(latch, createPersonaEpisodes({
+      sink: (key, text) => { posts.push({ key, text }) },
+      log: (line) => { latchLines.push(line) },
+      clock: createFakeClock(),
+    }))
+    setConflictLatch(latch)
+  })
+
+  afterEach(() => {
+    unbindNotice()
+    setConflictLatch(undefined)
+    resetClientForTests()
+  })
+
+  /**
+   * The file's deps, their liveness read the real adapter over a stub client:
+   * P's `status` answers `pAnswer` on every read, B's reads a dead row. P's
+   * session is disconnected (read live, its second tick would schedule it and
+   * ask for the notice), auto-restart is disabled, the latched query is the
+   * installed latch's, and each not-connected notice asked for is recorded.
+   */
+  function latchDeps(pAnswer: Error | ReturnType<typeof cannedStatusResult>, maxTicks: number) {
+    const config = makeMultiPersonaConfig([{ name: P }, { name: B }], baseDir)
+    const statusCalls: string[] = []
+    setClientForTests(makeStubClient({
+      statusFn: ({ claude_instance_id }) => {
+        statusCalls.push(String(claude_instance_id))
+        return claude_instance_id === personaInstanceId(P) ? pAnswer : DEAD_ROW
+      },
+    }) as unknown as Client)
+    const adapter = _buildIsSessionAliveAdapter(() => config)
+    const personas = buildPersonaWorkList(config)
+    const deps = makeDeps({ personas, connectedSequence: { [P]: [false] }, maxTicks })
+    deps.isSessionAlive = (key) => {
+      deps.isSessionAliveCalls.push(key)
+      return adapter(key)
+    }
+    deps.isLatched = (key) => latch.isLatched(key)
+    deps.isAutoRestartDisabled = () => true
+    const notified: string[] = []
+    deps.notifyNotConnected = (key) => void notified.push(key)
+    return { deps, notified, personas, statusCalls, adapter }
+  }
+
+  test('P\'s status answers UNUSABLE NAME on three ticks: P latches on the first and SRJ-1019 is posted once; P is read each tick but never scheduled, no not-connected notice; B, read dead, is scheduled each tick', async () => {
+    const err = ROW.build()
+    const { deps, notified, personas, statusCalls } = latchDeps(err, 3)
+
+    const lines = await capturingErrors(() => runTicks(deps, 3))
+
+    expect(deps.isSessionAliveCalls).toEqual([P, B, P, B, P, B])
+    expect(statusCalls).toEqual([P, B, P, B, P, B].map(personaInstanceId))
+    const scheduledB = { key: B, cwd: personas[B]! }
+    expect(deps.scheduleRestartCalls).toEqual([scheduledB, scheduledB, scheduledB])
+    expect(notified).toEqual([])
+    // Skipped on unknown, P's connection is never probed (B, read dead, neither).
+    expect(deps.isSessionConnectedCalls).toEqual([])
+    expect(latch.record(P)).toEqual({
+      sessionName: ROW.sessionName(P),
+      latchCase: ROW.latchCase,
+      refusedOperation: ROW.refusedOperation,
+      rowState: ROW.rowState,
+      description: ROW.description,
+    })
+    expect(latch.isLatched(B)).toBe(false)
+    expect(posts).toEqual([{ key: P, text: ROW.notice(P) }])
+    // The first tick's read latched P; the next two met the same case.
+    const stepLines = lines.filter((line) => line.startsWith(`[slack] isSessionAlive: status for persona=${P}: `))
+    expect(stepLines.map((line) => line.slice(line.indexOf('UNUSABLE NAME: ')))).toEqual([
+      'UNUSABLE NAME: the persona latched; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)',
+      'UNUSABLE NAME: the persona was already latched with this case; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)',
+      'UNUSABLE NAME: the persona was already latched with this case; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)',
+    ])
+    expect(latchLines.filter((line) => line.startsWith(`[slack] conflict-latch: persona=${P} latched`))).toHaveLength(1)
+    expect(lines.filter((line) => line.startsWith(`[slack] health-check: liveness unknown for persona=${P}`))).toHaveLength(3)
+    expect(notices).toEqual([])
+    expect(getOutageFlags(P).size).toBe(0)
+    assertNoLeak({ lines, latchLines, posts, notices })
+  })
+
+  // A latch set elsewhere while the tick's read ran: the read answers dead,
+  // which would schedule P at once, but the latch is asked again after it.
+  test('P latched by another path while its tick\'s liveness read runs, the read answering dead: nothing scheduled for P; B is scheduled as today', async () => {
+    const { deps, notified, personas, adapter } = latchDeps(DEAD_ROW, 1)
+    deps.isSessionAlive = async (key) => {
+      deps.isSessionAliveCalls.push(key)
+      const reading = await adapter(key)
+      if (key === P) latch.setFromUnusableName(P, ROW.build(), ROW.rowState)
+      return reading
+    }
+
+    const lines = await capturingErrors(() => runTicks(deps, 1))
+
+    expect(deps.isSessionAliveCalls).toEqual([P, B])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: B, cwd: personas[B]! }])
+    expect(notified).toEqual([])
+    expect(latch.isLatched(P)).toBe(true)
+    expect(posts).toEqual([{ key: P, text: ROW.notice(P) }])
+    assertNoLeak({ lines, latchLines, posts, notices })
+  })
+
+  // Control (b.jg5 SRJ-313): without the phrase the answer is not UNUSABLE
+  // NAME: P latches no one and nothing is posted; E9's skip on `unknown`
+  // stands on every tick.
+  test('control: P\'s status answers a phrase-less ErrInternal on three ticks: no latch, no post; P is skipped on unknown each tick, never scheduled; B is scheduled each tick', async () => {
+    const { deps, notified, personas } = latchDeps(errInternal(), 3)
+
+    const lines = await capturingErrors(() => runTicks(deps, 3))
+
+    expect(deps.isSessionAliveCalls).toEqual([P, B, P, B, P, B])
+    const scheduledB = { key: B, cwd: personas[B]! }
+    expect(deps.scheduleRestartCalls).toEqual([scheduledB, scheduledB, scheduledB])
+    expect(notified).toEqual([])
+    expect(latch.isLatched(P)).toBe(false)
+    expect(latchLines).toEqual([])
+    expect(posts).toEqual([])
+    expect(lines.filter((line) => line.startsWith(`[slack] health-check: liveness unknown for persona=${P}`))).toHaveLength(3)
+    expect(lines.filter((line) => line.includes('UNUSABLE NAME'))).toEqual([])
+    assertNoLeak({ lines, latchLines, posts, notices })
   })
 })

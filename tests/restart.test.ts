@@ -139,7 +139,7 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
 import type { DeleteParams, FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams } from 'agent-director'
-import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import { configDirLabelValue, personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import { stubOpenedDmId, type StubWebMethod } from './test-helpers/slack-stub.ts'
@@ -160,10 +160,13 @@ import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
   callCounts,
   makeRecoveryHarness,
+  personaCallCounts,
   retryNow,
   rowReadsUntilSpawn,
   type RecoveryHarness,
+  type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
+import { UNUSABLE_NAME_CASE_ROWS, tmuxTouchingCallsIn } from './test-helpers/conflict-cases.ts'
 import {
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
   tmuxUnresponsiveOnsetText,
@@ -5479,4 +5482,152 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
       expect(h.episodeNotices).toHaveLength(1)
     })
   })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-502, SRJ-512 — a restart run whose own liveness read latches P
+//
+// The real liveness adapter applies the own-row `status` step, so an UNUSABLE
+// NAME answer from P's row latches P (the case "unusable recorded name", the
+// state unreadable) and reads `unknown`. The restart work asks the latch
+// again right after each probe: after the first probe, and after b.d61's
+// re-probe that follows an escalate-dead reconnect (a `working` row whose
+// tmux session is gone, swept once). Either way the run answers
+// `RESTART_OUTCOME_LATCHED` with no `pending` deferral, no further reconnect,
+// no kill, spawn or `resume`, no arm hook and nothing recorded (P's one
+// failure on record stays one: a success would reset it, a counted failure
+// raise it), for a scheduled restart, a human-triggered restart request and
+// the UNAVAILABLE retry entry alike. The latch's holds and its one SRJ-1019
+// post run as `main()` binds them (the recovery harness). Q beside it, whose
+// row reads `ended`, is killed and relaunched as before. The scheduled
+// entries wait out their short restart timers with `Bun.sleep(WAIT_MS)`.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-512: a restart run whose own liveness read latches P stops there', () => {
+  /** The first `status` row of the unusable-name table (every fault is covered at the adapter, in tests/server.test.ts). */
+  const ROW = UNUSABLE_NAME_CASE_ROWS.find((row) => row.site === 'status')!
+
+  /** The restart work's line for a latched persona. */
+  const skipLine = (key: string): string =>
+    `[slack] Skipping restart for persona=${key} — the persona is latched; no agent-director call, nothing recorded (b.jg5 SRJ-502)`
+
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    cancelAllRestartTimers()
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    try {
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  /** How each entry runs persona `key`'s restart work, waiting for it as the file does. */
+  type Entry = (key: string, cwd: string) => Promise<void>
+  const ENTRIES: Array<[string, Entry]> = [
+    ['a scheduled restart', async (key, cwd) => {
+      scheduleRestart(key, cwd)
+      await Bun.sleep(WAIT_MS)
+    }],
+    ['a human-triggered restart request', async (key, cwd) => {
+      scheduleRestart(key, cwd, undefined, { humanTrigger: true })
+      await Bun.sleep(WAIT_MS)
+    }],
+    ["E8's retry entry (runRestartRetry)", async (key, cwd) => {
+      await runRestartRetry(key, cwd, isLaunchInFlight)
+    }],
+  ]
+
+  /**
+   * Where P's own `status` answers UNUSABLE NAME: `liveReads` is how many of
+   * P's reads answer a live `working` row before it, and `tmuxGone` whether
+   * P's tmux session is gone (so the reconnect adapter sweeps once and
+   * escalates); `calls` is every stub call the run makes for P, by verb.
+   */
+  const PROBES: Array<[string, { liveReads: number; tmuxGone: boolean; calls: Record<string, number> }]> = [
+    ['the first probe', { liveReads: 0, tmuxGone: false, calls: { statusCalls: 1 } }],
+    // The probe reads working (live, P not connected), the reconnect adapter
+    // reads working too, finds the tmux session gone and sweeps once.
+    ["b.d61's re-probe after an escalate-dead reconnect", { liveReads: 2, tmuxGone: true, calls: { statusCalls: 3, findMissingCalls: 1 } }],
+  ]
+
+  test.each(ENTRIES.flatMap(([entry, run]) => PROBES.map(([probe, opts]) => [entry, probe, run, opts] as const)))(
+    '%s, P\'s status answering UNUSABLE NAME at %s: P latches once with one SRJ-1019 post; the run answers latched with no deferral, kill, spawn, resume or send-keys, no arm hook, nothing counted; Q beside it restarts as before',
+    async (_entry, _probe, run, opts) => {
+      const deferred: string[] = []
+      const armHook: string[] = []
+      const outcomes: Array<{ key: string; outcome: unknown }> = []
+      const h = (harness = makeRecoveryHarness({
+        alertThresholdMs: false,
+        restartDeps: {
+          getRestartDelay: () => FAST_DELAY_S,
+          deferPendingRow: (key) => { deferred.push(key) },
+          armRetryTimer: (key) => { armHook.push(key) },
+          serialize: async <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
+            const outcome = await operation()
+            outcomes.push({ key, outcome })
+            return outcome
+          },
+        },
+      }))
+      const [p, q] = [h.keys[0]!, h.keys[1]!]
+      const cwdOf = (key: string): string => h.config.personas.find((persona) => persona.key === key)!.working_directory
+      // Q's row reads ended until its relaunch's spawn, then waiting; P's
+      // answers `liveReads` working rows, then UNUSABLE NAME.
+      rowReadsUntilSpawn(h, 'ended')
+      const othersRow = (h.stub.calls as unknown as RecoveryStubScript).statusFn!
+      const err = ROW.build()
+      let pReads = 0
+      h.script({
+        statusFn: (params) => {
+          if (params.claude_instance_id !== personaInstanceId(p)) return othersRow(params)
+          return pReads++ < opts.liveReads ? cannedStatusResult({ state: 'working' }) : err
+        },
+      })
+      _setTmuxSessionProber(async (name) => !(opts.tmuxGone && name === personaTmuxSessionName(p)))
+      recordFailure(p)
+
+      await run(p, cwdOf(p))
+
+      expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }])
+      expect(callCounts(h)).toEqual(opts.calls)
+      expect(personaCallCounts(h, p)).toEqual({ statusCalls: opts.calls.statusCalls! })
+      expect(tmuxTouchingCallsIn(h.stub.calls)).toEqual([])
+      expect(h.latch.record(p)).toEqual({
+        sessionName: ROW.sessionName(p),
+        latchCase: ROW.latchCase,
+        refusedOperation: ROW.refusedOperation,
+        rowState: ROW.rowState,
+        description: ROW.description,
+      })
+      expect(h.latchEvents.filter((event) => event.step === 'set').map((event) => event.key)).toEqual([p])
+      expect(h.episodeNotices).toEqual([{ key: p, text: ROW.notice(p) }])
+      expect(deferred).toEqual([])
+      expect(armHook).toEqual([])
+      expect(h.controller.armedKeys()).toEqual([])
+      expect(h.triggers).toEqual([])
+      expect(getFailureCount(p)).toBe(1)
+      expect(h.capReached).toEqual([])
+      expect(h.notices).toEqual([])
+      expect(h.errors.filter((line) => line === skipLine(p))).toHaveLength(1)
+      expect(h.errors.filter((line) => line.startsWith(`[slack] Relaunching session for persona=${p}`))).toEqual([])
+
+      // Q, not latched, is killed and relaunched through the same entry.
+      await run(q, cwdOf(q))
+      await h.settle()
+
+      expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }, { key: q, outcome: RESTART_OUTCOME_LAUNCHED }])
+      expect(h.latch.isLatched(q)).toBe(false)
+      expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(q)])
+      expect(h.stub.spawnedIds()).toEqual([personaInstanceId(q)])
+      expect(getFailureCount(q)).toBe(0)
+      expect(h.episodeNotices).toHaveLength(1)
+      expect(deferred).toEqual([])
+      expect(armHook).toEqual([])
+    },
+  )
 })
