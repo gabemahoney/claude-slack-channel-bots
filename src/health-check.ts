@@ -311,13 +311,20 @@ function noAttemptReason(d: HealthCheckDeps, key: string): NoAttemptReason | nul
  * launch, a failed run) leaves the persona with no attempt at all otherwise.
  * The tick schedules nothing and posts nothing for it. Called only for a
  * persona in the tick's work list (applied and up), never capped, with no
- * restart pending or active and nothing in flight, so at most once per tick
- * per persona, and only while no timer is armed; a timer armed here that
- * then finds the persona not up or capped stops at its first retry with no
- * agent-director call. A throw propagates (the per-persona `catch` logs it).
+ * restart pending or active, so at most once per tick per persona. The tick
+ * decided its no-attempt reason before awaiting its reads, so the reasons
+ * are checked again here, at arm time: nothing is armed unless the reason
+ * is still `tmux-unavailable` (the flag may have cleared during those
+ * awaits, by a teardown or a real clear, or work may now be in flight), and
+ * only while no timer is armed. A timer armed here that then finds the
+ * persona not up or capped stops at its first retry with no agent-director
+ * call. A throw propagates, as it does from the tick's own check (the
+ * per-persona `catch` logs it), so nothing is armed.
  */
 function armMissingRetryTimer(d: HealthCheckDeps, key: string): void {
-  if (d.armRetryTimer === undefined || d.isRetryArmed?.(key) !== false) return
+  if (d.armRetryTimer === undefined) return
+  if (noAttemptReason(d, key) !== 'tmux-unavailable') return
+  if (d.isRetryArmed?.(key) !== false) return
   console.error(`[slack] health-check: persona=${key} has its tmux-unavailable outage raised with no retry timer — arming one`)
   d.armRetryTimer(key)
 }

@@ -24,6 +24,7 @@ import {
   getOutageFlags,
   setOutageFlag,
   clearOutageFlag,
+  resetAllToHealthy,
   ONSET_TEMPLATES,
   ALL_CLEAR_TEMPLATE,
 } from '../src/outage-state.ts'
@@ -2038,6 +2039,62 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(lines).not.toContain(armingLine(P))
     expect(deps.scheduleRestartCalls).toEqual([])
     expect(getOutageFlags(P).has('tmux-unavailable')).toBe(true)
+  })
+
+  // b.jg5 SRJ-311: the tick decides P's no-attempt reason before awaiting its
+  // reads, so the arm re-checks it at arm time. Here the reason changes inside
+  // the `isSessionAlive` read, after the tick decided `tmux-unavailable` (so
+  // the tick still takes its no-attempt branch on the `dead` reading): the
+  // flag is cleared, or a launch goes in flight. Nothing is armed, no arming
+  // line is logged and `isRetryArmed` is never asked.
+  /** Wrap P's liveness read so `change` runs just before it answers. */
+  function changingAtRead(deps: Deps, change: () => void): void {
+    const read = deps.isSessionAlive
+    deps.isSessionAlive = async (key) => {
+      if (key === P) change()
+      return read(key)
+    }
+  }
+
+  // [how the flag is cleared, the clear, the outage notices it leaves]
+  const CLEARS_DURING_READ: Array<[string, () => void, string[]]> = [
+    // A teardown's `resetOutageState` (production binds it to resetAllToHealthy): silent.
+    ['by a teardown (resetAllToHealthy)', () => resetAllToHealthy([P]), [ONSET]],
+    ['by a real clear (clearOutageFlag)', () => clearOutageFlag(P, 'tmux-unavailable'), [ONSET, ALL_CLEAR]],
+  ]
+
+  test.each(CLEARS_DURING_READ)('b.jg5 SRJ-311: tmux-unavailable raised with no retry timer armed, the flag cleared %s during P\'s liveness read, which then reads dead: nothing is armed and no arming line logged', async (_how, clear, texts) => {
+    const deps = makeDeps({ personas: workList(P), retryArmedResult: false, recordRetryArms: true, maxTicks: 1 })
+    tmuxUnavailable(deps)
+    changingAtRead(deps, clear)
+
+    const lines = await capturingErrors(() => runTicks(deps, 1))
+
+    expect(deps.isSessionAliveCalls).toEqual([P])
+    expect(deps.isRetryArmedCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(lines).toEqual([])
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(getOutageFlags(P).has('tmux-unavailable')).toBe(false)
+    expect(notices).toEqual(texts.map((text) => ({ key: P, text })))
+  })
+
+  test('b.jg5 SRJ-311: tmux-unavailable raised with no retry timer armed, a launch going in flight during P\'s liveness read, which then reads dead: nothing is armed and no arming line logged; the flag stays raised', async () => {
+    const deps = makeDeps({ personas: workList(P), retryArmedResult: false, recordRetryArms: true, maxTicks: 1 })
+    tmuxUnavailable(deps)
+    let launched = false
+    deps.isLaunchInFlight = (key) => key === P && launched
+    changingAtRead(deps, () => { launched = true })
+
+    const lines = await capturingErrors(() => runTicks(deps, 1))
+
+    expect(deps.isSessionAliveCalls).toEqual([P])
+    expect(deps.isRetryArmedCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(lines).toEqual([])
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(getOutageFlags(P).has('tmux-unavailable')).toBe(true)
+    expect(notices).toEqual([{ key: P, text: ONSET }])
   })
 
   test('isolation: P with tmux-unavailable raised and B under neither rule, both dead with no retry timer armed, over two ticks: only P\'s timer is armed (once per tick); B is never asked about, armed for or logged, and is scheduled each tick as today', async () => {
