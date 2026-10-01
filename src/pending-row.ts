@@ -23,8 +23,8 @@
  *
  * Where later work plugs in: E28 builds the launch start's uses and the
  * row's ageing on this reader, E29 adds the pending-row rule to this module,
- * and E17 (the dialog approver) and E21 (the live-row sequence) read the
- * launch start through it.
+ * and E17 (the dialog approver), E21 (the live-row sequence) and E27 (the
+ * old-life wait) read the launch start through it.
  *
  * Pure: no module-scope state, no clock, no I/O, no agent-director call, no
  * log line, nothing run at import. Nothing names an export only the Phase 1

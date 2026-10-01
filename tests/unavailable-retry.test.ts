@@ -123,12 +123,9 @@ import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, rec
 import type { Persona } from '../src/config.ts'
 import {
   CONFLICT_LATCH_SET_LATCHED,
-  LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   LATCH_CASE_LEFTOVER,
   LATCH_ROW_STATE_NO_ROW,
-  REFUSED_OPERATION_NONE,
   REFUSED_OPERATION_PLAIN_SPAWN,
-  latchRowStateRead,
   launchStartNotRecordedNoticeText,
   type LatchRowState,
 } from '../src/conflict-latch.ts'
@@ -283,8 +280,6 @@ import {
   errUnusableName,
   holdSpawns,
   SAMPLE_LAUNCH_START_FRACTIONAL,
-  SAMPLE_LAUNCH_START_NONE,
-  SAMPLE_LAUNCH_START_WHOLE,
   SAMPLE_LAUNCH_STARTS,
   unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
@@ -296,7 +291,13 @@ import {
   REDACTED_SENTINEL_TAIL,
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
-import { conflictForPersona, conflictNoticeForPersona } from './test-helpers/conflict-cases.ts'
+import {
+  NO_LAUNCH_START_FORMS,
+  NO_LAUNCH_START_FORM_NAMES,
+  conflictForPersona,
+  conflictNoticeForPersona,
+  launchStartRecord,
+} from './test-helpers/conflict-cases.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { startManualPoller } from './test-helpers/permission-relay-harness.ts'
 import {
@@ -1666,6 +1667,27 @@ describe('unavailable retry: the retry action’s decisions over stand-ins', () 
     const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, {}, err)
 
     await expect(createFullModeRetryAction(deps)(KEY, PENDING_ONLY_RETRY)).rejects.toBe(err)
+    expect(deps.reads).toEqual([[KEY, true]])
+    expect(deps.calls).toEqual([])
+  })
+
+  // b.jg5 SRJ-305, SRJ-512, SRJ-513: the latched query asked again after the
+  // row read. On the harness the latch's hold stops the timer first, so this
+  // backstop is reached only here: the persona latches during the read, which
+  // answers a row that would otherwise be handed to the restart path.
+  test('pending-only: a row read during which the persona latches, answering ended, stops with the latch’s reason, with no hand-off and no retry entry call', async () => {
+    let latchedNow = false
+    const base = fullModeDeps(RESTART_OUTCOME_LAUNCHED, { isLatched: () => latchedNow }, 'ended')
+    const deps: StandInDeps = {
+      ...base,
+      readRow: async (key) => {
+        const row = await base.readRow(key)
+        latchedNow = true
+        return row
+      },
+    }
+
+    expect(await createFullModeRetryAction(deps)(KEY, PENDING_ONLY_RETRY)).toEqual({ kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_LATCHED })
     expect(deps.reads).toEqual([[KEY, true]])
     expect(deps.calls).toEqual([])
   })
@@ -5978,13 +6000,6 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
 // pending-only retry refuses on the row as E8 T4 left it.
 // ---------------------------------------------------------------------------
 
-/** Launch-start values that are none (b.jg5 SRJ-408): the key left out, `null`, and one that does not parse (no zone). */
-const NO_LAUNCH_START_FORMS: ReadonlyArray<readonly [string, string | null | undefined]> = [
-  ['absent', SAMPLE_LAUNCH_START_NONE],
-  ['null', null],
-  ['unparseable (no zone)', SAMPLE_LAUNCH_START_WHOLE.replace(/Z$/, '')],
-]
-
 /** From now on persona `key`'s `status` reads its own row `pending` with `launchStartedAt` (the key left out for `undefined`); every other persona has no row. */
 function pendingRowFor(h: RecoveryHarness, key: string, launchStartedAt: string | null | undefined): void {
   h.script({
@@ -5994,14 +6009,14 @@ function pendingRowFor(h: RecoveryHarness, key: string, launchStartedAt: string 
   })
 }
 
-/** Persona `key` latched once with "launch start not recorded" and the state `pending`; the holds ran before its one SRJ-1020 post; nothing counted. */
-function expectLaunchStartLatchedOnce(h: RecoveryHarness, key: string): void {
-  expect(h.latch.record(key)).toEqual({
-    sessionName: personaTmuxSessionName(key),
-    latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED,
-    refusedOperation: REFUSED_OPERATION_NONE,
-    rowState: latchRowStateRead(UNAVAILABLE_RETRY_ROW_PENDING),
-  })
+/**
+ * The retry's read latched persona `key` once with "launch start not
+ * recorded" (`launchStartRecord`), and the latch's holds, the retry timer's
+ * stop first, ran before its one SRJ-1020 post; the timer stopped with the
+ * latch's reason; nothing counted.
+ */
+function expectRetryStoppedByLaunchStartLatch(h: RecoveryHarness, key: string): void {
+  expect(h.latch.record(key)).toEqual(launchStartRecord(key))
   const steps = h.latchEvents.filter((event) => event.key === key).map((event) =>
     event.step === 'set' ? [event.step, event.outcome] : event.step === 'hold' ? [event.step, event.hold] : [event.step, event.text])
   expect(steps).toEqual([
@@ -6022,18 +6037,18 @@ function expectLaunchStartLatchedOnce(h: RecoveryHarness, key: string): void {
 }
 
 describe('unavailable retry: a retry whose row read finds P’s own pending row with no launch start latches P and stops (SRJ-303, SRJ-305, SRJ-513)', () => {
-  test.each(NO_LAUNCH_START_FORMS)('pending-only, launch start %s: the retry’s one row read latches P once and stops the timer with the latch’s reason; no call follows the read; nothing fires for P past several waits', async (_form, start) => {
+  test.each([...NO_LAUNCH_START_FORM_NAMES])('pending-only, launch start %s: the retry’s one row read latches P once and stops the timer with the latch’s reason; no call follows the read; nothing fires for P past several waits', async (form) => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
-    pendingRowFor(h, key, start)
+    pendingRowFor(h, key, NO_LAUNCH_START_FORMS[form])
     h.controller.armPendingOnly(key)
 
     await retryNow(h, key)
 
     expect(callCounts(h)).toEqual({ statusCalls: 1 })
     expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(key) }])
-    expectLaunchStartLatchedOnce(h, key)
+    expectRetryStoppedByLaunchStartLatch(h, key)
     expectNeverDestructive(h, key)
     expect(retryLinesOf(h, key)).toEqual([
       pendingOnlyArmedLine(key),
@@ -6050,7 +6065,7 @@ describe('unavailable retry: a retry whose row read finds P’s own pending row 
     expectUntouchedEpisode(h, other)
   })
 
-  test.each(NO_LAUNCH_START_FORMS)('full mode (armed by an UNAVAILABLE launch), launch start %s: the next retry’s liveness read latches P once and stops the timer with the latch’s reason; no call follows the read; nothing fires for P past several waits', async (_form, start) => {
+  test.each([...NO_LAUNCH_START_FORM_NAMES])('full mode (armed by an UNAVAILABLE launch), launch start %s: the next retry’s liveness read latches P once and stops the timer with the latch’s reason; no call follows the read; nothing fires for P past several waits', async (form) => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
@@ -6059,7 +6074,7 @@ describe('unavailable retry: a retry whose row read finds P’s own pending row 
     expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
     expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_FULL })
     h.script({ spawnError: undefined })
-    pendingRowFor(h, key, start)
+    pendingRowFor(h, key, NO_LAUNCH_START_FORMS[form])
 
     const before = callCounts(h)
     await retryNow(h, key)
@@ -6067,7 +6082,7 @@ describe('unavailable retry: a retry whose row read finds P’s own pending row 
     expect(h.attempts.map((a) => [a.key, a.mode])).toEqual([[key, UNAVAILABLE_RETRY_MODE_FULL]])
     expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
     expect(h.stub.calls.statusCalls.at(-1)).toEqual({ claude_instance_id: personaInstanceId(key) })
-    expectLaunchStartLatchedOnce(h, key)
+    expectRetryStoppedByLaunchStartLatch(h, key)
     // The launch's UNAVAILABLE spawn started the tmux-unresponsive condition; the latch's hold ended it.
     expect(conditionLines(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_LATCHED))
     expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_LATCHED))

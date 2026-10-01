@@ -172,7 +172,16 @@
  * post; such a row under a key outside the configuration latches no one. A
  * CONFLICT or an UNUSABLE NAME whose latch-time `status` read finds such a
  * row leaves P latched with the launch-start case alone, one post (hatch
- * A2). A lost message: its read of such a row latches P and reports
+ * A2). A relatch through a real read (the shared own-row `status` read,
+ * `readPersonaOwnRowStatus`): P latched first on a CONFLICT (at its launch)
+ * or on "unusable recorded name" (at a `status` read) relatches on a read
+ * of its own `pending` row with no launch start, the record replaced
+ * (`launchStartRecord`), the first episode ended, one SRJ-1020 post and the
+ * step's "the persona relatched" line; and P latched on the launch-start
+ * case relatches on a read answering UNUSABLE NAME with one SRJ-1019 post.
+ * Expected hold records come from the helper (an unusable-name row's
+ * `record(key)`, `launchStartRecord(key)`), never typed here. A lost
+ * message: its read of such a row latches P and reports
  * `held-for-human` with no restart; its read answering UNUSABLE NAME does
  * the same with SRJ-1019; with a launch start it reports `session-starting`;
  * with P already latched on either hold it reports `held-for-human` with no
@@ -301,6 +310,7 @@ import {
   type ConflictLatchRecord,
   type ConflictLatchSetEvent,
   type ConflictLatchSetInput,
+  type LatchCase,
   type LatchKind,
   type LatchRecoveryReason,
   type LatchRowState,
@@ -392,18 +402,17 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import {
   CONFLICT_CASE_ROWS,
+  LAUNCH_START_ABSENT_PERSONA_KEY,
   LAUNCH_START_AND_NOTE_ROW,
+  LAUNCH_START_ANOTHER_CALLERS_ID,
   LAUNCH_START_CASE_ROWS,
   LAUNCH_START_NON_LATCHING_ROWS,
-  LAUNCH_START_READ_SHAPES,
-  LAUNCH_START_ROW_VARIANTS,
-  NO_LAUNCH_START_FORM_NAMES,
   SESSION_ENDING_COMMAND_FORMS,
   UNUSABLE_NAME_CASE_ROWS,
-  UNUSABLE_NAME_SITES,
   cscbOwnLines,
   cscbOwnText,
   expectedConflictNotice,
+  launchStartRecord,
   sessionEndingCommandsIn,
   tmuxTouchingCallCounts,
   tmuxTouchingCallsIn,
@@ -1515,15 +1524,6 @@ const latchUnusable = (latch: ConflictLatch, key: string, row: UnusableNameCaseR
 const envelopeDescriptionOf = (err: unknown): string =>
   String((err as { envelope?: { err_description?: unknown } }).envelope?.err_description)
 
-/** What a latch from `row` for `key` records: the case, "none", the row's state, the session by SRJ-501's rule and the rendered description. */
-const unusableRecord = (row: UnusableNameCaseRow, key: string): ConflictLatchRecord => ({
-  sessionName: row.sessionName(key),
-  latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME,
-  refusedOperation: REFUSED_OPERATION_NONE,
-  rowState: row.rowState,
-  description: row.description,
-})
-
 describe('the unusable-recorded-name hold: SRJ-1019\'s notice, the record and the episode (SRJ-512, SRJ-1019)', () => {
   test('SRJ-1019\'s text for one persona: the builder gives it word for word, on one line', () => {
     // The file's only literal block for this text: SRJ-1019 as written.
@@ -1597,22 +1597,19 @@ describe('the unusable-recorded-name hold: SRJ-1019\'s notice, the record and th
     }
   })
 
-  test.each(UNUSABLE_ROWS)('%s: the latch records the case, "none", the path\'s row state, slack_bot_<key> and the rendered description; the set input matches; a second persona reads not latched', (_name, row) => {
+  test.each(UNUSABLE_ROWS)('%s: the set input is the case, "none", the path\'s row state, slack_bot_<key> and the rendered description; the latch records the row\'s record; a second persona reads not latched', (_name, row) => {
     const run = makeLatchRun()
     expect(isUnusableNameError(row.build())).toBe(true)
+    expect(unusableNameSetInput(KEY, row.build(), row.rowState)).toEqual({
+      latchCase: row.latchCase,
+      refusedOperation: row.refusedOperation,
+      rowState: row.rowState,
+      sessionName: row.sessionName(KEY),
+      description: row.description,
+    })
     expect(latchUnusable(run.latch, KEY, row)).toBe(CONFLICT_LATCH_SET_LATCHED)
-    expect(run.latch.record(KEY)).toEqual(unusableRecord(row, KEY))
-    expect(unusableNameSetInput(KEY, row.build(), row.rowState)).toEqual(unusableRecord(row, KEY))
+    expect(run.latch.record(KEY)).toEqual(row.record(KEY))
     expect([run.latch.isLatched(OTHER), run.latch.record(OTHER)]).toEqual([false, undefined])
-  })
-
-  test('the table covers every site T1 wires for every fault; the plain spawn alone takes its state from the latch-time read', () => {
-    expect(UNUSABLE_NAME_CASE_ROWS.map((row) => [row.site, row.fault])).toEqual(
-      UNUSABLE_NAME_SITES.flatMap((site) => UNUSABLE_NAME_FAULTS.map((fault) => [site, fault])),
-    )
-    expect(UNUSABLE_NAME_CASE_ROWS.filter((row) => row.latchTimeRead).map((row) => row.site)).toEqual(
-      UNUSABLE_NAME_FAULTS.map((): UnusableNameSite => 'plain spawn'),
-    )
   })
 
   test('a description that quotes a session records that session (SRJ-501\'s rule)', () => {
@@ -1671,7 +1668,7 @@ describe('the unusable-recorded-name notice\'s episode (SRJ-508, SRJ-1016)', () 
     expect(kindsOpen(run, KEY)).toEqual([true, false])
 
     expect(latchUnusable(run.latch, KEY, first)).toBe(CONFLICT_LATCH_SET_RELATCHED)
-    expect(run.latch.record(KEY)).toEqual(unusableRecord(first, KEY))
+    expect(run.latch.record(KEY)).toEqual(first.record(KEY))
     expect(kindsOpen(run, KEY)).toEqual([false, true])
     expect(run.posts).toEqual([
       [KEY, conflictRow.notice.text],
@@ -2195,7 +2192,7 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
 
     h.script(latchScript(h, p))
     expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
-    expect(h.latch.record(p)).toEqual(unusableRecord(row, p))
+    expect(h.latch.record(p)).toEqual(row.record(p))
     h.script(CLEARED)
     const touchingAtLatch = tmuxTouchingCallCounts(h.stub.calls)
     const rawAtLatch = raw.length
@@ -2238,7 +2235,7 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
       statusFn: (params) => (params.claude_instance_id === personaInstanceId(p) ? cannedStatusResult({ state: 'working' }) : errSpawnNotFound()),
     })
     expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
-    expect(h.latch.record(p)).toEqual(unusableRecord(row, p))
+    expect(h.latch.record(p)).toEqual(row.record(p))
     const pCallsAtLatch = personaCallCounts(h, p)
 
     const lost = await expectLostMessageReports(h, p, 'held-for-human')
@@ -2392,12 +2389,6 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
 // AC 40, AC 45, AC 85)
 // ---------------------------------------------------------------------------
 
-/** The instance id of a caller that is not CSCB: no persona's `cscb_<key>`. */
-const ANOTHER_CALLERS_ID = 'another-caller-instance'
-
-/** A key that is no persona of any harness's configuration. */
-const ABSENT = 'absent_persona'
-
 /**
  * One row read as `decideOwnRowRead` takes it. A `pending` row shows the
  * stub's default launch start, as the canned builders give one, so the note
@@ -2448,7 +2439,7 @@ describe('the note rules: the pure decision over one read of a persona\'s own ro
 
   test.each([
     ['the row of a key not configured (an absent persona\'s own row)', personaInstanceId(KEY), false],
-    ['another caller\'s row', ANOTHER_CALLERS_ID, true],
+    ['another caller\'s row', LAUNCH_START_ANOTHER_CALLERS_ID, true],
     ['another persona\'s own row, read for P', personaInstanceId(OTHER), true],
     ['a row whose id only starts with P\'s own', `${personaInstanceId(KEY)}_x`, true],
   ] as const)('the latching note on %s decides nothing', (_name, claudeInstanceId, configured) => {
@@ -2577,13 +2568,13 @@ describe('the note latch through the own-row read: record, notice, relatch and w
     ['no note on P\'s own row', (h, p) => ({ key: p, script: ownRowAnswer(h, p, undefined) })],
     [
       `a ${provenanceNote} note on another caller's row`,
-      (_h, p) => ({ key: p, script: { getResult: cannedGetResult({ claude_instance_id: ANOTHER_CALLERS_ID, liveness_note: provenanceNote }) } }),
+      (_h, p) => ({ key: p, script: { getResult: cannedGetResult({ claude_instance_id: LAUNCH_START_ANOTHER_CALLERS_ID, liveness_note: provenanceNote }) } }),
     ],
     [
       `a ${provenanceNote} note on the own row of a key outside the configuration (an absent persona)`,
       (h) => {
-        expect(h.keys).not.toContain(ABSENT)
-        return { key: ABSENT, script: { getResult: cannedGetResult({ claude_instance_id: personaInstanceId(ABSENT), liveness_note: provenanceNote }) } }
+        expect(h.keys).not.toContain(LAUNCH_START_ABSENT_PERSONA_KEY)
+        return { key: LAUNCH_START_ABSENT_PERSONA_KEY, script: { getResult: cannedGetResult({ claude_instance_id: personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY), liveness_note: provenanceNote }) } }
       },
     ],
     [
@@ -2601,7 +2592,7 @@ describe('the note latch through the own-row read: record, notice, relatch and w
     const { key, script } = read(h, p)
     h.script(script)
     expect(await readPersonaOwnRow(key, SITE)).toMatchObject({ kind: OWN_ROW_READ_ROW, latched: false })
-    expect([...h.keys, ABSENT].filter((k) => h.latch.isLatched(k))).toEqual([])
+    expect([...h.keys, LAUNCH_START_ABSENT_PERSONA_KEY].filter((k) => h.latch.isLatched(k))).toEqual([])
     expect([h.latchEvents, h.episodeNotices, h.notices]).toEqual([[], [], []])
   })
 })
@@ -2616,15 +2607,28 @@ describe('the note latch through the own-row read: record, notice, relatch and w
 /**
  * The directory the decision cases' persona labels are computed against: its
  * `claude_config_dir` sits under it (not created; the label follows the
- * nearest existing ancestor's real path). Nothing is written there.
+ * nearest existing ancestor's real path). Nothing is written there. Made by
+ * the first case that asks for it (`mkdtempSync`) and removed in `afterEach`.
  */
-const LAUNCH_START_HOME = tmpdir()
+let launchStartHomeDir: string | undefined
 
-/** A persona the launch-start rows are built for, its directories under `LAUNCH_START_HOME`. */
+/** This case's launch-start home: made on first use, removed in `afterEach`. */
+function launchStartHome(): string {
+  launchStartHomeDir ??= mkdtempSync(join(tmpdir(), 'conflict-latch-launch-start-'))
+  return launchStartHomeDir
+}
+
+afterEach(() => {
+  const dir = launchStartHomeDir
+  launchStartHomeDir = undefined
+  if (dir !== undefined) rmSync(dir, { recursive: true, force: true })
+})
+
+/** A persona the launch-start rows are built for, its directories under `launchStartHome()`. */
 const launchStartPersona = (key: string): CannedRowPersona => ({
   key,
-  working_directory: join(LAUNCH_START_HOME, 'conflict-latch-launch-start', key, 'work'),
-  claude_config_dir: join(LAUNCH_START_HOME, 'conflict-latch-launch-start', key, 'claude'),
+  working_directory: join(launchStartHome(), key, 'work'),
+  claude_config_dir: join(launchStartHome(), key, 'claude'),
 })
 
 /** `test.each` rows over the latching launch-start rows: the row name, then the row. */
@@ -2633,16 +2637,8 @@ const LAUNCH_START_ROWS = LAUNCH_START_CASE_ROWS.map((row) => [row.name, row] as
 /** The `pending` row state a launch-start latch records. */
 const PENDING = latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)
 
-/** What a launch-start latch of persona `key` records: the case, "none", `pending`, `slack_bot_<key>` and no description. */
-const launchStartRecord = (key: string): ConflictLatchRecord => ({
-  sessionName: personaTmuxSessionName(key),
-  latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED,
-  refusedOperation: REFUSED_OPERATION_NONE,
-  rowState: PENDING,
-})
-
 /** The launch-start decision over `row` read for persona `key` (the one configured persona). */
-const launchStartDecision = (row: LaunchStartCaseRow, key = KEY) => decideOwnRowRead(row.decisionInput(launchStartPersona(key), LAUNCH_START_HOME))
+const launchStartDecision = (row: LaunchStartCaseRow, key = KEY) => decideOwnRowRead(row.decisionInput(launchStartPersona(key), launchStartHome()))
 
 /** The latching row of `shape` for P's current life, its launch start absent. */
 function currentLifeRow(shape: LaunchStartCaseRow['shape']): LaunchStartCaseRow {
@@ -2659,31 +2655,23 @@ function latchFromLaunchStartRead(latch: ConflictLatch, key: string, row: Launch
 }
 
 describe('the launch-start decision over one read of a persona\'s own row (SRJ-513, SRJ-408)', () => {
-  test('the latching rows cover every read shape (status, get and list), every row variant and every form of no launch start', () => {
-    expect(LAUNCH_START_CASE_ROWS.map((row) => [row.shape, row.variant, row.form])).toEqual(
-      LAUNCH_START_READ_SHAPES.flatMap((shape) =>
-        LAUNCH_START_ROW_VARIANTS.flatMap((variant) => NO_LAUNCH_START_FORM_NAMES.map((form) => [shape, variant, form])),
-      ),
-    )
-  })
-
   test.each(LAUNCH_START_ROWS)('%s: the decision latches with "launch start not recorded", "none" and pending; latched from it, P records that with slack_bot_<key> and the post is the row\'s notice, once', (_name, row) => {
     expect(launchStartDecision(row)).toEqual({
       latch: { latchCase: row.latchCase, refusedOperation: row.refusedOperation, rowState: row.rowState },
     })
     const run = makeNoticeRun()
     expect(latchFromLaunchStartRead(run.latch, KEY, row)).toBe(CONFLICT_LATCH_SET_LATCHED)
-    expect(run.latch.record(KEY)).toEqual({ ...launchStartRecord(KEY), sessionName: row.sessionName(KEY) })
+    expect(run.latch.record(KEY)).toEqual(row.record(KEY))
     expect(run.posts).toEqual([[KEY, row.notice(KEY)]])
   })
 
   test.each(LAUNCH_START_NON_LATCHING_ROWS.map((row) => [row.name, row] as const))('%s decides nothing', (_name, row) => {
-    expect(decideOwnRowRead(row.decisionInput(launchStartPersona(KEY), LAUNCH_START_HOME))).toEqual(ROW_READ_NO_DECISION)
+    expect(decideOwnRowRead(row.decisionInput(launchStartPersona(KEY), launchStartHome()))).toEqual(ROW_READ_NO_DECISION)
   })
 
   test('a row carrying both the provenance_conflict note and no launch start decides "launch start not recorded" only, never "conflicting labels"', () => {
     const row = LAUNCH_START_AND_NOTE_ROW
-    expect(row.readRow(launchStartPersona(KEY), LAUNCH_START_HOME).liveness_note).toBe(provenanceNote)
+    expect(row.readRow(launchStartPersona(KEY), launchStartHome()).liveness_note).toBe(provenanceNote)
     expect(launchStartDecision(row)).toEqual(ROW_READ_LAUNCH_START_NOT_RECORDED)
     expect(launchStartDecision(row).latch?.latchCase).toBe(LATCH_CASE_LAUNCH_START_NOT_RECORDED)
   })
@@ -2699,9 +2687,8 @@ describe('SRJ-1020\'s notice for a launch start not recorded', () => {
     expect(expected.includes(CONFLICT_NOTICE_LINE_SEPARATOR)).toBe(false)
   })
 
-  test('the notice is every latching row\'s expected notice; it quotes the persona\'s session, points to "Operator actions" for a human only, and CSCB\'s words name no session-ending command, include-finished, kill-pane, set-option, agent-director delete or clear-latch', () => {
+  test('the notice quotes the persona\'s session, points to "Operator actions" for a human only, and CSCB\'s words name no session-ending command, include-finished, kill-pane, set-option, agent-director delete or clear-latch', () => {
     const notice = launchStartNotRecordedNoticeText(KEY)
-    expect(new Set(LAUNCH_START_CASE_ROWS.map((row) => row.notice(KEY)))).toEqual(new Set([notice]))
     expect(notice.includes(JSON.stringify(personaTmuxSessionName(KEY)))).toBe(true)
     expect(notice.includes(LAUNCH_START_NOTICE_POINTER)).toBe(true)
     expect(notice.includes(JSON.stringify(operatorActionsTitle()))).toBe(true)
@@ -2759,7 +2746,12 @@ describe('the launch-start latch\'s record and episode (SRJ-513, SRJ-508, SRJ-10
     expect(latchFromLaunchStartRead(run.latch, KEY, get)).toBe(CONFLICT_LATCH_SET_LATCHED)
     const record = run.latch.record(KEY)
     expect(record).toEqual(launchStartRecord(KEY))
-    expect(launchStartNotRecordedSetInput(KEY, PENDING)).toEqual(launchStartRecord(KEY))
+    expect(launchStartNotRecordedSetInput(KEY, PENDING)).toEqual({
+      latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+      refusedOperation: REFUSED_OPERATION_NONE,
+      rowState: PENDING,
+      sessionName: personaTmuxSessionName(KEY),
+    })
     const episode = run.episodes.view(KEY, PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED)
     expect(episode?.caseLabel).toBe(LATCH_CASE_LAUNCH_START_NOT_RECORDED)
     expect(kindsOpen(run, KEY)).toEqual([false, false, true])
@@ -2902,6 +2894,9 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
     const pAtLatch = personaCallCounts(h, p)
     const touchingAtLatch = tmuxTouchingCallCounts(h.stub.calls)
     const findMissingAtLatch = h.stub.calls.findMissingCalls.length
+    // An origin may itself have run restart work or stopped P's timer; only what the paths below add is checked.
+    const outcomesAtLatch = outcomes.length
+    const pStopsAtLatch = h.stops.filter((stop) => stop.key === p).length
 
     const { launched, qCalls, notScheduledLines, attemptsBefore } = await driveEveryPath(run)
 
@@ -2913,11 +2908,13 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
     expect(tmuxTouchingCallsIn(h.stub.calls).filter((call) => (call.verb === 'send-keys' || call.verb === 'kill') && instanceOf(call.params) === personaInstanceId(p))).toEqual([])
     // Each path stopped for P: the launch and the retry entry answered latched, no restart timer, the retry timer stopped latched.
     expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
-    expect(outcomes.filter(([key]) => key === p).map(([, outcome]) => outcome).every((outcome) => outcome === RESTART_OUTCOME_LATCHED)).toBe(true)
-    expect(outcomes.filter(([key]) => key === q)).toEqual([1, 2, 3, 4].map(() => [q, RESTART_OUTCOME_LAUNCHED]))
+    expect(outcomes.slice(outcomesAtLatch)).toEqual([
+      [p, RESTART_OUTCOME_LATCHED],
+      ...[1, 2, 3, 4].map(() => [q, RESTART_OUTCOME_LAUNCHED] as const),
+    ])
     expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
     expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual([[p, 1], [q, 1], [q, 2]])
-    expect(h.stops.filter((stop) => stop.key === p).at(-1)).toEqual({ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED })
+    expect(h.stops.filter((stop) => stop.key === p).slice(pStopsAtLatch)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
     expect([h.controller.isArmed(p), h.controller.armedKeys(), isRestartPendingOrActive(p)]).toEqual([false, [], false])
     // Nothing counted, no spawn-failure notice or spawn-failed entry, one latch and exactly one post: SRJ-1020.
     expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 0])
@@ -2933,8 +2930,8 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
   /** A key outside the harness's personas, or a persona removed from the applied configuration, whose row reads `pending` with no launch start. */
   const UNCONFIGURED_KEYS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => string]> = [
     ['a key outside the harness\'s personas', (h) => {
-      expect(h.keys).not.toContain(ABSENT)
-      return ABSENT
+      expect(h.keys).not.toContain(LAUNCH_START_ABSENT_PERSONA_KEY)
+      return LAUNCH_START_ABSENT_PERSONA_KEY
     }],
     ['a persona removed from the applied configuration', (h, p) => {
       h.remove(p)
@@ -2957,7 +2954,7 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
 
     expect(await readPersonaOwnRow(key, site)).toMatchObject({ kind: OWN_ROW_READ_ROW, latched: false })
     expect(await readPersonaOwnRowStatus(key, site)).toMatchObject({ kind: OWN_ROW_STATUS_STATE, state: AGENT_DIRECTOR_PENDING_STATE })
-    expect([...h.keys, ABSENT].filter((k) => h.latch.isLatched(k))).toEqual([])
+    expect([...h.keys, LAUNCH_START_ABSENT_PERSONA_KEY].filter((k) => h.latch.isLatched(k))).toEqual([])
     expect([h.latchEvents, h.episodeNotices, h.notices]).toEqual([[], [], []])
   })
 })
@@ -2984,6 +2981,106 @@ describe('SRJ-513, A2: a CONFLICT or an UNUSABLE NAME whose latch-time status re
     expect(h.episodeNotices).toEqual([{ key: p, text: launchStartNotRecordedNoticeText(p) }])
     expect(personaCallCounts(h, p)).toEqual({ spawnCalls: 1, statusCalls: 1 })
     expect([h.notices, getFailureCount(p), h.latch.isLatched(q)]).toEqual([[], 0, false])
+  })
+})
+
+describe('SRJ-513, SRJ-512: P latched on another case relatches through a real own-row status read with one new post (recovery harness)', () => {
+  /** The reading site the step's lines name. */
+  const SITE: OwnRowReadSite = { site: 'conflict-latch.test', what: 'own-row status read' }
+  const conflictRow = rowWhere(
+    (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.latchCase === LATCH_CASE_LEFTOVER && row.rowState !== LATCH_ROW_STATE_NO_ROW,
+  )
+  const unusable = unusableRow('status', 'empty')
+
+  /** `[slack] <site>: <what> for persona=<key>`: the head of every line the step logs for `key` at `SITE`. */
+  const stepHead = (key: string) => `[slack] ${SITE.site}: ${SITE.what} for persona=${key}`
+  /** The lines the step logged at `SITE` for `key` since `from` (an index into `h.errors`). */
+  const stepLinesSince = (h: RecoveryHarness, key: string, from: number) => h.errors.slice(from).filter((line) => line.startsWith(`${stepHead(key)}:`))
+
+  /** A `status` answer: persona `p`'s own row answers UNUSABLE NAME; every other persona's row is gone. */
+  const pUnusableStatus = (p: string): RecoveryStubScript => ({
+    statusFn: (params) => (params.claude_instance_id === personaInstanceId(p) ? unusable.build() : errSpawnNotFound()),
+  })
+
+  /** Each way P is latched first through a real path: the case it holds, its one post and the episode kind it opened. */
+  const FIRST_LATCHES: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => Promise<unknown>, LatchCase, (p: string) => string, PersonaEpisodeKind]> = [
+    [
+      'a CONFLICT (a case-table row) at P\'s launch',
+      async (h, p) => {
+        h.script({ spawnError: conflictRow.build() })
+        expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+        h.script({ spawnError: undefined })
+      },
+      LATCH_CASE_LEFTOVER,
+      () => conflictRow.notice.text,
+      PERSONA_EPISODE_KIND_CONFLICT,
+    ],
+    [
+      '"unusable recorded name" at a status read',
+      async (h, p) => {
+        h.script(pUnusableStatus(p))
+        expect(await readPersonaOwnRowStatus(p, SITE)).toEqual({ kind: OWN_ROW_STATUS_LATCHED, rowState: LATCH_ROW_STATE_UNREADABLE })
+        expect(h.latch.record(p)).toEqual(unusable.record(p))
+      },
+      LATCH_CASE_UNUSABLE_RECORDED_NAME,
+      (p) => unusable.notice(p),
+      PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME,
+    ],
+  ]
+
+  test.each(FIRST_LATCHES)('P latched first on %s: a status read of P\'s own pending row with no launch start relatches it with "launch start not recorded", ends the first episode, posts SRJ-1020 once and logs the relatched line', async (_label, latchFirst, firstCase, firstPost, firstKind) => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p, q] = h.keys as [string, string]
+    await latchFirst(h, p)
+    expect(h.latch.record(p)?.latchCase).toBe(firstCase)
+    expect(h.episodes.isOpen(p, firstKind)).toBe(true)
+
+    h.script(pNoLaunchStartStatus(p))
+    const from = h.errors.length
+    expect(await readPersonaOwnRowStatus(p, SITE)).toEqual({ kind: OWN_ROW_STATUS_LATCHED, rowState: PENDING })
+
+    expect(h.latch.record(p)).toEqual(launchStartRecord(p))
+    expect(harnessSetOutcomes(h)).toEqual([[p, CONFLICT_LATCH_SET_LATCHED], [p, CONFLICT_LATCH_SET_RELATCHED]])
+    expect([h.episodes.isOpen(p, firstKind), h.episodes.isOpen(p, PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED)]).toEqual([false, true])
+    expect(h.episodeNotices).toEqual([
+      { key: p, text: firstPost(p) },
+      { key: p, text: launchStartNotRecordedNoticeText(p) },
+    ])
+    expect(stepLinesSince(h, p, from)).toEqual([
+      `${stepHead(p)}: its row read latches the persona (case=${LATCH_CASE_LAUNCH_START_NOT_RECORDED}, state=${AGENT_DIRECTOR_PENDING_STATE}) — the persona relatched; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)`,
+    ])
+    expect([h.notices, h.latch.isLatched(q)]).toEqual([[], false])
+  })
+
+  test('P latched on "launch start not recorded" by a status read: a status read answering UNUSABLE NAME relatches it with "unusable recorded name", ends the launch-start episode, posts SRJ-1019 once and logs the relatched line', async () => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p, q] = h.keys as [string, string]
+    h.script(pNoLaunchStartStatus(p))
+    expect(await readPersonaOwnRowStatus(p, SITE)).toEqual({ kind: OWN_ROW_STATUS_LATCHED, rowState: PENDING })
+    expect(h.latch.record(p)).toEqual(launchStartRecord(p))
+    expect(h.episodes.isOpen(p, PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED)).toBe(true)
+
+    h.script(pUnusableStatus(p))
+    const from = h.errors.length
+    expect(await readPersonaOwnRowStatus(p, SITE)).toEqual({ kind: OWN_ROW_STATUS_LATCHED, rowState: LATCH_ROW_STATE_UNREADABLE })
+
+    expect(h.latch.record(p)).toEqual(unusable.record(p))
+    expect(harnessSetOutcomes(h)).toEqual([[p, CONFLICT_LATCH_SET_LATCHED], [p, CONFLICT_LATCH_SET_RELATCHED]])
+    expect([
+      h.episodes.isOpen(p, PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED),
+      h.episodes.isOpen(p, PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME),
+    ]).toEqual([false, true])
+    expect(h.episodeNotices).toEqual([
+      { key: p, text: launchStartNotRecordedNoticeText(p) },
+      { key: p, text: unusable.notice(p) },
+    ])
+    // The answer is rendered by the redacting describer between the head and the outcome.
+    const lines = stepLinesSince(h, p, from)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]!.endsWith(' — UNUSABLE NAME: the persona relatched; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)')).toBe(true)
+    expect([h.notices, h.latch.isLatched(q)]).toEqual([[], false])
   })
 })
 
@@ -3024,7 +3121,7 @@ describe('SRJ-513, SRJ-1011: a message lost for P whose row reads pending with n
       statusFn: (params) => (params.claude_instance_id === personaInstanceId(key) ? errUnusableName('empty') : errSpawnNotFound()),
     }))
     await expectLostMessageReports(h, p, 'held-for-human', { calls: { statusCalls: 1 } })
-    expect(h.latch.record(p)).toEqual(unusableRecord(row, p))
+    expect(h.latch.record(p)).toEqual(row.record(p))
     expect(h.episodeNotices).toEqual([{ key: p, text: row.notice(p) }])
     expectNoRestartFor(h, p)
     expect(h.latch.isLatched(q)).toBe(false)
@@ -3046,7 +3143,7 @@ describe('SRJ-513, SRJ-1011: a message lost for P whose row reads pending with n
     [
       'on "unusable recorded name"',
       () => ({ statusError: errUnusableName('empty') }),
-      (p) => unusableRecord(unusableRow('status', 'empty'), p),
+      (p) => unusableRow('status', 'empty').record(p),
       (p) => unusableRow('status', 'empty').notice(p),
     ],
   ]

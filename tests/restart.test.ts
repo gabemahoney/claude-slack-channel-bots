@@ -85,13 +85,12 @@ import {
 import {
   conflictNoticeText,
   createConflictLatch,
-  LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   LATCH_CASE_LEFTOVER,
   latchRowStateRead,
   launchStartNotRecordedNoticeText,
-  REFUSED_OPERATION_NONE,
   REFUSED_OPERATION_PLAIN_SPAWN,
   type ConflictLatch,
+  type ConflictLatchRecord,
 } from '../src/conflict-latch.ts'
 import { createPersonaBringUpController, type PersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { PERSONA_CONFIG_DIR_UNRESOLVABLE } from '../src/persona-diagnostics.ts'
@@ -169,9 +168,14 @@ import {
   retryNow,
   rowReadsUntilSpawn,
   type RecoveryHarness,
-  type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
-import { UNUSABLE_NAME_CASE_ROWS, tmuxTouchingCallsIn } from './test-helpers/conflict-cases.ts'
+import {
+  NO_LAUNCH_START_FORMS,
+  NO_LAUNCH_START_FORM_NAMES,
+  UNUSABLE_NAME_CASE_ROWS,
+  launchStartRecord,
+  tmuxTouchingCallsIn,
+} from './test-helpers/conflict-cases.ts'
 import {
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
   tmuxUnresponsiveOnsetText,
@@ -5496,31 +5500,92 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-502, SRJ-512 — a restart run whose own liveness read latches P
+// b.jg5 SRJ-502, SRJ-512, SRJ-513 — a restart run whose own liveness read
+// latches P
 //
-// The real liveness adapter applies the own-row `status` step, so an UNUSABLE
-// NAME answer from P's row latches P (the case "unusable recorded name", the
-// state unreadable) and reads `unknown`. The restart work asks the latch
-// again right after each probe: after the first probe, and after b.d61's
-// re-probe that follows an escalate-dead reconnect (a `working` row whose
-// tmux session is gone, swept once). Either way the run answers
-// `RESTART_OUTCOME_LATCHED` with no `pending` deferral, no further reconnect,
-// no kill, spawn or `resume`, no arm hook and nothing recorded (P's one
-// failure on record stays one: a success would reset it, a counted failure
-// raise it), for a scheduled restart, a human-triggered restart request and
-// the UNAVAILABLE retry entry alike. The latch's holds and its one SRJ-1019
-// post run as `main()` binds them (the recovery harness). Q beside it, whose
-// row reads `ended`, is killed and relaunched as before. The scheduled
-// entries wait out their short restart timers with `Bun.sleep(WAIT_MS)`.
+// The real liveness adapter applies the own-row `status` step with the
+// configured-persona query the recovery harness installs (as `main()` does),
+// so P's own read latches P and reads `unknown` when it answers UNUSABLE NAME
+// (the case "unusable recorded name", the state unreadable) or reads P's own
+// row `pending` with no launch start (absent, `null` or one that does not
+// parse: "launch start not recorded", refused operation "none", the state
+// `pending`). The restart work asks the latch again right after each probe:
+// after the first probe, and (UNUSABLE NAME) after b.d61's re-probe that
+// follows an escalate-dead reconnect (a `working` row whose tmux session is
+// gone, swept once). Either way the run answers `RESTART_OUTCOME_LATCHED` with
+// no `pending` deferral, no further reconnect, no kill, spawn, `resume` or
+// send-keys, no arm hook and nothing recorded (P's one failure on record
+// stays one: a success would reset it, a counted failure raise it), for a
+// scheduled restart, a human-triggered restart request and E8's retry entry
+// alike. The latch's holds and its one SRJ-1019 or SRJ-1020 post run as
+// `main()` binds them. Control: P's pending row with a launch start latches
+// no one and is handed to the `pending` deferral as E9 left it. Q beside P,
+// whose row reads `ended`, is killed and relaunched as before. One fault row
+// and one no-launch-start form per entry: every fault and form is covered at
+// the adapters, in tests/server.test.ts. The scheduled entries wait out their
+// short restart timers with `Bun.sleep(WAIT_MS)`.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-512: a restart run whose own liveness read latches P stops there', () => {
-  /** The first `status` row of the unusable-name table (every fault is covered at the adapter, in tests/server.test.ts). */
-  const ROW = UNUSABLE_NAME_CASE_ROWS.find((row) => row.site === 'status')!
+/** The restart work's line for a latched persona. */
+const latchedSkipLine = (key: string): string =>
+  `[slack] Skipping restart for persona=${key} — the persona is latched; no agent-director call, nothing recorded (b.jg5 SRJ-502)`
 
-  /** The restart work's line for a latched persona. */
-  const skipLine = (key: string): string =>
-    `[slack] Skipping restart for persona=${key} — the persona is latched; no agent-director call, nothing recorded (b.jg5 SRJ-502)`
+/** How each entry runs persona `key`'s restart work, waiting for it as the file does. */
+type RestartEntry = (key: string, cwd: string) => Promise<void>
+const RESTART_ENTRIES: ReadonlyArray<readonly [string, RestartEntry]> = [
+  ['a scheduled restart', async (key, cwd) => {
+    scheduleRestart(key, cwd)
+    await Bun.sleep(WAIT_MS)
+  }],
+  ['a human-triggered restart request', async (key, cwd) => {
+    scheduleRestart(key, cwd, undefined, { humanTrigger: true })
+    await Bun.sleep(WAIT_MS)
+  }],
+  ["E8's retry entry (runRestartRetry)", async (key, cwd) => {
+    await runRestartRetry(key, cwd, isLaunchInFlight)
+  }],
+]
+
+/** P's `status` answer for its `read`-th own-row read (from 0). */
+type OwnStatusAnswer = (read: number) => ReturnType<typeof cannedStatusResult> | Error
+
+/**
+ * A recovery harness whose restart deps record each `pending` deferral, each
+ * arm-hook call and each run's outcome. P's `status` answers `ownStatus` for
+ * each of its reads; Q's (every other persona's) reads `ended` until its
+ * relaunch's spawn, then `waiting`. P has one failure on record.
+ */
+function ownReadLatchHarness(ownStatus: OwnStatusAnswer) {
+  const deferred: string[] = []
+  const armHook: string[] = []
+  const outcomes: Array<{ key: string; outcome: unknown }> = []
+  const h = makeRecoveryHarness({
+    alertThresholdMs: false,
+    restartDeps: {
+      getRestartDelay: () => FAST_DELAY_S,
+      deferPendingRow: (key) => { deferred.push(key) },
+      armRetryTimer: (key) => { armHook.push(key) },
+      serialize: async <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
+        const outcome = await operation()
+        outcomes.push({ key, outcome })
+        return outcome
+      },
+    },
+  })
+  const [p, q] = [h.keys[0]!, h.keys[1]!]
+  const cwdOf = (key: string): string => h.config.personas.find((persona) => persona.key === key)!.working_directory
+  const othersRow = rowReadsUntilSpawn(h, 'ended')
+  let ownReads = 0
+  h.script({
+    statusFn: (params) => params.claude_instance_id === personaInstanceId(p) ? ownStatus(ownReads++) : othersRow(params),
+  })
+  recordFailure(p)
+  return { h, p, q, cwdOf, deferred, armHook, outcomes }
+}
+
+describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches P stops there', () => {
+  /** The first `status` row of the unusable-name table. */
+  const UNUSABLE_NAME_ROW = UNUSABLE_NAME_CASE_ROWS.find((row) => row.site === 'status')!
 
   let harness: RecoveryHarness | undefined
 
@@ -5537,21 +5602,55 @@ describe('b.jg5 SRJ-512: a restart run whose own liveness read latches P stops t
     expect(h.clock.pendingCount()).toBe(0)
   })
 
-  /** How each entry runs persona `key`'s restart work, waiting for it as the file does. */
-  type Entry = (key: string, cwd: string) => Promise<void>
-  const ENTRIES: Array<[string, Entry]> = [
-    ['a scheduled restart', async (key, cwd) => {
-      scheduleRestart(key, cwd)
-      await Bun.sleep(WAIT_MS)
-    }],
-    ['a human-triggered restart request', async (key, cwd) => {
-      scheduleRestart(key, cwd, undefined, { humanTrigger: true })
-      await Bun.sleep(WAIT_MS)
-    }],
-    ["E8's retry entry (runRestartRetry)", async (key, cwd) => {
-      await runRestartRetry(key, cwd, isLaunchInFlight)
-    }],
-  ]
+  /** What a latching case expects of P: its stub calls by verb, its latch record and its one notice. */
+  interface LatchExpectation {
+    readonly calls: Record<string, number>
+    readonly record: (key: string) => ConflictLatchRecord
+    readonly notice: (key: string) => string
+  }
+
+  /** Run P's restart work through `run`, expect it latched as `expected` says, then Q's, relaunched as before. */
+  async function expectLatchedThenOtherRelaunched(
+    rig: ReturnType<typeof ownReadLatchHarness>,
+    run: RestartEntry,
+    expected: LatchExpectation,
+  ): Promise<void> {
+    const { h, p, q, cwdOf, deferred, armHook, outcomes } = rig
+
+    await run(p, cwdOf(p))
+
+    expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }])
+    expect(callCounts(h)).toEqual(expected.calls)
+    expect(personaCallCounts(h, p)).toEqual({ statusCalls: expected.calls.statusCalls! })
+    expect(tmuxTouchingCallsIn(h.stub.calls)).toEqual([])
+    expect(h.latch.record(p)).toEqual(expected.record(p))
+    expect(h.latchEvents.filter((event) => event.step === 'set').map((event) => event.key)).toEqual([p])
+    expect(h.episodeNotices).toEqual([{ key: p, text: expected.notice(p) }])
+    expect(deferred).toEqual([])
+    expect(armHook).toEqual([])
+    expect(h.controller.armedKeys()).toEqual([])
+    expect(h.triggers).toEqual([])
+    expect(getFailureCount(p)).toBe(1)
+    expect(h.capReached).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.errors.filter((line) => line === latchedSkipLine(p))).toHaveLength(1)
+    expect(h.errors.filter((line) => line.startsWith(`[slack] Deferring persona=${p}`))).toEqual([])
+    expect(h.errors.filter((line) => line.startsWith(`[slack] Relaunching session for persona=${p}`))).toEqual([])
+
+    // Q, not latched, is killed and relaunched through the same entry.
+    await run(q, cwdOf(q))
+    await h.settle()
+
+    expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }, { key: q, outcome: RESTART_OUTCOME_LAUNCHED }])
+    expect(h.latch.isLatched(q)).toBe(false)
+    expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(q)])
+    expect(h.stub.spawnedIds()).toEqual([personaInstanceId(q)])
+    expect(personaCallCounts(h, p)).toEqual({ statusCalls: expected.calls.statusCalls! })
+    expect(getFailureCount(q)).toBe(0)
+    expect(h.episodeNotices).toHaveLength(1)
+    expect(deferred).toEqual([])
+    expect(armHook).toEqual([])
+  }
 
   /**
    * Where P's own `status` answers UNUSABLE NAME: `liveReads` is how many of
@@ -5566,234 +5665,45 @@ describe('b.jg5 SRJ-512: a restart run whose own liveness read latches P stops t
     ["b.d61's re-probe after an escalate-dead reconnect", { liveReads: 2, tmuxGone: true, calls: { statusCalls: 3, findMissingCalls: 1 } }],
   ]
 
-  test.each(ENTRIES.flatMap(([entry, run]) => PROBES.map(([probe, opts]) => [entry, probe, run, opts] as const)))(
+  test.each(RESTART_ENTRIES.flatMap(([entry, run]) => PROBES.map(([probe, opts]) => [entry, probe, run, opts] as const)))(
     '%s, P\'s status answering UNUSABLE NAME at %s: P latches once with one SRJ-1019 post; the run answers latched with no deferral, kill, spawn, resume or send-keys, no arm hook, nothing counted; Q beside it restarts as before',
     async (_entry, _probe, run, opts) => {
-      const deferred: string[] = []
-      const armHook: string[] = []
-      const outcomes: Array<{ key: string; outcome: unknown }> = []
-      const h = (harness = makeRecoveryHarness({
-        alertThresholdMs: false,
-        restartDeps: {
-          getRestartDelay: () => FAST_DELAY_S,
-          deferPendingRow: (key) => { deferred.push(key) },
-          armRetryTimer: (key) => { armHook.push(key) },
-          serialize: async <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
-            const outcome = await operation()
-            outcomes.push({ key, outcome })
-            return outcome
-          },
-        },
-      }))
-      const [p, q] = [h.keys[0]!, h.keys[1]!]
-      const cwdOf = (key: string): string => h.config.personas.find((persona) => persona.key === key)!.working_directory
-      // Q's row reads ended until its relaunch's spawn, then waiting; P's
-      // answers `liveReads` working rows, then UNUSABLE NAME.
-      rowReadsUntilSpawn(h, 'ended')
-      const othersRow = (h.stub.calls as unknown as RecoveryStubScript).statusFn!
-      const err = ROW.build()
-      let pReads = 0
-      h.script({
-        statusFn: (params) => {
-          if (params.claude_instance_id !== personaInstanceId(p)) return othersRow(params)
-          return pReads++ < opts.liveReads ? cannedStatusResult({ state: 'working' }) : err
-        },
+      const err = UNUSABLE_NAME_ROW.build()
+      const rig = ownReadLatchHarness((read) => read < opts.liveReads ? cannedStatusResult({ state: 'working' }) : err)
+      harness = rig.h
+      _setTmuxSessionProber(async (name) => !(opts.tmuxGone && name === personaTmuxSessionName(rig.p)))
+
+      await expectLatchedThenOtherRelaunched(rig, run, {
+        calls: opts.calls,
+        record: UNUSABLE_NAME_ROW.record,
+        notice: UNUSABLE_NAME_ROW.notice,
       })
-      _setTmuxSessionProber(async (name) => !(opts.tmuxGone && name === personaTmuxSessionName(p)))
-      recordFailure(p)
-
-      await run(p, cwdOf(p))
-
-      expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }])
-      expect(callCounts(h)).toEqual(opts.calls)
-      expect(personaCallCounts(h, p)).toEqual({ statusCalls: opts.calls.statusCalls! })
-      expect(tmuxTouchingCallsIn(h.stub.calls)).toEqual([])
-      expect(h.latch.record(p)).toEqual({
-        sessionName: ROW.sessionName(p),
-        latchCase: ROW.latchCase,
-        refusedOperation: ROW.refusedOperation,
-        rowState: ROW.rowState,
-        description: ROW.description,
-      })
-      expect(h.latchEvents.filter((event) => event.step === 'set').map((event) => event.key)).toEqual([p])
-      expect(h.episodeNotices).toEqual([{ key: p, text: ROW.notice(p) }])
-      expect(deferred).toEqual([])
-      expect(armHook).toEqual([])
-      expect(h.controller.armedKeys()).toEqual([])
-      expect(h.triggers).toEqual([])
-      expect(getFailureCount(p)).toBe(1)
-      expect(h.capReached).toEqual([])
-      expect(h.notices).toEqual([])
-      expect(h.errors.filter((line) => line === skipLine(p))).toHaveLength(1)
-      expect(h.errors.filter((line) => line.startsWith(`[slack] Relaunching session for persona=${p}`))).toEqual([])
-
-      // Q, not latched, is killed and relaunched through the same entry.
-      await run(q, cwdOf(q))
-      await h.settle()
-
-      expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }, { key: q, outcome: RESTART_OUTCOME_LAUNCHED }])
-      expect(h.latch.isLatched(q)).toBe(false)
-      expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(q)])
-      expect(h.stub.spawnedIds()).toEqual([personaInstanceId(q)])
-      expect(getFailureCount(q)).toBe(0)
-      expect(h.episodeNotices).toHaveLength(1)
-      expect(deferred).toEqual([])
-      expect(armHook).toEqual([])
     },
   )
-})
 
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-502, SRJ-513 — a restart run whose own liveness read finds P's
-// own row `pending` with no launch start
-//
-// The real liveness adapter applies the own-row `status` step with the
-// configured-persona query the recovery harness installs (as `main()` does),
-// so P's own row reading `pending` with no launch start (absent, `null`, or
-// one that does not parse) latches P with "launch start not recorded",
-// refused operation "none" and the state `pending`, and reads `unknown`. The
-// restart work asks the latch right after its probe and answers
-// `RESTART_OUTCOME_LATCHED`: no `pending` deferral, no reconnect, no kill,
-// spawn, `resume` or send-keys, no arm hook and nothing recorded (P's one
-// failure on record stays one: a success would reset it, a counted failure
-// raise it), for a scheduled restart, a human-triggered restart request and
-// E8's retry entry alike. The latch's holds and its one SRJ-1020 post run as
-// `main()` binds them. Control: the same row with a launch start latches no
-// one and is handed to the `pending` deferral as E9 left it. Q beside P,
-// whose row reads `ended`, is killed and relaunched as before. The scheduled
-// entries wait out their short restart timers with `Bun.sleep(WAIT_MS)`.
-// ---------------------------------------------------------------------------
-
-describe('b.jg5 SRJ-513: a restart run whose own liveness read finds P\'s own pending row with no launch start latches P and stops there', () => {
-  /** Launch-start values that are none (b.jg5 SRJ-408): the key left out, `null`, and one that does not parse (no zone). */
-  const NO_LAUNCH_START_FORMS: ReadonlyArray<readonly [string, string | null | undefined]> = [
-    ['absent', SAMPLE_LAUNCH_START_NONE],
-    ['null', null],
-    ['unparseable (no zone)', SAMPLE_LAUNCH_START_WHOLE.replace(/Z$/, '')],
-  ]
-
-  /** The restart work's line for a latched persona. */
-  const skipLine = (key: string): string =>
-    `[slack] Skipping restart for persona=${key} — the persona is latched; no agent-director call, nothing recorded (b.jg5 SRJ-502)`
-
-  let harness: RecoveryHarness | undefined
-
-  afterEach(() => {
-    cancelAllRestartTimers()
-    const h = harness
-    harness = undefined
-    if (h === undefined) return
-    try {
-      assertNoLeak(h.captured())
-    } finally {
-      h.cleanup()
-    }
-    expect(h.clock.pendingCount()).toBe(0)
-  })
-
-  /** How each entry runs persona `key`'s restart work, waiting for it as the file does. */
-  type Entry = (key: string, cwd: string) => Promise<void>
-  const ENTRIES: Array<[string, Entry]> = [
-    ['a scheduled restart', async (key, cwd) => {
-      scheduleRestart(key, cwd)
-      await Bun.sleep(WAIT_MS)
-    }],
-    ['a human-triggered restart request', async (key, cwd) => {
-      scheduleRestart(key, cwd, undefined, { humanTrigger: true })
-      await Bun.sleep(WAIT_MS)
-    }],
-    ["E8's retry entry (runRestartRetry)", async (key, cwd) => {
-      await runRestartRetry(key, cwd, isLaunchInFlight)
-    }],
-  ]
-
-  /**
-   * A recovery harness whose restart deps record each `pending` deferral,
-   * each arm-hook call and each run's outcome; P's `status` answers its own
-   * row `pending` with `launchStartedAt` (the key left out for `undefined`),
-   * Q's reads `ended` until its relaunch's spawn, then `waiting`. P has one
-   * failure on record.
-   */
-  function build(launchStartedAt: string | null | undefined) {
-    const deferred: string[] = []
-    const armHook: string[] = []
-    const outcomes: Array<{ key: string; outcome: unknown }> = []
-    const h = (harness = makeRecoveryHarness({
-      alertThresholdMs: false,
-      restartDeps: {
-        getRestartDelay: () => FAST_DELAY_S,
-        deferPendingRow: (key) => { deferred.push(key) },
-        armRetryTimer: (key) => { armHook.push(key) },
-        serialize: async <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
-          const outcome = await operation()
-          outcomes.push({ key, outcome })
-          return outcome
-        },
-      },
-    }))
-    const [p, q] = [h.keys[0]!, h.keys[1]!]
-    const cwdOf = (key: string): string => h.config.personas.find((persona) => persona.key === key)!.working_directory
-    rowReadsUntilSpawn(h, 'ended')
-    const othersRow = (h.stub.calls as unknown as RecoveryStubScript).statusFn!
-    h.script({
-      statusFn: (params) => params.claude_instance_id === personaInstanceId(p)
-        ? cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launchStartedAt })
-        : othersRow(params),
-    })
-    recordFailure(p)
-    return { h, p, q, cwdOf, deferred, armHook, outcomes }
-  }
-
-  test.each(ENTRIES.flatMap(([entry, run]) => NO_LAUNCH_START_FORMS.map(([form, start]) => [entry, form, run, start] as const)))(
+  // One no-launch-start form per entry, rotated so each form runs once.
+  test.each(RESTART_ENTRIES.map(([entry, run], i) => [entry, NO_LAUNCH_START_FORM_NAMES[i % NO_LAUNCH_START_FORM_NAMES.length]!, run] as const))(
     '%s, P\'s own row pending with its launch start %s: P latches once with state pending and one SRJ-1020 post; the run answers latched with no deferral, kill, spawn, resume or send-keys, no arm hook, nothing counted; Q beside it restarts as before',
-    async (_entry, _form, run, start) => {
-      const { h, p, q, cwdOf, deferred, armHook, outcomes } = build(start)
+    async (_entry, form, run) => {
+      const rig = ownReadLatchHarness(() =>
+        cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: NO_LAUNCH_START_FORMS[form] }))
+      harness = rig.h
 
-      await run(p, cwdOf(p))
-
-      expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }])
-      expect(callCounts(h)).toEqual({ statusCalls: 1 })
-      expect(personaCallCounts(h, p)).toEqual({ statusCalls: 1 })
-      expect(tmuxTouchingCallsIn(h.stub.calls)).toEqual([])
-      expect(h.latch.record(p)).toEqual({
-        sessionName: personaTmuxSessionName(p),
-        latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED,
-        refusedOperation: REFUSED_OPERATION_NONE,
-        rowState: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
+      await expectLatchedThenOtherRelaunched(rig, run, {
+        calls: { statusCalls: 1 },
+        record: launchStartRecord,
+        notice: launchStartNotRecordedNoticeText,
       })
-      expect(h.latchEvents.filter((event) => event.step === 'set').map((event) => event.key)).toEqual([p])
-      expect(h.episodeNotices).toEqual([{ key: p, text: launchStartNotRecordedNoticeText(p) }])
-      expect(deferred).toEqual([])
-      expect(armHook).toEqual([])
-      expect(h.controller.armedKeys()).toEqual([])
-      expect(h.triggers).toEqual([])
-      expect(getFailureCount(p)).toBe(1)
-      expect(h.capReached).toEqual([])
-      expect(h.notices).toEqual([])
-      expect(h.errors.filter((line) => line === skipLine(p))).toHaveLength(1)
-      expect(h.errors.filter((line) => line.startsWith(`[slack] Deferring persona=${p}`))).toEqual([])
-      expect(h.errors.filter((line) => line.startsWith(`[slack] Relaunching session for persona=${p}`))).toEqual([])
-
-      // Q, not latched, is killed and relaunched through the same entry.
-      await run(q, cwdOf(q))
-      await h.settle()
-
-      expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }, { key: q, outcome: RESTART_OUTCOME_LAUNCHED }])
-      expect(h.latch.isLatched(q)).toBe(false)
-      expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(q)])
-      expect(h.stub.spawnedIds()).toEqual([personaInstanceId(q)])
-      expect(personaCallCounts(h, p)).toEqual({ statusCalls: 1 })
-      expect(getFailureCount(q)).toBe(0)
-      expect(h.episodeNotices).toHaveLength(1)
-      expect(deferred).toEqual([])
-      expect(armHook).toEqual([])
     },
   )
 
-  test.each(ENTRIES)(
+  test.each(RESTART_ENTRIES)(
     'control, %s, P\'s own row pending with a launch start: no latch, no post; the row is handed to the pending deferral as E9 left it, with no kill, spawn, resume or send-keys, nothing counted',
     async (_entry, run) => {
-      const { h, p, cwdOf, deferred, armHook, outcomes } = build(SAMPLE_LAUNCH_START_FRACTIONAL)
+      const rig = ownReadLatchHarness(() =>
+        cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_FRACTIONAL }))
+      const { h, p, cwdOf, deferred, armHook, outcomes } = rig
+      harness = h
 
       await run(p, cwdOf(p))
 
@@ -5805,7 +5715,7 @@ describe('b.jg5 SRJ-513: a restart run whose own liveness read finds P\'s own pe
       expect(h.episodeNotices).toEqual([])
       expect(armHook).toEqual([])
       expect(getFailureCount(p)).toBe(1)
-      expect(h.errors.filter((line) => line === skipLine(p))).toEqual([])
+      expect(h.errors.filter((line) => line === latchedSkipLine(p))).toEqual([])
     },
   )
 })

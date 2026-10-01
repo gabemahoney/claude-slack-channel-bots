@@ -37,11 +37,11 @@
  * (`PERSONA_EPISODE_KINDS`). `tmux-unresponsive`'s episode is begun and
  * ended by its condition (below), which posts its onset, alert and recovery;
  * `unclassified-error`'s by its episodes (below), which post its one alert;
- * CONFLICT's and `unusable-recorded-name`'s are begun by the conflict latch's
- * one notice reaction (`src/conflict-latch.ts`), which posts each kind's one
- * notice per episode and, when it begins one, ends the persona's open
- * episodes of the other latch kinds silently (it begins
- * `launch-start-not-recorded`'s too, but posts nothing in it yet);
+ * CONFLICT's, `unusable-recorded-name`'s and `launch-start-not-recorded`'s
+ * are begun by the conflict latch's one notice reaction
+ * (`src/conflict-latch.ts`), which posts each kind's one notice per episode
+ * (the CONFLICT notice, SRJ-1019 and SRJ-1020) and, when it begins one, ends
+ * the persona's open episodes of the other latch kinds silently;
  * every other kind has no poster yet: its begin and end triggers and text
  * come with the Epic that posts it, named on its label below.
  *

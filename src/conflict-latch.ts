@@ -199,9 +199,17 @@ export const LATCH_CASE_DIFFERENT_ID = 'different-id'
 export const LATCH_CASE_ANOTHER_STORE = 'another-store'
 /** A CONFLICT whose description carries none of the case words. */
 export const LATCH_CASE_UNRECOGNISED = 'unrecognised'
-/** Hold case "unusable recorded name" (SRJ-512): set by `setFromUnusableName` ({@link unusableNameSetInput}). */
+/**
+ * Hold case "unusable recorded name" (SRJ-512): production sets it through
+ * `set` with {@link unusableNameSetInput}'s input; `setFromUnusableName` is
+ * the same set from a thrown value.
+ */
 export const LATCH_CASE_UNUSABLE_RECORDED_NAME = 'unusable-recorded-name'
-/** Hold case "launch start not recorded" (SRJ-513): set by `setLaunchStartNotRecorded` ({@link launchStartNotRecordedSetInput}). */
+/**
+ * Hold case "launch start not recorded" (SRJ-513): production sets it through
+ * `set` with {@link launchStartNotRecordedSetInput}'s input;
+ * `setLaunchStartNotRecorded` is the same set.
+ */
 export const LATCH_CASE_LAUNCH_START_NOT_RECORDED = 'launch-start-not-recorded'
 
 /**

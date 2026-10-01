@@ -337,7 +337,8 @@
  * `retryNow` (fire a
  * persona's next retry and settle it), `rowReadsUntilSpawn` (each row reads a
  * state until its spawn resolves, then `waiting`; a `pending` row shows the
- * stub's default launch start unless the case asks for none), and the condition's log
+ * stub's default launch start unless the case asks for none; it returns the
+ * `statusFn` it scripts), and the condition's log
  * lines: `conditionLinePrefix`, `conditionLines`, `conditionStartedLines`,
  * `conditionEndedLines` and the line builders `conditionOnsetLine`,
  * `conditionAlertLine`, `conditionEndedLine`, `conditionRecoveryLine` and
@@ -1480,13 +1481,14 @@ export type RecoveryRowState = NonNullable<NonNullable<Parameters<typeof cannedS
  * row shows the stub's default launch start unless `options` has a
  * `launchStartedAt` key: its value is the row's launch start then
  * (`SAMPLE_LAUNCH_START_NONE` leaves the field out, `null` shows it as
- * `null`).
+ * `null`). Returns the `statusFn` it scripts, so a case that scripts one
+ * persona's reads itself can hand every other persona's to it.
  */
 export function rowReadsUntilSpawn(
   h: RecoveryHarness,
   before: RecoveryRowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT,
   options: { launchStartedAt?: string | null } = {},
-): void {
+): NonNullable<RecoveryStubScript['statusFn']> {
   const beforeRow = 'launchStartedAt' in options ? { state: before, launch_started_at: options.launchStartedAt } : { state: before }
   const live = new Set<string>()
   const client = h.stub.client
@@ -1496,12 +1498,12 @@ export function rowReadsUntilSpawn(
     live.add(String(params.claude_instance_id))
     return result
   }
-  h.script({
-    statusFn: (params) => {
-      if (live.has(String(params.claude_instance_id))) return cannedStatusResult({ state: 'waiting' })
-      return before === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult(beforeRow)
-    },
-  })
+  const statusFn: NonNullable<RecoveryStubScript['statusFn']> = (params) => {
+    if (live.has(String(params.claude_instance_id))) return cannedStatusResult({ state: 'waiting' })
+    return before === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult(beforeRow)
+  }
+  h.script({ statusFn })
+  return statusFn
 }
 
 // The `tmux-unresponsive` condition's log lines (SRJ-307 to SRJ-310). The

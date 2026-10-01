@@ -2338,7 +2338,8 @@ export async function main(): Promise<void> {
   // reaction is bound to the notice episodes and posts every latch kind's
   // notice: a latch, or a relatch with a new case, ends the persona's open
   // episodes of the other latch kinds silently, begins the episode of its own
-  // kind (CONFLICT, or the unusable-recorded-name hold) and posts that kind's
+  // kind (CONFLICT, the unusable-recorded-name hold or the
+  // launch-start-not-recorded hold) and posts that kind's
   // notice once through the persona notifier; the same case posts nothing.
   // b.jg5 SRJ-305, SRJ-310, SRJ-313, SRJ-502: its holds are bound first, so
   // they run before the notice on every set: the persona's retry timer stops

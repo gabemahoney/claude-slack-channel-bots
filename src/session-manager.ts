@@ -708,9 +708,11 @@ const NOTHING_READ = undefined
 
 /**
  * What the latch-time `status` read gave (`latchTimeRowState`): the row
- * state to record, or `latched` when the read itself latched the persona.
+ * state to record, or `latched` when the persona is latched once the read is
+ * done (the read itself latched it, or it latched elsewhere meanwhile), with
+ * the latch line's outcome text saying which.
  */
-type LatchTimeRead = { readonly rowState: LatchRowState } | { readonly latched: true }
+type LatchTimeRead = { readonly rowState: LatchRowState } | { readonly latched: true; readonly outcome: string }
 
 /**
  * The latch-time `status` read (b.jg5 SRJ-501), for a CONFLICT or an
@@ -726,11 +728,16 @@ type LatchTimeRead = { readonly rowState: LatchRowState } | { readonly latched: 
  * start, b.jg5 SRJ-513) answers `latched`: that latch stands alone, the
  * caller sets nothing more (no CONFLICT or UNUSABLE NAME case on top, so
  * the persona gets that latch's one post, SRJ-1020's for a launch start not
- * recorded), and no further read is made. Logs nothing of its own; never
- * throws.
+ * recorded), and no further read is made. A persona latched elsewhere while
+ * the read was awaited (`personaLatchedNow`, b.jg5 SRJ-502: the health
+ * tick reads even while a launch is in flight, SRJ-315) answers `latched`
+ * the same way, whatever the read gave: that latch stands, and no second
+ * case or post is set on top of it. Logs nothing of its own; never throws.
  */
 async function latchTimeRowState(key: string): Promise<LatchTimeRead> {
   const read = await readPersonaOwnRowStatus(key, { site: 'spawnForPersona', what: 'latch-time status read' })
+  if (read.kind === OWN_ROW_STATUS_LATCHED) return { latched: true, outcome: LATCH_TIME_READ_LATCHED }
+  if (personaLatchedNow(key)) return { latched: true, outcome: LATCH_TIME_READ_LATCHED_ELSEWHERE }
   switch (read.kind) {
     case OWN_ROW_STATUS_STATE:
       return { rowState: latchRowStateRead(read.state) }
@@ -738,8 +745,6 @@ async function latchTimeRowState(key: string): Promise<LatchTimeRead> {
       return { rowState: LATCH_ROW_STATE_NO_ROW }
     case OWN_ROW_STATUS_REFUSED:
       return { rowState: LATCH_ROW_STATE_UNREADABLE }
-    case OWN_ROW_STATUS_LATCHED:
-      return { latched: true }
   }
 }
 
@@ -754,6 +759,10 @@ async function recordedRowState(key: string, lastRead: LastRowRead): Promise<Lat
 
 /** The latch line's outcome when the latch-time `status` read latched the persona itself. */
 const LATCH_TIME_READ_LATCHED = 'the latch-time status read latched the persona, so that latch stands'
+
+/** The latch line's outcome when the persona latched elsewhere while the latch-time `status` read was awaited. */
+const LATCH_TIME_READ_LATCHED_ELSEWHERE =
+  'the persona was latched elsewhere during the latch-time status read, so that latch stands'
 
 /**
  * b.jg5 SRJ-105, SRJ-501, SRJ-111, SRJ-113: the CONFLICT row of the ladder's
@@ -794,7 +803,7 @@ async function conflictAt(
   }
   const recorded = await recordedRowState(key, lastRead)
   if ('latched' in recorded) {
-    logConflict(what, ref, err, LATCH_TIME_READ_LATCHED)
+    logConflict(what, ref, err, recorded.outcome)
     return { key, action: 'latched' }
   }
   const { rowState } = recorded
@@ -899,7 +908,7 @@ async function unusableNameAt(
     what,
     ref,
     err,
-    'latched' in recorded ? LATCH_TIME_READ_LATCHED : latchOnUnusableName(key, err, recorded.rowState),
+    'latched' in recorded ? recorded.outcome : latchOnUnusableName(key, err, recorded.rowState),
   )
   return { key, action: 'latched' }
 }
@@ -979,6 +988,13 @@ export interface OwnRowReadSite {
   readonly what: string
   /** The persona's reference; `persona=<key>` when absent. */
   readonly ref?: string
+  /**
+   * Set for a `get` made in a context that routes an UNUSABLE NAME answer
+   * per SRJ-1002 instead of latching (b.jg5 SRJ-512): the start sweep's
+   * post-run `get`s. Names the context in the routed line
+   * (`readPersonaOwnRow`). The row-read rule still applies to a row read.
+   */
+  readonly unusableNameRoutedIn?: string
 }
 
 /**
@@ -1015,7 +1031,10 @@ export interface OwnRowReadSite {
  *     operation "none" and the state unreadable, since this read, the
  *     path's last, read none (`latchOnUnusableName`; no further read), and
  *     the caller calls nothing more for it, as after a read that latched;
- *     with no latch installed nothing is latched and the answer is the same;
+ *     with no latch installed nothing is latched and the answer is the same.
+ *     Where the answer is routed per SRJ-1002 (`at.unusableNameRoutedIn`:
+ *     the start sweep's post-run `get`s) nothing latches: the routed line
+ *     is logged and the answer is `refused`, carrying the error;
  *   - `refused` for any other error, carried unchanged for the caller's
  *     refusal handling (`refusalAt`, b.jg5 SRJ-105) or its own row.
  *
@@ -1026,6 +1045,7 @@ export interface OwnRowReadSite {
  *   [slack] <site>: <what> for <ref>: its row reads pending with no launch start (state=pending) — <outcome>; nothing more is called for it (b.jg5 SRJ-114, SRJ-513)
  *   [slack] <site>: <what> for <ref>: its row carries the liveness note provenance_conflict (state=<state>) — <outcome>; nothing more is called for it (b.jg5 SRJ-114, SRJ-501)
  *   [slack] <site>: <what> for <ref>: <failure> — UNUSABLE NAME: <outcome>; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)
+ *   [slack] <site>: <what> for <ref>: <failure> — UNUSABLE NAME met in <context>: routed to the server log; nothing latches (b.jg5 SRJ-512, SRJ-1002)
  *   [slack] <site>: <what> for <ref>: its row carries the liveness note provenance_conflict, but <why> — the note is not applied (b.jg5 SRJ-114)
  *   [slack] <site>: <what> for <ref>: its row carries the liveness note "<note>", which latches no one — going on (b.jg5 SRJ-114)
  *
@@ -1047,6 +1067,11 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
     )
   } catch (err) {
     if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: OWN_ROW_READ_ABSENT }
+    if (at.unusableNameRoutedIn !== undefined) {
+      // b.jg5 SRJ-512, SRJ-1002: routed, so nothing latches; carried as a failed read.
+      if (isUnusableNameError(err)) logUnusableNameRouted(key, at, at.unusableNameRoutedIn, err)
+      return { kind: OWN_ROW_READ_REFUSED, error: err }
+    }
     if (latchOnUnusableNameRead(key, err, at)) return { kind: OWN_ROW_READ_LATCHED }
     return { kind: OWN_ROW_READ_REFUSED, error: err }
   }
@@ -1057,6 +1082,20 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
     console.error(`${ownRowReadHead(key, at)}: applying the note rule failed: ${describeThrownValue(err)} (b.jg5 SRJ-114)`)
     return { kind: OWN_ROW_READ_ROW, row, latched: false }
   }
+}
+
+/**
+ * The one line for an UNUSABLE NAME answer to a `get` made where it is
+ * routed per SRJ-1002 (`OwnRowReadSite.unusableNameRoutedIn`, `context`):
+ * a server-log line, nothing latched or posted (b.jg5 SRJ-512, SRJ-1002).
+ * The answer through the redacting describer.
+ *
+ *   [slack] <site>: <what> for <ref>: <failure> — UNUSABLE NAME met in <context>: routed to the server log; nothing latches (b.jg5 SRJ-512, SRJ-1002)
+ */
+function logUnusableNameRouted(key: string, at: OwnRowReadSite, context: string, err: unknown): void {
+  console.error(
+    `${ownRowReadHead(key, at)}: ${describeAgentDirectorFailure(err)} — UNUSABLE NAME met in ${context}: routed to the server log; nothing latches (b.jg5 SRJ-512, SRJ-1002)`,
+  )
 }
 
 /** `[slack] <site>: <what> for <ref>`. */
@@ -2423,6 +2462,22 @@ function personaLatchedNow(key: string): boolean {
 }
 
 /**
+ * Asked right after one of persona `key`'s own-row reads (`what` at `site`)
+ * that did not itself latch it (b.jg5 SRJ-502): true when the persona is
+ * latched now (`personaLatchedNow`), latched elsewhere while the read was
+ * awaited (the health tick reads even while a launch is in flight, b.jg5
+ * SRJ-315), after logging one line; the caller then calls nothing more for
+ * it. False otherwise, with nothing logged. Never throws.
+ *
+ *   [slack] <site>: <ref> is latched after its <what> — nothing more is called for it (b.jg5 SRJ-502)
+ */
+function latchedAfterOwnRowRead(key: string, site: string, what: string, ref: string): boolean {
+  if (!personaLatchedNow(key)) return false
+  console.error(`[slack] ${site}: ${ref} is latched after its ${what} — nothing more is called for it (b.jg5 SRJ-502)`)
+  return true
+}
+
+/**
  * Read persona `key`'s pane (`readWorkingPane`, whose UNUSABLE NAME answer
  * latches the persona with `lastRead`, the row state the calling path last
  * read) and, only when it shows an idle screen, its transcript
@@ -3106,7 +3161,19 @@ interface FindMissingSweepOptions {
    * no read of that row from it.
    */
   readonly nextStepGetKey?: string
+  /**
+   * The start sweep's run (`reconcileKilledPrePersonaRows`, which acts for no
+   * persona): a run this caller starts makes its post-run `get`s with an
+   * UNUSABLE NAME answer routed per SRJ-1002, so it latches nothing (b.jg5
+   * SRJ-512) and is carried as a failed read. The note and launch-start
+   * decisions still latch there (b.jg5 SRJ-114, SRJ-513). A run another
+   * caller started keeps that caller's reads.
+   */
+  readonly startSweepRun?: boolean
 }
+
+/** The context an UNUSABLE NAME answer to the start sweep's post-run `get`s is routed in (b.jg5 SRJ-1002). */
+const START_SWEEP_ROUTED_CONTEXT = 'the start sweep'
 
 let _findMissingMemoTtlMs = FIND_MISSING_MEMO_TTL_MS
 
@@ -3121,8 +3188,10 @@ interface PostRunReads {
   /**
    * The configured personas whose own row's post-run `get` failed with an
    * error other than `ErrSpawnNotFound` and UNUSABLE NAME (`OWN_ROW_READ_REFUSED`), each with
-   * that error, carried unchanged. Only the persona's own caller acts on it
-   * (`postRunGetRefusal`, b.jg5 SRJ-105, SRJ-114).
+   * that error, carried unchanged; in the start sweep's run an UNUSABLE NAME
+   * answer too, which latched nothing there (b.jg5 SRJ-512, SRJ-1002). Only
+   * the persona's own caller acts on it (`postRunGetRefusal`, b.jg5
+   * SRJ-105, SRJ-114), and an UNUSABLE NAME answer is no refusal there.
    */
   readonly refusedReads: ReadonlyMap<string, unknown>
 }
@@ -3329,6 +3398,8 @@ async function sharedFindMissingSweep(
   start: () => Promise<FindMissingResult>,
   logPrefix: string,
   ref: string,
+  key?: undefined,
+  opts?: FindMissingSweepOptions,
 ): Promise<FindMissingResult | undefined>
 async function sharedFindMissingSweep(
   start: () => Promise<FindMissingResult>,
@@ -3362,7 +3433,7 @@ async function sharedFindMissingSweep(
     return latchedOr(key, _findMissingLast.result, NO_LATCHED_KEYS)
   }
 
-  const run = joined ?? startFindMissingRun(start, kind, opts.nextStepGetKey, logPrefix, ref)
+  const run = joined ?? startFindMissingRun(start, kind, opts, logPrefix, ref)
   if (joined === null) _findMissingInFlight = run
 
   let outcome: FindMissingRunOutcome
@@ -3413,9 +3484,10 @@ const NO_LATCHED_KEYS: ReadonlySet<string> = new Set<string>()
  * `get` ran in the starter's context, so the caller's own attempt had not
  * seen it (b.jg5 SRJ-301); the read's wrapper has already raised `key`'s
  * outage flags. Then `refusalAt` with `get` decides: a refusal logs its one
- * line and answers true; any other error answers false (none today: an
- * UNUSABLE NAME answer latched the persona and is not carried here), and the
- * caller goes on as after any read. A read that answered absent, or no read,
+ * line and answers true; any other error answers false (only an UNUSABLE
+ * NAME answer carried from the start sweep's run, which latched nothing
+ * there, b.jg5 SRJ-1002; elsewhere that answer latched the persona and is
+ * not carried here), and the caller goes on as after any read. A read that answered absent, or no read,
  * answers false. Never throws.
  */
 function postRunGetRefusal(
@@ -3463,7 +3535,7 @@ function findMissingSweepWords(kind: FindMissingRunKind): string {
 function startFindMissingRun(
   start: () => Promise<FindMissingResult>,
   kind: FindMissingRunKind,
-  nextStepGetKey: string | undefined,
+  opts: FindMissingSweepOptions,
   logPrefix: string,
   ref: string,
 ): FindMissingRun {
@@ -3484,7 +3556,13 @@ function startFindMissingRun(
     console.error(
       `[slack] ${logPrefix}: ${words} for ${ref} — count=${result.count} ids=[${result.ids.join(',')}] unverified=${result.unverified} unverified_ids=[${result.unverified_ids.join(',')}]`,
     )
-    const reads = await readListedPersonaRows(result, nextStepGetKey, logPrefix, `${words} for ${ref}`)
+    const reads = await readListedPersonaRows(
+      result,
+      opts.nextStepGetKey,
+      logPrefix,
+      `${words} for ${ref}`,
+      opts.startSweepRun === true ? START_SWEEP_ROUTED_CONTEXT : undefined,
+    )
     if (_findMissingLast === null || _findMissingLast.seq < seq) _findMissingLast = { result, at, seq }
     if (_findMissingInFlight === run) _findMissingInFlight = null
     return { result, latchedKeys: reads.latchedKeys, refusedReads: reads.refusedReads }
@@ -3524,7 +3602,10 @@ function configuredPersonaKeyOfRowId(id: unknown): string | undefined {
  * the persona's own row latches it, and the read logs its note lines
  * (`<logPrefix>: post-sweep get for persona=<key>: …`); a `get` answering
  * UNUSABLE NAME latches it too (b.jg5 SRJ-512), and that persona is among
- * the latched ones, so its caller stops (`FIND_MISSING_LATCHED`). A `get`
+ * the latched ones, so its caller stops (`FIND_MISSING_LATCHED`), except in
+ * the start sweep's run (`unusableNameRoutedIn` set), where that answer is
+ * routed per SRJ-1002 (its routed line), latches nothing and is carried as a
+ * failed read below. A `get`
  * answering absent changes nothing. A `get` failing with any other error is carried
  * in the answer (`refusedReads`) for that persona's own caller to handle
  * (`postRunGetRefusal`); for every other caller it is only listed in the
@@ -3548,6 +3629,7 @@ async function readListedPersonaRows(
   nextStepGetKey: string | undefined,
   logPrefix: string,
   run: string,
+  unusableNameRoutedIn: string | undefined,
 ): Promise<PostRunReads> {
   const latchedKeys = new Set<string>()
   const refusedReads = new Map<string, unknown>()
@@ -3564,7 +3646,14 @@ async function readListedPersonaRows(
     }
     const toRead = listed.filter((l) => !l.skipped).map((l) => l.key)
     const settled = await Promise.allSettled(
-      toRead.map((key) => readPersonaOwnRow(key, { site: logPrefix, what: 'post-sweep get' })),
+      toRead.map((key) =>
+        readPersonaOwnRow(
+          key,
+          unusableNameRoutedIn === undefined
+            ? { site: logPrefix, what: 'post-sweep get' }
+            : { site: logPrefix, what: 'post-sweep get', unusableNameRoutedIn },
+        ),
+      ),
     )
     const entryOf = new Map<string, string>()
     settled.forEach((outcome, i) => {
@@ -3875,7 +3964,13 @@ function isDeadRowState(state: string | undefined): boolean {
  * persona (an UNUSABLE NAME answer, b.jg5 SRJ-512, or its own row reading
  * `pending` with no launch start, b.jg5 SRJ-513, logged there) answers
  * `FIND_MISSING_LATCHED` too, and its caller makes no further call and never
- * escalates. Never throws.
+ * escalates. So does a persona latched elsewhere while that read was awaited
+ * (`latchedAfterOwnRowRead`, b.jg5 SRJ-502), whatever the read gave, with
+ * one line:
+ *
+ *   [slack] <logPrefix>: <ref> is latched after its status read after the findMissing sweep — nothing more is called for it (b.jg5 SRJ-502)
+ *
+ * Never throws.
  */
 async function reconcileAndReadRowState(
   key: string,
@@ -3891,13 +3986,16 @@ async function reconcileAndReadRowState(
     return FIND_MISSING_LATCHED
   }
   // b.jg5 SRJ-115: P's own row through the shared own-row `status` read.
-  const read = await readPersonaOwnRowStatus(key, { site: logPrefix, what: 'status read after the findMissing sweep', ref })
+  const what = 'status read after the findMissing sweep'
+  const read = await readPersonaOwnRowStatus(key, { site: logPrefix, what, ref })
+  // b.jg5 SRJ-512, SRJ-513, SRJ-502: the read latched P (logged there): no further call.
+  if (read.kind === OWN_ROW_STATUS_LATCHED) return FIND_MISSING_LATCHED
+  // b.jg5 SRJ-502: P latched elsewhere while the read was awaited: no resume,
+  // escalation or notice follows, whatever the read gave.
+  if (latchedAfterOwnRowRead(key, logPrefix, what, ref)) return FIND_MISSING_LATCHED
   switch (read.kind) {
     case OWN_ROW_STATUS_STATE:
       return read.state
-    case OWN_ROW_STATUS_LATCHED:
-      // b.jg5 SRJ-512, SRJ-513, SRJ-502: the read latched P (logged there): no further call.
-      return FIND_MISSING_LATCHED
     case OWN_ROW_STATUS_ABSENT:
       console.error(`[slack] ${logPrefix}: reading the row of ${ref} after the findMissing sweep failed: ${ERR_SPAWN_NOT_FOUND_NAME}`)
       return undefined
@@ -4313,9 +4411,10 @@ async function waitForWorkingRow(
         wait.refused = true
         return 'failed'
       }
-      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('status', 'UnknownError', String(err))
-      console.error(`[slack] waitForWaitingAndReconnect: status error for ${ref}: ${describeAgentDirectorFailure(e)}`)
-      notifySpawnFailure(key, e)
+      // Not reached: every `status` error but ErrSpawnNotFound and UNUSABLE
+      // NAME is a refusal. Any other ends the wait 'failed', as at the
+      // timeout: no spawn-failure notice (b.jg5 SRJ-105).
+      console.error(`[slack] waitForWaitingAndReconnect: status error for ${ref}: ${describeAgentDirectorFailure(err)} — not reconnected`)
       return 'failed'
     }
     if (waitMustEnd(key, wait)) return endWait(ref, wait)
@@ -5051,12 +5150,16 @@ function localStatNote(path: string): string {
  * when it latched the persona (a `provenance_conflict` note on its own row,
  * or an UNUSABLE NAME answer, b.jg5 SRJ-512, which records the state
  * unreadable): the diagnosis answers `latched`, and the caller deletes and
- * launches nothing (b.jg5 SRJ-502). Nor when it failed with a refusal
+ * launches nothing (b.jg5 SRJ-502). The same when the persona latched
+ * elsewhere while the get was awaited (`latchedAfterOwnRowRead`, its one
+ * line). Nor when it failed with a refusal
  * (`refusalAt` with verb `get`: any error but `ErrSpawnNotFound` and an
  * UNUSABLE NAME answer, a CONFIG answer included, b.jg5 SRJ-316): the
  * diagnosis answers the refusal result, and the caller deletes nothing and
- * launches nothing (SRJ-105). `ErrSpawnNotFound` (the row is absent) gives
- * 'inconclusive', its reason saying the row is absent.
+ * launches nothing (SRJ-105); any other failure, none today, answers
+ * `failed` the same way, with one line and no spawn-failure notice.
+ * `ErrSpawnNotFound` (the row is absent) gives 'inconclusive', its reason
+ * saying the row is absent.
  *
  * @returns 'lost' when the row had provable prior activity but no transcript
  *          survives (loud), 'never-created' when the archive was consulted and
@@ -5095,30 +5198,40 @@ async function diagnoseJsonlMissing(
     read.lastRead = LATCH_ROW_STATE_UNREADABLE
     return { key, action: 'latched' }
   }
-  if (ownRead.kind !== OWN_ROW_READ_ROW) {
-    let why: string
-    if (ownRead.kind === OWN_ROW_READ_REFUSED) {
-      // b.jg5 SRJ-105/SRJ-114: a read error on this get is a refusal (the get
-      // runs inside the launch attempt, so it arms the retry timer; `get` is
-      // not tmux-touching, so it starts no condition). No diagnosis is
-      // reported; the caller deletes nothing and launches nothing.
-      const refused = refusalAt(key, ownRead.error, 'get', 'spawnForPersona', what, ref)
-      if (refused) return refused
-      // Not reached today: every error but ErrSpawnNotFound and UNUSABLE NAME
-      // is a refusal at a `get`. Any other is taken as an unread row.
-      read.lastRead = LATCH_ROW_STATE_UNREADABLE
-      why = `could not fetch the agent-director row (${describeAgentDirectorFailure(ownRead.error)})`
-    } else {
-      read.lastRead = LATCH_ROW_STATE_NO_ROW
-      why = 'the agent-director row is absent (ErrSpawnNotFound)'
-    }
+  // b.jg5 SRJ-502: the get is awaited, and the persona may have latched
+  // elsewhere meanwhile (the health tick's liveness read, SRJ-315): no
+  // diagnosis is reported, and the caller deletes nothing and launches
+  // nothing.
+  if (latchedAfterOwnRowRead(key, 'spawnForPersona', what, ref)) return { key, action: 'latched' }
+  if (ownRead.kind === OWN_ROW_READ_REFUSED) {
+    // b.jg5 SRJ-105/SRJ-114: a read error on this get is a refusal (the get
+    // runs inside the launch attempt, so it arms the retry timer; `get` is
+    // not tmux-touching, so it starts no condition). No diagnosis is
+    // reported; the caller deletes nothing and launches nothing.
+    const refused = refusalAt(key, ownRead.error, 'get', 'spawnForPersona', what, ref)
+    if (refused) return refused
+    // Not reached: every `get` error but ErrSpawnNotFound and UNUSABLE NAME
+    // is a refusal. Any other ends the ladder 'failed' as a refusal does: no
+    // diagnosis, no delete, no launch, no spawn-failure notice (b.jg5 SRJ-105).
+    console.error(`[slack] spawnForPersona: ${what} failed for ${ref}: ${describeAgentDirectorFailure(ownRead.error)} — nothing more is called`)
+    return { key, action: 'failed' }
+  }
+  if (ownRead.kind === OWN_ROW_READ_ABSENT) {
+    read.lastRead = LATCH_ROW_STATE_NO_ROW
     // (a) Row already gone (ErrSpawnNotFound) — cannot enrich or classify.
     // Inconclusive: we could not consult the row at all, so we do NOT know
     // whether history was lost. Report it as uncertainty, not reassurance.
     const adDetail = adCandidates.length
       ? adCandidates.map((c) => `${c.source} ${c.path} (${c.note})`).join('; ')
       : redactSlackLogText(err.errDescription || '(no path detail from agent-director)')
-    reportInconclusiveDiagnosis(key, ref, claudeInstanceId, `${why}; AD reported: ${adDetail}`, isStartup, err)
+    reportInconclusiveDiagnosis(
+      key,
+      ref,
+      claudeInstanceId,
+      `the agent-director row is absent (ErrSpawnNotFound); AD reported: ${adDetail}`,
+      isStartup,
+      err,
+    )
     return 'inconclusive'
   }
   const row = ownRead.row
@@ -6007,6 +6120,10 @@ async function runPersonaLadder(
   // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer latched the persona: no
   // retry spawn, kill, delete or launch, no notice, nothing counted.
   if (collisionRead.kind === OWN_ROW_READ_LATCHED) return { key, action: 'latched' }
+  // b.jg5 SRJ-502: the get is awaited, and the persona may have latched
+  // elsewhere meanwhile (the health tick's liveness read, SRJ-315): no retry
+  // spawn, kill, delete, wait, resume or launch follows.
+  if (latchedAfterOwnRowRead(key, 'spawnForPersona', 'collision get', ref)) return { key, action: 'latched' }
   if (collisionRead.kind !== OWN_ROW_READ_ROW) {
     if (collisionRead.kind === OWN_ROW_READ_ABSENT) {
       // Race: row deleted between spawn-collision and get. Retry spawn once.
@@ -6036,9 +6153,10 @@ async function runPersonaLadder(
     const err = collisionRead.error
     const refused = refusalAt(key, err, 'get', 'spawnForPersona', 'collision get', ref)
     if (refused) return refused
-    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('get', 'UnknownError', String(err))
-    console.error(`[slack] spawnForPersona: get failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-    notifySpawnFailure(key, e, isStartup)
+    // Not reached: every `get` error but ErrSpawnNotFound and UNUSABLE NAME
+    // is a refusal. Any other ends the ladder 'failed': no spawn-failure
+    // notice, no `spawn-failed` entry (b.jg5 SRJ-105).
+    console.error(`[slack] spawnForPersona: collision get failed for ${ref}: ${describeAgentDirectorFailure(err)} — nothing more is called`)
     return { key, action: 'failed' }
   }
   if (collisionRead.latched) return { key, action: 'latched' }
@@ -6295,8 +6413,13 @@ async function keepPrePersonaRow(client: Client, row: ListRow, counts: PrePerson
  * outage flag is raised or cleared by the call. As after any run the server
  * makes, each configured persona's own row listed in `unverified_ids` is then
  * read with one `get` through that persona's `withOutageDetection`
- * (`readListedPersonaRows`; an already-latched persona is skipped), and only a `provenance_conflict` note there
- * latches. Never throws.
+ * (`readListedPersonaRows`; an already-latched persona is skipped), and only
+ * a `provenance_conflict` note there, or the persona's own row reading
+ * `pending` with no launch start (b.jg5 SRJ-513), latches. The run is the
+ * start sweep's (`startSweepRun`), so an UNUSABLE NAME answer to one of
+ * those `get`s is routed per SRJ-1002 and latches nothing (b.jg5 SRJ-512):
+ * its routed line, and `refused (<failure>)` in the reads' line. Never
+ * throws.
  *
  * Each killed row is read with `readFindMissingRow` and the state the start
  * sweep listed it with: `missing` holds the rows marked missing; `not-judged`
@@ -6315,7 +6438,9 @@ async function keepPrePersonaRow(client: Client, row: ListRow, counts: PrePerson
  */
 async function reconcileKilledPrePersonaRows(client: Client, killed: readonly KilledPrePersonaRow[]): Promise<void> {
   const head = `[slack] reconcileOrphans: findMissing after the kills of ${killed.length} live pre-persona row(s)`
-  const r = await sharedFindMissingSweep(() => client.findMissing({}), 'reconcileOrphans', 'killed pre-persona rows')
+  const r = await sharedFindMissingSweep(() => client.findMissing({}), 'reconcileOrphans', 'killed pre-persona rows', undefined, {
+    startSweepRun: true,
+  })
   if (!r) {
     console.error(`${head} failed — they still read live and are killed again at the next start`)
     return

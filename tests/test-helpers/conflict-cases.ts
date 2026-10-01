@@ -86,9 +86,28 @@
  *   - `notice(key)`: the SRJ-1019 notice for persona `key`, built by
  *     `unusableNameNoticeText(key, description)` (its instance id from
  *     `personaInstanceId`); `sessionName(key)`: the session the record holds,
- *     `personaTmuxSessionName(key)` (the stub's descriptions quote none).
+ *     `personaTmuxSessionName(key)` (the stub's descriptions quote none);
+ *   - `record(key)`: the whole latch record (`ConflictLatchRecord`) a latch
+ *     of persona `key` from the row holds (the case, "none", `rowState`, the
+ *     quoted session and the description), {@link expectedLatchRecord} of
+ *     `src/conflict-latch.ts`'s `unusableNameSetInput(key, build(), rowState)`.
+ *     Compare a latch's `record(key)` with it whole (`toEqual`).
  * The approver's and the reconnect's `send-keys` and a reuse spawn get no row
  * here (E17, E19, E22).
+ *
+ * The expected latch records (SRJ-501), for any test that checks what a
+ * hold-case latch holds (the server, restart, health-check, unavailable-retry
+ * and session-manager tests included), so no test types a record by hand:
+ *   - {@link expectedLatchRecord}`(key, input)`: the record a latch holds for
+ *     a set input (the session and description rendered by
+ *     `renderLogMessageText`, the session `slack_bot_<key>` when empty, no
+ *     description when empty);
+ *   - an unusable-name row's `record(key)` (above);
+ *   - {@link launchStartRecord}`(key)`: the "launch start not recorded"
+ *     record, from `launchStartNotRecordedSetInput(key, pending)`: the case
+ *     "launch start not recorded", the refused operation "none", the state
+ *     `pending`, the session `slack_bot_<key>` and no description; also every
+ *     latching launch-start row's `record(key)`.
  *
  * The tmux-touching verbs (SRJ-502), {@link TMUX_TOUCHING_STUB_VERBS} and
  * {@link tmuxTouchingCallsIn}: `resume`, `spawn` in both forms (plain and
@@ -140,8 +159,9 @@
  * `rowState`: "launch start not recorded", "none" and `pending`
  * (`LATCH_CASE_LAUNCH_START_NOT_RECORDED`, `REFUSED_OPERATION_NONE`,
  * `latchRowStateRead('pending')`); `sessionName(key)`, the quoted session
- * the record holds (`personaTmuxSessionName(key)`); and `notice(key)`, the
- * SRJ-1020 notice built by `launchStartNotRecordedNoticeText(key)`.
+ * the record holds (`personaTmuxSessionName(key)`); `notice(key)`, the
+ * SRJ-1020 notice built by `launchStartNotRecordedNoticeText(key)`; and
+ * `record(key)`, the whole latch record, {@link launchStartRecord}`(key)`.
  * {@link LAUNCH_START_AND_NOTE_ROW} is one more such row (P's current-life
  * `get`, launch start absent) that also carries the stub's `provenanceNote`:
  * it expects the launch-start decision only (SRJ-513's precedence).
@@ -167,9 +187,10 @@
  *
  * There is no "no pane 0.0" row: that case is withdrawn (rev 17; SRJ-507).
  *
- * No case word, notice text or session name is written here: the words reach
- * a row only through the stub, the notice's texts only through
- * `src/conflict-latch.ts`'s exports, and the session name is the stub's
+ * No case word, notice text, latch record or session name is written here:
+ * the words reach a row only through the stub, the notice's texts and the
+ * hold records' fields only through `src/conflict-latch.ts`'s exports, and
+ * the session name is the stub's
  * `STUB_TMUX_SESSION_NAME` or, for a persona, `personaTmuxSessionName(key)`
  * (its instance id `personaInstanceId(key)`). No timestamp is written here:
  * launch starts come from the stub's `SAMPLE_LAUNCH_START*` constants, the
@@ -228,10 +249,14 @@ import {
   UNUSABLE_NAME_NOTICE_SEPARATOR,
   latchRowStateRead,
   launchStartNotRecordedNoticeText,
+  launchStartNotRecordedSetInput,
   takesUnrecognisedHandling,
   unusableNameNoticeText,
+  unusableNameSetInput,
   type ConflictCaseWithSentence,
   type ConflictLatchCase,
+  type ConflictLatchRecord,
+  type ConflictLatchSetInput,
   type LatchRowState,
   type RefusedOperation,
 } from '../../src/conflict-latch.ts'
@@ -580,6 +605,31 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
 ])
 
 // ---------------------------------------------------------------------------
+// The expected latch record of a hold case (b.jg5 SRJ-501)
+// ---------------------------------------------------------------------------
+
+/**
+ * The record a latch of persona `key` holds for the set input `input`, as
+ * SRJ-501 says a record holds it: the case, the refused operation and the
+ * row state as given; the session and the description rendered by
+ * `renderLogMessageText` (redacted, on one line, capped), the session
+ * `slack_bot_<key>` (`personaTmuxSessionName`) when that is empty, and no
+ * description when that is empty. The hold rows build their `input` with
+ * `src/conflict-latch.ts`'s own set-input builders, so no field is typed here.
+ */
+export function expectedLatchRecord(key: string, input: ConflictLatchSetInput): ConflictLatchRecord {
+  const sessionName = renderLogMessageText(input.sessionName)
+  const description = renderLogMessageText(input.description)
+  return Object.freeze({
+    sessionName: sessionName === '' ? personaTmuxSessionName(key) : sessionName,
+    latchCase: input.latchCase,
+    refusedOperation: input.refusedOperation,
+    rowState: input.rowState,
+    ...(description === '' ? {} : { description }),
+  })
+}
+
+// ---------------------------------------------------------------------------
 // The unusable recorded name (b.jg5 SRJ-512, SRJ-1019)
 // ---------------------------------------------------------------------------
 
@@ -635,6 +685,8 @@ export interface UnusableNameCaseRow {
   readonly sessionName: (key: string) => string
   /** The SRJ-1019 notice body for persona `key` (the persona notifier adds the prefix). */
   readonly notice: (key: string) => string
+  /** The whole latch record a latch of persona `key` from this row holds ({@link expectedLatchRecord} of `unusableNameSetInput`). */
+  readonly record: (key: string) => ConflictLatchRecord
 }
 
 /** The state each non-read site kind's path last read before its call (see the header). */
@@ -652,6 +704,12 @@ function unusableNameRow(site: UnusableNameSite, fault: UnusableNameFault): Unus
   const build = () => errUnusableName(fault)
   const message = classifyAdError(build()).message
   if (message === undefined) throw new Error(`conflict-cases: errUnusableName('${fault}') has no classification message`)
+  const rowState = UNUSABLE_NAME_LAST_READ[site]
+  const record = (key: string): ConflictLatchRecord => {
+    const input = unusableNameSetInput(key, build(), rowState)
+    if (input === undefined) throw new Error(`conflict-cases: errUnusableName('${fault}') gives no unusable-name set input`)
+    return expectedLatchRecord(key, input)
+  }
   return Object.freeze({
     name: `${site}: ${fault}`,
     site,
@@ -660,11 +718,12 @@ function unusableNameRow(site: UnusableNameSite, fault: UnusableNameFault): Unus
     build,
     latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME,
     refusedOperation: REFUSED_OPERATION_NONE,
-    rowState: UNUSABLE_NAME_LAST_READ[site],
+    rowState,
     latchTimeRead: site === 'plain spawn',
     description: message,
     sessionName: (key: string) => personaTmuxSessionName(key),
     notice: (key: string) => unusableNameNoticeText(key, message),
+    record,
   })
 }
 
@@ -852,6 +911,19 @@ export interface LaunchStartCaseRowOf<S extends LaunchStartReadShape> extends La
   readonly sessionName: (key: string) => string
   /** The SRJ-1020 notice body for persona `key` (the persona notifier adds the prefix). */
   readonly notice: (key: string) => string
+  /** The whole latch record a latch of persona `key` from this row holds: {@link launchStartRecord}. */
+  readonly record: (key: string) => ConflictLatchRecord
+}
+
+/**
+ * The record a "launch start not recorded" latch of persona `key` holds
+ * (SRJ-501, SRJ-513): {@link expectedLatchRecord} of `src/conflict-latch.ts`'s
+ * `launchStartNotRecordedSetInput(key, pending)`: the case "launch start not
+ * recorded", the refused operation "none", the state `pending`, the session
+ * `slack_bot_<key>` as the record stores it, and no description.
+ */
+export function launchStartRecord(key: string): ConflictLatchRecord {
+  return expectedLatchRecord(key, launchStartNotRecordedSetInput(key, PENDING))
 }
 
 /** One latching launch-start row: narrow on `shape` for the read's own answer type. */
@@ -903,6 +975,7 @@ function launchStartRow<S extends LaunchStartReadShape>(
     rowState: PENDING,
     sessionName: (key: string) => personaTmuxSessionName(key),
     notice: (key: string) => launchStartNotRecordedNoticeText(key),
+    record: launchStartRecord,
   })
 }
 

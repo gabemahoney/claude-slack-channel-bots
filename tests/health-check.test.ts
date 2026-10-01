@@ -32,7 +32,7 @@ import {
 import type { Client } from 'agent-director'
 import { _buildIsSessionAliveAdapter, _buildStatRouteImpl } from '../src/server.ts'
 import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
-import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
+import { personaInstanceId } from '../src/persona-identity.ts'
 import { _resetBackoffState } from '../src/backoff.ts'
 import { makeMultiPersonaConfig, makePersonaConfig } from './test-helpers/persona-config.ts'
 import type { Persona } from '../src/config.ts'
@@ -50,16 +50,16 @@ import {
 } from '../src/session-manager.ts'
 import {
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
-  REFUSED_OPERATION_NONE,
   bindConflictNotice,
   createConflictLatch,
-  latchRowStateRead,
   launchStartNotRecordedNoticeText,
   type ConflictLatch,
+  type ConflictLatchRecord,
 } from '../src/conflict-latch.ts'
+import { describeAgentDirectorFailure } from '../src/ad-error-class.ts'
 import { createPersonaEpisodes } from '../src/persona-episodes.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
-import { UNUSABLE_NAME_CASE_ROWS } from './test-helpers/conflict-cases.ts'
+import { NO_LAUNCH_START_FORMS, UNUSABLE_NAME_CASE_ROWS, launchStartRecord } from './test-helpers/conflict-cases.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
@@ -91,7 +91,6 @@ import {
 } from './test-helpers/credentials.ts'
 import {
   SAMPLE_LAUNCH_START_FRACTIONAL,
-  SAMPLE_LAUNCH_START_NONE,
   SAMPLE_LAUNCH_START_WHOLE,
   cannedStatusResult,
   errConfigMalformed,
@@ -2869,29 +2868,40 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-502, SRJ-512 — a tick whose own liveness read latches P
+// b.jg5 SRJ-502, SRJ-512, SRJ-513 — a tick whose own liveness read latches P
 //
-// The real liveness adapter applies the own-row `status` step, so an UNUSABLE
-// NAME answer from P's row latches P through the installed latch (whose
+// The real liveness adapter applies the own-row `status` step, with the
+// configured-persona query installed as `main()` installs it (here: P and
+// B). So P latches on the first tick through the installed latch (whose
 // notice reaction, bound as `main()` binds it over a real episodes instance,
-// posts SRJ-1019 once per episode) and reads `unknown`: the tick skips P,
-// schedules nothing and asks for no not-connected notice. P is still read on
-// each later tick, as a latched persona is (SRJ-315); each read meets the same
-// case again, which posts nothing more. The tick asks the latch again after
-// its own read, so P latched while the read ran (here by another path, the
-// read itself answering dead) is not scheduled either. A phrase-less
-// `ErrInternal` latches no one and keeps E9's skip on `unknown`. B beside P,
-// read dead, is scheduled on every tick. `startHealthCheck` takes no clock,
-// so the ticks run on the file's short real interval (`runTicks`, bounded by
-// `maxTicks`).
+// posts once per episode) when P's `status` answers UNUSABLE NAME (SRJ-512:
+// "unusable recorded name", the state unreadable, SRJ-1019) or P's own row
+// reads `pending` with no launch start (SRJ-513: "launch start not recorded",
+// the state `pending`, SRJ-1020). The read gives `unknown`: the tick skips
+// P, schedules nothing and asks for no not-connected notice, whether P's
+// session is connected or not. P is still read on each later tick, as a
+// latched persona is (SRJ-315); each read meets the same case again, which
+// posts nothing more. The tick asks the latch again after its own read, so P
+// latched while the read ran (here by another path, the read itself
+// answering dead) is not scheduled either. Controls: a phrase-less
+// `ErrInternal` latches no one and keeps E9's skip on `unknown`; a `pending`
+// row with a launch start latches no one and keeps E9's two-tick streak,
+// then `scheduleRestart`. B beside P, read dead, is scheduled on every tick.
+// Each hold case runs one fault row or one no-launch-start form per
+// connection here: every fault and form is covered at the adapters, in
+// tests/server.test.ts. `startHealthCheck` takes no clock, so the ticks run
+// on the file's short real interval (`runTicks`, bounded by `maxTicks`).
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-512: a tick whose own liveness read latches P', () => {
-  const P = 'unusable_bot'
+describe('b.jg5 SRJ-512, SRJ-513: a tick whose own liveness read latches P', () => {
+  const P = 'held_bot'
   const B = 'other_bot'
   const DEAD_ROW = cannedStatusResult({ state: [...AGENT_DIRECTOR_DEAD_STATES][0]! })
-  /** The first `status` row of the unusable-name table (every fault is covered at the adapter, in tests/server.test.ts). */
+  /** The first `status` row of the unusable-name table. */
   const ROW = UNUSABLE_NAME_CASE_ROWS.find((row) => row.site === 'status')!
+  /** P's own row `pending` with the launch start `start` (the key left out for `undefined`). */
+  const pendingRow = (start: string | null | undefined) =>
+    cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: start })
 
   let latch: ConflictLatch
   let unbindNotice: () => void
@@ -2910,22 +2920,25 @@ describe('b.jg5 SRJ-512: a tick whose own liveness read latches P', () => {
       clock: createFakeClock(),
     }))
     setConflictLatch(latch)
+    setConfiguredPersonaQuery((key) => key === P || key === B)
   })
 
   afterEach(() => {
     unbindNotice()
     setConflictLatch(undefined)
+    _resetConfiguredPersonaQuery()
     resetClientForTests()
   })
 
   /**
    * The file's deps, their liveness read the real adapter over a stub client:
    * P's `status` answers `pAnswer` on every read, B's reads a dead row. P's
-   * session is disconnected (read live, its second tick would schedule it and
-   * ask for the notice), auto-restart is disabled, the latched query is the
-   * installed latch's, and each not-connected notice asked for is recorded.
+   * session is connected (with its stream) or not as given (default: not, so
+   * read live its second tick would schedule it and ask for the notice),
+   * auto-restart is disabled, the latched query is the installed latch's, and
+   * each not-connected notice asked for is recorded with its reason.
    */
-  function latchDeps(pAnswer: Error | ReturnType<typeof cannedStatusResult>, maxTicks: number) {
+  function latchDeps(pAnswer: Error | ReturnType<typeof cannedStatusResult>, maxTicks: number, connected = false) {
     const config = makeMultiPersonaConfig([{ name: P }, { name: B }], baseDir)
     const statusCalls: string[] = []
     setClientForTests(makeStubClient({
@@ -2936,53 +2949,64 @@ describe('b.jg5 SRJ-512: a tick whose own liveness read latches P', () => {
     }) as unknown as Client)
     const adapter = _buildIsSessionAliveAdapter(() => config)
     const personas = buildPersonaWorkList(config)
-    const deps = makeDeps({ personas, connectedSequence: { [P]: [false] }, maxTicks })
+    const deps = makeDeps({ personas, connectedSequence: { [P]: [connected] }, maxTicks })
     deps.isSessionAlive = (key) => {
       deps.isSessionAliveCalls.push(key)
       return adapter(key)
     }
     deps.isLatched = (key) => latch.isLatched(key)
     deps.isAutoRestartDisabled = () => true
-    const notified: string[] = []
-    deps.notifyNotConnected = (key) => void notified.push(key)
+    const notified: Array<[string, string]> = []
+    deps.notifyNotConnected = (key, why) => void notified.push([key, why])
     return { deps, notified, personas, statusCalls, adapter }
   }
 
-  test('P\'s status answers UNUSABLE NAME on three ticks: P latches on the first and SRJ-1019 is posted once; P is read each tick but never scheduled, no not-connected notice; B, read dead, is scheduled each tick', async () => {
-    const err = ROW.build()
-    const { deps, notified, personas, statusCalls } = latchDeps(err, 3)
+  /** P's own-row `status` step line at the liveness read for an UNUSABLE NAME answer `err`. */
+  const unusableStepLine = (err: unknown) => (outcome: string): string =>
+    `[slack] isSessionAlive: status for persona=${P}: ${describeAgentDirectorFailure(err)} — UNUSABLE NAME: ${outcome}; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)`
+  /** P's own-row `status` step line at the liveness read for its `pending` row with no launch start. */
+  const launchStartStepLine = (outcome: string): string =>
+    `[slack] isSessionAlive: status for persona=${P}: its row read latches the persona (case=${LATCH_CASE_LAUNCH_START_NOT_RECORDED}, state=${AGENT_DIRECTOR_PENDING_STATE}) — ${outcome}; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)`
 
-    const lines = await capturingErrors(() => runTicks(deps, 3))
+  /** [label, P's status answer, P connected, P's expected record, its one post, its step line by outcome]. */
+  const HOLD_CASES: ReadonlyArray<readonly [string, () => Error | ReturnType<typeof cannedStatusResult>, boolean, () => ConflictLatchRecord, () => string, (err: unknown) => (outcome: string) => string]> = [
+    [`P's status answers UNUSABLE NAME (${ROW.name}), P disconnected`, () => ROW.build(), false, () => ROW.record(P), () => ROW.notice(P), unusableStepLine],
+    ["P's own row pending, launch start absent, P connected with its stream", () => pendingRow(NO_LAUNCH_START_FORMS.absent), true, () => launchStartRecord(P), () => launchStartNotRecordedNoticeText(P), () => launchStartStepLine],
+    ["P's own row pending, launch start null, P disconnected", () => pendingRow(NO_LAUNCH_START_FORMS.null), false, () => launchStartRecord(P), () => launchStartNotRecordedNoticeText(P), () => launchStartStepLine],
+  ]
 
-    expect(deps.isSessionAliveCalls).toEqual([P, B, P, B, P, B])
-    expect(statusCalls).toEqual([P, B, P, B, P, B].map(personaInstanceId))
-    const scheduledB = { key: B, cwd: personas[B]! }
-    expect(deps.scheduleRestartCalls).toEqual([scheduledB, scheduledB, scheduledB])
-    expect(notified).toEqual([])
-    // Skipped on unknown, P's connection is never probed (B, read dead, neither).
-    expect(deps.isSessionConnectedCalls).toEqual([])
-    expect(latch.record(P)).toEqual({
-      sessionName: ROW.sessionName(P),
-      latchCase: ROW.latchCase,
-      refusedOperation: ROW.refusedOperation,
-      rowState: ROW.rowState,
-      description: ROW.description,
-    })
-    expect(latch.isLatched(B)).toBe(false)
-    expect(posts).toEqual([{ key: P, text: ROW.notice(P) }])
-    // The first tick's read latched P; the next two met the same case.
-    const stepLines = lines.filter((line) => line.startsWith(`[slack] isSessionAlive: status for persona=${P}: `))
-    expect(stepLines.map((line) => line.slice(line.indexOf('UNUSABLE NAME: ')))).toEqual([
-      'UNUSABLE NAME: the persona latched; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)',
-      'UNUSABLE NAME: the persona was already latched with this case; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)',
-      'UNUSABLE NAME: the persona was already latched with this case; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)',
-    ])
-    expect(latchLines.filter((line) => line.startsWith(`[slack] conflict-latch: persona=${P} latched`))).toHaveLength(1)
-    expect(lines.filter((line) => line.startsWith(`[slack] health-check: liveness unknown for persona=${P}`))).toHaveLength(3)
-    expect(notices).toEqual([])
-    expect(getOutageFlags(P).size).toBe(0)
-    assertNoLeak({ lines, latchLines, posts, notices })
-  })
+  test.each(HOLD_CASES)(
+    '%s, on three ticks: P latches on the first and its notice is posted once; P is read each tick but never scheduled, no not-connected notice; B, read dead, is scheduled each tick',
+    async (_label, answer, connected, record, notice, stepLineOf) => {
+      const pAnswer = answer()
+      const stepLine = stepLineOf(pAnswer)
+      const { deps, notified, personas, statusCalls } = latchDeps(pAnswer, 3, connected)
+
+      const lines = await capturingErrors(() => runTicks(deps, 3))
+
+      expect(deps.isSessionAliveCalls).toEqual([P, B, P, B, P, B])
+      expect(statusCalls).toEqual([P, B, P, B, P, B].map(personaInstanceId))
+      const scheduledB = { key: B, cwd: personas[B]! }
+      expect(deps.scheduleRestartCalls).toEqual([scheduledB, scheduledB, scheduledB])
+      expect(notified).toEqual([])
+      // Skipped on unknown, P's connection is never probed (B, read dead, neither).
+      expect(deps.isSessionConnectedCalls).toEqual([])
+      expect(latch.record(P)).toEqual(record())
+      expect(latch.isLatched(B)).toBe(false)
+      expect(posts).toEqual([{ key: P, text: notice() }])
+      // The first tick's read latched P; the next two met the same case.
+      expect(lines.filter((line) => line.startsWith(`[slack] isSessionAlive: status for persona=${P}: `))).toEqual([
+        stepLine('the persona latched'),
+        stepLine('the persona was already latched with this case'),
+        stepLine('the persona was already latched with this case'),
+      ])
+      expect(latchLines.filter((line) => line.startsWith(`[slack] conflict-latch: persona=${P} latched`))).toHaveLength(1)
+      expect(lines.filter((line) => line.startsWith(`[slack] health-check: liveness unknown for persona=${P}`))).toHaveLength(3)
+      expect(notices).toEqual([])
+      expect(getOutageFlags(P).size).toBe(0)
+      assertNoLeak({ lines, latchLines, posts, notices })
+    },
+  )
 
   // A latch set elsewhere while the tick's read ran: the read answers dead,
   // which would schedule P at once, but the latch is asked again after it.
@@ -3024,143 +3048,6 @@ describe('b.jg5 SRJ-512: a tick whose own liveness read latches P', () => {
     expect(lines.filter((line) => line.includes('UNUSABLE NAME'))).toEqual([])
     assertNoLeak({ lines, latchLines, posts, notices })
   })
-})
-
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-502, SRJ-513 — a tick whose own liveness read finds P's own row
-// `pending` with no launch start
-//
-// The real liveness adapter applies the own-row `status` step with the
-// configured-persona query installed as `main()` installs it (here: P and
-// B), so P's own row reading `pending` with no launch start (absent, `null`,
-// or one that does not parse) latches P on the first tick with "launch start
-// not recorded", refused operation "none" and the state `pending`, through
-// the installed latch, whose notice reaction (bound as `main()` binds it over
-// a real episodes instance) posts SRJ-1020 once per episode; the read gives
-// `unknown`, so the tick skips P, schedules nothing and asks for no
-// not-connected notice, whether P's session is connected or not. P is still
-// read on each later tick; each read meets the same case again and posts
-// nothing more. Control: the same row with a launch start latches no one and
-// keeps E9's two-tick streak, then `scheduleRestart`. B beside P, read dead,
-// is scheduled on every tick. `startHealthCheck` takes no clock, so the
-// ticks run on the file's short real interval (`runTicks`, bounded by
-// `maxTicks`).
-// ---------------------------------------------------------------------------
-
-describe('b.jg5 SRJ-513: a tick whose own liveness read finds P\'s own pending row with no launch start latches P', () => {
-  const P = 'launch_start_bot'
-  const B = 'other_bot'
-  const DEAD_ROW = cannedStatusResult({ state: [...AGENT_DIRECTOR_DEAD_STATES][0]! })
-  /** Launch-start values that are none (b.jg5 SRJ-408): the key left out, `null`, and one that does not parse (no zone). */
-  const NO_LAUNCH_START_FORMS: ReadonlyArray<readonly [string, string | null | undefined]> = [
-    ['absent', SAMPLE_LAUNCH_START_NONE],
-    ['null', null],
-    ['unparseable (no zone)', SAMPLE_LAUNCH_START_WHOLE.replace(/Z$/, '')],
-  ]
-  const CONNECTIONS: ReadonlyArray<readonly [string, boolean]> = [
-    ['connected with its stream', true],
-    ['disconnected', false],
-  ]
-
-  let latch: ConflictLatch
-  let unbindNotice: () => void
-  /** The latch's and the episodes' own lines. */
-  let latchLines: string[]
-  /** Every notice the episodes' sink received. */
-  let posts: Array<{ key: string; text: string }>
-
-  beforeEach(() => {
-    latchLines = []
-    posts = []
-    latch = createConflictLatch({ log: (line) => { latchLines.push(line) } })
-    unbindNotice = bindConflictNotice(latch, createPersonaEpisodes({
-      sink: (key, text) => { posts.push({ key, text }) },
-      log: (line) => { latchLines.push(line) },
-      clock: createFakeClock(),
-    }))
-    setConflictLatch(latch)
-    setConfiguredPersonaQuery((key) => key === P || key === B)
-  })
-
-  afterEach(() => {
-    unbindNotice()
-    setConflictLatch(undefined)
-    _resetConfiguredPersonaQuery()
-    resetClientForTests()
-  })
-
-  /**
-   * The file's deps, their liveness read the real adapter over a stub client:
-   * P's `status` answers its own row `pending` with `launchStartedAt` (the
-   * key left out for `undefined`) on every read, B's reads a dead row. P's
-   * session is connected (with its stream) or not as given, auto-restart is
-   * disabled, the latched query is the installed latch's, and each
-   * not-connected notice asked for is recorded with its reason.
-   */
-  function launchStartDeps(launchStartedAt: string | null | undefined, connected: boolean, maxTicks: number) {
-    const config = makeMultiPersonaConfig([{ name: P }, { name: B }], baseDir)
-    const statusCalls: string[] = []
-    setClientForTests(makeStubClient({
-      statusFn: ({ claude_instance_id }) => {
-        statusCalls.push(String(claude_instance_id))
-        return claude_instance_id === personaInstanceId(P)
-          ? cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launchStartedAt })
-          : DEAD_ROW
-      },
-    }) as unknown as Client)
-    const adapter = _buildIsSessionAliveAdapter(() => config)
-    const personas = buildPersonaWorkList(config)
-    const deps = makeDeps({ personas, connectedSequence: { [P]: [connected] }, maxTicks })
-    deps.isSessionAlive = (key) => {
-      deps.isSessionAliveCalls.push(key)
-      return adapter(key)
-    }
-    deps.isLatched = (key) => latch.isLatched(key)
-    deps.isAutoRestartDisabled = () => true
-    const notified: Array<[string, string]> = []
-    deps.notifyNotConnected = (key, why) => void notified.push([key, why])
-    return { deps, notified, personas, statusCalls }
-  }
-
-  /** P's own-row `status` step line at the liveness read, with `outcome` (what became of the latch). */
-  const stepLine = (outcome: string): string =>
-    `[slack] isSessionAlive: status for persona=${P}: its row read latches the persona (case=${LATCH_CASE_LAUNCH_START_NOT_RECORDED}, state=${AGENT_DIRECTOR_PENDING_STATE}) — ${outcome}; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)`
-
-  test.each(NO_LAUNCH_START_FORMS.flatMap(([form, start]) => CONNECTIONS.map(([conn, connected]) => [form, conn, start, connected] as const)))(
-    'P\'s own row pending, launch start %s, P %s, on three ticks: P latches on the first and SRJ-1020 is posted once; P is read each tick but never scheduled, no not-connected notice; B, read dead, is scheduled each tick',
-    async (_form, _conn, start, connected) => {
-      const { deps, notified, personas, statusCalls } = launchStartDeps(start, connected, 3)
-
-      const lines = await capturingErrors(() => runTicks(deps, 3))
-
-      expect(deps.isSessionAliveCalls).toEqual([P, B, P, B, P, B])
-      expect(statusCalls).toEqual([P, B, P, B, P, B].map(personaInstanceId))
-      const scheduledB = { key: B, cwd: personas[B]! }
-      expect(deps.scheduleRestartCalls).toEqual([scheduledB, scheduledB, scheduledB])
-      expect(notified).toEqual([])
-      // Skipped on unknown, P's connection is never probed (B, read dead, neither).
-      expect(deps.isSessionConnectedCalls).toEqual([])
-      expect(latch.record(P)).toEqual({
-        sessionName: personaTmuxSessionName(P),
-        latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED,
-        refusedOperation: REFUSED_OPERATION_NONE,
-        rowState: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
-      })
-      expect(latch.isLatched(B)).toBe(false)
-      expect(posts).toEqual([{ key: P, text: launchStartNotRecordedNoticeText(P) }])
-      // The first tick's read latched P; the next two met the same case.
-      expect(lines.filter((line) => line.startsWith(`[slack] isSessionAlive: status for persona=${P}: `))).toEqual([
-        stepLine('the persona latched'),
-        stepLine('the persona was already latched with this case'),
-        stepLine('the persona was already latched with this case'),
-      ])
-      expect(latchLines.filter((line) => line.startsWith(`[slack] conflict-latch: persona=${P} latched`))).toHaveLength(1)
-      expect(lines.filter((line) => line.startsWith(`[slack] health-check: liveness unknown for persona=${P}`))).toHaveLength(3)
-      expect(notices).toEqual([])
-      expect(getOutageFlags(P).size).toBe(0)
-      assertNoLeak({ lines, latchLines, posts, notices })
-    },
-  )
 
   // Control (b.jg5 SRJ-314, SRJ-408): with a launch start the row latches no
   // one; read `pending`, it is never healthy and takes the two-tick streak,
@@ -3170,7 +3057,7 @@ describe('b.jg5 SRJ-513: a tick whose own liveness read finds P\'s own pending r
     ['connected with its stream', true, []],
     ['disconnected', false, [[P, 'disconnected']]],
   ])('control: P\'s own row pending with a launch start, P %s, on two ticks: no latch, no post; P is scheduled on its second tick, never its first; B is scheduled each tick', async (_conn, connected, expectedNotices) => {
-    const { deps, notified, personas } = launchStartDeps(SAMPLE_LAUNCH_START_FRACTIONAL, connected, 2)
+    const { deps, notified, personas } = latchDeps(pendingRow(SAMPLE_LAUNCH_START_FRACTIONAL), 2, connected)
 
     const lines = await capturingErrors(() => runTicks(deps, 2))
 
