@@ -371,240 +371,265 @@ export function initHealthCheck(d: HealthCheckDeps): void {
 // startHealthCheck
 // ---------------------------------------------------------------------------
 
+/**
+ * Start the tick: every `intervalSeconds` seconds, one run of the tick body
+ * (`runHealthCheckTick`). 0 starts nothing.
+ */
 export function startHealthCheck(intervalSeconds: number): void {
   if (intervalSeconds === 0) return
 
-  intervalId = setInterval(async () => {
-    if (!deps) return
-    if (deps.isShuttingDown()) return
-    if (tickInFlight) {
-      skippedTicks++
-      // Fire exactly once when the streak crosses 5 (4 → 5 transition). At the
-      // 120 s interval, five consecutive skips represents ~10 minutes of
-      // tick-budget exhaustion — long enough to indicate genuine health-check
-      // wedging (e.g., a persistently hung statRoute or isSessionAliveAdapter)
-      // rather than transient slowness. Further skips within the same streak
-      // are silent; the next successfully-started tick body resets the counter
-      // and re-arms the warning for a future streak.
-      if (skippedTicks === 5) {
-        console.error('[slack] health-check: tick body in flight; skipped 5 consecutive ticks — investigate budget exhaustion')
-      }
-      return
+  // The callback returns the tick body's promise.
+  intervalId = setInterval(() => runHealthCheckTick(), intervalSeconds * 1000)
+}
+
+/**
+ * Test-only seam: run exactly one tick body (`runHealthCheckTick`) with the
+ * deps `initHealthCheck` installed, with no interval armed, and resolve once
+ * it has finished. The body is the one the interval runs, with the same
+ * guards: nothing runs with no deps or while shutting down, and a body still
+ * in flight makes this one a skipped tick.
+ */
+export function _runHealthCheckTickForTest(): Promise<void> {
+  return runHealthCheckTick()
+}
+
+/**
+ * One tick body (see the module comment): skipped with no deps, while
+ * shutting down, or while the previous body is still in flight (the overlap
+ * guard, which warns once a streak of skips reaches 5). A throw from the
+ * persona work, the work list or the tick-end hook is logged, never
+ * rethrown.
+ */
+async function runHealthCheckTick(): Promise<void> {
+  if (!deps) return
+  if (deps.isShuttingDown()) return
+  if (tickInFlight) {
+    skippedTicks++
+    // Fire exactly once when the streak crosses 5 (4 → 5 transition). At the
+    // 120 s interval, five consecutive skips represents ~10 minutes of
+    // tick-budget exhaustion — long enough to indicate genuine health-check
+    // wedging (e.g., a persistently hung statRoute or isSessionAliveAdapter)
+    // rather than transient slowness. Further skips within the same streak
+    // are silent; the next successfully-started tick body resets the counter
+    // and re-arms the warning for a future streak.
+    if (skippedTicks === 5) {
+      console.error('[slack] health-check: tick body in flight; skipped 5 consecutive ticks — investigate budget exhaustion')
     }
-    tickInFlight = true
-    skippedTicks = 0
-    // b.jg5 SRJ-308: the tick's start time, read before any of its work; the
-    // tick-end hook gets it once the body ends, however it ends. The deps are
-    // captured once so the hook that runs is the one whose clock was read,
-    // even if `initHealthCheck` swaps the deps mid-tick.
-    const tickDeps = deps
-    const tickStartedAt = readTickStart(tickDeps)
-    try {
-      const personas = deps.getPersonas()
+    return
+  }
+  tickInFlight = true
+  skippedTicks = 0
+  // b.jg5 SRJ-308: the tick's start time, read before any of its work; the
+  // tick-end hook gets it once the body ends, however it ends. The deps are
+  // captured once so the hook that runs is the one whose clock was read,
+  // even if `initHealthCheck` swaps the deps mid-tick.
+  const tickDeps = deps
+  const tickStartedAt = readTickStart(tickDeps)
+  try {
+    const personas = deps.getPersonas()
 
-      // A persona the relaunch gate left out of this tick's work list (not up)
-      // is a third skip, beside pending-restart and cap: drop its streak the
-      // same way, so a persona that comes back up starts a fresh consecutive
-      // count instead of inheriting one observation from before it went down.
-      for (const key of disconnectedStreak.keys()) {
-        if (!Object.hasOwn(personas, key)) disconnectedStreak.delete(key)
-      }
+    // A persona the relaunch gate left out of this tick's work list (not up)
+    // is a third skip, beside pending-restart and cap: drop its streak the
+    // same way, so a persona that comes back up starts a fresh consecutive
+    // count instead of inheriting one observation from before it went down.
+    for (const key of disconnectedStreak.keys()) {
+      if (!Object.hasOwn(personas, key)) disconnectedStreak.delete(key)
+    }
 
-      for (const [key, cwd] of Object.entries(personas)) {
+    for (const [key, cwd] of Object.entries(personas)) {
+      try {
+        // A restart pending or active owns the session: skip before any read.
+        // (Work in flight is not this skip: it is a no-attempt reason below,
+        // and the persona is still read; b.jg5 SRJ-315.)
+        if (deps.isRestartPendingOrActive(key)) {
+          // Clear any pending streak: "consecutive" means consecutive
+          // *observed* ticks, not observations separated by an entire restart
+          // cycle. A stale streak surviving across a restart could otherwise
+          // poke a freshly-booting session — the exact false positive the
+          // two-tick debounce exists to prevent.
+          disconnectedStreak.delete(key)
+          continue
+        }
+
+        // SR-25.3/25.4: skip capped personas — the tick must not re-schedule
+        // restarts for personas that have reached the consecutive-failure cap.
+        // The cap is not clearable from the inbound message path: a capped-dead
+        // persona has no registered session, so inbound messages are dropped
+        // (the lost-message branch in src/persona-routing.ts, which checks the
+        // cap itself) and never reach scheduleRestart. The in-process cap/backoff state clears
+        // only on a server restart.
+        //
+        // b.9a7 design decision 1 (DELIBERATE): this skip covers the new
+        // alive-but-disconnected reconnect path too — a capped persona gets NO
+        // tick-driven reconnect. The lost-message notice at the persona's
+        // destination reports a capped persona as "restart limit reached":
+        // automatic restarts are suspended and the operator must restart the
+        // server; a quiet tick-driven /mcp reconnect would contradict that.
+        // Revisiting this (reconnects are far cheaper than relaunches) is a
+        // separate decision — do not silently flip it here.
+        if (deps.isAtCap(key)) {
+          // A capped persona accumulating a disconnected streak is meaningless
+          // state — the tick will not act on it. Clear it so a later, uncapped
+          // observation starts a fresh consecutive count rather than inheriting
+          // a streak carried across the cap window.
+          disconnectedStreak.delete(key)
+          console.error(`[slack] health-check: persona=${key} is at cap — skipping tick (SR-25.3/25.4)`)
+          continue
+        }
+
+        // b.jg5 SRJ-315: decided once, before any read. With a reason (the
+        // persona latched, which a human decides, SRJ-502; work in flight,
+        // which owns the session and whose wait reconnects or reports it,
+        // b.f2b; or `tmux-unavailable` raised, whose retry timer is the
+        // persona's only attempt, SRJ-311), the persona is still
+        // read below, so one that recovered on its own takes the healthy
+        // branch (clearing the outage and ending `tmux-unresponsive`), but
+        // the tick schedules nothing and posts no not-connected notice.
+        let reason = noAttemptReason(deps, key)
+
+        if (await deps.statRoute(cwd)) {
+          clearOutageFlag(key, 'cwd-unreachable')
+        } else {
+          setOutageFlag(key, 'cwd-unreachable', cwd)
+        }
+
+        // b.jg5 SRJ-314: the probe answers a reading. `unknown` (a `status`
+        // error agent-director could not answer, or a probe that threw) is
+        // never read as dead: the persona is skipped this tick, with no
+        // restart scheduled, nothing posted and no episode ended. Its
+        // streak is cleared, as every skip clears it. The tick arms no
+        // retry timer.
+        let reading: LivenessKind
+        let failure = ''
         try {
-          // A restart pending or active owns the session: skip before any read.
-          // (Work in flight is not this skip: it is a no-attempt reason below,
-          // and the persona is still read; b.jg5 SRJ-315.)
-          if (deps.isRestartPendingOrActive(key)) {
-            // Clear any pending streak: "consecutive" means consecutive
-            // *observed* ticks, not observations separated by an entire restart
-            // cycle. A stale streak surviving across a restart could otherwise
-            // poke a freshly-booting session — the exact false positive the
-            // two-tick debounce exists to prevent.
-            disconnectedStreak.delete(key)
-            continue
-          }
+          reading = livenessKindOf(await deps.isSessionAlive(key))
+        } catch (err) {
+          reading = LIVENESS_UNKNOWN
+          failure = ` (isSessionAlive failed: ${describeThrownValue(err)})`
+        }
+        // b.jg5 SRJ-502, SRJ-512, SRJ-513: the tick's own liveness read may
+        // have latched the persona (an UNUSABLE NAME answer, or its own row
+        // reading `pending` with no launch start); its latched
+        // no-attempt reason is asked again after the read, so the tick
+        // schedules nothing for it.
+        if (reason !== 'latched' && latchedAfterRead(deps, key)) reason = 'latched'
+        const holdOff = reason !== null
+        if (reading === LIVENESS_UNKNOWN) {
+          disconnectedStreak.delete(key)
+          console.error(`[slack] health-check: liveness unknown for persona=${key}${failure} — skipping it this tick; not read as dead`)
+          continue
+        }
+        // `live` and `pending` take the alive branches below; only `live`
+        // is ever counted healthy (b.jg5 SRJ-314).
+        const alive = reading !== LIVENESS_DEAD
+        const pending = reading === LIVENESS_PENDING
 
-          // SR-25.3/25.4: skip capped personas — the tick must not re-schedule
-          // restarts for personas that have reached the consecutive-failure cap.
-          // The cap is not clearable from the inbound message path: a capped-dead
-          // persona has no registered session, so inbound messages are dropped
-          // (the lost-message branch in src/persona-routing.ts, which checks the
-          // cap itself) and never reach scheduleRestart. The in-process cap/backoff state clears
-          // only on a server restart.
+        // b.9a7: a persona can be alive (AD live state — pending, waiting,
+        // working, ask_user, check_permission) yet have a dead MCP session.
+        // `isSessionAlive` alone reads `live` or `pending` for such a row,
+        // so the pre-b.9a7 tick (`if (!alive) scheduleRestart`) did nothing
+        // for it forever —
+        // there was no time-bounded recovery. Route BOTH dead sessions and
+        // alive-but-disconnected sessions through scheduleRestart; restart.ts
+        // then does the right thing per case (live+connected → no-op self-
+        // heal, live+disconnected → reconnectSession, pending → the
+        // `pending` deferral, dead → kill+relaunch).
+        //
+        // NOTE (b.4vj, larva): a future inbound-delivery retry driver will
+        // also poke unreachable sessions. If it lands, reconcile the two poke
+        // paths so they don't race on the same persona.
+        // (Read once: b.f2b words the delay-0 notice by it.)
+        const connected = alive && deps.isSessionConnected(key)
+        const deliverable = connected && deps.hasSessionStream(key)
+        if (holdOff && (!alive || !deliverable || pending)) {
+          // b.jg5 SRJ-315: a no-attempt reason holds and the persona is not
+          // healthy (`dead`, `pending`, disconnected or streamless): no
+          // `scheduleRestart`, and no not-connected notice, which only
+          // accompanies an attempt. Drop the streak, as every skip does, so
+          // a later attempt starts a fresh two-tick count. With
+          // `tmux-unavailable` and no retry timer armed, arm one.
+          disconnectedStreak.delete(key)
+          // b.jg5 SRJ-311: the outage's retry timer is the persona's only
+          // attempt, but a raised flag does not guarantee one is armed.
+          if (reason === 'tmux-unavailable') armMissingRetryTimer(deps, key)
+        } else if (!alive) {
+          // Dead session: schedule immediately. The disconnected streak is
+          // meaningless once the row is not alive, so drop it.
+          disconnectedStreak.delete(key)
+          deps.scheduleRestart(key, cwd)
+        } else if (!deliverable || pending) {
+          // Alive but not deliverable: either MCP-disconnected (b.9a7) OR
+          // connected-but-streamless — the SDK silently dropped the
+          // `_GET_stream` map entry so messages cannot reach the bot (b.9cj).
           //
-          // b.9a7 design decision 1 (DELIBERATE): this skip covers the new
-          // alive-but-disconnected reconnect path too — a capped persona gets NO
-          // tick-driven reconnect. The lost-message notice at the persona's
-          // destination reports a capped persona as "restart limit reached":
-          // automatic restarts are suspended and the operator must restart the
-          // server; a quiet tick-driven /mcp reconnect would contradict that.
-          // Revisiting this (reconnects are far cheaper than relaunches) is a
-          // separate decision — do not silently flip it here.
-          if (deps.isAtCap(key)) {
-            // A capped persona accumulating a disconnected streak is meaningless
-            // state — the tick will not act on it. Clear it so a later, uncapped
-            // observation starts a fresh consecutive count rather than inheriting
-            // a streak carried across the cap window.
-            disconnectedStreak.delete(key)
-            console.error(`[slack] health-check: persona=${key} is at cap — skipping tick (SR-25.3/25.4)`)
-            continue
-          }
-
-          // b.jg5 SRJ-315: decided once, before any read. With a reason (the
-          // persona latched, which a human decides, SRJ-502; work in flight,
-          // which owns the session and whose wait reconnects or reports it,
-          // b.f2b; or `tmux-unavailable` raised, whose retry timer is the
-          // persona's only attempt, SRJ-311), the persona is still
-          // read below, so one that recovered on its own takes the healthy
-          // branch (clearing the outage and ending `tmux-unresponsive`), but
-          // the tick schedules nothing and posts no not-connected notice.
-          let reason = noAttemptReason(deps, key)
-
-          if (await deps.statRoute(cwd)) {
-            clearOutageFlag(key, 'cwd-unreachable')
-          } else {
-            setOutageFlag(key, 'cwd-unreachable', cwd)
-          }
-
-          // b.jg5 SRJ-314: the probe answers a reading. `unknown` (a `status`
-          // error agent-director could not answer, or a probe that threw) is
-          // never read as dead: the persona is skipped this tick, with no
-          // restart scheduled, nothing posted and no episode ended. Its
-          // streak is cleared, as every skip clears it. The tick arms no
-          // retry timer.
-          let reading: LivenessKind
-          let failure = ''
-          try {
-            reading = livenessKindOf(await deps.isSessionAlive(key))
-          } catch (err) {
-            reading = LIVENESS_UNKNOWN
-            failure = ` (isSessionAlive failed: ${describeThrownValue(err)})`
-          }
-          // b.jg5 SRJ-502, SRJ-512, SRJ-513: the tick's own liveness read may
-          // have latched the persona (an UNUSABLE NAME answer, or its own row
-          // reading `pending` with no launch start); its latched
-          // no-attempt reason is asked again after the read, so the tick
-          // schedules nothing for it.
-          if (reason !== 'latched' && latchedAfterRead(deps, key)) reason = 'latched'
-          const holdOff = reason !== null
-          if (reading === LIVENESS_UNKNOWN) {
-            disconnectedStreak.delete(key)
-            console.error(`[slack] health-check: liveness unknown for persona=${key}${failure} — skipping it this tick; not read as dead`)
-            continue
-          }
-          // `live` and `pending` take the alive branches below; only `live`
-          // is ever counted healthy (b.jg5 SRJ-314).
-          const alive = reading !== LIVENESS_DEAD
-          const pending = reading === LIVENESS_PENDING
-
-          // b.9a7: a persona can be alive (AD live state — pending, waiting,
-          // working, ask_user, check_permission) yet have a dead MCP session.
-          // `isSessionAlive` alone reads `live` or `pending` for such a row,
-          // so the pre-b.9a7 tick (`if (!alive) scheduleRestart`) did nothing
-          // for it forever —
-          // there was no time-bounded recovery. Route BOTH dead sessions and
-          // alive-but-disconnected sessions through scheduleRestart; restart.ts
-          // then does the right thing per case (live+connected → no-op self-
-          // heal, live+disconnected → reconnectSession, pending → the
-          // `pending` deferral, dead → kill+relaunch).
+          // b.jg5 SRJ-314: a `pending` row is never counted healthy, so one
+          // connected with its stream lands here too: its session has not
+          // started. It takes the same streak, then `scheduleRestart`,
+          // whose run hands it to the `pending` deferral (never relaunched,
+          // never scheduled as dead), and it never ends the not-connected
+          // episode.
+          // Both land here and share the SAME two-consecutive-tick guard:
+          // HAZARD 1 — a session between registerSession and its stream
+          // re-opening is legitimately streamless for a moment and must not be
+          // poked mid-boot. Require two CONSECUTIVE ticks before acting (see
+          // disconnectedStreak doc comment). scheduleRestart then does the
+          // right thing per case — reconnect a disconnected row, or recover a
+          // streamless one (restartWorkSteps' connected-and-stream check in
+          // restart.ts no longer waves the latter through).
           //
-          // NOTE (b.4vj, larva): a future inbound-delivery retry driver will
-          // also poke unreachable sessions. If it lands, reconcile the two poke
-          // paths so they don't race on the same persona.
-          // (Read once: b.f2b words the delay-0 notice by it.)
-          const connected = alive && deps.isSessionConnected(key)
-          const deliverable = connected && deps.hasSessionStream(key)
-          if (holdOff && (!alive || !deliverable || pending)) {
-            // b.jg5 SRJ-315: a no-attempt reason holds and the persona is not
-            // healthy (`dead`, `pending`, disconnected or streamless): no
-            // `scheduleRestart`, and no not-connected notice, which only
-            // accompanies an attempt. Drop the streak, as every skip does, so
-            // a later attempt starts a fresh two-tick count. With
-            // `tmux-unavailable` and no retry timer armed, arm one.
-            disconnectedStreak.delete(key)
-            // b.jg5 SRJ-311: the outage's retry timer is the persona's only
-            // attempt, but a raised flag does not guarantee one is armed.
-            if (reason === 'tmux-unavailable') armMissingRetryTimer(deps, key)
-          } else if (!alive) {
-            // Dead session: schedule immediately. The disconnected streak is
-            // meaningless once the row is not alive, so drop it.
+          // b.f2b: a reconnect deferred on a `working` row returns
+          // 'transient', and restart.ts never re-enters on it; this tick is
+          // the retry driver. While the adapter holds an idle run for the
+          // row (`hasPendingWorkingRowEvidence`), the next attempt, which
+          // can find the row stale and reconnect it, is scheduled on this
+          // first undeliverable tick rather than after a second.
+          const streak = (disconnectedStreak.get(key) ?? 0) + 1
+          if (streak >= 2 || deps.hasPendingWorkingRowEvidence?.(key) === true) {
             disconnectedStreak.delete(key)
             deps.scheduleRestart(key, cwd)
-          } else if (!deliverable || pending) {
-            // Alive but not deliverable: either MCP-disconnected (b.9a7) OR
-            // connected-but-streamless — the SDK silently dropped the
-            // `_GET_stream` map entry so messages cannot reach the bot (b.9cj).
-            //
-            // b.jg5 SRJ-314: a `pending` row is never counted healthy, so one
-            // connected with its stream lands here too: its session has not
-            // started. It takes the same streak, then `scheduleRestart`,
-            // whose run hands it to the `pending` deferral (never relaunched,
-            // never scheduled as dead), and it never ends the not-connected
-            // episode.
-            // Both land here and share the SAME two-consecutive-tick guard:
-            // HAZARD 1 — a session between registerSession and its stream
-            // re-opening is legitimately streamless for a moment and must not be
-            // poked mid-boot. Require two CONSECUTIVE ticks before acting (see
-            // disconnectedStreak doc comment). scheduleRestart then does the
-            // right thing per case — reconnect a disconnected row, or recover a
-            // streamless one (restartWorkSteps' connected-and-stream check in
-            // restart.ts no longer waves the latter through).
-            //
-            // b.f2b: a reconnect deferred on a `working` row returns
-            // 'transient', and restart.ts never re-enters on it; this tick is
-            // the retry driver. While the adapter holds an idle run for the
-            // row (`hasPendingWorkingRowEvidence`), the next attempt, which
-            // can find the row stale and reconnect it, is scheduled on this
-            // first undeliverable tick rather than after a second.
-            const streak = (disconnectedStreak.get(key) ?? 0) + 1
-            if (streak >= 2 || deps.hasPendingWorkingRowEvidence?.(key) === true) {
-              disconnectedStreak.delete(key)
-              deps.scheduleRestart(key, cwd)
-              // b.f2b: with auto-restart disabled scheduleRestart only logs and
-              // returns, so nothing would reconnect this persona: report it
-              // (the notice is raised once per episode), worded for why it is
-              // undeliverable. A `pending` row connected with its stream gets
-              // no notice: it is neither disconnected nor streamless, so
-              // either wording would be false.
-              if (!deliverable && deps.isAutoRestartDisabled?.() === true) {
-                deps.notifyNotConnected?.(key, connected ? 'streamless' : 'disconnected')
-              }
-            } else {
-              disconnectedStreak.set(key, streak)
+            // b.f2b: with auto-restart disabled scheduleRestart only logs and
+            // returns, so nothing would reconnect this persona: report it
+            // (the notice is raised once per episode), worded for why it is
+            // undeliverable. A `pending` row connected with its stream gets
+            // no notice: it is neither disconnected nor streamless, so
+            // either wording would be false.
+            if (!deliverable && deps.isAutoRestartDisabled?.() === true) {
+              deps.notifyNotConnected?.(key, connected ? 'streamless' : 'disconnected')
             }
           } else {
-            // `live`, connected, AND stream present — healthy. Reset any pending
-            // streak so a transient one-tick blip never accumulates toward the
-            // threshold. b.f2b: its not-connected episode, if any, is over.
-            // b.jg5 SRJ-310: so is its tmux-unresponsive condition, if it holds.
-            // b.jg5 SRJ-311, SRJ-312: a healthy check is the one tick
-            // observation that clears `tmux-unavailable` (with its single
-            // all-clear when that empties the persona's flags), carrying the
-            // tick's `live` reading so the retry timer's stop sees a row live
-            // out of `pending`. No other reading, and no disconnected or
-            // streamless session, clears it.
-            disconnectedStreak.delete(key)
-            deps.endNotConnectedEpisode?.(key)
-            deps.endTmuxUnresponsive?.(key)
-            clearOutageFlag(key, 'tmux-unavailable', LIVENESS_LIVE)
+            disconnectedStreak.set(key, streak)
           }
-        } catch (err) {
-          console.error(`[slack] health-check: error checking persona=${key}: ${describeThrownValue(err)}`)
+        } else {
+          // `live`, connected, AND stream present — healthy. Reset any pending
+          // streak so a transient one-tick blip never accumulates toward the
+          // threshold. b.f2b: its not-connected episode, if any, is over.
+          // b.jg5 SRJ-310: so is its tmux-unresponsive condition, if it holds.
+          // b.jg5 SRJ-311, SRJ-312: a healthy check is the one tick
+          // observation that clears `tmux-unavailable` (with its single
+          // all-clear when that empties the persona's flags), carrying the
+          // tick's `live` reading so the retry timer's stop sees a row live
+          // out of `pending`. No other reading, and no disconnected or
+          // streamless session, clears it.
+          disconnectedStreak.delete(key)
+          deps.endNotConnectedEpisode?.(key)
+          deps.endTmuxUnresponsive?.(key)
+          clearOutageFlag(key, 'tmux-unavailable', LIVENESS_LIVE)
         }
+      } catch (err) {
+        console.error(`[slack] health-check: error checking persona=${key}: ${describeThrownValue(err)}`)
       }
-    } catch (err) {
-      // A throw outside the per-persona work (e.g. `getPersonas`) ends the
-      // tick here: logged, never rethrown, so no unhandled rejection escapes
-      // the interval callback.
-      console.error(`[slack] health-check: the tick failed: ${describeThrownValue(err)}`)
-    } finally {
-      // b.jg5 SRJ-308: the onset check runs once the tick's per-persona work
-      // is done, however the body ended (never throws).
-      runTickEndHook(tickDeps, tickStartedAt)
-      tickInFlight = false
     }
-  }, intervalSeconds * 1000)
+  } catch (err) {
+    // A throw outside the per-persona work (e.g. `getPersonas`) ends the
+    // tick here: logged, never rethrown, so no unhandled rejection escapes
+    // the interval callback.
+    console.error(`[slack] health-check: the tick failed: ${describeThrownValue(err)}`)
+  } finally {
+    // b.jg5 SRJ-308: the onset check runs once the tick's per-persona work
+    // is done, however the body ended (never throws).
+    runTickEndHook(tickDeps, tickStartedAt)
+    tickInFlight = false
+  }
 }
 
 /** The tick's start time from `d.now` (the system clock when absent); a throwing clock is logged and reads as none. */

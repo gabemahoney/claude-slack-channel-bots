@@ -714,8 +714,8 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // site.
     //
     // For the dead-tmux 'escalate-dead' verdicts ('dead-session' from
-    // reconnectMcp, and b.d61's `working` row whose tmux session is gone)
-    // CSCB recovers itself (b.sv7 / Epic t1.tkk.e4): the reconnectSession
+    // reconnectMcp, and a row whose read-pane answered GONE or found the row
+    // absent) CSCB recovers itself (b.sv7 / Epic t1.tkk.e4): the reconnectSession
     // adapter fires the internal memoized findMissing sweep before returning,
     // which may reconcile the frozen `working` row to `missing`. It may also
     // leave the row live (in `unverified_ids`, or, when `pending`, not judged

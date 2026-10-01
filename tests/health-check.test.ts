@@ -13,9 +13,9 @@ import {
   initHealthCheck,
   startHealthCheck,
   _resetHealthCheckState,
+  _runHealthCheckTickForTest,
   buildPersonaWorkList,
   forgetDisconnectedStreak,
-  stopHealthCheck,
   type HealthCheckDeps,
 } from '../src/health-check.ts'
 import {
@@ -103,8 +103,43 @@ import {
 // Constants
 // ---------------------------------------------------------------------------
 
-const FAST_INTERVAL_S = 0.01  // 10 ms interval — fast enough for tests
-const WAIT_MS = 50             // wait after starting; long enough for several ticks
+const FAST_INTERVAL_S = 0.01  // the interval the arming cases pass to startHealthCheck
+
+// ---------------------------------------------------------------------------
+// Driving ticks
+//
+// No case here waits on the real interval. Each tick body runs through the
+// module's test seam (`_runHealthCheckTickForTest`, the body the interval
+// runs) and is awaited to its end, so a case drives exactly the ticks it
+// needs. The cases about `startHealthCheck` itself catch the interval it arms
+// (`armedIntervals`) and run its callback by hand.
+// ---------------------------------------------------------------------------
+
+/** Run `n` tick bodies with the installed deps, one after another, each awaited to its end. */
+async function driveTicks(n: number): Promise<void> {
+  for (let i = 0; i < n; i++) await _runHealthCheckTickForTest()
+}
+
+/**
+ * Run `arm` with the global `setInterval` swapped for a recorder, restored
+ * before this returns, and answer every interval it set (callback and
+ * period), none of them scheduled.
+ */
+function armedIntervals(arm: () => void): Array<{ callback: () => unknown; ms: number }> {
+  const g = globalThis as unknown as Record<string, unknown>
+  const saved = g.setInterval
+  const armed: Array<{ callback: () => unknown; ms: number }> = []
+  g.setInterval = (callback: () => unknown, ms: number) => {
+    armed.push({ callback, ms })
+    return 0
+  }
+  try {
+    arm()
+  } finally {
+    g.setInterval = saved
+  }
+  return armed
+}
 
 // ---------------------------------------------------------------------------
 // Persona fixtures (b.av2 SR-6.3): the tick's work list is persona key →
@@ -157,8 +192,8 @@ type DepsOpts = {
   isSessionConnectedResult?: boolean // default: true (MCP connected); false → alive-but-disconnected (b.9a7)
   // b.9a7: per-persona scripted connectedness. Each entry is a queue of results
   // consumed one-per-isSessionConnected-call, so a test can drive an exact
-  // sequence of observations across ticks (e.g. [false, true, false]) without
-  // depending on how many times the free-running timer fired. When the queue
+  // sequence of observations across ticks (e.g. [false, true, false]) however
+  // many ticks the case drives past its end. When the queue
   // for a persona is exhausted, the LAST scripted value repeats.
   connectedSequence?: Record<string, boolean[]>
   hasSessionStreamResult?: boolean   // default: true (stream present — prior semantics; b.9cj)
@@ -350,8 +385,7 @@ describe('startHealthCheck', () => {
     const deps = makeDeps()  // isSessionAlive reads dead by default; statRoute defaults to true
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(1)
 
     expect(deps.scheduleRestartCalls.length >= 1).toBe(true)
     expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
@@ -362,8 +396,7 @@ describe('startHealthCheck', () => {
     const deps = makeDeps({ isRestartPendingResult: true })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(3)
 
     expect(deps.scheduleRestartCalls).toHaveLength(0)
   })
@@ -372,8 +405,7 @@ describe('startHealthCheck', () => {
     const deps = makeDeps({ isActiveLaunchingResult: true })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(3)
 
     expect(deps.scheduleRestartCalls).toHaveLength(0)
   })
@@ -382,8 +414,7 @@ describe('startHealthCheck', () => {
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(3)
 
     expect(deps.scheduleRestartCalls).toHaveLength(0)
   })
@@ -396,8 +427,7 @@ describe('startHealthCheck', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(1)
 
     expect(deps.scheduleRestartCalls.some(c => c.key === 'dead_bot')).toBe(true)
     expect(deps.scheduleRestartCalls.some(c => c.key === 'failing_bot')).toBe(false)
@@ -440,8 +470,7 @@ describe('startHealthCheck', () => {
     const orig = console.error
     console.error = (...args: unknown[]) => { errArgs.push(args) }
     try {
-      startHealthCheck(FAST_INTERVAL_S)
-      await Bun.sleep(WAIT_MS)
+      await driveTicks(1)
     } finally {
       console.error = orig
     }
@@ -456,12 +485,11 @@ describe('startHealthCheck', () => {
     assertNoLeak({ errArgs, notices })
   })
 
-  test('6. zero interval disables poller — isSessionAlive never called', async () => {
+  test('6. zero interval disables poller — no interval armed, isSessionAlive never called', () => {
     const deps = makeDeps()
     initHealthCheck(deps)
 
-    startHealthCheck(0)
-    await Bun.sleep(WAIT_MS)
+    expect(armedIntervals(() => startHealthCheck(0))).toEqual([])
 
     expect(deps.isSessionAliveCalls).toHaveLength(0)
   })
@@ -470,8 +498,7 @@ describe('startHealthCheck', () => {
     const deps = makeDeps({ isShuttingDownResult: true })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(3)
 
     expect(deps.isSessionAliveCalls).toHaveLength(0)
   })
@@ -481,28 +508,31 @@ describe('startHealthCheck', () => {
   // only after startupSessionManager() returns and writeSessions() completes.
   // The unit-level guarantee is that initHealthCheck() alone does NOT start the
   // poller — the poller only starts when startHealthCheck() is explicitly called.
-  test('T26: initHealthCheck alone does not start poller — isSessionAlive not called until startHealthCheck is invoked', async () => {
+  test('T26: initHealthCheck alone does not start poller — no interval armed, isSessionAlive not called until startHealthCheck is invoked', () => {
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD })
-    initHealthCheck(deps)
 
     // Deliberately do NOT call startHealthCheck — simulate the window between
     // initHealthCheck (called before startup) and startHealthCheck (called after
     // writeSessions completes).
-    await Bun.sleep(WAIT_MS)
+    expect(armedIntervals(() => initHealthCheck(deps))).toEqual([])
 
     expect(deps.isSessionAliveCalls).toHaveLength(0)
   })
 
-  test('T26: poller starts immediately once startHealthCheck is called after writeSessions phase', async () => {
+  test('T26: poller starts once startHealthCheck is called after writeSessions phase — one interval at the given period, whose callback runs a tick body', async () => {
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     initHealthCheck(deps)
 
     // Simulate the writeSessions phase completing — then start health check
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    const armed = armedIntervals(() => startHealthCheck(FAST_INTERVAL_S))
+    expect(armed.map((a) => a.ms)).toEqual([FAST_INTERVAL_S * 1000])
+    expect(deps.isSessionAliveCalls).toHaveLength(0)
+    // The callback answers the tick body's promise; one firing is one body.
+    await armed[0]!.callback()
 
     // Poller fired at least once after startHealthCheck was called
     expect(deps.isSessionAliveCalls.length).toBeGreaterThan(0)
+    expect(deps.tickCount()).toBe(1)
   })
 })
 
@@ -519,8 +549,7 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
     const deps = makeDeps({ statRouteResult: true, isSessionAliveResult: LIVENESS_READING_LIVE })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(3)
 
     expect(getOutageFlags(KEY).has('cwd-unreachable')).toBe(false)
     // The pre-raise onset, then exactly one all-clear — both for the persona key.
@@ -537,8 +566,7 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
     const deps = makeDeps({ statRouteResult: false, isSessionAliveResult: LIVENESS_READING_LIVE })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(3)
 
     expect(getOutageFlags(KEY).has('cwd-unreachable')).toBe(true)
     // The stat target is the persona's working directory, and the one onset
@@ -552,8 +580,7 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
     const deps = makeDeps({ statRouteResult: true, isSessionAliveResult: LIVENESS_READING_DEAD })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(1)
 
     expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
     expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
@@ -562,7 +589,8 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
 
   test('(d) tick-in-flight guard: 5th consecutive skip emits exactly one warning', async () => {
     // statRoute never resolves — first tick body hangs forever, all subsequent
-    // interval firings hit the tickInFlight guard and increment skippedTicks.
+    // ticks hit the tickInFlight guard and increment skippedTicks. The hung
+    // body is never awaited; the next case's reset clears its in-flight mark.
     const deps = makeDeps({ statRouteHangs: true })
     initHealthCheck(deps)
 
@@ -571,21 +599,25 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
     console.error = (...args: unknown[]) => {
       capturedErrors.push(args.map(a => String(a)).join(' '))
     }
+    const warnings = () => capturedErrors.filter(e =>
+      e.includes('tick body in flight; skipped 5 consecutive ticks'),
+    )
 
+    let afterFourSkips: string[]
     try {
-      startHealthCheck(FAST_INTERVAL_S)  // 10 ms interval
-      // Need 6+ firings: 1 starts the hung body, then 5 are skips.
-      // At 10 ms/tick, 200 ms → ~20 firings → 1 body + 19 skips.
-      await Bun.sleep(200)
+      void _runHealthCheckTickForTest()  // starts the hung body
+      await driveTicks(4)
+      afterFourSkips = warnings()
+      // The 5th skip, then 14 more.
+      await driveTicks(15)
     } finally {
       console.error = origError
     }
 
-    const warnings = capturedErrors.filter(e =>
-      e.includes('tick body in flight; skipped 5 consecutive ticks'),
-    )
+    expect(deps.tickCount()).toBe(1)
+    expect(afterFourSkips).toEqual([])
     // Warning fires exactly once at the 4→5 skip boundary; further skips are silent.
-    expect(warnings).toHaveLength(1)
+    expect(warnings()).toHaveLength(1)
   })
 
   // ---------------------------------------------------------------------------
@@ -652,8 +684,7 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(3)
 
     // scheduleRestart must not have been called — capped persona is skipped
     expect(deps.scheduleRestartCalls).toHaveLength(0)
@@ -672,8 +703,7 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(1)
 
     expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
     expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
@@ -729,8 +759,7 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
     }
 
     initHealthCheck(deps)
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(2)
 
     // dead_bot: scheduleRestart called (not capped, dead)
     expect(scheduleRestartCalls.some(c => c.key === 'dead_bot')).toBe(true)
@@ -769,8 +798,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(4)
 
     // A stranded alive-but-disconnected persona IS scheduled within a bounded
     // number of ticks — no inbound message, no server restart (AC 2/5).
@@ -796,8 +824,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(6)
 
     // No two CONSECUTIVE disconnected observations ever occurred.
     expect(deps.scheduleRestartCalls).toHaveLength(0)
@@ -815,8 +842,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(6)
 
     // Every fire is at an even connected-call-count (2, 4, 6...): the streak was
     // dropped after each fire and had to re-accumulate two observations.
@@ -837,8 +863,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(3)
 
     expect(deps.scheduleRestartCalls).toHaveLength(0)
     // The skip fires before the connectedness probe.
@@ -855,8 +880,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(3)
 
     expect(deps.scheduleRestartCalls).toHaveLength(0)
     expect(deps.isSessionConnectedCalls).toHaveLength(0)
@@ -870,8 +894,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_DEAD, isSessionConnectedResult: false })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(2)
 
     expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
     expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
@@ -891,8 +914,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(3)
 
     expect(deps.scheduleRestartCalls).toHaveLength(0)
     // Skip fires before both probes.
@@ -907,12 +929,11 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // streak leaked as 1).
     const deps1 = makeDeps({
       isSessionAliveResult: LIVENESS_READING_LIVE,
-      // exactly one disconnected observation then connected — leaves streak at 1
+      // one tick, so exactly one disconnected observation — leaves streak at 1
       connectedSequence: { [KEY]: [false, true] },
     })
     initHealthCheck(deps1)
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(1)
     expect(deps1.scheduleRestartCalls).toHaveLength(0)
     // Anti-vacuity: the phase-1 run must actually have observed the persona at
     // least once (accumulating the streak of 1) — otherwise the reset below
@@ -928,8 +949,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
       connectedSequence: { [KEY]: [false, true] },
     })
     initHealthCheck(deps2)
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(2)
 
     expect(deps2.scheduleRestartCalls).toHaveLength(0)
   })
@@ -952,8 +972,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(4)
 
     expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
     expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
@@ -976,8 +995,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(4)
 
     expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
     expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
@@ -1007,8 +1025,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(4)
 
     // Anti-vacuity: tick 2 ran without DROP (not probed), STAY probed on every tick.
     expect(deps.isSessionConnectedCalls.slice(0, 6)).toEqual([DROP, STAY, STAY, DROP, STAY, DROP])
@@ -1048,8 +1065,7 @@ describe('b.9cj connected-but-streamless tick recovery', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(4)
 
     expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
     expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
@@ -1070,8 +1086,7 @@ describe('b.9cj connected-but-streamless tick recovery', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(6)
 
     // No two CONSECUTIVE streamless observations ever occurred — the healthy
     // (stream-present) branch cleared the streak each time.
@@ -1094,8 +1109,7 @@ describe('b.9cj connected-but-streamless tick recovery', () => {
     })
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(6)
 
     // The disconnected session was recovered.
     expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
@@ -1131,8 +1145,7 @@ describe('persona-keyed work list and streaks (b.av2 SR-6.3)', () => {
 
     const deps = makeDeps({ personas, isSessionAliveResult: LIVENESS_READING_DEAD, maxTicks: 1 })
     initHealthCheck(deps)
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(1)
 
     expect(deps.tickCount()).toBe(1)
     // Exactly one liveness probe and one stat per persona, never per channel.
@@ -1170,8 +1183,7 @@ describe('persona-keyed work list and streaks (b.av2 SR-6.3)', () => {
       maxTicks: 2,
     })
     initHealthCheck(deps)
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
+    await driveTicks(2)
 
     expect(deps.tickCount()).toBe(2)
     expect(deps.isSessionConnectedCalls).toEqual(['persona_a', 'persona_b', 'persona_a', 'persona_b'])
@@ -1187,13 +1199,10 @@ describe('persona-keyed work list and streaks (b.av2 SR-6.3)', () => {
 // of a persona missing from its work list (case 12 above).
 // ---------------------------------------------------------------------------
 
-/** Start the check and wait until `deps` has run `n` tick bodies (bounded by its `maxTicks`). */
+/** Install `deps` and run `n` tick bodies through the seam, each awaited to its end; `deps` must have begun exactly `n`. */
 async function runTicks(deps: ReturnType<typeof makeDeps>, n: number): Promise<void> {
   initHealthCheck(deps)
-  startHealthCheck(FAST_INTERVAL_S)
-  for (let waited = 0; deps.tickCount() < n && waited < 500; waited++) await Bun.sleep(1)
-  await Bun.sleep(20)  // let the last tick body settle; later ticks stop at maxTicks
-  stopHealthCheck()
+  await driveTicks(n)
   expect(deps.tickCount()).toBe(n)
 }
 
@@ -2524,15 +2533,16 @@ describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick
     initHealthCheck(first)
 
     await capturingErrors(async () => {
-      startHealthCheck(FAST_INTERVAL_S)
-      // The first body hangs on the first deps' statRoute.
-      for (let waited = 0; release === undefined && waited < 500; waited++) await Bun.sleep(1)
+      // The first body hangs on the first deps' statRoute, called before the
+      // body's first await.
+      const firstBody = _runHealthCheckTickForTest()
+      expect(release).toBeDefined()
       expect(first.tickCount()).toBe(1)
       initHealthCheck(second)
       release!(true)
-      for (let waited = 0; secondTicks.ends.length === 0 && waited < 500; waited++) await Bun.sleep(1)
-      await Bun.sleep(20)  // later fires stop at the second deps' maxTicks
-      stopHealthCheck()
+      await firstBody
+      // The next tick runs on the second deps.
+      await driveTicks(1)
     })
 
     expect(firstTicks.reads).toEqual([0])
@@ -2587,7 +2597,7 @@ describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick
     const { reads, ends } = withTickEnd(deps, [10_000, 20_000])
     let release: ((reachable: boolean) => void) | undefined
     deps.statRoute = () => new Promise<boolean>((resolve) => { release = resolve })
-    // Every interval fire asks isShuttingDown first; counting those counts the
+    // Every tick asks isShuttingDown first; counting those counts the
     // fires, the skipped ones included. Shutdown stays off until the hung body
     // is released, so every fire meanwhile reaches the in-flight guard.
     let fires = 0
@@ -2596,17 +2606,18 @@ describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick
     initHealthCheck(deps)
 
     const lines = await capturingErrors(async () => {
-      startHealthCheck(FAST_INTERVAL_S)
-      // The first body hangs on statRoute; wait for five skipped fires after it.
-      for (let waited = 0; (release === undefined || fires < 6) && waited < 500; waited++) await Bun.sleep(1)
+      // The first body hangs on statRoute; five skipped ticks follow it.
+      const hungBody = _runHealthCheckTickForTest()
+      expect(release).toBeDefined()
+      await driveTicks(5)
+      expect(fires).toBe(6)
       expect(deps.tickCount()).toBe(1)
       expect(reads).toEqual([0])
       expect(ends).toEqual([])
       // No further body may start once this one ends.
       stopping = true
       release!(true)
-      for (let waited = 0; ends.length === 0 && waited < 500; waited++) await Bun.sleep(1)
-      stopHealthCheck()
+      await hungBody
     })
 
     // The fires were in-flight skips (the fifth logs the guard's warning).
@@ -2625,9 +2636,7 @@ describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick
     deps.isShuttingDown = () => (fires++, shuttingDown())
     initHealthCheck(deps)
 
-    startHealthCheck(FAST_INTERVAL_S)
-    for (let waited = 0; fires < 3 && waited < 500; waited++) await Bun.sleep(1)
-    stopHealthCheck()
+    await driveTicks(3)
 
     expect(fires).toBeGreaterThanOrEqual(3)
     expect(deps.tickCount()).toBe(0)
@@ -2715,11 +2724,13 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
   }
 
   /**
-   * Start the real health check over `getPersonas`, every session dead, with
-   * the real statRoute on the real file system (a missing path answers as a
-   * non-directory rather than through the factory's error log). `tick()` lets exactly one more tick body run and
-   * resolves once every persona in its work list has finished (scheduled, or
-   * skipped at cap), so the assertions after it see the whole tick.
+   * Install the real health check's deps over `getPersonas`, every session
+   * dead, with the real statRoute on the real file system (a missing path
+   * answers as a non-directory rather than through the factory's error log).
+   * `tick()` runs exactly one more tick body through the seam and resolves
+   * once it has ended, checking that every persona in its work list finished
+   * (scheduled, or skipped at cap), so the assertions after it see the whole
+   * tick.
    */
   function startSteppedTicks(getPersonas: () => Record<string, string>, atCap: (key: string) => boolean = () => false) {
     const statRoute = _buildStatRouteImpl({
@@ -2756,10 +2767,9 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
         return personas
       },
     })
-    startHealthCheck(0.002)
     async function tick(): Promise<void> {
       allowed++
-      for (let waited = 0; (ticks < allowed || done < expectedDone) && waited < 500; waited++) await Bun.sleep(1)
+      await _runHealthCheckTickForTest()
       expect(ticks).toBe(allowed)
       expect(done).toBe(expectedDone)
     }
@@ -2889,8 +2899,8 @@ describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', 
 // then `scheduleRestart`. B beside P, read dead, is scheduled on every tick.
 // Each hold case runs one fault row or one no-launch-start form per
 // connection here: every fault and form is covered at the adapters, in
-// tests/server.test.ts. `startHealthCheck` takes no clock, so the ticks run
-// on the file's short real interval (`runTicks`, bounded by `maxTicks`).
+// tests/server.test.ts. The ticks run through the tick seam (`runTicks`),
+// each awaited to its end.
 // ---------------------------------------------------------------------------
 
 describe('b.jg5 SRJ-512, SRJ-513: a tick whose own liveness read latches P', () => {

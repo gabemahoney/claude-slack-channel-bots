@@ -4681,20 +4681,23 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expect(getFailureCount(key)).toBe(0)
   })
 
-  test('AC 27: a retry whose row reads live (a status success) and whose reconnect’s read-pane and send-keys answer ErrTmuxNotAvailable leaves the outage raised and the timer armed at the doubled wait, with no kill or spawn', async () => {
+  // b.jg5 SRJ-117, SRJ-604: ENVIRONMENT at a `waiting` row's read-pane types
+  // nothing, so the reconnect's send-keys is never reached.
+  test('AC 27: a retry whose row reads live (waiting, a status success) and whose reconnect’s read-pane answers ErrTmuxNotAvailable types nothing and leaves the outage raised and the timer armed at the doubled wait, with no kill or spawn and nothing counted', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     modelRow(h, 'waiting')
     await environmentLaunch(h, key)
-    h.script({ readPaneError: errTmuxNotAvailable(undefined, 'read-pane'), sendKeysError: errTmuxNotAvailable(undefined, 'send-keys') })
+    h.script({ readPaneError: errTmuxNotAvailable(undefined, 'read-pane') })
     const before = callCounts(h)
 
     await retryNow(h, key)
 
-    expect(callsSince(h, before)).toEqual({ statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 })
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, readPaneCalls: 1 })
     expect([...getOutageFlags(key)]).toEqual(['tmux-unavailable'])
     expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
     expect(h.outageClears).toEqual([])
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED, 1))
     expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(1), refusals: 1 })
     expect(getFailureCount(key)).toBe(0)
   })
@@ -4902,8 +4905,9 @@ describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and
     expect([...getOutageFlags(key)]).toEqual(['tmux-unavailable'])
 
     // Several retries, each at its due time and never 1 ms early. Each reads
-    // the row live and reconnects; tmux refuses the reconnect, so it re-arms
-    // at the doubled wait and posts nothing more.
+    // the row live (waiting); its reconnect's read-pane meets the re-bound
+    // socket, so nothing is typed (b.jg5 SRJ-117, SRJ-604), and it re-arms at
+    // the doubled wait and posts nothing more.
     const retries = 4
     let dueAt = armedAt
     for (let n = 0; n < retries; n++) {
@@ -4913,7 +4917,7 @@ describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and
       const before = callCounts(h)
       expect(await retryNow(h, key)).toBe(dueAt)
       expect([n, h.attempts.at(-1)]).toEqual([n, { key, retry: n + 1, causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt }])
-      expect([n, callsSince(h, before)]).toEqual([n, { statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 }])
+      expect([n, callsSince(h, before)]).toEqual([n, { statusCalls: 2, readPaneCalls: 1 }])
       expect([n, retryLinesOf(h, key).at(-1)]).toEqual([n, reArmedLine(key, n + 1, UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED, n + 1)])
       expect([n, h.controller.view(key)]).toEqual([n, expect.objectContaining({ phase: 'waiting', dueAt: dueAt + waitMs(n + 1), waitMs: waitMs(n + 1), refusals: n + 1 })])
       expect([n, getFailureCount(key)]).toEqual([n, 0])

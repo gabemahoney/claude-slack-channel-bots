@@ -42,8 +42,9 @@
  *
  * Isolation (b.av2 SR-13.2): every path is under a `mkdtempSync` directory
  * removed in afterEach; tokens are sentinel-bearing fakes and the token
- * environment variables hold fakes for the whole file. The health check runs
- * on a short real interval, one tick at a time, and is reset after each test.
+ * environment variables hold fakes for the whole file. The health check arms
+ * no interval: each tick body runs through its tick seam
+ * (`_runHealthCheckTickForTest`), and the check is reset after each test.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -54,7 +55,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { Persona } from '../src/config.ts'
-import { _resetHealthCheckState, buildPersonaWorkList, initHealthCheck, startHealthCheck } from '../src/health-check.ts'
+import { _resetHealthCheckState, _runHealthCheckTickForTest, buildPersonaWorkList, initHealthCheck } from '../src/health-check.ts'
 import { LIVENESS_READING_DEAD } from '../src/liveness-reading.ts'
 import { _resetOutageState, getOutageFlags, initOutageState } from '../src/outage-state.ts'
 import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
@@ -457,13 +458,13 @@ describe('composePersonaStatusListeners: every listener runs; the result rejects
 // ---------------------------------------------------------------------------
 
 /**
- * Start the real health check over `getPersonas` with every session reading
- * `dead` (`LIVENESS_READING_DEAD`), so each persona in a tick's work list is
- * scheduled. Ticks run one at a time: `tick()` lets exactly one more tick
- * body run and waits for it.
+ * Install the real health check over `getPersonas` with every session
+ * reading `dead` (`LIVENESS_READING_DEAD`), so each persona in a tick's work
+ * list is scheduled. No interval is armed: `tick()` runs exactly one tick
+ * body through the tick seam and waits for it to finish.
  */
 function startTicks(getPersonas: () => Record<string, string>) {
-  let allowed = 0
+  let ran = 0
   let ticks = 0
   const calls = { stat: [] as string[], alive: [] as string[], scheduled: [] as string[] }
   initHealthCheck({
@@ -474,19 +475,17 @@ function startTicks(getPersonas: () => Record<string, string>) {
     isAtCap: () => false,
     statRoute: async (cwd) => (calls.stat.push(cwd), false),
     scheduleRestart: (key) => void calls.scheduled.push(key),
-    isShuttingDown: () => ticks >= allowed,
+    isShuttingDown: () => false,
     getPersonas: () => {
       ticks++
       return getPersonas()
     },
   })
-  startHealthCheck(0.002)
   async function tick(): Promise<void> {
-    allowed++
-    for (let waited = 0; ticks < allowed && waited < 500; waited++) await new Promise((r) => setTimeout(r, 1))
-    expect(ticks).toBe(allowed)
-    // The tick body awaits only settled promises; let it finish.
-    await new Promise((r) => setTimeout(r, 10))
+    ran++
+    await _runHealthCheckTickForTest()
+    // Exactly one more tick body read the work list.
+    expect(ticks).toBe(ran)
   }
   return { calls, tick }
 }

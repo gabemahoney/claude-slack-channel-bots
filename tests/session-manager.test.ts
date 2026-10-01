@@ -97,8 +97,9 @@
  *     `makeRecoveryHarness`: an UNUSABLE NAME answer, each fault of the
  *     case table's rows for the site (`UNUSABLE_NAME_CASE_ROWS`), at every
  *     ladder spawn and `resume`, at the ladder's kill and delete, at the
- *     working-pane read (the launch wait's evidence read, `checkWorkingRowPane`
- *     → `defer`, `checkWaitingRowPane` → `defer`, never `reconnect`), at the
+ *     working-pane read (the launch wait's evidence read and
+ *     `checkWaitingRowPane` → `defer`, never `reconnect`; `checkWorkingRowPane`
+ *     on the working-row verdict's pane makes no read of its own), at the
  *     shared own-row `status` read (its four answers; the wait's poll and
  *     timeout, `reconcileAndReadRowState`, the retry timer's row read, the
  *     latch-time read, which records unreadable and reads once) and at E14's
@@ -125,9 +126,27 @@
  *     UNUSABLE NAME (each fault) with "none", each with one post and no
  *     further call; a latched P is not read. Controls: no latch installed,
  *     a latch whose set or latched query throws, another persona's reads.
- *     At `readWorkingPane`'s three callers a CONFLICT of the site's rows
- *     latches P with the site's state and nothing is typed. A failed pane
- *     read's line at those callers closes with its `read-pane` class.
+ *     At `readWorkingPane`'s two callers (the launch wait's evidence read
+ *     and the waiting-row check) a CONFLICT of the site's rows latches P with
+ *     the site's state and nothing is typed. A failed pane read's line at
+ *     those callers closes with its `read-pane` class. An `ErrInvalidFlags`
+ *     answer makes exactly one immediate version re-check (the real
+ *     installed one over a counting stub `resolveSystemBinary`) and is then
+ *     UNCLASSIFIED, reported inside P's attempt unless the re-check stops;
+ *     no other answer re-checks (b.jg5 SRJ-104, SRJ-204).
+ *   - b.jg5 SRJ-117's waiting-row column, SRJ-604: `checkWaitingRowPane`
+ *     answers GONE with `gone` and the row absent with `absent`, nothing
+ *     typed; ENVIRONMENT defers with `tmux-unavailable` raised; UNAVAILABLE,
+ *     CONFIG (`ad-config-malformed` raised) and UNCLASSIFIED reconnect on the
+ *     `waiting` row alone with one line; the read is the only call, raw tmux
+ *     included. b.jg5 SRJ-603: `checkWorkingRowPane` folds the pane the
+ *     working-row verdict read, makes no `read-pane`, and reads the
+ *     transcript only after an idle pane; the adapter's latched gate
+ *     (`latchedNow`), asked before a deferral is noted and before the
+ *     blocked-on-prompt notice, makes it defer with its evidence forgotten,
+ *     no deferral noted and no notice (the waiting-row check asks it before
+ *     the notice only). Each escalate-dead verdict's line carries its text
+ *     from `ESCALATE_DEAD_EVIDENCE`, and none says "dead".
  *   - b.jg5 SRJ-513, SRJ-1020 (E16 T2), with SRJ-114's and SRJ-115's sites,
  *     on `makeRecoveryHarness`: a configured persona's own row reading
  *     `pending` with no launch start (`LAUNCH_START_CASE_ROWS`: absent,
@@ -257,7 +276,8 @@
  *   - b.f2b stale `working` rows: how a pane read is classified (a Linux
  *     screen's `●` reply and tool lines are not a spinner; a custom spinner
  *     verb of several words is) and folded into evidence, the restart path's
- *     evidence across reconnect attempts (`checkWorkingRowPane`), the
+ *     evidence across reconnect attempts (`checkWorkingRowPane`, on the pane
+ *     the working-row verdict read), the
  *     once-per-episode not-connected notice, the unproven-idle notice once
  *     deferrals on a `working` row have run for 10 min at any restart delay,
  *     the wait at a launch reconnecting a stale row within 60 s (never typing
@@ -322,6 +342,10 @@ import {
   FIND_MISSING_ROW_NOT_JUDGED,
   type FindMissingRowReading,
   sweepDeadTmuxChannel,
+  ESCALATE_DEAD_EVIDENCE,
+  ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
+  ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
+  type EscalateDeadVerdict,
   _setTmuxSessionKiller,
   _resetTmuxSessionKiller,
   _setTmuxServerEnsurer,
@@ -402,6 +426,11 @@ import {
   PROMPT_ROW_SWEEP_AFTER_MS,
   checkWaitingRowPane,
   checkWorkingRowPane,
+  forgetWorkingRowEvidence,
+  WAITING_ROW_PANE_ABSENT,
+  WAITING_ROW_PANE_GONE,
+  type WaitingRowPaneVerdict,
+  type WorkingRowPaneCheckOptions,
   classifyWorkingPane,
   foldWorkingPaneRun,
   endWorkingRowDeferral,
@@ -618,6 +647,7 @@ import {
   PANE_READ_UNCLASSIFIED,
   PANE_READ_UNUSABLE_NAME,
   type PaneReadOutcome,
+  type PaneReadUnclassified,
 } from '../src/pane-read.ts'
 import type { UnclassifiedErrorSink } from '../src/persona-episodes.ts'
 import { getFailureCount } from '../src/backoff.ts'
@@ -6681,6 +6711,20 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
 //     in-flight-shared sweep; failures NOT memoized; never a second sweep pattern.
 // ---------------------------------------------------------------------------
 
+/**
+ * Every escalate-dead verdict, checked complete at compile time: the record
+ * names each `EscalateDeadVerdict` exactly once.
+ */
+const ESCALATE_DEAD_VERDICT_SET: Readonly<Record<EscalateDeadVerdict, true>> = {
+  'dead-session': true,
+  'row-not-interactive': true,
+  'working-tmux-gone': true,
+  [ESCALATE_DEAD_WAITING_ROW_PANE_GONE]: true,
+  [ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ]: true,
+  'prompt-row-tmux-gone': true,
+}
+const ESCALATE_DEAD_VERDICTS = Object.keys(ESCALATE_DEAD_VERDICT_SET) as EscalateDeadVerdict[]
+
 describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
   // Capture console.error to assert on the operator-visible log line. The
   // wrapper (and reconcileMissingSweep) log via console.error; we restore it in
@@ -6779,27 +6823,29 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
     expect(findMissingCalls).toHaveLength(2) // TTL=0 → no reuse, each escalate sweeps
   })
 
-  // b.jdc (b.dup review): the line says what the verdict proves. Only a gone
-  // tmux session is "provably dead"; a refused keystroke (ErrSpawnNotInteractive)
-  // proves the row is no longer interactive, whatever its tmux session. REPRO
-  // for `row-not-interactive`: the old line claimed a dead tmux session for
-  // every verdict.
-  test.each([
-    ['dead-session', 'tmux session provably dead'],
-    ['working-tmux-gone', 'tmux session provably dead'],
-    ['prompt-row-tmux-gone', 'tmux session provably dead'],
-    [
-      'row-not-interactive',
-      'row not interactive (agent-director refused the /mcp reconnect keystrokes: it ended the row or marked it missing, so its claude process is gone)',
-    ],
-  ] as const)('log: verdict=%s says "%s"', async (verdict, evidence) => {
+  // b.jdc, b.jg5 SRJ-613: the line says what the verdict observed, its text
+  // taken from `ESCALATE_DEAD_EVIDENCE`. A GONE answer, a refused keystroke,
+  // an absent row and a prompt row's missing tmux session each say only what
+  // was seen; none says a tmux session or a worker is "provably dead".
+  test.each(ESCALATE_DEAD_VERDICTS)('log: verdict=%s says its own evidence text, from ESCALATE_DEAD_EVIDENCE', async (verdict) => {
     installStub({})
 
     await sweepDeadTmuxChannel('C', verdict)
 
     expect(errLog.filter((l) => l.startsWith('[slack] escalate-dead: persona='))).toEqual([
-      `[slack] escalate-dead: persona=C verdict=${verdict} — ${evidence}, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)`,
+      `[slack] escalate-dead: persona=C verdict=${verdict} — ${ESCALATE_DEAD_EVIDENCE[verdict]}, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)`,
     ])
+  })
+
+  test('ESCALATE_DEAD_EVIDENCE is frozen and holds exactly one text per verdict, all different; none says "dead" or "provably"', () => {
+    expect(Object.isFrozen(ESCALATE_DEAD_EVIDENCE)).toBe(true)
+    expect(Object.keys(ESCALATE_DEAD_EVIDENCE).sort()).toEqual([...ESCALATE_DEAD_VERDICTS].sort())
+    const texts = ESCALATE_DEAD_VERDICTS.map((verdict) => ESCALATE_DEAD_EVIDENCE[verdict])
+    expect(new Set(texts).size).toBe(ESCALATE_DEAD_VERDICTS.length)
+    for (const text of texts) {
+      expect(text).not.toMatch(/\bdead\b/i)
+      expect(text).not.toMatch(/provabl/i)
+    }
   })
 
   // b.m4r contract pin through the wrapper: a FAILED sweep is not memoized, so
@@ -6923,8 +6969,11 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
 // agent-director can leave a persona's row `working` after its turn ended
 // (live Check 24). While the row reads `working`, the wait at a launch
 // (`waitForWaitingAndReconnect`) and the restart path's reconnect attempts
-// (`checkWorkingRowPane`) read the persona's evidence: its pane and, when the
-// pane shows an idle screen, its transcript. The row is stale only on the
+// read the persona's evidence: its pane and, when the pane shows an idle
+// screen, its transcript. On the restart path the pane is the working-row
+// verdict's one read (in `src/server.ts`, its cells in tests/server.test.ts),
+// and `checkWorkingRowPane` folds it with no read of its own (b.jg5 SRJ-603).
+// The row is stale only on the
 // positive-idle rule: across STALE_WORKING_WINDOW_MS (60 s), every read shows
 // the same idle screen (no spinner, busy hint, API retry row, prompt or
 // dialog) AND the same transcript, unchanged, ending with a completed turn. A
@@ -7190,30 +7239,38 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
   })
 
   /**
-   * A stub whose pane reads (every persona's) show `first` until `show`
-   * changes it (an Error fails the read), and whose `get` answers a `working`
-   * row with `fields` (default: naming a finished turn's transcript; null:
-   * the stub's default row, which names no transcript).
+   * A stub for persona C's `working` row whose `get` answers a `working` row
+   * with `fields` (default: naming a finished turn's transcript; null: the
+   * stub's default row, which names no transcript), and the pane the
+   * reconnect adapter's one read gave: `first` until `show` changes it.
+   * `check` runs `checkWorkingRowPane` on that pane (b.jg5 SRJ-603). Every
+   * raw tmux call is recorded in `rawTmux` (`recordRawTmux`).
    */
-  function paneStub(first: PaneReading, fields: PersonaGetResultOverrides | null = transcriptOf().fields) {
+  function paneStub(first: string, fields: PersonaGetResultOverrides | null = transcriptOf().fields) {
     const opts: StubClientOptions = { sendKeysCalls: [], readPaneCalls: [], getCalls: [] }
     if (fields !== null) opts.getResult = cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working', ...fields })
-    showPane(opts, first)
     installStub(opts)
+    const rawTmux: string[] = []
+    recordRawTmux(rawTmux, true)
+    let pane = first
     return {
-      show: (pane: PaneReading) => showPane(opts, pane),
+      show: (next: string) => {
+        pane = next
+      },
+      check: (key = 'C', options?: WorkingRowPaneCheckOptions) => checkWorkingRowPane(key, pane, options),
       sendKeysCalls: opts.sendKeysCalls!,
       readPaneCalls: opts.readPaneCalls!,
       getCalls: opts.getCalls!,
+      rawTmux,
     }
   }
 
-  test('the same idle screen and the same ended transcript on attempts spanning 60 s: defer until then, then reconnect; pending until it concludes, forgotten after; every attempt reads C\'s own pane and row; nothing typed, no notice', async () => {
+  test('the same idle screen and the same ended transcript on attempts spanning 60 s: defer until then, then reconnect; pending until it concludes, forgotten after; every attempt reads C\'s own row with one get and makes no read-pane and no raw tmux call; nothing typed, no notice', async () => {
     const stub = paneStub(IDLE_PANE)
     const verdicts: string[] = []
     const pending: boolean[] = []
     const attempt = async (): Promise<void> => {
-      verdicts.push(await checkWorkingRowPane('C'))
+      verdicts.push(await stub.check())
       pending.push(hasPendingWorkingRowEvidence('C'))
     }
     await attempt()
@@ -7228,73 +7285,88 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
 
     expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect', 'defer'])
     expect(pending).toEqual([true, true, true, false, true])
-    expect(stub.readPaneCalls).toEqual(Array(5).fill(paneReadOf('C')))
+    expect(stub.readPaneCalls).toEqual([])
     expect(stub.getCalls).toEqual(Array(5).fill({ claude_instance_id: 'cscb_C' }))
+    expect(stub.rawTmux).toEqual([])
     expect(stub.sendKeysCalls).toEqual([])
     expect(notices).toEqual([])
   })
 
+  test.each<[string, string, number]>([
+    ['an idle screen', IDLE_PANE, 1],
+    ['a running turn (its spinner line)', SPINNER_PANE, 0],
+    ['a blank pane', '', 0],
+    ['a prompt or dialog', PERMISSION_PANE, 0],
+  ])('b.jg5 SRJ-603: on %s, the transcript get follows an idle pane only (%d get); no read-pane, no raw tmux call, nothing typed', async (_label, pane, gets) => {
+    const stub = paneStub(pane)
+
+    expect(await stub.check()).toBe('defer')
+
+    expect(stub.getCalls).toEqual(Array(gets).fill({ claude_instance_id: 'cscb_C' }))
+    expect(stub.readPaneCalls).toEqual([])
+    expect(stub.rawTmux).toEqual([])
+    expect(stub.sendKeysCalls).toEqual([])
+  })
+
   test('a changed screen restarts the window', async () => {
     const stub = paneStub(IDLE_PANE)
-    const verdicts = [await checkWorkingRowPane('C')]
+    const verdicts = [await stub.check()]
     await clock.advance(40_000)
     stub.show(OTHER_IDLE_PANE)
-    verdicts.push(await checkWorkingRowPane('C'))
+    verdicts.push(await stub.check())
     await clock.advance(30_000) // 70 s since the first read, 30 s of this screen
-    verdicts.push(await checkWorkingRowPane('C'))
+    verdicts.push(await stub.check())
     await clock.advance(30_000)
-    verdicts.push(await checkWorkingRowPane('C'))
+    verdicts.push(await stub.check())
 
     expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect'])
   })
 
   test('a transcript written to mid-window (the session ran another turn behind the same screen) restarts the window, though it ends with a completed turn again', async () => {
     const transcript = transcriptOf()
-    paneStub(IDLE_PANE, transcript.fields)
-    const verdicts = [await checkWorkingRowPane('C')]
+    const stub = paneStub(IDLE_PANE, transcript.fields)
+    const verdicts = [await stub.check()]
     await clock.advance(30_000)
     appendTranscript(transcript.path, endedTurn())
-    verdicts.push(await checkWorkingRowPane('C'))
+    verdicts.push(await stub.check())
     await clock.advance(30_000) // 60 s since the first read, 30 s of this transcript
-    verdicts.push(await checkWorkingRowPane('C'))
+    verdicts.push(await stub.check())
     await clock.advance(30_000)
-    verdicts.push(await checkWorkingRowPane('C'))
+    verdicts.push(await stub.check())
 
     expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect'])
   })
 
-  test.each<[string, () => PaneReading]>([
-    ['a running turn (its spinner line)', () => SPINNER_PANE],
-    ['a blank pane', () => ''],
-    ['a failed read', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'evidence'))],
-  ])('%s between idle reads ends the evidence: defer, nothing pending, and the window starts over', async (_label, interruption) => {
+  // The verdict's read that gave no pane (GONE, UNAVAILABLE, CONFIG and the
+  // rest; its cells are in tests/server.test.ts) forgets the evidence
+  // (`forgetWorkingRowEvidence`) and calls no fold.
+  test.each<[string, (stub: ReturnType<typeof paneStub>) => Promise<unknown>]>([
+    ['a running turn (its spinner line)', async (stub) => {
+      stub.show(SPINNER_PANE)
+      return stub.check()
+    }],
+    ['a blank pane', async (stub) => {
+      stub.show('')
+      return stub.check()
+    }],
+    ['a read that gave no pane (the verdict forgets the evidence)', async () => forgetWorkingRowEvidence('C')],
+  ])('%s between idle reads ends the evidence: defer, nothing pending, and the window starts over', async (_label, interrupt) => {
     const stub = paneStub(IDLE_PANE)
     const verdicts: string[] = []
-    let pendingAfter: boolean | undefined
-    const broken = interruption()
-    const errLog = await withCapturedErr(async () => {
-      verdicts.push(await checkWorkingRowPane('C'))
-      await clock.advance(30_000)
-      stub.show(broken)
-      verdicts.push(await checkWorkingRowPane('C'))
-      pendingAfter = hasPendingWorkingRowEvidence('C')
-      await clock.advance(30_000) // 60 s since the first idle read: without the break, it would reconnect here
-      stub.show(IDLE_PANE)
-      verdicts.push(await checkWorkingRowPane('C'))
-      await clock.advance(STALE_WORKING_WINDOW_MS)
-      verdicts.push(await checkWorkingRowPane('C'))
-    })
+    verdicts.push(await stub.check())
+    await clock.advance(30_000)
+    await interrupt(stub)
+    const pendingAfter = hasPendingWorkingRowEvidence('C')
+    await clock.advance(30_000) // 60 s since the first idle read: without the break, it would reconnect here
+    stub.show(IDLE_PANE)
+    verdicts.push(await stub.check())
+    await clock.advance(STALE_WORKING_WINDOW_MS)
+    verdicts.push(await stub.check())
 
-    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect'])
+    expect(verdicts).toEqual(['defer', 'defer', 'reconnect'])
     expect(pendingAfter).toBe(false)
+    expect(stub.readPaneCalls).toEqual([])
     expect(stub.sendKeysCalls).toEqual([])
-    // A failed read is logged by its errName and redacted message only, with
-    // its read-pane class (a name CSCB gives no handling: UNCLASSIFIED).
-    const failure = `persona=C is working and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))}`
-    const failed = linesWith(errLog, failure)
-    expect(failed).toHaveLength(broken instanceof Error ? 1 : 0)
-    for (const line of failed) expect(line).toEndWith(`${paneReadClassNote(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b/b.rmy)`)
-    assertNoLeak({ errLog })
   })
 
   test.each<[string, () => PersonaGetResultOverrides | null, string]>([
@@ -7310,7 +7382,7 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
     const errLog = await withCapturedErr(async () => {
       for (let i = 0; i < 4; i++) {
         if (i > 0) await clock.advance(STALE_WORKING_WINDOW_MS)
-        verdicts.push(await checkWorkingRowPane('C'))
+        verdicts.push(await stub.check())
       }
     })
 
@@ -7326,13 +7398,13 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
     const composed = resolveJsonlPath(cwd, TRANSCRIPT_SESSION_ID, configDir)
     mkdirSync(join(composed, '..'), { recursive: true })
     writeTranscript(composed, endedTurn())
-    paneStub(IDLE_PANE, { claude_session_id: TRANSCRIPT_SESSION_ID, cwd })
+    const stub = paneStub(IDLE_PANE, { claude_session_id: TRANSCRIPT_SESSION_ID, cwd })
     const persona = { claude_config_dir: configDir }
 
-    const verdicts = [await checkWorkingRowPane('C', persona)]
+    const verdicts = [await stub.check('C', { persona })]
     await clock.advance(STALE_WORKING_WINDOW_MS)
-    verdicts.push(await checkWorkingRowPane('C', persona))
-    verdicts.push(await checkWorkingRowPane('C'))
+    verdicts.push(await stub.check('C', { persona }))
+    verdicts.push(await stub.check())
 
     expect(verdicts).toEqual(['defer', 'reconnect', 'defer'])
     expect(hasPendingWorkingRowEvidence('C')).toBe(false)
@@ -7340,11 +7412,11 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
 
   test('a prompt: every attempt defers and nothing is typed; once shown on attempts spanning 60 s, one blocked-on-prompt notice for the episode; never pending evidence', async () => {
     const stub = paneStub(PERMISSION_PANE)
-    const verdicts = [await checkWorkingRowPane('C')]
+    const verdicts = [await stub.check()]
     expect(notices).toEqual([])
     for (let i = 0; i < 3; i++) {
       await clock.advance(STALE_WORKING_WINDOW_MS)
-      verdicts.push(await checkWorkingRowPane('C'))
+      verdicts.push(await stub.check())
     }
 
     expect(verdicts).toEqual(['defer', 'defer', 'defer', 'defer'])
@@ -7356,9 +7428,9 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
   })
 
   test('forgetNotConnectedEpisode(key) ends only that persona\'s episode: its evidence and notice latch go, another persona\'s stay', async () => {
-    paneStub(IDLE_PANE)
-    await checkWorkingRowPane('K')
-    await checkWorkingRowPane('L')
+    const stub = paneStub(IDLE_PANE)
+    await stub.check('K')
+    await stub.check('L')
     const notice = { reason: 'auto-restart-disabled', cause: 'a test cause' } as const
     expect([notifyPersonaNotConnected('K', notice), notifyPersonaNotConnected('L', notice)]).toEqual([true, true])
 
@@ -7372,13 +7444,89 @@ describe('b.f2b: the restart path\'s evidence for a working row across reconnect
 
   test('any launch for the persona forgets its evidence: the session it brings up says nothing about the old row', async () => {
     const cfg = waitConfig()
-    paneStub(IDLE_PANE)
-    await checkWorkingRowPane('C')
+    const stub = paneStub(IDLE_PANE)
+    await stub.check()
     expect(hasPendingWorkingRowEvidence('C')).toBe(true)
 
     expect((await spawnForPersona(personaOf(cfg, 'C'), cfg, false)).action).toBe('spawned')
 
     expect(hasPendingWorkingRowEvidence('C')).toBe(false)
+  })
+
+  // b.jg5 SRJ-502 (E14's note): the adapter's latched gate (`latchedNow`) is
+  // asked right before a deferral is noted and right before the
+  // blocked-on-prompt notice; a persona latched meanwhile gets `defer`, its
+  // evidence forgotten, no deferral noted, no notice and nothing typed.
+  test('b.jg5 SRJ-502: latched right before each deferral is noted: every attempt defers with its evidence forgotten (the same idle proof never reaches reconnect), no deferral noted (16 min of attempts raise no unproven-idle notice), nothing typed; once unlatched the run and the window start from that attempt', async () => {
+    const stub = paneStub(IDLE_PANE)
+    let latched = true
+    let asked = 0
+    const latchedNow = (): boolean => {
+      asked++
+      return latched
+    }
+    const verdicts: string[] = []
+    const pending: boolean[] = []
+    for (const minute of [0, 4, 8, 12, 16]) {
+      await clock.advance(minute * 60_000 - clock.now())
+      verdicts.push(await stub.check('C', { latchedNow }))
+      pending.push(hasPendingWorkingRowEvidence('C'))
+    }
+
+    expect(verdicts).toEqual(Array(5).fill('defer'))
+    expect(pending).toEqual(Array(5).fill(false))
+    expect(asked).toBe(5)
+    expect(notices).toEqual([])
+
+    latched = false
+    asked = 0
+    await clock.advance(60_000)
+    verdicts.push(await stub.check('C', { latchedNow }))
+    expect(hasPendingWorkingRowEvidence('C')).toBe(true)
+    await clock.advance(STALE_WORKING_WINDOW_MS)
+    verdicts.push(await stub.check('C', { latchedNow }))
+
+    // Asked before the first deferral; a reconnect asks nothing.
+    expect(verdicts.slice(5)).toEqual(['defer', 'reconnect'])
+    expect(asked).toBe(1)
+    expect(notices).toEqual([])
+    expect(stub.sendKeysCalls).toEqual([])
+    expect(stub.readPaneCalls).toEqual([])
+  })
+
+  test('b.jg5 SRJ-502: a prompt shown across 60 s whose persona latched right before the blocked-on-prompt notice: defer, no notice and no blocked line, its run forgotten (the next prompt run starts afresh); the gate asked once there, nothing typed', async () => {
+    const stub = paneStub(PERMISSION_PANE)
+    let latched = false
+    let asked = 0
+    const latchedNow = (): boolean => {
+      asked++
+      return latched
+    }
+    const verdicts = [await stub.check('C', { latchedNow })]
+    await clock.advance(STALE_WORKING_WINDOW_MS)
+    latched = true
+    asked = 0
+    const errLog = await withCapturedErr(async () => {
+      verdicts.push(await stub.check('C', { latchedNow }))
+    })
+
+    expect(verdicts).toEqual(['defer', 'defer'])
+    expect(asked).toBe(1)
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, 'blocked on it')).toEqual([])
+
+    // The run was forgotten: unlatched, the prompt must be shown across a new window.
+    latched = false
+    await clock.advance(1)
+    verdicts.push(await stub.check('C', { latchedNow }))
+    expect(notices).toEqual([])
+    await clock.advance(STALE_WORKING_WINDOW_MS)
+    verdicts.push(await stub.check('C', { latchedNow }))
+
+    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'defer'])
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
+    expect(stub.sendKeysCalls).toEqual([])
   })
 })
 
@@ -7399,7 +7547,7 @@ describe('b.f2b: the restart path\'s check of a waiting row\'s pane before it re
     ['a running turn with a custom spinner verb of several words', 'defer', () => CUSTOM_VERB_SPINNER_PANE, 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
     ['an API retry row', 'defer', () => withLastLine('  ⎿  Waiting for API response · will retry in 30s'), 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
     // A name CSCB gives no handling: the line closes with its read-pane class, UNCLASSIFIED.
-    ['a failed read (the waiting row alone decides)', 'reconnect', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'waiting')), `persona=C is waiting and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))} — reconnecting on the waiting row alone ${paneReadClassNote(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b)`],
+    ['a failed read (the waiting row alone decides)', 'reconnect', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'waiting')), `persona=C is waiting and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))} — reconnecting on the waiting row alone ${paneReadClassNote(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b, b.jg5 SRJ-604)`],
   ])('%s → %s: C\'s own pane read once, nothing typed here, no notice, one line unless it goes ahead plainly', async (_label, verdict, pane, line) => {
     const opts = paneOnly(pane())
     let got: string | undefined
@@ -7429,6 +7577,31 @@ describe('b.f2b: the restart path\'s check of a waiting row\'s pane before it re
     expect(notices[0]!.text).toContain(PROMPT_NOTICE_AUTO_RESTART_ON)
     expect(notices[0]!.text).not.toContain('Once its turn ends it is reconnected')
     expect(linesWith(errLog, 'persona=C is waiting but its pane shows a prompt or dialog — not typing into it')).toHaveLength(2)
+  })
+
+  // b.jg5 SRJ-502: the adapter's latched gate is asked right before the
+  // blocked-on-prompt notice, and only there.
+  test.each<[string, string, string, number]>([
+    ['a prompt or dialog', PERMISSION_PANE, 'defer', 1],
+    ['a running turn', SPINNER_PANE, 'defer', 0],
+    ['an idle screen', IDLE_PANE, 'reconnect', 0],
+  ])('b.jg5 SRJ-502: %s with the persona latched by the time the pane is judged → %s, the gate asked %d time(s); no notice, no prompt line, nothing typed', async (_label, pane, verdict, asks) => {
+    const opts = paneOnly(pane)
+    let asked = 0
+    let got: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      got = await checkWaitingRowPane('C', () => {
+        asked++
+        return true
+      })
+    })
+
+    expect(got).toBe(verdict)
+    expect(asked).toBe(asks)
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, 'shows a prompt or dialog')).toEqual([])
+    expect(opts.readPaneCalls).toEqual([paneReadOf('C')])
+    expect(opts.sendKeysCalls).toEqual([])
   })
 })
 
@@ -7491,28 +7664,42 @@ describe('b.f2b: a working row whose idleness can\'t be proven is reported (unpr
   const min = (n: number): number => n * 60_000
 
   /**
-   * A stub for persona C's `working` row: its pane reads show `pane` until
-   * `show` changes it (an Error fails the read), and its `get` names
-   * `transcript` (without one, the row names no transcript).
+   * A stub for persona C's `working` row whose `get` names `transcript`
+   * (without one, the row names no transcript), and the pane the reconnect
+   * adapter's read gave: `pane` until `show` changes it. `pane` is what
+   * `attemptsAt` folds (`checkWorkingRowPane` on the verdict's pane, b.jg5
+   * SRJ-603); no case here makes a `read-pane`.
    */
-  function rowStub(pane: PaneReading, transcript?: Transcript) {
+  function rowStub(pane: string, transcript?: Transcript) {
     const opts: StubClientOptions = { sendKeysCalls: [], readPaneCalls: [], getCalls: [] }
     opts.getResult = cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working', ...transcript?.fields })
-    showPane(opts, pane)
     installStub(opts)
-    return { show: (next: PaneReading) => showPane(opts, next), sendKeysCalls: opts.sendKeysCalls! }
+    const stub = {
+      pane,
+      show: (next: string) => {
+        stub.pane = next
+      },
+      sendKeysCalls: opts.sendKeysCalls!,
+      readPaneCalls: opts.readPaneCalls!,
+    }
+    return stub
   }
 
-  /** Restart-path attempts on C's row at each of `at` (minutes on the fake clock, ascending); the verdicts and the notices raised by each. */
-  async function attemptsAt(at: number[], before?: (minute: number) => void): Promise<{ verdicts: string[]; noticesAfter: number[] }> {
+  /** Restart-path attempts on C's row (`stub`'s pane) at each of `at` (minutes on the fake clock, ascending); the verdicts and the notices raised by each. */
+  async function attemptsAt(
+    stub: ReturnType<typeof rowStub>,
+    at: number[],
+    before?: (minute: number) => void,
+  ): Promise<{ verdicts: string[]; noticesAfter: number[] }> {
     const verdicts: string[] = []
     const noticesAfter: number[] = []
     for (const minute of at) {
       await clock.advance(min(minute) - clock.now())
       before?.(minute)
-      verdicts.push(await checkWorkingRowPane('C'))
+      verdicts.push(await checkWorkingRowPane('C', stub.pane))
       noticesAfter.push(notices.length)
     }
+    expect(stub.readPaneCalls).toEqual([])
     return { verdicts, noticesAfter }
   }
 
@@ -7549,7 +7736,9 @@ describe('b.f2b: a working row whose idleness can\'t be proven is reported (unpr
     expect(notices[1]!.text).toContain('Automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it on its own')
   })
 
-  test.each<[string, () => { pane: PaneReading | ((minute: number) => PaneReading); transcript?: Transcript }]>([
+  // A read that gave no pane (UNAVAILABLE or CONFIG) is the verdict's
+  // deferral, with its unproven-idle case in tests/server.test.ts.
+  test.each<[string, () => { pane: string | ((minute: number) => string); transcript?: Transcript }]>([
     ['REPRO: an idle screen whose row names no transcript (unreadable)', () => ({ pane: IDLE_PANE })],
     ['REPRO: an idle screen whose transcript ends with a compaction summary', () => ({
       pane: IDLE_PANE,
@@ -7560,13 +7749,13 @@ describe('b.f2b: a working row whose idleness can\'t be proven is reported (unpr
       transcript: transcriptOf(),
     })],
     ['a turn that keeps running (its spinner line)', () => ({ pane: SPINNER_PANE, transcript: transcriptOf() })],
-    ['a pane that can\'t be read', () => ({ pane: errGeneric('read-pane', 'ErrPaneRead', 'pane read failed') })],
+    ['a blank pane', () => ({ pane: '', transcript: transcriptOf() })],
   ])('%s: restart-path attempts 4 min apart defer with nothing typed; the attempt 12 min after the first raises one unproven-idle notice, worded for auto-restart on; later attempts raise nothing more', async (_label, make) => {
     const { pane, transcript } = make()
     const stub = rowStub(typeof pane === 'function' ? pane(0) : pane, transcript)
     let result!: { verdicts: string[]; noticesAfter: number[] }
     const errLog = await withCapturedErr(async () => {
-      result = await attemptsAt([0, 4, 8, 12, 16], (minute) => {
+      result = await attemptsAt(stub, [0, 4, 8, 12, 16], (minute) => {
         if (typeof pane === 'function') stub.show(pane(minute))
       })
     })
@@ -7587,8 +7776,8 @@ describe('b.f2b: a working row whose idleness can\'t be proven is reported (unpr
   test('a reconnect on idle proof ends the run: deferrals after it are measured from their own first', async () => {
     const transcript = transcriptOf()
     rmSync(transcript.path) // unreadable at first
-    rowStub(IDLE_PANE, transcript)
-    const { verdicts, noticesAfter } = await attemptsAt([0, 3, 6, 9, 10, 11, 15, 19, 21], (minute) => {
+    const stub = rowStub(IDLE_PANE, transcript)
+    const { verdicts, noticesAfter } = await attemptsAt(stub, [0, 3, 6, 9, 10, 11, 15, 19, 21], (minute) => {
       if (minute === 9) writeTranscript(transcript.path, endedTurn())
       if (minute === 11) rmSync(transcript.path)
     })
@@ -7602,7 +7791,7 @@ describe('b.f2b: a working row whose idleness can\'t be proven is reported (unpr
 
   test('a prompt reported first holds the episode\'s one notice: the run passing 10 min raises nothing more', async () => {
     const stub = rowStub(PERMISSION_PANE)
-    const { verdicts, noticesAfter } = await attemptsAt([0, 2, 6, 10, 14])
+    const { verdicts, noticesAfter } = await attemptsAt(stub, [0, 2, 6, 10, 14])
 
     expect(verdicts).toEqual(Array(5).fill('defer'))
     expect(stub.sendKeysCalls).toEqual([])
@@ -7612,12 +7801,12 @@ describe('b.f2b: a working row whose idleness can\'t be proven is reported (unpr
 
   test('any launch for the persona starts a new run: deferrals before it don\'t count toward the notice', async () => {
     const cfg = waitConfig()
-    rowStub(IDLE_PANE)
-    await checkWorkingRowPane('C')
+    const stub = rowStub(IDLE_PANE)
+    await checkWorkingRowPane('C', stub.pane)
     await clock.advance(min(9))
     expect((await spawnForPersona(personaOf(cfg, 'C'), cfg, false)).action).toBe('spawned')
 
-    const { noticesAfter } = await attemptsAt([10, 14, 18, 19, 20])
+    const { noticesAfter } = await attemptsAt(stub, [10, 14, 18, 19, 20])
 
     expect(noticesAfter).toEqual([0, 0, 0, 0, 1])
   })
@@ -13637,17 +13826,19 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
   })
 
   // b.jg5 SRJ-114: readPersonaTranscript's get, reached from the restart
-  // path's check of a working row with an idle pane. A read error there is
+  // path's check of a working row on the idle pane its verdict read (b.jg5
+  // SRJ-603: the check makes no read-pane of its own). A read error there is
   // no evidence: the check defers, so the restart path types nothing, kills
   // and launches nothing, and nothing is counted or started.
   test.each([...READ_ERRORS, SRJ105_KILL_FAILED])('b.jg5 SRJ-114: %s at the transcript get of the restart path\'s working-row check (checkWorkingRowPane): unreadable, no evidence: defer, nothing typed, killed or launched, nothing counted, P\'s condition not started, nothing latched', async (_what, make) => {
     const { h, p } = srj105Build()
-    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getError: make('get') })
+    h.script({ getError: make('get') })
 
-    expect(await checkWorkingRowPane(p, harnessPersona(h, p))).toBe('defer')
+    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona: harnessPersona(h, p) })).toBe('defer')
 
     expect(hasPendingWorkingRowEvidence(p)).toBe(false)
     expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+    expect(h.stub.calls.readPaneCalls).toEqual([])
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
     expect(getFailureCount(p)).toBe(0)
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
@@ -13661,9 +13852,9 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
 
   test('regression: ErrSpawnNotFound at the transcript get of checkWorkingRowPane reads the row as absent: unreadable, defer, one line naming ErrSpawnNotFound; nothing latches', async () => {
     const { h, p } = srj105Build()
-    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getError: errSpawnNotFound() })
+    h.script({ getError: errSpawnNotFound() })
 
-    expect(await checkWorkingRowPane(p, harnessPersona(h, p))).toBe('defer')
+    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona: harnessPersona(h, p) })).toBe('defer')
 
     expect(hasPendingWorkingRowEvidence(p)).toBe(false)
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
@@ -15128,6 +15319,11 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
 
 const WORKING_READ = latchRowStateRead('working')
 
+/** The working-row verdict's one read of P's row (`workingReconnectVerdict` in `src/server.ts`, b.jg5 SRJ-603): full, the row read `working`. */
+function workingVerdictRead(): PersonaPaneReadRequest {
+  return { nLines: FULL_PANE_READ_LINES, lastRead: WORKING_READ, site: 'reconnectSession' }
+}
+
 /** A get site of SRJ-114 that P's launch reaches. */
 interface NoteSite {
   readonly name: string
@@ -15419,20 +15615,23 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
     expectNoteLatchedOnce(h, p, ENDED_READ)
   })
 
-  test('the restart path\'s working-row check (checkWorkingRowPane) whose transcript get reads the note on P\'s own row answers defer: P latched once with the row read working; nothing typed, pending or posted but the one CONFLICT notice; a second check makes no get and posts nothing', async () => {
+  test('the restart path\'s working-row check (checkWorkingRowPane) whose transcript get reads the note on P\'s own row answers defer: P latched once with the row read working; nothing typed, pending or posted but the one CONFLICT notice; the next check\'s read (the working-row verdict\'s read-pane) is not made and posts nothing', async () => {
     const { h, p } = srj105Build()
     const persona = harnessPersona(h, p)
-    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getResult: harnessRow(h, persona, { state: 'working', liveness_note: provenanceNote }) })
+    h.script({ getResult: harnessRow(h, persona, { state: 'working', liveness_note: provenanceNote }) })
 
-    expect(await checkWorkingRowPane(p, persona)).toBe('defer')
+    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona })).toBe('defer')
 
     expect(h.stub.calls.getCalls).toHaveLength(1)
+    expect(h.stub.calls.readPaneCalls).toEqual([])
     expect(hasPendingWorkingRowEvidence(p)).toBe(false)
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
     expectNoteLatchedOnce(h, p, WORKING_READ)
 
-    expect(await checkWorkingRowPane(p, persona)).toBe('defer')
+    // b.jg5 SRJ-603: the next check starts with the verdict's one read, which a latched P never makes.
+    expect(await readPersonaOwnPane(p, workingVerdictRead())).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
     expect(h.stub.calls.getCalls).toHaveLength(1)
+    expect(h.stub.calls.readPaneCalls).toEqual([])
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
     expect(h.latchEvents).toHaveLength(ONE_LATCH_STEPS.length)
     expect(h.episodeNotices).toHaveLength(1)
@@ -15442,9 +15641,9 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
   test.each(SAMPLE_PLAIN_NOTES)('the restart path\'s working-row check, %s on P\'s own row: today\'s reading (an idle screen and an ended transcript start the evidence: defer, pending); nothing latched', async (_label, note) => {
     const { h, p } = srj105Build()
     const persona = harnessPersona(h, p)
-    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getResult: harnessRow(h, persona, { state: 'working', ...transcriptOf().fields, liveness_note: note }) })
+    h.script({ getResult: harnessRow(h, persona, { state: 'working', ...transcriptOf().fields, liveness_note: note }) })
 
-    expect(await checkWorkingRowPane(p, persona)).toBe('defer')
+    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona })).toBe('defer')
 
     expect(hasPendingWorkingRowEvidence(p)).toBe(true)
     expectNoNoteLatch(h)
@@ -16672,7 +16871,9 @@ describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row
 // nothing makes the one latch-time `status` read). At every site the session
 // manager wires: the collision ladder's spawns and `resume` and its kill and
 // delete in a delete-then-spawn chain, the working-pane read (the launch
-// wait's evidence read, `checkWorkingRowPane`, `checkWaitingRowPane`), the
+// wait's evidence read and `checkWaitingRowPane`; the working-row verdict's
+// read is in tests/server.test.ts, and `checkWorkingRowPane` on its pane
+// makes no read, so it never meets the answer), the
 // shared own-row `status` read and its sites (the wait's poll and timeout
 // reads, `reconcileAndReadRowState`, the retry timer's row read, the
 // latch-time read) and E14's shared own-row `get` read at its callers (the
@@ -16989,27 +17190,34 @@ describe('b.jg5 SRJ-117, SRJ-512, SRJ-502: an UNUSABLE NAME answer at a working-
     if (before.length > 0) await expectLaunchedByNoPath(h, p, b, script)
   })
 
-  test.each(unusableNameRowsAt('read-pane').map((row) => [row.fault, row] as const))('the restart path\'s working-row check (checkWorkingRowPane), its pane read answering UNUSABLE NAME (%s): defer, P latched with the row read working; no transcript get, nothing typed, no evidence pending, no notice', async (_fault, row) => {
+  // b.jg5 SRJ-603: the working row's pane is read once, by the verdict
+  // (`workingReconnectVerdict`), whose UNUSABLE NAME cell (P latched with the
+  // row read working, nothing typed, no deferral noted) is in
+  // tests/server.test.ts. The fold on that pane reads none of its own, so an
+  // UNUSABLE NAME a read-pane would answer is never met there.
+  test.each(unusableNameRowsAt('read-pane').map((row) => [row.fault, row] as const))('the restart path\'s working-row check (checkWorkingRowPane) on the verdict\'s pane, with a read-pane that would answer UNUSABLE NAME (%s): no read-pane and no raw tmux call (only the transcript get of the idle pane); nothing latched, posted or typed', async (_fault, row) => {
     const { h, p } = srj105Build()
     h.script({ readPaneError: row.build() })
     const order = await recordEveryCall(h, p)
 
-    expect(await checkWorkingRowPane(p, harnessPersona(h, p))).toBe('defer')
+    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona: harnessPersona(h, p) })).toBe('defer')
 
-    expect(order).toEqual(['readPane'])
-    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-    expect(h.errors.filter((line) => line.startsWith(`[slack] reconnectSession: persona=${p} is working and is latched — deferring; `))).toHaveLength(1)
-    expectLatchedOnce(h, p, unusableNameLatch(p, row, WORKING_READ))
+    expect(order).toEqual(['get'])
+    expect(h.stub.calls.readPaneCalls).toEqual([])
+    expect(unusableNameLinesOf(h, p)).toEqual([])
+    expect(h.errors.filter((line) => line.includes(`persona=${p} is working and is latched`))).toEqual([])
+    expectNoNoteLatch(h)
+    expect(h.notices).toEqual([])
   })
 
-  test.each(unusableNameRowsAt('get').map((row) => [row.fault, row] as const))('the restart path\'s working-row check (checkWorkingRowPane), its transcript get after an idle pane answering UNUSABLE NAME (%s): defer, P latched with the state unreadable; nothing typed, no evidence pending, no notice', async (_fault, row) => {
+  test.each(unusableNameRowsAt('get').map((row) => [row.fault, row] as const))('the restart path\'s working-row check (checkWorkingRowPane), its transcript get after the verdict\'s idle pane answering UNUSABLE NAME (%s): defer, P latched with the state unreadable; the get the only call; nothing typed, no evidence pending, no notice', async (_fault, row) => {
     const { h, p } = srj105Build()
-    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getError: row.build() })
+    h.script({ getError: row.build() })
     const order = await recordEveryCall(h, p)
 
-    expect(await checkWorkingRowPane(p, harnessPersona(h, p))).toBe('defer')
+    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona: harnessPersona(h, p) })).toBe('defer')
 
-    expect(order).toEqual(['readPane', 'get'])
+    expect(order).toEqual(['get'])
     expect(hasPendingWorkingRowEvidence(p)).toBe(false)
     expectLatchedOnce(h, p, unusableNameLatch(p, row, LATCH_ROW_STATE_UNREADABLE))
   })
@@ -17030,8 +17238,9 @@ describe('b.jg5 SRJ-117, SRJ-512, SRJ-502: an UNUSABLE NAME answer at a working-
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-117 (with SRJ-501, SRJ-502, SRJ-512; E18): the shared read-pane
 // of a persona's own row (`readPersonaOwnPane`), which `readWorkingPane`
-// calls for the launch wait's evidence read, `checkWorkingRowPane` and
-// `checkWaitingRowPane`.
+// calls for the launch wait's evidence read and `checkWaitingRowPane`, and
+// the working-row verdict in `src/server.ts` calls for the pane
+// `checkWorkingRowPane` folds.
 //
 // One read is exactly one `read-pane` of `cscb_<key>` with the line count it
 // is given (`FULL_PANE_READ_LINES` at a full read), and no other verb or raw
@@ -17049,9 +17258,10 @@ describe('b.jg5 SRJ-117, SRJ-512, SRJ-502: an UNUSABLE NAME answer at a working-
 // A P already latched is not read. Controls: with no latch installed, or a
 // latch whose set throws, CONFLICT and UNUSABLE NAME still answer latched
 // and the reader never throws; another persona's reads and latch are
-// untouched. At the three callers, a CONFLICT of the site's rows latches P
-// with the site's state and nothing is typed: `checkWorkingRowPane` and
-// `checkWaitingRowPane` defer, the launch wait ends latched. Every case runs
+// untouched. At `readWorkingPane`'s two callers, a CONFLICT of the site's
+// rows latches P with the site's state and nothing is typed:
+// `checkWaitingRowPane` defers, the launch wait ends latched;
+// `checkWorkingRowPane` on the verdict's pane reads none. Every case runs
 // on `makeRecoveryHarness` (the real latch installed as `main()` installs
 // it, a recording notice sink); `srj105AfterEach` runs `assertNoLeak` over
 // what it captured, and the file's `afterEach` clears the latch install and
@@ -17061,7 +17271,7 @@ describe('b.jg5 SRJ-117, SRJ-512, SRJ-502: an UNUSABLE NAME answer at a working-
 /** The site label the direct cases give the shared reader. */
 const PANE_READ_TEST_SITE = 'paneReadTest'
 
-/** The site label `readWorkingPane` gives the shared reader (its three callers' reads). */
+/** The site label `readWorkingPane` gives the shared reader (its callers' reads). */
 const READ_WORKING_PANE_SITE = 'readWorkingPane'
 
 /** A full read of P's own row by the direct cases, recording `lastRead` on a latch. */
@@ -17418,21 +17628,24 @@ describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-512: the shared read-pane of a pe
   })
 })
 
-describe('b.jg5 SRJ-117, SRJ-501, SRJ-502: a CONFLICT from the pane read at each of readWorkingPane\'s three callers latches the persona with the state its caller last read; nothing is typed', () => {
+describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-603: a CONFLICT from the pane read at each of readWorkingPane\'s callers (the waiting-row check and the launch wait\'s evidence read) latches the persona with the state its caller last read, and the working-row fold reads no pane; nothing is typed', () => {
   afterEach(srj105AfterEach)
 
-  test.each(livenessPaneConflictRowsAt('working-row verdict').map((row) => [row.name, row] as const))('the restart path\'s working-row check (checkWorkingRowPane), its pane read answering %s: defer, P latched once with "P\'s next check or recovery" and working; no transcript get, nothing typed, no evidence pending, no notice', async (_name, row) => {
+  // b.jg5 SRJ-603: the working-row verdict's rows latch at the verdict's own
+  // read (tests/server.test.ts); the fold on its pane reads no pane, so the
+  // CONFLICT a read-pane would answer is never met there.
+  test.each(livenessPaneConflictRowsAt('working-row verdict').map((row) => [row.name, row] as const))('the restart path\'s working-row check (checkWorkingRowPane) on the verdict\'s pane, with a read-pane that would answer %s: no read-pane and no raw tmux call; a running turn defers; nothing latched, posted or typed', async (_name, row) => {
     const { h, p } = srj105Build()
     h.script({ readPaneError: row.build() })
     const order = await recordEveryCall(h, p)
 
-    expect(await checkWorkingRowPane(p, harnessPersona(h, p))).toBe('defer')
+    expect(await checkWorkingRowPane(p, SPINNER_PANE, { persona: harnessPersona(h, p) })).toBe('defer')
 
-    expect(order).toEqual(['readPane'])
-    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
-    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-    expect(h.errors.filter((line) => line.startsWith(`[slack] reconnectSession: persona=${p} is working and is latched — deferring; `))).toHaveLength(1)
-    expectLatchedOnce(h, p, paneConflictLatch(p, row, READ_WORKING_PANE_SITE))
+    expect(order).toEqual([])
+    expect(h.stub.calls.readPaneCalls).toEqual([])
+    expect(allPaneReadLatchLines(h)).toEqual([])
+    expectNoNoteLatch(h)
+    expect(h.notices).toEqual([])
   })
 
   test.each(livenessPaneConflictRowsAt('waiting-row check').map((row) => [row.name, row] as const))('the restart path\'s waiting-row check (checkWaitingRowPane), its pane read answering %s: defer, never reconnect; P latched once with "P\'s next check or recovery" and waiting; nothing typed, no notice', async (_name, row) => {
@@ -17477,6 +17690,292 @@ describe('b.jg5 SRJ-117, SRJ-501, SRJ-502: a CONFLICT from the pane read at each
     expectLatchedOnce(h, p, paneConflictLatch(p, row, READ_WORKING_PANE_SITE))
 
     if (before.length > 0) await expectLaunchedByNoPath(h, p, b, script)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-117's waiting-row column, SRJ-604: the restart path's check of a
+// `waiting` row (`checkWaitingRowPane`) answers by the class of its one
+// `read-pane` (through `readWorkingPane`). The pane cells (a running turn or
+// a prompt defers, anything else reconnects) are in the b.f2b describe
+// above, CONFLICT and UNUSABLE NAME in their describes; here, every other
+// answer: GONE answers `gone` and the row absent `absent`, both with nothing
+// typed; ENVIRONMENT raises `tmux-unavailable` and defers; UNAVAILABLE (E10's
+// builders), CONFIG (raising `ad-config-malformed`) and UNCLASSIFIED let the
+// reconnect go ahead on the `waiting` row alone, with one line. The read is
+// the only call, raw tmux included (`recordEveryCall`); nothing latches or is
+// posted; `srj105AfterEach` runs `assertNoLeak` over what was captured.
+// ---------------------------------------------------------------------------
+
+/** The check's one line for P's waiting row whose read-pane answered `err` of class `errorClass`: `says` (what it found), then `then` (what it does), closing with `srj`. */
+function waitingRowLine(p: string, says: string, err: Error, then: string, errorClass: string, srj: string): string {
+  return `[slack] reconnectSession: persona=${p} is waiting ${says}: ${describeAgentDirectorFailure(err)} — ${then} (read-pane class=${errorClass}; ${srj})`
+}
+
+/** The check's lines for persona `p`'s waiting row. */
+function waitingRowLinesOf(h: RecoveryHarness, p: string): string[] {
+  return h.errors.filter((line) => line.startsWith(`[slack] reconnectSession: persona=${p} is waiting`))
+}
+
+/** The reconnect-going-ahead line's two halves. */
+const WAITING_READ_FAILED = 'and reading its pane failed'
+const WAITING_GOES_AHEAD = 'reconnecting on the waiting row alone'
+const WAITING_GOES_AHEAD_SRJ = 'b.f2b, b.jg5 SRJ-604'
+
+/** UNCLASSIFIED answers a `read-pane` can give, each of the class UNCLASSIFIED. */
+const PANE_UNCLASSIFIED_ANSWERS: ReadonlyArray<readonly [string, () => Error]> = [
+  ['an ErrInternal not naming the recorded tmux session name', () => errInternal()],
+  ['a name CSCB gives no handling (ErrNotHandled)', () => errGeneric('read-pane', 'ErrNotHandled')],
+  ['a store that cannot be opened (ErrSchemaMismatch)', () => errSchemaMismatch()],
+]
+
+describe('b.jg5 SRJ-117, SRJ-604: the restart path\'s waiting-row check (checkWaitingRowPane) answers by its read-pane\'s class', () => {
+  afterEach(srj105AfterEach)
+
+  /** Script P's read-pane to answer `err`, run the check, and answer what it did. */
+  async function checkAnswering(err: Error) {
+    const { h, p, b } = srj105Build()
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+    const verdict = await checkWaitingRowPane(p)
+    return { h, p, b, order, verdict }
+  }
+
+  /** The read was the only call (raw tmux included), so nothing was typed; nothing latched or posted. */
+  function expectOnlyTheRead(h: RecoveryHarness, p: string, order: readonly string[]): void {
+    expect(order).toEqual(['readPane'])
+    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
+    expect(h.stub.calls.sendKeysCalls).toEqual([])
+    expectNoNoteLatch(h)
+    expect(h.notices).toEqual([])
+  }
+
+  test.each<[string, () => Error, WaitingRowPaneVerdict, string, string, string]>([
+    ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(), WAITING_ROW_PANE_GONE, AD_ERROR_CLASS_GONE, 'but agent-director\'s read-pane found no pane of its launch', 'b.jg5 SRJ-604'],
+    ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), WAITING_ROW_PANE_ABSENT, AD_ERROR_CLASS_STATE, 'but its agent-director row was absent at the pane read', 'b.jg5 SRJ-117'],
+  ])('%s → %s, never reconnect: one line saying nothing is typed; the read the only call; nothing latched or posted', async (_label, build, verdict, errorClass, says, srj) => {
+    const err = build()
+    const { h, p, order, verdict: got } = await checkAnswering(err)
+
+    expect(got).toBe(verdict)
+    expectOnlyTheRead(h, p, order)
+    expect(waitingRowLinesOf(h, p)).toEqual([
+      waitingRowLine(p, says, err, 'not typing /mcp reconnect; reconciling so the restart relaunches it', errorClass, srj),
+    ])
+  })
+
+  test.each(SRJ311_ENVIRONMENT.map(([what, make, onset]) => [what, make, onset] as const))('ENVIRONMENT (%s) → defer, never reconnect: P\'s tmux-unavailable raised once with its onset, B\'s untouched; one line; the read the only call; nothing latched', async (_what, make, onset) => {
+    const err = make('read-pane')
+    const { h, p, b, order, verdict } = await checkAnswering(err)
+
+    expect(verdict).toBe('defer')
+    expectOnlyTheRead(h, p, order)
+    expect([...getOutageFlags(p)]).toEqual([TMUX_UNAVAILABLE_CLASS])
+    expect([...getOutageFlags(b)]).toEqual([])
+    expect(h.outageNotices).toEqual([{ key: p, text: onset }])
+    expect(waitingRowLinesOf(h, p)).toEqual([
+      waitingRowLine(p, WAITING_READ_FAILED, err, 'tmux is not available; not typing /mcp reconnect, deferring to a later tick', AD_ERROR_CLASS_ENVIRONMENT, 'b.jg5 SRJ-117, SRJ-311'),
+    ])
+  })
+
+  test.each(PANE_UNAVAILABLE_FORMS)('UNAVAILABLE (%s) → reconnect on the waiting row alone, with one line naming the class; no outage raised; the read the only call; nothing latched or posted', async (_label, make) => {
+    const err = make('read-pane')
+    const { h, p, order, verdict } = await checkAnswering(err)
+
+    expect(verdict).toBe('reconnect')
+    expectOnlyTheRead(h, p, order)
+    expect([...getOutageFlags(p)]).toEqual([])
+    expect(waitingRowLinesOf(h, p)).toEqual([
+      waitingRowLine(p, WAITING_READ_FAILED, err, WAITING_GOES_AHEAD, AD_ERROR_CLASS_UNAVAILABLE, WAITING_GOES_AHEAD_SRJ),
+    ])
+  })
+
+  test('CONFIG (ErrConfigMalformed) → reconnect on the waiting row alone, as UNAVAILABLE: P\'s ad-config-malformed raised once with its onset, B\'s untouched; one line naming the class; the read the only call; nothing latched', async () => {
+    const err = errConfigMalformed()
+    const { h, p, b, order, verdict } = await checkAnswering(err)
+
+    expect(verdict).toBe('reconnect')
+    expectOnlyTheRead(h, p, order)
+    expect([...getOutageFlags(p)]).toEqual([AD_CONFIG_MALFORMED_CLASS])
+    expect([...getOutageFlags(b)]).toEqual([])
+    expect(h.outageNotices).toEqual([{ key: p, text: adConfigMalformedOnset(err) }])
+    expect(waitingRowLinesOf(h, p)).toEqual([
+      waitingRowLine(p, WAITING_READ_FAILED, err, WAITING_GOES_AHEAD, AD_ERROR_CLASS_CONFIG, WAITING_GOES_AHEAD_SRJ),
+    ])
+  })
+
+  test.each(PANE_UNCLASSIFIED_ANSWERS)('UNCLASSIFIED (%s) → reconnect on the waiting row alone, with one line naming the class; the read the only call; nothing latched or posted', async (_label, build) => {
+    const err = build()
+    const { h, p, order, verdict } = await checkAnswering(err)
+
+    expect(verdict).toBe('reconnect')
+    expectOnlyTheRead(h, p, order)
+    expect(waitingRowLinesOf(h, p)).toEqual([
+      waitingRowLine(p, WAITING_READ_FAILED, err, WAITING_GOES_AHEAD, AD_ERROR_CLASS_UNCLASSIFIED, WAITING_GOES_AHEAD_SRJ),
+    ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-104, SRJ-204: `read-pane` gives `ErrInvalidFlags` no meaning, so
+// the shared reader (`readPersonaOwnPane`) answers it with exactly one
+// immediate agent-director version re-check, then the UNCLASSIFIED outcome,
+// as the resume path does (the collision ladder's ErrInvalidFlags describe).
+// The re-check is the real installed one over a counting stub
+// `resolveSystemBinary` and an unmoved fake clock, reset after each case. No
+// other answer makes a re-check.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-104, SRJ-204: an ErrInvalidFlags answer at the shared read-pane makes one immediate version re-check, then is UNCLASSIFIED; no other answer re-checks', () => {
+  /** Every `resolveSystemBinary` call the installed re-check made. */
+  let resolveCalls: Array<object | undefined>
+  /** The exit codes the re-check stopped with. */
+  let stops: number[]
+
+  /** Install the real re-check, its `resolveSystemBinary` answering `outcome` (default: the installed baseline, a pass). */
+  function installRecheck(outcome?: StubResolveSystemBinaryOutcome): void {
+    resetAdVersionRecheckForTests()
+    installAdVersionRecheck({
+      resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls, ...(outcome === undefined ? {} : { outcomes: [outcome] }) }),
+      baselineVersion: PHASE1_RC_VERSION,
+      recordStartupError: () => {},
+      stop: (exitCode) => { stops.push(exitCode) },
+      log: () => {},
+      clock: createFakeClock(),
+    })
+  }
+
+  beforeEach(() => {
+    resolveCalls = []
+    stops = []
+    installRecheck()
+  })
+
+  afterEach(() => {
+    resetAdVersionRecheckForTests()
+    srj105AfterEach()
+  })
+
+  /** The reader's one line for P's ErrInvalidFlags at `site` (default: the direct cases' site) after the re-check answered `kind`. */
+  function invalidFlagsLine(p: string, err: Error & { errName: string; errDescription: string }, kind: string, site = PANE_READ_TEST_SITE): string {
+    return (
+      `[slack] ${site}: pane read for persona=${p} answered class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${err.errName} message=${JSON.stringify(err.errDescription)} ` +
+      `— UNCLASSIFIED after one immediate agent-director version re-check: ${kind} (b.jg5 SRJ-104, SRJ-204)`
+    )
+  }
+
+  /** The reader's re-check lines, any persona. */
+  function recheckLines(h: RecoveryHarness): string[] {
+    return h.errors.filter((line) => line.includes('after one immediate agent-director version re-check'))
+  }
+
+  test.each([
+    [RECHECK_OUTCOME_PASS, undefined],
+    [RECHECK_OUTCOME_COULD_NOT_RUN, { throws: new Error('the resolve failed') }],
+  ] as const)('the re-check answers %s: exactly one resolveSystemBinary call and no stop; answered UNCLASSIFIED with the redacted description and one line; the read the only call; nothing latched or posted; inside P\'s recovery attempt P\'s timer armed once with the UNCLASSIFIED cause and P\'s episode started once; B untouched', async (kind, outcome) => {
+    if (outcome !== undefined) installRecheck(outcome)
+    const { h, p, b } = srj105Build()
+    const err = errInvalidFlags('read-pane')
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+
+    const read = await runInAttempt(p, 'recovery', () => readPersonaOwnPane(p, fullPaneRead(WORKING_READ)))
+
+    expect(read).toStrictEqual(paneFailure(PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED, err))
+    // No stop decided: the outcome carries no stop mark.
+    expect(read).not.toHaveProperty('stopping')
+    expect(resolveCalls).toHaveLength(1)
+    expect(stops).toEqual([])
+    expectOneQuietRead(h, order, p)
+    expect(recheckLines(h)).toEqual([invalidFlagsLine(p, err, kind)])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+    expect(unclassifiedStartedLines(h, p)).toHaveLength(1)
+    expect(h.unclassifiedErrorOpen(p)).toBe(true)
+    expect(h.unclassifiedErrorOpen(b)).toBe(false)
+  })
+
+  test('the re-check answers stop: one resolveSystemBinary call and one stop; answered UNCLASSIFIED carrying the stop mark, with one line naming stop; nothing armed or reported, even inside P\'s recovery attempt', async () => {
+    installRecheck({ version: OLD_AD_VERSION })
+    const { h, p } = srj105Build()
+    const err = errInvalidFlags('read-pane')
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+
+    const read = await runInAttempt(p, 'recovery', () => readPersonaOwnPane(p, fullPaneRead(WORKING_READ)))
+
+    expect(read).toStrictEqual({ ...(paneFailure(PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED, err) as PaneReadUnclassified), stopping: true })
+    expect(resolveCalls).toHaveLength(1)
+    expect(stops).toHaveLength(1)
+    expectOneQuietRead(h, order, p)
+    expect(recheckLines(h)).toEqual([invalidFlagsLine(p, err, RECHECK_OUTCOME_STOP)])
+    expect(h.triggers).toEqual([])
+    expect(unclassifiedStartedLines(h, p)).toEqual([])
+  })
+
+  test('outside any attempt: one re-check, answered UNCLASSIFIED with one line; nothing armed or reported', async () => {
+    const { h, p } = srj105Build()
+    const err = errInvalidFlags('read-pane')
+    h.script({ readPaneError: err })
+
+    const read = await readPersonaOwnPane(p, fullPaneRead(WAITING_READ))
+
+    expect(read).toStrictEqual(paneFailure(PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED, err))
+    expect(read).not.toHaveProperty('stopping')
+    expect(resolveCalls).toHaveLength(1)
+    expect(recheckLines(h)).toEqual([invalidFlagsLine(p, err, RECHECK_OUTCOME_PASS)])
+    expect(h.triggers).toEqual([])
+    expect(unclassifiedStartedLines(h, p)).toEqual([])
+  })
+
+  // b.jg5 SRJ-205 at the waiting-row check: a marked outcome defers with its
+  // own line and nothing typed; an unmarked one (the re-check passed) lets the
+  // reconnect go ahead on the waiting row alone, as any UNCLASSIFIED does.
+  test.each<[string, WaitingRowPaneVerdict, StubResolveSystemBinaryOutcome | undefined, number, string, string]>([
+    [
+      RECHECK_OUTCOME_STOP,
+      'defer',
+      { version: OLD_AD_VERSION },
+      1,
+      'the agent-director version re-check decided that the server stops; not typing /mcp reconnect, nothing more is called for it',
+      'b.jg5 SRJ-204, SRJ-205',
+    ],
+    [RECHECK_OUTCOME_PASS, 'reconnect', undefined, 0, WAITING_GOES_AHEAD, WAITING_GOES_AHEAD_SRJ],
+  ])('the waiting-row check (checkWaitingRowPane), the re-check answering %s → %s: exactly one re-check with the stops it decides, and one line saying what the check does; the read the only call, nothing typed; nothing latched or posted', async (kind, verdict, outcome, stopCount, then, srj) => {
+    if (outcome !== undefined) installRecheck(outcome)
+    const { h, p } = srj105Build()
+    const err = errInvalidFlags('read-pane')
+    h.script({ readPaneError: err })
+    const order = await recordEveryCall(h, p)
+
+    expect(await checkWaitingRowPane(p)).toBe(verdict)
+
+    expect(resolveCalls).toHaveLength(1)
+    expect(stops).toHaveLength(stopCount)
+    expectOneQuietRead(h, order, p)
+    expect(h.stub.calls.sendKeysCalls).toEqual([])
+    expect(recheckLines(h)).toEqual([invalidFlagsLine(p, err, kind, READ_WORKING_PANE_SITE)])
+    expect(waitingRowLinesOf(h, p)).toEqual([waitingRowLine(p, WAITING_READ_FAILED, err, then, AD_ERROR_CLASS_UNCLASSIFIED, srj)])
+  })
+
+  test.each<[string, () => { readPaneError?: Error; readPaneResults?: Array<{ pane: string }> }]>([
+    ['a pane', () => ({ readPaneResults: [{ pane: IDLE_PANE }] })],
+    ['GONE (ErrTmuxCaptureFailed)', () => ({ readPaneError: errTmuxCaptureFailed() })],
+    ['the row absent (ErrSpawnNotFound)', () => ({ readPaneError: errSpawnNotFound() })],
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', () => ({ readPaneError: errTmuxUnresponsive('read-pane') })],
+    ['CONFIG (ErrConfigMalformed)', () => ({ readPaneError: errConfigMalformed() })],
+    ['ENVIRONMENT (ErrTmuxNotAvailable)', () => ({ readPaneError: errTmuxNotAvailable(undefined, 'read-pane') })],
+    ['UNCLASSIFIED (an ErrInternal not naming the recorded tmux session name)', () => ({ readPaneError: errInternal() })],
+    ['CONFLICT', () => ({ readPaneError: FIRST_LIVENESS_PANE_ROW.build() })],
+    ['UNUSABLE NAME', () => ({ readPaneError: PANE_UNUSABLE_NAME_ROWS[0]!.build() })],
+  ])('%s makes no version re-check and no re-check line', async (_label, script) => {
+    const { h, p } = srj105Build()
+    h.script(script())
+
+    await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))
+
+    expect(resolveCalls).toEqual([])
+    expect(stops).toEqual([])
+    expect(recheckLines(h)).toEqual([])
   })
 })
 
@@ -17735,7 +18234,7 @@ describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrIn
     expect(unusableNameLinesOf(h, p)).toEqual([])
   })
 
-  test('a phrase-less ErrInternal at the waiting-row check\'s pane read: reconnect on the waiting row alone, as for any failed read; never latched', async () => {
+  test('a phrase-less ErrInternal at the waiting-row check\'s pane read: reconnect on the waiting row alone, as for any UNCLASSIFIED read; never latched', async () => {
     const { h, p } = srj105Build()
     h.script({ readPaneError: errInternal() })
 
@@ -18121,20 +18620,22 @@ describe('b.jg5 SRJ-513, SRJ-114, SRJ-1020: a configured persona\'s own pending 
     expectLatchedOnce(h, p, launchStartLatch(p, row))
   })
 
-  test.each(byName(launchStartSampleOf('get')))('the restart path\'s working-row check (checkWorkingRowPane) whose transcript get after an idle pane reads %s answers defer: P latched with pending; no evidence pending, nothing typed; a second check makes no get and posts nothing', async (_name, row) => {
+  test.each(byName(launchStartSampleOf('get')))('the restart path\'s working-row check (checkWorkingRowPane) whose transcript get after the verdict\'s idle pane reads %s answers defer: P latched with pending; the get the only call (no read-pane, no raw tmux); no evidence pending, nothing typed; the next check\'s read (the working-row verdict\'s read-pane) is not made and posts nothing', async (_name, row) => {
     const { h, p } = srj105Build()
     const persona = harnessPersona(h, p)
-    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getResult: row.build(persona, h.home) })
+    h.script({ getResult: row.build(persona, h.home) })
     const order = await recordEveryCall(h, p)
 
-    expect(await checkWorkingRowPane(p, persona)).toBe('defer')
+    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona })).toBe('defer')
 
-    expect(order).toEqual(['readPane', 'get'])
+    expect(order).toEqual(['get'])
     expect(hasPendingWorkingRowEvidence(p)).toBe(false)
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
     expectLatchedOnce(h, p, launchStartLatch(p, row))
 
-    expect(await checkWorkingRowPane(p, persona)).toBe('defer')
+    // b.jg5 SRJ-603: the next check starts with the verdict's one read, which a latched P never makes.
+    expect(await readPersonaOwnPane(p, workingVerdictRead())).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
+    expect(order).toEqual(['get'])
     expect(getIds(h)).toEqual([personaInstanceId(p)])
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
     expect(h.latchEvents).toHaveLength(ONE_LATCH_STEPS.length)

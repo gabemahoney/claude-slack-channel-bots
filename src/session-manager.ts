@@ -88,9 +88,10 @@
  * no hand-off to the `pending` deferral or the pending-only retry. Every
  * `read-pane` of a persona's own row outside the dialog approver goes
  * through the shared read-pane (`readPersonaOwnPane`, b.jg5 SRJ-117; the
- * outcome and its class in `src/pane-read.ts`). Its working-pane use
- * (`readWorkingPane`, the launch wait's evidence read and the restart
- * path's `working`- and `waiting`-row checks) latches on a CONFLICT answer,
+ * outcome and its class in `src/pane-read.ts`). Its uses (the launch wait's
+ * evidence read and the restart path's `waiting`-row check through
+ * `readWorkingPane`, and the `working`-row verdict in `src/server.ts`,
+ * whose pane `checkWorkingRowPane` folds) latch on a CONFLICT answer,
  * with the refused operation "P's next check or recovery", and on an
  * UNUSABLE NAME answer, each with the state its caller last read; a latched
  * persona is not read, and its caller ends with nothing typed.
@@ -229,19 +230,28 @@ import {
   describeAgentDirectorFailure,
   hasAdErrorName,
   isInvalidFlagsError,
+  type InvalidFlagsError,
 } from './ad-error-class.ts'
 import { RECHECK_OUTCOME_STOP } from './ad-version-gate.ts'
 import {
   FULL_PANE_READ_LINES,
+  PANE_READ_ABSENT,
+  PANE_READ_CONFIG,
   PANE_READ_CONFLICT,
+  PANE_READ_ENVIRONMENT,
+  PANE_READ_GONE,
   PANE_READ_LATCHED,
   PANE_READ_NOT_READ_LATCHED,
   PANE_READ_PANE,
+  PANE_READ_UNAVAILABLE,
+  PANE_READ_UNCLASSIFIED,
   PANE_READ_UNUSABLE_NAME,
+  paneReadClassNote,
   paneReadFailureOf,
   type PaneReadConflict,
   type PaneReadFailure,
   type PaneReadOutcome,
+  type PaneReadUnclassified,
   type PaneReadUnusableName,
 } from './pane-read.ts'
 import {
@@ -1490,6 +1500,13 @@ export interface PersonaPaneReadRequest {
  *   - an UNUSABLE NAME latches it through the unusable-name entry
  *     (`latchOnUnusableName`: refused operation "none", `request.lastRead`,
  *     b.jg5 SRJ-512), and answers latched with it as its cause;
+ *   - an `ErrInvalidFlags`, to which `read-pane` gives no meaning, gets
+ *     exactly one immediate version re-check (`classifyWithInvalidFlagsRecheck`,
+ *     b.jg5 SRJ-104, SRJ-204) and then answers UNCLASSIFIED
+ *     (`paneReadInvalidFlagsFailure`), carrying the stop mark
+ *     `stopping: true` when the re-check decided that the server stops
+ *     (b.jg5 SRJ-205; the caller then types nothing and calls nothing more
+ *     for the persona);
  *   - every other outcome (a pane, GONE, absent, CONFIG, ENVIRONMENT,
  *     UNAVAILABLE, UNCLASSIFIED) is returned unchanged for the caller to
  *     handle.
@@ -1514,7 +1531,7 @@ export async function readPersonaOwnPane(key: string, request: PersonaPaneReadRe
     )
     return { kind: PANE_READ_PANE, pane: result.pane }
   } catch (err) {
-    failure = paneReadFailureOf(err)
+    failure = isInvalidFlagsError(err) ? await paneReadInvalidFlagsFailure(key, request, err) : paneReadFailureOf(err)
   }
   if (failure.kind === PANE_READ_CONFLICT) {
     logPaneReadLatch(key, request, failure, latchOnConflict(key, failure.error, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, request.lastRead))
@@ -1525,6 +1542,45 @@ export async function readPersonaOwnPane(key: string, request: PersonaPaneReadRe
     return { kind: PANE_READ_LATCHED, cause: failure }
   }
   return failure
+}
+
+/**
+ * `readPersonaOwnPane`'s answer for an `ErrInvalidFlags` (b.jg5 SRJ-104:
+ * `read-pane` gives it no meaning): exactly one immediate version re-check
+ * through the `ErrInvalidFlags` step (`classifyWithInvalidFlagsRecheck`,
+ * b.jg5 SRJ-204; a stop it decides ends the process as the re-check
+ * defines), then the UNCLASSIFIED outcome with the step's class and the
+ * error's redacted description. When the re-check decided the stop, the
+ * outcome carries the stop mark `stopping: true` (b.jg5 SRJ-205) and nothing
+ * is reported. Otherwise the outcome takes SRJ-105's UNCLASSIFIED row through
+ * the outage state's site entry (`reportUnclassifiedAtSite`: inside a launch
+ * or recovery attempt for the persona it arms the retry timer with the
+ * UNCLASSIFIED cause and reports the persona's unclassified-error episode;
+ * outside one it does nothing), since the wrapper's own report took the
+ * value as STATE and reported nothing. One line, built from the
+ * classification's rendered fields:
+ *
+ *   [slack] <site>: pane read for persona=<key> answered <classification> — UNCLASSIFIED after one immediate agent-director version re-check: <answer> (b.jg5 SRJ-104, SRJ-204)
+ *
+ * Never throws.
+ */
+async function paneReadInvalidFlagsFailure(
+  key: string,
+  request: PersonaPaneReadRequest,
+  err: InvalidFlagsError,
+): Promise<PaneReadUnclassified> {
+  const step = await classifyWithInvalidFlagsRecheck(err)
+  const stopping = step.recheck.kind === RECHECK_OUTCOME_STOP
+  if (!stopping) reportUnclassifiedAtSite(key, err, 'read-pane', step.classification)
+  console.error(
+    `[slack] ${request.site}: pane read for ${keyRef(key)} answered ${describeAdErrorClassification(step.classification)} — UNCLASSIFIED after one immediate agent-director version re-check: ${step.recheck.kind} (b.jg5 SRJ-104, SRJ-204)`,
+  )
+  const outcome: PaneReadUnclassified = {
+    kind: PANE_READ_UNCLASSIFIED,
+    errorClass: step.classification.errorClass,
+    description: describeAgentDirectorFailure(err),
+  }
+  return stopping ? { ...outcome, stopping: true } : outcome
 }
 
 /** `readPersonaOwnPane`'s one line for a latch it set (`outcome`: what became of the latch). */
@@ -1842,10 +1898,12 @@ export function _resetTmuxSessionProber(): void {
 
 /**
  * Probe whether the persona's own tmux session (`slack_bot_<key>`) is alive,
- * through the tmux-session prober seam above (b.d61: the restart module's
- * reconnect adapter bounds its `working` deferral with it). The default prober
- * never rejects; an injected one may, so the caller decides what a failed probe
- * means.
+ * through the tmux-session prober seam above. Its callers are the prompt-row
+ * paths (b.jdc): the reconnect adapter's verdict for an `ask_user` or
+ * `check_permission` row (`promptRowReconnectVerdict` in `src/server.ts`) and
+ * the launch path's check of such a row (`launchOnPromptRow`). The default
+ * prober never rejects; an injected one may, so the caller decides what a
+ * failed probe means.
  */
 export async function hasPersonaTmuxSession(key: string): Promise<boolean> {
   return _hasTmuxSession(personaTmuxSessionName(key))
@@ -2974,7 +3032,7 @@ export function _resetWaitForWaitingTimeoutMs(): void {
 /**
  * The clock of the `working`-row wait and evidence (b.f2b):
  * `waitForWaitingAndReconnect`'s deadline and loop, the launch wait's
- * evidence reads (`staleWorkingRowIsIdle`) and the restart path's
+ * evidence reads (`staleWorkingRowIsIdle`) and the restart path's fold
  * (`checkWorkingRowPane`), pane and transcript alike, and the findMissing
  * memo's window (`sharedFindMissingSweep`, `FIND_MISSING_MEMO_TTL_MS`).
  * Test-only override below.
@@ -3268,7 +3326,8 @@ interface WorkingRowRead {
   /**
    * The pane read's failure outcome (`src/pane-read.ts`: its class and its
    * token-safe description); set only when the read failed and latched
-   * nothing.
+   * nothing. An UNCLASSIFIED here carries the reader's stop mark
+   * (`stopping`) when its version re-check decided that the server stops.
    */
   paneFailure?: PaneReadFailure
   /** The session's transcript, read only when the pane shows an idle screen. */
@@ -3321,12 +3380,12 @@ function latchedAfterOwnRowRead(key: string, site: string, what: string, ref: st
  * Read persona `key`'s pane (`readWorkingPane`, whose CONFLICT or UNUSABLE
  * NAME answer latches the persona with `lastRead`, the row state the calling
  * path last read) and, only when it shows an idle screen, its transcript
- * (`readPersonaTranscript`), for one evidence read (b.f2b). After each of
- * the two reads it asks whether the persona is latched (`personaLatchedNow`,
- * or a read that latched it), and then answers `WORKING_ROW_READ_LATCHED`
- * with nothing more read (b.jg5 SRJ-502), carrying the state the transcript
- * `get` read when it was made. A failed pane read that latched nothing is
- * carried as its outcome (`paneFailure`). Never throws.
+ * (`readIdlePaneTranscript`), for one evidence read of the launch wait
+ * (b.f2b). After the pane read it asks whether the persona is latched
+ * (`personaLatchedNow`, or a read that latched it), and then answers
+ * `WORKING_ROW_READ_LATCHED` with nothing more read (b.jg5 SRJ-502). A
+ * failed pane read that latched nothing is carried as its outcome
+ * (`paneFailure`). Never throws.
  */
 async function readWorkingRowEvidence(
   key: string,
@@ -3336,13 +3395,26 @@ async function readWorkingRowEvidence(
   const read = await readWorkingPane(key, lastRead)
   if (read.kind === PANE_READ_LATCHED || personaLatchedNow(key)) return WORKING_ROW_READ_LATCHED
   if (read.kind !== PANE_READ_PANE) return { pane: undefined, paneFailure: read }
-  if (classifyWorkingPane(read.pane) !== 'idle') return { pane: read.pane }
+  return readIdlePaneTranscript(key, read.pane, configDir)
+}
+
+/**
+ * The rest of one evidence read of persona `key`'s `working` row once its
+ * `pane` has been read (b.f2b): the transcript (`readPersonaTranscript`, one
+ * `get` of its own row) only when the pane shows an idle screen. After the
+ * transcript `get` it asks whether the persona is latched (the `get` latched
+ * it, or `personaLatchedNow`), and then answers `WORKING_ROW_READ_LATCHED`
+ * (b.jg5 SRJ-502), carrying the state the `get` read when it gave one.
+ * Never throws.
+ */
+async function readIdlePaneTranscript(key: string, pane: string, configDir: string | undefined): Promise<WorkingRowRead> {
+  if (classifyWorkingPane(pane) !== 'idle') return { pane }
   const { transcript, rowRead } = await readPersonaTranscript(key, configDir)
   const tracked = rowRead === undefined ? {} : { rowRead }
   if (transcript.kind === PERSONA_TRANSCRIPT_LATCHED || personaLatchedNow(key)) {
     return { ...WORKING_ROW_READ_LATCHED, ...tracked }
   }
-  return { pane: read.pane, transcript, ...tracked }
+  return { pane, transcript, ...tracked }
 }
 
 /**
@@ -3350,18 +3422,13 @@ async function readWorkingRowEvidence(
  * through the shared read-pane of its own row (`readPersonaOwnPane`, b.jg5
  * SRJ-117), answering its outcome. A CONFLICT or UNUSABLE NAME answer
  * latches the persona with `lastRead`, the row state the calling path last
- * read (the launch wait's last read, or the `working` or `waiting` state the
- * restart path's check was called for), and a persona already latched is not
- * read: either way the outcome is latched, and the caller ends what it was
- * doing with nothing typed (b.jg5 SRJ-501, SRJ-502, SRJ-512). Never throws.
+ * read (the launch wait's last read, or the `waiting` state the restart
+ * path's check was called for), and a persona already latched is not read:
+ * either way the outcome is latched, and the caller ends what it was doing
+ * with nothing typed (b.jg5 SRJ-501, SRJ-502, SRJ-512). Never throws.
  */
 async function readWorkingPane(key: string, lastRead: LatchRowState): Promise<PaneReadOutcome> {
   return readPersonaOwnPane(key, { nLines: FULL_PANE_READ_LINES, lastRead, site: 'readWorkingPane' })
-}
-
-/** A failed pane read's class for the end of a log line (the description is rendered where the line names the failure). */
-function paneReadClassNote(failure: PaneReadFailure): string {
-  return `read-pane class=${failure.errorClass}`
 }
 
 /**
@@ -3551,13 +3618,15 @@ const workingRowPaneRuns = new Map<string, WorkingPaneRun>()
  * wait or the restart path held back from the row, typing nothing, because it
  * could not prove the session idle (`noteWorkingRowDeferral`). A run goes on
  * across reads and attempts that find no proof, whatever the reason: a busy,
- * changing, blank or unreadable pane, a transcript that doesn't end with a
- * completed turn or can't be read, idle evidence not yet held for the window,
- * a prompt, a failed tmux probe. A failed status call neither extends nor
- * ends it. It ends (`endWorkingRowDeferral`) when the row reads another state,
- * when a reconnect is typed into it, when any launch for the persona starts
- * (the launch's own wait starts a new run), and with the persona's
- * not-connected episode (`forgetNotConnectedEpisode`).
+ * changing or blank pane, a transcript that doesn't end with a completed
+ * turn or can't be read, idle evidence not yet held for the window, a
+ * prompt, a pane read agent-director could not answer (UNAVAILABLE or
+ * CONFIG, b.jg5 SRJ-603). A failed status call, and a pane read that met
+ * ENVIRONMENT, UNCLASSIFIED or a latch, neither extend nor end it. It ends
+ * (`endWorkingRowDeferral`) when the row reads another state, when a
+ * reconnect is typed into it, when any launch for the persona starts (the
+ * launch's own wait starts a new run), and with the persona's not-connected
+ * episode (`forgetNotConnectedEpisode`).
  */
 const workingRowDeferredSince = new Map<string, number>()
 
@@ -3588,72 +3657,122 @@ export function endWorkingRowDeferral(key: string): void {
   workingRowDeferredSince.delete(key)
 }
 
-/** What `checkWorkingRowPane` and `checkWaitingRowPane` tell the restart path's reconnect adapter (b.f2b). */
+/** What `checkWorkingRowPane` tells the restart path's reconnect adapter (b.f2b). */
 export type WorkingRowPaneVerdict = 'reconnect' | 'defer'
 
+/** `checkWaitingRowPane`'s answer when the row's `read-pane` answered GONE (b.jg5 SRJ-117, SRJ-604). */
+export const WAITING_ROW_PANE_GONE = 'gone'
+
+/** `checkWaitingRowPane`'s answer when the row was absent (`ErrSpawnNotFound`) at its `read-pane` (b.jg5 SRJ-117). */
+export const WAITING_ROW_PANE_ABSENT = 'absent'
+
 /**
- * b.f2b — the restart path's check of a persona whose row reads `working` and
- * whose tmux session is alive (the reconnect adapter in `server.ts`). Makes
- * one evidence read (the pane and, when it shows an idle screen, the
- * transcript, located with `persona`'s claude_config_dir; without `persona`
- * only the row's persisted transcript path is used) and folds it into the
- * persona's run, kept across reconnect attempts (`workingRowPaneRuns`):
+ * What `checkWaitingRowPane` tells the restart path's reconnect adapter
+ * (b.f2b, b.jg5 SRJ-604): `reconnect`, `defer`, or that the row's
+ * `read-pane` answered GONE (`gone`) or found the row absent (`absent`), on
+ * either of which the adapter sweeps and escalates with nothing typed.
+ */
+export type WaitingRowPaneVerdict = WorkingRowPaneVerdict | typeof WAITING_ROW_PANE_GONE | typeof WAITING_ROW_PANE_ABSENT
+
+/** What `checkWorkingRowPane` is given beside the persona's key and pane. */
+export interface WorkingRowPaneCheckOptions {
+  /**
+   * The persona, for locating its transcript under its claude_config_dir;
+   * absent, only the row's persisted transcript path is read.
+   */
+  readonly persona?: Pick<Persona, 'claude_config_dir'>
+  /**
+   * The caller's latched gate (b.jg5 SRJ-502; production: the reconnect
+   * adapter's `reconnectLatchedAt` for the persona, which logs the latched
+   * line), asked right before a deferral is noted and right before the
+   * `blocked-on-prompt` notice: a persona that latched meanwhile (a launch
+   * outside the restart serializer can latch it during the check's awaits)
+   * answers `defer` with its run forgotten, no deferral noted and no notice.
+   * Absent: never asked.
+   */
+  readonly latchedNow?: () => boolean
+}
+
+/**
+ * b.f2b, b.jg5 SRJ-603 — the restart path's positive-idle fold for a persona
+ * whose row reads `working`, on the `pane` its caller read: the reconnect
+ * adapter's one `read-pane` of the row (`workingReconnectVerdict` in
+ * `server.ts`). It makes no `read-pane` of its own. It reads the transcript
+ * (one `get` of the row; located with `options.persona`'s
+ * claude_config_dir, and without it only the row's persisted transcript path
+ * is used) only when the pane shows an idle screen, and folds the evidence
+ * into the persona's run, kept across reconnect attempts
+ * (`workingRowPaneRuns`):
  * - `reconnect` once the idle evidence has held across reads spanning
  *   `STALE_WORKING_WINDOW_MS`: the same idle screen (no busy indicator, no
  *   prompt) and the same transcript, ended with a completed turn and
  *   unchanged, at every read. The row is stale, and the caller types
  *   `/mcp reconnect`. The run is forgotten.
- * - `defer` otherwise: a busy, blank or unreadable pane, or an idle pane whose
- *   transcript does not end with a completed turn or can't be located or read
- *   (the run ends: no evidence); idle evidence not yet held for the window;
- *   or a prompt or dialog. A prompt shown across reads spanning the window
- *   also raises the `blocked-on-prompt` not-connected notice (once per
- *   episode); nothing is ever typed into a prompt.
+ * - `defer` otherwise: a busy or blank pane, or an idle pane whose transcript
+ *   does not end with a completed turn or can't be located or read (the run
+ *   ends: no evidence); idle evidence not yet held for the window; or a
+ *   prompt or dialog. A prompt shown across reads spanning the window also
+ *   raises the `blocked-on-prompt` not-connected notice (once per episode);
+ *   nothing is ever typed into a prompt.
  * Each `defer` is one more deferral in the persona's run on its `working` row
  * (`noteWorkingRowDeferral`): once the run has lasted
  * `UNPROVEN_IDLE_NOTICE_AFTER_MS`, the `unproven-idle` notice is raised (once
  * per episode), so a row whose idleness can never be proven is not held back
  * from silently. `reconnect` ends the run. A live turn never ends its
  * transcript with a completed turn, so it is never taken for idle (b.rmy).
- * A persona latched before or during the evidence read (its pane read
- * answered CONFLICT or UNUSABLE NAME, b.jg5 SRJ-117, SRJ-501, SRJ-512,
- * which latches it with the row state `working`; its transcript `get` read a
- * `provenance_conflict` note or answered UNUSABLE NAME, b.jg5 SRJ-114; or it
- * was latched elsewhere, and a latched persona's pane is not read) answers
+ *
+ * The pane comes from the caller's one read and may be a single leftover's
+ * (b.jg5 SRJ-613: with no session of the row's current launch there and one
+ * leftover of the persona, agent-director answers the leftover's pane), so a
+ * pane alone is never proof: the fold also needs the transcript, and the
+ * `/mcp reconnect` it leads to is classed in turn (its `send-keys` is the
+ * backstop, b.jg5 SRJ-118).
+ *
+ * A persona latched during the transcript `get` (it read a
+ * `provenance_conflict` note or answered UNUSABLE NAME, b.jg5 SRJ-114,
+ * SRJ-512, or it was latched elsewhere), or one `options.latchedNow` finds
+ * latched right before a deferral is noted or the notice is raised, answers
  * `defer` with its run forgotten, no deferral noted, no not-connected notice
- * and nothing typed (b.jg5 SRJ-502). Every other failed pane read defers as
- * an unreadable pane.
+ * and nothing typed (b.jg5 SRJ-502).
  * Logs one line per call; never throws.
  */
 export async function checkWorkingRowPane(
   key: string,
-  persona?: Pick<Persona, 'claude_config_dir'>,
+  pane: string,
+  options: WorkingRowPaneCheckOptions = {},
 ): Promise<WorkingRowPaneVerdict> {
-  const verdict = await workingRowPaneVerdict(key, persona)
-  // b.jg5 SRJ-502: a persona latched during the evidence read is deferred
-  // with no deferral noted, so no not-connected notice is raised for it.
+  const verdict = await workingRowPaneVerdict(key, pane, options)
+  // b.jg5 SRJ-502: a persona latched during the check is deferred with no
+  // deferral noted, so no not-connected notice is raised for it.
   if (verdict === WAIT_OUTCOME_LATCHED) return 'defer'
   if (verdict === 'reconnect') {
     endWorkingRowDeferral(key)
-  } else {
-    // The restart path runs only with auto-restart on.
-    noteWorkingRowDeferral(key, false)
+    return 'reconnect'
   }
-  return verdict
+  // b.jg5 SRJ-502: asked right before the deferral that may raise the
+  // `unproven-idle` notice.
+  if (options.latchedNow?.() === true) {
+    workingRowPaneRuns.delete(key)
+    return 'defer'
+  }
+  // The restart path runs only with auto-restart on.
+  noteWorkingRowDeferral(key, false)
+  return 'defer'
 }
 
 /**
- * `checkWorkingRowPane`'s evidence read and verdict, before its deferral is
- * noted (b.f2b); `latched` for a persona latched during the read (b.jg5
- * SRJ-502): its run is forgotten and one line is logged.
+ * `checkWorkingRowPane`'s transcript read and verdict on the caller's `pane`,
+ * before its deferral is noted (b.f2b); `latched` for a persona latched
+ * during the transcript `get`, or found latched right before the
+ * `blocked-on-prompt` notice (b.jg5 SRJ-502): its run is forgotten.
  */
 async function workingRowPaneVerdict(
   key: string,
-  persona: Pick<Persona, 'claude_config_dir'> | undefined,
+  pane: string,
+  options: WorkingRowPaneCheckOptions,
 ): Promise<WorkingRowPaneVerdict | typeof WAIT_OUTCOME_LATCHED> {
   const ref = keyRef(key)
-  // The adapter called this for a row it has just read `working`.
-  const read = await readWorkingRowEvidence(key, transcriptConfigDir(persona), latchRowStateRead('working'))
+  const read = await readIdlePaneTranscript(key, pane, transcriptConfigDir(options.persona))
   if (read.latched) {
     workingRowPaneRuns.delete(key)
     console.error(
@@ -3661,19 +3780,11 @@ async function workingRowPaneVerdict(
     )
     return WAIT_OUTCOME_LATCHED
   }
-  if (read.pane === undefined) {
-    workingRowPaneRuns.delete(key)
-    const failure = read.paneFailure
-    console.error(
-      `[slack] reconnectSession: ${ref} is working and reading its pane failed: ${failure?.description ?? 'no pane was read'} — no idle evidence; deferring /mcp reconnect to a later tick (${failure === undefined ? '' : `${paneReadClassNote(failure)}; `}b.f2b/b.rmy)`,
-    )
-    return 'defer'
-  }
   const now = _now()
-  const run = foldWorkingPaneRun(workingRowPaneRuns.get(key), read.pane, now, read.transcript)
+  const run = foldWorkingPaneRun(workingRowPaneRuns.get(key), pane, now, read.transcript)
   if (run === undefined) {
     workingRowPaneRuns.delete(key)
-    logNoWorkingRowEvidence(ref, classifyWorkingPane(read.pane), read.transcript)
+    logNoWorkingRowEvidence(ref, classifyWorkingPane(pane), read.transcript)
     return 'defer'
   }
   workingRowPaneRuns.set(key, run)
@@ -3695,6 +3806,11 @@ async function workingRowPaneVerdict(
   if (span < _staleWorkingWindowMs) {
     console.error(`[slack] reconnectSession: ${ref} is working and its pane shows a prompt or dialog — not typing into it; deferring /mcp reconnect to a later tick (b.f2b/b.rmy)`)
     return 'defer'
+  }
+  // b.jg5 SRJ-502: asked right before the notice; the gate logs its line.
+  if (options.latchedNow?.() === true) {
+    workingRowPaneRuns.delete(key)
+    return WAIT_OUTCOME_LATCHED
   }
   console.error(
     `[slack] reconnectSession: ${ref} reads working and its pane has shown a prompt or dialog for ${seconds}s — blocked on it; not typing into it, deferring /mcp reconnect to a later tick (answer it in tmux session "${personaTmuxSessionName(key)}") (b.f2b)`,
@@ -3719,36 +3835,108 @@ function logNoWorkingRowEvidence(ref: string, reading: WorkingPaneReading, trans
 }
 
 /**
- * b.f2b — the restart path's check of a persona whose row reads `waiting`,
- * before the reconnect adapter types `/mcp reconnect`: one pane read. A pane
- * that shows a running turn (`busy`) defers; so does a prompt or dialog,
- * which is never typed into and raises the `blocked-on-prompt` not-connected
- * notice (once per episode). b.jg5 SRJ-117, SRJ-501, SRJ-512: a pane read
- * that answers CONFLICT or UNUSABLE NAME latches the persona with the row
- * state `waiting` (`readWorkingPane`), and a latched persona's pane is not
- * read; either way it defers, never `reconnect`, with no notice, so the
- * adapter types nothing. Anything else, any other failed read included, lets
- * the reconnect go ahead: the `waiting` row is agent-director's own idle
- * signal. Logs a line for each deferral and for a failed read; never throws.
+ * b.f2b, b.jg5 SRJ-604 — the restart path's check of a persona whose row
+ * reads `waiting`, before the reconnect adapter types `/mcp reconnect`: one
+ * `read-pane` of the row through the shared reader (`readWorkingPane`, the
+ * full read, the row state `waiting`), answered by b.jg5 SRJ-117's
+ * waiting-row column:
+ * - a pane: a running turn (`busy`) defers; so does a prompt or dialog, which
+ *   is never typed into and raises the `blocked-on-prompt` not-connected
+ *   notice (once per episode); otherwise `reconnect`. The pane may be a
+ *   single leftover's (b.jg5 SRJ-613), so it is no proof the worker's own
+ *   session is there: the reconnect's own `send-keys` is classed in turn
+ *   and is the backstop (b.jg5 SRJ-118);
+ * - GONE (`ErrTmuxCaptureFailed`): `gone`; the adapter sweeps and escalates,
+ *   typing nothing;
+ * - the row absent (`ErrSpawnNotFound`): `absent`, which the adapter
+ *   handles as GONE without dead evidence (b.jg5 SRJ-117);
+ * - CONFLICT or UNUSABLE NAME (the reader latched the persona with the row
+ *   state `waiting`, b.jg5 SRJ-501, SRJ-512), or a persona already latched,
+ *   which the reader does not read: `defer`, with no notice, so nothing is
+ *   typed (b.jg5 SRJ-502);
+ * - ENVIRONMENT (`ErrTmuxNotAvailable`; the wrapper raised the
+ *   `tmux-unavailable` outage, b.jg5 SRJ-311): `defer`, nothing typed;
+ * - an UNCLASSIFIED carrying the stop mark (`stopping`: the reader's
+ *   `ErrInvalidFlags` re-check decided that the server stops, b.jg5
+ *   SRJ-205): `defer`, nothing typed and nothing more called;
+ * - UNAVAILABLE (timeouts included), CONFIG (the wrapper raised the
+ *   `ad-config-malformed` outage, b.jg5 SRJ-316) and any other
+ *   UNCLASSIFIED: `reconnect` on the `waiting` row alone, agent-director's
+ *   own idle signal, with one line naming the class.
+ * `latchedNow` (the adapter's latched gate, b.jg5 SRJ-502) is asked right
+ * before the `blocked-on-prompt` notice: a persona that latched meanwhile
+ * gets no notice and `defer`. Logs one line for each answer but a plain
+ * `reconnect`; never throws.
  */
-export async function checkWaitingRowPane(key: string): Promise<WorkingRowPaneVerdict> {
+export async function checkWaitingRowPane(key: string, latchedNow?: () => boolean): Promise<WaitingRowPaneVerdict> {
   const ref = keyRef(key)
   // The adapter called this for a row it has just read `waiting`.
   const read = await readWorkingPane(key, latchRowStateRead('waiting'))
-  if (read.kind === PANE_READ_LATCHED) {
-    console.error(`[slack] reconnectSession: ${ref} is waiting and is latched — deferring; nothing typed (b.jg5 SRJ-502)`)
-    return 'defer'
+  switch (read.kind) {
+    case PANE_READ_PANE:
+      return waitingRowPaneJudgement(key, ref, read.pane, latchedNow)
+    case PANE_READ_LATCHED:
+    case PANE_READ_CONFLICT:
+    case PANE_READ_UNUSABLE_NAME:
+      console.error(`[slack] reconnectSession: ${ref} is waiting and is latched — deferring; nothing typed (b.jg5 SRJ-502)`)
+      return 'defer'
+    case PANE_READ_GONE:
+      console.error(
+        `[slack] reconnectSession: ${ref} is waiting but agent-director's read-pane found no pane of its launch: ${read.description} — not typing /mcp reconnect; reconciling so the restart relaunches it (${paneReadClassNote(read)}; b.jg5 SRJ-604)`,
+      )
+      return WAITING_ROW_PANE_GONE
+    case PANE_READ_ABSENT:
+      console.error(
+        `[slack] reconnectSession: ${ref} is waiting but its agent-director row was absent at the pane read: ${read.description} — not typing /mcp reconnect; reconciling so the restart relaunches it (${paneReadClassNote(read)}; b.jg5 SRJ-117)`,
+      )
+      return WAITING_ROW_PANE_ABSENT
+    case PANE_READ_ENVIRONMENT:
+      console.error(
+        `[slack] reconnectSession: ${ref} is waiting and reading its pane failed: ${read.description} — tmux is not available; not typing /mcp reconnect, deferring to a later tick (${paneReadClassNote(read)}; b.jg5 SRJ-117, SRJ-311)`,
+      )
+      return 'defer'
+    case PANE_READ_UNCLASSIFIED:
+      if (read.stopping === true) {
+        console.error(
+          `[slack] reconnectSession: ${ref} is waiting and reading its pane failed: ${read.description} — the agent-director version re-check decided that the server stops; not typing /mcp reconnect, nothing more is called for it (${paneReadClassNote(read)}; b.jg5 SRJ-204, SRJ-205)`,
+        )
+        return 'defer'
+      }
+      return reconnectOnWaitingRowAlone(ref, read)
+    case PANE_READ_UNAVAILABLE:
+    case PANE_READ_CONFIG:
+      return reconnectOnWaitingRowAlone(ref, read)
   }
-  if (read.kind !== PANE_READ_PANE) {
-    console.error(`[slack] reconnectSession: ${ref} is waiting and reading its pane failed: ${read.description} — reconnecting on the waiting row alone (${paneReadClassNote(read)}; b.f2b)`)
-    return 'reconnect'
-  }
-  const reading = classifyWorkingPane(read.pane)
+}
+
+/** `checkWaitingRowPane`'s `reconnect` on the `waiting` row alone after a failed pane read, with its one line (b.f2b, b.jg5 SRJ-604). */
+function reconnectOnWaitingRowAlone(ref: string, read: PaneReadFailure): 'reconnect' {
+  console.error(
+    `[slack] reconnectSession: ${ref} is waiting and reading its pane failed: ${read.description} — reconnecting on the waiting row alone (${paneReadClassNote(read)}; b.f2b, b.jg5 SRJ-604)`,
+  )
+  return 'reconnect'
+}
+
+/**
+ * `checkWaitingRowPane`'s judgement of the `pane` it read (b.f2b): a running
+ * turn defers; a prompt or dialog defers and raises the `blocked-on-prompt`
+ * notice, unless `latchedNow` finds the persona latched right before it
+ * (b.jg5 SRJ-502: no notice); anything else is `reconnect`.
+ */
+function waitingRowPaneJudgement(
+  key: string,
+  ref: string,
+  pane: string,
+  latchedNow: (() => boolean) | undefined,
+): WorkingRowPaneVerdict {
+  const reading = classifyWorkingPane(pane)
   if (reading === 'busy') {
     console.error(`[slack] reconnectSession: ${ref} is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick (b.f2b/b.rmy)`)
     return 'defer'
   }
   if (reading === 'prompt') {
+    // b.jg5 SRJ-502: asked right before the notice; the gate logs its line.
+    if (latchedNow?.() === true) return 'defer'
     console.error(
       `[slack] reconnectSession: ${ref} is waiting but its pane shows a prompt or dialog — not typing into it; deferring /mcp reconnect to a later tick (answer it in tmux session "${personaTmuxSessionName(key)}") (b.f2b/b.rmy)`,
     )
@@ -4642,8 +4830,10 @@ export function readFindMissingRow(
  * the single reusable place for it (do NOT inline the sweep at another call
  * site).
  *
- * When the tick/restart path decides a persona's tmux session is provably dead
- * while its AD row still looks alive ('dead-session' → 'escalate-dead'), CSCB
+ * When the tick/restart path escalates a persona as dead while its AD row
+ * still looks alive (an `EscalateDeadVerdict`: a GONE answer, a refused
+ * keystroke, a row found absent at a pane read, or a prompt row's tmux
+ * session not found; 'dead-session' → 'escalate-dead'), CSCB
  * recovers itself instead of silently waiting on the external
  * `~/startup/find-missing-loop.sh`: emit an operator-visible log line, then run
  * the memoized, ordinary `reconcileMissingSweep` (b.m4r, b.jg5 SRJ-120). The
@@ -4699,31 +4889,68 @@ export async function sweepDeadTmuxChannelWithCause(key: string, verdict: Escala
 }
 
 /**
- * Why the restart path's reconnect adapter escalated a persona as dead:
- * - `dead-session`: `reconnectMcp`'s keystrokes failed twice with
- *   `ErrTmuxSendKeys`, so its tmux session is gone (b.3ce);
- * - `row-not-interactive`: agent-director refused them with
- *   `ErrSpawnNotInteractive`, having ended the row or marked it missing
- *   (b.dup);
- * - `working-tmux-gone`: its row reads `working`, but its tmux session is
- *   gone (b.d61);
- * - `prompt-row-tmux-gone`: its row reads `ask_user` or `check_permission`,
- *   but its tmux session is gone (b.jdc).
+ * Why the restart path's reconnect adapter escalated a persona as dead, by
+ * what the verdict came from:
+ * - from a GONE answer (`ErrTmuxSendKeys`, or `ErrTmuxCaptureFailed` at a
+ *   pane read: agent-director found no session or pane of the row's launch,
+ *   b.jg5 SRJ-104):
+ *   - `dead-session`: `reconnectMcp`'s keystrokes answered `ErrTmuxSendKeys`
+ *     at the `/mcp reconnect` and at its retry (b.3ce);
+ *   - `working-tmux-gone`: its row reads `working` and the reconnect
+ *     adapter's `read-pane` of the row answered GONE (b.d61, b.jg5 SRJ-603);
+ *   - `waiting-row-pane-gone`: its row reads `waiting` and the waiting-row
+ *     check's `read-pane` answered GONE (b.f2b, b.jg5 SRJ-604);
+ * - from a refusal: `row-not-interactive`, agent-director refused the
+ *   keystrokes with `ErrSpawnNotInteractive` (b.dup);
+ * - from a row read: `row-absent-at-pane-read`, the row was absent
+ *   (`ErrSpawnNotFound`) at the `read-pane` of the `working`-row verdict or
+ *   the waiting-row check, which takes the GONE column without being a GONE
+ *   (b.jg5 SRJ-117);
+ * - from the tmux probe of a prompt row: `prompt-row-tmux-gone`, its row
+ *   reads `ask_user` or `check_permission` and its tmux session was not
+ *   found (b.jdc).
+ * A GONE does not prove the worker's process gone (b.jg5 SRJ-613), and the
+ * evidence texts (`ESCALATE_DEAD_EVIDENCE`) of the GONE, absent-row and
+ * prompt-row-probe verdicts say only what was observed. Which verdicts count
+ * as dead evidence (b.jg5 SRJ-611) is decided from this origin, never from
+ * the text.
  */
-export type EscalateDeadVerdict = 'dead-session' | 'row-not-interactive' | 'working-tmux-gone' | 'prompt-row-tmux-gone'
+export type EscalateDeadVerdict =
+  | 'dead-session'
+  | 'row-not-interactive'
+  | 'working-tmux-gone'
+  | 'waiting-row-pane-gone'
+  | 'row-absent-at-pane-read'
+  | 'prompt-row-tmux-gone'
+
+/** The escalate-dead verdict of a `waiting` row whose `read-pane` answered GONE (b.jg5 SRJ-604). */
+export const ESCALATE_DEAD_WAITING_ROW_PANE_GONE = 'waiting-row-pane-gone' satisfies EscalateDeadVerdict
+
+/** The escalate-dead verdict of a row found absent (`ErrSpawnNotFound`) at a pane read (b.jg5 SRJ-117). */
+export const ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ = 'row-absent-at-pane-read' satisfies EscalateDeadVerdict
 
 /**
- * What each escalate-dead verdict proves, for its log line (b.jdc): only a
- * gone tmux session is "provably dead"; a refused keystroke proves the row is
- * no longer interactive, whatever became of its tmux session.
+ * What each escalate-dead verdict observed, for its log line
+ * (`sweepDeadTmuxChannelWithCause`, b.jdc): exactly one text per verdict.
+ * The texts of the GONE, absent-row and prompt-row-probe verdicts say no
+ * tmux session or worker is provably dead: a GONE says that agent-director
+ * found no session or pane of the row's launch, an absent row that the row
+ * read found none, and the prompt-row probe that it found no tmux session.
+ * The `row-not-interactive` text says the row's claude process is gone.
  */
-const ESCALATE_DEAD_EVIDENCE: Readonly<Record<EscalateDeadVerdict, string>> = {
-  'dead-session': 'tmux session provably dead',
+export const ESCALATE_DEAD_EVIDENCE: Readonly<Record<EscalateDeadVerdict, string>> = Object.freeze({
+  'dead-session':
+    "agent-director's send-keys answered GONE (ErrTmuxSendKeys) at the /mcp reconnect and at its retry: no session of the row's launch was found",
   'row-not-interactive':
     'row not interactive (agent-director refused the /mcp reconnect keystrokes: it ended the row or marked it missing, so its claude process is gone)',
-  'working-tmux-gone': 'tmux session provably dead',
-  'prompt-row-tmux-gone': 'tmux session provably dead',
-}
+  'working-tmux-gone':
+    "agent-director's read-pane found no pane of the row's launch (GONE) on its working row",
+  'waiting-row-pane-gone':
+    "agent-director's read-pane found no pane of the row's launch (GONE) on its waiting row",
+  'row-absent-at-pane-read':
+    "its agent-director row was absent at the pane read (ErrSpawnNotFound): a row read, not a GONE",
+  'prompt-row-tmux-gone': 'its tmux session was not found by the probe of its ask_user or check_permission row',
+})
 
 // ---------------------------------------------------------------------------
 // Rows waiting on a prompt whose session may be gone (b.jdc)

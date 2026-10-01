@@ -58,6 +58,8 @@ import {
   stopAllDialogApprovers,
   _setTmuxSessionProber,
   _resetTmuxSessionProber,
+  _setTmuxCommandRunner,
+  _resetTmuxCommandRunner,
   _setTmuxSessionKiller,
   _resetTmuxSessionKiller,
   _setDialogReadyTimeoutMs,
@@ -77,8 +79,13 @@ import {
   spawnForPersona,
   setConfiguredPersonaQuery,
   _resetConfiguredPersonaQuery,
+  ESCALATE_DEAD_EVIDENCE,
+  ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
+  ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
   type ConfigDirUnresolvableHook,
+  type EscalateDeadVerdict,
 } from '../src/session-manager.ts'
+import { FULL_PANE_READ_LINES } from '../src/pane-read.ts'
 import {
   conflictNoticeText,
   createConflictLatch,
@@ -121,12 +128,14 @@ import {
   errSpawnNotInteractive,
   errSystemInstallDisappeared,
   errTmuxKillFailed,
+  errTmuxCaptureFailed,
   errTmuxNotAvailable,
   errTmuxSendKeys,
   errTmuxSessionConflict,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
   holdSpawns,
+  UNAVAILABLE_FORMS,
   unavailableForms,
   makeStubCallLog,
   makeStubResolveSystemBinary,
@@ -140,7 +149,7 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
 import type { DeleteParams, FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams } from 'agent-director'
-import { configDirLabelValue, personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
+import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import { stubOpenedDmId, type StubWebMethod } from './test-helpers/slack-stub.ts'
@@ -2114,85 +2123,184 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.d61: a persona killed mid-turn is relaunched, not deferred forever.
+// b.d61, b.jg5 SRJ-603, SRJ-604: a persona killed mid-turn is relaunched, not
+// deferred forever.
 //
-// The live Check 7 shape: the persona's tmux session is killed while it is
+// The live Check 7 shape: the persona's session is killed while it is
 // `working`, so its MCP session drops and AD's row stays frozen at `working`
 // until a findMissing sweep reconciles it. The liveness probe and the reconnect
 // adapter are the REAL ones over one stub AD client whose row reads `working`
-// until a findMissing sweep has run and `missing` after it (what AD does for a
-// row whose tmux session is gone). The tmux-session prober reports the
-// persona's session gone. Kill and launch are recording fakes. The restart
-// run's liveness re-probe after the 'escalate-dead' verdict reads the
-// reconciled row, so the relaunch happens in that same run.
+// (or `waiting`) until a findMissing sweep has run and `missing` after it (what
+// AD does for a row whose session is gone). The row's evidence is the one
+// `read-pane` the reconnect adapter makes of it: GONE (`ErrTmuxCaptureFailed`)
+// sweeps and escalates with nothing typed, and the restart run's liveness
+// re-probe after the 'escalate-dead' verdict reads the reconciled row, so the
+// checked kill and the relaunch happen in that same run (b.jg5 SRJ-611). An
+// UNAVAILABLE `read-pane` of a `working` row is no proof the session is gone:
+// the run defers, with no sweep, kill, launch or accounting. Kill and launch
+// are recording fakes. No tmux is asked: the session prober and the server
+// ensurer are the defaults, whose only way to tmux is the raw runner, which
+// records every argv here.
 // ---------------------------------------------------------------------------
 
 describe('b.d61: a working persona whose tmux session is gone is relaunched in the same restart run', () => {
   let dir: string
+  /** Every argv the raw tmux runner was asked to run (the default session prober and server ensurer included). */
+  let rawTmux: string[][]
+  let errLines: string[]
+  let origConsoleError: typeof console.error
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'restart-d61-'))
     _resetFindMissingMemo()
+    _resetTmuxSessionProber()
+    _resetTmuxServerEnsurer()
+    rawTmux = []
+    _setTmuxCommandRunner(async (args) => {
+      rawTmux.push([...args])
+      return { code: 1, stdout: '' }
+    })
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
   })
 
   afterEach(() => {
+    console.error = origConsoleError
     cancelAllRestartTimers()
     resetClientForTests()
     _resetOutageState()
-    _resetTmuxServerEnsurer()
-    _resetTmuxSessionProber()
+    _resetTmuxCommandRunner()
     _resetFindMissingMemo()
     rmSync(dir, { recursive: true, force: true })
   })
 
-  test('alive (working) but disconnected → one findMissing sweep and no send-keys; the re-probe reads the row missing → one kill and one relaunch in that run, and no second relaunch', async () => {
+  /** P's `status` answer, by whether the findMissing sweep has run yet. */
+  type RowAnswer = (swept: boolean) => { state: string } | Error
+
+  /**
+   * One persona's restart deps over the real liveness and reconnect adapters
+   * and one stub client: its `status` answers `row`, its `read-pane` rejects
+   * with `readPaneError`, kill and launch record (the launch answering
+   * `launchResult`), and the arm hook and the serialized work's outcome are
+   * recorded. `stubCalls()` is the stub's calls by verb, leaving out verbs
+   * never called.
+   */
+  function d61Run(row: RowAnswer, readPaneError: Error, launchResult = true) {
     const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
-    const KEY = config.personas[0]!.key
-    const sendKeysCalls: SendKeysParams[] = []
-    const findMissingCalls: FindMissingParams[] = []
-    const stub = makeStubClient({
-      statusFn: () => ({ state: findMissingCalls.length > 0 ? 'missing' : 'working' }),
-      sendKeysCalls,
-      findMissingCalls,
-    })
+    const persona = config.personas[0]!
+    const log = makeStubCallLog()
+    const stub = makeStubClient({ ...log, statusFn: () => row(log.findMissingCalls.length > 0), readPaneError })
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
     setClientForTests(stub as unknown as Client)
-    _setTmuxServerEnsurer(async () => {})
-    _setTmuxSessionProber(async () => false)
-
-    const killSessionCalls: string[] = []
-    const launchSessionCalls: string[] = []
+    const kills: string[] = []
+    const launches: string[] = []
+    const armed: string[] = []
+    const outcomes: unknown[] = []
     initRestart({
       canRestart: () => true,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
       isSessionConnected: () => false,
       hasSessionStream: () => false,
       reconnectSession: _buildReconnectSessionAdapter(),
-      async killSession(key) { killSessionCalls.push(key) },
-      async launchSession(key) { launchSessionCalls.push(key); return true },
+      async killSession(key) { kills.push(key) },
+      async launchSession(key) { launches.push(key); return launchResult },
       getRestartDelay: () => FAST_DELAY_S,
       isShuttingDown: () => false,
       onCapReached: () => {},
+      armRetryTimer: (key) => { armed.push(key) },
+      serialize: async <T>(_key: string, operation: () => T | Promise<T>): Promise<T> => {
+        const outcome = await operation()
+        outcomes.push(outcome)
+        return outcome
+      },
     })
+    const stubCalls = (): Record<string, number> =>
+      Object.fromEntries(Object.entries(log).filter(([, calls]) => calls.length > 0).map(([verb, calls]) => [verb, calls.length]))
+    /** The pane reads made, as `[instance id, lines]`. */
+    const paneReads = (): Array<[string, number | undefined]> => log.readPaneCalls.map((c) => [c.claude_instance_id, c.n_lines])
+    return { KEY: persona.key, cwd: persona.working_directory, kills, launches, armed, outcomes, stubCalls, paneReads }
+  }
 
-    // One restart run: the frozen `working` row reads alive; the reconnect
-    // adapter finds the tmux session gone and sweeps instead of deferring; the
-    // sweep reconciled the row to `missing`, so the re-probe reads dead and the
-    // normal kill + relaunch branch runs at once.
-    scheduleRestart(KEY, config.personas[0]!.working_directory)
+  /** The escalate-dead verdict lines (one per sweep the adapter fires); only `verdict`'s, with its evidence text, when given. */
+  const escalateLines = (verdict?: EscalateDeadVerdict): string[] =>
+    errLines
+      .filter((l) => l.startsWith('[slack] escalate-dead: ') && l.includes(' verdict='))
+      .filter((l) => verdict === undefined || l.includes(` verdict=${verdict} — ${ESCALATE_DEAD_EVIDENCE[verdict]},`))
+
+  /** A row reading `state` until the sweep and `missing` after it. */
+  const untilSwept = (state: string): RowAnswer => (swept) => ({ state: swept ? 'missing' : state })
+
+  const WORKING_TMUX_GONE: EscalateDeadVerdict = 'working-tmux-gone'
+
+  test.each<[string, EscalateDeadVerdict]>([
+    ['working', WORKING_TMUX_GONE],
+    ['waiting', ESCALATE_DEAD_WAITING_ROW_PANE_GONE],
+  ])('alive (%s) but disconnected, its read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict %s) and no send-keys; the re-probe reads the row missing → one kill and one relaunch in that run, no failure counted, nothing armed, no tmux asked', async (state, verdict) => {
+    const run = d61Run(untilSwept(state), errTmuxCaptureFailed())
+
+    scheduleRestart(run.KEY, run.cwd)
     await Bun.sleep(WAIT_MS)
 
-    expect(findMissingCalls).toHaveLength(1)
-    // Nothing is typed into a pane that no longer exists.
-    expect(sendKeysCalls).toEqual([])
-    expect(killSessionCalls).toEqual([KEY])
-    expect(launchSessionCalls).toEqual([KEY])
+    // The probe, the adapter's state read, its read-pane and sweep, then the
+    // re-probe; nothing is typed into a pane that no longer exists.
+    expect(run.stubCalls()).toEqual({ statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
+    expect(run.paneReads()).toEqual([[personaInstanceId(run.KEY), FULL_PANE_READ_LINES]])
+    expect(escalateLines()).toHaveLength(1)
+    expect(escalateLines(verdict)).toHaveLength(1)
+    expect(run.kills).toEqual([run.KEY])
+    expect(run.launches).toEqual([run.KEY])
+    expect(run.outcomes).toEqual([RESTART_OUTCOME_LAUNCHED])
     // The successful launch counts no failure.
-    expect(getFailureCount(KEY)).toBe(0)
+    expect(getFailureCount(run.KEY)).toBe(0)
     // The run armed no further timer: nothing relaunches the persona again.
-    expect(isRestartPendingOrActive(KEY)).toBe(false)
+    expect(run.armed).toEqual([])
+    expect(isRestartPendingOrActive(run.KEY)).toBe(false)
+    expect(rawTmux).toEqual([])
   })
+
+  // b.jg5 SRJ-117: the row absent at the read-pane takes the GONE column
+  // without being a GONE. Which verdicts are dead evidence, and so what the
+  // run may kill after one, is not pinned here.
+  test.each(['working', 'waiting'])('alive (%s) but disconnected, its read-pane answering ErrSpawnNotFound → one findMissing sweep with the row-absent verdict and no send-keys; no failure counted, no tmux asked', async (state) => {
+    const run = d61Run(untilSwept(state), errSpawnNotFound())
+
+    scheduleRestart(run.KEY, run.cwd)
+    await Bun.sleep(WAIT_MS)
+
+    expect(run.stubCalls()).toEqual({ statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
+    expect(escalateLines()).toHaveLength(1)
+    expect(escalateLines(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)).toHaveLength(1)
+    expect(getFailureCount(run.KEY)).toBe(0)
+    expect(run.armed).toEqual([])
+    expect(rawTmux).toEqual([])
+  })
+
+  // b.jg5 SRJ-603 (HO C18 Verify, AC 77): a `working` row's read-pane that
+  // could not run is never proof the session is gone. Every UNAVAILABLE form
+  // a read can meet (the kill-failure form is a kill's only).
+  const READ_PANE_UNAVAILABLE_FORMS = UNAVAILABLE_FORMS.filter(([, , cause]) => cause === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
+
+  test.each(READ_PANE_UNAVAILABLE_FORMS)('alive (working) but disconnected, its read-pane answering UNAVAILABLE (%s) → the run defers: no sweep, send-keys, kill or launch, nothing counted or reset, nothing armed, no tmux asked', async (_label, make) => {
+    const run = d61Run(() => ({ state: 'working' }), make('read-pane'))
+    // One failure on record, so a reset or a counted launch would show.
+    recordFailure(run.KEY)
+
+    scheduleRestart(run.KEY, run.cwd)
+    await Bun.sleep(WAIT_MS)
+
+    expect(run.stubCalls()).toEqual({ statusCalls: 2, readPaneCalls: 1 })
+    expect(escalateLines()).toEqual([])
+    expect(run.kills).toEqual([])
+    expect(run.launches).toEqual([])
+    expect(run.outcomes).toEqual([RESTART_OUTCOME_RECONNECT_DEFERRED])
+    expect(getFailureCount(run.KEY)).toBe(1)
+    expect(run.armed).toEqual([])
+    expect(isRestartPendingOrActive(run.KEY)).toBe(false)
+    expect(rawTmux).toEqual([])
+  })
+
   // b.jg5 SRJ-314 (AC 37, HO C12): the real liveness adapter over the stub
   // reads a `status` error `unknown` unless it is ErrSpawnNotFound or
   // ErrSystemInstallDisappeared, at the first probe and at b.d61's re-probe
@@ -2211,59 +2319,27 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   const STATUS_ERROR_CASES = PROBES.flatMap(([probe]) => STATUS_ERRORS.map(([label, build, dead]) => [probe, label, build, dead] as const))
 
   test.each(STATUS_ERROR_CASES)('b.jg5 SRJ-314: the %s\'s status answers %s → dead: %p (a kill and a relaunch only when dead; unknown arms the hook once and counts nothing)', async (probe, _label, build, dead) => {
-    const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
-    const KEY = config.personas[0]!.key
-    const sendKeysCalls: SendKeysParams[] = []
-    const findMissingCalls: FindMissingParams[] = []
-    const statusCalls: StatusParams[] = []
     // First probe: status fails at once. Re-probe: the row reads `working`
-    // (the reconnect adapter finds the tmux session gone and sweeps) until
+    // (the reconnect adapter's read-pane answers GONE and it sweeps) until
     // the sweep, and status fails after it.
-    const stub = makeStubClient({
-      statusFn: () => (probe === 'first probe' || findMissingCalls.length > 0 ? build() : { state: 'working' }),
-      statusCalls,
-      sendKeysCalls,
-      findMissingCalls,
-    })
-    _resetOutageState()
-    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
-    setClientForTests(stub as unknown as Client)
-    _setTmuxServerEnsurer(async () => {})
-    _setTmuxSessionProber(async () => false)
-
+    const run = d61Run((swept) => (probe === 'first probe' || swept ? build() : { state: 'working' }), errTmuxCaptureFailed(), false)
     // One failure on record, so a reset or a counted launch would show.
-    recordFailure(KEY)
-    const killSessionCalls: string[] = []
-    const launchSessionCalls: string[] = []
-    const armed: string[] = []
-    initRestart({
-      canRestart: () => true,
-      isSessionAlive: _buildIsSessionAliveAdapter(() => config),
-      isSessionConnected: () => false,
-      hasSessionStream: () => false,
-      reconnectSession: _buildReconnectSessionAdapter(),
-      async killSession(key) { killSessionCalls.push(key) },
-      async launchSession(key) { launchSessionCalls.push(key); return false },
-      getRestartDelay: () => FAST_DELAY_S,
-      isShuttingDown: () => false,
-      onCapReached: () => {},
-      armRetryTimer: (key) => { armed.push(key) },
-    })
+    recordFailure(run.KEY)
 
-    scheduleRestart(KEY, config.personas[0]!.working_directory)
+    scheduleRestart(run.KEY, run.cwd)
     await Bun.sleep(WAIT_MS)
 
-    // The first probe, the reconnect adapter's read and the re-probe (the
-    // first-probe case stops, or goes straight to the kill, after one).
-    expect(statusCalls).toHaveLength(probe === 'first probe' ? 1 : 3)
-    expect(findMissingCalls).toHaveLength(probe === 'first probe' ? 0 : 1)
-    expect(sendKeysCalls).toEqual([])
-    expect(killSessionCalls).toEqual(dead ? [KEY] : [])
-    expect(launchSessionCalls).toEqual(dead ? [KEY] : [])
+    // The first probe, the reconnect adapter's state read and read-pane, and
+    // the re-probe (the first-probe case stops, or goes straight to the kill,
+    // after one).
+    expect(run.stubCalls()).toEqual(probe === 'first probe' ? { statusCalls: 1 } : { statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
+    expect(run.kills).toEqual(dead ? [run.KEY] : [])
+    expect(run.launches).toEqual(dead ? [run.KEY] : [])
     // A failed launch counts; an unknown run counts nothing and resets nothing.
-    expect(getFailureCount(KEY)).toBe(dead ? 2 : 1)
-    expect(armed).toEqual(dead ? [] : [KEY])
-    expect(isRestartPendingOrActive(KEY)).toBe(false)
+    expect(getFailureCount(run.KEY)).toBe(dead ? 2 : 1)
+    expect(run.armed).toEqual(dead ? [] : [run.KEY])
+    expect(isRestartPendingOrActive(run.KEY)).toBe(false)
+    expect(rawTmux).toEqual([])
   })
 })
 
@@ -5509,10 +5585,11 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
 // parse: "launch start not recorded", refused operation "none", the state
 // `pending`). The restart work asks the latch again right after each probe:
 // after the first probe, and (UNUSABLE NAME) after b.d61's re-probe that
-// follows an escalate-dead reconnect (a `working` row whose tmux session is
-// gone, swept once). Either way the run answers `RESTART_OUTCOME_LATCHED` with
-// no `pending` deferral, no further reconnect, no kill, spawn, `resume` or
-// send-keys, no arm hook and nothing recorded (P's one failure on record
+// follows an escalate-dead reconnect (a `working` row whose one `read-pane`
+// answers GONE, swept once). Either way the run answers
+// `RESTART_OUTCOME_LATCHED` with no `pending` deferral, no further reconnect,
+// no kill, spawn, `resume` or send-keys, no tmux-touching call after that
+// read-pane, no arm hook and nothing recorded (P's one failure on record
 // stays one: a success would reset it, a counted failure raise it), for a
 // scheduled restart, a human-triggered restart request and E8's retry entry
 // alike. The latch's holds and its one SRJ-1019 or SRJ-1020 post run as
@@ -5617,10 +5694,16 @@ describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches 
 
     await run(p, cwdOf(p))
 
+    // The sweep's findMissing names no instance; every other call is P's own.
+    const { findMissingCalls: _sweeps, ...ownCalls } = expected.calls
+    // The only tmux-touching call is the read-pane whose GONE escalated, made
+    // before P latched; none follows the latch.
+    const tmuxBeforeLatch = expected.calls.readPaneCalls === undefined ? [] : [['read-pane', personaInstanceId(p)]]
+
     expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }])
     expect(callCounts(h)).toEqual(expected.calls)
-    expect(personaCallCounts(h, p)).toEqual({ statusCalls: expected.calls.statusCalls! })
-    expect(tmuxTouchingCallsIn(h.stub.calls)).toEqual([])
+    expect(personaCallCounts(h, p)).toEqual(ownCalls)
+    expect(tmuxTouchingCallsIn(h.stub.calls).map((c) => [c.verb, (c.params as { claude_instance_id?: string }).claude_instance_id])).toEqual(tmuxBeforeLatch)
     expect(h.latch.record(p)).toEqual(expected.record(p))
     expect(h.latchEvents.filter((event) => event.step === 'set').map((event) => event.key)).toEqual([p])
     expect(h.episodeNotices).toEqual([{ key: p, text: expected.notice(p) }])
@@ -5643,7 +5726,7 @@ describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches 
     expect(h.latch.isLatched(q)).toBe(false)
     expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(q)])
     expect(h.stub.spawnedIds()).toEqual([personaInstanceId(q)])
-    expect(personaCallCounts(h, p)).toEqual({ statusCalls: expected.calls.statusCalls! })
+    expect(personaCallCounts(h, p)).toEqual(ownCalls)
     expect(getFailureCount(q)).toBe(0)
     expect(h.episodeNotices).toHaveLength(1)
     expect(deferred).toEqual([])
@@ -5652,15 +5735,16 @@ describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches 
 
   /**
    * Where P's own `status` answers UNUSABLE NAME: `liveReads` is how many of
-   * P's reads answer a live `working` row before it, and `tmuxGone` whether
-   * P's tmux session is gone (so the reconnect adapter sweeps once and
-   * escalates); `calls` is every stub call the run makes for P, by verb.
+   * P's reads answer a live `working` row before it, and `paneGone` whether
+   * the reconnect adapter's one `read-pane` of P's row answers GONE (so it
+   * sweeps once and escalates); `calls` is every stub call the run makes for
+   * P, by verb.
    */
-  const PROBES: Array<[string, { liveReads: number; tmuxGone: boolean; calls: Record<string, number> }]> = [
-    ['the first probe', { liveReads: 0, tmuxGone: false, calls: { statusCalls: 1 } }],
+  const PROBES: Array<[string, { liveReads: number; paneGone: boolean; calls: Record<string, number> }]> = [
+    ['the first probe', { liveReads: 0, paneGone: false, calls: { statusCalls: 1 } }],
     // The probe reads working (live, P not connected), the reconnect adapter
-    // reads working too, finds the tmux session gone and sweeps once.
-    ["b.d61's re-probe after an escalate-dead reconnect", { liveReads: 2, tmuxGone: true, calls: { statusCalls: 3, findMissingCalls: 1 } }],
+    // reads working too; its read-pane answers GONE and it sweeps once.
+    ["b.d61's re-probe after an escalate-dead reconnect", { liveReads: 2, paneGone: true, calls: { statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 } }],
   ]
 
   test.each(RESTART_ENTRIES.flatMap(([entry, run]) => PROBES.map(([probe, opts]) => [entry, probe, run, opts] as const)))(
@@ -5669,7 +5753,8 @@ describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches 
       const err = UNUSABLE_NAME_ROW.build()
       const rig = ownReadLatchHarness((read) => read < opts.liveReads ? cannedStatusResult({ state: 'working' }) : err)
       harness = rig.h
-      _setTmuxSessionProber(async (name) => !(opts.tmuxGone && name === personaTmuxSessionName(rig.p)))
+      // P's read-pane is the run's first: GONE, once; Q's launch reads the stub's default pane.
+      if (opts.paneGone) rig.h.script({ readPaneQueue: [cannedErr(errTmuxCaptureFailed())] })
 
       await expectLatchedThenOtherRelaunched(rig, run, {
         calls: opts.calls,

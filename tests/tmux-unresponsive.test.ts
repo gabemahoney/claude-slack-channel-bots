@@ -13,16 +13,22 @@
  *
  * - What starts it: each UNAVAILABLE form but `ErrTmuxKillFailed` at one of
  *   the tmux-touching calls the launch ladder makes, every such call met by
- *   at least one form, inside the launch, and a wrapped `read-pane` inside a
- *   recovery attempt; nothing else (the kill-failure cause, read and sweep
+ *   at least one form, inside the launch; each such form at the restart
+ *   run's one `read-pane` of a live `working` or `waiting` row (b.jg5
+ *   SRJ-603, SRJ-604), inside its recovery attempt, with nothing counted; and
+ *   a wrapped `read-pane` inside a recovery attempt; nothing else (the
+ *   kill-failure cause, read and sweep
  *   errors inside an attempt, kills not of a row read live, calls outside
  *   every attempt, the dialog approver's `status`, `read-pane` and
  *   `send-keys` among them: it runs after its launch call returned).
  * - Held apart from the outages: no flag raised or cleared, no onset or
  *   all-clear, and an outage's own all-clear neither held back nor joined.
- * - What ends it: a tmux-touching success or GONE, in any context, and the
- *   tick's end; a read's success does not. Ends are idempotent, and each end
- *   of a holding condition reaches the retry timer's condition-end entry once.
+ * - What ends it: a tmux-touching success or GONE, in any context (a later
+ *   restart run's `read-pane` of a live `working` or `waiting` row answering
+ *   a pane or GONE among them, with the recovery post only after an onset),
+ *   and the tick's end; a read's success does not. Ends are idempotent, and
+ *   each end of a holding condition reaches the retry timer's condition-end
+ *   entry once.
  * - Isolation: the other persona's condition, ends and notices are untouched.
  * - A lost message (SRJ-1011), through the harness's lost-message driver (the
  *   real routing bound as `main()` binds it): while P's condition holds it
@@ -89,9 +95,10 @@
  * `ALL_CLEAR_TEMPLATE`).
  *
  * No retry timer is real: the clock is the harness's fake clock, and the
- * only real-time waits are the spawn path's bounded 1 ms polls and, in the
- * `armMissingRetryTimer` case, one real health tick's interval (`healthTick`,
- * bounded; the tick's start is read from the fake clock).
+ * only real-time waits are the spawn path's bounded 1 ms polls. The
+ * `armMissingRetryTimer` case runs one health tick body through the health
+ * check's tick seam (`healthTick`), with no interval; the tick's start is
+ * read from the fake clock.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -107,7 +114,7 @@ import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_
 import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
-import { _resetHealthCheckState, initHealthCheck, startHealthCheck, stopHealthCheck, type HealthCheckDeps } from '../src/health-check.ts'
+import { _resetHealthCheckState, _runHealthCheckTickForTest, initHealthCheck, type HealthCheckDeps } from '../src/health-check.ts'
 import { LIVENESS_LIVE, LIVENESS_READING_DEAD, LIVENESS_READING_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
 import {
   ALL_CLEAR_TEMPLATE,
@@ -169,6 +176,8 @@ import type { AdConfigTables } from './test-helpers/ad-settings.ts'
 import { APPROVER_VERB_CALLS, conflictForPersona, conflictNoticeForPersona } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import {
+  callCounts,
+  callCountsSince,
   collided,
   conditionAlertLine,
   conditionEndedLine,
@@ -275,7 +284,10 @@ const TMUX_STARTING_FORMS = unavailableForms(
 /**
  * A tmux-touching call the launch ladder makes, and the stub answers that make
  * it meet `err`. The dialog approver's calls are not here: they come after the
- * launch call returned, outside every attempt (b.jg5 SRJ-401, SRJ-307).
+ * launch call returned, outside every attempt (b.jg5 SRJ-401, SRJ-307). The
+ * restart run's pane reads, its one `read-pane` of a live `working` or
+ * `waiting` row (b.jg5 SRJ-603, SRJ-604), have their own rows below
+ * (`restartRunPaneReads`), each run inside its recovery attempt.
  */
 interface TmuxSite {
   readonly name: string
@@ -296,6 +308,19 @@ const TMUX_SITES: readonly TmuxSite[] = [
     script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home, state: 'waiting' }), killError: err }),
   },
 ]
+
+/** The live rows whose pane the restart run reads with one `read-pane` before any reconnect (b.jg5 SRJ-603, SRJ-604). */
+const RESTART_RUN_ROWS = ['working', 'waiting'] as const
+
+/**
+ * One restart run's calls on P's live `row` (not connected) whose `read-pane`
+ * is refused: the liveness read and the reconnect adapter's state read, the
+ * one `read-pane`, and on a `waiting` row the reconnect's `send-keys`, which
+ * the refused read lets go ahead. No tmux probe, kill or spawn.
+ */
+function restartRunPaneReadCalls(row: (typeof RESTART_RUN_ROWS)[number]): Record<string, number> {
+  return { statusCalls: 2, readPaneCalls: 1, ...(row === 'waiting' ? { sendKeysCalls: 1 } : {}) }
+}
 
 describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
   // Every form at one site and every site with at least one form: the shorter
@@ -323,6 +348,43 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expect(h.clock.now()).toBeGreaterThan(firstAt)
     expectHolds(h, p, site.verb, firstAt)
     expect(h.conditionEnds).toEqual([])
+    expectNeverStarted(h, b)
+    expectNoPostYet(h)
+  })
+
+  // The restart run (the harness's default retry action) reads a live
+  // `working` or `waiting` row's pane with one `read-pane` (b.jg5 SRJ-603,
+  // SRJ-604) inside its recovery attempt. A `waiting` row's refused read lets
+  // the reconnect go ahead, so its `send-keys` is refused too here: a
+  // `send-keys` that succeeded would end the condition in the same run.
+  const restartRunPaneReads = RESTART_RUN_ROWS.flatMap((row) =>
+    TMUX_STARTING_FORMS.map(([what, make]) => [what, row, make] as const),
+  )
+
+  test.each(restartRunPaneReads)('%s answering the restart run’s read-pane of P’s live %s row starts P’s condition at the first refusal’s time; a second run’s refusal keeps it; B’s never starts; nothing is counted', async (_what, row, make) => {
+    const { h, p, b } = build()
+    h.script({
+      statusResult: cannedStatusResult({ state: row }),
+      readPaneError: make('read-pane'),
+      ...(row === 'waiting' ? { sendKeysError: make('send-keys') } : {}),
+    })
+    h.controller.arm(p, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+
+    const firstAt = await retryNow(h, p)
+
+    expectHolds(h, p, 'read-pane', firstAt)
+    expect(callCounts(h)).toEqual(restartRunPaneReadCalls(row))
+    expect(h.controller.isArmed(p)).toBe(true)
+
+    const before = callCounts(h)
+    const secondAt = await retryNow(h, p)
+
+    expect(secondAt).toBeGreaterThan(firstAt)
+    expect(callCountsSince(callCounts(h), before)).toEqual(restartRunPaneReadCalls(row))
+    expectHolds(h, p, 'read-pane', firstAt)
+    expect(h.conditionEnds).toEqual([])
+    expect(h.triggers.filter((t) => t.key !== p)).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
     expectNeverStarted(h, b)
     expectNoPostYet(h)
   })
@@ -718,6 +780,66 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
     expect(conditionEndedLines(h, p)).toHaveLength(1)
     expectNeverStarted(h, b)
     expectNoPostYet(h)
+  })
+
+  // The restart run's `read-pane` of a live `working` or `waiting` row
+  // (b.jg5 SRJ-603, SRJ-604) is tmux-touching: a pane or GONE ends the
+  // condition its earlier refusal started, while the run is in progress (the
+  // end is deferred to the run's end). With both settings 0 the onset comes
+  // only at a retry past the floor, and the end posts the recovery only after
+  // it (no alert check here, so the onset is the only notice). A pane on a
+  // `waiting` row lets the reconnect go ahead; GONE types nothing and sweeps,
+  // and the re-probe reads the row live again.
+  const restartRunEnds = RESTART_RUN_ROWS.flatMap((row) =>
+    ([
+      ['a pane', { readPaneResults: [{ pane: '' }] }, { statusCalls: 2, readPaneCalls: 1, ...(row === 'waiting' ? { sendKeysCalls: 1 } : {}) }],
+      ['GONE (ErrTmuxCaptureFailed)', { readPaneError: errTmuxCaptureFailed() }, { statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 }],
+    ] satisfies Array<[string, RecoveryStubScript, Record<string, number>]>).flatMap(([what, answer, calls]) => [
+      [what, row, 'before any onset', answer, calls, false],
+      [what, row, 'after its onset', answer, calls, true],
+    ] as const),
+  )
+
+  test.each(restartRunEnds)('%s answering a later restart run’s read-pane of P’s live %s row, %s, ends P’s condition once, with the recovery post only after an onset; nothing is counted; B’s never starts', async (_what, row, _when, answer, calls, withOnset) => {
+    const { h, p, b } = build({ alertThresholdMs: false })
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    h.script({
+      statusResult: cannedStatusResult({ state: row }),
+      readPaneError: errTmuxUnresponsive('read-pane'),
+      ...(row === 'waiting' ? { sendKeysError: errTmuxUnresponsive('send-keys') } : {}),
+    })
+    h.controller.arm(p, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+    const at = await retryNow(h, p)
+    expectHolds(h, p, 'read-pane', at)
+
+    const lines: string[] = []
+    if (withOnset) {
+      let firedAt = at
+      while (firedAt - at < FLOOR_MS) firedAt = await retryNow(h, p)
+      expectPosts(h, [onset(p)])
+      lines.push(conditionOnsetLine(p, 'a retry', firedAt - at))
+    }
+    expect(noticeAndEndLines(h, p)).toEqual(lines)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+    h.script({ readPaneError: undefined, sendKeysError: undefined, ...answer })
+    const before = callCounts(h)
+
+    await retryNow(h, p)
+
+    expect(callCountsSince(callCounts(h), before)).toEqual(calls)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(h.tmuxUnresponsive.firstRefusalAt(p)).toBeUndefined()
+    expect(conditionStartedLines(h, p)).toHaveLength(1)
+    expect(conditionEndedLines(h, p)).toEqual([conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TMUX_VERB)])
+    expect(h.conditionEnds).toEqual([{ key: p, reading: undefined, result: 'deferred' }])
+    expect(noticeAndEndLines(h, p)).toEqual([
+      ...lines,
+      conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TMUX_VERB),
+      ...(withOnset ? [conditionRecoveryLine(p)] : []),
+    ])
+    expectPosts(h, withOnset ? [onset(p), recovery(p)] : [])
+    expect(getFailureCount(p)).toBe(0)
+    expectNeverStarted(h, b)
   })
 
   test('ends are idempotent: a second end, by any reason, does nothing', async () => {
@@ -1491,25 +1613,25 @@ async function raiseTmuxUnavailable(key: string): Promise<void> {
 }
 
 /**
- * One real health tick (`startHealthCheck`, `src/health-check.ts`) over
- * persona `key` alone, which it reads `dead`, with the deps the cases need
- * bound as `main()` binds them: the retry deps over the harness's controller
- * (`isRetryArmed` is its `isArmed`; `armRetryTimer` arms it with
+ * One health tick body (`src/health-check.ts`, run once through its tick seam
+ * `_runHealthCheckTickForTest`, with no interval) over persona `key` alone,
+ * which it reads `dead`, with the deps the cases need bound as `main()` binds
+ * them: the retry deps over the harness's controller (`isRetryArmed` is its
+ * `isArmed`; `armRetryTimer` arms it with
  * `UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT`), so a persona held off on its raised
  * `tmux-unavailable` outage with no timer armed gets one
  * (`armMissingRetryTimer`); the restart cap over `isAtCap`; the tick-end hook
  * the condition's onset check (`tickOnset`); and the tick's start read from
- * the harness clock. The interval is real, so the wait for the one tick body
- * is bounded, and every later firing is skipped as shutting down. Resolves
+ * the harness clock. Resolves, once the body and its tick-end hook have run,
  * with the keys the tick scheduled a restart for.
  */
 async function healthTick(h: RecoveryHarness, key: string): Promise<string[]> {
-  const ended = Promise.withResolvers<void>()
   const scheduled: string[] = []
   let bodies = 0
+  let hookEnds = 0
   const deps: HealthCheckDeps = {
     getPersonas: () => ({ [key]: personaOf(h, key).working_directory }),
-    isShuttingDown: () => bodies > 0,
+    isShuttingDown: () => false,
     now: () => {
       bodies++
       return h.clock.now()
@@ -1528,20 +1650,17 @@ async function healthTick(h: RecoveryHarness, key: string): Promise<string[]> {
     },
     onTickEnd: (tickStartedAt) => {
       h.tickOnset(tickStartedAt)
-      ended.resolve()
+      hookEnds++
     },
   }
   initHealthCheck(deps)
-  const bound = setTimeout(() => ended.reject(new Error('healthTick: no tick body ended within 1 s')), 1000)
   try {
-    startHealthCheck(0.001)
-    await ended.promise
+    await _runHealthCheckTickForTest()
   } finally {
-    clearTimeout(bound)
-    stopHealthCheck()
     _resetHealthCheckState()
   }
   expect(bodies).toBe(1)
+  expect(hookEnds).toBe(1)
   return scheduled
 }
 

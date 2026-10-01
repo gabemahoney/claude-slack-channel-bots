@@ -43,8 +43,9 @@
  *                                            unclassified sink (b.jg5 SRJ-313)
  *   - reportUnclassifiedAtSite(key, err, call, classification) — the site entry for an
  *                                            UNCLASSIFIED outcome a site classifies itself
- *                                            (the resume path's ErrInvalidFlags): arms with the
- *                                            UNCLASSIFIED cause and reports it, inside an attempt
+ *                                            (an ErrInvalidFlags at the resume path or the shared
+ *                                            pane reader): arms with the UNCLASSIFIED cause and
+ *                                            reports it, inside an attempt
  *   - _resetOutageState()                  — test-only state reset
  *
  * Template exports (used by tests):
@@ -688,9 +689,11 @@ export function reportAgentDirectorError(
 
 /**
  * reportUnclassifiedAtSite — the site entry for an UNCLASSIFIED outcome a
- * site classifies itself (b.jg5 SRJ-104, SRJ-313): the resume path's
- * `ErrInvalidFlags` once its immediate re-check answered UNCLASSIFIED without
- * stopping the server. `classification` is the step's answer. Inside a
+ * site classifies itself (b.jg5 SRJ-104, SRJ-313): an `ErrInvalidFlags` at
+ * the resume path or at the shared pane reader (`readPersonaOwnPane` in
+ * `src/session-manager.ts`, `call` `read-pane`), once its immediate re-check
+ * answered UNCLASSIFIED without stopping the server. `classification` is the
+ * step's answer. Inside a
  * launch or recovery attempt for `key` it arms the persona's retry timer
  * with the UNCLASSIFIED cause through the installed trigger sink (the
  * attempt records it as its last error, so a launch it ends is refused) and

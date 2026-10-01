@@ -16,8 +16,9 @@
  *
  * The users of {@link PaneReadOutcome} are the shared reader
  * `readPersonaOwnPane` in `src/session-manager.ts` and, through it, the
- * b.d61 working-row verdict (`checkWorkingRowPane`), the b.f2b waiting-row
- * check (`checkWaitingRowPane`) and the launch wait's evidence read
+ * b.d61 working-row verdict (`workingReconnectVerdict` in `src/server.ts`,
+ * whose pane `checkWorkingRowPane` folds), the b.f2b waiting-row check
+ * (`checkWaitingRowPane`) and the launch wait's evidence read
  * (`staleWorkingRowIsIdle`). b.jg5 SRJ-117 holds the full table of sites
  * that read a persona's pane and how each handles each outcome. The dialog
  * approver (`approvePreSessionDialogs`) keeps its own classification and
@@ -54,8 +55,12 @@
  * Each failure outcome carries the classifier's class and the redacted
  * one-line description `describeAgentDirectorFailure` renders (the safe
  * `errName`, then the description through `redactSlackLogText`, on one line,
- * capped). The module is pure: no agent-director call, no latch, no module
- * state, no log line. Never throws.
+ * capped); {@link paneReadClassNote} renders the class for the end of a
+ * site's log line. An UNCLASSIFIED outcome the shared reader answers for an
+ * `ErrInvalidFlags` whose version re-check decided that the server stops
+ * carries the stop mark `stopping: true` ({@link PaneReadUnclassified}).
+ * The module is pure: no agent-director call, no latch, no module state, no
+ * log line. Never throws.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -139,9 +144,24 @@ interface PaneReadFailureFields {
   readonly description: string
 }
 
-/** A failure whose thrown value the caller does not need. */
+/** A failure whose thrown value the caller does not need, UNCLASSIFIED aside. */
 export interface PaneReadPlainFailure extends PaneReadFailureFields {
-  readonly kind: Exclude<PaneReadFailureKind, typeof PANE_READ_CONFLICT | typeof PANE_READ_UNUSABLE_NAME>
+  readonly kind: Exclude<
+    PaneReadFailureKind,
+    typeof PANE_READ_CONFLICT | typeof PANE_READ_UNUSABLE_NAME | typeof PANE_READ_UNCLASSIFIED
+  >
+}
+
+/**
+ * An UNCLASSIFIED answer. `stopping` marks one whose `ErrInvalidFlags`
+ * version re-check decided that the server stops (b.jg5 SRJ-204, SRJ-205):
+ * only the shared reader `readPersonaOwnPane` sets it, never
+ * {@link paneReadFailureOf}. A caller given a marked outcome types nothing
+ * and calls nothing more for the persona.
+ */
+export interface PaneReadUnclassified extends PaneReadFailureFields {
+  readonly kind: typeof PANE_READ_UNCLASSIFIED
+  readonly stopping?: true
 }
 
 /** A CONFLICT, the thrown value kept so the caller can latch through the latch's CONFLICT entry. */
@@ -157,7 +177,7 @@ export interface PaneReadUnusableName extends PaneReadFailureFields {
 }
 
 /** What {@link paneReadFailureOf} answers: exactly one failure outcome. */
-export type PaneReadFailure = PaneReadPlainFailure | PaneReadConflict | PaneReadUnusableName
+export type PaneReadFailure = PaneReadPlainFailure | PaneReadUnclassified | PaneReadConflict | PaneReadUnusableName
 
 /**
  * The persona is latched (b.jg5 SRJ-502): `cause` is the CONFLICT or
@@ -213,4 +233,12 @@ export function paneReadFailureOf(value: unknown): PaneReadFailure {
 /** True when `outcome` is a failure (neither a pane nor latched). */
 export function isPaneReadFailure(outcome: PaneReadOutcome): outcome is PaneReadFailure {
   return outcome.kind !== PANE_READ_PANE && outcome.kind !== PANE_READ_LATCHED
+}
+
+/**
+ * A failed pane read's class for the end of a log line (the description is
+ * rendered where the line names the failure): `read-pane class=<class>`.
+ */
+export function paneReadClassNote(failure: PaneReadFailure): string {
+  return `read-pane class=${failure.errorClass}`
 }
