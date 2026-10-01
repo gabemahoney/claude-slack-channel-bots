@@ -187,6 +187,28 @@
  * with P already latched on either hold it reports `held-for-human` with no
  * read; Q reports its own state.
  *
+ * The dialog approver's latches (SRJ-404, SRJ-501, SRJ-502, SRJ-512, SRJ-513;
+ * SRJ-117 and SRJ-118's approver rows), on `makeRecoveryHarness` with both
+ * settings 0, P's and Q's rows read `pending` with a launch start and every
+ * pane showing the folder-trust dialog. Its own answer, per approver row of
+ * the helper's tables (`APPROVER_CONFLICT_CASE_ROWS`: each CONFLICT its
+ * `read-pane` and `send-keys` can meet, recording P's next check or recovery
+ * and `pending`; `APPROVER_UNUSABLE_NAME_CASE_ROWS`: UNUSABLE NAME at its
+ * `status`, `read-pane` and `send-keys`, refused operation none): the
+ * approver stops `latched` with its lap's calls up to the refused one and
+ * none after, P latches once through the latch's set entry (the set, the
+ * three holds, one post), nothing is armed, counted or noticed, and Q's
+ * approver presses Enter on its own dialog and runs on to its cap; then every
+ * automated path (`driveEveryPath`) makes no call for P, tmux-touching or
+ * raw, with still one post, while Q's paths reach the stub as before. A latch
+ * from another path (an own-row `get` of a `provenance_conflict` note, an
+ * own-row `status` of a `pending` row with no launch start, a CONFLICT at a
+ * new launch's plain spawn), set while P's approver sleeps between laps or
+ * while its `read-pane` showing the dialog is awaited: the approver stops
+ * `latched` before the clock moves (its cap is past the laps driven), no
+ * Enter reaches P after the latch and no call follows over three more laps,
+ * with one post; Q, unlatched, presses Enter at each of its laps.
+ *
  * Pure module under test, except the recovery-harness cases: one
  * `createConflictLatch` per test over a line capture and a recording
  * observer; `afterEach` runs `assertNoLeak` over every line, event and record
@@ -277,6 +299,7 @@ import {
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
   REFUSED_OPERATION_BRING_UP,
+  REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
   REFUSED_OPERATION_NONE,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
@@ -347,6 +370,10 @@ import {
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
 import { decideOwnRowRead, ROW_READ_LAUNCH_START_NOT_RECORDED, ROW_READ_NO_DECISION, type RowReadRow } from '../src/row-read-rules.ts'
 import {
+  APPROVER_STOP_CAP,
+  APPROVER_STOP_LATCHED,
+  DIALOG_POLL_INTERVAL_MS,
+  TRUST_DIALOG_NEEDLE,
   _resetNotConnectedEpisodes,
   _resetTmuxCommandRunner,
   _resetTmuxSessionProber,
@@ -361,6 +388,7 @@ import {
   readPersonaOwnRow,
   readPersonaOwnRowStatus,
   setSessionNotifier,
+  type ApproverVerb,
   type NotConnectedNotice,
   type OwnRowReadSite,
 } from '../src/session-manager.ts'
@@ -398,6 +426,9 @@ import {
   type UnusableNameFault,
 } from './test-helpers/agent-director-stub.ts'
 import {
+  APPROVER_CONFLICT_CASE_ROWS,
+  APPROVER_SITES,
+  APPROVER_UNUSABLE_NAME_CASE_ROWS,
   CONFLICT_CASE_ROWS,
   LAUNCH_START_ABSENT_PERSONA_KEY,
   LAUNCH_START_AND_NOTE_ROW,
@@ -409,6 +440,7 @@ import {
   cscbOwnLines,
   cscbOwnText,
   expectedConflictNotice,
+  isApproverSite,
   launchStartRecord,
   sessionEndingCommandsIn,
   tmuxTouchingCallCounts,
@@ -446,6 +478,7 @@ import {
   unclassifiedLines,
   unclassifiedStartedLine,
   type RecoveryHarness,
+  type RecoveryHarnessOptions,
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
 
@@ -1738,6 +1771,14 @@ interface AutomatedPathsRun {
   readonly readWorking: (key: string) => void
   /** Persona `key`'s row reads `pending` with no launch start from now on, whatever its spawns answer (b.jg5 SRJ-513). */
   readonly readPendingNoLaunchStart: (key: string) => void
+  /**
+   * Persona `key`'s row reads `pending` with the stub's launch start while
+   * `pending` is true (the default), whatever its spawns answer; false puts
+   * back the reads above.
+   */
+  readonly readPending: (key: string, pending?: boolean) => void
+  /** Persona `key`'s `status` answers `err` from now on. */
+  readonly failStatus: (key: string, err: Error) => void
 }
 
 /**
@@ -1746,8 +1787,9 @@ interface AutomatedPathsRun {
  * module's serialized turns recorded. The restart module's delay accessor
  * answers `RESTART_DELAY_S`, so `scheduleRestart` arms its timer (with the
  * setting 0 it arms none); the configuration keeps `session_restart_delay` 0.
+ * `options` go to the harness (the approver's cap, for instance).
  */
-function makeAutomatedPathsRun(): AutomatedPathsRun {
+function makeAutomatedPathsRun(options: Omit<RecoveryHarnessOptions, 'restartDeps'> = {}): AutomatedPathsRun {
   const outcomes: Array<readonly [string, unknown]> = []
   let serializer: PersonaSerializer | undefined
   const serialize: PersonaSerialize = (key, operation) =>
@@ -1756,12 +1798,14 @@ function makeAutomatedPathsRun(): AutomatedPathsRun {
       outcomes.push([key, outcome])
       return outcome
     })
-  const h = makeRecoveryHarness({ restartDeps: { getRestartDelay: () => RESTART_DELAY_S, serialize } })
+  const h = makeRecoveryHarness({ ...options, restartDeps: { getRestartDelay: () => RESTART_DELAY_S, serialize } })
   harnesses.push(h)
   serializer = h.serializer
   const live = new Set<string>()
   const working = new Set<string>()
   const noLaunchStart = new Set<string>()
+  const pending = new Set<string>()
+  const statusErrors = new Map<string, Error>()
   const spawn = h.stub.client.spawn.bind(h.stub.client)
   h.stub.client.spawn = async (params) => {
     const result = await spawn(params)
@@ -1771,7 +1815,10 @@ function makeAutomatedPathsRun(): AutomatedPathsRun {
   h.script({
     statusFn: (params) => {
       const id = String(params.claude_instance_id)
+      const err = statusErrors.get(id)
+      if (err !== undefined) return err
       if (noLaunchStart.has(id)) return cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })
+      if (pending.has(id)) return cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE })
       return cannedStatusResult({ state: working.has(id) ? 'working' : live.has(id) ? 'waiting' : 'ended' })
     },
   })
@@ -1781,6 +1828,11 @@ function makeAutomatedPathsRun(): AutomatedPathsRun {
     killRow: (key) => live.delete(personaInstanceId(key)),
     readWorking: (key) => working.add(personaInstanceId(key)),
     readPendingNoLaunchStart: (key) => noLaunchStart.add(personaInstanceId(key)),
+    readPending: (key, isPending = true) => {
+      if (isPending) pending.add(personaInstanceId(key))
+      else pending.delete(personaInstanceId(key))
+    },
+    failStatus: (key, err) => statusErrors.set(personaInstanceId(key), err),
   }
 }
 
@@ -3154,5 +3206,236 @@ describe('SRJ-513, SRJ-1011: a message lost for P whose row reads pending with n
 
     await expectLostMessageReports(h, q, 'auto-restart-disabled')
     expect(h.latch.isLatched(q)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The dialog approver's latches (b.jg5 SRJ-404, SRJ-501, SRJ-502, SRJ-512,
+// SRJ-513; SRJ-117 and SRJ-118's approver rows), on the recovery harness
+// ---------------------------------------------------------------------------
+
+/** The approver verb of one of its site kinds; throws for any other site, so a case never runs on a wrong row. */
+function approverVerbOf(site: string): ApproverVerb {
+  if (!isApproverSite(site)) throw new Error(`not an approver site: ${site}`)
+  return site.slice('approver '.length) as ApproverVerb
+}
+
+/** The stub call list each approver verb is counted in, in lap order. */
+const APPROVER_VERB_CALLS: Readonly<Record<ApproverVerb, string>> = { 'status': 'statusCalls', 'read-pane': 'readPaneCalls', 'send-keys': 'sendKeysCalls' }
+
+/** The calls one approver lap makes up to and including its call at `verb`, by verb (one each). */
+function lapCallsThrough(verb: ApproverVerb): Record<string, number> {
+  const verbs = APPROVER_SITES.map(approverVerbOf)
+  return Object.fromEntries(verbs.slice(0, verbs.indexOf(verb) + 1).map((v) => [APPROVER_VERB_CALLS[v], 1]))
+}
+
+/** One answer to the approver that latches P: the verb that meets it, the answer, and what the latch holds and posts for persona `key`. */
+interface ApproverLatchCase {
+  readonly verb: ApproverVerb
+  readonly build: () => Error
+  readonly record: (key: string) => Partial<ConflictLatchRecord>
+  readonly notice: (key: string) => string
+}
+
+/**
+ * Every approver row of the helper's tables: each CONFLICT its `read-pane`
+ * and `send-keys` can meet on a `pending` row records P's next check or
+ * recovery and `pending` (b.jg5 SRJ-501, typed here from the SRD, not read
+ * from the row); each UNUSABLE NAME at its `status`, `read-pane` and
+ * `send-keys` holds the row's whole record (refused operation none).
+ */
+const APPROVER_LATCH_CASES: ReadonlyArray<readonly [string, ApproverLatchCase]> = [
+  ...APPROVER_CONFLICT_CASE_ROWS.map((row): readonly [string, ApproverLatchCase] => [
+    `CONFLICT at ${row.name}`,
+    {
+      verb: approverVerbOf(row.site),
+      build: row.build,
+      record: () => ({
+        sessionName: row.sessionName,
+        latchCase: row.latchCase,
+        refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+        rowState: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
+      }),
+      notice: () => row.notice.text,
+    },
+  ]),
+  ...APPROVER_UNUSABLE_NAME_CASE_ROWS.map((row): readonly [string, ApproverLatchCase] => [
+    `UNUSABLE NAME at ${row.name}`,
+    { verb: approverVerbOf(row.site), build: row.build, record: row.record, notice: row.notice },
+  ]),
+]
+
+/**
+ * Every pane shows the folder-trust dialog, and persona `key`'s approver
+ * call at `verb` answers `err`: its `status` through the run's row reads, a
+ * pane verb by wrapping the stub client's verb, which records the call
+ * before it answers.
+ */
+function approverMeets(run: AutomatedPathsRun, key: string, verb: ApproverVerb, err: Error): void {
+  const { h } = run
+  h.script({ readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }] })
+  const id = personaInstanceId(key)
+  const client = h.stub.client
+  if (verb === 'status') {
+    run.failStatus(key, err)
+  } else if (verb === 'read-pane') {
+    const readPane = client.readPane.bind(client)
+    client.readPane = async (params) => {
+      const result = await readPane(params)
+      if (params.claude_instance_id === id) throw err
+      return result
+    }
+  } else {
+    const sendKeys = client.sendKeys.bind(client)
+    client.sendKeys = async (params) => {
+      const result = await sendKeys(params)
+      if (params.claude_instance_id === id) throw err
+      return result
+    }
+  }
+}
+
+/** The calls of persona `key`'s instance in one stub call list. */
+const callsOf = (calls: readonly unknown[], key: string): unknown[] => calls.filter((params) => instanceOf(params) === personaInstanceId(key))
+
+/** The approver's cap in the cases where P latches from another path: past the laps the case drives, so only a stop ends P's approver. */
+const OTHER_PATH_CAP_MS = 10 * DIALOG_POLL_INTERVAL_MS
+
+/** The reading site the other paths' own-row reads name. */
+const OTHER_PATH_SITE: OwnRowReadSite = { site: 'conflict-latch.test', what: 'another path\'s own-row read' }
+
+/** A plain spawn's CONFLICT whose row state comes from the latch-time `status` read. */
+const LADDER_SPAWN_ROW = rowWhere(
+  (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.latchCase === LATCH_CASE_LEFTOVER && row.rowState !== LATCH_ROW_STATE_NO_ROW,
+)
+
+/** Each other path that latches P while its approver runs, and the case it records. */
+const OTHER_LATCH_PATHS: ReadonlyArray<readonly [string, (run: AutomatedPathsRun, p: string) => Promise<void>, LatchCase]> = [
+  [
+    'an own-row get read of a provenance_conflict note',
+    async ({ h }, p) => {
+      h.script({ getResult: cannedGetResult({ state: AGENT_DIRECTOR_PENDING_STATE, liveness_note: provenanceNote }, personaOf(h, p), h.home) })
+      expect(await readPersonaOwnRow(p, OTHER_PATH_SITE)).toMatchObject({ latched: true })
+    },
+    LATCH_CASE_CONFLICTING_LABELS,
+  ],
+  [
+    'an own-row status read of its pending row with no launch start',
+    async (run, p) => {
+      run.readPendingNoLaunchStart(p)
+      expect(await readPersonaOwnRowStatus(p, OTHER_PATH_SITE)).toMatchObject({ kind: OWN_ROW_STATUS_LATCHED })
+    },
+    LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+  ],
+  [
+    'a CONFLICT at a new launch\'s plain spawn',
+    async ({ h }, p) => {
+      h.script({ spawnError: LADDER_SPAWN_ROW.build() })
+      expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    },
+    LADDER_SPAWN_ROW.latchCase,
+  ],
+]
+
+/** When the other path latches P: while its approver sleeps between laps, or while its first `read-pane` (showing the dialog) is awaited. */
+const LATCH_TIMES = ['between its laps', 'while its read-pane is awaited'] as const
+
+describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latches P once, and a latch from any path stops it (recovery harness; SRJ-404, SRJ-501, SRJ-502, SRJ-512, SRJ-513)', () => {
+  test.each(APPROVER_LATCH_CASES)('%s: P latches once with its record and one post, its approver stops latched with nothing typed after it, and no automated path calls P while it is latched; Q\'s approver clears its own dialog', async (_name, c) => {
+    const run = makeAutomatedPathsRun()
+    const { h } = run
+    const [p, q] = h.keys as [string, string]
+    const raw = recordRawTmux()
+    run.readPending(p)
+    run.readPending(q)
+    approverMeets(run, p, c.verb, c.build())
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
+    expect(await h.launch(q)).toEqual({ key: q, action: 'spawned' })
+    await h.settle()
+
+    // P: its lap's calls up to the refused one and none after; one latch through the latch's set entry, one post; nothing armed, counted or noticed.
+    expect((await h.runApproverToStop(p))?.reason).toBe(APPROVER_STOP_LATCHED)
+    expect(personaCallCounts(h, p)).toEqual({ spawnCalls: 1, ...lapCallsThrough(c.verb) })
+    expect(h.latch.record(p)).toMatchObject(c.record(p))
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices).toEqual([{ key: p, text: c.notice(p) }])
+    expect([h.triggers, h.controller.armedKeys(), getFailureCount(p), h.notices]).toEqual([[], [], 0, []])
+
+    // Q, beside it: its approver pressed Enter on its dialog and ran on until its cap; Q is not latched.
+    expect(personaCallCounts(h, q)).toEqual({ spawnCalls: 1, ...lapCallsThrough('send-keys') })
+    expect(h.approverRunning(q)).toBe(true)
+    expect((await h.runApproverToStop(q))?.reason).toBe(APPROVER_STOP_CAP)
+    expect(h.latch.isLatched(q)).toBe(false)
+
+    // While P is latched no automated path calls it, tmux-touching or not; Q's paths reach the stub as before.
+    run.readPending(q, false)
+    const pAtLatch = personaCallCounts(h, p)
+    const touchingAtLatch = tmuxTouchingCallCounts(h.stub.calls)
+    const { launched, qCalls, attemptsBefore } = await driveEveryPath(run)
+    expect(callCountsSince(personaCallCounts(h, p), pAtLatch)).toEqual({})
+    expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
+    expect(raw.filter((call) => call.target.includes(personaTmuxSessionName(p)))).toEqual([])
+    expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
+    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual([[p, 1], [q, 1], [q, 2]])
+    expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH])
+    // Still the one latch and the one post.
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices).toEqual([{ key: p, text: c.notice(p) }])
+    expect([getFailureCount(p), h.clock.pendingCount()]).toEqual([0, 0])
+  })
+
+  test.each(OTHER_LATCH_PATHS.flatMap(([name, latchP, latchCase]) => LATCH_TIMES.map((when) => [name, when, latchP, latchCase] as const)))('P latched by %s %s: its running approver stops latched and makes no further call, so no Enter reaches P after the latch; one post; Q\'s approver runs on and keeps clearing its dialog', async (_name, when, latchP, latchCase) => {
+    const run = makeAutomatedPathsRun({ approverCapMs: OTHER_PATH_CAP_MS })
+    const { h } = run
+    const [p, q] = h.keys as [string, string]
+    run.readPending(p)
+    run.readPending(q)
+    h.script({ readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }] })
+    let pAtLatch: Record<string, number> | undefined
+    const latchNow = async (): Promise<void> => {
+      await latchP(run, p)
+      pAtLatch = personaCallCounts(h, p)
+    }
+    if (when === 'while its read-pane is awaited') {
+      // P's first pane read is made and shows the dialog; P latches before the approver gets its answer.
+      const client = h.stub.client
+      const readPane = client.readPane.bind(client)
+      client.readPane = async (params) => {
+        const result = await readPane(params)
+        if (params.claude_instance_id === personaInstanceId(p) && pAtLatch === undefined) await latchNow()
+        return result
+      }
+    }
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
+    expect(await h.launch(q)).toEqual({ key: q, action: 'spawned' })
+    await h.settle()
+    if (when === 'between its laps') {
+      // P's first lap pressed Enter, and its approver sleeps until its next lap.
+      expect(h.approverRunning(p)).toBe(true)
+      await latchNow()
+    }
+    await h.settle()
+
+    // Stopped by the latch, not by its cap: no longer running before the clock moves.
+    expect(h.approverRunning(p)).toBe(false)
+    expect((await h.runApproverToStop(p))?.reason).toBe(APPROVER_STOP_LATCHED)
+    expect(callsOf(h.stub.calls.sendKeysCalls, p)).toHaveLength(when === 'between its laps' ? 1 : 0)
+    expect(h.latch.record(p)?.latchCase).toBe(latchCase)
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
+
+    // Three laps of Q later: no call for P, and Q, unlatched, pressed Enter at each.
+    expect(h.approverRunning(q)).toBe(true)
+    const qEnters = callsOf(h.stub.calls.sendKeysCalls, q).length
+    await h.advance(3 * DIALOG_POLL_INTERVAL_MS)
+    expect(callCountsSince(personaCallCounts(h, p), pAtLatch!)).toEqual({})
+    expect(callsOf(h.stub.calls.sendKeysCalls, q)).toHaveLength(qEnters + 3)
+    expect([h.latch.isLatched(q), h.approverRunning(q)]).toEqual([false, true])
+    expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
+    expect((await h.runApproverToStop(q))?.reason).toBe(APPROVER_STOP_CAP)
+    expect(h.clock.pendingCount()).toBe(0)
   })
 })

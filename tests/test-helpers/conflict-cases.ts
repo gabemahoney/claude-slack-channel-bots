@@ -8,8 +8,13 @@
  * in at least one row.
  *
  * Columns filled here (E13, the latch record):
- *   - `name`: a readable row name, built from the operation, the stub's case
+ *   - `name`: a readable row name, built from the site kind, the stub's case
  *     identifier and the option set;
+ *   - `site`: the site kind that meets the refusal ({@link ConflictCaseSite}):
+ *     a plain spawn, a reuse spawn, a `resume`, a pane verb or a kill (named
+ *     by its verb), or one of the dialog approver's calls
+ *     ({@link ApproverSite}, `approver <verb>`; select those rows with
+ *     {@link isApproverSite} or take {@link APPROVER_CONFLICT_CASE_ROWS});
  *   - `verb`, `stubCase`, `options`, `sessionName`, and `build`, a thunk that
  *     builds the error through the stub's `errTmuxSessionConflict` with them;
  *   - `latchCase`: the case `src/conflict-latch.ts` recognises (SRJ-507);
@@ -35,6 +40,19 @@
  * are rows of the table (a `resume`'s unrecognised answer and a `kill`'s
  * never-reported-in answer); every `ConflictLatchCase` has at least one row.
  *
+ * The dialog approver's CONFLICT rows (E17; b.jg5 SRJ-117, SRJ-118, SRJ-404,
+ * SRJ-501), {@link APPROVER_CONFLICT_CASE_ROWS}: one row per stub CONFLICT
+ * case its `read-pane` and its `send-keys` can answer on a `pending` row (HO
+ * rev 27; agent-director's pane verbs): "the agent's pane was not found",
+ * with and without "the agent's pane was not adopted" (a lost create reply),
+ * and "conflicting labels" from both; "not this launch's session" from
+ * `read-pane` only (more than one leftover session), since `send-keys` on a
+ * `pending` row answers a leftover with `ErrSpawnNotInteractive`, not
+ * CONFLICT. Each records the refused operation "P's next check or recovery"
+ * and the state `pending`, which the lap's `status` read gave before the
+ * pane verb. The approver's `status` reads only the store and answers no
+ * CONFLICT, so it has no CONFLICT row.
+ *
  * Other exports (E13 T2):
  *   - {@link expectedConflictNotice}: the expected notice for any case,
  *     session and description (none: no description line), assembled from
@@ -59,22 +77,27 @@
  *     kept ({@link withoutInlineDescription}). {@link cscbOwnText} joins the
  *     lines back.
  *
- * Unusable-name rows (E16 T1, SRJ-512 and SRJ-1019), {@link UNUSABLE_NAME_CASE_ROWS}:
+ * Unusable-name rows (E16 T1 and E17, SRJ-512 and SRJ-1019), {@link UNUSABLE_NAME_CASE_ROWS}:
  * one row per fault in the stub's `UNUSABLE_NAME_FAULTS` for each verb site
- * kind T1 wires ({@link UNUSABLE_NAME_SITES}: `resume`, a plain spawn, the
- * ladder's kill, the ladder's delete, `read-pane`, `status`, `get`). Columns
- * ({@link UnusableNameCaseRow}):
+ * kind ({@link UNUSABLE_NAME_SITES}): those E16 T1 wires (`resume`, a plain
+ * spawn, the ladder's kill, the ladder's delete, `read-pane`, `status`,
+ * `get`), then the dialog approver's `status`, `read-pane` and `send-keys`
+ * (E17, {@link APPROVER_SITES}; {@link APPROVER_UNUSABLE_NAME_CASE_ROWS}).
+ * Columns ({@link UnusableNameCaseRow}):
  *   - `name` (`<site>: <fault>`), `site`, `verb` (the agent-director verb
  *     that answers), `fault`, and `build`, a thunk building the stub's
  *     `errUnusableName(fault)`;
  *   - `latchCase` and `refusedOperation`: "unusable recorded name" and
  *     "none" (`LATCH_CASE_UNUSABLE_RECORDED_NAME`, `REFUSED_OPERATION_NONE`);
  *   - `rowState`: the row state the path records. A `status` or a `get`
- *     that itself answers UNUSABLE NAME records unreadable. The others
- *     record the state the path last read: `ended` for `resume` and for the
- *     ladder's kill and delete (the finished-row path, a `resume` answering
- *     `ErrSpawnNotResumable` for the kill), `working` for `read-pane` (the
- *     launch wait's evidence read and `checkWorkingRowPane`). The plain spawn
+ *     that itself answers UNUSABLE NAME records unreadable, the approver's
+ *     `status` included (its read goes through the own-row `status` step).
+ *     The others record the state the path last read: `ended` for `resume`
+ *     and for the ladder's kill and delete (the finished-row path, a `resume`
+ *     answering `ErrSpawnNotResumable` for the kill), `working` for
+ *     `read-pane` (the launch wait's evidence read and
+ *     `checkWorkingRowPane`), `pending` for the approver's `read-pane` and
+ *     `send-keys` (the lap's `status` read before them). The plain spawn
  *     is the first spawn, which read nothing before it, so its state comes
  *     from the one latch-time `status` read (`latchTimeRead: true`); the row
  *     expects no row, so a case arranges that read to answer
@@ -92,8 +115,9 @@
  *     quoted session and the description), {@link expectedLatchRecord} of
  *     `src/conflict-latch.ts`'s `unusableNameSetInput(key, build(), rowState)`.
  *     Compare a latch's `record(key)` with it whole (`toEqual`).
- * The approver's and the reconnect's `send-keys` and a reuse spawn get no row
- * here (E17, E19, E22).
+ * The dialog approver's rows land here (E17); the reconnect's `send-keys`
+ * and a reuse spawn get none yet (E19, E22), and E30 adds the re-check
+ * columns.
  *
  * The expected latch records (SRJ-501), for any test that checks what a
  * hold-case latch holds (the server, restart, health-check, unavailable-retry
@@ -263,6 +287,7 @@ import {
 import { classifyAdError } from '../../src/ad-error-class.ts'
 import { renderLogMessageText } from '../../src/persona-connection-errors.ts'
 import { personaInstanceId, personaTmuxSessionName } from '../../src/persona-identity.ts'
+import type { ApproverVerb } from '../../src/session-manager.ts'
 import { escapeSlackControlCharacters } from '../../src/slack-text-escape.ts'
 import {
   SAMPLE_LAUNCH_START_NONE,
@@ -284,10 +309,44 @@ import {
   type UnusableNameFault,
 } from './agent-director-stub.ts'
 
+// ---------------------------------------------------------------------------
+// Site kinds
+// ---------------------------------------------------------------------------
+
+/** One of the dialog approver's calls as a site kind: `approver <verb>` (b.jg5 SRJ-117, SRJ-118, SRJ-402). */
+export type ApproverSite = `approver ${ApproverVerb}`
+
+/** The verb each approver site kind calls, in the order a lap calls them. */
+const APPROVER_SITE_VERB: Readonly<Record<ApproverSite, ApproverVerb>> = Object.freeze({
+  'approver status': 'status',
+  'approver read-pane': 'read-pane',
+  'approver send-keys': 'send-keys',
+})
+
+/** Every approver site kind, in lap order: `status`, `read-pane`, `send-keys`. */
+export const APPROVER_SITES: readonly ApproverSite[] = Object.freeze(Object.keys(APPROVER_SITE_VERB) as ApproverSite[])
+
+/** Whether `site` is one of the dialog approver's site kinds. */
+export function isApproverSite(site: string): site is ApproverSite {
+  return Object.hasOwn(APPROVER_SITE_VERB, site)
+}
+
+/** A pane verb or a kill whose CONFLICT refuses P's next check or recovery, as a site kind. */
+type PaneOrKillSite = 'kill' | 'read-pane' | 'send-keys' | 'pause'
+
+/**
+ * The site kind that meets a CONFLICT row's refusal: a plain spawn, a reuse
+ * spawn, a `resume`, a pane verb or a kill (by its verb), or one of the dialog
+ * approver's pane verbs.
+ */
+export type ConflictCaseSite = 'plain spawn' | 'reuse spawn' | 'resume' | PaneOrKillSite | ApproverSite
+
 /** One refusal and what latching a persona on it records. */
 export interface ConflictCaseRow {
-  /** Readable row name for `test.each`. */
+  /** Readable row name for `test.each`: `<site>: <stub case>`, with the option set. */
   readonly name: string
+  /** The site kind that meets the refusal. */
+  readonly site: ConflictCaseSite
   /** The verb the stub's error carries. */
   readonly verb: string
   /** The stub's case identifier. */
@@ -516,14 +575,8 @@ const WORKING = latchRowStateRead('working')
 const ASK_USER = latchRowStateRead('ask_user')
 const CHECK_PERMISSION = latchRowStateRead('check_permission')
 
-/** The readable label of each refused operation a row uses, for row names. */
-const OPERATION_LABEL: Readonly<Partial<Record<RefusedOperation, string>>> = {
-  [REFUSED_OPERATION_PLAIN_SPAWN]: 'plain spawn',
-  [REFUSED_OPERATION_REUSE_SPAWN]: 'reuse spawn',
-  [REFUSED_OPERATION_RESUME]: 'resume',
-}
-
 function row(
+  site: ConflictCaseSite,
   refusedOperation: RefusedOperation,
   verb: string,
   stubCase: ConflictCase,
@@ -532,11 +585,11 @@ function row(
   options: ConflictOptions = {},
 ): ConflictCaseRow {
   const variant = Object.keys(options).filter((key) => options[key as keyof ConflictOptions] === true)
-  const label = OPERATION_LABEL[refusedOperation] ?? verb
   const sessionName = STUB_TMUX_SESSION_NAME
   const build = () => errTmuxSessionConflict(verb, stubCase, sessionName, options)
   return Object.freeze({
-    name: `${label}: ${stubCase}${variant.length === 0 ? '' : ` (${variant.join(', ')})`}`,
+    name: `${site}: ${stubCase}${variant.length === 0 ? '' : ` (${variant.join(', ')})`}`,
+    site,
     verb,
     stubCase,
     options,
@@ -550,18 +603,29 @@ function row(
 }
 
 const plainSpawn = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState, o?: ConflictOptions): ConflictCaseRow =>
-  row(REFUSED_OPERATION_PLAIN_SPAWN, SPAWN_VERB, c, l, s, o)
+  row('plain spawn', REFUSED_OPERATION_PLAIN_SPAWN, SPAWN_VERB, c, l, s, o)
 const reuseSpawn = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState): ConflictCaseRow =>
-  row(REFUSED_OPERATION_REUSE_SPAWN, SPAWN_VERB, c, l, s)
+  row('reuse spawn', REFUSED_OPERATION_REUSE_SPAWN, SPAWN_VERB, c, l, s)
 const resume = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState): ConflictCaseRow =>
-  row(REFUSED_OPERATION_RESUME, 'resume', c, l, s)
+  row('resume', REFUSED_OPERATION_RESUME, 'resume', c, l, s)
 const paneOrKill = (
-  verb: string,
+  verb: PaneOrKillSite,
   c: ConflictCase,
   l: ConflictLatchCase,
   s: LatchRowState,
   o?: ConflictOptions,
-): ConflictCaseRow => row(REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, verb, c, l, s, o)
+): ConflictCaseRow => row(verb, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, verb, c, l, s, o)
+/**
+ * The dialog approver's CONFLICT from its pane verb `verb` (b.jg5 SRJ-501):
+ * P's next check or recovery, recorded `pending`, the state the lap's
+ * `status` read gave before the pane verb.
+ */
+const approverPane = (
+  verb: Exclude<ApproverVerb, 'status'>,
+  c: ConflictCase,
+  l: ConflictLatchCase,
+  o?: ConflictOptions,
+): ConflictCaseRow => row(`approver ${verb}`, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, verb, c, l, PENDING, o)
 
 /** Every CONFLICT latch row, for `test.each`. */
 export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
@@ -602,7 +666,23 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   paneOrKill('read-pane', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, PENDING),
   paneOrKill('kill', 'never-reported-in', LATCH_CASE_NEVER_REPORTED_IN, PENDING),
   paneOrKill('kill', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, WORKING),
+  // The dialog approver's pane verbs on a `pending` row (E17): P's next
+  // check or recovery, recorded `pending`. `send-keys` on a `pending` row
+  // answers a leftover with `ErrSpawnNotInteractive`, so only `read-pane`
+  // (more than one leftover) has a not-this-launch row.
+  approverPane('read-pane', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND),
+  approverPane('read-pane', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND, { notAdopted: true }),
+  approverPane('read-pane', 'not-this-launch', LATCH_CASE_NOT_THIS_LAUNCH),
+  approverPane('read-pane', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS),
+  approverPane('send-keys', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND),
+  approverPane('send-keys', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND, { notAdopted: true }),
+  approverPane('send-keys', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS),
 ])
+
+/** The dialog approver's CONFLICT rows of {@link CONFLICT_CASE_ROWS} (its `read-pane` and `send-keys`), for `test.each`. */
+export const APPROVER_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
+  CONFLICT_CASE_ROWS.filter((caseRow) => isApproverSite(caseRow.site)),
+)
 
 // ---------------------------------------------------------------------------
 // The expected latch record of a hold case (b.jg5 SRJ-501)
@@ -633,7 +713,7 @@ export function expectedLatchRecord(key: string, input: ConflictLatchSetInput): 
 // The unusable recorded name (b.jg5 SRJ-512, SRJ-1019)
 // ---------------------------------------------------------------------------
 
-/** A verb site kind E16 T1 wires for an UNUSABLE NAME answer. */
+/** A verb site kind wired for an UNUSABLE NAME answer: E16 T1's, then the dialog approver's (E17). */
 export type UnusableNameSite =
   | 'resume'
   | 'plain spawn'
@@ -642,6 +722,7 @@ export type UnusableNameSite =
   | 'read-pane'
   | 'status'
   | 'get'
+  | ApproverSite
 
 /** The agent-director verb each site kind calls. */
 const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Object.freeze({
@@ -652,6 +733,7 @@ const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Obje
   'read-pane': 'read-pane',
   'status': 'status',
   'get': 'get',
+  ...APPROVER_SITE_VERB,
 })
 
 /** Every site kind of {@link UnusableNameSite}, in row order. */
@@ -698,6 +780,11 @@ const UNUSABLE_NAME_LAST_READ: Readonly<Record<UnusableNameSite, LatchRowState>>
   'read-pane': WORKING,
   'status': LATCH_ROW_STATE_UNREADABLE,
   'get': LATCH_ROW_STATE_UNREADABLE,
+  // The approver's `status` goes through the own-row `status` step, which
+  // read no state; its pane verbs follow the lap's `pending` read.
+  'approver status': LATCH_ROW_STATE_UNREADABLE,
+  'approver read-pane': PENDING,
+  'approver send-keys': PENDING,
 })
 
 function unusableNameRow(site: UnusableNameSite, fault: UnusableNameFault): UnusableNameCaseRow {
@@ -730,6 +817,11 @@ function unusableNameRow(site: UnusableNameSite, fault: UnusableNameFault): Unus
 /** Every UNUSABLE NAME row: each fault of `UNUSABLE_NAME_FAULTS` at each site kind, for `test.each`. */
 export const UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_SITES.flatMap((site) => UNUSABLE_NAME_FAULTS.map((fault) => unusableNameRow(site, fault))),
+)
+
+/** The dialog approver's UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (its `status`, `read-pane` and `send-keys`), for `test.each`. */
+export const APPROVER_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
+  UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => isApproverSite(caseRow.site)),
 )
 
 // ---------------------------------------------------------------------------

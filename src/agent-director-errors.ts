@@ -152,6 +152,16 @@ export const ERR_STORE_OPEN_NAME = 'ErrStoreOpen'
 export const ERR_SPAWN_NOT_FOUND_NAME = 'ErrSpawnNotFound'
 
 /**
+ * `errName` of the error agent-director answers when a row is not interactive
+ * for the verb: a `send-keys` that reaches no session carrying this launch's
+ * label, or a `pending` row with no launch start (C5, C21). Every client
+ * declares its class; the name is kept here for the sites that tell it apart
+ * by name (`hasAdErrorName`), such as the dialog approver (b.jg5 SRJ-118,
+ * SRJ-404).
+ */
+export const ERR_SPAWN_NOT_INTERACTIVE_NAME = 'ErrSpawnNotInteractive'
+
+/**
  * `errName` of the error the client raises when its agent-director binary is
  * gone after the client was built (any verb; b.xht). Every client declares
  * its class; the name is kept here for the sites that tell it apart by name

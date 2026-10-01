@@ -98,7 +98,11 @@
  * persona's dialog approver after its launch call, outside the launch and
  * its attempt, in a registry holding at most one approver per persona
  * (`startDialogApprover`, b.jg5 SRJ-401); a teardown or shutdown stops it
- * (`stopDialogApprover`, `stopAllDialogApprovers`, SRJ-404). Every launch
+ * (`stopDialogApprover`, `stopAllDialogApprovers`, SRJ-404), and so does a
+ * latch of the persona set by any site (the set observer the latch installer
+ * registers, `setConflictLatch`, SRJ-502). The approver paces its laps
+ * (SRJ-403), stops at B from the launch start with no post (SRJ-404,
+ * SRJ-405) and classifies every answer by class (SRJ-117, SRJ-118). Every launch
  * first resolves the persona's claude_config_dir to a real path with no
  * lexical fallback (bug b.g57,
  * `checkLaunchConfigDir`); when it cannot be resolved the launch makes no
@@ -201,6 +205,7 @@ import {
   ErrSpawnCapReached,
   ErrSpawnNotInteractive,
   ERR_SPAWN_NOT_FOUND_NAME,
+  ERR_SPAWN_NOT_INTERACTIVE_NAME,
   ERR_SYSTEM_INSTALL_DISAPPEARED_NAME,
 } from './agent-director-errors.ts'
 import {
@@ -208,6 +213,9 @@ import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
   AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_GONE,
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
   adKillCall,
   type AdKillCall,
   type AdVerb,
@@ -226,6 +234,7 @@ import {
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
+  REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
   describeLatchRowState,
@@ -235,6 +244,7 @@ import {
   unusableNameSetInput,
   type ConflictLatch,
   type ConflictLatchRecord,
+  type ConflictLatchSetEvent,
   type ConflictLatchSetOutcome,
   type LatchRowState,
   type RefusedOperation,
@@ -284,7 +294,13 @@ import {
 } from './liveness-reading.ts'
 import { parseLaunchStart } from './pending-row.ts'
 import { isDryRun } from './tokens.ts'
-import { DIALOG_READY_TIMEOUT_MS, armNeverEarlyWait, type NeverEarlyWaitClock } from './ad-settings.ts'
+import {
+  DIALOG_READY_TIMEOUT_MS,
+  adGraceMsInEffect,
+  adLaunchBoundMsInEffect,
+  armNeverEarlyWait,
+  type NeverEarlyWaitClock,
+} from './ad-settings.ts'
 // Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
 import {
   UNATTRIBUTABLE_ZERO_REASON,
@@ -306,6 +322,9 @@ import { resolve as resolvePath } from 'node:path'
  * re-exported here.
  */
 export { AGENT_DIRECTOR_LIVE_STATES }
+
+/** B's floor (`src/ad-settings.ts`, b.jg5 SRJ-210), re-exported for the approver's readers. */
+export { DIALOG_READY_TIMEOUT_MS }
 
 /** The CSCB-shipped template name (mirrors agent-director-client). */
 const TEMPLATE_NAME = 'slack-channel-bot'
@@ -641,9 +660,12 @@ function logRefusal(site: string, what: string, ref: string, described: string):
  * (`readPersonaOwnRow`, `applyOwnRowStatusStep`; a launch start not recorded
  * with `launchStartNotRecordedSetInput`'s input) and for an UNUSABLE NAME
  * answer (with `unusableNameSetInput`'s input, `latchOnUnusableName`),
- * `setFromConflict` for a CONFLICT answer.
+ * `setFromConflict` for a CONFLICT answer; and, when the latch has it,
+ * `addSetObserver`, through which the installer stops a latched persona's
+ * running dialog approver (`setConflictLatch`, b.jg5 SRJ-502).
  */
-export type SessionConflictLatch = Pick<ConflictLatch, 'isLatched' | 'record' | 'set' | 'setFromConflict'>
+export type SessionConflictLatch = Pick<ConflictLatch, 'isLatched' | 'record' | 'set' | 'setFromConflict'> &
+  Partial<Pick<ConflictLatch, 'addSetObserver'>>
 
 /**
  * The installed latch. Production installs the server's one latch
@@ -660,9 +682,40 @@ export type SessionConflictLatch = Pick<ConflictLatch, 'isLatched' | 'record' | 
  */
 let conflictLatch: SessionConflictLatch | undefined
 
-/** Install the server's latch (production: `main()`), or remove it with undefined. */
+/** Removes the approver-stop set observer from the installed latch; undefined while none is registered. */
+let removeApproverLatchObserver: (() => void) | undefined
+
+/**
+ * Install the server's latch (production: `main()`; the recovery harness
+ * installs its own the same way), or remove it with undefined. The installer
+ * registers one set observer on a latch that has `addSetObserver`
+ * (`stopApproverOnLatch`, b.jg5 SRJ-502): every set of a persona, a relatch
+ * and a same-case set included, stops that persona's running dialog approver
+ * with the reason `latched`. The observer registered on a latch installed
+ * before is removed first, so exactly one is registered, on the installed
+ * latch only.
+ */
 export function setConflictLatch(latch: SessionConflictLatch | undefined): void {
+  removeApproverLatchObserver?.()
+  removeApproverLatchObserver = undefined
   conflictLatch = latch
+  if (latch?.addSetObserver !== undefined) removeApproverLatchObserver = latch.addSetObserver(stopApproverOnLatch)
+}
+
+/**
+ * The latch's set observer the installer registers (`setConflictLatch`,
+ * b.jg5 SRJ-502): stops persona `event.key`'s running dialog approver with
+ * the reason `latched` through the stop entry (`stopDialogApprover`). The
+ * approver is marked stopped synchronously, inside this call, so no approver
+ * call for the persona starts after the latch's `set` returns, whatever order
+ * the observers run in; a call already in progress returns first, and the
+ * approver makes none after it. Does nothing when no approver runs for the
+ * persona, and nothing more when its approver was already stopping (its own
+ * CONFLICT or UNUSABLE NAME answer marks it before it latches). Returns
+ * nothing to await; never throws.
+ */
+function stopApproverOnLatch(event: ConflictLatchSetEvent): void {
+  void stopDialogApprover(event.key, APPROVER_STOP_LATCHED)
 }
 
 /** The case the latched gate logs when it cannot read the persona's latch record. */
@@ -1869,23 +1922,61 @@ export const DEV_CHANNELS_DIALOG_NEEDLE = 'I am using this for local development
  */
 export const TRUST_DIALOG_NEEDLE = 'Yes, I trust this folder'
 
-/** The approver's sleep between laps, on the approver's clock (`_setApproverClock`). */
-export const DIALOG_POLL_INTERVAL_MS = 500
+/**
+ * The approver's pace (b.jg5 SRJ-403): at most one pane read a second. The
+ * lap after one that read the pane starts at least this long after that
+ * `read-pane` call, on the approver's clock (`_setApproverClock`), so two
+ * `read-pane` calls are never closer than the pace in effect, however long
+ * either lap's `status` read takes. The lap after one that read no pane
+ * starts at least this long after that lap's start.
+ */
+export const DIALOG_POLL_INTERVAL_MS = 1_000
 
-/** The approver's cap: how long it works on a launched row, measured from the
- *  approver's start on the approver's clock (`_setApproverClock`), before it
- *  stops. `DIALOG_READY_TIMEOUT_MS` (`src/ad-settings.ts`, B's floor) unless
- *  a test overrides it. */
-let _dialogReadyTimeoutMs = DIALOG_READY_TIMEOUT_MS
+/**
+ * The approver's slow pace (b.jg5 SRJ-403, SRJ-404): at most one pane read
+ * every 5 s, measured as `DIALOG_POLL_INTERVAL_MS` is. The next lap waits it
+ * once G (`adGraceMsInEffect`, read at the lap)
+ * has passed since the launch start the lap's `status` read carried, and
+ * after a lap that met an UNAVAILABLE or CONFIG answer (backing off).
+ */
+export const DIALOG_SLOW_POLL_INTERVAL_MS = 5_000
 
-/** Test-only seam: override the ready cap. */
+/**
+ * The approver's test cap (b.jg5 SRJ-404, SRJ-1303): unset by default. While
+ * it is set, the approver stops that many milliseconds after its own start,
+ * on the approver's clock, in place of B; no other wait reads it.
+ */
+let _dialogReadyTimeoutMs: number | undefined
+
+/** Test-only seam: cap the approver at `ms` from its own start, in place of B. */
 export function _setDialogReadyTimeoutMs(ms: number): void {
   _dialogReadyTimeoutMs = ms
 }
 
-/** Test-only seam: restore the default ready cap. */
+/** Test-only seam: unset the cap, so the approver stops at B. */
 export function _resetDialogReadyTimeoutMs(): void {
-  _dialogReadyTimeoutMs = DIALOG_READY_TIMEOUT_MS
+  _dialogReadyTimeoutMs = undefined
+}
+
+/**
+ * The time to wait from one lap's pane read (or, for a lap that read no
+ * pane, its start) to the next lap's start (b.jg5 SRJ-403, SRJ-404):
+ * `DIALOG_SLOW_POLL_INTERVAL_MS` after a lap that backed off (an
+ * UNAVAILABLE or CONFIG answer), or once `graceMs` (G in effect) has passed
+ * at `nowMs` since `launchStartMs`, the launch start the lap's `status` read
+ * carried, by a plain comparison; otherwise `DIALOG_POLL_INTERVAL_MS`. A lap
+ * with no launch start, and a G of `AD_WAIT_NEVER_ENDS`, keep the 1 s pace.
+ * Pure.
+ */
+export function approverPaceMs(
+  backOff: boolean,
+  launchStartMs: number | undefined,
+  nowMs: number,
+  graceMs: number,
+): number {
+  if (backOff) return DIALOG_SLOW_POLL_INTERVAL_MS
+  if (launchStartMs !== undefined && nowMs - launchStartMs >= graceMs) return DIALOG_SLOW_POLL_INTERVAL_MS
+  return DIALOG_POLL_INTERVAL_MS
 }
 
 // ---------------------------------------------------------------------------
@@ -1894,9 +1985,9 @@ export function _resetDialogReadyTimeoutMs(): void {
 
 /**
  * The approver's clock and timers: the timer subset of the persona clock type
- * (`NeverEarlyWaitClock`, `src/ad-settings.ts`). The approver's cap timer and
- * its sleeps between laps run on this clock only, so a suite drives them all
- * with `createFakeClock` and never waits on real time.
+ * (`NeverEarlyWaitClock`, `src/ad-settings.ts`). The approver's B (or cap)
+ * timer and its sleeps between laps run on this clock only, so a suite drives
+ * them all with `createFakeClock` and never waits on real time.
  */
 export type ApproverClock = NeverEarlyWaitClock
 
@@ -1909,7 +2000,7 @@ const SYSTEM_APPROVER_CLOCK: ApproverClock = Object.freeze({
 
 let _approverClock: ApproverClock = SYSTEM_APPROVER_CLOCK
 
-/** Test-only seam: run the approver's cap timer and sleeps on `clock` (a suite passes `createFakeClock()`). */
+/** Test-only seam: run the approver's B (or cap) timer and sleeps on `clock` (a suite passes `createFakeClock()`). */
 export function _setApproverClock(clock: ApproverClock): void {
   _approverClock = clock
 }
@@ -1925,7 +2016,13 @@ export const APPROVER_STOP_LIVE = 'live'
 export const APPROVER_STOP_FINISHED = 'finished'
 /** The approver stopped because `status` answered `ErrSpawnNotFound`: the row is absent. */
 export const APPROVER_STOP_ABSENT = 'absent'
-/** The approver stopped because its `status` read latched the persona (the own-row `status` step; b.jg5 SRJ-512, SRJ-513). */
+/**
+ * The approver stopped because the persona latched (b.jg5 SRJ-502, SRJ-512,
+ * SRJ-513): its `status` read latched it (the own-row `status` step), its
+ * own CONFLICT or UNUSABLE NAME answer latched it, it was latched before a
+ * lap or while a call was awaited, or a latch set by any other site stopped
+ * it (the latch's set observer, `setConflictLatch`).
+ */
 export const APPROVER_STOP_LATCHED = 'latched'
 /**
  * The approver stopped because the row read `pending` with no launch start
@@ -1938,8 +2035,32 @@ export const APPROVER_STOP_LATCHED = 'latched'
  * throws; e.g. a persona removed while its launch's approver runs).
  */
 export const APPROVER_STOP_NO_LAUNCH_START = 'no-launch-start'
-/** The approver stopped at its cap (`_setDialogReadyTimeoutMs`, measured from the approver's start). */
+/**
+ * The approver stopped at B (`adLaunchBoundMsInEffect`, b.jg5 SRJ-210,
+ * SRJ-404), measured from the launch start its first `pending` lap kept, or
+ * from its own start while no lap had read one.
+ */
+export const APPROVER_STOP_BOUND = 'bound'
+/** The approver stopped at its test cap (`_setDialogReadyTimeoutMs`, measured from its own start), set in place of B. */
 export const APPROVER_STOP_CAP = 'cap'
+/**
+ * The approver stopped on GONE (`ErrTmuxCaptureFailed`, `ErrTmuxSendKeys`)
+ * from any of its calls, or on `ErrSpawnNotFound` from `read-pane` or
+ * `send-keys` (b.jg5 SRJ-117, SRJ-118, SRJ-404).
+ */
+export const APPROVER_STOP_GONE = 'gone'
+/**
+ * The approver stopped on `ErrSpawnNotInteractive` with nothing typed (b.jg5
+ * SRJ-118, SRJ-404): the session holding the name is not this launch's, by
+ * its label's token, or the row has no launch start.
+ */
+export const APPROVER_STOP_NOT_INTERACTIVE = 'not-interactive'
+/**
+ * The approver stopped on ENVIRONMENT (`ErrTmuxNotAvailable`, b.jg5 SRJ-311,
+ * SRJ-404); the wrapper raised the persona's `tmux-unavailable` outage, and
+ * nothing is counted.
+ */
+export const APPROVER_STOP_TMUX_UNAVAILABLE = 'tmux-unavailable'
 /**
  * The approver was stopped by the one-approver rule (b.jg5 SRJ-401; hatch
  * A2): a later launch of the persona started its own approver
@@ -1954,14 +2075,25 @@ export const APPROVER_STOP_SHUTDOWN = 'shutdown'
 /** The approver's loop threw (not reached: every step is guarded); the throw was logged and nothing more was called. */
 export const APPROVER_STOP_FAILED = 'failed'
 
-/** Why the approver stopped: what `approvePreSessionDialogs` resolves with, and the reason in an {@link ApproverOutcome}. */
+/**
+ * Why the approver stopped: what `approvePreSessionDialogs` resolves with,
+ * and the reason in an {@link ApproverOutcome}. Each kind of stop has its own
+ * member, so a reader of the outcome tells which stops leave a `pending` row
+ * to the pending-row rule (b.jg5 SRJ-404: B or the cap, GONE, not
+ * interactive, tmux unavailable, superseded) from those that do not
+ * (shutdown, latched, teardown).
+ */
 export type ApproverStopReason =
   | typeof APPROVER_STOP_LIVE
   | typeof APPROVER_STOP_FINISHED
   | typeof APPROVER_STOP_ABSENT
   | typeof APPROVER_STOP_LATCHED
   | typeof APPROVER_STOP_NO_LAUNCH_START
+  | typeof APPROVER_STOP_BOUND
   | typeof APPROVER_STOP_CAP
+  | typeof APPROVER_STOP_GONE
+  | typeof APPROVER_STOP_NOT_INTERACTIVE
+  | typeof APPROVER_STOP_TMUX_UNAVAILABLE
   | typeof APPROVER_STOP_SUPERSEDED
   | typeof APPROVER_STOP_TEARDOWN
   | typeof APPROVER_STOP_SHUTDOWN
@@ -1970,15 +2102,18 @@ export type ApproverStopReason =
 /**
  * The reasons a caller stops a persona's approver with (`stopDialogApprover`):
  * each is also the stopped approver's {@link ApproverStopReason}. One member
- * per kind of stop, so a later stop (a latch, a key recorded as retired, the
- * abort of the persona's own stuck launch) is one more member here, and a
- * reader of the outcome tells which stops leave the row to the pending-row
- * rule.
+ * per kind of stop, so a later stop (a key recorded as retired, the abort of
+ * the persona's own stuck launch) is one more member here, and a reader of
+ * the outcome tells which stops leave the row to the pending-row rule.
  */
 export type ApproverStopRequestReason =
   | typeof APPROVER_STOP_SUPERSEDED
   | typeof APPROVER_STOP_TEARDOWN
   | typeof APPROVER_STOP_SHUTDOWN
+  | typeof APPROVER_STOP_LATCHED
+
+/** The approver's two time limits: B, or the test cap set in place of it. */
+type ApproverLimitReason = typeof APPROVER_STOP_BOUND | typeof APPROVER_STOP_CAP
 
 /** How one approver ended: why, and the launch start it kept (absent when no lap read the row `pending` with a launch start). */
 export interface ApproverOutcome {
@@ -1989,7 +2124,7 @@ export interface ApproverOutcome {
 
 /** The startup-errors class the approver writes, during a start-pass launch, when the row reads `ended` or `missing` (b.jg5 SRJ-402, SRJ-1013). */
 export const STARTUP_ERROR_APPROVE_SPAWN_DIED = 'dev-channels-approve-spawn-died'
-/** The startup-errors class the approver writes, during a start-pass launch, at its cap. */
+/** The startup-errors class the approver writes, during a start-pass launch, at B or its cap (b.jg5 SRJ-405). */
 export const STARTUP_ERROR_APPROVE_NOT_READY = 'dev-channels-approve-not-ready'
 
 /** The approver's site name, in its own log lines and in the own-row `status` read's lines. */
@@ -2000,6 +2135,17 @@ export const APPROVER_STATUS_READ_WHAT = 'readiness status read'
 export const APPROVER_LOG_PREFIX = `[slack] ${APPROVER_LOG_SITE}: `
 /** The pane lines one approver `read-pane` asks for (b.jg5 SRJ-402). */
 export const APPROVER_PANE_LINES = 40
+
+/** The agent-director verbs the approver calls. */
+export type ApproverVerb = 'status' | 'read-pane' | 'send-keys'
+
+/** B was measured from the launch start a lap kept. */
+export const APPROVER_BOUND_FROM_LAUNCH_START = 'the launch start'
+/** B was measured from the approver's own start: no lap had read a launch start. */
+export const APPROVER_BOUND_FROM_APPROVER_START = "the approver's start"
+
+/** Where B was measured from, in the at-B line ({@link approverBoundMessage}). */
+export type ApproverBoundFrom = typeof APPROVER_BOUND_FROM_LAUNCH_START | typeof APPROVER_BOUND_FROM_APPROVER_START
 
 /** One approver log line: {@link APPROVER_LOG_PREFIX} and `message`. */
 export function approverLogLine(message: string): string {
@@ -2023,31 +2169,90 @@ export function approverNoLaunchStartMessage(ref: string): string {
 
 /** The message for a state that is neither `pending`, live nor finished: nothing is read or typed this lap. */
 export function approverUnknownStateMessage(ref: string, state: string): string {
-  return `${ref} reads the state ${JSON.stringify(renderLogMessageText(state))}, which is neither pending, live nor finished — nothing read or typed; polling on within the cap`
+  return `${ref} reads the state ${JSON.stringify(renderLogMessageText(state))}, which is neither pending, live nor finished — nothing read or typed; polling on within the bound`
 }
 
 /**
- * The message for a refused `status` (any error but `ErrSpawnNotFound` that
- * latched nothing). `failure` is the error already described by the caller
- * through `describeAgentDirectorFailure` (redacted); the builder never sees
- * the raw error.
+ * The message for a refused `status` whose class keeps the approver polling
+ * (UNAVAILABLE, CONFIG, UNCLASSIFIED or a STATE name the approver gives no
+ * meaning; b.jg5 SRJ-404). `failure` is the error already described by the
+ * caller through `describeAgentDirectorFailure` (redacted); the builder never
+ * sees the raw error.
  */
 export function approverStatusRefusedMessage(ref: string, failure: string): string {
-  return `status of ${ref} failed: ${failure} — polling on within the cap`
+  return `status of ${ref} failed: ${failure} — polling on within the bound`
 }
 
 /**
- * The message for a failed `read-pane` or `send-keys`. `failure` is the error
- * already described by the caller through `describeAgentDirectorFailure`
- * (redacted); the builder never sees the raw error.
+ * The message for a failed `read-pane` or `send-keys` whose class keeps the
+ * approver polling (UNAVAILABLE, CONFIG, UNCLASSIFIED, `ErrSendKeysWhileRelayed`
+ * included, or a STATE name the approver gives no meaning; b.jg5 SRJ-117,
+ * SRJ-118). `failure` is the error already described by the caller through
+ * `describeAgentDirectorFailure` (redacted); the builder never sees the raw
+ * error.
  */
 export function approverPaneCallFailedMessage(ref: string, verb: 'read-pane' | 'send-keys', failure: string): string {
-  return `${verb} of ${ref} failed: ${failure} — polling on within the cap`
+  return `${verb} of ${ref} failed: ${failure} — polling on within the bound`
 }
 
-/** The message (log line and start-pass entry) at the cap. */
+/** The message for a GONE answer, or `ErrSpawnNotFound` from a pane verb: the approver stops. `failure` is already described (redacted). */
+export function approverGoneMessage(ref: string, verb: ApproverVerb, failure: string): string {
+  return `${verb} of ${ref} answered that the session is gone: ${failure} — the approver stops; nothing typed (b.jg5 SRJ-117, SRJ-118, SRJ-404)`
+}
+
+/**
+ * The one line for `ErrSpawnNotInteractive` (b.jg5 SRJ-118, SRJ-404), naming
+ * both possible causes. `failure` is already described (redacted).
+ */
+export function approverNotInteractiveMessage(ref: string, verb: ApproverVerb, failure: string): string {
+  return (
+    `${verb} of ${ref} answered that the row is not interactive: ${failure} — the session holding the name is not this ` +
+    `launch's (by its label's token), or the row has no launch start; the approver stops with nothing typed and nothing killed (b.jg5 SRJ-118, SRJ-404)`
+  )
+}
+
+/** The message for ENVIRONMENT (`ErrTmuxNotAvailable`): the approver stops. `failure` is already described (redacted). */
+export function approverTmuxUnavailableMessage(ref: string, verb: ApproverVerb, failure: string): string {
+  return `${verb} of ${ref} answered that tmux is not available: ${failure} — the approver stops; the tmux-unavailable outage is raised and nothing is counted (b.jg5 SRJ-311, SRJ-404)`
+}
+
+/**
+ * The message for a CONFLICT answer: the persona latched (refused operation
+ * "P's next check or recovery") and the approver stops. `failure` is already
+ * described (redacted); `outcome` says what became of the latch.
+ */
+export function approverConflictMessage(ref: string, verb: ApproverVerb, failure: string, outcome: string): string {
+  return `${verb} of ${ref} refused: ${failure} — CONFLICT: ${outcome}; the approver stops; nothing typed (b.jg5 SRJ-404, SRJ-501)`
+}
+
+/**
+ * The message for an UNUSABLE NAME answer: the persona latched (refused
+ * operation none) and the approver stops. `failure` is already described
+ * (redacted); `outcome` says what became of the latch.
+ */
+export function approverUnusableNameMessage(ref: string, verb: ApproverVerb, failure: string, outcome: string): string {
+  return `${verb} of ${ref} refused: ${failure} — UNUSABLE NAME: ${outcome}; the approver stops; nothing typed (b.jg5 SRJ-404, SRJ-512)`
+}
+
+/** The message for a persona found latched before a lap or after an awaited call: the approver stops with no further call. */
+export function approverLatchedMessage(ref: string): string {
+  return `${ref} is latched — the approver stops; nothing more is read or typed (b.jg5 SRJ-502)`
+}
+
+/** The message (log line and start-pass entry) at B: nothing is posted (b.jg5 SRJ-405). */
+export function approverBoundMessage(ref: string, boundMs: number, measuredFrom: ApproverBoundFrom): string {
+  return (
+    `spawn never reached a live state within B (${boundMs}ms from ${measuredFrom}) for ${ref} — dialog unrecognized or session hung ` +
+    `(dev-needle='${DEV_CHANNELS_DIALOG_NEEDLE}'); the approver stops and nothing is posted (b.jg5 SRJ-404, SRJ-405)`
+  )
+}
+
+/** The message (log line and start-pass entry) at the test cap: nothing is posted (b.jg5 SRJ-405). */
 export function approverCapMessage(ref: string, capMs: number): string {
-  return `spawn never reached a live state within ${capMs}ms for ${ref} — dialog unrecognized or session hung (dev-needle='${DEV_CHANNELS_DIALOG_NEEDLE}')`
+  return (
+    `spawn never reached a live state within ${capMs}ms for ${ref} — dialog unrecognized or session hung ` +
+    `(dev-needle='${DEV_CHANNELS_DIALOG_NEEDLE}'); the approver stops at its cap and nothing is posted (b.jg5 SRJ-404, SRJ-405)`
+  )
 }
 
 /** The message for a lap that read a launch start other than the one the approver kept: it stops with nothing typed. */
@@ -2064,9 +2269,10 @@ const APPROVER_STOP_REQUEST_WHY: Readonly<Record<ApproverStopRequestReason, stri
   [APPROVER_STOP_SUPERSEDED]: 'a later launch started its own approver',
   [APPROVER_STOP_TEARDOWN]: 'its teardown began',
   [APPROVER_STOP_SHUTDOWN]: 'the server is shutting down',
+  [APPROVER_STOP_LATCHED]: 'the persona latched',
 }
 
-/** The message for a stop of a running approver (`stopDialogApprover`, `startDialogApprover` superseding one). */
+/** The message for a stop of a running approver (`stopDialogApprover`, `startDialogApprover` superseding one, the latch's set observer). */
 export function approverStopRequestedMessage(ref: string, reason: ApproverStopRequestReason): string {
   return `stopping the approver for ${ref} (${reason}): ${APPROVER_STOP_REQUEST_WHY[reason]}; it makes no further call (b.jg5 SRJ-401, SRJ-404)`
 }
@@ -2085,13 +2291,37 @@ export function approverFailedMessage(ref: string, failure: string): string {
 const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEEDLE]
 
 /**
+ * One armed time limit of an approver (B, or the cap): its reason, the start
+ * it is measured from, the wait (B's accessor itself, so a value raised while
+ * armed never ends it early), where B was measured from, and the cancel of
+ * its never-early timer.
+ */
+interface ApproverLimit {
+  readonly reason: ApproverLimitReason
+  readonly fromMs: number
+  readonly waitMs: () => number
+  readonly measuredFrom: ApproverBoundFrom
+  readonly cancel: () => void
+}
+
+/**
  * One approver's state, shared by its loop and its stops. The registry
  * (`startDialogApprover`) keeps one per running approver; a direct
  * `approvePreSessionDialogs` call makes its own.
  */
 interface ApproverRun {
-  /** Set by the first stop asked of this approver (`stopDialogApprover`, a later start, the reset seam): its reason. */
+  /**
+   * Set by the first stop asked of this approver (`stopDialogApprover`, a
+   * later start, the latch's set observer, the reset seam): its reason. The
+   * approver sets `latched` itself right before it latches the persona on
+   * its own CONFLICT or UNUSABLE NAME answer, so the set observer finds it
+   * already stopping.
+   */
   stopRequested: ApproverStopRequestReason | undefined
+  /** Set when B (or the cap) has passed: the approver stops before its next call. */
+  limitReached: ApproverLimitReason | undefined
+  /** The armed limit, while the loop runs. */
+  limit: ApproverLimit | undefined
   /** Wakes the approver's sleep between laps, while it sleeps. */
   wake: (() => void) | undefined
   /**
@@ -2102,9 +2332,81 @@ interface ApproverRun {
   launchStartMs: number | undefined
 }
 
-/** A fresh approver state: no stop asked, no launch start kept. */
+/** A fresh approver state: no stop asked, no limit armed, no launch start kept. */
 function newApproverRun(): ApproverRun {
-  return { stopRequested: undefined, wake: undefined, launchStartMs: undefined }
+  return { stopRequested: undefined, limitReached: undefined, limit: undefined, wake: undefined, launchStartMs: undefined }
+}
+
+/** What one approver loop works with: the persona, its run and the clock it took at its start. */
+interface ApproverContext {
+  readonly key: string
+  readonly isStartup: boolean
+  readonly ref: string
+  readonly at: OwnRowReadSite
+  readonly run: ApproverRun
+  readonly clock: ApproverClock
+}
+
+/**
+ * Arm `run`'s time limit (`reason`, measured from `fromMs` with `waitMs`)
+ * with `armNeverEarlyWait` on `clock`, replacing (and cancelling) any limit
+ * armed before. The timer marks the limit reached and wakes any sleep.
+ * `fromMs` is always a finite time here.
+ */
+function armApproverLimit(
+  clock: ApproverClock,
+  run: ApproverRun,
+  reason: ApproverLimitReason,
+  fromMs: number,
+  waitMs: () => number,
+  measuredFrom: ApproverBoundFrom,
+): void {
+  run.limit?.cancel()
+  const cancel = armNeverEarlyWait(clock, fromMs, waitMs, () => markApproverLimit(run, reason))
+  run.limit = { reason, fromMs, waitMs, measuredFrom, cancel }
+}
+
+/** Mark `run`'s limit reached (the first mark is kept) and wake its sleep. */
+function markApproverLimit(run: ApproverRun, reason: ApproverLimitReason): void {
+  if (run.limitReached !== undefined) return
+  run.limitReached = reason
+  run.wake?.()
+}
+
+/**
+ * Why the approver must stop now, before its next call, or `undefined`: a
+ * stop asked of it first, then its limit, checked with the timer's mark and
+ * by a plain `elapsed >= wait` comparison against the wait in effect now (a
+ * wait that cannot be read is not reached).
+ */
+function approverStopMark(ctx: ApproverContext): ApproverStopReason | undefined {
+  const { run } = ctx
+  if (run.stopRequested !== undefined) return run.stopRequested
+  const limit = run.limit
+  if (run.limitReached === undefined && limit !== undefined) {
+    let waitMs: number
+    try {
+      waitMs = limit.waitMs()
+    } catch {
+      waitMs = Number.NaN
+    }
+    if (ctx.clock.now() - limit.fromMs >= waitMs) markApproverLimit(run, limit.reason)
+  }
+  return run.limitReached
+}
+
+/**
+ * The stop mark (`approverStopMark`), else `latched` when the persona is
+ * latched now (`personaLatchedNow`), after one line: a persona latched
+ * before a lap, or while a call was awaited, gets no further call (b.jg5
+ * SRJ-502). `undefined` to go on.
+ */
+function approverStopOrLatched(ctx: ApproverContext): ApproverStopReason | undefined {
+  const mark = approverStopMark(ctx)
+  if (mark !== undefined) return mark
+  if (!personaLatchedNow(ctx.key)) return undefined
+  console.error(approverLogLine(approverLatchedMessage(ctx.ref)))
+  return APPROVER_STOP_LATCHED
 }
 
 /**
@@ -2113,11 +2415,13 @@ function newApproverRun(): ApproverRun {
  * fresh or resumed, reads `pending` until its session reports in (HO C5),
  * so every lap works on the `pending` row:
  *
+ *   - before the lap, a persona already latched stops it with no call
+ *     (`latched`, b.jg5 SRJ-502);
  *   - one own-row `status` read (`readPersonaOwnRowStatus`, which applies
  *     the own-row `status` step): a read that latched the persona stops the
  *     approver with nothing read or typed (`latched`); `ErrSpawnNotFound`
  *     stops it with one line and no startup-errors entry (`absent`); any
- *     other refusal is logged once and polling goes on within the cap;
+ *     other refusal takes the class rules below;
  *   - a live state other than `pending` stops it (`live`);
  *   - `ended` or `missing` stops it at once with no pane read and one line,
  *     and a start-pass launch writes `dev-channels-approve-spawn-died`
@@ -2128,23 +2432,59 @@ function newApproverRun(): ApproverRun {
  *     read (`latched`), so this stop is reached only with no configured-persona
  *     query installed or one that does not answer `key` as configured;
  *   - `pending` with a launch start: the first such lap keeps that launch
- *     start; a later lap that reads another one stops the approver with one
- *     line and nothing read or typed (`superseded`, b.jg5 SRJ-401; hatch
- *     A2: the row belongs to a newer launch). Otherwise one `read-pane` (40
- *     lines, `allow_pending`), and when the pane shows a needle of
- *     `PRE_SESSION_DIALOG_NEEDLES`, one `send-keys` with an empty text and
- *     `allow_pending`, which presses Enter. A failed call is logged once and
- *     polling goes on within the cap.
+ *     start, and B is re-armed from it; a later lap that reads another one
+ *     stops the approver with one line and nothing read or typed
+ *     (`superseded`, b.jg5 SRJ-401; hatch A2: the row belongs to a newer
+ *     launch). Otherwise one `read-pane` (40 lines, `allow_pending`), and
+ *     when the pane shows a needle of `PRE_SESSION_DIALOG_NEEDLES`, one
+ *     `send-keys` with an empty text and `allow_pending`, which presses
+ *     Enter.
+ *
+ * Each refused call is classified by class and name through
+ * `src/ad-error-class.ts` (b.jg5 SRJ-117, SRJ-118, SRJ-404), with one line:
+ *
+ *   - GONE, or `ErrSpawnNotFound` from `read-pane` or `send-keys`: stop
+ *     (`gone`);
+ *   - `ErrSpawnNotInteractive`: stop with nothing typed and nothing killed
+ *     (`not-interactive`);
+ *   - CONFLICT: the persona latches through the latch's CONFLICT entry
+ *     (`setFromConflict`) with the refused operation "P's next check or
+ *     recovery" and the recorded state `pending` (unreadable for a `status`
+ *     answer, which read none); stop (`latched`);
+ *   - UNUSABLE NAME: the persona latches with the case "unusable recorded
+ *     name" and the refused operation none (`latchOnUnusableName`), recorded
+ *     `pending`; stop with nothing typed (`latched`);
+ *   - ENVIRONMENT (`ErrTmuxNotAvailable`): stop (`tmux-unavailable`); the
+ *     wrapper raised the outage, and nothing is counted;
+ *   - UNAVAILABLE and CONFIG: poll on within B, the next lap at the slow
+ *     pace (backing off; the wrapper raised `ad-config-malformed` for
+ *     CONFIG and armed the persona's retry timer as from any verb);
+ *   - anything else (UNCLASSIFIED, `ErrSendKeysWhileRelayed` included, or a
+ *     STATE name the approver gives no meaning): poll on within B at the pace
+ *     in effect.
  *
  * Every call names only the persona's `claude_instance_id`; agent-director
  * reads and types into the worker's recorded pane of a session carrying this
  * launch's label (HO rev 17), and the server runs no tmux command here.
  *
- * Laps are `DIALOG_POLL_INTERVAL_MS` apart; the cap (`_dialogReadyTimeoutMs`)
- * is measured from the approver's start. Both run on the approver's clock
- * (`_setApproverClock`). At the cap it logs one line, writes
- * `dev-channels-approve-not-ready` for a start-pass launch and sends the
- * spawn-failure notice (`cap`). Resolves with why it stopped; never rejects.
+ * Pace (b.jg5 SRJ-403): each lap starts at least `DIALOG_POLL_INTERVAL_MS`
+ * after the previous lap's `read-pane` call (or, when the previous lap read
+ * no pane, after its start), and `DIALOG_SLOW_POLL_INTERVAL_MS` after it
+ * once G has passed since the launch start that lap's `status` read carried,
+ * or after a lap that backed off (`approverPaceMs`). Two `read-pane` calls
+ * are so never closer than the pace in effect, whatever the `status` reads
+ * between them take.
+ *
+ * B (b.jg5 SRJ-210, SRJ-404): armed never-early (`armNeverEarlyWait` with
+ * `adLaunchBoundMsInEffect` itself) from the approver's own start until a
+ * lap keeps a launch start, then re-armed from that launch start; also
+ * checked by a plain comparison before each call. While the test cap
+ * (`_setDialogReadyTimeoutMs`) is set, the cap is armed from the approver's
+ * own start in place of B. All of it runs on the approver's clock
+ * (`_setApproverClock`). At B or the cap it logs one line and, for a
+ * start-pass launch, writes `dev-channels-approve-not-ready`; nothing is
+ * posted to any notifier (b.jg5 SRJ-405). Resolves with why it stopped;
+ * never rejects.
  *
  * This runs one approver in the caller's context and outside the registry:
  * nothing can stop it but its own rules. A launch starts its approver
@@ -2161,76 +2501,151 @@ export async function approvePreSessionDialogs(
 
 /**
  * The approver's loop (`approvePreSessionDialogs`) over `run`: a stop asked
- * of `run` wakes its sleep at once and is checked after each agent-director
- * call, before the next, so no call follows a stop; the approver then
- * resolves with the stop's reason. Never rejects.
+ * of `run`, or its limit, wakes its sleep at once and is checked before each
+ * agent-director call, so no call follows a stop; the approver then resolves
+ * with the stop's reason. Never rejects.
  */
 async function runApproverLoop(key: string, isStartup: boolean, ref: string, run: ApproverRun): Promise<ApproverStopReason> {
   const clock = _approverClock
   const capMs = _dialogReadyTimeoutMs
-  const at: OwnRowReadSite = { site: APPROVER_LOG_SITE, what: APPROVER_STATUS_READ_WHAT, ref }
+  const ctx: ApproverContext = {
+    key,
+    isStartup,
+    ref,
+    at: { site: APPROVER_LOG_SITE, what: APPROVER_STATUS_READ_WHAT, ref },
+    run,
+    clock,
+  }
   const startMs = clock.now()
-  let capReached = false
-  const cancelCap = armNeverEarlyWait(clock, startMs, capMs, () => {
-    capReached = true
-    run.wake?.()
-  })
+  if (capMs !== undefined) {
+    armApproverLimit(clock, run, APPROVER_STOP_CAP, startMs, () => capMs, APPROVER_BOUND_FROM_APPROVER_START)
+  } else {
+    // b.jg5 E17 ruling: before any launch start is read, B runs from the approver's own start.
+    armApproverLimit(clock, run, APPROVER_STOP_BOUND, startMs, adLaunchBoundMsInEffect, APPROVER_BOUND_FROM_APPROVER_START)
+  }
+  let reason: ApproverStopReason
   try {
-    while (!capReached && clock.now() - startMs < capMs) {
-      if (run.stopRequested !== undefined) return run.stopRequested
-      const stop = await approverLap(key, isStartup, ref, at, run)
-      if (stop !== undefined) return stop
-      if (run.stopRequested !== undefined) return run.stopRequested
-      if (capReached) break
-      await new Promise<void>((resolve) => {
-        const handle = clock.setTimeout(() => {
-          run.wake = undefined
-          resolve()
-        }, DIALOG_POLL_INTERVAL_MS)
-        run.wake = () => {
-          run.wake = undefined
-          clock.clearTimeout(handle)
-          resolve()
-        }
-      })
+    for (;;) {
+      const lapStartMs = clock.now()
+      const lap = await approverLap(ctx)
+      if (typeof lap === 'string') {
+        reason = lap
+        break
+      }
+      const mark = approverStopMark(ctx)
+      if (mark !== undefined) {
+        reason = mark
+        break
+      }
+      const paceMs = approverPaceMs(lap.backOff, lap.launchStartMs, clock.now(), adGraceMsInEffect())
+      // b.jg5 SRJ-403: the pace runs from the lap's pane read, so the next
+      // read (after the next lap's `status` read) is never closer than it.
+      const paceFromMs = lap.paneReadAtMs ?? lapStartMs
+      if (clock.now() - paceFromMs < paceMs) await sleepUntilNextLap(ctx, paceFromMs, paceMs)
     }
   } finally {
     run.wake = undefined
-    cancelCap()
+    run.limit?.cancel()
   }
-  if (run.stopRequested !== undefined) return run.stopRequested
-
-  // The cap: surfaced loudly (no silent give-up).
-  const msg = approverCapMessage(ref, capMs)
-  console.error(approverLogLine(msg))
-  if (isStartup) recordStartupError(STARTUP_ERROR_APPROVE_NOT_READY, msg)
-  notifySpawnFailure(key, new AgentDirectorError('status', 'DialogApprovalTimeout', msg), isStartup)
-  return APPROVER_STOP_CAP
+  if (reason === APPROVER_STOP_BOUND || reason === APPROVER_STOP_CAP) approverLimitReached(ctx, reason, capMs)
+  return reason
 }
 
 /**
- * One approver lap (`approvePreSessionDialogs`): answers the stop reason, or
- * `undefined` to poll on. A stop asked of `run` during a call is answered
- * as soon as that call returns, before anything else. Never throws.
+ * Sleep from `fromMs` (the lap's pane read, or its start when it read no
+ * pane) until `paceMs` has passed on the approver's clock (never early:
+ * `armNeverEarlyWait`), or until a stop or the limit wakes it.
  */
-async function approverLap(
-  key: string,
-  isStartup: boolean,
-  ref: string,
-  at: OwnRowReadSite,
-  run: ApproverRun,
-): Promise<ApproverStopReason | undefined> {
+function sleepUntilNextLap(ctx: ApproverContext, fromMs: number, paceMs: number): Promise<void> {
+  const { run, clock } = ctx
+  return new Promise<void>((resolve) => {
+    const done = (): void => {
+      run.wake = undefined
+      resolve()
+    }
+    const cancel = armNeverEarlyWait(clock, fromMs, paceMs, done)
+    run.wake = () => {
+      cancel()
+      done()
+    }
+  })
+}
+
+/**
+ * At B or the cap (b.jg5 SRJ-405): one server-log line and, for a start-pass
+ * launch, the `dev-channels-approve-not-ready` entry. Nothing is posted to
+ * Slack.
+ */
+function approverLimitReached(ctx: ApproverContext, reason: ApproverLimitReason, capMs: number | undefined): void {
+  const msg =
+    reason === APPROVER_STOP_CAP && capMs !== undefined
+      ? approverCapMessage(ctx.ref, capMs)
+      : approverBoundMessage(
+          ctx.ref,
+          adLaunchBoundMsInEffect(),
+          ctx.run.limit?.measuredFrom ?? APPROVER_BOUND_FROM_APPROVER_START,
+        )
+  console.error(approverLogLine(msg))
+  if (ctx.isStartup) recordStartupError(STARTUP_ERROR_APPROVE_NOT_READY, msg)
+}
+
+/**
+ * Keep `launchStartMs`, the first launch start a lap read (b.jg5 SRJ-401),
+ * and re-arm B from it (b.jg5 E17 ruling: B runs from the approver's own
+ * start only until a lap reads a launch start). The approver's start is
+ * never earlier than the launch start, so the bound armed first was never
+ * early. With the test cap set nothing is re-armed. `launchStartMs` is a
+ * finite time (`parseLaunchStart`); a value that is not is never armed.
+ */
+function keepApproverLaunchStart(ctx: ApproverContext, launchStartMs: number): void {
+  const { run } = ctx
+  run.launchStartMs = launchStartMs
+  if (!Number.isFinite(launchStartMs)) return
+  if (run.limit === undefined || run.limit.reason !== APPROVER_STOP_BOUND) return
+  armApproverLimit(ctx.clock, run, APPROVER_STOP_BOUND, launchStartMs, adLaunchBoundMsInEffect, APPROVER_BOUND_FROM_LAUNCH_START)
+}
+
+/**
+ * How a lap that stops nothing ended: whether it backed off, the launch
+ * start its `status` read carried, and when (on the approver's clock) it
+ * made its `read-pane` call, `undefined` when it made none (b.jg5 SRJ-403:
+ * the pace runs from it).
+ */
+interface ApproverLapGoesOn {
+  readonly backOff: boolean
+  readonly launchStartMs: number | undefined
+  readonly paneReadAtMs: number | undefined
+}
+
+/** What the approver does with one refused call: stop with a reason, or poll on (backing off or not). */
+type ApproverAnswer = { readonly stop: ApproverStopReason } | { readonly backOff: boolean }
+
+/**
+ * One approver lap (`approvePreSessionDialogs`): answers the stop reason, or
+ * how the lap ended to poll on. A stop asked of the approver during a call
+ * is answered as soon as that call returns, before anything else. Never
+ * throws.
+ */
+async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | ApproverLapGoesOn> {
+  const { key, isStartup, ref, at, run } = ctx
+  const before = approverStopOrLatched(ctx)
+  if (before !== undefined) return before
+
   const read = await readPersonaOwnRowStatus(key, at)
   if (run.stopRequested !== undefined) return run.stopRequested
   if (read.kind === OWN_ROW_STATUS_LATCHED) return APPROVER_STOP_LATCHED // the step logged its line
+  if (personaLatchedNow(key)) {
+    console.error(approverLogLine(approverLatchedMessage(ref)))
+    return APPROVER_STOP_LATCHED
+  }
   if (read.kind === OWN_ROW_STATUS_ABSENT) {
     console.error(approverLogLine(approverAbsentMessage(ref)))
     return APPROVER_STOP_ABSENT
   }
   if (read.kind === OWN_ROW_STATUS_REFUSED) {
     // A failed read keeps no launch start (b.jg5 SRJ-401; hatch A2).
-    console.error(approverLogLine(approverStatusRefusedMessage(ref, describeAgentDirectorFailure(read.error))))
-    return undefined
+    const answer = approverAnswerTo(ctx, 'status', read.error)
+    return 'stop' in answer ? answer.stop : { backOff: answer.backOff, launchStartMs: undefined, paneReadAtMs: undefined }
   }
 
   const state = read.state
@@ -2243,7 +2658,7 @@ async function approverLap(
   if (state !== AGENT_DIRECTOR_PENDING_STATE) {
     if (AGENT_DIRECTOR_LIVE_STATES.has(state)) return APPROVER_STOP_LIVE
     console.error(approverLogLine(approverUnknownStateMessage(ref, state)))
-    return undefined
+    return { backOff: false, launchStartMs: undefined, paneReadAtMs: undefined }
   }
   const launchStartMs = parseLaunchStart(read.launchStartedAt)
   if (launchStartMs === undefined) {
@@ -2254,13 +2669,17 @@ async function approverLap(
   // b.jg5 SRJ-401 (hatch A2): the first lap that reads a launch start keeps
   // it; a later one that reads another belongs to a newer launch.
   if (run.launchStartMs === undefined) {
-    run.launchStartMs = launchStartMs
+    keepApproverLaunchStart(ctx, launchStartMs)
   } else if (run.launchStartMs !== launchStartMs) {
     console.error(approverLogLine(approverLaunchStartChangedMessage(ref)))
     return APPROVER_STOP_SUPERSEDED
   }
+  const beforePane = approverStopMark(ctx)
+  if (beforePane !== undefined) return beforePane
 
   const claude_instance_id = personaInstanceId(key)
+  // b.jg5 SRJ-403: the next lap is paced from this pane read.
+  const goesOn: ApproverLapGoesOn = { backOff: false, launchStartMs, paneReadAtMs: ctx.clock.now() }
   let pane: string
   try {
     const result = await withOutageDetection(key, undefined, 'read-pane', (client) =>
@@ -2269,11 +2688,12 @@ async function approverLap(
     pane = result.pane
   } catch (err) {
     if (run.stopRequested !== undefined) return run.stopRequested
-    console.error(approverLogLine(approverPaneCallFailedMessage(ref, 'read-pane', describeAgentDirectorFailure(err))))
-    return undefined
+    const answer = approverAnswerTo(ctx, 'read-pane', err)
+    return 'stop' in answer ? answer.stop : { ...goesOn, backOff: answer.backOff }
   }
-  if (run.stopRequested !== undefined) return run.stopRequested
-  if (!PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))) return undefined
+  const afterPane = approverStopOrLatched(ctx)
+  if (afterPane !== undefined) return afterPane
+  if (!PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))) return goesOn
   try {
     // An empty text presses Enter.
     await withOutageDetection(key, undefined, 'send-keys', (client) =>
@@ -2281,9 +2701,98 @@ async function approverLap(
     )
   } catch (err) {
     if (run.stopRequested !== undefined) return run.stopRequested
-    console.error(approverLogLine(approverPaneCallFailedMessage(ref, 'send-keys', describeAgentDirectorFailure(err))))
+    const answer = approverAnswerTo(ctx, 'send-keys', err)
+    return 'stop' in answer ? answer.stop : { ...goesOn, backOff: answer.backOff }
   }
-  return undefined
+  if (run.stopRequested !== undefined) return run.stopRequested
+  return goesOn
+}
+
+/**
+ * The approver's one classification of a refused call (b.jg5 SRJ-117,
+ * SRJ-118, SRJ-404), by class and name through `src/ad-error-class.ts`
+ * (never `instanceof`), with one line from an exported builder carrying the
+ * persona reference and the redacted description: see
+ * `approvePreSessionDialogs` for the table. A `status` read's
+ * `ErrSpawnNotFound` and UNUSABLE NAME answers never reach here (the shared
+ * read answers absent and latched). Never throws.
+ */
+function approverAnswerTo(ctx: ApproverContext, verb: ApproverVerb, err: unknown): ApproverAnswer {
+  const { ref } = ctx
+  const { errorClass } = classifyAdError(err)
+  const failure = describeAgentDirectorFailure(err)
+  if (errorClass === AD_ERROR_CLASS_GONE || (verb !== 'status' && hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME))) {
+    console.error(approverLogLine(approverGoneMessage(ref, verb, failure)))
+    return { stop: APPROVER_STOP_GONE }
+  }
+  if (hasAdErrorName(err, ERR_SPAWN_NOT_INTERACTIVE_NAME)) {
+    console.error(approverLogLine(approverNotInteractiveMessage(ref, verb, failure)))
+    return { stop: APPROVER_STOP_NOT_INTERACTIVE }
+  }
+  if (errorClass === AD_ERROR_CLASS_CONFLICT) {
+    // The latch is set first; its line then carries what became of it.
+    logApproverLine(approverConflictMessage(ref, verb, failure, approverLatchOnConflict(ctx, verb, err)))
+    return { stop: APPROVER_STOP_LATCHED }
+  }
+  if (errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
+    ctx.run.stopRequested ??= APPROVER_STOP_LATCHED // the latch's set observer then finds it stopping
+    logApproverLine(approverUnusableNameMessage(ref, verb, failure, latchOnUnusableName(ctx.key, err, approverLatchRowState(verb))))
+    return { stop: APPROVER_STOP_LATCHED }
+  }
+  if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
+    console.error(approverLogLine(approverTmuxUnavailableMessage(ref, verb, failure)))
+    return { stop: APPROVER_STOP_TMUX_UNAVAILABLE }
+  }
+  const message =
+    verb === 'status' ? approverStatusRefusedMessage(ref, failure) : approverPaneCallFailedMessage(ref, verb, failure)
+  console.error(approverLogLine(message))
+  // CONFIG is taken as the UNAVAILABLE column (b.jg5 SRJ-117, SRJ-118): both back off.
+  return { backOff: errorClass === AD_ERROR_CLASS_UNAVAILABLE || errorClass === AD_ERROR_CLASS_CONFIG }
+}
+
+/** One approver line (`approverLogLine`) to the server log; `message` comes from an exported builder. */
+function logApproverLine(message: string): void {
+  console.error(approverLogLine(message))
+}
+
+/** The latch line's outcome text for what `setFromConflict` answered (`undefined`: the value was not CONFLICT, so nothing latched). */
+function conflictSetOutcomeText(outcome: ConflictLatchSetOutcome | undefined): string {
+  return outcome === undefined ? 'nothing is latched (the answer is not CONFLICT)' : LATCH_SET_OUTCOME_TEXT[outcome]
+}
+
+/**
+ * The row state a latch records for the approver's answer to `verb` (b.jg5
+ * SRJ-501): `pending`, which the lap's `status` read before a pane verb;
+ * unreadable for a `status` answer, which read no state.
+ */
+function approverLatchRowState(verb: ApproverVerb): LatchRowState {
+  return verb === 'status' ? LATCH_ROW_STATE_UNREADABLE : latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)
+}
+
+/**
+ * Latch the persona on the approver's CONFLICT answer `err` to `verb`
+ * (b.jg5 SRJ-501): the installed latch's CONFLICT entry (`setFromConflict`)
+ * with the refused operation "P's next check or recovery" and the recorded
+ * state (`approverLatchRowState`). The approver is marked stopping
+ * (`latched`) first, so the latch's set observer finds it already stopping.
+ * Answers the latch line's outcome text: the set's outcome, that no latch is
+ * installed, or that latching failed and what it threw. Logs nothing; never
+ * throws.
+ */
+function approverLatchOnConflict(ctx: ApproverContext, verb: ApproverVerb, err: unknown): string {
+  ctx.run.stopRequested ??= APPROVER_STOP_LATCHED
+  const latch = conflictLatch
+  if (latch === undefined) return LATCH_OUTCOME_NO_LATCH
+  try {
+    return conflictSetOutcomeText(
+      latch.setFromConflict(ctx.key, err, {
+        refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+        rowState: approverLatchRowState(verb),
+      }),
+    )
+  } catch (setErr) {
+    return `latching the persona failed: ${describeThrownValue(setErr)}`
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -15,10 +15,11 @@
  * there too, after its launch call returned and on the harness clock: it is
  * in flight for the persona (a lost message makes no read) but blocks no
  * retry (SRJ-303: the retry makes its row read), and once it stops a lost
- * message reads again; its UNAVAILABLE, STATE, GONE and UNCLASSIFIED answers
- * (`status`, `read-pane`, `send-keys`) arm no timer, add no cause, open no
- * episode and count nothing, while ENVIRONMENT and CONFIG raise their outage
- * and arm as from any verb. The shared findMissing sweep runs on the harness
+ * message reads again; its UNAVAILABLE and UNCLASSIFIED answers (`status`,
+ * `read-pane`, `send-keys`) keep it polling, and its `ErrSpawnNotInteractive`
+ * and GONE answers at `status` stop it (SRJ-404, SRJ-118); none of them arms
+ * a timer, adds a cause, opens an episode or counts anything, while
+ * ENVIRONMENT and CONFIG raise their outage and arm as from any verb. The shared findMissing sweep runs on the harness
  * as well, its one call held open by the test so each caller joins it before
  * it fails.
  * The attempt frames run on the bare context with the controller as the sink.
@@ -201,7 +202,9 @@ import {
   _resetConfigDirFs,
   _setConfigDirFs,
   APPROVER_STOP_FINISHED,
+  APPROVER_STOP_GONE,
   APPROVER_STOP_LIVE,
+  APPROVER_STOP_NOT_INTERACTIVE,
   APPROVER_STOP_TEARDOWN,
   DIALOG_POLL_INTERVAL_MS,
   isLaunchInFlight,
@@ -1318,8 +1321,6 @@ describe('unavailable retry: P’s dialog approver is in flight for P, blocks no
     ...UNAVAILABLE_VALUES.map(([what, make]) => [`UNAVAILABLE (${what})`, 'read-pane', () => make('read-pane')] as [string, ApproverVerb, () => Error]),
     ['UNAVAILABLE (ErrCallTimeout)', 'status', () => errCallTimeout('status')],
     ['UNAVAILABLE (ErrTmuxUnresponsive)', 'send-keys', () => errTmuxUnresponsive('send-keys')],
-    ['a STATE answer (ErrSpawnNotInteractive)', 'status', () => errSpawnNotInteractive('status')],
-    ['a GONE answer (ErrTmuxCaptureFailed)', 'status', () => errTmuxCaptureFailed(undefined, 'status')],
     ...(['status', 'read-pane', 'send-keys'] as const).flatMap((verb): Array<[string, ApproverVerb, () => Error]> => [
       ['UNCLASSIFIED (ErrInternal with no recognised phrase)', verb, () => errInternal()],
       ['UNCLASSIFIED (ErrSchemaMismatch)', verb, () => errSchemaMismatch()],
@@ -1339,6 +1340,37 @@ describe('unavailable retry: P’s dialog approver is in flight for P, blocks no
     for (const k of [key, other]) {
       expect([k, personaCallCounts(h, k)[APPROVER_VERB_CALLS[verb]]]).toEqual([k, 1])
       expect(h.approverRunning(k)).toBe(true)
+      expect(h.unclassifiedErrorOpen(k)).toBe(false)
+      expect(unclassifiedLines(h, k)).toEqual([])
+      expect(h.tmuxUnresponsive.holds(k)).toBe(false)
+      expect(getFailureCount(k)).toBe(0)
+    }
+    expect(h.triggers).toEqual([])
+    expect(h.controller.armedKeys()).toEqual([other])
+    expect(h.controller.view(other)).toEqual(otherView)
+    expect(h.episodeNotices).toEqual([])
+  })
+
+  // b.jg5 SRJ-404, SRJ-118: GONE stops polling, and `ErrSpawnNotInteractive`
+  // stops with nothing typed; either way the answer is outside every attempt.
+  test.each<[string, () => Error, ApproverStopReason]>([
+    ['a STATE answer (ErrSpawnNotInteractive)', () => errSpawnNotInteractive('status'), APPROVER_STOP_NOT_INTERACTIVE],
+    ['a GONE answer (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(undefined, 'status'), APPROVER_STOP_GONE],
+  ])('%s answering the dialog approver’s status, after the launch returned, stops it by its class with nothing read or typed; it arms no timer, adds no cause to an armed one, opens no episode and counts nothing', async (_what, make, reason) => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    // Q's timer is armed first, with a cause no approver answer gives.
+    h.controller.arm(other, { kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED })
+    const otherView = h.controller.view(other)
+    h.script(approverCallMeets('status', make()))
+
+    await h.launch(key)
+    await h.launch(other)
+    await h.settle()
+
+    for (const k of [key, other]) {
+      expect([k, (await h.runApproverToStop(k))?.reason]).toEqual([k, reason])
+      expect([k, personaCallCounts(h, k)]).toEqual([k, { spawnCalls: 1, statusCalls: 1 }])
       expect(h.unclassifiedErrorOpen(k)).toBe(false)
       expect(unclassifiedLines(h, k)).toEqual([])
       expect(h.tmuxUnresponsive.holds(k)).toBe(false)

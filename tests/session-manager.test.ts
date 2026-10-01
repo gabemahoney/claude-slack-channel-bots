@@ -154,9 +154,19 @@
  *     recording tmux runner records no call (AC 34, AC 48); `ended` or
  *     `missing` at the first lap stops it at once with no pane read, the
  *     spawn-died entry written once for a start-pass launch only and the
- *     launch result unchanged; a row leaving `pending` for `missing` between
- *     laps (b.dup) stops it at the next lap; the cap, the restart path's
- *     silence and the redacted error lines (AC 20).
+ *     launch result unchanged; an Enter refused with ErrSpawnNotInteractive
+ *     because the row just left `pending` (b.dup) stops it at that lap; the
+ *     redacted line of each class's handling (AC 20).
+ *   - b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the approver's
+ *     stops for the persona after a launch through the ladder, on a fake
+ *     clock started at the launch start: at B (from the launch start, a
+ *     resumed row's older `started_at` never used) or the test cap, one line,
+ *     the not-ready entry for a start pass only and nothing posted through
+ *     the notifier; ErrSpawnNotInteractive (both causes) stops it with
+ *     nothing typed, killed or deleted and one line; CONFIG raises
+ *     `ad-config-malformed`, arms P's timer and polls on, backing off, to B;
+ *     nothing is counted; `src/` names no `DialogApprovalTimeout`. Group B's
+ *     `ErrSystemInstallDisappeared` keeps it polling to B.
  *   - b.jg5 SRJ-401: every spawn or `resume` of the ladder that returns
  *     success, `launchSession`'s included, starts the approver on its own:
  *     the launch returns its own result, with the approver's fake clock held,
@@ -167,7 +177,11 @@
  *     that launch would start. On `makeRecoveryHarness`, its calls are
  *     outside the launch attempt: an UNAVAILABLE or UNCLASSIFIED answer to its
  *     `status`, `read-pane` or `send-keys` arms nothing and starts or opens
- *     nothing, while ENVIRONMENT and CONFIG raise their outages and arm.
+ *     nothing while it polls on (backing off after UNAVAILABLE), while
+ *     ENVIRONMENT and CONFIG raise their outages and arm, ENVIRONMENT
+ *     stopping it uncounted; each CONFLICT and UNUSABLE NAME row of the case
+ *     table at its sites latches P once and stops it, with no kill, delete or
+ *     relaunch.
  *   - b.av2 SR-6.1 start: `startupSessionManager` with `bringUp` (a persona
  *     not brought up is counted apart; every Slack bring-up runs at once and
  *     only the launches share the pool, in readiness order; a launch that
@@ -202,8 +216,8 @@
  *     `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` in `extra_env`, and a
  *     resume passes only the instance ID (agent-director restores the env
  *     stored at the row's spawn, modelled in one case).
- *   - Persona notices (b.av2 SR-7.2): spawn failure (generic, dialog-approval
- *     timeout, self-heal failure, restart cap), lost and inconclusive history,
+ *   - Persona notices (b.av2 SR-7.2): spawn failure (generic, self-heal
+ *     failure, restart cap), lost and inconclusive history,
  *     held-until-validated notices (channel and `dm` destinations) and the
  *     `spawn-failure-post` startup error and restart-path stderr line, whose
  *     cause names a failed DM open's step and code,
@@ -300,18 +314,28 @@ import {
   APPROVER_STOP_TEARDOWN,
   type ApproverOutcome,
   DIALOG_POLL_INTERVAL_MS,
+  DIALOG_SLOW_POLL_INTERVAL_MS,
+  APPROVER_BOUND_FROM_LAUNCH_START,
   APPROVER_LOG_PREFIX,
   APPROVER_PANE_LINES,
+  APPROVER_STOP_BOUND,
   APPROVER_STOP_CAP,
-  APPROVER_STOP_FINISHED,
+  APPROVER_STOP_GONE,
+  APPROVER_STOP_LATCHED,
   APPROVER_STOP_LIVE,
+  APPROVER_STOP_NOT_INTERACTIVE,
+  APPROVER_STOP_TMUX_UNAVAILABLE,
   STARTUP_ERROR_APPROVE_NOT_READY,
   STARTUP_ERROR_APPROVE_SPAWN_DIED,
+  approverBoundMessage,
   approverCapMessage,
   approverFinishedMessage,
+  approverGoneMessage,
   approverLogLine,
+  approverNotInteractiveMessage,
   approverPaneCallFailedMessage,
   approverStatusRefusedMessage,
+  approverTmuxUnavailableMessage,
   type ApproverStopReason,
   _setSpawnHomeDir,
   _resetSpawnHomeDir,
@@ -430,6 +454,7 @@ import {
   cannedListRow,
   cannedPermissionRequest,
   cannedStatusResult,
+  SAMPLE_LAUNCH_START_DEFAULT,
   SAMPLE_LAUNCH_START_FRACTIONAL,
   SAMPLE_LAUNCH_START_NONE,
   SAMPLE_LAUNCH_START_WHOLE,
@@ -444,6 +469,8 @@ import {
   errSpawnNotResumable,
   errGeneric,
   errSpawnNotInteractive,
+  errSpawnNotInteractiveLeftover,
+  errSpawnNotInteractiveNoLaunchStart,
   errTmuxSendKeys,
   errTmuxSessionCreate,
   errInvalidFlags,
@@ -544,6 +571,8 @@ import {
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
 import {
+  APPROVER_CONFLICT_CASE_ROWS,
+  APPROVER_UNUSABLE_NAME_CASE_ROWS,
   CONFLICT_CASE_ROWS,
   LAUNCH_START_AND_NOTE_ROW,
   LAUNCH_START_CASE_ROWS,
@@ -607,6 +636,8 @@ import {
   type UnavailableRetryTriggerSink,
 } from '../src/unavailable-retry.ts'
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
+import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
+import { parseLaunchStart } from '../src/pending-row.ts'
 import type { Phase1StatusResult } from '../src/ad-phase1-types.ts'
 
 // ---------------------------------------------------------------------------
@@ -921,14 +952,16 @@ async function settleNotices(): Promise<void> {
 
 /**
  * Run the startup-dialog approver on a fresh fake clock for this test
- * (`_setApproverClock`; the file's afterEach restores the real clock), at its
- * real pace (`DIALOG_POLL_INTERVAL_MS`) and its real cap
- * (`DIALOG_READY_TIMEOUT_MS`) unless the case sets a shorter one. Every
+ * (`_setApproverClock`; the file's afterEach restores the real clock),
+ * starting at `start` (0 by default), at its real pace and stopping at B
+ * (`adLaunchBoundMsInEffect`, the test cap unset) unless the case sets a cap.
+ * A case about B starts the clock at the launch start its `pending` row
+ * shows (`SAMPLE_LAUNCH_START_MS`), so B is reached on the clock. Every
  * approver case settles its call with `runOnApproverClock`, never on real
  * time.
  */
-function useApproverClock(): FakeClock {
-  const clock = createFakeClock()
+function useApproverClock(start = 0): FakeClock {
+  const clock = createFakeClock({ start })
   _setApproverClock(clock)
   _resetDialogReadyTimeoutMs()
   return clock
@@ -1018,6 +1051,9 @@ function recordTmuxCalls(): string[][] {
   })
   return calls
 }
+
+/** The stub's default launch start on a `pending` row, in ms, read with E16's reader (`parseLaunchStart`). */
+const SAMPLE_LAUNCH_START_MS = parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)!
 
 /** A `status` answer through the stub's canned builder: a `pending` row carries the sample launch start. */
 function statusReads(...states: string[]): CannedResponse<Phase1StatusResult>[] {
@@ -8091,24 +8127,20 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
     expect(notices).toEqual([])
   })
 
-  // The dialog approver presses Enter through agent-director only, and a
-  // refused send-keys is one log line, then the next lap. When the row was
-  // ended between its status read and its Enter, the next lap reads it
-  // `missing` and the approver stops there (b.jg5 SRJ-402): no pane read and
-  // no tmux call; a start-pass launch writes the spawn-died entry once.
-  test('the dialog approver\'s Enter refused because the row just left pending for missing: the next lap reads missing and stops the approver with no pane read and no tmux call; one refused-Enter line; no notice; the spawn-died entry once', async () => {
+  // The dialog approver presses Enter through agent-director only. When the
+  // row left `pending` between its status read and its Enter, agent-director
+  // refuses the Enter with ErrSpawnNotInteractive, and the approver stops
+  // there with nothing typed (b.jg5 SRJ-118, SRJ-404): no further lap, no pane
+  // read or tmux call, no kill or delete, one line, no notice and no entry.
+  test('the dialog approver\'s Enter refused because the row just left pending for missing: the approver stops at that lap (not-interactive) with nothing typed, no further lap, no kill, delete or tmux call; one not-interactive line; no notice and no startup entry', async () => {
     const clock = useApproverClock()
     const tmux = recordTmuxCalls()
     const readLog = captureStartupErrors()
     const ref = renderPersonaRef('C', 'C')
     const refused = errSpawnNotInteractive('send-keys')
-    const statusCalls: import('agent-director').StatusParams[] = []
-    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const calls = makeStubCallLog()
     installStub({
-      statusCalls,
-      readPaneCalls,
-      sendKeysCalls,
+      ...calls,
       sendKeysError: refused,
       readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
       statusQueue: statusReads('pending', 'missing', 'waiting'),
@@ -8119,16 +8151,21 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
       stop = await runOnApproverClock(clock, approvePreSessionDialogs('C', true, ref))
     })
 
-    expect(stop).toBe(APPROVER_STOP_FINISHED)
-    // Stopped at the next lap: one sleep between the two reads, no third read.
-    expect(statusCalls).toHaveLength(2)
-    expect(clock.now()).toBe(DIALOG_POLL_INTERVAL_MS)
-    expect(readPaneCalls).toHaveLength(1)
-    expect(sendKeysCalls).toEqual([{ claude_instance_id: personaInstanceId('C'), text: '', allow_pending: true }])
+    expect(stop).toBe(APPROVER_STOP_NOT_INTERACTIVE)
+    // Stopped at the first lap: no sleep, no second read.
+    expect(calls.statusCalls).toHaveLength(1)
+    expect(clock.now()).toBe(0)
+    expect(clock.pendingCount()).toBe(0)
+    expect(calls.readPaneCalls).toHaveLength(1)
+    expect(calls.sendKeysCalls).toEqual([{ claude_instance_id: personaInstanceId('C'), text: '', allow_pending: true }])
+    expect(calls.killCalls).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
     expect(tmux).toEqual([])
     expect(notices).toEqual([])
-    expect(linesWith(errLog, approverLogLine(approverPaneCallFailedMessage(ref, 'send-keys', describeAgentDirectorFailure(refused))))).toHaveLength(1)
-    expect(onlyStartupEntry(readLog(), STARTUP_ERROR_APPROVE_SPAWN_DIED)).toContain(approverFinishedMessage(ref, 'missing'))
+    expect(errLog.split('\n').filter((line) => line.startsWith(APPROVER_LOG_PREFIX))).toEqual([
+      approverLogLine(approverNotInteractiveMessage(ref, 'send-keys', describeAgentDirectorFailure(refused))),
+    ])
+    expect(readLog()).toBe('')
   })
 })
 
@@ -8851,32 +8888,6 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // isStartup=false path: no startup error recorded on cap hit
-  // -------------------------------------------------------------------------
-
-  test('launchSession (restart path, isStartup=false): does not record startup error on cap hit', async () => {
-    const clock = useApproverClock()
-    const capMs = 4 * DIALOG_POLL_INTERVAL_MS
-    _setDialogReadyTimeoutMs(capMs)
-    installStub({
-      statusResult: cannedStatusResult({ state: 'pending' }),
-      readPaneResults: [{ pane: 'unrelated' }],
-    })
-    const readLog = captureStartupErrors()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-
-    let result: SpawnPersonaResult | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg, false))
-    })
-
-    expect(result).toEqual({ key: 'C', action: 'spawned' })
-    expect(clock.now()).toBe(capMs)
-    expect(linesWith(errLog, approverLogLine(approverCapMessage(C_REF, capMs)))).toHaveLength(1)
-    expect(readLog()).toBe('')
-  })
-
-  // -------------------------------------------------------------------------
   // b.98w regression: readPane/sendKeys must pass allow_pending:true
   // -------------------------------------------------------------------------
 
@@ -8950,38 +8961,6 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   // -------------------------------------------------------------------------
   // New behavior tests for merged approver (b.4ie)
   // -------------------------------------------------------------------------
-
-  test('cap hit: sticky pending + unrecognized pane → one lap per 500 ms until the cap, the not-ready startup entry once, no sendKeys, posts a spawn-failure notice to the persona destination (isStartup=true)', async () => {
-    const clock = useApproverClock()
-    const capMs = 4 * DIALOG_POLL_INTERVAL_MS
-    _setDialogReadyTimeoutMs(capMs)
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
-    installStub({
-      sendKeysCalls,
-      readPaneCalls,
-      // sticky pending: never becomes live
-      statusResult: cannedStatusResult({ state: 'pending' }),
-      readPaneResults: [{ pane: 'unrelated pane text' }],
-    })
-    const readLog = captureStartupErrors()
-    const cfg = makeNoticeConfig()
-    const h = installNoticeNotifier(cfg)
-    await launchThenRunApprover(clock, NOTICE_KEY, spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg))
-    await settleNotices()
-
-    expect(sendKeysCalls).toHaveLength(0)
-    // One lap at each 500 ms step before the cap, measured from the approver's start.
-    expect(readPaneCalls).toHaveLength(capMs / DIALOG_POLL_INTERVAL_MS)
-    expect(clock.now()).toBe(capMs)
-    expect(onlyStartupEntry(readLog(), STARTUP_ERROR_APPROVE_NOT_READY)).toContain(
-      approverCapMessage(renderPersonaRef(NOTICE_NAME, NOTICE_KEY), capMs),
-    )
-    // cap path must also raise the spawn-failure notice (core requirement of b.4ie)
-    const text = expectOneNoticeToDestination(h)
-    expect(text).toContain('Spawn failure:\n')
-    expect(text).toContain('Error: `DialogApprovalTimeout`')
-  })
 
   test('already-live: the first lap reads waiting → no readPane, no sendKeys, no startup error', async () => {
     const clock = useApproverClock()
@@ -9115,9 +9094,12 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // AC 20 (b.av2 SR-10.3): the approver's status and readPane/sendKeys error
-  // lines log describeAgentDirectorFailure of the error (type, safe code or
-  // errName, redacted message, frames), never the error or its raw message.
+  // AC 20 (b.av2 SR-10.3): every line the approver's class handling writes
+  // for a refused status, readPane or sendKeys (b.jg5 SRJ-117, SRJ-118,
+  // SRJ-404) logs describeAgentDirectorFailure of the error (type, safe code
+  // or errName, redacted message, frames), never the error or its raw
+  // message: the polling-on lines (the approver then reads the ready state)
+  // and the lines of the stops (GONE, ErrSpawnNotInteractive, ENVIRONMENT).
   // Each error carries fake tokens in its message and properties; every
   // console.error argument is kept unformatted (errors whole).
   // -------------------------------------------------------------------------
@@ -9130,40 +9112,85 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       note: LEAK_SENTINEL,
     })
 
-  test.each<[string, () => { err: Error; opts: StubClientOptions }, (failure: string) => string, string]>([
+  /** An agent-director error named `errName` at `verb`, its message carrying fake tokens, and its expected redacted form. */
+  const namedTokenError = (verb: string, errName: string): { err: Error; shown: string } => ({
+    err: errGeneric(verb, errName, leakyMessage('refused', verb)),
+    shown: `${errName} message=${JSON.stringify(redactedLeakyMessage('refused'))}`,
+  })
+
+  /** Stub answers that reach the approver's Enter on a `pending` row, then (when the approver goes on) the ready state. */
+  const toEnter = (err: Error): StubClientOptions => ({
+    statusQueue: statusReads('pending', 'waiting'),
+    readPaneResults: [{ pane: DEV_CHANNELS_PANE }],
+    sendKeysError: err,
+  })
+
+  test.each<[string, () => { err: Error; opts: StubClientOptions; shown: string }, (failure: string) => string, ApproverStopReason]>([
     [
       'status',
       () => {
         const err = tokenError('status')
-        return { err, opts: { statusQueue: [cannedErr(err), ...statusReads('waiting')] } }
+        return {
+          err,
+          opts: { statusQueue: [cannedErr(err), ...statusReads('waiting')] },
+          shown: `Error code=ECONNRESET message=${JSON.stringify(redactedLeakyMessage('status refused'))}`,
+        }
       },
       (failure) => approverStatusRefusedMessage(C_REF, failure),
-      `Error code=ECONNRESET message=${JSON.stringify(redactedLeakyMessage('status refused'))}`,
+      APPROVER_STOP_LIVE,
     ],
     [
       'readPane (pending row)',
       () => {
         const err = tokenError('readpane')
-        return { err, opts: { statusQueue: statusReads('pending', 'waiting'), readPaneError: err } }
+        return {
+          err,
+          opts: { statusQueue: statusReads('pending', 'waiting'), readPaneError: err },
+          shown: `Error code=ECONNRESET message=${JSON.stringify(redactedLeakyMessage('readpane refused'))}`,
+        }
       },
       (failure) => approverPaneCallFailedMessage(C_REF, 'read-pane', failure),
-      `Error code=ECONNRESET message=${JSON.stringify(redactedLeakyMessage('readpane refused'))}`,
+      APPROVER_STOP_LIVE,
     ],
     [
       'sendKeys (pending row, needle on screen)',
       () => {
-        const err = errGeneric('send-keys', 'ErrSendKeysBroken', leakyMessage('refused', 'sendkeys'))
-        return {
-          err,
-          opts: { statusQueue: statusReads('pending', 'waiting'), readPaneResults: [{ pane: DEV_CHANNELS_PANE }], sendKeysError: err },
-        }
+        const { err, shown } = namedTokenError('send-keys', 'ErrSendKeysBroken')
+        return { err, opts: toEnter(err), shown }
       },
       (failure) => approverPaneCallFailedMessage(C_REF, 'send-keys', failure),
-      `ErrSendKeysBroken message=${JSON.stringify(redactedLeakyMessage('refused'))}`,
+      APPROVER_STOP_LIVE,
     ],
-  ])('AC 20: a %s error carrying fake tokens — one approver line naming the error with its redacted message; the approver goes on to the ready state; nothing logged leaks', async (_label, arrange, message, shown) => {
+    [
+      'readPane GONE (ErrTmuxCaptureFailed)',
+      () => {
+        const { err, shown } = namedTokenError('read-pane', 'ErrTmuxCaptureFailed')
+        return { err, opts: { statusQueue: statusReads('pending', 'waiting'), readPaneError: err }, shown }
+      },
+      (failure) => approverGoneMessage(C_REF, 'read-pane', failure),
+      APPROVER_STOP_GONE,
+    ],
+    [
+      'sendKeys ErrSpawnNotInteractive',
+      () => {
+        const { err, shown } = namedTokenError('send-keys', 'ErrSpawnNotInteractive')
+        return { err, opts: toEnter(err), shown }
+      },
+      (failure) => approverNotInteractiveMessage(C_REF, 'send-keys', failure),
+      APPROVER_STOP_NOT_INTERACTIVE,
+    ],
+    [
+      'status ENVIRONMENT (ErrTmuxNotAvailable)',
+      () => {
+        const { err, shown } = namedTokenError('status', 'ErrTmuxNotAvailable')
+        return { err, opts: { statusQueue: [cannedErr(err), ...statusReads('waiting')] }, shown }
+      },
+      (failure) => approverTmuxUnavailableMessage(C_REF, 'status', failure),
+      APPROVER_STOP_TMUX_UNAVAILABLE,
+    ],
+  ])('AC 20: a %s error carrying fake tokens — one approver line naming the error with its redacted message, then the class\'s stop or the ready state; nothing logged leaks', async (_label, arrange, message, expectedStop) => {
     const clock = useApproverClock()
-    const { err, opts } = arrange()
+    const { err, opts, shown } = arrange()
     installStub(opts)
     const errArgs: unknown[][] = []
     const orig = console.error
@@ -9175,11 +9202,256 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       console.error = orig
     }
 
-    expect(stop).toBe(APPROVER_STOP_LIVE)
+    expect(stop).toBe(expectedStop)
     const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(APPROVER_LOG_PREFIX))
     expect(lines).toEqual([approverLogLine(message(describeAgentDirectorFailure(err)))])
-    expect(lines[0]).toContain(`failed: ${shown}`)
-    assertNoLeak({ errArgs })
+    expect(lines[0]).toContain(`: ${shown}`)
+    assertNoLeak({ errArgs, outageEmissions })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-404, SRJ-405, SRJ-118 (the approver's row), SRJ-316: what follows
+// the dialog approver's stops for the persona, after a launch through the
+// ladder
+//
+// The approver stops at B, measured never-early from the launch start its
+// first `pending` lap kept (from its own start until then), or at the test
+// cap from its own start while `_setDialogReadyTimeoutMs` is set. At either it
+// writes one server-log line and, for a start-pass launch only, the
+// `dev-channels-approve-not-ready` entry; nothing reaches the notice notifier
+// (SRJ-405: the `DialogApprovalTimeout` spawn-failure notice is gone).
+// `ErrSpawnNotInteractive` on its Enter stops it with nothing typed and one
+// line; a CONFIG answer raises `ad-config-malformed` and arms P's retry timer
+// as from any verb while the approver polls on, backing off, to B. None of
+// these counts a failure, kills or deletes. Each case launches through the
+// real `spawnForPersona` and runs the approver to its stop on a fake clock
+// started at the stub's launch start (`useApproverClock`), so B is reached on
+// the clock; B comes from `adLaunchBoundMsInEffect`, never a literal. The
+// approver's ENVIRONMENT, CONFLICT and UNUSABLE NAME stops are covered on the
+// recovery harness below ("the dialog approver's calls are outside P's
+// launch attempt").
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog approver\'s stops for the persona, after a launch through the ladder', () => {
+  const C_ID = personaInstanceId('C')
+  const C_REF = renderPersonaRef('C', 'C')
+  const NOTICE_REF = renderPersonaRef(NOTICE_NAME, NOTICE_KEY)
+  /** A pane that shows no startup dialog: the approver presses nothing. */
+  const NO_DIALOG_PANE = 'unrelated pane text'
+
+  /** The approver's lines in a captured log, in order. */
+  function approverLines(errLog: string): string[] {
+    return errLog.split('\n').filter((line) => line.startsWith(APPROVER_LOG_PREFIX))
+  }
+
+  /** How a time limit ends the approver: its stop reason, the time from the launch start (the clock's start) and its line's message. */
+  interface ApproverLimitCase {
+    readonly reason: ApproverStopReason
+    readonly elapsedMs: number
+    readonly message: string
+  }
+
+  /** B, with the test cap unset (the file's afterEach unsets it, and `useApproverClock` too), and the test cap, set by the arrangement. */
+  const LIMITS: ReadonlyArray<readonly [string, () => ApproverLimitCase]> = [
+    [
+      'B (the test cap unset), measured from the launch start',
+      () => {
+        const boundMs = adLaunchBoundMsInEffect()
+        return { reason: APPROVER_STOP_BOUND, elapsedMs: boundMs, message: approverBoundMessage(NOTICE_REF, boundMs, APPROVER_BOUND_FROM_LAUNCH_START) }
+      },
+    ],
+    [
+      'the test cap, measured from the approver\'s start',
+      () => {
+        const capMs = 4 * DIALOG_POLL_INTERVAL_MS
+        _setDialogReadyTimeoutMs(capMs)
+        return { reason: APPROVER_STOP_CAP, elapsedMs: capMs, message: approverCapMessage(NOTICE_REF, capMs) }
+      },
+    ],
+  ]
+  const LIMIT_CROSS = LIMITS.flatMap(([limit, arrange]) =>
+    ([['a start-pass launch', true], ['a restart-path launch', false]] as const).map(([pass, isStartup]) => [limit, pass, arrange, isStartup] as const),
+  )
+
+  test.each(LIMIT_CROSS)('at %s, during %s, on a row that stays pending with no dialog: one approver line; the not-ready entry for a start pass only; nothing posted through the notice notifier (zero posts to the persona\'s destination and to the other persona); nothing counted, typed, killed or deleted; the launch result unchanged', async (_limit, _pass, arrange, isStartup) => {
+    // The approver starts at the launch start its `pending` row shows.
+    const clock = useApproverClock(SAMPLE_LAUNCH_START_MS)
+    const limit = arrange()
+    const calls = makeStubCallLog()
+    installStub({ ...calls, statusResult: cannedStatusResult({ state: 'pending' }), readPaneResults: [{ pane: NO_DIALOG_PANE }] })
+    const readLog = captureStartupErrors()
+    const cfg = makeNoticeConfig()
+    const h = installNoticeNotifier(cfg)
+
+    let launched: SpawnPersonaResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      launched = await launchThenRunApprover(clock, NOTICE_KEY, spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg, isStartup))
+    })
+    await settleNotices()
+
+    expect(launched).toEqual({ key: NOTICE_KEY, action: 'spawned' })
+    expect(await _whenDialogApproverStopped(NOTICE_KEY)).toEqual({ reason: limit.reason, launchStartMs: SAMPLE_LAUNCH_START_MS })
+    // Never early, never late: exactly at the limit, and nothing left armed.
+    expect(clock.now()).toBe(SAMPLE_LAUNCH_START_MS + limit.elapsedMs)
+    expect(clock.pendingCount()).toBe(0)
+    expect(approverLines(errLog)).toEqual([approverLogLine(limit.message)])
+    const log = readLog()
+    if (isStartup) {
+      expect(onlyStartupEntry(log, STARTUP_ERROR_APPROVE_NOT_READY)).toContain(limit.message)
+    } else {
+      expect(log).toBe('')
+    }
+    expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
+    // SRJ-405: nothing reaches the notifier from the approver.
+    expect(h.posts(NOTICE_KEY).filter((post) => post.channel === NOTICE_DEST)).toEqual([])
+    expect(h.posts(NOTICE_KEY)).toEqual([])
+    expect(h.posts(OTHER_KEY)).toEqual([])
+    expect(getFailureCount(NOTICE_KEY)).toBe(0)
+    expect(calls.sendKeysCalls).toEqual([])
+    expect(calls.killCalls).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
+    assertNoLeak({ errLog, log, posts: h.posts(NOTICE_KEY), logs: h.logs })
+  })
+
+  // b.jg5 SRJ-404, SRJ-406, SRJ-210: a resumed row's `started_at` is the
+  // original spawn time; B is measured from its launch start. The approver
+  // starts after the launch start, so a stop measured from its own start
+  // would come later, and one measured from `started_at` at its first lap.
+  test('B on a resumed row: a collision on an ended row whose started_at is older than B is resumed and reads pending with a later launch start; the approver, started after that launch start, polls on and stops at the launch start plus B, never from started_at or its own start; the launch answers resumed; no notice, nothing counted, killed or deleted', async () => {
+    const boundMs = adLaunchBoundMsInEffect()
+    const approverStartMs = SAMPLE_LAUNCH_START_MS + 3 * DIALOG_POLL_INTERVAL_MS
+    const clock = useApproverClock(approverStartMs)
+    const calls = makeStubCallLog()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const startedAt = new Date(SAMPLE_LAUNCH_START_MS - 2 * boundMs).toISOString()
+    installStub({
+      ...calls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: personaRow(cfg, 'C', { state: 'ended', started_at: startedAt }),
+      statusResult: cannedStatusResult({ state: 'pending' }),
+      readPaneResults: [{ pane: NO_DIALOG_PANE }],
+    })
+    const readLog = captureStartupErrors()
+
+    let launched: SpawnPersonaResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      launched = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
+    })
+
+    expect(launched).toEqual({ key: 'C', action: 'resumed' })
+    expect(calls.resumeCalls).toEqual([{ claude_instance_id: C_ID }])
+    expect(await _whenDialogApproverStopped('C')).toEqual({ reason: APPROVER_STOP_BOUND, launchStartMs: SAMPLE_LAUNCH_START_MS })
+    expect(clock.now()).toBe(SAMPLE_LAUNCH_START_MS + boundMs)
+    // It polled on past its first lap (started_at plus B had long passed there).
+    expect(calls.statusCalls.length).toBeGreaterThan(1)
+    expect(approverLines(errLog)).toEqual([approverLogLine(approverBoundMessage(C_REF, boundMs, APPROVER_BOUND_FROM_LAUNCH_START))])
+    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(notices).toEqual([])
+    expect(getFailureCount('C')).toBe(0)
+    expect(calls.sendKeysCalls).toEqual([])
+    expect(calls.killCalls).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
+  })
+
+  // b.jg5 SRJ-118 (the approver's row), SRJ-404: both causes agent-director
+  // names for ErrSpawnNotInteractive on a `pending` row.
+  test.each([
+    ['a leftover of an earlier launch holds the session', () => errSpawnNotInteractiveLeftover()],
+    ['the pending row has no launch start', () => errSpawnNotInteractiveNoLaunchStart()],
+  ])('ErrSpawnNotInteractive on the approver\'s Enter (%s): the approver stops at that lap (not-interactive) with nothing typed; no further lap, no kill, delete or tmux call; one approver line; no notice and no startup entry; nothing counted; the launch result unchanged', async (_label, make) => {
+    const clock = useApproverClock()
+    const tmux = recordTmuxCalls()
+    const readLog = captureStartupErrors()
+    const refused = make()
+    const calls = makeStubCallLog()
+    installStub({
+      ...calls,
+      statusResult: cannedStatusResult({ state: 'pending' }),
+      readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
+      sendKeysError: refused,
+    })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+
+    let launched: SpawnPersonaResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      launched = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
+    })
+
+    expect(launched).toEqual({ key: 'C', action: 'spawned' })
+    expect(await _whenDialogApproverStopped('C')).toEqual({ reason: APPROVER_STOP_NOT_INTERACTIVE, launchStartMs: SAMPLE_LAUNCH_START_MS })
+    // The one refused Enter, and nothing after it: no sleep, no second lap.
+    expect(calls.statusCalls).toEqual([{ claude_instance_id: C_ID }])
+    expect(calls.readPaneCalls).toHaveLength(1)
+    expect(calls.sendKeysCalls).toEqual([{ claude_instance_id: C_ID, text: '', allow_pending: true }])
+    expect(clock.firedCount()).toBe(0)
+    expect(clock.pendingCount()).toBe(0)
+    expect(calls.killCalls).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
+    expect(tmux).toEqual([])
+    expect(approverLines(errLog)).toEqual([approverLogLine(approverNotInteractiveMessage(C_REF, 'send-keys', describeAgentDirectorFailure(refused)))])
+    expect(notices).toEqual([])
+    expect(readLog()).toBe('')
+    expect(getFailureCount('C')).toBe(0)
+  })
+
+  // b.jg5 SRJ-117, SRJ-316, SRJ-301 (hatch A2): CONFIG at the approver is
+  // taken as its UNAVAILABLE column (keep polling, backing off, within B),
+  // and its wrapper raises `ad-config-malformed` and arms P's retry timer as
+  // from any verb (E12). A malformed config refuses every store-backed call,
+  // so after the first lap's `pending` read every `status` answers CONFIG too
+  // (a successful store read would clear the outage, SRJ-316).
+  test('CONFIG (ErrConfigMalformed) on the approver\'s pane read, then on every later status read: P\'s ad-config-malformed raised with one onset and P\'s retry timer armed with the CONFIG cause, as from any verb; the approver keeps polling, one lap every 5 s, and stops at B from the launch start its first lap kept; no notice, nothing counted, typed, killed or deleted', async () => {
+    const boundMs = adLaunchBoundMsInEffect()
+    const clock = useApproverClock(SAMPLE_LAUNCH_START_MS)
+    const armed: Array<{ key: string; kind: string }> = []
+    initOutageState({
+      getClient,
+      notify: (key, text) => { outageEmissions.push({ key, text }) },
+      triggerSink: { arm: (key, cause) => { armed.push({ key, kind: cause.kind }); return true } },
+    })
+    const err = errConfigMalformed()
+    const calls = makeStubCallLog()
+    installStub({ ...calls, statusQueue: statusReads('pending'), statusError: err, readPaneError: err })
+    const readLog = captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+
+    let launched: SpawnPersonaResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      launched = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
+    })
+
+    expect(launched).toEqual({ key: 'C', action: 'spawned' })
+    expect(await _whenDialogApproverStopped('C')).toEqual({ reason: APPROVER_STOP_BOUND, launchStartMs: SAMPLE_LAUNCH_START_MS })
+    expect(clock.now()).toBe(SAMPLE_LAUNCH_START_MS + boundMs)
+    // Backing off from the first lap: one lap every 5 s until B.
+    const laps = boundMs / DIALOG_SLOW_POLL_INTERVAL_MS
+    expect(calls.statusCalls).toHaveLength(laps)
+    expect(calls.readPaneCalls).toHaveLength(1)
+    const failure = describeAgentDirectorFailure(err)
+    expect(approverLines(errLog)).toEqual([
+      approverLogLine(approverPaneCallFailedMessage(C_REF, 'read-pane', failure)),
+      ...Array.from({ length: laps - 1 }, () => approverLogLine(approverStatusRefusedMessage(C_REF, failure))),
+      approverLogLine(approverBoundMessage(C_REF, boundMs, APPROVER_BOUND_FROM_LAUNCH_START)),
+    ])
+    expect([...getOutageFlags('C')]).toEqual(['ad-config-malformed'])
+    expect(outageEmissions).toEqual([{ key: 'C', text: adConfigMalformedOnset(err) }])
+    expect(armed[0]).toEqual({ key: 'C', kind: UNAVAILABLE_RETRY_CAUSE_CONFIG })
+    expect(armed.filter((a) => a.key !== 'C' || a.kind !== UNAVAILABLE_RETRY_CAUSE_CONFIG)).toEqual([])
+    expect(notices).toEqual([])
+    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(getFailureCount('C')).toBe(0)
+    expect(calls.sendKeysCalls).toEqual([])
+    expect(calls.killCalls).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
+  })
+
+  test('b.jg5 SRJ-405: no file under src/ names DialogApprovalTimeout (the approver\'s spawn-failure notice is removed)', () => {
+    const srcDir = join(import.meta.dir, '..', 'src')
+    const naming = readdirSync(srcDir, { recursive: true })
+      .map(String)
+      .filter((file) => file.endsWith('.ts') && readFileSync(join(srcDir, file), 'utf-8').includes('DialogApprovalTimeout'))
+    expect(naming).toEqual([])
   })
 })
 
@@ -9892,9 +10164,13 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
 
 // ---------------------------------------------------------------------------
 // Group B: the dialog approver's wrapped catch sites
-// Each asserts: (a) the approver resolves with its stop reason, (b)
-// ad-unreachable flag is raised, (c) binaryPath detail is captured in the
-// onset emission. Runs on the approver's fake clock (`useApproverClock`).
+// Each asserts: (a) the approver keeps polling and stops at B (b.jg5
+// SRJ-404: `ErrSystemInstallDisappeared` is UNCLASSIFIED, so it keeps
+// polling within B), (b) the ad-unreachable flag is raised, (c) the
+// binaryPath detail is captured in the onset emission. Runs on the
+// approver's fake clock started at the stub's launch start
+// (`useApproverClock`), with the test cap unset, so B is reached on the
+// clock.
 // ---------------------------------------------------------------------------
 
 describe('wrapper-migration: dialog outage cases (Group B)', () => {
@@ -9904,12 +10180,11 @@ describe('wrapper-migration: dialog outage cases (Group B)', () => {
   // -------------------------------------------------------------------------
   // Merged approvePreSessionDialogs — 3 wrapped call sites: status, readPane,
   // sendKeys. Each exercises an AD-outage error at one site, asserting the
-  // outage flag is raised and the approver polls on to its cap, on a fake
-  // clock (`useApproverClock`), and answers `cap`.
+  // outage flag is raised and the approver polls on to B
+  // (`adLaunchBoundMsInEffect`), measured from the launch start a `pending`
+  // lap read, or from its own start when no lap read one (the status site),
+  // and answers `bound`.
   // -------------------------------------------------------------------------
-
-  /** A short cap: four laps at the approver's pace. */
-  const CAP_MS = 4 * DIALOG_POLL_INTERVAL_MS
 
   test.each<[string, () => StubClientOptions]>([
     ['status outage: status always throws ErrSystemInstallDisappeared', () => ({ statusError: errSID() })],
@@ -9926,16 +10201,18 @@ describe('wrapper-migration: dialog outage cases (Group B)', () => {
         sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN),
       }),
     ],
-  ])('%s → ad-unreachable, polls on and resolves cap at the cap', async (_label, opts) => {
-    const clock = useApproverClock()
-    _setDialogReadyTimeoutMs(CAP_MS)
+  ])('%s → ad-unreachable, polls on and resolves bound at B', async (_label, opts) => {
+    // The approver starts at the launch start a `pending` row shows, so B from either start ends at the same time.
+    const clock = useApproverClock(SAMPLE_LAUNCH_START_MS)
     const statusCalls: import('agent-director').StatusParams[] = []
     installStub({ ...opts(), statusCalls })
 
-    expect(await runOnApproverClock(clock, approvePreSessionDialogs(CH, false))).toBe(APPROVER_STOP_CAP)
+    expect(await runOnApproverClock(clock, approvePreSessionDialogs(CH, false))).toBe(APPROVER_STOP_BOUND)
 
-    expect(clock.now()).toBe(CAP_MS)
-    expect(statusCalls).toHaveLength(CAP_MS / DIALOG_POLL_INTERVAL_MS)
+    expect(clock.now()).toBe(SAMPLE_LAUNCH_START_MS + adLaunchBoundMsInEffect())
+    expect(clock.pendingCount()).toBe(0)
+    // Polled on past the first lap.
+    expect(statusCalls.length).toBeGreaterThan(1)
     expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
     expect(outageEmissions.some(e => e.key === CH && e.text.includes(BIN))).toBe(true)
   })
@@ -13663,23 +13940,32 @@ describe('b.jg5 SRJ-301, SRJ-105: a persona that joins another\'s in-flight shar
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-401 (hatch A2; SRJ-301, SRJ-307, SRJ-311, SRJ-313, SRJ-316): the
-// dialog approver's calls are outside P's launch attempt
+// b.jg5 SRJ-401 (hatch A2; SRJ-301, SRJ-307, SRJ-311, SRJ-313, SRJ-316), with
+// SRJ-404's class rules (SRJ-117, SRJ-118, SRJ-501, SRJ-512): the dialog
+// approver's calls are outside P's launch attempt
 //
 // The approver runs after its launch call returned, on its own, so none of
 // its calls is part of P's launch or recovery attempt. E10's SRJ-105
 // regression rows for its `read-pane` and `send-keys` ran it inside the
 // attempt; they are here, with its `status`. An UNAVAILABLE or UNCLASSIFIED
 // answer to any of the three is logged once per lap and the approver polls
-// on: the launch result is the launch's own, nothing destructive follows,
-// nothing is counted or refused, and no retry timer is armed, no
-// `tmux-unresponsive` condition is started and no unclassified-error episode
-// is opened (an UNAVAILABLE answer's `tmux-unresponsive` start and arming,
-// and an UNCLASSIFIED answer's arming and episode, belong to an attempt). Its
-// ENVIRONMENT and CONFIG answers still raise their outages and arm P's retry
-// timer with their cause, as from any verb. The approver runs on the
+// on within B, its next lap at the slow pace after an UNAVAILABLE answer
+// (backing off) and at the 1 s pace after an UNCLASSIFIED one: the launch
+// result is the launch's own, nothing destructive follows, nothing is counted
+// or refused, and no retry timer is armed, no `tmux-unresponsive` condition is
+// started and no unclassified-error episode is opened (an UNAVAILABLE
+// answer's `tmux-unresponsive` start and arming, and an UNCLASSIFIED answer's
+// arming and episode, belong to an attempt). Its ENVIRONMENT and CONFIG
+// answers still raise their outages and arm P's retry timer with their cause,
+// as from any verb; ENVIRONMENT then stops the approver (`tmux-unavailable`),
+// uncounted, while CONFIG keeps it polling (its stop at B is covered by the
+// ladder-level describe of the approver's stops). A CONFLICT or UNUSABLE
+// NAME answer, each row of the case table at the approver's sites
+// (`APPROVER_CONFLICT_CASE_ROWS`, `APPROVER_UNUSABLE_NAME_CASE_ROWS`), latches
+// P once through the harness's latch and stops the approver (`latched`): no
+// kill, delete or relaunch, nothing counted. The approver runs on the
 // recovery harness's clock: `settle()` lets its first lap's calls be made,
-// and `advance(DIALOG_POLL_INTERVAL_MS)` its second, under a cap above both.
+// and `advance` its second, under a cap above both.
 // ---------------------------------------------------------------------------
 
 /** A call of the dialog approver: its verb, the stub answers that make every lap meet `err` there, and the pane reads and Enters one lap makes. */
@@ -13720,32 +14006,97 @@ const APPROVER_CALL_SITES: readonly ApproverCallSite[] = [
   },
 ]
 
-/** The answers that arm nothing outside an attempt: E4's UNAVAILABLE forms (`ErrTmuxUnresponsive` included) and the UNCLASSIFIED ones. */
-const APPROVER_UNARMED_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
-  ...SRJ105_UNAVAILABLE.map(([what, make]) => [`${what} (UNAVAILABLE)`, make] as const),
-  ...SRJ313_UNCLASSIFIED.map(([what, make]) => [`${what} (UNCLASSIFIED)`, make] as const),
-  ['an UNCLASSIFIED read error (ErrTimeout)', (verb) => errGeneric(verb, 'ErrTimeout')],
+/** The answers that arm nothing outside an attempt: E4's UNAVAILABLE forms (`ErrTmuxUnresponsive` included), which back off, and the UNCLASSIFIED ones, which keep the pace; with whether the answer backs off. */
+const APPROVER_UNARMED_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error, boolean]> = [
+  ...SRJ105_UNAVAILABLE.map(([what, make]) => [`${what} (UNAVAILABLE)`, make, true] as const),
+  ...SRJ313_UNCLASSIFIED.map(([what, make]) => [`${what} (UNCLASSIFIED)`, make, false] as const),
+  ['an UNCLASSIFIED read error (ErrTimeout)', (verb) => errGeneric(verb, 'ErrTimeout'), false],
 ]
 
-/** The answers raised and armed from any verb: ENVIRONMENT and CONFIG, with the cause they arm, the outage they raise and its onset. */
-const APPROVER_RAISED_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error, string, OutageClass, (err: Error) => string]> = [
-  ...SRJ311_ENVIRONMENT.map(([what, make, text]) => [what, make, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, 'tmux-unavailable' as OutageClass, () => text] as const),
-  ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG, 'ad-config-malformed', (err) => adConfigMalformedOnset(err)],
+/** An answer raised and armed from any verb: ENVIRONMENT or CONFIG. */
+interface ApproverRaisedAnswer {
+  readonly what: string
+  make(verb: string): Error
+  /** The cause P's timer is armed with. */
+  readonly kind: string
+  /** The outage it raises, and that outage's onset for `err`. */
+  readonly outage: OutageClass
+  onset(err: Error): string
+  /** The approver's one line for `err` at `site`, for persona ref `ref`. */
+  line(site: ApproverCallSite, ref: string, err: Error): string
+  /** The approver's stop at that lap; `undefined` when it polls on. */
+  readonly stop: ApproverStopReason | undefined
+}
+
+/** ENVIRONMENT stops the approver (b.jg5 SRJ-311, SRJ-404); CONFIG keeps it polling, as its UNAVAILABLE column (SRJ-316). */
+const APPROVER_RAISED_ANSWERS: readonly ApproverRaisedAnswer[] = [
+  ...SRJ311_ENVIRONMENT.map(([what, make, text]): ApproverRaisedAnswer => ({
+    what,
+    make,
+    kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
+    outage: 'tmux-unavailable',
+    onset: () => text,
+    line: (site, ref, err) => approverLogLine(approverTmuxUnavailableMessage(ref, site.verb, describeAgentDirectorFailure(err))),
+    stop: APPROVER_STOP_TMUX_UNAVAILABLE,
+  })),
+  {
+    what: 'a CONFIG answer (ErrConfigMalformed)',
+    make: () => errConfigMalformed(),
+    kind: UNAVAILABLE_RETRY_CAUSE_CONFIG,
+    outage: 'ad-config-malformed',
+    onset: (err) => adConfigMalformedOnset(err),
+    line: (site, ref, err) => site.line(ref, err),
+    stop: undefined,
+  },
 ]
 
-describe('b.jg5 SRJ-401, SRJ-105, SRJ-311, SRJ-313, SRJ-316: the dialog approver\'s calls are outside P\'s launch attempt', () => {
+/** The approver's lines for persona `key` saying `marker` (` — CONFLICT: ` or ` — UNUSABLE NAME: `), its own `status` read's included. */
+function approverLatchLines(marker: string): (h: RecoveryHarness, key: string) => string[] {
+  return (h, key) =>
+    h.errors.filter((line) => line.startsWith(APPROVER_LOG_PREFIX) && line.includes(marker) && line.includes(renderPersonaRef(key, key)))
+}
+
+/** Each CONFLICT and UNUSABLE NAME row of the case table at the approver's sites: its verb, its error, and P's expected latch with the approver's lines. */
+const APPROVER_LATCH_CASES: ReadonlyArray<readonly [string, string, () => Error, (p: string) => ExpectedLatch]> = [
+  ...APPROVER_CONFLICT_CASE_ROWS.map((row) => [
+    row.name,
+    row.verb,
+    () => row.build(),
+    (p: string): ExpectedLatch => ({ ...conflictLatch(p, row, row.refusedOperation, row.rowState), lines: approverLatchLines(' — CONFLICT: ') }),
+  ] as const),
+  ...APPROVER_UNUSABLE_NAME_CASE_ROWS.map((row) => [
+    row.name,
+    row.verb,
+    () => row.build(),
+    (p: string): ExpectedLatch => ({ ...unusableNameLatch(p, row), lines: approverLatchLines(' — UNUSABLE NAME: ') }),
+  ] as const),
+]
+
+/** The approver's call site at `verb`. */
+function approverCallSite(verb: string): ApproverCallSite {
+  const site = APPROVER_CALL_SITES.find((candidate) => candidate.verb === verb)
+  if (site === undefined) throw new Error(`no approver call site for ${verb}`)
+  return site
+}
+
+describe('b.jg5 SRJ-401, SRJ-404, SRJ-105, SRJ-311, SRJ-313, SRJ-316, SRJ-501, SRJ-512: the dialog approver\'s calls are outside P\'s launch attempt', () => {
   afterEach(srj105AfterEach)
 
-  const unarmedCross = APPROVER_UNARMED_ANSWERS.flatMap(([what, make]) => APPROVER_CALL_SITES.map((site) => [site.name, what, make, site] as const))
-  test.each(unarmedCross)('%s answering %s keeps the launch\'s outcome (spawned), logged once per lap while the approver polls on; no kill, delete, resume, notice or spawn-failed entry, never refused or counted; no trigger or retry timer, no tmux-unresponsive condition, no unclassified-error episode', async (_site, _what, make, site) => {
-    const { h, p, b } = srj105Build({ approverCapMs: 4 * DIALOG_POLL_INTERVAL_MS })
+  const unarmedCross = APPROVER_UNARMED_ANSWERS.flatMap(([what, make, backsOff]) =>
+    APPROVER_CALL_SITES.map((site) => [site.name, what, make, backsOff, site] as const),
+  )
+  test.each(unarmedCross)('%s answering %s keeps the launch\'s outcome (spawned), logged once per lap while the approver polls on, its next lap after 5 s when the answer is UNAVAILABLE and after 1 s otherwise; no kill, delete, resume, notice or spawn-failed entry, never refused or counted; no trigger or retry timer, no tmux-unresponsive condition, no unclassified-error episode', async (_site, _what, make, backsOff, site) => {
+    const { h, p, b } = srj105Build({ approverCapMs: 2 * DIALOG_SLOW_POLL_INTERVAL_MS })
     const err = make(site.verb)
     h.script(site.script(err))
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
-    // The approver's first lap, then its second on the harness clock.
+    // The approver's first lap, then the 1 s pace: a second lap there only when the answer does not back off.
     await h.settle()
     await h.advance(DIALOG_POLL_INTERVAL_MS)
+    expect(h.stub.calls.statusCalls).toHaveLength(backsOff ? 1 : 2)
+    // Backing off: the second lap comes at the slow pace from the first.
+    if (backsOff) await h.advance(DIALOG_SLOW_POLL_INTERVAL_MS - DIALOG_POLL_INTERVAL_MS)
 
     expect(h.approverRunning(p)).toBe(true)
     expect(h.stub.calls.statusCalls).toHaveLength(2)
@@ -13770,26 +14121,34 @@ describe('b.jg5 SRJ-401, SRJ-105, SRJ-311, SRJ-313, SRJ-316: the dialog approver
     expect(h.approverRunning(b)).toBe(false)
   })
 
-  const raisedCross = APPROVER_RAISED_ANSWERS.flatMap(([what, make, kind, outage, onset]) =>
-    APPROVER_CALL_SITES.map((site) => [site.name, what, make, kind, outage, onset, site] as const),
-  )
-  test.each(raisedCross)('%s answering %s raises it as from any verb: P\'s outage raised with one onset and P\'s timer armed once with its cause; the launch keeps its outcome (spawned), never refused or counted; no kill, delete, resume or notice; no tmux-unresponsive condition, no unclassified-error episode', async (_site, _what, make, kind, outage, onset, site) => {
+  const raisedCross = APPROVER_RAISED_ANSWERS.flatMap((answer) => APPROVER_CALL_SITES.map((site) => [site.name, answer.what, answer, site] as const))
+  test.each(raisedCross)('%s answering %s raises it as from any verb: P\'s outage raised with one onset and P\'s timer armed once with its cause; ENVIRONMENT stops the approver at that lap (tmux-unavailable), CONFIG keeps it polling; the launch keeps its outcome (spawned), never refused or counted; no kill, delete, resume or notice; no tmux-unresponsive condition, no unclassified-error episode', async (_site, _what, answer, site) => {
     const { h, p, b } = srj105Build()
-    const err = make(site.verb)
+    const err = answer.make(site.verb)
     h.script(site.script(err))
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
     // The approver's first lap only.
     await h.settle()
 
+    if (answer.stop === undefined) {
+      expect(h.approverRunning(p)).toBe(true)
+    } else {
+      expect(h.approverRunning(p)).toBe(false)
+      expect(await _whenDialogApproverStopped(p)).toEqual({
+        reason: answer.stop,
+        launchStartMs: site.verb === 'status' ? undefined : SAMPLE_LAUNCH_START_MS,
+      })
+    }
     expect(h.stub.calls.statusCalls).toHaveLength(1)
     expect(h.stub.calls.readPaneCalls).toHaveLength(site.paneReadsPerLap)
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: site.entersPerLap }))
-    expect(h.errors.filter((line) => line === site.line(renderPersonaRef(p, p), err))).toHaveLength(1)
-    expect([...getOutageFlags(p)]).toEqual([outage])
-    expect(h.outageNotices).toEqual([{ key: p, text: onset(err) }])
-    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(outage === 'ad-config-malformed' ? 1 : 0)
-    expect(h.triggers).toEqual([{ key: p, kind }])
+    const ref = renderPersonaRef(p, p)
+    expect(h.errors.filter((line) => line.startsWith(APPROVER_LOG_PREFIX) && line.includes(ref))).toEqual([answer.line(site, ref, err)])
+    expect([...getOutageFlags(p)]).toEqual([answer.outage])
+    expect(h.outageNotices).toEqual([{ key: p, text: answer.onset(err) }])
+    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(answer.outage === 'ad-config-malformed' ? 1 : 0)
+    expect(h.triggers).toEqual([{ key: p, kind: answer.kind }])
     expect(h.controller.isArmed(p)).toBe(true)
     expect(getFailureCount(p)).toBe(0)
     expect(refusalLines(h, p)).toEqual([])
@@ -13799,7 +14158,27 @@ describe('b.jg5 SRJ-401, SRJ-105, SRJ-311, SRJ-313, SRJ-316: the dialog approver
     expect(conditionStartedLines(h, p)).toEqual([])
     expect(unclassifiedStartedLines(h, p)).toEqual([])
     expect(h.unclassifiedErrorOpen(p)).toBe(false)
+    expect(h.latchEvents).toEqual([])
     expect([...getOutageFlags(b)]).toEqual([])
+  })
+
+  test.each(APPROVER_LATCH_CASES)('%s: P latched once with the row\'s case and state, the set and the three holds before one hold post; the approver stops at that lap (latched) with nothing more read or typed; no kill, delete or relaunch, no spawn-failure notice, nothing counted, armed or refused', async (_name, verb, make, expectedOf) => {
+    const { h, p, b } = srj105Build()
+    const site = approverCallSite(verb)
+    const err = make()
+    h.script(site.script(err))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+    const outcome = await h.runApproverToStop(p)
+
+    expect(outcome?.reason).toBe(APPROVER_STOP_LATCHED)
+    expectLatchedOnce(h, p, expectedOf(p))
+    // The refused call was the approver's last: one lap, nothing after it.
+    expect(h.stub.calls.statusCalls).toHaveLength(1)
+    expect(h.stub.calls.readPaneCalls).toHaveLength(site.paneReadsPerLap)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: site.entersPerLap }))
+    expect(h.latch.isLatched(b)).toBe(false)
+    expect(h.approverRunning(b)).toBe(false)
   })
 })
 

@@ -1170,7 +1170,7 @@ screen once too:
 | `[slack] reconnectSession: persona=<key> is waiting but its pane shows a prompt or dialog — not typing into it; deferring /mcp reconnect to a later tick (answer it in tmux session "slack_bot_<key>") (b.f2b/b.rmy)` | The row reads `waiting`, but a prompt is on screen: the *Waiting on a prompt* notice is posted. Answer the prompt. |
 | `[slack] reconnectSession: persona=<key> is waiting and reading its pane failed: <error> — reconnecting on the waiting row alone (b.f2b)` | agent-director couldn't read the screen; the `waiting` row is enough, and the reconnect goes ahead. |
 | `[slack] reconnectSession: persona=<key> status check failed: <error> — not typing /mcp reconnect blind; deferring to a later tick (b.f2b/b.rmy)` | agent-director couldn't report the row's state, so nothing is typed. A later tick retries. While agent-director can't report the persona, its instance is never killed or relaunched: see [agent-director can't report a persona's state](#agent-director-cant-report-a-personas-state). |
-| `[slack] Deferring persona=<key>: its row reads pending[ (launch started <time>)] — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; no reconnect, kill or launch, nothing counted (b.dup)` | The instance is still starting, even if it already shows as connected: until its session starts it is never treated as healthy, reconnected, killed or relaunched. While it starts, the server answers only Claude Code's two startup prompts (folder-trust and development-channels), with Enter, through agent-director, and types nothing else (the `approvePreSessionDialogs` lines in [Other lines you may see](#other-lines-you-may-see)). ` (launch started <time>)` is when agent-director started the launch, when it recorded one that looks like a timestamp (digits, `T`, `Z`, `:`, `.`, `+`, `-` only, at most 40 characters); any other value is left out of the line. Nothing is typed and nothing is posted; a later health check or retry checks again. If it repeats for many minutes, the instance is stuck before its session starts, and its launch posted a `Spawn failure:` notice (`DialogApprovalTimeout`); attach to its tmux session `slack_bot_<key>` to see what it shows. |
+| `[slack] Deferring persona=<key>: its row reads pending[ (launch started <time>)] — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; no reconnect, kill or launch, nothing counted (b.dup)` | The instance is still starting, even if it already shows as connected: until its session starts it is never treated as healthy, reconnected, killed or relaunched. While it starts, the server answers only Claude Code's two startup prompts (folder-trust and development-channels), with Enter, through agent-director, and types nothing else (the `approvePreSessionDialogs` lines in [Other lines you may see](#other-lines-you-may-see)). ` (launch started <time>)` is when agent-director started the launch, when it recorded one that looks like a timestamp (digits, `T`, `Z`, `:`, `.`, `+`, `-` only, at most 40 characters); any other value is left out of the line. Nothing is typed and nothing is posted; a later health check or retry checks again. If it repeats for many minutes, the instance is stuck before its session starts: the server stopped answering its startup prompts at its time limit, with one `approvePreSessionDialogs: spawn never reached a live state within B …` line (in [Other lines you may see](#other-lines-you-may-see)), and posted nothing to Slack. With the operator's say-so, attach (`tmux attach -t =slack_bot_<key>`) to see what it shows. |
 | `[slack] reconnectMcp: send-keys refused for <ref>: ErrSpawnNotInteractive message="…" — agent-director ended its row or marked it missing after its state was read (SessionEnd or a findMissing sweep), so its claude process is gone — dead session (b.dup)` | Normal after an instance died: agent-director found it gone just before the reconnect was typed. Nothing is posted. In the health check the persona is relaunched in the same restart (`Relaunching session for persona=<key>` follows); at a start it is resumed or respawned (`spawnForPersona: dead session for <ref> … — recovering via resume/fresh-spawn`). |
 
 ### A persona whose instance died under a prompt
@@ -1318,7 +1318,9 @@ The server met one of two things:
 
 - agent-director refused to act on the persona's tmux session because of a
   session conflict (`ErrTmuxSessionConflict`), when the server launched or
-  resumed the persona;
+  resumed the persona, or while it answered the startup prompts of the
+  persona's starting instance (a `CONFLICT` line under
+  [Other lines you may see](#other-lines-you-may-see));
 - agent-director had noted conflicting labels on the persona's own row
   (its liveness note `provenance_conflict`) when the server read that row:
   while launching the persona (the row read after the instance id was
@@ -1339,6 +1341,9 @@ attempts nothing more for it.
 
 While the persona is held:
 
+- the server stops answering the startup prompts of its starting instance
+  at once (an `approvePreSessionDialogs: … is latched` or `stopping the
+  approver … (latched)` line), and types nothing into it;
 - it is not launched, resumed or reconnected, by the start, a bring-up, a
   restart or a retry, and no agent-director call is made for it;
 - a restart for it does nothing and counts nothing;
@@ -1465,10 +1470,14 @@ The server holds the persona when it meets that answer at:
   row read right after the server's own `find-missing` run, the state reads
   of a launch waiting on a `working` row or on a prompt row, the state read
   of an automatic retry, the state reads of the health check and of a
-  restart, the reconnect's state read, and the one read made for a lost
-  message;
+  restart, the reconnect's state read, the one read made for a lost
+  message, and the state read of the server's watch of a starting
+  instance's startup prompts;
 - a read of the persona's screen: by a launch waiting on a `working` row,
-  and by the health check's reconnect checking a `working` or `waiting` row.
+  and by the health check's reconnect checking a `working` or `waiting` row;
+- the server's answer to a starting instance's startup prompts: its read
+  of the screen or its Enter (an `UNUSABLE NAME` line under
+  [Other lines you may see](#other-lines-you-may-see)); nothing is typed.
 
 The row read right after the `find-missing` run of the start sweep (the
 clean-up of old sessions at a server start) is the exception: there the
@@ -1480,6 +1489,9 @@ session name* notice, and the server attempts nothing more for it.
 
 While the persona is held:
 
+- the server stops answering the startup prompts of its starting instance
+  at once (an `approvePreSessionDialogs: … is latched` or `stopping the
+  approver … (latched)` line), and types nothing into it;
 - it is not launched, resumed, reconnected or killed by the server on its
   own, nothing is typed into its session, and the server makes no tmux call
   for it;
@@ -1565,7 +1577,8 @@ row read right after the server's own `find-missing` run, the state reads
 of a launch waiting on a `working` row or on a prompt row, the state read
 of an automatic retry, the state reads of the health check and of a
 restart, the reconnect's state read, the one read made for a lost message,
-and the state read made right after a launch step met a tmux session
+the state read of the server's watch of a starting instance's startup
+prompts, and the state read made right after a launch step met a tmux session
 conflict or an unusable tmux session name. It holds it whether or not the
 server launched that row, a row whose working directory differs from the
 persona's included. Only a persona in the applied configuration is held:
@@ -1576,6 +1589,9 @@ recorded* notice, and the server attempts nothing more for it.
 
 While the persona is held:
 
+- the server stops answering the startup prompts of its starting instance
+  at once (an `approvePreSessionDialogs: … is latched` or `stopping the
+  approver … (latched)` line), and types nothing into it;
 - it is not launched, resumed, reconnected or killed by the server on its
   own, and nothing is typed into its session;
 - nothing is counted toward the restart limit for it, no `Spawn failure:`
@@ -1673,11 +1689,15 @@ and a warning goes to the persona's destination once its Slack client is
 validated.
 
 The server's next check for pending changes waits until every teardown and
-bring-up of the change has settled, which can take minutes: up to 5 when a
-pre-session dialog has to be approved, up to 10 when a leftover instance of
-the persona is still `working` (about 1 when its screen and transcript show
-it idle; see
+bring-up of the change has settled, which can take minutes: up to 10 when a
+leftover instance of the persona is still `working` (about 1 when its screen
+and transcript show it idle; see
 [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected)).
+It doesn't wait for the server's answers to a new instance's startup
+prompts: those run on their own after the launch, for at most the later of
+5 minutes and agent-director's `pending_grace_seconds` plus 60 s from the
+launch's start (see
+[agent-director's timing settings](#agent-directors-timing-settings)).
 A teardown also waits for any restart already under way for its persona, but
 not for a launch waiting on a `working` row: it cancels that wait, and nothing
 is typed. Meanwhile `config.json.pending` isn't refreshed and
@@ -2003,7 +2023,10 @@ Both clear the same way, with the same *All clear.* notice naming
 `tmux-unavailable` (posted once nothing else is wrong for the persona), as
 below. Nothing is killed,
 deleted or relaunched because of it, no `Spawn failure:` notice is posted and
-nothing counts toward the restart limit. While the notice holds, the health
+nothing counts toward the restart limit. When the answer comes while the
+server is answering a just-launched instance's startup prompts, the server
+stops answering them (the `answered that tmux is not available` line under
+[Other lines you may see](#other-lines-you-may-see)). While the notice holds, the health
 check still checks the persona but never restarts or reconnects it; the
 retries go on at their backoff. If the retries stopped while the notice still
 holds (the persona wasn't up at a retry, its relaunch was declined, or the
@@ -2057,7 +2080,11 @@ The server does nothing because of it: nothing counts toward the restart
 limit, the persona is never read as dead (its state reads unknown), nothing
 is killed, deleted or relaunched, no `Spawn failure:` notice is posted and no
 `spawn-failed` entry is written. Every launch or restart step that meets it
-stops there with its `refused` line (below). The retries go on at their
+stops there with its `refused` line (below). When the answer comes while
+the server is answering a just-launched instance's startup prompts, the
+server keeps watching that instance within its time limit, checking every
+5 s after such an answer (the `polling on within the bound` lines under
+[Other lines you may see](#other-lines-you-may-see)). The retries go on at their
 backoff whatever `session_restart_delay` and `health_check_interval` are, `0`
 included. A message lost while the notice holds reports `not answering`, with
 no restart started, while the persona's retries are running. At the restart
@@ -2300,11 +2327,18 @@ coming, report it as a bug, with the persona's lines.
 | `[slack] approvePreSessionDialogs: "<name>" (key=<key>) reads <state>: the launch is over, so the approver stops with no pane read and the restart path decides (b.jg5 SRJ-402)` | While a newly launched instance was starting, agent-director reported it `ended` or `missing` (`<state>`): it died before its session started. The server stops watching it at once and reads nothing from its screen. During a server start the same text is in `startup-errors.log` as `dev-channels-approve-spawn-died`. The restart handling relaunches it as for any dead instance; if it keeps dying, attach with the operator's say-so (`tmux attach -t =slack_bot_<key>`) on its next launch to see what it shows, or read the persona's other lines around this one. |
 | `[slack] approvePreSessionDialogs: "<name>" (key=<key>) has no row (ErrSpawnNotFound): the approver stops; nothing is read or typed (b.jg5 SRJ-402)` | agent-director has no record of the newly launched instance, so the server stops watching it. Nothing is written to `startup-errors.log`. The restart handling or the next health check brings the persona back; nothing to do unless it repeats. |
 | `[slack] approvePreSessionDialogs: "<name>" (key=<key>) reads pending with no launch start: the approver stops; nothing is read or typed (b.jg5 SRJ-401, SRJ-513)` | The instance's record shows it starting but carries no launch start, so the server neither reads nor types into it. For a persona in the applied configuration you never see this line: the server holds the persona instead (see [A persona posts a Held: launch start not recorded notice](#a-persona-posts-a-held-launch-start-not-recorded-notice)). The line appears when the persona is no longer in the applied configuration, for example it was removed while its instance was starting: the server stops answering its startup prompts and holds nothing, which is expected. No action is needed beyond checking that the persona was in fact removed (its removal lines around this one, or its absence from `config.json`). |
-| `[slack] approvePreSessionDialogs: "<name>" (key=<key>) reads the state "<state>", which is neither pending, live nor finished — nothing read or typed; polling on within the cap` | agent-director reported a state the server doesn't know for a starting instance. Nothing is read or typed, and the server checks again. If it repeats, check that the agent-director version is one the server supports (`agent-director version`). |
-| `[slack] approvePreSessionDialogs: status of "<name>" (key=<key>) failed: <error> — polling on within the cap` | agent-director couldn't report a starting instance's state (see [The server log](#the-server-log), Error detail). The server checks again, until the instance starts or the 5-minute limit passes. If it repeats, check that agent-director responds (`agent-director version`). |
-| `[slack] approvePreSessionDialogs: read-pane of "<name>" (key=<key>) failed: <error> — polling on within the cap` (or `send-keys of …`) | agent-director couldn't read a starting instance's screen, or couldn't press Enter on its startup prompt. The server tries again, until the instance starts or the 5-minute limit passes. If the instance stays at its prompt, attach with the operator's say-so (`tmux attach -t =slack_bot_<key>`) and accept it by hand. |
-| `[slack] approvePreSessionDialogs: spawn never reached a live state within <ms>ms for "<name>" (key=<key>) — dialog unrecognized or session hung (dev-needle='I am using this for local development')` | A newly launched instance didn't start within the limit (5 minutes): a startup prompt the server doesn't recognise, or a hung session. A `Spawn failure:` notice (`DialogApprovalTimeout`) is posted to the persona's destination, and during a server start `startup-errors.log` has `dev-channels-approve-not-ready`. With the operator's say-so, attach (`tmux attach -t =slack_bot_<key>`) to see what it shows. |
+| `[slack] approvePreSessionDialogs: "<name>" (key=<key>) reads the state "<state>", which is neither pending, live nor finished — nothing read or typed; polling on within the bound` | agent-director reported a state the server doesn't know for a starting instance. Nothing is read or typed, and the server checks again, within its time limit (see the `spawn never reached a live state within B` row). If it repeats, check that the agent-director version is one the server supports (`agent-director version`). |
+| `[slack] approvePreSessionDialogs: status of "<name>" (key=<key>) failed: <error> — polling on within the bound` | agent-director couldn't report a starting instance's state (see [The server log](#the-server-log), Error detail): it can't act right now, refuses its config file, or gave an error the server can't classify. The server checks again, until the instance starts or its time limit passes; after a can't-act-now or config-file answer the next check waits 5 s. A config-file refusal also raises the persona's *agent-director refuses its config file* notice. If it repeats, check that agent-director responds (`agent-director version`). |
+| `[slack] approvePreSessionDialogs: read-pane of "<name>" (key=<key>) failed: <error> — polling on within the bound` (or `send-keys of …`) | agent-director couldn't read a starting instance's screen, or couldn't press Enter on its startup prompt (it can't act right now, refuses its config file, or gave an error the server can't classify). The server tries again, until the instance starts or its time limit passes; after a can't-act-now or config-file answer the next try waits 5 s. If the instance stays at its prompt, attach with the operator's say-so (`tmux attach -t =slack_bot_<key>`) and accept it by hand. |
+| `[slack] approvePreSessionDialogs: spawn never reached a live state within B (<ms>ms from the launch start) for "<name>" (key=<key>) — dialog unrecognized or session hung (dev-needle='I am using this for local development'); the approver stops and nothing is posted (b.jg5 SRJ-404, SRJ-405)` (or `from the approver's start`) | A newly launched instance didn't start within the server's time limit B: the later of 5 minutes and agent-director's `pending_grace_seconds` plus 60 s (`<ms>`), counted from the launch start agent-director recorded (`from the approver's start` when no read of the row had shown one yet). Cause: a startup prompt the server doesn't recognise, or a hung session. The server stops answering its startup prompts and posts nothing to Slack; during a server start `startup-errors.log` has `dev-channels-approve-not-ready` with the same text. Fix: with the operator's say-so, attach (`tmux attach -t =slack_bot_<key>`) to see what it shows, and accept a prompt by hand; or inspect it with `agent-director read-pane --claude-instance-id cscb_<key>`. |
 | `[slack] approvePreSessionDialogs: "<name>" (key=<key>) reads pending with a launch start other than the one this approver kept: the row belongs to a newer launch, whose own approver works on it — this approver stops; nothing read or typed (b.jg5 SRJ-401)` | While the server was answering a starting instance's startup prompts, agent-director reported a newer launch of the persona. The older watcher stops without reading or typing anything, so a prompt never gets two Enters; the newer launch's own watcher answers its prompts. Nothing to do. |
+| `[slack] approvePreSessionDialogs: read-pane of "<name>" (key=<key>) answered that the session is gone: <error> — the approver stops; nothing typed (b.jg5 SRJ-117, SRJ-118, SRJ-404)` (or `status of …`, `send-keys of …`) | agent-director found the starting instance's tmux session gone, or no record of it for the screen read or the Enter. The server stops answering its startup prompts. The restart handling or the next health check deals with the instance; nothing to do unless it repeats. |
+| `[slack] approvePreSessionDialogs: send-keys of "<name>" (key=<key>) answered that the row is not interactive: <error> — the session holding the name is not this launch's (by its label's token), or the row has no launch start; the approver stops with nothing typed and nothing killed (b.jg5 SRJ-118, SRJ-404)` (or `status of …`, `read-pane of …`) | agent-director refused to read or type into the starting instance: the tmux session holding the persona's name is not the one this launch created, or its record carries no launch start. The server stops answering its startup prompts, types nothing and ends nothing. Cause: usually a session left from an earlier launch, or one started by hand, holds the name. Fix: with the operator's say-so, look at it (`tmux attach -t =slack_bot_<key>`) and check the record with `agent-director get --claude-instance-id cscb_<key>`, then follow the "Operator actions" section of agent-director's README. |
+| `[slack] approvePreSessionDialogs: read-pane of "<name>" (key=<key>) answered that tmux is not available: <error> — the approver stops; the tmux-unavailable outage is raised and nothing is counted (b.jg5 SRJ-311, SRJ-404)` (or `status of …`, `send-keys of …`) | tmux couldn't be reached while the instance was starting. The server stops answering its startup prompts; the persona's *tmux unavailable* notice and its retries follow (see **tmux isn't available** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)). Nothing is counted toward the restart limit. Fix tmux as that entry says. |
+| `[slack] approvePreSessionDialogs: send-keys of "<name>" (key=<key>) refused: <error> — CONFLICT: <outcome>; the approver stops; nothing typed (b.jg5 SRJ-404, SRJ-501)` (or `status of …`, `read-pane of …`) | agent-director refused to act on the starting instance's tmux session (a conflict). The persona is held (`<outcome>`: `the persona latched`, `the persona relatched` or `the persona was already latched with this case`), nothing is typed, and the server stops answering its startup prompts. See [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice). |
+| `[slack] approvePreSessionDialogs: read-pane of "<name>" (key=<key>) refused: <error> — UNUSABLE NAME: <outcome>; the approver stops; nothing typed (b.jg5 SRJ-404, SRJ-512)` (or `send-keys of …`) | agent-director can't use the tmux session name recorded for the starting instance. The persona is held, nothing is typed, and the server stops answering its startup prompts. See [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice). |
+| `[slack] approvePreSessionDialogs: "<name>" (key=<key>) is latched — the approver stops; nothing more is read or typed (b.jg5 SRJ-502)` | The persona was held (by any of the three *Held:* notices) before or while the server checked its starting instance. The server stops answering its startup prompts and types nothing more. See the *Held:* entry the persona's notice names. |
+| `[slack] approvePreSessionDialogs: stopping the approver for "<name>" (key=<key>) (latched): the persona latched; it makes no further call (b.jg5 SRJ-401, SRJ-404)` | The persona was held while its instance was starting; the server stops answering that instance's startup prompts at once. See the *Held:* entry the persona's notice names. |
 | `[slack] approvePreSessionDialogs: stopping the approver for "<name>" (key=<key>) (superseded): a later launch started its own approver; it makes no further call (b.jg5 SRJ-401, SRJ-404)` | The persona was launched again while the server was still answering the previous launch's startup prompts. Only the newest launch's prompts are answered. Normal after a quick relaunch; if it repeats for the same persona, look at its lines around this one for why it keeps being relaunched. |
 | `[slack] approvePreSessionDialogs: stopping the approver for "<name>" (key=<key>) (teardown): its teardown began; it makes no further call (b.jg5 SRJ-401, SRJ-404)` | The persona was removed or changed destructively while its instance was still starting. The server stops answering its startup prompts first, so nothing is typed into an instance being torn down. Normal; the teardown's own lines follow. |
 | `[slack] approvePreSessionDialogs: stopping the approver for "<name>" (key=<key>) (shutdown): the server is shutting down; it makes no further call (b.jg5 SRJ-401, SRJ-404)` | The server stopped while a persona's instance was still starting. Its startup prompts are not answered any more; the instance is left as it is and the next start handles it. Nothing to do. |
@@ -2503,6 +2537,14 @@ nine keys and their defaults.
   fixed, the server picks it up within about 120 s, with no restart.
 - **Who decides:** agent-director's own answers always decide. The server's
   reading of the file never overrides what agent-director does or reports.
+- **What `pending_grace_seconds` sets on the server's side:** how long and
+  how often the server watches a just-launched instance to answer its
+  startup prompts. It watches for at most the later of 5 minutes and
+  `pending_grace_seconds` plus 60 s, counted from the launch's start (5
+  minutes at the default 60; 6 minutes at 300). It checks once a second,
+  then once every 5 s once `pending_grace_seconds` has passed since the
+  launch's start. The value in effect is used at each check, so a change is
+  used within about 120 s, as above.
 
 ### The call timeout
 

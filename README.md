@@ -1280,7 +1280,22 @@ While a persona is down, its Claude instance keeps running and keeps its history
 The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step. It ships in the package at `skills/debug-slack-channel-bots/SKILL.md`, and postinstall links it into `~/.claude/skills/debug-slack-channel-bots`; a copied directory or file already at that path is left in place, and postinstall logs `skipped: <path> (not a link; …)` — remove it and re-run postinstall to get the link. Invoke `/debug-slack-channel-bots` from Claude Code.
 
 **A persona's instance waits at a startup prompt**
-After each launch of a persona's instance (a start, a restart, a resume or a confirmed change's bring-up), the server watches it through agent-director while it starts. When Claude Code's folder-trust or development-channels prompt shows, the server presses Enter to accept it. It types nothing else, and nothing at all when neither prompt shows; the server runs no tmux command for this. When agent-director reports the instance ended or missing before it started, the server stops watching at once, and the restart handling decides what happens next.
+After each launch of a persona's instance (a start, a restart, a resume or a confirmed change's bring-up), the server watches it through agent-director while it starts. When Claude Code's folder-trust or development-channels prompt shows, the server presses Enter to accept it. It types nothing else, and nothing at all when neither prompt shows; the server runs no tmux command for this.
+
+How long and how often it watches:
+
+- It watches until the session starts, for at most the later of 5 minutes and agent-director's `pending_grace_seconds` plus 60 s, counted from the launch's start (see [agent-director's timing settings](#agent-directors-timing-settings)). At the defaults that is 5 minutes.
+- It looks once a second, and once every 5 s after `pending_grace_seconds` has passed since the launch's start. After agent-director answers that it can't act right now, or refuses its config file, the next look also waits 5 s.
+- When that time runs out it gives up: it writes one line to `server.log` and, during a server start, a `dev-channels-approve-not-ready` entry (see [Startup errors](#startup-errors)). Nothing is posted to Slack.
+
+It also stops watching, with a line in `server.log`, when:
+
+- agent-director reports the instance ended or missing, or its session gone: the restart handling decides what happens next;
+- agent-director says the session holding the persona's name is not this launch's: nothing is typed and nothing is ended;
+- the persona is held: see the *Held:* entries below ("A persona posts a *Held: tmux session conflict* notice", "… *Held: unusable tmux session name* …" and "… *Held: launch start not recorded* …"). A hold set while it watches stops it at once, and nothing is typed;
+- tmux is unavailable: see "A persona posts a *tmux unavailable* or *tmux server changed* notice" below.
+
+When agent-director refuses its config file ("A persona posts an *agent-director refuses its config file* notice" below), the server keeps watching within the same time limit.
 
 To look at the session, or to answer its prompt by hand, attach to it:
 
@@ -1624,7 +1639,7 @@ The following classes are **non-fatal** failures while preparing or launching pe
 - `trust-bootstrap` — an unexpected error while pre-accepting a persona's workspace trust, such as a failed write of `.claude.json`; the line names the persona and its working directory. Check that the file is writable.
 - `spawn-failed` — launching, resuming or reconnecting a persona's instance failed; the line names the persona and the step. The server keeps running; see "Session not restarting after crash" in [Troubleshooting](#troubleshooting) for how restarts are retried. No `spawn-failed` entry is written when agent-director refuses the call or can't read the persona's state (it is unreachable, answers that it can't act right now, or refuses its own config file), or answers with an error the server can't classify: such a refusal is not a failure, and the server retries the persona on its own. See "A persona is retried after agent-director refuses it", "A persona posts a *Not answering*, *Still not answering* or *Answering again* notice", "A persona posts an *agent-director refuses its config file* notice" and "A persona posts an *Unclassified agent-director error* notice" in [Troubleshooting](#troubleshooting).
 - `dev-channels-approve-spawn-died` — during a server start, agent-director reported a persona's instance ended or missing before its startup prompt was cleared; the entry is written as soon as that is found. Restarts are retried as for `spawn-failed`. See "A persona's instance waits at a startup prompt" in [Troubleshooting](#troubleshooting).
-- `dev-channels-approve-not-ready` — a persona's instance didn't become ready in time: its startup dialog wasn't recognised or the session hung. A `Spawn failure:` notice is also posted to the persona's destination. Inspect the instance with `agent-director read-pane --claude-instance-id <id>`.
+- `dev-channels-approve-not-ready` — during a server start, a persona's instance didn't start within the time the server watches it (see "A persona's instance waits at a startup prompt" in [Troubleshooting](#troubleshooting)): its startup dialog wasn't recognised or the session hung. Nothing is posted to Slack. Inspect the instance with `agent-director read-pane --claude-instance-id <id>`.
 - `spawn-failure-post` — posting a `Spawn failure:` notice to a persona's destination failed. The notice is held and retried; see "A permission prompt or notice doesn't arrive" in [Troubleshooting](#troubleshooting).
 - `orphan-cleanup-list-failed` — the server couldn't list its agent-director instances to remove stale ones (see "Bots come back with no memory" in [Troubleshooting](#troubleshooting)). Nothing is removed at this start.
 - `orphan-cleanup` — killing or deleting one such instance failed; the line names the instance and the persona label it carries. A `kill failed for pre-persona row` line names a bot instance from before the upgrade to personas: its row is kept, and its session may still be running. Check with `tmux ls` as in [First start on a host with running bots](#first-start-on-a-host-with-running-bots).
