@@ -40,11 +40,13 @@
  *      and a resume's `ErrInvalidFlags` after its re-check) outcome at any
  *      spawn, resume, kill, delete or reconnect keystroke, or a read error (an
  *      ENVIRONMENT, CONFIG or UNCLASSIFIED answer included) at the collision
- *      `get` or the working-row wait's `status`. It is logged once and stops
- *      the ladder with `failed`: no notice, no `spawn-failed` entry, no
- *      `dead-session` verdict, and no further kill, delete or launch. An
- *      UNCLASSIFIED outcome has also been reported to the persona's
- *      unclassified-error episode (`src/persona-episodes.ts`).
+ *      `get`. It is logged once and stops the ladder with `failed`: no
+ *      notice, no `spawn-failed` entry, no `dead-session` verdict, and no
+ *      further kill, delete or launch. An UNCLASSIFIED outcome has also been
+ *      reported to the persona's unclassified-error episode
+ *      (`src/persona-episodes.ts`). A `status` error in the working-row wait
+ *      is no refusal: the wait goes on, or at its timeout ends
+ *      `not-reconnected` (b.jg5 SRJ-605, `waitForWaitingAndReconnect`).
  *   4. A CONFLICT (`ErrTmuxSessionConflict`, b.jg5 SRJ-105, SRJ-501) at any
  *      spawn or resume the ladder makes (the first spawn, its self-heal
  *      spawn, the retry spawn after the collision `get` found no row, the
@@ -210,7 +212,6 @@ import {
   ErrSpawnNotInteractive,
   ERR_SPAWN_NOT_FOUND_NAME,
   ERR_SPAWN_NOT_INTERACTIVE_NAME,
-  ERR_SYSTEM_INSTALL_DISAPPEARED_NAME,
 } from './agent-director-errors.ts'
 import {
   AD_CALL_KILL_ROW_READ_LIVE,
@@ -1615,18 +1616,6 @@ function latchOnConflict(key: string, err: unknown, operation: RefusedOperation,
 }
 
 /**
- * True when `err` is `ErrSystemInstallDisappeared`, recognised by name
- * through `src/ad-error-class.ts`. The launch wait's two status reads (the
- * poll and the timeout read) both answer an early 'failed' for it, so the two
- * reads keep one rule. An ENVIRONMENT answer (`ErrTmuxNotAvailable`) is not
- * this: at both reads it is a refusal (`refusalAt`, b.jg5 SRJ-311). Never
- * throws.
- */
-function isInstallGone(err: unknown): boolean {
-  return hasAdErrorName(err, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME)
-}
-
-/**
  * Why a persona is reported not connected (b.f2b), and what the notice says:
  * - `blocked-on-prompt`: its session shows a prompt or dialog that no one
  *   answered, and CSCB never types into one, so it won't reconnect the
@@ -1910,32 +1899,44 @@ export async function hasPersonaTmuxSession(key: string): Promise<boolean> {
 }
 
 /**
- * Reconnect outcome (b.3ce). `dead-session` means the session is provably
- * unusable — callers should recover via the resume/fresh-spawn path rather than
- * report a bare failure. Two classes of proof qualify:
- *   - the claude PROCESS is provably gone per AD's evidence-based
- *     findMissing + status verdict (waitForWaitingAndReconnect's ended/missing
- *     branch and its timeout branch; b.ecw), or AD refused reconnectMcp's
- *     keystrokes because it had ended the row or marked it missing since the
- *     caller read its state (`ErrSpawnNotInteractive`; b.dup), or
- *   - the tmux SESSION provably doesn't exist (the ErrSpawnNotFound paths where
- *     AD has no row to consult, and reconnectMcp's double-ErrTmuxSendKeys).
+ * Reconnect outcome (b.3ce). `dead-session` sends the caller to the
+ * resume/fresh-spawn path rather than a bare failure; that recovery's resume
+ * or spawn decides what holds the persona's name (agent-director classifies
+ * any leftover session, and a CONFLICT there latches the persona, b.jg5
+ * SRJ-501). It is answered when:
+ *   - agent-director's row says the claude process is gone: it reads `ended`
+ *     or `missing` (waitForWaitingAndReconnect's ended/missing branch and its
+ *     timeout branch, after an evidence-based findMissing sweep; b.ecw), or
+ *     agent-director refused reconnectMcp's keystrokes because it had ended
+ *     the row or marked it missing since the caller read its state
+ *     (`ErrSpawnNotInteractive`; b.dup);
+ *   - the row is absent: the wait's `status` answered `ErrSpawnNotFound`, at
+ *     the poll or the timeout (b.jg5 SRJ-605), with no tmux probe;
+ *   - reconnectMcp's keystrokes failed twice with `ErrTmuxSendKeys` (b.3ce).
+ * A verdict from a row read is not dead evidence (b.jg5 SRJ-611). A `status`
+ * error other than `ErrSpawnNotFound` never gives `dead-session`.
  */
 export type ReconnectOutcome = 'ok' | 'failed' | 'dead-session'
 
 /**
  * `waitForWaitingAndReconnect`'s outcome (b.f2b): a reconnect outcome (`ok`
- * only when `/mcp reconnect` was typed); `not-reconnected`: the wait ended
- * with the persona's session alive but typed nothing (the row moved to a live
- * transient state, agent-director lost the row while its tmux session lives,
- * or the timeout found it still live), and has logged what happens next for
- * the restart delay in effect (`reportWaitEndedDisconnected`); or `cancelled`:
+ * only when `/mcp reconnect` was typed; `dead-session` as `ReconnectOutcome`
+ * says, never for a `status` error other than `ErrSpawnNotFound`; `failed`
+ * only for a refused findMissing sweep, a failed or refused reconnect, or a
+ * server stop decided at the evidence read's version re-check, never for a
+ * `status` error, b.jg5 SRJ-605); `not-reconnected`: the wait ended with the
+ * persona's session alive, or its state unknown, but typed nothing (the row
+ * moved to a live transient state, the timeout found it still live, or the
+ * timeout `status` read failed), and has logged what happens next for the
+ * restart delay in effect (`reportWaitEndedDisconnected`); or `cancelled`:
  * the persona's teardown cancelled the wait (`cancelWorkingRowWait`), and
  * nothing was typed; or `latched`: the persona is latched after one of the
- * wait's agent-director calls (b.jg5 SRJ-502: a note its transcript `get`
- * read, or a latch set elsewhere), the wait called nothing more, typed
- * nothing and raised no not-connected notice, and the ladder answers
- * `latched`.
+ * wait's agent-director calls (b.jg5 SRJ-502, SRJ-608: an UNUSABLE NAME
+ * answer or a `pending` row with no launch start at a `status` read, a
+ * CONFLICT or UNUSABLE NAME at the evidence read's pane read, a note its
+ * transcript `get` read, or a latch set elsewhere), the wait called nothing
+ * more, typed nothing and raised no not-connected notice, and the ladder
+ * answers `latched`.
  */
 export type WaitReconnectOutcome = ReconnectOutcome | 'not-reconnected' | 'cancelled' | typeof WAIT_OUTCOME_LATCHED
 
@@ -3513,6 +3514,12 @@ function transcriptNoEvidence(transcript: TranscriptReading | undefined): string
   return transcript.kind === 'open' ? `its transcript "${transcript.snapshot.path}" does not end with a completed turn` : undefined
 }
 
+/**
+ * `staleWorkingRowIsIdle`'s answer when its pane read's version re-check
+ * decided that the server stops (b.jg5 SRJ-205).
+ */
+const WORKING_EVIDENCE_STOPPING = 'stopping'
+
 /** One launch wait's evidence for a `working` row (b.f2b). */
 interface WorkingPaneWatch {
   run: WorkingPaneRun | undefined
@@ -3542,10 +3549,16 @@ interface WorkingPaneWatch {
  * `latched` when the persona is latched after the read's pane or transcript
  * read (b.jg5 SRJ-502, `WorkingRowRead.latched`; a pane read's CONFLICT or
  * UNUSABLE NAME answer latches it with the wait's last read, b.jg5 SRJ-117,
- * SRJ-501, SRJ-512, and a latched persona's pane is not read):
+ * SRJ-501, SRJ-512, SRJ-608, and a latched persona's pane is not read):
  * nothing is logged, folded or reported, and the wait ends with nothing
- * typed. The state the transcript `get` read, when it was made, becomes the
- * wait's last read (`wait.lastRead`, b.jg5 SRJ-501).
+ * typed. `stopping` (`WORKING_EVIDENCE_STOPPING`) when the pane read's
+ * UNCLASSIFIED carries the stop mark (b.jg5 SRJ-205: the shared reader's
+ * `ErrInvalidFlags` re-check decided that the server stops): one line,
+ * nothing folded or reported, and the wait ends with nothing typed. Every
+ * other failed pane read (GONE, an absent row, UNAVAILABLE, ENVIRONMENT,
+ * CONFIG, UNCLASSIFIED) is no evidence (b.jg5 SRJ-117, SRJ-608). The state
+ * the transcript `get` read, when it was made, becomes the wait's last read
+ * (`wait.lastRead`, b.jg5 SRJ-501).
  */
 async function staleWorkingRowIsIdle(
   key: string,
@@ -3553,7 +3566,7 @@ async function staleWorkingRowIsIdle(
   config: PersonaConfig,
   watch: WorkingPaneWatch,
   wait: WorkingRowWait,
-): Promise<boolean | typeof WAIT_OUTCOME_LATCHED> {
+): Promise<boolean | typeof WAIT_OUTCOME_LATCHED | typeof WORKING_EVIDENCE_STOPPING> {
   const due = _now()
   if (watch.lastReadAt !== undefined && due - watch.lastReadAt < _workingRowReadIntervalMs) return false
   watch.lastReadAt = due
@@ -3564,7 +3577,17 @@ async function staleWorkingRowIsIdle(
     wait.lastRead ?? latchRowStateRead('working'),
   )
   if (read.rowRead !== undefined) wait.lastRead = read.rowRead
+  // b.jg5 SRJ-608: a CONFLICT (or UNUSABLE NAME) at the pane read latched P;
+  // the wait ends `latched` with no further call and nothing typed.
   if (read.latched) return WAIT_OUTCOME_LATCHED
+  // b.jg5 SRJ-205: the pane read's version re-check decided that the server
+  // stops; the wait ends with no further call and nothing typed.
+  if (read.paneFailure?.kind === PANE_READ_UNCLASSIFIED && read.paneFailure.stopping === true) {
+    console.error(
+      `[slack] waitForWaitingAndReconnect: reading the pane of ${ref} failed: ${read.paneFailure.description} — the agent-director version re-check decided that the server stops; the wait ends, nothing more is called and nothing is typed (${paneReadClassNote(read.paneFailure)}; b.jg5 SRJ-204, SRJ-205)`,
+    )
+    return WORKING_EVIDENCE_STOPPING
+  }
   if (read.paneFailure !== undefined && !watch.readFailureLogged) {
     watch.readFailureLogged = true
     console.error(
@@ -3978,11 +4001,19 @@ interface WorkingRowWait {
   /** Ends the wait's current poll sleep at once (a no-op between sleeps). */
   wake: () => void
   /**
-   * b.jg5 SRJ-105: set when the wait answers 'failed' for a refusal (a read
-   * error at its poll or timeout `status`, or a refused reconnect), so the
-   * ladder records no `spawn-failed` entry for it.
+   * b.jg5 SRJ-105: set when the wait answers 'failed' for a refusal (a
+   * refused findMissing sweep or a refused reconnect), so the ladder records
+   * no `spawn-failed` entry for it. A `status` error never ends the wait
+   * 'failed' (b.jg5 SRJ-605).
    */
   refused?: true
+  /**
+   * b.jg5 SRJ-205: set when the wait answers 'failed' because its evidence
+   * read's version re-check decided that the server stops; the ladder answers
+   * a `failed` result marked `stopping`, records no `spawn-failed` entry and
+   * posts nothing.
+   */
+  stopping?: true
   /**
    * b.jg5 SRJ-501: the row state the wait's last `status` read gave (no row
    * for `ErrSpawnNotFound`), for a CONFLICT at the resume or spawn the ladder
@@ -4093,33 +4124,137 @@ export const PROMPT_ROW_STATES: ReadonlySet<string> = new Set(['ask_user', 'chec
  * nothing reconnects it), else `auto-restart-disabled` with `cause`. (The
  * timeout words a `working` row's as `unproven-idle` itself.)
  */
-function waitEndedNotice(state: string, cause: string): NotConnectedNotice {
+export function waitEndedNotice(state: string, cause: string): NotConnectedNotice {
   return PROMPT_ROW_STATES.has(state)
     ? { reason: 'blocked-on-prompt', autoRestartDisabled: true }
     : { reason: 'auto-restart-disabled', cause }
 }
 
 /**
- * b.f2b: the wait ends with the persona's session alive but not reconnected.
- * Log what happens next for the restart delay in effect: with auto-restart
- * on, `logHead` and `enabledFollowUp` (the recovery the health check drives);
- * with `session_restart_delay` 0, that nothing will reconnect it, and raise
- * the once-per-episode not-connected `notice`, so the persona is never left
- * down silently. Returns the wait's outcome, `not-reconnected`.
+ * How a launch wait that ends `not-reconnected` reports itself (b.f2b,
+ * `reportWaitEndedDisconnected`): the head of its log line, the line's
+ * follow-up with auto-restart on (the recovery the health check drives), and
+ * the not-connected notice raised with `session_restart_delay` 0.
  */
-function reportWaitEndedDisconnected(
-  key: string,
-  config: PersonaConfig,
-  logHead: string,
-  enabledFollowUp: string,
-  notice: NotConnectedNotice,
-): 'not-reconnected' {
-  if (config.session_restart_delay !== 0) {
-    console.error(`${logHead}; ${enabledFollowUp}`)
-    return 'not-reconnected'
+export interface WaitEndedReport {
+  readonly logHead: string
+  readonly enabledFollowUp: string
+  readonly notice: NotConnectedNotice
+}
+
+/**
+ * The report of a wait whose poll read the row in `state`, a live state that
+ * is neither `waiting` nor `working` (b.f2b): the notice is
+ * `blocked-on-prompt` for a prompt state (`waitEndedNotice`).
+ */
+export function waitEndedOnStateReport(ref: string, state: string): WaitEndedReport {
+  return {
+    logHead: `[slack] waitForWaitingAndReconnect: ${ref} transitioned to state=${state} — aborting`,
+    enabledFollowUp:
+      'the health check reconnects it (tick sees alive && !connected on two ticks -> scheduleRestart -> reconnect, b.9a7; an ask_user or check_permission row is never typed into, b.f2b)',
+    notice: waitEndedNotice(state, `it moved to state ${state} while CSCB waited to reconnect it`),
   }
-  console.error(`${logHead}; session_restart_delay is 0, so nothing will reconnect it — the not-connected notice reports it (once per episode) (b.f2b)`)
-  notifyPersonaNotConnected(key, notice)
+}
+
+/**
+ * The report of a wait whose timeout read found the row in `state`, a live
+ * state other than `waiting` (b.f2b), `timeoutMs` after it started; the
+ * health check's `working`-row report comes after `unprovenIdleAfterMs` of
+ * holding back. A `working` row's notice is `unproven-idle`, held for
+ * `heldMs` (required for it); any other state's is `waitEndedNotice`'s.
+ */
+export function waitTimedOutLiveReport(
+  ref: string,
+  timeoutMs: number,
+  unprovenIdleAfterMs: number,
+  state: string,
+  heldMs?: number,
+): WaitEndedReport {
+  return {
+    logHead: `[slack] reconnect: gave up waiting for ${ref} after ${timeoutMs}ms — claude process state=${state} (alive)`,
+    enabledFollowUp: `the health check schedules a reconnect once it has seen the persona disconnected on two ticks; for a working row it types /mcp reconnect only once its pane has shown the same idle screen and its transcript has ended with a completed turn, both unchanged, across attempts, and never into a prompt, and it reports the persona once CSCB has held back from the row for ${describeWaitSpan(unprovenIdleAfterMs)} (b.9a7/b.rmy/b.f2b)`,
+    notice:
+      state === 'working'
+        ? { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: heldMs ?? 0 }
+        : waitEndedNotice(
+            state,
+            `its agent-director row still read ${state} ${describeWaitSpan(timeoutMs)} after launch, and CSCB found no proof it was idle`,
+          ),
+  }
+}
+
+/**
+ * The report of a wait whose timeout `status` read failed with any error but
+ * `ErrSpawnNotFound` (b.jg5 SRJ-605), `timeoutMs` after it started:
+ * `described` is the error through the redacting describer and `errorClass`
+ * its class. The line names no tmux session; the notice is
+ * `auto-restart-disabled`, saying agent-director could not report the
+ * persona's state.
+ */
+export function waitTimedOutUnreadReport(
+  ref: string,
+  timeoutMs: number,
+  described: string,
+  errorClass: AdErrorClass,
+): WaitEndedReport {
+  return {
+    logHead: `[slack] waitForWaitingAndReconnect: timed out for ${ref} after ${timeoutMs}ms — its status read failed: ${described} (class=${errorClass}), so its state is not known — not reconnected (b.jg5 SRJ-605)`,
+    enabledFollowUp:
+      "the health check recovers it from its own reads of the row: once agent-director answers with the row live and the persona disconnected, the tick schedules a reconnect (b.9a7)",
+    notice: {
+      reason: 'auto-restart-disabled',
+      cause: `agent-director could not report its state when CSCB stopped waiting for it, ${describeWaitSpan(timeoutMs)} after launching it`,
+    },
+  }
+}
+
+/**
+ * The one line a wait ending `not-reconnected` writes (b.f2b): `report`'s
+ * head and, with `session_restart_delay` (`sessionRestartDelay`) on, its
+ * follow-up; with it 0, that nothing will reconnect the persona and the
+ * not-connected notice reports it.
+ */
+export function waitEndedDisconnectedLine(
+  report: Pick<WaitEndedReport, 'logHead' | 'enabledFollowUp'>,
+  sessionRestartDelay: number,
+): string {
+  return sessionRestartDelay !== 0
+    ? `${report.logHead}; ${report.enabledFollowUp}`
+    : `${report.logHead}; session_restart_delay is 0, so nothing will reconnect it — the not-connected notice reports it (once per episode) (b.f2b)`
+}
+
+/**
+ * The line of a wait whose `status` read found persona `ref`'s row absent
+ * (`ErrSpawnNotFound`, b.jg5 SRJ-605): at the poll, or, with `timedOutAfterMs`,
+ * at the timeout read. The wait answers 'dead-session' with no tmux probe;
+ * the recovery's spawn classifies any leftover session.
+ */
+export function waitRowAbsentLine(ref: string, timedOutAfterMs?: number): string {
+  const at = timedOutAfterMs === undefined ? `${ref}'s` : `timed out for ${ref} after ${timedOutAfterMs}ms —`
+  return `[slack] waitForWaitingAndReconnect: ${at} agent-director row is absent (ErrSpawnNotFound) — dead session; the recovery's spawn classifies any leftover session (b.jg5 SRJ-605)`
+}
+
+/**
+ * The line of a wait whose poll `status` read failed with any error but
+ * `ErrSpawnNotFound` (b.jg5 SRJ-605): `described` is the error through the
+ * redacting describer and `errorClass` its class. The wait goes on; it writes
+ * this for its first failed read and again only when the class changes.
+ */
+export function waitPollStatusErrorLine(ref: string, described: string, errorClass: AdErrorClass): string {
+  return `[slack] waitForWaitingAndReconnect: status read failed for ${ref}: ${described} (class=${errorClass}) — its state is not known; still waiting for its working row, nothing posted (b.jg5 SRJ-605)`
+}
+
+/**
+ * b.f2b: the wait ends with the persona's session alive but not reconnected.
+ * Log what happens next for the restart delay in effect
+ * (`waitEndedDisconnectedLine`): with auto-restart on, the recovery the health
+ * check drives; with `session_restart_delay` 0, that nothing will reconnect
+ * it, and raise the once-per-episode not-connected notice, so the persona is
+ * never left down silently. Returns the wait's outcome, `not-reconnected`.
+ */
+function reportWaitEndedDisconnected(key: string, config: PersonaConfig, report: WaitEndedReport): 'not-reconnected' {
+  console.error(waitEndedDisconnectedLine(report, config.session_restart_delay))
+  if (config.session_restart_delay === 0) notifyPersonaNotConnected(key, report.notice)
   return 'not-reconnected'
 }
 
@@ -5210,41 +5345,6 @@ async function launchOnPromptRow(
 }
 
 /**
- * b.ecw: the timeout-branch tmux-probe fallback. When the timeout status call
- * throws and AD therefore has nothing to say, key on the tmux SESSION (the only
- * object left) so an AD outage can't manufacture a false 'dead-session' — the
- * b.rmy invariant. `reason` is the log fragment describing why we fell back
- * (e.g. `spawn not found`, `status error ${errName}`): alive →
- * 'not-reconnected' (b.f2b; 'ok' before), which says what happens next for
- * the restart delay in effect (`reportWaitEndedDisconnected`); gone →
- * 'dead-session'.
- */
-async function tmuxFallbackVerdict(
-  key: string,
-  config: PersonaConfig,
-  ref: string,
-  reason: string,
-): Promise<WaitReconnectOutcome> {
-  const sessionName = personaTmuxSessionName(key)
-  if (await _hasTmuxSession(sessionName)) {
-    return reportWaitEndedDisconnected(
-      key,
-      config,
-      `[slack] waitForWaitingAndReconnect: timed out for ${ref} after ${_waitForWaitingTimeoutMs}ms — ${reason}, tmux session alive`,
-      'the health check recovers it (b.9a7): while a status error reads unknown the tick skips the persona (no restart); a missing row reads dead and the tick relaunches it; once AD answers with the row live, the tick sees alive && !connected -> scheduleRestart -> reconnect',
-      {
-        reason: 'auto-restart-disabled',
-        cause: `agent-director could not report its state when CSCB stopped waiting for it, ${describeWaitSpan(_waitForWaitingTimeoutMs)} after launching it`,
-      },
-    )
-  }
-  console.error(
-    `[slack] waitForWaitingAndReconnect: timed out for ${ref} after ${_waitForWaitingTimeoutMs}ms — ${reason} and tmux session "${sessionName}" is gone — dead session`,
-  )
-  return 'dead-session'
-}
-
-/**
  * Poll `status({claude_instance_id})` until the spawn transitions to
  * `waiting`, then call reconnectMcp. Transitions to live transient states
  * (ask_user, check_permission, pending) return 'not-reconnected' (b.f2b;
@@ -5277,14 +5377,16 @@ async function tmuxFallbackVerdict(
  * any restart delay (once per episode). Any other state ends the run.
  *
  * b.f2b — every wait that ends without reconnecting a live session (a live
- * transient state, a missing row with a live tmux session, the timeout)
- * returns 'not-reconnected' and says what happens next for the restart delay
- * in effect: with `session_restart_delay` 0 nothing will reconnect the
- * persona, so the not-connected notice is raised (once per episode) instead
- * of claiming the health check will (`reportWaitEndedDisconnected`): the
- * `blocked-on-prompt` notice when the row ended at `ask_user` or
- * `check_permission`, `unproven-idle` when the timeout finds it `working`,
- * the `auto-restart-disabled` one otherwise.
+ * transient state at the poll; at the timeout, a live row or a failed
+ * `status` read) returns 'not-reconnected' and says what happens next for
+ * the restart delay in effect: with `session_restart_delay` 0 nothing will
+ * reconnect the persona, so the not-connected notice is raised (once per
+ * episode) instead of claiming the health check will
+ * (`reportWaitEndedDisconnected`, its line and notice built by
+ * `waitEndedOnStateReport`, `waitTimedOutLiveReport` and
+ * `waitTimedOutUnreadReport`): the `blocked-on-prompt` notice when the row
+ * ended at `ask_user` or `check_permission`, `unproven-idle` when the timeout
+ * finds it `working`, the `auto-restart-disabled` one otherwise.
  *
  * b.f2b — a teardown cancels the wait (`cancelWorkingRowWait`). The wait
  * checks after each agent-director call and wakes from its poll sleep at
@@ -5298,44 +5400,58 @@ async function tmuxFallbackVerdict(
  * with 'latched', one line, no further call, nothing typed and no
  * not-connected notice. A cancelled wait still answers 'cancelled'.
  *
- * b.ecw — which object each terminal branch keys on. AD probes the claude
- * PROCESS; CSCB's `_hasTmuxSession` probes the TMUX SESSION. A lingering tmux
- * shell with a dead claude process would flip the two verdicts, so the choice
- * is made per branch (requires AD ≥ 0.8.0 / b.93m Part E — degraded-mode guard
- * removed, findMissing verdicts per-row and evidence-based):
- *   - ended/missing branch: keys on the claude process. `ended` means
- *     SessionEnd fired (process exited); `missing` after the up-front sweep is
- *     an evidence-based verdict that the process is provably gone. Returns
- *     'dead-session' directly — no tmux probe. A dead process in a live tmux
- *     shell is a dead bot; the resume/fresh-spawn path's b.vub self-heal reaps
- *     the orphan tmux session.
- *   - timeout branch: keys on the claude process via a FRESH findMissing sweep
- *     (the 10s memo has long expired at the 10-minute deadline) + one status
- *     call. A `waiting` row is reconnected (b.f2b); a process mid-long-turn
- *     is left alive, 'not-reconnected' (the b.rmy/b.3ce long-turn guard, now
- *     keyed on the process); only a provably-gone process returns
- *     'dead-session'. On ErrSpawnNotFound it falls back to the raw tmux
- *     probe (b.rmy invariant).
- *   - read errors (b.jg5 SRJ-105, SRJ-311, SRJ-316), at the poll and at the
- *     timeout `status` alike: ErrSystemInstallDisappeared returns 'failed'
- *     quietly; any other error but ErrSpawnNotFound and an UNUSABLE NAME
- *     answer, an ENVIRONMENT answer (ErrTmuxNotAvailable) and a CONFIG
- *     answer (ErrConfigMalformed, whose wrapper raised `ad-config-malformed`)
- *     included, is a refusal (`refusalAt`): one line, no notice, no
- *     `spawn-failed` entry, no tmux fallback, never 'dead-session', and
- *     'failed'.
- *   - an UNUSABLE NAME answer (b.jg5 SRJ-105, SRJ-512), at the poll or the
- *     timeout `status` (both through `readPersonaOwnRowStatus`) or at a pane
- *     read or transcript `get` of the evidence read: the persona latches and
- *     the wait ends 'latched', with nothing typed, no not-connected notice,
- *     no tmux fallback and never 'dead-session'. A `status` answer records
- *     the state unreadable (`wait.lastRead`); a pane read records the
+ * b.ecw, b.jg5 SRJ-605 — every terminal branch keys on agent-director's row
+ * for the claude process; the wait makes no tmux probe. Where it answers
+ * 'dead-session', the recovery's resume or spawn (`resumeOrFreshSpawn`)
+ * decides what holds the persona's name: agent-director classifies any
+ * leftover session, and a CONFLICT there latches the persona (b.jg5
+ * SRJ-501). A 'dead-session' from a row read is not dead evidence (b.jg5
+ * SRJ-611).
+ *   - ended/missing branch: `ended` means SessionEnd fired (the process
+ *     exited); `missing` after the up-front sweep is agent-director's
+ *     evidence-based verdict that the process is gone. Returns
+ *     'dead-session' directly.
+ *   - timeout branch: a FRESH findMissing sweep (the 10s memo has long
+ *     expired at the 10-minute deadline) + one status call. A `waiting` row
+ *     is reconnected (b.f2b); a process mid-long-turn is left alive,
+ *     'not-reconnected' (the b.rmy/b.3ce long-turn guard); only a row that
+ *     reads `ended` or `missing`, or is absent, returns 'dead-session'.
+ *   - an absent row (`ErrSpawnNotFound`), at the poll or the timeout
+ *     `status`: one line, then 'dead-session'.
+ *   - any other `status` error (UNAVAILABLE, a timeout, ENVIRONMENT, CONFIG,
+ *     UNCLASSIFIED, `ErrSystemInstallDisappeared` included; b.jg5 SRJ-605):
+ *     never 'dead-session', 'failed' or a refusal. At the poll the wait goes
+ *     on to its next poll with no post, logging its first failed read and
+ *     again only when the class changes; at the timeout it ends
+ *     'not-reconnected' through `reportWaitEndedDisconnected`. The wrapper
+ *     raised the error's outage (`ad-unreachable`, `tmux-unavailable`,
+ *     `ad-config-malformed`), armed the persona's retry timer and reported
+ *     an UNCLASSIFIED answer to its episode, as at any row read in a launch
+ *     attempt (b.jg5 SRJ-105, SRJ-301), so the launch's result follows the
+ *     wait's outcome.
+ *   - an UNUSABLE NAME answer (b.jg5 SRJ-105, SRJ-512), or the persona's own
+ *     row reading `pending` with no launch start (b.jg5 SRJ-513), at the
+ *     poll or the timeout `status` (both through `readPersonaOwnRowStatus`),
+ *     or an UNUSABLE NAME at a pane read or transcript `get` of the evidence
+ *     read: the persona latches and the wait ends 'latched', with nothing
+ *     typed, no not-connected notice and never 'dead-session'. A `status`
+ *     answer records what it read (`wait.lastRead`); a pane read records the
  *     wait's last read; a transcript `get` that read a row, or no row,
  *     becomes the wait's last read (b.jg5 SRJ-501).
+ *   - a CONFLICT at the evidence read's pane read (b.jg5 SRJ-608): the
+ *     shared reader latches the persona with the refused operation "P's next
+ *     check or recovery" and the wait's last read, and the wait ends
+ *     'latched' at once, with no further call and nothing typed. Every other
+ *     failed pane read (GONE, an absent row, UNAVAILABLE, ENVIRONMENT, CONFIG,
+ *     UNCLASSIFIED) is no evidence and the wait goes on.
+ *   - an UNCLASSIFIED at the evidence read's pane read carrying the stop mark
+ *     (`stopping`: the shared reader's `ErrInvalidFlags` re-check decided
+ *     that the server stops, b.jg5 SRJ-205): one line, then 'failed' with the
+ *     stop noted on the wait, no further call and nothing typed; the ladder
+ *     answers a `failed` result marked `stopping`, as for a resume's re-check
+ *     stop.
  *   - a refused findMissing sweep (b.jg5 SRJ-105), up front or at the
  *     timeout: its refusal line, then 'failed' with no status read.
- *   - ErrSpawnNotFound branch: keys on the TMUX SESSION by design — no AD row
- *     exists, so there is nothing to reconcile or consult (b.c3o).
  */
 export async function waitForWaitingAndReconnect(
   key: string,
@@ -5347,22 +5463,25 @@ export async function waitForWaitingAndReconnect(
 
 /**
  * `waitForWaitingAndReconnect`, also saying whether a `failed` outcome was a
- * refusal (b.jg5 SRJ-105): a refused findMissing sweep, a read error at the
- * poll or timeout `status`, or a refused reconnect. The ladder records no `spawn-failed` entry for it.
- * `lastRead` is the row state the wait's last `status` read gave (b.jg5
- * SRJ-501), absent when none answered.
+ * refusal (b.jg5 SRJ-105: a refused findMissing sweep or a refused
+ * reconnect; the ladder records no `spawn-failed` entry for it) or a stop
+ * (`stopping`, b.jg5 SRJ-205: the evidence read's version re-check decided
+ * that the server stops). `lastRead` is the row state the wait's last read
+ * gave (b.jg5 SRJ-501), absent when none answered.
  */
 async function waitForWaitingAndReconnectWithCause(
   key: string,
   config: PersonaConfig,
   ref: string,
-): Promise<{ outcome: WaitReconnectOutcome; refused?: true; lastRead?: LatchRowState }> {
+): Promise<{ outcome: WaitReconnectOutcome; refused?: true; stopping?: true; lastRead?: LatchRowState }> {
   const wait: WorkingRowWait = { cancelled: cancelledLaunchWaits.has(key), wake: () => {} }
   workingRowWaits.set(key, wait)
   try {
     const outcome = await waitForWorkingRow(key, config, ref, wait)
     const lastRead = wait.lastRead === undefined ? {} : { lastRead: wait.lastRead }
-    return outcome === 'failed' && wait.refused ? { outcome, refused: true, ...lastRead } : { outcome, ...lastRead }
+    if (outcome !== 'failed') return { outcome, ...lastRead }
+    if (wait.stopping) return { outcome, stopping: true, ...lastRead }
+    return wait.refused ? { outcome, refused: true, ...lastRead } : { outcome, ...lastRead }
   } finally {
     if (workingRowWaits.get(key) === wait) workingRowWaits.delete(key)
   }
@@ -5394,10 +5513,11 @@ async function waitForWorkingRow(
   ref: string,
   wait: WorkingRowWait,
 ): Promise<WaitReconnectOutcome> {
-  const sessionName = personaTmuxSessionName(key)
   const pollIntervalMs = config.agent_director_poll_interval_ms
   const waitStartedAt = _now()
   const deadline = waitStartedAt + _waitForWaitingTimeoutMs
+  /** The class of the poll's last logged `status` error (b.jg5 SRJ-605); undefined before the first. */
+  let loggedStatusErrorClass: AdErrorClass | undefined
   const paneWatch: WorkingPaneWatch = {
     run: undefined,
     lastReadAt: undefined,
@@ -5422,7 +5542,7 @@ async function waitForWorkingRow(
   // resumeOrFreshSpawn's reconcileMissingFirst branch. On a findMissing
   // error, log and fall through to the existing poll loop (today's
   // behavior), except a refused sweep (b.jg5 SRJ-105): nothing more is
-  // called, and the wait answers 'failed' as for a refused status read.
+  // called, and the wait answers 'failed' with the refusal noted.
   if (waitMustEnd(key, wait)) return endWait(ref, wait)
   const upFrontSweep = await reconcileMissingSweep(key, 'waitForWaitingAndReconnect', ref)
   if (upFrontSweep === FIND_MISSING_REFUSED) return refusedWaitSweep(key, ref, wait)
@@ -5436,7 +5556,7 @@ async function waitForWorkingRow(
     // b.jg5 SRJ-105, SRJ-512, SRJ-513: the read latched P (an UNUSABLE NAME
     // answer, recorded unreadable, or its own row reading `pending` with no
     // launch start, recorded `pending`): the wait ends `latched`, nothing
-    // typed, no not-connected notice and no tmux fallback.
+    // typed and no not-connected notice.
     if (read.kind === OWN_ROW_STATUS_LATCHED) {
       wait.lastRead = read.rowState
       return endWait(ref, wait)
@@ -5448,39 +5568,27 @@ async function waitForWorkingRow(
     } else {
       if (waitMustEnd(key, wait)) return endWait(ref, wait)
       if (read.kind === OWN_ROW_STATUS_ABSENT) {
+        // b.jg5 SRJ-605: the row is absent (`ErrSpawnNotFound`): 'dead-session'
+        // with no tmux probe; the recovery's spawn classifies any leftover
+        // session. A row read, so not dead evidence (b.jg5 SRJ-611).
         wait.lastRead = LATCH_ROW_STATE_NO_ROW
-        // b.c3o: spawn-not-found means the AD row is gone — same class as
-        // `missing`. Only the tmux session's actual existence decides the
-        // verdict, mirroring the timeout branch's own ErrSpawnNotFound
-        // sub-branch below.
-        if (await _hasTmuxSession(sessionName)) {
-          return reportWaitEndedDisconnected(
-            key,
-            config,
-            `[slack] waitForWaitingAndReconnect: spawn not found for ${ref} but tmux session alive — aborting poll`,
-            'the health check reads the missing row as dead and relaunches the persona',
-            { reason: 'auto-restart-disabled', cause: 'agent-director has no record of its session, though its tmux session is alive' },
-          )
-        }
-        console.error(`[slack] waitForWaitingAndReconnect: spawn not found for ${ref} and tmux session "${sessionName}" is gone — dead session`)
+        console.error(waitRowAbsentLine(ref))
         return 'dead-session'
       }
-      const err = read.error
-      if (isInstallGone(err)) {
-        return 'failed'
+      // b.jg5 SRJ-605: any other `status` error (UNAVAILABLE, ENVIRONMENT,
+      // CONFIG, UNCLASSIFIED, `ErrSystemInstallDisappeared` included) is
+      // transient: the wait goes on to its next poll, with no post and no
+      // result of its own. The wrapper has raised the error's outage, armed
+      // the retry timer and reported an UNCLASSIFIED episode (b.jg5 SRJ-105,
+      // SRJ-301). The wait's first failed read is logged, and again only
+      // when the class changes.
+      const errorClass = classifyAdError(read.error).errorClass
+      if (errorClass !== loggedStatusErrorClass) {
+        loggedStatusErrorClass = errorClass
+        console.error(waitPollStatusErrorLine(ref, describeAgentDirectorFailure(read.error), errorClass))
       }
-      // b.jg5 SRJ-105, SRJ-311, SRJ-316: any other read error, an
-      // ENVIRONMENT and a CONFIG answer included, is a refusal: no notice, no
-      // `spawn-failed` entry, nothing more is called.
-      if (refusalAt(key, err, 'status', 'waitForWaitingAndReconnect', 'status read', ref)) {
-        wait.refused = true
-        return 'failed'
-      }
-      // Not reached: every `status` error but ErrSpawnNotFound and UNUSABLE
-      // NAME is a refusal. Any other ends the wait 'failed', as at the
-      // timeout: no spawn-failure notice (b.jg5 SRJ-105).
-      console.error(`[slack] waitForWaitingAndReconnect: status error for ${ref}: ${describeAgentDirectorFailure(err)} — not reconnected`)
-      return 'failed'
+      await sleepUnlessCancelled(wait, pollIntervalMs)
+      continue
     }
     if (waitMustEnd(key, wait)) return endWait(ref, wait)
     // b.f2b: a run of deferrals on the `working` row ends with any other state.
@@ -5495,7 +5603,16 @@ async function waitForWorkingRow(
       // (the same idle screen and the same ended, unchanged transcript) — is
       // reconnected like a `waiting` one.
       const stale = await staleWorkingRowIsIdle(key, ref, config, paneWatch, wait)
+      // b.jg5 SRJ-608: the evidence read latched P (a pane read's CONFLICT
+      // or UNUSABLE NAME): `latched` at once, nothing more called or typed.
       if (stale === WAIT_OUTCOME_LATCHED) return endWait(ref, wait)
+      // b.jg5 SRJ-205: the pane read's version re-check decided the stop.
+      if (stale === WORKING_EVIDENCE_STOPPING) {
+        wait.stopping = true
+        return 'failed'
+      }
+      // b.jg5 SRJ-502: E14's after-call check — a latch set elsewhere, or a
+      // cancel, ends the wait.
       if (waitMustEnd(key, wait)) return endWait(ref, wait)
       if (stale) {
         endWorkingRowDeferral(key)
@@ -5508,50 +5625,41 @@ async function waitForWorkingRow(
       continue
     }
 
-    // b.ecw: post-b.93m (AD ≥ 0.8.0) this branch keys on the claude PROCESS,
-    // not the tmux session. `ended` means SessionEnd fired (the process
-    // exited); `missing` — after the up-front reconcileMissingSweep — is an
-    // evidence-based verdict that the process was probed and is provably gone.
-    // Either way the bot is dead, so return 'dead-session' directly with no
-    // tmux probe. A dead claude process in a lingering tmux shell is still a
-    // dead bot; routing it to resumeOrFreshSpawn lets b.vub's
-    // selfHealTmuxCollisionAndRespawn reap the orphan tmux session on
-    // ErrTmuxSessionCreate. (The old tmux-alive → 'ok' behavior deferred a dead
-    // persona to the health-check for minutes.) Live transient states
-    // (ask_user, check_permission, pending) still fall through to
-    // 'not-reconnected' below (b.f2b).
+    // b.ecw: this branch keys on the row agent-director keeps for the claude
+    // process. `ended` means SessionEnd fired (the process exited); `missing`
+    // (after the up-front reconcileMissingSweep) is agent-director's
+    // evidence-based verdict that the process is gone. Either way the wait
+    // returns 'dead-session' directly, with no tmux probe, and the recovery's
+    // resume or spawn (resumeOrFreshSpawn) decides what holds the persona's
+    // name: agent-director classifies any leftover session. A row read, so
+    // not dead evidence (b.jg5 SRJ-611). Live transient states (ask_user,
+    // check_permission, pending) fall through to 'not-reconnected' below
+    // (b.f2b).
     if (state === 'ended' || state === 'missing') {
       console.error(`[slack] waitForWaitingAndReconnect: ${ref} transitioned to state=${state} (claude process gone) — dead session`)
       return 'dead-session'
     }
 
-    return reportWaitEndedDisconnected(
-      key,
-      config,
-      `[slack] waitForWaitingAndReconnect: ${ref} transitioned to state=${state} — aborting`,
-      'the health check reconnects it (tick sees alive && !connected on two ticks -> scheduleRestart -> reconnect, b.9a7; an ask_user or check_permission row is never typed into, b.f2b)',
-      waitEndedNotice(state, `it moved to state ${state} while CSCB waited to reconnect it`),
-    )
+    return reportWaitEndedDisconnected(key, config, waitEndedOnStateReport(ref, state))
   }
 
-  // b.ecw: timed out — key on the claude PROCESS via AD, not the raw tmux
-  // session. The up-front sweep's 10s memo has long expired at the 10-minute
+  // b.ecw: timed out — key on agent-director's row for the claude process.
+  // The up-front sweep's 10s memo has long expired at the 10-minute
   // deadline, so run a FRESH reconcileMissingSweep (a real whole-store
   // findMissing) to reconcile a row frozen at `working`, then one status call.
-  // - ended/missing → the process is provably gone → 'dead-session'.
+  // - ended/missing → the process is gone → 'dead-session'.
   // - waiting → the turn ended at the deadline: reconnect (b.f2b).
   // - any other live state (working/ask_user/check_permission/pending) → a
   //   process merely mid-long-turn is left alive, 'not-reconnected' (b.f2b;
-  //   'ok' before) (b.rmy/b.3ce long-turn guard, now keyed on the process
-  //   rather than the tmux session).
-  // - ErrSpawnNotFound → the AD row is gone and AD has nothing to say, so fall
-  //   back to the tmux session (the only object left to key on), exactly like
-  //   the poll loop's ErrSpawnNotFound branch: alive → 'not-reconnected', gone
-  //   → 'dead-session'.
-  // - any other status error → 'failed', never 'dead-session' (b.jg5 SRJ-105,
-  //   below), a CONFIG answer included (SRJ-316: no tmux fallback); an
-  //   UNUSABLE NAME answer latches the persona and ends the wait 'latched'
-  //   (b.jg5 SRJ-512), never the tmux fallback.
+  //   the b.rmy/b.3ce long-turn guard).
+  // - ErrSpawnNotFound → the row is absent: 'dead-session', with no tmux
+  //   probe, as at the poll; the recovery's spawn classifies any leftover
+  //   session (b.jg5 SRJ-605).
+  // - any other status error → 'not-reconnected' through
+  //   reportWaitEndedDisconnected, never 'dead-session' or 'failed' (b.jg5
+  //   SRJ-605); an UNUSABLE NAME answer, or the row reading `pending` with
+  //   no launch start, latches the persona and ends the wait 'latched'
+  //   (b.jg5 SRJ-512, SRJ-513).
   // - a refused sweep → 'failed' with no status read (b.jg5 SRJ-105).
   if (waitMustEnd(key, wait)) return endWait(ref, wait)
   const timeoutSweep = await reconcileMissingSweep(key, 'waitForWaitingAndReconnect: timeout', ref)
@@ -5568,7 +5676,7 @@ async function waitForWorkingRow(
   // b.jg5 SRJ-105, SRJ-512, SRJ-513: the read latched P (an UNUSABLE NAME
   // answer, recorded unreadable, or its own row reading `pending` with no
   // launch start, recorded `pending`, b.jg5 SRJ-501): the wait ends
-  // `latched`, nothing typed, never the tmux fallback or 'dead-session'.
+  // `latched`, nothing typed, never 'dead-session'.
   if (timeoutRead.kind === OWN_ROW_STATUS_LATCHED) {
     wait.lastRead = timeoutRead.rowState
     return endWait(ref, wait)
@@ -5576,26 +5684,21 @@ async function waitForWorkingRow(
   if (timeoutRead.kind !== OWN_ROW_STATUS_STATE) {
     if (waitMustEnd(key, wait)) return endWait(ref, wait)
     if (timeoutRead.kind === OWN_ROW_STATUS_ABSENT) {
+      // b.jg5 SRJ-605: the row is absent: 'dead-session' with no tmux probe,
+      // as at the poll; not dead evidence (b.jg5 SRJ-611).
       wait.lastRead = LATCH_ROW_STATE_NO_ROW
-      return tmuxFallbackVerdict(key, config, ref, 'spawn not found')
+      console.error(waitRowAbsentLine(ref, _waitForWaitingTimeoutMs))
+      return 'dead-session'
     }
-    // b.jg5 SRJ-105, SRJ-311: a read error never reaches the tmux fallback,
-    // so it can never give 'dead-session'. ErrSystemInstallDisappeared takes
-    // the poll loop's early 'failed', so the two reads share one rule; any
-    // other read error, an ENVIRONMENT and a CONFIG answer included, is a
-    // refusal and never probes tmux (b.jg5 SRJ-316).
+    // b.jg5 SRJ-605: any other `status` error (`ErrSystemInstallDisappeared`
+    // included) ends the wait 'not-reconnected', never 'dead-session' or
+    // 'failed'; the wrapper has raised its outage and armed the retry timer.
     const err = timeoutRead.error
-    if (isInstallGone(err)) {
-      return 'failed'
-    }
-    if (refusalAt(key, err, 'status', 'waitForWaitingAndReconnect: timeout', 'status read', ref)) {
-      wait.refused = true
-      return 'failed'
-    }
-    // Not reached: every `status` error but ErrSpawnNotFound and UNUSABLE
-    // NAME is a refusal. Any other ends the wait 'failed', never probing tmux.
-    console.error(`[slack] waitForWaitingAndReconnect: timeout status error for ${ref}: ${describeAgentDirectorFailure(err)} — not reconnected`)
-    return 'failed'
+    return reportWaitEndedDisconnected(
+      key,
+      config,
+      waitTimedOutUnreadReport(ref, _waitForWaitingTimeoutMs, describeAgentDirectorFailure(err), classifyAdError(err).errorClass),
+    )
   }
   const timeoutState = timeoutRead.state
   wait.lastRead = latchRowStateRead(timeoutState)
@@ -5613,14 +5716,10 @@ async function waitForWorkingRow(
   // b.f2b: a `working` row given up on is one more deferral: a run that has
   // lasted UNPROVEN_IDLE_NOTICE_AFTER_MS raises the unproven-idle notice, at
   // any restart delay.
-  let notice = waitEndedNotice(
-    timeoutState,
-    `its agent-director row still read ${timeoutState} ${describeWaitSpan(_waitForWaitingTimeoutMs)} after launch, and CSCB found no proof it was idle`,
-  )
+  let heldMs: number | undefined
   if (timeoutState === 'working') {
-    const heldMs = _now() - (workingRowDeferredSince.get(key) ?? waitStartedAt)
+    heldMs = _now() - (workingRowDeferredSince.get(key) ?? waitStartedAt)
     noteWorkingRowDeferral(key, config.session_restart_delay === 0)
-    notice = { reason: 'unproven-idle', autoRestartDisabled: true, heldMs }
   }
   // b.f2b: say what actually happens next for the restart delay in effect.
   // With auto-restart on, the health check schedules the reconnect, whose
@@ -5632,9 +5731,7 @@ async function waitForWorkingRow(
   return reportWaitEndedDisconnected(
     key,
     config,
-    `[slack] reconnect: gave up waiting for ${ref} after ${_waitForWaitingTimeoutMs}ms — claude process state=${timeoutState} (alive)`,
-    `the health check schedules a reconnect once it has seen the persona disconnected on two ticks; for a working row it types /mcp reconnect only once its pane has shown the same idle screen and its transcript has ended with a completed turn, both unchanged, across attempts, and never into a prompt, and it reports the persona once CSCB has held back from the row for ${describeWaitSpan(_unprovenIdleNoticeAfterMs)} (b.9a7/b.rmy/b.f2b)`,
-    notice,
+    waitTimedOutLiveReport(ref, _waitForWaitingTimeoutMs, _unprovenIdleNoticeAfterMs, timeoutState, heldMs),
   )
 }
 
@@ -5695,10 +5792,12 @@ export interface SpawnPersonaResult {
    */
   refused?: true
   /**
-   * Set on a `failed` result only: a resume answered `ErrInvalidFlags` and
-   * the immediate version re-check decided the stop, so the server is
-   * stopping. No spawn-failure notice was posted; `launchSession` answers
-   * `'skipped'`, which counts toward no failure or cap.
+   * Set on a `failed` result only: a resume, or a pane read of the launch
+   * wait's evidence read (b.jg5 SRJ-205), answered `ErrInvalidFlags` and the
+   * immediate version re-check decided the stop, so the server is stopping.
+   * No spawn-failure notice was posted and no `spawn-failed` entry recorded;
+   * `launchSession` answers `'skipped'`, which counts toward no failure or
+   * cap.
    */
   stopping?: true
 }
@@ -6914,12 +7013,20 @@ const inFlightLaunches = new Map<string, Promise<SpawnPersonaResult>>()
 
 /**
  * Test-only seam: forget every in-flight launch (and, b.f2b, every cancel of
- * a wait one had not started), and stop and forget every dialog approver
- * (`_resetDialogApprovers`), so none outlives a test.
+ * a wait one had not started); cancel, wake and forget every running wait for
+ * a `working` row, as `cancelWorkingRowWait` does but without its log line, so
+ * the wait types nothing more and returns `cancelled` instead of polling on
+ * to its deadline; and stop and forget every dialog approver
+ * (`_resetDialogApprovers`); so none outlives a test.
  */
 export function _resetInFlightLaunches(): void {
   inFlightLaunches.clear()
   cancelledLaunchWaits.clear()
+  for (const wait of workingRowWaits.values()) {
+    wait.cancelled = true
+    wait.wake()
+  }
+  workingRowWaits.clear()
   _resetDialogApprovers()
 }
 
@@ -7605,19 +7712,24 @@ async function runPersonaLadder(
     // b.rmy/b.3ce/b.ecw: same outcome propagation and dead-session recovery as
     // the `waiting` branch. waitForWaitingAndReconnect returns 'ok' once it
     // typed `/mcp reconnect`; 'not-reconnected' (b.f2b) on live transient
-    // transitions and whenever the claude PROCESS is verifiably alive at the
-    // deadline (a long turn isn't an error); 'dead-session' when the process is
-    // provably gone (ended/missing, or the timeout sweep + status verdict —
-    // b.ecw; or its reconnect was refused because the row had just been
-    // ended or marked missing — b.dup) or the tmux session provably doesn't
-    // exist (spawn-not-found — b.c3o).
+    // transitions, whenever the row reads live at the deadline (a long turn
+    // isn't an error), and when the timeout `status` read fails (b.jg5
+    // SRJ-605); 'dead-session' when the row reads ended or missing (or the
+    // timeout sweep + status verdict says so, b.ecw), when its reconnect was
+    // refused because the row had just been ended or marked missing (b.dup),
+    // or when the row is absent (`ErrSpawnNotFound`, b.jg5 SRJ-605): the
+    // recovery's resume or spawn then decides what holds the name.
     // b.f2b: the wait can take up to WAIT_FOR_WAITING_TIMEOUT_MS; tell the
     // caller (the start pass lets the launch go on in the background).
     hooks?.onWorkingRowWait?.()
-    const { outcome, refused, lastRead: waitRead } = await waitForWaitingAndReconnectWithCause(key, config, ref)
-    // b.jg5 SRJ-502: the persona latched during the wait (a note its
-    // transcript `get` read, or a latch set elsewhere): nothing more for it.
+    const { outcome, refused, stopping, lastRead: waitRead } = await waitForWaitingAndReconnectWithCause(key, config, ref)
+    // b.jg5 SRJ-502, SRJ-608: the persona latched during the wait (a CONFLICT
+    // or UNUSABLE NAME at a read, a note its transcript `get` read, or a
+    // latch set elsewhere): nothing more for it.
     if (outcome === WAIT_OUTCOME_LATCHED) return { key, action: 'latched' }
+    // b.jg5 SRJ-205: the evidence read's version re-check decided the stop:
+    // no post, no `spawn-failed` entry, nothing counted (as at a resume).
+    if (stopping) return { key, action: 'failed', stopping: true }
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForPersona: dead session for ${ref} (state=working) — recovering via resume/fresh-spawn`)
       return resumeOrFreshSpawn(persona, params, config, isStartup, row, {
@@ -7631,9 +7743,10 @@ async function runPersonaLadder(
     if (outcome === 'not-reconnected' || outcome === 'cancelled') return { key, action: 'not-reconnected' }
     if (outcome !== 'ok') {
       console.error(`[slack] spawnForPersona: reconnect failed for ${ref}`)
-      // b.jg5 SRJ-105, SRJ-311, SRJ-316: a refusal (a read error in the
-      // wait, an ENVIRONMENT, a CONFIG or an UNCLASSIFIED answer included, or a refused
-      // reconnect) records no `spawn-failed` entry.
+      // b.jg5 SRJ-105, SRJ-311, SRJ-316: a refusal (a refused findMissing
+      // sweep, or a refused reconnect) records no `spawn-failed` entry. A
+      // `status` error in the wait never gets here: it never ends the wait
+      // 'failed' (b.jg5 SRJ-605).
       if (isStartup && !refused) recordStartupError('spawn-failed', `reconnect failed for ${ref} (state=working)`)
       return { key, action: 'failed' }
     }
@@ -8355,7 +8468,8 @@ function createLaunchPool(size: number): <T>(task: () => Promise<T>) => Promise<
  * resolved; nothing was launched and its row is kept), for `latched` (b.jg5
  * SRJ-502, SRJ-1015: the persona is latched, or latched at this launch;
  * nothing more was launched, and the latch stops its retry timer) and for a `failed`
- * marked `stopping` (a resume's version re-check decided the stop), which
+ * marked `stopping` (the version re-check of a resume or of the launch wait's
+ * evidence read decided the stop), which
  * count toward no failure or cap, and `'refused'` for a `failed` carrying the
  * refusal marker (b.jg5 SRJ-301: its UNAVAILABLE retry timer owns the
  * persona), which the restart path never counts (SRJ-302). The richer `SpawnPersonaResult` is collapsed here

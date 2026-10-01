@@ -95,7 +95,8 @@
  * `ALL_CLEAR_TEMPLATE`).
  *
  * No retry timer is real: the clock is the harness's fake clock, and the
- * only real-time waits are the spawn path's bounded 1 ms polls. The
+ * only real-time waits are the spawn path's bounded 1 ms polls and the
+ * working-row wait's `WAIT_POLL_MS` sleep after a failed poll. The
  * `armMissingRetryTimer` case runs one health tick body through the health
  * check's tick seam (`healthTick`), with no interval; the tick's start is
  * read from the fake clock.
@@ -217,6 +218,9 @@ function build(options?: RecoveryHarnessOptions): { h: RecoveryHarness; p: strin
   const [p, b] = h.keys as [string, string]
   return { h, p, b }
 }
+
+/** The working-row wait's poll interval in the launch cases, in real ms: a wait that goes on past a failed poll (b.jg5 SRJ-605) polls again at once. */
+const WAIT_POLL_MS = 1
 
 /** Half the retry timer's first wait, in ms: a clock step that fires no retry. */
 function halfFirstWaitMs(): number {
@@ -411,15 +415,21 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
 
   test.each<[string, string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript]>([
     ['the collision get', 'get', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errCallTimeout('get') })],
-    ['the working-row read', 'status', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusError: errCallTimeout('status') })],
+    // b.jg5 SRJ-605: the working-row wait goes on past its failed poll; its
+    // next poll reads the stub's default `waiting` row and the launch
+    // reconnects, so the launch ends.
+    ['the working-row read', 'status', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusQueue: [cannedErr(errCallTimeout('status'))] })],
     ['the sweep before a working-row wait', 'find-missing', (h, p) => ({ ...collided(h, p, { state: 'working' }), findMissingError: errCallTimeout('find-missing') })],
   ])('AC 27: ErrCallTimeout from %s (%s) inside a launch starts nothing and posts nothing; the retry timer is armed', async (_site, _verb, script) => {
     const { h, p, b } = build()
+    // The working-row wait sleeps its poll interval in real time between polls.
+    h.config.agent_director_poll_interval_ms = WAIT_POLL_MS
     h.script(script(h, personaOf(h, p)))
 
     await h.launch(p)
 
     expect(h.triggers).toContainEqual({ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+    expect(getFailureCount(p)).toBe(0)
     expectNeverStarted(h, p)
     expectNeverStarted(h, b)
     expectNoPostYet(h)

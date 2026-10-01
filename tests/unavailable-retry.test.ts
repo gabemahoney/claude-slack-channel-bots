@@ -11,7 +11,13 @@
  * timer (b.jg5 SRJ-301) runs on the harness with the controller as the outage
  * state's trigger sink: real launches through `spawnForPersona` over the
  * stub, the arming predicate on its own, and the reads made outside every
- * attempt. The persona's dialog approver (b.jg5 SRJ-401; hatch A2) runs
+ * attempt. A `status` error at the launch's working-row wait (b.jg5 SRJ-605)
+ * runs there too: the wait goes on past a failed poll (polling every
+ * `WAIT_POLL_MS` of real time) while P's timer is armed, and its next poll
+ * reading `waiting` reconnects; an error that lasts to the timeout read (the
+ * wait's own clock, `_setNow`, moved past its timeout by each read) ends it
+ * `not-reconnected`; neither is failed, refused or counted, and
+ * `ErrSpawnNotFound` there arms nothing. The persona's dialog approver (b.jg5 SRJ-401; hatch A2) runs
  * there too, after its launch call returned and on the harness clock: it is
  * in flight for the persona (a lost message makes no read) but blocks no
  * retry (SRJ-303: the retry makes its row read), and once it stops a lost
@@ -115,7 +121,8 @@
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
- * polls, bounded by the harness (`settle`), and one 0 ms `setTimeout` a
+ * polls, bounded by the harness (`settle`), the working-row wait's
+ * `WAIT_POLL_MS` sleep after a failed poll, and one 0 ms `setTimeout` a
  * frames case sets inside an attempt and awaits.
  *
  * SPDX-License-Identifier: MIT
@@ -125,7 +132,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { classifyAdError } from '../src/ad-error-class.ts'
+import { classifyAdError, describeAgentDirectorFailure } from '../src/ad-error-class.ts'
 import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
 import { ERR_SCHEMA_MISMATCH_NAME, ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
@@ -154,7 +161,7 @@ import {
 } from '../src/outage-state.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
-import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
   TMUX_UNRESPONSIVE_END_LATCHED,
@@ -200,7 +207,12 @@ import {
 import { _buildIsSessionAliveAdapter, deferPendingRow } from '../src/server.ts'
 import {
   _resetConfigDirFs,
+  _resetNotConnectedEpisodes,
+  _resetNow,
+  _resetWaitForWaitingTimeoutMs,
   _setConfigDirFs,
+  _setNow,
+  _setWaitForWaitingTimeoutMs,
   APPROVER_STOP_FINISHED,
   APPROVER_STOP_GONE,
   APPROVER_STOP_LIVE,
@@ -213,6 +225,9 @@ import {
   stopDialogApprover,
   sweepDeadTmuxChannel,
   TRUST_DIALOG_NEEDLE,
+  waitEndedDisconnectedLine,
+  waitPollStatusErrorLine,
+  waitTimedOutUnreadReport,
   type ApproverStopReason,
   type ApproverVerb,
   type SpawnPersonaResult,
@@ -290,6 +305,7 @@ import {
   errSchemaMismatch,
   errSpawnNotFound,
   errSpawnNotInteractive,
+  errSystemInstallDisappeared,
   errTmuxCaptureFailed,
   errTmuxKillFailed,
   errTmuxNotAvailable,
@@ -341,6 +357,7 @@ import {
   type RecoveryAttempt,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
+  type RecoveryNotice,
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
 import { stripComments } from './test-helpers/source-audit.ts'
@@ -861,7 +878,12 @@ interface LaunchSite {
   readonly name: string
   readonly verb: string
   script(h: RecoveryHarness, persona: Persona, err: Error): RecoveryStubScript
-  /** The launch's action when this site's call fails. */
+  /**
+   * The launch's action when this site's call fails: `failed` for a refusal
+   * that stops the launch; for the working-row read, whose failed poll lets
+   * the wait go on (b.jg5 SRJ-605), the action of the launch whose next poll
+   * reads `waiting` and reconnects.
+   */
   readonly action: SpawnPersonaResult['action']
   /**
    * For the sites whose refusal stops the launch at once (b.jg5 SRJ-105): the
@@ -898,7 +920,14 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
     startsNoCondition: true,
     script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), findMissingError: err }),
   },
-  { name: 'the working-row read', verb: 'status', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusError: err }) },
+  // b.jg5 SRJ-605: the wait's first poll meets the error and goes on; its next
+  // poll reads the stub's default `waiting` row, and the launch reconnects.
+  {
+    name: 'the working-row read',
+    verb: 'status',
+    action: 'reconnected',
+    script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusQueue: [cannedErr(err)] }),
+  },
   // The collision get reads the row `waiting` (live), so its kill is tmux-touching.
   {
     name: 'the kill of a row in another directory',
@@ -937,18 +966,39 @@ const READ_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
   ['a GONE answer (ErrTmuxCaptureFailed)', (verb) => errTmuxCaptureFailed(undefined, verb)],
 ]
 
-/** The result a launch that met an arming error at a site with `action` answers: a failure carries the refusal marker. */
+/**
+ * The result a launch that met an arming error at a site with `action`
+ * answers: a failure carries the refusal marker; any other action (the
+ * working-row wait's, which goes on past a failed read, b.jg5 SRJ-605) is
+ * the wait's own outcome, unmarked.
+ */
 function armedResult(key: string, action: SpawnPersonaResult['action']): SpawnPersonaResult {
   return action === 'failed' ? { key, action, refused: true } : { key, action }
 }
 
 /**
- * Persona `key`'s timer was armed once, just now, at the base wait with
- * `kind`; no other persona's was. `lastRow` is the row it last read, when one
- * is recorded.
+ * The working-row wait's poll interval in the launch cases, in real ms. The
+ * wait sleeps its configuration's `agent_director_poll_interval_ms` between
+ * polls on the real timer, so a case whose wait goes on past a failed read
+ * (b.jg5 SRJ-605) polls again at once.
  */
-function expectArmedOnce(h: RecoveryHarness, key: string, kind: string, lastRow?: string): void {
-  expect(h.triggers).toEqual([{ key, kind }])
+const WAIT_POLL_MS = 1
+
+/** A recovery harness for a launch case, its working-row wait polling every `WAIT_POLL_MS`. */
+function launchHarness(options?: RecoveryHarnessOptions): RecoveryHarness {
+  const h = (harness = makeRecoveryHarness(options))
+  h.config.agent_director_poll_interval_ms = WAIT_POLL_MS
+  return h
+}
+
+/**
+ * Persona `key`'s timer was armed once, at the base wait from now, with
+ * `kind`; no other persona's was. `triggers` is how many triggers the
+ * persona's failed calls sent (one by default; a trigger while armed keeps
+ * the one due time). `lastRow` is the row it last read, when one is recorded.
+ */
+function expectArmedOnce(h: RecoveryHarness, key: string, kind: string, lastRow?: string, triggers = 1): void {
+  expect(h.triggers).toEqual(Array.from({ length: triggers }, () => ({ key, kind })))
   expect(h.controller.armedKeys()).toEqual([key])
   expect(h.controller.view(key)).toEqual({
     phase: 'waiting',
@@ -986,7 +1036,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
   )
 
   test.each(unavailableCross)('UNAVAILABLE (%s) at %s (%s) inside a launch arms that persona’s timer once, at the base wait', async (_what, _site, verb, make, kind, site) => {
-    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const h = launchHarness(RETRY_TIMER_ONLY)
     const [key] = h.keys as [string]
     h.script(site.script(h, personaOf(h, key), make(verb)))
 
@@ -994,6 +1044,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
 
     expect(result).toEqual(armedResult(key, site.action))
     expectArmedOnce(h, key, kind)
+    expect(getFailureCount(key)).toBe(0)
     if (site.ladderCalls !== undefined) expect(callCounts(h)).toEqual(site.ladderCalls)
     // No later call in the launch ends a condition this refusal started.
     if (site.leavesConditionHeld === true) expect(h.tmuxUnresponsive.holds(key)).toBe(kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
@@ -1007,7 +1058,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
   const readCross = READ_ERRORS.flatMap(([what, make]) => READ_SITES.map((site) => [what, site.name, make, site] as const))
 
   test.each(readCross)('%s at %s inside a launch arms that persona’s timer as a read error', async (_what, _site, make, site) => {
-    const h = (harness = makeRecoveryHarness())
+    const h = launchHarness()
     const [, key] = h.keys as [string, string]
     h.script(site.script(h, personaOf(h, key), make(site.verb)))
 
@@ -1015,6 +1066,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
 
     expect(result).toEqual(armedResult(key, site.action))
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
+    expect(getFailureCount(key)).toBe(0)
   })
 
   test.each<[string, () => Error, string | undefined, string | undefined]>([
@@ -1069,6 +1121,9 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     ['a DIRECTORY answer from spawn', () => ({ spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found') }), 'failed'],
     ['a LAUNCH FAILURE answer from resume', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errTmuxSessionCreate('resume') }), 'spawned'],
     ['ErrSpawnNotFound from the collision get', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() }), 'spawned'],
+    // b.jg5 SRJ-605: the working-row wait's poll reading the row absent is
+    // 'dead-session', and the recovery resumes the row the collision read.
+    ['ErrSpawnNotFound from the working-row read (status)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusQueue: [cannedErr(errSpawnNotFound())] }), 'resumed'],
   ])('%s inside a launch arms nothing and marks nothing', async (_what, script, action) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
@@ -1231,6 +1286,116 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
 
     expect(result).toEqual({ key, action: 'failed' })
     expectNothingArmed(h)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A `status` error at the launch's working-row wait (b.jg5 SRJ-605, SRJ-301):
+// the wait goes on with no post and ends `not-reconnected` at its timeout,
+// while the wrapper still arms P's timer. `ErrSpawnNotFound` keeps its own
+// meaning (above: it arms nothing).
+// ---------------------------------------------------------------------------
+
+/**
+ * The `status` errors the working-row wait goes on past, each with the cause
+ * it arms and whether the wrapper raises the `ad-unreachable` outage for it:
+ * E10's UNAVAILABLE values, and `ErrSystemInstallDisappeared`, an
+ * UNCLASSIFIED answer that a read records as a read error.
+ */
+const WAIT_STATUS_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error, string, boolean]> = [
+  ...UNAVAILABLE_VALUES.map(([what, make, kind]) => [what, make, kind, false] as const),
+  ['ErrSystemInstallDisappeared', (verb) => errSystemInstallDisappeared(verb), UNAVAILABLE_RETRY_CAUSE_READ_ERROR, true],
+]
+
+/** The working-row wait's timeout in the cases that reach it, on the wait's own clock (`_setNow`). */
+const WAIT_TIMEOUT_MS = 60_000
+
+/** The line the wait writes for a failed poll read of `err` by persona `persona` (b.jg5 SRJ-605). */
+function pollStatusErrorLine(persona: Persona, err: Error): string {
+  return waitPollStatusErrorLine(renderPersonaRef(persona.name, persona.key), describeAgentDirectorFailure(err), classifyAdError(err).errorClass)
+}
+
+/** The `ad-unreachable` onsets the outage state posted, for the stub's binary. */
+function adUnreachableOnsets(h: RecoveryHarness): RecoveryNotice[] {
+  return h.outageNotices.filter((notice) => notice.text === ONSET_TEMPLATES['ad-unreachable'](h.stub.client.binaryPath))
+}
+
+describe('unavailable retry: a status error at the launch’s working-row wait arms P’s timer while the wait goes on, and never fails or counts the launch (SRJ-605, SRJ-301)', () => {
+  beforeEach(() => {
+    _resetNotConnectedEpisodes()
+  })
+
+  afterEach(() => {
+    _resetNow()
+    _resetWaitForWaitingTimeoutMs()
+    _resetNotConnectedEpisodes()
+  })
+
+  test.each(WAIT_STATUS_ERRORS)('%s at the wait’s poll arms P’s timer once and not Q’s; the next poll reads waiting and the launch reconnects with nothing posted or counted; the timer’s retry then finds P live', async (_what, make, kind, adUnreachable) => {
+    const h = launchHarness()
+    const [p, q] = h.keys as [string, string]
+    const persona = personaOf(h, p)
+    const err = make('status')
+    h.script({ ...collided(h, persona, { state: 'working' }), statusQueue: [cannedErr(err)] })
+
+    const result = await h.launch(p)
+
+    expect(result).toEqual({ key: p, action: 'reconnected' })
+    expectArmedOnce(h, p, kind)
+    // The failed poll, then the poll that reads `waiting` and the reconnect's keystrokes.
+    expect(personaCallCounts(h, p)).toMatchObject({ statusCalls: 2, sendKeysCalls: 1 })
+    expect(h.errors.filter((line) => line === pollStatusErrorLine(persona, err))).toHaveLength(1)
+    // ErrSystemInstallDisappeared raises `ad-unreachable` once; the next read's success clears it.
+    expect(adUnreachableOnsets(h)).toHaveLength(adUnreachable ? 1 : 0)
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+    expect(getFailureCount(q)).toBe(0)
+
+    h.setConnected(p, true)
+    const dueAt = await retryNow(h, p)
+
+    expect(h.attempts).toEqual([{ key: p, retry: 1, causes: [kind], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt }])
+    expect(h.stops).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
+    expect(h.controller.armedKeys()).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  test.each(WAIT_STATUS_ERRORS)('%s persisting from the wait’s poll to its timeout read ends the launch not-reconnected, never failed or counted; both reads arm P’s one timer and not Q’s', async (_what, make, kind, adUnreachable) => {
+    const h = launchHarness()
+    const [p, q] = h.keys as [string, string]
+    const persona = personaOf(h, p)
+    const err = make('status')
+    // The wait's clock moves past its timeout at each status read, so the
+    // wait polls once and then makes its timeout read.
+    let waitNow = 0
+    _setNow(() => waitNow)
+    _setWaitForWaitingTimeoutMs(WAIT_TIMEOUT_MS)
+    h.script({
+      ...collided(h, persona, { state: 'working' }),
+      statusFn: () => {
+        waitNow += WAIT_TIMEOUT_MS
+        return err
+      },
+    })
+
+    const result = await h.launch(p)
+
+    expect(result).toEqual({ key: p, action: 'not-reconnected' })
+    expectArmedOnce(h, p, kind, undefined, 2)
+    expect(personaCallCounts(h, p).statusCalls).toBe(2)
+    expect(personaCallCounts(h, p).sendKeysCalls).toBeUndefined()
+    const report = waitTimedOutUnreadReport(renderPersonaRef(persona.name, persona.key), WAIT_TIMEOUT_MS, describeAgentDirectorFailure(err), classifyAdError(err).errorClass)
+    expect(h.errors.filter((line) => line === pollStatusErrorLine(persona, err))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === waitEndedDisconnectedLine(report, h.config.session_restart_delay))).toHaveLength(1)
+    // With session_restart_delay 0 the wait's end raises P's one not-connected
+    // notice, saying agent-director could not report its state.
+    expect(report.notice.reason).toBe('auto-restart-disabled')
+    expect(h.notices).toEqual([{ key: p, text: expect.stringContaining((report.notice as { cause: string }).cause) }])
+    expect(getOutageFlags(p).has('ad-unreachable')).toBe(adUnreachable)
+    expect(h.startupErrors()).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+    expect(getFailureCount(q)).toBe(0)
   })
 })
 
