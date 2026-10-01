@@ -87,6 +87,12 @@
  *     `launch_started_at: null`. Rows in any other state carry no launch
  *     start unless given one. Tests take launch starts from the
  *     `SAMPLE_LAUNCH_START*` constants and never type a timestamp.
+ *   - Pre-trust (b.jg5 SRJ-413): `cannedSpawnResult` and `cannedResumeResult`
+ *     take a `pre_trust`, and `PRE_TRUST_VALUES` lists the three values
+ *     (`ok`, `skipped`, `failed`), checked at compile time against every
+ *     member of `PreTrust`; a result with no `pre_trust` (from a binary older
+ *     than Phase 1) is the builder's value left out. Tests take `pre_trust`
+ *     values from the list and never type them.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -421,6 +427,25 @@ export function cannedResumeResult(claudeInstanceId: string = 'cscb_test', preTr
     ? { claude_instance_id: claudeInstanceId }
     : { claude_instance_id: claudeInstanceId, pre_trust: preTrust }
 }
+
+/**
+ * Every `PreTrust` member, each its own key. Typed as a record over
+ * `PreTrust`, so a member missing here, or a key that is not a member, fails
+ * `bun run typecheck`.
+ */
+const PRE_TRUST_MEMBERS: { readonly [V in PreTrust]: V } = {
+  ok: 'ok',
+  skipped: 'skipped',
+  failed: 'failed',
+}
+
+/**
+ * The three `pre_trust` values a Phase 1 spawn or `resume` result carries
+ * (b.jg5 SRJ-413), for `test.each` with `cannedSpawnResult` and
+ * `cannedResumeResult`; an absent field is their `preTrust` left out. Tests
+ * take `pre_trust` values from here and never type them.
+ */
+export const PRE_TRUST_VALUES: readonly PreTrust[] = Object.freeze(Object.values(PRE_TRUST_MEMBERS))
 
 /** Build an ErrBunVersionTooOld (Client-constructor failure mode). */
 export function errBunVersionTooOld(actual: string = '0.9.0', minimum: string = '1.0.21'): ErrBunVersionTooOld {

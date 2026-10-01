@@ -251,6 +251,15 @@
  *     cases pass a fake clock's `now` to the session manager's clock seam
  *     (`_setNow`, reset in afterEach) and build their screens and transcripts
  *     from `tests/test-helpers/working-row-panes.ts`.
+ *   - b.jg5 SRJ-413: over every success site of the ladder no spawn or
+ *     `resume` call carries `no_pre_trust` (and no file in `src/` names it
+ *     outside a comment); each launch writes exactly one `pre_trust` line,
+ *     the persona's, from `preTrustLogLine`, for each value of the stub's
+ *     `PRE_TRUST_VALUES` and an absent field at every site; a `resume` whose
+ *     result is no object writes the absent field's line and still returns
+ *     `resumed`; on a first spawn and on a `resume` of an `ended` row the
+ *     four have identical effects otherwise, the approver still clearing the
+ *     folder-trust dialog that follows.
  *
  * Most blocks use a stand-in persona keyed by its channel ID
  * (`makeStandInPersonaConfig`), so their `cscb_<channelId>` ids and outage
@@ -337,6 +346,11 @@ import {
   approverStatusRefusedMessage,
   approverTmuxUnavailableMessage,
   type ApproverStopReason,
+  LAUNCH_VERB_RESUME,
+  LAUNCH_VERB_SPAWN,
+  PRE_TRUST_LOG_PREFIX,
+  preTrustLogLine,
+  type LaunchVerb,
   _setSpawnHomeDir,
   _resetSpawnHomeDir,
   checkLaunchConfigDir,
@@ -453,7 +467,10 @@ import {
   cannedGetResult,
   cannedListRow,
   cannedPermissionRequest,
+  cannedResumeResult,
+  cannedSpawnResult,
   cannedStatusResult,
+  PRE_TRUST_VALUES,
   SAMPLE_LAUNCH_START_DEFAULT,
   SAMPLE_LAUNCH_START_FRACTIONAL,
   SAMPLE_LAUNCH_START_NONE,
@@ -495,6 +512,7 @@ import {
   type CannedResponse,
   type FindMissingRowPlacement,
   type PersonaGetResultOverrides,
+  type StubCallLog,
   type StubClient,
   type StubClientOptions,
   type StubResolveSystemBinaryOutcome,
@@ -638,7 +656,7 @@ import {
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
 import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
-import type { Phase1StatusResult } from '../src/ad-phase1-types.ts'
+import type { Phase1ResumeResult, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -9472,11 +9490,134 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
 // (`runOnApproverClock` over `_whenDialogApproverStopped`). Every
 // agent-director call is recorded with whether a launch of the persona was
 // in flight when it was made (`recordCallsWithInFlight`).
+//
+// The success sites (`SUCCESS_SITES`) are shared with the `pre_trust` cases
+// (b.jg5 SRJ-413) below.
 // ---------------------------------------------------------------------------
 
+/** The persona every success site launches. */
+const SUCCESS_SITE_KEY = 'C'
+const SUCCESS_SITE_ID = personaInstanceId(SUCCESS_SITE_KEY)
+
+/** Persona `C` in a real working directory; `overrides` go to the whole config. */
+function successSiteConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
+  return makeStandInPersonaConfig({ [SUCCESS_SITE_KEY]: { working_directory: fixtureSubdir('work') } }, fixtureDir, overrides)
+}
+
+type SpawnResultOf = import('agent-director').SpawnResult
+const collision = () => cannedErr<SpawnResultOf>(errInstanceIdCollision())
+/** A spawn that succeeds, its result carrying `preTrust` (the field absent when it is undefined). */
+const spawnOk = (preTrust?: PreTrust) => cannedOk<Phase1SpawnResult>(cannedSpawnResult(SUCCESS_SITE_ID, preTrust))
+
+/**
+ * A success site of the ladder: the stub answers that reach it (the launch
+ * call that succeeds answering with `preTrust`), the config it needs, the
+ * launch call's verb and the launch's result.
+ */
+interface SuccessSite {
+  readonly script: (cfg: PersonaConfig, preTrust?: PreTrust) => StubClientOptions
+  readonly config?: Partial<Omit<PersonaConfig, 'personas'>>
+  readonly launchVerb: LaunchVerb
+  readonly action: SpawnPersonaResult['action']
+}
+
+/** The persona's row reading `ended`, its labels its current ones. */
+const endedRow = (cfg: PersonaConfig) => personaRow(cfg, SUCCESS_SITE_KEY, { state: 'ended' })
+/** A collision on the persona's `ended` row whose `resume` answers `err`, then a fresh spawn that succeeds. */
+const resumeAnswers = (err: Error) => (cfg: PersonaConfig, preTrust?: PreTrust): StubClientOptions => ({
+  spawnQueue: [collision(), spawnOk(preTrust)],
+  getResult: endedRow(cfg),
+  resumeError: err,
+})
+
+/** The ladder's first spawn, succeeding. */
+const FIRST_SPAWN_SITE: SuccessSite = { script: (_cfg, preTrust) => ({ spawnQueue: [spawnOk(preTrust)] }), launchVerb: 'spawn', action: 'spawned' }
+/** A collision on the persona's `ended` row, then a `resume` that succeeds. */
+const ENDED_ROW_RESUME_SITE: SuccessSite = {
+  script: (cfg, preTrust) => ({ spawnQueue: [collision()], getResult: endedRow(cfg), resumeResult: cannedResumeResult(SUCCESS_SITE_ID, preTrust) }),
+  launchVerb: 'resume',
+  action: 'resumed',
+}
+
+/** Every spawn and `resume` of the collision ladder that returns success. */
+const SUCCESS_SITES: ReadonlyArray<readonly [string, SuccessSite]> = [
+  ['the first spawn', FIRST_SPAWN_SITE],
+  [
+    'the retry spawn after the collision get answers ErrSpawnNotFound',
+    { script: (_cfg, preTrust) => ({ spawnQueue: [collision(), spawnOk(preTrust)], getError: errSpawnNotFound() }), launchVerb: 'spawn', action: 'spawned' },
+  ],
+  [
+    'the self-heal spawn after ErrTmuxSessionCreate on the first spawn',
+    {
+      script: (_cfg, preTrust) => ({ spawnQueue: [cannedErr<SpawnResultOf>(errTmuxSessionCreate('spawn')), spawnOk(preTrust)] }),
+      launchVerb: 'spawn',
+      action: 'spawned',
+    },
+  ],
+  ['the self-heal spawn after ErrTmuxSessionCreate on resume', { script: resumeAnswers(errTmuxSessionCreate('resume')), launchVerb: 'spawn', action: 'spawned' }],
+  [
+    'the self-heal spawn after ErrTmuxSessionCreate on a replacement\'s fresh spawn',
+    {
+      script: (cfg, preTrust) => ({ spawnQueue: [collision(), cannedErr<SpawnResultOf>(errTmuxSessionCreate('spawn')), spawnOk(preTrust)], getResult: endedRow(cfg) }),
+      config: { resume_enabled: false },
+      launchVerb: 'spawn',
+      action: 'spawned',
+    },
+  ],
+  [
+    'the fresh spawn of a replacement of a row in another directory (kill, delete, spawn)',
+    {
+      script: (cfg, preTrust) => ({
+        spawnQueue: [collision(), spawnOk(preTrust)],
+        getResult: personaRow(cfg, SUCCESS_SITE_KEY, { state: 'waiting', cwd: fixtureSubdir('elsewhere') }),
+      }),
+      launchVerb: 'spawn',
+      action: 'spawned',
+    },
+  ],
+  [
+    'the fresh spawn of a replacement of a row whose config_dir label changed (delete, spawn)',
+    {
+      script: (cfg, preTrust) => {
+        const labels = { ...endedRow(cfg).labels, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome()) }
+        return { spawnQueue: [collision(), spawnOk(preTrust)], getResult: personaRow(cfg, SUCCESS_SITE_KEY, { state: 'ended', labels }) }
+      },
+      launchVerb: 'spawn',
+      action: 'spawned',
+    },
+  ],
+  [
+    'the fresh spawn of a replacement with resume_enabled false (kill, delete, spawn)',
+    {
+      script: (cfg, preTrust) => ({ spawnQueue: [collision(), spawnOk(preTrust)], getResult: endedRow(cfg) }),
+      config: { resume_enabled: false },
+      launchVerb: 'spawn',
+      action: 'spawned',
+    },
+  ],
+  ['the amnesia spawn after resume\'s ErrNoSessionId', { script: resumeAnswers(errNoSessionId()), launchVerb: 'spawn', action: 'spawned' }],
+  ['the amnesia spawn after resume\'s ErrJsonlMissing', { script: resumeAnswers(errJsonlMissing()), launchVerb: 'spawn', action: 'fresh-after-inconclusive-amnesia' }],
+  ['the amnesia spawn after resume\'s ErrJsonlNeverWritten', { script: resumeAnswers(errJsonlNeverWritten()), launchVerb: 'spawn', action: 'spawned' }],
+  ['the spawn after resume\'s ErrSpawnNotResumable (kill, delete, spawn)', { script: resumeAnswers(errSpawnNotResumable()), launchVerb: 'spawn', action: 'spawned' }],
+  ['the spawn after resume\'s ErrSpawnNotFound', { script: resumeAnswers(errSpawnNotFound()), launchVerb: 'spawn', action: 'spawned' }],
+  ['the resume of an ended row', ENDED_ROW_RESUME_SITE],
+  [
+    'the resume of a missing row',
+    {
+      script: (cfg, preTrust) => ({
+        spawnQueue: [collision()],
+        getResult: personaRow(cfg, SUCCESS_SITE_KEY, { state: 'missing' }),
+        resumeResult: cannedResumeResult(SUCCESS_SITE_ID, preTrust),
+      }),
+      launchVerb: 'resume',
+      action: 'resumed',
+    },
+  ],
+]
+
 describe('b.jg5 SRJ-401: the approver runs after every launch that returns success, outside the launch call', () => {
-  const KEY = 'C'
-  const ID = personaInstanceId(KEY)
+  const KEY = SUCCESS_SITE_KEY
+  const ID = SUCCESS_SITE_ID
   const REF = renderPersonaRef(KEY, KEY)
   /** The launch start the approver's `pending` read shows. */
   const LAUNCH_START = SAMPLE_LAUNCH_START_WHOLE
@@ -9523,88 +9664,7 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
   const APPROVER_LAPS: readonly CallInFlight[] = ['status', 'readPane', 'status'].map((verb) => ({ verb, id: ID, inFlight: false }))
 
   /** Persona `C` in a real working directory; `overrides` go to the whole config. */
-  function launchConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
-    return makeStandInPersonaConfig({ [KEY]: { working_directory: fixtureSubdir('work') } }, fixtureDir, overrides)
-  }
-
-  type SpawnResultOf = import('agent-director').SpawnResult
-  const collision = () => cannedErr<SpawnResultOf>(errInstanceIdCollision())
-  const spawnOk = () => cannedOk<SpawnResultOf>({ claude_instance_id: ID })
-
-  /** A success site of the ladder: the stub answers that reach it, the config it needs, the launch call's verb and the launch's result. */
-  interface SuccessSite {
-    readonly script: (cfg: PersonaConfig) => StubClientOptions
-    readonly config?: Partial<Omit<PersonaConfig, 'personas'>>
-    readonly launchVerb: 'spawn' | 'resume'
-    readonly action: SpawnPersonaResult['action']
-  }
-
-  /** The persona's row reading `ended`, its labels its current ones. */
-  const endedRow = (cfg: PersonaConfig) => personaRow(cfg, KEY, { state: 'ended' })
-  /** A collision on the persona's `ended` row whose `resume` answers `err`, then a fresh spawn that succeeds. */
-  const resumeAnswers = (err: Error) => (cfg: PersonaConfig): StubClientOptions => ({
-    spawnQueue: [collision(), spawnOk()],
-    getResult: endedRow(cfg),
-    resumeError: err,
-  })
-
-  const SUCCESS_SITES: ReadonlyArray<readonly [string, SuccessSite]> = [
-    ['the first spawn', { script: () => ({}), launchVerb: 'spawn', action: 'spawned' }],
-    [
-      'the retry spawn after the collision get answers ErrSpawnNotFound',
-      { script: () => ({ spawnQueue: [collision(), spawnOk()], getError: errSpawnNotFound() }), launchVerb: 'spawn', action: 'spawned' },
-    ],
-    [
-      'the self-heal spawn after ErrTmuxSessionCreate on the first spawn',
-      { script: () => ({ spawnQueue: [cannedErr<SpawnResultOf>(errTmuxSessionCreate('spawn')), spawnOk()] }), launchVerb: 'spawn', action: 'spawned' },
-    ],
-    ['the self-heal spawn after ErrTmuxSessionCreate on resume', { script: resumeAnswers(errTmuxSessionCreate('resume')), launchVerb: 'spawn', action: 'spawned' }],
-    [
-      'the self-heal spawn after ErrTmuxSessionCreate on a replacement\'s fresh spawn',
-      {
-        script: (cfg) => ({ spawnQueue: [collision(), cannedErr<SpawnResultOf>(errTmuxSessionCreate('spawn')), spawnOk()], getResult: endedRow(cfg) }),
-        config: { resume_enabled: false },
-        launchVerb: 'spawn',
-        action: 'spawned',
-      },
-    ],
-    [
-      'the fresh spawn of a replacement of a row in another directory (kill, delete, spawn)',
-      {
-        script: (cfg) => ({ spawnQueue: [collision(), spawnOk()], getResult: personaRow(cfg, KEY, { state: 'waiting', cwd: fixtureSubdir('elsewhere') }) }),
-        launchVerb: 'spawn',
-        action: 'spawned',
-      },
-    ],
-    [
-      'the fresh spawn of a replacement of a row whose config_dir label changed (delete, spawn)',
-      {
-        script: (cfg) => {
-          const labels = { ...endedRow(cfg).labels, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome()) }
-          return { spawnQueue: [collision(), spawnOk()], getResult: personaRow(cfg, KEY, { state: 'ended', labels }) }
-        },
-        launchVerb: 'spawn',
-        action: 'spawned',
-      },
-    ],
-    [
-      'the fresh spawn of a replacement with resume_enabled false (kill, delete, spawn)',
-      { script: (cfg) => ({ spawnQueue: [collision(), spawnOk()], getResult: endedRow(cfg) }), config: { resume_enabled: false }, launchVerb: 'spawn', action: 'spawned' },
-    ],
-    ['the amnesia spawn after resume\'s ErrNoSessionId', { script: resumeAnswers(errNoSessionId()), launchVerb: 'spawn', action: 'spawned' }],
-    ['the amnesia spawn after resume\'s ErrJsonlMissing', { script: resumeAnswers(errJsonlMissing()), launchVerb: 'spawn', action: 'fresh-after-inconclusive-amnesia' }],
-    ['the amnesia spawn after resume\'s ErrJsonlNeverWritten', { script: resumeAnswers(errJsonlNeverWritten()), launchVerb: 'spawn', action: 'spawned' }],
-    ['the spawn after resume\'s ErrSpawnNotResumable (kill, delete, spawn)', { script: resumeAnswers(errSpawnNotResumable()), launchVerb: 'spawn', action: 'spawned' }],
-    ['the spawn after resume\'s ErrSpawnNotFound', { script: resumeAnswers(errSpawnNotFound()), launchVerb: 'spawn', action: 'spawned' }],
-    [
-      'the resume of an ended row',
-      { script: (cfg) => ({ spawnQueue: [collision()], getResult: endedRow(cfg) }), launchVerb: 'resume', action: 'resumed' },
-    ],
-    [
-      'the resume of a missing row',
-      { script: (cfg) => ({ spawnQueue: [collision()], getResult: personaRow(cfg, KEY, { state: 'missing' }) }), launchVerb: 'resume', action: 'resumed' },
-    ],
-  ]
+  const launchConfig = successSiteConfig
 
   /**
    * Assert `calls`: the launch's last call is its launch call `launchVerb` on
@@ -9846,6 +9906,238 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
     expectLaunchThenApprover(calls.slice(1), 'spawn')
     expect(calls.slice(1).map((c) => c.verb)).toEqual(['spawn', ...APPROVER_LAPS.map((c) => c.verb)])
     assertNoLeak({ errLog })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-413 — each launch's pre_trust is logged, and no launch passes
+// no_pre_trust
+//
+// agent-director pre-accepts the persona's folder trust at each launch and
+// reports the outcome as the result's `pre_trust`. CSCB passes no
+// `no_pre_trust` on any spawn or `resume`, writes one line per successful
+// launch from `preTrustLogLine` (for a result without the field, that it came
+// from a binary older than Phase 1) and lets no value change anything else: a
+// folder-trust dialog that follows is still the approver's to clear. Values
+// come from the stub's `PRE_TRUST_VALUES` and lines from the builder.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-413: each launch\'s pre_trust is logged once with the persona reference and changes nothing else; no launch carries no_pre_trust', () => {
+  const KEY = SUCCESS_SITE_KEY
+  const ID = SUCCESS_SITE_ID
+  const REF = renderPersonaRef(KEY, KEY)
+  const VERBS: readonly LaunchVerb[] = [LAUNCH_VERB_SPAWN, LAUNCH_VERB_RESUME]
+  /** What a launch result can carry: each value, then no field at all. */
+  const PRE_TRUST_CASES: ReadonlyArray<PreTrust | undefined> = [...PRE_TRUST_VALUES, undefined]
+  const caseName = (preTrust: PreTrust | undefined): string => preTrust ?? 'absent'
+
+  /** The longest end all of `texts` share. */
+  function commonEnd(texts: readonly string[]): string {
+    let end = texts[0]!
+    for (const text of texts) while (!text.endsWith(end)) end = end.slice(1)
+    return end
+  }
+
+  /** The end every line the builder writes shares, whatever its persona, verb or value. */
+  const LINE_END = commonEnd(VERBS.flatMap((verb) => PRE_TRUST_CASES.map((preTrust) => preTrustLogLine(REF, verb, preTrust))))
+
+  /** The `pre_trust` lines of a captured log, for any persona, verb or value. */
+  function preTrustLines(errLog: string): string[] {
+    return errLog.split('\n').filter((line) => line.startsWith(PRE_TRUST_LOG_PREFIX) && line.endsWith(LINE_END))
+  }
+
+  test('no file in src/ names no_pre_trust outside a comment', () => {
+    const srcDir = join(import.meta.dir, '..', 'src')
+    const files = (readdirSync(srcDir, { recursive: true }) as string[]).filter((file) => file.endsWith('.ts'))
+    expect(files).toContain('session-manager.ts')
+    expect(files.filter((file) => stripComments(readFileSync(join(srcDir, file), 'utf-8')).includes('no_pre_trust'))).toEqual([])
+  })
+
+  const BUILDER_CROSS = VERBS.flatMap((verb) => PRE_TRUST_CASES.map((preTrust) => [verb, caseName(preTrust), preTrust] as const))
+
+  test.each(BUILDER_CROSS)('preTrustLogLine for a %s whose pre_trust is %s: one line naming the persona reference and the verb, then the value when there is one; the four lines of a verb all differ', (verb, _name, preTrust) => {
+    const line = preTrustLogLine(REF, verb, preTrust)
+    const body = line.slice(PRE_TRUST_LOG_PREFIX.length)
+
+    expect(line.split('\n')).toEqual([line])
+    expect(line.startsWith(PRE_TRUST_LOG_PREFIX)).toBe(true)
+    expect(body.startsWith(`${REF} `)).toBe(true)
+    expect(body.split(' ')).toContain(verb)
+    if (preTrust !== undefined) expect(body).toContain(preTrust)
+    expect(new Set(PRE_TRUST_CASES.map((other) => preTrustLogLine(REF, verb, other))).size).toBe(PRE_TRUST_CASES.length)
+  })
+
+  const ODD_VALUES: ReadonlyArray<readonly [string, unknown]> = [
+    ['an empty string', ''],
+    ['a value with a line break', `${PRE_TRUST_VALUES[0]}\n${PRE_TRUST_VALUES[1]}`],
+    ['a number', 7],
+    ['a value with no JSON text (a bigint)', 7n],
+    ['a token-shaped value', fakeToken(BOT_TOKEN_PREFIX, 'pretrust')],
+  ]
+
+  test.each(ODD_VALUES)('preTrustLogLine for %s, none of the three values: never throws, one line with the persona reference and every line\'s end, not the absent field\'s line, no token', (_name, value) => {
+    const line = preTrustLogLine(REF, LAUNCH_VERB_SPAWN, value as PreTrust)
+
+    expect(line.split('\n')).toEqual([line])
+    expect(line.startsWith(`${PRE_TRUST_LOG_PREFIX}${REF} `)).toBe(true)
+    expect(line.endsWith(LINE_END)).toBe(true)
+    expect(line).not.toBe(preTrustLogLine(REF, LAUNCH_VERB_SPAWN, undefined))
+    assertNoLeak({ line })
+  })
+
+  /**
+   * Every success site with every value and the absent field, so a site that
+   * logs anything but its own launch's result fails with each value.
+   */
+  const SITE_CASES = SUCCESS_SITES.flatMap(([name, site]) => PRE_TRUST_CASES.map((preTrust) => [name, caseName(preTrust), site, preTrust] as const))
+
+  test.each(SITE_CASES)('%s, its result\'s pre_trust %s: no spawn or resume call carries no_pre_trust, and the launch writes exactly one pre_trust line, P\'s, for its verb and value', async (_name, _value, site, preTrust) => {
+    const clock = useApproverClock()
+    _setTmuxSessionKiller(async () => {})
+    const cfg = successSiteConfig(site.config)
+    const calls = makeStubCallLog()
+    installStub({ ...calls, ...site.script(cfg, preTrust) })
+
+    let result: SpawnPersonaResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await launchThenRunApprover(clock, KEY, spawnForPersona(personaOf(cfg, KEY), cfg))
+    })
+
+    expect(result).toStrictEqual({ key: KEY, action: site.action })
+    const launchCalls: object[] = [...calls.spawnCalls, ...calls.resumeCalls]
+    expect(launchCalls.length).toBeGreaterThan(0)
+    expect(launchCalls.filter((params) => 'no_pre_trust' in params)).toEqual([])
+    expect(preTrustLines(errLog)).toEqual([preTrustLogLine(REF, site.launchVerb, preTrust)])
+    assertNoLeak({ errLog })
+  })
+
+  /** A launch result that is no object at all. */
+  const NO_OBJECT_RESULTS: ReadonlyArray<readonly [string, null | undefined]> = [
+    ['null', null],
+    ['missing (undefined)', undefined],
+  ]
+
+  test.each(NO_OBJECT_RESULTS)('the resume of an ended row whose result is %s: the launch writes the absent field\'s line, P\'s, and the ladder still returns resumed', async (_name, value) => {
+    const clock = useApproverClock()
+    _setTmuxSessionKiller(async () => {})
+    const cfg = successSiteConfig()
+    installStub({ spawnQueue: [collision()], getResult: endedRow(cfg), resumeQueue: [cannedOk(value as unknown as Phase1ResumeResult)] })
+
+    let result: SpawnPersonaResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await launchThenRunApprover(clock, KEY, spawnForPersona(personaOf(cfg, KEY), cfg))
+    })
+
+    expect(result).toStrictEqual({ key: KEY, action: 'resumed' })
+    expect(preTrustLines(errLog)).toEqual([preTrustLogLine(REF, LAUNCH_VERB_RESUME, undefined)])
+    assertNoLeak({ errLog })
+  })
+
+  const LAUNCH_KINDS: ReadonlyArray<readonly [string, SuccessSite]> = [
+    ['a first spawn', FIRST_SPAWN_SITE],
+    ['a resume of an ended row', ENDED_ROW_RESUME_SITE],
+  ]
+
+  /** The one Enter the approver presses on the folder-trust dialog. */
+  const ENTER: import('agent-director').SendKeysParams = { claude_instance_id: ID, text: '', allow_pending: true }
+
+  /** What one launch did, besides its `pre_trust` line. */
+  interface LaunchEffects {
+    readonly result: SpawnPersonaResult | undefined
+    readonly calls: StubCallLog
+    readonly notices: typeof notices
+    readonly outageNotices: typeof outageEmissions
+    /** Its startup-errors entries, each without its timestamp. */
+    readonly startupEntries: string[]
+    readonly outageFlags: string[]
+    readonly failureCount: number
+    readonly approver: ApproverOutcome | undefined
+    readonly approverClockMs: number
+    /** Its log lines but the `pre_trust` lines. */
+    readonly otherLines: string[]
+  }
+
+  /**
+   * Launch P at the start pass through `site`, its result carrying
+   * `preTrust`, with the folder-trust dialog on P's pane: once the launch
+   * has settled, P's row reads `pending` at the approver's first lap and live
+   * after it. Run the approver to its stop on a fresh approver clock. Answers
+   * the launch's `pre_trust` lines, its log and everything else it did, then
+   * forgets the launch, its approver and the findMissing memo, so a next
+   * launch in the same case starts as this one did.
+   */
+  async function launchWithTrustDialog(
+    cfg: PersonaConfig,
+    site: SuccessSite,
+    preTrust: PreTrust | undefined,
+  ): Promise<{ lines: string[]; errLog: string; effects: LaunchEffects }> {
+    const clock = useApproverClock()
+    const calls = makeStubCallLog()
+    let laps = 0
+    installStub({
+      ...calls,
+      ...site.script(cfg, preTrust),
+      statusFn: () => {
+        if (isLaunchInFlight(KEY)) return cannedStatusResult({ state: 'waiting' })
+        laps++
+        return cannedStatusResult({ state: laps === 1 ? AGENT_DIRECTOR_PENDING_STATE : 'waiting' })
+      },
+      readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }],
+    })
+    const readLog = captureStartupErrors()
+    const before = { notices: notices.length, outage: outageEmissions.length, log: readLog().length }
+
+    let result: SpawnPersonaResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await launchThenRunApprover(clock, KEY, spawnForPersona(personaOf(cfg, KEY), cfg, true))
+    })
+    await settleNotices()
+
+    const lines = preTrustLines(errLog)
+    const effects: LaunchEffects = {
+      result,
+      calls,
+      notices: notices.slice(before.notices),
+      outageNotices: outageEmissions.slice(before.outage),
+      startupEntries: readLog().slice(before.log).split('\n').filter((entry) => entry !== '').map((entry) => entry.replace(/^\[[^\]]*\] /, '')),
+      outageFlags: [...getOutageFlags(KEY)].sort(),
+      failureCount: getFailureCount(KEY),
+      approver: await _whenDialogApproverStopped(KEY),
+      approverClockMs: clock.now(),
+      otherLines: errLog.split('\n').filter((line) => !lines.includes(line)),
+    }
+    _resetInFlightLaunches()
+    _resetFindMissingMemo()
+    return { lines, errLog, effects }
+  }
+
+  const KIND_CROSS = LAUNCH_KINDS.flatMap(([kind, site]) => PRE_TRUST_CASES.map((preTrust) => [kind, caseName(preTrust), site, preTrust] as const))
+
+  test.each(KIND_CROSS)('%s whose result\'s pre_trust is %s: exactly one pre_trust line, P\'s, with the value (for an absent field, the older-binary wording); the approver still clears the folder-trust dialog that follows', async (_kind, _name, site, preTrust) => {
+    const { lines, errLog, effects } = await launchWithTrustDialog(successSiteConfig(), site, preTrust)
+
+    expect(effects.result).toStrictEqual({ key: KEY, action: site.action })
+    expect(lines).toEqual([preTrustLogLine(REF, site.launchVerb, preTrust)])
+    expect(effects.calls.sendKeysCalls).toEqual([ENTER])
+    expect(effects.approver).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: SAMPLE_LAUNCH_START_MS })
+    assertNoLeak({ errLog })
+  })
+
+  test.each(LAUNCH_KINDS)('%s: each pre_trust value and an absent field have the same effects but their line — the same agent-director calls (none carrying no_pre_trust), launch result, notices, startup entries, outage flags, failure count and approver run', async (_kind, site) => {
+    const cfg = successSiteConfig()
+    const runs: Array<Awaited<ReturnType<typeof launchWithTrustDialog>>> = []
+    for (const preTrust of PRE_TRUST_CASES) runs.push(await launchWithTrustDialog(cfg, site, preTrust))
+    const effects = runs.map((run) => run.effects)
+
+    expect(effects).toEqual(effects.map(() => effects[0]!))
+    // The run every other is compared with cleared the dialog and wrote nothing beside its line.
+    expect(effects[0]!.calls.sendKeysCalls).toEqual([ENTER])
+    expect(effects[0]!.notices).toEqual([])
+    expect(effects[0]!.startupEntries).toEqual([])
+    const launchCalls: object[] = effects.flatMap((e) => [...e.calls.spawnCalls, ...e.calls.resumeCalls])
+    expect(launchCalls).toHaveLength(PRE_TRUST_CASES.length * (site.launchVerb === LAUNCH_VERB_RESUME ? 2 : 1))
+    expect(launchCalls.filter((params) => 'no_pre_trust' in params)).toEqual([])
+    for (const run of runs) assertNoLeak({ errLog: run.errLog })
   })
 })
 

@@ -1309,6 +1309,19 @@ To follow the server's watch for one persona:
 grep -E '\[slack\] approvePreSessionDialogs: .*(\(key=<key>\)|persona=<key>\b)' ~/.claude/channels/slack/server.log
 ```
 
+agent-director also accepts the persona's folder trust itself at each launch and reports whether it did. The server writes one line to `server.log` with that report for each launch call that returns success (a failed launch call writes none), and does nothing else because of it:
+
+- `[slack] spawnForPersona: "<name>" (key=<key>) <spawn|resume> pre_trust=ok (logged only, b.jg5 SRJ-413)`: the folder trust was accepted.
+- `… pre_trust=skipped …`: it was not accepted for this launch, so the folder-trust prompt may show.
+- `… pre_trust=failed …`: agent-director could not accept it, so the folder-trust prompt may show.
+- `[slack] spawnForPersona: "<name>" (key=<key>) <spawn|resume> result carries no pre_trust: it came from an agent-director older than Phase 1 (logged only, b.jg5 SRJ-413)`: the installed agent-director reports nothing about it.
+
+A folder-trust prompt that still shows is accepted by the server as described above. To see these lines for one persona:
+
+```sh
+grep -F 'pre_trust' ~/.claude/channels/slack/server.log | grep -F '(key=<key>)'
+```
+
 **A persona doesn't receive messages in a channel or DM**
 Check each of these for the persona that should receive the messages:
 

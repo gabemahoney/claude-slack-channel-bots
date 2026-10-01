@@ -152,9 +152,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-import type { Client, ListRow, SpawnParams, FindMissingResult, GetResult, ResumeResult, SpawnResult } from 'agent-director'
+import type { Client, ListRow, SpawnParams, FindMissingResult, GetResult } from 'agent-director'
 
-import type { Phase1StatusResult } from './ad-phase1-types.ts'
+import type { Phase1ResumeResult, Phase1SpawnResult, Phase1StatusResult, PreTrust } from './ad-phase1-types.ts'
 
 import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
 import {
@@ -5463,6 +5463,11 @@ function spawnHomeDir(): string {
  * the replacement and amnesia spawns, the b.vub self-heal respawn) sends
  * these params, and a resume restores the env agent-director stored with the
  * row at its spawn, so every launch of the persona's Claude runs with it.
+ *
+ * CSCB never passes `no_pre_trust`: not here, and not on a `resume`, so
+ * agent-director pre-accepts the persona's folder trust at every launch and
+ * reports the outcome as the result's `pre_trust`, which CSCB only logs
+ * (`preTrustLogLine`, b.jg5 SRJ-413).
  */
 function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabel: string): SpawnParams {
   const { key } = persona
@@ -5615,14 +5620,15 @@ export function _resetTmuxSessionKiller(): void {
  * Self-heal an `ErrTmuxSessionCreate` collision (b.vub): the deterministic tmux
  * session name is still held by an orphaned session while the AD row is
  * terminal/gone, so a fresh spawn/resume cannot create the session. Kill the
- * orphan by name, then retry `client.spawn` ONCE. Returns the spawn result on
- * success, or rethrows the retry's error (caller surfaces it).
+ * orphan by name, then retry `client.spawn` ONCE. Returns the retry's whole
+ * spawn result on success (its `pre_trust` included, for the after-launch
+ * step's line), or rethrows the retry's error (caller surfaces it).
  */
 async function selfHealTmuxCollisionAndRespawn(
   persona: Persona,
   params: SpawnParams,
   ref: string,
-): Promise<{ claude_instance_id: string }> {
+): Promise<Phase1SpawnResult> {
   const { key } = persona
   const sessionName = personaTmuxSessionName(key)
   console.error(
@@ -5729,9 +5735,9 @@ async function replaceWithFreshSpawn(
   }
 
   try {
-    const launched = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
+    const launched: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
     console.error(`[slack] spawnForPersona: fresh-spawned (after ${opts.kill ? 'kill+delete' : 'delete'}) for ${ref}`)
-    afterLaunchSucceeded(key, isStartup, ref, launched)
+    afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
     return { key, action: 'spawned' }
   } catch (err) {
     if (!(err instanceof ErrTmuxSessionCreate)) return failed(err, 'fresh spawn after delete')
@@ -5739,7 +5745,7 @@ async function replaceWithFreshSpawn(
   try {
     const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
     console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
-    afterLaunchSucceeded(key, isStartup, ref, r)
+    afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
     return { key, action: 'spawned' }
   } catch (err2) {
     return failed(err2, 'self-heal spawn after ErrTmuxSessionCreate')
@@ -6213,13 +6219,13 @@ async function resumeOrFreshSpawn(
   // resume_enabled: attempt resume
   console.error(`[slack] spawnForPersona: attempting resume for ${ref}`)
   try {
-    const launched = await launchWithReplyGuard(persona, ref, 'resume', (client) => client.resume({ claude_instance_id: personaInstanceId(key) }))
+    const launched: Phase1ResumeResult = await launchWithReplyGuard(persona, ref, 'resume', (client) => client.resume({ claude_instance_id: personaInstanceId(key) }))
     console.error(`[slack] spawnForPersona: resumed ${ref}`)
     // A resumed bot faces the same startup dialogs as a fresh one. Its row
     // reads `pending` from the resume until its session reports in (HO C5),
     // so the approver clears the dialog through agent-director, as after a
     // spawn (b.jg5 SRJ-402).
-    afterLaunchSucceeded(key, isStartup, ref, launched)
+    afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_RESUME, launched)
     return { key, action: 'resumed' }
   } catch (err) {
     if (err instanceof ErrTmuxSessionCreate) {
@@ -6230,7 +6236,7 @@ async function resumeOrFreshSpawn(
       try {
         const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
         console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
-        afterLaunchSucceeded(key, isStartup, ref, r)
+        afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
@@ -6275,9 +6281,9 @@ async function resumeOrFreshSpawn(
       const deleteStop = await tryDelete(key, isStartup, ref, diagnosisRead.lastRead ?? lastRead)
       if (deleteStop) return deleteStop
       try {
-        const launched = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
+        const launched: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: fresh-spawned (after delete) for ${ref}`)
-        afterLaunchSucceeded(key, isStartup, ref, launched)
+        afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
         // A fresh-spawn that replaced a resume because the transcript was gone
         // is amnesia, not a clean spawn — surface it as its own action so the
         // startup summary does not count it as an ordinary "ok". b.fwu: split
@@ -6327,8 +6333,8 @@ async function resumeOrFreshSpawn(
       const deleteStop = await tryDelete(key, isStartup, ref, lastRead)
       if (deleteStop) return deleteStop
       try {
-        const launched = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
-        afterLaunchSucceeded(key, isStartup, ref, launched)
+        const launched: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
+        afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
@@ -6349,9 +6355,9 @@ async function resumeOrFreshSpawn(
       // recovery into action: 'failed'. Mirrors the caller-level retry below.
       console.error(`[slack] spawnForPersona: ErrSpawnNotFound on resume for ${ref} — fresh-spawn`)
       try {
-        const launched = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
+        const launched: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: fresh-spawned (after ErrSpawnNotFound on resume) for ${ref}`)
-        afterLaunchSucceeded(key, isStartup, ref, launched)
+        afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
@@ -6755,17 +6761,73 @@ export function _resetDialogApprovers(): void {
   approversClosed = false
 }
 
+/** The agent-director launch verbs whose success runs the after-launch step. */
+export type LaunchVerb = typeof LAUNCH_VERB_SPAWN | typeof LAUNCH_VERB_RESUME
+/** A plain spawn (a fresh, self-heal, retry, replacement or amnesia spawn). */
+export const LAUNCH_VERB_SPAWN = 'spawn'
+/** A `resume`. */
+export const LAUNCH_VERB_RESUME = 'resume'
+
+/** The head of every `pre_trust` line. */
+export const PRE_TRUST_LOG_PREFIX = '[slack] spawnForPersona: '
+
+/**
+ * The one log line a successful launch writes about its `pre_trust` (b.jg5
+ * SRJ-413): the persona reference `ref`, the launch verb and the value the
+ * result carried, shown as it arrived (rendered for the log, never checked
+ * against a list); for a result without the field (`preTrust` undefined), that
+ * the result came from an agent-director older than Phase 1. The line is
+ * information only: no value changes what CSCB does, and a folder-trust prompt
+ * that follows is the dialog approver's. Pure; never throws.
+ */
+export function preTrustLogLine(ref: string, verb: LaunchVerb, preTrust: PreTrust | undefined): string {
+  if (preTrust === undefined) {
+    return (
+      `${PRE_TRUST_LOG_PREFIX}${ref} ${verb} result carries no pre_trust: ` +
+      `it came from an agent-director older than Phase 1 (logged only, b.jg5 SRJ-413)`
+    )
+  }
+  return `${PRE_TRUST_LOG_PREFIX}${ref} ${verb} pre_trust=${renderPreTrustValue(preTrust)} (logged only, b.jg5 SRJ-413)`
+}
+
+/**
+ * A present `pre_trust` value as the log shows it: a string through
+ * `renderLogMessageText`, any other JSON value by its JSON text, rendered the
+ * same way; `<unreadable>` when that renders to nothing. Never throws.
+ */
+function renderPreTrustValue(value: unknown): string {
+  let text: string
+  try {
+    text = typeof value === 'string' ? value : (JSON.stringify(value) ?? '')
+  } catch {
+    text = ''
+  }
+  const rendered = renderLogMessageText(text)
+  return rendered === '' ? '<unreadable>' : rendered
+}
+
 /**
  * The one step after a launch call that returned success (b.jg5 SRJ-401):
  * the plain spawn, the self-heal spawn, the retry spawn after the collision
  * `get`'s `ErrSpawnNotFound`, the fresh spawn of a replacement, the
  * `resume`, the amnesia spawn and the spawns after `resume`'s
- * `ErrSpawnNotResumable` and `ErrSpawnNotFound`. It starts the persona's
- * dialog approver (`startDialogApprover`) without awaiting it, so the
- * ladder's result is returned as soon as the launch call returned.
- * `launched` is that call's result. Never throws.
+ * `ErrSpawnNotResumable` and `ErrSpawnNotFound`. `verb` names the launch
+ * call and `launched` is its whole result. The step writes the launch's one
+ * `pre_trust` line (`preTrustLogLine`, b.jg5 SRJ-413), then starts the
+ * persona's dialog approver (`startDialogApprover`) without awaiting it, so
+ * the ladder's result is returned as soon as the launch call returned.
+ * The client returns the parsed reply as is, so a `null` or missing result
+ * is read as one with no `pre_trust` field. Nothing here or after it reads
+ * the `pre_trust` value. Never throws.
  */
-function afterLaunchSucceeded(key: string, isStartup: boolean, ref: string, launched: SpawnResult | ResumeResult): void {
+function afterLaunchSucceeded(
+  key: string,
+  isStartup: boolean,
+  ref: string,
+  verb: LaunchVerb,
+  launched: Phase1SpawnResult | Phase1ResumeResult,
+): void {
+  console.error(preTrustLogLine(ref, verb, launched?.pre_trust))
   try {
     startDialogApprover(key, isStartup, ref)
   } catch (err) {
@@ -6991,9 +7053,9 @@ async function runPersonaLadder(
   let replyGuardUndo: ReplyGuardUndo | undefined
   try {
     replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
-    const r = await withSpawnDetection(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
+    const r: Phase1SpawnResult = await withSpawnDetection(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
     console.error(`[slack] spawnForPersona: spawned ${ref} instanceId=${r.claude_instance_id}`)
-    afterLaunchSucceeded(key, isStartup, ref, r)
+    afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
     return { key, action: 'spawned' }
   } catch (err) {
     if (err instanceof ErrInstanceIdCollision) {
@@ -7007,7 +7069,7 @@ async function runPersonaLadder(
       try {
         const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
         console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
-        afterLaunchSucceeded(key, isStartup, ref, r)
+        afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
@@ -7059,9 +7121,9 @@ async function runPersonaLadder(
       // Race: row deleted between spawn-collision and get. Retry spawn once.
       console.error(`[slack] spawnForPersona: ErrSpawnNotFound after collision for ${ref} — retrying spawn (single retry)`)
       try {
-        const r = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
+        const r: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: retry-spawn succeeded for ${ref} instanceId=${r.claude_instance_id}`)
-        afterLaunchSucceeded(key, isStartup, ref, r)
+        afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
