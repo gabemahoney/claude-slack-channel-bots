@@ -111,6 +111,19 @@
  *     post; B launches. Controls: a phrase-less `ErrInternal` keeps E12's
  *     UNCLASSIFIED handling, and the persona teardown's kill and delete
  *     rethrow and latch nothing.
+ *   - b.jg5 SRJ-513, SRJ-1020 (E16 T2), with SRJ-114's and SRJ-115's sites,
+ *     on `makeRecoveryHarness`: a configured persona's own row reading
+ *     `pending` with no launch start (`LAUNCH_START_CASE_ROWS`: absent,
+ *     `null` or unparseable; P's current life, another `cwd`, another
+ *     `config_dir` label) at E14's four `get` sites and at the shared
+ *     own-row `status` read's sites latches P with "launch start not
+ *     recorded", "none" and `pending`; nothing is called after that read, raw
+ *     tmux included; one SRJ-1020 post; at the latch-time read that latch
+ *     stands alone (no CONFLICT or UNUSABLE NAME latch or post on top).
+ *     Controls: the same row with a launch start keeps today's `pending`
+ *     branch, a key the configured-persona query does not hold latches no
+ *     one, and the permission poller's and the JSONL persistence
+ *     safeguard's `get`s (SRJ-122) latch and post nothing.
  *   - b.jg5 SRJ-303 / SRJ-115 the retry timer's row read
  *     (`readPersonaRowState`): one `status` call for `cscb_<key>` and no
  *     other, answering each state as is (`pending` included), a `pending`
@@ -496,15 +509,23 @@ import {
 } from './test-helpers/recovery-harness.ts'
 import {
   CONFLICT_CASE_ROWS,
+  LAUNCH_START_AND_NOTE_ROW,
+  LAUNCH_START_CASE_ROWS,
+  LAUNCH_START_NON_LATCHING_ROWS,
   UNUSABLE_NAME_CASE_ROWS,
   expectedConflictNotice,
   type ConflictCaseRow,
+  type LaunchStartCaseRow,
+  type LaunchStartCaseRowOf,
+  type LaunchStartNonLatchingRowOf,
+  type LaunchStartReadShape,
   type UnusableNameCaseRow,
   type UnusableNameSite,
 } from './test-helpers/conflict-cases.ts'
 import {
   CONFLICT_LATCH_SET_LATCHED,
   LATCH_CASE_CONFLICTING_LABELS,
+  LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   LATCH_CASE_UNUSABLE_RECORDED_NAME,
   LATCH_ROW_STATE_KIND_NO_ROW,
   LATCH_ROW_STATE_KIND_READ,
@@ -547,6 +568,7 @@ import {
   type UnavailableRetryTriggerSink,
 } from '../src/unavailable-retry.ts'
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
+import type { Phase1StatusResult } from '../src/ad-phase1-types.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -16027,5 +16049,530 @@ describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrIn
     expectNoNoteLatch(h)
     expect(unusableNameLinesOf(h, p)).toEqual([])
     expect(h.notices).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-513, SRJ-1020 (E16 T2), with SRJ-114's Test clause "a pending row
+// with no launch start latches P" (AC 86) at E14's four `get` sites and
+// SRJ-115's `status` sites: a configured persona's own row that reads
+// `pending` with no launch start (absent, `null` or unparseable; P's current
+// life, another `cwd` or another `config_dir` label: the helper's
+// `LAUNCH_START_CASE_ROWS`) latches P with "launch start not recorded", the
+// refused operation "none" and the state `pending`, the session
+// `slack_bot_<key>` and no description, with one SRJ-1020 post after the
+// holds. At the collision `get` it decides before the `cwd` and `config_dir`
+// guards and the state branches, with no extra `status` read. Nothing is
+// called for P after the latching read, raw tmux included (no reconnect,
+// wait, `find-missing`, `resume`, kill, delete, spawn or `send-keys`), no
+// diagnosis is reported, nothing is counted, and no launch path reaches
+// agent-director for P afterwards while B launches. At the latch-time read,
+// that latch stands alone: a CONFLICT or an UNUSABLE NAME answer that asked
+// for it sets nothing more and posts no SRJ-1004 or SRJ-1019 notice
+// (SRJ-513; hatch A2). Controls: the same row with a launch start keeps
+// today's `pending` branch, a key the configured-persona query does not hold
+// latches no one, and the permission poller's and the JSONL persistence
+// safeguard's `get`s (SRJ-122) latch and post nothing and keep their
+// behaviour. Every case runs on `makeRecoveryHarness` (its latch and
+// configured-persona query installed as `main()` installs them);
+// `srj105AfterEach` runs `assertNoLeak` over the lines, notices and entries
+// it captured, and the file's `afterEach` clears the notifier, the latch
+// install and the configured-persona query.
+// ---------------------------------------------------------------------------
+
+/** The latching launch-start rows of read shape `shape`. */
+function launchStartRowsOf<S extends LaunchStartReadShape>(shape: S): readonly LaunchStartCaseRowOf<S>[] {
+  return LAUNCH_START_CASE_ROWS.filter((row) => row.shape === shape) as readonly LaunchStartCaseRow[] as unknown as readonly LaunchStartCaseRowOf<S>[]
+}
+
+/** P's current-life rows of `shape`, one per form of "no launch start". */
+function launchStartCurrentLifeOf<S extends LaunchStartReadShape>(shape: S): readonly LaunchStartCaseRowOf<S>[] {
+  return launchStartRowsOf(shape).filter((row) => row.variant === 'current life')
+}
+
+/**
+ * A sample of `shape`'s rows: each variant once and each form once (current
+ * life with none, another `cwd` with `null`, another `config_dir` with an
+ * unparseable launch start). Every row runs at the collision `get`, where the
+ * guards are; the other sites share the one decision and take the sample.
+ */
+function launchStartSampleOf<S extends LaunchStartReadShape>(shape: S): readonly LaunchStartCaseRowOf<S>[] {
+  return launchStartRowsOf(shape).filter(
+    (row) =>
+      (row.variant === 'current life' && row.form === 'absent') ||
+      (row.variant === 'other cwd' && row.form === 'null') ||
+      (row.variant === 'other config_dir' && row.form === 'unparseable'),
+  )
+}
+
+/** `rows` as `test.each` cases, named by each row's name. */
+function byName<R extends { readonly name: string }>(rows: readonly R[]): Array<readonly [string, R]> {
+  return rows.map((row) => [row.name, row] as const)
+}
+
+/**
+ * The session manager's launch-start latch lines for persona `key`, at a
+ * launch (`"P" (key=P)`) or a check (`persona=P`): the shared `get` read's
+ * (b.jg5 SRJ-114, SRJ-513) and the own-row `status` step's (b.jg5 SRJ-115,
+ * SRJ-501).
+ */
+function launchStartLinesOf(h: RecoveryHarness, key: string): string[] {
+  const pending = describeLatchRowState(latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE))
+  return h.errors.filter(
+    (line) =>
+      (line.includes(` for ${renderPersonaRef(key, key)}: `) || line.includes(` for persona=${key}: `)) &&
+      ((line.includes(`: its row reads pending with no launch start (state=${pending}) — `) && line.endsWith('; nothing more is called for it (b.jg5 SRJ-114, SRJ-513)')) ||
+        (line.includes(`: its row read latches the persona (case=${LATCH_CASE_LAUNCH_START_NOT_RECORDED}, state=${pending}) — `) &&
+          line.endsWith('; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)'))),
+  )
+}
+
+/**
+ * P latched once on `row`: its record ("launch start not recorded", "none",
+ * `pending`, the session and no description), the set and the three holds
+ * before the one SRJ-1020 post, one launch-start line, and nothing counted,
+ * posted as a spawn failure or a diagnosis (only the `noticesBefore` the path
+ * posted before the read), recorded `spawn-failed` or as a diagnosis entry,
+ * armed, refused, started as `tmux-unresponsive` or reported to the
+ * unclassified-error episode.
+ */
+function expectLaunchStartLatchedOnce(h: RecoveryHarness, p: string, row: LaunchStartCaseRow, noticesBefore = 0): void {
+  expect(h.latch.isLatched(p)).toBe(true)
+  expect(h.latch.record(p)).toStrictEqual({
+    sessionName: row.sessionName(p),
+    latchCase: row.latchCase,
+    refusedOperation: row.refusedOperation,
+    rowState: row.rowState,
+  })
+  expect(h.latchEvents.map((event) => [event.step, event.key])).toEqual(ONE_LATCH_STEPS.map((step) => [step, p]))
+  expect(h.latchEvents[0]).toMatchObject({ step: 'set', key: p, outcome: CONFLICT_LATCH_SET_LATCHED })
+  expect(h.episodeNotices).toEqual([{ key: p, text: row.notice(p) }])
+  expect(h.notices.map((n) => n.key)).toEqual(Array.from({ length: noticesBefore }, () => p))
+  const log = h.startupErrors().join('\n')
+  expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
+  expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(0)
+  expect(countStartupEntries(log, 'jsonl-transcript-lost-on-resume')).toBe(0)
+  expect(getFailureCount(p)).toBe(0)
+  expect(h.controller.isArmed(p)).toBe(false)
+  expect(h.triggers).toEqual([])
+  expect(refusalLines(h, p)).toEqual([])
+  expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+  expect(conditionStartedLines(h, p)).toEqual([])
+  expect(unclassifiedStartedLines(h, p)).toEqual([])
+  expect(h.unclassifiedErrorOpen(p)).toBe(false)
+  const lines = launchStartLinesOf(h, p)
+  expect(lines).toHaveLength(1)
+  expect(lines[0]).toContain(' — the persona latched; ')
+}
+
+/** A `get` of P's own row through E14's shared read, reached by P's launch. */
+interface LaunchStartGetSite {
+  readonly name: string
+  setup?(h: RecoveryHarness): void
+  /** Stub answers for a launch of `persona` whose site `get` reads `row`. */
+  script(h: RecoveryHarness, persona: Persona, row: CannedGetResult): RecoveryStubScript
+  /** Every call the launch makes, raw tmux included, the latching `get` last (`whole`), or the calls that end it. */
+  readonly order: readonly string[]
+  readonly whole: boolean
+  readonly calls: LaunchVerbCalls
+  readonly gets: number
+}
+
+const LAUNCH_START_GET_SITES: readonly LaunchStartGetSite[] = [
+  {
+    name: 'the collision get',
+    script: (_h, _p, row) => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getResult: row }),
+    order: ['spawn', 'get'],
+    whole: true,
+    calls: ladderCallsOf({ spawn: 1 }),
+    gets: 1,
+  },
+  {
+    name: 'the ErrJsonlMissing diagnosis get (the collision get read ended)',
+    script: (h, p, row) => jsonlMissingDiagnosisGets(h, p, cannedOk(row)),
+    order: ['spawn', 'get', 'resume', 'get'],
+    whole: true,
+    calls: ladderCallsOf({ spawn: 1, resume: 1 }),
+    gets: 2,
+  },
+  {
+    // The wait's first poll reads working and its pane idle, so it reads the
+    // transcript; every later poll would read waiting.
+    name: 'readPersonaTranscript\'s get in the working-row wait (an idle pane)',
+    setup: fastPolls,
+    script: (h, p, row) => ({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk(harnessRow(h, p, { state: 'working' })), cannedOk(row)],
+      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
+      statusResult: cannedStatusResult({ state: 'waiting' }),
+      readPaneResults: [{ pane: IDLE_PANE }],
+    }),
+    order: ['spawn', 'get', 'findMissing', 'status', 'readPane', 'get'],
+    whole: true,
+    calls: ladderCallsOf({ spawn: 1 }),
+    gets: 2,
+  },
+  {
+    // b.4dk: a waiting row whose reconnect found its session dead runs the
+    // sweep before resume; the run lists P's own row in unverified_ids.
+    name: 'the get after unverified_ids (the b.4dk sweep before resume)',
+    script: (h, p, row) => ({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk(harnessRow(h, p, { state: 'waiting' })), cannedOk(row)],
+      sendKeysError: errTmuxSendKeys(),
+      findMissingResult: unverifiedRowsOf(p.key),
+    }),
+    order: ['findMissing', 'get'],
+    whole: false,
+    calls: ladderCallsOf({ spawn: 1, sendKeys: 2 }),
+    gets: 2,
+  },
+]
+
+/** Each get site crossed with its rows: every `get` row at the collision get, the sample elsewhere. */
+const LAUNCH_START_GET_CROSS = LAUNCH_START_GET_SITES.flatMap((site) =>
+  (site === LAUNCH_START_GET_SITES[0] ? launchStartRowsOf('get') : launchStartSampleOf('get')).map((row) => [site.name, row.name, site, row] as const),
+)
+
+describe('b.jg5 SRJ-513, SRJ-114, SRJ-1020: a configured persona\'s own pending row with no launch start latches it at each of E14\'s get sites, and its caller stops', () => {
+  beforeEach(() => {
+    _resetFindMissingMemo()
+  })
+  afterEach(srj105AfterEach)
+
+  // Demo (AC 86): a pending row with no launch start latches P.
+  test.each(LAUNCH_START_GET_CROSS)('%s reading %s: P latched with "launch start not recorded", "none" and pending; that get is the last call, raw tmux included; one SRJ-1020 post; nothing counted, diagnosed or posted as a failure; the launch answers latched; then no launch path reaches agent-director; B launches', async (_site, _row, site, row) => {
+    const { h, p, b } = srj105Build()
+    const persona = harnessPersona(h, p)
+    site.setup?.(h)
+    const script = site.script(h, persona, row.build(persona, h.home))
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(site.whole ? order : order.slice(-site.order.length)).toEqual([...site.order])
+    expect(ladderCallsMade(h)).toEqual(site.calls)
+    expect(getIds(h)).toEqual(Array(site.gets).fill(personaInstanceId(p)))
+    expectLaunchStartLatchedOnce(h, p, row)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  // SRJ-513's precedence (hatch A2): a row that also carries the note latches
+  // with "launch start not recorded" only, with one post (no CONFLICT notice).
+  test('the collision get reading P\'s own pending row with no launch start that also carries provenance_conflict: one latch, "launch start not recorded" only, one SRJ-1020 post and no CONFLICT notice', async () => {
+    const { h, p, b } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const row = LAUNCH_START_AND_NOTE_ROW
+    const script: RecoveryStubScript = { spawnQueue: [cannedErr(errInstanceIdCollision())], getResult: row.build(persona, h.home) }
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(['spawn', 'get'])
+    expect(h.errors.filter((line) => line.includes(`: its row carries the liveness note ${provenanceNote}`))).toEqual([])
+    expectLaunchStartLatchedOnce(h, p, row)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  test.each(byName(launchStartSampleOf('get')))('the start pass: P latched at its ErrJsonlMissing diagnosis get (%s) is listed latched and counted in neither amnesia counter, failed nor succeeded; no delete, diagnosis entry or notice; B is counted', async (_name, row) => {
+    const { h, p, b } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const pId = personaInstanceId(p)
+    let pGets = 0
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getFn: (params) =>
+        params.claude_instance_id !== pId ? errSpawnNotFound() : ++pGets === 2 ? row.build(persona, h.home) : harnessRow(h, persona, { state: 'ended' }),
+      resumeError: errJsonlMissing(),
+    })
+
+    const result = await startupSessionManager(h.config, { concurrency: 1 })
+
+    expect(result.perPersona).toEqual([
+      { key: p, action: 'latched' },
+      { key: b, action: 'spawned' },
+    ])
+    expect(result.failed).toBe(0)
+    expect(result.succeeded).toBe(1)
+    expect(result.freshAfterAmnesia).toBe(0)
+    expect(result.freshAfterInconclusiveAmnesia).toBe(0)
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.stub.calls.spawnCalls.filter((c) => c.claude_instance_id === pId)).toHaveLength(1)
+    expectLaunchStartLatchedOnce(h, p, row)
+  })
+
+  test.each(byName(launchStartSampleOf('get')))('the restart path\'s working-row check (checkWorkingRowPane) whose transcript get after an idle pane reads %s answers defer: P latched with pending; no evidence pending, nothing typed; a second check makes no get and posts nothing', async (_name, row) => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getResult: row.build(persona, h.home) })
+    const order = await recordEveryCall(h, p)
+
+    expect(await checkWorkingRowPane(p, persona)).toBe('defer')
+
+    expect(order).toEqual(['readPane', 'get'])
+    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
+    expectLaunchStartLatchedOnce(h, p, row)
+
+    expect(await checkWorkingRowPane(p, persona)).toBe('defer')
+    expect(getIds(h)).toEqual([personaInstanceId(p)])
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
+    expect(h.latchEvents).toHaveLength(ONE_LATCH_STEPS.length)
+    expect(h.episodeNotices).toHaveLength(1)
+  })
+
+  test.each(byName(launchStartSampleOf('get')))('a bypassing run listing P\'s and B\'s own rows in unverified_ids, P\'s get reading %s: P latched and the caller gets FIND_MISSING_LATCHED; B\'s row is still read and B latches nothing', async (_name, row) => {
+    const { h, p, b } = srj105Build()
+    const pId = personaInstanceId(p)
+    h.script({
+      findMissingResult: unverifiedRowsOf(p, b),
+      getFn: (params) => (params.claude_instance_id === pId ? row.build(harnessPersona(h, p), h.home) : harnessRow(h, harnessPersona(h, b), { state: 'ended' })),
+    })
+
+    expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toBe(FIND_MISSING_LATCHED)
+
+    expect([...getIds(h)].sort()).toEqual([pId, personaInstanceId(b)].sort())
+    expect(postRunReadsOf(h)).toBe(`persona=${p} latched, persona=${b} read`)
+    expect(h.latch.isLatched(b)).toBe(false)
+    expectLaunchStartLatchedOnce(h, p, row)
+  })
+})
+
+describe('b.jg5 SRJ-513, SRJ-114, SRJ-408: the controls at the collision get — a launch start recorded, or a key the configured-persona query does not hold, latches no one', () => {
+  afterEach(srj105AfterEach)
+
+  const recorded = LAUNCH_START_NON_LATCHING_ROWS.filter(
+    (row): row is LaunchStartNonLatchingRowOf<'get'> => row.shape === 'get' && row.kind === 'launch start recorded',
+  )
+  test.each(byName(recorded))('P\'s own row %s keeps today\'s pending branch: no-op after one spawn and one get, no status read; nothing latched or posted', async (_name, row) => {
+    const { h, p } = srj105Build()
+    h.script({ spawnQueue: [cannedErr(errInstanceIdCollision())], getResult: row.build(harnessPersona(h, p), h.home) })
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'no-op' })
+
+    expect(order).toEqual(['spawn', 'get'])
+    expect(h.errors).toContain(`[slack] spawnForPersona: no action — state=${AGENT_DIRECTOR_PENDING_STATE} for ${renderPersonaRef(p, p)}`)
+    expectNoNoteLatch(h)
+    expect(launchStartLinesOf(h, p)).toEqual([])
+  })
+
+  test.each(byName(launchStartCurrentLifeOf('get')))('the configured-persona query does not hold P, its own row %s: today\'s pending branch (no-op); nothing latched or posted', async (_name, row) => {
+    const { h, p, b } = srj105Build()
+    setConfiguredPersonaQuery((key) => key === b)
+    h.script({ spawnQueue: [cannedErr(errInstanceIdCollision())], getResult: row.build(harnessPersona(h, p), h.home) })
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'no-op' })
+
+    expect(order).toEqual(['spawn', 'get'])
+    expectNoNoteLatch(h)
+    expect(launchStartLinesOf(h, p)).toEqual([])
+  })
+})
+
+/** A `status` site of the session manager reached by P's launch, its stub answers and the calls the launch makes. */
+interface LaunchStartStatusSite {
+  readonly name: string
+  setup?(h: RecoveryHarness): void
+  script(h: RecoveryHarness, persona: Persona, result: Phase1StatusResult): RecoveryStubScript
+  /** Whether the site is the working-row wait's (which logs its latched end). */
+  readonly wait: boolean
+}
+
+const LAUNCH_START_STATUS_SITES: readonly LaunchStartStatusSite[] = [
+  {
+    name: 'the working-row wait\'s poll status',
+    setup: fastPolls,
+    script: (h, p, result) => ({ ...collided(h, p, { state: 'working' }), statusResult: result }),
+    wait: true,
+  },
+  {
+    name: 'the working-row wait\'s timeout status (every poll read working)',
+    setup: shortWait,
+    script: (h, p, result) => {
+      const sweepsBefore = h.stub.calls.findMissingCalls.length
+      return {
+        ...collided(h, p, { state: 'working' }),
+        readPaneResults: [{ pane: SPINNER_PANE }],
+        statusFn: () => (h.stub.calls.findMissingCalls.length >= sweepsBefore + 2 ? result : cannedStatusResult({ state: 'working' })),
+      }
+    },
+    wait: true,
+  },
+  {
+    name: 'the re-read after the sweep of a check_permission row whose tmux session is gone (reconcileAndReadRowState)',
+    setup: tmuxSessionsGone,
+    script: (h, p, result) => ({ ...collided(h, p, { state: 'check_permission' }), statusResult: result }),
+    wait: false,
+  },
+]
+
+describe('b.jg5 SRJ-513, SRJ-115, SRJ-1020: a configured persona\'s own pending row with no launch start latches it at each of the session manager\'s status sites', () => {
+  afterEach(srj105AfterEach)
+
+  test.each(byName(launchStartRowsOf('status')))('the shared own-row status read, %s: latched with pending, from one status call; P latched once, one post', async (_name, row) => {
+    const { h, p } = srj105Build()
+    h.script({ statusResult: row.build(harnessPersona(h, p), h.home) })
+
+    expect(await readPersonaOwnRowStatus(p, STATUS_READ_SITE)).toStrictEqual({ kind: OWN_ROW_STATUS_LATCHED, rowState: row.rowState })
+
+    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.callCount()).toBe(1)
+    expectLaunchStartLatchedOnce(h, p, row)
+  })
+
+  test.each(byName(launchStartCurrentLifeOf('status')))('the shared own-row status read with the configured-persona query not holding P, %s: the state pending, nothing latched or posted', async (_name, row) => {
+    const { h, p, b } = srj105Build()
+    setConfiguredPersonaQuery((key) => key === b)
+    h.script({ statusResult: row.build(harnessPersona(h, p), h.home) })
+
+    const read = await readPersonaOwnRowStatus(p, STATUS_READ_SITE)
+
+    expect(read.kind === OWN_ROW_STATUS_STATE && read.state).toBe(AGENT_DIRECTOR_PENDING_STATE)
+    expectNoNoteLatch(h)
+    expect(launchStartLinesOf(h, p)).toEqual([])
+  })
+
+  const statusCross = LAUNCH_START_STATUS_SITES.flatMap((site) => launchStartCurrentLifeOf('status').map((row) => [site.name, row.form, site, row] as const))
+  test.each(statusCross)('a launch whose %s reads pending with launch start %s: latched, P latched with pending; that read is the last call, raw tmux included: no send-keys, find-missing, tmux fallback or dead-session verdict, no resume or launch; then no launch path reaches agent-director; B launches', async (_site, _form, site, row) => {
+    const { h, p, b } = srj105Build()
+    const persona = harnessPersona(h, p)
+    site.setup?.(h)
+    const script = site.script(h, persona, row.build(persona, h.home))
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order.at(-1)).toBe('status')
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1 }))
+    expect(waitLatchedLines(h)).toHaveLength(site.wait ? 1 : 0)
+    expectLaunchStartLatchedOnce(h, p, row)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  test.each(byName(launchStartCurrentLifeOf('status')))('the retry timer\'s row read (readPersonaRowState), %s: P latched with pending; a pending-only retry makes that one call and stops with the latch\'s reason, handing nothing to the restart path', async (_name, row) => {
+    const { h, p } = srj105Build()
+    h.script({ statusResult: row.build(harnessPersona(h, p), h.home) })
+    h.controller.armPendingOnly(p)
+
+    await retryNow(h, p)
+
+    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.callCount()).toBe(1)
+    expect(h.stops.filter((stop) => stop.key === p).map((stop) => stop.reason)).toEqual([UNAVAILABLE_RETRY_STOP_LATCHED])
+    expect(h.restartAsks).toEqual([])
+    expectLaunchStartLatchedOnce(h, p, row)
+
+    // The read itself answers the state the latch recorded (pending), with no second post.
+    expect(await readPersonaRowState(p)).toStrictEqual({ state: describeLatchRowState(row.rowState) })
+    expect(h.episodeNotices).toHaveLength(1)
+  })
+
+  // SRJ-513's precedence at E13's latch-time read: the read's own latch
+  // stands alone, so the CONFLICT or the UNUSABLE NAME that asked for it sets
+  // nothing on top and posts nothing of its own.
+  test.each(byName(launchStartCurrentLifeOf('status')))('a CONFLICT at the first spawn whose latch-time status read reads %s: one status read; one latch, "launch start not recorded", with one SRJ-1020 post and no SRJ-1004 post; the CONFLICT line says the read\'s latch stands', async (_name, row) => {
+    const { h, p, b } = srj105Build()
+    const script: RecoveryStubScript = { spawnError: conflictRowsFor('spawn')[0]!.build(), statusResult: row.build(harnessPersona(h, p), h.home) }
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(['spawn', 'status'])
+    const conflictLines = conflictLinesIn(h.errors, p)
+    expect(conflictLines).toHaveLength(1)
+    expect(conflictLines[0]).toContain(' — CONFLICT: the latch-time status read latched the persona, so that latch stands; ')
+    expectLaunchStartLatchedOnce(h, p, row)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  test.each(byName(launchStartCurrentLifeOf('status')))('an UNUSABLE NAME at the first spawn whose latch-time status read reads %s: one status read; one latch, "launch start not recorded", with one SRJ-1020 post and no SRJ-1019 post; the UNUSABLE NAME line says the read\'s latch stands', async (_name, row) => {
+    const { h, p, b } = srj105Build()
+    const script: RecoveryStubScript = { spawnError: unusableNameRowsAt('plain spawn')[0]!.build(), statusResult: row.build(harnessPersona(h, p), h.home) }
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(['spawn', 'status'])
+    const lines = unusableNameLinesOf(h, p)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(' — UNUSABLE NAME: the latch-time status read latched the persona, so that latch stands; ')
+    expectLaunchStartLatchedOnce(h, p, row)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+})
+
+describe('b.jg5 SRJ-122, SRJ-513 (hatch A2): the gets SRJ-122 leaves alone latch no one on a pending row with no launch start and keep their behaviour', () => {
+  afterEach(() => {
+    stopPermissionPoller()
+    _resetPollerState()
+    srj105AfterEach()
+  })
+
+  test.each(byName(launchStartCurrentLifeOf('get')))('the permission poller\'s get of P\'s own row reading %s, with a permission request: its prompt is posted as for any row; nothing latched, nothing posted to the latch', async (_name, row) => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const slack = makeStubSlack()
+    const trail = makeTrailCapture()
+    const requested: CannedGetResult = { ...row.build(persona, h.home), permission_requests: [cannedPermissionRequest()] }
+    // The poller reads through the harness's client, the session manager's too.
+    h.script({
+      listResult: { spawns: [cannedListRow({ state: 'check_permission' }, persona, h.home)] },
+      getResult: requested,
+    })
+    const ivl = startManualPoller({
+      getClient: () => h.stub.client as unknown as ReturnType<PollerDeps['getClient']>,
+      clientFor: makePersonaClients((key) => (key === p ? slack : undefined)).clientFor,
+      getPersona: (key) => h.config.personas.find((candidate) => candidate.key === key),
+      emitTrail: trail.emit,
+    })
+
+    await ivl.tick()
+
+    expect(getIds(h)).toEqual([personaInstanceId(p)])
+    expect(posts(slack)).toHaveLength(1)
+    expectNoNoteLatch(h)
+    expect(launchStartLinesOf(h, p)).toEqual([])
+    assertNoLeak({ posts: posts(slack), trail: trail.events })
+  })
+
+  test.each(byName(launchStartCurrentLifeOf('get')))('the JSONL persistence safeguard\'s get of P\'s own row reading %s: its lost-transcript notice is made as for any row; nothing latched, nothing posted to the latch', async (_name, row) => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const pId = personaInstanceId(p)
+    h.script({
+      getFn: (params) =>
+        params.claude_instance_id === pId
+          ? { ...row.build(persona, h.home), claude_session_id: TRANSCRIPT_SESSION_ID, jsonl_path: join(h.home, 'gone.jsonl') }
+          : errSpawnNotFound(),
+    })
+    const posted: Array<{ key: string; text: string }> = []
+
+    await runJsonlPersistenceSafeguard(h.config, (key, text) => {
+      posted.push({ key, text })
+    }, {
+      readMountinfo: () => '',
+      statFn: () => false,
+      archiveCountSince: () => 2,
+      recordStartupError: () => {},
+      home: h.home,
+    })
+
+    expect(getIds(h)).toContain(pId)
+    expect(posted.map((n) => n.key)).toEqual([p])
+    expectNoNoteLatch(h)
+    expect(launchStartLinesOf(h, p)).toEqual([])
+    assertNoLeak({ posted })
   })
 })

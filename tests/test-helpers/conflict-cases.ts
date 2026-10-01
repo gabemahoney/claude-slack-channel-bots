@@ -109,12 +109,61 @@
  *     {@link expectedConflictNotice} gives for `LATCH_CASE_LEFTOVER`, the
  *     persona's session name and the error's description.
  *
+ * Launch-start rows (E16 T2, SRJ-513, SRJ-408 and SRJ-1020): a configured
+ * persona P's own row read `pending` with no launch start, and the rows that
+ * latch nothing beside it. Every row is built for P (a `CannedRowPersona`)
+ * and a `home` with the stub's canned builders in their persona form
+ * (`cannedStatusResult`, `cannedGetResult`, `cannedListRow`), each launch
+ * start given explicitly, since the builders give a `pending` row a sample
+ * launch start when the case gives none. Columns common to both kinds
+ * ({@link LaunchStartCaseRowOf}, {@link LaunchStartNonLatchingRowOf}):
+ *   - `name`, `shape` (the read: `status`, `get` or `list`,
+ *     {@link LAUNCH_START_READ_SHAPES}; narrow a row on it for the read's own
+ *     answer type, {@link LaunchStartReadResults}) and `launchStart` (the raw
+ *     value; `undefined` for absent);
+ *   - `build(persona, home)`: the read's answer as the stub gives it. A
+ *     `status` result carries only `state` and `launch_started_at`, so a
+ *     row's `cwd`, labels and id are the row behind it and do not show;
+ *   - `readKey(persona)` (the key the read is made for: P's own, or the key
+ *     the row's id stands for) and `configured` (whether that key is a
+ *     configured persona's when P is the one configured persona);
+ *   - `readRow(persona, home)`: the row as `decideOwnRowRead` reads it, a
+ *     `status` result given its row's id as the own-row `status` step gives
+ *     it; `decisionInput(persona, home)`: the decision's whole input.
+ * The latching rows, {@link LAUNCH_START_CASE_ROWS}: each read shape × each
+ * row variant ({@link LAUNCH_START_ROW_VARIANTS}: P's current life, a `cwd`
+ * other than P's, a `config_dir` label other than P's) × each form of "no
+ * launch start" ({@link NO_LAUNCH_START_FORMS}: absent, i.e. the stub's
+ * `SAMPLE_LAUNCH_START_NONE`; `null`; {@link UNPARSEABLE_LAUNCH_START}, the
+ * stub's whole-second sample with its zone dropped). Their own columns:
+ * `variant`, `form`, `livenessNote`; `latchCase`, `refusedOperation` and
+ * `rowState`: "launch start not recorded", "none" and `pending`
+ * (`LATCH_CASE_LAUNCH_START_NOT_RECORDED`, `REFUSED_OPERATION_NONE`,
+ * `latchRowStateRead('pending')`); `sessionName(key)`, the quoted session
+ * the record holds (`personaTmuxSessionName(key)`); and `notice(key)`, the
+ * SRJ-1020 notice built by `launchStartNotRecordedNoticeText(key)`.
+ * {@link LAUNCH_START_AND_NOTE_ROW} is one more such row (P's current-life
+ * `get`, launch start absent) that also carries the stub's `provenanceNote`:
+ * it expects the launch-start decision only (SRJ-513's precedence).
+ * The non-latching rows, {@link LAUNCH_START_NON_LATCHING_ROWS}, per read
+ * shape, each with its `kind` and `state`: P's `pending` row with each
+ * non-none form of the stub's `SAMPLE_LAUNCH_STARTS` ("launch start
+ * recorded"); P's row in every other state with no launch start ("not
+ * pending"); and the no-launch-start `pending` row under a key outside the
+ * configured set: an absent persona's `cscb_<key>`
+ * ({@link LAUNCH_START_ABSENT_PERSONA_KEY}, not configured), another
+ * caller's id ({@link LAUNCH_START_ANOTHER_CALLERS_ID}, read for P), and a
+ * pre-persona row (`cscb_<key>` of {@link LAUNCH_START_PRE_PERSONA_KEY},
+ * labelled `service=cscb` only, not configured). Whether P's row is
+ * "covered" (SRJ-409, E28) is no column: the decision never asks.
+ *
  * Columns added later: E14 adds the `provenance_conflict` note latch's rows
- * (P's bring-up, no builder call); E16 T2 adds the "launch start not
- * recorded" rows and their SRJ-1020 notice; E30 adds the re-check's action
+ * (P's bring-up, no builder call); E30 adds the re-check's action
  * and its still-latched and cleared answers (SRJ-505), with a plain-spawn row
  * per row state step 1 can read, and the unusable-name rows' re-check
- * (`status` only) and `ErrSpawnNotFound` clear columns.
+ * (`status` only) and `ErrSpawnNotFound` clear columns, and the launch-start
+ * rows' re-check (`status` only) and their `ErrSpawnNotFound`, `ended` or
+ * `missing` and `waiting` clear columns.
  *
  * There is no "no pane 0.0" row: that case is withdrawn (rev 17; SRJ-507).
  *
@@ -122,14 +171,24 @@
  * a row only through the stub, the notice's texts only through
  * `src/conflict-latch.ts`'s exports, and the session name is the stub's
  * `STUB_TMUX_SESSION_NAME` or, for a persona, `personaTmuxSessionName(key)`
- * (its instance id `personaInstanceId(key)`).
+ * (its instance id `personaInstanceId(key)`). No timestamp is written here:
+ * launch starts come from the stub's `SAMPLE_LAUNCH_START*` constants, the
+ * unparseable one derived from a sample (and checked at import, through
+ * `parseLaunchStart`, not to parse).
  * No Phase-1-only export
  * is named, and no `mock.module()` is used.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { AGENT_DIRECTOR_PENDING_STATE } from '../../src/liveness-reading.ts'
+import type { Phase1GetResult, Phase1ListRow, Phase1StatusResult } from '../../src/ad-phase1-types.ts'
+import {
+  AGENT_DIRECTOR_DEAD_STATES,
+  AGENT_DIRECTOR_LIVE_STATES,
+  AGENT_DIRECTOR_PENDING_STATE,
+} from '../../src/liveness-reading.ts'
+import { parseLaunchStart } from '../../src/pending-row.ts'
+import type { OwnRowReadInput, RowReadRow } from '../../src/row-read-rules.ts'
 import {
   CONFLICT_CASE_SENTENCES,
   CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE,
@@ -147,6 +206,7 @@ import {
   LATCH_CASE_ANOTHER_STORE,
   LATCH_CASE_CONFLICTING_LABELS,
   LATCH_CASE_DIFFERENT_ID,
+  LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   LATCH_CASE_LEFTOVER,
   LATCH_CASE_NEVER_REPORTED_IN,
   LATCH_CASE_NO_VALID_ID,
@@ -167,6 +227,7 @@ import {
   UNUSABLE_NAME_NOTICE_REASON,
   UNUSABLE_NAME_NOTICE_SEPARATOR,
   latchRowStateRead,
+  launchStartNotRecordedNoticeText,
   takesUnrecognisedHandling,
   unusableNameNoticeText,
   type ConflictCaseWithSentence,
@@ -176,13 +237,22 @@ import {
 } from '../../src/conflict-latch.ts'
 import { classifyAdError } from '../../src/ad-error-class.ts'
 import { renderLogMessageText } from '../../src/persona-connection-errors.ts'
-import { personaTmuxSessionName } from '../../src/persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName } from '../../src/persona-identity.ts'
 import { escapeSlackControlCharacters } from '../../src/slack-text-escape.ts'
 import {
+  SAMPLE_LAUNCH_START_NONE,
+  SAMPLE_LAUNCH_START_WHOLE,
+  SAMPLE_LAUNCH_STARTS,
   STUB_TMUX_SESSION_NAME,
   UNUSABLE_NAME_FAULTS,
+  cannedGetResult,
+  cannedListRow,
+  cannedStatusResult,
   errTmuxSessionConflict,
   errUnusableName,
+  provenanceNote,
+  type CannedGetResult,
+  type CannedRowPersona,
   type ConflictCase,
   type ConflictOptions,
   type StubCallLog,
@@ -601,6 +671,352 @@ function unusableNameRow(site: UnusableNameSite, fault: UnusableNameFault): Unus
 /** Every UNUSABLE NAME row: each fault of `UNUSABLE_NAME_FAULTS` at each site kind, for `test.each`. */
 export const UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_SITES.flatMap((site) => UNUSABLE_NAME_FAULTS.map((fault) => unusableNameRow(site, fault))),
+)
+
+// ---------------------------------------------------------------------------
+// The launch start not recorded (b.jg5 SRJ-513, SRJ-408, SRJ-1020)
+// ---------------------------------------------------------------------------
+
+/** What each read shape answers, as the stub's canned builders build it. */
+export interface LaunchStartReadResults {
+  readonly status: Phase1StatusResult
+  readonly get: CannedGetResult
+  readonly list: Phase1ListRow
+}
+
+/** A read the server makes of a row: `status`, `get` or `list`. */
+export type LaunchStartReadShape = keyof LaunchStartReadResults
+
+/** Every read shape, in row order. */
+export const LAUNCH_START_READ_SHAPES: readonly LaunchStartReadShape[] = Object.freeze(['status', 'get', 'list'] as const)
+
+/**
+ * Which of persona P's rows a latching row is (SRJ-513: "whether or not it is
+ * P's current life"): P's current life, or P's own row with a `cwd` or a
+ * `config_dir` label other than P's.
+ */
+export type LaunchStartRowVariant = 'current life' | 'other cwd' | 'other config_dir'
+
+/** Every row variant, in row order. */
+export const LAUNCH_START_ROW_VARIANTS: readonly LaunchStartRowVariant[] = Object.freeze([
+  'current life',
+  'other cwd',
+  'other config_dir',
+] as const)
+
+/** A form of "no launch start" (SRJ-408): the field absent, `null`, or a value that does not parse. */
+export type NoLaunchStartForm = 'absent' | 'null' | 'unparseable'
+
+/**
+ * An unparseable launch start: the stub's whole-second sample with its zone
+ * dropped, which RFC 3339 requires. No timestamp is typed here.
+ */
+export const UNPARSEABLE_LAUNCH_START: string = SAMPLE_LAUNCH_START_WHOLE.replace(/(?:[Zz]|[+-]\d{2}:\d{2})$/, '')
+if (UNPARSEABLE_LAUNCH_START === SAMPLE_LAUNCH_START_WHOLE || parseLaunchStart(UNPARSEABLE_LAUNCH_START) !== undefined) {
+  throw new Error('conflict-cases: UNPARSEABLE_LAUNCH_START must not parse as a launch start')
+}
+
+/**
+ * Each form of "no launch start" as a builder override: `SAMPLE_LAUNCH_START_NONE`
+ * (the key left out of the row), `null`, and {@link UNPARSEABLE_LAUNCH_START}.
+ * Each is passed explicitly, since the canned builders give a `pending` row a
+ * sample launch start when the override has no `launch_started_at` key.
+ */
+export const NO_LAUNCH_START_FORMS: Readonly<Record<NoLaunchStartForm, string | null | undefined>> = Object.freeze({
+  absent: SAMPLE_LAUNCH_START_NONE,
+  null: null,
+  unparseable: UNPARSEABLE_LAUNCH_START,
+})
+
+/** Every form of "no launch start", in row order. */
+export const NO_LAUNCH_START_FORM_NAMES: readonly NoLaunchStartForm[] = Object.freeze(['absent', 'null', 'unparseable'] as const)
+
+/** The instance id of a caller that is not CSCB: no persona's `cscb_<key>`. */
+export const LAUNCH_START_ANOTHER_CALLERS_ID = 'another-caller-instance'
+/** A key no configured persona uses: an absent persona's. */
+export const LAUNCH_START_ABSENT_PERSONA_KEY = 'absent_persona'
+/** The key of a pre-persona row's id (`cscb_<key>`, labelled `service=cscb` only, b.1ix). */
+export const LAUNCH_START_PRE_PERSONA_KEY = 'legacy'
+
+/** The fields a row variant or kind overrides: those every read shape's builder takes. */
+interface LaunchStartRowOverrides {
+  readonly state: string
+  readonly launch_started_at: string | null | undefined
+  readonly liveness_note?: Phase1GetResult['liveness_note']
+  readonly cwd?: string
+  readonly labels?: Record<string, string>
+  readonly claude_instance_id?: string
+}
+
+/** What a row is built from for persona P: the persona the persona-form builder takes, and the overrides. */
+interface LaunchStartRowSpec {
+  readonly rowPersona: CannedRowPersona
+  readonly overrides: LaunchStartRowOverrides
+}
+
+/**
+ * The read answer `shape` gives for `spec`, through the stub's canned
+ * builders in their persona form (`home`: the directory the `config_dir`
+ * label is computed against). A `status` result carries only `state` and
+ * `launch_started_at`, so a variant's `cwd`, labels and note are the row
+ * behind it and do not show in the result.
+ */
+function buildLaunchStartRead<S extends LaunchStartReadShape>(
+  shape: S,
+  spec: LaunchStartRowSpec,
+  home: string,
+): LaunchStartReadResults[S] {
+  const { state, launch_started_at } = spec.overrides
+  const result =
+    shape === 'status'
+      ? cannedStatusResult({ state, launch_started_at })
+      : shape === 'get'
+        ? cannedGetResult({ ...spec.overrides }, spec.rowPersona, home)
+        : cannedListRow({ ...spec.overrides }, spec.rowPersona, home)
+  return result as LaunchStartReadResults[S]
+}
+
+/**
+ * The row as `decideOwnRowRead` reads it: a `get` or `list` row as built; a
+ * `status` result with the id of the row the read addressed, as the own-row
+ * `status` step gives it (`applyOwnRowStatusStep`).
+ */
+function launchStartReadRow(shape: LaunchStartReadShape, read: LaunchStartReadResults[LaunchStartReadShape], rowId: string): RowReadRow {
+  return shape === 'status' ? { ...read, claude_instance_id: rowId } : (read as RowReadRow)
+}
+
+/** The labels a spawn of `persona` writes, read off the stub's persona-form row. */
+function personaLabels(persona: CannedRowPersona, home: string): Record<string, string> {
+  return cannedGetResult({}, persona, home).labels
+}
+
+/** The columns every launch-start row carries, for one read shape. */
+interface LaunchStartRowColumns<S extends LaunchStartReadShape> {
+  /** Readable row name for `test.each`. */
+  readonly name: string
+  /** The read that gives the row. */
+  readonly shape: S
+  /** The raw launch start the row carries (absent when `undefined`). */
+  readonly launchStart: string | null | undefined
+  /** Builds the read's answer for persona P with the stub's canned builders in their persona form. */
+  readonly build: (persona: CannedRowPersona, home: string) => LaunchStartReadResults[S]
+  /** The key the read is made for: P's own, or the key the row's id stands for. */
+  readonly readKey: (persona: CannedRowPersona) => string
+  /** Whether {@link readKey} is a configured persona's when P is the one configured persona. */
+  readonly configured: boolean
+  /** The row as `decideOwnRowRead` reads it (a `status` result given its row's id). */
+  readonly readRow: (persona: CannedRowPersona, home: string) => RowReadRow
+  /** `decideOwnRowRead`'s input for this row: {@link readKey}, {@link readRow} and {@link configured}. */
+  readonly decisionInput: (persona: CannedRowPersona, home: string) => OwnRowReadInput
+}
+
+function launchStartColumns<S extends LaunchStartReadShape>(
+  name: string,
+  shape: S,
+  specOf: (persona: CannedRowPersona, home: string) => LaunchStartRowSpec,
+  readKey: (persona: CannedRowPersona) => string,
+  configured: boolean,
+): LaunchStartRowColumns<S> {
+  const build = (persona: CannedRowPersona, home: string) => buildLaunchStartRead(shape, specOf(persona, home), home)
+  const readRow = (persona: CannedRowPersona, home: string): RowReadRow => {
+    const spec = specOf(persona, home)
+    return launchStartReadRow(shape, buildLaunchStartRead(shape, spec, home), spec.overrides.claude_instance_id ?? personaInstanceId(spec.rowPersona.key))
+  }
+  return {
+    name,
+    shape,
+    launchStart: undefined,
+    build,
+    readKey,
+    configured,
+    readRow,
+    decisionInput: (persona, home) => ({ key: readKey(persona), row: readRow(persona, home), configured }),
+  }
+}
+
+/** One latching launch-start row for one read shape. */
+export interface LaunchStartCaseRowOf<S extends LaunchStartReadShape> extends LaunchStartRowColumns<S> {
+  /** Which of P's rows it is. */
+  readonly variant: LaunchStartRowVariant
+  /** Its form of "no launch start". */
+  readonly form: NoLaunchStartForm
+  /** The `liveness_note` the row also carries (`provenanceNote` on {@link LAUNCH_START_AND_NOTE_ROW} only). */
+  readonly livenessNote: Phase1GetResult['liveness_note'] | undefined
+  /** "launch start not recorded". */
+  readonly latchCase: typeof LATCH_CASE_LAUNCH_START_NOT_RECORDED
+  /** "none": the re-check reads only `status`. */
+  readonly refusedOperation: typeof REFUSED_OPERATION_NONE
+  /** `pending`, the state the read gave. */
+  readonly rowState: LatchRowState
+  /** The session the record holds for persona `key`: `personaTmuxSessionName(key)`. */
+  readonly sessionName: (key: string) => string
+  /** The SRJ-1020 notice body for persona `key` (the persona notifier adds the prefix). */
+  readonly notice: (key: string) => string
+}
+
+/** One latching launch-start row: narrow on `shape` for the read's own answer type. */
+export type LaunchStartCaseRow = { [S in LaunchStartReadShape]: LaunchStartCaseRowOf<S> }[LaunchStartReadShape]
+
+/** P's own row in `variant`, reading `pending` with `launchStart` (and `note`, if any). */
+function ownRowSpec(
+  variant: LaunchStartRowVariant,
+  launchStart: string | null | undefined,
+  note: Phase1GetResult['liveness_note'] | undefined,
+): (persona: CannedRowPersona, home: string) => LaunchStartRowSpec {
+  return (persona, home) => {
+    const base: LaunchStartRowOverrides = {
+      state: AGENT_DIRECTOR_PENDING_STATE,
+      launch_started_at: launchStart,
+      ...(note === undefined ? {} : { liveness_note: note }),
+    }
+    if (variant === 'other cwd') return { rowPersona: persona, overrides: { ...base, cwd: `${persona.working_directory}_elsewhere` } }
+    if (variant === 'other config_dir') {
+      const labels = personaLabels(persona, home)
+      return { rowPersona: persona, overrides: { ...base, labels: { ...labels, config_dir: `${labels['config_dir']}_elsewhere` } } }
+    }
+    return { rowPersona: persona, overrides: base }
+  }
+}
+
+function launchStartRow<S extends LaunchStartReadShape>(
+  shape: S,
+  variant: LaunchStartRowVariant,
+  form: NoLaunchStartForm,
+  note?: Phase1GetResult['liveness_note'],
+): LaunchStartCaseRowOf<S> {
+  const launchStart = NO_LAUNCH_START_FORMS[form]
+  const noteLabel = note === undefined ? '' : `, ${note} note`
+  return Object.freeze({
+    ...launchStartColumns(
+      `${shape}: ${variant}, pending with launch start ${form}${noteLabel}`,
+      shape,
+      ownRowSpec(variant, launchStart, note),
+      (persona) => persona.key,
+      true,
+    ),
+    launchStart,
+    variant,
+    form,
+    livenessNote: note,
+    latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+    refusedOperation: REFUSED_OPERATION_NONE,
+    rowState: PENDING,
+    sessionName: (key: string) => personaTmuxSessionName(key),
+    notice: (key: string) => launchStartNotRecordedNoticeText(key),
+  })
+}
+
+/**
+ * Every latching launch-start row: each read shape × each row variant × each
+ * form of "no launch start", for `test.each`.
+ */
+export const LAUNCH_START_CASE_ROWS: readonly LaunchStartCaseRow[] = Object.freeze(
+  LAUNCH_START_READ_SHAPES.flatMap((shape) =>
+    LAUNCH_START_ROW_VARIANTS.flatMap((variant) =>
+      // `shape` spans the union here; each row is one shape's row.
+      NO_LAUNCH_START_FORM_NAMES.map((form) => launchStartRow(shape, variant, form) as LaunchStartCaseRow),
+    ),
+  ),
+)
+
+/**
+ * P's current-life `get` row reading `pending` with no launch start (absent)
+ * and carrying `provenanceNote`: the launch-start decision only, never the
+ * note's "conflicting labels" (SRJ-513's precedence).
+ */
+export const LAUNCH_START_AND_NOTE_ROW: LaunchStartCaseRowOf<'get'> = launchStartRow('get', 'current life', 'absent', provenanceNote)
+
+/**
+ * Why a non-latching row latches nothing: a `pending` row with a launch
+ * start, a row in another state, or a no-launch-start `pending` row that is
+ * no configured persona's own (an absent persona's `cscb_<key>`, another
+ * caller's id, a pre-persona row).
+ */
+export type LaunchStartNonLatchingKind =
+  | 'launch start recorded'
+  | 'not pending'
+  | 'absent persona'
+  | 'another caller'
+  | 'pre-persona'
+
+/** One read of a row that latches nothing. */
+export interface LaunchStartNonLatchingRowOf<S extends LaunchStartReadShape> extends LaunchStartRowColumns<S> {
+  readonly kind: LaunchStartNonLatchingKind
+  /** The row's state. */
+  readonly state: string
+}
+
+/** One non-latching launch-start row: narrow on `shape` for the read's own answer type. */
+export type LaunchStartNonLatchingRow = { [S in LaunchStartReadShape]: LaunchStartNonLatchingRowOf<S> }[LaunchStartReadShape]
+
+function nonLatchingRow<S extends LaunchStartReadShape>(
+  shape: S,
+  kind: LaunchStartNonLatchingKind,
+  detail: string,
+  state: string,
+  launchStart: string | null | undefined,
+  specOf: (persona: CannedRowPersona, home: string) => LaunchStartRowSpec,
+  readKey: (persona: CannedRowPersona) => string,
+  configured: boolean,
+): LaunchStartNonLatchingRowOf<S> {
+  return Object.freeze({
+    ...launchStartColumns(`${shape}: ${kind}${detail}`, shape, specOf, readKey, configured),
+    launchStart,
+    kind,
+    state,
+  })
+}
+
+/** Every state but `pending` (the live and the terminal states). */
+const NOT_PENDING_STATES: readonly string[] = Object.freeze(
+  [...AGENT_DIRECTOR_LIVE_STATES, ...AGENT_DIRECTOR_DEAD_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE),
+)
+
+/** The non-none sample launch starts, by form name. */
+const RECORDED_LAUNCH_STARTS: readonly (readonly [string, string])[] = Object.freeze(
+  Object.entries(SAMPLE_LAUNCH_STARTS).flatMap(([form, value]) => (value === undefined ? [] : [[form, value] as const])),
+)
+
+function nonLatchingRowsFor<S extends LaunchStartReadShape>(shape: S): LaunchStartNonLatchingRowOf<S>[] {
+  const own = (persona: CannedRowPersona) => persona.key
+  const noLaunchStart = NO_LAUNCH_START_FORMS.absent
+  const pendingNone: LaunchStartRowOverrides = { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: noLaunchStart }
+  const absentPersona = (persona: CannedRowPersona): CannedRowPersona => ({ ...persona, key: LAUNCH_START_ABSENT_PERSONA_KEY })
+  const prePersona = (persona: CannedRowPersona): CannedRowPersona => ({ ...persona, key: LAUNCH_START_PRE_PERSONA_KEY })
+  return [
+    // A `pending` row with a launch start: each non-none sample form.
+    ...RECORDED_LAUNCH_STARTS.map(([form, value]) =>
+      nonLatchingRow(shape, 'launch start recorded', ` (${form})`, AGENT_DIRECTOR_PENDING_STATE, value,
+        (persona) => ({ rowPersona: persona, overrides: { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: value } }), own, true),
+    ),
+    // Every other state, with no launch start.
+    ...NOT_PENDING_STATES.map((state) =>
+      nonLatchingRow(shape, 'not pending', ` (${state})`, state, noLaunchStart,
+        (persona) => ({ rowPersona: persona, overrides: { state, launch_started_at: noLaunchStart } }), own, true),
+    ),
+    // A no-launch-start `pending` row under a key outside the configured set.
+    nonLatchingRow(shape, 'absent persona', '', AGENT_DIRECTOR_PENDING_STATE, noLaunchStart,
+      (persona) => ({ rowPersona: absentPersona(persona), overrides: pendingNone }), () => LAUNCH_START_ABSENT_PERSONA_KEY, false),
+    nonLatchingRow(shape, 'another caller', '', AGENT_DIRECTOR_PENDING_STATE, noLaunchStart,
+      (persona) => ({ rowPersona: persona, overrides: { ...pendingNone, claude_instance_id: LAUNCH_START_ANOTHER_CALLERS_ID, labels: {} } }), own, true),
+    nonLatchingRow(shape, 'pre-persona', '', AGENT_DIRECTOR_PENDING_STATE, noLaunchStart,
+      (persona, home) => {
+        const { persona: _persona, config_dir: _configDir, ...labels } = personaLabels(persona, home)
+        return { rowPersona: prePersona(persona), overrides: { ...pendingNone, labels } }
+      }, () => LAUNCH_START_PRE_PERSONA_KEY, false),
+  ]
+}
+
+/**
+ * Every non-latching launch-start row, per read shape: `pending` with each
+ * non-none form in `SAMPLE_LAUNCH_STARTS`; every other state with no launch
+ * start; and the no-launch-start `pending` row under a key outside the
+ * configured set (an absent persona's `cscb_<key>`, another caller's id, a
+ * pre-persona row). Each decides nothing.
+ */
+export const LAUNCH_START_NON_LATCHING_ROWS: readonly LaunchStartNonLatchingRow[] = Object.freeze(
+  // `shape` spans the union here; each row is one shape's row.
+  LAUNCH_START_READ_SHAPES.flatMap((shape) => nonLatchingRowsFor(shape) as LaunchStartNonLatchingRow[]),
 )
 
 // ---------------------------------------------------------------------------

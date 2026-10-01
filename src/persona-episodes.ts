@@ -292,10 +292,11 @@ export const PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME = 'unusable-recorded-na
 
 /**
  * Launch start not recorded (SRJ-513, SRJ-1020): from the latch being set
- * until it clears. Begun by the conflict latch's notice reaction
- * (`createConflictNoticeObserver`, `src/conflict-latch.ts`), which ends it
- * silently on a latch of another kind; it posts nothing yet (SRJ-1020's text
- * is a row of that module's `HOLD_NOTICES` still to be built).
+ * until it clears. Posted by the conflict latch's notice reaction
+ * (`createConflictNoticeObserver`, `src/conflict-latch.ts`): a latch, or a
+ * relatch from another case, begins the episode and posts SRJ-1020 once; a
+ * latch of another kind ends it silently. Its end, at the latch's clear, is
+ * E30's.
  */
 export const PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED = 'launch-start-not-recorded'
 

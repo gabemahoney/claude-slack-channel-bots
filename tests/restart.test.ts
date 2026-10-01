@@ -78,13 +78,18 @@ import {
   checkLaunchConfigDir,
   setConfigDirUnresolvableHook,
   spawnForPersona,
+  setConfiguredPersonaQuery,
+  _resetConfiguredPersonaQuery,
   type ConfigDirUnresolvableHook,
 } from '../src/session-manager.ts'
 import {
   conflictNoticeText,
   createConflictLatch,
+  LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   LATCH_CASE_LEFTOVER,
   latchRowStateRead,
+  launchStartNotRecordedNoticeText,
+  REFUSED_OPERATION_NONE,
   REFUSED_OPERATION_PLAIN_SPAWN,
   type ConflictLatch,
 } from '../src/conflict-latch.ts'
@@ -4667,26 +4672,32 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 
   // Through the real liveness and reconnect adapters over the stub, with the
   // deferral bound as `main()` binds it: `status` answers `pending`, with or
-  // without a launch start. One `status` read (the liveness probe's) and no
-  // other agent-director call: no send-keys, kill, spawn or resume. One
-  // deferral line, naming the launch start when there is one.
-  describe('through the real adapters over the stub', () => {
+  // without a launch start, under a key no configured persona uses (the
+  // configured-persona query counts no key), so the row latches no one
+  // (b.jg5 SRJ-408); a configured persona's own such row with no launch
+  // start latches it instead (the SRJ-513 describe below). One `status` read
+  // (the liveness probe's) and no other agent-director call: no send-keys,
+  // kill, spawn or resume. One deferral line, naming the launch start when
+  // there is one.
+  describe('through the real adapters over the stub, under a key no configured persona uses', () => {
     let dir: string
 
     beforeEach(() => {
       dir = mkdtempSync(join(tmpdir(), 'restart-pending-'))
+      setConfiguredPersonaQuery(() => false)
     })
 
     afterEach(() => {
       resetClientForTests()
       _resetOutageState()
+      _resetConfiguredPersonaQuery()
       rmSync(dir, { recursive: true, force: true })
     })
 
     const REAL_CASES = CONNECTIONS.flatMap(([conn, connected, stream]) =>
       LAUNCH_STARTS.map(([startLabel, start]) => [conn, startLabel, connected, stream, start] as const))
 
-    test.each(REAL_CASES)('status answers pending, P %s, %s → one status read and no other agent-director call; no kill or launch; nothing counted; one deferral line; pending-deferred', async (_conn, _startLabel, connected, stream, start) => {
+    test.each(REAL_CASES)('status answers pending, P %s, %s, its key one no configured persona uses → one status read and no other agent-director call; no kill or launch; nothing counted; one deferral line; pending-deferred', async (_conn, _startLabel, connected, stream, start) => {
       const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
       const KEY = config.personas[0]!.key
       const log = makeStubCallLog()
@@ -5628,6 +5639,173 @@ describe('b.jg5 SRJ-512: a restart run whose own liveness read latches P stops t
       expect(h.episodeNotices).toHaveLength(1)
       expect(deferred).toEqual([])
       expect(armHook).toEqual([])
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-502, SRJ-513 — a restart run whose own liveness read finds P's
+// own row `pending` with no launch start
+//
+// The real liveness adapter applies the own-row `status` step with the
+// configured-persona query the recovery harness installs (as `main()` does),
+// so P's own row reading `pending` with no launch start (absent, `null`, or
+// one that does not parse) latches P with "launch start not recorded",
+// refused operation "none" and the state `pending`, and reads `unknown`. The
+// restart work asks the latch right after its probe and answers
+// `RESTART_OUTCOME_LATCHED`: no `pending` deferral, no reconnect, no kill,
+// spawn, `resume` or send-keys, no arm hook and nothing recorded (P's one
+// failure on record stays one: a success would reset it, a counted failure
+// raise it), for a scheduled restart, a human-triggered restart request and
+// E8's retry entry alike. The latch's holds and its one SRJ-1020 post run as
+// `main()` binds them. Control: the same row with a launch start latches no
+// one and is handed to the `pending` deferral as E9 left it. Q beside P,
+// whose row reads `ended`, is killed and relaunched as before. The scheduled
+// entries wait out their short restart timers with `Bun.sleep(WAIT_MS)`.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-513: a restart run whose own liveness read finds P\'s own pending row with no launch start latches P and stops there', () => {
+  /** Launch-start values that are none (b.jg5 SRJ-408): the key left out, `null`, and one that does not parse (no zone). */
+  const NO_LAUNCH_START_FORMS: ReadonlyArray<readonly [string, string | null | undefined]> = [
+    ['absent', SAMPLE_LAUNCH_START_NONE],
+    ['null', null],
+    ['unparseable (no zone)', SAMPLE_LAUNCH_START_WHOLE.replace(/Z$/, '')],
+  ]
+
+  /** The restart work's line for a latched persona. */
+  const skipLine = (key: string): string =>
+    `[slack] Skipping restart for persona=${key} — the persona is latched; no agent-director call, nothing recorded (b.jg5 SRJ-502)`
+
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    cancelAllRestartTimers()
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    try {
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  /** How each entry runs persona `key`'s restart work, waiting for it as the file does. */
+  type Entry = (key: string, cwd: string) => Promise<void>
+  const ENTRIES: Array<[string, Entry]> = [
+    ['a scheduled restart', async (key, cwd) => {
+      scheduleRestart(key, cwd)
+      await Bun.sleep(WAIT_MS)
+    }],
+    ['a human-triggered restart request', async (key, cwd) => {
+      scheduleRestart(key, cwd, undefined, { humanTrigger: true })
+      await Bun.sleep(WAIT_MS)
+    }],
+    ["E8's retry entry (runRestartRetry)", async (key, cwd) => {
+      await runRestartRetry(key, cwd, isLaunchInFlight)
+    }],
+  ]
+
+  /**
+   * A recovery harness whose restart deps record each `pending` deferral,
+   * each arm-hook call and each run's outcome; P's `status` answers its own
+   * row `pending` with `launchStartedAt` (the key left out for `undefined`),
+   * Q's reads `ended` until its relaunch's spawn, then `waiting`. P has one
+   * failure on record.
+   */
+  function build(launchStartedAt: string | null | undefined) {
+    const deferred: string[] = []
+    const armHook: string[] = []
+    const outcomes: Array<{ key: string; outcome: unknown }> = []
+    const h = (harness = makeRecoveryHarness({
+      alertThresholdMs: false,
+      restartDeps: {
+        getRestartDelay: () => FAST_DELAY_S,
+        deferPendingRow: (key) => { deferred.push(key) },
+        armRetryTimer: (key) => { armHook.push(key) },
+        serialize: async <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
+          const outcome = await operation()
+          outcomes.push({ key, outcome })
+          return outcome
+        },
+      },
+    }))
+    const [p, q] = [h.keys[0]!, h.keys[1]!]
+    const cwdOf = (key: string): string => h.config.personas.find((persona) => persona.key === key)!.working_directory
+    rowReadsUntilSpawn(h, 'ended')
+    const othersRow = (h.stub.calls as unknown as RecoveryStubScript).statusFn!
+    h.script({
+      statusFn: (params) => params.claude_instance_id === personaInstanceId(p)
+        ? cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launchStartedAt })
+        : othersRow(params),
+    })
+    recordFailure(p)
+    return { h, p, q, cwdOf, deferred, armHook, outcomes }
+  }
+
+  test.each(ENTRIES.flatMap(([entry, run]) => NO_LAUNCH_START_FORMS.map(([form, start]) => [entry, form, run, start] as const)))(
+    '%s, P\'s own row pending with its launch start %s: P latches once with state pending and one SRJ-1020 post; the run answers latched with no deferral, kill, spawn, resume or send-keys, no arm hook, nothing counted; Q beside it restarts as before',
+    async (_entry, _form, run, start) => {
+      const { h, p, q, cwdOf, deferred, armHook, outcomes } = build(start)
+
+      await run(p, cwdOf(p))
+
+      expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }])
+      expect(callCounts(h)).toEqual({ statusCalls: 1 })
+      expect(personaCallCounts(h, p)).toEqual({ statusCalls: 1 })
+      expect(tmuxTouchingCallsIn(h.stub.calls)).toEqual([])
+      expect(h.latch.record(p)).toEqual({
+        sessionName: personaTmuxSessionName(p),
+        latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+        refusedOperation: REFUSED_OPERATION_NONE,
+        rowState: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
+      })
+      expect(h.latchEvents.filter((event) => event.step === 'set').map((event) => event.key)).toEqual([p])
+      expect(h.episodeNotices).toEqual([{ key: p, text: launchStartNotRecordedNoticeText(p) }])
+      expect(deferred).toEqual([])
+      expect(armHook).toEqual([])
+      expect(h.controller.armedKeys()).toEqual([])
+      expect(h.triggers).toEqual([])
+      expect(getFailureCount(p)).toBe(1)
+      expect(h.capReached).toEqual([])
+      expect(h.notices).toEqual([])
+      expect(h.errors.filter((line) => line === skipLine(p))).toHaveLength(1)
+      expect(h.errors.filter((line) => line.startsWith(`[slack] Deferring persona=${p}`))).toEqual([])
+      expect(h.errors.filter((line) => line.startsWith(`[slack] Relaunching session for persona=${p}`))).toEqual([])
+
+      // Q, not latched, is killed and relaunched through the same entry.
+      await run(q, cwdOf(q))
+      await h.settle()
+
+      expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }, { key: q, outcome: RESTART_OUTCOME_LAUNCHED }])
+      expect(h.latch.isLatched(q)).toBe(false)
+      expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(q)])
+      expect(h.stub.spawnedIds()).toEqual([personaInstanceId(q)])
+      expect(personaCallCounts(h, p)).toEqual({ statusCalls: 1 })
+      expect(getFailureCount(q)).toBe(0)
+      expect(h.episodeNotices).toHaveLength(1)
+      expect(deferred).toEqual([])
+      expect(armHook).toEqual([])
+    },
+  )
+
+  test.each(ENTRIES)(
+    'control, %s, P\'s own row pending with a launch start: no latch, no post; the row is handed to the pending deferral as E9 left it, with no kill, spawn, resume or send-keys, nothing counted',
+    async (_entry, run) => {
+      const { h, p, cwdOf, deferred, armHook, outcomes } = build(SAMPLE_LAUNCH_START_FRACTIONAL)
+
+      await run(p, cwdOf(p))
+
+      expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_PENDING_DEFERRED }])
+      expect(deferred).toEqual([p])
+      expect(callCounts(h)).toEqual({ statusCalls: 1 })
+      expect(h.latch.isLatched(p)).toBe(false)
+      expect(h.latchEvents).toEqual([])
+      expect(h.episodeNotices).toEqual([])
+      expect(armHook).toEqual([])
+      expect(getFailureCount(p)).toBe(1)
+      expect(h.errors.filter((line) => line === skipLine(p))).toEqual([])
     },
   )
 })

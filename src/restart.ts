@@ -175,7 +175,8 @@ export const RESTART_OUTCOME_LIVENESS_UNKNOWN = 'liveness-unknown'
  * first step found it so, and nothing was probed, reconnected, killed or
  * launched, and nothing was recorded; or it latched while a liveness probe
  * (or the 'escalate-dead' reconnect, or its re-probe) ran, the probe's own
- * `status` read included (an UNUSABLE NAME answer, b.jg5 SRJ-512), and the
+ * `status` read included (an UNUSABLE NAME answer, b.jg5 SRJ-512, or the
+ * persona's own row reading `pending` with no launch start, SRJ-513), and the
  * latched query asked again right after each probe and before the instance
  * is reconnected, re-probed or killed found it so, and nothing more was done
  * or recorded (no `pending` deferral, no arm hook); or its launch answered
@@ -642,7 +643,8 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // b.jg5 SRJ-502: the latch is asked again for the same reason. A launch
   // outside the serializer (e.g. the start pass's) may have latched the
   // persona while the probe ran, or the probe's own `status` read did (an
-  // UNUSABLE NAME answer, b.jg5 SRJ-512, read `unknown`); then nothing is
+  // UNUSABLE NAME answer, b.jg5 SRJ-512, or its own row reading `pending`
+  // with no launch start, SRJ-513, read `unknown`); then nothing is
   // deferred, reconnected or killed, and the arm hook is not called.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
 
@@ -844,7 +846,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
  * `unknown` or threw: agent-director could not report on the persona, and the
  * arm hook is called), `RESTART_OUTCOME_SHUTTING_DOWN`,
  * `RESTART_OUTCOME_NOT_UP`, or `RESTART_OUTCOME_LATCHED` when the persona is
- * latched after the re-probe (its own read latched it, b.jg5 SRJ-512, or a
+ * latched after the re-probe (its own read latched it, b.jg5 SRJ-512, SRJ-513, or a
  * latch set elsewhere): then the arm hook is not called. Shutdown and the not-up gate are asked after the
  * probe, since it is an async agent-director call; `killSession`'s
  * launch-in-flight guard and `launchSession`'s own gate still apply after it.
@@ -858,8 +860,9 @@ async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<Re
     return RESTART_OUTCOME_SHUTTING_DOWN
   }
   if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
-  // b.jg5 SRJ-502, SRJ-512: the re-probe's own `status` read may have
-  // latched the persona (an UNUSABLE NAME answer, read `unknown`): no arm
+  // b.jg5 SRJ-502, SRJ-512, SRJ-513: the re-probe's own `status` read may
+  // have latched the persona (an UNUSABLE NAME answer, or its own row
+  // reading `pending` with no launch start, read `unknown`): no arm
   // hook, deferral, kill or launch, and nothing recorded.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
 

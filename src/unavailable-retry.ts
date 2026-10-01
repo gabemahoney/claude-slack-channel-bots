@@ -161,7 +161,8 @@
  * reading at the restart work, the re-probe's included, that leaves the
  * persona unlatched (a probe that throws included, which the arming predicate
  * above does not arm on). The restart work asks the latch first: an UNUSABLE
- * NAME answer latches the persona (b.jg5 SRJ-512), so its `unknown` reading
+ * NAME answer (b.jg5 SRJ-512), or the persona's own row reading `pending`
+ * with no launch start (SRJ-513), latches the persona, so its `unknown` reading
  * stops there and arms nothing. A third is
  * the health tick's (`HealthCheckDeps.armRetryTimer`, wired in `main()`): a
  * persona held off on its `tmux-unavailable` outage that the tick does not
@@ -339,7 +340,8 @@ export const UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES: ReadonlySet<string> = new Set
  * the restart work's arm hook (`RestartDeps.armRetryTimer`, wired in
  * `main()`) arms with, on every `unknown` liveness reading at the restart
  * work that leaves the persona unlatched, a thrown probe included (b.jg5
- * SRJ-314); an UNUSABLE NAME answer latches the persona (b.jg5 SRJ-512) and
+ * SRJ-314); an UNUSABLE NAME answer (b.jg5 SRJ-512), or the persona's own
+ * row reading `pending` with no launch start (SRJ-513), latches the persona and
  * the restart work stops at its latch check first, arming nothing; a CONFIG
  * `status` has armed the CONFIG cause first through the reporting point, and
  * a trigger while armed keeps the due time.
@@ -1283,7 +1285,7 @@ export interface FullModeRetryDeps {
  * pending-only mode, answers a `launch-in-flight` refusal with no call when
  * the in-flight predicate answers true or throws, else reads the row inside
  * a recovery attempt for the persona, asks the latched query again (a read
- * that latched the persona, b.jg5 SRJ-512, stops with the latch's reason and
+ * that latched the persona, b.jg5 SRJ-512, SRJ-513, stops with the latch's reason and
  * hands nothing on) and answers from its state (`pendingOnlyAnswer`). A latched query that throws counts as latched
  * (logged, with what it threw). A dependency that throws (but the in-flight
  * predicate and the latched query),
@@ -1304,8 +1306,11 @@ export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableR
         return { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, row: UNAVAILABLE_RETRY_ROW_PENDING }
       }
       const row = await runInAttempt(key, 'recovery', () => deps.readRow(key))
-      // b.jg5 SRJ-305, SRJ-512: a row read that latched the persona stops the
-      // timer with the latch's reason; nothing is handed to the restart path.
+      // b.jg5 SRJ-305, SRJ-512, SRJ-513: a row read that latched the persona
+      // stops the timer with the latch's reason; nothing is handed to the
+      // restart path. A configured persona's own `pending` row with no launch
+      // start latches at that read, so it never reaches `pendingOnlyAnswer`;
+      // a row under an unconfigured key latches nothing and still does.
       if (latched(key, deps.isLatched)) return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
       if (isLiveOutOfPending(row.state) && probe(key, deps.isSessionConnected) && probe(key, deps.hasSessionStream)) {
         endCondition(key, row.state, deps.endTmuxUnresponsive)

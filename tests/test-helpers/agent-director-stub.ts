@@ -73,6 +73,16 @@
  *     the list a `test.each` iterates for "no other note latches", typed as
  *     the 0.10.0 client's free text; `unknownNote` is a note CSCB does not
  *     know. Tests take note values from here and never type them.
+ *   - Launch starts (b.jg5 SRJ-513): the canned row builders
+ *     (`cannedStatusResult`, `cannedGetResult`, `cannedListRow`) and the stub
+ *     client's default answers give a `pending` row the sample launch start
+ *     `SAMPLE_LAUNCH_START_DEFAULT` unless the case gives `launch_started_at`,
+ *     since a configured persona's own `pending` row with no launch start
+ *     latches the persona. "No launch start" is an explicit request:
+ *     `launch_started_at: SAMPLE_LAUNCH_START_NONE` (the key left out) or
+ *     `launch_started_at: null`. Rows in any other state carry no launch
+ *     start unless given one. Tests take launch starts from the
+ *     `SAMPLE_LAUNCH_START*` constants and never type a timestamp.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -282,9 +292,18 @@ export function cannedKillResult(killSent?: boolean): Phase1KillResult {
 /**
  * Sample launch starts (`launch_started_at`, ADSRD SR-22.2: RFC 3339 UTC with
  * millisecond precision, the fraction shown only when it is not zero): one
- * with fractional seconds and one without. For a row with no launch start,
- * pass `SAMPLE_LAUNCH_START_NONE` (`undefined`): the canned builders then omit
- * the key.
+ * with fractional seconds and one without.
+ *
+ * The canned row builders (`cannedStatusResult`, `cannedGetResult`,
+ * `cannedListRow`) give a `pending` row `SAMPLE_LAUNCH_START_DEFAULT` when the
+ * overrides have no `launch_started_at` key, since a configured persona's own
+ * `pending` row with no launch start latches the persona (b.jg5 SRJ-513).
+ * "No launch start" is an explicit request: pass
+ * `launch_started_at: SAMPLE_LAUNCH_START_NONE` (`undefined`: the key is left
+ * out of the row) or `launch_started_at: null` (the key shown as `null`). A
+ * row in any other state gets no launch start by default, as agent-director
+ * shows the field on `pending` rows only; an explicit override still wins in
+ * every state.
  */
 export const SAMPLE_LAUNCH_START_FRACTIONAL = '2026-05-24T12:00:00.123Z'
 export const SAMPLE_LAUNCH_START_WHOLE = '2026-05-24T12:00:00Z'
@@ -295,6 +314,24 @@ export const SAMPLE_LAUNCH_STARTS: Readonly<Record<'fractional' | 'whole' | 'non
   fractional: SAMPLE_LAUNCH_START_FRACTIONAL,
   whole: SAMPLE_LAUNCH_START_WHOLE,
   none: SAMPLE_LAUNCH_START_NONE,
+}
+
+/** The launch start a canned `pending` row shows when the caller gives none. */
+export const SAMPLE_LAUNCH_START_DEFAULT = SAMPLE_LAUNCH_STARTS.fractional
+
+/** The row state that carries a launch start: the stub's own spelling of agent-director's `pending`. */
+const PENDING_ROW_STATE = 'pending'
+
+/**
+ * Give `row` the default launch start when it reads `pending` and `overrides`
+ * has no `launch_started_at` key (a key given as `undefined` or `null` is an
+ * explicit "no launch start" and is kept).
+ */
+function withDefaultLaunchStart<T extends { state?: unknown }>(row: T, overrides: object): T {
+  if (row.state === PENDING_ROW_STATE && !('launch_started_at' in overrides)) {
+    (row as Record<string, unknown>)['launch_started_at'] = SAMPLE_LAUNCH_START_DEFAULT
+  }
+  return row
 }
 
 /**
@@ -358,11 +395,13 @@ function omitUndefined<T extends object>(row: T, keys: readonly string[]): T {
  * Build a canned `status` result (default `{ state: 'waiting' }`). A Phase 1
  * `status` result carries only `state` and `launch_started_at`, so
  * `launch_started_at` is its one Phase 1 override; `liveness_note` belongs on
- * `cannedGetResult` and `cannedListRow`. A `launch_started_at` of `undefined`
- * omits the key.
+ * `cannedGetResult` and `cannedListRow`. A `pending` result shows
+ * `SAMPLE_LAUNCH_START_DEFAULT` unless the overrides give `launch_started_at`;
+ * given as `undefined` (`SAMPLE_LAUNCH_START_NONE`) the key is left out, and
+ * given as `null` it is shown as `null`.
  */
 export function cannedStatusResult(overrides: Partial<Phase1StatusResult> = {}): Phase1StatusResult {
-  return omitUndefined({ state: 'waiting', ...overrides }, ['launch_started_at'])
+  return omitUndefined(withDefaultLaunchStart({ state: 'waiting', ...overrides }, overrides), ['launch_started_at'])
 }
 
 /**
@@ -1159,15 +1198,18 @@ function defaultRowFields(claudeInstanceId: string): {
  *
  * The Phase 1 fields are overrides too: `launch_started_at` (see
  * `SAMPLE_LAUNCH_STARTS`) and `liveness_note` (`provenanceNote`,
- * `nonLatchingNotes`). Neither is set by default, and either given as
- * `undefined` is left out of the row.
+ * `nonLatchingNotes`). A `pending` row shows `SAMPLE_LAUNCH_START_DEFAULT`
+ * unless the overrides give `launch_started_at`; no other row has a launch
+ * start, and no row has a note, unless given. Either field given as
+ * `undefined` (`SAMPLE_LAUNCH_START_NONE` for the launch start) is left out
+ * of the row; a `null` launch start is shown as `null`.
  */
 export function cannedListRow(overrides: Partial<Phase1ListRow> & { claude_instance_id: string }): Phase1ListRow
 export function cannedListRow(overrides: Partial<Phase1ListRow>, persona: CannedRowPersona, home: string): Phase1ListRow
 export function cannedListRow(overrides: Partial<Phase1ListRow>, persona?: CannedRowPersona, home?: string): Phase1ListRow {
   if (persona) {
     if (home === undefined) throw new Error('cannedListRow: the persona form needs a home')
-    return omitUndefined({
+    return omitUndefined(withDefaultLaunchStart({
       parent_id: undefined,
       state: 'waiting',
       relay_mode: 'on',
@@ -1176,9 +1218,9 @@ export function cannedListRow(overrides: Partial<Phase1ListRow>, persona?: Canne
       ended_at: null,
       ...personaRowDefaults(persona, home),
       ...overrides,
-    }, PHASE1_ROW_FIELDS)
+    }, overrides), PHASE1_ROW_FIELDS)
   }
-  return omitUndefined({
+  return omitUndefined(withDefaultLaunchStart({
     parent_id: undefined,
     state: 'waiting',
     relay_mode: 'on',
@@ -1187,7 +1229,7 @@ export function cannedListRow(overrides: Partial<Phase1ListRow>, persona?: Canne
     last_seen_at: '2026-05-24T12:00:00Z',
     ended_at: null,
     ...overrides,
-  } as Phase1ListRow, PHASE1_ROW_FIELDS)
+  } as Phase1ListRow, overrides), PHASE1_ROW_FIELDS)
 }
 
 /**
@@ -1252,8 +1294,9 @@ export type CannedGetResult = Phase1GetResult & { permission_requests?: Permissi
  * always win. The stub client's default `get` row uses the no-persona form.
  *
  * The Phase 1 fields `launch_started_at` and `liveness_note` are overrides
- * as on `cannedListRow`: unset by default, and left out when given as
- * `undefined`.
+ * as on `cannedListRow`: a `pending` row shows `SAMPLE_LAUNCH_START_DEFAULT`
+ * unless the overrides give `launch_started_at`, nothing else is set by
+ * default, and either field given as `undefined` is left out.
  */
 export function cannedGetResult(overrides: GetResultOverrides): CannedGetResult
 export function cannedGetResult(
@@ -1268,7 +1311,7 @@ export function cannedGetResult(
 ): CannedGetResult {
   if (persona) {
     if (home === undefined) throw new Error('cannedGetResult: the persona form needs a home')
-    return omitUndefined({
+    return omitUndefined(withDefaultLaunchStart({
       parent_id: '',
       state: 'waiting',
       claude_args: [],
@@ -1280,9 +1323,9 @@ export function cannedGetResult(
       ended_at: null,
       ...personaRowDefaults(persona, home),
       ...overrides,
-    }, PHASE1_ROW_FIELDS)
+    }, overrides), PHASE1_ROW_FIELDS)
   }
-  return omitUndefined({
+  return omitUndefined(withDefaultLaunchStart({
     parent_id: '',
     state: 'waiting',
     claude_args: [],
@@ -1294,7 +1337,7 @@ export function cannedGetResult(
     last_seen_at: '2026-05-24T12:00:00Z',
     ended_at: null,
     ...overrides,
-  } as CannedGetResult, PHASE1_ROW_FIELDS)
+  } as CannedGetResult, overrides), PHASE1_ROW_FIELDS)
 }
 
 /**
@@ -1428,7 +1471,8 @@ export interface StubClientOptions {
   spawnCalls?: SpawnParams[]
 
   // status() — a result may carry the Phase 1 `launch_started_at`
-  // (`cannedStatusResult`).
+  // (`cannedStatusResult`). Default: `cannedStatusResult()`, a `waiting` row
+  // (no launch start, as on every row but a `pending` one).
   statusResult?: Phase1StatusResult
   statusError?: Error
   statusQueue?: CannedResponse<Phase1StatusResult>[]
@@ -1621,7 +1665,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
         if (r instanceof Error) throw r
         return r
       }
-      return nextResponse('status', opts.statusQueue, opts.statusResult, opts.statusError, { state: 'waiting' })
+      return nextResponse('status', opts.statusQueue, opts.statusResult, opts.statusError, cannedStatusResult())
     },
     async get(params: GetParams): Promise<Phase1GetResult> {
       opts.getCalls?.push(params)

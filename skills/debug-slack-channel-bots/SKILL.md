@@ -123,6 +123,11 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    at its destination, or a line containing `— UNUSABLE NAME:`, is covered
    under
    [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice).
+   A persona that is silent with a *Held: launch start not recorded* notice
+   at its destination, or a line containing
+   `case=launch-start-not-recorded` or
+   `its row reads pending with no launch start`, is covered under
+   [A persona posts a Held: launch start not recorded notice](#a-persona-posts-a-held-launch-start-not-recorded-notice).
    A *tmux unavailable* or *tmux server changed* notice is covered under
    **tmux isn't available** in
    [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
@@ -1135,7 +1140,7 @@ once the server has held back from it for 10 min:
 |---|---|
 | `[slack] waitForWaitingAndReconnect: "<name>" (key=<key>) transitioned to state=<state> — aborting;` | The row moved to `pending`, `ask_user` or `check_permission`. |
 | `[slack] waitForWaitingAndReconnect: spawn not found for "<name>" (key=<key>) but tmux session alive — aborting poll;` | The row vanished; the tmux session lives. |
-| `[slack] waitForWaitingAndReconnect: timed out for "<name>" (key=<key>) after <ms>ms — <reason>, tmux session alive;` | After 10 minutes agent-director had no row for the persona (`spawn not found`), and its tmux session lives. When agent-director couldn't report the row for another reason, the line is `waitForWaitingAndReconnect: timeout: status read refused for …` instead (see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)); when it answered that the persona's recorded tmux session name can't be used, the persona is held instead (see [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice)). |
+| `[slack] waitForWaitingAndReconnect: timed out for "<name>" (key=<key>) after <ms>ms — <reason>, tmux session alive;` | After 10 minutes agent-director had no row for the persona (`spawn not found`), and its tmux session lives. When agent-director couldn't report the row for another reason, the line is `waitForWaitingAndReconnect: timeout: status read refused for …` instead (see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)); when it answered that the persona's recorded tmux session name can't be used, or its row read pending with no launch start, the persona is held instead (see [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice) and [A persona posts a Held: launch start not recorded notice](#a-persona-posts-a-held-launch-start-not-recorded-notice)). |
 | `[slack] reconnect: gave up waiting for "<name>" (key=<key>) after <ms>ms — claude process state=<state> (alive);` | After 10 minutes the row was still live. A row that reads `waiting` at that point is reconnected instead. |
 
 Removing the persona (or changing it destructively) with a confirmed change
@@ -1205,7 +1210,7 @@ the check for pending changes start as usual.
 | `[slack] startupSessionManager: "<name>" (key=<key>) is waiting for its working row to settle — the start pass goes on without it; its launch stays in flight in the background (b.f2b)` | Normal. Until the launch ends, the health check still checks this persona but never restarts, reconnects or reports it. |
 | `[slack] startupSessionManager: complete — <N> persona(s): … <n> not brought up, <m> not reconnected` | The start summary. `not reconnected` counts instances left running without a reconnect (see the lines above). |
 | `[slack] startupSessionManager: <n> persona(s) still waiting in the background for a working row to settle — not counted above; each logs its outcome when it settles (b.f2b)` | Launches still waiting when the summary was logged. |
-| `[slack] startupSessionManager: background launch for "<name>" (key=<key>) settled: <outcome> (b.f2b)` | The launch ended. `reconnected`: the reconnect was typed. `not-reconnected`: the instance was left running without it (the line before says what happens next), or the persona's removal cancelled the wait. A relaunch action (`resumed`, `spawned`, `fresh-after-amnesia` or `fresh-after-inconclusive-amnesia`): the instance had died and was relaunched; for the two amnesia actions, the persona's `[slack] ErrJsonlMissing diagnostic:` lines say whether its conversation history was kept. `deferred`: its `claude_config_dir` stopped resolving, and the persona is held until it does. `latched`: the relaunch met a tmux session conflict, or an unusable recorded tmux session name, and the persona is held (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice) and [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice)). `failed`: see the persona's spawn-failure lines. |
+| `[slack] startupSessionManager: background launch for "<name>" (key=<key>) settled: <outcome> (b.f2b)` | The launch ended. `reconnected`: the reconnect was typed. `not-reconnected`: the instance was left running without it (the line before says what happens next), or the persona's removal cancelled the wait. A relaunch action (`resumed`, `spawned`, `fresh-after-amnesia` or `fresh-after-inconclusive-amnesia`): the instance had died and was relaunched; for the two amnesia actions, the persona's `[slack] ErrJsonlMissing diagnostic:` lines say whether its conversation history was kept. `deferred`: its `claude_config_dir` stopped resolving, and the persona is held until it does. `latched`: the relaunch met a tmux session conflict, an unusable recorded tmux session name, or a row pending with no launch start, and the persona is held (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice), [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice) and [A persona posts a Held: launch start not recorded notice](#a-persona-posts-a-held-launch-start-not-recorded-notice)). `failed`: see the persona's spawn-failure lines. |
 | `[slack] startupSessionManager: unexpected error in the background launch for "<name>" (key=<key>): <error>` | An internal error, also recorded as `spawn-failed` in `startup-errors.log`. Report it as a bug, with the persona's lines. |
 
 ---
@@ -1529,6 +1534,99 @@ restart or retry, a wait or check that ended): see the table under
 | `[slack] spawnForPersona: <step> refused for <persona>: <error> — UNUSABLE NAME: the latch-time status read latched the persona, so that latch stands; no spawn-failure notice; nothing more is called (b.jg5 SRJ-105, SRJ-512)` | A launch step got the answer, and the one state read made right after it got the same answer, which held the persona already (its `spawnForPersona: latch-time status read` line comes first). One hold and one notice. | As for the notice. |
 | `[slack] reconnectSession: persona=<key> is waiting and is latched — deferring; nothing typed (b.jg5 SRJ-502)` | The health check's reconnect read the screen of a `waiting` row, and that read held the persona. Nothing is typed. | As for the notice. |
 | The two `UNUSABLE NAME` lines with `latching the persona failed: <error>` as the outcome, `[slack] persona-episodes: persona=<key> unusable-recorded-name notice failed: <error>`, `[slack] <site>: <what> for <persona>: applying the own-row rules failed: <error> (b.jg5 SRJ-115)` | An internal error while holding the persona or posting its notice: the step that met the answer still stopped, but the hold may not be recorded or the notice may be missing. | Report it as a bug, with the persona's lines. |
+
+---
+
+## A persona posts a Held: launch start not recorded notice
+
+The persona's own agent-director row (`cscb_<key>`) reads `pending` but
+records no launch start: the row shows none, or one that is not a valid
+timestamp. Only an agent-director process older than the installed one, or
+a hand edit of agent-director's store, writes such a row, and agent-director
+acts on no session for it: it types nothing into it and never ends it.
+
+The server holds the persona the first time it reads such a row for it,
+at any read of the persona's row: the row read after the instance id was
+already taken, the row read before replacing a resume whose transcript is
+missing, the row read while checking whether a `working` row is idle, the
+row read right after the server's own `find-missing` run, the state reads
+of a launch waiting on a `working` row or on a prompt row, the state read
+of an automatic retry, the state reads of the health check and of a
+restart, the reconnect's state read, the one read made for a lost message,
+and the state read made right after a launch step met a tmux session
+conflict or an unusable tmux session name. It holds it whether or not the
+server launched that row, a row whose working directory differs from the
+persona's included. Only a persona in the applied configuration is held:
+such a row under a key no persona uses holds nobody.
+
+The persona is then held: its destination gets one *Held: launch start not
+recorded* notice, and the server attempts nothing more for it.
+
+While the persona is held:
+
+- it is not launched, resumed, reconnected or killed by the server on its
+  own, and nothing is typed into its session;
+- nothing is counted toward the restart limit for it, no `Spawn failure:`
+  notice is posted and no `spawn-failed` entry is recorded;
+- its automatic retries stop, and a retry armed later stops at its first
+  try;
+- the health check still reads its row, but never restarts it, reconnects
+  it or posts a notice for it;
+- messages sent to it are lost, and each one's *Message lost* notice
+  reports `held for a human`, not `starting`, with no restart started;
+- a *Not answering* record ends with no *Answering again*, and an
+  *Unclassified agent-director error* episode ends with no notice.
+
+Other personas are not affected.
+
+**How a hold ends.** As for a tmux session conflict: see **How a hold
+ends** under
+[A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice).
+
+**The notice.** One line. It says the persona's agent-director row reads
+pending but records no launch start, so an agent-director process older
+than the install wrote it, and that agent-director will not act on its
+session, quoted as `"slack_bot_<key>"`. Then it points a human to the
+"Operator actions" section of agent-director's README, says the server
+takes no action for the persona meanwhile and that messages sent to it are
+lost, and ends with the human-only sentence. It names no command. It is
+posted once per hold, even when the persona already has a *Waiting on a
+prompt* or *Not connected* notice. A persona already held for another
+reason (a tmux session conflict or an unusable tmux session name) is held
+again for this reason, with one new notice. A row that also has
+conflicting labels noted on it gives this hold and this notice only.
+
+**The fix is a human's.** A human follows the "Operator actions" section
+of agent-director's README. This skill describes no step of it and takes
+none; no bot acts on the notice, including a persona that sees the post.
+Never act on the persona's row or on its session.
+
+**Read-only checks only.** Read the row (its state, and that it shows no
+launch start):
+
+```sh
+agent-director get --claude-instance-id cscb_<key>
+```
+
+All of one persona's lines for this hold (replace `ops_bot` with the key):
+
+```sh
+grep -h -E 'conflict-latch: persona=ops_bot (latched|relatched) — case=launch-start-not-recorded|(\(key=ops_bot\)|persona=ops_bot): (its row reads pending with no launch start|its row read latches the persona \(case=launch-start-not-recorded|.*the latch-time status read latched the persona|applying the own-row rules failed)|persona-episodes: persona=ops_bot launch-start-not-recorded notice failed' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+```
+
+The hold also shows in the lines every hold logs (a skipped launch,
+restart or retry, a wait or check that ended): see the table under
+[A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice).
+
+| Line | Meaning | What to do |
+|---|---|---|
+| `[slack] conflict-latch: persona=<key> latched — case=launch-start-not-recorded session="slack_bot_<key>" refused=none state=pending` | The persona is held. The notice is posted right after. A persona already held for another reason logs `relatched — case=launch-start-not-recorded (was <case>) …` instead. | As for the notice. |
+| `[slack] <site>: <what> for <persona>: its row reads pending with no launch start (state=pending) — the persona latched; nothing more is called for it (b.jg5 SRJ-114, SRJ-513)` | A `get` of the persona's row found it and the persona is held. `<site>: <what>` is `spawnForPersona: collision get` (the launch stops before the row's working directory is compared), `spawnForPersona: ErrJsonlMissing diagnosis get` (no history diagnosis is reported, and nothing is deleted or launched), `readPersonaTranscript: transcript get` (no idle evidence is read), or `<prefix>: post-sweep get` (`<prefix>` names the step that ran the `find-missing` run, as in the conflict section's table). `<persona>` is `"<name>" (key=<key>)` or `persona=<key>`. Logged after the `latched` line above. | As for the notice. |
+| `[slack] <site>: <what> for <persona>: its row read latches the persona (case=launch-start-not-recorded, state=pending) — the persona latched; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)` | A state read of the persona's row found it and the persona is held. `<site>: <what>` is `spawnForPersona: latch-time status read`; `<prefix>: status read after the findMissing sweep`; `waitForWaitingAndReconnect: status read` or `waitForWaitingAndReconnect: timeout: status read` (a launch waiting on a `working` row: the wait ends, nothing typed); `unavailable-retry: retry row read` (the retries stop); `isSessionAlive: status` (the health check's, a restart's or a lost message's read: the restart stops, and a lost message reports `held for a human`); or `reconnectSession: status check` (nothing is typed). `<persona>` is `"<name>" (key=<key>)` or `persona=<key>`. | As for the notice. |
+| The same two lines ending `— the persona was already latched with this case; …` | The persona was already held for this reason, and a read found the row unchanged. Nothing new is posted. While the row stays as it is, every health check reads it, logs an `isSessionAlive: status` line like this one, then `[slack] health-check: liveness unknown for persona=<key> — skipping it this tick; not read as dead`. | Nothing more: this is the hold working. |
+| The same two lines ending `— the persona relatched; …` | The persona was held for another reason and is now held for this one, with one new notice. | As for the notice. |
+| `[slack] spawnForPersona: <step> refused for <persona>: <error> — CONFLICT: the latch-time status read latched the persona, so that latch stands; no spawn-failure notice; nothing more is called (b.jg5 SRJ-105, SRJ-501)`, or the same with `— UNUSABLE NAME:` and `(b.jg5 SRJ-105, SRJ-512)` | A launch step met a tmux session conflict or an unusable tmux session name, and the one state read made right after it found the row pending with no launch start, which held the persona for that (its `spawnForPersona: latch-time status read` line comes first). One hold and one notice, *Held: launch start not recorded*. | As for the notice. |
+| The two lines above with `latching the persona failed: <error>` as the outcome, `[slack] persona-episodes: persona=<key> launch-start-not-recorded notice failed: <error>`, `[slack] <site>: <what> for <persona>: applying the own-row rules failed: <error> (b.jg5 SRJ-115)` | An internal error while holding the persona or posting its notice: the step that read the row still stopped, but the hold may not be recorded or the notice may be missing. | Report it as a bug, with the persona's lines. |
 
 ---
 
@@ -2188,7 +2286,7 @@ coming, report it as a bug, with the persona's lines.
 | `[slack] Session disconnected[ (SSE abort)]: persona "<name>" (key=<key>) has its tmux-unavailable outage raised and no retry controller — no restart scheduled, no retry timer armed (b.jg5 SRJ-311)` | Follows the persona's `Session disconnected … cwd="<path>"` line. Its *tmux unavailable* or *tmux server changed* notice holds, but the disconnect came before the server had set up its retries during startup, so it scheduled no restart and started none. Nothing to do; the next health check that finds the persona not healthy starts its retries, unless `health_check_interval` is `0`. If it repeats after startup, report it as a bug, with the persona's lines. |
 | `[slack] Session disconnected[ (SSE abort)]: persona "<name>" (key=<key>) cwd="<path>"`, then `[slack] Skipping restart — server is shutting down (persona=<key>)` | The persona's instance's session closed while the server was stopping (stopping the server closes every session). Nothing is restarted and no retries are started. Nothing to do. |
 | `[slack] Lost message: persona=<key> has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)` | A message for the persona was lost while its *tmux unavailable* or *tmux server changed* notice holds and nothing was retrying it (its earlier retries stopped: it wasn't up at a retry, its relaunch was declined, or the retry failed internally), below the restart limit (at the limit nothing is started and this line is not logged). The lost-message notice reports `not answering`; no restart was started, and the retries were started with the `environment` cause instead; `[slack] unavailable-retry: persona=<key> armed (environment) — first retry in 30 s` follows. The retries come even with `session_restart_delay` and `health_check_interval` both `0`. Nothing to do; for tmux itself, see **tmux isn't available** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
-| `[slack] No live session for persona "<name>" (key=<key>) chat_id=<id> — dropping message` | The persona's instance has no live MCP session (the persona is up but its instance isn't registered, or the persona stopped being up while the message was being handled), so a message for it is lost: not delivered, not saved and not replayed later. Nothing else is posted in `<id>`, the conversation it came from (the notice below lands there only when `<id>` is the destination), and it gets no ack reaction. The persona posts one lost-message notice to its destination: `Persona "<name>" (key=<key>): :warning: *Message lost* — a message from <sender> …`, naming the sender (display name, else user ID; for a bot or webhook post, its name or bot ID) and ending in a `Recovery:` state, never the message text. The notice reports the first state that applies, in this order. `not up`: the persona stopped being up (broken or retrying) while the message was being handled, so no restart was started; its instance is launched once the persona recovers: fix its cause (its class line), then resend. A persona that isn't up receives nothing, so this state appears only when the persona stops being up after its connection received a message and before the session lookup (for example Slack refuses a Web API call for its bot token), or when the old half of a persona being torn down by a destructive change receives a message just before its connection stops. `held for a human`: the persona is held until a human resolves a problem with its tmux session or agent-director row; follow [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice) or [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice), whichever notice its destination has, then resend. `not answering`: the persona's *Not answering* record holds, or its *tmux unavailable* / *tmux server changed* or *agent-director refuses its config file* notice holds, and the server is retrying it (a persona at its restart limit never reports this, whatever is wrong with tmux or agent-director; one whose retries stopped reports the next state that applies); follow that notice's entry, then resend once it's back. `starting`: the persona's session is starting but hasn't come up yet: a launch of it is running, or, when nothing earlier applies and nothing is running for it, the server checked with agent-director once, when it found the message lost, and its row still reads starting (a check that fails never gives `starting`); resend once it's up. No restart is started in these three states. `restarting`: a restart was already under way; resend once it's back. `auto-restart disabled`: `session_restart_delay` is `0`, so no restart was started; a persona the server is already retrying (see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)) comes back when a retry succeeds, otherwise a server restart recovers it. `restart limit reached`: the persona is capped, and this takes precedence over `not answering` even while tmux or agent-director is failing for it; nothing was started for it; the notice says to restart the server to recover. `starting now`: the message itself started a restart (not the same as `starting`); resend once it's back. If the notice doesn't arrive, look for a [`persona-destination-failed`](#persona-destination-failed) line. |
+| `[slack] No live session for persona "<name>" (key=<key>) chat_id=<id> — dropping message` | The persona's instance has no live MCP session (the persona is up but its instance isn't registered, or the persona stopped being up while the message was being handled), so a message for it is lost: not delivered, not saved and not replayed later. Nothing else is posted in `<id>`, the conversation it came from (the notice below lands there only when `<id>` is the destination), and it gets no ack reaction. The persona posts one lost-message notice to its destination: `Persona "<name>" (key=<key>): :warning: *Message lost* — a message from <sender> …`, naming the sender (display name, else user ID; for a bot or webhook post, its name or bot ID) and ending in a `Recovery:` state, never the message text. The notice reports the first state that applies, in this order. `not up`: the persona stopped being up (broken or retrying) while the message was being handled, so no restart was started; its instance is launched once the persona recovers: fix its cause (its class line), then resend. A persona that isn't up receives nothing, so this state appears only when the persona stops being up after its connection received a message and before the session lookup (for example Slack refuses a Web API call for its bot token), or when the old half of a persona being torn down by a destructive change receives a message just before its connection stops. `held for a human`: the persona is held until a human resolves a problem with its tmux session or agent-director row; follow [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice), [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice) or [A persona posts a Held: launch start not recorded notice](#a-persona-posts-a-held-launch-start-not-recorded-notice), whichever notice its destination has, then resend. A persona whose row reads pending with no launch start reports `held for a human`, never `starting`, even when the one read made for the lost message is the one that held it. `not answering`: the persona's *Not answering* record holds, or its *tmux unavailable* / *tmux server changed* or *agent-director refuses its config file* notice holds, and the server is retrying it (a persona at its restart limit never reports this, whatever is wrong with tmux or agent-director; one whose retries stopped reports the next state that applies); follow that notice's entry, then resend once it's back. `starting`: the persona's session is starting but hasn't come up yet: a launch of it is running, or, when nothing earlier applies and nothing is running for it, the server checked with agent-director once, when it found the message lost, and its row still reads starting (a check that fails never gives `starting`); resend once it's up. No restart is started in these three states. `restarting`: a restart was already under way; resend once it's back. `auto-restart disabled`: `session_restart_delay` is `0`, so no restart was started; a persona the server is already retrying (see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)) comes back when a retry succeeds, otherwise a server restart recovers it. `restart limit reached`: the persona is capped, and this takes precedence over `not answering` even while tmux or agent-director is failing for it; nothing was started for it; the notice says to restart the server to recover. `starting now`: the message itself started a restart (not the same as `starting`); resend once it's back. If the notice doesn't arrive, look for a [`persona-destination-failed`](#persona-destination-failed) line. |
 | `[slack] DROP: no _GET_stream for persona "<name>" (key=<key>) chat_id=<id> cwd="<path>" mcpSessionId=<id> — message will not reach the bot; triggering recovery` | The instance's session is registered and looks connected, but its message stream is gone (the `Dispatching to persona …` line just before it has `hasGetStream=false`). The message is lost exactly as for `No live session` above: the same lost-message notice at the destination, with the same `Recovery:` states in the same order, `starting now` last (`held for a human`, `not answering` and `starting` included, none of which starts a restart), nothing else in the source conversation. |
 | `[slack] persona-routing: user-name lookup for persona "<name>" (key=<key>) failed, using the user ID: …` | The sender's display name couldn't be looked up through the persona's Slack client. The message is handled as usual, with the sender named by user ID (in the delivered message, or in a lost-message notice). Nothing to do unless it repeats; then check the persona's app and the host's Slack connectivity. |
 | `[slack] persona-routing: lost-message notice for persona "<name>" (key=<key>) failed: …` | An internal error raising a lost-message notice: the message was lost and its recovery still ran, but no notice reaches the destination. Report it as a bug, with the persona's lines around it. |

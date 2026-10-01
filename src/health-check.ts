@@ -323,7 +323,7 @@ function noAttemptReason(d: HealthCheckDeps, key: string): NoAttemptReason | nul
 
 /**
  * The latched no-attempt reason asked again after the tick's liveness read
- * (b.jg5 SRJ-502, SRJ-512): true when `isLatched` answers exactly `true`,
+ * (b.jg5 SRJ-502, SRJ-512, SRJ-513): true when `isLatched` answers exactly `true`,
  * since the read itself may have latched the persona. A throw propagates, as
  * from `noAttemptReason` (the per-persona `catch` logs it and ends the
  * persona's work for the tick).
@@ -480,8 +480,9 @@ export function startHealthCheck(intervalSeconds: number): void {
             reading = LIVENESS_UNKNOWN
             failure = ` (isSessionAlive failed: ${describeThrownValue(err)})`
           }
-          // b.jg5 SRJ-502, SRJ-512: the tick's own liveness read may have
-          // latched the persona (an UNUSABLE NAME answer); its latched
+          // b.jg5 SRJ-502, SRJ-512, SRJ-513: the tick's own liveness read may
+          // have latched the persona (an UNUSABLE NAME answer, or its own row
+          // reading `pending` with no launch start); its latched
           // no-attempt reason is asked again after the read, so the tick
           // schedules nothing for it.
           if (reason !== 'latched' && latchedAfterRead(deps, key)) reason = 'latched'

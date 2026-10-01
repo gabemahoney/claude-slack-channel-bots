@@ -56,6 +56,7 @@ import {
   makeStubCallLog,
   makeStubClient,
   makeStubCreateClient,
+  stubCallCount,
   errCallTimeout,
   errConfigMalformed,
   errGeneric,
@@ -126,7 +127,15 @@ import {
   setSessionNotifier,
   spawnForPersona,
 } from '../src/session-manager.ts'
-import { bindConflictNotice, createConflictLatch, type ConflictLatch } from '../src/conflict-latch.ts'
+import {
+  LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+  REFUSED_OPERATION_NONE,
+  bindConflictNotice,
+  createConflictLatch,
+  latchRowStateRead,
+  launchStartNotRecordedNoticeText,
+  type ConflictLatch,
+} from '../src/conflict-latch.ts'
 import { createPersonaEpisodes } from '../src/persona-episodes.ts'
 import type { ClientOptions, FindMissingParams, FindMissingResult, GetParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams } from 'agent-director'
 import { KILL_SESSION_REFUSED, type KillSessionResult } from '../src/restart.ts'
@@ -148,7 +157,7 @@ import {
   type PersonaConfig,
 } from '../src/config.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
-import { personaInstanceId } from '../src/persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
 import { makePersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import {
   APP_TOKEN_PREFIX,
@@ -747,13 +756,21 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(launchStartOfReading(result)).toBe(start)
   })
 
-  test('SRJ-115: a pending result showing no launch start → the plain pending reading, carrying none', async () => {
-    const { adapter } = makeHarness(undefined, AGENT_DIRECTOR_PENDING_STATE, standIns('C1'), SAMPLE_LAUNCH_START_NONE)
+  // b.jg5 SRJ-513: under a configured persona's key such a row latches the
+  // persona instead (the SRJ-513 describe below); here the configured-persona
+  // query counts no key, so the row latches nothing (SRJ-408).
+  test('SRJ-115, SRJ-408: a pending result showing no launch start under a key no configured persona uses → the plain pending reading, carrying none', async () => {
+    setConfiguredPersonaQuery(() => false)
+    try {
+      const { adapter } = makeHarness(undefined, AGENT_DIRECTOR_PENDING_STATE, standIns('C1'), SAMPLE_LAUNCH_START_NONE)
 
-    const result = await adapter('C1')
+      const result = await adapter('C1')
 
-    expect(result).toEqual(LIVENESS_READING_PENDING)
-    expect(result).not.toHaveProperty('launchStartedAt')
+      expect(result).toEqual(LIVENESS_READING_PENDING)
+      expect(result).not.toHaveProperty('launchStartedAt')
+    } finally {
+      _resetConfiguredPersonaQuery()
+    }
   })
 
   test('SRJ-115: a live (not pending) result carrying a launch start → reads live, carrying none', async () => {
@@ -1269,7 +1286,12 @@ describe('_buildReconnectSessionAdapter', () => {
     getPersona?: (key: string) => Persona | undefined
     /** The state every status probe reads once a findMissing sweep has run (default: `statusState`). */
     statusAfterSweep?: string
-    /** The `launch_started_at` every status result shows (default: none, the key absent). */
+    /**
+     * The `launch_started_at` every status result shows. Without the key, a
+     * `pending` result shows the stub's default launch start and any other
+     * none; given as `undefined` (`SAMPLE_LAUNCH_START_NONE`) the field is
+     * left out.
+     */
     launchStartedAt?: string
     /** When set, every findMissing sweep rejects with it. */
     findMissingError?: Error
@@ -1312,7 +1334,7 @@ describe('_buildReconnectSessionAdapter', () => {
         opts.statusError ??
         cannedStatusResult({
           state: (findMissingCalls.length > 0 ? opts.statusAfterSweep : undefined) ?? opts.statusState ?? 'waiting',
-          launch_started_at: opts.launchStartedAt,
+          ...('launchStartedAt' in opts ? { launch_started_at: opts.launchStartedAt } : {}),
         }),
       sendKeysCalls,
       sendKeysError: opts.sendKeysThrows,
@@ -1785,9 +1807,13 @@ describe('_buildReconnectSessionAdapter', () => {
     ...LAUNCH_STARTS.map((start) => [`launch start ${start}`, start, ` (launch started ${start})`] as const),
   ]
 
-  test.each(DEFERRAL_CASES)("REPRO (b.dup), b.jg5 SRJ-303/SRJ-115: a pending row showing %s → 'pending' with no send-keys, pane read, tmux probe or sweep, no notice, and one line naming its launch start", async (_label, launchStartedAt, launch) => {
+  // b.jg5 SRJ-408, SRJ-513: the configured-persona query counts no key here,
+  // so the row with no launch start latches nothing and is deferred; under a
+  // configured persona's key it latches instead (the SRJ-513 describe below).
+  test.each(DEFERRAL_CASES)("REPRO (b.dup), b.jg5 SRJ-303/SRJ-115: a pending row showing %s, under a key no configured persona uses → 'pending' with no send-keys, pane read, tmux probe or sweep, no notice, and one line naming its launch start", async (_label, launchStartedAt, launch) => {
     const raised: string[] = []
     setSessionNotifier((key) => { raised.push(key) })
+    setConfiguredPersonaQuery(() => false)
     const lines: string[] = []
     const orig = console.error
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
@@ -1810,6 +1836,7 @@ describe('_buildReconnectSessionAdapter', () => {
     } finally {
       console.error = orig
       setSessionNotifier(undefined)
+      _resetConfiguredPersonaQuery()
     }
   })
 
@@ -2914,6 +2941,233 @@ describe('b.jg5 SRJ-115, SRJ-512: an UNUSABLE NAME status at the liveness and re
     expect(reconnect.result).toBe('transient')
     expect(log.sendKeysCalls).toEqual([])
     expect([...alive.lines, ...reconnect.lines].filter((line) => line.includes('UNUSABLE NAME'))).toEqual([])
+    expect(latch.isLatched('C1')).toBe(false)
+    expect(latchLines).toEqual([])
+    expect(posts).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-115, SRJ-513: a configured persona's own `pending` row with no
+// launch start at the liveness and reconnect adapters
+//
+// Both adapters apply the session manager's own-row `status` step to the
+// result whole, with the configured-persona query installed as `main()`
+// installs it (here: C1 and C2 count). C1's row reading `pending` with no
+// launch start (absent, `null`, or one that does not parse) latches C1 once
+// with "launch start not recorded", refused operation "none" and the state
+// `pending`, through the installed latch, whose notice reaction (bound as
+// `main()` binds it, over a real episodes instance) posts SRJ-1020 once per
+// episode. The liveness adapter reads `unknown`, never `pending`, so no
+// restart run hands the row to `deferPendingRow`; the reconnect adapter
+// answers 'transient' with nothing typed, no deferral and no escalate-dead.
+// Controls: the same row with a launch start, or under a key the query does
+// not count, latches no one and is read and deferred as E9 left it. C2
+// beside C1 reads a live row and is never latched. Every line and post is
+// leak-checked.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-115, SRJ-513: a pending row with no launch start at the liveness and reconnect adapters latches a configured persona', () => {
+  /** Launch-start values that are none (b.jg5 SRJ-408): the key left out, `null`, and one that does not parse (no zone). */
+  const NO_LAUNCH_START_FORMS: ReadonlyArray<readonly [string, string | null | undefined]> = [
+    ['absent', SAMPLE_LAUNCH_START_NONE],
+    ['null', null],
+    ['unparseable (no zone)', SAMPLE_LAUNCH_START_WHOLE.replace(/Z$/, '')],
+  ]
+
+  let dir: string
+  let latch: ConflictLatch
+  let unbindNotice: () => void
+  /** The keys the configured-persona query counts (default: C1 and C2). */
+  let configured: Set<string>
+  /** The latch's and the episodes' own lines. */
+  let latchLines: string[]
+  /** Every notice the episodes' sink received: the key and the body. */
+  let posts: Array<{ key: string; text: string }>
+  let emissions: Array<{ key: string; text: string }>
+  let triggers: Array<{ key: string; kind: string }>
+  let unclassified: string[]
+  /** Every not-connected notice the session manager raised. */
+  let raised: string[]
+  /** Every `console.error` argument list the case captured, for the leak check. */
+  let captured: unknown[][]
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'server-launch-start-'))
+    configured = new Set(['C1', 'C2'])
+    latchLines = []
+    posts = []
+    emissions = []
+    triggers = []
+    unclassified = []
+    raised = []
+    captured = []
+    latch = createConflictLatch({ log: (line) => { latchLines.push(line) } })
+    const episodes = createPersonaEpisodes({
+      sink: (key, text) => { posts.push({ key, text }) },
+      log: (line) => { latchLines.push(line) },
+      clock: createFakeClock(),
+    })
+    unbindNotice = bindConflictNotice(latch, episodes)
+    setConflictLatch(latch)
+    setConfiguredPersonaQuery((key) => configured.has(key))
+    setSessionNotifier((key) => { raised.push(key) })
+  })
+
+  afterEach(() => {
+    unbindNotice()
+    setConflictLatch(undefined)
+    _resetConfiguredPersonaQuery()
+    setSessionNotifier(undefined)
+    resetClientForTests()
+    _resetOutageState()
+    _resetTmuxSessionProber()
+    _resetTmuxServerEnsurer()
+    _resetFindMissingMemo()
+    _resetNotConnectedEpisodes()
+    rmSync(dir, { recursive: true, force: true })
+    assertNoLeak({ captured, latchLines, posts, emissions })
+  })
+
+  /**
+   * One stub over the outage state and the client seam: C1's `status`
+   * answers `pending` with `launchStartedAt` as given (the key left out for
+   * `undefined`), every other persona's row reads `waiting`; every send-keys
+   * succeeds; the tmux session probe answers alive. Spies on every sink.
+   */
+  function install(launchStartedAt: string | null | undefined): StubCallLog {
+    const log = makeStubCallLog()
+    const stub = makeStubClient({
+      ...log,
+      statusFn: ({ claude_instance_id }) =>
+        claude_instance_id === personaInstanceId('C1')
+          ? cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launchStartedAt })
+          : cannedStatusResult({ state: 'waiting' }),
+      sendKeysResult: {},
+    })
+    _resetOutageState()
+    initOutageState({
+      notify: (key, text) => { emissions.push({ key, text }) },
+      getClient: () => stub as unknown as Client,
+      triggerSink: { arm: (key, cause) => { triggers.push({ key, kind: cause.kind }); return true } },
+      unclassifiedSink: { report: (key) => { unclassified.push(key) } },
+    })
+    setClientForTests(stub as unknown as Client)
+    _setTmuxSessionProber(async () => true)
+    _setTmuxServerEnsurer(async () => {})
+    return log
+  }
+
+  /** Run `fn`, keeping its `console.error` argument lists for the case and the leak check. */
+  async function run<T>(fn: () => Promise<T>): Promise<{ result: T; lines: string[] }> {
+    const { result, errArgs } = await capturingErrorArgs(fn)
+    captured.push(...errArgs)
+    return { result, lines: stringLines(errArgs) }
+  }
+
+  /** The own-row `status` step's line for C1's row at `site`'s read, with `outcome` (what became of the latch). */
+  const stepLine = (site: string, outcome: string): string =>
+    `[slack] ${site} for persona=C1: its row read latches the persona (case=${LATCH_CASE_LAUNCH_START_NOT_RECORDED}, state=${AGENT_DIRECTOR_PENDING_STATE}) — ${outcome}; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)`
+  const LIVENESS_SITE = 'isSessionAlive: status'
+  const RECONNECT_SITE = 'reconnectSession: status check'
+  /** The reconnect adapter's `pending` deferral line for C1 begins with this. */
+  const DEFERRAL_HEAD = '[slack] Deferring persona=C1: its row reads pending'
+
+  /** C1 latched once with "launch start not recorded" and its one SRJ-1020 post; C2 not latched. */
+  function expectLatchedOnce(): void {
+    expect(latch.record('C1')).toEqual({
+      sessionName: personaTmuxSessionName('C1'),
+      latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+      refusedOperation: REFUSED_OPERATION_NONE,
+      rowState: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
+    })
+    expect(latchLines.filter((line) => line.startsWith('[slack] conflict-latch: persona=C1 latched'))).toHaveLength(1)
+    expect(posts).toEqual([{ key: 'C1', text: launchStartNotRecordedNoticeText('C1') }])
+    expect(latch.isLatched('C2')).toBe(false)
+  }
+
+  test.each(NO_LAUNCH_START_FORMS)(
+    'liveness adapter, launch start %s: three probes of C1 each read unknown, never pending; C1 latched once with state pending and SRJ-1020 posted once; no deferral, flag, arm or unclassified report; one step line per probe; C2 beside it reads live, unlatched',
+    async (_form, launchStartedAt) => {
+      const log = install(launchStartedAt)
+      const config = makeStandInPersonaConfig({ C1: {}, C2: {} }, dir)
+      const adapter = _buildIsSessionAliveAdapter(() => config)
+
+      const first = await run(() => adapter('C1'))
+      const other = await run(() => adapter('C2'))
+      const later = [await run(() => adapter('C1')), await run(() => adapter('C1'))]
+
+      expect([first, ...later].map((p) => p.result)).toEqual([LIVENESS_READING_UNKNOWN, LIVENESS_READING_UNKNOWN, LIVENESS_READING_UNKNOWN])
+      expect(other.result).toEqual(LIVENESS_READING_LIVE)
+      expect(log.statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1', 'cscb_C2', 'cscb_C1', 'cscb_C1'])
+      expectLatchedOnce()
+      expect(first.lines).toEqual([stepLine(LIVENESS_SITE, 'the persona latched')])
+      for (const p of later) {
+        expect(p.lines).toEqual([stepLine(LIVENESS_SITE, 'the persona was already latched with this case')])
+      }
+      expect(other.lines).toEqual([])
+      expect(stubCallCount(log)).toBe(4)
+      expect(getOutageFlags('C1').size).toBe(0)
+      expect(emissions).toEqual([])
+      expect(triggers).toEqual([])
+      expect(unclassified).toEqual([])
+    },
+  )
+
+  test.each(NO_LAUNCH_START_FORMS)(
+    "reconnect adapter, launch start %s: C1's state read latches C1 once and posts SRJ-1020 once → 'transient' with nothing typed, read, probed or swept, no deferral and no escalate-dead; a second attempt posts nothing more; C2 beside it is reconnected as before",
+    async (_form, launchStartedAt) => {
+      const log = install(launchStartedAt)
+      const tmuxProbes: string[] = []
+      _setTmuxSessionProber(async (name) => { tmuxProbes.push(name); return true })
+      const adapter = _buildReconnectSessionAdapter(undefined, (key) => latch.isLatched(key))
+
+      const c1 = await run(() => runInAttempt('C1', 'recovery', () => adapter('C1')))
+      const again = await run(() => runInAttempt('C1', 'recovery', () => adapter('C1')))
+
+      expect([c1.result, again.result]).toEqual(['transient', 'transient'])
+      expect(log.statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1', 'cscb_C1'])
+      expect(stubCallCount(log)).toBe(2)
+      expect(tmuxProbes).toEqual([])
+      expectLatchedOnce()
+      expect(c1.lines).toEqual([stepLine(RECONNECT_SITE, 'the persona latched')])
+      expect(again.lines).toEqual([stepLine(RECONNECT_SITE, 'the persona was already latched with this case')])
+      expect(raised).toEqual([])
+      expect(triggers).toEqual([])
+      expect(emissions).toEqual([])
+
+      // C2's waiting row: `/mcp reconnect` is typed into C2 alone.
+      const c2 = await run(() => runInAttempt('C2', 'recovery', () => adapter('C2')))
+
+      expect(c2.result).toBe('success')
+      expect(log.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C2'])
+      expect(latch.isLatched('C2')).toBe(false)
+      expect(posts).toHaveLength(1)
+    },
+  )
+
+  // Controls (b.jg5 SRJ-408, SRJ-513): a valid launch start, or a key the
+  // configured-persona query does not count, latches no one and posts
+  // nothing: the liveness adapter reads `pending` (carrying the launch start
+  // raw) and the reconnect adapter defers as E9 left it, with its one line.
+  test.each<[string, string | null | undefined, boolean, LivenessReading, string]>([
+    ...LAUNCH_STARTS.map((start) => [`configured, launch start ${start}`, start, true, { ...LIVENESS_READING_PENDING, launchStartedAt: start }, ` (launch started ${start})`] as [string, string, boolean, LivenessReading, string]),
+    ['a key no configured persona uses, no launch start', SAMPLE_LAUNCH_START_NONE, false, LIVENESS_READING_PENDING, ''],
+    ['a key no configured persona uses, a null launch start', null, false, LIVENESS_READING_PENDING, ''],
+  ])("control, %s: no latch, no post; the liveness adapter reads pending and the reconnect adapter answers 'pending' with its one deferral line, nothing typed", async (_label, launchStartedAt, isConfigured, reading, launchPart) => {
+    if (!isConfigured) configured.delete('C1')
+    const log = install(launchStartedAt)
+    const config = makeStandInPersonaConfig({ C1: {}, C2: {} }, dir)
+
+    const alive = await run(() => _buildIsSessionAliveAdapter(() => config)('C1'))
+    const reconnect = await run(() => runInAttempt('C1', 'recovery', () => _buildReconnectSessionAdapter(undefined, (key) => latch.isLatched(key))('C1')))
+
+    expect(alive.result).toEqual(reading)
+    expect(alive.lines).toEqual([])
+    expect(reconnect.result).toBe('pending')
+    expect(reconnect.lines).toHaveLength(1)
+    expect(reconnect.lines[0]).toStartWith(`${DEFERRAL_HEAD}${launchPart} — `)
+    expect(log.sendKeysCalls).toEqual([])
     expect(latch.isLatched('C1')).toBe(false)
     expect(latchLines).toEqual([])
     expect(posts).toEqual([])

@@ -44,8 +44,9 @@
  * `main()`. `set` latches a persona, relatches it with a different case
  * (replacing the record), or, with the same case, keeps it with the record
  * unchanged (SRJ-506), and answers which ({@link ConflictLatchSetOutcome});
- * `setFromConflict` builds the record from a thrown CONFLICT value, and
- * `setFromUnusableName` from a thrown UNUSABLE NAME value. Every set
+ * `setFromConflict` builds the record from a thrown CONFLICT value,
+ * `setFromUnusableName` from a thrown UNUSABLE NAME value, and
+ * `setLaunchStartNotRecorded` for a `pending` row with no launch start. Every set
  * calls each set observer once with the key, the outcome and the record, so
  * the CONFLICT notice and the holds react to it. `forget(key)` drops one
  * persona's latch silently: no post, no observer call, no line. The persona
@@ -66,12 +67,26 @@
  * reconnect's keystrokes and the prompt rows' pane reads (E19), the restart
  * path's kill (E20), the reuse spawn (E22) and the re-check's relatch (E30).
  *
- * The notices (SRJ-1004, SRJ-1019, SRJ-508, SRJ-1016): {@link conflictNoticeText}
+ * The launch start not recorded (SRJ-513): {@link launchStartNotRecordedSetInput}
+ * builds its `set` input: the case "launch start not recorded", the refused
+ * operation "none", the row state the caller gives (`pending`), the session
+ * `slack_bot_<key>` and no description. Its trigger is the row-read rule's
+ * launch-start decision (`decideOwnRowRead`, `src/row-read-rules.ts`), acted
+ * on by the session manager's shared own-row `get` read and own-row `status`
+ * step (so also by the liveness and reconnect adapters in `src/server.ts`),
+ * which latch through `set` with this input. Later sites latch through the
+ * same input: the start sweep's `list` (E26), the dialog approver (E17) and
+ * the re-check's relatch (E30).
+ *
+ * The notices (SRJ-1004, SRJ-1019, SRJ-1020, SRJ-508, SRJ-1016): {@link conflictNoticeText}
  * builds the CONFLICT notice's body from a CONFLICT latch's record, from the
  * exported fixed lines (`CONFLICT_NOTICE_*`) and the case sentences
  * ({@link CONFLICT_CASE_SENTENCES}); {@link unusableNameNoticeText} builds
  * SRJ-1019's from the persona's key and the record's description, from the
- * exported fixed parts (`UNUSABLE_NAME_NOTICE_*`). One set observer
+ * exported fixed parts (`UNUSABLE_NAME_NOTICE_*`); and
+ * {@link launchStartNotRecordedNoticeText} builds SRJ-1020's from the
+ * persona's key, from the exported fixed parts (`LAUNCH_START_NOTICE_*`).
+ * One set observer
  * ({@link createConflictNoticeObserver}, bound by {@link bindConflictNotice}
  * in `main()`) dispatches by latch kind: it ends the persona's open episodes
  * of the other latch kinds silently, then begins or keeps its episode of the
@@ -101,10 +116,9 @@
  * latch kind ({@link LatchKind}) and one of five reasons
  * ({@link LatchRecoveryReason}); nothing here posts it (see its section).
  *
- * Where later Epics plug in: the "launch start not recorded" latch's trigger
- * and its notice's text (a row of {@link HOLD_NOTICES}), and the sites E17
- * to E22 and E29 convert, all latch through `set`, `setFromConflict` or
- * `setFromUnusableName`; E30's re-check and its timer read the record and
+ * Where later Epics plug in: the sites E17 to E22, E26 and E29 convert all
+ * latch through `set`, `setFromConflict`, `setFromUnusableName` or
+ * `setLaunchStartNotRecorded`; E30's re-check and its timer read the record and
  * relatch through `set`, and post the recovery notice when a latch clears;
  * E31's `clear-latch` clears through the clear E30 adds.
  *
@@ -187,7 +201,7 @@ export const LATCH_CASE_ANOTHER_STORE = 'another-store'
 export const LATCH_CASE_UNRECOGNISED = 'unrecognised'
 /** Hold case "unusable recorded name" (SRJ-512): set by `setFromUnusableName` ({@link unusableNameSetInput}). */
 export const LATCH_CASE_UNUSABLE_RECORDED_NAME = 'unusable-recorded-name'
-/** Hold case "launch start not recorded" (SRJ-513): no trigger yet. */
+/** Hold case "launch start not recorded" (SRJ-513): set by `setLaunchStartNotRecorded` ({@link launchStartNotRecordedSetInput}). */
 export const LATCH_CASE_LAUNCH_START_NOT_RECORDED = 'launch-start-not-recorded'
 
 /**
@@ -467,6 +481,13 @@ export interface ConflictLatch {
    * `undefined`, and does nothing, for a value of any other class.
    */
   setFromUnusableName(key: string, value: unknown, rowState: LatchRowState): ConflictLatchSetOutcome | undefined
+  /**
+   * `set` with the record of a `pending` row with no launch start
+   * ({@link launchStartNotRecordedSetInput}): the case "launch start not
+   * recorded", the refused operation "none", `rowState`, the session
+   * `slack_bot_<key>` and no description.
+   */
+  setLaunchStartNotRecorded(key: string, rowState: LatchRowState): ConflictLatchSetOutcome
   /** Whether `key` is latched. */
   isLatched(key: string): boolean
   /** `key`'s record, or `undefined` when it is not latched. */
@@ -538,6 +559,8 @@ export function createConflictLatch(deps: ConflictLatchDeps): ConflictLatch {
       const input = unusableNameSetInput(key, value, rowState)
       return input === undefined ? undefined : set(key, input)
     },
+
+    setLaunchStartNotRecorded: (key, rowState) => set(key, launchStartNotRecordedSetInput(key, rowState)),
 
     isLatched: (key) => records.has(key),
 
@@ -643,6 +666,28 @@ export function unusableNameSetInput(
     rowState,
     sessionName: conflictSessionName(description, key),
     ...(description === undefined ? {} : { description }),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A `pending` row with no launch start (b.jg5 SRJ-513)
+// ---------------------------------------------------------------------------
+
+/**
+ * What `set` takes for persona `key` whose own row reads `pending` with no
+ * launch start (b.jg5 SRJ-501, SRJ-513): the case "launch start not
+ * recorded", the refused operation "none" (its re-check reads only
+ * `status`), `rowState` (the state the read gave, `pending`), the session
+ * `slack_bot_<key>` and no description, since a row read carries none. The
+ * latch's `setLaunchStartNotRecorded` sets it; a holder of only `set` (the
+ * session manager) passes it to `set`. Pure; never throws.
+ */
+export function launchStartNotRecordedSetInput(key: string, rowState: LatchRowState): ConflictLatchSetInput {
+  return {
+    latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+    refusedOperation: REFUSED_OPERATION_NONE,
+    rowState,
+    sessionName: personaTmuxSessionName(key),
   }
 }
 
@@ -853,6 +898,47 @@ export function unusableNameNoticeText(key: string, description: string | undefi
 }
 
 // ---------------------------------------------------------------------------
+// The launch-start-not-recorded notice (b.jg5 SRJ-1020)
+// ---------------------------------------------------------------------------
+
+/** The notice up to `<session>`. */
+export const LAUNCH_START_NOTICE_HEAD =
+  ":no_entry: *Held: launch start not recorded* — this persona's agent-director row reads pending but records no launch start, so it was written by an agent-director process older than the install, and agent-director will not act on its session "
+
+/** After `<session>`. */
+export const LAUNCH_START_NOTICE_SESSION_END = '.'
+
+/** The pointer sentence: to the "Operator actions" section. */
+export const LAUNCH_START_NOTICE_POINTER =
+  'A human should look: follow the "Operator actions" section of agent-director\'s README.'
+
+/** What CSCB does meanwhile. */
+export const LAUNCH_START_NOTICE_HOLD =
+  'CSCB takes no action for this persona until the row reads ended or missing, or is removed, and messages sent to it meanwhile are lost.'
+
+/** What separates the notice's sentences: it is one line. */
+export const LAUNCH_START_NOTICE_SEPARATOR = ' '
+
+/**
+ * The launch-start-not-recorded notice's body for persona `key` (b.jg5
+ * SRJ-1020); the persona notifier adds the persona prefix. One line:
+ * {@link LAUNCH_START_NOTICE_HEAD}, the persona's session `"slack_bot_<key>"`
+ * (the session such a latch records, rendered as the CONFLICT notice renders
+ * a record's quoted session: redacted, escaped for Slack, between double
+ * quotes), {@link LAUNCH_START_NOTICE_SESSION_END}, the pointer, the hold
+ * sentence and the human-only sentence (`CONFLICT_NOTICE_HUMAN_ONLY_LINE`),
+ * joined by single spaces. Names no command. Pure.
+ */
+export function launchStartNotRecordedNoticeText(key: string): string {
+  return [
+    LAUNCH_START_NOTICE_HEAD + slackQuotedSession(personaTmuxSessionName(key)) + LAUNCH_START_NOTICE_SESSION_END,
+    LAUNCH_START_NOTICE_POINTER,
+    LAUNCH_START_NOTICE_HOLD,
+    CONFLICT_NOTICE_HUMAN_ONLY_LINE,
+  ].join(LAUNCH_START_NOTICE_SEPARATOR)
+}
+
+// ---------------------------------------------------------------------------
 // The recovery notice (b.jg5 SRJ-1005)
 //
 // Built here, posted elsewhere: E30's re-check and clear post it (every
@@ -991,18 +1077,18 @@ export function latchRecoveryText(kind: LatchKind, reason: LatchRecoveryReason, 
  */
 export type ConflictNoticeEpisodes = Pick<PersonaEpisodes, 'begin' | 'post' | 'end'>
 
-/** One hold case's notice: its episode kind and its text builder (absent: the case posts nothing yet). */
+/** One hold case's notice: its episode kind and its text builder. */
 export interface HoldNotice {
   readonly episodeKind: PersonaEpisodeKind
   /** The notice's body for persona `key`'s latch record; the persona notifier adds the prefix. Pure. */
-  readonly text?: (key: string, record: ConflictLatchRecord) => string
+  readonly text: (key: string, record: ConflictLatchRecord) => string
 }
 
 /**
  * Each hold case's notice (b.jg5 SRJ-508, SRJ-1016): its own episode kind
- * and, once built, its text. "unusable recorded name" posts SRJ-1019
- * ({@link unusableNameNoticeText}); "launch start not recorded" has its
- * episode kind but no text yet (SRJ-1020), so its latch posts nothing.
+ * and its text. "unusable recorded name" posts SRJ-1019
+ * ({@link unusableNameNoticeText}); "launch start not recorded" posts
+ * SRJ-1020 ({@link launchStartNotRecordedNoticeText}).
  */
 export const HOLD_NOTICES: Readonly<Record<HoldLatchCase, HoldNotice>> = Object.freeze({
   [LATCH_CASE_UNUSABLE_RECORDED_NAME]: Object.freeze({
@@ -1011,6 +1097,7 @@ export const HOLD_NOTICES: Readonly<Record<HoldLatchCase, HoldNotice>> = Object.
   }),
   [LATCH_CASE_LAUNCH_START_NOT_RECORDED]: Object.freeze({
     episodeKind: PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED,
+    text: (key: string) => launchStartNotRecordedNoticeText(key),
   }),
 })
 
@@ -1042,8 +1129,8 @@ export function latchNoticeEpisodeKindOf(latchCase: LatchCase): PersonaEpisodeKi
  *         most once: a new case's episode is new, so it posts once more;
  *       - for a hold case, it begins (or keeps) P's episode of that case's
  *         kind ({@link HOLD_NOTICES}) and posts that case's text in it at
- *         most once; a case with no text yet posts nothing. SRJ-1004 is
- *         never posted for a hold case;
+ *         most once (SRJ-1019 or SRJ-1020). SRJ-1004 is never posted for a
+ *         hold case;
  *   - a same-case set (`same-case`) keeps the episode and posts nothing.
  *
  * Every post goes through the episodes' sink (the persona notifier), never
@@ -1062,8 +1149,7 @@ export function createConflictNoticeObserver(episodes: ConflictNoticeEpisodes): 
     }
     if (episodes.begin(key, kind, latchCase) === 'closed') return
     if (isHoldLatchCase(latchCase)) {
-      const text = HOLD_NOTICES[latchCase].text
-      if (text !== undefined) episodes.post(key, kind, text(key, record))
+      episodes.post(key, kind, HOLD_NOTICES[latchCase].text(key, record))
       return
     }
     episodes.post(key, kind, conflictNoticeText({ sessionName: record.sessionName, latchCase, description: record.description }))

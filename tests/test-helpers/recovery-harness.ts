@@ -236,7 +236,8 @@
  *   makes one stub `status` call (in `calls` and in `stub.calls.status`),
  *   outside any launch or recovery attempt, answered by the stub's `status`
  *   knobs (`script({ statusResult })`, `statusQueue`, `statusError` or
- *   `statusFn`; e.g. `cannedStatusResult({ state: 'pending' })` for state 6);
+ *   `statusFn`; e.g. `cannedStatusResult({ state: 'pending' })` for state 6,
+ *   a row that shows the stub's default launch start, so it latches no one);
  *   while a launch's spawn is held open (`holdSpawns(stub.client)` and a
  *   `launch(key)` not yet settled) a launch is in flight and no read is made.
  *   Its `armRetryTimerIfMissing` (b.jg5 SRJ-311) is bound as `main()` binds
@@ -335,7 +336,8 @@
  * `close` included, so a case can assert exactly the calls a launch makes),
  * `retryNow` (fire a
  * persona's next retry and settle it), `rowReadsUntilSpawn` (each row reads a
- * state until its spawn resolves, then `waiting`), and the condition's log
+ * state until its spawn resolves, then `waiting`; a `pending` row shows the
+ * stub's default launch start unless the case asks for none), and the condition's log
  * lines: `conditionLinePrefix`, `conditionLines`, `conditionStartedLines`,
  * `conditionEndedLines` and the line builders `conditionOnsetLine`,
  * `conditionAlertLine`, `conditionEndedLine`, `conditionRecoveryLine` and
@@ -348,6 +350,15 @@
  *
  * Pending-only mode is armed directly (`controller.armPendingOnly`) until
  * covered `pending` rows exist. Later work extends this harness in place.
+ *
+ * Launch starts (b.jg5 SRJ-513): every `pending` row the harness scripts
+ * (`rowReadsUntilSpawn`, and a case's own `cannedStatusResult`,
+ * `cannedGetResult` or `cannedListRow` row, `collided`'s included) carries
+ * the stub's sample launch start (`SAMPLE_LAUNCH_START_DEFAULT`) unless the
+ * case asks for none (`launch_started_at: SAMPLE_LAUNCH_START_NONE` or
+ * `null`, or `rowReadsUntilSpawn`'s `launchStartedAt` option), since a
+ * configured persona's own `pending` row with no launch start latches it.
+ * Rows in any other state carry none.
  *
  * Isolation: no top-level `mock.module()`, no real HOME, `~/.agent-director`,
  * tmux, child process or Slack client (the driver's clients are stubs). The retry timer runs on the fake clock only; the one
@@ -1465,9 +1476,18 @@ export type RecoveryRowState = NonNullable<NonNullable<Parameters<typeof cannedS
 /**
  * Each persona's row as the stub's `status` reports it: `before` (no row,
  * `ErrSpawnNotFound`, for `UNAVAILABLE_RETRY_ROW_ABSENT`) until a spawn of
- * that instance resolves, and `waiting` from then on.
+ * that instance resolves, and `waiting` from then on. A `pending` `before`
+ * row shows the stub's default launch start unless `options` has a
+ * `launchStartedAt` key: its value is the row's launch start then
+ * (`SAMPLE_LAUNCH_START_NONE` leaves the field out, `null` shows it as
+ * `null`).
  */
-export function rowReadsUntilSpawn(h: RecoveryHarness, before: RecoveryRowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT): void {
+export function rowReadsUntilSpawn(
+  h: RecoveryHarness,
+  before: RecoveryRowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT,
+  options: { launchStartedAt?: string | null } = {},
+): void {
+  const beforeRow = 'launchStartedAt' in options ? { state: before, launch_started_at: options.launchStartedAt } : { state: before }
   const live = new Set<string>()
   const client = h.stub.client
   const spawn = client.spawn.bind(client)
@@ -1479,7 +1499,7 @@ export function rowReadsUntilSpawn(h: RecoveryHarness, before: RecoveryRowState 
   h.script({
     statusFn: (params) => {
       if (live.has(String(params.claude_instance_id))) return cannedStatusResult({ state: 'waiting' })
-      return before === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult({ state: before })
+      return before === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult(beforeRow)
     },
   })
 }

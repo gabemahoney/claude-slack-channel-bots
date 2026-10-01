@@ -1321,7 +1321,11 @@ export async function _runCallTimeoutStartStep(
  * (`applyOwnRowStatusStep`, b.jg5 SRJ-115) to the answer: an UNUSABLE NAME
  * answer latches the persona (b.jg5 SRJ-512; it is never reported as an
  * unclassified error, and arms nothing), and so does a latch decision of the
- * row-read rule over a returned result. An answer that latched the persona
+ * row-read rule over a returned result: a configured persona's own row
+ * that reads `pending` with no launch start latches it with "launch start
+ * not recorded" (b.jg5 SRJ-513), so such a row is never read `pending` and
+ * never handed to `deferPendingRow`. The step reads the result whole, its
+ * `launch_started_at` included. An answer that latched the persona
  * reads `unknown` (`livenessLatchedReading`), so the restart work, the
  * health tick and the lost-message routing ask the latch next.
  *
@@ -1702,11 +1706,13 @@ export function _buildKillSessionAdapter(
  *     No spawn-failure notice is raised. Its escalate-dead line has the
  *     verdict `row-not-interactive` (b.jdc), not a dead tmux session's.
  *
- * b.jg5 SRJ-115, SRJ-512 — the state read applies the session manager's
- * own-row `status` step (`applyOwnRowStatusStep`) after its own call: an
- * UNUSABLE NAME answer, or a latch decision of the row-read rule over the
- * result, latches the persona, and the adapter answers 'transient' with
- * nothing typed (`reconnectLatchedByRead`). The `working` and `waiting`
+ * b.jg5 SRJ-115, SRJ-512, SRJ-513 — the state read applies the session manager's
+ * own-row `status` step (`applyOwnRowStatusStep`) after its own call, on the
+ * result whole: an UNUSABLE NAME answer, or a latch decision of the row-read
+ * rule over the result (a configured persona's own row reading `pending`
+ * with no launch start, b.jg5 SRJ-513), latches the persona, and the
+ * adapter answers 'transient' with nothing typed and no `deferPendingRow`
+ * hand-off (`reconnectLatchedByRead`). The `working` and `waiting`
  * rows' pane reads (`checkWorkingRowPane`, `checkWaitingRowPane`) latch on
  * an UNUSABLE NAME answer too and defer, so nothing is typed after them.
  * (The lost-message row read is the liveness adapter's,
@@ -2005,6 +2011,13 @@ export const LAUNCH_START_LOG_RE = /^[0-9TZ:.+-]{1,40}$/
  * when one was read and it passes `LAUNCH_START_LOG_RE` (anything else is left
  * out of the line; the value itself stays as carried), and returns 'pending',
  * a deferral like 'transient'. A later tick or retry reads the row again.
+ *
+ * b.jg5 SRJ-513: a configured persona's own `pending` row with no launch
+ * start never reaches it from either caller: the `status` read that found
+ * it applied the own-row `status` step, which latched the persona first (the
+ * liveness probe then reads `unknown`, and the reconnect adapter answers
+ * 'transient'). A row under a key no configured persona uses latches nothing
+ * and still reaches it, with no launch start to name.
  *
  * Exported for tests.
  *
@@ -2813,7 +2826,9 @@ export async function main(): Promise<void> {
   // any state CSCB does not know. Only `dead` leads to a kill and a launch;
   // the restart path hands `pending` to `deferPendingRow` and arms the
   // persona's retry timer on `unknown`; the health tick never counts
-  // `pending` healthy and skips an `unknown` persona that tick.
+  // `pending` healthy and skips an `unknown` persona that tick. A configured
+  // persona's own `pending` row with no launch start latches it instead and
+  // reads `unknown` (b.jg5 SRJ-513).
   const isSessionAliveAdapter = _buildIsSessionAliveAdapter(() => personaConfig)
   // b.jg5 SRJ-115, SRJ-1011: the persona routing's lost-message row read is
   // this same instance, set before the start bring-up pass opens any
@@ -2882,7 +2897,8 @@ export async function main(): Promise<void> {
     // b.jg5 SRJ-314: a restart run whose liveness reads `pending` hands the
     // row, with its launch start, to the `pending` deferral, whatever the
     // session's connection shows; nothing is reconnected, killed, launched or
-    // counted.
+    // counted. A configured persona's own `pending` row with no launch start
+    // never reaches it: the probe latched the persona (b.jg5 SRJ-513).
     deferPendingRow: (key, reading) => {
       deferPendingRow(key, reading.launchStartedAt)
     },

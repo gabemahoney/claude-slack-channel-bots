@@ -825,9 +825,11 @@ async function runTick(deps: PollerDeps): Promise<void> {
       }
 
       let got: GetResultWithPermissionRequests
-      // b.jg5 SRJ-122: this `get` is not one of SRJ-114's sites, so no rule of
-      // `src/row-read-rules.ts` applies here: a liveness note on the row,
-      // `provenance_conflict` included, latches no one and changes nothing.
+      // b.jg5 SRJ-122: this `get` (like the `list` above) is not one of
+      // SRJ-114's sites, so neither decision of `src/row-read-rules.ts`
+      // applies here: a liveness note on the row, `provenance_conflict`
+      // included, and a `pending` row with no launch start (SRJ-513) latch
+      // no one and change nothing.
       try {
         got = (await withOutageDetection(persona.key, undefined, 'get', () =>
           client.get({ claude_instance_id: row.claude_instance_id })
