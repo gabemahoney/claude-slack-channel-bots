@@ -91,8 +91,10 @@
  *   session manager's row read `readPersonaRowState` (SRJ-303); the restart
  *   module's arm hook (`armRetryTimer`) arms it with the read-error cause
  *   (SRJ-314); the health check's retry-timer read (`isRetryArmed`) is its
- *   `isArmed` and its arm hook (`armRetryTimer`) arms it with the
- *   environment cause (SRJ-311); shutdown closes it once, right after `cancelAllRestartTimers`,
+ *   `isArmed` and its arm hook (`armRetryTimer`) is server.ts's one
+ *   ENVIRONMENT arm path (`armEnvironmentRetryTimer`), which arms it through
+ *   that handle with the environment cause (SRJ-311); shutdown closes it
+ *   once, right after `cancelAllRestartTimers`,
  *   after the shutting-down flag and before the HTTP server stops.
  * - b.jg5 SRJ-314 / SRJ-115: the restart module's pending deferral
  *   (`deferPendingRow`) is bound to server.ts's one module-scope
@@ -150,11 +152,11 @@
  *   only `tmux-unavailable` clear (every other clear there is
  *   `ad-unreachable`). These are the only two `conditionEnded` reports in
  *   server.ts.
- * - b.jg5 SRJ-315: one named in-flight predicate, declared once in main()'s
- *   own statement list before the retry controller, wraps the session
- *   manager's `isLaunchInFlight`; the full-mode retry action's `isInFlight`
- *   and the health check's `isLaunchInFlight` both get it, and nothing else
- *   names it (no no-op, other predicate or local shadow).
+ * - b.jg5 SRJ-315: one named in-flight predicate, a module-scope function
+ *   declared once, wraps the session manager's `isLaunchInFlight`; the
+ *   full-mode retry action's `isInFlight` and the health check's
+ *   `isLaunchInFlight` both get it, the session-disconnect handler calls it,
+ *   and nothing else names it (no no-op, other predicate or local shadow).
  * - b.jg5 SRJ-501 / SRJ-508: the one per-persona latch is built once,
  *   imported from the latch module, in main()'s own statement list, after the
  *   notice episodes and before the retry controller and the start pass, with
@@ -184,6 +186,22 @@
  *   (`(key) => getAppliedPersona(key) !== undefined`), never reset; it and
  *   the latch's install both come before the start sweep (`reconcileOrphans`)
  *   and the start pass, with no await between them.
+ * - b.jg5 SRJ-1011: the module-scope persona routing's lost-message inputs
+ *   are read at call time: its latched query through a module-scope holder
+ *   assigned the one latch once in main(), its `tmux-unresponsive` query
+ *   through one assigned the one condition (its `holds`, server.ts's only
+ *   holds query), both before the start bring-up; its launch-running query is
+ *   the session manager's `isLaunchInFlight`, not the shared in-flight
+ *   predicate; the held-on-invalid-flags, kill-failed and sequence/wait
+ *   inputs are unbound.
+ * - b.jg5 SRJ-311: the session-disconnect handler schedules the restart only
+ *   while the persona's `tmux-unavailable` outage is not raised; with it
+ *   raised it schedules none and, in order, does nothing more when the
+ *   persona's retry timer (on the one retry controller's handle) is armed,
+ *   arms nothing when the persona is latched (through the routing's latch
+ *   holder) or has work in flight (the shared predicate) or no controller
+ *   exists, and otherwise arms the timer through the health tick's arm path
+ *   (`armEnvironmentRetryTimer`); each branch logs one line.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -251,6 +269,7 @@ import type * as PersonaConnectionsModule from '../src/persona-connections.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
 import type { PersonaConfig } from '../src/config.ts'
+import type { PersonaRoutingDeps } from '../src/persona-routing.ts'
 
 const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url))
 const SERVER_PATH = join(SRC_DIR, 'server.ts')
@@ -350,31 +369,89 @@ const RETRY_IN_FLIGHT_MEMBER: keyof FullModeRetryDeps = 'isInFlight'
 /** The health check's in-flight member (b.f2b, b.jg5 SRJ-315); renaming it fails the typecheck. */
 const TICK_IN_FLIGHT_MEMBER: keyof HealthCheckDeps = 'isLaunchInFlight'
 
+/** `text` with every string and template literal blanked (offsets kept), so brackets inside a log line never count. */
+function blankLiterals(text: string): string {
+  return text.replace(/'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`/g, (m) => ' '.repeat(m.length))
+}
+
+/**
+ * The module-scope function `name` in server.ts. Fails unless it is declared
+ * exactly once (no local shadow, no second declaration), as a plain
+ * `function <name>(…)` starting a line of its own (so in no other function or
+ * block) outside main(). Returns its declaration's offset, its parameters'
+ * names, and its body as [start, end) and as text.
+ */
+function moduleFunction(name: string): { at: number; params: string[]; start: number; end: number; body: string } {
+  declaredOnce(name)
+  const decls = indicesOf(new RegExp(`^function\\s+${name}\\s*\\(`, 'gm'), SERVER_CODE)
+  expect(decls).toHaveLength(1)
+  const at = decls[0]!
+  expect(insideMain(at)).toBe(false)
+  const [paramsStart, paramsEnd] = balancedAfter(SERVER_CODE, at, '(', ')')
+  const params = splitTopLevel(SERVER_CODE.slice(paramsStart, paramsEnd)).map((p) => p.match(/^(\w+)/)![1]!)
+  const [start, end] = balancedAfter(SERVER_CODE, paramsEnd + 1, '{', '}')
+  return { at, params, start, end, body: SERVER_CODE.slice(start, end) }
+}
+
+/** The session-disconnect handler (b.jg5 SRJ-311): private to server.ts, so named by string. */
+const DISCONNECT_HANDLER = 'restartDisconnectedPersona'
+
+/** server.ts's one ENVIRONMENT arm path (b.jg5 SRJ-311): private to server.ts, so named by string. */
+const ENVIRONMENT_ARM = 'armEnvironmentRetryTimer'
+
+/** The retry controller's one module-scope handle (assigned only the one controller, once, in main(); pinned in the controller's describe). */
+function retryHandle(): string {
+  return SERVER_CODE.match(/^let\s+(\w+)\s*:\s*UnavailableRetryController\s*\|\s*undefined\s*$/m)![1]!
+}
+
+/** How many of `offsets` lie inside the parentheses of the call (or the declaration's parameter list) at `at`. */
+function withinCall(offsets: number[], at: number): number {
+  const [open, close] = balancedAfter(SERVER_CODE, at, '(', ')')
+  return offsets.filter((offset) => offset > open && offset < close).length
+}
+
 /**
  * b.jg5 SRJ-315: the one shared in-flight predicate, as the full-mode retry
- * action's `isInFlight` binds it. Fails unless that binding is a bare name
- * declared exactly once in server.ts (no import, no local shadow, no second
- * declaration), in main()'s own statement list before the retry controller is
- * built, as a one-parameter arrow that only calls the session manager's
- * `isLaunchInFlight` with its own key (no no-op, no other predicate), and
+ * action's `isInFlight` binds it. Fails unless that binding is a bare name,
+ * not imported, of a module-scope function declared exactly once in server.ts
+ * (see moduleFunction) whose one parameter is its key and whose whole body is
+ * `return isLaunchInFlight(<key>)` (no no-op, no other predicate); no other
+ * function, arrow or binding in server.ts is such a wrapper (no second
+ * predicate); the name is named exactly four times: its declaration, the
+ * retry action's `isInFlight`, the health tick's `isLaunchInFlight` and one
+ * call in the session-disconnect handler (b.jg5 SRJ-311); and
  * `isLaunchInFlight` is the session manager's import, declared nowhere in
  * server.ts. Returns the predicate's name.
  */
 function sharedInFlightPredicate(): string {
   const name = onlyCallProps('createFullModeRetryAction').get(RETRY_IN_FLIGHT_MEMBER)
   expect(name).toMatch(/^\w+$/)
-  declaredOnce(name!)
   expect(importSource(SERVER_CODE, name!)).toBeUndefined()
 
-  const decl = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+${name}\\s*=\\s*([^\\n;]+)`, 'g'))]
-  expect(decl).toHaveLength(1)
-  const at = decl[0]!.index!
-  expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
-  expect(at).toBeLessThan(onlyCallOf('createUnavailableRetryController'))
-  // `(key: string): boolean => isLaunchInFlight(key)`; the parameter's name is free.
-  expect(decl[0]![1]!.trim()).toMatch(
-    /^\(?(\w+)(?:\s*:\s*string)?\)?(?:\s*:\s*boolean)?\s*=>\s*isLaunchInFlight\(\1\)$/,
-  )
+  const { at, params, body } = moduleFunction(name!)
+  expect(params).toHaveLength(1)
+  expect(body.replace(/\s+/g, ' ').trim()).toBe(`return isLaunchInFlight(${params[0]})`)
+
+  // No second predicate: this is server.ts's only declared function or
+  // const/let/var arrow whose whole body calls isLaunchInFlight with its own
+  // key. (The persona routing's launch-running member is an inline arrow,
+  // pinned separately, b.jg5 SRJ-1011.)
+  const wrappers = [
+    ...indicesOf(/\bfunction\s+\w+\s*\(\s*(\w+)(?:\s*:\s*string)?\s*\)(?:\s*:\s*boolean)?\s*\{\s*return\s+isLaunchInFlight\(\s*\1\s*\)\s*;?\s*\}/g, SERVER_CODE),
+    ...indicesOf(/\b(?:const|let|var)\s+\w+(?:\s*:[^=\n]+)?\s*=\s*\(?\s*(\w+)(?:\s*:\s*string)?\s*\)?(?:\s*:\s*boolean)?\s*=>\s*\{?\s*(?:return\s+)?isLaunchInFlight\(\s*\1\s*\)/g, SERVER_CODE),
+  ]
+  expect(wrappers).toEqual([at])
+
+  // Named by the retry action, the health tick and the disconnect handler,
+  // once each, and nowhere else.
+  const named = indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)
+  expect(named).toHaveLength(4)
+  expect(named[0]).toBe(SERVER_CODE.indexOf(name!, at))
+  expect(withinCall(named, onlyCallOf('createFullModeRetryAction'))).toBe(1)
+  expect(onlyCallProps('initHealthCheck').get(TICK_IN_FLIGHT_MEMBER)).toBe(name)
+  expect(withinCall(named, onlyCallOf('initHealthCheck'))).toBe(1)
+  const handler = moduleFunction(DISCONNECT_HANDLER)
+  expect(named.filter((offset) => offset > handler.start && offset < handler.end)).toHaveLength(1)
 
   expect(importSource(SERVER_CODE, 'isLaunchInFlight')).toBe('./session-manager.ts')
   expect(indicesOf(/\b(?:let|const|var|function)\s+isLaunchInFlight\b/g, SERVER_CODE)).toEqual([])
@@ -390,6 +467,66 @@ function assignmentsTo(name: string): Array<{ at: number; value: string }> {
 /** Whether `offset` lies inside main()'s body in server.ts. */
 function insideMain(offset: number): boolean {
   return insideMainOf(SERVER_CODE, offset)
+}
+
+/** The persona routing's latched member (b.jg5 SRJ-1011, SRJ-502); renaming it fails the typecheck. */
+const ROUTING_LATCHED: keyof PersonaRoutingDeps = 'isLatched'
+/** The persona routing's `tmux-unresponsive` member (b.jg5 SRJ-1011, SRJ-307); renaming it fails the typecheck. */
+const ROUTING_TMUX_UNRESPONSIVE: keyof PersonaRoutingDeps = 'isTmuxUnresponsive'
+
+/**
+ * b.jg5 SRJ-1011: the module-scope holder through which the persona routing's
+ * `member` reads `query` on one instance main() builds, at call time. The
+ * routing is built at module scope, before main() builds the instance, so the
+ * member must read the holder at each call:
+ * `(key) => <holder>?.<query>(key) ?? false` (or `=== true`). Fails unless
+ * the member has that form; the holder is a module-scope `let` declared once
+ * with no initializer (no copy taken at import); it is assigned exactly once,
+ * in main()'s own statement list, the bare name `instance` (the one instance,
+ * never a second one), after that instance is built and before the start
+ * bring-up (the first time a persona can connect and lose a message); and it
+ * is named nowhere else (its declaration, that assignment and the member),
+ * but in each module-scope function in `readers`, which reads it exactly once,
+ * as the same call-time query for its own first parameter,
+ * `<holder>?.<query>(<key>)` (the latch's: the session-disconnect handler,
+ * b.jg5 SRJ-311, SRJ-502). Returns the holder's name and the [start, end) of
+ * its assignment.
+ */
+function routingHolder(
+  member: keyof PersonaRoutingDeps,
+  query: string,
+  instance: string,
+  readers: string[] = [],
+): { holder: string; at: number; end: number } {
+  const binding = onlyCallProps('createPersonaRouting').get(member)
+  expect(binding).toBeDefined()
+  const form = binding!.match(new RegExp(`^\\(?(\\w+)\\)? => (\\w+)\\?\\.${query}\\(\\1\\) (?:\\?\\? false|=== true)$`))
+  expect(form).not.toBeNull()
+  const holder = form![2]!
+
+  declaredOnce(holder)
+  const decls = [...SERVER_CODE.matchAll(new RegExp(`^let\\s+${holder}\\s*:[^=\\n]+$`, 'gm'))]
+  expect(decls).toHaveLength(1)
+  expect(insideMain(decls[0]!.index!)).toBe(false)
+
+  const assigned = [...SERVER_CODE.matchAll(new RegExp(`(?<![\\w.$]|(?:let|const|var)\\s+)${holder}\\s*=(?![=>])\\s*([^\\n;]*)`, 'g'))]
+  expect(assigned.map((m) => m[1]!.trim())).toEqual([instance])
+  const at = assigned[0]!.index!
+  expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+  const built = SERVER_CODE.search(new RegExp(`\\bconst\\s+${instance}\\s*=`))
+  expect(built).toBeGreaterThan(-1)
+  expect(at).toBeGreaterThan(built)
+  expect(at).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+
+  const named = indicesOf(new RegExp(`\\b${holder}\\b`, 'g'), SERVER_CODE)
+  for (const reader of readers) {
+    const { params, start, end } = moduleFunction(reader)
+    const reads = named.filter((offset) => offset > start && offset < end)
+    expect(reads).toHaveLength(1)
+    expect(SERVER_CODE.slice(reads[0]!)).toMatch(new RegExp(`^${holder}\\?\\.${query}\\(${params[0]}\\)`))
+  }
+  expect(named).toHaveLength(3 + readers.length)
+  return { holder, at, end: at + assigned[0]![0].length }
 }
 
 /** Every `.ts` file under src/, as [repo-relative path, source text]. */
@@ -1628,8 +1765,10 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
   // a no-op or another cause would type-check and pass every behaviour suite
   // while a persona whose retry stopped with its tmux-unavailable outage still
   // raised was never attempted again. What the tick does with them is tested
-  // in tests/health-check.test.ts; pinned here: their bindings.
-  test('the health check\'s retry-timer read (isRetryArmed) is this controller\'s isArmed, and its arm (armRetryTimer) arms this controller for the persona it is given, with the environment cause (b.jg5 SRJ-311, SRJ-301)', () => {
+  // in tests/health-check.test.ts; pinned here: their bindings. The arm is
+  // server.ts's one ENVIRONMENT arm path (armEnvironmentRetryTimer), which the
+  // session-disconnect handler also calls (b.jg5 SRJ-311).
+  test('the health check\'s retry-timer read (isRetryArmed) is this controller\'s isArmed, and its arm (armRetryTimer) is server.ts\'s one ENVIRONMENT arm path, armEnvironmentRetryTimer, which arms this controller, through its one module-scope handle, for the persona it is given, with the environment cause (b.jg5 SRJ-311, SRJ-301)', () => {
     // Tied to src by type: renaming any of these fails the typecheck.
     const TICK_READ: keyof HealthCheckDeps = 'isRetryArmed'
     const TICK_ARM: keyof HealthCheckDeps = 'armRetryTimer'
@@ -1646,12 +1785,34 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
     expect(read).toBeDefined()
     expect(read).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${controller}\\.${IS_ARMED}\\(\\1\\)$`))
 
-    // `(key) => { <controller>.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }) }`,
-    // or the same call as an expression body; the parameter's name is free.
+    // The arm is server.ts's one ENVIRONMENT arm path, a module-scope
+    // function (not imported) whose whole body arms, with the ENVIRONMENT
+    // cause, the persona it is given, on the retry controller's one
+    // module-scope handle, read at call time; that handle is assigned exactly
+    // once, in main(), this controller (so nothing is armed before it exists,
+    // and never on a second controller).
     const hook = props.get(TICK_ARM)
-    expect(hook).toBeDefined()
-    const arm = `${controller}\\.${ARM}\\(\\1, \\{ kind: ${CAUSE} \\}\\)`
-    expect(hook).toMatch(new RegExp(`^\\(?(\\w+)\\)? => (?:\\{ ${arm};? \\}|${arm})$`))
+    expect(hook).toBe(ENVIRONMENT_ARM)
+    expect(importSource(SERVER_CODE, ENVIRONMENT_ARM)).toBeUndefined()
+    const { params, body } = moduleFunction(ENVIRONMENT_ARM)
+    expect(params).toHaveLength(1)
+    const handle = retryHandle()
+    expect(body.replace(/\s+/g, ' ').trim()).toMatch(
+      new RegExp(`^${handle}\\?\\.${ARM}\\(${params[0]}, \\{ kind: ${CAUSE} \\}\\);?$`),
+    )
+    const assigned = assignmentsTo(handle)
+    expect(assigned.map((a) => a.value)).toEqual([controller])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+    // The one arm path: the ENVIRONMENT cause is named only by its import and
+    // this function; server.ts's only other arm is the restart module's
+    // read-error hook (pinned above); and the function is named only at its
+    // declaration, the tick's binding and the session-disconnect handler's
+    // call (b.jg5 SRJ-311; pinned in the handler's describe).
+    expect(indicesOf(new RegExp(`\\b${CAUSE}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    const arms = indicesOf(new RegExp(`\\.\\s*${ARM}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(arms).toHaveLength(2)
+    expect(withinCall(arms, onlyCallOf('initRestart'))).toBe(1)
+    expect(indicesOf(new RegExp(`\\b${ENVIRONMENT_ARM}\\b`, 'g'), SERVER_CODE)).toHaveLength(3)
     // The retry module's own cause: imported, never declared or shadowed here.
     expect(importSource(SERVER_CODE, CAUSE)).toBe('./unavailable-retry.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${CAUSE}\\b`, 'g'), SERVER_CODE)).toEqual([])
@@ -2391,8 +2552,9 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(indicesOf(new RegExp(`\\.\\s*${ADD_OBSERVER}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build, its two bindings, its install, its four latched queries (the retry action\'s, the restart work\'s, the reconnect adapter\'s inside the restart module\'s call, and the health tick\'s) and the teardown\'s forget, and the latch module imports no file-system module', () => {
+  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build, its two bindings, its install, its four latched queries in main() (the retry action\'s, the restart work\'s, the reconnect adapter\'s inside the restart module\'s call, and the health tick\'s), the persona routing\'s holder assignment and the teardown\'s forget, and the latch module imports no file-system module', () => {
     const latch = constOf(LATCH_FACTORY)
+    const IS_LATCHED: keyof ConflictLatch = 'isLatched'
 
     // No seed: no statement in main()'s own list records a latch, and nothing
     // in server.ts calls a set entry on it at all.
@@ -2406,10 +2568,13 @@ describe('main() builds the one per-persona latch, in server memory only, before
     // queries, and the persona teardown's latch forget (b.jg5 SRJ-504; its
     // form is pinned in tests/reload-wiring.test.ts); twice inside the restart
     // module's call: its own latched query and the reconnect adapter's, asked
-    // right before /mcp reconnect is typed (b.jg5 SRJ-502). The queries'
-    // forms are pinned in the describe below.
+    // right before /mcp reconnect is typed (b.jg5 SRJ-502); and once as the
+    // value of the persona routing's module-scope holder, which the routing's
+    // lost-message latched query reads at call time (b.jg5 SRJ-1011). The
+    // queries' forms are pinned in the describe below; the holder's in the
+    // persona routing's describe.
     const named = indicesOf(new RegExp(`\\b${latch}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(9)
+    expect(named).toHaveLength(10)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${latch}\\b`))!
     expect(named[0]).toBe(decl.index! + decl[0].length - latch.length)
     const withinAt = (at: number) => {
@@ -2426,6 +2591,9 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(adapter > restartOpen && adapter < restartClose).toBe(true)
     expect(withinAt(adapter)).toBe(1)
     expect(onlyCallProps('createPersonaLifecycle').get('forgetConflictLatch')).toContain(`${latch}.`)
+    // The tenth: the routing holder's one assignment, the bare latch.
+    const routing = routingHolder(ROUTING_LATCHED, IS_LATCHED, latch, [DISCONNECT_HANDLER])
+    expect(named.filter((offset) => offset > routing.at && offset < routing.end)).toHaveLength(1)
 
     // The factory itself reads no file: the latch module imports no
     // file-system module and opens no file through Bun.
@@ -2559,7 +2727,7 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(install, last))).toEqual([])
   })
 
-  test('four latched queries: the latched query is bound exactly once into each of the full-mode retry action, the restart work, the reconnect adapter (its second argument, after the persona lookup) and the health tick, as a call-time read of the one latch\'s isLatched for the key it is given', () => {
+  test('five latched queries and one read: the latched query is bound exactly once into each of the full-mode retry action, the restart work, the reconnect adapter (its second argument, after the persona lookup) and the health tick, as a call-time read of the one latch\'s isLatched for the key it is given, and once into the persona routing, through its module-scope holder of that one latch (b.jg5 SRJ-1011), which the session-disconnect handler also asks once (b.jg5 SRJ-311)', () => {
     const latch = constOf(LATCH_FACTORY)
     declaredOnce(latch)
     const query = oneKeyArrow(`${latch}\\.${IS_LATCHED}\\(\\1\\)`)
@@ -2571,23 +2739,263 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect([lookup, extra]).toEqual(['getAppliedPersona', []])
     expect(adapterQuery).toMatch(query)
 
-    // No other latched member in main() or query anywhere in server.ts: one
-    // member inside each of the three calls, and one query inside each of the
-    // three calls and the reconnect adapter's build (the one inside the
-    // restart module's call). Outside main(), `isLatched:` is only a
-    // parameter's type annotation (the reconnect adapter's latched gate), no
-    // binding.
-    const within = (offsets: number[], at: number) => {
-      const [open, close] = balancedAfter(SERVER_CODE, at, '(', ')')
-      return offsets.filter((offset) => offset > open && offset < close).length
-    }
-    const members = indicesOf(new RegExp(`\\b${IS_LATCHED}\\s*:`, 'g'), SERVER_CODE).filter(insideMain)
+    // b.jg5 SRJ-1011: the persona routing, built at module scope before the
+    // latch exists, reads it through its holder, whose one assignment is this
+    // same latch (no second latch, no copy; see routingHolder). The
+    // session-disconnect handler reads the same holder once, for its own key.
+    routingHolder(ROUTING_LATCHED, IS_LATCHED, latch, [DISCONNECT_HANDLER])
+
+    // No other latched member or query anywhere in server.ts: one member
+    // inside each of the three calls in main() and one inside the module-scope
+    // routing's call, and one query inside each of the three calls, the
+    // reconnect adapter's build (the one inside the restart module's call),
+    // the routing's call and the session-disconnect handler. Outside main(),
+    // `isLatched:` is otherwise only a parameter's type annotation (the
+    // reconnect adapter's latched gate), no binding.
+    const within = withinCall
+    const allMembers = indicesOf(new RegExp(`\\b${IS_LATCHED}\\s*:`, 'g'), SERVER_CODE)
+    const members = allMembers.filter(insideMain)
     expect(members).toHaveLength(3)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => within(members, onlyCallOf(call)))).toEqual([1, 1, 1])
+    const outside = allMembers.filter((offset) => !insideMain(offset))
+    expect(outside).toHaveLength(2)
+    expect(within(outside, onlyCallOf('createPersonaRouting'))).toBe(1)
+    expect(within(outside, SERVER_CODE.search(/\bfunction\s+reconnectLatchedAt\s*\(/))).toBe(1)
     const queries = indicesOf(new RegExp(`\\.\\s*${IS_LATCHED}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(queries).toHaveLength(4)
-    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => within(queries, onlyCallOf(call)))).toEqual([1, 2, 1])
+    expect(queries).toHaveLength(6)
+    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => within(queries, onlyCallOf(call)))).toEqual([1, 2, 1, 1])
     expect(within(queries, onlyReconnectAdapterBuild())).toBe(1)
+    const handler = moduleFunction(DISCONNECT_HANDLER)
+    expect(queries.filter((offset) => offset > handler.start && offset < handler.end)).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-1011 — the persona routing's lost-message state
+// inputs
+//
+// Every lost-message input of `PersonaRoutingDeps` is optional and answers
+// false when absent, so a production wiring that dropped one, bound it to a
+// constant, to a second latch or condition, or to a copy taken at import
+// (before main() builds the one instance, so it stays empty for good) would
+// type-check and pass every behaviour suite while a message lost for a
+// latched, not-answering or starting persona reported `starting-now` and
+// fired a restart. The routing is built at module scope and the latch and the
+// condition in main(), so each is read through a module-scope holder at call
+// time. State 5's outage flags are read by the routing from the outage state
+// itself, so they have no binding here. What the routing does with each input
+// is tested in tests/inbound-recovery-drop-branch.test.ts,
+// tests/dispatch-get-stream.test.ts and tests/lost-message.test.ts; pinned
+// here: the bindings.
+// ---------------------------------------------------------------------------
+
+describe('server.ts binds the persona routing\'s lost-message state inputs to the one latch, the one tmux-unresponsive condition and the session manager\'s isLaunchInFlight, each read at call time (b.jg5 SRJ-1011, SRJ-502, SRJ-307)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const IS_LATCHED: keyof ConflictLatch = 'isLatched'
+  const HOLDS: keyof TmuxUnresponsiveCondition = 'holds'
+  const LAUNCH_RUNNING: keyof PersonaRoutingDeps = 'isLaunchOrApproverRunning'
+  /** The three inputs later Epics bind: E23, E20 and E27, E21 and E27. */
+  const UNBOUND: Array<keyof PersonaRoutingDeps> = ['isHeldOnInvalidFlags', 'isKillFailed', 'isSequenceOrWaitRunning']
+
+  test('the latched query reads the one latch at call time, through a module-scope holder assigned that latch once in main(), before the start bring-up (state 2, held for a human)', () => {
+    const latch = constOf(LATCH_FACTORY)
+    declaredOnce(latch)
+    const { at } = routingHolder(ROUTING_LATCHED, IS_LATCHED, latch, [DISCONNECT_HANDLER])
+    // After the latch is built (the one the collision ladder sets), and before
+    // every path that can launch, and so latch.
+    expect(at).toBeGreaterThan(onlyCallOf(LATCH_FACTORY))
+    for (const later of latchStartPass()) expect(at).toBeLessThan(later)
+  })
+
+  test('the tmux-unresponsive query reads the one condition\'s holds at call time, through a module-scope holder assigned that condition once in main(), before the start bring-up (state 5, not answering)', () => {
+    const condition = constOf('createTmuxUnresponsiveCondition')
+    declaredOnce(condition)
+    const { at } = routingHolder(ROUTING_TMUX_UNRESPONSIVE, HOLDS, condition)
+    expect(at).toBeGreaterThan(onlyCallOf('createTmuxUnresponsiveCondition'))
+    // The holder's read is server.ts's only holds query: no second condition
+    // or copy is asked anywhere.
+    const holdsQueries = indicesOf(new RegExp(`\\.\\s*${HOLDS}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(holdsQueries).toHaveLength(1)
+    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf('createPersonaRouting'), '(', ')')
+    expect(holdsQueries[0]! > open && holdsQueries[0]! < close).toBe(true)
+  })
+
+  // b.jg5 SRJ-1011 ruling ("two separate inputs"): state 6's input is the
+  // session manager's isLaunchInFlight itself (a launch call awaits its dialog
+  // approver), not the shared in-flight predicate main() builds for the retry
+  // action and the health tick (b.jg5 SRJ-315), which later Epics widen with
+  // work that must report `restarting` instead. Both still resolve to the one
+  // isLaunchInFlight (see sharedInFlightPredicate).
+  test('the launch-running query is the session manager\'s isLaunchInFlight for the key it is given, separate from the shared in-flight predicate (state 6, starting)', () => {
+    const binding = onlyCallProps('createPersonaRouting').get(LAUNCH_RUNNING)
+    expect(binding).toBeDefined()
+    expect(binding === 'isLaunchInFlight' || /^\(?(\w+)\)? => isLaunchInFlight\(\1\)$/.test(binding!)).toBe(true)
+    // sharedInFlightPredicate also pins isLaunchInFlight to the session
+    // manager's import, declared nowhere in server.ts.
+    const shared = sharedInFlightPredicate()
+    expect(binding).not.toContain(shared)
+    expect(indicesOf(new RegExp(`\\b${shared}\\b`, 'g'), SERVER_CODE.slice(...balancedAfter(SERVER_CODE, onlyCallOf('createPersonaRouting'), '(', ')')))).toEqual([])
+  })
+
+  test('the held-on-invalid-flags, kill-failed and sequence/wait inputs are unbound: absent from the routing\'s call and named nowhere in server.ts (their Epics, E23, E20, E21 and E27, update this pin)', () => {
+    const props = onlyCallProps('createPersonaRouting')
+    for (const member of UNBOUND) {
+      expect(props.has(member)).toBe(false)
+      expect(indicesOf(new RegExp(`\\b${member}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    }
+    // The three bound inputs are present (each pinned above).
+    for (const member of [ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING]) expect(props.has(member)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-311 — a session disconnect while `tmux-unavailable`
+// is raised
+//
+// While a persona's `tmux-unavailable` outage is raised, the only attempts
+// made for it are its retry timer's, one per backoff interval (SRJ-311), so
+// the session-disconnect handler (`restartDisconnectedPersona`, reached from
+// a registered session's close and its SSE abort) never schedules a restart
+// then. With no timer armed (a retry that stopped as not up, on a declined
+// launch or on a failed run leaves the flag raised with none), it arms one
+// with the ENVIRONMENT cause through the same arm path the health tick uses
+// for such a persona (`armEnvironmentRetryTimer`), unless the persona is
+// latched (the one latch, SRJ-502) or has work in flight (the shared
+// in-flight predicate, SRJ-315); the handler's arm does not wait for a tick,
+// so a retry comes even with `health_check_interval` 0. The handler is
+// private to server.ts and reads the retry timers and the latch through the
+// module-scope holders only main() assigns, so it cannot be driven from a
+// unit test; a handler that dropped, reordered or loosened one of its
+// branches would pass every behaviour suite. What an arm does is tested in
+// tests/unavailable-retry.test.ts. Pinned here: with the flag not raised it
+// schedules the restart as before; with it raised it asks, in order, an armed
+// timer (nothing more), the latch and the in-flight predicate (nothing armed),
+// a missing controller (nothing armed), and otherwise arms the timer; each
+// branch logs one line, and none can reach `scheduleRestart`.
+// ---------------------------------------------------------------------------
+
+describe('the session-disconnect handler schedules a restart only while the persona\'s tmux-unavailable outage is not raised; with it raised it schedules none, and arms the retry timer (the health tick\'s arm path) only when none is armed and the persona is neither latched nor has work in flight (b.jg5 SRJ-311)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const GET_FLAGS: keyof typeof OutageStateModule = 'getOutageFlags'
+  const IS_ARMED: keyof UnavailableRetryController = 'isArmed'
+  const IS_LATCHED: keyof ConflictLatch = 'isLatched'
+
+  interface Guard {
+    /** Offset of the `if` in the body. */
+    at: number
+    /** The condition, whitespace collapsed. */
+    cond: string
+    /** The block's text, braces excluded. */
+    block: string
+    /** Offset just past the block's closing brace. */
+    end: number
+  }
+
+  /** The handler's key parameter, its body text, and the `if` statements at the top level of its body, in order (each must have a braced block). */
+  function handler(): { key: string; body: string; guards: Guard[] } {
+    const { params, body } = moduleFunction(DISCONNECT_HANDLER)
+    const blank = blankLiterals(body)
+    const guards: Guard[] = []
+    for (const m of blank.matchAll(/\bif\s*\(/g)) {
+      const before = blank.slice(0, m.index!)
+      const depth = (before.match(/[{(\[]/g) ?? []).length - (before.match(/[})\]]/g) ?? []).length
+      if (depth !== 0) continue
+      const [condStart, condEnd] = balancedAfter(body, m.index!, '(', ')')
+      expect(blank.slice(condEnd + 1).trimStart().startsWith('{')).toBe(true)
+      const [blockStart, blockEnd] = balancedAfter(body, condEnd, '{', '}')
+      guards.push({
+        at: m.index!,
+        cond: body.slice(condStart, condEnd).replace(/\s+/g, ' ').trim(),
+        block: body.slice(blockStart, blockEnd),
+        end: blockEnd + 1,
+      })
+    }
+    return { key: params[0]!, body, guards }
+  }
+
+  /** A block that logs one line and returns, and does nothing else (literals blanked, so the line's text is free). */
+  const LOG_AND_RETURN = /^console\.error\(\s*\);? return;?$/
+
+  /** `text` with its literals blanked and its whitespace collapsed. */
+  function shape(text: string): string {
+    return blankLiterals(text).replace(/\s+/g, ' ').trim()
+  }
+
+  test('with the tmux-unavailable flag not raised, it schedules the restart for the persona in its working directory and returns, right after the not-applied guard; that is its only scheduleRestart, so none is reachable while the flag is raised', () => {
+    const { key, body, guards } = handler()
+    const persona = body.match(new RegExp(`\\bconst\\s+(\\w+)\\s*=\\s*getAppliedPersona\\(${key}\\)`))![1]!
+    expect(guards.slice(0, 2).map((g) => g.cond)).toEqual([
+      `!${persona}`,
+      `!${GET_FLAGS}(${key}).has('${TMUX_UNAVAILABLE_CLASS}')`,
+    ])
+    expect(importSource(SERVER_CODE, GET_FLAGS)).toBe('./outage-state.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${GET_FLAGS}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    // The flag is read once.
+    expect(indicesOf(new RegExp(`\\b${GET_FLAGS}\\b`, 'g'), body)).toHaveLength(1)
+
+    // Its block: the restart, then return; nothing else.
+    const block = guards[1]!.block
+    expect(shape(block)).toMatch(/^scheduleRestart\([^()]*\);? return;?$/)
+    expect(splitTopLevel(callArguments(block, block.search(/\bscheduleRestart\s*\(/)))).toEqual([key, `${persona}.working_directory`])
+    expect(importSource(SERVER_CODE, 'scheduleRestart')).toBe('./restart.ts')
+
+    // The handler's only scheduleRestart is that one.
+    const schedules = indicesOf(/\bscheduleRestart\s*\(/g, body)
+    expect(schedules).toHaveLength(1)
+    expect(schedules[0]).toBeGreaterThan(guards[1]!.at)
+    expect(schedules[0]).toBeLessThan(guards[1]!.end)
+  })
+
+  test('with the flag raised it asks, in order: the one retry controller\'s armed timer for the persona, the one latch (through the routing\'s holder), the shared in-flight predicate, and whether the controller exists; each of those branches logs one line saying no restart is scheduled and returns, arming nothing', () => {
+    const { key, body, guards } = handler()
+    const latchHolder = routingHolder(ROUTING_LATCHED, IS_LATCHED, constOf(LATCH_FACTORY), [DISCONNECT_HANDLER]).holder
+    const predicate = sharedInFlightPredicate()
+
+    // The armed read: once, on the one retry controller's handle (assigned
+    // only that controller; see the controller's describe), between the flag
+    // guard and the first branch, at the top level of the body.
+    const reads = [...body.matchAll(new RegExp(`\\bconst\\s+(\\w+)\\s*=\\s*${retryHandle()}\\?\\.${IS_ARMED}\\(${key}\\)`, 'g'))]
+    expect(reads).toHaveLength(1)
+    expect(indicesOf(new RegExp(`\\.${IS_ARMED}\\(`, 'g'), body)).toHaveLength(1)
+    const armed = reads[0]![1]!
+    const readAt = reads[0]!.index!
+    expect(readAt).toBeGreaterThan(guards[1]!.end)
+    expect(readAt).toBeLessThan(guards[2]!.at)
+
+    // Exactly these branches, in this order, and no other top-level guard: a
+    // missing controller (`isArmed` answers undefined) is told apart from
+    // "not armed" (exactly false) only after the latch and in-flight checks.
+    expect(guards.slice(2).map((g) => g.cond)).toEqual([
+      `${armed} === true`,
+      `${latchHolder}?.${IS_LATCHED}(${key}) === true`,
+      `${predicate}(${key})`,
+      `${armed} !== false`,
+    ])
+
+    // Each: one log line, then return; no restart, no arm.
+    const lines = ['its retry timer recovers it', 'and is latched', 'with work in flight', 'and no retry controller']
+    guards.slice(2).forEach((g, i) => {
+      expect(shape(g.block)).toMatch(LOG_AND_RETURN)
+      expect(g.block).toContain('no restart scheduled')
+      expect(g.block).toContain(lines[i]!)
+      expect(g.block).not.toContain(ENVIRONMENT_ARM)
+    })
+  })
+
+  test('otherwise (the controller answers not armed) it logs one line and arms the timer through armEnvironmentRetryTimer, the health tick\'s arm path, as the body\'s last statement; it arms nowhere else, calls no controller arm directly, and returns only from its guards', () => {
+    const { key, body, guards } = handler()
+    const last = guards[guards.length - 1]!
+    expect(shape(body.slice(last.end))).toMatch(new RegExp(`^console\\.error\\(\\s*\\);? ${ENVIRONMENT_ARM}\\(${key}\\);?$`))
+    expect(body.slice(last.end)).toContain('no restart scheduled; arming one')
+
+    // The one arm, outside every guard; no direct controller arm.
+    expect(indicesOf(new RegExp(`\\b${ENVIRONMENT_ARM}\\b`, 'g'), body)).toHaveLength(1)
+    expect(indicesOf(/\.\s*arm\s*\(/g, body)).toEqual([])
+
+    // One return per guard (six), each its block's last statement.
+    expect(guards).toHaveLength(6)
+    expect(indicesOf(/\breturn\b/g, blankLiterals(body))).toHaveLength(6)
+    for (const g of guards) expect(shape(g.block)).toMatch(/\breturn;?$/)
   })
 })
 
@@ -2665,10 +3073,8 @@ describe('server.ts wires the b.f2b stale-working-row recovery', () => {
     // the session manager's isLaunchInFlight (see sharedInFlightPredicate).
     const predicate = sharedInFlightPredicate()
     expect(props.get(TICK_IN_FLIGHT_MEMBER)).toBe(predicate)
-    // Declared before the health check is initialised, so the tick's binding
-    // reads the one declaration in scope (the helper pins it before the retry
-    // controller).
-    expect(SERVER_CODE.search(new RegExp(`\\bconst\\s+${predicate}\\s*=`))).toBeLessThan(onlyCallOf('initHealthCheck'))
+    // A module-scope function declaration (the helper pins it), so the tick's
+    // binding reads the one declaration in scope wherever main() binds it.
     for (const [dep, value] of [
       ['hasPendingWorkingRowEvidence', 'hasPendingWorkingRowEvidence'],
       ['notifyNotConnected', 'notifyDisconnectedWithAutoRestartDisabled'],

@@ -59,7 +59,10 @@
  *   `UNAVAILABLE_RETRY_CAUSE_READ_ERROR`, straight to the controller (it is
  *   not recorded in `triggers`); an arm while the timer is armed or running
  *   keeps its due time. `isLatched` is the latch's latched query (`latch`
- *   below). `options.restartDeps` replaces any of these.
+ *   below). `options.restartDeps` replaces any of these. Every ask of the
+ *   latched query in effect, a replacement's included, is recorded by key
+ *   first (for `loseMessage`'s `restartRequested`); a throw still reaches
+ *   the restart module.
  * - The relaunch gate is the real `createPersonaRelaunchGate` over a serving
  *   connection, with the bring-up outcome `setUp(key, up)` controls (every
  *   configured persona up at first) and the live applied set (its lines go
@@ -206,6 +209,38 @@
  *   real-time wait: 1 ms steps, bounded by `options.settleMs`, and it throws
  *   when a launch or a run is still in flight at the bound. A retry whose
  *   launch goes on past a spawn needs it before the clock moves on.
+ * - `loseMessage(key)`, the lost-message driver (b.jg5 SRJ-1011): one Slack
+ *   message, a human's in persona `key`'s first channel, handed to the real
+ *   `createPersonaRouting` with no session registered for the persona, so it
+ *   takes the no-session branch and is lost. The routing is built at the
+ *   first call, bound as `main()` binds it: the up predicate is the real
+ *   `createPersonaUpPredicate` over the same serving connection, bring-up
+ *   outcome (`setUp`) and live applied set as the relaunch gate; `isLatched`
+ *   is `latch`'s latched query; `isTmuxUnresponsive` is the condition's
+ *   `holds`; `isLaunchOrApproverRunning` is the session manager's
+ *   `isLaunchInFlight` (a launch call awaits its dialog approver); the
+ *   restart guards and `scheduleRestart` are the restart module the harness
+ *   initialised, and the outage flags are the outage state's. The members
+ *   later Epics bind (held on `ErrInvalidFlags`, kill-failed, a sequence or
+ *   wait step running) are left unbound, as in production, and so are the
+ *   one `status` read and the in-flight gate, which E15's second Task adds.
+ *   Each persona has its own Slack stub (`slack(key)`, leak marker on) as its
+ *   client and bot identity; the routing's `notify` records each notice in
+ *   `lostMessageNotices` (`{ key, text }`, the body without the persona
+ *   prefix) and hands it to the real persona notifier (`makeNotifierStack`,
+ *   its destination hold on the harness clock), which posts it with the
+ *   persona's own stub. The routing's lines go to `lines`. It throws when a
+ *   session is registered for the persona, or when the message raised no
+ *   notice, or one for another persona. It resolves, once the notice is
+ *   raised, with `LostMessageOutcome`: the state the notice reports
+ *   (`stateOf`, from the routing harness), the notice body, whether the
+ *   routing asked the restart module for the persona's restart
+ *   (`restartRequested`: `scheduleRestart` asks the restart deps' latched
+ *   query first, before any other gate, and the harness records every such
+ *   ask, so a request is seen even for a latched persona or with the delay
+ *   0, where none is armed), whether a restart of it is pending or running
+ *   afterwards (`isRestartPendingOrActive`), and the stub calls the message
+ *   made (by verb, as `callCountsSince`).
  * - `outageNotices`: the outage state's notices, `{ key, text }`, in order.
  * - `episodeNotices`: the notice episodes' posts, `{ key, text }`, in order
  *   (production posts them through the persona notifier).
@@ -233,13 +268,14 @@
  *   with spaces, in order. `console.error` is replaced at build and put back
  *   by `cleanup()`.
  * - `captured()`: everything captured, for `assertNoLeak`: the lines, the
- *   `console.error` lines, the three notice lists, the startup-errors
+ *   `console.error` lines, the four notice lists, the startup-errors
  *   entries, the attempts, the triggers, the condition ends, the outage
- *   clears, the stops, the latch events and the state directory as a written
- *   file.
- * - `cleanup()`: stops every retry timer (`stopAll`) and forgets every
- *   episode (`episodes.forgetAll()`, which cancels every alert check), then
- *   undoes every
+ *   clears, the stops, the latch events, the driver's Slack calls and the
+ *   state directory as a written file.
+ * - `cleanup()`: stops every retry timer (`stopAll`), forgets every
+ *   episode (`episodes.forgetAll()`, which cancels every alert check) and
+ *   cancels every notice the driver's destination hold holds, then
+ *   drops the driver's routing and undoes every
  *   install and reset the harness made (`console.error`, the restart module's state and the
  *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
  *   the session manager's latch install and the latch's set observers,
@@ -281,7 +317,7 @@
  * covered `pending` rows exist. Later work extends this harness in place.
  *
  * Isolation: no top-level `mock.module()`, no real HOME, `~/.agent-director`,
- * tmux or child process. The retry timer runs on the fake clock only; the one
+ * tmux, child process or Slack client (the driver's clients are stubs). The retry timer runs on the fake clock only; the one
  * real-time wait is `settle()`'s bounded poll for the spawn path. A retry
  * never arms the restart module's own (real) timer: its entry bypasses it. Every file
  * sits under one `mkdtempSync` directory.
@@ -293,11 +329,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { WebClient } from '@slack/web-api'
 import type { Client, SpawnResult } from 'agent-director'
 
 import { adAlertThresholdMsInEffect, adSettingsInEffect, installAdSettings, resetAdSettingsForTests, type AdSettingsInEffect } from '../../src/ad-settings.ts'
 import { _resetBackoffState, isAtCap } from '../../src/backoff.ts'
-import type { Persona, PersonaConfig } from '../../src/config.ts'
+import { replySettingsOf, type Persona, type PersonaConfig } from '../../src/config.ts'
 import {
   bindConflictLatchHolds,
   bindConflictNotice,
@@ -331,9 +368,20 @@ import {
   type UnclassifiedErrorEndReason,
 } from '../../src/persona-episodes.ts'
 import { personaInstanceId } from '../../src/persona-identity.ts'
+import { createPersonaRouting, type PersonaRouting } from '../../src/persona-routing.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
-import { createPersonaRelaunchGate } from '../../src/persona-start.ts'
-import { _resetRestartState, initRestart, RESTART_FAILURE_CAP, runRestartRetry, type RestartDeps } from '../../src/restart.ts'
+import { createPersonaRelaunchGate, createPersonaUpPredicate, type PersonaUpQuery } from '../../src/persona-start.ts'
+import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
+import { createNameResolver, type NameResolverWebClient } from '../../src/message-archive.ts'
+import { getSessionByPersona } from '../../src/registry.ts'
+import {
+  _resetRestartState,
+  initRestart,
+  isRestartPendingOrActive,
+  RESTART_FAILURE_CAP,
+  runRestartRetry,
+  type RestartDeps,
+} from '../../src/restart.ts'
 import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter } from '../../src/server.ts'
 import {
   _resetConfiguredPersonaQuery,
@@ -385,9 +433,12 @@ import {
   type StubClientOptions,
   type StubSpawnPath,
 } from './agent-director-stub.ts'
-import { writtenFile } from './credentials.ts'
+import { LEAK_SENTINEL, writtenFile } from './credentials.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
+import { makeNotifierStack } from './persona-notifier.ts'
+import { stateOf } from './persona-routing-harness.ts'
+import { makeChannelMessage, makeStubSlack, type StubSlack } from './slack-stub.ts'
 
 /** Clock flushes `advance` waits at most for the in-flight retry runs, before and after each firing. */
 const DEFAULT_SETTLE_FLUSHES = 20
@@ -502,6 +553,26 @@ export type RecoveryLatchEvent =
   | { readonly step: 'hold'; readonly key: string; readonly hold: RecoveryLatchHold }
   | { readonly step: 'notice'; readonly key: string; readonly text: string }
 
+/** What `loseMessage` resolves with: one lost message for one persona, as the driver saw it. */
+export interface LostMessageOutcome {
+  /** The state the notice reports, identified by `stateOf`. */
+  readonly state: ReturnType<typeof stateOf>
+  /** The notice body the routing raised (no persona prefix). */
+  readonly notice: string
+  /** Whether the routing asked the restart module for the persona's restart (`scheduleRestart`), armed or not. */
+  readonly restartRequested: boolean
+  /** Whether a restart of the persona is pending or running once the message was handled. */
+  readonly restartPending: boolean
+  /** The stub calls made while the message was handled, by verb, leaving out verbs with none. */
+  readonly calls: Record<string, number>
+}
+
+/** The driver's pieces, built at the first `loseMessage`. */
+interface LostMessageDriver {
+  readonly routing: PersonaRouting
+  readonly hold: PersonaDestinationHold
+}
+
 /** The harness's latch, read-only: the latched query and the record. */
 export type RecoveryLatchView = Pick<ConflictLatch, 'isLatched' | 'record'>
 
@@ -541,6 +612,15 @@ export interface RecoveryHarness {
   readonly latch: RecoveryLatchView
   /** Every latch set, hold and CONFLICT notice post, in order. */
   readonly latchEvents: RecoveryLatchEvent[]
+  /** Every lost-message notice the driver's routing raised (body, no persona prefix), in order. */
+  readonly lostMessageNotices: RecoveryNotice[]
+  /** Persona `key`'s Slack stub: its client and bot identity in the driver's routing. */
+  slack(key: string): StubSlack
+  /**
+   * Lose one Slack message for persona `key` through the real routing's
+   * no-session branch, bound as `main()` binds it; see the module comment.
+   */
+  loseMessage(key: string): Promise<LostMessageOutcome>
   /** The per-persona serializer the restart module runs its work through. */
   readonly serializer: PersonaSerializer
   /** The server's retry action, for both modes, over the real row read and restart entry (the default). */
@@ -625,10 +705,13 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const appliedPersona = (key: string): Persona | undefined =>
     applied.has(key) ? config.personas.find((persona) => persona.key === key) : undefined
   const appliedConfig = (): PersonaConfig => ({ ...config, personas: config.personas.filter((persona) => applied.has(persona.key)) })
-  const canRelaunch = createPersonaRelaunchGate({ status: () => SERVING }, log, {
+  // As main(): the relaunch gate and the up predicate decide over the same
+  // connection status, bring-up outcome and live applied set.
+  const upQuery: PersonaUpQuery = {
     isUp: (key) => !down.has(key),
     isApplied: (key) => applied.has(key),
-  })
+  }
+  const canRelaunch = createPersonaRelaunchGate({ status: () => SERVING }, log, upQuery)
 
   const queued = new Map<string, UnavailableRetryOutcome[]>()
   const scripted: UnavailableRetryAction = (key) => queued.get(key)?.shift() ?? SCRIPTED_REFUSAL
@@ -803,7 +886,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   _resetRestartState()
   _resetBackoffState()
-  initRestart({
+  const restartDeps: RestartDeps = {
     canRestart: canRelaunch,
     isSessionAlive: _buildIsSessionAliveAdapter(appliedConfig),
     isSessionConnected: (key) => connected.has(key),
@@ -840,6 +923,19 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // makes no agent-director call.
     isLatched: (key) => latch.isLatched(key),
     ...options.restartDeps,
+  }
+  // Every ask of the latched query in effect is recorded first (the driver's
+  // `restartRequested`: `scheduleRestart` asks it before any other gate); its
+  // answer, or its throw, reaches the restart module unchanged (an absent
+  // query answers false, as the restart module reads an absent one).
+  const restartLatchedAsks: string[] = []
+  const latchedQuery = restartDeps.isLatched
+  initRestart({
+    ...restartDeps,
+    isLatched: (key) => {
+      restartLatchedAsks.push(key)
+      return latchedQuery?.(key) ?? false
+    },
   })
 
   /** Every key a run may be in flight for: the configured, the armed and those a retry ran for. */
@@ -881,6 +977,90 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     return readFileSync(path, 'utf-8').split('\n').filter((line) => line !== '')
   }
 
+  // The lost-message driver (b.jg5 SRJ-1011): one Slack stub per persona,
+  // and the routing and notifier, built at the first `loseMessage`.
+  const lostMessageNotices: RecoveryNotice[] = []
+  const slackStubs = new Map<string, StubSlack>(keys.map((key) => [key, makeStubSlack({ leakMarker: LEAK_SENTINEL })]))
+  let lostMessageDriver: LostMessageDriver | undefined
+  let lostMessageCount = 0
+
+  function slackStubOf(key: string): StubSlack {
+    const stub = slackStubs.get(key)
+    if (stub === undefined) throw new Error(`recovery harness: no configured persona ${JSON.stringify(key)}`)
+    return stub
+  }
+
+  /** The persona's Slack client in the driver's routing and notifier: its own stub. */
+  const slackClientFor = (key: string): WebClient | undefined => slackStubs.get(key)?.web as unknown as WebClient | undefined
+
+  /**
+   * The driver's routing, built once, bound as `main()` binds it. E15's
+   * second Task adds the routing's one `status` read and its in-flight gate;
+   * the members later Epics bind stay unbound, as in production.
+   */
+  function driver(): LostMessageDriver {
+    if (lostMessageDriver !== undefined) return lostMessageDriver
+    const { notifier, hold } = makeNotifierStack({ getPersona: appliedPersona, clientFor: slackClientFor, clock, log })
+    const routing = createPersonaRouting({
+      getPersonaConfig: appliedConfig,
+      getBotIdentity: (key) => slackStubs.get(key)?.identity,
+      clientFor: slackClientFor,
+      // As server.ts: `users.info` through the persona's client.
+      resolveUserName: async (key, userId) => {
+        const client = slackClientFor(key)
+        return client ? createNameResolver(client as unknown as NameResolverWebClient).resolveUserName(userId) : userId
+      },
+      archive: () => {},
+      getReplySettings: () => replySettingsOf(appliedConfig()),
+      notify: (key, text, noticeOptions) => {
+        lostMessageNotices.push({ key, text })
+        return notifier.notify(key, text, noticeOptions)
+      },
+      log,
+      dedupeClock: () => clock.now(),
+      isPersonaUp: createPersonaUpPredicate({ status: () => SERVING }, upQuery),
+      isLatched: (key) => latch.isLatched(key),
+      isTmuxUnresponsive: (key) => tmuxUnresponsive.holds(key),
+      isLaunchOrApproverRunning: (key) => isLaunchInFlight(key),
+    })
+    lostMessageDriver = { routing, hold }
+    return lostMessageDriver
+  }
+
+  /** The stub's call counts, by verb, leaving out verbs never called. */
+  function stubCallCounts(): Record<string, number> {
+    return Object.fromEntries(Object.entries(stub.calls).filter(([, calls]) => calls.length > 0).map(([verb, calls]) => [verb, calls.length]))
+  }
+
+  async function loseMessage(key: string): Promise<LostMessageOutcome> {
+    const persona = appliedPersona(key)
+    if (persona === undefined) throw new Error(`recovery harness: no applied persona ${JSON.stringify(key)}`)
+    if (getSessionByPersona(key) !== undefined) {
+      throw new Error(`recovery harness: persona ${key} has a registered session; the driver loses a message through the no-session branch`)
+    }
+    const channel = persona.channels[0]?.id
+    if (channel === undefined) throw new Error(`recovery harness: persona ${key} lists no channel to receive a message in`)
+    const { routing } = driver()
+    const noticesBefore = lostMessageNotices.length
+    const asksBefore = restartLatchedAsks.length
+    const callsBefore = stubCallCounts()
+    lostMessageCount += 1
+    const event = makeChannelMessage({ channel, ts: `1700000000.${String(lostMessageCount).padStart(6, '0')}` })
+    await routing.receive(event, () => {}, key)
+    const raised = lostMessageNotices.slice(noticesBefore)
+    if (raised.length !== 1 || raised[0]!.key !== key) {
+      throw new Error(`recovery harness: losing a message for ${key} raised ${JSON.stringify(raised.map((n) => n.key))}, not one notice for it`)
+    }
+    const notice = raised[0]!.text
+    return {
+      state: stateOf(notice),
+      notice,
+      restartRequested: restartLatchedAsks.slice(asksBefore).includes(key),
+      restartPending: isRestartPendingOrActive(key),
+      calls: callCountsSince(stubCallCounts(), callsBefore),
+    }
+  }
+
   return {
     clock,
     controller,
@@ -905,6 +1085,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     unclassifiedErrorOpen: (key) => unclassifiedErrors.isOpen(key),
     latch: Object.freeze({ isLatched: (key: string) => latch.isLatched(key), record: (key: string) => latch.record(key) }),
     latchEvents,
+    lostMessageNotices,
+    slack: slackStubOf,
+    loseMessage,
     serializer,
     fullModeAction: fullMode,
     scriptedAction: scripted,
@@ -1000,12 +1183,16 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       outageClears: [...outageClears],
       stops: [...stops],
       latchEvents: [...latchEvents],
+      lostMessageNotices: [...lostMessageNotices],
+      slackCalls: Object.fromEntries([...slackStubs].map(([key, slack]) => [key, slack.callLog])),
       stateDir: writtenFile(stateDir),
     }),
 
     cleanup() {
       controller.stopAll('the recovery harness is cleaned up')
       episodes.forgetAll()
+      lostMessageDriver?.hold.cancelAll()
+      lostMessageDriver = undefined
       const pendingTimers = clock.pendingCount()
       const armed = controller.armedKeys()
       _resetRestartState()

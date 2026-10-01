@@ -65,6 +65,15 @@
  * notice, by which P's timer, `tmux-unresponsive` condition and
  * unclassified episode are all closed, and nothing fires for P afterwards.
  *
+ * A lost message while latched (SRJ-502, SRJ-1011, AC 68, on
+ * `makeRecoveryHarness` with both settings 0): P latches through the launch
+ * driver at a plain-spawn `scan-leftover` row; a message lost for P through
+ * the harness's lost-message driver (the real routing's no-session branch,
+ * its latched query the harness's latch, as `main()` binds it) reports
+ * `held-for-human` with the exported wording, posted at P's destination, asks
+ * the restart module for no restart and makes no call, and nothing fires for
+ * P afterwards; Q's lost message reports its own state.
+ *
  * SRJ-504's restart legs (AC 45, on `makeRecoveryHarness`): a server restart
  * is two harness lifetimes, the first cleaned up before the second is built,
  * each over a stub answering the same condition. In each lifetime P's
@@ -221,7 +230,9 @@ import {
   AGENT_DIRECTOR_LIVE_STATES,
   AGENT_DIRECTOR_PENDING_STATE,
 } from '../src/liveness-reading.ts'
+import { STATE_WORDING } from '../src/lost-message.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
+import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import {
   createPersonaEpisodes,
   PERSONA_EPISODE_KIND_CONFLICT,
@@ -294,6 +305,7 @@ import {
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { posts } from './test-helpers/permission-relay-harness.ts'
 import {
   callCounts,
   callCountsSince,
@@ -1647,6 +1659,65 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
     expect(unclassifiedLines(h, p)).toEqual(episodeLines)
     expect(h.episodeNotices).toEqual([{ key: p, text: plainSpawnRow.notice.text }])
     expect(h.notices).toEqual([])
+    expect(personaCallCounts(h, q)).toEqual({})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRJ-502, SRJ-1011: a message lost while P is latched reports held for a
+// human, and no restart fires (AC 68), through the recovery harness's
+// lost-message driver: the real routing's no-session branch with the
+// harness's latch's latched query bound as `main()` binds it
+// ---------------------------------------------------------------------------
+
+describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for a human and fires no restart (recovery harness)', () => {
+  const leftoverRow = rowWhere(
+    (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.stubCase === 'scan-leftover' && row.rowState === LATCH_ROW_STATE_NO_ROW,
+  )
+
+  test('a CONFLICT at P’s spawn latches P; a message lost then reports held for a human with its exported wording at P’s destination, asks for no restart and makes no call, and nothing fires for P afterwards; Q’s lost message reports its own state', async () => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    expect(h.config.session_restart_delay).toBe(0)
+    const [p, q] = h.keys as [string, string]
+    h.script({ spawnError: leftoverRow.build(), statusError: errSpawnNotFound() })
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    expect(h.latch.isLatched(p)).toBe(true)
+    const afterLatch = callCounts(h)
+
+    const lost = await h.loseMessage(p)
+
+    // Ignoring the latch would report the delay 0's auto-restart disabled; a
+    // restart request is seen even though the latched restart module arms none.
+    expect(lost).toEqual({
+      state: 'held-for-human',
+      notice: expect.stringContaining(STATE_WORDING['held-for-human']),
+      restartRequested: false,
+      restartPending: false,
+      calls: {},
+    })
+    const persona = personaOf(h, p)
+    expect(posts(h.slack(p)).map((post) => [post.channel, post.text])).toEqual([
+      [persona.permission_prompts, formatPersonaNotice(persona, lost.notice)],
+    ])
+    expect(h.lostMessageNotices).toEqual([{ key: p, text: lost.notice }])
+    expect(h.episodeNotices).toEqual([{ key: p, text: leftoverRow.notice.text }])
+
+    // Nothing fires for P afterwards: several retry waits on, no attempt, no call, nothing pending.
+    await h.advance(4 * UNAVAILABLE_RETRY_CEILING_S * 1000)
+    expect([h.attempts, callCounts(h), h.clock.pendingCount(), isRestartPendingOrActive(p)]).toEqual([[], afterLatch, 0, false])
+
+    // Q is not latched: its message reports the state that applies to it at the delay 0.
+    expect(await h.loseMessage(q)).toEqual({
+      state: 'auto-restart-disabled',
+      notice: expect.stringContaining(STATE_WORDING['auto-restart-disabled']),
+      restartRequested: false,
+      restartPending: false,
+      calls: {},
+    })
+    expect(h.slack(q).calls.postMessage).toHaveLength(1)
+    expect(h.slack(p).calls.postMessage).toHaveLength(1)
+    expect(h.latch.isLatched(q)).toBe(false)
     expect(personaCallCounts(h, q)).toEqual({})
   })
 })

@@ -6,10 +6,13 @@
  * lost its standalone GET stream (`_GET_stream`), the MCP SDK's send() would
  * evaporate silently. The dispatch path in src/persona-routing.ts therefore
  * does NOT call notification() and adds no ack reaction. It decides the
- * recovery state from whether P is up (not up, bug b.g57) and P's restart
- * guards (restarting, starting now, auto-restart disabled, restart limit
- * reached), schedules a human-triggered
- * restart of P in the session's cwd only when starting now, and raises one
+ * recovery state, the first that applies in the order src/lost-message.ts
+ * exports (`LOST_MESSAGE_STATES`; b.jg5 SRJ-1011): not up (bug b.g57), held
+ * for a human (latched), cannot launch, kill failed, not answering, session
+ * starting (a launch running), then P's restart guards (restarting,
+ * auto-restart disabled, restart limit reached) and starting now. It
+ * schedules a human-triggered restart of P in the session's cwd only when
+ * starting now (b.jg5 SRJ-1501, AC 68), and raises one
  * lost-message notice naming the sender and the state at P's
  * permission-prompt destination, through P's own client (b.av2 SR-4.6,
  * SR-7.3). Nothing is posted in the conversation the message came from, and
@@ -27,6 +30,11 @@
  * Alpha's destination is either its first channel (the message arrives in its
  * second) or a DM with its contact. The notice is compared with the real
  * builder's output for the expected state, never with a copied string. The
+ * Each state is arranged through the harness's real inputs: its latch
+ * (E13's `setFromConflict`), its `tmux-unresponsive` condition (E10's
+ * `start`), its own restart launch held open (a launch running, as
+ * production binds `isLaunchInFlight`), a restart timer that has not fired
+ * (restarting), and its per-key sets for the inputs later Epics bind. The
  * stream-presence probe is the module's exported `hasSessionStream`, the one
  * the restart guard and the health check also use. The no-session branch
  * (b.kvq) is covered by tests/inbound-recovery-drop-branch.test.ts.
@@ -51,7 +59,8 @@ import { recordFailure } from '../src/backoff.ts'
 import { consumeAck } from '../src/ack-tracker.ts'
 import type { Persona } from '../src/config.ts'
 import { hasSessionStream } from '../src/persona-routing.ts'
-import { buildLostMessageNotice, type LostMessageState } from '../src/lost-message.ts'
+import { buildLostMessageNotice, LOST_MESSAGE_STATES, type LostMessageState } from '../src/lost-message.ts'
+import { LATCH_ROW_STATE_NO_ROW, REFUSED_OPERATION_PLAIN_SPAWN } from '../src/conflict-latch.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { createPersonaUpPredicate } from '../src/persona-start.ts'
 import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
@@ -63,6 +72,8 @@ import {
   stubOpenedDmId,
 } from './test-helpers/slack-stub.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
+import { conflictForPersona } from './test-helpers/conflict-cases.ts'
+import { errTmuxUnresponsive } from './test-helpers/agent-director-stub.ts'
 import type { PersonaSpec } from './test-helpers/persona-config.ts'
 import {
   makeRestartDeps,
@@ -209,29 +220,26 @@ afterEach(() => {
 // Streamless-state arrangement
 // ---------------------------------------------------------------------------
 
-/** Alpha set up so the next streamless message finds P's restart guards in `state`. */
+/** Alpha set up so the next streamless message finds P in `state`. */
 interface Arranged {
   a: Alpha
   /** Lets a held launch finish. */
   release(): void
 }
 
+/** A launch outcome held open until `release`, keeping alpha's launch in flight. */
+function heldLaunch(): { launchSession: () => Promise<boolean>; release(): void } {
+  let launchResolve!: (ok: boolean) => void
+  const held = new Promise<boolean>((res) => { launchResolve = res })
+  return { launchSession: () => held, release: () => launchResolve(true) }
+}
+
 async function arrangeState(state: LostMessageState, destination: Destination): Promise<Arranged> {
   // restart.ts itself could launch (fast delay), so a wrongly scheduled
   // restart would show up as a launch.
   const base = { hasGetStream: false, destination, restartDelayS: FAST_DELAY_S }
+  const none = () => {}
   switch (state) {
-    case 'restarting': {
-      // A launch for alpha is in flight and held open.
-      let launchResolve!: (ok: boolean) => void
-      const held = new Promise<boolean>((res) => { launchResolve = res })
-      const a = makeAlpha({ ...base, launchSession: () => held })
-      scheduleRestart(a.alpha.key, a.sessionCwd)
-      await waitFor(() => a.h.launches.length === 1)
-      expect(a.h.launches).toHaveLength(1)
-      expect(isRestartPendingOrActive(a.alpha.key)).toBe(true)
-      return { a, release: () => launchResolve(true) }
-    }
     case 'not-up': {
       // Bug b.g57: alpha held (its bring-up retrying, as for an unresolvable
       // claude_config_dir) while its Slack connection still serves, through
@@ -241,16 +249,58 @@ async function arrangeState(state: LostMessageState, destination: Destination): 
       const isPersonaUp = createPersonaUpPredicate({ status: () => serving }, { isUp: (key) => !notUp.has(key) })
       const a = makeAlpha({ ...base, isPersonaUp })
       notUp.add(a.alpha.key)
-      return { a, release: () => {} }
+      return { a, release: none }
+    }
+    case 'held-for-human': {
+      // Alpha latched through E13's set entry, on a CONFLICT.
+      const a = makeAlpha(base)
+      a.h.latch.setFromConflict(a.alpha.key, conflictForPersona(a.alpha.key), { refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: LATCH_ROW_STATE_NO_ROW })
+      expect(a.h.latch.isLatched(a.alpha.key)).toBe(true)
+      return { a, release: none }
+    }
+    case 'cannot-launch': {
+      const a = makeAlpha(base)
+      a.h.heldOnInvalidFlags.add(a.alpha.key)
+      return { a, release: none }
+    }
+    case 'kill-failed': {
+      const a = makeAlpha(base)
+      a.h.killFailed.add(a.alpha.key)
+      return { a, release: none }
+    }
+    case 'not-answering': {
+      // Alpha's tmux-unresponsive condition started through E10's entry.
+      const a = makeAlpha(base)
+      expect(a.h.tmuxUnresponsive.start(a.alpha.key, 'resume', errTmuxUnresponsive('resume'))).toBe('started')
+      return { a, release: none }
+    }
+    case 'session-starting': {
+      // A restart's launch for alpha is in flight and held open: a launch running.
+      const launch = heldLaunch()
+      const a = makeAlpha({ ...base, launchSession: launch.launchSession })
+      scheduleRestart(a.alpha.key, a.sessionCwd)
+      await waitFor(() => a.h.launches.length === 1)
+      expect(a.h.launches).toHaveLength(1)
+      expect(a.h.isLaunchInFlight(a.alpha.key)).toBe(true)
+      return { a, release: launch.release }
+    }
+    case 'restarting': {
+      // A restart of alpha whose timer has not fired; restart.ts can launch again after.
+      const a = makeAlpha(base)
+      a.h.restartDelayS = NEVER_FIRE_RESTART_DELAY_S
+      scheduleRestart(a.alpha.key, a.sessionCwd)
+      a.h.restartDelayS = FAST_DELAY_S
+      expect(isRestartPendingOrActive(a.alpha.key)).toBe(true)
+      return { a, release: none }
     }
     case 'starting-now':
-      return { a: makeAlpha(base), release: () => {} }
+      return { a: makeAlpha(base), release: none }
     case 'auto-restart-disabled':
-      return { a: makeAlpha({ ...base, sessionRestartDelay: 0 }), release: () => {} }
+      return { a: makeAlpha({ ...base, sessionRestartDelay: 0 }), release: none }
     case 'restart-limit-reached': {
       const a = makeAlpha(base)
       for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(a.alpha.key)
-      return { a, release: () => {} }
+      return { a, release: none }
     }
   }
 }
@@ -262,26 +312,33 @@ async function arrangeState(state: LostMessageState, destination: Destination): 
 describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
   // -------------------------------------------------------------------------
   // Streamless, each recovery state × each destination kind: no
-  // notification(), no ack reaction, a launch only when starting now (keyed to
-  // the persona, not the source channel, in the session's cwd), and one
-  // lost-message notice at alpha's destination through alpha's client, with
-  // nothing in the source channel. The b.sjy instrumentation logs the
-  // dispatch line and the DROP line naming the session.
+  // notification(), no ack reaction, a restart asked for and a launch only
+  // when starting now (keyed to the persona, not the source channel, in the
+  // session's cwd), and one lost-message notice at alpha's destination
+  // through alpha's client, with nothing in the source channel. The b.sjy
+  // instrumentation logs the dispatch line and the DROP line naming the
+  // session.
   // -------------------------------------------------------------------------
-  const STATES: readonly [LostMessageState, boolean, number][] = [
-    // state, restart pending or active after the message, launches after it
-    ['not-up', false, 0], // b.g57: nothing scheduled for a persona that is not up
-    ['restarting', true, 1], // the in-flight launch only; none stacked
-    ['starting-now', true, 1],
-    ['auto-restart-disabled', false, 0],
-    ['restart-limit-reached', false, 0],
-  ]
+  /** Per state: restart pending or active after the message, and launches after it. */
+  const EXPECTED: Record<LostMessageState, { pending: boolean; launches: number }> = {
+    'not-up': { pending: false, launches: 0 }, // b.g57: nothing scheduled for a persona that is not up
+    'held-for-human': { pending: false, launches: 0 },
+    'cannot-launch': { pending: false, launches: 0 },
+    'kill-failed': { pending: false, launches: 0 },
+    'not-answering': { pending: false, launches: 0 },
+    'session-starting': { pending: true, launches: 1 }, // the held launch only; none stacked
+    'restarting': { pending: true, launches: 0 }, // the timer armed before, not fired
+    'starting-now': { pending: true, launches: 1 },
+    'auto-restart-disabled': { pending: false, launches: 0 },
+    'restart-limit-reached': { pending: false, launches: 0 },
+  }
   const DESTINATIONS: readonly Destination[] = ['channel', 'dm']
-  const ROWS = DESTINATIONS.flatMap((d) => STATES.map(([s, pending, launches]) => [s, d, pending, launches] as const))
+  const ROWS = DESTINATIONS.flatMap((d) => LOST_MESSAGE_STATES.map((s) => [s, d, EXPECTED[s].pending, EXPECTED[s].launches] as const))
 
   test.each(ROWS)('b.9cj streamless %s, %s destination: no notification(), its recovery, one destination notice, nothing in the source channel', async (state, destination, pending, launches) => {
     const { a, release } = await arrangeState(state, destination)
     const event = alphaMessage()
+    const asksBefore = a.h.restartAsks.length
 
     const notifications = await dispatchToAlpha(a, event)
 
@@ -289,6 +346,8 @@ describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
     // No ack reaction and no ack-tracker entry for a lost message, under
     // alpha's key (the reaction itself is checked in expectOneLostNotice).
     expect(consumeAck(a.alpha.key, ALPHA_SECOND, event.ts as string)).toBe(false)
+    // Only starting now asks the relaunch gate for a restart (AC 68).
+    expect(a.h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [a.alpha.key] : [])
     expect(isRestartPendingOrActive(a.alpha.key)).toBe(pending)
     // Never keyed by the source channel (mis-keying regression).
     expect(isRestartPendingOrActive(ALPHA_SECOND)).toBe(false)
@@ -310,29 +369,34 @@ describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Restarting and starting now are reported differently. The first message
-  // starts a restart (starting now) whose launch is held open; the second
-  // finds it under way (restarting). Two notices, same sender, different text.
+  // Starting now and session starting are reported differently. The first
+  // message starts a restart (starting now) whose launch is held open; the
+  // second finds that launch running, so P's row reads `pending` (b.jg5
+  // SRJ-1011 state 6): session starting, never starting now, and no second
+  // launch. Two notices, same sender, different text.
   // -------------------------------------------------------------------------
-  test('b.9cj streamless: "starting now" and "restarting" give different notices', async () => {
-    let launchResolve!: (ok: boolean) => void
-    const held = new Promise<boolean>((res) => { launchResolve = res })
-    const a = makeAlpha({ hasGetStream: false, restartDelayS: FAST_DELAY_S, launchSession: () => held })
+  test('b.9cj streamless: "starting now", then, while its launch is held, "session starting": different notices and one launch', async () => {
+    const launch = heldLaunch()
+    const a = makeAlpha({ hasGetStream: false, restartDelayS: FAST_DELAY_S, launchSession: launch.launchSession })
 
     await dispatchToAlpha(a)
+    await waitFor(() => a.h.launches.length > 0)
+    expect(a.h.isLaunchInFlight(a.alpha.key)).toBe(true)
+    const asksBefore = a.h.restartAsks.length
     await a.h.receive(makeChannelMessage({ channel: ALPHA_SECOND, user: SENDER_ID, text: MESSAGE_TEXT }), ['alpha'])
 
     const posts = a.h.allPosts()
     expect(posts.map((p) => p.channel)).toEqual([ALPHA_FIRST, ALPHA_FIRST])
     const [first, second] = posts.map((p) => p.text!) as [string, string]
     expect(stateOf(first)).toBe('starting-now')
-    expect(stateOf(second)).toBe('restarting')
+    expect(stateOf(second)).toBe('session-starting')
     expect(first).not.toBe(second)
     for (const text of [first, second]) expect(text).toContain(SENDER_NAME)
-    await waitFor(() => a.h.launches.length > 0)
-    expect(a.h.launches).toHaveLength(1)
+    expect(a.h.restartAsks.slice(asksBefore)).toEqual([])
+    await Bun.sleep(WAIT_MS)
+    expect(a.h.launches).toEqual([{ key: a.alpha.key, cwd: a.sessionCwd }])
 
-    launchResolve(true)
+    launch.release()
     await Bun.sleep(1)
   })
 

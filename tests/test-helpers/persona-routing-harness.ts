@@ -19,9 +19,11 @@
  * - the real restart and backoff state, with `initRestart` given
  *   `makeRestartDeps`: every liveness probe answers the `dead` reading
  *   (`LIVENESS_READING_DEAD`, src/liveness-reading.ts), launches are recorded in
- *   `h.launches`, and the restart delay is read from `h.restartDelayS` at call
- *   time. `launchSession` replaces the launch outcome (hold a launch open to
- *   keep the persona in flight);
+ *   `h.launches`, every relaunch-gate ask (`canRestart`, made when a restart
+ *   is scheduled and when its timer fires) in `h.restartAsks`, and the restart
+ *   delay is read from `h.restartDelayS` at call time. `launchSession`
+ *   replaces the launch outcome (hold a launch open to keep the persona in
+ *   flight: it then reads as a launch running);
  * - the real persona notifier as the injected `notify`, built by
  *   `makeNotifierStack` (tests/test-helpers/persona-notifier.ts) over the
  *   same `clientFor` and stubs and the applied config (`h.config`, read at
@@ -40,6 +42,37 @@
  *   replaces it;
  * - the up predicate (`isPersonaUp`), only when the caller passes one, so by
  *   default every persona counts as up;
+ * - the lost-message state inputs (b.jg5 SRJ-1011), each composed as `main()`
+ *   binds it and asked with the persona key at call time:
+ *   - latched (`held-for-human`): `h.latch`, one real latch instance built by
+ *     E13's factory (`createConflictLatch`) bare, with no set observer, so a
+ *     set (`h.latch.set`, `h.latch.setFromConflict`) logs one line to
+ *     `h.logs` and posts nothing; `h.latch.forget(key)` is its silent drop.
+ *     The restart deps are not given the latch, so the routing's own rule
+ *     (only `starting-now` restarts) is what keeps a latched persona's
+ *     message from restarting it;
+ *   - not answering (`not-answering`): `h.tmuxUnresponsive`, E10's real
+ *     condition over `h.episodes`, one real episodes instance on its own fake
+ *     clock (`h.episodesClock`), whose sink records into `h.episodeNotices`,
+ *     never a Slack stub. The condition is built with no alert threshold, so
+ *     it arms no timer. The routing asks its `holds`; P's `tmux-unavailable`
+ *     and `ad-config-malformed` flags are read by the routing itself from the
+ *     real outage state. With the `outageState` option the harness installs
+ *     that state (`initOutageState`) with a recording sink (`h.outageNotices`),
+ *     never a Slack stub, so `raiseTmuxUnavailable`, `raiseAdConfigMalformed`,
+ *     `setOutageFlag` and `clearOutageFlag` work and their notices are not
+ *     posts; without it a raise does nothing. An unclassified-error episode
+ *     opened in `h.episodes` is not an input (SRJ-1011);
+ *   - a launch running (`session-starting`): by default, whether one of the
+ *     harness's own restart launches is in flight for the key
+ *     (`h.isLaunchInFlight`), as production binds `isLaunchInFlight`, so a
+ *     restart launch held open (`launchSession`) reads as a launch running;
+ *     the `isLaunchOrApproverRunning` option replaces it;
+ *   - held on `ErrInvalidFlags` (`cannot-launch`), kill failed
+ *     (`kill-failed`) and a live-row sequence or old-life wait step running
+ *     (`restarting`): the key sets `h.heldOnInvalidFlags`, `h.killFailed`
+ *     and `h.sequenceOrWaitRunning` (seeded by the options of the same names,
+ *     with persona names), which production leaves unbound;
  * - the server-wide reply settings source (`getReplySettings`, as src/server.ts
  *   passes its start-time settings): it returns the `ackReaction` option and
  *   the default chunking, so by default there is no ack reaction and a
@@ -58,8 +91,9 @@
  * per-persona dedupe stores; `dedupeClock` injects their clock (default
  * `Date.now`).
  *
- * The harness calls `initRestart` and registers sessions; reset the registry,
- * restart, backoff and ack-tracker state between tests with
+ * The harness calls `initRestart` (and, with `outageState`,
+ * `initOutageState`) and registers sessions; reset the registry, restart,
+ * backoff, ack-tracker and outage state between tests with
  * `resetRoutingState()`. A case that can hold a notice (a failing destination)
  * calls `h.hold.cancelAll()` in teardown; the hold's timers are on
  * `h.holdClock`, so nothing fires unless the test moves it.
@@ -83,7 +117,15 @@ import { replySettingsOf, type Persona, type PersonaConfig, type ReplySettings }
 import { createPersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
-import type { LostMessageState } from '../../src/lost-message.ts'
+import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
+import { createConflictLatch, type ConflictLatch } from '../../src/conflict-latch.ts'
+import {
+  createPersonaEpisodes,
+  createTmuxUnresponsiveCondition,
+  type PersonaEpisodes,
+  type TmuxUnresponsiveCondition,
+} from '../../src/persona-episodes.ts'
+import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
 import { createSessionServer, registerSession, _resetRegistry, type SessionEntry, type SessionToolDeps } from '../../src/registry.ts'
 import { initRestart, _resetRestartState, type RestartDeps } from '../../src/restart.ts'
 import { LIVENESS_READING_DEAD } from '../../src/liveness-reading.ts'
@@ -99,7 +141,7 @@ import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
 import { makeStubSlack, type StubSlack, type StubSlackOptions } from './slack-stub.ts'
 import { makePersonaClients, posts, type PersonaClients } from './permission-relay-harness.ts'
 import { LEAK_SENTINEL, sentinelInMessage } from './credentials.ts'
-import type { FakeClock } from './fake-clock.ts'
+import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 
 /** Default restart delay (seconds): the restart timer fires within a few ms. */
@@ -113,32 +155,19 @@ export const NEVER_FIRE_RESTART_DELAY_S = 9999
 // ---------------------------------------------------------------------------
 
 /**
- * The five recovery states a lost-message notice reports (b.av2 SR-7.3;
- * `not-up` from bug b.g57), in decision order.
+ * Every recovery state a lost-message notice reports, in SRJ-1011's order:
+ * the list `src/lost-message.ts` exports, re-exported, never a copy.
  */
-export const LOST_MESSAGE_STATES: readonly LostMessageState[] = [
-  'not-up',
-  'restarting',
-  'starting-now',
-  'auto-restart-disabled',
-  'restart-limit-reached',
-]
+export { LOST_MESSAGE_STATES }
 
 /**
- * The phrase that identifies each recovery state in a notice, so a state is
- * told apart by its text and not only by equality with the builder's output.
+ * The one recovery state a notice text identifies: the state whose exported
+ * wording (`STATE_WORDING`) the text contains, or `none` / `several`. Whole
+ * wordings are matched, so `session-starting`'s wording is never taken for
+ * `starting-now`'s, whose opening words it shares.
  */
-export const LOST_STATE_PHRASES: Readonly<Record<LostMessageState, RegExp>> = {
-  'not-up': /\bnot up\b/i,
-  'restarting': /\brestarting\b/i,
-  'starting-now': /\bstarting now\b/i,
-  'auto-restart-disabled': /\bauto-restart disabled\b/i,
-  'restart-limit-reached': /\brestart limit reached\b/i,
-}
-
-/** The one recovery state a notice text identifies, or `none` / `several`. */
 export function stateOf(text: string | undefined): LostMessageState | 'none' | 'several' {
-  const found = LOST_MESSAGE_STATES.filter((s) => LOST_STATE_PHRASES[s].test(text ?? ''))
+  const found = LOST_MESSAGE_STATES.filter((s) => (text ?? '').includes(STATE_WORDING[s]))
   return found.length === 1 ? found[0]! : found.length === 0 ? 'none' : 'several'
 }
 
@@ -229,13 +258,34 @@ export interface RestartFakeOptions {
   launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<boolean>
 }
 
-/** Restart deps whose session always reads `dead` and whose launches are recorded in `launches`. */
-export function makeRestartDeps(opts: RestartFakeOptions = {}): RestartDeps & { launches: LaunchCall[] } {
+/** What `makeRestartDeps` adds to the restart deps: its captures and its in-flight query. */
+export interface RestartFakeCaptures {
+  /** Every launch issued, in order. */
+  launches: LaunchCall[]
+  /** Every key the relaunch gate (`canRestart`) was asked about, in order. */
+  restartAsks: string[]
+  /** Whether a launch for `key` has been issued and has not settled (production: `isLaunchInFlight`). */
+  isLaunchInFlight(key: string): boolean
+}
+
+/**
+ * Restart deps whose session always reads `dead`, whose launches are recorded
+ * in `launches` (and counted in flight until their outcome settles) and whose
+ * relaunch-gate asks are recorded in `restartAsks`.
+ */
+export function makeRestartDeps(opts: RestartFakeOptions = {}): RestartDeps & RestartFakeCaptures {
   const launches: LaunchCall[] = []
+  const restartAsks: string[] = []
+  const inFlight = new Map<string, number>()
   const delay = opts.restartDelayS ?? FAST_RESTART_DELAY_S
   return {
     launches,
-    canRestart: () => true,
+    restartAsks,
+    isLaunchInFlight: (key) => (inFlight.get(key) ?? 0) > 0,
+    canRestart: (key) => {
+      restartAsks.push(key)
+      return true
+    },
     isSessionAlive: async () => LIVENESS_READING_DEAD,
     isSessionConnected: () => false,
     hasSessionStream: () => false,
@@ -243,7 +293,14 @@ export function makeRestartDeps(opts: RestartFakeOptions = {}): RestartDeps & { 
     killSession: async () => {},
     launchSession: async (key, cwd, sessionId) => {
       launches.push(sessionId === undefined ? { key, cwd } : { key, cwd, sessionId })
-      return opts.launchSession ? opts.launchSession(key, cwd, sessionId) : true
+      inFlight.set(key, (inFlight.get(key) ?? 0) + 1)
+      try {
+        return opts.launchSession ? await opts.launchSession(key, cwd, sessionId) : true
+      } finally {
+        const left = (inFlight.get(key) ?? 1) - 1
+        if (left > 0) inFlight.set(key, left)
+        else inFlight.delete(key)
+      }
     },
     getRestartDelay: () => (typeof delay === 'function' ? delay() : delay),
     isShuttingDown: () => false,
@@ -296,6 +353,24 @@ export interface RoutingHarnessOptions {
   notify?: PersonaRoutingDeps['notify']
   /** The routing's up predicate (b.av2 SR-6.4, bug b.g57); absent, as by default, every persona counts as up. */
   isPersonaUp?: PersonaRoutingDeps['isPersonaUp']
+  /**
+   * Install the real outage state (`initOutageState`) with a recording sink
+   * (`h.outageNotices`) and no agent-director client, so a raise or clear
+   * works and its notice is not a Slack post. Default off: no outage state is
+   * installed, and a raise does nothing. `resetRoutingState()` removes it.
+   */
+  outageState?: boolean
+  /**
+   * Replaces the routing's launch-running query (b.jg5 SRJ-1011 state 6);
+   * default `h.isLaunchInFlight`, the harness's own restart launches in flight.
+   */
+  isLaunchOrApproverRunning?: PersonaRoutingDeps['isLaunchOrApproverRunning']
+  /** Names first held on `ErrInvalidFlags` (`h.heldOnInvalidFlags`, `cannot-launch`). */
+  heldOnInvalidFlags?: readonly string[]
+  /** Names whose kill failed first (`h.killFailed`, `kill-failed`). */
+  killFailed?: readonly string[]
+  /** Names with a live-row sequence or old-life wait step running first (`h.sequenceOrWaitRunning`, `restarting`). */
+  sequenceOrWaitRunning?: readonly string[]
 }
 
 /** One notice the routing raised: the persona key and the body, without the notifier's persona prefix. */
@@ -324,6 +399,28 @@ export interface RoutingHarness {
   order: string[]
   /** Launches the restart module issued. */
   launches: LaunchCall[]
+  /** Every key the restart module's relaunch gate (`canRestart`) was asked about: one per restart scheduled and one per timer fire. */
+  restartAsks: string[]
+  /** Whether one of the harness's restart launches for `key` is in flight (issued, outcome not settled). */
+  isLaunchInFlight(key: string): boolean
+  /** The latch the routing's latched query reads: E13's factory, bare (no set observer, so a set posts nothing). */
+  latch: ConflictLatch
+  /** The episodes instance on `episodesClock`; its sink records into `episodeNotices`, never a Slack stub. */
+  episodes: PersonaEpisodes
+  /** The fake clock the episodes run on. */
+  episodesClock: FakeClock
+  /** Every notice `episodes` handed to its sink (the condition's onset, alert or recovery), in order. */
+  episodeNotices: RaisedNotice[]
+  /** E10's `tmux-unresponsive` condition over `episodes`; the routing asks its `holds`. No alert threshold, so no timer. */
+  tmuxUnresponsive: TmuxUnresponsiveCondition
+  /** Every onset or all-clear the outage state emitted (with the `outageState` option), in order; never a Slack post. */
+  outageNotices: RaisedNotice[]
+  /** Keys held on `ErrInvalidFlags` (`cannot-launch`), read at call time. */
+  heldOnInvalidFlags: Set<string>
+  /** Keys whose kill failed (`kill-failed`), read at call time. */
+  killFailed: Set<string>
+  /** Keys with a live-row sequence or old-life wait step running (`restarting`), read at call time. */
+  sequenceOrWaitRunning: Set<string>
   /** Restart delay (seconds) the restart deps report, read at call time. */
   restartDelayS: number
   /** Archive writes started through the seam. */
@@ -419,6 +516,29 @@ export function makeRoutingHarness(
 
   const restartDeps = makeRestartDeps({ restartDelayS: () => h.restartDelayS, launchSession: opts.launchSession })
 
+  // The lost-message state inputs (b.jg5 SRJ-1011), as main() builds them:
+  // one latch, bare; one episodes instance on its own fake clock with the
+  // condition over it (no alert threshold, so no timer); the outage state
+  // only with `outageState`. Every sink records apart from the Slack stubs.
+  // (`h` is read only when they are called.)
+  const latch = createConflictLatch({ log: (line) => { h.logs.push(line) } })
+  const episodesClock = createFakeClock()
+  const episodes = createPersonaEpisodes({
+    sink: (key, text) => { h.episodeNotices.push({ key, text }) },
+    log: (line) => { h.logs.push(line) },
+    clock: episodesClock,
+  })
+  const tmuxUnresponsive = createTmuxUnresponsiveCondition({ episodes, log: (line) => { h.logs.push(line) } })
+  if (opts.outageState === true) {
+    _resetOutageState()
+    initOutageState({
+      notify: (key, text) => { h.outageNotices.push({ key, text }) },
+      getClient: () => { throw new Error('the routing harness has no agent-director client') },
+    })
+  }
+  const keySet = (names: readonly string[] | undefined): Set<string> =>
+    new Set((names ?? []).map((n) => byName(n).persona.key))
+
   // The notifier and its hold, as server.ts builds them: the applied persona
   // read at call time, the same client lookup as the routing, one log. (`h`
   // is read only when they are called.)
@@ -470,6 +590,17 @@ export function makeRoutingHarness(
     logs: [],
     order: [],
     launches: restartDeps.launches,
+    restartAsks: restartDeps.restartAsks,
+    isLaunchInFlight: restartDeps.isLaunchInFlight,
+    latch,
+    episodes,
+    episodesClock,
+    episodeNotices: [],
+    tmuxUnresponsive,
+    outageNotices: [],
+    heldOnInvalidFlags: keySet(opts.heldOnInvalidFlags),
+    killFailed: keySet(opts.killFailed),
+    sequenceOrWaitRunning: keySet(opts.sequenceOrWaitRunning),
     restartDelayS: opts.restartDelayS ?? FAST_RESTART_DELAY_S,
     archiveWrites: [],
     receive: (event, names, ack) => routing.receive(
@@ -500,6 +631,8 @@ export function makeRoutingHarness(
       notifications: [...handles.map((x) => x.notifications), ...extraNotifications],
       posts: h.allPosts(),
       notices: h.notices,
+      episodeNotices: h.episodeNotices,
+      outageNotices: h.outageNotices,
     }),
   }
 
@@ -534,18 +667,31 @@ export function makeRoutingHarness(
     log,
     dedupeClock: opts.dedupeClock,
     isPersonaUp: opts.isPersonaUp,
+    // As main() binds them, each asked with the persona key at call time.
+    isLatched: (key) => h.latch.isLatched(key),
+    isTmuxUnresponsive: (key) => h.tmuxUnresponsive.holds(key),
+    isLaunchOrApproverRunning: opts.isLaunchOrApproverRunning ?? ((key) => h.isLaunchInFlight(key)),
+    // Unbound in production until their Epics bind them.
+    isHeldOnInvalidFlags: (key) => h.heldOnInvalidFlags.has(key),
+    isKillFailed: (key) => h.killFailed.has(key),
+    isSequenceOrWaitRunning: (key) => h.sequenceOrWaitRunning.has(key),
   })
 
   initRestart(restartDeps)
   return h
 }
 
-/** Reset the registry, restart (timers cancelled), backoff and ack-tracker state the harness drives. */
+/**
+ * Reset the registry, restart (timers cancelled), backoff, ack-tracker and
+ * outage state the harness drives: afterwards no outage flag is raised and no
+ * outage state is installed.
+ */
 export function resetRoutingState(): void {
   _resetRestartState()
   _resetRegistry()
   _resetBackoffState()
   _resetAckTracker()
+  _resetOutageState()
 }
 
 /** Poll `cond` every 5 ms for at most `ms` (the fast restart timer fires within this). */

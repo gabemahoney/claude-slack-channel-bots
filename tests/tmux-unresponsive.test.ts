@@ -22,6 +22,13 @@
  *   tick's end; a read's success does not. Ends are idempotent, and each end
  *   of a holding condition reaches the retry timer's condition-end entry once.
  * - Isolation: the other persona's condition, ends and notices are untouched.
+ * - A lost message (SRJ-1011), through the harness's lost-message driver (the
+ *   real routing bound as `main()` binds it): while P's condition holds it
+ *   reports `not-answering` with no restart and no call, B's reports its own
+ *   state, and after a tmux-touching success ends the condition it does not;
+ *   after `ErrTmuxKillFailed`, which starts no condition, it never does. The
+ *   states are identified by `stateOf` and the wording is the exported
+ *   `STATE_WORDING`.
  *
  * The cases above reach no onset (no health tick, no retry past the floor, no
  * alert threshold), so each asserts that nothing is posted yet. The notice
@@ -100,6 +107,7 @@ import { doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '.
 import type { Persona } from '../src/config.ts'
 import { _resetHealthCheckState, initHealthCheck, startHealthCheck, stopHealthCheck, type HealthCheckDeps } from '../src/health-check.ts'
 import { LIVENESS_LIVE, LIVENESS_READING_DEAD, LIVENESS_READING_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
+import { STATE_WORDING, type LostMessageState } from '../src/lost-message.ts'
 import {
   ALL_CLEAR_TEMPLATE,
   getOutageFlags,
@@ -319,7 +327,7 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNoPostYet(h)
   })
 
-  test('ErrTmuxKillFailed from the replacement kill of a row read live starts nothing and posts nothing (the kill-failure cause only)', async () => {
+  test('ErrTmuxKillFailed from the replacement kill of a row read live starts nothing and posts nothing (the kill-failure cause only); a message lost after it never reports not answering (SRJ-1011)', async () => {
     const { h, p, b } = build()
     h.script({ ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }), killError: errTmuxKillFailed() })
 
@@ -330,6 +338,13 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNeverStarted(h, p)
     expectNeverStarted(h, b)
     expectNoPostYet(h)
+
+    // No condition, no outage: not state 5. State 4 (kill failed) has no
+    // binding yet, so the state that applies at the delay 0 is
+    // auto-restart disabled.
+    expect(getOutageFlags(p).size).toBe(0)
+    await expectLostMessageReports(h, p, 'auto-restart-disabled')
+    expectNeverStarted(h, p)
   })
 
   test.each<[string, string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript]>([
@@ -1839,5 +1854,47 @@ describe('tmux-unresponsive: a CONFLICT ends it silently (SRJ-310, SRJ-502)', ()
     expect(h.notices).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     expectNeverStarted(h, b)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A lost message reads the holds query (b.jg5 SRJ-1011, SRJ-307; AC 68),
+// through the recovery harness's driver: the real routing's no-session
+// branch, bound as `main()` binds it, both settings 0
+// ---------------------------------------------------------------------------
+
+/**
+ * Lose one message for persona `key` through the driver: it reports `state`
+ * with its exported wording, asks the restart module for no restart, leaves
+ * none pending and makes no agent-director call.
+ */
+async function expectLostMessageReports(h: RecoveryHarness, key: string, state: LostMessageState): Promise<void> {
+  expect([key, await h.loseMessage(key)]).toEqual([key, {
+    state,
+    notice: expect.stringContaining(STATE_WORDING[state]),
+    restartRequested: false,
+    restartPending: false,
+    calls: {},
+  }])
+}
+
+describe('tmux-unresponsive: a lost message reads the holds query (SRJ-1011, SRJ-307)', () => {
+  test('a launch’s spawn refused ErrTmuxUnresponsive starts P’s condition: a message lost while it holds reports not answering, with no restart and no call, and B’s reports its own state; once a tmux-touching success ends it, the next lost message reports auto-restart disabled', async () => {
+    const { h, p, b } = build()
+    await refuse(h, p)
+    // The condition alone: no outage flag is raised beside it.
+    expect(getOutageFlags(p).size).toBe(0)
+
+    await expectLostMessageReports(h, p, 'not-answering')
+    await expectLostMessageReports(h, b, 'auto-restart-disabled')
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+
+    await wrapped(p, 'read-pane', RESOLVES)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(h.conditionEnds).toEqual([{ key: p, reading: undefined, result: 'stopped' }])
+
+    await expectLostMessageReports(h, p, 'auto-restart-disabled')
+    expectNeverStarted(h, b)
+    expectNoPostYet(h)
   })
 })

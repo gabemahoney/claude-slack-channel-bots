@@ -44,15 +44,19 @@
  *    its bot ID. The meta also carries the author's
  *    `user_id` (or, for an author without `user`, its `bot_id`; never both)
  *    and `via`, how the message reached P (b.av2 SR-4.4).
- * 6. Lost message (b.av2 SR-4.6, SR-7.3): when P has no live session, or its
- *    session has lost its GET stream, the message is dropped with no ack
- *    reaction or ack-tracker entry, a human-triggered restart of P is
- *    scheduled only in the "starting now" state (`src/lost-message.ts`
- *    decides the state from whether P is up and the restart guards; a P that
- *    is not up is never restarted from here), and one lost-message notice
- *    naming the sender and the state goes to P's destination through the
- *    injected `notify`. Nothing is posted in the source conversation, and the
- *    message text is never in the notice.
+ * 6. Lost message (b.av2 SR-4.6, SR-7.3; b.jg5 SRJ-1011, SRJ-1509): when P
+ *    has no live session, or its session has lost its GET stream, the
+ *    message is dropped with no ack reaction or ack-tracker entry, a
+ *    human-triggered restart of P is scheduled only in the "starting now"
+ *    state, and one lost-message notice naming the sender and the state goes
+ *    to P's destination through the injected `notify`. `src/lost-message.ts`
+ *    decides the state, the first that applies, from whether P is up, whether
+ *    P is latched (held for a human), whether P is not answering (its
+ *    `tmux-unresponsive` condition holds, or its `tmux-unavailable` or
+ *    `ad-config-malformed` outage is raised), whether a launch for P is
+ *    running (starting), and the restart guards. A P in any state but
+ *    "starting now" is never restarted from here. Nothing is posted in the
+ *    source conversation, and the message text is never in the notice.
  *
  * The ack reaction's name comes from the server-wide `ack_reaction` setting
  * (b.av2 SR-1.6); with it absent, no persona reacts or records an entry.
@@ -61,10 +65,11 @@
  * client, reads no token, file or environment variable, starts no timer and
  * logs nothing. Every Slack client, the persona config, the bot identity, the
  * name resolver, the archive writer, the ack-reaction source, the notice sink,
- * the logger and (optionally) the dedupe clock and the up predicate are
- * injected through `createPersonaRouting`. The session lookup comes from
- * the registry and the restart guards from the restart and backoff modules,
- * so tests drive their real state. This module never calls agent-director.
+ * the logger and (optionally) the dedupe clock, the up predicate and the
+ * lost-message state inputs are injected through `createPersonaRouting`. The
+ * session lookup comes from the registry, the restart guards from the restart
+ * and backoff modules and the outage flags from the outage state, so tests
+ * drive their real state. This module never calls agent-director.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -91,7 +96,8 @@ import { getSessionByPersona } from './registry.ts'
 import { isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from './restart.ts'
 import { isAtCap } from './backoff.ts'
 import { trackAck } from './ack-tracker.ts'
-import { buildLostMessageNotice, decideLostMessageState } from './lost-message.ts'
+import { buildLostMessageNotice, decideLostMessageState, firesHumanTriggeredRestart } from './lost-message.ts'
+import { getOutageFlags } from './outage-state.ts'
 import type { PersonaNotify } from './persona-notifier.ts'
 
 // ---------------------------------------------------------------------------
@@ -165,6 +171,41 @@ export interface PersonaRoutingDeps {
    * `not-up` recovery state. Without it every persona counts as up.
    */
   isPersonaUp?(key: string): boolean
+  // The lost-message state inputs (b.jg5 SRJ-1011), each asked for a lost
+  // message only, with P's key at that time. An absent member answers false.
+  /**
+   * Whether persona P is latched (b.jg5 SRJ-502; production: the server's one
+   * latch's `isLatched`, which covers every declared case): a message lost
+   * while it is latched reports `held-for-human`.
+   */
+  isLatched?(key: string): boolean
+  /**
+   * Whether persona P's `tmux-unresponsive` condition holds (b.jg5 SRJ-307;
+   * production: the condition's `holds`): a message lost while it holds
+   * reports `not-answering`, as does one lost while P's `tmux-unavailable` or
+   * `ad-config-malformed` outage is raised (read from the outage state).
+   */
+  isTmuxUnresponsive?(key: string): boolean
+  /**
+   * Whether a launch or dialog approver for persona P is running, so its row
+   * reads `pending` (production: the session manager's `isLaunchInFlight`,
+   * whose launch call awaits the approver): a message lost then reports
+   * `session-starting`, unless an earlier state applies.
+   */
+  isLaunchOrApproverRunning?(key: string): boolean
+  /** Whether persona P is held on `ErrInvalidFlags`: reports `cannot-launch`. */
+  isHeldOnInvalidFlags?(key: string): boolean
+  /**
+   * Whether persona P's kill-failure episode is open, or P waits on an
+   * old-life hold whose old key's kill failed: reports `kill-failed`.
+   */
+  isKillFailed?(key: string): boolean
+  /**
+   * Whether a live-row sequence or old-life wait step is running for persona
+   * P: reports `restarting`, after states 1 to 5 and before
+   * `session-starting`.
+   */
+  isSequenceOrWaitRunning?(key: string): boolean
 }
 
 /** A persona-routing instance. */
@@ -410,17 +451,23 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * b.av2 SR-4.6, SR-7.3: the message is lost. Decide the recovery state from
-   * whether P is up (`isPersonaUp`: a persona that is not up, such as one
-   * that stopped being up while this message was being handled, is launched
-   * by its own recovery, never restarted from here) and P's real restart
-   * guards
-   * (pending, auto-restart disabled, cap), schedule a human-triggered restart
-   * of P in `cwd` only when the state is `starting-now`, and raise one
-   * lost-message notice naming `senderLabel` and the state at P's
-   * destination. Nothing is posted in the source conversation. The notice is
-   * awaited so it is issued before dispatch returns; a failing sink is
-   * logged, never thrown.
+   * b.av2 SR-4.6, SR-7.3; b.jg5 SRJ-1011: the message is lost. Decide the
+   * recovery state, the first that applies, from: whether P is up
+   * (`isPersonaUp`: a persona that is not up, such as one that stopped being
+   * up while this message was being handled, is launched by its own
+   * recovery, never restarted from here); whether P is latched (`isLatched`,
+   * `held-for-human`); whether P is not answering (`not-answering`: its
+   * `tmux-unresponsive` condition holds, or its `tmux-unavailable` or
+   * `ad-config-malformed` outage flag is raised; an unclassified-error
+   * episode is not consulted); whether a launch for P is running
+   * (`isLaunchOrApproverRunning`, `session-starting`); and P's real restart
+   * guards (pending, auto-restart disabled, cap). The held-on-invalid-flags,
+   * kill-failed and sequence/wait members are asked too, when supplied.
+   * Schedule a human-triggered restart of P in `cwd` only when the
+   * state is `starting-now`, and raise one lost-message notice naming
+   * `senderLabel` and the state at P's destination. Nothing is posted in the
+   * source conversation. The notice is awaited so it is issued before
+   * dispatch returns; a failing sink is logged, never thrown.
    */
   async function handleLostMessage(
     persona: Persona,
@@ -428,13 +475,20 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     senderLabel: string,
     config: PersonaRoutingConfig,
   ): Promise<void> {
+    const key = persona.key
     const state = decideLostMessageState({
-      isNotUp: () => deps.isPersonaUp?.(persona.key) === false,
-      isRestartPending: () => isRestartPendingOrActive(persona.key),
+      isNotUp: () => deps.isPersonaUp?.(key) === false,
+      isLatched: () => deps.isLatched?.(key) === true,
+      isHeldOnInvalidFlags: () => deps.isHeldOnInvalidFlags?.(key) === true,
+      isKillFailed: () => deps.isKillFailed?.(key) === true,
+      isNotAnswering: () => isNotAnswering(key),
+      isSequenceOrWaitRunning: () => deps.isSequenceOrWaitRunning?.(key) === true,
+      isRowPending: () => deps.isLaunchOrApproverRunning?.(key) === true,
+      isRestartPending: () => isRestartPendingOrActive(key),
       isAutoRestartDisabled: () => config.session_restart_delay === 0,
-      isAtRestartLimit: () => isAtCap(persona.key, RESTART_FAILURE_CAP),
+      isAtRestartLimit: () => isAtCap(key, RESTART_FAILURE_CAP),
     })
-    if (state === 'starting-now') scheduleRestart(persona.key, cwd, undefined, { humanTrigger: true })
+    if (firesHumanTriggeredRestart(state)) scheduleRestart(key, cwd, undefined, { humanTrigger: true })
     try {
       await deps.notify(persona.key, buildLostMessageNotice(senderLabel, state))
     } catch (err) {
@@ -443,6 +497,18 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
         `failed: ${describeThrownValue(err)}`,
       )
     }
+  }
+
+  /**
+   * b.jg5 SRJ-1011 state 5: persona `key`'s `tmux-unresponsive` condition
+   * holds, or its `tmux-unavailable` or `ad-config-malformed` outage flag is
+   * raised (b.jg5 SRJ-311, SRJ-316). No other outage class and no
+   * unclassified-error episode counts.
+   */
+  function isNotAnswering(key: string): boolean {
+    if (deps.isTmuxUnresponsive?.(key) === true) return true
+    const flags = getOutageFlags(key)
+    return flags.has('tmux-unavailable') || flags.has('ad-config-malformed')
   }
 
   return {

@@ -91,6 +91,15 @@
  * the bare controller (its one line, then the stop line), and the restart
  * work's query on the harness, each with no call and the other persona's
  * retry untouched.
+ * A lost message (b.jg5 SRJ-1011, SRJ-311, SRJ-316, AC 36, AC 68) runs on the
+ * harness with both settings 0, through its lost-message driver (the real
+ * routing's no-session branch, bound as `main()` binds it): while P's
+ * `tmux-unavailable` (ENVIRONMENT) or `ad-config-malformed` (CONFIG) outage
+ * from its bring-up is raised, it reports `not-answering` with the exported
+ * wording, asks for no restart and makes no call, and the other persona's
+ * reports its own state; once calls succeed and the outage clears it reports
+ * `auto-restart-disabled`. An UNCLASSIFIED answer on the attempt's row reads,
+ * P's unclassified-error episode open, never gives `not-answering`.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -118,6 +127,7 @@ import {
 } from '../src/conflict-latch.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
 import { LIVENESS_LIVE, LIVENESS_PENDING, LIVENESS_READING_UNKNOWN, type PendingLivenessReading } from '../src/liveness-reading.ts'
+import { STATE_WORDING, type LostMessageState } from '../src/lost-message.ts'
 import {
   adConfigMalformedOnset,
   ALL_CLEAR_TEMPLATE,
@@ -6109,5 +6119,87 @@ describe('unavailable retry: a restart work whose latched query throws stops the
     expect(personaCallCounts(h, other)).not.toEqual({})
     expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
     expect(personaCallCounts(h, key)).toEqual({})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A lost message (b.jg5 SRJ-1011, SRJ-311, SRJ-316; AC 36, AC 68) through the
+// recovery harness's driver: the real routing's no-session branch, bound as
+// `main()` binds it, both settings 0. State 5 comes before
+// `auto-restart-disabled`, so the delay 0 also checks the order.
+// ---------------------------------------------------------------------------
+
+/**
+ * Lose one message for persona `key` through the driver: it reports `state`
+ * with its exported wording, asks the restart module for no restart, leaves
+ * none pending and makes no agent-director call.
+ */
+async function expectLostMessageReports(h: RecoveryHarness, key: string, state: LostMessageState): Promise<void> {
+  expect([key, await h.loseMessage(key)]).toEqual([key, {
+    state,
+    notice: expect.stringContaining(STATE_WORDING[state]),
+    restartRequested: false,
+    restartPending: false,
+    calls: {},
+  }])
+}
+
+describe('unavailable retry: a message lost while P’s tmux-unavailable or ad-config-malformed outage is raised reports not answering, with no restart (SRJ-1011, SRJ-311, SRJ-316, AC 36, AC 68)', () => {
+  test.each<[string, () => Error, OutageClass, string]>([
+    ['ErrTmuxNotAvailable (tmux-unavailable)', () => errTmuxNotAvailable(), 'tmux-unavailable', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['a CONFIG answer (ad-config-malformed)', () => errConfigMalformed(), AD_CONFIG_MALFORMED, UNAVAILABLE_RETRY_CAUSE_CONFIG],
+  ])('%s on P’s bring-up, both settings 0: a message lost meanwhile reports not answering, schedules no restart and makes no call, the timer untouched; once calls succeed and the outage clears, one lost for the still-unregistered P reports auto-restart disabled', async (_what, make, raised, cause) => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    const row = modelRow(h, 'missing')
+    h.script({ spawnError: make() })
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect([...getOutageFlags(key)]).toEqual([raised])
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expectArmedOnce(h, key, cause)
+    const timer = h.controller.view(key)
+
+    await expectLostMessageReports(h, key, 'not-answering')
+
+    expect(h.controller.view(key)).toEqual(timer)
+    expect(h.stub.calls.spawnCalls).toHaveLength(1)
+    expect([h.stub.calls.killCalls, h.stub.calls.deleteCalls]).toEqual([[], []])
+    // The flags are P's own: the other persona's message reports its own state.
+    await expectLostMessageReports(h, other, 'auto-restart-disabled')
+
+    // Calls succeed: the retry reads the row missing and relaunches P, and
+    // the outage clears; P is still unregistered.
+    h.script({ spawnError: undefined })
+    await retryNow(h, key)
+    expect(row.spawnedAt).toHaveLength(2)
+    expect(getOutageFlags(key).size).toBe(0)
+
+    await expectLostMessageReports(h, key, 'auto-restart-disabled')
+
+    // The next retry reads the row live: nothing left to recover.
+    await retryNow(h, key)
+    expectStopped(h, key)
+    expect(h.stub.calls.deleteCalls).toEqual([])
+  })
+
+  test.each(UNCLASSIFIED_ERRORS)('no unclassified input: %s answering P’s attempt’s row reads, P’s unclassified-error episode open, a message lost meanwhile reports auto-restart disabled, never not answering', async (_what, make) => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key] = h.keys as [string]
+    const readErr = make('status')
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT, () => readErr)
+    await unclassifiedLaunch(h, key, make('spawn'))
+    const before = callCounts(h)
+    await retryNow(h, key)
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+    expect(h.unclassifiedErrorOpen(key)).toBe(true)
+    expect(getOutageFlags(key).size).toBe(0)
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+
+    await expectLostMessageReports(h, key, 'auto-restart-disabled')
+
+    expect(h.unclassifiedErrorOpen(key)).toBe(true)
+    expectNeverDestructive(h, key)
   })
 })

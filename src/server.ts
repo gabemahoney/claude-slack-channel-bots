@@ -125,8 +125,14 @@ import {
   UNCLASSIFIED_ERROR_END_CAPPED,
   UNCLASSIFIED_ERROR_END_LATCHED,
   type PersonaEpisodes,
+  type TmuxUnresponsiveCondition,
 } from './persona-episodes.ts'
-import { bindConflictLatchHolds, bindConflictNotice, createConflictLatch } from './conflict-latch.ts'
+import {
+  bindConflictLatchHolds,
+  bindConflictNotice,
+  createConflictLatch,
+  type ConflictLatch,
+} from './conflict-latch.ts'
 import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
@@ -263,7 +269,7 @@ import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import { createReloadTickDriver } from './reload-timer.ts'
 import { PRODUCTION_SLACK_CLIENT_FACTORY } from './persona-slack-clients.ts'
-import { initOutageState, setOutageFlag, clearOutageFlag, raiseAdConfigMalformed, raiseTmuxUnavailable, resetAllToHealthy, withOutageDetection, reportAgentDirectorError } from './outage-state.ts'
+import { initOutageState, getOutageFlags, setOutageFlag, clearOutageFlag, raiseAdConfigMalformed, raiseTmuxUnavailable, resetAllToHealthy, withOutageDetection, reportAgentDirectorError } from './outage-state.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -370,6 +376,46 @@ let unavailableRetry: UnavailableRetryController | undefined
  * the start pass, every episode forgotten on shutdown.
  */
 let personaEpisodes: PersonaEpisodes | undefined
+
+/**
+ * The server's one per-persona latch (b.jg5 SRJ-501), for the lost-message
+ * state's latched query; built in main() before the start pass. Undefined
+ * before then, when no persona is latched.
+ */
+let personaLatch: Pick<ConflictLatch, 'isLatched'> | undefined
+
+/**
+ * b.jg5 SRJ-315: true while work is in flight for the persona (today only a
+ * launch call, `isLaunchInFlight`). Today this one predicate serves the retry
+ * timer (`isInFlight`), the health tick (`isLaunchInFlight`) and the session
+ * disconnect handler (`restartDisconnectedPersona`). They need not stay
+ * equal: a running dialog approver counts as in flight for the tick but never
+ * blocks a retry (SRJ-303, SRJ-401). What must hold is that the tick never
+ * attempts over work that holds back the retry timer.
+ */
+function isPersonaWorkInFlight(key: string): boolean {
+  return isLaunchInFlight(key)
+}
+
+/**
+ * b.jg5 SRJ-311: arm the persona's UNAVAILABLE retry timer with the
+ * ENVIRONMENT cause, the `tmux-unavailable` outage's own class, on the
+ * controller main() builds (read at call time; nothing is armed before it
+ * exists). The one arm path for a persona held off on that outage with no
+ * timer: the health tick's `armRetryTimer` and the session disconnect handler
+ * both call it. An arm while the timer is armed or running keeps its due time
+ * and wait count.
+ */
+function armEnvironmentRetryTimer(key: string): void {
+  unavailableRetry?.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT })
+}
+
+/**
+ * The per-persona `tmux-unresponsive` conditions (b.jg5 SRJ-307), for the
+ * lost-message state's holds query; built in main() before the start pass.
+ * Undefined before then, when no condition holds.
+ */
+let personaTmuxUnresponsive: Pick<TmuxUnresponsiveCondition, 'holds'> | undefined
 
 /** The manager's per-persona queries, answering nothing before main() builds it. */
 const connectionView: Pick<PersonaConnectionManager, 'status' | 'webClient' | 'identity'> = {
@@ -509,6 +555,22 @@ const sessionToolDeps: SessionToolDeps = {
  * A registered session for persona `key` closed: log it and schedule a
  * restart of that persona in its working directory. `via` qualifies the log
  * line (e.g. ` (SSE abort)`).
+ *
+ * b.jg5 SRJ-311: while the persona's `tmux-unavailable` outage is raised, the
+ * retry timer's retries, one per backoff interval, are the only attempts made
+ * for it, so no restart is ever scheduled here, and one line says what was
+ * done instead:
+ *   - its retry timer is armed: nothing more;
+ *   - it is latched (the server's one latch) or work is in flight for it
+ *     (`isPersonaWorkInFlight`, the predicate the health tick and the retry
+ *     timer use): nothing is armed;
+ *   - otherwise, with no timer armed (the controller's `isArmed` answers
+ *     exactly false; a retry that stopped as not up, on a declined launch or
+ *     on a failed run leaves the flag raised with none), its timer is armed
+ *     with the ENVIRONMENT cause (`armEnvironmentRetryTimer`, the health
+ *     tick's arm path), so a retry comes even with `session_restart_delay` 0
+ *     and `health_check_interval` 0.
+ * Each is asked here, at arm time, through the holders main() sets.
  */
 function restartDisconnectedPersona(key: string, via: string): void {
   const persona = getAppliedPersona(key)
@@ -516,13 +578,34 @@ function restartDisconnectedPersona(key: string, via: string): void {
     console.error(`[slack] Session disconnected${via}: persona=${key} is not an applied persona`)
     return
   }
-  console.error(
-    `[slack] Session disconnected${via}: persona ${renderPersonaRef(persona.name, persona.key)} ` +
-    `cwd="${persona.working_directory}"`,
-  )
-  // Session-id resume is owned by agent-director (SR-1.3); launchSession
-  // relaunches the persona in its own working directory.
-  scheduleRestart(key, persona.working_directory)
+  const ref = renderPersonaRef(persona.name, persona.key)
+  console.error(`[slack] Session disconnected${via}: persona ${ref} cwd="${persona.working_directory}"`)
+  if (!getOutageFlags(key).has('tmux-unavailable')) {
+    // Session-id resume is owned by agent-director (SR-1.3); launchSession
+    // relaunches the persona in its own working directory.
+    scheduleRestart(key, persona.working_directory)
+    return
+  }
+  const head = `[slack] Session disconnected${via}: persona ${ref} has its tmux-unavailable outage raised`
+  const armed = unavailableRetry?.isArmed(key)
+  if (armed === true) {
+    console.error(`${head} — no restart scheduled; its retry timer recovers it (b.jg5 SRJ-311)`)
+    return
+  }
+  if (personaLatch?.isLatched(key) === true) {
+    console.error(`${head} and is latched — no restart scheduled, no retry timer armed (b.jg5 SRJ-311, SRJ-502)`)
+    return
+  }
+  if (isPersonaWorkInFlight(key)) {
+    console.error(`${head} with work in flight — no restart scheduled, no retry timer armed (b.jg5 SRJ-311, SRJ-315)`)
+    return
+  }
+  if (armed !== false) {
+    console.error(`${head} and no retry controller — no restart scheduled, no retry timer armed (b.jg5 SRJ-311)`)
+    return
+  }
+  console.error(`${head} with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`)
+  armEnvironmentRetryTimer(key)
 }
 
 /**
@@ -748,6 +831,19 @@ const personaRouting = createPersonaRouting({
   log: (line) => console.error(line),
   // A lost message for a persona that is not up restarts nothing (b.av2 SR-6.4).
   isPersonaUp,
+  // b.jg5 SRJ-1011: the lost-message state inputs, each read at call time.
+  // The latch and the tmux-unresponsive conditions are built in main(), so
+  // before then no persona is latched and no condition holds. A launch call
+  // awaits its dialog approver, so a launch in flight covers the approver
+  // too (E17 widens this binding if its approver runs outside the launch
+  // call). This is not the shared in-flight predicate main() builds for the
+  // retry timer and the health tick.
+  isLatched: (key) => personaLatch?.isLatched(key) ?? false,
+  isTmuxUnresponsive: (key) => personaTmuxUnresponsive?.holds(key) ?? false,
+  isLaunchOrApproverRunning: (key) => isLaunchInFlight(key),
+  // Left unbound until their Epics bind them, so they answer false:
+  // isHeldOnInvalidFlags (E23), isKillFailed (E20, E27) and
+  // isSequenceOrWaitRunning (E21, E27).
 })
 
 // Permission Block Kit builders moved to src/permission-poller.ts
@@ -1981,6 +2077,8 @@ export async function main(): Promise<void> {
     (line) => console.error(line),
   )
   bindConflictNotice(conflictLatch, noticeEpisodes)
+  // b.jg5 SRJ-1011: the persona routing's lost-message state reads it.
+  personaLatch = conflictLatch
   // b.jg5 SRJ-501, SRJ-502: the collision ladder latches through it on a
   // CONFLICT at a spawn or resume, and launches no latched persona. The
   // restart work, the retry action and the health tick ask it below. A
@@ -2018,15 +2116,6 @@ export async function main(): Promise<void> {
     isConfigured: (key) => getAppliedPersona(key) !== undefined,
     logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `persona=${key}: ${text}`),
   })
-
-  // b.jg5 SRJ-315: true while work is in flight for the persona (today only
-  // a launch call, `isLaunchInFlight`). Today this one predicate serves both
-  // the retry timer (`isInFlight`) and the health tick (`isLaunchInFlight`).
-  // The two need not stay equal: a running dialog approver counts as in
-  // flight for the tick but never blocks a retry (SRJ-303, SRJ-401). What
-  // must hold is that the tick never attempts over work that holds back the
-  // retry timer.
-  const isPersonaWorkInFlight = (key: string): boolean => isLaunchInFlight(key)
 
   // b.jg5 SRJ-301, SRJ-303, SRJ-305: one UNAVAILABLE retry controller, on the
   // system clock, installed below as the outage state's trigger sink before
@@ -2113,6 +2202,8 @@ export async function main(): Promise<void> {
     healthCheckOn: () => (personaConfig ?? appliedConfig).health_check_interval !== 0,
     alertThresholdMs: adAlertThresholdMsInEffect,
   })
+  // b.jg5 SRJ-1011: the persona routing's lost-message state reads its holds.
+  personaTmuxUnresponsive = tmuxUnresponsive
 
   // Every persona notice goes through the one per-persona notifier: it holds
   // a notice until the persona's client is available and logs instead of
@@ -2619,9 +2710,7 @@ export async function main(): Promise<void> {
     // armed with the ENVIRONMENT cause, the outage's own class; its stop
     // checks end it with no agent-director call for a persona not up.
     isRetryArmed: (key) => retryTimers.isArmed(key),
-    armRetryTimer: (key) => {
-      retryTimers.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT })
-    },
+    armRetryTimer: armEnvironmentRetryTimer,
     // b.f2b: with session_restart_delay 0 scheduleRestart does nothing, so an
     // alive persona the tick would reconnect gets the not-connected notice
     // (once per episode, worded for a disconnected or a streamless session)
