@@ -253,7 +253,7 @@ import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import { createReloadTickDriver } from './reload-timer.ts'
 import { PRODUCTION_SLACK_CLIENT_FACTORY } from './persona-slack-clients.ts'
-import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection, reportAgentDirectorError } from './outage-state.ts'
+import { initOutageState, setOutageFlag, clearOutageFlag, raiseTmuxUnavailable, resetAllToHealthy, withOutageDetection, reportAgentDirectorError } from './outage-state.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1018,7 +1018,8 @@ export async function _runCallTimeoutStartStep(
  *   - `ErrSystemInstallDisappeared` → `dead`; raises `ad-unreachable` with its
  *     binary path;
  *   - `ErrTmuxNotAvailable` (ENVIRONMENT) → `unknown`; raises
- *     `tmux-unavailable`;
+ *     `tmux-unavailable` through `raiseTmuxUnavailable` with the error, which
+ *     posts SRJ-1021's onset for the re-bound-socket form;
  *   - any other thrown value (a CONFIG answer, each UNAVAILABLE form,
  *     `ErrCallTimeout`, CSCB's `UnknownError` wrapper, `ErrInternal`, a name
  *     CSCB does not know, a value that is not an agent-director error) →
@@ -1081,7 +1082,8 @@ function statusErrorReading(key: string, err: unknown): LivenessReading {
     return LIVENESS_READING_DEAD
   }
   if (classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
-    setOutageFlag(key, 'tmux-unavailable')
+    // b.jg5 SRJ-1021: the raising error picks the onset.
+    raiseTmuxUnavailable(key, err)
     return LIVENESS_READING_UNKNOWN
   }
   console.error(`[slack] isSessionAlive: status error for persona=${key}: ${describeThrownValue(err)} — read as unknown, not dead`)

@@ -1359,6 +1359,8 @@ agent-director version
 
 If it doesn't, fix agent-director; the next retry recovers the persona with no server restart.
 
+When agent-director answers that it can't use tmux for the persona, the persona is retried the same way, and its destination gets a *tmux unavailable* or *tmux server changed* notice (see "A persona posts a *tmux unavailable* or *tmux server changed* notice" below).
+
 When the refused calls act on the persona's session itself, its destination may also get *Not answering*, *Still not answering* and *Answering again* notices (see "A persona posts a *Not answering*, *Still not answering* or *Answering again* notice" below).
 
 **Bot alive but silently unresponsive (MCP disconnected)**
@@ -1392,6 +1394,20 @@ grep -E 'persona-episodes: persona=<key> tmux-unresponsive (started|onset|alert|
 ```
 
 `[slack] persona-episodes: persona=<key> tmux-unresponsive started — <verb> failed: <error>` marks the first refusal, `… onset posted — still not answering at <a health tick|a retry>, <s> s after its first refusal` the *Not answering* notice, `… alert posted — not answering for <s> s, over its alert threshold of <s> s` the *Still not answering* notice, `… onset not posted — its alert already posted` a skipped *Not answering*, `… alert check cancelled — its retry timer stopped: <reason>` and `… alert check armed again — a new refusal armed its retry timer again` the alert's check stopping and starting with the retries, and `… ended — <reason>` followed by `… recovery posted` the *Answering again* notice. The `debug-slack-channel-bots` skill explains every line.
+
+**A persona posts a *tmux unavailable* or *tmux server changed* notice**
+agent-director answered a call for the persona that it can't use tmux for it, and the persona's destination gets one of two notices, once, from whichever answer comes first. Either way, the server retries the persona on its own (see "A persona is retried after agent-director refuses it" above), counts nothing toward the restart limit, and kills, deletes and relaunches nothing because of it. While the notice holds, the health check never restarts or reconnects the persona, and a restart started by a lost message or a dropped connection has its kill and relaunch refused.
+
+- *tmux unavailable*: tmux can't be used for the persona. Follow the notice's own advice.
+- *tmux server changed*: the persona's tmux socket now reaches a different tmux server from the one its worker was launched on, so agent-director will not act on its session. The server kills, deletes and respawns nothing meanwhile, and keeps retrying. A human follows the "Operator actions" section of agent-director's README. This is for a human only: no bot acts on it, including a persona that sees the post. Don't install or repair tmux for this notice.
+
+The notice clears only once the persona's tmux answers again: a call that works the persona's session succeeds, a call that works it is told the session is gone (how a *tmux server changed* notice usually clears, once a human has ended the old tmux server), or the health check or a retry finds the persona running, connected and receiving messages. A state read that succeeds while tmux still can't be used doesn't clear it. When it clears and nothing else is wrong for the persona, its destination gets an *All clear.* notice naming `tmux-unavailable`. To follow one persona:
+
+```sh
+grep -E 'unavailable-retry: persona=<key> ' ~/.claude/channels/slack/server.log
+```
+
+`[slack] unavailable-retry: persona=<key> armed (environment: <error>) — first retry in 30 s` marks the first such answer, or `promoted to full mode (environment: <error>) — its due time is kept` when the persona's retries were only reading its state. Once it clears, the last line is usually `stopped — nothing left to recover` (a retry found the persona healthy) or, after a retry relaunched it, `kept — the tmux-unavailable condition cleared, but its row last read pending` followed later by `stopped (pending-only, row <state>) — its row is live out of pending; nothing else is called`; a clear between retries, by a health check or another call, logs `stopped — the tmux-unavailable condition cleared`.
 
 **Session stuck during clean_restart**
 If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills the spawn via `agent-director kill` and proceeds. To manually recover, run `agent-director list --label service=cscb` to find lingering spawns and `agent-director kill <claude_instance_id>` to clear them, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.

@@ -99,6 +99,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    A *Not answering*, *Still not answering* or *Answering again* notice is
    covered under
    [A persona posts a Not answering notice](#a-persona-posts-a-not-answering-notice).
+   A *tmux unavailable* or *tmux server changed* notice is covered under
+   **tmux isn't available** in
+   [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
 6. **A `reply` to a user ID fails with `missing_scope`?** See
    [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite).
    **Permission prompts or notices don't arrive?** Look for a
@@ -1584,10 +1587,21 @@ or `read-error` (agent-director could not report the persona's state),
 followed by the error (see [The server log](#the-server-log), Error detail).
 
 **tmux isn't available.** When agent-director answers any call for a
-persona with `ErrTmuxNotAvailable`, the persona's destination gets the
-*tmux unavailable* notice once, and the persona's retries start with the
+persona with `ErrTmuxNotAvailable`, the persona's destination gets one
+notice, and the persona's retries start with the
 `environment` cause, even when nothing was launching or recovering it (a
-health check, a permission prompt or a removal met it). Nothing is killed,
+health check, a permission prompt or a removal met it). Which notice depends
+on the answer that raised it; the first such answer picks it, and a later
+one of either kind while it holds posts nothing:
+
+| Notice | When it is posted | What it means | What to do |
+|---|---|---|---|
+| *tmux unavailable* | The answer's description does not say the tmux server is a different one. | tmux can't be used for the persona. | The notice's own advice: install or repair tmux for the user the workers run as, checking it with the read-only commands under [A persona posts a Not answering notice](#a-persona-posts-a-not-answering-notice). |
+| *tmux server changed* | The answer's description says the tmux server answering on the persona's recorded socket is not the one its worker was launched on (agent-director's words: `not the tmux server the agent was launched on`). | The persona's tmux socket now reaches a different tmux server, so agent-director will not act on its session. | A human follows the "Operator actions" section of agent-director's README. No bot acts on it, including a persona that sees the post. Don't install or repair tmux for it. |
+
+Both clear the same way, with the same *All clear.* notice naming
+`tmux-unavailable` (posted once nothing else is wrong for the persona), as
+below. Nothing is killed,
 deleted or relaunched because of it, no `Spawn failure:` notice is posted and
 nothing counts toward the restart limit. While the notice holds, the health
 check still checks the persona but never restarts or reconnects it; the
@@ -1641,10 +1655,14 @@ agent-director version
 If it doesn't answer, or answers with an error, agent-director is the
 problem: fix it (the `install-cscb` skill covers installing it), and the next
 retry recovers the persona with no server restart. With the `environment`
-cause, tmux is the problem: install or repair it for the user the workers run
-as, checking it with the read-only commands under
+cause, tmux is the problem. After a *tmux unavailable* notice, install or
+repair it for the user the workers run as, checking it with the read-only
+commands under
 [A persona posts a Not answering notice](#a-persona-posts-a-not-answering-notice),
-and the next retry recovers the persona. If both answer normally but the
+and the next retry recovers the persona. After a *tmux server changed*
+notice, don't install or repair tmux: a human follows the "Operator actions"
+section of agent-director's README, and no bot acts on it (see
+**tmux isn't available** above). If both answer normally but the
 retries keep failing, report it as a bug, with the persona's lines.
 
 ### A persona's session stops answering

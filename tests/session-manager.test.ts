@@ -368,6 +368,7 @@ import {
   getOutageFlags,
   setOutageFlag,
   ONSET_TEMPLATES,
+  tmuxServerChangedOnset,
   _resetOutageState,
   type OutageClass,
 } from '../src/outage-state.ts'
@@ -5501,10 +5502,14 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     ['ErrSystemInstallDisappeared', () => new ErrSystemInstallDisappeared('status', '/usr/bin/agent-director')],
   ] as const
 
-  /** The ENVIRONMENT answers (`ErrTmuxNotAvailable`) at a `status` read: tmux cannot be run, and the different-server form. */
+  /**
+   * The ENVIRONMENT answers (`ErrTmuxNotAvailable`) at a `status` read, each
+   * with the onset it raises: tmux cannot be run (today's onset), and the
+   * different-server form (b.jg5 SRJ-1021's onset).
+   */
   const WAIT_ENVIRONMENT_ERRORS = [
-    ['ErrTmuxNotAvailable (tmux cannot be run)', () => errTmuxNotAvailable(undefined, 'status')],
-    ['ErrTmuxNotAvailable (not the tmux server the agent was launched on)', () => errTmuxNotAvailableDifferentServer(undefined, 'status')],
+    ['ErrTmuxNotAvailable (tmux cannot be run)', () => errTmuxNotAvailable(undefined, 'status'), ONSET_TEMPLATES['tmux-unavailable']()],
+    ['ErrTmuxNotAvailable (not the tmux server the agent was launched on)', () => errTmuxNotAvailableDifferentServer(undefined, 'status'), tmuxServerChangedOnset()],
   ] as const
 
   test.each(TIMEOUT_EARLY_FAILED_ERRORS)('b.jg5 SRJ-105: timeout with %s → failed, tmux NOT probed, nothing typed, not refused', async (_label, errorFactory) => {
@@ -5540,7 +5545,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
   // 'failed' with one refusal line, never the tmux fallback (so never
   // 'dead-session'), nothing typed, no notice, and C's tmux-unavailable
   // outage raised with one onset.
-  test.each(WAIT_ENVIRONMENT_ERRORS)('b.jg5 SRJ-311: timeout with %s → failed and refused (one refusal line), tmux NOT probed, nothing typed, no notice, one tmux-unavailable onset', async (_label, errorFactory) => {
+  test.each(WAIT_ENVIRONMENT_ERRORS)('b.jg5 SRJ-311, SRJ-1021: timeout with %s → failed and refused (one refusal line), tmux NOT probed, nothing typed, no notice, one tmux-unavailable onset with the form\'s text', async (_label, errorFactory, onset) => {
     _setWaitForWaitingTimeoutMs(30)
     _setFindMissingMemoTtlMs(0)
     const probed: string[] = []
@@ -5568,7 +5573,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(notices).toEqual([])
     expect(linesWith(errLog, 'waitForWaitingAndReconnect: timeout: status read refused for persona=C')).toHaveLength(1)
     expect([...getOutageFlags('C')]).toEqual(['tmux-unavailable'])
-    expect(outageEmissions.map((e) => e.key)).toEqual(['C'])
+    expect(outageEmissions).toEqual([{ key: 'C', text: onset }])
   })
 
   // The ladder's working branch treats both reads alike: 'failed', no
@@ -5627,10 +5632,10 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
   // timer once), no dead-session recovery, no tmux probe, no notice, one
   // tmux-unavailable onset, and no `spawn-failed` entry (the E10 hatch note).
   test.each(
-    WAIT_ENVIRONMENT_ERRORS.flatMap(([label, errorFactory]) =>
-      (['poll', 'timeout'] as const).map((read) => [label, read, errorFactory] as const),
+    WAIT_ENVIRONMENT_ERRORS.flatMap(([label, errorFactory, onset]) =>
+      (['poll', 'timeout'] as const).map((read) => [label, read, errorFactory, onset] as const),
     ),
-  )('b.jg5 SRJ-311: spawnForPersona working branch, %s at the wait\'s %s status read → failed and refused, no probe, no kill/delete/resume/launch, no notice, one tmux-unavailable onset, no spawn-failed entry', async (_label, read, errorFactory) => {
+  )('b.jg5 SRJ-311, SRJ-1021: spawnForPersona working branch, %s at the wait\'s %s status read → failed and refused, no probe, no kill/delete/resume/launch, no notice, one tmux-unavailable onset with the form\'s text, no spawn-failed entry', async (_label, read, errorFactory, onset) => {
     const readLog = captureStartupErrors()
     const armed: Array<{ key: string; kind: string }> = []
     initOutageState({
@@ -5688,7 +5693,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(notices).toEqual([])
     expect(linesWith(errLog, `status read refused for ${renderPersonaRef('C', 'C')}: `)).toHaveLength(1)
     expect([...getOutageFlags('C')]).toEqual(['tmux-unavailable'])
-    expect(outageEmissions.map((e) => e.key)).toEqual(['C'])
+    expect(outageEmissions).toEqual([{ key: 'C', text: onset }])
     expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
   })
 
@@ -11139,10 +11144,10 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
   // b.jg5 SRJ-312: a successful `status` is no tmux answer, so the row read
   // leaves tmux-unavailable raised; a tmux-touching success for B (its
   // `/mcp reconnect` keystrokes) clears it with B's one all-clear.
-  test.each<[string, () => Error]>([
-    ['tmux cannot be run', () => new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not available')],
-    ['the different-server form', () => errTmuxNotAvailableDifferentServer(undefined, 'status')],
-  ])('b.jg5 SRJ-312: goes through the outage wrapper: ErrTmuxNotAvailable (%s) raises B\'s tmux-unavailable flag (and rethrows); a later successful read leaves it raised with no all-clear; a tmux-touching success for B clears it with B\'s all-clear; A\'s flag is untouched', async (_label, build) => {
+  test.each<[string, () => Error, string]>([
+    ['tmux cannot be run', () => new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not available'), ONSET_TEMPLATES['tmux-unavailable']()],
+    ['the different-server form', () => errTmuxNotAvailableDifferentServer(undefined, 'status'), tmuxServerChangedOnset()],
+  ])('b.jg5 SRJ-312, SRJ-1021: goes through the outage wrapper: ErrTmuxNotAvailable (%s) raises B\'s tmux-unavailable flag with the form\'s onset (and rethrows); a later successful read leaves it raised with no all-clear; a tmux-touching success for B clears it with B\'s all-clear; A\'s flag is untouched', async (_label, build, onset) => {
     setOutageFlag(A, 'ad-unreachable', '/opt/ad/bin/agent-director')
     outageEmissions = []
     const failure = build()
@@ -11152,7 +11157,7 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
 
     expect('err' in failed.outcome && failed.outcome.err).toBe(failure)
     expect([...getOutageFlags(B)]).toEqual(['tmux-unavailable'])
-    expect(outageEmissions.map((e) => e.key)).toEqual([B])
+    expect(outageEmissions).toEqual([{ key: B, text: onset }])
 
     installStub({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_FRACTIONAL }) })
     const ok = await readQuietly()
@@ -11181,10 +11186,10 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
   // b.jg5 SRJ-311: ENVIRONMENT from any verb for B arms B's timer in any
   // context; inside B's attempt it is also B's last error, so a launch it
   // ended would be refused.
-  test.each<[string, () => Error]>([
-    ['tmux cannot be run', () => errTmuxNotAvailable(undefined, 'status')],
-    ['the different-server form', () => errTmuxNotAvailableDifferentServer(undefined, 'status')],
-  ])('b.jg5 SRJ-311: ErrTmuxNotAvailable (%s) from the row read is reported to the sink with the ENVIRONMENT cause in every context (outside any attempt, inside A\'s, inside B\'s), always under B; it still propagates', async (_label, build) => {
+  test.each<[string, () => Error, string]>([
+    ['tmux cannot be run', () => errTmuxNotAvailable(undefined, 'status'), ONSET_TEMPLATES['tmux-unavailable']()],
+    ['the different-server form', () => errTmuxNotAvailableDifferentServer(undefined, 'status'), tmuxServerChangedOnset()],
+  ])('b.jg5 SRJ-311: ErrTmuxNotAvailable (%s) from the row read is reported to the sink with the ENVIRONMENT cause in every context (outside any attempt, inside A\'s, inside B\'s), always under B; it still propagates', async (_label, build, onset) => {
     installRecordingSink()
     const err = build()
     installStub({ statusError: err })
@@ -11207,8 +11212,8 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
       { key: B, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT },
     ])
     expect(attempt!.lastError).toEqual({ verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, armed: true })
-    // One onset for B's bad stretch: the repeats dedupe.
-    expect(outageEmissions.map((e) => e.key)).toEqual([B])
+    // One onset for B's bad stretch, the form's (b.jg5 SRJ-1021): the repeats dedupe.
+    expect(outageEmissions).toEqual([{ key: B, text: onset }])
   })
 
   test.each<[string, () => Error, string]>([
@@ -11846,20 +11851,21 @@ function srj105AfterEach(): void {
 
 /**
  * What the outage state posts for the refused launch: nothing (the default),
- * or P's one `tmux-unavailable` onset (an ENVIRONMENT answer, b.jg5 SRJ-311),
- * with its text when `text` is given.
+ * or P's one `tmux-unavailable` onset (an ENVIRONMENT answer, b.jg5 SRJ-311)
+ * reading exactly `text`: the onset the raising error's form picks
+ * (b.jg5 SRJ-1021).
  */
 interface ExpectedOutage {
   readonly tmuxUnavailableOnset: true
-  readonly text?: string
+  readonly text: string
 }
 
 /**
  * Launch P as the start pass does, with `site` meeting `err`; assert the
  * refusal's outcome (see the section comment); then launch it again through
  * `launchSession`, and launch B over the stub's defaults. With `outage`, P's
- * `tmux-unavailable` flag is raised by the first launch with one onset, and
- * is still raised at the end.
+ * `tmux-unavailable` flag is raised by the first launch with one onset
+ * reading `outage.text`, and is still raised at the end.
  */
 async function expectRefusedAt(site: LadderSite, err: Error, triggerKind: string, outage?: ExpectedOutage): Promise<{ h: RecoveryHarness; p: string }> {
   const { h, p, b } = srj105Build()
@@ -11877,7 +11883,7 @@ async function expectRefusedAt(site: LadderSite, err: Error, triggerKind: string
     expect(h.outageNotices).toEqual([])
   } else {
     expect(h.outageNotices.map((n) => n.key)).toEqual([p])
-    if (outage.text !== undefined) expect(h.outageNotices[0]!.text).toBe(outage.text)
+    expect(h.outageNotices[0]!.text).toBe(outage.text)
     expect(getOutageFlags(p).has('tmux-unavailable')).toBe(true)
   }
   expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
@@ -12267,18 +12273,18 @@ describe('b.jg5 SRJ-105 with E8\'s refusal marker: a refused kill on a replace p
 // ---------------------------------------------------------------------------
 
 /**
- * The ENVIRONMENT answers, each built for the verb that meets it (by name):
- * tmux cannot be run, with today's onset text, and the different-server form
- * (its onset is checked by count only: SRJ-1021 gives it its own text).
+ * The ENVIRONMENT answers, each built for the verb that meets it (by name),
+ * with the onset it raises: tmux cannot be run, with today's onset text, and
+ * the different-server form, with b.jg5 SRJ-1021's.
  */
-const SRJ311_ENVIRONMENT: ReadonlyArray<readonly [string, (verb: string) => Error, string | undefined]> = [
+const SRJ311_ENVIRONMENT: ReadonlyArray<readonly [string, (verb: string) => Error, string]> = [
   ['ErrTmuxNotAvailable (tmux cannot be run)', (verb) => errTmuxNotAvailable(undefined, verb), ONSET_TEMPLATES['tmux-unavailable']()],
-  ['ErrTmuxNotAvailable (not the tmux server the agent was launched on)', (verb) => errTmuxNotAvailableDifferentServer(undefined, verb), undefined],
+  ['ErrTmuxNotAvailable (not the tmux server the agent was launched on)', (verb) => errTmuxNotAvailableDifferentServer(undefined, verb), tmuxServerChangedOnset()],
 ]
 
-/** The `ExpectedOutage` of an ENVIRONMENT refusal: one `tmux-unavailable` onset, with `text` when given. */
-function environmentOnset(text: string | undefined): ExpectedOutage {
-  return text === undefined ? { tmuxUnavailableOnset: true } : { tmuxUnavailableOnset: true, text }
+/** The `ExpectedOutage` of an ENVIRONMENT refusal: one `tmux-unavailable` onset reading `text`. */
+function environmentOnset(text: string): ExpectedOutage {
+  return { tmuxUnavailableOnset: true, text }
 }
 
 describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladder, the reconnect and the working-row wait is a refusal: never destructive, never counted, one tmux-unavailable onset', () => {
@@ -12320,13 +12326,16 @@ describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladd
   })
 
   // A joiner's sweep failure is its own (SRJ-301): with ENVIRONMENT it raises
-  // its own `tmux-unavailable`, as P's wrapper does for P. The contrast row:
-  // an UNAVAILABLE sweep error raises no `tmux-unavailable` for either.
+  // its own `tmux-unavailable`, as P's wrapper does for P, and the error's
+  // form picks the onset for each (SRJ-1021): the joiner's raise site is its
+  // own, so B's text is checked as well as P's. The contrast row: an
+  // UNAVAILABLE sweep error raises no `tmux-unavailable` for either.
   const JOINED_SWEEP_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error, string, ExpectedOutage | undefined]> = [
+    // The re-bound (different-server) row pins wiring only: today's agent-director never returns this error from `find-missing`; it proves the joiner's site hands its error to `raiseTmuxUnavailable`.
     ...SRJ311_ENVIRONMENT.map(([what, make, text]) => [what, make, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, environmentOnset(text)] as const),
     ...unavailableForms('ErrTmuxUnresponsive').map(([what, make, kind]) => [`contrast: ${what} (UNAVAILABLE)`, make, kind, undefined] as const),
   ]
-  test.each(JOINED_SWEEP_ERRORS)('b.jg5 SRJ-311: %s at P\'s prompt-row sweep, which B joined: one findMissing call; each persona raises its own tmux-unavailable (one onset each) only for ENVIRONMENT, is armed once with the cause, and nothing destructive follows for either', async (_what, make, kind, outage) => {
+  test.each(JOINED_SWEEP_ERRORS)('b.jg5 SRJ-311, SRJ-1021: %s at P\'s prompt-row sweep, which B joined: one findMissing call; each persona raises its own tmux-unavailable (one onset each, with the form\'s text) only for ENVIRONMENT, is armed once with the cause, and nothing destructive follows for either', async (_what, make, kind, outage) => {
     const { h, p, b } = srj105Build()
     const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, make('find-missing'))
 
@@ -12349,8 +12358,7 @@ describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladd
         expect(onsets).toEqual([])
       } else {
         expect(getOutageFlags(key).has('tmux-unavailable')).toBe(true)
-        expect(onsets).toHaveLength(1)
-        if (outage.text !== undefined) expect(onsets[0]!.text).toBe(outage.text)
+        expect(onsets.map((n) => n.text)).toEqual([outage.text])
       }
     }
     expect(h.outageNotices).toHaveLength(outage === undefined ? 0 : 2)

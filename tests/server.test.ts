@@ -36,6 +36,7 @@ import {
   initOutageState,
   getOutageFlags,
   setOutageFlag,
+  tmuxServerChangedOnset,
   withOutageDetection,
   type OutageClass,
 } from '../src/outage-state.ts'
@@ -62,6 +63,7 @@ import {
   errSystemInstallDisappeared,
   errTmuxCaptureFailed,
   errTmuxNotAvailable,
+  errTmuxNotAvailableDifferentServer,
   errTmuxSendKeys,
   errTmuxUnresponsive,
   errUnknownErrorName,
@@ -801,6 +803,47 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions[0].text).toMatch(/tmux unavailable/)
     // ONSET_TEMPLATES['tmux-unavailable'] ignores the detail arg — nothing extra
     expect(emissions[0].text).not.toContain('undefined')
+  })
+
+  // b.jg5 SRJ-1021: the liveness adapter is a raise site of its own, so the
+  // error it hands the raise entry picks the onset. The re-bound-socket form
+  // (the description carries "not the tmux server the agent was launched
+  // on") posts SRJ-1021's onset; plain `ErrTmuxNotAvailable` posts today's.
+  // Either way the probe reads unknown, never dead.
+  test.each([
+    // Wiring only: today's agent-director never returns this error from `status`; the row proves the site hands its error to `raiseTmuxUnavailable`.
+    ['the re-bound-socket form (errTmuxNotAvailableDifferentServer)', () => errTmuxNotAvailableDifferentServer(undefined, 'status'), tmuxServerChangedOnset],
+    ['plain ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'status'), () => ONSET_TEMPLATES['tmux-unavailable']()],
+  ] as const)('b.jg5 SRJ-1021: status throws %s → reads unknown; tmux-unavailable raised with that form\'s onset, posted once; the ENVIRONMENT cause armed once', async (_label, build, onset) => {
+    // Non-vacuity: the two onsets differ, so posting the wrong one fails.
+    expect(tmuxServerChangedOnset()).not.toBe(ONSET_TEMPLATES['tmux-unavailable']())
+    const { emissions, statusCalls, triggers, adapter } = makeHarness(build())
+
+    const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
+
+    expect(result).toEqual(LIVENESS_READING_UNKNOWN)
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
+    expect(emissions).toEqual([{ key: 'C1', text: onset() }])
+    expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, inside: false }])
+    assertNoLeak({ errArgs, emissions })
+  })
+
+  // b.jg5 SRJ-1021: one onset per bad stretch, from whichever form arrives
+  // first; a second probe answering either form while the flag is raised
+  // posts nothing more (same-flag dedupe kept at this raise site).
+  test.each([
+    ['re-bound first, then plain', () => errTmuxNotAvailableDifferentServer(undefined, 'status'), () => errTmuxNotAvailable(undefined, 'status'), tmuxServerChangedOnset],
+    ['plain first, then re-bound', () => errTmuxNotAvailable(undefined, 'status'), () => errTmuxNotAvailableDifferentServer(undefined, 'status'), () => ONSET_TEMPLATES['tmux-unavailable']()],
+  ] as const)('b.jg5 SRJ-1021: %s → the first form\'s onset only; the second probe posts nothing and both read unknown', async (_label, first, second, onset) => {
+    const { emissions, adapter } = makeHarness(first())
+
+    expect(await adapter('C1')).toEqual(LIVENESS_READING_UNKNOWN)
+    setClientForTests(makeStubClient({ statusError: second() }) as unknown as Client)
+    expect(await adapter('C1')).toEqual(LIVENESS_READING_UNKNOWN)
+
+    expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
+    expect(emissions).toEqual([{ key: 'C1', text: onset() }])
   })
 
   // b.jg5 SRJ-314: every other `status` error reads `unknown`, never `dead`,
@@ -2161,8 +2204,14 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
   // launch. The wrapper raises `tmux-unavailable` (its one onset) and arms the
   // timer once with the ENVIRONMENT cause; ENVIRONMENT never starts the
   // `tmux-unresponsive` condition (SRJ-307).
-  test('b.jg5 SRJ-311: kill answers ErrTmuxNotAvailable (ENVIRONMENT) → KILL_SESSION_REFUSED, not swallowed into a launch; one described refusal line; tmux-unavailable raised with its onset; the timer armed once with the environment cause; no condition', async () => {
-    const err = errTmuxNotAvailable(undefined, 'kill')
+  // b.jg5 SRJ-1021: the re-bound-socket form (the description carries "not the
+  // tmux server the agent was launched on") is the same refusal, with
+  // SRJ-1021's onset in place of today's.
+  test.each([
+    ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill'), () => ONSET_TEMPLATES['tmux-unavailable']()],
+    ['ErrTmuxNotAvailable, re-bound-socket form (b.jg5 SRJ-1021)', () => errTmuxNotAvailableDifferentServer(undefined, 'kill'), tmuxServerChangedOnset],
+  ] as const)('b.jg5 SRJ-311: kill answers %s (ENVIRONMENT) → KILL_SESSION_REFUSED, not swallowed into a launch; one described refusal line; tmux-unavailable raised with its onset; the timer armed once with the environment cause; no condition', async (_label, build, onset) => {
+    const err = build()
     install(err)
 
     const { result, errArgs } = await killInAttempt()
@@ -2171,7 +2220,7 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
     expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
     expect(stringLines(errArgs)).toEqual([refusedLine(err)])
     expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
-    expect(emissions).toEqual([{ key: 'C1', text: ONSET_TEMPLATES['tmux-unavailable']() }])
+    expect(emissions).toEqual([{ key: 'C1', text: onset() }])
     expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
     expect(starts).toEqual([])
     expect(ends).toEqual([])

@@ -73,7 +73,7 @@ import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, rec
 import type { Persona } from '../src/config.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
 import { LIVENESS_LIVE, LIVENESS_PENDING, LIVENESS_READING_UNKNOWN, type PendingLivenessReading } from '../src/liveness-reading.ts'
-import { ALL_CLEAR_TEMPLATE, clearOutageFlag, getOutageFlags, ONSET_TEMPLATES, setOutageFlag, withOutageDetection } from '../src/outage-state.ts'
+import { ALL_CLEAR_TEMPLATE, clearOutageFlag, getOutageFlags, ONSET_TEMPLATES, setOutageFlag, tmuxServerChangedOnset, withOutageDetection } from '../src/outage-state.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
 import {
@@ -4581,6 +4581,100 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expect(h.outageNotices).toHaveLength(2)
     expect(getFailureCount(key)).toBe(0)
     expect(h.capReached).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A re-bound tmux socket (b.jg5 SRJ-1021, SRJ-311's AC 86 Test line): the
+// `ErrTmuxNotAvailable` whose description says the socket's server is not the
+// one the worker was launched on posts SRJ-1021's onset, not today's. The row
+// stays live, so each retry reruns the restart path's reconnect: never a kill,
+// delete or launch, nothing counted, and the retries on the backoff until
+// tmux answers.
+// ---------------------------------------------------------------------------
+
+describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and no kill, delete or launch (SRJ-1021, SRJ-311, AC 86)', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test('AC 86: with both settings 0, a live, unconnected row whose every tmux-touching verb answers the re-bound ErrTmuxNotAvailable posts one onset, SRJ-1021’s, across several retries at the backoff’s due times, with no kill, delete, spawn or resume and nothing counted; once tmux answers, the reconnect clears it with today’s all-clear and the timer stops', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, 'waiting')
+    h.setConnected(key, false)
+    h.script({
+      readPaneError: errTmuxNotAvailableDifferentServer(undefined, 'read-pane'),
+      sendKeysError: errTmuxNotAvailableDifferentServer(undefined, 'send-keys'),
+      killError: errTmuxNotAvailableDifferentServer(undefined, 'kill'),
+      deleteError: errTmuxNotAvailableDifferentServer(undefined, 'delete'),
+      spawnError: errTmuxNotAvailableDifferentServer(undefined, 'spawn'),
+      resumeError: errTmuxNotAvailableDifferentServer(undefined, 'resume'),
+    })
+    const reBoundOnset = { key, text: tmuxServerChangedOnset() }
+
+    // A read-pane outside every attempt meets the re-bound socket: the
+    // outage is raised with SRJ-1021's onset and P's timer armed.
+    const armedAt = h.clock.now()
+    await expect(readPaneSucceeds(h, key)).rejects.toThrow()
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)
+    expect(h.outageNotices).toEqual([reBoundOnset])
+    expect([...getOutageFlags(key)]).toEqual(['tmux-unavailable'])
+
+    // Several retries, each at its due time and never 1 ms early. Each reads
+    // the row live and reconnects; tmux refuses the reconnect, so it re-arms
+    // at the doubled wait and posts nothing more.
+    const retries = 4
+    let dueAt = armedAt
+    for (let n = 0; n < retries; n++) {
+      dueAt += waitMs(n)
+      await h.advance(dueAt - 1 - h.clock.now())
+      expect([n, h.attempts.length]).toEqual([n, n])
+      const before = callCounts(h)
+      expect(await retryNow(h, key)).toBe(dueAt)
+      expect([n, h.attempts.at(-1)]).toEqual([n, { key, retry: n + 1, causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt }])
+      expect([n, callsSince(h, before)]).toEqual([n, { statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 }])
+      expect([n, retryLinesOf(h, key).at(-1)]).toEqual([n, reArmedLine(key, n + 1, UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED, n + 1)])
+      expect([n, h.controller.view(key)]).toEqual([n, expect.objectContaining({ phase: 'waiting', dueAt: dueAt + waitMs(n + 1), waitMs: waitMs(n + 1), refusals: n + 1 })])
+      expect([n, getFailureCount(key)]).toEqual([n, 0])
+    }
+
+    // One onset for the stretch, SRJ-1021's; never today's install-or-repair onset.
+    expect(h.outageNotices).toEqual([reBoundOnset])
+    expect(h.outageNotices.map((n) => n.text)).not.toContain(ONSET_TEMPLATES['tmux-unavailable']())
+    expect(h.outageClears).toEqual([])
+    // No kill, delete or launch in the whole run, and nothing counted or escalated.
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.stub.calls.spawnCalls).toEqual([])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(getFailureCount(key)).toBe(0)
+    expect(isAtCap(key, RESTART_FAILURE_CAP)).toBe(false)
+    expect(h.capReached).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+
+    // tmux answers again: the next retry's reconnect succeeds, clearing the
+    // outage with today's all-clear, and the timer stops.
+    h.script({ readPaneError: undefined, sendKeysError: undefined })
+    dueAt += waitMs(retries)
+    const before = callCounts(h)
+    expect(await retryNow(h, key)).toBe(dueAt)
+
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 })
+    expect(h.outageNotices).toEqual([reBoundOnset, tmuxUnavailableAllClear(key)])
+    expect(getOutageFlags(key).size).toBe(0)
+    expect(h.outageClears).toEqual([{ key, reading: undefined, result: 'deferred' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expectStopped(h, key)
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.stub.calls.spawnCalls).toEqual([])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(getFailureCount(key)).toBe(0)
+    expectUntouched(h, other)
   })
 })
 

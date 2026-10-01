@@ -61,6 +61,11 @@
  * STATE name's meaning is set per site); {@link isInvalidFlagsError} is its
  * use for `ErrInvalidFlags`. Never throws.
  *
+ * {@link isDifferentTmuxServerError} answers whether a value is the
+ * re-bound-socket form of ENVIRONMENT (b.jg5 SRJ-1021): ENVIRONMENT by the
+ * classifier, its description carrying `DIFFERENT_TMUX_SERVER_PHRASE`
+ * (`src/ad-description-phrases.ts`). Never throws.
+ *
  * {@link classifyWithInvalidFlagsRecheck} is the step for a site that gives
  * `ErrInvalidFlags` no meaning (b.jg5 SRJ-104: any site but a plain or reuse
  * spawn): an `ErrInvalidFlags` gets exactly one immediate version re-check
@@ -90,7 +95,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { UNUSABLE_RECORDED_NAME_PHRASE } from './ad-description-phrases.ts'
+import { DIFFERENT_TMUX_SERVER_PHRASE, UNUSABLE_RECORDED_NAME_PHRASE } from './ad-description-phrases.ts'
 import {
   RECHECK_OUTCOME_COULD_NOT_RUN,
   triggerAdVersionRecheck,
@@ -381,6 +386,23 @@ export function isInvalidFlagsError(value: unknown): value is InvalidFlagsError 
 export function hasAdErrorName(value: unknown, name: string): boolean {
   try {
     return isAgentDirectorError(value) && readProp(value, 'errName') === name
+  } catch {
+    return false
+  }
+}
+
+/**
+ * True when `value` is the re-bound-socket form of ENVIRONMENT (b.jg5
+ * SRJ-311, SRJ-1021): it classifies as ENVIRONMENT by {@link classifyAdError}
+ * and its `errDescription` contains `DIFFERENT_TMUX_SERVER_PHRASE`.
+ * Recognition is by class and phrase only. A missing or non-string description
+ * answers false. Pure; never throws.
+ */
+export function isDifferentTmuxServerError(value: unknown): boolean {
+  try {
+    if (classifyAdError(value).errorClass !== AD_ERROR_CLASS_ENVIRONMENT) return false
+    const description = readProp(value, 'errDescription')
+    return typeof description === 'string' && description.includes(DIFFERENT_TMUX_SERVER_PHRASE)
   } catch {
     return false
   }

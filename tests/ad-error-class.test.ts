@@ -1,7 +1,9 @@
 /**
  * ad-error-class.test.ts — the one classifier of agent-director errors
- * (b.jg5 SRJ-104), the `ErrInvalidFlags` step beside it, and the stub's error
- * builders it is fed with (b.jg5 SRJ-1303; their shape checks live here).
+ * (b.jg5 SRJ-104), the `ErrInvalidFlags` step beside it, the re-bound-socket
+ * predicate `isDifferentTmuxServerError` (b.jg5 SRJ-311, SRJ-1021), and the
+ * stub's error builders it is fed with (b.jg5 SRJ-1303; their shape checks
+ * live here).
  *
  * Every value is built with the stub's builders; a value the stub has no
  * builder for (`ErrCwdNotFound`, `ErrCwdNotADirectory`,
@@ -43,6 +45,7 @@ import {
   classifyWithInvalidFlagsRecheck,
   describeAdErrorClassification,
   hasAdErrorName,
+  isDifferentTmuxServerError,
   isInvalidFlagsError,
   type AdErrorClass,
   type AdErrorClassification,
@@ -958,6 +961,109 @@ describe('hasAdErrorName', () => {
 
   test('ERR_SPAWN_NOT_FOUND_NAME is the errName of the client\'s ErrSpawnNotFound', () => {
     expect(errSpawnNotFound().errName).toBe(ERR_SPAWN_NOT_FOUND_NAME)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isDifferentTmuxServerError (b.jg5 SRJ-311, SRJ-1021)
+// ---------------------------------------------------------------------------
+
+/** `ErrTmuxNotAvailable`, as the stub's builder names it. */
+const ERR_TMUX_NOT_AVAILABLE = errTmuxNotAvailable().errName
+
+/** A socket other than the stub's default, to show the predicate does not depend on it. */
+const OTHER_SOCKET_PATH = `${STUB_TMUX_SOCKET_PATH}-other`
+
+/** A description carrying the different-server words, as the stub's builder writes it. */
+const DIFFERENT_SERVER_DESCRIPTION = errTmuxNotAvailableDifferentServer().errDescription
+
+/** The stub's different-server `ErrTmuxNotAvailable` with its `errDescription` replaced by `descriptor`. */
+function differentServerWithDescription(descriptor: PropertyDescriptor): AgentDirectorError {
+  return Object.defineProperty(errTmuxNotAvailableDifferentServer(), 'errDescription', descriptor)
+}
+
+describe('isDifferentTmuxServerError', () => {
+  test.each<[string, () => unknown]>([
+    ['the stub\'s different-server form', () => errTmuxNotAvailableDifferentServer()],
+    ['the different-server form on another socket', () => errTmuxNotAvailableDifferentServer(OTHER_SOCKET_PATH)],
+    ['the different-server form from read-pane', () => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, 'read-pane')],
+    ['a base error named ErrTmuxNotAvailable carrying the words', () => baseError(ERR_TMUX_NOT_AVAILABLE, DIFFERENT_SERVER_DESCRIPTION)],
+    ['an ErrTmuxNotAvailable whose description is exactly the words', () => errGeneric('resume', ERR_TMUX_NOT_AVAILABLE, DIFFERENT_TMUX_SERVER_PHRASE)],
+  ])('%s is the re-bound form', (_label, build) => {
+    const value = build()
+    expect(classifyAdError(value).errorClass).toBe(AD_ERROR_CLASS_ENVIRONMENT)
+    expect(isDifferentTmuxServerError(value)).toBe(true)
+  })
+
+  test.each<[string, () => unknown]>([
+    ['plain ENVIRONMENT without a socket', () => errTmuxNotAvailable()],
+    ['plain ENVIRONMENT with the stub\'s socket', () => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH)],
+    ['plain ENVIRONMENT with another socket', () => errTmuxNotAvailable(OTHER_SOCKET_PATH, 'resume')],
+  ])('%s is ENVIRONMENT but not the re-bound form', (_label, build) => {
+    const value = build()
+    expect(classifyAdError(value).errorClass).toBe(AD_ERROR_CLASS_ENVIRONMENT)
+    expect(isDifferentTmuxServerError(value)).toBe(false)
+  })
+
+  test.each<[string, () => unknown, AdErrorClass]>([
+    ['ErrTmuxUnresponsive', () => baseError(ERR_TMUX_UNRESPONSIVE_NAME, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_UNAVAILABLE],
+    ['ErrTmuxSessionConflict', () => baseError(ERR_TMUX_SESSION_CONFLICT_NAME, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_CONFLICT],
+    ['ErrTmuxSessionCreate', () => baseError(errTmuxSessionCreate().errName, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_LAUNCH_FAILURE],
+    ['ErrSpawnNotFound', () => baseError(ERR_SPAWN_NOT_FOUND_NAME, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_STATE],
+    ['ErrTmuxSendKeys', () => baseError(errTmuxSendKeys().errName, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_GONE],
+    ['CSCB\'s wrapped UnknownError', () => baseError(CSCB_UNKNOWN_ERROR_NAME, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_UNAVAILABLE],
+    ['an ErrInternal (envelope description)', () => errInternal(DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_UNCLASSIFIED],
+    ['an ErrConfigMalformed (envelope description)', () => errUnknownErrorName(ERR_CONFIG_MALFORMED, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_CONFIG],
+    [
+      'an ErrUnknownErrorName whose unknownName is ErrTmuxNotAvailable (envelope description)',
+      () => errUnknownErrorName(ERR_TMUX_NOT_AVAILABLE, DIFFERENT_SERVER_DESCRIPTION),
+      AD_ERROR_CLASS_UNAVAILABLE,
+    ],
+  ])('%s carrying the words is %s-classed and not the re-bound form', (_label, build, expected) => {
+    const value = build()
+    expect(classifyAdError(value).errorClass).toBe(expected)
+    expect(isDifferentTmuxServerError(value)).toBe(false)
+  })
+
+  test('the ErrUnknownErrorName case does carry the words in its envelope description', () => {
+    const err = errUnknownErrorName(ERR_TMUX_NOT_AVAILABLE, DIFFERENT_SERVER_DESCRIPTION)
+    expect((err.envelope as { err_description: string }).err_description).toContain(DIFFERENT_TMUX_SERVER_PHRASE)
+  })
+
+  test.each<[string, PropertyDescriptor]>([
+    ['missing (undefined)', { value: undefined }],
+    ['null', { value: null }],
+    ['a number', { value: 42 }],
+    ['an object carrying the words', { value: { text: DIFFERENT_TMUX_SERVER_PHRASE } }],
+    ['an array of the words', { value: [DIFFERENT_TMUX_SERVER_PHRASE] }],
+    ['a getter that throws', { get: () => { throw new Error('boom') } }],
+  ])('an ErrTmuxNotAvailable whose description is %s is not the re-bound form, and nothing throws', (_label, descriptor) => {
+    const value = differentServerWithDescription(descriptor)
+    expect(classifyAdError(value).errorClass).toBe(AD_ERROR_CLASS_ENVIRONMENT)
+    expect(() => isDifferentTmuxServerError(value)).not.toThrow()
+    expect(isDifferentTmuxServerError(value)).toBe(false)
+  })
+
+  test.each<[string, () => unknown]>([
+    ['an Error named ErrTmuxNotAvailable whose message carries the words', () => Object.assign(plainErrorNamed(ERR_TMUX_NOT_AVAILABLE), { message: DIFFERENT_SERVER_DESCRIPTION })],
+    [
+      'an object shaped like the different-server form',
+      () => ({ verb: 'resume', errName: ERR_TMUX_NOT_AVAILABLE, errDescription: DIFFERENT_SERVER_DESCRIPTION, name: ERR_TMUX_NOT_AVAILABLE }),
+    ],
+    ['the description string itself', () => DIFFERENT_SERVER_DESCRIPTION],
+    ['undefined', () => undefined],
+    ['null', () => null],
+    ['a proxy whose every trap throws', () => new Proxy({}, { get: () => { throw new Error('boom') }, getPrototypeOf: () => { throw new Error('boom') } })],
+  ])('%s is not an agent-director error: false, and nothing throws', (_label, build) => {
+    const value = build()
+    expect(() => isDifferentTmuxServerError(value)).not.toThrow()
+    expect(isDifferentTmuxServerError(value)).toBe(false)
+  })
+
+  test('an errName getter that throws answers false and throws nothing', () => {
+    const value = Object.defineProperty(errTmuxNotAvailableDifferentServer(), 'errName', { get: () => { throw new Error('boom') } })
+    expect(() => isDifferentTmuxServerError(value)).not.toThrow()
+    expect(isDifferentTmuxServerError(value)).toBe(false)
   })
 })
 

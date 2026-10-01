@@ -4,7 +4,9 @@
  * resetAllToHealthy call-site audit (case 23 Part A), the wrappers'
  * report to the UNAVAILABLE retry timer's trigger sink (b.jg5 SRJ-301), and
  * the declared verb's start and end of the persona's `tmux-unresponsive`
- * condition (b.jg5 SRJ-307, SRJ-310).
+ * condition (b.jg5 SRJ-307, SRJ-310), and the `tmux-unavailable` onset a
+ * re-bound socket gets (b.jg5 SRJ-1021: one pin case holds its text; every
+ * other case compares with the exported builder).
  *
  * Every wrapped call declares its verb. The trigger-sink and condition-sink
  * cases install recording fake sinks (no timer, no episodes) and run the
@@ -37,9 +39,12 @@ import {
   reportAgentDirectorError,
   ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
+  raiseTmuxUnavailable,
+  tmuxServerChangedOnset,
   type ClassRecord,
   type OutageClass,
 } from '../src/outage-state.ts'
+import { DIFFERENT_TMUX_SERVER_PHRASE } from '../src/ad-description-phrases.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { LIVENESS_LIVE } from '../src/liveness-reading.ts'
 import {
@@ -574,6 +579,7 @@ describe('persona-keyed notices', () => {
   test('onset and all-clear texts name no route or channel and carry no persona reference (the notifier adds it)', () => {
     const texts = [
       ...ALL_CLASSES.map((cls) => ONSET_TEMPLATES[cls]('/some/detail')),
+      tmuxServerChangedOnset(),
       ALL_CLEAR_TEMPLATE(new Map(ALL_CLASSES.map((cls) => [cls, { detail: '/some/detail' }]))),
     ]
     for (const text of texts) {
@@ -1685,11 +1691,14 @@ describe('what clears tmux-unavailable (b.jg5 SRJ-312: AC 27, AC 36)', () => {
 })
 
 describe('ENVIRONMENT is reported (b.jg5 SRJ-301, SRJ-311): from any verb for P, in any context', () => {
-  /** The ENVIRONMENT answers, each built for the declared verb. */
-  const ENVIRONMENT_FORMS: ReadonlyArray<readonly [string, (verb: string) => unknown]> = [
-    ['plain', (verb) => errTmuxNotAvailable(undefined, verb)],
-    ['a socket not accessible', (verb) => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH, verb)],
-    ['the different-server form', (verb) => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, verb)],
+  /**
+   * The ENVIRONMENT answers, each built for the declared verb, with the onset
+   * it raises: SRJ-1021's for the different-server form, today's for the others.
+   */
+  const ENVIRONMENT_FORMS: ReadonlyArray<readonly [string, (verb: string) => unknown, () => string]> = [
+    ['plain', (verb) => errTmuxNotAvailable(undefined, verb), () => ONSET_TEMPLATES['tmux-unavailable']()],
+    ['a socket not accessible', (verb) => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH, verb), () => ONSET_TEMPLATES['tmux-unavailable']()],
+    ['the different-server form', (verb) => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, verb), tmuxServerChangedOnset],
   ]
 
   /** Where the call runs: inside an attempt for P, inside another persona's attempt, outside every attempt. */
@@ -1718,7 +1727,7 @@ describe('ENVIRONMENT is reported (b.jg5 SRJ-301, SRJ-311): from any verb for P,
 
   test.each(ENVIRONMENT_ROWS)('%s, %s: each form, in each context, raises P\'s tmux-unavailable with one onset and reports the ENVIRONMENT cause once for P; B gets nothing; rethrown unchanged; no condition start', async (_w, _c, wrap, call) => {
     const verb = adCallVerb(call)!
-    for (const [form, build] of ENVIRONMENT_FORMS) {
+    for (const [form, build, onset] of ENVIRONMENT_FORMS) {
       for (const context of CONTEXTS) {
         const err = build(verb)
         const { emissions, arms, starts } = makeRecordingHarness()
@@ -1730,7 +1739,7 @@ describe('ENVIRONMENT is reported (b.jg5 SRJ-301, SRJ-311): from any verb for P,
         expect({ ...at, arms: arms.map((a) => ({ key: a.key, kind: a.kind, same: a.error === err })) })
           .toEqual({ ...at, arms: [{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, same: true }] })
         expect({ ...at, flags: [...getOutageFlags(P1)], b: [...getOutageFlags(P2)] }).toEqual({ ...at, flags: ['tmux-unavailable'], b: [] })
-        expect({ ...at, emissions }).toEqual({ ...at, emissions: [{ key: P1, text: ONSET_TEMPLATES['tmux-unavailable']() }] })
+        expect({ ...at, emissions }).toEqual({ ...at, emissions: [{ key: P1, text: onset() }] })
         // SRJ-307: only UNAVAILABLE starts tmux-unresponsive, never ENVIRONMENT.
         expect({ ...at, starts }).toEqual({ ...at, starts: [] })
         // Inside P's attempt the attempt records it armed (the launch is refused, never counted);
@@ -1830,6 +1839,174 @@ describe('ENVIRONMENT is reported (b.jg5 SRJ-301, SRJ-311): from any verb for P,
     expect(rejected).toBe(err)
     expect(arms).toHaveLength(1)
     assertNoLeak({ emissions, lastError, kinds: arms.map((a) => a.kind), flags: [...getOutageFlags(P1)] })
+  })
+})
+
+describe('the tmux-unavailable onset for a re-bound socket (b.jg5 SRJ-1021: AC 86)', () => {
+  /** Today's tmux-unavailable onset. */
+  const plainOnset = (): string => ONSET_TEMPLATES['tmux-unavailable']()
+
+  /** The ErrTmuxNotAvailable forms, each built for the declared verb, with the onset it raises. */
+  type Form = readonly [label: string, build: (verb: string) => unknown, onset: () => string]
+  const REBOUND: Form = ['the different-server form', (verb) => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, verb), tmuxServerChangedOnset]
+  const PLAIN: Form = ['plain ErrTmuxNotAvailable', (verb) => errTmuxNotAvailable(undefined, verb), plainOnset]
+  const PLAIN_SOCKET: Form = ['ErrTmuxNotAvailable with a socket path', (verb) => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH, verb), plainOnset]
+
+  /** Both wrappers, over a tmux-touching verb (resume) and one that is not (status). */
+  const SELECTION_ROWS = wrapRows(['resume', 'status'])
+
+  test('pin: the re-bound onset is SRJ-1021\'s text byte for byte, with no install-or-repair advice', () => {
+    expect(tmuxServerChangedOnset()).toBe(
+      ':rotating_light: *tmux server changed* — this persona\'s tmux socket now reaches a different tmux server than the one its worker was launched on, so agent-director will not act on its session. CSCB kills, deletes and respawns nothing meanwhile and keeps retrying. What to do: a human follows the "Operator actions" section of agent-director\'s README. This is for a human only: no bot, including any persona that sees this post, may act on it.',
+    )
+    const remediationLine = plainOnset().split('\n').at(-1)!
+    expect(remediationLine).toMatch(/install or repair tmux/)
+    expect(tmuxServerChangedOnset()).not.toContain(remediationLine)
+    expect(tmuxServerChangedOnset()).not.toMatch(/install|repair/i)
+  })
+
+  test.each(SELECTION_ROWS)('%s, %s: the different-server form raises P\'s tmux-unavailable and posts exactly the re-bound onset', async (_w, _c, wrap, call) => {
+    const err = REBOUND[1](adCallVerb(call)!)
+    const { emissions } = makeRecordingHarness()
+
+    expect(await rejectionFrom(wrap, P1, call, err)).toBe(err)
+
+    expect([...getOutageFlags(P1)]).toEqual(['tmux-unavailable'])
+    expect(emissions).toEqual([{ key: P1, text: tmuxServerChangedOnset() }])
+    expect(emissions[0]!.text).not.toBe(plainOnset())
+  })
+
+  test.each(SELECTION_ROWS)('%s, %s: plain ErrTmuxNotAvailable, with and without a socket path, posts exactly today\'s onset', async (_w, _c, wrap, call) => {
+    for (const [form, build] of [PLAIN, PLAIN_SOCKET]) {
+      const err = build(adCallVerb(call)!)
+      const { emissions } = makeRecordingHarness()
+
+      expect({ form, same: (await rejectionFrom(wrap, P1, call, err)) === err }).toEqual({ form, same: true })
+
+      expect({ form, flags: [...getOutageFlags(P1)] }).toEqual({ form, flags: ['tmux-unavailable'] })
+      expect({ form, emissions }).toEqual({ form, emissions: [{ key: P1, text: plainOnset() }] })
+      expect({ form, rebound: emissions[0]!.text === tmuxServerChangedOnset() }).toEqual({ form, rebound: false })
+    }
+  })
+
+  /** The raise routes: a wrapper's ENVIRONMENT branch, and the one raise entry called directly (as the liveness adapter and the sweep do). */
+  type RaiseRoute = readonly [label: string, raise: (err: unknown) => Promise<unknown> | void]
+  const RAISE_ROUTES: readonly RaiseRoute[] = [
+    ['withOutageDetection (read-pane)', (err) => rejectionFrom(withOutageDetection, P1, 'read-pane', err)],
+    ['withSpawnDetection (resume)', (err) => rejectionFrom(withSpawnDetection, P1, 'resume', err)],
+    ['raiseTmuxUnavailable', (err) => raiseTmuxUnavailable(P1, err)],
+  ]
+
+  /** The all-clear a plain tmux-unavailable stretch posts, through the same route and the same clearing success. */
+  async function plainStretchAllClear(raise: RaiseRoute[1]): Promise<string> {
+    const { emissions } = makeRecordingHarness()
+    await raise(PLAIN[1]('resume'))
+    await withOutageDetection(P1, WRAP_WORKDIR, 'read-pane', async () => 'ok')
+    expect(emissions).toHaveLength(2)
+    return emissions[1]!.text
+  }
+
+  test.each(RAISE_ROUTES)('all-clear, %s: after a re-bound onset the clear posts the text a plain stretch gets, with no description in it', async (_label, raise) => {
+    const plainAllClear = await plainStretchAllClear(raise)
+    const err = errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, 'resume')
+    const { emissions } = makeRecordingHarness()
+
+    await raise(err)
+    await withOutageDetection(P1, WRAP_WORKDIR, 'read-pane', async () => 'ok')
+
+    expect(emissions).toEqual([
+      { key: P1, text: tmuxServerChangedOnset() },
+      { key: P1, text: plainAllClear },
+    ])
+    expect(plainAllClear).toBe(allClearOf([['tmux-unavailable', undefined]]))
+    expect(emissions[1]!.text).not.toContain(DIFFERENT_TMUX_SERVER_PHRASE)
+    expect(emissions[1]!.text).not.toContain(STUB_TMUX_SOCKET_PATH)
+    expect(getOutageFlags(P1).size).toBe(0)
+  })
+
+  /** Both orders of the two forms. */
+  const ORDERS: ReadonlyArray<readonly [string, Form, Form]> = [
+    ['re-bound then plain', REBOUND, PLAIN],
+    ['plain then re-bound', PLAIN, REBOUND],
+  ]
+
+  test.each(ORDERS)('dedupe, %s: while the flag is raised by one form, the other form posts nothing (wrapped or direct); after the clear, it posts its own onset', async (_label, [, first, firstOnset], [, second, secondOnset]) => {
+    const { emissions } = makeRecordingHarness()
+
+    await rejectionFrom(withSpawnDetection, P1, 'resume', first('resume'))
+    await rejectionFrom(withOutageDetection, P1, 'read-pane', second('read-pane'))
+    await rejectionFrom(withOutageDetection, P1, 'status', second('status'))
+    raiseTmuxUnavailable(P1, second('resume'))
+
+    expect(emissions).toEqual([{ key: P1, text: firstOnset() }])
+    expect([...getOutageFlags(P1)]).toEqual(['tmux-unavailable'])
+
+    // tmux answers: one all-clear; the next stretch's onset is chosen by its own first error.
+    await withSpawnDetection(P1, WRAP_WORKDIR, 'spawn', async () => 'ok')
+    await rejectionFrom(withOutageDetection, P1, 'send-keys', second('send-keys'))
+
+    expect(emissions).toEqual([
+      { key: P1, text: firstOnset() },
+      { key: P1, text: allClearOf([['tmux-unavailable', undefined]]) },
+      { key: P1, text: secondOnset() },
+    ])
+  })
+
+  test('isolation: P\'s re-bound onset leaves B silent and unflagged; B\'s own plain error then posts B\'s own today\'s onset', async () => {
+    const { emissions } = makeRecordingHarness()
+
+    await rejectionFrom(withSpawnDetection, P1, 'resume', REBOUND[1]('resume'))
+
+    expect(emissions).toEqual([{ key: P1, text: tmuxServerChangedOnset() }])
+    expect(getOutageFlags(P2).size).toBe(0)
+
+    await rejectionFrom(withOutageDetection, P2, 'read-pane', PLAIN[1]('read-pane'))
+
+    expect(emissions).toEqual([
+      { key: P1, text: tmuxServerChangedOnset() },
+      { key: P2, text: plainOnset() },
+    ])
+  })
+
+  /** Values handed to raiseTmuxUnavailable directly, with the onset each must post. */
+  const DIRECT: ReadonlyArray<readonly [string, () => unknown, () => string]> = [
+    ['the different-server form', () => errTmuxNotAvailableDifferentServer(), tmuxServerChangedOnset],
+    ['plain ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'status'), plainOnset],
+    ['ErrTmuxNotAvailable with a socket path', () => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH, 'status'), plainOnset],
+    ['another class carrying the different-server words (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('resume', `the tmux server is ${DIFFERENT_TMUX_SERVER_PHRASE}; nothing was done`), plainOnset],
+    ['a plain Error carrying the different-server words', () => new Error(DIFFERENT_TMUX_SERVER_PHRASE), plainOnset],
+    ['undefined', () => undefined, plainOnset],
+  ]
+
+  test.each(DIRECT)('raiseTmuxUnavailable, %s: raises P\'s tmux-unavailable with its onset, records no detail (the all-clear is today\'s), and a second raise posts nothing', (_label, build, onset) => {
+    const { emissions } = makeRecordingHarness()
+
+    raiseTmuxUnavailable(P1, build())
+    raiseTmuxUnavailable(P1, build())
+
+    expect(emissions).toEqual([{ key: P1, text: onset() }])
+    expect([...getOutageFlags(P1)]).toEqual(['tmux-unavailable'])
+    expect(getOutageFlags(P2).size).toBe(0)
+
+    clearOutageFlag(P1, 'tmux-unavailable')
+    expect(emissions.slice(1)).toEqual([{ key: P1, text: allClearOf([['tmux-unavailable', undefined]]) }])
+  })
+
+  test('raiseTmuxUnavailable before initOutageState does nothing and does not throw', () => {
+    _resetOutageState()
+    expect(() => raiseTmuxUnavailable(P1, errTmuxNotAvailableDifferentServer())).not.toThrow()
+    expect(getOutageFlags(P1).size).toBe(0)
+  })
+
+  test('the description reaches neither the re-bound onset nor its all-clear (leak check)', async () => {
+    const err = errTmuxNotAvailableDifferentServer(sentinelInMessage('resume'), 'resume')
+    const { emissions } = makeRecordingHarness()
+
+    await rejectionFrom(withSpawnDetection, P1, 'resume', err)
+    await withSpawnDetection(P1, WRAP_WORKDIR, 'resume', async () => 'ok')
+
+    expect(emissions.map((e) => e.text)).toEqual([tmuxServerChangedOnset(), allClearOf([['tmux-unavailable', undefined]])])
+    assertNoLeak({ emissions, flags: [...getOutageFlags(P1)] })
   })
 })
 

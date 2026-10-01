@@ -13,6 +13,10 @@
  *   - initOutageState(deps)                — install production dependencies
  *   - getOutageFlags(key)                  — read live flag set
  *   - setOutageFlag(key, cls, detail?)     — raise flag + emit onset notice
+ *   - raiseTmuxUnavailable(key, err)       — the one raise entry for tmux-unavailable: emits
+ *                                            SRJ-1021's onset for the re-bound-socket form
+ *                                            (isDifferentTmuxServerError), today's otherwise;
+ *                                            records no detail (b.jg5 SRJ-1021)
  *   - clearOutageFlag(key, cls, reading?)  — lower flag; emits all-clear when set empties;
  *                                            a real clear is told to the cleared-flag observer
  *   - resetAllToHealthy(keys)              — silent wipe (boot-time reset; one key at a teardown);
@@ -31,6 +35,7 @@
  *
  * Template exports (used by tests):
  *   - ONSET_TEMPLATES
+ *   - tmuxServerChangedOnset()             — SRJ-1021's onset for the re-bound socket
  *   - ALL_CLEAR_TEMPLATE
  *
  * The `tmux-unresponsive` condition (b.jg5 SRJ-307, SRJ-310) is a
@@ -50,6 +55,7 @@ import {
   AD_ERROR_CLASS_GONE,
   adCallVerb,
   classifyAdError,
+  isDifferentTmuxServerError,
   isLaunchCall,
   isTmuxTouchingCall,
   type AdCall,
@@ -182,6 +188,19 @@ export const ONSET_TEMPLATES: Record<OutageClass, (detail?: string) => string> =
 }
 
 /**
+ * tmuxServerChangedOnset — the `tmux-unavailable` onset for a re-bound socket
+ * (b.jg5 SRJ-1021): posted in place of `ONSET_TEMPLATES['tmux-unavailable']`
+ * when the error that raises the flag is the re-bound-socket form
+ * (`isDifferentTmuxServerError`). It sends a human to agent-director's README
+ * "Operator actions" and carries no advice to install or repair tmux. Chosen
+ * at raise time by {@link raiseTmuxUnavailable}, never stored as the flag's
+ * detail, so the all-clear is the existing one.
+ */
+export function tmuxServerChangedOnset(): string {
+  return ':rotating_light: *tmux server changed* — this persona\'s tmux socket now reaches a different tmux server than the one its worker was launched on, so agent-director will not act on its session. CSCB kills, deletes and respawns nothing meanwhile and keeps retrying. What to do: a human follows the "Operator actions" section of agent-director\'s README. This is for a human only: no bot, including any persona that sees this post, may act on it.'
+}
+
+/**
  * ALL_CLEAR_TEMPLATE — renders an all-clear notice from the bad-stretch
  * history snapshot. Entries are emitted in the stable class order regardless
  * of the order flags were raised. No timestamps.
@@ -230,13 +249,39 @@ export function getOutageFlags(key: string): ReadonlySet<OutageClass> {
  * cannot cause double-emission on the next observation.
  */
 export function setOutageFlag(key: string, cls: OutageClass, detail?: string): void {
+  raiseFlag(key, cls, detail, () => ONSET_TEMPLATES[cls](detail))
+}
+
+/**
+ * raiseTmuxUnavailable — the one raise entry for `tmux-unavailable` (b.jg5
+ * SRJ-311, SRJ-1021), for every site that raises it on an ENVIRONMENT answer
+ * (`ErrTmuxNotAvailable`): the wrappers, the liveness adapter's bare `status`
+ * and the shared findMissing sweep's joiner. `err` is the error that raises
+ * the flag. The onset is chosen here, from `err`: `tmuxServerChangedOnset()`
+ * when `isDifferentTmuxServerError(err)` holds, else
+ * `ONSET_TEMPLATES['tmux-unavailable']`. No detail is recorded, so the
+ * all-clear is the existing one. Same-flag dedupe as `setOutageFlag`: while
+ * the flag is raised, a second error of either form posts nothing.
+ */
+export function raiseTmuxUnavailable(key: string, err: unknown): void {
+  raiseFlag(key, 'tmux-unavailable', undefined, () =>
+    isDifferentTmuxServerError(err) ? tmuxServerChangedOnset() : ONSET_TEMPLATES['tmux-unavailable'](),
+  )
+}
+
+/**
+ * Raise `cls` for persona `key` with `detail` recorded for the all-clear, and
+ * emit the onset `onset` renders. Same-flag re-raise is a silent no-op
+ * (dedupe); state mutates before the emit.
+ */
+function raiseFlag(key: string, cls: OutageClass, detail: string | undefined, onset: () => string): void {
   if (!deps) return
   const entry = entryFor(key)
   if (entry.flags.has(cls)) return // same-flag dedupe
   // Mutate state BEFORE emit (SR-V-2.x state-before-emit contract).
   entry.flags.add(cls)
   entry.badStretchClasses.set(cls, { detail })
-  deps.notify(key, ONSET_TEMPLATES[cls](detail))
+  deps.notify(key, onset())
 }
 
 /**
@@ -303,7 +348,8 @@ export function resetAllToHealthy(keys: string[]): void {
  * On error:
  *   - ErrSystemInstallDisappeared → raises 'ad-unreachable' (detail = binaryPath)
  *   - ENVIRONMENT (`ErrTmuxNotAvailable`, by class through
- *     `src/ad-error-class.ts`) → raises 'tmux-unavailable'
+ *     `src/ad-error-class.ts`) → raises 'tmux-unavailable' through
+ *     `raiseTmuxUnavailable` with the error, which picks the onset
  *   - ErrCwdNotFound / ErrCwdNotADirectory → raises 'cwd-unreachable' (detail =
  *     workingDirectory, the persona's working directory) UNLESS
  *     workingDirectory is undefined, in which case logs loudly and rethrows
@@ -366,7 +412,7 @@ export async function withOutageDetection<T>(
     if (err instanceof ErrSystemInstallDisappeared) {
       setOutageFlag(key, 'ad-unreachable', err.binaryPath)
     } else if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
-      setOutageFlag(key, 'tmux-unavailable')
+      raiseTmuxUnavailable(key, err)
     } else if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
       if (workingDirectory !== undefined) {
         setOutageFlag(key, 'cwd-unreachable', workingDirectory)

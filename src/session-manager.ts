@@ -111,7 +111,7 @@ import {
   resolveClaudeConfigDir,
 } from './persona-identity.ts'
 import { getClient } from './agent-director-client.ts'
-import { reportAgentDirectorError, setOutageFlag, withOutageDetection, withSpawnDetection } from './outage-state.ts'
+import { raiseTmuxUnavailable, reportAgentDirectorError, setOutageFlag, withOutageDetection, withSpawnDetection } from './outage-state.ts'
 import {
   AgentDirectorError,
   ErrInstanceIdCollision,
@@ -2200,7 +2200,8 @@ async function sharedFindMissingSweep(
     // starter's wrapper did under the starter's (b.jg5 SRJ-301, SRJ-311).
     if (!started && key !== undefined) {
       if (classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
-        setOutageFlag(key, 'tmux-unavailable')
+        // b.jg5 SRJ-1021: the raising error picks the onset.
+        raiseTmuxUnavailable(key, err)
       }
       reportAgentDirectorError(key, err, 'find-missing')
     }
