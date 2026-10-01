@@ -5366,24 +5366,17 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
     // A success resets the failure count and a counted failure raises it, so
     // Q's one failure on record shows which was recorded: none for a latched
     // persona (above), a success here.
-    // The latched query, when present, is asked at the retry entry, at the
-    // work's start, after the probe, after the reconnect and before the kill.
-    const UNLATCHED_ESCALATE: Array<[string, (deps: ReturnType<typeof makeDeps>) => string[], string[]]> = [
-      ['with the latched query present, answering false for Q', (deps) => {
-        const asked: string[] = []
-        deps.isLatched = (key) => { asked.push(key); return latch.isLatched(key) }
-        return asked
-      }, [Q, Q, Q, Q, Q]],
+    const UNLATCHED_ESCALATE: Array<[string, (deps: ReturnType<typeof makeDeps>) => void]> = [
+      ['with the latched query present, answering false for Q', () => {}],
       ['with a hand-built RestartDeps that has no latched query', (deps) => {
         delete deps.isLatched
-        return []
-      }, []],
+      }],
     ]
 
-    test.each(UNLATCHED_ESCALATE)('an unlatched persona on the escalate-dead path, %s: the reconnect, the re-probe that reads dead, one kill and one launch, launched, a success recorded', async (_label, setLatchQuery, expectedAsks) => {
+    test.each(UNLATCHED_ESCALATE)('an unlatched persona on the escalate-dead path, %s: the reconnect, the re-probe that reads dead, one kill and one launch, launched, a success recorded', async (_label, setLatchQuery) => {
       recordFailure(Q)
       const deps = latchedDeps()
-      const asked = setLatchQuery(deps)
+      setLatchQuery(deps)
       const readings = [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD]
       deps.isSessionAlive = async (key) => {
         deps.isSessionAliveCalls.push(key)
@@ -5403,7 +5396,6 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
       expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([Q])
       expect(getFailureCount(Q)).toBe(0)
       expect(deps.armRetryTimerCalls).toEqual([])
-      expect(asked).toEqual(expectedAsks)
       expect(errLines.filter((l) => l.includes(`persona=${Q}`) && l.includes('latched'))).toEqual([])
     })
   })

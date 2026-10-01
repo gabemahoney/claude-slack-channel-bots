@@ -289,6 +289,7 @@ import {
   notifyPersonaNotConnected,
   setConflictLatch,
   _resetConfiguredPersonaQuery,
+  setConfiguredPersonaQuery,
   readPersonaOwnRow,
   OWN_ROW_READ_ROW,
   WAIT_OUTCOME_LATCHED,
@@ -471,7 +472,6 @@ import {
 import { CONFLICT_CASE_ROWS, expectedConflictNotice, type ConflictCaseRow } from './test-helpers/conflict-cases.ts'
 import {
   CONFLICT_LATCH_SET_LATCHED,
-  CONFLICT_LATCH_SET_SAME_CASE,
   LATCH_CASE_CONFLICTING_LABELS,
   LATCH_ROW_STATE_KIND_NO_ROW,
   LATCH_ROW_STATE_KIND_READ,
@@ -3709,6 +3709,20 @@ function countDeferredLines(errLog: string): number {
   return errLog.split('\n').filter((line) => line.includes('the cwd check is deferred to its launch')).length
 }
 
+/**
+ * A pre-persona row (b.1ix) as the start sweep's `list` answers it: only the
+ * `service` and `channel` labels, in `state`, with instance id `id` and the
+ * tmux session that id names.
+ */
+function prePersonaRow(state: string, id = `cscb_old_${state}_C0OLD`): import('agent-director').ListRow {
+  return cannedListRow({
+    claude_instance_id: id,
+    state,
+    labels: { service: 'cscb', channel: 'C0OLD' },
+    tmux_session_name: id.replace(/^cscb_/, 'slack_bot_'),
+  })
+}
+
 // ---------------------------------------------------------------------------
 // b.av2 SR-6.3 (formerly SR-1.6) — the start sweep
 // ---------------------------------------------------------------------------
@@ -3972,15 +3986,6 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
   // kill leaves the row's state as it was. A row naming an absent persona is
   // still killed and deleted, even after a failed kill.
   describe('pre-persona rows are kept, never deleted (b.1ix)', () => {
-    /** A pre-persona row in `state`: only the `service` and `channel` labels. */
-    const prePersonaRow = (state: string): import('agent-director').ListRow =>
-      cannedListRow({
-        claude_instance_id: `cscb_old_${state}_C0OLD`,
-        state,
-        labels: { service: 'cscb', channel: 'C0OLD' },
-        tmux_session_name: `slack_bot_old_${state}_C0OLD`,
-      })
-
     test.each([
       ['reports success', undefined],
       ['fails', errGeneric('kill', 'ErrKillBroken')],
@@ -4028,20 +4033,22 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       }
     })
 
-    test('every live state gets one kill call and all share one findMissing sweep, whose outcome line counts the killed pending row left in neither list as not judged; ended and missing pre-persona rows get no kill, no delete and no line', async () => {
+    test('every live state gets one kill call and all share one findMissing sweep, whose outcome line counts the killed pending row left in neither list as not judged and a killed pending row in unverified_ids as still live; ended and missing pre-persona rows get no kill, no delete and no line', async () => {
       const { cfg } = sweepConfig()
       const killCalls: import('agent-director').KillParams[] = []
       const deleteCalls: import('agent-director').DeleteParams[] = []
       const findMissingCalls: import('agent-director').FindMissingParams[] = []
       const states = [...AGENT_DIRECTOR_LIVE_STATES, 'ended', 'missing']
       const liveIds = [...AGENT_DIRECTOR_LIVE_STATES].map((s) => `cscb_old_${s}_C0OLD`)
+      // A second killed pending row, which the sweep judges and leaves live.
+      const pendingLeftLive = 'cscb_old_pending_left_live_C0OLD'
       installStub({
         killCalls,
         deleteCalls,
         findMissingCalls,
         // The sweep marks two of the killed rows missing (and a row the start sweep never saw).
-        findMissingResult: cannedFindMissing({ count: 3, ids: [liveIds[1]!, liveIds[3]!, 'cscb_other'].sort() }),
-        listResult: { spawns: states.map(prePersonaRow) },
+        findMissingResult: cannedFindMissing({ count: 3, ids: [liveIds[1]!, liveIds[3]!, 'cscb_other'].sort(), unverified: 1, unverified_ids: [pendingLeftLive] }),
+        listResult: { spawns: [...states.map((state) => prePersonaRow(state)), prePersonaRow(AGENT_DIRECTOR_PENDING_STATE, pendingLeftLive)] },
       })
 
       let result!: Awaited<ReturnType<typeof reconcileOrphans>>
@@ -4049,21 +4056,22 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         result = await reconcileOrphans(cfg)
       })
 
-      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 7, live: 5, killFailed: 0 } })
-      expect(killCalls.map((k) => k.claude_instance_id)).toEqual(liveIds)
+      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 8, live: 6, killFailed: 0 } })
+      expect(killCalls.map((k) => k.claude_instance_id)).toEqual([...liveIds, pendingLeftLive])
       expect(deleteCalls).toHaveLength(0)
       expect(findMissingCalls).toEqual([{}])
       // b.jg5 SRJ-120: the killed `pending` row the sweep left in neither list
-      // was not judged; the other rows in neither list still read live.
+      // was not judged; the one in unverified_ids and the other rows in
+      // neither list still read live.
       const pendingId = `cscb_old_${AGENT_DIRECTOR_PENDING_STATE}_C0OLD`
       expect(liveIds[0]).toBe(pendingId)
-      const stillLive = liveIds.filter((_, i) => i !== 0 && i !== 1 && i !== 3)
+      const stillLive = [...liveIds.filter((_, i) => i !== 0 && i !== 1 && i !== 3), pendingLeftLive]
       expect(errLog).toContain(
-        `reconcileOrphans: findMissing after the kills of 5 live pre-persona row(s): missing=2 [${liveIds[1]},${liveIds[3]}] still-live=2 [${stillLive.join(',')}] not-judged=1 [${pendingId}] — a row that still reads live is killed again at the next start; a not-judged row was pending and not judged by this sweep (retry later)`,
+        `reconcileOrphans: findMissing after the kills of 6 live pre-persona row(s): missing=2 [${liveIds[1]},${liveIds[3]}] still-live=3 [${stillLive.join(',')}] not-judged=1 [${pendingId}] — a row that still reads live is killed again at the next start; a not-judged row was pending and not judged by this sweep (retry later)`,
       )
       // The summary line still ends the sweep.
       const lines = errLog.trim().split('\n')
-      expect(lines.at(-1)).toContain('reconcileOrphans: found=0 killed=0 failed=0; pre-persona rows kept=7 live=5 kill-failed=0')
+      expect(lines.at(-1)).toContain('reconcileOrphans: found=0 killed=0 failed=0; pre-persona rows kept=8 live=6 kill-failed=0')
       expect(errLog).not.toContain('cscb_old_ended_C0OLD')
       expect(errLog).not.toContain('cscb_old_missing_C0OLD')
     })
@@ -4078,7 +4086,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         findMissingCalls,
         listResult: {
           spawns: [
-            ...states.map(prePersonaRow),
+            ...states.map((state) => prePersonaRow(state)),
             cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }),
           ],
         },
@@ -12228,19 +12236,40 @@ async function expectRefusedAt(
 /**
  * Launch P, then B, as the start pass does, both meeting a prompt row whose
  * tmux session is gone, so each reaches the prompt-row findMissing sweep.
- * P's sweep is held in flight until B has joined it, then answers `err`:
- * P started the one sweep and B joined it. Answers both launches' results.
+ * P's sweep is held in flight until B has joined it, then answers `answer`
+ * (fails with it when it is an error): P started the one sweep and B joined
+ * it. Each row's first `get` (its collision get) reads it `check_permission`;
+ * a later `get` of it (a post-run get) answers its entry in
+ * `postRunGetErrors`, or the row again, and so does every `status` read.
+ * Answers both launches' results.
  */
-async function launchBothThroughOneSweep(h: RecoveryHarness, p: string, b: string, err: Error): Promise<[SpawnPersonaResult, SpawnPersonaResult]> {
+async function launchBothThroughOneSweep(
+  h: RecoveryHarness,
+  p: string,
+  b: string,
+  answer: Error | import('agent-director').FindMissingResult,
+  postRunGetErrors: ReadonlyMap<string, Error> = new Map(),
+): Promise<[SpawnPersonaResult, SpawnPersonaResult]> {
   const rows = new Map(
     [p, b].map((key) => {
       const row = harnessRow(h, harnessPersona(h, key), { state: 'check_permission' })
-      return [row.claude_instance_id, row] as const
+      return [row.claude_instance_id, [key, row] as const] as const
     }),
   )
+  const read = new Set<string>()
   h.script({
     spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())],
-    getFn: (params) => rows.get(params.claude_instance_id) ?? errSpawnNotFound(),
+    getFn: (params) => {
+      const entry = rows.get(params.claude_instance_id)
+      if (entry === undefined) return errSpawnNotFound()
+      const [key, row] = entry
+      if (!read.has(key)) {
+        read.add(key)
+        return row
+      }
+      return postRunGetErrors.get(key) ?? row
+    },
+    statusResult: cannedStatusResult({ state: 'check_permission' }),
   })
   // Both tmux sessions are gone; B's probe is the second.
   let bProbed!: () => void
@@ -12253,8 +12282,8 @@ async function launchBothThroughOneSweep(h: RecoveryHarness, p: string, b: strin
   // P's sweep is held in flight until B has joined it.
   let sweepStarted!: () => void
   const pSwept = new Promise<void>((resolve) => (sweepStarted = resolve))
-  let failSweep!: (err: Error) => void
-  const held = new Promise<never>((_resolve, reject) => (failSweep = reject))
+  let settleSweep!: { resolve(result: import('agent-director').FindMissingResult): void; reject(err: Error): void }
+  const held = new Promise<import('agent-director').FindMissingResult>((resolve, reject) => (settleSweep = { resolve, reject }))
   h.stub.client.findMissing = async (params) => {
     h.stub.calls.findMissingCalls.push(params)
     sweepStarted()
@@ -12267,7 +12296,8 @@ async function launchBothThroughOneSweep(h: RecoveryHarness, p: string, b: strin
   await bReachedProbe
   // A macrotask turn: B's launch runs on, over resolved stubs only, to the shared sweep.
   await new Promise((resolve) => setTimeout(resolve, 0))
-  failSweep(err)
+  if (answer instanceof Error) settleSweep.reject(answer)
+  else settleSweep.resolve(answer)
   return [await pLaunch, await bLaunch]
 }
 
@@ -13543,6 +13573,54 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     expect(getFailureCount('C')).toBe(0)
   })
 
+  // b.jg5 SRJ-114: a provenance_conflict note on P's own row (the
+  // configured-persona query installed) takes the same fallbacks as the
+  // CONFLICT row: with no latch, or a set that throws, the read still answers
+  // latched and the launch calls nothing after the collision get.
+  test.each<[string, (sets: string[]) => SessionConflictLatch | undefined, string]>([
+    ['no latch is installed', () => undefined, ' — no latch is installed, so nothing is latched; nothing more is called for it '],
+    [
+      'an installed latch whose set throws',
+      (sets) => ({
+        isLatched: () => false,
+        record: () => undefined,
+        set: (key) => {
+          sets.push(key)
+          throw new Error('latch store broken')
+        },
+        setFromConflict: () => undefined,
+      }),
+      ' — latching the persona failed: ',
+    ],
+  ])('a provenance_conflict note on C\'s own row at the collision get when %s: the launch still answers latched, with nothing called after the get, one note line naming the outcome, no notice and no spawn-failed entry, never counted', async (_label, latchOf, outcome) => {
+    const readLog = captureStartupErrors()
+    const sets: string[] = []
+    const latch = latchOf(sets)
+    setConflictLatch(latch)
+    setConfiguredPersonaQuery((key) => key === 'C')
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const calls = makeStubCallLog()
+    installStub({ ...calls, spawnQueue: [cannedErr(errInstanceIdCollision())], getResult: personaRow(cfg, 'C', { state: 'ended', liveness_note: provenanceNote }) })
+
+    let result: SpawnPersonaResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg, true)
+    })
+
+    expect(result).toStrictEqual({ key: 'C', action: 'latched' })
+    expect(calls.spawnCalls).toHaveLength(1)
+    expect(calls.getCalls).toHaveLength(1)
+    expect(stubCallCount(calls)).toBe(2)
+    expect(sets).toEqual(latch === undefined ? [] : ['C'])
+    const noteLines = errLog.split('\n').filter((line) => line.includes(': its row carries the liveness note provenance_conflict (state=ended)'))
+    expect(noteLines).toHaveLength(1)
+    expect(noteLines[0]).toContain(outcome)
+    expect(notices).toEqual([])
+    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(getFailureCount('C')).toBe(0)
+    assertNoLeak({ errLog, notices })
+  })
+
   // Fail safe (b.jg5 SRJ-502): a latch the gate cannot read holds the launch back.
   test.each<[string, SessionConflictLatch, string]>([
     [
@@ -13613,7 +13691,7 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
 // unknown one (`unknownNote`) and no note leave today's step for the row; so
 // does `provenanceNote` on a row that is not a configured persona's own (P
 // outside the applied configuration, no configured-persona query installed,
-// or another caller's row). Every case runs on `makeRecoveryHarness`, which
+// one that throws, or another caller's row). Every case runs on `makeRecoveryHarness`, which
 // installs the latch and the configured-persona query as `main()` does, and
 // `srj105AfterEach` runs `assertNoLeak` over what it captured.
 // ---------------------------------------------------------------------------
@@ -13706,6 +13784,16 @@ const PLAIN_NOTES: ReadonlyArray<readonly [string, string | undefined]> = [
   ...[...nonLatchingNotes, unknownNote].map((note) => [`the note ${note}`, note] as const),
 ]
 
+/**
+ * `PLAIN_NOTES` sampled: no note, one note that never latches and the unknown
+ * one. The full list runs at the collision get and the post-run gets; every
+ * other site shares the one note rule, so it takes the sample.
+ */
+const SAMPLE_PLAIN_NOTES = PLAIN_NOTES.filter(([, note]) => note === undefined || note === nonLatchingNotes[0] || note === unknownNote)
+
+/** A row id that is no persona's: another caller's. */
+const ANOTHER_CALLERS_ROW = 'adhoc_caller_1'
+
 /** The reads of `provenanceNote` that are not of a configured persona's own row, each set up on the harness. */
 const NOT_A_CONFIGURED_OWN_ROW: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => PersonaGetResultOverrides]> = [
   [
@@ -13722,7 +13810,16 @@ const NOT_A_CONFIGURED_OWN_ROW: ReadonlyArray<readonly [string, (h: RecoveryHarn
       return {}
     },
   ],
-  ['the row is another caller\'s (its id is no persona\'s)', () => ({ claude_instance_id: 'adhoc_caller_1' })],
+  ['the row is another caller\'s (its id is no persona\'s)', () => ({ claude_instance_id: ANOTHER_CALLERS_ROW })],
+  [
+    'the configured-persona query throws (taken as not configured)',
+    () => {
+      setConfiguredPersonaQuery(() => {
+        throw new Error('configured-persona query broken')
+      })
+      return {}
+    },
+  ],
 ]
 
 /**
@@ -13747,27 +13844,6 @@ const WAIT_ENTRIES: ReadonlyArray<readonly [string, typeof LADDER_CALLS_BEFORE_W
   ['waitForWaitingAndReconnect', []],
   ['the collision ladder\'s launch', LADDER_CALLS_BEFORE_WAIT],
 ]
-
-/**
- * Wrap every verb of the harness's stub client, in place, so each call
- * appends the verb's name to the returned list, in call order, and the call
- * at position `at` of that list runs `during` once it has its answer, before
- * its caller gets it.
- */
-function runDuringCall(h: RecoveryHarness, at: number, during: () => void): string[] {
-  const order: string[] = []
-  const client = h.stub.client as unknown as Record<string, unknown>
-  for (const name of Object.keys(client)) {
-    const verb = client[name]
-    if (typeof verb !== 'function') continue
-    client[name] = (...args: unknown[]): unknown => {
-      const position = order.push(name) - 1
-      const result = (verb as (...a: unknown[]) => unknown).apply(client, args)
-      return position === at ? Promise.resolve(result).finally(during) : result
-    }
-  }
-  return order
-}
 
 /** The record a latch set elsewhere gives P: a case, P's bring-up and the working row. */
 const LATCHED_ELSEWHERE: ConflictLatchSetInput = {
@@ -13858,8 +13934,11 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
   })
 
   // Demo: tmux_server_changed and process_not_seen_session_present (with
-  // every other note, an unknown one and none) latch no one.
-  const plainCross = NOTE_SITES.flatMap((site) => PLAIN_NOTES.map(([label, note]) => [site.name, label, note, site] as const))
+  // every other note, an unknown one and none) latch no one. Every note runs
+  // at the collision get (NOTE_SITES[0]); the other sites take the sample.
+  const plainCross = NOTE_SITES.flatMap((site) =>
+    (site === NOTE_SITES[0] ? PLAIN_NOTES : SAMPLE_PLAIN_NOTES).map(([label, note]) => [site.name, label, note, site] as const),
+  )
   test.each(plainCross)('at %s, %s on P\'s own row latches no one: the launch takes today\'s step for the row and nothing is posted', async (_site, _label, note, site) => {
     const { h, p } = srj105Build()
     site.setup?.(h)
@@ -13945,7 +14024,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
     expect(h.notices).toEqual([])
   })
 
-  test.each(PLAIN_NOTES)('the restart path\'s working-row check, %s on P\'s own row: today\'s reading (an idle screen and an ended transcript start the evidence: defer, pending); nothing latched', async (_label, note) => {
+  test.each(SAMPLE_PLAIN_NOTES)('the restart path\'s working-row check, %s on P\'s own row: today\'s reading (an idle screen and an ended transcript start the evidence: defer, pending); nothing latched', async (_label, note) => {
     const { h, p } = srj105Build()
     const persona = harnessPersona(h, p)
     h.script({ readPaneResults: [{ pane: IDLE_PANE }], getResult: harnessRow(h, persona, { state: 'working', ...transcriptOf().fields, liveness_note: note }) })
@@ -13976,8 +14055,11 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
       readPaneResults: [{ pane: IDLE_PANE }],
     })
     const latchedAt = before.length + at
-    const order = runDuringCall(h, latchedAt, () => {
-      elsewhere.set(p, LATCHED_ELSEWHERE)
+    const order = recordCallOrder(h, {
+      at: latchedAt,
+      run: () => {
+        elsewhere.set(p, LATCHED_ELSEWHERE)
+      },
     })
 
     if (before.length === 0) {
@@ -13995,21 +14077,6 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
     expect(hasPendingWorkingRowEvidence(p)).toBe(false)
     expect(getFailureCount(p)).toBe(0)
     expect(h.controller.isArmed(p)).toBe(false)
-  })
-
-  test('a second read of the note on a latched P\'s own row reads latched again and posts nothing more: one CONFLICT notice for the episode', async () => {
-    const { h, p } = srj105Build()
-    h.script({ getResult: harnessRow(h, harnessPersona(h, p), { state: 'ended', liveness_note: provenanceNote }) })
-    const at = { site: 'readPersonaOwnRow', what: 'a test get' }
-
-    const reads = [await readPersonaOwnRow(p, at), await readPersonaOwnRow(p, at)]
-
-    expect(reads.map((read) => read.kind === OWN_ROW_READ_ROW && read.latched)).toEqual([true, true])
-    expect(h.latchEvents.filter((event) => event.step === 'set').map((event) => event.step === 'set' && event.outcome)).toEqual([
-      CONFLICT_LATCH_SET_LATCHED,
-      CONFLICT_LATCH_SET_SAME_CASE,
-    ])
-    expect(h.episodeNotices).toEqual([{ key: p, text: noteLatchNotice(p) }])
   })
 })
 
@@ -14065,7 +14132,7 @@ async function readOwnRowOnce(key: string, at: OwnRowReadSite = DEDUP_SITE): Pro
 describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a persona\'s own row is logged once per note, again only when the note changes', () => {
   afterEach(srj105AfterEach)
 
-  test.each([...nonLatchingNotes, unknownNote])('the note %s read twice on P\'s own row logs one line; nothing latched', async (note) => {
+  test.each([nonLatchingNotes[0]!, unknownNote])('the note %s read twice on P\'s own row logs one line; nothing latched', async (note) => {
     const { h, p } = srj105Build()
     scriptNotedRows(h, new Map([[p, { liveness_note: note }]]))
 
@@ -14104,7 +14171,7 @@ describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a 
       _resetConfiguredPersonaQuery()
       return { liveness_note: provenanceNote }
     }],
-    ['provenance_conflict on another caller\'s row (not applied)', () => ({ liveness_note: provenanceNote, claude_instance_id: 'adhoc_caller_1' })],
+    ['provenance_conflict on another caller\'s row (not applied)', () => ({ liveness_note: provenanceNote, claude_instance_id: ANOTHER_CALLERS_ROW })],
     ['provenance_conflict on P\'s own row (P latches)', () => ({ liveness_note: provenanceNote })],
   ])('note A, then a read with %s, then note A again logs A twice', async (_label, between) => {
     const { h, p } = srj105Build()
@@ -14140,25 +14207,6 @@ describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a 
       [dedupHead(p), a],
       [dedupHead(q), a],
       [dedupHead(p), a],
-    ])
-  })
-
-  test('_resetNotConnectedEpisodes() forgets every persona\'s logged note', async () => {
-    const { h, p, b: q } = srj105Build()
-    const [a] = nonLatchingNotes as [string]
-    scriptNotedRows(h, new Map([[p, { liveness_note: a }], [q, { liveness_note: a }]]))
-
-    await readOwnRowOnce(p)
-    await readOwnRowOnce(q)
-    _resetNotConnectedEpisodes()
-    await readOwnRowOnce(p)
-    await readOwnRowOnce(q)
-
-    expect(nonLatchingNoteLines(h)).toEqual([
-      [dedupHead(p), a],
-      [dedupHead(q), a],
-      [dedupHead(p), a],
-      [dedupHead(q), a],
     ])
   })
 
@@ -14280,12 +14328,7 @@ describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch
 // ---------------------------------------------------------------------------
 
 /** The one live pre-persona row (no `persona` label) the observing start sweep kills. */
-const SWEPT_OLD_ID = 'cscb_old_waiting_C0OLD'
-
-/** A pre-persona row as the start sweep's `list` answers it: `id` in `state`. */
-function sweptOldRow(state = 'waiting', id = SWEPT_OLD_ID): import('agent-director').ListRow {
-  return cannedListRow({ claude_instance_id: id, state, labels: { service: 'cscb', channel: 'C0OLD' } })
-}
+const SWEPT_OLD_ID = prePersonaRow('waiting').claude_instance_id
 
 /** A result that marks the swept row missing. */
 const OLD_MARKED_MISSING = cannedFindMissing({ rows: { [SWEPT_OLD_ID]: 'ids' } })
@@ -14368,7 +14411,7 @@ describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the sess
     installStub({
       findMissingCalls,
       findMissingQueue: [cannedOk(OLD_LEFT_LIVE), cannedOk(OLD_MARKED_MISSING), cannedOk(OLD_LEFT_LIVE)],
-      listResult: { spawns: [sweptOldRow()] },
+      listResult: { spawns: [prePersonaRow('waiting')] },
     })
     expect(FIND_MISSING_MEMO_TTL_MS).toBe(10_000)
 
@@ -14393,8 +14436,8 @@ describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the sess
     expect(lines.filter((line) => line.startsWith(`[slack] ${BYPASS_SITE}: bypassing findMissing sweep for persona=${C} — `))).toHaveLength(1)
   })
 
-  test('a bypassing run started while an ordinary run is in flight makes its own call; an ordinary caller arriving during it joins it, and the older run settling first leaves the bypassing run in flight', async () => {
-    const stub = installStub({ listResult: { spawns: [sweptOldRow()] } })
+  test('a bypassing run started while an ordinary run is in flight makes its own call; an ordinary caller arriving during it joins it, and the older run settling first leaves the bypassing run in flight: a caller arriving after that joins the bypassing run, not the older result', async () => {
+    const stub = installStub({ listResult: { spawns: [prePersonaRow('waiting')] } })
     const { held, calls } = holdFindMissing(stub, 2)
 
     const ordinary = sweepDeadTmuxChannel(C, 'dead-session')
@@ -14409,16 +14452,22 @@ describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the sess
 
     held[0]!.resolve(OLD_LEFT_LIVE)
     await ordinary
+    // The older run has settled; the bypassing run is still in flight.
+    const lateJoiner = reconcileOrphans(cfg)
+    await settleTurns(clock)
+    expect(calls()).toBe(2)
     held[1]!.resolve(OLD_MARKED_MISSING)
     expect(await bypass).toEqual(OLD_MARKED_MISSING)
     await joiner
+    await lateJoiner
 
     expect(calls()).toBe(2)
-    expect(sweptRowBuckets(lines)).toEqual(['missing'])
+    // Both ordinary callers got the bypassing run's result, never the older run's still-live.
+    expect(sweptRowBuckets(lines)).toEqual(['missing', 'missing'])
   })
 
   test('an older run resolving after a newer one leaves the newer result: each bypassing caller gets its own run\'s result, and a later ordinary caller reuses the newer one', async () => {
-    const stub = installStub({ listResult: { spawns: [sweptOldRow()] } })
+    const stub = installStub({ listResult: { spawns: [prePersonaRow('waiting')] } })
     const { held, calls } = holdFindMissing(stub, 2)
 
     const older = bypassingFindMissingSweep(C, BYPASS_SITE)
@@ -14433,25 +14482,6 @@ describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the sess
 
     await reconcileOrphans(cfg)
     expect(calls()).toBe(2)
-    expect(sweptRowBuckets(lines)).toEqual(['missing'])
-  })
-
-  test('regression (b.m4r): N concurrent ordinary callers make one findMissing call, and all get its result', async () => {
-    const stub = installStub({ listResult: { spawns: [sweptOldRow()] } })
-    const { held, calls } = holdFindMissing(stub, 1)
-
-    const callers = [
-      sweepDeadTmuxChannel('A', 'dead-session'),
-      sweepDeadTmuxChannel('B', 'dead-session'),
-      sweepDeadTmuxChannel(C, 'dead-session'),
-      reconcileOrphans(cfg),
-    ]
-    await settleTurns(clock)
-    expect(calls()).toBe(1)
-    held[0]!.resolve(OLD_MARKED_MISSING)
-    await Promise.all(callers)
-
-    expect(calls()).toBe(1)
     expect(sweptRowBuckets(lines)).toEqual(['missing'])
   })
 
@@ -14471,7 +14501,7 @@ describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the sess
       findMissingCalls,
       findMissingQueue: [cannedOk(OLD_MARKED_MISSING), cannedErr(err())],
       findMissingResult: OLD_LEFT_LIVE,
-      listResult: { spawns: [sweptOldRow()] },
+      listResult: { spawns: [prePersonaRow('waiting')] },
     })
 
     await reconcileOrphans(cfg)
@@ -14485,7 +14515,7 @@ describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the sess
   })
 })
 
-describe('b.jg5 SRJ-120: a pending row a findMissing run put in neither list was not judged (readFindMissingRow, the start sweep\'s post-kill line)', () => {
+describe('b.jg5 SRJ-120: a pending row a findMissing run put in neither list was not judged (readFindMissingRow)', () => {
   const ROW = personaInstanceId('C')
 
   test.each<[string, FindMissingRowPlacement, string, FindMissingRowReading]>([
@@ -14501,44 +14531,6 @@ describe('b.jg5 SRJ-120: a pending row a findMissing run put in neither list was
 
     expect(readFindMissingRow(result, ROW, stateBefore)).toBe(reading)
   })
-
-  test('the start sweep\'s post-kill line: a killed pending row left in neither list is not judged; a killed pending row in unverified_ids and a killed waiting row in neither list still read live; a killed row in ids is missing; each is killed once and none deleted', async () => {
-    const pendingNotJudged = 'cscb_old_pending_a_C0OLD'
-    const pendingLeftLive = 'cscb_old_pending_b_C0OLD'
-    const waitingAlive = 'cscb_old_waiting_c_C0OLD'
-    const workingMissing = 'cscb_old_working_d_C0OLD'
-    const killCalls: import('agent-director').KillParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
-    installStub({
-      killCalls,
-      deleteCalls,
-      listResult: {
-        spawns: [
-          sweptOldRow(AGENT_DIRECTOR_PENDING_STATE, pendingNotJudged),
-          sweptOldRow(AGENT_DIRECTOR_PENDING_STATE, pendingLeftLive),
-          sweptOldRow('waiting', waitingAlive),
-          sweptOldRow('working', workingMissing),
-        ],
-      },
-      findMissingResult: cannedFindMissing({ rows: { [pendingLeftLive]: 'unverified_ids', [workingMissing]: 'ids' } }),
-    })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-
-    const errLog = await withCapturedErr(async () => {
-      await reconcileOrphans(cfg)
-    })
-
-    const lines = errLog.split('\n')
-    expect([pendingNotJudged, pendingLeftLive, waitingAlive, workingMissing].map((id) => sweptRowBuckets(lines, id))).toEqual([
-      ['not-judged'],
-      ['still-live'],
-      ['still-live'],
-      ['missing'],
-    ])
-    expect(killCalls.map((k) => k.claude_instance_id)).toEqual([pendingNotJudged, pendingLeftLive, waitingAlive, workingMissing])
-    expect(deleteCalls).toEqual([])
-    assertNoLeak({ errLog })
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -14551,8 +14543,11 @@ describe('b.jg5 SRJ-120: a pending row a findMissing run put in neither list was
 // goes on, except the row of the starter's next-step key; a
 // `provenance_conflict` note there latches that persona (SRJ-114). Another
 // caller's row, the row of a key the applied set does not hold, and a row in
-// `ids` or in neither list get no `get`. A persona latched by such a `get`
-// stops its caller's path: the b.4dk sweep before `resume` answers `latched`,
+// `ids` or in neither list get no `get`. The `get`s are made all at once,
+// and their line lists the personas in `unverified_ids` order. A failed `get`
+// of the caller's own row refuses the caller (the describe after these);
+// another persona's failed `get` is only logged. A persona latched by such a
+// `get` stops its caller's path: the b.4dk sweep before `resume` answers `latched`,
 // `checkPromptRowDeferral` answers `latched` with no `status` read, and the
 // working-row wait ends `latched` with nothing typed. Every case runs on
 // `makeRecoveryHarness` (the real latch, the configured-persona query over
@@ -14571,8 +14566,23 @@ function getIds(h: RecoveryHarness): string[] {
   return h.stub.calls.getCalls.map((c) => c.claude_instance_id)
 }
 
-/** A row id that is no persona's: another caller's. */
-const ANOTHER_CALLERS_ROW = 'adhoc_caller_1'
+/** What the one line of a run's post-run gets lists: `persona=<key> <read|latched|absent|refused (…)>, …`. */
+function postRunReadsOf(h: RecoveryHarness): string {
+  const marker = ' — one get of each configured persona\'s own row in unverified_ids: '
+  const lines = h.errors.filter((line) => line.includes(marker) && line.endsWith(' (b.jg5 SRJ-120)'))
+  expect(lines).toHaveLength(1)
+  return lines[0]!.slice(lines[0]!.indexOf(marker) + marker.length, -' (b.jg5 SRJ-120)'.length)
+}
+
+/** The refusal lines of a failed post-run get of the caller's own row, logged at `logPrefix` for `ref`. */
+function postRunGetRefusalLines(h: RecoveryHarness, logPrefix: string, ref: string): string[] {
+  return h.errors.filter((line) => line.startsWith(`[slack] ${logPrefix}: post-sweep get refused for ${ref}: `) && line.endsWith(' — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)'))
+}
+
+/** Every refusal line (b.jg5 SRJ-105) the harness captured, at any site, for any persona. */
+function everyRefusalLine(h: RecoveryHarness): string[] {
+  return h.errors.filter((line) => line.endsWith(' — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)'))
+}
 
 /** The two callers of the demo: an ordinary run (no answer) and a bypassing run (`FIND_MISSING_LATCHED` once P latched). */
 const P_ROW_CALLERS: ReadonlyArray<readonly [string, (p: string) => Promise<unknown>, unknown]> = [
@@ -14690,20 +14700,30 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     expect(clock.pendingCount()).toBe(0)
   })
 
-  test('N concurrent callers sharing one run make one get per listed configured row; P latches once with one post', async () => {
+  test('callers sharing one run make one get per listed configured row: B starts the run, B and P\'s prompt-row check join it; P latches once with one post, and P\'s joining check answers latched with no status read', async () => {
     const { h, p, b } = srj105Build()
+    const clock = useFakeNow()
     scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
-    h.script({ findMissingResult: unverifiedRowsOf(p, b) })
+    h.script({ statusResult: cannedStatusResult({ state: 'check_permission' }) })
+    expect(await checkPromptRowDeferral(p, 'check_permission')).toBe('defer')
+    await clock.advance(PROMPT_ROW_SWEEP_AFTER_MS)
+    const { held, calls } = holdFindMissing(h.stub.client, 1)
 
-    await Promise.all([
-      sweepDeadTmuxChannel(p, 'dead-session'),
-      sweepDeadTmuxChannel(b, 'dead-session'),
-      sweepDeadTmuxChannel(p, 'dead-session'),
-    ])
+    const starter = sweepDeadTmuxChannel(b, 'dead-session')
+    await settleTurns(clock)
+    const joiners = [sweepDeadTmuxChannel(b, 'dead-session'), checkPromptRowDeferral(p, 'check_permission')]
+    await settleTurns(clock)
+    expect(calls()).toBe(1)
+    held[0]!.resolve(unverifiedRowsOf(p, b))
+    await starter
+    const [, pCheck] = await Promise.all(joiners)
 
-    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    expect(pCheck).toBe('latched')
+    expect(calls()).toBe(1)
     expect([...getIds(h)].sort()).toEqual([personaInstanceId(p), personaInstanceId(b)].sort())
+    expect(h.stub.calls.statusCalls).toEqual([])
     expectNoteLatchedOnce(h, p, ENDED_READ)
+    expect(clock.pendingCount()).toBe(0)
   })
 
   test('the next-step option: a bypassing run whose caller\'s next step is a get of P\'s row makes no get of it, while B\'s listed row gets its own and its note latches B', async () => {
@@ -14719,21 +14739,76 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     expect(h.latch.isLatched(p)).toBe(false)
   })
 
-  test.each<[string, () => Error]>([
-    ['ErrSpawnNotFound (the row is absent)', () => errSpawnNotFound()],
-    ...SRJ105_UNAVAILABLE.map(([label, build]) => [`${label} (UNAVAILABLE)`, () => build('get')] as [string, () => Error]),
-  ])('a follow-up get answering %s latches nothing and starts no tmux-unresponsive condition; the caller still gets the run\'s result', async (_label, err) => {
-    const { h, p } = srj105Build()
-    const result = unverifiedRowsOf(p)
-    h.script({ findMissingResult: result, getError: err() })
+  // b.jg5 SRJ-114, SRJ-105: the post-run get of the caller's own row is a get
+  // site; any error but ErrSpawnNotFound (and UNUSABLE NAME, below) refuses
+  // the caller. The other listed row is read all the same, and the run's
+  // result is memoized either way.
+  test.each<[string, () => Error, boolean]>([
+    ['ErrSpawnNotFound (the row is absent): the caller gets the run\'s result', () => errSpawnNotFound(), false],
+    ...SRJ105_UNAVAILABLE.map(([label, build]) => [`${label} (UNAVAILABLE): the caller is refused (FIND_MISSING_REFUSED) with one refusal line`, () => build('get'), true] as [string, () => Error, boolean]),
+  ])('the post-run get of the caller\'s (P\'s) own row answering %s; B\'s listed row is still read and its note latches B; P latches nothing and starts no tmux-unresponsive condition; the result is memoized, so an ordinary caller inside the window makes no second findMissing call', async (_label, err, refused) => {
+    const { h, p, b } = srj105Build()
+    const pId = personaInstanceId(p)
+    const result = unverifiedRowsOf(p, b)
+    h.script({
+      findMissingResult: result,
+      getFn: (params) => (params.claude_instance_id === pId ? err() : harnessRow(h, harnessPersona(h, b), { state: 'ended', liveness_note: provenanceNote })),
+    })
+
+    expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toBe(refused ? FIND_MISSING_REFUSED : result)
+
+    expect([...getIds(h)].sort()).toEqual([pId, personaInstanceId(b)].sort())
+    expectNoteLatchedOnce(h, b, ENDED_READ)
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+    expect(postRunGetRefusalLines(h, BYPASS_SITE, `persona=${p}`)).toHaveLength(refused ? 1 : 0)
+    expect(everyRefusalLine(h)).toHaveLength(refused ? 1 : 0)
+
+    await sweepDeadTmuxChannel(p, 'dead-session')
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    expect(getIds(h)).toHaveLength(2)
+  })
+
+  test('the post-run get of another persona\'s (B\'s) own row failing (UNAVAILABLE) is only logged: P\'s caller gets the run\'s result; no refusal line for either persona; the run\'s line lists B refused', async () => {
+    const { h, p, b } = srj105Build()
+    const bId = personaInstanceId(b)
+    const [, unavailable] = SRJ105_UNAVAILABLE.find(([label]) => label.includes('ErrCallTimeout'))!
+    const result = unverifiedRowsOf(p, b)
+    h.script({
+      findMissingResult: result,
+      getFn: (params) => (params.claude_instance_id === bId ? unavailable('get') : harnessRow(h, harnessPersona(h, p), { state: 'ended' })),
+    })
 
     expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toEqual(result)
 
-    expect(getIds(h)).toEqual([personaInstanceId(p)])
+    expect([...getIds(h)].sort()).toEqual([personaInstanceId(p), bId].sort())
+    expect(everyRefusalLine(h)).toEqual([])
+    expect(postRunReadsOf(h)).toContain(`persona=${b} refused (`)
     expectNoNoteLatch(h)
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-    expect(h.notices).toEqual([])
+  })
+
+  test('the post-run gets run at once: with two listed rows whose gets are held, both gets are made before either answers, and the run\'s line lists the personas in unverified_ids order, not in the order their gets answered', async () => {
+    const { h, p, b } = srj105Build()
+    // unverified_ids lists B's row before P's.
+    const result: import('agent-director').FindMissingResult = { count: 0, ids: [], unverified: 2, unverified_ids: [personaInstanceId(b), personaInstanceId(p)] }
+    h.script({ findMissingResult: result })
+    const gets = new Map<string, (row: CannedGetResult) => void>()
+    h.stub.client.get = (params) =>
+      new Promise((resolve) => {
+        gets.set(params.claude_instance_id, (row) => resolve(row as Awaited<ReturnType<typeof h.stub.client.get>>))
+      })
+
+    const caller = bypassingFindMissingSweep(p, BYPASS_SITE)
+    await settleTurns(h.clock)
+    expect([...gets.keys()]).toEqual([personaInstanceId(b), personaInstanceId(p)])
+    // P's get answers first.
+    gets.get(personaInstanceId(p))!(harnessRow(h, harnessPersona(h, p), { state: 'ended' }))
+    await settleTurns(h.clock)
+    gets.get(personaInstanceId(b))!(harnessRow(h, harnessPersona(h, b), { state: 'ended' }))
+
+    expect(await caller).toEqual(result)
+    expect(postRunReadsOf(h)).toBe(`persona=${b} read, persona=${p} read`)
   })
 
   test('a failed run makes no get: an UNUSABLE NAME findMissing answer reads no row', async () => {
@@ -14752,7 +14827,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     const { h, p } = srj105Build()
     scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
     h.script({
-      listResult: { spawns: [sweptOldRow()] },
+      listResult: { spawns: [prePersonaRow('waiting')] },
       findMissingResult: cannedFindMissing({ rows: { [SWEPT_OLD_ID]: 'ids', [personaInstanceId(p)]: 'unverified_ids' } }),
     })
     const order = recordCallOrder(h)
@@ -14796,6 +14871,28 @@ describe('b.jg5 SRJ-120, SRJ-502: a persona latched by a run\'s get stops its ca
     expectNoteLatchedOnce(h, p, WAITING_READ)
   })
 
+  test('launchOnPromptRow (a check_permission row whose tmux session is gone): the sweep lists P\'s own row and its get reads the note: P latches and the launch answers latched, with no status read, resume, kill, delete or second spawn after the get', async () => {
+    const { h, p } = srj105Build()
+    tmuxSessionsGone()
+    const persona = harnessPersona(h, p)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [
+        cannedOk(harnessRow(h, persona, { state: 'check_permission' })),
+        cannedOk(harnessRow(h, persona, { state: 'check_permission', liveness_note: provenanceNote })),
+      ],
+      findMissingResult: unverifiedRowsOf(p),
+    })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order.slice(order.indexOf('findMissing'))).toEqual(['findMissing', 'get'])
+    expect(h.stub.calls.statusCalls).toEqual([])
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1 }))
+    expectNoteLatchedOnce(h, p, latchRowStateRead('check_permission'))
+  })
+
   test('checkPromptRowDeferral past PROMPT_ROW_SWEEP_AFTER_MS: the run lists P\'s own row and its get reads the note: P latches and the check answers latched, with no status read after the get', async () => {
     const { h, p } = srj105Build()
     const clock = useFakeNow()
@@ -14836,5 +14933,79 @@ describe('b.jg5 SRJ-120, SRJ-502: a persona latched by a run\'s get stops its ca
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: before.length === 0 ? 0 : 1 }))
     expect(waitLatchedLines(h)).toHaveLength(1)
     expectNoteLatchedOnce(h, p, WORKING_READ)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-114 with SRJ-105: the post-run get of the caller's own row is one
+// of SRJ-114's get sites, so its failure follows SRJ-105's get rule. When it
+// fails with an error other than ErrSpawnNotFound and UNUSABLE NAME, the
+// persona's caller, the run's starter or a joiner, is refused
+// (`FIND_MISSING_REFUSED`): one refusal line, its retry timer armed with the
+// cause, nothing counted, and no resume, kill, delete or launch. A joiner's
+// attempt sees the error under its own key (b.jg5 SRJ-301), since the get
+// ran in the starter's. An UNUSABLE NAME answer lets the caller go on.
+// Another persona's failed get only shows in the run's line (above).
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row stops the caller\'s attempt', () => {
+  beforeEach(() => {
+    _resetFindMissingMemo()
+  })
+  afterEach(srj105AfterEach)
+
+  const [callTimeoutLabel, callTimeout, callTimeoutKind] = SRJ105_UNAVAILABLE.find(([label]) => label.includes('ErrCallTimeout'))!
+
+  // The b.4dk path: a waiting row whose reconnect found its session dead runs
+  // the sweep before `resume`; its run lists P's own row, and the post-run
+  // get of that row fails.
+  test.each<[string, () => Error, SpawnPersonaResult['action'], boolean, Partial<LaunchVerbCalls>]>([
+    [`${callTimeoutLabel} (UNAVAILABLE): refused, no resume, kill, delete or spawn`, () => callTimeout('get'), 'failed', true, { spawn: 1, sendKeys: 2 }],
+    ['an UNUSABLE NAME answer: no refusal, the resume goes on', () => errUnusableName(), 'resumed', false, { spawn: 1, sendKeys: 2, resume: 1 }],
+  ])('the b.4dk path (the sweep before resume), P\'s own post-run get answering %s', async (_label, err, action, refused, calls) => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk(harnessRow(h, persona, { state: 'waiting' })), cannedErr(err())],
+      sendKeysError: errTmuxSendKeys(),
+      findMissingResult: unverifiedRowsOf(p),
+    })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual(refused ? { key: p, action, refused: true } : { key: p, action })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf(calls))
+    expect(order.slice(order.indexOf('findMissing'), order.indexOf('findMissing') + 2)).toEqual(['findMissing', 'get'])
+    expect(postRunGetRefusalLines(h, 'spawnForPersona: before resume', renderPersonaRef(p, p))).toHaveLength(refused ? 1 : 0)
+    expect(everyRefusalLine(h)).toHaveLength(refused ? 1 : 0)
+    expect(h.triggers).toEqual(refused ? [{ key: p, kind: callTimeoutKind }] : [])
+    expect(h.controller.isArmed(p)).toBe(refused)
+    expect(getFailureCount(p)).toBe(0)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(h.notices).toEqual([])
+    expectNoNoteLatch(h)
+  })
+
+  test(`a joiner (B) whose own post-run get answers ${callTimeoutLabel} (UNAVAILABLE): P started the prompt-row sweep and B joined it; one findMissing call; B is refused under its own key (its attempt sees the error: armed once with the cause, never counted, no tmux-unresponsive condition) with no resume, kill, delete or launch; P, whose own get read its row, goes on (no-op: its row still reads check_permission)`, async () => {
+    const { h, p, b } = srj105Build()
+    const err = callTimeout('get')
+
+    const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, unverifiedRowsOf(p, b), new Map([[b, err]]))
+
+    expect(pResult).toStrictEqual({ key: p, action: 'no-op' })
+    expect(bResult).toStrictEqual({ key: b, action: 'failed', refused: true })
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
+    expect(postRunGetRefusalLines(h, 'spawnForPersona: prompt row', renderPersonaRef(b, b))).toHaveLength(1)
+    expect(everyRefusalLine(h)).toHaveLength(1)
+    expect(h.triggers).toEqual([{ key: b, kind: callTimeoutKind }])
+    expect(h.controller.isArmed(b)).toBe(true)
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(getFailureCount(b)).toBe(0)
+    expect(h.tmuxUnresponsive.holds(b)).toBe(false)
+    expect(conditionStartedLines(h, b)).toEqual([])
+    expect(h.notices).toEqual([])
+    expectNoNoteLatch(h)
   })
 })

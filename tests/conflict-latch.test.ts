@@ -97,10 +97,10 @@
  * line by line from the exported constants and the case-sentence table, with
  * no "agent-director said" line; P latched first with another case relatches
  * on the note with one new post; a configured Q's own row latches Q alone;
- * and `tmux_server_changed`, `process_not_seen_session_present`, every other
- * listed note, the unknown note, no note, and the latching note on another
- * caller's row, on a key outside the configuration and on a removed
- * persona's row latch no one and post nothing.
+ * and `tmux_server_changed`, `process_not_seen_session_present` (standing
+ * for every other listed note), the unknown note, no note, and the latching
+ * note on another caller's row, on a key outside the configuration and on a
+ * removed persona's row latch no one and post nothing.
  *
  * Pure module under test, except the recovery-harness cases: one
  * `createConflictLatch` per test over a line capture and a recording
@@ -1939,11 +1939,12 @@ describe('the note latch through the own-row read: record, notice, relatch and w
 
   /**
    * The reads that latch no one, by name: the key read and the stub's `get`
-   * answer for it. An absent persona is a key outside the harness's
-   * personas, or one removed from the applied configuration.
+   * answer for it. Two listed notes stand for the rest (the pure decision
+   * above covers every note). An absent persona is a key outside the
+   * harness's personas, or one removed from the applied configuration.
    */
   const NO_LATCH_READS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => { key: string; script: RecoveryStubScript }]> = [
-    ...nonLatchingNotes.map(
+    ...(['tmux_server_changed', 'process_not_seen_session_present'] as const).map(
       (note) => [`a ${note} note on P's own row`, (h: RecoveryHarness, p: string) => ({ key: p, script: ownRowAnswer(h, p, note) })] as const,
     ),
     [`an unknown note (${unknownNote}) on P's own row`, (h, p) => ({ key: p, script: ownRowAnswer(h, p, unknownNote) })],

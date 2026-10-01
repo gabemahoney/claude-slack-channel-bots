@@ -1104,16 +1104,21 @@ export function callCountsSince(after: Record<string, number>, before: Record<st
  * Every function the client has is wrapped (unlike the stub's own `calls`
  * log, which a case reads verb by verb), so the list holds exactly the calls
  * made, a stray `readPane`, `sendKeys`, `pause` or `decide` included.
+ *
+ * With `during`, the call at position `during.at` of the list runs
+ * `during.run` once it has its answer, before its caller gets it (for
+ * example, to latch a persona elsewhere while that call is in progress).
  */
-export function recordCallOrder(h: RecoveryHarness): string[] {
+export function recordCallOrder(h: RecoveryHarness, during?: { readonly at: number; run(): void }): string[] {
   const order: string[] = []
   const client = h.stub.client as unknown as Record<string, unknown>
   for (const name of Object.keys(client)) {
     const verb = client[name]
     if (typeof verb !== 'function') continue
     client[name] = (...args: unknown[]): unknown => {
-      order.push(name)
-      return (verb as (...a: unknown[]) => unknown).apply(client, args)
+      const position = order.push(name) - 1
+      const result = (verb as (...a: unknown[]) => unknown).apply(client, args)
+      return position === during?.at ? Promise.resolve(result).finally(() => during.run()) : result
     }
   }
   return order

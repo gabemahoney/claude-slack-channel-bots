@@ -2661,14 +2661,25 @@ interface FindMissingSweepOptions {
 
 let _findMissingMemoTtlMs = FIND_MISSING_MEMO_TTL_MS
 
-/** What a run that resolved hands every caller awaiting it. */
-interface FindMissingRunOutcome {
-  readonly result: FindMissingResult
+/** What the post-run `get`s of a run read (`readListedPersonaRows`). */
+interface PostRunReads {
   /**
    * The configured personas whose own row a post-run `get` of this run read
    * as latching (`OwnRowRead.latched`, b.jg5 SRJ-114).
    */
   readonly latchedKeys: ReadonlySet<string>
+  /**
+   * The configured personas whose own row's post-run `get` failed with an
+   * error other than `ErrSpawnNotFound` (`OWN_ROW_READ_REFUSED`), each with
+   * that error, carried unchanged. Only the persona's own caller acts on it
+   * (`postRunGetRefusal`, b.jg5 SRJ-105, SRJ-114).
+   */
+  readonly refusedReads: ReadonlyMap<string, unknown>
+}
+
+/** What a run that resolved hands every caller awaiting it: its result and its post-run reads. */
+interface FindMissingRunOutcome extends PostRunReads {
+  readonly result: FindMissingResult
 }
 
 /** One findMissing run the server made. `seq` orders runs by when they started. */
@@ -2731,6 +2742,10 @@ export function _resetFindMissingMemo(): void {
  * answer, b.jg5 SRJ-313) is a refusal: one refusal line, and
  * `FIND_MISSING_REFUSED`, after which the caller calls nothing more in its
  * attempt. Any other failure, UNUSABLE NAME included, logs once and lets the
+ * caller proceed. A post-run `get` of persona `key`'s own row that fails with
+ * an error other than `ErrSpawnNotFound` is handled as a `get` at an SRJ-114
+ * site (b.jg5 SRJ-105, SRJ-114, `refusalAt` with verb `get`): a refusal
+ * answers `FIND_MISSING_REFUSED` too, and an UNUSABLE NAME answer lets the
  * caller proceed.
  *
  * @param key persona key: the outage key and log context — the sweep itself is whole-store.
@@ -2772,9 +2787,11 @@ export type FindMissingSweepAnswer =
  * A persona's findMissing sweep that was refused (b.jg5 SRJ-105): the sweep
  * failed with an error the arming predicate answers a cause for, which for
  * `find-missing` (not a read verb) is an UNAVAILABLE, an ENVIRONMENT, a
- * CONFIG or an UNCLASSIFIED answer (b.jg5 SRJ-313). The caller
- * stops its launch or recovery attempt: no resume, kill, delete, launch,
- * reconnect or dead-session verdict follows.
+ * CONFIG or an UNCLASSIFIED answer (b.jg5 SRJ-313); or the sweep succeeded
+ * and the post-run `get` of the persona's own row failed with such an error,
+ * which for `get` is any error but `ErrSpawnNotFound` and an UNUSABLE NAME
+ * answer (b.jg5 SRJ-114). The caller stops its launch or recovery attempt:
+ * no resume, kill, delete, launch, reconnect or dead-session verdict follows.
  */
 export const FIND_MISSING_REFUSED: unique symbol = Symbol('find-missing refused')
 
@@ -2814,7 +2831,18 @@ export const FIND_MISSING_LATCHED: unique symbol = Symbol('find-missing latched'
  * alike) goes on, each configured persona's own row listed in
  * `unverified_ids` is read with one `get` through the shared own-row read
  * (`readPersonaOwnRow`), except the row of the starter's
- * `opts.nextStepGetKey`. A memo hit makes no `get`.
+ * `opts.nextStepGetKey`. A memo hit makes no `get`. When the `get` of a
+ * persona caller's own row failed with an error other than
+ * `ErrSpawnNotFound`, that caller, the starter or a joiner, handles it as a
+ * `get` at an SRJ-114 site (`postRunGetRefusal`, b.jg5 SRJ-105, SRJ-114): a
+ * joiner first reports it under its own key, then a refusal (`refusalAt`
+ * with `get`) logs its line and answers `FIND_MISSING_REFUSED`:
+ *
+ *   [slack] <logPrefix>: post-sweep get refused for <ref>: <failure> — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)
+ *
+ * and any other error (an UNUSABLE NAME answer) lets the caller go on. A
+ * failed `get` of another persona's row only shows in the run's line, and
+ * no failed `get` changes the run's result or its memo.
  *
  * Failures, of either kind, are logged with the run kind, never memoized, and
  * leave any earlier memoized result in place; a failed run makes no `get`.
@@ -2839,7 +2867,9 @@ export const FIND_MISSING_LATCHED: unique symbol = Symbol('find-missing latched'
  * A persona's caller gets `FIND_MISSING_LATCHED` instead of a result or
  * undefined when its persona is latched once the sweep is done (b.jg5
  * SRJ-502): a post-run `get` of this run read its row as latching, or
- * `personaLatchedNow` answers true. The caller logs its own stop line.
+ * `personaLatchedNow` answers true. The caller logs its own stop line. A
+ * refusal, of the sweep or of the post-run `get` of the caller's own row,
+ * answers `FIND_MISSING_REFUSED` whether or not the persona is latched.
  */
 async function sharedFindMissingSweep(
   start: () => Promise<FindMissingResult>,
@@ -2881,9 +2911,9 @@ async function sharedFindMissingSweep(
   const run = joined ?? startFindMissingRun(start, kind, opts.nextStepGetKey, logPrefix, ref)
   if (joined === null) _findMissingInFlight = run
 
+  let outcome: FindMissingRunOutcome
   try {
-    const outcome = await run.promise
-    return latchedOr(key, outcome.result, outcome.latchedKeys)
+    outcome = await run.promise
   } catch (err) {
     // A joiner's failure is its own: raise and report it under its key, as the
     // starter's wrapper did under the starter's (b.jg5 SRJ-301, SRJ-311).
@@ -2907,10 +2937,44 @@ async function sharedFindMissingSweep(
     console.error(`[slack] ${logPrefix}: ${what} failed for ${ref}: ${describeAgentDirectorFailure(e)} — proceeding`)
     return latchedOr(key, undefined, NO_LATCHED_KEYS)
   }
+  // b.jg5 SRJ-105, SRJ-114: a failed post-run `get` of the caller's own row stops its attempt.
+  if (key !== undefined && postRunGetRefusal(key, outcome.refusedReads, joined !== null, logPrefix, ref)) {
+    return FIND_MISSING_REFUSED
+  }
+  return latchedOr(key, outcome.result, outcome.latchedKeys)
 }
 
 /** No persona latched by a run's post-run `get`s. */
 const NO_LATCHED_KEYS: ReadonlySet<string> = new Set<string>()
+
+/**
+ * Whether the post-run `get` of persona `key`'s own row, made by the run its
+ * caller started or joined, is a refusal for that caller (b.jg5 SRJ-114:
+ * this read is one of the `get` sites, and any error but `ErrSpawnNotFound`
+ * follows SRJ-105's `status`/`get`/`list` rule). Only `key`'s own read
+ * counts: another persona's failed read stays in the run's summary line.
+ * When `key`'s read failed (`refusedReads`) and the caller joined a run
+ * someone else started, the error is first reported under `key`
+ * (`reportAgentDirectorError` with `get`), as a joiner's failed sweep is: the
+ * `get` ran in the starter's context, so the caller's own attempt had not
+ * seen it (b.jg5 SRJ-301); the read's wrapper has already raised `key`'s
+ * outage flags. Then `refusalAt` with `get` decides: a refusal logs its one
+ * line and answers true; any other error (an UNUSABLE NAME answer) answers
+ * false, and the caller goes on as after any read. A read that answered
+ * absent, or no read, answers false. Never throws.
+ */
+function postRunGetRefusal(
+  key: string,
+  refusedReads: ReadonlyMap<string, unknown>,
+  joined: boolean,
+  logPrefix: string,
+  ref: string,
+): boolean {
+  if (!refusedReads.has(key)) return false
+  const err = refusedReads.get(key)
+  if (joined) reportAgentDirectorError(key, err, 'get')
+  return refusalAt(key, err, 'get', logPrefix, 'post-sweep get', ref) !== undefined
+}
 
 /**
  * What a sweep answers persona `key`'s caller: `FIND_MISSING_LATCHED` when
@@ -2934,7 +2998,8 @@ function findMissingSweepWords(kind: FindMissingRunKind): string {
 /**
  * Start one findMissing run (`sharedFindMissingSweep`): make the call, then,
  * on success, log the run's line, make the post-run `get`s
- * (`readListedPersonaRows`), memoize the result unless a run started later
+ * (`readListedPersonaRows`, whose latched and failed reads the run's outcome
+ * carries), memoize the result unless a run started later
  * has been memoized already, and clear the in-flight slot while this run is
  * still in it. On failure only the slot is cleared (while this run is in it)
  * and the error is rethrown to every caller awaiting the run. The caller puts
@@ -2964,10 +3029,10 @@ function startFindMissingRun(
     console.error(
       `[slack] ${logPrefix}: ${words} for ${ref} — count=${result.count} ids=[${result.ids.join(',')}] unverified=${result.unverified} unverified_ids=[${result.unverified_ids.join(',')}]`,
     )
-    const latchedKeys = await readListedPersonaRows(result, nextStepGetKey, logPrefix, `${words} for ${ref}`)
+    const reads = await readListedPersonaRows(result, nextStepGetKey, logPrefix, `${words} for ${ref}`)
     if (_findMissingLast === null || _findMissingLast.seq < seq) _findMissingLast = { result, at, seq }
     if (_findMissingInFlight === run) _findMissingInFlight = null
-    return { result, latchedKeys }
+    return { result, latchedKeys: reads.latchedKeys, refusedReads: reads.refusedReads }
   })()
   run = { seq, kind, promise }
   return run
@@ -2995,28 +3060,34 @@ function configuredPersonaKeyOfRowId(id: unknown): string | undefined {
  * in list order), except `nextStepGetKey`'s, is read with one `get` through
  * the shared own-row read (`readPersonaOwnRow`, through
  * `withOutageDetection` for that persona, whatever persona the run was made
- * for), one after another. SRJ-114's rule applies at each read: only a
- * `provenance_conflict` note on the persona's own row latches it, and the
- * read logs its note lines (`<logPrefix>: post-sweep get for persona=<key>:
- * …`). A `get` answering absent or refused changes nothing: it never fails
- * the run, is never memoized as a failure and never stops the other `get`s.
- * No `get` is made for any other id. When at least one row was read, one line
- * lists the personas read and what each read answered (persona references
- * only; a refused read carries the redacting describer's text):
+ * for), all at once, and the run waits for every one of them to settle.
+ * SRJ-114's rule applies at each read: only a `provenance_conflict` note on
+ * the persona's own row latches it, and the read logs its note lines
+ * (`<logPrefix>: post-sweep get for persona=<key>: …`). A `get` answering
+ * absent changes nothing. A `get` failing with any other error is carried
+ * in the answer (`refusedReads`) for that persona's own caller to handle
+ * (`postRunGetRefusal`); for every other caller it is only listed in the
+ * line below. Neither ever fails the run, is memoized as a failure or stops
+ * the other `get`s. No `get` is made for any other id. When at least one row
+ * was read, one line lists the personas read, in `unverified_ids` order, and
+ * what each read answered (persona references only; a refused read carries
+ * the redacting describer's text):
  *
  *   [slack] <logPrefix>: after the <run> — one get of each configured persona's own row in unverified_ids: persona=<key> <read|latched|absent|refused (<failure>)>, … (b.jg5 SRJ-120)
  *
  * where `<run>` is `findMissing sweep for <ref>` or `bypassing findMissing
  * sweep for <ref>`. Answers the personas whose read latched
- * (`OwnRowRead.latched`). Never throws.
+ * (`OwnRowRead.latched`) and the personas whose read failed, each with its
+ * error. Never throws.
  */
 async function readListedPersonaRows(
   result: FindMissingResult,
   nextStepGetKey: string | undefined,
   logPrefix: string,
   run: string,
-): Promise<ReadonlySet<string>> {
+): Promise<PostRunReads> {
   const latchedKeys = new Set<string>()
+  const refusedReads = new Map<string, unknown>()
   const read: string[] = []
   try {
     const keys: string[] = []
@@ -3025,19 +3096,29 @@ async function readListedPersonaRows(
       if (key === undefined || key === nextStepGetKey || keys.includes(key)) continue
       keys.push(key)
     }
-    for (const key of keys) {
-      const ownRead = await readPersonaOwnRow(key, { site: logPrefix, what: 'post-sweep get' })
+    const settled = await Promise.allSettled(
+      keys.map((key) => readPersonaOwnRow(key, { site: logPrefix, what: 'post-sweep get' })),
+    )
+    settled.forEach((outcome, i) => {
+      const key = keys[i]
+      if (outcome.status === 'rejected') {
+        // Not reached (`readPersonaOwnRow` never throws); that persona is left out of the line.
+        console.error(`[slack] ${logPrefix}: after the ${run} — the post-sweep gets failed: ${describeThrownValue(outcome.reason)} (b.jg5 SRJ-120)`)
+        return
+      }
+      const ownRead = outcome.value
       if (ownRead.kind === OWN_ROW_READ_ROW) {
         if (ownRead.latched) latchedKeys.add(key)
         read.push(`${keyRef(key)} ${ownRead.latched ? 'latched' : 'read'}`)
       } else if (ownRead.kind === OWN_ROW_READ_ABSENT) {
         read.push(`${keyRef(key)} absent`)
       } else {
+        refusedReads.set(key, ownRead.error)
         read.push(`${keyRef(key)} refused (${describeAgentDirectorFailure(ownRead.error)})`)
       }
-    }
+    })
   } catch (err) {
-    // Not reached (`readPersonaOwnRow` never throws); a throw ends the reads with what was read.
+    // Not reached (nothing above throws); a throw ends the reads with what was read.
     console.error(`[slack] ${logPrefix}: after the ${run} — the post-sweep gets failed: ${describeThrownValue(err)} (b.jg5 SRJ-120)`)
   }
   if (read.length > 0) {
@@ -3045,7 +3126,7 @@ async function readListedPersonaRows(
       `[slack] ${logPrefix}: after the ${run} — one get of each configured persona's own row in unverified_ids: ${read.join(', ')} (b.jg5 SRJ-120)`,
     )
   }
-  return latchedKeys
+  return { latchedKeys, refusedReads }
 }
 
 /**
@@ -3072,7 +3153,8 @@ async function readListedPersonaRows(
  * ordinary run.
  *
  * Answers as `reconcileMissingSweep` does: the result, `FIND_MISSING_REFUSED`
- * for a refusal (b.jg5 SRJ-105: the caller stops its attempt),
+ * for a refusal of the run or of the post-run `get` of `key`'s own row (b.jg5
+ * SRJ-105, SRJ-114: the caller stops its attempt),
  * `FIND_MISSING_LATCHED` when `key` is latched once the run is done (b.jg5
  * SRJ-502: the caller calls nothing more for it), or undefined for any other
  * failure, which is logged and never memoized and leaves the earlier memoized
@@ -3196,7 +3278,8 @@ export async function sweepDeadTmuxChannel(key: string, verdict: EscalateDeadVer
 
 /**
  * `sweepDeadTmuxChannel`, also saying whether the sweep was refused (b.jg5
- * SRJ-105, `FIND_MISSING_REFUSED`). The restart path's reconnect adapter
+ * SRJ-105, `FIND_MISSING_REFUSED`: the run, or the post-run `get` of the
+ * persona's own row, SRJ-114). The restart path's reconnect adapter
  * (`src/server.ts`) then answers `transient` instead of `escalate-dead`, so
  * the restart run neither re-probes nor kills nor relaunches the persona. A
  * persona latched once the sweep is done (`FIND_MISSING_LATCHED`) answers as
@@ -3300,7 +3383,8 @@ function isDeadRowState(state: string | undefined): boolean {
  * b.jdc: run the memoized findMissing sweep (b.m4r), then read persona
  * `key`'s row state again. Returns that state, or undefined when the read
  * failed (logged with `logPrefix` and `ref`). A failed sweep logs its own
- * line, and the row is read anyway, except a refused one (b.jg5 SRJ-105):
+ * line, and the row is read anyway, except a refused one (b.jg5 SRJ-105; the
+ * run refused, or the post-run `get` of the persona's own row, SRJ-114):
  * then nothing is read and `FIND_MISSING_REFUSED` is returned. When the
  * persona is latched once the sweep is done (`FIND_MISSING_LATCHED`: a
  * post-run `get` of its row read the latching note, or the latch answers it
@@ -4714,7 +4798,8 @@ async function resumeOrFreshSpawn(
   // The ended/missing caller does NOT set reconcileMissingFirst (row already
   // terminal). A refused sweep (b.jg5 SRJ-105: UNAVAILABLE, e.g.
   // ErrCallTimeout, ENVIRONMENT, ErrTmuxNotAvailable, CONFIG,
-  // ErrConfigMalformed, SRJ-316, or UNCLASSIFIED, SRJ-313) stops the attempt
+  // ErrConfigMalformed, SRJ-316, or UNCLASSIFIED, SRJ-313), or a refused
+  // post-run `get` of the persona's own row (SRJ-114), stops the attempt
   // before the resume: a resume of the still-live row would answer
   // ErrSpawnNotResumable, whose branch kills, deletes and spawns fresh. The ladder answers failed, and markRefusal adds
   // `refused`. On any other findMissing error, fall through to attempting
