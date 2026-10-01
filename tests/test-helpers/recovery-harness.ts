@@ -34,9 +34,11 @@
  *   one. As in `main()`, the controller's per-fire observer (`onRetryFire`)
  *   is the condition's retry onset check (`tmuxUnresponsive.onsetAtRetry`),
  *   called at every fire, one whose retry is skipped included, before the
- *   action; its stop observer (`onStopped`) is the condition's
- *   `cancelAlert(key, reason)`, so every real stop of a persona's timer
- *   cancels its pending alert check.
+ *   action; its stop observer (`onStopped`) is composed as in `main()`: the
+ *   condition's `cancelAlert(key, reason)`, so every real stop of a
+ *   persona's timer cancels its pending alert check, then the
+ *   unclassified-error episodes' `retryStopped(key, reason)`, each isolated.
+ *   Every call to it is recorded first in `stops` (`{ key, reason }`).
  * - The restart module is initialised over the configuration
  *   (`initRestart`) with the production adapters: the liveness read
  *   (`_buildIsSessionAliveAdapter` over the applied configuration), the
@@ -45,8 +47,10 @@
  *   `launchSession` over the applied configuration with the relaunch gate as
  *   `canLaunch`. `getRestartDelay` answers the configuration's
  *   `session_restart_delay` (0 by default). `onCapReached` records the key in
- *   `capReached` and then calls `notifyRestartCapReached`, whose notice lands
- *   in `notices`. `serialize` is `serializer.run`, one real per-persona
+ *   `capReached` and then, as `main()` binds it, calls
+ *   `notifyRestartCapReached`, whose notice lands in `notices`, and ends the
+ *   persona's unclassified-error episode
+ *   (`end(key, UNCLASSIFIED_ERROR_END_CAPPED)`), each isolated. `serialize` is `serializer.run`, one real per-persona
  *   serializer (`createPersonaSerializer`), which a test may hold a turn on.
  *   `armRetryTimer`, the arm hook, is bound as `main()` binds it (b.jg5
  *   SRJ-314, SRJ-301): every `unknown` liveness reading at the restart work,
@@ -68,8 +72,12 @@
  *   stops the persona's timer (`stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`)
  *   and cancels its alert check (`tmuxUnresponsive.cancelAlert(key,
  *   UNAVAILABLE_RETRY_STOP_TORN_DOWN)`, which logs nothing more when the
- *   stop observer has already cancelled it), the condition kept; `remove(key)` drops the persona from the applied
- *   configuration.
+ *   stop observer has already cancelled it), the condition kept. The
+ *   teardown's turn forgets the persona's episodes, every kind (its
+ *   unclassified-error episode included), as production's
+ *   `forgetNoticeEpisodes` does; a case does that step with
+ *   `episodes.forget(key)` after `teardown(key)`. `remove(key)` drops the
+ *   persona from the applied configuration without a teardown.
  * - `stub`: one stub client (`makeStubClient`) with its call log
  *   (`stub.calls`), installed through `installStubSpawnPath` with the spawn
  *   home under the harness's temporary HOME, and handed to the outage state
@@ -121,6 +129,20 @@
  *   `tmuxUnresponsive.holds(key)` and `tmuxUnresponsive.firstRefusalAt(key)`.
  *   With `options.conditionSink: false` the condition is not installed in
  *   the outage state (the retry hooks and `tickEnd` still reach it).
+ * - The unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009;
+ *   `createUnclassifiedErrorEpisodes`) over the same episodes instance,
+ *   wired as `main()` wires them: the outage state's unclassified sink in
+ *   the same `initOutageState` call, so each UNCLASSIFIED outcome inside a
+ *   launch or recovery attempt (a row read's included) begins or continues
+ *   the persona's episode; the alert threshold is E6's
+ *   `adAlertThresholdMsInEffect` (never `options.alertThresholdMs`, which is
+ *   the condition's); the configured-key lookup reads the live applied set,
+ *   so after `remove(key)` the alert takes the log-only route, one
+ *   `recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, 'persona=<key>:
+ *   <text>')` into the harness's `startup-errors.log` (`startupErrors()`);
+ *   otherwise the alert lands in `episodeNotices`; their lines go to
+ *   `lines`. `unclassifiedErrorOpen(key)` reads whether the persona's
+ *   episode is open; nothing sets it by hand.
  * - `tickEnd(key)`: what a health tick's healthy branch does to the
  *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
  *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
@@ -170,8 +192,7 @@
  * - `captured()`: everything captured, for `assertNoLeak`: the lines, the
  *   `console.error` lines, the three notice lists, the startup-errors
  *   entries, the attempts, the triggers, the condition ends, the outage
- *   clears and the state
- *   directory as a written file.
+ *   clears, the stops and the state directory as a written file.
  * - `cleanup()`: stops every retry timer (`stopAll`) and forgets every
  *   episode (`episodes.forgetAll()`, which cancels every alert check), then
  *   undoes every
@@ -221,10 +242,13 @@ import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
 import {
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
+  createUnclassifiedErrorEpisodes,
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
+  PERSONA_UNCLASSIFIED_ERROR_LABEL,
   TMUX_UNRESPONSIVE_END_RETRY,
   TMUX_UNRESPONSIVE_END_TEXT,
   TMUX_UNRESPONSIVE_END_TICK,
+  UNCLASSIFIED_ERROR_END_CAPPED,
   type PersonaEpisodes,
   type TmuxUnresponsiveCondition,
   type TmuxUnresponsiveEndReason,
@@ -249,6 +273,7 @@ import {
   whenLaunchSettled,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
+import { recordStartupError } from '../../src/startup-errors.ts'
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
@@ -372,6 +397,12 @@ export interface RecoveryConditionEnd {
   readonly result: UnavailableRetryConditionEndResult
 }
 
+/** One real stop of a persona's retry timer, as the controller's stop observer saw it. */
+export interface RecoveryStop {
+  readonly key: string
+  readonly reason: string
+}
+
 /** What `makeRecoveryHarness` returns; see the module comment. */
 export interface RecoveryHarness {
   readonly clock: FakeClock
@@ -400,6 +431,10 @@ export interface RecoveryHarness {
   readonly outageClears: RecoveryConditionEnd[]
   /** Keys `onCapReached` was called for, in order. */
   readonly capReached: string[]
+  /** Every call to the controller's stop observer (`onStopped`), in order. */
+  readonly stops: RecoveryStop[]
+  /** Whether persona `key`'s unclassified-error episode is open (read-only). */
+  unclassifiedErrorOpen(key: string): boolean
   /** The per-persona serializer the restart module runs its work through. */
   readonly serializer: PersonaSerializer
   /** The server's retry action, for both modes, over the real row read and restart entry (the default). */
@@ -470,6 +505,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   for (const persona of config.personas) mkdirSync(persona.working_directory, { recursive: true })
 
   const capReached: string[] = []
+  const stops: RecoveryStop[] = []
   const applied = new Set(keys)
   const down = new Set<string>()
   const connected = new Set<string>()
@@ -509,8 +545,22 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // condition's onset check with the health check off.
     onRetryFire: (key, firedAt) => tmuxUnresponsive.onsetAtRetry(key, firedAt),
     // As main() binds it: every real stop of a persona's timer cancels the
-    // condition's pending alert check, with the stop's reason.
-    onStopped: (key, reason) => tmuxUnresponsive.cancelAlert(key, reason),
+    // condition's pending alert check, with the stop's reason, and then tells
+    // the unclassified-error episodes (b.jg5 SRJ-313), each step isolated.
+    // Each call is recorded in `stops` first.
+    onStopped: (key, reason) => {
+      stops.push({ key, reason })
+      try {
+        tmuxUnresponsive.cancelAlert(key, reason)
+      } catch {
+        /* isolated, as in main() */
+      }
+      try {
+        unclassifiedErrors.retryStopped(key, reason)
+      } catch {
+        /* isolated, as in main() */
+      }
+    },
     action: (key, attempt) => {
       attempts.push({ key, retry: attempt.retry, causes: attempt.causes, mode: attempt.mode, at: clock.now() })
       return current(key, attempt)
@@ -538,6 +588,18 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     healthCheckOn: () => appliedConfig().health_check_interval !== 0,
     ...(alertThresholdMs === false ? {} : { alertThresholdMs }),
   })
+  // As main() builds them (b.jg5 SRJ-313, SRJ-1009): the unclassified-error
+  // episodes over the same episodes instance, at E6's alert threshold in
+  // effect, the configured-key lookup over the live applied set, and the
+  // log-only route through `recordStartupError` into the harness's
+  // startup-errors capture.
+  const unclassifiedErrors = createUnclassifiedErrorEpisodes({
+    episodes,
+    log,
+    alertThresholdMs: adAlertThresholdMsInEffect,
+    isConfigured: (key) => applied.has(key),
+    logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `persona=${key}: ${text}`),
+  })
 
   const savedStateDir = process.env['SLACK_STATE_DIR']
   process.env['SLACK_STATE_DIR'] = stateDir
@@ -564,6 +626,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     getClient: () => stub.client as unknown as Client,
     ...(options.triggerSink === false ? {} : { triggerSink }),
     ...(options.conditionSink === false ? {} : { conditionSink: tmuxUnresponsive }),
+    unclassifiedSink: unclassifiedErrors,
     // As main() binds it: each real clear of the persona's `tmux-unavailable`
     // outage reaches the controller's condition-end entry once, with the
     // reading the clear brought.
@@ -593,9 +656,20 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     launchSession: (key) => launchSession(key, appliedConfig(), { canLaunch: canRelaunch }),
     getRestartDelay: () => config.session_restart_delay,
     isShuttingDown: () => shuttingDown,
+    // As main() binds it, after recording the key: the cap notice, then the
+    // silent end of the persona's unclassified-error episode, each isolated.
     onCapReached: (key) => {
       capReached.push(key)
-      notifyRestartCapReached(key)
+      try {
+        notifyRestartCapReached(key)
+      } catch {
+        /* isolated, as in main() */
+      }
+      try {
+        unclassifiedErrors.end(key, UNCLASSIFIED_ERROR_END_CAPPED)
+      } catch {
+        /* isolated, as in main() */
+      }
     },
     serialize: serializer.run,
     // As main() binds it (b.jg5 SRJ-314, SRJ-301): every `unknown` liveness
@@ -667,6 +741,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     conditionEnds,
     outageClears,
     capReached,
+    stops,
+    unclassifiedErrorOpen: (key) => unclassifiedErrors.isOpen(key),
     serializer,
     fullModeAction: fullMode,
     scriptedAction: scripted,
@@ -757,6 +833,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       triggers: [...triggers],
       conditionEnds: [...conditionEnds],
       outageClears: [...outageClears],
+      stops: [...stops],
       stateDir: writtenFile(stateDir),
     }),
 

@@ -62,6 +62,20 @@
  * while it lasts, nothing counted, the retries on the backoff, and the
  * bring-up with one all-clear once calls succeed), and a clear of the outage
  * that leaves the timer armed.
+ * UNCLASSIFIED (b.jg5 SRJ-313, SRJ-1009, AC 69, AC 80) runs on the harness
+ * with both settings 0 and the unclassified-error episodes composed as
+ * `main()` composes them: SRJ-1009's one pin case (the only copy of its
+ * text); an `ErrInternal`, an unhandled name and `ErrSchemaMismatch` in a
+ * start-pass launch and in a restart-run recovery, never destructive or
+ * counted past the restart cap, retried on the backoff; the one alert at the
+ * first retry strictly past the alert threshold in effect (agent-director's
+ * defaults and AC 80's settings), derived from the accessor; a collision
+ * `get` and every retry's row read (`ErrSchemaMismatch`); the log-only route
+ * for a persona removed while its retry spawn is held (AC 69); the episode's
+ * ends (nothing left to recover, a pending-only row live, the cap through
+ * `onCapReached`, the teardown's forget) and a new episode alerting again;
+ * the stop observer once per stop; and nothing armed or opened outside an
+ * attempt.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -75,8 +89,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
-import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
+import { classifyAdError, describeAdErrorClassification } from '../src/ad-error-class.ts'
+import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
+import { ERR_SCHEMA_MISMATCH_NAME, ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
@@ -93,8 +108,11 @@ import {
   type OutageClass,
 } from '../src/outage-state.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
+import { MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
 import {
+  PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
+  PERSONA_UNCLASSIFIED_ERROR_LABEL,
   TMUX_UNRESPONSIVE_END_RETRY,
   TMUX_UNRESPONSIVE_END_TICK,
   TMUX_UNRESPONSIVE_END_TMUX_VERB,
@@ -102,6 +120,10 @@ import {
   tmuxUnresponsiveAlertText,
   tmuxUnresponsiveOnsetText,
   tmuxUnresponsiveRecoveryText,
+  UNCLASSIFIED_ERROR_END_CAPPED,
+  UNCLASSIFIED_ERROR_END_RECOVERED,
+  UNCLASSIFIED_ERROR_END_ROW_LIVE,
+  unclassifiedErrorAlertText,
   type TmuxUnresponsiveEndReason,
 } from '../src/persona-episodes.ts'
 import {
@@ -160,6 +182,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_CEILING_S,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
@@ -193,6 +216,7 @@ import {
   type UnavailableRetryRowRead,
   type UnavailableRetryTriggerSink,
 } from '../src/unavailable-retry.ts'
+import type { AdConfigTables } from './test-helpers/ad-settings.ts'
 import {
   cannedErr,
   cannedListRow,
@@ -202,7 +226,9 @@ import {
   errConfigMalformed,
   errGeneric,
   errInstanceIdCollision,
+  errInternal,
   errJsonlNeverWritten,
+  errSchemaMismatch,
   errSpawnNotFound,
   errSpawnNotInteractive,
   errTmuxCaptureFailed,
@@ -5216,5 +5242,559 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
     expect(h.attempts).toEqual([])
     await h.advance(1)
     expect(h.attempts).toEqual([{ key, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_CONFIG], mode: UNAVAILABLE_RETRY_MODE_FULL, at: before.dueAt! }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// UNCLASSIFIED outcomes (b.jg5 SRJ-313, SRJ-1009, SRJ-105, SRJ-301, AC 69,
+// AC 80) on the recovery harness, both settings 0, with the unclassified-error
+// episodes composed as `main()` composes them: never destructive, never
+// counted, retried on the backoff, one alert per episode at the first
+// UNCLASSIFIED outcome met strictly past the alert threshold in effect, the
+// log-only route for a persona no longer configured, and the episode's ends.
+// The reuse spawn half is E22's and the latch end E13's.
+// ---------------------------------------------------------------------------
+
+/** AC 80's agent-director settings (the AC's input): an alert threshold below the defaults'. */
+const AC_80_TMUX = { stopping_window_seconds: 30n, starting_session_seconds: 120n } as const satisfies AdConfigTables['tmux']
+
+/** UNCLASSIFIED values (b.jg5 SRJ-104), each built by the stub for the verb whose call meets it. */
+const UNCLASSIFIED_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
+  ['ErrInternal without the unusable-name phrase', () => errInternal()],
+  ['an error name CSCB gives no handling', (verb) => errGeneric(verb, 'ErrKillBroken', 'the kill is broken')],
+  ['ErrSchemaMismatch (a store that cannot be opened)', () => errSchemaMismatch()],
+]
+
+/** The prefix of every line persona `key`'s unclassified-error episode logs. */
+function unclassifiedPrefix(key: string): string {
+  return `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR} `
+}
+
+/** Persona `key`'s unclassified-error lines, in order. */
+function unclassifiedLines(h: RecoveryHarness, key: string): string[] {
+  return h.lines.filter((line) => line.startsWith(unclassifiedPrefix(key)))
+}
+
+/** The started line of an episode whose first outcome is `err`. */
+function unclassifiedStartedLine(key: string, err: unknown): string {
+  return `${unclassifiedPrefix(key)}started — ${describeAdErrorClassification(classifyAdError(err))}`
+}
+
+/** The ended line for `reason`. */
+function unclassifiedEndedLine(key: string, reason: string): string {
+  return `${unclassifiedPrefix(key)}ended — ${reason}`
+}
+
+/** What an alert line says of the outcome `err` met `elapsedMs` after the episode's first, over `thresholdMs`. */
+function unclassifiedMet(elapsedMs: number, thresholdMs: number, err: unknown): string {
+  return `an UNCLASSIFIED outcome met ${Math.floor(elapsedMs / 1000)} s after the episode's first, over its alert threshold of ${Math.floor(thresholdMs / 1000)} s: ${describeAdErrorClassification(classifyAdError(err))}`
+}
+
+/** The line of an alert posted to the persona's destination. */
+function unclassifiedPostedLine(key: string, elapsedMs: number, thresholdMs: number, err: unknown): string {
+  return `${unclassifiedPrefix(key)}alert posted to its destination — ${unclassifiedMet(elapsedMs, thresholdMs, err)}`
+}
+
+/** The line of an alert for a persona not in the applied configuration, written only to the logs. */
+function unclassifiedLoggedLine(key: string, elapsedMs: number, thresholdMs: number, err: unknown): string {
+  return `${unclassifiedPrefix(key)}alert written to the server log and startup-errors.log (${PERSONA_UNCLASSIFIED_ERROR_LABEL}) — the persona is not in the applied configuration; ${unclassifiedMet(elapsedMs, thresholdMs, err)}`
+}
+
+/** The alert for persona `key` quoting the outcome `err`, as the notice episodes post it. */
+function unclassifiedAlert(key: string, err: unknown): { key: string; text: string } {
+  return { key, text: unclassifiedErrorAlertText(classifyAdError(err)) }
+}
+
+/**
+ * The retry of a timer armed at `armedAt`, its first outcome then, that is
+ * the first strictly more than `thresholdMs` after it: its number and due
+ * time, from the exported base and ceiling.
+ */
+function alertRetry(armedAt: number, thresholdMs: number): { retry: number; dueAt: number } {
+  let dueAt = armedAt
+  for (let n = 0; ; n++) {
+    dueAt += waitMs(n)
+    if (dueAt - armedAt > thresholdMs) return { retry: n + 1, dueAt }
+  }
+}
+
+/**
+ * A start-pass launch of persona `key` whose optimistic spawn answers the
+ * UNCLASSIFIED `err` (the stub keeps answering it): refused, P's timer armed
+ * at the base wait with the UNCLASSIFIED cause, and an episode begun with
+ * one started line. Resolves with the arm's time.
+ */
+async function unclassifiedLaunch(h: RecoveryHarness, key: string, err: Error): Promise<number> {
+  h.script({ spawnError: err })
+  const armedAt = h.clock.now()
+  expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+  expect(h.controller.view(key)).toEqual({
+    phase: 'waiting',
+    dueAt: armedAt + waitMs(0),
+    waitMs: waitMs(0),
+    refusals: 0,
+    causes: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+    mode: UNAVAILABLE_RETRY_MODE_FULL,
+  })
+  expect(h.unclassifiedErrorOpen(key)).toBe(true)
+  expect(unclassifiedLines(h, key).at(-1)).toBe(unclassifiedStartedLine(key, err))
+  return armedAt
+}
+
+/**
+ * Nothing destructive or counted for persona `key`: no delete, no failure
+ * counted and no cap reached, no spawn-failure notice or startup entry, and
+ * no outage or `tmux-unresponsive` condition or post.
+ */
+function expectNeverDestructive(h: RecoveryHarness, key: string): void {
+  expect(h.stub.calls.deleteCalls).toEqual([])
+  expect(getFailureCount(key)).toBe(0)
+  expect(isAtCap(key, RESTART_FAILURE_CAP)).toBe(false)
+  expect(h.capReached).toEqual([])
+  expect(h.notices).toEqual([])
+  expect(h.startupErrors()).toEqual([])
+  expect(h.outageNotices).toEqual([])
+  expect(getOutageFlags(key).size).toBe(0)
+  expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+  expect(conditionLines(h, key)).toEqual([])
+}
+
+/** Persona `other` was untouched, its unclassified-error episode included. */
+function expectUntouchedEpisode(h: RecoveryHarness, other: string): void {
+  expectUntouched(h, other)
+  expect(h.unclassifiedErrorOpen(other)).toBe(false)
+  expect(unclassifiedLines(h, other)).toEqual([])
+  expect(h.episodeNotices.filter((n) => n.key === other)).toEqual([])
+  expect(h.stops.filter((s) => s.key === other)).toEqual([])
+}
+
+/** One kind of attempt that meets an UNCLASSIFIED outcome, and what each of its retries calls. */
+interface UnclassifiedAttempt {
+  /** The verb whose call answers it. */
+  readonly verb: string
+  /** The persona's row before any spawn. */
+  readonly row: RowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT
+  /** The stub's answer of that verb. */
+  readonly script: (err: Error) => RecoveryStubScript
+  /** Run the first attempt for persona `key`; it meets the outcome and is refused. */
+  readonly run: (h: RecoveryHarness, key: string) => Promise<void>
+  /** The calls the first attempt makes, ending at the refused one. */
+  readonly firstCalls: Record<string, number>
+  /** The calls each retry makes, ending at the refused one. */
+  readonly retryCalls: Record<string, number>
+}
+
+const UNCLASSIFIED_ATTEMPTS: ReadonlyArray<readonly [string, UnclassifiedAttempt]> = [
+  ['a start-pass launch (its optimistic spawn)', {
+    verb: 'spawn',
+    row: UNAVAILABLE_RETRY_ROW_ABSENT,
+    script: (err) => ({ spawnError: err }),
+    run: async (h, key) => {
+      expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    },
+    firstCalls: { spawnCalls: 1 },
+    // The dead reading's kill comes before the relaunch; the refused spawn is the retry's last call.
+    retryCalls: { statusCalls: 1, killCalls: 1, spawnCalls: 1 },
+  }],
+  ['a restart-run recovery (its kill of an ended row)', {
+    verb: 'kill',
+    row: 'ended',
+    script: (err) => ({ killError: err }),
+    run: async (h, key) => {
+      expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+      await h.settle()
+    },
+    firstCalls: { statusCalls: 1, killCalls: 1 },
+    // The refused kill ends each retry: no launch follows it.
+    retryCalls: { statusCalls: 1, killCalls: 1 },
+  }],
+]
+
+describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or counted, are retried, and post one alert per episode past the threshold (SRJ-313, SRJ-1009, AC 69, AC 80)', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test('SRJ-1009: the one pin case, the alert’s exact text for a sample name and message', () => {
+    const text = unclassifiedErrorAlertText({ reportedName: 'ErrInternal', message: 'the store could not be read' })
+
+    expect(text).toBe(
+      ':warning: *Unclassified agent-director error* — agent-director returned an error CSCB cannot classify for this persona: ErrInternal "the store could not be read". CSCB keeps retrying and takes no destructive action; a human should check the host\'s agent-director.',
+    )
+    assertNoLeak(text)
+  })
+
+  const neverDestructiveCross = UNCLASSIFIED_ERRORS.flatMap(([what, make]) =>
+    UNCLASSIFIED_ATTEMPTS.map(([where, attempt]) => [what, where, make, attempt] as const),
+  )
+
+  test.each(neverDestructiveCross)('%s in %s, with both settings 0: no delete, no kill or launch outside a retry and no call after it in any attempt, never counted past the restart cap, no spawn-failure notice, spawn-failed entry or condition post; the timer armed with the UNCLASSIFIED cause and each retry exactly at its due time from the backoff; the other persona untouched', async (_what, _where, make, attempt) => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    const err = make(attempt.verb)
+    modelRow(h, attempt.row)
+    h.script(attempt.script(err))
+    const armedAt = h.clock.now()
+
+    await attempt.run(h, key)
+
+    expect(callCounts(h)).toEqual(attempt.firstCalls)
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED)
+    expect(h.unclassifiedErrorOpen(key)).toBe(true)
+    expect(unclassifiedLines(h, key)).toEqual([unclassifiedStartedLine(key, err)])
+
+    let dueAt = armedAt
+    const retries = RESTART_FAILURE_CAP + 2
+    for (let n = 0; n < retries; n++) {
+      dueAt += waitMs(n)
+      const before = callCounts(h)
+      await h.advance(dueAt - 1 - h.clock.now())
+      expect([n, h.attempts.length, callsSince(h, before)]).toEqual([n, n, {}])
+      await h.advance(1)
+      await h.settle()
+      expect([n, h.attempts.at(-1)]).toEqual([n, expect.objectContaining({ key, retry: n + 1, mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt })])
+      expect([n, callsSince(h, before)]).toEqual([n, attempt.retryCalls])
+      expect([n, h.controller.view(key)]).toEqual([n, {
+        phase: 'waiting',
+        dueAt: dueAt + waitMs(n + 1),
+        waitMs: waitMs(n + 1),
+        refusals: n + 1,
+        causes: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+        mode: UNAVAILABLE_RETRY_MODE_FULL,
+      }])
+    }
+
+    expect(h.triggers).toEqual(Array.from({ length: retries + 1 }, () => ({ key, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED })))
+    expectNeverDestructive(h, key)
+    // The episode lasts through every retry and posts its one alert.
+    expect(h.unclassifiedErrorOpen(key)).toBe(true)
+    expect(h.episodeNotices).toEqual([unclassifiedAlert(key, err)])
+    expectUntouchedEpisode(h, other)
+  })
+
+  test.each<[string, RecoveryHarnessOptions, () => number]>([
+    ['agent-director’s defaults', {}, () => adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT)],
+    ['AC 80’s settings, in effect before the first outcome', { adSettings: { tmux: AC_80_TMUX } }, () => adAlertThresholdMs({ ...DEFAULT_AD_SETTINGS_IN_EFFECT, tmux: { ...DEFAULT_AD_SETTINGS_IN_EFFECT.tmux, ...AC_80_TMUX } })],
+  ])('the alert at %s: none at any retry up to the threshold; exactly one, quoting the redacted and capped message, at the first retry strictly past the accessor’s threshold; none again however far the clock goes while the retries go on', async (_settings, options, expectedThreshold) => {
+    const h = (harness = makeRecoveryHarness(options))
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    const thresholdMs = adAlertThresholdMsInEffect()
+    expect(thresholdMs).toBe(expectedThreshold())
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const description = `the store could not be read (${sentinelInMessage('unclassified')}) ${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)}`
+    const err = errInternal(description)
+    const armedAt = await unclassifiedLaunch(h, key, err)
+    const alert = alertRetry(armedAt, thresholdMs)
+
+    let dueAt = armedAt
+    for (let n = 0; n < alert.retry - 1; n++) {
+      dueAt += waitMs(n)
+      expect(await retryNow(h, key)).toBe(dueAt)
+      expect([n, dueAt - armedAt <= thresholdMs, h.episodeNotices]).toEqual([n, true, []])
+    }
+    expect(await retryNow(h, key)).toBe(alert.dueAt)
+
+    expect(h.episodeNotices).toEqual([unclassifiedAlert(key, err)])
+    const quoted = classifyAdError(err).message!
+    expect(quoted).toContain(REDACTED_SENTINEL_TAIL)
+    expect(quoted.length).toBeLessThanOrEqual(MAX_LOGGED_MESSAGE_LENGTH)
+    expect(description.length).toBeGreaterThan(MAX_LOGGED_MESSAGE_LENGTH)
+    expect(unclassifiedLines(h, key)).toEqual([
+      unclassifiedStartedLine(key, err),
+      unclassifiedPostedLine(key, alert.dueAt - armedAt, thresholdMs, err),
+    ])
+
+    const attempts = h.attempts.length
+    for (let n = 0; n < RESTART_FAILURE_CAP; n++) await retryNow(h, key)
+    expect(h.attempts).toHaveLength(attempts + RESTART_FAILURE_CAP)
+    expect(h.controller.isArmed(key)).toBe(true)
+    expect(h.unclassifiedErrorOpen(key)).toBe(true)
+    expect(h.episodeNotices).toEqual([unclassifiedAlert(key, err)])
+    expect(unclassifiedLines(h, key)).toHaveLength(2)
+    expectNeverDestructive(h, key)
+    expectUntouchedEpisode(h, other)
+  })
+
+  test('AC 80’s threshold is below the defaults’, so its alert comes at an earlier retry: the alert time follows the settings in effect, not a fixed time', () => {
+    const ac80 = adAlertThresholdMs({ ...DEFAULT_AD_SETTINGS_IN_EFFECT, tmux: { ...DEFAULT_AD_SETTINGS_IN_EFFECT.tmux, ...AC_80_TMUX } })
+    const defaults = adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
+
+    expect(ac80).toBeLessThan(defaults)
+    expect(alertRetry(0, ac80).retry).toBeLessThan(alertRetry(0, defaults).retry)
+  })
+
+  test('an UNCLASSIFIED answer to the collision get inside a launch opens the episode and arms with the read-error cause; one inside a later launch before the threshold continues it with no new line or alert', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    const persona = personaOf(h, key)
+    const err = errInternal()
+    h.script({ ...collided(h, persona, { state: 'waiting' }), getError: err })
+
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
+    expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1 })
+    expect(h.unclassifiedErrorOpen(key)).toBe(true)
+    expect(unclassifiedLines(h, key)).toEqual([unclassifiedStartedLine(key, err)])
+
+    await h.advance(waitMs(0) - 1)
+    h.script({ ...collided(h, persona, { state: 'waiting' }), getError: err })
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+
+    expect(callCounts(h)).toEqual({ spawnCalls: 2, getCalls: 2 })
+    expect(h.unclassifiedErrorOpen(key)).toBe(true)
+    expect(unclassifiedLines(h, key)).toEqual([unclassifiedStartedLine(key, err)])
+    expect(h.episodeNotices).toEqual([])
+    expectNeverDestructive(h, key)
+    expectUntouchedEpisode(h, other)
+  })
+
+  test('ErrSchemaMismatch from every row read (SRJ-303, A-32), both settings 0: the retries read the row and call nothing else, nothing is counted past the restart cap, and the one alert past the threshold names ErrSchemaMismatch and quotes its description', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    const err = errSchemaMismatch()
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT, () => err)
+    const armedAt = await unclassifiedLaunch(h, key, err)
+    const thresholdMs = adAlertThresholdMsInEffect()
+    const alert = alertRetry(armedAt, thresholdMs)
+    const retries = Math.max(alert.retry, RESTART_FAILURE_CAP) + 1
+
+    let dueAt = armedAt
+    for (let n = 0; n < retries; n++) {
+      dueAt += waitMs(n)
+      const before = callCounts(h)
+      expect(await retryNow(h, key)).toBe(dueAt)
+      expect([n, callsSince(h, before)]).toEqual([n, { statusCalls: 1 }])
+      expect([n, retryLinesOf(h, key).at(-1)]).toEqual([n, reArmedLine(key, n + 1, UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN, n + 1)])
+      expect([n, h.episodeNotices.length]).toEqual([n, n + 1 < alert.retry ? 0 : 1])
+    }
+
+    expect(h.stub.calls.spawnCalls).toHaveLength(1)
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.episodeNotices).toEqual([unclassifiedAlert(key, err)])
+    expect(h.episodeNotices[0]!.text).toContain(`${ERR_SCHEMA_MISMATCH_NAME} "${classifyAdError(err).message}"`)
+    expect(unclassifiedLines(h, key)).toEqual([
+      unclassifiedStartedLine(key, err),
+      unclassifiedPostedLine(key, alert.dueAt - armedAt, thresholdMs, err),
+    ])
+    expectNeverDestructive(h, key)
+    expectUntouchedEpisode(h, other)
+  })
+
+  test('AC 69, a persona no longer configured: P’s retry spawn held past the threshold, P removed from the applied configuration without a teardown, then the spawn failing ErrInternal, gives one server-log line and one persona-unclassified-error entry naming P and the alert’s text, and nothing to Slack for any persona; the removal’s stop leaves the episode open with no second entry', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const armedAt = await unclassifiedLaunch(h, key, errInternal())
+    const thresholdMs = adAlertThresholdMsInEffect()
+    const alert = alertRetry(armedAt, thresholdMs)
+    for (let n = 0; n < alert.retry - 1; n++) await retryNow(h, key)
+    expect(h.episodeNotices).toEqual([])
+
+    const id = personaInstanceId(key)
+    const hold = holdSpawns(h.stub.client)
+    expect(await retryNow(h, key, { settle: false })).toBe(alert.dueAt)
+    await hold.entered(id)
+    h.remove(key)
+    const err = errInternal(`the store could not be read (${sentinelInMessage('removed')})`)
+    hold.fail(id, err)
+    await h.settle()
+
+    expect(h.episodeNotices).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.outageNotices).toEqual([])
+    const entries = h.startupErrors()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!.endsWith(`] [${PERSONA_UNCLASSIFIED_ERROR_LABEL}] persona=${key}: ${unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false })}`)).toBe(true)
+    expect(unclassifiedLines(h, key).at(-1)).toBe(unclassifiedLoggedLine(key, alert.dueAt - armedAt, thresholdMs, err))
+    expect(unclassifiedLines(h, key).filter((line) => line.includes(' alert '))).toHaveLength(1)
+    assertNoLeak([entries, h.lines])
+
+    await retryNow(h, key)
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_NOT_APPLIED))
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_NOT_APPLIED }])
+    expect(h.unclassifiedErrorOpen(key)).toBe(true)
+    expect(h.startupErrors()).toHaveLength(1)
+    expect(h.episodeNotices).toEqual([])
+    expectUntouchedEpisode(h, other)
+  })
+})
+
+describe('unavailable retry: the unclassified-error episode’s ends and the stop observer (SRJ-313, SRJ-305)', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test('a retry that finds nothing left to recover ends the episode silently after its alert; a later UNCLASSIFIED outcome begins a new episode that alerts again only past the threshold from its own first outcome', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    const row = modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const err = errInternal()
+    const thresholdMs = adAlertThresholdMsInEffect()
+    const firstAt = await unclassifiedLaunch(h, key, err)
+    const first = alertRetry(firstAt, thresholdMs)
+    for (let n = 0; n < first.retry; n++) await retryNow(h, key)
+    expect(h.episodeNotices).toEqual([unclassifiedAlert(key, err)])
+
+    // P came back on its own: its row reads live and it is connected.
+    row.set('waiting')
+    h.setConnected(key, true)
+    await retryNow(h, key)
+
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
+    expect(h.unclassifiedErrorOpen(key)).toBe(false)
+    expect(unclassifiedLines(h, key).at(-1)).toBe(unclassifiedEndedLine(key, UNCLASSIFIED_ERROR_END_RECOVERED))
+    expect(h.episodeNotices).toEqual([unclassifiedAlert(key, err)])
+
+    // P is lost again, and its next launch meets UNCLASSIFIED once more.
+    h.setConnected(key, false)
+    row.set('missing')
+    const secondAt = await unclassifiedLaunch(h, key, err)
+    const second = alertRetry(secondAt, thresholdMs)
+    for (let n = 0; n < second.retry - 1; n++) await retryNow(h, key)
+    expect(h.episodeNotices).toHaveLength(1)
+    expect(await retryNow(h, key)).toBe(second.dueAt)
+
+    expect(h.episodeNotices).toEqual([unclassifiedAlert(key, err), unclassifiedAlert(key, err)])
+    expect(unclassifiedLines(h, key).slice(-2)).toEqual([
+      unclassifiedStartedLine(key, err),
+      unclassifiedPostedLine(key, second.dueAt - secondAt, thresholdMs, err),
+    ])
+    expectNeverDestructive(h, key)
+    expectUntouchedEpisode(h, other)
+  })
+
+  test('a pending-only retry that reads the row live out of pending ends the episode silently, before any alert', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const err = errInternal()
+    await unclassifiedLaunch(h, key, err)
+
+    // The next retry's launch succeeds: the timer goes on pending-only, the episode still open.
+    h.script({ spawnError: undefined })
+    await retryNow(h, key)
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
+    expect(h.unclassifiedErrorOpen(key)).toBe(true)
+
+    await retryNow(h, key)
+
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE }])
+    expect(h.unclassifiedErrorOpen(key)).toBe(false)
+    expect(unclassifiedLines(h, key)).toEqual([unclassifiedStartedLine(key, err), unclassifiedEndedLine(key, UNCLASSIFIED_ERROR_END_ROW_LIVE)])
+    expect(h.episodeNotices).toEqual([])
+    expectUntouchedEpisode(h, other)
+  })
+
+  test('counted LAUNCH FAILUREs at the retries reaching the restart cap end the episode silently through onCapReached, with no unclassified alert', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const err = errInternal()
+    await unclassifiedLaunch(h, key, err)
+
+    h.script({ spawnError: errTmuxSessionCreate('spawn') })
+    for (let n = 0; n < RESTART_FAILURE_CAP; n++) await retryNow(h, key)
+
+    expect(getFailureCount(key)).toBe(RESTART_FAILURE_CAP)
+    expect(h.capReached).toEqual([key])
+    expect(h.unclassifiedErrorOpen(key)).toBe(false)
+    expect(unclassifiedLines(h, key)).toEqual([unclassifiedStartedLine(key, err), unclassifiedEndedLine(key, UNCLASSIFIED_ERROR_END_CAPPED)])
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_CAPPED }])
+    expectStopped(h, key)
+    expect(h.episodeNotices).toEqual([])
+    expectUntouchedEpisode(h, other)
+  })
+
+  test('the teardown (its submit, then its turn’s forget) ends the episode with no line, and no alert comes however far the clock goes', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const err = errInternal()
+    await unclassifiedLaunch(h, key, err)
+
+    h.teardown(key)
+    expect(h.unclassifiedErrorOpen(key)).toBe(true)
+    h.episodes.forget(key)
+
+    expect(h.unclassifiedErrorOpen(key)).toBe(false)
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_TORN_DOWN }])
+    await h.advance(2 * adAlertThresholdMsInEffect())
+    expect(h.attempts).toEqual([])
+    expect(unclassifiedLines(h, key)).toEqual([unclassifiedStartedLine(key, err)])
+    expect(h.episodeNotices).toEqual([])
+    expectUntouchedEpisode(h, other)
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string, row: RowModel) => Promise<void>, string, boolean]>([
+    ['a retry that finds nothing left to recover', async (h, key, row) => {
+      row.set('waiting')
+      h.setConnected(key, true)
+      await retryNow(h, key)
+    }, UNAVAILABLE_RETRY_STOP_RECOVERED, false],
+    // The cap's end of the episode is onCapReached's (the case above); the stop alone leaves it.
+    ['the restart cap', async (h, key) => {
+      for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(key)
+      await retryNow(h, key)
+    }, UNAVAILABLE_RETRY_STOP_CAPPED, true],
+    ['the persona not up', async (h, key) => {
+      h.setUp(key, false)
+      await retryNow(h, key)
+    }, UNAVAILABLE_RETRY_STOP_NOT_UP, true],
+    // The teardown's forget is its turn's step, after the stop.
+    ['a teardown’s submit', async (h, key) => h.teardown(key), UNAVAILABLE_RETRY_STOP_TORN_DOWN, true],
+    ['a removal from the applied configuration', async (h, key) => {
+      h.remove(key)
+      await retryNow(h, key)
+    }, UNAVAILABLE_RETRY_STOP_NOT_APPLIED, true],
+    // Shutdown then closes the episodes.
+    ['shutdown', async (h) => h.shutdown(), UNAVAILABLE_RETRY_STOP_SHUTDOWN, false],
+  ])('the stop observer fires once for %s, with its reason; only the reasons that end the episode close it, silently', async (_what, stop, reason, openAfter) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    const row = modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const err = errInternal()
+    await unclassifiedLaunch(h, key, err)
+
+    await stop(h, key, row)
+
+    expect(h.stops).toEqual([{ key, reason }])
+    expectStopped(h, key)
+    expect(h.unclassifiedErrorOpen(key)).toBe(openAfter)
+    const ended = reason === UNAVAILABLE_RETRY_STOP_RECOVERED ? [unclassifiedEndedLine(key, UNCLASSIFIED_ERROR_END_RECOVERED)] : []
+    expect(unclassifiedLines(h, key)).toEqual([unclassifiedStartedLine(key, err), ...ended])
+    expect(h.episodeNotices).toEqual([])
+    expectUntouchedEpisode(h, other)
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string, err: Error) => Promise<void>, Record<string, number>]>([
+    ['the health tick’s liveness read (status), which reads unknown', async (h, key, err) => {
+      h.script({ statusError: err })
+      expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
+    }, { statusCalls: 1 }],
+    ['a persona teardown’s kill', async (h, key, err) => {
+      h.script({ killError: err })
+      await expect(killPersonaInstance(key)).rejects.toBe(err)
+    }, { killCalls: 1 }],
+    ['a plain read-pane through the outage wrapper', async (h, key, err) => {
+      h.script({ readPaneError: err })
+      await expect(readPaneSucceeds(h, key)).rejects.toBe(err)
+    }, { readPaneCalls: 1 }],
+  ])('an UNCLASSIFIED answer to %s, made outside every attempt, arms nothing and opens no episode', async (_site, run, calls) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    expect(isInsideAttempt(key)).toBe(false)
+
+    await run(h, key, errInternal())
+
+    expect(callCounts(h)).toEqual(calls)
+    expectNothingArmed(h)
+    expect(h.unclassifiedErrorOpen(key)).toBe(false)
+    expect(unclassifiedLines(h, key)).toEqual([])
+    expect(h.episodeNotices).toEqual([])
+    expect(getFailureCount(key)).toBe(0)
+    expectUntouchedEpisode(h, other)
   })
 })

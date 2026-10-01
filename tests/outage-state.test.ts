@@ -10,7 +10,9 @@
  * `ad-config-malformed` outage a CONFIG answer raises: its raise, clear,
  * report and onset (b.jg5 SRJ-316, SRJ-312, SRJ-1018: one pin case holds
  * the onset's text; every other case compares with the exported template
- * over the classifier's rendered message).
+ * over the classifier's rendered message), and the report of an UNCLASSIFIED
+ * outcome met in P's attempt to the unclassified sink, through the wrappers,
+ * the reporting point and the site entry (b.jg5 SRJ-313, SRJ-301).
  *
  * Every wrapped call declares its verb. The trigger-sink and condition-sink
  * cases install recording fake sinks (no timer, no episodes) and run the
@@ -41,6 +43,7 @@ import {
   withOutageDetection,
   withSpawnDetection,
   reportAgentDirectorError,
+  reportUnclassifiedAtSite,
   ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
   OUTAGE_CLASS_ORDER,
@@ -57,13 +60,16 @@ import { LIVENESS_LIVE } from '../src/liveness-reading.ts'
 import {
   AD_CALL_KILL_ROW_NOT_READ_LIVE,
   AD_CALL_KILL_ROW_READ_LIVE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
   AD_VERB_KILL,
   AD_VERBS,
   TMUX_TOUCHING_VERBS,
   adCallVerb,
   classifyAdError,
+  classifyWithInvalidFlagsRecheck,
   describeAdErrorClassification,
   type AdCall,
+  type AdErrorClassification,
   type AdVerb,
 } from '../src/ad-error-class.ts'
 import {
@@ -76,8 +82,11 @@ import {
   STUB_TMUX_SOCKET_PATH,
   errCallTimeout,
   errConfigMalformed,
+  errGeneric,
   errInstanceIdCollision,
   errInternal,
+  errInvalidFlags,
+  errSchemaMismatch,
   errSpawnNotFound,
   errSpawnNotResumable,
   errSystemInstallDisappeared,
@@ -102,6 +111,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_ROW_PENDING,
   runInAttempt,
   type AttemptErrorRecord,
@@ -109,7 +119,7 @@ import {
 } from '../src/unavailable-retry.ts'
 import { APP_TOKEN_PREFIX, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH, describeThrownValue } from '../src/persona-connection-errors.ts'
-import { RECHECK_OUTCOME_PASS, createAdVersionRecheck } from '../src/ad-version-gate.ts'
+import { RECHECK_OUTCOME_NOT_RUNNING, RECHECK_OUTCOME_PASS, createAdVersionRecheck } from '../src/ad-version-gate.ts'
 import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
@@ -2580,6 +2590,256 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
 
     expect(emissions.map((e) => e.text)).toEqual([onsetFor(err), configAllClear(), onsetFor(err), configAllClear()])
     expect(raiseLinesFor(err)).toHaveLength(2)
+  })
+})
+
+describe('UNCLASSIFIED is reported to the unclassified sink in P\'s attempt only (b.jg5 SRJ-313, SRJ-301)', () => {
+  /** One `report` the recording unclassified sink received. */
+  type Report = { key: string; error: unknown; classification: AdErrorClassification | undefined }
+
+  /** The binary path the `ErrSystemInstallDisappeared` answers here carry. */
+  const AD_PATH = '/bin/ad'
+
+  /**
+   * A fresh outage state over the default stub client with a recording
+   * trigger sink that answers true, a recording condition sink, a recording
+   * cleared-flag observer and, unless `unclassified` is false, a recording
+   * unclassified sink. `unclassifiedThrows` makes that sink record and then throw.
+   */
+  function makeUnclassifiedHarness(opts: { unclassified?: boolean; unclassifiedThrows?: boolean } = {}): {
+    emissions: Emission[]
+    arms: RecordedArm[]
+    reports: Report[]
+    starts: string[]
+    ends: string[]
+    cleared: RecordedClear[]
+  } {
+    const emissions: Emission[] = []
+    const arms: RecordedArm[] = []
+    const reports: Report[] = []
+    const starts: string[] = []
+    const ends: string[] = []
+    const cleared: RecordedClear[] = []
+    const client = makeStubClient()
+    _resetOutageState()
+    initOutageState({
+      notify: (key, text) => { emissions.push({ key, text }) },
+      getClient: () => client as unknown as Client,
+      triggerSink: { arm: (key, cause) => { arms.push({ key, kind: cause.kind, error: cause.error }); return true } },
+      conditionSink: {
+        start: (key) => { starts.push(key); return 'started' },
+        end: (key) => { ends.push(key); return 'ended' },
+      },
+      onFlagCleared: (key, cls, reading) => { cleared.push({ key, cls, reading }) },
+      ...(opts.unclassified === false
+        ? {}
+        : {
+            unclassifiedSink: {
+              report: (key: string, error: unknown, classification?: AdErrorClassification) => {
+                reports.push({ key, error, classification })
+                if (opts.unclassifiedThrows) throw new Error('unclassified sink failed')
+                return 'begun'
+              },
+            },
+          }),
+    })
+    return { emissions, arms, reports, starts, ends, cleared }
+  }
+
+  /** The reports as `{ key, same }`, `same` true when the reported value is `err` itself. */
+  function reportsOf(reports: Report[], err: unknown): Array<{ key: string; same: boolean }> {
+    return reports.map((r) => ({ key: r.key, same: r.error === err }))
+  }
+
+  /** The arms as `{ key, kind, same }`, `same` true when the cause carries `err` itself. */
+  function armsOf(arms: RecordedArm[], err: unknown): Array<{ key: string; kind: string; same: boolean }> {
+    return arms.map((a) => ({ key: a.key, kind: a.kind, same: a.error === err }))
+  }
+
+  /**
+   * The UNCLASSIFIED answers (b.jg5 SRJ-104), each built for the declared
+   * verb, with the flags each raises by itself: `ErrSystemInstallDisappeared`
+   * still raises `ad-unreachable`; the others raise none.
+   */
+  const UNCLASSIFIED_FORMS: ReadonlyArray<readonly [label: string, build: (verb: string) => unknown, raises: OutageClass[]]> = [
+    ['ErrInternal', () => errInternal(), []],
+    ['an unhandled name', (verb) => errGeneric(verb, 'ErrNoHandlingInCscb'), []],
+    ['ErrSchemaMismatch', () => errSchemaMismatch(), []],
+    ['ErrSystemInstallDisappeared', (verb) => errSystemInstallDisappeared(verb, AD_PATH), ['ad-unreachable']],
+  ]
+
+  /** The read calls, which keep E8's read-error cause; every other declared call arms the UNCLASSIFIED cause. */
+  const READ_CALLS: readonly AdCall[] = ['status', 'get', 'list']
+
+  /** Every declared call through withOutageDetection, and the launch calls through withSpawnDetection. */
+  const UNCLASSIFIED_ROWS: WrapRow[] = [
+    ...EVERY_DECLARED_CALL.map((call): WrapRow => ['withOutageDetection', declaredName(call), withOutageDetection, call]),
+    ['withSpawnDetection', 'spawn', withSpawnDetection, 'spawn'],
+    ['withSpawnDetection', 'resume', withSpawnDetection, 'resume'],
+  ]
+
+  test.each(UNCLASSIFIED_ROWS)('%s, %s: each form inside P\'s attempt is reported once for P with the same value and arms once; inside Q\'s attempt or outside any, nothing; no flag raised (but ad-unreachable) or cleared; no condition start or end; rethrown unchanged', async (_w, _c, wrap, call) => {
+    const verb = adCallVerb(call)!
+    const kind = READ_CALLS.includes(call) ? UNAVAILABLE_RETRY_CAUSE_READ_ERROR : UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED
+    for (const [form, build, raises] of UNCLASSIFIED_FORMS) {
+      for (const context of CONTEXTS) {
+        const err = build(verb)
+        const { emissions, arms, reports, starts, ends, cleared } = makeUnclassifiedHarness()
+        // Flags up beforehand, so a clear would show.
+        setOutageFlag(P1, 'tmux-unavailable')
+        setOutageFlag(P1, 'cwd-unreachable', WRAP_WORKDIR)
+        const before = emissions.length
+
+        const { result: rejected, lastError } = await runIn(context, () => rejectionFrom(wrap, P1, call, err))
+
+        const at = { form, context }
+        const inP = context === 'inside P\'s attempt'
+        expect({ ...at, same: rejected === err }).toEqual({ ...at, same: true })
+        expect({ ...at, reports: reportsOf(reports, err) }).toEqual({ ...at, reports: inP ? [{ key: P1, same: true }] : [] })
+        expect({ ...at, arms: armsOf(arms, err) }).toEqual({ ...at, arms: inP ? [{ key: P1, kind, same: true }] : [] })
+        expect({ ...at, lastError }).toEqual({ ...at, lastError: inP ? { verb, causeKind: kind, armed: true } : undefined })
+        expect({ ...at, flags: [...getOutageFlags(P1)].sort(), b: [...getOutageFlags(P2)] })
+          .toEqual({ ...at, flags: (['cwd-unreachable', 'tmux-unavailable', ...raises] satisfies OutageClass[]).sort(), b: [] })
+        expect({ ...at, cleared }).toEqual({ ...at, cleared: [] })
+        expect({ ...at, posted: emissions.slice(before) }).toEqual({ ...at, posted: raises.map(() => ({ key: P1, text: ONSET_TEMPLATES['ad-unreachable'](AD_PATH) })) })
+        // SRJ-307: only UNAVAILABLE starts tmux-unresponsive; an UNCLASSIFIED answer is not tmux answering either.
+        expect({ ...at, starts, ends }).toEqual({ ...at, starts: [], ends: [] })
+      }
+    }
+  })
+
+  test('a call for P inside Q\'s attempt nested in P\'s is reported once, for P', async () => {
+    const err = errInternal()
+    const { reports, arms } = makeUnclassifiedHarness()
+
+    await runInAttempt(P1, 'recovery', () => runInAttempt(P2, 'launch', () => rejectionFrom(withSpawnDetection, P1, 'spawn', err)))
+
+    expect(reportsOf(reports, err)).toEqual([{ key: P1, same: true }])
+    expect(armsOf(arms, err)).toEqual([{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, same: true }])
+  })
+
+  test('an ErrInternal carrying the unusable-name phrase (UNUSABLE NAME, the E16 boundary) inside P\'s attempt is not reported', async () => {
+    const err = errUnusableName()
+    const { reports } = makeUnclassifiedHarness()
+
+    await runIn('inside P\'s attempt', async () => {
+      await rejectionFrom(withOutageDetection, P1, 'get', err)
+      await rejectionFrom(withSpawnDetection, P1, 'spawn', err)
+      reportAgentDirectorError(P1, err, 'status')
+    })
+
+    expect(reports).toEqual([])
+  })
+
+  test('ruling 4: an UNCLASSIFIED answer from a call with no known verb, inside P\'s attempt, neither arms nor is reported', async () => {
+    const { reports, arms } = makeUnclassifiedHarness()
+
+    const { lastError } = await runIn('inside P\'s attempt', () => reportAgentDirectorError(P1, errInternal(), UNDECLARED_CALL))
+
+    expect(reports).toEqual([])
+    expect(arms).toEqual([])
+    expect(lastError).toEqual({ armed: false })
+  })
+
+  test.each([
+    ['no options (reports)', errInternal(), undefined, 1],
+    ['no options, ErrSystemInstallDisappeared (reports)', errSystemInstallDisappeared('status', AD_PATH), undefined, 1],
+    ['reportUnclassified true (reports)', errSystemInstallDisappeared('status', AD_PATH), { reportUnclassified: true }, 1],
+    ['reportUnclassified false, the liveness adapter\'s ErrSystemInstallDisappeared (not reported)', errSystemInstallDisappeared('status', AD_PATH), { reportUnclassified: false }, 0],
+    ['reportUnclassified false, ErrInternal (not reported)', errInternal(), { reportUnclassified: false }, 0],
+  ] as const)('reportAgentDirectorError from status inside P\'s attempt, %s: the read-error arming is the same either way; no flag, no notice', async (_label, err, options, reported) => {
+    const { emissions, arms, reports, starts } = makeUnclassifiedHarness()
+
+    const { lastError } = await runIn('inside P\'s attempt', () => reportAgentDirectorError(P1, err, 'status', options))
+
+    expect(reportsOf(reports, err)).toEqual(reported === 1 ? [{ key: P1, same: true }] : [])
+    expect(armsOf(arms, err)).toEqual([{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR, same: true }])
+    expect(lastError).toEqual({ verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR, armed: true })
+    expect({ flags: getOutageFlags(P1).size, emissions, starts }).toEqual({ flags: 0, emissions: [], starts: [] })
+  })
+
+  test.each([...CONTEXTS])('reportAgentDirectorError outside P\'s attempt (%s) reports nothing', async (context) => {
+    const err = errInternal()
+    const { reports } = makeUnclassifiedHarness()
+
+    await runIn(context, () => {
+      reportAgentDirectorError(P1, err, 'status')
+      reportAgentDirectorError(P1, err, 'spawn')
+    })
+
+    expect(reportsOf(reports, err)).toEqual(context === 'inside P\'s attempt' ? [{ key: P1, same: true }, { key: P1, same: true }] : [])
+  })
+
+  /** The resume path's step for `err`: the ErrInvalidFlags re-check, here answering not-running. */
+  function invalidFlagsStep(err: ReturnType<typeof errInvalidFlags>) {
+    return classifyWithInvalidFlagsRecheck(err, async () => ({ kind: RECHECK_OUTCOME_NOT_RUNNING }))
+  }
+
+  test.each([...CONTEXTS])('the site entry after the resume path\'s ErrInvalidFlags, %s: inside P\'s attempt it arms the UNCLASSIFIED cause and reports once with the step\'s classification (the wrapper reported and armed nothing); elsewhere nothing', async (context) => {
+    const err = errInvalidFlags('resume')
+    const { classification } = await invalidFlagsStep(err)
+    const { emissions, arms, reports, starts, ends, cleared } = makeUnclassifiedHarness()
+
+    const { result, lastError } = await runIn(context, async () => {
+      const rejected = await rejectionFrom(withSpawnDetection, P1, 'resume', err)
+      const byWrapper = { reports: reports.length, arms: arms.length }
+      return { same: rejected === err, byWrapper, armed: reportUnclassifiedAtSite(P1, err, 'resume', classification) }
+    })
+
+    const inP = context === 'inside P\'s attempt'
+    expect(classification.errorClass).toBe(AD_ERROR_CLASS_UNCLASSIFIED)
+    expect(result).toEqual({ same: true, byWrapper: { reports: 0, arms: 0 }, armed: inP })
+    expect(armsOf(arms, err)).toEqual(inP ? [{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, same: true }] : [])
+    expect(reports.map((r) => ({ key: r.key, same: r.error === err, classification: r.classification })))
+      .toEqual(inP ? [{ key: P1, same: true, classification }] : [])
+    expect(lastError).toEqual(inP ? { verb: 'resume', causeKind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, armed: true } : undefined)
+    expect({ flags: getOutageFlags(P1).size, emissions, starts, ends, cleared }).toEqual({ flags: 0, emissions: [], starts: [], ends: [], cleared: [] })
+  })
+
+  test.each([
+    ['no unclassified sink installed', { unclassified: false }],
+    ['an unclassified sink that throws', { unclassifiedThrows: true }],
+  ] as const)('the site entry with %s still arms and answers true, and does not throw', async (_label, opts) => {
+    const err = errInvalidFlags('resume')
+    const { classification } = await invalidFlagsStep(err)
+    const { arms, reports } = makeUnclassifiedHarness(opts)
+
+    const { result: armed } = await runIn('inside P\'s attempt', () => reportUnclassifiedAtSite(P1, err, 'resume', classification))
+
+    expect(armed).toBe(true)
+    expect(armsOf(arms, err)).toEqual([{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, same: true }])
+    expect(reports).toHaveLength('unclassifiedThrows' in opts ? 1 : 0)
+  })
+
+  test.each([
+    ['ErrInternal from spawn', withSpawnDetection, 'spawn', () => errInternal()],
+    ['ErrSystemInstallDisappeared from status (raises ad-unreachable)', withOutageDetection, 'status', () => errSystemInstallDisappeared('status', AD_PATH)],
+  ] as const)('%s inside P\'s attempt: the rethrown value, arming, attempt record, flags and notices are exactly as with no unclassified sink, or with one that throws', async (_label, wrap, call, build) => {
+    const err = build()
+    /** One run: its outcome, the arms, P's flags and every notice. */
+    async function runWith(opts: { unclassified?: boolean; unclassifiedThrows?: boolean }): Promise<unknown> {
+      const { emissions, arms, starts } = makeUnclassifiedHarness(opts)
+      const { result, lastError } = await runIn('inside P\'s attempt', async () => (await rejectionFrom(wrap, P1, call, err)) === err)
+      return { result, lastError, arms: armsOf(arms, err), flags: [...getOutageFlags(P1)].sort(), emissions, starts }
+    }
+
+    const without = await runWith({ unclassified: false })
+    const recording = await runWith({})
+    const throwing = await runWith({ unclassifiedThrows: true })
+
+    expect(recording).toEqual(without)
+    expect(throwing).toEqual(without)
+  })
+
+  test('the error text reaches no notice, flag or attempt record, and the sink gets the value itself (leak check)', async () => {
+    const err = errInternal(`the store could not be read (${sentinelInMessage('spawn')}); nothing was done`)
+    const { emissions, arms, reports, starts } = makeUnclassifiedHarness()
+
+    const { result: rejected, lastError } = await runIn('inside P\'s attempt', () => rejectionFrom(withSpawnDetection, P1, 'spawn', err))
+
+    expect(rejected).toBe(err)
+    expect(reportsOf(reports, err)).toEqual([{ key: P1, same: true }])
+    assertNoLeak({ emissions, lastError, kinds: arms.map((a) => a.kind), flags: [...getOutageFlags(P1)], starts })
   })
 })
 

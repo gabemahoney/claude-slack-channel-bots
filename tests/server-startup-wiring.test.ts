@@ -125,6 +125,19 @@
  *   itself, never a value taken once; its alert is cancelled only by the
  *   teardown's retry-timer stop (pinned in tests/reload-wiring.test.ts) and
  *   by shutdown's close of the episodes.
+ * - b.jg5 SRJ-313 / SRJ-1009: the one unclassified-error episodes instance is
+ *   built once, imported from the episodes module, in main()'s own statement
+ *   list, over the one notice episodes instance (so a teardown's forget and
+ *   shutdown's close end it), with the server log, E6's alert threshold
+ *   accessor itself, a configured-key lookup over `getAppliedPersona` and a
+ *   log-only route through `recordStartupError` with the exported
+ *   `persona-unclassified-error` label, the persona's key and the alert's
+ *   text, before the retry controller and the start pass; it is the
+ *   unclassified sink of the one `initOutageState` call; the retry
+ *   controller's stop observer calls the condition's alert cancel and the
+ *   instance's `retryStopped`, each isolated; the restart module's
+ *   `onCapReached` calls the cap notice and the instance's `end` with the
+ *   capped reason, each isolated; the instance is named nowhere else.
  * - b.jg5 SRJ-311 / SRJ-312 / SRJ-305 / SRJ-306: the one `initOutageState`
  *   call (in main()'s own statement list, after the retry controller and
  *   before the start pass) installs the cleared-flag observer
@@ -193,6 +206,8 @@ import type {
   PersonaEpisodesDeps,
   TmuxUnresponsiveCondition,
   TmuxUnresponsiveConditionDeps,
+  UnclassifiedErrorEpisodes,
+  UnclassifiedErrorEpisodesDeps,
 } from '../src/persona-episodes.ts'
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
 import type { FullModeRetryDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
@@ -243,6 +258,11 @@ function constOf(call: string): string {
 /** `name` is declared exactly once in server.ts (no local shadow, no second instance). */
 function declaredOnce(name: string): void {
   expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+}
+
+/** A pattern for the call pattern `call` as the one statement of a `try` whose `catch` swallows (its body empty once comments are stripped). */
+function isolated(call: string): string {
+  return `try \\{ ${call};? \\} catch(?: \\(\\w+\\))? \\{ \\}`
 }
 
 /** The retry action's in-flight member (b.jg5 SRJ-301); renaming it fails the typecheck. */
@@ -1973,6 +1993,8 @@ describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s e
   const TICK_NOW: keyof HealthCheckDeps = 'now'
   const RETRY_FIRE: keyof UnavailableRetryDeps = 'onRetryFire'
   const RETRY_STOPPED: keyof UnavailableRetryDeps = 'onStopped'
+  const UNCLASSIFIED_FACTORY: keyof typeof PersonaEpisodesModule = 'createUnclassifiedErrorEpisodes'
+  const RETRY_STOPPED_ENTRY: keyof UnclassifiedErrorEpisodes = 'retryStopped'
   const TORN_DOWN: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_STOP_TORN_DOWN'
   const THRESHOLD_IN_EFFECT: keyof typeof AdSettingsModule = 'adAlertThresholdMsInEffect'
   const INTERVAL: keyof PersonaConfig = 'health_check_interval'
@@ -2043,16 +2065,21 @@ describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s e
     expect(indicesOf(new RegExp(`\\b${THRESHOLD_IN_EFFECT}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('the retry controller\'s stop observer is the condition\'s alert cancel, given the persona and the stop reason', () => {
+  test('the retry controller\'s stop observer calls the condition\'s alert cancel and the unclassified-error episodes\' stop entry, each given the persona and the stop reason and each in its own try/catch (b.jg5 SRJ-309, SRJ-313)', () => {
     const condition = constOf(FACTORY)
     declaredOnce(condition)
+    const unclassified = constOf(UNCLASSIFIED_FACTORY)
+    declaredOnce(unclassified)
     const hook = onlyCallProps('createUnavailableRetryController').get(RETRY_STOPPED)
     expect(hook).toBeDefined()
-    // `(key, reason) => <condition>.cancelAlert(key, reason)` (block or
-    // expression body); the parameters' names are free. Only a wrapper: the
-    // condition is declared after the controller is built.
-    const call = `${condition}\\.${CANCEL_ALERT}\\(\\1, \\2\\)`
-    expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
+    // `(key, reason) => { try { <condition>.cancelAlert(key, reason) } catch { }
+    // try { <episodes>.retryStopped(key, reason) } catch { } }`, in either
+    // order; the parameters' names are free. Only a wrapper: both are
+    // declared after the controller is built. Each call is isolated, so one
+    // consumer that throws never skips the other.
+    const cancel = isolated(`${condition}\\.${CANCEL_ALERT}\\(\\1, \\2\\)`)
+    const stopped = isolated(`${unclassified}\\.${RETRY_STOPPED_ENTRY}\\(\\1, \\2\\)`)
+    expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => \\{ (?:${cancel} ${stopped}|${stopped} ${cancel}) \\}$`))
   })
 
   test('the alert is cancelled only by the retry controller\'s stop observer and by the lifecycle\'s stopRetryTimer, with the torn-down reason (server.ts\'s two cancelAlert calls)', () => {
@@ -2069,6 +2096,138 @@ describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s e
       return cancels.filter((at) => at > start && at < end).length
     }
     expect([inside('createUnavailableRetryController'), inside('createPersonaLifecycle')]).toEqual([1, 1])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-313 / SRJ-1009 — the unclassified-error episodes'
+// production bindings
+//
+// The outage state's unclassified sink (`OutageStateDeps.unclassifiedSink`),
+// the episodes' configured-key lookup and log-only route
+// (`UnclassifiedErrorEpisodesDeps.isConfigured`, `logOnly`), the retry
+// controller's stop observer and the restart module's `onCapReached` are all
+// optional or take any body: absent, no UNCLASSIFIED outcome reaches an
+// episode, every key reads as configured (an alert for a persona no longer
+// configured would reach Slack), a log-only alert goes nowhere, and an
+// episode never ends at a recovered retry or at the cap. So a production
+// wiring that dropped one, bound it to a no-op or a local shadow, built a
+// second instance, installed the sink twice or after the start pass would
+// type-check and pass every behaviour suite. What the episodes do is tested
+// in tests/persona-episodes.test.ts, the reporting point in
+// tests/outage-state.test.ts and the end-to-end cases in
+// tests/unavailable-retry.test.ts; the stop observer's binding is pinned in
+// the describe above. Pinned here: the build and the other bindings.
+// ---------------------------------------------------------------------------
+
+describe('main() builds the one unclassified-error episodes instance over the notice episodes before the start pass, installs it as the outage state\'s unclassified sink, routes its log-only alert through recordStartupError, and ends its episode at the restart cap (b.jg5 SRJ-313, SRJ-1009)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const FACTORY: keyof typeof PersonaEpisodesModule = 'createUnclassifiedErrorEpisodes'
+  const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
+  const LABEL: keyof typeof PersonaEpisodesModule = 'PERSONA_UNCLASSIFIED_ERROR_LABEL'
+  const END_CAPPED: keyof typeof PersonaEpisodesModule = 'UNCLASSIFIED_ERROR_END_CAPPED'
+  const EPISODES: keyof UnclassifiedErrorEpisodesDeps = 'episodes'
+  const LOG: keyof UnclassifiedErrorEpisodesDeps = 'log'
+  const THRESHOLD: keyof UnclassifiedErrorEpisodesDeps = 'alertThresholdMs'
+  const IS_CONFIGURED: keyof UnclassifiedErrorEpisodesDeps = 'isConfigured'
+  const LOG_ONLY: keyof UnclassifiedErrorEpisodesDeps = 'logOnly'
+  const END: keyof UnclassifiedErrorEpisodes = 'end'
+  const RETRY_STOPPED_ENTRY: keyof UnclassifiedErrorEpisodes = 'retryStopped'
+  const REPORT: keyof UnclassifiedErrorEpisodes = 'report'
+  const SINK: keyof OutageStateDeps = 'unclassifiedSink'
+  const CAP_REACHED: keyof RestartDeps = 'onCapReached'
+  const RETRY_STOPPED: keyof UnavailableRetryDeps = 'onStopped'
+  const THRESHOLD_IN_EFFECT: keyof typeof AdSettingsModule = 'adAlertThresholdMsInEffect'
+
+  /** Every path that can report an UNCLASSIFIED outcome: the start bring-up, the restart module and the health check. */
+  function startPass(): number[] {
+    return [startResolution(SERVER_CODE).bringUpAt, onlyCallOf('initRestart'), onlyCallOf('initHealthCheck')]
+  }
+
+  test('the instance is built exactly once, in main()\'s own statement list (not at module scope, behind no branch), over the one notice episodes instance, after it and before the retry controller, the outage state\'s install and the start pass', () => {
+    const at = onlyCallOf(FACTORY)
+    const unclassified = constOf(FACTORY)
+    declaredOnce(unclassified)
+    const decl = SERVER_CODE.search(new RegExp(`\\bconst\\s+${unclassified}\\s*=\\s*${FACTORY}\\s*\\(`))
+    expect(decl).toBeGreaterThan(-1)
+    expect(decl).toBeLessThan(at)
+    expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
+    expect(importSource(SERVER_CODE, FACTORY)).toBe('./persona-episodes.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+
+    // Over the one episodes instance: a teardown's forget and shutdown's
+    // close reach its episode.
+    const episodes = constOf(EPISODES_FACTORY)
+    expect(onlyCallProps(FACTORY).get(EPISODES)).toBe(episodes)
+    expect(at).toBeGreaterThan(onlyCallOf(EPISODES_FACTORY))
+
+    for (const later of [onlyCallOf('createUnavailableRetryController'), onlyCallOf('initOutageState'), ...startPass()]) {
+      expect(at).toBeLessThan(later)
+    }
+  })
+
+  test('its log is the server log and its alert threshold is E6\'s accessor of the threshold in effect itself, never a value taken once', () => {
+    const props = onlyCallProps(FACTORY)
+    expect(props.get(LOG)).toMatch(/^\((\w+)\) => console\.error\(\1\)$/)
+    expect(props.get(THRESHOLD)).toBe(THRESHOLD_IN_EFFECT)
+    expect(importSource(SERVER_CODE, THRESHOLD_IN_EFFECT)).toBe('./ad-settings.ts')
+  })
+
+  test('its configured-key lookup asks the live applied-persona lookup, getAppliedPersona, for the key it is given, at each check', () => {
+    // `(key) => getAppliedPersona(key) !== undefined`; the parameter's name is free.
+    expect(onlyCallProps(FACTORY).get(IS_CONFIGURED)).toMatch(/^\(?(\w+)\)? => getAppliedPersona\(\1\) !== undefined$/)
+    declaredOnce('getAppliedPersona')
+    expect(importSource(SERVER_CODE, 'getAppliedPersona')).toBeUndefined()
+  })
+
+  test('its log-only route is one recordStartupError call with the exported persona-unclassified-error label and a text naming the persona\'s key and the alert\'s text', () => {
+    const route = onlyCallProps(FACTORY).get(LOG_ONLY)
+    expect(route).toBeDefined()
+    // `(key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `…${key}…${text}…`)`
+    // (block or expression body); the parameters' names are free.
+    const call = `recordStartupError\\(${LABEL}, \`[^\`]*\\$\\{\\1\\}[^\`]*\\$\\{\\2\\}[^\`]*\`\\)`
+    expect(route).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
+    expect(importSource(SERVER_CODE, 'recordStartupError')).toBe('./startup-errors.ts')
+    expect(importSource(SERVER_CODE, LABEL)).toBe('./persona-episodes.ts')
+    for (const name of ['recordStartupError', LABEL]) {
+      expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    }
+  })
+
+  test('it is the unclassified sink of the one initOutageState call, in main()\'s own statement list before the start pass; nothing else names an unclassified sink', () => {
+    const install = onlyCallOf('initOutageState')
+    expect(onlyCallProps('initOutageState').get(SINK)).toBe(constOf(FACTORY))
+    expect(atMainTopLevel(SERVER_CODE, install)).toBe(true)
+    for (const later of startPass()) expect(install).toBeLessThan(later)
+    const named = indicesOf(new RegExp(`\\b${SINK}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(1)
+    const [open, close] = balancedAfter(SERVER_CODE, install, '(', ')')
+    expect(named[0]! > open && named[0]! < close).toBe(true)
+  })
+
+  test('the restart module\'s onCapReached raises the cap notice and ends the persona\'s episode with the capped reason, for the key it is given, each in its own try/catch', () => {
+    const unclassified = constOf(FACTORY)
+    const hook = onlyCallProps('initRestart').get(CAP_REACHED)
+    expect(hook).toBeDefined()
+    // `(key) => { try { notifyRestartCapReached(key) } catch { } try { <episodes>.end(key, UNCLASSIFIED_ERROR_END_CAPPED) } catch { } }`,
+    // in either order; the parameter's name is free.
+    const notice = isolated('notifyRestartCapReached\\(\\1\\)')
+    const end = isolated(`${unclassified}\\.${END}\\(\\1, ${END_CAPPED}\\)`)
+    expect(hook).toMatch(new RegExp(`^\\(?(\\w+)\\)? => \\{ (?:${notice} ${end}|${end} ${notice}) \\}$`))
+    expect(importSource(SERVER_CODE, 'notifyRestartCapReached')).toBe('./session-manager.ts')
+    expect(importSource(SERVER_CODE, END_CAPPED)).toBe('./persona-episodes.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+(?:notifyRestartCapReached|${END_CAPPED})\\b`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  test('the instance is named only at its build, as the sink, in the stop observer and in onCapReached: its end and stop entries are called from those bindings alone, and server.ts reports to it directly nowhere', () => {
+    const unclassified = constOf(FACTORY)
+    expect(indicesOf(new RegExp(`\\b${unclassified}\\b`, 'g'), SERVER_CODE)).toHaveLength(4)
+    const calls = (entry: string) => indicesOf(new RegExp(`\\b${unclassified}\\s*[?!]?\\.\\s*${entry}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(calls(REPORT)).toEqual([])
+    expect(calls(END)).toHaveLength(1)
+    expect(calls(RETRY_STOPPED_ENTRY)).toHaveLength(1)
+    expect(onlyCallProps('initRestart').get(CAP_REACHED)).toContain(`${unclassified}.${END}(`)
+    expect(onlyCallProps('createUnavailableRetryController').get(RETRY_STOPPED)).toContain(`${unclassified}.${RETRY_STOPPED_ENTRY}(`)
   })
 })
 

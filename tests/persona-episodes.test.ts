@@ -36,6 +36,27 @@
  * and a throwing health-check mode accessor (taken as on). Its starts and
  * ends through the outage state are in `tests/tmux-unresponsive.test.ts`.
  *
+ * The unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009, SRJ-1016),
+ * direct over `createUnclassifiedErrorEpisodes` with the threshold from an
+ * injected accessor (agent-director's defaults and AC 80's settings, through
+ * `adAlertThresholdMs`): a report at exactly the threshold after the
+ * episode's first posts nothing, the first strictly past it posts one alert
+ * (the builder's text for that report's classification, or the site's own)
+ * and later ones post nothing; the accessor is read at each check. The text:
+ * name and message from the classifier, an unsafe name left out, a message
+ * redacted and capped, and escaped for Slack (`<!channel>`, `<@U…>`, `&`)
+ * only on the post route. Routing, decided at the alert: a configured key to
+ * the sink only, any other key to the log-only route only (with the
+ * `persona-unclassified-error` label on its line), a throwing lookup taking
+ * the log-only route, a missing or throwing log-only route logged, and one
+ * latch for both routes. Ends: `end` for each reason and `retryStopped` for
+ * `UNAVAILABLE_RETRY_STOP_RECOVERED` and `UNAVAILABLE_RETRY_STOP_ROW_LIVE`
+ * (each ended line exact); every other stop leaves the episode open; `end`,
+ * `forget`, `forgetAll` and `close` post nothing and leave another persona's
+ * episode intact, and a report after them begins a new episode that alerts
+ * again. A throwing episodes member, threshold accessor or log breaks no
+ * report.
+ *
  * Close steps: `whenClosed` runs its step exactly once on every close path
  * (`end`, a new case, `forget`, `forgetAll`, `close`), answers false and
  * keeps nothing with no episode open, and a throwing step is logged
@@ -51,32 +72,51 @@
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
-import { describeAgentDirectorFailure } from '../src/ad-error-class.ts'
-import { DEFAULT_AD_SETTINGS_IN_EFFECT, adAlertThresholdMs } from '../src/ad-settings.ts'
+import {
+  AD_ERROR_CLASS_UNCLASSIFIED,
+  classifyAdError,
+  describeAdErrorClassification,
+  describeAgentDirectorFailure,
+  type AdErrorClassification,
+} from '../src/ad-error-class.ts'
+import { DEFAULT_AD_SETTINGS_IN_EFFECT, adAlertThresholdMs, type AdSettingsInEffect } from '../src/ad-settings.ts'
 import { LIVENESS_LIVE } from '../src/liveness-reading.ts'
+import { MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
 import {
   PERSONA_EPISODE_DEFAULT_MARK,
   PERSONA_EPISODE_KINDS,
   PERSONA_EPISODE_KIND_CONFLICT,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
+  PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
+  PERSONA_UNCLASSIFIED_ERROR_LABEL,
   TMUX_UNRESPONSIVE_END_RETRY,
   TMUX_UNRESPONSIVE_END_TEXT,
   TMUX_UNRESPONSIVE_END_TICK,
   TMUX_UNRESPONSIVE_END_TMUX_VERB,
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
+  UNCLASSIFIED_ERROR_END_CAPPED,
+  UNCLASSIFIED_ERROR_END_RECOVERED,
+  UNCLASSIFIED_ERROR_END_ROW_LIVE,
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
+  createUnclassifiedErrorEpisodes,
   tmuxUnresponsiveAlertText,
   tmuxUnresponsiveOnsetText,
   tmuxUnresponsiveRecoveryText,
+  unclassifiedErrorAlertText,
   type PersonaEpisodeKind,
   type PersonaEpisodeSink,
   type PersonaEpisodesClock,
   type PersonaEpisodes,
   type TmuxUnresponsiveCondition,
   type TmuxUnresponsiveEndReason,
+  type UnclassifiedErrorEndReason,
+  type UnclassifiedErrorEpisodes,
+  type UnclassifiedErrorEpisodesDeps,
+  type UnclassifiedErrorQuote,
 } from '../src/persona-episodes.ts'
+import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   _resetNotConnectedEpisodes,
   forgetNotConnectedEpisode,
@@ -84,10 +124,37 @@ import {
   setSessionNotifier,
   type NotConnectedNotice,
 } from '../src/session-manager.ts'
-import { UNAVAILABLE_RETRY_STOP_RUN_FAILED, UNAVAILABLE_RETRY_TERMINAL_STOPS } from '../src/unavailable-retry.ts'
-import { errTmuxUnresponsive } from './test-helpers/agent-director-stub.ts'
+import {
+  UNAVAILABLE_RETRY_STOP_CAPPED,
+  UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED,
+  UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
+  UNAVAILABLE_RETRY_STOP_NOT_UP,
+  UNAVAILABLE_RETRY_STOP_RECOVERED,
+  UNAVAILABLE_RETRY_STOP_ROW_GONE,
+  UNAVAILABLE_RETRY_STOP_ROW_LIVE,
+  UNAVAILABLE_RETRY_STOP_RUN_FAILED,
+  UNAVAILABLE_RETRY_STOP_SHUTDOWN,
+  UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED,
+  UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED,
+  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
+  UNAVAILABLE_RETRY_TERMINAL_STOPS,
+} from '../src/unavailable-retry.ts'
+import {
+  errGeneric,
+  errInternal,
+  errSchemaMismatch,
+  errSystemInstallDisappeared,
+  errTmuxUnresponsive,
+} from './test-helpers/agent-director-stub.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import {
+  BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
+  assertNoLeak,
+  fakeToken,
+  sentinelInMessage,
+} from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -1215,6 +1282,586 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
       expect(posts).toEqual(onsetFor.map((key) => ({ key, text: tmuxUnresponsiveOnsetText(key) })))
       expect(condition.holds('K')).toBe(true)
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009, SRJ-1016)
+// ---------------------------------------------------------------------------
+
+describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
+  const KIND = PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR
+  const DEFAULT_THRESHOLD_MS = adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
+  /** AC 80's agent-director settings (`stopping_window_seconds` 30, `starting_session_seconds` 120). */
+  const AC_80_SETTINGS: AdSettingsInEffect = {
+    ...DEFAULT_AD_SETTINGS_IN_EFFECT,
+    tmux: { ...DEFAULT_AD_SETTINGS_IN_EFFECT.tmux, stopping_window_seconds: 30n, starting_session_seconds: 120n },
+  }
+  const AC_80_THRESHOLD_MS = adAlertThresholdMs(AC_80_SETTINGS)
+
+  let logOnlyCalls: Post[]
+
+  beforeEach(() => {
+    logOnlyCalls = []
+  })
+
+  afterEach(() => {
+    assertNoLeak({ logOnlyCalls })
+  })
+
+  const recordLogOnly = (key: string, text: string): void => {
+    logOnlyCalls.push({ key, text })
+  }
+
+  /** Episodes over `episodes` and the line capture, at the default threshold, every key configured, unless overridden. */
+  function buildUnclassified(overrides: Partial<UnclassifiedErrorEpisodesDeps> = {}): UnclassifiedErrorEpisodes {
+    return createUnclassifiedErrorEpisodes({
+      episodes,
+      log: (line) => lines.push(line),
+      alertThresholdMs: () => DEFAULT_THRESHOLD_MS,
+      logOnly: recordLogOnly,
+      ...overrides,
+    })
+  }
+
+  /** `persona=<key> unclassified-error <text>`. */
+  function personaLine(key: string, text: string): string {
+    return `[slack] persona-episodes: persona=${key} ${KIND} ${text}`
+  }
+
+  function startedLine(key: string, err: unknown): string {
+    return personaLine(key, `started — ${describeAdErrorClassification(classifyAdError(err))}`)
+  }
+
+  function endedLine(key: string, reason: UnclassifiedErrorEndReason): string {
+    return personaLine(key, `ended — ${reason}`)
+  }
+
+  /** The `<met>` tail of an alert line: whole seconds since the first outcome and of the threshold, then the quoted classification. */
+  function met(elapsedMs: number, thresholdMs: number, classification: AdErrorClassification): string {
+    return `an UNCLASSIFIED outcome met ${Math.floor(elapsedMs / 1000)} s after the episode's first, over its alert threshold of ${Math.floor(thresholdMs / 1000)} s: ${describeAdErrorClassification(classification)}`
+  }
+
+  function postedLine(key: string, elapsedMs: number, thresholdMs: number, classification: AdErrorClassification): string {
+    return personaLine(key, `alert posted to its destination — ${met(elapsedMs, thresholdMs, classification)}`)
+  }
+
+  function logOnlyLine(key: string, elapsedMs: number, thresholdMs: number, classification: AdErrorClassification): string {
+    return personaLine(
+      key,
+      `alert written to the server log and startup-errors.log (${PERSONA_UNCLASSIFIED_ERROR_LABEL}) — the persona is not in the applied configuration; ${met(elapsedMs, thresholdMs, classification)}`,
+    )
+  }
+
+  /** The alert as the sink receives it for `err`. */
+  function alertPost(key: string, err: unknown): Post {
+    return { key, text: unclassifiedErrorAlertText(classifyAdError(err)) }
+  }
+
+  /** Begin `key`'s episode now and report again just past the default threshold, so its alert posts. */
+  async function untilAlert(u: UnclassifiedErrorEpisodes, key = 'K', err: unknown = errInternal()): Promise<void> {
+    expect(u.report(key, errInternal())).toBe('begun')
+    await clock.advance(DEFAULT_THRESHOLD_MS + 1)
+    expect(u.report(key, err)).toBe('alerted')
+  }
+
+  test('the kind is declared, so it has its row in the per-kind once-per-episode table', () => {
+    expect(PERSONA_EPISODE_KINDS).toContain(KIND)
+  })
+
+  // -------------------------------------------------------------------------
+  // The alert rule
+  // -------------------------------------------------------------------------
+
+  test.each([
+    ["agent-director's defaults", DEFAULT_THRESHOLD_MS],
+    ["AC 80's settings", AC_80_THRESHOLD_MS],
+  ])('at %s: a report at exactly the threshold posts nothing; the first strictly past it posts one alert quoting it; later reports post nothing', async (_settings, thresholdMs) => {
+    const u = buildUnclassified({ alertThresholdMs: () => thresholdMs })
+    const first = errInternal('the first outcome')
+    const atThreshold = errInternal('at the threshold')
+    const past = errSchemaMismatch()
+
+    expect(u.report('K', first)).toBe('begun')
+    expect(u.isOpen('K')).toBe(true)
+    expect(episodes.view('K', KIND)?.startedAt).toBe(START_MS)
+
+    await clock.advance(thresholdMs)
+    expect(u.report('K', atThreshold)).toBe('continued')
+    expect(posts).toEqual([])
+
+    await clock.advance(1)
+    expect(u.report('K', past)).toBe('alerted')
+    expect(posts).toEqual([alertPost('K', past)])
+
+    await clock.advance(thresholdMs * 3)
+    expect([u.report('K', errInternal('later')), u.report('K', past)]).toEqual(['continued', 'continued'])
+
+    expect(posts).toEqual([alertPost('K', past)])
+    expect(logOnlyCalls).toEqual([])
+    expect(lines).toEqual([startedLine('K', first), postedLine('K', thresholdMs + 1, thresholdMs, classifyAdError(past))])
+  })
+
+  test('the threshold accessor is read at each check: raising it before the old boundary holds the alert; lowering it posts at the next report', async () => {
+    let thresholdMs = DEFAULT_THRESHOLD_MS
+    let reads = 0
+    const u = buildUnclassified({
+      alertThresholdMs: () => {
+        reads++
+        return thresholdMs
+      },
+    })
+
+    u.report('K', errInternal())
+    expect(reads).toBe(0)
+
+    thresholdMs = DEFAULT_THRESHOLD_MS * 2
+    await clock.advance(DEFAULT_THRESHOLD_MS + 1)
+    expect(u.report('K', errInternal())).toBe('continued')
+    expect(reads).toBe(1)
+
+    thresholdMs = AC_80_THRESHOLD_MS
+    await clock.advance(1)
+    expect(u.report('K', errInternal())).toBe('alerted')
+    expect(reads).toBe(2)
+    expect(lines.at(-1)).toBe(postedLine('K', DEFAULT_THRESHOLD_MS + 2, AC_80_THRESHOLD_MS, classifyAdError(errInternal())))
+
+    // Once the alert is posted no check reads it again.
+    u.report('K', errInternal())
+    expect(reads).toBe(2)
+    expect(posts).toHaveLength(1)
+  })
+
+  test('a site\'s own classification is quoted in place of the value\'s', async () => {
+    const u = buildUnclassified()
+    const own: AdErrorClassification = { errorClass: AD_ERROR_CLASS_UNCLASSIFIED, reportedName: 'ErrFromTheSite', message: 'the site said so' }
+
+    expect(u.report('K', errInternal(), own)).toBe('begun')
+    await clock.advance(DEFAULT_THRESHOLD_MS + 1)
+    expect(u.report('K', errInternal(), own)).toBe('alerted')
+
+    expect(lines[0]).toBe(personaLine('K', `started — ${describeAdErrorClassification(own)}`))
+    expect(posts).toEqual([{ key: 'K', text: unclassifiedErrorAlertText(own) }])
+  })
+
+  // -------------------------------------------------------------------------
+  // The text (SRJ-1009)
+  // -------------------------------------------------------------------------
+
+  test.each<[string, () => Error]>([
+    ['ErrInternal', () => errInternal('the store could not be read')],
+    ['ErrSchemaMismatch (a store that cannot be opened)', () => errSchemaMismatch()],
+    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared()],
+  ])('%s: the alert quotes the classifier\'s reported name and rendered message', async (_what, make) => {
+    const u = buildUnclassified()
+    const err = make()
+    const { reportedName, message } = classifyAdError(err)
+
+    await untilAlert(u, 'K', err)
+
+    expect(posts).toEqual([alertPost('K', err)])
+    expect(reportedName).toBeDefined()
+    expect(message).toBeDefined()
+    expect(posts[0]!.text).toContain(`${reportedName} "${escapeSlackControlCharacters(message!)}"`)
+  })
+
+  test('a value whose name is unsafe (it carries a fake token) gives the text without the name and with the quoted message', async () => {
+    const u = buildUnclassified()
+    const unsafeName = fakeToken(BOT_TOKEN_PREFIX, 'name')
+    const err = errGeneric('status', unsafeName, 'a description of the failure')
+    const classification = classifyAdError(err)
+    expect(classification).toEqual({ errorClass: AD_ERROR_CLASS_UNCLASSIFIED, message: 'a description of the failure' })
+
+    await untilAlert(u, 'K', err)
+
+    expect(posts).toEqual([{ key: 'K', text: unclassifiedErrorAlertText({ message: 'a description of the failure' }) }])
+    expect(posts[0]!.text).not.toContain(unsafeName)
+    // The builder leaves out a raw unsafe name given to it directly, too.
+    expect(unclassifiedErrorAlertText({ reportedName: unsafeName, message: 'm' })).toBe(unclassifiedErrorAlertText({ message: 'm' }))
+  })
+
+  test('a message carrying a fake token and a URL is redacted in the alert and in every line', async () => {
+    const u = buildUnclassified()
+    const err = errInternal(`the store refused (${sentinelInMessage('description')})`)
+
+    await untilAlert(u, 'K', err)
+
+    expect(posts[0]!.text).toContain(`"${escapeSlackControlCharacters(`the store refused (${REDACTED_SENTINEL_TAIL})`)}"`)
+    expect(lines.at(-1)).toContain(`message=${JSON.stringify(`the store refused (${REDACTED_SENTINEL_TAIL})`)}`)
+    assertNoLeak({ posts, lines })
+  })
+
+  test('an over-long message is capped at MAX_LOGGED_MESSAGE_LENGTH in the alert', async () => {
+    const u = buildUnclassified()
+    const err = errInternal('a'.repeat(MAX_LOGGED_MESSAGE_LENGTH * 2))
+    const { message } = classifyAdError(err)
+
+    await untilAlert(u, 'K', err)
+
+    expect(message).toHaveLength(MAX_LOGGED_MESSAGE_LENGTH)
+    expect(posts[0]!.text).toContain(`"${message}"`)
+    expect(posts[0]!.text).not.toContain('a'.repeat(MAX_LOGGED_MESSAGE_LENGTH))
+  })
+
+  test.each<[string, UnclassifiedErrorQuote, string]>([
+    ['a name alone', { reportedName: 'ErrX' }, ': ErrX'],
+    ['a message alone', { message: 'm' }, ': "m"'],
+    ['both', { reportedName: 'ErrX', message: 'm' }, ': ErrX "m"'],
+    ['an empty message', { reportedName: 'ErrX', message: '' }, ': ErrX'],
+  ])('the builder with %s is the bare text with only the quote added after "persona"', (_what, quote, added) => {
+    const bare = unclassifiedErrorAlertText({})
+    const text = unclassifiedErrorAlertText(quote)
+
+    expect(bare).not.toContain('"')
+    expect(text.replace(added, '')).toBe(bare)
+  })
+
+  test('the builder reads a quote whose fields throw as absent', () => {
+    const quote = {
+      get reportedName(): string {
+        throw new Error('read refused')
+      },
+      get message(): string {
+        throw new Error('read refused')
+      },
+    }
+
+    expect(unclassifiedErrorAlertText(quote)).toBe(unclassifiedErrorAlertText({}))
+  })
+
+  // -------------------------------------------------------------------------
+  // Routing and Slack escaping
+  // -------------------------------------------------------------------------
+
+  /** A description carrying Slack's control sequences: a channel mention, a user mention and an ampersand. */
+  const MENTIONING = 'ping <!channel> and <@U0123ABCD> & everyone'
+
+  test('a configured key\'s alert goes to the sink only, its quoted message escaped for Slack', async () => {
+    const configuredAsked: string[] = []
+    const u = buildUnclassified({
+      isConfigured: (key) => {
+        configuredAsked.push(key)
+        return true
+      },
+    })
+    const err = errInternal(MENTIONING)
+
+    await untilAlert(u, 'K', err)
+
+    expect(configuredAsked).toEqual(['K'])
+    expect(logOnlyCalls).toEqual([])
+    expect(posts).toEqual([alertPost('K', err)])
+    expect(posts[0]!.text).toContain(`"${escapeSlackControlCharacters(MENTIONING)}"`)
+    expect(posts[0]!.text).toContain('&lt;!channel&gt;')
+    expect(posts[0]!.text).toContain('&lt;@U0123ABCD&gt;')
+    expect(posts[0]!.text).toContain('&amp; everyone')
+    expect(posts[0]!.text).not.toContain('<!channel>')
+    expect(posts[0]!.text).not.toContain('<@U')
+  })
+
+  test('with no configured-key lookup every key is configured', async () => {
+    const u = buildUnclassified({ isConfigured: undefined })
+
+    await untilAlert(u)
+
+    expect(posts).toEqual([alertPost('K', errInternal())])
+    expect(logOnlyCalls).toEqual([])
+  })
+
+  test('an unconfigured key\'s alert goes to the log-only route only, with the key and the unescaped text, and its line names the class label', async () => {
+    const u = buildUnclassified({ isConfigured: () => false })
+    const err = errInternal(MENTIONING)
+
+    await untilAlert(u, 'K', err)
+
+    expect(posts).toEqual([])
+    expect(logOnlyCalls).toEqual([{ key: 'K', text: unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false }) }])
+    expect(logOnlyCalls[0]!.text).toContain(`"${MENTIONING}"`)
+    expect(lines.at(-1)).toBe(logOnlyLine('K', DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err)))
+  })
+
+  test('the route is decided when the alert is posted: a key removed from the applied configuration after its episode began takes the log-only route', async () => {
+    let configured = true
+    const u = buildUnclassified({ isConfigured: () => configured })
+
+    u.report('K', errInternal())
+    configured = false
+    await clock.advance(DEFAULT_THRESHOLD_MS + 1)
+    expect(u.report('K', errInternal())).toBe('alerted')
+
+    expect(posts).toEqual([])
+    expect(logOnlyCalls.map((c) => c.key)).toEqual(['K'])
+  })
+
+  test('one latch for both routes: after a log-only alert, the key configured again gets no post in the same episode', async () => {
+    let configured = false
+    const u = buildUnclassified({ isConfigured: () => configured })
+    await untilAlert(u)
+
+    configured = true
+    await clock.advance(DEFAULT_THRESHOLD_MS)
+    expect(u.report('K', errInternal())).toBe('continued')
+
+    expect(posts).toEqual([])
+    expect(logOnlyCalls).toHaveLength(1)
+  })
+
+  test('a configured-key lookup that throws is logged, redacted, and the alert takes the log-only route', async () => {
+    const u = buildUnclassified({
+      isConfigured: () => {
+        throw new Error(`lookup refused (${sentinelInMessage('lookup')})`)
+      },
+    })
+
+    await untilAlert(u)
+
+    expect(posts).toEqual([])
+    expect(logOnlyCalls).toHaveLength(1)
+    const failed = lines.filter((l) => l.startsWith(personaLine('K', 'configured-key lookup failed: ')))
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toStartWith(personaLine('K', `configured-key lookup failed: Error message="lookup refused (${REDACTED_SENTINEL_TAIL})"`))
+    expect(failed[0]).toEndWith(' — the alert takes the log-only route')
+    expect(lines.at(-1)).toStartWith(personaLine('K', 'alert written to the server log'))
+  })
+
+  test('an unconfigured key with no log-only route installed: one not-routed line, nothing posted, and the alert counts as posted', async () => {
+    const u = buildUnclassified({ isConfigured: () => false, logOnly: undefined })
+
+    await untilAlert(u)
+    await clock.advance(1)
+    expect(u.report('K', errInternal())).toBe('continued')
+
+    expect(posts).toEqual([])
+    expect(lines.filter((l) => l.startsWith(personaLine('K', 'alert not routed — ')))).toHaveLength(1)
+    expect(lines).toHaveLength(2)
+  })
+
+  test('the log-only route\'s written line is logged only after the route returns', async () => {
+    const order: string[] = []
+    const u = createUnclassifiedErrorEpisodes({
+      episodes,
+      log: (line) => order.push(line.includes(' alert written to the server log ') ? 'written line' : 'other line'),
+      alertThresholdMs: () => DEFAULT_THRESHOLD_MS,
+      isConfigured: () => false,
+      logOnly: () => {
+        order.push('logOnly entered')
+        order.push('logOnly returning')
+      },
+    })
+
+    await untilAlert(u)
+
+    expect(order).toEqual(['other line', 'logOnly entered', 'logOnly returning', 'written line'])
+  })
+
+  test('a log-only route that throws is logged, redacted, in place of the written line, and the alert counts as posted', async () => {
+    let calls = 0
+    const u = buildUnclassified({
+      isConfigured: () => false,
+      logOnly: () => {
+        calls++
+        throw new Error(`record refused (${sentinelInMessage('record')})`)
+      },
+    })
+
+    await untilAlert(u)
+
+    expect(calls).toBe(1)
+    expect(posts).toEqual([])
+    expect(lines.at(-1)).toStartWith(personaLine('K', `log-only alert failed: Error message="record refused (${REDACTED_SENTINEL_TAIL})"`))
+    expect(lines.filter((l) => l.includes('alert written to the server log'))).toEqual([])
+    expect(lines).toHaveLength(2)
+
+    // The latch holds: a later outcome past the threshold neither retries the route nor posts.
+    await clock.advance(DEFAULT_THRESHOLD_MS + 1)
+    expect(u.report('K', errInternal())).toBe('continued')
+
+    expect(calls).toBe(1)
+    expect(posts).toEqual([])
+    expect(lines).toHaveLength(2)
+  })
+
+  // -------------------------------------------------------------------------
+  // Ends, retry-timer stops, forget, forget-all and close
+  // -------------------------------------------------------------------------
+
+  test.each<[UnclassifiedErrorEndReason]>([
+    [UNCLASSIFIED_ERROR_END_RECOVERED],
+    [UNCLASSIFIED_ERROR_END_ROW_LIVE],
+    [UNCLASSIFIED_ERROR_END_CAPPED],
+  ])('end for "%s": one ended line, nothing posted, no state left; another persona\'s episode stays; a later report begins a new episode that alerts again', async (reason) => {
+    const u = buildUnclassified()
+    await untilAlert(u, 'K')
+    u.report('Q', errInternal())
+    const postsBefore = posts.length
+
+    expect(u.end('K', reason)).toBe(true)
+
+    expect(lines.at(-1)).toBe(endedLine('K', reason))
+    expect(posts).toHaveLength(postsBefore)
+    expect(u.isOpen('K')).toBe(false)
+    expect(episodes.view('K', KIND)).toBeUndefined()
+    expect(u.isOpen('Q')).toBe(true)
+    const linesAfter = lines.length
+    expect(u.end('K', reason)).toBe(false)
+    expect(lines).toHaveLength(linesAfter)
+
+    // A new episode alerts again; Q's alert is still its own.
+    await untilAlert(u, 'K')
+    expect(u.report('Q', errInternal())).toBe('alerted')
+    expect(posts.map((p) => p.key)).toEqual(['K', 'K', 'Q'])
+  })
+
+  test.each<[string, UnclassifiedErrorEndReason]>([
+    [UNAVAILABLE_RETRY_STOP_RECOVERED, UNCLASSIFIED_ERROR_END_RECOVERED],
+    [UNAVAILABLE_RETRY_STOP_ROW_LIVE, UNCLASSIFIED_ERROR_END_ROW_LIVE],
+  ])('the retry timer\'s stop "%s" ends the episode silently with its ended line', async (stop, reason) => {
+    const u = buildUnclassified()
+    await untilAlert(u)
+
+    expect(u.retryStopped('K', stop)).toBe(true)
+
+    expect(u.isOpen('K')).toBe(false)
+    expect(lines.at(-1)).toBe(endedLine('K', reason))
+    expect(posts).toHaveLength(1)
+    expect(u.retryStopped('K', stop)).toBe(false)
+  })
+
+  test('the pending-only row-live stop\'s ended line, exactly', () => {
+    const u = buildUnclassified()
+    u.report('K', errInternal())
+
+    u.retryStopped('K', UNAVAILABLE_RETRY_STOP_ROW_LIVE)
+
+    expect(lines.at(-1)).toBe(`[slack] persona-episodes: persona=K ${KIND} ended — ${UNCLASSIFIED_ERROR_END_ROW_LIVE}`)
+  })
+
+  test.each([
+    [UNAVAILABLE_RETRY_STOP_NOT_UP],
+    [UNAVAILABLE_RETRY_STOP_NOT_APPLIED],
+    [UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED],
+    [UNAVAILABLE_RETRY_STOP_ROW_GONE],
+    [UNAVAILABLE_RETRY_STOP_CAPPED],
+    [UNAVAILABLE_RETRY_STOP_TORN_DOWN],
+    [UNAVAILABLE_RETRY_STOP_SHUTDOWN],
+    [UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED],
+    [UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED],
+    [UNAVAILABLE_RETRY_STOP_RUN_FAILED],
+    ['a reason no module names'],
+  ])('the retry timer\'s stop "%s" leaves the episode open, with its start kept, and its alert still posts past the threshold', async (stop) => {
+    const u = buildUnclassified()
+    u.report('K', errInternal())
+    const linesBefore = lines.length
+
+    expect(u.retryStopped('K', stop)).toBe(false)
+
+    expect(lines).toHaveLength(linesBefore)
+    expect(u.isOpen('K')).toBe(true)
+    expect(episodes.view('K', KIND)?.startedAt).toBe(START_MS)
+    await clock.advance(DEFAULT_THRESHOLD_MS + 1)
+    expect(u.report('K', errInternal())).toBe('alerted')
+  })
+
+  test('a retry-timer stop or an end with no episode open answers false and logs nothing', () => {
+    const u = buildUnclassified()
+
+    expect(u.retryStopped('K', UNAVAILABLE_RETRY_STOP_RECOVERED)).toBe(false)
+    expect(u.end('K', UNCLASSIFIED_ERROR_END_CAPPED)).toBe(false)
+
+    expect(lines).toEqual([])
+    expect(u.isOpen('K')).toBe(false)
+  })
+
+  test.each<[string, (e: PersonaEpisodes) => void, readonly string[]]>([
+    ['forget(key)', (e) => e.forget('K'), ['K']],
+    ['forgetAll()', (e) => e.forgetAll(), ['K', 'Q']],
+  ])('%s drops the episode with nothing posted or logged and no state left; a later report begins a new one that alerts again', async (_how, drop, dropped) => {
+    const u = buildUnclassified()
+    await untilAlert(u, 'K')
+    await untilAlert(u, 'Q')
+    const linesBefore = lines.length
+
+    drop(episodes)
+
+    expect(posts).toHaveLength(2)
+    expect(lines).toHaveLength(linesBefore)
+    for (const key of ['K', 'Q']) {
+      const gone = dropped.includes(key)
+      expect({ key, open: u.isOpen(key), view: episodes.view(key, KIND) === undefined }).toEqual({ key, open: !gone, view: gone })
+    }
+    // An episode kept is still alerted: its next report posts nothing.
+    if (!dropped.includes('Q')) expect(u.report('Q', errInternal())).toBe('continued')
+
+    await untilAlert(u, 'K')
+    expect(posts.map((p) => p.key)).toEqual(['K', 'Q', 'K'])
+  })
+
+  test('after close() a report answers closed, opens nothing and logs nothing', async () => {
+    const u = buildUnclassified()
+    u.report('K', errInternal())
+    const linesBefore = lines.length
+
+    episodes.close()
+
+    expect(u.isOpen('K')).toBe(false)
+    expect(u.report('K', errInternal())).toBe('closed')
+    await clock.advance(DEFAULT_THRESHOLD_MS + 1)
+    expect(u.report('K', errInternal())).toBe('closed')
+    expect(lines).toHaveLength(linesBefore)
+    expect(posts).toEqual([])
+  })
+
+  // -------------------------------------------------------------------------
+  // Failures never escape a report
+  // -------------------------------------------------------------------------
+
+  test.each<[string, () => Partial<UnclassifiedErrorEpisodesDeps>, string]>([
+    [
+      'an episodes member that throws',
+      () => ({
+        episodes: {
+          ...episodes,
+          view: () => {
+            throw new Error(`view refused (${sentinelInMessage('view')})`)
+          },
+        },
+      }),
+      'view',
+    ],
+    [
+      'a threshold accessor that throws',
+      () => ({
+        alertThresholdMs: () => {
+          throw new Error(`threshold refused (${sentinelInMessage('threshold')})`)
+        },
+      }),
+      'threshold',
+    ],
+  ])('%s: a report past the threshold throws nothing, answers continued, logs one redacted report-failed line and posts nothing', async (_what, fault, what) => {
+    const u = buildUnclassified(fault())
+    u.report('K', errInternal())
+    await clock.advance(DEFAULT_THRESHOLD_MS + 1)
+    const before = lines.length
+
+    let answer: string | undefined
+    expect(() => {
+      answer = u.report('K', errInternal())
+    }).not.toThrow()
+
+    expect(answer).toBe('continued')
+    expect(posts).toEqual([])
+    expect(lines.slice(before)).toHaveLength(1)
+    expect(lines.at(-1)).toStartWith(personaLine('K', `report failed: Error message="${what} refused (${REDACTED_SENTINEL_TAIL})"`))
+  })
+
+  test('a log that throws breaks no report: the episode begins, the alert posts and the end ends it', async () => {
+    const u = buildUnclassified({ log: throwingLog })
+
+    await untilAlert(u)
+    expect(u.end('K', UNCLASSIFIED_ERROR_END_CAPPED)).toBe(true)
+
+    expect(posts).toEqual([alertPost('K', errInternal())])
+    expect(lines).toHaveLength(3)
   })
 })
 

@@ -88,8 +88,10 @@
  *   stop's hand-off (b.jg5 SRJ-309: the `tmux-unresponsive` alert check is
  *   cancelled with the timer, since the alert says CSCB keeps retrying, and
  *   armed again by a later refusal unless the reason is one of
- *   `UNAVAILABLE_RETRY_TERMINAL_STOPS`). It reads nothing back and changes
- *   nothing here.
+ *   `UNAVAILABLE_RETRY_TERMINAL_STOPS`; b.jg5 SRJ-313: the persona's
+ *   unclassified-error episode ends on `UNAVAILABLE_RETRY_STOP_RECOVERED`
+ *   and `UNAVAILABLE_RETRY_STOP_ROW_LIVE` only). It reads nothing back and
+ *   changes nothing here.
  * - `view(key)`, `isArmed(key)` and `armedKeys()` are read-only queries;
  *   `whenRunSettled(key)` awaits the persona's in-flight run, with its re-arm
  *   or stop, and a stop's hand-off.
@@ -140,7 +142,8 @@
  * `src/outage-state.ts`: inside an attempt for `key`, the arming predicate
  * `unavailableRetryCauseFor(value, verb)` decides the cause (UNAVAILABLE from
  * any verb, `ErrTmuxKillFailed` told apart by name; ENVIRONMENT from any
- * verb; CONFIG from any verb; any other `status`, `get` or `list` error but
+ * verb; CONFIG from any verb; UNCLASSIFIED from any verb but the reads,
+ * b.jg5 SRJ-313; any other `status`, `get` or `list` error but
  * `ErrSpawnNotFound` and UNUSABLE NAME), the trigger sink
  * (`UnavailableRetryTriggerSink`, which the controller is) arms the persona's
  * timer with it, and the innermost attempt records the error as its last,
@@ -236,6 +239,7 @@ import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
   AD_READ_VERBS,
   classifyAdError,
@@ -286,6 +290,18 @@ export const UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT = 'environment'
  * only UNAVAILABLE does).
  */
 export const UNAVAILABLE_RETRY_CAUSE_CONFIG = 'config'
+
+/**
+ * The cause of an UNCLASSIFIED outcome (b.jg5 SRJ-104: an `ErrInternal` other
+ * than an unusable recorded name, a store-open name, `ErrSystemInstallDisappeared`
+ * or any name CSCB gives no handling) from any verb but `status`, `get` and
+ * `list`, inside a launch or recovery attempt for the persona (b.jg5 SRJ-301,
+ * SRJ-313). A read's UNCLASSIFIED answer keeps the read-error cause. Never
+ * counted, it arms nothing outside an attempt for the persona, and it never
+ * starts or continues the `tmux-unresponsive` condition (SRJ-307: only
+ * UNAVAILABLE does).
+ */
+export const UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED = 'unclassified'
 
 /**
  * The causes that arm the persona's timer in any context
@@ -595,9 +611,15 @@ export interface UnavailableRetryDeps {
    * b.jg5 SRJ-309: called once per real stop of a persona's timer, with the
    * stop's reason (the stopped line's, or `UNAVAILABLE_RETRY_STOP_RUN_FAILED`
    * for a timer forgotten because its re-arm failed), after the stopped line
-   * and before any hand-off (production: the `tmux-unresponsive` condition's
-   * `cancelAlert`). Not called for a no-op stop, a first arm that failed or
-   * a pending-only stop that yielded to a full-mode cause. A throw is
+   * and before any hand-off. Production binds two consumers in one observer:
+   * the `tmux-unresponsive` condition's `cancelAlert`, then the
+   * unclassified-error episodes' `retryStopped` (b.jg5 SRJ-313), which ends
+   * the persona's episode only for `UNAVAILABLE_RETRY_STOP_RECOVERED` and
+   * `UNAVAILABLE_RETRY_STOP_ROW_LIVE`. Each
+   * reason is one of the `UNAVAILABLE_RETRY_STOP_*` constants (or the text a
+   * `stop`, `stopAll` or `close` caller gives), so a consumer tells them
+   * apart by equality. Not called for a no-op stop, a first arm that failed
+   * or a pending-only stop that yielded to a full-mode cause. A throw is
    * swallowed. Absent: nothing is called.
    */
   onStopped?: (key: string, reason: string) => unknown
@@ -1475,6 +1497,12 @@ function describeCause(cause: UnavailableRetryCause): string {
  * - CONFIG (`ErrConfigMalformed`) from any verb, `kill` and the read verbs
  *   included: a `config` cause (`UNAVAILABLE_RETRY_CAUSE_CONFIG`, SRJ-316),
  *   also decided before the read-error rule;
+ * - UNCLASSIFIED from any declared verb but `status`, `get` and `list` (an
+ *   unknown verb, which might be a read, arms nothing): an `unclassified` cause
+ *   (`UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED`, SRJ-301, SRJ-313). An
+ *   `ErrInvalidFlags` is STATE here; the resume path, which gives it no
+ *   meaning, arms through the outage state's site entry
+ *   (`reportUnclassifiedAtSite`) after its re-check;
  * - any other `status`, `get` or `list` error: a `read-error` cause, except
  *   `ErrSpawnNotFound` (each site keeps its meaning) and an UNUSABLE NAME
  *   answer (its own handling, SRJ-105);
@@ -1501,7 +1529,10 @@ export function unavailableRetryCauseFor(value: unknown, verb: string | undefine
     }
     if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) return { kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, error: value }
     if (errorClass === AD_ERROR_CLASS_CONFIG) return { kind: UNAVAILABLE_RETRY_CAUSE_CONFIG, error: value }
-    if (verb === undefined || !AD_READ_VERBS.has(verb)) return undefined
+    if (verb === undefined) return undefined
+    if (!AD_READ_VERBS.has(verb)) {
+      return errorClass === AD_ERROR_CLASS_UNCLASSIFIED ? { kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, error: value } : undefined
+    }
     if (errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) return undefined
     if (hasAdErrorName(value, ERR_SPAWN_NOT_FOUND_NAME)) return undefined
     return { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR, error: value }
@@ -1631,9 +1662,33 @@ export function reportAttemptError(
   verb: string | undefined,
   sink: UnavailableRetryTriggerSink | undefined,
 ): boolean {
+  let cause: UnavailableRetryCause | undefined
+  try {
+    cause = unavailableRetryCauseFor(value, verb)
+  } catch {
+    cause = undefined
+  }
+  return reportAttemptCause(key, cause, verb, sink)
+}
+
+/**
+ * The reporting step of {@link reportAttemptError} for a cause the caller
+ * decided itself: a site that classifies an outcome on its own (the resume
+ * path's `ErrInvalidFlags`, UNCLASSIFIED after its re-check, b.jg5 SRJ-104,
+ * SRJ-313) passes `UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED`. The same context
+ * rule applies: inside an attempt for `key` the sink arms with `cause` and
+ * the innermost attempt records it as its last error; outside one, only the
+ * ENVIRONMENT and CONFIG causes arm. Answers whether the sink armed. Never
+ * throws.
+ */
+export function reportAttemptCause(
+  key: string,
+  cause: UnavailableRetryCause | undefined,
+  verb: string | undefined,
+  sink: UnavailableRetryTriggerSink | undefined,
+): boolean {
   try {
     const frame = innermostFrame(key)
-    const cause = unavailableRetryCauseFor(value, verb)
     if (frame === undefined && (cause === undefined || !UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES.has(cause.kind))) return false
     let armed = false
     if (cause !== undefined && sink !== undefined) {

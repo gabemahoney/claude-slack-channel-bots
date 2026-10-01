@@ -21,8 +21,26 @@
  *     UNCLASSIFIED line and kills, deletes, spawns and resumes nothing more;
  *     an ErrNoSessionId makes no re-check. A re-check that answers stop posts
  *     no spawn-failure notice, answers `{ failed, stopping }` and makes
- *     `launchSession` answer `'skipped'`; a pass or could-not-run keeps the
- *     notice and a plain `failed` (`launchSession` false).
+ *     `launchSession` answer `'skipped'`; after a pass or could-not-run it
+ *     takes SRJ-105's UNCLASSIFIED row (b.jg5 SRJ-313, on
+ *     `makeRecoveryHarness`): no notice, one refusal line, `{ failed,
+ *     refused }`, the timer armed with the UNCLASSIFIED cause, never counted,
+ *     and reported once (over recording sinks: exactly once, with the site's
+ *     classification) to the persona's unclassified-error episode.
+ *   - b.jg5 SRJ-313 (SRJ-105's UNCLASSIFIED row, AC 69), on
+ *     `makeRecoveryHarness`: every spawn, resume, kill, delete, reconnect
+ *     keystroke and findMissing sweep of the ladder, fed an `ErrInternal`
+ *     (not the unusable recorded name) and an unhandled name, and every
+ *     action site fed `ErrSystemInstallDisappeared` (which still raises
+ *     `ad-unreachable`), is refused as an UNAVAILABLE outcome is, arms the
+ *     timer with the UNCLASSIFIED cause, never starts the condition, and is
+ *     reported to the persona's unclassified-error episode (B's untouched);
+ *     an `ErrInternal` at a read keeps the read-error cause and is reported
+ *     too. Over recording sinks, each such outcome is handed to the sink
+ *     exactly once and arms once; outside an attempt nothing is reported.
+ *     The `errGeneric` cases whose point is a launch failure use the LAUNCH
+ *     FAILURE answer (`ErrTmuxSessionCreate`), and a findMissing rejection
+ *     the launch proceeds past is an UNUSABLE NAME answer.
  *   - b.jg5 SRJ-301 / SRJ-302 launch attempt: with a trigger sink installed
  *     through `initOutageState` (a recording sink, or the real
  *     `createUnavailableRetryController` on a fake clock, stopped in
@@ -325,6 +343,7 @@ import {
   errConfigMalformed,
   errUnusableName,
   errSchemaMismatch,
+  errSystemInstallDisappeared,
   errUnknownErrorName,
   holdSpawns,
   makeStubCallLog,
@@ -390,7 +409,8 @@ import {
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
 import { RESTART_FAILURE_CAP, RESTART_OUTCOME_REFUSED, runRestartRetry, type LaunchSessionResult } from '../src/restart.ts'
-import { AD_ERROR_CLASS_UNCLASSIFIED } from '../src/ad-error-class.ts'
+import { AD_ERROR_CLASS_UNCLASSIFIED, classifyAdError, describeAdErrorClassification } from '../src/ad-error-class.ts'
+import { PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR, type UnclassifiedErrorSink } from '../src/persona-episodes.ts'
 import { getFailureCount } from '../src/backoff.ts'
 import {
   collided,
@@ -418,6 +438,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_ROW_ABSENT,
   type AttemptView,
   type UnavailableRetryController,
@@ -1273,20 +1294,21 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
   })
 
   // b.2oy — ErrSpawnNotFound recovery still surfaces genuine spawn failures.
-  // Resume throws ErrSpawnNotFound, then the fresh spawn fails with a generic
-  // error → 'failed' and a spawn-failure notice goes to the persona's
-  // destination (b.av2 SR-7.2).
+  // Resume throws ErrSpawnNotFound, then the fresh spawn fails with a LAUNCH
+  // FAILURE (ErrTmuxSessionCreate; this site has no self-heal) → 'failed' and
+  // a spawn-failure notice goes to the persona's destination (b.av2 SR-7.2).
   test('b.2oy: ErrSpawnNotFound on resume + fresh spawn fails → failed + spawn-failure notice to the persona destination', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const readLog = captureStartupErrors()
     const cfg = makeNoticeConfig()
+    const launchFailure = errTmuxSessionCreate('spawn')
     installStub({
       spawnCalls,
       deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedErr<import('agent-director').SpawnResult>(errGeneric('spawn', 'ErrSpawnBroken')),
+        cannedErr<import('agent-director').SpawnResult>(launchFailure),
       ],
       resumeError: errSpawnNotFound(),
       getResult: personaRow(cfg, NOTICE_KEY, { state: 'ended' }),
@@ -1297,10 +1319,10 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     expect(result.action).toBe('failed')
     expect(spawnCalls).toHaveLength(2)
     expect(deleteCalls).toHaveLength(0)
-    // generic spawn failure is surfaced to the persona's destination only
+    // the launch failure is surfaced to the persona's destination only
     const text = expectOneNoticeToDestination(h)
     expect(text).toContain('Spawn failure:\n')
-    expect(text).toContain('Error: `ErrSpawnBroken`')
+    expect(text).toContain(`Error: \`${launchFailure.errName}\``)
     expect(text).toContain('Remediation: Check server.log for details.')
     // startup-error side effect is part of the tested contract
     expect(readLog()).toContain('[spawn-failed]')
@@ -1329,9 +1351,14 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
 //
 // The real re-check (`installAdVersionRecheck`) runs over a counting stub
 // `resolveSystemBinary` and a fake clock that is never moved, so every call
-// recorded is the immediate re-check the resume path triggered. The notice
-// and the failed outcome are not asserted: UNCLASSIFIED handling is E8's and
-// E12's.
+// recorded is the immediate re-check the resume path triggered. A re-check
+// that does not stop the server leaves the resume's ErrInvalidFlags
+// UNCLASSIFIED, which takes SRJ-105's UNCLASSIFIED row (b.jg5 SRJ-313): no
+// spawn-failure notice, one refusal line, the persona's timer armed with the
+// UNCLASSIFIED cause, a refused launch (never counted), and the outcome
+// reported once to the persona's unclassified-error episode, with the site's
+// own classification. Those cases run on `makeRecoveryHarness` (the
+// production composition); the exact-once report runs over recording sinks.
 
 describe('collision ladder: ErrInvalidFlags on resume makes one version re-check, then is UNCLASSIFIED (b.jg5 SRJ-104)', () => {
   /** Every `resolveSystemBinary` call the installed re-check made, by its opts. */
@@ -1354,6 +1381,7 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
 
   afterEach(() => {
     resetAdVersionRecheckForTests()
+    srj105AfterEach()
   })
 
   /** A persona `C` whose spawn collides with its `ended` row, so the ladder resumes it and the resume rejects with `resumeError`. */
@@ -1377,7 +1405,20 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     return { cfg, calls }
   }
 
-  test('ErrInvalidFlags: exactly one resolveSystemBinary call with no clock advance, one UNCLASSIFIED line, no kill, delete, fresh spawn or second resume', async () => {
+  /** The UNCLASSIFIED rendering of a resume's ErrInvalidFlags after its re-check (the site's classification, b.jg5 SRJ-104). */
+  function invalidFlagsClassText(invalidFlags: Error & { errName: string; errDescription: string }): string {
+    return `class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${invalidFlags.errName} message=${JSON.stringify(invalidFlags.errDescription)}`
+  }
+
+  /** The one refusal line of a resume's ErrInvalidFlags for persona `key` after the re-check answered `kind` (b.jg5 SRJ-105, SRJ-313). */
+  function invalidFlagsRefusalLine(key: string, invalidFlags: Error & { errName: string; errDescription: string }, kind: string): string {
+    return (
+      `[slack] spawnForPersona: resume refused for ${renderPersonaRef(key, key)}: ${invalidFlagsClassText(invalidFlags)} ` +
+      `(after one immediate agent-director version re-check: ${kind}) — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)`
+    )
+  }
+
+  test('b.jg5 SRJ-313: ErrInvalidFlags: exactly one resolveSystemBinary call with no clock advance, one UNCLASSIFIED refusal line, no notice, no kill, delete, fresh spawn or second resume', async () => {
     const invalidFlags = errInvalidFlags('resume')
     const { cfg, calls } = installEndedRowResumeRejects(invalidFlags)
     const log = await withCapturedErr(async () => {
@@ -1385,16 +1426,42 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     })
     expect(resolveCalls).toHaveLength(1)
     expect(stops).toEqual([])
-    const lines = log.split('\n').filter((l) => l.includes(`resume failed for ${renderPersonaRef('C', 'C')}: `))
-    expect(lines).toEqual([
-      `[slack] spawnForPersona: resume failed for ${renderPersonaRef('C', 'C')}: ` +
-        `class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${invalidFlags.errName} message=${JSON.stringify(invalidFlags.errDescription)} ` +
-        `(after one immediate agent-director version re-check: ${RECHECK_OUTCOME_PASS})`,
-    ])
+    const lines = log.split('\n').filter((l) => l.includes(`resume refused for ${renderPersonaRef('C', 'C')}: `) || l.includes(`resume failed for ${renderPersonaRef('C', 'C')}: `))
+    expect(lines).toEqual([invalidFlagsRefusalLine('C', invalidFlags, RECHECK_OUTCOME_PASS)])
+    expect(notices).toEqual([])
     expect(calls.resumeCalls).toHaveLength(1)
     expect(calls.spawnCalls).toHaveLength(1)
     expect(calls.killCalls).toEqual([])
     expect(calls.deleteCalls).toEqual([])
+  })
+
+  test('b.jg5 SRJ-313: the resume\'s ErrInvalidFlags is reported once to the unclassified sink, with the site\'s UNCLASSIFIED classification (never as STATE by the wrapper too), and arms the timer once with the UNCLASSIFIED cause', async () => {
+    const reports: Array<{ key: string; error: unknown; classification: unknown }> = []
+    const armed: Array<{ key: string; kind: string }> = []
+    const unclassifiedSink: UnclassifiedErrorSink = {
+      report: (key, error, classification) => { reports.push({ key, error, classification }) },
+    }
+    initOutageState({
+      getClient,
+      notify: (key, text) => { outageEmissions.push({ key, text }) },
+      triggerSink: { arm: (key, cause) => { armed.push({ key, kind: cause.kind }); return true } },
+      unclassifiedSink,
+    })
+    const invalidFlags = errInvalidFlags('resume')
+    const { cfg } = installEndedRowResumeRejects(invalidFlags)
+
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toStrictEqual({ key: 'C', action: 'failed', refused: true })
+    expect(reports).toHaveLength(1)
+    expect(reports[0]!.key).toBe('C')
+    expect(reports[0]!.error).toBe(invalidFlags)
+    expect(describeAdErrorClassification(reports[0]!.classification as Parameters<typeof describeAdErrorClassification>[0])).toBe(invalidFlagsClassText(invalidFlags))
+    expect(armed).toEqual([{ key: 'C', kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+    expect(notices).toEqual([])
   })
 
   test('ErrNoSessionId: no re-check call; delete + fresh spawn as before', async () => {
@@ -1468,35 +1535,50 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     expect(notices).toEqual([])
   })
 
+  // The passing answer is `makeStubResolveSystemBinary`'s default (the
+  // installed baseline); could-not-run is a resolve that throws.
   test.each([
-    [RECHECK_OUTCOME_PASS, { version: PHASE1_RC_VERSION }],
+    [RECHECK_OUTCOME_PASS, undefined],
     [RECHECK_OUTCOME_COULD_NOT_RUN, { throws: new Error('the resolve failed') }],
-  ] as const)('the re-check answers %s: today\'s spawn-failure notice and a plain failed; launchSession answers false', async (kind, outcome) => {
-    reinstallRecheck(outcome)
-    const { cfg } = installEndedRowResumeRejects(errInvalidFlags('resume'))
+  ] as const)('b.jg5 SRJ-105, SRJ-313: the re-check answers %s: UNCLASSIFIED handling — no spawn-failure notice or spawn-failed entry, one refusal line, { failed, refused }, P\'s timer armed with the UNCLASSIFIED cause, never counted (launchSession \'refused\'), the outcome reported once to P\'s episode; nothing killed, deleted or launched after it; B launches', async (kind, outcome) => {
+    if (outcome !== undefined) reinstallRecheck(outcome)
+    const { h, p, b } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const invalidFlags = errInvalidFlags('resume')
+    const script = (): RecoveryStubScript => ({ ...collided(h, persona, { state: 'ended' }), resumeError: invalidFlags })
+    h.script(script())
 
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    const log = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
 
+    expect(resolveCalls).toHaveLength(1)
     expect(stops).toEqual([])
-    expect(result).toStrictEqual({ key: 'C', action: 'failed' })
-    expect(notices.map((n) => n.key)).toEqual(['C'])
-    expect(resumeFailedLines(log)).toHaveLength(1)
-    expect(resumeFailedLines(log)[0]).toEndWith(`(after one immediate agent-director version re-check: ${kind})`)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, resume: 1 }))
+    expect(h.notices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(refusalLines(h, p)).toEqual([invalidFlagsRefusalLine(p, invalidFlags, kind)])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+    expect(h.controller.isArmed(p)).toBe(true)
+    expect(getFailureCount(p)).toBe(0)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    // Reported to P's episode with the site's classification (the classifier
+    // alone would call ErrInvalidFlags STATE).
+    expect(unclassifiedStartedLines(h, p)).toEqual([unclassifiedStartedLine(p, invalidFlagsClassText(invalidFlags))])
+    expect(h.unclassifiedErrorOpen(p)).toBe(true)
+    expect(h.episodeNotices).toEqual([])
 
-    // The restart path's entry: the same answer is a counted failure.
-    resetClientForTests()
-    notices = []
-    installEndedRowResumeRejects(errInvalidFlags('resume'))
-    let launched: LaunchSessionResult | undefined
-    await withCapturedErr(async () => {
-      launched = await launchSession('C', cfg)
-    })
-    expect(launched).toBe(false)
-    expect(notices.map((n) => n.key)).toEqual(['C'])
+    // The restart path's entry: the same answer is refused, never counted.
+    h.script(script())
+    expect(await launchSession(p, h.config)).toBe('refused')
+    expect(getFailureCount(p)).toBe(0)
     expect(resolveCalls).toHaveLength(2)
+    expect(h.notices).toEqual([])
+    expect(unclassifiedStartedLines(h, p)).toHaveLength(1)
+
+    // B is unaffected.
+    h.script(clearedScript(script()))
+    expect(await h.launch(b)).toEqual({ key: b, action: 'spawned' })
+    expect(h.controller.isArmed(b)).toBe(false)
+    expect(h.unclassifiedErrorOpen(b)).toBe(false)
   })
 })
 
@@ -1730,9 +1812,10 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
     const readLog = captureStartupErrors()
     const { cfg } = guardConfig()
     const calls = newLadderCalls()
-    installCollision(personaRow(cfg, 'C', { state: 'waiting', cwd: fixtureSubdir('elsewhere') }), calls, {
-      deleteError: errGeneric('delete', 'ErrDeleteBroken'),
-    })
+    // A delete failure that is no refusal (a LAUNCH FAILURE answer; an
+    // UNCLASSIFIED one is refused, b.jg5 SRJ-313, below).
+    const deleteError = errTmuxSessionCreate('delete')
+    installCollision(personaRow(cfg, 'C', { state: 'waiting', cwd: fixtureSubdir('elsewhere') }), calls, { deleteError })
 
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
@@ -1744,7 +1827,7 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
     expect(calls.sendKeysCalls).toHaveLength(0)
     const log = readLog()
     expect(log).toContain('[spawn-failed]')
-    expect(log).toContain(`delete failed for ${renderPersonaRef('C', 'C')}: ErrDeleteBroken`)
+    expect(log).toContain(`delete failed for ${renderPersonaRef('C', 'C')}: ${deleteError.errName}`)
     expect(notices).toHaveLength(1)
     expect(notices[0].key).toBe('C')
   })
@@ -4769,7 +4852,10 @@ describe('startupSessionManager', () => {
   // JSON-quoted with the key beside it.
   test('a startup spawn failure names the persona in rendered form (JSON-quoted name plus key)', async () => {
     const readLog = captureStartupErrors()
-    installStub({ spawnError: errGeneric('spawn', 'ErrSpawnBroken') })
+    // A LAUNCH FAILURE at every spawn: the self-heal's respawn fails too.
+    _setTmuxSessionKiller(async () => {})
+    const launchFailure = errTmuxSessionCreate('spawn')
+    installStub({ spawnError: launchFailure })
     const name = 'Ops "Prod" Bot'
     const key = personaKey(name)
     const cfg = makeMultiPersonaConfig([{ name, working_directory: '/x/ops' }], fixtureDir)
@@ -4788,8 +4874,8 @@ describe('startupSessionManager', () => {
     expect(rendered).toBe(renderPersonaRef(name, key))
     const log = readLog()
     expect(log).toContain('[spawn-failed]')
-    expect(log).toContain(`spawn failed for ${rendered}: ErrSpawnBroken`)
-    expect(lines.some((l) => l.includes(`spawnForPersona: spawn failed for ${rendered}`))).toBe(true)
+    expect(log).toContain(`self-heal spawn after ErrTmuxSessionCreate failed for ${rendered}: ${launchFailure.errName}`)
+    expect(lines.some((l) => l.includes(`spawnForPersona: self-heal spawn after ErrTmuxSessionCreate failed for ${rendered}`))).toBe(true)
   })
 })
 
@@ -5314,16 +5400,25 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
   test('spawnForPersona waiting branch: dead session and recovery also fails → action=failed', async () => {
     const readLog = captureStartupErrors()
     _setTmuxServerEnsurer(async () => {})
+    _setTmuxSessionKiller(async () => {})
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      // Recovery fails too: a LAUNCH FAILURE at the resume, and at the self-heal respawn after it.
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+      ],
       getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
-      resumeError: errGeneric('resume', 'ErrResumeBroken'), // recovery fails too
+      resumeError: errTmuxSessionCreate('resume'),
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
-    expect(readLog()).toBe('') // resume-failure path raises a spawn-failure notice; no reconnect-failed startup entry
+    // The recovery's failure raises a spawn-failure notice and its own one
+    // spawn-failed entry (the self-heal respawn's); no reconnect-failed startup entry.
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(onlyStartupEntry(readLog(), 'spawn-failed')).toContain(`self-heal spawn after ErrTmuxSessionCreate failed for ${renderPersonaRef('C', 'C')}: `)
+    expect(readLog()).not.toContain('reconnect failed')
   })
 
   test('startupSessionManager: unrecoverable channels are counted (no false "0 failed")', async () => {
@@ -5910,6 +6005,10 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
 
   // findMissing rejects → still attempt resume anyway → on a still-live row AD
   // throws ErrSpawnNotResumable → existing defensive kill+delete+fresh preserved.
+  // The rejection is one that is no refusal at `find-missing` (an UNUSABLE
+  // NAME answer, b.jg5 SRJ-105); an UNAVAILABLE, ENVIRONMENT, CONFIG or
+  // UNCLASSIFIED one stops the attempt there (the SRJ-105, SRJ-311, SRJ-316 and
+  // SRJ-313 sweep cases below).
   test('waiting dead-session: findMissing rejects → resume attempted → ErrSpawnNotResumable → kill+delete+fresh', async () => {
     _setTmuxServerEnsurer(async () => {})
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
@@ -5930,7 +6029,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       ],
       getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
-      findMissingError: errGeneric('find-missing', 'ErrProbeFailed'),
+      findMissingError: errUnusableName(),
       resumeError: errSpawnNotResumable(), // row still live-state → resume rejects
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
@@ -6065,14 +6164,16 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
 
   // findMissing rejects → logged, poll loop proceeds exactly as today. Here the
   // row then transitions working→waiting and reconnectMcp succeeds → 'ok'. No
-  // crash, no behavior change from the sweep failure.
+  // crash, no behavior change from the sweep failure. The rejection is one
+  // that is no refusal at `find-missing` (an UNUSABLE NAME answer, b.jg5
+  // SRJ-105); a refused one stops the wait (the sweep cases below).
   test('findMissing rejects → poll loop proceeds → working→waiting → reconnect ok', async () => {
     _setWaitForWaitingTimeoutMs(60_000)
     _setTmuxServerEnsurer(async () => {})
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     installStub({
       findMissingCalls,
-      findMissingError: errGeneric('find-missing', 'ErrProbeFailed'),
+      findMissingError: errUnusableName(),
       statusQueue: [
         cannedOk<import('agent-director').StatusResult>({ state: 'working' }),
         cannedOk<import('agent-director').StatusResult>({ state: 'waiting' }),
@@ -6132,14 +6233,15 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
     expect(findMissingCalls).toHaveLength(2) // TTL=0 → no reuse, each caller sweeps
   })
 
-  // A failed sweep is NOT memoized: the next caller retries.
+  // A failed sweep is NOT memoized: the next caller retries. (The failure is
+  // no refusal, as in the case above, so each wait goes on as before.)
   test('memo: a failed sweep is not memoized → next caller retries', async () => {
     _setWaitForWaitingTimeoutMs(60_000)
     _setTmuxServerEnsurer(async () => {})
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     installStub({
       findMissingCalls,
-      findMissingError: errGeneric('find-missing', 'ErrProbeFailed'),
+      findMissingError: errUnusableName(),
       statusQueue: [
         cannedOk<import('agent-director').StatusResult>({ state: 'working' }),
         cannedOk<import('agent-director').StatusResult>({ state: 'waiting' }),
@@ -8875,13 +8977,14 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
 
   // -------------------------------------------------------------------------
   // Site #9 — tryKill → kill (tested via spawnForPersona collision path)
-  // A kill error that is not a refusal (b.jg5 SRJ-105: not UNAVAILABLE) is
-  // ignored by tryKill and the delete follows, but the outage flag IS raised.
+  // ErrSystemInstallDisappeared is UNCLASSIFIED (b.jg5 SRJ-104): at the kill
+  // it is a refusal (SRJ-105's UNCLASSIFIED row, SRJ-313), so nothing is
+  // deleted or launched after it, and the wrapper still raises the outage
+  // flag.
   // -------------------------------------------------------------------------
 
-  test('site #9: tryKill kill ErrSystemInstallDisappeared → ad-unreachable, error ignored: the delete follows (no spawn-failure notice)', async () => {
-    // collision → get=ended → resume_enabled=false → kill throws (flag set, ignored)
-    // delete also throws so flow terminates without a fresh spawn that would clear the flag
+  test('site #9: tryKill kill ErrSystemInstallDisappeared → ad-unreachable, refused (b.jg5 SRJ-105, SRJ-313): no delete or launch after it, no spawn-failure notice', async () => {
+    // collision → get=ended → resume_enabled=false → kill throws (flag set, refused)
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     const calls = newLadderCalls()
     installStub({
@@ -8889,15 +8992,18 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
       killError: new ErrSystemInstallDisappeared('kill', BIN),
-      deleteError: new ErrSystemInstallDisappeared('delete', BIN),
     })
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
     expect(result.action).toBe('failed')
     expect(calls.killCalls).toHaveLength(1)
-    expect(calls.deleteCalls).toHaveLength(1)
-    expect(calls.spawnCalls).toHaveLength(1) // the colliding spawn only: the failed delete stops the chain
+    expect(calls.deleteCalls).toHaveLength(0)
+    expect(calls.spawnCalls).toHaveLength(1) // the colliding spawn only: the refused kill stops the chain
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(notices).toHaveLength(0)
+    expect(errLog.split('\n').filter((l) => l.startsWith(`[slack] spawnForPersona: kill refused for ${renderPersonaRef('C', 'C')}: `))).toHaveLength(1)
   })
 
   // -------------------------------------------------------------------------
@@ -10398,14 +10504,23 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
 // ---------------------------------------------------------------------------
 
 describe('persona notices (b.av2 SR-7.2)', () => {
-  /** A startup spawn whose first spawn call fails with a generic error. */
-  function installGenericSpawnFailure(): void {
-    installStub({ spawnError: errGeneric('spawn', 'ErrSpawnBroken') })
+  /**
+   * A startup spawn whose every spawn call fails with a LAUNCH FAILURE
+   * (`ErrTmuxSessionCreate`): the first spawn's self-heal kills the orphan
+   * session (a no-op here) and respawns once, which fails the same way, so
+   * the spawn-failure notice names it.
+   */
+  function installLaunchFailure(): void {
+    _setTmuxSessionKiller(async () => {})
+    installStub({ spawnError: launchFailure })
   }
+
+  /** The LAUNCH FAILURE every spawn of `installLaunchFailure` answers. */
+  const launchFailure = errTmuxSessionCreate('spawn')
 
   test('held: a startup spawn failure raised before the persona client is validated posts nothing until the flush, then exactly once', async () => {
     captureStartupErrors()
-    installGenericSpawnFailure()
+    installLaunchFailure()
     const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg, { validated: false })
 
@@ -10426,7 +10541,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     await h.notifier.flush(OTHER_KEY)
     const text = expectOneNoticeToDestination(h)
     expect(text).toContain('Spawn failure:\n')
-    expect(text).toContain('Error: `ErrSpawnBroken`')
+    expect(text).toContain(`Error: \`${launchFailure.errName}\``)
 
     // A second flush posts nothing more.
     await h.notifier.flush(NOTICE_KEY)
@@ -10437,7 +10552,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
 
   test('held (mixed destinations): notices raised before validation make no Slack call, even on a flush; once validated each persona\'s held notices flush to its own destination on its own client, once each, with one DM open', async () => {
     captureStartupErrors()
-    installGenericSpawnFailure()
+    installLaunchFailure()
     const cfg = makeDmNoticeConfig()
     const h = installNoticeNotifier(cfg, { validated: false })
     h.stub(NOTICE_KEY).script.open.push(openedDm(NOTICE_DM))
@@ -10469,7 +10584,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(h.stub(NOTICE_KEY).calls.conversationsOpen).toEqual([{ users: NOTICE_CONTACT }])
     const dmPosts = h.posts(NOTICE_KEY)
     expect(dmPosts.map((p) => p.channel)).toEqual([NOTICE_DM, NOTICE_DM])
-    expect(dmPosts[0]!.text).toContain('Error: `ErrSpawnBroken`')
+    expect(dmPosts[0]!.text).toContain(`Error: \`${launchFailure.errName}\``)
     expect(dmPosts[1]!.text).toContain('Error: `SpawnCapReached`')
     // Posted to the returned D… conversation, never to the contact's user ID; top-level, no identity override.
     for (const post of dmPosts) {
@@ -10504,7 +10619,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
 
   test('held then failed (dm): notices held before validation whose flushed DM open fails missing_scope are held under one episode line naming im:write, retried on backoff and posted once each, in raised order, after the cause clears', async () => {
     const readLog = captureStartupErrors()
-    installGenericSpawnFailure()
+    installLaunchFailure()
     const cfg = makeDmNoticeConfig()
     const h = installNoticeNotifier(cfg, { validated: false, leakMarker: LEAK_SENTINEL })
     const dmStub = h.stub(NOTICE_KEY)
@@ -10582,7 +10697,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     ])
     const dmPosts = h.posts(NOTICE_KEY)
     expect(dmPosts.map((p) => p.channel)).toEqual([NOTICE_DM, NOTICE_DM, NOTICE_DM])
-    expect(dmPosts[0]!.text).toContain('Error: `ErrSpawnBroken`')
+    expect(dmPosts[0]!.text).toContain(`Error: \`${launchFailure.errName}\``)
     expect(dmPosts[1]!.text).toContain('Error: `SpawnCapReached`')
     expect(dmPosts[2]!.text).toContain('Error: `ErrLateNotice`')
     for (const post of dmPosts) {
@@ -10648,7 +10763,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
   test('spawn-failure-post: a rejected (platform) startup spawn-failure post records exactly one token-free entry; the notice is held, retried on backoff and posted once the destination accepts it', async () => {
     const outcome: WebApiOutcome = { kind: 'platform', error: 'not_in_channel' }
     const readLog = captureStartupErrors()
-    installGenericSpawnFailure()
+    installLaunchFailure()
     const cfg = makeNoticeConfig()
     // The first attempt and the first retry fail; the second retry is posted.
     const h = installNoticeNotifier(cfg, { post: [outcome, outcome], leakMarker: LEAK_SENTINEL })
@@ -10695,7 +10810,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(posts).toHaveLength(3)
     expect(posts.map((p) => p.channel)).toEqual([NOTICE_DEST, NOTICE_DEST, NOTICE_DEST])
     expect(new Set(posts.map((p) => p.text)).size).toBe(1)
-    expect(posts[0]!.text).toContain('Error: `ErrSpawnBroken`')
+    expect(posts[0]!.text).toContain(`Error: \`${launchFailure.errName}\``)
     expect(destinationFailedLines(h)).toEqual([
       expect.stringContaining('holding its permission prompts and notices'),
       `${NOTICE_DIAG_PREFIX}cleared: destination=${NOTICE_DEST} accepts posts again ` +
@@ -10718,7 +10833,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     'spawn-failure-post: a rejected (%s) startup spawn-failure post records exactly one token-free entry, not another after a failed retry',
     async (_label, outcome, code) => {
       const readLog = captureStartupErrors()
-      installGenericSpawnFailure()
+      installLaunchFailure()
       const cfg = makeNoticeConfig()
       const h = installNoticeNotifier(cfg, { post: [outcome, outcome], leakMarker: LEAK_SENTINEL })
 
@@ -10740,7 +10855,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
 
   test('spawn-failure-post: a held startup notice whose flushed post is rejected records no entry before the flush and exactly one token-free entry after it, not another after a failed retry', async () => {
     const readLog = captureStartupErrors()
-    installGenericSpawnFailure()
+    installLaunchFailure()
     const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg, { validated: false, post: [{ kind: 'network' }, { kind: 'network' }], leakMarker: LEAK_SENTINEL })
 
@@ -10784,7 +10899,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
 
   test('spawn-failure-post: a rejected restart-path (launchSession) notice post records none and logs one token-free line, not another after a failed retry', async () => {
     const readLog = captureStartupErrors()
-    installGenericSpawnFailure()
+    installLaunchFailure()
     const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg, { post: [{ kind: 'network' }, { kind: 'network' }], leakMarker: LEAK_SENTINEL })
 
@@ -10854,7 +10969,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     'spawn-failure-post cause (%s): the startup record is exactly "<message> — <cause>"',
     async (_label, makeCfg, script, methods, cause) => {
       const readLog = captureStartupErrors()
-      installGenericSpawnFailure()
+      installLaunchFailure()
       const cfg = makeCfg()
       const h = installNoticeNotifier(cfg, { leakMarker: LEAK_SENTINEL })
       script(h)
@@ -10878,7 +10993,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     'spawn-failure-post cause (%s): the restart-path (launchSession) stderr line is exactly "<message>: <cause>" and nothing is recorded',
     async (_label, makeCfg, script, methods, cause) => {
       const readLog = captureStartupErrors()
-      installGenericSpawnFailure()
+      installLaunchFailure()
       const cfg = makeCfg()
       const h = installNoticeNotifier(cfg, { leakMarker: LEAK_SENTINEL })
       script(h)
@@ -10921,7 +11036,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     ['rejects', () => Promise.reject(sinkError())],
   ] as const)('a notifier that %s is contained: the spawn still reports failed and the error is logged by description (AC 20: nothing logged leaks)', async (_label, sink) => {
     const readLog = captureStartupErrors()
-    installGenericSpawnFailure()
+    installLaunchFailure()
     const cfg = makeNoticeConfig()
     setSessionNotifier(sink)
 
@@ -10942,7 +11057,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
 
   test('the bare capture records the notice under the persona key with its body only', async () => {
     captureStartupErrors()
-    installGenericSpawnFailure()
+    installLaunchFailure()
     const cfg = makeNoticeConfig()
 
     await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
@@ -11457,12 +11572,9 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
   // `message="…"` when the errName is a short identifier, else
   // describeThrownValue (the type, the redacted message `<errName>:
   // <description>`, frames). The description appears once.
+  // (A spawn whose error has a token-shaped errName is UNCLASSIFIED, b.jg5
+  // SRJ-313: refused with no spawn-failed record; its case follows this table.)
   test.each<[string, string, string, (err: Error) => Promise<void>]>([
-    ['a failed spawn', 'spawn-failed', 'spawn', async (err) => {
-      installStub({ spawnError: err })
-      const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-      expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'failed' })
-    }],
     ['a failed orphan kill', 'orphan-cleanup', 'kill', async (err) => {
       expect(await reconcileOrphans(installOrphan('killError', err))).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
     }],
@@ -11486,16 +11598,39 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
+  test('b.jg5 SRJ-313: a spawn failing with a base AgentDirectorError whose errName is token-shaped (UNCLASSIFIED) and whose description holds a URL and a fake token is refused: no spawn-failed record and no notice; its one refusal line names its type and the redacted description once; nothing leaks', async () => {
+    const readLog = captureStartupErrors()
+    installStub({ spawnError: new AgentDirectorError('spawn', tokenErrName(), adDescription()) })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toEqual({ key: 'C', action: 'failed' })
+    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(notices).toEqual([])
+    const refused = errLog.split('\n').filter((l) => l.startsWith(`[slack] spawnForPersona: spawn refused for ${renderPersonaRef('C', 'C')}: `))
+    expect(refused).toHaveLength(1)
+    expect(refused[0]).toContain(': AgentDirectorError message="')
+    expect(refused[0]).toContain(`${REDACTED_AD_DESCRIPTION}"`)
+    expect(refused[0]!.split(REDACTED_URL_PLACEHOLDER)).toHaveLength(2)
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
+
+  // A LAUNCH FAILURE answer named by name (the base class, so the plain
+  // spawn's handling, with no self-heal): the record's text is the point.
   test('a failed spawn with a safe errName → the spawn-failed record ends in `<errName> message="<redacted description>"`, with no cause tail', async () => {
     const readLog = captureStartupErrors()
-    installStub({ spawnError: errGeneric('spawn', 'ErrSpawnBroken', adDescription()) })
+    const launchFailureName = errTmuxSessionCreate('spawn').errName
+    installStub({ spawnError: errGeneric('spawn', launchFailureName, adDescription()) })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const errLog = await withCapturedErr(async () => {
       await spawnForPersona(personaOf(cfg, 'C'), cfg)
     })
 
     const entry = onlyStartupEntry(readLog(), 'spawn-failed')
-    expect(entry.endsWith(`] [spawn-failed] spawn failed for ${renderPersonaRef('C', 'C')}: ErrSpawnBroken message=${JSON.stringify(REDACTED_AD_DESCRIPTION)}`)).toBe(true)
+    expect(entry.endsWith(`] [spawn-failed] spawn failed for ${renderPersonaRef('C', 'C')}: ${launchFailureName} message=${JSON.stringify(REDACTED_AD_DESCRIPTION)}`)).toBe(true)
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
@@ -11928,6 +12063,16 @@ function refusalLines(h: RecoveryHarness, key: string): string[] {
   return h.errors.filter((line) => line.includes(` refused for ${renderPersonaRef(key, key)}: `) && line.endsWith('nothing more is called (b.jg5 SRJ-105)'))
 }
 
+/** The started line of persona `key`'s unclassified-error episode for an outcome `described` renders (b.jg5 SRJ-313). */
+function unclassifiedStartedLine(key: string, described: string): string {
+  return `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR} started — ${described}`
+}
+
+/** Persona `key`'s unclassified-error started lines in the harness's lines. */
+function unclassifiedStartedLines(h: RecoveryHarness, key: string): string[] {
+  return h.lines.filter((line) => line.startsWith(`[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR} started — `))
+}
+
 let srj105Harness: RecoveryHarness | undefined
 
 /** A recovery harness over two personas, P and B, cleaned up after the case. */
@@ -12080,28 +12225,8 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     }
   })
 
-  /** Kill answers that are no refusal (UNCLASSIFIED): ignored, as before. */
-  const KILL_NOT_REFUSED: ReadonlyArray<readonly [string, () => Error]> = [
-    ['an UNCLASSIFIED ErrInternal', () => errInternal()],
-    ['an UNCLASSIFIED ErrKillBroken', () => errGeneric('kill', 'ErrKillBroken')],
-  ]
-
-  const killContrast = KILL_NOT_REFUSED.flatMap(([what, make]) => KILL_SITES.map((site) => [what, site.name, make, site] as const))
-  test.each(killContrast)('contrast: %s at %s is not refused: the delete and a fresh spawn follow; no refusal line, trigger or timer, never counted', async (_what, _site, make, site) => {
-    const { h, p } = srj105Build()
-    site.setup?.(h)
-    h.script(site.script(h, harnessPersona(h, p), make()))
-
-    const result = await h.launch(p)
-
-    expect(result).toEqual({ key: p, action: 'spawned' })
-    expect(ladderCallsMade(h)).toEqual({ ...site.calls, delete: 1, spawn: site.calls.spawn + 1 })
-    expect(refusalLines(h, p)).toEqual([])
-    expect(h.triggers).toEqual([])
-    expect(h.controller.isArmed(p)).toBe(false)
-    expect(h.notices).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
-  })
+  // An UNCLASSIFIED kill answer (an ErrInternal, an unhandled name such as
+  // ErrKillBroken) is a refusal too: b.jg5 SRJ-313's describe below.
 
   test.each(SRJ105_UNAVAILABLE)('the kill after the resume\'s ErrSpawnNotResumable is declared a kill of a row read live: %s there starts P\'s condition (tmux-touching), where the same answer to a kill of a row in another directory read ended starts nothing', async (_what, make) => {
     const { h, p } = srj105Build()
@@ -12217,8 +12342,9 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
     expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
   })
 
-  // A sweep is no read verb: of READ_ERRORS only the UNAVAILABLE forms are a
-  // refusal there (the UNCLASSIFIED ones proceed, below).
+  // A sweep is no read verb: of READ_ERRORS the UNAVAILABLE forms are a
+  // refusal there with the UNAVAILABLE cause; the UNCLASSIFIED ones are a
+  // refusal with the UNCLASSIFIED cause (b.jg5 SRJ-313's describe below).
   const sweepCross = SRJ105_UNAVAILABLE.flatMap(([what, make, kind]) => SWEEP_SITES.map((site) => [what, site.name, make, kind, site] as const))
   test.each(sweepCross)('%s at %s: the attempt stops there: no resume, kill, delete, launch, notice or spawn-failed entry, refused and never counted, and P\'s condition is not started; B launches', async (_what, _site, make, kind, site) => {
     const { h, p } = await expectRefusedAt(site, make(site.verb), kind)
@@ -12229,9 +12355,11 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
     expect(conditionStartedLines(h, p)).toEqual([])
   })
 
-  test.each(READ_ERRORS.filter(([, , kind]) => kind === UNAVAILABLE_RETRY_CAUSE_READ_ERROR))('contrast: %s at the before-resume sweep is no refusal: logged, and the resume goes on', async (_what, make) => {
+  // The UNCLASSIFIED read errors at this sweep are refused (b.jg5 SRJ-313's
+  // describe below); an UNUSABLE NAME answer is still no refusal there.
+  test('contrast: an UNUSABLE NAME answer at the before-resume sweep is no refusal: logged, and the resume goes on', async () => {
     const { h, p } = srj105Build()
-    h.script({ ...SWEEP_SITES[0]!.script(h, harnessPersona(h, p), make('find-missing')) })
+    h.script({ ...SWEEP_SITES[0]!.script(h, harnessPersona(h, p), errUnusableName()) })
 
     expect(await h.launch(p)).toEqual({ key: p, action: 'resumed' })
 
@@ -12241,6 +12369,7 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
     expect(refusalLines(h, p)).toEqual([])
     expect(h.triggers).toEqual([])
     expect(h.controller.isArmed(p)).toBe(false)
+    expect(h.unclassifiedErrorOpen(p)).toBe(false)
   })
 
   test.each(SRJ105_UNAVAILABLE)('a persona that joins another\'s in-flight shared sweep gets the same refusal: %s at P\'s prompt-row sweep, which B joined, refuses both under their own keys with one findMissing call; no resume, kill, delete, launch, notice or spawn-failed entry, never counted', async (_what, make, kind) => {
@@ -12332,6 +12461,9 @@ describe('b.jg5 SRJ-105 with E8\'s refusal marker: a refused kill on a replace p
   const KILL_REFUSALS: ReadonlyArray<readonly [string, (verb: string) => Error, string]> = [
     ...unavailableForms('ErrTmuxUnresponsive', 'ErrTmuxKillFailed'),
     ['a CONFIG answer (ErrConfigMalformed, b.jg5 SRJ-316)', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    // AC 69: an injected ErrInternal is never counted (b.jg5 SRJ-313).
+    ['an UNCLASSIFIED ErrInternal (b.jg5 SRJ-313)', () => errInternal(), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+    ['an UNCLASSIFIED unhandled name (ErrKillBroken, b.jg5 SRJ-313)', (verb) => errGeneric(verb, 'ErrKillBroken'), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
   ]
 
   const cross = REPLACE_PATHS.flatMap(([path, script, setup, calls]) => KILL_REFUSALS.map(([what, make]) => [path, what, script, setup, calls, make] as const))
@@ -12570,5 +12702,220 @@ describe('b.jg5 SRJ-105, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the co
     expect(h.outageNotices).toHaveLength(2)
     expect(h.notices).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-105's UNCLASSIFIED row, SRJ-313: an UNCLASSIFIED outcome at the
+// collision ladder, the reconnect, the working-row wait and the findMissing
+// sweeps
+//
+// "No step follows" (SRJ-110, SRJ-111, SRJ-113). Every site of the SRJ-105
+// cases above, fed an UNCLASSIFIED answer (an `ErrInternal` whose description
+// does not carry the unusable recorded name, a name CSCB gives no handling,
+// and at every action site `ErrSystemInstallDisappeared`), is a refusal
+// through `expectRefusedAt`: the stub's call counts are exact (no kill,
+// delete, resume or launch after it, never a dead-session resume), no
+// spawn-failure notice, no `spawn-failed` entry, one refusal line, P's timer
+// armed with the UNCLASSIFIED cause (a read keeps E10's read-error cause),
+// `launchSession` answering 'refused', the failure count left at 0, and B
+// launching. On top of that, P's `tmux-unresponsive` condition is never
+// started (SRJ-307), the outcome is reported to P's unclassified-error
+// episode (one started line across both launches, quoting the classifier's
+// rendering; the episode open; no alert at the same instant), B's episode
+// stays closed, and `ErrSystemInstallDisappeared` still raises P's
+// `ad-unreachable` with one onset (SRJ-104, Q-3). The exact-once report and
+// the arming are pinned over recording sinks at the end.
+// ---------------------------------------------------------------------------
+
+/** The UNCLASSIFIED answers fed to every site, each built for the verb that meets it (by name). */
+const SRJ313_UNCLASSIFIED: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
+  ['an ErrInternal (its description not the unusable recorded name)', () => errInternal()],
+  ['a name CSCB gives no handling (ErrNotHandled)', (verb) => errGeneric(verb, 'ErrNotHandled')],
+]
+
+/**
+ * At a findMissing sweep (not a read verb) every UNCLASSIFIED answer is a
+ * refusal (b.jg5 SRJ-105, SRJ-313), the read errors of the SRJ-105 read
+ * describe included.
+ */
+const SRJ313_SWEEP_UNCLASSIFIED: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
+  ...SRJ313_UNCLASSIFIED,
+  ['an UNCLASSIFIED read error (ErrTimeout)', (verb) => errGeneric(verb, 'ErrTimeout')],
+  ['a store that cannot be opened (ErrSchemaMismatch)', () => errSchemaMismatch()],
+]
+
+describe('b.jg5 SRJ-105, SRJ-313: an UNCLASSIFIED outcome at the collision ladder, the reconnect, the working-row wait and the findMissing sweeps is a refusal: no step follows, never counted, never dead, P\'s timer armed, reported once to P\'s unclassified-error episode', () => {
+  afterEach(srj105AfterEach)
+
+  /**
+   * What every UNCLASSIFIED refusal adds to `expectRefusedAt`'s checks: P's
+   * condition was never started; `err` was reported to P's unclassified-error
+   * episode (one started line, quoting the classifier's rendering of it, for
+   * both launches) and the episode is open with no alert posted; B's episode
+   * never began.
+   */
+  function expectReportedToEpisode(h: RecoveryHarness, p: string, err: unknown): void {
+    const [, b] = h.keys as [string, string]
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+    expect(unclassifiedStartedLines(h, p)).toEqual([unclassifiedStartedLine(p, describeAdErrorClassification(classifyAdError(err)))])
+    expect(h.unclassifiedErrorOpen(p)).toBe(true)
+    expect(h.unclassifiedErrorOpen(b)).toBe(false)
+    expect(unclassifiedStartedLines(h, b)).toEqual([])
+    expect(h.episodeNotices).toEqual([])
+  }
+
+  const ACTION_SITES = [...SPAWN_AND_RESUME_SITES, ...KILL_SITES, ...DELETE_SITES, ...RECONNECT_SITES]
+
+  const actionCross = SRJ313_UNCLASSIFIED.flatMap(([what, make]) => ACTION_SITES.map((site) => [what, site.name, make, site] as const))
+  test.each(actionCross)('b.jg5 SRJ-313: %s at %s: no kill, delete or launch after it, never dead-session, no notice or spawn-failed entry, refused and never counted, P armed with the UNCLASSIFIED cause, reported once to P\'s episode, P\'s condition not started; B launches', async (_what, _site, make, site) => {
+    const err = make(site.verb)
+    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED)
+    expectReportedToEpisode(h, p, err)
+  })
+
+  test.each(ACTION_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-104, SRJ-313: ErrSystemInstallDisappeared at %s: refused as any UNCLASSIFIED outcome (nothing after it, never counted, P armed with the UNCLASSIFIED cause, reported once to P\'s episode), and P\'s ad-unreachable is raised with one onset; B launches', async (_name, site) => {
+    const err = errSystemInstallDisappeared(site.verb)
+    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, ONSET_TEMPLATES['ad-unreachable'](err.binaryPath), 'ad-unreachable')
+    expectReportedToEpisode(h, p, err)
+  })
+
+  test.each(READ_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-105, SRJ-313: an ErrInternal at %s keeps the read-error outcome (no tmux probe, no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, P armed with the read-error cause) and is reported once to P\'s episode; B launches', async (_name, site) => {
+    // Every tmux session reads gone: a tmux fallback would give dead-session
+    // and a resume, which the exact call counts would catch.
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => {
+      probed.push(name)
+      return false
+    })
+    const err = errInternal()
+    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
+    expect(probed).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expectReportedToEpisode(h, p, err)
+  })
+
+  const sweepCross = SRJ313_SWEEP_UNCLASSIFIED.flatMap(([what, make]) => SWEEP_SITES.map((site) => [what, site.name, make, site] as const))
+  test.each(sweepCross)('b.jg5 SRJ-105, SRJ-313: %s at %s: the sweep is refused and the attempt stops there: no resume, kill, delete, launch, notice or spawn-failed entry, refused and never counted, P armed with the UNCLASSIFIED cause, reported once to P\'s episode; B launches', async (_what, _site, make, site) => {
+    const err = make(site.verb)
+    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED)
+    // Both launches (the start pass's and launchSession's) were refused at this sweep.
+    const refusedAt = `[slack] ${site.logPrefix}: findMissing sweep refused for ${renderPersonaRef(p, p)}: `
+    expect(refusalLines(h, p).map((line) => line.startsWith(refusedAt))).toEqual([true, true])
+    expectReportedToEpisode(h, p, err)
+  })
+
+  test('b.jg5 SRJ-105, SRJ-313: an ErrInternal at P\'s prompt-row sweep, which B joined: one findMissing call; each persona is refused under its own key, armed once with the UNCLASSIFIED cause and has its own episode begun once; nothing destructive follows for either', async () => {
+    const { h, p, b } = srj105Build()
+    const err = errInternal()
+    const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, err)
+
+    expect(pResult).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(bResult).toStrictEqual({ key: b, action: 'failed', refused: true })
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
+    for (const key of [p, b]) {
+      expect(refusalLines(h, key)).toHaveLength(1)
+      expect(h.triggers.filter((t) => t.key === key)).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+      expect(h.controller.isArmed(key)).toBe(true)
+      expect(getFailureCount(key)).toBe(0)
+      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+      expect(unclassifiedStartedLines(h, key)).toEqual([unclassifiedStartedLine(key, describeAdErrorClassification(classifyAdError(err)))])
+      expect(h.unclassifiedErrorOpen(key)).toBe(true)
+    }
+    expect(h.outageNotices).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.episodeNotices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  })
+
+  test.each(SRJ105_UNAVAILABLE)('contrast: an UNAVAILABLE outcome (%s) at the first spawn is refused but never reported to P\'s unclassified-error episode', async (_what, make, kind) => {
+    const { h, p } = await expectRefusedAt(SPAWN_AND_RESUME_SITES[0]!, make('spawn'), kind)
+    expect(unclassifiedStartedLines(h, p)).toEqual([])
+    expect(h.unclassifiedErrorOpen(p)).toBe(false)
+  })
+
+  test('outside a launch or recovery attempt nothing is reported or armed: the persona teardown\'s kill (killPersonaInstance) answering an ErrInternal rethrows it unchanged, quietly, and begins no episode', async () => {
+    const { h, p } = srj105Build()
+    const err = errInternal()
+    h.script({ killError: err })
+
+    await expect(killPersonaInstance(p)).rejects.toBe(err)
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ kill: 1 }))
+    expect(h.errors).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.triggers).toEqual([])
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(unclassifiedStartedLines(h, p)).toEqual([])
+    expect(h.unclassifiedErrorOpen(p)).toBe(false)
+  })
+
+  // The exact count, over recording sinks installed as `main()` installs the
+  // real ones (`initOutageState`'s trigger and unclassified sinks): each
+  // UNCLASSIFIED outcome in a launch is handed to the unclassified sink once
+  // (by the reporting point, which leaves the classification to the sink) and
+  // arms the timer once.
+  describe('each UNCLASSIFIED outcome in a launch is reported once and arms once (recording sinks)', () => {
+    /** Each site, the cause it arms, whether resume is enabled, and the stub answers that make C's launch meet `err` there. */
+    const ONCE_SITES: ReadonlyArray<readonly [string, string, boolean, (cfg: PersonaConfig, err: Error) => StubClientOptions]> = [
+      ['the first spawn', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true, (_cfg, err) => ({ spawnError: err })],
+      ['the resume of an ended row', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true, (cfg, err) => ({
+        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+        getResult: personaRow(cfg, 'C', { state: 'ended' }),
+        resumeError: err,
+      })],
+      ['the kill of a replacement (resume_enabled false)', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, false, (cfg, err) => ({
+        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+        getResult: personaRow(cfg, 'C', { state: 'ended' }),
+        killError: err,
+      })],
+      ['the delete of a replacement (resume_enabled false)', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, false, (cfg, err) => ({
+        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+        getResult: personaRow(cfg, 'C', { state: 'ended' }),
+        deleteError: err,
+      })],
+      ['the reconnect of a waiting row', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true, (cfg, err) => ({
+        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+        getResult: personaRow(cfg, 'C', { state: 'waiting' }),
+        sendKeysError: err,
+      })],
+      ['the before-resume sweep of a waiting row\'s dead session', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true, (cfg, err) => ({
+        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+        getResult: personaRow(cfg, 'C', { state: 'waiting' }),
+        sendKeysError: errSpawnNotInteractive('send-keys'),
+        findMissingError: err,
+      })],
+      ['the collision get (a read: the read-error cause)', UNAVAILABLE_RETRY_CAUSE_READ_ERROR, true, (_cfg, err) => ({
+        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+        getError: err,
+      })],
+    ]
+
+    test.each(ONCE_SITES)('b.jg5 SRJ-313: an ErrInternal at %s is handed to the unclassified sink exactly once, as thrown, and arms C once (%s); the launch is refused with no notice', async (_site, kind, resumeEnabled, script) => {
+      captureStartupErrors()
+      const reports: Array<{ key: string; error: unknown; classification: unknown }> = []
+      const armed: Array<{ key: string; kind: string }> = []
+      initOutageState({
+        getClient,
+        notify: (key, text) => { outageEmissions.push({ key, text }) },
+        triggerSink: { arm: (key, cause) => { armed.push({ key, kind: cause.kind }); return true } },
+        unclassifiedSink: { report: (key, error, classification) => { reports.push({ key, error, classification }) } },
+      })
+      const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: resumeEnabled })
+      const err = errInternal()
+      installStub(script(cfg, err))
+
+      let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+      await withCapturedErr(async () => {
+        result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+      })
+
+      expect(result).toStrictEqual({ key: 'C', action: 'failed', refused: true })
+      expect(reports).toEqual([{ key: 'C', error: err, classification: undefined }])
+      expect(armed).toEqual([{ key: 'C', kind }])
+      expect(notices).toEqual([])
+    })
   })
 })

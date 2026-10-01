@@ -6,7 +6,8 @@
  * `&lt;` and `&gt;`, so text such as `<!channel>`, `<@U…>` or a `<…>`
  * placeholder renders as itself in a Slack message and notifies no one. The
  * lost-message notice uses it for the sender label; the `ad-config-malformed`
- * onset uses it for agent-director's quoted description.
+ * onset and the unclassified-error alert use it for agent-director's quoted
+ * description.
  *
  * Pure module: no imports, no module-scope state, nothing runs at import.
  *

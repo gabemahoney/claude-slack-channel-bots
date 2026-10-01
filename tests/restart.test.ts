@@ -58,6 +58,8 @@ import {
   _resetTmuxDialogHelpers,
   _setTmuxSessionProber,
   _resetTmuxSessionProber,
+  _setTmuxSessionKiller,
+  _resetTmuxSessionKiller,
   _setDialogPollIntervalMs,
   _resetDialogPollIntervalMs,
   _setDialogReadyTimeoutMs,
@@ -103,6 +105,7 @@ import {
   errConfigMalformed,
   errGeneric,
   errInstanceIdCollision,
+  errInternal,
   errInvalidFlags,
   errSpawnNotFound,
   errSpawnNotInteractive,
@@ -137,6 +140,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_MODE_FULL,
   type UnavailableRetryController,
 } from '../src/unavailable-retry.ts'
@@ -2712,16 +2716,32 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     expect(spawnsFor(a)).toHaveLength(1)
     expect(getFailureCount(a.key)).toBe(0)
 
-    // The one held spawn fails: the one shared ladder returns `failed`, so
-    // each launchSession call hands restart `false`, and each is counted.
-    hold.fail(personaInstanceId(a.key), errGeneric('spawn', 'ErrSomethingElse', 'spawn blew up'))
-    await Bun.sleep(WAIT_MS)
-    expect(launchResults).toEqual([{ key: a.key, ok: false }, { key: a.key, ok: false }])
-    expect(getFailureCount(a.key)).toBe(2)
-    expect(spawnsFor(a)).toHaveLength(1)
-    // One ladder ran, so one spawn-failure notice, for A.
-    expect(notices.map((n) => n.key)).toEqual([a.key])
-    expect(notices[0]!.text).toContain('ErrSomethingElse')
+    // The one held spawn fails with a LAUNCH FAILURE (ErrTmuxSessionCreate):
+    // the shared ladder's own self-heal kills the orphan tmux session by name
+    // (stubbed) and spawns once more, still held, and that spawn fails too. The
+    // one shared ladder returns `failed`, so each launchSession call hands
+    // restart `false`, and each is counted.
+    const tmuxKills: string[] = []
+    _setTmuxSessionKiller(async (name) => { tmuxKills.push(name) })
+    try {
+      const launchFailure = errTmuxSessionCreate('spawn')
+      hold.fail(personaInstanceId(a.key), launchFailure)
+      await Bun.sleep(WAIT_MS)
+      expect(tmuxKills).toHaveLength(1)
+      expect(spawnsFor(a)).toHaveLength(2)
+      expect(launchResults).toEqual([])
+      hold.fail(personaInstanceId(a.key), errTmuxSessionCreate('spawn'))
+      await Bun.sleep(WAIT_MS)
+      expect(launchResults).toEqual([{ key: a.key, ok: false }, { key: a.key, ok: false }])
+      expect(getFailureCount(a.key)).toBe(2)
+      // One ladder ran: its spawn and its one self-heal spawn, and one
+      // spawn-failure notice, for A.
+      expect(spawnsFor(a)).toHaveLength(2)
+      expect(notices.map((n) => n.key)).toEqual([a.key])
+      expect(notices[0]!.text).toContain(launchFailure.errName)
+    } finally {
+      _resetTmuxSessionKiller()
+    }
   })
 
   test('different persona: while A\'s launch is held, a restart for B kills and spawns B and completes without waiting for A', async () => {
@@ -3329,9 +3349,9 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
 
   // A plain `Error` is no agent-director error, so it classifies UNAVAILABLE
   // (b.jg5 SRJ-105): the adapter answers the refusal with its "kill refused"
-  // line. A base AgentDirectorError of a name no class knows is not
-  // UNAVAILABLE for a kill: it keeps the "error for persona" line and the
-  // launch goes on.
+  // line. A base AgentDirectorError of a name CSCB gives no handling is
+  // UNCLASSIFIED (b.jg5 SRJ-313), the same refusal. A GONE name (by name) is
+  // neither: it keeps the "error for persona" line and the launch goes on.
   test.each<[string, () => Error, (key: string) => string, KillSessionResult]>([
     [
       'a plain error with a safe code (UNAVAILABLE, b.jg5 SRJ-105) — one "kill refused" line; the adapter answers the refusal',
@@ -3341,10 +3361,17 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
       KILL_SESSION_REFUSED,
     ],
     [
-      'a base AgentDirectorError whose description carries a fake token — one "error for persona" line; the adapter answers nothing (go on)',
+      'a base AgentDirectorError of a name CSCB gives no handling (UNCLASSIFIED, b.jg5 SRJ-313) whose description carries a fake token — one "kill refused" line; the adapter answers the refusal',
       () => errGeneric('kill', 'ErrKillBroken', `kill refused (${sentinelInMessage('kill', APP_TOKEN_PREFIX)})`),
       (key) =>
-        `[slack] killSession (restart adapter): error for persona=${key}: AgentDirectorError errName=ErrKillBroken message="ErrKillBroken: kill refused (${REDACTED_SENTINEL_TAIL})"`,
+        `[slack] killSession (restart adapter): kill refused for persona=${key}: ErrKillBroken message="kill refused (${REDACTED_SENTINEL_TAIL})" — no relaunch follows (b.jg5 SRJ-105)`,
+      KILL_SESSION_REFUSED,
+    ],
+    [
+      'a base AgentDirectorError of a GONE name (ErrTmuxCaptureFailed) whose description carries a fake token — one "error for persona" line; the adapter answers nothing (go on)',
+      () => errGeneric('kill', 'ErrTmuxCaptureFailed', `capture failed (${sentinelInMessage('kill', APP_TOKEN_PREFIX)})`),
+      (key) =>
+        `[slack] killSession (restart adapter): error for persona=${key}: AgentDirectorError errName=ErrTmuxCaptureFailed message="ErrTmuxCaptureFailed: capture failed (${REDACTED_SENTINEL_TAIL})"`,
       undefined,
     ],
   ])('AC 20: the kill fails with %s; the line names the error with its message redacted; no captured argument carries a credential value', async (_label, makeError, line, answer) => {
@@ -4703,7 +4730,11 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 // `tmux-unresponsive` condition is server.test.ts's `_buildKillSessionAdapter`
 // case.) An UNAVAILABLE `send-keys` in the reconnect is never 'escalate-dead': no
 // re-probe, no kill, no launch. An UNAVAILABLE relaunch is never counted.
-// None of them posts a spawn-failure notice.
+// None of them posts a spawn-failure notice. b.jg5 SRJ-313 (AC 69): an
+// UNCLASSIFIED answer (an `ErrInternal`, a name CSCB gives no handling) at
+// the kill, the reconnect's `send-keys` or the relaunch is the same refusal,
+// arms the timer with the UNCLASSIFIED cause and is never counted toward the
+// cap. Only a kill answering `ErrSpawnNotFound` still goes on to the launch.
 //
 // The RestartDeps cases run on the file's `makeDeps` through the retry entry
 // (`runRestartRetry`) with the delay at 0. The adapter cases run on
@@ -4802,13 +4833,10 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
       expect(h.episodeNotices).toEqual([])
     })
 
-    test.each<[string, () => Error]>([
-      ['ErrSpawnNotFound (regression)', () => errSpawnNotFound()],
-      ['an AgentDirectorError of a name no class knows (not UNAVAILABLE)', () => errGeneric('kill', 'ErrKillBroken', 'the kill broke')],
-    ])('the kill after a dead reading answers %s → the run still launches P; no refusal', async (_label, make) => {
+    test('the kill after a dead reading answers ErrSpawnNotFound (regression) → the run still launches P; no refusal', async () => {
       const { h, p, cwd } = build()
       rowReadsUntilSpawn(h, 'ended')
-      h.script({ killError: make() })
+      h.script({ killError: errSpawnNotFound() })
 
       expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_LAUNCHED)
       await h.settle()
@@ -4818,6 +4846,90 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
       expect(getFailureCount(p)).toBe(0)
       expect(h.errors).not.toContain(KILL_REFUSED_LINE(p))
       expect(h.triggers).toEqual([])
+      expect(h.notices).toEqual([])
+    })
+
+    /** UNCLASSIFIED answers (b.jg5 SRJ-104), each built for the verb that meets it. */
+    const UNCLASSIFIED_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
+      ['ErrInternal', () => errInternal()],
+      ['an AgentDirectorError of a name CSCB gives no handling', (verb) => errGeneric(verb, 'ErrSomethingElse', 'it broke')],
+    ]
+
+    // b.jg5 SRJ-313, SRJ-110 (AC 69): the kill's UNCLASSIFIED answer is the
+    // adapter's refusal, so no step follows it and nothing is counted.
+    test.each(UNCLASSIFIED_ANSWERS)('b.jg5 SRJ-313, AC 69: the kill after a dead reading answers %s (UNCLASSIFIED) → refused: no launch, no recordFailure, no onCapReached; nothing posted; the timer is armed with the unclassified cause', async (_label, make) => {
+      const { h, p, cwd } = build()
+      rowReadsUntilSpawn(h, 'ended')
+      h.script({ killError: make('kill') })
+
+      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+
+      expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
+      expect(h.stub.spawnedIds()).toEqual([])
+      expect(h.errors).toContain(KILL_REFUSED_LINE(p))
+      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+      expectNothingCounted(h, p)
+      expect(h.episodeNotices).toEqual([])
+    })
+
+    // b.jg5 SRJ-313, SRJ-113 (AC 69): an UNCLASSIFIED `send-keys` in the
+    // reconnect is a refusal, never 'escalate-dead'.
+    test.each(UNCLASSIFIED_ANSWERS)('b.jg5 SRJ-313, AC 69: the reconnect\'s send-keys on a live row answers %s (UNCLASSIFIED) → no escalate-dead, no re-probe, no sweep, no kill, no launch; nothing counted, no spawn-failure notice; the timer is armed with the unclassified cause', async (_label, make) => {
+      const { h, p, cwd } = build()
+      h.script({ statusFn: () => cannedStatusResult({ state: 'waiting' }), sendKeysError: make('send-keys') })
+
+      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_RECONNECT_DEFERRED)
+
+      expect(h.stub.calls.statusCalls).toHaveLength(2)
+      expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
+      expect(Object.keys(callCounts(h)).sort()).toEqual(['readPaneCalls', 'sendKeysCalls', 'statusCalls'])
+      expect(h.errors.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
+      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+      expectNothingCounted(h, p)
+      expect(h.episodeNotices).toEqual([])
+    })
+
+    // b.jg5 SRJ-313, SRJ-111 (AC 69): an UNCLASSIFIED relaunch is refused,
+    // never counted toward the cap, with no spawn-failure notice.
+    test.each(UNCLASSIFIED_ANSWERS)('b.jg5 SRJ-313, AC 69: the relaunch after a dead reading answers %s (UNCLASSIFIED) → refused: one spawn and nothing after it, no recordFailure, no onCapReached, no spawn-failure notice; the timer is armed with the unclassified cause', async (_label, make) => {
+      const { h, p, cwd } = build()
+      rowReadsUntilSpawn(h, 'ended')
+      h.script({ spawnError: make('spawn') })
+
+      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+      await h.settle()
+
+      expect(h.stub.calls.killCalls).toHaveLength(1)
+      expect(h.stub.calls.spawnCalls).toHaveLength(1)
+      expect(h.stub.calls.resumeCalls).toEqual([])
+      expect(h.stub.calls.deleteCalls).toEqual([])
+      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+      expect(h.errors).not.toContain(KILL_REFUSED_LINE(p))
+      expectNothingCounted(h, p)
+      expect(h.episodeNotices).toEqual([])
+    })
+
+    // AC 69: retried, an UNCLASSIFIED relaunch is still never counted, so P
+    // never reaches the cap on it; a later retry that launches clears nothing
+    // it did not count.
+    test('b.jg5 SRJ-313, AC 69: a relaunch that keeps answering ErrInternal across several retries never counts a failure or reaches the cap; once it succeeds P is launched with nothing counted', async () => {
+      const { h, p, cwd } = build()
+      rowReadsUntilSpawn(h, 'ended')
+      h.script({ spawnError: errInternal() })
+
+      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+      for (let i = 0; i < RESTART_FAILURE_CAP + 1; i++) await retryNow(h, p)
+
+      expect(h.attempts).toHaveLength(RESTART_FAILURE_CAP + 1)
+      expect(h.stub.calls.spawnCalls).toHaveLength(RESTART_FAILURE_CAP + 2)
+      expect(new Set(h.triggers.map((t) => t.kind))).toEqual(new Set([UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED]))
+      expectNothingCounted(h, p)
+
+      h.script({ spawnError: undefined })
+      await retryNow(h, p)
+      expect(h.stub.calls.spawnCalls).toHaveLength(RESTART_FAILURE_CAP + 3)
+      expect(getFailureCount(p)).toBe(0)
+      expect(h.capReached).toEqual([])
       expect(h.notices).toEqual([])
     })
 

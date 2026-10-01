@@ -37,8 +37,14 @@
  *   - reportAgentDirectorError(key, err, call) — report an error to the retry timer's trigger sink
  *                                            (inside a launch or recovery attempt, and for
  *                                            ENVIRONMENT and CONFIG in any context; b.jg5 SRJ-301,
- *                                            SRJ-311, SRJ-316) and start or continue the persona's
- *                                            tmux-unresponsive condition (b.jg5 SRJ-307)
+ *                                            SRJ-311, SRJ-316), start or continue the persona's
+ *                                            tmux-unresponsive condition (b.jg5 SRJ-307), and
+ *                                            report an in-attempt UNCLASSIFIED outcome to the
+ *                                            unclassified sink (b.jg5 SRJ-313)
+ *   - reportUnclassifiedAtSite(key, err, call, classification) — the site entry for an
+ *                                            UNCLASSIFIED outcome a site classifies itself
+ *                                            (the resume path's ErrInvalidFlags): arms with the
+ *                                            UNCLASSIFIED cause and reports it, inside an attempt
  *   - _resetOutageState()                  — test-only state reset
  *
  * Template exports (used by tests):
@@ -63,6 +69,14 @@
  * tmux-touching call ends it (a success, or a GONE answer, in any context).
  * Neither touches a flag, posts a notice or records bad-stretch history.
  *
+ * The unclassified-error episode (b.jg5 SRJ-313) is kept in
+ * `src/persona-episodes.ts` too: this module only reports to the installed
+ * unclassified sink each UNCLASSIFIED outcome met inside a launch or recovery
+ * attempt for the persona (at the reporting point, and through the site entry
+ * for an outcome a site classifies itself). An UNCLASSIFIED outcome touches
+ * no flag; `ErrSystemInstallDisappeared`, which is UNCLASSIFIED, still raises
+ * `ad-unreachable` in the wrappers.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -71,6 +85,7 @@ import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_GONE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
   adCallVerb,
   classifyAdError,
   describeAdErrorClassification,
@@ -88,11 +103,17 @@ import {
 } from './agent-director-errors.ts'
 import { describeThrownValue, renderLogMessageText } from './persona-connection-errors.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
-import { TMUX_UNRESPONSIVE_END_TMUX_VERB, type TmuxUnresponsiveSink } from './persona-episodes.ts'
+import {
+  TMUX_UNRESPONSIVE_END_TMUX_VERB,
+  type TmuxUnresponsiveSink,
+  type UnclassifiedErrorSink,
+} from './persona-episodes.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_ROW_PENDING,
   isInsideAttempt,
+  reportAttemptCause,
   reportAttemptError,
   unavailableRetryCauseFor,
   type UnavailableRetryTriggerSink,
@@ -162,6 +183,26 @@ export interface OutageStateDeps {
    * Absent: nothing is called.
    */
   onFlagCleared?: (key: string, cls: OutageClass, reading?: string) => void
+  /**
+   * Where an UNCLASSIFIED outcome in a launch or recovery attempt for the
+   * persona is reported (b.jg5 SRJ-313): production passes the
+   * unclassified-error episodes (`createUnclassifiedErrorEpisodes`,
+   * `src/persona-episodes.ts`). Fed once per outcome by the reporting point
+   * (`reportAgentDirectorError`), a row read's included, and by the site
+   * entry (`reportUnclassifiedAtSite`). Without it nothing is reported; the
+   * arming is unchanged.
+   */
+  unclassifiedSink?: UnclassifiedErrorSink
+}
+
+/** Options of {@link reportAgentDirectorError}. */
+export interface ReportAgentDirectorErrorOptions {
+  /**
+   * False keeps an UNCLASSIFIED outcome from the unclassified sink: the
+   * liveness adapter's `ErrSystemInstallDisappeared`, which keeps its `dead`
+   * reading (b.jg5 SRJ-105, SRJ-314). Its arming is unchanged. Default true.
+   */
+  reportUnclassified?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +562,8 @@ export function resetAllToHealthy(keys: string[]): void {
  * SRJ-316), and, inside such
  * an attempt, starts or continues its `tmux-unresponsive` condition when the
  * call is tmux-touching and the error is UNAVAILABLE (not
- * `ErrTmuxKillFailed`). A GONE answer (`ErrTmuxSendKeys`,
+ * `ErrTmuxKillFailed`), and reports an UNCLASSIFIED error to the unclassified
+ * sink (b.jg5 SRJ-313). A GONE answer (`ErrTmuxSendKeys`,
  * `ErrTmuxCaptureFailed`, by class) from a tmux-touching call clears
  * 'tmux-unavailable' and ends the condition, in any context, before the same
  * value is rethrown; a GONE-classed value from a call that is not
@@ -616,18 +658,86 @@ export async function withOutageDetection<T>(
  *   its last, so a launch it ends is refused and never counted.
  * - Inside such an attempt, when the call is tmux-touching
  *   (`isTmuxTouchingCall`) and the arming predicate answers the UNAVAILABLE
- *   cause (never the kill-failure, ENVIRONMENT or CONFIG cause), the
- *   installed condition sink starts or continues the persona's
+ *   cause (never the kill-failure, ENVIRONMENT, CONFIG or UNCLASSIFIED
+ *   cause), the installed condition sink starts or continues the persona's
  *   `tmux-unresponsive` condition.
+ * - Inside such an attempt, an UNCLASSIFIED answer (by class, through
+ *   `src/ad-error-class.ts`) from any verb, a `status`, `get` or `list`
+ *   included, is reported once to the installed unclassified sink with the
+ *   value and its classification (b.jg5 SRJ-313), unless
+ *   `options.reportUnclassified` is false (the liveness adapter's
+ *   `ErrSystemInstallDisappeared`). An `ErrInternal` carrying the unusable
+ *   recorded name is UNUSABLE NAME, and is not reported. Outside an attempt
+ *   for `key` nothing is reported.
  *
- * With no sink installed, nothing is armed or started. Flags and notices are
+ * With no sink installed, nothing is armed, started or reported. Flags and notices are
  * untouched, and it never throws, so the caller's own handling and rethrow
  * are as without it.
  */
-export function reportAgentDirectorError(key: string, err: unknown, call: AdCall): void {
+export function reportAgentDirectorError(
+  key: string,
+  err: unknown,
+  call: AdCall,
+  options?: ReportAgentDirectorErrorOptions,
+): void {
   const verb = adCallVerb(call)
   reportAttemptError(key, err, verb, deps?.triggerSink)
   startTmuxUnresponsive(key, err, call, verb)
+  if (options?.reportUnclassified !== false) reportUnclassified(key, err, verb)
+}
+
+/**
+ * reportUnclassifiedAtSite — the site entry for an UNCLASSIFIED outcome a
+ * site classifies itself (b.jg5 SRJ-104, SRJ-313): the resume path's
+ * `ErrInvalidFlags` once its immediate re-check answered UNCLASSIFIED without
+ * stopping the server. `classification` is the step's answer. Inside a
+ * launch or recovery attempt for `key` it arms the persona's retry timer
+ * with the UNCLASSIFIED cause through the installed trigger sink (the
+ * attempt records it as its last error, so a launch it ends is refused) and
+ * reports the outcome once to the installed unclassified sink with the
+ * classification; outside one it does nothing. The wrapper's own report of
+ * the same value armed and reported nothing (`ErrInvalidFlags` is STATE to
+ * the arming predicate), so the outcome is reported once. It starts no
+ * condition, touches no flag and never throws. Answers whether the timer was
+ * armed.
+ */
+export function reportUnclassifiedAtSite(
+  key: string,
+  err: unknown,
+  call: AdCall,
+  classification: AdErrorClassification,
+): boolean {
+  if (!isInsideAttempt(key)) return false
+  const armed = reportAttemptCause(key, { kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, error: err }, adCallVerb(call), deps?.triggerSink)
+  sendUnclassified(key, err, classification)
+  return armed
+}
+
+/**
+ * Report `err` to the installed unclassified sink once when the current call
+ * runs inside a launch or recovery attempt for `key` and the classifier
+ * answers UNCLASSIFIED (from any declared verb, the reads included; b.jg5
+ * SRJ-313). A call with no known verb is not reported, as it arms nothing.
+ * Never throws.
+ */
+function reportUnclassified(key: string, err: unknown, verb: AdVerb | undefined): void {
+  try {
+    if (deps?.unclassifiedSink === undefined || verb === undefined || !isInsideAttempt(key)) return
+    if (classifyAdError(err).errorClass !== AD_ERROR_CLASS_UNCLASSIFIED) return
+    // The sink classifies the value itself (`UnclassifiedErrorSink.report`).
+    sendUnclassified(key, err)
+  } catch {
+    /* a failing sink changes nothing about the call's own outcome */
+  }
+}
+
+/** Hand one outcome to the installed unclassified sink, with the site's own classification when given. Never throws. */
+function sendUnclassified(key: string, err: unknown, classification?: AdErrorClassification): void {
+  try {
+    deps?.unclassifiedSink?.report(key, err, classification)
+  } catch {
+    /* a failing sink changes nothing about the call's own outcome */
+  }
 }
 
 /**

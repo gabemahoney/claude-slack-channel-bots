@@ -36,6 +36,7 @@
  * Kinds and their posters. One label per row of SRJ-1016's table
  * (`PERSONA_EPISODE_KINDS`). `tmux-unresponsive`'s episode is begun and
  * ended by its condition (below), which posts its onset, alert and recovery;
+ * `unclassified-error`'s by its episodes (below), which post its one alert;
  * every other kind has no poster yet: its begin and end triggers and text
  * come with the Epic that posts it, named on its label below.
  *
@@ -128,6 +129,62 @@
  * failed: <error>` and `[slack] persona-episodes: tmux-unresponsive
  * health-check mode read failed: <error> — taken as on`.
  *
+ * The unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009).
+ * `createUnclassifiedErrorEpisodes(deps)` builds them over one episodes
+ * instance: a persona's episode is its open `unclassified-error` episode, and
+ * the episode's start time is its first outcome's time. They post nothing but
+ * the one alert per episode, set no timer and touch no outage flag, retry
+ * timer or restart counter:
+ *
+ * - `report(key, error, classification?)` is the outage state's unclassified
+ *   sink (`OutageStateDeps.unclassifiedSink`, `src/outage-state.ts`), called
+ *   once for each UNCLASSIFIED outcome in a launch or recovery attempt for
+ *   the persona, a row read's included (its only caller; a site that
+ *   classifies an outcome itself passes its classification through the
+ *   outage state's site entry). With no open episode it begins one. In an
+ *   open episode whose alert has not been posted, when the time since its
+ *   first outcome, on the episodes' clock, is strictly longer than the alert
+ *   threshold in effect now (the injected accessor, read at each check), the
+ *   alert is posted once, quoting this outcome. No timer: an outcome met past
+ *   the threshold posts it, and none posts it otherwise.
+ * - The alert's route is decided when it is posted: a persona in the applied
+ *   configuration (the injected lookup) gets it through the episodes' sink
+ *   (its destination); any other persona gets it through the injected
+ *   log-only route (in production `recordStartupError` with
+ *   `PERSONA_UNCLASSIFIED_ERROR_LABEL`, the key and the unescaped text), and
+ *   nothing reaches Slack. Either way it counts as posted.
+ * - `end(key, reason)` ends the episode silently: `retryStopped(key, stop)`,
+ *   bound in `main()` to every stop of the retry timer, ends it only for
+ *   `UNAVAILABLE_RETRY_STOP_RECOVERED` (`UNCLASSIFIED_ERROR_END_RECOVERED`)
+ *   and `UNAVAILABLE_RETRY_STOP_ROW_LIVE` (`UNCLASSIFIED_ERROR_END_ROW_LIVE`:
+ *   a pending-only retry read the row live out of `pending`, so a launch the
+ *   retries made succeeded and no retry follows); every other stop (not up,
+ *   not applied, launch skipped, row gone and the rest) leaves it open.
+ *   `main()` ends it at the restart cap.
+ *   A later report begins a new episode, whose alert is posted again. The
+ *   episodes' `forget(key)` (a teardown), `forgetAll()` and `close()` drop it
+ *   silently with nothing left pending.
+ *
+ * Text (SRJ-1009): `unclassifiedErrorAlertText`, from the classifier's
+ * reported name (left out when absent) and rendered message, the message
+ * escaped for Slack (`escapeSlackControlCharacters`) after its redaction and
+ * cap; the log-only route and every log line carry it unescaped.
+ *
+ * Log lines, to the injected log (a throwing log is swallowed):
+ *
+ *   [slack] persona-episodes: persona=<key> unclassified-error started — <describeAdErrorClassification>
+ *   [slack] persona-episodes: persona=<key> unclassified-error alert posted to its destination — <met>
+ *   [slack] persona-episodes: persona=<key> unclassified-error alert written to the server log and startup-errors.log (persona-unclassified-error) — the persona is not in the applied configuration; <met>
+ *   [slack] persona-episodes: persona=<key> unclassified-error ended — <reason>
+ *
+ * where `<met>` is `an UNCLASSIFIED outcome met <s> s after the episode's
+ * first, over its alert threshold of <s> s: <describeAdErrorClassification>`;
+ * and, only on a failure or a missing route: `report failed: <error>`,
+ * `configured-key lookup failed: <error> — the alert takes the log-only
+ * route`, `log-only alert failed: <error>` (in place of the written line) and
+ * `alert not routed — …` (each after `persona=<key> unclassified-error`). The
+ * written line is logged only after the log-only route returns.
+ *
  * b.f2b's not-connected reasons keep their one shared latch
  * (`notConnectedNoticeRaised` in `src/session-manager.ts`), which this module
  * neither reads nor writes. `src/persona-slack-episodes.ts` is a different
@@ -149,12 +206,23 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describeAgentDirectorFailure, type AdVerb } from './ad-error-class.ts'
+import {
+  classifyAdError,
+  describeAdErrorClassification,
+  describeAgentDirectorFailure,
+  type AdErrorClassification,
+  type AdVerb,
+} from './ad-error-class.ts'
 import { armNeverEarlyWait, wholeMinutes } from './ad-settings.ts'
-import { describeThrownValue } from './persona-connection-errors.ts'
+import { describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 import { personaTmuxSessionName } from './persona-identity.ts'
-import { UNAVAILABLE_RETRY_TERMINAL_STOPS } from './unavailable-retry.ts'
+import { escapeSlackControlCharacters } from './slack-text-escape.ts'
+import {
+  UNAVAILABLE_RETRY_STOP_RECOVERED,
+  UNAVAILABLE_RETRY_STOP_ROW_LIVE,
+  UNAVAILABLE_RETRY_TERMINAL_STOPS,
+} from './unavailable-retry.ts'
 
 // ---------------------------------------------------------------------------
 // Kinds (b.jg5 SRJ-1016)
@@ -190,7 +258,13 @@ export const PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED = 'ad-config-malformed'
 /** `ErrInvalidFlags` hold: as SRJ-207 states. No poster yet (b.jg5 E23). */
 export const PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD = 'invalid-flags-hold'
 
-/** Unclassified error: as SRJ-313 states. No poster yet (b.jg5 E12). */
+/**
+ * Unclassified error (SRJ-313): from the first UNCLASSIFIED outcome in a
+ * launch or recovery attempt until a retry finds nothing left to recover or,
+ * pending-only, reads the row live out of `pending`, the persona reaches the
+ * restart cap or is torn down. Posted by its episodes
+ * (`createUnclassifiedErrorEpisodes`, below); a latch's end is E13's.
+ */
 export const PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR = 'unclassified-error'
 
 /**
@@ -883,4 +957,255 @@ function endText(reason: unknown): string {
   return typeof reason === 'string' && Object.hasOwn(TMUX_UNRESPONSIVE_END_TEXT, reason)
     ? TMUX_UNRESPONSIVE_END_TEXT[reason as TmuxUnresponsiveEndReason]
     : 'an unnamed reason'
+}
+
+// ---------------------------------------------------------------------------
+// The unclassified-error episode (b.jg5 SRJ-313, SRJ-1009)
+// ---------------------------------------------------------------------------
+
+/**
+ * The `startup-errors.log` class of an unclassified-error alert for a persona
+ * no longer in the applied configuration (b.jg5 SRJ-313, SRJ-1013). `main()`
+ * binds the episode's log-only route to `recordStartupError` with it.
+ */
+export const PERSONA_UNCLASSIFIED_ERROR_LABEL = 'persona-unclassified-error'
+
+/** End reason: a retry of the persona's timer found nothing left to recover (b.jg5 SRJ-313). */
+export const UNCLASSIFIED_ERROR_END_RECOVERED = 'a retry found nothing left to recover'
+
+/**
+ * End reason: a pending-only retry of the persona's timer read its row live
+ * out of `pending` (b.jg5 SRJ-313): a launch the retries made succeeded and
+ * the retries are over.
+ */
+export const UNCLASSIFIED_ERROR_END_ROW_LIVE = 'a retry read its row live out of pending'
+
+/** End reason: the persona reached the restart cap (b.jg5 SRJ-313). */
+export const UNCLASSIFIED_ERROR_END_CAPPED = 'the persona reached the restart cap'
+
+/** Why an unclassified-error episode ended. */
+export type UnclassifiedErrorEndReason =
+  | typeof UNCLASSIFIED_ERROR_END_RECOVERED
+  | typeof UNCLASSIFIED_ERROR_END_ROW_LIVE
+  | typeof UNCLASSIFIED_ERROR_END_CAPPED
+
+/** What the alert quotes: the classifier's reported name (a safe identifier) and rendered message. */
+export type UnclassifiedErrorQuote = Pick<AdErrorClassification, 'reportedName' | 'message'>
+
+/** Options of {@link unclassifiedErrorAlertText}. */
+export interface UnclassifiedErrorAlertTextOptions {
+  /**
+   * Escape Slack's control characters in the quoted message
+   * (`escapeSlackControlCharacters`), for a Slack post. Default true; false
+   * for the log-only route, whose text goes to the server log and
+   * `startup-errors.log` and is never posted.
+   */
+  escapeForSlack?: boolean
+}
+
+/**
+ * The unclassified-error alert's body (b.jg5 SRJ-1009); the persona notifier
+ * adds the persona prefix. `<error name>` is the classification's reported
+ * name, left out (with no placeholder) when it is absent or not a safe
+ * identifier; the quoted message is its rendered message (agent-director's
+ * description through `redactSlackLogText`, on one line, capped at
+ * `MAX_LOGGED_MESSAGE_LENGTH`), escaped for Slack after that unless
+ * `options.escapeForSlack` is false, and left out with its quotes when
+ * absent. With neither, the sentence ends at "for this persona". Never throws.
+ */
+export function unclassifiedErrorAlertText(quote: UnclassifiedErrorQuote, options?: UnclassifiedErrorAlertTextOptions): string {
+  const parts: string[] = []
+  const name = readQuoteField(quote, 'reportedName')
+  if (isSafeIdentifier(name)) parts.push(name)
+  const message = readQuoteField(quote, 'message')
+  if (typeof message === 'string' && message !== '') {
+    parts.push(`"${options?.escapeForSlack === false ? message : escapeSlackControlCharacters(message)}"`)
+  }
+  const quoted = parts.length > 0 ? `: ${parts.join(' ')}` : ''
+  return (
+    `:warning: *Unclassified agent-director error* — agent-director returned an error CSCB cannot classify for this persona${quoted}. ` +
+    "CSCB keeps retrying and takes no destructive action; a human should check the host's agent-director."
+  )
+}
+
+/** `quote[field]`, or `undefined` when the read throws. */
+function readQuoteField(quote: UnclassifiedErrorQuote, field: keyof UnclassifiedErrorQuote): unknown {
+  try {
+    return quote[field]
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Where the outage state's reporting point reports an UNCLASSIFIED outcome in
+ * a launch or recovery attempt for the persona (`OutageStateDeps.unclassifiedSink`,
+ * `src/outage-state.ts`). The unclassified-error episodes are one.
+ * `classification` is given by a site that classified the outcome itself (the
+ * resume path's `ErrInvalidFlags` after its re-check); otherwise the value is
+ * classified here.
+ */
+export interface UnclassifiedErrorSink {
+  report(key: string, error: unknown, classification?: AdErrorClassification): unknown
+}
+
+/** What `report` did: began an episode, continued one, posted its alert, or nothing after the episodes' `close`. */
+export type UnclassifiedErrorReportResult = 'begun' | 'continued' | 'alerted' | 'closed'
+
+/** Dependencies of `createUnclassifiedErrorEpisodes`. */
+export interface UnclassifiedErrorEpisodesDeps {
+  /** The episodes instance whose `unclassified-error` episode is the persona's episode; its sink posts the alert. */
+  episodes: PersonaEpisodes
+  /** Receives the episode's `[slack]` lines (the server log). A throwing log is swallowed. */
+  log: (line: string) => void
+  /** The alert threshold in effect, in milliseconds (production: E6's `adAlertThresholdMsInEffect`), read at each check. */
+  alertThresholdMs: () => number
+  /**
+   * Whether the persona is in the applied configuration, read when the alert
+   * is posted: true, the alert goes to the episodes' sink (the persona's
+   * destination); false, to `logOnly`. Absent: every key is configured. A
+   * throw takes the log-only route.
+   */
+  isConfigured?: (key: string) => boolean
+  /**
+   * The log-only route for a persona not in the applied configuration
+   * (production: `recordStartupError` with `PERSONA_UNCLASSIFIED_ERROR_LABEL`,
+   * the key and the text, which writes the server-log line and the
+   * startup-errors entry). Given the unescaped text. Never posts to Slack.
+   * Absent: one line says the alert had no route. The written line follows
+   * its return; a throw is logged in its place, and the alert still counts as
+   * posted.
+   */
+  logOnly?: (key: string, text: string) => void
+}
+
+/** One server's unclassified-error episodes, one per persona key. */
+export interface UnclassifiedErrorEpisodes extends UnclassifiedErrorSink {
+  /**
+   * An UNCLASSIFIED outcome `error` in a launch or recovery attempt for
+   * persona `key` (b.jg5 SRJ-313), with the site's own `classification` when
+   * given. With no open episode it begins one (the time from the episodes'
+   * clock, one started line). In an open episode whose alert has not been
+   * posted, when the time since the episode's first outcome is strictly
+   * longer than the threshold in effect now, it posts the alert once,
+   * quoting this outcome, routed by `isConfigured`. Never throws.
+   */
+  report(key: string, error: unknown, classification?: AdErrorClassification): UnclassifiedErrorReportResult
+  /** End persona `key`'s open episode silently, with one ended line naming `reason`. Answers whether one was open. */
+  end(key: string, reason: UnclassifiedErrorEndReason): boolean
+  /**
+   * A stop of persona `key`'s retry timer (`UnavailableRetryDeps.onStopped`):
+   * `UNAVAILABLE_RETRY_STOP_RECOVERED` (a retry found nothing left to
+   * recover) ends the episode (`UNCLASSIFIED_ERROR_END_RECOVERED`), and
+   * `UNAVAILABLE_RETRY_STOP_ROW_LIVE` (a pending-only retry read the row live
+   * out of `pending`; no retry follows) ends it
+   * (`UNCLASSIFIED_ERROR_END_ROW_LIVE`); every other stop reason leaves it
+   * open. Answers whether it ended one.
+   */
+  retryStopped(key: string, stopReason: string): boolean
+  /** Whether persona `key`'s episode is open. */
+  isOpen(key: string): boolean
+}
+
+/** The unclassified-error alert's mark in its episode. */
+const UNCLASSIFIED_ALERT_MARK = 'alert'
+
+/**
+ * Build one server's unclassified-error episodes over `deps.episodes` (b.jg5
+ * SRJ-313); see the module comment. No timer, no agent-director call; nothing
+ * is read, posted or logged at creation.
+ */
+export function createUnclassifiedErrorEpisodes(deps: UnclassifiedErrorEpisodesDeps): UnclassifiedErrorEpisodes {
+  const kind = PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR
+  const { episodes } = deps
+  /**
+   * The episode whose alert was posted, per persona, by either route (the
+   * log-only route hands nothing to the episodes' sink). Dropped when that
+   * episode closes, by an end, `forget`, `forgetAll` or `close`.
+   */
+  const alerted = new Map<string, number>()
+
+  function line(key: string, text: string): void {
+    safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} ${text}`)
+  }
+
+  /** The configured-key lookup; absent reads as configured, a throw as not configured (logged). */
+  function configured(key: string): boolean {
+    if (deps.isConfigured === undefined) return true
+    try {
+      return deps.isConfigured(key) === true
+    } catch (err) {
+      line(key, `configured-key lookup failed: ${describeThrownValue(err)} — the alert takes the log-only route`)
+      return false
+    }
+  }
+
+  /** Post the alert for `episode` once, quoting `classification`, by the route `isConfigured` gives now. */
+  function postAlert(key: string, episode: number, classification: AdErrorClassification, elapsedMs: number, thresholdMs: number): void {
+    alerted.set(key, episode)
+    episodes.whenClosed(key, kind, () => {
+      if (alerted.get(key) === episode) alerted.delete(key)
+    })
+    const met = `an UNCLASSIFIED outcome met ${seconds(elapsedMs)} s after the episode's first, over its alert threshold of ${seconds(thresholdMs)} s: ${describeAdErrorClassification(classification)}`
+    if (configured(key)) {
+      episodes.post(key, kind, unclassifiedErrorAlertText(classification), UNCLASSIFIED_ALERT_MARK)
+      line(key, `alert posted to its destination — ${met}`)
+      return
+    }
+    const text = unclassifiedErrorAlertText(classification, { escapeForSlack: false })
+    if (deps.logOnly === undefined) {
+      line(key, `alert not routed — the persona is not in the applied configuration and no log-only route is installed; ${met}`)
+      return
+    }
+    try {
+      deps.logOnly(key, text)
+    } catch (err) {
+      // The alert stays latched as posted; no "written" line, which would be false.
+      line(key, `log-only alert failed: ${describeThrownValue(err)}`)
+      return
+    }
+    line(key, `alert written to the server log and startup-errors.log (${PERSONA_UNCLASSIFIED_ERROR_LABEL}) — the persona is not in the applied configuration; ${met}`)
+  }
+
+  function end(key: string, reason: UnclassifiedErrorEndReason): boolean {
+    if (!episodes.end(key, kind)) return false
+    line(key, `ended — ${reason}`)
+    return true
+  }
+
+  /** `report` for an outcome already classified. Never throws. */
+  function reportClassified(key: string, classification: AdErrorClassification): UnclassifiedErrorReportResult {
+    try {
+      const current = episodes.view(key, kind)
+      if (current === undefined) {
+        if (episodes.begin(key, kind) === 'closed') return 'closed'
+        line(key, `started — ${describeAdErrorClassification(classification)}`)
+        return 'begun'
+      }
+      if (alerted.get(key) === current.episode) return 'continued'
+      const thresholdMs = deps.alertThresholdMs()
+      const elapsedMs = episodes.clock.now() - current.startedAt
+      if (!(elapsedMs > thresholdMs)) return 'continued'
+      postAlert(key, current.episode, classification, elapsedMs, thresholdMs)
+      return 'alerted'
+    } catch (err) {
+      line(key, `report failed: ${describeThrownValue(err)}`)
+      return 'continued'
+    }
+  }
+
+  return {
+    // `classifyAdError` never throws.
+    report: (key, error, given) => reportClassified(key, given ?? classifyAdError(error)),
+
+    end,
+
+    retryStopped(key, stopReason) {
+      if (stopReason === UNAVAILABLE_RETRY_STOP_RECOVERED) return end(key, UNCLASSIFIED_ERROR_END_RECOVERED)
+      if (stopReason === UNAVAILABLE_RETRY_STOP_ROW_LIVE) return end(key, UNCLASSIFIED_ERROR_END_ROW_LIVE)
+      return false
+    },
+
+    isOpen: (key) => episodes.isOpen(key, kind),
+  }
 }

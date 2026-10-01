@@ -119,7 +119,14 @@ import {
 } from '../src/session-manager.ts'
 import type { ClientOptions, FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams } from 'agent-director'
 import { KILL_SESSION_REFUSED, type KillSessionResult } from '../src/restart.ts'
-import { UNAVAILABLE_RETRY_CAUSE_CONFIG, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, isInsideAttempt, runInAttempt } from '../src/unavailable-retry.ts'
+import {
+  UNAVAILABLE_RETRY_CAUSE_CONFIG,
+  UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
+  UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
+  isInsideAttempt,
+  runInAttempt,
+} from '../src/unavailable-retry.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
@@ -553,6 +560,8 @@ describe('_buildIsSessionAliveAdapter', () => {
   type Trigger = { key: string; kind: string; inside: boolean }
   /** One real flag clear the cleared-flag observer saw. */
   type Cleared = { key: string; cls: OutageClass }
+  /** One report to the unclassified sink: its key, the reported value, and whether it came from inside an attempt for its key. */
+  type Unclassified = { key: string; error: unknown; inside: boolean }
 
   /** The all-clear an `ad-unreachable` raised with `binaryPath` alone posts when it clears. */
   const adUnreachableAllClear = (binaryPath: string): string =>
@@ -585,19 +594,22 @@ describe('_buildIsSessionAliveAdapter', () => {
     statusCalls: StatusParams[]
     triggers: Trigger[]
     cleared: Cleared[]
+    unclassified: Unclassified[]
     adapter: (key: string) => Promise<LivenessReading>
   } {
     const emissions: Emission[] = []
     const statusCalls: StatusParams[] = []
     const triggers: Trigger[] = []
     const cleared: Cleared[] = []
+    const unclassified: Unclassified[] = []
     _resetOutageState()
     initOutageState({
       notify: (key, text) => { emissions.push({ key, text }) },
       getClient: () => makeStubClient() as unknown as Client,
-      // Spies: every arm (with whether it came from inside an attempt for
-      // the key) and every real flag clear.
+      // Spies: every arm and every unclassified report (each with whether it
+      // came from inside an attempt for the key) and every real flag clear.
       triggerSink: { arm: (key, cause) => { triggers.push({ key, kind: cause.kind, inside: isInsideAttempt(key) }); return true } },
+      unclassifiedSink: { report: (key, error) => { unclassified.push({ key, error, inside: isInsideAttempt(key) }) } },
       onFlagCleared: (key, cls) => { cleared.push({ key, cls }) },
     })
     const stubOpts = statusError
@@ -616,6 +628,7 @@ describe('_buildIsSessionAliveAdapter', () => {
       statusCalls,
       triggers,
       cleared,
+      unclassified,
       adapter: _buildIsSessionAliveAdapter(() => config),
     }
   }
@@ -984,6 +997,74 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions).toHaveLength(0)
     expect(errArgs).toHaveLength(1)
     expect(triggers).toEqual([])
+  })
+
+  // b.jg5 SRJ-313 (Task ruling: reads count toward the episode): inside a
+  // restart run for the persona (a recovery attempt) an UNCLASSIFIED `status`
+  // is reported once to the unclassified sink, with the value itself; the
+  // reading (`unknown`, pinned above) and the read-error cause are unchanged.
+  // Each description carries the leak marker, so the one line is checked.
+  const UNCLASSIFIED_STATUS_ERRORS = [
+    ['ErrInternal', () => errInternal(`the store could not be read (${sentinelInMessage('status-internal')})`)],
+    ['a store agent-director cannot open (ErrSchemaMismatch)', () => errSchemaMismatch(`the store could not be opened (${sentinelInMessage('status-schema')})`)],
+    ['a name CSCB gives no handling', () => errGeneric('status', 'ErrStatusBroken', `the status broke (${sentinelInMessage('status-generic')})`)],
+  ] as const
+  test.each(UNCLASSIFIED_STATUS_ERRORS)('b.jg5 SRJ-313: status throws %s inside a restart run for the persona → reported once to the unclassified sink, with the value; reads unknown; the read-error cause armed; one token-safe line', async (_label, build) => {
+    const err = build()
+    const { emissions, triggers, unclassified, adapter } = makeHarness(err)
+
+    const { result, errArgs } = await runInAttempt('C1', 'recovery', () => probeCapturingErrors(adapter, 'C1'))
+
+    expect(result).toEqual(LIVENESS_READING_UNKNOWN)
+    expect(unclassified.map((u) => ({ key: u.key, inside: u.inside, same: u.error === err }))).toEqual([{ key: 'C1', inside: true, same: true }])
+    expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR, inside: true }])
+    expect(emissions).toEqual([])
+    const lines = stringLines(errArgs)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith('[slack] isSessionAlive: status error for persona=C1: ')
+    assertNoLeak({ errArgs, emissions })
+  })
+
+  // Outside a launch or recovery attempt for the persona (the health tick, or
+  // a restart run for another persona) an UNCLASSIFIED answer starts no
+  // episode: nothing is reported, and nothing is armed.
+  test.each([
+    ['outside any attempt', undefined],
+    ['inside a restart run for another persona', 'C2'],
+  ] as const)('b.jg5 SRJ-313: status throws ErrInternal %s → nothing reported to the unclassified sink, nothing armed; reads unknown', async (_label, attemptKey) => {
+    const { triggers, unclassified, adapter } = makeHarness(errInternal(), LIVE_STATE, standIns('C1', 'C2'))
+
+    const { result } = attemptKey === undefined
+      ? await probeCapturingErrors(adapter, 'C1')
+      : await runInAttempt(attemptKey, 'recovery', () => probeCapturingErrors(adapter, 'C1'))
+
+    expect(result).toEqual(LIVENESS_READING_UNKNOWN)
+    expect(unclassified).toEqual([])
+    expect(triggers).toEqual([])
+  })
+
+  // b.jg5 SRJ-105, SRJ-314 (Task ruling): `ErrSystemInstallDisappeared` is
+  // UNCLASSIFIED, but at the liveness adapter it keeps its `dead` reading and
+  // its `ad-unreachable` raise, and is never reported to the unclassified
+  // sink, inside a restart run for the persona or outside one. Its arming is
+  // unchanged (a read's error inside the attempt: the read-error cause).
+  test.each([
+    ['inside a restart run for the persona', true],
+    ['outside any attempt', false],
+  ] as const)('b.jg5 SRJ-313: status throws ErrSystemInstallDisappeared %s → reads dead; ad-unreachable raised; not reported to the unclassified sink', async (_label, inside) => {
+    const { triggers, unclassified, adapter } = makeHarness(errSystemInstallDisappeared('status'))
+
+    const { result, errArgs } = inside
+      ? await runInAttempt('C1', 'recovery', () => probeCapturingErrors(adapter, 'C1'))
+      : await probeCapturingErrors(adapter, 'C1')
+
+    expect(result).toEqual(LIVENESS_READING_DEAD)
+    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
+    expect(unclassified).toEqual([])
+    expect(triggers).toEqual(inside ? [{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR, inside: true }] : [])
+    // Any line is a string (no raw error), and none leaks.
+    stringLines(errArgs)
+    assertNoLeak({ errArgs })
   })
 
   test('5. each persona is probed by its own key: cscb_<key> for the key passed (b.av2 SR-2.2)', async () => {
@@ -1589,12 +1670,50 @@ describe('_buildReconnectSessionAdapter', () => {
     assertNoLeak({ errArgs })
   })
 
-  // Another class keeps today's handling: an UNCLASSIFIED send-keys error
-  // (not UNAVAILABLE) still raises the spawn-failure notice and answers
-  // 'transient', with no refusal line (the contrast that shows the notice
-  // spy above is live).
-  test("SRJ-105 contrast: send-keys answering an UNCLASSIFIED error (ErrInternal) keeps today's handling → 'transient' with one spawn-failure notice and no refusal line", async () => {
-    const { result, errArgs, raised, findMissingCalls } = await reconnectCapturing({ statusState: 'waiting', sendKeysThrows: errInternal() })
+  // b.jg5 SRJ-105, SRJ-313, SRJ-113: an UNCLASSIFIED `send-keys` (an
+  // `ErrInternal`, a name CSCB gives no handling, or
+  // `ErrSystemInstallDisappeared`, whose wrapper raises `ad-unreachable`), at
+  // the first try or at the retry after ErrTmuxSendKeys, is the same refusal:
+  // 'transient', never 'escalate-dead', no sweep, kill or launch and no
+  // spawn-failure notice; one described refusal line, nothing leaks.
+  const UNCLASSIFIED_SEND_KEYS_ERRORS: ReadonlyArray<readonly [string, () => Error]> = [
+    ['ErrInternal', () => errInternal(`the store could not be read (${sentinelInMessage('send-keys-internal')})`)],
+    ['a name CSCB gives no handling', () => errGeneric('send-keys', 'ErrSendKeysBroken', `the keystrokes broke (${sentinelInMessage('send-keys-generic')})`)],
+    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('send-keys')],
+  ]
+  /** Where the keystrokes meet the error: the label, the refusal line's call, the harness options and the send-keys made. */
+  const SEND_KEYS_POSITIONS = [
+    ['at the first try', 'send-keys', (err: Error) => ({ sendKeysThrows: err }), 1],
+    ['at the retry after ErrTmuxSendKeys', 'retry send-keys after ErrTmuxSendKeys', (err: Error) => ({ sendKeysErrors: [errTmuxSendKeys(), err] }), 2],
+  ] as const
+  test.each(UNCLASSIFIED_SEND_KEYS_ERRORS.flatMap(([label, build]) =>
+    SEND_KEYS_POSITIONS.map(([where, what, sendKeys, sends]) => [label, where, what, sendKeys, sends, build] as const),
+  ))("b.jg5 SRJ-313: send-keys answers %s (UNCLASSIFIED) %s → 'transient', never 'escalate-dead'; no sweep, kill or launch, no spawn-failure notice; one described refusal line; nothing leaks", async (_label, _where, what, sendKeys, sends, build) => {
+    const err = build()
+
+    const { result, errArgs, raised, sendKeysCalls, findMissingCalls, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({
+      statusState: 'waiting',
+      ...sendKeys(err),
+    })
+
+    expect(result).toBe('transient')
+    expect(sendKeysCalls).toHaveLength(sends)
+    expect(findMissingCalls).toHaveLength(0)
+    expect([killCalls, spawnCalls, resumeCalls]).toEqual([[], [], []])
+    expect(raised).toEqual([])
+    const lines = stringLines(errArgs)
+    expect(lines.filter((l) => l.includes(' refused for persona=C1'))).toEqual([sendKeysRefusedLine(what, err)])
+    expect(lines.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
+    expect(lines.filter((l) => l.includes(' failed for persona=C1'))).toEqual([])
+    assertNoLeak({ errArgs })
+  })
+
+  // A class that is no refusal still raises the spawn-failure notice: an
+  // UNUSABLE NAME `ErrInternal` (its own handling, SRJ-105) answers
+  // 'transient' with one notice and no refusal line (the contrast that shows
+  // the notice spy above is live).
+  test("SRJ-105 contrast: send-keys answering an UNUSABLE NAME ErrInternal (no refusal) → 'transient' with one spawn-failure notice and no refusal line", async () => {
+    const { result, errArgs, raised, findMissingCalls } = await reconnectCapturing({ statusState: 'waiting', sendKeysThrows: errUnusableName() })
 
     expect(result).toBe('transient')
     expect(findMissingCalls).toHaveLength(0)
@@ -2132,9 +2251,10 @@ describe('_buildReconnectSessionAdapter', () => {
   // the reconnect's keystrokes, a `working` or prompt row whose tmux session
   // is gone (`sweepDeadTmuxChannelWithCause`), and a live prompt row's
   // deferral from 10 min on (`checkPromptRowDeferral`, which then reads no
-  // row and raises no notice). One described refusal line; nothing leaks. A
-  // sweep failing with another class keeps today's handling: one "proceeding"
-  // line and the verdict as before.
+  // row and raises no notice). One described refusal line; nothing leaks. An
+  // UNCLASSIFIED failure (b.jg5 SRJ-313) is the same refusal. A sweep failing
+  // with a class that is no refusal (UNUSABLE NAME) logs one "proceeding"
+  // line and keeps the verdict.
   describe('b.jg5 SRJ-105: a refused findMissing sweep on the restart path', () => {
     type SweepSite = {
       /** The harness options that lead the adapter to the sweep. */
@@ -2212,8 +2332,14 @@ describe('_buildReconnectSessionAdapter', () => {
       await expectRefused(WORKING_TMUX_GONE, build('find-missing'), redacted)
     })
 
-    test.each(SWEEP_SITES)("contrast: the sweep at %s failing with an UNCLASSIFIED error (ErrInternal) keeps today's handling → 'escalate-dead' at the swept attempt, one 'proceeding' line and no refusal line", async (_label, site) => {
-      const err = errInternal()
+    // b.jg5 SRJ-313: an UNCLASSIFIED sweep failure (ErrInternal) is the same
+    // refusal (find-missing is not a read verb).
+    test.each(SWEEP_SITES)("b.jg5 SRJ-313: the sweep at %s refused with an UNCLASSIFIED error (ErrInternal) → 'transient', never 'escalate-dead'; no row read after it, no kill or launch; one described refusal line", async (_label, site) => {
+      await expectRefused(site, errInternal(`the store could not be read (${sentinelInMessage('sweep-internal')})`), false)
+    })
+
+    test.each(SWEEP_SITES)("contrast: the sweep at %s failing with an UNUSABLE NAME ErrInternal (no refusal) → 'escalate-dead' at the swept attempt, one 'proceeding' line and no refusal line", async (_label, site) => {
+      const err = errUnusableName()
       const r = await sweepFailing(site, err)
 
       expect(r.verdicts).toEqual([...site.minutes.slice(0, -1).map(() => 'transient'), 'escalate-dead'])
@@ -2236,10 +2362,12 @@ describe('_buildReconnectSessionAdapter', () => {
 // described line, so the restart work launches nothing; so does an
 // ENVIRONMENT kill (`ErrTmuxNotAvailable`, b.jg5 SRJ-311), which also raises
 // `tmux-unavailable`, and a CONFIG kill (`ErrConfigMalformed`, b.jg5
-// SRJ-316), which also raises `ad-config-malformed`; success and
-// `ErrSpawnNotFound` answer nothing ("go
-// on"); `ErrSystemInstallDisappeared` and every other class keep today's
-// handling (go on). The kill follows a `dead`
+// SRJ-316), which also raises `ad-config-malformed`, and an UNCLASSIFIED
+// kill (b.jg5 SRJ-313: an `ErrInternal`, a store-open name, a name CSCB gives
+// no handling, `ErrSystemInstallDisappeared`, which also raises
+// `ad-unreachable`), which the wrapper reports to the unclassified sink;
+// success and `ErrSpawnNotFound` answer nothing ("go on"), and so does every
+// other class, with one error line. The kill follows a `dead`
 // reading, so it is declared as not of a row read live: not tmux-touching, it
 // never starts (or, on success, ends) the `tmux-unresponsive` condition. The
 // outage state's trigger and condition sinks are spies.
@@ -2252,6 +2380,10 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
   let starts: Array<{ key: string; verb: string }>
   let ends: string[]
   let emissions: Array<{ key: string; text: string }>
+  /** Every report to the unclassified sink: its key and whether it was the kill's own error. */
+  let reports: Array<{ key: string; same: boolean }>
+  /** The error the stub's `kill` answers, for `reports`. */
+  let killErr: Error | undefined
 
   /** The adapter's refusal line for persona C1. */
   const refusedLine = (err: unknown): string =>
@@ -2259,6 +2391,7 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
 
   /** Install a stub whose `kill` answers `killError` (default: success), with spy sinks. */
   function install(killError?: Error): StubClient {
+    killErr = killError
     const stub = makeStubClient({ killCalls, killError })
     _resetOutageState()
     initOutageState({
@@ -2269,6 +2402,7 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
         start: (key, verb) => { starts.push({ key, verb }) },
         end: (key) => { ends.push(key) },
       },
+      unclassifiedSink: { report: (key, error) => { reports.push({ key, same: error === killErr }) } },
     })
     setClientForTests(stub as unknown as Client)
     return stub
@@ -2289,6 +2423,8 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
     starts = []
     ends = []
     emissions = []
+    reports = []
+    killErr = undefined
   })
 
   afterEach(() => {
@@ -2412,31 +2548,44 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
     assertNoLeak({ errArgs, emissions })
   })
 
-  // The `ad-unreachable` branch is unchanged: the flag is raised by the
-  // wrapper and the adapter goes on, with no refusal line.
+  // b.jg5 SRJ-105, SRJ-110, SRJ-313: an UNCLASSIFIED kill is a refusal too:
+  // the adapter reports the stop to the restart work (`KILL_SESSION_REFUSED`)
+  // and makes no second call, so no step follows. The wrapper arms the timer
+  // once with the UNCLASSIFIED cause and, inside the attempt, reports the
+  // error once to the unclassified sink; it starts no condition.
+  // `ErrSystemInstallDisappeared` also raises `ad-unreachable` with its onset;
+  // nothing else posts.
   test.each([
+    ['ErrInternal', () => errInternal(`the store could not be read (${sentinelInMessage('kill-internal')})`), undefined],
+    ['a store agent-director cannot open (ErrSchemaMismatch)', () => errSchemaMismatch(`the store could not be opened (${sentinelInMessage('kill-schema')})`), undefined],
+    ['a name CSCB gives no handling', () => errGeneric('kill', 'ErrKillBroken', `the kill broke (${sentinelInMessage('kill-generic')})`), undefined],
     ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('kill'), 'ad-unreachable'],
-  ] as const)('kill answers %s → answers nothing (go on); its outage flag is raised; no refusal line, no condition', async (_label, build, flag) => {
-    install(build())
+  ] as const)('b.jg5 SRJ-313: kill answers %s (UNCLASSIFIED) → KILL_SESSION_REFUSED with no second kill; one described refusal line; the timer armed once with the unclassified cause; reported once to the unclassified sink; no condition; nothing leaks', async (_label, build, flag) => {
+    const err = build()
+    install(err)
 
     const { result, errArgs } = await killInAttempt()
 
-    expect(result).toBeUndefined()
-    expect(killCalls).toHaveLength(1)
-    expect(getOutageFlags('C1').has(flag)).toBe(true)
-    expect(stringLines(errArgs).filter((l) => l.includes('kill refused'))).toEqual([])
+    expect(result).toBe(KILL_SESSION_REFUSED)
+    expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual([refusedLine(err)])
+    expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+    expect(reports).toEqual([{ key: 'C1', same: true }])
     expect(starts).toEqual([])
+    expect(ends).toEqual([])
+    expect([...getOutageFlags('C1')]).toEqual(flag === undefined ? [] : [flag])
+    expect(emissions.map((e) => e.key)).toEqual(flag === undefined ? [] : ['C1'])
+    assertNoLeak({ errArgs, emissions })
   })
 
-  // Every other class keeps today's handling: one "error for persona" line
-  // and the launch follows (nothing answered); a kill is no read, so nothing
-  // is armed either.
+  // Every other class is no refusal: one "error for persona" line and the
+  // launch follows (nothing answered); a kill is no read, so nothing is armed
+  // or reported either.
   test.each([
-    ['an UNCLASSIFIED ErrInternal', () => errInternal()],
     ['an UNUSABLE NAME ErrInternal', () => errUnusableName()],
     ['a STATE name (ErrSpawnNotResumable)', () => errSpawnNotResumable()],
     ['a GONE name (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(undefined, 'kill')],
-  ])("kill answers %s → today's handling: answers nothing (go on) with one error line; nothing armed, no condition", async (_label, build) => {
+  ])("kill answers %s → answers nothing (go on) with one error line; nothing armed or reported, no condition", async (_label, build) => {
     const err = build()
     install(err)
 
@@ -2448,6 +2597,7 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
       `[slack] killSession (restart adapter): error for persona=C1: ${describeThrownValue(err)}`,
     ])
     expect(triggers).toEqual([])
+    expect(reports).toEqual([])
     expect(starts).toEqual([])
     assertNoLeak({ errArgs })
   })

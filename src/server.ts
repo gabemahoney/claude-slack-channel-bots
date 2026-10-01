@@ -115,8 +115,11 @@ import { createPersonaNotifier } from './persona-notifier.ts'
 import {
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
+  createUnclassifiedErrorEpisodes,
+  PERSONA_UNCLASSIFIED_ERROR_LABEL,
   TMUX_UNRESPONSIVE_END_RETRY,
   TMUX_UNRESPONSIVE_END_TICK,
+  UNCLASSIFIED_ERROR_END_CAPPED,
   type PersonaEpisodes,
 } from './persona-episodes.ts'
 import { createPersonaDestinations } from './persona-destination.ts'
@@ -147,7 +150,6 @@ import { ErrSpawnNotFound, resolveSystemBinary } from 'agent-director'
 import {
   ERR_SPAWN_NOT_FOUND_NAME,
   ERR_SYSTEM_INSTALL_DISAPPEARED_NAME,
-  ErrSystemInstallDisappeared,
 } from './agent-director-errors.ts'
 import {
   AD_CALL_KILL_ROW_NOT_READ_LIVE,
@@ -879,9 +881,10 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // nothing), so no retry is pending after this and none fires.
   unavailableRetry?.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
   // b.jg5 SRJ-1016: every persona's notice episodes end silently, which
-  // cancels every tmux-unresponsive alert check, and none begins again (a
-  // launch still in flight that meets UNAVAILABLE starts no condition), so
-  // nothing is posted and no alert check is pending after this.
+  // cancels every tmux-unresponsive alert check and ends every
+  // unclassified-error episode, and none begins again (a launch still in
+  // flight that meets UNAVAILABLE or UNCLASSIFIED starts no condition and no
+  // episode), so nothing is posted and no alert check is pending after this.
   personaEpisodes?.close()
   // Every persona's bring-up retry (directory re-checks); the manager's Slack
   // retries stop with stopAll() below.
@@ -1043,7 +1046,11 @@ export async function _runCallTimeoutStartStep(
  * it arms the persona's retry timer (b.jg5 SRJ-301), and from the health
  * tick, which runs outside every attempt, it arms nothing, except for an
  * ENVIRONMENT or CONFIG answer, which arms the persona's timer in any context
- * (b.jg5 SRJ-311, SRJ-316).
+ * (b.jg5 SRJ-311, SRJ-316). Inside a restart run an UNCLASSIFIED answer (an
+ * `ErrInternal`, a store-open name, a name CSCB gives no handling) is also
+ * reported to the persona's unclassified-error episode (b.jg5 SRJ-313), but
+ * `ErrSystemInstallDisappeared` is not: it keeps its `dead` reading (SRJ-105,
+ * SRJ-314). From the health tick nothing is reported.
  *
  * @internal
  */
@@ -1070,7 +1077,12 @@ export function _buildIsSessionAliveAdapter(
     } catch (err) {
       // b.jg5 SRJ-301: inside a restart run (a recovery attempt) a status
       // error arms the persona's retry timer, whatever the reading below.
-      reportAgentDirectorError(key, err, 'status')
+      // b.jg5 SRJ-313: an UNCLASSIFIED status there is reported to the
+      // persona's unclassified-error episode, except ErrSystemInstallDisappeared,
+      // which keeps its `dead` reading (SRJ-105, SRJ-314).
+      reportAgentDirectorError(key, err, 'status', {
+        reportUnclassified: !hasAdErrorName(err, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME),
+      })
       return statusErrorReading(key, err)
     }
   }
@@ -1187,19 +1199,22 @@ export function _buildStatRouteImpl(deps?: {
  * would (`holdLaunchIfConfigDirUnresolvable`); the launch that follows is then
  * refused by the relaunch gate (`'skipped'`), counting no failure.
  *
- * b.jg5 SRJ-105, SRJ-110, SRJ-311, SRJ-316: a kill that meets an
+ * b.jg5 SRJ-105, SRJ-110, SRJ-311, SRJ-313, SRJ-316: a kill that meets an
  * UNAVAILABLE outcome (by name, `ErrTmuxKillFailed` included), an
  * ENVIRONMENT answer (`ErrTmuxNotAvailable`, which also raises
  * `tmux-unavailable` and arms the persona's retry timer through the outage
- * wrapper) or a CONFIG answer (`ErrConfigMalformed`, which the wrapper turns
- * into the `ad-config-malformed` outage and an armed retry timer) answers
- * `KILL_SESSION_REFUSED`, decided by the arming predicate
+ * wrapper), a CONFIG answer (`ErrConfigMalformed`, which the wrapper turns
+ * into the `ad-config-malformed` outage and an armed retry timer) or an
+ * UNCLASSIFIED answer (an `ErrInternal` other than an unusable recorded name,
+ * a store-open name, `ErrSystemInstallDisappeared`, whose wrapper also raises
+ * `ad-unreachable`, or any name CSCB gives no handling; the wrapper arms the
+ * persona's retry timer and reports it to its unclassified-error episode)
+ * answers `KILL_SESSION_REFUSED`, decided by the arming predicate
  * (`unavailableRetryCauseFor`, by name through `src/ad-error-class.ts`), and
- * the restart work launches nothing and counts nothing: the refused outcome.
- * The kill is not repeated.
- * `ErrSpawnNotFound` and `ErrSystemInstallDisappeared` resolve with nothing,
- * as before, and every other kill error is ignored as before; the launch
- * follows.
+ * the restart work launches nothing and counts nothing: the refused outcome
+ * (SRJ-110: "No step follows"). The kill is not repeated.
+ * `ErrSpawnNotFound` resolves with nothing, as before, and every other kill
+ * error is ignored as before; the launch follows.
  *
  * @param getPersona  The applied persona with a key (production:
  *   `getAppliedPersona`); without it the directory is not checked here.
@@ -1229,10 +1244,10 @@ export function _buildKillSessionAdapter(
       )
     } catch (err) {
       if (err instanceof ErrSpawnNotFound) return
-      if (err instanceof ErrSystemInstallDisappeared) return
-      // b.jg5 SRJ-105, SRJ-311, SRJ-316: an UNAVAILABLE kill
+      // b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: an UNAVAILABLE kill
       // (`ErrTmuxKillFailed` included), an ENVIRONMENT kill
-      // (`ErrTmuxNotAvailable`) or a CONFIG kill (`ErrConfigMalformed`),
+      // (`ErrTmuxNotAvailable`), a CONFIG kill (`ErrConfigMalformed`) or an
+      // UNCLASSIFIED kill (`ErrSystemInstallDisappeared` included),
       // classified by name, is a refusal: the restart work launches nothing.
       if (unavailableRetryCauseFor(err, AD_VERB_KILL) !== undefined) {
         console.error(
@@ -1867,6 +1882,26 @@ export async function main(): Promise<void> {
   })
   personaEpisodes = noticeEpisodes
 
+  // b.jg5 SRJ-313, SRJ-1009: each persona's unclassified-error episode, held
+  // in the notice episodes (so a teardown forgets it and shutdown closes it).
+  // The outage state's reporting point feeds it each UNCLASSIFIED outcome in a
+  // launch or recovery attempt (installed as its unclassified sink below,
+  // before the start pass). Its one alert per episode is posted at the first
+  // such outcome met longer than agent-director's alert threshold in effect
+  // (SRJ-210) after the episode's first: to the persona's destination while
+  // the persona is in the applied configuration, else written only to the
+  // server log and startup-errors.log (`persona-unclassified-error`, SRJ-1013).
+  // It ends on a retry that finds nothing left to recover or, pending-only,
+  // reads the row live out of `pending` (the retry timer's stop observer
+  // below), and at the restart cap (`onCapReached`).
+  const unclassifiedErrors = createUnclassifiedErrorEpisodes({
+    episodes: noticeEpisodes,
+    log: (line) => console.error(line),
+    alertThresholdMs: adAlertThresholdMsInEffect,
+    isConfigured: (key) => getAppliedPersona(key) !== undefined,
+    logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `persona=${key}: ${text}`),
+  })
+
   // b.jg5 SRJ-315: true while work is in flight for the persona (today only
   // a launch call, `isLaunchInFlight`). Today this one predicate serves both
   // the retry timer (`isInFlight`) and the health tick (`isLaunchInFlight`).
@@ -1898,10 +1933,26 @@ export async function main(): Promise<void> {
   // of `pending`, connected with its stream) also clears the persona's
   // `tmux-unavailable` outage, with that reading, which the cleared-flag
   // observer below passes on to the timer's condition-end entry.
+  // b.jg5 SRJ-313: the same stop observer then tells the unclassified-error
+  // episodes, which end the persona's episode only when the stop's reason is
+  // that a retry found nothing left to recover or that a pending-only retry
+  // read the row live out of `pending`. Each consumer is isolated, so
+  // one that throws does not skip the other.
   const retryTimers = createUnavailableRetryController({
     log: (line) => console.error(line),
     onRetryFire: (key, firedAt) => tmuxUnresponsive.onsetAtRetry(key, firedAt),
-    onStopped: (key, reason) => tmuxUnresponsive.cancelAlert(key, reason),
+    onStopped: (key, reason) => {
+      try {
+        tmuxUnresponsive.cancelAlert(key, reason)
+      } catch {
+        /* isolated: the episode's stop handler still runs */
+      }
+      try {
+        unclassifiedErrors.retryStopped(key, reason)
+      } catch {
+        /* isolated: a stop never fails because of an observer */
+      }
+    },
     action: createFullModeRetryAction({
       retry: runRestartRetry,
       appliedPersona: getAppliedPersona,
@@ -1944,9 +1995,11 @@ export async function main(): Promise<void> {
   // a notice until the persona's client is available and logs instead of
   // posting in dry run. An agent-director error inside a launch or recovery
   // attempt, or an ENVIRONMENT answer from any call, arms the persona's retry
-  // timer through the trigger sink, and a tmux-touching call's UNAVAILABLE
+  // timer through the trigger sink, a tmux-touching call's UNAVAILABLE
   // there starts the persona's tmux-unresponsive condition through the
-  // condition sink. b.jg5 SRJ-305, SRJ-306: each real clear of a persona's
+  // condition sink, and an UNCLASSIFIED answer there (a row read's included)
+  // reaches the persona's unclassified-error episode through the
+  // unclassified sink (b.jg5 SRJ-313). b.jg5 SRJ-305, SRJ-306: each real clear of a persona's
   // `tmux-unavailable` outage (never the silent boot or teardown reset) is
   // reported once to the retry controller's condition-end entry, with the
   // reading the clear brought (the live reading of a tick or a retry that
@@ -1959,6 +2012,7 @@ export async function main(): Promise<void> {
     getClient,
     triggerSink: retryTimers,
     conditionSink: tmuxUnresponsive,
+    unclassifiedSink: unclassifiedErrors,
     onFlagCleared: (key, cls, reading) => {
       if (cls === 'tmux-unavailable') {
         retryTimers.conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE, reading)
@@ -2305,8 +2359,21 @@ export async function main(): Promise<void> {
     },
     getRestartDelay: () => appliedConfig.session_restart_delay,
     isShuttingDown: () => shuttingDown,
-    // The persona's restart-cap notice (SR-25.3), built in the session manager.
-    onCapReached: (key) => notifyRestartCapReached(key),
+    // The persona's restart-cap notice (SR-25.3), built in the session
+    // manager. b.jg5 SRJ-313: reaching the cap also ends the persona's
+    // unclassified-error episode silently; each step is isolated.
+    onCapReached: (key) => {
+      try {
+        notifyRestartCapReached(key)
+      } catch {
+        /* isolated: the episode still ends */
+      }
+      try {
+        unclassifiedErrors.end(key, UNCLASSIFIED_ERROR_END_CAPPED)
+      } catch {
+        /* isolated: the cap notice is unaffected */
+      }
+    },
     // b.av2 SR-6.6: a fired timer's work waits its turn behind any lifecycle
     // operation for the persona.
     serialize: personaLifecycle.run,
