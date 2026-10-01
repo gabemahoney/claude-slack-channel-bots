@@ -214,6 +214,7 @@ import {
   sweepDeadTmuxChannel,
   TRUST_DIALOG_NEEDLE,
   type ApproverStopReason,
+  type ApproverVerb,
   type SpawnPersonaResult,
 } from '../src/session-manager.ts'
 import {
@@ -310,6 +311,7 @@ import {
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
 import {
+  APPROVER_VERB_CALLS,
   NO_LAUNCH_START_FORMS,
   NO_LAUNCH_START_FORM_NAMES,
   conflictForPersona,
@@ -1239,10 +1241,6 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
 // calls are outside every launch or recovery attempt (SRJ-301, SRJ-313).
 // ---------------------------------------------------------------------------
 
-/** The approver's three verbs, and the stub call list each one is counted in. */
-const APPROVER_VERB_CALLS = { 'status': 'statusCalls', 'read-pane': 'readPaneCalls', 'send-keys': 'sendKeysCalls' } as const
-type ApproverVerb = keyof typeof APPROVER_VERB_CALLS
-
 /**
  * Stub answers under which a dialog approver's `verb` call meets `err`: the
  * row reads `pending` (with the stub's default launch start) for `read-pane`
@@ -1317,14 +1315,11 @@ describe('unavailable retry: P’s dialog approver is in flight for P, blocks no
     expectNothingArmed(h)
   })
 
+  // One answer of each class here; the harness-level matrix over every form
+  // and verb lives with the session manager's approver cases.
   test.each<[string, ApproverVerb, () => Error]>([
-    ...UNAVAILABLE_VALUES.map(([what, make]) => [`UNAVAILABLE (${what})`, 'read-pane', () => make('read-pane')] as [string, ApproverVerb, () => Error]),
-    ['UNAVAILABLE (ErrCallTimeout)', 'status', () => errCallTimeout('status')],
-    ['UNAVAILABLE (ErrTmuxUnresponsive)', 'send-keys', () => errTmuxUnresponsive('send-keys')],
-    ...(['status', 'read-pane', 'send-keys'] as const).flatMap((verb): Array<[string, ApproverVerb, () => Error]> => [
-      ['UNCLASSIFIED (ErrInternal with no recognised phrase)', verb, () => errInternal()],
-      ['UNCLASSIFIED (ErrSchemaMismatch)', verb, () => errSchemaMismatch()],
-    ]),
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', 'read-pane', () => errTmuxUnresponsive('read-pane')],
+    ['UNCLASSIFIED (ErrInternal with no recognised phrase)', 'send-keys', () => errInternal()],
   ])('%s answering the dialog approver’s %s, after the launch returned, arms no timer, adds no cause to an armed one, opens no episode and counts nothing', async (_what, verb, make) => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key, other] = h.keys as [string, string]
@@ -1380,28 +1375,6 @@ describe('unavailable retry: P’s dialog approver is in flight for P, blocks no
     expect(h.controller.armedKeys()).toEqual([other])
     expect(h.controller.view(other)).toEqual(otherView)
     expect(h.episodeNotices).toEqual([])
-  })
-
-  test.each<[string, () => Error, OutageClass, UnavailableRetryCause['kind']]>([
-    ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'read-pane'), 'tmux-unavailable', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
-    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), 'ad-config-malformed', UNAVAILABLE_RETRY_CAUSE_CONFIG],
-  ])('%s answering the dialog approver’s read-pane, after the launch returned, raises %s for P and arms P’s timer once at the base wait, as from any verb; Q is untouched', async (_what, make, flag, kind) => {
-    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
-    const [key, other] = h.keys as [string, string]
-    h.script(approverCallMeets('read-pane', make()))
-
-    await h.launch(key)
-    await h.settle()
-
-    expect(personaCallCounts(h, key)).toMatchObject({ readPaneCalls: 1 })
-    expect([...getOutageFlags(key)]).toEqual([flag])
-    expect(h.triggers).toEqual([{ key, kind }])
-    expect(h.controller.armedKeys()).toEqual([key])
-    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', waitMs: waitMs(0), refusals: 0, causes: [kind] })
-    expect(h.unclassifiedErrorOpen(key)).toBe(false)
-    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-    expect(getFailureCount(key)).toBe(0)
-    expect(getOutageFlags(other).size).toBe(0)
   })
 })
 

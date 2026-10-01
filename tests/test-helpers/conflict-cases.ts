@@ -326,6 +326,13 @@ const APPROVER_SITE_VERB: Readonly<Record<ApproverSite, ApproverVerb>> = Object.
 /** Every approver site kind, in lap order: `status`, `read-pane`, `send-keys`. */
 export const APPROVER_SITES: readonly ApproverSite[] = Object.freeze(Object.keys(APPROVER_SITE_VERB) as ApproverSite[])
 
+/** The stub call list (`StubCallLog`) each approver verb is counted in, in lap order. */
+export const APPROVER_VERB_CALLS: Readonly<Record<ApproverVerb, 'statusCalls' | 'readPaneCalls' | 'sendKeysCalls'>> = Object.freeze({
+  'status': 'statusCalls',
+  'read-pane': 'readPaneCalls',
+  'send-keys': 'sendKeysCalls',
+})
+
 /** Whether `site` is one of the dialog approver's site kinds. */
 export function isApproverSite(site: string): site is ApproverSite {
   return Object.hasOwn(APPROVER_SITE_VERB, site)

@@ -429,6 +429,7 @@ import {
   APPROVER_CONFLICT_CASE_ROWS,
   APPROVER_SITES,
   APPROVER_UNUSABLE_NAME_CASE_ROWS,
+  APPROVER_VERB_CALLS,
   CONFLICT_CASE_ROWS,
   LAUNCH_START_ABSENT_PERSONA_KEY,
   LAUNCH_START_AND_NOTE_ROW,
@@ -440,6 +441,7 @@ import {
   cscbOwnLines,
   cscbOwnText,
   expectedConflictNotice,
+  expectedLatchRecord,
   isApproverSite,
   launchStartRecord,
   sessionEndingCommandsIn,
@@ -3220,9 +3222,6 @@ function approverVerbOf(site: string): ApproverVerb {
   return site.slice('approver '.length) as ApproverVerb
 }
 
-/** The stub call list each approver verb is counted in, in lap order. */
-const APPROVER_VERB_CALLS: Readonly<Record<ApproverVerb, string>> = { 'status': 'statusCalls', 'read-pane': 'readPaneCalls', 'send-keys': 'sendKeysCalls' }
-
 /** The calls one approver lap makes up to and including its call at `verb`, by verb (one each). */
 function lapCallsThrough(verb: ApproverVerb): Record<string, number> {
   const verbs = APPROVER_SITES.map(approverVerbOf)
@@ -3233,7 +3232,7 @@ function lapCallsThrough(verb: ApproverVerb): Record<string, number> {
 interface ApproverLatchCase {
   readonly verb: ApproverVerb
   readonly build: () => Error
-  readonly record: (key: string) => Partial<ConflictLatchRecord>
+  readonly record: (key: string) => ConflictLatchRecord
   readonly notice: (key: string) => string
 }
 
@@ -3241,8 +3240,9 @@ interface ApproverLatchCase {
  * Every approver row of the helper's tables: each CONFLICT its `read-pane`
  * and `send-keys` can meet on a `pending` row records P's next check or
  * recovery and `pending` (b.jg5 SRJ-501, typed here from the SRD, not read
- * from the row); each UNUSABLE NAME at its `status`, `read-pane` and
- * `send-keys` holds the row's whole record (refused operation none).
+ * from the row) beside the row's quoted session and description, as a whole
+ * record; each UNUSABLE NAME at its `status`, `read-pane` and `send-keys`
+ * holds the row's whole record (refused operation none).
  */
 const APPROVER_LATCH_CASES: ReadonlyArray<readonly [string, ApproverLatchCase]> = [
   ...APPROVER_CONFLICT_CASE_ROWS.map((row): readonly [string, ApproverLatchCase] => [
@@ -3250,12 +3250,14 @@ const APPROVER_LATCH_CASES: ReadonlyArray<readonly [string, ApproverLatchCase]> 
     {
       verb: approverVerbOf(row.site),
       build: row.build,
-      record: () => ({
-        sessionName: row.sessionName,
-        latchCase: row.latchCase,
-        refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
-        rowState: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
-      }),
+      record: (key) =>
+        expectedLatchRecord(key, {
+          sessionName: row.sessionName,
+          latchCase: row.latchCase,
+          refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+          rowState: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
+          description: row.build().errDescription,
+        }),
       notice: () => row.notice.text,
     },
   ]),
@@ -3357,7 +3359,7 @@ describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latc
     // P: its lap's calls up to the refused one and none after; one latch through the latch's set entry, one post; nothing armed, counted or noticed.
     expect((await h.runApproverToStop(p))?.reason).toBe(APPROVER_STOP_LATCHED)
     expect(personaCallCounts(h, p)).toEqual({ spawnCalls: 1, ...lapCallsThrough(c.verb) })
-    expect(h.latch.record(p)).toMatchObject(c.record(p))
+    expect(h.latch.record(p)).toEqual(c.record(p))
     expect(latchSteps(h)).toEqual(oneLatch(p))
     expect(h.episodeNotices).toEqual([{ key: p, text: c.notice(p) }])
     expect([h.triggers, h.controller.armedKeys(), getFailureCount(p), h.notices]).toEqual([[], [], 0, []])

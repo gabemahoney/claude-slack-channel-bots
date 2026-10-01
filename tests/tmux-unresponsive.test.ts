@@ -131,7 +131,7 @@ import {
 import { personaInstanceId } from '../src/persona-identity.ts'
 import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
-import { killPersonaInstance, reconcileOrphans, TRUST_DIALOG_NEEDLE } from '../src/session-manager.ts'
+import { killPersonaInstance, reconcileOrphans, TRUST_DIALOG_NEEDLE, type ApproverVerb } from '../src/session-manager.ts'
 import {
   runInAttempt,
   UNAVAILABLE_RETRY_BASE_S,
@@ -166,7 +166,7 @@ import {
   unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
 import type { AdConfigTables } from './test-helpers/ad-settings.ts'
-import { conflictForPersona, conflictNoticeForPersona } from './test-helpers/conflict-cases.ts'
+import { APPROVER_VERB_CALLS, conflictForPersona, conflictNoticeForPersona } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import {
   collided,
@@ -399,11 +399,11 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
 
   // The dialog approver runs after its launch call returned, outside every
   // launch or recovery attempt (SRJ-401, SRJ-307; hatch A2), as the tick's
-  // read does: none of its calls starts the condition or arms the timer.
-  test.each<[string, 'status' | 'read-pane' | 'send-keys', (verb: string) => Error]>([
-    ...TMUX_STARTING_FORMS.flatMap(([what, make]) =>
-      (['read-pane', 'send-keys'] as const).map((verb): [string, 'read-pane' | 'send-keys', (verb: string) => Error] => [what, verb, make]),
-    ),
+  // read does: none of its calls starts the condition or arms the timer. One
+  // starting form per pane verb, and AC 27's form at its status.
+  test.each<[string, ApproverVerb, (verb: string) => Error]>([
+    ['ErrTmuxUnresponsive', 'read-pane', errTmuxUnresponsive],
+    ['ErrTmuxUnresponsive', 'send-keys', errTmuxUnresponsive],
     ['AC 27: ErrCallTimeout', 'status', errCallTimeout],
   ])('%s answering the dialog approver’s %s, after the launch returned, starts nothing, posts nothing and arms nothing', async (_what, verb, make) => {
     const { h, p, b } = build()
@@ -419,8 +419,7 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expect(await h.launch(p)).toMatchObject({ key: p, action: 'spawned' })
     await h.settle()
 
-    const calls = { 'status': h.stub.calls.statusCalls, 'read-pane': h.stub.calls.readPaneCalls, 'send-keys': h.stub.calls.sendKeysCalls }[verb]
-    expect(calls).toHaveLength(1)
+    expect(h.stub.calls[APPROVER_VERB_CALLS[verb]]).toHaveLength(1)
     expect(h.approverRunning(p)).toBe(true)
     expect(h.triggers).toEqual([])
     expectNeverStarted(h, p)

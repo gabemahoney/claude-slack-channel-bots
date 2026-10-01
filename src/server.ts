@@ -1572,9 +1572,11 @@ export function _buildKillSessionAdapter(
   // `key` is the persona key.
   return async (key: string) => {
     // The launch call only, not a running dialog approver (b.jg5 SRJ-401):
-    // this kill follows a `dead` reading, a row that is not `pending`, on
-    // which the approver has stopped. So do the reconnect verdicts' checks
-    // (`promptRowReconnectVerdict`, `workingReconnectVerdict`).
+    // this kill can run while an approver still runs for the persona (an
+    // approver reads the row again only at its next lap, or once its call in
+    // progress returns). That approver then meets GONE, or is superseded by
+    // a newer launch's, and stops. So the kill checks `isLaunchInFlight` only, as do the
+    // reconnect verdicts (`promptRowReconnectVerdict`, `workingReconnectVerdict`).
     if (isLaunchInFlight(key)) {
       console.error(`[slack] killSession (restart adapter): launch already in flight for persona=${key} — not killing`)
       return

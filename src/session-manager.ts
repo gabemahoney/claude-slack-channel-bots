@@ -217,6 +217,7 @@ import {
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNUSABLE_NAME,
   adKillCall,
+  type AdErrorClass,
   type AdKillCall,
   type AdVerb,
   classifyAdError,
@@ -2486,17 +2487,19 @@ function approverStopOrLatched(ctx: ApproverContext): ApproverStopReason | undef
  * posted to any notifier (b.jg5 SRJ-405). Resolves with why it stopped;
  * never rejects.
  *
- * This runs one approver in the caller's context and outside the registry:
- * nothing can stop it but its own rules. A launch starts its approver
- * through the registry instead (`startDialogApprover`), which runs it
- * outside every launch or recovery attempt and stops it on request.
+ * Production starts an approver only through the registry
+ * (`startDialogApprover`), which runs it outside every launch or recovery
+ * attempt and stops it on request; direct calls are for tests. A direct
+ * call runs one approver outside the registry, so nothing can stop it but
+ * its own rules, and outside every launch or recovery attempt
+ * (`runOutsideAttempts`), whatever attempt the caller runs in.
  */
 export async function approvePreSessionDialogs(
   key: string,
   isStartup: boolean,
   ref: string = keyRef(key),
 ): Promise<ApproverStopReason> {
-  return runApproverLoop(key, isStartup, ref, newApproverRun())
+  return runOutsideAttempts(() => runApproverLoop(key, isStartup, ref, newApproverRun()))
 }
 
 /**
@@ -2623,8 +2626,9 @@ type ApproverAnswer = { readonly stop: ApproverStopReason } | { readonly backOff
 /**
  * One approver lap (`approvePreSessionDialogs`): answers the stop reason, or
  * how the lap ended to poll on. A stop asked of the approver during a call
- * is answered as soon as that call returns, before anything else. Never
- * throws.
+ * is answered as soon as that call returns, before anything else, except
+ * that a pane call's CONFLICT or UNUSABLE NAME answer still latches the
+ * persona first (`approverStoppedDuringCall`). Never throws.
  */
 async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | ApproverLapGoesOn> {
   const { key, isStartup, ref, at, run } = ctx
@@ -2687,7 +2691,7 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
     )
     pane = result.pane
   } catch (err) {
-    if (run.stopRequested !== undefined) return run.stopRequested
+    if (run.stopRequested !== undefined) return approverStoppedDuringCall(ctx, 'read-pane', err, run.stopRequested)
     const answer = approverAnswerTo(ctx, 'read-pane', err)
     return 'stop' in answer ? answer.stop : { ...goesOn, backOff: answer.backOff }
   }
@@ -2700,7 +2704,7 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
       client.sendKeys({ claude_instance_id, text: '', allow_pending: true }),
     )
   } catch (err) {
-    if (run.stopRequested !== undefined) return run.stopRequested
+    if (run.stopRequested !== undefined) return approverStoppedDuringCall(ctx, 'send-keys', err, run.stopRequested)
     const answer = approverAnswerTo(ctx, 'send-keys', err)
     return 'stop' in answer ? answer.stop : { ...goesOn, backOff: answer.backOff }
   }
@@ -2729,16 +2733,7 @@ function approverAnswerTo(ctx: ApproverContext, verb: ApproverVerb, err: unknown
     console.error(approverLogLine(approverNotInteractiveMessage(ref, verb, failure)))
     return { stop: APPROVER_STOP_NOT_INTERACTIVE }
   }
-  if (errorClass === AD_ERROR_CLASS_CONFLICT) {
-    // The latch is set first; its line then carries what became of it.
-    logApproverLine(approverConflictMessage(ref, verb, failure, approverLatchOnConflict(ctx, verb, err)))
-    return { stop: APPROVER_STOP_LATCHED }
-  }
-  if (errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
-    ctx.run.stopRequested ??= APPROVER_STOP_LATCHED // the latch's set observer then finds it stopping
-    logApproverLine(approverUnusableNameMessage(ref, verb, failure, latchOnUnusableName(ctx.key, err, approverLatchRowState(verb))))
-    return { stop: APPROVER_STOP_LATCHED }
-  }
+  if (approverLatchOn(ctx, verb, err, errorClass, failure)) return { stop: APPROVER_STOP_LATCHED }
   if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
     console.error(approverLogLine(approverTmuxUnavailableMessage(ref, verb, failure)))
     return { stop: APPROVER_STOP_TMUX_UNAVAILABLE }
@@ -2748,6 +2743,60 @@ function approverAnswerTo(ctx: ApproverContext, verb: ApproverVerb, err: unknown
   console.error(approverLogLine(message))
   // CONFIG is taken as the UNAVAILABLE column (b.jg5 SRJ-117, SRJ-118): both back off.
   return { backOff: errorClass === AD_ERROR_CLASS_UNAVAILABLE || errorClass === AD_ERROR_CLASS_CONFIG }
+}
+
+/**
+ * The two classes that latch at the approver (b.jg5 SRJ-117, SRJ-118):
+ * for a CONFLICT or UNUSABLE NAME answer `err` to `verb` (`errorClass`, with
+ * `failure` its redacted description), latch the persona through the
+ * installed latch's entry for the class and log one line carrying what
+ * became of the latch. The approver is marked stopping (`latched`) first
+ * unless a stop was already asked, so the latch's set observer finds it
+ * stopping. Answers whether `err` was of either class; for any other class
+ * it does nothing. Never throws.
+ */
+function approverLatchOn(
+  ctx: ApproverContext,
+  verb: ApproverVerb,
+  err: unknown,
+  errorClass: AdErrorClass,
+  failure: string,
+): boolean {
+  const { ref } = ctx
+  if (errorClass === AD_ERROR_CLASS_CONFLICT) {
+    // The latch is set first; its line then carries what became of it.
+    logApproverLine(approverConflictMessage(ref, verb, failure, approverLatchOnConflict(ctx, verb, err)))
+    return true
+  }
+  if (errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
+    ctx.run.stopRequested ??= APPROVER_STOP_LATCHED // the latch's set observer then finds it stopping
+    logApproverLine(approverUnusableNameMessage(ref, verb, failure, latchOnUnusableName(ctx.key, err, approverLatchRowState(verb))))
+    return true
+  }
+  return false
+}
+
+/**
+ * A pane call (`verb`) refused with `err` after a stop was asked of the
+ * approver (`requested`: superseded, latched, teardown or shutdown) while
+ * the call was in progress. A CONFLICT or UNUSABLE NAME answer still latches
+ * the persona with its one line (`approverLatchOn`; a persona already
+ * latched answers as the latch's entry does for a same-case set); every
+ * other answer is dropped with no line. Either way the approver honours the
+ * stop already asked, answering its reason, and types nothing more. Never
+ * throws.
+ */
+function approverStoppedDuringCall(
+  ctx: ApproverContext,
+  verb: ApproverVerb,
+  err: unknown,
+  requested: ApproverStopRequestReason,
+): ApproverStopReason {
+  const { errorClass } = classifyAdError(err)
+  if (errorClass === AD_ERROR_CLASS_CONFLICT || errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
+    approverLatchOn(ctx, verb, err, errorClass, describeAgentDirectorFailure(err))
+  }
+  return requested
 }
 
 /** One approver line (`approverLogLine`) to the server log; `message` comes from an exported builder. */

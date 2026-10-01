@@ -177,12 +177,14 @@ import {
   AGENT_DIRECTOR_PENDING_STATE,
 } from '../src/liveness-reading.ts'
 import {
+  CONFLICT_LATCH_SET_LATCHED,
   createConflictLatch,
   describeLatchRowState,
   latchRowStateRead,
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   type ConflictLatch,
   type ConflictLatchRecord,
+  type ConflictLatchSetEvent,
 } from '../src/conflict-latch.ts'
 import { describeAgentDirectorFailure } from '../src/ad-error-class.ts'
 import type { Phase1StatusResult } from '../src/ad-phase1-types.ts'
@@ -1685,7 +1687,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     const at = clock.now()
     const fired = clock.firedCount()
 
-    expect(await stopDialogApprover(PLAIN.key, 'teardown')).toBe(true)
+    expect(await stopDialogApprover(PLAIN.key, APPROVER_STOP_TEARDOWN)).toBe(true)
 
     // Ended during its sleep: no timer fired and no time passed.
     expect(clock.now()).toBe(at)
@@ -1693,11 +1695,11 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     expect(isDialogApproverRunning(PLAIN.key)).toBe(false)
     expect(isDialogApproverRunning(NAMED.key)).toBe(true)
     expect(await _whenDialogApproverStopped(PLAIN.key)).toEqual({ reason: APPROVER_STOP_TEARDOWN, launchStartMs: LAUNCH_START_MS })
-    const stopLine = approverLogLine(approverStopRequestedMessage(PLAIN.ref, 'teardown'))
+    const stopLine = approverLogLine(approverStopRequestedMessage(PLAIN.ref, APPROVER_STOP_TEARDOWN))
     expect(approverLines()).toEqual([stopLine])
 
-    expect(await stopDialogApprover(PLAIN.key, 'teardown')).toBe(false)
-    expect(await stopDialogApprover(personaKey('never-started'), 'teardown')).toBe(false)
+    expect(await stopDialogApprover(PLAIN.key, APPROVER_STOP_TEARDOWN)).toBe(false)
+    expect(await stopDialogApprover(personaKey('never-started'), APPROVER_STOP_TEARDOWN)).toBe(false)
     expect(approverLines()).toEqual([stopLine])
 
     // Q's next lap runs; P makes no call.
@@ -1727,7 +1729,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       await clock.flush()
       expect(hold.reached).toBe(true)
 
-      const stop = track(stopDialogApprover(PLAIN.key, 'teardown'))
+      const stop = track(stopDialogApprover(PLAIN.key, APPROVER_STOP_TEARDOWN))
       await clock.flush()
       expect(stop.settled).toBe(false)
       expect(isDialogApproverRunning(PLAIN.key)).toBe(true)
@@ -1739,7 +1741,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       expect(events).toEqual(lap(PLAIN, ...upTo))
       expect(clock.pending()).toEqual([])
       expect((await _whenDialogApproverStopped(PLAIN.key))?.reason).toBe(APPROVER_STOP_TEARDOWN)
-      expect(approverLines()).toEqual([approverLogLine(approverStopRequestedMessage(PLAIN.ref, 'teardown'))])
+      expect(approverLines()).toEqual([approverLogLine(approverStopRequestedMessage(PLAIN.ref, APPROVER_STOP_TEARDOWN))])
     },
   )
 
@@ -1853,6 +1855,111 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     )
   })
 
+  /** The stops a caller asks of a running approver here: the stop entry's teardown, and stop-all's shutdown. */
+  const ASKED_STOPS: ReadonlyArray<readonly [typeof APPROVER_STOP_TEARDOWN | typeof APPROVER_STOP_SHUTDOWN, () => Promise<unknown>]> = [
+    [APPROVER_STOP_TEARDOWN, () => stopDialogApprover(PLAIN.key, APPROVER_STOP_TEARDOWN)],
+    [APPROVER_STOP_SHUTDOWN, () => stopAllDialogApprovers()],
+  ]
+
+  /** The approver's CONFLICT row at its `read-pane`, and its UNUSABLE NAME row at its `send-keys`. */
+  const STOP_CONFLICT_ROW = APPROVER_CONFLICT_CASE_ROWS.find((caseRow) => caseRow.verb === 'read-pane')!
+  const STOP_UNUSABLE_NAME_ROW = APPROVER_UNUSABLE_NAME_CASE_ROWS.find((caseRow) => caseRow.verb === 'send-keys')!
+
+  /**
+   * A latching answer to a pane call held open while a stop is asked: [the
+   * class, the held verb, its answer, the record P latches with, the
+   * approver's line for it (around the latch outcome), the lap's calls].
+   */
+  const LATCHING_DURING_STOP: ReadonlyArray<
+    readonly [string, ApproverVerb, () => Error, () => ConflictLatchRecord, (failure: string, outcome: string) => string, readonly ApproverVerb[]]
+  > = [
+    [
+      'CONFLICT',
+      'read-pane',
+      () => STOP_CONFLICT_ROW.build(),
+      () => conflictRowRecord(PLAIN.key, STOP_CONFLICT_ROW),
+      (failure, outcome) => approverConflictMessage(PLAIN.ref, 'read-pane', failure, outcome),
+      ['status', 'read-pane'],
+    ],
+    [
+      'UNUSABLE NAME',
+      'send-keys',
+      () => STOP_UNUSABLE_NAME_ROW.build(),
+      () => STOP_UNUSABLE_NAME_ROW.record(PLAIN.key),
+      (failure, outcome) => approverUnusableNameMessage(PLAIN.ref, 'send-keys', failure, outcome),
+      ['status', 'read-pane', 'send-keys'],
+    ],
+  ]
+
+  test.each(LATCHING_DURING_STOP.flatMap(([cls, verb, make, record, line, upTo]) => ASKED_STOPS.map(([reason, ask]) => [cls, verb, reason, ask, make, record, line, upTo] as const)))(
+    'a %s answer to its %s held open while a stop (%s) is asked: P latches once with the whole record and one line, the approver stops with the reason asked, and nothing is typed after it (b.jg5 SRJ-404, SRJ-501, SRJ-512)',
+    async (_cls, verb, reason, ask, make, record, line, upTo) => {
+      const latch = installLatch(true)
+      const sets: ConflictLatchSetEvent[] = []
+      latch.addSetObserver((event) => {
+        sets.push(event)
+      })
+      rows.set(PLAIN.id, [PENDING_ROW])
+      panes.set(PLAIN.id, dialogPane(TRUST_DIALOG_NEEDLE))
+      const err = make()
+      const hold = holdNext(verb, PLAIN)
+      failures.set(call(verb, PLAIN.id), err)
+      startDialogApprover(PLAIN.key, true, PLAIN.ref)
+      await clock.flush()
+      expect(hold.reached).toBe(true)
+
+      const stop = track(ask())
+      await clock.flush()
+      expect(stop.settled).toBe(false)
+      expect(latch.isLatched(PLAIN.key)).toBe(false)
+
+      hold.release()
+      await clock.flush()
+      expect(stop.settled).toBe(true)
+      expect(isDialogApproverRunning(PLAIN.key)).toBe(false)
+      expect(await _whenDialogApproverStopped(PLAIN.key)).toEqual({ reason, launchStartMs: LAUNCH_START_MS })
+      expect(events).toEqual(lap(PLAIN, ...upTo))
+      expect(sendKeysCount(PLAIN)).toBe(verb === 'send-keys' ? 1 : 0)
+      expect(clock.pending()).toEqual([])
+
+      expect(latch.record(PLAIN.key)).toEqual(record())
+      expect(sets.map((event) => [event.key, event.outcome])).toEqual([[PLAIN.key, CONFLICT_LATCH_SET_LATCHED]])
+      // The stop's own line, then the one latch line; the latch's set observer adds no stop line.
+      const lines = approverLines()
+      expect(lines).toHaveLength(2)
+      expect(lines[0]).toBe(approverLogLine(approverStopRequestedMessage(PLAIN.ref, reason)))
+      expectLineAroundOutcome(lines[1], (outcome) => line(describeAgentDirectorFailure(err), outcome))
+    },
+  )
+
+  test.each(ASKED_STOPS)(
+    'an UNAVAILABLE answer to its read-pane held open while a stop (%s) is asked: no latch and no line for it; the approver stops with the reason asked and types nothing',
+    async (reason, ask) => {
+      const latch = installLatch(true)
+      rows.set(PLAIN.id, [PENDING_ROW])
+      panes.set(PLAIN.id, dialogPane(TRUST_DIALOG_NEEDLE))
+      const hold = holdNext('read-pane', PLAIN)
+      failures.set(call('read-pane', PLAIN.id), errTmuxUnresponsive('read-pane'))
+      startDialogApprover(PLAIN.key, true, PLAIN.ref)
+      await clock.flush()
+      expect(hold.reached).toBe(true)
+
+      const stop = track(ask())
+      await clock.flush()
+      expect(stop.settled).toBe(false)
+
+      hold.release()
+      await clock.flush()
+      expect(stop.settled).toBe(true)
+      expect(isDialogApproverRunning(PLAIN.key)).toBe(false)
+      expect(await _whenDialogApproverStopped(PLAIN.key)).toEqual({ reason, launchStartMs: LAUNCH_START_MS })
+      expect(events).toEqual(lap(PLAIN, 'status', 'read-pane'))
+      expect(clock.pending()).toEqual([])
+      expect([latch.isLatched(PLAIN.key), latch.record(PLAIN.key)]).toEqual([false, undefined])
+      expect(approverLines()).toEqual([approverLogLine(approverStopRequestedMessage(PLAIN.ref, reason))])
+    },
+  )
+
   /**
    * Where the first approver is when a second start for P comes: before its
    * first call; asleep between laps (its lap read a pane with no dialog,
@@ -1895,7 +2002,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       expect(sendKeysCount(PLAIN)).toBe(1)
       expect(maxActive.get(PLAIN.id)).toBe(1)
       expect(isDialogApproverRunning(PLAIN.key)).toBe(true)
-      expect(approverLines()).toEqual([approverLogLine(approverStopRequestedMessage(PLAIN.ref, 'superseded'))])
+      expect(approverLines()).toEqual([approverLogLine(approverStopRequestedMessage(PLAIN.ref, APPROVER_STOP_SUPERSEDED))])
 
       rows.set(PLAIN.id, [LIVE_ROW])
       expect(await runUntilStopped(PLAIN)).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: LAUNCH_START_MS })
@@ -1956,7 +2063,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     expect(plainFirst.settled).toBe(false)
     expect(isDialogApproverRunning(PLAIN.key)).toBe(true)
     expect(isDialogApproverRunning(NAMED.key)).toBe(true)
-    expect(approverLines()).toEqual([approverLogLine(approverStopRequestedMessage(NAMED.ref, 'superseded'))])
+    expect(approverLines()).toEqual([approverLogLine(approverStopRequestedMessage(NAMED.ref, APPROVER_STOP_SUPERSEDED))])
 
     rows.set(PLAIN.id, [LIVE_ROW])
     rows.set(NAMED.id, [LIVE_ROW])
@@ -1988,7 +2095,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     expect(sendKeysCount(NAMED)).toBe(0)
     expect(await _whenDialogApproverStopped(PLAIN.key)).toEqual({ reason: APPROVER_STOP_SHUTDOWN, launchStartMs: LAUNCH_START_MS })
     expect(await _whenDialogApproverStopped(NAMED.key)).toEqual({ reason: APPROVER_STOP_SHUTDOWN, launchStartMs: LAUNCH_START_MS })
-    const stopLines = PERSONAS.map((p) => approverLogLine(approverStopRequestedMessage(p.ref, 'shutdown')))
+    const stopLines = PERSONAS.map((p) => approverLogLine(approverStopRequestedMessage(p.ref, APPROVER_STOP_SHUTDOWN)))
     expect([...approverLines()].sort()).toEqual([...stopLines].sort())
 
     const callsBefore = events.length
@@ -1997,7 +2104,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     expect(isDialogApproverRunning(PLAIN.key)).toBe(false)
     expect(events.length).toBe(callsBefore)
     expect(clock.pending()).toEqual([])
-    expect(approverLines().slice(stopLines.length)).toEqual([approverLogLine(approverNotStartedMessage(PLAIN.ref, 'shutdown'))])
+    expect(approverLines().slice(stopLines.length)).toEqual([approverLogLine(approverNotStartedMessage(PLAIN.ref, APPROVER_STOP_SHUTDOWN))])
   })
 
   test('its calls run outside P\'s launch attempt: none sees the attempt, and a failed send-keys records nothing on it', async () => {
@@ -2080,6 +2187,8 @@ describe('source audit: the approver\'s raw tmux path, its seams, the dead-state
     'DIALOG_DEAD_GRACE_POLLS',
     '_setDialogDeadGracePolls',
     '_resetDialogDeadGracePolls',
+    '_setDialogPollIntervalMs',
+    '_resetDialogPollIntervalMs',
     'DIALOG_READY_STATES',
     'DIALOG_DEAD_STATES',
     // The spawn-failure notice the approver posted at its cap (b.jg5 SRJ-405).
