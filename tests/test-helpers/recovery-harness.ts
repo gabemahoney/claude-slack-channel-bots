@@ -246,7 +246,12 @@
  *
  * Shared case helpers, each over a harness: `personaOf` (a configured
  * persona), `collided` (the stub answers of a launch whose optimistic spawn
- * collides), `callCounts` (the stub's calls by verb), `recordCallOrder`
+ * collides), `callCounts` (the stub's calls by verb), `personaCallCounts`
+ * (the stub's calls for one persona's instance, those whose
+ * `claude_instance_id` is `personaInstanceId(key)`, by verb, leaving out
+ * verbs with none; a case wanting the persona's total over every verb sums
+ * its values), `callCountsSince` (what one by-verb count holds beyond an
+ * earlier one, by verb, leaving out verbs with no increase), `recordCallOrder`
  * (wraps every verb of the stub client, in place, so each call from then on
  * also appends the verb's name to the returned list, in call order: every
  * function the client has, `readPane`, `sendKeys`, `pause`, `decide` and
@@ -317,6 +322,7 @@ import {
   type TmuxUnresponsiveEndResult,
   type UnclassifiedErrorEndReason,
 } from '../../src/persona-episodes.ts'
+import { personaInstanceId } from '../../src/persona-identity.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
 import { createPersonaRelaunchGate } from '../../src/persona-start.ts'
 import { _resetRestartState, initRestart, RESTART_FAILURE_CAP, runRestartRetry, type RestartDeps } from '../../src/restart.ts'
@@ -1056,6 +1062,25 @@ export function collided(h: RecoveryHarness, persona: Persona, row: PersonaGetRe
 /** The stub's call counts, by verb, leaving out verbs never called. */
 export function callCounts(h: RecoveryHarness): Record<string, number> {
   return Object.fromEntries(Object.entries(h.stub.calls).filter(([, calls]) => calls.length > 0).map(([verb, calls]) => [verb, calls.length]))
+}
+
+/**
+ * The stub's calls for persona `key`'s instance (`claude_instance_id` is
+ * `personaInstanceId(key)`), by verb, leaving out verbs with none. Its values
+ * summed are the persona's calls over every verb.
+ */
+export function personaCallCounts(h: RecoveryHarness, key: string): Record<string, number> {
+  const id = personaInstanceId(key)
+  return Object.fromEntries(
+    Object.entries(h.stub.calls)
+      .map(([verb, calls]) => [verb, (calls as Array<{ claude_instance_id?: unknown } | undefined>).filter((c) => c?.claude_instance_id === id).length] as const)
+      .filter(([, count]) => count > 0),
+  )
+}
+
+/** The calls `after` holds beyond `before` (two by-verb counts), by verb, leaving out verbs with no increase. */
+export function callCountsSince(after: Record<string, number>, before: Record<string, number>): Record<string, number> {
+  return Object.fromEntries(Object.entries(after).map(([verb, n]) => [verb, n - (before[verb] ?? 0)] as const).filter(([, n]) => n > 0))
 }
 
 /**

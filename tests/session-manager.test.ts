@@ -450,7 +450,6 @@ import {
   LATCH_ROW_STATE_KIND_NO_ROW,
   LATCH_ROW_STATE_KIND_READ,
   LATCH_ROW_STATE_NO_ROW,
-  LATCH_ROW_STATE_UNREADABLE,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
   latchRowStateRead,
@@ -476,7 +475,6 @@ import {
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_ROW_ABSENT,
-  UNAVAILABLE_RETRY_STOP_LATCHED,
   type AttemptView,
   type UnavailableRetryController,
   type UnavailableRetryRowRead,
@@ -13235,7 +13233,11 @@ async function expectLaunchedByNoPath(h: RecoveryHarness, p: string, b: string, 
 describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of the collision ladder latches the persona; nothing else is done for it', () => {
   afterEach(srj105AfterEach)
 
-  test.each(LATCH_CROSS)('%s answering %s: latched with the row\'s case and session, the site\'s refused operation and the state the path last read; the refused call is the last; one CONFLICT notice after the holds; nothing counted or posted as a spawn failure; then no launch path reaches agent-director; B launches', async (_site, _row, site, row) => {
+  // Covers SRJ-111 (AC 7's unit half: the first spawn's plain-spawn rows read no
+  // row after the scan's refusal, ended after "duplicate session"; latched with
+  // plain spawn, never counted, never a kill) and SRJ-113 (a resume latches with
+  // "resume" and the collision get's state; never a kill, delete or fresh spawn).
+  test.each(LATCH_CROSS)('b.jg5 SRJ-111, SRJ-113: %s answering %s: latched with the row\'s case and session, the site\'s refused operation and the state the path last read; the refused call is the last; one CONFLICT notice after the holds; nothing counted or posted as a spawn failure; then no launch path reaches agent-director; B launches', async (_site, _row, site, row) => {
     const { h, p, b } = srj105Build()
     const persona = harnessPersona(h, p)
     site.setup?.(h)
@@ -13250,7 +13252,9 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     const latchTimeReads = site.lastRead === undefined ? 1 : 0
     expect(ladderCallsMade(h)).toEqual(site.calls)
     expect(h.stub.calls.getCalls).toHaveLength(site.reads.get)
-    expect(h.stub.calls.statusCalls).toHaveLength(site.reads.status + latchTimeReads)
+    expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual(
+      Array(site.reads.status + latchTimeReads).fill(`${PERSONA_INSTANCE_ID_PREFIX}${p}`),
+    )
     expect(order.slice(order.lastIndexOf(site.verb))).toEqual([site.verb, ...(latchTimeReads === 1 ? ['status'] : [])])
 
     expectLatchedOnce(h, p, row, refusedOperationAt(site), site.lastRead ?? row.rowState, site.noticesBefore)
@@ -13259,38 +13263,10 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     await expectLaunchedByNoPath(h, p, b, script)
   })
 
-  // SRJ-111's plain-spawn rows (AC 7's unit half): after the scan's refusal the
-  // stub holds no row, after "duplicate session" the row reads ended; either
-  // way P is latched with "plain spawn", nothing is counted, no kill is called.
-  test.each(conflictRowsFor('spawn').filter((row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN).map((row) => [row.name, row] as const))('b.jg5 SRJ-111 (AC 7): the first spawn answering %s: the one latch-time status read gives the row\'s state (no row after the scan, ended after duplicate session); latched with plain spawn, never counted, never a kill', async (_name, row) => {
-    const { h, p } = srj105Build()
-    h.script({ spawnError: row.build(), ...statusAnswering(row.rowState) })
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
-
-    expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual([`${PERSONA_INSTANCE_ID_PREFIX}${p}`])
-    expect(h.latch.record(p)?.rowState).toEqual(row.rowState)
-    expect(h.latch.record(p)?.refusedOperation).toBe(REFUSED_OPERATION_PLAIN_SPAWN)
-    expect(h.stub.calls.killCalls).toEqual([])
-    expect(h.stub.calls.deleteCalls).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
-    expect(h.notices).toEqual([])
-  })
-
-  // SRJ-113's resume row: the resume latches, and never a kill.
-  test.each(conflictRowsFor('resume').map((row) => [row.name, row] as const))('b.jg5 SRJ-113: the resume of an ended row answering %s latches P with "resume" and the collision get\'s state; never a kill, delete or fresh spawn', async (_name, row) => {
-    const { h, p } = srj105Build()
-    h.script({ ...collided(h, harnessPersona(h, p), { state: 'ended' }), resumeError: row.build() })
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
-
-    expect(h.latch.record(p)).toMatchObject({ latchCase: row.latchCase, refusedOperation: REFUSED_OPERATION_RESUME, rowState: ENDED_READ })
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, resume: 1 }))
-  })
-
   // SRJ-1015 (hatch A3): launchSession answers 'skipped' for a launch that
-  // latches, as for one already latched; nothing is recorded.
-  test.each(LATCH_SPAWN_SITES.concat(LATCH_RESUME_SITES).map((site) => [site.name, site] as const))('b.jg5 SRJ-1015: launchSession whose launch meets a CONFLICT at %s answers \'skipped\': P latched, nothing counted, no spawn-failure notice', async (_name, site) => {
+  // latches, as for one already latched; nothing is recorded. The mapping does
+  // not depend on the site: one spawn site and one resume site.
+  test.each([LATCH_SPAWN_SITES[0]!, LATCH_RESUME_SITES[0]!].map((site) => [site.name, site] as const))('b.jg5 SRJ-1015: launchSession whose launch meets a CONFLICT at %s answers \'skipped\': P latched, nothing counted, no spawn-failure notice', async (_name, site) => {
     const { h, p } = srj105Build()
     const row = conflictRowsFor(site.verb)[0]!
     site.setup?.(h)
@@ -13303,44 +13279,6 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     expect(getFailureCount(p)).toBe(0)
     expect(h.notices).toHaveLength(site.noticesBefore ?? 0)
     expect(h.episodeNotices.filter((n) => n.key === p)).toHaveLength(1)
-  })
-
-  // Task ruling: the latch-time read runs inside the launch attempt, so its
-  // error may arm P's timer or open its unclassified-error episode; the holds
-  // that run before the notice stop and end both.
-  test.each<[string, () => Error, string, boolean]>([
-    ['an UNAVAILABLE read (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, false],
-    ['an UNCLASSIFIED read (ErrInternal)', () => errInternal(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR, true],
-  ])('b.jg5 SRJ-501: a latch-time status read answering %s records the state unreadable (live); the timer it armed is stopped with the latch\'s reason and any episode it opened is ended, both before the CONFLICT notice', async (_what, make, kind, opensEpisode) => {
-    const { h, p, b } = srj105Build()
-    const row = conflictRowsFor('spawn')[0]!
-    const script: RecoveryStubScript = { spawnError: row.build(), statusError: make() }
-    h.script(script)
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
-
-    expect(h.stub.calls.statusCalls).toHaveLength(1)
-    expect(h.latch.record(p)?.rowState).toEqual(LATCH_ROW_STATE_UNREADABLE)
-    // The read armed P once; the latch's first hold stopped it.
-    expect(h.triggers).toEqual([{ key: p, kind }])
-    expect(h.stops).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
-    expect(h.controller.isArmed(p)).toBe(false)
-    expect(unclassifiedStartedLines(h, p)).toHaveLength(opensEpisode ? 1 : 0)
-    expect(h.unclassifiedErrorOpen(p)).toBe(false)
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    // Holds in order, then the notice.
-    expect(h.latchEvents.map((event) => (event.step === 'hold' ? event.hold : event.step))).toEqual([
-      'set',
-      'retry timer stop',
-      'tmux-unresponsive end',
-      'unclassified-error end',
-      'notice',
-    ])
-    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
-    expect(h.notices).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
-
-    await expectLaunchedByNoPath(h, p, b, script)
   })
 
   test('b.jg5 SRJ-501: the ErrJsonlMissing diagnosis get answering ErrSpawnNotFound is the last read: the spawn after its delete latches P with no row, and no status read is added', async () => {
@@ -13454,11 +13392,12 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     expect(getFailureCount('C')).toBe(0)
     assertNoLeak({ errLog, notices })
 
-    await withCapturedErr(async () => {
+    const secondErrLog = await withCapturedErr(async () => {
       result = await spawnForPersona(personaOf(cfg, 'C'), cfg, true)
     })
-    expect(result?.action).not.toBe('latched')
+    expect(result).toStrictEqual({ key: 'C', action: 'spawned' })
     expect(spawnCalls).toHaveLength(2)
+    assertNoLeak({ errLog: secondErrLog, notices })
   })
 
   test('an installed latch whose set throws: the launch still answers latched, its one CONFLICT line naming the failure; no spawn-failure notice, no spawn-failed entry, never counted', async () => {

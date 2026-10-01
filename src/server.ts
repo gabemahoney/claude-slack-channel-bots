@@ -1384,14 +1384,25 @@ export function _buildKillSessionAdapter(
  *     No spawn-failure notice is raised. Its escalate-dead line has the
  *     verdict `row-not-interactive` (b.jdc), not a dead tmux session's.
  *
+ * b.jg5 SRJ-502 — never type into a latched persona. The reads above are
+ * awaited, and a launch outside the restart serializer can latch the persona
+ * while they run, after the restart work's own latched check. So the latch
+ * (`isLatched`) is asked once more right before `/mcp reconnect` is typed: a
+ * latched persona, or a query that throws (fail safe), gets nothing typed and
+ * one line naming it, and the adapter answers 'transient', which restart.ts
+ * neither counts nor escalates to a kill (`RESTART_OUTCOME_RECONNECT_DEFERRED`).
+ *
  * @param getPersona  The applied persona with a key (production:
  *   `getAppliedPersona`), for locating a `working` row's transcript under its
  *   claude_config_dir; without it only the row's persisted transcript path is
  *   read.
+ * @param isLatched  The latched query (production: the server's latch's
+ *   `isLatched`); absent, no persona is latched here.
  * @internal
  */
 export function _buildReconnectSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
+  isLatched?: (key: string) => boolean,
 ): (key: string) => Promise<'success' | 'escalate-dead' | 'transient' | 'pending'> {
   // `key` is the persona key.
   return async (key: string) => {
@@ -1452,6 +1463,12 @@ export function _buildReconnectSessionAdapter(
     // removing it is a separate operator decision). Not counting here keeps
     // failures attributed to the launchSession site, which owns the single
     // counting site (SR-25.1).
+    //
+    // b.jg5 SRJ-502: the reads above are awaited, and a launch outside the
+    // restart serializer (e.g. the start pass's) may have latched the persona
+    // meanwhile. Ask the latch right before typing: a latched persona (or a
+    // query that throws: fail safe) gets nothing typed, 'transient'.
+    if (reconnectLatchedAt(key, isLatched)) return 'transient'
     const result = await reconnectMcpWithCause(key)
     if (result.outcome === 'ok') return 'success'
     if (result.outcome === 'dead-session') {
@@ -1475,6 +1492,27 @@ export function _buildReconnectSessionAdapter(
     }
     return 'transient'
   }
+}
+
+/**
+ * The reconnect adapter's latched gate (b.jg5 SRJ-502), asked right before
+ * `/mcp reconnect` is typed: true, after logging one line naming the persona,
+ * when `isLatched` answers exactly `true` for persona `key` or throws (fail
+ * safe: the line names what it threw); false when it answers anything else or
+ * is absent. Never throws.
+ */
+function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) | undefined): boolean {
+  if (isLatched === undefined) return false
+  let failure = ''
+  try {
+    if (isLatched(key) !== true) return false
+  } catch (err) {
+    failure = ` (the latched query failed: ${describeThrownValue(err)} — taken as latched)`
+  }
+  console.error(
+    `[slack] reconnectSession: persona=${key} is latched${failure} — not typing /mcp reconnect; nothing done (b.jg5 SRJ-502)`,
+  )
+  return true
 }
 
 /**
@@ -2397,7 +2435,7 @@ export async function main(): Promise<void> {
     hasSessionStream,
     // b.f2b: the persona locates a `working` row's transcript (its
     // claude_config_dir) for the positive-idle rule.
-    reconnectSession: _buildReconnectSessionAdapter(getAppliedPersona),
+    reconnectSession: _buildReconnectSessionAdapter(getAppliedPersona, (key) => conflictLatch.isLatched(key)),
     killSession: _buildKillSessionAdapter(getAppliedPersona),
     launchSession: async (key) => {
       if (!personaConfig) return false

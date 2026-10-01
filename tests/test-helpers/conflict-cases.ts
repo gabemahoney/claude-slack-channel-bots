@@ -54,6 +54,17 @@
  *     quoted description line (found by `CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD`),
  *     so a check over CSCB's own words lets the quoted description through.
  *
+ * Per-persona CONFLICT helpers (shared by the recovery-harness cases, so no
+ * test file keeps its own copy):
+ *   - {@link conflictForPersona}: a plain spawn's CONFLICT for persona `key`,
+ *     its session left over from an earlier life ("duplicate session"): the
+ *     stub's `errTmuxSessionConflict('spawn', 'duplicate-session-leftover',
+ *     personaTmuxSessionName(key))`;
+ *   - {@link conflictNoticeForPersona}: the CONFLICT notice that error posts
+ *     to persona `key`'s destination, `{ key, text }`, the text
+ *     {@link expectedConflictNotice} gives for `LATCH_CASE_LEFTOVER`, the
+ *     persona's session name and the error's description.
+ *
  * Columns added later: E14 adds the `provenance_conflict` note latch's rows
  * (P's bring-up, no builder call); E16 adds the "unusable recorded name" and
  * "launch start not recorded" rows; E30 adds the re-check's action and its
@@ -65,7 +76,8 @@
  * No case word, notice text or session name is written here: the words reach
  * a row only through the stub, the notice's texts only through
  * `src/conflict-latch.ts`'s exports, and the session name is the stub's
- * `STUB_TMUX_SESSION_NAME` (`personaTmuxSessionName`). No Phase-1-only export
+ * `STUB_TMUX_SESSION_NAME` or, for a persona, `personaTmuxSessionName(key)`.
+ * No Phase-1-only export
  * is named, and no `mock.module()` is used.
  *
  * SPDX-License-Identifier: MIT
@@ -110,6 +122,7 @@ import {
   type RefusedOperation,
 } from '../../src/conflict-latch.ts'
 import { renderLogMessageText } from '../../src/persona-connection-errors.ts'
+import { personaTmuxSessionName } from '../../src/persona-identity.ts'
 import { escapeSlackControlCharacters } from '../../src/slack-text-escape.ts'
 import {
   STUB_TMUX_SESSION_NAME,
@@ -240,6 +253,21 @@ export function cscbOwnLines(notice: string): string[] {
   return notice
     .split(CONFLICT_NOTICE_LINE_SEPARATOR)
     .filter((line) => !line.startsWith(CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD))
+}
+
+// ---------------------------------------------------------------------------
+// Per-persona CONFLICT error and notice
+// ---------------------------------------------------------------------------
+
+/** A plain spawn's CONFLICT for persona `key`: its session left over from an earlier life ("duplicate session"). */
+export function conflictForPersona(key: string): ReturnType<typeof errTmuxSessionConflict> {
+  return errTmuxSessionConflict(SPAWN_VERB, 'duplicate-session-leftover', personaTmuxSessionName(key))
+}
+
+/** The CONFLICT notice `err` (a {@link conflictForPersona} error) posts to persona `key`'s destination. */
+export function conflictNoticeForPersona(key: string, err: ReturnType<typeof conflictForPersona>): { key: string; text: string } {
+  const notice = expectedConflictNotice({ latchCase: LATCH_CASE_LEFTOVER, sessionName: personaTmuxSessionName(key), description: err.errDescription })
+  return { key, text: notice.text }
 }
 
 // ---------------------------------------------------------------------------

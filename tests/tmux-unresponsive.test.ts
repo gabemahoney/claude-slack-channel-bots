@@ -70,8 +70,8 @@
  *   `main()` composes it: a retry's launch answering CONFLICT, after the onset
  *   or before any, stops the retry timer (cancelling the alert check) and
  *   ends the condition with no recovery before the one CONFLICT post, which
- *   is compared through `expectedConflictNotice`; nothing posts past the
- *   threshold.
+ *   is compared through `conflictNoticeForPersona` (`expectedConflictNotice`'s
+ *   text); nothing posts past the threshold.
  *
  * Tick-mode cases drive the tick's two hooks as `main()` binds them
  * (`tickEnd` for a persona the tick finds healthy, then `tickOnset` with the
@@ -98,7 +98,6 @@ import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_
 import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
-import { LATCH_CASE_LEFTOVER } from '../src/conflict-latch.ts'
 import { _resetHealthCheckState, initHealthCheck, startHealthCheck, stopHealthCheck, type HealthCheckDeps } from '../src/health-check.ts'
 import { LIVENESS_LIVE, LIVENESS_READING_DEAD, LIVENESS_READING_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
 import {
@@ -120,7 +119,7 @@ import {
   tmuxUnresponsiveRecoveryText,
   type TmuxUnresponsiveEndReason,
 } from '../src/persona-episodes.ts'
-import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
+import { personaInstanceId } from '../src/persona-identity.ts'
 import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
 import { killPersonaInstance, reconcileOrphans } from '../src/session-manager.ts'
@@ -153,14 +152,13 @@ import {
   errTmuxKillFailed,
   errTmuxNotAvailable,
   errTmuxSendKeys,
-  errTmuxSessionConflict,
   errTmuxUnresponsive,
   errTmuxUnresponsiveStillStopping,
   holdSpawns,
   unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
 import type { AdConfigTables } from './test-helpers/ad-settings.ts'
-import { expectedConflictNotice } from './test-helpers/conflict-cases.ts'
+import { conflictForPersona, conflictNoticeForPersona } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import {
   collided,
@@ -1776,16 +1774,6 @@ describe('tmux-unresponsive: teardown and shutdown post nothing more', () => {
  */
 const LATE_ALERT: RecoveryHarnessOptions = { adSettings: { tmux: { starting_session_seconds: BigInt(2 * UNAVAILABLE_RETRY_CEILING_S) } } }
 
-/** A plain spawn's CONFLICT for persona `key`: its session left over from an earlier life ("duplicate session"). */
-function conflictFor(key: string): ReturnType<typeof errTmuxSessionConflict> {
-  return errTmuxSessionConflict('spawn', 'duplicate-session-leftover', personaTmuxSessionName(key))
-}
-
-/** The CONFLICT notice `err` posts to persona `key`'s destination. */
-function conflictPost(key: string, err: ReturnType<typeof conflictFor>): RecoveryNotice {
-  return { key, text: expectedConflictNotice({ latchCase: LATCH_CASE_LEFTOVER, sessionName: personaTmuxSessionName(key), description: err.errDescription }).text }
-}
-
 /** Whether persona `key`'s condition still held at each post of `text` to it, recorded as the post lands. */
 function holdsAtPosts(h: RecoveryHarness, key: string, text: string): boolean[] {
   const held: boolean[] = []
@@ -1819,9 +1807,9 @@ describe('tmux-unresponsive: a CONFLICT ends it silently (SRJ-310, SRJ-502)', ()
       lines.push(conditionOnsetLine(p, 'a retry', firedAt - at))
     }
     expect(noticeAndEndLines(h, p)).toEqual(lines)
-    const err = conflictFor(p)
+    const err = conflictForPersona(p)
     h.script({ spawnError: err })
-    const held = holdsAtPosts(h, p, conflictPost(p, err).text)
+    const held = holdsAtPosts(h, p, conflictNoticeForPersona(p, err).text)
 
     const conflictAt = await retryNow(h, p)
 
@@ -1830,7 +1818,7 @@ describe('tmux-unresponsive: a CONFLICT ends it silently (SRJ-310, SRJ-502)', ()
     expect(h.latch.isLatched(p)).toBe(true)
     expect(held).toEqual([false])
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    const posts = [...(withOnset ? [onset(p)] : []), conflictPost(p, err)]
+    const posts = [...(withOnset ? [onset(p)] : []), conflictNoticeForPersona(p, err)]
     expectPosts(h, posts)
     // The latch's timer stop cancels the alert check, then its silent end ends the condition.
     lines.push(

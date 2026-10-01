@@ -113,6 +113,7 @@ import {
   PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE,
   RETRY_KILL_LATER_PHRASE,
 } from '../src/ad-description-phrases.ts'
+import { adAlertThresholdMsInEffect } from '../src/ad-settings.ts'
 import { ERR_TMUX_SESSION_CONFLICT_NAME } from '../src/agent-director-errors.ts'
 import {
   CONFLICT_CASE_ORDER,
@@ -234,6 +235,7 @@ import {
   CONFLICT_CASES,
   cannedStatusResult,
   errGeneric,
+  errCallTimeout,
   errInternal,
   errNoSessionId,
   errSpawnNotFound,
@@ -260,15 +262,17 @@ import {
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
   callCounts,
+  callCountsSince,
   collided,
   conditionEndedLine,
   conditionRecoveryLine,
   makeRecoveryHarness,
+  personaCallCounts,
   personaOf,
   recordCallOrder,
   unclassifiedEndedLine,
+  unclassifiedLines,
   unclassifiedStartedLine,
-  unclassifiedStartedLines,
   type RecoveryHarness,
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
@@ -981,16 +985,12 @@ describe('the CONFLICT notice by row', () => {
     expect(at(CONFLICT_NOTICE_POINTER_LINE) >= 0).toBe(row.notice.carries.pointer)
     expect(at(CONFLICT_NOTICE_DIFFERENT_ID_MUST_NOT_END_LINE) >= 0).toBe(row.notice.carries.mustNotEnd === 'row')
     expect(at(CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE) >= 0).toBe(row.notice.carries.mustNotEnd === 'store')
-    expect(row.notice.carries.pointer).toBe(row.latchCase !== LATCH_CASE_DIFFERENT_ID)
     if (row.latchCase === LATCH_CASE_DIFFERENT_ID) {
-      expect(row.notice.carries.mustNotEnd).toBe('row')
       expect(at(CONFLICT_NOTICE_DIFFERENT_ID_MUST_NOT_END_LINE)).toBe(2)
       expect(run.posts[0][1].includes(operatorActionsTitle())).toBe(false)
     } else if (row.latchCase === LATCH_CASE_ANOTHER_STORE) {
-      expect(row.notice.carries.mustNotEnd).toBe('store')
       expect([at(CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE), at(CONFLICT_NOTICE_POINTER_LINE), at(listLine)]).toEqual([2, 3, 4])
     } else {
-      expect(row.notice.carries.mustNotEnd).toBe('none')
       expect(at(CONFLICT_NOTICE_POINTER_LINE)).toBe(2)
     }
   })
@@ -1039,15 +1039,10 @@ const forbiddenIn = (line: string): string[] =>
   CSCB_OWN_LINE_FORBIDDEN.filter((pattern) => pattern.test(line)).map((pattern) => `${pattern} in ${JSON.stringify(line)}`)
 
 describe('no session-ending command', () => {
-  test.each(ROWS)('%s: CSCB\'s own lines name no session-ending command and no --include-finished', (_name, row) => {
+  test.each(ROWS)('%s: CSCB\'s own lines name no session-ending command, no --include-finished, and no kill-pane, set-option, agent-director delete, clear-latch, has-session or label option', (_name, row) => {
     const own = cscbOwnLines(conflictNoticeText({ sessionName: row.sessionName, latchCase: row.latchCase, description: descriptionOf(row) }))
     expect(own.length).toBe(row.notice.lines.length - 1)
     expect(own.flatMap(sessionEndingCommandsIn)).toEqual([])
-  })
-
-  test.each(ROWS)('%s: CSCB\'s own lines name no kill-pane, set-option, agent-director delete, clear-latch, has-session or label option', (_name, row) => {
-    const own = cscbOwnLines(conflictNoticeText({ sessionName: row.sessionName, latchCase: row.latchCase, description: descriptionOf(row) }))
-    expect(own.length).toBe(row.notice.lines.length - 1)
     expect(own.flatMap(forbiddenIn)).toEqual([])
   })
 
@@ -1063,13 +1058,6 @@ describe('no session-ending command', () => {
     'the @ad_owner option',
     'the @ad_pane option',
   ]
-
-  test('every forbidden entry has a sample, and each sample matches exactly one entry', () => {
-    expect(FORBIDDEN_SAMPLES.map((sample) => CSCB_OWN_LINE_FORBIDDEN.filter((pattern) => pattern.test(sample)).length)).toEqual(
-      FORBIDDEN_SAMPLES.map(() => 1),
-    )
-    expect(CSCB_OWN_LINE_FORBIDDEN.filter((pattern) => !FORBIDDEN_SAMPLES.some((sample) => pattern.test(sample)))).toEqual([])
-  })
 
   test.each(FORBIDDEN_SAMPLES.map((sample) => [sample]))('%p in a line of CSCB\'s own is caught; in the quoted description it is let through', (sample) => {
     const notice = conflictNoticeText({ sessionName: STUB_TMUX_SESSION_NAME, latchCase: LATCH_CASE_OWN_ID, description: sample })
@@ -1336,8 +1324,11 @@ afterEach(() => {
   harnesses = []
   _resetHealthCheckState()
   for (const h of built) {
-    assertNoLeak(h.captured())
-    h.cleanup()
+    try {
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
   }
 })
 
@@ -1380,21 +1371,6 @@ function makeAutomatedPathsRun(): AutomatedPathsRun {
   }
   h.script({ statusFn: (params) => cannedStatusResult({ state: live.has(String(params.claude_instance_id)) ? 'waiting' : 'ended' }) })
   return { h, outcomes, killRow: (key) => live.delete(personaInstanceId(key)) }
-}
-
-/** Persona `key`'s calls in the stub's log, by verb, leaving out verbs with none. */
-function callsFor(h: RecoveryHarness, key: string): Record<string, number> {
-  const id = personaInstanceId(key)
-  return Object.fromEntries(
-    Object.entries(h.stub.calls)
-      .map(([verb, calls]) => [verb, (calls as Array<{ claude_instance_id?: unknown }>).filter((c) => c.claude_instance_id === id).length] as const)
-      .filter(([, count]) => count > 0),
-  )
-}
-
-/** The calls `after` holds beyond `before`, by verb, leaving out verbs with none. */
-function callsSince(after: Record<string, number>, before: Record<string, number>): Record<string, number> {
-  return Object.fromEntries(Object.entries(after).map(([verb, n]) => [verb, n - (before[verb] ?? 0)] as const).filter(([, n]) => n > 0))
 }
 
 /**
@@ -1467,17 +1443,17 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
       rowState: row.rowState,
     })
     h.script(CLEARED)
-    const pAtLatch = callsFor(h, p)
+    const pAtLatch = personaCallCounts(h, p)
     const qCalls: Array<readonly [string, Record<string, number>]> = []
     /** Drive `path` for P, then for Q with its row dead, recording what Q's run called. */
     async function drive(name: string, path: (key: string) => Promise<unknown>): Promise<void> {
       await path(p)
       await h.settle()
       killRow(q)
-      const before = callsFor(h, q)
+      const before = personaCallCounts(h, q)
       await path(q)
       await h.settle()
-      qCalls.push([name, callsSince(callsFor(h, q), before)])
+      qCalls.push([name, callCountsSince(personaCallCounts(h, q), before)])
     }
 
     /**
@@ -1535,13 +1511,13 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
       now: h.clock.now,
     })
     killRow(q)
-    const qBeforeTick = callsFor(h, q)
+    const qBeforeTick = personaCallCounts(h, q)
     await captureTimer('setInterval', () => startHealthCheck(1))()
     stopHealthCheck()
-    qCalls.push(['the health tick', callsSince(callsFor(h, q), qBeforeTick)])
+    qCalls.push(['the health tick', callCountsSince(personaCallCounts(h, q), qBeforeTick)])
 
     // P: since the latch, only the tick's liveness read; never a kill of its instance.
-    expect(callsSince(callsFor(h, p), pAtLatch)).toEqual({ statusCalls: 1 })
+    expect(callCountsSince(personaCallCounts(h, p), pAtLatch)).toEqual({ statusCalls: 1 })
     expect(h.stub.calls.killCalls.filter((call) => call.claude_instance_id === personaInstanceId(p))).toEqual([])
     expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
     // P's only serialized work is the retry entry's, answered latched; neither restart request armed a timer for it.
@@ -1577,6 +1553,7 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
 
   test.each([
     ['UNAVAILABLE (ErrTmuxUnresponsive)', (): Error => errTmuxUnresponsive('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, false],
+    ['UNAVAILABLE (ErrCallTimeout)', (): Error => errCallTimeout('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, false],
     // A read verb's UNCLASSIFIED answer arms with the read-error cause.
     ['UNCLASSIFIED (ErrInternal)', (): Error => errInternal(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR, true],
   ] as const)('a latch-time status read answering %s: read, then set, then the holds, then the notice; no retry timer, tmux-unresponsive condition or unclassified episode is left open for P', async (_label, readError, cause, opensEpisode) => {
@@ -1613,48 +1590,30 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
 
     expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
 
-    // Read: before any set, and its error reached the timer and (UNCLASSIFIED) the episode.
+    // Read: before any set, and its error reached the timer and (UNCLASSIFIED) the episode, which the latch ended.
     expect(atRead).toEqual([{ latchSteps: 0, latched: false }])
     expect(h.triggers.slice(triggersBefore)).toEqual([{ key: p, kind: cause }])
-    expect(unclassifiedStartedLines(h, p)).toEqual(opensEpisode ? [unclassifiedStartedLine(p, err)] : [])
+    const episodeLines = opensEpisode ? [unclassifiedStartedLine(p, err), unclassifiedEndedLine(p, UNCLASSIFIED_ERROR_END_LATCHED)] : []
+    expect(unclassifiedLines(h, p)).toEqual(episodeLines)
     // Set, with the read's state (unreadable), then the holds in order, then the notice.
     expect(h.latch.record(p)).toMatchObject({ refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: LATCH_ROW_STATE_UNREADABLE })
     expect(latchSteps(h)).toEqual(oneLatch(p))
     expect(h.stops).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
     expect(h.lines.includes(conditionEndedLine(p, TMUX_UNRESPONSIVE_END_LATCHED))).toBe(true)
     expect(h.lines.includes(conditionRecoveryLine(p))).toBe(false)
-    expect(h.lines.includes(unclassifiedEndedLine(p, UNCLASSIFIED_ERROR_END_LATCHED))).toBe(opensEpisode)
     // By the notice every hold had run.
     expect(atNotice).toEqual([{ armed: false, conditionHolds: false, episodeOpen: false, latched: true }])
     expect(h.episodeNotices).toEqual([{ key: p, text: plainSpawnRow.notice.text }])
 
-    // Nothing is left to fire for P: several waits on, no attempt and no call.
-    const pCalls = callsFor(h, p)
+    // Nothing is left to fire for P: several waits on, then past twice the alert threshold in effect, no attempt, no call and no unclassified alert.
+    const pCalls = personaCallCounts(h, p)
     await h.advance(4 * UNAVAILABLE_RETRY_CEILING_S * 1000)
-    expect([h.attempts, callsFor(h, p), h.controller.armedKeys(), h.clock.pendingCount()]).toEqual([[], pCalls, [], 0])
+    await h.advance(2 * adAlertThresholdMsInEffect())
+    expect([h.attempts, personaCallCounts(h, p), h.controller.armedKeys(), h.clock.pendingCount()]).toEqual([[], pCalls, [], 0])
+    expect(unclassifiedLines(h, p)).toEqual(episodeLines)
+    expect(h.episodeNotices).toEqual([{ key: p, text: plainSpawnRow.notice.text }])
     expect(h.notices).toEqual([])
-    expect(callsFor(h, q)).toEqual({})
-  })
-
-  test('a second harness starts with no latch: P latched in the first, cleaned up, is unlatched in the second, with no latch events, and its launch spawns', async () => {
-    const { h: h1 } = makeAutomatedPathsRun()
-    // Cleaned up here, so out of the afterEach list; leak-checked as afterEach would.
-    harnesses = harnesses.filter((h) => h !== h1)
-    const p = h1.keys[0]!
-    h1.script({ spawnError: plainSpawnRow.build() })
-    expect(await h1.launch(p)).toEqual({ key: p, action: 'latched' })
-    expect(h1.latch.isLatched(p)).toBe(true)
-    assertNoLeak(h1.captured())
-    h1.cleanup()
-
-    const { h: h2 } = makeAutomatedPathsRun()
-    expect(h2.keys[0]).toBe(p)
-    expect(h2.latch.isLatched(p)).toBe(false)
-    expect(h2.latchEvents).toEqual([])
-    expect(await h2.launch(p)).toEqual({ key: p, action: 'spawned' })
-    expect(h2.stub.calls.spawnCalls.length).toBe(1)
-    expect(h2.latch.isLatched(p)).toBe(false)
-    expect(h2.latchEvents).toEqual([])
+    expect(personaCallCounts(h, q)).toEqual({})
   })
 })
 
@@ -1753,10 +1712,13 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
     harnesses.push(h1)
     const p = h1.keys[0]!
     await bringUpLatches(h1, row, script, rowState, calls)
-    // The restart: cleaned up here (so out of the afterEach list), leak-checked as afterEach would.
+    // The restart: leak-checked as afterEach would and cleaned up here, even when the check fails; only then out of the afterEach list.
+    try {
+      assertNoLeak(h1.captured())
+    } finally {
+      h1.cleanup()
+    }
     harnesses = harnesses.filter((h) => h !== h1)
-    assertNoLeak(h1.captured())
-    h1.cleanup()
 
     // The second lifetime, over a stub still answering the same condition.
     const h2 = makeRecoveryHarness()

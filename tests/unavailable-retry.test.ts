@@ -113,7 +113,6 @@ import {
   CONFLICT_LATCH_SET_LATCHED,
   LATCH_CASE_LEFTOVER,
   LATCH_ROW_STATE_NO_ROW,
-  LATCH_ROW_STATE_UNREADABLE,
   REFUSED_OPERATION_PLAIN_SPAWN,
   type LatchRowState,
 } from '../src/conflict-latch.ts'
@@ -262,7 +261,6 @@ import {
   errTmuxKillFailed,
   errTmuxNotAvailable,
   errTmuxNotAvailableDifferentServer,
-  errTmuxSessionConflict,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
   errUnusableName,
@@ -279,7 +277,7 @@ import {
   REDACTED_SENTINEL_TAIL,
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
-import { expectedConflictNotice } from './test-helpers/conflict-cases.ts'
+import { conflictForPersona, conflictNoticeForPersona } from './test-helpers/conflict-cases.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { startManualPoller } from './test-helpers/permission-relay-harness.ts'
 import {
@@ -291,6 +289,7 @@ import {
   conditionRecoveryLine,
   adConfigMalformedRaiseLines,
   makeRecoveryHarness,
+  personaCallCounts,
   personaOf,
   retryNow,
   unclassifiedEndedLine,
@@ -330,7 +329,10 @@ interface Rig {
 }
 
 let rigs: Rig[] = []
+/** The test's recovery harness, if it built one: checked, leak-checked and cleaned up in `afterEach`. */
 let harness: RecoveryHarness | undefined
+/** A describe's own end-of-test check on the harness, run in `afterEach` before its leak check (the cleanup runs either way). */
+let harnessEndCheck: ((h: RecoveryHarness) => void) | undefined
 
 /**
  * Build a rig; its action refuses every retry unless `action` is given. The
@@ -398,17 +400,26 @@ function throwingClock(err: Error): { clock: FakeClock; prime(): void } {
 beforeEach(() => {
   rigs = []
   harness = undefined
+  harnessEndCheck = undefined
   _resetBackoffState()
   _resetRestartState()
 })
 
 afterEach(() => {
   const clocks = rigs.map((rig) => rig.clock)
+  const h = harness
+  harness = undefined
   try {
     for (const rig of rigs) rig.controller.stopAll('the test is over')
-    if (harness !== undefined) {
-      clocks.push(harness.clock)
-      harness.cleanup()
+    if (h !== undefined) {
+      clocks.push(h.clock)
+      // A failed check must not skip the cleanup: bun runs no later hook once one throws.
+      try {
+        harnessEndCheck?.(h)
+        assertNoLeak(h.captured())
+      } finally {
+        h.cleanup()
+      }
     }
   } finally {
     _resetBackoffState()
@@ -936,10 +947,6 @@ function expectNothingArmed(h: RecoveryHarness): void {
 }
 
 describe('unavailable retry: what arms the timer (SRJ-301)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   const unavailableCross = UNAVAILABLE_VALUES.flatMap(([what, make, kind]) =>
     LAUNCH_SITES.map((site) => [what, site.name, site.verb, make, kind, site] as const),
   )
@@ -1232,10 +1239,6 @@ function sweepInAttempt(key: string): Promise<void> {
 }
 
 describe('unavailable retry: a shared findMissing sweep that fails arms each persona that met it inside its attempt (SRJ-301)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('P and Q, each inside its own attempt, share one findMissing call; when it fails each is armed once with unavailable', async () => {
     const h = (harness = makeRecoveryHarness())
     const [p, q] = h.keys as [string, string]
@@ -1717,10 +1720,6 @@ async function armBoth(h: RecoveryHarness, key: string, other: string): Promise<
 }
 
 describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-302, SRJ-303, SRJ-305)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('AC 26: with both settings 0 and agent-director’s default settings, a refused bring-up spawns at each due time and never early, counts nothing past the cap, posts one onset at the first retry at or past the onset floor and one alert once past the alert threshold (none at it) while the retries go on, launches once when the refusal clears and posts one recovery, runs on at the next wait in pending-only mode, and its next retry reads the row once and stops with nothing pending', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -2097,10 +2096,6 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
 })
 
 describe('unavailable retry: the stop rules that exist now on the recovery harness (SRJ-305, AC 28)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('the restart cap: each counted launch failure re-arms at the doubled wait until the cap stops the timer, with onCapReached once and its notice', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
@@ -2283,10 +2278,6 @@ function expectStopped(h: RecoveryHarness, key: string): void {
 }
 
 describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301, SRJ-303, SRJ-305)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('a row still pending: armed at the base wait, each retry’s only agent-director call is its one row read, and the next wait doubles', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -2655,10 +2646,6 @@ function expectKeptThroughEveryConditionEnd(h: RecoveryHarness, key: string, why
 }
 
 describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
     ['armed pending-only directly', async (h, key) => h.controller.armPendingOnly(key)],
     ['a full-mode retry deferred on the pending row', async (h, key) => {
@@ -2857,11 +2844,8 @@ function readPaneSucceeds(h: RecoveryHarness, key: string): Promise<unknown> {
 }
 
 describe('unavailable retry: the tmux-unresponsive condition’s ends and the retry timer (SRJ-305, SRJ-306, SRJ-310)', () => {
-  afterEach(() => {
-    if (harness !== undefined) {
-      expect(harness.episodeNotices).toEqual([])
-      assertNoLeak(harness.captured())
-    }
+  beforeEach(() => {
+    harnessEndCheck = (h) => expect(h.episodeNotices).toEqual([])
   })
 
   test.each<[string, ConditionArm, string, (key: string) => string]>([
@@ -4293,10 +4277,6 @@ function expectUntouched(h: RecoveryHarness, other: string): void {
 }
 
 describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, is retried only on the backoff, and its clear stops the timer (SRJ-311, SRJ-312, SRJ-305, SRJ-306, AC 27, AC 36)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('a start-pass launch whose spawn answers ErrTmuxNotAvailable is refused and arms that persona’s timer once at the base wait with the ENVIRONMENT cause: one onset, nothing counted, no other call; the other persona is untouched', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -4692,10 +4672,6 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
 // ---------------------------------------------------------------------------
 
 describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and no kill, delete or launch (SRJ-1021, SRJ-311, AC 86)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('AC 86: with both settings 0, a live, unconnected row whose every tmux-touching verb answers the re-bound ErrTmuxNotAvailable posts one onset, SRJ-1021’s, across several retries at the backoff’s due times, with no kill, delete, spawn or resume and nothing counted; once tmux answers, the reconnect clears it with today’s all-clear and the timer stops', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -4787,10 +4763,6 @@ describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and
 // ---------------------------------------------------------------------------
 
 describe('unavailable retry: a kill of the last session on a socket, then answers from a tmux server that is exiting (AD handoff rev 23)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('ErrTmuxNotAvailable after the kill: one onset for the episode however many calls answer it, the retries on the backoff with nothing counted, deleted or launched while it lasts, one all-clear when tmux answers, the timer stopped once the persona is up; a later episode posts its own onset', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -5074,10 +5046,6 @@ async function retriesRefusedByConfig(h: RecoveryHarness, key: string, armedAt: 
 }
 
 describe('unavailable retry: CONFIG arms from any verb in any context, takes no action, is never counted, is retried only on the backoff, and its clear stops no timer (SRJ-316, SRJ-301, SRJ-305, AC 84)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('a start-pass launch whose spawn answers ErrConfigMalformed is refused and arms that persona’s timer once at the base wait with the CONFIG cause: one onset, the flag raised, no other call, nothing counted, no spawn-failure notice or spawn-failed entry; the other persona is untouched', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -5410,10 +5378,6 @@ const UNCLASSIFIED_ATTEMPTS: ReadonlyArray<readonly [string, UnclassifiedAttempt
 ]
 
 describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or counted, are retried, and post one alert per episode past the threshold (SRJ-313, SRJ-1009, AC 69, AC 80)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('SRJ-1009: the one pin case, the alert’s exact text for a sample name and message', () => {
     const text = unclassifiedErrorAlertText({ reportedName: 'ErrInternal', message: 'the store could not be read' })
 
@@ -5614,10 +5578,6 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
 })
 
 describe('unavailable retry: the unclassified-error episode’s ends and the stop observer (SRJ-313, SRJ-305)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('a retry that finds nothing left to recover ends the episode silently after its alert; a later UNCLASSIFIED outcome begins a new episode that alerts again only past the threshold from its own first outcome', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
@@ -5808,30 +5768,13 @@ describe('unavailable retry: the unclassified-error episode’s ends and the sto
 // the latch composed as `main()` composes it (the holds, then the notice)
 // ---------------------------------------------------------------------------
 
-/** A plain spawn's CONFLICT for persona `key`: its session left over from an earlier life ("duplicate session"). */
-function conflictFor(key: string): ReturnType<typeof errTmuxSessionConflict> {
-  return errTmuxSessionConflict('spawn', 'duplicate-session-leftover', personaTmuxSessionName(key))
-}
-
-/** The CONFLICT notice `conflictFor(key)` posts to persona `key`'s destination. */
-function conflictNotice(key: string, err: ReturnType<typeof conflictFor>): { key: string; text: string } {
-  const notice = expectedConflictNotice({ latchCase: LATCH_CASE_LEFTOVER, sessionName: personaTmuxSessionName(key), description: err.errDescription })
-  return { key, text: notice.text }
-}
-
-/** Every stub call made for persona `key`'s instance, over every verb. */
-function callsOf(h: RecoveryHarness, key: string): number {
-  const id = personaInstanceId(key)
-  return (Object.values(h.stub.calls).flat() as Array<{ claude_instance_id?: unknown }>).filter((params) => params?.claude_instance_id === id).length
-}
-
 /**
  * Persona `key` latched once, at a plain spawn, on `err`, recording
  * `rowState`; on that set the three holds ran, in order, before its one
  * CONFLICT notice; it is not armed, and nothing failed or was counted: no
  * spawn-failure notice, no startup-errors entry, no failure, no cap.
  */
-function expectLatchedOnce(h: RecoveryHarness, key: string, err: ReturnType<typeof conflictFor>, rowState: LatchRowState): void {
+function expectLatchedOnce(h: RecoveryHarness, key: string, err: ReturnType<typeof conflictForPersona>, rowState: LatchRowState): void {
   expect(h.latch.isLatched(key)).toBe(true)
   expect(h.latch.record(key)).toMatchObject({
     sessionName: personaTmuxSessionName(key),
@@ -5846,9 +5789,9 @@ function expectLatchedOnce(h: RecoveryHarness, key: string, err: ReturnType<type
     ['hold', 'retry timer stop'],
     ['hold', 'tmux-unresponsive end'],
     ['hold', 'unclassified-error end'],
-    ['notice', conflictNotice(key, err).text],
+    ['notice', conflictNoticeForPersona(key, err).text],
   ])
-  expect(h.episodeNotices.filter((notice) => notice.key === key)).toEqual([conflictNotice(key, err)])
+  expect(h.episodeNotices.filter((notice) => notice.key === key)).toEqual([conflictNoticeForPersona(key, err)])
   expect(h.controller.isArmed(key)).toBe(false)
   expect(h.notices).toEqual([])
   expect(h.startupErrors()).toEqual([])
@@ -5864,17 +5807,7 @@ const ARMED_MODES: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: str
   ['in pending-only mode', (h, key) => { h.controller.armPendingOnly(key) }],
 ]
 
-/** The latch-time `status` read's failures: what it answers, and whether that opens P's unclassified-error episode. */
-const LATCH_TIME_READS: ReadonlyArray<readonly [string, () => Error, boolean]> = [
-  ['UNAVAILABLE (ErrCallTimeout)', () => errCallTimeout('status'), false],
-  ['UNCLASSIFIED (ErrInternal)', () => errInternal(), true],
-]
-
 describe('unavailable retry: a latch stops the timer and ends the unclassified-error episode (SRJ-305, SRJ-313, SRJ-502)', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('a retry whose launch answers CONFLICT latches P and stops its timer with the latch’s reason, nothing pending for P; past several backoff waits nothing fires or is called for P, and the other persona’s timer keeps its schedule', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
@@ -5891,7 +5824,7 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
     const otherView = h.controller.view(other)
 
     // P's first retry: its liveness read finds no row, so it launches; the spawn answers CONFLICT.
-    const err = conflictFor(key)
+    const err = conflictForPersona(key)
     h.script({ spawnError: err })
     const before = callCounts(h)
     expect(await retryNow(h, key)).toBe(armedAt + waitMs(0))
@@ -5908,7 +5841,7 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
     expect(h.controller.view(key)).toBeUndefined()
     expect(h.controller.view(other)).toEqual(otherView)
 
-    const pCalls = callsOf(h, key)
+    const pCalls = personaCallCounts(h, key)
     const pAttempts = h.attempts.filter((attempt) => attempt.key === key).length
     let otherDue = otherArmedAt
     for (let n = 0; n < 4; n++) {
@@ -5917,7 +5850,7 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
       expect([n, h.controller.view(other)]).toEqual([n, expect.objectContaining({ phase: 'waiting', dueAt: otherDue + waitMs(n + 1), refusals: n + 1 })])
     }
     expect(otherDue - armedAt).toBeGreaterThan(waitMs(0) + waitMs(1) + waitMs(2))
-    expect(callsOf(h, key)).toBe(pCalls)
+    expect(personaCallCounts(h, key)).toEqual(pCalls)
     expect(h.attempts.filter((attempt) => attempt.key === key)).toHaveLength(pAttempts)
     expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
     expect(h.controller.armedKeys()).toEqual([other])
@@ -5931,7 +5864,7 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
     modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
     arm(h, key)
     await h.advance(waitMs(0) / 2)
-    const err = conflictFor(key)
+    const err = conflictForPersona(key)
     h.script({ spawnError: err })
 
     expect(await h.launch(key)).toEqual({ key, action: 'latched' })
@@ -5946,38 +5879,11 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
     expectUntouchedEpisode(h, other)
   })
 
-  test.each(LATCH_TIME_READS)('a start-pass launch’s first spawn answers CONFLICT and the latch-time status read answers %s: P latches with an unreadable row, the timer that read armed is stopped with nothing pending, and no episode stays open', async (_what, make, opensEpisode) => {
-    const h = (harness = makeRecoveryHarness())
-    const [key, other] = h.keys as [string, string]
-    const readErr = make()
-    const err = conflictFor(key)
-    h.script({ spawnError: err, statusError: readErr })
-
-    expect(await h.launch(key)).toEqual({ key, action: 'latched' })
-
-    expect(callCounts(h)).toEqual({ spawnCalls: 1, statusCalls: 1 })
-    expectLatchedOnce(h, key, err, LATCH_ROW_STATE_UNREADABLE)
-    // The read ran inside the launch attempt, so it armed P's timer; the latch's hold stopped it.
-    expect(h.triggers.map((trigger) => trigger.key)).toEqual([key])
-    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
-    expect(h.clock.pendingCount()).toBe(0)
-    expect(h.unclassifiedErrorOpen(key)).toBe(false)
-    expect(unclassifiedLines(h, key)).toEqual(opensEpisode
-      ? [unclassifiedStartedLine(key, readErr), unclassifiedEndedLine(key, UNCLASSIFIED_ERROR_END_LATCHED)]
-      : [])
-
-    await h.advance(2 * adAlertThresholdMsInEffect())
-    expect(h.attempts).toEqual([])
-    expect(callCounts(h)).toEqual({ spawnCalls: 1, statusCalls: 1 })
-    expect(h.episodeNotices).toEqual([conflictNotice(key, err)])
-    expectUntouchedEpisode(h, other)
-  })
-
   test.each(ARMED_MODES)('a timer armed for P after the latch %s stops at its first fire with the latch’s reason and no agent-director call', async (_mode, arm) => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
-    const err = conflictFor(key)
+    const err = conflictForPersona(key)
     h.script({ spawnError: err })
     expect(await h.launch(key)).toEqual({ key, action: 'latched' })
     expectLatchedOnce(h, key, err, LATCH_ROW_STATE_NO_ROW)
@@ -5995,7 +5901,7 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
     expect(h.clock.pendingCount()).toBe(0)
     await h.advance(10 * UNAVAILABLE_RETRY_CEILING_S * 1000)
     expect(h.attempts).toHaveLength(1)
-    expect(h.episodeNotices).toEqual([conflictNotice(key, err)])
+    expect(h.episodeNotices).toEqual([conflictNoticeForPersona(key, err)])
     expectUntouchedEpisode(h, other)
   })
 
@@ -6014,7 +5920,7 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
     expect(h.unclassifiedErrorOpen(key)).toBe(true)
     expect(h.episodeNotices).toEqual([])
 
-    const err = conflictFor(key)
+    const err = conflictForPersona(key)
     h.script({ spawnError: err })
     const conflictAt = await retryNow(h, key)
 
@@ -6030,7 +5936,7 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
     const attempts = h.attempts.length
     await h.advance(armedAt + 2 * thresholdMs - h.clock.now())
     expect(h.attempts).toHaveLength(attempts)
-    expect(h.episodeNotices).toEqual([conflictNotice(key, err)])
+    expect(h.episodeNotices).toEqual([conflictNoticeForPersona(key, err)])
     expect(unclassifiedLines(h, key)).toHaveLength(2)
     expect(h.clock.pendingCount()).toBe(0)
     expectNeverDestructive(h, key)
@@ -6161,10 +6067,6 @@ describe('unavailable retry: a latched query that throws counts as latched (SRJ-
 })
 
 describe('unavailable retry: a restart work whose latched query throws stops the timer (SRJ-502, fail safe), on the harness', () => {
-  afterEach(() => {
-    if (harness !== undefined) assertNoLeak(harness.captured())
-  })
-
   test('a full-mode retry whose restart work’s latched query throws for P stops P’s timer with the latch’s reason: no agent-director call, nothing counted, one skip line naming what it threw; the other persona’s timer keeps its schedule', async () => {
     const h = (harness = makeRecoveryHarness({
       restartDeps: {
@@ -6185,7 +6087,7 @@ describe('unavailable retry: a restart work whose latched query throws stops the
     await retryNow(h, key)
 
     expect(callsSince(h, before)).toEqual({})
-    expect(callsOf(h, key)).toBe(0)
+    expect(personaCallCounts(h, key)).toEqual({})
     expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
     expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_LATCHED))
     expect(h.controller.isArmed(key)).toBe(false)
@@ -6204,8 +6106,8 @@ describe('unavailable retry: a restart work whose latched query throws stops the
     await retryNow(h, other)
     expect(h.attempts).toHaveLength(attempts + 1)
     expect(h.attempts.at(-1)).toMatchObject({ key: other })
-    expect(callsOf(h, other)).toBeGreaterThan(0)
+    expect(personaCallCounts(h, other)).not.toEqual({})
     expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
-    expect(callsOf(h, key)).toBe(0)
+    expect(personaCallCounts(h, key)).toEqual({})
   })
 })

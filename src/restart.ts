@@ -59,6 +59,9 @@
  * before the liveness read, so a fired restart timer, the retry entry (before
  * its in-flight and cap checks) and a human-triggered restart all answer
  * `RESTART_OUTCOME_LATCHED` with no agent-director call and nothing recorded.
+ * The query is asked again before the instance is reconnected or killed
+ * (after the liveness probe, and right before the kill), since a launch
+ * outside the serializer can latch the persona during those awaits.
  * A launch that answers `'skipped'` for a persona that latched at it answers
  * the same. A latched query that throws counts as latched (fail safe).
  * Isolated from server.ts side effects — injectable deps make it testable.
@@ -168,7 +171,10 @@ export const RESTART_OUTCOME_LIVENESS_UNKNOWN = 'liveness-unknown'
 /**
  * The persona is latched (b.jg5 SRJ-502, `RestartDeps.isLatched`): the work's
  * first step found it so, and nothing was probed, reconnected, killed or
- * launched, and nothing was recorded; or its launch answered `'skipped'`
+ * launched, and nothing was recorded; or it latched while a liveness probe
+ * (or the 'escalate-dead' reconnect and its re-probe) ran, and the latched
+ * query asked again before the instance is reconnected or killed found it so,
+ * and nothing more was done or recorded; or its launch answered `'skipped'`
  * because the persona latched at that launch (a CONFLICT at a spawn or
  * resume), after which nothing was recorded either. A latched query that
  * threw answers this too (fail safe). The retry timer stops on it.
@@ -338,6 +344,12 @@ export interface RestartDeps {
    * entry before its in-flight and cap checks, a human-triggered restart):
    * for a latched persona the work makes no agent-director call, records no
    * success or failure, and answers `RESTART_OUTCOME_LATCHED`. Asked again
+   * before the instance is touched, since a launch outside the serializer can
+   * latch the persona during the work's awaits: after the liveness probe
+   * (with the second `canRestart` check, before `reconnectSession` or
+   * `killSession`) and right before `killSession` (after an 'escalate-dead'
+   * reconnect and its re-probe); a persona latched then answers the same with
+   * nothing more done. Asked again
    * when the launch answers `'skipped'`, so a persona that latched at that
    * launch answers the same. An answer of exactly `true` is latched, and so
    * is a query that throws (fail safe: logged in the one latched line, with
@@ -593,8 +605,9 @@ function launchInFlight(key: string, isInFlight: (key: string) => boolean): bool
  * one recovery attempt for the persona (b.jg5 SRJ-301). Answers what it did (`RestartWorkOutcome`).
  */
 async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<RestartWorkOutcome> {
-  // b.jg5 SRJ-502: the one gate before the liveness read; a latched persona's
-  // instance is never probed, reconnected, killed or launched here.
+  // b.jg5 SRJ-502: the gate before the liveness read; a latched persona's
+  // instance is never probed, reconnected, killed or launched here. The steps
+  // ask again after their awaits, before the instance is touched.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
   return runInAttempt(key, 'recovery', () => restartWorkSteps(d, key, cwd, sessionId))
 }
@@ -620,6 +633,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // instance; `launchSession`'s own gate (`'skipped'` below) covers a flip
   // during the kill.
   if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
+  // b.jg5 SRJ-502: the latch is asked again for the same reason. A launch
+  // outside the serializer (e.g. the start pass's) may have latched the
+  // persona while the probe ran; then nothing is reconnected or killed.
+  if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
 
   // b.jg5 SRJ-314: agent-director could not report on the persona (a
   // `status` error, or a probe that threw). Never read as dead: no
@@ -710,6 +727,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // Kill the zombie session, if any. A refused kill (`KILL_SESSION_REFUSED`,
   // b.jg5 SRJ-105) stops the run below with no launch; any other error (a
   // throw, e.g. the session may not exist) is ignored and the launch follows.
+  // b.jg5 SRJ-502: the latch is asked once more right before the kill, so a
+  // persona that latched during the 'escalate-dead' reconnect and its re-probe
+  // is never killed.
+  if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
   let killed: KillSessionResult = undefined
   try {
     killed = await d.killSession(key)

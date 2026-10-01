@@ -311,6 +311,34 @@ function latchHoldProps(): Map<string, string> {
   return objectProperties(args[1]!)
 }
 
+/** The latch's factory (b.jg5 SRJ-501); renaming it fails the typecheck. */
+const LATCH_FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatch'
+
+/** Every path that can launch, and so latch or meet a latched persona (b.jg5 SRJ-501, SRJ-502): the retry controller's retries, the restart module, the start bring-up and the health check. */
+function latchStartPass(): number[] {
+  return [
+    onlyCallOf('createUnavailableRetryController'),
+    onlyCallOf('initRestart'),
+    startResolution(SERVER_CODE).bringUpAt,
+    onlyCallOf('initHealthCheck'),
+  ]
+}
+
+/** The reconnect adapter's builder (b.f2b, b.jg5 SRJ-502); renaming it fails the typecheck. */
+const RECONNECT_ADAPTER: keyof typeof ServerModule = '_buildReconnectSessionAdapter'
+
+/** The offset of the reconnect adapter's only build in server.ts (its declaration aside); fails unless there is exactly one. */
+function onlyReconnectAdapterBuild(): number {
+  const builds = indicesOf(new RegExp(`(?<![\\w.$]|function\\s+)${RECONNECT_ADAPTER}\\s*\\(`, 'g'), SERVER_CODE)
+  expect(builds).toHaveLength(1)
+  return builds[0]!
+}
+
+/** The top-level arguments of the reconnect adapter's only build (whitespace collapsed). */
+function reconnectAdapterArgs(): string[] {
+  return splitTopLevel(callArguments(SERVER_CODE, onlyReconnectAdapterBuild()))
+}
+
 /** The retry action's in-flight member (b.jg5 SRJ-301); renaming it fails the typecheck. */
 const RETRY_IN_FLIGHT_MEMBER: keyof FullModeRetryDeps = 'isInFlight'
 /** The health check's in-flight member (b.f2b, b.jg5 SRJ-315); renaming it fails the typecheck. */
@@ -2310,7 +2338,6 @@ describe('main() builds the one unclassified-error episodes instance over the no
 
 describe('main() builds the one per-persona latch, in server memory only, before the start pass, and binds its CONFLICT notice once to the one set of notice episodes (b.jg5 SRJ-501, SRJ-508)', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
-  const FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatch'
   const BIND: keyof typeof ConflictLatchModule = 'bindConflictNotice'
   const OBSERVER_FACTORY: keyof typeof ConflictLatchModule = 'createConflictNoticeObserver'
   const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
@@ -2321,33 +2348,23 @@ describe('main() builds the one per-persona latch, in server memory only, before
 
   const LATCH_PATH = join(SRC_DIR, 'conflict-latch.ts')
 
-  /** Every path that can launch, and so meet a CONFLICT: the retry controller's retries, the restart module, the start bring-up and the health check. */
-  function startPass(): number[] {
-    return [
-      onlyCallOf('createUnavailableRetryController'),
-      onlyCallOf('initRestart'),
-      startResolution(SERVER_CODE).bringUpAt,
-      onlyCallOf('initHealthCheck'),
-    ]
-  }
-
   test('the latch is built exactly once, in main()\'s own statement list (not at module scope, behind no branch), after the notice episodes and before the retry controller and the start pass', () => {
-    const at = onlyCallOf(FACTORY)
-    const latch = constOf(FACTORY)
+    const at = onlyCallOf(LATCH_FACTORY)
+    const latch = constOf(LATCH_FACTORY)
     declaredOnce(latch)
-    const decl = SERVER_CODE.search(new RegExp(`\\bconst\\s+${latch}\\s*=\\s*${FACTORY}\\s*\\(`))
+    const decl = SERVER_CODE.search(new RegExp(`\\bconst\\s+${latch}\\s*=\\s*${LATCH_FACTORY}\\s*\\(`))
     expect(decl).toBeGreaterThan(-1)
     expect(decl).toBeLessThan(at)
     expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
-    expect(importSource(SERVER_CODE, FACTORY)).toBe('./conflict-latch.ts')
-    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(importSource(SERVER_CODE, LATCH_FACTORY)).toBe('./conflict-latch.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${LATCH_FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
 
     expect(at).toBeGreaterThan(onlyCallOf(EPISODES_FACTORY))
-    for (const later of startPass()) expect(at).toBeLessThan(later)
+    for (const later of latchStartPass()) expect(at).toBeLessThan(later)
   })
 
   test('its only dependency is the server log: no option loads latch state from anywhere', () => {
-    const props = onlyCallProps(FACTORY)
+    const props = onlyCallProps(LATCH_FACTORY)
     expect([...props.keys()]).toEqual([LOG])
     expect(props.get(LOG)).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
   })
@@ -2358,9 +2375,9 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(importSource(SERVER_CODE, BIND)).toBe('./conflict-latch.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${BIND}\\b`, 'g'), SERVER_CODE)).toEqual([])
 
-    expect(onlyCallArgs(BIND)).toEqual([constOf(FACTORY), constOf(EPISODES_FACTORY)])
-    expect(at).toBeGreaterThan(onlyCallOf(FACTORY))
-    for (const later of startPass()) expect(at).toBeLessThan(later)
+    expect(onlyCallArgs(BIND)).toEqual([constOf(LATCH_FACTORY), constOf(EPISODES_FACTORY)])
+    expect(at).toBeGreaterThan(onlyCallOf(LATCH_FACTORY))
+    for (const later of latchStartPass()) expect(at).toBeLessThan(later)
 
     // No second binding by hand: the notice's observer is built only inside
     // the binding, and no set observer is added in server.ts.
@@ -2368,8 +2385,8 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(indicesOf(new RegExp(`\\.\\s*${ADD_OBSERVER}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build, its two bindings, its install, its three latched queries and the teardown\'s forget, and the latch module imports no file-system module', () => {
-    const latch = constOf(FACTORY)
+  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build, its two bindings, its install, its four latched queries (the retry action\'s, the restart work\'s, the reconnect adapter\'s inside the restart module\'s call, and the health tick\'s) and the teardown\'s forget, and the latch module imports no file-system module', () => {
+    const latch = constOf(LATCH_FACTORY)
 
     // No seed: no statement in main()'s own list records a latch, and nothing
     // in server.ts calls a set entry on it at all.
@@ -2379,21 +2396,29 @@ describe('main() builds the one per-persona latch, in server memory only, before
 
     // Named only at its build, then once inside each of: the holds' binding
     // and the notice's binding (b.jg5 SRJ-502, SRJ-508), the session
-    // manager's install, and the retry action's, the restart module's and the
-    // health check's latched queries (their forms are pinned in the describe
-    // below), and the persona teardown's latch forget (b.jg5 SRJ-504; its
-    // form is pinned in tests/reload-wiring.test.ts).
+    // manager's install, the retry action's and the health check's latched
+    // queries, and the persona teardown's latch forget (b.jg5 SRJ-504; its
+    // form is pinned in tests/reload-wiring.test.ts); twice inside the restart
+    // module's call: its own latched query and the reconnect adapter's, asked
+    // right before /mcp reconnect is typed (b.jg5 SRJ-502). The queries'
+    // forms are pinned in the describe below.
     const named = indicesOf(new RegExp(`\\b${latch}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(8)
+    expect(named).toHaveLength(9)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${latch}\\b`))!
     expect(named[0]).toBe(decl.index! + decl[0].length - latch.length)
-    const within = (call: string) => {
-      const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf(call), '(', ')')
-      return named.filter((at) => at >= open && at < close).length
+    const withinAt = (at: number) => {
+      const [open, close] = balancedAfter(SERVER_CODE, at, '(', ')')
+      return named.filter((offset) => offset >= open && offset < close).length
     }
+    const within = (call: string) => withinAt(onlyCallOf(call))
     expect(
       [BIND_LATCH_HOLDS, BIND, 'setConflictLatch', 'createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaLifecycle'].map(within),
-    ).toEqual([1, 1, 1, 1, 1, 1, 1])
+    ).toEqual([1, 1, 1, 1, 2, 1, 1])
+    // The restart module's second: the reconnect adapter's, built inside its call.
+    const [restartOpen, restartClose] = balancedAfter(SERVER_CODE, onlyCallOf('initRestart'), '(', ')')
+    const adapter = onlyReconnectAdapterBuild()
+    expect(adapter > restartOpen && adapter < restartClose).toBe(true)
+    expect(withinAt(adapter)).toBe(1)
     expect(onlyCallProps('createPersonaLifecycle').get('forgetConflictLatch')).toContain(`${latch}.`)
 
     // The factory itself reads no file: the latch module imports no
@@ -2429,7 +2454,6 @@ describe('main() builds the one per-persona latch, in server memory only, before
 
 describe('main() binds the latch\'s holds before its CONFLICT notice, installs the latch in the session manager before the start pass, and binds its latched query into the retry action, the restart work and the health tick (b.jg5 SRJ-502, SRJ-305, SRJ-310, SRJ-313, SRJ-315)', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
-  const FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatch'
   const BIND_NOTICE: keyof typeof ConflictLatchModule = 'bindConflictNotice'
   const HOLD_OBSERVER_FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatchHoldObserver'
   const IS_LATCHED: keyof ConflictLatch = 'isLatched'
@@ -2443,16 +2467,6 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
   const TMUX_END_LATCHED: keyof typeof PersonaEpisodesModule = 'TMUX_UNRESPONSIVE_END_LATCHED'
   const UNCLASSIFIED_END_LATCHED: keyof typeof PersonaEpisodesModule = 'UNCLASSIFIED_ERROR_END_LATCHED'
   const INSTALL: keyof typeof SessionManagerModule = 'setConflictLatch'
-
-  /** Every path that can launch, and so latch or meet a latched persona: the retry controller's retries, the restart module, the start bring-up and the health check. */
-  function startPass(): number[] {
-    return [
-      onlyCallOf('createUnavailableRetryController'),
-      onlyCallOf('initRestart'),
-      startResolution(SERVER_CODE).bringUpAt,
-      onlyCallOf('initHealthCheck'),
-    ]
-  }
 
   /** `(key) => <call>` or `(key) => { <call> }`, `<call>` given `\1` for the parameter, whose name is free. */
   function oneKeyArrow(call: string): RegExp {
@@ -2471,12 +2485,12 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     importedOnly(BIND_LATCH_HOLDS, './conflict-latch.ts')
 
     const [latch, , log] = onlyCallArgs(BIND_LATCH_HOLDS)
-    expect(latch).toBe(constOf(FACTORY))
+    expect(latch).toBe(constOf(LATCH_FACTORY))
     expect(log).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
 
-    expect(at).toBeGreaterThan(onlyCallOf(FACTORY))
+    expect(at).toBeGreaterThan(onlyCallOf(LATCH_FACTORY))
     expect(at).toBeLessThan(onlyCallOf(BIND_NOTICE))
-    for (const later of startPass()) expect(at).toBeLessThan(later)
+    for (const later of latchStartPass()) expect(at).toBeLessThan(later)
 
     expect(callsOf(HOLD_OBSERVER_FACTORY)).toEqual([])
   })
@@ -2520,11 +2534,11 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     const at = onlyCallOf(INSTALL)
     expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
     importedOnly(INSTALL, './session-manager.ts')
-    expect(onlyCallArgs(INSTALL)).toEqual([constOf(FACTORY)])
+    expect(onlyCallArgs(INSTALL)).toEqual([constOf(LATCH_FACTORY)])
 
     expect(at).toBeGreaterThan(onlyCallOf(BIND_LATCH_HOLDS))
     expect(at).toBeGreaterThan(onlyCallOf(BIND_NOTICE))
-    for (const later of startPass()) expect(at).toBeLessThan(later)
+    for (const later of latchStartPass()) expect(at).toBeLessThan(later)
   })
 
   // The holds name the retry controller, the condition and the unclassified
@@ -2539,26 +2553,35 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(install, last))).toEqual([])
   })
 
-  test('the latched query is bound exactly once into each of the full-mode retry action, the restart work and the health tick, as a call-time read of the one latch\'s isLatched for the key it is given', () => {
-    const latch = constOf(FACTORY)
+  test('four latched queries: the latched query is bound exactly once into each of the full-mode retry action, the restart work, the reconnect adapter (its second argument, after the persona lookup) and the health tick, as a call-time read of the one latch\'s isLatched for the key it is given', () => {
+    const latch = constOf(LATCH_FACTORY)
     declaredOnce(latch)
     const query = oneKeyArrow(`${latch}\\.${IS_LATCHED}\\(\\1\\)`)
     expect(onlyCallProps('createFullModeRetryAction').get(RETRY_LATCHED)).toMatch(query)
     expect(onlyCallProps('initRestart').get(RESTART_LATCHED)).toMatch(query)
     expect(onlyCallProps('initHealthCheck').get(TICK_LATCHED)).toMatch(query)
+    // b.jg5 SRJ-502: the reconnect adapter asks it right before typing /mcp reconnect.
+    const [lookup, adapterQuery, ...extra] = reconnectAdapterArgs()
+    expect([lookup, extra]).toEqual(['getAppliedPersona', []])
+    expect(adapterQuery).toMatch(query)
 
-    // No other latched member or query anywhere in server.ts: one of each
-    // inside each of the three calls.
-    const members = indicesOf(new RegExp(`\\b${IS_LATCHED}\\s*:`, 'g'), SERVER_CODE)
-    const queries = indicesOf(new RegExp(`\\.\\s*${IS_LATCHED}\\s*\\(`, 'g'), SERVER_CODE)
-    for (const offsets of [members, queries]) {
-      expect(offsets).toHaveLength(3)
-      const within = (call: string) => {
-        const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf(call), '(', ')')
-        return offsets.filter((at) => at > open && at < close).length
-      }
-      expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map(within)).toEqual([1, 1, 1])
+    // No other latched member in main() or query anywhere in server.ts: one
+    // member inside each of the three calls, and one query inside each of the
+    // three calls and the reconnect adapter's build (the one inside the
+    // restart module's call). Outside main(), `isLatched:` is only a
+    // parameter's type annotation (the reconnect adapter's latched gate), no
+    // binding.
+    const within = (offsets: number[], at: number) => {
+      const [open, close] = balancedAfter(SERVER_CODE, at, '(', ')')
+      return offsets.filter((offset) => offset > open && offset < close).length
     }
+    const members = indicesOf(new RegExp(`\\b${IS_LATCHED}\\s*:`, 'g'), SERVER_CODE).filter(insideMain)
+    expect(members).toHaveLength(3)
+    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => within(members, onlyCallOf(call)))).toEqual([1, 1, 1])
+    const queries = indicesOf(new RegExp(`\\.\\s*${IS_LATCHED}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(queries).toHaveLength(4)
+    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => within(queries, onlyCallOf(call)))).toEqual([1, 2, 1])
+    expect(within(queries, onlyReconnectAdapterBuild())).toBe(1)
   })
 })
 
@@ -2601,10 +2624,18 @@ describe('server.ts wires the b.f2b stale-working-row recovery', () => {
     expect(props.get('isAutoRestartDisabled')).toBe(`() => ${delay![1]}.session_restart_delay === 0`)
   })
 
-  test('the restart module\'s reconnect is the reconnect adapter over the live applied persona lookup, getAppliedPersona, which locates a working row\'s transcript under the persona\'s claude_config_dir', () => {
-    expect(onlyCallProps('initRestart').get('reconnectSession')).toBe('_buildReconnectSessionAdapter(getAppliedPersona)')
-    // The only adapter built (its declaration aside): no reconnect path without the lookup.
-    expect(indicesOf(/(?<![\w.$]|function\s+)_buildReconnectSessionAdapter\s*\(/g, SERVER_CODE)).toHaveLength(1)
+  test('the restart module\'s reconnect is the reconnect adapter over the live applied persona lookup, getAppliedPersona, which locates a working row\'s transcript under the persona\'s claude_config_dir, and the one latch\'s latched query, asked right before /mcp reconnect is typed (b.jg5 SRJ-502)', () => {
+    // Tied to src by type: renaming it fails the typecheck.
+    const IS_LATCHED: keyof ConflictLatch = 'isLatched'
+    const latch = constOf(LATCH_FACTORY)
+    const reconnect = onlyCallProps('initRestart').get('reconnectSession')!
+    expect(reconnect).toMatch(new RegExp(`^${RECONNECT_ADAPTER}\\(getAppliedPersona, \\(?(\\w+)\\)? => ${latch}\\.${IS_LATCHED}\\(\\1\\)\\)$`))
+    // The only adapter built (its declaration aside), and it is the one the
+    // restart module gets: no reconnect path without the lookup or the latch.
+    const adapter = onlyReconnectAdapterBuild()
+    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf('initRestart'), '(', ')')
+    expect(adapter > open && adapter < close).toBe(true)
+    expect(reconnectAdapterArgs()).toHaveLength(2)
   })
 
   test('handleInitialized ends the persona\'s not-connected episode once its session is registered: forgetNotConnectedEpisode(persona.key), the session manager\'s, right after registerSession', () => {

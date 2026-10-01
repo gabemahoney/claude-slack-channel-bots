@@ -1107,8 +1107,21 @@ function conflictWithDescription(descriptor: PropertyDescriptor, c: ConflictCase
 }
 
 describe('conflictDescriptionOf', () => {
-  test('the CONFLICT table is not vacuous: every stub case and every options variant is in it', () => {
-    expect(CONFLICT_BUILDS.length).toBeGreaterThanOrEqual(CONFLICT_CASES.length * 2 + CONFLICT_VARIANTS.length * 2)
+  test('the CONFLICT table is not vacuous: the stub cases and options variants its values carry the words of are exactly the stub\'s CONFLICT_CASES and every options variant', () => {
+    // A stub value's case, read back from its description: the case (or
+    // variant) whose words are exactly the description's CONFLICT words. Only
+    // the stub's values carry the list --tmux-session-name line; the base
+    // error, whose description carries no CONFLICT word, is left out.
+    const sameWords = (description: string, words: readonly string[]) =>
+      JSON.stringify(wordsIn(description)) === JSON.stringify([...words].sort())
+    const descriptions = CONFLICT_BUILDS
+      .map(([, build]) => (build() as AgentDirectorError).errDescription)
+      .filter((d) => d.includes('list --tmux-session-name '))
+    const caseOf = (d: string) => (Object.keys(CASE_WORDS) as ConflictCase[]).find((c) => sameWords(d, CASE_WORDS[c]))
+    const cases = new Set(descriptions.map(caseOf).filter((c) => c !== undefined))
+    const variants = new Set(CONFLICT_VARIANTS.filter(([, , , , words]) => descriptions.some((d) => sameWords(d, words))).map(([label]) => label))
+    expect(cases).toEqual(new Set(CONFLICT_CASES))
+    expect(variants).toEqual(new Set(CONFLICT_VARIANTS.map(([label]) => label)))
   })
 
   test.each(CONFLICT_BUILDS)('%s answers its own errDescription, read from the value', (_label, build) => {

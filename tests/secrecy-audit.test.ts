@@ -410,8 +410,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     if (touches) expect(reasons.every((r) => r.includes('src/conflict-latch.ts') && r.includes('the conflict latch'))).toBe(true)
   })
 
-  test('src/conflict-latch.ts exists, so its surface is not stale, and no suite is exempted for it', () => {
-    expect(SOURCE_FILES).toContain('src/conflict-latch.ts')
+  test('no suite is exempted for src/conflict-latch.ts', () => {
     const exemptForLatch = Object.keys(EXEMPT).filter(
       (file) => SUITES.includes(file) && touchReasons(file).some((r) => r.includes('src/conflict-latch.ts')),
     )

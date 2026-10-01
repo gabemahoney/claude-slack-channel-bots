@@ -1262,6 +1262,8 @@ describe('_buildReconnectSessionAdapter', () => {
     launchStartedAt?: string
     /** When set, every findMissing sweep rejects with it. */
     findMissingError?: Error
+    /** The adapter's latched query (production: the one latch's `isLatched`, b.jg5 SRJ-502); absent, none is passed. */
+    isLatched?: (key: string) => boolean
   }): {
     adapter: (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient' | 'pending'>
     statusCalls: StatusParams[]
@@ -1324,8 +1326,9 @@ describe('_buildReconnectSessionAdapter', () => {
     return {
       // The builder resolves the instance ID from the persona key alone
       // (b.av2 SR-2.2); its persona lookup only locates a `working` row's
-      // transcript (b.f2b).
-      adapter: _buildReconnectSessionAdapter(opts.getPersona),
+      // transcript (b.f2b). Its latched query is asked right before
+      // `/mcp reconnect` is typed (b.jg5 SRJ-502).
+      adapter: _buildReconnectSessionAdapter(opts.getPersona, opts.isLatched),
       statusCalls,
       sendKeysCalls,
       findMissingCalls,
@@ -2335,6 +2338,199 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(r.lines.filter((l) => l.includes('findMissing sweep failed'))).toEqual([
         `[slack] ${site.prefix}: findMissing sweep failed for persona=C1: ${describeAgentDirectorFailure(err)} — proceeding`,
       ])
+    })
+  })
+
+  // b.jg5 SRJ-502: the adapter's reads are awaited, and a launch outside the
+  // restart serializer can latch the persona while they run, after the
+  // restart work's own latched check. So the latch is asked once more right
+  // before `/mcp reconnect` is typed, after every read: a latched persona, or
+  // a query that throws (fail safe), gets nothing typed, one line naming it,
+  // and 'transient'. An unlatched one, or no query passed, is reconnected as
+  // before. Attempts run on a fake clock passed to `_setNow`.
+  describe('b.jg5 SRJ-502: a persona latched by the time /mcp reconnect would be typed', () => {
+    let clock: FakeClock
+
+    beforeEach(() => {
+      clock = createFakeClock()
+      _setNow(clock.now)
+    })
+
+    /** The adapter's latched line for persona C1; `failure` is the failed query's part (`''`: none). */
+    const latchedLine = (failure: string): string =>
+      `[slack] reconnectSession: persona=C1 is latched${failure} — not typing /mcp reconnect; nothing done (b.jg5 SRJ-502)`
+
+    /** The adapter's latched lines for persona C1 among the lines `errArgs` holds. */
+    const latchedLines = (errArgs: unknown[][]): string[] =>
+      stringLines(errArgs).filter((l) => l.startsWith('[slack] reconnectSession: persona=C1 is latched'))
+
+    /** The latched line's part for a query that threw `err`. */
+    const queryFailed = (err: unknown): string => ` (the latched query failed: ${describeThrownValue(err)} — taken as latched)`
+
+    /** A latch for the adapter: `latched` read at each query, every query's key in `asked`, and each query noted in `events`. */
+    function makeLatch(events: string[] = []): { latched: boolean; asked: string[]; isLatched: (key: string) => boolean } {
+      const latch = {
+        latched: false,
+        asked: [] as string[],
+        isLatched: (key: string) => {
+          latch.asked.push(key)
+          events.push('isLatched')
+          return latch.latched
+        },
+      }
+      return latch
+    }
+
+    /** The harness options for a stale `working` row whose positive-idle evidence concludes at the attempt 60 s after the first. */
+    function staleWorkingRow(): Parameters<typeof makeHarness>[0] {
+      const transcript = join(dir, `${TRANSCRIPT_SESSION_ID}.jsonl`)
+      writeTranscript(transcript, endedTurn())
+      return { statusState: 'working', tmux: 'alive', pane: IDLE_PANE, row: { jsonl_path: transcript, claude_session_id: TRANSCRIPT_SESSION_ID } }
+    }
+
+    test("a waiting row whose persona is latched → 'transient': the status and pane reads ran, then the query was asked once for C1, and nothing was typed or swept; one latched line", async () => {
+      const latch = makeLatch()
+      latch.latched = true
+      const h = makeHarness({ statusState: 'waiting', isLatched: latch.isLatched })
+
+      const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
+
+      expect(result).toBe('transient')
+      expect(h.statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+      expect(h.readPaneCalls).toHaveLength(1)
+      expect(latch.asked).toEqual(['C1'])
+      expect(h.sendKeysCalls).toEqual([])
+      expect(h.findMissingCalls).toHaveLength(0)
+      expect([h.killCalls, h.spawnCalls, h.resumeCalls]).toEqual([[], [], []])
+      expect(stringLines(errArgs)).toEqual([latchedLine('')])
+    })
+
+    test("a stale working row whose persona is latched → 'transient' at the attempt that would type, though its evidence has held for 60 s; nothing typed; one latched line", async () => {
+      const latch = makeLatch()
+      const h = makeHarness({ ...staleWorkingRow(), isLatched: latch.isLatched })
+
+      expect(await h.adapter('C1')).toBe('transient') // the evidence starts; no query yet
+      expect(latch.asked).toEqual([])
+      await clock.advance(STALE_WORKING_WINDOW_MS)
+      latch.latched = true
+      const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
+
+      expect(result).toBe('transient')
+      expect(latch.asked).toEqual(['C1'])
+      expect(h.sendKeysCalls).toEqual([])
+      expect(h.findMissingCalls).toHaveLength(0)
+      // The b.f2b line that the row is stale comes first; the latch stops the typing.
+      expect(latchedLines(errArgs)).toEqual([latchedLine('')])
+    })
+
+    test("a latched query that throws is taken as latched (fail safe) → 'transient', nothing typed or swept; one line naming what it threw, described and token-safe", async () => {
+      const err = Object.assign(new Error(`latched query broke (${sentinelInMessage('latched-query')})`), { code: 'EIO', note: LEAK_SENTINEL })
+      const asked: string[] = []
+      const h = makeHarness({ statusState: 'waiting', isLatched: (key) => { asked.push(key); throw err } })
+
+      const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
+
+      expect(result).toBe('transient')
+      expect(asked).toEqual(['C1'])
+      expect(h.sendKeysCalls).toEqual([])
+      expect(h.findMissingCalls).toHaveLength(0)
+      const lines = stringLines(errArgs)
+      expect(lines).toEqual([latchedLine(queryFailed(err))])
+      expect(lines[0]).toContain(`(the latched query failed: Error code=EIO message="latched query broke (${REDACTED_SENTINEL_TAIL})" at `)
+      expect(lines[0]).not.toContain(LEAK_SENTINEL)
+      assertNoLeak({ errArgs })
+    })
+
+    // The persona is not latched when the attempt starts; the latch is set
+    // while one of its awaited reads is in flight (the read resolves after
+    // it). The query asked after the last read sees it.
+    /** [label, harness options, attempts before the one the latch lands in, the verb the latch lands in, the reads of that attempt in order]. */
+    const LATCH_DURING: ReadonlyArray<readonly [string, () => Parameters<typeof makeHarness>[0], number, 'status' | 'readPane' | 'get', readonly string[]]> = [
+      ["a waiting row's status read", () => ({ statusState: 'waiting' }), 0, 'status', ['status', 'readPane']],
+      ["a waiting row's pane read", () => ({ statusState: 'waiting' }), 0, 'readPane', ['status', 'readPane']],
+      ["a stale working row's pane read", staleWorkingRow, 1, 'readPane', ['status', 'readPane', 'get']],
+      ["a stale working row's transcript row read", staleWorkingRow, 1, 'get', ['status', 'readPane', 'get']],
+    ]
+
+    test.each(LATCH_DURING)("REPRO: the persona latched during %s → 'transient' with nothing typed or swept: the query is asked once, after every read of the attempt; one latched line", async (_label, opts, before, verb, reads) => {
+      const events: string[] = []
+      const latch = makeLatch(events)
+      const h = makeHarness({ ...opts(), isLatched: latch.isLatched })
+      for (let i = 0; i < before; i++) {
+        expect(await h.adapter('C1')).toBe('transient')
+        await clock.advance(STALE_WORKING_WINDOW_MS)
+      }
+      expect(latch.asked).toEqual([])
+      // Note each read of the attempt; the latch is set inside `verb`'s, before it resolves.
+      const stub = h.stub as unknown as Record<string, (params: unknown) => Promise<unknown>>
+      for (const name of new Set(reads)) {
+        const real = stub[name]!.bind(h.stub)
+        stub[name] = async (params) => {
+          events.push(name)
+          if (name === verb) latch.latched = true
+          return real(params)
+        }
+      }
+
+      const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
+
+      expect(result).toBe('transient')
+      expect(events).toEqual([...reads, 'isLatched'])
+      expect(latch.asked).toEqual(['C1'])
+      expect(h.sendKeysCalls).toEqual([])
+      expect(h.findMissingCalls).toHaveLength(0)
+      expect(latchedLines(errArgs)).toEqual([latchedLine('')])
+    })
+
+    test("an unlatched persona is reconnected as before: the query is asked once for C1, then /mcp reconnect is typed → 'success'; no latched line", async () => {
+      const latch = makeLatch()
+      const h = makeHarness({ statusState: 'waiting', isLatched: latch.isLatched })
+
+      const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
+
+      expect(result).toBe('success')
+      expect(latch.asked).toEqual(['C1'])
+      expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(latchedLines(errArgs)).toEqual([])
+    })
+
+    test("an unlatched stale working row is reconnected once its evidence has held for 60 s, as before → ['transient', 'success']; the query is asked only at the attempt that types", async () => {
+      const latch = makeLatch()
+      const h = makeHarness({ ...staleWorkingRow(), isLatched: latch.isLatched })
+
+      const verdicts = [await h.adapter('C1')]
+      await clock.advance(STALE_WORKING_WINDOW_MS)
+      verdicts.push(await h.adapter('C1'))
+
+      expect(verdicts).toEqual(['transient', 'success'])
+      expect(latch.asked).toEqual(['C1'])
+      expect(h.sendKeysCalls).toHaveLength(1)
+    })
+
+    test("no latched query passed: a waiting row is reconnected as before → 'success', with no latched line", async () => {
+      // The harness's stub and seams, with the adapter built without the query.
+      const h = makeHarness({ statusState: 'waiting' })
+      const adapter = _buildReconnectSessionAdapter(undefined)
+
+      const { result, errArgs } = await capturingErrorArgs(() => adapter('C1'))
+
+      expect(result).toBe('success')
+      expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(stringLines(errArgs)).toEqual([`[slack] reconnecting MCP server "${MCP_SERVER_NAME}": persona=C1`])
+    })
+
+    test("a verdict reached before the reconnect is unchanged and asks no query: a pending row → 'pending', a working row mid-turn → 'transient', with nothing typed and no latched line", async () => {
+      const latch = makeLatch()
+      latch.latched = true
+      const pending = makeHarness({ statusState: AGENT_DIRECTOR_PENDING_STATE, isLatched: latch.isLatched })
+      const pendingRun = await capturingErrorArgs(() => pending.adapter('C1'))
+      const busy = makeHarness({ statusState: 'working', tmux: 'alive', pane: SPINNER_PANE, isLatched: latch.isLatched })
+      const busyRun = await capturingErrorArgs(() => busy.adapter('C1'))
+
+      expect([pendingRun.result, busyRun.result]).toEqual(['pending', 'transient'])
+      expect(latch.asked).toEqual([])
+      expect([pending.sendKeysCalls, busy.sendKeysCalls]).toEqual([[], []])
+      expect(latchedLines([...pendingRun.errArgs, ...busyRun.errArgs])).toEqual([])
     })
   })
 })
