@@ -1016,18 +1016,18 @@ describe('isDifferentTmuxServerError', () => {
     ['an ErrConfigMalformed (envelope description)', () => errUnknownErrorName(ERR_CONFIG_MALFORMED, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_CONFIG],
     [
       'an ErrUnknownErrorName whose unknownName is ErrTmuxNotAvailable (envelope description)',
-      () => errUnknownErrorName(ERR_TMUX_NOT_AVAILABLE, DIFFERENT_SERVER_DESCRIPTION),
+      () => {
+        const err = errUnknownErrorName(ERR_TMUX_NOT_AVAILABLE, DIFFERENT_SERVER_DESCRIPTION)
+        // Precondition: the words really are in the envelope's description.
+        expect((err.envelope as { err_description: string }).err_description).toContain(DIFFERENT_TMUX_SERVER_PHRASE)
+        return err
+      },
       AD_ERROR_CLASS_UNAVAILABLE,
     ],
   ])('%s carrying the words is %s-classed and not the re-bound form', (_label, build, expected) => {
     const value = build()
     expect(classifyAdError(value).errorClass).toBe(expected)
     expect(isDifferentTmuxServerError(value)).toBe(false)
-  })
-
-  test('the ErrUnknownErrorName case does carry the words in its envelope description', () => {
-    const err = errUnknownErrorName(ERR_TMUX_NOT_AVAILABLE, DIFFERENT_SERVER_DESCRIPTION)
-    expect((err.envelope as { err_description: string }).err_description).toContain(DIFFERENT_TMUX_SERVER_PHRASE)
   })
 
   test.each<[string, PropertyDescriptor]>([

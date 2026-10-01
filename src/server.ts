@@ -192,6 +192,7 @@ import {
   createFullModeRetryAction,
   createUnavailableRetryController,
   unavailableRetryCauseFor,
+  UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
@@ -2393,6 +2394,15 @@ export async function main(): Promise<void> {
     // background for a `working` row), so the tick still reads the persona
     // but makes no attempt for it.
     isLaunchInFlight: isPersonaWorkInFlight,
+    // b.jg5 SRJ-311: a persona held off on its `tmux-unavailable` outage that
+    // the tick does not find healthy, with no retry timer on the controller
+    // built above (a retry can stop with the flag still raised), gets one
+    // armed with the ENVIRONMENT cause, the outage's own class; its stop
+    // checks end it with no agent-director call for a persona not up.
+    isRetryArmed: (key) => retryTimers.isArmed(key),
+    armRetryTimer: (key) => {
+      retryTimers.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT })
+    },
     // b.f2b: with session_restart_delay 0 scheduleRestart does nothing, so an
     // alive persona the tick would reconnect gets the not-connected notice
     // (once per episode, worded for a disconnected or a streamless session)

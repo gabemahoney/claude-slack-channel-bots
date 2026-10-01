@@ -4705,7 +4705,7 @@ describe('unavailable retry: a kill of the last session on a socket, then answer
     // ErrTmuxNotAvailable.
     h.script({ spawnError: errTmuxNotAvailable() })
     const killedAt = h.clock.now()
-    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).not.toBe(RESTART_OUTCOME_COUNTED_FAILURE)
+    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
     await h.settle()
     expect(kills).toEqual([killedAt])
     expect(row.spawnedAt).toEqual([killedAt])
@@ -4779,7 +4779,7 @@ describe('unavailable retry: a kill of the last session on a socket, then answer
 
     h.script({ spawnError: errTmuxUnresponsive('spawn') })
     const killedAt = h.clock.now()
-    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).not.toBe(RESTART_OUTCOME_COUNTED_FAILURE)
+    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
     await h.settle()
     expect(kills).toEqual([killedAt])
     expect(row.spawnedAt).toEqual([killedAt])

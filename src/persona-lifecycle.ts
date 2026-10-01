@@ -291,7 +291,9 @@ export interface PersonaLifecycleDeps {
   /**
    * Stop the key's UNAVAILABLE retry timer (b.jg5 SRJ-305: the retry
    * controller's `stop` with the torn-down reason), called beside
-   * `cancelRestartTimer`; other personas' timers stay armed. In production
+   * `cancelRestartTimer`, and again after the teardown's agent-director calls
+   * (a failing kill's ENVIRONMENT answer arms the key's timer); other
+   * personas' timers stay armed. In production
    * the stop also cancels the key's `tmux-unresponsive` alert check through
    * the controller's stop observer (b.jg5 SRJ-309: its text says CSCB keeps
    * retrying), its episode kept until `forgetNoticeEpisodes`.
@@ -530,8 +532,13 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
       await step(`agent-director kill of ${instanceId}`, () => deps.killInstance(key))
       await step(`agent-director delete of ${instanceId}`, () => deps.deleteInstance(key))
     }
-    // After the agent-director calls: a flag a failing call raised goes too.
+    // After the agent-director calls: a flag a failing call raised goes too,
+    // and so does a retry timer it armed (an ENVIRONMENT answer arms one in
+    // any context, b.jg5 SRJ-311). Its key stays applied for a destructive
+    // modify, so a timer left armed would retry against the new half 30 s
+    // later with agent-director calls; stopping it here leaves none.
     await step('forgetting its outage state', () => deps.resetOutageState([key]))
+    await step('stopping its UNAVAILABLE retry timer', () => deps.stopRetryTimer(key))
     // The old half of a destructive modify is still applied, so a notice
     // raised during this teardown (an outage onset from a failing kill) was
     // held for it rather than dropped: drop it again, so it never reaches the

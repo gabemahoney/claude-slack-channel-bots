@@ -151,7 +151,12 @@
  * timer with `UNAVAILABLE_RETRY_CAUSE_READ_ERROR` on every `unknown` liveness
  * reading at the restart work, the re-probe's included, whatever made it
  * `unknown` (a CONFIG or UNUSABLE NAME answer and a probe that throws
- * included, which the arming predicate above does not arm on).
+ * included, which the arming predicate above does not arm on). A third is
+ * the health tick's (`HealthCheckDeps.armRetryTimer`, wired in `main()`): a
+ * persona held off on its `tmux-unavailable` outage that the tick does not
+ * find healthy, with no timer armed, is armed with
+ * `UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT` (a retry that stopped as not up, on
+ * a declined launch or on a failed run leaves the flag raised).
  *
  * The retry action (b.jg5 SRJ-303, SRJ-305). The server's action is
  * `createFullModeRetryAction(deps)`, for both modes: at each retry, before
@@ -262,7 +267,9 @@ export const UNAVAILABLE_RETRY_CAUSE_KILL_FAILED = 'kill-failed'
  * The cause of an ENVIRONMENT answer (`ErrTmuxNotAvailable`) from any verb
  * for the persona (b.jg5 SRJ-301, SRJ-311, SRJ-105), in or out of an attempt:
  * the only cause that arms outside a launch or recovery attempt for the
- * persona (`reportAttemptError`). Never counted, and it never starts or
+ * persona (`reportAttemptError`), and the cause the health tick arms with
+ * for a raised `tmux-unavailable` outage that has no timer
+ * (`HealthCheckDeps.armRetryTimer`). Never counted, and it never starts or
  * continues the `tmux-unresponsive` condition (SRJ-307: only UNAVAILABLE
  * does).
  */

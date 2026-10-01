@@ -27,7 +27,9 @@
  * liveness, connection and stream are read, so a healthy one takes the
  * healthy branch. Any other reading clears its streak, with no
  * `scheduleRestart` and no not-connected notice: the tick makes no attempt
- * of its own for it.
+ * of its own for it. When that reason is `tmux-unavailable` and the persona
+ * has no retry timer (`isRetryArmed`), the tick arms one (`armRetryTimer`,
+ * the ENVIRONMENT cause), so the outage's retry is still its attempt.
  * Follows the same pattern as restart.ts: module-scoped state, injectable
  * deps, no server.ts imports.
  *
@@ -98,6 +100,28 @@ export interface HealthCheckDeps {
    * tick (logged), before any read. Absent: nothing is in flight.
    */
   isLaunchInFlight?(key: string): boolean
+  /**
+   * b.jg5 SRJ-311: true while the persona has a retry timer, waiting or
+   * running (production: the retry controller's `isArmed`). Read only for a
+   * persona whose no-attempt reason is `tmux-unavailable` and that the tick
+   * read but did not find healthy: a raised outage does not guarantee a
+   * timer (a retry that stopped as not up, on a declined launch or on a
+   * failed run leaves the flag raised), and with none armed nothing would
+   * ever attempt for it. Only an answer of exactly `false` lets the tick call
+   * `armRetryTimer`. Absent: the tick arms nothing.
+   */
+  isRetryArmed?(key: string): boolean
+  /**
+   * b.jg5 SRJ-311: arm the persona's retry timer with the ENVIRONMENT cause
+   * (production: the retry controller's `arm` with
+   * `UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT`), called when `isRetryArmed`
+   * answers false for a persona the tick holds off on for `tmux-unavailable`
+   * and did not find healthy. The tick still makes no attempt of its own:
+   * the timer's retry is the persona's attempt, and its stop checks end it,
+   * with no agent-director call, for a persona that is not up, not applied
+   * or at the cap. Absent: nothing is armed.
+   */
+  armRetryTimer?(key: string): void
   /**
    * b.f2b: true when auto-restart is disabled (`session_restart_delay` 0).
    * `scheduleRestart` then does nothing, so an alive persona the tick finds
@@ -259,7 +283,9 @@ const disconnectedStreak = new Map<string, number>()
  * Why the tick makes no attempt of its own for a persona this tick (b.jg5
  * SRJ-315): `in-flight`, work in flight for it (`isLaunchInFlight`), or
  * `tmux-unavailable`, its `tmux-unavailable` outage raised (b.jg5 SRJ-311:
- * its retry timer is then its only attempt, one per backoff interval). A
+ * its retry timer is then its only attempt, one per backoff interval; a tick
+ * that finds it not healthy with no timer armed arms one,
+ * `armMissingRetryTimer`). A
  * new reason is one more member here and one more check in
  * `noAttemptReason`.
  */
@@ -275,6 +301,25 @@ function noAttemptReason(d: HealthCheckDeps, key: string): NoAttemptReason | nul
   if (d.isLaunchInFlight?.(key) === true) return 'in-flight'
   if (getOutageFlags(key).has('tmux-unavailable')) return 'tmux-unavailable'
   return null
+}
+
+/**
+ * b.jg5 SRJ-311: for a persona held off on `tmux-unavailable` that the tick
+ * did not find healthy, arm its retry timer with the ENVIRONMENT cause when
+ * it has none (`isRetryArmed` answers exactly false), with one line saying
+ * so. A retry that stopped while the flag stayed raised (not up, a declined
+ * launch, a failed run) leaves the persona with no attempt at all otherwise.
+ * The tick schedules nothing and posts nothing for it. Called only for a
+ * persona in the tick's work list (applied and up), never capped, with no
+ * restart pending or active and nothing in flight, so at most once per tick
+ * per persona, and only while no timer is armed; a timer armed here that
+ * then finds the persona not up or capped stops at its first retry with no
+ * agent-director call. A throw propagates (the per-persona `catch` logs it).
+ */
+function armMissingRetryTimer(d: HealthCheckDeps, key: string): void {
+  if (d.armRetryTimer === undefined || d.isRetryArmed?.(key) !== false) return
+  console.error(`[slack] health-check: persona=${key} has its tmux-unavailable outage raised with no retry timer — arming one`)
+  d.armRetryTimer(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +421,8 @@ export function startHealthCheck(intervalSeconds: number): void {
           // read below, so one that recovered on its own takes the healthy
           // branch (clearing the outage and ending `tmux-unresponsive`), but
           // the tick schedules nothing and posts no not-connected notice.
-          const holdOff = noAttemptReason(deps, key) !== null
+          const reason = noAttemptReason(deps, key)
+          const holdOff = reason !== null
 
           if (await deps.statRoute(cwd)) {
             clearOutageFlag(key, 'cwd-unreachable')
@@ -430,8 +476,12 @@ export function startHealthCheck(intervalSeconds: number): void {
             // healthy (`dead`, `pending`, disconnected or streamless): no
             // `scheduleRestart`, and no not-connected notice, which only
             // accompanies an attempt. Drop the streak, as every skip does, so
-            // a later attempt starts a fresh two-tick count.
+            // a later attempt starts a fresh two-tick count. With
+            // `tmux-unavailable` and no retry timer armed, arm one.
             disconnectedStreak.delete(key)
+            // b.jg5 SRJ-311: the outage's retry timer is the persona's only
+            // attempt, but a raised flag does not guarantee one is armed.
+            if (reason === 'tmux-unavailable') armMissingRetryTimer(deps, key)
           } else if (!alive) {
             // Dead session: schedule immediately. The disconnected streak is
             // meaningless once the row is not alive, so drop it.

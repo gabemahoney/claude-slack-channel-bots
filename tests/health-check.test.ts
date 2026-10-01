@@ -146,6 +146,13 @@ type DepsOpts = {
   personasSequence?: Array<Record<string, string>>
   throwOnKey?: string               // isSessionAlive throws for this persona key
   maxTicks?: number                  // stop after this many tick bodies (isShuttingDown turns true)
+  // b.jg5 SRJ-311: when set, `isRetryArmed` is present, answers this for every
+  // persona and records each key asked (isRetryArmedCalls). Absent: the dep
+  // is absent, as every case that leaves it alone expects.
+  retryArmedResult?: boolean
+  // b.jg5 SRJ-311: when true, `armRetryTimer` is present and records each arm
+  // with the tick it came on (armRetryTimerCalls). Otherwise it is absent.
+  recordRetryArms?: boolean
 }
 
 function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
@@ -163,6 +170,10 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
   // b.9cj: same idea keyed on hasSessionStream call count — lets a streamless
   // test assert the fire landed on the Nth stream observation (streak debounce).
   scheduleRestartAtStreamCount: number[]
+  /** b.jg5 SRJ-311: every key `isRetryArmed` was asked for (present only with `retryArmedResult`). */
+  isRetryArmedCalls: string[]
+  /** b.jg5 SRJ-311: every `armRetryTimer` call, with its tick number (present only with `recordRetryArms`). */
+  armRetryTimerCalls: Array<{ key: string; tick: number }>
 } {
   const scheduleRestartCalls: Array<{ key: string; cwd: string }> = []
   const isSessionAliveCalls: string[] = []
@@ -171,6 +182,8 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
   const statRouteCalls: string[] = []
   const scheduleRestartAtConnectedCount: number[] = []
   const scheduleRestartAtStreamCount: number[] = []
+  const isRetryArmedCalls: string[] = []
+  const armRetryTimerCalls: Array<{ key: string; tick: number }> = []
   const connectedCallCount = new Map<string, number>()
   const streamCallCount = new Map<string, number>()
   const aliveCallCount = new Map<string, number>()
@@ -187,6 +200,20 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
     tickCount: () => ticks,
     scheduleRestartAtConnectedCount,
     scheduleRestartAtStreamCount,
+    isRetryArmedCalls,
+    armRetryTimerCalls,
+
+    ...(opts.retryArmedResult === undefined ? {} : {
+      isRetryArmed(key: string) {
+        isRetryArmedCalls.push(key)
+        return opts.retryArmedResult!
+      },
+    }),
+    ...(opts.recordRetryArms === true ? {
+      armRetryTimer(key: string) {
+        armRetryTimerCalls.push({ key, tick: ticks })
+      },
+    } : {}),
 
     async isSessionAlive(key) {
       isSessionAliveCalls.push(key)
@@ -1140,6 +1167,15 @@ async function runTicks(deps: ReturnType<typeof makeDeps>, n: number): Promise<v
   expect(deps.tickCount()).toBe(n)
 }
 
+/** Run `fn` with console.error captured; answers the lines it logged. */
+async function capturingErrors(fn: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = []
+  const saved = console.error
+  console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '))
+  try { await fn() } finally { console.error = saved }
+  return lines
+}
+
 describe('forgetDisconnectedStreak — per-persona teardown (b.av2 SR-6.5)', () => {
   test('B\'s streak is dropped at once and silently, A\'s is kept; B then leaves the work list (not probed) and is re-added with a fresh streak', async () => {
     const full = workList('persona_a', 'persona_b')
@@ -1465,6 +1501,24 @@ describe('b.jg5 SRJ-314: a pending row is never counted healthy', () => {
   })
 })
 
+/**
+ * Every tick reading that is not healthy (b.jg5 SRJ-310, SRJ-312), each row
+ * scripting `persona`'s answers. It takes a name fixed when the table is
+ * built, not the file's KEY: KEY is only set in beforeAll, after the table
+ * exists.
+ */
+function notHealthyReadings(persona: string): Array<[string, DepsOpts]> {
+  return [
+    ['pending (no launch start), connected with its stream', { aliveSequence: { [persona]: [LIVENESS_READING_PENDING] } }],
+    ['pending (a launch start), connected with its stream', { aliveSequence: { [persona]: [pendingLivenessReading(SAMPLE_LAUNCH_START_WHOLE)] } }],
+    ['unknown', { aliveSequence: { [persona]: [LIVENESS_READING_UNKNOWN] } }],
+    ['a thrown probe', { aliveSequence: { [persona]: [new Error('simulated status failure')] } }],
+    ['dead', { aliveSequence: { [persona]: [LIVENESS_READING_DEAD] } }],
+    ['live but disconnected', { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false }],
+    ['live and connected but streamless', { isSessionAliveResult: LIVENESS_READING_LIVE, hasSessionStreamResult: false }],
+  ]
+}
+
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-310 rule 2 (tick half) — a live healthy tick ends tmux-unresponsive
 //
@@ -1521,17 +1575,7 @@ describe('b.jg5 SRJ-310: a live, connected tick with its stream ends the persona
     expect(ended).toEqual([[1, KEY], [4, KEY]])
   })
 
-  // The rows key their scripted answers by P, a name fixed when the table is
-  // built: the file's KEY is only set in beforeAll, after the table exists.
-  test.each<[string, DepsOpts]>([
-    ['pending (no launch start), connected with its stream', { aliveSequence: { [P]: [LIVENESS_READING_PENDING] } }],
-    ['pending (a launch start), connected with its stream', { aliveSequence: { [P]: [pendingLivenessReading(SAMPLE_LAUNCH_START_WHOLE)] } }],
-    ['unknown', { aliveSequence: { [P]: [LIVENESS_READING_UNKNOWN] } }],
-    ['a thrown probe', { aliveSequence: { [P]: [new Error('simulated status failure')] } }],
-    ['dead', { aliveSequence: { [P]: [LIVENESS_READING_DEAD] } }],
-    ['live but disconnected', { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false }],
-    ['live and connected but streamless', { isSessionAliveResult: LIVENESS_READING_LIVE, hasSessionStreamResult: false }],
-  ])('%s: over two ticks the hook is never called', async (_label, opts) => {
+  test.each(notHealthyReadings(P))('%s: over two ticks the hook is never called', async (_label, opts) => {
     const deps = makeDeps({ personas: workList(P), ...opts, maxTicks: 2 })
     const ended: string[] = []
     deps.endTmuxUnresponsive = (key) => void ended.push(key)
@@ -1615,17 +1659,7 @@ describe('b.jg5 SRJ-312: a live, connected tick with its stream clears the perso
     expect(cleared).toEqual([[P, 'tmux-unavailable', LIVENESS_LIVE]])
   })
 
-  // The rows key their scripted answers by P, a name fixed when the table is
-  // built: the file's KEY is only set in beforeAll, after the table exists.
-  test.each<[string, DepsOpts]>([
-    ['pending (no launch start), connected with its stream', { aliveSequence: { [P]: [LIVENESS_READING_PENDING] } }],
-    ['pending (a launch start), connected with its stream', { aliveSequence: { [P]: [pendingLivenessReading(SAMPLE_LAUNCH_START_WHOLE)] } }],
-    ['unknown', { aliveSequence: { [P]: [LIVENESS_READING_UNKNOWN] } }],
-    ['a thrown probe', { aliveSequence: { [P]: [new Error('simulated status failure')] } }],
-    ['dead', { aliveSequence: { [P]: [LIVENESS_READING_DEAD] } }],
-    ['live but disconnected', { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false }],
-    ['live and connected but streamless', { isSessionAliveResult: LIVENESS_READING_LIVE, hasSessionStreamResult: false }],
-  ])('%s: over two ticks the flag stays raised, nothing is posted after its onset and the observer is never told', async (_label, opts) => {
+  test.each(notHealthyReadings(P))('%s: over two ticks the flag stays raised, nothing is posted after its onset and the observer is never told', async (_label, opts) => {
     setOutageFlag(P, 'tmux-unavailable')
     const deps = makeDeps({ personas: workList(P), ...opts, maxTicks: 2 })
 
@@ -1648,8 +1682,12 @@ describe('b.jg5 SRJ-312: a live, connected tick with its stream clears the perso
 // healthy persona takes the healthy branch (episode and tmux-unresponsive
 // ended, tmux-unavailable cleared). Any other reading clears its streak. A
 // restart pending or active, and the cap, still skip it before any read, and
-// come first. The tick-end (onset) hook runs once per tick under every rule.
-// Another persona under neither rule is checked as today.
+// come first. The tick-end (onset) hook runs once per tick under every rule
+// (pinned in the SRJ-308 cases below). Another persona under neither rule is
+// checked as today. Under `tmux-unavailable` only, a tick that reads the
+// persona not healthy with no retry timer armed (`isRetryArmed` false) arms
+// one (`armRetryTimer`, b.jg5 SRJ-311; production binds both to the retry
+// controller, pinned in tests/server-startup-wiring.test.ts).
 // ---------------------------------------------------------------------------
 
 describe('b.jg5 SRJ-315: no attempt, still read', () => {
@@ -1703,15 +1741,6 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     return { notified, episodesEnded, conditionsEnded }
   }
 
-  /** Run `fn` with console.error captured (the cap skip logs a line per tick); answers the lines. */
-  async function quietly(fn: () => Promise<void>): Promise<string[]> {
-    const lines: string[] = []
-    const saved = console.error
-    console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '))
-    try { await fn() } finally { console.error = saved }
-    return lines
-  }
-
   // Each row but `unknown` would be attempted without a rule: dead on the
   // first tick, the others on the second (the two-tick debounce), with the
   // notice at delay 0. `unknown` is never attempted; under a rule it is still
@@ -1736,7 +1765,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     const { notified, episodesEnded, conditionsEnded } = recording(deps)
 
     // An unknown reading logs a line per tick.
-    await quietly(() => runTicks(deps, 2))
+    await capturingErrors(() => runTicks(deps, 2))
 
     expect(deps.statRouteCalls).toEqual([personas[P]!, personas[P]!])
     expect(deps.isSessionAliveCalls).toEqual([P, P])
@@ -1829,25 +1858,6 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(getOutageFlags(B).size).toBe(0)
   })
 
-  const onsetRows: Array<[string, (deps: Deps) => void]> = [
-    ...RULES.map(([rule, apply]) => [rule, (deps: Deps) => apply(deps)] as [string, (deps: Deps) => void]),
-    ['a restart pending', (deps) => { deps.isRestartPendingOrActive = (key) => key === P }],
-    ['at the restart cap', (deps) => { deps.isAtCap = (key) => key === P }],
-  ]
-  test.each(onsetRows)('onset regardless of attempt: P dead and skipped (%s) on each of two ticks: the tick-end hook is still called once per tick, with that tick\'s start time; nothing scheduled', async (_rule, apply) => {
-    const deps = makeDeps({ personas: workList(P), maxTicks: 2 })
-    apply(deps)
-    const startTimes = [10_000, 20_000]
-    deps.now = () => startTimes[Math.min(deps.tickCount(), startTimes.length - 1)]!
-    const ends: Array<[number, number]> = []
-    deps.onTickEnd = (tickStartedAt) => void ends.push([tickStartedAt, deps.tickCount()])
-
-    await quietly(() => runTicks(deps, 2))
-
-    expect(ends).toEqual([[10_000, 1], [20_000, 2]])
-    expect(deps.scheduleRestartCalls).toEqual([])
-  })
-
   // The restart-pending/active and cap skips come before the no-attempt
   // decision: P reads healthy, so were it read it would be probed, end its
   // episode and condition, and (when raised) clear tmux-unavailable.
@@ -1862,7 +1872,7 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     apply(deps)
     const { notified, episodesEnded, conditionsEnded } = recording(deps)
 
-    await quietly(() => runTicks(deps, 2))
+    await capturingErrors(() => runTicks(deps, 2))
 
     expect(deps.statRouteCalls).toEqual([])
     expect(deps.isSessionAliveCalls).toEqual([])
@@ -1883,12 +1893,166 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
       return false
     }
 
-    const lines = await quietly(() => runTicks(deps, 1))
+    const lines = await capturingErrors(() => runTicks(deps, 1))
 
     expect(deps.statRouteCalls).toEqual([personas[B]!])
     expect(deps.isSessionAliveCalls).toEqual([B])
     expect(deps.scheduleRestartCalls).toEqual([{ key: B, cwd: personas[B]! }])
     expect(lines.filter((l) => l.includes(`persona=${P}`) && l.includes('simulated in-flight failure'))).toHaveLength(1)
+  })
+
+  // b.jg5 SRJ-311: a raised tmux-unavailable outage does not guarantee a retry
+  // timer, so a tick that reads P not healthy under that rule with none armed
+  // (`isRetryArmed` answers exactly false) arms one, logging one line before
+  // it, and still schedules nothing and posts nothing. A healthy tick clears
+  // the flag instead; a reading the tick skips (`unknown`, a thrown probe), an
+  // armed timer, an absent `isRetryArmed` and work in flight arm nothing.
+  // Only these cases set `retryArmedResult` / `recordRetryArms`; every other
+  // case in this file leaves both deps absent.
+  const armingLine = (key: string) =>
+    `[slack] health-check: persona=${key} has its tmux-unavailable outage raised with no retry timer — arming one`
+  const armMark = (key: string) => `arm ${key}`
+
+  /** Log a mark at each arm, so the captured lines show each arm's place beside its line. */
+  function markingArms(deps: Deps): void {
+    const arm = deps.armRetryTimer!
+    deps.armRetryTimer = (key) => {
+      console.error(armMark(key))
+      arm(key)
+    }
+  }
+
+  /** The rows of `notHealthyReadings(P)` with these labels; throws (failing the file) if one is missing. */
+  function readingsLabelled(...labels: string[]): Array<[string, DepsOpts]> {
+    const rows = notHealthyReadings(P).filter(([label]) => labels.includes(label))
+    if (rows.length !== labels.length) throw new Error(`notHealthyReadings has no row for one of: ${labels.join(', ')}`)
+    return rows
+  }
+  // Read and not healthy: the tick reaches its no-attempt branch.
+  const READ_NOT_HEALTHY = readingsLabelled(
+    'pending (no launch start), connected with its stream',
+    'pending (a launch start), connected with its stream',
+    'dead',
+    'live but disconnected',
+    'live and connected but streamless',
+  )
+  // Skipped after the read (b.jg5 SRJ-314): never reaches that branch.
+  const SKIPPED_READINGS = readingsLabelled('unknown', 'a thrown probe')
+
+  test.each(READ_NOT_HEALTHY)('tmux-unavailable raised with no retry timer armed, read %s on two ticks with auto-restart disabled: the tick arms P\'s timer once per tick, each after its line; nothing scheduled, no not-connected notice, the flag stays raised', async (_label, opts) => {
+    const deps = makeDeps({ personas: workList(P), ...opts, retryArmedResult: false, recordRetryArms: true, maxTicks: 2 })
+    tmuxUnavailable(deps)
+    markingArms(deps)
+    const { notified, episodesEnded, conditionsEnded } = recording(deps)
+
+    const lines = await capturingErrors(() => runTicks(deps, 2))
+
+    expect(deps.isSessionAliveCalls).toEqual([P, P])
+    expect(deps.isRetryArmedCalls).toEqual([P, P])
+    expect(deps.armRetryTimerCalls).toEqual([{ key: P, tick: 1 }, { key: P, tick: 2 }])
+    expect(lines).toEqual([armingLine(P), armMark(P), armingLine(P), armMark(P)])
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(notified).toEqual([])
+    expect(episodesEnded).toEqual([])
+    expect(conditionsEnded).toEqual([])
+    expect(getOutageFlags(P).has('tmux-unavailable')).toBe(true)
+    expect(notices).toEqual([{ key: P, text: ONSET }])
+  })
+
+  test('a timer the tick armed is seen as armed on the next tick: tmux-unavailable raised, read dead on three ticks, P\'s timer is armed once, on tick 1', async () => {
+    const deps = makeDeps({ personas: workList(P), retryArmedResult: false, recordRetryArms: true, maxTicks: 3 })
+    tmuxUnavailable(deps)
+    deps.isRetryArmed = (key) => deps.armRetryTimerCalls.some((call) => call.key === key)
+
+    const lines = await capturingErrors(() => runTicks(deps, 3))
+
+    expect(deps.isSessionAliveCalls).toEqual([P, P, P])
+    expect(deps.armRetryTimerCalls).toEqual([{ key: P, tick: 1 }])
+    expect(lines).toEqual([armingLine(P)])
+    expect(deps.scheduleRestartCalls).toEqual([])
+  })
+
+  test.each(READ_NOT_HEALTHY)('tmux-unavailable raised with a retry timer armed, read %s on two ticks: nothing is armed and no line logged', async (_label, opts) => {
+    const deps = makeDeps({ personas: workList(P), ...opts, retryArmedResult: true, recordRetryArms: true, maxTicks: 2 })
+    tmuxUnavailable(deps)
+
+    const lines = await capturingErrors(() => runTicks(deps, 2))
+
+    expect(deps.isRetryArmedCalls).toEqual([P, P])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(lines).not.toContain(armingLine(P))
+    expect(deps.scheduleRestartCalls).toEqual([])
+  })
+
+  test('tmux-unavailable raised with no isRetryArmed (armRetryTimer present), read dead on two ticks: nothing is armed and no line logged', async () => {
+    const deps = makeDeps({ personas: workList(P), recordRetryArms: true, maxTicks: 2 })
+    tmuxUnavailable(deps)
+    expect(deps.isRetryArmed).toBeUndefined()
+
+    const lines = await capturingErrors(() => runTicks(deps, 2))
+
+    expect(deps.isSessionAliveCalls).toEqual([P, P])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(lines).not.toContain(armingLine(P))
+    expect(deps.scheduleRestartCalls).toEqual([])
+  })
+
+  test('tmux-unavailable raised with no retry timer armed, read live, connected and with its stream: nothing is armed and the flag clears instead, with one all-clear', async () => {
+    const deps = makeDeps({ personas: workList(P), isSessionAliveResult: LIVENESS_READING_LIVE, retryArmedResult: false, recordRetryArms: true, maxTicks: 1 })
+    tmuxUnavailable(deps)
+
+    const lines = await capturingErrors(() => runTicks(deps, 1))
+
+    expect(deps.isRetryArmedCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(lines).not.toContain(armingLine(P))
+    expect(getOutageFlags(P).size).toBe(0)
+    expect(notices).toEqual([{ key: P, text: ONSET }, { key: P, text: ALL_CLEAR }])
+  })
+
+  test.each(SKIPPED_READINGS)('tmux-unavailable raised with no retry timer armed, read %s on two ticks: the persona is skipped after the read, nothing is armed and the flag stays raised', async (_label, opts) => {
+    const deps = makeDeps({ personas: workList(P), ...opts, retryArmedResult: false, recordRetryArms: true, maxTicks: 2 })
+    tmuxUnavailable(deps)
+
+    // Each skipped reading logs a line per tick.
+    const lines = await capturingErrors(() => runTicks(deps, 2))
+
+    expect(deps.isSessionAliveCalls).toEqual([P, P])
+    expect(deps.isRetryArmedCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(lines).not.toContain(armingLine(P))
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(getOutageFlags(P).has('tmux-unavailable')).toBe(true)
+  })
+
+  test.each(READ_NOT_HEALTHY)('a launch in flight with tmux-unavailable raised too and no retry timer armed, read %s on two ticks: the in-flight reason wins, so nothing is armed', async (_label, opts) => {
+    const deps = makeDeps({ personas: workList(P), ...opts, retryArmedResult: false, recordRetryArms: true, maxTicks: 2 })
+    inFlight(deps)
+    tmuxUnavailable(deps)
+
+    const lines = await capturingErrors(() => runTicks(deps, 2))
+
+    expect(deps.isSessionAliveCalls).toEqual([P, P])
+    expect(deps.isRetryArmedCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(lines).not.toContain(armingLine(P))
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(getOutageFlags(P).has('tmux-unavailable')).toBe(true)
+  })
+
+  test('isolation: P with tmux-unavailable raised and B under neither rule, both dead with no retry timer armed, over two ticks: only P\'s timer is armed (once per tick); B is never asked about, armed for or logged, and is scheduled each tick as today', async () => {
+    const personas = workList(P, B)
+    const deps = makeDeps({ personas, retryArmedResult: false, recordRetryArms: true, maxTicks: 2 })
+    tmuxUnavailable(deps)
+
+    const lines = await capturingErrors(() => runTicks(deps, 2))
+
+    expect(deps.isSessionAliveCalls).toEqual([P, B, P, B])
+    expect(deps.isRetryArmedCalls).toEqual([P, P])
+    expect(deps.armRetryTimerCalls).toEqual([{ key: P, tick: 1 }, { key: P, tick: 2 }])
+    expect(lines).toEqual([armingLine(P), armingLine(P)])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: B, cwd: personas[B]! }, { key: B, cwd: personas[B]! }])
+    expect(getOutageFlags(B).size).toBe(0)
   })
 })
 
@@ -1933,15 +2097,6 @@ describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick
       ends.push({ tickStartedAt, ticks: deps.tickCount(), probes: deps.isSessionAliveCalls.length })
     }
     return { reads, ends }
-  }
-
-  /** Run `fn` with console.error captured; answers the lines it logged. */
-  async function capturingErrors(fn: () => Promise<void>): Promise<string[]> {
-    const lines: string[] = []
-    const saved = console.error
-    console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '))
-    try { await fn() } finally { console.error = saved }
-    return lines
   }
 
   test('two personas over three ticks: one call per tick body, after both personas\' work, with that tick\'s start time from now; now is read once per body, before its work', async () => {
@@ -1994,6 +2149,10 @@ describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick
   test.each<[string, DepsOpts, (deps: ReturnType<typeof makeDeps>) => void]>([
     ['a restart pending', { isRestartPendingResult: true }, bindNothing],
     ['a launch in flight', {}, (deps) => { deps.isLaunchInFlight = () => true }],
+    ['tmux-unavailable raised', {}, () => {
+      setOutageFlag('persona_a', 'tmux-unavailable')
+      setOutageFlag('persona_b', 'tmux-unavailable')
+    }],
     ['at the restart cap', { isAtCapResult: true }, bindNothing],
     ['an unknown reading', { aliveSequence: { persona_a: [LIVENESS_READING_UNKNOWN], persona_b: [LIVENESS_READING_UNKNOWN] } }, bindNothing],
   ])('no persona attempted (%s) on each of two ticks: the hook is still called once per tick, with that tick\'s start time', async (_label, opts, bind) => {

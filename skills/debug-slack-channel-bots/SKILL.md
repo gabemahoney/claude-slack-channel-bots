@@ -1180,7 +1180,8 @@ that one persona, not an agent-director outage: no outage notice is posted
 for it. The refused call is retried on its own (see
 [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)).
 The record ends as soon as the session answers again: a call that acts on
-its session succeeds, or a health check or retry finds its instance running
+its session succeeds or is told the session is gone, or a health check or
+retry finds its instance running
 with its session connected and receiving messages. A `status`, `get` or
 `list` failure alone (a call that only reads the persona's state) never
 starts it, ends it or produces these notices, and neither does a failure to
@@ -1577,7 +1578,7 @@ retries' own lines go only to the server log.
 All of one persona's retry lines (replace `ops_bot` with the key):
 
 ```sh
-grep -h -E 'unavailable-retry: persona=ops_bot |Session relaunch refused for persona=ops_bot |Session kill refused for persona=ops_bot |refused for persona=ops_bot: |refused for "[^"]*" \(key=ops_bot\)|Restart retry skipped for persona=ops_bot ' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+grep -h -E 'unavailable-retry: persona=ops_bot |health-check: persona=ops_bot has its tmux-unavailable |Session relaunch refused for persona=ops_bot |Session kill refused for persona=ops_bot |refused for persona=ops_bot: |refused for "[^"]*" \(key=ops_bot\)|Restart retry skipped for persona=ops_bot ' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
 ```
 
 `<cause>` is `unavailable` (agent-director refused a call), `kill-failed`
@@ -1605,12 +1606,17 @@ below. Nothing is killed,
 deleted or relaunched because of it, no `Spawn failure:` notice is posted and
 nothing counts toward the restart limit. While the notice holds, the health
 check still checks the persona but never restarts or reconnects it; the
-retries go on at their backoff. A lost message or a session disconnect can
+retries go on at their backoff. If the retries stopped while the notice still
+holds (the persona wasn't up at a retry, its relaunch was declined, or the
+retry failed internally), the next health check that finds the persona not
+healthy starts them again with the `environment` cause (the
+`has its tmux-unavailable outage raised with no retry timer` line below), so
+the persona is never left with nothing retrying it. A lost message or a session disconnect can
 still start a restart, but while tmux is unavailable its reconnect, kill and
 relaunch are refused (`Session kill refused` or `Session relaunch refused`
 below): nothing is relaunched and nothing counts toward the restart limit. The notice clears, with its
 all-clear, only once tmux itself answers: a call that works the persona's
-session succeeds, or a health check or retry finds the persona running,
+session succeeds or is told the session is gone, or a health check or retry finds the persona running,
 connected and receiving messages. The retry line that follows is usually
 `stopped — nothing left to recover` (a retry found the persona healthy) or,
 after a retry relaunched it, `kept — the tmux-unavailable condition cleared,
@@ -1619,11 +1625,14 @@ row until it is live). A clear between retries, by a health check or another
 call, logs `stopped — the tmux-unavailable condition cleared`. A state
 check or row read that succeeds while tmux is still broken clears nothing. A
 retry started for a persona that was removed or isn't up stops at its first
-retry with no call.
+retry with no call; one started by a removal's own kill or delete is stopped
+by the removal itself, so it never retries a persona whose settings changed
+and is coming up again.
 
 | Line | Meaning | What to do |
 |---|---|---|
 | `[slack] unavailable-retry: persona=<key> armed (<cause>) — first retry in 30 s` | agent-director refused a call while the persona was being launched or recovered, answered any call for it with `ErrTmuxNotAvailable` (`environment`, at any time), or a restart couldn't read the persona's state (`read-error`). Its first retry is due in 30 s. A refusal while it is already waiting logs nothing and keeps the time. | Nothing. If it keeps retrying, see below. |
+| `[slack] health-check: persona=<key> has its tmux-unavailable outage raised with no retry timer — arming one` | The persona's *tmux unavailable* or *tmux server changed* notice still holds, a health check found it not running, still starting, disconnected or not receiving messages, and nothing was retrying it (its earlier retries stopped: it wasn't up at a retry, its relaunch was declined, or the retry failed internally). The health check starts the retries; `[slack] unavailable-retry: persona=<key> armed (environment) — first retry in 30 s` follows. The health check itself still restarts and reconnects nothing. | Nothing; the retries take over. If the persona isn't up, the first retry stops with `the persona is not up; its bring-up owns it`: follow its class line (see [Persona diagnostic classes](#persona-diagnostic-classes)). For tmux itself, see **tmux isn't available** above and **It never clears** below. |
 | `[slack] Session relaunch refused for persona=<key> — not counted; its UNAVAILABLE retry timer owns the persona` | A relaunch was refused by agent-director. It doesn't count toward the restart limit; the retries above take over. | Nothing. |
 | `[slack] <step>: <call> refused for "<name>" (key=<key>): <error> — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)` | While the persona was being launched, agent-director refused a call (`<call>` names it, such as `spawn`, `resume`, `kill`, `delete`, `collision get`, `send-keys` or `findMissing sweep`), or couldn't report the persona's state (`status read`, or `ErrJsonlMissing diagnosis get`: the read of the persona's old row before replacing a missing transcript). The launch stops there with no `Spawn failure:` notice, no `spawn-failed` entry and nothing counted; nothing is deleted, killed or launched after it. After `ErrJsonlMissing diagnosis get` there is also no `jsonl-diagnosis-inconclusive` entry and no uncertainty warning to the persona: nothing was diagnosed. The retries above take over. The restart path's reconnect logs the same line with `persona=<key>` in place of the name, `reconnectMcp: send-keys refused for persona=<key>: <error> — …`: agent-director refused its keystrokes and the reconnect is not done. A refused `findMissing sweep` on the restart path logs `escalate-dead: findMissing sweep refused for persona=<key>: <error> — …` (after its `escalate-dead:` line) or `reconnectSession: prompt row: findMissing sweep refused for persona=<key>: <error> — …`: the restart does nothing more this time (nothing is checked again, stopped or relaunched, and no notice is posted). A `send-keys refused` line naming `ErrSpawnNotInteractive` and ending `dead session (b.dup)` is not a refusal: the persona's session is gone and it is recovered. | Nothing. If it keeps happening, see **It never clears** below. |
 | `[slack] killSession (restart adapter): kill refused for persona=<key>: <error> — no relaunch follows (b.jg5 SRJ-105)` | A restart's kill of the persona's old session was refused by agent-director, agent-director couldn't stop the session, or it answered that tmux isn't available (`ErrTmuxNotAvailable`). The next line follows. | Nothing. For `ErrTmuxNotAvailable`, see **tmux isn't available** above. |

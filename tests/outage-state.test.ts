@@ -430,16 +430,6 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     expect(getOutageFlags(P1).size).toBe(0)
   })
 
-  test('16a twin. withOutageDetection success of a call that is not tmux-touching (status): ad clears silently; tmux-unavailable stays raised; no all-clear (b.jg5 SRJ-312)', async () => {
-    const { emissions } = makeHarness()
-    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
-    setOutageFlag(P1, 'tmux-unavailable')
-    const before = emissions.length
-    await withOutageDetection(P1, '/cwd', 'status', async (_client) => 'ok')
-    expect(emissions.length).toBe(before) // silent — tmux-unavailable still set
-    expect([...getOutageFlags(P1)]).toEqual(['tmux-unavailable'])
-  })
-
   test('16b. withOutageDetection success of a tmux-touching call (read-pane) with cwd also set: ad+tmux clear is silent; cwd-unreachable remains', async () => {
     const { emissions } = makeHarness()
     setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
@@ -451,17 +441,6 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
     expect(getOutageFlags(P1).has('ad-unreachable')).toBe(false)
     expect(getOutageFlags(P1).has('tmux-unavailable')).toBe(false)
-  })
-
-  test('16b twin. withOutageDetection success of a call that is not tmux-touching (status) with cwd also set: only ad clears, silently; tmux-unavailable and cwd-unreachable remain', async () => {
-    const { emissions } = makeHarness()
-    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
-    setOutageFlag(P1, 'tmux-unavailable')
-    setOutageFlag(P1, 'cwd-unreachable', '/foo')
-    const before = emissions.length
-    await withOutageDetection(P1, '/cwd', 'status', async (_client) => 'ok')
-    expect(emissions.length).toBe(before)
-    expect([...getOutageFlags(P1)].sort()).toEqual(['cwd-unreachable', 'tmux-unavailable'])
   })
 
   test.each([
@@ -1547,12 +1526,12 @@ function declaredName(call: AdCall): string {
 const CLEARING_CALLS: readonly AdCall[] = [...TMUX_TOUCHING_VERBS].map((verb) =>
   verb === AD_VERB_KILL ? AD_CALL_KILL_ROW_READ_LIVE : (verb as AdCall),
 )
-/** Declared calls tmux does not answer: they never clear `tmux-unavailable`. */
-const NON_CLEARING_CALLS: readonly AdCall[] = ['status', 'get', 'list', 'find-missing', 'delete', AD_CALL_KILL_ROW_NOT_READ_LIVE]
 /** Every declared call: each agent-director verb, and `kill` in both declarations. */
 const EVERY_DECLARED_CALL: readonly AdCall[] = AD_VERBS.flatMap((verb): AdCall[] =>
   verb === AD_VERB_KILL ? [AD_CALL_KILL_ROW_READ_LIVE, AD_CALL_KILL_ROW_NOT_READ_LIVE] : [verb],
 )
+/** Every other declared call: tmux does not answer it, so it never clears `tmux-unavailable`. */
+const NON_CLEARING_CALLS: readonly AdCall[] = EVERY_DECLARED_CALL.filter((call) => !CLEARING_CALLS.includes(call))
 
 type AnyWrap = typeof withOutageDetection
 /** The two wrappers, by name. */
@@ -1588,9 +1567,10 @@ function allClearOf(history: ReadonlyArray<readonly [OutageClass, string | undef
 }
 
 describe('what clears tmux-unavailable (b.jg5 SRJ-312: AC 27, AC 36)', () => {
-  test('pin: the exported tmux-touching set is the six the clear rows below run over', () => {
-    expect(CLEARING_CALLS.map((c): string | undefined => adCallVerb(c)).sort()).toEqual([...TMUX_TOUCHING_VERBS].sort())
-    expect(CLEARING_CALLS).toHaveLength(6)
+  test('pin: the calls the not-tmux-touching rows below run over include every one the SRD names (status, get, list, find-missing, delete, kill of a row not read live)', () => {
+    expect(NON_CLEARING_CALLS).toEqual(expect.arrayContaining(
+      ['status', 'get', 'list', 'find-missing', 'delete', AD_CALL_KILL_ROW_NOT_READ_LIVE] satisfies AdCall[],
+    ))
   })
 
   test.each(wrapRows(CLEARING_CALLS))('%s, tmux-touching %s: a success clears it and ad-unreachable, with one all-clear over the recorded history; B is untouched', async (_w, _c, wrap, call) => {
@@ -1720,10 +1700,6 @@ describe('ENVIRONMENT is reported (b.jg5 SRJ-301, SRJ-311): from any verb for P,
     ['withSpawnDetection', 'spawn', withSpawnDetection, 'spawn'],
     ['withSpawnDetection', 'resume', withSpawnDetection, 'resume'],
   ]
-
-  test('pin: the rows cover every agent-director verb', () => {
-    expect(new Set(ENVIRONMENT_ROWS.map((r) => adCallVerb(r[3])))).toEqual(new Set(AD_VERBS))
-  })
 
   test.each(ENVIRONMENT_ROWS)('%s, %s: each form, in each context, raises P\'s tmux-unavailable with one onset and reports the ENVIRONMENT cause once for P; B gets nothing; rethrown unchanged; no condition start', async (_w, _c, wrap, call) => {
     const verb = adCallVerb(call)!

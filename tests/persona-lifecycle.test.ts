@@ -89,12 +89,13 @@ import { LIVENESS_READING_DEAD } from '../src/liveness-reading.ts'
 import { deletePersonaInstance, killPersonaInstance } from '../src/session-manager.ts'
 import {
   createUnavailableRetryController,
+  UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   type UnavailableRetryController,
 } from '../src/unavailable-retry.ts'
-import { errGeneric, errSpawnNotFound, makeStubCallLog, makeStubClient, stubCallCount } from './test-helpers/agent-director-stub.ts'
+import { errGeneric, errSpawnNotFound, errTmuxNotAvailable, makeStubCallLog, makeStubClient, stubCallCount } from './test-helpers/agent-director-stub.ts'
 import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken, writeCredentialsFile } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeConnectionHarness, type ConnectionHarness, type ConnectionHarnessOptions } from './test-helpers/persona-connection-harness.ts'
@@ -349,7 +350,10 @@ function teardownPrefix(p: Persona): string {
 /**
  * The teardown's own steps for `p` (its serializer turn), outside dry run,
  * with the recorders' defaults: the launch's wait for a `working` row is
- * cancelled again (b.f2b) right before the teardown waits for the launch.
+ * cancelled again (b.f2b) right before the teardown waits for the launch,
+ * and after the agent-director calls the outage state is forgotten and the
+ * UNAVAILABLE retry timer stopped again (b.jg5 SRJ-311: a failing kill's
+ * ENVIRONMENT answer arms one).
  */
 function teardownTurnTrail(p: Persona, launchPass: string): string[] {
   const k = p.key
@@ -357,7 +361,7 @@ function teardownTurnTrail(p: Persona, launchPass: string): string[] {
     `bringUps.cancel:${k}`, `cancelRestartTimer:${k}`, `stopRetryTimer:${k}`, `cancelLaunchWait:${k}`, `whenLaunchSettled:${k}`,
     `connections.stop:${k}`, `routing.forget:${k}`, `forgetAcks:${k}`, `destinations.forget:${k}`, `destinationHold.cancel:${k}`,
     `notifier.forget:${k}`, `forgetPersonaPrompts:${k}`, `dropSession:${k}`,
-    `resetOutageState:${k}`, `killInstance:${k}`, `deleteInstance:${k}`, `resetOutageState:${k}`,
+    `resetOutageState:${k}`, `killInstance:${k}`, `deleteInstance:${k}`, `resetOutageState:${k}`, `stopRetryTimer:${k}`,
     `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`, `forgetNotConnectedEpisode:${k}`, `forgetNoticeEpisodes:${k}`,
     `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPass}`,
   ]
@@ -377,11 +381,12 @@ function fullTeardownTrail(p: Persona, launchPass: string): string[] {
  * half of a destructive modify): its launch's wait, bring-up retries and
  * restart timer cancelled and its UNAVAILABLE retry timer stopped at submit,
  * before its turn, then its turn with its
- * held notices dropped again right after the agent-director calls.
+ * held notices dropped again right after the agent-director calls (and the
+ * outage-state reset and retry-timer stop that follow them).
  */
 function stillAppliedTeardownTrail(p: Persona, launchPass: string): string[] {
   const turn = teardownTurnTrail(p, launchPass)
-  const afterAd = turn.lastIndexOf(`resetOutageState:${p.key}`) + 1
+  const afterAd = turn.lastIndexOf(`stopRetryTimer:${p.key}`) + 1
   return [
     `cancelLaunchWait:${p.key}`, `bringUps.cancel:${p.key}`, `cancelRestartTimer:${p.key}`, `stopRetryTimer:${p.key}`,
     ...turn.slice(0, afterAd), `notifier.forget:${p.key}`, ...turn.slice(afterAd),
@@ -525,10 +530,13 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   })
 
   // Rows: the dependency that fails, the step phrase its line names, and how many steps fail.
+  // Two deps run twice in the turn under one phrase, so both of their steps fail:
+  // resetOutageState (before and after the agent-director calls) and stopRetryTimer
+  // (with the early timers, and again after the post-call reset, b.jg5 SRJ-311).
   test.each<[DepName, string, number]>([
     ['bringUps.cancel', 'cancelling its bring-up retries', 1],
     ['cancelRestartTimer', 'cancelling its restart timer', 1],
-    ['stopRetryTimer', 'stopping its UNAVAILABLE retry timer', 1],
+    ['stopRetryTimer', 'stopping its UNAVAILABLE retry timer', 2],
     ['whenLaunchSettled', 'waiting for its launch in flight', 1],
     ['connections.stop', 'stopping its Slack connection', 1],
     ['routing.forget', 'forgetting its inbound dedupe store', 1],
@@ -578,7 +586,8 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await f.lifecycle.teardown(f.b)
 
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 24 failed step(s)`)
+    // 23 dependencies; resetOutageState and stopRetryTimer each run (and fail) twice.
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 25 failed step(s)`)
     assertNoLeak({ lines: f.lines })
   })
 
@@ -777,7 +786,9 @@ describe('persona teardown of a key still applied (the old half of a destructive
     expect(beforeTurn).toHaveLength(1)
     expect(beforeTurn[0]).toMatch(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${phrase} before its turn failed: Error`)}( |$)`))
     expect(f.lines).toContain(`${teardownPrefix(f.b)}: starting`)
-    expect(f.lines.at(-1)).toBe(how === 'throws' ? `${teardownPrefix(f.b)}: complete, with 1 failed step(s)` : `${teardownPrefix(f.b)}: complete`)
+    // A throwing stopRetryTimer fails both of the turn's stops (before and after the agent-director calls, b.jg5 SRJ-311).
+    const turnFailures = how === 'rejects' ? 0 : dep === 'stopRetryTimer' ? 2 : 1
+    expect(f.lines.at(-1)).toBe(turnFailures === 0 ? `${teardownPrefix(f.b)}: complete` : `${teardownPrefix(f.b)}: complete, with ${turnFailures} failed step(s)`)
     assertNoLeak({ lines: f.lines })
   })
 
@@ -793,7 +804,8 @@ describe('persona teardown of a key still applied (the old half of a destructive
       expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: stopping its UNAVAILABLE retry timer before its turn failed: Error`)}( |$)`)),
       `${teardownPrefix(f.b)}: starting`,
     ])
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 3 failed step(s)`)
+    // In the turn: the bring-up cancel, the restart-timer cancel and both retry-timer stops (b.jg5 SRJ-311).
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 4 failed step(s)`)
     assertNoLeak({ lines: f.lines })
   })
 
@@ -846,9 +858,17 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
   /**
    * B already left the applied set (apply step 1): the notifier harness's
    * persona list no longer has it. Outage notices go through the real
-   * notifier. `kill` / `delete` script the stub's errors.
+   * notifier. `kill` / `delete` script the stub's errors; `triggerSink` is
+   * the outage state's retry trigger sink (none by default) and `overrides`
+   * replace further lifecycle dependencies.
    */
-  function makeReal(opts: { killError?: Error; deleteError?: Error; post?: Record<string, readonly WebApiOutcome[]> } = {}): RealFixture {
+  function makeReal(opts: {
+    killError?: Error
+    deleteError?: Error
+    post?: Record<string, readonly WebApiOutcome[]>
+    triggerSink?: UnavailableRetryController
+    overrides?: (f: () => Fixture) => Partial<PersonaLifecycleDeps>
+  } = {}): RealFixture {
     const config = makeConfig()
     const h = makeNotifierHarness(config, { post: opts.post })
     cleanups.push(() => h.hold.cancelAll())
@@ -867,8 +887,9 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
         emissions.push({ key, text })
         void h.notifier.notify(key, text)
       },
+      ...(opts.triggerSink !== undefined ? { triggerSink: opts.triggerSink } : {}),
     })
-    const f = makeFixture({
+    const f: Fixture = makeFixture({
       overrides: {
         killInstance: killPersonaInstance,
         deleteInstance: deletePersonaInstance,
@@ -876,6 +897,7 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
         notifier: h.notifier,
         destinations: h.destinations,
         destinationHold: h.hold,
+        ...opts.overrides?.(() => f),
       },
     })
     return { f, h, calls, adOrder, emissions }
@@ -991,6 +1013,66 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     expect([...getOutageFlags(b.key)]).toEqual([])
     expect(r.h.hold.view(b.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
     expect(r.f.lines.at(-1)).toBe(`${teardownPrefix(b)}: complete, with 2 failed step(s)`)
+    assertNoLeak({ lines: r.f.lines, logs: r.h.logs })
+  })
+
+  test('b.jg5 SRJ-311: the old half of a destructive modify (B still applied) whose kill answers ErrTmuxNotAvailable: the ENVIRONMENT retry timer that answer arms is stopped by the teardown\'s second stop, after the agent-director calls, so B is left with no retry timer while A\'s stays armed', async () => {
+    const clock = createFakeClock()
+    const retryLines: string[] = []
+    const controller = createUnavailableRetryController({
+      log: (line) => void retryLines.push(line),
+      action: () => {
+        throw new Error('no retry falls due in this case')
+      },
+      clock,
+    })
+    cleanups.push(() => {
+      controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+      expect(clock.pendingCount()).toBe(0)
+      assertNoLeak({ lines: retryLines })
+    })
+    const r = makeReal({
+      killError: errTmuxNotAvailable(undefined, 'kill'),
+      triggerSink: controller,
+      overrides: (f) => ({
+        // As server.ts binds it, recording whether the key had a timer when this stop ran.
+        stopRetryTimer: (key) => {
+          f().trail.push(`stopRetryTimer:${key}:${controller.isArmed(key) ? 'armed' : 'none'}`)
+          controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+        },
+      }),
+    })
+    const b = r.f.b
+    const k = b.key
+    r.f.applied.push(b) // B keeps its key applied until step 6 brings its new declaration up
+    controller.arm(r.f.a.key, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+
+    await r.f.lifecycle.teardown(b)
+    await flush()
+
+    const id = personaInstanceId(k)
+    expect(r.adOrder).toEqual([`kill:${id}`, `delete:${id}`])
+    // The submit-time stop and the turn's first stop find no timer; the kill's
+    // ENVIRONMENT answer arms one, and the stop after the agent-director calls
+    // (right before the restart failure count is forgotten) stops it.
+    const stops = r.f.trail.filter((c) => c.startsWith('stopRetryTimer:'))
+    expect(stops).toEqual([`stopRetryTimer:${k}:none`, `stopRetryTimer:${k}:none`, `stopRetryTimer:${k}:armed`])
+    const secondStop = r.f.trail.indexOf(`stopRetryTimer:${k}:armed`)
+    expect(secondStop).toBeGreaterThan(r.f.trail.indexOf(`dropSession:${k}`))
+    expect(r.f.trail[secondStop + 1]).toBe(`forgetFailures:${k}`)
+
+    const bLines = retryLines.filter((l) => l.startsWith(`[slack] unavailable-retry: persona=${k} `))
+    expect(bLines).toHaveLength(2)
+    expect(bLines[0]).toStartWith(`[slack] unavailable-retry: persona=${k} armed (${UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT}`)
+    expect(bLines[1]).toBe(`[slack] unavailable-retry: persona=${k} stopped — ${UNAVAILABLE_RETRY_STOP_TORN_DOWN}`)
+    expect(controller.isArmed(k)).toBe(false)
+    expect(controller.armedKeys()).toEqual([r.f.a.key])
+    expect(clock.pendingCount()).toBe(1) // A's timer only
+    expect([...getOutageFlags(k)]).toEqual([])
+    expect(r.f.lines.slice(1)).toEqual([
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(b)}: agent-director kill of ${id} failed: ErrTmuxNotAvailable`)}`)),
+      `${teardownPrefix(b)}: complete, with 1 failed step(s)`,
+    ])
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs })
   })
 
