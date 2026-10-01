@@ -1417,7 +1417,7 @@ grep -E 'unavailable-retry: persona=<key> ' ~/.claude/channels/slack/server.log
 Symptom: the persona is silent, and its destination has a *Held: tmux session conflict* notice naming the persona and its tmux session. The server met one of two things:
 
 - agent-director refused to act on that tmux session because of a session conflict, when the server launched or resumed the persona;
-- agent-director had noted conflicting labels on the persona's own row when the server read it (while launching the persona, or while checking whether a session whose row reads `working` is really idle). This is the "Conflicting labels" case below.
+- agent-director had noted conflicting labels on the persona's own row when the server read it (while launching the persona, while checking whether a session whose row reads `working` is really idle, or right after the server's own `find-missing` run listed that row as unverified). This is the "Conflicting labels" case below.
 
 Only the persona's own row counts. agent-director's other notes on a row, and any note on a row that is not one of your personas', never hold a persona.
 

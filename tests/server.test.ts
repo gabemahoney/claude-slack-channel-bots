@@ -49,6 +49,7 @@ import {
 } from '../src/agent-director-client.ts'
 import {
   cannedErr,
+  cannedFindMissing,
   cannedGetResult,
   cannedStatusResult,
   makeCloseCountingStubClient,
@@ -71,6 +72,8 @@ import {
   errUnknownErrorName,
   errUnusableName,
   holdSpawns,
+  nonLatchingNotes,
+  provenanceNote,
   SAMPLE_LAUNCH_START_FRACTIONAL,
   SAMPLE_LAUNCH_START_NONE,
   SAMPLE_LAUNCH_START_WHOLE,
@@ -114,10 +117,14 @@ import {
   forgetNotConnectedEpisode,
   hasPendingWorkingRowEvidence,
   isLaunchInFlight,
+  setConflictLatch,
+  setConfiguredPersonaQuery,
+  _resetConfiguredPersonaQuery,
   setSessionNotifier,
   spawnForPersona,
 } from '../src/session-manager.ts'
-import type { ClientOptions, FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams } from 'agent-director'
+import { createConflictLatch, type ConflictLatch } from '../src/conflict-latch.ts'
+import type { ClientOptions, FindMissingParams, FindMissingResult, GetParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams } from 'agent-director'
 import { KILL_SESSION_REFUSED, type KillSessionResult } from '../src/restart.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
@@ -1262,6 +1269,10 @@ describe('_buildReconnectSessionAdapter', () => {
     launchStartedAt?: string
     /** When set, every findMissing sweep rejects with it. */
     findMissingError?: Error
+    /** What every findMissing sweep answers (default: the stub's empty sweep). */
+    findMissingResult?: FindMissingResult
+    /** The row every `get` answers; takes precedence over `row`. */
+    getRow?: ReturnType<typeof cannedGetResult>
     /** The adapter's latched query (production: the one latch's `isLatched`, b.jg5 SRJ-502); absent, none is passed. */
     isLatched?: (key: string) => boolean
   }): {
@@ -1273,6 +1284,7 @@ describe('_buildReconnectSessionAdapter', () => {
     killCalls: KillParams[]
     spawnCalls: SpawnParams[]
     resumeCalls: ResumeParams[]
+    getCalls: GetParams[]
     tmuxProbes: string[]
     stub: StubClient
   } {
@@ -1283,6 +1295,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const killCalls: KillParams[] = []
     const spawnCalls: SpawnParams[] = []
     const resumeCalls: ResumeParams[] = []
+    const getCalls: GetParams[] = []
     const tmuxProbes: string[] = []
     _setTmuxSessionProber(async (name) => {
       tmuxProbes.push(name)
@@ -1306,12 +1319,14 @@ describe('_buildReconnectSessionAdapter', () => {
       // seam for "was the memoized sweep triggered".
       findMissingCalls,
       findMissingError: opts.findMissingError,
+      findMissingResult: opts.findMissingResult,
       readPaneCalls,
       killCalls,
       spawnCalls,
       resumeCalls,
       readPaneResults: opts.pane === undefined ? undefined : [{ pane: opts.pane }],
-      getResult: opts.row === undefined ? undefined : cannedGetResult({ claude_instance_id: 'cscb_C1', state: 'working', ...opts.row }),
+      getCalls,
+      getResult: opts.getRow ?? (opts.row === undefined ? undefined : cannedGetResult({ claude_instance_id: 'cscb_C1', state: 'working', ...opts.row })),
     })
     _resetOutageState()
     initOutageState({
@@ -1336,6 +1351,7 @@ describe('_buildReconnectSessionAdapter', () => {
       killCalls,
       spawnCalls,
       resumeCalls,
+      getCalls,
       tmuxProbes,
       stub,
     }
@@ -2230,6 +2246,64 @@ describe('_buildReconnectSessionAdapter', () => {
 
       expect(h.findMissingCalls).toHaveLength(1)
       expect(raised.map((n) => n.key)).toEqual(['C1', 'C1'])
+    })
+
+    // b.jg5 SRJ-120, SRJ-502: the sweep from 10 min on lists C1's own row in
+    // `unverified_ids`, so the run reads that row with one `get`. A
+    // `provenance_conflict` note there latches C1: the deferral check answers
+    // `latched` and the adapter 'transient', with no row read after the
+    // sweep, nothing escalated and no deferral (no deferral line, no
+    // blocked-on-prompt notice, since the persona is held (b.jg5 SRJ-502) and
+    // its latch's own notice already tells the human (SRJ-508)). Any other
+    // row latches no one, and the attempt defers, or escalates, as before.
+    // The episode's notice is raised at minute 0, so a deferral at minute 10
+    // shows as a second copy of minute 0's deferral line.
+    describe('b.jg5 SRJ-502: the post-run get of the sweep from 10 min on', () => {
+      let latch: ConflictLatch
+
+      beforeEach(() => {
+        latch = createConflictLatch({ log: (line) => { lines.push(line) } })
+        setConflictLatch(latch)
+        setConfiguredPersonaQuery((key) => key === 'C1')
+      })
+
+      afterEach(() => {
+        setConflictLatch(undefined)
+        _resetConfiguredPersonaQuery()
+      })
+
+      test.each<[string, string | undefined, string, boolean, string, number]>([
+        ['a provenance_conflict note latches C1; the row would still read check_permission', provenanceNote, 'check_permission', true, 'transient', 1],
+        ['a provenance_conflict note latches C1; the row would read missing', provenanceNote, 'missing', true, 'transient', 1],
+        ['regression: no note, the row still reads check_permission → deferred again', undefined, 'check_permission', false, 'transient', 2],
+        ['regression: a note that latches no one, the row still reads check_permission → deferred again', nonLatchingNotes[0], 'check_permission', false, 'transient', 2],
+        ['regression: no note, the row reads missing → escalated', undefined, 'missing', false, 'escalate-dead', 1],
+      ])('%s: one sweep, one get of cscb_C1, nothing typed, killed or launched', async (_label, note, after, latched, verdict, deferrals) => {
+        const h = makeHarness({
+          statusState: 'check_permission',
+          tmux: 'alive',
+          statusAfterSweep: after,
+          findMissingResult: cannedFindMissing({ rows: { [personaInstanceId('C1')]: 'unverified_ids' } }),
+          getRow: cannedGetResult({ claude_instance_id: personaInstanceId('C1'), state: 'check_permission', liveness_note: note }),
+        })
+
+        expect(await attemptsAt(h.adapter, [0])).toEqual(['transient'])
+        const minuteZero = adapterLines()
+        expect(minuteZero).toHaveLength(1)
+        expect(await attemptsAt(h.adapter, [10])).toEqual([verdict])
+
+        expect(latch.isLatched('C1')).toBe(latched)
+        expect(h.findMissingCalls).toHaveLength(1)
+        expect(h.getCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+        // One status read per attempt, and one more after the sweep unless C1 latched.
+        expect(h.statusCalls).toHaveLength(latched ? 2 : 3)
+        expect(h.sendKeysCalls).toEqual([])
+        expect(h.readPaneCalls).toEqual([])
+        expect([h.killCalls, h.spawnCalls, h.resumeCalls]).toEqual([[], [], []])
+        expect(adapterLines().filter((l) => l === minuteZero[0])).toHaveLength(deferrals)
+        // The minute-0 notice only.
+        expect(raised.map((n) => n.key)).toEqual(['C1'])
+      })
     })
   })
 

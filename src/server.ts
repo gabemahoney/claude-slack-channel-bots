@@ -1355,8 +1355,15 @@ export function _buildKillSessionAdapter(
  *     'escalate-dead' ('transient' when the sweep was refused, b.jg5
  *     SRJ-105: nothing is re-probed, killed or relaunched).
  *     restart.ts then probes liveness again in the same restart run and, when
- *     the reconciled row reads dead, takes the kill+relaunch branch at once
- *     (otherwise a later tick does);
+ *     the reconciled row reads dead, takes the kill+relaunch branch at once.
+ *     The sweep may leave the row live (in `unverified_ids`, or, when
+ *     `pending`, not judged, b.jg5 SRJ-120), and it may then stay live for
+ *     further ticks, each of which tries again. After a run the sweep makes,
+ *     each configured persona's own row left in `unverified_ids` is read
+ *     with one `get`, and only a `provenance_conflict` note there latches
+ *     (b.jg5 SRJ-114); restart.ts asks the latch right after this verdict,
+ *     before its re-probe, so a persona latched that way gets no further
+ *     agent-director call (b.jg5 SRJ-502), and again before its kill;
  *   - the probe throws → defer ('transient'): a failed probe is no proof the
  *     session is dead (b.rmy).
  * The deferral therefore lasts only while the persona's tmux session exists
@@ -1453,12 +1460,20 @@ export function _buildReconnectSessionAdapter(
     // 'dead-session' maps to 'escalate-dead' (b.9a7-amended): restart.ts does
     // not re-enter scheduleRestart on it. For the dead-tmux escalate-dead case
     // (b.sv7 / Epic t1.tkk.e4), CSCB recovers ITSELF: we fire the internal
-    // sweep wrapper here so the frozen `working` row reconciles to `missing`,
-    // and restart.ts probes liveness again in the same restart run (b.d61):
-    // a re-probe that reads `dead` takes the normal kill+relaunch branch at
-    // once. `pending` or `unknown` leaves the relaunch undone (`unknown` arms
-    // the retry timer). When the row still reads `live`, the NEXT
-    // health-check tick reads it again and reschedules. The external
+    // sweep wrapper here, which may reconcile the frozen `working` row to
+    // `missing`, and restart.ts probes liveness again in the same restart run
+    // (b.d61): a re-probe that reads `dead` takes the normal kill+relaunch
+    // branch at once. `pending` or `unknown` leaves the relaunch undone
+    // (`unknown` arms the retry timer). The sweep may leave the row live (in
+    // `unverified_ids`, or, when `pending`, not judged at all, b.jg5
+    // SRJ-120), and the row may then stay live for further ticks: each later
+    // health-check tick reads it again and reschedules. After a run the sweep
+    // makes, each configured persona's own row left in `unverified_ids` is
+    // read with one `get`, and only a `provenance_conflict` note there
+    // latches (b.jg5 SRJ-114); restart.ts asks the latch right after this
+    // verdict, before its re-probe, so a persona latched that way gets no
+    // further agent-director call (b.jg5 SRJ-502), and again right before its
+    // kill. The external
     // ~/startup/find-missing-loop.sh is belt-and-braces only (it may also
     // reconcile the row, but recovery no longer silently depends on it —
     // removing it is a separate operator decision). Not counting here keeps
@@ -1479,10 +1494,11 @@ export function _buildReconnectSessionAdapter(
       // verdict says what proved the session dead, so the line doesn't claim
       // a dead tmux session for a refused keystroke (b.dup).
       //
-      // Memo-TTL vs. tick-cadence: reconcileMissingSweep's 10s memo TTL is
-      // harmless at the ~120s health-check tick cadence — a memoized-stale
-      // answer costs at most ONE extra tick, because the following tick's
-      // escalate-dead sweeps again well past the TTL. And the fleet-wide
+      // Memo-TTL vs. tick-cadence: reconcileMissingSweep's 10s memo window is
+      // harmless at the ~120s health-check tick cadence — the following
+      // tick's escalate-dead sweeps again well past the window, though a row
+      // agent-director leaves live (b.jg5 SRJ-120) stays live for further
+      // ticks whatever the sweep's age. And the fleet-wide
       // post-reboot case (b.nk5 — /tmp wiped, ALL personas dead-tmux at once)
       // is served correctly by the single in-flight-shared sweep: one
       // findMissing reconciles the whole store for every escalating persona.
@@ -1529,12 +1545,20 @@ function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) |
  *   - its own tmux session is gone (`hasPersonaTmuxSession`, exact target) →
  *     the dead-tmux sweep (`sweepDeadTmuxChannelWithCause`, verdict
  *     `prompt-row-tmux-gone`) and 'escalate-dead', with no notice: restart.ts
- *     re-probes and relaunches the persona in the same run (b.d61);
+ *     re-probes and, once the row reads dead, relaunches the persona in the
+ *     same run (b.d61); a row the sweep leaves live may stay live for
+ *     further ticks (b.jg5 SRJ-120);
  *   - alive, or the probe failed (no proof it is dead) → one more deferral on
  *     the row (`checkPromptRowDeferral`): once the run has lasted
  *     `PROMPT_ROW_SWEEP_AFTER_MS`, it sweeps and reads the row again, and a
  *     row now `ended` or `missing` escalates the same way; otherwise
- *     `deferPromptRow` defers and raises the notice, as before.
+ *     `deferPromptRow` defers and raises the notice, as before. A persona
+ *     latched once that sweep is done (a post-run `get` of its own row read
+ *     a `provenance_conflict` note, b.jg5 SRJ-114, SRJ-120, or the latch
+ *     answers it latched) gets no row read and is never escalated: the check
+ *     answers `latched`, and this answers 'transient' with no notice, since the
+ *     persona is held (b.jg5 SRJ-502) and its latch's own notice already
+ *     tells the human (SRJ-508).
  * A refused sweep at either step (b.jg5 SRJ-105) answers 'transient', with
  * no notice: nothing is re-probed, killed or relaunched.
  * Never throws: the sweep and the deferral check swallow their own failures.
@@ -1564,6 +1588,8 @@ async function promptRowReconnectVerdict(key: string, state: string): Promise<'e
   const deferral = await checkPromptRowDeferral(key, state)
   if (deferral === 'escalate') return 'escalate-dead'
   if (deferral === 'refused') return 'transient'
+  // b.jg5 SRJ-502: latched after the sweep (its line is logged there): no notice.
+  if (deferral === 'latched') return 'transient'
   return deferPromptRow(key, state)
 }
 

@@ -5330,7 +5330,10 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
       (['reconnect', 're-probe'] as const).map((during): [string, string, MakeLatched, ExpectLatchedLine] => [source, during, makeLatched, expectLine]),
     )
 
-    test.each(LATCH_SOURCES_X_ESCALATE)('%s from during the escalate-dead path\'s %s: the re-probe reads dead, and the work answers latched with no kill or launch, nothing counted, nothing armed, one skip line', async (_source, during, makeLatched, expectLine) => {
+    // Latched during the reconnect (its findMissing sweep's post-run `get` can
+    // latch P, b.jg5 SRJ-120): no re-probe follows. Latched during the
+    // re-probe (which would read dead): no kill follows.
+    test.each(LATCH_SOURCES_X_ESCALATE)('%s from during the escalate-dead path\'s %s: the work answers latched with no re-probe after a latching reconnect, no kill or launch, nothing counted, nothing armed, one skip line', async (_source, during, makeLatched, expectLine) => {
       recordFailure(P)
       const deps = latchedDeps()
       const readings = [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD]
@@ -5348,7 +5351,7 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
 
       expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_LATCHED)
 
-      expect(deps.isSessionAliveCalls).toEqual([P, P])
+      expect(deps.isSessionAliveCalls).toEqual(during === 'reconnect' ? [P] : [P, P])
       expect(deps.reconnectSessionCalls).toEqual([P])
       expect(deps.killSessionCalls).toEqual([])
       expect(deps.launchSessionCalls).toEqual([])
@@ -5358,6 +5361,50 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
       expect(isRestartPendingOrActive(P)).toBe(false)
       expectLine(skipLine(P))
       expect(errLines.filter((l) => l.startsWith(`[slack] Relaunching session for persona=${P}`))).toEqual([])
+    })
+
+    // A success resets the failure count and a counted failure raises it, so
+    // Q's one failure on record shows which was recorded: none for a latched
+    // persona (above), a success here.
+    // The latched query, when present, is asked at the retry entry, at the
+    // work's start, after the probe, after the reconnect and before the kill.
+    const UNLATCHED_ESCALATE: Array<[string, (deps: ReturnType<typeof makeDeps>) => string[], string[]]> = [
+      ['with the latched query present, answering false for Q', (deps) => {
+        const asked: string[] = []
+        deps.isLatched = (key) => { asked.push(key); return latch.isLatched(key) }
+        return asked
+      }, [Q, Q, Q, Q, Q]],
+      ['with a hand-built RestartDeps that has no latched query', (deps) => {
+        delete deps.isLatched
+        return []
+      }, []],
+    ]
+
+    test.each(UNLATCHED_ESCALATE)('an unlatched persona on the escalate-dead path, %s: the reconnect, the re-probe that reads dead, one kill and one launch, launched, a success recorded', async (_label, setLatchQuery, expectedAsks) => {
+      recordFailure(Q)
+      const deps = latchedDeps()
+      const asked = setLatchQuery(deps)
+      const readings = [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD]
+      deps.isSessionAlive = async (key) => {
+        deps.isSessionAliveCalls.push(key)
+        return readings.shift()!
+      }
+      deps.reconnectSession = async (key) => {
+        deps.reconnectSessionCalls.push(key)
+        return 'escalate-dead'
+      }
+      initRestart(deps)
+
+      expect(await runRestartRetry(Q, CWD[Q]!, () => false)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+      expect(deps.isSessionAliveCalls).toEqual([Q, Q])
+      expect(deps.reconnectSessionCalls).toEqual([Q])
+      expect(deps.killSessionCalls).toEqual([Q])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([Q])
+      expect(getFailureCount(Q)).toBe(0)
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(asked).toEqual(expectedAsks)
+      expect(errLines.filter((l) => l.includes(`persona=${Q}`) && l.includes('latched'))).toEqual([])
     })
   })
 

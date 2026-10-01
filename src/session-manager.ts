@@ -122,6 +122,7 @@ import { checkPersonaConfigDir, type ConfigDirCheckResult } from './persona-brin
 import type { PersonaCheckFailure } from './persona-diagnostics.ts'
 import {
   CONFIG_DIR_LABEL_PREFIX,
+  PERSONA_INSTANCE_ID_PREFIX,
   PERSONA_LABEL_KEY,
   PERSONA_LABEL_PREFIX,
   SERVICE_LABEL,
@@ -227,7 +228,7 @@ import {
 import { describeDestinationFailureCause } from './persona-destination.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { RESTART_FAILURE_CAP } from './restart.ts'
-import { AGENT_DIRECTOR_LIVE_STATES, pendingLaunchStartOf } from './liveness-reading.ts'
+import { AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE, pendingLaunchStartOf } from './liveness-reading.ts'
 import { isDryRun } from './tokens.ts'
 import { DIALOG_READY_TIMEOUT_MS } from './ad-settings.ts'
 // Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
@@ -1728,12 +1729,13 @@ export function _resetWaitForWaitingTimeoutMs(): void {
  * The clock of the `working`-row wait and evidence (b.f2b):
  * `waitForWaitingAndReconnect`'s deadline and loop, the launch wait's
  * evidence reads (`staleWorkingRowIsIdle`) and the restart path's
- * (`checkWorkingRowPane`), pane and transcript alike. Test-only override
- * below.
+ * (`checkWorkingRowPane`), pane and transcript alike, and the findMissing
+ * memo's window (`sharedFindMissingSweep`, `FIND_MISSING_MEMO_TTL_MS`).
+ * Test-only override below.
  */
 let _now: () => number = () => Date.now()
 
-/** Test-only seam: override the clock of the `working`-row wait and evidence (a suite passes `createFakeClock().now`). */
+/** Test-only seam: override the clock of the `working`-row wait and evidence and of the findMissing memo (a suite passes `createFakeClock().now`). */
 export function _setNow(now: () => number): void {
   _now = now
 }
@@ -2596,69 +2598,137 @@ function reportWaitEndedDisconnected(
 // ---------------------------------------------------------------------------
 
 /**
- * TTL for the findMissing memo window (b.m4r). AD's `findMissing({})` is a
- * whole-store, per-row evidence-based sweep; it is idempotent, so two sweeps
- * fired within a few seconds of each other return the same verdicts. On a
- * fleet restart, startupSessionManager (concurrency=3) resolves collisions
- * across N channels near-simultaneously, and every `working`-row collision —
- * plus each dead-path `reconcileMissingFirst` — would otherwise fire its own
- * whole-store sweep (N sweeps, up to 3 concurrent). Single-flight collapses
- * concurrent callers onto one in-flight promise; the TTL then lets callers
+ * The findMissing memo window (b.m4r), measured on the session manager's
+ * clock (`_now`). AD's `findMissing({})` is a whole-store, per-row
+ * evidence-based sweep, so two sweeps fired within a few seconds of each
+ * other return the same verdicts. On a fleet restart, startupSessionManager
+ * (concurrency=3) resolves collisions across N channels near-simultaneously,
+ * and every `working`-row collision — plus each dead-path
+ * `reconcileMissingFirst` — would otherwise fire its own whole-store sweep
+ * (N sweeps, up to 3 concurrent). Single-flight collapses concurrent ordinary
+ * callers onto one in-flight run; the window then lets ordinary callers
  * arriving just after it resolves reuse that result instead of re-sweeping.
  *
- * 10s is chosen to comfortably cover one startup reconcile wave (the whole
- * concurrency=3 wave over the fleet completes well inside this window) and to
- * collapse a same-tick escalate-dead burst: when N personas escalate together
- * (b.nk5 fleet shape — /tmp wiped, every persona dead-tmux at once), those
- * `sweepDeadTmuxChannel` callers deliberately land INSIDE the window and share
- * the single in-flight/memoized sweep — one findMissing reconciles the whole
- * store for all of them. Across ticks the 10s TTL is far shorter than the
- * ~120s health-check cadence, so the following tick's escalate-dead sweeps
- * always fall outside the window and re-sweep: a memoized-stale answer costs at
- * most ONE extra tick. Recovery behavior is unchanged, only redundant load is
- * shed (see the `_buildReconnectSessionAdapter` call-site note in src/server.ts
- * and docs/architecture.md's b.m4r sweep note).
+ * 10s comfortably covers one startup reconcile wave (the whole concurrency=3
+ * wave over the fleet completes well inside this window) and collapses a
+ * same-tick escalate-dead burst: when N personas escalate together (b.nk5
+ * fleet shape — /tmp wiped, every persona dead-tmux at once), those
+ * `sweepDeadTmuxChannel` callers land inside the window and share the single
+ * in-flight or memoized sweep — one findMissing reconciles the whole store for
+ * all of them. Across ticks the window is far shorter than the ~120s
+ * health-check cadence, so the following tick's escalate-dead sweeps fall
+ * outside it and re-sweep. A swept row is not sure to read dead afterwards:
+ * agent-director may leave it live (in `unverified_ids`, or, when `pending`,
+ * not judged at all), and it then stays live for further ticks. Only redundant
+ * load is shed (see the `_buildReconnectSessionAdapter` call-site note in
+ * src/server.ts and docs/architecture.md's sweep note).
+ *
+ * A bypassing run (`FIND_MISSING_RUN_BYPASSING`, b.jg5 SRJ-120) ignores the
+ * window and anything in flight; its result is memoized for later ordinary
+ * callers like any other run's.
  */
-const FIND_MISSING_MEMO_TTL_MS = 10 * 1000
+export const FIND_MISSING_MEMO_TTL_MS = 10 * 1000
+
+/**
+ * An ordinary findMissing run (b.jg5 SRJ-120): a caller arriving inside the
+ * memo window reuses the memoized result, and one arriving while a run is in
+ * flight joins it. Every caller today is ordinary.
+ */
+const FIND_MISSING_RUN_ORDINARY = 'ordinary'
+
+/**
+ * A bypassing findMissing run (b.jg5 SRJ-120): a new call whatever is
+ * memoized or in flight, whose result is memoized for later ordinary callers
+ * (`bypassingFindMissingSweep`).
+ */
+const FIND_MISSING_RUN_BYPASSING = 'bypassing'
+
+/** The kind of a findMissing run (b.jg5 SRJ-120). */
+type FindMissingRunKind = typeof FIND_MISSING_RUN_ORDINARY | typeof FIND_MISSING_RUN_BYPASSING
+
+/** What a findMissing run is asked for (`reconcileMissingSweep`, `sharedFindMissingSweep`). */
+interface FindMissingSweepOptions {
+  /** The run kind; ordinary when absent. */
+  readonly kind?: FindMissingRunKind
+  /**
+   * The persona whose own row the caller's next step reads with a `get`: a run
+   * this caller starts makes no post-run `get` of that row (b.jg5 SRJ-120).
+   * Only the starter's key counts: an ordinary caller that joins the run gets
+   * no read of that row from it.
+   */
+  readonly nextStepGetKey?: string
+}
 
 let _findMissingMemoTtlMs = FIND_MISSING_MEMO_TTL_MS
 
-/** In-flight single-flight promise, shared by concurrent callers. */
-let _findMissingInFlight: Promise<FindMissingResult> | null = null
-/** Last successful sweep result and the time it resolved (for TTL reuse). */
-let _findMissingLast: { result: FindMissingResult; at: number } | null = null
+/** What a run that resolved hands every caller awaiting it. */
+interface FindMissingRunOutcome {
+  readonly result: FindMissingResult
+  /**
+   * The configured personas whose own row a post-run `get` of this run read
+   * as latching (`OwnRowRead.latched`, b.jg5 SRJ-114).
+   */
+  readonly latchedKeys: ReadonlySet<string>
+}
+
+/** One findMissing run the server made. `seq` orders runs by when they started. */
+interface FindMissingRun {
+  readonly seq: number
+  readonly kind: FindMissingRunKind
+  readonly promise: Promise<FindMissingRunOutcome>
+}
+
+/** Sequence number of the most recently started run (`FindMissingRun.seq`). */
+let _findMissingRunSeq = 0
+/**
+ * The most recently started run while it is in flight: ordinary callers join
+ * it. Cleared when that run settles; an older run settling never clears it.
+ */
+let _findMissingInFlight: FindMissingRun | null = null
+/**
+ * The memo: the result of the most recently started run that succeeded, with
+ * the time its call resolved (`_now`) and its `seq`. A run that started earlier
+ * than the memoized one never overwrites it; a failure never touches it.
+ */
+let _findMissingLast: { result: FindMissingResult; at: number; seq: number } | null = null
 
 /**
- * Test-only seam (mirrors `_setWaitForWaitingTimeoutMs`): override the memo TTL.
+ * Test-only seam (mirrors `_setWaitForWaitingTimeoutMs`): override the memo
+ * window (`FIND_MISSING_MEMO_TTL_MS` by default).
  */
 export function _setFindMissingMemoTtlMs(ms: number): void {
   _findMissingMemoTtlMs = ms
 }
 
 /**
- * Test-only seam: clear all memo state (in-flight promise, cached result) and
- * restore the default TTL. Tests that count findMissing calls must call this in
- * their setup/teardown to stay deterministic.
+ * Test-only seam: clear all memo state (the in-flight run, the memoized
+ * result, the run sequence) and restore the default window. Tests that count
+ * findMissing calls must call this in their setup/teardown to stay
+ * deterministic.
  */
 export function _resetFindMissingMemo(): void {
   _findMissingInFlight = null
   _findMissingLast = null
+  _findMissingRunSeq = 0
   _findMissingMemoTtlMs = FIND_MISSING_MEMO_TTL_MS
 }
 
 /**
- * Run AD's per-row, evidence-based `findMissing({})` sweep once, shedding
- * redundant load (b.m4r). The sweep is idempotent, so this is purely a
- * load-shedding optimization over calling `client.findMissing({})` directly:
+ * Run AD's per-row, evidence-based `findMissing({})` sweep for persona `key`
+ * through `withOutageDetection`, shedding redundant load (b.m4r, b.jg5
+ * SRJ-120; `sharedFindMissingSweep` holds the rules):
  *
- * - Single-flight: concurrent callers share one in-flight sweep promise.
- * - Short-TTL memo: a caller arriving within `_findMissingMemoTtlMs` of the
- *   last successful sweep reuses that result instead of re-sweeping.
+ * - An ordinary run (the default) reuses a result memoized inside the window
+ *   and joins a run in flight; a bypassing run always makes a new call.
+ * - After a run the server makes (not a memo reuse), each configured
+ *   persona's own row listed in `unverified_ids` is read with one `get`
+ *   (except `opts.nextStepGetKey`'s), and only a `provenance_conflict` note
+ *   there latches.
  *
- * Failures are NOT memoized — on error the next caller retries. A failure the
- * arming predicate answers a cause for (b.jg5 SRJ-105, `refusalAt` with verb
- * `find-missing`, which is not a read verb, so an UNAVAILABLE, an
- * ENVIRONMENT, a CONFIG or an UNCLASSIFIED answer, b.jg5 SRJ-313) is a refusal: one refusal line, and
+ * Failures are never memoized. A failure the arming predicate answers a cause
+ * for (b.jg5 SRJ-105, `refusalAt` with verb `find-missing`, which is not a
+ * read verb, so an UNAVAILABLE, an ENVIRONMENT, a CONFIG or an UNCLASSIFIED
+ * answer, b.jg5 SRJ-313) is a refusal: one refusal line, and
  * `FIND_MISSING_REFUSED`, after which the caller calls nothing more in its
  * attempt. Any other failure, UNUSABLE NAME included, logs once and lets the
  * caller proceed.
@@ -2666,17 +2736,37 @@ export function _resetFindMissingMemo(): void {
  * @param key persona key: the outage key and log context — the sweep itself is whole-store.
  * @param logPrefix distinguishes the call sites in the log line.
  * @param ref log reference; defaults to the key alone.
- * @returns the sweep's result (this caller's, a shared in-flight one or the
- *   memoized one), `FIND_MISSING_REFUSED` for a refusal, or undefined when
- *   the sweep failed otherwise.
+ * @param opts the run kind and the next-step `get` key; an ordinary run with none by default.
+ * @returns the sweep's result (this caller's run, a shared in-flight one or
+ *   the memoized one), `FIND_MISSING_REFUSED` for a refusal,
+ *   `FIND_MISSING_LATCHED` when persona `key` is latched once the sweep is
+ *   done (b.jg5 SRJ-502), or undefined when the sweep failed otherwise.
  */
 async function reconcileMissingSweep(
   key: string,
   logPrefix: string,
   ref: string = keyRef(key),
-): Promise<FindMissingResult | typeof FIND_MISSING_REFUSED | undefined> {
-  return sharedFindMissingSweep(() => withOutageDetection(key, undefined, 'find-missing', (client) => client.findMissing({})), logPrefix, ref, key)
+  opts: FindMissingSweepOptions = {},
+): Promise<FindMissingSweepAnswer> {
+  return sharedFindMissingSweep(
+    () => withOutageDetection(key, undefined, 'find-missing', (client) => client.findMissing({})),
+    logPrefix,
+    ref,
+    key,
+    opts,
+  )
 }
+
+/**
+ * What a persona's findMissing sweep answers (`reconcileMissingSweep`,
+ * `bypassingFindMissingSweep`): the result, `FIND_MISSING_REFUSED`,
+ * `FIND_MISSING_LATCHED`, or undefined for any other failure.
+ */
+export type FindMissingSweepAnswer =
+  | FindMissingResult
+  | typeof FIND_MISSING_REFUSED
+  | typeof FIND_MISSING_LATCHED
+  | undefined
 
 /**
  * A persona's findMissing sweep that was refused (b.jg5 SRJ-105): the sweep
@@ -2686,30 +2776,70 @@ async function reconcileMissingSweep(
  * stops its launch or recovery attempt: no resume, kill, delete, launch,
  * reconnect or dead-session verdict follows.
  */
-const FIND_MISSING_REFUSED: unique symbol = Symbol('find-missing refused')
+export const FIND_MISSING_REFUSED: unique symbol = Symbol('find-missing refused')
 
 /**
- * The memo and single-flight core of `reconcileMissingSweep`, shared by every
- * findMissing caller. `start` makes the call when no sweep is in flight or
- * memoized: a persona's call through `withOutageDetection`, or the start
- * sweep's direct call (`reconcileKilledPrePersonaRows`), which acts for no
- * persona. Never throws; logs as `reconcileMissingSweep` describes.
+ * A persona's findMissing sweep after which the persona is latched (b.jg5
+ * SRJ-502): a post-run `get` of its own row read the latching note (b.jg5
+ * SRJ-114, SRJ-120), or the installed latch answers it latched
+ * (`personaLatchedNow`). The caller makes no further agent-director call for
+ * the persona: no status read, resume, kill, delete, launch or reconnect.
+ */
+export const FIND_MISSING_LATCHED: unique symbol = Symbol('find-missing latched')
+
+/**
+ * The memo and single-flight core of every findMissing caller
+ * (b.m4r, b.jg5 SRJ-120). `start` makes the call when a run starts: a
+ * persona's call through `withOutageDetection`, or the start sweep's direct
+ * call (`reconcileKilledPrePersonaRows`), which acts for no persona. Never
+ * throws.
  *
- * `key` is the calling persona's key, and is absent for a caller that acts for
- * no persona. A failed sweep is reported to the retry timer once per persona
- * that met it (b.jg5 SRJ-301): the starter's `withOutageDetection` reports it
- * under the starter's key, and a persona that joined a sweep someone else
- * started (another persona's, or the start sweep's direct call) reports it
- * here under its own key, so sharing the sweep never changes whose timer arms.
- * A joiner whose sweep failed with ENVIRONMENT (`ErrTmuxNotAvailable`, by
- * class through `src/ad-error-class.ts`) also raises its own
- * 'tmux-unavailable' before that report, as the starter's wrapper does for
- * the starter (b.jg5 SRJ-311): same onset, same-flag dedupe. A joiner whose
- * sweep failed with CONFIG (`ErrConfigMalformed`) raises its own
- * 'ad-config-malformed' the same way (b.jg5 SRJ-316).
- * For a persona's caller, the starter and each joiner alike, a refused sweep
- * answers `FIND_MISSING_REFUSED` (b.jg5 SRJ-105); a caller that acts for no
- * persona only ever gets undefined for a failure.
+ * Run kinds (`opts.kind`):
+ * - ordinary (the default): the run in flight, if any, is joined (a
+ *   bypassing one included); otherwise a result memoized less than the
+ *   window ago (`_findMissingMemoTtlMs`, on `_now`) is returned with no call
+ *   and no `get`; otherwise a run starts;
+ * - bypassing: a run always starts, and becomes the run in flight that later
+ *   ordinary callers join.
+ * A run that succeeds is memoized only when no run started after it has been
+ * memoized already, so an older run resolving later never overwrites a newer
+ * result, and it clears the in-flight slot only while it is still the run
+ * there. Each run logs its line once (the starter's `logPrefix` and `ref`):
+ *
+ *   [slack] <logPrefix>: findMissing sweep for <ref> — count=<n> ids=[…] unverified=<n> unverified_ids=[…]
+ *   [slack] <logPrefix>: bypassing findMissing sweep for <ref> — count=<n> ids=[…] unverified=<n> unverified_ids=[…]
+ *
+ * Post-run `get`s (`readListedPersonaRows`, b.jg5 SRJ-120): when a run
+ * resolves, and before any caller awaiting it (its starter and its joiners
+ * alike) goes on, each configured persona's own row listed in
+ * `unverified_ids` is read with one `get` through the shared own-row read
+ * (`readPersonaOwnRow`), except the row of the starter's
+ * `opts.nextStepGetKey`. A memo hit makes no `get`.
+ *
+ * Failures, of either kind, are logged with the run kind, never memoized, and
+ * leave any earlier memoized result in place; a failed run makes no `get`.
+ * A joiner's failure is its own: a failed sweep is reported to the retry
+ * timer once per persona that met it (b.jg5 SRJ-301): the starter's
+ * `withOutageDetection` reports it under the starter's key, and a persona
+ * that joined a run someone else started (another persona's, or the start
+ * sweep's direct call) reports it here under its own key. A joiner whose
+ * sweep failed with ENVIRONMENT (`ErrTmuxNotAvailable`, by class through
+ * `src/ad-error-class.ts`) also raises its own 'tmux-unavailable' before that
+ * report, as the starter's wrapper does for the starter (b.jg5 SRJ-311): same
+ * onset, same-flag dedupe. A joiner whose sweep failed with CONFIG
+ * (`ErrConfigMalformed`) raises its own 'ad-config-malformed' the same way
+ * (b.jg5 SRJ-316). For a persona's caller, the starter and each joiner alike,
+ * a refused sweep answers `FIND_MISSING_REFUSED` (b.jg5 SRJ-105); a caller
+ * that acts for no persona only ever gets undefined for a failure. Any other
+ * failure logs:
+ *
+ *   [slack] <logPrefix>: findMissing sweep failed for <ref>: <failure> — proceeding
+ *   [slack] <logPrefix>: bypassing findMissing sweep failed for <ref>: <failure> — proceeding
+ *
+ * A persona's caller gets `FIND_MISSING_LATCHED` instead of a result or
+ * undefined when its persona is latched once the sweep is done (b.jg5
+ * SRJ-502): a post-run `get` of this run read its row as latching, or
+ * `personaLatchedNow` answers true. The caller logs its own stop line.
  */
 async function sharedFindMissingSweep(
   start: () => Promise<FindMissingResult>,
@@ -2721,40 +2851,43 @@ async function sharedFindMissingSweep(
   logPrefix: string,
   ref: string,
   key: string,
-): Promise<FindMissingResult | typeof FIND_MISSING_REFUSED | undefined>
+  opts?: FindMissingSweepOptions,
+): Promise<FindMissingSweepAnswer>
 async function sharedFindMissingSweep(
   start: () => Promise<FindMissingResult>,
   logPrefix: string,
   ref: string,
   key?: string,
-): Promise<FindMissingResult | typeof FIND_MISSING_REFUSED | undefined> {
-  // Memo hit: a recent successful sweep is still within the TTL. Reuse it.
-  if (_findMissingLast && Date.now() - _findMissingLast.at < _findMissingMemoTtlMs) {
-    return _findMissingLast.result
+  opts: FindMissingSweepOptions = {},
+): Promise<FindMissingSweepAnswer> {
+  const kind = opts.kind ?? FIND_MISSING_RUN_ORDINARY
+
+  // Single flight (ordinary runs only): join the run in flight rather than
+  // starting one. Asked before the memo, so an ordinary caller arriving while
+  // a bypassing run is in flight joins it; with ordinary runs alone a run is
+  // in flight only once the memo has expired.
+  const joined = kind === FIND_MISSING_RUN_ORDINARY ? _findMissingInFlight : null
+
+  // Memo hit (ordinary runs only): a recent successful run is still inside the window.
+  if (
+    joined === null &&
+    kind === FIND_MISSING_RUN_ORDINARY &&
+    _findMissingLast &&
+    _now() - _findMissingLast.at < _findMissingMemoTtlMs
+  ) {
+    return latchedOr(key, _findMissingLast.result, NO_LATCHED_KEYS)
   }
 
-  // Single-flight: an in-flight sweep exists — await it rather than starting one.
-  // The async wrapper turns a synchronous throw from `start` into a rejection.
-  const started = !_findMissingInFlight
-  if (!_findMissingInFlight) {
-    _findMissingInFlight = (async () => start())()
-  }
-  const inFlight = _findMissingInFlight
+  const run = joined ?? startFindMissingRun(start, kind, opts.nextStepGetKey, logPrefix, ref)
+  if (joined === null) _findMissingInFlight = run
 
   try {
-    const r = await inFlight
-    // Only the caller that started this sweep records the result/log (others
-    // await the same promise but must not double-log or re-stamp the memo).
-    if (_findMissingInFlight === inFlight) {
-      _findMissingLast = { result: r, at: Date.now() }
-      _findMissingInFlight = null
-      console.error(`[slack] ${logPrefix}: findMissing sweep for ${ref} — count=${r.count} ids=[${r.ids.join(',')}] unverified=${r.unverified} unverified_ids=[${r.unverified_ids.join(',')}]`)
-    }
-    return r
+    const outcome = await run.promise
+    return latchedOr(key, outcome.result, outcome.latchedKeys)
   } catch (err) {
     // A joiner's failure is its own: raise and report it under its key, as the
     // starter's wrapper did under the starter's (b.jg5 SRJ-301, SRJ-311).
-    if (!started && key !== undefined) {
+    if (joined !== null && key !== undefined) {
       const { errorClass } = classifyAdError(err)
       if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
         // b.jg5 SRJ-1021: the raising error picks the onset.
@@ -2765,44 +2898,289 @@ async function sharedFindMissingSweep(
       }
       reportAgentDirectorError(key, err, 'find-missing')
     }
-    // Do NOT memoize failures — clear the in-flight slot so the next caller
-    // retries. Log and let the caller proceed with today's behavior.
-    if (_findMissingInFlight === inFlight) {
-      _findMissingInFlight = null
-    }
+    const what = findMissingSweepWords(run.kind)
     // b.jg5 SRJ-105: a refused sweep stops the persona's attempt.
-    if (key !== undefined && refusalAt(key, err, 'find-missing', logPrefix, 'findMissing sweep', ref)) {
+    if (key !== undefined && refusalAt(key, err, 'find-missing', logPrefix, what, ref)) {
       return FIND_MISSING_REFUSED
     }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('findMissing', 'UnknownError', String(err))
-    console.error(`[slack] ${logPrefix}: findMissing sweep failed for ${ref}: ${describeAgentDirectorFailure(e)} — proceeding`)
+    console.error(`[slack] ${logPrefix}: ${what} failed for ${ref}: ${describeAgentDirectorFailure(e)} — proceeding`)
+    return latchedOr(key, undefined, NO_LATCHED_KEYS)
+  }
+}
+
+/** No persona latched by a run's post-run `get`s. */
+const NO_LATCHED_KEYS: ReadonlySet<string> = new Set<string>()
+
+/**
+ * What a sweep answers persona `key`'s caller: `FIND_MISSING_LATCHED` when
+ * `key` is in `latchedKeys` or latched now (`personaLatchedNow`), otherwise
+ * `answer`. A caller that acts for no persona (`key` undefined) gets `answer`.
+ */
+function latchedOr(
+  key: string | undefined,
+  answer: FindMissingResult | undefined,
+  latchedKeys: ReadonlySet<string>,
+): FindMissingResult | typeof FIND_MISSING_LATCHED | undefined {
+  if (key === undefined) return answer
+  return latchedKeys.has(key) || personaLatchedNow(key) ? FIND_MISSING_LATCHED : answer
+}
+
+/** The run's words in its log lines: `findMissing sweep`, or `bypassing findMissing sweep` for a bypassing run. */
+function findMissingSweepWords(kind: FindMissingRunKind): string {
+  return kind === FIND_MISSING_RUN_BYPASSING ? 'bypassing findMissing sweep' : 'findMissing sweep'
+}
+
+/**
+ * Start one findMissing run (`sharedFindMissingSweep`): make the call, then,
+ * on success, log the run's line, make the post-run `get`s
+ * (`readListedPersonaRows`), memoize the result unless a run started later
+ * has been memoized already, and clear the in-flight slot while this run is
+ * still in it. On failure only the slot is cleared (while this run is in it)
+ * and the error is rethrown to every caller awaiting the run. The caller puts
+ * the run in the in-flight slot.
+ */
+function startFindMissingRun(
+  start: () => Promise<FindMissingResult>,
+  kind: FindMissingRunKind,
+  nextStepGetKey: string | undefined,
+  logPrefix: string,
+  ref: string,
+): FindMissingRun {
+  const seq = ++_findMissingRunSeq
+  // Assigned before the call below can settle: `start` runs behind an await.
+  let run: FindMissingRun | undefined
+  const promise = (async (): Promise<FindMissingRunOutcome> => {
+    let result: FindMissingResult
+    try {
+      // The async wrapper turns a synchronous throw from `start` into a rejection.
+      result = await (async () => start())()
+    } catch (err) {
+      if (_findMissingInFlight === run) _findMissingInFlight = null
+      throw err
+    }
+    const at = _now()
+    const words = findMissingSweepWords(kind)
+    console.error(
+      `[slack] ${logPrefix}: ${words} for ${ref} — count=${result.count} ids=[${result.ids.join(',')}] unverified=${result.unverified} unverified_ids=[${result.unverified_ids.join(',')}]`,
+    )
+    const latchedKeys = await readListedPersonaRows(result, nextStepGetKey, logPrefix, `${words} for ${ref}`)
+    if (_findMissingLast === null || _findMissingLast.seq < seq) _findMissingLast = { result, at, seq }
+    if (_findMissingInFlight === run) _findMissingInFlight = null
+    return { result, latchedKeys }
+  })()
+  run = { seq, kind, promise }
+  return run
+}
+
+/**
+ * The persona key whose own row id `id` is (`cscb_<key>`, `personaInstanceId`)
+ * when that key is a persona of the applied configuration now (the installed
+ * `ConfiguredPersonaQuery`, `configuredReadingOf`); undefined for any other
+ * id: another caller's row, a pre-persona row, a non-`cscb_` id, or the
+ * `cscb_<key>` of a key outside the applied configuration (C14, C24). With no
+ * query installed no id counts. Pure but for the query; never throws.
+ */
+function configuredPersonaKeyOfRowId(id: unknown): string | undefined {
+  if (typeof id !== 'string' || !id.startsWith(PERSONA_INSTANCE_ID_PREFIX)) return undefined
+  const key = id.slice(PERSONA_INSTANCE_ID_PREFIX.length)
+  if (key === '' || personaInstanceId(key) !== id) return undefined
+  return configuredReadingOf(key).configured ? key : undefined
+}
+
+/**
+ * The post-run `get`s of a findMissing run the server made (b.jg5 SRJ-120's
+ * notes on CSCB's rows): each configured persona's own row listed in
+ * `result.unverified_ids` (`configuredPersonaKeyOfRowId`, each persona once,
+ * in list order), except `nextStepGetKey`'s, is read with one `get` through
+ * the shared own-row read (`readPersonaOwnRow`, through
+ * `withOutageDetection` for that persona, whatever persona the run was made
+ * for), one after another. SRJ-114's rule applies at each read: only a
+ * `provenance_conflict` note on the persona's own row latches it, and the
+ * read logs its note lines (`<logPrefix>: post-sweep get for persona=<key>:
+ * …`). A `get` answering absent or refused changes nothing: it never fails
+ * the run, is never memoized as a failure and never stops the other `get`s.
+ * No `get` is made for any other id. When at least one row was read, one line
+ * lists the personas read and what each read answered (persona references
+ * only; a refused read carries the redacting describer's text):
+ *
+ *   [slack] <logPrefix>: after the <run> — one get of each configured persona's own row in unverified_ids: persona=<key> <read|latched|absent|refused (<failure>)>, … (b.jg5 SRJ-120)
+ *
+ * where `<run>` is `findMissing sweep for <ref>` or `bypassing findMissing
+ * sweep for <ref>`. Answers the personas whose read latched
+ * (`OwnRowRead.latched`). Never throws.
+ */
+async function readListedPersonaRows(
+  result: FindMissingResult,
+  nextStepGetKey: string | undefined,
+  logPrefix: string,
+  run: string,
+): Promise<ReadonlySet<string>> {
+  const latchedKeys = new Set<string>()
+  const read: string[] = []
+  try {
+    const keys: string[] = []
+    for (const id of result.unverified_ids ?? []) {
+      const key = configuredPersonaKeyOfRowId(id)
+      if (key === undefined || key === nextStepGetKey || keys.includes(key)) continue
+      keys.push(key)
+    }
+    for (const key of keys) {
+      const ownRead = await readPersonaOwnRow(key, { site: logPrefix, what: 'post-sweep get' })
+      if (ownRead.kind === OWN_ROW_READ_ROW) {
+        if (ownRead.latched) latchedKeys.add(key)
+        read.push(`${keyRef(key)} ${ownRead.latched ? 'latched' : 'read'}`)
+      } else if (ownRead.kind === OWN_ROW_READ_ABSENT) {
+        read.push(`${keyRef(key)} absent`)
+      } else {
+        read.push(`${keyRef(key)} refused (${describeAgentDirectorFailure(ownRead.error)})`)
+      }
+    }
+  } catch (err) {
+    // Not reached (`readPersonaOwnRow` never throws); a throw ends the reads with what was read.
+    console.error(`[slack] ${logPrefix}: after the ${run} — the post-sweep gets failed: ${describeThrownValue(err)} (b.jg5 SRJ-120)`)
+  }
+  if (read.length > 0) {
+    console.error(
+      `[slack] ${logPrefix}: after the ${run} — one get of each configured persona's own row in unverified_ids: ${read.join(', ')} (b.jg5 SRJ-120)`,
+    )
+  }
+  return latchedKeys
+}
+
+/**
+ * The bypassing findMissing run for persona `key` (b.jg5 SRJ-120): a new
+ * `findMissing({})` call through `withOutageDetection` for `key`, whatever is
+ * memoized or in flight; its result is memoized for later ordinary callers,
+ * and ordinary callers arriving while it is in flight join it. After it, each
+ * configured persona's own row listed in `unverified_ids` is read with one
+ * `get` (`readListedPersonaRows`), except `nextStepGetKey`'s, the row the
+ * caller's own next step reads with a `get`. Exactly these runs bypass, and
+ * this is their one entry:
+ *
+ * - the live-row sequence's runs (b.jg5 SRJ-705) and an old-life wait's runs
+ *   (SRJ-811);
+ * - the pending-row rule's runs (SRJ-410);
+ * - the run before the single retry that follows a latch re-check whose probe
+ *   found the condition cleared, and the run after a latch clears by the
+ *   re-check's step 1 or by `clear-latch` (SRJ-506).
+ *
+ * No path calls it yet. The Epics of Plan b.b6r that will call it: E21 (the
+ * live-row sequence, SRJ-705), E27 (the old-life wait, SRJ-811), E29 (the
+ * pending-row rule, SRJ-410), E30 (the latch re-check, SRJ-505, SRJ-506) and
+ * E31 (`clear-latch`, SRJ-506). Every other findMissing caller is an
+ * ordinary run.
+ *
+ * Answers as `reconcileMissingSweep` does: the result, `FIND_MISSING_REFUSED`
+ * for a refusal (b.jg5 SRJ-105: the caller stops its attempt),
+ * `FIND_MISSING_LATCHED` when `key` is latched once the run is done (b.jg5
+ * SRJ-502: the caller calls nothing more for it), or undefined for any other
+ * failure, which is logged and never memoized and leaves the earlier memoized
+ * result in place. A persona already latched before the run gets
+ * `FIND_MISSING_LATCHED` too, whatever the run found (a refusal still answers
+ * `FIND_MISSING_REFUSED`); a successful run's result is still memoized. Never
+ * throws.
+ *
+ * @param key the persona the run is made for: its outage key and log context.
+ * @param logPrefix distinguishes the call site in the log lines.
+ * @param nextStepGetKey the persona whose own row the caller reads next with a `get`, if any.
+ */
+export async function bypassingFindMissingSweep(
+  key: string,
+  logPrefix: string,
+  nextStepGetKey?: string,
+): Promise<FindMissingSweepAnswer> {
+  try {
+    return await reconcileMissingSweep(key, logPrefix, keyRef(key), { kind: FIND_MISSING_RUN_BYPASSING, nextStepGetKey })
+  } catch (err) {
+    // Not reached (`reconcileMissingSweep` never throws).
+    console.error(`[slack] ${logPrefix}: bypassing findMissing sweep failed for ${keyRef(key)}: ${describeThrownValue(err)} — proceeding`)
     return undefined
   }
 }
 
 /**
+ * The reading of one row in a findMissing result (b.jg5 SRJ-120): agent-director
+ * marked it `missing` (it is in `ids`).
+ */
+export const FIND_MISSING_ROW_MARKED_MISSING = 'marked-missing'
+/** The row was judged and left live (it is in `unverified_ids`). */
+export const FIND_MISSING_ROW_LEFT_LIVE = 'judged-left-live'
+/**
+ * The row was not judged: it was `pending` when last read and is in neither
+ * list (inside the host's grace period, or its launch's worker process is
+ * alive). Retry later; never a reason to escalate, alert or kill.
+ */
+export const FIND_MISSING_ROW_NOT_JUDGED = 'not-judged'
+/** The row was judged alive: it was not `pending` when last read and is in neither list. */
+export const FIND_MISSING_ROW_JUDGED_ALIVE = 'judged-alive'
+
+/** What a findMissing result says of one row (`readFindMissingRow`). */
+export type FindMissingRowReading =
+  | typeof FIND_MISSING_ROW_MARKED_MISSING
+  | typeof FIND_MISSING_ROW_LEFT_LIVE
+  | typeof FIND_MISSING_ROW_NOT_JUDGED
+  | typeof FIND_MISSING_ROW_JUDGED_ALIVE
+
+/**
+ * What findMissing result `result` says of row `id`, whose state was
+ * `stateBefore` as last read before the run (b.jg5 SRJ-120; HO C2 step 2,
+ * C14, C21, C23):
+ *
+ * - in `ids` → `FIND_MISSING_ROW_MARKED_MISSING`: marked `missing`;
+ * - in `unverified_ids` → `FIND_MISSING_ROW_LEFT_LIVE`: judged and left live;
+ * - in neither, `stateBefore` `pending` → `FIND_MISSING_ROW_NOT_JUDGED`: the
+ *   run did not judge it (the row is inside the host's grace period, or its
+ *   launch's worker process is alive);
+ * - in neither, any other `stateBefore` → `FIND_MISSING_ROW_JUDGED_ALIVE`.
+ *
+ * `stateBefore` is required: a caller with no state read for the row has no
+ * reading to ask for.
+ *
+ * "Not judged" means retry later, whatever time has passed, and is never a
+ * reason to escalate, alert or kill (b.jg5 SRJ-410, SRJ-717). Pure: no state,
+ * no call, no log line; never throws.
+ */
+export function readFindMissingRow(
+  result: Pick<FindMissingResult, 'ids' | 'unverified_ids'>,
+  id: string,
+  stateBefore: string,
+): FindMissingRowReading {
+  if ((result.ids ?? []).includes(id)) return FIND_MISSING_ROW_MARKED_MISSING
+  if ((result.unverified_ids ?? []).includes(id)) return FIND_MISSING_ROW_LEFT_LIVE
+  return stateBefore === AGENT_DIRECTOR_PENDING_STATE ? FIND_MISSING_ROW_NOT_JUDGED : FIND_MISSING_ROW_JUDGED_ALIVE
+}
+
+/**
  * b.sv7 / Epic t1.tkk.e4: the escalate-dead → internal-sweep entry point, and
- * the single reusable place for it (b.4vj will add a second retry driver that
- * hits dead-tmux and must share this exact logic — do NOT inline the sweep at
- * another call site).
+ * the single reusable place for it (do NOT inline the sweep at another call
+ * site).
  *
  * When the tick/restart path decides a persona's tmux session is provably dead
  * while its AD row still looks alive ('dead-session' → 'escalate-dead'), CSCB
  * recovers itself instead of silently waiting on the external
  * `~/startup/find-missing-loop.sh`: emit an operator-visible log line, then run
- * the existing memoized `reconcileMissingSweep` (b.m4r). The sweep reconciles
- * the frozen `working` row to `missing`, so the restart run's second liveness
- * probe (b.d61) reads `dead` and takes the normal kill+relaunch branch at
- * once. A re-probe reading `pending` or `unknown` leaves the relaunch undone
- * (`unknown` arms the retry timer); if the row still reads `live`, a later
- * health-check tick does. The external loop remains belt-and-braces; removing it is a separate
- * operator decision.
+ * the memoized, ordinary `reconcileMissingSweep` (b.m4r, b.jg5 SRJ-120). The
+ * sweep may reconcile the frozen `working` row to `missing`, and the restart
+ * run's second liveness probe (b.d61) then reads `dead` and takes the normal
+ * kill+relaunch branch at once. It may also leave the row live (in
+ * `unverified_ids`, or, when `pending`, not judged), and then the row stays
+ * live for further ticks: a re-probe reading `pending` or `unknown` leaves the
+ * relaunch undone (`unknown` arms the retry timer), and a row that still reads
+ * `live` is left to later health-check ticks. After a run the sweep makes,
+ * each configured persona's own row left in `unverified_ids` is read with one
+ * `get`, and only a `provenance_conflict` note there latches; the restart run
+ * asks the latch right after the 'escalate-dead' verdict, before its re-probe,
+ * so a persona latched that way gets no further agent-director call (b.jg5
+ * SRJ-502), and again right before its kill (src/restart.ts). The external
+ * loop remains belt-and-braces; removing it is a separate operator decision.
  *
  * The log line is emitted UNCONDITIONALLY here — before/outside the memoized
  * helper — because a memo hit returns silently and a sweep failure logs only
  * the generic failure line; an operator must see that recovery was triggered on
- * every escalate-dead verdict. `reconcileMissingSweep` stays module-private; this
- * wrapper and `sweepDeadTmuxChannelWithCause` are its only exports.
+ * every escalate-dead verdict. `reconcileMissingSweep` stays module-private;
+ * this wrapper, `sweepDeadTmuxChannelWithCause` and the bypassing entry
+ * (`bypassingFindMissingSweep`) are its only exports.
  *
  * Never throws: `reconcileMissingSweep` already logs and swallows its own
  * failures (and does not memoize them, so the next tick retries).
@@ -2820,7 +3198,11 @@ export async function sweepDeadTmuxChannel(key: string, verdict: EscalateDeadVer
  * `sweepDeadTmuxChannel`, also saying whether the sweep was refused (b.jg5
  * SRJ-105, `FIND_MISSING_REFUSED`). The restart path's reconnect adapter
  * (`src/server.ts`) then answers `transient` instead of `escalate-dead`, so
- * the restart run neither re-probes nor kills nor relaunches the persona.
+ * the restart run neither re-probes nor kills nor relaunches the persona. A
+ * persona latched once the sweep is done (`FIND_MISSING_LATCHED`) answers as
+ * an unrefused sweep: the restart run asks the latch right after the
+ * 'escalate-dead' verdict, before its re-probe, and stops there with no
+ * further agent-director call (b.jg5 SRJ-502).
  */
 export async function sweepDeadTmuxChannelWithCause(key: string, verdict: EscalateDeadVerdict): Promise<{ refused?: true }> {
   console.error(
@@ -2919,14 +3301,29 @@ function isDeadRowState(state: string | undefined): boolean {
  * `key`'s row state again. Returns that state, or undefined when the read
  * failed (logged with `logPrefix` and `ref`). A failed sweep logs its own
  * line, and the row is read anyway, except a refused one (b.jg5 SRJ-105):
- * then nothing is read and `FIND_MISSING_REFUSED` is returned. Never throws.
+ * then nothing is read and `FIND_MISSING_REFUSED` is returned. When the
+ * persona is latched once the sweep is done (`FIND_MISSING_LATCHED`: a
+ * post-run `get` of its row read the latching note, or the latch answers it
+ * latched, b.jg5 SRJ-120, SRJ-502), nothing is read, one line is logged and
+ * `FIND_MISSING_LATCHED` is returned:
+ *
+ *   [slack] <logPrefix>: <ref> is latched after the findMissing sweep — its row is not read; nothing more is called for it (b.jg5 SRJ-502)
+ *
+ * Never throws.
  */
 async function reconcileAndReadRowState(
   key: string,
   logPrefix: string,
   ref: string,
-): Promise<string | typeof FIND_MISSING_REFUSED | undefined> {
-  if ((await reconcileMissingSweep(key, logPrefix, ref)) === FIND_MISSING_REFUSED) return FIND_MISSING_REFUSED
+): Promise<string | typeof FIND_MISSING_REFUSED | typeof FIND_MISSING_LATCHED | undefined> {
+  const sweep = await reconcileMissingSweep(key, logPrefix, ref)
+  if (sweep === FIND_MISSING_REFUSED) return FIND_MISSING_REFUSED
+  if (sweep === FIND_MISSING_LATCHED) {
+    console.error(
+      `[slack] ${logPrefix}: ${ref} is latched after the findMissing sweep — its row is not read; nothing more is called for it (b.jg5 SRJ-502)`,
+    )
+    return FIND_MISSING_LATCHED
+  }
   try {
     const st = await withOutageDetection(key, undefined, 'status', (client) =>
       client.status({ claude_instance_id: personaInstanceId(key) }),
@@ -2977,15 +3374,23 @@ export async function readPersonaRowState(key: string): Promise<UnavailableRetry
  * escalates the persona as dead for the restart to relaunch. A refused sweep
  * (b.jg5 SRJ-105) returns `refused`: the row is not read, and the adapter
  * answers `transient`, so the restart run kills and launches nothing and
- * raises no notice. Otherwise `defer`: the adapter defers the row and raises
- * its notice, as before. Never throws.
+ * raises no notice. A persona latched once the sweep is done (b.jg5 SRJ-120,
+ * SRJ-502: `reconcileAndReadRowState` answers `FIND_MISSING_LATCHED`) gets no
+ * row read and is never escalated: `latched`, and the adapter answers
+ * `transient` with no notice, since the persona is held (b.jg5 SRJ-502) and
+ * its latch's own notice already tells the human (SRJ-508). Otherwise
+ * `defer`: the adapter defers the row and raises its notice, as before.
+ * Never throws.
  */
-export async function checkPromptRowDeferral(key: string, state: string): Promise<'escalate' | 'defer' | 'refused'> {
+export async function checkPromptRowDeferral(key: string, state: string): Promise<'escalate' | 'defer' | 'refused' | 'latched'> {
   const heldMs = noteDeferralRun(promptRowDeferredSince, key)
   if (heldMs < PROMPT_ROW_SWEEP_AFTER_MS) return 'defer'
   const ref = keyRef(key)
   const after = await reconcileAndReadRowState(key, 'reconnectSession: prompt row', ref)
   if (after === FIND_MISSING_REFUSED) return 'refused'
+  // b.jg5 SRJ-502: a persona latched after the sweep is never escalated, and
+  // gets no not-connected notice.
+  if (after === FIND_MISSING_LATCHED) return 'latched'
   if (!isDeadRowState(after)) return 'defer'
   endPromptRowDeferral(key)
   console.error(
@@ -3007,7 +3412,10 @@ export async function checkPromptRowDeferral(key: string, state: string): Promis
  *   `ended` or `missing` is a dead session, recovered through
  *   `resumeOrFreshSpawn`; anything else (or a failed read) is left as it is
  *   (`no-op`), for the restart path to retry. A refused sweep (b.jg5
- *   SRJ-105) reads nothing and answers `failed`: no resume or launch.
+ *   SRJ-105) reads nothing and answers `failed`: no resume or launch. A
+ *   persona latched once the sweep is done (b.jg5 SRJ-120, SRJ-502:
+ *   `FIND_MISSING_LATCHED`) reads nothing and answers `latched`: no further
+ *   call, no resume, kill, delete or launch.
  */
 async function launchOnPromptRow(
   persona: Persona,
@@ -3037,6 +3445,8 @@ async function launchOnPromptRow(
   )
   const after = await reconcileAndReadRowState(key, 'spawnForPersona: prompt row', ref)
   if (after === FIND_MISSING_REFUSED) return { key, action: 'failed' }
+  // b.jg5 SRJ-502: a persona latched after the sweep gets no further call.
+  if (after === FIND_MISSING_LATCHED) return { key, action: 'latched' }
   if (isDeadRowState(after)) {
     console.error(`[slack] spawnForPersona: dead session for ${ref} (state=${state}) — recovering via resume/fresh-spawn`)
     // b.jg5 SRJ-501: the re-read after the sweep is the path's last read.
@@ -3135,9 +3545,10 @@ async function tmuxFallbackVerdict(
  * b.jg5 SRJ-502 — the wait asks whether its persona is latched at the same
  * points, after each agent-director call it makes (its `find-missing` runs,
  * `status` polls, pane reads and transcript `get`s): a latch its transcript
- * `get` set (a `provenance_conflict` note, b.jg5 SRJ-114) or one set
- * elsewhere ends it with 'latched', one line, no further call, nothing typed
- * and no not-connected notice. A cancelled wait still answers 'cancelled'.
+ * `get` set (a `provenance_conflict` note, b.jg5 SRJ-114), one a `find-missing`
+ * run's post-run `get` set (b.jg5 SRJ-120), or one set elsewhere ends it
+ * with 'latched', one line, no further call, nothing typed and no
+ * not-connected notice. A cancelled wait still answers 'cancelled'.
  *
  * b.ecw — which object each terminal branch keys on. AD probes the claude
  * PROCESS; CSCB's `_hasTmuxSession` probes the TMUX SESSION. A lingering tmux
@@ -3259,9 +3670,10 @@ async function waitForWorkingRow(
   // behavior), except a refused sweep (b.jg5 SRJ-105): nothing more is
   // called, and the wait answers 'failed' as for a refused status read.
   if (waitMustEnd(key, wait)) return endWait(ref, wait)
-  if ((await reconcileMissingSweep(key, 'waitForWaitingAndReconnect', ref)) === FIND_MISSING_REFUSED) {
-    return refusedWaitSweep(key, ref, wait)
-  }
+  const upFrontSweep = await reconcileMissingSweep(key, 'waitForWaitingAndReconnect', ref)
+  if (upFrontSweep === FIND_MISSING_REFUSED) return refusedWaitSweep(key, ref, wait)
+  // b.jg5 SRJ-120, SRJ-502: a persona latched once the sweep is done ends the wait.
+  if (upFrontSweep === FIND_MISSING_LATCHED) return endWait(ref, wait)
 
   while (_now() < deadline) {
     if (waitMustEnd(key, wait)) return endWait(ref, wait)
@@ -3378,9 +3790,10 @@ async function waitForWorkingRow(
   //   gives 'dead-session' only for a gone session.
   // - a refused sweep → 'failed' with no status read (b.jg5 SRJ-105).
   if (waitMustEnd(key, wait)) return endWait(ref, wait)
-  if ((await reconcileMissingSweep(key, 'waitForWaitingAndReconnect: timeout', ref)) === FIND_MISSING_REFUSED) {
-    return refusedWaitSweep(key, ref, wait)
-  }
+  const timeoutSweep = await reconcileMissingSweep(key, 'waitForWaitingAndReconnect: timeout', ref)
+  if (timeoutSweep === FIND_MISSING_REFUSED) return refusedWaitSweep(key, ref, wait)
+  // b.jg5 SRJ-120, SRJ-502: a persona latched once the sweep is done ends the wait.
+  if (timeoutSweep === FIND_MISSING_LATCHED) return endWait(ref, wait)
   if (waitMustEnd(key, wait)) return endWait(ref, wait)
   let timeoutState: string
   try {
@@ -4264,6 +4677,11 @@ function reportInconclusiveDiagnosis(
  * `get` read. It answers `latched`: nothing is killed, deleted or launched
  * after it.
  *
+ * b.jg5 SRJ-120, SRJ-502: with `reconcileMissingFirst`, a persona latched
+ * once the findMissing sweep is done (a post-run `get` of its own row read
+ * the latching note, or the latch answers it latched) answers `latched` with
+ * one line and no `resume`, kill, delete or spawn.
+ *
  * @param row  The row returned by the collision `get` (its `labels`).
  */
 async function resumeOrFreshSpawn(
@@ -4304,8 +4722,16 @@ async function resumeOrFreshSpawn(
   // fallback). Prefer AD's findMissing verb over CSCB-side tmux probing per
   // docs/engineering-guide.md ("Avoiding Duplicated Effort").
   if (opts.reconcileMissingFirst) {
-    if ((await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref)) === FIND_MISSING_REFUSED) {
-      return { key, action: 'failed' }
+    const sweep = await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref)
+    if (sweep === FIND_MISSING_REFUSED) return { key, action: 'failed' }
+    if (sweep === FIND_MISSING_LATCHED) {
+      // b.jg5 SRJ-120, SRJ-502: the persona latched during the sweep (a
+      // post-run `get` of its row read the latching note, or the latch
+      // answers it latched): no resume, kill, delete or spawn follows.
+      console.error(
+        `[slack] spawnForPersona: ${ref} is latched after the findMissing sweep before resume — not resuming; nothing more is called for it (b.jg5 SRJ-502)`,
+      )
+      return { key, action: 'latched' }
     }
   }
 
@@ -5194,36 +5620,58 @@ async function keepPrePersonaRow(client: Client, row: ListRow, counts: PrePerson
  * leaves the row's state as it was). It runs after a failed kill too: the
  * session may be gone all the same, and only the sweep would tell.
  *
- * It is the memoized, single-flight sweep every findMissing caller shares
- * (`sharedFindMissingSweep`, b.m4r). The start sweep runs before any launch
- * and before the health check, so no earlier sweep in this process can be
- * reused; the launches right after it reuse this one within its TTL. The call
- * goes to the start sweep's client directly, as its list and kills do: it acts
- * for no persona, so no persona's outage flag is raised or cleared. Never
- * throws. The sweep's own line, then one line with the outcome for the killed
- * rows (`still-live` holds each the sweep did not mark missing, an unverified
- * one included):
+ * It is an ordinary run of the memoized, single-flight sweep every
+ * findMissing caller shares (`sharedFindMissingSweep`, b.m4r, b.jg5 SRJ-120).
+ * The start sweep runs before any launch and before the health check, so no
+ * earlier sweep in this process can be reused; the launches right after it
+ * reuse this one within its window. The call goes to the start sweep's client
+ * directly, as its list and kills do: it acts for no persona, so no persona's
+ * outage flag is raised or cleared by the call. As after any run the server
+ * makes, each configured persona's own row listed in `unverified_ids` is then
+ * read with one `get` through that persona's `withOutageDetection`
+ * (`readListedPersonaRows`), and only a `provenance_conflict` note there
+ * latches. Never throws.
+ *
+ * Each killed row is read with `readFindMissingRow` and the state the start
+ * sweep listed it with: `missing` holds the rows marked missing; `not-judged`
+ * the `pending` rows in neither list, which agent-director did not judge
+ * (retry later; never a reason to escalate, alert or kill); `still-live` the
+ * rest, judged and left live (in `unverified_ids`) or judged alive. The
+ * start sweep's kill decisions do not depend on this line. The sweep's own
+ * line, then one line with the outcome for the killed rows:
  *
  *   [slack] reconcileOrphans: findMissing sweep for killed pre-persona rows — count=<n> ids=[…] unverified=<n> unverified_ids=[…]
- *   [slack] reconcileOrphans: findMissing after the kills of <n> live pre-persona row(s): missing=<n> [<ids>] still-live=<n> [<ids>] — a row that still reads live is killed again at the next start
+ *   [slack] reconcileOrphans: findMissing after the kills of <n> live pre-persona row(s): missing=<n> [<ids>] still-live=<n> [<ids>] not-judged=<n> [<ids>] — a row that still reads live is killed again at the next start; a not-judged row was pending and not judged by this sweep (retry later)
  *
  * or, when the sweep fails, its failure line and:
  *
  *   [slack] reconcileOrphans: findMissing after the kills of <n> live pre-persona row(s) failed — they still read live and are killed again at the next start
  */
-async function reconcileKilledPrePersonaRows(client: Client, killedIds: string[]): Promise<void> {
-  const head = `[slack] reconcileOrphans: findMissing after the kills of ${killedIds.length} live pre-persona row(s)`
+async function reconcileKilledPrePersonaRows(client: Client, killed: readonly KilledPrePersonaRow[]): Promise<void> {
+  const head = `[slack] reconcileOrphans: findMissing after the kills of ${killed.length} live pre-persona row(s)`
   const r = await sharedFindMissingSweep(() => client.findMissing({}), 'reconcileOrphans', 'killed pre-persona rows')
   if (!r) {
     console.error(`${head} failed — they still read live and are killed again at the next start`)
     return
   }
-  const nowMissing = new Set(r.ids)
-  const missing = killedIds.filter((id) => nowMissing.has(id))
-  const stillLive = killedIds.filter((id) => !nowMissing.has(id))
+  const missing: string[] = []
+  const stillLive: string[] = []
+  const notJudged: string[] = []
+  for (const { id, state } of killed) {
+    const reading = readFindMissingRow(r, id, state)
+    if (reading === FIND_MISSING_ROW_MARKED_MISSING) missing.push(id)
+    else if (reading === FIND_MISSING_ROW_NOT_JUDGED) notJudged.push(id)
+    else stillLive.push(id)
+  }
   console.error(
-    `${head}: missing=${missing.length} [${missing.join(',')}] still-live=${stillLive.length} [${stillLive.join(',')}] — a row that still reads live is killed again at the next start`,
+    `${head}: missing=${missing.length} [${missing.join(',')}] still-live=${stillLive.length} [${stillLive.join(',')}] not-judged=${notJudged.length} [${notJudged.join(',')}] — a row that still reads live is killed again at the next start; a not-judged row was pending and not judged by this sweep (retry later)`,
   )
+}
+
+/** A pre-persona row the start sweep killed: its instance id and the state the sweep listed it with. */
+interface KilledPrePersonaRow {
+  readonly id: string
+  readonly state: string
 }
 
 /**
@@ -5308,12 +5756,14 @@ export async function reconcileOrphans(
   const home = spawnHomeDir()
   const result = emptySweepResult()
   const deferredLogged = new Set<string>()
-  const killedPrePersonaIds: string[] = []
+  const killedPrePersonaRows: KilledPrePersonaRow[] = []
 
   for (const row of rows) {
     const personaLabel = row.labels?.[PERSONA_LABEL_KEY]
     if (!personaLabel) {
-      if (await keepPrePersonaRow(client, row, result.prePersona)) killedPrePersonaIds.push(row.claude_instance_id)
+      if (await keepPrePersonaRow(client, row, result.prePersona)) {
+        killedPrePersonaRows.push({ id: row.claude_instance_id, state: row.state })
+      }
       continue
     }
     const persona = personasByKey.get(personaLabel)
@@ -5343,7 +5793,7 @@ export async function reconcileOrphans(
     else result.failed++
   }
 
-  if (killedPrePersonaIds.length > 0) await reconcileKilledPrePersonaRows(client, killedPrePersonaIds)
+  if (killedPrePersonaRows.length > 0) await reconcileKilledPrePersonaRows(client, killedPrePersonaRows)
 
   const { found, killed, failed, prePersona } = result
   console.error(

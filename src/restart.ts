@@ -60,8 +60,10 @@
  * its in-flight and cap checks) and a human-triggered restart all answer
  * `RESTART_OUTCOME_LATCHED` with no agent-director call and nothing recorded.
  * The query is asked again before the instance is reconnected or killed
- * (after the liveness probe, and right before the kill), since a launch
- * outside the serializer can latch the persona during those awaits.
+ * (after the liveness probe, right after an 'escalate-dead' reconnect before
+ * its re-probe, and right before the kill), since a launch outside the
+ * serializer, or the reconnect's findMissing sweep, can latch the persona
+ * during those awaits.
  * A launch that answers `'skipped'` for a persona that latched at it answers
  * the same. A latched query that throws counts as latched (fail safe).
  * Isolated from server.ts side effects — injectable deps make it testable.
@@ -172,9 +174,9 @@ export const RESTART_OUTCOME_LIVENESS_UNKNOWN = 'liveness-unknown'
  * The persona is latched (b.jg5 SRJ-502, `RestartDeps.isLatched`): the work's
  * first step found it so, and nothing was probed, reconnected, killed or
  * launched, and nothing was recorded; or it latched while a liveness probe
- * (or the 'escalate-dead' reconnect and its re-probe) ran, and the latched
- * query asked again before the instance is reconnected or killed found it so,
- * and nothing more was done or recorded; or its launch answered `'skipped'`
+ * (or the 'escalate-dead' reconnect, or its re-probe) ran, and the latched
+ * query asked again before the instance is reconnected, re-probed or killed
+ * found it so, and nothing more was done or recorded; or its launch answered `'skipped'`
  * because the persona latched at that launch (a CONFLICT at a spawn or
  * resume), after which nothing was recorded either. A latched query that
  * threw answers this too (fail safe). The retry timer stops on it.
@@ -347,9 +349,10 @@ export interface RestartDeps {
    * before the instance is touched, since a launch outside the serializer can
    * latch the persona during the work's awaits: after the liveness probe
    * (with the second `canRestart` check, before `reconnectSession` or
-   * `killSession`) and right before `killSession` (after an 'escalate-dead'
-   * reconnect and its re-probe); a persona latched then answers the same with
-   * nothing more done. Asked again
+   * `killSession`), right after an 'escalate-dead' reconnect (before its
+   * re-probe: the reconnect's findMissing sweep may latch the persona, b.jg5
+   * SRJ-120) and right before `killSession` (after that re-probe); a persona
+   * latched then answers the same with nothing more done. Asked again
    * when the launch answers `'skipped'`, so a persona that latched at that
    * launch answers the same. An answer of exactly `true` is latched, and so
    * is a query that throws (fail safe: logged in the one latched line, with
@@ -707,19 +710,31 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // reconnectMcp, and b.d61's `working` row whose tmux session is gone)
     // CSCB recovers itself (b.sv7 / Epic t1.tkk.e4): the reconnectSession
     // adapter fires the internal memoized findMissing sweep before returning,
-    // so the frozen `working` row reconciles to `missing`. b.d61: rather than
+    // which may reconcile the frozen `working` row to `missing`. It may also
+    // leave the row live (in `unverified_ids`, or, when `pending`, not judged
+    // at all, b.jg5 SRJ-120), and the row then stays live for further ticks.
+    // After a run the sweep makes, each configured persona's own row left in
+    // `unverified_ids` is read with one `get`, and only a
+    // `provenance_conflict` note there latches (b.jg5 SRJ-114, SRJ-120). The
+    // latch is asked right after the 'escalate-dead' verdict, before the
+    // re-probe, so a persona latched that way gets no further agent-director
+    // call in this run (b.jg5 SRJ-502); it is asked again right before the
+    // kill below. b.d61: rather than
     // wait for the next tick (a full health interval plus another backoff
     // delay), this run probes liveness again and, when the row now reads
     // `dead`, falls through to the kill+relaunch branch below at once, with
     // the same accounting as any dead-session relaunch. When the row still
-    // reads live or `pending` (e.g. the sweep failed or a memoized result
-    // predates the kill), it returns as before and the next tick retries;
-    // when the re-probe reads `unknown` (b.jg5 SRJ-314), it returns with no
-    // relaunch and the arm hook is called. The external
+    // reads live or `pending` (e.g. the sweep failed, left the row live, or a
+    // memoized result predates the kill), it returns as before and a later
+    // tick retries; when the re-probe reads `unknown` (b.jg5 SRJ-314), it
+    // returns with no relaunch and the arm hook is called. The external
     // ~/startup/find-missing-loop.sh is belt-and-braces only — recovery no
     // longer depends on it, and removing it is a separate operator decision.
     if (reconnectResult === 'pending') return RESTART_OUTCOME_PENDING_DEFERRED
     if (reconnectResult !== 'escalate-dead') return RESTART_OUTCOME_RECONNECT_DEFERRED
+    // b.jg5 SRJ-502: the adapter's sweep may have latched the persona (a
+    // post-run `get` of its own row); then no re-probe follows.
+    if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
     const held = await reprobeDeadAfterEscalate(d, key)
     if (held !== undefined) return held
   }
@@ -728,8 +743,8 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // b.jg5 SRJ-105) stops the run below with no launch; any other error (a
   // throw, e.g. the session may not exist) is ignored and the launch follows.
   // b.jg5 SRJ-502: the latch is asked once more right before the kill, so a
-  // persona that latched during the 'escalate-dead' reconnect and its re-probe
-  // is never killed.
+  // persona that latched during the 'escalate-dead' re-probe (or, with the
+  // check after the reconnect, during the reconnect) is never killed.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
   let killed: KillSessionResult = undefined
   try {
