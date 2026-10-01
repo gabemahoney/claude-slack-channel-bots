@@ -2917,13 +2917,38 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     for (const member of [ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ]) expect(props.has(member)).toBe(true)
   })
 
+  // b.jg5 SRJ-1011 as amended ("state 5 applies only while P's retry timer is
+  // armed"): `isRetryArmed` is optional, and absent the routing decides state
+  // 5 without the armed-timer gate, so a wiring that dropped it, bound it to a
+  // constant, to a copy of the controller taken at import (before main()
+  // builds it) or to a second controller would type-check and pass every
+  // behaviour suite while a persona whose retry timer stopped reported CSCB
+  // retrying. What the routing does with it is tested in
+  // tests/inbound-recovery-drop-branch.test.ts and through the recovery
+  // harness in tests/unavailable-retry.test.ts; pinned here: the binding.
+  test('the retry-timer query (isRetryArmed) reads the one retry controller\'s isArmed at call time, through its one module-scope handle (assigned that controller once, in main()), true only when it answers exactly true (state 5, not answering)', () => {
+    const IS_ARMED: keyof UnavailableRetryController = 'isArmed'
+    const ROUTING_RETRY_ARMED: keyof PersonaRoutingDeps = 'isRetryArmed'
+    const handle = retryHandle()
+    expect(onlyCallProps('createPersonaRouting').get(ROUTING_RETRY_ARMED)).toMatch(
+      new RegExp(`^\\(?(\\w+)\\)? => ${handle}\\?\\.${IS_ARMED}\\(\\1\\) === true$`),
+    )
+    // The handle is the one controller, assigned once in main() (no copy, no second controller).
+    const assigned = assignmentsTo(handle)
+    expect(assigned.map((a) => a.value)).toEqual([constOf('createUnavailableRetryController')])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+    // The routing's call names the handle only in this member.
+    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf('createPersonaRouting'), '(', ')')
+    expect(indicesOf(new RegExp(`\\b${handle}\\b`, 'g'), SERVER_CODE.slice(open, close))).toHaveLength(1)
+  })
+
   // A new routing input (one reading the unclassified-error episode, say)
   // fails here until it is pinned like the others.
   test('the routing\'s call binds exactly these members, no more', () => {
     const MEMBERS: Array<keyof PersonaRoutingDeps> = [
       'getPersonaConfig', 'getBotIdentity', 'clientFor', 'resolveUserName', 'archive', 'getReplySettings', 'notify', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
-      'armRetryTimerIfMissing',
+      'isRetryArmed', 'armRetryTimerIfMissing',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })

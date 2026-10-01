@@ -70,6 +70,17 @@
  *     `setOutageFlag` and `clearOutageFlag` work and their notices are not
  *     posts; without it a raise does nothing. An unclassified-error episode
  *     opened in `h.episodes` is not an input (SRJ-1011);
+ *   - P's retry timer armed (`isRetryArmed`, b.jg5 SRJ-1011 as amended:
+ *     "state 5 applies only while P's retry timer is armed"): whether the key
+ *     is in `h.retryArmed`, read at call time, exactly as `main()` reads the
+ *     one retry controller's `isArmed`. In production every state-5 source
+ *     arms P's timer (E10's condition start, the `tmux-unavailable` and
+ *     `ad-config-malformed` raises), so by default every persona's timer is
+ *     armed (`retryArmed` replaces that, with persona names: `[]` for none);
+ *     a case takes it away with `h.retryArmed.delete(key)`, as a retry that
+ *     stopped. The restart cap is the routing's own read of the real backoff
+ *     state: `putAtRestartCap(key)` records `RESTART_FAILURE_CAP` real
+ *     failures there;
  *   - a launch running (`session-starting`): by default, whether one of the
  *     harness's own restart launches is in flight for the key
  *     (`h.isLaunchInFlight`), as production binds `isLaunchInFlight`, so a
@@ -102,9 +113,11 @@
  *     gets `notice:<key>` for every notice the routing raises, so a case sees
  *     each read's place relative to the notices;
  *   - the missing-retry-timer arm (`armRetryTimerIfMissing`, b.jg5 SRJ-311),
- *     only with the `armRetryTimer` option: a recording member that adds the
- *     key to `h.retryTimerArms` and arms nothing; without it the member is
- *     absent, as a caller that does not wire it leaves it;
+ *     only with the `armRetryTimer` option: a member that records every ask,
+ *     by key, in `h.retryTimerArms` and then arms P's timer (adds the key to
+ *     `h.retryArmed`; nothing new when it is armed already, as production's
+ *     check arms only when none is); without it the member is absent, as a
+ *     caller that does not wire it leaves it;
  * - the server-wide reply settings source (`getReplySettings`, as src/server.ts
  *   passes its start-time settings): it returns the `ackReaction` option and
  *   the default chunking, so by default there is no ack reaction and a
@@ -168,7 +181,7 @@ import {
   type RestartDeps,
 } from '../../src/restart.ts'
 import { LIVENESS_READING_DEAD, type LivenessReading } from '../../src/liveness-reading.ts'
-import { _resetBackoffState, recordFailure } from '../../src/backoff.ts'
+import { _resetBackoffState, isAtCap, recordFailure } from '../../src/backoff.ts'
 import { LATCH_ROW_STATE_NO_ROW, REFUSED_OPERATION_PLAIN_SPAWN } from '../../src/conflict-latch.ts'
 import { createPersonaUpPredicate } from '../../src/persona-start.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
@@ -255,6 +268,17 @@ function arranged(ok: boolean, what: string): void {
 }
 
 /**
+ * Put persona `key` at the restart cap (SRJ-305) through the real backoff
+ * state: `RESTART_FAILURE_CAP` failures recorded with `recordFailure`, as
+ * counted launch failures record them. Throws unless `isAtCap` then answers
+ * true. `resetRoutingState()` undoes it.
+ */
+export function putAtRestartCap(key: string): void {
+  for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(key)
+  arranged(isAtCap(key, RESTART_FAILURE_CAP), 'P is not at the restart cap')
+}
+
+/**
  * The one per-state table for a lost message's recovery state (b.jg5
  * SRJ-1011, SRJ-1501): each state of `LOST_MESSAGE_STATES` arranged through
  * the harness's real inputs, with what it leaves. Only `starting-now`
@@ -282,11 +306,14 @@ export const LOST_STATE_SETUPS: Readonly<Record<LostMessageState, LostStateSetup
   },
   'cannot-launch': { opts: {}, arrange: (h, key) => { h.heldOnInvalidFlags.add(key) }, pending: false, launches: 0 },
   'kill-failed': { opts: {}, arrange: (h, key) => { h.killFailed.add(key) }, pending: false, launches: 0 },
-  // E10's entry: a refusal from a tmux-touching verb starts the condition.
+  // E10's entry: a refusal from a tmux-touching verb starts the condition,
+  // with P's retry timer armed (state 5 applies only while it is, b.jg5
+  // SRJ-1011 as amended; production arms it at the same refusal).
   'not-answering': {
     opts: {},
     arrange: (h, key) => {
       arranged(h.tmuxUnresponsive.start(key, 'resume', errTmuxUnresponsive('resume')) === 'started', 'the condition did not start')
+      h.retryArmed.add(key)
     },
     pending: false,
     launches: 0,
@@ -321,7 +348,7 @@ export const LOST_STATE_SETUPS: Readonly<Record<LostMessageState, LostStateSetup
   'auto-restart-disabled': { opts: { sessionRestartDelay: 0 }, arrange: () => {}, pending: false, launches: 0 },
   'restart-limit-reached': {
     opts: {},
-    arrange: (_h, key) => { for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(key) },
+    arrange: (_h, key) => { putAtRestartCap(key) },
     pending: false,
     launches: 0,
   },
@@ -566,10 +593,16 @@ export interface RoutingHarnessOptions {
   holdLaunches?: boolean
   /**
    * Bind the routing's `armRetryTimerIfMissing` (b.jg5 SRJ-311) as a member
-   * that records each key in `h.retryTimerArms` and arms nothing. Absent, as
-   * by default: the member is absent.
+   * that records each ask in `h.retryTimerArms` and arms P's timer (adds the
+   * key to `h.retryArmed`). Absent, as by default: the member is absent.
    */
   armRetryTimer?: boolean
+  /**
+   * Names whose retry timer is armed first (`h.retryArmed`, read by the
+   * routing's `isRetryArmed`); default every persona, as production arms it
+   * at every state-5 source. `[]`: none armed.
+   */
+  retryArmed?: readonly string[]
   /**
    * Install the real outage state (`initOutageState`) with a recording sink
    * (`h.outageNotices`) and no agent-director client, so a raise or clear
@@ -670,6 +703,8 @@ export interface RoutingHarness {
   releaseLaunches(ok?: boolean): number
   /** Every key `armRetryTimerIfMissing` was asked to arm, in order (with `armRetryTimer`). */
   retryTimerArms: string[]
+  /** Keys whose retry timer is armed, read by the routing's `isRetryArmed` at call time (see `retryArmed`). */
+  retryArmed: Set<string>
   /** Restart delay (seconds) the restart deps report, read at call time. */
   restartDelayS: number
   /** Archive writes started through the seam. */
@@ -882,6 +917,7 @@ export function makeRoutingHarness(
       return held.length
     },
     retryTimerArms: [],
+    retryArmed: keySet(opts.retryArmed ?? config.personas.map((p) => p.name)),
     restartDelayS: opts.restartDelayS ?? FAST_RESTART_DELAY_S,
     archiveWrites: [],
     receive: (event, names, ack) => routing.receive(
@@ -964,6 +1000,7 @@ export function makeRoutingHarness(
     // As main() binds them, each asked with the persona key at call time.
     isLatched: (key) => h.latch.isLatched(key),
     isTmuxUnresponsive: (key) => h.tmuxUnresponsive.holds(key),
+    isRetryArmed: (key) => h.retryArmed.has(key),
     isLaunchOrApproverRunning: opts.isLaunchOrApproverRunning ?? ((key) => h.isLaunchInFlight(key)),
     // Unbound in production until their Epics bind them.
     isHeldOnInvalidFlags: (key) => h.heldOnInvalidFlags.has(key),
@@ -973,7 +1010,14 @@ export function makeRoutingHarness(
     // plus the non-launch work a case marks.
     isWorkInFlight: (key) => h.isLaunchInFlight(key) || h.workInFlight.has(key),
     readRowLiveness,
-    ...(opts.armRetryTimer === true ? { armRetryTimerIfMissing: (key: string) => { h.retryTimerArms.push(key) } } : {}),
+    ...(opts.armRetryTimer === true
+      ? {
+        armRetryTimerIfMissing: (key: string) => {
+          h.retryTimerArms.push(key)
+          h.retryArmed.add(key)
+        },
+      }
+      : {}),
   })
 
   for (const key of keySet(opts.notUp)) notUp.add(key)

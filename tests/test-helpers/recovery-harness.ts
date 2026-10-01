@@ -220,7 +220,10 @@
  *   `createPersonaUpPredicate` over the same serving connection, bring-up
  *   outcome (`setUp`) and live applied set as the relaunch gate; `isLatched`
  *   is `latch`'s latched query; `isTmuxUnresponsive` is the condition's
- *   `holds`; `isLaunchOrApproverRunning` is the session manager's
+ *   `holds`; `isRetryArmed` is the controller's `isArmed`, exactly true
+ *   (b.jg5 SRJ-1011 as amended: state 5 applies only while P's retry timer
+ *   is armed, and never at the restart cap, which the routing reads from the
+ *   real backoff state); `isLaunchOrApproverRunning` is the session manager's
  *   `isLaunchInFlight` (a launch call awaits its dialog approver); the
  *   restart guards and `scheduleRestart` are the restart module the harness
  *   initialised, and the outage flags are the outage state's. The read gate's
@@ -244,9 +247,10 @@
  *   latched query, the shared in-flight predicate, and an arm straight to the
  *   controller with `UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT` (not through the
  *   trigger sink, so not in `triggers`), its one line to `console.error`
- *   (`errors`). So a message lost in `not-answering` with the persona's
- *   `tmux-unavailable` flag raised, no timer armed, not latched and nothing
- *   in flight arms its timer, with no restart asked for.
+ *   (`errors`). So a message lost with the persona's `tmux-unavailable`
+ *   flag raised, no timer armed, below the restart cap, not latched and
+ *   nothing in flight arms its timer before the state is decided, and so
+ *   reports `not-answering`, with no restart asked for.
  *   The members later Epics bind (held on `ErrInvalidFlags`, kill-failed, a
  *   sequence or wait step running) are left unbound, as in production.
  *   Each persona has its own Slack stub (`slack(key)`, leak marker on) as its
@@ -1098,6 +1102,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       isPersonaUp: createPersonaUpPredicate({ status: () => SERVING }, upQuery),
       isLatched: (key) => latch.isLatched(key),
       isTmuxUnresponsive: (key) => tmuxUnresponsive.holds(key),
+      // As main() binds it (b.jg5 SRJ-1011 as amended: state 5 applies only
+      // while P's retry timer is armed): the one controller's `isArmed`,
+      // exactly true.
+      isRetryArmed: (key) => controller.isArmed(key) === true,
       isLaunchOrApproverRunning: (key) => isLaunchInFlight(key),
       // As main() binds them (b.jg5 SRJ-1011, SRJ-115): the read gate's
       // "in flight for P" is the shared in-flight predicate, and the one row

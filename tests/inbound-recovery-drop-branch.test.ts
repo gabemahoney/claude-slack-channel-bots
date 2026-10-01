@@ -16,7 +16,9 @@
  * (held for a human); P held on `ErrInvalidFlags` (cannot launch); P's kill
  * failed; P not answering (its `tmux-unresponsive` condition holds, or its
  * `tmux-unavailable` or `ad-config-malformed` outage is raised; never an
- * unclassified-error episode alone); P's row reading `pending` (session
+ * unclassified-error episode alone; only while P's retry timer is armed and
+ * P is below the restart cap, b.jg5 SRJ-1011 as amended, so a P at the cap
+ * reports restart limit reached whatever is raised); P's row reading `pending` (session
  * starting: a launch or dialog approver for P running, or the one row read
  * the routing makes when none of states 1 to 5 applies and nothing is in
  * flight for P answering `pending`; a live-row sequence or old-life wait
@@ -160,6 +162,7 @@ import {
 import {
   makeRestartDeps,
   makeRoutingHarness,
+  putAtRestartCap,
   resetRoutingState,
   stateOf,
   waitFor,
@@ -270,6 +273,10 @@ interface HarnessOptions {
    * (the harness's `rowRead`). Without it no read is bound and none is made.
    */
   rowRead?: RoutingHarnessOptions['rowRead']
+  /** Bind the routing's missing-retry-timer arm (the harness's `armRetryTimer`: each ask recorded, P's timer armed). */
+  armRetryTimer?: boolean
+  /** Names whose retry timer is armed first (the harness's `retryArmed`); default every persona. */
+  retryArmed?: readonly string[]
 }
 
 /** A connection that serves, so only the bring-up outcome decides whether a persona is up. */
@@ -327,6 +334,8 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
         ? (key) => h.isLaunchInFlight(key) || approverRunning.has(key)
         : undefined,
       rowRead: opts.rowRead,
+      armRetryTimer: opts.armRetryTimer,
+      retryArmed: opts.retryArmed,
     },
   )
   const [beta, alpha] = h.config!.personas as [Persona, Persona]
@@ -752,6 +761,91 @@ describe('b.jg5 SRJ-1011 state 5: a message lost while the persona is not answer
       expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
       // The outage's onset went to the outage state's sink, never to Slack.
       expect(h.outageNotices.map((n) => n.key)).toEqual([h.alpha.key])
+    },
+  )
+})
+
+// ===========================================================================
+// b.jg5 SRJ-1011 as amended (orchestrator ruling): "A persona whose retry
+// timer is stopped at the restart cap reports restart-limit-reached, never
+// state 5's 'CSCB is retrying', whatever condition or flag is raised. In
+// SRJ-1011's order, state 5 applies only while P's retry timer is armed."
+// Through the real routing, with the restart delay above 0 (so auto-restart
+// disabled does not come first) and the row read bound (answering live, a
+// restart's input): alpha at the restart cap (SRJ-305, the real backoff
+// state) with each state-5 source, its retry timer still armed (the window
+// the cap closes: that timer stops at its next retry) or none, reports
+// restart limit reached; no restart is asked for, scheduled or launched,
+// and the missing-retry-timer arm is never asked. Below the cap, state 5
+// needs the timer: armed, not answering; `tmux-unavailable` raised with
+// none armed, the arm is asked before the decision and its timer makes the
+// message not answering, with no read; the condition or `ad-config-malformed`
+// alone with none armed is not state 5, so the message falls through to the
+// next state that applies (here starting now, with its read and restart).
+// ===========================================================================
+
+describe('b.jg5 SRJ-1011 as amended: state 5 applies only while the retry timer is armed, and never at the restart cap', () => {
+  /** Alpha under `source`, its retry timer armed first or not, the arm member bound and the row read answering live. */
+  function gateHarness(source: typeof STATE_5_SOURCES[number], armed: boolean): Harness {
+    const h = makeHarness({
+      ...inputOpts(source),
+      armRetryTimer: true,
+      retryArmed: armed ? ['alpha'] : [],
+      rowRead: { alpha: LIVENESS_READING_LIVE },
+    })
+    INPUTS[source].set(h, h.alpha.key)
+    return h
+  }
+
+  const CAPPED = STATE_5_SOURCES.flatMap((source) => ([true, false] as const).map(
+    (armed): [typeof STATE_5_SOURCES[number], string, boolean] => [source, armed ? 'still armed' : 'none armed', armed],
+  ))
+
+  test.each(CAPPED)(
+    'AC 68: alpha at the restart cap with %s, its retry timer %s: the notice says restart limit reached, never not answering; no restart is asked for, scheduled or launched, and no retry timer is asked for or armed',
+    async (source, _timer, armed) => {
+      const h = gateHarness(source, armed)
+      putAtRestartCap(h.alpha.key)
+
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+      expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'restart-limit-reached' })
+      // States 1 to 5 did not apply, so the one read was made.
+      expect(h.rowReads).toEqual([h.alpha.key])
+      expect(h.retryTimerArms).toEqual([])
+      expect(h.retryArmed.has(h.alpha.key)).toBe(armed)
+      expect(h.restartAsks).toEqual([])
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+      await Bun.sleep(WAIT_MS) // a restart the message scheduled would have launched by now
+      expect(h.launches).toEqual([])
+      expectNoFakeTimerLeft(h)
+    },
+  )
+
+  test.each<[typeof STATE_5_SOURCES[number], string, LostMessageState, boolean, readonly string[]]>([
+    ['tmux-unresponsive holds', 'armed', 'not-answering', true, []],
+    ['tmux-unavailable raised', 'armed', 'not-answering', true, ['alpha']],
+    ['ad-config-malformed raised', 'armed', 'not-answering', true, []],
+    ['tmux-unavailable raised', 'none armed (the arm, asked before the decision, arms it)', 'not-answering', false, ['alpha']],
+    ['tmux-unresponsive holds', 'none armed', 'starting-now', false, []],
+    ['ad-config-malformed raised', 'none armed', 'starting-now', false, []],
+  ])(
+    'below the cap, %s, the retry timer %s: the notice says %s; only starting now asks for a restart',
+    async (source, _timer, state, armed, armAsks) => {
+      const h = gateHarness(source, armed)
+
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+      expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+      expect(h.retryTimerArms).toEqual(h.keys(armAsks))
+      expect(h.retryArmed.has(h.alpha.key)).toBe(state === 'not-answering')
+      // Not answering is decided at the read gate's check, with no read; a
+      // fall-through makes the one read (live) and then starts now.
+      expect(h.rowReads).toEqual(state === 'not-answering' ? [] : [h.alpha.key])
+      expect(h.restartAsks).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(state === 'starting-now')
+      await Bun.sleep(WAIT_MS)
+      expect(h.launches).toEqual(state === 'starting-now' ? [{ key: h.alpha.key, cwd: h.alpha.working_directory }] : [])
     },
   )
 })

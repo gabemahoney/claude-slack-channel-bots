@@ -989,13 +989,24 @@ const personaRouting = createPersonaRouting({
   // and opens no episode, while ENVIRONMENT and CONFIG raise their outages
   // and arm the retry timer as from any verb (SRJ-105, SRJ-1501).
   readRowLiveness: (key) => personaRowLiveness?.(key) ?? Promise.resolve(LIVENESS_READING_UNKNOWN),
-  // b.jg5 SRJ-311: a message lost in `not-answering` while P's
-  // tmux-unavailable outage is raised arms P's retry timer when none is
-  // armed, P is not latched and nothing is in flight for it: the same check
-  // the session-disconnect handler makes, over the same holders, read at
-  // call time. It never schedules a restart (SRJ-1501). While the server is
-  // shutting down it arms nothing and logs nothing: shutdown has closed the
-  // retry controller, which would refuse the arm.
+  // b.jg5 SRJ-1011 as amended: state 5 applies only while P's retry timer is
+  // armed. Its notice says CSCB is retrying, so a P whose retry timer is not
+  // armed is not reported `not-answering`, whatever condition or flag is
+  // raised. The routing also asks the restart cap (SRJ-305) itself, so a P
+  // at the cap reports `restart-limit-reached` even while a timer that will
+  // stop at its next retry is still armed. Read at call time through the
+  // holder main() sets: before main() builds the controller no timer is armed.
+  isRetryArmed: (key) => unavailableRetry?.isArmed(key) === true,
+  // b.jg5 SRJ-311: before a lost message's state is decided, a P that would
+  // be `not-answering` but for the retry-timer gate, with its
+  // tmux-unavailable outage raised and below the restart cap (SRJ-305), has
+  // its retry timer armed when none is armed, P is not latched and nothing
+  // is in flight for it: the same check the session-disconnect handler
+  // makes, over the same holders, read at call time. The decision then sees
+  // the armed timer and reports `not-answering`. It never schedules a
+  // restart (SRJ-1501). While the server is shutting down it arms nothing
+  // and logs nothing: shutdown has closed the retry controller, which would
+  // refuse the arm.
   armRetryTimerIfMissing: (key) => {
     if (shuttingDown) return
     armMissingTmuxUnavailableRetry(

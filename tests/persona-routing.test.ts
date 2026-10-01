@@ -1082,23 +1082,30 @@ describe('lost-message row read: gating and isolation in the pipeline (b.jg5 SRJ
 })
 
 // ---------------------------------------------------------------------------
-// The missing retry timer (b.jg5 SRJ-311): a lost message whose final state
-// is `not-answering` with P's `tmux-unavailable` outage raised asks the
-// routing's `armRetryTimerIfMissing` for P, once, after the decision; never
-// for the tmux-unresponsive condition or `ad-config-malformed` alone, never
-// in another state, never for another persona's flag, and never as a restart
-// (SRJ-1501). The member here records the key (`h.retryTimerArms`) and arms
-// nothing; what production arms is tested on the recovery harness.
+// The missing retry timer (b.jg5 SRJ-311, with SRJ-1011 as amended: "state 5
+// applies only while P's retry timer is armed"): a lost message for P with
+// none of states 1 to 4 applying, state 5's condition holding, P's
+// `tmux-unavailable` outage raised and P below the restart cap asks the
+// routing's `armRetryTimerIfMissing` for P BEFORE the state is decided, so
+// the gated decision sees the timer it armed and reports `not-answering`;
+// again after a row read, when one was made (a retry may stop during it).
+// Never for the tmux-unresponsive condition or `ad-config-malformed` alone,
+// never in another state, never at the restart cap (SRJ-305: P's own flag
+// raised there reports `restart-limit-reached`), never for another persona's
+// flag, and never as a restart (SRJ-1501). The member here records each ask
+// (`h.retryTimerArms`) and arms P's timer in the harness (`h.retryArmed`),
+// adding nothing when it is armed already; what production arms is tested on
+// the recovery harness.
 // ---------------------------------------------------------------------------
 
-describe('lost message: the missing retry timer is armed only for not answering with tmux-unavailable raised (b.jg5 SRJ-311)', () => {
+describe('lost message: the missing retry timer is asked for, before the decision, only for state 5 with tmux-unavailable raised below the cap (b.jg5 SRJ-311)', () => {
   /** A: `all` in CA (its destination) and CS. B: `all` in CB (its destination) and CS. */
   const armSpecs = (): PersonaSpec[] => [
     { name: 'Alpha Bot', channels: [{ id: CA, delivery: 'all' }, { id: CS, delivery: 'all' }] },
     { name: 'Beta Bot', channels: [{ id: CB, delivery: 'all' }, { id: CS, delivery: 'all' }] },
   ]
 
-  /** No sessions, the outage state installed, the arm member recording, and the needs of a shared-table state (`LOST_STATE_SETUPS`). */
+  /** No sessions, the outage state installed, the arm member recording (and arming), and the needs of a shared-table state (`LOST_STATE_SETUPS`). */
   function armHarness(needs: LostStateOptions = {}, opts: RoutingHarnessOptions = {}): Harness {
     return makeHarness(armSpecs(), {
       sessions: [],
@@ -1133,23 +1140,53 @@ describe('lost message: the missing retry timer is armed only for not answering 
     ['tmux-unavailable and ad-config-malformed both raised', (_h, key) => { raiseUnavailable(key); raiseMalformed(key) }, true],
     ['only the tmux-unresponsive condition holding', (h, key) => startUnresponsive(h, key), false],
     ['only ad-config-malformed raised', (_h, key) => raiseMalformed(key), false],
-  ])('not answering from %s: the arm is asked once for P: %p; no restart is asked for or pending', async (_label, set, armed) => {
+  ])('not answering from %s, P\'s retry timer armed: the arm is asked once for P: %p (adding no timer); no restart is asked for or pending', async (_label, set, asked) => {
     const h = track(armHarness({}, { restartDelayS: NEVER_FIRE_RESTART_DELAY_S }))
+    const B = h.p('Beta Bot').persona.key
+    expect(h.retryArmed.has(B)).toBe(true)
+    set(h, B)
+
+    await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
+
+    expect(h.notices.map((n) => [n.key, stateOf(n.text)])).toEqual([[B, 'not-answering']])
+    expect(h.retryTimerArms).toEqual(asked ? [B] : [])
+    expect([...h.retryArmed].sort()).toEqual(h.keys(['Alpha Bot', 'Beta Bot']).sort())
+    expect(h.restartAsks).toEqual([])
+    expect(isRestartPendingOrActive(B)).toBe(false)
+    assertNoLeak(captured(h))
+  })
+
+  // The arm is asked before the decision: with no timer armed, the timer it
+  // arms is what makes the decision report not answering (asked after it,
+  // the gated decision would fall through to starting now and restart P).
+  test.each<[string, (h: Harness, key: string) => void]>([
+    ['tmux-unavailable raised', (_h, key) => raiseUnavailable(key)],
+    ['tmux-unavailable raised and the tmux-unresponsive condition holding', (h, key) => { raiseUnavailable(key); startUnresponsive(h, key) }],
+    ['tmux-unavailable and ad-config-malformed both raised', (_h, key) => { raiseUnavailable(key); raiseMalformed(key) }],
+  ])('%s, no retry timer armed for P: the arm is asked once, before the decision, and P\'s timer is armed; the notice says not answering, with no read and no restart', async (_label, set) => {
+    const h = track(armHarness({}, { restartDelayS: NEVER_FIRE_RESTART_DELAY_S, retryArmed: [], rowRead: {} }))
     const B = h.p('Beta Bot').persona.key
     set(h, B)
 
     await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
 
     expect(h.notices.map((n) => [n.key, stateOf(n.text)])).toEqual([[B, 'not-answering']])
-    expect(h.retryTimerArms).toEqual(armed ? [B] : [])
+    expect(h.retryTimerArms).toEqual([B])
+    expect([...h.retryArmed]).toEqual([B])
+    // State 5 applied at the read gate's check, so no read was made.
+    expect(h.rowReads).toEqual([])
     expect(h.restartAsks).toEqual([])
     expect(isRestartPendingOrActive(B)).toBe(false)
     assertNoLeak(captured(h))
   })
 
-  test('tmux-unavailable raised while the row read runs (the state decided again after it): the arm is asked once for P, after the read', async () => {
+  test.each<[string, readonly string[]]>([
+    ['armed', ['Beta Bot']],
+    ['not armed', []],
+  ])('tmux-unavailable raised while the row read runs (the state decided again after it), P\'s retry timer %s: the arm is asked once for P, after the read, and the notice says not answering', async (_label, retryArmed) => {
     const h = track(armHarness({}, {
       restartDelayS: NEVER_FIRE_RESTART_DELAY_S,
+      retryArmed,
       rowRead: { 'Beta Bot': { answer: LIVENESS_READING_PENDING, during: (_hh, key) => raiseUnavailable(key) } },
     }))
     const B = h.p('Beta Bot').persona.key
@@ -1159,24 +1196,27 @@ describe('lost message: the missing retry timer is armed only for not answering 
     expect(h.rowReads).toEqual([B])
     expect(h.notices.map((n) => [n.key, stateOf(n.text)])).toEqual([[B, 'not-answering']])
     expect(h.retryTimerArms).toEqual([B])
+    expect([...h.retryArmed]).toEqual([B])
     expect(h.restartAsks).toEqual([])
     assertNoLeak(captured(h))
   })
 
-  // States 1 to 4 come before not answering, so P's flag is raised too; in
-  // the later states it cannot be (P would be not answering), so another
-  // persona's (A's) is.
+  // States 1 to 4 come before not answering, and at the restart cap state 5
+  // never applies (SRJ-305), so P's flag is raised too; in the other later
+  // states it cannot be (P would be not answering), so another persona's
+  // (A's) is.
   const OTHER_STATES = LOST_MESSAGE_STATES.filter((s) => s !== 'not-answering')
   const EARLIER = LOST_MESSAGE_STATES.slice(0, LOST_MESSAGE_STATES.indexOf('not-answering'))
+  const OWN_FLAG: readonly LostMessageState[] = [...EARLIER, 'restart-limit-reached']
 
-  test.each(OTHER_STATES.map((s): [LostMessageState, string] => [s, EARLIER.includes(s) ? 'P\'s' : 'another persona\'s']))(
+  test.each(OTHER_STATES.map((s): [LostMessageState, string] => [s, OWN_FLAG.includes(s) ? 'P\'s' : 'another persona\'s']))(
     'state %s with %s tmux-unavailable raised: the arm is never asked',
     async (state) => {
       const setup = LOST_STATE_SETUPS[state]
       const h = track(armHarness(setup.opts))
       const [A, B] = h.keys(['Alpha Bot', 'Beta Bot']) as [string, string]
       await setup.arrange(h, B, h.p('Beta Bot').persona.working_directory)
-      raiseUnavailable(EARLIER.includes(state) ? B : A)
+      raiseUnavailable(OWN_FLAG.includes(state) ? B : A)
 
       await h.receive(makeChannelMessage({ channel: CB }), ['Beta Bot'])
 

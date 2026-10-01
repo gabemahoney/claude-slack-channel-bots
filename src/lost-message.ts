@@ -54,7 +54,10 @@ import { escapeSlackControlCharacters } from './slack-text-escape.ts'
  * - `kill-failed`: P's kill-failure episode is open, or P waits on an
  *   old-life hold whose old key's kill failed.
  * - `not-answering`: P's `tmux-unresponsive` condition holds, or its
- *   `tmux-unavailable` or `ad-config-malformed` outage is raised.
+ *   `tmux-unavailable` or `ad-config-malformed` outage is raised, P is below
+ *   the restart cap and P's retry timer is armed (b.jg5 SRJ-1011 as amended:
+ *   "state 5 applies only while P's retry timer is armed"; the caller's
+ *   `isNotAnswering` asks it). A P at the restart cap is never in this state.
  * - `session-starting`: P's row reads `pending` (a launch or dialog approver
  *   for P is running, or the caller's one `status` read returned `pending`).
  * - `restarting`: a restart of P is already pending or running, or a
@@ -107,8 +110,10 @@ export interface EarlyLostMessageQueries {
   isKillFailed?(): boolean
   /**
    * True when the persona's `tmux-unresponsive` condition holds, or its
-   * `tmux-unavailable` or `ad-config-malformed` outage is raised (state 5,
-   * `not-answering`). No unclassified-error episode feeds it.
+   * `tmux-unavailable` or `ad-config-malformed` outage is raised, it is
+   * below the restart cap and its retry timer is armed (state 5,
+   * `not-answering`; state 5 applies only while the persona's retry timer is
+   * armed, and never at the cap). No unclassified-error episode feeds it.
    */
   isNotAnswering?(): boolean
 }

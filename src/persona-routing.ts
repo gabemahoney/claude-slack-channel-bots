@@ -53,16 +53,24 @@
  *    decides the state, the first that applies, from whether P is up, whether
  *    P is latched (held for a human), whether P is not answering (its
  *    `tmux-unresponsive` condition holds, or its `tmux-unavailable` or
- *    `ad-config-malformed` outage is raised), whether P's row reads `pending`
- *    (a launch for P is running, or the one row read below answered
- *    `pending`: starting), and the restart guards. When none of states 1 to 5
- *    applies and nothing is in flight for P, one row read of P is made (the
- *    injected `readRowLiveness`), and the state is decided again after it.
- *    A P in any state but "starting now" is never restarted from here (b.jg5
- *    SRJ-1501). A P reported "not answering" with its `tmux-unavailable`
- *    outage raised has its retry timer armed when it has none (the injected
- *    `armRetryTimerIfMissing`, b.jg5 SRJ-311). Nothing is posted in the source conversation, and the message
- *    text is never in the notice.
+ *    `ad-config-malformed` outage is raised, P is below the restart cap and
+ *    P's retry timer is armed), whether P's row reads `pending` (a launch for
+ *    P is running, or the one row read below answered `pending`: starting),
+ *    and the restart guards. State 5 ("not answering", whose notice says CSCB
+ *    is retrying) applies only while P's retry timer is armed (b.jg5 SRJ-1011
+ *    as amended: "state 5 applies only while P's retry timer is armed"; the
+ *    injected `isRetryArmed`) and never at the restart cap (SRJ-305), so a P
+ *    at the cap reports "restart limit reached", whatever condition or flag
+ *    is raised, even while a timer that will stop at its next retry is still
+ *    armed for it. Before the state is decided, a P that would be "not answering"
+ *    but for the gate, with its `tmux-unavailable` outage raised and below
+ *    the restart cap, has its retry timer armed when it has none (the
+ *    injected `armRetryTimerIfMissing`, b.jg5 SRJ-311), so it reports "not
+ *    answering". When none of states 1 to 5 applies and nothing is in flight
+ *    for P, one row read of P is made (the injected `readRowLiveness`), and
+ *    the state is decided again after it. A P in any state but "starting
+ *    now" is never restarted from here (b.jg5 SRJ-1501). Nothing is posted in
+ *    the source conversation, and the message text is never in the notice.
  *
  * The ack reaction's name comes from the server-wide `ack_reaction` setting
  * (b.av2 SR-1.6); with it absent, no persona reacts or records an entry.
@@ -187,7 +195,9 @@ export interface PersonaRoutingDeps {
    */
   isPersonaUp?(key: string): boolean
   // The lost-message state inputs (b.jg5 SRJ-1011), each asked for a lost
-  // message only, with P's key at that time. An absent member answers false.
+  // message only, with P's key at that time. An absent member answers false,
+  // except `isRetryArmed`, whose absence leaves state 5 without its
+  // armed-timer gate (its restart-cap gate is always asked).
   /**
    * Whether persona P is latched (b.jg5 SRJ-502; production: the server's one
    * latch's `isLatched`, which covers every declared case): a message lost
@@ -198,9 +208,25 @@ export interface PersonaRoutingDeps {
    * Whether persona P's `tmux-unresponsive` condition holds (b.jg5 SRJ-307;
    * production: the condition's `holds`): a message lost while it holds
    * reports `not-answering`, as does one lost while P's `tmux-unavailable` or
-   * `ad-config-malformed` outage is raised (read from the outage state).
+   * `ad-config-malformed` outage is raised (read from the outage state), in
+   * both cases only while P is below the restart cap and its retry timer is
+   * armed (`isRetryArmed`).
    */
   isTmuxUnresponsive?(key: string): boolean
+  /**
+   * Whether persona P's retry timer is armed, waiting or running (b.jg5
+   * SRJ-1011 as amended: "state 5 applies only while P's retry timer is
+   * armed"; production: the retry controller's `isArmed`, false when there
+   * is no controller). State 5 (`not-answering`) is decided only while it
+   * answers exactly true and P is below the restart cap (SRJ-305), so a P
+   * whose retry timer stopped, or one at the cap whose timer is still armed
+   * until its next retry, is not reported as being retried and falls
+   * through to the later states. Asked by the read gate's check of states 1
+   * to 5 and by the final decision, after the cap. Absent (hand-built
+   * fixtures): the armed-timer part is not asked, and state 5 is decided
+   * from the condition, the flags and the cap.
+   */
+  isRetryArmed?(key: string): boolean
   /**
    * Whether a launch or dialog approver for persona P is running, so its row
    * reads `pending` (production: the session manager's `isLaunchInFlight`,
@@ -245,10 +271,16 @@ export interface PersonaRoutingDeps {
    * outage is raised and it has none (production: the server's one check,
    * shared with the session-disconnect handler, which arms only when no
    * timer is armed, P is not latched and nothing is in flight for P, and
-   * logs one line when it arms). Asked only when a lost message's final
-   * state is `not-answering` and P's `tmux-unavailable` flag is raised, after
-   * the state is decided; it never schedules a restart (SRJ-1501). Absent:
-   * nothing is armed.
+   * logs one line when it arms). Asked for a lost message before the state
+   * is decided, only when none of states 1 to 4 applies, state 5's condition
+   * holds (P's `tmux-unresponsive` condition, or its `tmux-unavailable` or
+   * `ad-config-malformed` flag), P's `tmux-unavailable` flag is raised and P
+   * is below the restart cap (SRJ-305): so a P whose retry stopped with the
+   * flag still raised gets its timer armed and reports `not-answering`
+   * (state 5 applies only while P's retry timer is armed, `isRetryArmed`).
+   * At the cap nothing is armed: a timer armed there would stop at its first
+   * retry, and a P at the cap is never in state 5. It never schedules a
+   * restart (SRJ-1501). Absent: nothing is armed.
    */
   armRetryTimerIfMissing?(key: string): void
 }
@@ -503,25 +535,54 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
    * recovery, never restarted from here); whether P is latched (`isLatched`,
    * `held-for-human`); whether P is not answering (`not-answering`: its
    * `tmux-unresponsive` condition holds, or its `tmux-unavailable` or
-   * `ad-config-malformed` outage flag is raised; an unclassified-error
-   * episode is not consulted); whether P's row reads `pending`
-   * (`session-starting`: a launch for P is running,
-   * `isLaunchOrApproverRunning`, or the one row read answered `pending`);
-   * and P's real restart guards (pending, auto-restart disabled, cap). The
-   * held-on-invalid-flags, kill-failed and sequence/wait members are asked
-   * too, when supplied.
+   * `ad-config-malformed` outage flag is raised, P is below the restart cap
+   * and P's retry timer is armed, `isRetryArmed`; an unclassified-error
+   * episode is not consulted);
+   * whether P's row reads `pending` (`session-starting`: a launch for P is
+   * running, `isLaunchOrApproverRunning`, or the one row read answered
+   * `pending`); and P's real restart guards (pending, auto-restart disabled,
+   * cap). The held-on-invalid-flags, kill-failed and sequence/wait members
+   * are asked too, when supplied.
+   *
+   * The retry-timer gate (b.jg5 SRJ-1011 as amended: "state 5 applies only
+   * while P's retry timer is armed"): state 5's notice says CSCB is
+   * retrying, so a P whose retry timer is not armed, or that is at the
+   * restart cap (SRJ-305; `isAtCap(key, RESTART_FAILURE_CAP)`, asked even
+   * when `isRetryArmed` is absent), is not in state 5, whatever condition or
+   * flag is raised. A timer still armed at the cap stops at its next retry,
+   * so the cap wins over it. Such a P gets no early state and falls through
+   * to the later ones: `session-starting` when the row reads `pending`,
+   * `restarting` when a restart is pending, `auto-restart-disabled` at delay
+   * 0, else `restart-limit-reached` at the cap, none of which fires a
+   * restart. So a P at the cap reports `restart-limit-reached` (unless an
+   * earlier of those applies), never state 5. The gate applies wherever
+   * state 5 is asked: the read gate's check of states 1 to 5 and the final
+   * decision.
+   *
+   * The missing retry timer (b.jg5 SRJ-311): before the read gate's check,
+   * and again before the final decision when a row read was awaited (a
+   * retry may have stopped during it), when none of states 1 to 4 applies,
+   * state 5's condition holds, P's `tmux-unavailable` flag is raised and P
+   * is below the restart cap, `armRetryTimerIfMissing` is asked for P
+   * (`armStoppedRetryBeforeDecision`). Then the gated decision sees the timer
+   * it armed, so a P whose retry stopped with the flag still raised is
+   * retried, even with `health_check_interval` 0, and reports
+   * `not-answering`. At the cap nothing is armed: a timer armed there would
+   * stop at its first retry, and the notice must not say CSCB is retrying.
+   * That arm is the outage's own retry, never a restart.
    *
    * The read gate (b.jg5 SRJ-1011): one row read of P (`readRowLiveness`) is
    * made only when none of states 1 to 5 applies (asked through the same
-   * helper the decision asks first), no launch or approver for P runs, no
-   * live-row sequence or old-life wait step runs for P and nothing is in
-   * flight for P (`isWorkInFlight`). Never more than one read, no retry, no
-   * timer. The read is outside any launch or recovery attempt (see
-   * `readRowOnce`).
+   * helper the decision asks first, gated as above), no launch or approver
+   * for P runs, no live-row sequence or old-life wait step runs for P and
+   * nothing is in flight for P (`isWorkInFlight`). Never more than one read,
+   * no retry, no timer. The read is outside any launch or recovery attempt
+   * (see `readRowOnce`).
    *
    * Decide again after the read: the state is decided once, after the read,
    * over fresh answers to every query, so a latch or outage that began during
-   * the read, or that the read raised itself, reports state 2 or 5.
+   * the read, or that the read raised itself, reports state 2 or 5 (state 5
+   * only while P's retry timer is armed and P is below the restart cap).
    *
    * The no-restart rule (b.jg5 SRJ-1501): a human-triggered restart of P in
    * `cwd` is scheduled only when that final state fires one
@@ -530,15 +591,10 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
    * Nothing is awaited between the final decision and `scheduleRestart`, so
    * messages lost together schedule at most one restart.
    *
-   * The missing retry timer (b.jg5 SRJ-311): when the final state is
-   * `not-answering` and P's `tmux-unavailable` flag is raised,
-   * `armRetryTimerIfMissing` is asked for P, so a P whose retry stopped with
-   * the flag still raised is retried even with `health_check_interval` 0.
-   * That arm is the outage's own retry, never a restart. Then one
-   * lost-message notice naming `senderLabel` and the state is raised at P's
-   * destination. Nothing is posted in the source conversation. The notice is
-   * awaited so it is issued before dispatch returns; a failing sink is
-   * logged, never thrown.
+   * Then one lost-message notice naming `senderLabel` and the state is
+   * raised at P's destination. Nothing is posted in the source conversation.
+   * The notice is awaited so it is issued before dispatch returns; a failing
+   * sink is logged, never thrown.
    */
   async function handleLostMessage(
     persona: Persona,
@@ -548,7 +604,12 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   ): Promise<void> {
     const key = persona.key
     const early = earlyQueries(key)
-    const rowReadPending = shouldReadRow(key, early) ? await readRowOnce(persona) : false
+    // b.jg5 SRJ-311: arm a stopped retry first, so the gated check sees it.
+    armStoppedRetryBeforeDecision(key)
+    const readRow = shouldReadRow(key, early)
+    const rowReadPending = readRow ? await readRowOnce(persona) : false
+    // The read was awaited, so P's retry may have stopped meanwhile: ask again.
+    if (readRow) armStoppedRetryBeforeDecision(key)
     // The final decision: every query is asked afresh here, after the read.
     const state = decideLostMessageState({
       ...early,
@@ -560,7 +621,6 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     })
     // Nothing is awaited between the decision above and this call.
     if (firesHumanTriggeredRestart(state)) scheduleRestart(key, cwd, undefined, { humanTrigger: true })
-    if (state === 'not-answering' && getOutageFlags(key).has('tmux-unavailable')) deps.armRetryTimerIfMissing?.(key)
     try {
       await deps.notify(persona.key, buildLostMessageNotice(senderLabel, state))
     } catch (err) {
@@ -574,16 +634,44 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   /**
    * The queries of states 1 to 5 (b.jg5 SRJ-1011) for persona `key`, each
    * asked at call time, so the gate and the final decision both read fresh
-   * answers.
+   * answers. State 5's query is gated on the restart cap and P's retry
+   * timer (`isNotAnswering`).
    */
   function earlyQueries(key: string): EarlyLostMessageQueries {
+    return {
+      ...earlyQueriesBeforeState5(key),
+      isNotAnswering: () => isNotAnswering(key),
+    }
+  }
+
+  /** The queries of states 1 to 4 (b.jg5 SRJ-1011) for persona `key`, each asked at call time. */
+  function earlyQueriesBeforeState5(key: string): EarlyLostMessageQueries {
     return {
       isNotUp: () => deps.isPersonaUp?.(key) === false,
       isLatched: () => deps.isLatched?.(key) === true,
       isHeldOnInvalidFlags: () => deps.isHeldOnInvalidFlags?.(key) === true,
       isKillFailed: () => deps.isKillFailed?.(key) === true,
-      isNotAnswering: () => isNotAnswering(key),
     }
+  }
+
+  /**
+   * b.jg5 SRJ-311, asked before a lost message's state is decided: when the
+   * state would be `not-answering` but for the retry-timer gate (none of
+   * states 1 to 4 applies and state 5's condition holds), P's
+   * `tmux-unavailable` flag is raised and P is below the restart cap
+   * (SRJ-305), ask `armRetryTimerIfMissing` for P, so the gated decision
+   * that follows sees the timer it armed. At the cap nothing is armed: a
+   * timer armed there would stop at its first retry, and P reports
+   * `restart-limit-reached`. Never schedules a restart (SRJ-1501).
+   */
+  function armStoppedRetryBeforeDecision(key: string): void {
+    const arm = deps.armRetryTimerIfMissing
+    if (arm === undefined) return
+    if (decideEarlyLostMessageState(earlyQueriesBeforeState5(key)) !== undefined) return
+    if (!notAnsweringConditionHolds(key)) return
+    if (!getOutageFlags(key).has('tmux-unavailable')) return
+    if (isAtCap(key, RESTART_FAILURE_CAP)) return
+    arm(key)
   }
 
   /**
@@ -627,12 +715,30 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * b.jg5 SRJ-1011 state 5: persona `key`'s `tmux-unresponsive` condition
-   * holds, or its `tmux-unavailable` or `ad-config-malformed` outage flag is
-   * raised (b.jg5 SRJ-311, SRJ-316). No other outage class and no
-   * unclassified-error episode counts.
+   * b.jg5 SRJ-1011 state 5 (as amended: "state 5 applies only while P's
+   * retry timer is armed"): state 5's condition holds for persona `key`
+   * (`notAnsweringConditionHolds`), P is below the restart cap (SRJ-305,
+   * `isAtCap(key, RESTART_FAILURE_CAP)`) and its retry timer is armed
+   * (`isRetryArmed` answers exactly true). A P at the cap is never in state
+   * 5, even while a timer is still armed for it (that timer stops at its
+   * next retry), and neither is a P whose retry timer is not armed, whatever
+   * condition or flag is raised. With `isRetryArmed` absent (hand-built
+   * fixtures) the armed-timer part is not asked; the cap part always is.
    */
   function isNotAnswering(key: string): boolean {
+    if (!notAnsweringConditionHolds(key)) return false
+    if (isAtCap(key, RESTART_FAILURE_CAP)) return false
+    return deps.isRetryArmed === undefined || deps.isRetryArmed(key) === true
+  }
+
+  /**
+   * State 5's condition (b.jg5 SRJ-1011), before the cap and retry-timer gates:
+   * persona `key`'s `tmux-unresponsive` condition holds, or its
+   * `tmux-unavailable` or `ad-config-malformed` outage flag is raised (b.jg5
+   * SRJ-311, SRJ-316). No other outage class and no unclassified-error
+   * episode counts.
+   */
+  function notAnsweringConditionHolds(key: string): boolean {
     if (deps.isTmuxUnresponsive?.(key) === true) return true
     const flags = getOutageFlags(key)
     return flags.has('tmux-unavailable') || flags.has('ad-config-malformed')

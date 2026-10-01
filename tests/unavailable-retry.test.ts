@@ -98,7 +98,10 @@
  * from its bring-up is raised, it reports `not-answering` with the exported
  * wording, asks for no restart and makes no call, and the other persona's
  * reports its own state; once calls succeed and the outage clears it reports
- * `auto-restart-disabled`. An UNCLASSIFIED answer on the attempt's row reads,
+ * `auto-restart-disabled`. State 5 applies only while P's retry timer is
+ * armed and P is below the restart cap (SRJ-1011 as amended): at the cap,
+ * reached through real counted failures, P reports `restart-limit-reached`
+ * with either outage raised, its timer armed or not. An UNCLASSIFIED answer on the attempt's row reads,
  * P's unclassified-error episode open, never gives `not-answering`.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
@@ -6200,9 +6203,15 @@ describe('unavailable retry: a message lost while P’s tmux-unavailable or ad-c
 // A lost message arms a missing retry timer (b.jg5 SRJ-311, SRJ-1501): the
 // driver's `armRetryTimerIfMissing`, bound as `main()` binds it, both
 // settings 0, so no health tick and no restart would ever attempt for P.
+// Its `isRetryArmed` is the controller's `isArmed`, as `main()` binds it
+// (b.jg5 SRJ-1011 as amended: state 5 applies only while P's retry timer is
+// armed), so a state-5 condition with no timer armed that this path does
+// not arm falls through to a later state, and a P at the restart cap
+// (reached through real counted failures) reports restart limit reached
+// whatever is raised, with nothing armed by the message.
 // ---------------------------------------------------------------------------
 
-describe('unavailable retry: a message lost in not answering with P’s tmux-unavailable outage raised and no retry timer arms one, never a restart (SRJ-311, SRJ-1501)', () => {
+describe('unavailable retry: a message lost in not answering with P’s tmux-unavailable outage raised and no retry timer arms one, never a restart, and never at the restart cap (SRJ-311, SRJ-1501, SRJ-305)', () => {
   /** The driver's arm lines for persona `key` since `from` (the one line `armRetryTimerIfMissing` logs when it arms). */
   const armLinesSince = (h: RecoveryHarness, key: string, from: number): string[] =>
     h.errors.slice(from).filter((line) => line.startsWith(`[slack] Lost message: persona=${key} `))
@@ -6260,20 +6269,27 @@ describe('unavailable retry: a message lost in not answering with P’s tmux-una
     expectStopped(h, key)
   })
 
-  test('ad-config-malformed raised alone with no timer: the message reports not answering and arms nothing through this path', async () => {
+  // b.jg5 SRJ-1011 as amended: state 5 applies only while P's retry timer is
+  // armed, and this path arms only for tmux-unavailable, so the message falls
+  // through: its one row read (the row missing, not pending), then auto-restart
+  // disabled at the delay 0.
+  test('ad-config-malformed raised alone with no timer: not state 5 (no timer armed), so the message makes its one read and reports auto-restart disabled, and arms nothing through this path', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     await stoppedWithFlagRaised(h, key, () => errConfigMalformed(), AD_CONFIG_MALFORMED, UNAVAILABLE_RETRY_CAUSE_CONFIG)
     const errorsBefore = h.errors.length
 
-    await expectLostMessageReports(h, key, 'not-answering')
+    await expectLostMessageReports(h, key, 'auto-restart-disabled')
 
     expect(h.controller.armedKeys()).toEqual([])
     expect(armLinesSince(h, key, errorsBefore)).toEqual([])
     expectStopped(h, key)
   })
 
-  test('raised while a launch for P is in flight, no timer: the message reports not answering and arms nothing', async () => {
+  // b.jg5 SRJ-1011 as amended: the check arms nothing while a launch for P
+  // is in flight, so no timer is armed and state 5 does not apply; the launch
+  // running is state 6, with no read.
+  test('raised while a launch for P is in flight, no timer: the check arms nothing, so not state 5: the message reports session starting, with no read', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     const id = personaInstanceId(key)
@@ -6284,7 +6300,7 @@ describe('unavailable retry: a message lost in not answering with P’s tmux-una
     expect(isLaunchInFlight(key)).toBe(true)
     const errorsBefore = h.errors.length
 
-    await expectLostMessageReports(h, key, 'not-answering')
+    await expectLostMessageReports(h, key, 'session-starting', { calls: {} })
 
     expect(h.controller.armedKeys()).toEqual([])
     expect(armLinesSince(h, key, errorsBefore)).toEqual([])
@@ -6309,6 +6325,98 @@ describe('unavailable retry: a message lost in not answering with P’s tmux-una
     expect(armLinesSince(h, key, errorsBefore)).toEqual([])
     expectStopped(h, key)
   })
+
+  // b.jg5 SRJ-1011 as amended (orchestrator ruling): "A persona whose retry
+  // timer is stopped at the restart cap reports restart-limit-reached, never
+  // state 5's 'CSCB is retrying', whatever condition or flag is raised."
+  // P reaches the cap through real counted launch failures on its own retry
+  // timer, which the cap stops; `session_restart_delay` is above 0 (and
+  // never fires), so auto-restart disabled does not come first.
+
+  /**
+   * Drive P to the restart cap as the cap stop rule's case does: its retry
+   * timer armed, each retry's launch failing with `ErrTmuxSessionCreate`
+   * (counted) over a missing row, until the cap stops the timer with one cap
+   * notice, nothing pending on the clock and no restart pending. `refuse`
+   * (see `modelRow`) answers every `status` once it returns an error.
+   */
+  async function cappedByLaunchFailures(h: RecoveryHarness, key: string, refuse?: () => Error | undefined): Promise<void> {
+    modelRow(h, 'missing', refuse)
+    h.script({ spawnError: errTmuxSessionCreate('spawn') })
+    h.controller.arm(key, UNAVAILABLE)
+    for (let n = 1; n <= RESTART_FAILURE_CAP; n++) await retryNow(h, key)
+    expect(getFailureCount(key)).toBe(RESTART_FAILURE_CAP)
+    expect(isAtCap(key, RESTART_FAILURE_CAP)).toBe(true)
+    expect(h.capReached).toEqual([key])
+    expect(h.lines).toContain(stoppedLine(key, UNAVAILABLE_RETRY_STOP_CAPPED))
+    expectStopped(h, key)
+    expect(isRestartPendingOrActive(key)).toBe(false)
+  }
+
+  /** Both settings as the cases above, but a restart delay above 0 that never fires. */
+  const cappedHarness = (): RecoveryHarness => (harness = makeRecoveryHarness({ sessionRestartDelay: 9999 }))
+
+  test.each<[OutageClass]>([['tmux-unavailable'], [AD_CONFIG_MALFORMED]])(
+    'P at the restart cap by real counted failures, its timer stopped there, then its %s flag raised: the message makes its one read (failing UNAVAILABLE, so it raises and clears nothing) and reports restart limit reached, never not answering; no restart is asked for, no timer is armed and nothing is pending',
+    async (flag) => {
+      const h = cappedHarness()
+      const [key, other] = h.keys as [string, string]
+      let refusal: Error | undefined
+      await cappedByLaunchFailures(h, key, () => refusal)
+      setOutageFlag(key, flag)
+      refusal = errTmuxUnresponsive('status')
+      const spawns = h.stub.calls.spawnCalls.length
+      const errorsBefore = h.errors.length
+
+      await expectLostMessageReports(h, key, 'restart-limit-reached')
+
+      expect([...getOutageFlags(key)]).toEqual([flag])
+      expect(h.controller.armedKeys()).toEqual([])
+      expect(armLinesSince(h, key, errorsBefore)).toEqual([])
+      expect(h.stub.calls.spawnCalls).toHaveLength(spawns)
+      expect(isRestartPendingOrActive(key)).toBe(false)
+      expectStopped(h, key)
+      // The other persona, below the cap, is not held at it.
+      expect(isAtCap(other, RESTART_FAILURE_CAP)).toBe(false)
+    },
+  )
+
+  test.each<[string, () => Error, OutageClass, string]>([
+    ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'status'), 'tmux-unavailable', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), AD_CONFIG_MALFORMED, UNAVAILABLE_RETRY_CAUSE_CONFIG],
+  ])(
+    'P at the restart cap, the message\'s own read answering %s, which raises %s and arms P\'s timer as from any verb: the message still reports restart limit reached (the cap wins over the armed timer), as does a second with the timer still armed; no restart, no arm through the lost-message path; the timer stops at its next retry with no call',
+    async (_label, make, flag, cause) => {
+      const h = cappedHarness()
+      const [key] = h.keys as [string]
+      let refusal: Error | undefined
+      await cappedByLaunchFailures(h, key, () => refusal)
+      refusal = make()
+      const triggers = h.triggers.length
+      const errorsBefore = h.errors.length
+
+      await expectLostMessageReports(h, key, 'restart-limit-reached')
+
+      expect([...getOutageFlags(key)]).toEqual([flag])
+      expect(h.triggers.slice(triggers)).toEqual([{ key, kind: cause }])
+      expect(h.controller.armedKeys()).toEqual([key])
+      const timer = h.controller.view(key)
+
+      // The window the cap closes: the flag raised and the timer armed.
+      await expectLostMessageReports(h, key, 'restart-limit-reached')
+
+      expect(h.controller.view(key)).toEqual(timer)
+      expect(armLinesSince(h, key, errorsBefore)).toEqual([])
+      expect(isRestartPendingOrActive(key)).toBe(false)
+
+      // That timer stops at its next retry, at the cap, with no call.
+      const before = callCounts(h)
+      await retryNow(h, key)
+      expect(callsSince(h, before)).toEqual({})
+      expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_CAPPED))
+      expectStopped(h, key)
+    },
+  )
 
   // Positive control for `restartRequested`: at the delay 0 the restart module
   // arms nothing, so only the harness's record of the latched-query ask can
