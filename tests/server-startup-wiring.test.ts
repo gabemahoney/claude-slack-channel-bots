@@ -178,6 +178,12 @@
  *   into the full-mode retry action, `initRestart` and `initHealthCheck`, and
  *   the latch is named nowhere else. The condition's three ends and the
  *   unclassified episodes' two ends are each located in their binding.
+ * - b.jg5 SRJ-114 / SRJ-501: the session manager's configured-persona query
+ *   is installed once (`setConfiguredPersonaQuery`), in main()'s own
+ *   statement list, as a call-time read of the live applied-persona lookup
+ *   (`(key) => getAppliedPersona(key) !== undefined`), never reset; it and
+ *   the latch's install both come before the start sweep (`reconcileOrphans`)
+ *   and the start pass, with no await between them.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -2582,6 +2588,59 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(queries).toHaveLength(4)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => within(queries, onlyCallOf(call)))).toEqual([1, 2, 1])
     expect(within(queries, onlyReconnectAdapterBuild())).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-114 / SRJ-501 — the configured-persona query
+//
+// The note rule latches a persona only when the session manager's
+// configured-persona query counts its key as configured. The install is
+// optional: absent, no key counts and no `provenance_conflict` note latches
+// anyone; installed over a copy of the configuration taken once, a persona a
+// reload adds is never latched by its note and one it removes still is;
+// installed after the start sweep or the start pass, a note read there
+// latches no one. Any of these would type-check and pass every behaviour
+// suite. What the rule does is tested in tests/session-manager.test.ts and
+// tests/conflict-latch.test.ts; pinned here: the install.
+// ---------------------------------------------------------------------------
+
+describe('main() installs the configured-persona query over the live applied configuration, beside the latch, before the start sweep and the start pass (b.jg5 SRJ-114, SRJ-501)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const QUERY_INSTALL: keyof typeof SessionManagerModule = 'setConfiguredPersonaQuery'
+  const QUERY_RESET: keyof typeof SessionManagerModule = '_resetConfiguredPersonaQuery'
+  const LATCH_INSTALL: keyof typeof SessionManagerModule = 'setConflictLatch'
+  const START_SWEEP: keyof typeof SessionManagerModule = 'reconcileOrphans'
+
+  test('the query is installed in the session manager exactly once (nothing uninstalls or resets it), in main()\'s own statement list, through the session manager\'s own install', () => {
+    const at = onlyCallOf(QUERY_INSTALL)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(importSource(SERVER_CODE, QUERY_INSTALL)).toBe('./session-manager.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${QUERY_INSTALL}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    // The test-only reset is never named in server.ts.
+    expect(indicesOf(new RegExp(`\\b${QUERY_RESET}\\b`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  test('the query reads the live applied configuration at each call: `(key) => getAppliedPersona(key) !== undefined` over the one applied-persona lookup, never a copy of the configuration taken once', () => {
+    const args = onlyCallArgs(QUERY_INSTALL)
+    expect(args).toHaveLength(1)
+    // The parameter's name is free; its type annotation is optional.
+    expect(args[0]).toMatch(/^\(?(\w+)(?:\s*:\s*string)?\)?(?:\s*:\s*boolean)?\s*=>\s*getAppliedPersona\(\1\) !== undefined$/)
+    // getAppliedPersona reads the holder at call time (pinned in tests/reload-wiring.test.ts).
+    declaredOnce('getAppliedPersona')
+    expect(importSource(SERVER_CODE, 'getAppliedPersona')).toBeUndefined()
+  })
+
+  test('the query\'s and the latch\'s installs both come before the start sweep (reconcileOrphans) and the start pass, with no await between them', () => {
+    const query = onlyCallOf(QUERY_INSTALL)
+    const latch = onlyCallOf(LATCH_INSTALL)
+    const sweep = onlyCallOf(START_SWEEP)
+    expect(insideMain(sweep)).toBe(true)
+    for (const install of [query, latch]) {
+      for (const later of [sweep, ...latchStartPass()]) expect(install).toBeLessThan(later)
+    }
+    // Installed together: nothing else runs between the two installs.
+    expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(Math.min(query, latch), Math.max(query, latch)))).toEqual([])
   })
 })
 

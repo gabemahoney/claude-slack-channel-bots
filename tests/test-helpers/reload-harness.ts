@@ -357,7 +357,9 @@
  * run's notifier, each post recorded in `run.episodeNotices`) and one latch
  * (`createConflictLatch`, its lines to `run.logs`) whose CONFLICT notice is
  * bound to those episodes (`bindConflictNotice`). A realLaunch run installs
- * the latch in the session manager (`setConflictLatch`), so a CONFLICT at a
+ * the latch in the session manager (`setConflictLatch`), and beside it, as
+ * `main()` does, the configured-persona query over the run's live applied
+ * configuration (`setConfiguredPersonaQuery`), so a CONFLICT at a
  * ladder spawn or `resume` latches the persona (its launch record's `action`
  * is `latched`, with one CONFLICT notice to its destination) and a latched
  * persona's launch makes no agent-director call. The composition's
@@ -402,7 +404,8 @@
  * realLaunch run also installs the session manager's module seams (the
  * process's agent-director client, dialog and tmux fakes, the spawn home,
  * the trust patcher, the reply guard, the claude_config_dir hook, the
- * session notifier, the latch) and captures `console.error`; `h.cleanup()`
+ * session notifier, the latch, the configured-persona query) and captures
+ * `console.error`; `h.cleanup()`
  * resets and restores them. No launch is a startup launch, so nothing resolves the
  * state directory from the environment. It
  * spawns nothing itself: `mkfifoAvailable` and `h.makeFifo` start `mkfifo`
@@ -509,6 +512,7 @@ import {
   type SessionToolDeps,
 } from '../../src/registry.ts'
 import {
+  _resetConfiguredPersonaQuery,
   _resetDialogPollIntervalMs,
   _resetDialogReadyTimeoutMs,
   _resetFindMissingMemo,
@@ -530,6 +534,7 @@ import {
   launchSession,
   personaConfigDirLabelValue,
   setConfigDirUnresolvableHook,
+  setConfiguredPersonaQuery,
   setConflictLatch,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
@@ -2960,6 +2965,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // the collision ladder latches through the run's latch on a CONFLICT at
       // a spawn or resume, and launches no latched persona.
       setConflictLatch(latch)
+      // As main() installs it beside the latch (b.jg5 SRJ-114): a key counts
+      // as configured while the run's applied configuration holds it, read at
+      // each call, so a note on a configured persona's own row latches it.
+      setConfiguredPersonaQuery((key) => getAppliedPersona(key) !== undefined)
     }
   }
 
@@ -3268,6 +3277,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           setConfigDirUnresolvableHook(undefined)
           setSessionNotifier(undefined)
           setConflictLatch(undefined)
+          _resetConfiguredPersonaQuery()
         }
         if (outageStateInstalled) _resetOutageState()
         if (registryTouched) {

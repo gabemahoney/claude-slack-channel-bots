@@ -278,6 +278,11 @@ import {
   notifyDisconnectedWithAutoRestartDisabled,
   notifyPersonaNotConnected,
   setConflictLatch,
+  _resetConfiguredPersonaQuery,
+  readPersonaOwnRow,
+  OWN_ROW_READ_ROW,
+  WAIT_OUTCOME_LATCHED,
+  type OwnRowReadSite,
   type SessionConflictLatch,
   type ConfigDirUnresolvableHook,
   type NotConnectedNotice,
@@ -298,7 +303,9 @@ import {
 } from '../src/stop-hook-bootstrap.ts'
 import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
 import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
-import { UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
+import { UNATTRIBUTABLE_ZERO_REASON, runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
+import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
+import { makePersonaClients, makeTrailCapture, posts, startManualPoller } from './test-helpers/permission-relay-harness.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
 import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../src/persona-destination-hold.ts'
@@ -306,6 +313,7 @@ import { PERSONA_CONFIG_DIR_UNRESOLVABLE, PERSONA_DESTINATION_FAILED } from '../
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   makeDeferredConnect,
+  makeStubSlack,
   openedDm,
   type DeferredConnect,
   type StubSlackOptions,
@@ -331,11 +339,12 @@ import {
   writtenFile,
 } from './test-helpers/credentials.ts'
 import { MCP_SERVER_NAME, type Persona, type PersonaConfig, resolveRealPath } from '../src/config.ts'
-import { PERSONA_INSTANCE_ID_PREFIX, configDirLabelValue, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { PERSONA_INSTANCE_ID_PREFIX, configDirLabelValue, personaInstanceId, personaKey, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import {
   cannedGetResult,
   cannedListRow,
+  cannedPermissionRequest,
   cannedStatusResult,
   SAMPLE_LAUNCH_START_FRACTIONAL,
   SAMPLE_LAUNCH_START_NONE,
@@ -367,7 +376,10 @@ import {
   makeStubCallLog,
   makeStubClient,
   makeStubResolveSystemBinary,
+  nonLatchingNotes,
+  provenanceNote,
   stubCallCount,
+  unknownNote,
   type CannedGetResult,
   type CannedResponse,
   type PersonaGetResultOverrides,
@@ -445,14 +457,20 @@ import {
   type RecoveryRowState,
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
-import { CONFLICT_CASE_ROWS, type ConflictCaseRow } from './test-helpers/conflict-cases.ts'
+import { CONFLICT_CASE_ROWS, expectedConflictNotice, type ConflictCaseRow } from './test-helpers/conflict-cases.ts'
 import {
+  CONFLICT_LATCH_SET_LATCHED,
+  CONFLICT_LATCH_SET_SAME_CASE,
+  LATCH_CASE_CONFLICTING_LABELS,
   LATCH_ROW_STATE_KIND_NO_ROW,
   LATCH_ROW_STATE_KIND_READ,
   LATCH_ROW_STATE_NO_ROW,
+  REFUSED_OPERATION_BRING_UP,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
+  createConflictLatch,
   latchRowStateRead,
+  type ConflictLatchSetInput,
   type LatchRowState,
   type RefusedOperation,
 } from '../src/conflict-latch.ts'
@@ -653,6 +671,8 @@ afterEach(() => {
   setSessionNotifier(undefined)
   // b.jg5 SRJ-502: a case that installs its own latch leaves none behind.
   setConflictLatch(undefined)
+  // b.jg5 SRJ-114: nor its own configured-persona query.
+  _resetConfiguredPersonaQuery()
   installedHold?.cancelAll()
   installedHold = undefined
   process.env = savedEnv as NodeJS.ProcessEnv
@@ -9706,9 +9726,10 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // b.fwu case (a): the diagnostic get() rejects → the row cannot be consulted,
   // so we cannot classify loss vs never-created. Must not throw; the amnesia
   // fresh-spawn still completes, now bucketed as the dedicated
-  // 'fresh-after-inconclusive-amnesia' action. b.jg5 SRJ-105: only an answer
-  // that is not a read error reaches it (`ErrSpawnNotFound`, a CONFIG answer,
-  // an UNUSABLE NAME answer); here an UNUSABLE NAME answer.
+  // 'fresh-after-inconclusive-amnesia' action. b.jg5 SRJ-105: only
+  // `ErrSpawnNotFound` (an absent row) and an UNUSABLE NAME answer reach it;
+  // every other error at that get, a CONFIG answer included (b.jg5 SRJ-316),
+  // is a refusal; here an UNUSABLE NAME answer.
   test('inconclusive (a): diagnostic row fetch fails → no throw, fresh-after-inconclusive-amnesia', async () => {
     captureStartupErrors()
     const spawnCalls: import('agent-director').SpawnParams[] = []
@@ -9860,29 +9881,19 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     `${err.errName} ${quoted(err.errDescription)}`
 
   // AC 20 (b.av2 SR-10.3): a row-fetch failure that is not a read error
-  // (b.jg5 SRJ-105: `ErrSpawnNotFound`, an UNUSABLE NAME answer) reaches the
-  // inconclusive report, where it is named by
-  // describeAgentDirectorFailure — an agent-director error's errName and
-  // redacted description when the errName is a short identifier — in the log
-  // line, startup-errors.log and the persona notice alike; never the thrown
-  // value's raw message, description or envelope, which carry fake tokens here.
+  // (b.jg5 SRJ-105: an UNUSABLE NAME answer) reaches the inconclusive report,
+  // where it is named by describeAgentDirectorFailure — an agent-director
+  // error's errName and redacted description when the errName is a short
+  // identifier — in the log line, startup-errors.log and the persona notice
+  // alike; never the thrown value's raw message, description or envelope,
+  // which carry fake tokens here.
   const leakyConfig = (): unknown => errUnknownErrorName('ErrConfigMalformed', adDescription())
   const leakyUnusableName = (): unknown => errInternal(`${UNUSABLE_RECORDED_NAME_PHRASE} is empty; ${adDescription()}`)
-  test.each<[string, () => unknown, string]>([
-    [
-      'a typed subclass (ErrSpawnNotFound)',
-      () => new ErrSpawnNotFound('get', 'ErrSpawnNotFound', leakyMessage('gone', 'sub')),
-      `ErrSpawnNotFound ${quoted(redactedLeakyMessage('gone'))}`,
-    ],
-    [
-      'an UNUSABLE NAME answer whose envelope description holds a URL and a fake token',
-      leakyUnusableName,
-      unknownNameShown(leakyUnusableName() as { errName: string; errDescription: string }),
-    ],
-  ])('AC 20: row fetch fails with %s → named with its redacted message in the line, startup-errors.log and notice', async (_label, makeErr, shown) => {
+  test('AC 20: row fetch fails with an UNUSABLE NAME answer whose envelope description holds a URL and a fake token → named with its redacted message in the line, startup-errors.log and notice', async () => {
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    installDiagnosisGetFailure(cfg, makeErr, { spawnCalls: [], deleteCalls: [] })
+    installDiagnosisGetFailure(cfg, leakyUnusableName, { spawnCalls: [], deleteCalls: [] })
+    const shown = unknownNameShown(leakyUnusableName() as { errName: string; errDescription: string })
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
     const errArgs = await withErrArgs(async () => {
       result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
@@ -9895,6 +9906,34 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(lines.map(reasonOf)).toEqual([shown])
     expect(reasonOf(readLog())).toBe(shown)
     expect(notices.map((n) => reasonOf(n.text)).filter((r) => r !== undefined)).toEqual([shown])
+    assertNoLeak({ errArgs, startupErrorsLog: readLog(), notices })
+  })
+
+  // AC 20 with b.jg5 SRJ-114: `ErrSpawnNotFound` at the diagnosis get reads
+  // the row as absent. The inconclusive report names the absence by the error
+  // name alone, never the thrown value's message (which carries a fake token
+  // here), in the log line, startup-errors.log and the persona notice.
+  test('AC 20, b.jg5 SRJ-114: row fetch answers a typed ErrSpawnNotFound whose message holds a fake token → the row is read as absent: the line, startup-errors.log and notice name ErrSpawnNotFound, never its message; nothing leaks', async () => {
+    const readLog = captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    installDiagnosisGetFailure(cfg, () => new ErrSpawnNotFound('get', 'ErrSpawnNotFound', leakyMessage('gone', 'sub')), { spawnCalls: [], deleteCalls: [] })
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const errArgs = await withErrArgs(async () => {
+      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    })
+
+    expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
+    const reports = [
+      ...errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith('[slack] ErrJsonlMissing diagnostic: ')),
+      onlyStartupEntry(readLog(), 'jsonl-diagnosis-inconclusive'),
+      ...notices.map((n) => n.text),
+    ]
+    expect(reports).toHaveLength(3)
+    for (const report of reports) {
+      expect(report).toContain(ErrSpawnNotFound.name)
+      expect(report).not.toContain(redactedLeakyMessage('gone'))
+      expect(report).not.toContain('could not fetch the agent-director row')
+    }
     assertNoLeak({ errArgs, startupErrorsLog: readLog(), notices })
   })
 
@@ -12350,11 +12389,62 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
   ]
 
   const cross = READ_ERRORS.flatMap(([what, make, kind]) => READ_SITES.map((site) => [what, site.name, make, kind, site] as const))
-  test.each(cross)('%s at %s: no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, and P\'s condition is not started; B launches', async (_what, _site, make, kind, site) => {
+  test.each(cross)('%s at %s: no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, P\'s condition is not started and nothing latches; B launches', async (_what, _site, make, kind, site) => {
     const { h, p } = await expectRefusedAt(site, make(site.verb), kind)
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(conditionStartedLines(h, p)).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
+    // b.jg5 SRJ-114: a read error at a get site latches no one.
+    expect(h.latchEvents).toEqual([])
+  })
+
+  // b.jg5 SRJ-114: the diagnosis get fed the kill-failure form too (E10's
+  // fifth builder) is refused the same way, with its own cause.
+  test('b.jg5 SRJ-114: ErrTmuxKillFailed at the ErrJsonlMissing diagnosis get: no delete, kill, launch, notice or inconclusive entry, refused and never counted, P\'s condition is not started and nothing latches; B launches', async () => {
+    const site = READ_SITES.find((s) => s.name === 'the ErrJsonlMissing diagnosis get')!
+    const { h, p } = await expectRefusedAt(site, SRJ105_KILL_FAILED[1](site.verb), SRJ105_KILL_FAILED[2])
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(h.latchEvents).toEqual([])
+  })
+
+  // b.jg5 SRJ-114: readPersonaTranscript's get, reached from the restart
+  // path's check of a working row with an idle pane. A read error there is
+  // no evidence: the check defers, so the restart path types nothing, kills
+  // and launches nothing, and nothing is counted or started.
+  test.each([...READ_ERRORS, SRJ105_KILL_FAILED])('b.jg5 SRJ-114: %s at the transcript get of the restart path\'s working-row check (checkWorkingRowPane): unreadable, no evidence: defer, nothing typed, killed or launched, nothing counted, P\'s condition not started, nothing latched', async (_what, make) => {
+    const { h, p } = srj105Build()
+    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getError: make('get') })
+
+    expect(await checkWorkingRowPane(p, harnessPersona(h, p))).toBe('defer')
+
+    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
+    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
+    expect(getFailureCount(p)).toBe(0)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+    expect(h.latchEvents).toEqual([])
+    expect(h.notices).toEqual([])
+    const unreadable = h.errors.filter((line) => line.includes(`persona=${p} is working and its pane shows an idle screen, but`))
+    expect(unreadable).toHaveLength(1)
+    expect(unreadable[0]).toContain('reading its agent-director row failed: ')
+  })
+
+  test('regression: ErrSpawnNotFound at the transcript get of checkWorkingRowPane reads the row as absent: unreadable, defer, one line naming ErrSpawnNotFound; nothing latches', async () => {
+    const { h, p } = srj105Build()
+    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getError: errSpawnNotFound() })
+
+    expect(await checkWorkingRowPane(p, harnessPersona(h, p))).toBe('defer')
+
+    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
+    expect(h.latchEvents).toEqual([])
+    const unreadable = h.errors.filter((line) => line.includes(`persona=${p} is working and its pane shows an idle screen, but`))
+    expect(unreadable).toHaveLength(1)
+    expect(unreadable[0]).toContain(ErrSpawnNotFound.name)
+    expect(unreadable[0]).not.toContain('reading its agent-director row failed: ')
   })
 
   // A sweep is no read verb: of READ_ERRORS the UNAVAILABLE forms are a
@@ -12425,18 +12515,19 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
 
   // The refusal cases' "no notice, no inconclusive entry" is only evidence if
   // the harness captures that notice and entry: ErrSpawnNotFound at the
-  // diagnosis get still posts the one inconclusive notice and writes the one
-  // jsonl-diagnosis-inconclusive entry, both naming the failed row fetch.
-  test('regression: ErrSpawnNotFound at the ErrJsonlMissing diagnosis get still posts the inconclusive notice and writes the jsonl-diagnosis-inconclusive entry the harness captures', async () => {
+  // diagnosis get (the row read as absent, b.jg5 SRJ-114) still posts the one
+  // inconclusive notice and writes the one jsonl-diagnosis-inconclusive
+  // entry, both naming ErrSpawnNotFound, and latches nothing.
+  test('regression: ErrSpawnNotFound at the ErrJsonlMissing diagnosis get still posts the inconclusive notice and writes the jsonl-diagnosis-inconclusive entry the harness captures, both naming the absent row\'s ErrSpawnNotFound; nothing latches', async () => {
     const { h, p } = srj105Build()
     h.script(jsonlMissingDiagnosisGets(h, harnessPersona(h, p), cannedErr(errSpawnNotFound())))
 
     expect(await h.launch(p)).toEqual({ key: p, action: 'fresh-after-inconclusive-amnesia' })
 
-    const fetchFailed = 'could not fetch the agent-director row (ErrSpawnNotFound'
-    expect(h.notices.filter((n) => n.key === p && n.text.includes(fetchFailed))).toHaveLength(1)
-    expect(onlyStartupEntry(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toContain(fetchFailed)
+    expect(h.notices.filter((n) => n.key === p && n.text.includes(ErrSpawnNotFound.name))).toHaveLength(1)
+    expect(onlyStartupEntry(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toContain(ErrSpawnNotFound.name)
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(h.latchEvents).toEqual([])
   })
 })
 
@@ -13407,6 +13498,10 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     const latch: SessionConflictLatch = {
       isLatched: () => false,
       record: () => undefined,
+      set: (key) => {
+        sets.push(key)
+        throw new Error('latch store broken')
+      },
       setFromConflict: (key) => {
         sets.push(key)
         throw new Error('latch store broken')
@@ -13437,17 +13532,17 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
   test.each<[string, SessionConflictLatch, string]>([
     [
       'its latched query throws',
-      { isLatched: () => { throw new Error('latch query broken') }, record: () => undefined, setFromConflict: () => undefined },
+      { isLatched: () => { throw new Error('latch query broken') }, record: () => undefined, set: () => CONFLICT_LATCH_SET_LATCHED, setFromConflict: () => undefined },
       'latch query broken',
     ],
     [
       'it answers latched and its record read throws',
-      { isLatched: () => true, record: () => { throw new Error('latch record broken') }, setFromConflict: () => undefined },
+      { isLatched: () => true, record: () => { throw new Error('latch record broken') }, set: () => CONFLICT_LATCH_SET_LATCHED, setFromConflict: () => undefined },
       'latch record broken',
     ],
     [
       'it answers latched and its record read comes back empty',
-      { isLatched: () => true, record: () => undefined, setFromConflict: () => undefined },
+      { isLatched: () => true, record: () => undefined, set: () => CONFLICT_LATCH_SET_LATCHED, setFromConflict: () => undefined },
       'case=unknown',
     ],
   ])('an installed latch that %s is taken as latched: the launch answers latched with one gate line and no agent-director call, no trust patch, notice or spawn-failed entry; launchSession answers \'skipped\'', async (_what, latch, logged) => {
@@ -13482,5 +13577,667 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
     expect(getFailureCount('C')).toBe(0)
     assertNoLeak({ errLog, notices })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-114 (with SRJ-501, SRJ-502): the note rules at the session
+// manager's get sites
+//
+// At each get site that exists today (the collision `get`, the
+// ErrJsonlMissing diagnosis `get`, and `readPersonaTranscript`'s `get`,
+// reached through the working-row wait and through the restart path's
+// working-row check), a configured persona's own row whose `liveness_note`
+// is `provenanceNote` latches P with the case "conflicting labels", the
+// refused operation "P's bring-up", the state that `get` read and the session
+// `slack_bot_<key>`; its one CONFLICT notice has no "agent-director said"
+// line. Nothing more is called for P after that `get` (no `status` read, no
+// kill, delete, resume, spawn or keystrokes), the launch answers `latched`,
+// nothing is counted, posted as a spawn failure or recorded, and every later
+// launch path makes no call for P. Every other note (`nonLatchingNotes`), an
+// unknown one (`unknownNote`) and no note leave today's step for the row; so
+// does `provenanceNote` on a row that is not a configured persona's own (P
+// outside the applied configuration, no configured-persona query installed,
+// or another caller's row). Every case runs on `makeRecoveryHarness`, which
+// installs the latch and the configured-persona query as `main()` does, and
+// `srj105AfterEach` runs `assertNoLeak` over what it captured.
+// ---------------------------------------------------------------------------
+
+const WORKING_READ = latchRowStateRead('working')
+
+/** A get site of SRJ-114 that P's launch reaches. */
+interface NoteSite {
+  readonly name: string
+  /** Configuration or seams the site needs, set before the launch. */
+  setup?(h: RecoveryHarness): void
+  /** Stub answers for a launch of `persona` whose site `get` reads its own row with `noted` (the note, or another id) on it. */
+  script(h: RecoveryHarness, persona: Persona, noted: PersonaGetResultOverrides): RecoveryStubScript
+  /** The launch when the row's note latches no one: today's outcome and calls. */
+  readonly plain: { readonly action: SpawnPersonaResult['action']; readonly calls: LaunchVerbCalls }
+  /** The launch when the note latches P: its calls, its `get` and `status` reads (the latching `get` is the last call), and the state P's record holds. */
+  readonly latched: { readonly calls: LaunchVerbCalls; readonly gets: number; readonly statusReads: number; readonly rowState: LatchRowState }
+}
+
+const NOTE_SITES: readonly NoteSite[] = [
+  {
+    name: 'the collision get (an ended row)',
+    script: (h, p, noted) => collided(h, p, { state: 'ended', ...noted }),
+    plain: { action: 'resumed', calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
+    latched: { calls: ladderCallsOf({ spawn: 1 }), gets: 1, statusReads: 0, rowState: ENDED_READ },
+  },
+  {
+    name: 'the ErrJsonlMissing diagnosis get (an ended row)',
+    script: (h, p, noted) => jsonlMissingDiagnosisGets(h, p, cannedOk(harnessRow(h, p, { state: 'ended', ...noted }))),
+    plain: { action: 'fresh-after-inconclusive-amnesia', calls: ladderCallsOf({ spawn: 2, resume: 1, delete: 1 }) },
+    latched: { calls: ladderCallsOf({ spawn: 1, resume: 1 }), gets: 2, statusReads: 0, rowState: ENDED_READ },
+  },
+  {
+    // The wait's first poll reads working and its pane idle, so it reads the
+    // transcript; every later poll reads waiting.
+    name: 'the transcript get of the working-row wait (an idle pane; the next status reads waiting)',
+    setup: fastPolls,
+    script: (h, p, noted) => ({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk(harnessRow(h, p, { state: 'working' })), cannedOk(harnessRow(h, p, { state: 'working', ...noted }))],
+      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
+      statusResult: cannedStatusResult({ state: 'waiting' }),
+      readPaneResults: [{ pane: IDLE_PANE }],
+    }),
+    plain: { action: 'reconnected', calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }) },
+    latched: { calls: ladderCallsOf({ spawn: 1 }), gets: 2, statusReads: 1, rowState: WORKING_READ },
+  },
+]
+
+/** The CONFLICT notice a note latch posts for persona `key`: "conflicting labels", the session `slack_bot_<key>`, no description line. */
+function noteLatchNotice(key: string): string {
+  return expectedConflictNotice({ latchCase: LATCH_CASE_CONFLICTING_LABELS, sessionName: personaTmuxSessionName(key) }).text
+}
+
+/**
+ * P latched once from a note: its record, the set and the three holds before
+ * the one CONFLICT notice, and nothing counted, posted as a spawn failure,
+ * recorded, armed or refused.
+ */
+function expectNoteLatchedOnce(h: RecoveryHarness, p: string, rowState: LatchRowState): void {
+  expect(h.latch.record(p)).toStrictEqual({
+    sessionName: personaTmuxSessionName(p),
+    latchCase: LATCH_CASE_CONFLICTING_LABELS,
+    refusedOperation: REFUSED_OPERATION_BRING_UP,
+    rowState,
+  })
+  expect(h.latchEvents.map((event) => [event.step, event.key])).toEqual(ONE_LATCH_STEPS.map((step) => [step, p]))
+  expect(h.latchEvents[0]).toMatchObject({ step: 'set', outcome: CONFLICT_LATCH_SET_LATCHED })
+  expect(h.episodeNotices).toEqual([{ key: p, text: noteLatchNotice(p) }])
+  expect(h.notices).toEqual([])
+  const log = h.startupErrors().join('\n')
+  expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
+  expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(0)
+  expect(getFailureCount(p)).toBe(0)
+  expect(h.controller.isArmed(p)).toBe(false)
+  expect(h.triggers).toEqual([])
+  expect(refusalLines(h, p)).toEqual([])
+}
+
+/** No persona of the harness is latched, and nothing was set or posted for a latch. */
+function expectNoNoteLatch(h: RecoveryHarness): void {
+  expect(h.keys.filter((key) => h.latch.isLatched(key))).toEqual([])
+  expect(h.latchEvents).toEqual([])
+  expect(h.episodeNotices).toEqual([])
+}
+
+/** No note, every note that never latches, and a note CSCB does not know. */
+const PLAIN_NOTES: ReadonlyArray<readonly [string, string | undefined]> = [
+  ['no note', undefined],
+  ...[...nonLatchingNotes, unknownNote].map((note) => [`the note ${note}`, note] as const),
+]
+
+/** The reads of `provenanceNote` that are not of a configured persona's own row, each set up on the harness. */
+const NOT_A_CONFIGURED_OWN_ROW: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => PersonaGetResultOverrides]> = [
+  [
+    'P is not in the applied configuration (an absent persona\'s own row)',
+    (h, p) => {
+      h.remove(p)
+      return {}
+    },
+  ],
+  [
+    'no configured-persona query is installed',
+    () => {
+      _resetConfiguredPersonaQuery()
+      return {}
+    },
+  ],
+  ['the row is another caller\'s (its id is no persona\'s)', () => ({ claude_instance_id: 'adhoc_caller_1' })],
+]
+
+/**
+ * The working-row wait's calls, in order, for a row that reads `working`
+ * with an idle pane: the up-front findMissing sweep, the status poll, the
+ * pane read and the transcript `get`. The launch reaches the wait through
+ * the collision ladder (`spawn`, then the collision `get`).
+ */
+const WAIT_CALLS = ['findMissing', 'status', 'readPane', 'get'] as const
+const LADDER_CALLS_BEFORE_WAIT = ['spawn', 'get'] as const
+
+/** Each of the wait's calls by name, with its place in `WAIT_CALLS`. */
+const WAIT_CALL_KINDS: ReadonlyArray<readonly [string, number]> = [
+  ['the up-front findMissing sweep', 0],
+  ['the status poll', 1],
+  ['the pane read', 2],
+  ['the transcript get', 3],
+]
+
+/** How the wait is entered: directly, or through the launch's collision ladder. */
+const WAIT_ENTRIES: ReadonlyArray<readonly [string, typeof LADDER_CALLS_BEFORE_WAIT | readonly []]> = [
+  ['waitForWaitingAndReconnect', []],
+  ['the collision ladder\'s launch', LADDER_CALLS_BEFORE_WAIT],
+]
+
+/**
+ * Wrap every verb of the harness's stub client, in place, so each call
+ * appends the verb's name to the returned list, in call order, and the call
+ * at position `at` of that list runs `during` once it has its answer, before
+ * its caller gets it.
+ */
+function runDuringCall(h: RecoveryHarness, at: number, during: () => void): string[] {
+  const order: string[] = []
+  const client = h.stub.client as unknown as Record<string, unknown>
+  for (const name of Object.keys(client)) {
+    const verb = client[name]
+    if (typeof verb !== 'function') continue
+    client[name] = (...args: unknown[]): unknown => {
+      const position = order.push(name) - 1
+      const result = (verb as (...a: unknown[]) => unknown).apply(client, args)
+      return position === at ? Promise.resolve(result).finally(during) : result
+    }
+  }
+  return order
+}
+
+/** The record a latch set elsewhere gives P: a case, P's bring-up and the working row. */
+const LATCHED_ELSEWHERE: ConflictLatchSetInput = {
+  latchCase: LATCH_CASE_CONFLICTING_LABELS,
+  refusedOperation: REFUSED_OPERATION_BRING_UP,
+  rowState: WORKING_READ,
+}
+
+/** The wait's own lines for a wait that ends because its persona is latched. */
+function waitLatchedLines(h: RecoveryHarness): string[] {
+  return h.errors.filter((line) => line.startsWith('[slack] waitForWaitingAndReconnect: ') && line.includes(' is latched — the wait ends'))
+}
+
+describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a configured persona\'s own row latches it at each get site; no other note, and no row that is not a configured persona\'s own, latches anyone', () => {
+  afterEach(srj105AfterEach)
+
+  // Demo: a provenance_conflict note on the persona's row latches it once.
+  test.each(NOTE_SITES.map((site) => [site.name, site] as const))('a provenance_conflict note on P\'s own row at %s latches P once with the note\'s case, P\'s bring-up and the state read; nothing is called after that get; the launch answers latched; one CONFLICT notice; nothing counted or posted as a failure; then no launch path reaches agent-director; B launches', async (_name, site) => {
+    const { h, p, b } = srj105Build()
+    site.setup?.(h)
+    const script = site.script(h, harnessPersona(h, p), { liveness_note: provenanceNote })
+    h.script(script)
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(ladderCallsMade(h)).toEqual(site.latched.calls)
+    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual(Array(site.latched.gets).fill(personaInstanceId(p)))
+    expect(h.stub.calls.statusCalls).toHaveLength(site.latched.statusReads)
+    expect(order.slice(order.lastIndexOf('get'))).toEqual(['get'])
+    expectNoteLatchedOnce(h, p, site.latched.rowState)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  // The note decides before the cwd and config_dir guards and the state
+  // branches: whatever the row reads, in every row state, the collision get
+  // latches P and ends the ladder there (no kill, delete, wait, sweep,
+  // reconnect or launch). A prompt row (ask_user, check_permission) never
+  // reaches launchOnPromptRow: its tmux session is not probed, no pane is
+  // read and nothing is typed.
+  test.each<[string, (h: RecoveryHarness, persona: Persona) => PersonaGetResultOverrides, LatchRowState]>([
+    ['a pending row', () => ({ state: 'pending' }), latchRowStateRead('pending')],
+    ['an ended row', () => ({ state: 'ended' }), ENDED_READ],
+    ['a missing row', () => ({ state: 'missing' }), MISSING_READ],
+    ['a waiting row (a live state)', () => ({ state: 'waiting' }), WAITING_READ],
+    ['a working row', () => ({ state: 'working' }), WORKING_READ],
+    ['an ask_user row (a prompt row)', () => ({ state: 'ask_user' }), latchRowStateRead('ask_user')],
+    ['a check_permission row (a prompt row)', () => ({ state: 'check_permission' }), latchRowStateRead('check_permission')],
+    ['a row in another directory (the cwd guard)', (h) => elsewhere(h, 'ended'), ENDED_READ],
+    ['a waiting row with no config_dir label (the config_dir guard)', (h, persona) => unlabelledRow(h, persona, 'waiting'), WAITING_READ],
+  ])('the note on P\'s own row at the collision get, %s: P latched with that state, before any guard or state branch: one spawn and one get, no status read, no tmux probe, pane read or keystroke; latched', async (_row, row, rowState) => {
+    const { h, p, b } = srj105Build()
+    fastPolls(h)
+    // Every raw tmux seam a prompt row (or a dialog approval) reaches records its call.
+    const probed: string[] = []
+    const capturedPanes: string[] = []
+    const enters: string[] = []
+    _setTmuxSessionProber(async (name) => {
+      probed.push(name)
+      return true
+    })
+    _setTmuxCapturePane(async (name) => {
+      capturedPanes.push(name)
+      return ''
+    })
+    _setTmuxSendEnter(async (name) => {
+      enters.push(name)
+    })
+    const persona = harnessPersona(h, p)
+    const script = collided(h, persona, { ...row(h, persona), liveness_note: provenanceNote })
+    h.script(script)
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1 }))
+    expect(h.stub.calls.statusCalls).toEqual([])
+    expect(h.stub.calls.findMissingCalls).toEqual([])
+    expect(h.stub.calls.readPaneCalls).toEqual([])
+    expect(order).toEqual(['spawn', 'get'])
+    expect(probed).toEqual([])
+    expect(capturedPanes).toEqual([])
+    expect(enters).toEqual([])
+    expectNoteLatchedOnce(h, p, rowState)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  // Demo: tmux_server_changed and process_not_seen_session_present (with
+  // every other note, an unknown one and none) latch no one.
+  const plainCross = NOTE_SITES.flatMap((site) => PLAIN_NOTES.map(([label, note]) => [site.name, label, note, site] as const))
+  test.each(plainCross)('at %s, %s on P\'s own row latches no one: the launch takes today\'s step for the row and nothing is posted', async (_site, _label, note, site) => {
+    const { h, p } = srj105Build()
+    site.setup?.(h)
+    h.script(site.script(h, harnessPersona(h, p), { liveness_note: note }))
+
+    expect(await h.launch(p)).toEqual({ key: p, action: site.plain.action })
+
+    expect(ladderCallsMade(h)).toEqual(site.plain.calls)
+    expectNoNoteLatch(h)
+  })
+
+  // Demo: a provenance_conflict note on another caller's row latches no one.
+  const notOwnCross = NOTE_SITES.flatMap((site) => NOT_A_CONFIGURED_OWN_ROW.map(([label, setup]) => [site.name, label, setup, site] as const))
+  test.each(notOwnCross)('at %s, a provenance_conflict note on a row that is not a configured persona\'s own (%s) latches no one and changes nothing: today\'s step for the row', async (_site, _label, setup, site) => {
+    const { h, p } = srj105Build()
+    site.setup?.(h)
+    const noted = setup(h, p)
+    h.script(site.script(h, harnessPersona(h, p), { ...noted, liveness_note: provenanceNote }))
+
+    expect(await h.launch(p)).toEqual({ key: p, action: site.plain.action })
+
+    expect(ladderCallsMade(h)).toEqual(site.plain.calls)
+    expectNoNoteLatch(h)
+  })
+
+  test('regression: ErrSpawnNotFound at the collision get still retries the plain spawn once, and latches no one', async () => {
+    const { h, p } = srj105Build()
+    h.script({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() })
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
+    expect(h.stub.calls.getCalls).toHaveLength(1)
+    expectNoNoteLatch(h)
+  })
+
+  test('the start pass: P latched at its ErrJsonlMissing diagnosis get is listed latched and counted in neither amnesia counter, failed nor succeeded; no diagnosis entry or notice; B is counted', async () => {
+    const { h, p, b } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const pId = personaInstanceId(p)
+    let pGets = 0
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getFn: (params) =>
+        params.claude_instance_id !== pId
+          ? errSpawnNotFound()
+          : harnessRow(h, persona, { state: 'ended', ...(++pGets === 2 ? { liveness_note: provenanceNote } : {}) }),
+      resumeError: errJsonlMissing(),
+    })
+
+    const result = await startupSessionManager(h.config, { concurrency: 1 })
+
+    expect(result.perPersona).toEqual([
+      { key: p, action: 'latched' },
+      { key: b, action: 'spawned' },
+    ])
+    expect(result.failed).toBe(0)
+    expect(result.succeeded).toBe(1)
+    expect(result.freshAfterAmnesia).toBe(0)
+    expect(result.freshAfterInconclusiveAmnesia).toBe(0)
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.stub.calls.spawnCalls.filter((c) => c.claude_instance_id === pId)).toHaveLength(1)
+    expectNoteLatchedOnce(h, p, ENDED_READ)
+  })
+
+  test('the restart path\'s working-row check (checkWorkingRowPane) whose transcript get reads the note on P\'s own row answers defer: P latched once with the row read working; nothing typed, pending or posted but the one CONFLICT notice; a second check makes no get and posts nothing', async () => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getResult: harnessRow(h, persona, { state: 'working', liveness_note: provenanceNote }) })
+
+    expect(await checkWorkingRowPane(p, persona)).toBe('defer')
+
+    expect(h.stub.calls.getCalls).toHaveLength(1)
+    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
+    expectNoteLatchedOnce(h, p, WORKING_READ)
+
+    expect(await checkWorkingRowPane(p, persona)).toBe('defer')
+    expect(h.stub.calls.getCalls).toHaveLength(1)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
+    expect(h.latchEvents).toHaveLength(ONE_LATCH_STEPS.length)
+    expect(h.episodeNotices).toHaveLength(1)
+    expect(h.notices).toEqual([])
+  })
+
+  test.each(PLAIN_NOTES)('the restart path\'s working-row check, %s on P\'s own row: today\'s reading (an idle screen and an ended transcript start the evidence: defer, pending); nothing latched', async (_label, note) => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    h.script({ readPaneResults: [{ pane: IDLE_PANE }], getResult: harnessRow(h, persona, { state: 'working', ...transcriptOf().fields, liveness_note: note }) })
+
+    expect(await checkWorkingRowPane(p, persona)).toBe('defer')
+
+    expect(hasPendingWorkingRowEvidence(p)).toBe(true)
+    expectNoNoteLatch(h)
+  })
+
+  // b.jg5 SRJ-502: the wait asks after each of its agent-director calls
+  // whether P is latched, so a persona latched elsewhere while it waits (no
+  // note on any row it reads) ends the wait there. The harness's latch is
+  // read-only, so the case installs a latch of its own, as main() installs
+  // one, and sets P on it from the stub during one of the wait's calls, as
+  // another path would.
+  const waitCross = WAIT_ENTRIES.flatMap(([entry, before]) => WAIT_CALL_KINDS.map(([kind, at]) => [entry, kind, before, at] as const))
+  test.each(waitCross)('%s: P latched elsewhere during %s of the working-row wait (no note on the row) ends the wait latched: no further call, nothing typed, no not-connected notice; the latch keeps the record set elsewhere', async (_entry, _kind, before, at) => {
+    const { h, p } = srj105Build()
+    fastPolls(h)
+    const persona = harnessPersona(h, p)
+    const elsewhere = createConflictLatch({ log: () => {} })
+    setConflictLatch(elsewhere)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getResult: harnessRow(h, persona, { state: 'working' }),
+      statusResult: cannedStatusResult({ state: 'working' }),
+      readPaneResults: [{ pane: IDLE_PANE }],
+    })
+    const latchedAt = before.length + at
+    const order = runDuringCall(h, latchedAt, () => {
+      elsewhere.set(p, LATCHED_ELSEWHERE)
+    })
+
+    if (before.length === 0) {
+      expect(await waitForWaitingAndReconnect(p, h.config)).toBe(WAIT_OUTCOME_LATCHED)
+    } else {
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+    }
+
+    // The call during which P latched is the last call made.
+    expect(order).toEqual([...before, ...WAIT_CALLS.slice(0, at + 1)])
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: before.length === 0 ? 0 : 1 }))
+    expect(h.notices).toEqual([])
+    expect(waitLatchedLines(h)).toHaveLength(1)
+    expect(elsewhere.record(p)).toStrictEqual({ ...LATCHED_ELSEWHERE, sessionName: personaTmuxSessionName(p) })
+    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
+    expect(getFailureCount(p)).toBe(0)
+    expect(h.controller.isArmed(p)).toBe(false)
+  })
+
+  test('a second read of the note on a latched P\'s own row reads latched again and posts nothing more: one CONFLICT notice for the episode', async () => {
+    const { h, p } = srj105Build()
+    h.script({ getResult: harnessRow(h, harnessPersona(h, p), { state: 'ended', liveness_note: provenanceNote }) })
+    const at = { site: 'readPersonaOwnRow', what: 'a test get' }
+
+    const reads = [await readPersonaOwnRow(p, at), await readPersonaOwnRow(p, at)]
+
+    expect(reads.map((read) => read.kind === OWN_ROW_READ_ROW && read.latched)).toEqual([true, true])
+    expect(h.latchEvents.filter((event) => event.step === 'set').map((event) => event.step === 'set' && event.outcome)).toEqual([
+      CONFLICT_LATCH_SET_LATCHED,
+      CONFLICT_LATCH_SET_SAME_CASE,
+    ])
+    expect(h.episodeNotices).toEqual([{ key: p, text: noteLatchNotice(p) }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a
+// persona's own row is logged once per note for that persona, and again only
+// when the note changes. A read with no note, or with the latching note
+// (applied or not), forgets the logged note, so its return logs again. The
+// memory is per persona, forgotten with its not-connected episode
+// (`forgetNotConnectedEpisode`) and by `_resetNotConnectedEpisodes` (the
+// file's afterEach), and shared by every get site. Lines are matched by
+// their stable fragment, `its row carries the liveness note "<note>", which
+// latches no one`, and read back as [head, note].
+// ---------------------------------------------------------------------------
+
+const NON_LATCHING_LINE = /^\[slack\] (.+): its row carries the liveness note "(.*)", which latches no one — going on \(b\.jg5 SRJ-114\)$/
+
+/** The "latches no one" lines the harness captured, in order, each as [`<site>: <what> for <ref>`, note]. */
+function nonLatchingNoteLines(h: RecoveryHarness): Array<[string, string]> {
+  return h.errors.flatMap((line) => {
+    const m = NON_LATCHING_LINE.exec(line)
+    return m === null ? [] : [[m[1]!, m[2]!] as [string, string]]
+  })
+}
+
+/** A direct own-row read's site, and the head its lines carry for persona `key` (no ref given: `persona=<key>`). */
+const DEDUP_SITE: OwnRowReadSite = { site: 'readPersonaOwnRow', what: 'a test get' }
+function dedupHead(key: string, at: OwnRowReadSite = DEDUP_SITE): string {
+  return `${at.site}: ${at.what} for persona=${key}`
+}
+
+/**
+ * Script the harness's `get` to answer, for each persona, the row its entry in
+ * `notes` describes (an ended row in its own directory carrying that note, or
+ * none). Change an entry between reads to change what the next read sees.
+ */
+function scriptNotedRows(h: RecoveryHarness, notes: Map<string, PersonaGetResultOverrides>): void {
+  h.script({
+    getFn: (params) => {
+      const key = h.keys.find((candidate) => personaInstanceId(candidate) === params.claude_instance_id)
+      if (key === undefined) return errSpawnNotFound()
+      return harnessRow(h, harnessPersona(h, key), { state: 'ended', ...(notes.get(key) ?? {}) })
+    },
+  })
+}
+
+/** Read persona `key`'s own row once at `at`; the read must answer a row. */
+async function readOwnRowOnce(key: string, at: OwnRowReadSite = DEDUP_SITE): Promise<void> {
+  const read = await readPersonaOwnRow(key, at)
+  expect(read.kind).toBe(OWN_ROW_READ_ROW)
+}
+
+describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a persona\'s own row is logged once per note, again only when the note changes', () => {
+  afterEach(srj105AfterEach)
+
+  test.each([...nonLatchingNotes, unknownNote])('the note %s read twice on P\'s own row logs one line; nothing latched', async (note) => {
+    const { h, p } = srj105Build()
+    scriptNotedRows(h, new Map([[p, { liveness_note: note }]]))
+
+    await readOwnRowOnce(p)
+    await readOwnRowOnce(p)
+
+    expect(h.stub.calls.getCalls).toHaveLength(2)
+    expect(nonLatchingNoteLines(h)).toEqual([[dedupHead(p), note]])
+    expectNoNoteLatch(h)
+  })
+
+  test('a changed note logs again: A, A, B, B, A logs A, B, A', async () => {
+    const { h, p } = srj105Build()
+    const [a, b] = nonLatchingNotes as [string, string]
+    const notes = new Map<string, PersonaGetResultOverrides>()
+    scriptNotedRows(h, notes)
+
+    for (const note of [a, a, b, b, a]) {
+      notes.set(p, { liveness_note: note })
+      await readOwnRowOnce(p)
+    }
+
+    expect(nonLatchingNoteLines(h)).toEqual([
+      [dedupHead(p), a],
+      [dedupHead(p), b],
+      [dedupHead(p), a],
+    ])
+  })
+
+  // A read that carries no note, or the latching note (whether it latches P or
+  // is not applied), forgets the logged note: A's return logs again.
+  test.each<[string, (h: RecoveryHarness, p: string) => PersonaGetResultOverrides]>([
+    ['no note', () => ({})],
+    ['an empty note', () => ({ liveness_note: '' })],
+    ['provenance_conflict with no configured-persona query installed (not applied)', () => {
+      _resetConfiguredPersonaQuery()
+      return { liveness_note: provenanceNote }
+    }],
+    ['provenance_conflict on another caller\'s row (not applied)', () => ({ liveness_note: provenanceNote, claude_instance_id: 'adhoc_caller_1' })],
+    ['provenance_conflict on P\'s own row (P latches)', () => ({ liveness_note: provenanceNote })],
+  ])('note A, then a read with %s, then note A again logs A twice', async (_label, between) => {
+    const { h, p } = srj105Build()
+    const [a] = nonLatchingNotes as [string]
+    const notes = new Map<string, PersonaGetResultOverrides>([[p, { liveness_note: a }]])
+    scriptNotedRows(h, notes)
+
+    await readOwnRowOnce(p)
+    notes.set(p, between(h, p))
+    await readOwnRowOnce(p)
+    notes.set(p, { liveness_note: a })
+    await readOwnRowOnce(p)
+
+    expect(h.stub.calls.getCalls).toHaveLength(3)
+    expect(nonLatchingNoteLines(h)).toEqual([
+      [dedupHead(p), a],
+      [dedupHead(p), a],
+    ])
+  })
+
+  test('forgetNotConnectedEpisode(P) forgets P\'s logged note, so P\'s next read of it logs again; Q\'s logged note is untouched', async () => {
+    const { h, p, b: q } = srj105Build()
+    const [a] = nonLatchingNotes as [string]
+    scriptNotedRows(h, new Map([[p, { liveness_note: a }], [q, { liveness_note: a }]]))
+
+    await readOwnRowOnce(p)
+    await readOwnRowOnce(q)
+    forgetNotConnectedEpisode(p)
+    await readOwnRowOnce(p)
+    await readOwnRowOnce(q)
+
+    expect(nonLatchingNoteLines(h)).toEqual([
+      [dedupHead(p), a],
+      [dedupHead(q), a],
+      [dedupHead(p), a],
+    ])
+  })
+
+  test('_resetNotConnectedEpisodes() forgets every persona\'s logged note', async () => {
+    const { h, p, b: q } = srj105Build()
+    const [a] = nonLatchingNotes as [string]
+    scriptNotedRows(h, new Map([[p, { liveness_note: a }], [q, { liveness_note: a }]]))
+
+    await readOwnRowOnce(p)
+    await readOwnRowOnce(q)
+    _resetNotConnectedEpisodes()
+    await readOwnRowOnce(p)
+    await readOwnRowOnce(q)
+
+    expect(nonLatchingNoteLines(h)).toEqual([
+      [dedupHead(p), a],
+      [dedupHead(q), a],
+      [dedupHead(p), a],
+      [dedupHead(q), a],
+    ])
+  })
+
+  test('the same note read for P at a second site logs nothing more: the line names the first site only', async () => {
+    const { h, p } = srj105Build()
+    const [a] = nonLatchingNotes as [string]
+    scriptNotedRows(h, new Map([[p, { liveness_note: a }]]))
+    const collisionGet: OwnRowReadSite = { site: 'spawnForPersona', what: 'collision get' }
+    const transcriptGet: OwnRowReadSite = { site: 'readPersonaTranscript', what: 'transcript get' }
+
+    await readOwnRowOnce(p, collisionGet)
+    await readOwnRowOnce(p, transcriptGet)
+
+    expect(nonLatchingNoteLines(h)).toEqual([[dedupHead(p, collisionGet), a]])
+  })
+
+  test('a launch whose collision get and ErrJsonlMissing diagnosis get both read the same note on P\'s own row logs one line, at the collision get; the launch goes on as without the note', async () => {
+    const { h, p } = srj105Build()
+    const [a] = nonLatchingNotes as [string]
+    const persona = harnessPersona(h, p)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getResult: harnessRow(h, persona, { state: 'ended', liveness_note: a }),
+      resumeError: errJsonlMissing(),
+    })
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'fresh-after-inconclusive-amnesia' })
+
+    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p), personaInstanceId(p)])
+    const lines = nonLatchingNoteLines(h)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]![0]).toStartWith('spawnForPersona: collision get for ')
+    expect(lines[0]![1]).toBe(a)
+    expectNoNoteLatch(h)
+  })
+})
+
+describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch no one and keep their behaviour', () => {
+  afterEach(() => {
+    stopPermissionPoller()
+    _resetPollerState()
+    srj105AfterEach()
+  })
+
+  test('the permission poller\'s get of P\'s own check_permission row carrying the note: its prompt is posted as without the note; nothing latched, no CONFLICT notice', async () => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const slack = makeStubSlack()
+    const trail = makeTrailCapture()
+    // The poller reads through the harness's client, the session manager's too.
+    h.script({
+      listResult: { spawns: [cannedListRow({ state: 'check_permission', liveness_note: provenanceNote }, persona, h.home)] },
+      getResult: harnessRow(h, persona, { state: 'check_permission', liveness_note: provenanceNote, permission_requests: [cannedPermissionRequest()] }),
+    })
+    const ivl = startManualPoller({
+      getClient: () => h.stub.client as unknown as ReturnType<PollerDeps['getClient']>,
+      clientFor: makePersonaClients((key) => (key === p ? slack : undefined)).clientFor,
+      getPersona: (key) => h.config.personas.find((candidate) => candidate.key === key),
+      emitTrail: trail.emit,
+    })
+
+    await ivl.tick()
+
+    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+    expect(posts(slack)).toHaveLength(1)
+    expectNoNoteLatch(h)
+    assertNoLeak({ posts: posts(slack), trail: trail.events })
+  })
+
+  test('the JSONL persistence safeguard\'s get of P\'s own row carrying the note: its lost-transcript notice is made as without the note; nothing latched, no CONFLICT notice', async () => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const pId = personaInstanceId(p)
+    h.script({
+      getFn: (params) =>
+        params.claude_instance_id === pId
+          ? harnessRow(h, persona, { state: 'ended', liveness_note: provenanceNote, claude_session_id: TRANSCRIPT_SESSION_ID, jsonl_path: join(h.home, 'gone.jsonl') })
+          : errSpawnNotFound(),
+    })
+    const posted: Array<{ key: string; text: string }> = []
+
+    await runJsonlPersistenceSafeguard(h.config, (key, text) => {
+      posted.push({ key, text })
+    }, {
+      readMountinfo: () => '',
+      statFn: () => false,
+      archiveCountSince: () => 2,
+      recordStartupError: () => {},
+      home: h.home,
+    })
+
+    expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toContain(pId)
+    expect(posted.map((n) => n.key)).toEqual([p])
+    expectNoNoteLatch(h)
+    assertNoLeak({ posted })
   })
 })

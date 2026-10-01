@@ -79,6 +79,29 @@
  * `ErrNoSessionId`, delete, then the plain spawn answering `no-valid-id`,
  * recorded "plain spawn" with the collision `get`'s `ended`.
  *
+ * The note rules (SRJ-114; SRJ-501's note trigger and its Test half;
+ * SRJ-1004's note notice, hatch A2). The pure decision
+ * (`decideOwnRowRead`): a configured persona's own row carrying the stub's
+ * `provenanceNote`, in every state, decides a latch with "conflicting
+ * labels", P's bring-up and the state read (a `waiting` state counts as
+ * live); every other note agent-director names (`nonLatchingNotes`), the
+ * stub's `unknownNote` (a prefix of it is the latching note), the latching
+ * note case-folded or inside other text, and no note decide nothing; so does
+ * the latching note on an unconfigured key's row, another caller's row,
+ * another persona's row read for P and an id that only starts with P's.
+ * Through the shared own-row read (`readPersonaOwnRow`) on
+ * `makeRecoveryHarness`, its real latch and notice episodes: a note latch
+ * once (the record is `slack_bot_<key>`, "conflicting labels", P's bring-up
+ * and the live `waiting` state, with no description; one CONFLICT post; a
+ * second read posts nothing; Q is neither latched nor called); the notice,
+ * line by line from the exported constants and the case-sentence table, with
+ * no "agent-director said" line; P latched first with another case relatches
+ * on the note with one new post; a configured Q's own row latches Q alone;
+ * and `tmux_server_changed`, `process_not_seen_session_present`, every other
+ * listed note, the unknown note, no note, and the latching note on another
+ * caller's row, on a key outside the configuration and on a removed
+ * persona's row latch no one and post nothing.
+ *
  * Pure module under test, except the recovery-harness cases: one
  * `createConflictLatch` per test over a line capture and a recording
  * observer; `afterEach` runs `assertNoLeak` over every line, event and record
@@ -122,10 +145,12 @@ import {
   CONFLICT_LATCH_SET_RELATCHED,
   CONFLICT_LATCH_SET_SAME_CASE,
   CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE,
+  CONFLICT_NOTICE_CASE_SENTENCE_LEAD,
   CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD,
   CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL,
   CONFLICT_NOTICE_DIFFERENT_ID_MUST_NOT_END_LINE,
   CONFLICT_NOTICE_FIRST_LINE_HEAD,
+  CONFLICT_NOTICE_FIRST_LINE_TAIL,
   CONFLICT_NOTICE_HUMAN_ONLY_LINE,
   CONFLICT_NOTICE_LINE_SEPARATOR,
   CONFLICT_NOTICE_LIST_LINE_HEAD,
@@ -161,6 +186,7 @@ import {
   LATCH_ROW_STATE_KIND_NO_ROW,
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
+  REFUSED_OPERATION_BRING_UP,
   REFUSED_OPERATION_NONE,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
@@ -216,12 +242,16 @@ import {
   scheduleRestart,
 } from '../src/restart.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
+import { decideOwnRowRead, ROW_READ_NO_DECISION, type RowReadRow } from '../src/row-read-rules.ts'
 import {
   _resetNotConnectedEpisodes,
   isLaunchInFlight,
   notifyPersonaNotConnected,
+  OWN_ROW_READ_ROW,
+  readPersonaOwnRow,
   setSessionNotifier,
   type NotConnectedNotice,
+  type OwnRowReadSite,
 } from '../src/session-manager.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
@@ -233,6 +263,7 @@ import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   CONFLICT_CASES,
+  cannedGetResult,
   cannedStatusResult,
   errGeneric,
   errCallTimeout,
@@ -242,7 +273,10 @@ import {
   errTmuxSessionConflict,
   errTmuxUnresponsive,
   errUnknownErrorName,
+  nonLatchingNotes,
+  provenanceNote,
   STUB_TMUX_SESSION_NAME,
+  unknownNote,
 } from './test-helpers/agent-director-stub.ts'
 import {
   CONFLICT_CASE_ROWS,
@@ -1729,5 +1763,218 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
     expect([h2.latchEvents, h2.episodeNotices, callCounts(h2)]).toEqual([[], [], {}])
 
     await bringUpLatches(h2, row, script, rowState, calls)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The note rules (SRJ-114; SRJ-501's note trigger; SRJ-1004's note notice;
+// AC 40, AC 45, AC 85)
+// ---------------------------------------------------------------------------
+
+/** The instance id of a caller that is not CSCB: no persona's `cscb_<key>`. */
+const ANOTHER_CALLERS_ID = 'another-caller-instance'
+
+/** A key that is no persona of any harness's configuration. */
+const ABSENT = 'absent_persona'
+
+/** One row read as `decideOwnRowRead` takes it. */
+const rowRead = (claudeInstanceId: string, note: string | null | undefined, state = 'waiting'): RowReadRow => ({
+  claude_instance_id: claudeInstanceId,
+  state,
+  liveness_note: note,
+})
+
+/** Every state agent-director reports, by name: the live states (`pending` and `waiting` among them), then the dead ones. */
+const ROW_STATES = [...AGENT_DIRECTOR_LIVE_STATES, ...AGENT_DIRECTOR_DEAD_STATES].map((state) => [state] as const)
+
+/**
+ * The notes that latch no one, by name: every other note agent-director
+ * names, a note CSCB does not know (which starts with the latching note's
+ * spelling, so a prefix match catches it), the latching note case-folded and
+ * inside other text (no case-folded or substring match), and no note.
+ */
+const NON_LATCHING_NOTES: ReadonlyArray<readonly [string, string | null | undefined]> = [
+  ...nonLatchingNotes.map((note) => [`the ${note} note`, note] as const),
+  [`the unknown note ${unknownNote}`, unknownNote],
+  ['the latching note case-folded', provenanceNote.toUpperCase()],
+  ['the latching note inside other text', ` ${provenanceNote} `],
+  ['no note (absent)', undefined],
+  ['no note (null)', null],
+  ['an empty note', ''],
+]
+
+describe('the note rules: the pure decision over one read of a persona\'s own row (SRJ-114)', () => {
+  test.each(ROW_STATES)('a configured persona\'s own row in state %s with the latching note decides a latch: conflicting labels, P\'s bring-up and the state read', (state) => {
+    expect(decideOwnRowRead({ key: KEY, row: rowRead(personaInstanceId(KEY), provenanceNote, state), configured: true })).toEqual({
+      latch: { latchCase: LATCH_CASE_CONFLICTING_LABELS, refusedOperation: REFUSED_OPERATION_BRING_UP, rowState: latchRowStateRead(state) },
+    })
+  })
+
+  test('a waiting row\'s decided state counts as live', () => {
+    const decision = decideOwnRowRead({ key: KEY, row: rowRead(personaInstanceId(KEY), provenanceNote, 'waiting'), configured: true })
+    expect(decision.latch).toBeDefined()
+    expect(rowStateCountsAsLive(decision.latch!.rowState)).toBe(true)
+  })
+
+  test.each(NON_LATCHING_NOTES)('%s on a configured persona\'s own row decides nothing', (_name, note) => {
+    expect(decideOwnRowRead({ key: KEY, row: rowRead(personaInstanceId(KEY), note), configured: true })).toEqual(ROW_READ_NO_DECISION)
+  })
+
+  test.each([
+    ['the row of a key not configured (an absent persona\'s own row)', personaInstanceId(KEY), false],
+    ['another caller\'s row', ANOTHER_CALLERS_ID, true],
+    ['another persona\'s own row, read for P', personaInstanceId(OTHER), true],
+    ['a row whose id only starts with P\'s own', `${personaInstanceId(KEY)}_x`, true],
+  ] as const)('the latching note on %s decides nothing', (_name, claudeInstanceId, configured) => {
+    expect(decideOwnRowRead({ key: KEY, row: rowRead(claudeInstanceId, provenanceNote), configured })).toEqual(ROW_READ_NO_DECISION)
+  })
+})
+
+describe('the note latch through the own-row read: record, notice, relatch and who latches (recovery harness; SRJ-114, SRJ-501, SRJ-1004)', () => {
+  /** The reading site the log lines name; any site reads the same way. */
+  const SITE: OwnRowReadSite = { site: 'conflict-latch.test', what: 'own-row get' }
+
+  /** A recovery harness, cleaned up and leak-checked in `afterEach`, with its two configured personas. */
+  function makeNoteRun(): { h: RecoveryHarness; p: string; q: string } {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p, q] = h.keys as [string, string]
+    return { h, p, q }
+  }
+
+  /** The stub's `get` answer: configured persona `key`'s own row in `state`, carrying `note` (none when undefined). */
+  const ownRowAnswer = (h: RecoveryHarness, key: string, note: string | undefined, state = 'waiting'): RecoveryStubScript => ({
+    getResult: cannedGetResult({ state, liveness_note: note }, personaOf(h, key), h.home),
+  })
+
+  /** Each latch set as the observers saw it: the key and the outcome. */
+  const setOutcomes = (h: RecoveryHarness) => h.latchEvents.flatMap((event) => (event.step === 'set' ? [[event.key, event.outcome]] : []))
+
+  /** The note latch's notice for `key`, as the shared helper builds it: "conflicting labels", `slack_bot_<key>`, no description. */
+  const noteNotice = (key: string) => expectedConflictNotice({ latchCase: LATCH_CASE_CONFLICTING_LABELS, sessionName: personaTmuxSessionName(key) }).text
+
+  test('a note latch once: a provenance_conflict note on P\'s own waiting row latches P with slack_bot_<key>, conflicting labels, P\'s bring-up and a live waiting state; one CONFLICT post; a second read posts nothing; Q stays unlatched', async () => {
+    const { h, p, q } = makeNoteRun()
+    h.script(ownRowAnswer(h, p, provenanceNote))
+
+    expect(await readPersonaOwnRow(p, SITE)).toMatchObject({ kind: OWN_ROW_READ_ROW, latched: true })
+    const record = h.latch.record(p)
+    expect(record).toEqual({
+      sessionName: personaTmuxSessionName(p),
+      latchCase: LATCH_CASE_CONFLICTING_LABELS,
+      refusedOperation: REFUSED_OPERATION_BRING_UP,
+      rowState: latchRowStateRead('waiting'),
+    })
+    expect(rowStateCountsAsLive(record!.rowState)).toBe(true)
+    expect(h.episodeNotices).toEqual([{ key: p, text: noteNotice(p) }])
+
+    // The same note read again: still latched with the record unchanged, and nothing more posted.
+    expect(await readPersonaOwnRow(p, SITE)).toMatchObject({ kind: OWN_ROW_READ_ROW, latched: true })
+    expect(h.latch.record(p)).toBe(record)
+    expect(setOutcomes(h)).toEqual([[p, CONFLICT_LATCH_SET_LATCHED], [p, CONFLICT_LATCH_SET_SAME_CASE]])
+    expect(h.episodeNotices).toEqual([{ key: p, text: noteNotice(p) }])
+    expect(h.notices).toEqual([])
+
+    // Q, configured beside P, is neither latched nor called.
+    expect([h.latch.isLatched(q), h.latch.record(q)]).toEqual([false, undefined])
+    expect(personaCallCounts(h, q)).toEqual({})
+    expect(personaCallCounts(h, p)).toEqual({ getCalls: 2 })
+  })
+
+  test('the note latch\'s notice is SRJ-1004\'s conflicting-labels notice for slack_bot_<key>: the first line with the case sentence, the pointer, the list and the human-only lines, and no "agent-director said" line', async () => {
+    const { h, p } = makeNoteRun()
+    h.script(ownRowAnswer(h, p, provenanceNote))
+    await readPersonaOwnRow(p, SITE)
+
+    const session = personaTmuxSessionName(p)
+    expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
+    const lines = h.episodeNotices[0]!.text.split(CONFLICT_NOTICE_LINE_SEPARATOR)
+    expect(lines).toEqual([
+      CONFLICT_NOTICE_FIRST_LINE_HEAD +
+        JSON.stringify(session) +
+        CONFLICT_NOTICE_CASE_SENTENCE_LEAD +
+        CONFLICT_CASE_SENTENCES[LATCH_CASE_CONFLICTING_LABELS] +
+        CONFLICT_NOTICE_FIRST_LINE_TAIL,
+      CONFLICT_NOTICE_POINTER_LINE,
+      CONFLICT_NOTICE_LIST_LINE_HEAD + session + CONFLICT_NOTICE_LIST_LINE_TAIL,
+      CONFLICT_NOTICE_HUMAN_ONLY_LINE,
+    ])
+    expect(lines.filter((line) => line.startsWith(CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD))).toEqual([])
+  })
+
+  test('P latched first with another case relatches on the note with conflicting labels, P\'s bring-up and the state read, and exactly one new post', async () => {
+    const { h, p, q } = makeNoteRun()
+    const first = rowWhere(
+      (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.latchCase === LATCH_CASE_LEFTOVER && row.rowState !== LATCH_ROW_STATE_NO_ROW,
+    )
+    h.script({ spawnError: first.build() })
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    expect(h.latch.record(p)?.latchCase).toBe(LATCH_CASE_LEFTOVER)
+
+    h.script({ spawnError: undefined, ...ownRowAnswer(h, p, provenanceNote, 'ended') })
+    expect(await readPersonaOwnRow(p, SITE)).toMatchObject({ kind: OWN_ROW_READ_ROW, latched: true })
+    expect(h.latch.record(p)).toEqual({
+      sessionName: personaTmuxSessionName(p),
+      latchCase: LATCH_CASE_CONFLICTING_LABELS,
+      refusedOperation: REFUSED_OPERATION_BRING_UP,
+      rowState: ENDED,
+    })
+    expect(setOutcomes(h)).toEqual([[p, CONFLICT_LATCH_SET_LATCHED], [p, CONFLICT_LATCH_SET_RELATCHED]])
+    expect(h.episodeNotices).toEqual([
+      { key: p, text: first.notice.text },
+      { key: p, text: noteNotice(p) },
+    ])
+    expect(h.latch.isLatched(q)).toBe(false)
+  })
+
+  test('a configured second persona\'s own row with the note latches that persona alone, with its own session', async () => {
+    const { h, p, q } = makeNoteRun()
+    h.script(ownRowAnswer(h, q, provenanceNote))
+    expect(await readPersonaOwnRow(q, SITE)).toMatchObject({ kind: OWN_ROW_READ_ROW, latched: true })
+    expect(h.latch.record(q)?.sessionName).toBe(personaTmuxSessionName(q))
+    expect([h.latch.isLatched(p), h.latch.record(p)]).toEqual([false, undefined])
+    expect(setOutcomes(h)).toEqual([[q, CONFLICT_LATCH_SET_LATCHED]])
+    expect(h.episodeNotices).toEqual([{ key: q, text: noteNotice(q) }])
+  })
+
+  /**
+   * The reads that latch no one, by name: the key read and the stub's `get`
+   * answer for it. An absent persona is a key outside the harness's
+   * personas, or one removed from the applied configuration.
+   */
+  const NO_LATCH_READS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => { key: string; script: RecoveryStubScript }]> = [
+    ...nonLatchingNotes.map(
+      (note) => [`a ${note} note on P's own row`, (h: RecoveryHarness, p: string) => ({ key: p, script: ownRowAnswer(h, p, note) })] as const,
+    ),
+    [`an unknown note (${unknownNote}) on P's own row`, (h, p) => ({ key: p, script: ownRowAnswer(h, p, unknownNote) })],
+    ['no note on P\'s own row', (h, p) => ({ key: p, script: ownRowAnswer(h, p, undefined) })],
+    [
+      `a ${provenanceNote} note on another caller's row`,
+      (_h, p) => ({ key: p, script: { getResult: cannedGetResult({ claude_instance_id: ANOTHER_CALLERS_ID, liveness_note: provenanceNote }) } }),
+    ],
+    [
+      `a ${provenanceNote} note on the own row of a key outside the configuration (an absent persona)`,
+      (h) => {
+        expect(h.keys).not.toContain(ABSENT)
+        return { key: ABSENT, script: { getResult: cannedGetResult({ claude_instance_id: personaInstanceId(ABSENT), liveness_note: provenanceNote }) } }
+      },
+    ],
+    [
+      `a ${provenanceNote} note on the own row of a persona removed from the applied configuration`,
+      (h, p) => {
+        const script = ownRowAnswer(h, p, provenanceNote)
+        h.remove(p)
+        return { key: p, script }
+      },
+    ],
+  ]
+
+  test.each(NO_LATCH_READS)('%s latches no one and posts nothing', async (_name, read) => {
+    const { h, p } = makeNoteRun()
+    const { key, script } = read(h, p)
+    h.script(script)
+    expect(await readPersonaOwnRow(key, SITE)).toMatchObject({ kind: OWN_ROW_READ_ROW, latched: false })
+    expect([...h.keys, ABSENT].filter((k) => h.latch.isLatched(k))).toEqual([])
+    expect([h.latchEvents, h.episodeNotices, h.notices]).toEqual([[], [], []])
   })
 })

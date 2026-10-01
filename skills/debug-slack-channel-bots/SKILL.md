@@ -1289,11 +1289,26 @@ grep -h -E 'persona-episodes: persona=ops_bot tmux-unresponsive |unavailable-ret
 
 ## A persona posts a Held: tmux session conflict notice
 
-agent-director refused to act on the persona's tmux session because of a
-session conflict (`ErrTmuxSessionConflict`). Today this is met when the
-server launches or resumes the persona. The persona is then held: the
-persona's destination gets one *Held: tmux session conflict* notice naming
-the persona and its session, and the server attempts nothing more for it.
+The server met one of two things:
+
+- agent-director refused to act on the persona's tmux session because of a
+  session conflict (`ErrTmuxSessionConflict`), when the server launched or
+  resumed the persona;
+- agent-director had noted conflicting labels on the persona's own row
+  (its liveness note `provenance_conflict`) when the server read that row:
+  while launching the persona (the row read after the instance id was
+  already taken, or before replacing a resume whose transcript is missing),
+  or while checking whether a session whose row reads `working` is really
+  idle. This is the "Conflicting labels" case below.
+
+Only the persona's own row, for a persona in the configuration, counts.
+agent-director's other liveness notes (such as `tmux_server_changed` or
+`process_not_seen_session_present`), and any note on a row that is not one
+of your personas' own, never hold a persona.
+
+The persona is then held: the persona's destination gets one *Held: tmux
+session conflict* notice naming the persona and its session, and the server
+attempts nothing more for it.
 
 While the persona is held:
 
@@ -1325,9 +1340,12 @@ and ending one logs no line of its own.
 
 **The notice.** It is posted once per hold, even when the persona already
 has a *Waiting on a prompt* or *Not connected* notice. Its first line names
-the session and the case, and its next line quotes agent-director's
-description (`agent-director said: "…"`), with anything that looks like a
-token removed. Then, for every case but one, a pointer to the "Operator
+the session and the case. For a refused launch or resume, its next line
+quotes agent-director's description (`agent-director said: "…"`), with
+anything that looks like a token removed. For a hold set from conflicting
+labels noted on the row, the session is the persona's own
+(`slack_bot_<key>`) and there is no `agent-director said` line, since the
+note carries no description. Then, for every case but one, a pointer to the "Operator
 actions" section of agent-director's README; then the read-only `list`
 check below; and last, that it is for a human only.
 
@@ -1365,13 +1383,19 @@ agent-director list --tmux-session-name <name>
 All of one persona's hold lines (replace `ops_bot` with the key):
 
 ```sh
-grep -h -E 'conflict-latch: persona=ops_bot |\(key=ops_bot\): .*— CONFLICT: |\(key=ops_bot\): forgetting its latch failed|\(key=ops_bot\) — .*latched \(case=|(Not scheduling|Skipping) restart for persona=ops_bot — the persona is latched|Session relaunch for persona=ops_bot ended latched|reconnectSession: persona=ops_bot is latched|unavailable-retry: persona=ops_bot (stopped.* — the persona is latched|the latched query failed)|persona-episodes: persona=ops_bot ((tmux-unresponsive|unclassified-error) ended — the persona latched|conflict notice failed)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+grep -h -E 'conflict-latch: persona=ops_bot |\(key=ops_bot\): .*— CONFLICT: |(\(key=ops_bot\)|persona=ops_bot): (its row carries the liveness note provenance_conflict|applying the note rule failed)|\(key=ops_bot\) is latched — the wait ends|reconnectSession: persona=ops_bot is working and is latched|\(key=ops_bot\): forgetting its latch failed|\(key=ops_bot\) — .*latched \(case=|(Not scheduling|Skipping) restart for persona=ops_bot — the persona is latched|Session relaunch for persona=ops_bot ended latched|reconnectSession: persona=ops_bot is latched|unavailable-retry: persona=ops_bot (stopped.* — the persona is latched|the latched query failed)|persona-episodes: persona=ops_bot ((tmux-unresponsive|unclassified-error) ended — the persona latched|conflict notice failed)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
 ```
 
 | Line | Meaning | What to do |
 |---|---|---|
 | `[slack] spawnForPersona: <step> refused for "<name>" (key=<key>): <error> — CONFLICT: the persona latched; no spawn-failure notice; nothing more is called (b.jg5 SRJ-105, SRJ-501)` | A launch step (`<step>`: `spawn`, `retry-spawn`, `resume`, `fresh spawn`, `fresh spawn after delete`, `fresh spawn after ErrSpawnNotFound on resume` or `self-heal spawn after ErrTmuxSessionCreate`) was refused with `ErrTmuxSessionConflict`. The launch stops there: nothing is killed, deleted or launched after it. Logged once the persona is held, so it comes after the `latched` line below and the notice. | As for the notice. |
-| `[slack] conflict-latch: persona=<key> latched — case=<case> session="<name>" refused=<operation> state=<state>[ message="<description>"]` | The persona is held. `<operation>` is the refused call (`plain-spawn` or `resume`); `<state>` is the state the server last read for its row before that call, or, when it had read none (the first spawn and its self-heal spawn), the state one read right after the refusal gives (`no-row` when there is no row, `unreadable` when it could not be read); ` message="…"` is agent-director's description, redacted, when it gave one. The notice is posted right after. | As for the notice. |
+| `[slack] <site>: <what> for <persona>: its row carries the liveness note provenance_conflict (state=<state>) — the persona latched; nothing more is called for it (b.jg5 SRJ-114, SRJ-501)` | agent-director has noted conflicting labels on the persona's own row, and the server read that row. `<site>: <what>` is `spawnForPersona: collision get` (a launch found the instance id taken and read its row) or `spawnForPersona: ErrJsonlMissing diagnosis get` (a resume's transcript was missing; no history diagnosis is reported, and nothing is deleted or launched), with `<persona>` `"<name>" (key=<key>)`; or `readPersonaTranscript: transcript get` (checking whether a `working` row is idle), with `<persona>` `persona=<key>`. `<state>` is the state that read gave. Nothing more is called for the persona: the launch stops, or the wait or check ends. Logged once the persona is held, so it comes after the `latched` line below and the notice. With `the persona relatched` the hold now records this case and a new notice was posted; with `the persona was already latched with this case` nothing new is posted. | As for the notice. |
+| `[slack] <site>: <what> for <persona>: its row carries the liveness note provenance_conflict, but persona=<key> is not a persona of the applied configuration — the note is not applied (b.jg5 SRJ-114)`, `[slack] <site>: <what> for <persona>: its row carries the liveness note provenance_conflict, but the row is not the persona's own (claude_instance_id="<id>") — the note is not applied (b.jg5 SRJ-114)` | The note was read, but on a row that is not the own row of a persona in the configuration (for example, the persona was removed meanwhile). Nobody is held and nothing is posted; the server goes on as if the row had no note. | Nothing. |
+| `[slack] <site>: <what> for <persona>: its row carries the liveness note "<note>", which latches no one — going on (b.jg5 SRJ-114)` | agent-director noted something else on the persona's row (for example `tmux_server_changed` or `process_not_seen_session_present`). Only conflicting labels hold a persona; the server goes on. Logged once per persona for a note: again only when the note changes, after a read showing no note or conflicting labels, or after the persona reconnects, is found healthy again or is removed. Not a hold line, so the grep above leaves it out. | Nothing. |
+| `[slack] waitForWaitingAndReconnect: "<name>" (key=<key>) is latched — the wait ends; nothing more is called and nothing is typed (b.jg5 SRJ-502)` | A launch waiting on the persona's `working` row found the persona held (by the wait's own row read, or by another path meanwhile). The wait stops: nothing is typed and no *Not connected* notice is posted. | As for the notice. |
+| `[slack] reconnectSession: persona=<key> is working and is latched — deferring; no deferral noted, nothing typed (b.jg5 SRJ-502)` | The health check's reconnect, checking whether a `working` row is idle, found the persona held (by its own row read, or by another path meanwhile). Nothing is typed, and the held-back time toward the *Not connected* notice is not counted. | As for the notice. |
+| `[slack] <site>: <what> for <persona>: its row carries the liveness note provenance_conflict (state=<state>) — latching the persona failed: <error>; nothing more is called for it (b.jg5 SRJ-114, SRJ-501)`, `[slack] <site>: <what> for <persona>: its row carries the liveness note provenance_conflict, but the configured-persona query failed: <error> — the note is not applied (b.jg5 SRJ-114)`, `[slack] <site>: <what> for <persona>: applying the note rule failed: <error> (b.jg5 SRJ-114)` | An internal error while applying the note. With `latching the persona failed`, that launch, wait or check still stopped, but the hold may not be recorded and the notice may be missing. With the other two, the note was not applied and nobody was held. | Report it as a bug, with the persona's lines. |
+| `[slack] conflict-latch: persona=<key> latched — case=<case> session="<name>" refused=<operation> state=<state>[ message="<description>"]` | The persona is held. `<operation>` is the refused call (`plain-spawn` or `resume`), or `bring-up` for a hold set from conflicting labels noted on its row (`case=conflicting-labels`, `session="slack_bot_<key>"`, no ` message=`); `<state>` is the state the server last read for its row before that call, or, when it had read none (the first spawn and its self-heal spawn), the state one read right after the refusal gives (`no-row` when there is no row, `unreadable` when it could not be read), or for a noted row the state that read gave; ` message="…"` is agent-director's description, redacted, when it gave one. The notice is posted right after. | As for the notice. |
 | `[slack] conflict-latch: persona=<key> relatched — case=<case> (was <case>) session="<name>" refused=<operation> state=<state>[ message="<description>"]` | A held persona met a conflict of another case; the hold now records the new one, and a new notice is posted for it. The same case again logs nothing and posts nothing. | As for the notice. |
 | `[slack] spawnForPersona: not launching "<name>" (key=<key>) — it is latched (case=<case>); no agent-director call (b.jg5 SRJ-502)` | A launch was asked for the held persona (the start, a bring-up, a restart or a retry) and skipped. | Nothing more: this is the hold working. |
 | `[slack] Not scheduling restart for persona=<key> — the persona is latched; no timer armed (b.jg5 SRJ-502)` | A restart was asked for the held persona (a lost message or a dropped connection) and none was scheduled. | Nothing more: this is the hold working. |

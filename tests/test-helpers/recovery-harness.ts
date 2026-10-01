@@ -179,6 +179,12 @@
  *   bound here; a tick case binds `latch.isLatched` itself. `teardown(key)`
  *   forgets the persona's latch silently (b.jg5 SRJ-504), as production's
  *   teardown does.
+ * - The configured-persona query (b.jg5 SRJ-114): installed in the session
+ *   manager beside the latch (`setConfiguredPersonaQuery`), as `main()`
+ *   installs it, over the live applied set: a key counts as configured while
+ *   it is applied, so a `provenance_conflict` note on a configured persona's
+ *   own row latches it through `latch`, and a key outside the harness's
+ *   personas, or one `remove(key)` dropped, counts as not configured.
  * - `tickEnd(key)`: what a health tick's healthy branch does to the
  *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
  *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
@@ -237,6 +243,8 @@
  *   install and reset the harness made (`console.error`, the restart module's state and the
  *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
  *   the session manager's latch install and the latch's set observers,
+ *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
+ *   harnesses built one after the other share no query,
  *   the stub spawn path and client with every launch still in flight, the
  *   findMissing memo, the tmux seams, the settings install,
  *   `SLACK_STATE_DIR`) and removes the temporary directory. It throws, after
@@ -328,6 +336,7 @@ import { createPersonaRelaunchGate } from '../../src/persona-start.ts'
 import { _resetRestartState, initRestart, RESTART_FAILURE_CAP, runRestartRetry, type RestartDeps } from '../../src/restart.ts'
 import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter } from '../../src/server.ts'
 import {
+  _resetConfiguredPersonaQuery,
   _resetFindMissingMemo,
   _resetTmuxServerEnsurer,
   _resetTmuxSessionKiller,
@@ -337,6 +346,7 @@ import {
   launchSession,
   notifyRestartCapReached,
   readPersonaRowState,
+  setConfiguredPersonaQuery,
   setConflictLatch,
   setSessionNotifier,
   spawnForPersona,
@@ -782,6 +792,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // As main() installs it, before any launch: the collision ladder latches
   // through it and launches no latched persona.
   setConflictLatch(latch)
+  // As main() installs it, beside the latch (b.jg5 SRJ-114): a key counts as
+  // configured while it is in the live applied set, so a note on a persona's
+  // own row latches it and a key outside the set, or removed from it, does not.
+  setConfiguredPersonaQuery((key) => appliedPersona(key) !== undefined)
 
   resetAdSettingsForTests()
   if (options.adSettings !== undefined) writeAgentDirectorConfig(home, options.adSettings)
@@ -999,6 +1013,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       _resetOutageState()
       setSessionNotifier(undefined)
       setConflictLatch(undefined)
+      _resetConfiguredPersonaQuery()
       for (const unbind of unbindLatch) unbind()
       resetStubSpawnPath()
       _resetTmuxSessionKiller()

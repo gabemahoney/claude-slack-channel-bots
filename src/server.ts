@@ -103,6 +103,7 @@ import {
   reconcileOrphans,
   reconnectMcpWithCause,
   setConfigDirUnresolvableHook,
+  setConfiguredPersonaQuery,
   setConflictLatch,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
@@ -1961,6 +1962,14 @@ export async function main(): Promise<void> {
   // the persona lifecycle below); a server restart drops every latch with the
   // process, so there is no forget-all at shutdown.
   setConflictLatch(conflictLatch)
+  // b.jg5 SRJ-114, SRJ-501: which keys are configured personas, for the note
+  // rule at every read of a persona's own row (a `provenance_conflict` note on
+  // a configured persona's own row latches it through the latch above). It
+  // reads the applied configuration at each call, so a persona an apply adds
+  // counts at once and one it removes stops counting at once; it holds no
+  // state, so shutdown has nothing to undo. Installed with the latch, before
+  // the start sweep and the start pass.
+  setConfiguredPersonaQuery((key) => getAppliedPersona(key) !== undefined)
 
   // b.jg5 SRJ-313, SRJ-1009: each persona's unclassified-error episode, held
   // in the notice episodes (so a teardown forgets it and shutdown closes it).

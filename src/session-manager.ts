@@ -10,7 +10,10 @@
  * the SR-1.4 collision-then-act dispatch:
  *
  *   1. Try `client.spawn(...)` directly.
- *   2. On `ErrInstanceIdCollision`, call `client.get(...)`. A row whose `cwd`
+ *   2. On `ErrInstanceIdCollision`, call `client.get(...)` through the shared
+ *      own-row read (`readPersonaOwnRow`, b.jg5 SRJ-114). A read that latched
+ *      the persona (a `provenance_conflict` note on a configured persona's
+ *      own row) ends the ladder with `latched` before anything below. A row whose `cwd`
  *      differs from the persona's working directory by real path is killed,
  *      deleted and spawned fresh whatever its state (b.av2 SR-6.2). Otherwise
  *      branch on the observed state (ended/missing → resume or
@@ -173,16 +176,28 @@ import {
 } from './ad-error-class.ts'
 import { RECHECK_OUTCOME_STOP } from './ad-version-gate.ts'
 import {
+  CONFLICT_LATCH_SET_LATCHED,
+  CONFLICT_LATCH_SET_RELATCHED,
+  CONFLICT_LATCH_SET_SAME_CASE,
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
+  describeLatchRowState,
   latchRowStateRead,
   type ConflictLatch,
   type ConflictLatchRecord,
+  type ConflictLatchSetOutcome,
   type LatchRowState,
   type RefusedOperation,
 } from './conflict-latch.ts'
+import {
+  LATCHING_LIVENESS_NOTE,
+  decideOwnRowRead,
+  isLatchingLivenessNote,
+  isPersonaOwnRow,
+  type RowReadLatchDecision,
+} from './row-read-rules.ts'
 import {
   runInAttempt,
   unavailableRetryCauseFor,
@@ -207,6 +222,7 @@ import {
   describeThrownValue,
   isSafeIdentifier,
   MAX_LOGGED_MESSAGE_LENGTH,
+  renderLogMessageText,
 } from './persona-connection-errors.ts'
 import { describeDestinationFailureCause } from './persona-destination.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
@@ -510,6 +526,9 @@ export function notifyRestartCapReached(key: string): void {
 /** The result a launch or recovery site answers for a refusal: `failed`, which `markRefusal` marks refused when the timer was armed. */
 type RefusedSiteResult = { key: string; action: 'failed' }
 
+/** A site's latched result (b.jg5 SRJ-502): the persona latched, and nothing more is called for it. */
+type LatchedSiteResult = { key: string; action: 'latched' }
+
 /**
  * b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: the one handling of a refusal at
  * the launch and recovery sites. `err` was thrown by an agent-director call
@@ -561,15 +580,21 @@ function logRefusal(site: string, what: string, ref: string, described: string):
 // The latch (b.jg5 SRJ-501, SRJ-502)
 // ---------------------------------------------------------------------------
 
-/** What the session manager uses of the server's one latch (`src/conflict-latch.ts`). */
-export type SessionConflictLatch = Pick<ConflictLatch, 'isLatched' | 'record' | 'setFromConflict'>
+/**
+ * What the session manager uses of the server's one latch
+ * (`src/conflict-latch.ts`): `set` for a `provenance_conflict` note
+ * (`readPersonaOwnRow`), `setFromConflict` for a CONFLICT answer.
+ */
+export type SessionConflictLatch = Pick<ConflictLatch, 'isLatched' | 'record' | 'set' | 'setFromConflict'>
 
 /**
  * The installed latch. Production installs the server's one latch
  * (`createConflictLatch`, built in `main()`) before the start pass. With none
  * installed (unit tests, the integration driver) no persona is latched, so no
  * launch is held back, and a CONFLICT at a ladder spawn or resume still takes
- * the CONFLICT row's no-action path and answers `latched` (`conflictAt`).
+ * the CONFLICT row's no-action path and answers `latched` (`conflictAt`), as
+ * does a latching note at an own-row read (`readPersonaOwnRow`) when a
+ * configured-persona query counts the key.
  */
 let conflictLatch: SessionConflictLatch | undefined
 
@@ -730,6 +755,216 @@ async function launchRefusalAt(
   return (await conflictAt(key, err, operation, lastRead, what, ref)) ?? refusalAt(key, err, verb, 'spawnForPersona', what, ref)
 }
 
+// ---------------------------------------------------------------------------
+// Reads of a persona's own row (b.jg5 SRJ-114)
+// ---------------------------------------------------------------------------
+
+/** Whether a key is a persona of the applied configuration now. */
+export type ConfiguredPersonaQuery = (key: string) => boolean
+
+/**
+ * The installed configured-persona query. Production installs one in
+ * `main()` that reads the applied configuration at each call, so a persona an
+ * apply adds or removes counts, or stops counting, at once. With none
+ * installed (unit tests, the integration driver) no key counts as
+ * configured, so no note latches anyone (`readPersonaOwnRow`).
+ */
+let configuredPersonaQuery: ConfiguredPersonaQuery | undefined
+
+/** Install the configured-persona query (production: `main()`), or remove it with undefined. */
+export function setConfiguredPersonaQuery(query: ConfiguredPersonaQuery | undefined): void {
+  configuredPersonaQuery = query
+}
+
+/** Test-only seam: remove any installed configured-persona query. */
+export function _resetConfiguredPersonaQuery(): void {
+  configuredPersonaQuery = undefined
+}
+
+/** `readPersonaOwnRow` read the row: `latched` is true when this read latched the persona. */
+export const OWN_ROW_READ_ROW = 'row'
+/** `readPersonaOwnRow`'s `get` answered `ErrSpawnNotFound`: the row is absent. */
+export const OWN_ROW_READ_ABSENT = 'absent'
+/** `readPersonaOwnRow`'s `get` failed with any other error, carried unchanged. */
+export const OWN_ROW_READ_REFUSED = 'refused'
+
+/** What one read of a persona's own row answers (`readPersonaOwnRow`). */
+export type OwnRowRead =
+  | { readonly kind: typeof OWN_ROW_READ_ROW; readonly row: GetResult; readonly latched: boolean }
+  | { readonly kind: typeof OWN_ROW_READ_ABSENT }
+  | { readonly kind: typeof OWN_ROW_READ_REFUSED; readonly error: unknown }
+
+/** Who reads, for `readPersonaOwnRow`'s log lines: `[slack] <site>: <what> for <ref>: …`. */
+export interface OwnRowReadSite {
+  readonly site: string
+  readonly what: string
+  /** The persona's reference; `persona=<key>` when absent. */
+  readonly ref?: string
+}
+
+/**
+ * The one read of persona `key`'s own row (`cscb_<key>`) at SRJ-114's sites
+ * (b.jg5 SRJ-114): one `get` through `withOutageDetection`, then SRJ-114's
+ * rule (`decideOwnRowRead`, `src/row-read-rules.ts`). Answers:
+ *
+ *   - `row`, with `latched` true when this read latched the persona: the row
+ *     is `key`'s own, `key` is configured (the installed
+ *     `ConfiguredPersonaQuery`) and the row's `liveness_note` is exactly
+ *     `provenance_conflict`. The persona latches through the installed
+ *     latch's `set` with the case "conflicting labels", the refused operation
+ *     "P's bring-up", the row's state as this `get` read it, the session
+ *     `slack_bot_<key>` and no description (b.jg5 SRJ-501); the latch's set
+ *     observers stop its timers and post the CONFLICT notice once per
+ *     episode (b.jg5 SRJ-1004), and nothing else is posted here. The caller
+ *     then calls nothing more for the persona (b.jg5 SRJ-502). With no latch
+ *     installed, or a `set` that throws, nothing is latched and `latched` is
+ *     still true, as at the CONFLICT row (`conflictAt`). Every other note, an
+ *     unknown note, no note, or the latching note on a row that is not a
+ *     configured persona's own changes nothing (C14, C24);
+ *   - `absent` for `ErrSpawnNotFound` (recognised by name);
+ *   - `refused` for any other error, carried unchanged for the caller's
+ *     refusal handling (`refusalAt`, b.jg5 SRJ-105) or its own row.
+ *
+ * Log lines (no line carries a token: the note and the instance id are
+ * agent-director's text, rendered by `renderLogMessageText`):
+ *
+ *   [slack] <site>: <what> for <ref>: its row carries the liveness note provenance_conflict (state=<state>) — <outcome>; nothing more is called for it (b.jg5 SRJ-114, SRJ-501)
+ *   [slack] <site>: <what> for <ref>: its row carries the liveness note provenance_conflict, but <why> — the note is not applied (b.jg5 SRJ-114)
+ *   [slack] <site>: <what> for <ref>: its row carries the liveness note "<note>", which latches no one — going on (b.jg5 SRJ-114)
+ *
+ * where `<outcome>` is `the persona latched`, `the persona relatched`, `the
+ * persona was already latched with this case`, `no latch is installed, so
+ * nothing is latched` or `latching the persona failed: <error>`, and `<why>`
+ * is `no configured-persona query is installed`, `the configured-persona
+ * query failed: <error>`, `persona=<key> is not a persona of the applied
+ * configuration` or `the row is not the persona's own
+ * (claude_instance_id="<id>")`. A row with no note logs nothing. The
+ * "latches no one" line is logged once per note for a persona and again only
+ * when the note on its row changes (`nonLatchingNoteLogged`). Never throws.
+ */
+export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promise<OwnRowRead> {
+  let row: GetResult
+  try {
+    row = await withOutageDetection(key, undefined, 'get', (client) =>
+      client.get({ claude_instance_id: personaInstanceId(key) }),
+    )
+  } catch (err) {
+    return hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)
+      ? { kind: OWN_ROW_READ_ABSENT }
+      : { kind: OWN_ROW_READ_REFUSED, error: err }
+  }
+  try {
+    return { kind: OWN_ROW_READ_ROW, row, latched: applyOwnRowRules(key, row, at) }
+  } catch (err) {
+    // Not reached (every step below is guarded); a throw reads the row with no latch.
+    console.error(`${ownRowReadHead(key, at)}: applying the note rule failed: ${describeThrownValue(err)} (b.jg5 SRJ-114)`)
+    return { kind: OWN_ROW_READ_ROW, row, latched: false }
+  }
+}
+
+/** `[slack] <site>: <what> for <ref>`. */
+function ownRowReadHead(key: string, at: OwnRowReadSite): string {
+  return `[slack] ${at.site}: ${at.what} for ${at.ref ?? keyRef(key)}`
+}
+
+/**
+ * The last non-latching liveness note logged for each persona's own row
+ * (`applyOwnRowRules`): the "latches no one" line is logged once per note and
+ * again only when the note on the persona's row changes. A read of the row
+ * with no note or the latching note forgets it, so the note's return is
+ * logged again. Forgotten with the persona's not-connected episode
+ * (`forgetNotConnectedEpisode`, run when it is torn down) and by
+ * `_resetNotConnectedEpisodes`.
+ */
+const nonLatchingNoteLogged = new Map<string, string>()
+
+/**
+ * SRJ-114's rule on `row`, read for persona `key`: asks `decideOwnRowRead`
+ * for every row read, latches the persona on a latch decision, and otherwise
+ * logs the read's note line, if any (a non-latching note's line once per
+ * note, `nonLatchingNoteLogged`). True when the read latched the persona (or
+ * would have, with no latch installed or a `set` that threw). Never throws.
+ */
+function applyOwnRowRules(key: string, row: GetResult, at: OwnRowReadSite): boolean {
+  const configured = configuredReadingOf(key)
+  const decision = decideOwnRowRead({ key, row, configured: configured.configured })
+  const note: unknown = row.liveness_note
+  const hasNote = note !== undefined && note !== null && note !== ''
+  if (!hasNote || isLatchingLivenessNote(note)) nonLatchingNoteLogged.delete(key)
+  if (decision.latch !== undefined) {
+    const outcome = latchFromNote(key, decision.latch)
+    console.error(
+      `${ownRowReadHead(key, at)}: its row carries the liveness note ${LATCHING_LIVENESS_NOTE} (state=${describeLatchRowState(decision.latch.rowState)}) — ${outcome}; nothing more is called for it (b.jg5 SRJ-114, SRJ-501)`,
+    )
+    return true
+  }
+  if (!hasNote) return false
+  if (!isLatchingLivenessNote(note)) {
+    const noteText = String(note)
+    if (nonLatchingNoteLogged.get(key) !== noteText) {
+      nonLatchingNoteLogged.set(key, noteText)
+      console.error(
+        `${ownRowReadHead(key, at)}: its row carries the liveness note ${JSON.stringify(renderLogMessageText(note))}, which latches no one — going on (b.jg5 SRJ-114)`,
+      )
+    }
+    return false
+  }
+  const why = !isPersonaOwnRow(row, key)
+    ? `the row is not the persona's own (claude_instance_id=${JSON.stringify(renderLogMessageText(row.claude_instance_id))})`
+    : configured.why
+  console.error(
+    `${ownRowReadHead(key, at)}: its row carries the liveness note ${LATCHING_LIVENESS_NOTE}, but ${why} — the note is not applied (b.jg5 SRJ-114)`,
+  )
+  return false
+}
+
+/**
+ * Whether persona `key` counts as configured for SRJ-114's rule, and, when
+ * it does not, why (for the not-applied line). No query installed, or one
+ * that throws, counts as not configured. Never throws.
+ */
+function configuredReadingOf(key: string): { configured: boolean; why: string } {
+  const query = configuredPersonaQuery
+  if (query === undefined) return { configured: false, why: 'no configured-persona query is installed' }
+  try {
+    return query(key) === true
+      ? { configured: true, why: '' }
+      : { configured: false, why: `${keyRef(key)} is not a persona of the applied configuration` }
+  } catch (err) {
+    return { configured: false, why: `the configured-persona query failed: ${describeThrownValue(err)}` }
+  }
+}
+
+/** The latch line's outcome text for each set outcome. */
+const NOTE_LATCH_OUTCOME_TEXT: Readonly<Record<ConflictLatchSetOutcome, string>> = Object.freeze({
+  [CONFLICT_LATCH_SET_LATCHED]: 'the persona latched',
+  [CONFLICT_LATCH_SET_RELATCHED]: 'the persona relatched',
+  [CONFLICT_LATCH_SET_SAME_CASE]: 'the persona was already latched with this case',
+})
+
+/**
+ * Latch persona `key` from a note (b.jg5 SRJ-501): the installed latch's
+ * `set` with `decision`'s case, refused operation and row state, the session
+ * `slack_bot_<key>` and no description, so its CONFLICT notice has no
+ * "agent-director said" line (b.jg5 SRJ-1004). Answers the latch line's
+ * outcome text. Never throws.
+ */
+function latchFromNote(key: string, decision: RowReadLatchDecision): string {
+  const latch = conflictLatch
+  if (latch === undefined) return 'no latch is installed, so nothing is latched'
+  try {
+    const outcome = latch.set(key, {
+      latchCase: decision.latchCase,
+      refusedOperation: decision.refusedOperation,
+      rowState: decision.rowState,
+      sessionName: personaTmuxSessionName(key),
+    })
+    return NOTE_LATCH_OUTCOME_TEXT[outcome] ?? 'the persona latched'
+  } catch (err) {
+    return `latching the persona failed: ${describeThrownValue(err)}`
+  }
+}
+
 /**
  * True when `err` is `ErrSystemInstallDisappeared`, recognised by name
  * through `src/ad-error-class.ts`. The launch wait's two status reads (the
@@ -823,23 +1058,26 @@ export function notifyDisconnectedWithAutoRestartDisabled(key: string, cause: Un
  * torn down. Its notice latch is cleared, so a later episode is reported
  * again, and so are the idle evidence the restart path gathered for its
  * `working` row (`checkWorkingRowPane`), its run of deferrals on that row
- * (`noteWorkingRowDeferral`) and its run of deferrals on a row waiting on a
- * prompt (`checkPromptRowDeferral`, b.jdc). Silent; other personas are
- * untouched.
+ * (`noteWorkingRowDeferral`), its run of deferrals on a row waiting on a
+ * prompt (`checkPromptRowDeferral`, b.jdc) and the last non-latching
+ * liveness note logged for its own row (`nonLatchingNoteLogged`, b.jg5
+ * SRJ-114). Silent; other personas are untouched.
  */
 export function forgetNotConnectedEpisode(key: string): void {
   notConnectedNoticeRaised.delete(key)
   workingRowPaneRuns.delete(key)
   workingRowDeferredSince.delete(key)
   promptRowDeferredSince.delete(key)
+  nonLatchingNoteLogged.delete(key)
 }
 
-/** Test-only seam: end every persona's not-connected episode (notice latches, idle evidence and deferral runs). */
+/** Test-only seam: end every persona's not-connected episode (notice latches, idle evidence, deferral runs and logged liveness notes). */
 export function _resetNotConnectedEpisodes(): void {
   notConnectedNoticeRaised.clear()
   workingRowPaneRuns.clear()
   workingRowDeferredSince.clear()
   promptRowDeferredSince.clear()
+  nonLatchingNoteLogged.clear()
 }
 
 /**
@@ -1051,9 +1289,16 @@ export type ReconnectOutcome = 'ok' | 'failed' | 'dead-session'
  * or the timeout found it still live), and has logged what happens next for
  * the restart delay in effect (`reportWaitEndedDisconnected`); or `cancelled`:
  * the persona's teardown cancelled the wait (`cancelWorkingRowWait`), and
- * nothing was typed.
+ * nothing was typed; or `latched`: the persona is latched after one of the
+ * wait's agent-director calls (b.jg5 SRJ-502: a note its transcript `get`
+ * read, or a latch set elsewhere), the wait called nothing more, typed
+ * nothing and raised no not-connected notice, and the ladder answers
+ * `latched`.
  */
-export type WaitReconnectOutcome = ReconnectOutcome | 'not-reconnected' | 'cancelled'
+export type WaitReconnectOutcome = ReconnectOutcome | 'not-reconnected' | 'cancelled' | typeof WAIT_OUTCOME_LATCHED
+
+/** The wait's outcome for a persona that is latched (`WaitReconnectOutcome`). */
+export const WAIT_OUTCOME_LATCHED = 'latched'
 
 /**
  * Send `/mcp reconnect <MCP_SERVER_NAME>` to the spawn's pane. Library's
@@ -1773,24 +2018,49 @@ export function foldWorkingPaneRun(
 
 /** One evidence read of a `working` row (b.f2b). */
 interface WorkingRowRead {
-  /** The pane; undefined when the read failed. */
+  /** The pane; undefined when the read failed, or when the persona latched. */
   pane: string | undefined
   /** Why the pane read failed (`describeAgentDirectorFailure`, token-safe); set only then. */
   paneFailure?: string
   /** The session's transcript, read only when the pane shows an idle screen. */
   transcript?: TranscriptReading
+  /**
+   * b.jg5 SRJ-502: the persona is latched after one of the read's
+   * agent-director calls (its transcript `get` latched it, or it was latched
+   * elsewhere). No evidence: the caller calls nothing more and types nothing.
+   */
+  latched?: true
+}
+
+/** The evidence read of a persona that is latched (`WorkingRowRead.latched`). */
+const WORKING_ROW_READ_LATCHED: WorkingRowRead = Object.freeze({ pane: undefined, latched: true })
+
+/**
+ * True when persona `key` is latched now, by the installed latch (b.jg5
+ * SRJ-502): a latched query that throws, or a latched persona whose record
+ * cannot be read, counts as latched (`latchGateReadingOf`). False with no
+ * latch installed. Logs nothing; never throws.
+ */
+function personaLatchedNow(key: string): boolean {
+  return latchGateReadingOf(key) !== undefined
 }
 
 /**
  * Read persona `key`'s pane and, only when it shows an idle screen, its
- * transcript (`readPersonaTranscript`), for one evidence read (b.f2b). Never
- * throws.
+ * transcript (`readPersonaTranscript`), for one evidence read (b.f2b). After
+ * each of the two reads it asks whether the persona is latched
+ * (`personaLatchedNow`, or a transcript read that latched it), and then
+ * answers `WORKING_ROW_READ_LATCHED` with nothing more read (b.jg5 SRJ-502).
+ * Never throws.
  */
 async function readWorkingRowEvidence(key: string, configDir: string | undefined): Promise<WorkingRowRead> {
   const read = await readWorkingPane(key)
+  if (personaLatchedNow(key)) return WORKING_ROW_READ_LATCHED
   if ('failure' in read) return { pane: undefined, paneFailure: read.failure }
   if (classifyWorkingPane(read.pane) !== 'idle') return { pane: read.pane }
-  return { pane: read.pane, transcript: await readPersonaTranscript(key, configDir) }
+  const transcript = await readPersonaTranscript(key, configDir)
+  if (transcript.kind === PERSONA_TRANSCRIPT_LATCHED || personaLatchedNow(key)) return WORKING_ROW_READ_LATCHED
+  return { pane: read.pane, transcript }
 }
 
 /**
@@ -1817,23 +2087,31 @@ function transcriptConfigDir(persona: Pick<Persona, 'claude_config_dir'> | undef
   return persona === undefined ? undefined : resolveClaudeConfigDir(persona.claude_config_dir, spawnHomeDir())
 }
 
+/** `readPersonaTranscript`'s answer when its `get` latched the persona (b.jg5 SRJ-114). */
+const PERSONA_TRANSCRIPT_LATCHED = 'latched'
+
+/** What `readPersonaTranscript` answers: a transcript reading, or that its `get` latched the persona. */
+type PersonaTranscriptRead = TranscriptReading | { kind: typeof PERSONA_TRANSCRIPT_LATCHED }
+
 /**
  * Read persona `key`'s transcript for idle evidence (b.f2b): fetch its
- * agent-director row (`get`, through `withOutageDetection`), locate the
- * transcript of the row's session (`locateTranscript`: the persisted
- * `jsonl_path`, else the path composed under `configDir`) and read its turn
- * state (`readTranscriptTurnState`). A failed `get`, a row that names no
- * transcript, or a file that can't be read is `unreadable`, with a
+ * agent-director row through the shared own-row read (`readPersonaOwnRow`,
+ * one `get`, b.jg5 SRJ-114), locate the transcript of the row's session
+ * (`locateTranscript`: the persisted `jsonl_path`, else the path composed
+ * under `configDir`) and read its turn state (`readTranscriptTurnState`). A
+ * `get` that latched the persona answers `latched`, and nothing more is read:
+ * no evidence. An absent row (`ErrSpawnNotFound`), a failed `get`, a row that
+ * names no transcript, or a file that can't be read is `unreadable`, with a
  * token-safe reason: no evidence. Never throws.
  */
-async function readPersonaTranscript(key: string, configDir: string | undefined): Promise<TranscriptReading> {
-  let row: GetResult
-  try {
-    row = await withOutageDetection(key, undefined, 'get', (client) =>
-      client.get({ claude_instance_id: personaInstanceId(key) }))
-  } catch (err) {
-    return { kind: 'unreadable', reason: `reading its agent-director row failed: ${describeAgentDirectorFailure(err)}` }
+async function readPersonaTranscript(key: string, configDir: string | undefined): Promise<PersonaTranscriptRead> {
+  const read = await readPersonaOwnRow(key, { site: 'readPersonaTranscript', what: 'transcript get' })
+  if (read.kind === OWN_ROW_READ_ABSENT) return { kind: 'unreadable', reason: 'its agent-director row is absent (ErrSpawnNotFound)' }
+  if (read.kind === OWN_ROW_READ_REFUSED) {
+    return { kind: 'unreadable', reason: `reading its agent-director row failed: ${describeAgentDirectorFailure(read.error)}` }
   }
+  if (read.latched) return { kind: PERSONA_TRANSCRIPT_LATCHED }
+  const { row } = read
   const path = locateTranscript(row, configDir)
   if (path === undefined) return { kind: 'unreadable', reason: 'its agent-director row names no transcript for its session' }
   const reading = readTranscriptTurnState(path)
@@ -1876,17 +2154,21 @@ interface WorkingPaneWatch {
  * into it. A failed pane read or an idle pane whose transcript gives no
  * evidence ends the run; the wait's first pane failure and each new
  * transcript reason are logged, and the wait goes on as before.
+ * `latched` when the persona is latched after the read's pane or transcript
+ * read (b.jg5 SRJ-502, `WorkingRowRead.latched`): nothing is logged,
+ * folded or reported, and the wait ends.
  */
 async function staleWorkingRowIsIdle(
   key: string,
   ref: string,
   config: PersonaConfig,
   watch: WorkingPaneWatch,
-): Promise<boolean> {
+): Promise<boolean | typeof WAIT_OUTCOME_LATCHED> {
   const due = _now()
   if (watch.lastReadAt !== undefined && due - watch.lastReadAt < _workingRowReadIntervalMs) return false
   watch.lastReadAt = due
   const read = await readWorkingRowEvidence(key, transcriptConfigDir(config.personas.find((p) => p.key === key)))
+  if (read.latched) return WAIT_OUTCOME_LATCHED
   if (read.paneFailure !== undefined && !watch.readFailureLogged) {
     watch.readFailureLogged = true
     console.error(
@@ -2004,6 +2286,10 @@ export type WorkingRowPaneVerdict = 'reconnect' | 'defer'
  * per episode), so a row whose idleness can never be proven is not held back
  * from silently. `reconnect` ends the run. A live turn never ends its
  * transcript with a completed turn, so it is never taken for idle (b.rmy).
+ * A persona latched during the evidence read (its transcript `get` read a
+ * `provenance_conflict` note, b.jg5 SRJ-114, or it was latched elsewhere)
+ * answers `defer` with its run forgotten, no deferral noted and no
+ * not-connected notice (b.jg5 SRJ-502).
  * Logs one line per call; never throws.
  */
 export async function checkWorkingRowPane(
@@ -2011,6 +2297,9 @@ export async function checkWorkingRowPane(
   persona?: Pick<Persona, 'claude_config_dir'>,
 ): Promise<WorkingRowPaneVerdict> {
   const verdict = await workingRowPaneVerdict(key, persona)
+  // b.jg5 SRJ-502: a persona latched during the evidence read is deferred
+  // with no deferral noted, so no not-connected notice is raised for it.
+  if (verdict === WAIT_OUTCOME_LATCHED) return 'defer'
   if (verdict === 'reconnect') {
     endWorkingRowDeferral(key)
   } else {
@@ -2020,13 +2309,24 @@ export async function checkWorkingRowPane(
   return verdict
 }
 
-/** `checkWorkingRowPane`'s evidence read and verdict, before its deferral is noted (b.f2b). */
+/**
+ * `checkWorkingRowPane`'s evidence read and verdict, before its deferral is
+ * noted (b.f2b); `latched` for a persona latched during the read (b.jg5
+ * SRJ-502): its run is forgotten and one line is logged.
+ */
 async function workingRowPaneVerdict(
   key: string,
   persona: Pick<Persona, 'claude_config_dir'> | undefined,
-): Promise<WorkingRowPaneVerdict> {
+): Promise<WorkingRowPaneVerdict | typeof WAIT_OUTCOME_LATCHED> {
   const ref = keyRef(key)
   const read = await readWorkingRowEvidence(key, transcriptConfigDir(persona))
+  if (read.latched) {
+    workingRowPaneRuns.delete(key)
+    console.error(
+      `[slack] reconnectSession: ${ref} is working and is latched — deferring; no deferral noted, nothing typed (b.jg5 SRJ-502)`,
+    )
+    return WAIT_OUTCOME_LATCHED
+  }
   if (read.pane === undefined) {
     workingRowPaneRuns.delete(key)
     console.error(
@@ -2217,6 +2517,28 @@ function sleepUnlessCancelled(wait: WorkingRowWait, ms: number): Promise<void> {
 function waitCancelled(ref: string): 'cancelled' {
   console.error(`[slack] waitForWaitingAndReconnect: the wait for ${ref} was cancelled (its persona is being torn down) — nothing typed (b.f2b)`)
   return 'cancelled'
+}
+
+/** The wait's outcome once its persona is latched (b.jg5 SRJ-502): logged, nothing more called, nothing typed. */
+function waitLatched(ref: string): typeof WAIT_OUTCOME_LATCHED {
+  console.error(
+    `[slack] waitForWaitingAndReconnect: ${ref} is latched — the wait ends; nothing more is called and nothing is typed (b.jg5 SRJ-502)`,
+  )
+  return WAIT_OUTCOME_LATCHED
+}
+
+/**
+ * Whether the wait must end now: its teardown cancelled it, or its persona
+ * `key` is latched (`personaLatchedNow`, b.jg5 SRJ-502). Asked after each
+ * agent-director call the wait makes. Never throws.
+ */
+function waitMustEnd(key: string, wait: WorkingRowWait): boolean {
+  return wait.cancelled || personaLatchedNow(key)
+}
+
+/** The ending outcome for a wait `waitMustEnd` answered true for: `cancelled` first, else `latched`. */
+function endWait(ref: string, wait: WorkingRowWait): 'cancelled' | typeof WAIT_OUTCOME_LATCHED {
+  return wait.cancelled ? waitCancelled(ref) : waitLatched(ref)
 }
 
 /** A wait's length for a notice: whole minutes from one minute up, else seconds. */
@@ -2810,6 +3132,13 @@ async function tmuxFallbackVerdict(
  * checks after each agent-director call and wakes from its poll sleep at
  * once, types nothing once cancelled, and returns 'cancelled'.
  *
+ * b.jg5 SRJ-502 — the wait asks whether its persona is latched at the same
+ * points, after each agent-director call it makes (its `find-missing` runs,
+ * `status` polls, pane reads and transcript `get`s): a latch its transcript
+ * `get` set (a `provenance_conflict` note, b.jg5 SRJ-114) or one set
+ * elsewhere ends it with 'latched', one line, no further call, nothing typed
+ * and no not-connected notice. A cancelled wait still answers 'cancelled'.
+ *
  * b.ecw — which object each terminal branch keys on. AD probes the claude
  * PROCESS; CSCB's `_hasTmuxSession` probes the TMUX SESSION. A lingering tmux
  * shell with a dead claude process would flip the two verdicts, so the choice
@@ -2886,8 +3215,8 @@ async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait): 
  * meanwhile, otherwise 'failed' with the refusal noted on `wait`. No status
  * read, reconnect or 'dead-session' verdict follows.
  */
-function refusedWaitSweep(ref: string, wait: WorkingRowWait): WaitReconnectOutcome {
-  if (wait.cancelled) return waitCancelled(ref)
+function refusedWaitSweep(key: string, ref: string, wait: WorkingRowWait): WaitReconnectOutcome {
+  if (waitMustEnd(key, wait)) return endWait(ref, wait)
   wait.refused = true
   return 'failed'
 }
@@ -2929,20 +3258,20 @@ async function waitForWorkingRow(
   // error, log and fall through to the existing poll loop (today's
   // behavior), except a refused sweep (b.jg5 SRJ-105): nothing more is
   // called, and the wait answers 'failed' as for a refused status read.
-  if (wait.cancelled) return waitCancelled(ref)
+  if (waitMustEnd(key, wait)) return endWait(ref, wait)
   if ((await reconcileMissingSweep(key, 'waitForWaitingAndReconnect', ref)) === FIND_MISSING_REFUSED) {
-    return refusedWaitSweep(ref, wait)
+    return refusedWaitSweep(key, ref, wait)
   }
 
   while (_now() < deadline) {
-    if (wait.cancelled) return waitCancelled(ref)
+    if (waitMustEnd(key, wait)) return endWait(ref, wait)
     let state: string
     try {
       const r = await withOutageDetection(key, undefined, 'status', (client) => client.status({ claude_instance_id }))
       state = r.state
       wait.lastRead = latchRowStateRead(state)
     } catch (err) {
-      if (wait.cancelled) return waitCancelled(ref)
+      if (waitMustEnd(key, wait)) return endWait(ref, wait)
       if (err instanceof ErrSpawnNotFound) {
         wait.lastRead = LATCH_ROW_STATE_NO_ROW
         // b.c3o: spawn-not-found means the AD row is gone — same class as
@@ -2977,7 +3306,7 @@ async function waitForWorkingRow(
       notifySpawnFailure(key, e)
       return 'failed'
     }
-    if (wait.cancelled) return waitCancelled(ref)
+    if (waitMustEnd(key, wait)) return endWait(ref, wait)
     // b.f2b: a run of deferrals on the `working` row ends with any other state.
     if (state !== 'working') endWorkingRowDeferral(key)
 
@@ -2990,7 +3319,8 @@ async function waitForWorkingRow(
       // (the same idle screen and the same ended, unchanged transcript) — is
       // reconnected like a `waiting` one.
       const stale = await staleWorkingRowIsIdle(key, ref, config, paneWatch)
-      if (wait.cancelled) return waitCancelled(ref)
+      if (stale === WAIT_OUTCOME_LATCHED) return endWait(ref, wait)
+      if (waitMustEnd(key, wait)) return endWait(ref, wait)
       if (stale) {
         endWorkingRowDeferral(key)
         return reconnectInWait(key, ref, wait)
@@ -3047,18 +3377,18 @@ async function waitForWorkingRow(
   //   UNUSABLE NAME answer still falls back to the raw tmux probe, which
   //   gives 'dead-session' only for a gone session.
   // - a refused sweep → 'failed' with no status read (b.jg5 SRJ-105).
-  if (wait.cancelled) return waitCancelled(ref)
+  if (waitMustEnd(key, wait)) return endWait(ref, wait)
   if ((await reconcileMissingSweep(key, 'waitForWaitingAndReconnect: timeout', ref)) === FIND_MISSING_REFUSED) {
-    return refusedWaitSweep(ref, wait)
+    return refusedWaitSweep(key, ref, wait)
   }
-  if (wait.cancelled) return waitCancelled(ref)
+  if (waitMustEnd(key, wait)) return endWait(ref, wait)
   let timeoutState: string
   try {
     const r = await withOutageDetection(key, undefined, 'status', (client) => client.status({ claude_instance_id }))
     timeoutState = r.state
     wait.lastRead = latchRowStateRead(timeoutState)
   } catch (err) {
-    if (wait.cancelled) return waitCancelled(ref)
+    if (waitMustEnd(key, wait)) return endWait(ref, wait)
     if (err instanceof ErrSpawnNotFound) {
       wait.lastRead = LATCH_ROW_STATE_NO_ROW
       return tmuxFallbackVerdict(key, config, ref, 'spawn not found')
@@ -3080,7 +3410,7 @@ async function waitForWorkingRow(
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('status', 'UnknownError', String(err))
     return tmuxFallbackVerdict(key, config, ref, `status error ${describeAgentDirectorFailure(e)}`)
   }
-  if (wait.cancelled) return waitCancelled(ref)
+  if (waitMustEnd(key, wait)) return endWait(ref, wait)
 
   if (timeoutState !== 'working') endWorkingRowDeferral(key)
   if (timeoutState === 'ended' || timeoutState === 'missing') {
@@ -3658,12 +3988,18 @@ function localStatNote(path: string): string {
  * MUST be called BEFORE tryDelete so the row's jsonl_path / session id / cwd /
  * started_at are still available. Never throws.
  *
- * b.jg5 SRJ-105/SRJ-114: the row `get` is a read site. When it fails with a
- * refusal (`refusalAt` with verb `get`: any error but `ErrSpawnNotFound` and
- * an UNUSABLE NAME answer, a CONFIG answer included, b.jg5 SRJ-316), the
- * diagnosis answers the
- * refusal result instead of a verdict: no inconclusive notice, no startup
- * entry, and the caller must delete nothing and launch nothing.
+ * b.jg5 SRJ-105/SRJ-114: the row `get` is one of SRJ-114's sites, made
+ * through the shared own-row read (`readPersonaOwnRow`). No diagnosis is
+ * reported (no startup-errors entry, no persona notice, no amnesia count)
+ * when it latched the persona (a `provenance_conflict` note on its own row):
+ * the diagnosis answers `latched`, and the caller deletes and launches
+ * nothing (b.jg5 SRJ-502). Nor when it failed with a refusal (`refusalAt`
+ * with verb `get`: any error but `ErrSpawnNotFound` and an UNUSABLE NAME
+ * answer, a CONFIG answer included, b.jg5 SRJ-316): the diagnosis answers
+ * the refusal result, and the caller deletes nothing and launches nothing
+ * (SRJ-105). `ErrSpawnNotFound` (the row is absent) gives 'inconclusive',
+ * its reason saying the row is absent; an UNUSABLE NAME answer keeps its
+ * earlier handling, 'inconclusive' with the fetch failure as its reason.
  *
  * @returns 'lost' when the row had provable prior activity but no transcript
  *          survives (loud), 'never-created' when the archive was consulted and
@@ -3671,7 +4007,8 @@ function localStatNote(path: string): string {
  *          'inconclusive' when we could not gather enough evidence to decide
  *          either way (loud-but-uncertain — the diagnosis machinery itself is
  *          degraded, which correlates with the storage faults that cause loss),
- *          or a `RefusedSiteResult` when the row `get` was refused.
+ *          or the ladder's result (`failed` or `latched`) when the row `get`
+ *          failed or latched the persona.
  */
 async function diagnoseJsonlMissing(
   persona: Persona,
@@ -3679,7 +4016,7 @@ async function diagnoseJsonlMissing(
   err: ErrJsonlMissing,
   isStartup: boolean,
   read: { lastRead?: LatchRowState },
-): Promise<'lost' | 'never-created' | 'inconclusive' | RefusedSiteResult> {
+): Promise<'lost' | 'never-created' | 'inconclusive' | RefusedSiteResult | LatchedSiteResult> {
   const { key } = persona
   const ref = personaRef(persona)
   // --- 1. What paths did AD try, and from where? -------------------------
@@ -3692,37 +4029,40 @@ async function diagnoseJsonlMissing(
   // b.jg5 SRJ-501: this get is the path's last read of the row before the
   // spawn that follows the delete, so `read.lastRead` records what it gave.
   const claudeInstanceId = personaInstanceId(key)
-  let row: GetResult | undefined
-  try {
-    row = await withOutageDetection(key, undefined, 'get', (client) =>
-      client.get({ claude_instance_id: claudeInstanceId }),
-    )
-    read.lastRead = latchRowStateRead(row.state)
-  } catch (getErr) {
-    // b.jg5 SRJ-105/SRJ-114: a read error on this get is a refusal (the get
-    // runs inside the launch attempt, so it arms the retry timer; `get` is
-    // not tmux-touching, so it starts no condition). No inconclusive notice,
-    // no startup entry; the caller deletes nothing and launches nothing.
-    const refused = refusalAt(key, getErr, 'get', 'spawnForPersona', 'ErrJsonlMissing diagnosis get', ref)
-    if (refused) return refused
-    read.lastRead = hasAdErrorName(getErr, ERR_SPAWN_NOT_FOUND_NAME) ? LATCH_ROW_STATE_NO_ROW : LATCH_ROW_STATE_UNREADABLE
+  const what = 'ErrJsonlMissing diagnosis get'
+  const ownRead = await readPersonaOwnRow(key, { site: 'spawnForPersona', what, ref })
+  if (ownRead.kind !== OWN_ROW_READ_ROW) {
+    let why: string
+    if (ownRead.kind === OWN_ROW_READ_REFUSED) {
+      // b.jg5 SRJ-105/SRJ-114: a read error on this get is a refusal (the get
+      // runs inside the launch attempt, so it arms the retry timer; `get` is
+      // not tmux-touching, so it starts no condition). No diagnosis is
+      // reported; the caller deletes nothing and launches nothing.
+      const refused = refusalAt(key, ownRead.error, 'get', 'spawnForPersona', what, ref)
+      if (refused) return refused
+      // An UNUSABLE NAME answer, which is no refusal, keeps its earlier
+      // handling (the inconclusive diagnosis) until its own row is built.
+      read.lastRead = LATCH_ROW_STATE_UNREADABLE
+      why = `could not fetch the agent-director row (${describeAgentDirectorFailure(ownRead.error)})`
+    } else {
+      read.lastRead = LATCH_ROW_STATE_NO_ROW
+      why = 'the agent-director row is absent (ErrSpawnNotFound)'
+    }
     // (a) Row already gone (ErrSpawnNotFound), or an UNUSABLE NAME answer —
-    // cannot enrich or classify. Inconclusive: we could not consult
-    // the row at all, so we do NOT know whether history was lost. Report it
-    // as uncertainty, not reassurance.
+    // cannot enrich or classify. Inconclusive: we could not consult the row
+    // at all, so we do NOT know whether history was lost. Report it as
+    // uncertainty, not reassurance.
     const adDetail = adCandidates.length
       ? adCandidates.map((c) => `${c.source} ${c.path} (${c.note})`).join('; ')
       : redactSlackLogText(err.errDescription || '(no path detail from agent-director)')
-    reportInconclusiveDiagnosis(
-      key,
-      ref,
-      claudeInstanceId,
-      `could not fetch the agent-director row (${describeAgentDirectorFailure(getErr)}); AD reported: ${adDetail}`,
-      isStartup,
-      err,
-    )
+    reportInconclusiveDiagnosis(key, ref, claudeInstanceId, `${why}; AD reported: ${adDetail}`, isStartup, err)
     return 'inconclusive'
   }
+  const row = ownRead.row
+  read.lastRead = latchRowStateRead(row.state)
+  // b.jg5 SRJ-502: a persona this read latched is not started fresh, so the
+  // diagnosis, whose texts say it is, is not reported either.
+  if (ownRead.latched) return { key, action: 'latched' }
 
   // --- 3. Assemble the candidate list to log. ----------------------------
   // The persona's effective claude_config_dir (per-persona, else top-level);
@@ -4044,7 +4384,8 @@ async function resumeOrFreshSpawn(
       // made operator-visible inside diagnoseJsonlMissing itself.
       // b.jg5 SRJ-105/SRJ-114: a refused diagnosis get stops the chain: no
       // delete, no launch; the ladder answers failed and markRefusal adds
-      // `refused`.
+      // `refused`. A diagnosis get that latched the persona stops it too, and
+      // the ladder answers latched (b.jg5 SRJ-502).
       let jsonlDiagnosis: 'lost' | 'never-created' | 'inconclusive' | undefined
       // b.jg5 SRJ-501: the diagnosis `get`, when made, is the last read before the spawn below.
       const diagnosisRead: { lastRead?: LatchRowState } = {}
@@ -4359,7 +4700,16 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    guard (b.av2 SR-9.4); the optimistic spawn undoes its reply-guard steps
  *    on `ErrInstanceIdCollision`: the record and launched-with dir are
  *    restored while still its own, and the hook is re-evaluated.
- * 5. `ErrInstanceIdCollision` → `client.get(...)`, then:
+ * 5. `ErrInstanceIdCollision` → `client.get(...)`, the shared own-row read
+ *    (`readPersonaOwnRow`, b.jg5 SRJ-114), then:
+ *    - the note check comes first, before the guards and the state branches:
+ *      a read that latched the persona (its own row carries the
+ *      `provenance_conflict` note and it is configured) answers `latched` at
+ *      once, whatever the row's state, `cwd` or `config_dir` label: no kill,
+ *      delete, wait, sweep, reconnect or launch, no notice, nothing counted
+ *      (b.jg5 SRJ-501, SRJ-502). Any other note, or none, goes on below.
+ *      `ErrSpawnNotFound` retries the plain spawn once; any other error takes
+ *      the refusal row (`refusalAt`);
  *    - the row's `cwd` differs from the persona's working_directory by real
  *      path (`compareRowToPersona`) → kill + delete + fresh spawn, whatever
  *      the state and resume_enabled (b.av2 SR-6.2). When the working directory
@@ -4561,11 +4911,14 @@ async function runPersonaLadder(
   }
 
   // Collision-handling: get-then-act ---
-  let row: GetResult
-  try {
-    row = await withOutageDetection(key, undefined, 'get', (client) => client.get({ claude_instance_id: personaInstanceId(key) }))
-  } catch (err) {
-    if (err instanceof ErrSpawnNotFound) {
+  // b.jg5 SRJ-114: the collision `get` is the shared own-row read. A read
+  // that latched the persona (a `provenance_conflict` note on its own row)
+  // ends the ladder here, before the `cwd` and `config_dir` guards and the
+  // state branches: no kill, delete, wait, sweep, reconnect or launch, no
+  // notice, nothing counted (b.jg5 SRJ-501, SRJ-502).
+  const collisionRead = await readPersonaOwnRow(key, { site: 'spawnForPersona', what: 'collision get', ref })
+  if (collisionRead.kind !== OWN_ROW_READ_ROW) {
+    if (collisionRead.kind === OWN_ROW_READ_ABSENT) {
       // Race: row deleted between spawn-collision and get. Retry spawn once.
       console.error(`[slack] spawnForPersona: ErrSpawnNotFound after collision for ${ref} — retrying spawn (single retry)`)
       try {
@@ -4590,6 +4943,7 @@ async function runPersonaLadder(
     // b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: a read error is a refusal,
     // an ENVIRONMENT, a CONFIG and an UNCLASSIFIED answer
     // (`ErrSystemInstallDisappeared` too) included.
+    const err = collisionRead.error
     const refused = refusalAt(key, err, 'get', 'spawnForPersona', 'collision get', ref)
     if (refused) return refused
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('get', 'UnknownError', String(err))
@@ -4597,6 +4951,8 @@ async function runPersonaLadder(
     notifySpawnFailure(key, e, isStartup)
     return { key, action: 'failed' }
   }
+  if (collisionRead.latched) return { key, action: 'latched' }
+  const { row } = collisionRead
 
   const { state } = row
   console.error(`[slack] spawnForPersona: collision resolved, state=${state} for ${ref}`)
@@ -4676,6 +5032,9 @@ async function runPersonaLadder(
     // caller (the start pass lets the launch go on in the background).
     hooks?.onWorkingRowWait?.()
     const { outcome, refused, lastRead: waitRead } = await waitForWaitingAndReconnectWithCause(key, config, ref)
+    // b.jg5 SRJ-502: the persona latched during the wait (a note its
+    // transcript `get` read, or a latch set elsewhere): nothing more for it.
+    if (outcome === WAIT_OUTCOME_LATCHED) return { key, action: 'latched' }
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForPersona: dead session for ${ref} (state=working) — recovering via resume/fresh-spawn`)
       return resumeOrFreshSpawn(persona, params, config, isStartup, row, {

@@ -68,6 +68,11 @@
  *     `src/ad-description-phrases.ts`; the Phase 1 result fields
  *     (`kill_sent`, `launch_started_at`, `liveness_note`, `pre_trust`) are
  *     typed by `src/ad-phase1-types.ts`, never imported from `agent-director`.
+ *   - Liveness notes (b.jg5 SRJ-114): `provenanceNote` is the only note that
+ *     latches; `nonLatchingNotes` is every other note agent-director names,
+ *     the list a `test.each` iterates for "no other note latches", typed as
+ *     the 0.10.0 client's free text; `unknownNote` is a note CSCB does not
+ *     know. Tests take note values from here and never type them.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -293,19 +298,46 @@ export const SAMPLE_LAUNCH_STARTS: Readonly<Record<'fractional' | 'whole' | 'non
 }
 
 /**
+ * A `liveness_note` as the 0.10.0 client types it: free text, since
+ * agent-director has notes CSCB does not tell apart.
+ */
+type ClientLivenessNote = NonNullable<Phase1GetResult['liveness_note']>
+
+/**
  * The `liveness_note` that latches a persona with the CONFLICT case
- * "conflicting labels" (b.jg5 SRJ-507). Set it on a `get` or `list` row with
+ * "conflicting labels" (b.jg5 SRJ-114, SRJ-501, SRJ-507), and the only note
+ * that latches. Set it on a `get` or `list` row with
  * `cannedGetResult({ ..., liveness_note: provenanceNote })` or
- * `cannedListRow(...)`.
+ * `cannedListRow(...)`. It is the stub's own spelling of agent-director's
+ * wire value, not a re-export of `src/`'s constant, so a misspelt constant
+ * fails a test.
  */
 export const provenanceNote: LivenessNote = 'provenance_conflict'
 
-/** The `liveness_note` values CSCB knows that must never latch a persona. */
-export const nonLatchingNotes: readonly LivenessNote[] = [
+/**
+ * Every `liveness_note` agent-director names besides `provenanceNote`, as
+ * HO rev 22 spells them; none ever latches a persona (b.jg5 SRJ-114:
+ * `tmux_server_changed`, `process_not_seen_*`, `probe_eacces`,
+ * `tmux_session_name_*`). This is the list a `test.each` iterates for "no
+ * other note latches". Neither `provenanceNote` nor `unknownNote` is in it.
+ */
+export const nonLatchingNotes: readonly ClientLivenessNote[] = [
   'tmux_server_changed',
   'process_not_seen_session_present',
+  'process_not_seen_tmux_unchecked',
+  'probe_eacces',
+  'tmux_session_name_empty',
+  'tmux_session_name_control_char',
   'tmux_session_name_rewritten',
 ]
+
+/**
+ * A `liveness_note` agent-director might send that CSCB does not know, for
+ * the "an unknown note latches no one" cases (b.jg5 SRJ-114). It starts with
+ * `provenanceNote`'s spelling, so a prefix match of the latching note (in
+ * place of exact equality) latches on it and fails the case.
+ */
+export const unknownNote: ClientLivenessNote = `${provenanceNote}_cleared`
 
 /**
  * The Phase 1 row fields `cannedGetResult` and `cannedListRow` take as
