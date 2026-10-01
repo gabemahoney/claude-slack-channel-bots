@@ -20,6 +20,14 @@
  * clear of the persona's `tmux-unavailable` outage (b.jg5 SRJ-312), with the
  * `live` reading passed on to the cleared-flag observer; the liveness read
  * itself never clears it.
+ * A persona with a restart pending or active, or at the cap, is skipped
+ * before any read. A persona with a no-attempt reason (`noAttemptReason`:
+ * work in flight for it, or its `tmux-unavailable` outage raised; b.jg5
+ * SRJ-315, SRJ-311) is still read: the working-directory check runs, and its
+ * liveness, connection and stream are read, so a healthy one takes the
+ * healthy branch. Any other reading clears its streak, with no
+ * `scheduleRestart` and no not-connected notice: the tick makes no attempt
+ * of its own for it.
  * Follows the same pattern as restart.ts: module-scoped state, injectable
  * deps, no server.ts imports.
  *
@@ -27,7 +35,7 @@
  */
 
 import type { PersonaConfig } from './config.ts'
-import { setOutageFlag, clearOutageFlag } from './outage-state.ts'
+import { setOutageFlag, clearOutageFlag, getOutageFlags } from './outage-state.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import {
   LIVENESS_DEAD,
@@ -76,12 +84,18 @@ export interface HealthCheckDeps {
   hasSessionStream(key: string): boolean
   isRestartPendingOrActive(key: string): boolean
   /**
-   * b.f2b: true while a launch for the persona is in flight (production: the
-   * session manager's `isLaunchInFlight`) — a start launch still waiting in
-   * the background for a `working` row to settle, a bring-up retry's launch
-   * or a restart's. The tick skips the persona, as for a pending restart: the
-   * launch owns its session, and its wait reconnects it or reports it.
-   * Absent: no persona is skipped for it.
+   * True while anything is in flight for the persona (b.f2b, b.jg5 SRJ-315;
+   * production: the server's in-flight predicate, which today the retry timer
+   * shares; work that holds back the retry timer must count here too, but
+   * not the reverse: a running dialog approver counts here and never blocks
+   * a retry, SRJ-303, SRJ-401). Today that is a launch call: a start launch
+   * still waiting in the background for a `working` row to settle, a bring-up
+   * retry's launch or a restart's. The work in flight owns the persona's
+   * session, so it is a no-attempt reason: the tick still runs the
+   * working-directory check and reads the persona's liveness, connection and
+   * stream, and a healthy one takes the healthy branch, but it never calls
+   * `scheduleRestart` or `notifyNotConnected` for it. A throw ends the persona's work for the
+   * tick (logged), before any read. Absent: nothing is in flight.
    */
   isLaunchInFlight?(key: string): boolean
   /**
@@ -224,15 +238,44 @@ let skippedTicks = 0
  * This map leaks nothing across contexts because it is cleared:
  *   - the moment a persona is observed connected (streak reset inline below),
  *   - when a reconnect is scheduled for it (consumed on fire, below),
- *   - when a tick skips it: pending/active restart, a launch in flight
- *     (b.f2b), at cap, a liveness reading of `unknown` or a probe that threw
- *     (b.jg5 SRJ-314), or left out of the tick's work list by the relaunch
- *     gate,
+ *   - when a tick skips it: pending/active restart, at cap, a liveness
+ *     reading of `unknown` or a probe that threw (b.jg5 SRJ-314), or left out
+ *     of the tick's work list by the relaunch gate,
+ *   - when a tick that has a no-attempt reason for it (`noAttemptReason`:
+ *     work in flight, b.f2b, or `tmux-unavailable` raised, b.jg5 SRJ-315)
+ *     reads it anything but healthy: the tick makes no attempt for it, and
+ *     the work in flight or the outage's retry owns it meanwhile,
  *   - by `forgetDisconnectedStreak` when the persona is torn down,
  *   - and wholesale by `_resetHealthCheckState` (the test-reset seam and the
  *     production stop path both call it).
  */
 const disconnectedStreak = new Map<string, number>()
+
+// ---------------------------------------------------------------------------
+// noAttemptReason
+// ---------------------------------------------------------------------------
+
+/**
+ * Why the tick makes no attempt of its own for a persona this tick (b.jg5
+ * SRJ-315): `in-flight`, work in flight for it (`isLaunchInFlight`), or
+ * `tmux-unavailable`, its `tmux-unavailable` outage raised (b.jg5 SRJ-311:
+ * its retry timer is then its only attempt, one per backoff interval). A
+ * new reason is one more member here and one more check in
+ * `noAttemptReason`.
+ */
+type NoAttemptReason = 'in-flight' | 'tmux-unavailable'
+
+/**
+ * The persona's no-attempt reason for this tick, the first that holds, or
+ * `null` when the tick may attempt. Decided once per persona per tick,
+ * before any read. A throw from a dep propagates (the per-persona `catch`
+ * logs it and ends the persona's work for the tick).
+ */
+function noAttemptReason(d: HealthCheckDeps, key: string): NoAttemptReason | null {
+  if (d.isLaunchInFlight?.(key) === true) return 'in-flight'
+  if (getOutageFlags(key).has('tmux-unavailable')) return 'tmux-unavailable'
+  return null
+}
 
 // ---------------------------------------------------------------------------
 // initHealthCheck
@@ -287,9 +330,10 @@ export function startHealthCheck(intervalSeconds: number): void {
 
       for (const [key, cwd] of Object.entries(personas)) {
         try {
-          // b.f2b: a launch in flight (e.g. a start launch still waiting in the
-          // background for a `working` row) owns the session, like a restart.
-          if (deps.isRestartPendingOrActive(key) || deps.isLaunchInFlight?.(key) === true) {
+          // A restart pending or active owns the session: skip before any read.
+          // (Work in flight is not this skip: it is a no-attempt reason below,
+          // and the persona is still read; b.jg5 SRJ-315.)
+          if (deps.isRestartPendingOrActive(key)) {
             // Clear any pending streak: "consecutive" means consecutive
             // *observed* ticks, not observations separated by an entire restart
             // cycle. A stale streak surviving across a restart could otherwise
@@ -324,6 +368,15 @@ export function startHealthCheck(intervalSeconds: number): void {
             console.error(`[slack] health-check: persona=${key} is at cap — skipping tick (SR-25.3/25.4)`)
             continue
           }
+
+          // b.jg5 SRJ-315: decided once, before any read. With a reason (work
+          // in flight, which owns the session and whose wait reconnects or
+          // reports it, b.f2b; or `tmux-unavailable` raised, whose retry timer
+          // is the persona's only attempt, SRJ-311), the persona is still
+          // read below, so one that recovered on its own takes the healthy
+          // branch (clearing the outage and ending `tmux-unresponsive`), but
+          // the tick schedules nothing and posts no not-connected notice.
+          const holdOff = noAttemptReason(deps, key) !== null
 
           if (await deps.statRoute(cwd)) {
             clearOutageFlag(key, 'cwd-unreachable')
@@ -372,7 +425,14 @@ export function startHealthCheck(intervalSeconds: number): void {
           // (Read once: b.f2b words the delay-0 notice by it.)
           const connected = alive && deps.isSessionConnected(key)
           const deliverable = connected && deps.hasSessionStream(key)
-          if (!alive) {
+          if (holdOff && (!alive || !deliverable || pending)) {
+            // b.jg5 SRJ-315: a no-attempt reason holds and the persona is not
+            // healthy (`dead`, `pending`, disconnected or streamless): no
+            // `scheduleRestart`, and no not-connected notice, which only
+            // accompanies an attempt. Drop the streak, as every skip does, so
+            // a later attempt starts a fresh two-tick count.
+            disconnectedStreak.delete(key)
+          } else if (!alive) {
             // Dead session: schedule immediately. The disconnected streak is
             // meaningless once the row is not alive, so drop it.
             disconnectedStreak.delete(key)

@@ -87,11 +87,11 @@
  *   `initOutageState` call before the start bring-up and the restart module;
  *   its action is the full-mode retry action over `runRestartRetry`,
  *   `getAppliedPersona`, the relaunch gate, the restart cap, the restart
- *   module's shutdown flag, `isLaunchInFlight` and the session manager's
- *   row read `readPersonaRowState` (SRJ-303); the restart module's arm hook
- *   (`armRetryTimer`) arms it with the read-error cause (SRJ-314); shutdown
- *   closes it once, right after `cancelAllRestartTimers`, after the
- *   shutting-down flag and before the HTTP server stops.
+ *   module's shutdown flag, the shared in-flight predicate (below) and the
+ *   session manager's row read `readPersonaRowState` (SRJ-303); the restart
+ *   module's arm hook (`armRetryTimer`) arms it with the read-error cause
+ *   (SRJ-314); shutdown closes it once, right after `cancelAllRestartTimers`,
+ *   after the shutting-down flag and before the HTTP server stops.
  * - b.jg5 SRJ-314 / SRJ-115: the restart module's pending deferral
  *   (`deferPendingRow`) is bound to server.ts's one module-scope
  *   `deferPendingRow` (no import, local shadow or second declaration), passed
@@ -135,6 +135,11 @@
  *   only `tmux-unavailable` clear (every other clear there is
  *   `ad-unreachable`). These are the only two `conditionEnded` reports in
  *   server.ts.
+ * - b.jg5 SRJ-315: one named in-flight predicate, declared once in main()'s
+ *   own statement list before the retry controller, wraps the session
+ *   manager's `isLaunchInFlight`; the full-mode retry action's `isInFlight`
+ *   and the health check's `isLaunchInFlight` both get it, and nothing else
+ *   names it (no no-op, other predicate or local shadow).
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -236,6 +241,42 @@ function constOf(call: string): string {
 /** `name` is declared exactly once in server.ts (no local shadow, no second instance). */
 function declaredOnce(name: string): void {
   expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+}
+
+/** The retry action's in-flight member (b.jg5 SRJ-301); renaming it fails the typecheck. */
+const RETRY_IN_FLIGHT_MEMBER: keyof FullModeRetryDeps = 'isInFlight'
+/** The health check's in-flight member (b.f2b, b.jg5 SRJ-315); renaming it fails the typecheck. */
+const TICK_IN_FLIGHT_MEMBER: keyof HealthCheckDeps = 'isLaunchInFlight'
+
+/**
+ * b.jg5 SRJ-315: the one shared in-flight predicate, as the full-mode retry
+ * action's `isInFlight` binds it. Fails unless that binding is a bare name
+ * declared exactly once in server.ts (no import, no local shadow, no second
+ * declaration), in main()'s own statement list before the retry controller is
+ * built, as a one-parameter arrow that only calls the session manager's
+ * `isLaunchInFlight` with its own key (no no-op, no other predicate), and
+ * `isLaunchInFlight` is the session manager's import, declared nowhere in
+ * server.ts. Returns the predicate's name.
+ */
+function sharedInFlightPredicate(): string {
+  const name = onlyCallProps('createFullModeRetryAction').get(RETRY_IN_FLIGHT_MEMBER)
+  expect(name).toMatch(/^\w+$/)
+  declaredOnce(name!)
+  expect(importSource(SERVER_CODE, name!)).toBeUndefined()
+
+  const decl = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+${name}\\s*=\\s*([^\\n;]+)`, 'g'))]
+  expect(decl).toHaveLength(1)
+  const at = decl[0]!.index!
+  expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+  expect(at).toBeLessThan(onlyCallOf('createUnavailableRetryController'))
+  // `(key: string): boolean => isLaunchInFlight(key)`; the parameter's name is free.
+  expect(decl[0]![1]!.trim()).toMatch(
+    /^\(?(\w+)(?:\s*:\s*string)?\)?(?:\s*:\s*boolean)?\s*=>\s*isLaunchInFlight\(\1\)$/,
+  )
+
+  expect(importSource(SERVER_CODE, 'isLaunchInFlight')).toBe('./session-manager.ts')
+  expect(indicesOf(/\b(?:let|const|var|function)\s+isLaunchInFlight\b/g, SERVER_CODE)).toEqual([])
+  return name!
 }
 
 /** Offsets of every plain assignment to `name` (`name = …`, not `==`, not a declaration or property). */
@@ -1451,8 +1492,9 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
     expect(props.get('isShuttingDown')).toBeDefined()
     expect(props.get('isShuttingDown')).toBe(onlyCallProps('initRestart').get('isShuttingDown')!)
 
-    expect(props.get('isInFlight')).toBe('isLaunchInFlight')
-    expect(importSource(SERVER_CODE, 'isLaunchInFlight')).toBe('./session-manager.ts')
+    // b.jg5 SRJ-315: the one shared in-flight predicate, which resolves to the
+    // session manager's isLaunchInFlight (see sharedInFlightPredicate).
+    expect(props.get(RETRY_IN_FLIGHT_MEMBER)).toBe(sharedInFlightPredicate())
 
     // b.jg5 SRJ-303, SRJ-115: a pending-only retry's row read is the session
     // manager's, one `status` call through the outage wrapper.
@@ -2003,8 +2045,15 @@ describe('main() binds the tmux-unresponsive condition\'s onset to the tick\'s e
 describe('server.ts wires the b.f2b stale-working-row recovery', () => {
   test('the health check gets the session manager\'s isLaunchInFlight, hasPendingWorkingRowEvidence, notifyDisconnectedWithAutoRestartDisabled and forgetNotConnectedEpisode, and reads session_restart_delay 0 from the config the restart module reads', () => {
     const props = onlyCallProps('initHealthCheck')
+    // b.jg5 SRJ-315: through the one shared in-flight predicate, which wraps
+    // the session manager's isLaunchInFlight (see sharedInFlightPredicate).
+    const predicate = sharedInFlightPredicate()
+    expect(props.get(TICK_IN_FLIGHT_MEMBER)).toBe(predicate)
+    // Declared before the health check is initialised, so the tick's binding
+    // reads the one declaration in scope (the helper pins it before the retry
+    // controller).
+    expect(SERVER_CODE.search(new RegExp(`\\bconst\\s+${predicate}\\s*=`))).toBeLessThan(onlyCallOf('initHealthCheck'))
     for (const [dep, value] of [
-      ['isLaunchInFlight', 'isLaunchInFlight'],
       ['hasPendingWorkingRowEvidence', 'hasPendingWorkingRowEvidence'],
       ['notifyNotConnected', 'notifyDisconnectedWithAutoRestartDisabled'],
       // A healthy tick ends the persona's not-connected episode.

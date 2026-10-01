@@ -23,6 +23,7 @@ import {
   initOutageState,
   getOutageFlags,
   setOutageFlag,
+  clearOutageFlag,
   ONSET_TEMPLATES,
   ALL_CLEAR_TEMPLATE,
 } from '../src/outage-state.ts'
@@ -1183,8 +1184,9 @@ describe('forgetDisconnectedStreak — per-persona teardown (b.av2 SR-6.5)', () 
 // working-row evidence
 //
 // A start launch still waiting in the background for a `working` row (or any
-// launch in flight) owns its session: the tick skips the persona as it skips a
-// pending restart. With session_restart_delay 0, scheduleRestart only logs and
+// launch in flight) owns its session: the tick still reads the persona but
+// makes no attempt of its own for it (b.jg5 SRJ-315; the full rule is pinned
+// in the SRJ-315 describe below). With session_restart_delay 0, scheduleRestart only logs and
 // returns, so an alive persona the tick would reconnect gets the not-connected
 // notice, worded for why it is undeliverable (the real session-manager
 // notifier here: once per episode, and a healthy tick ends the episode). While the
@@ -1199,10 +1201,11 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
     _resetNotConnectedEpisodes()
   })
 
-  test('a persona whose launch is in flight is skipped like a pending restart (not stat\'d, probed or scheduled), and its streak does not carry across the launch', async () => {
+  test('a persona whose launch is in flight is still stat\'d and probed but not scheduled (b.jg5 SRJ-315), and its streak does not carry across the launch', async () => {
     //   tick1: not in flight → alive && !connected → streak 1 (connected call 1)
-    //   tick2: in flight     → skipped, streak cleared
-    //   tick3: → fresh streak 1 (call 2); tick4: → streak 2 → scheduled (call 3)
+    //   tick2: in flight     → stat'd and probed (call 2), no attempt, streak cleared
+    //   tick3: → fresh streak 1 (call 3); tick4: → streak 2 → scheduled (call 4)
+    // A streak kept or advanced across tick 2 would schedule at call 3 (or 2).
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false, maxTicks: 4 })
     const inFlight = [false, true, false, false]
     const asked: string[] = []
@@ -1211,9 +1214,11 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
     await runTicks(deps, 4)
 
     expect(asked).toEqual([KEY, KEY, KEY, KEY])
-    expect(deps.statRouteCalls).toHaveLength(3)
-    expect(deps.isSessionAliveCalls).toHaveLength(3)
-    expect(deps.scheduleRestartAtConnectedCount).toEqual([3])
+    expect(deps.statRouteCalls).toEqual([WD, WD, WD, WD])
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY, KEY, KEY])
+    expect(deps.isSessionConnectedCalls).toEqual([KEY, KEY, KEY, KEY])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([4])
   })
 
   test.each<[string, boolean, DepsOpts, 'disconnected' | 'streamless', string[]]>([
@@ -1634,6 +1639,260 @@ describe('b.jg5 SRJ-312: a live, connected tick with its stream clears the perso
 })
 
 // ---------------------------------------------------------------------------
+// b.jg5 SRJ-315 — no attempt, still read
+//
+// While a persona has work in flight (`isLaunchInFlight`) or its
+// `tmux-unavailable` outage raised, the tick makes no attempt of its own for
+// it: no `scheduleRestart` and no not-connected notice. It still runs the
+// working-directory check and reads liveness, connection and stream, so a
+// healthy persona takes the healthy branch (episode and tmux-unresponsive
+// ended, tmux-unavailable cleared). Any other reading clears its streak. A
+// restart pending or active, and the cap, still skip it before any read, and
+// come first. The tick-end (onset) hook runs once per tick under every rule.
+// Another persona under neither rule is checked as today.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-315: no attempt, still read', () => {
+  const P = 'held_bot'
+  const B = 'other_bot'
+  const ONSET = ONSET_TEMPLATES['tmux-unavailable']()
+  const ALL_CLEAR = ALL_CLEAR_TEMPLATE(new Map([['tmux-unavailable', { detail: undefined }]]))
+
+  type Deps = ReturnType<typeof makeDeps>
+  /**
+   * A no-attempt rule for P. With `active`, the rule holds on the ticks it
+   * accepts (by tick number) and is lifted on the others; without it, it holds
+   * from the start (`tmux-unavailable` is raised once, before the first tick,
+   * so a healthy tick can clear it).
+   */
+  type NoAttemptRule = (deps: Deps, active?: (tick: number) => boolean) => void
+
+  const inFlight: NoAttemptRule = (deps, active = () => true) => {
+    deps.isLaunchInFlight = (key) => key === P && active(deps.tickCount())
+  }
+  const tmuxUnavailable: NoAttemptRule = (deps, active) => {
+    if (active === undefined) {
+      setOutageFlag(P, 'tmux-unavailable')
+      return
+    }
+    // Raised or lowered at each tick body's start, before P's work.
+    const getPersonas = deps.getPersonas
+    deps.getPersonas = () => {
+      const personas = getPersonas()
+      const raised = getOutageFlags(P).has('tmux-unavailable')
+      const holds = active(deps.tickCount())
+      if (holds && !raised) setOutageFlag(P, 'tmux-unavailable')
+      if (!holds && raised) clearOutageFlag(P, 'tmux-unavailable')
+      return personas
+    }
+  }
+  const RULES: Array<[string, NoAttemptRule, boolean]> = [
+    ['a launch in flight', inFlight, false],
+    ['tmux-unavailable raised', tmuxUnavailable, true],
+  ]
+
+  /** Auto-restart disabled, with every attempt-side and healthy-side hook recorded. */
+  function recording(deps: Deps) {
+    const notified: Array<[string, string]> = []
+    const episodesEnded: string[] = []
+    const conditionsEnded: string[] = []
+    deps.isAutoRestartDisabled = () => true
+    deps.notifyNotConnected = (key, why) => void notified.push([key, why])
+    deps.endNotConnectedEpisode = (key) => void episodesEnded.push(key)
+    deps.endTmuxUnresponsive = (key) => void conditionsEnded.push(key)
+    return { notified, episodesEnded, conditionsEnded }
+  }
+
+  /** Run `fn` with console.error captured (the cap skip logs a line per tick); answers the lines. */
+  async function quietly(fn: () => Promise<void>): Promise<string[]> {
+    const lines: string[] = []
+    const saved = console.error
+    console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '))
+    try { await fn() } finally { console.error = saved }
+    return lines
+  }
+
+  // Each row but `unknown` would be attempted without a rule: dead on the
+  // first tick, the others on the second (the two-tick debounce), with the
+  // notice at delay 0. `unknown` is never attempted; under a rule it is still
+  // read, and the rule's outage stays as it was.
+  // The rows key their scripted answers by P, a name fixed when the table is
+  // built: the file's KEY is only set in beforeAll, after the table exists.
+  const NOT_HEALTHY: Array<[string, DepsOpts, string[]]> = [
+    ['dead', { aliveSequence: { [P]: [LIVENESS_READING_DEAD] } }, []],
+    ['live but disconnected', { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false }, [P, P]],
+    ['live and connected but streamless', { isSessionAliveResult: LIVENESS_READING_LIVE, hasSessionStreamResult: false }, [P, P]],
+    ['pending, connected with its stream', { aliveSequence: { [P]: [LIVENESS_READING_PENDING] } }, [P, P]],
+    // Skipped after the read (b.jg5 SRJ-314), so never probed for its connection.
+    ['unknown', { aliveSequence: { [P]: [LIVENESS_READING_UNKNOWN] } }, []],
+  ]
+
+  test.each(RULES.flatMap(([rule, apply, flag]) => NOT_HEALTHY.map(([reading, opts, connectedCalls]) =>
+    [rule, reading, apply, flag, opts, connectedCalls] as [string, string, NoAttemptRule, boolean, DepsOpts, string[]],
+  )))('%s, read %s on two ticks with auto-restart disabled: the directory is stat\'d and P probed each tick, nothing scheduled, no not-connected notice, nothing ended', async (_rule, _reading, apply, flag, opts, connectedCalls) => {
+    const personas = workList(P)
+    const deps = makeDeps({ personas, ...opts, maxTicks: 2 })
+    apply(deps)
+    const { notified, episodesEnded, conditionsEnded } = recording(deps)
+
+    // An unknown reading logs a line per tick.
+    await quietly(() => runTicks(deps, 2))
+
+    expect(deps.statRouteCalls).toEqual([personas[P]!, personas[P]!])
+    expect(deps.isSessionAliveCalls).toEqual([P, P])
+    expect(deps.isSessionConnectedCalls).toEqual(connectedCalls)
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(notified).toEqual([])
+    expect(episodesEnded).toEqual([])
+    expect(conditionsEnded).toEqual([])
+    expect(getOutageFlags(P).has('tmux-unavailable')).toBe(flag)
+    expect(notices).toEqual(flag ? [{ key: P, text: ONSET }] : [])
+  })
+
+  test.each(RULES)('%s: the working-directory check still runs, raising cwd-unreachable for an unreachable directory', async (_rule, apply) => {
+    const personas = workList(P)
+    const deps = makeDeps({ personas, statRouteResult: false, maxTicks: 1 })
+    apply(deps)
+
+    await runTicks(deps, 1)
+
+    expect(deps.statRouteCalls).toEqual([personas[P]!])
+    expect(getOutageFlags(P).has('cwd-unreachable')).toBe(true)
+    expect(deps.scheduleRestartCalls).toEqual([])
+  })
+
+  test.each(RULES)('%s, read live, connected and with its stream: the healthy branch ends the not-connected episode and tmux-unresponsive and clears tmux-unavailable with one all-clear; nothing scheduled', async (_rule, apply, flag) => {
+    const deps = makeDeps({ personas: workList(P), isSessionAliveResult: LIVENESS_READING_LIVE, maxTicks: 1 })
+    apply(deps)
+    const { notified, episodesEnded, conditionsEnded } = recording(deps)
+
+    await runTicks(deps, 1)
+
+    expect(deps.isSessionAliveCalls).toEqual([P])
+    expect(episodesEnded).toEqual([P])
+    expect(conditionsEnded).toEqual([P])
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(notified).toEqual([])
+    expect(getOutageFlags(P).size).toBe(0)
+    expect(notices).toEqual(flag ? [{ key: P, text: ONSET }, { key: P, text: ALL_CLEAR }] : [])
+  })
+
+  test('once a healthy tick has cleared tmux-unavailable, the next dead tick schedules at once', async () => {
+    const personas = workList(P)
+    const deps = makeDeps({ personas, aliveSequence: { [P]: [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD] }, maxTicks: 2 })
+    tmuxUnavailable(deps)
+
+    await runTicks(deps, 2)
+
+    expect(deps.isSessionAliveCalls).toEqual([P, P])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: P, cwd: personas[P]! }])
+  })
+
+  test.each(RULES)('%s on tick 1 only, read dead on both ticks: nothing on tick 1, scheduled at once on tick 2 once it lifts', async (_rule, apply) => {
+    const personas = workList(P)
+    const deps = makeDeps({ personas, maxTicks: 2 })
+    apply(deps, (tick) => tick === 1)
+    const fired: number[] = []
+    const schedule = deps.scheduleRestart
+    deps.scheduleRestart = (key, cwd) => { fired.push(deps.tickCount()); schedule(key, cwd) }
+
+    await runTicks(deps, 2)
+
+    expect(deps.isSessionAliveCalls).toEqual([P, P])
+    expect(fired).toEqual([2])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: P, cwd: personas[P]! }])
+  })
+
+  test.each(RULES)('streak: %s on tick 2 only, P live but disconnected on four ticks: the held tick leaves no streak, so the first tick after it lifts does not schedule; the second does', async (_rule, apply) => {
+    //   tick1: no rule → streak 1 (connected call 1)
+    //   tick2: rule    → read (call 2), no attempt, streak cleared
+    //   tick3: lifted  → fresh streak 1 (call 3), not scheduled
+    //   tick4:         → streak 2 → scheduled (call 4)
+    const deps = makeDeps({ personas: workList(P), isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false, maxTicks: 4 })
+    apply(deps, (tick) => tick === 2)
+
+    await runTicks(deps, 4)
+
+    expect(deps.isSessionConnectedCalls).toEqual([P, P, P, P])
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([4])
+  })
+
+  test.each(RULES)('isolation: P under %s and B under neither, both dead, over two ticks: B is probed and scheduled each tick as today, P never', async (_rule, apply) => {
+    const personas = workList(P, B)
+    const deps = makeDeps({ personas, maxTicks: 2 })
+    apply(deps)
+
+    await runTicks(deps, 2)
+
+    expect(deps.isSessionAliveCalls).toEqual([P, B, P, B])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: B, cwd: personas[B]! }, { key: B, cwd: personas[B]! }])
+    expect(getOutageFlags(B).size).toBe(0)
+  })
+
+  const onsetRows: Array<[string, (deps: Deps) => void]> = [
+    ...RULES.map(([rule, apply]) => [rule, (deps: Deps) => apply(deps)] as [string, (deps: Deps) => void]),
+    ['a restart pending', (deps) => { deps.isRestartPendingOrActive = (key) => key === P }],
+    ['at the restart cap', (deps) => { deps.isAtCap = (key) => key === P }],
+  ]
+  test.each(onsetRows)('onset regardless of attempt: P dead and skipped (%s) on each of two ticks: the tick-end hook is still called once per tick, with that tick\'s start time; nothing scheduled', async (_rule, apply) => {
+    const deps = makeDeps({ personas: workList(P), maxTicks: 2 })
+    apply(deps)
+    const startTimes = [10_000, 20_000]
+    deps.now = () => startTimes[Math.min(deps.tickCount(), startTimes.length - 1)]!
+    const ends: Array<[number, number]> = []
+    deps.onTickEnd = (tickStartedAt) => void ends.push([tickStartedAt, deps.tickCount()])
+
+    await quietly(() => runTicks(deps, 2))
+
+    expect(ends).toEqual([[10_000, 1], [20_000, 2]])
+    expect(deps.scheduleRestartCalls).toEqual([])
+  })
+
+  // The restart-pending/active and cap skips come before the no-attempt
+  // decision: P reads healthy, so were it read it would be probed, end its
+  // episode and condition, and (when raised) clear tmux-unavailable.
+  const READ_FREE_SKIPS: Array<[string, DepsOpts]> = [
+    ['a restart pending or active', { isRestartPendingResult: true }],
+    ['at the restart cap', { isAtCapResult: true }],
+  ]
+  test.each(READ_FREE_SKIPS.flatMap(([skip, skipOpts]) => RULES.map(([rule, apply, flag]) =>
+    [skip, rule, skipOpts, apply, flag] as [string, string, DepsOpts, NoAttemptRule, boolean],
+  )))('%s, with %s too: P is skipped before any read on each of two ticks (not stat\'d, probed, scheduled or cleared)', async (_skip, _rule, skipOpts, apply, flag) => {
+    const deps = makeDeps({ personas: workList(P), isSessionAliveResult: LIVENESS_READING_LIVE, ...skipOpts, maxTicks: 2 })
+    apply(deps)
+    const { notified, episodesEnded, conditionsEnded } = recording(deps)
+
+    await quietly(() => runTicks(deps, 2))
+
+    expect(deps.statRouteCalls).toEqual([])
+    expect(deps.isSessionAliveCalls).toEqual([])
+    expect(deps.isSessionConnectedCalls).toEqual([])
+    expect(deps.hasSessionStreamCalls).toEqual([])
+    expect(deps.scheduleRestartCalls).toEqual([])
+    expect(notified).toEqual([])
+    expect(episodesEnded).toEqual([])
+    expect(conditionsEnded).toEqual([])
+    expect(getOutageFlags(P).has('tmux-unavailable')).toBe(flag)
+  })
+
+  test('a throwing in-flight predicate ends P\'s work for the tick before any read, logged; B is still checked', async () => {
+    const personas = workList(P, B)
+    const deps = makeDeps({ personas, maxTicks: 1 })
+    deps.isLaunchInFlight = (key) => {
+      if (key === P) throw new Error('simulated in-flight failure')
+      return false
+    }
+
+    const lines = await quietly(() => runTicks(deps, 1))
+
+    expect(deps.statRouteCalls).toEqual([personas[B]!])
+    expect(deps.isSessionAliveCalls).toEqual([B])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: B, cwd: personas[B]! }])
+    expect(lines.filter((l) => l.includes(`persona=${P}`) && l.includes('simulated in-flight failure'))).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // b.jg5 SRJ-308 — the tick-end hook (the onset check with the health check on)
 //
 // Each tick body reads its start time from `now` once, before any of its work,
@@ -1737,7 +1996,7 @@ describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick
     ['a launch in flight', {}, (deps) => { deps.isLaunchInFlight = () => true }],
     ['at the restart cap', { isAtCapResult: true }, bindNothing],
     ['an unknown reading', { aliveSequence: { persona_a: [LIVENESS_READING_UNKNOWN], persona_b: [LIVENESS_READING_UNKNOWN] } }, bindNothing],
-  ])('every persona skipped (%s) on each of two ticks: the hook is still called once per tick, with that tick\'s start time', async (_label, opts, bind) => {
+  ])('no persona attempted (%s) on each of two ticks: the hook is still called once per tick, with that tick\'s start time', async (_label, opts, bind) => {
     const deps = makeDeps({ ...opts, personas: workList('persona_a', 'persona_b'), maxTicks: 2 })
     bind(deps)
     const { ends } = withTickEnd(deps, [10_000, 20_000])

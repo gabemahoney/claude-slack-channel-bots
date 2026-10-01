@@ -1845,6 +1845,15 @@ export async function main(): Promise<void> {
   })
   personaEpisodes = noticeEpisodes
 
+  // b.jg5 SRJ-315: true while work is in flight for the persona (today only
+  // a launch call, `isLaunchInFlight`). Today this one predicate serves both
+  // the retry timer (`isInFlight`) and the health tick (`isLaunchInFlight`).
+  // The two need not stay equal: a running dialog approver counts as in
+  // flight for the tick but never blocks a retry (SRJ-303, SRJ-401). What
+  // must hold is that the tick never attempts over work that holds back the
+  // retry timer.
+  const isPersonaWorkInFlight = (key: string): boolean => isLaunchInFlight(key)
+
   // b.jg5 SRJ-301, SRJ-303, SRJ-305: one UNAVAILABLE retry controller, on the
   // system clock, installed below as the outage state's trigger sink before
   // the start pass (whose launches are the first attempts that can arm it).
@@ -1877,7 +1886,7 @@ export async function main(): Promise<void> {
       canRelaunch: (key) => canRelaunch(key),
       isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
       isShuttingDown: () => shuttingDown,
-      isInFlight: isLaunchInFlight,
+      isInFlight: isPersonaWorkInFlight,
       readRow: readPersonaRowState,
       isSessionConnected: (key) => getSessionByPersona(key)?.connected === true,
       hasSessionStream,
@@ -2377,9 +2386,11 @@ export async function main(): Promise<void> {
     // tick can notice connected-but-streamless rows and route them to recovery.
     hasSessionStream,
     isRestartPendingOrActive,
-    // b.f2b: a launch in flight owns its session (a start launch may still be
-    // waiting in the background for a `working` row), so the tick skips it.
-    isLaunchInFlight,
+    // b.f2b, b.jg5 SRJ-315: the retry timer's in-flight predicate. Work in
+    // flight owns the session (a start launch may still be waiting in the
+    // background for a `working` row), so the tick still reads the persona
+    // but makes no attempt for it.
+    isLaunchInFlight: isPersonaWorkInFlight,
     // b.f2b: with session_restart_delay 0 scheduleRestart does nothing, so an
     // alive persona the tick would reconnect gets the not-connected notice
     // (once per episode, worded for a disconnected or a streamless session)
@@ -2416,7 +2427,8 @@ export async function main(): Promise<void> {
   // INVARIANT: Health check starts only after startupSessionManager() returns.
   // By then every start launch has settled, or (b.f2b) is still waiting in the
   // background for a `working` row: such a launch stays in flight, and the
-  // tick skips a persona whose launch is in flight (`isLaunchInFlight`).
+  // tick makes no attempt for a persona with work in flight
+  // (`isPersonaWorkInFlight`), though it still reads it.
   // Do not move this call earlier in the startup sequence.
   startHealthCheck(personaConfig.health_check_interval)
 
