@@ -41,6 +41,7 @@ import {
 } from '../src/session-manager.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import {
+  LIVENESS_LIVE,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_LIVE,
   LIVENESS_READING_PENDING,
@@ -1515,23 +1516,120 @@ describe('b.jg5 SRJ-310: a live, connected tick with its stream ends the persona
     expect(ended).toEqual([[1, KEY], [4, KEY]])
   })
 
+  // The rows key their scripted answers by P, a name fixed when the table is
+  // built: the file's KEY is only set in beforeAll, after the table exists.
   test.each<[string, DepsOpts]>([
-    ['pending (no launch start), connected with its stream', { aliveSequence: { [KEY]: [LIVENESS_READING_PENDING] } }],
-    ['pending (a launch start), connected with its stream', { aliveSequence: { [KEY]: [pendingLivenessReading(SAMPLE_LAUNCH_START_WHOLE)] } }],
-    ['unknown', { aliveSequence: { [KEY]: [LIVENESS_READING_UNKNOWN] } }],
-    ['a thrown probe', { aliveSequence: { [KEY]: [new Error('simulated status failure')] } }],
-    ['dead', { aliveSequence: { [KEY]: [LIVENESS_READING_DEAD] } }],
+    ['pending (no launch start), connected with its stream', { aliveSequence: { [P]: [LIVENESS_READING_PENDING] } }],
+    ['pending (a launch start), connected with its stream', { aliveSequence: { [P]: [pendingLivenessReading(SAMPLE_LAUNCH_START_WHOLE)] } }],
+    ['unknown', { aliveSequence: { [P]: [LIVENESS_READING_UNKNOWN] } }],
+    ['a thrown probe', { aliveSequence: { [P]: [new Error('simulated status failure')] } }],
+    ['dead', { aliveSequence: { [P]: [LIVENESS_READING_DEAD] } }],
     ['live but disconnected', { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false }],
     ['live and connected but streamless', { isSessionAliveResult: LIVENESS_READING_LIVE, hasSessionStreamResult: false }],
   ])('%s: over two ticks the hook is never called', async (_label, opts) => {
-    const deps = makeDeps({ ...opts, maxTicks: 2 })
+    const deps = makeDeps({ personas: workList(P), ...opts, maxTicks: 2 })
     const ended: string[] = []
     deps.endTmuxUnresponsive = (key) => void ended.push(key)
 
     await runTicks(deps, 2)
 
-    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
+    expect(deps.isSessionAliveCalls).toEqual([P, P])
     expect(ended).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-311, SRJ-312 — the healthy branch clears tmux-unavailable
+//
+// A tick that finds the persona `live`, connected and with its stream clears
+// its `tmux-unavailable` outage through the real outage state: one all-clear
+// over its bad stretch when that empties its flags, and the cleared-flag
+// observer told once with the class and the tick's `live` reading (production
+// binds the observer to the retry timer's condition-end entry; the binding is
+// pinned in tests/server-startup-wiring.test.ts). `pending` (never healthy),
+// `unknown`, a thrown probe, `dead`, and a live session that is disconnected
+// or connected but streamless leave it raised and post nothing. Another
+// persona's flag is never touched. The flag is raised with no detail, as the
+// wrappers raise it.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-312: a live, connected tick with its stream clears the persona\'s tmux-unavailable outage', () => {
+  const P = 'healed_bot'
+  const B = 'other_bot'
+
+  /** The cleared-flag observer's calls during the current test, in order. */
+  let cleared: Array<[string, string, string | undefined]>
+
+  beforeEach(() => {
+    // The file's capturing notice hook, plus a recording cleared-flag observer.
+    cleared = []
+    initOutageState({
+      notify: (key, text) => { notices.push({ key, text }) },
+      getClient: () => null as any,
+      onFlagCleared: (key, cls, reading) => { cleared.push([key, cls, reading]) },
+    })
+  })
+
+  test('P live, connected and with its stream, beside B live but disconnected with its flag raised: over two ticks P\'s flag clears once with one all-clear over its history and the live reading told to the observer; B\'s stays raised', async () => {
+    // B is checked first, so a clear made with the wrong persona's key would
+    // lower B's flag and leave P's raised.
+    setOutageFlag(B, 'tmux-unavailable')
+    setOutageFlag(P, 'tmux-unavailable')
+    const deps = makeDeps({
+      personas: workList(B, P),
+      aliveSequence: { [B]: [LIVENESS_READING_LIVE], [P]: [LIVENESS_READING_LIVE] },
+      connectedSequence: { [B]: [false], [P]: [true] },
+      maxTicks: 2,
+    })
+
+    await runTicks(deps, 2)
+
+    expect(deps.isSessionAliveCalls).toEqual([B, P, B, P])
+    expect(getOutageFlags(P).has('tmux-unavailable')).toBe(false)
+    expect(getOutageFlags(B).has('tmux-unavailable')).toBe(true)
+    expect(notices).toEqual([
+      { key: B, text: ONSET_TEMPLATES['tmux-unavailable']() },
+      { key: P, text: ONSET_TEMPLATES['tmux-unavailable']() },
+      { key: P, text: ALL_CLEAR_TEMPLATE(new Map([['tmux-unavailable', { detail: undefined }]])) },
+    ])
+    expect(cleared).toEqual([[P, 'tmux-unavailable', LIVENESS_LIVE]])
+  })
+
+  test('with ad-unreachable also raised for P: the healthy tick lowers only tmux-unavailable, posts no all-clear, and tells the observer with the live reading', async () => {
+    setOutageFlag(P, 'ad-unreachable')
+    setOutageFlag(P, 'tmux-unavailable')
+    const deps = makeDeps({ personas: workList(P), isSessionAliveResult: LIVENESS_READING_LIVE, maxTicks: 1 })
+
+    await runTicks(deps, 1)
+
+    expect([...getOutageFlags(P)]).toEqual(['ad-unreachable'])
+    expect(notices).toEqual([
+      { key: P, text: ONSET_TEMPLATES['ad-unreachable']() },
+      { key: P, text: ONSET_TEMPLATES['tmux-unavailable']() },
+    ])
+    expect(cleared).toEqual([[P, 'tmux-unavailable', LIVENESS_LIVE]])
+  })
+
+  // The rows key their scripted answers by P, a name fixed when the table is
+  // built: the file's KEY is only set in beforeAll, after the table exists.
+  test.each<[string, DepsOpts]>([
+    ['pending (no launch start), connected with its stream', { aliveSequence: { [P]: [LIVENESS_READING_PENDING] } }],
+    ['pending (a launch start), connected with its stream', { aliveSequence: { [P]: [pendingLivenessReading(SAMPLE_LAUNCH_START_WHOLE)] } }],
+    ['unknown', { aliveSequence: { [P]: [LIVENESS_READING_UNKNOWN] } }],
+    ['a thrown probe', { aliveSequence: { [P]: [new Error('simulated status failure')] } }],
+    ['dead', { aliveSequence: { [P]: [LIVENESS_READING_DEAD] } }],
+    ['live but disconnected', { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false }],
+    ['live and connected but streamless', { isSessionAliveResult: LIVENESS_READING_LIVE, hasSessionStreamResult: false }],
+  ])('%s: over two ticks the flag stays raised, nothing is posted after its onset and the observer is never told', async (_label, opts) => {
+    setOutageFlag(P, 'tmux-unavailable')
+    const deps = makeDeps({ personas: workList(P), ...opts, maxTicks: 2 })
+
+    await runTicks(deps, 2)
+
+    expect(deps.isSessionAliveCalls).toEqual([P, P])
+    expect(getOutageFlags(P).has('tmux-unavailable')).toBe(true)
+    expect(notices).toEqual([{ key: P, text: ONSET_TEMPLATES['tmux-unavailable']() }])
+    expect(cleared).toEqual([])
   })
 })
 

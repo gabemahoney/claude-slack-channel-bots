@@ -148,7 +148,6 @@ import {
   ERR_SPAWN_NOT_FOUND_NAME,
   ERR_SYSTEM_INSTALL_DISAPPEARED_NAME,
   ErrSystemInstallDisappeared,
-  ErrTmuxNotAvailable,
 } from './agent-director-errors.ts'
 import {
   AD_CALL_KILL_ROW_NOT_READ_LIVE,
@@ -194,6 +193,7 @@ import {
   createUnavailableRetryController,
   unavailableRetryCauseFor,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
@@ -1006,10 +1006,15 @@ export async function _runCallTimeoutStartStep(
  * a `status` result maps through `livenessReadingForStatus` (`pending` →
  * `pending`, carrying the row's raw launch start when the result shows one,
  * b.jg5 SRJ-115; another live state → `live`, `ended` or `missing` → `dead`,
- * any other state → `unknown`, logged). A `status` error is decided by name
- * through `src/ad-error-class.ts`:
- *   - `ErrSpawnNotFound` → `dead`; clears `ad-unreachable` and
- *     `tmux-unavailable`, as a state answer does;
+ * any other state → `unknown`, logged), and clears `ad-unreachable`. It
+ * never clears `tmux-unavailable` (b.jg5 SRJ-312): a `status` is not
+ * tmux-touching, so neither its success nor its `ErrSpawnNotFound` shows tmux
+ * answering; only a tmux-touching success or GONE (the outage wrappers), or a
+ * check that finds the row live and connected with its stream (the health
+ * tick's healthy branch, a retry's healthy row), clears it. A `status` error
+ * is decided by name through `src/ad-error-class.ts`:
+ *   - `ErrSpawnNotFound` → `dead`; clears `ad-unreachable`, as a state
+ *     answer does;
  *   - `ErrSystemInstallDisappeared` → `dead`; raises `ad-unreachable` with its
  *     binary path;
  *   - `ErrTmuxNotAvailable` (ENVIRONMENT) → `unknown`; raises
@@ -1026,7 +1031,9 @@ export async function _runCallTimeoutStartStep(
  * wrappers, so its error branches report the error themselves
  * (`reportAgentDirectorError` with the verb `status`): inside a restart run
  * it arms the persona's retry timer (b.jg5 SRJ-301), and from the health
- * tick, which runs outside every attempt, it arms nothing.
+ * tick, which runs outside every attempt, it arms nothing, except for an
+ * ENVIRONMENT answer, which arms the persona's timer in any context (b.jg5
+ * SRJ-311).
  *
  * @internal
  */
@@ -1040,8 +1047,9 @@ export function _buildIsSessionAliveAdapter(
     const claude_instance_id = personaInstanceId(key)
     try {
       const r = await getClient().status({ claude_instance_id })
+      // b.jg5 SRJ-312: a `status` is not tmux-touching, so its success never
+      // clears `tmux-unavailable`; it clears `ad-unreachable` only.
       clearOutageFlag(key, 'ad-unreachable')
-      clearOutageFlag(key, 'tmux-unavailable')
       const reading = livenessReadingForStatus(r)
       if (reading.kind === LIVENESS_UNKNOWN) {
         console.error(`[slack] isSessionAlive: status answered a state CSCB does not know for persona=${key} — read as unknown, not dead`)
@@ -1064,8 +1072,8 @@ export function _buildIsSessionAliveAdapter(
  */
 function statusErrorReading(key: string, err: unknown): LivenessReading {
   if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+    // b.jg5 SRJ-312: agent-director answered, but tmux did not; `tmux-unavailable` stays raised.
     clearOutageFlag(key, 'ad-unreachable')
-    clearOutageFlag(key, 'tmux-unavailable')
     return LIVENESS_READING_DEAD
   }
   if (hasAdErrorName(err, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME)) {
@@ -1161,10 +1169,16 @@ export function _buildStatRouteImpl(deps?: {
  * would (`holdLaunchIfConfigDirUnresolvable`); the launch that follows is then
  * refused by the relaunch gate (`'skipped'`), counting no failure.
  *
- * b.jg5 SRJ-105: a kill that meets an UNAVAILABLE outcome (by name,
- * `ErrTmuxKillFailed` included) answers `KILL_SESSION_REFUSED`, and the
- * restart work launches nothing and counts nothing. Every other kill error is
- * ignored as before, and the launch follows.
+ * b.jg5 SRJ-105, SRJ-311: a kill that meets an UNAVAILABLE outcome (by name,
+ * `ErrTmuxKillFailed` included) or an ENVIRONMENT answer
+ * (`ErrTmuxNotAvailable`, which also raises `tmux-unavailable` and arms the
+ * persona's retry timer through the outage wrapper) answers
+ * `KILL_SESSION_REFUSED`, decided by the arming predicate
+ * (`unavailableRetryCauseFor`, by name through `src/ad-error-class.ts`), and
+ * the restart work launches nothing and counts nothing: the refused outcome.
+ * `ErrSpawnNotFound` and `ErrSystemInstallDisappeared` resolve with nothing,
+ * as before, and every other kill error is ignored as before; the launch
+ * follows.
  *
  * @param getPersona  The applied persona with a key (production:
  *   `getAppliedPersona`); without it the directory is not checked here.
@@ -1194,9 +1208,10 @@ export function _buildKillSessionAdapter(
       )
     } catch (err) {
       if (err instanceof ErrSpawnNotFound) return
-      if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return
-      // b.jg5 SRJ-105: an UNAVAILABLE kill (`ErrTmuxKillFailed` included),
-      // classified by name, is a refusal: the restart work launches nothing.
+      if (err instanceof ErrSystemInstallDisappeared) return
+      // b.jg5 SRJ-105, SRJ-311: an UNAVAILABLE kill (`ErrTmuxKillFailed`
+      // included) or an ENVIRONMENT kill (`ErrTmuxNotAvailable`), classified
+      // by name, is a refusal: the restart work launches nothing.
       if (unavailableRetryCauseFor(err, AD_VERB_KILL) !== undefined) {
         console.error(
           `[slack] killSession (restart adapter): kill refused for persona=${key}: ${describeAgentDirectorFailure(err)} — no relaunch follows (b.jg5 SRJ-105)`,
@@ -1848,6 +1863,10 @@ export async function main(): Promise<void> {
   // b.jg5 SRJ-309: every stop of a persona's timer, whatever its reason (a
   // teardown and shutdown included), cancels the condition's alert check
   // not yet posted while it holds, since the alert says CSCB keeps retrying.
+  // b.jg5 SRJ-311, SRJ-312: the same healthy-row observation (a live row out
+  // of `pending`, connected with its stream) also clears the persona's
+  // `tmux-unavailable` outage, with that reading, which the cleared-flag
+  // observer below passes on to the timer's condition-end entry.
   const retryTimers = createUnavailableRetryController({
     log: (line) => console.error(line),
     onRetryFire: (key, firedAt) => tmuxUnresponsive.onsetAtRetry(key, firedAt),
@@ -1864,6 +1883,7 @@ export async function main(): Promise<void> {
       hasSessionStream,
       endTmuxUnresponsive: (key, reading) => {
         tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
+        clearOutageFlag(key, 'tmux-unavailable', reading)
       },
     }),
   })
@@ -1892,9 +1912,15 @@ export async function main(): Promise<void> {
   // Every persona notice goes through the one per-persona notifier: it holds
   // a notice until the persona's client is available and logs instead of
   // posting in dry run. An agent-director error inside a launch or recovery
-  // attempt arms the persona's retry timer through the trigger sink, and a
-  // tmux-touching call's UNAVAILABLE there starts the persona's
-  // tmux-unresponsive condition through the condition sink.
+  // attempt, or an ENVIRONMENT answer from any call, arms the persona's retry
+  // timer through the trigger sink, and a tmux-touching call's UNAVAILABLE
+  // there starts the persona's tmux-unresponsive condition through the
+  // condition sink. b.jg5 SRJ-305, SRJ-306: each real clear of a persona's
+  // `tmux-unavailable` outage (never the silent boot or teardown reset) is
+  // reported once to the retry controller's condition-end entry, with the
+  // reading the clear brought (the live reading of a tick or a retry that
+  // found the row healthy, or a launch call's `pending`), so the timer stops
+  // unless its `pending` or kill-failure exception holds.
   initOutageState({
     notify: (key, text) => {
       void personaNotifier.notify(key, text)
@@ -1902,6 +1928,11 @@ export async function main(): Promise<void> {
     getClient,
     triggerSink: retryTimers,
     conditionSink: tmuxUnresponsive,
+    onFlagCleared: (key, cls, reading) => {
+      if (cls === 'tmux-unavailable') {
+        retryTimers.conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE, reading)
+      }
+    },
   })
   setSessionNotifier(personaNotifier.notify)
 

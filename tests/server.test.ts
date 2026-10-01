@@ -30,11 +30,14 @@ import {
 } from '../src/liveness-reading.ts'
 import type { Phase1StatusResult } from '../src/ad-phase1-types.ts'
 import {
+  ALL_CLEAR_TEMPLATE,
+  ONSET_TEMPLATES,
   _resetOutageState,
   initOutageState,
   getOutageFlags,
   setOutageFlag,
   withOutageDetection,
+  type OutageClass,
 } from '../src/outage-state.ts'
 import {
   getClient,
@@ -112,7 +115,7 @@ import {
 } from '../src/session-manager.ts'
 import type { ClientOptions, FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams } from 'agent-director'
 import { KILL_SESSION_REFUSED, type KillSessionResult } from '../src/restart.ts'
-import { runInAttempt } from '../src/unavailable-retry.ts'
+import { UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, isInsideAttempt, runInAttempt } from '../src/unavailable-retry.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
@@ -541,6 +544,14 @@ describe("liveness-reading: a pending row's launch start (b.jg5 SRJ-115)", () =>
 
 describe('_buildIsSessionAliveAdapter', () => {
   type Emission = { key: string; text: string }
+  /** One arm of the trigger-sink spy, and whether it came from inside an attempt for its key. */
+  type Trigger = { key: string; kind: string; inside: boolean }
+  /** One real flag clear the cleared-flag observer saw. */
+  type Cleared = { key: string; cls: OutageClass }
+
+  /** The all-clear an `ad-unreachable` raised with `binaryPath` alone posts when it clears. */
+  const adUnreachableAllClear = (binaryPath: string): string =>
+    ALL_CLEAR_TEMPLATE(new Map([['ad-unreachable', { detail: binaryPath }]]))
 
   /** A live state the harness's `status` answers by default. */
   const LIVE_STATE = LIVE_NOT_PENDING_STATES[0]!
@@ -567,14 +578,22 @@ describe('_buildIsSessionAliveAdapter', () => {
   ): {
     emissions: Emission[]
     statusCalls: StatusParams[]
+    triggers: Trigger[]
+    cleared: Cleared[]
     adapter: (key: string) => Promise<LivenessReading>
   } {
     const emissions: Emission[] = []
     const statusCalls: StatusParams[] = []
+    const triggers: Trigger[] = []
+    const cleared: Cleared[] = []
     _resetOutageState()
     initOutageState({
       notify: (key, text) => { emissions.push({ key, text }) },
       getClient: () => makeStubClient() as unknown as Client,
+      // Spies: every arm (with whether it came from inside an attempt for
+      // the key) and every real flag clear.
+      triggerSink: { arm: (key, cause) => { triggers.push({ key, kind: cause.kind, inside: isInsideAttempt(key) }); return true } },
+      onFlagCleared: (key, cls) => { cleared.push({ key, cls }) },
     })
     const stubOpts = statusError
       ? { statusError, statusCalls }
@@ -590,6 +609,8 @@ describe('_buildIsSessionAliveAdapter', () => {
     return {
       emissions,
       statusCalls,
+      triggers,
+      cleared,
       adapter: _buildIsSessionAliveAdapter(() => config),
     }
   }
@@ -615,9 +636,12 @@ describe('_buildIsSessionAliveAdapter', () => {
     rmSync(baseDir, { recursive: true, force: true })
   })
 
-  test('1. alive: status returns a live state → clears ad-unreachable + tmux-unavailable; reads live', async () => {
-    const { emissions, statusCalls, adapter } = makeHarness(undefined, LIVE_STATE)
-    // Pre-raise both flags so the clears are observable
+  // b.jg5 SRJ-312: a `status` is not tmux-touching, so a state answer clears
+  // `ad-unreachable` only; `tmux-unavailable` stays raised, and with the set
+  // not empty no all-clear is posted.
+  test('1. alive (b.jg5 SRJ-312): status returns a live state with both flags raised → clears ad-unreachable only; tmux-unavailable stays raised, no all-clear; reads live', async () => {
+    const { emissions, statusCalls, triggers, cleared, adapter } = makeHarness(undefined, LIVE_STATE)
+    // Pre-raise both flags so the clear (and the flag kept) are observable
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     setOutageFlag('C1', 'tmux-unavailable')
     const before = emissions.length
@@ -629,34 +653,49 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(statusCalls).toHaveLength(1)
     expect(statusCalls[0].claude_instance_id).toBe(personaInstanceId('C1'))
     expect(statusCalls[0].claude_instance_id).toBe('cscb_C1')
+    expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
+    expect(cleared).toEqual([{ key: 'C1', cls: 'ad-unreachable' }])
+    expect(emissions.slice(before)).toEqual([])
+    expect(triggers).toEqual([])
+  })
+
+  // Twin of case 1 (b.jg5 SRJ-312): the `ad-unreachable` clear stays pinned.
+  test('1b. alive (b.jg5 SRJ-312): status returns a live state with only ad-unreachable raised → clears it; one all-clear posted; reads live', async () => {
+    const { emissions, cleared, adapter } = makeHarness(undefined, LIVE_STATE)
+    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
+    const before = emissions.length
+
+    const result = await adapter('C1')
+
+    expect(result).toEqual(LIVENESS_READING_LIVE)
     expect(getOutageFlags('C1').size).toBe(0)
-    const newEmissions = emissions.slice(before)
-    expect(newEmissions).toHaveLength(1)
-    expect(newEmissions[0].key).toBe('C1')
-    expect(newEmissions[0].text).toMatch(/All clear/)
-    expect(newEmissions[0].text).toContain('ad-unreachable')
-    expect(newEmissions[0].text).toContain('tmux-unavailable')
+    expect(cleared).toEqual([{ key: 'C1', cls: 'ad-unreachable' }])
+    expect(emissions.slice(before)).toEqual([{ key: 'C1', text: adUnreachableAllClear('/bin/ad') }])
   })
 
   // b.jg5 SRJ-314: `pending` is its own reading (never `live`); the dead list
   // is closed, so a state CSCB does not know reads `unknown`, never `dead`,
   // and logs one line naming the persona; a known state logs no such line.
-  // Any state answer clears both flags.
+  // b.jg5 SRJ-312: any state answer clears `ad-unreachable` and leaves
+  // `tmux-unavailable` raised (no all-clear while the set is not empty).
   /** The start of the line the probe logs for a state CSCB does not know. */
   const UNKNOWN_STATE_LINE = 'isSessionAlive: status answered a state CSCB does not know'
   test.each([
     ...NOT_PENDING_STATE_READINGS,
     [AGENT_DIRECTOR_PENDING_STATE, LIVENESS_READING_PENDING] as const,
-  ])('status answers state %s → reads %j and clears both flags; an unknown-state line only for a state CSCB does not know', async (state, reading) => {
-    const { statusCalls, adapter } = makeHarness(undefined, state)
+  ])('status answers state %s → reads %j; clears ad-unreachable and leaves tmux-unavailable raised, no all-clear (b.jg5 SRJ-312); an unknown-state line only for a state CSCB does not know', async (state, reading) => {
+    const { emissions, statusCalls, cleared, adapter } = makeHarness(undefined, state)
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     setOutageFlag('C1', 'tmux-unavailable')
+    const before = emissions.length
 
     const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
 
     expect(result).toEqual(reading)
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
-    expect(getOutageFlags('C1').size).toBe(0)
+    expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
+    expect(cleared).toEqual([{ key: 'C1', cls: 'ad-unreachable' }])
+    expect(emissions.slice(before)).toEqual([])
     const unknownStateLines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.includes(UNKNOWN_STATE_LINE))
     if (state === UNRECOGNISED_STATE) {
       expect(unknownStateLines).toHaveLength(1)
@@ -697,8 +736,10 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(result).not.toHaveProperty('launchStartedAt')
   })
 
-  test('2. ErrSpawnNotFound: status throws → clears ad-unreachable + tmux-unavailable; reads dead', async () => {
-    const { emissions, statusCalls, adapter } = makeHarness(errSpawnNotFound())
+  // b.jg5 SRJ-312: agent-director answered but tmux did not, so an
+  // ErrSpawnNotFound clears `ad-unreachable` only.
+  test('2. ErrSpawnNotFound (b.jg5 SRJ-312): status throws with both flags raised → clears ad-unreachable only; tmux-unavailable stays raised, no all-clear; reads dead', async () => {
+    const { emissions, statusCalls, triggers, cleared, adapter } = makeHarness(errSpawnNotFound())
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     setOutageFlag('C1', 'tmux-unavailable')
     const before = emissions.length
@@ -707,12 +748,24 @@ describe('_buildIsSessionAliveAdapter', () => {
 
     expect(result).toEqual(LIVENESS_READING_DEAD)
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
+    expect(cleared).toEqual([{ key: 'C1', cls: 'ad-unreachable' }])
+    expect(emissions.slice(before)).toEqual([])
+    expect(triggers).toEqual([])
+  })
+
+  // Twin of case 2 (b.jg5 SRJ-312): the `ad-unreachable` clear stays pinned.
+  test('2b. ErrSpawnNotFound (b.jg5 SRJ-312): status throws with only ad-unreachable raised → clears it; one all-clear posted; reads dead', async () => {
+    const { emissions, cleared, adapter } = makeHarness(errSpawnNotFound())
+    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
+    const before = emissions.length
+
+    const result = await adapter('C1')
+
+    expect(result).toEqual(LIVENESS_READING_DEAD)
     expect(getOutageFlags('C1').size).toBe(0)
-    const newEmissions = emissions.slice(before)
-    expect(newEmissions).toHaveLength(1)
-    expect(newEmissions[0].text).toMatch(/All clear/)
-    expect(newEmissions[0].text).toContain('ad-unreachable')
-    expect(newEmissions[0].text).toContain('tmux-unavailable')
+    expect(cleared).toEqual([{ key: 'C1', cls: 'ad-unreachable' }])
+    expect(emissions.slice(before)).toEqual([{ key: 'C1', text: adUnreachableAllClear('/bin/ad') }])
   })
 
   test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; reads dead', async () => {
@@ -731,12 +784,15 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions[0].text).toContain(binaryPath)
   })
 
-  test('4. ErrTmuxNotAvailable: status throws → sets tmux-unavailable (no detail); reads unknown, not dead', async () => {
-    const { emissions, statusCalls, adapter } = makeHarness(errTmuxNotAvailable(undefined, 'status'))
+  // b.jg5 SRJ-311: the ENVIRONMENT cause arms the persona's timer from any
+  // verb in any context; the probe here runs outside every attempt.
+  test('4. ErrTmuxNotAvailable: status throws → sets tmux-unavailable (no detail); reads unknown, not dead; the ENVIRONMENT cause is reported once outside any attempt (b.jg5 SRJ-311)', async () => {
+    const { emissions, statusCalls, triggers, adapter } = makeHarness(errTmuxNotAvailable(undefined, 'status'))
 
     const result = await adapter('C1')
 
     expect(result).toEqual(LIVENESS_READING_UNKNOWN)
+    expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, inside: false }])
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(true)
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(false)
@@ -762,8 +818,8 @@ describe('_buildIsSessionAliveAdapter', () => {
     ['an UNUSABLE NAME ErrInternal', () => errUnusableName()],
     ['a store agent-director cannot open (ErrSchemaMismatch)', () => errSchemaMismatch()],
     ['a GONE name (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(undefined, 'status')],
-  ])('%s: status throws → reads unknown, not dead; no flag, nothing posted, one log line', async (_label, build) => {
-    const { emissions, statusCalls, adapter } = makeHarness(build())
+  ])('%s: status throws → reads unknown, not dead; no flag, nothing posted, one log line; outside any attempt nothing is armed (only ENVIRONMENT arms there, b.jg5 SRJ-311)', async (_label, build) => {
+    const { emissions, statusCalls, triggers, adapter } = makeHarness(build())
 
     const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
 
@@ -772,6 +828,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(getOutageFlags('C1').size).toBe(0)
     expect(emissions).toHaveLength(0)
     expect(errArgs).toHaveLength(1)
+    expect(triggers).toEqual([])
   })
 
   test('5. each persona is probed by its own key: cscb_<key> for the key passed (b.av2 SR-2.2)', async () => {
@@ -1975,9 +2032,11 @@ describe('_buildReconnectSessionAdapter', () => {
 // The restart work's kill adapter, run inside a recovery attempt for the
 // persona as `runRestartWork` runs it. An UNAVAILABLE kill (by name,
 // `ErrTmuxKillFailed` included) answers `KILL_SESSION_REFUSED` with one
-// described line, so the restart work launches nothing; success and
-// `ErrSpawnNotFound` answer nothing ("go on"); the outage-class branches and
-// every other class keep today's handling (go on). The kill follows a `dead`
+// described line, so the restart work launches nothing; so does an
+// ENVIRONMENT kill (`ErrTmuxNotAvailable`, b.jg5 SRJ-311), which also raises
+// `tmux-unavailable`; success and `ErrSpawnNotFound` answer nothing ("go
+// on"); `ErrSystemInstallDisappeared` and every other class keep today's
+// handling (go on). The kill follows a `dead`
 // reading, so it is declared as not of a row read live: not tmux-touching, it
 // never starts (or, on success, ends) the `tmux-unresponsive` condition. The
 // outage state's trigger and condition sinks are spies.
@@ -2098,11 +2157,31 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
     expect(starts).toEqual([])
   })
 
-  // The outage-class branches are unchanged: the flag is raised by the
+  // b.jg5 SRJ-311: an ENVIRONMENT kill is a refusal, never swallowed into a
+  // launch. The wrapper raises `tmux-unavailable` (its one onset) and arms the
+  // timer once with the ENVIRONMENT cause; ENVIRONMENT never starts the
+  // `tmux-unresponsive` condition (SRJ-307).
+  test('b.jg5 SRJ-311: kill answers ErrTmuxNotAvailable (ENVIRONMENT) → KILL_SESSION_REFUSED, not swallowed into a launch; one described refusal line; tmux-unavailable raised with its onset; the timer armed once with the environment cause; no condition', async () => {
+    const err = errTmuxNotAvailable(undefined, 'kill')
+    install(err)
+
+    const { result, errArgs } = await killInAttempt()
+
+    expect(result).toBe(KILL_SESSION_REFUSED)
+    expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+    expect(stringLines(errArgs)).toEqual([refusedLine(err)])
+    expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
+    expect(emissions).toEqual([{ key: 'C1', text: ONSET_TEMPLATES['tmux-unavailable']() }])
+    expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
+    expect(starts).toEqual([])
+    expect(ends).toEqual([])
+    assertNoLeak({ errArgs, emissions })
+  })
+
+  // The `ad-unreachable` branch is unchanged: the flag is raised by the
   // wrapper and the adapter goes on, with no refusal line.
   test.each([
     ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('kill'), 'ad-unreachable'],
-    ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill'), 'tmux-unavailable'],
   ] as const)('kill answers %s → answers nothing (go on); its outage flag is raised; no refusal line, no condition', async (_label, build, flag) => {
     install(build())
 

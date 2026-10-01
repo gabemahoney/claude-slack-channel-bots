@@ -13,13 +13,18 @@
  *   - initOutageState(deps)                — install production dependencies
  *   - getOutageFlags(key)                  — read live flag set
  *   - setOutageFlag(key, cls, detail?)     — raise flag + emit onset notice
- *   - clearOutageFlag(key, cls)            — lower flag; emits all-clear when set empties
- *   - resetAllToHealthy(keys)              — silent wipe (boot-time reset; one key at a teardown)
+ *   - clearOutageFlag(key, cls, reading?)  — lower flag; emits all-clear when set empties;
+ *                                            a real clear is told to the cleared-flag observer
+ *   - resetAllToHealthy(keys)              — silent wipe (boot-time reset; one key at a teardown);
+ *                                            tells the observer nothing
  *   - withOutageDetection(key, dir, call, fn) — AD verb wrapper; raises/clears flags on error/success;
- *                                            `call` is the verb `fn` calls, declared by the site
+ *                                            `call` is the verb `fn` calls, declared by the site;
+ *                                            clears tmux-unavailable only on a tmux-touching
+ *                                            success or GONE (b.jg5 SRJ-312)
  *   - withSpawnDetection(key, dir, call, fn)  — like withOutageDetection + clears cwd-unreachable on success
  *   - reportAgentDirectorError(key, err, call) — report an error to the retry timer's trigger sink
- *                                            (inside a launch or recovery attempt only; b.jg5 SRJ-301)
+ *                                            (inside a launch or recovery attempt, and for
+ *                                            ENVIRONMENT in any context; b.jg5 SRJ-301, SRJ-311)
  *                                            and start or continue the persona's tmux-unresponsive
  *                                            condition (b.jg5 SRJ-307)
  *   - _resetOutageState()                  — test-only state reset
@@ -41,6 +46,7 @@
 
 import type { Client } from 'agent-director'
 import {
+  AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_GONE,
   adCallVerb,
   classifyAdError,
@@ -51,7 +57,6 @@ import {
 } from './ad-error-class.ts'
 import {
   ErrSystemInstallDisappeared,
-  ErrTmuxNotAvailable,
   ErrCwdNotFound,
   ErrCwdNotADirectory,
 } from './agent-director-errors.ts'
@@ -112,6 +117,18 @@ export interface OutageStateDeps {
    * starts or ends.
    */
   conditionSink?: TmuxUnresponsiveSink
+  /**
+   * The cleared-flag observer (b.jg5 SRJ-305, SRJ-311): called once each time
+   * `clearOutageFlag` lowers a flag that was raised for persona `key`, with
+   * its class and the reading the clear brought, when it came from a check
+   * that read the row live (the health tick's healthy branch, a retry's
+   * healthy row). Called after the state change and any all-clear notice. A
+   * clear of a flag not raised, and `resetAllToHealthy` (boot, teardown),
+   * never call it. Production binds it in `main()` so a `tmux-unavailable`
+   * clear reaches the retry timer's condition-end entry. A throw is swallowed.
+   * Absent: nothing is called.
+   */
+  onFlagCleared?: (key: string, cls: OutageClass, reading?: string) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -228,9 +245,12 @@ export function setOutageFlag(key: string, cls: OutageClass, detail?: string): v
  * non-empty bad-stretch history (i.e., at least one onset was recorded).
  * Intermediate clears (flag set still non-empty after removal) are silent.
  *
- * State mutates BEFORE the emit (same contract as setOutageFlag).
+ * State mutates BEFORE the emit (same contract as setOutageFlag). After it,
+ * a real clear (the flag was raised) is told to the cleared-flag observer
+ * (`OutageStateDeps.onFlagCleared`) with `reading`: the row reading a check
+ * that found the row live brings (b.jg5 SRJ-305), absent otherwise.
  */
-export function clearOutageFlag(key: string, cls: OutageClass): void {
+export function clearOutageFlag(key: string, cls: OutageClass, reading?: string): void {
   if (!deps) return
   const entry = entries.get(key)
   if (!entry) return
@@ -243,6 +263,16 @@ export function clearOutageFlag(key: string, cls: OutageClass): void {
     entry.badStretchClasses = new Map()
     deps.notify(key, ALL_CLEAR_TEMPLATE(snapshot))
   }
+  flagCleared(key, cls, reading)
+}
+
+/** Tell the cleared-flag observer of a real clear. Never throws. */
+function flagCleared(key: string, cls: OutageClass, reading: string | undefined): void {
+  try {
+    deps?.onFlagCleared?.(key, cls, reading)
+  } catch {
+    /* an observer must not change what a clear does */
+  }
 }
 
 /**
@@ -251,7 +281,8 @@ export function clearOutageFlag(key: string, cls: OutageClass): void {
  * server.ts with the applied persona keys, before any persona is brought up,
  * as a defensive boundary for pre-start observations (added in Epic 2), and
  * with one key by a teardown (b.av2 SR-6.5), which clears that persona's
- * flags with no all-clear notice; other personas' entries are untouched.
+ * flags with no all-clear notice; other personas' entries are untouched. It
+ * never calls the cleared-flag observer, so it stops no retry timer.
  */
 export function resetAllToHealthy(keys: string[]): void {
   for (const key of keys) {
@@ -271,7 +302,8 @@ export function resetAllToHealthy(keys: string[]): void {
  *
  * On error:
  *   - ErrSystemInstallDisappeared → raises 'ad-unreachable' (detail = binaryPath)
- *   - ErrTmuxNotAvailable         → raises 'tmux-unavailable'
+ *   - ENVIRONMENT (`ErrTmuxNotAvailable`, by class through
+ *     `src/ad-error-class.ts`) → raises 'tmux-unavailable'
  *   - ErrCwdNotFound / ErrCwdNotADirectory → raises 'cwd-unreachable' (detail =
  *     workingDirectory, the persona's working directory) UNLESS
  *     workingDirectory is undefined, in which case logs loudly and rethrows
@@ -279,19 +311,32 @@ export function resetAllToHealthy(keys: string[]): void {
  *   - Other errors → no flag change; rethrow unchanged.
  * Then, every error is reported (`reportAgentDirectorError`) with the
  * declared call, which arms the persona's retry timer when the call ran
- * inside a launch or recovery attempt for it and the error is a trigger, and,
- * inside such an attempt, starts or continues its `tmux-unresponsive`
- * condition when the call is tmux-touching and the error is UNAVAILABLE (not
- * `ErrTmuxKillFailed`). A GONE
- * answer from a tmux-touching call ends the condition, in any context.
+ * inside a launch or recovery attempt for it and the error is a trigger, or
+ * the error is ENVIRONMENT (in any context, b.jg5 SRJ-311), and, inside such
+ * an attempt, starts or continues its `tmux-unresponsive` condition when the
+ * call is tmux-touching and the error is UNAVAILABLE (not
+ * `ErrTmuxKillFailed`). A GONE answer (`ErrTmuxSendKeys`,
+ * `ErrTmuxCaptureFailed`, by class) from a tmux-touching call clears
+ * 'tmux-unavailable' and ends the condition, in any context, before the same
+ * value is rethrown; a GONE-classed value from a call that is not
+ * tmux-touching does neither.
  *
- * On success: clears 'ad-unreachable' and 'tmux-unavailable', and a
- * tmux-touching call ends the persona's `tmux-unresponsive` condition, in any
- * context; returns result. A launch call (`isLaunchCall`: `spawn`, plain or
- * reuse, or `resume`) ends it with the reading `pending`, the state its
- * success leaves the row in, so the retry timer's `pending` exception keeps
- * the timer (b.jg5 SRJ-305, SRJ-306); every other tmux-touching success, and
- * a GONE answer, ends it with no reading.
+ * On success (b.jg5 SRJ-312):
+ *   - 'ad-unreachable' clears on any call;
+ *   - 'tmux-unavailable' clears only when the declared call is tmux-touching
+ *     (`isTmuxTouchingCall`: `spawn`, plain or reuse, `resume`, `read-pane`,
+ *     `send-keys`, `pause`, and a `kill` only when declared as a kill of a
+ *     row read live). A successful `status`, `get`, `list`, `find-missing`,
+ *     `delete`, `get-permission`, `decide` or undeclared-live `kill` leaves it
+ *     raised: tmux did not answer them;
+ *   - a tmux-touching call ends the persona's `tmux-unresponsive` condition,
+ *     in any context. A launch call (`isLaunchCall`: `spawn`, plain or reuse,
+ *     or `resume`) ends it, and clears 'tmux-unavailable', with the reading
+ *     `pending`, the state its success leaves the row in, so the retry
+ *     timer's `pending` exception keeps the timer (b.jg5 SRJ-305, SRJ-306);
+ *     every other tmux-touching success, and a GONE answer, ends and clears
+ *     with no reading.
+ * Returns result.
  *
  * The original error is always rethrown so callers can handle it normally.
  */
@@ -309,13 +354,18 @@ export async function withOutageDetection<T>(
   try {
     const result = await fn(deps.getClient())
     clearOutageFlag(key, 'ad-unreachable')
-    clearOutageFlag(key, 'tmux-unavailable')
-    if (isTmuxTouchingCall(call)) endTmuxUnresponsive(key, isLaunchCall(call) ? UNAVAILABLE_RETRY_ROW_PENDING : undefined)
+    if (isTmuxTouchingCall(call)) {
+      // A launch's success leaves its row `pending`: both ends bring that reading.
+      const reading = isLaunchCall(call) ? UNAVAILABLE_RETRY_ROW_PENDING : undefined
+      clearOutageFlag(key, 'tmux-unavailable', reading)
+      endTmuxUnresponsive(key, reading)
+    }
     return result
   } catch (err) {
+    const { errorClass } = classifyAdError(err)
     if (err instanceof ErrSystemInstallDisappeared) {
       setOutageFlag(key, 'ad-unreachable', err.binaryPath)
-    } else if (err instanceof ErrTmuxNotAvailable) {
+    } else if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
       setOutageFlag(key, 'tmux-unavailable')
     } else if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
       if (workingDirectory !== undefined) {
@@ -327,7 +377,11 @@ export async function withOutageDetection<T>(
       }
     }
     reportAgentDirectorError(key, err, call)
-    if (isTmuxTouchingCall(call) && classifyAdError(err).errorClass === AD_ERROR_CLASS_GONE) endTmuxUnresponsive(key)
+    if (isTmuxTouchingCall(call) && errorClass === AD_ERROR_CLASS_GONE) {
+      // b.jg5 SRJ-312: GONE from a tmux-touching call is tmux answering.
+      clearOutageFlag(key, 'tmux-unavailable')
+      endTmuxUnresponsive(key)
+    }
     throw err
   }
 }
@@ -335,22 +389,28 @@ export async function withOutageDetection<T>(
 /**
  * reportAgentDirectorError — the one reporting point for an agent-director
  * error met by persona `key`'s call, declared as `call` (b.jg5 SRJ-301,
- * SRJ-307). The wrappers call it for every wrapped call that throws, and two
- * unwrapped calls for their own errors: the liveness adapter's bare `status`
- * and the shared findMissing sweep's `find-missing`. Inside a launch or
- * recovery attempt for `key`:
+ * SRJ-307, SRJ-311). The wrappers call it for every wrapped call that throws,
+ * and two unwrapped calls for their own errors: the liveness adapter's bare
+ * `status` and the shared findMissing sweep's `find-missing`.
  *
- * - an error the arming predicate answers a cause for is sent once to the
- *   installed trigger sink, and the attempt records it as its last error
- *   (`reportAttemptError` in `src/unavailable-retry.ts`);
- * - when the call is tmux-touching (`isTmuxTouchingCall`) and the arming
- *   predicate answers the UNAVAILABLE cause (never the kill-failure cause),
- *   the installed condition sink starts or continues the persona's
- *   `tmux-unresponsive` condition.
+ * - An ENVIRONMENT answer (`ErrTmuxNotAvailable`) from any verb, `kill`
+ *   included, is sent once to the installed trigger sink with the
+ *   ENVIRONMENT cause in any context: inside an attempt for `key`, inside
+ *   another persona's attempt, or outside every attempt
+ *   (`reportAttemptError` in `src/unavailable-retry.ts`).
+ * - Inside a launch or recovery attempt for `key`, any other error the
+ *   arming predicate answers a cause for is sent once to the trigger sink,
+ *   and the attempt records the error (ENVIRONMENT included) as its last,
+ *   so a launch it ends is refused and never counted.
+ * - Inside such an attempt, when the call is tmux-touching
+ *   (`isTmuxTouchingCall`) and the arming predicate answers the UNAVAILABLE
+ *   cause (never the kill-failure or ENVIRONMENT cause), the installed
+ *   condition sink starts or continues the persona's `tmux-unresponsive`
+ *   condition.
  *
- * Outside such an attempt, or with no sink installed, nothing is armed or
- * started. Flags and notices are untouched, and it never throws, so the
- * caller's own handling and rethrow are as without it.
+ * With no sink installed, nothing is armed or started. Flags and notices are
+ * untouched, and it never throws, so the caller's own handling and rethrow
+ * are as without it.
  */
 export function reportAgentDirectorError(key: string, err: unknown, call: AdCall): void {
   const verb = adCallVerb(call)
@@ -361,8 +421,8 @@ export function reportAgentDirectorError(key: string, err: unknown, call: AdCall
 /**
  * Start or continue persona `key`'s `tmux-unresponsive` condition for `err`
  * from `call`, when the call ran inside an attempt for `key`, is
- * tmux-touching and the arming predicate answers the UNAVAILABLE cause.
- * Never throws.
+ * tmux-touching and the arming predicate answers the UNAVAILABLE cause (so
+ * never for ENVIRONMENT, b.jg5 SRJ-307). Never throws.
  */
 function startTmuxUnresponsive(key: string, err: unknown, call: AdCall, verb: AdVerb | undefined): void {
   try {

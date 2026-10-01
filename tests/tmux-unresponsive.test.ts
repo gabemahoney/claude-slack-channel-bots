@@ -80,7 +80,7 @@ import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_
 import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
-import { LIVENESS_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
+import { LIVENESS_LIVE, LIVENESS_READING_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
 import {
   ALL_CLEAR_TEMPLATE,
   getOutageFlags,
@@ -113,6 +113,7 @@ import {
   UNAVAILABLE_RETRY_STOP_CAPPED,
   UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
   UNAVAILABLE_RETRY_STOP_NOT_UP,
+  UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   UNAVAILABLE_RETRY_TERMINAL_STOPS,
   type UnavailableRetryConditionEndResult,
@@ -421,6 +422,8 @@ describe('tmux-unresponsive: held apart from the outages', () => {
     // A tmux-unavailable outage raised while the condition holds.
     const raised = await raiseOutage(p, undefined, errTmuxNotAvailable(undefined, 'status'))
 
+    // The condition's end hook alone; the health tick's own clear of
+    // tmux-unavailable (SRJ-312) is health-check's, not the condition's.
     expect(h.tickEnd(p)).toBe('ended')
 
     expect([...getOutageFlags(p)]).toEqual([raised])
@@ -429,19 +432,88 @@ describe('tmux-unresponsive: held apart from the outages', () => {
     expectNeverStarted(h, b)
   })
 
-  test('a tmux-unavailable outage raised and cleared while the condition holds posts its single all-clear, neither held back nor joined; the condition still holds', async () => {
-    const { h, p, b } = build()
+  // b.jg5 SRJ-312: only tmux answering clears tmux-unavailable (a
+  // tmux-touching success or GONE, or a check that finds the row live and
+  // connected), and each of those ends the condition too. The wrapper's
+  // success and GONE branches clear the outage first and end the condition
+  // after, in the same call, so its all-clear is posted while the condition
+  // still holds; the tick and the retry end the condition first. The case
+  // records whether the condition holds at each outage post.
+  test.each<[string, (key: string) => Promise<void>]>([
+    ['a send-keys that succeeds', (key) => wrapped(key, 'send-keys', RESOLVES)],
+    ['a read-pane that answers GONE (ErrTmuxCaptureFailed)', (key) => wrapped(key, 'read-pane', { rejects: () => errTmuxCaptureFailed() })],
+  ])('a tmux-unavailable outage raised while the condition holds, cleared by %s, posts its single all-clear while the condition still holds, neither held back nor joined; the condition, untouched by the outage, then ends by its own reason with its own recovery', async (_what, clear) => {
+    const { h, p, b } = build(TICK_MODE)
     const at = await refuse(h, p)
+    await h.advance(tickMs(h))
+    tick(h)
+    expectPosts(h, [onset(p)])
 
     const raised = await raiseOutage(p, undefined, errTmuxNotAvailable(undefined, 'status'))
-    await withOutageDetection(p, undefined, 'status', () => Promise.resolve(cannedStatusResult({ state: 'waiting' })))
 
+    // The outage's onset leaves the condition as it was.
+    expectHolds(h, p, 'spawn', at)
+    expect(conditionEndedLines(h, p)).toEqual([])
+    expect(h.conditionEnds).toEqual([])
+
+    const holdsAtOutagePost: boolean[] = []
+    const post = h.outageNotices.push.bind(h.outageNotices)
+    h.outageNotices.push = (...notices: RecoveryNotice[]) => {
+      holdsAtOutagePost.push(h.tmuxUnresponsive.holds(p))
+      return post(...notices)
+    }
+
+    await clear(p)
+
+    // The outage: cleared, with one all-clear naming it alone, posted while the condition held.
     expect([...getOutageFlags(p)]).toEqual([])
     expect(h.outageNotices).toEqual([
       { key: p, text: ONSET_TEMPLATES[raised]() },
       { key: p, text: ALL_CLEAR_TEMPLATE(new Map([[raised, { detail: undefined }]])) },
     ])
+    expect(holdsAtOutagePost).toEqual([true])
+    // The clear came first: it reached the retry timer's condition-end entry
+    // and stopped P's timer (SRJ-306), which, as every real stop while the
+    // condition holds, cancelled its pending alert check (SRJ-309).
+    expect(h.outageClears).toEqual([{ key: p, reading: undefined, result: 'stopped' }])
+
+    // The condition: its own end (the tmux verb), once, with its own recovery,
+    // apart from the all-clear; the timer was already stopped when it ended.
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(h.episodeNotices).toEqual([onset(p), recovery(p)])
+    expect(noticeAndEndLines(h, p)).toEqual([
+      conditionOnsetLine(p, 'a health tick', tickMs(h)),
+      alertCancelledLine(p, UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED),
+      conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TMUX_VERB),
+      conditionRecoveryLine(p),
+    ])
+    expect(h.conditionEnds).toEqual([{ key: p, reading: undefined, result: 'not-armed' }])
+    expectNeverStarted(h, b)
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
+    ['a wrapped status', async (_h, key) => {
+      await withOutageDetection(key, undefined, 'status', () => Promise.resolve(cannedStatusResult({ state: 'waiting' })))
+    }],
+    ['the health tick’s liveness read (its bare status)', async (h, key) => {
+      h.script({ statusResult: cannedStatusResult({ state: 'waiting' }) })
+      const before = h.stub.calls.statusCalls.length
+      expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_LIVE)
+      expect(h.stub.calls.statusCalls).toHaveLength(before + 1)
+    }],
+  ])('SRJ-312: %s that succeeds while the tmux-unavailable outage and the condition are both active clears neither and posts nothing', async (_what, read) => {
+    const { h, p, b } = build()
+    const at = await refuse(h, p)
+    const raised = await raiseOutage(p, undefined, errTmuxNotAvailable(undefined, 'status'))
+
+    await read(h, p)
+
+    expect([...getOutageFlags(p)]).toEqual([raised])
+    expect(h.outageNotices).toEqual([{ key: p, text: ONSET_TEMPLATES[raised]() }])
+    expect(h.outageClears).toEqual([])
+    expect(h.controller.isArmed(p)).toBe(true)
     expectHolds(h, p, 'spawn', at)
+    expect(conditionEndedLines(h, p)).toEqual([])
     expect(h.conditionEnds).toEqual([])
     expect(h.episodeNotices).toEqual([])
     expectNeverStarted(h, b)

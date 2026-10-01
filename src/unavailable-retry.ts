@@ -64,11 +64,15 @@
  *   `stop` answer makes it moot,
  *   but a pending-only stop that yields to a full-mode cause counts as
  *   `again` here, and when the rule stops the timer the yielded stop's
- *   hand-off runs after that stop. Its caller is the `tmux-unresponsive`
+ *   hand-off runs after that stop. Its callers are the `tmux-unresponsive`
  *   condition's end (`createTmuxUnresponsiveCondition` in
- *   `src/persona-episodes.ts`, bound in `main()`); `tmux-unavailable` has no
- *   caller yet. The exceptions hold against this entry only; every other
- *   stop is unaffected.
+ *   `src/persona-episodes.ts`, bound in `main()`) and each real clear of the
+ *   `tmux-unavailable` outage (the outage state's cleared-flag observer,
+ *   `OutageStateDeps.onFlagCleared`, bound in `main()`), which passes on the
+ *   reading the clear brought: a tick's or retry's live reading, or a launch
+ *   call's `pending`. A silent boot or teardown reset of the outage flags
+ *   reaches neither. The exceptions hold against this entry only; every
+ *   other stop is unaffected.
  * - The optional retry observer (`UnavailableRetryDeps.onRetryFire`) is
  *   called once at every retry, a retry the action skips for work in flight
  *   included, before the action runs (b.jg5 SRJ-308: the
@@ -135,12 +139,14 @@
  * which the agent-director wrappers and the liveness adapter reach through
  * `src/outage-state.ts`: inside an attempt for `key`, the arming predicate
  * `unavailableRetryCauseFor(value, verb)` decides the cause (UNAVAILABLE from
- * any verb, `ErrTmuxKillFailed` told apart by name; any other `status`, `get`
- * or `list` error but `ErrSpawnNotFound`, CONFIG and UNUSABLE NAME), the
- * trigger sink (`UnavailableRetryTriggerSink`, which the controller is) arms
- * the persona's timer with it, and the innermost attempt records the error as
- * its last, with whether it armed. A trigger while armed keeps the due time
- * (`arm` above). A second arming path is the restart work's arm hook,
+ * any verb, `ErrTmuxKillFailed` told apart by name; ENVIRONMENT from any
+ * verb; any other `status`, `get` or `list` error but `ErrSpawnNotFound`,
+ * CONFIG and UNUSABLE NAME), the trigger sink (`UnavailableRetryTriggerSink`,
+ * which the controller is) arms the persona's timer with it, and the
+ * innermost attempt records the error as its last, with whether it armed.
+ * The ENVIRONMENT cause (`ErrTmuxNotAvailable`, b.jg5 SRJ-311) arms the
+ * persona's timer outside an attempt for it too; no other cause does. A
+ * trigger while armed keeps the due time (`arm` above). A second arming path is the restart work's arm hook,
  * `RestartDeps.armRetryTimer` (wired in `main()`): it arms the persona's
  * timer with `UNAVAILABLE_RETRY_CAUSE_READ_ERROR` on every `unknown` liveness
  * reading at the restart work, the re-probe's included, whatever made it
@@ -222,6 +228,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 
 import {
   AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNUSABLE_NAME,
   AD_READ_VERBS,
@@ -250,6 +257,16 @@ export const UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE = 'unavailable'
 
 /** The cause of an `ErrTmuxKillFailed` in an attempt: UNAVAILABLE, told apart by name. */
 export const UNAVAILABLE_RETRY_CAUSE_KILL_FAILED = 'kill-failed'
+
+/**
+ * The cause of an ENVIRONMENT answer (`ErrTmuxNotAvailable`) from any verb
+ * for the persona (b.jg5 SRJ-301, SRJ-311, SRJ-105), in or out of an attempt:
+ * the only cause that arms outside a launch or recovery attempt for the
+ * persona (`reportAttemptError`). Never counted, and it never starts or
+ * continues the `tmux-unresponsive` condition (SRJ-307: only UNAVAILABLE
+ * does).
+ */
+export const UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT = 'environment'
 
 /**
  * The cause of any other `status`, `get` or `list` error in an attempt (b.jg5
@@ -1144,9 +1161,10 @@ export interface FullModeRetryDeps {
    * full-mode retry finds the persona already connected with its stream on a
    * `live` reading (`LIVENESS_LIVE`), and when a pending-only retry reads the
    * row live out of `pending` (its state) with the session connected with its
-   * stream. Production binds the condition's end (reason `retry`). Absent:
-   * nothing is called. A throw is swallowed and changes nothing about the
-   * retry's answer.
+   * stream. Production binds the condition's end (reason `retry`) and the
+   * clear of the persona's `tmux-unavailable` outage with the same reading
+   * (b.jg5 SRJ-311, SRJ-312). Absent: nothing is called. A throw is
+   * swallowed and changes nothing about the retry's answer.
    */
   endTmuxUnresponsive?: (key: string, reading: string) => void
 }
@@ -1412,15 +1430,23 @@ function describeCause(cause: UnavailableRetryCause): string {
 
 /**
  * What arms persona P's retry timer when `value` is thrown by an
- * agent-director call made with `verb` inside a launch or recovery attempt
- * for P (b.jg5 SRJ-301), classified by `classifyAdError`:
+ * agent-director call made with `verb` for P (b.jg5 SRJ-301), classified by
+ * `classifyAdError`, in this order:
  *
  * - UNAVAILABLE from any verb: an `unavailable` cause, or a `kill-failed`
  *   cause when the value's name is `ErrTmuxKillFailed`;
+ * - ENVIRONMENT (`ErrTmuxNotAvailable`) from any verb, `kill` and the read
+ *   verbs included: an `environment` cause
+ *   (`UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT`, SRJ-311). It is decided before
+ *   the read-error rule, so a `status`, `get` or `list` answering it records
+ *   this cause, not `read-error`;
  * - any other `status`, `get` or `list` error: a `read-error` cause, except
  *   `ErrSpawnNotFound` (each site keeps its meaning) and a CONFIG or UNUSABLE
  *   NAME answer (each takes its own handling, SRJ-105);
  * - `undefined` (nothing arms) otherwise.
+ *
+ * The ENVIRONMENT cause arms in any context; every other cause arms only
+ * inside a launch or recovery attempt for P (`reportAttemptError`).
  *
  * The cause carries `value`, which reaches a line only through
  * `describeThrownValue`. `verb` is agent-director's verb name (`status`,
@@ -1437,6 +1463,7 @@ export function unavailableRetryCauseFor(value: unknown, verb: string | undefine
         : UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE
       return { kind, error: value }
     }
+    if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) return { kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, error: value }
     if (verb === undefined || !AD_READ_VERBS.has(verb)) return undefined
     if (errorClass === AD_ERROR_CLASS_CONFIG || errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) return undefined
     if (hasAdErrorName(value, ERR_SPAWN_NOT_FOUND_NAME)) return undefined
@@ -1546,12 +1573,19 @@ export function isInsideAttempt(key: string): boolean {
 
 /**
  * Report an agent-director error for persona `key`, thrown by a call made
- * with `verb` (b.jg5 SRJ-301). Outside an attempt for `key` it does nothing.
- * Inside one, when the arming predicate answers a cause and `sink` is given,
- * the sink is called once with `key` and the cause; the innermost attempt
- * then records the error as its last, armed when the sink answered true (the
- * persona has a timer after the call); a sink that answers anything else, or
- * throws, armed nothing. Answers whether the sink armed. Never throws.
+ * with `verb` (b.jg5 SRJ-301, SRJ-311). When the arming predicate answers a
+ * cause and `sink` is given, the sink is called once with `key` and the
+ * cause, inside an attempt for `key`, and for the ENVIRONMENT cause
+ * (`UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT`) in any context too: inside another
+ * persona's attempt or outside every attempt (the health tick, the permission
+ * poller and click handler, the JSONL safeguard, a teardown's kill). A stray
+ * arm there (a torn-down persona, one not applied or not up) stops at its
+ * first retry through the action's stop checks, with no agent-director call.
+ * Outside an attempt for `key`, any other cause arms nothing. Inside one,
+ * the innermost attempt then records the error as its last, armed when the
+ * sink answered true (the persona has a timer after the call), so a launch
+ * ended by it is refused; a sink that answers anything else, or throws, armed
+ * nothing. Answers whether the sink armed. Never throws.
  */
 export function reportAttemptError(
   key: string,
@@ -1561,8 +1595,8 @@ export function reportAttemptError(
 ): boolean {
   try {
     const frame = innermostFrame(key)
-    if (frame === undefined) return false
     const cause = unavailableRetryCauseFor(value, verb)
+    if (frame === undefined && cause?.kind !== UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT) return false
     let armed = false
     if (cause !== undefined && sink !== undefined) {
       try {
@@ -1571,6 +1605,7 @@ export function reportAttemptError(
         /* a failing sink arms nothing; the call's own error is what its caller sees */
       }
     }
+    if (frame === undefined) return armed
     frame.lastError = {
       ...(verb !== undefined ? { verb } : {}),
       ...(cause !== undefined ? { causeKind: cause.kind } : {}),

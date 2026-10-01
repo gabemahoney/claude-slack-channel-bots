@@ -123,6 +123,18 @@
  *   itself, never a value taken once; its alert is cancelled only by the
  *   teardown's retry-timer stop (pinned in tests/reload-wiring.test.ts) and
  *   by shutdown's close of the episodes.
+ * - b.jg5 SRJ-311 / SRJ-312 / SRJ-305 / SRJ-306: the one `initOutageState`
+ *   call (in main()'s own statement list, after the retry controller and
+ *   before the start pass) installs the cleared-flag observer
+ *   (`onFlagCleared`), named nowhere else, which reports only a
+ *   `tmux-unavailable` clear to the retry controller's `conditionEnded` for
+ *   the tmux-unavailable condition, with the persona and the clear's reading;
+ *   the full-mode retry action's healthy-row hook ends the tmux-unresponsive
+ *   condition and clears `tmux-unavailable` through the outage state's
+ *   `clearOutageFlag` with the retry's own reading, and that is server.ts's
+ *   only `tmux-unavailable` clear (every other clear there is
+ *   `ad-unreachable`). These are the only two `conditionEnded` reports in
+ *   server.ts.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -179,7 +191,8 @@ import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
 import type { FullModeRetryDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
 import type * as LivenessReadingModule from '../src/liveness-reading.ts'
 import type { HealthCheckDeps } from '../src/health-check.ts'
-import type { OutageStateDeps } from '../src/outage-state.ts'
+import type * as OutageStateModule from '../src/outage-state.ts'
+import type { OutageClass, OutageStateDeps } from '../src/outage-state.ts'
 import type * as PersonaConnectionsModule from '../src/persona-connections.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
@@ -1635,6 +1648,8 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
   const CONTROLLER_END: keyof UnavailableRetryController = 'conditionEnded'
   const RETRY_CONDITION: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE'
   const LIVE: keyof typeof LivenessReadingModule = 'LIVENESS_LIVE'
+  const FLAG_CLEARED: keyof OutageStateDeps = 'onFlagCleared'
+  const TMUX_UNAVAILABLE_CLASS: OutageClass = 'tmux-unavailable'
 
   test('the condition is built exactly once, in main()\'s own statement list (not at module scope, behind no branch), over the one notice episodes instance, after the retry controller and before the start bring-up, initRestart and initHealthCheck', () => {
     const at = onlyCallOf(FACTORY)
@@ -1694,10 +1709,14 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
     const props = onlyCallProps('createFullModeRetryAction')
     const hook = props.get(RETRY_HOOK)
     expect(hook).toBeDefined()
-    // `(key, reading) => { <condition>.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading) }`,
-    // or the same call as an expression body; the parameters' names are free.
+    // `(key, reading) => { <condition>.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading); <clear> }`,
+    // where <clear> is the same healthy-row observation's `tmux-unavailable`
+    // clear (b.jg5 SRJ-311, SRJ-312; its binding is pinned in the describe
+    // below), in either order; the parameters' names are free. The end is a
+    // statement of its own, never skipped behind a branch.
     const call = `${condition}\\.${END}\\(\\1, ${END_RETRY}, \\2\\)`
-    expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
+    const clear = `clearOutageFlag\\(\\1, '${TMUX_UNAVAILABLE_CLASS}', \\2\\)`
+    expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => \\{ (?:${call};? ${clear}|${clear};? ${call});? \\}$`))
     expect(importSource(SERVER_CODE, END_RETRY)).toBe('./persona-episodes.ts')
 
     // Absent, either probe answers "not connected" and a retry ends nothing:
@@ -1730,8 +1749,107 @@ describe('main() builds the one tmux-unresponsive condition over the notice epis
     const call = `${controller}\\.${CONTROLLER_END}\\(\\1, ${RETRY_CONDITION}, \\2\\)`
     expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ (?:return )?${call};? \\}|${call})$`))
     expect(importSource(SERVER_CODE, RETRY_CONDITION)).toBe('./unavailable-retry.ts')
-    // No other report of a condition's end anywhere in server.ts.
-    expect(indicesOf(new RegExp(`\\.\\s*${CONTROLLER_END}\\s*\\(`, 'g'), SERVER_CODE)).toHaveLength(1)
+    // No other report of a condition's end anywhere in server.ts: this hook's
+    // and the outage state's cleared-flag observer's (b.jg5 SRJ-305, SRJ-306;
+    // pinned in the describe below) are the only two.
+    const endEntry = new RegExp(`\\.\\s*${CONTROLLER_END}\\s*\\(`, 'g')
+    expect(indicesOf(endEntry, SERVER_CODE)).toHaveLength(2)
+    expect(hook!.match(endEntry) ?? []).toHaveLength(1)
+    expect(onlyCallProps('initOutageState').get(FLAG_CLEARED)?.match(endEntry) ?? []).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-311 / SRJ-312 / SRJ-305 / SRJ-306 — the
+// `tmux-unavailable` clear's production bindings
+//
+// The outage state's cleared-flag observer (`OutageStateDeps.onFlagCleared`)
+// is optional (absent, a clear reaches nobody) and the full-mode retry
+// action's healthy-row hook (`FullModeRetryDeps.endTmuxUnresponsive`) takes
+// any body, so a production wiring that dropped either, bound the observer to
+// a no-op, another controller or the wrong condition, reported every class's
+// clear, dropped the clear's reading, installed a second observer or
+// installed it after the start pass would type-check and pass every behaviour
+// suite while a real `tmux-unavailable` clear never stopped the persona's
+// retry timer, or a retry that found the row healthy never cleared the
+// outage. What the observer and the clear do is tested in
+// tests/outage-state.test.ts and tests/unavailable-retry.test.ts; pinned
+// here: the bindings.
+// ---------------------------------------------------------------------------
+
+describe('main() binds the outage state\'s cleared-flag observer to the retry controller\'s condition-end entry for a tmux-unavailable clear, and the retry\'s healthy-row hook clears tmux-unavailable, both before the start pass (b.jg5 SRJ-311, SRJ-312, SRJ-305, SRJ-306)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const FLAG_CLEARED: keyof OutageStateDeps = 'onFlagCleared'
+  const CLEAR: keyof typeof OutageStateModule = 'clearOutageFlag'
+  const INIT: keyof typeof OutageStateModule = 'initOutageState'
+  const TMUX_UNAVAILABLE_CLASS: OutageClass = 'tmux-unavailable'
+  const AD_UNREACHABLE_CLASS: OutageClass = 'ad-unreachable'
+  const CONTROLLER_END: keyof UnavailableRetryController = 'conditionEnded'
+  const RETRY_CONDITION: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE'
+  const RETRY_HOOK: keyof FullModeRetryDeps = 'endTmuxUnresponsive'
+  const CONDITION_FACTORY: keyof typeof PersonaEpisodesModule = 'createTmuxUnresponsiveCondition'
+  const END: keyof TmuxUnresponsiveCondition = 'end'
+  const END_RETRY: keyof typeof PersonaEpisodesModule = 'TMUX_UNRESPONSIVE_END_RETRY'
+
+  /** Every path that can raise, clear or read the flag: the start bring-up, the restart module and the health check. */
+  function startPass(): number[] {
+    return [startResolution(SERVER_CODE).bringUpAt, onlyCallOf('initRestart'), onlyCallOf('initHealthCheck')]
+  }
+
+  test('the observer reports only a tmux-unavailable clear, for the persona it is given and with the clear\'s reading, to the one retry controller\'s condition-end entry for the tmux-unavailable condition', () => {
+    const controller = constOf('createUnavailableRetryController')
+    declaredOnce(controller)
+    const hook = onlyCallProps(INIT).get(FLAG_CLEARED)
+    expect(hook).toBeDefined()
+    // `(key, cls, reading) => { if (cls === 'tmux-unavailable') { <controller>.conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE, reading) } }`,
+    // the if's body braced or not; the parameters' names are free.
+    const call = `${controller}\\.${CONTROLLER_END}\\(\\1, ${RETRY_CONDITION}, \\3\\)`
+    expect(hook).toMatch(new RegExp(
+      `^\\((\\w+), (\\w+), (\\w+)\\) => \\{ if \\(\\2 === '${TMUX_UNAVAILABLE_CLASS}'\\) (?:\\{ ${call};? \\}|${call};?) \\}$`,
+    ))
+    expect(importSource(SERVER_CODE, RETRY_CONDITION)).toBe('./unavailable-retry.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${RETRY_CONDITION}\\b`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  test('the observer is installed once, through the one initOutageState call, in main()\'s own statement list after the retry controller is built and before the start bring-up, the restart module and the health check', () => {
+    const install = onlyCallOf(INIT)
+    expect(importSource(SERVER_CODE, INIT)).toBe('./outage-state.ts')
+    expect(atMainTopLevel(SERVER_CODE, install)).toBe(true)
+    expect(install).toBeGreaterThan(onlyCallOf('createUnavailableRetryController'))
+    for (const later of startPass()) expect(install).toBeLessThan(later)
+    // Nothing else names the observer in server.ts: no second install.
+    const named = indicesOf(new RegExp(`\\b${FLAG_CLEARED}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(1)
+    const [open, close] = balancedAfter(SERVER_CODE, install, '(', ')')
+    expect(named[0]! > open && named[0]! < close).toBe(true)
+  })
+
+  test('the full-mode retry action\'s healthy-row hook clears the persona\'s tmux-unavailable outage with the retry\'s own reading, as a statement of its own beside the condition\'s end, through the outage state\'s clearOutageFlag', () => {
+    const condition = constOf(CONDITION_FACTORY)
+    const hook = onlyCallProps('createFullModeRetryAction').get(RETRY_HOOK)
+    expect(hook).toBeDefined()
+    // `(key, reading) => { <condition>.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading); clearOutageFlag(key, 'tmux-unavailable', reading) }`,
+    // in either order; the parameters' names are free.
+    const end = `${condition}\\.${END}\\(\\1, ${END_RETRY}, \\2\\)`
+    const clear = `${CLEAR}\\(\\1, '${TMUX_UNAVAILABLE_CLASS}', \\2\\)`
+    expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => \\{ (?:${end};? ${clear}|${clear};? ${end});? \\}$`))
+    // The outage state's own clear: imported, never declared or shadowed here.
+    expect(importSource(SERVER_CODE, CLEAR)).toBe('./outage-state.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${CLEAR}\\b`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  test('that hook\'s clear is server.ts\'s only tmux-unavailable clear, inside the one full-mode retry action built in main() before the start pass; every other clear in server.ts is of ad-unreachable', () => {
+    const clears = indicesOf(new RegExp(`\\b${CLEAR}\\s*\\(`, 'g'), SERVER_CODE)
+    const classOf = (at: number) => splitTopLevel(callArguments(SERVER_CODE, at))[1]
+    const tmuxClears = clears.filter((at) => classOf(at) !== `'${AD_UNREACHABLE_CLASS}'`)
+    expect(tmuxClears).toHaveLength(1)
+    expect(classOf(tmuxClears[0]!)).toBe(`'${TMUX_UNAVAILABLE_CLASS}'`)
+
+    const action = onlyCallOf('createFullModeRetryAction')
+    const [open, close] = balancedAfter(SERVER_CODE, action, '(', ')')
+    expect(tmuxClears[0]! > open && tmuxClears[0]! < close).toBe(true)
+    expect(insideMain(action)).toBe(true)
+    for (const later of startPass()) expect(action).toBeLessThan(later)
   })
 })
 

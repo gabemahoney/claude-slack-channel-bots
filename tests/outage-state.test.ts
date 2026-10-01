@@ -41,10 +41,12 @@ import {
   type OutageClass,
 } from '../src/outage-state.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
+import { LIVENESS_LIVE } from '../src/liveness-reading.ts'
 import {
   AD_CALL_KILL_ROW_NOT_READ_LIVE,
   AD_CALL_KILL_ROW_READ_LIVE,
   AD_VERB_KILL,
+  AD_VERBS,
   TMUX_TOUCHING_VERBS,
   adCallVerb,
   type AdCall,
@@ -57,14 +59,17 @@ import {
 } from '../src/persona-episodes.ts'
 import {
   STUB_INSTANCE_ID,
+  STUB_TMUX_SOCKET_PATH,
   errCallTimeout,
   errConfigMalformed,
   errInstanceIdCollision,
   errSpawnNotFound,
+  errSpawnNotResumable,
   errSystemInstallDisappeared,
   errTmuxCaptureFailed,
   errTmuxKillFailed,
   errTmuxNotAvailable,
+  errTmuxNotAvailableDifferentServer,
   errTmuxSendKeys,
   errTmuxUnresponsive,
   errUnusableName,
@@ -75,9 +80,11 @@ import {
   unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
 import {
+  UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_ROW_PENDING,
   runInAttempt,
   type AttemptErrorRecord,
   type UnavailableRetryCause,
@@ -404,12 +411,12 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     expect(emissions).toHaveLength(0)
   })
 
-  test('16a. withOutageDetection success: clears ad+tmux → all-clear emits naming both', async () => {
+  test('16a. withOutageDetection success of a tmux-touching call (read-pane): clears ad+tmux → all-clear emits naming both', async () => {
     const { emissions } = makeHarness()
     setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
     setOutageFlag(P1, 'tmux-unavailable')
     const before = emissions.length
-    await withOutageDetection(P1, '/cwd', 'status', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', 'read-pane', async (_client) => 'ok')
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
     expect(newEmissions[0].text).toMatch(/All clear/)
@@ -418,29 +425,53 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     expect(getOutageFlags(P1).size).toBe(0)
   })
 
-  test('16b. withOutageDetection success with cwd also set: ad+tmux clear is silent; cwd-unreachable remains', async () => {
+  test('16a twin. withOutageDetection success of a call that is not tmux-touching (status): ad clears silently; tmux-unavailable stays raised; no all-clear (b.jg5 SRJ-312)', async () => {
+    const { emissions } = makeHarness()
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'tmux-unavailable')
+    const before = emissions.length
+    await withOutageDetection(P1, '/cwd', 'status', async (_client) => 'ok')
+    expect(emissions.length).toBe(before) // silent — tmux-unavailable still set
+    expect([...getOutageFlags(P1)]).toEqual(['tmux-unavailable'])
+  })
+
+  test('16b. withOutageDetection success of a tmux-touching call (read-pane) with cwd also set: ad+tmux clear is silent; cwd-unreachable remains', async () => {
     const { emissions } = makeHarness()
     setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
     setOutageFlag(P1, 'tmux-unavailable')
     setOutageFlag(P1, 'cwd-unreachable', '/foo')
     const before = emissions.length
-    await withOutageDetection(P1, '/cwd', 'status', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', 'read-pane', async (_client) => 'ok')
     expect(emissions.length).toBe(before) // silent — cwd still set
     expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
     expect(getOutageFlags(P1).has('ad-unreachable')).toBe(false)
     expect(getOutageFlags(P1).has('tmux-unavailable')).toBe(false)
   })
 
-  test('17. withOutageDetection success: cwd-unreachable NOT cleared by non-spawn verb', async () => {
+  test('16b twin. withOutageDetection success of a call that is not tmux-touching (status) with cwd also set: only ad clears, silently; tmux-unavailable and cwd-unreachable remain', async () => {
     const { emissions } = makeHarness()
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'tmux-unavailable')
     setOutageFlag(P1, 'cwd-unreachable', '/foo')
     const before = emissions.length
     await withOutageDetection(P1, '/cwd', 'status', async (_client) => 'ok')
+    expect(emissions.length).toBe(before)
+    expect([...getOutageFlags(P1)].sort()).toEqual(['cwd-unreachable', 'tmux-unavailable'])
+  })
+
+  test.each([
+    ['a non-spawn verb that is not tmux-touching (status)', 'status'],
+    ['its twin, a non-spawn tmux-touching verb (read-pane)', 'read-pane'],
+  ] as const)('17. withOutageDetection success: cwd-unreachable NOT cleared by %s', async (_label, call) => {
+    const { emissions } = makeHarness()
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')
+    const before = emissions.length
+    await withOutageDetection(P1, '/cwd', call, async (_client) => 'ok')
     expect(emissions.length).toBe(before) // silent (only cwd, so clear of ad+tmux is a no-op)
     expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
   })
 
-  test('18. withSpawnDetection success: clears cwd+ad+tmux; all-clear names all three', async () => {
+  test('18. withSpawnDetection success of a tmux-touching call (spawn): clears cwd+ad+tmux; all-clear names all three', async () => {
     const { emissions } = makeHarness()
     setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
     setOutageFlag(P1, 'tmux-unavailable')
@@ -456,14 +487,28 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     expect(getOutageFlags(P1).size).toBe(0)
   })
 
-  test('19. withSpawnDetection ErrCwdNotFound: cwd-unreachable raised; ad/tmux NOT cleared; error rethrows', async () => {
+  test('18 twin. withSpawnDetection success of a call that is not tmux-touching (status): clears cwd+ad silently; tmux-unavailable stays raised', async () => {
+    const { emissions } = makeHarness()
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'tmux-unavailable')
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')
+    const before = emissions.length
+    await withSpawnDetection(P1, '/foo', 'status', async (_client) => 'ok')
+    expect(emissions.length).toBe(before)
+    expect([...getOutageFlags(P1)]).toEqual(['tmux-unavailable'])
+  })
+
+  test.each([
+    ['a tmux-touching call (spawn)', 'spawn'],
+    ['its twin, a call that is not tmux-touching (status)', 'status'],
+  ] as const)('19. withSpawnDetection ErrCwdNotFound from %s: cwd-unreachable raised; ad/tmux NOT cleared; error rethrows', async (_label, call) => {
     const { emissions } = makeHarness()
     setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
     setOutageFlag(P1, 'tmux-unavailable')
     const before = emissions.length
-    const err = new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found')
+    const err = new ErrCwdNotFound(call, 'ErrCwdNotFound', 'cwd not found')
     await expect(
-      withSpawnDetection(P1, '/foo', 'spawn', async (_client) => { throw err })
+      withSpawnDetection(P1, '/foo', call, async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrCwdNotFound)
     expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
     expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
@@ -832,6 +877,9 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
     ['a status error (ErrSystemInstallDisappeared)', 'status', () => errSystemInstallDisappeared('status'), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
     ['a get error (a STATE error other than ErrSpawnNotFound)', 'get', () => errInstanceIdCollision(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
     ['a list error', 'list', () => errInstanceIdCollision(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+    ['ENVIRONMENT from resume', 'resume', () => errTmuxNotAvailable(undefined, 'resume'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['ENVIRONMENT from kill', 'kill', () => errTmuxNotAvailable(undefined, 'kill'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['ENVIRONMENT from status (the ENVIRONMENT cause, not read-error)', 'status', () => errTmuxNotAvailable(undefined, 'status'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
   ] as const)('inside P\'s attempt, %s calls the sink once with P and the cause; the attempt records it armed', async (_label, verb, build, kind) => {
     const err = build()
     const { arms } = makeSinkHarness({ client: failing(verb, err) })
@@ -852,7 +900,7 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
     ['a CONFIG answer from status', 'status', () => errConfigMalformed()],
     ['an UNUSABLE NAME answer from get', 'get', () => errUnusableName()],
     ['a STATE error from kill (not a read verb)', 'kill', () => errInstanceIdCollision()],
-    ['an ENVIRONMENT error from resume', 'resume', () => errTmuxNotAvailable(undefined, 'resume')],
+    ['a STATE error from resume (not a read verb; ENVIRONMENT now arms, b.jg5 SRJ-311)', 'resume', () => errSpawnNotResumable()],
   ] as const)('inside P\'s attempt, a non-arming error (%s) calls no sink; the attempt records it unarmed', async (_label, verb, build) => {
     const err = build()
     const { arms } = makeSinkHarness({ client: failing(verb, err) })
@@ -950,7 +998,7 @@ describe('trigger sink (b.jg5 SRJ-301): the wrappers and reportAgentDirectorErro
   test.each([
     ['ErrSystemInstallDisappeared from status (arms; raises ad-unreachable)', 'status', () => errSystemInstallDisappeared('status', '/bin/ad')],
     ['ErrTmuxKillFailed from kill (arms; no flag)', 'kill', () => errTmuxKillFailed()],
-    ['ErrTmuxNotAvailable from resume (no arm; raises tmux-unavailable)', 'resume', () => errTmuxNotAvailable(undefined, 'resume')],
+    ['ErrTmuxNotAvailable from resume (arms the ENVIRONMENT cause; raises tmux-unavailable)', 'resume', () => errTmuxNotAvailable(undefined, 'resume')],
   ] as const)('%s: the rethrown value, flags and notices are exactly as without a sink or an attempt', async (_label, verb, build) => {
     const err = build()
     /** One run: its rejection, P's flags and every notice raised. */
@@ -1426,6 +1474,473 @@ describe('the declared verb and the tmux-unresponsive condition sink (b.jg5 SRJ-
     expect(starts).toHaveLength(1)
     expect(starts[0]!.error).toBe(err)
     assertNoLeak({ emissions, lastError, starts: starts.map((s) => ({ key: s.key, verb: s.verb })), flags: [...getOutageFlags(P1)] })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-311, SRJ-312, SRJ-301, SRJ-305 — what clears `tmux-unavailable`,
+// ENVIRONMENT's report to the trigger sink, and the cleared-flag observer
+// ---------------------------------------------------------------------------
+
+/** The persona's working directory every wrapped call in the sections below passes. */
+const WRAP_WORKDIR = '/persona/workdir'
+
+/** One `arm` the recording trigger sink received: the key, the cause kind, and whether the error is the thrown value itself. */
+type RecordedArm = { key: string; kind: string; error: unknown }
+/** One call the recording cleared-flag observer received. */
+type RecordedClear = { key: string; cls: OutageClass; reading: string | undefined }
+
+/**
+ * A fresh outage state over the default stub client with, unless turned off,
+ * a recording trigger sink that answers true, a recording condition sink and
+ * a recording cleared-flag observer. `observerThrows` makes the observer
+ * record and then throw. `onClear` runs inside the observer, after the record.
+ */
+function makeRecordingHarness(opts: { sink?: boolean; observer?: boolean; observerThrows?: boolean; onClear?: (c: RecordedClear) => void } = {}): {
+  emissions: Emission[]
+  arms: RecordedArm[]
+  starts: string[]
+  cleared: RecordedClear[]
+} {
+  const emissions: Emission[] = []
+  const arms: RecordedArm[] = []
+  const starts: string[] = []
+  const cleared: RecordedClear[] = []
+  const client = makeStubClient()
+  _resetOutageState()
+  initOutageState({
+    notify: (key, text) => { emissions.push({ key, text }) },
+    getClient: () => client as unknown as Client,
+    ...(opts.sink === false
+      ? {}
+      : { triggerSink: { arm: (key: string, cause: UnavailableRetryCause) => { arms.push({ key, kind: cause.kind, error: cause.error }); return true } } }),
+    conditionSink: {
+      start: (key) => { starts.push(key); return 'started' },
+      end: () => 'ended',
+    },
+    ...(opts.observer === false
+      ? {}
+      : {
+          onFlagCleared: (key: string, cls: OutageClass, reading?: string) => {
+            const c = { key, cls, reading }
+            cleared.push(c)
+            opts.onClear?.(c)
+            if (opts.observerThrows) throw new Error('observer failed')
+          },
+        }),
+  })
+  return { emissions, arms, starts, cleared }
+}
+
+/** A readable name for a declared call. */
+function declaredName(call: AdCall): string {
+  return typeof call === 'string' ? call : `kill (row read live: ${call.rowReadLive})`
+}
+
+/** Each tmux-touching verb in the exported set as a site declares it: `kill` only as a kill of a row read live. */
+const CLEARING_CALLS: readonly AdCall[] = [...TMUX_TOUCHING_VERBS].map((verb) =>
+  verb === AD_VERB_KILL ? AD_CALL_KILL_ROW_READ_LIVE : (verb as AdCall),
+)
+/** Declared calls tmux does not answer: they never clear `tmux-unavailable`. */
+const NON_CLEARING_CALLS: readonly AdCall[] = ['status', 'get', 'list', 'find-missing', 'delete', AD_CALL_KILL_ROW_NOT_READ_LIVE]
+/** Every declared call: each agent-director verb, and `kill` in both declarations. */
+const EVERY_DECLARED_CALL: readonly AdCall[] = AD_VERBS.flatMap((verb): AdCall[] =>
+  verb === AD_VERB_KILL ? [AD_CALL_KILL_ROW_READ_LIVE, AD_CALL_KILL_ROW_NOT_READ_LIVE] : [verb],
+)
+
+type AnyWrap = typeof withOutageDetection
+/** The two wrappers, by name. */
+const WRAPPERS: ReadonlyArray<readonly [string, AnyWrap]> = [
+  ['withOutageDetection', withOutageDetection],
+  ['withSpawnDetection', withSpawnDetection],
+]
+type WrapRow = [wrapName: string, callName: string, wrap: AnyWrap, call: AdCall]
+/** One row per wrapper and declared call. */
+function wrapRows(calls: readonly AdCall[]): WrapRow[] {
+  return WRAPPERS.flatMap(([name, wrap]) => calls.map((call): WrapRow => [name, declaredName(call), wrap, call]))
+}
+
+/** Run `call` for `key` through `wrap` with an `fn` that throws `err`; answer what it rejected with (it must reject). */
+async function rejectionFrom(wrap: AnyWrap, key: string, call: AdCall, err: unknown): Promise<unknown> {
+  try {
+    await wrap(key, WRAP_WORKDIR, call, async () => { throw err })
+  } catch (rejected) {
+    return rejected
+  }
+  throw new Error(`${declaredName(call)} did not reject`)
+}
+
+/** The GONE answers (b.jg5 SRJ-104). */
+const GONE_ANSWERS: ReadonlyArray<readonly [string, () => unknown]> = [
+  ['ErrTmuxSendKeys', () => errTmuxSendKeys()],
+  ['ErrTmuxCaptureFailed', () => errTmuxCaptureFailed()],
+]
+
+/** The all-clear for a bad stretch that recorded exactly `history`. */
+function allClearOf(history: ReadonlyArray<readonly [OutageClass, string | undefined]>): string {
+  return ALL_CLEAR_TEMPLATE(new Map<OutageClass, ClassRecord>(history.map(([cls, detail]) => [cls, { detail }])))
+}
+
+describe('what clears tmux-unavailable (b.jg5 SRJ-312: AC 27, AC 36)', () => {
+  test('pin: the exported tmux-touching set is the six the clear rows below run over', () => {
+    expect(CLEARING_CALLS.map((c): string | undefined => adCallVerb(c)).sort()).toEqual([...TMUX_TOUCHING_VERBS].sort())
+    expect(CLEARING_CALLS).toHaveLength(6)
+  })
+
+  test.each(wrapRows(CLEARING_CALLS))('%s, tmux-touching %s: a success clears it and ad-unreachable, with one all-clear over the recorded history; B is untouched', async (_w, _c, wrap, call) => {
+    const { emissions } = makeRecordingHarness()
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'tmux-unavailable')
+    setOutageFlag(P2, 'tmux-unavailable')
+    const before = emissions.length
+
+    expect(await wrap(P1, WRAP_WORKDIR, call, async () => 'ok')).toBe('ok')
+
+    expect(emissions.slice(before)).toEqual([
+      { key: P1, text: allClearOf([['ad-unreachable', '/bin/ad'], ['tmux-unavailable', undefined]]) },
+    ])
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect([...getOutageFlags(P2)]).toEqual(['tmux-unavailable'])
+  })
+
+  test.each(wrapRows(NON_CLEARING_CALLS))('%s, %s (not tmux-touching): a success leaves it raised and posts nothing, but clears ad-unreachable silently; a later tmux-touching success posts the one all-clear over both', async (_w, _c, wrap, call) => {
+    const { emissions } = makeRecordingHarness()
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'tmux-unavailable')
+    const before = emissions.length
+
+    expect(await wrap(P1, WRAP_WORKDIR, call, async () => 'ok')).toBe('ok')
+    expect(emissions.length).toBe(before)
+    expect([...getOutageFlags(P1)]).toEqual(['tmux-unavailable'])
+
+    // The same call does it again: still raised, still silent.
+    await wrap(P1, WRAP_WORKDIR, call, async () => 'ok')
+    expect(emissions.length).toBe(before)
+    expect([...getOutageFlags(P1)]).toEqual(['tmux-unavailable'])
+
+    // tmux answers: the one all-clear names both classes of the stretch.
+    await withOutageDetection(P1, WRAP_WORKDIR, 'read-pane', async () => 'ok')
+    expect(emissions.slice(before)).toEqual([
+      { key: P1, text: allClearOf([['ad-unreachable', '/bin/ad'], ['tmux-unavailable', undefined]]) },
+    ])
+    expect(getOutageFlags(P1).size).toBe(0)
+  })
+
+  test.each(wrapRows(NON_CLEARING_CALLS))('%s, %s (not tmux-touching): a success still clears ad-unreachable raised alone, with its all-clear', async (_w, _c, wrap, call) => {
+    const { emissions } = makeRecordingHarness()
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    const before = emissions.length
+
+    await wrap(P1, WRAP_WORKDIR, call, async () => 'ok')
+
+    expect(emissions.slice(before)).toEqual([{ key: P1, text: allClearOf([['ad-unreachable', '/bin/ad']]) }])
+    expect(getOutageFlags(P1).size).toBe(0)
+  })
+
+  test.each(wrapRows(CLEARING_CALLS))('%s, tmux-touching %s: each GONE answer clears it with one all-clear and rethrows the same value', async (_w, _c, wrap, call) => {
+    for (const [form, build] of GONE_ANSWERS) {
+      const err = build()
+      const { emissions } = makeRecordingHarness()
+      setOutageFlag(P1, 'tmux-unavailable')
+      const before = emissions.length
+
+      const rejected = await rejectionFrom(wrap, P1, call, err)
+
+      expect({ form, same: rejected === err }).toEqual({ form, same: true })
+      expect({ form, flags: [...getOutageFlags(P1)] }).toEqual({ form, flags: [] })
+      expect({ form, posted: emissions.slice(before) }).toEqual({
+        form,
+        posted: [{ key: P1, text: allClearOf([['tmux-unavailable', undefined]]) }],
+      })
+    }
+  })
+
+  test.each(wrapRows(NON_CLEARING_CALLS))('%s, %s (not tmux-touching): a GONE answer leaves it raised, posts nothing and rethrows the same value', async (_w, _c, wrap, call) => {
+    for (const [form, build] of GONE_ANSWERS) {
+      const err = build()
+      const { emissions } = makeRecordingHarness()
+      setOutageFlag(P1, 'tmux-unavailable')
+      const before = emissions.length
+
+      const rejected = await rejectionFrom(wrap, P1, call, err)
+
+      expect({ form, same: rejected === err }).toEqual({ form, same: true })
+      expect({ form, flags: [...getOutageFlags(P1)], posted: emissions.length - before }).toEqual({ form, flags: ['tmux-unavailable'], posted: 0 })
+    }
+  })
+
+  test.each([...CLEARING_CALLS, ...NON_CLEARING_CALLS].map((call) => [declaredName(call), call] as const))('withSpawnDetection, %s: a success clears cwd-unreachable as before (tmux-touching or not); a failure does not', async (_c, call) => {
+    const { emissions } = makeRecordingHarness()
+    setOutageFlag(P1, 'cwd-unreachable', WRAP_WORKDIR)
+
+    await rejectionFrom(withSpawnDetection, P1, call, errTmuxSendKeys())
+    expect([...getOutageFlags(P1)]).toEqual(['cwd-unreachable'])
+    const before = emissions.length
+
+    await withSpawnDetection(P1, WRAP_WORKDIR, call, async () => 'ok')
+
+    expect(emissions.slice(before)).toEqual([{ key: P1, text: allClearOf([['cwd-unreachable', WRAP_WORKDIR]]) }])
+    expect(getOutageFlags(P1).size).toBe(0)
+  })
+})
+
+describe('ENVIRONMENT is reported (b.jg5 SRJ-301, SRJ-311): from any verb for P, in any context', () => {
+  /** The ENVIRONMENT answers, each built for the declared verb. */
+  const ENVIRONMENT_FORMS: ReadonlyArray<readonly [string, (verb: string) => unknown]> = [
+    ['plain', (verb) => errTmuxNotAvailable(undefined, verb)],
+    ['a socket not accessible', (verb) => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH, verb)],
+    ['the different-server form', (verb) => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, verb)],
+  ]
+
+  /** Where the call runs: inside an attempt for P, inside another persona's attempt, outside every attempt. */
+  type Context = 'inside P\'s attempt' | 'inside Q\'s attempt' | 'outside any attempt'
+  const CONTEXTS: readonly Context[] = ['inside P\'s attempt', 'inside Q\'s attempt', 'outside any attempt']
+
+  /** Run `body` in `context`; answer its result and the last error of the attempt it ran in (none outside). */
+  async function runIn<T>(context: Context, body: () => Promise<T> | T): Promise<{ result: T; lastError: AttemptErrorRecord | undefined }> {
+    if (context === 'outside any attempt') return { result: await body(), lastError: undefined }
+    return runInAttempt(context === 'inside P\'s attempt' ? P1 : P2, 'launch', async (attempt) => {
+      const result = await body()
+      return { result, lastError: attempt.lastError }
+    })
+  }
+
+  /** Every declared call through withOutageDetection, and the launch calls through withSpawnDetection. */
+  const ENVIRONMENT_ROWS: WrapRow[] = [
+    ...EVERY_DECLARED_CALL.map((call): WrapRow => ['withOutageDetection', declaredName(call), withOutageDetection, call]),
+    ['withSpawnDetection', 'spawn', withSpawnDetection, 'spawn'],
+    ['withSpawnDetection', 'resume', withSpawnDetection, 'resume'],
+  ]
+
+  test('pin: the rows cover every agent-director verb', () => {
+    expect(new Set(ENVIRONMENT_ROWS.map((r) => adCallVerb(r[3])))).toEqual(new Set(AD_VERBS))
+  })
+
+  test.each(ENVIRONMENT_ROWS)('%s, %s: each form, in each context, raises P\'s tmux-unavailable with one onset and reports the ENVIRONMENT cause once for P; B gets nothing; rethrown unchanged; no condition start', async (_w, _c, wrap, call) => {
+    const verb = adCallVerb(call)!
+    for (const [form, build] of ENVIRONMENT_FORMS) {
+      for (const context of CONTEXTS) {
+        const err = build(verb)
+        const { emissions, arms, starts } = makeRecordingHarness()
+
+        const { result: rejected, lastError } = await runIn(context, () => rejectionFrom(wrap, P1, call, err))
+
+        const at = { form, context }
+        expect({ ...at, same: rejected === err }).toEqual({ ...at, same: true })
+        expect({ ...at, arms: arms.map((a) => ({ key: a.key, kind: a.kind, same: a.error === err })) })
+          .toEqual({ ...at, arms: [{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, same: true }] })
+        expect({ ...at, flags: [...getOutageFlags(P1)], b: [...getOutageFlags(P2)] }).toEqual({ ...at, flags: ['tmux-unavailable'], b: [] })
+        expect({ ...at, emissions }).toEqual({ ...at, emissions: [{ key: P1, text: ONSET_TEMPLATES['tmux-unavailable']() }] })
+        // SRJ-307: only UNAVAILABLE starts tmux-unresponsive, never ENVIRONMENT.
+        expect({ ...at, starts }).toEqual({ ...at, starts: [] })
+        // Inside P's attempt the attempt records it armed (the launch is refused, never counted);
+        // inside Q's attempt, Q's attempt records nothing of P's error.
+        const expected = context === 'inside P\'s attempt' ? { verb, causeKind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, armed: true } : undefined
+        expect({ ...at, lastError }).toEqual({ ...at, lastError: expected })
+      }
+    }
+  })
+
+  test.each([...CONTEXTS])('through reportAgentDirectorError (the liveness adapter\'s bare status), %s: each form reports the ENVIRONMENT cause once for P; no flag, no notice; B gets nothing', async (context) => {
+    for (const [form, build] of ENVIRONMENT_FORMS) {
+      const err = build('status')
+      const { emissions, arms, starts } = makeRecordingHarness()
+
+      const { lastError } = await runIn(context, () => reportAgentDirectorError(P1, err, 'status'))
+
+      expect({ form, arms: arms.map((a) => ({ key: a.key, kind: a.kind, same: a.error === err })) })
+        .toEqual({ form, arms: [{ key: P1, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, same: true }] })
+      expect({ form, flags: getOutageFlags(P1).size + getOutageFlags(P2).size, emissions, starts }).toEqual({ form, flags: 0, emissions: [], starts: [] })
+      const expected = context === 'inside P\'s attempt' ? { verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, armed: true } : undefined
+      expect({ form, lastError }).toEqual({ form, lastError: expected })
+    }
+  })
+
+  test.each([...CONTEXTS])('with no sink installed, %s: nothing is reported; the flag, onset and rethrow are as with one', async (context) => {
+    const err = errTmuxNotAvailable(undefined, 'resume')
+    const { emissions } = makeRecordingHarness({ sink: false })
+
+    const { result: rejected, lastError } = await runIn(context, () => rejectionFrom(withSpawnDetection, P1, 'resume', err))
+    const direct = await runIn(context, () => reportAgentDirectorError(P1, err, 'status'))
+
+    expect(rejected).toBe(err)
+    expect([...getOutageFlags(P1)]).toEqual(['tmux-unavailable'])
+    expect(emissions).toEqual([{ key: P1, text: ONSET_TEMPLATES['tmux-unavailable']() }])
+    const recorded = (v: string) => context === 'inside P\'s attempt' ? { verb: v, causeKind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, armed: false } : undefined
+    expect(lastError).toEqual(recorded('resume'))
+    expect(direct.lastError).toEqual(recorded('status'))
+  })
+
+  /** Errors of other classes that arm only inside an attempt for P. */
+  const OTHER_CLASSES: ReadonlyArray<readonly [string, AdCall, () => unknown]> = [
+    ['UNAVAILABLE (ErrCallTimeout) from status', 'status', () => errCallTimeout('status')],
+    ['UNAVAILABLE (ErrTmuxUnresponsive) from resume', 'resume', () => errTmuxUnresponsive('resume')],
+    ['ErrTmuxKillFailed from a kill of a live row', AD_CALL_KILL_ROW_READ_LIVE, () => errTmuxKillFailed()],
+    ['a read error (ErrSystemInstallDisappeared) from status', 'status', () => errSystemInstallDisappeared('status', '/bin/ad')],
+    ['a read error (a STATE error) from get', 'get', () => errInstanceIdCollision()],
+    ['GONE from send-keys', 'send-keys', () => errTmuxSendKeys()],
+  ]
+
+  test.each(OTHER_CLASSES)('%s outside any attempt, or inside Q\'s attempt, reports nothing (wrapped or through reportAgentDirectorError)', async (_label, call, build) => {
+    const err = build()
+    const { arms } = makeRecordingHarness()
+
+    for (const context of ['outside any attempt', 'inside Q\'s attempt'] as const) {
+      expect(await runIn(context, () => rejectionFrom(withOutageDetection, P1, call, err)).then((r) => r.result)).toBe(err)
+      await runIn(context, () => reportAgentDirectorError(P1, err, call))
+    }
+
+    expect(arms).toEqual([])
+  })
+
+  test('AD rev 23: after a kill of the last persona on a socket, repeated ErrTmuxNotAvailable posts one onset (each report arms P); tmux answering posts one all-clear; nothing latches', async () => {
+    const { emissions, arms } = makeRecordingHarness()
+
+    await withOutageDetection(P1, WRAP_WORKDIR, AD_CALL_KILL_ROW_READ_LIVE, async () => 'ok')
+    await rejectionFrom(withOutageDetection, P1, AD_CALL_KILL_ROW_READ_LIVE, errTmuxNotAvailable(undefined, 'kill'))
+    await rejectionFrom(withOutageDetection, P1, 'status', errTmuxNotAvailable(undefined, 'status'))
+    await rejectionFrom(withSpawnDetection, P1, 'spawn', errTmuxNotAvailable(undefined, 'spawn'))
+
+    expect(emissions).toEqual([{ key: P1, text: ONSET_TEMPLATES['tmux-unavailable']() }])
+    expect(arms.map((a) => [a.key, a.kind])).toEqual([
+      [P1, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+      [P1, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+      [P1, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ])
+
+    // A read that succeeds while tmux is still unusable ends nothing.
+    await withOutageDetection(P1, WRAP_WORKDIR, 'status', async () => 'ok')
+    expect(emissions).toHaveLength(1)
+
+    await withSpawnDetection(P1, WRAP_WORKDIR, 'spawn', async () => 'ok')
+    expect(emissions.slice(1)).toEqual([{ key: P1, text: allClearOf([['tmux-unavailable', undefined]]) }])
+    expect(getOutageFlags(P1).size).toBe(0)
+
+    // Not latched: the next ENVIRONMENT answer is a fresh onset.
+    await rejectionFrom(withOutageDetection, P1, 'read-pane', errTmuxNotAvailable(undefined, 'read-pane'))
+    expect(emissions.slice(2)).toEqual([{ key: P1, text: ONSET_TEMPLATES['tmux-unavailable']() }])
+  })
+
+  test('the error text reaches no notice, flag or attempt record (leak check)', async () => {
+    const err = errTmuxNotAvailable(sentinelInMessage('resume'), 'resume')
+    const { emissions, arms } = makeRecordingHarness()
+
+    const { result: rejected, lastError } = await runIn('inside P\'s attempt', () => rejectionFrom(withSpawnDetection, P1, 'resume', err))
+
+    expect(rejected).toBe(err)
+    expect(arms).toHaveLength(1)
+    assertNoLeak({ emissions, lastError, kinds: arms.map((a) => a.kind), flags: [...getOutageFlags(P1)] })
+  })
+})
+
+describe('the cleared-flag observer (b.jg5 SRJ-305, SRJ-311)', () => {
+  /** A real clear of P's tmux-unavailable, by route, and the reading the observer must get. */
+  type Route = readonly [label: string, clear: () => Promise<unknown> | void, reading: string | undefined]
+  const ROUTES: readonly Route[] = [
+    ['clearOutageFlag with no reading', () => clearOutageFlag(P1, 'tmux-unavailable'), undefined],
+    ['clearOutageFlag with a check\'s live reading (the tick\'s healthy branch, a retry\'s healthy row)', () => clearOutageFlag(P1, 'tmux-unavailable', LIVENESS_LIVE), LIVENESS_LIVE],
+    ['a launch success: spawn through withSpawnDetection', () => withSpawnDetection(P1, WRAP_WORKDIR, 'spawn', async () => 'ok'), UNAVAILABLE_RETRY_ROW_PENDING],
+    ['a launch success: resume through withSpawnDetection', () => withSpawnDetection(P1, WRAP_WORKDIR, 'resume', async () => 'ok'), UNAVAILABLE_RETRY_ROW_PENDING],
+    ['a launch success: spawn through withOutageDetection', () => withOutageDetection(P1, WRAP_WORKDIR, 'spawn', async () => 'ok'), UNAVAILABLE_RETRY_ROW_PENDING],
+    ['a non-launch tmux-touching success: read-pane', () => withOutageDetection(P1, WRAP_WORKDIR, 'read-pane', async () => 'ok'), undefined],
+    ['a non-launch tmux-touching success: send-keys', () => withOutageDetection(P1, WRAP_WORKDIR, 'send-keys', async () => 'ok'), undefined],
+    ['a non-launch tmux-touching success: pause', () => withOutageDetection(P1, WRAP_WORKDIR, 'pause', async () => 'ok'), undefined],
+    ['a non-launch tmux-touching success: a kill of a live row', () => withOutageDetection(P1, WRAP_WORKDIR, AD_CALL_KILL_ROW_READ_LIVE, async () => 'ok'), undefined],
+    ['a GONE answer from send-keys', () => rejectionFrom(withOutageDetection, P1, 'send-keys', errTmuxSendKeys()), undefined],
+    ['a GONE answer from read-pane', () => rejectionFrom(withOutageDetection, P1, 'read-pane', errTmuxCaptureFailed()), undefined],
+    ['a GONE answer from a launch call (spawn): no pending reading', () => rejectionFrom(withSpawnDetection, P1, 'spawn', errTmuxSendKeys()), undefined],
+  ]
+
+  test.each(ROUTES)('a real clear of P\'s tmux-unavailable by %s calls it once with P, the class and the reading, after the state change and the all-clear', async (_label, clear, reading) => {
+    const seen: Array<{ flags: OutageClass[]; posted: number }> = []
+    const h = makeRecordingHarness({ onClear: () => { seen.push({ flags: [...getOutageFlags(P1)], posted: h.emissions.length }) } })
+    setOutageFlag(P1, 'tmux-unavailable')
+    setOutageFlag(P2, 'tmux-unavailable')
+
+    await clear()
+
+    expect(h.cleared).toEqual([{ key: P1, cls: 'tmux-unavailable', reading }])
+    // Called after the flag is lowered and after the all-clear was posted.
+    expect(seen).toEqual([{ flags: [], posted: 2 + 1 }])
+    expect(h.emissions.at(-1)).toEqual({ key: P1, text: allClearOf([['tmux-unavailable', undefined]]) })
+    expect([...getOutageFlags(P2)]).toEqual(['tmux-unavailable'])
+  })
+
+  test('each class\'s real clear is told with its class: a launch success over all three calls it in clear order, the reading on tmux-unavailable only', async () => {
+    const { cleared } = makeRecordingHarness()
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'tmux-unavailable')
+    setOutageFlag(P1, 'cwd-unreachable', WRAP_WORKDIR)
+
+    await withSpawnDetection(P1, WRAP_WORKDIR, 'resume', async () => 'ok')
+
+    expect(cleared).toEqual([
+      { key: P1, cls: 'ad-unreachable', reading: undefined },
+      { key: P1, cls: 'tmux-unavailable', reading: UNAVAILABLE_RETRY_ROW_PENDING },
+      { key: P1, cls: 'cwd-unreachable', reading: undefined },
+    ])
+  })
+
+  test('a clear of a flag that is not raised calls nothing: a never-touched key, another class, a second clear, a non-tmux-touching success or GONE', async () => {
+    const { cleared } = makeRecordingHarness()
+
+    clearOutageFlag(P9, 'tmux-unavailable')
+    setOutageFlag(P1, 'tmux-unavailable')
+    clearOutageFlag(P1, 'ad-unreachable')
+    clearOutageFlag(P1, 'cwd-unreachable', LIVENESS_LIVE)
+    for (const call of NON_CLEARING_CALLS) {
+      await withOutageDetection(P1, WRAP_WORKDIR, call, async () => 'ok')
+      await rejectionFrom(withOutageDetection, P1, call, errTmuxSendKeys())
+    }
+    expect(cleared).toEqual([])
+
+    clearOutageFlag(P1, 'tmux-unavailable')
+    clearOutageFlag(P1, 'tmux-unavailable')
+    await withOutageDetection(P1, WRAP_WORKDIR, 'read-pane', async () => 'ok')
+
+    expect(cleared).toEqual([{ key: P1, cls: 'tmux-unavailable', reading: undefined }])
+  })
+
+  test('resetAllToHealthy (boot, teardown) calls nothing, and a later clear of the wiped flag calls nothing', () => {
+    const { cleared, emissions } = makeRecordingHarness()
+    setOutageFlag(P1, 'tmux-unavailable')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P2, 'tmux-unavailable')
+
+    resetAllToHealthy([P1])
+    resetAllToHealthy([P1, P2])
+    clearOutageFlag(P1, 'tmux-unavailable')
+    clearOutageFlag(P2, 'tmux-unavailable')
+
+    expect(cleared).toEqual([])
+    expect(emissions).toHaveLength(3) // the three onsets only
+  })
+
+  test('an observer that throws changes nothing: the flag is lowered, the all-clear posted, the wrapper answers its result, and the next clear is told again', async () => {
+    const { cleared, emissions } = makeRecordingHarness({ observerThrows: true })
+    setOutageFlag(P1, 'tmux-unavailable')
+
+    expect(() => clearOutageFlag(P1, 'tmux-unavailable')).not.toThrow()
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect(emissions.at(-1)).toEqual({ key: P1, text: allClearOf([['tmux-unavailable', undefined]]) })
+
+    setOutageFlag(P1, 'tmux-unavailable')
+    expect(await withSpawnDetection(P1, WRAP_WORKDIR, 'spawn', async () => 'ok')).toBe('ok')
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect(cleared).toEqual([
+      { key: P1, cls: 'tmux-unavailable', reading: undefined },
+      { key: P1, cls: 'tmux-unavailable', reading: UNAVAILABLE_RETRY_ROW_PENDING },
+    ])
+  })
+
+  test('with no observer installed, a clear works as before', async () => {
+    const { emissions } = makeRecordingHarness({ observer: false })
+    setOutageFlag(P1, 'tmux-unavailable')
+
+    await withOutageDetection(P1, WRAP_WORKDIR, 'send-keys', async () => 'ok')
+
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect(emissions.at(-1)).toEqual({ key: P1, text: allClearOf([['tmux-unavailable', undefined]]) })
   })
 })
 

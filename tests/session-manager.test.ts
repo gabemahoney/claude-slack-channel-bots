@@ -315,6 +315,8 @@ import {
   errInvalidFlags,
   errInternal,
   errTmuxUnresponsive,
+  errTmuxNotAvailable,
+  errTmuxNotAvailableDifferentServer,
   errConfigMalformed,
   errUnusableName,
   errSchemaMismatch,
@@ -365,6 +367,7 @@ import {
   initOutageState,
   getOutageFlags,
   setOutageFlag,
+  ONSET_TEMPLATES,
   _resetOutageState,
   type OutageClass,
 } from '../src/outage-state.ts'
@@ -402,6 +405,7 @@ import {
   createUnavailableRetryController,
   runInAttempt,
   UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
@@ -5489,12 +5493,18 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(linesWith(errLog, 'waitForWaitingAndReconnect: timeout: status read refused for persona=C')).toHaveLength(1)
   })
 
-  // b.jg5 SRJ-105: ErrSystemInstallDisappeared and ErrTmuxNotAvailable at the
-  // TIMEOUT CALL take the poll loop's early 'failed' (one rule at both reads):
-  // never the tmux fallback, never 'dead-session', and not a refusal.
+  // b.jg5 SRJ-105: ErrSystemInstallDisappeared at the TIMEOUT CALL takes the
+  // poll loop's early 'failed' (one rule at both reads): never the tmux
+  // fallback, never 'dead-session', and not a refusal. (ErrTmuxNotAvailable
+  // is a refusal at both reads since b.jg5 SRJ-311: the cases below.)
   const TIMEOUT_EARLY_FAILED_ERRORS = [
     ['ErrSystemInstallDisappeared', () => new ErrSystemInstallDisappeared('status', '/usr/bin/agent-director')],
-    ['ErrTmuxNotAvailable', () => new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not available')],
+  ] as const
+
+  /** The ENVIRONMENT answers (`ErrTmuxNotAvailable`) at a `status` read: tmux cannot be run, and the different-server form. */
+  const WAIT_ENVIRONMENT_ERRORS = [
+    ['ErrTmuxNotAvailable (tmux cannot be run)', () => errTmuxNotAvailable(undefined, 'status')],
+    ['ErrTmuxNotAvailable (not the tmux server the agent was launched on)', () => errTmuxNotAvailableDifferentServer(undefined, 'status')],
   ] as const
 
   test.each(TIMEOUT_EARLY_FAILED_ERRORS)('b.jg5 SRJ-105: timeout with %s → failed, tmux NOT probed, nothing typed, not refused', async (_label, errorFactory) => {
@@ -5524,6 +5534,41 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(findMissingCalls).toHaveLength(2) // the deadline's read decided, not the poll
     expect(notices).toEqual([])
     expect(linesWith(errLog, 'status read refused for persona=C')).toEqual([])
+  })
+
+  // b.jg5 SRJ-311: ErrTmuxNotAvailable at the TIMEOUT CALL is a refusal:
+  // 'failed' with one refusal line, never the tmux fallback (so never
+  // 'dead-session'), nothing typed, no notice, and C's tmux-unavailable
+  // outage raised with one onset.
+  test.each(WAIT_ENVIRONMENT_ERRORS)('b.jg5 SRJ-311: timeout with %s → failed and refused (one refusal line), tmux NOT probed, nothing typed, no notice, one tmux-unavailable onset', async (_label, errorFactory) => {
+    _setWaitForWaitingTimeoutMs(30)
+    _setFindMissingMemoTtlMs(0)
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return false }) // gone: the fallback would say dead-session
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      findMissingCalls,
+      sendKeysCalls,
+      findMissingResult: cannedFindMissing(),
+      statusFn: () =>
+        findMissingCalls.length >= 2 ? errorFactory() : ({ state: 'working' } as import('agent-director').StatusResult),
+    })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+
+    let result: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await waitForWaitingAndReconnect('C', cfg)
+    })
+
+    expect(result).toBe('failed')
+    expect(probed).toEqual([])
+    expect(sendKeysCalls).toEqual([])
+    expect(findMissingCalls).toHaveLength(2) // the deadline's read decided, not the poll
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, 'waitForWaitingAndReconnect: timeout: status read refused for persona=C')).toHaveLength(1)
+    expect([...getOutageFlags('C')]).toEqual(['tmux-unavailable'])
+    expect(outageEmissions.map((e) => e.key)).toEqual(['C'])
   })
 
   // The ladder's working branch treats both reads alike: 'failed', no
@@ -5575,6 +5620,76 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(resumeCalls).toEqual([])
     expect(spawnCalls).toHaveLength(1) // only the initial colliding spawn
     expect(onlyStartupEntry(readLog(), 'spawn-failed')).toEndWith(`] [spawn-failed] reconnect failed for ${renderPersonaRef('C', 'C')} (state=working)`)
+  })
+
+  // b.jg5 SRJ-311: ErrTmuxNotAvailable at either read is a refusal of the
+  // launch: 'failed' with the refusal marker (the ENVIRONMENT cause armed C's
+  // timer once), no dead-session recovery, no tmux probe, no notice, one
+  // tmux-unavailable onset, and no `spawn-failed` entry (the E10 hatch note).
+  test.each(
+    WAIT_ENVIRONMENT_ERRORS.flatMap(([label, errorFactory]) =>
+      (['poll', 'timeout'] as const).map((read) => [label, read, errorFactory] as const),
+    ),
+  )('b.jg5 SRJ-311: spawnForPersona working branch, %s at the wait\'s %s status read → failed and refused, no probe, no kill/delete/resume/launch, no notice, one tmux-unavailable onset, no spawn-failed entry', async (_label, read, errorFactory) => {
+    const readLog = captureStartupErrors()
+    const armed: Array<{ key: string; kind: string }> = []
+    initOutageState({
+      getClient,
+      notify: (key, text) => { outageEmissions.push({ key, text }) },
+      triggerSink: {
+        arm: (key, cause) => {
+          armed.push({ key, kind: cause.kind })
+          return true
+        },
+      },
+    })
+    _setWaitForWaitingTimeoutMs(30)
+    _setFindMissingMemoTtlMs(0)
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return false })
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const killCalls: import('agent-director').KillParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+    // The poll read fails at once; the timeout read fails only after the
+    // deadline's fresh sweep (this launch's second).
+    const failsAt = read === 'poll' ? 1 : 2
+    installStub({
+      findMissingCalls,
+      spawnCalls,
+      killCalls,
+      deleteCalls,
+      resumeCalls,
+      sendKeysCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: personaRow(cfg, 'C', { state: 'working' }),
+      findMissingResult: cannedFindMissing(),
+      statusFn: () =>
+        findMissingCalls.length >= failsAt ? errorFactory() : ({ state: 'working' } as import('agent-director').StatusResult),
+    })
+
+    let result: SpawnPersonaResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toStrictEqual({ key: 'C', action: 'failed', refused: true })
+    expect(armed).toEqual([{ key: 'C', kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
+    expect(findMissingCalls).toHaveLength(failsAt)
+    expect(probed).toEqual([])
+    expect(sendKeysCalls).toEqual([])
+    expect(killCalls).toEqual([])
+    expect(deleteCalls).toEqual([])
+    expect(resumeCalls).toEqual([])
+    expect(spawnCalls).toHaveLength(1) // only the initial colliding spawn
+    expect(notices).toEqual([])
+    expect(linesWith(errLog, `status read refused for ${renderPersonaRef('C', 'C')}: `)).toHaveLength(1)
+    expect([...getOutageFlags('C')]).toEqual(['tmux-unavailable'])
+    expect(outageEmissions.map((e) => e.key)).toEqual(['C'])
+    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
   })
 
   // b.ecw: the poll loop's ended/missing branch aborts early. `statusFn` flips to
@@ -10998,7 +11113,6 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
 
   test.each<[string, () => Error, OutageClass]>([
     ['agent-director unreachable', () => new ErrSystemInstallDisappeared('status', '/opt/ad/bin/agent-director'), 'ad-unreachable'],
-    ['tmux not available', () => new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not available'), 'tmux-unavailable'],
   ])('goes through the outage wrapper: %s raises B\'s %s flag (and rethrows); a later read clears it with B\'s all-clear; A\'s flag is untouched', async (_label, build, flag) => {
     setOutageFlag(A, 'ad-unreachable', '/opt/ad/bin/agent-director')
     outageEmissions = []
@@ -11020,6 +11134,81 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
     expect(outageEmissions[1]!.text).toContain('All clear')
     expect([...getOutageFlags(A)]).toEqual(['ad-unreachable'])
     expectQuiet(ok)
+  })
+
+  // b.jg5 SRJ-312: a successful `status` is no tmux answer, so the row read
+  // leaves tmux-unavailable raised; a tmux-touching success for B (its
+  // `/mcp reconnect` keystrokes) clears it with B's one all-clear.
+  test.each<[string, () => Error]>([
+    ['tmux cannot be run', () => new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not available')],
+    ['the different-server form', () => errTmuxNotAvailableDifferentServer(undefined, 'status')],
+  ])('b.jg5 SRJ-312: goes through the outage wrapper: ErrTmuxNotAvailable (%s) raises B\'s tmux-unavailable flag (and rethrows); a later successful read leaves it raised with no all-clear; a tmux-touching success for B clears it with B\'s all-clear; A\'s flag is untouched', async (_label, build) => {
+    setOutageFlag(A, 'ad-unreachable', '/opt/ad/bin/agent-director')
+    outageEmissions = []
+    const failure = build()
+    installStub({ statusError: failure })
+
+    const failed = await readQuietly()
+
+    expect('err' in failed.outcome && failed.outcome.err).toBe(failure)
+    expect([...getOutageFlags(B)]).toEqual(['tmux-unavailable'])
+    expect(outageEmissions.map((e) => e.key)).toEqual([B])
+
+    installStub({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_FRACTIONAL }) })
+    const ok = await readQuietly()
+
+    expect(ok.outcome).toStrictEqual({ ok: { state: AGENT_DIRECTOR_PENDING_STATE, launchStartedAt: SAMPLE_LAUNCH_START_FRACTIONAL } })
+    expect([...getOutageFlags(B)]).toEqual(['tmux-unavailable'])
+    expect(outageEmissions.map((e) => e.key)).toEqual([B])
+    expectQuiet(ok)
+
+    // tmux answers: B's keystrokes succeed.
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({ sendKeysCalls })
+    let outcome: string | undefined
+    await withCapturedErr(async () => {
+      outcome = await reconnectMcp(B)
+    })
+
+    expect(outcome).toBe('ok')
+    expect(sendKeysCalls).toHaveLength(1)
+    expect([...getOutageFlags(B)]).toEqual([])
+    expect(outageEmissions.map((e) => e.key)).toEqual([B, B])
+    expect(outageEmissions[1]!.text).toContain('All clear')
+    expect([...getOutageFlags(A)]).toEqual(['ad-unreachable'])
+  })
+
+  // b.jg5 SRJ-311: ENVIRONMENT from any verb for B arms B's timer in any
+  // context; inside B's attempt it is also B's last error, so a launch it
+  // ended would be refused.
+  test.each<[string, () => Error]>([
+    ['tmux cannot be run', () => errTmuxNotAvailable(undefined, 'status')],
+    ['the different-server form', () => errTmuxNotAvailableDifferentServer(undefined, 'status')],
+  ])('b.jg5 SRJ-311: ErrTmuxNotAvailable (%s) from the row read is reported to the sink with the ENVIRONMENT cause in every context (outside any attempt, inside A\'s, inside B\'s), always under B; it still propagates', async (_label, build) => {
+    installRecordingSink()
+    const err = build()
+    installStub({ statusError: err })
+
+    const outside = await readQuietly()
+    const otherAttempt = await readQuietly(() => runInAttempt(A, 'recovery', () => readPersonaRowState(B)))
+    let attempt: AttemptView | undefined
+    const inside = await readQuietly(() => runInAttempt(B, 'recovery', (view) => {
+      attempt = view
+      return readPersonaRowState(B)
+    }))
+
+    for (const r of [outside, otherAttempt, inside]) {
+      expect('err' in r.outcome && r.outcome.err).toBe(err)
+      expectQuiet(r)
+    }
+    expect(armed).toEqual([
+      { key: B, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT },
+      { key: B, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT },
+      { key: B, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT },
+    ])
+    expect(attempt!.lastError).toEqual({ verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, armed: true })
+    // One onset for B's bad stretch: the repeats dedupe.
+    expect(outageEmissions.map((e) => e.key)).toEqual([B])
   })
 
   test.each<[string, () => Error, string]>([
@@ -11656,11 +11845,23 @@ function srj105AfterEach(): void {
 }
 
 /**
+ * What the outage state posts for the refused launch: nothing (the default),
+ * or P's one `tmux-unavailable` onset (an ENVIRONMENT answer, b.jg5 SRJ-311),
+ * with its text when `text` is given.
+ */
+interface ExpectedOutage {
+  readonly tmuxUnavailableOnset: true
+  readonly text?: string
+}
+
+/**
  * Launch P as the start pass does, with `site` meeting `err`; assert the
  * refusal's outcome (see the section comment); then launch it again through
- * `launchSession`, and launch B over the stub's defaults.
+ * `launchSession`, and launch B over the stub's defaults. With `outage`, P's
+ * `tmux-unavailable` flag is raised by the first launch with one onset, and
+ * is still raised at the end.
  */
-async function expectRefusedAt(site: LadderSite, err: Error, triggerKind: string): Promise<{ h: RecoveryHarness; p: string }> {
+async function expectRefusedAt(site: LadderSite, err: Error, triggerKind: string, outage?: ExpectedOutage): Promise<{ h: RecoveryHarness; p: string }> {
   const { h, p, b } = srj105Build()
   const persona = harnessPersona(h, p)
   site.setup?.(h)
@@ -11672,7 +11873,13 @@ async function expectRefusedAt(site: LadderSite, err: Error, triggerKind: string
   expect(result).toStrictEqual({ key: p, action: 'failed', refused: true })
   expect(ladderCallsMade(h)).toEqual(site.calls)
   expect(h.notices).toEqual([])
-  expect(h.outageNotices).toEqual([])
+  if (outage === undefined) {
+    expect(h.outageNotices).toEqual([])
+  } else {
+    expect(h.outageNotices.map((n) => n.key)).toEqual([p])
+    if (outage.text !== undefined) expect(h.outageNotices[0]!.text).toBe(outage.text)
+    expect(getOutageFlags(p).has('tmux-unavailable')).toBe(true)
+  }
   expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
   expect(refusalLines(h, p)).toHaveLength(1)
   expect(h.triggers).toEqual([{ key: p, kind: triggerKind }])
@@ -11692,7 +11899,57 @@ async function expectRefusedAt(site: LadderSite, err: Error, triggerKind: string
   expect(h.controller.isArmed(b)).toBe(false)
   expect(h.triggers.filter((t) => t.key === b)).toEqual([])
   expect(h.notices).toEqual([])
+  if (outage !== undefined) {
+    expect(getOutageFlags(p).has('tmux-unavailable')).toBe(true)
+    expect(getOutageFlags(b).has('tmux-unavailable')).toBe(false)
+  }
   return { h, p }
+}
+
+/**
+ * Launch P, then B, as the start pass does, both meeting a prompt row whose
+ * tmux session is gone, so each reaches the prompt-row findMissing sweep.
+ * P's sweep is held in flight until B has joined it, then answers `err`:
+ * P started the one sweep and B joined it. Answers both launches' results.
+ */
+async function launchBothThroughOneSweep(h: RecoveryHarness, p: string, b: string, err: Error): Promise<[SpawnPersonaResult, SpawnPersonaResult]> {
+  const rows = new Map(
+    [p, b].map((key) => {
+      const row = harnessRow(h, harnessPersona(h, key), { state: 'check_permission' })
+      return [row.claude_instance_id, row] as const
+    }),
+  )
+  h.script({
+    spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())],
+    getFn: (params) => rows.get(params.claude_instance_id) ?? errSpawnNotFound(),
+  })
+  // Both tmux sessions are gone; B's probe is the second.
+  let bProbed!: () => void
+  const bReachedProbe = new Promise<void>((resolve) => (bProbed = resolve))
+  let probes = 0
+  _setTmuxSessionProber(async () => {
+    if (++probes === 2) bProbed()
+    return false
+  })
+  // P's sweep is held in flight until B has joined it.
+  let sweepStarted!: () => void
+  const pSwept = new Promise<void>((resolve) => (sweepStarted = resolve))
+  let failSweep!: (err: Error) => void
+  const held = new Promise<never>((_resolve, reject) => (failSweep = reject))
+  h.stub.client.findMissing = async (params) => {
+    h.stub.calls.findMissingCalls.push(params)
+    sweepStarted()
+    return held
+  }
+
+  const pLaunch = h.launch(p)
+  await pSwept
+  const bLaunch = h.launch(b)
+  await bReachedProbe
+  // A macrotask turn: B's launch runs on, over resolved stubs only, to the shared sweep.
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  failSweep(err)
+  return [await pLaunch, await bLaunch]
 }
 
 describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
@@ -11883,45 +12140,10 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
 
   test.each(SRJ105_UNAVAILABLE)('a persona that joins another\'s in-flight shared sweep gets the same refusal: %s at P\'s prompt-row sweep, which B joined, refuses both under their own keys with one findMissing call; no resume, kill, delete, launch, notice or spawn-failed entry, never counted', async (_what, make, kind) => {
     const { h, p, b } = srj105Build()
-    const rows = new Map(
-      [p, b].map((key) => {
-        const row = harnessRow(h, harnessPersona(h, key), { state: 'check_permission' })
-        return [row.claude_instance_id, row] as const
-      }),
-    )
-    h.script({
-      spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())],
-      getFn: (params) => rows.get(params.claude_instance_id) ?? errSpawnNotFound(),
-    })
-    // Both tmux sessions are gone; B's probe is the second.
-    let bProbed!: () => void
-    const bReachedProbe = new Promise<void>((resolve) => (bProbed = resolve))
-    let probes = 0
-    _setTmuxSessionProber(async () => {
-      if (++probes === 2) bProbed()
-      return false
-    })
-    // P's sweep is held in flight until B has joined it.
-    let sweepStarted!: () => void
-    const pSwept = new Promise<void>((resolve) => (sweepStarted = resolve))
-    let failSweep!: (err: Error) => void
-    const held = new Promise<never>((_resolve, reject) => (failSweep = reject))
-    h.stub.client.findMissing = async (params) => {
-      h.stub.calls.findMissingCalls.push(params)
-      sweepStarted()
-      return held
-    }
+    const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, make('find-missing'))
 
-    const pLaunch = h.launch(p)
-    await pSwept
-    const bLaunch = h.launch(b)
-    await bReachedProbe
-    // A macrotask turn: B's launch runs on, over resolved stubs only, to the shared sweep.
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    failSweep(make('find-missing'))
-
-    expect(await pLaunch).toStrictEqual({ key: p, action: 'failed', refused: true })
-    expect(await bLaunch).toStrictEqual({ key: b, action: 'failed', refused: true })
+    expect(pResult).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(bResult).toStrictEqual({ key: b, action: 'failed', refused: true })
     // One call: B joined P's sweep (a later start would have made a second).
     expect(h.stub.calls.findMissingCalls).toHaveLength(1)
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
@@ -12027,5 +12249,112 @@ describe('b.jg5 SRJ-105 with E8\'s refusal marker: a refused kill on a replace p
     expect(getFailureCount(p)).toBe(0)
     expect(h.notices).toEqual([])
     expect(h.capReached).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-311: ENVIRONMENT (`ErrTmuxNotAvailable`) at the collision ladder,
+// the reconnect and the working-row wait (SRJ-105's ENVIRONMENT row)
+//
+// Every site of the SRJ-105 cases above, fed each ENVIRONMENT form, is a
+// refusal through `expectRefusedAt`: the stub's call counts are exact (no
+// kill, delete, resume or launch after it, never dead-session), no
+// spawn-failure notice, no `spawn-failed` entry, one refusal line, P's timer
+// armed with the ENVIRONMENT cause, `launchSession` answering 'refused', the
+// failure count left at 0, and B launching. On top of that, P's
+// `tmux-unavailable` outage is raised with one onset and stays raised, and
+// ENVIRONMENT never starts P's `tmux-unresponsive` condition (SRJ-307).
+// ---------------------------------------------------------------------------
+
+/**
+ * The ENVIRONMENT answers, each built for the verb that meets it (by name):
+ * tmux cannot be run, with today's onset text, and the different-server form
+ * (its onset is checked by count only: SRJ-1021 gives it its own text).
+ */
+const SRJ311_ENVIRONMENT: ReadonlyArray<readonly [string, (verb: string) => Error, string | undefined]> = [
+  ['ErrTmuxNotAvailable (tmux cannot be run)', (verb) => errTmuxNotAvailable(undefined, verb), ONSET_TEMPLATES['tmux-unavailable']()],
+  ['ErrTmuxNotAvailable (not the tmux server the agent was launched on)', (verb) => errTmuxNotAvailableDifferentServer(undefined, verb), undefined],
+]
+
+/** The `ExpectedOutage` of an ENVIRONMENT refusal: one `tmux-unavailable` onset, with `text` when given. */
+function environmentOnset(text: string | undefined): ExpectedOutage {
+  return text === undefined ? { tmuxUnavailableOnset: true } : { tmuxUnavailableOnset: true, text }
+}
+
+describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladder, the reconnect and the working-row wait is a refusal: never destructive, never counted, one tmux-unavailable onset', () => {
+  afterEach(srj105AfterEach)
+
+  const destructiveCross = SRJ311_ENVIRONMENT.flatMap(([what, make, text]) =>
+    [...SPAWN_AND_RESUME_SITES, ...KILL_SITES, ...DELETE_SITES, ...RECONNECT_SITES].map((site) => [what, site.name, make, text, site] as const),
+  )
+  test.each(destructiveCross)('b.jg5 SRJ-311: %s at %s: nothing destructive after it, never dead-session, no notice or spawn-failed entry, refused and never counted, one tmux-unavailable onset, P\'s condition not started; B launches', async (_what, _site, make, text, site) => {
+    const { h, p } = await expectRefusedAt(site, make(site.verb), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, environmentOnset(text))
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+  })
+
+  const readCross = SRJ311_ENVIRONMENT.flatMap(([what, make, text]) => READ_SITES.map((site) => [what, site.name, make, text, site] as const))
+  test.each(readCross)('b.jg5 SRJ-311: %s at %s: no tmux probe, no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, one tmux-unavailable onset, P\'s condition not started; B launches', async (_what, _site, make, text, site) => {
+    // Every tmux session reads gone: a tmux fallback would give dead-session
+    // and a resume, which the exact call counts would catch.
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => {
+      probed.push(name)
+      return false
+    })
+    const { h, p } = await expectRefusedAt(site, make(site.verb), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, environmentOnset(text))
+    expect(probed).toEqual([])
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
+  })
+
+  const sweepCross = SRJ311_ENVIRONMENT.flatMap(([what, make, text]) => SWEEP_SITES.map((site) => [what, site.name, make, text, site] as const))
+  test.each(sweepCross)('b.jg5 SRJ-311: %s at %s: the sweep is refused and the attempt stops there: no resume, kill, delete, launch, notice or spawn-failed entry, refused and never counted, one tmux-unavailable onset; B launches', async (_what, _site, make, text, site) => {
+    const { h, p } = await expectRefusedAt(site, make(site.verb), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, environmentOnset(text))
+    // Both launches (the start pass's and launchSession's) were refused at this sweep.
+    const refusedAt = `[slack] ${site.logPrefix}: findMissing sweep refused for ${renderPersonaRef(p, p)}: `
+    expect(refusalLines(h, p).map((line) => line.startsWith(refusedAt))).toEqual([true, true])
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+  })
+
+  // A joiner's sweep failure is its own (SRJ-301): with ENVIRONMENT it raises
+  // its own `tmux-unavailable`, as P's wrapper does for P. The contrast row:
+  // an UNAVAILABLE sweep error raises no `tmux-unavailable` for either.
+  const JOINED_SWEEP_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error, string, ExpectedOutage | undefined]> = [
+    ...SRJ311_ENVIRONMENT.map(([what, make, text]) => [what, make, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, environmentOnset(text)] as const),
+    ...unavailableForms('ErrTmuxUnresponsive').map(([what, make, kind]) => [`contrast: ${what} (UNAVAILABLE)`, make, kind, undefined] as const),
+  ]
+  test.each(JOINED_SWEEP_ERRORS)('b.jg5 SRJ-311: %s at P\'s prompt-row sweep, which B joined: one findMissing call; each persona raises its own tmux-unavailable (one onset each) only for ENVIRONMENT, is armed once with the cause, and nothing destructive follows for either', async (_what, make, kind, outage) => {
+    const { h, p, b } = srj105Build()
+    const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, make('find-missing'))
+
+    expect(pResult).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(bResult).toStrictEqual({ key: b, action: 'failed', refused: true })
+    // One call: B joined P's sweep (a later start would have made a second).
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    // Nothing destructive after the collisions: no resume, kill, delete or launch.
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
+    for (const key of [p, b]) {
+      expect(refusalLines(h, key)).toHaveLength(1)
+      expect(h.triggers.filter((t) => t.key === key)).toEqual([{ key, kind }])
+      expect(h.controller.isArmed(key)).toBe(true)
+      expect(getFailureCount(key)).toBe(0)
+      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+      expect(conditionStartedLines(h, key)).toEqual([])
+      const onsets = h.outageNotices.filter((n) => n.key === key)
+      if (outage === undefined) {
+        expect(getOutageFlags(key).has('tmux-unavailable')).toBe(false)
+        expect(onsets).toEqual([])
+      } else {
+        expect(getOutageFlags(key).has('tmux-unavailable')).toBe(true)
+        expect(onsets).toHaveLength(1)
+        if (outage.text !== undefined) expect(onsets[0]!.text).toBe(outage.text)
+      }
+    }
+    expect(h.outageNotices).toHaveLength(outage === undefined ? 0 : 2)
+    expect(h.notices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
   })
 })

@@ -40,6 +40,20 @@
  * scripted, held or failing-clock action and, for the early stops, the
  * server's retry action on stand-in deps, with the pin of
  * `UNAVAILABLE_RETRY_TERMINAL_STOPS` over the exported stop reasons.
+ * ENVIRONMENT (`ErrTmuxNotAvailable`, b.jg5 SRJ-311, SRJ-312, AC 27, AC 36)
+ * runs on the harness with both settings 0, the outage state's cleared-flag
+ * observer bound as `main()` binds it: what arms the timer in a start-pass
+ * launch and outside every attempt (the liveness read, a teardown's kill, a
+ * read-pane, the permission poller's and the JSONL safeguard's get), a stray
+ * arm for a key out of the applied configuration, never counted and retried
+ * only on the backoff, a row read that succeeds while the next verb still
+ * answers it, the clears that stop the timer (a retry's reconnect, a retry
+ * that finds the persona live and connected, a health tick's healthy-branch
+ * clear, called as `src/health-check.ts` calls it since the harness has no
+ * tick), SRJ-306's pending and kill-failure exceptions against the clear, and
+ * the recovery. A kill of the last session on a socket followed by answers
+ * from an exiting tmux server (AD handoff rev 23) runs there too, once with
+ * `ErrTmuxNotAvailable` and once with `ErrTmuxUnresponsive`.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -59,7 +73,7 @@ import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, rec
 import type { Persona } from '../src/config.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
 import { LIVENESS_LIVE, LIVENESS_PENDING, LIVENESS_READING_UNKNOWN, type PendingLivenessReading } from '../src/liveness-reading.ts'
-import { withOutageDetection } from '../src/outage-state.ts'
+import { ALL_CLEAR_TEMPLATE, clearOutageFlag, getOutageFlags, ONSET_TEMPLATES, setOutageFlag, withOutageDetection } from '../src/outage-state.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
 import {
@@ -122,6 +136,7 @@ import {
   UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED,
   UNAVAILABLE_RETRY_AGAIN_ROW_PENDING,
   UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
@@ -173,6 +188,8 @@ import {
   errSpawnNotInteractive,
   errTmuxCaptureFailed,
   errTmuxKillFailed,
+  errTmuxNotAvailable,
+  errTmuxNotAvailableDifferentServer,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
   errUnusableName,
@@ -889,6 +906,17 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     ['a STATE answer from get', () => errSpawnNotInteractive('get'), 'get', UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
     ['a GONE answer from status', () => errTmuxCaptureFailed(undefined, 'status'), 'status', UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
     ['a STATE answer from list', () => errSpawnNotInteractive('list'), 'list', UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+    // b.jg5 SRJ-311: ENVIRONMENT is decided before the read-error rule, so
+    // the read verbs record the ENVIRONMENT cause too, as every other verb does.
+    ['ErrTmuxNotAvailable from status', () => errTmuxNotAvailable(undefined, 'status'), 'status', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['ErrTmuxNotAvailable from get', () => errTmuxNotAvailable(undefined, 'get'), 'get', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['ErrTmuxNotAvailable from list', () => errTmuxNotAvailable(undefined, 'list'), 'list', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['ErrTmuxNotAvailable from kill', () => errTmuxNotAvailable(undefined, 'kill'), 'kill', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['ErrTmuxNotAvailable from spawn', () => errTmuxNotAvailable(), 'spawn', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['ErrTmuxNotAvailable from read-pane', () => errTmuxNotAvailable(undefined, 'read-pane'), 'read-pane', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['ErrTmuxNotAvailable from delete', () => errTmuxNotAvailable(undefined, 'delete'), 'delete', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['ErrTmuxNotAvailable (the re-bound socket) from resume', () => errTmuxNotAvailableDifferentServer(), 'resume', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['ErrTmuxNotAvailable with no verb known', () => errTmuxNotAvailable(), undefined, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
     ['ErrSpawnNotFound from get', () => errSpawnNotFound(), 'get', undefined],
     ['ErrSpawnNotFound from status', () => errSpawnNotFound(), 'status', undefined],
     ['a CONFIG answer from get', () => errConfigMalformed(), 'get', undefined],
@@ -4085,5 +4113,628 @@ describe('unavailable retry: the stop observer (SRJ-309)', () => {
     const terminal = [UNAVAILABLE_RETRY_STOP_TORN_DOWN, UNAVAILABLE_RETRY_STOP_NOT_APPLIED, UNAVAILABLE_RETRY_STOP_SHUTDOWN]
     expect([...UNAVAILABLE_RETRY_TERMINAL_STOPS].sort()).toEqual([...terminal].sort())
     expect(ALL_STOP_REASONS.filter((reason) => UNAVAILABLE_RETRY_TERMINAL_STOPS.has(reason)).sort()).toEqual([...terminal].sort())
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ENVIRONMENT (`ErrTmuxNotAvailable`, b.jg5 SRJ-311, SRJ-312, AC 27, AC 36) on
+// the recovery harness, both settings 0: what arms the timer in and out of an
+// attempt, never counted and retried only on the backoff, a read success that
+// keeps the outage, the clears that stop the timer (SRJ-305) and SRJ-306's
+// exceptions against them, the recovery, and a kill of the last session on a
+// socket followed by answers from a tmux server that is exiting (AD handoff
+// rev 23)
+// ---------------------------------------------------------------------------
+
+/** The `tmux-unavailable` onset, as the outage state posts it. */
+function tmuxUnavailableOnset(key: string): { key: string; text: string } {
+  return { key, text: ONSET_TEMPLATES['tmux-unavailable']() }
+}
+
+/** The single all-clear of a bad stretch that held only `tmux-unavailable`. */
+function tmuxUnavailableAllClear(key: string): { key: string; text: string } {
+  return { key, text: ALL_CLEAR_TEMPLATE(new Map([['tmux-unavailable', { detail: undefined }]])) }
+}
+
+/**
+ * A start-pass launch of persona `key` whose optimistic spawn answers
+ * ENVIRONMENT: refused, one onset, P's timer armed at the base wait with the
+ * ENVIRONMENT cause. The stub's spawn keeps answering ENVIRONMENT. Resolves
+ * with the arm's time.
+ */
+async function environmentLaunch(h: RecoveryHarness, key: string): Promise<number> {
+  h.script({ spawnError: errTmuxNotAvailable() })
+  const armedAt = h.clock.now()
+  expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+  expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+  expect(h.controller.view(key)).toEqual({
+    phase: 'waiting',
+    dueAt: armedAt + waitMs(0),
+    waitMs: waitMs(0),
+    refusals: 0,
+    causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    mode: UNAVAILABLE_RETRY_MODE_FULL,
+  })
+  return armedAt
+}
+
+/** The re-armed line of a retry refused by ENVIRONMENT: its prefix and suffix, after `refusals` refusals. */
+function environmentReArmed(h: RecoveryHarness, key: string, retry: number, refusals: number): string[] {
+  const prefix = `[slack] unavailable-retry: persona=${key} retry ${retry}: ${UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT}: `
+  const suffix = ` — re-armed, next retry in ${waitMs(refusals) / 1000} s`
+  return retryLinesOf(h, key).filter((line) => line.startsWith(prefix) && line.endsWith(suffix))
+}
+
+/** Record the clock time of every stub `kill` call, in order. */
+function recordKills(h: RecoveryHarness): number[] {
+  const at: number[] = []
+  const client = h.stub.client
+  const kill = client.kill.bind(client)
+  client.kill = async (params) => {
+    at.push(h.clock.now())
+    return kill(params)
+  }
+  return at
+}
+
+/** What a health tick's healthy branch does to the outage (`src/health-check.ts`): the clear, with the tick's `live` reading. */
+function tickClear(key: string): void {
+  clearOutageFlag(key, 'tmux-unavailable', LIVENESS_LIVE)
+}
+
+/** Nothing reached persona `other`: no trigger, timer, notice or call. */
+function expectUntouched(h: RecoveryHarness, other: string): void {
+  expect(h.triggers.filter((t) => t.key === other)).toEqual([])
+  expect(h.controller.isArmed(other)).toBe(false)
+  expect(h.outageNotices.filter((n) => n.key === other)).toEqual([])
+  expect(h.notices.filter((n) => n.key === other)).toEqual([])
+  expect(getOutageFlags(other).size).toBe(0)
+  const otherId = personaInstanceId(other)
+  const calls = Object.values(h.stub.calls).flat() as Array<{ claude_instance_id?: unknown }>
+  expect(calls.filter((params) => params?.claude_instance_id === otherId)).toEqual([])
+}
+
+describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, is retried only on the backoff, and its clear stops the timer (SRJ-311, SRJ-312, SRJ-305, SRJ-306, AC 27, AC 36)', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test('a start-pass launch whose spawn answers ErrTmuxNotAvailable is refused and arms that persona’s timer once at the base wait with the ENVIRONMENT cause: one onset, nothing counted, no other call; the other persona is untouched', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+
+    await environmentLaunch(h, key)
+
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)
+    expect(callCounts(h)).toEqual({ spawnCalls: 1 })
+    expect(getFailureCount(key)).toBe(0)
+    expect([...getOutageFlags(key)]).toEqual(['tmux-unavailable'])
+    // ENVIRONMENT never starts the tmux-unresponsive condition (SRJ-307).
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expectUntouched(h, other)
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>, Record<string, number>]>([
+    ['the health tick’s liveness read (status)', async (h, key) => {
+      h.script({ statusError: errTmuxNotAvailable(undefined, 'status') })
+      expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
+    }, { statusCalls: 1 }],
+    ['a persona teardown’s kill', async (h, key) => {
+      const err = errTmuxNotAvailable(undefined, 'kill')
+      h.script({ killError: err })
+      await expect(killPersonaInstance(key)).rejects.toBe(err)
+    }, { killCalls: 1 }],
+    ['a plain read-pane through the outage wrapper', async (h, key) => {
+      const err = errTmuxNotAvailable(undefined, 'read-pane')
+      h.script({ readPaneError: err })
+      await expect(readPaneSucceeds(h, key)).rejects.toBe(err)
+    }, { readPaneCalls: 1 }],
+    ['the permission poller’s get', async (h, key) => {
+      h.script({
+        listResult: { spawns: [cannedListRow({ state: 'check_permission' }, personaOf(h, key), h.home)] },
+        getError: errTmuxNotAvailable(undefined, 'get'),
+      })
+      // The poller skips its per-event line for ENVIRONMENT: its tick is
+      // over once its get has been answered and the trigger sent.
+      const client = h.stub.client
+      const get = client.get.bind(client)
+      const answered = Promise.withResolvers<void>()
+      client.get = async (params) => {
+        try {
+          return await get(params)
+        } finally {
+          answered.resolve()
+        }
+      }
+      stopPermissionPoller()
+      _resetPollerState()
+      const poller = startManualPoller({
+        getClient: () => h.stub.client as unknown as ReturnType<PollerDeps['getClient']>,
+        clientFor: () => undefined,
+        getPersona: (k) => h.config.personas.find((p) => p.key === k),
+        emitTrail: () => {},
+        log: () => {},
+      })
+      try {
+        poller.fire()
+        await answered.promise
+        for (let flushes = 0; flushes < 20 && h.triggers.length === 0; flushes++) await h.clock.flush()
+      } finally {
+        stopPermissionPoller()
+        _resetPollerState()
+      }
+    }, { listCalls: 1, getCalls: 1 }],
+  ])('ErrTmuxNotAvailable from %s, made outside every attempt, raises the outage and arms that persona’s timer once at the base wait with the ENVIRONMENT cause; the other persona is untouched', async (_site, run, calls) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    expect(isInsideAttempt(key)).toBe(false)
+
+    await run(h, key)
+
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)
+    expect(callCounts(h)).toEqual(calls)
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+    expect(getFailureCount(key)).toBe(0)
+    expectUntouched(h, other)
+  })
+
+  test('ErrTmuxNotAvailable from the JSONL safeguard’s get for each persona, made outside every attempt, arms each persona’s timer once at the base wait with the ENVIRONMENT cause', async () => {
+    const h = (harness = makeRecoveryHarness())
+    h.script({ getError: errTmuxNotAvailable(undefined, 'get') })
+
+    await runJsonlPersistenceSafeguard(h.config, undefined, {
+      home: h.home,
+      readMountinfo: () => '',
+      statFn: () => false,
+      archiveCountSince: () => null,
+      recordStartupError: () => {},
+    })
+
+    expect(h.triggers).toEqual(h.keys.map((key) => ({ key, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT })))
+    expect([...h.controller.armedKeys()].sort()).toEqual([...h.keys].sort())
+    for (const key of h.keys) {
+      expect(h.controller.view(key)).toEqual({
+        phase: 'waiting',
+        dueAt: h.clock.now() + waitMs(0),
+        waitMs: waitMs(0),
+        refusals: 0,
+        causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+        mode: UNAVAILABLE_RETRY_MODE_FULL,
+      })
+    }
+    expect(h.outageNotices).toEqual(h.keys.map(tmuxUnavailableOnset))
+    expect(h.attempts).toEqual([])
+  })
+
+  test('a trigger for a key no longer in the applied configuration (its teardown’s kill answers ErrTmuxNotAvailable) arms it, and its first retry stops it with no agent-director call; the other persona is untouched', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    h.remove(key)
+    h.script({ killError: errTmuxNotAvailable(undefined, 'kill') })
+    await expect(killPersonaInstance(key)).rejects.toThrow()
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)
+    const before = callCounts(h)
+
+    await retryNow(h, key)
+
+    expect(h.attempts).toHaveLength(1)
+    expect(callsSince(h, before)).toEqual({})
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_NOT_APPLIED))
+    expectStopped(h, key)
+    expectUntouched(h, other)
+  })
+
+  test('AC 36: with both settings 0, a spawn that keeps answering ErrTmuxNotAvailable is retried only at each due time from the backoff, never 1 ms early, never counted past the cap, with no delete and no kill or launch outside a retry, and exactly one onset however many retries', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    const row = modelRow(h, 'missing')
+    const kills = recordKills(h)
+    const armedAt = await environmentLaunch(h, key)
+    expect(row.spawnedAt).toEqual([armedAt])
+
+    const retries = RESTART_FAILURE_CAP + refusalsToCeiling() + 2
+    const retryTimes: number[] = []
+    let dueAt = armedAt
+    for (let n = 0; n < retries; n++) {
+      dueAt += waitMs(n)
+      await h.advance(dueAt - 1 - h.clock.now())
+      expect([n, row.spawnedAt.length, kills.length]).toEqual([n, n + 1, n])
+      await h.advance(1)
+      await h.settle()
+      retryTimes.push(dueAt)
+      expect([n, row.spawnedAt.at(-1), kills.at(-1)]).toEqual([n, dueAt, dueAt])
+      expect([n, environmentReArmed(h, key, n + 1, n + 1)]).toEqual([n, [expect.any(String)]])
+      expect(h.controller.view(key)).toEqual({
+        phase: 'waiting',
+        dueAt: dueAt + waitMs(n + 1),
+        waitMs: waitMs(n + 1),
+        refusals: n + 1,
+        causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+        mode: UNAVAILABLE_RETRY_MODE_FULL,
+      })
+    }
+
+    // Every spawn and kill came at the arm or a retry's due time.
+    expect(row.spawnedAt).toEqual([armedAt, ...retryTimes])
+    expect(kills).toEqual(retryTimes)
+    expect(h.attempts.map((a) => a.at)).toEqual(retryTimes)
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(getFailureCount(key)).toBe(0)
+    expect(isAtCap(key, RESTART_FAILURE_CAP)).toBe(false)
+    expect(h.capReached).toEqual([])
+    expect(h.triggers.every((t) => t.key === key && t.kind === UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)).toBe(true)
+    // The row reads succeeded every retry; none cleared the outage.
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+    expect(h.outageClears).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expectUntouched(h, other)
+  })
+
+  test.each<[string, RowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT, Record<string, number>]>([
+    ['reads the row ended (a status success); its kill answers and its spawn answers ErrTmuxNotAvailable', 'ended', { statusCalls: 1, killCalls: 1, spawnCalls: 1 }],
+    ['reads the row missing (a status success); its kill answers and its spawn answers ErrTmuxNotAvailable', 'missing', { statusCalls: 1, killCalls: 1, spawnCalls: 1 }],
+    ['reads no row (status answers ErrSpawnNotFound); its kill answers and its spawn answers ErrTmuxNotAvailable', UNAVAILABLE_RETRY_ROW_ABSENT, { statusCalls: 1, killCalls: 1, spawnCalls: 1 }],
+  ])('AC 27, AC 36: a retry that %s leaves the outage raised with no all-clear and the timer armed at the doubled wait', async (_what, state, calls) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, state)
+    await environmentLaunch(h, key)
+    const before = callCounts(h)
+
+    await retryNow(h, key)
+
+    expect(callsSince(h, before)).toEqual(calls)
+    expect([...getOutageFlags(key)]).toEqual(['tmux-unavailable'])
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+    expect(h.outageClears).toEqual([])
+    expect(environmentReArmed(h, key, 1, 1)).toHaveLength(1)
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(1), waitMs: waitMs(1), refusals: 1 })
+    expect(getFailureCount(key)).toBe(0)
+  })
+
+  test('AC 27: a retry whose row reads live (a status success) and whose reconnect’s read-pane and send-keys answer ErrTmuxNotAvailable leaves the outage raised and the timer armed at the doubled wait, with no kill or spawn', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, 'waiting')
+    await environmentLaunch(h, key)
+    h.script({ readPaneError: errTmuxNotAvailable(undefined, 'read-pane'), sendKeysError: errTmuxNotAvailable(undefined, 'send-keys') })
+    const before = callCounts(h)
+
+    await retryNow(h, key)
+
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 })
+    expect([...getOutageFlags(key)]).toEqual(['tmux-unavailable'])
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+    expect(h.outageClears).toEqual([])
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(1), refusals: 1 })
+    expect(getFailureCount(key)).toBe(0)
+  })
+
+  test('a retry whose reconnect of the live row succeeds (tmux answers its read-pane and send-keys) clears the outage with one all-clear, and the timer stops', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, 'waiting')
+    await environmentLaunch(h, key)
+    const before = callCounts(h)
+
+    await retryNow(h, key)
+
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 })
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(getOutageFlags(key).size).toBe(0)
+    // The clear reaches the condition-end entry once, while the retry runs.
+    expect(h.outageClears).toEqual([{ key, reading: undefined, result: 'deferred' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expectStopped(h, key)
+    expect(getFailureCount(key)).toBe(0)
+    expectUntouched(h, other)
+  })
+
+  test('a retry that finds the persona live (not pending) and connected with its stream clears the outage with its live reading and one all-clear, and the timer stops', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, 'waiting')
+    await environmentLaunch(h, key)
+    h.setConnected(key, true)
+    const before = callCounts(h)
+
+    await retryNow(h, key)
+
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(h.outageClears).toEqual([{ key, reading: LIVENESS_LIVE, result: 'deferred' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expectStopped(h, key)
+  })
+
+  test('a pending-only retry that reads the row live out of pending, connected with its stream, clears the outage with that reading and one all-clear, and the timer stops', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, 'waiting')
+    // The outage raised as the wrappers raise it, and the timer armed
+    // pending-only directly (no wired path yet leaves both).
+    setOutageFlag(key, 'tmux-unavailable')
+    h.controller.armPendingOnly(key)
+    h.setConnected(key, true)
+
+    await retryNow(h, key)
+
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(h.outageClears).toEqual([{ key, reading: 'waiting', result: 'deferred' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
+    expectStopped(h, key)
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
+    ['no retry has read the row', async () => {}],
+    ['a retry last read the row pending (the tick’s live reading is the later read)', async (h, key) => {
+      modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
+      await retryNow(h, key)
+      expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+    }],
+  ])('a health tick’s healthy-branch clear, when %s, posts one all-clear and stops the timer', async (_what, before) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    await environmentLaunch(h, key)
+    await before(h, key)
+
+    tickClear(key)
+
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(h.outageClears).toEqual([{ key, reading: LIVENESS_LIVE, result: 'stopped' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED))
+    expectStopped(h, key)
+
+    // A second clear finds nothing raised: no all-clear, no call to the entry.
+    tickClear(key)
+    expect(h.outageNotices).toHaveLength(2)
+    expect(h.outageClears).toHaveLength(1)
+  })
+
+  test('AC 30 (its tmux-unavailable half): a successful read-pane that clears the outage while a retry last read the row pending posts one all-clear and leaves the timer armed with its due time; the next retry still runs at it', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
+    await environmentLaunch(h, key)
+    await retryNow(h, key)
+    expect([...getOutageFlags(key)]).toEqual(['tmux-unavailable'])
+    const before = h.controller.view(key)!
+    expect(before).toMatchObject({ phase: 'waiting', refusals: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+
+    await readPaneSucceeds(h, key)
+
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(h.outageClears).toEqual([{ key, reading: undefined, result: 'kept' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING))
+    expect(h.controller.view(key)).toEqual(before)
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([before.dueAt!])
+
+    const attempts = h.attempts.length
+    await h.advance(before.dueAt! - 1 - h.clock.now())
+    expect(h.attempts).toHaveLength(attempts)
+    await retryNow(h, key)
+    expect(h.attempts.slice(attempts)).toEqual([{ key, retry: 2, causes: before.causes, mode: UNAVAILABLE_RETRY_MODE_FULL, at: before.dueAt! }])
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<unknown>, string | undefined]>([
+    ['a successful read-pane', readPaneSucceeds, undefined],
+    ['a health tick’s healthy-branch clear', async (_h, key) => tickClear(key), LIVENESS_LIVE],
+  ])('with a kill-failure cause recorded, %s clears the outage with one all-clear and leaves the timer armed with its due time', async (_what, clear, reading) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, 'ended')
+    h.script({ killError: errTmuxKillFailed() })
+    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+    await h.settle()
+    // The outage is raised by a read-pane outside every attempt.
+    h.script({ killError: undefined, readPaneError: errTmuxNotAvailable(undefined, 'read-pane') })
+    await expect(readPaneSucceeds(h, key)).rejects.toThrow()
+    h.script({ readPaneError: undefined })
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }, { key, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
+    const before = h.controller.view(key)!
+    expect(before).toMatchObject({ phase: 'waiting', causes: [UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT] })
+
+    await clear(h, key)
+
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(h.outageClears).toEqual([{ key, reading, result: 'kept' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED, UNAVAILABLE_RETRY_KEPT_KILL_FAILED))
+    expect(h.controller.view(key)).toEqual({ ...before, ...(reading !== undefined ? { lastRow: reading } : {}) })
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([before.dueAt!])
+  })
+
+  test('recovery: once the spawn answers, the persona comes up once, the outage clears with one all-clear (the launch’s pending row keeps the timer, pending-only), and the next retry finds it live and connected and stops', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const row = modelRow(h, 'missing')
+    await environmentLaunch(h, key)
+    await retryNow(h, key)
+    await retryNow(h, key)
+    expect(row.spawnedAt).toHaveLength(3)
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+
+    h.script({ spawnError: undefined })
+    await retryNow(h, key)
+
+    expect(row.spawnedAt).toHaveLength(4)
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(h.outageClears).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'deferred' }])
+    expect(retryLinesOf(h, key).slice(-2)).toEqual([
+      keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
+      reArmedLine(key, 3, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 3, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }),
+    ])
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+
+    h.setConnected(key, true)
+    const before = callCounts(h)
+    await retryNow(h, key)
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+    expect(row.spawnedAt).toHaveLength(4)
+    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
+    expectStopped(h, key)
+    expect(h.outageNotices).toHaveLength(2)
+    expect(getFailureCount(key)).toBe(0)
+    expect(h.capReached).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A kill of the last session on a tmux socket, then a tmux server that is
+// exiting (AD handoff rev 23): right after the kill, the calls that follow on
+// that socket can briefly answer `ErrTmuxNotAvailable` or
+// `ErrTmuxUnresponsive`. CSCB handles each by its class (b.jg5 SRJ-311,
+// SRJ-307): one onset per episode, one all-clear or recovery when tmux
+// answers, nothing posted twice, nothing latched, and the retry timer on its
+// schedule (SRJ-302, SRJ-305, SRJ-306).
+// ---------------------------------------------------------------------------
+
+describe('unavailable retry: a kill of the last session on a socket, then answers from a tmux server that is exiting (AD handoff rev 23)', () => {
+  afterEach(() => {
+    if (harness !== undefined) assertNoLeak(harness.captured())
+  })
+
+  test('ErrTmuxNotAvailable after the kill: one onset for the episode however many calls answer it, the retries on the backoff with nothing counted, deleted or launched while it lasts, one all-clear when tmux answers, the timer stopped once the persona is up; a later episode posts its own onset', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    const row = modelRow(h, 'ended')
+    const kills = recordKills(h)
+
+    // The restart kills the persona's session, the last on its socket (the
+    // kill answers); the tmux server exits and the launch's spawn answers
+    // ErrTmuxNotAvailable.
+    h.script({ spawnError: errTmuxNotAvailable() })
+    const killedAt = h.clock.now()
+    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).not.toBe(RESTART_OUTCOME_COUNTED_FAILURE)
+    await h.settle()
+    expect(kills).toEqual([killedAt])
+    expect(row.spawnedAt).toEqual([killedAt])
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+
+    // More calls on the socket answer it while the server exits: a read-pane
+    // outside every attempt, and each retry's kill. None posts again; the
+    // trigger keeps the due time.
+    h.script({ killError: errTmuxNotAvailable(undefined, 'kill'), readPaneError: errTmuxNotAvailable(undefined, 'read-pane') })
+    await expect(readPaneSucceeds(h, key)).rejects.toThrow()
+    expect(h.controller.view(key)).toMatchObject({ dueAt: killedAt + waitMs(0), refusals: 0 })
+    let dueAt = killedAt
+    for (let n = 0; n < 2; n++) {
+      dueAt += waitMs(n)
+      await h.advance(dueAt - 1 - h.clock.now())
+      expect(h.attempts).toHaveLength(n)
+      await retryNow(h, key)
+      expect(h.attempts.at(-1)).toEqual({ key, retry: n + 1, causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt })
+      expect(environmentReArmed(h, key, n + 1, n + 1)).toHaveLength(1)
+    }
+    // Each refused kill stopped its retry: no spawn followed it.
+    expect(kills).toEqual([killedAt, killedAt + waitMs(0), killedAt + waitMs(0) + waitMs(1)])
+    expect(row.spawnedAt).toEqual([killedAt])
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+    expect(h.outageClears).toEqual([])
+
+    // tmux answers again: the next retry's kill and spawn succeed. The
+    // spawn's success clears the outage with one all-clear; its pending row
+    // keeps the timer, now pending-only.
+    h.script({ killError: undefined, readPaneError: undefined, spawnError: undefined })
+    dueAt += waitMs(2)
+    expect(await retryNow(h, key)).toBe(dueAt)
+    expect(row.spawnedAt).toEqual([killedAt, dueAt])
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(h.outageClears).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'deferred' }])
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: dueAt + waitMs(3), refusals: 3, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+
+    // The persona connects: the next retry reads its row live and stops.
+    h.setConnected(key, true)
+    await retryNow(h, key)
+    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
+    expectStopped(h, key)
+
+    // Never counted, deleted or escalated; the condition never started.
+    expect(getFailureCount(key)).toBe(0)
+    expect(h.capReached).toEqual([])
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(conditionLines(h, key)).toEqual([])
+    expect(h.episodeNotices).toEqual([])
+
+    // Nothing latched: a later ErrTmuxNotAvailable is a new episode, with its
+    // own onset and arm, and its own all-clear.
+    h.script({ readPaneError: errTmuxNotAvailable(undefined, 'read-pane') })
+    await expect(readPaneSucceeds(h, key)).rejects.toThrow()
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key), tmuxUnavailableOnset(key)])
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(0), refusals: 0, causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT] })
+    tickClear(key)
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key), tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expectStopped(h, key)
+    expectUntouched(h, other)
+  })
+
+  test('ErrTmuxUnresponsive after the kill: the tmux-unresponsive condition, not the outage, with the retries on the backoff and nothing counted, deleted or launched while it lasts; each post at most once, and the timer stopped once the persona is up', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    const row = modelRow(h, 'ended')
+    const kills = recordKills(h)
+
+    h.script({ spawnError: errTmuxUnresponsive('spawn') })
+    const killedAt = h.clock.now()
+    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).not.toBe(RESTART_OUTCOME_COUNTED_FAILURE)
+    await h.settle()
+    expect(kills).toEqual([killedAt])
+    expect(row.spawnedAt).toEqual([killedAt])
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
+    expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(killedAt)
+
+    // Each retry's kill answers ErrTmuxUnresponsive while the server exits:
+    // refused, no spawn. The retries run past the onset floor and one more,
+    // so the onset is posted at the first retry at or past it, and only then.
+    h.script({ killError: errTmuxUnresponsive('kill') })
+    const onset = { key, text: tmuxUnresponsiveOnsetText(key) }
+    let dueAt = killedAt
+    let onsetAt: number | undefined
+    for (let n = 0; onsetAt === undefined || dueAt === onsetAt; n++) {
+      dueAt += waitMs(n)
+      await h.advance(dueAt - 1 - h.clock.now())
+      expect(h.attempts).toHaveLength(n)
+      await retryNow(h, key)
+      expect(h.attempts.at(-1)).toMatchObject({ key, retry: n + 1, mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt })
+      if (onsetAt === undefined && dueAt - killedAt >= TMUX_UNRESPONSIVE_ONSET_FLOOR_MS) onsetAt = dueAt
+      expect([n, h.episodeNotices]).toEqual([n, onsetAt === undefined ? [] : [onset]])
+    }
+    const refused = h.attempts.length
+    expect(row.spawnedAt).toEqual([killedAt])
+    expect(h.tmuxUnresponsive.holds(key)).toBe(true)
+    expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(killedAt)
+
+    // tmux answers again: the retry's kill and spawn succeed; the spawn ends
+    // the condition with its pending row (one recovery), keeping the timer.
+    h.script({ killError: undefined, spawnError: undefined })
+    dueAt += waitMs(refused)
+    expect(await retryNow(h, key)).toBe(dueAt)
+    expect(row.spawnedAt).toEqual([killedAt, dueAt])
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(h.conditionEnds).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'deferred' }])
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+
+    h.setConnected(key, true)
+    await retryNow(h, key)
+    expectStopped(h, key)
+
+    // One onset and one recovery, and never the outage's posts.
+    expect(h.episodeNotices).toEqual([onset, { key, text: tmuxUnresponsiveRecoveryText(key) }])
+    expect(h.outageNotices).toEqual([])
+    expect(h.outageClears).toEqual([])
+    expect(getFailureCount(key)).toBe(0)
+    expect(h.capReached).toEqual([])
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.notices).toEqual([])
+    expectUntouched(h, other)
   })
 })

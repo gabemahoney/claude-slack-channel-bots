@@ -23,7 +23,9 @@
  *   connection and stream probes (`isSessionConnected` and
  *   `hasSessionStream`, both over `setConnected`) and `endTmuxUnresponsive`,
  *   the condition's end with reason `TMUX_UNRESPONSIVE_END_RETRY` and the
- *   retry's reading. `scriptedAction` is
+ *   retry's reading followed by the clear of the persona's
+ *   `tmux-unavailable` outage with that reading (b.jg5 SRJ-311, SRJ-312).
+ *   `scriptedAction` is
  *   the scripted action: it answers each persona's queued outcomes
  *   (`answer(key, ...outcomes)`) in order and, once they run out, a bare
  *   refusal (`{ kind: 'again' }`). `options.action` replaces the default
@@ -73,9 +75,22 @@
  * - `triggers`: the outage state's trigger sink (b.jg5 SRJ-301) is the
  *   controller, behind a recorder: every trigger an agent-director error
  *   inside a launch or recovery attempt sends (`{ key, kind }`, the cause
- *   kind) is recorded here, then armed on the controller. With
+ *   kind) is recorded here, then armed on the controller; an ENVIRONMENT
+ *   answer (`ErrTmuxNotAvailable`) from any call for a persona, in or out of
+ *   an attempt, is sent too (b.jg5 SRJ-311). With
  *   `options.triggerSink: false` no sink is installed: nothing is recorded or
  *   armed.
+ * - `outageClears` (b.jg5 SRJ-305, SRJ-306, SRJ-311): the outage state's
+ *   cleared-flag observer (`onFlagCleared`), installed in the same
+ *   `initOutageState` call as `main()` binds it: each real clear of a
+ *   persona's `tmux-unavailable` outage (never a silent reset, never another
+ *   class) calls the controller's condition-end entry once
+ *   (`conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
+ *   reading)`, the reading the clear brought), recorded here
+ *   (`{ key, reading, result }`) with what the controller answered. The
+ *   health tick's healthy branch clears it with `LIVENESS_LIVE`; the harness
+ *   has no tick, so a case clears it as that branch does
+ *   (`clearOutageFlag(key, 'tmux-unavailable', LIVENESS_LIVE)`).
  * - `episodes` and `tmuxUnresponsive` (b.jg5 SRJ-307, SRJ-310, SRJ-1016):
  *   one notice-episodes instance (`createPersonaEpisodes`) on the harness
  *   clock, whose posts land in `episodeNotices` and whose lines go to
@@ -148,7 +163,8 @@
  *   by `cleanup()`.
  * - `captured()`: everything captured, for `assertNoLeak`: the lines, the
  *   `console.error` lines, the three notice lists, the startup-errors
- *   entries, the attempts, the triggers, the condition ends and the state
+ *   entries, the attempts, the triggers, the condition ends, the outage
+ *   clears and the state
  *   directory as a written file.
  * - `cleanup()`: stops every retry timer (`stopAll`) and forgets every
  *   episode (`episodes.forgetAll()`, which cancels every alert check), then
@@ -194,7 +210,7 @@ import { adAlertThresholdMsInEffect, adSettingsInEffect, installAdSettings, rese
 import { _resetBackoffState, isAtCap } from '../../src/backoff.ts'
 import type { Persona, PersonaConfig } from '../../src/config.ts'
 import { LIVENESS_LIVE } from '../../src/liveness-reading.ts'
-import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
+import { _resetOutageState, clearOutageFlag, initOutageState } from '../../src/outage-state.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
 import {
   createPersonaEpisodes,
@@ -230,6 +246,7 @@ import {
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
+  UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_ROW_ABSENT,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
@@ -332,10 +349,17 @@ export interface RecoveryNotice {
   readonly text: string
 }
 
-/** One end of a holding `tmux-unresponsive` condition, as the controller's condition-end entry saw it. */
+/**
+ * One call to the controller's condition-end entry: an end of a holding
+ * `tmux-unresponsive` condition (`conditionEnds`) or a real clear of the
+ * `tmux-unavailable` outage (`outageClears`).
+ */
 export interface RecoveryConditionEnd {
   readonly key: string
-  /** The reading the end brought (a tick's or a retry's), or undefined (a tmux-touching success or GONE). */
+  /**
+   * The reading the end brought (a tick's or a retry's, or a launch call's
+   * `pending` clear), or undefined (a tmux-touching success or GONE).
+   */
   readonly reading: string | undefined
   /** What `controller.conditionEnded` answered. */
   readonly result: UnavailableRetryConditionEndResult
@@ -365,6 +389,8 @@ export interface RecoveryHarness {
   readonly tmuxUnresponsive: TmuxUnresponsiveCondition
   /** Every call the condition made to the controller's condition-end entry, in order. */
   readonly conditionEnds: RecoveryConditionEnd[]
+  /** Every call a real `tmux-unavailable` clear made to the controller's condition-end entry, in order. */
+  readonly outageClears: RecoveryConditionEnd[]
   /** Keys `onCapReached` was called for, in order. */
   readonly capReached: string[]
   /** The per-persona serializer the restart module runs its work through. */
@@ -422,6 +448,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const triggers: RecoveryTrigger[] = []
   const episodeNotices: RecoveryNotice[] = []
   const conditionEnds: RecoveryConditionEnd[] = []
+  const outageClears: RecoveryConditionEnd[] = []
   const settleFlushes = options.settleFlushes ?? DEFAULT_SETTLE_FLUSHES
   const settleMs = options.settleMs ?? DEFAULT_SETTLE_MS
   const log = (line: string): void => {
@@ -464,6 +491,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     hasSessionStream: (key) => connected.has(key),
     endTmuxUnresponsive: (key, reading) => {
       tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
+      clearOutageFlag(key, 'tmux-unavailable', reading)
     },
   })
   let current: UnavailableRetryAction = options.action === 'scripted' ? scripted : (options.action ?? fullMode)
@@ -529,6 +557,14 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     getClient: () => stub.client as unknown as Client,
     ...(options.triggerSink === false ? {} : { triggerSink }),
     ...(options.conditionSink === false ? {} : { conditionSink: tmuxUnresponsive }),
+    // As main() binds it: each real clear of the persona's `tmux-unavailable`
+    // outage reaches the controller's condition-end entry once, with the
+    // reading the clear brought.
+    onFlagCleared: (key, cls, reading) => {
+      if (cls !== 'tmux-unavailable') return
+      const result = controller.conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE, reading)
+      outageClears.push({ key, reading, result })
+    },
   })
   setSessionNotifier((key, text) => {
     notices.push({ key, text })
@@ -615,6 +651,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     episodes,
     tmuxUnresponsive,
     conditionEnds,
+    outageClears,
     capReached,
     serializer,
     fullModeAction: fullMode,
@@ -705,6 +742,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       attempts: [...attempts],
       triggers: [...triggers],
       conditionEnds: [...conditionEnds],
+      outageClears: [...outageClears],
       stateDir: writtenFile(stateDir),
     }),
 

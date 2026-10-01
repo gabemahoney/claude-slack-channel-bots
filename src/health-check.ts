@@ -16,6 +16,10 @@
  * scheduled on its first undeliverable tick (b.f2b). The work list, the
  * disconnected streaks, every guard call and the `cwd-unreachable` flag are
  * keyed by persona key (b.av2 SR-6.3); log lines name it as `persona=<key>`.
+ * The healthy branch (`live`, connected, stream present) is the tick's only
+ * clear of the persona's `tmux-unavailable` outage (b.jg5 SRJ-312), with the
+ * `live` reading passed on to the cleared-flag observer; the liveness read
+ * itself never clears it.
  * Follows the same pattern as restart.ts: module-scoped state, injectable
  * deps, no server.ts imports.
  *
@@ -27,6 +31,7 @@ import { setOutageFlag, clearOutageFlag } from './outage-state.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import {
   LIVENESS_DEAD,
+  LIVENESS_LIVE,
   LIVENESS_PENDING,
   LIVENESS_UNKNOWN,
   livenessKindOf,
@@ -419,9 +424,16 @@ export function startHealthCheck(intervalSeconds: number): void {
             // streak so a transient one-tick blip never accumulates toward the
             // threshold. b.f2b: its not-connected episode, if any, is over.
             // b.jg5 SRJ-310: so is its tmux-unresponsive condition, if it holds.
+            // b.jg5 SRJ-311, SRJ-312: a healthy check is the one tick
+            // observation that clears `tmux-unavailable` (with its single
+            // all-clear when that empties the persona's flags), carrying the
+            // tick's `live` reading so the retry timer's stop sees a row live
+            // out of `pending`. No other reading, and no disconnected or
+            // streamless session, clears it.
             disconnectedStreak.delete(key)
             deps.endNotConnectedEpisode?.(key)
             deps.endTmuxUnresponsive?.(key)
+            clearOutageFlag(key, 'tmux-unavailable', LIVENESS_LIVE)
           }
         } catch (err) {
           console.error(`[slack] health-check: error checking persona=${key}: ${describeThrownValue(err)}`)
