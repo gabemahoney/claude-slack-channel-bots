@@ -34,8 +34,10 @@
  *    notifier and destinations, the health check, the CLI, the template
  *    install, the agent-director error classifier, the agent-director
  *    settings reader, the UNAVAILABLE retry timer, the persona episodes
- *    with their tmux-unresponsive condition and the outage state, whose
- *    config-file onset quotes agent-director), a value import of one
+ *    with their tmux-unresponsive condition, the outage state, whose
+ *    config-file onset quotes agent-director, and the conflict latch, whose
+ *    lines and record carry agent-director's CONFLICT description), a value
+ *    import of one
  *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
  *    config-file writer, the agent-director settings-file writer, the reload,
  *    connection, routing and recovery harnesses, the Slack client factory
@@ -133,6 +135,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/unavailable-retry\.ts$/, "the UNAVAILABLE retry timer, whose lines can carry agent-director failure text (a cause or a failed retry, described)"],
   [/^src\/persona-episodes\.ts$/, "the persona episodes and the tmux-unresponsive condition, whose start line carries agent-director failure text (the refusing verb's error, described)"],
   [/^src\/outage-state\.ts$/, "the outage flags and their notices, whose ad-config-malformed onset carries agent-director's description (its error's message) to Slack"],
+  [/^src\/conflict-latch\.ts$/, "the conflict latch, whose latch and relatch lines and stored record carry text from agent-director's CONFLICT description (the quoted session and the description, redacted)"],
 ]
 
 /** Test helpers whose named exports build tokens, credentials or config files, or plant the sentinel. */
@@ -256,7 +259,11 @@ const SCREAMING_CASE = /^[A-Z][A-Z0-9_]*$/
 
 /** Why `file` touches config, credentials or reload (empty when it does not). */
 function touchReasons(file: string): string[] {
-  const code = codeOf(file)
+  return touchReasonsOf(file, codeOf(file))
+}
+
+/** Why a suite at `file` whose comment-stripped code is `code` touches config, credentials or reload. */
+function touchReasonsOf(file: string, code: string): string[] {
   const reasons: string[] = []
   for (const { module, imported } of valueImports(file, code)) {
     const surface = SOURCE_SURFACES.find(([re]) => re.test(module))
@@ -376,6 +383,39 @@ describe('every suite that touches config, credentials or reload calls assertNoL
       return []
     })
     expect(checked(failures, 'exemption failures')).toEqual([])
+  })
+
+  test('every source surface has a reason and still names a module under src/ (none stale)', () => {
+    const failures = SOURCE_SURFACES.flatMap(([re, reason]) => [
+      ...(reason.trim() === '' ? [`${re.source}: surface has no reason`] : []),
+      ...(SOURCE_FILES.some((file) => re.test(file)) ? [] : [`${re.source}: stale surface: matches no module under src/`]),
+    ])
+    expect(checked(failures, 'source-surface failures')).toEqual([])
+  })
+
+  // b.jg5 SRJ-501, SRJ-507: the conflict latch's lines and record carry text from agent-director's CONFLICT description.
+  const LATCH_SUITE = 'tests/some-latch-user.test.ts'
+  test.each<[string, string, boolean]>([
+    ['a named value import of its factory', "import { createConflictLatch } from '../src/conflict-latch.ts'", true],
+    ['a renamed value import of a function', "import { recogniseConflictCase as recognise } from '../src/conflict-latch.ts'", true],
+    ['a namespace import', "import * as latch from '../src/conflict-latch.ts'", true],
+    ['a dynamic import', "const latch = await import('../src/conflict-latch.ts')", true],
+    ['only SCREAMING_CASE constants', "import { LATCH_CASE_LEFTOVER, REFUSED_OPERATION_RESUME } from '../src/conflict-latch.ts'", false],
+    ['an import type', "import type { ConflictLatchRecord } from '../src/conflict-latch.ts'", false],
+    ['a type specifier only', "import { type ConflictLatch } from '../src/conflict-latch.ts'", false],
+  ])('src/conflict-latch.ts is a source surface: a suite with %s touches it (%p)', (_label, code, touches) => {
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/conflict-latch.ts'))).toBe(true)
+    const reasons = touchReasonsOf(LATCH_SUITE, code)
+    expect(reasons.length > 0).toBe(touches)
+    if (touches) expect(reasons.every((r) => r.includes('src/conflict-latch.ts') && r.includes('the conflict latch'))).toBe(true)
+  })
+
+  test('src/conflict-latch.ts exists, so its surface is not stale, and no suite is exempted for it', () => {
+    expect(SOURCE_FILES).toContain('src/conflict-latch.ts')
+    const exemptForLatch = Object.keys(EXEMPT).filter(
+      (file) => SUITES.includes(file) && touchReasons(file).some((r) => r.includes('src/conflict-latch.ts')),
+    )
+    expect(exemptForLatch).toEqual([])
   })
 
   test("each suite that builds the reload harness leak-checks a run's captured() artifacts", () => {

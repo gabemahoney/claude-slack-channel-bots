@@ -53,6 +53,13 @@
  * {@link describeAdErrorClassification} renders a classification for a log
  * line from those fields only.
  *
+ * {@link conflictDescriptionOf} answers the description of a value that
+ * classifies as CONFLICT (its `errDescription`, read by name), and nothing
+ * for any other value; the conflict latch (`src/conflict-latch.ts`; b.jg5
+ * SRJ-501, SRJ-507) reads its quoted session and its case from it. A CONFLICT
+ * classification itself carries no description, so
+ * `describeAdErrorClassification` never logs the raw text. Never throws.
+ *
  * The classifier is pure: no I/O, clock, module state or agent-director call,
  * and it never throws (a throwing property read counts as an absent field).
  *
@@ -362,6 +369,26 @@ export function classifyAdError(value: unknown): AdErrorClassification {
     return reported(AD_ERROR_CLASS_UNCLASSIFIED, errName, readProp(value, 'errDescription'))
   } catch {
     return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
+  }
+}
+
+/**
+ * The description of a value that {@link classifyAdError} classifies as
+ * CONFLICT: its `errDescription`, read by name (b.jg5 SRJ-101 interim rule),
+ * raw as agent-director wrote it, when it is a string. `undefined` for a value
+ * of any other class (an `ErrUnknownErrorName` included, whatever its
+ * `unknownName`: SRJ-104 classes it by that name, never as CONFLICT), for a
+ * value that is not an agent-director error, and when the read throws or
+ * finds no string. The caller redacts it before it reaches a log line, a
+ * stored record or a notice. Pure; never throws.
+ */
+export function conflictDescriptionOf(value: unknown): string | undefined {
+  try {
+    if (classifyAdError(value).errorClass !== AD_ERROR_CLASS_CONFLICT) return undefined
+    const description = readProp(value, 'errDescription')
+    return typeof description === 'string' ? description : undefined
+  } catch {
+    return undefined
   }
 }
 

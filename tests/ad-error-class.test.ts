@@ -1,7 +1,10 @@
 /**
  * ad-error-class.test.ts — the one classifier of agent-director errors
  * (b.jg5 SRJ-104), the `ErrInvalidFlags` step beside it, the re-bound-socket
- * predicate `isDifferentTmuxServerError` (b.jg5 SRJ-311, SRJ-1021), and the
+ * predicate `isDifferentTmuxServerError` (b.jg5 SRJ-311, SRJ-1021), the
+ * CONFLICT description accessor `conflictDescriptionOf` (b.jg5 SRJ-501,
+ * SRJ-507; by class, so an `ErrUnknownErrorName` carrying the CONFLICT name,
+ * UNAVAILABLE by SRJ-104, answers nothing), and the
  * stub's error builders it is fed with (b.jg5 SRJ-1303; their shape checks
  * live here).
  *
@@ -43,6 +46,7 @@ import {
   TRIGGER_FAILED_DESCRIPTION,
   classifyAdError,
   classifyWithInvalidFlagsRecheck,
+  conflictDescriptionOf,
   describeAdErrorClassification,
   hasAdErrorName,
   isDifferentTmuxServerError,
@@ -1064,6 +1068,183 @@ describe('isDifferentTmuxServerError', () => {
     const value = Object.defineProperty(errTmuxNotAvailableDifferentServer(), 'errName', { get: () => { throw new Error('boom') } })
     expect(() => isDifferentTmuxServerError(value)).not.toThrow()
     expect(isDifferentTmuxServerError(value)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// conflictDescriptionOf (b.jg5 SRJ-501, SRJ-507)
+// ---------------------------------------------------------------------------
+
+/** A thrown value and its label, for the accessor's tables. */
+type Built = readonly [label: string, build: () => unknown]
+
+/**
+ * Every CONFLICT value the stub builds: SRJ-104's CONFLICT rows above (every
+ * case from `resume`, the two `kill` forms, the options variants), and every
+ * case and options variant again on another session name and verb.
+ */
+const CONFLICT_BUILDS: readonly Built[] = [
+  ...ROWS.filter(([, , expected]) => expected === AD_ERROR_CLASS_CONFLICT).map(([label, build]): Built => [label, build]),
+  ...CONFLICT_CASES.map((c): Built => [
+    `errTmuxSessionConflict (spawn, ${c}, another session)`,
+    () => errTmuxSessionConflict('spawn', c, OTHER_SESSION_NAME),
+  ]),
+  ...CONFLICT_VARIANTS.map(([label, verb, c, options]): Built => [
+    `errTmuxSessionConflict (${label}, another session)`,
+    () => errTmuxSessionConflict(verb, c, OTHER_SESSION_NAME, options),
+  ]),
+  ['a base error with the CONFLICT errName and its default name', () => baseError(ERR_TMUX_SESSION_CONFLICT_NAME, 'a session conflict')],
+]
+
+/** A proxy whose every trap throws. */
+function hostileProxy(): unknown {
+  return new Proxy({}, { get: () => { throw new Error('boom') }, getPrototypeOf: () => { throw new Error('boom') } })
+}
+
+/** The stub's CONFLICT for `c` with its `errDescription` replaced by `descriptor`. */
+function conflictWithDescription(descriptor: PropertyDescriptor, c: ConflictCase = 'own-id'): AgentDirectorError {
+  return Object.defineProperty(errTmuxSessionConflict('resume', c), 'errDescription', descriptor)
+}
+
+describe('conflictDescriptionOf', () => {
+  test('the CONFLICT table is not vacuous: every stub case and every options variant is in it', () => {
+    expect(CONFLICT_BUILDS.length).toBeGreaterThanOrEqual(CONFLICT_CASES.length * 2 + CONFLICT_VARIANTS.length * 2)
+  })
+
+  test.each(CONFLICT_BUILDS)('%s answers its own errDescription, read from the value', (_label, build) => {
+    const value = build() as AgentDirectorError
+    expect(classifyAdError(value).errorClass).toBe(AD_ERROR_CLASS_CONFLICT)
+    const expected = value.errDescription
+    expect(typeof expected).toBe('string')
+    expect(expected).not.toBe('')
+    expect(conflictDescriptionOf(value)).toBe(expected)
+  })
+
+  test.each([...CONFLICT_CASES])('errTmuxSessionConflict (%s): two values of one case answer each its own session', (c) => {
+    const ours = conflictDescriptionOf(errTmuxSessionConflict('resume', c))
+    const other = conflictDescriptionOf(errTmuxSessionConflict('resume', c, OTHER_SESSION_NAME))
+    expect(ours).toContain(JSON.stringify(STUB_TMUX_SESSION_NAME))
+    expect(other).toContain(JSON.stringify(OTHER_SESSION_NAME))
+    expect(ours).not.toBe(other)
+  })
+
+  test('the description comes back raw: not redacted onto one line, not capped, a case word past the cap kept', () => {
+    const description = `first line\nsecond line\r\n${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)} ${CONFLICT_ANOTHER_STORE_PHRASE}`
+    const value = baseError(ERR_TMUX_SESSION_CONFLICT_NAME, description)
+    expect(conflictDescriptionOf(value)).toBe(description)
+  })
+
+  test('an empty CONFLICT description comes back as the empty string', () => {
+    expect(conflictDescriptionOf(baseError(ERR_TMUX_SESSION_CONFLICT_NAME, ''))).toBe('')
+  })
+
+  // SRJ-104: an ErrUnknownErrorName whose unknownName is not one of the five
+  // names the table gives their own handling is UNAVAILABLE, the CONFLICT name
+  // included, so it has no CONFLICT description.
+  test.each([...CONFLICT_CASES])(
+    'an ErrUnknownErrorName whose unknownName is the CONFLICT name, carrying the %s description, is UNAVAILABLE and answers nothing',
+    (c) => {
+      const description = errTmuxSessionConflict('resume', c).errDescription
+      const value = errUnknownErrorName(ERR_TMUX_SESSION_CONFLICT_NAME, description)
+      // Precondition: the description really is in the envelope.
+      expect((value.envelope as { err_description: string }).err_description).toBe(description)
+      expect(value.unknownName).toBe(ERR_TMUX_SESSION_CONFLICT_NAME)
+      expect(classifyAdError(value)).toEqual({ errorClass: AD_ERROR_CLASS_UNAVAILABLE })
+      expect(conflictDescriptionOf(value)).toBeUndefined()
+    },
+  )
+
+  test('an ErrUnknownErrorName for the CONFLICT name whose own errDescription is set answers nothing either', () => {
+    const value = errUnknownErrorName(ERR_TMUX_SESSION_CONFLICT_NAME, errTmuxSessionConflict('resume', 'own-id').errDescription)
+    Object.defineProperty(value, 'errDescription', { value: errTmuxSessionConflict('resume', 'leftover').errDescription })
+    expect(conflictDescriptionOf(value)).toBeUndefined()
+  })
+
+  test.each(
+    ROWS.filter(([, , expected]) => expected !== AD_ERROR_CLASS_CONFLICT).map(([label, build, expected]) => [label, expected, build] as const),
+  )('%s (%s) answers nothing', (_label, _expected, build) => {
+    expect(conflictDescriptionOf(build())).toBeUndefined()
+  })
+
+  test.each<[string, () => unknown, AdErrorClass]>([
+    ['ErrTmuxUnresponsive', () => baseError(ERR_TMUX_UNRESPONSIVE_NAME, errTmuxSessionConflict('resume', 'own-id').errDescription), AD_ERROR_CLASS_UNAVAILABLE],
+    ['ErrTmuxKillFailed', () => baseError(ERR_TMUX_KILL_FAILED_NAME, errTmuxSessionConflict('kill', 'not-this-launch').errDescription), AD_ERROR_CLASS_UNAVAILABLE],
+    ['ErrSpawnNotFound', () => baseError(ERR_SPAWN_NOT_FOUND_NAME, errTmuxSessionConflict('resume', 'leftover').errDescription), AD_ERROR_CLASS_STATE],
+    ['ErrTmuxSessionCreate', () => baseError(errTmuxSessionCreate().errName, errTmuxSessionConflict('spawn', 'conflicting-labels').errDescription), AD_ERROR_CLASS_LAUNCH_FAILURE],
+    ['an ErrInternal (envelope description)', () => errInternal(errTmuxSessionConflict('resume', 'another-store').errDescription), AD_ERROR_CLASS_UNCLASSIFIED],
+  ])('%s carrying a CONFLICT description answers nothing: the class decides, never the words', (_label, build, expected) => {
+    const value = build()
+    expect(classifyAdError(value).errorClass).toBe(expected)
+    expect(conflictDescriptionOf(value)).toBeUndefined()
+  })
+
+  test.each<Built>([
+    ['an Error named ErrTmuxSessionConflict whose message is a CONFLICT description', () => Object.assign(plainErrorNamed(ERR_TMUX_SESSION_CONFLICT_NAME), { message: errTmuxSessionConflict('resume', 'own-id').errDescription })],
+    [
+      'an object shaped like a CONFLICT',
+      () => ({ verb: 'resume', errName: ERR_TMUX_SESSION_CONFLICT_NAME, errDescription: errTmuxSessionConflict('resume', 'own-id').errDescription, name: ERR_TMUX_SESSION_CONFLICT_NAME }),
+    ],
+    ['a CONFLICT description string itself', () => errTmuxSessionConflict('resume', 'own-id').errDescription],
+    ['undefined', () => undefined],
+    ['null', () => null],
+    ['a number', () => 42],
+  ])('%s is not an agent-director error: nothing, and nothing throws', (_label, build) => {
+    const value = build()
+    expect(() => conflictDescriptionOf(value)).not.toThrow()
+    expect(conflictDescriptionOf(value)).toBeUndefined()
+  })
+
+  test.each<[string, PropertyDescriptor]>([
+    ['missing (undefined)', { value: undefined }],
+    ['null', { value: null }],
+    ['a number', { value: 42 }],
+    ['an object carrying case words', { value: { text: CONFLICT_OWN_ID_PHRASE } }],
+    ['an array of case words', { value: [CONFLICT_OWN_ID_PHRASE] }],
+    ['a getter that throws', { get: () => { throw new Error('boom') } }],
+  ])('a CONFLICT whose errDescription is %s answers nothing, and nothing throws', (_label, descriptor) => {
+    const value = conflictWithDescription(descriptor)
+    expect(classifyAdError(value).errorClass).toBe(AD_ERROR_CLASS_CONFLICT)
+    expect(() => conflictDescriptionOf(value)).not.toThrow()
+    expect(conflictDescriptionOf(value)).toBeUndefined()
+  })
+
+  test.each<Built>([
+    ['an errName getter that throws', () => Object.defineProperty(errTmuxSessionConflict('resume', 'own-id'), 'errName', { get: () => { throw new Error('boom') } })],
+    ['a proxy whose every trap throws', hostileProxy],
+    [
+      'a proxy over a CONFLICT whose every read throws',
+      () => new Proxy(errTmuxSessionConflict('resume', 'own-id'), { get: () => { throw new Error('boom') } }),
+    ],
+  ])('%s answers nothing, and nothing throws', (_label, build) => {
+    const value = build()
+    expect(() => conflictDescriptionOf(value)).not.toThrow()
+    expect(conflictDescriptionOf(value)).toBeUndefined()
+  })
+
+  test("the CONFLICT classification is unchanged: no description in it, so its log line carries none", () => {
+    const secret = `${CONFLICT_OWN_ID_PHRASE} (${sentinelInMessage('conflict')})`
+    const value = baseError(ERR_TMUX_SESSION_CONFLICT_NAME, secret)
+    const before = classifyAdError(value)
+    expect(conflictDescriptionOf(value)).toBe(secret)
+    const after = classifyAdError(value)
+    expect(before).toEqual({ errorClass: AD_ERROR_CLASS_CONFLICT })
+    expect(after).toEqual(before)
+    const line = describeAdErrorClassification(after)
+    expect(line).toBe(`class=${AD_ERROR_CLASS_CONFLICT}`)
+    assertNoLeak({ classification: after, line })
+  })
+
+  test('reading the description changes no value, makes no agent-director call and answers the same twice', () => {
+    const log = makeStubCallLog()
+    setClientForTests(makeStubClient(log) as unknown as Parameters<typeof setClientForTests>[0])
+    for (const [label, build] of CONFLICT_BUILDS) {
+      const value = build()
+      const before = snapshot(value)
+      const first = conflictDescriptionOf(value)
+      expect({ label, same: conflictDescriptionOf(value) }).toEqual({ label, same: first })
+      expect({ label, value: snapshot(value) }).toEqual({ label, value: before })
+    }
+    expect(stubCallCount(log)).toBe(0)
   })
 })
 

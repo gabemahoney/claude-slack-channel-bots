@@ -9,8 +9,10 @@
  * (`tests/test-helpers/agent-director-stub.ts`) take the words from here
  * (SRJ-1303), and the error classifier (`src/ad-error-class.ts`; b.jg5
  * SRJ-104) matches `UNUSABLE_RECORDED_NAME_PHRASE` and
- * `DIFFERENT_TMUX_SERVER_PHRASE` from here; later Epics (E13, E20, E28) will
- * match the others from here too.
+ * `DIFFERENT_TMUX_SERVER_PHRASE` from here; the conflict latch
+ * (`src/conflict-latch.ts`; b.jg5 SRJ-507) matches the nine CONFLICT case
+ * words from here, in the order it defines; later Epics (E20, E28) will match
+ * the others from here too.
  *
  * The CONFLICT case words number nine (b.jg5 SRJ-507), "another
  * agent-director store" among them. The other description words below (the
