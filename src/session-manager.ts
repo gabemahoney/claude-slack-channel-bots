@@ -3697,6 +3697,30 @@ export const WAITING_ROW_PANE_ABSENT = 'absent'
  */
 export type WaitingRowPaneVerdict = WorkingRowPaneVerdict | typeof WAITING_ROW_PANE_GONE | typeof WAITING_ROW_PANE_ABSENT
 
+/**
+ * What a reconnect line says it does on a row it escalates as dead before the
+ * restart path's re-probe (b.jg5 SRJ-610): the sweep and the 'escalate-dead'
+ * answer, and no outcome, since a swept row may stay live for further ticks.
+ */
+export const ESCALATE_DEAD_REPROBE_DECIDES = "sweeping and escalating (escalate-dead); the restart path's re-probe decides"
+
+/**
+ * `checkWaitingRowPane`'s line when the `waiting` row's `read-pane` answered
+ * GONE (b.jg5 SRJ-604); `read` is that failure.
+ */
+export function waitingRowPaneGoneLine(key: string, read: PaneReadFailure): string {
+  return `[slack] reconnectSession: ${keyRef(key)} is waiting but agent-director's read-pane found no pane of its launch: ${read.description} — not typing /mcp reconnect; ${ESCALATE_DEAD_REPROBE_DECIDES} (${paneReadClassNote(read)}; b.jg5 SRJ-604)`
+}
+
+/**
+ * `checkWaitingRowPane`'s line when the `waiting` row was absent
+ * (`ErrSpawnNotFound`) at its `read-pane` (b.jg5 SRJ-117); `read` is that
+ * failure.
+ */
+export function waitingRowAbsentAtPaneReadLine(key: string, read: PaneReadFailure): string {
+  return `[slack] reconnectSession: ${keyRef(key)} is waiting but its agent-director row was absent at the pane read: ${read.description} — not typing /mcp reconnect; ${ESCALATE_DEAD_REPROBE_DECIDES} (${paneReadClassNote(read)}; b.jg5 SRJ-117)`
+}
+
 /** What `checkWorkingRowPane` is given beside the persona's key and pane. */
 export interface WorkingRowPaneCheckOptions {
   /**
@@ -3904,14 +3928,10 @@ export async function checkWaitingRowPane(key: string, latchedNow?: () => boolea
       console.error(`[slack] reconnectSession: ${ref} is waiting and is latched — deferring; nothing typed (b.jg5 SRJ-502)`)
       return 'defer'
     case PANE_READ_GONE:
-      console.error(
-        `[slack] reconnectSession: ${ref} is waiting but agent-director's read-pane found no pane of its launch: ${read.description} — not typing /mcp reconnect; reconciling so the restart relaunches it (${paneReadClassNote(read)}; b.jg5 SRJ-604)`,
-      )
+      console.error(waitingRowPaneGoneLine(key, read))
       return WAITING_ROW_PANE_GONE
     case PANE_READ_ABSENT:
-      console.error(
-        `[slack] reconnectSession: ${ref} is waiting but its agent-director row was absent at the pane read: ${read.description} — not typing /mcp reconnect; reconciling so the restart relaunches it (${paneReadClassNote(read)}; b.jg5 SRJ-117)`,
-      )
+      console.error(waitingRowAbsentAtPaneReadLine(key, read))
       return WAITING_ROW_PANE_ABSENT
     case PANE_READ_ENVIRONMENT:
       console.error(
@@ -4281,12 +4301,15 @@ function reportWaitEndedDisconnected(key: string, config: PersonaConfig, report:
  * `sweepDeadTmuxChannel` callers land inside the window and share the single
  * in-flight or memoized sweep — one findMissing reconciles the whole store for
  * all of them. Across ticks the window is far shorter than the ~120s
- * health-check cadence, so the following tick's escalate-dead sweeps fall
- * outside it and re-sweep. A swept row is not sure to read dead afterwards:
+ * health-check cadence, so a later tick's escalate-dead sweep falls outside
+ * it and runs again. A swept row is not sure to read dead afterwards:
  * agent-director may leave it live (in `unverified_ids`, or, when `pending`,
- * not judged at all), and it then stays live for further ticks. Only redundant
- * load is shed (see the `_buildReconnectSessionAdapter` call-site note in
- * src/server.ts and docs/architecture.md's sweep note).
+ * not judged at all), and it may stay live for further ticks; each
+ * escalate-dead tick then sweeps again, with no step beyond the sweep, and
+ * the restart path posts the slow-recovery notice once after 3 such ticks
+ * (b.jg5 SRJ-610, SRJ-1010). Only redundant load is shed (see the
+ * `_buildReconnectSessionAdapter` call-site note in src/server.ts and
+ * docs/architecture.md's sweep note).
  *
  * A bypassing run (`FIND_MISSING_RUN_BYPASSING`, b.jg5 SRJ-120) ignores the
  * window and anything in flight; its result is memoized for later ordinary
@@ -4972,13 +4995,17 @@ export function readFindMissingRow(
  * recovers itself instead of silently waiting on the external
  * `~/startup/find-missing-loop.sh`: emit an operator-visible log line, then run
  * the memoized, ordinary `reconcileMissingSweep` (b.m4r, b.jg5 SRJ-120). The
- * sweep may reconcile the frozen `working` row to `missing`, and the restart
- * run's second liveness probe (b.d61) then reads `dead` and takes the normal
+ * sweep may reconcile the frozen `working` row to `missing`; when the restart
+ * run's second liveness probe (b.d61) then reads `dead`, it takes the normal
  * kill+relaunch branch at once. It may also leave the row live (in
- * `unverified_ids`, or, when `pending`, not judged), and then the row stays
- * live for further ticks: a re-probe reading `pending` or `unknown` leaves the
- * relaunch undone (`unknown` arms the retry timer), and a row that still reads
- * `live` is left to later health-check ticks. After a run the sweep makes,
+ * `unverified_ids`, or, when `pending`, not judged), and the row may stay
+ * live for further ticks: nothing promises that the re-probe or a later tick
+ * reads it dead (b.jg5 SRJ-610). A re-probe reading `pending` or `unknown`
+ * leaves the relaunch undone (`unknown` arms the retry timer); one that still
+ * reads `live` ends the run with no kill, launch or counted failure, and each
+ * later escalate-dead tick sweeps again here, with no step beyond the sweep,
+ * while the restart path counts those re-probes and posts the slow-recovery
+ * notice once after 3 such ticks (SRJ-1010). After a run the sweep makes,
  * each configured persona's own row left in `unverified_ids` is read with one
  * `get`, and only a `provenance_conflict` note there latches; the restart run
  * asks the latch right after the 'escalate-dead' verdict, before its re-probe,
@@ -4994,7 +5021,8 @@ export function readFindMissingRow(
  * (`bypassingFindMissingSweep`) are its only exports.
  *
  * Never throws: `reconcileMissingSweep` already logs and swallows its own
- * failures (and does not memoize them, so the next tick retries).
+ * failures (and does not memoize them, so a later escalate-dead tick's sweep
+ * runs again).
  *
  * @param key the dead-tmux persona's key (log context; the sweep itself is
  *   whole-store, so one in-flight sweep serves the fleet — b.nk5).
@@ -5017,10 +5045,19 @@ export async function sweepDeadTmuxChannel(key: string, verdict: EscalateDeadVer
  * further agent-director call (b.jg5 SRJ-502).
  */
 export async function sweepDeadTmuxChannelWithCause(key: string, verdict: EscalateDeadVerdict): Promise<{ refused?: true }> {
-  console.error(
-    `[slack] escalate-dead: ${keyRef(key)} verdict=${verdict} — ${ESCALATE_DEAD_EVIDENCE[verdict]}, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)`,
-  )
+  console.error(escalateDeadSweepLine(key, verdict))
   return (await reconcileMissingSweep(key, 'escalate-dead')) === FIND_MISSING_REFUSED ? { refused: true } : {}
+}
+
+/**
+ * The escalate-dead line `sweepDeadTmuxChannelWithCause` logs before each
+ * sweep (b.sv7, b.jdc): the persona reference, the verdict and what it
+ * observed (`ESCALATE_DEAD_EVIDENCE`). It names no outcome: the row may stay
+ * live for further ticks, each escalate-dead tick sweeping again (b.jg5
+ * SRJ-610).
+ */
+export function escalateDeadSweepLine(key: string, verdict: EscalateDeadVerdict): string {
+  return `[slack] escalate-dead: ${keyRef(key)} verdict=${verdict} — ${ESCALATE_DEAD_EVIDENCE[verdict]}, triggering internal findMissing reconciliation (the row may stay live for further ticks, each escalate-dead tick sweeping again; ~/startup/find-missing-loop.sh is belt-and-braces)`
 }
 
 /**

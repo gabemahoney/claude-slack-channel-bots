@@ -33,11 +33,21 @@ import {
   RESTART_OUTCOME_REFUSED,
   RESTART_OUTCOME_SHUTTING_DOWN,
   KILL_SESSION_REFUSED,
+  RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE,
+  RESTART_SLOW_RECOVERY_OTHER_VERDICT,
+  reprobeDeadLine,
+  reprobeLiveLine,
+  reprobePendingLine,
+  reprobeUnhandledLine,
+  reprobeUnknownLine,
   type KillSessionResult,
   type LaunchSessionResult,
   type ReconnectSessionResult,
   type RestartDeps,
   type RestartRetryOutcome,
+  type RestartWorkOutcome,
+  type RestartSlowRecoveryObserver,
+  type SlowRecoveryOtherReason,
 } from '../src/restart.ts'
 import {
   _resetBackoffState,
@@ -82,6 +92,10 @@ import {
   ESCALATE_DEAD_EVIDENCE,
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
+  FIND_MISSING_MEMO_TTL_MS,
+  _setNow,
+  _resetNow,
+  setConflictLatch,
   type ConfigDirUnresolvableHook,
   type EscalateDeadVerdict,
 } from '../src/session-manager.ts'
@@ -116,6 +130,7 @@ import { CSCB_UNKNOWN_ERROR_NAME } from '../src/ad-error-class.ts'
 import {
   cannedErr,
   cannedOk,
+  cannedFindMissing,
   cannedGetResult,
   cannedStatusResult,
   errCallTimeout,
@@ -139,6 +154,8 @@ import {
   unavailableForms,
   makeStubCallLog,
   makeStubResolveSystemBinary,
+  nonLatchingNotes,
+  provenanceNote,
   SAMPLE_LAUNCH_START_FRACTIONAL,
   SAMPLE_LAUNCH_START_NONE,
   SAMPLE_LAUNCH_START_WHOLE,
@@ -183,13 +200,16 @@ import {
   tmuxTouchingCallsIn,
 } from './test-helpers/conflict-cases.ts'
 import {
+  createPersonaEpisodes,
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
   tmuxUnresponsiveOnsetText,
 } from '../src/persona-episodes.ts'
+import { createSlowRecoveryTracker, SLOW_RECOVERY_POST_THRESHOLD, slowRecoveryText } from '../src/slow-recovery.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_READING_DEAD,
+  LIVENESS_READING_DEAD_INSTALL_GONE,
   LIVENESS_READING_LIVE,
   LIVENESS_READING_PENDING,
   LIVENESS_READING_UNKNOWN,
@@ -309,6 +329,69 @@ async function driveFailures(key: string, cwd: string, count: number): Promise<v
     scheduleRestart(key, cwd)
     await Bun.sleep(backoffDelayMs + CAP_MARGIN_MS)
   }
+}
+
+/** One call the restart work made to the slow-recovery observer: the note, the persona key and, for `noteOther`, its reason. */
+type SlowRecoveryNote = readonly [note: keyof RestartSlowRecoveryObserver, key: string, reason?: SlowRecoveryOtherReason]
+
+/** A slow-recovery observer (b.jg5 SRJ-610) that appends each note it is told to `into`, in call order. */
+function recordingSlowRecovery(into: unknown[]): RestartSlowRecoveryObserver {
+  return {
+    noteLive: (key) => { into.push(['noteLive', key]) },
+    noteDead: (key) => { into.push(['noteDead', key]) },
+    noteInstallGone: (key) => { into.push(['noteInstallGone', key]) },
+    noteOther: (key, reason) => { into.push(['noteOther', key, reason]) },
+  }
+}
+
+/**
+ * Make each restart run of `deps` awaitable: installs a `serialize` that runs
+ * the work at once and records its outcome in `outcomes`. `tick(key, cwd)`
+ * schedules a restart and resolves once its work has run and one event-loop
+ * turn has passed (in which the timer body releases its active marker), or at
+ * once when `scheduleRestart` armed no timer; never a fixed sleep.
+ */
+function awaitRuns(deps: RestartDeps): { outcomes: unknown[]; tick: (key: string, cwd: string) => Promise<void> } {
+  const outcomes: unknown[] = []
+  let workDone = Promise.withResolvers<void>()
+  deps.serialize = async <T>(_key: string, operation: () => T | Promise<T>): Promise<T> => {
+    try {
+      const outcome = await operation()
+      outcomes.push(outcome)
+      return outcome
+    } catch (err) {
+      workDone.reject(err)
+      throw err
+    } finally {
+      workDone.resolve()
+    }
+  }
+  const tick = async (key: string, cwd: string): Promise<void> => {
+    workDone = Promise.withResolvers<void>()
+    scheduleRestart(key, cwd)
+    if (!isRestartPendingOrActive(key)) return
+    await workDone.promise
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+  }
+  return { outcomes, tick }
+}
+
+/**
+ * The stub calls in `log` that are one persona's, by verb, leaving out verbs
+ * with none: those naming its instance `instanceId`, and those naming no
+ * instance (the whole-store `find-missing`). A call another case left running
+ * for another persona is never counted.
+ */
+function ownStubCalls(log: StubCallLog, instanceId: string): Record<string, number> {
+  const isOwn = (params: unknown): boolean => {
+    const named = (params as { claude_instance_id?: unknown } | undefined)?.claude_instance_id
+    return named === undefined || named === instanceId
+  }
+  return Object.fromEntries(
+    Object.entries(log)
+      .map(([verb, calls]) => [verb, (calls as unknown[]).filter(isOwn).length] as const)
+      .filter(([, count]) => count > 0),
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -2123,6 +2206,175 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// b.jg5 SRJ-610, SRJ-1010 (HO C14 Verify, AC 66): a row the escalate-dead
+// sweep leaves live for several ticks.
+//
+// P's row reads `working` on every `status`; its `read-pane` answers GONE
+// (`ErrTmuxCaptureFailed`), so the reconnect adapter sweeps and answers
+// 'escalate-dead'; every `find-missing` leaves P's own row in
+// `unverified_ids`, so the run reads that row with one `get` (b.jg5 SRJ-120),
+// whose note latches no one; and the re-probe still reads the row live. The
+// liveness probe and the reconnect adapter are the REAL ones over one stub
+// client, the slow-recovery observer is the real tracker over a real episodes
+// instance on a fake clock, whose sink records each post, and the latch and
+// the configured-persona query are installed as `main()` installs them. Kill
+// and launch are recording fakes. The findMissing memo runs on the same fake
+// clock (`_setNow`), moved past `FIND_MISSING_MEMO_TTL_MS` between runs, so
+// every run sweeps. Each run is awaited (`awaitRuns`), and only P's own stub
+// calls are counted (`ownStubCalls`). No tmux is asked: the raw runner records
+// every argv.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unverified_ids for several ticks (HO C14 Verify, AC 66)', () => {
+  /** Two runs past the post, so a second post or one before the threshold shows. */
+  const RUNS = SLOW_RECOVERY_POST_THRESHOLD + 2
+  let dir: string
+  let clock: FakeClock
+  let latch: ConflictLatch
+  let errLines: string[]
+  /** Every argv the raw tmux runner was asked to run. */
+  let rawTmux: string[][]
+  /** The persona keys the session manager raised a spawn-failure notice for. */
+  let raised: string[]
+  let origConsoleError: typeof console.error
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-slow-recovery-'))
+    _resetFindMissingMemo()
+    clock = createFakeClock()
+    _setNow(() => clock.now())
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+    rawTmux = []
+    _setTmuxCommandRunner(async (args) => {
+      rawTmux.push([...args])
+      return { code: 1, stdout: '' }
+    })
+    raised = []
+    setSessionNotifier((key) => { raised.push(key) })
+    latch = createConflictLatch({ log: (line) => { errLines.push(line) } })
+    setConflictLatch(latch)
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+    resetClientForTests()
+    _resetOutageState()
+    _resetTmuxCommandRunner()
+    _resetFindMissingMemo()
+    _resetNow()
+    setConflictLatch(undefined)
+    _resetConfiguredPersonaQuery()
+    setSessionNotifier(undefined)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  /**
+   * P's restart deps as the describe comment says; the `get` after each
+   * sweep carries `noteOfRun(run)` (runs count from 1). `nextRun()` moves the
+   * clock past the memo window, then schedules P's restart and awaits it.
+   */
+  function slowRecoveryRuns(noteOfRun: (run: number) => string) {
+    const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
+    const persona = config.personas[0]!
+    const KEY = persona.key
+    const instanceId = personaInstanceId(KEY)
+    setConfiguredPersonaQuery((key) => key === KEY)
+    let run = 0
+    const log = makeStubCallLog()
+    const stub = makeStubClient({
+      ...log,
+      statusFn: () => ({ state: 'working' }),
+      readPaneError: errTmuxCaptureFailed(),
+      findMissingResult: cannedFindMissing({ rows: { [instanceId]: 'unverified_ids' } }),
+      getFn: () => cannedGetResult({ claude_instance_id: instanceId, state: 'working', liveness_note: noteOfRun(run) }),
+    })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    const posts: Array<[string, string]> = []
+    const episodes = createPersonaEpisodes({ sink: (key, text) => { posts.push([key, text]) }, log: (line) => { errLines.push(line) }, clock })
+    const kills: string[] = []
+    const launches: string[] = []
+    const armed: string[] = []
+    const deps: RestartDeps = {
+      canRestart: () => true,
+      isSessionAlive: _buildIsSessionAliveAdapter(() => config),
+      isSessionConnected: () => false,
+      hasSessionStream: () => false,
+      reconnectSession: _buildReconnectSessionAdapter(),
+      async killSession(key) { kills.push(key) },
+      async launchSession(key) { launches.push(key); return true },
+      getRestartDelay: () => FAST_DELAY_S,
+      isShuttingDown: () => false,
+      onCapReached: () => {},
+      armRetryTimer: (key) => { armed.push(key) },
+      isLatched: (key) => latch.isLatched(key),
+      slowRecovery: createSlowRecoveryTracker({ episodes, log: (line) => { errLines.push(line) } }),
+    }
+    const { outcomes, tick } = awaitRuns(deps)
+    initRestart(deps)
+    const nextRun = async (): Promise<void> => {
+      await clock.advance(FIND_MISSING_MEMO_TTL_MS)
+      run++
+      await tick(KEY, persona.working_directory)
+    }
+    return { KEY, posts, kills, launches, armed, outcomes, nextRun, stubCalls: () => ownStubCalls(log, instanceId) }
+  }
+
+  test(`demo: ${SLOW_RECOVERY_POST_THRESHOLD + 2} ticks, each an escalate-dead verdict whose re-probe still reads the row live → one sweep and one get per tick, no delete, kill or launch, no counted failure, no spawn-failure notice, and exactly one slow-recovery post, after tick ${SLOW_RECOVERY_POST_THRESHOLD}, with SRJ-1010's text`, async () => {
+    const runs = slowRecoveryRuns((run) => nonLatchingNotes[(run - 1) % nonLatchingNotes.length]!)
+
+    for (let run = 1; run <= RUNS; run++) {
+      await runs.nextRun()
+      // The probe, the adapter's state read, its read-pane, the sweep and its
+      // get of P's own row, then the re-probe: nothing typed, deleted, killed
+      // or launched.
+      expect(runs.stubCalls()).toEqual({ statusCalls: 3 * run, readPaneCalls: run, findMissingCalls: run, getCalls: run })
+      expect(runs.posts).toEqual(run >= SLOW_RECOVERY_POST_THRESHOLD ? [[runs.KEY, slowRecoveryText(runs.KEY)]] : [])
+      expect(errLines.filter((l) => l === reprobeLiveLine(runs.KEY))).toHaveLength(run)
+    }
+
+    expect(runs.outcomes).toEqual(Array(RUNS).fill(RESTART_OUTCOME_RECONNECT_DEFERRED))
+    expect(runs.kills).toEqual([])
+    expect(runs.launches).toEqual([])
+    expect(getFailureCount(runs.KEY)).toBe(0)
+    expect(raised).toEqual([])
+    expect(runs.armed).toEqual([])
+    expect(latch.isLatched(runs.KEY)).toBe(false)
+    expect(isRestartPendingOrActive(runs.KEY)).toBe(false)
+    expect(rawTmux).toEqual([])
+    expect(clock.pendingCount()).toBe(0)
+    assertNoLeak({ errLines, posts: runs.posts })
+  })
+
+  // The second tick, and the tick that would post: a re-probe after the
+  // latch would count that tick and post.
+  test.each([2, SLOW_RECOVERY_POST_THRESHOLD])('a provenance_conflict note on the get after tick %p\'s sweep latches P (E14): that run stops before its re-probe, the later ticks schedule nothing (E13), and no slow-recovery post is made', async (latchRun) => {
+    const runs = slowRecoveryRuns((run) => (run === latchRun ? provenanceNote : nonLatchingNotes[0]!))
+
+    for (let run = 1; run <= RUNS; run++) await runs.nextRun()
+
+    expect(latch.isLatched(runs.KEY)).toBe(true)
+    // The ticks before as in the demo; the latching tick with no re-probe; no
+    // agent-director call after it.
+    expect(runs.stubCalls()).toEqual({ statusCalls: 3 * latchRun - 1, readPaneCalls: latchRun, findMissingCalls: latchRun, getCalls: latchRun })
+    expect(runs.outcomes).toEqual([...Array(latchRun - 1).fill(RESTART_OUTCOME_RECONNECT_DEFERRED), RESTART_OUTCOME_LATCHED])
+    expect(errLines.filter((l) => l.startsWith(`[slack] Not scheduling restart for persona=${runs.KEY} — the persona is latched`))).toHaveLength(RUNS - latchRun)
+    expect(runs.posts).toEqual([])
+    expect(runs.kills).toEqual([])
+    expect(runs.launches).toEqual([])
+    expect(getFailureCount(runs.KEY)).toBe(0)
+    expect(raised).toEqual([])
+    expect(rawTmux).toEqual([])
+    expect(clock.pendingCount()).toBe(0)
+    assertNoLeak({ errLines, posts: runs.posts })
+  })
+})
+
+// ---------------------------------------------------------------------------
 // b.d61, b.jg5 SRJ-603, SRJ-604: a persona killed mid-turn is relaunched, not
 // deferred forever.
 //
@@ -2185,14 +2437,15 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
    * One persona's restart deps over the real liveness and reconnect adapters
    * and one stub client: its `status` answers `row`, its `read-pane` rejects
    * with `readPaneError`, kill and launch record (the launch answering
-   * `launchResult`), and the arm hook and the serialized work's outcome are
+   * `launchResult`), and the arm hook, the slow-recovery observer's notes
+   * (`notes`, b.jg5 SRJ-610) and the serialized work's outcome are
    * recorded. `settled()` resolves once the restart timer's work has run and
    * the restart is no longer active, whenever the timer fires. `stubCalls()`
-   * is the run's stub calls by verb, leaving out verbs never called: those
-   * naming the persona's own instance, and the whole-store `find-missing`,
-   * which names none. The stub is the process's agent-director client while
-   * the case runs, so a call another case left running (another persona's
-   * launch wait, which polls until its timeout) is never counted as the run's.
+   * is the run's stub calls by verb (`ownStubCalls`): those naming the
+   * persona's own instance, and the whole-store `find-missing`, which names
+   * none. The stub is the process's agent-director client while the case
+   * runs, so a call another case left running (another persona's launch
+   * wait, which polls until its timeout) is never counted as the run's.
    */
   function d61Run(row: RowAnswer, readPaneError: Error, launchResult = true) {
     const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
@@ -2206,6 +2459,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     const kills: string[] = []
     const launches: string[] = []
     const armed: string[] = []
+    const notes: SlowRecoveryNote[] = []
     const outcomes: unknown[] = []
     const workDone = Promise.withResolvers<void>()
     initRestart({
@@ -2220,6 +2474,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
       isShuttingDown: () => false,
       onCapReached: () => {},
       armRetryTimer: (key) => { armed.push(key) },
+      slowRecovery: recordingSlowRecovery(notes),
       serialize: async <T>(_key: string, operation: () => T | Promise<T>): Promise<T> => {
         try {
           const outcome = await operation()
@@ -2242,21 +2497,11 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
       await workDone.promise
       await new Promise<void>((resolve) => setTimeout(resolve, 0))
     }
-    /** Whether a recorded call is the run's: one naming the persona's own instance, or one naming no instance. */
-    const isRunCall = (params: unknown): boolean => {
-      const named = (params as { claude_instance_id?: unknown } | undefined)?.claude_instance_id
-      return named === undefined || named === instanceId
-    }
-    const stubCalls = (): Record<string, number> =>
-      Object.fromEntries(
-        Object.entries(log)
-          .map(([verb, calls]) => [verb, (calls as unknown[]).filter(isRunCall).length] as const)
-          .filter(([, count]) => count > 0),
-      )
+    const stubCalls = (): Record<string, number> => ownStubCalls(log, instanceId)
     /** The run's pane reads, as `[instance id, lines]`. */
     const paneReads = (): Array<[string, number | undefined]> =>
-      log.readPaneCalls.filter(isRunCall).map((c) => [c.claude_instance_id, c.n_lines])
-    return { KEY: persona.key, cwd: persona.working_directory, kills, launches, armed, outcomes, settled, stubCalls, paneReads }
+      log.readPaneCalls.filter((c) => c.claude_instance_id === instanceId).map((c) => [c.claude_instance_id, c.n_lines])
+    return { KEY: persona.key, cwd: persona.working_directory, kills, launches, armed, notes, outcomes, settled, stubCalls, paneReads }
   }
 
   /** The escalate-dead verdict lines (one per sweep the adapter fires); only `verdict`'s, with its evidence text, when given. */
@@ -2273,7 +2518,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   test.each<[string, EscalateDeadVerdict]>([
     ['working', WORKING_TMUX_GONE],
     ['waiting', ESCALATE_DEAD_WAITING_ROW_PANE_GONE],
-  ])('alive (%s) but disconnected, its read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict %s) and no send-keys; the re-probe reads the row missing → one kill and one relaunch in that run, no failure counted, nothing armed, no tmux asked', async (state, verdict) => {
+  ])('alive (%s) but disconnected, its read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict %s) and no send-keys; the re-probe reads the row missing → one noteDead, then one kill and one relaunch in that run, no failure counted, nothing armed, no tmux asked', async (state, verdict) => {
     const run = d61Run(untilSwept(state), errTmuxCaptureFailed())
 
     scheduleRestart(run.KEY, run.cwd)
@@ -2288,6 +2533,8 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     expect(run.kills).toEqual([run.KEY])
     expect(run.launches).toEqual([run.KEY])
     expect(run.outcomes).toEqual([RESTART_OUTCOME_LAUNCHED])
+    // b.jg5 SRJ-610: the re-probe's row read of `missing` ends any slow recovery.
+    expect(run.notes).toEqual([['noteDead', run.KEY]])
     // The successful launch counts no failure.
     expect(getFailureCount(run.KEY)).toBe(0)
     // The run armed no further timer: nothing relaunches the persona again.
@@ -2318,7 +2565,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   // a read can meet (the kill-failure form is a kill's only).
   const READ_PANE_UNAVAILABLE_FORMS = UNAVAILABLE_FORMS.filter(([, , cause]) => cause === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
 
-  test.each(READ_PANE_UNAVAILABLE_FORMS)('alive (working) but disconnected, its read-pane answering UNAVAILABLE (%s) → the run defers: no sweep, send-keys, kill or launch, nothing counted or reset, nothing armed, no tmux asked', async (_label, make) => {
+  test.each(READ_PANE_UNAVAILABLE_FORMS)('alive (working) but disconnected, its read-pane answering UNAVAILABLE (%s) → the run defers: no sweep, send-keys, kill or launch, nothing counted or reset, nothing armed, no tmux asked; the transient verdict resets the slow-recovery count', async (_label, make) => {
     const run = d61Run(() => ({ state: 'working' }), make('read-pane'))
     // One failure on record, so a reset or a counted launch would show.
     recordFailure(run.KEY)
@@ -2331,6 +2578,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     expect(run.kills).toEqual([])
     expect(run.launches).toEqual([])
     expect(run.outcomes).toEqual([RESTART_OUTCOME_RECONNECT_DEFERRED])
+    expect(run.notes).toEqual([['noteOther', run.KEY, RESTART_SLOW_RECOVERY_OTHER_VERDICT]])
     expect(getFailureCount(run.KEY)).toBe(1)
     expect(run.armed).toEqual([])
     expect(isRestartPendingOrActive(run.KEY)).toBe(false)
@@ -2341,20 +2589,24 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   // reads a `status` error `unknown` unless it is ErrSpawnNotFound or
   // ErrSystemInstallDisappeared, at the first probe and at b.d61's re-probe
   // alike. `unknown` kills and launches nothing, counts nothing and calls the
-  // arm hook once; the two dead errors still relaunch in that run.
-  const STATUS_ERRORS: ReadonlyArray<[string, () => Error, boolean]> = [
-    ['a plain Error', () => new Error('status blew up'), false],
-    ['ErrCallTimeout', () => errCallTimeout('status'), false],
-    ['a wrapped UnknownError', () => errGeneric('status', CSCB_UNKNOWN_ERROR_NAME, 'Error: boom'), false],
-    ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed(), false],
-    ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'status'), false],
-    ['ErrSpawnNotFound', () => errSpawnNotFound(), true],
-    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status'), true],
+  // arm hook once; the two dead errors still relaunch in that run. b.jg5
+  // SRJ-610: the slow-recovery observer is told ErrSpawnNotFound (no row) as
+  // `noteDead`, ErrSystemInstallDisappeared (which reads no row) as
+  // `noteInstallGone`, and an `unknown` reading not at all.
+  const STATUS_ERRORS: ReadonlyArray<[string, 'noteDead' | 'noteInstallGone' | undefined, () => Error]> = [
+    ['a plain Error', undefined, () => new Error('status blew up')],
+    ['ErrCallTimeout', undefined, () => errCallTimeout('status')],
+    ['a wrapped UnknownError', undefined, () => errGeneric('status', CSCB_UNKNOWN_ERROR_NAME, 'Error: boom')],
+    ['CONFIG (ErrConfigMalformed)', undefined, () => errConfigMalformed()],
+    ['ErrTmuxNotAvailable', undefined, () => errTmuxNotAvailable(undefined, 'status')],
+    ['ErrSpawnNotFound', 'noteDead', () => errSpawnNotFound()],
+    ['ErrSystemInstallDisappeared', 'noteInstallGone', () => errSystemInstallDisappeared('status')],
   ]
   const PROBES: ReadonlyArray<['first probe' | 're-probe']> = [['first probe'], ['re-probe']]
-  const STATUS_ERROR_CASES = PROBES.flatMap(([probe]) => STATUS_ERRORS.map(([label, build, dead]) => [probe, label, build, dead] as const))
+  const STATUS_ERROR_CASES = PROBES.flatMap(([probe]) => STATUS_ERRORS.map(([label, note, build]) => [probe, label, note, build] as const))
 
-  test.each(STATUS_ERROR_CASES)('b.jg5 SRJ-314: the %s\'s status answers %s → dead: %p (a kill and a relaunch only when dead; unknown arms the hook once and counts nothing)', async (probe, _label, build, dead) => {
+  test.each(STATUS_ERROR_CASES)('b.jg5 SRJ-314, SRJ-610: the %s\'s status answers %s → slow-recovery note %p (a kill and a relaunch only after a dead note; unknown arms the hook once, counts nothing and tells the observer nothing)', async (probe, _label, note, build) => {
+    const dead = note !== undefined
     // First probe: status fails at once. Re-probe: the row reads `working`
     // (the reconnect adapter's read-pane answers GONE and it sweeps) until
     // the sweep, and status fails after it.
@@ -2374,6 +2626,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     // A failed launch counts; an unknown run counts nothing and resets nothing.
     expect(getFailureCount(run.KEY)).toBe(dead ? 2 : 1)
     expect(run.armed).toEqual(dead ? [] : [run.KEY])
+    expect(run.notes).toEqual(dead ? [[note, run.KEY]] : [])
     expect(isRestartPendingOrActive(run.KEY)).toBe(false)
     expect(rawTmux).toEqual([])
   })
@@ -2544,27 +2797,41 @@ describe('b.jdc: a persona whose session died under a prompt is relaunched in th
 // reconnect adapter has already run the findMissing sweep when it answers
 // 'escalate-dead', so the restart run probes liveness once more: only a row
 // that now reads `dead` goes on to the kill and relaunch in the same run, with
-// the launch's usual accounting. A row that still reads `live`, or reads
-// `pending`, is left to a later tick; a re-probe that reads `unknown` or throws
-// (b.jg5 SRJ-314: never read as dead) relaunches nothing, counts nothing and
-// calls the arm hook. Shutdown and the not-up gate are asked again after the
-// re-probe, since it is an async agent-director call. The deps are `makeDeps`
-// fakes: the first probe reads `live` and the reconnect answers 'escalate-dead'.
+// the launch's usual accounting. A row that still reads `live` (b.jg5 SRJ-610:
+// it may stay live for further ticks, each sweeping again), or reads
+// `pending`, gets no relaunch in this run; a re-probe that reads `unknown`,
+// throws, or answers a kind no reading names (b.jg5 SRJ-314: never read as
+// dead; the probe reads such a kind as `unknown`, so the switch's
+// unhandled-kind default is never reached and its line never logged)
+// relaunches nothing, counts nothing and calls the arm hook. Shutdown and the not-up gate are asked again
+// after the re-probe, since it is an async agent-director call. Each run tells
+// a recording slow-recovery observer what it read (b.jg5 SRJ-610). The deps
+// are `makeDeps` fakes: the first probe reads `live` and the reconnect answers
+// 'escalate-dead'. Each case awaits its run's end (`awaitRuns`). The re-probe
+// lines are the exported builders'.
 // ---------------------------------------------------------------------------
 
 describe('b.d61: after an escalate-dead reconnect, the restart run probes liveness again', () => {
   const KEY = 'reprobe_bot'
-  const RELAUNCH = '[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run'
-  const STILL_ALIVE = `[slack] Session still reads alive after escalate-dead — leaving the relaunch to a later tick for persona=${KEY}`
-  const PENDING = `[slack] Session reads pending after escalate-dead — its session has not started; no relaunch in this restart run for persona=${KEY}`
-  const UNKNOWN = `[slack] Liveness unknown after escalate-dead for persona=${KEY}`
-  const NOTHING_COUNTED = ' — no relaunch in this restart run; nothing counted'
+  const CWD = '/cwd/reprobe'
+  const RELAUNCH = reprobeDeadLine(KEY)
+  const STILL_LIVE = reprobeLiveLine(KEY)
+  const PENDING = reprobePendingLine(KEY)
+  const UNKNOWN = reprobeUnknownLine(KEY)
+  /** The unknown line of a re-probe that threw, up to where what it threw begins. */
+  const THROWN_MARK = '\u0001'
+  const UNKNOWN_THROWN_HEAD = reprobeUnknownLine(KEY, THROWN_MARK).split(THROWN_MARK)[0]!
+  /** The unhandled-kind line, up to where the kind begins. */
+  const UNHANDLED_HEAD = reprobeUnhandledLine(KEY, THROWN_MARK).split(THROWN_MARK)[0]!
   /** Every raw console.error argument list, so a leak in an error object shows. */
   let errArgs: unknown[][]
   let origConsoleError: typeof console.error
 
   const lines = () => errArgs.map((args) => args.map(String).join(' '))
   const linesStarting = (prefix: string) => lines().filter((l) => l.startsWith(prefix) && l.includes(`persona=${KEY}`))
+  /** The re-probe's lines for KEY: any builder's line, an unknown line naming what the re-probe threw, or an unhandled-kind line. */
+  const reprobeLines = () =>
+    lines().filter((l) => [RELAUNCH, STILL_LIVE, PENDING, UNKNOWN].includes(l) || l.startsWith(UNKNOWN_THROWN_HEAD) || l.startsWith(UNHANDLED_HEAD))
 
   /**
    * makeDeps whose first liveness probe reads `live`, whose reconnect answers
@@ -2583,6 +2850,16 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
     return deps
   }
 
+  /**
+   * `DepsOpts` whose kill and failing launch append `['kill', key]` and
+   * `['launch', key]` to `timeline`, where a recording observer's notes go
+   * too, so the order of the notes and the instance calls shows.
+   */
+  const timelineOpts = (timeline: unknown[]): DepsOpts => ({
+    killSession: async (key) => { timeline.push(['kill', key]) },
+    launchSession: async (key) => { timeline.push(['launch', key]); return false },
+  })
+
   beforeEach(() => {
     errArgs = []
     origConsoleError = console.error
@@ -2594,55 +2871,91 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
     cancelAllRestartTimers()
   })
 
-  test.each<[string, () => Promise<LivenessReading>, boolean, string, string]>([
-    ['reads dead → the same run kills and relaunches once', async () => LIVENESS_READING_DEAD, true, RELAUNCH, ''],
+  test.each<[string, () => Promise<LivenessReading>, boolean, string, string, SlowRecoveryNote[]]>([
+    ['reads dead (a row read) → noteDead, then the same run kills and relaunches once', async () => LIVENESS_READING_DEAD, true, RELAUNCH, '', [['noteDead', KEY]]],
     [
-      'throws → b.jg5 SRJ-314: read unknown, never dead: nothing is killed or launched, nothing counted, the arm hook is called once; the failure is logged as its redacted description',
+      'reads dead from ErrSystemInstallDisappeared, which reads no row → noteInstallGone (never noteDead), then the same run kills and relaunches once',
+      async () => LIVENESS_READING_DEAD_INSTALL_GONE,
+      true,
+      RELAUNCH,
+      '',
+      [['noteInstallGone', KEY]],
+    ],
+    [
+      'throws → b.jg5 SRJ-314: read unknown, never dead: nothing is killed or launched, nothing counted, the arm hook is called once, the observer is told nothing; the failure is logged as its redacted description',
       async () => {
         throw Object.assign(new Error(`status refused (${sentinelInMessage('reprobe')})`), { code: 'EIO', note: LEAK_SENTINEL })
       },
       false,
-      `${UNKNOWN} (isSessionAlive failed: Error code=EIO message="status refused (${REDACTED_SENTINEL_TAIL})" at `,
+      `${UNKNOWN_THROWN_HEAD}Error code=EIO message="status refused (${REDACTED_SENTINEL_TAIL})" at `,
       KEY,
+      [],
     ],
-    ['reads unknown → b.jg5 SRJ-314: nothing is killed or launched, nothing counted, the arm hook is called once', async () => LIVENESS_READING_UNKNOWN, false, `${UNKNOWN}${NOTHING_COUNTED}`, KEY],
-    ['reads pending → its session has not started: nothing is killed or launched, nothing counted, nothing armed', async () => LIVENESS_READING_PENDING, false, PENDING, ''],
-    ['still reads alive → nothing is killed or launched; the relaunch is left to a later tick', async () => LIVENESS_READING_LIVE, false, STILL_ALIVE, ''],
-  ])('the re-probe %s', async (_label, reprobe, relaunched, line, armedKey) => {
+    ['reads unknown → b.jg5 SRJ-314: nothing is killed or launched, nothing counted, the arm hook is called once, the observer is told nothing', async () => LIVENESS_READING_UNKNOWN, false, UNKNOWN, KEY, []],
+    [
+      'answers a reading of a kind no reading names (cast) → read unknown, never the unhandled-kind line: nothing is killed or launched, nothing counted, the arm hook is called once, the observer is told nothing',
+      async () => ({ kind: 'zombie' }) as unknown as LivenessReading,
+      false,
+      UNKNOWN,
+      KEY,
+      [],
+    ],
+    [
+      'reads pending → its session has not started: nothing is killed or launched, nothing counted, nothing armed; noteOther with the pending re-probe reason, never noteLive',
+      async () => LIVENESS_READING_PENDING,
+      false,
+      PENDING,
+      '',
+      [['noteOther', KEY, RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE]],
+    ],
+    [
+      'still reads live → b.jg5 SRJ-610: noteLive; nothing is killed or launched, nothing counted or armed; the row may stay live for further ticks',
+      async () => LIVENESS_READING_LIVE,
+      false,
+      STILL_LIVE,
+      '',
+      [['noteLive', KEY]],
+    ],
+  ])('the re-probe %s', async (_label, reprobe, relaunched, line, armedKey, notes) => {
     // One failure on record and a failed launch, so the count shows whether the
     // launch was attempted, and a reset would show too (the escalate-dead
     // verdict itself never counts: single counting site).
     recordFailure(KEY)
-    const deps = makeEscalateDeps(reprobe, { launchSessionResult: false })
+    const timeline: unknown[] = []
+    const deps = makeEscalateDeps(reprobe, timelineOpts(timeline))
+    deps.slowRecovery = recordingSlowRecovery(timeline)
+    const run = awaitRuns(deps)
     initRestart(deps)
 
-    scheduleRestart(KEY, '/cwd/reprobe')
-    await Bun.sleep(WAIT_MS)
+    await run.tick(KEY, CWD)
 
     expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
     expect(deps.reconnectSessionCalls).toEqual([KEY])
     expect(deps.killSessionCalls).toEqual(relaunched ? [KEY] : [])
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual(relaunched ? [KEY] : [])
+    // The re-probe's note, told before the same run's kill and relaunch.
+    expect(timeline).toEqual([...notes, ...(relaunched ? [['kill', KEY], ['launch', KEY]] : [])])
     expect(getFailureCount(KEY)).toBe(relaunched ? 2 : 1)
     expect(deps.armRetryTimerCalls).toEqual(armedKey === '' ? [] : [armedKey])
     // restart.ts re-arms nothing either way: the health-check tick is the retry driver.
     expect(isRestartPendingOrActive(KEY)).toBe(false)
     // Exactly one of the re-probe's lines, and it is this case's.
-    const reprobeLines = [RELAUNCH, STILL_ALIVE, PENDING, UNKNOWN].flatMap((prefix) => linesStarting(prefix))
-    expect(reprobeLines).toHaveLength(1)
-    expect(reprobeLines[0]).toStartWith(line)
+    const reprobed = reprobeLines()
+    expect(reprobed).toHaveLength(1)
+    expect(reprobed[0]).toStartWith(line)
     assertNoLeak({ errArgs })
   })
 
   test.each<[string, 'shutdown' | 'not-up', string, number]>([
     ['the server starts shutting down', 'shutdown', `[slack] Skipping restart — server is shutting down (persona=${KEY})`, 3],
     ['the persona stops being up', 'not-up', `[slack] Skipping restart for persona=${KEY} — the persona is no longer up; its instance is left as it is`, 4],
-  ])('%s while the re-probe is pending: though the row now reads dead, nothing is killed or launched; the count is unchanged; the skip is logged once', async (_label, flip, skipLine, gateAsks) => {
+  ])('%s while the re-probe is pending: though the row now reads dead, nothing is killed or launched; the count is unchanged; the skip is logged once; the observer is told nothing', async (_label, flip, skipLine, gateAsks) => {
     // One failure on record, so a reset or a counted launch would show.
     recordFailure(KEY)
     let shuttingDown = false
     let up = true
     const asked: string[] = []
+    const notes: SlowRecoveryNote[] = []
     const deps = makeEscalateDeps(async () => {
       if (flip === 'shutdown') shuttingDown = true
       else up = false
@@ -2650,10 +2963,11 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
     }, { launchSessionResult: false })
     deps.isShuttingDown = () => shuttingDown
     deps.canRestart = (key) => { asked.push(key); return up }
+    deps.slowRecovery = recordingSlowRecovery(notes)
+    const run = awaitRuns(deps)
     initRestart(deps)
 
-    scheduleRestart(KEY, '/cwd/reprobe')
-    await Bun.sleep(WAIT_MS)
+    await run.tick(KEY, CWD)
 
     expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
     expect(deps.reconnectSessionCalls).toEqual([KEY])
@@ -2668,6 +2982,165 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
     expect(lines().filter((l) => l === skipLine)).toHaveLength(1)
     expect(linesStarting(RELAUNCH)).toEqual([])
     expect(linesStarting('[slack] Relaunching session')).toEqual([])
+    // b.jg5 SRJ-610: a run its gates stop after the re-probe tells nothing.
+    expect(notes).toEqual([])
+  })
+
+  // b.jg5 SRJ-610: the slow-recovery observer (`RestartDeps.slowRecovery`)
+  // beyond the re-probe: a dead first probe, a reconnect ending with another
+  // verdict, the runs that tell nothing, a note that throws, and a run with no
+  // observer.
+  describe('b.jg5 SRJ-610: what each restart run tells the slow-recovery observer', () => {
+    test.each<[string, LivenessReading, SlowRecoveryNote]>([
+      ['a row read (ended, missing or no row) → noteDead', LIVENESS_READING_DEAD, ['noteDead', KEY]],
+      ['ErrSystemInstallDisappeared, which reads no row → noteInstallGone, never noteDead', LIVENESS_READING_DEAD_INSTALL_GONE, ['noteInstallGone', KEY]],
+    ])('a first liveness probe reading dead from %s, told before the kill and the relaunch; no reconnect', async (_label, reading, note) => {
+      const timeline: unknown[] = []
+      const deps = makeDeps({ isSessionAliveResult: reading, ...timelineOpts(timeline) })
+      deps.slowRecovery = recordingSlowRecovery(timeline)
+      const run = awaitRuns(deps)
+      initRestart(deps)
+
+      await run.tick(KEY, CWD)
+
+      expect(deps.isSessionAliveCalls).toEqual([KEY])
+      expect(deps.reconnectSessionCalls).toEqual([])
+      expect(timeline).toEqual([note, ['kill', KEY], ['launch', KEY]])
+      expect(run.outcomes).toEqual([RESTART_OUTCOME_COUNTED_FAILURE])
+    })
+
+    test.each<[string, (key: string) => Promise<ReconnectSessionResult>, RestartWorkOutcome]>([
+      ['success', async () => 'success', RESTART_OUTCOME_RECONNECTED],
+      ['transient', async () => 'transient', RESTART_OUTCOME_RECONNECT_DEFERRED],
+      ['pending (its own read found the row pending)', async () => 'pending', RESTART_OUTCOME_PENDING_DEFERRED],
+      ['nothing', async () => undefined, RESTART_OUTCOME_RECONNECT_DEFERRED],
+      ['by throwing', async () => { throw new Error('reconnect broke') }, RESTART_OUTCOME_RECONNECT_DEFERRED],
+    ])('a first probe reading live and a reconnect answering %s → one noteOther with the other-verdict reason; no re-probe, kill or launch', async (_label, reconnect, outcome) => {
+      const notes: SlowRecoveryNote[] = []
+      const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
+      deps.reconnectSession = reconnect
+      deps.slowRecovery = recordingSlowRecovery(notes)
+      const run = awaitRuns(deps)
+      initRestart(deps)
+
+      await run.tick(KEY, CWD)
+
+      expect(notes).toEqual([['noteOther', KEY, RESTART_SLOW_RECOVERY_OTHER_VERDICT]])
+      expect(deps.isSessionAliveCalls).toEqual([KEY])
+      expect(deps.killSessionCalls).toEqual([])
+      expect(deps.launchSessionCalls).toEqual([])
+      expect(run.outcomes).toEqual([outcome])
+      assertNoLeak({ errArgs })
+    })
+
+    /** Changes the escalate-dead deps (whose re-probe reads dead) so the run stops before it tells anything. */
+    type StopBeforeTelling = (deps: ReturnType<typeof makeDeps>) => void
+    test.each<[string, StopBeforeTelling, RestartWorkOutcome]>([
+      ['the first probe reads unknown', (deps) => { deps.isSessionAlive = async () => LIVENESS_READING_UNKNOWN }, RESTART_OUTCOME_LIVENESS_UNKNOWN],
+      ['the first probe throws', (deps) => { deps.isSessionAlive = async () => { throw new Error('status broke') } }, RESTART_OUTCOME_LIVENESS_UNKNOWN],
+      ['the first probe reads pending', (deps) => { deps.isSessionAlive = async () => LIVENESS_READING_PENDING }, RESTART_OUTCOME_PENDING_DEFERRED],
+      ['the session is already connected with its stream', (deps) => { deps.isSessionConnected = () => true }, RESTART_OUTCOME_ALREADY_CONNECTED],
+      [
+        'the persona stops being up during a first probe that reads dead',
+        (deps) => {
+          let up = true
+          deps.canRestart = () => up
+          deps.isSessionAlive = async () => { up = false; return LIVENESS_READING_DEAD }
+        },
+        RESTART_OUTCOME_NOT_UP,
+      ],
+      [
+        'the escalate-dead reconnect\'s sweep latches the persona',
+        (deps) => {
+          let latched = false
+          deps.isLatched = () => latched
+          deps.reconnectSession = async () => { latched = true; return 'escalate-dead' }
+        },
+        RESTART_OUTCOME_LATCHED,
+      ],
+      [
+        'the persona latches during a re-probe that reads dead',
+        (deps) => {
+          let latched = false
+          deps.isLatched = () => latched
+          const probe = deps.isSessionAlive
+          deps.isSessionAlive = async (key) => {
+            const reading = await probe(key)
+            if (deps.isSessionAliveCalls.length === 2) latched = true
+            return reading
+          }
+        },
+        RESTART_OUTCOME_LATCHED,
+      ],
+    ])('%s → the observer is told nothing; nothing is killed or launched', async (_label, stop, outcome) => {
+      const notes: SlowRecoveryNote[] = []
+      const deps = makeEscalateDeps(async () => LIVENESS_READING_DEAD)
+      stop(deps)
+      deps.slowRecovery = recordingSlowRecovery(notes)
+      const run = awaitRuns(deps)
+      initRestart(deps)
+
+      await run.tick(KEY, CWD)
+
+      expect(run.outcomes).toEqual([outcome])
+      expect(notes).toEqual([])
+      expect(deps.killSessionCalls).toEqual([])
+      expect(deps.launchSessionCalls).toEqual([])
+    })
+
+    test.each<[keyof RestartSlowRecoveryObserver, LivenessReading, boolean, RestartWorkOutcome]>([
+      ['noteLive', LIVENESS_READING_LIVE, false, RESTART_OUTCOME_RECONNECT_DEFERRED],
+      ['noteDead', LIVENESS_READING_DEAD, true, RESTART_OUTCOME_LAUNCHED],
+    ])('a %s that throws is logged once as its redacted description and changes nothing else: the run goes on as without the observer', async (note, reading, relaunched, outcome) => {
+      const broke = (): never => {
+        throw Object.assign(new Error(`note broke (${sentinelInMessage('note')})`), { note: LEAK_SENTINEL })
+      }
+      const deps = makeEscalateDeps(async () => reading)
+      deps.slowRecovery = { noteLive: broke, noteDead: broke, noteInstallGone: broke, noteOther: broke }
+      const run = awaitRuns(deps)
+      initRestart(deps)
+
+      await run.tick(KEY, CWD)
+
+      const failed = lines().filter((l) => l.startsWith('[slack] restart: the slow-recovery '))
+      expect(failed).toHaveLength(1)
+      expect(failed[0]).toStartWith(`[slack] restart: the slow-recovery ${note} failed for persona=${KEY}: Error message="note broke (${REDACTED_SENTINEL_TAIL})" at `)
+      expect(run.outcomes).toEqual([outcome])
+      expect(deps.killSessionCalls).toEqual(relaunched ? [KEY] : [])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual(relaunched ? [KEY] : [])
+      expect(getFailureCount(KEY)).toBe(0)
+      assertNoLeak({ errArgs })
+    })
+
+    test.each<[string, LivenessReading]>([
+      ['live', LIVENESS_READING_LIVE],
+      ['pending', LIVENESS_READING_PENDING],
+      ['dead (a row read)', LIVENESS_READING_DEAD],
+      ['dead (ErrSystemInstallDisappeared)', LIVENESS_READING_DEAD_INSTALL_GONE],
+    ])('with no observer, a run whose re-probe reads %s makes the same calls, logs the same lines and answers the same outcome as with one', async (_label, reading) => {
+      /** One run from a clean restart and backoff state, with or without a recording observer. */
+      const runOnce = async (withObserver: boolean) => {
+        _resetRestartState()
+        _resetBackoffState()
+        errArgs = []
+        const notes: SlowRecoveryNote[] = []
+        const deps = makeEscalateDeps(async () => reading)
+        if (withObserver) deps.slowRecovery = recordingSlowRecovery(notes)
+        const run = awaitRuns(deps)
+        initRestart(deps)
+        await run.tick(KEY, CWD)
+        const { isSessionAliveCalls, reconnectSessionCalls, killSessionCalls, launchSessionCalls, onCapReachedCalls, armRetryTimerCalls } = deps
+        const recorded = { isSessionAliveCalls, reconnectSessionCalls, killSessionCalls, launchSessionCalls, onCapReachedCalls, armRetryTimerCalls }
+        return { notes, run: { recorded, outcomes: run.outcomes, failures: getFailureCount(KEY), lines: lines() } }
+      }
+
+      const withOne = await runOnce(true)
+      const withNone = await runOnce(false)
+
+      // The observer was told the reading, so the run is one that tells it something.
+      expect(withOne.notes).toHaveLength(1)
+      expect(withNone.run).toEqual(withOne.run)
+    })
   })
 })
 

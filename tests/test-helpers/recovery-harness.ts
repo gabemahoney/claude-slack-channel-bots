@@ -63,7 +63,9 @@
  *   `UNAVAILABLE_RETRY_CAUSE_READ_ERROR`, straight to the controller (it is
  *   not recorded in `triggers`); an arm while the timer is armed or running
  *   keeps its due time. `isLatched` is the latch's latched query (`latch`
- *   below). `options.restartDeps` replaces any of these. Every ask of the
+ *   below). `slowRecovery`, the slow-recovery observer, is the harness's
+ *   slow-recovery tracker (below), as `main()` binds it (b.jg5 SRJ-610).
+ *   `options.restartDeps` replaces any of these. Every ask of the
  *   latched query in effect, a replacement's included, is recorded by key
  *   first (for `loseMessage`'s `restartRequested`); a throw still reaches
  *   the restart module.
@@ -90,8 +92,9 @@
  *   forgets the persona's latch silently (`latch.forget(key)`: no post, no
  *   set observer call, no line), the turn's step that production's
  *   `forgetConflictLatch` binds (b.jg5 SRJ-504). The teardown's turn then
- *   forgets the persona's episodes, every kind (its unclassified-error and
- *   CONFLICT episodes included), as production's `forgetNoticeEpisodes`
+ *   forgets the persona's episodes, every kind (its unclassified-error,
+ *   CONFLICT and slow-recovery episodes included), and its counts (the
+ *   slow-recovery count), as production's `forgetNoticeEpisodes`
  *   does; a case does that step with `episodes.forget(key)` after
  *   `teardown(key)`, which keeps production's order (the latch, then the
  *   episodes). The harness does not wait for a launch in flight as the turn
@@ -162,6 +165,17 @@
  *   otherwise the alert lands in `episodeNotices`; their lines go to
  *   `lines`. `unclassifiedErrorOpen(key)` reads whether the persona's
  *   episode is open; nothing sets it by hand.
+ * - `slowRecovery` (b.jg5 SRJ-610, SRJ-1010, SRJ-1016): one slow-recovery
+ *   tracker (`createSlowRecoveryTracker`) over the same episodes instance,
+ *   built after the unclassified-error episodes as `main()` builds it, its
+ *   lines to `lines`; its post (SRJ-1010, `slowRecoveryText`) lands in
+ *   `episodeNotices`. It is the restart deps' slow-recovery observer, so the
+ *   restart work's runs feed its count, and its latch end (`endForLatch`) is
+ *   the latch's fourth hold. `slowRecovery` is read-only: `count(key)` and
+ *   `isOpen(key)` (the same state as `episodes.count(key,
+ *   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY)` and `episodes.isOpen`);
+ *   a case moves it only through restart runs, a latch, a forget or
+ *   `shutdown()`.
  * - `latch` and `latchEvents` (b.jg5 SRJ-501, SRJ-502, SRJ-508): one latch
  *   per harness (`createConflictLatch`, its lines to `lines`), composed as
  *   `main()` composes it: installed in the session manager
@@ -179,14 +193,18 @@
  *   UNAVAILABLE_RETRY_STOP_LATCHED)`, so a real stop shows in `stops`), the
  *   condition's silent end (`tmuxUnresponsive.end(key,
  *   TMUX_UNRESPONSIVE_END_LATCHED, undefined, { silent: true })`: no recovery
- *   post; a holding condition's end shows in `conditionEnds`) and the
+ *   post; a holding condition's end shows in `conditionEnds`), the
  *   unclassified-error episode's end (`end(key,
- *   UNCLASSIFIED_ERROR_END_LATCHED)`). `latch` is read-only: `isLatched(key)`
+ *   UNCLASSIFIED_ERROR_END_LATCHED)`) and the slow-recovery tracker's latch
+ *   end (`slowRecovery.endForLatch(key)`: the count reset and the episode
+ *   ended silently). `latch` is read-only: `isLatched(key)`
  *   and `record(key)`. `latchEvents` holds, in order, each set as the
  *   observers see it (`{ step: 'set', key, outcome, record }`, recorded by an
- *   observer added before the holds), each hold as it is called (`{ step:
- *   'hold', key, hold }`) and each CONFLICT notice posted (`{ step: 'notice',
- *   key, text }`), so a case can read that every hold ran before the notice.
+ *   observer added before the holds), each of the first three holds as it is
+ *   called (`{ step: 'hold', key, hold }`; the slow-recovery end is not
+ *   recorded, and a case reads it through `slowRecovery`) and each CONFLICT
+ *   notice posted (`{ step: 'notice', key, text }`), so a case can read that
+ *   every hold ran before the notice.
  *   The harness has no health tick, so `HealthCheckDeps.isLatched` is not
  *   bound here; a tick case binds `latch.isLatched` itself. `teardown(key)`
  *   forgets the persona's latch silently (b.jg5 SRJ-504), as production's
@@ -345,7 +363,10 @@
  *   (`_resetDialogApprovers`, silently: none makes a call after the one in
  *   progress) and clears the timers they left on the harness clock, then
  *   stops every retry timer (`stopAll`), forgets every
- *   episode (`episodes.forgetAll()`, which cancels every alert check) and
+ *   episode and clears every count (`episodes.forgetAll()`, which cancels
+ *   every alert check; so no slow-recovery count or episode is left behind,
+ *   and two harnesses built one after the other, each with its own episodes
+ *   and tracker, share none) and
  *   cancels every notice the driver's destination hold holds, then
  *   drops the driver's routing and undoes every
  *   install and reset the harness made (`console.error`, the restart module's state and the
@@ -508,6 +529,7 @@ import {
   type ApproverOutcome,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
+import { createSlowRecoveryTracker, type SlowRecoveryTracker } from '../../src/slow-recovery.ts'
 import { recordStartupError } from '../../src/startup-errors.ts'
 import {
   createFullModeRetryAction,
@@ -654,7 +676,11 @@ export interface RecoveryStop {
   readonly reason: string
 }
 
-/** The three holds a latch runs, by the names the hold observer logs them under, in its order. */
+/**
+ * The holds a latch runs that `latchEvents` records, by the names the hold
+ * observer logs them under, in its order. The fourth, `'slow-recovery end'`,
+ * runs after them and is not recorded.
+ */
 export type RecoveryLatchHold = 'retry timer stop' | 'tmux-unresponsive end' | 'unclassified-error end'
 
 /**
@@ -695,6 +721,9 @@ interface LostMessageDriver {
 /** The harness's latch, read-only: the latched query and the record. */
 export type RecoveryLatchView = Pick<ConflictLatch, 'isLatched' | 'record'>
 
+/** The harness's slow-recovery tracker, read-only: a persona's count and whether its episode is open. */
+export type RecoverySlowRecoveryView = Pick<SlowRecoveryTracker, 'count' | 'isOpen'>
+
 /** What `makeRecoveryHarness` returns; see the module comment. */
 export interface RecoveryHarness {
   readonly clock: FakeClock
@@ -729,8 +758,13 @@ export interface RecoveryHarness {
   unclassifiedErrorOpen(key: string): boolean
   /** The harness's one latch, read-only (`isLatched`, `record`); composed as `main()` composes it. */
   readonly latch: RecoveryLatchView
-  /** Every latch set, hold and CONFLICT notice post, in order. */
+  /** Every latch set, each of the three recorded holds and every CONFLICT notice post, in order. */
   readonly latchEvents: RecoveryLatchEvent[]
+  /**
+   * The harness's one slow-recovery tracker, read-only (`count`, `isOpen`);
+   * built over `episodes` and wired as `main()` wires it.
+   */
+  readonly slowRecovery: RecoverySlowRecoveryView
   /** Every lost-message notice the driver's routing raised (body, no persona prefix), in order. */
   readonly lostMessageNotices: RecoveryNotice[]
   /** Persona `key`'s Slack stub: its client and bot identity in the driver's routing. */
@@ -954,14 +988,25 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     isConfigured: (key) => applied.has(key),
     logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `persona=${key}: ${text}`),
   })
+  // As main() builds it (b.jg5 SRJ-610, SRJ-1010, SRJ-1016): the one
+  // slow-recovery tracker over the same episodes instance, so its count and
+  // its episode live there (a case's `episodes.forget(key)` and `shutdown()`'s
+  // close drop them, and `cleanup()`'s forget-all clears them); its lines go
+  // to `lines`. It is the restart deps' slow-recovery observer below, and its
+  // latch end is the latch's fourth hold.
+  const slowRecovery = createSlowRecoveryTracker({ episodes, log })
 
   // As main() builds it (b.jg5 SRJ-501, SRJ-502, SRJ-508): one latch per
   // harness, its lines to `lines`. A recorder observer first (it only records
   // the set in `latchEvents`), then, in main()'s order, the holds (the timer's
   // stop with the latch's reason, the condition's silent end, the
-  // unclassified-error episode's end), then the CONFLICT notice over the
-  // episodes, so every hold is done before the notice is posted. The
-  // session manager's installer comes with the other installs below.
+  // unclassified-error episode's end, the slow-recovery tracker's latch end),
+  // then the CONFLICT notice over the episodes, so every hold is done before
+  // the notice is posted. The first three holds are recorded in
+  // `latchEvents`; the slow-recovery end is not (its effect is read through
+  // `slowRecovery`), so a latch's events are the set, three holds and the
+  // notice. The session manager's installer comes with the other installs
+  // below.
   const latchEvents: RecoveryLatchEvent[] = []
   const latch = createConflictLatch({ log })
   const hold = (key: string, name: RecoveryLatchHold): void => {
@@ -985,6 +1030,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
         endUnclassifiedError: (key) => {
           hold(key, 'unclassified-error end')
           unclassifiedErrors.end(key, UNCLASSIFIED_ERROR_END_LATCHED)
+        },
+        // As main() binds it (b.jg5 SRJ-610, SRJ-1016): the count reset and
+        // the episode ended silently; not recorded in `latchEvents`.
+        endSlowRecovery: (key) => {
+          slowRecovery.endForLatch(key)
         },
       },
       log,
@@ -1105,6 +1155,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // As main() binds it (b.jg5 SRJ-502): a latched persona's restart work
     // makes no agent-director call.
     isLatched: (key) => latch.isLatched(key),
+    // As main() binds it (b.jg5 SRJ-610): each run's readings and verdicts
+    // feed the slow-recovery tracker.
+    slowRecovery,
     ...options.restartDeps,
   }
   // Every ask of the latched query in effect is recorded first (the driver's
@@ -1365,6 +1418,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     unclassifiedErrorOpen: (key) => unclassifiedErrors.isOpen(key),
     latch: Object.freeze({ isLatched: (key: string) => latch.isLatched(key), record: (key: string) => latch.record(key) }),
     latchEvents,
+    slowRecovery: Object.freeze({ count: (key: string) => slowRecovery.count(key), isOpen: (key: string) => slowRecovery.isOpen(key) }),
     lostMessageNotices,
     slack: slackStubOf,
     loseMessage,

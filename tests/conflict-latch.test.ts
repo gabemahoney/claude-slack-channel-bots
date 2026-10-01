@@ -99,6 +99,21 @@
  * notice, by which P's timer, `tmux-unresponsive` condition and
  * unclassified episode are all closed, and nothing fires for P afterwards.
  *
+ * The holds' set observer (SRJ-502, SRJ-610, SRJ-1016), pure: on a set the
+ * four holds (the timer's stop, the condition's end, the unclassified end and
+ * the slow-recovery end) run for the persona in that order, before a notice
+ * observer bound after them; a hold that throws is logged and the next still
+ * runs; holds with no slow-recovery end run the other three. The latch's
+ * slow-recovery end on `makeRecoveryHarness` (SRJ-610, SRJ-1016, SRJ-502):
+ * P's and Q's rows read `working` with their panes gone, so three restart
+ * runs each escalate dead with a live re-probe and open both slow-recovery
+ * episodes (one `slowRecoveryText` post each); P's next run meets the
+ * working-row verdict's `read-pane` CONFLICT and latches; by the CONFLICT
+ * notice P's count is 0 and its episode ended, with the latched reason's
+ * lines and no slow-recovery post, exactly one CONFLICT post follows, later
+ * runs for P are latched and post nothing, and Q keeps its count and open
+ * episode; the harness's cleanup leaves no count or episode behind.
+ *
  * A lost message while latched (SRJ-502, SRJ-1011, AC 68, on
  * `makeRecoveryHarness` with both settings 0): P latches through the launch
  * driver at a plain-spawn `scan-leftover` row; a message lost for P through
@@ -306,6 +321,7 @@ import {
   REFUSED_OPERATION_REUSE_SPAWN,
   UNUSABLE_NAME_NOTICE_HEAD,
   UNUSABLE_NAME_NOTICE_REASON,
+  bindConflictLatchHolds,
   bindConflictNotice,
   conflictCaseSentence,
   conflictNoticeText,
@@ -330,6 +346,7 @@ import {
   type ConflictLatch,
   type ConflictLatchCase,
   type ConflictLatchConflictFields,
+  type ConflictLatchHolds,
   type ConflictLatchRecord,
   type ConflictLatchSetEvent,
   type ConflictLatchSetInput,
@@ -349,6 +366,7 @@ import {
   createPersonaEpisodes,
   PERSONA_EPISODE_KIND_CONFLICT,
   PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED,
+  PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
   PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME,
   TMUX_UNRESPONSIVE_END_LATCHED,
   UNCLASSIFIED_ERROR_END_LATCHED,
@@ -364,9 +382,17 @@ import {
   RESTART_FAILURE_CAP,
   RESTART_OUTCOME_LATCHED,
   RESTART_OUTCOME_LAUNCHED,
+  RESTART_OUTCOME_RECONNECT_DEFERRED,
   runRestartRetry,
   scheduleRestart,
 } from '../src/restart.ts'
+import {
+  SLOW_RECOVERY_POST_THRESHOLD,
+  SLOW_RECOVERY_RESET_LATCHED,
+  slowRecoveryCountResetLine,
+  slowRecoveryEpisodeEndedLine,
+  slowRecoveryText,
+} from '../src/slow-recovery.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
 import { decideOwnRowRead, ROW_READ_LAUNCH_START_NOT_RECORDED, ROW_READ_NO_DECISION, type RowReadRow } from '../src/row-read-rules.ts'
 import {
@@ -411,6 +437,7 @@ import {
   errInternal,
   errNoSessionId,
   errSpawnNotFound,
+  errTmuxCaptureFailed,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
   errUnknownErrorName,
@@ -444,6 +471,7 @@ import {
   expectedLatchRecord,
   isApproverSite,
   launchStartRecord,
+  livenessPaneConflictRowsAt,
   sessionEndingCommandsIn,
   tmuxTouchingCallCounts,
   tmuxTouchingCallsIn,
@@ -1738,6 +1766,53 @@ describe('the unusable-recorded-name notice\'s episode (SRJ-508, SRJ-1016)', () 
 })
 
 // ---------------------------------------------------------------------------
+// The holds' set observer (SRJ-502; SRJ-610 and SRJ-1016's slow-recovery end)
+// ---------------------------------------------------------------------------
+
+/** The holds as `bindConflictLatchHolds` takes them, each recording `[hold, key]` in `calls`; `slowRecovery: false` leaves the optional slow-recovery end out. */
+function recordingHolds(calls: Array<readonly [string, string]>, opts: { slowRecovery?: boolean; throwAt?: keyof ConflictLatchHolds } = {}): ConflictLatchHolds {
+  const hold = (name: keyof ConflictLatchHolds) => (key: string): void => {
+    calls.push([name, key])
+    if (opts.throwAt === name) throw new Error(`${name} failed`)
+  }
+  return {
+    stopRetryTimer: hold('stopRetryTimer'),
+    endTmuxUnresponsive: hold('endTmuxUnresponsive'),
+    endUnclassifiedError: hold('endUnclassifiedError'),
+    ...(opts.slowRecovery === false ? {} : { endSlowRecovery: hold('endSlowRecovery') }),
+  }
+}
+
+describe('the holds\' set observer: the slow-recovery end is the fourth hold (SRJ-502, SRJ-610, SRJ-1016)', () => {
+  test('on a set the four holds run for the persona in order, before a notice observer bound after them; a hold that throws is logged and the slow-recovery end still runs', () => {
+    const { latch, lines } = makeLatchRun()
+    const calls: Array<readonly [string, string]> = []
+    bindConflictLatchHolds(latch, recordingHolds(calls, { throwAt: 'endUnclassifiedError' }), (line) => lines.push(line))
+    latch.addSetObserver(({ key }) => {
+      calls.push(['notice', key])
+    })
+    latchOnRow(latch, KEY, ROWS[0]![1])
+    expect(calls).toEqual([
+      ['stopRetryTimer', KEY],
+      ['endTmuxUnresponsive', KEY],
+      ['endUnclassifiedError', KEY],
+      ['endSlowRecovery', KEY],
+      ['notice', KEY],
+    ])
+    expect(lines.filter((line) => line.includes(' hold failed '))).toEqual([expect.stringContaining(`persona=${KEY} hold failed (unclassified-error end): `)])
+  })
+
+  test('holds with no slow-recovery end run the other three and log no failure', () => {
+    const { latch, lines } = makeLatchRun()
+    const calls: Array<readonly [string, string]> = []
+    bindConflictLatchHolds(latch, recordingHolds(calls, { slowRecovery: false }), (line) => lines.push(line))
+    latchOnRow(latch, KEY, ROWS[0]![1])
+    expect(calls.map(([name]) => name)).toEqual(['stopRetryTimer', 'endTmuxUnresponsive', 'endUnclassifiedError'])
+    expect(lines.filter((line) => line.includes(' hold failed '))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // AC 46's automated half, on the recovery harness (SRJ-502, SRJ-501, SRJ-508)
 // ---------------------------------------------------------------------------
 
@@ -2112,6 +2187,98 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
     expect(h.episodeNotices).toEqual([{ key: p, text: plainSpawnRow.notice.text }])
     expect(h.notices).toEqual([])
     expect(personaCallCounts(h, q)).toEqual({})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRJ-610, SRJ-1016, SRJ-502: a latch ends P's open slow-recovery episode
+// silently and resets its count, through the harness's hold observer as
+// main() binds it; Q's episode is left as it is
+// ---------------------------------------------------------------------------
+
+describe('SRJ-610, SRJ-1016, SRJ-502: P\'s latch ends its open slow-recovery episode silently and resets its count; Q\'s is untouched (recovery harness)', () => {
+  /** The working-row verdict's `read-pane` CONFLICT row: P's next run latches P through the latch's set entry. */
+  const workingRowConflict = livenessPaneConflictRowsAt('working-row verdict')[0]!
+  const SLOW = PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY
+  /** `key`'s slow-recovery lines among `lines`. */
+  const slowLinesOf = (lines: readonly string[], key: string): string[] =>
+    lines.filter((line) => line.startsWith(`[slack] slow-recovery: persona=${key} `))
+
+  test('P\'s and Q\'s episodes open after three escalate-dead runs each whose re-probe reads the row live; P\'s CONFLICT latches it: by the CONFLICT notice its count is 0 and its episode ended, with the latched reason and no slow-recovery post; exactly one CONFLICT post; later runs for P post nothing; Q keeps its count and open episode; cleanup leaves no count or episode', async () => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p, q] = h.keys as [string, string]
+    const cwdOf = (key: string): string => personaOf(h, key).working_directory
+    const run = (key: string) => runRestartRetry(key, cwdOf(key), isLaunchInFlight)
+
+    // Both rows read `working` and each pane read answers GONE: every run's
+    // working-row verdict sweeps and escalates dead, and its re-probe still
+    // reads the row live, so each run is one of the tracker's notes.
+    h.script({ statusResult: cannedStatusResult({ state: 'working' }), readPaneError: errTmuxCaptureFailed() })
+    for (let tick = 0; tick < SLOW_RECOVERY_POST_THRESHOLD; tick++) {
+      expect([await run(p), await run(q)]).toEqual([RESTART_OUTCOME_RECONNECT_DEFERRED, RESTART_OUTCOME_RECONNECT_DEFERRED])
+    }
+    await h.settle()
+    // Open, through the tracker and through the harness's episodes view.
+    for (const key of [p, q]) {
+      expect([key, h.slowRecovery.count(key), h.slowRecovery.isOpen(key), h.episodes.count(key, SLOW), h.episodes.isOpen(key, SLOW)])
+        .toEqual([key, SLOW_RECOVERY_POST_THRESHOLD, true, SLOW_RECOVERY_POST_THRESHOLD, true])
+    }
+    expect(h.episodeNotices).toEqual([{ key: p, text: slowRecoveryText(p) }, { key: q, text: slowRecoveryText(q) }])
+    expect([h.latchEvents, h.stub.calls.killCalls, h.stub.calls.spawnCalls]).toEqual([[], [], []])
+
+    // What P's and Q's slow-recovery state is when the CONFLICT notice is posted.
+    const atNotice: unknown[] = []
+    const post = h.episodeNotices.push.bind(h.episodeNotices)
+    h.episodeNotices.push = (...notices) => {
+      atNotice.push([h.slowRecovery.count(p), h.slowRecovery.isOpen(p), h.slowRecovery.count(q), h.slowRecovery.isOpen(q)])
+      return post(...notices)
+    }
+
+    // P's next run: its working-row read-pane answers a CONFLICT, which latches P.
+    const linesBefore = h.lines.length
+    h.script({ readPaneError: workingRowConflict.build() })
+    await run(p)
+    await h.settle()
+    expect(h.latch.record(p)).toMatchObject({
+      sessionName: workingRowConflict.sessionName,
+      latchCase: workingRowConflict.latchCase,
+      refusedOperation: workingRowConflict.refusedOperation,
+      rowState: workingRowConflict.rowState,
+    })
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    // By the notice the latch's hold had reset P's count and ended its episode; Q's were as before.
+    expect(atNotice).toEqual([[0, false, SLOW_RECOVERY_POST_THRESHOLD, true]])
+    // Silently: no slow-recovery post, exactly one CONFLICT post; the ended lines carry the latched reason.
+    expect(h.episodeNotices).toEqual([
+      { key: p, text: slowRecoveryText(p) },
+      { key: q, text: slowRecoveryText(q) },
+      { key: p, text: workingRowConflict.notice.text },
+    ])
+    const latchRunLines = h.lines.slice(linesBefore)
+    expect(slowLinesOf(latchRunLines, p)).toEqual([
+      slowRecoveryCountResetLine(p, SLOW_RECOVERY_POST_THRESHOLD, SLOW_RECOVERY_RESET_LATCHED),
+      slowRecoveryEpisodeEndedLine(p, SLOW_RECOVERY_RESET_LATCHED),
+    ])
+    expect(slowLinesOf(latchRunLines, q)).toEqual([])
+
+    // Later runs for P are latched: no call, no count, no slow-recovery post.
+    const pCalls = personaCallCounts(h, p)
+    for (let tick = 0; tick < SLOW_RECOVERY_POST_THRESHOLD; tick++) expect(await run(p)).toBe(RESTART_OUTCOME_LATCHED)
+    expect([personaCallCounts(h, p), h.slowRecovery.count(p), h.slowRecovery.isOpen(p), h.episodes.isOpen(p, SLOW)]).toEqual([pCalls, 0, false, false])
+    expect(h.episodeNotices).toHaveLength(3)
+    // Q, not latched, keeps its count and its open episode.
+    expect([h.latch.isLatched(q), h.slowRecovery.count(q), h.slowRecovery.isOpen(q)]).toEqual([false, SLOW_RECOVERY_POST_THRESHOLD, true])
+    expect(h.clock.pendingCount()).toBe(0)
+
+    // Cleanup leaves no count or open episode behind: Q's are gone with it.
+    harnesses = harnesses.filter((built) => built !== h)
+    try {
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+    expect([h.slowRecovery.count(q), h.slowRecovery.isOpen(q), h.clock.pendingCount()]).toEqual([0, false, 0])
   })
 })
 

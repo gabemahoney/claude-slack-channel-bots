@@ -11,7 +11,10 @@
  *   pending  the row reads `pending`: its session has not started
  *   dead     `ended` or `missing`; also `ErrSpawnNotFound`, and
  *            `ErrSystemInstallDisappeared` with its `ad-unreachable` outage
- *            (the adapter decides those errors)
+ *            (the adapter decides those errors); the last reads no row, so
+ *            its reading carries the source `install-gone`
+ *            (`isInstallGoneDeadReading`), which the slow-recovery count
+ *            tells apart from a row read (b.jg5 SRJ-610)
  *   unknown  any other `status` error, and any state string that is none of
  *            the above: agent-director could not report on the persona
  *
@@ -94,9 +97,22 @@ export interface PendingLivenessReading {
   readonly launchStartedAt?: string
 }
 
-/** The `dead` reading. */
+/**
+ * The `dead` reading's source when it came from `ErrSystemInstallDisappeared`
+ * (b.jg5 SRJ-314), which reads no row: the reading is `dead` all the same,
+ * but it is not a row read of `ended`, `missing` or no row, so it ends no
+ * slow-recovery episode (SRJ-610, SRJ-1016; hatch A2).
+ */
+export const LIVENESS_DEAD_SOURCE_INSTALL_GONE = 'install-gone'
+
+/**
+ * The `dead` reading. `source` is `LIVENESS_DEAD_SOURCE_INSTALL_GONE` when the
+ * reading came from `ErrSystemInstallDisappeared`; absent for a row read
+ * (`ended`, `missing`, `ErrSpawnNotFound`).
+ */
 export interface DeadLivenessReading {
   readonly kind: typeof LIVENESS_DEAD
+  readonly source?: typeof LIVENESS_DEAD_SOURCE_INSTALL_GONE
 }
 
 /** The `unknown` reading. */
@@ -115,8 +131,13 @@ export type LivenessReading =
 export const LIVENESS_READING_LIVE: LiveLivenessReading = Object.freeze({ kind: LIVENESS_LIVE })
 /** The `pending` reading with no launch start, as a value. */
 export const LIVENESS_READING_PENDING: PendingLivenessReading = Object.freeze({ kind: LIVENESS_PENDING })
-/** The `dead` reading, as a value. */
+/** The `dead` reading of a row read, as a value. */
 export const LIVENESS_READING_DEAD: DeadLivenessReading = Object.freeze({ kind: LIVENESS_DEAD })
+/** The `dead` reading from `ErrSystemInstallDisappeared`, which reads no row, as a value. */
+export const LIVENESS_READING_DEAD_INSTALL_GONE: DeadLivenessReading = Object.freeze({
+  kind: LIVENESS_DEAD,
+  source: LIVENESS_DEAD_SOURCE_INSTALL_GONE,
+})
 /** The `unknown` reading, as a value. */
 export const LIVENESS_READING_UNKNOWN: UnknownLivenessReading = Object.freeze({ kind: LIVENESS_UNKNOWN })
 
@@ -152,6 +173,21 @@ export function livenessKindOf(reading: unknown): LivenessKind {
     return KINDS.has(kind) ? (kind as LivenessKind) : LIVENESS_UNKNOWN
   } catch {
     return LIVENESS_UNKNOWN
+  }
+}
+
+/**
+ * Whether a probe's answer is the `dead` reading from
+ * `ErrSystemInstallDisappeared` (its `source` is
+ * `LIVENESS_DEAD_SOURCE_INSTALL_GONE`); false for every other answer, a row
+ * read's `dead` included. Never throws.
+ */
+export function isInstallGoneDeadReading(reading: unknown): boolean {
+  try {
+    if (livenessKindOf(reading) !== LIVENESS_DEAD) return false
+    return (reading as { readonly source?: unknown }).source === LIVENESS_DEAD_SOURCE_INSTALL_GONE
+  } catch {
+    return false
   }
 }
 

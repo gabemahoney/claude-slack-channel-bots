@@ -167,7 +167,12 @@
  *     blocked-on-prompt notice, makes it defer with its evidence forgotten,
  *     no deferral noted and no notice (the waiting-row check asks it before
  *     the notice only). Each escalate-dead verdict's line carries its text
- *     from `ESCALATE_DEAD_EVIDENCE`, and none says "dead".
+ *     from `ESCALATE_DEAD_EVIDENCE`, and none says "dead"; the sweep's line
+ *     (`escalateDeadSweepLine`, pinned once) promises no dead reading, since
+ *     the row may stay live for further ticks (b.jg5 SRJ-610), and the five
+ *     reconnect lines logged before such a sweep promise no relaunch: each
+ *     ends with `ESCALATE_DEAD_REPROBE_DECIDES` (checked once, beside the
+ *     sweep line's pin).
  *   - b.jg5 SRJ-513, SRJ-1020 (E16 T2), with SRJ-114's and SRJ-115's sites,
  *     on `makeRecoveryHarness`: a configured persona's own row reading
  *     `pending` with no launch start (`LAUNCH_START_CASE_ROWS`: absent,
@@ -363,7 +368,9 @@ import {
   FIND_MISSING_ROW_NOT_JUDGED,
   type FindMissingRowReading,
   sweepDeadTmuxChannel,
+  escalateDeadSweepLine,
   ESCALATE_DEAD_EVIDENCE,
+  ESCALATE_DEAD_REPROBE_DECIDES,
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
   type EscalateDeadVerdict,
@@ -451,6 +458,8 @@ import {
   WAITING_ROW_PANE_ABSENT,
   WAITING_ROW_PANE_GONE,
   type WaitingRowPaneVerdict,
+  waitingRowAbsentAtPaneReadLine,
+  waitingRowPaneGoneLine,
   type WorkingRowPaneCheckOptions,
   classifyWorkingPane,
   foldWorkingPaneRun,
@@ -675,9 +684,12 @@ import {
   PANE_READ_UNAVAILABLE,
   PANE_READ_UNCLASSIFIED,
   PANE_READ_UNUSABLE_NAME,
+  type PaneReadFailure,
   type PaneReadOutcome,
   type PaneReadUnclassified,
+  paneReadFailureOf,
 } from '../src/pane-read.ts'
+import { promptRowTmuxGoneLine, workingRowAbsentAtPaneReadLine, workingRowPaneGoneLine } from '../src/server.ts'
 import type { UnclassifiedErrorSink } from '../src/persona-episodes.ts'
 import { getFailureCount } from '../src/backoff.ts'
 import {
@@ -6884,9 +6896,46 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
 
     await sweepDeadTmuxChannel('C', verdict)
 
-    expect(errLog.filter((l) => l.startsWith('[slack] escalate-dead: persona='))).toEqual([
-      `[slack] escalate-dead: persona=C verdict=${verdict} — ${ESCALATE_DEAD_EVIDENCE[verdict]}, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)`,
-    ])
+    expect(errLog.filter((l) => l.startsWith('[slack] escalate-dead: persona='))).toEqual([escalateDeadSweepLine('C', verdict)])
+    expect(escalateDeadSweepLine('C', verdict)).toContain(` verdict=${verdict} — ${ESCALATE_DEAD_EVIDENCE[verdict]}, `)
+  })
+
+  // b.jg5 SRJ-610: the sweep's line names no outcome. A swept row may stay
+  // live for further ticks, each escalate-dead tick sweeping again, so the
+  // line never promises the restart finds the row dead. The line's one
+  // literal pin; every other case compares with `escalateDeadSweepLine`.
+  test('escalateDeadSweepLine pin: the persona, the verdict and its evidence, then the re-sweep note; no promise the row reads dead', () => {
+    const line = escalateDeadSweepLine('C', 'dead-session')
+
+    expect(line).toBe(
+      `[slack] escalate-dead: persona=C verdict=dead-session — ${ESCALATE_DEAD_EVIDENCE['dead-session']}, triggering internal findMissing reconciliation (the row may stay live for further ticks, each escalate-dead tick sweeping again; ~/startup/find-missing-loop.sh is belt-and-braces)`,
+    )
+    for (const verdict of ESCALATE_DEAD_VERDICTS) {
+      expect(escalateDeadSweepLine('C', verdict)).not.toMatch(/reads dead|relaunch/)
+    }
+  })
+
+  // b.jg5 SRJ-610: the five reconnect lines logged before an escalate-dead
+  // sweep promise no relaunch: each ends with the shared tail, then its own
+  // references. The tail's one literal pin; every other case compares with
+  // the line's builder.
+  test('the five escalate-dead reconnect lines end with ESCALATE_DEAD_REPROBE_DECIDES and their references; none says "relaunches it"', () => {
+    const gone = paneReadFailureOf(errTmuxCaptureFailed())
+    const absent = paneReadFailureOf(errSpawnNotFound())
+    const lines: ReadonlyArray<readonly [string, string]> = [
+      [promptRowTmuxGoneLine('C', 'ask_user'), ' (b.jdc)'],
+      [workingRowPaneGoneLine('C', gone), ` (read-pane class=${AD_ERROR_CLASS_GONE}; b.d61, b.jg5 SRJ-603)`],
+      [workingRowAbsentAtPaneReadLine('C', absent), ` (read-pane class=${AD_ERROR_CLASS_STATE}; b.jg5 SRJ-117)`],
+      [waitingRowPaneGoneLine('C', gone), ` (read-pane class=${AD_ERROR_CLASS_GONE}; b.jg5 SRJ-604)`],
+      [waitingRowAbsentAtPaneReadLine('C', absent), ` (read-pane class=${AD_ERROR_CLASS_STATE}; b.jg5 SRJ-117)`],
+    ]
+
+    expect(ESCALATE_DEAD_REPROBE_DECIDES).toBe("sweeping and escalating (escalate-dead); the restart path's re-probe decides")
+    for (const [line, suffix] of lines) {
+      expect(line.endsWith(`${ESCALATE_DEAD_REPROBE_DECIDES}${suffix}`)).toBe(true)
+      expect(line).not.toContain('relaunches it')
+    }
+    assertNoLeak(lines.map(([line]) => line))
   })
 
   test('ESCALATE_DEAD_EVIDENCE is frozen and holds exactly one text per verdict, all different; none says "dead" or "provably"', () => {
@@ -18023,18 +18072,16 @@ describe('b.jg5 SRJ-117, SRJ-604: the restart path\'s waiting-row check (checkWa
     expect(h.notices).toEqual([])
   }
 
-  test.each<[string, () => Error, WaitingRowPaneVerdict, string, string, string]>([
-    ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(), WAITING_ROW_PANE_GONE, AD_ERROR_CLASS_GONE, 'but agent-director\'s read-pane found no pane of its launch', 'b.jg5 SRJ-604'],
-    ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), WAITING_ROW_PANE_ABSENT, AD_ERROR_CLASS_STATE, 'but its agent-director row was absent at the pane read', 'b.jg5 SRJ-117'],
-  ])('%s → %s, never reconnect: one line saying nothing is typed; the read the only call; nothing latched or posted', async (_label, build, verdict, errorClass, says, srj) => {
+  test.each<[string, () => Error, WaitingRowPaneVerdict, (key: string, read: PaneReadFailure) => string]>([
+    ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(), WAITING_ROW_PANE_GONE, waitingRowPaneGoneLine],
+    ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), WAITING_ROW_PANE_ABSENT, waitingRowAbsentAtPaneReadLine],
+  ])('%s → %s, never reconnect: one line saying nothing is typed; the read the only call; nothing latched or posted', async (_label, build, verdict, lineOf) => {
     const err = build()
     const { h, p, order, verdict: got } = await checkAnswering(err)
 
     expect(got).toBe(verdict)
     expectOnlyTheRead(h, p, order)
-    expect(waitingRowLinesOf(h, p)).toEqual([
-      waitingRowLine(p, says, err, 'not typing /mcp reconnect; reconciling so the restart relaunches it', errorClass, srj),
-    ])
+    expect(waitingRowLinesOf(h, p)).toEqual([lineOf(p, paneReadFailureOf(err))])
   })
 
   test.each(SRJ311_ENVIRONMENT.map(([what, make, onset]) => [what, make, onset] as const))('ENVIRONMENT (%s) → defer, never reconnect: P\'s tmux-unavailable raised once with its onset, B\'s untouched; one line; the read the only call; nothing latched', async (_what, make, onset) => {

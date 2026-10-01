@@ -69,6 +69,14 @@
  * again. A throwing episodes member, threshold accessor or log breaks no
  * report.
  *
+ * Per-kind counts (b.jg5 SRJ-610): `addCount` and `resetCount` answer the
+ * new and the prior count, per persona and kind; a count is independent of
+ * the open episode of its kind (begin, post, a new case and end leave it, and
+ * adding or resetting leaves the episode); `forget` clears that persona's
+ * counts of every kind and no other key's, `forgetAll` and `close` every
+ * count; none of these posts or logs. The slow-recovery tracker that drives
+ * the count is in `tests/slow-recovery.test.ts`.
+ *
  * Close steps: `whenClosed` runs its step exactly once on every close path
  * (`end`, a new case, `forget`, `forgetAll`, `close`), answers false and
  * keeps nothing with no episode open, and a throwing step is logged
@@ -98,6 +106,7 @@ import {
   PERSONA_EPISODE_DEFAULT_MARK,
   PERSONA_EPISODE_KINDS,
   PERSONA_EPISODE_KIND_CONFLICT,
+  PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
   PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
@@ -448,6 +457,92 @@ describe('isolation', () => {
     expect(other.isOpen('K', kind)).toBe(false)
     other.begin('K', kind)
     expect(other.post('K', kind, textOf(kind, 2))).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Per-kind counts
+// ---------------------------------------------------------------------------
+
+describe('per-persona, per-kind counts (b.jg5 SRJ-610)', () => {
+  const slow = PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY
+
+  /** Every kind's count for `key`, in `PERSONA_EPISODE_KINDS` order. */
+  const countsOf = (key: string) => PERSONA_EPISODE_KINDS.map((kind) => episodes.count(key, kind))
+
+  /** Kind i gets i + 1 counts for K and one for Q. */
+  function addEveryKind(): void {
+    PERSONA_EPISODE_KINDS.forEach((kind, i) => {
+      for (let n = 0; n <= i; n++) episodes.addCount('K', kind)
+      episodes.addCount('Q', kind)
+    })
+  }
+
+  test('a count adds and resets per persona and kind, answering the new and the prior count, and posts nothing', () => {
+    expect(countsOf('K')).toEqual(PERSONA_EPISODE_KINDS.map(() => 0))
+    PERSONA_EPISODE_KINDS.forEach((kind, i) => {
+      const added = Array.from({ length: i + 1 }, () => episodes.addCount('K', kind))
+      expect({ kind, added }).toEqual({ kind, added: added.map((_, n) => n + 1) })
+      expect(episodes.addCount('Q', kind)).toBe(1)
+    })
+    const slowIndex = PERSONA_EPISODE_KINDS.indexOf(slow)
+
+    expect(episodes.resetCount('K', slow)).toBe(slowIndex + 1)
+    expect(episodes.resetCount('K', slow)).toBe(0)
+
+    expect(countsOf('K')).toEqual(PERSONA_EPISODE_KINDS.map((kind, i) => (kind === slow ? 0 : i + 1)))
+    expect(countsOf('Q')).toEqual(PERSONA_EPISODE_KINDS.map(() => 1))
+    expect(episodes.addCount('K', slow)).toBe(1)
+    expect(posts).toEqual([])
+    expect(lines).toEqual([])
+  })
+
+  test('a count is independent of an open episode of its kind: begin, post, a new case and end leave it, and adding or resetting leaves the episode', () => {
+    expect([episodes.addCount('K', slow), episodes.addCount('K', slow)]).toEqual([1, 2])
+
+    expect(episodes.begin('K', slow)).toBe('begun')
+    expect(episodes.post('K', slow, textOf(slow, 1))).toBe(true)
+    expect(episodes.count('K', slow)).toBe(2)
+
+    expect(episodes.addCount('K', slow)).toBe(3)
+    expect(episodes.resetCount('K', slow)).toBe(3)
+    expect(episodes.isOpen('K', slow)).toBe(true)
+    expect(episodes.hasPosted('K', slow)).toBe(true)
+    expect(episodes.post('K', slow, textOf(slow, 2))).toBe(false)
+
+    episodes.addCount('K', slow)
+    expect(episodes.begin('K', slow, 'case-a')).toBe('new-case')
+    expect(episodes.count('K', slow)).toBe(1)
+    expect(episodes.end('K', slow)).toBe(true)
+    expect(episodes.count('K', slow)).toBe(1)
+
+    expect(posts).toEqual([{ key: 'K', text: textOf(slow, 1) }])
+    expect(lines).toEqual([])
+  })
+
+  test('forget(key) clears that persona\'s counts of every kind and leaves another key\'s, posting nothing', () => {
+    addEveryKind()
+    episodes.begin('Q', slow)
+    episodes.post('Q', slow, textOf(slow, 1))
+
+    episodes.forget('K')
+
+    expect(countsOf('K')).toEqual(PERSONA_EPISODE_KINDS.map(() => 0))
+    expect(countsOf('Q')).toEqual(PERSONA_EPISODE_KINDS.map(() => 1))
+    expect(episodes.isOpen('Q', slow)).toBe(true)
+    expect(episodes.addCount('K', slow)).toBe(1)
+    expect(posts).toEqual([{ key: 'Q', text: textOf(slow, 1) }])
+    expect(lines).toEqual([])
+  })
+
+  test.each([['forgetAll'], ['close']] as const)('%s() clears every persona\'s counts of every kind, posting nothing', (step) => {
+    addEveryKind()
+
+    episodes[step]()
+
+    for (const key of ['K', 'Q']) expect({ key, counts: countsOf(key) }).toEqual({ key, counts: PERSONA_EPISODE_KINDS.map(() => 0) })
+    expect(posts).toEqual([])
+    expect(lines).toEqual([])
   })
 })
 

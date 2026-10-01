@@ -182,14 +182,23 @@
  *   before the notice) and before the start pass; they are exactly the retry
  *   controller's `stop` with `UNAVAILABLE_RETRY_STOP_LATCHED`, the
  *   tmux-unresponsive condition's silent `end` with
- *   `TMUX_UNRESPONSIVE_END_LATCHED` and the unclassified-error episodes'
- *   `end` with `UNCLASSIFIED_ERROR_END_LATCHED`. The latch is installed in
+ *   `TMUX_UNRESPONSIVE_END_LATCHED`, the unclassified-error episodes'
+ *   `end` with `UNCLASSIFIED_ERROR_END_LATCHED` and the slow-recovery
+ *   tracker's latch end (below). The latch is installed in
  *   the session manager once (`setConflictLatch`), after both bindings and
  *   before the retry controller and the start pass, with no await before the
  *   holds' targets are built; its `isLatched` is bound, as a call-time read,
  *   into the full-mode retry action, `initRestart` and `initHealthCheck`, and
  *   the latch is named nowhere else. The condition's three ends and the
  *   unclassified episodes' two ends are each located in their binding.
+ * - b.jg5 SRJ-610 / SRJ-1010 / SRJ-1016 / SRJ-502: the one slow-recovery
+ *   tracker (`createSlowRecoveryTracker`) is built once, in main()'s own
+ *   statement list, over the one notice episodes instance and the server log,
+ *   after the episodes and before the restart module and the start pass, with
+ *   no await between the latch's install and its build; it is `initRestart`'s
+ *   `slowRecovery` observer, and the latch's `endSlowRecovery` hold calls its
+ *   `endForLatch` for the key. It is named only there; server.ts calls none
+ *   of its notes, and no other src file builds one.
  * - b.jg5 SRJ-114 / SRJ-501: the session manager's configured-persona query
  *   is installed once (`setConfiguredPersonaQuery`), in main()'s own
  *   statement list, as a call-time read of the live applied-persona lookup
@@ -272,6 +281,8 @@ import type { PendingLivenessReading } from '../src/liveness-reading.ts'
 import type * as ConflictLatchModule from '../src/conflict-latch.ts'
 import type { ConflictLatch, ConflictLatchDeps, ConflictLatchHolds } from '../src/conflict-latch.ts'
 import type * as PersonaEpisodesModule from '../src/persona-episodes.ts'
+import type * as SlowRecoveryModule from '../src/slow-recovery.ts'
+import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-recovery.ts'
 import type {
   PersonaEpisodes,
   PersonaEpisodesDeps,
@@ -340,10 +351,16 @@ function isolated(call: string): string {
 
 /** The latch's holds binder (b.jg5 SRJ-502); renaming it fails the typecheck. */
 const BIND_LATCH_HOLDS: keyof typeof ConflictLatchModule = 'bindConflictLatchHolds'
-/** The latch's three holds (b.jg5 SRJ-305, SRJ-310, SRJ-313); renaming one fails the typecheck. */
+/** The latch's four holds (b.jg5 SRJ-305, SRJ-310, SRJ-313, SRJ-610); renaming one fails the typecheck. */
 const HOLD_STOP_RETRY: keyof ConflictLatchHolds = 'stopRetryTimer'
 const HOLD_END_TMUX: keyof ConflictLatchHolds = 'endTmuxUnresponsive'
 const HOLD_END_UNCLASSIFIED: keyof ConflictLatchHolds = 'endUnclassifiedError'
+const HOLD_END_SLOW_RECOVERY: keyof ConflictLatchHolds = 'endSlowRecovery'
+
+/** `(key) => <call>` or `(key) => { <call> }`, `<call>` given `\1` for the parameter, whose name is free. */
+function oneKeyArrow(call: string): RegExp {
+  return new RegExp(`^\\(?(\\w+)\\)? => (?:\\{ ${call};? \\}|${call})$`)
+}
 
 /**
  * b.jg5 SRJ-502: the holds object main() binds to the latch, as its
@@ -2793,11 +2810,6 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
   const UNCLASSIFIED_END_LATCHED: keyof typeof PersonaEpisodesModule = 'UNCLASSIFIED_ERROR_END_LATCHED'
   const INSTALL: keyof typeof SessionManagerModule = 'setConflictLatch'
 
-  /** `(key) => <call>` or `(key) => { <call> }`, `<call>` given `\1` for the parameter, whose name is free. */
-  function oneKeyArrow(call: string): RegExp {
-    return new RegExp(`^\\(?(\\w+)\\)? => (?:\\{ ${call};? \\}|${call})$`)
-  }
-
   /** `name` is imported from `module` and declared nowhere in server.ts. */
   function importedOnly(name: string, module: string): void {
     expect(importSource(SERVER_CODE, name)).toBe(module)
@@ -2820,8 +2832,8 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(callsOf(HOLD_OBSERVER_FACTORY)).toEqual([])
   })
 
-  test('the holds are exactly three: the retry timer stop, the silent end of tmux-unresponsive and the end of the unclassified-error episode', () => {
-    expect([...latchHoldProps().keys()].sort()).toEqual([HOLD_STOP_RETRY, HOLD_END_TMUX, HOLD_END_UNCLASSIFIED].sort())
+  test('the holds are exactly four: the retry timer stop, the silent end of tmux-unresponsive, the end of the unclassified-error episode and the slow-recovery end (b.jg5 SRJ-610; its binding is pinned in the slow-recovery describe below)', () => {
+    expect([...latchHoldProps().keys()].sort()).toEqual([HOLD_STOP_RETRY, HOLD_END_TMUX, HOLD_END_UNCLASSIFIED, HOLD_END_SLOW_RECOVERY].sort())
   })
 
   test('the retry-timer hold stops the persona\'s timer on the one retry controller through its stop entry, with the latch\'s own stop reason, never through the condition-end entry (b.jg5 SRJ-305)', () => {
@@ -2926,6 +2938,91 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     const CHECK: keyof typeof ServerModule = 'armMissingTmuxUnavailableRetry'
     const [checkStart, checkEnd] = exportedFunctionBody(CHECK)
     expect(queries.filter((offset) => offset > checkStart && offset < checkEnd)).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-610 / SRJ-1010 / SRJ-1016 / SRJ-502 — the one
+// slow-recovery tracker
+//
+// `RestartDeps.slowRecovery` and `ConflictLatchHolds.endSlowRecovery` are
+// optional, and absent the restart work and the latch behave the same. So a
+// production wiring that dropped either binding, built a second tracker (one
+// the restart work counts on, another the latch ends), built it over episodes
+// other than the one instance (which a teardown never forgets and shutdown
+// never closes, so its count and episode would outlive the persona), or built
+// it after the start pass would type-check and pass every behaviour suite
+// while no slow-recovery notice was ever posted, or a latch left P's episode
+// open. What the tracker does is tested in tests/slow-recovery.test.ts and
+// tests/restart.test.ts, and its latch end in tests/conflict-latch.test.ts;
+// pinned here: the bindings.
+// ---------------------------------------------------------------------------
+
+describe('main() builds the one slow-recovery tracker over the notice episodes before the start pass, hands it to the restart work as its slow-recovery observer, and binds its latch end into the latch\'s holds (b.jg5 SRJ-610, SRJ-1010, SRJ-1016, SRJ-502)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const FACTORY: keyof typeof SlowRecoveryModule = 'createSlowRecoveryTracker'
+  const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
+  const EPISODES: keyof SlowRecoveryTrackerDeps = 'episodes'
+  const LOG: keyof SlowRecoveryTrackerDeps = 'log'
+  const OBSERVER: keyof RestartDeps = 'slowRecovery'
+  const LATCH_END: keyof SlowRecoveryTracker = 'endForLatch'
+  /** Every other entry of the tracker: the restart work's notes and the read-only queries. */
+  const OTHER_ENTRIES: ReadonlyArray<keyof SlowRecoveryTracker> = ['noteLive', 'noteDead', 'noteInstallGone', 'noteOther', 'count', 'isOpen']
+  const INSTALL: keyof typeof SessionManagerModule = 'setConflictLatch'
+
+  test('the tracker is built exactly once, in main()\'s own statement list (not at module scope, behind no branch), from the slow-recovery module, after the notice episodes and before the restart module and the start pass, with no await between the latch\'s install and its build', () => {
+    const at = onlyCallOf(FACTORY)
+    const tracker = constOf(FACTORY)
+    declaredOnce(tracker)
+    const decl = SERVER_CODE.search(new RegExp(`\\bconst\\s+${tracker}\\s*=\\s*${FACTORY}\\s*\\(`))
+    expect(decl).toBeGreaterThan(-1)
+    expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
+    expect(importSource(SERVER_CODE, FACTORY)).toBe('./slow-recovery.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+
+    expect(at).toBeGreaterThan(onlyCallOf(EPISODES_FACTORY))
+    for (const later of latchStartPass()) expect(at).toBeLessThan(later)
+    // The latch's hold names the tracker before its declaration, as a call-time
+    // read: nothing may yield between the latch's install and the tracker's
+    // build, so no latch is set before the hold's target exists.
+    const install = onlyCallOf(INSTALL)
+    expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(Math.min(install, at), Math.max(install, at)))).toEqual([])
+  })
+
+  test('its dependencies are exactly the one notice episodes instance, which holds its count and episode, and the server log', () => {
+    const props = onlyCallProps(FACTORY)
+    expect([...props.keys()].sort()).toEqual([EPISODES, LOG].sort())
+    expect(props.get(EPISODES)).toBe(constOf(EPISODES_FACTORY))
+    expect(props.get(LOG)).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+  })
+
+  test('the restart module\'s slow-recovery observer is this tracker, by name', () => {
+    expect(onlyCallProps('initRestart').get(OBSERVER)).toBe(constOf(FACTORY))
+  })
+
+  test('the latch\'s slow-recovery hold calls this tracker\'s latch end for the persona it is given', () => {
+    expect(latchHoldProps().get(HOLD_END_SLOW_RECOVERY)).toMatch(oneKeyArrow(`${constOf(FACTORY)}\\.${LATCH_END}\\(\\1\\)`))
+  })
+
+  test('the tracker is named only at its build, in the restart module\'s call and in the latch\'s holds; server.ts calls its latch end once and none of its other entries (the restart work tells it each run), and no other file under src/ builds one', () => {
+    const tracker = constOf(FACTORY)
+    const named = indicesOf(new RegExp(`\\b${tracker}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(3)
+    const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${tracker}\\b`))!
+    expect(named).toContain(decl.index! + decl[0].length - tracker.length)
+    const within = (call: string) => {
+      const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf(call), '(', ')')
+      return named.filter((offset) => offset > open && offset < close).length
+    }
+    expect([within('initRestart'), within(BIND_LATCH_HOLDS)]).toEqual([1, 1])
+
+    const calls = (entry: string) => indicesOf(new RegExp(`\\.\\s*${entry}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(indicesOf(new RegExp(`\\b${tracker}\\s*[?!]?\\.\\s*${LATCH_END}\\s*\\(`, 'g'), SERVER_CODE)).toHaveLength(1)
+    expect(calls(LATCH_END)).toHaveLength(1)
+    expect(OTHER_ENTRIES.filter((entry) => indicesOf(new RegExp(`\\b${tracker}\\s*[?!]?\\.\\s*${entry}\\b`, 'g'), SERVER_CODE).length > 0)).toEqual([])
+
+    const builders = srcFiles().filter(([, text]) => new RegExp(`\\b${FACTORY}\\s*\\(`).test(stripComments(text)))
+    expect(builders.map(([path]) => path).sort()).toEqual(['src/server.ts', 'src/slow-recovery.ts'])
   })
 })
 

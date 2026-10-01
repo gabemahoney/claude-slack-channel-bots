@@ -86,6 +86,7 @@ import {
   checkWaitingRowPane,
   checkWorkingRowPane,
   deletePersonaInstance,
+  ESCALATE_DEAD_REPROBE_DECIDES,
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
   type EscalateDeadVerdict,
@@ -137,6 +138,7 @@ import {
   PANE_READ_UNCLASSIFIED,
   PANE_READ_UNUSABLE_NAME,
   paneReadClassNote,
+  type PaneReadFailure,
 } from './pane-read.ts'
 import { createPersonaNotifier } from './persona-notifier.ts'
 import {
@@ -161,6 +163,7 @@ import {
 } from './conflict-latch.ts'
 import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
+import { createSlowRecoveryTracker } from './slow-recovery.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
 import { createPersonaConnectionManager, type PersonaConnectionManager } from './persona-connections.ts'
 import { resolveSlackApiUrlOverride } from './persona-slack-clients.ts'
@@ -200,6 +203,7 @@ import {
 import {
   LIVENESS_LIVE,
   LIVENESS_READING_DEAD,
+  LIVENESS_READING_DEAD_INSTALL_GONE,
   LIVENESS_READING_UNKNOWN,
   LIVENESS_UNKNOWN,
   livenessReadingForStatus,
@@ -1346,8 +1350,10 @@ export async function _runCallTimeoutStartStep(
  * is decided by name through `src/ad-error-class.ts`:
  *   - `ErrSpawnNotFound` → `dead`; clears `ad-unreachable` and
  *     `ad-config-malformed`, as a state answer does;
- *   - `ErrSystemInstallDisappeared` → `dead`; raises `ad-unreachable` with its
- *     binary path;
+ *   - `ErrSystemInstallDisappeared` → `dead`, marked as read from no row
+ *     (`LIVENESS_READING_DEAD_INSTALL_GONE`: the slow-recovery count resets
+ *     on it without ending its episode, b.jg5 SRJ-610); raises
+ *     `ad-unreachable` with its binary path;
  *   - `ErrTmuxNotAvailable` (ENVIRONMENT) → `unknown`; raises
  *     `tmux-unavailable` through `raiseTmuxUnavailable` with the error, which
  *     posts SRJ-1021's onset for the re-bound-socket form;
@@ -1471,7 +1477,9 @@ function statusErrorReading(key: string, err: unknown): LivenessReading {
   }
   if (hasAdErrorName(err, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME)) {
     setOutageFlag(key, 'ad-unreachable', binaryPathOf(err))
-    return LIVENESS_READING_DEAD
+    // b.jg5 SRJ-610: `dead` all the same, marked as read from no row, so the
+    // slow-recovery count resets without ending its episode (hatch A2).
+    return LIVENESS_READING_DEAD_INSTALL_GONE
   }
   if (classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
     // b.jg5 SRJ-1021: the raising error picks the onset.
@@ -1765,7 +1773,11 @@ export function _buildKillSessionAdapter(
  *   same restart run and, when the reconciled row reads dead, takes the
  *   kill+relaunch branch at once. The sweep may leave the row live (in
  *   `unverified_ids`, or, when `pending`, not judged, b.jg5 SRJ-120), and it
- *   may then stay live for further ticks, each of which tries again. After a
+ *   may then stay live for further ticks: nothing promises that the re-probe
+ *   or a later tick reads it dead. Each escalate-dead tick sweeps again, with
+ *   no step beyond the sweep, and restart.ts's slow-recovery observer posts
+ *   the slow-recovery notice once after 3 such ticks whose re-probe still
+ *   reads the row live (b.jg5 SRJ-610, SRJ-1010). After a
  *   run the sweep makes, each configured persona's own row left in
  *   `unverified_ids` is read with one `get`, and only a `provenance_conflict`
  *   note there latches (b.jg5 SRJ-114); restart.ts asks the latch right after
@@ -1793,8 +1805,10 @@ export function _buildKillSessionAdapter(
  *     and the keystrokes (a findMissing sweep, such as the one another
  *     persona's launch wait starts with, marked the row missing) → the
  *     refused keystrokes make `reconnectMcp` answer 'dead-session', which
- *     escalates below: the claude process is gone, and restart.ts's re-probe
- *     reads the row dead and relaunches the persona in the same run (b.d61).
+ *     escalates below: the claude process is gone, and when restart.ts's
+ *     re-probe reads the row dead it relaunches the persona in the same run
+ *     (b.d61); a row that still reads live is swept again at each later
+ *     escalate-dead tick (b.jg5 SRJ-610).
  *     No spawn-failure notice is raised. Its escalate-dead line has the
  *     verdict `row-not-interactive` (b.jdc), not a dead tmux session's.
  *
@@ -1913,8 +1927,12 @@ export function _buildReconnectSessionAdapter(
     // branch at once. `pending` or `unknown` leaves the relaunch undone
     // (`unknown` arms the retry timer). The sweep may leave the row live (in
     // `unverified_ids`, or, when `pending`, not judged at all, b.jg5
-    // SRJ-120), and the row may then stay live for further ticks: each later
-    // health-check tick reads it again and reschedules. After a run the sweep
+    // SRJ-120), and the row may then stay live for further ticks: nothing
+    // promises that the re-probe or the next tick reads it dead. Each later
+    // escalate-dead tick sweeps again, with no step beyond the sweep, and
+    // restart.ts's slow-recovery observer posts the slow-recovery notice once
+    // after 3 such ticks whose re-probe still reads the row live (b.jg5
+    // SRJ-610, SRJ-1010). After a run the sweep
     // makes, each configured persona's own row left in `unverified_ids` is
     // read with one `get`, and only a `provenance_conflict` note there
     // latches (b.jg5 SRJ-114); restart.ts asks the latch right after this
@@ -1942,10 +1960,11 @@ export function _buildReconnectSessionAdapter(
       // a dead tmux session for a refused keystroke (b.dup).
       //
       // Memo-TTL vs. tick-cadence: reconcileMissingSweep's 10s memo window is
-      // harmless at the ~120s health-check tick cadence — the following
-      // tick's escalate-dead sweeps again well past the window, though a row
-      // agent-director leaves live (b.jg5 SRJ-120) stays live for further
-      // ticks whatever the sweep's age. And the fleet-wide
+      // harmless at the ~120s health-check tick cadence — a later
+      // escalate-dead tick's sweep runs again well past the window, though a
+      // row agent-director leaves live (b.jg5 SRJ-120) may stay live for
+      // further ticks whatever the sweep's age; each such tick sweeps again
+      // and nothing more (b.jg5 SRJ-610). And the fleet-wide
       // post-reboot case (b.nk5 — /tmp wiped, ALL personas dead-tmux at once)
       // is served correctly by the single in-flight-shared sweep: one
       // findMissing reconciles the whole store for every escalating persona.
@@ -2014,9 +2033,11 @@ function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) |
  *   - its own tmux session is gone (`hasPersonaTmuxSession`, exact target) →
  *     the dead-tmux sweep (`sweepDeadTmuxChannelWithCause`, verdict
  *     `prompt-row-tmux-gone`) and 'escalate-dead', with no notice: restart.ts
- *     re-probes and, once the row reads dead, relaunches the persona in the
+ *     re-probes and, when the row reads dead, relaunches the persona in the
  *     same run (b.d61); a row the sweep leaves live may stay live for
- *     further ticks (b.jg5 SRJ-120);
+ *     further ticks (b.jg5 SRJ-120), each escalate-dead tick sweeping again
+ *     with no step beyond the sweep and the slow-recovery notice posted once
+ *     after 3 such ticks (b.jg5 SRJ-610, SRJ-1010);
  *   - alive, or the probe failed (no proof it is dead) → one more deferral on
  *     the row (`checkPromptRowDeferral`): once the run has lasted
  *     `PROMPT_ROW_SWEEP_AFTER_MS`, it sweeps and reads the row again, and a
@@ -2054,9 +2075,7 @@ async function promptRowReconnectVerdict(
   if (latchedNow()) return 'transient'
   if (!tmuxAlive) {
     endPromptRowDeferral(key)
-    console.error(
-      `[slack] reconnectSession: persona=${key} is ${state} but its tmux session "${personaTmuxSessionName(key)}" is gone — no prompt is waiting in it; not deferring, reconciling so the restart relaunches it (b.jdc)`,
-    )
+    console.error(promptRowTmuxGoneLine(key, state))
     const sweep = await sweepDeadTmuxChannelWithCause(key, 'prompt-row-tmux-gone')
     return sweep.refused ? 'transient' : 'escalate-dead'
   }
@@ -2066,6 +2085,17 @@ async function promptRowReconnectVerdict(
   // b.jg5 SRJ-502: latched after the sweep (its line is logged there): no notice.
   if (deferral === 'latched') return 'transient'
   return deferPromptRow(key, state)
+}
+
+/**
+ * `promptRowReconnectVerdict`'s line when persona `key`'s row reads `state`
+ * (`ask_user` or `check_permission`) but its own tmux session is gone (b.jdc).
+ * Exported for tests.
+ *
+ * @internal
+ */
+export function promptRowTmuxGoneLine(key: string, state: string): string {
+  return `[slack] reconnectSession: persona=${key} is ${state} but its tmux session "${personaTmuxSessionName(key)}" is gone — no prompt is waiting in it; not deferring, ${ESCALATE_DEAD_REPROBE_DECIDES} (b.jdc)`
 }
 
 /**
@@ -2139,6 +2169,28 @@ export function deferPendingRow(key: string, launchStartedAt?: string): 'pending
     `[slack] Deferring persona=${key}: its row reads pending${launch} — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; no reconnect, kill or launch, nothing counted (b.dup)`,
   )
   return 'pending'
+}
+
+/**
+ * `workingReconnectVerdict`'s line when the `working` row's `read-pane`
+ * answered GONE (b.d61, b.jg5 SRJ-603); `read` is that failure. Exported for
+ * tests.
+ *
+ * @internal
+ */
+export function workingRowPaneGoneLine(key: string, read: PaneReadFailure): string {
+  return `[slack] reconnectSession: persona=${key} is working but agent-director's read-pane found no pane of its launch: ${read.description} — not deferring; ${ESCALATE_DEAD_REPROBE_DECIDES} (${paneReadClassNote(read)}; b.d61, b.jg5 SRJ-603)`
+}
+
+/**
+ * `workingReconnectVerdict`'s line when the `working` row was absent
+ * (`ErrSpawnNotFound`) at its `read-pane` (b.jg5 SRJ-117); `read` is that
+ * failure. Exported for tests.
+ *
+ * @internal
+ */
+export function workingRowAbsentAtPaneReadLine(key: string, read: PaneReadFailure): string {
+  return `[slack] reconnectSession: persona=${key} is working but its agent-director row was absent at the pane read: ${read.description} — not deferring; ${ESCALATE_DEAD_REPROBE_DECIDES} (${paneReadClassNote(read)}; b.jg5 SRJ-117)`
 }
 
 /** The site label of the `working`-row verdict's read, the head of the shared reader's latch line. */
@@ -2224,14 +2276,10 @@ async function workingReconnectVerdict(
         ? 'reconnect'
         : 'transient'
     case PANE_READ_GONE:
-      console.error(
-        `[slack] reconnectSession: persona=${key} is working but agent-director's read-pane found no pane of its launch: ${read.description} — not deferring; reconciling so the restart relaunches it (${paneReadClassNote(read)}; b.d61, b.jg5 SRJ-603)`,
-      )
+      console.error(workingRowPaneGoneLine(key, read))
       return escalateRowWithNoPane(key, 'working-tmux-gone', latchedNow)
     case PANE_READ_ABSENT:
-      console.error(
-        `[slack] reconnectSession: persona=${key} is working but its agent-director row was absent at the pane read: ${read.description} — not deferring; reconciling so the restart relaunches it (${paneReadClassNote(read)}; b.jg5 SRJ-117)`,
-      )
+      console.error(workingRowAbsentAtPaneReadLine(key, read))
       return escalateRowWithNoPane(key, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, latchedNow)
     case PANE_READ_UNAVAILABLE:
     case PANE_READ_CONFIG:
@@ -2262,7 +2310,9 @@ async function workingReconnectVerdict(
  * escalate-dead line) and the answer is 'escalate-dead', or 'transient' when
  * the sweep was refused (b.jg5 SRJ-105). A persona `latchedNow` finds
  * latched first gets no sweep: 'transient' (b.jg5 SRJ-502). restart.ts then
- * probes liveness again in the same run (b.d61). Never throws.
+ * probes liveness again in the same run (b.d61); the row may still read live
+ * then and at further ticks, each escalate-dead tick sweeping again (b.jg5
+ * SRJ-610). Never throws.
  */
 async function escalateRowWithNoPane(
   key: string,
@@ -2535,9 +2585,10 @@ export async function main(): Promise<void> {
   // through the controller's `stop` with the latch's reason (never the
   // condition-end entry, whose `pending` and kill-failure exceptions do not
   // apply to a latch), its tmux-unresponsive condition ends silently (no
-  // recovery notice; the latch's notice follows) and its unclassified-error
-  // episode ends. The three are built below; no latch can be set before the
-  // start pass, by which time they exist.
+  // recovery notice; the latch's notice follows), its unclassified-error
+  // episode ends, and its slow-recovery count resets and that episode ends
+  // silently (b.jg5 SRJ-610, SRJ-1016). The four are built below; no latch
+  // can be set before the start pass, by which time they exist.
   const conflictLatch = createConflictLatch({ log: (line) => console.error(line) })
   bindConflictLatchHolds(
     conflictLatch,
@@ -2548,6 +2599,9 @@ export async function main(): Promise<void> {
       },
       endUnclassifiedError: (key) => {
         unclassifiedErrors.end(key, UNCLASSIFIED_ERROR_END_LATCHED)
+      },
+      endSlowRecovery: (key) => {
+        slowRecovery.endForLatch(key)
       },
     },
     (line) => console.error(line),
@@ -2591,6 +2645,20 @@ export async function main(): Promise<void> {
     alertThresholdMs: adAlertThresholdMsInEffect,
     isConfigured: (key) => getAppliedPersona(key) !== undefined,
     logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `persona=${key}: ${text}`),
+  })
+
+  // b.jg5 SRJ-610, SRJ-1010, SRJ-1016: the slow dead-session recovery
+  // tracker, its count and episode held in the notice episodes (so a
+  // teardown's forget clears both and shutdown's close drops them). The
+  // restart work tells it each run's readings and verdicts (initRestart's
+  // `slowRecovery` below): the third escalate-dead verdict in a row whose
+  // re-probe still reads the row live posts SRJ-1010 once per episode
+  // through the persona notifier. A row read of `ended`, `missing` or no row
+  // ends the episode; the latch's hold above ends it at a latch. It adds no
+  // timer and makes no agent-director call.
+  const slowRecovery = createSlowRecoveryTracker({
+    episodes: noticeEpisodes,
+    log: (line) => console.error(line),
   })
 
   // b.jg5 SRJ-301, SRJ-303, SRJ-305: one UNAVAILABLE retry controller, on the
@@ -3100,6 +3168,9 @@ export async function main(): Promise<void> {
     // b.jg5 SRJ-502: a latched persona's restart work (a fired timer, a
     // retry, a human-triggered restart) makes no agent-director call.
     isLatched: (key) => conflictLatch.isLatched(key),
+    // b.jg5 SRJ-610: each run's readings and verdicts feed the slow-recovery
+    // count; nothing in the run changes because of it.
+    slowRecovery,
   })
 
   // b.av2 SR-6.3: the start sweep, BEFORE the trust patch and any spawn.

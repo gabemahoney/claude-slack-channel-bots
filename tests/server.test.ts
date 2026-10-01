@@ -19,17 +19,20 @@ import {
   CSCB_UNKNOWN_ERROR_NAME,
   describeAgentDirectorFailure,
 } from '../src/ad-error-class.ts'
-import { FULL_PANE_READ_LINES } from '../src/pane-read.ts'
+import { FULL_PANE_READ_LINES, paneReadFailureOf, type PaneReadFailure } from '../src/pane-read.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_READING_DEAD,
+  LIVENESS_READING_DEAD_INSTALL_GONE,
   LIVENESS_READING_LIVE,
   LIVENESS_READING_PENDING,
   LIVENESS_READING_UNKNOWN,
   LIVENESS_PENDING,
+  isInstallGoneDeadReading,
   launchStartOfReading,
+  livenessKindOf,
   livenessReadingForStatus,
   pendingLaunchStartOf,
   pendingLivenessReading,
@@ -119,6 +122,9 @@ import {
   _runCallTimeoutStartStep,
   deferPendingRow,
   LAUNCH_START_LOG_RE,
+  promptRowTmuxGoneLine,
+  workingRowAbsentAtPaneReadLine,
+  workingRowPaneGoneLine,
 } from '../src/server.ts'
 import { buildPersonaClientOrExit, type PersonaClientDeps } from '../src/agent-director-startup.ts'
 import {
@@ -146,9 +152,11 @@ import {
   _resetNotConnectedEpisodes,
   _resetNow,
   _setNow,
-  ESCALATE_DEAD_EVIDENCE,
+  escalateDeadSweepLine,
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
+  waitingRowAbsentAtPaneReadLine,
+  waitingRowPaneGoneLine,
   STALE_WORKING_WINDOW_MS,
   UNPROVEN_IDLE_NOTICE_AFTER_MS,
   forgetNotConnectedEpisode,
@@ -612,6 +620,41 @@ describe("liveness-reading: a pending row's launch start (b.jg5 SRJ-115)", () =>
   })
 })
 
+// ---------------------------------------------------------------------------
+// The `dead` reading's source (b.jg5 SRJ-314, SRJ-610, SRJ-1016): the `dead`
+// reading from `ErrSystemInstallDisappeared` reads no row, so it is told apart
+// from a row read's `dead`; only a row read of `ended` or `missing` ends a
+// slow-recovery episode.
+// ---------------------------------------------------------------------------
+
+describe("liveness-reading: the dead reading's install-gone source", () => {
+  test('LIVENESS_READING_DEAD_INSTALL_GONE is a frozen dead reading, told apart from the row read\'s dead', () => {
+    expect(Object.isFrozen(LIVENESS_READING_DEAD_INSTALL_GONE)).toBe(true)
+    expect(livenessKindOf(LIVENESS_READING_DEAD_INSTALL_GONE)).toBe(livenessKindOf(LIVENESS_READING_DEAD))
+    expect(LIVENESS_READING_DEAD_INSTALL_GONE).not.toEqual(LIVENESS_READING_DEAD)
+    expect(isInstallGoneDeadReading(LIVENESS_READING_DEAD_INSTALL_GONE)).toBe(true)
+  })
+
+  test('isInstallGoneDeadReading → false for every other reading, a row read\'s dead included, for a non-dead reading carrying the source, and for a value that is not a reading; never throws', () => {
+    for (const other of [LIVENESS_READING_LIVE, LIVENESS_READING_PENDING, LIVENESS_READING_DEAD, LIVENESS_READING_UNKNOWN]) {
+      expect(isInstallGoneDeadReading(other)).toBe(false)
+    }
+    for (const other of [LIVENESS_READING_LIVE, LIVENESS_READING_PENDING, LIVENESS_READING_UNKNOWN]) {
+      expect(isInstallGoneDeadReading({ ...other, source: LIVENESS_READING_DEAD_INSTALL_GONE.source })).toBe(false)
+    }
+    expect(isInstallGoneDeadReading({ ...LIVENESS_READING_DEAD, source: 'another-source' })).toBe(false)
+    const throwingSource = Object.defineProperty({ kind: LIVENESS_READING_DEAD.kind }, 'source', {
+      get(): never {
+        throw new Error('boom')
+      },
+    })
+    expect(isInstallGoneDeadReading(throwingSource)).toBe(false)
+    for (const notAReading of [null, undefined, LIVENESS_READING_DEAD.kind, LIVENESS_READING_DEAD_INSTALL_GONE.source]) {
+      expect(isInstallGoneDeadReading(notAReading)).toBe(false)
+    }
+  })
+})
+
 describe('_buildIsSessionAliveAdapter', () => {
   type Emission = { key: string; text: string }
   /** One arm of the trigger-sink spy, and whether it came from inside an attempt for its key. */
@@ -768,6 +811,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
 
     expect(result).toEqual(reading)
+    expect(isInstallGoneDeadReading(result)).toBe(false)
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
     expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
     expect(cleared).toEqual([{ key: 'C1', cls: 'ad-unreachable' }])
@@ -831,6 +875,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     const result = await adapter('C1')
 
     expect(result).toEqual(LIVENESS_READING_DEAD)
+    expect(isInstallGoneDeadReading(result)).toBe(false)
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
     expect(cleared).toEqual([{ key: 'C1', cls: 'ad-unreachable' }])
@@ -852,13 +897,17 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions.slice(before)).toEqual([{ key: 'C1', text: adUnreachableAllClear('/bin/ad') }])
   })
 
-  test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; reads dead', async () => {
+  // b.jg5 SRJ-610, SRJ-1016: the reading is `dead`, from no row read, so it
+  // carries the install-gone source (a slow-recovery episode stays open).
+  test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; reads dead, from the install-gone source', async () => {
     const binaryPath = '/home/horde/.agent-director/bin/agent-director'
     const { emissions, statusCalls, adapter } = makeHarness(errSystemInstallDisappeared('status', binaryPath))
 
     const result = await adapter('C1')
 
-    expect(result).toEqual(LIVENESS_READING_DEAD)
+    expect(result).toEqual(LIVENESS_READING_DEAD_INSTALL_GONE)
+    expect(livenessKindOf(result)).toBe(livenessKindOf(LIVENESS_READING_DEAD))
+    expect(isInstallGoneDeadReading(result)).toBe(true)
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
     expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(false)
@@ -1005,6 +1054,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     const { result, errArgs } = await probeCapturingErrors(adapter, 'C1')
 
     expect(result).toEqual(reading)
+    expect(isInstallGoneDeadReading(result)).toBe(false)
     expect(cleared).toEqual([{ key: 'C1', cls: 'ad-config-malformed' }])
     expect(stringLines(errArgs).filter((l) => l.includes('ad-config-malformed cleared for persona=C1'))).toHaveLength(1)
     if (withTmux) {
@@ -1023,7 +1073,7 @@ describe('_buildIsSessionAliveAdapter', () => {
   /** The binary path the ErrSystemInstallDisappeared row names (its `ad-unreachable` onset carries it). */
   const disappearedBinaryPath = '/home/horde/.agent-director/bin/agent-director'
   test.each([
-    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status', disappearedBinaryPath), LIVENESS_READING_DEAD, [ONSET_TEMPLATES['ad-unreachable'](disappearedBinaryPath)]],
+    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status', disappearedBinaryPath), LIVENESS_READING_DEAD_INSTALL_GONE, [ONSET_TEMPLATES['ad-unreachable'](disappearedBinaryPath)]],
     ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'status'), LIVENESS_READING_UNKNOWN, [ONSET_TEMPLATES['tmux-unavailable']()]],
     ...unavailableForms('ErrCallTimeout', 'ErrTmuxUnresponsive', 'ErrUnknownErrorName').map(
       ([label, build]) => [`${label} (UNAVAILABLE)`, () => build('status'), LIVENESS_READING_UNKNOWN, []] as const,
@@ -1114,21 +1164,23 @@ describe('_buildIsSessionAliveAdapter', () => {
   })
 
   // b.jg5 SRJ-105, SRJ-314 (Task ruling): `ErrSystemInstallDisappeared` is
-  // UNCLASSIFIED, but at the liveness adapter it keeps its `dead` reading and
+  // UNCLASSIFIED, but at the liveness adapter it keeps its `dead` reading
+  // (from the install-gone source, b.jg5 SRJ-610) and
   // its `ad-unreachable` raise, and is never reported to the unclassified
   // sink, inside a restart run for the persona or outside one. Its arming is
   // unchanged (a read's error inside the attempt: the read-error cause).
   test.each([
     ['inside a restart run for the persona', true],
     ['outside any attempt', false],
-  ] as const)('b.jg5 SRJ-313: status throws ErrSystemInstallDisappeared %s → reads dead; ad-unreachable raised; not reported to the unclassified sink', async (_label, inside) => {
+  ] as const)('b.jg5 SRJ-313: status throws ErrSystemInstallDisappeared %s → reads dead, from the install-gone source; ad-unreachable raised; not reported to the unclassified sink', async (_label, inside) => {
     const { triggers, unclassified, adapter } = makeHarness(errSystemInstallDisappeared('status'))
 
     const { result, errArgs } = inside
       ? await runInAttempt('C1', 'recovery', () => probeCapturingErrors(adapter, 'C1'))
       : await probeCapturingErrors(adapter, 'C1')
 
-    expect(result).toEqual(LIVENESS_READING_DEAD)
+    expect(result).toEqual(LIVENESS_READING_DEAD_INSTALL_GONE)
+    expect(isInstallGoneDeadReading(result)).toBe(true)
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
     expect(unclassified).toEqual([])
     expect(triggers).toEqual(inside ? [{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR, inside: true }] : [])
@@ -1157,6 +1209,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     const result = await adapter('C9')
 
     expect(result).toEqual(LIVENESS_READING_DEAD)
+    expect(isInstallGoneDeadReading(result)).toBe(false)
     expect(statusCalls).toHaveLength(0)
     // No probe ran, so nothing was cleared and no all-clear was posted.
     expect(getOutageFlags('C9').has('ad-unreachable')).toBe(true)
@@ -1457,9 +1510,8 @@ describe('_buildReconnectSessionAdapter', () => {
   const fullPaneReads = (n: number): ReadPaneParams[] =>
     Array(n).fill({ claude_instance_id: personaInstanceId('C1'), n_lines: FULL_PANE_READ_LINES })
 
-  /** The escalate-dead line for persona C1 with `verdict`, its evidence text imported. */
-  const escalateDeadLine = (verdict: EscalateDeadVerdict): string =>
-    `[slack] escalate-dead: persona=C1 verdict=${verdict} — ${ESCALATE_DEAD_EVIDENCE[verdict]}, triggering internal findMissing reconciliation (the restart relaunches it once its row reads dead; ~/startup/find-missing-loop.sh is belt-and-braces)`
+  /** The escalate-dead sweep line for persona C1 with `verdict`, from the imported builder. */
+  const escalateDeadLine = (verdict: EscalateDeadVerdict): string => escalateDeadSweepLine('C1', verdict)
 
   /** C1's `read-pane` answering GONE: agent-director found no pane of its launch. */
   const paneGone = (): Error => errTmuxCaptureFailed(personaTmuxSessionName('C1'))
@@ -1539,9 +1591,9 @@ describe('_buildReconnectSessionAdapter', () => {
     expectNoTmuxCall(h)
     // Nothing is typed into a pane that no longer exists.
     expect(sendKeysCalls).toHaveLength(0)
-    // The dead-tmux sweep reconciles the frozen row to `missing`, so the
-    // restart run's liveness re-probe reads the session dead and relaunches it
-    // in that same run.
+    // The dead-tmux sweep may reconcile the frozen row to `missing`; the
+    // restart run's liveness re-probe then decides whether that same run
+    // relaunches the persona.
     expect(findMissingCalls).toHaveLength(1)
     expect(stringLines(errArgs).filter((l) => l.startsWith('[slack] escalate-dead: persona='))).toEqual([escalateDeadLine('working-tmux-gone')])
   })
@@ -2597,13 +2649,14 @@ describe('_buildReconnectSessionAdapter', () => {
 
     // ---- GONE and the row absent, on either row ----------------------------
 
-    test.each<readonly [string, 'working' | 'waiting', () => Error, EscalateDeadVerdict, string]>([
-      ['a working row, GONE (ErrTmuxCaptureFailed)', 'working', paneGone, 'working-tmux-gone', AD_ERROR_CLASS_GONE],
-      ['a working row, the row absent (ErrSpawnNotFound)', 'working', errSpawnNotFound, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, AD_ERROR_CLASS_STATE],
-      ['a waiting row, GONE (ErrTmuxCaptureFailed)', 'waiting', paneGone, ESCALATE_DEAD_WAITING_ROW_PANE_GONE, AD_ERROR_CLASS_GONE],
-      ['a waiting row, the row absent (ErrSpawnNotFound)', 'waiting', errSpawnNotFound, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, AD_ERROR_CLASS_STATE],
-    ])("%s → 'escalate-dead' with nothing typed: one read-pane, one findMissing sweep and the escalate-dead line with the verdict and its imported evidence text; nothing latched, no notice; no tmux call", async (_label, state, build, escalateVerdict, errorClass) => {
-      const h = cellHarness(state, { paneError: build() })
+    test.each<readonly [string, 'working' | 'waiting', () => Error, EscalateDeadVerdict, (key: string, read: PaneReadFailure) => string]>([
+      ['a working row, GONE (ErrTmuxCaptureFailed)', 'working', paneGone, 'working-tmux-gone', workingRowPaneGoneLine],
+      ['a working row, the row absent (ErrSpawnNotFound)', 'working', errSpawnNotFound, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, workingRowAbsentAtPaneReadLine],
+      ['a waiting row, GONE (ErrTmuxCaptureFailed)', 'waiting', paneGone, ESCALATE_DEAD_WAITING_ROW_PANE_GONE, waitingRowPaneGoneLine],
+      ['a waiting row, the row absent (ErrSpawnNotFound)', 'waiting', errSpawnNotFound, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, waitingRowAbsentAtPaneReadLine],
+    ])("%s → 'escalate-dead' with nothing typed: one read-pane, one findMissing sweep, the row's own line (its builder's) and the escalate-dead line with the verdict and its imported evidence text; nothing latched, no notice; no tmux call", async (_label, state, build, escalateVerdict, lineOf) => {
+      const err = build()
+      const h = cellHarness(state, { paneError: err })
 
       const { verdict, lines } = await attempt(h)
 
@@ -2613,7 +2666,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.findMissingCalls).toHaveLength(1)
       expectNoTmuxCall(h)
       expect(lines.filter((l) => l.startsWith('[slack] escalate-dead: persona='))).toEqual([escalateDeadLine(escalateVerdict)])
-      expect(classLines(lines, `is ${state} but `, errorClass)).toHaveLength(1)
+      expect(lines.filter((l) => l.startsWith(`[slack] reconnectSession: persona=C1 is ${state} `))).toEqual([lineOf('C1', paneReadFailureOf(err))])
       expect(latch.isLatched('C1')).toBe(false)
       expect(raised).toEqual([])
     })
@@ -2728,10 +2781,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.sendKeysCalls).toEqual([])
       expect(h.readPaneCalls).toEqual([])
       expect(raised).toEqual([])
-      expect(adapterLines()).toEqual([
-        `[slack] reconnectSession: persona=C1 is ${state} but its tmux session "slack_bot_C1" is gone — no prompt is waiting in it; not deferring, reconciling so the restart relaunches it (b.jdc)`,
-        escalateDeadLine('prompt-row-tmux-gone'),
-      ])
+      expect(adapterLines()).toEqual([promptRowTmuxGoneLine('C1', state), escalateDeadLine('prompt-row-tmux-gone')])
     })
 
     test.each([

@@ -32,6 +32,16 @@
  *   the episode (the `tmux-unresponsive` alert check) is cancelled with it.
  * - `openKeys(kind)` lists the keys with an open episode of the kind; `clock`
  *   is the clock the start times come from.
+ * - `count(key, kind)`, `addCount(key, kind)` and `resetCount(key, kind)`
+ *   keep a per-persona, per-kind count of consecutive observations, for a
+ *   kind whose post waits for a run of them (the slow dead-session recovery
+ *   kind: consecutive escalate-dead verdicts whose re-probe still reads the
+ *   row live, b.jg5 SRJ-610). The count runs before the episode begins (the
+ *   episode begins at its post), so it is kept apart from the open episode:
+ *   beginning, posting in or ending an episode leaves it as it is, and only
+ *   its poster adds to it or resets it. `forget(key)` clears the persona's
+ *   counts of every kind with its episodes, and `forgetAll()` and `close()`
+ *   clear every count; none posts anything.
  *
  * Kinds and their posters. One label per row of SRJ-1016's table
  * (`PERSONA_EPISODE_KINDS`). `tmux-unresponsive`'s episode is begun and
@@ -42,6 +52,9 @@
  * (`src/conflict-latch.ts`), which posts each kind's one notice per episode
  * (the CONFLICT notice, SRJ-1019 and SRJ-1020) and, when it begins one, ends
  * the persona's open episodes of the other latch kinds silently;
+ * `slow-dead-session-recovery`'s by the slow-recovery tracker
+ * (`createSlowRecoveryTracker`, `src/slow-recovery.ts`), which keeps its
+ * count here and posts SRJ-1010 once per episode;
  * every other kind has no poster yet: its begin and end triggers and text
  * come with the Epic that posts it, named on its label below.
  *
@@ -331,8 +344,15 @@ export const PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD = 'invalid-flags-hold'
 export const PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR = 'unclassified-error'
 
 /**
- * Slow dead-session recovery: from its post until the row reads `ended` or
- * `missing`, the persona latches, or it is torn down. No poster yet (b.jg5 E18).
+ * Slow dead-session recovery (SRJ-610, SRJ-1010): from its post until the row
+ * reads `ended` or `missing` or is gone (`ErrSpawnNotFound`), the persona
+ * latches, or it is torn down. Posted by the slow-recovery tracker
+ * (`createSlowRecoveryTracker`, `src/slow-recovery.ts`): its count of
+ * consecutive escalate-dead verdicts whose re-probe still reads the row live
+ * is this kind's count here (`addCount`, `resetCount`), and the third begins
+ * the episode and posts SRJ-1010 once. The tracker ends it on a row read of
+ * `ended` or `missing` or no row, and at the latch (`main()`'s latch hold);
+ * a teardown's `forget` and shutdown's `close` drop it and its count.
  */
 export const PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY = 'slow-dead-session-recovery'
 
@@ -435,18 +455,30 @@ export interface PersonaEpisodes {
   end(key: string, kind: PersonaEpisodeKind): boolean
   /** The open episode, or undefined. */
   view(key: string, kind: PersonaEpisodeKind): PersonaEpisodeView | undefined
-  /** End every kind's episode of the persona silently. */
+  /**
+   * The persona's count of this kind: how many consecutive observations its
+   * poster has added since the last reset (0 when none). Independent of
+   * whether an episode of the kind is open.
+   */
+  count(key: string, kind: PersonaEpisodeKind): number
+  /** Add one to the persona's count of this kind. Answers the new count. Posts nothing. */
+  addCount(key: string, kind: PersonaEpisodeKind): number
+  /** Reset the persona's count of this kind to 0. Answers the count before the reset. Posts nothing; an open episode stays open. */
+  resetCount(key: string, kind: PersonaEpisodeKind): number
+  /** End every kind's episode of the persona silently, and clear its counts of every kind. */
   forget(key: string): void
   /**
-   * End every episode of every persona silently, leaving the instance open
-   * (a later `begin` opens again). For tests only: the module's one test
-   * reset, which lets a test harness reset between cases without closing
-   * the instance. No production path calls it; shutdown uses `close`.
+   * End every episode of every persona silently and clear every count,
+   * leaving the instance open (a later `begin` opens again). For tests only:
+   * the module's one test reset, which lets a test harness reset between
+   * cases without closing the instance. No production path calls it;
+   * shutdown uses `close`.
    */
   forgetAll(): void
   /**
-   * The server's shutdown: end every episode silently, as `forgetAll`, and
-   * refuse every later `begin`, so nothing opens, posts or arms after it.
+   * The server's shutdown: end every episode silently and clear every count,
+   * as `forgetAll`, and refuse every later `begin`, so nothing opens, posts
+   * or arms after it.
    */
   close(): void
 }
@@ -470,6 +502,8 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
   const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
   /** Open episodes by persona key, then by kind. */
   const byKey = new Map<string, Map<PersonaEpisodeKind, OpenEpisode>>()
+  /** Counts above 0 by persona key, then by kind; kept apart from the open episodes. */
+  const counts = new Map<string, Map<PersonaEpisodeKind, number>>()
   let lastEpisode = 0
   /** Set by `close`: every later `begin` is refused. */
   let closed = false
@@ -489,10 +523,11 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
     }
   }
 
-  /** Close every episode of every persona silently. */
+  /** Close every episode of every persona silently, and clear every count. */
   function closeAll(): void {
     const closing = [...byKey].flatMap(([key, kinds]) => [...kinds].map(([kind, ep]) => ({ key, kind, ep })))
     byKey.clear()
+    counts.clear()
     for (const { key, kind, ep } of closing) dispose(key, kind, ep)
   }
 
@@ -583,7 +618,31 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
       }
     },
 
+    count: (key, kind) => counts.get(key)?.get(kind) ?? 0,
+
+    addCount(key, kind) {
+      let kinds = counts.get(key)
+      if (kinds === undefined) {
+        kinds = new Map()
+        counts.set(key, kinds)
+      }
+      const next = (kinds.get(kind) ?? 0) + 1
+      kinds.set(kind, next)
+      return next
+    },
+
+    resetCount(key, kind) {
+      const kinds = counts.get(key)
+      const prior = kinds?.get(kind) ?? 0
+      if (kinds !== undefined) {
+        kinds.delete(kind)
+        if (kinds.size === 0) counts.delete(key)
+      }
+      return prior
+    },
+
     forget(key) {
+      counts.delete(key)
       const kinds = byKey.get(key)
       if (kinds === undefined) return
       byKey.delete(key)

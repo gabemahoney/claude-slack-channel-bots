@@ -41,6 +41,13 @@
  * reconnect, kill, launch or accounting, and call the arm hook
  * (`RestartDeps.armRetryTimer`); so does an `unknown` re-probe after an
  * 'escalate-dead' reconnect (b.d61).
+ * A row the reconnect's escalate-dead sweep leaves live may stay live for
+ * further ticks (b.jg5 SRJ-610): its re-probe then reads `live`, the run ends
+ * with no kill, launch or accounting, and each later escalate-dead tick
+ * sweeps again with no step beyond the sweep. The optional slow-recovery
+ * observer (`RestartDeps.slowRecovery`) is told each run's readings and
+ * verdicts, so the server counts such re-probes and posts SRJ-1010 once per
+ * episode after the third in a row.
  * The work answers an outcome (`RestartWorkOutcome`, one of the
  * `RESTART_OUTCOME_*` labels); the restart timer ignores it. The retry entry,
  * `runRestartRetry`, is how the UNAVAILABLE retry timer's retries rerun the
@@ -83,8 +90,10 @@ import { describeThrownValue } from './persona-connection-errors.ts'
 import { runInAttempt } from './unavailable-retry.ts'
 import {
   LIVENESS_DEAD,
+  LIVENESS_LIVE,
   LIVENESS_PENDING,
   LIVENESS_UNKNOWN,
+  isInstallGoneDeadReading,
   launchStartOfReading,
   livenessKindOf,
   pendingLivenessReading,
@@ -363,6 +372,61 @@ export interface RestartDeps {
    * what it threw); any other answer is not. Absent: no persona is latched.
    */
   isLatched?(key: string): boolean
+  /**
+   * The slow-recovery observer (b.jg5 SRJ-610, SRJ-1016; production: the
+   * server's slow-recovery tracker, `src/slow-recovery.ts`). It is told what
+   * each run read, after the gates that follow each probe (shutdown, not up,
+   * latched) have passed, so a run those gates stop tells it nothing:
+   * - after an 'escalate-dead' reconnect, the re-probe reports once: `live`
+   *   → `noteLive`; `pending` → `noteOther` with
+   *   `RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE`; `dead` from a row read
+   *   (`ended`, `missing`, `ErrSpawnNotFound`) → `noteDead`, and `dead` from
+   *   `ErrSystemInstallDisappeared` (`isInstallGoneDeadReading`) →
+   *   `noteInstallGone`, each before the same run's kill and relaunch;
+   *   `unknown` or a thrown probe → nothing; a persona latched by that read
+   *   → nothing (the latch's own end applies);
+   * - at the run's first liveness probe, `dead` from a row read →
+   *   `noteDead`, and `dead` from `ErrSystemInstallDisappeared` →
+   *   `noteInstallGone`;
+   * - a run whose reconnect ends with any verdict other than 'escalate-dead'
+   *   (a success, 'transient', 'pending', no answer or a reconnect that
+   *   throws) → `noteOther` with `RESTART_SLOW_RECOVERY_OTHER_VERDICT`;
+   * - a run that stops before the reconnect for any other reason (an
+   *   `unknown` or `pending` first probe, a session already connected, a
+   *   latch, a launch in flight, shutdown, not up) → nothing.
+   * After a live re-probe nothing else changes: no kill, no launch and no
+   * accounting; the next escalate-dead tick sweeps again through the
+   * reconnect adapter's ordinary sweep. A note that throws is logged and
+   * changes nothing else. Absent: nothing is told, and the work behaves the
+   * same.
+   */
+  slowRecovery?: RestartSlowRecoveryObserver
+}
+
+/** `RestartSlowRecoveryObserver.noteOther`'s reason: a run whose reconnect ended with a verdict other than 'escalate-dead'. */
+export const RESTART_SLOW_RECOVERY_OTHER_VERDICT = 'other-verdict'
+/** `RestartSlowRecoveryObserver.noteOther`'s reason: an 'escalate-dead' verdict whose re-probe read `pending` (not counted, b.jg5 SRJ-610). */
+export const RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE = 'pending-reprobe'
+
+/** Why the restart work told the slow-recovery observer `noteOther`. */
+export type SlowRecoveryOtherReason =
+  | typeof RESTART_SLOW_RECOVERY_OTHER_VERDICT
+  | typeof RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE
+
+/**
+ * What the restart work tells about each run, for the slow dead-session
+ * recovery count (b.jg5 SRJ-610; `RestartDeps.slowRecovery` says when).
+ * Answers are ignored.
+ */
+export interface RestartSlowRecoveryObserver {
+  /** An 'escalate-dead' verdict whose re-probe reads the row `live`. */
+  noteLive(key: string): unknown
+  /** A row read of `ended` or `missing`, or no row (`ErrSpawnNotFound`). */
+  noteDead(key: string): unknown
+  /** The `dead` reading from `ErrSystemInstallDisappeared`, which reads no row. */
+  noteInstallGone(key: string): unknown
+  /** A run whose reconnect ended with another verdict, or an 'escalate-dead' verdict whose re-probe read `pending`. */
+  noteOther(key: string, reason: SlowRecoveryOtherReason): unknown
 }
 
 /** What `RestartDeps.reconnectSession` answers; `void` is a non-success. */
@@ -666,6 +730,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     return RESTART_OUTCOME_PENDING_DEFERRED
   }
 
+  // b.jg5 SRJ-610: a `dead` first probe resets the slow-recovery count; a
+  // row read of `ended`, `missing` or no row also ends its episode.
+  if (probe.kind === LIVENESS_DEAD) noteDeadReading(d, key, probe)
+
   // `live` takes the reconnect path; only `dead` falls through to the kill
   // and the launch.
   if (probe.kind !== LIVENESS_DEAD) {
@@ -687,6 +755,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
       console.error(`[slack] restart: reconnectSession failed for persona=${key}: ${describeThrownValue(err)}`)
       reconnectResult = undefined
     }
+
+    // b.jg5 SRJ-610: a run whose reconnect ends with any verdict other than
+    // 'escalate-dead' resets the slow-recovery count.
+    if (reconnectResult !== 'escalate-dead') tellSlowRecovery(d, key, 'noteOther', RESTART_SLOW_RECOVERY_OTHER_VERDICT)
 
     if (reconnectResult === 'success') {
       // Reconnect succeeded — reset the failure counter and cap latch.
@@ -719,24 +791,28 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // adapter fires the internal memoized findMissing sweep before returning,
     // which may reconcile the frozen `working` row to `missing`. It may also
     // leave the row live (in `unverified_ids`, or, when `pending`, not judged
-    // at all, b.jg5 SRJ-120), and the row then stays live for further ticks.
-    // After a run the sweep makes, each configured persona's own row left in
-    // `unverified_ids` is read with one `get`, and only a
+    // at all, b.jg5 SRJ-120), and the row may then stay live for further
+    // ticks: nothing promises that the re-probe or any later tick reads it
+    // dead. After a run the sweep makes, each configured persona's own row
+    // left in `unverified_ids` is read with one `get`, and only a
     // `provenance_conflict` note there latches (b.jg5 SRJ-114, SRJ-120). The
     // latch is asked right after the 'escalate-dead' verdict, before the
     // re-probe, so a persona latched that way gets no further agent-director
     // call in this run (b.jg5 SRJ-502); it is asked again right before the
-    // kill below. b.d61: rather than
-    // wait for the next tick (a full health interval plus another backoff
-    // delay), this run probes liveness again and, when the row now reads
-    // `dead`, falls through to the kill+relaunch branch below at once, with
-    // the same accounting as any dead-session relaunch. When the row still
-    // reads live or `pending` (e.g. the sweep failed, left the row live, or a
-    // memoized result predates the kill), it returns as before and a later
-    // tick retries; when the re-probe reads `unknown` (b.jg5 SRJ-314), it
-    // returns with no relaunch and the arm hook is called. The external
-    // ~/startup/find-missing-loop.sh is belt-and-braces only — recovery no
-    // longer depends on it, and removing it is a separate operator decision.
+    // kill below. b.d61: this run probes liveness again and, when the row
+    // now reads `dead`, falls through to the kill+relaunch branch below at
+    // once, with the same accounting as any dead-session relaunch. When the
+    // row still reads `live` (the sweep failed, left the row live, or a
+    // memoized result predates the kill), the run ends with no kill, launch
+    // or accounting, and each later escalate-dead tick sweeps again through
+    // the adapter's ordinary sweep, with no step beyond it (b.jg5 SRJ-610):
+    // the slow-recovery observer counts such re-probes, and the third in a
+    // row posts SRJ-1010 once per episode. A `pending` re-probe returns with
+    // no relaunch and resets that count; an `unknown` one (b.jg5 SRJ-314)
+    // returns with no relaunch, calls the arm hook and leaves the count as it
+    // is. The external ~/startup/find-missing-loop.sh is belt-and-braces only
+    // — recovery no longer depends on it, and removing it is a separate
+    // operator decision.
     if (reconnectResult === 'pending') return RESTART_OUTCOME_PENDING_DEFERRED
     if (reconnectResult !== 'escalate-dead') return RESTART_OUTCOME_RECONNECT_DEFERRED
     // b.jg5 SRJ-502: the adapter's sweep may have latched the persona (a
@@ -836,21 +912,34 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
 
 /**
  * b.d61: after an 'escalate-dead' reconnect verdict (whose adapter already ran
- * the findMissing sweep), probe the persona's liveness again. Returns
+ * the findMissing sweep), probe the persona's liveness again. A swept row may
+ * stay live for further ticks (b.jg5 SRJ-610): nothing promises this re-probe
+ * or a later one reads it dead. Returns
  * undefined only when the row now reads `dead` and this restart run should go
  * on to the kill+relaunch branch; otherwise the outcome the run returns with,
  * with no relaunch (b.jg5 SRJ-314): `RESTART_OUTCOME_RECONNECT_DEFERRED` (the
- * row still reads `live`, so the next tick retries),
+ * row still reads `live`: no kill, launch or accounting; each later
+ * escalate-dead tick sweeps again, and the slow-recovery observer counts the
+ * reading, the third in a row posting SRJ-1010 once per episode),
  * `RESTART_OUTCOME_PENDING_DEFERRED` (the row reads `pending`: its session
  * has not started), `RESTART_OUTCOME_LIVENESS_UNKNOWN` (the re-probe read
  * `unknown` or threw: agent-director could not report on the persona, and the
  * arm hook is called), `RESTART_OUTCOME_SHUTTING_DOWN`,
- * `RESTART_OUTCOME_NOT_UP`, or `RESTART_OUTCOME_LATCHED` when the persona is
+ * `RESTART_OUTCOME_NOT_UP`, `RESTART_OUTCOME_RECONNECT_DEFERRED` as well for a
+ * reading of a kind none of its cases names (no relaunch, nothing told to the
+ * slow-recovery observer; the switch's `never` check makes a new kind fail
+ * the typecheck), or `RESTART_OUTCOME_LATCHED` when the persona is
  * latched after the re-probe (its own read latched it, b.jg5 SRJ-512, SRJ-513, or a
  * latch set elsewhere): then the arm hook is not called. Shutdown and the not-up gate are asked after the
  * probe, since it is an async agent-director call; `killSession`'s
  * launch-in-flight guard and `launchSession`'s own gate still apply after it.
- * Records no success or failure.
+ * Records no success or failure. Once those gates pass, the reading is told
+ * to the slow-recovery observer (`RestartDeps.slowRecovery`): `live` counts,
+ * `pending` resets the count, `dead` resets it (a row read also ends the
+ * episode, `ErrSystemInstallDisappeared` leaves it open), and `unknown` is
+ * not told. Each reading's line is exported (`reprobeDeadLine`,
+ * `reprobeLiveLine`, `reprobePendingLine`, `reprobeUnknownLine`,
+ * `reprobeUnhandledLine`).
  */
 async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<RestartWorkOutcome | undefined> {
   const probe = await probeLiveness(d, key)
@@ -868,19 +957,70 @@ async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<Re
 
   switch (probe.kind) {
     case LIVENESS_DEAD:
-      console.error(`[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run for persona=${key} (b.d61)`)
+      console.error(reprobeDeadLine(key))
+      noteDeadReading(d, key, probe)
       return undefined
     case LIVENESS_UNKNOWN:
-      console.error(`[slack] Liveness unknown after escalate-dead for persona=${key}${probeFailure(probe)} — no relaunch in this restart run; nothing counted`)
+      // b.jg5 SRJ-610: neither counts nor resets the slow-recovery count.
+      console.error(reprobeUnknownLine(key, probe.failure))
       armOnUnknown(d, key)
       return RESTART_OUTCOME_LIVENESS_UNKNOWN
     case LIVENESS_PENDING:
-      console.error(`[slack] Session reads pending after escalate-dead — its session has not started; no relaunch in this restart run for persona=${key}`)
+      console.error(reprobePendingLine(key))
+      tellSlowRecovery(d, key, 'noteOther', RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE)
       return RESTART_OUTCOME_PENDING_DEFERRED
-    default:
-      console.error(`[slack] Session still reads alive after escalate-dead — leaving the relaunch to a later tick for persona=${key}`)
+    case LIVENESS_LIVE:
+      console.error(reprobeLiveLine(key))
+      tellSlowRecovery(d, key, 'noteLive')
       return RESTART_OUTCOME_RECONNECT_DEFERRED
+    default: {
+      // Every reading kind is handled above, so `probe.kind` is `never` here
+      // and a new kind fails the typecheck. At runtime a kind none of the
+      // cases names relaunches nothing and is not told to the slow-recovery
+      // observer: the run ends as a deferral, never with `undefined` (which
+      // would take the kill+relaunch branch).
+      const unhandled: never = probe.kind
+      console.error(reprobeUnhandledLine(key, unhandled))
+      return RESTART_OUTCOME_RECONNECT_DEFERRED
+    }
   }
+}
+
+/**
+ * The re-probe's line when its reading has a kind none of the cases names:
+ * no relaunch in this run and nothing noted. `kind` is that reading's kind,
+ * as `String` renders it.
+ */
+export function reprobeUnhandledLine(key: string, kind: unknown): string {
+  return `[slack] Session re-probe after escalate-dead read an unhandled kind "${String(kind)}" — no relaunch in this restart run for persona=${key}; nothing noted`
+}
+
+/** The re-probe's line when the row reads `dead` after an 'escalate-dead' verdict (b.d61): the same run relaunches. */
+export function reprobeDeadLine(key: string): string {
+  return `[slack] Session reads dead after escalate-dead reconciliation — relaunching in this restart run for persona=${key} (b.d61)`
+}
+
+/**
+ * The re-probe's line when the row still reads `live` after an
+ * 'escalate-dead' verdict (b.jg5 SRJ-610): no relaunch in this run, and the
+ * row may stay live for further ticks, each of which sweeps again.
+ */
+export function reprobeLiveLine(key: string): string {
+  return `[slack] Session still reads live after escalate-dead — no relaunch in this restart run for persona=${key}; the row may stay live for further ticks, each escalate-dead tick sweeping again`
+}
+
+/** The re-probe's line when the row reads `pending` after an 'escalate-dead' verdict (b.jg5 SRJ-314). */
+export function reprobePendingLine(key: string): string {
+  return `[slack] Session reads pending after escalate-dead — its session has not started; no relaunch in this restart run for persona=${key}`
+}
+
+/**
+ * The re-probe's line when it reads `unknown` after an 'escalate-dead'
+ * verdict (b.jg5 SRJ-314); `failure` is what a probe that threw threw, as
+ * `describeThrownValue` renders it, absent when the probe answered.
+ */
+export function reprobeUnknownLine(key: string, failure?: string): string {
+  return `[slack] Liveness unknown after escalate-dead for persona=${key}${probeFailure({ failure })} — no relaunch in this restart run; nothing counted`
 }
 
 /**
@@ -891,6 +1031,8 @@ interface LivenessProbe {
   readonly kind: LivenessKind
   /** `describeThrownValue` of what the probe threw; absent when it answered. */
   readonly failure?: string
+  /** True for the `dead` reading from `ErrSystemInstallDisappeared`, which reads no row (`isInstallGoneDeadReading`). */
+  readonly installGone?: true
   /** A `pending` reading's launch start (raw); absent for any other reading, or when it showed none. */
   readonly launchStartedAt?: string
 }
@@ -909,6 +1051,7 @@ async function probeLiveness(d: RestartDeps, key: string): Promise<LivenessProbe
     return { kind: LIVENESS_UNKNOWN, failure: describeThrownValue(err) }
   }
   const kind = livenessKindOf(reading)
+  if (isInstallGoneDeadReading(reading)) return { kind, installGone: true }
   const launchStartedAt = launchStartOfReading(reading)
   return launchStartedAt === undefined ? { kind } : { kind, launchStartedAt }
 }
@@ -929,8 +1072,39 @@ function deferPending(d: RestartDeps, key: string, probe: LivenessProbe): void {
 }
 
 /** ` (isSessionAlive failed: <why>)` for a probe that threw, else empty: the part of an unknown line that names the failure. */
-function probeFailure(probe: LivenessProbe): string {
+function probeFailure(probe: Pick<LivenessProbe, 'failure'>): string {
   return probe.failure === undefined ? '' : ` (isSessionAlive failed: ${probe.failure})`
+}
+
+/**
+ * Tell the slow-recovery observer (`RestartDeps.slowRecovery`) a `dead`
+ * reading (b.jg5 SRJ-610): `noteInstallGone` for one from
+ * `ErrSystemInstallDisappeared`, `noteDead` for a row read. Never throws.
+ */
+function noteDeadReading(d: RestartDeps, key: string, probe: LivenessProbe): void {
+  if (probe.installGone === true) tellSlowRecovery(d, key, 'noteInstallGone')
+  else tellSlowRecovery(d, key, 'noteDead')
+}
+
+/**
+ * Call one note of the slow-recovery observer for persona `key` (b.jg5
+ * SRJ-610). Absent, nothing is told. A note that throws is logged; never
+ * throws.
+ */
+function tellSlowRecovery(
+  d: RestartDeps,
+  key: string,
+  note: 'noteLive' | 'noteDead' | 'noteInstallGone' | 'noteOther',
+  reason?: SlowRecoveryOtherReason,
+): void {
+  const observer = d.slowRecovery
+  if (observer === undefined) return
+  try {
+    if (note === 'noteOther') observer.noteOther(key, reason ?? RESTART_SLOW_RECOVERY_OTHER_VERDICT)
+    else observer[note](key)
+  } catch (err) {
+    console.error(`[slack] restart: the slow-recovery ${note} failed for persona=${key}: ${describeThrownValue(err)}`)
+  }
 }
 
 /**
