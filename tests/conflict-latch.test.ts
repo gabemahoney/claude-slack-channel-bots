@@ -349,11 +349,8 @@ import { decideOwnRowRead, ROW_READ_LAUNCH_START_NOT_RECORDED, ROW_READ_NO_DECIS
 import {
   _resetNotConnectedEpisodes,
   _resetTmuxCommandRunner,
-  _resetTmuxDialogHelpers,
   _resetTmuxSessionProber,
-  _setTmuxCapturePane,
   _setTmuxCommandRunner,
-  _setTmuxSendEnter,
   _setTmuxSessionKiller,
   _setTmuxSessionProber,
   isLaunchInFlight,
@@ -1719,7 +1716,6 @@ afterEach(() => {
   // The raw tmux seams a case records (`recordRawTmux`); the harness puts back the killer and the ensurer.
   _resetTmuxCommandRunner()
   _resetTmuxSessionProber()
-  _resetTmuxDialogHelpers()
   for (const h of built) {
     try {
       assertNoLeak(h.captured())
@@ -2131,9 +2127,11 @@ interface RawTmuxCall {
 
 /**
  * Replace every raw tmux seam of the session manager (the command runner,
- * the session prober, the pane reader, the Enter sender and the session
- * killer) with a recorder that runs nothing; `afterEach` and the harness's
- * `cleanup()` put them back. Answers the recorded calls, in order.
+ * the session prober and the session killer) with a recorder that runs
+ * nothing; `afterEach` and the harness's `cleanup()` put them back. Answers
+ * the recorded calls, in order. The startup-dialog approver has no raw tmux
+ * seam: its pane reads and keys go through the stub client's `readPane` and
+ * `sendKeys`, which `tmuxTouchingCallsIn` counts.
  */
 function recordRawTmux(): RawTmuxCall[] {
   const calls: RawTmuxCall[] = []
@@ -2145,13 +2143,6 @@ function recordRawTmux(): RawTmuxCall[] {
   _setTmuxSessionProber(async (name) => {
     record('prober', name)
     return false
-  })
-  _setTmuxCapturePane(async (name) => {
-    record('capture-pane', name)
-    return ''
-  })
-  _setTmuxSendEnter(async (name) => {
-    record('send-enter', name)
   })
   _setTmuxSessionKiller(async (name) => {
     record('killer', name)

@@ -144,9 +144,19 @@
  *     next start doesn't kill it again.
  *   - b.1ix raw tmux: through the tmux runner seam (`_setTmuxCommandRunner`,
  *     a failing stand-in by default, so no test reaches a real tmux server),
- *     the b.vub kill, the approver's raw pane read and Enter and the liveness
- *     probe target the persona's own session exactly, never a prefix
- *     neighbour (`slack_bot_dev` / `slack_bot_dev_2`).
+ *     the b.vub kill and the liveness probe target the persona's own session
+ *     exactly, never a prefix neighbour (`slack_bot_dev` / `slack_bot_dev_2`).
+ *   - b.4ie / b.jg5 SRJ-402 startup-dialog approver, through agent-director
+ *     only, on a fake clock (`_setApproverClock`, `useApproverClock`): a
+ *     fresh or resumed row reading `pending` with either dialog is cleared
+ *     with one `readPane` (40 lines, `allow_pending`) and one `sendKeys`
+ *     (empty text, `allow_pending`) on the persona's instance, and a
+ *     recording tmux runner records no call (AC 34, AC 48); `ended` or
+ *     `missing` at the first lap stops it at once with no pane read, the
+ *     spawn-died entry written once for a start-pass launch only and the
+ *     launch result unchanged; a row leaving `pending` for `missing` between
+ *     laps (b.dup) stops it at the next lap; the cap, the restart path's
+ *     silence and the redacted error lines (AC 20).
  *   - b.av2 SR-6.1 start: `startupSessionManager` with `bringUp` (a persona
  *     not brought up is counted apart; every Slack bring-up runs at once and
  *     only the launches share the pool, in readiness order; a launch that
@@ -268,15 +278,26 @@ import {
   _resetTmuxServerEnsurer,
   _setTmuxSessionProber,
   _resetTmuxSessionProber,
-  _setTmuxCapturePane,
-  _setTmuxSendEnter,
-  _resetTmuxDialogHelpers,
   _setTmuxCommandRunner,
   _resetTmuxCommandRunner,
   hasPersonaTmuxSession,
   type TmuxCommandRunner,
-  _setDialogDeadGracePolls,
-  _resetDialogDeadGracePolls,
+  _setApproverClock,
+  _resetApproverClock,
+  DIALOG_POLL_INTERVAL_MS,
+  APPROVER_LOG_PREFIX,
+  APPROVER_PANE_LINES,
+  APPROVER_STOP_CAP,
+  APPROVER_STOP_FINISHED,
+  APPROVER_STOP_LIVE,
+  STARTUP_ERROR_APPROVE_NOT_READY,
+  STARTUP_ERROR_APPROVE_SPAWN_DIED,
+  approverCapMessage,
+  approverFinishedMessage,
+  approverLogLine,
+  approverPaneCallFailedMessage,
+  approverStatusRefusedMessage,
+  type ApproverStopReason,
   _setSpawnHomeDir,
   _resetSpawnHomeDir,
   checkLaunchConfigDir,
@@ -703,10 +724,6 @@ beforeEach(() => {
   const defaultHome = fixtureSubdir('default-home')
   mkdirSync(join(defaultHome, '.claude'))
   _setSpawnHomeDir(defaultHome)
-  // Default the raw-tmux dialog seams to safe no-ops so unit tests never shell
-  // out to real tmux (b.vub). Dead-row tests override these to drive behavior.
-  _setTmuxCapturePane(async () => '')
-  _setTmuxSendEnter(async () => {})
   // Default the b.3ce timeout-liveness prober to "alive" so unit tests never
   // shell out to real tmux and the timeout verdict stays 'ok' unless a test
   // explicitly drives the dead-session path.
@@ -726,9 +743,9 @@ afterEach(() => {
   _resetTmuxSessionKiller()
   _resetTmuxServerEnsurer()
   _resetTmuxSessionProber()
-  _resetTmuxDialogHelpers()
   _resetTmuxCommandRunner()
-  _resetDialogDeadGracePolls()
+  // An approver case runs the approver on a fake clock (`useApproverClock`).
+  _resetApproverClock()
   _resetOutageState()
   _resetSpawnHomeDir()
   _resetInFlightLaunches()
@@ -887,6 +904,79 @@ async function pollUntil(cond: () => boolean, ms = 2_000): Promise<void> {
 /** Let fire-and-forget notice posts (and their rejection handlers) settle. */
 async function settleNotices(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+/**
+ * Run the startup-dialog approver on a fresh fake clock for this test
+ * (`_setApproverClock`; the file's afterEach restores the real clock), at its
+ * real pace (`DIALOG_POLL_INTERVAL_MS`) and its real cap
+ * (`DIALOG_READY_TIMEOUT_MS`) unless the case sets a shorter one. Every
+ * approver case settles its call with `runOnApproverClock`, never on real
+ * time.
+ */
+function useApproverClock(): FakeClock {
+  const clock = createFakeClock()
+  _setApproverClock(clock)
+  _resetDialogPollIntervalMs()
+  _resetDialogReadyTimeoutMs()
+  return clock
+}
+
+/** Most event-loop turns `runOnApproverClock` gives a call to settle. */
+const APPROVER_DRIVE_TURNS = 5_000
+
+/**
+ * Settle `work` (an approver call, or a launch that awaits one) on `clock`,
+ * the approver's clock (`useApproverClock`). Virtual time moves only while
+ * the approver sleeps between laps, that is while a timer besides its cap is
+ * pending, and then by one `runNext` (the next lap, or the cap when that is
+ * due first). Between steps it yields one event-loop turn, so a launch's own
+ * file I/O before the approver starts goes on. Fails the test when `work`
+ * has not settled after `APPROVER_DRIVE_TURNS` turns.
+ */
+async function runOnApproverClock<T>(clock: FakeClock, work: Promise<T>): Promise<T> {
+  let settled = false
+  work.then(
+    () => { settled = true },
+    () => { settled = true },
+  )
+  for (let turn = 0; !settled && turn < APPROVER_DRIVE_TURNS; turn++) {
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    if (!settled && clock.pendingCount() >= 2) await clock.runNext()
+  }
+  if (!settled) throw new Error(`the approver did not stop within ${APPROVER_DRIVE_TURNS} event-loop turns (virtual time ${clock.now()} ms)`)
+  return work
+}
+
+/**
+ * Record every raw tmux call from now on, in order: each command through the
+ * runner seam (`_setTmuxCommandRunner`, answering as the file's failing
+ * stand-in does) as its argv, and the session prober, killer and server
+ * ensurer as `[<seam>, <session>]`. The file's afterEach puts every seam
+ * back. The startup-dialog approver makes none of these calls.
+ */
+function recordTmuxCalls(): string[][] {
+  const calls: string[][] = []
+  _setTmuxCommandRunner(async (args) => {
+    calls.push([...args])
+    return { code: 1, stdout: '' }
+  })
+  _setTmuxSessionProber(async (name) => {
+    calls.push(['prober', name])
+    return true
+  })
+  _setTmuxSessionKiller(async (name) => {
+    calls.push(['killer', name])
+  })
+  _setTmuxServerEnsurer(async () => {
+    calls.push(['ensurer'])
+  })
+  return calls
+}
+
+/** A `status` answer through the stub's canned builder: a `pending` row carries the sample launch start. */
+function statusReads(...states: string[]): CannedResponse<Phase1StatusResult>[] {
+  return states.map((state) => cannedOk(cannedStatusResult({ state })))
 }
 
 /**
@@ -7956,33 +8046,44 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
     expect(notices).toEqual([])
   })
 
-  // Audit, no change: the dialog approver presses Enter through agent-director
-  // only while the row reads `pending`, and treats a failed send-keys as a
-  // no-op. When the row was ended between its status poll and its Enter, the
-  // next poll reads it `missing` and presses Enter through raw tmux instead.
-  test('the dialog approver\'s Enter refused because the row just left pending for missing: the next poll presses Enter through raw tmux; no notice, no startup error', async () => {
+  // The dialog approver presses Enter through agent-director only, and a
+  // refused send-keys is one log line, then the next lap. When the row was
+  // ended between its status read and its Enter, the next lap reads it
+  // `missing` and the approver stops there (b.jg5 SRJ-402): no pane read and
+  // no tmux call; a start-pass launch writes the spawn-died entry once.
+  test('the dialog approver\'s Enter refused because the row just left pending for missing: the next lap reads missing and stops the approver with no pane read and no tmux call; one refused-Enter line; no notice; the spawn-died entry once', async () => {
+    const clock = useApproverClock()
+    const tmux = recordTmuxCalls()
     const readLog = captureStartupErrors()
+    const ref = renderPersonaRef('C', 'C')
+    const refused = errSpawnNotInteractive('send-keys')
+    const statusCalls: import('agent-director').StatusParams[] = []
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    const rawEntered: string[] = []
-    _setTmuxCapturePane(async () => DEV_CHANNELS_DIALOG_PANE)
-    _setTmuxSendEnter(async (name) => { rawEntered.push(name) })
     installStub({
+      statusCalls,
+      readPaneCalls,
       sendKeysCalls,
-      sendKeysError: errSpawnNotInteractive('send-keys'),
+      sendKeysError: refused,
       readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
-      statusQueue: [
-        cannedOk({ state: 'pending' }),
-        cannedOk({ state: 'missing' }),
-        cannedOk({ state: 'waiting' }),
-      ],
+      statusQueue: statusReads('pending', 'missing', 'waiting'),
     })
 
-    await approvePreSessionDialogs('C', true)
+    let stop: ApproverStopReason | undefined
+    const errLog = await withCapturedErr(async () => {
+      stop = await runOnApproverClock(clock, approvePreSessionDialogs('C', true, ref))
+    })
 
-    expect(sendKeysCalls).toEqual([{ claude_instance_id: 'cscb_C', text: '', allow_pending: true }])
-    expect(rawEntered).toEqual(['slack_bot_C'])
+    expect(stop).toBe(APPROVER_STOP_FINISHED)
+    // Stopped at the next lap: one sleep between the two reads, no third read.
+    expect(statusCalls).toHaveLength(2)
+    expect(clock.now()).toBe(DIALOG_POLL_INTERVAL_MS)
+    expect(readPaneCalls).toHaveLength(1)
+    expect(sendKeysCalls).toEqual([{ claude_instance_id: personaInstanceId('C'), text: '', allow_pending: true }])
+    expect(tmux).toEqual([])
     expect(notices).toEqual([])
-    expect(readLog()).toBe('')
+    expect(linesWith(errLog, approverLogLine(approverPaneCallFailedMessage(ref, 'send-keys', describeAgentDirectorFailure(refused))))).toHaveLength(1)
+    expect(onlyStartupEntry(readLog(), STARTUP_ERROR_APPROVE_SPAWN_DIED)).toContain(approverFinishedMessage(ref, 'missing'))
   })
 })
 
@@ -8488,7 +8589,19 @@ describe('SR-8.6 invariants', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.4ie — merged approvePreSessionDialogs (dev-channels + trust needle)
+// b.4ie — merged approvePreSessionDialogs (dev-channels + trust needle),
+// through agent-director only (b.jg5 SRJ-402)
+//
+// Each lap reads the persona's row with `status`; on `pending` with a launch
+// start it reads the pane once (`readPane`, 40 lines, `allow_pending`) and,
+// when a needle shows, presses Enter once (`sendKeys`, empty text,
+// `allow_pending`); a live state stops it; `ended` or `missing` stops it at
+// that lap with no pane read, and a start-pass launch writes the spawn-died
+// entry. A launch, fresh or resumed, reads `pending` until it reports in
+// (HO C5), so the server runs no tmux command for it. In this Task the
+// approver still runs inside the launch. Every approver case runs it on a fake
+// clock (`useApproverClock`, `runOnApproverClock`) and installs `pending`
+// answers through the stub's canned builder, so each carries a launch start.
 // ---------------------------------------------------------------------------
 
 describe('approvePreSessionDialogs (b.4ie)', () => {
@@ -8497,48 +8610,47 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     'utf-8',
   )
   const WELCOME_PANE = 'Listening for channel messages from: server:slack-channel-router'
+  const C_ID = personaInstanceId('C')
+  const C_REF = renderPersonaRef('C', 'C')
+  /** The one pane read a lap makes. */
+  const PANE_READ: import('agent-director').ReadPaneParams = { claude_instance_id: C_ID, n_lines: APPROVER_PANE_LINES, allow_pending: true }
+  /** The one Enter a lap presses on a dialog. */
+  const ENTER: import('agent-director').SendKeysParams = { claude_instance_id: C_ID, text: '', allow_pending: true }
+
+  /** Capture lists for the approver's verbs and the ladder's resume. */
+  function approverCalls() {
+    return {
+      statusCalls: [] as import('agent-director').StatusParams[],
+      readPaneCalls: [] as import('agent-director').ReadPaneParams[],
+      sendKeysCalls: [] as import('agent-director').SendKeysParams[],
+      resumeCalls: [] as import('agent-director').ResumeParams[],
+    }
+  }
 
   // -------------------------------------------------------------------------
   // Happy path: dialog detected → Enter sent (via spawnForPersona, the SR-1.1
   // fresh-spawn path that calls approvePreSessionDialogs).
-  // statusQueue drives pending→waiting so the approver presses Enter then exits.
   // -------------------------------------------------------------------------
 
-  test('happy path: dialog detected → Enter sent (allow_pending true, id cscb_C)', async () => {
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+  test('happy path: a fresh spawn reading pending with the dialog: one readPane and one Enter (allow_pending, cscb_<key>), then the next lap reads waiting; no tmux call', async () => {
+    const clock = useApproverClock()
+    const tmux = recordTmuxCalls()
+    const calls = approverCalls()
     installStub({
-      sendKeysCalls,
-      readPaneCalls,
-      // pending → approver reads pane and presses Enter; then waiting → returns
-      statusQueue: [
-        cannedOk({ state: 'pending' }),
-        cannedOk({ state: 'waiting' }),
-      ],
-      readPaneResults: [
-        { pane: DEV_CHANNELS_PANE },
-        { pane: WELCOME_PANE },
-      ],
+      ...calls,
+      statusQueue: statusReads('pending', 'waiting'),
+      readPaneResults: [{ pane: DEV_CHANNELS_PANE }, { pane: WELCOME_PANE }],
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
-    expect(result.action).toBe('spawned')
-    expect(sendKeysCalls).toHaveLength(1)
-    expect(sendKeysCalls[0].text).toBe('')
-    expect(sendKeysCalls[0].claude_instance_id).toBe('cscb_C')
-    // readPane should have been invoked at least once while pending
-    expect(readPaneCalls.length).toBeGreaterThanOrEqual(1)
-    for (const r of readPaneCalls) {
-      expect(r.claude_instance_id).toBe('cscb_C')
-      expect(r.n_lines).toBe(40)
-      // b.98w: every readPane call must carry allow_pending=true
-      expect(r.allow_pending).toBe(true)
-    }
-    // b.98w: the sendKeys call that presses Enter must also carry allow_pending=true
-    for (const s of sendKeysCalls) {
-      expect(s.allow_pending).toBe(true)
-    }
+    const result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
+
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(calls.statusCalls).toEqual([{ claude_instance_id: C_ID }, { claude_instance_id: C_ID }])
+    expect(calls.readPaneCalls).toEqual([PANE_READ])
+    expect(calls.sendKeysCalls).toEqual([ENTER])
+    expect(tmux).toEqual([])
+    expect(clock.now()).toBe(DIALOG_POLL_INTERVAL_MS)
   })
 
   // -------------------------------------------------------------------------
@@ -8551,25 +8663,26 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Collision/skip tests — no approvePreSessionDialogs on collision paths
+  // The collision ladder
   // -------------------------------------------------------------------------
 
-  test('collision-resume path: approver runs but returns immediately when status is already live (no readPane)', async () => {
-    // b.vub: the resume-success path now calls approvePreSessionDialogs. When
-    // the resumed row is already live (default stub status='waiting'), the
-    // approver returns before ever reading the pane.
-    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+  test('collision-resume path: the approver stops at its first lap when the resumed row already reads a live state (no readPane)', async () => {
+    const clock = useApproverClock()
+    const calls = approverCalls()
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
-      readPaneCalls,
+      ...calls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
-      statusResult: { state: 'waiting' },
+      statusResult: cannedStatusResult({ state: 'waiting' }),
     })
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
-    expect(result.action).toBe('resumed')
-    expect(readPaneCalls).toHaveLength(0)
+    const result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
+
+    expect(result).toEqual({ key: 'C', action: 'resumed' })
+    expect(calls.statusCalls).toHaveLength(1)
+    expect(calls.readPaneCalls).toHaveLength(0)
+    expect(clock.firedCount()).toBe(0)
   })
 
   test('skipped on collision-reconnect path (waiting state → no readPane)', async () => {
@@ -8600,22 +8713,119 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     expect(readPaneCalls).toHaveLength(0)
   })
 
+  // AC 34, AC 48: a resumed launch reads `pending` until it reports in, like a
+  // fresh one, so its dialog is cleared through agent-director, never raw tmux.
+  test.each([
+    ['the development channels dialog', DEV_CHANNELS_DIALOG_PANE],
+    ['the folder trust dialog', TRUST_DIALOG_PANE],
+  ])('AC 34, AC 48: a collision on an ended row is resumed and the resumed row reads pending with %s: one readPane (40 lines, allow_pending) and one Enter (empty text, allow_pending) on P\'s instance only clear it, the next lap reads waiting; the recording tmux runner records no call', async (_label, pane) => {
+    const clock = useApproverClock()
+    const tmux = recordTmuxCalls()
+    const calls = approverCalls()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    installStub({
+      ...calls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
+      statusQueue: statusReads('pending', 'waiting'),
+      readPaneResults: [{ pane }, { pane: WELCOME_PANE }],
+    })
+
+    const result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
+
+    expect(result).toEqual({ key: 'C', action: 'resumed' })
+    expect(calls.resumeCalls).toEqual([{ claude_instance_id: C_ID }])
+    expect(calls.statusCalls).toEqual([{ claude_instance_id: C_ID }, { claude_instance_id: C_ID }])
+    expect(calls.readPaneCalls).toEqual([PANE_READ])
+    expect(calls.sendKeysCalls).toEqual([ENTER])
+    expect(tmux).toEqual([])
+  })
+
+  /** A launch of `C` whose approver then runs: the stub knobs that reach it and the result the launch answers. */
+  const LADDER_LAUNCHES: Array<[string, (cfg: PersonaConfig) => StubClientOptions, SpawnPersonaResult]> = [
+    ['a fresh spawn', () => ({}), { key: 'C', action: 'spawned' }],
+    [
+      'a resume at the collision ladder (its row read ended)',
+      (cfg) => ({
+        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+        getResult: personaRow(cfg, 'C', { state: 'ended' }),
+      }),
+      { key: 'C', action: 'resumed' },
+    ],
+  ]
+  const FINISHED_CROSS = (['ended', 'missing'] as const).flatMap((state) =>
+    LADDER_LAUNCHES.flatMap(([launch, knobs, result]) =>
+      ([['a start-pass launch', true], ['a restart-path launch', false]] as const).map(
+        ([pass, isStartup]) => [state, launch, pass, knobs, result, isStartup] as const,
+      ),
+    ),
+  )
+
+  // b.jg5 SRJ-402: `ended` or `missing` means the launch is over: the approver
+  // stops at that lap, at once (no streak, no sleep), with no pane read, and
+  // the restart path decides.
+  test.each(FINISHED_CROSS)('the row reads %s at the first lap after %s, during %s: the approver stops there at once with no pane read, no Enter, no further status and no tmux call; the spawn-died entry once for a start pass only; the launch result unchanged', async (state, _launch, _pass, knobs, result, isStartup) => {
+    const clock = useApproverClock()
+    const tmux = recordTmuxCalls()
+    const readLog = captureStartupErrors()
+    const calls = approverCalls()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    installStub({
+      ...calls,
+      ...knobs(cfg),
+      statusQueue: statusReads(state, 'pending', 'waiting'),
+      readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
+    })
+
+    let launched: SpawnPersonaResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      launched = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg, isStartup))
+    })
+
+    expect(launched).toStrictEqual(result)
+    expect(calls.statusCalls).toEqual([{ claude_instance_id: C_ID }])
+    expect(calls.readPaneCalls).toEqual([])
+    expect(calls.sendKeysCalls).toEqual([])
+    expect(tmux).toEqual([])
+    // At once: no timer fired and no virtual time passed.
+    expect(clock.firedCount()).toBe(0)
+    expect(clock.now()).toBe(0)
+    expect(clock.pendingCount()).toBe(0)
+    const finished = approverFinishedMessage(C_REF, state)
+    expect(linesWith(errLog, approverLogLine(finished))).toHaveLength(1)
+    const log = readLog()
+    if (isStartup) {
+      expect(onlyStartupEntry(log, STARTUP_ERROR_APPROVE_SPAWN_DIED)).toContain(finished)
+    } else {
+      expect(countStartupEntries(log, STARTUP_ERROR_APPROVE_SPAWN_DIED)).toBe(0)
+    }
+    expect(countStartupEntries(log, STARTUP_ERROR_APPROVE_NOT_READY)).toBe(0)
+    expect(notices).toEqual([])
+  })
+
   // -------------------------------------------------------------------------
   // isStartup=false path: no startup error recorded on cap hit
   // -------------------------------------------------------------------------
 
   test('launchSession (restart path, isStartup=false): does not record startup error on cap hit', async () => {
-    // sticky pending → cap hit; isStartup=false means no startup error
-    _setDialogReadyTimeoutMs(20)
+    const clock = useApproverClock()
+    const capMs = 4 * DIALOG_POLL_INTERVAL_MS
+    _setDialogReadyTimeoutMs(capMs)
     installStub({
-      statusResult: { state: 'pending' },
+      statusResult: cannedStatusResult({ state: 'pending' }),
       readPaneResults: [{ pane: 'unrelated' }],
     })
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, false)
 
-    expect(result.action).toBe('spawned')
+    let result: SpawnPersonaResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg, false))
+    })
+
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(clock.now()).toBe(capMs)
+    expect(linesWith(errLog, approverLogLine(approverCapMessage(C_REF, capMs)))).toHaveLength(1)
     expect(readLog()).toBe('')
   })
 
@@ -8624,6 +8834,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   // -------------------------------------------------------------------------
 
   test('b.98w / allow_pending: Enter pressed with allow_pending:true while spawn is pending', async () => {
+    const clock = useApproverClock()
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const readPaneCalls: import('agent-director').ReadPaneParams[] = []
 
@@ -8650,22 +8861,18 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       return {}
     }
 
-    // statusQueue: pending → (readPane+sendKeys fire) → waiting → exit
-    stub.status = async (_params: import('agent-director').StatusParams): Promise<import('agent-director').StatusResult> => {
-      const enterCount = sendKeysCalls.length
-      return { state: enterCount >= 1 ? 'waiting' : 'pending' }
-    }
+    // pending (with a launch start) → (readPane+sendKeys fire) → waiting → exit
+    stub.status = async (_params: import('agent-director').StatusParams): Promise<Phase1StatusResult> =>
+      cannedStatusResult({ state: sendKeysCalls.length >= 1 ? 'waiting' : 'pending' })
 
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    const result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
 
     // If allow_pending is present everywhere the spawn must complete cleanly.
     expect(result.action).toBe('spawned')
     // Exactly one sendKeys (the Enter key that dismisses the dialog).
-    const enterCalls = sendKeysCalls.filter((s) => s.text === '')
-    expect(enterCalls).toHaveLength(1)
-    // The sendKeys call must carry allow_pending:true
-    expect(enterCalls[0].allow_pending).toBe(true)
+    expect(sendKeysCalls).toEqual([ENTER])
+    expect(readPaneCalls).toEqual([PANE_READ])
   })
 
   // -------------------------------------------------------------------------
@@ -8674,231 +8881,97 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   // -------------------------------------------------------------------------
 
   test('b.ben: dialog approval addresses cscb_<key> for a persona whose key differs from its name', async () => {
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    const clock = useApproverClock()
+    const calls = approverCalls()
     installStub({
-      sendKeysCalls,
-      readPaneCalls,
-      statusQueue: [
-        cannedOk({ state: 'pending' }),
-        cannedOk({ state: 'waiting' }),
-      ],
-      readPaneResults: [
-        { pane: DEV_CHANNELS_PANE },
-        { pane: WELCOME_PANE },
-      ],
+      ...calls,
+      statusQueue: statusReads('pending', 'waiting'),
+      readPaneResults: [{ pane: DEV_CHANNELS_PANE }, { pane: WELCOME_PANE }],
     })
     const key = personaKey('My Chan')
     expect(key).not.toBe('My Chan')
     const cfg = makeMultiPersonaConfig([{ name: 'My Chan', working_directory: '/x' }], fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, key), cfg)
+    const result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, key), cfg))
 
     expect(result.action).toBe('spawned')
-    // Approver must address the persona's cscb_<key>.
-    expect(readPaneCalls.length).toBeGreaterThanOrEqual(1)
-    for (const r of readPaneCalls) {
-      expect(r.claude_instance_id).toBe(`cscb_${key}`)
-    }
-    expect(sendKeysCalls).toHaveLength(1)
-    expect(sendKeysCalls[0].claude_instance_id).toBe(`cscb_${key}`)
-    expect(sendKeysCalls[0].text).toBe('')
+    const id = personaInstanceId(key)
+    expect(calls.statusCalls).toEqual([{ claude_instance_id: id }, { claude_instance_id: id }])
+    expect(calls.readPaneCalls).toEqual([{ ...PANE_READ, claude_instance_id: id }])
+    expect(calls.sendKeysCalls).toEqual([{ ...ENTER, claude_instance_id: id }])
   })
 
   // -------------------------------------------------------------------------
   // New behavior tests for merged approver (b.4ie)
   // -------------------------------------------------------------------------
 
-  test('cap hit: sticky pending + unrecognized pane → records dev-channels-approve-not-ready, no sendKeys, posts a spawn-failure notice to the persona destination (isStartup=true)', async () => {
-    _setDialogReadyTimeoutMs(30)
+  test('cap hit: sticky pending + unrecognized pane → one lap per 500 ms until the cap, the not-ready startup entry once, no sendKeys, posts a spawn-failure notice to the persona destination (isStartup=true)', async () => {
+    const clock = useApproverClock()
+    const capMs = 4 * DIALOG_POLL_INTERVAL_MS
+    _setDialogReadyTimeoutMs(capMs)
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
     installStub({
       sendKeysCalls,
+      readPaneCalls,
       // sticky pending: never becomes live
-      statusResult: { state: 'pending' },
+      statusResult: cannedStatusResult({ state: 'pending' }),
       readPaneResults: [{ pane: 'unrelated pane text' }],
     })
     const readLog = captureStartupErrors()
     const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg)
-    await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
+    await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg))
     await settleNotices()
 
     expect(sendKeysCalls).toHaveLength(0)
-    const log = readLog()
-    expect(log).toContain('[dev-channels-approve-not-ready]')
-    expect(log).toContain(`for ${renderPersonaRef(NOTICE_NAME, NOTICE_KEY)} —`)
+    // One lap at each 500 ms step before the cap, measured from the approver's start.
+    expect(readPaneCalls).toHaveLength(capMs / DIALOG_POLL_INTERVAL_MS)
+    expect(clock.now()).toBe(capMs)
+    expect(onlyStartupEntry(readLog(), STARTUP_ERROR_APPROVE_NOT_READY)).toContain(
+      approverCapMessage(renderPersonaRef(NOTICE_NAME, NOTICE_KEY), capMs),
+    )
     // cap path must also raise the spawn-failure notice (core requirement of b.4ie)
     const text = expectOneNoticeToDestination(h)
     expect(text).toContain('Spawn failure:\n')
     expect(text).toContain('Error: `DialogApprovalTimeout`')
   })
 
-  test('dead state: sticky ended + no needle (grace exhausted) → records dev-channels-approve-spawn-died', async () => {
-    // b.vub: dead rows are driven via RAW tmux (AD refuses missing/ended panes).
-    // With no needle in the raw pane and the grace streak set to 1, the first
-    // ended poll exhausts the grace and records the death.
-    _setDialogDeadGracePolls(1)
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    let rawEnterCount = 0
-    _setTmuxCapturePane(async () => 'no needle here') // raw pane, no dialog
-    _setTmuxSendEnter(async () => { rawEnterCount += 1 })
-    installStub({
-      sendKeysCalls,
-      statusQueue: [
-        cannedOk({ state: 'pending' }),
-        cannedOk({ state: 'ended' }),
-      ],
-      readPaneResults: [{ pane: 'no needle here' }],
-    })
+  test('already-live: the first lap reads waiting → no readPane, no sendKeys, no startup error', async () => {
+    const clock = useApproverClock()
+    const calls = approverCalls()
+    installStub({ ...calls, statusQueue: statusReads('waiting') })
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
 
-    const log = readLog()
-    expect(log).toContain('[dev-channels-approve-spawn-died]')
-    // No needle anywhere → neither AD nor raw Enter was pressed.
-    expect(sendKeysCalls).toHaveLength(0)
-    expect(rawEnterCount).toBe(0)
-  })
-
-  test('already-live: statusQueue [waiting] → no readPane, no sendKeys, no startup error', async () => {
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
-    installStub({
-      sendKeysCalls,
-      readPaneCalls,
-      statusQueue: [cannedOk({ state: 'waiting' })],
-    })
-    const readLog = captureStartupErrors()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    await spawnForPersona(personaOf(cfg, 'C'), cfg)
-
-    expect(readPaneCalls).toHaveLength(0)
-    expect(sendKeysCalls).toHaveLength(0)
+    expect(calls.statusCalls).toHaveLength(1)
+    expect(calls.readPaneCalls).toHaveLength(0)
+    expect(calls.sendKeysCalls).toHaveLength(0)
     expect(readLog()).toBe('')
   })
 
-  test('self-heal: statusQueue [pending, pending, waiting] + sticky dialog → Enter pressed ≥2 times', async () => {
+  test('approvePreSessionDialogs answers live when the row leaves pending for a live state', async () => {
+    const clock = useApproverClock()
+    installStub({ statusQueue: statusReads('pending', 'working') })
+
+    expect(await runOnApproverClock(clock, approvePreSessionDialogs('C', true, C_REF))).toBe(APPROVER_STOP_LIVE)
+  })
+
+  test('self-heal: pending, pending, waiting + sticky dialog → Enter pressed once per pending lap', async () => {
+    const clock = useApproverClock()
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     installStub({
       sendKeysCalls,
-      statusQueue: [
-        cannedOk({ state: 'pending' }),
-        cannedOk({ state: 'pending' }),
-        cannedOk({ state: 'waiting' }),
-      ],
+      statusQueue: statusReads('pending', 'pending', 'waiting'),
       // sticky: every readPane returns the dialog needle
       readPaneResults: [{ pane: DEV_CHANNELS_PANE }],
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
 
     // Enter pressed each time the pane shows the needle while pending
-    expect(sendKeysCalls.length).toBeGreaterThanOrEqual(2)
-  })
-
-  // -------------------------------------------------------------------------
-  // b.vub — pane-first / state-tolerant: press Enter despite missing/ended
-  // -------------------------------------------------------------------------
-
-  test('b.vub: dead row (missing) with needle → RAW tmux Enter, NOT agent-director sendKeys', async () => {
-    // A resumed bot blocked at the dialog reports state=missing while the pane
-    // still shows the needle. agent-director REFUSES read-pane/send-keys on a
-    // missing row (ErrSpawnNotInteractive), so the approver must drive the
-    // dialog via raw tmux keyed on the deterministic session name.
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
-    const rawCaptured: string[] = []
-    const rawEntered: string[] = []
-    _setTmuxCapturePane(async (name) => { rawCaptured.push(name); return DEV_CHANNELS_PANE })
-    _setTmuxSendEnter(async (name) => { rawEntered.push(name) })
-    const readLog = captureStartupErrors()
-    installStub({
-      sendKeysCalls,
-      readPaneCalls,
-      // missing (raw needle → raw Enter) → then waiting → return
-      statusQueue: [
-        cannedOk({ state: 'missing' }),
-        cannedOk({ state: 'waiting' }),
-      ],
-    })
-
-    await approvePreSessionDialogs('C', true)
-
-    // Raw tmux was used, keyed on the deterministic session name.
-    expect(rawCaptured).toContain('slack_bot_C')
-    expect(rawEntered).toEqual(['slack_bot_C'])
-    // agent-director's interactive verbs were NOT used on the dead row.
-    expect(readPaneCalls).toHaveLength(0)
-    expect(sendKeysCalls).toHaveLength(0)
-    // Must NOT have recorded spawn-died — the needle was present, not dead.
-    expect(readLog()).not.toContain('[dev-channels-approve-spawn-died]')
-  })
-
-  test('b.vub: dead row (ended) with needle → RAW tmux Enter clears the dialog', async () => {
-    const rawEntered: string[] = []
-    _setTmuxCapturePane(async () => DEV_CHANNELS_PANE)
-    _setTmuxSendEnter(async (name) => { rawEntered.push(name) })
-    installStub({
-      statusQueue: [
-        cannedOk({ state: 'ended' }),
-        cannedOk({ state: 'waiting' }),
-      ],
-    })
-
-    await approvePreSessionDialogs('C', true)
-
-    expect(rawEntered).toEqual(['slack_bot_C'])
-  })
-
-  test('b.vub: dead row with NO needle in raw pane (grace exhausted) → terminal, no Enter', async () => {
-    // Without a needle in the RAW pane, a sticky missing row exhausts the grace
-    // streak and is recorded as dead — no stray Enter, AD verbs untouched.
-    _setDialogDeadGracePolls(1)
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    const rawEntered: string[] = []
-    _setTmuxCapturePane(async () => 'no needle here')
-    _setTmuxSendEnter(async (name) => { rawEntered.push(name) })
-    installStub({
-      sendKeysCalls,
-      statusResult: { state: 'missing' },
-    })
-    const readLog = captureStartupErrors()
-
-    await approvePreSessionDialogs('C', true)
-
-    expect(sendKeysCalls).toHaveLength(0)
-    expect(rawEntered).toHaveLength(0)
-    expect(readLog()).toContain('[dev-channels-approve-spawn-died]')
-  })
-
-  // -------------------------------------------------------------------------
-  // b.vub — resume-success path invokes the approver
-  // -------------------------------------------------------------------------
-
-  test('b.vub: resume-success path drives the dialog approver via RAW tmux (missing row)', async () => {
-    const resumeCalls: import('agent-director').ResumeParams[] = []
-    const rawEntered: string[] = []
-    _setTmuxCapturePane(async () => DEV_CHANNELS_PANE)
-    _setTmuxSendEnter(async (name) => { rawEntered.push(name) })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    installStub({
-      resumeCalls,
-      // fresh spawn collides → get=missing → resume succeeds → approver runs
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: personaRow(cfg, 'C', { state: 'missing' }),
-      // resumed bot is still `missing` while blocked at the dialog, then waiting
-      statusQueue: [
-        cannedOk({ state: 'missing' }),
-        cannedOk({ state: 'waiting' }),
-      ],
-    })
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-
-    expect(result.action).toBe('resumed')
-    expect(resumeCalls).toHaveLength(1)
-    // The approver ran on the resume path and dismissed the dialog via raw tmux.
-    expect(rawEntered).toEqual(['slack_bot_C'])
+    expect(sendKeysCalls).toEqual([ENTER, ENTER])
+    expect(clock.now()).toBe(2 * DIALOG_POLL_INTERVAL_MS)
   })
 
   // -------------------------------------------------------------------------
@@ -8995,11 +9068,11 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // AC 20 (b.av2 SR-10.3): the approver's status, readPane/sendKeys and
-  // raw-tmux error lines log describeThrownValue of the error (type, safe
-  // code or errName, redacted message, frames), never the error or its raw
-  // message. Each error carries fake tokens in its message and properties;
-  // every console.error argument is kept unformatted (errors whole).
+  // AC 20 (b.av2 SR-10.3): the approver's status and readPane/sendKeys error
+  // lines log describeAgentDirectorFailure of the error (type, safe code or
+  // errName, redacted message, frames), never the error or its raw message.
+  // Each error carries fake tokens in its message and properties; every
+  // console.error argument is kept unformatted (errors whole).
   // -------------------------------------------------------------------------
 
   /** An error at `site` whose message and properties carry fake tokens, with a safe code. */
@@ -9010,47 +9083,55 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       note: LEAK_SENTINEL,
     })
 
-  test.each<[string, () => void, string]>([
+  test.each<[string, () => { err: Error; opts: StubClientOptions }, (failure: string) => string, string]>([
     [
       'status',
-      () => installStub({ statusQueue: [cannedErr(tokenError('status')), cannedOk({ state: 'waiting' })] }),
-      `status error persona=C: Error code=ECONNRESET message=${JSON.stringify(redactedLeakyMessage('status refused'))}`,
+      () => {
+        const err = tokenError('status')
+        return { err, opts: { statusQueue: [cannedErr(err), ...statusReads('waiting')] } }
+      },
+      (failure) => approverStatusRefusedMessage(C_REF, failure),
+      `Error code=ECONNRESET message=${JSON.stringify(redactedLeakyMessage('status refused'))}`,
     ],
     [
       'readPane (pending row)',
-      () => installStub({ statusQueue: [cannedOk({ state: 'pending' }), cannedOk({ state: 'waiting' })], readPaneError: tokenError('readpane') }),
-      `readPane/sendKeys error persona=C: Error code=ECONNRESET message=${JSON.stringify(redactedLeakyMessage('readpane refused'))}`,
+      () => {
+        const err = tokenError('readpane')
+        return { err, opts: { statusQueue: statusReads('pending', 'waiting'), readPaneError: err } }
+      },
+      (failure) => approverPaneCallFailedMessage(C_REF, 'read-pane', failure),
+      `Error code=ECONNRESET message=${JSON.stringify(redactedLeakyMessage('readpane refused'))}`,
     ],
     [
       'sendKeys (pending row, needle on screen)',
-      () => installStub({
-        statusQueue: [cannedOk({ state: 'pending' }), cannedOk({ state: 'waiting' })],
-        readPaneResults: [{ pane: DEV_CHANNELS_PANE }],
-        sendKeysError: errGeneric('send-keys', 'ErrSendKeysBroken', leakyMessage('refused', 'sendkeys')),
-      }),
-      `readPane/sendKeys error persona=C: AgentDirectorError errName=ErrSendKeysBroken message=${JSON.stringify(redactedLeakyMessage('ErrSendKeysBroken: refused'))}`,
-    ],
-    [
-      'raw-tmux capture (dead row)',
       () => {
-        _setTmuxCapturePane(async () => { throw tokenError('rawtmux') })
-        installStub({ statusQueue: [cannedOk({ state: 'missing' }), cannedOk({ state: 'waiting' })] })
+        const err = errGeneric('send-keys', 'ErrSendKeysBroken', leakyMessage('refused', 'sendkeys'))
+        return {
+          err,
+          opts: { statusQueue: statusReads('pending', 'waiting'), readPaneResults: [{ pane: DEV_CHANNELS_PANE }], sendKeysError: err },
+        }
       },
-      `raw-tmux fallback error persona=C: Error code=ECONNRESET message=${JSON.stringify(redactedLeakyMessage('rawtmux refused'))}`,
+      (failure) => approverPaneCallFailedMessage(C_REF, 'send-keys', failure),
+      `ErrSendKeysBroken message=${JSON.stringify(redactedLeakyMessage('refused'))}`,
     ],
-  ])('AC 20: a %s error carrying fake tokens — one approver line naming the error with its redacted message; the approver goes on to the ready state; nothing logged leaks', async (_label, arrange, shown) => {
-    arrange()
+  ])('AC 20: a %s error carrying fake tokens — one approver line naming the error with its redacted message; the approver goes on to the ready state; nothing logged leaks', async (_label, arrange, message, shown) => {
+    const clock = useApproverClock()
+    const { err, opts } = arrange()
+    installStub(opts)
     const errArgs: unknown[][] = []
     const orig = console.error
     console.error = (...args: unknown[]) => { errArgs.push(args) }
+    let stop: ApproverStopReason | undefined
     try {
-      await approvePreSessionDialogs('C', false)
+      stop = await runOnApproverClock(clock, approvePreSessionDialogs('C', false, C_REF))
     } finally {
       console.error = orig
     }
 
-    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith('[slack] approvePreSessionDialogs:'))
-    expect(lines.map((l) => l.split(' at ')[0])).toEqual([`[slack] approvePreSessionDialogs: ${shown}`])
+    expect(stop).toBe(APPROVER_STOP_LIVE)
+    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(APPROVER_LOG_PREFIX))
+    expect(lines).toEqual([approverLogLine(message(describeAgentDirectorFailure(err)))])
+    expect(lines[0]).toContain(`failed: ${shown}`)
     assertNoLeak({ errArgs })
   })
 })
@@ -9075,37 +9156,28 @@ const CWD = '/test/cwd'
 
 describe('b.1ix: raw tmux calls target the persona’s own session exactly, never a prefix neighbour', () => {
   /**
-   * A tmux server behind the runner seam: live sessions by name, each pane
-   * showing `pane`. It resolves a target as tmux 3.2a does (checked in the
-   * `/ci` image): `=<name>` is only that exact session and `=<name>:` its
-   * pane, while `=<name>` is no pane target at all; a bare name is the exact
-   * session, else the one session it prefixes (the hazard).
+   * A tmux server behind the runner seam: live sessions by name. It resolves
+   * a session target as tmux 3.2a does (checked in the `/ci` image):
+   * `=<name>` is only that exact session; a bare name is the exact session,
+   * else the one session it prefixes (the hazard).
    */
-  function fakeTmuxServer(sessions: string[], pane: string) {
+  function fakeTmuxServer(sessions: string[]) {
     const alive = new Set(sessions)
     const argvs: string[][] = []
-    const entered: string[] = []
-    const resolve = (target: string, paneTarget: boolean): string | undefined => {
-      if (target.startsWith('=')) {
-        const name = paneTarget ? target.slice(1).replace(/:$/, '') : target.slice(1)
-        if (paneTarget && !target.endsWith(':')) return undefined
-        return alive.has(name) ? name : undefined
-      }
-      const name = target.replace(/:$/, '')
-      if (alive.has(name)) return name
-      const prefixed = [...alive].filter((s) => s.startsWith(name))
+    const resolve = (target: string): string | undefined => {
+      if (target.startsWith('=')) return alive.has(target.slice(1)) ? target.slice(1) : undefined
+      if (alive.has(target)) return target
+      const prefixed = [...alive].filter((s) => s.startsWith(target))
       return prefixed.length === 1 ? prefixed[0] : undefined
     }
     const runner: TmuxCommandRunner = async (args) => {
       argvs.push([...args])
-      const command = args[0]
-      const session = resolve(args[args.indexOf('-t') + 1]!, command === 'capture-pane' || command === 'send-keys')
+      const session = resolve(args[args.indexOf('-t') + 1]!)
       if (session === undefined) return { code: 1, stdout: '' }
-      if (command === 'kill-session') alive.delete(session)
-      if (command === 'send-keys') entered.push(session)
-      return { code: 0, stdout: command === 'capture-pane' ? pane : '' }
+      if (args[0] === 'kill-session') alive.delete(session)
+      return { code: 0, stdout: '' }
     }
-    return { runner, alive, argvs, entered }
+    return { runner, alive, argvs }
   }
 
   const NEIGHBOUR_ONLY = ['slack_bot_dev_2']
@@ -9115,7 +9187,7 @@ describe('b.1ix: raw tmux calls target the persona’s own session exactly, neve
     ['only its prefix neighbour slack_bot_dev_2 exists', NEIGHBOUR_ONLY],
     ['it and slack_bot_dev_2 both exist', BOTH],
   ])('the b.vub self-heal kill for persona dev, when %s: kill-session -t =slack_bot_dev, and slack_bot_dev_2 survives', async (_label, sessions) => {
-    const tmux = fakeTmuxServer(sessions, '')
+    const tmux = fakeTmuxServer(sessions)
     _setTmuxCommandRunner(tmux.runner)
     _resetTmuxSessionKiller()
     installStub({
@@ -9134,29 +9206,10 @@ describe('b.1ix: raw tmux calls target the persona’s own session exactly, neve
   })
 
   test.each([
-    ['only its prefix neighbour slack_bot_dev_2 exists', NEIGHBOUR_ONLY, [] as string[]],
-    ['it and slack_bot_dev_2 both exist', BOTH, ['slack_bot_dev']],
-  ])('the approver’s raw pane read and Enter for persona dev’s ended row, when %s and every pane shows the dialog: both target =slack_bot_dev:, so slack_bot_dev_2 gets no Enter', async (_label, sessions, entered) => {
-    const tmux = fakeTmuxServer(sessions, DEV_CHANNELS_DIALOG_PANE)
-    _setTmuxCommandRunner(tmux.runner)
-    _resetTmuxDialogHelpers()
-    _setDialogDeadGracePolls(1)
-    installStub({ statusQueue: [cannedOk({ state: 'ended' }), cannedOk({ state: 'waiting' })] })
-
-    await approvePreSessionDialogs('dev', false)
-
-    expect(tmux.argvs).toEqual([
-      ['capture-pane', '-p', '-t', '=slack_bot_dev:'],
-      ...entered.map(() => ['send-keys', '-t', '=slack_bot_dev:', 'Enter']),
-    ])
-    expect(tmux.entered).toEqual(entered)
-  })
-
-  test.each([
     ['only its prefix neighbour slack_bot_dev_2 exists', false, NEIGHBOUR_ONLY],
     ['it and slack_bot_dev_2 both exist', true, BOTH],
   ])('the liveness probe for persona dev, when %s: has-session -t =slack_bot_dev reads alive=%p', async (_label, alive, sessions) => {
-    const tmux = fakeTmuxServer(sessions, '')
+    const tmux = fakeTmuxServer(sessions)
     _setTmuxCommandRunner(tmux.runner)
     _resetTmuxSessionProber()
 
@@ -9397,10 +9450,10 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Group B: 6 dialog wrapped catch sites (sites #2-#7)
-// Each asserts: (a) dialog function returns normally, (b) ad-unreachable flag
-// is raised, (c) binaryPath detail is captured in the onset emission.
-// Uses poll seams to keep tests near-instant.
+// Group B: the dialog approver's wrapped catch sites
+// Each asserts: (a) the approver resolves with its stop reason, (b)
+// ad-unreachable flag is raised, (c) binaryPath detail is captured in the
+// onset emission. Runs on the approver's fake clock (`useApproverClock`).
 // ---------------------------------------------------------------------------
 
 describe('wrapper-migration: dialog outage cases (Group B)', () => {
@@ -9410,38 +9463,38 @@ describe('wrapper-migration: dialog outage cases (Group B)', () => {
   // -------------------------------------------------------------------------
   // Merged approvePreSessionDialogs — 3 wrapped call sites: status, readPane,
   // sendKeys. Each exercises an AD-outage error at one site, asserting the
-  // outage flag is raised and the function resolves normally.
+  // outage flag is raised and the approver polls on to its cap, on a fake
+  // clock (`useApproverClock`), and answers `cap`.
   // -------------------------------------------------------------------------
 
-  test('status outage: status always throws ErrSystemInstallDisappeared → ad-unreachable, resolves (cap hit)', async () => {
-    _setDialogReadyTimeoutMs(50)
-    installStub({ statusError: errSID() })
-    // status throws every poll → transient → cap hit → resolves
-    await expect(approvePreSessionDialogs(CH, false)).resolves.toBeUndefined()
-    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
-    expect(outageEmissions.some(e => e.key === CH && e.text.includes(BIN))).toBe(true)
-  })
+  /** A short cap: four laps at the approver's pace. */
+  const CAP_MS = 4 * DIALOG_POLL_INTERVAL_MS
 
-  test('readPane outage: status=pending, readPane throws ErrSystemInstallDisappeared → ad-unreachable, resolves (cap hit)', async () => {
-    _setDialogReadyTimeoutMs(50)
-    installStub({
-      statusResult: { state: 'pending' },
-      readPaneError: errSID(),
-    })
-    await expect(approvePreSessionDialogs(CH, false)).resolves.toBeUndefined()
-    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
-    expect(outageEmissions.some(e => e.key === CH && e.text.includes(BIN))).toBe(true)
-  })
+  test.each<[string, () => StubClientOptions]>([
+    ['status outage: status always throws ErrSystemInstallDisappeared', () => ({ statusError: errSID() })],
+    [
+      'readPane outage: status=pending, readPane throws ErrSystemInstallDisappeared',
+      () => ({ statusResult: cannedStatusResult({ state: 'pending' }), readPaneError: errSID() }),
+    ],
+    [
+      // readPane returns the dialog needle so sendKeys is reached; sendKeys throws
+      'sendKeys outage: status=pending + dialog pane, sendKeys throws ErrSystemInstallDisappeared',
+      () => ({
+        statusResult: cannedStatusResult({ state: 'pending' }),
+        readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
+        sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN),
+      }),
+    ],
+  ])('%s → ad-unreachable, polls on and resolves cap at the cap', async (_label, opts) => {
+    const clock = useApproverClock()
+    _setDialogReadyTimeoutMs(CAP_MS)
+    const statusCalls: import('agent-director').StatusParams[] = []
+    installStub({ ...opts(), statusCalls })
 
-  test('sendKeys outage: status=pending + dialog pane, sendKeys throws ErrSystemInstallDisappeared → ad-unreachable, resolves (cap hit)', async () => {
-    _setDialogReadyTimeoutMs(50)
-    // readPane returns the dialog needle so sendKeys is reached; sendKeys throws
-    installStub({
-      statusResult: { state: 'pending' },
-      readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_NEEDLE }],
-      sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN),
-    })
-    await expect(approvePreSessionDialogs(CH, false)).resolves.toBeUndefined()
+    expect(await runOnApproverClock(clock, approvePreSessionDialogs(CH, false))).toBe(APPROVER_STOP_CAP)
+
+    expect(clock.now()).toBe(CAP_MS)
+    expect(statusCalls).toHaveLength(CAP_MS / DIALOG_POLL_INTERVAL_MS)
     expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
     expect(outageEmissions.some(e => e.key === CH && e.text.includes(BIN))).toBe(true)
   })
@@ -14113,21 +14166,8 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
   ])('the note on P\'s own row at the collision get, %s: P latched with that state, before any guard or state branch: one spawn and one get, no status read, no tmux probe, pane read or keystroke; latched', async (_row, row, rowState) => {
     const { h, p, b } = srj105Build()
     fastPolls(h)
-    // Every raw tmux seam a prompt row (or a dialog approval) reaches records its call.
-    const probed: string[] = []
-    const capturedPanes: string[] = []
-    const enters: string[] = []
-    _setTmuxSessionProber(async (name) => {
-      probed.push(name)
-      return true
-    })
-    _setTmuxCapturePane(async (name) => {
-      capturedPanes.push(name)
-      return ''
-    })
-    _setTmuxSendEnter(async (name) => {
-      enters.push(name)
-    })
+    // Every raw tmux call a prompt row (or anything else) reaches is recorded.
+    const tmux = recordTmuxCalls()
     const persona = harnessPersona(h, p)
     const script = collided(h, persona, { ...row(h, persona), liveness_note: provenanceNote })
     h.script(script)
@@ -14140,9 +14180,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
     expect(h.stub.calls.findMissingCalls).toEqual([])
     expect(h.stub.calls.readPaneCalls).toEqual([])
     expect(order).toEqual(['spawn', 'get'])
-    expect(probed).toEqual([])
-    expect(capturedPanes).toEqual([])
-    expect(enters).toEqual([])
+    expect(tmux).toEqual([])
     expectNoteLatchedOnce(h, p, rowState)
 
     await expectLaunchedByNoPath(h, p, b, script)
@@ -15514,8 +15552,10 @@ function unusableNameLinesOf(h: RecoveryHarness, key: string): string[] {
 /**
  * Record every raw tmux call into `order` (the call order `recordCallOrder`
  * keeps), as `tmux <what>`: the b.vub session kill, the server ensurer, the
- * session probe (answering `alive`), and the dialog approver's pane capture
- * and Enter. The file's `afterEach` puts every seam back.
+ * session probe (answering `alive`), and any other command through the
+ * runner seam as `tmux <command>` (failing, as the file's stand-in does; the
+ * startup-dialog approver makes none). The file's `afterEach` puts every
+ * seam back.
  */
 function recordRawTmux(order: string[], alive: boolean): void {
   _setTmuxSessionKiller(async () => {
@@ -15528,12 +15568,9 @@ function recordRawTmux(order: string[], alive: boolean): void {
     order.push('tmux has-session')
     return alive
   })
-  _setTmuxCapturePane(async () => {
-    order.push('tmux capture-pane')
-    return ''
-  })
-  _setTmuxSendEnter(async () => {
-    order.push('tmux send-enter')
+  _setTmuxCommandRunner(async (args) => {
+    order.push(`tmux ${args[0]}`)
+    return { code: 1, stdout: '' }
   })
 }
 

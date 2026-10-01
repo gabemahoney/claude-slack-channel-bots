@@ -96,7 +96,7 @@ tests/
     test-9-reload-destructive-and-server-wide.sh
                                    # E13 dry-run leg (SR-8.6): a working_directory change gives one DESTRUCTIVE: line and touches one persona; a port change waits for the restart
     test-10-credentials-change.sh  # E13 (SR-8.3, SR-8.6), live against the Slack stub: a credentials change reconnects one persona on confirmation; handshake failure and refused change; leak counts
-    test-11-exact-tmux-targets.sh  # b.1ix: persona dev's raw tmux calls (probe, dialog approver, b.vub kill) touch slack_bot_dev only, never its prefix neighbour slack_bot_dev_2
+    test-11-exact-tmux-targets.sh  # b.1ix: persona dev's raw tmux calls (probe, b.vub kill) touch slack_bot_dev only, never its prefix neighbour slack_bot_dev_2; its approver leg is stale (drives the removed raw approver path) and fails until retired
     test-12-bot-hook-absoluteness.sh
                                    # b.cnu SR-8.2, b.2qu, live against the Slack stub: every hook command of an agent-director-launched persona is an absolute path to an existing executable; agent-director's run the user's agent-director install, the reply guard runs the installed package's script
     lib/

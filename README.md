@@ -1279,6 +1279,21 @@ While a persona is down, its Claude instance keeps running and keeps its history
 
 The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step. It ships in the package at `skills/debug-slack-channel-bots/SKILL.md`, and postinstall links it into `~/.claude/skills/debug-slack-channel-bots`; a copied directory or file already at that path is left in place, and postinstall logs `skipped: <path> (not a link; …)` — remove it and re-run postinstall to get the link. Invoke `/debug-slack-channel-bots` from Claude Code.
 
+**A persona's instance waits at a startup prompt**
+After each launch of a persona's instance (a start, a restart, a resume or a confirmed change's bring-up), the server watches it through agent-director while it starts. When Claude Code's folder-trust or development-channels prompt shows, the server presses Enter to accept it. It types nothing else, and nothing at all when neither prompt shows; the server runs no tmux command for this. When agent-director reports the instance ended or missing before it started, the server stops watching at once, and the restart handling decides what happens next.
+
+To look at the session, or to answer its prompt by hand, attach to it:
+
+```sh
+tmux attach -t =slack_bot_<key>
+```
+
+To follow the server's watch for one persona:
+
+```sh
+grep -E '\[slack\] approvePreSessionDialogs: .*(\(key=<key>\)|persona=<key>\b)' ~/.claude/channels/slack/server.log
+```
+
 **A persona doesn't receive messages in a channel or DM**
 Check each of these for the persona that should receive the messages:
 
@@ -1608,7 +1623,7 @@ The following classes are **non-fatal** failures while preparing or launching pe
 - `trust-bootstrap-config-parse` — that `.claude.json` isn't valid JSON, so it is left untouched. Fix its syntax.
 - `trust-bootstrap` — an unexpected error while pre-accepting a persona's workspace trust, such as a failed write of `.claude.json`; the line names the persona and its working directory. Check that the file is writable.
 - `spawn-failed` — launching, resuming or reconnecting a persona's instance failed; the line names the persona and the step. The server keeps running; see "Session not restarting after crash" in [Troubleshooting](#troubleshooting) for how restarts are retried. No `spawn-failed` entry is written when agent-director refuses the call or can't read the persona's state (it is unreachable, answers that it can't act right now, or refuses its own config file), or answers with an error the server can't classify: such a refusal is not a failure, and the server retries the persona on its own. See "A persona is retried after agent-director refuses it", "A persona posts a *Not answering*, *Still not answering* or *Answering again* notice", "A persona posts an *agent-director refuses its config file* notice" and "A persona posts an *Unclassified agent-director error* notice" in [Troubleshooting](#troubleshooting).
-- `dev-channels-approve-spawn-died` — a persona's instance ended before its startup dialog was cleared. Restarts are retried as for `spawn-failed`.
+- `dev-channels-approve-spawn-died` — during a server start, agent-director reported a persona's instance ended or missing before its startup prompt was cleared; the entry is written as soon as that is found. Restarts are retried as for `spawn-failed`. See "A persona's instance waits at a startup prompt" in [Troubleshooting](#troubleshooting).
 - `dev-channels-approve-not-ready` — a persona's instance didn't become ready in time: its startup dialog wasn't recognised or the session hung. A `Spawn failure:` notice is also posted to the persona's destination. Inspect the instance with `agent-director read-pane --claude-instance-id <id>`.
 - `spawn-failure-post` — posting a `Spawn failure:` notice to a persona's destination failed. The notice is held and retried; see "A permission prompt or notice doesn't arrive" in [Troubleshooting](#troubleshooting).
 - `orphan-cleanup-list-failed` — the server couldn't list its agent-director instances to remove stale ones (see "Bots come back with no memory" in [Troubleshooting](#troubleshooting)). Nothing is removed at this start.

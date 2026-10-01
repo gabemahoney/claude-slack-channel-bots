@@ -33,7 +33,8 @@
  * `makeStubCallLog` / `stubCallCount` give a capture list for every verb and
  * their total, and `installStubSpawnPath` / `resetStubSpawnPath` route the
  * real persona launch path (`spawnForPersona`) to a fresh stub client with
- * the dialog and tmux seams faked and a temp spawn home.
+ * the approver's cap shortened, the liveness prober faked and a temp spawn
+ * home; the approver reads and types through the stub client only.
  *
  * Phase 1 errors and results (b.jg5 SRJ-1303):
  *   - Every error builder uses the 0.10.0 client's own class, except:
@@ -159,17 +160,15 @@ import {
   personaTmuxSessionName,
 } from '../../src/persona-identity.ts'
 import {
+  _resetApproverClock,
   _resetDialogPollIntervalMs,
   _resetDialogReadyTimeoutMs,
   _resetInFlightLaunches,
   _resetSpawnHomeDir,
-  _resetTmuxDialogHelpers,
   _resetTmuxSessionProber,
   _setDialogPollIntervalMs,
   _setDialogReadyTimeoutMs,
   _setSpawnHomeDir,
-  _setTmuxCapturePane,
-  _setTmuxSendEnter,
   _setTmuxSessionProber,
   personaConfigDirLabelValue,
 } from '../../src/session-manager.ts'
@@ -1872,11 +1871,13 @@ export interface StubSpawnPath {
 /**
  * Route the real persona launch path (`spawnForPersona`) to a fresh stub
  * client with an empty call log: the client is installed as the process's
- * agent-director client, the dialog poll runs at 1 ms with a 200 ms ready
- * bound, tmux reads an empty pane, sends nothing and reports every session
- * alive, and the spawn home is `homeDir` (its `.claude` directory is
- * created). `homeDir` must be under the test's `mkdtempSync` directory.
- * Undo everything with `resetStubSpawnPath` in `afterEach`.
+ * agent-director client; a launch through this path runs the startup-dialog
+ * approver through that client (`status`, `readPane`, `sendKeys`), with laps
+ * 1 ms apart and its cap at 200 ms (`_setDialogReadyTimeoutMs`, which caps
+ * the approver only); the liveness prober reports every session alive; and
+ * the spawn home is `homeDir` (its `.claude` directory is created).
+ * `homeDir` must be under the test's `mkdtempSync` directory. Undo
+ * everything with `resetStubSpawnPath` in `afterEach`.
  */
 export function installStubSpawnPath(homeDir: string): StubSpawnPath {
   const calls = makeStubCallLog()
@@ -1884,8 +1885,6 @@ export function installStubSpawnPath(homeDir: string): StubSpawnPath {
   setClientForTests(client as unknown as Parameters<typeof setClientForTests>[0])
   _setDialogPollIntervalMs(1)
   _setDialogReadyTimeoutMs(200)
-  _setTmuxCapturePane(async () => '')
-  _setTmuxSendEnter(async () => {})
   _setTmuxSessionProber(async () => true)
   mkdirSync(join(homeDir, '.claude'), { recursive: true })
   _setSpawnHomeDir(homeDir)
@@ -1897,12 +1896,15 @@ export function installStubSpawnPath(homeDir: string): StubSpawnPath {
   }
 }
 
-/** Undo `installStubSpawnPath`, and forget any launch still marked in flight. */
+/**
+ * Undo `installStubSpawnPath`, restore the approver's real clock (a case may
+ * have set `_setApproverClock`), and forget any launch still marked in flight.
+ */
 export function resetStubSpawnPath(): void {
   resetClientForTests()
   _resetDialogPollIntervalMs()
   _resetDialogReadyTimeoutMs()
-  _resetTmuxDialogHelpers()
+  _resetApproverClock()
   _resetTmuxSessionProber()
   _resetSpawnHomeDir()
   _resetInFlightLaunches()

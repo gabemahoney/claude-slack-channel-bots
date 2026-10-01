@@ -402,7 +402,9 @@
  * recording notice sink), and a registered session or delivered event
  * touches the registry and ack tracker; `h.cleanup()` resets them. A
  * realLaunch run also installs the session manager's module seams (the
- * process's agent-director client, dialog and tmux fakes, the spawn home,
+ * process's agent-director client, through which the startup-dialog
+ * approver reads and types, the approver's 1 ms laps and 200 ms cap, the
+ * liveness prober fake, the spawn home,
  * the trust patcher, the reply guard, the claude_config_dir hook, the
  * session notifier, the latch, the configured-persona query) and captures
  * `console.error`; `h.cleanup()`
@@ -512,6 +514,7 @@ import {
   type SessionToolDeps,
 } from '../../src/registry.ts'
 import {
+  _resetApproverClock,
   _resetConfiguredPersonaQuery,
   _resetDialogPollIntervalMs,
   _resetDialogReadyTimeoutMs,
@@ -520,13 +523,10 @@ import {
   _resetPreLaunchReplyGuard,
   _resetPreLaunchTrustPatcher,
   _resetSpawnHomeDir,
-  _resetTmuxDialogHelpers,
   _resetTmuxSessionProber,
   _setDialogPollIntervalMs,
   _setDialogReadyTimeoutMs,
   _setSpawnHomeDir,
-  _setTmuxCapturePane,
-  _setTmuxSendEnter,
   _setTmuxSessionProber,
   checkLaunchConfigDir,
   deletePersonaInstance,
@@ -1328,8 +1328,9 @@ export interface ReloadRunOptions {
    * reply-guard steps over `h.stateDir` and the applied set, the bring-up
    * controller's claude_config_dir hold and re-check, and a session notifier
    * that records each notice (`run.sessionNotices`) and raises it through
-   * the run's notifier, and the run's latch (`run.latch`); the dialog poll runs at 1 ms, tmux is faked and the
-   * spawn home is `h.home`. The composition's reply-guard members are the
+   * the run's notifier, and the run's latch (`run.latch`); the startup-dialog approver reads and types
+   * through the stub only, its laps run 1 ms apart with a 200 ms cap, the
+   * liveness prober reports every session alive and the spawn home is `h.home`. The composition's reply-guard members are the
    * real ones over `h.stateDir`. Every `console.error` line (the session
    * manager's, the reply guard's) goes to `run.logs` while the run is the
    * latest live one. The start-time bootstraps (the sweep, the trust and
@@ -2943,8 +2944,6 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       setClientForTests(composition!.client as Parameters<typeof setClientForTests>[0])
       _setDialogPollIntervalMs(1)
       _setDialogReadyTimeoutMs(200)
-      _setTmuxCapturePane(async () => '')
-      _setTmuxSendEnter(async () => {})
       _setTmuxSessionProber(async () => true)
       _setSpawnHomeDir(home)
       // A new server process: nothing in flight, no launched-with dir known.
@@ -3266,7 +3265,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           resetClientForTests()
           _resetDialogPollIntervalMs()
           _resetDialogReadyTimeoutMs()
-          _resetTmuxDialogHelpers()
+          _resetApproverClock()
           _resetTmuxSessionProber()
           _resetSpawnHomeDir()
           _resetInFlightLaunches()

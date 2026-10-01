@@ -72,7 +72,7 @@
  *
  * Own-row reads (b.jg5 SRJ-114, SRJ-115): every `get` of a persona's own row
  * at SRJ-114's sites goes through `readPersonaOwnRow`, and every own-row
- * `status` the session manager makes, but the dialog approver's, through
+ * `status` the session manager makes, the dialog approver's included, through
  * `readPersonaOwnRowStatus`, which applies the own-row `status` step
  * (`applyOwnRowStatusStep`; the liveness and reconnect adapters in
  * `src/server.ts` apply it after their own calls). Both apply the row-read
@@ -270,9 +270,15 @@ import {
 import { describeDestinationFailureCause } from './persona-destination.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { RESTART_FAILURE_CAP } from './restart.ts'
-import { AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE, pendingLaunchStartOf } from './liveness-reading.ts'
+import {
+  AGENT_DIRECTOR_DEAD_STATES,
+  AGENT_DIRECTOR_LIVE_STATES,
+  AGENT_DIRECTOR_PENDING_STATE,
+  pendingLaunchStartOf,
+} from './liveness-reading.ts'
+import { isPendingWithNoLaunchStart } from './pending-row.ts'
 import { isDryRun } from './tokens.ts'
-import { DIALOG_READY_TIMEOUT_MS } from './ad-settings.ts'
+import { DIALOG_READY_TIMEOUT_MS, armNeverEarlyWait, type NeverEarlyWaitClock } from './ad-settings.ts'
 // Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
 import {
   UNATTRIBUTABLE_ZERO_REASON,
@@ -1348,8 +1354,8 @@ export type OwnRowStatusRead =
  * The session manager's own-row `status` sites read through it: the launch
  * wait's poll and timeout reads, the prompt rows' re-read after a sweep
  * (`reconcileAndReadRowState`), the retry timer's row read
- * (`readPersonaRowState`) and the latch-time read (`latchTimeRowState`). The
- * dialog approver's readiness poll does not (E17 rebuilds it). Never throws.
+ * (`readPersonaRowState`), the latch-time read (`latchTimeRowState`) and
+ * the dialog approver's lap (`approvePreSessionDialogs`). Never throws.
  */
 export async function readPersonaOwnRowStatus(key: string, at: OwnRowReadSite): Promise<OwnRowStatusRead> {
   // The result whole, so the step reads its launch start (b.jg5 SRJ-513).
@@ -1548,8 +1554,8 @@ export interface TmuxRunResult {
 
 /**
  * Runs `tmux <args>` and never rejects. Every raw tmux call in the server goes
- * through this one runner (the server start, the liveness probe, the dialog
- * approver's pane read and Enter, and the b.vub orphan kill), so a unit test
+ * through this one runner (the server start, the liveness probe and the b.vub
+ * orphan kill), so a unit test
  * can see each argv and no test reaches a real tmux server.
  */
 export type TmuxCommandRunner = (args: readonly string[]) => Promise<TmuxRunResult>
@@ -1586,7 +1592,7 @@ export function _resetTmuxCommandRunner(): void {
  * there is one, and otherwise to the one session whose name starts with it.
  * Persona keys can prefix one another (`dev`, `dev_2`), so a bare
  * `slack_bot_dev` reaches `slack_bot_dev_2` whenever `slack_bot_dev` is gone:
- * a kill or an Enter would hit the neighbour's bot. A `=` prefix accepts only
+ * a kill would hit the neighbour's bot. A `=` prefix accepts only
  * the exact name (b.1ix). Verified against tmux 3.2a, the version in the
  * `/ci` image.
  *
@@ -1595,15 +1601,6 @@ export function _resetTmuxCommandRunner(): void {
  */
 function tmuxExactSessionTarget(sessionName: string): string {
   return `=${sessionName}`
-}
-
-/**
- * A pane target (`capture-pane`, `send-keys`) is `=<name>:`, the exact
- * session's active pane: tmux 3.2a refuses `=<name>` as a pane target
- * ("can't find pane"), even when the session exists.
- */
-function tmuxExactPaneTarget(sessionName: string): string {
-  return `=${sessionName}:`
 }
 
 // ---------------------------------------------------------------------------
@@ -1881,10 +1878,10 @@ export function _resetDialogPollIntervalMs(): void {
   _dialogPollIntervalMs = DIALOG_POLL_INTERVAL_MS
 }
 
-/** Hard cap: how long to wait for a fresh spawn to leave `pending` (reach a
- *  live SessionStart state) while auto-dismissing pre-session dialogs.
- *  `DIALOG_READY_TIMEOUT_MS` (`src/ad-settings.ts`, B's floor) unless a test
- *  overrides it. */
+/** The approver's cap: how long it works on a launched row, measured from the
+ *  approver's start on the approver's clock (`_setApproverClock`), before it
+ *  stops. `DIALOG_READY_TIMEOUT_MS` (`src/ad-settings.ts`, B's floor) unless
+ *  a test overrides it. */
 let _dialogReadyTimeoutMs = DIALOG_READY_TIMEOUT_MS
 
 /** Test-only seam: override the ready cap. */
@@ -1898,219 +1895,274 @@ export function _resetDialogReadyTimeoutMs(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Raw-tmux dialog fallback (b.vub) — bypass agent-director when the row is in
-// a non-interactive state (missing/ended) but the pane still shows the dialog.
+// The approver's clock, stop reasons, startup-errors labels and log lines
 // ---------------------------------------------------------------------------
 
 /**
- * b.vub — the critical mechanism the ticket's manual mitigation used.
- *
- * On the RESUME lap, `client.resume` re-creates the tmux session but the AD row
- * stays `missing`/`ended` until SessionStart re-fires — and SessionStart can't
- * fire because the dev-channels dialog blocks it. Crucially, agent-director's
- * `read-pane` / `send-keys` REFUSE to touch a `missing`/`ended` row
- * (`ErrSpawnNotInteractive`, even with allow_pending), so the approver cannot
- * clear the dialog through AD. A raw `tmux capture-pane` + `tmux send-keys …
- * Enter` DOES clear it (verified against real AD/tmux; this is exactly the
- * `tmux send-keys -t <session> Enter` the operator ran by hand in the ticket),
- * after which AD flips to `waiting`.
- *
- * These two seams shell out to tmux directly, keyed on the deterministic
- * per-persona session name and addressing that session's pane exactly
- * (`=<name>:`, b.1ix), so a persona whose key prefixes another's never reads
- * or presses Enter in its neighbour's pane. A session that isn't there reads
- * as an empty pane. Injectable so unit tests stay hermetic.
+ * The approver's clock and timers: the timer subset of the persona clock type
+ * (`NeverEarlyWaitClock`, `src/ad-settings.ts`). The approver's cap timer and
+ * its sleeps between laps run on this clock only, so a suite drives them all
+ * with `createFakeClock` and never waits on real time.
  */
-export type TmuxPaneReader = (sessionName: string) => Promise<string>
-export type TmuxEnterSender = (sessionName: string) => Promise<void>
+export type ApproverClock = NeverEarlyWaitClock
 
-async function defaultTmuxCapturePane(sessionName: string): Promise<string> {
-  const { stdout } = await _runTmux(['capture-pane', '-p', '-t', tmuxExactPaneTarget(sessionName)])
-  return stdout
+/** The real clock, the approver's default. */
+const SYSTEM_APPROVER_CLOCK: ApproverClock = Object.freeze({
+  now: (): number => Date.now(),
+  setTimeout: (callback: () => void, delayMs: number): unknown => setTimeout(callback, delayMs),
+  clearTimeout: (handle: unknown): void => clearTimeout(handle as ReturnType<typeof setTimeout>),
+})
+
+let _approverClock: ApproverClock = SYSTEM_APPROVER_CLOCK
+
+/** Test-only seam: run the approver's cap timer and sleeps on `clock` (a suite passes `createFakeClock()`). */
+export function _setApproverClock(clock: ApproverClock): void {
+  _approverClock = clock
 }
 
-async function defaultTmuxSendEnter(sessionName: string): Promise<void> {
-  await _runTmux(['send-keys', '-t', tmuxExactPaneTarget(sessionName), 'Enter'])
+/** Test-only seam: restore the real clock for the approver. */
+export function _resetApproverClock(): void {
+  _approverClock = SYSTEM_APPROVER_CLOCK
 }
 
-let _tmuxCapturePane: TmuxPaneReader = defaultTmuxCapturePane
-let _tmuxSendEnter: TmuxEnterSender = defaultTmuxSendEnter
+/** The approver stopped because the row left `pending` for a live state: the dialog is gone. */
+export const APPROVER_STOP_LIVE = 'live'
+/** The approver stopped because the row read `ended` or `missing`: the launch is over (b.jg5 SRJ-402). */
+export const APPROVER_STOP_FINISHED = 'finished'
+/** The approver stopped because `status` answered `ErrSpawnNotFound`: the row is absent. */
+export const APPROVER_STOP_ABSENT = 'absent'
+/** The approver stopped because its `status` read latched the persona (the own-row `status` step; b.jg5 SRJ-512, SRJ-513). */
+export const APPROVER_STOP_LATCHED = 'latched'
+/**
+ * The approver stopped because the row read `pending` with no launch start
+ * and the read latched nothing (b.jg5 SRJ-401, SRJ-513). For a configured
+ * persona the own-row `status` step (`applyOwnRowStatusStep`) latches such a
+ * row with "launch start not recorded", answering latched even with no latch
+ * installed, so the approver stops `latched` instead. This stop is reached
+ * only when no configured-persona query is installed, or the query does not
+ * answer that `key` is a configured persona's (it answers otherwise or
+ * throws; e.g. a persona removed while its launch's approver runs).
+ */
+export const APPROVER_STOP_NO_LAUNCH_START = 'no-launch-start'
+/** The approver stopped at its cap (`_setDialogReadyTimeoutMs`, measured from the approver's start). */
+export const APPROVER_STOP_CAP = 'cap'
 
-/** Test-only seam: override the raw tmux pane reader. */
-export function _setTmuxCapturePane(fn: TmuxPaneReader): void {
-  _tmuxCapturePane = fn
-}
-/** Test-only seam: override the raw tmux Enter sender. */
-export function _setTmuxSendEnter(fn: TmuxEnterSender): void {
-  _tmuxSendEnter = fn
-}
-/** Test-only seam: restore the default raw tmux helpers. */
-export function _resetTmuxDialogHelpers(): void {
-  _tmuxCapturePane = defaultTmuxCapturePane
-  _tmuxSendEnter = defaultTmuxSendEnter
+/** Why `approvePreSessionDialogs` stopped: what its promise resolves with. */
+export type ApproverStopReason =
+  | typeof APPROVER_STOP_LIVE
+  | typeof APPROVER_STOP_FINISHED
+  | typeof APPROVER_STOP_ABSENT
+  | typeof APPROVER_STOP_LATCHED
+  | typeof APPROVER_STOP_NO_LAUNCH_START
+  | typeof APPROVER_STOP_CAP
+
+/** The startup-errors class the approver writes, during a start-pass launch, when the row reads `ended` or `missing` (b.jg5 SRJ-402, SRJ-1013). */
+export const STARTUP_ERROR_APPROVE_SPAWN_DIED = 'dev-channels-approve-spawn-died'
+/** The startup-errors class the approver writes, during a start-pass launch, at its cap. */
+export const STARTUP_ERROR_APPROVE_NOT_READY = 'dev-channels-approve-not-ready'
+
+/** The approver's site name, in its own log lines and in the own-row `status` read's lines. */
+export const APPROVER_LOG_SITE = 'approvePreSessionDialogs'
+/** What the approver's own-row `status` read is called in that read's lines (`OwnRowReadSite.what`). */
+export const APPROVER_STATUS_READ_WHAT = 'readiness status read'
+/** The head of every log line the approver writes itself. */
+export const APPROVER_LOG_PREFIX = `[slack] ${APPROVER_LOG_SITE}: `
+/** The pane lines one approver `read-pane` asks for (b.jg5 SRJ-402). */
+export const APPROVER_PANE_LINES = 40
+
+/** One approver log line: {@link APPROVER_LOG_PREFIX} and `message`. */
+export function approverLogLine(message: string): string {
+  return `${APPROVER_LOG_PREFIX}${message}`
 }
 
-/** Live (post-SessionStart) states: the dialog is gone, the session is ready. */
-const DIALOG_READY_STATES = new Set(['waiting', 'working', 'ask_user', 'check_permission'])
-/** Terminal states: the spawn died before becoming ready. */
-const DIALOG_DEAD_STATES = new Set(['ended', 'missing'])
-/** Every pre-SessionStart dialog we can auto-approve (option 1 pre-selected; Enter accepts). */
+/** The message (log line and start-pass entry) for a row that read `ended` or `missing`. */
+export function approverFinishedMessage(ref: string, state: string): string {
+  return `${ref} reads ${renderLogMessageText(state)}: the launch is over, so the approver stops with no pane read and the restart path decides (b.jg5 SRJ-402)`
+}
+
+/** The message for an absent row (`ErrSpawnNotFound`); no startup-errors entry is written for it. */
+export function approverAbsentMessage(ref: string): string {
+  return `${ref} has no row (ErrSpawnNotFound): the approver stops; nothing is read or typed (b.jg5 SRJ-402)`
+}
+
+/** The message for a `pending` row with no launch start that latched nothing. */
+export function approverNoLaunchStartMessage(ref: string): string {
+  return `${ref} reads pending with no launch start: the approver stops; nothing is read or typed (b.jg5 SRJ-401, SRJ-513)`
+}
+
+/** The message for a state that is neither `pending`, live nor finished: nothing is read or typed this lap. */
+export function approverUnknownStateMessage(ref: string, state: string): string {
+  return `${ref} reads the state ${JSON.stringify(renderLogMessageText(state))}, which is neither pending, live nor finished — nothing read or typed; polling on within the cap`
+}
+
+/**
+ * The message for a refused `status` (any error but `ErrSpawnNotFound` that
+ * latched nothing). `failure` is the error already described by the caller
+ * through `describeAgentDirectorFailure` (redacted); the builder never sees
+ * the raw error.
+ */
+export function approverStatusRefusedMessage(ref: string, failure: string): string {
+  return `status of ${ref} failed: ${failure} — polling on within the cap`
+}
+
+/**
+ * The message for a failed `read-pane` or `send-keys`. `failure` is the error
+ * already described by the caller through `describeAgentDirectorFailure`
+ * (redacted); the builder never sees the raw error.
+ */
+export function approverPaneCallFailedMessage(ref: string, verb: 'read-pane' | 'send-keys', failure: string): string {
+  return `${verb} of ${ref} failed: ${failure} — polling on within the cap`
+}
+
+/** The message (log line and start-pass entry) at the cap. */
+export function approverCapMessage(ref: string, capMs: number): string {
+  return `spawn never reached a live state within ${capMs}ms for ${ref} — dialog unrecognized or session hung (dev-needle='${DEV_CHANNELS_DIALOG_NEEDLE}')`
+}
+
+/** Every pre-SessionStart dialog the approver answers (option 1 pre-selected; Enter accepts). Both kept: a folder-trust prompt can follow a `pre_trust` of `skipped` or `failed`. */
 const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEEDLE]
 
 /**
- * b.vub: consecutive dead-state-with-no-needle polls required before treating a
- * spawn as genuinely dead. A freshly resumed (or freshly spawned) row is
- * legitimately `missing`/`ended` for a brief window: after `client.resume`, the
- * tmux pane needs a moment to render the dev-channels dialog, and AD keeps
- * reporting the prior terminal state until SessionStart re-fires. Bailing on the
- * FIRST such poll (as the pre-b.vub code did) races the dialog and re-hangs the
- * resume. Requiring a short grace streak lets the dialog appear (needle → Enter,
- * which resets the streak) while still fast-failing a truly dead spawn without
- * waiting the full 5-minute cap. Reset to 0 on any live state or needle sighting.
- */
-export const DIALOG_DEAD_GRACE_POLLS = 20
-
-let _dialogDeadGracePolls = DIALOG_DEAD_GRACE_POLLS
-
-/** Test-only seam: override the dead-state grace streak. */
-export function _setDialogDeadGracePolls(n: number): void {
-  _dialogDeadGracePolls = n
-}
-
-/** Test-only seam: restore the default dead-state grace streak. */
-export function _resetDialogDeadGracePolls(): void {
-  _dialogDeadGracePolls = DIALOG_DEAD_GRACE_POLLS
-}
-
-/**
- * Drive a freshly-spawned bot past its pre-SessionStart dialogs (folder-trust
- * and/or dev-channels) by watching agent-director's state machine: while the
- * spawn is `pending` (SessionStart not yet fired — a dialog may be blocking),
- * poll the pane and press Enter whenever a known dialog needle is on screen.
- * Exit the instant AD reports a live state (the dialog is gone). 5-minute hard
- * cap; failure to reach ready is surfaced loudly — never a silent early quit.
+ * Drive a launched bot past its pre-SessionStart dialogs (folder-trust and
+ * dev-channels) through agent-director only (b.jg5 SRJ-402). A launch,
+ * fresh or resumed, reads `pending` until its session reports in (HO C5),
+ * so every lap works on the `pending` row:
  *
- * status/readPane/sendKeys are wrapped in withOutageDetection so AD-outage
- * flags keep working (b.en2). readPane/sendKeys use allow_pending:true because
- * the bot is `pending` here (b.98w). The needle-gate guarantees Enter is sent
- * ONLY when a dialog is actually displayed, so we never inject a stray Enter
- * into a live prompt. Addresses the persona's `cscb_<key>` instance.
+ *   - one own-row `status` read (`readPersonaOwnRowStatus`, which applies
+ *     the own-row `status` step): a read that latched the persona stops the
+ *     approver with nothing read or typed (`latched`); `ErrSpawnNotFound`
+ *     stops it with one line and no startup-errors entry (`absent`); any
+ *     other refusal is logged once and polling goes on within the cap;
+ *   - a live state other than `pending` stops it (`live`);
+ *   - `ended` or `missing` stops it at once with no pane read and one line,
+ *     and a start-pass launch writes `dev-channels-approve-spawn-died`
+ *     (`finished`); the restart path decides what follows;
+ *   - `pending` with no launch start (`isPendingWithNoLaunchStart`) that the
+ *     read did not latch stops it with one line and nothing read or typed
+ *     (`no-launch-start`); a configured persona's such row is latched by the
+ *     read (`latched`), so this stop is reached only with no configured-persona
+ *     query installed or one that does not answer `key` as configured;
+ *   - `pending` with a launch start: one `read-pane` (40 lines,
+ *     `allow_pending`), and when the pane shows a needle of
+ *     `PRE_SESSION_DIALOG_NEEDLES`, one `send-keys` with an empty text and
+ *     `allow_pending`, which presses Enter. A failed call is logged once and
+ *     polling goes on within the cap.
  *
- * Replaces the former two-function pair (trust-folder + dev-channels approvers):
- * one loop from spawn+0 (no wasted 30s trust window) that self-heals a missed
- * Enter (state stays pending, needle reappears, next iteration presses again)
- * and never gives up silently at 30s.
+ * Every call names only the persona's `claude_instance_id`; agent-director
+ * reads and types into the worker's recorded pane of a session carrying this
+ * launch's label (HO rev 17), and the server runs no tmux command here.
  *
- * b.vub: pane-first / state-tolerant, with a RAW-TMUX fallback for dead rows.
- * A *resumed* bot faces the same `--dangerously-load-development-channels`
- * dialog, but its AD row is `missing`/`ended` from the prior life while it sits
- * blocked at the dialog (SessionStart never re-fires). Two compounding facts the
- * pre-b.vub code missed: (1) it early-returned on DIALOG_DEAD_STATES before ever
- * reading the pane; (2) even if it had tried, agent-director's read-pane/
- * send-keys REFUSE a `missing`/`ended` row (ErrSpawnNotInteractive), so the
- * dialog can only be cleared by talking to tmux directly. Fix: within the
- * pre-SessionStart window, for a dead row read+Enter via raw tmux (keyed on the
- * deterministic session name), for a pending row via AD; press Enter whenever a
- * needle is visible regardless of AD state; treat missing/ended as terminal only
- * after a short no-needle grace streak (DIALOG_DEAD_GRACE_POLLS), tolerating the
- * brief post-resume window before the dialog renders. Still needle-gated (no
- * stray Enter into a live session) and bounded by the hard cap.
+ * Laps are `_dialogPollIntervalMs` apart; the cap (`_dialogReadyTimeoutMs`)
+ * is measured from the approver's start. Both run on the approver's clock
+ * (`_setApproverClock`). At the cap it logs one line, writes
+ * `dev-channels-approve-not-ready` for a start-pass launch and sends the
+ * spawn-failure notice (`cap`). Resolves with why it stopped; never rejects.
  */
 export async function approvePreSessionDialogs(
   key: string,
   isStartup: boolean,
   ref: string = keyRef(key),
-): Promise<void> {
-  const claude_instance_id = personaInstanceId(key)
-  const deadline = Date.now() + _dialogReadyTimeoutMs
-  let deadStreak = 0
-
-  while (Date.now() < deadline) {
-    // 1) Readiness oracle.
-    let state: string
-    try {
-      const r = await withOutageDetection(key, undefined, 'status', (client) => client.status({ claude_instance_id }))
-      state = r.state
-    } catch (err) {
-      if (err instanceof ErrSpawnNotFound) {
-        console.error(`[slack] approvePreSessionDialogs: spawn not found for ${ref} — aborting`)
-        return
-      }
-      // Transient (incl. AD-outage errors already flagged by withOutageDetection) — keep polling.
-      console.error(`[slack] approvePreSessionDialogs: status error ${ref}: ${describeThrownValue(err)}`)
-      await new Promise((r) => setTimeout(r, _dialogPollIntervalMs))
-      continue
-    }
-    if (DIALOG_READY_STATES.has(state)) return // dialog cleared, session live
-
-    // 2) Pane-first (b.vub): read the pane and dismiss any visible pre-session
-    // dialog BEFORE deciding whether a dead state is terminal.
-    //
-    // Two paths, because agent-director's read-pane/send-keys REFUSE a
-    // `missing`/`ended` row (ErrSpawnNotInteractive) even with allow_pending:
-    //   - Fresh spawn (state=pending): drive via AD read-pane/send-keys.
-    //   - Resumed row (state=missing/ended): AD won't touch the pane, but the
-    //     dialog IS on screen and blocking SessionStart. Fall back to RAW tmux
-    //     (capture-pane + send-keys Enter) keyed on the deterministic session
-    //     name, addressed exactly (`=<session>:`, b.1ix) — the
-    //     `tmux send-keys -t <session> Enter` the operator ran by hand in the
-    //     ticket. Once Enter lands, SessionStart fires and AD flips to a live
-    //     state on the next poll.
-    let needleVisible = false
-    if (DIALOG_DEAD_STATES.has(state)) {
-      // Raw-tmux fallback (agent-director cannot interact with a dead row).
-      const sessionName = personaTmuxSessionName(key)
-      try {
-        const pane = await _tmuxCapturePane(sessionName)
-        needleVisible = PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))
-        if (needleVisible) {
-          await _tmuxSendEnter(sessionName)
+): Promise<ApproverStopReason> {
+  const clock = _approverClock
+  const capMs = _dialogReadyTimeoutMs
+  const pollMs = _dialogPollIntervalMs
+  const at: OwnRowReadSite = { site: APPROVER_LOG_SITE, what: APPROVER_STATUS_READ_WHAT, ref }
+  const startMs = clock.now()
+  let capReached = false
+  let wakeSleep: (() => void) | undefined
+  const cancelCap = armNeverEarlyWait(clock, startMs, capMs, () => {
+    capReached = true
+    wakeSleep?.()
+  })
+  try {
+    while (!capReached && clock.now() - startMs < capMs) {
+      const stop = await approverLap(key, isStartup, ref, at)
+      if (stop !== undefined) return stop
+      if (capReached) break
+      await new Promise<void>((resolve) => {
+        const handle = clock.setTimeout(() => {
+          wakeSleep = undefined
+          resolve()
+        }, pollMs)
+        wakeSleep = () => {
+          wakeSleep = undefined
+          clock.clearTimeout(handle)
+          resolve()
         }
-      } catch (err) {
-        console.error(`[slack] approvePreSessionDialogs: raw-tmux fallback error ${ref}: ${describeThrownValue(err)}`)
-      }
-    } else {
-      // Interactive (pending) — drive via agent-director.
-      try {
-        const { pane } = await withOutageDetection(key, undefined, 'read-pane', (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
-        needleVisible = PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))
-        if (needleVisible) {
-          await withOutageDetection(key, undefined, 'send-keys', (client) => client.sendKeys({ claude_instance_id, text: '', allow_pending: true })) // Enter
-        }
-      } catch (err) {
-        console.error(`[slack] approvePreSessionDialogs: readPane/sendKeys error ${ref}: ${describeThrownValue(err)}`)
-      }
+      })
     }
-
-    // 3) Dead-state handling (b.vub). A needle means "dialog-blocked, not dead":
-    // reset the streak and keep pressing Enter. Only treat missing/ended as
-    // terminal after it persists with NO needle for DIALOG_DEAD_GRACE_POLLS
-    // consecutive polls — this tolerates the brief post-spawn/post-resume window
-    // where the row is still terminal and the pane hasn't rendered the dialog
-    // yet, without racing the dialog and re-hanging the resume.
-    if (needleVisible) {
-      deadStreak = 0
-    } else if (DIALOG_DEAD_STATES.has(state)) {
-      deadStreak += 1
-      if (deadStreak >= _dialogDeadGracePolls) {
-        const msg = `spawn reached ${state} before clearing dev-channels dialog for ${ref} (no needle for ${deadStreak} polls)`
-        console.error(`[slack] approvePreSessionDialogs: ${msg}`)
-        if (isStartup) recordStartupError('dev-channels-approve-spawn-died', msg)
-        return
-      }
-    } else {
-      // pending (or any other non-dead, non-ready state) — reset the streak.
-      deadStreak = 0
-    }
-
-    await new Promise((r) => setTimeout(r, _dialogPollIntervalMs))
+  } finally {
+    wakeSleep = undefined
+    cancelCap()
   }
 
-  // 3) Hard cap hit — genuine failure, surfaced loudly (no silent give-up).
-  const msg = `spawn never reached a live state within ${_dialogReadyTimeoutMs}ms for ${ref} — dialog unrecognized or session hung (dev-needle='${DEV_CHANNELS_DIALOG_NEEDLE}')`
-  console.error(`[slack] approvePreSessionDialogs: ${msg}`)
-  if (isStartup) recordStartupError('dev-channels-approve-not-ready', msg)
+  // The cap: surfaced loudly (no silent give-up).
+  const msg = approverCapMessage(ref, capMs)
+  console.error(approverLogLine(msg))
+  if (isStartup) recordStartupError(STARTUP_ERROR_APPROVE_NOT_READY, msg)
   notifySpawnFailure(key, new AgentDirectorError('status', 'DialogApprovalTimeout', msg), isStartup)
+  return APPROVER_STOP_CAP
+}
+
+/**
+ * One approver lap (`approvePreSessionDialogs`): answers the stop reason, or
+ * `undefined` to poll on. Never throws.
+ */
+async function approverLap(
+  key: string,
+  isStartup: boolean,
+  ref: string,
+  at: OwnRowReadSite,
+): Promise<ApproverStopReason | undefined> {
+  const read = await readPersonaOwnRowStatus(key, at)
+  if (read.kind === OWN_ROW_STATUS_LATCHED) return APPROVER_STOP_LATCHED // the step logged its line
+  if (read.kind === OWN_ROW_STATUS_ABSENT) {
+    console.error(approverLogLine(approverAbsentMessage(ref)))
+    return APPROVER_STOP_ABSENT
+  }
+  if (read.kind === OWN_ROW_STATUS_REFUSED) {
+    console.error(approverLogLine(approverStatusRefusedMessage(ref, describeAgentDirectorFailure(read.error))))
+    return undefined
+  }
+
+  const state = read.state
+  if (AGENT_DIRECTOR_DEAD_STATES.has(state)) {
+    const msg = approverFinishedMessage(ref, state)
+    console.error(approverLogLine(msg))
+    if (isStartup) recordStartupError(STARTUP_ERROR_APPROVE_SPAWN_DIED, msg)
+    return APPROVER_STOP_FINISHED
+  }
+  if (state !== AGENT_DIRECTOR_PENDING_STATE) {
+    if (AGENT_DIRECTOR_LIVE_STATES.has(state)) return APPROVER_STOP_LIVE
+    console.error(approverLogLine(approverUnknownStateMessage(ref, state)))
+    return undefined
+  }
+  if (isPendingWithNoLaunchStart({ state, launch_started_at: read.launchStartedAt })) {
+    console.error(approverLogLine(approverNoLaunchStartMessage(ref)))
+    return APPROVER_STOP_NO_LAUNCH_START
+  }
+
+  const claude_instance_id = personaInstanceId(key)
+  let pane: string
+  try {
+    const result = await withOutageDetection(key, undefined, 'read-pane', (client) =>
+      client.readPane({ claude_instance_id, n_lines: APPROVER_PANE_LINES, allow_pending: true }),
+    )
+    pane = result.pane
+  } catch (err) {
+    console.error(approverLogLine(approverPaneCallFailedMessage(ref, 'read-pane', describeAgentDirectorFailure(err))))
+    return undefined
+  }
+  if (!PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))) return undefined
+  try {
+    // An empty text presses Enter.
+    await withOutageDetection(key, undefined, 'send-keys', (client) =>
+      client.sendKeys({ claude_instance_id, text: '', allow_pending: true }),
+    )
+  } catch (err) {
+    console.error(approverLogLine(approverPaneCallFailedMessage(ref, 'send-keys', describeAgentDirectorFailure(err))))
+  }
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -5533,9 +5585,10 @@ async function resumeOrFreshSpawn(
   try {
     await launchWithReplyGuard(persona, ref, 'resume', (client) => client.resume({ claude_instance_id: personaInstanceId(key) }))
     console.error(`[slack] spawnForPersona: resumed ${ref}`)
-    // b.vub: a resumed bot faces the same --dangerously-load-development-channels
-    // dialog. Its AD row is still `missing`/`ended` while blocked at the dialog
-    // (SessionStart hasn't re-fired), so the pane-first approver drives it past.
+    // A resumed bot faces the same startup dialogs as a fresh one. Its row
+    // reads `pending` from the resume until its session reports in (HO C5),
+    // so the approver clears the dialog through agent-director, as after a
+    // spawn (b.jg5 SRJ-402).
     await approvePreSessionDialogs(key, isStartup, ref)
     return { key, action: 'resumed' }
   } catch (err) {

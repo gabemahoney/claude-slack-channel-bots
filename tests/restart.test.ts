@@ -54,9 +54,6 @@ import {
   _setTmuxServerEnsurer,
   _resetTmuxServerEnsurer,
   _resetInFlightLaunches,
-  _setTmuxCapturePane,
-  _setTmuxSendEnter,
-  _resetTmuxDialogHelpers,
   _setTmuxSessionProber,
   _resetTmuxSessionProber,
   _setTmuxSessionKiller,
@@ -2632,8 +2629,6 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     _setSpawnHomeDir(dir)
     _setDialogPollIntervalMs(1)
     _setDialogReadyTimeoutMs(200)
-    _setTmuxCapturePane(async () => '')
-    _setTmuxSendEnter(async () => {})
     _setTmuxSessionProber(async () => true)
     _setTmuxServerEnsurer(async () => {})
   })
@@ -2651,7 +2646,6 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     _resetSpawnHomeDir()
     _resetDialogPollIntervalMs()
     _resetDialogReadyTimeoutMs()
-    _resetTmuxDialogHelpers()
     _resetTmuxSessionProber()
     _resetTmuxServerEnsurer()
     rmSync(dir, { recursive: true, force: true })
@@ -2842,8 +2836,6 @@ describe('restart: the reply-guard record holds the effective value before the r
     _setSpawnHomeDir(dir)
     _setDialogPollIntervalMs(1)
     _setDialogReadyTimeoutMs(200)
-    _setTmuxCapturePane(async () => '')
-    _setTmuxSendEnter(async () => {})
     _setTmuxSessionProber(async () => true)
     _setTmuxServerEnsurer(async () => {})
   })
@@ -2858,7 +2850,6 @@ describe('restart: the reply-guard record holds the effective value before the r
     _resetSpawnHomeDir()
     _resetDialogPollIntervalMs()
     _resetDialogReadyTimeoutMs()
-    _resetTmuxDialogHelpers()
     _resetTmuxSessionProber()
     _resetTmuxServerEnsurer()
     rg.cleanup()
@@ -3080,8 +3071,6 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     _resetInFlightLaunches()
     _setDialogPollIntervalMs(1)
     _setDialogReadyTimeoutMs(200)
-    _setTmuxCapturePane(async () => '')
-    _setTmuxSendEnter(async () => {})
     _setTmuxSessionProber(async () => true)
     _setTmuxServerEnsurer(async () => {})
     _setConfigDirFs({
@@ -3164,7 +3153,6 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     _resetSpawnHomeDir()
     _resetDialogPollIntervalMs()
     _resetDialogReadyTimeoutMs()
-    _resetTmuxDialogHelpers()
     _resetTmuxSessionProber()
     _resetTmuxServerEnsurer()
     rmSync(dir, { recursive: true, force: true })
@@ -3521,8 +3509,6 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     _setSpawnHomeDir(dir)
     _setDialogPollIntervalMs(1)
     _setDialogReadyTimeoutMs(200)
-    _setTmuxCapturePane(async () => '')
-    _setTmuxSendEnter(async () => {})
     _setTmuxSessionProber(async () => true)
     _setTmuxServerEnsurer(async () => {})
   })
@@ -3542,7 +3528,6 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     _resetSpawnHomeDir()
     _resetDialogPollIntervalMs()
     _resetDialogReadyTimeoutMs()
-    _resetTmuxDialogHelpers()
     _resetTmuxSessionProber()
     _resetTmuxServerEnsurer()
     rmSync(dir, { recursive: true, force: true })
@@ -4284,8 +4269,6 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
       _setSpawnHomeDir(dir)
       _setDialogPollIntervalMs(1)
       _setDialogReadyTimeoutMs(200)
-      _setTmuxCapturePane(async () => '')
-      _setTmuxSendEnter(async () => {})
       _setTmuxSessionProber(async () => true)
       _setTmuxServerEnsurer(async () => {})
     })
@@ -4299,7 +4282,6 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
       _resetSpawnHomeDir()
       _resetDialogPollIntervalMs()
       _resetDialogReadyTimeoutMs()
-      _resetTmuxDialogHelpers()
       _resetTmuxSessionProber()
       _resetTmuxServerEnsurer()
       rmSync(dir, { recursive: true, force: true })
