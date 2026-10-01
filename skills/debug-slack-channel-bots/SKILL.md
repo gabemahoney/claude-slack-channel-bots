@@ -1310,7 +1310,16 @@ While the persona is held:
 - nothing is killed, deleted or counted toward the restart limit for it,
   and no `Spawn failure:` notice is posted.
 
-Other personas are not affected. The hold is kept in the server's memory.
+Other personas are not affected.
+
+**How a hold ends.** Removing the persona from the configuration (a
+confirmed change) ends its hold, with no post. A destructive change (its
+name, credentials file or working directory) also brings the persona up
+unheld; it is held again, with one post to its destination, only if its own
+launch meets a conflict. The hold is kept in the server's memory only, so a
+server restart drops every hold; a persona whose conflict is still there is
+held again, with one new post, at its next launch. Nothing else ends a hold,
+and ending one logs no line of its own.
 
 **The notice.** It is posted once per hold, even when the persona already
 has a *Waiting on a prompt* or *Not connected* notice. Its first line names
@@ -1354,7 +1363,7 @@ agent-director list --tmux-session-name <name>
 All of one persona's hold lines (replace `ops_bot` with the key):
 
 ```sh
-grep -h -E 'conflict-latch: persona=ops_bot |\(key=ops_bot\): .*— CONFLICT: |\(key=ops_bot\) — .*latched \(case=|(Not scheduling|Skipping) restart for persona=ops_bot — the persona is latched|Session relaunch for persona=ops_bot ended latched|unavailable-retry: persona=ops_bot (stopped.* — the persona is latched|the latched query failed)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+grep -h -E 'conflict-latch: persona=ops_bot |\(key=ops_bot\): .*— CONFLICT: |\(key=ops_bot\): forgetting its latch failed|\(key=ops_bot\) — .*latched \(case=|(Not scheduling|Skipping) restart for persona=ops_bot — the persona is latched|Session relaunch for persona=ops_bot ended latched|unavailable-retry: persona=ops_bot (stopped.* — the persona is latched|the latched query failed)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
 ```
 
 | Line | Meaning | What to do |
@@ -1420,15 +1429,17 @@ Slack connection is closed, its MCP session dropped, its reply-guard record
 deleted, and its instance `cscb_<key>` killed and its agent-director row
 deleted. Its conversation can't be resumed. Its permission prompts stay in
 Slack as posted; clicking one does nothing, because clicks arrive only on the
-persona's own Slack connection, which the removal closed. To bring the persona
-back, add it to `config.json` again and confirm; its old conversation isn't
-guaranteed to be resumed.
+persona's own Slack connection, which the removal closed. A held persona's
+hold ends with it, silently. To bring the persona back, add it to
+`config.json` again and confirm; its old conversation isn't guaranteed to be
+resumed.
 
 | Line | Meaning |
 |---|---|
 | `[slack] persona teardown of "<name>" (key=<key>): starting`, later `…: complete` | The teardown ran. Normal. |
 | `[slack] persona teardown of "<name>" (key=<key>): complete, with <n> failed step(s)` | Some steps failed; each has its own line (below). |
 | `[slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key> failed: <error>` (or `… delete of cscb_<key> failed: …`) | agent-director couldn't kill or delete the instance, often because it was unreachable. The row may still be there (see [Listing instances](#listing-instances)); for a removed persona, the next server start removes it. For a destructively modified persona, its bring-up finds the row: a row whose working directory or config directory no longer matches is replaced, but when neither changed (for example a `credentials_file` path change alone) the row still matches, so the launch may resume it with its conversation instead of spawning a fresh instance. |
+| `[slack] persona teardown of "<name>" (key=<key>): forgetting its latch failed: <error>` | An internal error ending the persona's hold (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice)). The other steps still ran, but the key may still be held: a destructively modified persona, or a persona added again with the same key, is then not launched (`spawnForPersona: not launching … — it is latched`) until the server next starts. Report it as a bug, with the persona's lines. |
 | `[slack] persona teardown of "<name>" (key=<key>): <step> failed: <error>`, any other step | An internal error. The other steps still ran. Report it as a bug. |
 | `[slack] dry-run: persona teardown of "<name>" (key=<key>): skipping the agent-director kill and delete of cscb_<key>` | Dry run: the instance and its row are left alone. |
 | `[slack] Cancelled restart timer for persona=<key>` | A restart that was pending for it was cancelled. |
@@ -1446,7 +1457,9 @@ guaranteed to be resumed.
 path or `working_directory` changed gets both: the removed persona's teardown
 lines, then the added persona's bring-up lines (`persona-start`, then
 `up at apply — launching` or a class line). It comes up fresh, with no
-conversation history. A restart or retry that was pending for it is cancelled
+conversation history, and unheld: a hold it had ends with its teardown, and it
+is held again, with one new notice, only if its own launch meets a conflict.
+A restart or retry that was pending for it is cancelled
 when its teardown is queued, so the old entry is never relaunched in between.
 `[slack] persona teardown of "<name>" (key=<key>): <step> before its turn failed: <error>`
 is an internal error in that cancel; the teardown still runs. Report it as a

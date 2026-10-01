@@ -43,7 +43,9 @@
  * teardown stops a key's UNAVAILABLE retry timer through the one retry
  * controller main() builds (b.jg5 SRJ-305) and, in the same binding, cancels
  * the key's tmux-unresponsive alert check on the one condition main() builds
- * (b.jg5 SRJ-309), and that the refresh gets the server-wide
+ * (b.jg5 SRJ-309), that the teardown forgets the key's latch on the one
+ * latch main() builds, through the only forget of that latch in server.ts
+ * (b.jg5 SRJ-504), and that the refresh gets the server-wide
  * template arguments the boot install wrote (a value captured once at start,
  * never re-read at apply) and the agent-director client. What the default step bodies do with those members
  * is tested in tests/reload-apply.test.ts; what the teardown, the apply
@@ -489,7 +491,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     ])
     // Functions and objects with a parameter name of the source's choosing.
     // (`templateRefresh` is pinned in the test after this one.)
-    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopRetryTimer', 'forgetNoticeEpisodes']
+    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopRetryTimer', 'forgetConflictLatch', 'forgetNoticeEpisodes']
     expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
     for (const [dep, value] of expected) expect([dep, props.get(dep)]).toEqual([dep, value])
 
@@ -515,6 +517,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       UNAVAILABLE_RETRY_STOP_TORN_DOWN: './unavailable-retry.ts',
       createPersonaEpisodes: './persona-episodes.ts',
       createTmuxUnresponsiveCondition: './persona-episodes.ts',
+      createConflictLatch: './conflict-latch.ts',
     }
     for (const [name, module] of Object.entries(imports)) {
       expect([name, importSource(SERVER_CODE, name)]).toEqual([name, module])
@@ -587,6 +590,18 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(forgetEpisodes).not.toBeNull()
     expect(forgetEpisodes![2]).toBe(forgetEpisodes![1])
 
+    // b.jg5 SRJ-504: the teardown silently forgets the key's latch on the
+    // server's one latch (its build and binding count are pinned in the test
+    // after the template refresh's): not a stub, not another instance's
+    // forget, not a local shadow of the instance, and never every persona's.
+    const latch = constOf('createConflictLatch')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${latch}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+    const forgetLatch = (props.get('forgetConflictLatch') ?? '').match(
+      new RegExp(`^\\(?(\\w+)\\)? => ${latch}\\.forget\\((\\w+)\\)$`),
+    )
+    expect(forgetLatch).not.toBeNull()
+    expect(forgetLatch![2]).toBe(forgetLatch![1])
+
     // The storage check at apply posts through the persona notifier.
     const storage = (props.get('storageCheck') ?? '').match(new RegExp(`^\\(?(\\w+)\\)? => runPersonaStorageCheck\\((\\w+), ${notifier}\\.notify\\)$`))
     expect(storage).not.toBeNull()
@@ -640,6 +655,36 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     }
     expect(anyCallOf('refreshSlackChannelBotTemplate')).toEqual([])
     expect(anyCallOf('buildTemplateParams')).toEqual([])
+  })
+
+  // b.jg5 SRJ-504: `forgetConflictLatch` is required, so the typecheck
+  // catches it missing; it cannot catch it bound to a stub or to a second
+  // latch (the removed persona would stay latched on the one the launches
+  // ask), nor a second forget of the server's latch elsewhere (a forget-all
+  // at shutdown, which SRJ-504 rules out: a restart drops every latch with
+  // the process). Its form is pinned in the test above.
+  test('the teardown\'s latch forget is bound exactly once, to the server\'s one latch: the instance\'s only forget in server.ts is that binding (b.jg5 SRJ-504)', () => {
+    const latch = constOf('createConflictLatch')
+    expect(callsOf(SERVER_CODE, 'createConflictLatch')).toHaveLength(1)
+    expect(insideMain(SERVER_CODE, SERVER_CODE.search(new RegExp(`\\bconst\\s+${latch}\\s*=`)))).toBe(true)
+
+    // The step is named once in server.ts: as a property of the one
+    // createPersonaLifecycle({ … }), whose literal has no duplicate key
+    // (objectProperties throws on one).
+    const [open, close] = balancedAfter(SERVER_CODE, callsOf(SERVER_CODE, 'createPersonaLifecycle')[0]!, '(', ')')
+    const steps = indicesOf(/(?<![\w$])forgetConflictLatch\b/g, SERVER_CODE)
+    expect(steps).toHaveLength(1)
+    expect(steps[0]!).toBeGreaterThan(open)
+    expect(steps[0]!).toBeLessThan(close)
+    expect(onlyCallProps('createPersonaLifecycle').get('forgetConflictLatch')).toMatch(new RegExp(`=> ${latch}\\.forget\\(`))
+
+    // The latch's forget is read nowhere else: not called (with any key, or
+    // in a loop over every persona), not passed on as a reference.
+    const forgets = indicesOf(new RegExp(`(?<![\\w$.])${latch}\\s*[?!]?\\.\\s*forget\\b`, 'g'), SERVER_CODE)
+    expect(forgets).toHaveLength(1)
+    expect(forgets[0]!).toBeGreaterThan(steps[0]!)
+    expect(forgets[0]!).toBeLessThan(close)
+    expect(indicesOf(new RegExp(`(?<![\\w$.])${latch}\\s*(?:\\?\\.|!)?\\s*\\[`, 'g'), SERVER_CODE)).toEqual([])
   })
 })
 

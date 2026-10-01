@@ -47,8 +47,10 @@
  * `setFromConflict` builds the record from a thrown CONFLICT value. Every set
  * calls each set observer once with the key, the outcome and the record, so
  * the CONFLICT notice and the holds react to it. `forget(key)` drops one
- * persona's latch silently: no post, no observer call, no line. There is no
- * forget-all.
+ * persona's latch silently: no post, no observer call, no line. The persona
+ * teardown calls it (`runTeardown`, `src/persona-lifecycle.ts`) after the
+ * launch in flight settled and right before it forgets the persona's notice
+ * episodes, which ends the CONFLICT episode with it. There is no forget-all.
  *
  * The CONFLICT notice (SRJ-1004, SRJ-508): {@link conflictNoticeText} builds
  * its body from a CONFLICT latch's record, from the exported fixed lines

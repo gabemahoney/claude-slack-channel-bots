@@ -74,12 +74,17 @@
  *   stops the persona's timer (`stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`)
  *   and cancels its alert check (`tmuxUnresponsive.cancelAlert(key,
  *   UNAVAILABLE_RETRY_STOP_TORN_DOWN)`, which logs nothing more when the
- *   stop observer has already cancelled it), the condition kept. The
- *   teardown's turn forgets the persona's episodes, every kind (its
- *   unclassified-error episode included), as production's
- *   `forgetNoticeEpisodes` does; a case does that step with
- *   `episodes.forget(key)` after `teardown(key)`. `remove(key)` drops the
- *   persona from the applied configuration without a teardown.
+ *   stop observer has already cancelled it), the condition kept; then it
+ *   forgets the persona's latch silently (`latch.forget(key)`: no post, no
+ *   set observer call, no line), the turn's step that production's
+ *   `forgetConflictLatch` binds (b.jg5 SRJ-504). The teardown's turn then
+ *   forgets the persona's episodes, every kind (its unclassified-error and
+ *   CONFLICT episodes included), as production's `forgetNoticeEpisodes`
+ *   does; a case does that step with `episodes.forget(key)` after
+ *   `teardown(key)`, which keeps production's order (the latch, then the
+ *   episodes). The harness does not wait for a launch in flight as the turn
+ *   does, so a case settles any launch before `teardown(key)`. `remove(key)`
+ *   drops the persona from the applied configuration without a teardown.
  * - `stub`: one stub client (`makeStubClient`) with its call log
  *   (`stub.calls`), installed through `installStubSpawnPath` with the spawn
  *   home under the harness's temporary HOME, and handed to the outage state
@@ -171,7 +176,9 @@
  *   'hold', key, hold }`) and each CONFLICT notice posted (`{ step: 'notice',
  *   key, text }`), so a case can read that every hold ran before the notice.
  *   The harness has no health tick, so `HealthCheckDeps.isLatched` is not
- *   bound here; a tick case binds `latch.isLatched` itself.
+ *   bound here; a tick case binds `latch.isLatched` itself. `teardown(key)`
+ *   forgets the persona's latch silently (b.jg5 SRJ-504), as production's
+ *   teardown does.
  * - `tickEnd(key)`: what a health tick's healthy branch does to the
  *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
  *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
@@ -239,7 +246,12 @@
  *
  * Shared case helpers, each over a harness: `personaOf` (a configured
  * persona), `collided` (the stub answers of a launch whose optimistic spawn
- * collides), `callCounts` (the stub's calls by verb), `retryNow` (fire a
+ * collides), `callCounts` (the stub's calls by verb), `recordCallOrder`
+ * (wraps every verb of the stub client, in place, so each call from then on
+ * also appends the verb's name to the returned list, in call order: every
+ * function the client has, `readPane`, `sendKeys`, `pause`, `decide` and
+ * `close` included, so a case can assert exactly the calls a launch makes),
+ * `retryNow` (fire a
  * persona's next retry and settle it), `rowReadsUntilSpawn` (each row reads a
  * state until its spawn resolves, then `waiting`), and the condition's log
  * lines: `conditionLinePrefix`, `conditionLines`, `conditionStartedLines`,
@@ -530,7 +542,11 @@ export interface RecoveryHarness {
   setConnected(key: string, connected: boolean): void
   /** The server's shutdown: raise the shutting-down flag, close the controller, then close the episodes. */
   shutdown(): void
-  /** The persona teardown's submit: stop the retry timer and cancel the condition's alert check. */
+  /**
+   * The persona teardown's submit (stop the retry timer, cancel the
+   * condition's alert check), then its turn's latch forget (silent); its
+   * episodes forget is the case's `episodes.forget(key)` after it.
+   */
   teardown(key: string): void
   /** Drop persona `key` from the applied configuration. */
   remove(key: string): void
@@ -917,6 +933,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     teardown(key) {
       controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
       tmuxUnresponsive.cancelAlert(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+      // As main()'s `forgetConflictLatch` (b.jg5 SRJ-504): silently, before
+      // the turn's episodes forget (the case's `episodes.forget(key)`).
+      latch.forget(key)
     },
 
     remove(key) {
@@ -1037,6 +1056,27 @@ export function collided(h: RecoveryHarness, persona: Persona, row: PersonaGetRe
 /** The stub's call counts, by verb, leaving out verbs never called. */
 export function callCounts(h: RecoveryHarness): Record<string, number> {
   return Object.fromEntries(Object.entries(h.stub.calls).filter(([, calls]) => calls.length > 0).map(([verb, calls]) => [verb, calls.length]))
+}
+
+/**
+ * Wrap every verb of the harness's stub client, in place, so each call from
+ * now on also appends the verb's name to the returned list, in call order.
+ * Every function the client has is wrapped (unlike the stub's own `calls`
+ * log, which a case reads verb by verb), so the list holds exactly the calls
+ * made, a stray `readPane`, `sendKeys`, `pause` or `decide` included.
+ */
+export function recordCallOrder(h: RecoveryHarness): string[] {
+  const order: string[] = []
+  const client = h.stub.client as unknown as Record<string, unknown>
+  for (const name of Object.keys(client)) {
+    const verb = client[name]
+    if (typeof verb !== 'function') continue
+    client[name] = (...args: unknown[]): unknown => {
+      order.push(name)
+      return (verb as (...a: unknown[]) => unknown).apply(client, args)
+    }
+  }
+  return order
 }
 
 /**

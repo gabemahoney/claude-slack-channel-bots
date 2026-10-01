@@ -436,6 +436,7 @@ import {
   conditionStartedLines,
   makeRecoveryHarness,
   personaOf as harnessPersona,
+  recordCallOrder,
   unclassifiedLinePrefix,
   unclassifiedStartedLine,
   unclassifiedStartedLines,
@@ -12923,25 +12924,6 @@ function statusAnswering(state: LatchRowState): RecoveryStubScript {
   if (state.kind === LATCH_ROW_STATE_KIND_NO_ROW) return { statusError: errSpawnNotFound() }
   if (state.kind === LATCH_ROW_STATE_KIND_READ) return { statusResult: cannedStatusResult({ state: state.state as RecoveryRowState }) }
   return { statusError: errTmuxUnresponsive('status') }
-}
-
-/**
- * Wrap every verb of the harness's stub client so each call also appends the
- * verb's name to the returned list, in call order (every verb, unlike the
- * stub's own `callLog`).
- */
-function recordCallOrder(h: RecoveryHarness): string[] {
-  const order: string[] = []
-  const client = h.stub.client as unknown as Record<string, unknown>
-  for (const name of Object.keys(client)) {
-    const verb = client[name]
-    if (typeof verb !== 'function') continue
-    client[name] = (...args: unknown[]): unknown => {
-      order.push(name)
-      return (verb as (...a: unknown[]) => unknown).apply(client, args)
-    }
-  }
-  return order
 }
 
 /** `persona`'s row in its own directory reading `state`, with no `config_dir` label (b.av2 SR-6.2: never resumed). */

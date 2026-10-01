@@ -65,6 +65,20 @@
  * notice, by which P's timer, `tmux-unresponsive` condition and
  * unclassified episode are all closed, and nothing fires for P afterwards.
  *
+ * SRJ-504's restart legs (AC 45, on `makeRecoveryHarness`): a server restart
+ * is two harness lifetimes, the first cleaned up before the second is built,
+ * each over a stub answering the same condition. In each lifetime P's
+ * bring-up latches it with the one fresh latch reaction (set latched, the
+ * three holds, one CONFLICT post), no spawn-failure notice and only the leg's
+ * calls; before the second lifetime's first attempt P is unlatched, with no
+ * record, event, post or call. The scan leg: the plain first spawn meets
+ * `scan-leftover`, recorded "plain spawn" with no row (the latch-time `status`
+ * read answers `ErrSpawnNotFound`). The "no valid label" leg, as today's
+ * ladder reaches it (E22 makes its last step the reuse spawn): collision,
+ * `get` reading `ended` with no session id, `resume` answering
+ * `ErrNoSessionId`, delete, then the plain spawn answering `no-valid-id`,
+ * recorded "plain spawn" with the collision `get`'s `ended`.
+ *
  * Pure module under test, except the recovery-harness cases: one
  * `createConflictLatch` per test over a line capture and a recording
  * observer; `afterEach` runs `assertNoLeak` over every line, event and record
@@ -221,6 +235,7 @@ import {
   cannedStatusResult,
   errGeneric,
   errInternal,
+  errNoSessionId,
   errSpawnNotFound,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
@@ -244,11 +259,13 @@ import {
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
+  callCounts,
   collided,
   conditionEndedLine,
   conditionRecoveryLine,
   makeRecoveryHarness,
   personaOf,
+  recordCallOrder,
   unclassifiedEndedLine,
   unclassifiedStartedLine,
   unclassifiedStartedLines,
@@ -1638,5 +1655,117 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
     expect(h2.stub.calls.spawnCalls.length).toBe(1)
     expect(h2.latch.isLatched(p)).toBe(false)
     expect(h2.latchEvents).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRJ-504: a server restart drops every latch; the next attempt meeting the
+// same condition latches again with exactly one post (AC 45)
+// ---------------------------------------------------------------------------
+
+describe('SRJ-504: after a server restart a persona that was latched latches again with exactly one post (recovery harness)', () => {
+  const scanRow = rowWhere(
+    (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.stubCase === 'scan-leftover' && row.rowState === LATCH_ROW_STATE_NO_ROW,
+  )
+  const noValidIdRow = rowWhere((row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.latchCase === LATCH_CASE_NO_VALID_ID)
+
+  /**
+   * Each leg: the row its refusal is, the stub's answers (the same in both
+   * lifetimes: the condition still holds after the restart), the row state the
+   * latch records by T3's rule, and the calls the bring-up's launch makes.
+   */
+  const RESTART_LEGS: ReadonlyArray<
+    readonly [string, ConflictCaseRow, (h: RecoveryHarness, key: string) => RecoveryStubScript, LatchRowState, readonly string[]]
+  > = [
+    [
+      // The scan's refusal wrote no row, so the bring-up's plain first spawn
+      // meets the scan again; the latch-time status read finds no row (HO rev 15).
+      'the scan leg: the bring-up\'s plain first spawn meets scan-leftover again',
+      scanRow,
+      () => ({ spawnError: scanRow.build(), statusError: errSpawnNotFound() }),
+      LATCH_ROW_STATE_NO_ROW,
+      ['spawn', 'status'],
+    ],
+    [
+      // Today's ladder (E22 makes the last step the reuse spawn): the row reads
+      // ended with no session id, so the resume answers ErrNoSessionId, the row
+      // is deleted and the plain spawn meets "duplicate session"; the collision
+      // get's ended is the last read before it (no diagnosis get for ErrNoSessionId).
+      'the "no valid label" leg: collision, get ended with no session id, resume ErrNoSessionId, delete, plain spawn no-valid-id',
+      noValidIdRow,
+      (h, key) => ({
+        ...collided(h, personaOf(h, key), { state: 'ended', claude_session_id: '' }, noValidIdRow.build()),
+        resumeError: errNoSessionId(),
+      }),
+      ENDED,
+      ['spawn', 'get', 'resume', 'delete', 'spawn'],
+    ],
+  ]
+
+  /** The reaction to one fresh latch of `key`: the set (latched, not relatched), the three holds, the one notice. */
+  const freshLatch = (key: string, text: string) => [
+    ['set', key, CONFLICT_LATCH_SET_LATCHED],
+    ['hold', key, 'retry timer stop'],
+    ['hold', key, 'tmux-unresponsive end'],
+    ['hold', key, 'unclassified-error end'],
+    ['notice', key, text],
+  ]
+  const latchReaction = (h: RecoveryHarness) =>
+    h.latchEvents.map((event) =>
+      event.step === 'set' ? [event.step, event.key, event.outcome] : event.step === 'hold' ? [event.step, event.key, event.hold] : [event.step, event.key, event.text],
+    )
+
+  /**
+   * One server lifetime's bring-up of P against the condition: the launch
+   * answers latched with the leg's record, the one fresh latch reaction and
+   * exactly one CONFLICT post, no spawn-failure notice and no spawn-failed
+   * entry, and only the leg's calls.
+   */
+  async function bringUpLatches(
+    h: RecoveryHarness,
+    row: ConflictCaseRow,
+    script: (h: RecoveryHarness, key: string) => RecoveryStubScript,
+    rowState: LatchRowState,
+    calls: readonly string[],
+  ): Promise<void> {
+    const [p, q] = h.keys as [string, string]
+    h.script(script(h, p))
+    const order = recordCallOrder(h)
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect(h.latch.record(p)).toMatchObject({
+      sessionName: row.sessionName,
+      latchCase: row.latchCase,
+      refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN,
+      rowState,
+    })
+    expect(order).toEqual([...calls])
+    expect(latchReaction(h)).toEqual(freshLatch(p, row.notice.text))
+    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(h.latch.isLatched(q)).toBe(false)
+  }
+
+  test.each(RESTART_LEGS)('%s: P latches in the first lifetime; the second starts with P unlatched and latches it again with one post', async (_label, row, script, rowState, calls) => {
+    // The first server lifetime: P latches at its bring-up.
+    const h1 = makeRecoveryHarness()
+    harnesses.push(h1)
+    const p = h1.keys[0]!
+    await bringUpLatches(h1, row, script, rowState, calls)
+    // The restart: cleaned up here (so out of the afterEach list), leak-checked as afterEach would.
+    harnesses = harnesses.filter((h) => h !== h1)
+    assertNoLeak(h1.captured())
+    h1.cleanup()
+
+    // The second lifetime, over a stub still answering the same condition.
+    const h2 = makeRecoveryHarness()
+    harnesses.push(h2)
+    expect(h2.keys[0]).toBe(p)
+    // Nothing carried over: before its first attempt P is unlatched, with no record, no latch event and no post.
+    expect([h2.latch.isLatched(p), h2.latch.record(p)]).toEqual([false, undefined])
+    expect([h2.latchEvents, h2.episodeNotices, callCounts(h2)]).toEqual([[], [], {}])
+
+    await bringUpLatches(h2, row, script, rowState, calls)
   })
 })

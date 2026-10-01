@@ -35,8 +35,19 @@
  *      all-clear) and again after them (so a flag a failing call raised does
  *      not survive). Its restart failure count, health-check streak,
  *      not-connected episode (b.f2b: its notice latch and the restart path's
- *      idle evidence) and notice episodes of every kind (b.jg5 SRJ-1016) are
- *      forgotten, silently;
+ *      idle evidence), its latch (b.jg5 SRJ-504) and then its notice episodes
+ *      of every kind (b.jg5 SRJ-1016) are forgotten, silently. The latch and
+ *      the episodes go after the launch in flight settled (step 2), so a latch
+ *      that launch set during the teardown, and the CONFLICT episode it began,
+ *      go too (SRJ-1002) (that latch's CONFLICT notice was raised at the set,
+ *      while the connection still served: the notifier drops it for a removed
+ *      persona and, for a destructive modify's old half, posts it to the
+ *      destination of the declaration now applied, the new half's; routing it
+ *      to the teardown's log-only entry is not built yet): the key is left
+ *      neither latched nor with a CONFLICT episode open, so a destructive
+ *      modify's new half starts unlatched and, if its own launch meets the
+ *      same CONFLICT, latches with one post. No recovery notice is posted and
+ *      no clear is logged;
  *   8. its reply-guard record is deleted and its launched-with directory
  *      forgotten (read first), then the Stop-hook launch pass re-evaluates
  *      the persona's configured and launched-with directories against the
@@ -315,6 +326,15 @@ export interface PersonaLifecycleDeps {
    * after its launch in flight settled; other personas' episodes stay open.
    */
   forgetNoticeEpisodes: (key: string) => unknown
+  /**
+   * Forget the key's latch silently (b.jg5 SRJ-504: the latch instance's
+   * `forget`): no post, no set observer call, no line claiming a clear. Run
+   * after its launch in flight settled and after the teardown's
+   * agent-director calls, so a latch that launch set during the teardown
+   * goes too (SRJ-1002), and right before `forgetNoticeEpisodes`, which ends
+   * the CONFLICT episode that latch began; other personas' latches stay.
+   */
+  forgetConflictLatch: (key: string) => unknown
   /** Forget the keys' outage flags silently (`resetAllToHealthy`). */
   resetOutageState: (keys: string[]) => void
   /** Drop the key's tracked permission prompts and wedge state (`forgetPersonaPrompts`). */
@@ -547,6 +567,12 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     await step('forgetting its restart failure count', () => deps.forgetFailures(key))
     await step('forgetting its health-check streak', () => deps.forgetDisconnectedStreak(key))
     await step('forgetting its not-connected episode', () => deps.forgetNotConnectedEpisode?.(key))
+    // b.jg5 SRJ-504, SRJ-1002: silently, after its launch in flight settled
+    // and after the agent-director calls, so a latch that launch set during
+    // the teardown goes too; then its notice episodes, the CONFLICT episode
+    // that latch began included, so neither is left open: a CONFLICT episode
+    // left open would keep a later same-case latch from posting.
+    await step('forgetting its latch', () => deps.forgetConflictLatch(key))
     await step('forgetting its notice episodes', () => deps.forgetNoticeEpisodes(key))
 
     // Read the launched-with dir before the teardown forgets it.

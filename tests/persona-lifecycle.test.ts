@@ -16,6 +16,9 @@
  * - the ack-reaction entries: the real ack tracker's `forgetPersonaAcks`;
  * - the notice episodes (b.jg5 SRJ-1016): a real `createPersonaEpisodes`
  *   instance on a fake clock, its `forget` as `forgetNoticeEpisodes`;
+ * - the latch (b.jg5 SRJ-504): a real `createConflictLatch` with the CONFLICT
+ *   notice bound to real notice episodes over a recording sink, its `forget`
+ *   as `forgetConflictLatch`;
  * - serialization behind a restart: the real restart module
  *   (`initRestart` with `serialize`, real `cancelRestartTimer`). Its timer is
  *   a real `setTimeout` (1 ms here; it takes no fake clock), waited for by a
@@ -46,6 +49,22 @@ import { resetClientForTests, setClientForTests, getClient } from '../src/agent-
 import { ErrSystemInstallDisappeared } from '../src/agent-director-errors.ts'
 import { _resetAckTracker, consumeAck, forgetPersonaAcks, trackAck } from '../src/ack-tracker.ts'
 import { _resetBackoffState } from '../src/backoff.ts'
+import {
+  bindConflictNotice,
+  CONFLICT_LATCH_SET_LATCHED,
+  CONFLICT_LATCH_SET_SAME_CASE,
+  conflictNoticeText,
+  createConflictLatch,
+  LATCH_CASE_LEFTOVER,
+  LATCH_CASE_OWN_ID,
+  LATCH_ROW_STATE_NO_ROW,
+  latchRowStateRead,
+  REFUSED_OPERATION_PLAIN_SPAWN,
+  REFUSED_OPERATION_RESUME,
+  type ConflictLatch,
+  type ConflictLatchRecord,
+  type ConflictLatchSetInput,
+} from '../src/conflict-latch.ts'
 import { _resetOutageState, getOutageFlags, initOutageState, resetAllToHealthy, setOutageFlag } from '../src/outage-state.ts'
 import {
   createPersonaBringUpController,
@@ -59,7 +78,13 @@ import {
 } from '../src/persona-bringup-controller.ts'
 import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
 import { credentialsDigest, readCredentialsFile } from '../src/persona-credentials.ts'
-import { createPersonaEpisodes, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE, PERSONA_EPISODE_KINDS } from '../src/persona-episodes.ts'
+import {
+  createPersonaEpisodes,
+  PERSONA_EPISODE_KIND_CONFLICT,
+  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
+  PERSONA_EPISODE_KINDS,
+  type PersonaEpisodes,
+} from '../src/persona-episodes.ts'
 import {
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
@@ -172,7 +197,7 @@ type DepName =
   | 'whenLaunchSettled' | 'connections.stop'
   | 'routing.forget' | 'forgetAcks' | 'destinations.forget' | 'destinationHold.cancel' | 'notifier.forget' | 'forgetPersonaPrompts'
   | 'dropSession' | 'resetOutageState' | 'killInstance' | 'deleteInstance' | 'forgetFailures'
-  | 'forgetDisconnectedStreak' | 'forgetNotConnectedEpisode' | 'forgetNoticeEpisodes' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
+  | 'forgetDisconnectedStreak' | 'forgetNotConnectedEpisode' | 'forgetConflictLatch' | 'forgetNoticeEpisodes' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
   | 'storageCheck' | 'launch' | 'connections.reconnectCredentials' | 'connections.replaceRetryTokens'
 
 /** Dependencies whose production form returns a promise: their failure is a rejection, the others' a throw. */
@@ -312,6 +337,7 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
     forgetFailures: rec('forgetFailures', byKey, () => undefined),
     forgetDisconnectedStreak: rec('forgetDisconnectedStreak', byKey, () => undefined),
     forgetNotConnectedEpisode: rec('forgetNotConnectedEpisode', byKey, () => undefined),
+    forgetConflictLatch: rec('forgetConflictLatch', byKey, () => false),
     forgetNoticeEpisodes: rec('forgetNoticeEpisodes', byKey, () => undefined),
     resetOutageState: rec('resetOutageState', (keys: string[]) => keys.join(','), () => undefined),
     forgetPersonaPrompts: rec('forgetPersonaPrompts', byKey, () => 0),
@@ -362,8 +388,8 @@ function teardownTurnTrail(p: Persona, launchPass: string): string[] {
     `connections.stop:${k}`, `routing.forget:${k}`, `forgetAcks:${k}`, `destinations.forget:${k}`, `destinationHold.cancel:${k}`,
     `notifier.forget:${k}`, `forgetPersonaPrompts:${k}`, `dropSession:${k}`,
     `resetOutageState:${k}`, `killInstance:${k}`, `deleteInstance:${k}`, `resetOutageState:${k}`, `stopRetryTimer:${k}`,
-    `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`, `forgetNotConnectedEpisode:${k}`, `forgetNoticeEpisodes:${k}`,
-    `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPass}`,
+    `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`, `forgetNotConnectedEpisode:${k}`, `forgetConflictLatch:${k}`,
+    `forgetNoticeEpisodes:${k}`, `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPass}`,
   ]
 }
 
@@ -552,6 +578,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['forgetFailures', 'forgetting its restart failure count', 1],
     ['forgetDisconnectedStreak', 'forgetting its health-check streak', 1],
     ['forgetNotConnectedEpisode', 'forgetting its not-connected episode', 1],
+    ['forgetConflictLatch', 'forgetting its latch', 1],
     ['forgetNoticeEpisodes', 'forgetting its notice episodes', 1],
     ['replyGuard.launchedWithDir', 'reading its launched-with directory', 1],
     ['replyGuard.teardown', 'deleting its reply-guard record', 1],
@@ -579,15 +606,15 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
       'bringUps.cancel', 'cancelRestartTimer', 'stopRetryTimer', 'cancelLaunchWait', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
       'forgetAcks', 'destinations.forget', 'destinationHold.cancel', 'notifier.forget', 'forgetPersonaPrompts', 'dropSession',
       'resetOutageState', 'killInstance', 'deleteInstance', 'forgetFailures', 'forgetDisconnectedStreak', 'forgetNotConnectedEpisode',
-      'forgetNoticeEpisodes', 'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
+      'forgetConflictLatch', 'forgetNoticeEpisodes', 'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
     ]
     const f = makeFixture({ fail: all })
 
     await f.lifecycle.teardown(f.b)
 
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
-    // 23 dependencies; resetOutageState and stopRetryTimer each run (and fail) twice.
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 25 failed step(s)`)
+    // 24 dependencies; resetOutageState and stopRetryTimer each run (and fail) twice.
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 26 failed step(s)`)
     assertNoLeak({ lines: f.lines })
   })
 
@@ -635,12 +662,18 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(consumeAck(a, 'C0ALPHA001', '1700000000.000300')).toBe(true)
   })
 
-  // Rows: how forgetting B's notice episodes fails (the step's production form returns nothing, but a rejection is awaited too).
-  test.each<['throws' | 'rejects']>([['throws'], ['rejects']])('b.jg5 SRJ-1016: forgetting B\'s notice episodes %s: its step is logged token-safely by its own phrase, every other step still runs, and the teardown completes with one failed step', async (how) => {
+  // Rows: the forget that fails (b.jg5 SRJ-1016's notice episodes, SRJ-504's latch), its step
+  // phrase, and how (neither production form returns a promise, but a rejection is awaited too).
+  test.each<['forgetNoticeEpisodes' | 'forgetConflictLatch', string, 'throws' | 'rejects']>([
+    ['forgetNoticeEpisodes', 'forgetting its notice episodes', 'throws'],
+    ['forgetNoticeEpisodes', 'forgetting its notice episodes', 'rejects'],
+    ['forgetConflictLatch', 'forgetting its latch', 'throws'],
+    ['forgetConflictLatch', 'forgetting its latch', 'rejects'],
+  ])('b.jg5: %s failing (%s; it %s): its step is logged token-safely by its own phrase, every other step still runs, and the teardown completes with one failed step', async (dep, phrase, how) => {
     const f = makeFixture({
       overrides: {
-        forgetNoticeEpisodes: (key) => {
-          f.trail.push(`forgetNoticeEpisodes:${key}`)
+        [dep]: (key: string) => {
+          f.trail.push(`${dep}:${key}`)
           if (how === 'rejects') return Promise.reject(failure())
           throw failure()
         },
@@ -651,7 +684,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
     expect(f.lines.slice(1)).toEqual([
-      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: forgetting its notice episodes failed: Error`)}( |$)`)),
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${phrase} failed: Error`)}( |$)`)),
       `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
     ])
     assertNoLeak({ lines: f.lines })
@@ -840,6 +873,188 @@ describe('persona teardown of a key still applied (the old half of a destructive
 })
 
 // ---------------------------------------------------------------------------
+// Persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the latch
+// ends silently with its persona, a latch its launch in flight set included.
+// ---------------------------------------------------------------------------
+
+describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the key\'s latch and CONFLICT episode end silently, for that key only', () => {
+  interface LatchFixture {
+    f: Fixture
+    latch: ConflictLatch
+    episodes: PersonaEpisodes
+    /** Every notice the episodes' sink received (the persona notifier in production), in order. */
+    posts: Array<{ key: string; text: string }>
+    /** The latch's and the episodes' log lines. */
+    latchLines: string[]
+  }
+
+  /**
+   * A real latch with the CONFLICT notice bound to real notice episodes (fake
+   * clock, recording sink), as `main()` binds them; the lifecycle's latch and
+   * episodes forgets are theirs, each recorded in the trail first so the
+   * order is asserted with the other steps. `launchInFlight` is B's launch in
+   * flight, given the latch.
+   */
+  function makeLatched(opts: { launchInFlight?: (latch: ConflictLatch) => Promise<void>; dryRun?: boolean } = {}): LatchFixture {
+    const clock = createFakeClock()
+    const posts: LatchFixture['posts'] = []
+    const latchLines: string[] = []
+    const episodes = createPersonaEpisodes({ sink: (key, text) => void posts.push({ key, text }), log: (line) => void latchLines.push(line), clock })
+    const latch = createConflictLatch({ log: (line) => void latchLines.push(line) })
+    bindConflictNotice(latch, episodes)
+    const f: Fixture = makeFixture({
+      dryRun: opts.dryRun ?? false,
+      ...(opts.launchInFlight !== undefined ? { launchInFlight: () => opts.launchInFlight!(latch) } : {}),
+      overrides: {
+        forgetConflictLatch: (key) => {
+          f.trail.push(`forgetConflictLatch:${key}`)
+          return latch.forget(key)
+        },
+        forgetNoticeEpisodes: (key) => {
+          f.trail.push(`forgetNoticeEpisodes:${key}`)
+          episodes.forget(key)
+        },
+      },
+    })
+    cleanups.push(() => {
+      expect(clock.pendingCount()).toBe(0)
+      assertNoLeak({ lines: f.lines, latchLines, posts })
+    })
+    return { f, latch, episodes, posts, latchLines }
+  }
+
+  /** B's plain spawn refused by the pre-spawn scan ("left over from an earlier life", no row; HO §7 scenario 19). */
+  const LEFTOVER: ConflictLatchSetInput = { latchCase: LATCH_CASE_LEFTOVER, refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: LATCH_ROW_STATE_NO_ROW }
+  /** A's `resume` refused with "own id", its row read `ended`. */
+  const OWN_ID: ConflictLatchSetInput = { latchCase: LATCH_CASE_OWN_ID, refusedOperation: REFUSED_OPERATION_RESUME, rowState: latchRowStateRead('ended') }
+
+  /** The CONFLICT notice B's leftover latch posts. */
+  function leftoverNotice(r: LatchFixture): { key: string; text: string } {
+    const record = r.latch.record(r.f.b.key)!
+    return { key: r.f.b.key, text: conflictNoticeText({ sessionName: record.sessionName, latchCase: LATCH_CASE_LEFTOVER, description: record.description }) }
+  }
+
+  test('tearing latched B down leaves B unlatched with no CONFLICT episode open, posts nothing (no recovery notice) and logs no clear; A\'s latch, record and posted episode stay; B added again latches with exactly one new post', async () => {
+    const r = makeLatched()
+    const [a, b] = [r.f.a.key, r.f.b.key]
+    r.latch.set(a, OWN_ID)
+    r.latch.set(b, LEFTOVER)
+    const bNotice = leftoverNotice(r)
+    expect(r.posts.map((p) => p.key)).toEqual([a, b])
+    const aRecord = r.latch.record(a)
+    const aEpisode = r.episodes.view(a, PERSONA_EPISODE_KIND_CONFLICT)
+    const postsBefore = [...r.posts]
+    const linesBefore = [...r.latchLines]
+
+    await r.f.lifecycle.teardown(r.f.b)
+    await flush()
+
+    expect(r.f.trail).toEqual(fullTeardownTrail(r.f.b, launchPassOf(r.f, undefined)))
+    expect(r.f.lines).toEqual([`${teardownPrefix(r.f.b)}: starting`, `${teardownPrefix(r.f.b)}: complete`])
+    expect(r.latch.isLatched(b)).toBe(false)
+    expect(r.latch.record(b)).toBeUndefined()
+    expect(r.episodes.isOpen(b, PERSONA_EPISODE_KIND_CONFLICT)).toBe(false)
+    expect(r.posts).toEqual(postsBefore)
+    expect(r.latchLines).toEqual(linesBefore)
+    expect(r.latch.isLatched(a)).toBe(true)
+    expect(r.latch.record(a)).toBe(aRecord)
+    expect(r.episodes.view(a, PERSONA_EPISODE_KIND_CONFLICT)).toEqual(aEpisode)
+
+    // B added again: its next attempt meeting the same case latches it afresh, with one post.
+    expect(r.latch.set(b, LEFTOVER)).toBe(CONFLICT_LATCH_SET_LATCHED)
+    expect(r.posts.slice(postsBefore.length)).toEqual([bNotice])
+  })
+
+  test('SRJ-1002: a latch B\'s launch in flight sets as it settles during the teardown is forgotten too (the forget waits for the launch), and its CONFLICT episode is not left open: a later same-case latch posts again', async () => {
+    const release = Promise.withResolvers<void>()
+    let postsAtSettle = -1
+    let bRecordAtSettle: ConflictLatchRecord | undefined
+    const r = makeLatched({
+      // B's held launch: once released, its plain spawn is refused by the pre-spawn scan, latching B.
+      launchInFlight: (latch) =>
+        release.promise.then(() => {
+          latch.set(r.f.b.key, LEFTOVER)
+          bRecordAtSettle = latch.record(r.f.b.key)
+          postsAtSettle = r.posts.length
+        }),
+    })
+    const [a, b] = [r.f.a.key, r.f.b.key]
+    r.latch.set(a, OWN_ID)
+    const aRecord = r.latch.record(a)!
+    const aNotice = { key: a, text: conflictNoticeText({ sessionName: aRecord.sessionName, latchCase: LATCH_CASE_OWN_ID, description: aRecord.description }) }
+    const full = fullTeardownTrail(r.f.b, launchPassOf(r.f, undefined))
+
+    const done = r.f.lifecycle.teardown(r.f.b)
+    await flush()
+    // The teardown waits for the launch: nothing after the wait has run.
+    expect(r.f.trail).toEqual(untilLaunchSettled(full, r.f.b))
+    expect(r.latch.isLatched(b)).toBe(false)
+
+    release.resolve()
+    await done
+    await flush()
+
+    expect(r.latch.isLatched(b)).toBe(false)
+    expect(r.episodes.isOpen(b, PERSONA_EPISODE_KIND_CONFLICT)).toBe(false)
+    expect(r.f.trail).toEqual(full)
+    expect(r.f.lines).toEqual([`${teardownPrefix(r.f.b)}: starting`, `${teardownPrefix(r.f.b)}: complete`])
+    // The posts are A's own notice, then the one B's in-flight latch posted as
+    // the launch settled (pinned as today's behaviour: a later Epic routes an
+    // in-flight latch's notice to the log only, and this pin changes then).
+    // The teardown itself posted nothing after the launch settled.
+    expect(bRecordAtSettle).toBeDefined()
+    expect(bRecordAtSettle!.latchCase).toBe(LATCH_CASE_LEFTOVER)
+    const bNoticeAtSettle = { key: b, text: conflictNoticeText({ sessionName: bRecordAtSettle!.sessionName, latchCase: LATCH_CASE_LEFTOVER, description: bRecordAtSettle!.description }) }
+    expect(postsAtSettle).toBe(2)
+    expect(r.posts).toEqual([aNotice, bNoticeAtSettle])
+    expect(r.latch.isLatched(a)).toBe(true)
+
+    // B added again, meeting the same case: a new episode, so exactly one new post.
+    expect(r.latch.set(b, LEFTOVER)).toBe(CONFLICT_LATCH_SET_LATCHED)
+    expect(r.posts.slice(postsAtSettle)).toEqual([leftoverNotice(r)])
+  })
+
+  test('the old half of a destructive modify (B still applied) forgets B\'s latch too: the new half starts unlatched and, meeting the same CONFLICT itself, latches with exactly one post for B', async () => {
+    const r = makeLatched()
+    const b = r.f.b
+    r.f.applied.push(b) // B keeps its key applied until step 6 brings its new declaration up
+    r.latch.set(r.f.a.key, OWN_ID)
+    r.latch.set(b.key, LEFTOVER)
+    const bNotice = leftoverNotice(r)
+    const postsBefore = r.posts.length
+
+    await r.f.lifecycle.teardown(b)
+    await flush()
+
+    const launchPass = `${JSON.stringify([b.claude_config_dir, undefined])}:[${r.f.a.key},${b.key}]`
+    expect(r.f.trail).toEqual(stillAppliedTeardownTrail(b, launchPass))
+    expect(r.latch.isLatched(b.key)).toBe(false)
+    expect(r.episodes.isOpen(b.key, PERSONA_EPISODE_KIND_CONFLICT)).toBe(false)
+    expect(r.posts).toHaveLength(postsBefore)
+    expect(r.latch.isLatched(r.f.a.key)).toBe(true)
+
+    // The new half's own launch meets the same CONFLICT (twice): one latch, one post.
+    expect(r.latch.set(b.key, LEFTOVER)).toBe(CONFLICT_LATCH_SET_LATCHED)
+    expect(r.latch.set(b.key, LEFTOVER)).toBe(CONFLICT_LATCH_SET_SAME_CASE)
+    expect(r.posts.slice(postsBefore)).toEqual([bNotice])
+  })
+
+  test('dry run: B\'s latch and CONFLICT episode are still forgotten silently (only the agent-director kill and delete are skipped)', async () => {
+    const r = makeLatched({ dryRun: true })
+    r.latch.set(r.f.b.key, LEFTOVER)
+    const postsBefore = r.posts.length
+
+    await r.f.lifecycle.teardown(r.f.b)
+    await flush()
+
+    expect(r.f.trail).not.toContain(`killInstance:${r.f.b.key}`)
+    expect(r.latch.isLatched(r.f.b.key)).toBe(false)
+    expect(r.episodes.isOpen(r.f.b.key, PERSONA_EPISODE_KIND_CONFLICT)).toBe(false)
+    expect(r.posts).toHaveLength(postsBefore)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Persona teardown with the real agent-director calls, outage state,
 // notifier and destination hold: no wind-down, no flag and no notice left.
 // ---------------------------------------------------------------------------
@@ -953,9 +1168,9 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
 
     const id = personaInstanceId(r.f.b.key)
     expect(r.adOrder).toEqual([`kill:${id}`, `delete:${id}`])
-    expect(r.f.trail.slice(-7)).toEqual([
+    expect(r.f.trail.slice(-8)).toEqual([
       `forgetFailures:${r.f.b.key}`, `forgetDisconnectedStreak:${r.f.b.key}`, `forgetNotConnectedEpisode:${r.f.b.key}`,
-      `forgetNoticeEpisodes:${r.f.b.key}`,
+      `forgetConflictLatch:${r.f.b.key}`, `forgetNoticeEpisodes:${r.f.b.key}`,
       `replyGuard.launchedWithDir:${r.f.b.key}`, `replyGuard.teardown:${r.f.b.key}`,
       `replyGuard.launchPass:${launchPassOf(r.f, undefined)}`,
     ])

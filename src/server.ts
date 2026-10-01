@@ -1918,7 +1918,10 @@ export async function main(): Promise<void> {
   bindConflictNotice(conflictLatch, noticeEpisodes)
   // b.jg5 SRJ-501, SRJ-502: the collision ladder latches through it on a
   // CONFLICT at a spawn or resume, and launches no latched persona. The
-  // restart work, the retry action and the health tick ask it below.
+  // restart work, the retry action and the health tick ask it below. A
+  // persona's teardown forgets its latch silently (b.jg5 SRJ-504; bound into
+  // the persona lifecycle below); a server restart drops every latch with the
+  // process, so there is no forget-all at shutdown.
   setConflictLatch(conflictLatch)
 
   // b.jg5 SRJ-313, SRJ-1009: each persona's unclassified-error episode, held
@@ -2172,6 +2175,10 @@ export async function main(): Promise<void> {
     forgetFailures,
     forgetDisconnectedStreak,
     forgetNotConnectedEpisode,
+    // b.jg5 SRJ-504: the teardown forgets the key's latch silently (no
+    // observer call, no post, no line), after its launch in flight settled
+    // and right before its notice episodes, the CONFLICT episode included.
+    forgetConflictLatch: (key) => conflictLatch.forget(key),
     forgetNoticeEpisodes: (key) => noticeEpisodes.forget(key),
     resetOutageState: resetAllToHealthy,
     forgetPersonaPrompts,

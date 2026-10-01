@@ -2368,7 +2368,7 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(indicesOf(new RegExp(`\\.\\s*${ADD_OBSERVER}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build, its two bindings, its install and its three latched queries, and the latch module imports no file-system module', () => {
+  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build, its two bindings, its install, its three latched queries and the teardown\'s forget, and the latch module imports no file-system module', () => {
     const latch = constOf(FACTORY)
 
     // No seed: no statement in main()'s own list records a latch, and nothing
@@ -2381,9 +2381,10 @@ describe('main() builds the one per-persona latch, in server memory only, before
     // and the notice's binding (b.jg5 SRJ-502, SRJ-508), the session
     // manager's install, and the retry action's, the restart module's and the
     // health check's latched queries (their forms are pinned in the describe
-    // below).
+    // below), and the persona teardown's latch forget (b.jg5 SRJ-504; its
+    // form is pinned in tests/reload-wiring.test.ts).
     const named = indicesOf(new RegExp(`\\b${latch}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(7)
+    expect(named).toHaveLength(8)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${latch}\\b`))!
     expect(named[0]).toBe(decl.index! + decl[0].length - latch.length)
     const within = (call: string) => {
@@ -2391,8 +2392,9 @@ describe('main() builds the one per-persona latch, in server memory only, before
       return named.filter((at) => at >= open && at < close).length
     }
     expect(
-      [BIND_LATCH_HOLDS, BIND, 'setConflictLatch', 'createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map(within),
-    ).toEqual([1, 1, 1, 1, 1, 1])
+      [BIND_LATCH_HOLDS, BIND, 'setConflictLatch', 'createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaLifecycle'].map(within),
+    ).toEqual([1, 1, 1, 1, 1, 1, 1])
+    expect(onlyCallProps('createPersonaLifecycle').get('forgetConflictLatch')).toContain(`${latch}.`)
 
     // The factory itself reads no file: the latch module imports no
     // file-system module and opens no file through Bun.

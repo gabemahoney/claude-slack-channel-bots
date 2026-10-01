@@ -41,6 +41,14 @@
  * directories. Step 5 is read from `run.lifecycle.applyTimeline` and the
  * stub's `makeTemplate` captures.
  *
+ * The latch block (b.jg5 SRJ-504, AC 45) latches a persona through the real
+ * launch path (a fresh spawn meets a `CONFLICT_CASE_ROWS` refusal scripted on
+ * the stub's spawn queue), then destructively modifies it, and reads the
+ * run's latch (`run.latch`), its CONFLICT notices (`run.episodeNotices`) and
+ * the posts they made: the old half's teardown forgets the latch silently,
+ * and the new half latches, with one post to its own destination, only if its
+ * own spawn meets the same refusal.
+ *
  * The AC 20 block (b.av2 SR-10.3, apply side) drives every apply-time Slack
  * contact, a locally invalid confirmed credentials file, a rejected Web API
  * call, a failing teardown step, both step-5 outcomes, a held reconnect and
@@ -64,6 +72,7 @@ import { dirname, join, relative } from 'node:path'
 
 import type { PersonaConfigInput, PersonaInput } from '../src/config.ts'
 import { isCredentialsBroken, type PersonaBringUpOutcome } from '../src/persona-bringup-controller.ts'
+import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import {
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
@@ -80,7 +89,9 @@ import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src
 import type { InPlaceSetting } from '../src/reload-plan.ts'
 import { RELOAD_APPLIED, RELOAD_NOOP } from '../src/reload.ts'
 import { personaConfigDirLabelValue } from '../src/session-manager.ts'
-import { errTemplateMalformed, stubCallCount } from './test-helpers/agent-director-stub.ts'
+import { REFUSED_OPERATION_PLAIN_SPAWN } from '../src/conflict-latch.ts'
+import { cannedErr, errTemplateMalformed, stubCallCount, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
+import { CONFLICT_CASE_ROWS } from './test-helpers/conflict-cases.ts'
 import {
   APP_TOKEN_PREFIX,
   assertNoLeak,
@@ -2633,6 +2644,123 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
       expectNoPostNoLeak(run)
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// A destructive modify of a latched persona (b.jg5 SRJ-504, AC 45)
+// ---------------------------------------------------------------------------
+
+/** The pre-spawn scan's refusal of a plain spawn (no row written): what a fresh spawn of a deleted row can meet. */
+const SCAN_LEFTOVER = CONFLICT_CASE_ROWS.find(
+  (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.stubCase === 'scan-leftover',
+)!
+
+/** The stub's spawn answers, in order (each spawn that reaches the stub takes the next; an empty queue spawns). */
+type SpawnQueue = NonNullable<StubClientOptions['spawnQueue']>
+
+/** A post's channel and text. */
+function postOf(call: StubWebCall): { channel: string; text: string } {
+  const { channel, text } = call.args as { channel: string; text: string }
+  return { channel, text }
+}
+
+describe('b.jg5 SRJ-504: a destructive modify does not carry a latch over to its new half, which latches, with one post to its own destination, only if it meets the same CONFLICT itself (AC 45; real launch)', () => {
+  beforeEach(useConfigDirs)
+
+  test.each<{ label: string; again: boolean }>([
+    { label: 'its fresh spawn succeeds: up and unlatched, nothing posted', again: false },
+    { label: 'its fresh spawn meets the same CONFLICT: latched again with exactly one post, to the new declaration’s destination', again: true },
+  ])("bravo, latched by a CONFLICT at a fresh spawn, is destructively modified (working directory and destination moved): the old half's teardown forgets the latch and posts nothing, and the new half's spawn reaches agent-director; $label; alpha gets no call", async ({ again }) => {
+    const spawnQueue: SpawnQueue = []
+    const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { spawnQueue } })
+    const [alpha, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const bravoId = personaInstanceId(bravoKey)
+    const oldDestination = bravo!.permission_prompts!
+    expect(run.latch.isLatched(alphaKey)).toBe(false)
+    expect(run.latch.isLatched(bravoKey)).toBe(false)
+
+    // A first destructive modify latches bravo: its fresh spawn meets the scan's refusal.
+    spawnQueue.push(cannedErr(SCAN_LEFTOVER.build()))
+    const latchedDeclaration = movedDirectory(bravo!)
+    await applyConfig(run, [alpha!, latchedDeclaration])
+    expect(run.lifecycle.records.filter((r) => r.op === 'launch' && r.key === bravoKey).at(-1)?.action).toBe('latched')
+    expect(run.latch.record(bravoKey)).toMatchObject({
+      latchCase: SCAN_LEFTOVER.latchCase,
+      refusedOperation: SCAN_LEFTOVER.refusedOperation,
+      rowState: SCAN_LEFTOVER.rowState,
+    })
+    expect(h.rowOf('bravo')).toBeUndefined()
+    expect(run.episodeNotices).toEqual([{ key: bravoKey, text: SCAN_LEFTOVER.notice.text }])
+    const posted = formatPersonaNotice({ name: 'bravo', key: bravoKey }, SCAN_LEFTOVER.notice.text)
+    expect(run.slackPosts().map(postOf)).toEqual([{ channel: oldDestination, text: posted }])
+
+    // The second destructive modify: a new working directory, and a destination no other persona claims.
+    const newDestination = h.persona('charlie').permission_prompts!
+    const moved = h.persona('bravo', {
+      working_directory: join(dirname(bravo!.working_directory), 'moved-again'),
+      channels: [...bravo!.channels!, { id: newDestination, delivery: 'all' }],
+      permission_prompts: newDestination,
+    })
+    h.makeWorkingDirectory(moved)
+    if (again) spawnQueue.push(cannedErr(SCAN_LEFTOVER.build()))
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const noticesFrom = run.episodeNotices.length
+    const postsFrom = run.slackPosts().length
+    const gate = run.lifecycle.hold('bring-up', bravoKey)
+    const cp = run.checkpoint()
+
+    const { applying } = await confirmConfig(run, [alpha!, moved])
+    await gate.entered
+    // Between the halves: the teardown forgot the latch, silently.
+    expect(run.latch.isLatched(bravoKey)).toBe(false)
+    expect(run.episodeNotices.slice(noticesFrom)).toEqual([])
+    expect(run.slackPosts().slice(postsFrom)).toEqual([])
+    gate.release()
+    await applying
+    await turns()
+
+    // One teardown and one bring-up for bravo; its launch reached agent-director (a fresh spawn, never held as latched before the call).
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: bravoKey, via: 'apply' },
+      { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: bravoKey, via: 'apply', action: again ? 'latched' : 'spawned' },
+    ])
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual([
+      'kill ok',
+      'delete ok',
+      `spawn ${again ? SCAN_LEFTOVER.build().name : 'ok'}`,
+    ])
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, cwd: moved.working_directory })
+    const newPosts = run.slackPosts().slice(postsFrom).map(postOf)
+    if (again) {
+      // Latched again with a new record and exactly one post, to the new declaration's destination only.
+      expect(run.latch.record(bravoKey)).toMatchObject({
+        latchCase: SCAN_LEFTOVER.latchCase,
+        refusedOperation: SCAN_LEFTOVER.refusedOperation,
+        rowState: SCAN_LEFTOVER.rowState,
+      })
+      expect(run.episodeNotices.slice(noticesFrom)).toEqual([{ key: bravoKey, text: SCAN_LEFTOVER.notice.text }])
+      expect(newPosts).toEqual([{ channel: newDestination, text: posted }])
+      expect(h.rowOf('bravo')).toBeUndefined()
+    } else {
+      expect(run.latch.isLatched(bravoKey)).toBe(false)
+      expect(run.episodeNotices.slice(noticesFrom)).toEqual([])
+      expect(newPosts).toEqual([])
+      expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: moved.working_directory })
+    }
+    expect(newPosts.filter((p) => p.channel === oldDestination)).toEqual([])
+    expect(run.isUp('bravo')).toBe(true)
+    // alpha: never latched, no lifecycle record, dependency call, agent-director call or Slack activity.
+    expect(run.latch.isLatched(alphaKey)).toBe(false)
+    alphaUntouched()
+    expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+    expect(adCallsSince(run, adFrom).filter((c) => c.id !== bravoId)).toEqual([])
+    await expectNothingPendingAfter(run)
+    assertNoLeak(run.captured())
+  })
 })
 
 describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no session and takes effect at the next launch (b.av2 SR-8.6, SR-6.2, SR-9.4)', () => {

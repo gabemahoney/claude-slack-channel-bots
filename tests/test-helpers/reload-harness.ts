@@ -352,6 +352,23 @@
  * are `run.sessionNotices` (also raised through the run's notifier), and
  * the session manager's `console.error` lines join `run.logs`.
  *
+ * The latch (b.jg5 SRJ-501, SRJ-504, SRJ-508): every run builds, as `main()`
+ * does, one set of notice episodes (on `run.clock`, posting through the
+ * run's notifier, each post recorded in `run.episodeNotices`) and one latch
+ * (`createConflictLatch`, its lines to `run.logs`) whose CONFLICT notice is
+ * bound to those episodes (`bindConflictNotice`). A realLaunch run installs
+ * the latch in the session manager (`setConflictLatch`), so a CONFLICT at a
+ * ladder spawn or `resume` latches the persona (its launch record's `action`
+ * is `latched`, with one CONFLICT notice to its destination) and a latched
+ * persona's launch makes no agent-director call. The composition's
+ * `forgetConflictLatch` and `forgetNoticeEpisodes` are the latch's and the
+ * episodes' `forget`, in the teardown's order. `run.latch` reads it
+ * (`isLatched`, `record`). The latch is per run: a later run (a server
+ * restart) and another harness start with none. The holds `main()` binds
+ * before the notice are not bound (a run has no retry controller,
+ * tmux-unresponsive condition or unclassified-error episode), and
+ * `run.stop()` closes the episodes as `main()`'s shutdown does.
+ *
  * Step 5 (b.av2 SR-8.6): with the real composition the refresh calls the
  * stub's `makeTemplate` (params on `run.composition.agentDirector
  * .makeTemplateCalls`) with `run.composition.installedTemplate`'s start-time
@@ -385,8 +402,8 @@
  * realLaunch run also installs the session manager's module seams (the
  * process's agent-director client, dialog and tmux fakes, the spawn home,
  * the trust patcher, the reply guard, the claude_config_dir hook, the
- * session notifier) and captures `console.error`; `h.cleanup()` resets and
- * restores them. No launch is a startup launch, so nothing resolves the
+ * session notifier, the latch) and captures `console.error`; `h.cleanup()`
+ * resets and restores them. No launch is a startup launch, so nothing resolves the
  * state directory from the environment. It
  * spawns nothing itself: `mkfifoAvailable` and `h.makeFifo` start `mkfifo`
  * through the shared FIFO helper (`fifo.ts`), with a host-safe environment.
@@ -464,6 +481,8 @@ import type { MakeTemplateParams, SpawnParams } from 'agent-director'
 import { _resetAckTracker, consumeAck, forgetPersonaAcks } from '../../src/ack-tracker.ts'
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
 import { buildTemplateParams, type TemplateRefreshResult } from '../../src/agent-director-template.ts'
+import { bindConflictNotice, createConflictLatch, type ConflictLatch } from '../../src/conflict-latch.ts'
+import { createPersonaEpisodes } from '../../src/persona-episodes.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
 import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from '../../src/persona-lifecycle.ts'
@@ -511,6 +530,7 @@ import {
   launchSession,
   personaConfigDirLabelValue,
   setConfigDirUnresolvableHook,
+  setConflictLatch,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setSessionNotifier,
@@ -852,7 +872,7 @@ export interface RealLifecycleComposition {
    * `'destinationHold.cancel'`, `'notifier.forget'`, `'forgetPersonaPrompts'`,
    * `'dropSession'`, `'resetOutageState'`, `'killInstance'`,
    * `'deleteInstance'`, `'forgetFailures'`, `'forgetDisconnectedStreak'`,
-   * `'forgetNoticeEpisodes'`, `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
+   * `'forgetConflictLatch'`, `'forgetNoticeEpisodes'`, `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
    * `'replyGuard.launchPass'`, `'storageCheck'`, `'bringUps.bringUp'`,
    * `'bringUps.changeCredentials'`, `'connections.reconnectCredentials'`,
    * `'connections.replaceRetryTokens'`, `'launch'`) plus `'outage-notice'`
@@ -1303,7 +1323,7 @@ export interface ReloadRunOptions {
    * reply-guard steps over `h.stateDir` and the applied set, the bring-up
    * controller's claude_config_dir hold and re-check, and a session notifier
    * that records each notice (`run.sessionNotices`) and raises it through
-   * the run's notifier; the dialog poll runs at 1 ms, tmux is faked and the
+   * the run's notifier, and the run's latch (`run.latch`); the dialog poll runs at 1 ms, tmux is faked and the
    * spawn home is `h.home`. The composition's reply-guard members are the
    * real ones over `h.stateDir`. Every `console.error` line (the session
    * manager's, the reply guard's) goes to `run.logs` while the run is the
@@ -1322,6 +1342,9 @@ export interface ReloadRunOptions {
    */
   beforeWrite?: (path: string) => void
 }
+
+/** A run's latch, read-only: the latched query and the record. */
+export type ReloadLatchView = Pick<ConflictLatch, 'isLatched' | 'record'>
 
 /** One server start over the harness's files; see the file comment. */
 export interface ReloadRun {
@@ -1539,6 +1562,19 @@ export interface ReloadRun {
   relaunch(name: string): Promise<LaunchSessionResult>
   /** Every session-manager notice raised (spawn failure, restart cap, lost history) with `opts.realLaunch`, by persona key, in order. */
   readonly sessionNotices: ReadonlyArray<{ readonly key: string; readonly text: string }>
+  /**
+   * The run's one latch, read-only (`isLatched`, `record`; b.jg5 SRJ-501):
+   * a CONFLICT at a real launch's ladder spawn or `resume` sets it, the
+   * teardown's `forgetConflictLatch` forgets the key, and a later run starts
+   * with none (a server restart drops every latch).
+   */
+  readonly latch: ReloadLatchView
+  /**
+   * Every post of the run's notice episodes (the CONFLICT notice's body,
+   * b.jg5 SRJ-1004), by persona key, in order, as handed to the run's
+   * notifier (which posts it to the persona's destination).
+   */
+  readonly episodeNotices: ReadonlyArray<{ readonly key: string; readonly text: string }>
   /** Stop detection (`controller.stopDetection()`, which stops `run.ticks`), cancel every bring-up retry and stop every connection. Idempotent. */
   stop(): Promise<void>
 }
@@ -2045,6 +2081,25 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       return res.user?.profile?.display_name || userId
     }
     const noticeStack = makeNotifierStack({ getPersona: getAppliedPersona, clientFor, log, isDryRun: () => dryRun })
+    // As main() builds them (b.jg5 SRJ-1016, SRJ-501, SRJ-508): the run's one
+    // set of notice episodes, on the run's fake clock, posting through the
+    // run's notifier (each post also recorded in `episodeNotices`), and the
+    // run's one latch, in memory only, so a later run (a server restart) and
+    // another harness start with none. Its CONFLICT notice is bound to the
+    // episodes. The holds main() binds before the notice are not bound: a run
+    // has no UNAVAILABLE retry controller, tmux-unresponsive condition or
+    // unclassified-error episode for them to stop or end.
+    const episodeNotices: Array<{ key: string; text: string }> = []
+    const episodes = createPersonaEpisodes({
+      sink: (key, text) => {
+        episodeNotices.push({ key, text })
+        void noticeStack.notifier.notify(key, text)
+      },
+      log,
+      clock: connections.clock,
+    })
+    const latch = createConflictLatch({ log })
+    bindConflictNotice(latch, episodes)
     // server.ts's getReplySettings: config.ts's replySettingsOf over
     // `personaConfig` at call time, so after an apply the start's values
     // (configInEffect). No ack reaction unless the start's config sets one.
@@ -2239,8 +2294,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         stopRetryTimer: rec('stopRetryTimer'),
         forgetFailures: rec('forgetFailures'),
         forgetDisconnectedStreak: rec('forgetDisconnectedStreak'),
-        // A recording no-op: the run opens no notice episode.
-        forgetNoticeEpisodes: rec('forgetNoticeEpisodes'),
+        // As main() binds them (b.jg5 SRJ-504, SRJ-1016): the run's latch
+        // forgets the key silently, then the run's episodes end every kind of
+        // the key's episode (its CONFLICT episode included), silently.
+        forgetConflictLatch: rec('forgetConflictLatch', (key) => latch.forget(key)),
+        forgetNoticeEpisodes: rec('forgetNoticeEpisodes', (key) => episodes.forget(key)),
         resetOutageState: (keys) => {
           for (const key of keys) calls.push(['resetOutageState', key])
         },
@@ -2764,6 +2822,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         writes,
         removes,
         slack: slackCalls(),
+        episodeNotices,
         written: [...new Set(writes.filter((w) => w.ok).map((w) => w.path))]
           .filter((path) => existsSync(path))
           .map((path) => writtenFile(path)),
@@ -2850,12 +2909,16 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         return entry.restart
       },
       sessionNotices,
+      latch: Object.freeze({ isLatched: (key: string) => latch.isLatched(key), record: (key: string) => latch.record(key) }),
+      episodeNotices,
       async stop() {
         if (stopped) return
         stopped = true
         controller.stopDetection()
         bringUps.cancelAll()
         noticeStack.hold.cancelAll()
+        // As main()'s shutdown closes them: nothing opens or posts after it.
+        episodes.close()
         for (const client of toolClients.values()) await client.close()
         await connections.manager.stopAll()
       },
@@ -2893,6 +2956,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         sessionNotices.push({ key, text })
         return noticeStack.notifier.notify(key, text, options)
       })
+      // As main() installs it before the start pass (b.jg5 SRJ-501, SRJ-502):
+      // the collision ladder latches through the run's latch on a CONFLICT at
+      // a spawn or resume, and launches no latched persona.
+      setConflictLatch(latch)
     }
   }
 
@@ -3200,6 +3267,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           _resetPreLaunchReplyGuard()
           setConfigDirUnresolvableHook(undefined)
           setSessionNotifier(undefined)
+          setConflictLatch(undefined)
         }
         if (outageStateInstalled) _resetOutageState()
         if (registryTouched) {
