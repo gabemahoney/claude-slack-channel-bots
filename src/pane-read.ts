@@ -230,11 +230,6 @@ export function paneReadFailureOf(value: unknown): PaneReadFailure {
   }
 }
 
-/** True when `outcome` is a failure (neither a pane nor latched). */
-export function isPaneReadFailure(outcome: PaneReadOutcome): outcome is PaneReadFailure {
-  return outcome.kind !== PANE_READ_PANE && outcome.kind !== PANE_READ_LATCHED
-}
-
 /**
  * A failed pane read's class for the end of a log line (the description is
  * rendered where the line names the failure): `read-pane class=<class>`.

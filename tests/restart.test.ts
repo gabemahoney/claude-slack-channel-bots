@@ -33,6 +33,7 @@ import {
   RESTART_OUTCOME_REFUSED,
   RESTART_OUTCOME_SHUTTING_DOWN,
   KILL_SESSION_REFUSED,
+  RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE,
   RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE,
   RESTART_SLOW_RECOVERY_OTHER_VERDICT,
   reprobeDeadLine,
@@ -204,7 +205,14 @@ import {
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
   tmuxUnresponsiveOnsetText,
 } from '../src/persona-episodes.ts'
-import { createSlowRecoveryTracker, SLOW_RECOVERY_POST_THRESHOLD, slowRecoveryText } from '../src/slow-recovery.ts'
+import {
+  createSlowRecoveryTracker,
+  SLOW_RECOVERY_POST_THRESHOLD,
+  SLOW_RECOVERY_RESET_OTHER_VERDICT,
+  slowRecoveryCountResetLine,
+  slowRecoveryNoticePostedLine,
+  slowRecoveryText,
+} from '../src/slow-recovery.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
@@ -2213,7 +2221,9 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
 // (`ErrTmuxCaptureFailed`), so the reconnect adapter sweeps and answers
 // 'escalate-dead'; every `find-missing` leaves P's own row in
 // `unverified_ids`, so the run reads that row with one `get` (b.jg5 SRJ-120),
-// whose note latches no one; and the re-probe still reads the row live. The
+// whose note latches no one; and the re-probe still reads the row live. P
+// reads disconnected, except on a run a case marks healed, where it reads
+// connected with its stream and the run stops as already connected. The
 // liveness probe and the reconnect adapter are the REAL ones over one stub
 // client, the slow-recovery observer is the real tracker over a real episodes
 // instance on a fake clock, whose sink records each post, and the latch and
@@ -2273,10 +2283,13 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
 
   /**
    * P's restart deps as the describe comment says; the `get` after each
-   * sweep carries `noteOfRun(run)` (runs count from 1). `nextRun()` moves the
-   * clock past the memo window, then schedules P's restart and awaits it.
+   * sweep carries `noteOfRun(run)` (runs count from 1). On a run
+   * `connectedOnRun(run)` answers true for, P reads connected with its
+   * stream (it healed on its own), so that run stops at its first probe as
+   * already connected. `nextRun()` moves the clock past the memo window,
+   * then schedules P's restart and awaits it.
    */
-  function slowRecoveryRuns(noteOfRun: (run: number) => string) {
+  function slowRecoveryRuns(noteOfRun: (run: number) => string, connectedOnRun: (run: number) => boolean = () => false) {
     const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
     const persona = config.personas[0]!
     const KEY = persona.key
@@ -2302,8 +2315,8 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     const deps: RestartDeps = {
       canRestart: () => true,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
-      isSessionConnected: () => false,
-      hasSessionStream: () => false,
+      isSessionConnected: () => connectedOnRun(run),
+      hasSessionStream: () => connectedOnRun(run),
       reconnectSession: _buildReconnectSessionAdapter(),
       async killSession(key) { kills.push(key) },
       async launchSession(key) { launches.push(key); return true },
@@ -2345,6 +2358,38 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     expect(runs.armed).toEqual([])
     expect(latch.isLatched(runs.KEY)).toBe(false)
     expect(isRestartPendingOrActive(runs.KEY)).toBe(false)
+    expect(rawTmux).toEqual([])
+    expect(clock.pendingCount()).toBe(0)
+    assertNoLeak({ errLines, posts: runs.posts })
+  })
+
+  // SRJ-1010's "consecutive": a run between them that finds P healed on its
+  // own (connected with its stream) resets the count, so the post waits for
+  // threshold-many escalate-dead runs in a row after it.
+  test(`a run that finds P already connected with its stream, after ${SLOW_RECOVERY_POST_THRESHOLD - 1} escalate-dead ticks whose re-probe reads live, resets the count: no post until ${SLOW_RECOVERY_POST_THRESHOLD} more such ticks in a row, then exactly one`, async () => {
+    const healedRun = SLOW_RECOVERY_POST_THRESHOLD
+    const total = 2 * SLOW_RECOVERY_POST_THRESHOLD
+    const runs = slowRecoveryRuns(() => nonLatchingNotes[0]!, (run) => run === healedRun)
+
+    for (let run = 1; run <= total; run++) {
+      await runs.nextRun()
+      expect(runs.posts).toEqual(run === total ? [[runs.KEY, slowRecoveryText(runs.KEY)]] : [])
+    }
+
+    expect(runs.outcomes).toEqual([
+      ...Array(healedRun - 1).fill(RESTART_OUTCOME_RECONNECT_DEFERRED),
+      RESTART_OUTCOME_ALREADY_CONNECTED,
+      ...Array(total - healedRun).fill(RESTART_OUTCOME_RECONNECT_DEFERRED),
+    ])
+    // The healed run's probe only: no state read, read-pane, sweep or get.
+    const escalated = total - 1
+    expect(runs.stubCalls()).toEqual({ statusCalls: 3 * escalated + 1, readPaneCalls: escalated, findMissingCalls: escalated, getCalls: escalated })
+    expect(errLines.filter((l) => l === slowRecoveryCountResetLine(runs.KEY, healedRun - 1, SLOW_RECOVERY_RESET_OTHER_VERDICT))).toHaveLength(1)
+    expect(errLines.filter((l) => l === slowRecoveryNoticePostedLine(runs.KEY, SLOW_RECOVERY_POST_THRESHOLD))).toHaveLength(1)
+    expect(runs.kills).toEqual([])
+    expect(runs.launches).toEqual([])
+    expect(getFailureCount(runs.KEY)).toBe(0)
+    expect(raised).toEqual([])
     expect(rawTmux).toEqual([])
     expect(clock.pendingCount()).toBe(0)
     assertNoLeak({ errLines, posts: runs.posts })
@@ -2439,8 +2484,8 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
    * with `readPaneError`, kill and launch record (the launch answering
    * `launchResult`), and the arm hook, the slow-recovery observer's notes
    * (`notes`, b.jg5 SRJ-610) and the serialized work's outcome are
-   * recorded. `settled()` resolves once the restart timer's work has run and
-   * the restart is no longer active, whenever the timer fires. `stubCalls()`
+   * recorded. `tick()` schedules the persona's restart and resolves once its
+   * work has run (`awaitRuns`), whenever the timer fires. `stubCalls()`
    * is the run's stub calls by verb (`ownStubCalls`): those naming the
    * persona's own instance, and the whole-store `find-missing`, which names
    * none. The stub is the process's agent-director client while the case
@@ -2460,9 +2505,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     const launches: string[] = []
     const armed: string[] = []
     const notes: SlowRecoveryNote[] = []
-    const outcomes: unknown[] = []
-    const workDone = Promise.withResolvers<void>()
-    initRestart({
+    const deps: RestartDeps = {
       canRestart: () => true,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
       isSessionConnected: () => false,
@@ -2475,33 +2518,14 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
       onCapReached: () => {},
       armRetryTimer: (key) => { armed.push(key) },
       slowRecovery: recordingSlowRecovery(notes),
-      serialize: async <T>(_key: string, operation: () => T | Promise<T>): Promise<T> => {
-        try {
-          const outcome = await operation()
-          outcomes.push(outcome)
-          return outcome
-        } catch (err) {
-          workDone.reject(err)
-          throw err
-        } finally {
-          workDone.resolve()
-        }
-      },
-    })
-    /**
-     * The timer's work has run; then one event-loop turn, in which the timer
-     * body's own continuation (its active marker's release) runs, since every
-     * pending promise continuation runs before the next turn.
-     */
-    const settled = async (): Promise<void> => {
-      await workDone.promise
-      await new Promise<void>((resolve) => setTimeout(resolve, 0))
     }
+    const { outcomes, tick } = awaitRuns(deps)
+    initRestart(deps)
     const stubCalls = (): Record<string, number> => ownStubCalls(log, instanceId)
     /** The run's pane reads, as `[instance id, lines]`. */
     const paneReads = (): Array<[string, number | undefined]> =>
       log.readPaneCalls.filter((c) => c.claude_instance_id === instanceId).map((c) => [c.claude_instance_id, c.n_lines])
-    return { KEY: persona.key, cwd: persona.working_directory, kills, launches, armed, notes, outcomes, settled, stubCalls, paneReads }
+    return { KEY: persona.key, kills, launches, armed, notes, outcomes, tick: () => tick(persona.key, persona.working_directory), stubCalls, paneReads }
   }
 
   /** The escalate-dead verdict lines (one per sweep the adapter fires); only `verdict`'s, with its evidence text, when given. */
@@ -2521,8 +2545,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   ])('alive (%s) but disconnected, its read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict %s) and no send-keys; the re-probe reads the row missing → one noteDead, then one kill and one relaunch in that run, no failure counted, nothing armed, no tmux asked', async (state, verdict) => {
     const run = d61Run(untilSwept(state), errTmuxCaptureFailed())
 
-    scheduleRestart(run.KEY, run.cwd)
-    await run.settled()
+    await run.tick()
 
     // The probe, the adapter's state read, its read-pane and sweep, then the
     // re-probe; nothing is typed into a pane that no longer exists.
@@ -2549,8 +2572,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   test.each(['working', 'waiting'])('alive (%s) but disconnected, its read-pane answering ErrSpawnNotFound → one findMissing sweep with the row-absent verdict and no send-keys; no failure counted, no tmux asked', async (state) => {
     const run = d61Run(untilSwept(state), errSpawnNotFound())
 
-    scheduleRestart(run.KEY, run.cwd)
-    await run.settled()
+    await run.tick()
 
     expect(run.stubCalls()).toEqual({ statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
     expect(escalateLines()).toHaveLength(1)
@@ -2570,8 +2592,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     // One failure on record, so a reset or a counted launch would show.
     recordFailure(run.KEY)
 
-    scheduleRestart(run.KEY, run.cwd)
-    await run.settled()
+    await run.tick()
 
     expect(run.stubCalls()).toEqual({ statusCalls: 2, readPaneCalls: 1 })
     expect(escalateLines()).toEqual([])
@@ -2614,8 +2635,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     // One failure on record, so a reset or a counted launch would show.
     recordFailure(run.KEY)
 
-    scheduleRestart(run.KEY, run.cwd)
-    await run.settled()
+    await run.tick()
 
     // The first probe, the reconnect adapter's state read and read-pane, and
     // the re-probe (the first-probe case stops, or goes straight to the kill,
@@ -2988,8 +3008,8 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
 
   // b.jg5 SRJ-610: the slow-recovery observer (`RestartDeps.slowRecovery`)
   // beyond the re-probe: a dead first probe, a reconnect ending with another
-  // verdict, the runs that tell nothing, a note that throws, and a run with no
-  // observer.
+  // verdict, a pending first probe and a session already connected, the runs
+  // that tell nothing, a note that throws, and a run with no observer.
   describe('b.jg5 SRJ-610: what each restart run tells the slow-recovery observer', () => {
     test.each<[string, LivenessReading, SlowRecoveryNote]>([
       ['a row read (ended, missing or no row) → noteDead', LIVENESS_READING_DEAD, ['noteDead', KEY]],
@@ -3033,13 +3053,31 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
       assertNoLeak({ errArgs })
     })
 
-    /** Changes the escalate-dead deps (whose re-probe reads dead) so the run stops before it tells anything. */
+    /** Changes the escalate-dead deps (whose re-probe reads dead) so the run stops before its reconnect. */
     type StopBeforeTelling = (deps: ReturnType<typeof makeDeps>) => void
+    test.each<[string, StopBeforeTelling, RestartWorkOutcome, SlowRecoveryOtherReason]>([
+      ['the first probe reads pending', (deps) => { deps.isSessionAlive = async () => LIVENESS_READING_PENDING }, RESTART_OUTCOME_PENDING_DEFERRED, RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE],
+      ['the session is already connected with its stream', (deps) => { deps.isSessionConnected = () => true }, RESTART_OUTCOME_ALREADY_CONNECTED, RESTART_SLOW_RECOVERY_OTHER_VERDICT],
+    ])('%s → one noteOther with reason %p; no reconnect, kill or launch', async (_label, stop, outcome, reason) => {
+      const notes: SlowRecoveryNote[] = []
+      const deps = makeEscalateDeps(async () => LIVENESS_READING_DEAD)
+      stop(deps)
+      deps.slowRecovery = recordingSlowRecovery(notes)
+      const run = awaitRuns(deps)
+      initRestart(deps)
+
+      await run.tick(KEY, CWD)
+
+      expect(run.outcomes).toEqual([outcome])
+      expect(notes).toEqual([['noteOther', KEY, reason]])
+      expect(deps.reconnectSessionCalls).toEqual([])
+      expect(deps.killSessionCalls).toEqual([])
+      expect(deps.launchSessionCalls).toEqual([])
+    })
+
     test.each<[string, StopBeforeTelling, RestartWorkOutcome]>([
       ['the first probe reads unknown', (deps) => { deps.isSessionAlive = async () => LIVENESS_READING_UNKNOWN }, RESTART_OUTCOME_LIVENESS_UNKNOWN],
       ['the first probe throws', (deps) => { deps.isSessionAlive = async () => { throw new Error('status broke') } }, RESTART_OUTCOME_LIVENESS_UNKNOWN],
-      ['the first probe reads pending', (deps) => { deps.isSessionAlive = async () => LIVENESS_READING_PENDING }, RESTART_OUTCOME_PENDING_DEFERRED],
-      ['the session is already connected with its stream', (deps) => { deps.isSessionConnected = () => true }, RESTART_OUTCOME_ALREADY_CONNECTED],
       [
         'the persona stops being up during a first probe that reads dead',
         (deps) => {

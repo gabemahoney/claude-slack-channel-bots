@@ -196,9 +196,11 @@
  *   statement list, over the one notice episodes instance and the server log,
  *   after the episodes and before the restart module and the start pass, with
  *   no await between the latch's install and its build; it is `initRestart`'s
- *   `slowRecovery` observer, and the latch's `endSlowRecovery` hold calls its
- *   `endForLatch` for the key. It is named only there; server.ts calls none
- *   of its notes, and no other src file builds one.
+ *   `slowRecovery` observer, the health check's `resetSlowRecoveryCount`
+ *   hook calls its `noteHealthy` for the key, and the latch's
+ *   `endSlowRecovery` hold calls its `endForLatch` for the key. It is named
+ *   only there; server.ts calls none of its restart-run notes, and no other
+ *   src file builds one.
  * - b.jg5 SRJ-114 / SRJ-501: the session manager's configured-persona query
  *   is installed once (`setConfiguredPersonaQuery`), in main()'s own
  *   statement list, as a call-time read of the live applied-persona lookup
@@ -2945,20 +2947,23 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
 // Static audit: b.jg5 SRJ-610 / SRJ-1010 / SRJ-1016 / SRJ-502 — the one
 // slow-recovery tracker
 //
-// `RestartDeps.slowRecovery` and `ConflictLatchHolds.endSlowRecovery` are
-// optional, and absent the restart work and the latch behave the same. So a
-// production wiring that dropped either binding, built a second tracker (one
-// the restart work counts on, another the latch ends), built it over episodes
+// `RestartDeps.slowRecovery`, `HealthCheckDeps.resetSlowRecoveryCount` and
+// `ConflictLatchHolds.endSlowRecovery` are optional, and absent the restart
+// work, the health check and the latch behave the same. So a production
+// wiring that dropped any binding, built a second tracker (one the restart
+// work counts on, another the health check resets or the latch ends), built
+// it over episodes
 // other than the one instance (which a teardown never forgets and shutdown
 // never closes, so its count and episode would outlive the persona), or built
 // it after the start pass would type-check and pass every behaviour suite
-// while no slow-recovery notice was ever posted, or a latch left P's episode
-// open. What the tracker does is tested in tests/slow-recovery.test.ts and
-// tests/restart.test.ts, and its latch end in tests/conflict-latch.test.ts;
-// pinned here: the bindings.
+// while no slow-recovery notice was ever posted, a persona healed between
+// ticks kept its count, or a latch left P's episode open. What the tracker does is tested in tests/slow-recovery.test.ts and
+// tests/restart.test.ts, its healthy reset's call in
+// tests/health-check.test.ts, and its latch end in
+// tests/conflict-latch.test.ts; pinned here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('main() builds the one slow-recovery tracker over the notice episodes before the start pass, hands it to the restart work as its slow-recovery observer, and binds its latch end into the latch\'s holds (b.jg5 SRJ-610, SRJ-1010, SRJ-1016, SRJ-502)', () => {
+describe('main() builds the one slow-recovery tracker over the notice episodes before the start pass, hands it to the restart work as its slow-recovery observer, binds its healthy reset into the health check and its latch end into the latch\'s holds (b.jg5 SRJ-610, SRJ-1010, SRJ-1016, SRJ-502)', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const FACTORY: keyof typeof SlowRecoveryModule = 'createSlowRecoveryTracker'
   const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
@@ -2966,6 +2971,8 @@ describe('main() builds the one slow-recovery tracker over the notice episodes b
   const LOG: keyof SlowRecoveryTrackerDeps = 'log'
   const OBSERVER: keyof RestartDeps = 'slowRecovery'
   const LATCH_END: keyof SlowRecoveryTracker = 'endForLatch'
+  const HEALTHY_RESET: keyof SlowRecoveryTracker = 'noteHealthy'
+  const TICK_RESET: keyof HealthCheckDeps = 'resetSlowRecoveryCount'
   /** Every other entry of the tracker: the restart work's notes and the read-only queries. */
   const OTHER_ENTRIES: ReadonlyArray<keyof SlowRecoveryTracker> = ['noteLive', 'noteDead', 'noteInstallGone', 'noteOther', 'count', 'isOpen']
   const INSTALL: keyof typeof SessionManagerModule = 'setConflictLatch'
@@ -3000,25 +3007,31 @@ describe('main() builds the one slow-recovery tracker over the notice episodes b
     expect(onlyCallProps('initRestart').get(OBSERVER)).toBe(constOf(FACTORY))
   })
 
+  test('the health check\'s slow-recovery reset hook calls this tracker\'s healthy reset for the persona it is given', () => {
+    expect(onlyCallProps('initHealthCheck').get(TICK_RESET)).toMatch(oneKeyArrow(`${constOf(FACTORY)}\\.${HEALTHY_RESET}\\(\\1\\)`))
+  })
+
   test('the latch\'s slow-recovery hold calls this tracker\'s latch end for the persona it is given', () => {
     expect(latchHoldProps().get(HOLD_END_SLOW_RECOVERY)).toMatch(oneKeyArrow(`${constOf(FACTORY)}\\.${LATCH_END}\\(\\1\\)`))
   })
 
-  test('the tracker is named only at its build, in the restart module\'s call and in the latch\'s holds; server.ts calls its latch end once and none of its other entries (the restart work tells it each run), and no other file under src/ builds one', () => {
+  test('the tracker is named only at its build, in the restart module\'s call, in the health check\'s call and in the latch\'s holds; server.ts calls its healthy reset once, its latch end once and none of its other entries (the restart work tells it each run), and no other file under src/ builds one', () => {
     const tracker = constOf(FACTORY)
     const named = indicesOf(new RegExp(`\\b${tracker}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(3)
+    expect(named).toHaveLength(4)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${tracker}\\b`))!
     expect(named).toContain(decl.index! + decl[0].length - tracker.length)
     const within = (call: string) => {
       const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf(call), '(', ')')
       return named.filter((offset) => offset > open && offset < close).length
     }
-    expect([within('initRestart'), within(BIND_LATCH_HOLDS)]).toEqual([1, 1])
+    expect([within('initRestart'), within('initHealthCheck'), within(BIND_LATCH_HOLDS)]).toEqual([1, 1, 1])
 
     const calls = (entry: string) => indicesOf(new RegExp(`\\.\\s*${entry}\\s*\\(`, 'g'), SERVER_CODE)
     expect(indicesOf(new RegExp(`\\b${tracker}\\s*[?!]?\\.\\s*${LATCH_END}\\s*\\(`, 'g'), SERVER_CODE)).toHaveLength(1)
     expect(calls(LATCH_END)).toHaveLength(1)
+    expect(indicesOf(new RegExp(`\\b${tracker}\\s*[?!]?\\.\\s*${HEALTHY_RESET}\\s*\\(`, 'g'), SERVER_CODE)).toHaveLength(1)
+    expect(calls(HEALTHY_RESET)).toHaveLength(1)
     expect(OTHER_ENTRIES.filter((entry) => indicesOf(new RegExp(`\\b${tracker}\\s*[?!]?\\.\\s*${entry}\\b`, 'g'), SERVER_CODE).length > 0)).toEqual([])
 
     const builders = srcFiles().filter(([, text]) => new RegExp(`\\b${FACTORY}\\s*\\(`).test(stripComments(text)))

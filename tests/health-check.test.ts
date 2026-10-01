@@ -377,19 +377,18 @@ beforeEach(() => {
 })
 
 // ---------------------------------------------------------------------------
-// startHealthCheck
+// The tick body: dead-session detection, the skips, per-persona error
+// isolation and shutdown, each driven through the tick seam.
 // ---------------------------------------------------------------------------
 
-describe('startHealthCheck', () => {
+describe('the tick body: dead-session detection, skips, per-persona error isolation and shutdown', () => {
   test('1. normal dead-session detection — scheduleRestart called for dead session', async () => {
     const deps = makeDeps()  // isSessionAlive reads dead by default; statRoute defaults to true
     initHealthCheck(deps)
 
     await driveTicks(1)
 
-    expect(deps.scheduleRestartCalls.length >= 1).toBe(true)
-    expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
-    expect(deps.scheduleRestartCalls[0].cwd).toBe(WD)
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
   })
 
   test('2a. skip pending — restart timer scheduled, not yet fired → scheduleRestart never called', async () => {
@@ -429,8 +428,7 @@ describe('startHealthCheck', () => {
 
     await driveTicks(1)
 
-    expect(deps.scheduleRestartCalls.some(c => c.key === 'dead_bot')).toBe(true)
-    expect(deps.scheduleRestartCalls.some(c => c.key === 'failing_bot')).toBe(false)
+    expect(deps.scheduleRestartCalls.map((c) => c.key)).toEqual(['dead_bot'])
   })
 
   // AC 20 (b.av2 SR-10.3): the per-persona catch logs the error's description
@@ -485,20 +483,26 @@ describe('startHealthCheck', () => {
     assertNoLeak({ errArgs, notices })
   })
 
-  test('6. zero interval disables poller — no interval armed, isSessionAlive never called', () => {
-    const deps = makeDeps()
-    initHealthCheck(deps)
-
-    expect(armedIntervals(() => startHealthCheck(0))).toEqual([])
-
-    expect(deps.isSessionAliveCalls).toHaveLength(0)
-  })
-
   test('7. shutdown halts cycles — isShuttingDown true → no checks run', async () => {
     const deps = makeDeps({ isShuttingDownResult: true })
     initHealthCheck(deps)
 
     await driveTicks(3)
+
+    expect(deps.isSessionAliveCalls).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// startHealthCheck: the interval it arms (caught by `armedIntervals`).
+// ---------------------------------------------------------------------------
+
+describe('startHealthCheck', () => {
+  test('6. zero interval disables poller — no interval armed, isSessionAlive never called', () => {
+    const deps = makeDeps()
+    initHealthCheck(deps)
+
+    expect(armedIntervals(() => startHealthCheck(0))).toEqual([])
 
     expect(deps.isSessionAliveCalls).toHaveLength(0)
   })
@@ -530,8 +534,8 @@ describe('startHealthCheck', () => {
     // The callback answers the tick body's promise; one firing is one body.
     await armed[0]!.callback()
 
-    // Poller fired at least once after startHealthCheck was called
-    expect(deps.isSessionAliveCalls.length).toBeGreaterThan(0)
+    // The one firing ran one tick body, which probed the persona once.
+    expect(deps.isSessionAliveCalls).toEqual([KEY])
     expect(deps.tickCount()).toBe(1)
   })
 })
@@ -571,8 +575,7 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
     expect(getOutageFlags(KEY).has('cwd-unreachable')).toBe(true)
     // The stat target is the persona's working directory, and the one onset
     // (deduped across ticks) carries it as detail, raised for the persona key.
-    expect(deps.statRouteCalls.length).toBeGreaterThan(0)
-    expect(new Set(deps.statRouteCalls)).toEqual(new Set([WD]))
+    expect(deps.statRouteCalls).toEqual([WD, WD, WD])
     expect(notices).toEqual([{ key: KEY, text: ONSET_TEMPLATES['cwd-unreachable'](WD) }])
   })
 
@@ -582,9 +585,7 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
 
     await driveTicks(1)
 
-    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
-    expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
-    expect(deps.scheduleRestartCalls[0].cwd).toBe(WD)
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
   })
 
   test('(d) tick-in-flight guard: 5th consecutive skip emits exactly one warning', async () => {
@@ -705,8 +706,7 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
 
     await driveTicks(1)
 
-    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
-    expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
   })
 
   // -------------------------------------------------------------------------
@@ -761,17 +761,11 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
     initHealthCheck(deps)
     await driveTicks(2)
 
-    // dead_bot: scheduleRestart called (not capped, dead)
-    expect(scheduleRestartCalls.some(c => c.key === 'dead_bot')).toBe(true)
-
-    // capped_bot: scheduleRestart NOT called (skipped due to cap)
-    expect(scheduleRestartCalls.some(c => c.key === 'capped_bot')).toBe(false)
-
-    // capped_bot: isSessionAlive NOT called (skip fires before the probe)
-    expect(isSessionAliveCalls.some(k => k === 'capped_bot')).toBe(false)
-
-    // dead_bot: isSessionAlive WAS called (not skipped)
-    expect(isSessionAliveCalls.some(k => k === 'dead_bot')).toBe(true)
+    // dead_bot (not capped, dead) is probed and scheduled on each of the two
+    // ticks; capped_bot is skipped before the probe, so never probed or
+    // scheduled.
+    expect(scheduleRestartCalls.map((c) => c.key)).toEqual(['dead_bot', 'dead_bot'])
+    expect(isSessionAliveCalls).toEqual(['dead_bot', 'dead_bot'])
   })
 })
 
@@ -802,12 +796,10 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
 
     // A stranded alive-but-disconnected persona IS scheduled within a bounded
     // number of ticks — no inbound message, no server restart (AC 2/5).
-    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
-    expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
-    expect(deps.scheduleRestartCalls[0].cwd).toBe(WD)
-    // The FIRST fire happened on the 2nd disconnected observation, never the 1st
-    // (AC 6 debounce). connected-call-count at first fire === 2.
-    expect(deps.scheduleRestartAtConnectedCount[0]).toBe(2)
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }, { key: KEY, cwd: WD }])
+    // Each fire happened on the 2nd disconnected observation of its streak,
+    // never the 1st (AC 6 debounce): connected-call-counts 2 and 4.
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([2, 4])
   })
 
   test('2. streak reset: disconnected → connected → later blip does NOT schedule', async () => {
@@ -830,7 +822,7 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     expect(deps.scheduleRestartCalls).toHaveLength(0)
     // Anti-vacuity: prove the ticks actually ran through the scripted sequence
     // (the post-reset fresh blip was genuinely observed, not skipped).
-    expect(deps.isSessionConnectedCalls.length).toBeGreaterThanOrEqual(4)
+    expect(deps.isSessionConnectedCalls).toHaveLength(6)
   })
 
   test('3. streak dropped on fire: after scheduling on tick 2, streak resets (next fire needs 2 more)', async () => {
@@ -844,12 +836,9 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
 
     await driveTicks(6)
 
-    // Every fire is at an even connected-call-count (2, 4, 6...): the streak was
+    // The fires are at connected-call-counts 2, 4 and 6: the streak was
     // dropped after each fire and had to re-accumulate two observations.
-    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
-    for (const n of deps.scheduleRestartAtConnectedCount) {
-      expect(n % 2).toBe(0)
-    }
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([2, 4, 6])
   })
 
   test('4. no racing reconnect: restart pending/active suppresses tick-driven scheduling', async () => {
@@ -896,10 +885,9 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
 
     await driveTicks(2)
 
-    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
-    expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
-    // Dead path does not consult isSessionConnected: count stays 0 at fire.
-    expect(deps.scheduleRestartAtConnectedCount[0]).toBe(0)
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }, { key: KEY, cwd: WD }])
+    // Dead path does not consult isSessionConnected: count stays 0 at each fire.
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([0, 0])
     expect(deps.isSessionConnectedCalls).toHaveLength(0)
   })
 
@@ -935,10 +923,10 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     initHealthCheck(deps1)
     await driveTicks(1)
     expect(deps1.scheduleRestartCalls).toHaveLength(0)
-    // Anti-vacuity: the phase-1 run must actually have observed the persona at
-    // least once (accumulating the streak of 1) — otherwise the reset below
-    // would be clearing nothing and the test would pass vacuously.
-    expect(deps1.isSessionConnectedCalls.length).toBeGreaterThanOrEqual(1)
+    // Anti-vacuity: the phase-1 run must actually have observed the persona
+    // once (accumulating the streak of 1) — otherwise the reset below would be
+    // clearing nothing and the test would pass vacuously.
+    expect(deps1.isSessionConnectedCalls).toEqual([KEY])
 
     _resetHealthCheckState()
 
@@ -974,11 +962,10 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
 
     await driveTicks(4)
 
-    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
-    expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
     // Fire required TWO fresh post-skip observations — the pre-skip streak did
     // not carry across the restart cycle.
-    expect(deps.scheduleRestartAtConnectedCount[0]).toBe(3)
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([3])
   })
 
   test('11. streak cleared on cap-skip: a pre-cap disconnected tick does NOT carry across the cap window', async () => {
@@ -997,11 +984,10 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
 
     await driveTicks(4)
 
-    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
-    expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }])
     // Two fresh post-cap observations were required — the pre-cap streak of 1
     // was cleared by the cap skip rather than carried across.
-    expect(deps.scheduleRestartAtConnectedCount[0]).toBe(3)
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([3])
   })
 
   test('12. streak cleared on not-up skip: a persona the relaunch gate leaves out of a tick\'s work list does NOT carry its disconnected streak back in (b.av2 SR-6.4)', async () => {
@@ -1028,13 +1014,11 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     await driveTicks(4)
 
     // Anti-vacuity: tick 2 ran without DROP (not probed), STAY probed on every tick.
-    expect(deps.isSessionConnectedCalls.slice(0, 6)).toEqual([DROP, STAY, STAY, DROP, STAY, DROP])
-    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
-    expect(deps.scheduleRestartCalls.every((c) => c.key === DROP)).toBe(true)
-    expect(deps.scheduleRestartCalls[0].cwd).toBe(full[DROP])
+    expect(deps.isSessionConnectedCalls).toEqual([DROP, STAY, STAY, DROP, STAY, DROP, STAY])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: DROP, cwd: full[DROP] }])
     // Two fresh observations after it came back were required — no reconnect
     // or restart was scheduled on the first one.
-    expect(deps.scheduleRestartAtConnectedCount[0]).toBe(3)
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([3])
   })
 })
 
@@ -1067,11 +1051,9 @@ describe('b.9cj connected-but-streamless tick recovery', () => {
 
     await driveTicks(4)
 
-    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
-    expect(deps.scheduleRestartCalls[0].key).toBe(KEY)
-    expect(deps.scheduleRestartCalls[0].cwd).toBe(WD)
-    // First fire landed on the 2nd streamless observation, never the 1st.
-    expect(deps.scheduleRestartAtStreamCount[0]).toBe(2)
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: WD }, { key: KEY, cwd: WD }])
+    // Each fire landed on the 2nd streamless observation of its streak, never the 1st.
+    expect(deps.scheduleRestartAtStreamCount).toEqual([2, 4])
   })
 
   test('alive + connected + stream present → healthy: no scheduleRestart and streak resets', async () => {
@@ -1091,8 +1073,8 @@ describe('b.9cj connected-but-streamless tick recovery', () => {
     // No two CONSECUTIVE streamless observations ever occurred — the healthy
     // (stream-present) branch cleared the streak each time.
     expect(deps.scheduleRestartCalls).toHaveLength(0)
-    // Anti-vacuity: the scripted sequence was actually observed.
-    expect(deps.hasSessionStreamCalls.length).toBeGreaterThanOrEqual(4)
+    // Anti-vacuity: the scripted sequence was actually observed, once per tick.
+    expect(deps.hasSessionStreamCalls).toHaveLength(6)
   })
 
   test('DISCONNECTED (connected===false) short-circuits the OR: hasSessionStream is never consulted, recovery still fires on every 2nd tick', async () => {
@@ -1111,15 +1093,12 @@ describe('b.9cj connected-but-streamless tick recovery', () => {
 
     await driveTicks(6)
 
-    // The disconnected session was recovered.
-    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
     // Proof of short-circuit: the stream probe was never consulted for the persona.
     expect(deps.hasSessionStreamCalls).toHaveLength(0)
-    // Every fire lands at an even CONNECTED-observation count (2, 4, 6…): the
-    // shared streak is consumed on fire and must re-accumulate two observations.
-    for (const n of deps.scheduleRestartAtConnectedCount) {
-      expect(n % 2).toBe(0)
-    }
+    // The disconnected session was recovered on the 2nd, 4th and 6th
+    // CONNECTED observations: the shared streak is consumed on fire and must
+    // re-accumulate two observations.
+    expect(deps.scheduleRestartAtConnectedCount).toEqual([2, 4, 6])
   })
 })
 
@@ -1708,6 +1687,119 @@ describe('b.jg5 SRJ-312: a live, connected tick with its stream clears the perso
     expect(getOutageFlags(P).has('tmux-unavailable')).toBe(true)
     expect(notices).toEqual([{ key: P, text: ONSET_TEMPLATES['tmux-unavailable']() }])
     expect(cleared).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-610 — a live healthy tick resets the persona's slow-recovery count
+//
+// A tick that finds the persona `live`, connected and with its stream calls
+// `resetSlowRecoveryCount(key)` for that persona, last in the healthy branch,
+// after the tmux-unavailable clear (production binds it to the slow-recovery
+// tracker's `noteHealthy`; the binding is pinned in
+// tests/server-startup-wiring.test.ts, and what the tracker does in
+// tests/slow-recovery.test.ts). `pending` (never healthy), `unknown`, a
+// thrown probe, `dead`, and a live session that is disconnected or connected
+// but streamless never call it. A throwing hook is the persona's error for
+// the tick: logged, and the tick goes on to the next persona. Every other
+// case in this file leaves the hook at its default (absent).
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-610: a live, connected tick with its stream resets the persona\'s slow-recovery count', () => {
+  const P = 'healed_bot'
+  const Q = 'healthy_bot'
+  const B = 'other_bot'
+
+  test.each(notHealthyReadings(B))('P and Q live, connected and with their streams, beside B %s, over two ticks: the hook is called once per healthy persona per tick, never for B', async (_label, opts) => {
+    // B is checked first, so a hook fired with the wrong persona's key would
+    // show B's key. B's reading, scripted per persona; P and Q read live and
+    // are connected with their streams (the defaults).
+    const deps = makeDeps({
+      personas: workList(B, P, Q),
+      aliveSequence: {
+        [B]: opts.aliveSequence?.[B] ?? [opts.isSessionAliveResult!],
+        [P]: [LIVENESS_READING_LIVE],
+        [Q]: [LIVENESS_READING_LIVE],
+      },
+      connectedSequence: { [B]: [opts.isSessionConnectedResult ?? true] },
+      streamSequence: { [B]: [opts.hasSessionStreamResult ?? true] },
+      maxTicks: 2,
+    })
+    const reset: string[] = []
+    deps.resetSlowRecoveryCount = (key) => void reset.push(key)
+
+    await runTicks(deps, 2)
+
+    expect(deps.isSessionAliveCalls).toEqual([B, P, Q, B, P, Q])
+    expect(reset).toEqual([P, Q, P, Q])
+  })
+
+  test('the hook is called on every tick that finds the persona live and deliverable, and on no other, after the tick clears its tmux-unavailable outage', async () => {
+    //   tick 1: live, deliverable            → called
+    //   tick 2: pending, deliverable         → not called
+    //   tick 3: live, disconnected           → not called
+    //   tick 4: live, deliverable            → called
+    const order: string[] = []
+    initOutageState({
+      notify: (key, text) => { notices.push({ key, text }) },
+      getClient: () => null as any,
+      onFlagCleared: (key) => void order.push(`cleared ${key}`),
+    })
+    setOutageFlag(KEY, 'tmux-unavailable')
+    const deps = makeDeps({
+      aliveSequence: { [KEY]: [LIVENESS_READING_LIVE, LIVENESS_READING_PENDING, LIVENESS_READING_LIVE, LIVENESS_READING_LIVE] },
+      connectedSequence: { [KEY]: [true, true, false, true] },
+      maxTicks: 4,
+    })
+    deps.endNotConnectedEpisode = (key) => void order.push(`not-connected ${key}`)
+    deps.endTmuxUnresponsive = (key) => void order.push(`unresponsive ${key}`)
+    deps.resetSlowRecoveryCount = (key) => void order.push(`reset ${key} at tick ${deps.isSessionAliveCalls.length}`)
+
+    await runTicks(deps, 4)
+
+    expect(order).toEqual([
+      `not-connected ${KEY}`,
+      `unresponsive ${KEY}`,
+      `cleared ${KEY}`,
+      `reset ${KEY} at tick 1`,
+      `not-connected ${KEY}`,
+      `unresponsive ${KEY}`,
+      `reset ${KEY} at tick 4`,
+    ])
+  })
+
+  test('a throwing hook is logged once per tick as the persona\'s error, described and redacted; the tick goes on to the next persona, and the next tick runs', async () => {
+    // P is checked first; B, read dead after it, is still scheduled each tick.
+    const personas = workList(P, B)
+    const deps = makeDeps({
+      personas,
+      aliveSequence: { [P]: [LIVENESS_READING_LIVE], [B]: [LIVENESS_READING_DEAD] },
+      maxTicks: 2,
+    })
+    const thrown = Object.assign(new Error(`reset refused (${sentinelInMessage('reset')})`), { note: LEAK_SENTINEL })
+    const reset: string[] = []
+    deps.resetSlowRecoveryCount = (key) => {
+      reset.push(key)
+      throw thrown
+    }
+    const errArgs: unknown[][] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    try {
+      await runTicks(deps, 2)
+    } finally {
+      console.error = orig
+    }
+
+    expect(reset).toEqual([P, P])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: B, cwd: personas[B] }, { key: B, cwd: personas[B] }])
+    const lines = errArgs.filter((args) => String(args[0]).includes(`persona=${P}`))
+    expect(lines).toHaveLength(2)
+    for (const line of lines) {
+      expect(line).toHaveLength(1)
+      expect(String(line[0])).toStartWith(`[slack] health-check: error checking persona=${P}: Error message="reset refused (${REDACTED_SENTINEL_TAIL})" at `)
+    }
+    assertNoLeak({ errArgs, notices })
   })
 })
 
@@ -2638,7 +2730,7 @@ describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick
 
     await driveTicks(3)
 
-    expect(fires).toBeGreaterThanOrEqual(3)
+    expect(fires).toBe(3)
     expect(deps.tickCount()).toBe(0)
     expect(reads).toEqual([])
     expect(ends).toEqual([])

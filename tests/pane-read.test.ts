@@ -9,20 +9,18 @@
  * built with `new` on the 0.10.0 client's class imported through
  * `src/agent-director-errors.ts`. Phase-1-only and store-open names come from
  * that module as strings. Kinds, class labels and the line count are
- * imported from `src/`.
+ * imported from `src/`; the line count and the class note are pinned once
+ * as literals.
  *
- * The one session-manager case installs the stub client and the outage
- * wrapper's deps, and resets both in `afterEach`. No process, no real timer,
- * no top-level mock.module(), no value import of `Client` or
- * `resolveSystemBinary`.
+ * Pure: no client, no process, no real timer, no top-level mock.module(), no
+ * value import of `Client` or `resolveSystemBinary`.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { Client, ReadPaneParams } from 'agent-director'
 
 import {
   AD_ERROR_CLASS_CONFIG,
@@ -39,14 +37,12 @@ import {
   type AdErrorClass,
 } from '../src/ad-error-class.ts'
 import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
-import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
 import {
   ERR_SCHEMA_MIGRATION_REQUIRED_NAME,
   ERR_STORE_OPEN_NAME,
   ErrCwdNotFound,
   PHASE1_ONLY_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
-import { _resetOutageState, initOutageState } from '../src/outage-state.ts'
 import {
   FULL_PANE_READ_LINES,
   PANE_READ_ABSENT,
@@ -61,14 +57,12 @@ import {
   PANE_READ_UNAVAILABLE,
   PANE_READ_UNCLASSIFIED,
   PANE_READ_UNUSABLE_NAME,
-  isPaneReadFailure,
+  paneReadClassNote,
   paneReadFailureOf,
   type PaneReadConflict,
   type PaneReadFailureKind,
   type PaneReadOutcome,
 } from '../src/pane-read.ts'
-import { personaInstanceId } from '../src/persona-identity.ts'
-import { checkWaitingRowPane } from '../src/session-manager.ts'
 import {
   CONFLICT_CASES,
   STUB_TMUX_SOCKET_PATH,
@@ -90,7 +84,6 @@ import {
   errTmuxUnresponsive,
   errUnknownErrorName,
   errUnusableName,
-  makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { importSource, stripComments } from './test-helpers/source-audit.ts'
@@ -131,7 +124,6 @@ describe('paneReadFailureOf: each value a read-pane throws maps to exactly one o
     const value = make()
     const outcome = paneReadFailureOf(value)
     expect([outcome.kind, outcome.errorClass]).toEqual([kind, errorClass])
-    expect(isPaneReadFailure(outcome)).toBe(true)
     expect(outcome.description).toBe(describeAgentDirectorFailure(value))
     expect(outcome.description.includes('\n')).toBe(false)
     if (KEEPS_ERROR.has(kind)) expect('error' in outcome && outcome.error).toBe(value)
@@ -188,8 +180,8 @@ describe('outcomes that are not failures', () => {
     ['a pane', { kind: PANE_READ_PANE, pane: '' }],
     ['latched, not read', PANE_READ_NOT_READ_LATCHED],
     ['latched by its CONFLICT', { kind: PANE_READ_LATCHED, cause: paneReadFailureOf(errTmuxSessionConflict(VERB, 'own-id')) as PaneReadConflict }],
-  ])('%s is not a failure', (_label, outcome) => {
-    expect(isPaneReadFailure(outcome)).toBe(false)
+  ])('%s is of no failure kind', (_label, outcome) => {
+    expect((PANE_READ_FAILURE_KINDS as readonly string[]).includes(outcome.kind)).toBe(false)
   })
 
   test('the not-read latched outcome carries no cause and is frozen', () => {
@@ -198,25 +190,15 @@ describe('outcomes that are not failures', () => {
   })
 })
 
-describe('the full-read line count is what the session manager\'s reads ask for', () => {
-  afterEach(() => {
-    resetClientForTests()
-    _resetOutageState()
+// The pins: the session manager's and the server's tests build the full-read
+// count and every failed read's `(read-pane class=<CLASS>; ` from these exports.
+describe('the full-read line count and the class note', () => {
+  test('a full read asks for the last 40 lines', () => {
+    expect(FULL_PANE_READ_LINES).toBe(40)
   })
 
-  test('checkWaitingRowPane makes one read-pane of the persona\'s own row with FULL_PANE_READ_LINES', async () => {
-    const readPaneCalls: ReadPaneParams[] = []
-    const client = makeStubClient({ readPaneResults: [{ pane: '' }], readPaneCalls }) as unknown as Client
-    setClientForTests(client)
-    initOutageState({ notify: () => {}, getClient: () => client })
-    const errors = spyOn(console, 'error').mockImplementation(() => {})
-    try {
-      await checkWaitingRowPane('alpha')
-      expect(readPaneCalls).toEqual([{ claude_instance_id: personaInstanceId('alpha'), n_lines: FULL_PANE_READ_LINES }])
-      assertNoLeak(errors.mock.calls)
-    } finally {
-      errors.mockRestore()
-    }
+  test('paneReadClassNote names the verb and the failure\'s class', () => {
+    expect(paneReadClassNote(paneReadFailureOf(errTmuxCaptureFailed()))).toBe('read-pane class=GONE')
   })
 })
 

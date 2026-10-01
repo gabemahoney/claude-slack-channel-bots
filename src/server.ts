@@ -129,14 +129,12 @@ import {
   FULL_PANE_READ_LINES,
   PANE_READ_ABSENT,
   PANE_READ_CONFIG,
-  PANE_READ_CONFLICT,
   PANE_READ_ENVIRONMENT,
   PANE_READ_GONE,
   PANE_READ_LATCHED,
   PANE_READ_PANE,
   PANE_READ_UNAVAILABLE,
   PANE_READ_UNCLASSIFIED,
-  PANE_READ_UNUSABLE_NAME,
   paneReadClassNote,
   type PaneReadFailure,
 } from './pane-read.ts'
@@ -2245,7 +2243,7 @@ async function workingReconnectVerdict(
     lastRead: latchRowStateRead('working'),
     site: WORKING_ROW_PANE_READ_SITE,
   })
-  if (read.kind === PANE_READ_LATCHED || read.kind === PANE_READ_CONFLICT || read.kind === PANE_READ_UNUSABLE_NAME) {
+  if (read.kind === PANE_READ_LATCHED) {
     forgetWorkingRowEvidence(key)
     console.error(
       `[slack] reconnectSession: persona=${key} is working and is latched — deferring; no deferral noted, nothing typed (b.jg5 SRJ-502)`,
@@ -2651,9 +2649,11 @@ export async function main(): Promise<void> {
   // tracker, its count and episode held in the notice episodes (so a
   // teardown's forget clears both and shutdown's close drops them). The
   // restart work tells it each run's readings and verdicts (initRestart's
-  // `slowRecovery` below): the third escalate-dead verdict in a row whose
-  // re-probe still reads the row live posts SRJ-1010 once per episode
-  // through the persona notifier. A row read of `ended`, `missing` or no row
+  // `slowRecovery` below), and the health tick resets its count on each tick
+  // that finds the persona healthy (initHealthCheck's
+  // `resetSlowRecoveryCount` below): the third escalate-dead verdict in a
+  // row whose re-probe still reads the row live posts SRJ-1010 once per
+  // episode through the persona notifier. A row read of `ended`, `missing` or no row
   // ends the episode; the latch's hold above ends it at a latch. It adds no
   // timer and makes no agent-director call.
   const slowRecovery = createSlowRecoveryTracker({
@@ -3282,6 +3282,12 @@ export async function main(): Promise<void> {
     // its stream ends its tmux-unresponsive condition, with that reading.
     endTmuxUnresponsive: (key) => {
       tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)
+    },
+    // b.jg5 SRJ-610: the same tick resets the persona's slow-recovery count
+    // (the tracker built above), leaving an open episode open; the reset
+    // logs only when the count was above 0.
+    resetSlowRecoveryCount: (key) => {
+      slowRecovery.noteHealthy(key)
     },
     // b.jg5 SRJ-308: each tick body ends with the condition's onset check,
     // after all of its per-persona work, for every condition whose first

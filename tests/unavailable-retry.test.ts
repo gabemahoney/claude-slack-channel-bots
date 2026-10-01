@@ -1307,6 +1307,13 @@ const WAIT_STATUS_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Erro
   ['ErrSystemInstallDisappeared', (verb) => errSystemInstallDisappeared(verb), UNAVAILABLE_RETRY_CAUSE_READ_ERROR, true],
 ]
 
+/**
+ * The poll cases beyond what the launch cross above already runs at the
+ * working-row read: `ErrSystemInstallDisappeared`, which raises its outage,
+ * and one UNAVAILABLE value for the poll line and the retry finding P live.
+ */
+const WAIT_POLL_STATUS_ERRORS = WAIT_STATUS_ERRORS.filter(([what]) => what === 'ErrTmuxUnresponsive' || what === 'ErrSystemInstallDisappeared')
+
 /** The working-row wait's timeout in the cases that reach it, on the wait's own clock (`_setNow`). */
 const WAIT_TIMEOUT_MS = 60_000
 
@@ -1331,7 +1338,7 @@ describe('unavailable retry: a status error at the launch’s working-row wait a
     _resetNotConnectedEpisodes()
   })
 
-  test.each(WAIT_STATUS_ERRORS)('%s at the wait’s poll arms P’s timer once and not Q’s; the next poll reads waiting and the launch reconnects with nothing posted or counted; the timer’s retry then finds P live', async (_what, make, kind, adUnreachable) => {
+  test.each(WAIT_POLL_STATUS_ERRORS)('%s at the wait’s poll arms P’s timer once and not Q’s; the next poll reads waiting and the launch reconnects with nothing posted or counted; the timer’s retry then finds P live', async (_what, make, kind, adUnreachable) => {
     const h = launchHarness()
     const [p, q] = h.keys as [string, string]
     const persona = personaOf(h, p)

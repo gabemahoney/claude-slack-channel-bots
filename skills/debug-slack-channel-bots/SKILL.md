@@ -1245,11 +1245,15 @@ destination gets one notice:
   a row post it again.
 - **The count starts over** when a check reads the row `ended` or `missing`
   or finds no row, when the agent-director binary is found gone (the episode
-  stays open then), when a restart's reconnect ends any other way, when the
+  stays open then), when a restart's reconnect ends any other way, when a
+  restart finds the session already reconnected, when a restart's first or
   second check finds the row `pending` (a session still starting is not a
-  slow recovery), or when the persona is held. A second check that can't
-  learn the state (`Liveness unknown after escalate-dead`) leaves the count
-  as it is.
+  slow recovery), when a health check finds the persona healthy (live,
+  connected and with its stream), or when the persona is held. So the
+  notice needs three checks in a row with no healthy check between them.
+  Apart from a held persona and a row read `ended` or `missing` or no row,
+  these leave an open episode open. A second check that can't learn the
+  state (`Liveness unknown after escalate-dead`) leaves the count as it is.
 
 Nothing is needed unless it persists. Then make read-only checks only:
 `agent-director get --claude-instance-id cscb_<key>` shows the row, and
@@ -1262,18 +1266,19 @@ acts on it, including a persona that sees the post.
 All of one persona's lines of this kind (replace `ops_bot` with the key):
 
 ```sh
-grep -h -E 'persona=ops_bot( |:|;|$)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | grep -E 'slow-recovery|escalate-dead' | sort
+grep -h -E 'persona=ops_bot( |:|;|$)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | grep -E 'slow-recovery|slow-dead-session-recovery|escalate-dead' | sort
 ```
 
 | Line | Meaning |
 |---|---|
 | `[slack] Session still reads live after escalate-dead — no relaunch in this restart run for persona=<key>; the row may stay live for further ticks, each escalate-dead tick sweeping again` | After the sweep, agent-director still reports the row live. Nothing is relaunched, killed or counted in this restart. |
 | `[slack] slow-recovery: persona=<key> count <n> of 3 — an escalate-dead verdict's re-probe still reads the row live` | The line above, counted. `<n>` keeps rising while the row stays live; the notice is posted at 3 only. |
-| `[slack] slow-recovery: persona=<key> notice posted — <n> consecutive escalate-dead verdicts whose re-probe still reads the row live` | The *Slow recovery* notice was handed to the persona's destination. |
+| `[slack] slow-recovery: persona=<key> notice posted — <n> consecutive escalate-dead verdicts whose re-probe still reads the row live` | The *Slow recovery* notice was handed to the persona's destination. The line is logged before the post's result is known: a post that fails shows only as the `notice failed` line below, or as [`persona-destination-failed`](#persona-destination-failed) when the notice reached the persona's notifier but couldn't be delivered. |
 | `[slack] slow-recovery: persona=<key> notice not posted — the server is shutting down` | The third check came while the server was stopping. Nothing is posted. |
-| `[slack] slow-recovery: persona=<key> count reset from <n> — <reason>` | The count started over. `<reason>`: `its row read ended or missing, or no row was found`; `its liveness read dead from ErrSystemInstallDisappeared, which reads no row` (see **agent-director returns an error the server can't classify** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)); `a restart run ended with a verdict other than escalate-dead`; `an escalate-dead verdict's re-probe read the row pending, which is not counted`; or `the persona latched`. |
+| `[slack] slow-recovery: persona=<key> count reset from <n> — <reason>` | The count started over. `<reason>`: `its row read ended or missing, or no row was found`; `its liveness read dead from ErrSystemInstallDisappeared, which reads no row` (see **agent-director returns an error the server can't classify** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)); `a restart run ended with a verdict other than escalate-dead` (also when the restart found the session already reconnected); `an escalate-dead verdict's re-probe read the row pending, which is not counted`; `a restart run's liveness probe read the row pending`; `a health check found the session live, connected and with its stream`; or `the persona latched`. Logged only when the count was above 0. |
 | `[slack] slow-recovery: persona=<key> episode ended — <reason>` | The episode ended, with no post: `its row read ended or missing, or no row was found`, or `the persona latched`. A later run of three posts again. A teardown or a server stop ends it with no line. |
 | `[slack] slow-recovery: persona=<key> failed: <error>`, `[slack] restart: the slow-recovery <note> failed for persona=<key>: <error>` | An internal error keeping the count. The restart is not affected, but the count or the notice may be off. Report it as a bug, with the persona's lines. |
+| `[slack] persona-episodes: persona=<key> slow-dead-session-recovery notice failed: <error>` | An internal error handing the *Slow recovery* notice to the persona's notifier (it follows the `notice posted` line, or precedes it when the hand-off throws at once). It is not posted again in the episode. (A notice that reaches the notifier but can't be delivered shows as [`persona-destination-failed`](#persona-destination-failed) instead.) Report it as a bug, with the persona's lines. |
 
 ### At a start: one persona waiting doesn't hold up the others
 

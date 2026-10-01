@@ -19,7 +19,8 @@
  * The healthy branch (`live`, connected, stream present) is the tick's only
  * clear of the persona's `tmux-unavailable` outage (b.jg5 SRJ-312), with the
  * `live` reading passed on to the cleared-flag observer; the liveness read
- * itself never clears it.
+ * itself never clears it. It also resets the persona's slow-recovery count
+ * (b.jg5 SRJ-610).
  * A persona with a restart pending or active, or at the cap, is skipped
  * before any read. A persona with a no-attempt reason (`noAttemptReason`:
  * it is latched, b.jg5 SRJ-502; work in flight for it; or its
@@ -157,6 +158,16 @@ export interface HealthCheckDeps {
    * Absent: nothing is called.
    */
   endNotConnectedEpisode?(key: string): void
+  /**
+   * b.jg5 SRJ-610: reset the persona's slow-recovery count (production: the
+   * slow-recovery tracker's `noteHealthy`), called on every tick that finds
+   * it `live` (never `pending`), connected and with its stream, so a persona
+   * that healed on its own starts a later count from 0. An open slow-recovery
+   * episode is left open. Called after the tick's other healthy-branch calls;
+   * a throw is the persona's error for the tick (logged). Absent: nothing is
+   * called.
+   */
+  resetSlowRecoveryCount?(key: string): void
   /**
    * b.jg5 SRJ-310 rule 2 (tick half): end the persona's `tmux-unresponsive`
    * condition (production: the condition's end, reason `tick`, with the
@@ -614,6 +625,9 @@ async function runHealthCheckTick(): Promise<void> {
           deps.endNotConnectedEpisode?.(key)
           deps.endTmuxUnresponsive?.(key)
           clearOutageFlag(key, 'tmux-unavailable', LIVENESS_LIVE)
+          // b.jg5 SRJ-610: a persona healthy on its own resets its
+          // slow-recovery count; its episode, if open, stays open.
+          deps.resetSlowRecoveryCount?.(key)
         }
       } catch (err) {
         console.error(`[slack] health-check: error checking persona=${key}: ${describeThrownValue(err)}`)

@@ -1485,6 +1485,13 @@ export interface PersonaPaneReadRequest {
 }
 
 /**
+ * What `readPersonaOwnPane` answers: a pane-read outcome other than CONFLICT
+ * or UNUSABLE NAME, which the reader always answers as `PANE_READ_LATCHED`
+ * with the failure as its `cause`.
+ */
+export type OwnPaneReadOutcome = Exclude<PaneReadOutcome, PaneReadConflict | PaneReadUnusableName>
+
+/**
  * The shared read-pane of persona `key`'s own row (`cscb_<key>`, b.jg5
  * SRJ-117): one `readPane` through `withOutageDetection`, declaring the
  * `read-pane` verb (tmux-touching: inside an attempt an UNAVAILABLE starts
@@ -1523,7 +1530,7 @@ export interface PersonaPaneReadRequest {
  *
  * Never throws.
  */
-export async function readPersonaOwnPane(key: string, request: PersonaPaneReadRequest): Promise<PaneReadOutcome> {
+export async function readPersonaOwnPane(key: string, request: PersonaPaneReadRequest): Promise<OwnPaneReadOutcome> {
   if (personaLatchedNow(key)) return PANE_READ_NOT_READ_LATCHED
   let failure: PaneReadFailure
   try {
@@ -3428,7 +3435,7 @@ async function readIdlePaneTranscript(key: string, pane: string, configDir: stri
  * either way the outcome is latched, and the caller ends what it was doing
  * with nothing typed (b.jg5 SRJ-501, SRJ-502, SRJ-512). Never throws.
  */
-async function readWorkingPane(key: string, lastRead: LatchRowState): Promise<PaneReadOutcome> {
+async function readWorkingPane(key: string, lastRead: LatchRowState): Promise<OwnPaneReadOutcome> {
   return readPersonaOwnPane(key, { nLines: FULL_PANE_READ_LINES, lastRead, site: 'readWorkingPane' })
 }
 
@@ -3923,8 +3930,6 @@ export async function checkWaitingRowPane(key: string, latchedNow?: () => boolea
     case PANE_READ_PANE:
       return waitingRowPaneJudgement(key, ref, read.pane, latchedNow)
     case PANE_READ_LATCHED:
-    case PANE_READ_CONFLICT:
-    case PANE_READ_UNUSABLE_NAME:
       console.error(`[slack] reconnectSession: ${ref} is waiting and is latched — deferring; nothing typed (b.jg5 SRJ-502)`)
       return 'defer'
     case PANE_READ_GONE:
@@ -4144,7 +4149,7 @@ export const PROMPT_ROW_STATES: ReadonlySet<string> = new Set(['ask_user', 'chec
  * nothing reconnects it), else `auto-restart-disabled` with `cause`. (The
  * timeout words a `working` row's as `unproven-idle` itself.)
  */
-export function waitEndedNotice(state: string, cause: string): NotConnectedNotice {
+function waitEndedNotice(state: string, cause: string): NotConnectedNotice {
   return PROMPT_ROW_STATES.has(state)
     ? { reason: 'blocked-on-prompt', autoRestartDisabled: true }
     : { reason: 'auto-restart-disabled', cause }
@@ -5083,9 +5088,8 @@ export function escalateDeadSweepLine(key: string, verdict: EscalateDeadVerdict)
  *   found (b.jdc).
  * A GONE does not prove the worker's process gone (b.jg5 SRJ-613), and the
  * evidence texts (`ESCALATE_DEAD_EVIDENCE`) of the GONE, absent-row and
- * prompt-row-probe verdicts say only what was observed. Which verdicts count
- * as dead evidence (b.jg5 SRJ-611) is decided from this origin, never from
- * the text.
+ * prompt-row-probe verdicts say only what was observed. Each verdict records
+ * its origin as one of the labels above, apart from its evidence text.
  */
 export type EscalateDeadVerdict =
   | 'dead-session'

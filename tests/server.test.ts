@@ -18,8 +18,15 @@ import {
   AD_ERROR_CLASS_UNCLASSIFIED,
   CSCB_UNKNOWN_ERROR_NAME,
   describeAgentDirectorFailure,
+  type AdErrorClass,
 } from '../src/ad-error-class.ts'
-import { FULL_PANE_READ_LINES, paneReadFailureOf, type PaneReadFailure } from '../src/pane-read.ts'
+import {
+  FULL_PANE_READ_LINES,
+  PANE_READ_UNCLASSIFIED,
+  paneReadClassNote,
+  paneReadFailureOf,
+  type PaneReadFailure,
+} from '../src/pane-read.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
@@ -2410,9 +2417,11 @@ describe('_buildReconnectSessionAdapter', () => {
     const readerLatchLines = (lines: readonly string[]): string[] =>
       lines.filter((l) => l.includes(': pane read refused for persona=C1: '))
 
-    /** C1's line for a failed read naming `errorClass`. */
-    const classLines = (lines: readonly string[], head: string, errorClass: string): string[] =>
-      lines.filter((l) => l.startsWith(`[slack] reconnectSession: persona=C1 ${head}`) && l.includes(`(read-pane class=${errorClass}; `))
+    /** C1's line for a failed read naming `errorClass` (its class note: `paneReadClassNote` reads only the failure's class). */
+    const classLines = (lines: readonly string[], head: string, errorClass: AdErrorClass): string[] => {
+      const note = paneReadClassNote({ kind: PANE_READ_UNCLASSIFIED, errorClass, description: '' })
+      return lines.filter((l) => l.startsWith(`[slack] reconnectSession: persona=C1 ${head}`) && l.includes(`(${note}; `))
+    }
 
     /** The stub's UNAVAILABLE forms a `read-pane` can answer (every one but the kill-only `ErrTmuxKillFailed`). */
     const PANE_UNAVAILABLE_FORMS = UNAVAILABLE_FORMS.filter(([, , , cause]) => cause !== UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)
@@ -2557,7 +2566,7 @@ describe('_buildReconnectSessionAdapter', () => {
       ...PANE_UNAVAILABLE_FORMS.map(([label, build]) => [`UNAVAILABLE: ${label}`, () => cannedErr<ReadPaneResult>(build('read-pane')), [], AD_ERROR_CLASS_UNAVAILABLE] as const),
       ['CONFIG (ErrConfigMalformed)', () => cannedErr<ReadPaneResult>(paneConfigMalformed()), ['ad-config-malformed'], AD_ERROR_CLASS_CONFIG] as const,
       ...PANE_UNCLASSIFIED.map(([label, build, flags]) => [`UNCLASSIFIED: ${label}`, () => cannedErr<ReadPaneResult>(build()), flags, AD_ERROR_CLASS_UNCLASSIFIED] as const),
-    ] as ReadonlyArray<readonly [string, () => CannedResponse<ReadPaneResult>, readonly OutageClass[], string | undefined]>)("a waiting row, %s → the reconnect goes ahead on the row alone: /mcp reconnect typed → 'success'; one read-pane, no sweep, nothing latched; the outage flags the read raised are up when it types; no tmux call", async (_label, answer, flags, errorClass) => {
+    ] as ReadonlyArray<readonly [string, () => CannedResponse<ReadPaneResult>, readonly OutageClass[], AdErrorClass | undefined]>)("a waiting row, %s → the reconnect goes ahead on the row alone: /mcp reconnect typed → 'success'; one read-pane, no sweep, nothing latched; the outage flags the read raised are up when it types; no tmux call", async (_label, answer, flags, errorClass) => {
       const h = cellHarness('waiting', { paneQueue: [answer()] })
       // The flags raised when /mcp reconnect is typed (its success then clears them).
       const flagsAtTyping: OutageClass[][] = []

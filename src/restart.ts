@@ -388,12 +388,15 @@ export interface RestartDeps {
    * - at the run's first liveness probe, `dead` from a row read →
    *   `noteDead`, and `dead` from `ErrSystemInstallDisappeared` →
    *   `noteInstallGone`;
+   * - at the run's first liveness probe, `pending` → `noteOther` with
+   *   `RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE`;
    * - a run whose reconnect ends with any verdict other than 'escalate-dead'
    *   (a success, 'transient', 'pending', no answer or a reconnect that
-   *   throws) → `noteOther` with `RESTART_SLOW_RECOVERY_OTHER_VERDICT`;
+   *   throws), and a run that finds the session already connected with its
+   *   stream → `noteOther` with `RESTART_SLOW_RECOVERY_OTHER_VERDICT`;
    * - a run that stops before the reconnect for any other reason (an
-   *   `unknown` or `pending` first probe, a session already connected, a
-   *   latch, a launch in flight, shutdown, not up) → nothing.
+   *   `unknown` first probe, a latch, a launch in flight, shutdown, not up)
+   *   → nothing.
    * After a live re-probe nothing else changes: no kill, no launch and no
    * accounting; the next escalate-dead tick sweeps again through the
    * reconnect adapter's ordinary sweep. A note that throws is logged and
@@ -403,15 +406,18 @@ export interface RestartDeps {
   slowRecovery?: RestartSlowRecoveryObserver
 }
 
-/** `RestartSlowRecoveryObserver.noteOther`'s reason: a run whose reconnect ended with a verdict other than 'escalate-dead'. */
+/** `RestartSlowRecoveryObserver.noteOther`'s reason: a run whose reconnect ended with a verdict other than 'escalate-dead', or that found the session already connected with its stream. */
 export const RESTART_SLOW_RECOVERY_OTHER_VERDICT = 'other-verdict'
 /** `RestartSlowRecoveryObserver.noteOther`'s reason: an 'escalate-dead' verdict whose re-probe read `pending` (not counted, b.jg5 SRJ-610). */
 export const RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE = 'pending-reprobe'
+/** `RestartSlowRecoveryObserver.noteOther`'s reason: a run whose first liveness probe read `pending` (b.jg5 SRJ-610). */
+export const RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE = 'pending-probe'
 
 /** Why the restart work told the slow-recovery observer `noteOther`. */
 export type SlowRecoveryOtherReason =
   | typeof RESTART_SLOW_RECOVERY_OTHER_VERDICT
   | typeof RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE
+  | typeof RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE
 
 /**
  * What the restart work tells about each run, for the slow dead-session
@@ -425,7 +431,7 @@ export interface RestartSlowRecoveryObserver {
   noteDead(key: string): unknown
   /** The `dead` reading from `ErrSystemInstallDisappeared`, which reads no row. */
   noteInstallGone(key: string): unknown
-  /** A run whose reconnect ended with another verdict, or an 'escalate-dead' verdict whose re-probe read `pending`. */
+  /** A run whose reconnect ended with another verdict or that found the session already connected with its stream, a run whose first probe read `pending`, or an 'escalate-dead' verdict whose re-probe read `pending`. */
   noteOther(key: string, reason: SlowRecoveryOtherReason): unknown
 }
 
@@ -725,7 +731,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // It goes to the `pending` deferral whatever the session's connection
   // shows (a connected `pending` row is never "already reconnected"): no
   // reconnect, kill or launch, nothing counted.
+  // b.jg5 SRJ-610: a `pending` first probe resets the slow-recovery count; an
+  // open episode stays open.
   if (probe.kind === LIVENESS_PENDING) {
+    tellSlowRecovery(d, key, 'noteOther', RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE)
     deferPending(d, key, probe)
     return RESTART_OUTCOME_PENDING_DEFERRED
   }
@@ -745,6 +754,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // waved through as "already reconnected".
     if (d.isSessionConnected(key) && d.hasSessionStream(key)) {
       console.error(`[slack] Session already reconnected — skipping restart for persona=${key}`)
+      // b.jg5 SRJ-610: the persona healed on its own, a verdict other than
+      // 'escalate-dead': the slow-recovery count resets; an open episode
+      // stays open.
+      tellSlowRecovery(d, key, 'noteOther', RESTART_SLOW_RECOVERY_OTHER_VERDICT)
       return RESTART_OUTCOME_ALREADY_CONNECTED
     }
     console.error(`[slack] Session alive but disconnected — reconnecting MCP for persona=${key}`)

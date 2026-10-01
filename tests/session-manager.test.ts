@@ -475,6 +475,7 @@ import {
   readPersonaOwnRow,
   readPersonaOwnRowStatus,
   readPersonaOwnPane,
+  type OwnPaneReadOutcome,
   type PersonaPaneReadRequest,
   OWN_ROW_READ_ROW,
   OWN_ROW_STATUS_ABSENT,
@@ -687,6 +688,7 @@ import {
   type PaneReadFailure,
   type PaneReadOutcome,
   type PaneReadUnclassified,
+  paneReadClassNote,
   paneReadFailureOf,
 } from '../src/pane-read.ts'
 import { promptRowTmuxGoneLine, workingRowAbsentAtPaneReadLine, workingRowPaneGoneLine } from '../src/server.ts'
@@ -6916,23 +6918,44 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
   })
 
   // b.jg5 SRJ-610: the five reconnect lines logged before an escalate-dead
-  // sweep promise no relaunch: each ends with the shared tail, then its own
-  // references. The tail's one literal pin; every other case compares with
-  // the line's builder.
-  test('the five escalate-dead reconnect lines end with ESCALATE_DEAD_REPROBE_DECIDES and their references; none says "relaunches it"', () => {
+  // sweep promise no relaunch: each opens with what it found (the failure's
+  // description where it names one) and what it does not do, then the shared
+  // tail, then its own references. The lines' one literal pin; every other
+  // case compares with the line's builder.
+  test('the five escalate-dead reconnect lines: what each found, then ESCALATE_DEAD_REPROBE_DECIDES and their references; none says "relaunches it"', () => {
     const gone = paneReadFailureOf(errTmuxCaptureFailed())
     const absent = paneReadFailureOf(errSpawnNotFound())
-    const lines: ReadonlyArray<readonly [string, string]> = [
-      [promptRowTmuxGoneLine('C', 'ask_user'), ' (b.jdc)'],
-      [workingRowPaneGoneLine('C', gone), ` (read-pane class=${AD_ERROR_CLASS_GONE}; b.d61, b.jg5 SRJ-603)`],
-      [workingRowAbsentAtPaneReadLine('C', absent), ` (read-pane class=${AD_ERROR_CLASS_STATE}; b.jg5 SRJ-117)`],
-      [waitingRowPaneGoneLine('C', gone), ` (read-pane class=${AD_ERROR_CLASS_GONE}; b.jg5 SRJ-604)`],
-      [waitingRowAbsentAtPaneReadLine('C', absent), ` (read-pane class=${AD_ERROR_CLASS_STATE}; b.jg5 SRJ-117)`],
+    const lines: ReadonlyArray<readonly [line: string, opening: string, references: string]> = [
+      [
+        promptRowTmuxGoneLine('C', 'ask_user'),
+        '[slack] reconnectSession: persona=C is ask_user but its tmux session "slack_bot_C" is gone — no prompt is waiting in it; not deferring, ',
+        ' (b.jdc)',
+      ],
+      [
+        workingRowPaneGoneLine('C', gone),
+        `[slack] reconnectSession: persona=C is working but agent-director's read-pane found no pane of its launch: ${gone.description} — not deferring; `,
+        ` (${paneReadClassNote(gone)}; b.d61, b.jg5 SRJ-603)`,
+      ],
+      [
+        workingRowAbsentAtPaneReadLine('C', absent),
+        `[slack] reconnectSession: persona=C is working but its agent-director row was absent at the pane read: ${absent.description} — not deferring; `,
+        ` (${paneReadClassNote(absent)}; b.jg5 SRJ-117)`,
+      ],
+      [
+        waitingRowPaneGoneLine('C', gone),
+        `[slack] reconnectSession: persona=C is waiting but agent-director's read-pane found no pane of its launch: ${gone.description} — not typing /mcp reconnect; `,
+        ` (${paneReadClassNote(gone)}; b.jg5 SRJ-604)`,
+      ],
+      [
+        waitingRowAbsentAtPaneReadLine('C', absent),
+        `[slack] reconnectSession: persona=C is waiting but its agent-director row was absent at the pane read: ${absent.description} — not typing /mcp reconnect; `,
+        ` (${paneReadClassNote(absent)}; b.jg5 SRJ-117)`,
+      ],
     ]
 
     expect(ESCALATE_DEAD_REPROBE_DECIDES).toBe("sweeping and escalating (escalate-dead); the restart path's re-probe decides")
-    for (const [line, suffix] of lines) {
-      expect(line.endsWith(`${ESCALATE_DEAD_REPROBE_DECIDES}${suffix}`)).toBe(true)
+    for (const [line, opening, references] of lines) {
+      expect(line).toBe(`${opening}${ESCALATE_DEAD_REPROBE_DECIDES}${references}`)
       expect(line).not.toContain('relaunches it')
     }
     assertNoLeak(lines.map(([line]) => line))
@@ -7151,9 +7174,13 @@ function paneReadOf(key: string): import('agent-director').ReadPaneParams {
   return { claude_instance_id: personaInstanceId(key), n_lines: FULL_PANE_READ_LINES }
 }
 
-/** The class note a failed pane read's line closes with (`read-pane class=<CLASS>`), for an answer of class `errorClass`. */
-function paneReadClassNote(errorClass: string): string {
-  return `(read-pane class=${errorClass}; `
+/**
+ * How a failed pane read's line of class `errorClass` opens its closing
+ * references: `(`, the class note `paneReadClassNote` gives (it reads only
+ * the failure's class), then `; `.
+ */
+function paneReadClassOpening(errorClass: AdErrorClass): string {
+  return `(${paneReadClassNote({ kind: PANE_READ_UNCLASSIFIED, errorClass, description: '' })}; `
 }
 
 /** Persona `C`'s agent-director row reading `working`, naming `transcript` (without one: no transcript). */
@@ -7653,7 +7680,7 @@ describe('b.f2b: the restart path\'s check of a waiting row\'s pane before it re
     ['a running turn with a custom spinner verb of several words', 'defer', () => CUSTOM_VERB_SPINNER_PANE, 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
     ['an API retry row', 'defer', () => withLastLine('  ⎿  Waiting for API response · will retry in 30s'), 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
     // A name CSCB gives no handling: the line closes with its read-pane class, UNCLASSIFIED.
-    ['a failed read (the waiting row alone decides)', 'reconnect', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'waiting')), `persona=C is waiting and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))} — reconnecting on the waiting row alone ${paneReadClassNote(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b, b.jg5 SRJ-604)`],
+    ['a failed read (the waiting row alone decides)', 'reconnect', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'waiting')), `persona=C is waiting and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))} — reconnecting on the waiting row alone ${paneReadClassOpening(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b, b.jg5 SRJ-604)`],
   ])('%s → %s: C\'s own pane read once, nothing typed here, no notice, one line unless it goes ahead plainly', async (_label, verdict, pane, line) => {
     const opts = paneOnly(pane())
     let got: string | undefined
@@ -7939,6 +7966,80 @@ describe('b.f2b: a working row whose idleness can\'t be proven is reported (unpr
   })
 })
 
+// b.f2b, b.jg5 SRJ-605: the wait's reports and lines, each builder pinned
+// once with literal text; every other case compares the wait's lines and
+// notices with these builders' output.
+describe('b.f2b, b.jg5 SRJ-605: the wait-ended reports and the wait\'s lines (one literal pin per builder)', () => {
+  /** A failed status read's description, as the redacting describer would render one. */
+  const DESCRIBED = 'ErrTimeout message="timed out"'
+
+  test('waitTimedOutUnreadReport: the failed timeout read named with its class, the health check\'s recovery, and a notice saying agent-director could not report the state', () => {
+    expect(waitTimedOutUnreadReport(WAIT_REF_C, 10 * 60_000, DESCRIBED, AD_ERROR_CLASS_UNCLASSIFIED)).toEqual({
+      logHead: '[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — its status read failed: ErrTimeout message="timed out" (class=UNCLASSIFIED), so its state is not known — not reconnected (b.jg5 SRJ-605)',
+      enabledFollowUp: 'the health check recovers it from its own reads of the row: once agent-director answers with the row live and the persona disconnected, the tick schedules a reconnect (b.9a7)',
+      notice: { reason: 'auto-restart-disabled', cause: 'agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it' },
+    })
+  })
+
+  test('waitTimedOutLiveReport: the live state at the deadline, the health check\'s idle rule, and a notice by state (working: unproven-idle; a prompt: blocked-on-prompt; any other: the state and no proof of idle)', () => {
+    expect(waitTimedOutLiveReport(WAIT_REF_C, 10 * 60_000, 10 * 60_000, 'working', 12 * 60_000)).toEqual({
+      logHead: '[slack] reconnect: gave up waiting for persona=C after 600000ms — claude process state=working (alive)',
+      enabledFollowUp: 'the health check schedules a reconnect once it has seen the persona disconnected on two ticks; for a working row it types /mcp reconnect only once its pane has shown the same idle screen and its transcript has ended with a completed turn, both unchanged, across attempts, and never into a prompt, and it reports the persona once CSCB has held back from the row for 10 min (b.9a7/b.rmy/b.f2b)',
+      notice: { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 12 * 60_000 },
+    })
+    expect(waitTimedOutLiveReport(WAIT_REF_C, 90_000, 30_000, 'check_permission').notice).toEqual({ reason: 'blocked-on-prompt', autoRestartDisabled: true })
+    expect(waitTimedOutLiveReport(WAIT_REF_C, 90_000, 30_000, 'compacting').notice).toEqual({
+      reason: 'auto-restart-disabled',
+      cause: 'its agent-director row still read compacting 2 min after launch, and CSCB found no proof it was idle',
+    })
+  })
+
+  test('waitEndedOnStateReport: the state the row moved to, the health check\'s recovery, and a notice by state (a prompt: blocked-on-prompt; any other: the state it moved to)', () => {
+    expect(waitEndedOnStateReport(WAIT_REF_C, 'ask_user')).toEqual({
+      logHead: '[slack] waitForWaitingAndReconnect: persona=C transitioned to state=ask_user — aborting',
+      enabledFollowUp: 'the health check reconnects it (tick sees alive && !connected on two ticks -> scheduleRestart -> reconnect, b.9a7; an ask_user or check_permission row is never typed into, b.f2b)',
+      notice: { reason: 'blocked-on-prompt', autoRestartDisabled: true },
+    })
+    expect(waitEndedOnStateReport(WAIT_REF_C, 'compacting').notice).toEqual({
+      reason: 'auto-restart-disabled',
+      cause: 'it moved to state compacting while CSCB waited to reconnect it',
+    })
+  })
+
+  test('waitEndedDisconnectedLine: at session_restart_delay 0 the head, then that nothing will reconnect it and the notice reports it; at any other delay the head, then the follow-up', () => {
+    const report = { logHead: '[slack] the head', enabledFollowUp: 'what the health check does next' }
+
+    expect(waitEndedDisconnectedLine(report, 0)).toBe(
+      '[slack] the head; session_restart_delay is 0, so nothing will reconnect it — the not-connected notice reports it (once per episode) (b.f2b)',
+    )
+    expect(waitEndedDisconnectedLine(report, 60)).toBe('[slack] the head; what the health check does next')
+  })
+
+  test('waitRowAbsentLine: the absent row at the poll and at the timeout read, a dead session either way', () => {
+    expect(waitRowAbsentLine(WAIT_REF_C)).toBe(
+      "[slack] waitForWaitingAndReconnect: persona=C's agent-director row is absent (ErrSpawnNotFound) — dead session; the recovery's spawn classifies any leftover session (b.jg5 SRJ-605)",
+    )
+    expect(waitRowAbsentLine(WAIT_REF_C, 10 * 60_000)).toBe(
+      "[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — agent-director row is absent (ErrSpawnNotFound) — dead session; the recovery's spawn classifies any leftover session (b.jg5 SRJ-605)",
+    )
+  })
+
+  test('waitPollStatusErrorLine: the failed poll read named with its class; the wait goes on and posts nothing', () => {
+    expect(waitPollStatusErrorLine(WAIT_REF_C, DESCRIBED, AD_ERROR_CLASS_UNAVAILABLE)).toBe(
+      '[slack] waitForWaitingAndReconnect: status read failed for persona=C: ErrTimeout message="timed out" (class=UNAVAILABLE) — its state is not known; still waiting for its working row, nothing posted (b.jg5 SRJ-605)',
+    )
+  })
+
+  test('the notice a wait-ended report raises posts its cause in the not-connected notice, with how to recover', async () => {
+    const { notice } = waitTimedOutUnreadReport(WAIT_REF_C, 10 * 60_000, DESCRIBED, AD_ERROR_CLASS_UNCLASSIFIED)
+
+    expect(await renderedNotice('C', notice)).toBe(
+      ":warning: *Not connected* — this persona's session is running but is not connected to this server (agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it), and automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it; messages sent to it are lost.\n" +
+        'To recover: attach with `tmux attach -t =slack_bot_C`, deal with anything on screen and type `/mcp reconnect slack-channel-router`, or restart the server.',
+    )
+  })
+})
+
 describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconnect)', () => {
   let clock: FakeClock
   beforeEach(() => {
@@ -8077,6 +8178,7 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     expect(results).toEqual(['not-reconnected', 'not-reconnected'])
     expect(row.sendKeysCalls).toEqual([])
     expect(linesWith(errLog, report().logHead)).toEqual(Array(2).fill(waitEndedDisconnectedLine(report(), 0)))
+    expect(linesWith(errLog, 'session_restart_delay is 0, so nothing will reconnect it')).toHaveLength(2)
     expect(errLog).not.toContain('health-check will')
     expect(notices.map((n) => [n.key, n.text])).toEqual([['C', await renderedNotice('C', report().notice)]])
   })
@@ -8301,7 +8403,7 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     expect(linesWith(errLog, 'reading the pane of persona=C failed')).toHaveLength(row.pane instanceof Error ? 1 : 0)
     const failed = linesWith(errLog, failure)
     expect(failed).toHaveLength(row.pane instanceof Error ? 1 : 0)
-    for (const line of failed) expect(line).toEndWith(`${paneReadClassNote(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b)`)
+    for (const line of failed) expect(line).toEndWith(`${paneReadClassOpening(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b)`)
     assertNoLeak({ errLog })
   })
 })
@@ -17621,13 +17723,13 @@ function paneUnusableNameLatch(p: string, row: UnusableNameCaseRow, rowState: La
 }
 
 /** The failure outcome the reader answers for `err` of `kind`: the class given and the redacting describer's text. */
-function paneFailure(kind: string, errorClass: string, err: unknown): PaneReadOutcome {
-  return { kind, errorClass, description: describeAgentDirectorFailure(err) } as PaneReadOutcome
+function paneFailure(kind: string, errorClass: string, err: unknown): OwnPaneReadOutcome {
+  return { kind, errorClass, description: describeAgentDirectorFailure(err) } as OwnPaneReadOutcome
 }
 
 /** The latched outcome the reader answers for a latching `err` of `kind`: the answer kept as its cause. */
-function paneLatchedBy(kind: string, errorClass: string, err: unknown): PaneReadOutcome {
-  return { kind: PANE_READ_LATCHED, cause: { kind, errorClass, description: describeAgentDirectorFailure(err), error: err } } as PaneReadOutcome
+function paneLatchedBy(kind: string, errorClass: string, err: unknown): OwnPaneReadOutcome {
+  return { kind: PANE_READ_LATCHED, cause: { kind, errorClass, description: describeAgentDirectorFailure(err), error: err } } as OwnPaneReadOutcome
 }
 
 /**
@@ -18030,8 +18132,8 @@ describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-603: a CONFLICT from the pane rea
 // ---------------------------------------------------------------------------
 
 /** The check's one line for P's waiting row whose read-pane answered `err` of class `errorClass`: `says` (what it found), then `then` (what it does), closing with `srj`. */
-function waitingRowLine(p: string, says: string, err: Error, then: string, errorClass: string, srj: string): string {
-  return `[slack] reconnectSession: persona=${p} is waiting ${says}: ${describeAgentDirectorFailure(err)} — ${then} (read-pane class=${errorClass}; ${srj})`
+function waitingRowLine(p: string, says: string, err: Error, then: string, errorClass: AdErrorClass, srj: string): string {
+  return `[slack] reconnectSession: persona=${p} is waiting ${says}: ${describeAgentDirectorFailure(err)} — ${then} ${paneReadClassOpening(errorClass)}${srj})`
 }
 
 /** The check's lines for persona `p`'s waiting row. */
@@ -18183,7 +18285,7 @@ describe('b.jg5 SRJ-117, SRJ-608: the launch wait\'s evidence read — every fai
     expect(order.indexOf('readPane')).toBe(order.indexOf('status') + 1)
     expect(h.stub.calls.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
     expect(h.errors.filter((line) => line.includes(`reading the pane of ${renderPersonaRef(p, p)} failed`))).toEqual([
-      `[slack] waitForWaitingAndReconnect: reading the pane of ${renderPersonaRef(p, p)} failed: ${describeAgentDirectorFailure(err)} — no idle evidence from it; still waiting for its working row (read-pane class=${errorClass}; b.f2b)`,
+      `[slack] waitForWaitingAndReconnect: reading the pane of ${renderPersonaRef(p, p)} failed: ${describeAgentDirectorFailure(err)} — no idle evidence from it; still waiting for its working row ${paneReadClassOpening(errorClass)}b.f2b)`,
     ])
     expectNoNoteLatch(h)
     expect(allPaneReadLatchLines(h)).toEqual([])
@@ -18368,7 +18470,7 @@ describe('b.jg5 SRJ-104, SRJ-204: an ErrInvalidFlags answer at the shared read-p
     expect(recheckLines(h)).toEqual([invalidFlagsLine(p, err, RECHECK_OUTCOME_STOP, READ_WORKING_PANE_SITE)])
     const ref = renderPersonaRef(p, p)
     expect(h.errors.filter((line) => line.includes(`reading the pane of ${ref} failed`))).toEqual([
-      `[slack] waitForWaitingAndReconnect: reading the pane of ${ref} failed: ${describeAgentDirectorFailure(err)} — the agent-director version re-check decided that the server stops; the wait ends, nothing more is called and nothing is typed (read-pane class=${AD_ERROR_CLASS_UNCLASSIFIED}; b.jg5 SRJ-204, SRJ-205)`,
+      `[slack] waitForWaitingAndReconnect: reading the pane of ${ref} failed: ${describeAgentDirectorFailure(err)} — the agent-director version re-check decided that the server stops; the wait ends, nothing more is called and nothing is typed ${paneReadClassOpening(AD_ERROR_CLASS_UNCLASSIFIED)}b.jg5 SRJ-204, SRJ-205)`,
     ])
     expect(h.notices).toEqual([])
     expect(h.triggers).toEqual([])

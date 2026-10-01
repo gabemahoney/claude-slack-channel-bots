@@ -13,10 +13,12 @@
  * nothing, the note at it posts the builder's text once, and later live notes
  * post nothing while the episode is open. A dead note resets the count and
  * ends the episode, so the next run of threshold-many posts once more. An
- * install-gone note (`ErrSystemInstallDisappeared`) and an other note (another
- * verdict, or a `pending` re-probe) reset the count and leave an open episode
- * open, so threshold-many live notes after them post nothing; with none open
- * the count starts again from one. The latch end, the teardown's `forget` and
+ * install-gone note (`ErrSystemInstallDisappeared`), an other note (another
+ * verdict or a session already connected, a `pending` first probe, or a
+ * `pending` re-probe; any other reason given is the other-verdict one) and a
+ * healthy note (a health-check tick found the session healthy) reset the
+ * count and leave an open episode open, so threshold-many live notes after
+ * them post nothing; with none open the count starts again from one. The latch end, the teardown's `forget` and
  * shutdown's `close` reset the count and end the episode silently. Q's notes
  * count and post apart from P's. A throwing episodes member or log breaks no
  * note. Each behaviour's case asserts the exact lines it logs, through the
@@ -28,7 +30,8 @@
  * `assertNoLeak` over every post and line.
  *
  * What the restart work notes for each reading (an `unknown` re-probe noting
- * nothing included) is in `tests/restart.test.ts`; the count's own rules in
+ * nothing included) is in `tests/restart.test.ts`, the health check's call of
+ * the healthy note in `tests/health-check.test.ts`; the count's own rules in
  * the episodes instance are in `tests/persona-episodes.test.ts`.
  */
 
@@ -43,9 +46,11 @@ import {
 } from '../src/persona-episodes.ts'
 import {
   SLOW_RECOVERY_POST_THRESHOLD,
+  SLOW_RECOVERY_RESET_HEALTHY,
   SLOW_RECOVERY_RESET_INSTALL_GONE,
   SLOW_RECOVERY_RESET_LATCHED,
   SLOW_RECOVERY_RESET_OTHER_VERDICT,
+  SLOW_RECOVERY_RESET_PENDING_PROBE,
   SLOW_RECOVERY_RESET_PENDING_REPROBE,
   SLOW_RECOVERY_RESET_ROW_DEAD,
   SLOW_RECOVERY_RESET_TEXT,
@@ -58,6 +63,7 @@ import {
   slowRecoveryNoticePostedLine,
   slowRecoveryText,
   type SlowRecoveryLiveResult,
+  type SlowRecoveryResetReason,
   type SlowRecoveryTracker,
 } from '../src/slow-recovery.ts'
 import { REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
@@ -171,6 +177,8 @@ describe('SRJ-1010\'s text (pin)', () => {
       [SLOW_RECOVERY_RESET_INSTALL_GONE]: 'its liveness read dead from ErrSystemInstallDisappeared, which reads no row',
       [SLOW_RECOVERY_RESET_OTHER_VERDICT]: 'a restart run ended with a verdict other than escalate-dead',
       [SLOW_RECOVERY_RESET_PENDING_REPROBE]: "an escalate-dead verdict's re-probe read the row pending, which is not counted",
+      [SLOW_RECOVERY_RESET_PENDING_PROBE]: "a restart run's liveness probe read the row pending",
+      [SLOW_RECOVERY_RESET_HEALTHY]: 'a health check found the session live, connected and with its stream',
       [SLOW_RECOVERY_RESET_LATCHED]: 'the persona latched',
     })
   })
@@ -219,37 +227,21 @@ describe('once per episode (AC 66)', () => {
     expect(posts).toEqual([notice(P), notice(P)])
   })
 
-  test('an install-gone note (ErrSystemInstallDisappeared) resets the count and leaves an open episode open: threshold-many live notes after it post nothing', () => {
-    openEpisode()
-    takeLines()
-
-    tracker.noteInstallGone(P)
-
-    expect([tracker.count(P), tracker.isOpen(P)]).toEqual([0, true])
-    expect(takeLines()).toEqual([slowRecoveryCountResetLine(P, T, SLOW_RECOVERY_RESET_INSTALL_GONE)])
-    expect(live(P, T)).toEqual(counted(T))
-    expect(posts).toEqual([notice(P)])
-  })
-
-  test('with no episode open, an install-gone note restarts the count from one', () => {
-    live(P, T - 1)
-
-    tracker.noteInstallGone(P)
-
-    expect(live(P, T - 1)).toEqual(counted(T - 1))
-    expect(tracker.noteLive(P)).toBe('posted')
-    expect(posts).toEqual([notice(P)])
-  })
-
-  describe.each([
-    ['another verdict', SLOW_RECOVERY_RESET_OTHER_VERDICT],
-    ['a pending re-probe', SLOW_RECOVERY_RESET_PENDING_REPROBE],
-  ] as const)('an other note (%s)', (_, reason) => {
+  // Each note that resets the count and leaves an open episode open, with the
+  // reason its reset line carries. The tracker is read at call time, since
+  // beforeEach builds a new one per case.
+  describe.each<[string, SlowRecoveryResetReason, (key: string) => void]>([
+    ['an install-gone note (ErrSystemInstallDisappeared)', SLOW_RECOVERY_RESET_INSTALL_GONE, (key) => tracker.noteInstallGone(key)],
+    ['an other note (another verdict)', SLOW_RECOVERY_RESET_OTHER_VERDICT, (key) => tracker.noteOther(key, SLOW_RECOVERY_RESET_OTHER_VERDICT)],
+    ['an other note (a pending re-probe)', SLOW_RECOVERY_RESET_PENDING_REPROBE, (key) => tracker.noteOther(key, SLOW_RECOVERY_RESET_PENDING_REPROBE)],
+    ['an other note (a pending first probe)', SLOW_RECOVERY_RESET_PENDING_PROBE, (key) => tracker.noteOther(key, SLOW_RECOVERY_RESET_PENDING_PROBE)],
+    ['a healthy note (a health-check tick found the session healthy)', SLOW_RECOVERY_RESET_HEALTHY, (key) => tracker.noteHealthy(key)],
+  ])('%s', (_, reason, note) => {
     test('resets the count and leaves an open episode open: threshold-many live notes after it post nothing', () => {
       openEpisode()
       takeLines()
 
-      tracker.noteOther(P, reason)
+      note(P)
 
       expect([tracker.count(P), tracker.isOpen(P)]).toEqual([0, true])
       expect(takeLines()).toEqual([slowRecoveryCountResetLine(P, T, reason)])
@@ -257,15 +249,32 @@ describe('once per episode (AC 66)', () => {
       expect(posts).toEqual([notice(P)])
     })
 
-    test('with no episode open, restarts the count from one', () => {
+    // SRJ-1010's threshold counts consecutive verdicts: one live note just
+    // below it, then this note, then one more live note posts nothing.
+    test('with no episode open, restarts the count from one: the threshold is reached only after threshold-many live notes in a row', () => {
       live(P, T - 1)
+      takeLines()
 
-      tracker.noteOther(P, reason)
+      note(P)
 
-      expect(live(P, T - 1)).toEqual(counted(T - 1))
+      expect(takeLines()).toEqual([slowRecoveryCountResetLine(P, T - 1, reason)])
+      expect(tracker.noteLive(P)).toBe('counted')
+      expect(tracker.count(P)).toBe(1)
+      expect(posts).toEqual([])
+      expect(live(P, T - 2)).toEqual(counted(T - 2))
       expect(tracker.noteLive(P)).toBe('posted')
       expect(posts).toEqual([notice(P)])
     })
+  })
+
+  test('an other note given a reason that is none of its own resets with the other-verdict reason', () => {
+    live(P, T - 1)
+    takeLines()
+
+    tracker.noteOther(P, 'unheard-of' as never)
+
+    expect(tracker.count(P)).toBe(0)
+    expect(takeLines()).toEqual([slowRecoveryCountResetLine(P, T - 1, SLOW_RECOVERY_RESET_OTHER_VERDICT)])
   })
 
   // The latch end logs its reset and ended lines; the teardown's forget,
@@ -337,12 +346,15 @@ describe('lines and failures', () => {
     tracker.noteDead(P)
     tracker.noteInstallGone(P)
     tracker.noteOther(P, SLOW_RECOVERY_RESET_OTHER_VERDICT)
+    tracker.noteHealthy(P)
     tracker.endForLatch(P)
     expect(lines).toEqual([])
 
     openEpisode(P)
     live(Q, 1)
     tracker.noteOther(Q, SLOW_RECOVERY_RESET_PENDING_REPROBE)
+    live(Q, 1)
+    tracker.noteHealthy(Q)
     tracker.noteDead(P)
 
     expect(lines.length).toBeGreaterThan(0)
@@ -366,11 +378,12 @@ describe('lines and failures', () => {
     tracker.noteDead(P)
     tracker.noteInstallGone(P)
     tracker.noteOther(P, SLOW_RECOVERY_RESET_OTHER_VERDICT)
+    tracker.noteHealthy(P)
     tracker.endForLatch(P)
 
     expect(tracker.count(P)).toBe(1)
     expect(posts).toEqual([])
-    expect(lines).toEqual(Array(5).fill(slowRecoveryFailedLine(P, describeThrownValue(refusal))))
+    expect(lines).toEqual(Array(6).fill(slowRecoveryFailedLine(P, describeThrownValue(refusal))))
     expect(lines[0]).toContain(`message="count refused (${REDACTED_SENTINEL_TAIL})"`)
   })
 
