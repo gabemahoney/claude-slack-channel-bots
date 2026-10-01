@@ -34,7 +34,10 @@
  * their total, and `installStubSpawnPath` / `resetStubSpawnPath` route the
  * real persona launch path (`spawnForPersona`) to a fresh stub client with
  * the approver's cap shortened, the liveness prober faked and a temp spawn
- * home; the approver reads and types through the stub client only.
+ * home; the approver reads and types through the stub client only. A launch
+ * through that path returns before its approver's first lap (the approver
+ * runs on its own after the launch call, b.jg5 SRJ-401), and
+ * `resetStubSpawnPath` leaves no approver running.
  *
  * Phase 1 errors and results (b.jg5 SRJ-1303):
  *   - Every error builder uses the 0.10.0 client's own class, except:
@@ -161,12 +164,10 @@ import {
 } from '../../src/persona-identity.ts'
 import {
   _resetApproverClock,
-  _resetDialogPollIntervalMs,
   _resetDialogReadyTimeoutMs,
   _resetInFlightLaunches,
   _resetSpawnHomeDir,
   _resetTmuxSessionProber,
-  _setDialogPollIntervalMs,
   _setDialogReadyTimeoutMs,
   _setSpawnHomeDir,
   _setTmuxSessionProber,
@@ -1871,19 +1872,25 @@ export interface StubSpawnPath {
 /**
  * Route the real persona launch path (`spawnForPersona`) to a fresh stub
  * client with an empty call log: the client is installed as the process's
- * agent-director client; a launch through this path runs the startup-dialog
- * approver through that client (`status`, `readPane`, `sendKeys`), with laps
- * 1 ms apart and its cap at 200 ms (`_setDialogReadyTimeoutMs`, which caps
- * the approver only); the liveness prober reports every session alive; and
- * the spawn home is `homeDir` (its `.claude` directory is created).
+ * agent-director client; the liveness prober reports every session alive;
+ * and the spawn home is `homeDir` (its `.claude` directory is created).
  * `homeDir` must be under the test's `mkdtempSync` directory. Undo
  * everything with `resetStubSpawnPath` in `afterEach`.
+ *
+ * A launch through this path that returns success starts the persona's
+ * startup-dialog approver on its own (b.jg5 SRJ-401): `spawnForPersona`
+ * returns before the approver's first lap, which then reads and types
+ * through the same client (`status`, `readPane`, `sendKeys`). Its cap is
+ * 200 ms (`_setDialogReadyTimeoutMs`, which caps the approver only); its
+ * laps are `DIALOG_POLL_INTERVAL_MS` apart, and its sleeps and cap run on
+ * the approver's clock (the real one unless the case sets
+ * `_setApproverClock`). A case that counts calls after the launch awaits the
+ * approver's stop first (`_whenDialogApproverStopped(key)`).
  */
 export function installStubSpawnPath(homeDir: string): StubSpawnPath {
   const calls = makeStubCallLog()
   const client = makeStubClient(calls)
   setClientForTests(client as unknown as Parameters<typeof setClientForTests>[0])
-  _setDialogPollIntervalMs(1)
   _setDialogReadyTimeoutMs(200)
   _setTmuxSessionProber(async () => true)
   mkdirSync(join(homeDir, '.claude'), { recursive: true })
@@ -1897,17 +1904,20 @@ export function installStubSpawnPath(homeDir: string): StubSpawnPath {
 }
 
 /**
- * Undo `installStubSpawnPath`, restore the approver's real clock (a case may
- * have set `_setApproverClock`), and forget any launch still marked in flight.
+ * Undo `installStubSpawnPath`: stop and forget every dialog approver and
+ * every launch still marked in flight (`_resetInFlightLaunches`, which runs
+ * the session manager's approver reset), so no approver is left running;
+ * then restore the approver's real clock (a case may have set
+ * `_setApproverClock`) and its cap, the client, the liveness prober and the
+ * spawn home.
  */
 export function resetStubSpawnPath(): void {
+  _resetInFlightLaunches()
   resetClientForTests()
-  _resetDialogPollIntervalMs()
   _resetDialogReadyTimeoutMs()
   _resetApproverClock()
   _resetTmuxSessionProber()
   _resetSpawnHomeDir()
-  _resetInFlightLaunches()
 }
 
 // ---------------------------------------------------------------------------

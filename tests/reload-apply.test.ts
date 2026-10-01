@@ -502,11 +502,21 @@ describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 
     const bravoRef = renderPersonaRef('bravo', bravoKey)
     const before = { alpha: slackSideOf(run, 'alpha'), charlie: slackSideOf(run, 'charlie') }
     const cp = run.checkpoint()
+    const callsAtCp = run.composition!.calls.length
 
     await applyConfig(run, [alpha!, charlie!])
 
     expect(run.since(cp).lifecycle).toEqual([{ op: 'teardown', key: bravoKey, via: 'apply' }])
     const composition = run.composition!
+    // The teardown reaches the approver stop first (b.jg5 SRJ-404, SRJ-715): recorded at its submission and again
+    // as its turn's first step, before every other teardown step for bravo, the wait for its launch in flight included.
+    const bravoTeardownCalls = composition.calls.slice(callsAtCp).filter(([, key]) => key === bravoKey)
+    expect(bravoTeardownCalls.slice(0, 2)).toEqual([
+      ['stopApprover', bravoKey],
+      ['stopApprover', bravoKey],
+    ])
+    expect(bravoTeardownCalls.slice(2).filter(([member]) => member === 'stopApprover')).toEqual([])
+    expect(bravoTeardownCalls.slice(2).map(([member]) => member)).toContain('whenLaunchSettled')
     expect(composition.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`, `delete ${personaInstanceId(bravoKey)}`])
     expect(stubCallCount(composition.agentDirector)).toBe(2)
     // Every dependency call is for bravo, except the Stop-hook pass, which re-evaluates against the personas still applied.

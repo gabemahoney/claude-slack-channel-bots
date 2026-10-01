@@ -11,8 +11,16 @@
  * timer (b.jg5 SRJ-301) runs on the harness with the controller as the outage
  * state's trigger sink: real launches through `spawnForPersona` over the
  * stub, the arming predicate on its own, and the reads made outside every
- * attempt. The shared findMissing sweep runs there too, its one call held
- * open by the test so each caller joins it before it fails.
+ * attempt. The persona's dialog approver (b.jg5 SRJ-401; hatch A2) runs
+ * there too, after its launch call returned and on the harness clock: it is
+ * in flight for the persona (a lost message makes no read) but blocks no
+ * retry (SRJ-303: the retry makes its row read), and once it stops a lost
+ * message reads again; its UNAVAILABLE, STATE, GONE and UNCLASSIFIED answers
+ * (`status`, `read-pane`, `send-keys`) arm no timer, add no cause, open no
+ * episode and count nothing, while ENVIRONMENT and CONFIG raise their outage
+ * and arm as from any verb. The shared findMissing sweep runs on the harness
+ * as well, its one call held open by the test so each caller joins it before
+ * it fails.
  * The attempt frames run on the bare context with the controller as the sink.
  * The retry action's decisions, in both modes, run over a stand-in row read
  * and retry entry; the full-mode retry end to end (AC 26 with the
@@ -130,6 +138,7 @@ import {
   type LatchRowState,
 } from '../src/conflict-latch.ts'
 import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
+import type { LostMessageState } from '../src/lost-message.ts'
 import { LIVENESS_LIVE, LIVENESS_PENDING, LIVENESS_READING_UNKNOWN, type PendingLivenessReading } from '../src/liveness-reading.ts'
 import {
   adConfigMalformedOnset,
@@ -191,10 +200,17 @@ import { _buildIsSessionAliveAdapter, deferPendingRow } from '../src/server.ts'
 import {
   _resetConfigDirFs,
   _setConfigDirFs,
+  APPROVER_STOP_FINISHED,
+  APPROVER_STOP_LIVE,
+  APPROVER_STOP_TEARDOWN,
+  DIALOG_POLL_INTERVAL_MS,
   isLaunchInFlight,
   killPersonaInstance,
   reconcileOrphans,
+  stopDialogApprover,
   sweepDeadTmuxChannel,
+  TRUST_DIALOG_NEEDLE,
+  type ApproverStopReason,
   type SpawnPersonaResult,
 } from '../src/session-manager.ts'
 import {
@@ -260,7 +276,6 @@ import type { AdConfigTables } from './test-helpers/ad-settings.ts'
 import {
   cannedErr,
   cannedListRow,
-  cannedOk,
   cannedStatusResult,
   errCallTimeout,
   errConfigMalformed,
@@ -869,13 +884,6 @@ interface LaunchSite {
 const LAUNCH_SITES: readonly LaunchSite[] = [
   { name: 'the optimistic spawn', verb: 'spawn', action: 'failed', script: (_h, _p, err) => ({ spawnError: err }) },
   { name: 'the collision get', verb: 'get', action: 'failed', script: (_h, _p, err) => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: err }) },
-  { name: 'the readiness read after a spawn', verb: 'status', action: 'spawned', script: (_h, _p, err) => ({ statusQueue: [cannedErr(err)] }) },
-  {
-    name: 'the dialog pane read after a spawn',
-    verb: 'read-pane',
-    action: 'spawned',
-    script: (_h, _p, err) => ({ statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' }))], readPaneQueue: [cannedErr(err)] }),
-  },
   { name: 'the reconnect of a waiting row', verb: 'send-keys', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: err }) },
   {
     name: 'the sweep before a working-row wait',
@@ -1056,7 +1064,6 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     ['a DIRECTORY answer from spawn', () => ({ spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found') }), 'failed'],
     ['a LAUNCH FAILURE answer from resume', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errTmuxSessionCreate('resume') }), 'spawned'],
     ['ErrSpawnNotFound from the collision get', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() }), 'spawned'],
-    ['ErrSpawnNotFound from the readiness read', () => ({ statusQueue: [cannedErr(errSpawnNotFound())] }), 'spawned'],
   ])('%s inside a launch arms nothing and marks nothing', async (_what, script, action) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
@@ -1065,7 +1072,14 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     const result = await h.launch(key)
 
     expect(result).toEqual({ key, action })
+    expect(h.triggers).toEqual([])
+    expect(h.controller.armedKeys()).toEqual([])
+    // A launch that answers spawned starts P's dialog approver, whose cap and
+    // sleep timers are on the same clock; driven to its stop, it leaves none,
+    // so a timer still pending would be one the launch's answer armed.
+    await h.runApproverToStop(key)
     expectNothingArmed(h)
+    expect(h.attempts).toEqual([])
   })
 
   test.each<[string, (h: RecoveryHarness, key: string) => Promise<number>]>([
@@ -1212,6 +1226,150 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
 
     expect(result).toEqual({ key, action: 'failed' })
     expectNothingArmed(h)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// P's dialog approver (b.jg5 SRJ-401; hatch A2) runs after its launch call
+// returned: it is in flight for P (the lost-message read gate, as for the
+// health tick; SRJ-315, SRJ-1011) but blocks no retry (SRJ-303), and its
+// calls are outside every launch or recovery attempt (SRJ-301, SRJ-313).
+// ---------------------------------------------------------------------------
+
+/** The approver's three verbs, and the stub call list each one is counted in. */
+const APPROVER_VERB_CALLS = { 'status': 'statusCalls', 'read-pane': 'readPaneCalls', 'send-keys': 'sendKeysCalls' } as const
+type ApproverVerb = keyof typeof APPROVER_VERB_CALLS
+
+/**
+ * Stub answers under which a dialog approver's `verb` call meets `err`: the
+ * row reads `pending` (with the stub's default launch start) for `read-pane`
+ * and `send-keys`, and the pane shows a startup dialog's needle for
+ * `send-keys`, so Enter is sent.
+ */
+function approverCallMeets(verb: ApproverVerb, err: Error): RecoveryStubScript {
+  if (verb === 'status') return { statusError: err }
+  const pending = { statusResult: cannedStatusResult({ state: 'pending' }) }
+  if (verb === 'read-pane') return { ...pending, readPaneError: err }
+  return { ...pending, readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }], sendKeysError: err }
+}
+
+describe('unavailable retry: P’s dialog approver is in flight for P, blocks no retry and makes its calls outside every attempt (SRJ-303, SRJ-315, SRJ-401; hatch A2)', () => {
+  test('a launch call held in flight both blocks a retry and is in flight for P; once it returns, P’s approver alone is in flight for P (a lost message for P makes no read, one for Q does) and blocks no retry (the retry makes its row read)', async () => {
+    // The approver's cap outlasts the retry's second wait, so it still runs when the retry fires.
+    const h = (harness = makeRecoveryHarness({ ...RETRY_TIMER_ONLY, approverCapMs: waitMs(0) + 2 * waitMs(1) }))
+    const [key, other] = h.keys as [string, string]
+    const id = personaInstanceId(key)
+    h.script({ statusResult: cannedStatusResult({ state: 'pending' }) })
+    const hold = holdSpawns(h.stub.client)
+    const launch = h.launch(key)
+    await hold.entered(id)
+    h.controller.arm(key, UNAVAILABLE)
+
+    // The launch call in flight: no read for the message, and the retry is skipped.
+    expect(isLaunchInFlight(key)).toBe(true)
+    await expectLostMessageReports(h, key, 'session-starting', { calls: {} })
+    await h.advance(waitMs(0))
+    expect(h.stub.callCount()).toBe(0)
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, 1))
+
+    hold.release(id)
+    expect(await launch).toMatchObject({ key, action: 'spawned' })
+    await h.settle()
+    expect(isLaunchInFlight(key)).toBe(false)
+    expect(h.approverRunning(key)).toBe(true)
+    expect(personaCallCounts(h, key)).toMatchObject({ statusCalls: 1, readPaneCalls: 1 })
+
+    // Only the approver runs: in flight for P, and not for Q.
+    await expectLostMessageReports(h, key, 'session-starting', { calls: {} })
+    await expectLostMessageReports(h, other, 'session-starting')
+
+    // The retry is not skipped: its row read finds the row pending, which defers it.
+    await retryNow(h, key)
+    expect(h.approverRunning(key)).toBe(true)
+    expect(h.attempts.map((a) => [a.key, a.retry])).toEqual([[key, 1], [key, 2]])
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 2, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 2))
+    expect(h.triggers).toEqual([])
+  })
+
+  test.each<[string, RowState, boolean, ApproverStopReason, LostMessageState]>([
+    ['the row reads live', 'waiting', false, APPROVER_STOP_LIVE, 'auto-restart-disabled'],
+    ['the row reads ended', 'ended', false, APPROVER_STOP_FINISHED, 'auto-restart-disabled'],
+    ['its stop entry, the row still pending', 'pending', true, APPROVER_STOP_TEARDOWN, 'session-starting'],
+  ])('once P’s approver stops (%s) it is no longer in flight for P: the next lost message makes its row read', async (_what, state, stopEntry, reason, lostState) => {
+    // A cap past the pace, so a second lap reads the row.
+    const h = (harness = makeRecoveryHarness({ approverCapMs: 2 * DIALOG_POLL_INTERVAL_MS }))
+    const [key] = h.keys as [string]
+    h.script({ statusResult: cannedStatusResult({ state: 'pending' }) })
+    await h.launch(key)
+    await h.settle()
+    expect(h.approverRunning(key)).toBe(true)
+
+    h.script({ statusResult: cannedStatusResult({ state }) })
+    if (stopEntry) expect(await stopDialogApprover(key, APPROVER_STOP_TEARDOWN)).toBe(true)
+    expect((await h.runApproverToStop(key))?.reason).toBe(reason)
+
+    expect(h.approverRunning(key)).toBe(false)
+    expect(isLaunchInFlight(key)).toBe(false)
+    await expectLostMessageReports(h, key, lostState)
+    expectNothingArmed(h)
+  })
+
+  test.each<[string, ApproverVerb, () => Error]>([
+    ...UNAVAILABLE_VALUES.map(([what, make]) => [`UNAVAILABLE (${what})`, 'read-pane', () => make('read-pane')] as [string, ApproverVerb, () => Error]),
+    ['UNAVAILABLE (ErrCallTimeout)', 'status', () => errCallTimeout('status')],
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', 'send-keys', () => errTmuxUnresponsive('send-keys')],
+    ['a STATE answer (ErrSpawnNotInteractive)', 'status', () => errSpawnNotInteractive('status')],
+    ['a GONE answer (ErrTmuxCaptureFailed)', 'status', () => errTmuxCaptureFailed(undefined, 'status')],
+    ...(['status', 'read-pane', 'send-keys'] as const).flatMap((verb): Array<[string, ApproverVerb, () => Error]> => [
+      ['UNCLASSIFIED (ErrInternal with no recognised phrase)', verb, () => errInternal()],
+      ['UNCLASSIFIED (ErrSchemaMismatch)', verb, () => errSchemaMismatch()],
+    ]),
+  ])('%s answering the dialog approver’s %s, after the launch returned, arms no timer, adds no cause to an armed one, opens no episode and counts nothing', async (_what, verb, make) => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    // Q's timer is armed first, with a cause no approver answer gives.
+    h.controller.arm(other, { kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED })
+    const otherView = h.controller.view(other)
+    h.script(approverCallMeets(verb, make()))
+
+    await h.launch(key)
+    await h.launch(other)
+    await h.settle()
+
+    for (const k of [key, other]) {
+      expect([k, personaCallCounts(h, k)[APPROVER_VERB_CALLS[verb]]]).toEqual([k, 1])
+      expect(h.approverRunning(k)).toBe(true)
+      expect(h.unclassifiedErrorOpen(k)).toBe(false)
+      expect(unclassifiedLines(h, k)).toEqual([])
+      expect(h.tmuxUnresponsive.holds(k)).toBe(false)
+      expect(getFailureCount(k)).toBe(0)
+    }
+    expect(h.triggers).toEqual([])
+    expect(h.controller.armedKeys()).toEqual([other])
+    expect(h.controller.view(other)).toEqual(otherView)
+    expect(h.episodeNotices).toEqual([])
+  })
+
+  test.each<[string, () => Error, OutageClass, UnavailableRetryCause['kind']]>([
+    ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'read-pane'), 'tmux-unavailable', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), 'ad-config-malformed', UNAVAILABLE_RETRY_CAUSE_CONFIG],
+  ])('%s answering the dialog approver’s read-pane, after the launch returned, raises %s for P and arms P’s timer once at the base wait, as from any verb; Q is untouched', async (_what, make, flag, kind) => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    h.script(approverCallMeets('read-pane', make()))
+
+    await h.launch(key)
+    await h.settle()
+
+    expect(personaCallCounts(h, key)).toMatchObject({ readPaneCalls: 1 })
+    expect([...getOutageFlags(key)]).toEqual([flag])
+    expect(h.triggers).toEqual([{ key, kind }])
+    expect(h.controller.armedKeys()).toEqual([key])
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', waitMs: waitMs(0), refusals: 0, causes: [kind] })
+    expect(h.unclassifiedErrorOpen(key)).toBe(false)
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(getFailureCount(key)).toBe(0)
+    expect(getOutageFlags(other).size).toBe(0)
   })
 })
 

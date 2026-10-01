@@ -54,12 +54,12 @@ import {
   _setTmuxServerEnsurer,
   _resetTmuxServerEnsurer,
   _resetInFlightLaunches,
+  _whenDialogApproverStopped,
+  stopAllDialogApprovers,
   _setTmuxSessionProber,
   _resetTmuxSessionProber,
   _setTmuxSessionKiller,
   _resetTmuxSessionKiller,
-  _setDialogPollIntervalMs,
-  _resetDialogPollIntervalMs,
   _setDialogReadyTimeoutMs,
   _resetDialogReadyTimeoutMs,
   _setSpawnHomeDir,
@@ -199,6 +199,18 @@ const SLOW_DELAY_S = 9999  // large enough to never fire during a test
 const WAIT_MS = 50         // wait after scheduling; long enough for FAST_DELAY_S to fire
 const CAP_BASE_DELAY_S = 0.001  // 1 ms base for the cap-driving helper below
 const CAP_MARGIN_MS = 40        // margin above each computed backoff delay
+
+/**
+ * Stop every dialog approver a real launch started and wait until each has
+ * stopped (after any call in progress returned), then forget them and every
+ * launch still marked in flight: no approver outlives the case (b.jg5
+ * SRJ-401: a launch returns before its approver's first lap, so one may still
+ * be running when the case ends).
+ */
+async function stopApproversAndForgetLaunches(): Promise<void> {
+  await stopAllDialogApprovers()
+  _resetInFlightLaunches()
+}
 
 /** The restart work's line for a kill it was refused (b.jg5 SRJ-105). */
 const KILL_REFUSED_LINE = (key: string) => `[slack] Session kill refused for persona=${key} — no relaunch; not counted`
@@ -2559,7 +2571,10 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
 //
 // `holdSpawns` keeps the stub AD client's `spawn` open per instance ID, so a
 // launch can be kept in flight while a second restart fires. `status` answers
-// `waiting`, so the dialog approver returns at once. Every raw-tmux seam is a
+// `waiting`, so the dialog approver a launch starts after it returns (b.jg5
+// SRJ-401) stops at its first lap; a case awaits that stop
+// (`_whenDialogApproverStopped`) before it asserts on what followed the
+// launch, and afterEach stops any still running. Every raw-tmux seam is a
 // no-op, the `config_dir` label derives from a temp home, and every persona
 // path lies under a temp directory removed in afterEach.
 // ---------------------------------------------------------------------------
@@ -2627,7 +2642,6 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
 
     _resetInFlightLaunches()
     _setSpawnHomeDir(dir)
-    _setDialogPollIntervalMs(1)
     _setDialogReadyTimeoutMs(200)
     _setTmuxSessionProber(async () => true)
     _setTmuxServerEnsurer(async () => {})
@@ -2637,14 +2651,13 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     // Let any launch a failed assertion left held settle before tearing down.
     hold.releaseAll()
     await Bun.sleep(WAIT_MS)
+    await stopApproversAndForgetLaunches()
     console.error = origConsoleError
     cancelAllRestartTimers()
-    _resetInFlightLaunches()
     resetClientForTests()
     _resetOutageState()
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
-    _resetDialogPollIntervalMs()
     _resetDialogReadyTimeoutMs()
     _resetTmuxSessionProber()
     _resetTmuxServerEnsurer()
@@ -2669,6 +2682,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     hold.release(personaInstanceId(a.key))
     expect(await launch).toBe(true)
     expect(isLaunchInFlight(a.key)).toBe(false)
+    await _whenDialogApproverStopped(a.key)
     await killSession(a.key)
     expect(killCalls.map((k) => k.claude_instance_id)).toEqual([personaInstanceId(b.key), personaInstanceId(a.key)])
     expect(errLines.filter((l) => l === skipLine(a))).toHaveLength(1)
@@ -2703,6 +2717,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     hold.release(personaInstanceId(a.key))
     await Bun.sleep(WAIT_MS)
     expect(launchResults).toEqual([{ key: a.key, ok: true }, { key: a.key, ok: true }])
+    await _whenDialogApproverStopped(a.key)
     expect(spawnsFor(a)).toHaveLength(1)
     expect(getFailureCount(a.key)).toBe(0)
     expect(isRestartPendingOrActive(a.key)).toBe(false)
@@ -2711,6 +2726,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     holdIds.clear()
     scheduleRestart(a.key, a.working_directory)
     await Bun.sleep(WAIT_MS)
+    await _whenDialogApproverStopped(a.key)
     expect(killsFor(a)).toBe(2)
     expect(spawnsFor(a)).toHaveLength(2)
     expect(launchResults).toHaveLength(3)
@@ -2773,6 +2789,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
 
     scheduleRestart(b.key, b.working_directory)
     await Bun.sleep(WAIT_MS)
+    await _whenDialogApproverStopped(b.key)
     // B was killed (no launch of B in flight), its spawn was issued, addressed
     // to B, and B's launch completed while A's spawn is still held.
     expect(killsFor(b)).toBe(1)
@@ -2785,6 +2802,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
 
     hold.release(personaInstanceId(a.key))
     await Bun.sleep(WAIT_MS)
+    await _whenDialogApproverStopped(a.key)
     expect(launchResults).toEqual([{ key: b.key, ok: true }, { key: a.key, ok: true }])
     expect(spawnsFor(a)).toHaveLength(1)
     expect(spawnsFor(b)).toHaveLength(1)
@@ -2834,21 +2852,19 @@ describe('restart: the reply-guard record holds the effective value before the r
     setSessionNotifier(() => {})
     _resetInFlightLaunches()
     _setSpawnHomeDir(dir)
-    _setDialogPollIntervalMs(1)
     _setDialogReadyTimeoutMs(200)
     _setTmuxSessionProber(async () => true)
     _setTmuxServerEnsurer(async () => {})
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    await stopApproversAndForgetLaunches()
     console.error = origConsoleError
     cancelAllRestartTimers()
-    _resetInFlightLaunches()
     resetClientForTests()
     _resetOutageState()
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
-    _resetDialogPollIntervalMs()
     _resetDialogReadyTimeoutMs()
     _resetTmuxSessionProber()
     _resetTmuxServerEnsurer()
@@ -2911,6 +2927,7 @@ describe('restart: the reply-guard record holds the effective value before the r
 
     scheduleRestart(a.key, a.working_directory)
     await waitFor(() => results.length > 0)
+    await _whenDialogApproverStopped(a.key)
 
     expect(deps.killSessionCalls).toEqual([a.key])
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([a.key])
@@ -2983,6 +3000,7 @@ describe('restart: the reply-guard record holds the effective value before the r
 
     scheduleRestart(a.key, a.working_directory)
     await waitFor(() => results.length === 1)
+    await _whenDialogApproverStopped(a.key)
     expect(results).toEqual([true])
     expect(spawnCalls).toHaveLength(1)
     expect(spawnCalls[0]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
@@ -2993,6 +3011,7 @@ describe('restart: the reply-guard record holds the effective value before the r
     applied = configFor(newDir, false)
     scheduleRestart(a.key, a.working_directory)
     await waitFor(() => results.length === 2)
+    await _whenDialogApproverStopped(a.key)
 
     expect(results).toEqual([true, true])
     expect(resumeCalls).toEqual([])
@@ -3069,7 +3088,6 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
 
     _setSpawnHomeDir(dir)
     _resetInFlightLaunches()
-    _setDialogPollIntervalMs(1)
     _setDialogReadyTimeoutMs(200)
     _setTmuxSessionProber(async () => true)
     _setTmuxServerEnsurer(async () => {})
@@ -3146,12 +3164,11 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     await h.manager.stopAll()
     setConfigDirUnresolvableHook(undefined)
     _resetConfigDirFs()
-    _resetInFlightLaunches()
+    await stopApproversAndForgetLaunches()
     resetClientForTests()
     _resetOutageState()
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
-    _resetDialogPollIntervalMs()
     _resetDialogReadyTimeoutMs()
     _resetTmuxSessionProber()
     _resetTmuxServerEnsurer()
@@ -3200,6 +3217,7 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     scheduleRestart(a.key, a.working_directory)
     scheduleRestart(b.key, b.working_directory)
     await waitFor(() => !isRestartPendingOrActive(a.key) && !isRestartPendingOrActive(b.key))
+    await _whenDialogApproverStopped(b.key)
 
     // A: only the liveness probe reached agent-director.
     expect(idsFor(calls.killCalls, a)).toEqual([])
@@ -3247,6 +3265,7 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     broken = false
     await h.clock.advance(10_000)
     await waitFor(() => calls.resumeCalls.length > 0 && !isLaunchInFlight(a.key))
+    await _whenDialogApproverStopped(a.key)
 
     expect(calls.resumeCalls.map((r) => r.claude_instance_id)).toEqual([personaInstanceId(a.key)])
     expect(calls.deleteCalls).toEqual([])
@@ -3507,26 +3526,24 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     _resetInFlightLaunches()
     _resetFindMissingMemo()
     _setSpawnHomeDir(dir)
-    _setDialogPollIntervalMs(1)
     _setDialogReadyTimeoutMs(200)
     _setTmuxSessionProber(async () => true)
     _setTmuxServerEnsurer(async () => {})
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    await stopApproversAndForgetLaunches()
     console.error = origConsoleError
     retry.stopAll('test end')
     // Checked after the cleanup below, so a failed check never skips it.
     const pendingAfterStop = clock.pendingCount()
     cancelAllRestartTimers()
     resetAdVersionRecheckForTests()
-    _resetInFlightLaunches()
     _resetFindMissingMemo()
     resetClientForTests()
     _resetOutageState()
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
-    _resetDialogPollIntervalMs()
     _resetDialogReadyTimeoutMs()
     _resetTmuxSessionProber()
     _resetTmuxServerEnsurer()
@@ -4267,20 +4284,18 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
       setSessionNotifier(() => {})
       _resetInFlightLaunches()
       _setSpawnHomeDir(dir)
-      _setDialogPollIntervalMs(1)
       _setDialogReadyTimeoutMs(200)
       _setTmuxSessionProber(async () => true)
       _setTmuxServerEnsurer(async () => {})
     })
 
-    afterEach(() => {
+    afterEach(async () => {
       hold.releaseAll()
-      _resetInFlightLaunches()
+      await stopApproversAndForgetLaunches()
       resetClientForTests()
       _resetOutageState()
       setSessionNotifier(undefined)
       _resetSpawnHomeDir()
-      _resetDialogPollIntervalMs()
       _resetDialogReadyTimeoutMs()
       _resetTmuxSessionProber()
       _resetTmuxServerEnsurer()
@@ -4313,6 +4328,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
       hold.release(id)
       expect(await launch).toBe(true)
       expect(isLaunchInFlight(a.key)).toBe(false)
+      await _whenDialogApproverStopped(a.key)
     })
   })
 })

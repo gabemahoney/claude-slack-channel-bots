@@ -81,21 +81,29 @@
  *     stopped. The restart cap is the routing's own read of the real backoff
  *     state: `putAtRestartCap(key)` records `RESTART_FAILURE_CAP` real
  *     failures there;
- *   - a launch running (`session-starting`): by default, whether one of the
- *     harness's own restart launches is in flight for the key
- *     (`h.isLaunchInFlight`), as production binds `isLaunchInFlight`, so a
- *     restart launch held open (`launchSession`) reads as a launch running;
- *     the `isLaunchOrApproverRunning` option replaces it;
+ *   - a launch or dialog approver running (`session-starting`): by default,
+ *     as `main()` binds it (`isLaunchInFlight` or `isDialogApproverRunning`,
+ *     b.jg5 SRJ-401), whether one of the harness's own restart launches is in
+ *     flight for the key (`h.isLaunchInFlight`), so a restart launch held
+ *     open (`launchSession`) reads as a launch running, or the session
+ *     manager's `isDialogApproverRunning` answers true for it (the approver a
+ *     real launch started runs on after its launch call returned; the
+ *     harness's own launches are recorded fakes and start none); the
+ *     `isLaunchOrApproverRunning` option replaces it;
  *   - held on `ErrInvalidFlags` (`cannot-launch`), kill failed
  *     (`kill-failed`) and a live-row sequence or old-life wait step running
  *     (`restarting`): the key sets `h.heldOnInvalidFlags`, `h.killFailed`
  *     and `h.sequenceOrWaitRunning` (seeded by the options of the same names,
  *     with persona names), which production leaves unbound;
- *   - in flight for P (the read gate's `isWorkInFlight`): as `main()` binds
- *     the one shared in-flight predicate, one of the harness's own restart
- *     launches in flight (`h.isLaunchInFlight`), or the key in
- *     `h.workInFlight` (seeded by `workInFlight`, with persona names), work
- *     in flight that is not a launch (a later Epic's sequence or wait step);
+ *   - in flight for P (the read gate's `isWorkInFlight`): as `main()`
+ *     composes "in flight for P" (`isPersonaWorkInFlight`) from "blocks a
+ *     retry" (`isPersonaRetryBlocked`) and a running dialog approver: one of
+ *     the harness's own restart launches in flight (`h.isLaunchInFlight`) or
+ *     the key in `h.workInFlight` (seeded by `workInFlight`, with persona
+ *     names), work in flight that is not a launch (a later Epic's sequence or
+ *     wait step), or the session manager's `isDialogApproverRunning`
+ *     answering true for the key (b.jg5 SRJ-401). With no approver running, a
+ *     harness built with no option behaves as before;
  *   - the one lost-message row read (`readRowLiveness`), only with the
  *     `rowRead` option; without it the routing gets no read and makes none.
  *     Each persona's answer is scripted in `h.rowReadScripts` (by key, read at
@@ -171,6 +179,7 @@ import {
   type TmuxUnresponsiveCondition,
 } from '../../src/persona-episodes.ts'
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
+import { isDialogApproverRunning } from '../../src/session-manager.ts'
 import { createSessionServer, registerSession, _resetRegistry, type SessionEntry, type SessionToolDeps } from '../../src/registry.ts'
 import {
   initRestart,
@@ -611,8 +620,10 @@ export interface RoutingHarnessOptions {
    */
   outageState?: boolean
   /**
-   * Replaces the routing's launch-running query (b.jg5 SRJ-1011 state 6);
-   * default `h.isLaunchInFlight`, the harness's own restart launches in flight.
+   * Replaces the routing's launch-or-approver query (b.jg5 SRJ-1011 state 6);
+   * default `h.isLaunchInFlight` (the harness's own restart launches in
+   * flight) or the session manager's `isDialogApproverRunning`, as `main()`
+   * binds it.
    */
   isLaunchOrApproverRunning?: PersonaRoutingDeps['isLaunchOrApproverRunning']
   /** Names first held on `ErrInvalidFlags` (`h.heldOnInvalidFlags`, `cannot-launch`). */
@@ -1001,14 +1012,17 @@ export function makeRoutingHarness(
     isLatched: (key) => h.latch.isLatched(key),
     isTmuxUnresponsive: (key) => h.tmuxUnresponsive.holds(key),
     isRetryArmed: (key) => h.retryArmed.has(key),
-    isLaunchOrApproverRunning: opts.isLaunchOrApproverRunning ?? ((key) => h.isLaunchInFlight(key)),
+    // As main() binds it (b.jg5 SRJ-401): a launch call, or the dialog
+    // approver that runs after it returned.
+    isLaunchOrApproverRunning: opts.isLaunchOrApproverRunning ?? ((key) => h.isLaunchInFlight(key) || isDialogApproverRunning(key)),
     // Unbound in production until their Epics bind them.
     isHeldOnInvalidFlags: (key) => h.heldOnInvalidFlags.has(key),
     isKillFailed: (key) => h.killFailed.has(key),
     isSequenceOrWaitRunning: (key) => h.sequenceOrWaitRunning.has(key),
-    // As main() binds the shared in-flight predicate (today a launch call),
-    // plus the non-launch work a case marks.
-    isWorkInFlight: (key) => h.isLaunchInFlight(key) || h.workInFlight.has(key),
+    // As main() composes "in flight for P": "blocks a retry" (a launch call,
+    // plus the non-launch work a case marks), or a running dialog approver
+    // (b.jg5 SRJ-401).
+    isWorkInFlight: (key) => h.isLaunchInFlight(key) || h.workInFlight.has(key) || isDialogApproverRunning(key),
     readRowLiveness,
     ...(opts.armRetryTimer === true
       ? {

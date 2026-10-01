@@ -87,12 +87,13 @@ export interface HealthCheckDeps {
   isRestartPendingOrActive(key: string): boolean
   /**
    * True while anything is in flight for the persona (b.f2b, b.jg5 SRJ-315;
-   * production: the server's in-flight predicate, which today the retry timer
-   * shares; work that holds back the retry timer must count here too, but
-   * not the reverse: a running dialog approver counts here and never blocks
-   * a retry, SRJ-303, SRJ-401). Today that is a launch call: a start launch
-   * still waiting in the background for a `working` row to settle, a bring-up
-   * retry's launch or a restart's. The work in flight owns the persona's
+   * production: the server's "in flight for P" predicate, built from the
+   * retry timer's "blocks a retry" one; work that holds back the retry timer
+   * counts here too, but not the reverse: a running dialog approver counts
+   * here and never blocks a retry, SRJ-303, SRJ-401). Today that is a launch
+   * call (a start launch still waiting in the background for a `working` row
+   * to settle, a bring-up retry's launch or a restart's), or the dialog
+   * approver that runs after a launch call returned. The work in flight owns the persona's
    * session, so it is a no-attempt reason: the tick still runs the
    * working-directory check and reads the persona's liveness, connection and
    * stream, and a healthy one takes the healthy branch, but it never calls

@@ -491,7 +491,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     ])
     // Functions and objects with a parameter name of the source's choosing.
     // (`templateRefresh` is pinned in the test after this one.)
-    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopRetryTimer', 'forgetConflictLatch', 'forgetNoticeEpisodes']
+    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopApprover', 'stopRetryTimer', 'forgetConflictLatch', 'forgetNoticeEpisodes']
     expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
     for (const [dep, value] of expected) expect([dep, props.get(dep)]).toEqual([dep, value])
 
@@ -502,6 +502,8 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       cancelWorkingRowWait: './session-manager.ts',
       killPersonaInstance: './session-manager.ts',
       deletePersonaInstance: './session-manager.ts',
+      stopDialogApprover: './session-manager.ts',
+      APPROVER_STOP_TEARDOWN: './session-manager.ts',
       cancelRestartTimer: './restart.ts',
       forgetFailures: './backoff.ts',
       forgetDisconnectedStreak: './health-check.ts',
@@ -556,6 +558,17 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     )
     expect(launchPass).not.toBeNull()
     expect([launchPass![3], launchPass![4]]).toEqual([launchPass![1], launchPass![2]])
+
+    // b.jg5 SRJ-404, SRJ-715: optional in the deps, so only this pin makes
+    // sure a production teardown stops the key's dialog approver (and the one
+    // its launch in flight would start), first: the session manager's approver
+    // stop for that key with the teardown reason, not a stub, not another
+    // key's or every persona's stop (imported above, not shadowed).
+    const stopApprover = (props.get('stopApprover') ?? '').match(
+      /^\(?(\w+)\)? => stopDialogApprover\((\w+), APPROVER_STOP_TEARDOWN\)$/,
+    )
+    expect(stopApprover).not.toBeNull()
+    expect(stopApprover![2]).toBe(stopApprover![1])
 
     // b.jg5 SRJ-305: the teardown stops the key's UNAVAILABLE retry timer on
     // the server's one retry controller (the one installed as the outage

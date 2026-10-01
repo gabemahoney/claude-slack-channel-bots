@@ -141,7 +141,8 @@
  * holds the running attempts only. `isInsideAttempt(key)` reads it; an
  * attempt for another persona, or a call outside every attempt (the health
  * tick, the permission poller, the JSONL safeguard, the start sweep, a
- * persona teardown), is not inside one.
+ * persona teardown, and the dialog approver, which a launch attempt starts
+ * through `runOutsideAttempts`, b.jg5 SRJ-401), is not inside one.
  * `reportAttemptError(key, value, verb, sink)` is the one reporting step,
  * which the agent-director wrappers and the liveness adapter reach through
  * `src/outage-state.ts`: inside an attempt for `key`, the arming predicate
@@ -186,7 +187,8 @@
  * retry whose restart work answers `latched` stops the same way.
  *
  * In full mode the restart module's retry entry then reruns the restart
- * path's decision, with the one in-flight predicate as its first step, and
+ * path's decision, with the "blocks a retry" check (`isInFlight`) as its
+ * first step, and
  * its outcome decides: a persona already connected with its stream, or
  * reconnected, has nothing left to recover (stop; a persona already
  * connected with its stream, whose row read `live`, also ends its
@@ -1245,10 +1247,12 @@ export interface FullModeRetryDeps {
    */
   isLatched?: (key: string) => boolean
   /**
-   * The one in-flight predicate: true while work that owns the persona's
-   * session is in flight (today a launch call, `isLaunchInFlight`). A retry
-   * in either mode that finds it true makes no agent-director call and is a
-   * refusal; a throw counts as in flight.
+   * Whether work in flight for the persona blocks a retry (b.jg5 SRJ-303;
+   * production: the server's `isPersonaRetryBlocked`, today a launch call,
+   * `isLaunchInFlight`). A running dialog approver never counts here: it
+   * runs after its launch call has returned and never blocks a retry
+   * (SRJ-401). A retry in either mode that finds it true makes no
+   * agent-director call and is a refusal; a throw counts as in flight.
    */
   isInFlight: (key: string) => boolean
   /**
@@ -1671,7 +1675,7 @@ interface AttemptFrame {
 /**
  * The attempt the current call runs in, carried across awaits, timers and
  * microtasks by `AsyncLocalStorage` (Bun carries it on the launch path's
- * awaits, the dialog approver's timer polls included). It holds only the
+ * awaits and timers). It holds only the
  * running attempts' frames, never a persona's state between attempts.
  */
 const attemptContext = new AsyncLocalStorage<AttemptFrame>()
@@ -1699,6 +1703,21 @@ export async function runInAttempt<T>(
   } finally {
     frame.open = false
   }
+}
+
+/**
+ * Run `fn` outside every launch or recovery attempt, and answer what it
+ * answers: inside `fn`, and in every await, timer and microtask it starts,
+ * no attempt is running, for any persona, whatever attempt the caller runs
+ * in. For work that is part of no attempt but is started from one: the
+ * dialog approver, which a launch attempt starts as its launch call returns
+ * (b.jg5 SRJ-401). An agent-director error met there then arms a retry
+ * timer only with the ENVIRONMENT or CONFIG cause, and starts no
+ * `tmux-unresponsive` condition and no unclassified-error episode (both are
+ * attempt-scoped, `src/outage-state.ts`).
+ */
+export function runOutsideAttempts<T>(fn: () => T): T {
+  return attemptContext.exit(fn)
 }
 
 /** A live view of `frame`: its `lastError` reads the frame's current record. */

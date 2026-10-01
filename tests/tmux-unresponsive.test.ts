@@ -13,9 +13,11 @@
  *
  * - What starts it: each UNAVAILABLE form but `ErrTmuxKillFailed` at one of
  *   the tmux-touching calls the launch ladder makes, every such call met by
- *   at least one form, inside the launch; nothing
- *   else (the kill-failure cause, read and sweep errors inside an attempt,
- *   kills not of a row read live, calls outside every attempt).
+ *   at least one form, inside the launch, and a wrapped `read-pane` inside a
+ *   recovery attempt; nothing else (the kill-failure cause, read and sweep
+ *   errors inside an attempt, kills not of a row read live, calls outside
+ *   every attempt, the dialog approver's `status`, `read-pane` and
+ *   `send-keys` among them: it runs after its launch call returned).
  * - Held apart from the outages: no flag raised or cleared, no onset or
  *   all-clear, and an outage's own all-clear neither held back nor joined.
  * - What ends it: a tmux-touching success or GONE, in any context, and the
@@ -129,7 +131,7 @@ import {
 import { personaInstanceId } from '../src/persona-identity.ts'
 import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
-import { killPersonaInstance, reconcileOrphans } from '../src/session-manager.ts'
+import { killPersonaInstance, reconcileOrphans, TRUST_DIALOG_NEEDLE } from '../src/session-manager.ts'
 import {
   runInAttempt,
   UNAVAILABLE_RETRY_BASE_S,
@@ -151,7 +153,6 @@ import {
 import {
   cannedErr,
   cannedListRow,
-  cannedOk,
   cannedStatusResult,
   errCallTimeout,
   errInstanceIdCollision,
@@ -271,7 +272,11 @@ const TMUX_STARTING_FORMS = unavailableForms(
   'a wrapped UnknownError',
 )
 
-/** A tmux-touching call the launch ladder makes, and the stub answers that make it meet `err`. */
+/**
+ * A tmux-touching call the launch ladder makes, and the stub answers that make
+ * it meet `err`. The dialog approver's calls are not here: they come after the
+ * launch call returned, outside every attempt (b.jg5 SRJ-401, SRJ-307).
+ */
 interface TmuxSite {
   readonly name: string
   readonly verb: string
@@ -281,11 +286,6 @@ interface TmuxSite {
 const TMUX_SITES: readonly TmuxSite[] = [
   { name: 'the optimistic spawn', verb: 'spawn', script: (_h, _p, err) => ({ spawnError: err }) },
   { name: 'the resume of an ended row', verb: 'resume', script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: err }) },
-  {
-    name: 'the dialog approver’s pane read after a spawn',
-    verb: 'read-pane',
-    script: (_h, _p, err) => ({ statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' }))], readPaneError: err }),
-  },
   { name: 'the reconnect of a waiting row', verb: 'send-keys', script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: err }) },
   {
     // The row is `waiting` (read live) in another directory. The refused kill
@@ -349,7 +349,6 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
 
   test.each<[string, string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript]>([
     ['the collision get', 'get', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errCallTimeout('get') })],
-    ['the readiness read after a spawn', 'status', () => ({ statusQueue: [cannedErr(errCallTimeout('status'))] })],
     ['the working-row read', 'status', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusError: errCallTimeout('status') })],
     ['the sweep before a working-row wait', 'find-missing', (h, p) => ({ ...collided(h, p, { state: 'working' }), findMissingError: errCallTimeout('find-missing') })],
   ])('AC 27: ErrCallTimeout from %s (%s) inside a launch starts nothing and posts nothing; the retry timer is armed', async (_site, _verb, script) => {
@@ -379,6 +378,51 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     )
 
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expectNeverStarted(h, p)
+    expectNeverStarted(h, b)
+    expectNoPostYet(h)
+  })
+
+  test('inside a recovery attempt, a wrapped read-pane call refused ErrTmuxUnresponsive starts P’s condition at its time', async () => {
+    const { h, p, b } = build()
+    const at = h.clock.now()
+
+    await runInAttempt(p, 'recovery', () =>
+      expect(withOutageDetection(p, undefined, 'read-pane', () => Promise.reject(errTmuxUnresponsive('read-pane')))).rejects.toThrow(),
+    )
+
+    expectHolds(h, p, 'read-pane', at)
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expectNeverStarted(h, b)
+    expectNoPostYet(h)
+  })
+
+  // The dialog approver runs after its launch call returned, outside every
+  // launch or recovery attempt (SRJ-401, SRJ-307; hatch A2), as the tick's
+  // read does: none of its calls starts the condition or arms the timer.
+  test.each<[string, 'status' | 'read-pane' | 'send-keys', (verb: string) => Error]>([
+    ...TMUX_STARTING_FORMS.flatMap(([what, make]) =>
+      (['read-pane', 'send-keys'] as const).map((verb): [string, 'read-pane' | 'send-keys', (verb: string) => Error] => [what, verb, make]),
+    ),
+    ['AC 27: ErrCallTimeout', 'status', errCallTimeout],
+  ])('%s answering the dialog approver’s %s, after the launch returned, starts nothing, posts nothing and arms nothing', async (_what, verb, make) => {
+    const { h, p, b } = build()
+    const pending = { statusResult: cannedStatusResult({ state: 'pending' }) }
+    h.script(
+      verb === 'status'
+        ? { statusError: make(verb) }
+        : verb === 'read-pane'
+          ? { ...pending, readPaneError: make(verb) }
+          : { ...pending, readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }], sendKeysError: make(verb) },
+    )
+
+    expect(await h.launch(p)).toMatchObject({ key: p, action: 'spawned' })
+    await h.settle()
+
+    const calls = { 'status': h.stub.calls.statusCalls, 'read-pane': h.stub.calls.readPaneCalls, 'send-keys': h.stub.calls.sendKeysCalls }[verb]
+    expect(calls).toHaveLength(1)
+    expect(h.approverRunning(p)).toBe(true)
+    expect(h.triggers).toEqual([])
     expectNeverStarted(h, p)
     expectNeverStarted(h, b)
     expectNoPostYet(h)

@@ -74,8 +74,11 @@
  * own instance, outside any launch or recovery attempt, so its answers'
  * effects (outage raises, retry timer arms, episodes, the condition) are
  * read from the real modules over the stub client and a fake clock; none is
- * made while a spawn is held open; and the restart path's own read still
- * keeps a launch off a `pending` row after a failed routing read.
+ * made while a spawn is held open, nor while the persona's dialog approver
+ * runs after its launch returned (b.jg5 SRJ-401; driven on the harness
+ * clock), and one is made once the approver has stopped; and the restart
+ * path's own read still keeps a launch off a `pending` row after a failed
+ * routing read.
  *
  * main() in src/server.ts cannot run in a test (startup gate, real port, real
  * Slack connections), so describe (7) audits its source for the wiring only:
@@ -176,10 +179,20 @@ import {
   type RowReadAnswer,
 } from './test-helpers/persona-routing-harness.ts'
 import {
+  APPROVER_STOP_CAP,
+  APPROVER_STOP_LIVE,
+  APPROVER_STOP_TEARDOWN,
+  DIALOG_POLL_INTERVAL_MS,
+  TRUST_DIALOG_NEEDLE,
+  stopDialogApprover,
+  type ApproverStopReason,
+} from '../src/session-manager.ts'
+import {
   expectLostMessageReports,
   makeRecoveryHarness,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
+  type RecoveryRowState,
 } from './test-helpers/recovery-harness.ts'
 
 // ---------------------------------------------------------------------------
@@ -1218,25 +1231,60 @@ function expectNothingRaisedOrArmed(h: RecoveryHarness, key: string): void {
 }
 
 describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness adapter\'s one `status`, outside any attempt', () => {
-  test('AC 68: a spawn held open reports session starting with no `status` call from the routing; after the launch settles with the row still `pending`, the next lost message makes one `status` call and reports session starting, with no spawn', async () => {
+  test('AC 68: a spawn held open, and then P’s dialog approver running after the launch returned (the row `pending`, a dialog shown), each report session starting with no `status` call from the routing and no restart; Q beside it makes its read', async () => {
     const h = makeRecovery()
-    const [key] = h.keys as [string]
+    const [key, other] = h.keys as [string, string]
     const id = personaInstanceId(key)
     const hold = holdSpawns(h.stub.client)
     const launch = h.launch(key)
     await hold.entered(id)
-    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }] })
 
     // A launch running is state 6 with no read.
     await expectLostMessageReports(h, key, 'session-starting', { calls: {} })
 
-    // The spawn returns; the launch's approver reads the row `pending` until its cap, and the launch returns.
+    // The spawn returns and the launch with it; P's approver makes its first
+    // lap (it reads the row `pending` and answers the dialog) and then waits
+    // for its next one on the harness clock.
     hold.release(id)
-    await launch
+    expect(await launch).toMatchObject({ key, action: 'spawned' })
     await h.settle()
+    expect(h.approverRunning(key)).toBe(true)
+    expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
     const spawnsBefore = h.stub.calls.spawnCalls.length
 
-    await expectLostMessageReports(h, key, 'session-starting')
+    // The approver running is state 6 with no read, never starting now.
+    await expectLostMessageReports(h, key, 'session-starting', { calls: {} })
+    expect(isRestartPendingOrActive(key)).toBe(false)
+    expect(h.stub.calls.spawnCalls).toHaveLength(spawnsBefore)
+    // Q has no approver: its message makes its one read, which finds its row `pending`.
+    await expectLostMessageReports(h, other, 'session-starting')
+
+    expect(await h.runApproverToStop(key)).toMatchObject({ reason: APPROVER_STOP_CAP })
+    expectNothingRaisedOrArmed(h, key)
+  })
+
+  test.each<[string, string, RecoveryRowState, ApproverStopReason, LostMessageState]>([
+    ['its stop entry', 'the row still `pending`', AGENT_DIRECTOR_PENDING_STATE, APPROVER_STOP_TEARDOWN, 'session-starting'],
+    ['its ready cap', 'the row still `pending`', AGENT_DIRECTOR_PENDING_STATE, APPROVER_STOP_CAP, 'session-starting'],
+    ['a lap that reads the row live', 'the row live', 'waiting', APPROVER_STOP_LIVE, 'auto-restart-disabled'],
+  ])('AC 68: after P’s dialog approver stopped at %s, %s, the next lost message makes exactly one `status` call and reports %s, with no restart and no spawn', async (_how, _row, state, reason, lostState) => {
+    // A cap past the pace, so a second lap reads the row before it.
+    const h = makeRecovery({ approverCapMs: 2 * DIALOG_POLL_INTERVAL_MS })
+    const [key] = h.keys as [string]
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+    await h.launch(key)
+    await h.settle()
+    expect(h.approverRunning(key)).toBe(true)
+
+    h.script({ statusResult: cannedStatusResult({ state }) })
+    if (reason === APPROVER_STOP_TEARDOWN) expect(await stopDialogApprover(key, APPROVER_STOP_TEARDOWN)).toBe(true)
+    expect(await h.runApproverToStop(key)).toMatchObject({ reason })
+    expect(h.approverRunning(key)).toBe(false)
+    const spawnsBefore = h.stub.calls.spawnCalls.length
+
+    await expectLostMessageReports(h, key, lostState)
+    expect(isRestartPendingOrActive(key)).toBe(false)
     expect(h.stub.calls.spawnCalls).toHaveLength(spawnsBefore)
     expectNothingRaisedOrArmed(h, key)
   })

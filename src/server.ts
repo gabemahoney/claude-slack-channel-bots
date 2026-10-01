@@ -78,6 +78,7 @@ import {
 } from './config.ts'
 import { personaInstanceId, personaTmuxSessionName, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import {
+  APPROVER_STOP_TEARDOWN,
   applyOwnRowStatusStep,
   cancelWorkingRowWait,
   checkLaunchConfigDir,
@@ -92,6 +93,7 @@ import {
   hasPendingWorkingRowEvidence,
   hasPersonaTmuxSession,
   holdLaunchIfConfigDirUnresolvable,
+  isDialogApproverRunning,
   isLaunchInFlight,
   killPersonaInstance,
   launchSession,
@@ -111,6 +113,8 @@ import {
   setSessionNotifier,
   spawnForPersona,
   startupSessionManager,
+  stopAllDialogApprovers,
+  stopDialogApprover,
   sweepDeadTmuxChannelWithCause,
   whenLaunchSettled,
 } from './session-manager.ts'
@@ -386,18 +390,31 @@ let personaEpisodes: PersonaEpisodes | undefined
 let personaLatch: Pick<ConflictLatch, 'isLatched'> | undefined
 
 /**
- * b.jg5 SRJ-315: true while work is in flight for the persona (today only a
- * launch call, `isLaunchInFlight`). Today this one predicate serves the retry
- * timer (`isInFlight`), the health tick (`isLaunchInFlight`), the
- * `tmux-unavailable` retry check (`armMissingTmuxUnavailableRetry`, for the
- * session disconnect handler and the lost-message routing) and the
- * lost-message routing's read gate (`isWorkInFlight`, b.jg5 SRJ-1011). They need not stay
- * equal: a running dialog approver counts as in flight for the tick but never
- * blocks a retry (SRJ-303, SRJ-401). What must hold is that the tick never
- * attempts over work that holds back the retry timer.
+ * b.jg5 SRJ-303: true while work in flight for the persona blocks a retry of
+ * its retry timer: today a launch call (`isLaunchInFlight`). E21 and E27
+ * extend it (a live-row sequence, an old-life wait step). A running dialog
+ * approver is not here: it runs after its launch call has returned and
+ * never blocks a retry (SRJ-401). Given to the retry controller
+ * (`isInFlight`). Every member here is also in flight for the persona
+ * (`isPersonaWorkInFlight` is built from this), so the tick never attempts
+ * over work that holds back the retry timer.
+ */
+function isPersonaRetryBlocked(key: string): boolean {
+  return isLaunchInFlight(key)
+}
+
+/**
+ * b.jg5 SRJ-315, SRJ-1011 (Terms, "In flight for P"): true while work is in
+ * flight for the persona: anything that blocks a retry
+ * (`isPersonaRetryBlocked`), or a running dialog approver
+ * (`isDialogApproverRunning`, SRJ-401). Given to the health tick's in-flight
+ * member (`isLaunchInFlight`), the lost-message routing's read gate
+ * (`isWorkInFlight`) and the `tmux-unavailable` retry check
+ * (`armMissingTmuxUnavailableRetry`, for the session disconnect handler and
+ * the lost-message routing), which mirrors the tick's own check.
  */
 function isPersonaWorkInFlight(key: string): boolean {
-  return isLaunchInFlight(key)
+  return isPersonaRetryBlocked(key) || isDialogApproverRunning(key)
 }
 
 /**
@@ -638,7 +655,8 @@ export function armMissingTmuxUnavailableRetry(
  * The production dependencies of {@link armMissingTmuxUnavailableRetry}: the
  * outage state's flag, the retry controller and the latch through the
  * holders main() sets (read at call time: before main() builds them there is
- * no controller and no persona is latched), the shared in-flight predicate
+ * no controller and no persona is latched), "in flight for P" as the health
+ * tick takes it (`isPersonaWorkInFlight`, a running dialog approver included)
  * and the one ENVIRONMENT arm path.
  */
 const tmuxUnavailableRetryDeps: TmuxUnavailableRetryDeps = {
@@ -969,18 +987,18 @@ const personaRouting = createPersonaRouting({
   isPersonaUp,
   // b.jg5 SRJ-1011: the lost-message state inputs, each read at call time.
   // The latch and the tmux-unresponsive conditions are built in main(), so
-  // before then no persona is latched and no condition holds. A launch call
-  // awaits its dialog approver, so a launch in flight covers the approver
-  // too (E17 widens this binding if its approver runs outside the launch
-  // call). This is not the shared in-flight predicate (the module-scope
-  // isPersonaWorkInFlight) the retry timer and the health tick receive.
+  // before then no persona is latched and no condition holds. State 6's
+  // launch-or-approver member: a launch call, or the dialog approver that
+  // runs after it returned, in its own registry (SRJ-401). This is not the
+  // "in flight for P" predicate below: a live-row sequence or an old-life
+  // wait step reports `restarting` instead.
   isLatched: (key) => personaLatch?.isLatched(key) ?? false,
   isTmuxUnresponsive: (key) => personaTmuxUnresponsive?.holds(key) ?? false,
-  isLaunchOrApproverRunning: (key) => isLaunchInFlight(key),
-  // b.jg5 SRJ-1011: the lost-message read gate's "in flight for P" is the one
-  // shared in-flight predicate the retry timer and the health tick receive,
-  // so the in-flight work later Epics add to it (E17's approver, E21's and
-  // E27's sequences and wait steps) reaches the gate through it.
+  isLaunchOrApproverRunning: (key) => isLaunchInFlight(key) || isDialogApproverRunning(key),
+  // b.jg5 SRJ-1011: the lost-message read gate's "in flight for P" is the
+  // health tick's (isPersonaWorkInFlight: a running approver included), so
+  // the in-flight work later Epics add (E21's and E27's sequences and wait
+  // steps) reaches the gate through it.
   isWorkInFlight: isPersonaWorkInFlight,
   // b.jg5 SRJ-115, SRJ-1011: the lost-message read is the liveness adapter's
   // one `status` for P (no new getClient() site), read at call time; before
@@ -1127,7 +1145,9 @@ let cronScheduler: CronScheduler | null = null
  * timer the server runs (the permission poller, the health check, the
  * runtime version re-check, the reload detection tick, the cron scheduler,
  * restart, UNAVAILABLE retry, bring-up and destination-hold timers,
- * keep-alives), forgets every persona's notice episodes, closes HTTP,
+ * keep-alives), stops every dialog approver (b.jg5 SRJ-404; none makes a
+ * further call, and none starts after it), forgets every persona's notice
+ * episodes, closes HTTP,
  * the MCP transports and the persona Slack connections, releases the
  * agent-director client handle, removes the PID file and exits with
  * `exitCode`. It makes no agent-director call: every worker and row is left
@@ -1170,6 +1190,12 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // persona whose held notices are dropped unposted.
   personaDestinationHold.cancelAll()
   stopAllKeepAliveTimers()
+  // b.jg5 SRJ-404: every running dialog approver is stopped (marked and woken
+  // now, so none makes a call after the one in progress returns) and none
+  // starts after this; a call in progress is not waited for.
+  void stopAllDialogApprovers().catch((err: unknown) => {
+    console.error(`[slack] stopping the dialog approvers on shutdown failed: ${describeThrownValue(err)}`)
+  })
 
   console.error(`[slack] Shutting down: ${reason}`)
 
@@ -1545,6 +1571,10 @@ export function _buildKillSessionAdapter(
 ): (key: string) => Promise<KillSessionResult> {
   // `key` is the persona key.
   return async (key: string) => {
+    // The launch call only, not a running dialog approver (b.jg5 SRJ-401):
+    // this kill follows a `dead` reading, a row that is not `pending`, on
+    // which the approver has stopped. So do the reconnect verdicts' checks
+    // (`promptRowReconnectVerdict`, `workingReconnectVerdict`).
     if (isLaunchInFlight(key)) {
       console.error(`[slack] killSession (restart adapter): launch already in flight for persona=${key} — not killing`)
       return
@@ -2458,7 +2488,9 @@ export async function main(): Promise<void> {
       isShuttingDown: () => shuttingDown,
       // b.jg5 SRJ-303, SRJ-305: a retry of a latched persona makes no call and stops the timer.
       isLatched: (key) => conflictLatch.isLatched(key),
-      isInFlight: isPersonaWorkInFlight,
+      // b.jg5 SRJ-303: only work that blocks a retry skips it; a running
+      // dialog approver alone never does (SRJ-401).
+      isInFlight: isPersonaRetryBlocked,
       readRow: readPersonaRowState,
       isSessionConnected: (key) => getSessionByPersona(key)?.connected === true,
       hasSessionStream,
@@ -2608,6 +2640,9 @@ export async function main(): Promise<void> {
     isShuttingDown: () => shuttingDown,
     log: (line) => console.error(line),
     whenLaunchSettled,
+    // b.jg5 SRJ-404, SRJ-715: a teardown stops the key's dialog approver
+    // first, and the one its launch in flight would start.
+    stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_TEARDOWN),
     // b.f2b: a teardown cancels a launch's wait for a `working` row rather
     // than wait it out (up to 10 min).
     cancelLaunchWait: cancelWorkingRowWait,
@@ -2990,10 +3025,10 @@ export async function main(): Promise<void> {
     // tick can notice connected-but-streamless rows and route them to recovery.
     hasSessionStream,
     isRestartPendingOrActive,
-    // b.f2b, b.jg5 SRJ-315: the retry timer's in-flight predicate. Work in
-    // flight owns the session (a start launch may still be waiting in the
-    // background for a `working` row), so the tick still reads the persona
-    // but makes no attempt for it.
+    // b.f2b, b.jg5 SRJ-315: "in flight for P", a running dialog approver
+    // included (SRJ-401). Work in flight owns the session (a start launch
+    // may still be waiting in the background for a `working` row), so the
+    // tick still reads the persona but makes no attempt for it.
     isLaunchInFlight: isPersonaWorkInFlight,
     // b.jg5 SRJ-315, SRJ-502: a latched persona is still read, but the tick
     // makes no attempt for it.

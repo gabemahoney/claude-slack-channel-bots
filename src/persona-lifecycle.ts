@@ -11,6 +11,10 @@
  *   for one persona key goes, with no graceful wind-down. It serves a
  *   removed persona and the old half of a destructive modify alike. In
  *   order:
+ *   0. its dialog approver is stopped (b.jg5 SRJ-404, SRJ-715), first, when
+ *      the teardown is submitted and again as its first step, before it
+ *      waits for its launch in flight; the stop also cancels the approver a
+ *      launch in flight would start, so no Enter reaches the old life;
  *   1. its bring-up retries are cancelled and its bring-up state forgotten,
  *      its pending restart timer is cancelled and its UNAVAILABLE retry timer
  *      stopped (b.jg5 SRJ-305; a retry already running finishes first, since
@@ -288,6 +292,16 @@ export interface PersonaLifecycleDeps {
   log: (line: string) => void
 
   // --- persona teardown ---
+  /**
+   * Stop the key's dialog approver (b.jg5 SRJ-404, SRJ-715: production
+   * `stopDialogApprover` with the teardown reason): a running one makes no
+   * further call and the returned promise settles once it has stopped; the
+   * approver a launch in flight would start does not start. Called first:
+   * when the teardown is submitted, and awaited as its first step, before the
+   * wait for the launch in flight. Optional, so hand-built fixtures stay
+   * valid; production always passes it.
+   */
+  stopApprover?: (key: string) => unknown
   /** Resolves once the launch in flight for the key (if any) settled; never rejects (`whenLaunchSettled`). */
   whenLaunchSettled: (key: string) => Promise<void>
   /**
@@ -465,7 +479,9 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
 
   /**
    * Run when a teardown is submitted, before its serializer turn. For every
-   * teardown (b.f2b): cancel its launch's wait for a `working` row, if one is
+   * teardown, first (b.jg5 SRJ-404, SRJ-715): stop its dialog approver, and
+   * the one its launch in flight would start. Then (b.f2b): cancel its
+   * launch's wait for a `working` row, if one is
    * running, so neither the teardown nor work queued ahead of it for the key
    * (a restart that joined that launch) waits it out, up to 10 minutes. For
    * the old half of a destructive modify (its key still applied after step
@@ -476,14 +492,16 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
    * timer's or a retry's work finds it not up (the relaunch gate), and a
    * bring-up retry or its launch finds its entry cancelled.
    * Otherwise that work would launch the new declaration (the launch paths
-   * read the applied set) only for the teardown to kill it. Every call is
-   * synchronous and runs again, as a no-op, in the teardown's own steps. A
-   * failure is logged.
+   * read the applied set) only for the teardown to kill it. Every call acts
+   * synchronously (the approver's stop is not awaited here: its teardown
+   * step awaits it) and runs again in the teardown's own steps. A failure,
+   * thrown or rejected, is logged.
    */
   function cancelBeforeTurn(persona: Persona): void {
     const { key } = persona
     const prefix = `[slack] persona teardown of ${renderPersonaRef(persona.name, key)}`
     const cancels: [string, () => unknown][] = [
+      ['stopping its dialog approver', () => deps.stopApprover?.(key)],
       ["cancelling its launch's wait for a working row", () => deps.cancelLaunchWait?.(key)],
     ]
     if (isApplied(key)) {
@@ -520,7 +538,11 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
 
     log(`${prefix}: starting`)
 
-    // Retries and timers first, so nothing for the key is started while the
+    // b.jg5 SRJ-404, SRJ-715: its dialog approver first, before any other
+    // step and before the wait for its launch in flight, so no Enter reaches
+    // the old life (the approver that launch would start does not start).
+    await step('stopping its dialog approver', () => deps.stopApprover?.(key))
+    // Retries and timers next, so nothing for the key is started while the
     // teardown waits below.
     await step('cancelling its bring-up retries', () => deps.bringUps.cancel(key))
     await step('cancelling its restart timer', () => deps.cancelRestartTimer(key))

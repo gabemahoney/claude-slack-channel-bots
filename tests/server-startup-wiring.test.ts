@@ -87,7 +87,7 @@
  *   `initOutageState` call before the start bring-up and the restart module;
  *   its action is the full-mode retry action over `runRestartRetry`,
  *   `getAppliedPersona`, the relaunch gate, the restart cap, the restart
- *   module's shutdown flag, the shared in-flight predicate (below) and the
+ *   module's shutdown flag, "blocks a retry" (below) and the
  *   session manager's row read `readPersonaRowState` (SRJ-303); the restart
  *   module's arm hook (`armRetryTimer`) arms it with the read-error cause
  *   (SRJ-314); the health check's retry-timer read (`isRetryArmed`) is its
@@ -152,13 +152,21 @@
  *   only `tmux-unavailable` clear (every other clear there is
  *   `ad-unreachable`). These are the only two `conditionEnded` reports in
  *   server.ts.
- * - b.jg5 SRJ-315: one named in-flight predicate, a module-scope function
- *   declared once, wraps the session manager's `isLaunchInFlight`; the
- *   full-mode retry action's `isInFlight`, the health check's
- *   `isLaunchInFlight` and the persona routing's read-gate member
- *   `isWorkInFlight` (b.jg5 SRJ-1011) all get it, the `tmux-unavailable`
- *   retry check's production deps bind it (b.jg5 SRJ-311), and nothing else
- *   names it (no no-op, other predicate or local shadow).
+ * - b.jg5 SRJ-303 / SRJ-315 / SRJ-401: two named in-flight bindings, each a
+ *   module-scope function declared once: "blocks a retry" wraps the session
+ *   manager's `isLaunchInFlight` alone and is the full-mode retry action's
+ *   `isInFlight` (a running dialog approver never skips a retry); "in flight
+ *   for P" is built from it and the session manager's
+ *   `isDialogApproverRunning`, and is the health check's `isLaunchInFlight`,
+ *   the persona routing's read-gate member `isWorkInFlight` (b.jg5 SRJ-1011)
+ *   and the `tmux-unavailable` retry check's production deps' `isWorkInFlight`
+ *   (b.jg5 SRJ-311); nothing else names either (no no-op, other predicate or
+ *   local shadow).
+ * - b.jg5 SRJ-404: `shutdown()` stops every dialog approver once, through the
+ *   session manager's `stopAllDialogApprovers`, after the shutting-down flag
+ *   and `stopAllKeepAliveTimers()`, before it first yields and before
+ *   `closeClient()`; nothing else in server.ts calls it. (The teardown's
+ *   approver stop is pinned in tests/reload-wiring.test.ts.)
  * - b.jg5 SRJ-501 / SRJ-508: the one per-persona latch is built once,
  *   imported from the latch module, in main()'s own statement list, after the
  *   notice episodes and before the retry controller and the start pass, with
@@ -192,11 +200,12 @@
  *   are read at call time: its latched query through a module-scope holder
  *   assigned the one latch once in main(), its `tmux-unresponsive` query
  *   through one assigned the one condition (its `holds`, server.ts's only
- *   holds query), both before the start bring-up; its launch-running query is
- *   the session manager's `isLaunchInFlight`, not the shared in-flight
- *   predicate; the held-on-invalid-flags, kill-failed and sequence/wait
+ *   holds query), both before the start bring-up; its launch-or-approver
+ *   query asks the session manager's `isLaunchInFlight` and
+ *   `isDialogApproverRunning` for the key at call time, and is neither
+ *   in-flight binding; the held-on-invalid-flags, kill-failed and sequence/wait
  *   inputs are unbound. Its read gate's in-flight member (`isWorkInFlight`)
- *   is the shared in-flight predicate, and its one row read
+ *   is "in flight for P", and its one row read
  *   (`readRowLiveness`) is the one liveness adapter main() builds
  *   (`_buildIsSessionAliveAdapter`, built once, the restart module's and the
  *   health tick's `isSessionAlive`), read at call time through a module-scope
@@ -209,7 +218,7 @@
  *   `scheduleRestart` and its shutdown flag, and only the session close and
  *   the SSE abort call it; those deps are exactly the outage flag, the one
  *   retry controller's `isArmed` through its handle, the one latch through
- *   the routing's holder, the shared in-flight predicate, the health tick's
+ *   the routing's holder, "in flight for P", the health tick's
  *   arm path (`armEnvironmentRetryTimer`) and the server log; the routing's
  *   `armRetryTimerIfMissing` does nothing while shutting down and otherwise
  *   asks the same check (`armMissingTmuxUnavailableRetry`) over the same
@@ -453,58 +462,87 @@ function withinCall(offsets: number[], at: number): number {
   return offsets.filter((offset) => offset > open && offset < close).length
 }
 
+/** The session manager's launch-in-flight query (b.f2b, b.jg5 SRJ-303); renaming it fails the typecheck. */
+const LAUNCH_IN_FLIGHT: keyof typeof SessionManagerModule = 'isLaunchInFlight'
+/** The session manager's approver-running query (b.jg5 SRJ-401); renaming it fails the typecheck. */
+const APPROVER_RUNNING: keyof typeof SessionManagerModule = 'isDialogApproverRunning'
+
 /**
- * b.jg5 SRJ-315: the one shared in-flight predicate, as the full-mode retry
- * action's `isInFlight` binds it. Fails unless that binding is a bare name,
- * not imported, of a module-scope function declared exactly once in server.ts
- * (see moduleFunction) whose one parameter is its key and whose whole body is
- * `return isLaunchInFlight(<key>)` (no no-op, no other predicate); no other
- * function, arrow or binding in server.ts is such a wrapper (no second
- * predicate); the name is named exactly five times: its declaration, the
- * retry action's `isInFlight`, the health tick's `isLaunchInFlight`, the
- * `tmux-unavailable` retry check's production deps' `isWorkInFlight` (the
- * session-disconnect handler's and the routing's arm, b.jg5 SRJ-311) and the
- * persona routing's read-gate member `isWorkInFlight`, each bound to the bare
- * name (b.jg5 SRJ-1011); and
- * `isLaunchInFlight` is the session manager's import, declared nowhere in
- * server.ts. Returns the predicate's name.
+ * The two named in-flight bindings main() hands out (b.jg5 SRJ-303, SRJ-315,
+ * SRJ-401, SRJ-1011), each a module-scope function declared exactly once in
+ * server.ts (see moduleFunction), not imported, with one parameter, its key:
+ * - "blocks a retry" (`retryBlocked`), as the full-mode retry action's
+ *   `isInFlight` binds it: its whole body is `return isLaunchInFlight(<key>)`,
+ *   a launch call (E21 and E27 extend it), never a running dialog approver
+ *   (SRJ-303: a running approver does not skip a retry). No other function or
+ *   const/let/var arrow in server.ts wraps `isLaunchInFlight` alone (no second
+ *   narrow predicate). It is named exactly three times: its declaration, the
+ *   retry action's `isInFlight` and the body of "in flight for P".
+ * - "in flight for P" (`workInFlight`), as the health tick's
+ *   `isLaunchInFlight` binds it: its whole body is
+ *   `return <blocks a retry>(<key>) || isDialogApproverRunning(<key>)`, built
+ *   from the narrow one, so later Epics extend one place. It is named exactly
+ *   four times: its declaration, the health tick's `isLaunchInFlight`, the
+ *   `tmux-unavailable` retry check's production deps' `isWorkInFlight` (the
+ *   session-disconnect handler's and the routing's arm, which mirror the
+ *   tick's check, b.jg5 SRJ-311) and the persona routing's read-gate member
+ *   `isWorkInFlight` (b.jg5 SRJ-1011), each bound to the bare name.
+ * The two names differ, and `isLaunchInFlight` and `isDialogApproverRunning`
+ * are the session manager's imports, declared nowhere in server.ts. Replaces
+ * the one shared predicate E11 and E15 pinned. Returns both names.
  */
-function sharedInFlightPredicate(): string {
-  const name = onlyCallProps('createFullModeRetryAction').get(RETRY_IN_FLIGHT_MEMBER)
-  expect(name).toMatch(/^\w+$/)
-  expect(importSource(SERVER_CODE, name!)).toBeUndefined()
+function inFlightBindings(): { retryBlocked: string; workInFlight: string } {
+  for (const query of [LAUNCH_IN_FLIGHT, APPROVER_RUNNING]) {
+    expect([query, importSource(SERVER_CODE, query)]).toEqual([query, './session-manager.ts'])
+    expect([query, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${query}\\b`, 'g'), SERVER_CODE)]).toEqual([query, []])
+  }
 
-  const { at, params, body } = moduleFunction(name!)
-  expect(params).toHaveLength(1)
-  expect(body.replace(/\s+/g, ' ').trim()).toBe(`return isLaunchInFlight(${params[0]})`)
-
-  // No second predicate: this is server.ts's only declared function or
-  // const/let/var arrow whose whole body calls isLaunchInFlight with its own
-  // key. (The persona routing's launch-running member is an inline arrow,
-  // pinned separately, b.jg5 SRJ-1011.)
+  // "Blocks a retry": the retry action's binding.
+  const retryBlocked = onlyCallProps('createFullModeRetryAction').get(RETRY_IN_FLIGHT_MEMBER)
+  expect(retryBlocked).toMatch(/^\w+$/)
+  expect(importSource(SERVER_CODE, retryBlocked!)).toBeUndefined()
+  const narrow = moduleFunction(retryBlocked!)
+  expect(narrow.params).toHaveLength(1)
+  expect(narrow.body.replace(/\s+/g, ' ').trim()).toBe(`return ${LAUNCH_IN_FLIGHT}(${narrow.params[0]})`)
+  // No second narrow predicate: this is server.ts's only declared function or
+  // const/let/var arrow whose body starts by calling isLaunchInFlight with its
+  // own key. (The persona routing's launch-or-approver member is an inline
+  // arrow, pinned separately, b.jg5 SRJ-1011.)
   const wrappers = [
-    ...indicesOf(/\bfunction\s+\w+\s*\(\s*(\w+)(?:\s*:\s*string)?\s*\)(?:\s*:\s*boolean)?\s*\{\s*return\s+isLaunchInFlight\(\s*\1\s*\)\s*;?\s*\}/g, SERVER_CODE),
+    ...indicesOf(/\bfunction\s+\w+\s*\(\s*(\w+)(?:\s*:\s*string)?\s*\)(?:\s*:\s*boolean)?\s*\{\s*return\s+isLaunchInFlight\(\s*\1\s*\)/g, SERVER_CODE),
     ...indicesOf(/\b(?:const|let|var)\s+\w+(?:\s*:[^=\n]+)?\s*=\s*\(?\s*(\w+)(?:\s*:\s*string)?\s*\)?(?:\s*:\s*boolean)?\s*=>\s*\{?\s*(?:return\s+)?isLaunchInFlight\(\s*\1\s*\)/g, SERVER_CODE),
   ]
-  expect(wrappers).toEqual([at])
+  expect(wrappers).toEqual([narrow.at])
 
-  // Named by the retry action, the health tick, the retry check's deps and
-  // the persona routing's read gate, once each, and nowhere else.
-  const named = indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)
-  expect(named).toHaveLength(5)
-  expect(named[0]).toBe(SERVER_CODE.indexOf(name!, at))
-  expect(withinCall(named, onlyCallOf('createFullModeRetryAction'))).toBe(1)
-  expect(onlyCallProps('initHealthCheck').get(TICK_IN_FLIGHT_MEMBER)).toBe(name)
-  expect(withinCall(named, onlyCallOf('initHealthCheck'))).toBe(1)
+  // "In flight for P": the health tick's binding, built from the narrow one.
+  const workInFlight = onlyCallProps('initHealthCheck').get(TICK_IN_FLIGHT_MEMBER)
+  expect(workInFlight).toMatch(/^\w+$/)
+  expect(workInFlight).not.toBe(retryBlocked)
+  expect(importSource(SERVER_CODE, workInFlight!)).toBeUndefined()
+  const broad = moduleFunction(workInFlight!)
+  expect(broad.params).toHaveLength(1)
+  const key = broad.params[0]!
+  expect(broad.body.replace(/\s+/g, ' ').trim()).toBe(`return ${retryBlocked}(${key}) || ${APPROVER_RUNNING}(${key})`)
+
+  // The narrow one: its declaration, the retry action and the broad one's body.
+  const narrowNamed = indicesOf(new RegExp(`\\b${retryBlocked}\\b`, 'g'), SERVER_CODE)
+  expect(narrowNamed).toHaveLength(3)
+  expect(narrowNamed[0]).toBe(SERVER_CODE.indexOf(retryBlocked!, narrow.at))
+  expect(withinCall(narrowNamed, onlyCallOf('createFullModeRetryAction'))).toBe(1)
+  expect(narrowNamed.filter((offset) => offset > broad.start && offset < broad.end)).toHaveLength(1)
+
+  // The broad one: its declaration, the health tick, the retry check's deps
+  // and the persona routing's read gate, once each, and nowhere else.
+  const broadNamed = indicesOf(new RegExp(`\\b${workInFlight}\\b`, 'g'), SERVER_CODE)
+  expect(broadNamed).toHaveLength(4)
+  expect(broadNamed[0]).toBe(SERVER_CODE.indexOf(workInFlight!, broad.at))
+  expect(withinCall(broadNamed, onlyCallOf('initHealthCheck'))).toBe(1)
   const check = retryCheckDeps()
-  expect(check.props.get(CHECK_IN_FLIGHT)).toBe(name)
-  expect(named.filter((offset) => offset > check.start && offset < check.end)).toHaveLength(1)
-  expect(onlyCallProps('createPersonaRouting').get(ROUTING_WORK_IN_FLIGHT)).toBe(name)
-  expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
-
-  expect(importSource(SERVER_CODE, 'isLaunchInFlight')).toBe('./session-manager.ts')
-  expect(indicesOf(/\b(?:let|const|var|function)\s+isLaunchInFlight\b/g, SERVER_CODE)).toEqual([])
-  return name!
+  expect(check.props.get(CHECK_IN_FLIGHT)).toBe(workInFlight)
+  expect(broadNamed.filter((offset) => offset > check.start && offset < check.end)).toHaveLength(1)
+  expect(onlyCallProps('createPersonaRouting').get(ROUTING_WORK_IN_FLIGHT)).toBe(workInFlight)
+  expect(withinCall(broadNamed, onlyCallOf('createPersonaRouting'))).toBe(1)
+  return { retryBlocked: retryBlocked!, workInFlight: workInFlight! }
 }
 
 /** Offsets of every plain assignment to `name` (`name = …`, not `==`, not a declaration or property). */
@@ -1763,7 +1801,7 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
   // makes sure production binds the real one: a stub in-flight or cap read
   // would still launch over an in-flight launch or past the cap. Only these
   // members are pinned, not the full key set.
-  test('the controller\'s action is the full-mode retry action over the restart module\'s retry entry, the live applied persona lookup, the relaunch gate, the restart cap, the restart module\'s shutdown flag, the session manager\'s isLaunchInFlight and its row read (readPersonaRowState)', () => {
+  test('the controller\'s action is the full-mode retry action over the restart module\'s retry entry, the live applied persona lookup, the relaunch gate, the restart cap, the restart module\'s shutdown flag, "blocks a retry" (the session manager\'s isLaunchInFlight, never a running dialog approver) and its row read (readPersonaRowState)', () => {
     expect(onlyCallProps('createUnavailableRetryController').get('action')!.startsWith('createFullModeRetryAction(')).toBe(true)
     expect(importSource(SERVER_CODE, 'createFullModeRetryAction')).toBe('./unavailable-retry.ts')
     const props = onlyCallProps('createFullModeRetryAction')
@@ -1787,9 +1825,9 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
     expect(props.get('isShuttingDown')).toBeDefined()
     expect(props.get('isShuttingDown')).toBe(onlyCallProps('initRestart').get('isShuttingDown')!)
 
-    // b.jg5 SRJ-315: the one shared in-flight predicate, which resolves to the
-    // session manager's isLaunchInFlight (see sharedInFlightPredicate).
-    expect(props.get(RETRY_IN_FLIGHT_MEMBER)).toBe(sharedInFlightPredicate())
+    // b.jg5 SRJ-303: "blocks a retry", a launch call only, so a running dialog
+    // approver alone never skips a retry (SRJ-401; see inFlightBindings).
+    expect(props.get(RETRY_IN_FLIGHT_MEMBER)).toBe(inFlightBindings().retryBlocked)
 
     // b.jg5 SRJ-303, SRJ-115: a pending-only retry's row read is the session
     // manager's, one `status` call through the outage wrapper.
@@ -1878,6 +1916,60 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
 
     // The controller is built before the health check is initialised.
     expect(onlyCallOf('createUnavailableRetryController')).toBeLessThan(onlyCallOf('initHealthCheck'))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-404 — shutdown stops every dialog approver
+//
+// The approver runs on its own after its launch returned (b.jg5 SRJ-401), so
+// nothing that shutdown already stops ends it: a wiring that dropped the
+// stop-all, ran it after the agent-director client is closed, or ran it only
+// after shutdown's awaits would type-check and pass every behaviour suite
+// while an approver kept reading panes and typing Enter on a row during
+// shutdown. What the stop-all does (every approver marked and woken, none
+// starts after it) is tested in tests/session-manager.test.ts and through the
+// recovery harness; pinned here: where shutdown calls it.
+// ---------------------------------------------------------------------------
+
+describe('shutdown stops every dialog approver exactly once, through the session manager\'s stop-all, after the shutting-down flag and the keep-alive stop and before the agent-director client is closed (b.jg5 SRJ-404)', () => {
+  // Tied to src by type: renaming it fails the typecheck.
+  const STOP_ALL: keyof typeof SessionManagerModule = 'stopAllDialogApprovers'
+
+  test('the stop-all is the session manager\'s import, declared nowhere in server.ts, and called exactly once in server.ts, in shutdown(), with no argument', () => {
+    expect(importSource(SERVER_CODE, STOP_ALL)).toBe('./session-manager.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${STOP_ALL}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    // Its import and the one call are its only mentions: no alias, no second stop-all.
+    expect(indicesOf(new RegExp(`\\b${STOP_ALL}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    const at = onlyCallOf(STOP_ALL)
+    const [start, end] = shutdownBody(SERVER_CODE)
+    expect(at > start && at < end).toBe(true)
+    expect(onlyCallArguments(SERVER_CODE, STOP_ALL).trim()).toBe('')
+  })
+
+  test('in shutdown(), it comes after the shutting-down flag is raised and after stopAllKeepAliveTimers(), before shutdown first yields and before closeClient()', () => {
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const inShutdown = (offset: number) => offset > start && offset < end
+    const at = onlyCallOf(STOP_ALL)
+
+    const raises = indicesOf(/(?<![\w.$])shuttingDown\s*=\s*true\b/g, SERVER_CODE)
+    expect(raises).toHaveLength(1)
+    expect(inShutdown(raises[0]!)).toBe(true)
+    expect(at).toBeGreaterThan(raises[0]!)
+
+    const keepAlives = indicesOf(/(?<![\w.$])stopAllKeepAliveTimers\s*\(\s*\)/g, SERVER_CODE).filter(inShutdown)
+    expect(keepAlives).toHaveLength(1)
+    expect(at).toBeGreaterThan(keepAlives[0]!)
+
+    // Before shutdown first yields: every approver is marked and woken before
+    // the transports and connections are awaited, so none types meanwhile.
+    const firstAwait = SERVER_CODE.slice(start, end).search(/\bawait\b/)
+    expect(firstAwait).toBeGreaterThan(-1)
+    expect(at).toBeLessThan(start + firstAwait)
+
+    const closes = indicesOf(/(?<![\w.$])closeClient\s*\(/g, SERVER_CODE).filter(inShutdown)
+    expect(closes).toHaveLength(1)
+    expect(at).toBeLessThan(closes[0]!)
   })
 })
 
@@ -2856,7 +2948,7 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
 // here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('server.ts binds the persona routing\'s lost-message state inputs to the one latch, the one tmux-unresponsive condition and the session manager\'s isLaunchInFlight, each read at call time (b.jg5 SRJ-1011, SRJ-502, SRJ-307)', () => {
+describe('server.ts binds the persona routing\'s lost-message state inputs to the one latch, the one tmux-unresponsive condition and the session manager\'s launch-in-flight and approver-running queries, each read at call time (b.jg5 SRJ-1011, SRJ-502, SRJ-307, SRJ-401)', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const IS_LATCHED: keyof ConflictLatch = 'isLatched'
   const HOLDS: keyof TmuxUnresponsiveCondition = 'holds'
@@ -2887,24 +2979,31 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     expect(holdsQueries[0]! > open && holdsQueries[0]! < close).toBe(true)
   })
 
-  // b.jg5 SRJ-1011 ruling ("two separate inputs"): state 6's input is the
-  // session manager's isLaunchInFlight itself (a launch call awaits its dialog
-  // approver), not the shared in-flight predicate main() builds for the retry
-  // action and the health tick (b.jg5 SRJ-315), which later Epics widen with
-  // work that must report `restarting` instead. Both still resolve to the one
-  // isLaunchInFlight (see sharedInFlightPredicate). The shared predicate is
-  // named in the routing's call only as its read gate's in-flight member
-  // (E15 T2; see the read-gate describe below).
-  test('the launch-running query is the session manager\'s isLaunchInFlight for the key it is given, separate from the shared in-flight predicate (state 6, starting)', () => {
+  // b.jg5 SRJ-1011 ruling ("two separate inputs"): state 6's input is a
+  // launch call or the dialog approver that runs after it returned, in its own
+  // registry (SRJ-401), each asked of the session manager for the key at call
+  // time; it is neither named in-flight binding main() builds (see
+  // inFlightBindings), which later Epics widen with work that must report
+  // `restarting` instead. "In flight for P" is named in the routing's call
+  // only as its read gate's in-flight member (see the read-gate describe
+  // below), and "blocks a retry" not at all.
+  test('the launch-or-approver query answers, for the key it is given, from the session manager\'s isLaunchInFlight and its isDialogApproverRunning, read at call time, separate from both in-flight bindings (state 6, starting)', () => {
     const binding = onlyCallProps('createPersonaRouting').get(LAUNCH_RUNNING)
     expect(binding).toBeDefined()
-    expect(binding === 'isLaunchInFlight' || /^\(?(\w+)\)? => isLaunchInFlight\(\1\)$/.test(binding!)).toBe(true)
-    // sharedInFlightPredicate also pins isLaunchInFlight to the session
-    // manager's import, declared nowhere in server.ts.
-    const shared = sharedInFlightPredicate()
-    expect(binding).not.toContain(shared)
+    const launch = `${LAUNCH_IN_FLIGHT}\\(\\1\\)`
+    const approver = `${APPROVER_RUNNING}\\(\\1\\)`
+    expect(binding).toMatch(new RegExp(`^\\(?(\\w+)\\)? => (?:${launch} \\|\\| ${approver}|${approver} \\|\\| ${launch})$`))
+    // inFlightBindings also pins both queries to the session manager's
+    // imports, declared nowhere in server.ts.
+    const { retryBlocked, workInFlight } = inFlightBindings()
     const props = onlyCallProps('createPersonaRouting')
-    expect([...props].filter(([, value]) => new RegExp(`\\b${shared}\\b`).test(value)).map(([member]) => member)).toEqual([ROUTING_WORK_IN_FLIGHT])
+    const naming = (name: string) => [...props].filter(([, value]) => new RegExp(`\\b${name}\\b`).test(value)).map(([member]) => member)
+    expect(naming(workInFlight)).toEqual([ROUTING_WORK_IN_FLIGHT])
+    expect(naming(retryBlocked)).toEqual([])
+    // The approver-running query is asked only here and in "in flight for P".
+    const asked = indicesOf(new RegExp(`(?<![\\w.$])${APPROVER_RUNNING}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(asked).toHaveLength(2)
+    expect(withinCall(asked, onlyCallOf('createPersonaRouting'))).toBe(1)
   })
 
   test('the held-on-invalid-flags, kill-failed and sequence/wait inputs are unbound: absent from the routing\'s call and named nowhere in server.ts (their Epics, E23, E20, E21 and E27, update this pin)', () => {
@@ -2974,7 +3073,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
 // recovery harness's lost-message driver; pinned here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('server.ts binds the persona routing\'s read gate to the shared in-flight predicate and its one row read to the one liveness adapter main() builds, read at call time through a module-scope holder (b.jg5 SRJ-1011, SRJ-115, SRJ-315)', () => {
+describe('server.ts binds the persona routing\'s read gate to "in flight for P" and its one row read to the one liveness adapter main() builds, read at call time through a module-scope holder (b.jg5 SRJ-1011, SRJ-115, SRJ-315)', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const ADAPTER: keyof typeof ServerModule = '_buildIsSessionAliveAdapter'
   const RESTART_ALIVE: keyof RestartDeps = 'isSessionAlive'
@@ -2995,13 +3094,17 @@ describe('server.ts binds the persona routing\'s read gate to the shared in-flig
     return form![2]!
   }
 
-  test('the read gate\'s in-flight member is the shared in-flight predicate, bound by its bare name: the very binding the full-mode retry action\'s isInFlight and the health tick\'s isLaunchInFlight get, no second predicate (see sharedInFlightPredicate)', () => {
-    const shared = sharedInFlightPredicate()
+  // b.jg5 SRJ-1011, SRJ-401: the gate reads no row while a launch call or a
+  // running dialog approver is in flight for P, as the health tick makes no
+  // attempt then; the retry action gets the narrow "blocks a retry", since a
+  // running approver never skips a retry (SRJ-303).
+  test('the read gate\'s in-flight member is "in flight for P", bound by its bare name: the very binding the health tick\'s isLaunchInFlight gets, not "blocks a retry", which the full-mode retry action\'s isInFlight gets (see inFlightBindings)', () => {
+    const { retryBlocked, workInFlight } = inFlightBindings()
     expect([
       onlyCallProps('createPersonaRouting').get(ROUTING_WORK_IN_FLIGHT),
-      onlyCallProps('createFullModeRetryAction').get(RETRY_IN_FLIGHT_MEMBER),
       onlyCallProps('initHealthCheck').get(TICK_IN_FLIGHT_MEMBER),
-    ]).toEqual([shared, shared, shared])
+      onlyCallProps('createFullModeRetryAction').get(RETRY_IN_FLIGHT_MEMBER),
+    ]).toEqual([workInFlight, workInFlight, retryBlocked])
   })
 
   test('the liveness adapter is built exactly once, in main()\'s own statement list, as one const that the restart module\'s and the health tick\'s isSessionAlive both get', () => {
@@ -3065,7 +3168,7 @@ describe('server.ts binds the persona routing\'s read gate to the shared in-flig
 // routing's arm binding.
 // ---------------------------------------------------------------------------
 
-describe('the session-disconnect handler and the routing\'s retry-timer arm decide through one tmux-unavailable retry check over one set of production deps: the outage flag, the one controller, the one latch, the shared in-flight predicate and the one ENVIRONMENT arm path (b.jg5 SRJ-311)', () => {
+describe('the session-disconnect handler and the routing\'s retry-timer arm decide through one tmux-unavailable retry check over one set of production deps: the outage flag, the one controller, the one latch, "in flight for P" and the one ENVIRONMENT arm path (b.jg5 SRJ-311)', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const BUILD: keyof typeof ServerModule = '_buildRestartDisconnectedPersona'
   const CHECK: keyof typeof ServerModule = 'armMissingTmuxUnavailableRetry'
@@ -3118,7 +3221,7 @@ describe('the session-disconnect handler and the routing\'s retry-timer arm deci
     for (const callArgs of calls) expect(callArgs).toHaveLength(2)
   })
 
-  test('the production deps are exactly the six members, each read at call time: the outage state\'s tmux-unavailable flag, the one retry controller\'s isArmed through its handle, the one latch through the routing\'s holder (=== true), the shared in-flight predicate, the one ENVIRONMENT arm path and the server log; nothing else names them but the handler\'s build and the routing\'s arm', () => {
+  test('the production deps are exactly the six members, each read at call time: the outage state\'s tmux-unavailable flag, the one retry controller\'s isArmed through its handle, the one latch through the routing\'s holder (=== true), "in flight for P" as the health tick takes it (a running dialog approver included), the one ENVIRONMENT arm path and the server log; nothing else names them but the handler\'s build and the routing\'s arm', () => {
     const { name, props } = retryCheckDeps()
     expect([...props.keys()].sort()).toEqual([...CHECK_MEMBERS].sort())
 
@@ -3129,7 +3232,8 @@ describe('the session-disconnect handler and the routing\'s retry-timer arm deci
     // The handle is assigned only the one controller (pinned in the controller's describe).
     expect(props.get('isRetryArmed')).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${retryHandle()}\\?\\.${IS_ARMED}\\(\\1\\)$`))
     routingHolder(ROUTING_LATCHED, IS_LATCHED, constOf(LATCH_FACTORY), [CHECK_LATCHED])
-    expect(props.get(CHECK_IN_FLIGHT)).toBe(sharedInFlightPredicate())
+    // It mirrors the health tick's own check, so it follows the tick (b.jg5 SRJ-315, SRJ-401).
+    expect(props.get(CHECK_IN_FLIGHT)).toBe(inFlightBindings().workInFlight)
     expect(props.get('armRetryTimer')).toBe(ENVIRONMENT_ARM)
     expect(props.get('log')).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
 
@@ -3229,12 +3333,12 @@ describe('main() installs the configured-persona query over the live applied con
 // ---------------------------------------------------------------------------
 
 describe('server.ts wires the b.f2b stale-working-row recovery', () => {
-  test('the health check gets the session manager\'s isLaunchInFlight, hasPendingWorkingRowEvidence, notifyDisconnectedWithAutoRestartDisabled and forgetNotConnectedEpisode, and reads session_restart_delay 0 from the config the restart module reads', () => {
+  test('the health check gets "in flight for P" (the session manager\'s isLaunchInFlight or isDialogApproverRunning), hasPendingWorkingRowEvidence, notifyDisconnectedWithAutoRestartDisabled and forgetNotConnectedEpisode, and reads session_restart_delay 0 from the config the restart module reads', () => {
     const props = onlyCallProps('initHealthCheck')
-    // b.jg5 SRJ-315: through the one shared in-flight predicate, which wraps
-    // the session manager's isLaunchInFlight (see sharedInFlightPredicate).
-    const predicate = sharedInFlightPredicate()
-    expect(props.get(TICK_IN_FLIGHT_MEMBER)).toBe(predicate)
+    // b.jg5 SRJ-315, SRJ-401: "in flight for P", built from "blocks a retry"
+    // and the approver-running query (see inFlightBindings), so the tick makes
+    // no attempt while only P's dialog approver runs.
+    expect(props.get(TICK_IN_FLIGHT_MEMBER)).toBe(inFlightBindings().workInFlight)
     // A module-scope function declaration (the helper pins it), so the tick's
     // binding reads the one declaration in scope wherever main() binds it.
     for (const [dep, value] of [

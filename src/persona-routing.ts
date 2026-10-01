@@ -229,8 +229,8 @@ export interface PersonaRoutingDeps {
   isRetryArmed?(key: string): boolean
   /**
    * Whether a launch or dialog approver for persona P is running, so its row
-   * reads `pending` (production: the session manager's `isLaunchInFlight`,
-   * whose launch call awaits the approver): a message lost then reports
+   * reads `pending` (production: the session manager's `isLaunchInFlight`
+   * or `isDialogApproverRunning`, b.jg5 SRJ-401): a message lost then reports
    * `session-starting`, unless an earlier state applies.
    */
   isLaunchOrApproverRunning?(key: string): boolean
@@ -249,9 +249,11 @@ export interface PersonaRoutingDeps {
   isSequenceOrWaitRunning?(key: string): boolean
   /**
    * Whether anything is in flight for persona P (b.jg5 SRJ-1011, "in flight
-   * for P"; production: the server's one shared in-flight predicate, the one
-   * the health tick and the retry timer receive). While it answers true the
-   * lost-message row read is not made. Absent: nothing counts as in flight.
+   * for P"; production: the server's `isPersonaWorkInFlight`, the one the
+   * health tick receives, which counts a running dialog approver; the retry
+   * timer receives the narrower "blocks a retry" check instead). While it
+   * answers true the lost-message row read is not made. Absent: nothing
+   * counts as in flight.
    */
   isWorkInFlight?(key: string): boolean
   /**

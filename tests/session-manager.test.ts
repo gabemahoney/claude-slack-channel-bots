@@ -157,6 +157,17 @@
  *     launch result unchanged; a row leaving `pending` for `missing` between
  *     laps (b.dup) stops it at the next lap; the cap, the restart path's
  *     silence and the redacted error lines (AC 20).
+ *   - b.jg5 SRJ-401: every spawn or `resume` of the ladder that returns
+ *     success, `launchSession`'s included, starts the approver on its own:
+ *     the launch returns its own result, with the approver's fake clock held,
+ *     while the approver runs, with no launch in flight and the launch
+ *     settled, and the approver's `status` and `read-pane` follow the launch
+ *     call on the persona's row; no other branch, result or dry run starts
+ *     one; a stop made while the launch is in flight cancels the approver
+ *     that launch would start. On `makeRecoveryHarness`, its calls are
+ *     outside the launch attempt: an UNAVAILABLE or UNCLASSIFIED answer to its
+ *     `status`, `read-pane` or `send-keys` arms nothing and starts or opens
+ *     nothing, while ENVIRONMENT and CONFIG raise their outages and arm.
  *   - b.av2 SR-6.1 start: `startupSessionManager` with `bringUp` (a persona
  *     not brought up is counted apart; every Slack bring-up runs at once and
  *     only the launches share the pool, in readiness order; a launch that
@@ -254,9 +265,7 @@ import {
   DEV_CHANNELS_DIALOG_NEEDLE,
   TRUST_DIALOG_NEEDLE,
   _setDialogReadyTimeoutMs,
-  _setDialogPollIntervalMs,
   _resetDialogReadyTimeoutMs,
-  _resetDialogPollIntervalMs,
   _setWaitForWaitingTimeoutMs,
   _resetWaitForWaitingTimeoutMs,
   _setFindMissingMemoTtlMs,
@@ -284,6 +293,12 @@ import {
   type TmuxCommandRunner,
   _setApproverClock,
   _resetApproverClock,
+  _whenDialogApproverStopped,
+  isDialogApproverRunning,
+  stopDialogApprover,
+  approverNotStartedMessage,
+  APPROVER_STOP_TEARDOWN,
+  type ApproverOutcome,
   DIALOG_POLL_INTERVAL_MS,
   APPROVER_LOG_PREFIX,
   APPROVER_PANE_LINES,
@@ -699,13 +714,10 @@ let savedEnv: NodeJS.ProcessEnv
 beforeEach(() => {
   savedEnv = { ...process.env }
   fixtureDir = mkdtempSync(join(tmpdir(), 'cscb-sm-'))
-  // Keep dialog approval polling tight so the merged approvePreSessionDialogs
-  // running on every fresh-spawn doesn't add seconds to the suite. Individual
-  // tests can override these as needed.
-  _setDialogPollIntervalMs(1)
-  // Use a large-enough ready timeout that the happy path (statusQueue reaches
-  // 'waiting' in 2-3 polls at 1ms interval) completes before the cap. Tests
-  // that need to exercise the cap override this locally.
+  // A launch that returns success starts the persona's dialog approver in
+  // the background (b.jg5 SRJ-401). Cap it short, so one left on the real
+  // clock stops soon; afterEach stops every approver (`_resetInFlightLaunches`).
+  // An approver case runs it on a fake clock (`useApproverClock`).
   _setDialogReadyTimeoutMs(200)
   // Wire the outage-state module so withOutageDetection / withSpawnDetection
   // can resolve the AD client and emit Slack onset/all-clear messages.
@@ -735,8 +747,10 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  // First: stop every dialog approver a launch started (b.jg5 SRJ-401), so
+  // none makes a call after this test's client and seams are put back.
+  _resetInFlightLaunches()
   resetClientForTests()
-  _resetDialogPollIntervalMs()
   _resetDialogReadyTimeoutMs()
   _resetWaitForWaitingTimeoutMs()
   _resetFindMissingMemo()
@@ -748,7 +762,6 @@ afterEach(() => {
   _resetApproverClock()
   _resetOutageState()
   _resetSpawnHomeDir()
-  _resetInFlightLaunches()
   _resetPreLaunchTrustPatcher()
   _resetPreLaunchReplyGuard()
   _resetLaunchedWithDirs()
@@ -917,7 +930,6 @@ async function settleNotices(): Promise<void> {
 function useApproverClock(): FakeClock {
   const clock = createFakeClock()
   _setApproverClock(clock)
-  _resetDialogPollIntervalMs()
   _resetDialogReadyTimeoutMs()
   return clock
 }
@@ -946,6 +958,39 @@ async function runOnApproverClock<T>(clock: FakeClock, work: Promise<T>): Promis
   }
   if (!settled) throw new Error(`the approver did not stop within ${APPROVER_DRIVE_TURNS} event-loop turns (virtual time ${clock.now()} ms)`)
   return work
+}
+
+/**
+ * Settle `work` without moving the approver's clock: yield event-loop turns,
+ * at most `APPROVER_DRIVE_TURNS`, and fail the test when `work` has not
+ * settled by then. A launch settles so whatever its dialog approver does:
+ * the approver runs on its own after the launch call (b.jg5 SRJ-401), and
+ * its laps after the first wait for the clock.
+ */
+async function settleOffApproverClock<T>(work: Promise<T>): Promise<T> {
+  let settled = false
+  work.then(
+    () => { settled = true },
+    () => { settled = true },
+  )
+  for (let turn = 0; !settled && turn < APPROVER_DRIVE_TURNS; turn++) {
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
+  if (!settled) throw new Error(`the call did not settle within ${APPROVER_DRIVE_TURNS} event-loop turns with the approver's clock held`)
+  return work
+}
+
+/**
+ * Settle `launch`, a launch of persona `key`, with the approver's clock held
+ * (`settleOffApproverClock`), then run the dialog approver its success
+ * started (b.jg5 SRJ-401) to its stop on `clock` (`useApproverClock`), awaited
+ * through the stop seam (`_whenDialogApproverStopped`). Answers the launch's
+ * result; the seam answers how the approver ended.
+ */
+async function launchThenRunApprover<T>(clock: FakeClock, key: string, launch: Promise<T>): Promise<T> {
+  const result = await settleOffApproverClock(launch)
+  await runOnApproverClock(clock, _whenDialogApproverStopped(key))
+  return result
 }
 
 /**
@@ -8598,10 +8643,12 @@ describe('SR-8.6 invariants', () => {
 // `allow_pending`); a live state stops it; `ended` or `missing` stops it at
 // that lap with no pane read, and a start-pass launch writes the spawn-died
 // entry. A launch, fresh or resumed, reads `pending` until it reports in
-// (HO C5), so the server runs no tmux command for it. In this Task the
-// approver still runs inside the launch. Every approver case runs it on a fake
-// clock (`useApproverClock`, `runOnApproverClock`) and installs `pending`
-// answers through the stub's canned builder, so each carries a launch start.
+// (HO C5), so the server runs no tmux command for it. A launch that returns
+// success starts the approver on its own after the launch call (b.jg5
+// SRJ-401), so a case settles the launch, then runs its approver to its stop
+// (`launchThenRunApprover`). Every approver case runs it on a fake clock
+// (`useApproverClock`, `runOnApproverClock`) and installs `pending` answers
+// through the stub's canned builder, so each carries a launch start.
 // ---------------------------------------------------------------------------
 
 describe('approvePreSessionDialogs (b.4ie)', () => {
@@ -8643,7 +8690,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
 
-    const result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
+    const result = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect(calls.statusCalls).toEqual([{ claude_instance_id: C_ID }, { claude_instance_id: C_ID }])
@@ -8677,7 +8724,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       statusResult: cannedStatusResult({ state: 'waiting' }),
     })
 
-    const result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
+    const result = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
 
     expect(result).toEqual({ key: 'C', action: 'resumed' })
     expect(calls.statusCalls).toHaveLength(1)
@@ -8731,7 +8778,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       readPaneResults: [{ pane }, { pane: WELCOME_PANE }],
     })
 
-    const result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
+    const result = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
 
     expect(result).toEqual({ key: 'C', action: 'resumed' })
     expect(calls.resumeCalls).toEqual([{ claude_instance_id: C_ID }])
@@ -8779,7 +8826,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
 
     let launched: SpawnPersonaResult | undefined
     const errLog = await withCapturedErr(async () => {
-      launched = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg, isStartup))
+      launched = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg, isStartup))
     })
 
     expect(launched).toStrictEqual(result)
@@ -8820,7 +8867,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
 
     let result: SpawnPersonaResult | undefined
     const errLog = await withCapturedErr(async () => {
-      result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg, false))
+      result = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg, false))
     })
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
@@ -8866,7 +8913,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       cannedStatusResult({ state: sendKeysCalls.length >= 1 ? 'waiting' : 'pending' })
 
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    const result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
+    const result = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
 
     // If allow_pending is present everywhere the spawn must complete cleanly.
     expect(result.action).toBe('spawned')
@@ -8891,7 +8938,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     const key = personaKey('My Chan')
     expect(key).not.toBe('My Chan')
     const cfg = makeMultiPersonaConfig([{ name: 'My Chan', working_directory: '/x' }], fixtureDir)
-    const result = await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, key), cfg))
+    const result = await launchThenRunApprover(clock, key, spawnForPersona(personaOf(cfg, key), cfg))
 
     expect(result.action).toBe('spawned')
     const id = personaInstanceId(key)
@@ -8920,7 +8967,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     const readLog = captureStartupErrors()
     const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg)
-    await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg))
+    await launchThenRunApprover(clock, NOTICE_KEY, spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg))
     await settleNotices()
 
     expect(sendKeysCalls).toHaveLength(0)
@@ -8942,7 +8989,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     installStub({ ...calls, statusQueue: statusReads('waiting') })
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
+    await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
 
     expect(calls.statusCalls).toHaveLength(1)
     expect(calls.readPaneCalls).toHaveLength(0)
@@ -8967,7 +9014,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       readPaneResults: [{ pane: DEV_CHANNELS_PANE }],
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    await runOnApproverClock(clock, spawnForPersona(personaOf(cfg, 'C'), cfg))
+    await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
 
     // Enter pressed each time the pane shows the needle while pending
     expect(sendKeysCalls).toEqual([ENTER, ENTER])
@@ -9133,6 +9180,400 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     expect(lines).toEqual([approverLogLine(message(describeAgentDirectorFailure(err)))])
     expect(lines[0]).toContain(`failed: ${shown}`)
     assertNoLeak({ errArgs })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-401 — the approver after every launch that returns success,
+// outside the launch call
+//
+// Every spawn or `resume` of the collision ladder that returns success starts
+// the persona's dialog approver on its own; `spawnForPersona` returns the
+// launch's result as soon as the launch call returns, and the approver's
+// first call comes once the launch has settled, so `isLaunchInFlight` is
+// false while only the approver runs. No other branch, result or dry run
+// starts one, and a stop made while the launch is in flight cancels the
+// approver that launch would start. Each case runs the approver on a fake
+// clock (`useApproverClock`): a launch settles with that clock held
+// (`settleOffApproverClock`), so a launch that waited for its approver would
+// fail the case, and the approver then runs to its stop
+// (`runOnApproverClock` over `_whenDialogApproverStopped`). Every
+// agent-director call is recorded with whether a launch of the persona was
+// in flight when it was made (`recordCallsWithInFlight`).
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-401: the approver runs after every launch that returns success, outside the launch call', () => {
+  const KEY = 'C'
+  const ID = personaInstanceId(KEY)
+  const REF = renderPersonaRef(KEY, KEY)
+  /** The launch start the approver's `pending` read shows. */
+  const LAUNCH_START = SAMPLE_LAUNCH_START_WHOLE
+
+  /** One agent-director call: its verb, the instance it names and whether a launch of the persona was in flight when it was made. */
+  interface CallInFlight {
+    readonly verb: string
+    readonly id: string
+    readonly inFlight: boolean
+  }
+
+  /** The verbs a launch or its approver can call. */
+  const RECORDED_VERBS = ['spawn', 'resume', 'status', 'get', 'readPane', 'sendKeys', 'kill', 'delete', 'findMissing'] as const
+
+  /** Record each call of `RECORDED_VERBS` through `stub` from now on, in order, with `isLaunchInFlight(key)` at the call. */
+  function recordCallsWithInFlight(stub: StubClient, key: string): CallInFlight[] {
+    const calls: CallInFlight[] = []
+    const client = stub as unknown as Record<string, (params: { claude_instance_id?: unknown }) => Promise<unknown>>
+    for (const verb of RECORDED_VERBS) {
+      const original = client[verb]!
+      client[verb] = (params) => {
+        calls.push({ verb, id: String(params.claude_instance_id), inFlight: isLaunchInFlight(key) })
+        return original.call(stub, params)
+      }
+    }
+    return calls
+  }
+
+  /**
+   * The `status` answers for persona `key`: `waiting` while its launch is in
+   * flight (the ladder's own reads), and after it the approver's laps:
+   * `pending` with `LAUNCH_START`, then `waiting`.
+   */
+  function approverReadsPendingThenLive(key: string): () => Phase1StatusResult {
+    let laps = 0
+    return () => {
+      if (isLaunchInFlight(key)) return cannedStatusResult({ state: 'waiting' })
+      laps++
+      return laps === 1 ? cannedStatusResult({ state: 'pending', launch_started_at: LAUNCH_START }) : cannedStatusResult({ state: 'waiting' })
+    }
+  }
+
+  /** The approver's calls for one launch that reads `pending`, then live: a lap with its pane read, then a lap that stops it. */
+  const APPROVER_LAPS: readonly CallInFlight[] = ['status', 'readPane', 'status'].map((verb) => ({ verb, id: ID, inFlight: false }))
+
+  /** Persona `C` in a real working directory; `overrides` go to the whole config. */
+  function launchConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
+    return makeStandInPersonaConfig({ [KEY]: { working_directory: fixtureSubdir('work') } }, fixtureDir, overrides)
+  }
+
+  type SpawnResultOf = import('agent-director').SpawnResult
+  const collision = () => cannedErr<SpawnResultOf>(errInstanceIdCollision())
+  const spawnOk = () => cannedOk<SpawnResultOf>({ claude_instance_id: ID })
+
+  /** A success site of the ladder: the stub answers that reach it, the config it needs, the launch call's verb and the launch's result. */
+  interface SuccessSite {
+    readonly script: (cfg: PersonaConfig) => StubClientOptions
+    readonly config?: Partial<Omit<PersonaConfig, 'personas'>>
+    readonly launchVerb: 'spawn' | 'resume'
+    readonly action: SpawnPersonaResult['action']
+  }
+
+  /** The persona's row reading `ended`, its labels its current ones. */
+  const endedRow = (cfg: PersonaConfig) => personaRow(cfg, KEY, { state: 'ended' })
+  /** A collision on the persona's `ended` row whose `resume` answers `err`, then a fresh spawn that succeeds. */
+  const resumeAnswers = (err: Error) => (cfg: PersonaConfig): StubClientOptions => ({
+    spawnQueue: [collision(), spawnOk()],
+    getResult: endedRow(cfg),
+    resumeError: err,
+  })
+
+  const SUCCESS_SITES: ReadonlyArray<readonly [string, SuccessSite]> = [
+    ['the first spawn', { script: () => ({}), launchVerb: 'spawn', action: 'spawned' }],
+    [
+      'the retry spawn after the collision get answers ErrSpawnNotFound',
+      { script: () => ({ spawnQueue: [collision(), spawnOk()], getError: errSpawnNotFound() }), launchVerb: 'spawn', action: 'spawned' },
+    ],
+    [
+      'the self-heal spawn after ErrTmuxSessionCreate on the first spawn',
+      { script: () => ({ spawnQueue: [cannedErr<SpawnResultOf>(errTmuxSessionCreate('spawn')), spawnOk()] }), launchVerb: 'spawn', action: 'spawned' },
+    ],
+    ['the self-heal spawn after ErrTmuxSessionCreate on resume', { script: resumeAnswers(errTmuxSessionCreate('resume')), launchVerb: 'spawn', action: 'spawned' }],
+    [
+      'the self-heal spawn after ErrTmuxSessionCreate on a replacement\'s fresh spawn',
+      {
+        script: (cfg) => ({ spawnQueue: [collision(), cannedErr<SpawnResultOf>(errTmuxSessionCreate('spawn')), spawnOk()], getResult: endedRow(cfg) }),
+        config: { resume_enabled: false },
+        launchVerb: 'spawn',
+        action: 'spawned',
+      },
+    ],
+    [
+      'the fresh spawn of a replacement of a row in another directory (kill, delete, spawn)',
+      {
+        script: (cfg) => ({ spawnQueue: [collision(), spawnOk()], getResult: personaRow(cfg, KEY, { state: 'waiting', cwd: fixtureSubdir('elsewhere') }) }),
+        launchVerb: 'spawn',
+        action: 'spawned',
+      },
+    ],
+    [
+      'the fresh spawn of a replacement of a row whose config_dir label changed (delete, spawn)',
+      {
+        script: (cfg) => {
+          const labels = { ...endedRow(cfg).labels, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome()) }
+          return { spawnQueue: [collision(), spawnOk()], getResult: personaRow(cfg, KEY, { state: 'ended', labels }) }
+        },
+        launchVerb: 'spawn',
+        action: 'spawned',
+      },
+    ],
+    [
+      'the fresh spawn of a replacement with resume_enabled false (kill, delete, spawn)',
+      { script: (cfg) => ({ spawnQueue: [collision(), spawnOk()], getResult: endedRow(cfg) }), config: { resume_enabled: false }, launchVerb: 'spawn', action: 'spawned' },
+    ],
+    ['the amnesia spawn after resume\'s ErrNoSessionId', { script: resumeAnswers(errNoSessionId()), launchVerb: 'spawn', action: 'spawned' }],
+    ['the amnesia spawn after resume\'s ErrJsonlMissing', { script: resumeAnswers(errJsonlMissing()), launchVerb: 'spawn', action: 'fresh-after-inconclusive-amnesia' }],
+    ['the amnesia spawn after resume\'s ErrJsonlNeverWritten', { script: resumeAnswers(errJsonlNeverWritten()), launchVerb: 'spawn', action: 'spawned' }],
+    ['the spawn after resume\'s ErrSpawnNotResumable (kill, delete, spawn)', { script: resumeAnswers(errSpawnNotResumable()), launchVerb: 'spawn', action: 'spawned' }],
+    ['the spawn after resume\'s ErrSpawnNotFound', { script: resumeAnswers(errSpawnNotFound()), launchVerb: 'spawn', action: 'spawned' }],
+    [
+      'the resume of an ended row',
+      { script: (cfg) => ({ spawnQueue: [collision()], getResult: endedRow(cfg) }), launchVerb: 'resume', action: 'resumed' },
+    ],
+    [
+      'the resume of a missing row',
+      { script: (cfg) => ({ spawnQueue: [collision()], getResult: personaRow(cfg, KEY, { state: 'missing' }) }), launchVerb: 'resume', action: 'resumed' },
+    ],
+  ]
+
+  /**
+   * Assert `calls`: the launch's last call is its launch call `launchVerb` on
+   * P's instance (the approver makes no spawn or `resume`), and every call
+   * after it is the approver's, on P's instance with no launch in flight,
+   * exactly `APPROVER_LAPS`. Every launch call but the ladder's very first is
+   * made with the launch in flight; that one is issued as the launch starts.
+   */
+  function expectLaunchThenApprover(calls: readonly CallInFlight[], launchVerb: string): void {
+    let launchCall = calls.length - 1
+    while (launchCall >= 0 && calls[launchCall]!.verb !== 'spawn' && calls[launchCall]!.verb !== 'resume') launchCall--
+    expect(launchCall).toBeGreaterThanOrEqual(0)
+    expect(calls[launchCall]).toMatchObject({ verb: launchVerb, id: ID })
+    expect(calls.slice(1, launchCall + 1).every((c) => c.inFlight)).toBe(true)
+    expect(calls.slice(launchCall + 1)).toEqual([...APPROVER_LAPS])
+  }
+
+  test.each(SUCCESS_SITES)('%s: spawnForPersona returns the launch\'s own result while the approver still runs, with no launch in flight and the launch settled; then P\'s status and read-pane follow the launch call on P\'s row, until a live read stops the approver', async (_name, site) => {
+    const clock = useApproverClock()
+    _setTmuxSessionKiller(async () => {})
+    const cfg = launchConfig(site.config)
+    const stub = installStub({ ...site.script(cfg), statusFn: approverReadsPendingThenLive(KEY) })
+    const calls = recordCallsWithInFlight(stub, KEY)
+
+    let result: SpawnPersonaResult | undefined
+    let outcome: ApproverOutcome | undefined
+    let runningAtReturn: boolean | undefined
+    let inFlightAtReturn: boolean | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await settleOffApproverClock(spawnForPersona(personaOf(cfg, KEY), cfg))
+      runningAtReturn = isDialogApproverRunning(KEY)
+      inFlightAtReturn = isLaunchInFlight(KEY)
+      await settleOffApproverClock(whenLaunchSettled(KEY))
+      outcome = await runOnApproverClock(clock, _whenDialogApproverStopped(KEY))
+    })
+
+    expect(result).toStrictEqual({ key: KEY, action: site.action })
+    // Returned while its approver runs: the approver is outside the launch call.
+    expect(runningAtReturn).toBe(true)
+    expect(inFlightAtReturn).toBe(false)
+    expectLaunchThenApprover(calls, site.launchVerb)
+    expect(outcome).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: Date.parse(LAUNCH_START) })
+    expect(isDialogApproverRunning(KEY)).toBe(false)
+    expect(clock.now()).toBe(DIALOG_POLL_INTERVAL_MS)
+    assertNoLeak({ errLog })
+  })
+
+  test('a launchSession launch (the restart path, isStartup false) runs it too: launchSession answers true while the approver still runs, and P\'s status and read-pane follow the spawn; no startup entry', async () => {
+    const clock = useApproverClock()
+    const readLog = captureStartupErrors()
+    const cfg = launchConfig()
+    const stub = installStub({ statusFn: approverReadsPendingThenLive(KEY) })
+    const calls = recordCallsWithInFlight(stub, KEY)
+
+    let launched: Awaited<ReturnType<typeof launchSession>> | undefined
+    let runningAtReturn: boolean | undefined
+    const errLog = await withCapturedErr(async () => {
+      launched = await settleOffApproverClock(launchSession(KEY, cfg))
+      runningAtReturn = isDialogApproverRunning(KEY)
+      await runOnApproverClock(clock, _whenDialogApproverStopped(KEY))
+    })
+
+    expect(launched).toBe(true)
+    expect(runningAtReturn).toBe(true)
+    expect(isLaunchInFlight(KEY)).toBe(false)
+    expectLaunchThenApprover(calls, 'spawn')
+    expect(await _whenDialogApproverStopped(KEY)).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: Date.parse(LAUNCH_START) })
+    expect(readLog()).toBe('')
+    assertNoLeak({ errLog })
+  })
+
+  /** A launch that returns no success: what reaches it and its result. */
+  interface NoLaunchPath {
+    readonly arrange: (cfg: PersonaConfig) => { cfg?: PersonaConfig; opts: StubClientOptions }
+    readonly config?: Partial<Omit<PersonaConfig, 'personas'>>
+    readonly action: SpawnPersonaResult['action']
+    readonly refused?: true
+  }
+
+  const NO_LAUNCH_PATHS: ReadonlyArray<readonly [string, NoLaunchPath]> = [
+    [
+      'a collision on a waiting row (reconnected)',
+      {
+        arrange: (cfg) => {
+          _setTmuxServerEnsurer(async () => {})
+          return { opts: { spawnQueue: [collision()], getResult: personaRow(cfg, KEY, { state: 'waiting' }) } }
+        },
+        action: 'reconnected',
+      },
+    ],
+    [
+      'a collision on a working row (the wait reads waiting and reconnects)',
+      {
+        arrange: (cfg) => {
+          _setTmuxServerEnsurer(async () => {})
+          return { opts: { spawnQueue: [collision()], getResult: personaRow(cfg, KEY, { state: 'working' }) } }
+        },
+        config: { agent_director_poll_interval_ms: 1 },
+        action: 'reconnected',
+      },
+    ],
+    [
+      'a collision on a row waiting on a prompt whose tmux session lives (no-op)',
+      { arrange: (cfg) => ({ opts: { spawnQueue: [collision()], getResult: personaRow(cfg, KEY, { state: 'ask_user' }), statusResult: cannedStatusResult({ state: 'ask_user' }) } }), action: 'no-op' },
+    ],
+    [
+      'a collision on a pending row (no-op)',
+      { arrange: (cfg) => ({ opts: { spawnQueue: [collision()], getResult: personaRow(cfg, KEY, { state: 'pending' }) } }), action: 'no-op' },
+    ],
+    [
+      'a latched persona (latched)',
+      {
+        arrange: () => {
+          const latch: SessionConflictLatch = {
+            isLatched: () => true,
+            record: () => undefined,
+            set: () => {
+              throw new Error('no latch is set here')
+            },
+            setFromConflict: () => {
+              throw new Error('no latch is set here')
+            },
+          }
+          setConflictLatch(latch)
+          return { opts: {} }
+        },
+        action: 'latched',
+      },
+    ],
+    [
+      'a spawn that fails (ErrCwdNotFound: failed)',
+      { arrange: (cfg) => ({ opts: { spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${personaOf(cfg, KEY).working_directory} does not exist`) } }), action: 'failed' },
+    ],
+    [
+      'a spawn that is refused (an UNAVAILABLE answer: failed, refused)',
+      {
+        arrange: () => {
+          // As `main()` wires it: the trigger sink arms P's timer, so the attempt is refused.
+          initOutageState({ getClient, notify: () => {}, triggerSink: { arm: () => true } })
+          return { opts: { spawnError: unavailableForms('ErrCallTimeout')[0]![1]('spawn') } }
+        },
+        action: 'failed',
+        refused: true,
+      },
+    ],
+    [
+      'a launch deferred on an unresolvable claude_config_dir (deferred)',
+      {
+        arrange: () => {
+          const configDir = fixtureSubdir('claude-config')
+          const cfg = makeStandInPersonaConfig({ [KEY]: { working_directory: fixtureSubdir('deferred-work'), claude_config_dir: configDir } }, fixtureDir)
+          setConfigDirUnresolvableHook(() => false)
+          _setConfigDirFs({ realpath: realpathFailingUnder(configDir, () => true) })
+          return { cfg, opts: {} }
+        },
+        action: 'deferred',
+      },
+    ],
+    [
+      'a dry run (no-op)',
+      {
+        arrange: () => {
+          process.env['SLACK_DRY_RUN'] = '1'
+          return { opts: {} }
+        },
+        action: 'no-op',
+      },
+    ],
+  ]
+
+  test.each(NO_LAUNCH_PATHS)('no approver without a launch that returns success: %s starts none — no approver running or stopped for P, no approver line, no call after the launch', async (_name, path) => {
+    useApproverClock()
+    const base = launchConfig(path.config)
+    const { cfg = base, opts } = path.arrange(base)
+    const stub = installStub(opts)
+    const calls = recordCallsWithInFlight(stub, KEY)
+
+    let result: SpawnPersonaResult | undefined
+    let callsAtReturn = 0
+    const errLog = await withCapturedErr(async () => {
+      result = await settleOffApproverClock(spawnForPersona(personaOf(cfg, KEY), cfg))
+      callsAtReturn = calls.length
+      // Turns enough for an approver the launch had started to make its first call.
+      await settleOffApproverClock(new Promise<void>((resolve) => setTimeout(resolve, 0)))
+    })
+
+    expect(result?.action).toBe(path.action)
+    expect(result?.refused).toBe(path.refused)
+    expect(isDialogApproverRunning(KEY)).toBe(false)
+    // An approver that had started would still run (its stub reads `waiting`
+    // stop it at its first lap) or have left its outcome.
+    expect(await _whenDialogApproverStopped(KEY)).toBeUndefined()
+    expect(calls.slice(callsAtReturn)).toEqual([])
+    // No call but the ladder's first was made with no launch in flight.
+    expect(calls.slice(1).filter((c) => !c.inFlight)).toEqual([])
+    expect(linesWith(errLog, APPROVER_LOG_PREFIX)).toEqual([])
+    assertNoLeak({ errLog })
+  })
+
+  test('a stop made while P\'s launch is held in flight cancels the approver that launch would start: the launch still returns spawned, its approver makes no call (one not-started line); the next launch\'s approver runs', async () => {
+    const clock = useApproverClock()
+    const cfg = launchConfig()
+    const stub = installStub({ statusFn: approverReadsPendingThenLive(KEY) })
+    let first = true
+    const hold = holdSpawns(stub, () => {
+      const held = first
+      first = false
+      return held
+    })
+    const calls = recordCallsWithInFlight(stub, KEY)
+
+    let heldResult: SpawnPersonaResult | undefined
+    let stopped: boolean | undefined
+    let inFlightAtStop: boolean | undefined
+    const errLog = await withCapturedErr(async () => {
+      const launching = spawnForPersona(personaOf(cfg, KEY), cfg)
+      await hold.entered(ID)
+      inFlightAtStop = isLaunchInFlight(KEY)
+      stopped = await stopDialogApprover(KEY, APPROVER_STOP_TEARDOWN)
+      hold.release(ID)
+      heldResult = await settleOffApproverClock(launching)
+      await settleOffApproverClock(new Promise<void>((resolve) => setTimeout(resolve, 0)))
+    })
+
+    expect(inFlightAtStop).toBe(true)
+    // No approver ran when the stop was made.
+    expect(stopped).toBe(false)
+    expect(heldResult).toStrictEqual({ key: KEY, action: 'spawned' })
+    expect(isDialogApproverRunning(KEY)).toBe(false)
+    expect(await _whenDialogApproverStopped(KEY)).toBeUndefined()
+    // Only the held spawn: no approver call followed it.
+    expect(calls.map((c) => [c.verb, c.id])).toEqual([['spawn', ID]])
+    expect(linesWith(errLog, APPROVER_LOG_PREFIX)).toEqual([approverLogLine(approverNotStartedMessage(REF, APPROVER_STOP_TEARDOWN))])
+
+    // The stop ended with that launch: the next launch's approver runs.
+    const next = await launchThenRunApprover(clock, KEY, spawnForPersona(personaOf(cfg, KEY), cfg))
+    expect(next).toStrictEqual({ key: KEY, action: 'spawned' })
+    expect(await _whenDialogApproverStopped(KEY)).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: Date.parse(LAUNCH_START) })
+    expectLaunchThenApprover(calls.slice(1), 'spawn')
+    expect(calls.slice(1).map((c) => c.verb)).toEqual(['spawn', ...APPROVER_LAPS.map((c) => c.verb)])
+    assertNoLeak({ errLog })
   })
 })
 
@@ -12592,25 +13033,11 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     readonly sendKeys: number
   }
 
+  // The dialog approver's pane read and Enter left this table: the approver
+  // runs after its launch call returned, outside P's attempt (b.jg5 SRJ-401),
+  // and its rows are the describe "the dialog approver's calls are outside
+  // P's launch attempt" below.
   const PASS_THROUGH_SITES: readonly PassThroughSite[] = [
-    {
-      name: 'the dialog approver\'s pane read',
-      verb: 'read-pane',
-      script: (_h, _p, err) => ({ statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' }))], readPaneError: err }),
-      action: 'spawned',
-      sendKeys: 0,
-    },
-    {
-      name: 'the dialog approver\'s Enter on a dialog',
-      verb: 'send-keys',
-      script: (_h, _p, err) => ({
-        statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' }))],
-        readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }],
-        sendKeysError: err,
-      }),
-      action: 'spawned',
-      sendKeys: 1,
-    },
     {
       name: 'the working-row wait\'s pane read',
       verb: 'read-pane',
@@ -13232,6 +13659,147 @@ describe('b.jg5 SRJ-301, SRJ-105: a persona that joins another\'s in-flight shar
     expect(h.notices).toEqual([])
     expect(h.episodeNotices).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-401 (hatch A2; SRJ-301, SRJ-307, SRJ-311, SRJ-313, SRJ-316): the
+// dialog approver's calls are outside P's launch attempt
+//
+// The approver runs after its launch call returned, on its own, so none of
+// its calls is part of P's launch or recovery attempt. E10's SRJ-105
+// regression rows for its `read-pane` and `send-keys` ran it inside the
+// attempt; they are here, with its `status`. An UNAVAILABLE or UNCLASSIFIED
+// answer to any of the three is logged once per lap and the approver polls
+// on: the launch result is the launch's own, nothing destructive follows,
+// nothing is counted or refused, and no retry timer is armed, no
+// `tmux-unresponsive` condition is started and no unclassified-error episode
+// is opened (an UNAVAILABLE answer's `tmux-unresponsive` start and arming,
+// and an UNCLASSIFIED answer's arming and episode, belong to an attempt). Its
+// ENVIRONMENT and CONFIG answers still raise their outages and arm P's retry
+// timer with their cause, as from any verb. The approver runs on the
+// recovery harness's clock: `settle()` lets its first lap's calls be made,
+// and `advance(DIALOG_POLL_INTERVAL_MS)` its second, under a cap above both.
+// ---------------------------------------------------------------------------
+
+/** A call of the dialog approver: its verb, the stub answers that make every lap meet `err` there, and the pane reads and Enters one lap makes. */
+interface ApproverCallSite {
+  readonly name: string
+  readonly verb: 'status' | 'read-pane' | 'send-keys'
+  script(err: Error): RecoveryStubScript
+  readonly paneReadsPerLap: number
+  readonly entersPerLap: number
+  /** The line the approver logs for `err` there, for persona ref `ref`. */
+  line(ref: string, err: Error): string
+}
+
+const APPROVER_CALL_SITES: readonly ApproverCallSite[] = [
+  {
+    name: 'the dialog approver\'s status read',
+    verb: 'status',
+    script: (err) => ({ statusError: err }),
+    paneReadsPerLap: 0,
+    entersPerLap: 0,
+    line: (ref, err) => approverLogLine(approverStatusRefusedMessage(ref, describeAgentDirectorFailure(err))),
+  },
+  {
+    name: 'the dialog approver\'s pane read',
+    verb: 'read-pane',
+    script: (err) => ({ statusResult: cannedStatusResult({ state: 'pending' }), readPaneError: err }),
+    paneReadsPerLap: 1,
+    entersPerLap: 0,
+    line: (ref, err) => approverLogLine(approverPaneCallFailedMessage(ref, 'read-pane', describeAgentDirectorFailure(err))),
+  },
+  {
+    name: 'the dialog approver\'s Enter on a dialog',
+    verb: 'send-keys',
+    script: (err) => ({ statusResult: cannedStatusResult({ state: 'pending' }), readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }], sendKeysError: err }),
+    paneReadsPerLap: 1,
+    entersPerLap: 1,
+    line: (ref, err) => approverLogLine(approverPaneCallFailedMessage(ref, 'send-keys', describeAgentDirectorFailure(err))),
+  },
+]
+
+/** The answers that arm nothing outside an attempt: E4's UNAVAILABLE forms (`ErrTmuxUnresponsive` included) and the UNCLASSIFIED ones. */
+const APPROVER_UNARMED_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
+  ...SRJ105_UNAVAILABLE.map(([what, make]) => [`${what} (UNAVAILABLE)`, make] as const),
+  ...SRJ313_UNCLASSIFIED.map(([what, make]) => [`${what} (UNCLASSIFIED)`, make] as const),
+  ['an UNCLASSIFIED read error (ErrTimeout)', (verb) => errGeneric(verb, 'ErrTimeout')],
+]
+
+/** The answers raised and armed from any verb: ENVIRONMENT and CONFIG, with the cause they arm, the outage they raise and its onset. */
+const APPROVER_RAISED_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error, string, OutageClass, (err: Error) => string]> = [
+  ...SRJ311_ENVIRONMENT.map(([what, make, text]) => [what, make, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, 'tmux-unavailable' as OutageClass, () => text] as const),
+  ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG, 'ad-config-malformed', (err) => adConfigMalformedOnset(err)],
+]
+
+describe('b.jg5 SRJ-401, SRJ-105, SRJ-311, SRJ-313, SRJ-316: the dialog approver\'s calls are outside P\'s launch attempt', () => {
+  afterEach(srj105AfterEach)
+
+  const unarmedCross = APPROVER_UNARMED_ANSWERS.flatMap(([what, make]) => APPROVER_CALL_SITES.map((site) => [site.name, what, make, site] as const))
+  test.each(unarmedCross)('%s answering %s keeps the launch\'s outcome (spawned), logged once per lap while the approver polls on; no kill, delete, resume, notice or spawn-failed entry, never refused or counted; no trigger or retry timer, no tmux-unresponsive condition, no unclassified-error episode', async (_site, _what, make, site) => {
+    const { h, p, b } = srj105Build({ approverCapMs: 4 * DIALOG_POLL_INTERVAL_MS })
+    const err = make(site.verb)
+    h.script(site.script(err))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+    // The approver's first lap, then its second on the harness clock.
+    await h.settle()
+    await h.advance(DIALOG_POLL_INTERVAL_MS)
+
+    expect(h.approverRunning(p)).toBe(true)
+    expect(h.stub.calls.statusCalls).toHaveLength(2)
+    expect(h.stub.calls.readPaneCalls).toHaveLength(2 * site.paneReadsPerLap)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 2 * site.entersPerLap }))
+    expect(h.errors.filter((line) => line === site.line(renderPersonaRef(p, p), err))).toHaveLength(2)
+    expect(h.notices).toEqual([])
+    expect(h.outageNotices).toEqual([])
+    expect([...getOutageFlags(p)]).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(refusalLines(h, p)).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+    // Outside the attempt: nothing armed, started or opened.
+    expect(h.triggers).toEqual([])
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+    expect(unclassifiedStartedLines(h, p)).toEqual([])
+    expect(h.unclassifiedErrorOpen(p)).toBe(false)
+    expect(h.episodeNotices).toEqual([])
+    expect(h.latchEvents).toEqual([])
+    expect(h.approverRunning(b)).toBe(false)
+  })
+
+  const raisedCross = APPROVER_RAISED_ANSWERS.flatMap(([what, make, kind, outage, onset]) =>
+    APPROVER_CALL_SITES.map((site) => [site.name, what, make, kind, outage, onset, site] as const),
+  )
+  test.each(raisedCross)('%s answering %s raises it as from any verb: P\'s outage raised with one onset and P\'s timer armed once with its cause; the launch keeps its outcome (spawned), never refused or counted; no kill, delete, resume or notice; no tmux-unresponsive condition, no unclassified-error episode', async (_site, _what, make, kind, outage, onset, site) => {
+    const { h, p, b } = srj105Build()
+    const err = make(site.verb)
+    h.script(site.script(err))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+    // The approver's first lap only.
+    await h.settle()
+
+    expect(h.stub.calls.statusCalls).toHaveLength(1)
+    expect(h.stub.calls.readPaneCalls).toHaveLength(site.paneReadsPerLap)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: site.entersPerLap }))
+    expect(h.errors.filter((line) => line === site.line(renderPersonaRef(p, p), err))).toHaveLength(1)
+    expect([...getOutageFlags(p)]).toEqual([outage])
+    expect(h.outageNotices).toEqual([{ key: p, text: onset(err) }])
+    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(outage === 'ad-config-malformed' ? 1 : 0)
+    expect(h.triggers).toEqual([{ key: p, kind }])
+    expect(h.controller.isArmed(p)).toBe(true)
+    expect(getFailureCount(p)).toBe(0)
+    expect(refusalLines(h, p)).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionStartedLines(h, p)).toEqual([])
+    expect(unclassifiedStartedLines(h, p)).toEqual([])
+    expect(h.unclassifiedErrorOpen(p)).toBe(false)
+    expect([...getOutageFlags(b)]).toEqual([])
   })
 })
 

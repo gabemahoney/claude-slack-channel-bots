@@ -19,9 +19,10 @@
  *   call), the applied-persona lookup over the live applied set, the
  *   relaunch gate below, the restart cap (`isAtCap` at
  *   `RESTART_FAILURE_CAP`), the harness's shutting-down flag, the latch's
- *   latched query (`latch` below) and the shared in-flight predicate
- *   (`isPersonaWorkInFlight`, as `main()`'s: today the session manager's
- *   `isLaunchInFlight`), and the condition's retry hooks: the
+ *   latched query (`latch` below) and "blocks a retry" (as `main()`'s
+ *   `isPersonaRetryBlocked`, b.jg5 SRJ-303: today the session manager's
+ *   `isLaunchInFlight`; a running dialog approver alone never skips a retry,
+ *   SRJ-401), and the condition's retry hooks: the
  *   connection and stream probes (`isSessionConnected` and
  *   `hasSessionStream`, both over `setConnected`) and `endTmuxUnresponsive`,
  *   the condition's end with reason `TMUX_UNRESPONSIVE_END_RETRY` and the
@@ -74,9 +75,14 @@
  *   (`isSessionConnected` and `hasSessionStream`; none at first).
  * - Drivers, each as the server does it: `shutdown()` raises the
  *   shutting-down flag, closes the controller
- *   (`close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)`) and then the episodes
+ *   (`close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)`), then the episodes
  *   (`episodes.close()`: every alert check cancelled, a later condition
- *   start answers `closed`); `teardown(key)` is the teardown's submit: it
+ *   start answers `closed`), then stops every dialog approver
+ *   (`stopAllDialogApprovers`, not awaited: none makes a call after the one
+ *   in progress, and none starts after it); `teardown(key)` is the
+ *   teardown's submit: it first stops the persona's dialog approver
+ *   (`stopDialogApprover(key, APPROVER_STOP_TEARDOWN)`, not awaited; also the
+ *   one a launch in flight would start), then
  *   stops the persona's timer (`stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`)
  *   and cancels its alert check (`tmuxUnresponsive.cancelAlert(key,
  *   UNAVAILABLE_RETRY_STOP_TORN_DOWN)`, which logs nothing more when the
@@ -204,13 +210,39 @@
  *   through the real `spawnForPersona` (`isStartup` true) over the stub,
  *   resolving with its `SpawnPersonaResult` (`latched` for a CONFLICT at a
  *   ladder spawn or `resume`, and for a persona already latched). Each persona's working directory
- *   exists, so a row the stub answers in it is the persona's own.
+ *   exists, so a row the stub answers in it is the persona's own. A launch
+ *   that returns success starts the persona's dialog approver on its own
+ *   (b.jg5 SRJ-401): `launch(key)` resolves before the approver's first lap,
+ *   which comes once the launch has settled.
+ * - The dialog approver runs on the harness clock (`_setApproverClock`): its
+ *   sleeps between laps (`DIALOG_POLL_INTERVAL_MS`) and its cap timer are
+ *   harness-clock timers, so it makes no lap until the clock moves. Its cap
+ *   is `installStubSpawnPath`'s 200 ms, below the pace, so it makes one lap
+ *   and stops at the cap once the clock reaches it; `options.approverCapMs`
+ *   sets another (a case that needs a second lap passes one above
+ *   `DIALOG_POLL_INTERVAL_MS`). `approverRunning(key)` is the session
+ *   manager's `isDialogApproverRunning(key)`, read-only. So a case launches
+ *   P, calls `settle()` (the first lap's calls are then made, and P's
+ *   approver sleeps until its next lap), and holds P there until it moves the
+ *   clock: `advance(ms)` fires the approver's timers due by then, each lap
+ *   running before the next firing. `runApproverToStop(key, maxSteps?)` drives
+ *   P's approver to its stop: it settles, then advances the clock to the
+ *   approver's next timer, until the approver no longer runs (throwing after
+ *   `maxSteps` timers, 1000 by default, or when it runs with no timer, held
+ *   in a call), and resolves with its outcome (`ApproverOutcome`, through
+ *   `_whenDialogApproverStopped`); other timers due on the way fire too, as in
+ *   `advance`. A case that counts calls after a launch settles first, or
+ *   drives the approver to its stop.
  * - `settle()`: awaits every configured persona's launch in flight
  *   (`whenLaunchSettled`) and every retry run in flight (`whenRunSettled`),
- *   with its re-arm or stop. The spawn path polls in real time (the dialog
- *   approver's 1 ms steps; it takes no fake clock), so this is the one
+ *   with its re-arm or stop, and then until every running dialog approver
+ *   waits for its next lap on the harness clock or has stopped (each holds
+ *   its cap timer and, while it sleeps, its sleep timer, so all sleep when
+ *   their pending timers number twice the running approvers). The spawn path
+ *   does its own file I/O in real event-loop turns, so this is the one
  *   real-time wait: 1 ms steps, bounded by `options.settleMs`, and it throws
- *   when a launch or a run is still in flight at the bound. A retry whose
+ *   when a launch or a run is still in flight at the bound, or an approver
+ *   neither sleeps nor has stopped (one held in a call). A retry whose
  *   launch goes on past a spawn needs it before the clock moves on.
  * - `loseMessage(key)`, the lost-message driver (b.jg5 SRJ-1011): one Slack
  *   message, a human's in persona `key`'s first channel, handed to the real
@@ -224,11 +256,13 @@
  *   (b.jg5 SRJ-1011 as amended: state 5 applies only while P's retry timer
  *   is armed, and never at the restart cap, which the routing reads from the
  *   real backoff state); `isLaunchOrApproverRunning` is the session manager's
- *   `isLaunchInFlight` (a launch call awaits its dialog approver); the
+ *   `isLaunchInFlight` or `isDialogApproverRunning` (the approver runs after
+ *   its launch call returned, SRJ-401); the
  *   restart guards and `scheduleRestart` are the restart module the harness
  *   initialised, and the outage flags are the outage state's. The read gate's
- *   in-flight member (`isWorkInFlight`) is the shared in-flight predicate the
- *   full-mode retry action receives, and the one row read
+ *   in-flight member (`isWorkInFlight`) is "in flight for P" (as `main()`'s
+ *   `isPersonaWorkInFlight`: "blocks a retry", which the full-mode retry
+ *   action receives, or a running dialog approver), and the one row read
  *   (`readRowLiveness`) is the harness's liveness adapter, the restart deps'
  *   default `isSessionAlive` (b.jg5 SRJ-1011, SRJ-115); a
  *   `restartDeps.isSessionAlive` replacement does not reach it. So when states
@@ -239,13 +273,15 @@
  *   `statusFn`; e.g. `cannedStatusResult({ state: 'pending' })` for state 6,
  *   a row that shows the stub's default launch start, so it latches no one);
  *   while a launch's spawn is held open (`holdSpawns(stub.client)` and a
- *   `launch(key)` not yet settled) a launch is in flight and no read is made.
+ *   `launch(key)` not yet settled) a launch is in flight, and while P's
+ *   dialog approver runs (after a launch, until it stops) the approver is,
+ *   so the message reports `session-starting` and no read is made.
  *   Its `armRetryTimerIfMissing` (b.jg5 SRJ-311) is bound as `main()` binds
  *   it: nothing while the harness is shutting down (`shutdown()`), else the
  *   server's one check (`armMissingTmuxUnavailableRetry`) over the harness's
  *   own holders, as `main()`'s `tmuxUnavailableRetryDeps`: the outage
  *   state's `tmux-unavailable` flag, the controller's `isArmed`, `latch`'s
- *   latched query, the shared in-flight predicate, and an arm straight to the
+ *   latched query, "in flight for P", and an arm straight to the
  *   controller with `UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT` (not through the
  *   trigger sink, so not in `triggers`), its one line to `console.error`
  *   (`errors`). So a message lost with the persona's `tmux-unavailable`
@@ -291,9 +327,11 @@
  *   Every persona is applied at first.
  * - `advance(ms)`: moves the clock `ms` forward one due time at a time.
  *   Before and after each firing it awaits every in-flight retry run
- *   (`whenRunSettled`), bounded by `options.settleFlushes` clock flushes, so
- *   a re-arm measured from a run's end lands exactly and a run the test holds
- *   open does not stall the step. Resolves with the number of timers fired.
+ *   (`whenRunSettled`) and then every running dialog approver's next sleep,
+ *   each bounded by `options.settleFlushes` clock flushes, so a re-arm
+ *   measured from a run's end lands exactly, an approver's lap runs at the
+ *   time its sleep ended, and a run or approver the test holds open does
+ *   not stall the step. Resolves with the number of timers fired.
  * - `errors`: every `console.error` call while the harness is live (the
  *   session manager's and the restart module's lines), its arguments joined
  *   with spaces, in order. `console.error` is replaced at build and put back
@@ -303,7 +341,10 @@
  *   entries, the attempts, the triggers, the condition ends, the outage
  *   clears, the stops, the latch events, the driver's Slack calls and the
  *   state directory as a written file.
- * - `cleanup()`: stops every retry timer (`stopAll`), forgets every
+ * - `cleanup()`: first stops and forgets every dialog approver
+ *   (`_resetDialogApprovers`, silently: none makes a call after the one in
+ *   progress) and clears the timers they left on the harness clock, then
+ *   stops every retry timer (`stopAll`), forgets every
  *   episode (`episodes.forgetAll()`, which cancels every alert check) and
  *   cancels every notice the driver's destination hold holds, then
  *   drops the driver's routing and undoes every
@@ -312,7 +353,8 @@
  *   the session manager's latch install and the latch's set observers,
  *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
  *   harnesses built one after the other share no query,
- *   the stub spawn path and client with every launch still in flight, the
+ *   the stub spawn path and client with every launch still in flight and the
+ *   approver's clock and cap, the
  *   findMissing memo, the tmux seams, the settings install,
  *   `SLACK_STATE_DIR`) and removes the temporary directory. It throws, after
  *   undoing everything, when a timer is still pending on the clock or a
@@ -362,7 +404,8 @@
  * Rows in any other state carry none.
  *
  * Isolation: no top-level `mock.module()`, no real HOME, `~/.agent-director`,
- * tmux, child process or Slack client (the driver's clients are stubs). The retry timer runs on the fake clock only; the one
+ * tmux, child process or Slack client (the driver's clients are stubs). The
+ * retry timer and the dialog approver run on the fake clock only; the one
  * real-time wait is `settle()`'s bounded poll for the spawn path. A retry
  * never arms the restart module's own (real) timer: its entry bypasses it. Every file
  * sits under one `mkdtempSync` directory.
@@ -437,12 +480,19 @@ import {
   type TmuxUnavailableRetryDeps,
 } from '../../src/server.ts'
 import {
+  APPROVER_STOP_TEARDOWN,
+  DIALOG_POLL_INTERVAL_MS,
   _resetConfiguredPersonaQuery,
+  _resetDialogApprovers,
   _resetFindMissingMemo,
   _resetTmuxServerEnsurer,
   _resetTmuxSessionKiller,
+  _setApproverClock,
+  _setDialogReadyTimeoutMs,
   _setTmuxServerEnsurer,
   _setTmuxSessionKiller,
+  _whenDialogApproverStopped,
+  isDialogApproverRunning,
   isLaunchInFlight,
   launchSession,
   notifyRestartCapReached,
@@ -451,7 +501,11 @@ import {
   setConflictLatch,
   setSessionNotifier,
   spawnForPersona,
+  stopAllDialogApprovers,
+  stopDialogApprover,
   whenLaunchSettled,
+  type ApproverClock,
+  type ApproverOutcome,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
 import { recordStartupError } from '../../src/startup-errors.ts'
@@ -500,6 +554,9 @@ const DEFAULT_SETTLE_FLUSHES = 20
 /** How long `settle` waits at most for the launches in flight, in real ms (1 ms steps). */
 const DEFAULT_SETTLE_MS = 2000
 
+/** How many approver timers `runApproverToStop` fires at most when the case gives no bound. */
+const DEFAULT_APPROVER_STEPS = 1000
+
 /** What the scripted action answers once a persona's queued outcomes run out: a bare refusal. */
 const SCRIPTED_REFUSAL: UnavailableRetryOutcome = Object.freeze({ kind: 'again' })
 
@@ -539,6 +596,14 @@ export interface RecoveryHarnessOptions {
   conditionSink?: boolean
   /** Real ms `settle` waits at most for the launches in flight; `DEFAULT_SETTLE_MS` when unset. */
   settleMs?: number
+  /**
+   * The dialog approver's cap in ms (`_setDialogReadyTimeoutMs`), on the
+   * harness clock from the approver's start: `installStubSpawnPath`'s 200 ms
+   * when unset, below the approver's pace (`DIALOG_POLL_INTERVAL_MS`), so it
+   * makes one lap and stops at the cap when the clock reaches it. A case
+   * that needs later laps passes a larger cap.
+   */
+  approverCapMs?: number
 }
 
 /** The stub's answer knobs: every `StubClientOptions` field but the capture lists. */
@@ -690,18 +755,30 @@ export interface RecoveryHarness {
   script(knobs: RecoveryStubScript): void
   launch(key: string): Promise<SpawnPersonaResult>
   settle(): Promise<void>
+  /** Whether persona `key`'s dialog approver is running (read-only; the session manager's `isDialogApproverRunning`). */
+  approverRunning(key: string): boolean
+  /**
+   * Drive persona `key`'s dialog approver on the harness clock until it has
+   * stopped, and resolve with how it ended (the session manager's
+   * `_whenDialogApproverStopped`); see the module comment.
+   */
+  runApproverToStop(key: string, maxSteps?: number): Promise<ApproverOutcome | undefined>
   answer(key: string, ...outcomes: UnavailableRetryOutcome[]): void
   setAction(action: UnavailableRetryAction | undefined): void
   /** Whether persona `key`'s bring-up outcome is up (the relaunch gate); true at first. */
   setUp(key: string, up: boolean): void
   /** Whether persona `key`'s session is registered as connected with its message stream; false at first. */
   setConnected(key: string, connected: boolean): void
-  /** The server's shutdown: raise the shutting-down flag, close the controller, then close the episodes. */
+  /**
+   * The server's shutdown: raise the shutting-down flag, close the
+   * controller, close the episodes, then stop every dialog approver (none
+   * starts after it).
+   */
   shutdown(): void
   /**
-   * The persona teardown's submit (stop the retry timer, cancel the
-   * condition's alert check), then its turn's latch forget (silent); its
-   * episodes forget is the case's `episodes.forget(key)` after it.
+   * The persona teardown's submit (stop its dialog approver, stop the retry
+   * timer, cancel the condition's alert check), then its turn's latch forget
+   * (silent); its episodes forget is the case's `episodes.forget(key)` after it.
    */
   teardown(key: string): void
   /** Drop persona `key` from the applied configuration. */
@@ -782,10 +859,15 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   }
   const canRelaunch = createPersonaRelaunchGate({ status: () => SERVING }, log, upQuery)
 
-  // As main()'s `isPersonaWorkInFlight` (b.jg5 SRJ-315, SRJ-1011): the one
-  // shared in-flight predicate (today a launch call, `isLaunchInFlight`),
-  // which the full-mode retry action and the driver's read gate both receive.
-  const isPersonaWorkInFlight = (key: string): boolean => isLaunchInFlight(key)
+  // As main()'s two in-flight bindings. "Blocks a retry"
+  // (`isPersonaRetryBlocked`, b.jg5 SRJ-303): a launch call
+  // (`isLaunchInFlight`), never a running dialog approver (SRJ-401); the
+  // full-mode retry action receives it. "In flight for P"
+  // (`isPersonaWorkInFlight`, SRJ-315, SRJ-1011), built from it: that, or a
+  // running dialog approver (`isDialogApproverRunning`); the driver's read
+  // gate and its `tmux-unavailable` retry check receive it.
+  const isPersonaRetryBlocked = (key: string): boolean => isLaunchInFlight(key)
+  const isPersonaWorkInFlight = (key: string): boolean => isPersonaRetryBlocked(key) || isDialogApproverRunning(key)
 
   const queued = new Map<string, UnavailableRetryOutcome[]>()
   const scripted: UnavailableRetryAction = (key) => queued.get(key)?.shift() ?? SCRIPTED_REFUSAL
@@ -799,7 +881,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // As main() binds it (b.jg5 SRJ-303, SRJ-305): a retry of a latched
     // persona makes no call and stops the timer.
     isLatched: (key) => latch.isLatched(key),
-    isInFlight: isPersonaWorkInFlight,
+    // As main() binds it (b.jg5 SRJ-303): only work that blocks a retry
+    // skips it; a running dialog approver alone never does (SRJ-401).
+    isInFlight: isPersonaRetryBlocked,
     isSessionConnected: (key) => connected.has(key),
     hasSessionStream: (key) => connected.has(key),
     endTmuxUnresponsive: (key, reading) => {
@@ -916,6 +1000,28 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   }
 
   const stub = installStubSpawnPath(home)
+  // The dialog approver runs on the harness clock (b.jg5 SRJ-401): its sleeps
+  // between laps and its cap timer are harness-clock timers, tracked here so
+  // `settle()` can tell an approver waiting for its next lap and `cleanup()`
+  // can clear what a stopped approver left. Undone by `resetStubSpawnPath`.
+  const approverTimers = new Set<unknown>()
+  const approverClock: ApproverClock = {
+    now: () => clock.now(),
+    setTimeout: (callback, delayMs) => {
+      const handle = clock.setTimeout(() => {
+        approverTimers.delete(handle)
+        callback()
+      }, delayMs)
+      approverTimers.add(handle)
+      return handle
+    },
+    clearTimeout: (handle) => {
+      approverTimers.delete(handle)
+      clock.clearTimeout(handle)
+    },
+  }
+  _setApproverClock(approverClock)
+  if (options.approverCapMs !== undefined) _setDialogReadyTimeoutMs(options.approverCapMs)
   _setTmuxSessionKiller(async () => {})
   _setTmuxServerEnsurer(async () => {})
   _resetFindMissingMemo()
@@ -1030,9 +1136,32 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     void all
   }
 
+  /** The configured personas whose dialog approver is running. */
+  function runningApproverKeys(): string[] {
+    return keys.filter((key) => isDialogApproverRunning(key))
+  }
+
+  /**
+   * Whether every running dialog approver waits for its next lap on the
+   * harness clock: each holds at most two harness-clock timers (its cap and,
+   * while it sleeps between laps, its sleep), so all sleep exactly when the
+   * approvers' pending timers number twice the running approvers. True when
+   * none runs and none left a timer.
+   */
+  function approversQuiet(): boolean {
+    return approverTimers.size === 2 * runningApproverKeys().length
+  }
+
+  /** Let the running approvers reach their next sleep, for at most `settleFlushes` clock flushes. */
+  async function settleApprovers(): Promise<void> {
+    for (let flushes = 0; flushes < settleFlushes && !approversQuiet(); flushes++) await clock.flush()
+  }
+
   /**
    * Await every configured persona's launch in flight and every retry run in
-   * flight, in 1 ms real-time steps, for at most `settleMs`.
+   * flight, and then every running dialog approver's next sleep on the
+   * harness clock (or its stop), in 1 ms real-time steps, for at most
+   * `settleMs`.
    */
   async function settleLaunches(): Promise<void> {
     let settled = false
@@ -1042,10 +1171,50 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     ]).then(() => {
       settled = true
     })
-    for (let waited = 0; waited < settleMs && !settled; waited++) {
-      await Promise.race([all, new Promise((resolve) => setTimeout(resolve, 1))])
+    const realTurn = (): Promise<unknown> => new Promise((resolve) => setTimeout(resolve, 1))
+    for (let waited = 0; waited < settleMs && !(settled && approversQuiet()); waited++) {
+      if (!settled) {
+        await Promise.race([all, realTurn()])
+        continue
+      }
+      await clock.flush()
+      if (!approversQuiet()) await realTurn()
     }
     if (!settled) throw new Error(`recovery harness: a launch or a retry run was still in flight after ${settleMs} ms`)
+    if (!approversQuiet()) {
+      throw new Error(
+        `recovery harness: a dialog approver was neither stopped nor waiting for its next lap after ${settleMs} ms (running for ${JSON.stringify(runningApproverKeys())})`,
+      )
+    }
+  }
+
+  /**
+   * Move the clock `ms` forward one due time at a time; before and after each
+   * firing, await the retry runs and the approvers (flush-bounded).
+   */
+  async function advance(ms: number): Promise<number> {
+    if (!Number.isFinite(ms) || ms < 0) throw new RangeError(`recovery harness: advance needs a finite, non-negative ms, got ${ms}`)
+    const target = clock.now() + ms
+    let fired = 0
+    await settleRuns()
+    await settleApprovers()
+    for (let next = clock.pending()[0]; next !== undefined && next.dueAt <= target; next = clock.pending()[0]) {
+      fired += await clock.advanceTo(next.dueAt)
+      await settleRuns()
+      await settleApprovers()
+    }
+    await clock.advanceTo(target)
+    return fired
+  }
+
+  /** The earliest due time of a pending approver timer, or undefined. */
+  function nextApproverDue(): number | undefined {
+    let due: number | undefined
+    for (const timer of clock.pending()) {
+      if (![...approverTimers].some((handle) => (handle as { id?: unknown }).id === timer.id)) continue
+      if (due === undefined || timer.dueAt < due) due = timer.dueAt
+    }
+    return due
   }
 
   function startupErrors(): string[] {
@@ -1071,8 +1240,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const slackClientFor = (key: string): WebClient | undefined => slackStubs.get(key)?.web as unknown as WebClient | undefined
 
   // As main()'s `tmuxUnavailableRetryDeps` (b.jg5 SRJ-311): the outage
-  // state's flag, the controller's armed read, the latch's latched query, the
-  // shared in-flight predicate and the ENVIRONMENT arm, straight to the
+  // state's flag, the controller's armed read, the latch's latched query,
+  // "in flight for P" (a running dialog approver included) and the
+  // ENVIRONMENT arm, straight to the
   // controller (not through the trigger sink, so not in `triggers`), with
   // its line to `console.error` (`errors`).
   const tmuxUnavailableRetryDeps: TmuxUnavailableRetryDeps = {
@@ -1118,9 +1288,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // while P's retry timer is armed): the one controller's `isArmed`,
       // exactly true.
       isRetryArmed: (key) => controller.isArmed(key) === true,
-      isLaunchOrApproverRunning: (key) => isLaunchInFlight(key),
+      // As main() binds it (b.jg5 SRJ-1011, SRJ-401): state 6's member is a
+      // launch call or the dialog approver that runs after it returned.
+      isLaunchOrApproverRunning: (key) => isLaunchInFlight(key) || isDialogApproverRunning(key),
       // As main() binds them (b.jg5 SRJ-1011, SRJ-115): the read gate's
-      // "in flight for P" is the shared in-flight predicate, and the one row
+      // "in flight for P" (a running dialog approver included), and the one row
       // read is the harness's liveness adapter, so it shows as a stub `status`.
       isWorkInFlight: isPersonaWorkInFlight,
       readRowLiveness: isSessionAliveAdapter,
@@ -1218,6 +1390,19 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     settle: settleLaunches,
 
+    approverRunning: (key) => isDialogApproverRunning(key),
+
+    async runApproverToStop(key, maxSteps = DEFAULT_APPROVER_STEPS) {
+      for (let steps = 0; ; steps++) {
+        await settleLaunches()
+        if (!isDialogApproverRunning(key)) return _whenDialogApproverStopped(key)
+        if (steps >= maxSteps) throw new Error(`recovery harness: persona ${key}'s dialog approver still ran after ${maxSteps} steps`)
+        const due = nextApproverDue()
+        if (due === undefined) throw new Error(`recovery harness: persona ${key}'s dialog approver runs with no timer on the harness clock`)
+        await advance(due - clock.now())
+      }
+    },
+
     answer(key, ...outcomes) {
       queued.set(key, [...(queued.get(key) ?? []), ...outcomes])
     },
@@ -1240,9 +1425,16 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       shuttingDown = true
       controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
       episodes.close()
+      // As main()'s shutdown (b.jg5 SRJ-404): every approver is marked and
+      // woken now, not awaited; none starts after it.
+      void stopAllDialogApprovers()
     },
 
     teardown(key) {
+      // As production's teardown submit (b.jg5 SRJ-404, SRJ-715): its dialog
+      // approver first, and the one a launch in flight would start; not
+      // awaited here (the teardown's turn awaits it).
+      void stopDialogApprover(key, APPROVER_STOP_TEARDOWN)
       controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
       tmuxUnresponsive.cancelAlert(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
       // As main()'s `forgetConflictLatch` (b.jg5 SRJ-504): silently, before
@@ -1266,18 +1458,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     settings: () => adSettingsInEffect(),
 
-    async advance(ms) {
-      if (!Number.isFinite(ms) || ms < 0) throw new RangeError(`recovery harness: advance needs a finite, non-negative ms, got ${ms}`)
-      const target = clock.now() + ms
-      let fired = 0
-      await settleRuns()
-      for (let next = clock.pending()[0]; next !== undefined && next.dueAt <= target; next = clock.pending()[0]) {
-        fired += await clock.advanceTo(next.dueAt)
-        await settleRuns()
-      }
-      await clock.advanceTo(target)
-      return fired
-    },
+    advance,
 
     captured: () => ({
       lines: [...lines],
@@ -1298,6 +1479,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     }),
 
     cleanup() {
+      // Every dialog approver first, so none makes a call (or arms a timer
+      // through the trigger sink) after this; their timers go with them.
+      _resetDialogApprovers()
+      for (const handle of approverTimers) clock.clearTimeout(handle)
+      approverTimers.clear()
       controller.stopAll('the recovery harness is cleaned up')
       episodes.forgetAll()
       lostMessageDriver?.hold.cancelAll()

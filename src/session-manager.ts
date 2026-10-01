@@ -94,8 +94,13 @@
  *
  * Both row checks go through `compareRowToPersona`. At most one launch per
  * persona is in flight (b.av2 SR-6.3): a concurrent call for the same key
- * joins the running ladder. Every launch first resolves the persona's
- * claude_config_dir to a real path with no lexical fallback (bug b.g57,
+ * joins the running ladder. A launch that returned success starts the
+ * persona's dialog approver after its launch call, outside the launch and
+ * its attempt, in a registry holding at most one approver per persona
+ * (`startDialogApprover`, b.jg5 SRJ-401); a teardown or shutdown stops it
+ * (`stopDialogApprover`, `stopAllDialogApprovers`, SRJ-404). Every launch
+ * first resolves the persona's claude_config_dir to a real path with no
+ * lexical fallback (bug b.g57,
  * `checkLaunchConfigDir`); when it cannot be resolved the launch makes no
  * agent-director call, keeps the row, hands the persona to the installed
  * hook (`setConfigDirUnresolvableHook`: the bring-up controller holds it
@@ -143,7 +148,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import type { Client, ListRow, SpawnParams, FindMissingResult, GetResult } from 'agent-director'
+import type { Client, ListRow, SpawnParams, FindMissingResult, GetResult, ResumeResult, SpawnResult } from 'agent-director'
 
 import type { Phase1StatusResult } from './ad-phase1-types.ts'
 
@@ -243,6 +248,7 @@ import {
 } from './row-read-rules.ts'
 import {
   runInAttempt,
+  runOutsideAttempts,
   unavailableRetryCauseFor,
   UNAVAILABLE_RETRY_ROW_ABSENT,
   type AttemptView,
@@ -276,7 +282,7 @@ import {
   AGENT_DIRECTOR_PENDING_STATE,
   pendingLaunchStartOf,
 } from './liveness-reading.ts'
-import { isPendingWithNoLaunchStart } from './pending-row.ts'
+import { parseLaunchStart } from './pending-row.ts'
 import { isDryRun } from './tokens.ts'
 import { DIALOG_READY_TIMEOUT_MS, armNeverEarlyWait, type NeverEarlyWaitClock } from './ad-settings.ts'
 // Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
@@ -1863,20 +1869,8 @@ export const DEV_CHANNELS_DIALOG_NEEDLE = 'I am using this for local development
  */
 export const TRUST_DIALOG_NEEDLE = 'Yes, I trust this folder'
 
-/** Default poll interval while watching for pre-session dialogs. */
+/** The approver's sleep between laps, on the approver's clock (`_setApproverClock`). */
 export const DIALOG_POLL_INTERVAL_MS = 500
-
-let _dialogPollIntervalMs = DIALOG_POLL_INTERVAL_MS
-
-/** Test-only seam: override the dialog poll interval. */
-export function _setDialogPollIntervalMs(ms: number): void {
-  _dialogPollIntervalMs = ms
-}
-
-/** Test-only seam: restore the default poll interval. */
-export function _resetDialogPollIntervalMs(): void {
-  _dialogPollIntervalMs = DIALOG_POLL_INTERVAL_MS
-}
 
 /** The approver's cap: how long it works on a launched row, measured from the
  *  approver's start on the approver's clock (`_setApproverClock`), before it
@@ -1946,8 +1940,21 @@ export const APPROVER_STOP_LATCHED = 'latched'
 export const APPROVER_STOP_NO_LAUNCH_START = 'no-launch-start'
 /** The approver stopped at its cap (`_setDialogReadyTimeoutMs`, measured from the approver's start). */
 export const APPROVER_STOP_CAP = 'cap'
+/**
+ * The approver was stopped by the one-approver rule (b.jg5 SRJ-401; hatch
+ * A2): a later launch of the persona started its own approver
+ * (`startDialogApprover`), or a lap read a launch start other than the one
+ * the approver kept. Either way the row belongs to a newer launch.
+ */
+export const APPROVER_STOP_SUPERSEDED = 'superseded'
+/** The persona's teardown stopped the approver (b.jg5 SRJ-404, SRJ-715). */
+export const APPROVER_STOP_TEARDOWN = 'teardown'
+/** Shutdown stopped the approver (b.jg5 SRJ-404). */
+export const APPROVER_STOP_SHUTDOWN = 'shutdown'
+/** The approver's loop threw (not reached: every step is guarded); the throw was logged and nothing more was called. */
+export const APPROVER_STOP_FAILED = 'failed'
 
-/** Why `approvePreSessionDialogs` stopped: what its promise resolves with. */
+/** Why the approver stopped: what `approvePreSessionDialogs` resolves with, and the reason in an {@link ApproverOutcome}. */
 export type ApproverStopReason =
   | typeof APPROVER_STOP_LIVE
   | typeof APPROVER_STOP_FINISHED
@@ -1955,6 +1962,30 @@ export type ApproverStopReason =
   | typeof APPROVER_STOP_LATCHED
   | typeof APPROVER_STOP_NO_LAUNCH_START
   | typeof APPROVER_STOP_CAP
+  | typeof APPROVER_STOP_SUPERSEDED
+  | typeof APPROVER_STOP_TEARDOWN
+  | typeof APPROVER_STOP_SHUTDOWN
+  | typeof APPROVER_STOP_FAILED
+
+/**
+ * The reasons a caller stops a persona's approver with (`stopDialogApprover`):
+ * each is also the stopped approver's {@link ApproverStopReason}. One member
+ * per kind of stop, so a later stop (a latch, a key recorded as retired, the
+ * abort of the persona's own stuck launch) is one more member here, and a
+ * reader of the outcome tells which stops leave the row to the pending-row
+ * rule.
+ */
+export type ApproverStopRequestReason =
+  | typeof APPROVER_STOP_SUPERSEDED
+  | typeof APPROVER_STOP_TEARDOWN
+  | typeof APPROVER_STOP_SHUTDOWN
+
+/** How one approver ended: why, and the launch start it kept (absent when no lap read the row `pending` with a launch start). */
+export interface ApproverOutcome {
+  readonly reason: ApproverStopReason
+  /** Epoch ms of the launch start the approver's first lap whose `status` read the row `pending` with a launch start read. */
+  readonly launchStartMs: number | undefined
+}
 
 /** The startup-errors class the approver writes, during a start-pass launch, when the row reads `ended` or `missing` (b.jg5 SRJ-402, SRJ-1013). */
 export const STARTUP_ERROR_APPROVE_SPAWN_DIED = 'dev-channels-approve-spawn-died'
@@ -2019,8 +2050,62 @@ export function approverCapMessage(ref: string, capMs: number): string {
   return `spawn never reached a live state within ${capMs}ms for ${ref} — dialog unrecognized or session hung (dev-needle='${DEV_CHANNELS_DIALOG_NEEDLE}')`
 }
 
+/** The message for a lap that read a launch start other than the one the approver kept: it stops with nothing typed. */
+export function approverLaunchStartChangedMessage(ref: string): string {
+  return `${ref} reads pending with a launch start other than the one this approver kept: the row belongs to a newer launch, whose own approver works on it — this approver stops; nothing read or typed (b.jg5 SRJ-401)`
+}
+
+/**
+ * Why each requested stop happened, in {@link approverStopRequestedMessage}'s
+ * line. Keyed by every {@link ApproverStopRequestReason}, so a new reason does
+ * not compile without its text.
+ */
+const APPROVER_STOP_REQUEST_WHY: Readonly<Record<ApproverStopRequestReason, string>> = {
+  [APPROVER_STOP_SUPERSEDED]: 'a later launch started its own approver',
+  [APPROVER_STOP_TEARDOWN]: 'its teardown began',
+  [APPROVER_STOP_SHUTDOWN]: 'the server is shutting down',
+}
+
+/** The message for a stop of a running approver (`stopDialogApprover`, `startDialogApprover` superseding one). */
+export function approverStopRequestedMessage(ref: string, reason: ApproverStopRequestReason): string {
+  return `stopping the approver for ${ref} (${reason}): ${APPROVER_STOP_REQUEST_WHY[reason]}; it makes no further call (b.jg5 SRJ-401, SRJ-404)`
+}
+
+/** The message for an approver not started because its persona was stopped while its launch was in flight, or after shutdown. */
+export function approverNotStartedMessage(ref: string, reason: ApproverStopRequestReason): string {
+  return `not starting the approver for ${ref} (${reason}): it was stopped before its launch returned; nothing read or typed (b.jg5 SRJ-404)`
+}
+
+/** The message for an approver whose loop threw. `failure` is already described (`describeThrownValue`). */
+export function approverFailedMessage(ref: string, failure: string): string {
+  return `the approver for ${ref} failed: ${failure} — it stops; nothing more is called`
+}
+
 /** Every pre-SessionStart dialog the approver answers (option 1 pre-selected; Enter accepts). Both kept: a folder-trust prompt can follow a `pre_trust` of `skipped` or `failed`. */
 const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEEDLE]
+
+/**
+ * One approver's state, shared by its loop and its stops. The registry
+ * (`startDialogApprover`) keeps one per running approver; a direct
+ * `approvePreSessionDialogs` call makes its own.
+ */
+interface ApproverRun {
+  /** Set by the first stop asked of this approver (`stopDialogApprover`, a later start, the reset seam): its reason. */
+  stopRequested: ApproverStopRequestReason | undefined
+  /** Wakes the approver's sleep between laps, while it sleeps. */
+  wake: (() => void) | undefined
+  /**
+   * The launch start (epoch ms) the first lap whose `status` read the row
+   * `pending` with a launch start read (b.jg5 SRJ-401; hatch A2). A lap whose
+   * `status` failed sets nothing.
+   */
+  launchStartMs: number | undefined
+}
+
+/** A fresh approver state: no stop asked, no launch start kept. */
+function newApproverRun(): ApproverRun {
+  return { stopRequested: undefined, wake: undefined, launchStartMs: undefined }
+}
 
 /**
  * Drive a launched bot past its pre-SessionStart dialogs (folder-trust and
@@ -2042,8 +2127,11 @@ const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEE
  *     (`no-launch-start`); a configured persona's such row is latched by the
  *     read (`latched`), so this stop is reached only with no configured-persona
  *     query installed or one that does not answer `key` as configured;
- *   - `pending` with a launch start: one `read-pane` (40 lines,
- *     `allow_pending`), and when the pane shows a needle of
+ *   - `pending` with a launch start: the first such lap keeps that launch
+ *     start; a later lap that reads another one stops the approver with one
+ *     line and nothing read or typed (`superseded`, b.jg5 SRJ-401; hatch
+ *     A2: the row belongs to a newer launch). Otherwise one `read-pane` (40
+ *     lines, `allow_pending`), and when the pane shows a needle of
  *     `PRE_SESSION_DIALOG_NEEDLES`, one `send-keys` with an empty text and
  *     `allow_pending`, which presses Enter. A failed call is logged once and
  *     polling goes on within the cap.
@@ -2052,49 +2140,65 @@ const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEE
  * reads and types into the worker's recorded pane of a session carrying this
  * launch's label (HO rev 17), and the server runs no tmux command here.
  *
- * Laps are `_dialogPollIntervalMs` apart; the cap (`_dialogReadyTimeoutMs`)
+ * Laps are `DIALOG_POLL_INTERVAL_MS` apart; the cap (`_dialogReadyTimeoutMs`)
  * is measured from the approver's start. Both run on the approver's clock
  * (`_setApproverClock`). At the cap it logs one line, writes
  * `dev-channels-approve-not-ready` for a start-pass launch and sends the
  * spawn-failure notice (`cap`). Resolves with why it stopped; never rejects.
+ *
+ * This runs one approver in the caller's context and outside the registry:
+ * nothing can stop it but its own rules. A launch starts its approver
+ * through the registry instead (`startDialogApprover`), which runs it
+ * outside every launch or recovery attempt and stops it on request.
  */
 export async function approvePreSessionDialogs(
   key: string,
   isStartup: boolean,
   ref: string = keyRef(key),
 ): Promise<ApproverStopReason> {
+  return runApproverLoop(key, isStartup, ref, newApproverRun())
+}
+
+/**
+ * The approver's loop (`approvePreSessionDialogs`) over `run`: a stop asked
+ * of `run` wakes its sleep at once and is checked after each agent-director
+ * call, before the next, so no call follows a stop; the approver then
+ * resolves with the stop's reason. Never rejects.
+ */
+async function runApproverLoop(key: string, isStartup: boolean, ref: string, run: ApproverRun): Promise<ApproverStopReason> {
   const clock = _approverClock
   const capMs = _dialogReadyTimeoutMs
-  const pollMs = _dialogPollIntervalMs
   const at: OwnRowReadSite = { site: APPROVER_LOG_SITE, what: APPROVER_STATUS_READ_WHAT, ref }
   const startMs = clock.now()
   let capReached = false
-  let wakeSleep: (() => void) | undefined
   const cancelCap = armNeverEarlyWait(clock, startMs, capMs, () => {
     capReached = true
-    wakeSleep?.()
+    run.wake?.()
   })
   try {
     while (!capReached && clock.now() - startMs < capMs) {
-      const stop = await approverLap(key, isStartup, ref, at)
+      if (run.stopRequested !== undefined) return run.stopRequested
+      const stop = await approverLap(key, isStartup, ref, at, run)
       if (stop !== undefined) return stop
+      if (run.stopRequested !== undefined) return run.stopRequested
       if (capReached) break
       await new Promise<void>((resolve) => {
         const handle = clock.setTimeout(() => {
-          wakeSleep = undefined
+          run.wake = undefined
           resolve()
-        }, pollMs)
-        wakeSleep = () => {
-          wakeSleep = undefined
+        }, DIALOG_POLL_INTERVAL_MS)
+        run.wake = () => {
+          run.wake = undefined
           clock.clearTimeout(handle)
           resolve()
         }
       })
     }
   } finally {
-    wakeSleep = undefined
+    run.wake = undefined
     cancelCap()
   }
+  if (run.stopRequested !== undefined) return run.stopRequested
 
   // The cap: surfaced loudly (no silent give-up).
   const msg = approverCapMessage(ref, capMs)
@@ -2106,21 +2210,25 @@ export async function approvePreSessionDialogs(
 
 /**
  * One approver lap (`approvePreSessionDialogs`): answers the stop reason, or
- * `undefined` to poll on. Never throws.
+ * `undefined` to poll on. A stop asked of `run` during a call is answered
+ * as soon as that call returns, before anything else. Never throws.
  */
 async function approverLap(
   key: string,
   isStartup: boolean,
   ref: string,
   at: OwnRowReadSite,
+  run: ApproverRun,
 ): Promise<ApproverStopReason | undefined> {
   const read = await readPersonaOwnRowStatus(key, at)
+  if (run.stopRequested !== undefined) return run.stopRequested
   if (read.kind === OWN_ROW_STATUS_LATCHED) return APPROVER_STOP_LATCHED // the step logged its line
   if (read.kind === OWN_ROW_STATUS_ABSENT) {
     console.error(approverLogLine(approverAbsentMessage(ref)))
     return APPROVER_STOP_ABSENT
   }
   if (read.kind === OWN_ROW_STATUS_REFUSED) {
+    // A failed read keeps no launch start (b.jg5 SRJ-401; hatch A2).
     console.error(approverLogLine(approverStatusRefusedMessage(ref, describeAgentDirectorFailure(read.error))))
     return undefined
   }
@@ -2137,9 +2245,19 @@ async function approverLap(
     console.error(approverLogLine(approverUnknownStateMessage(ref, state)))
     return undefined
   }
-  if (isPendingWithNoLaunchStart({ state, launch_started_at: read.launchStartedAt })) {
+  const launchStartMs = parseLaunchStart(read.launchStartedAt)
+  if (launchStartMs === undefined) {
+    // `pending` with no launch start, or one that does not parse (as `isPendingWithNoLaunchStart` reads it).
     console.error(approverLogLine(approverNoLaunchStartMessage(ref)))
     return APPROVER_STOP_NO_LAUNCH_START
+  }
+  // b.jg5 SRJ-401 (hatch A2): the first lap that reads a launch start keeps
+  // it; a later one that reads another belongs to a newer launch.
+  if (run.launchStartMs === undefined) {
+    run.launchStartMs = launchStartMs
+  } else if (run.launchStartMs !== launchStartMs) {
+    console.error(approverLogLine(approverLaunchStartChangedMessage(ref)))
+    return APPROVER_STOP_SUPERSEDED
   }
 
   const claude_instance_id = personaInstanceId(key)
@@ -2150,9 +2268,11 @@ async function approverLap(
     )
     pane = result.pane
   } catch (err) {
+    if (run.stopRequested !== undefined) return run.stopRequested
     console.error(approverLogLine(approverPaneCallFailedMessage(ref, 'read-pane', describeAgentDirectorFailure(err))))
     return undefined
   }
+  if (run.stopRequested !== undefined) return run.stopRequested
   if (!PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))) return undefined
   try {
     // An empty text presses Enter.
@@ -2160,6 +2280,7 @@ async function approverLap(
       client.sendKeys({ claude_instance_id, text: '', allow_pending: true }),
     )
   } catch (err) {
+    if (run.stopRequested !== undefined) return run.stopRequested
     console.error(approverLogLine(approverPaneCallFailedMessage(ref, 'send-keys', describeAgentDirectorFailure(err))))
   }
   return undefined
@@ -5099,9 +5220,9 @@ async function replaceWithFreshSpawn(
   }
 
   try {
-    await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
+    const launched = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
     console.error(`[slack] spawnForPersona: fresh-spawned (after ${opts.kill ? 'kill+delete' : 'delete'}) for ${ref}`)
-    await approvePreSessionDialogs(key, isStartup, ref)
+    afterLaunchSucceeded(key, isStartup, ref, launched)
     return { key, action: 'spawned' }
   } catch (err) {
     if (!(err instanceof ErrTmuxSessionCreate)) return failed(err, 'fresh spawn after delete')
@@ -5109,7 +5230,7 @@ async function replaceWithFreshSpawn(
   try {
     const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
     console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
-    await approvePreSessionDialogs(key, isStartup, ref)
+    afterLaunchSucceeded(key, isStartup, ref, r)
     return { key, action: 'spawned' }
   } catch (err2) {
     return failed(err2, 'self-heal spawn after ErrTmuxSessionCreate')
@@ -5583,13 +5704,13 @@ async function resumeOrFreshSpawn(
   // resume_enabled: attempt resume
   console.error(`[slack] spawnForPersona: attempting resume for ${ref}`)
   try {
-    await launchWithReplyGuard(persona, ref, 'resume', (client) => client.resume({ claude_instance_id: personaInstanceId(key) }))
+    const launched = await launchWithReplyGuard(persona, ref, 'resume', (client) => client.resume({ claude_instance_id: personaInstanceId(key) }))
     console.error(`[slack] spawnForPersona: resumed ${ref}`)
     // A resumed bot faces the same startup dialogs as a fresh one. Its row
     // reads `pending` from the resume until its session reports in (HO C5),
     // so the approver clears the dialog through agent-director, as after a
     // spawn (b.jg5 SRJ-402).
-    await approvePreSessionDialogs(key, isStartup, ref)
+    afterLaunchSucceeded(key, isStartup, ref, launched)
     return { key, action: 'resumed' }
   } catch (err) {
     if (err instanceof ErrTmuxSessionCreate) {
@@ -5600,7 +5721,7 @@ async function resumeOrFreshSpawn(
       try {
         const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
         console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
-        await approvePreSessionDialogs(key, isStartup, ref)
+        afterLaunchSucceeded(key, isStartup, ref, r)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
@@ -5645,9 +5766,9 @@ async function resumeOrFreshSpawn(
       const deleteStop = await tryDelete(key, isStartup, ref, diagnosisRead.lastRead ?? lastRead)
       if (deleteStop) return deleteStop
       try {
-        await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
+        const launched = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: fresh-spawned (after delete) for ${ref}`)
-        await approvePreSessionDialogs(key, isStartup, ref)
+        afterLaunchSucceeded(key, isStartup, ref, launched)
         // A fresh-spawn that replaced a resume because the transcript was gone
         // is amnesia, not a clean spawn — surface it as its own action so the
         // startup summary does not count it as an ordinary "ok". b.fwu: split
@@ -5697,8 +5818,8 @@ async function resumeOrFreshSpawn(
       const deleteStop = await tryDelete(key, isStartup, ref, lastRead)
       if (deleteStop) return deleteStop
       try {
-        await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
-        await approvePreSessionDialogs(key, isStartup, ref)
+        const launched = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
+        afterLaunchSucceeded(key, isStartup, ref, launched)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
@@ -5719,9 +5840,9 @@ async function resumeOrFreshSpawn(
       // recovery into action: 'failed'. Mirrors the caller-level retry below.
       console.error(`[slack] spawnForPersona: ErrSpawnNotFound on resume for ${ref} — fresh-spawn`)
       try {
-        await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
+        const launched = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: fresh-spawned (after ErrSpawnNotFound on resume) for ${ref}`)
-        await approvePreSessionDialogs(key, isStartup, ref)
+        afterLaunchSucceeded(key, isStartup, ref, launched)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
@@ -5887,26 +6008,261 @@ function launchWithReplyGuard<T>(
 /**
  * In-flight launches by persona key (b.av2 SR-6.3): at most one ladder per
  * persona runs at a time. Holds only unsettled launches; an entry is removed
- * when its launch settles, whatever the outcome.
+ * when its launch settles, whatever the outcome. A launch's dialog approver
+ * is not part of it: it runs after the launch call returned, in the approver
+ * registry below (b.jg5 SRJ-401).
  */
 const inFlightLaunches = new Map<string, Promise<SpawnPersonaResult>>()
 
-/** Test-only seam: forget every in-flight launch (and, b.f2b, every cancel of a wait one had not started). */
+/**
+ * Test-only seam: forget every in-flight launch (and, b.f2b, every cancel of
+ * a wait one had not started), and stop and forget every dialog approver
+ * (`_resetDialogApprovers`), so none outlives a test.
+ */
 export function _resetInFlightLaunches(): void {
   inFlightLaunches.clear()
   cancelledLaunchWaits.clear()
+  _resetDialogApprovers()
 }
 
 /**
- * True while a launch (collision ladder) for persona `key` is in flight
+ * True while a launch call (collision ladder) for persona `key` is in flight
  * (b.av2 SR-6.6). The restart module's kill adapter consults this so a restart
  * that is about to join a running launch does not first kill the session that
  * launch is bringing up. The health check skips such a persona (b.f2b): a
  * start launch still waiting in the background for a `working` row owns its
- * session until it settles.
+ * session until it settles. The launch's dialog approver is not part of the
+ * launch in flight: this answers false while only the approver runs
+ * (b.jg5 SRJ-401; `isDialogApproverRunning` answers for it).
  */
 export function isLaunchInFlight(key: string): boolean {
   return inFlightLaunches.has(key)
+}
+
+// ---------------------------------------------------------------------------
+// The dialog approver registry (b.jg5 SRJ-401, SRJ-404)
+// ---------------------------------------------------------------------------
+
+/** One running approver in the registry: its state and the promise its stop resolves. */
+interface RegisteredApprover {
+  readonly run: ApproverRun
+  readonly ref: string
+  /** Resolves once the approver has stopped (after any call in progress returned); never rejects. */
+  readonly stopped: Promise<ApproverOutcome>
+}
+
+/**
+ * The running dialog approvers by persona key (b.jg5 SRJ-401; hatch A2): at
+ * most one per persona. An approver's entry is removed when it stops; an
+ * approver a later start superseded has already left the map then, and the
+ * later one waits for its stop before its first call.
+ */
+const runningApprovers = new Map<string, RegisteredApprover>()
+
+/**
+ * Keys whose launch in flight has not started its approver yet and whose
+ * approver was stopped meanwhile (`stopDialogApprover`), with the stop's
+ * reason: that launch's approver does not start. Forgotten when the launch
+ * settles, as `cancelledLaunchWaits` is.
+ */
+const cancelledComingApprovers = new Map<string, ApproverStopRequestReason>()
+
+/** Set by `stopAllDialogApprovers` (shutdown): no approver starts after it. Cleared only by the reset seam. */
+let approversClosed = false
+
+/**
+ * How each persona's latest stopped approver ended; one entry per key.
+ * Read by the await seam `_whenDialogApproverStopped`, which answers from it
+ * once no approver runs for the key.
+ */
+const lastApproverOutcomes = new Map<string, ApproverOutcome>()
+
+/**
+ * Ask `entry`'s approver to stop with `reason`: marks it (the first reason
+ * asked is kept) and wakes its sleep at once; a call in progress returns
+ * first, and the loop makes no further call. Logs one line when this ask
+ * is the first. Answers whether it was.
+ */
+function requestApproverStop(entry: RegisteredApprover, reason: ApproverStopRequestReason, log: boolean): boolean {
+  if (entry.run.stopRequested !== undefined) return false
+  entry.run.stopRequested = reason
+  if (log) console.error(approverLogLine(approverStopRequestedMessage(entry.ref, reason)))
+  entry.run.wake?.()
+  return true
+}
+
+/**
+ * Start persona `key`'s dialog approver on its own (b.jg5 SRJ-401): the
+ * approver's loop (`approvePreSessionDialogs`' rules) runs without being
+ * awaited, outside every launch or recovery attempt (`runOutsideAttempts`),
+ * so this returns at once, and the caller's launch call returns while the
+ * approver runs. Its UNAVAILABLE answers then arm no retry timer and start
+ * no `tmux-unresponsive` condition, its UNCLASSIFIED answers open no
+ * unclassified-error episode and arm nothing, and its ENVIRONMENT and CONFIG
+ * answers raise their outages and arm the persona's retry timer as from any
+ * verb (SRJ-301, SRJ-307, SRJ-311, SRJ-313, SRJ-316).
+ *
+ * The approver makes its first call only once the launch in flight for
+ * `key` when it starts (the launch whose success started it), if any, has
+ * settled, so it never runs while `isLaunchInFlight` answers for that
+ * launch. The registry holds at most one approver per persona (hatch A2): an
+ * approver still running for `key` is stopped first (`superseded`, one line),
+ * and the new one makes its first call only once that stop has completed.
+ * No approver starts when `key` was stopped while this launch was in flight
+ * (`stopDialogApprover`), or after `stopAllDialogApprovers`: one line, and
+ * the answer false. Otherwise answers true. A failure inside the loop is
+ * logged and the approver stops (`failed`); it never becomes an unhandled
+ * rejection. The entry is removed when the approver stops. Never throws.
+ */
+export function startDialogApprover(key: string, isStartup: boolean, ref: string = keyRef(key)): boolean {
+  const refusal = approversClosed ? APPROVER_STOP_SHUTDOWN : cancelledComingApprovers.get(key)
+  if (refusal !== undefined) {
+    console.error(approverLogLine(approverNotStartedMessage(ref, refusal)))
+    return false
+  }
+  const previous = runningApprovers.get(key)
+  if (previous !== undefined) requestApproverStop(previous, APPROVER_STOP_SUPERSEDED, true)
+  const run = newApproverRun()
+  let resolveStopped!: (outcome: ApproverOutcome) => void
+  const stopped = new Promise<ApproverOutcome>((resolve) => {
+    resolveStopped = resolve
+  })
+  const entry: RegisteredApprover = { run, ref, stopped }
+  runningApprovers.set(key, entry)
+  const launch = inFlightLaunches.get(key)
+  runOutsideAttempts(() => {
+    void runRegisteredApprover(key, isStartup, entry, launch, previous).then(resolveStopped)
+  })
+  return true
+}
+
+/**
+ * The registered approver's run: waits for `launch` to settle and
+ * `previous` to stop, runs the loop unless a stop came meanwhile, and
+ * removes its entry. Never rejects.
+ */
+async function runRegisteredApprover(
+  key: string,
+  isStartup: boolean,
+  entry: RegisteredApprover,
+  launch: Promise<unknown> | undefined,
+  previous: RegisteredApprover | undefined,
+): Promise<ApproverOutcome> {
+  let reason: ApproverStopReason
+  try {
+    // Always awaited, so the first call comes after the start entry returned.
+    await (launch ?? Promise.resolve()).then(
+      () => undefined,
+      () => undefined, // the launch's own caller handles its outcome
+    )
+    if (previous !== undefined) await previous.stopped
+    reason = entry.run.stopRequested ?? (await runApproverLoop(key, isStartup, entry.ref, entry.run))
+  } catch (err) {
+    console.error(approverLogLine(approverFailedMessage(entry.ref, describeThrownValue(err))))
+    reason = APPROVER_STOP_FAILED
+  }
+  const outcome: ApproverOutcome = { reason, launchStartMs: entry.run.launchStartMs }
+  if (runningApprovers.get(key) === entry) {
+    runningApprovers.delete(key)
+    lastApproverOutcomes.set(key, outcome)
+  }
+  return outcome
+}
+
+/**
+ * Stop persona `key`'s dialog approver with `reason` (b.jg5 SRJ-404), as
+ * `cancelWorkingRowWait` cancels a launch's wait. A running approver is
+ * marked and its sleep woken at once; it makes no call after the one in
+ * progress, if any, returns (no `send-keys` follows a stop), and resolves
+ * true once it has stopped, with one line logged when this stop was the
+ * first asked of it. While a launch for `key` is in flight, the approver that
+ * launch would start is cancelled too, from its start: it makes no call.
+ * Resolves false, silently, when no approver ran. Never rejects.
+ */
+export async function stopDialogApprover(key: string, reason: ApproverStopRequestReason): Promise<boolean> {
+  if (inFlightLaunches.has(key) && !cancelledComingApprovers.has(key)) cancelledComingApprovers.set(key, reason)
+  const entry = runningApprovers.get(key)
+  if (entry === undefined) return false
+  requestApproverStop(entry, reason, true)
+  await entry.stopped
+  return true
+}
+
+/**
+ * Stop every running dialog approver (`shutdown`, b.jg5 SRJ-404), and let no
+ * approver start after it. Every approver is marked and woken before this
+ * returns its promise, so none makes a further call once the call in
+ * progress returns; the promise resolves once all have stopped. Never rejects.
+ */
+export async function stopAllDialogApprovers(): Promise<void> {
+  approversClosed = true
+  const entries = [...runningApprovers.values()]
+  for (const entry of entries) requestApproverStop(entry, APPROVER_STOP_SHUTDOWN, true)
+  await Promise.all(entries.map((entry) => entry.stopped))
+}
+
+/**
+ * True while a dialog approver runs for persona `key` (b.jg5 SRJ-401): from
+ * its start until it has stopped, a stop asked but not yet completed
+ * included. Such an approver is in flight for the persona for the health
+ * tick and the lost-message routing, and never blocks a retry (SRJ-303).
+ */
+export function isDialogApproverRunning(key: string): boolean {
+  return runningApprovers.has(key)
+}
+
+/**
+ * The launch start (epoch ms) that persona `key`'s running approver kept:
+ * the one its first lap whose `status` read the row `pending` with a launch
+ * start read (b.jg5 SRJ-401, SRJ-412). Undefined when no approver runs or
+ * none has kept one yet. Read-only. That kept launch start is what decides
+ * whether a launch that returned success is CSCB's own (b.jg5 SRJ-412).
+ */
+export function dialogApproverLaunchStart(key: string): number | undefined {
+  return runningApprovers.get(key)?.run.launchStartMs
+}
+
+/**
+ * Test-only seam: resolves with how persona `key`'s latest approver ended:
+ * the running one's, once it has stopped; otherwise at once the last one's
+ * that stopped while it was the persona's latest (a superseded approver's
+ * outcome is not kept); `undefined` when there is none. Starts and stops
+ * nothing.
+ */
+export function _whenDialogApproverStopped(key: string): Promise<ApproverOutcome | undefined> {
+  return runningApprovers.get(key)?.stopped ?? Promise.resolve(lastApproverOutcomes.get(key))
+}
+
+/**
+ * Test-only seam: stop every running approver (marked and woken, silently;
+ * each makes no further call once its call in progress returns) and forget
+ * them all, with every cancel of a coming approver and the shutdown mark.
+ */
+export function _resetDialogApprovers(): void {
+  for (const entry of runningApprovers.values()) requestApproverStop(entry, APPROVER_STOP_SHUTDOWN, false)
+  runningApprovers.clear()
+  cancelledComingApprovers.clear()
+  lastApproverOutcomes.clear()
+  approversClosed = false
+}
+
+/**
+ * The one step after a launch call that returned success (b.jg5 SRJ-401):
+ * the plain spawn, the self-heal spawn, the retry spawn after the collision
+ * `get`'s `ErrSpawnNotFound`, the fresh spawn of a replacement, the
+ * `resume`, the amnesia spawn and the spawns after `resume`'s
+ * `ErrSpawnNotResumable` and `ErrSpawnNotFound`. It starts the persona's
+ * dialog approver (`startDialogApprover`) without awaiting it, so the
+ * ladder's result is returned as soon as the launch call returned.
+ * `launched` is that call's result. Never throws.
+ */
+function afterLaunchSucceeded(key: string, isStartup: boolean, ref: string, launched: SpawnResult | ResumeResult): void {
+  try {
+    startDialogApprover(key, isStartup, ref)
+  } catch (err) {
+    // Not reached: the start entry never throws.
+    console.error(approverLogLine(approverFailedMessage(ref, describeThrownValue(err))))
+  }
 }
 
 /**
@@ -5914,7 +6270,10 @@ export function isLaunchInFlight(key: string): boolean {
  * whatever its outcome; at once when none is. Never rejects and starts
  * nothing. For a teardown (b.av2 SR-6.6), which must not kill or delete the
  * row while a launch is still bringing it up; launches that run outside the
- * lifecycle serializer (the start pass) are covered too.
+ * lifecycle serializer (the start pass) are covered too. The launch's dialog
+ * approver is not waited for: a launch settles as its launch call returns,
+ * and the teardown stops the approver first (`stopDialogApprover`, b.jg5
+ * SRJ-404, SRJ-715).
  */
 export async function whenLaunchSettled(key: string): Promise<void> {
   const inFlight = inFlightLaunches.get(key)
@@ -5998,6 +6357,13 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    error armed it carries the refusal marker (`refused`). A joining call,
  *    the latched gate, the claude_config_dir deferral and dry run are no
  *    attempt.
+ * 8. Every spawn or resume above that returns success is followed by one
+ *    after-launch step (`afterLaunchSucceeded`), which starts the persona's
+ *    dialog approver in its own registry (`startDialogApprover`, b.jg5
+ *    SRJ-401) without awaiting it: the result is returned as soon as the
+ *    launch call returns, and the launch is no longer in flight
+ *    (`isLaunchInFlight`) while the approver runs. The approver runs outside
+ *    the launch attempt. No other branch, result or dry run starts one.
  *
  * `hooks` belong to the ladder this call starts; a call that joins a launch
  * already in flight gets none of them.
@@ -6059,8 +6425,10 @@ export async function spawnForPersona(
   } finally {
     if (inFlightLaunches.get(key) === launch) {
       inFlightLaunches.delete(key)
-      // b.f2b: a teardown's cancel of this launch's wait ends with it.
+      // b.f2b: a teardown's cancel of this launch's wait ends with it, and
+      // (b.jg5 SRJ-404) so does a stop of the approver it had not started.
       cancelledLaunchWaits.delete(key)
+      cancelledComingApprovers.delete(key)
     }
   }
 }
@@ -6116,7 +6484,7 @@ async function runPersonaLadder(
     replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
     const r = await withSpawnDetection(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
     console.error(`[slack] spawnForPersona: spawned ${ref} instanceId=${r.claude_instance_id}`)
-    await approvePreSessionDialogs(key, isStartup, ref)
+    afterLaunchSucceeded(key, isStartup, ref, r)
     return { key, action: 'spawned' }
   } catch (err) {
     if (err instanceof ErrInstanceIdCollision) {
@@ -6130,7 +6498,7 @@ async function runPersonaLadder(
       try {
         const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
         console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
-        await approvePreSessionDialogs(key, isStartup, ref)
+        afterLaunchSucceeded(key, isStartup, ref, r)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
@@ -6184,7 +6552,7 @@ async function runPersonaLadder(
       try {
         const r = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: retry-spawn succeeded for ${ref} instanceId=${r.claude_instance_id}`)
-        await approvePreSessionDialogs(key, isStartup, ref)
+        afterLaunchSucceeded(key, isStartup, ref, r)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
