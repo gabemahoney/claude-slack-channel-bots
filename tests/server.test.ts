@@ -952,14 +952,18 @@ describe('_buildIsSessionAliveAdapter', () => {
 
   // b.jg5 SRJ-312: no other `status` error shows agent-director read its
   // store, so none clears `ad-config-malformed`; each keeps its own reading.
+  // The only post is the onset of a class the error itself raises (never an
+  // all-clear).
+  /** The binary path the ErrSystemInstallDisappeared row names (its `ad-unreachable` onset carries it). */
+  const disappearedBinaryPath = '/home/horde/.agent-director/bin/agent-director'
   test.each([
-    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status'), LIVENESS_READING_DEAD],
-    ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'status'), LIVENESS_READING_UNKNOWN],
+    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status', disappearedBinaryPath), LIVENESS_READING_DEAD, [ONSET_TEMPLATES['ad-unreachable'](disappearedBinaryPath)]],
+    ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'status'), LIVENESS_READING_UNKNOWN, [ONSET_TEMPLATES['tmux-unavailable']()]],
     ...unavailableForms('ErrCallTimeout', 'ErrTmuxUnresponsive', 'ErrUnknownErrorName').map(
-      ([label, build]) => [`${label} (UNAVAILABLE)`, () => build('status'), LIVENESS_READING_UNKNOWN] as const,
+      ([label, build]) => [`${label} (UNAVAILABLE)`, () => build('status'), LIVENESS_READING_UNKNOWN, []] as const,
     ),
-    ['ErrInternal', () => errInternal(), LIVENESS_READING_UNKNOWN],
-  ] as ReadonlyArray<readonly [string, () => Error, LivenessReading]>)('b.jg5 SRJ-312: with ad-config-malformed raised, status throws %s → ad-config-malformed stays raised: no clear, no clear line, no all-clear; reads %j', async (_label, build, reading) => {
+    ['ErrInternal', () => errInternal(), LIVENESS_READING_UNKNOWN, []],
+  ] as ReadonlyArray<readonly [string, () => Error, LivenessReading, readonly string[]]>)('b.jg5 SRJ-312: with ad-config-malformed raised, status throws %s → ad-config-malformed stays raised: no clear, no clear line, no all-clear; reads %j; posts exactly %j', async (_label, build, reading, posts) => {
     const { emissions, cleared, adapter } = makeHarness(build())
     await raiseConfigOutage()
     const before = emissions.length
@@ -970,7 +974,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(getOutageFlags('C1').has('ad-config-malformed')).toBe(true)
     expect(cleared).toEqual([])
     expect(stringLines(errArgs).filter((l) => l.includes('ad-config-malformed cleared'))).toEqual([])
-    expect(emissions.slice(before).map((e) => e.text)).not.toContain(configAllClear())
+    expect(emissions.slice(before)).toEqual(posts.map((text) => ({ key: 'C1', text })))
   })
 
   // b.jg5 SRJ-314: every other `status` error reads `unknown`, never `dead`,
@@ -1643,52 +1647,33 @@ describe('_buildReconnectSessionAdapter', () => {
     assertNoLeak({ errArgs })
   })
 
-  // b.jg5 SRJ-105, SRJ-316: a CONFIG `send-keys` (at the first try, or at the
-  // retry after ErrTmuxSendKeys) is the same refusal: 'transient', never
-  // 'escalate-dead', no sweep, kill or launch and no spawn-failure notice.
-  // The outage wrapper raises `ad-config-malformed`.
-  test.each([
-    ['at the first try', 'send-keys', (err: Error) => ({ sendKeysThrows: err }), 1],
-    ['at the retry after ErrTmuxSendKeys', 'retry send-keys after ErrTmuxSendKeys', (err: Error) => ({ sendKeysErrors: [errTmuxSendKeys(), err] }), 2],
-  ] as const)("SRJ-105, SRJ-316: send-keys answers a CONFIG answer (ErrConfigMalformed) %s → 'transient', never 'escalate-dead'; no sweep, kill or launch, no spawn-failure notice; one described refusal line; ad-config-malformed raised; nothing leaks", async (_label, what, sendKeys, sends) => {
-    const err = errConfigMalformed('starting_session_seconds', sentinelInMessage('send-keys-config'))
-
-    const { result, errArgs, raised, sendKeysCalls, findMissingCalls, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({
-      statusState: 'waiting',
-      ...sendKeys(err),
-    })
-
-    expect(result).toBe('transient')
-    expect(sendKeysCalls).toHaveLength(sends)
-    expect(findMissingCalls).toHaveLength(0)
-    expect([killCalls, spawnCalls, resumeCalls]).toEqual([[], [], []])
-    expect(raised).toEqual([])
-    expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
-    const lines = stringLines(errArgs)
-    expect(lines.filter((l) => l.includes(' refused for persona=C1'))).toEqual([sendKeysRefusedLine(what, err)])
-    expect(lines.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
-    assertNoLeak({ errArgs })
-  })
-
-  // b.jg5 SRJ-105, SRJ-313, SRJ-113: an UNCLASSIFIED `send-keys` (an
-  // `ErrInternal`, a name CSCB gives no handling, or
+  // b.jg5 SRJ-105, SRJ-316, SRJ-313, SRJ-113: a CONFIG `send-keys`
+  // (ErrConfigMalformed, whose outage wrapper raises `ad-config-malformed`) or
+  // an UNCLASSIFIED one (an `ErrInternal`, a name CSCB gives no handling, or
   // `ErrSystemInstallDisappeared`, whose wrapper raises `ad-unreachable`), at
   // the first try or at the retry after ErrTmuxSendKeys, is the same refusal:
   // 'transient', never 'escalate-dead', no sweep, kill or launch and no
-  // spawn-failure notice; one described refusal line, nothing leaks.
-  const UNCLASSIFIED_SEND_KEYS_ERRORS: ReadonlyArray<readonly [string, () => Error]> = [
-    ['ErrInternal', () => errInternal(`the store could not be read (${sentinelInMessage('send-keys-internal')})`)],
-    ['a name CSCB gives no handling', () => errGeneric('send-keys', 'ErrSendKeysBroken', `the keystrokes broke (${sentinelInMessage('send-keys-generic')})`)],
-    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('send-keys')],
+  // spawn-failure notice; one described refusal line, nothing leaks. Each
+  // row raises exactly its expected outage flags.
+  /** [label, builder, the outage flags it leaves raised for C1]. */
+  const CONFIG_SEND_KEYS_ERROR: readonly [string, () => Error, readonly OutageClass[]] = [
+    'a CONFIG answer (ErrConfigMalformed)',
+    () => errConfigMalformed('starting_session_seconds', sentinelInMessage('send-keys-config')),
+    ['ad-config-malformed'],
+  ]
+  const UNCLASSIFIED_SEND_KEYS_ERRORS: ReadonlyArray<readonly [string, () => Error, readonly OutageClass[]]> = [
+    ['ErrInternal (UNCLASSIFIED)', () => errInternal(`the store could not be read (${sentinelInMessage('send-keys-internal')})`), []],
+    ['a name CSCB gives no handling (UNCLASSIFIED)', () => errGeneric('send-keys', 'ErrSendKeysBroken', `the keystrokes broke (${sentinelInMessage('send-keys-generic')})`), []],
+    ['ErrSystemInstallDisappeared (UNCLASSIFIED)', () => errSystemInstallDisappeared('send-keys'), ['ad-unreachable']],
   ]
   /** Where the keystrokes meet the error: the label, the refusal line's call, the harness options and the send-keys made. */
   const SEND_KEYS_POSITIONS = [
     ['at the first try', 'send-keys', (err: Error) => ({ sendKeysThrows: err }), 1],
     ['at the retry after ErrTmuxSendKeys', 'retry send-keys after ErrTmuxSendKeys', (err: Error) => ({ sendKeysErrors: [errTmuxSendKeys(), err] }), 2],
   ] as const
-  test.each(UNCLASSIFIED_SEND_KEYS_ERRORS.flatMap(([label, build]) =>
-    SEND_KEYS_POSITIONS.map(([where, what, sendKeys, sends]) => [label, where, what, sendKeys, sends, build] as const),
-  ))("b.jg5 SRJ-313: send-keys answers %s (UNCLASSIFIED) %s → 'transient', never 'escalate-dead'; no sweep, kill or launch, no spawn-failure notice; one described refusal line; nothing leaks", async (_label, _where, what, sendKeys, sends, build) => {
+  test.each([CONFIG_SEND_KEYS_ERROR, ...UNCLASSIFIED_SEND_KEYS_ERRORS].flatMap(([label, build, flags]) =>
+    SEND_KEYS_POSITIONS.map(([where, what, sendKeys, sends]) => [label, where, flags, what, sendKeys, sends, build] as const),
+  ))("b.jg5 SRJ-105, SRJ-316, SRJ-313: send-keys answers %s %s → 'transient', never 'escalate-dead'; no sweep, kill or launch, no spawn-failure notice; one described refusal line; outage flags exactly %j; nothing leaks", async (_label, _where, flags, what, sendKeys, sends, build) => {
     const err = build()
 
     const { result, errArgs, raised, sendKeysCalls, findMissingCalls, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({
@@ -1697,10 +1682,11 @@ describe('_buildReconnectSessionAdapter', () => {
     })
 
     expect(result).toBe('transient')
-    expect(sendKeysCalls).toHaveLength(sends)
+    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(Array(sends).fill(personaInstanceId('C1')))
     expect(findMissingCalls).toHaveLength(0)
     expect([killCalls, spawnCalls, resumeCalls]).toEqual([[], [], []])
     expect(raised).toEqual([])
+    expect([...getOutageFlags('C1')]).toEqual([...flags])
     const lines = stringLines(errArgs)
     expect(lines.filter((l) => l.includes(' refused for persona=C1'))).toEqual([sendKeysRefusedLine(what, err)])
     expect(lines.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])

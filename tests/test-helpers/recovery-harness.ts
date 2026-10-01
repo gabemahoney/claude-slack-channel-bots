@@ -213,7 +213,12 @@
  * lines: `conditionLinePrefix`, `conditionLines`, `conditionStartedLines`,
  * `conditionEndedLines` and the line builders `conditionOnsetLine`,
  * `conditionAlertLine`, `conditionEndedLine`, `conditionRecoveryLine` and
- * `conditionSilentEndLine`.
+ * `conditionSilentEndLine`; the unclassified-error episodes' log lines:
+ * `unclassifiedLinePrefix`, `unclassifiedLines`, `unclassifiedStartedLines`
+ * and the line builders `unclassifiedStartedLine`, `unclassifiedEndedLine`
+ * (for any end reason), `unclassifiedPostedLine` and
+ * `unclassifiedLoggedLine`; and `adConfigMalformedRaiseLines`, the outage
+ * state's `ad-config-malformed` raise lines.
  *
  * Pending-only mode is armed directly (`controller.armPendingOnly`) until
  * covered `pending` rows exist. Later work extends this harness in place.
@@ -237,13 +242,15 @@ import { adAlertThresholdMsInEffect, adSettingsInEffect, installAdSettings, rese
 import { _resetBackoffState, isAtCap } from '../../src/backoff.ts'
 import type { Persona, PersonaConfig } from '../../src/config.ts'
 import { LIVENESS_LIVE } from '../../src/liveness-reading.ts'
-import { _resetOutageState, clearOutageFlag, initOutageState } from '../../src/outage-state.ts'
+import { classifyAdError, describeAdErrorClassification } from '../../src/ad-error-class.ts'
+import { _resetOutageState, clearOutageFlag, initOutageState, type OutageClass } from '../../src/outage-state.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
 import {
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
   createUnclassifiedErrorEpisodes,
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
+  PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
   TMUX_UNRESPONSIVE_END_RETRY,
   TMUX_UNRESPONSIVE_END_TEXT,
@@ -253,6 +260,7 @@ import {
   type TmuxUnresponsiveCondition,
   type TmuxUnresponsiveEndReason,
   type TmuxUnresponsiveEndResult,
+  type UnclassifiedErrorEndReason,
 } from '../../src/persona-episodes.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
 import { createPersonaRelaunchGate } from '../../src/persona-start.ts'
@@ -981,4 +989,63 @@ export function conditionRecoveryLine(key: string): string {
 /** A silent end's line after an onset, after the ended line. */
 export function conditionSilentEndLine(key: string): string {
   return `${conditionLinePrefix(key)}recovery not posted — a silent end (a CONFLICT answer ended it)`
+}
+
+// The unclassified-error episodes' log lines (b.jg5 SRJ-313, SRJ-1009). As
+// above, the fixed words are held here; the kind, the startup-errors label and
+// the rendering of an outcome come from `src/`. Each outcome builder takes the
+// thrown value and renders it as the episodes do when the site gives no
+// classification of its own (`classifyAdError`).
+
+/** The prefix of every line persona `key`'s unclassified-error episode logs. */
+export function unclassifiedLinePrefix(key: string): string {
+  return `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR} `
+}
+
+/** Persona `key`'s unclassified-error lines, in order. */
+export function unclassifiedLines(h: RecoveryHarness, key: string): string[] {
+  return h.lines.filter((line) => line.startsWith(unclassifiedLinePrefix(key)))
+}
+
+/** Persona `key`'s unclassified-error started lines. */
+export function unclassifiedStartedLines(h: RecoveryHarness, key: string): string[] {
+  return unclassifiedLines(h, key).filter((line) => line.startsWith(`${unclassifiedLinePrefix(key)}started — `))
+}
+
+/** The rendering of the thrown value `err` an unclassified-error line quotes. */
+function unclassifiedQuote(err: unknown): string {
+  return describeAdErrorClassification(classifyAdError(err))
+}
+
+/** The started line of an episode whose first outcome is `err`. */
+export function unclassifiedStartedLine(key: string, err: unknown): string {
+  return `${unclassifiedLinePrefix(key)}started — ${unclassifiedQuote(err)}`
+}
+
+/** The ended line for `reason`. */
+export function unclassifiedEndedLine(key: string, reason: UnclassifiedErrorEndReason): string {
+  return `${unclassifiedLinePrefix(key)}ended — ${reason}`
+}
+
+/** What an alert line says of the outcome `err` met `elapsedMs` after the episode's first, over `thresholdMs`. */
+function unclassifiedMet(elapsedMs: number, thresholdMs: number, err: unknown): string {
+  return `an UNCLASSIFIED outcome met ${wholeSeconds(elapsedMs)} s after the episode's first, over its alert threshold of ${wholeSeconds(thresholdMs)} s: ${unclassifiedQuote(err)}`
+}
+
+/** The line of an alert posted to the persona's destination. */
+export function unclassifiedPostedLine(key: string, elapsedMs: number, thresholdMs: number, err: unknown): string {
+  return `${unclassifiedLinePrefix(key)}alert posted to its destination — ${unclassifiedMet(elapsedMs, thresholdMs, err)}`
+}
+
+/** The line of an alert for a persona not in the applied configuration, written only to the logs. */
+export function unclassifiedLoggedLine(key: string, elapsedMs: number, thresholdMs: number, err: unknown): string {
+  return `${unclassifiedLinePrefix(key)}alert written to the server log and startup-errors.log (${PERSONA_UNCLASSIFIED_ERROR_LABEL}) — the persona is not in the applied configuration; ${unclassifiedMet(elapsedMs, thresholdMs, err)}`
+}
+
+/** The outage class a CONFIG answer raises (b.jg5 SRJ-316). */
+const AD_CONFIG_MALFORMED_CLASS: OutageClass = 'ad-config-malformed'
+
+/** The outage state's raise lines for persona `key`'s `ad-config-malformed` outage (one per raise), in `errors`. */
+export function adConfigMalformedRaiseLines(h: RecoveryHarness, key: string): string[] {
+  return h.errors.filter((line) => line.startsWith(`[slack] outage-state: ${AD_CONFIG_MALFORMED_CLASS} raised for persona=${key}: `))
 }

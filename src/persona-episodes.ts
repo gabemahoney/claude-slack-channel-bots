@@ -177,13 +177,21 @@
  *   `PERSONA_UNCLASSIFIED_ERROR_LABEL`, the key and the unescaped text), and
  *   nothing reaches Slack. Either way it counts as posted.
  * - `end(key, reason)` ends the episode silently: `retryStopped(key, stop)`,
- *   bound in `main()` to every stop of the retry timer, ends it only for
- *   `UNAVAILABLE_RETRY_STOP_RECOVERED` (`UNCLASSIFIED_ERROR_END_RECOVERED`)
- *   and `UNAVAILABLE_RETRY_STOP_ROW_LIVE` (`UNCLASSIFIED_ERROR_END_ROW_LIVE`:
- *   a pending-only retry read the row live out of `pending`, so a launch the
- *   retries made succeeded and no retry follows); every other stop (not up,
- *   not applied, launch skipped, row gone and the rest) leaves it open.
- *   `main()` ends it at the restart cap.
+ *   bound in `main()` to every stop of the retry timer, ends it for the stops
+ *   that mean the retries are over because the persona's state got better:
+ *   `UNAVAILABLE_RETRY_STOP_RECOVERED` (`UNCLASSIFIED_ERROR_END_RECOVERED`),
+ *   `UNAVAILABLE_RETRY_STOP_ROW_LIVE` (`UNCLASSIFIED_ERROR_END_ROW_LIVE`: a
+ *   pending-only retry read the row live out of `pending`, so a launch the
+ *   retries made succeeded and no retry follows),
+ *   `UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED` and
+ *   `UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED`
+ *   (`UNCLASSIFIED_ERROR_END_CONDITION_ENDED`: the timer's tmux condition
+ *   ended and no retry follows) and `UNAVAILABLE_RETRY_STOP_ROW_GONE`
+ *   (`UNCLASSIFIED_ERROR_END_ROW_GONE`: a pending-only retry read the row
+ *   ended or missing, or found none, and handed the persona to the restart
+ *   path's decision). Every other stop (not up, not applied, launch skipped,
+ *   run failed and the rest) leaves it open: `main()` ends it at the restart
+ *   cap, and a teardown or shutdown drops it through `forget` or `close`.
  *   A later report begins a new episode, whose alert is posted again. The
  *   episodes' `forget(key)` (a teardown), `forgetAll()` and `close()` drop it
  *   silently with nothing left pending.
@@ -243,7 +251,10 @@ import { personaTmuxSessionName } from './persona-identity.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 import {
   UNAVAILABLE_RETRY_STOP_RECOVERED,
+  UNAVAILABLE_RETRY_STOP_ROW_GONE,
   UNAVAILABLE_RETRY_STOP_ROW_LIVE,
+  UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED,
+  UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED,
   UNAVAILABLE_RETRY_TERMINAL_STOPS,
 } from './unavailable-retry.ts'
 
@@ -1070,6 +1081,20 @@ export const UNCLASSIFIED_ERROR_END_RECOVERED = 'a retry found nothing left to r
  */
 export const UNCLASSIFIED_ERROR_END_ROW_LIVE = 'a retry read its row live out of pending'
 
+/**
+ * End reason: the persona's retry timer stopped because its `tmux-unavailable`
+ * condition cleared or its `tmux-unresponsive` condition ended (b.jg5
+ * SRJ-313): no retry follows.
+ */
+export const UNCLASSIFIED_ERROR_END_CONDITION_ENDED = 'its retry timer stopped when its tmux condition ended'
+
+/**
+ * End reason: a pending-only retry of the persona's timer read its row ended
+ * or missing, or found none (b.jg5 SRJ-313): the retries are over and the
+ * restart path's decision runs once.
+ */
+export const UNCLASSIFIED_ERROR_END_ROW_GONE = 'a retry read its row ended or gone'
+
 /** End reason: the persona reached the restart cap (b.jg5 SRJ-313). */
 export const UNCLASSIFIED_ERROR_END_CAPPED = 'the persona reached the restart cap'
 
@@ -1077,6 +1102,8 @@ export const UNCLASSIFIED_ERROR_END_CAPPED = 'the persona reached the restart ca
 export type UnclassifiedErrorEndReason =
   | typeof UNCLASSIFIED_ERROR_END_RECOVERED
   | typeof UNCLASSIFIED_ERROR_END_ROW_LIVE
+  | typeof UNCLASSIFIED_ERROR_END_CONDITION_ENDED
+  | typeof UNCLASSIFIED_ERROR_END_ROW_GONE
   | typeof UNCLASSIFIED_ERROR_END_CAPPED
 
 /** What the alert quotes: the classifier's reported name (a safe identifier) and rendered message. */
@@ -1184,13 +1211,22 @@ export interface UnclassifiedErrorEpisodes extends UnclassifiedErrorSink {
   /** End persona `key`'s open episode silently, with one ended line naming `reason`. Answers whether one was open. */
   end(key: string, reason: UnclassifiedErrorEndReason): boolean
   /**
-   * A stop of persona `key`'s retry timer (`UnavailableRetryDeps.onStopped`):
-   * `UNAVAILABLE_RETRY_STOP_RECOVERED` (a retry found nothing left to
-   * recover) ends the episode (`UNCLASSIFIED_ERROR_END_RECOVERED`), and
+   * A stop of persona `key`'s retry timer (`UnavailableRetryDeps.onStopped`).
+   * The stops that mean the retries are over because the persona's state got
+   * better end the episode: `UNAVAILABLE_RETRY_STOP_RECOVERED` (a retry found
+   * nothing left to recover; `UNCLASSIFIED_ERROR_END_RECOVERED`),
    * `UNAVAILABLE_RETRY_STOP_ROW_LIVE` (a pending-only retry read the row live
-   * out of `pending`; no retry follows) ends it
-   * (`UNCLASSIFIED_ERROR_END_ROW_LIVE`); every other stop reason leaves it
-   * open. Answers whether it ended one.
+   * out of `pending`; `UNCLASSIFIED_ERROR_END_ROW_LIVE`),
+   * `UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED` and
+   * `UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED` (the timer's tmux
+   * condition ended; `UNCLASSIFIED_ERROR_END_CONDITION_ENDED`) and
+   * `UNAVAILABLE_RETRY_STOP_ROW_GONE` (a pending-only retry read the row
+   * ended or missing, or found none; `UNCLASSIFIED_ERROR_END_ROW_GONE`). No
+   * retry follows any of them. Every other stop reason (not up, not applied,
+   * launch skipped, run failed, torn down, shutdown, capped, a caller's own
+   * text) leaves it open: the cap ends it through `end`, a teardown or
+   * shutdown drops it through the episodes' `forget` or `close`. Answers
+   * whether it ended one.
    */
   retryStopped(key: string, stopReason: string): boolean
   /** Whether persona `key`'s episode is open. */
@@ -1293,6 +1329,13 @@ export function createUnclassifiedErrorEpisodes(deps: UnclassifiedErrorEpisodesD
     retryStopped(key, stopReason) {
       if (stopReason === UNAVAILABLE_RETRY_STOP_RECOVERED) return end(key, UNCLASSIFIED_ERROR_END_RECOVERED)
       if (stopReason === UNAVAILABLE_RETRY_STOP_ROW_LIVE) return end(key, UNCLASSIFIED_ERROR_END_ROW_LIVE)
+      if (
+        stopReason === UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED ||
+        stopReason === UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED
+      ) {
+        return end(key, UNCLASSIFIED_ERROR_END_CONDITION_ENDED)
+      }
+      if (stopReason === UNAVAILABLE_RETRY_STOP_ROW_GONE) return end(key, UNCLASSIFIED_ERROR_END_ROW_GONE)
       return false
     },
 

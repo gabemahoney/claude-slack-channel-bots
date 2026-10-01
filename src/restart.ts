@@ -19,13 +19,17 @@
  * restart cap: a timer fired for a persona already at the cap re-attempts the
  * launch (a success resets the cap; a further failure is counted).
  * The work runs as a recovery attempt for the persona (b.jg5 SRJ-301,
- * `runInAttempt`), adapters included: an UNAVAILABLE or ENVIRONMENT outcome
- * from any of its agent-director calls (the liveness read, the reconnect with
- * its reads, the kill, the relaunch), or a `status`, `get` or `list` error,
- * arms the persona's UNAVAILABLE retry timer through the installed trigger
- * sink. A relaunch the timer now owns answers `'refused'`, which is never
- * counted toward the cap (SRJ-302): a persona is never given up on for
- * UNAVAILABLE or ENVIRONMENT alone.
+ * `runInAttempt`), adapters included: an UNAVAILABLE, ENVIRONMENT or CONFIG
+ * (`ErrConfigMalformed`, SRJ-316) outcome from any of its agent-director
+ * calls (the liveness read, the reconnect with its reads, the kill, the
+ * relaunch), an UNCLASSIFIED one (SRJ-313, `ErrSystemInstallDisappeared`
+ * included) from any of them but a `status`, `get` or `list`, or any other
+ * `status`, `get` or `list` error, arms the persona's UNAVAILABLE retry timer
+ * through the installed trigger sink. A kill that meets UNAVAILABLE,
+ * ENVIRONMENT, CONFIG or UNCLASSIFIED is refused, and a relaunch the timer
+ * now owns answers `'refused'`; neither is ever counted toward the cap
+ * (SRJ-302): a persona is never given up on for UNAVAILABLE, ENVIRONMENT,
+ * CONFIG or UNCLASSIFIED alone.
  * The liveness probe answers one of four readings (b.jg5 SRJ-314,
  * `src/liveness-reading.ts`), and only `dead` leads to the kill and the
  * launch. `live` takes the reconnect path. `pending` (the row's session has
@@ -243,8 +247,10 @@ export interface RestartDeps {
   /**
    * Kill the persona's instance before its launch. `KILL_SESSION_REFUSED`:
    * the kill met an UNAVAILABLE outcome (b.jg5 SRJ-105, `ErrTmuxKillFailed`
-   * included) or an ENVIRONMENT one (`ErrTmuxNotAvailable`), so the work
-   * launches nothing, records no success or failure and answers
+   * included), an ENVIRONMENT one (`ErrTmuxNotAvailable`, SRJ-311), a CONFIG
+   * one (`ErrConfigMalformed`, SRJ-316) or an UNCLASSIFIED one (SRJ-313,
+   * `ErrSystemInstallDisappeared` included), so the work launches nothing,
+   * records no success or failure and answers
    * `RESTART_OUTCOME_REFUSED`. Anything else, `undefined`
    * included, and a kill that throws, means go on to the launch.
    */
@@ -654,8 +660,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   } catch { /* ignore */ }
 
   if (killed === KILL_SESSION_REFUSED) {
-    // b.jg5 SRJ-105: agent-director refused the kill (UNAVAILABLE or
-    // ENVIRONMENT), so no launch follows it. Nothing is counted: the failure
+    // b.jg5 SRJ-105: agent-director refused the kill (UNAVAILABLE,
+    // ENVIRONMENT, CONFIG (`ErrConfigMalformed`, SRJ-316) or UNCLASSIFIED
+    // (SRJ-313, `ErrSystemInstallDisappeared` included)), so no launch
+    // follows it. Nothing is counted: the failure
     // counter, backoff and cap latch are left exactly as they were, and the
     // refusal is answered as the launch's is (SRJ-302).
     console.error(`[slack] Session kill refused for persona=${key} — no relaunch; not counted`)

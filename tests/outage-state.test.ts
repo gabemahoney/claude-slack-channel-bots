@@ -1577,6 +1577,12 @@ type WrapRow = [wrapName: string, callName: string, wrap: AnyWrap, call: AdCall]
 function wrapRows(calls: readonly AdCall[]): WrapRow[] {
   return WRAPPERS.flatMap(([name, wrap]) => calls.map((call): WrapRow => [name, declaredName(call), wrap, call]))
 }
+/** Every declared call through withOutageDetection, and the launch calls through withSpawnDetection. */
+const EVERY_WRAPPED_ROW: readonly WrapRow[] = [
+  ...EVERY_DECLARED_CALL.map((call): WrapRow => ['withOutageDetection', declaredName(call), withOutageDetection, call]),
+  ['withSpawnDetection', 'spawn', withSpawnDetection, 'spawn'],
+  ['withSpawnDetection', 'resume', withSpawnDetection, 'resume'],
+]
 
 /** Run `call` for `key` through `wrap` with an `fn` that throws `err`; answer what it rejected with (it must reject). */
 async function rejectionFrom(wrap: AnyWrap, key: string, call: AdCall, err: unknown): Promise<unknown> {
@@ -1727,14 +1733,7 @@ describe('ENVIRONMENT is reported (b.jg5 SRJ-301, SRJ-311): from any verb for P,
     ['the different-server form', (verb) => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, verb), tmuxServerChangedOnset],
   ]
 
-  /** Every declared call through withOutageDetection, and the launch calls through withSpawnDetection. */
-  const ENVIRONMENT_ROWS: WrapRow[] = [
-    ...EVERY_DECLARED_CALL.map((call): WrapRow => ['withOutageDetection', declaredName(call), withOutageDetection, call]),
-    ['withSpawnDetection', 'spawn', withSpawnDetection, 'spawn'],
-    ['withSpawnDetection', 'resume', withSpawnDetection, 'resume'],
-  ]
-
-  test.each(ENVIRONMENT_ROWS)('%s, %s: each form, in each context, raises P\'s tmux-unavailable with one onset and reports the ENVIRONMENT cause once for P; B gets nothing; rethrown unchanged; no condition start', async (_w, _c, wrap, call) => {
+  test.each(EVERY_WRAPPED_ROW)('%s, %s: each form, in each context, raises P\'s tmux-unavailable with one onset and reports the ENVIRONMENT cause once for P; B gets nothing; rethrown unchanged; no condition start', async (_w, _c, wrap, call) => {
     const verb = adCallVerb(call)!
     for (const [form, build, onset] of ENVIRONMENT_FORMS) {
       for (const context of CONTEXTS) {
@@ -2482,14 +2481,7 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
     expect(EVERY_DECLARED_CALL.map(adCallVerb)).not.toContain('help')
   })
 
-  /** Every declared call through withOutageDetection, and the launch calls through withSpawnDetection. */
-  const CONFIG_ROWS: WrapRow[] = [
-    ...EVERY_DECLARED_CALL.map((call): WrapRow => ['withOutageDetection', declaredName(call), withOutageDetection, call]),
-    ['withSpawnDetection', 'spawn', withSpawnDetection, 'spawn'],
-    ['withSpawnDetection', 'resume', withSpawnDetection, 'resume'],
-  ]
-
-  test.each(CONFIG_ROWS)('%s, %s: CONFIG, in each context, reports the CONFIG cause once for P and raises P\'s flag with one onset; B gets nothing; no condition start', async (_w, _c, wrap, call) => {
+  test.each(EVERY_WRAPPED_ROW)('%s, %s: CONFIG, in each context, reports the CONFIG cause once for P and raises P\'s flag with one onset; B gets nothing; no condition start', async (_w, _c, wrap, call) => {
     const verb = adCallVerb(call)!
     for (const context of CONTEXTS) {
       const err = errConfigMalformed()
@@ -2671,14 +2663,7 @@ describe('UNCLASSIFIED is reported to the unclassified sink in P\'s attempt only
   /** The read calls, which keep E8's read-error cause; every other declared call arms the UNCLASSIFIED cause. */
   const READ_CALLS: readonly AdCall[] = ['status', 'get', 'list']
 
-  /** Every declared call through withOutageDetection, and the launch calls through withSpawnDetection. */
-  const UNCLASSIFIED_ROWS: WrapRow[] = [
-    ...EVERY_DECLARED_CALL.map((call): WrapRow => ['withOutageDetection', declaredName(call), withOutageDetection, call]),
-    ['withSpawnDetection', 'spawn', withSpawnDetection, 'spawn'],
-    ['withSpawnDetection', 'resume', withSpawnDetection, 'resume'],
-  ]
-
-  test.each(UNCLASSIFIED_ROWS)('%s, %s: each form inside P\'s attempt is reported once for P with the same value and arms once; inside Q\'s attempt or outside any, nothing; no flag raised (but ad-unreachable) or cleared; no condition start or end; rethrown unchanged', async (_w, _c, wrap, call) => {
+  test.each(EVERY_WRAPPED_ROW)('%s, %s: each form inside P\'s attempt is reported once for P with the same value and arms once; inside Q\'s attempt or outside any, nothing; no flag raised (but ad-unreachable) or cleared; no condition start or end; rethrown unchanged', async (_w, _c, wrap, call) => {
     const verb = adCallVerb(call)!
     const kind = READ_CALLS.includes(call) ? UNAVAILABLE_RETRY_CAUSE_READ_ERROR : UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED
     for (const [form, build, raises] of UNCLASSIFIED_FORMS) {
@@ -2849,6 +2834,10 @@ describe('the stable class order (b.jg5 SRJ-1018)', () => {
     expect<string[]>([...OUTAGE_CLASS_ORDER].sort()).toEqual(Object.keys(ONSET_TEMPLATES).sort())
     expect(new Set(OUTAGE_CLASS_ORDER).size).toBe(OUTAGE_CLASS_ORDER.length)
     expect(Object.isFrozen(OUTAGE_CLASS_ORDER)).toBe(true)
+  })
+
+  test('the order is ad-unreachable, cwd-unreachable, tmux-unavailable, then ad-config-malformed', () => {
+    expect<readonly string[]>(OUTAGE_CLASS_ORDER).toEqual(['ad-unreachable', 'cwd-unreachable', 'tmux-unavailable', 'ad-config-malformed'])
   })
 
   test.each([

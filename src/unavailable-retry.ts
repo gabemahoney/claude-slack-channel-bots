@@ -90,9 +90,13 @@
  *   the timer, since both say CSCB keeps retrying, and a later refusal
  *   allows the onset and arms the check again unless the reason is one of
  *   `UNAVAILABLE_RETRY_TERMINAL_STOPS`; b.jg5 SRJ-313: the persona's
- *   unclassified-error episode ends on `UNAVAILABLE_RETRY_STOP_RECOVERED`
- *   and `UNAVAILABLE_RETRY_STOP_ROW_LIVE` only). It reads nothing back and
- *   changes nothing here.
+ *   unclassified-error episode ends on the stops that mean the retries are
+ *   over because the persona's state got better:
+ *   `UNAVAILABLE_RETRY_STOP_RECOVERED`, `UNAVAILABLE_RETRY_STOP_ROW_LIVE`,
+ *   `UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED`,
+ *   `UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED` and
+ *   `UNAVAILABLE_RETRY_STOP_ROW_GONE`, and on no other). It reads nothing
+ *   back and changes nothing here.
  * - `view(key)`, `isArmed(key)` and `armedKeys()` are read-only queries;
  *   `whenRunSettled(key)` awaits the persona's in-flight run, with its re-arm
  *   or stop, and a stop's hand-off.
@@ -618,8 +622,12 @@ export interface UnavailableRetryDeps {
    * the `tmux-unresponsive` condition's `cancelAlert` (which holds the
    * condition's onset back and cancels its pending alert check), then the
    * unclassified-error episodes' `retryStopped` (b.jg5 SRJ-313), which ends
-   * the persona's episode only for `UNAVAILABLE_RETRY_STOP_RECOVERED` and
-   * `UNAVAILABLE_RETRY_STOP_ROW_LIVE`. Each
+   * the persona's episode only for the stops that mean the retries are over
+   * because the persona's state got better (`UNAVAILABLE_RETRY_STOP_RECOVERED`,
+   * `UNAVAILABLE_RETRY_STOP_ROW_LIVE`,
+   * `UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED`,
+   * `UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED` and
+   * `UNAVAILABLE_RETRY_STOP_ROW_GONE`). Each
    * reason is one of the `UNAVAILABLE_RETRY_STOP_*` constants (or the text a
    * `stop`, `stopAll` or `close` caller gives), so a consumer tells them
    * apart by equality. Not called for a no-op stop, a first arm that failed

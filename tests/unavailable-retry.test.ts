@@ -89,7 +89,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { classifyAdError, describeAdErrorClassification } from '../src/ad-error-class.ts'
+import { classifyAdError } from '../src/ad-error-class.ts'
 import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
 import { ERR_SCHEMA_MISMATCH_NAME, ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
@@ -111,7 +111,6 @@ import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src
 import { MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
 import {
-  PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
   TMUX_UNRESPONSIVE_END_RETRY,
   TMUX_UNRESPONSIVE_END_TICK,
@@ -121,10 +120,12 @@ import {
   tmuxUnresponsiveOnsetText,
   tmuxUnresponsiveRecoveryText,
   UNCLASSIFIED_ERROR_END_CAPPED,
+  UNCLASSIFIED_ERROR_END_CONDITION_ENDED,
   UNCLASSIFIED_ERROR_END_RECOVERED,
   UNCLASSIFIED_ERROR_END_ROW_LIVE,
   unclassifiedErrorAlertText,
   type TmuxUnresponsiveEndReason,
+  type UnclassifiedErrorEndReason,
 } from '../src/persona-episodes.ts'
 import {
   _resetRestartState,
@@ -260,9 +261,15 @@ import {
   conditionLinePrefix,
   conditionLines,
   conditionRecoveryLine,
+  adConfigMalformedRaiseLines,
   makeRecoveryHarness,
   personaOf,
   retryNow,
+  unclassifiedEndedLine,
+  unclassifiedLines,
+  unclassifiedLoggedLine,
+  unclassifiedPostedLine,
+  unclassifiedStartedLine,
   type RecoveryAttempt,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
@@ -4984,11 +4991,6 @@ async function configLaunch(h: RecoveryHarness, key: string, err: Error): Promis
   return armedAt
 }
 
-/** The outage state's raise lines for persona `key`'s `ad-config-malformed` (one per episode). */
-function configRaisedLines(h: RecoveryHarness, key: string): string[] {
-  return h.errors.filter((line) => line.startsWith(`[slack] outage-state: ${AD_CONFIG_MALFORMED} raised for persona=${key}: `))
-}
-
 /**
  * No action was taken for persona `key` because of CONFIG: no kill or delete
  * call, nothing counted and no cap reached, no spawn-failure notice, no
@@ -5056,7 +5058,7 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_CONFIG)
     expect(callCounts(h)).toEqual({ spawnCalls: 1 })
     expect([...getOutageFlags(key)]).toEqual([AD_CONFIG_MALFORMED])
-    expect(configRaisedLines(h, key)).toHaveLength(1)
+    expect(adConfigMalformedRaiseLines(h, key)).toHaveLength(1)
     expectNoActionTaken(h, key)
     expectUntouched(h, other)
   })
@@ -5106,7 +5108,7 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([dueAt])
     expect(h.triggers).toEqual([1, 2, 3].map(() => ({ key, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG })))
     expect(h.outageNotices).toEqual([configOnset(key, err)])
-    expect(configRaisedLines(h, key)).toHaveLength(1)
+    expect(adConfigMalformedRaiseLines(h, key)).toHaveLength(1)
     expect(h.attempts).toEqual([])
 
     await h.advance(1)
@@ -5130,7 +5132,7 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
     let dueAt = await retriesRefusedByConfig(h, key, armedAt, retries)
 
     expect(h.outageNotices).toEqual([configOnset(key, config.err)])
-    expect(configRaisedLines(h, key)).toHaveLength(1)
+    expect(adConfigMalformedRaiseLines(h, key)).toHaveLength(1)
     expect(h.triggers.every((t) => t.key === key && t.kind === UNAVAILABLE_RETRY_CAUSE_CONFIG)).toBe(true)
     expect(h.stub.calls.spawnCalls).toEqual([])
     expect(h.stub.calls.resumeCalls).toEqual([])
@@ -5170,7 +5172,7 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
     expect(h.stub.calls.spawnCalls).toHaveLength(1)
     expect(h.stub.calls.resumeCalls).toEqual([])
     expect(h.outageNotices).toEqual([configOnset(key, config.err)])
-    expect(configRaisedLines(h, key)).toHaveLength(1)
+    expect(adConfigMalformedRaiseLines(h, key)).toHaveLength(1)
     expectNoActionTaken(h, key)
     expectUntouched(h, other)
 
@@ -5264,41 +5266,6 @@ const UNCLASSIFIED_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Err
   ['an error name CSCB gives no handling', (verb) => errGeneric(verb, 'ErrKillBroken', 'the kill is broken')],
   ['ErrSchemaMismatch (a store that cannot be opened)', () => errSchemaMismatch()],
 ]
-
-/** The prefix of every line persona `key`'s unclassified-error episode logs. */
-function unclassifiedPrefix(key: string): string {
-  return `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR} `
-}
-
-/** Persona `key`'s unclassified-error lines, in order. */
-function unclassifiedLines(h: RecoveryHarness, key: string): string[] {
-  return h.lines.filter((line) => line.startsWith(unclassifiedPrefix(key)))
-}
-
-/** The started line of an episode whose first outcome is `err`. */
-function unclassifiedStartedLine(key: string, err: unknown): string {
-  return `${unclassifiedPrefix(key)}started — ${describeAdErrorClassification(classifyAdError(err))}`
-}
-
-/** The ended line for `reason`. */
-function unclassifiedEndedLine(key: string, reason: string): string {
-  return `${unclassifiedPrefix(key)}ended — ${reason}`
-}
-
-/** What an alert line says of the outcome `err` met `elapsedMs` after the episode's first, over `thresholdMs`. */
-function unclassifiedMet(elapsedMs: number, thresholdMs: number, err: unknown): string {
-  return `an UNCLASSIFIED outcome met ${Math.floor(elapsedMs / 1000)} s after the episode's first, over its alert threshold of ${Math.floor(thresholdMs / 1000)} s: ${describeAdErrorClassification(classifyAdError(err))}`
-}
-
-/** The line of an alert posted to the persona's destination. */
-function unclassifiedPostedLine(key: string, elapsedMs: number, thresholdMs: number, err: unknown): string {
-  return `${unclassifiedPrefix(key)}alert posted to its destination — ${unclassifiedMet(elapsedMs, thresholdMs, err)}`
-}
-
-/** The line of an alert for a persona not in the applied configuration, written only to the logs. */
-function unclassifiedLoggedLine(key: string, elapsedMs: number, thresholdMs: number, err: unknown): string {
-  return `${unclassifiedPrefix(key)}alert written to the server log and startup-errors.log (${PERSONA_UNCLASSIFIED_ERROR_LABEL}) — the persona is not in the applied configuration; ${unclassifiedMet(elapsedMs, thresholdMs, err)}`
-}
 
 /** The alert for persona `key` quoting the outcome `err`, as the notice episodes post it. */
 function unclassifiedAlert(key: string, err: unknown): { key: string; text: string } {
@@ -5517,14 +5484,6 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
     expectUntouchedEpisode(h, other)
   })
 
-  test('AC 80’s threshold is below the defaults’, so its alert comes at an earlier retry: the alert time follows the settings in effect, not a fixed time', () => {
-    const ac80 = adAlertThresholdMs({ ...DEFAULT_AD_SETTINGS_IN_EFFECT, tmux: { ...DEFAULT_AD_SETTINGS_IN_EFFECT.tmux, ...AC_80_TMUX } })
-    const defaults = adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
-
-    expect(ac80).toBeLessThan(defaults)
-    expect(alertRetry(0, ac80).retry).toBeLessThan(alertRetry(0, defaults).retry)
-  })
-
   test('an UNCLASSIFIED answer to the collision get inside a launch opens the episode and arms with the read-error cause; one inside a later launch before the threshold continues it with no new line or alert', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
@@ -5734,6 +5693,14 @@ describe('unavailable retry: the unclassified-error episode’s ends and the sto
       h.setConnected(key, true)
       await retryNow(h, key)
     }, UNAVAILABLE_RETRY_STOP_RECOVERED, false],
+    // A read-pane outside every attempt raises tmux-unavailable; the health
+    // tick's healthy-branch clear then ends the condition and stops the timer.
+    ['the tmux-unavailable condition clearing', async (h, key) => {
+      h.script({ readPaneError: errTmuxNotAvailable(undefined, 'read-pane') })
+      await expect(readPaneSucceeds(h, key)).rejects.toThrow()
+      expect([...getOutageFlags(key)]).toEqual(['tmux-unavailable'])
+      tickClear(key)
+    }, UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED, false],
     // The cap's end of the episode is onCapReached's (the case above); the stop alone leaves it.
     ['the restart cap', async (h, key) => {
       for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(key)
@@ -5763,7 +5730,11 @@ describe('unavailable retry: the unclassified-error episode’s ends and the sto
     expect(h.stops).toEqual([{ key, reason }])
     expectStopped(h, key)
     expect(h.unclassifiedErrorOpen(key)).toBe(openAfter)
-    const ended = reason === UNAVAILABLE_RETRY_STOP_RECOVERED ? [unclassifiedEndedLine(key, UNCLASSIFIED_ERROR_END_RECOVERED)] : []
+    const endedBy: Record<string, UnclassifiedErrorEndReason> = {
+      [UNAVAILABLE_RETRY_STOP_RECOVERED]: UNCLASSIFIED_ERROR_END_RECOVERED,
+      [UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED]: UNCLASSIFIED_ERROR_END_CONDITION_ENDED,
+    }
+    const ended = endedBy[reason] !== undefined ? [unclassifiedEndedLine(key, endedBy[reason])] : []
     expect(unclassifiedLines(h, key)).toEqual([unclassifiedStartedLine(key, err), ...ended])
     expect(h.episodeNotices).toEqual([])
     expectUntouchedEpisode(h, other)

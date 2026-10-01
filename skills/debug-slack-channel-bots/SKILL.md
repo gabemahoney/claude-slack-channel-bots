@@ -1213,7 +1213,7 @@ notices, each naming the persona's session (`"slack_bot_<key>"`):
 
 | Notice | When it is posted | What it means | What to do |
 |---|---|---|---|
-| *Not answering* | At the next health check after the first refusal, if the session still isn't answering after that check. With `health_check_interval` `0`, at the first retry at least 2 minutes after the first refusal (a retry skipped because a launch was running counts). A single refusal that clears before then posts nothing. Never posted once *Still not answering* has been posted for the episode. Only while the server is retrying: not posted while the persona's retries are stopped, for any reason, until a later refusal in the same episode starts them again; never again in the episode once the persona was removed or the server is stopping. A health check that restarts the retries on its own does not allow it. | agent-director or tmux isn't answering for the persona's session. The server keeps retrying. | Nothing yet. |
+| *Not answering* | At the next health check after the first refusal, if the session still isn't answering after that check. With `health_check_interval` `0`, at the first retry at least 2 minutes after the first refusal (a retry skipped because a launch was running counts). A single refusal that clears before then posts nothing. Never posted once *Still not answering* has been posted for the episode. Only while the server is retrying: not posted while the persona's retries are stopped, for any reason, until a later refusal in the same episode starts them again; never again in the episode once the persona was torn down or removed from the configuration, or the server is stopping. A health check that restarts the retries on its own does not allow it. | agent-director or tmux isn't answering for the persona's session. The server keeps retrying. | Nothing yet. |
 | *Still not answering* | Once the session has not answered for longer than the alert threshold: the longer of agent-director's `stopping_window_seconds` and `starting_session_seconds`, plus 60 s, from the values in effect (see [agent-director's timing settings](#agent-directors-timing-settings)). At agent-director's defaults that is 6 minutes, and the notice says `over 6 minutes`. It doesn't wait for *Not answering* first. Only while the server is retrying: if the persona's retries stop before it is posted, it is not posted; if a later refusal in the same episode starts the retries again, it is posted once the time since the first refusal is over the threshold (at once when it already is), unless the persona was removed or the server is stopping. | It has lasted long enough to need a human. The retries continue; the notice stops nothing, counts toward nothing and takes no destructive action. | The read-only checks below. |
 | *Answering again* | When the record ends, only if *Not answering* or *Still not answering* was posted for it. | The persona reaches its session again. | Nothing. |
 
@@ -1731,10 +1731,13 @@ agent-director. No second notice follows in the episode.
 
 The episode runs from the first such error until a retry finds nothing left
 to recover, a retry that only reads the persona's state after a relaunch
-finds its new session started, the persona reaches the restart limit, it is
-torn down, or the server stops. Its retries stopping for another reason
-(the persona isn't up, it is no longer in the applied configuration, its
-relaunch was declined) leave the episode open. A later error after the end
+finds its new session started, ended or gone, the persona's retries stop
+because its tmux condition ended (the `tmux-unavailable` condition cleared
+or the `tmux-unresponsive` condition ended), the persona reaches the restart
+limit, it is torn down, or the server stops. Its retries stopping for
+another reason (the persona isn't up, it is no longer in the applied
+configuration, its relaunch was declined, a retry run failed) leave the
+episode open. A later error after the end
 starts a new episode, which posts the notice again.
 
 **A persona no longer configured.** When the notice falls due for a persona
@@ -1770,7 +1773,7 @@ grep -h -E 'persona-episodes: persona=ops_bot unclassified-error |unavailable-re
 | `[slack] unavailable-retry: persona=<key> armed (unclassified: <error>) — first retry in 30 s` | The retries started with the `unclassified` cause (`armed (read-error: <error>)` when the error came from reading the persona's state). | Nothing. |
 | `[slack] persona-episodes: persona=<key> unclassified-error alert posted to its destination — an UNCLASSIFIED outcome met <s> s after the episode's first, over its alert threshold of <s> s: class=UNCLASSIFIED[ name=<name>][ message="<description>"]` | The *Unclassified agent-director error* notice went to the persona's destination. The numbers are the time since the episode's first error and the alert threshold in effect; the classification is the error the notice quotes. | A human checks the host's agent-director, following agent-director's documentation. If the notice doesn't arrive, see [`persona-destination-failed`](#persona-destination-failed). |
 | `[slack] persona-episodes: persona=<key> unclassified-error alert written to the server log and startup-errors.log (persona-unclassified-error) — the persona is not in the applied configuration; an UNCLASSIFIED outcome met <s> s after the episode's first, over its alert threshold of <s> s: <classification>` | The notice was due, but the persona is no longer in the applied configuration, so it went to `startup-errors.log` (the `persona-unclassified-error` entry) and `server.log` only. | As above; nothing to do for the removed persona itself. |
-| `[slack] persona-episodes: persona=<key> unclassified-error ended — <reason>` | The episode ended with no notice. `<reason>`: `a retry found nothing left to recover` (the persona is back), `a retry read its row live out of pending` (after a relaunch, its new session started), or `the persona reached the restart cap` (see the `SpawnCapReached` notice). | Nothing. At the restart cap, restart the server to retry the persona once agent-director answers normally. |
+| `[slack] persona-episodes: persona=<key> unclassified-error ended — <reason>` | The episode ended with no notice. `<reason>`: `a retry found nothing left to recover` (the persona is back), `a retry read its row live out of pending` (after a relaunch, its new session started), `its retry timer stopped when its tmux condition ended` (tmux answers again for the persona), `a retry read its row ended or gone` (after a relaunch, its new session ended or disappeared; the restart path decides what happens next), or `the persona reached the restart cap` (see the `SpawnCapReached` notice). | Nothing. At the restart cap, restart the server to retry the persona once agent-director answers normally. |
 | `[slack] spawnForPersona: resume refused for "<name>" (key=<key>): class=UNCLASSIFIED name=ErrInvalidFlags[ message="<description>"] (after one immediate agent-director version re-check: <answer>) — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)` | agent-director refused the persona's resume with `ErrInvalidFlags`. The server re-checked the binary's version once (`<answer>`: `pass`, `could-not-run` or `not-running`) and treats it as an error it can't classify: the resume stops, nothing is deleted, killed or launched, and the retries take over. When the re-check refuses the binary instead, the line reads `resume failed for … (after one immediate agent-director version re-check: stop)` and the server stops (see [Found while the server was running](#found-while-the-server-was-running)). | Nothing yet; the notice follows if it lasts. |
 | `[slack] persona-episodes: persona=<key> unclassified-error configured-key lookup failed: <error> — the alert takes the log-only route` | An internal error checking whether the persona is still configured; the notice went to `startup-errors.log` and `server.log` instead of Slack. | Report it as a bug, with the persona's lines. |
 | `[slack] persona-episodes: persona=<key> unclassified-error report failed: <error>`, `… log-only alert failed: <error>`, `… alert not routed — the persona is not in the applied configuration and no log-only route is installed; <…>`, `[slack] persona-episodes: persona=<key> unclassified-error notice failed: <error>` | An internal error: the notice may be missing, but the retries go on unchanged. | Report it as a bug, with the persona's lines. |
@@ -1842,11 +1845,14 @@ tries again at the next one. A restart that meets it stops there and hands
 the persona to the retries above (`armed (<cause>)`, then the
 `liveness-unknown` reason), so once agent-director answers again the persona
 is recovered with no server restart. `<cause>` is `unavailable` when
-agent-director timed out, couldn't be reached or gave an error the server
-doesn't know, `config` when it refused its config file (`ErrConfigMalformed`,
-which also posts a notice: see **agent-director refuses its config file**
-above), and `read-error` for any other error (an internal error, for
-example), a state the server doesn't know, or a check that itself failed. Only a state that shows the instance is gone (`ended`,
+agent-director timed out, couldn't be reached or gave an error name this
+agent-director client doesn't recognise, `config` when it refused its config
+file (`ErrConfigMalformed`, which also posts a notice: see **agent-director
+refuses its config file** above), and `read-error` for any other error (an
+internal error, for example), an error the server can't classify (see
+**agent-director returns an error the server can't classify** above), a
+state the server doesn't know, or a check that itself failed. Only a state
+that shows the instance is gone (`ended`,
 `missing`, no row, or the agent-director binary gone) leads to a relaunch;
 a restart's kill that then finds the binary still gone is refused, and
 nothing is relaunched. Inside a restart, an internal error or a store

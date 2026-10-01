@@ -125,6 +125,7 @@ import {
   stubCallCount,
   type SpawnHold,
   type StubCallLog,
+  type UnavailableForm,
 } from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
 import type { DeleteParams, FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams } from 'agent-director'
@@ -4745,7 +4746,7 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 // record, so one counted failure would reach the cap.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the restart run launches nothing, counts nothing and posts no spawn-failure notice', () => {
+describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys or relaunch in the restart run launches nothing, counts nothing and posts no spawn-failure notice', () => {
 
   describe('RestartDeps.killSession\'s answer', () => {
     const P = 'persona_p'
@@ -4815,10 +4816,20 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
       expect(h.outageNotices).toEqual([])
     }
 
-    /** E4's UNAVAILABLE forms of agent-director's own errors, each built for the verb that meets it, and the cause each arms. */
-    const UNAVAILABLE_ANSWERS = unavailableForms('ErrUnknownErrorName', 'ErrCallTimeout', 'a wrapped UnknownError', 'ErrTmuxUnresponsive', 'ErrTmuxKillFailed')
+    /**
+     * The refusing answers, each built for the verb that meets it, and the
+     * cause each arms: E4's UNAVAILABLE forms of agent-director's own errors,
+     * then the UNCLASSIFIED ones (b.jg5 SRJ-104, SRJ-313, AC 69).
+     */
+    const REFUSING_ANSWERS: ReadonlyArray<UnavailableForm> = [
+      ...unavailableForms('ErrUnknownErrorName', 'ErrCallTimeout', 'a wrapped UnknownError', 'ErrTmuxUnresponsive', 'ErrTmuxKillFailed'),
+      ['ErrInternal (UNCLASSIFIED)', () => errInternal(), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+      ['an AgentDirectorError of a name CSCB gives no handling (UNCLASSIFIED)', (verb) => errGeneric(verb, 'ErrSomethingElse', 'it broke'), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+    ]
 
-    test.each(UNAVAILABLE_ANSWERS)('the kill after a dead reading answers %s → refused: no launch, no recordFailure, no onCapReached; nothing posted; the timer is armed (cause %s)', async (_label, make, cause) => {
+    // b.jg5 SRJ-110, SRJ-313 (AC 69 for the UNCLASSIFIED rows): the kill's
+    // refusal is the adapter's, so no step follows it and nothing is counted.
+    test.each(REFUSING_ANSWERS)('the kill after a dead reading answers %s → refused: no launch, no recordFailure, no onCapReached; nothing posted; the timer is armed (cause %s)', async (_label, make, cause) => {
       const { h, p, cwd } = build()
       rowReadsUntilSpawn(h, 'ended')
       h.script({ killError: make('kill') })
@@ -4827,6 +4838,7 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
 
       expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
       expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+      expect(h.stub.spawnedIds()).toEqual([])
       expect(h.errors).toContain(KILL_REFUSED_LINE(p))
       expect(h.triggers).toEqual([{ key: p, kind: cause }])
       expectNothingCounted(h, p)
@@ -4847,66 +4859,6 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
       expect(h.errors).not.toContain(KILL_REFUSED_LINE(p))
       expect(h.triggers).toEqual([])
       expect(h.notices).toEqual([])
-    })
-
-    /** UNCLASSIFIED answers (b.jg5 SRJ-104), each built for the verb that meets it. */
-    const UNCLASSIFIED_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
-      ['ErrInternal', () => errInternal()],
-      ['an AgentDirectorError of a name CSCB gives no handling', (verb) => errGeneric(verb, 'ErrSomethingElse', 'it broke')],
-    ]
-
-    // b.jg5 SRJ-313, SRJ-110 (AC 69): the kill's UNCLASSIFIED answer is the
-    // adapter's refusal, so no step follows it and nothing is counted.
-    test.each(UNCLASSIFIED_ANSWERS)('b.jg5 SRJ-313, AC 69: the kill after a dead reading answers %s (UNCLASSIFIED) → refused: no launch, no recordFailure, no onCapReached; nothing posted; the timer is armed with the unclassified cause', async (_label, make) => {
-      const { h, p, cwd } = build()
-      rowReadsUntilSpawn(h, 'ended')
-      h.script({ killError: make('kill') })
-
-      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
-
-      expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
-      expect(h.stub.spawnedIds()).toEqual([])
-      expect(h.errors).toContain(KILL_REFUSED_LINE(p))
-      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-      expectNothingCounted(h, p)
-      expect(h.episodeNotices).toEqual([])
-    })
-
-    // b.jg5 SRJ-313, SRJ-113 (AC 69): an UNCLASSIFIED `send-keys` in the
-    // reconnect is a refusal, never 'escalate-dead'.
-    test.each(UNCLASSIFIED_ANSWERS)('b.jg5 SRJ-313, AC 69: the reconnect\'s send-keys on a live row answers %s (UNCLASSIFIED) → no escalate-dead, no re-probe, no sweep, no kill, no launch; nothing counted, no spawn-failure notice; the timer is armed with the unclassified cause', async (_label, make) => {
-      const { h, p, cwd } = build()
-      h.script({ statusFn: () => cannedStatusResult({ state: 'waiting' }), sendKeysError: make('send-keys') })
-
-      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_RECONNECT_DEFERRED)
-
-      expect(h.stub.calls.statusCalls).toHaveLength(2)
-      expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
-      expect(Object.keys(callCounts(h)).sort()).toEqual(['readPaneCalls', 'sendKeysCalls', 'statusCalls'])
-      expect(h.errors.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
-      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-      expectNothingCounted(h, p)
-      expect(h.episodeNotices).toEqual([])
-    })
-
-    // b.jg5 SRJ-313, SRJ-111 (AC 69): an UNCLASSIFIED relaunch is refused,
-    // never counted toward the cap, with no spawn-failure notice.
-    test.each(UNCLASSIFIED_ANSWERS)('b.jg5 SRJ-313, AC 69: the relaunch after a dead reading answers %s (UNCLASSIFIED) → refused: one spawn and nothing after it, no recordFailure, no onCapReached, no spawn-failure notice; the timer is armed with the unclassified cause', async (_label, make) => {
-      const { h, p, cwd } = build()
-      rowReadsUntilSpawn(h, 'ended')
-      h.script({ spawnError: make('spawn') })
-
-      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
-      await h.settle()
-
-      expect(h.stub.calls.killCalls).toHaveLength(1)
-      expect(h.stub.calls.spawnCalls).toHaveLength(1)
-      expect(h.stub.calls.resumeCalls).toEqual([])
-      expect(h.stub.calls.deleteCalls).toEqual([])
-      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-      expect(h.errors).not.toContain(KILL_REFUSED_LINE(p))
-      expectNothingCounted(h, p)
-      expect(h.episodeNotices).toEqual([])
     })
 
     // AC 69: retried, an UNCLASSIFIED relaunch is still never counted, so P
@@ -4933,7 +4885,9 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
       expect(h.notices).toEqual([])
     })
 
-    test.each(UNAVAILABLE_ANSWERS)('the reconnect\'s send-keys on a live row answers %s → no escalate-dead, no re-probe, no kill, no launch; nothing counted, no spawn-failure notice', async (_label, make, cause) => {
+    // b.jg5 SRJ-113, SRJ-313 (AC 69 for the UNCLASSIFIED rows): a refusing
+    // `send-keys` in the reconnect is never 'escalate-dead'.
+    test.each(REFUSING_ANSWERS)('the reconnect\'s send-keys on a live row answers %s → no escalate-dead, no re-probe, no sweep, no kill, no launch; nothing counted, no spawn-failure notice; the timer is armed (cause %s)', async (_label, make, cause) => {
       const { h, p, cwd } = build()
       h.script({ statusFn: () => cannedStatusResult({ state: 'waiting' }), sendKeysError: make('send-keys') })
 
@@ -4944,11 +4898,16 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
       expect(h.stub.calls.statusCalls).toHaveLength(2)
       expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
       expect(Object.keys(callCounts(h)).sort()).toEqual(['readPaneCalls', 'sendKeysCalls', 'statusCalls'])
+      expect(h.errors.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
       expect(h.triggers).toEqual([{ key: p, kind: cause }])
       expectNothingCounted(h, p)
+      expect(h.episodeNotices).toEqual([])
     })
 
-    test.each(UNAVAILABLE_ANSWERS)('the relaunch after a dead reading answers %s → refused: no recordFailure, no onCapReached, no spawn-failure notice', async (_label, make, cause) => {
+    // b.jg5 SRJ-111, SRJ-313 (AC 69 for the UNCLASSIFIED rows): a refusing
+    // relaunch is never counted toward the cap and posts no spawn-failure
+    // notice.
+    test.each(REFUSING_ANSWERS)('the relaunch after a dead reading answers %s → refused: one spawn and nothing after it, no recordFailure, no onCapReached, no spawn-failure notice; the timer is armed (cause %s)', async (_label, make, cause) => {
       const { h, p, cwd } = build()
       rowReadsUntilSpawn(h, 'ended')
       h.script({ spawnError: make('spawn') })
@@ -4959,9 +4918,12 @@ describe('b.jg5 SRJ-105: an UNAVAILABLE kill, send-keys or relaunch in the resta
       expect(h.stub.calls.killCalls).toHaveLength(1)
       expect(h.stub.calls.spawnCalls).toHaveLength(1)
       expect(h.stub.spawnedIds()).toEqual([personaInstanceId(p)])
+      expect(h.stub.calls.resumeCalls).toEqual([])
+      expect(h.stub.calls.deleteCalls).toEqual([])
       expect(h.triggers).toEqual([{ key: p, kind: cause }])
       expect(h.errors).not.toContain(KILL_REFUSED_LINE(p))
       expectNothingCounted(h, p)
+      expect(h.episodeNotices).toEqual([])
     })
 
     test('HO C3 Verify, AC 25: a relaunch that keeps answering ErrTmuxUnresponsive across several retries posts one onset for P and nothing more, and counts nothing', async () => {

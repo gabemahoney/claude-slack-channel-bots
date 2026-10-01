@@ -409,14 +409,18 @@ import {
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
 import { RESTART_FAILURE_CAP, RESTART_OUTCOME_REFUSED, runRestartRetry, type LaunchSessionResult } from '../src/restart.ts'
-import { AD_ERROR_CLASS_UNCLASSIFIED, classifyAdError, describeAdErrorClassification } from '../src/ad-error-class.ts'
-import { PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR, type UnclassifiedErrorSink } from '../src/persona-episodes.ts'
+import { AD_ERROR_CLASS_UNCLASSIFIED, describeAdErrorClassification } from '../src/ad-error-class.ts'
+import type { UnclassifiedErrorSink } from '../src/persona-episodes.ts'
 import { getFailureCount } from '../src/backoff.ts'
 import {
+  adConfigMalformedRaiseLines,
   collided,
   conditionStartedLines,
   makeRecoveryHarness,
   personaOf as harnessPersona,
+  unclassifiedLinePrefix,
+  unclassifiedStartedLine,
+  unclassifiedStartedLines,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoveryStubScript,
@@ -1418,23 +1422,6 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     )
   }
 
-  test('b.jg5 SRJ-313: ErrInvalidFlags: exactly one resolveSystemBinary call with no clock advance, one UNCLASSIFIED refusal line, no notice, no kill, delete, fresh spawn or second resume', async () => {
-    const invalidFlags = errInvalidFlags('resume')
-    const { cfg, calls } = installEndedRowResumeRejects(invalidFlags)
-    const log = await withCapturedErr(async () => {
-      await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    })
-    expect(resolveCalls).toHaveLength(1)
-    expect(stops).toEqual([])
-    const lines = log.split('\n').filter((l) => l.includes(`resume refused for ${renderPersonaRef('C', 'C')}: `) || l.includes(`resume failed for ${renderPersonaRef('C', 'C')}: `))
-    expect(lines).toEqual([invalidFlagsRefusalLine('C', invalidFlags, RECHECK_OUTCOME_PASS)])
-    expect(notices).toEqual([])
-    expect(calls.resumeCalls).toHaveLength(1)
-    expect(calls.spawnCalls).toHaveLength(1)
-    expect(calls.killCalls).toEqual([])
-    expect(calls.deleteCalls).toEqual([])
-  })
-
   test('b.jg5 SRJ-313: the resume\'s ErrInvalidFlags is reported once to the unclassified sink, with the site\'s UNCLASSIFIED classification (never as STATE by the wrapper too), and arms the timer once with the UNCLASSIFIED cause', async () => {
     const reports: Array<{ key: string; error: unknown; classification: unknown }> = []
     const armed: Array<{ key: string; kind: string }> = []
@@ -1476,7 +1463,8 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
 
   // E8 (b.jg5 SRJ-205, SRJ-302): a re-check that decides the stop posts
   // nothing and ends a launch the restart path does not count; any other
-  // re-check answer keeps today's notice and failed outcome.
+  // re-check answer (it passes, or could not run) leaves the ErrInvalidFlags
+  // UNCLASSIFIED: a refusal with no notice (b.jg5 SRJ-105, SRJ-313).
 
   /** Replace the installed re-check with one whose `resolveSystemBinary` answers `outcome`, recorded as the default one is. */
   function reinstallRecheck(outcome: StubResolveSystemBinaryOutcome): void {
@@ -1540,7 +1528,7 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
   test.each([
     [RECHECK_OUTCOME_PASS, undefined],
     [RECHECK_OUTCOME_COULD_NOT_RUN, { throws: new Error('the resolve failed') }],
-  ] as const)('b.jg5 SRJ-105, SRJ-313: the re-check answers %s: UNCLASSIFIED handling — no spawn-failure notice or spawn-failed entry, one refusal line, { failed, refused }, P\'s timer armed with the UNCLASSIFIED cause, never counted (launchSession \'refused\'), the outcome reported once to P\'s episode; nothing killed, deleted or launched after it; B launches', async (kind, outcome) => {
+  ] as const)('b.jg5 SRJ-105, SRJ-313: the re-check answers %s (exactly one resolveSystemBinary call): UNCLASSIFIED handling — no spawn-failure notice or spawn-failed entry, one refusal line and no resume failed line, { failed, refused }, P\'s timer armed with the UNCLASSIFIED cause, never counted (launchSession \'refused\'), the outcome reported once to P\'s episode; nothing killed, deleted or launched after it; B launches', async (kind, outcome) => {
     if (outcome !== undefined) reinstallRecheck(outcome)
     const { h, p, b } = srj105Build()
     const persona = harnessPersona(h, p)
@@ -1556,13 +1544,14 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     expect(h.notices).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
     expect(refusalLines(h, p)).toEqual([invalidFlagsRefusalLine(p, invalidFlags, kind)])
+    expect(h.errors.filter((line) => line.includes(`resume failed for ${renderPersonaRef(p, p)}: `))).toEqual([])
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
     expect(h.controller.isArmed(p)).toBe(true)
     expect(getFailureCount(p)).toBe(0)
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     // Reported to P's episode with the site's classification (the classifier
     // alone would call ErrInvalidFlags STATE).
-    expect(unclassifiedStartedLines(h, p)).toEqual([unclassifiedStartedLine(p, invalidFlagsClassText(invalidFlags))])
+    expect(unclassifiedStartedLines(h, p)).toEqual([`${unclassifiedLinePrefix(p)}started — ${invalidFlagsClassText(invalidFlags)}`])
     expect(h.unclassifiedErrorOpen(p)).toBe(true)
     expect(h.episodeNotices).toEqual([])
 
@@ -11940,6 +11929,9 @@ const RECONNECT_SITES: readonly LadderSite[] = [
   },
 ]
 
+/** Every action site of the ladder: each spawn and resume, kill, delete and reconnect site above. */
+const ACTION_SITES: readonly LadderSite[] = [...SPAWN_AND_RESUME_SITES, ...KILL_SITES, ...DELETE_SITES, ...RECONNECT_SITES]
+
 /**
  * The reads of the ladder (b.jg5 SRJ-105's read-error row): the collision
  * `get`, the working-row wait's poll and timeout `status`, and the
@@ -12061,16 +12053,6 @@ function clearedScript(script: RecoveryStubScript): RecoveryStubScript {
 /** The refusal lines `refusalAt` logged for persona `key`. */
 function refusalLines(h: RecoveryHarness, key: string): string[] {
   return h.errors.filter((line) => line.includes(` refused for ${renderPersonaRef(key, key)}: `) && line.endsWith('nothing more is called (b.jg5 SRJ-105)'))
-}
-
-/** The started line of persona `key`'s unclassified-error episode for an outcome `described` renders (b.jg5 SRJ-313). */
-function unclassifiedStartedLine(key: string, described: string): string {
-  return `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR} started — ${described}`
-}
-
-/** Persona `key`'s unclassified-error started lines in the harness's lines. */
-function unclassifiedStartedLines(h: RecoveryHarness, key: string): string[] {
-  return h.lines.filter((line) => line.startsWith(`[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR} started — `))
 }
 
 let srj105Harness: RecoveryHarness | undefined
@@ -12372,28 +12354,6 @@ describe('b.jg5 SRJ-105: a read error at the collision get, the working-row wait
     expect(h.unclassifiedErrorOpen(p)).toBe(false)
   })
 
-  test.each(SRJ105_UNAVAILABLE)('a persona that joins another\'s in-flight shared sweep gets the same refusal: %s at P\'s prompt-row sweep, which B joined, refuses both under their own keys with one findMissing call; no resume, kill, delete, launch, notice or spawn-failed entry, never counted', async (_what, make, kind) => {
-    const { h, p, b } = srj105Build()
-    const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, make('find-missing'))
-
-    expect(pResult).toStrictEqual({ key: p, action: 'failed', refused: true })
-    expect(bResult).toStrictEqual({ key: b, action: 'failed', refused: true })
-    // One call: B joined P's sweep (a later start would have made a second).
-    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
-    for (const key of [p, b]) {
-      expect(refusalLines(h, key)).toHaveLength(1)
-      expect(refusalLines(h, key)[0]).toStartWith(`[slack] spawnForPersona: prompt row: findMissing sweep refused for ${renderPersonaRef(key, key)}: `)
-      expect(h.triggers.filter((t) => t.key === key)).toEqual([{ key, kind }])
-      expect(h.controller.isArmed(key)).toBe(true)
-      expect(getFailureCount(key)).toBe(0)
-      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-    }
-    expect(h.notices).toEqual([])
-    expect(h.outageNotices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
-  })
-
   test.each<[string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined, SpawnPersonaResult['action'], Partial<LaunchVerbCalls>]>([
     ['the collision get (the row went away: one retry spawn)', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() }), undefined, 'spawned', { spawn: 2 }],
     ['the working-row wait\'s poll status (its tmux session alive: not reconnected)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusError: errSpawnNotFound() }), fastPolls, 'not-reconnected', { spawn: 1 }],
@@ -12521,7 +12481,7 @@ describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladd
   afterEach(srj105AfterEach)
 
   const destructiveCross = SRJ311_ENVIRONMENT.flatMap(([what, make, text]) =>
-    [...SPAWN_AND_RESUME_SITES, ...KILL_SITES, ...DELETE_SITES, ...RECONNECT_SITES].map((site) => [what, site.name, make, text, site] as const),
+    ACTION_SITES.map((site) => [what, site.name, make, text, site] as const),
   )
   test.each(destructiveCross)('b.jg5 SRJ-311: %s at %s: nothing destructive after it, never dead-session, no notice or spawn-failed entry, refused and never counted, one tmux-unavailable onset, P\'s condition not started; B launches', async (_what, _site, make, text, site) => {
     const { h, p } = await expectRefusedAt(site, make(site.verb), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, text)
@@ -12554,47 +12514,6 @@ describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladd
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(conditionStartedLines(h, p)).toEqual([])
   })
-
-  // A joiner's sweep failure is its own (SRJ-301): with ENVIRONMENT it raises
-  // its own `tmux-unavailable`, as P's wrapper does for P, and the error's
-  // form picks the onset for each (SRJ-1021): the joiner's raise site is its
-  // own, so B's text is checked as well as P's. The contrast row: an
-  // UNAVAILABLE sweep error raises no `tmux-unavailable` for either.
-  const JOINED_SWEEP_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error, string, string | undefined]> = [
-    // The re-bound (different-server) row pins wiring only: today's agent-director never returns this error from `find-missing`; it proves the joiner's site hands its error to `raiseTmuxUnavailable`.
-    ...SRJ311_ENVIRONMENT.map(([what, make, text]) => [what, make, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, text] as const),
-    ...unavailableForms('ErrTmuxUnresponsive').map(([what, make, kind]) => [`contrast: ${what} (UNAVAILABLE)`, make, kind, undefined] as const),
-  ]
-  test.each(JOINED_SWEEP_ERRORS)('b.jg5 SRJ-311, SRJ-1021: %s at P\'s prompt-row sweep, which B joined: one findMissing call; each persona raises its own tmux-unavailable (one onset each, with the form\'s text) only for ENVIRONMENT, is armed once with the cause, and nothing destructive follows for either', async (_what, make, kind, onsetText) => {
-    const { h, p, b } = srj105Build()
-    const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, make('find-missing'))
-
-    expect(pResult).toStrictEqual({ key: p, action: 'failed', refused: true })
-    expect(bResult).toStrictEqual({ key: b, action: 'failed', refused: true })
-    // One call: B joined P's sweep (a later start would have made a second).
-    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
-    // Nothing destructive after the collisions: no resume, kill, delete or launch.
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
-    for (const key of [p, b]) {
-      expect(refusalLines(h, key)).toHaveLength(1)
-      expect(h.triggers.filter((t) => t.key === key)).toEqual([{ key, kind }])
-      expect(h.controller.isArmed(key)).toBe(true)
-      expect(getFailureCount(key)).toBe(0)
-      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-      expect(conditionStartedLines(h, key)).toEqual([])
-      const onsets = h.outageNotices.filter((n) => n.key === key)
-      if (onsetText === undefined) {
-        expect(getOutageFlags(key).has('tmux-unavailable')).toBe(false)
-        expect(onsets).toEqual([])
-      } else {
-        expect(getOutageFlags(key).has('tmux-unavailable')).toBe(true)
-        expect(onsets.map((n) => n.text)).toEqual([onsetText])
-      }
-    }
-    expect(h.outageNotices).toHaveLength(onsetText === undefined ? 0 : 2)
-    expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -12618,11 +12537,6 @@ describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladd
 describe('b.jg5 SRJ-105, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the collision ladder, the reconnect, the working-row wait and the findMissing sweeps is a refusal: no action, never counted, never dead, P\'s timer armed with the CONFIG cause, one ad-config-malformed onset', () => {
   afterEach(srj105AfterEach)
 
-  /** The `ad-config-malformed` raise lines logged for persona `key`. */
-  function raiseLines(h: RecoveryHarness, key: string): string[] {
-    return h.errors.filter((line) => line.startsWith(`[slack] outage-state: ad-config-malformed raised for persona=${key}: `))
-  }
-
   /**
    * What every CONFIG refusal adds to `expectRefusedAt`'s checks: P holds the
    * `ad-config-malformed` flag only, its condition was never started, every
@@ -12639,11 +12553,10 @@ describe('b.jg5 SRJ-105, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the co
     expect(h.outageNotices.every((n) => n.key === p)).toBe(true)
     const onsets = h.outageNotices.filter((n) => n.text === onset)
     expect(onsets.length).toBeGreaterThanOrEqual(1)
-    expect(raiseLines(h, p)).toHaveLength(onsets.length)
-    expect(raiseLines(h, b)).toEqual([])
+    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(onsets.length)
+    expect(adConfigMalformedRaiseLines(h, b)).toEqual([])
   }
 
-  const ACTION_SITES = [...SPAWN_AND_RESUME_SITES, ...KILL_SITES, ...DELETE_SITES, ...RECONNECT_SITES]
   test.each(ACTION_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-105, SRJ-316: CONFIG at %s: nothing destructive after it, never dead-session, no notice or spawn-failed entry, refused and never counted, P armed with the CONFIG cause, one ad-config-malformed onset, P\'s condition not started; B launches', async (_name, site) => {
     const err = errConfigMalformed()
     const onset = adConfigMalformedOnset(err)
@@ -12675,33 +12588,6 @@ describe('b.jg5 SRJ-105, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the co
     const refusedAt = `[slack] ${site.logPrefix}: findMissing sweep refused for ${renderPersonaRef(p, p)}: `
     expect(refusalLines(h, p).map((line) => line.startsWith(refusedAt))).toEqual([true, true])
     expectConfigOutageOnly(h, p, onset)
-  })
-
-  // A joiner's sweep failure is its own (SRJ-301): with CONFIG it raises its
-  // own `ad-config-malformed`, as P's wrapper does for P.
-  test('b.jg5 SRJ-105, SRJ-316: CONFIG at P\'s prompt-row sweep, which B joined: one findMissing call; each persona raises its own ad-config-malformed (one onset and one raise line each), is armed once with the CONFIG cause, and nothing destructive follows for either', async () => {
-    const { h, p, b } = srj105Build()
-    const err = errConfigMalformed()
-    const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, err)
-
-    expect(pResult).toStrictEqual({ key: p, action: 'failed', refused: true })
-    expect(bResult).toStrictEqual({ key: b, action: 'failed', refused: true })
-    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
-    for (const key of [p, b]) {
-      expect(refusalLines(h, key)).toHaveLength(1)
-      expect(h.triggers.filter((t) => t.key === key)).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG }])
-      expect(h.controller.isArmed(key)).toBe(true)
-      expect(getFailureCount(key)).toBe(0)
-      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-      expect(conditionStartedLines(h, key)).toEqual([])
-      expect([...getOutageFlags(key)]).toEqual(['ad-config-malformed'])
-      expect(h.outageNotices.filter((n) => n.key === key).map((n) => n.text)).toEqual([adConfigMalformedOnset(err)])
-      expect(raiseLines(h, key)).toHaveLength(1)
-    }
-    expect(h.outageNotices).toHaveLength(2)
-    expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
   })
 })
 
@@ -12759,14 +12645,12 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNCLASSIFIED outcome at the collision ladde
     const [, b] = h.keys as [string, string]
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(conditionStartedLines(h, p)).toEqual([])
-    expect(unclassifiedStartedLines(h, p)).toEqual([unclassifiedStartedLine(p, describeAdErrorClassification(classifyAdError(err)))])
+    expect(unclassifiedStartedLines(h, p)).toEqual([unclassifiedStartedLine(p, err)])
     expect(h.unclassifiedErrorOpen(p)).toBe(true)
     expect(h.unclassifiedErrorOpen(b)).toBe(false)
     expect(unclassifiedStartedLines(h, b)).toEqual([])
     expect(h.episodeNotices).toEqual([])
   }
-
-  const ACTION_SITES = [...SPAWN_AND_RESUME_SITES, ...KILL_SITES, ...DELETE_SITES, ...RECONNECT_SITES]
 
   const actionCross = SRJ313_UNCLASSIFIED.flatMap(([what, make]) => ACTION_SITES.map((site) => [what, site.name, make, site] as const))
   test.each(actionCross)('b.jg5 SRJ-313: %s at %s: no kill, delete or launch after it, never dead-session, no notice or spawn-failed entry, refused and never counted, P armed with the UNCLASSIFIED cause, reported once to P\'s episode, P\'s condition not started; B launches', async (_what, _site, make, site) => {
@@ -12804,30 +12688,6 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNCLASSIFIED outcome at the collision ladde
     const refusedAt = `[slack] ${site.logPrefix}: findMissing sweep refused for ${renderPersonaRef(p, p)}: `
     expect(refusalLines(h, p).map((line) => line.startsWith(refusedAt))).toEqual([true, true])
     expectReportedToEpisode(h, p, err)
-  })
-
-  test('b.jg5 SRJ-105, SRJ-313: an ErrInternal at P\'s prompt-row sweep, which B joined: one findMissing call; each persona is refused under its own key, armed once with the UNCLASSIFIED cause and has its own episode begun once; nothing destructive follows for either', async () => {
-    const { h, p, b } = srj105Build()
-    const err = errInternal()
-    const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, err)
-
-    expect(pResult).toStrictEqual({ key: p, action: 'failed', refused: true })
-    expect(bResult).toStrictEqual({ key: b, action: 'failed', refused: true })
-    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
-    for (const key of [p, b]) {
-      expect(refusalLines(h, key)).toHaveLength(1)
-      expect(h.triggers.filter((t) => t.key === key)).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-      expect(h.controller.isArmed(key)).toBe(true)
-      expect(getFailureCount(key)).toBe(0)
-      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
-      expect(unclassifiedStartedLines(h, key)).toEqual([unclassifiedStartedLine(key, describeAdErrorClassification(classifyAdError(err)))])
-      expect(h.unclassifiedErrorOpen(key)).toBe(true)
-    }
-    expect(h.outageNotices).toEqual([])
-    expect(h.notices).toEqual([])
-    expect(h.episodeNotices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
   })
 
   test.each(SRJ105_UNAVAILABLE)('contrast: an UNAVAILABLE outcome (%s) at the first spawn is refused but never reported to P\'s unclassified-error episode', async (_what, make, kind) => {
@@ -12917,5 +12777,69 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNCLASSIFIED outcome at the collision ladde
       expect(armed).toEqual([{ key: 'C', kind }])
       expect(notices).toEqual([])
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-301, SRJ-105: a persona that joins another's in-flight shared
+// findMissing sweep gets its own refusal, for every outcome class
+//
+// A joiner's sweep failure is its own (SRJ-301): P starts the one prompt-row
+// sweep, B joins it, and the sweep's answer refuses both under their own keys,
+// each armed once with the answer's cause and nothing destructive after it for
+// either. The outage each class raises is raised by each persona's own site:
+// ENVIRONMENT raises `tmux-unavailable` (the error's form picks the onset,
+// SRJ-1021, so B's text is checked as well as P's) and CONFIG raises
+// `ad-config-malformed` (one onset and one raise line each, SRJ-316); the
+// UNAVAILABLE forms raise nothing. An UNCLASSIFIED answer begins each
+// persona's own unclassified-error episode once (SRJ-313); no other class
+// begins one.
+// ---------------------------------------------------------------------------
+
+/** The outage a joined sweep's answer raises for each persona: its class and the onset text for the thrown value. */
+type JoinedSweepOutage = readonly [OutageClass, (err: Error) => string]
+
+/** Each answer of the joined sweep, built for `find-missing` (by name), with the cause it arms and the outage it raises (none for `undefined`). */
+const JOINED_SWEEP_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error, string, JoinedSweepOutage | undefined]> = [
+  ...SRJ105_UNAVAILABLE.map(([what, make, kind]) => [`${what} (UNAVAILABLE)`, make, kind, undefined] as const),
+  // The re-bound (different-server) row pins wiring only: today's agent-director never returns this error from `find-missing`; it proves the joiner's site hands its error to `raiseTmuxUnavailable`.
+  ...SRJ311_ENVIRONMENT.map(([what, make, text]) => [what, make, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, ['tmux-unavailable', () => text] as const] as const),
+  ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG, ['ad-config-malformed', (err) => adConfigMalformedOnset(err)]],
+  ...SRJ313_SWEEP_UNCLASSIFIED.map(([what, make]) => [what, make, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, undefined] as const),
+]
+
+describe('b.jg5 SRJ-301, SRJ-105: a persona that joins another\'s in-flight shared sweep gets its own refusal, for every outcome class', () => {
+  afterEach(srj105AfterEach)
+
+  test.each(JOINED_SWEEP_ANSWERS)('%s at P\'s prompt-row sweep, which B joined: one findMissing call; each persona is refused under its own key at the prompt-row sweep, armed once with the cause, never counted, raises its own outage only for ENVIRONMENT or CONFIG and begins its own unclassified-error episode only for UNCLASSIFIED; no resume, kill, delete, launch, notice or spawn-failed entry for either', async (_what, make, kind, outage) => {
+    const { h, p, b } = srj105Build()
+    const err = make('find-missing')
+    const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, err)
+
+    expect(pResult).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(bResult).toStrictEqual({ key: b, action: 'failed', refused: true })
+    // One call: B joined P's sweep (a later start would have made a second).
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    // Nothing destructive after the collisions: no resume, kill, delete or launch.
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2 }))
+    const episode = kind === UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED
+    for (const key of [p, b]) {
+      expect(refusalLines(h, key)).toHaveLength(1)
+      expect(refusalLines(h, key)[0]).toStartWith(`[slack] spawnForPersona: prompt row: findMissing sweep refused for ${renderPersonaRef(key, key)}: `)
+      expect(h.triggers.filter((t) => t.key === key)).toEqual([{ key, kind }])
+      expect(h.controller.isArmed(key)).toBe(true)
+      expect(getFailureCount(key)).toBe(0)
+      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+      expect(conditionStartedLines(h, key)).toEqual([])
+      expect([...getOutageFlags(key)]).toEqual(outage === undefined ? [] : [outage[0]])
+      expect(h.outageNotices.filter((n) => n.key === key).map((n) => n.text)).toEqual(outage === undefined ? [] : [outage[1](err)])
+      expect(adConfigMalformedRaiseLines(h, key)).toHaveLength(outage?.[0] === 'ad-config-malformed' ? 1 : 0)
+      expect(unclassifiedStartedLines(h, key)).toEqual(episode ? [unclassifiedStartedLine(key, err)] : [])
+      expect(h.unclassifiedErrorOpen(key)).toBe(episode)
+    }
+    expect(h.outageNotices).toHaveLength(outage === undefined ? 0 : 2)
+    expect(h.notices).toEqual([])
+    expect(h.episodeNotices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
   })
 })

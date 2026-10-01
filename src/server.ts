@@ -1891,9 +1891,11 @@ export async function main(): Promise<void> {
   // (SRJ-210) after the episode's first: to the persona's destination while
   // the persona is in the applied configuration, else written only to the
   // server log and startup-errors.log (`persona-unclassified-error`, SRJ-1013).
-  // It ends on a retry that finds nothing left to recover or, pending-only,
-  // reads the row live out of `pending` (the retry timer's stop observer
-  // below), and at the restart cap (`onCapReached`).
+  // It ends when the retry timer stops because the persona's state got
+  // better (the retry timer's stop observer below): a retry finds nothing
+  // left to recover, a pending-only retry reads the row live out of
+  // `pending` or ended or gone, or the timer's tmux condition ends; and at
+  // the restart cap (`onCapReached`).
   const unclassifiedErrors = createUnclassifiedErrorEpisodes({
     episodes: noticeEpisodes,
     log: (line) => console.error(line),
@@ -1937,9 +1939,11 @@ export async function main(): Promise<void> {
   // observer below passes on to the timer's condition-end entry.
   // b.jg5 SRJ-313: the same stop observer then tells the unclassified-error
   // episodes, which end the persona's episode only when the stop's reason is
-  // that a retry found nothing left to recover or that a pending-only retry
-  // read the row live out of `pending`. Each consumer is isolated, so
-  // one that throws does not skip the other.
+  // that a retry found nothing left to recover, that a pending-only retry
+  // read the row live out of `pending` or ended or gone, or that the
+  // `tmux-unavailable` condition cleared or the `tmux-unresponsive`
+  // condition ended. Each consumer is isolated, so one that throws does not
+  // skip the other.
   const retryTimers = createUnavailableRetryController({
     log: (line) => console.error(line),
     onRetryFire: (key, firedAt) => tmuxUnresponsive.onsetAtRetry(key, firedAt),

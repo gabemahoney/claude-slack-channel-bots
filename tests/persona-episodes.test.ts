@@ -58,8 +58,12 @@
  * `persona-unclassified-error` label on its line), a throwing lookup taking
  * the log-only route, a missing or throwing log-only route logged, and one
  * latch for both routes. Ends: `end` for each reason and `retryStopped` for
- * `UNAVAILABLE_RETRY_STOP_RECOVERED` and `UNAVAILABLE_RETRY_STOP_ROW_LIVE`
- * (each ended line exact); every other stop leaves the episode open; `end`,
+ * `UNAVAILABLE_RETRY_STOP_RECOVERED`, `UNAVAILABLE_RETRY_STOP_ROW_LIVE`,
+ * `UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED`,
+ * `UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED` and
+ * `UNAVAILABLE_RETRY_STOP_ROW_GONE` (each ended line exact; a much later
+ * outcome after a condition-end or row-gone stop begins a new episode that
+ * waits out its own threshold); every other stop leaves the episode open; `end`,
  * `forget`, `forgetAll` and `close` post nothing and leave another persona's
  * episode intact, and a report after them begins a new episode that alerts
  * again. A throwing episodes member, threshold accessor or log breaks no
@@ -104,7 +108,9 @@ import {
   TMUX_UNRESPONSIVE_END_TMUX_VERB,
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
   UNCLASSIFIED_ERROR_END_CAPPED,
+  UNCLASSIFIED_ERROR_END_CONDITION_ENDED,
   UNCLASSIFIED_ERROR_END_RECOVERED,
+  UNCLASSIFIED_ERROR_END_ROW_GONE,
   UNCLASSIFIED_ERROR_END_ROW_LIVE,
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
@@ -1197,14 +1203,20 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
       expect(condition.end('K', TMUX_UNRESPONSIVE_END_RETRY)).toBe('ended-after-notice')
     })
 
-    test.each(checks)('a stop with no alert check pending still holds the onset back at %s: cancelAlert answers false and the stop itself logs nothing', async (where, healthOn, check) => {
+    // A cancel with no stop reason at all is a non-terminal stop, like the cap.
+    test.each(
+      ([UNAVAILABLE_RETRY_STOP_CAPPED, undefined] as const).flatMap((reason) =>
+        checks.map(([where, healthOn, check]) => [reason ?? 'no stop reason', reason, where, healthOn, check] as const),
+      ),
+    )('a non-terminal stop (%s) with no alert check pending holds the onset back at %s: cancelAlert answers false, the stop itself logs nothing, one stopped line, and a refusal lets it post', async (_what, reason, where, healthOn, check) => {
       // No threshold accessor: no alert check is ever armed.
       const condition = buildCondition({ healthCheckOn: () => healthOn })
       await startPastFloor(condition)
       const before = lines.length
 
-      expect(condition.cancelAlert('K', UNAVAILABLE_RETRY_STOP_CAPPED)).toBe(false)
+      expect(condition.cancelAlert('K', reason)).toBe(false)
       expect(lines.slice(before)).toEqual([])
+      check(condition, 'K')
       check(condition, 'K')
 
       expect(posts).toEqual([])
@@ -1214,23 +1226,7 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
       check(condition, 'K')
       expect(posts).toEqual([onsetPost('K')])
       expect(lines.at(-1)).toStartWith(onsetPostedLine('K', where))
-      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
-    })
-
-    test.each(checks)('a cancel with no stop reason is a non-terminal stop at %s: it holds the onset back, and a refusal lets it post', async (where, healthOn, check) => {
-      const condition = buildCondition({ healthCheckOn: () => healthOn })
-      await startPastFloor(condition)
-
-      condition.cancelAlert('K')
-      check(condition, 'K')
-      expect(posts).toEqual([])
-      expect(lines.at(-1)).toBe(stoppedLine('K'))
-
-      refuse(condition)
-      check(condition, 'K')
-      expect(posts).toEqual([onsetPost('K')])
-      expect(lines.at(-1)).toStartWith(onsetPostedLine('K', where))
-      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)).toBe('ended-after-notice')
     })
 
     test.each(terminalStops.flatMap((reason) => checks.map(([where, healthOn, check]) => [reason, where, healthOn, check] as const)))(
@@ -1349,12 +1345,21 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
     test.each<[string, (c: TmuxUnresponsiveCondition) => void]>([
       ['end', (c) => void c.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)],
       ['forget(key)', () => episodes.forget('K')],
-    ])('a terminal stop\'s mark does not reach the next episode (closed by %s): its tick posts the onset', async (_how, close) => {
+    ])('a terminal stop\'s mark does not reach the next episode (closed by %s): its tick posts the onset; another persona\'s terminal stop still holds its own onset back', async (_how, close) => {
       const condition = buildCondition()
+      condition.start('Q', VERB, errTmuxUnresponsive(VERB))
       await startPastFloor(condition)
       condition.cancelAlert('K', UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+      condition.cancelAlert('Q', UNAVAILABLE_RETRY_STOP_SHUTDOWN)
       close(condition)
       expect(condition.holds('K')).toBe(false)
+      expect(condition.holds('Q')).toBe(true)
+
+      // Q's mark is untouched: its tick logs the stopped line and posts nothing.
+      const before = lines.length
+      condition.onsetAtTick(clock.now())
+      expect(posts).toEqual([])
+      expect(lines.slice(before)).toEqual([stoppedLine('Q')])
 
       await startPastFloor(condition)
       condition.onsetAtTick(clock.now())
@@ -1362,7 +1367,8 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
       expect(posts).toEqual([onsetPost('K')])
       expect(lines.at(-1)).toStartWith(onsetPostedLine('K', 'a health tick'))
       expect(lines).not.toContain(stoppedLine('K'))
-      condition.end('K', TMUX_UNRESPONSIVE_END_TMUX_VERB)
+      expect(lines.filter((l) => l === stoppedLine('Q'))).toHaveLength(1)
+      for (const key of ['K', 'Q']) condition.end(key, TMUX_UNRESPONSIVE_END_TMUX_VERB)
     })
   })
 
@@ -1969,6 +1975,8 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
   test.each<[UnclassifiedErrorEndReason]>([
     [UNCLASSIFIED_ERROR_END_RECOVERED],
     [UNCLASSIFIED_ERROR_END_ROW_LIVE],
+    [UNCLASSIFIED_ERROR_END_CONDITION_ENDED],
+    [UNCLASSIFIED_ERROR_END_ROW_GONE],
     [UNCLASSIFIED_ERROR_END_CAPPED],
   ])('end for "%s": one ended line, nothing posted, no state left; another persona\'s episode stays; a later report begins a new episode that alerts again', async (reason) => {
     const u = buildUnclassified()
@@ -1993,41 +2001,63 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
     expect(posts.map((p) => p.key)).toEqual(['K', 'K', 'Q'])
   })
 
-  test.each<[string, UnclassifiedErrorEndReason]>([
-    [UNAVAILABLE_RETRY_STOP_RECOVERED, UNCLASSIFIED_ERROR_END_RECOVERED],
-    [UNAVAILABLE_RETRY_STOP_ROW_LIVE, UNCLASSIFIED_ERROR_END_ROW_LIVE],
-  ])('the retry timer\'s stop "%s" ends the episode silently with its ended line', async (stop, reason) => {
+  test.each<[string, UnclassifiedErrorEndReason, string]>([
+    [UNAVAILABLE_RETRY_STOP_RECOVERED, UNCLASSIFIED_ERROR_END_RECOVERED, 'a retry found nothing left to recover'],
+    [UNAVAILABLE_RETRY_STOP_ROW_LIVE, UNCLASSIFIED_ERROR_END_ROW_LIVE, 'a retry read its row live out of pending'],
+    [UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED, UNCLASSIFIED_ERROR_END_CONDITION_ENDED, 'its retry timer stopped when its tmux condition ended'],
+    [UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNCLASSIFIED_ERROR_END_CONDITION_ENDED, 'its retry timer stopped when its tmux condition ended'],
+    [UNAVAILABLE_RETRY_STOP_ROW_GONE, UNCLASSIFIED_ERROR_END_ROW_GONE, 'a retry read its row ended or gone'],
+  ])('the retry timer\'s stop "%s" ends the episode silently with its ended line, exactly', async (stop, reason, text) => {
     const u = buildUnclassified()
     await untilAlert(u)
 
     expect(u.retryStopped('K', stop)).toBe(true)
 
     expect(u.isOpen('K')).toBe(false)
-    expect(lines.at(-1)).toBe(endedLine('K', reason))
+    expect(episodes.view('K', KIND)).toBeUndefined()
+    expect<string>(reason).toBe(text)
+    expect(lines.at(-1)).toBe(`[slack] persona-episodes: persona=K ${KIND} ended — ${text}`)
     expect(posts).toHaveLength(1)
+    const linesAfter = lines.length
     expect(u.retryStopped('K', stop)).toBe(false)
+    expect(lines).toHaveLength(linesAfter)
   })
 
-  test('the pending-only row-live stop\'s ended line, exactly', () => {
+  test.each([
+    [UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED],
+    [UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED],
+    [UNAVAILABLE_RETRY_STOP_ROW_GONE],
+  ])('after the retry timer\'s stop "%s" ends an open episode before its alert, a much later outcome begins a new episode and posts no alert until that episode\'s own threshold passes', async (stop) => {
     const u = buildUnclassified()
-    u.report('K', errInternal())
+    expect(u.report('K', errInternal())).toBe('begun')
+    expect(u.retryStopped('K', stop)).toBe(true)
 
-    u.retryStopped('K', UNAVAILABLE_RETRY_STOP_ROW_LIVE)
+    await clock.advance(DEFAULT_THRESHOLD_MS * 5)
+    const laterStart = clock.now()
+    expect(u.report('K', errInternal())).toBe('begun')
 
-    expect(lines.at(-1)).toBe(`[slack] persona-episodes: persona=K ${KIND} ended — ${UNCLASSIFIED_ERROR_END_ROW_LIVE}`)
+    expect(posts).toEqual([])
+    expect(logOnlyCalls).toEqual([])
+    expect(episodes.view('K', KIND)?.startedAt).toBe(laterStart)
+    expect(lines.at(-1)).toBe(startedLine('K', errInternal()))
+
+    await clock.advance(DEFAULT_THRESHOLD_MS)
+    expect(u.report('K', errInternal())).toBe('continued')
+    expect(posts).toEqual([])
+
+    await clock.advance(1)
+    expect(u.report('K', errInternal())).toBe('alerted')
+    expect(posts).toEqual([alertPost('K', errInternal())])
   })
 
   test.each([
     [UNAVAILABLE_RETRY_STOP_NOT_UP],
     [UNAVAILABLE_RETRY_STOP_NOT_APPLIED],
     [UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED],
-    [UNAVAILABLE_RETRY_STOP_ROW_GONE],
+    [UNAVAILABLE_RETRY_STOP_RUN_FAILED],
     [UNAVAILABLE_RETRY_STOP_CAPPED],
     [UNAVAILABLE_RETRY_STOP_TORN_DOWN],
     [UNAVAILABLE_RETRY_STOP_SHUTDOWN],
-    [UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED],
-    [UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED],
-    [UNAVAILABLE_RETRY_STOP_RUN_FAILED],
     ['a reason no module names'],
   ])('the retry timer\'s stop "%s" leaves the episode open, with its start kept, and its alert still posts past the threshold', async (stop) => {
     const u = buildUnclassified()
