@@ -29,8 +29,8 @@
  *     SRJ-112, SRJ-708). The 0.10.0 client's parameter type does not declare
  *     it and its flag builder does not emit it, so a spawn made through the
  *     0.10.0 client never carries `--reuse-finished`; the test stub records
- *     the parameters as given. The Phase 1 client's own field replaces this
- *     declaration (b.jg5 E37) and must map to `--reuse-finished`.
+ *     the parameters as given; agent-director's own flag for it is
+ *     `--reuse-finished`.
  *
  * SPDX-License-Identifier: MIT
  */

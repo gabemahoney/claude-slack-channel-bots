@@ -124,8 +124,6 @@ import {
   LIVENESS_READING_UNKNOWN,
 } from '../src/liveness-reading.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
-import { adGraceMsInEffect } from '../src/ad-settings.ts'
-import { parseLaunchStart } from '../src/pending-row.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
@@ -181,7 +179,6 @@ import {
   errTmuxUnresponsive,
   holdFindMissing,
   holdSpawns,
-  SAMPLE_LAUNCH_START_DEFAULT,
   SAMPLE_LAUNCH_START_NONE,
   unavailableForms,
   type FindMissingHold,
@@ -219,6 +216,7 @@ import {
   launchThroughSequence,
   makeRecoveryHarness,
   ownRowsLiveThenMissing,
+  pastSampleGrace,
   personaOf,
   retryNow,
   scriptLiveRowElsewhere,
@@ -1532,7 +1530,7 @@ describe('b.jg5 SRJ-706, SRJ-1011: a message lost while P\'s live-row sequence r
   test('the row the sequence last read `pending`, and the stub\'s `status` answering `pending`: restarting, never session starting, with no read', async () => {
     const h = makeRecovery()
     const [key] = h.keys as [string]
-    await h.clock.advanceTo(parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)! + adGraceMsInEffect())
+    await pastSampleGrace(h)
     const persona = personaOf(h, key)
     h.script({
       statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }),

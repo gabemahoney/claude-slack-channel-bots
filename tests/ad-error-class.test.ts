@@ -11,11 +11,7 @@
  * stub's error builders it is fed with (b.jg5 SRJ-1303; their shape checks
  * live here).
  *
- * Every value is built with the stub's builders; a value the stub has no
- * builder for (`ErrCwdNotFound`, `ErrCwdNotADirectory`,
- * `ErrSendKeysWhileRelayed`) is built with `new` on the 0.10.0 client's own
- * class, imported through `src/agent-director-errors.ts`, its `errName` taken
- * from the class name. The three Phase-1-only names and the three store-open
+ * Every value is built with the stub's builders. The three Phase-1-only names and the three store-open
  * names come from `src/agent-director-errors.ts` as strings; no class of
  * theirs is imported. Class labels come from `src/ad-error-class.ts`, the
  * description words, the survivor pattern and `survivorPids` from
@@ -105,9 +101,6 @@ import {
   ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
-  ErrCwdNotADirectory,
-  ErrCwdNotFound,
-  ErrSendKeysWhileRelayed,
   ErrUnknownErrorName,
   PHASE1_ONLY_ERR_NAMES,
   STORE_OPEN_ERR_NAMES,
@@ -127,6 +120,8 @@ import {
   UNUSABLE_NAME_FAULTS,
   errCallTimeout,
   errConfigMalformed,
+  errCwdNotADirectory,
+  errCwdNotFound,
   errGeneric,
   errInstanceIdCollision,
   errInternal,
@@ -135,6 +130,7 @@ import {
   errJsonlNeverWritten,
   errNoSessionId,
   errSchemaMismatch,
+  errSendKeysWhileRelayed,
   errSpawnNotFound,
   errSpawnNotInteractive,
   errSpawnNotInteractiveLeftover,
@@ -193,15 +189,6 @@ const REPORTING_CLASSES: readonly AdErrorClass[] = [
   AD_ERROR_CLASS_UNUSABLE_NAME,
   AD_ERROR_CLASS_CONFIG,
 ]
-
-/** A value of the 0.10.0 client's own class that the stub has no builder for; `errName` is the class name. */
-function clientError<T extends AgentDirectorError>(
-  Cls: new (verb: string, errName: string, description: string) => T,
-  verb: string,
-  description: string,
-): T {
-  return new Cls(verb, Cls.name, description)
-}
 
 /** An `Error` whose `name` is `name` (not an `AgentDirectorError`). */
 function plainErrorNamed(name: string): Error {
@@ -306,8 +293,8 @@ const ROWS: readonly Row[] = [
   ['errInvalidFlags (decide)', () => errInvalidFlags('decide'), AD_ERROR_CLASS_STATE],
   ['errInvalidFlags (resume)', () => errInvalidFlags('resume'), AD_ERROR_CLASS_STATE],
   // DIRECTORY
-  ['ErrCwdNotFound', () => clientError(ErrCwdNotFound, 'spawn', 'cwd not found'), AD_ERROR_CLASS_DIRECTORY],
-  ['ErrCwdNotADirectory', () => clientError(ErrCwdNotADirectory, 'spawn', 'cwd not a directory'), AD_ERROR_CLASS_DIRECTORY],
+  ['errCwdNotFound', () => errCwdNotFound(), AD_ERROR_CLASS_DIRECTORY],
+  ['errCwdNotADirectory', () => errCwdNotADirectory(), AD_ERROR_CLASS_DIRECTORY],
   // UNCLASSIFIED
   ['errInternal without the phrase', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED],
   ['errSchemaMismatch', () => errSchemaMismatch(), AD_ERROR_CLASS_UNCLASSIFIED],
@@ -323,8 +310,8 @@ const ROWS: readonly Row[] = [
   ],
   ['errSystemInstallDisappeared', () => errSystemInstallDisappeared(), AD_ERROR_CLASS_UNCLASSIFIED],
   [
-    'ErrSendKeysWhileRelayed (a name CSCB gives no handling)',
-    () => clientError(ErrSendKeysWhileRelayed, 'send-keys', 'relay is on'),
+    'errSendKeysWhileRelayed (a name CSCB gives no handling)',
+    () => errSendKeysWhileRelayed(),
     AD_ERROR_CLASS_UNCLASSIFIED,
   ],
 ]
@@ -805,11 +792,11 @@ describe('classifyAdError: reported name and message', () => {
   })
 
   test('an error of its own class reports its errName and its errDescription', () => {
-    const err = clientError(ErrSendKeysWhileRelayed, 'send-keys', 'relay is on')
+    const err = errSendKeysWhileRelayed()
     expect(classifyAdError(err)).toEqual({
       errorClass: AD_ERROR_CLASS_UNCLASSIFIED,
-      reportedName: ErrSendKeysWhileRelayed.name,
-      message: 'relay is on',
+      reportedName: err.errName,
+      message: err.errDescription,
     })
   })
 
@@ -834,7 +821,7 @@ describe('classifyAdError: reported name and message', () => {
         `${UNUSABLE_RECORDED_NAME_PHRASE} ${redacted}`,
       ],
       [classifyAdError(unknownNamed(ERR_CONFIG_MALFORMED, secret)), ERR_CONFIG_MALFORMED, redacted],
-      [classifyAdError(errNamed(ErrSendKeysWhileRelayed.name)), ErrSendKeysWhileRelayed.name, redacted],
+      [classifyAdError(errNamed(errSendKeysWhileRelayed().errName)), errSendKeysWhileRelayed().errName, redacted],
       [
         (await classifyWithInvalidFlagsRecheck(errNamed(errInvalidFlags().errName), recordingTrigger(PASS).trigger)).classification,
         errInvalidFlags().errName,
@@ -1376,7 +1363,7 @@ describe('unclassifiedClassificationOf (b.jg5 SRJ-104, SRJ-110)', () => {
     ['errInstanceIdCollision', () => errInstanceIdCollision(), AD_ERROR_CLASS_STATE],
     ['errSpawnNotResumable', () => errSpawnNotResumable(), AD_ERROR_CLASS_STATE],
     ['errTmuxSessionCreate', () => errTmuxSessionCreate('kill'), AD_ERROR_CLASS_LAUNCH_FAILURE],
-    ['ErrCwdNotFound', () => clientError(ErrCwdNotFound, 'kill', 'cwd not found'), AD_ERROR_CLASS_DIRECTORY],
+    ['errCwdNotFound', () => errCwdNotFound('kill'), AD_ERROR_CLASS_DIRECTORY],
   ])('%s (classified %s) → UNCLASSIFIED, carrying its errName and its description', (_label, build, classified) => {
     const value = build()
     // Precondition: the classifier gives it another class.

@@ -5,10 +5,8 @@
  *
  * One row per value S1 names, each mapped to exactly one outcome by class
  * and by name through `src/ad-error-class.ts`. Every value is built with the
- * stub's builders; `ErrCwdNotFound`, which the stub has no builder for, is
- * built with `new` on the 0.10.0 client's class imported through
- * `src/agent-director-errors.ts`. Phase-1-only and store-open names come from
- * that module as strings. Kinds, class labels and the line count are
+ * stub's builders. Phase-1-only and store-open names come from
+ * `src/agent-director-errors.ts` as strings. Kinds, class labels and the line count are
  * imported from `src/`; the line count and the class note are pinned once
  * as literals.
  *
@@ -40,7 +38,6 @@ import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
 import {
   ERR_SCHEMA_MIGRATION_REQUIRED_NAME,
   ERR_STORE_OPEN_NAME,
-  ErrCwdNotFound,
   PHASE1_ONLY_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
 import {
@@ -69,6 +66,7 @@ import {
   UNAVAILABLE_FORMS,
   UNUSABLE_NAME_FAULTS,
   errConfigMalformed,
+  errCwdNotFound,
   errInternal,
   errJsonlMissing,
   errRelayModeOff,
@@ -112,7 +110,7 @@ const ROWS: readonly Row[] = [
   ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared(VERB), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED],
   ['ErrSpawnNotInteractive (a STATE name other than ErrSpawnNotFound)', () => errSpawnNotInteractive(VERB), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_STATE],
   ['ErrTmuxSessionCreate (LAUNCH FAILURE)', () => errTmuxSessionCreate(VERB), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_LAUNCH_FAILURE],
-  ['ErrCwdNotFound (DIRECTORY)', () => new ErrCwdNotFound(VERB, ErrCwdNotFound.name, 'cwd not found'), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_DIRECTORY],
+  ['ErrCwdNotFound (DIRECTORY)', () => errCwdNotFound(VERB), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_DIRECTORY],
   ['ErrRelayModeOff (a name CSCB gives no handling)', () => errRelayModeOff(), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED],
 ]
 

@@ -46,12 +46,15 @@
  * made of a row last read `pending` while P's `ad-config-malformed` outage is
  * raised (SRJ-316); every kill's retry is seeded with the state last read and
  * keeps going only while the sequence is neither stopped nor P latched. An
- * answer that arrives once the stop signal is set for a teardown, shutdown
- * or a persona not up (a kill's, a `get`'s, a run's, the step-6 launch's, a
- * latch's, a dependency's throw) is dropped
+ * answer that arrives once the stop signal is set for a teardown or shutdown
+ * (a kill's, a `get`'s, a run's, the step-6 launch's, a latch's, a
+ * dependency's throw) is dropped
  * with one line: the sequence ends stopped, with no further call, no latch,
- * no alert and no arm; a kill whose tries the keep-going check stopped raises
- * only the retry's log-only alert (`stopped`). A stop for P's latch (the
+ * no alert and no arm. A kill whose tries the keep-going check stopped raises
+ * only the retry's log-only alert (`stopped`) and ends the sequence stopped:
+ * with the stop signal's reason when it is set, else `latched` when P is
+ * latched, else `not-up` (the server's keep-going query stopped the tries:
+ * P is not up or the server is stopping). A stop for P's latch (the
  * latch's set observer, which also fires for the sequence's own latching
  * call) drops no answer: it is handled as for a latched P, and the sequence
  * makes no call after it. A
@@ -111,6 +114,8 @@
 import {
   AD_ERROR_CLASS_CONFLICT,
   AD_ERROR_CLASS_UNUSABLE_NAME,
+  classifyAdError,
+  describeAdErrorClassification,
   describeAgentDirectorFailure,
 } from './ad-error-class.ts'
 import { AD_WAIT_NEVER_ENDS, armNeverEarlyWait, type NeverEarlyWaitClock } from './ad-settings.ts'
@@ -702,11 +707,6 @@ function head(ref: string): string {
   return `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}`
 }
 
-/** The last read, for a line. */
-function describeLastRead(lastRead: LiveRowSequenceLastRead): string {
-  return lastRead.kind === LIVE_ROW_SEQUENCE_NO_ROW ? 'no row' : renderState(lastRead.state)
-}
-
 /**
  * The start line:
  *   `[slack] live-row-sequence: <ref>: started at step <n> for <id> (last read <state>; <launch form>; alert context <context>) (b.jg5 SRJ-705)`
@@ -734,13 +734,13 @@ export function liveRowSequenceNoKillLine(ref: string, step: 1 | 4): string {
 
 /**
  * A `get`'s line:
- *   `[slack] live-row-sequence: <ref>: step <n> get: state=<state> | no row (ErrSpawnNotFound) | failed: <redacted failure> | the read latched the persona (b.jg5 SRJ-705, SRJ-114)`
+ *   `[slack] live-row-sequence: <ref>: step <n> get: state=<state> | no row (ErrSpawnNotFound) | failed: <describeReadFailure> | the read latched the persona (b.jg5 SRJ-705, SRJ-114)`
  */
 export function liveRowSequenceGetLine(ref: string, step: 2 | 3 | 4, read: LiveRowSequenceRead): string {
   return `${head(ref)}: step ${step} get: ${describeRead(read)} (b.jg5 SRJ-705, SRJ-114)`
 }
 
-/** A read's answer, in words; a failure through the redacting describer. */
+/** A read's answer, in words; a failure through {@link describeReadFailure}. */
 function describeRead(read: LiveRowSequenceRead): string {
   switch (read.kind) {
     case LIVE_ROW_READ_ROW:
@@ -748,10 +748,25 @@ function describeRead(read: LiveRowSequenceRead): string {
     case LIVE_ROW_READ_ABSENT:
       return 'no row (ErrSpawnNotFound)'
     case LIVE_ROW_READ_REFUSED:
-      return `failed: ${describeAgentDirectorFailure(read.error)}`
+      return `failed: ${describeReadFailure(read.error)}`
     case LIVE_ROW_READ_LATCHED:
       return 'the read latched the persona'
   }
+}
+
+/**
+ * A failed read, as the kill line reports a failure (b.jg5 SRJ-104): the
+ * classification's class, reported name and rendered message
+ * (`describeAdErrorClassification`) when it carries a name or a message, so
+ * an `ErrUnknownErrorName` reports its `unknownName` and agent-director's own
+ * description; else the redacting describer's name and message. Never throws.
+ */
+function describeReadFailure(error: unknown): string {
+  const classification = classifyAdError(error)
+  if (classification.reportedName !== undefined || classification.message !== undefined) {
+    return describeAdErrorClassification(classification)
+  }
+  return describeAgentDirectorFailure(error)
 }
 
 /**
@@ -880,7 +895,7 @@ export function liveRowSequenceEndLine(ref: string, outcome: LiveRowSequenceOutc
 
 /**
  * The line when a result arrives after the sequence was stopped:
- *   `[slack] live-row-sequence: <ref>: the <what> answered after the sequence was stopped — its answer is dropped; no further call`
+ *   `[slack] live-row-sequence: <ref>: the <what> answered after the sequence was stopped — its answer is dropped; no further call (b.jg5 SRJ-706)`
  */
 export function liveRowSequenceDroppedLine(ref: string, what: string): string {
   return `${head(ref)}: the ${what} answered after the sequence was stopped — its answer is dropped; no further call (b.jg5 SRJ-706)`
@@ -889,7 +904,7 @@ export function liveRowSequenceDroppedLine(ref: string, what: string): string {
 /**
  * The line when a dependency threw; `described` is a redacting describer's
  * output (`describeThrownValue`), never the error:
- *   `[slack] live-row-sequence: <ref>: <what> failed: <described> — the sequence ends without its launch`
+ *   `[slack] live-row-sequence: <ref>: <what> failed: <described> — the sequence ends without its launch (b.jg5 SRJ-705)`
  */
 export function liveRowSequenceFailedLine(ref: string, what: string, described: string): string {
   return `${head(ref)}: ${what} failed: ${described} — the sequence ends without its launch (b.jg5 SRJ-705)`
@@ -946,8 +961,8 @@ export async function runLiveRowSequence(
   }
 
   /**
-   * The stop that drops an answer arriving after it: a teardown, shutdown or
-   * not-up stop. A stop for P's latch (the latch's set observer, SRJ-502)
+   * The stop that drops an answer arriving after it: a teardown or shutdown
+   * stop. A stop for P's latch (the latch's set observer, SRJ-502)
    * drops nothing: the answer is handled as for a latched P (the sequence's
    * own latching call included), and `halted()` ends the sequence before its
    * next call.

@@ -91,7 +91,7 @@
  * The kill as a latch site (SRJ-110, SRJ-505, AC 9; E20): P's restart run's
  * kill of its dead row, or the step-1 kill of the live-row sequence P's
  * launch starts at a collision ladder replacement site over a row read
- * `waiting` in another directory (SRJ-613's kill backstop; the ladder makes
+ * `waiting` in another directory (the ladder makes
  * no kill of its own, b.jg5 SRJ-707), answers CONFLICT "not this launch's
  * session" (the case table's restart-kill and sequence-kill rows), or
  * the restart run's kill answers UNUSABLE NAME; P latches once with one
@@ -108,9 +108,13 @@
  * a `provenance_conflict` note at the step-2 `get` or a confirming `get`
  * latches "conflicting labels" with the note latch's refused operation, one
  * post; P's own `pending` row with no launch start at the step-2 `get`
- * latches "launch start not recorded" with one post and no wait armed, and
- * the same row under an old key latches no one; Q's sequence, run beside
- * P's, is not latched and launches.
+ * latches "launch start not recorded" with one post and no wait armed (each
+ * such read ends the sequence stopped for the latch, with no further call
+ * and nothing armed), and the same row under an old key latches no one; Q's
+ * sequence, run beside P's, is not latched and launches. A running sequence
+ * whose first run is held stops when P latches from another path's own-row
+ * read: no further call for P, one post, no alert or timer left, while Q's
+ * sequence beside it runs on to its launch.
  * The reuse spawn's latches (SRJ-112, SRJ-501, SRJ-507, SRJ-512; HO rev 15,
  * rev 20; AC 77, AC 85; E22, on `makeRecoveryHarness`'s sequence driver
  * ending in a reuse): over the case table's reuse rows
@@ -311,7 +315,7 @@ import {
   PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE,
   RETRY_KILL_LATER_PHRASE,
 } from '../src/ad-description-phrases.ts'
-import { adAlertThresholdMsInEffect, adGraceMsInEffect } from '../src/ad-settings.ts'
+import { adAlertThresholdMsInEffect } from '../src/ad-settings.ts'
 import type { Phase1GetResult } from '../src/ad-phase1-types.ts'
 import { ERR_TMUX_SESSION_CONFLICT_NAME } from '../src/agent-director-errors.ts'
 import {
@@ -411,16 +415,17 @@ import {
   LIVE_ROW_OUTCOME_LAUNCHED,
   LIVE_ROW_OUTCOME_STOPPED,
   LIVE_ROW_SEQUENCE_ENTRY_GET,
-  LIVE_ROW_SEQUENCE_STEP3_RUNS,
+  LIVE_ROW_SEQUENCE_LOG_PREFIX,
   LIVE_ROW_STOP_LATCHED,
+  liveRowSequenceStopAskedLine,
 } from '../src/live-row-sequence.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
+  LIVENESS_DEAD_ROW_MISSING,
 } from '../src/liveness-reading.ts'
-import { parseLaunchStart } from '../src/pending-row.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import {
@@ -490,7 +495,6 @@ import {
   CONFLICT_CASES,
   cannedFindMissing,
   cannedGetResult,
-  cannedKillResult,
   cannedOk,
   cannedStatusResult,
   errGeneric,
@@ -569,16 +573,21 @@ import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
 import {
   callCounts,
   callCountsSince,
+  callsBeforeSequenceKill,
   collided,
   conditionEndedLine,
   conditionRecoveryLine,
   expectLostMessageReports,
+  killFailureLines,
   makeRecoveryHarness,
+  pastSampleGrace,
   personaCallCounts,
   personaOf,
+  personaRow,
   recordCallOrder,
   reuseSpawnOf,
   retryNow,
+  scriptSequenceKillFailure,
   startSequenceHeldAtRun,
   unclassifiedEndedLine,
   unclassifiedLines,
@@ -2648,7 +2657,7 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
 // a latch site (E20; the E13, E16 and E19 hatch notes). P's restart run kills
 // its dead row, or the live-row sequence P's launch starts at a collision
 // ladder replacement site (a row of P's read `waiting` in another directory;
-// b.jg5 SRJ-707) kills it at its step 1 (SRJ-613's kill backstop), and the
+// b.jg5 SRJ-707) kills it at its step 1, and the
 // kill answers CONFLICT
 // "not this launch's session"; or the restart run's kill answers UNUSABLE
 // NAME. P latches once with one post, P's retry timer (armed before) stops
@@ -2680,7 +2689,7 @@ const KILL_LATCH_WAYS: ReadonlyArray<
     },
   ] as const),
   ...sequenceKillConflictRowsAt(SEQUENCE_STEP1_KILL_SITE, 'waiting').filter((row) => row.latchCase === LATCH_CASE_NOT_THIS_LAUNCH).map((row) => [
-    `the step-1 kill of the live-row sequence P's launch starts over a row read waiting in another directory: CONFLICT (${row.name}, SRJ-613's kill backstop)`,
+    `the step-1 kill of the live-row sequence P's launch starts over a row read waiting in another directory: CONFLICT (${row.name})`,
     (key: string) =>
       expectedLatchRecord(key, {
         latchCase: row.latchCase,
@@ -2891,11 +2900,10 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
 // ---------------------------------------------------------------------------
 
 describe('SRJ-507: the another-store description at the ladder\'s ErrNoSessionId reuse site latches P with "another agent-director store" and "reuse spawn" (recovery harness)', () => {
-  const ANOTHER_STORE_REUSE_ROWS = REUSE_SPAWN_CONFLICT_CASE_ROWS.filter((row) => row.latchCase === LATCH_CASE_ANOTHER_STORE)
-
-  test('both forms of the another-store description are reuse rows: the reuse\'s own and the plain spawn\'s wording', () => {
-    expect(ANOTHER_STORE_REUSE_ROWS.map((row) => row.options.plainSpawn === true)).toEqual([false, true])
-  })
+  /** Both forms of the another-store description, each a reuse row: the reuse's own wording, then the plain spawn's. */
+  const ANOTHER_STORE_REUSE_ROWS = [false, true].map((plainSpawn) =>
+    REUSE_SPAWN_CONFLICT_CASE_ROWS.find((row) => row.latchCase === LATCH_CASE_ANOTHER_STORE && (row.options.plainSpawn === true) === plainSpawn)!,
+  )
 
   test.each(ANOTHER_STORE_REUSE_ROWS.map((row) => [row.name, row] as const))('%s: P latches once with "another agent-director store", "reuse spawn" and the collision get\'s ended; one post carrying the another-store line; the reuse spawn is the last call; no delete, kill or count; Q is not latched', async (_name, row) => {
     const h = makeRecoveryHarness()
@@ -3949,7 +3957,8 @@ describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latc
 // or a live `waiting` one), a `provenance_conflict` note at a `get`, or P's
 // own `pending` row with no launch start at its step-2 `get`. Each latches P
 // once through the latch's entries with one post, and the sequence makes no
-// further call; the outcome itself is tests/live-row-sequence.test.ts's.
+// further call; a latching read's outcome (stopped for the latch, nothing
+// armed) is asserted here too, a kill's is tests/live-row-sequence.test.ts's.
 // ---------------------------------------------------------------------------
 
 /** The live-row sequence's own latch: how P's sequence meets it, and what it records and posts. */
@@ -3995,21 +4004,19 @@ const SEQUENCE_LATCH_WAYS: ReadonlyArray<readonly [string, SequenceLatchWay]> = 
 
 /**
  * Script P's sequence to reach `site`'s kill having last read `state`, and
- * that kill to answer `error`: every `get` reads P's own row in `state`, every
- * run judges it and leaves it live, and an earlier kill succeeds. The clock
- * is past G from the stub's sample launch start, so a `pending` row is waited
- * on no longer. Answers the calls the sequence makes before that kill.
+ * that kill to answer `error` (`scriptSequenceKillFailure`): every `get`
+ * reads P's own row in `state`, every run judges it and leaves it live, and
+ * an earlier kill succeeds. The clock is past G from the stub's sample launch
+ * start (`pastSampleGrace`), so a `pending` row is waited on no longer.
+ * Answers the calls the sequence makes before that kill
+ * (`callsBeforeSequenceKill`).
  */
 async function scriptSequenceKill(h: RecoveryHarness, key: string, site: SequenceKillSite, state: string, error: () => Error): Promise<string[]> {
-  await h.clock.advanceTo(parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)! + adGraceMsInEffect())
-  const step4 = SEQUENCE_KILL_STEP[site] === 4
-  h.script({
-    getResult: cannedGetResult({ state }, personaOf(h, key), h.home),
-    findMissingResult: cannedFindMissing({ rows: { [personaInstanceId(key)]: 'unverified_ids' } }),
-    killQueue: step4 ? [cannedOk(cannedKillResult(true))] : [],
-    killError: error(),
-  })
-  return step4 ? ['kill', 'get', ...Array.from({ length: LIVE_ROW_SEQUENCE_STEP3_RUNS }, () => ['findMissing', 'get']).flat()] : []
+  await pastSampleGrace(h)
+  const step = SEQUENCE_KILL_STEP[site]
+  h.script({ getResult: personaRow(h, key, { state }), findMissingResult: cannedFindMissing({ rows: { [personaInstanceId(key)]: 'unverified_ids' } }) })
+  scriptSequenceKillFailure(h, step, error)
+  return callsBeforeSequenceKill(step)
 }
 
 describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME, a note at a get, a pending row with no launch start (recovery harness; SRJ-110, SRJ-501, SRJ-512, SRJ-513, SRJ-114, SRJ-613)', () => {
@@ -4068,19 +4075,23 @@ describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME
   })
 
   test.each([
-    ['the step-2 get', 0],
-    ['a confirming get', 1],
-  ] as const)('a provenance_conflict note at %s: P latches "conflicting labels" with the note latch\'s refused operation, one post', async (_label, before) => {
+    ['the step-2 get', 0, ['kill', 'get']],
+    ['a confirming get', 1, ['kill', 'get', 'findMissing', 'get']],
+  ] as const)('a provenance_conflict note at %s: P latches "conflicting labels" with the note latch\'s refused operation, one post; the sequence stops for the latch with no further call and nothing armed', async (_label, before, calls) => {
     const { h, p } = makeSequenceRun()
-    const persona = personaOf(h, p)
     h.script({
       getQueue: [
-        ...Array.from({ length: before }, () => cannedOk<Phase1GetResult>(cannedGetResult({}, persona, h.home))),
-        cannedOk<Phase1GetResult>(cannedGetResult({ liveness_note: provenanceNote }, persona, h.home)),
+        ...Array.from({ length: before }, () => cannedOk<Phase1GetResult>(personaRow(h, p))),
+        cannedOk<Phase1GetResult>(personaRow(h, p, { liveness_note: provenanceNote })),
       ],
     })
+    const order = recordCallOrder(h)
 
-    await h.runSequence(p, { lastReadState: cannedStatusResult().state })
+    const outcome = await h.runSequence(p, { lastReadState: cannedStatusResult().state })
+
+    expect(order).toEqual([...calls])
+    expect(outcome).toEqual({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED, runs: before, kills: 1, judgedRuns: before })
+    expect(h.controller.isArmed(p)).toBe(false)
 
     expect(h.latch.record(p)).toEqual(
       expectedLatchRecord(p, {
@@ -4096,12 +4107,15 @@ describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME
     ])
   })
 
-  test('a configured persona\'s own pending row with no launch start at the step-2 get: P latches "launch start not recorded" with one post, and no wait is armed', async () => {
+  test('a configured persona\'s own pending row with no launch start at the step-2 get: P latches "launch start not recorded" with one post, and no wait is armed; the sequence stops for the latch with no wait, run or other call', async () => {
     const { h, p } = makeSequenceRun()
-    h.script({ getResult: cannedGetResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }, personaOf(h, p), h.home) })
+    h.script({ getResult: personaRow(h, p, { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }) })
+    const order = recordCallOrder(h)
 
-    await h.runSequence(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
+    const outcome = await h.runSequence(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
 
+    expect(order).toEqual(['get'])
+    expect(outcome).toEqual({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED, runs: 0, kills: 0, judgedRuns: 0 })
     // No wait was armed: no timer fired or is pending on the clock.
     expect([h.clock.firedCount(), h.clock.pendingCount()]).toEqual([0, 0])
     expect(h.latch.record(p)).toEqual(launchStartRecord(p))
@@ -4248,41 +4262,55 @@ describe('the reuse spawn\'s latches at the sequence\'s final launch: CONFLICT w
 // T2; b.jg5 SRJ-502, SRJ-706; the E13 hatch note)
 //
 // On `makeAutomatedPathsRun`'s recovery harness, whose registry is installed
-// after the latch as main() installs it, with P's sequence started through
-// the registry and its first run held. P latches through the other paths'
-// own-row reads (a `get` noting `provenance_conflict`, and the tick's and
-// retry's `status` read of P's own `pending` row with no launch start): the
-// latch's set observer stops the sequence, so once its run is released it
-// makes no further `get`, kill or launch, and no kill of `cscb_<key>`
-// follows the latch (AC 46). A start of a latched P's sequence (no call at
-// all) is tests/live-row-sequence.test.ts's; a latch of Q leaving P's
-// sequence running, tests/session-manager.test.ts's.
+// after the latch as main() installs it, with P's and Q's sequences started
+// through the registry and each first run held. P latches through the other
+// paths' own-row reads (a `get` noting `provenance_conflict`, and the tick's
+// and retry's `status` read of P's own `pending` row with no launch start):
+// the latch's set observer stops P's sequence, so once its run is released
+// it makes no further `get`, kill or launch, and no kill of `cscb_<key>`
+// follows the latch (AC 46); Q's sequence, not latched, runs on to its
+// launch. A start of a latched P's sequence (no call at all) is
+// tests/live-row-sequence.test.ts's; a latch installed after the registry,
+// tests/session-manager.test.ts's.
 // ---------------------------------------------------------------------------
 
 describe('a running live-row sequence stops when P latches from another path: no further get, kill or launch for P, and one post (recovery harness; SRJ-502, SRJ-706, AC 46)', () => {
-  test.each(OTHER_LATCH_PATHS.filter(([name]) => name.startsWith('an own-row')))('P latched by %s while its first run is held: a launch of P meanwhile answers latched; once the run is released the sequence ends stopped for the latch and makes no further call for P, with only the latch\'s own post', async (_name, latchP, latchCase) => {
+  test.each(OTHER_LATCH_PATHS.filter(([name]) => name.startsWith('an own-row')))('P latched by %s while its first run is held: a launch of P meanwhile answers latched; once the run is released the sequence ends stopped for the latch and makes no further call for P, with only the latch\'s own post and no alert or timer left; Q\'s sequence beside it runs on to its launch', async (_name, latchP, latchCase) => {
     const run = makeAutomatedPathsRun()
     const { h } = run
-    const [p] = h.keys as [string]
+    const [p, q] = h.keys as [string, string]
     const hold = holdFindMissing(h.stub.client)
     const sequence = await startSequenceHeldAtRun(h, p, hold)
+    const qSequence = await startSequenceHeldAtRun(h, q, hold)
     expect(personaCallCounts(h, p)).toEqual({ killCalls: 1, getCalls: 1 })
 
     await latchP(run, p)
     const pAtLatch = personaCallCounts(h, p)
+    // Only P's sequence was asked to stop.
+    expect(h.lines.filter((line) => line.startsWith(LIVE_ROW_SEQUENCE_LOG_PREFIX) && line.includes(': stop asked'))).toEqual([
+      liveRowSequenceStopAskedLine(`persona=${p}`, LIVE_ROW_STOP_LATCHED),
+    ])
 
     // Stopped but still settling: the gate gives the latched persona the latched answer, with no call.
     expect(h.sequenceRunning(p)).toBe(true)
     expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    // Q's next get reads its own row missing, so its released run goes on to its launch.
+    h.script({ getResult: personaRow(h, q, { state: LIVENESS_DEAD_ROW_MISSING }) })
     hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(q)]: 'ids' } }))
 
-    expect(await h.driveSequence(sequence.outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
+    const [pOutcome, qOutcome] = await h.driveSequence(Promise.all([sequence.outcome, qSequence.outcome]))
+    expect(pOutcome).toEqual({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED, runs: 1, kills: 1, judgedRuns: 0 })
+    expect(qOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: q, action: 'spawned' } })
     expect(callCountsSince(personaCallCounts(h, p), pAtLatch)).toEqual({})
-    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
-    expect([hold.calls.length, h.stub.calls.spawnCalls]).toEqual([1, []])
+    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }, { claude_instance_id: personaInstanceId(q) }])
+    expect(hold.calls).toHaveLength(2)
+    expect(h.reuseSpawns().map((reuse) => reuse.claude_instance_id)).toEqual([personaInstanceId(q)])
     expect(h.latch.record(p)?.latchCase).toBe(latchCase)
-    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect([h.latch.isLatched(q), latchSteps(h)]).toEqual([false, oneLatch(p)])
     expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
-    expect([h.sequenceRunning(p), h.clock.pendingCount()]).toEqual([false, 0])
+    expect(killFailureLines(h, p)).toEqual([])
+    await h.runApproverToStop(q)
+    expect([h.sequenceRunning(p), h.sequenceRunning(q), h.clock.pendingCount()]).toEqual([false, false, 0])
   })
 })

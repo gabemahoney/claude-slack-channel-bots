@@ -294,8 +294,6 @@ import {
   AgentDirectorError,
   ErrInstanceIdCollision,
   ErrSpawnNotFound,
-  ErrCwdNotFound,
-  ErrCwdNotADirectory,
   ErrSpawnCapReached,
   ERR_INSTANCE_ID_COLLISION_NAME,
   ERR_JSONL_MISSING_NAME,
@@ -7035,8 +7033,8 @@ async function readPersonaKillRow(key: string, site: string, ref: string): Promi
 /**
  * Delete persona `key`'s row (`cscb_<key>`) through `withOutageDetection`;
  * rethrows every error. The persona teardown's delete only
- * (`deletePersonaInstance`), which E25 removes (b.jg5 SRJ-715, SRJ-716): no
- * launch path deletes a row, and none deletes before a spawn (SRJ-707).
+ * (`deletePersonaInstance`; b.jg5 SRJ-715, SRJ-716): no launch path deletes
+ * a row, and none deletes before a spawn (SRJ-707).
  */
 function deleteInstanceRow(key: string): Promise<unknown> {
   return withOutageDetection(key, undefined, 'delete', (client) => client.delete({ claude_instance_id: [personaInstanceId(key)] }))
@@ -7048,7 +7046,7 @@ function deleteInstanceRow(key: string): Promise<unknown> {
  * the row was there, false when it was already gone (`ErrSpawnNotFound`);
  * every other error is rethrown. A failure records no startup error and
  * raises no spawn-failure notice. For the persona teardown only (b.av2
- * SR-6.5), until E25 removes it (b.jg5 SRJ-715).
+ * SR-6.5, b.jg5 SRJ-715).
  */
 export async function deletePersonaInstance(key: string): Promise<boolean> {
   try {
@@ -7166,8 +7164,9 @@ function launchFailureResult(key: string): SpawnPersonaResult {
  * spawn the ladder makes (the first spawn, the retry spawn after the
  * collision `get` found no row, and the spawn after `resume` found none;
  * every replacement and resume's no-transcript answer go to the reuse spawn
- * of the same id instead, b.jg5 SRJ-707, SRJ-712), with no further launch: the `cwd` errors
- * answer `failed` quietly (the spawn's wrapper raised `cwd-unreachable`);
+ * of the same id instead, b.jg5 SRJ-707, SRJ-712), with no further launch: the DIRECTORY
+ * errors (`ErrCwdNotFound`, `ErrCwdNotADirectory`, by name) answer `failed`
+ * quietly (the spawn's wrapper raised `cwd-unreachable`);
  * then the refusal handling (`launchRefusalAt`: a CONFLICT latches with the
  * refused operation "plain spawn" and `lastRead`, an UNUSABLE NAME latches,
  * a refusal answers `failed`); any other error writes one line (`what`
@@ -7184,7 +7183,8 @@ async function plainSpawnFailedAt(
   what: string,
   lastRead: LastRowRead,
 ): Promise<SpawnPersonaResult> {
-  if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) return { key, action: 'failed' }
+  // b.av2 SR-6.4: `cwd-unreachable` was raised by the spawn's wrapper.
+  if (classifyAdError(err).errorClass === AD_ERROR_CLASS_DIRECTORY) return { key, action: 'failed' }
   const refused = await launchRefusalAt(key, err, 'spawn', what, ref, lastRead)
   if (refused) return refused
   const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
@@ -7396,7 +7396,6 @@ async function diagnoseJsonlMissing(
       ? adCandidates.map((c) => `${c.source} ${c.path} (${c.note})`).join('; ')
       : redactSlackLogText(err.errDescription || '(no path detail from agent-director)')
     const notice = reportInconclusiveDiagnosis(
-      key,
       ref,
       claudeInstanceId,
       `the agent-director row is absent (ErrSpawnNotFound); AD reported: ${adDetail}`,
@@ -7524,7 +7523,6 @@ async function diagnoseJsonlMissing(
       `unreadable, or the count query failed) — see prior archive-count error line`
   }
   const notice = reportInconclusiveDiagnosis(
-    key,
     ref,
     claudeInstanceId,
     `${reason}. Transcript candidates tried (${detailProvenance}): ${candidateStr}`,
@@ -7547,7 +7545,6 @@ async function diagnoseJsonlMissing(
  * harm. Never throws.
  */
 function reportInconclusiveDiagnosis(
-  key: string,
   ref: string,
   claudeInstanceId: string,
   reason: string,
@@ -7842,8 +7839,7 @@ async function reuseFinishedRow(
  * retry timer is armed with the lost-race cause
  * (`reportLostRaceAtSite`, `UNAVAILABLE_RETRY_CAUSE_LOST_RACE`), and the
  * answer is the uncounted refused result, so the persona is re-evaluated at
- * its next tick or retry. E23 adds the row's re-read with `get`, its
- * `pending` rule and the live-row sequence on dead evidence.
+ * its next tick or retry; the row is not re-read here.
  *
  * b.jg5 SRJ-104: a `resume` that answers `ErrInvalidFlags` goes through the
  * `ErrInvalidFlags` step (`classifyWithInvalidFlagsRecheck`): one immediate
@@ -8025,8 +8021,7 @@ function deferForUnresolvedConfigDir(persona: Persona, ref: string): SpawnPerson
  * state's site entry (`reportLostRaceAtSite`; the attempt records it), and
  * the uncounted refused result (`failed` marked `refused`): no notice, no
  * `spawn-failed` entry, nothing counted. The persona is re-evaluated at its
- * next tick or retry. E23 adds the `get` re-read, its `pending` rule and the
- * live-row sequence on dead evidence (SRJ-710, SRJ-611). Never throws.
+ * next tick or retry; the row is not re-read here. Never throws.
  */
 function spawnNotResumableLostRace(key: string, ref: string, err: unknown): SpawnPersonaResult {
   const armed = reportLostRaceAtSite(key)
@@ -8041,8 +8036,9 @@ function spawnNotResumableLostRace(key: string, ref: string, err: unknown): Spaw
  * it (`resumeOrFreshSpawn`'s, the live-row sequence's launch entry's), with
  * no further launch: `ErrInvalidFlags` gets one immediate version re-check
  * (a stop it decides answers `failed` marked `stopping`; otherwise
- * UNCLASSIFIED through the site entry, b.jg5 SRJ-104, SRJ-313); the `cwd`
- * errors answer `failed` quietly; then the refusal handling
+ * UNCLASSIFIED through the site entry, b.jg5 SRJ-104, SRJ-313); the
+ * DIRECTORY errors (`ErrCwdNotFound`, `ErrCwdNotADirectory`, by name) answer
+ * `failed` quietly (the wrapper raised `cwd-unreachable`); then the refusal handling
  * (`launchRefusalAt`: a CONFLICT latches with the refused operation
  * "resume" and `lastRead`, an UNUSABLE NAME latches, a refusal answers
  * `failed`); any other error answers `failed` with one line and the
@@ -8084,9 +8080,8 @@ async function resumeFailedAt(
     logRefusal('spawnForPersona', 'resume', ref, `${describeAdErrorClassification(step.classification)} (${recheck})`)
     return { key, action: 'failed' }
   }
-  if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
-    return { key, action: 'failed' }
-  }
+  // b.av2 SR-6.4: `cwd-unreachable` was raised by the resume's wrapper.
+  if (classifyAdError(err).errorClass === AD_ERROR_CLASS_DIRECTORY) return { key, action: 'failed' }
   // b.jg5 SRJ-104, SRJ-105: `ErrSystemInstallDisappeared` is UNCLASSIFIED
   // (its wrapper has raised `ad-unreachable`), a refusal like the others.
   // b.jg5 SRJ-113: a CONFLICT latches the persona (refused operation

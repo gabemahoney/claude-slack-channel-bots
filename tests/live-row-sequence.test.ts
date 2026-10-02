@@ -13,42 +13,46 @@
  * wait: measured from the launch start with G in effect (SRJ-406, SRJ-210),
  * never early, at a G beyond the timer maximum too; no wait without a launch
  * start (SRJ-408). The not-judged stop (SRJ-717), the failed runs (SRJ-120's
- * refusal split, E14 build), the kills (SRJ-110, SRJ-702, SRJ-703, SRJ-1007),
- * the `ad-config-malformed` rule (SRJ-316), the reads (SRJ-114, SRJ-513), a
- * failed `get` (hatch A2), the alert's episode (SRJ-704), the launch kind
- * (step 6, its pure decision and through the sequence, a `resume` with no
- * transcript going on to one reuse, after the lost-transcript diagnosis's
- * `get` on `ErrJsonlMissing`, whose amnesia action the outcome carries,
- * SRJ-712: every reuse is one
- * stub `spawn` of `cscb_<key>` through the session manager's reuse spawn,
- * carrying the reuse flag and the persona's `extra_env`, read through the
- * harness's `reuseSpawns()`), the launch's end (which launch results are a
- * success, the outcome and its end line after a reuse that succeeds, fails
- * by each class, collides with a live row or throws; SRJ-112), the entries
- * and forms, the stop
- * signal (SRJ-706: an answer after the stop, a kill's, its latch's or a
- * dependency's throw, is dropped; a latched persona gets no call), the lines
- * that carry agent-director text, the module's import boundary, and the
- * scheduling (SRJ-706, AC 61: the registry through the session manager's
- * start, running and stop entries, with a run held by the stub's
- * `holdFindMissing`: a start that answers before the first call, one
- * sequence per persona at a time, every other launch of P answering
- * `sequence-waiting` with no call while Q goes ahead, a new sequence after
- * each kind of end, the stops at a latch, a teardown and shutdown during a
- * held run and the waits, `closed` after shutdown, and the sequence's own
- * detached recovery attempt), and the sequence started at the collision
- * ladder's real replacement sites (SRJ-707: the launch answering while it
- * runs, its reuse at step 6, a new episode at the next retry after a
- * not-judged stop, the `recovery` context). Every sequence runs through the registry but
- * `runWithDeps`'s, whose dependencies a case replaces. This
- * file asserts that the sequence stops; the latches it causes
- * (each kill's CONFLICT and UNUSABLE NAME rows, SRJ-613's kill backstop among
- * them, with their records and posts, and the reuse's CONFLICT and UNUSABLE
- * NAME latches) are in tests/conflict-latch.test.ts, the `resume` leg's
- * fallbacks, the sequence-launch entry and the reuse spawn's parameters,
- * steps and outcome table in tests/session-manager.test.ts, and the retry
- * cause each end arms (the reuse collision's among them) and step 4's
- * `ad-config-malformed` no-kill in tests/unavailable-retry.test.ts.
+ * refusal split, E14 build), the kills (SRJ-110, SRJ-702, SRJ-703, SRJ-1007;
+ * `ErrInvalidFlags`'s one version re-check, SRJ-104), the
+ * `ad-config-malformed` rule (SRJ-316), a failed `get` (hatch A2; its line
+ * reporting the failure's class, name and redacted message, SRJ-104), the
+ * alert's episode (SRJ-704), the launch kind (step 6, its pure decision and
+ * through the sequence: every reuse is one stub `spawn` of `cscb_<key>`
+ * through the session manager's reuse spawn, carrying the reuse flag and the
+ * persona's `extra_env`, read through the harness's `reuseSpawns()`), the
+ * launch's end (which launch results are a success, and the outcome, its end
+ * line, P's triggers in order, the count and the notice after a reuse that
+ * succeeds, fails by each class, collides with a live row or throws; SRJ-112,
+ * SRJ-301), the entries and forms, the stop signal (SRJ-706: an answer after
+ * the stop, a kill's, its latch's or a dependency's throw, is dropped; a
+ * latched persona gets no call), the lines that carry agent-director text,
+ * the module's import boundary, and the scheduling (SRJ-706, AC 61: the
+ * registry through the session manager's start, running and stop entries,
+ * with a run held by the stub's `holdFindMissing`: a start that answers
+ * before the first call, one sequence per persona at a time, every other
+ * launch of P answering `sequence-waiting` with no call while Q goes ahead, a
+ * new sequence after each kind of end, the stops at a teardown and shutdown
+ * during a held run, and at a latch, a teardown and shutdown during the
+ * waits, `closed` after shutdown, and the sequence's own detached recovery attempt),
+ * and the sequence started at the collision ladder's real replacement sites
+ * (SRJ-707: the launch answering while it runs, its reuse at step 6, a new
+ * episode at the next retry after a not-judged stop, the `recovery`
+ * context). Every end without the launch arms P's retry timer with its
+ * exported cause, the controller's own label, through the trigger sink
+ * (SRJ-301; `expectEndArmed`). Every sequence runs through the registry but
+ * `runWithDeps`'s, whose dependencies a case replaces. This file asserts
+ * that the sequence stops; the latches it causes (each kill's CONFLICT and
+ * UNUSABLE NAME rows, SRJ-613's kill backstop among them, a latching read at
+ * a `get`, a latch from another path while a run is held, with their records
+ * and posts, and the reuse's CONFLICT and UNUSABLE NAME latches) are in
+ * tests/conflict-latch.test.ts; the `resume` leg's fallbacks (a `resume` with
+ * no transcript going on to one reuse, after the lost-transcript diagnosis's
+ * `get` on `ErrJsonlMissing`, SRJ-712), the sequence-launch entry and the
+ * reuse spawn's parameters, steps and outcome table in
+ * tests/session-manager.test.ts; and a sequence end keeping an armed timer's
+ * due time, what a dropped kill arms, step 4's `ad-config-malformed` no-kill
+ * and the step-6 resume's failures in tests/unavailable-retry.test.ts.
  *
  * Every spacing, limit, outcome, cause, context, state and class is
  * imported from `src/` or the stub builders, and every expected alert text
@@ -166,7 +170,6 @@ import { KILL_FAILURE_END_ROW_FINISHED } from '../src/persona-episodes.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
 import {
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
-  JSONL_DIAGNOSIS_REUSE_WORDING,
   _resetNow,
   _setNow,
   isLaunchInFlight,
@@ -178,17 +181,22 @@ import {
 } from '../src/session-manager.ts'
 import {
   runInAttempt,
+  UNAVAILABLE_RETRY_CAUSE_CONFIG,
+  UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
+  UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
+  UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
-  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
+  UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   type AttemptView,
 } from '../src/unavailable-retry.ts'
 import { raiseAdConfigMalformed } from '../src/outage-state.ts'
 import {
   cannedErr,
   cannedFindMissing,
-  cannedGetResult,
   cannedKillResult,
   cannedOk,
   cannedStatusResult,
@@ -199,9 +207,6 @@ import {
   errInstanceIdCollision,
   errInvalidFlags,
   errInternal,
-  errJsonlMissing,
-  errJsonlNeverWritten,
-  errNoSessionId,
   errSpawnNotFound,
   errSystemInstallDisappeared,
   errTmuxKillFailed,
@@ -213,18 +218,16 @@ import {
   errUnusableName,
   holdFindMissing,
   KILL_FAILED_DESCRIPTIONS,
-  provenanceNote,
   SAMPLE_LAUNCH_START_DEFAULT,
   SAMPLE_LAUNCH_START_FRACTIONAL,
   SAMPLE_LAUNCH_START_NONE,
   SAMPLE_LAUNCH_START_WHOLE,
   STUB_SURVIVOR_PIDS,
-  unavailableForms,
   type FindMissingRowPlacement,
   type PersonaGetResultOverrides,
 } from './test-helpers/agent-director-stub.ts'
 import { UNPARSEABLE_LAUNCH_START, reuseSpawnScanRows } from './test-helpers/conflict-cases.ts'
-import { OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
+import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { assertNoLeak, isTokenLike, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
 import {
@@ -241,8 +244,9 @@ import {
   makeRecoveryHarness,
   ordinaryAlertContent,
   ownRowsLiveThenMissing,
+  pastSampleGrace,
   personaCallCounts,
-  personaOf,
+  personaRow,
   recordCallOrder,
   retryNow,
   reuseSpawnOf,
@@ -251,6 +255,9 @@ import {
   startSequenceHeldAtRun,
   startupEntriesOf,
   survivorAlertContent,
+  unavailableAt,
+  unclassifiedStartedLines,
+  expectUntouched,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoverySequenceRequest,
@@ -296,11 +303,6 @@ const MISSING = LIVENESS_DEAD_ROW_MISSING
 
 /** The default sample launch start, in ms. */
 const LAUNCH_START_MS = parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)!
-
-/** Persona `key`'s own row as a `get` reads it (its `cwd`, labels and id), with `overrides`. */
-function rowOf(h: RecoveryHarness, key: string, overrides: PersonaGetResultOverrides = {}): Phase1GetResult {
-  return cannedGetResult(overrides, personaOf(h, key), h.home)
-}
 
 /** A `find-missing` result that places persona `key`'s row `where`. */
 function placed(key: string, where: FindMissingRowPlacement): FindMissingResult {
@@ -371,6 +373,27 @@ function killFailurePosts(h: RecoveryHarness, key: string): string[] {
 }
 
 /**
+ * P's sequence (the harness's first persona) ended and armed P's retry timer
+ * once with `cause`, through the trigger sink (b.jg5 SRJ-301): the outcome's
+ * `armed` is that cause, the controller's own label, and its one end line
+ * names it; the triggers are `before` (what P's failed calls sent first),
+ * then `cause`; only P is armed, nothing is counted for P or Q, and no
+ * spawn-failure notice is posted.
+ */
+function expectEndArmed(h: RecoveryHarness, outcome: LiveRowSequenceOutcome, cause: string, before: readonly string[] = []): void {
+  const [p, q] = h.keys as [string, string]
+  expect<string | undefined>(outcome.armed).toBe(cause)
+  const endLine = liveRowSequenceEndLine(`persona=${p}`, outcome)
+  expect(endLine).toContain(`the retry timer armed (${cause})`)
+  expect(h.lines.filter((line) => line === endLine)).toHaveLength(1)
+  expect(h.triggers).toEqual([...before, cause].map((kind) => ({ key: p, kind })))
+  expect(h.controller.view(p)?.causes).toContain(cause)
+  expect(h.controller.armedKeys()).toEqual([p])
+  expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 0])
+  expect(h.notices).toEqual([])
+}
+
+/**
  * Run one sequence for persona `key` as `startSequence` would by default
  * (step 1, a row last read live, ending in a launch, the recovery context),
  * inside its recovery attempt, over the harness's dependencies with `replaced`
@@ -398,7 +421,7 @@ describe('pacing and limits: one kill, three runs spaced apart, a second kill, t
   test('a live row each run leaves in unverified_ids: the calls in order at the exported spacing and pause, the maxima, one get after each run, then exactly one ordinary alert with no description and the not-latched closing, and no launch', async () => {
     const { h, p } = build()
     const id = personaInstanceId(p)
-    h.script({ getResult: rowOf(h, p), findMissingResult: placed(p, 'unverified_ids') })
+    h.script({ getResult: personaRow(h, p), findMissingResult: placed(p, 'unverified_ids') })
     const calls = recordCallTimes(h)
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE })
@@ -429,9 +452,9 @@ describe('pacing and limits: one kill, three runs spaced apart, a second kill, t
     expect([h.stub.calls.resumeCalls, h.stub.calls.spawnCalls]).toEqual([[], []])
   })
 
-  test('a live row other than pending that every run leaves in neither list is judged alive by each run and reaches the alert', async () => {
+  test('a live row other than pending that every run leaves in neither list is judged alive by each run and reaches the alert; the escalation arms P\'s timer with the other-end cause (SRJ-301)', async () => {
     const { h, p } = build()
-    h.script({ getResult: rowOf(h, p) })
+    h.script({ getResult: personaRow(h, p) })
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE })
 
@@ -443,12 +466,13 @@ describe('pacing and limits: one kill, three runs spaced apart, a second kill, t
       armed: LIVE_ROW_ARM_ENDED,
     })
     expect(h.episodeNotices).toEqual([killFailureNotice(p, ordinaryAlertContent(p))])
+    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED)
   })
 
   test('each run bypasses the memo: with a fresh result from an ordinary run inside the memo window, every sequence run still makes a new find-missing call', async () => {
     const { h, p } = build()
     _setNow(h.clock.now)
-    h.script({ getResult: rowOf(h, p) })
+    h.script({ getResult: personaRow(h, p) })
     await sweepDeadTmuxChannel(p, ESCALATE_DEAD_WAITING_ROW_PANE_GONE)
     expect(h.stub.calls.findMissingCalls).toHaveLength(1)
     // An ordinary run now reuses the memo: no new call.
@@ -467,8 +491,8 @@ describe('pacing and limits: one kill, three runs spaced apart, a second kill, t
 
 /** The `get` answers that go to step 6: `ended`, `missing` and no row (`ErrSpawnNotFound`, SRJ-114). */
 const FINISHED_READS: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => Phase1GetResult | Error]> = [
-  [ENDED, (h, key) => rowOf(h, key, { state: ENDED })],
-  [MISSING, (h, key) => rowOf(h, key, { state: MISSING })],
+  [ENDED, (h, key) => personaRow(h, key, { state: ENDED })],
+  [MISSING, (h, key) => personaRow(h, key, { state: MISSING })],
   ['no row (ErrSpawnNotFound)', () => errSpawnNotFound()],
 ]
 
@@ -481,7 +505,7 @@ describe('step exits: a get after a run reading the row finished goes to step 6 
     async (run, _label, read) => {
       const { h, p } = build()
       // Step 2's get and each earlier run's read the row live; the run's own get reads it finished.
-      gets(h, ...Array.from({ length: run }, () => rowOf(h, p)), read(h, p))
+      gets(h, ...Array.from({ length: run }, () => personaRow(h, p)), read(h, p))
       const order = recordCallOrder(h)
 
       const outcome = await h.runSequence(p, { lastReadState: LIVE })
@@ -525,7 +549,7 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
    * follows the first run.
    */
   function pendingThenMarkedMissing(h: RecoveryHarness, key: string, row: PersonaGetResultOverrides): void {
-    gets(h, rowOf(h, key, { state: PENDING, ...row }), rowOf(h, key, { state: MISSING }))
+    gets(h, personaRow(h, key, { state: PENDING, ...row }), personaRow(h, key, { state: MISSING }))
     runs(h, placed(key, 'ids'))
   }
 
@@ -588,8 +612,7 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
 
   test('a launch start already older than G arms a wait that asks for no delay, and the first run follows it', async () => {
     const { h, p } = build()
-    const grace = adGraceMsInEffect()
-    await clockAt(h, LAUNCH_START_MS + grace)
+    await pastSampleGrace(h)
     pendingThenMarkedMissing(h, p, {})
     const run = h.startSequence(p, { lastReadState: PENDING, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
     await h.clock.flush()
@@ -648,18 +671,13 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
 // ---------------------------------------------------------------------------
 
 describe('a run that leaves a pending row in neither list did not judge it: the episode stops at once (SRJ-717, AC 62)', () => {
-  /** P's `pending` row, its launch start G in the past: no wait at step 2. */
-  async function pendingPastGrace(h: RecoveryHarness): Promise<void> {
-    await clockAt(h, LAUNCH_START_MS + adGraceMsInEffect())
-  }
-
   test.each([
     ['a step-3 run', 1, ['kill', 'get', 'findMissing']],
     ["step 4's run", LIVE_ROW_SEQUENCE_MAX_RUNS, ['kill', 'get', ...runAndGet(LIVE_ROW_SEQUENCE_STEP3_RUNS), 'kill', 'findMissing']],
   ] as const)('%s leaves the pending row in neither list: no further run or kill, no alert, nothing counted, no launch; P\'s timer armed with the not-judged cause', async (_label, run, calls) => {
     const { h, p } = build()
-    await pendingPastGrace(h)
-    h.script({ getResult: rowOf(h, p, { state: PENDING }) })
+    await pastSampleGrace(h)
+    h.script({ getResult: personaRow(h, p, { state: PENDING }) })
     runs(h, ...Array.from({ length: run - 1 }, () => placed(p, 'unverified_ids')), placed(p, 'neither'))
     const order = recordCallOrder(h)
 
@@ -681,15 +699,14 @@ describe('a run that leaves a pending row in neither list did not judge it: the 
     })
     expect(h.episodeNotices).toEqual([])
     expect(killFailureLines(h, p)).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
     expect([h.stub.calls.resumeCalls, h.stub.calls.spawnCalls]).toEqual([[], []])
-    expect(h.controller.isArmed(p)).toBe(true)
+    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED)
   })
 
   test('runs that put the pending row in unverified_ids while it stays live judged it: the sequence reaches the alert', async () => {
     const { h, p } = build()
-    await pendingPastGrace(h)
-    h.script({ getResult: rowOf(h, p, { state: PENDING }), findMissingResult: placed(p, 'unverified_ids') })
+    await pastSampleGrace(h)
+    h.script({ getResult: personaRow(h, p, { state: PENDING }), findMissingResult: placed(p, 'unverified_ids') })
 
     const outcome = await h.runSequence(p, { lastReadState: PENDING })
 
@@ -713,8 +730,8 @@ describe('a run that leaves a pending row in neither list did not judge it: the 
       },
     })
     expect(adGraceMsInEffect()).toBe(Number(GRACE_MINIMUM + above) * 1000)
-    await pendingPastGrace(h)
-    h.script({ getResult: rowOf(h, p, { state: PENDING }), findMissingResult: placed(p, 'neither') })
+    await pastSampleGrace(h)
+    h.script({ getResult: personaRow(h, p, { state: PENDING }), findMissingResult: placed(p, 'neither') })
 
     const outcome = await h.runSequence(p, { lastReadState: PENDING })
 
@@ -728,20 +745,20 @@ describe('a run that leaves a pending row in neither list did not judge it: the 
 // Failed runs (SRJ-120's refusal split, E14 build; HO rev 28 / apply21)
 // ---------------------------------------------------------------------------
 
-/** A `find-missing` failure of each class SRJ-120 refuses the run for. */
-const REFUSED_RUNS: ReadonlyArray<readonly [string, () => Error]> = [
-  [AD_ERROR_CLASS_UNAVAILABLE, () => unavailableForms('ErrCallTimeout')[0]![1]('find-missing')],
-  [AD_ERROR_CLASS_ENVIRONMENT, () => errTmuxNotAvailable(undefined, 'find-missing')],
-  [AD_ERROR_CLASS_CONFIG, () => errConfigMalformed()],
-  [AD_ERROR_CLASS_UNCLASSIFIED, () => errSystemInstallDisappeared('find-missing')],
+/** A `find-missing` failure of each class SRJ-120 refuses the run for, and the retry cause its own refusal arms. */
+const REFUSED_RUNS: ReadonlyArray<readonly [string, () => Error, string]> = [
+  [AD_ERROR_CLASS_UNAVAILABLE, () => unavailableAt('find-missing'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+  [AD_ERROR_CLASS_ENVIRONMENT, () => errTmuxNotAvailable(undefined, 'find-missing'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+  [AD_ERROR_CLASS_CONFIG, () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
+  [AD_ERROR_CLASS_UNCLASSIFIED, () => errSystemInstallDisappeared('find-missing'), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
 ]
 
 describe('failed runs: a refused run ends the sequence; any other failed run judges nothing and the step goes on (SRJ-120)', () => {
-  test.each([1, LIVE_ROW_SEQUENCE_MAX_RUNS].flatMap((run) => REFUSED_RUNS.map(([label, make]) => [run, label, make] as const)))(
-    'run %d refused (%s): the sequence ends at once with no further run, kill or launch and nothing counted; the other-end cause armed',
-    async (run, _label, make) => {
+  test.each([1, LIVE_ROW_SEQUENCE_MAX_RUNS].flatMap((run) => REFUSED_RUNS.map(([label, make, cause]) => [run, label, make, cause] as const)))(
+    'run %d refused (%s): the sequence ends at once with no further run, kill or launch and nothing counted; the other-end cause armed after the refusal\'s own',
+    async (run, _label, make, cause) => {
       const { h, p } = build()
-      h.script({ getResult: rowOf(h, p) })
+      h.script({ getResult: personaRow(h, p) })
       runs(h, ...Array.from({ length: run - 1 }, () => cannedFindMissing()), make())
       const order = recordCallOrder(h)
 
@@ -761,14 +778,14 @@ describe('failed runs: a refused run ends the sequence; any other failed run jud
         judgedRuns: run - 1,
         armed: LIVE_ROW_ARM_ENDED,
       })
-      expect(getFailureCount(p)).toBe(0)
       expect([h.stub.calls.spawnCalls, h.episodeNotices]).toEqual([[], []])
+      expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED, [cause])
     },
   )
 
   test('every run failing otherwise (an UNUSABLE NAME answer): no run judged the row, so no alert and no launch; the timer armed', async () => {
     const { h, p } = build()
-    h.script({ getResult: rowOf(h, p), findMissingError: errUnusableName() })
+    h.script({ getResult: personaRow(h, p), findMissingError: errUnusableName() })
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE })
 
@@ -781,12 +798,12 @@ describe('failed runs: a refused run ends the sequence; any other failed run jud
     })
     expect([h.stub.calls.spawnCalls, h.episodeNotices, killFailureLines(h, p)]).toEqual([[], [], []])
     expect(h.latch.isLatched(p)).toBe(false)
-    expect(h.controller.isArmed(p)).toBe(true)
+    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED)
   })
 
   test('one such failed run among judged ones: the step goes on, and the row still live leads to the alert', async () => {
     const { h, p } = build()
-    h.script({ getResult: rowOf(h, p) })
+    h.script({ getResult: personaRow(h, p) })
     runs(h, errUnusableName())
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE })
@@ -826,7 +843,7 @@ describe('the kills: checked, with the bounded retry; a non-success aborts by it
     'the step-%d kill answering %s (%s) after the bounded retry\'s tries: an abort by class; no launch and no further run or kill',
     async (step, _label, errorClass, before, make, tries) => {
       const { h, p } = build()
-      h.script({ getResult: rowOf(h, p) })
+      h.script({ getResult: personaRow(h, p) })
       scriptSequenceKillFailure(h, step, make)
       const order = recordCallOrder(h)
 
@@ -850,6 +867,58 @@ describe('the kills: checked, with the bounded retry; a non-success aborts by it
     },
   )
 
+  // SRJ-104, SRJ-204, SRJ-205: ErrInvalidFlags at a kill gets one immediate
+  // version re-check, which is not tried again. One that passes leaves the
+  // UNCLASSIFIED outcome: the abort, its own cause and then the other-end
+  // cause armed. One that decides the server stops ends the sequence stopped
+  // for shutdown: nothing armed and no alert.
+  test.each(KILL_STEPS)('the step-%d kill answering ErrInvalidFlags whose one re-check passes: an abort by UNCLASSIFIED, no launch and no further run or kill; the other-end cause armed after the UNCLASSIFIED one', async (step, before) => {
+    const { h, p } = build()
+    const { resolves, stops } = h.recheckAnswers(PHASE1_RC_VERSION)
+    h.script({ getResult: personaRow(h, p) })
+    scriptSequenceKillFailure(h, step, () => errInvalidFlags('kill'))
+    const order = recordCallOrder(h)
+
+    const outcome = await h.runSequence(p, { lastReadState: LIVE })
+
+    expect([resolves.length, stops.length]).toEqual([1, 0])
+    expect(order).toEqual([...before, 'kill'])
+    expect(outcome).toEqual({
+      kind: LIVE_ROW_OUTCOME_ABORTED,
+      step,
+      errorClass: AD_ERROR_CLASS_UNCLASSIFIED,
+      latched: false,
+      runs: step === 1 ? 0 : LIVE_ROW_SEQUENCE_STEP3_RUNS,
+      kills: step === 1 ? 1 : LIVE_ROW_SEQUENCE_MAX_KILLS,
+      judgedRuns: step === 1 ? 0 : LIVE_ROW_SEQUENCE_STEP3_RUNS,
+      armed: LIVE_ROW_ARM_ENDED,
+    })
+    expect([h.stub.calls.spawnCalls, h.episodeNotices]).toEqual([[], []])
+    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED, [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED])
+  })
+
+  test.each(KILL_STEPS)('the step-%d kill answering ErrInvalidFlags whose one re-check decides that the server stops: the sequence ends stopped for shutdown, with no further call, nothing armed and no alert', async (step, before) => {
+    const { h, p } = build()
+    const { resolves, stops } = h.recheckAnswers(OLD_AD_VERSION)
+    h.script({ getResult: personaRow(h, p) })
+    scriptSequenceKillFailure(h, step, () => errInvalidFlags('kill'))
+    const order = recordCallOrder(h)
+
+    const outcome = await h.runSequence(p, { lastReadState: LIVE })
+
+    expect([resolves.length, stops.length]).toEqual([1, 1])
+    expect(order).toEqual([...before, 'kill'])
+    expect(outcome).toEqual({
+      kind: LIVE_ROW_OUTCOME_STOPPED,
+      reason: LIVE_ROW_STOP_SHUTDOWN,
+      runs: step === 1 ? 0 : LIVE_ROW_SEQUENCE_STEP3_RUNS,
+      kills: step === 1 ? 1 : LIVE_ROW_SEQUENCE_MAX_KILLS,
+      judgedRuns: step === 1 ? 0 : LIVE_ROW_SEQUENCE_STEP3_RUNS,
+    })
+    expect([h.triggers, h.controller.armedKeys(), h.episodeNotices, killFailurePosts(h, p)]).toEqual([[], [], [], []])
+    expect([h.stub.calls.spawnCalls, getFailureCount(p)]).toEqual([[], 0])
+  })
+
   test('the tries of an UNAVAILABLE kill are KILL_RETRY_SPACING_MS apart on the clock', async () => {
     const { h, p } = build()
     h.script({ killError: errTmuxUnresponsive('kill') })
@@ -865,7 +934,7 @@ describe('the kills: checked, with the bounded retry; a non-success aborts by it
     async (step, description) => {
       const { h, p } = build()
       const err = (): Error => errTmuxKillFailed(undefined, description)
-      h.script({ getResult: rowOf(h, p) })
+      h.script({ getResult: personaRow(h, p) })
       scriptSequenceKillFailure(h, step, err)
 
       const outcome = await h.runSequence(p, { lastReadState: LIVE })
@@ -878,7 +947,7 @@ describe('the kills: checked, with the bounded retry; a non-success aborts by it
 
   test.each([ENDED, MISSING])('a step-1 success with kill_sent false whose next get reads %s: no alert, and the launch (SRJ-703)', async (state) => {
     const { h, p } = build()
-    h.script({ killResult: cannedKillResult(false), getResult: rowOf(h, p, { state }) })
+    h.script({ killResult: cannedKillResult(false), getResult: personaRow(h, p, { state }) })
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE })
 
@@ -889,7 +958,7 @@ describe('the kills: checked, with the bounded retry; a non-success aborts by it
 
   test('ErrSpawnNotFound at a kill counts as a success: the sequence goes on to its get', async () => {
     const { h, p } = build()
-    h.script({ killError: errSpawnNotFound(), getResult: rowOf(h, p, { state: ENDED }) })
+    h.script({ killError: errSpawnNotFound(), getResult: personaRow(h, p, { state: ENDED }) })
     const order = recordCallOrder(h)
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE })
@@ -907,7 +976,7 @@ describe('the kills: checked, with the bounded retry; a non-success aborts by it
   ])('a survivor-naming ErrTmuxKillFailed (%s), then a success: one survivor post, and the sequence goes on to its launch', async (_label, pids) => {
     const { h, p } = build()
     const survivor = survivorErr(pids)
-    h.script({ killQueue: [cannedErr(survivor), cannedOk(cannedKillResult(true))], getResult: rowOf(h, p, { state: ENDED }) })
+    h.script({ killQueue: [cannedErr(survivor), cannedOk(cannedKillResult(true))], getResult: personaRow(h, p, { state: ENDED }) })
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE })
 
@@ -962,13 +1031,14 @@ describe('ad-config-malformed: no kill of a row last read pending while P\'s out
 
     expect(outcome).toEqual({ kind: LIVE_ROW_OUTCOME_CONFIG_MALFORMED, step: 1, runs: 0, kills: 0, judgedRuns: 0, armed: LIVE_ROW_ARM_ENDED })
     expect(h.stub.callCount()).toBe(0)
+    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED)
   })
 
   test('a step-4 kill whose between-try status read answers CONFIG, on a row last read pending: its tries end with no further kill, the last try\'s outcome standing', async () => {
     const { h, p } = build()
-    await clockAt(h, LAUNCH_START_MS + adGraceMsInEffect())
+    await pastSampleGrace(h)
     h.script({
-      getResult: rowOf(h, p, { state: PENDING }),
+      getResult: personaRow(h, p, { state: PENDING }),
       findMissingResult: placed(p, 'unverified_ids'),
       killQueue: [cannedOk(cannedKillResult(true))],
       killError: errTmuxUnresponsive('kill'),
@@ -984,38 +1054,6 @@ describe('ad-config-malformed: no kill of a row last read pending while P\'s out
 })
 
 // ---------------------------------------------------------------------------
-// Reads through the shared own-row read (SRJ-114, SRJ-513; the E14, E16 notes)
-// ---------------------------------------------------------------------------
-
-describe('the reads: a get that latches P stops the sequence with no further call (SRJ-114, SRJ-513)', () => {
-  test.each([
-    ['the step-2 get', 0, ['kill', 'get']],
-    ['a confirming get', 1, ['kill', 'get', 'findMissing', 'get']],
-  ] as const)('a provenance_conflict note at %s: stopped for the latch, no further call, nothing armed', async (_label, before, calls) => {
-    const { h, p } = build()
-    gets(h, ...Array.from({ length: before }, () => rowOf(h, p)), rowOf(h, p, { liveness_note: provenanceNote }))
-    const order = recordCallOrder(h)
-
-    const outcome = await h.runSequence(p, { lastReadState: LIVE })
-
-    expect(order).toEqual([...calls])
-    expect(outcome).toEqual({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED, runs: before, kills: 1, judgedRuns: before })
-    expect(h.controller.isArmed(p)).toBe(false)
-  })
-
-  test('a configured persona\'s own pending row with no launch start at the step-2 get: stopped for the latch, with no wait and no run', async () => {
-    const { h, p } = build()
-    h.script({ getResult: rowOf(h, p, { state: PENDING, launch_started_at: SAMPLE_LAUNCH_START_NONE }) })
-    const order = recordCallOrder(h)
-
-    const outcome = await h.runSequence(p, { lastReadState: LIVE })
-
-    expect(order).toEqual(['kill', 'get'])
-    expect(outcome).toEqual({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED, runs: 0, kills: 1, judgedRuns: 0 })
-  })
-})
-
-// ---------------------------------------------------------------------------
 // A failed get (SRJ-705; hatch A2)
 // ---------------------------------------------------------------------------
 
@@ -1027,10 +1065,28 @@ const GET_SITES = [
 ] as const
 
 describe('a failed get: UNAVAILABLE ends the sequence with the timer armed; UNUSABLE NAME latches P instead (SRJ-705; hatch A2)', () => {
+  // SRJ-104: a failed get's line reports the failure as the kill line does.
+  // An ErrInternal (an unknown name to the client) shows its class, its name
+  // and agent-director's own description, redacted.
+  test.each(GET_SITES.slice(0, 2))('%s answering an ErrInternal: its one get line carries class=UNCLASSIFIED, name=ErrInternal and the description redacted; the read is refused', async (_label, before, step) => {
+    const { h, p } = build()
+    const err = Object.assign(errInternal(`the store could not be read (${sentinelInMessage('get')})`), { detail: LEAK_SENTINEL })
+    gets(h, ...Array.from({ length: before }, () => personaRow(h, p)), err)
+
+    const outcome = await h.runSequence(p, { lastReadState: LIVE })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_READ_REFUSED, step, runs: before })
+    const line = liveRowSequenceGetLine(`persona=${p}`, step, { kind: LIVE_ROW_READ_REFUSED, error: err })
+    expect(err.unknownName).toBe('ErrInternal')
+    expect(line).toContain(`: step ${step} get: failed: class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${err.unknownName} message="the store could not be read (${REDACTED_SENTINEL_TAIL})" (b.jg5 `)
+    expect(h.lines.filter((logged) => logged === line)).toHaveLength(1)
+    assertNoLeak({ line })
+  })
+
   // ErrSpawnNotFound reads as no row: the step exits above.
   test.each(GET_SITES)('%s answering UNAVAILABLE: no further run, kill or launch, nothing counted; P\'s retry timer armed', async (_label, before, step) => {
     const { h, p } = build()
-    gets(h, ...Array.from({ length: before }, () => rowOf(h, p)), unavailableForms('ErrCallTimeout')[0]![1]('get'))
+    gets(h, ...Array.from({ length: before }, () => personaRow(h, p)), unavailableAt('get'))
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE })
 
@@ -1044,13 +1100,12 @@ describe('a failed get: UNAVAILABLE ends the sequence with the timer armed; UNUS
     })
     expect(h.stub.calls.findMissingCalls).toHaveLength(before)
     expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
-    expect(getFailureCount(p)).toBe(0)
-    expect(h.controller.isArmed(p)).toBe(true)
+    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED, [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE])
   })
 
   test.each(GET_SITES)('%s answering UNUSABLE NAME: P latched, which stops the sequence; no timer armed', async (_label, before, step) => {
     const { h, p } = build()
-    gets(h, ...Array.from({ length: before }, () => rowOf(h, p)), errUnusableName())
+    gets(h, ...Array.from({ length: before }, () => personaRow(h, p)), errUnusableName())
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE })
 
@@ -1076,15 +1131,15 @@ describe('the step-5 alert\'s episode: once per episode, routed by the applied c
     // The scripted retry action makes no call, so a retry fired between sequences changes nothing here.
     const { h, p } = build({ action: 'scripted' })
     const content = ordinaryAlertContent(p)
-    h.script({ getResult: rowOf(h, p) })
+    h.script({ getResult: personaRow(h, p) })
     expect(await h.runSequence(p, { lastReadState: LIVE })).toMatchObject({ kind: LIVE_ROW_OUTCOME_ESCALATED })
     h.script({ killResult: cannedKillResult(true) })
     expect(await h.runSequence(p, { lastReadState: LIVE })).toMatchObject({ kind: LIVE_ROW_OUTCOME_ESCALATED, kills: LIVE_ROW_SEQUENCE_MAX_KILLS })
     expect(h.episodeNotices).toEqual([killFailureNotice(p, content)])
 
-    h.script({ getResult: rowOf(h, p, { state: ENDED }) })
+    h.script({ getResult: personaRow(h, p, { state: ENDED }) })
     expect(await h.runSequence(p, { lastReadState: LIVE })).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED })
-    h.script({ getResult: rowOf(h, p) })
+    h.script({ getResult: personaRow(h, p) })
     expect(await h.runSequence(p, { lastReadState: LIVE })).toMatchObject({ kind: LIVE_ROW_OUTCOME_ESCALATED })
 
     expect(h.episodeNotices).toEqual([killFailureNotice(p, content), killFailureNotice(p, content)])
@@ -1098,7 +1153,7 @@ describe('the step-5 alert\'s episode: once per episode, routed by the applied c
 
   test('P removed from the applied configuration during the sequence: one log line and one persona-kill-failed entry with the not-configured closing; nothing to Slack', async () => {
     const { h, p } = build()
-    h.script({ getResult: rowOf(h, p) })
+    h.script({ getResult: personaRow(h, p) })
     // The last get's position in the call order: the sequence's 11th call.
     const lastGet = ['kill', 'get', ...runAndGet(LIVE_ROW_SEQUENCE_STEP3_RUNS), 'kill', ...runAndGet(1)].length - 1
     recordCallOrder(h, { at: lastGet, run: () => h.remove(p) })
@@ -1118,7 +1173,7 @@ describe('the step-5 alert\'s episode: once per episode, routed by the applied c
     [KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT, LIVE_ROW_SEQUENCE_ENTRY_GET],
   ] as const)('the alert carries the request\'s context (%s)', async (alertContext, entryStep) => {
     const { h, p } = build()
-    h.script({ getResult: rowOf(h, p) })
+    h.script({ getResult: personaRow(h, p) })
 
     await h.runSequence(p, { lastReadState: LIVE, alertContext, ...(entryStep === undefined ? {} : { entryStep }) })
 
@@ -1135,7 +1190,7 @@ const SESSION_ID = 'a-session-id'
 
 /** A sequence that reaches step 6 at once: step 2's get and run 1's read the row finished, or answer `read` (an error). */
 function finishedAtRun1(h: RecoveryHarness, key: string, read: PersonaGetResultOverrides | Error): void {
-  h.script(read instanceof Error ? { getError: read } : { getResult: rowOf(h, key, { state: ENDED, ...read }) })
+  h.script(read instanceof Error ? { getError: read } : { getResult: personaRow(h, key, { state: ENDED, ...read }) })
 }
 
 /** Step 6's inputs when every condition for a resume holds. */
@@ -1180,40 +1235,16 @@ describe('the launch: a resume when the row has a session id and P keeps its con
       result: { key: p },
     })
     expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
-    // No reuse after the resume succeeded.
+    // No reuse after the resume succeeded, and no sequence cause, or any other, armed (SRJ-301).
     expect(h.stub.calls.spawnCalls).toEqual([])
+    expect(outcome.armed).toBeUndefined()
+    expect([h.triggers, h.controller.armedKeys(), h.notices]).toEqual([[], [], []])
     await h.runApproverToStop(p)
   })
 
-  // SRJ-705, SRJ-707: a `resume` with no transcript to resume goes on to the
-  // reuse. SRJ-712: after ErrJsonlMissing the lost-transcript diagnosis's
-  // `get` comes first, and the launched outcome carries its amnesia action
-  // (inconclusive: the harness configures no message archive); its line is
-  // logged and its notice posted once (the sequence's launch is no start-pass
-  // launch, so no startup-errors entry is written). The other two make no
-  // diagnosis and answer `spawned`.
-  test.each([
-    ['ErrNoSessionId', () => errNoSessionId(), 'spawned', [], 0],
-    ['ErrJsonlMissing', () => errJsonlMissing(), 'fresh-after-inconclusive-amnesia', ['get'], 1],
-    ['ErrJsonlNeverWritten', () => errJsonlNeverWritten(), 'spawned', [], 0],
-  ] as const)('the resume answering %s: exactly one reuse spawn of the same id through the session manager\'s reuse spawn, with the flag, answering %s; the diagnosis get, if any, before it; no further call', async (_label, make, action, diagnosisGets, diagnoses) => {
-    const { h, p } = build()
-    finishedAtRun1(h, p, { claude_session_id: SESSION_ID })
-    h.script({ resumeError: make() })
-    const order = recordCallOrder(h)
-
-    const outcome = await h.runSequence(p, { lastReadState: LIVE, keepsConversation: true })
-
-    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action } })
-    expectCallsThenApprover(order, ['kill', 'get', 'findMissing', 'get', 'resume', ...diagnosisGets, 'spawn'])
-    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
-    expectOneReuseOf(h, p)
-    expect(h.errors.filter((line) => line.startsWith('[slack] ErrJsonlMissing diagnostic: '))).toHaveLength(diagnoses)
-    expect(h.notices).toEqual(Array.from({ length: diagnoses }, () => ({ key: p, text: expect.stringContaining(`I was ${JSONL_DIAGNOSIS_REUSE_WORDING}`) })))
-    expect(h.startupErrors()).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
-    await h.runApproverToStop(p)
-  })
+  // A resume with no transcript to resume goes on to the reuse through the
+  // launch entry's resume leg: tests/session-manager.test.ts's SRJ-705
+  // step-6 describe.
 
   test.each<[string, string, RecoveryHarnessOptions, (h: RecoveryHarness, key: string) => PersonaGetResultOverrides | Error, boolean]>([
     ['the last get reading no row (ErrSpawnNotFound)', LIVE_ROW_LAUNCH_REASON_NO_ROW, {}, () => errSpawnNotFound(), false],
@@ -1225,7 +1256,7 @@ describe('the launch: a resume when the row has a session id and P keeps its con
       LIVE_ROW_LAUNCH_REASON_CONFIG_DIR_MISMATCH,
       {},
       (h, key) => {
-        const { config_dir: _dropped, ...labels } = rowOf(h, key).labels
+        const { config_dir: _dropped, ...labels } = personaRow(h, key).labels
         return { claude_session_id: SESSION_ID, labels }
       },
       false,
@@ -1234,7 +1265,7 @@ describe('the launch: a resume when the row has a session id and P keeps its con
       'a config_dir label that differs',
       LIVE_ROW_LAUNCH_REASON_CONFIG_DIR_MISMATCH,
       {},
-      (h, key) => ({ claude_session_id: SESSION_ID, labels: { ...rowOf(h, key).labels, config_dir: h.stateDir } }),
+      (h, key) => ({ claude_session_id: SESSION_ID, labels: { ...personaRow(h, key).labels, config_dir: h.stateDir } }),
       false,
     ],
     ['a retired key', LIVE_ROW_LAUNCH_REASON_RETIRED_KEY, {}, () => ({ claude_session_id: SESSION_ID }), true],
@@ -1291,58 +1322,142 @@ const LAUNCH_ACTION_SUCCEEDS: Readonly<Record<SpawnPersonaResult['action'], bool
   'sequence-waiting': false,
 }
 
+/** One step-6 reuse outcome (b.jg5 SRJ-112, SRJ-301) as the sequence ends with it. */
+interface ReuseEnd {
+  /** The reuse spawn's answer: an error to throw, or success. */
+  readonly make: () => Error | undefined
+  /** Step 3's get read no row (`ErrSpawnNotFound`): a reuse of an id with no row. Else it read the row `ended`. */
+  readonly noRow?: true
+  /** The launch's result, but its key. */
+  readonly answer: Omit<SpawnPersonaResult, 'key'>
+  /** The cause the sequence itself arms, when it arms one. */
+  readonly armed?: LiveRowSequenceArmCause
+  /** P's triggers, in order: the reuse's own handling's, then the sequence's. */
+  readonly triggers: readonly string[]
+  /** The failures counted toward the restart cap. */
+  readonly counted: number
+  /** Whether one spawn-failure notice is posted. */
+  readonly notice?: true
+  /** Whether the answer is reported once to P's unclassified-error episode. */
+  readonly unclassified?: true
+  /** The end line's words for the launch, and for the arm. */
+  readonly said: string
+  readonly armedSaid: string
+}
+
+const REUSE_FAILED = 'the launch failed (reuse; result=failed)'
+const REUSE_REFUSED = 'the launch failed (reuse; result=failed, refused)'
+const ENDED_ARMED = `the retry timer armed (${LIVE_ROW_ARM_ENDED})`
+const PENDING_ONLY_ARMED = 'the retry timer armed by the launch (pending-only)'
+const REFUSED_ANSWER = { action: 'failed', refused: true } as const
+
+/** A reuse refused by `cause`'s class: the refusal's own cause, then the sequence's. */
+const refusedBy = (make: () => Error, cause: string, unclassified?: true): ReuseEnd => ({
+  make,
+  answer: REFUSED_ANSWER,
+  armed: LIVE_ROW_ARM_ENDED,
+  triggers: [cause, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED],
+  counted: 0,
+  ...(unclassified === undefined ? {} : { unclassified }),
+  said: REUSE_REFUSED,
+  armedSaid: ENDED_ARMED,
+})
+
+/** A reuse answering ErrTmuxSessionCreate (SRJ-112, SRJ-409, HO rev 28): counted once with its notice, P armed at once pending-only; the sequence arms nothing of its own. */
+const launchFailure = (noRow?: true): ReuseEnd => ({
+  make: () => errTmuxSessionCreate('spawn'),
+  ...(noRow === undefined ? {} : { noRow }),
+  answer: { action: 'failed', countedClass: true, pendingOnlyArmed: true },
+  triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+  counted: 1,
+  notice: true,
+  said: REUSE_FAILED,
+  armedSaid: PENDING_ONLY_ARMED,
+})
+
+const REUSE_ENDS: ReadonlyArray<readonly [string, ReuseEnd]> = [
+  ['succeeds', { make: () => undefined, answer: { action: 'spawned' }, triggers: [], counted: 0, said: 'launched (reuse; result=spawned)', armedSaid: 'no retry timer armed' }],
+  // SRJ-112, SRJ-602: a directory error is one counted launch failure, with no notice.
+  [
+    'fails with a directory error (ErrCwdNotFound), counted once',
+    { make: () => errCwdNotFound(), answer: { action: 'failed', countedClass: true }, armed: LIVE_ROW_ARM_ENDED, triggers: [UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED], counted: 1, said: REUSE_FAILED, armedSaid: ENDED_ARMED },
+  ],
+  ['fails with UNAVAILABLE (ErrTmuxUnresponsive), refused', refusedBy(() => errTmuxUnresponsive('spawn'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)],
+  ['fails with ENVIRONMENT (ErrTmuxNotAvailable), refused', refusedBy(() => errTmuxNotAvailable(), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)],
+  ['fails with CONFIG (ErrConfigMalformed), refused', refusedBy(() => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG)],
+  ['fails with UNCLASSIFIED (ErrInternal), refused', refusedBy(() => errInternal(), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true)],
+  ['fails with ErrTmuxSessionCreate, armed pending-only', launchFailure()],
+  ['of an id with no row (step 3\'s get read none) fails with ErrTmuxSessionCreate, armed pending-only', launchFailure(true)],
+  [
+    'fails with ErrInvalidFlags whose re-check stops the server',
+    { make: () => errInvalidFlags('spawn'), answer: { action: 'failed', stopping: true }, triggers: [], counted: 0, said: 'the launch failed (reuse; result=failed, stopping)', armedSaid: 'no retry timer armed' },
+  ],
+]
+
 describe('the launch\'s end: the outcome carries the launch\'s result, and the end line says whether it launched (SRJ-705 step 6, SRJ-301, SRJ-112)', () => {
   test.each(Object.entries(LAUNCH_ACTION_SUCCEEDS))('a launch result %s is a success: %p', (action, succeeds) => {
     expect(liveRowLaunchSucceeded({ key: 'p', action })).toBe(succeeds)
   })
 
   // The reuse's answer to each outcome class (b.jg5 SRJ-112) as the sequence
-  // ends with it; what each counts and arms through the retry controller is
-  // tests/unavailable-retry.test.ts's, and every class row at the entry is
+  // ends with it, and what it arms and counts through the retry controller
+  // (SRJ-301); every class row at the entry is
   // tests/session-manager.test.ts's.
-  test.each<[string, () => Error | undefined, Omit<SpawnPersonaResult, 'key'>, LiveRowSequenceArmCause | undefined, string, string]>([
-    ['succeeds', () => undefined, { action: 'spawned' }, undefined, 'launched (reuse; result=spawned)', 'no retry timer armed'],
-    ['fails with a directory error (counted)', () => errCwdNotFound(), { action: 'failed', countedClass: true }, LIVE_ROW_ARM_ENDED, 'the launch failed (reuse; result=failed)', `the retry timer armed (${LIVE_ROW_ARM_ENDED})`],
-    ['fails with UNAVAILABLE, refused', () => errTmuxUnresponsive('spawn'), { action: 'failed', refused: true }, LIVE_ROW_ARM_ENDED, 'the launch failed (reuse; result=failed, refused)', `the retry timer armed (${LIVE_ROW_ARM_ENDED})`],
-    // SRJ-112, SRJ-409 (HO rev 28): its own pending-only arm stands; the sequence arms no cause of its own.
-    [
-      'fails with ErrTmuxSessionCreate, armed pending-only',
-      () => errTmuxSessionCreate('spawn'),
-      { action: 'failed', countedClass: true, pendingOnlyArmed: true },
-      undefined,
-      'the launch failed (reuse; result=failed)',
-      'the retry timer armed by the launch (pending-only)',
-    ],
-    ['fails with ErrInvalidFlags whose re-check stops the server', () => errInvalidFlags('spawn'), { action: 'failed', stopping: true }, undefined, 'the launch failed (reuse; result=failed, stopping)', 'no retry timer armed'],
-  ])('a reuse that %s: the outcome is launched with its result and the arm, and its one end line says so', async (label, make, answer, armed, said, armedSaid) => {
-    const { h, p } = build()
-    const stops = answer.stopping === true ? h.recheckAnswers(OLD_AD_VERSION).stops : []
-    const err = make()
-    h.script({ getResult: rowOf(h, p, { state: ENDED }), ...(err === undefined ? {} : { spawnError: err }) })
-    const result: SpawnPersonaResult = { key: p, ...answer }
+  test.each(REUSE_ENDS)('a reuse that %s: the outcome is launched with its result and the arm, its one end line says so, the reuse is the last call, and P\'s triggers, count and notice are its class\'s; Q is untouched', async (_label, row) => {
+    const { h, p, q } = build()
+    const stops = row.answer.stopping === true ? h.recheckAnswers(OLD_AD_VERSION).stops : []
+    const err = row.make()
+    h.script({
+      ...(row.noRow === true ? { getError: errSpawnNotFound() } : { getResult: personaRow(h, p, { state: ENDED }) }),
+      ...(err === undefined ? {} : { spawnError: err }),
+    })
+    const order = recordCallOrder(h)
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE })
 
     expect(outcome).toEqual({
       kind: LIVE_ROW_OUTCOME_LAUNCHED,
       launchKind: LIVE_ROW_LAUNCH_REUSE,
+      // The conversation is not kept: the first reason that holds, with a row or none.
       reason: LIVE_ROW_LAUNCH_REASON_NOT_KEPT,
-      result,
+      result: { key: p, ...row.answer },
       runs: 1,
       kills: 1,
       judgedRuns: 1,
-      ...(armed === undefined ? {} : { armed }),
+      ...(row.armed === undefined ? {} : { armed: row.armed }),
     })
     const endLine = liveRowSequenceEndLine(`persona=${p}`, outcome)
-    expect(endLine).toContain(`: ${said} — runs=1 kills=1 judged=1; ${armedSaid} (b.jg5 `)
+    expect(endLine).toContain(`: ${row.said} — runs=1 kills=1 judged=1; ${row.armedSaid} (b.jg5 `)
     expect(h.lines.filter((line) => line === endLine)).toHaveLength(1)
-    // One reuse, never a second launch after a failure.
-    expect([label, h.stub.calls.spawnCalls.length, h.stub.calls.resumeCalls.length, stops.length]).toEqual([label, 1, 0, answer.stopping === true ? 1 : 0])
+    // One reuse, the last call: never a kill, delete, resume or second launch after it.
+    const calls = ['kill', 'get', 'findMissing', 'get', 'spawn']
+    if (row.answer.action === 'spawned') expectCallsThenApprover(order, calls)
+    else expect(order).toEqual(calls)
+    expectOneReuseOf(h, p)
+    expect(stops).toHaveLength(row.answer.stopping === true ? 1 : 0)
+    // P's timer armed with the causes in order (the reuse's own handling's first), or not at all.
+    expect(h.triggers).toEqual(row.triggers.map((kind) => ({ key: p, kind })))
+    expect(h.controller.view(p)?.causes ?? []).toEqual([...row.triggers])
+    expect(h.controller.armedKeys()).toEqual(row.triggers.length > 0 ? [p] : [])
+    if (row.triggers.includes(UNAVAILABLE_RETRY_CAUSE_PENDING_ROW)) expect(h.controller.view(p)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
+    // Only a counted class is counted, once; only a LAUNCH FAILURE posts the spawn-failure notice.
+    expect([getFailureCount(p), getFailureCount(q)]).toEqual([row.counted, 0])
+    expect(h.notices).toEqual(row.notice === true ? [{ key: p, text: expect.stringContaining(`\`${err!.name}\``) }] : [])
+    // SRJ-313: an UNCLASSIFIED outcome is reported to P's episode once.
+    expect(unclassifiedStartedLines(h, p)).toHaveLength(row.unclassified === true ? 1 : 0)
+    if (row.armed !== undefined) {
+      // The sequence left no timer of its own: only P's retry timer is pending,
+      // and the alert timer of P's tmux-unresponsive condition while it holds.
+      expect(h.clock.pending().map((timer) => timer.dueAt)).toContain(h.controller.view(p)!.dueAt!)
+      expect(h.clock.pendingCount()).toBe(h.tmuxUnresponsive.holds(p) ? 2 : 1)
+    }
+    if (row.answer.stopping === true) expect(h.clock.pendingCount()).toBe(0)
+    expectUntouched(h, q)
   })
 
-  test('a reuse that collides with a live row (ErrInstanceIdCollision): the sequence ends without its launch, not launched (reuse-collision), with the reuse-collision cause armed and no second spawn', async () => {
+  test('a reuse that collides with a live row (ErrInstanceIdCollision): the sequence ends without its launch, not launched (reuse-collision), with the reuse-collision cause armed and no second spawn; nothing counted or posted', async () => {
     const { h, p } = build()
-    h.script({ getResult: rowOf(h, p, { state: ENDED }), spawnError: errInstanceIdCollision() })
+    h.script({ getResult: personaRow(h, p, { state: ENDED }), spawnError: errInstanceIdCollision() })
     const order = recordCallOrder(h)
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE })
@@ -1360,7 +1475,7 @@ describe('the launch\'s end: the outcome carries the launch\'s result, and the e
     expect(h.reuseSpawns()).toHaveLength(1)
     const endLine = liveRowSequenceEndLine(`persona=${p}`, outcome)
     expect(endLine).toContain(`: not launched (reuse; ${LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION}) — runs=1 kills=1 judged=1; the retry timer armed (${LIVE_ROW_ARM_REUSE_COLLISION}) `)
-    expect(h.lines.filter((line) => line === endLine)).toHaveLength(1)
+    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION)
   })
 
   test.each([
@@ -1368,7 +1483,7 @@ describe('the launch\'s end: the outcome carries the launch\'s result, and the e
     ['after a stop for teardown: the failure is dropped too, and the sequence ends stopped with nothing armed', true],
   ] as const)('a launch dependency that throws %s; its failure is logged redacted before the end line', async (_label, stopped) => {
     const { h, p } = build()
-    h.script({ getResult: rowOf(h, p, { state: ENDED }) })
+    h.script({ getResult: personaRow(h, p, { state: ENDED }) })
     const err = Object.assign(new Error(`the launch broke (${sentinelInMessage('launch')})`), { detail: LEAK_SENTINEL })
     const stop = createLiveRowSequenceStop()
 
@@ -1402,7 +1517,7 @@ describe('the launch\'s end: the outcome carries the launch\'s result, and the e
 describe('entries and forms: the step-2 entry and the no-launch form', () => {
   test('entered at step 2: no kill before its get, and one kill at most (step 4\'s)', async () => {
     const { h, p } = build()
-    h.script({ getResult: rowOf(h, p) })
+    h.script({ getResult: personaRow(h, p) })
     const order = recordCallOrder(h)
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET, alertContext: KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT })
@@ -1413,7 +1528,7 @@ describe('entries and forms: the step-2 entry and the no-launch form', () => {
 
   test('the no-launch form makes no launch call and ends as "row finished", arming nothing', async () => {
     const { h, p } = build()
-    h.script({ getResult: rowOf(h, p, { state: ENDED }) })
+    h.script({ getResult: personaRow(h, p, { state: ENDED }) })
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE, launches: false })
 
@@ -1565,19 +1680,23 @@ describe('the lines that carry agent-director text: redacted, on one line', () =
 /** A stop of P's running sequence: how a case makes it, and the reason the sequence ends with. */
 type SequenceStopWay = readonly [label: string, stop: (h: RecoveryHarness, key: string) => Promise<unknown> | void, reason: LiveRowSequenceStopReason]
 
-const SEQUENCE_STOP_WAYS: readonly SequenceStopWay[] = [
-  [
-    'a latch of P from another path (the retry\'s own-row status read of its pending row with no launch start)',
-    async (h, key) => {
-      h.script({ statusResult: cannedStatusResult({ state: PENDING, launch_started_at: SAMPLE_LAUNCH_START_NONE }) })
-      await readPersonaRowState(key)
-      expect(h.latch.isLatched(key)).toBe(true)
-    },
-    LIVE_ROW_STOP_LATCHED,
-  ],
+const LATCH_FROM_ANOTHER_PATH: SequenceStopWay = [
+  'a latch of P from another path (the retry\'s own-row status read of its pending row with no launch start)',
+  async (h, key) => {
+    h.script({ statusResult: cannedStatusResult({ state: PENDING, launch_started_at: SAMPLE_LAUNCH_START_NONE }) })
+    await readPersonaRowState(key)
+    expect(h.latch.isLatched(key)).toBe(true)
+  },
+  LIVE_ROW_STOP_LATCHED,
+]
+
+/** A teardown's and shutdown's stops of P's running sequence. */
+const TEARDOWN_AND_SHUTDOWN: readonly SequenceStopWay[] = [
   ['teardown(P)', (h, key) => h.teardown(key), LIVE_ROW_STOP_TEARDOWN],
   ['shutdown()', (h) => h.shutdown(), LIVE_ROW_STOP_SHUTDOWN],
 ]
+
+const SEQUENCE_STOP_WAYS: readonly SequenceStopWay[] = [LATCH_FROM_ANOTHER_PATH, ...TEARDOWN_AND_SHUTDOWN]
 
 describe('scheduling: each sequence runs in the background, one per persona at a time, holds every other launch of it, and stops at once on a latch, a teardown and shutdown (SRJ-706, AC 61)', () => {
   test('the start entry answers started before the sequence\'s first call; P\'s sequence reads as running while its first run is held, and once released it goes on to its launch and no longer runs', async () => {
@@ -1649,7 +1768,7 @@ describe('scheduling: each sequence runs in the background, one per persona at a
 
   test('during the sequence\'s own step-6 launch: that launch is a launch in flight and goes ahead, while another launch of P answers sequence-waiting and joins nothing', async () => {
     const { h, p } = build()
-    h.script({ getResult: rowOf(h, p, { state: ENDED }) })
+    h.script({ getResult: personaRow(h, p, { state: ENDED }) })
     const reuse = holdSequenceReuse(h, p)
     const run = h.startSequence(p, { lastReadState: LIVE })
     await h.driveSequence(reuse.entered)
@@ -1669,7 +1788,7 @@ describe('scheduling: each sequence runs in the background, one per persona at a
   // begins a new sequence, which runs its steps again from step 1.
   test.each<[string, (h: RecoveryHarness, key: string) => Promise<RecoverySequenceRequest>, LiveRowSequenceOutcome['kind']]>([
     ['it launches', async (h, key) => {
-      h.script({ getResult: rowOf(h, key, { state: ENDED }) })
+      h.script({ getResult: personaRow(h, key, { state: ENDED }) })
       return { lastReadState: LIVE }
     }, LIVE_ROW_OUTCOME_LAUNCHED],
     ['it aborts by class (ENVIRONMENT at its kill)', async (h) => {
@@ -1677,12 +1796,12 @@ describe('scheduling: each sequence runs in the background, one per persona at a
       return { lastReadState: LIVE }
     }, LIVE_ROW_OUTCOME_ABORTED],
     ['it stops on a run that did not judge its pending row', async (h, key) => {
-      await clockAt(h, LAUNCH_START_MS + adGraceMsInEffect())
-      h.script({ getResult: rowOf(h, key, { state: PENDING }) })
+      await pastSampleGrace(h)
+      h.script({ getResult: personaRow(h, key, { state: PENDING }) })
       return { lastReadState: PENDING }
     }, LIVE_ROW_OUTCOME_NOT_JUDGED],
     ['it escalates', async (h, key) => {
-      h.script({ getResult: rowOf(h, key), findMissingResult: placed(key, 'unverified_ids') })
+      h.script({ getResult: personaRow(h, key), findMissingResult: placed(key, 'unverified_ids') })
       return { lastReadState: LIVE }
     }, LIVE_ROW_OUTCOME_ESCALATED],
   ])('after the sequence ends because %s, P\'s sequence no longer runs and a new start begins a new one', async (_label, setup, kind) => {
@@ -1699,7 +1818,10 @@ describe('scheduling: each sequence runs in the background, one per persona at a
     expect(h.sequenceRunning(p)).toBe(false)
   })
 
-  test.each(SEQUENCE_STOP_WAYS)('%s while P\'s first run is held: once the run is released no get, kill, run or launch follows for P, no alert is raised and no timer is left', async (_label, stopP, reason) => {
+  // A latch from another path while the run is held is
+  // tests/conflict-latch.test.ts's (a running sequence stops when P latches
+  // from another path).
+  test.each(TEARDOWN_AND_SHUTDOWN)('%s while P\'s first run is held: once the run is released no get, kill, run or launch follows for P, no alert is raised and no timer is left', async (_label, stopP, reason) => {
     const { h, p } = build()
     const hold = holdFindMissing(h.stub.client)
     ownRowsLiveThenMissing(h)
@@ -1719,7 +1841,7 @@ describe('scheduling: each sequence runs in the background, one per persona at a
   test.each(SEQUENCE_STOP_WAYS)('%s during the pending wait until G: the wait\'s timer is cancelled and no run follows', async (_label, stopP, reason) => {
     const { h, p } = build()
     await clockAt(h, LAUNCH_START_MS)
-    h.script({ getResult: rowOf(h, p, { state: PENDING }) })
+    h.script({ getResult: personaRow(h, p, { state: PENDING }) })
     const order = recordCallOrder(h)
     const run = h.startSequence(p, { lastReadState: PENDING, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
     for (let flushes = 0; flushes < 20 && h.clock.pendingCount() === 0; flushes++) await h.clock.flush()
@@ -1737,12 +1859,12 @@ describe('scheduling: each sequence runs in the background, one per persona at a
   // tests/unavailable-retry.test.ts's (it arms nothing and cancels the wait).
   test('a latch of P from another path during the spacing between runs cancels the wait, and no further run follows', async () => {
     const { h, p } = build()
-    h.script({ getResult: rowOf(h, p) })
+    h.script({ getResult: personaRow(h, p) })
     const run = h.startSequence(p, { lastReadState: LIVE })
     for (let flushes = 0; flushes < 20 && h.clock.pendingCount() === 0; flushes++) await h.clock.flush()
     expect(h.stub.calls.findMissingCalls).toHaveLength(1)
 
-    await SEQUENCE_STOP_WAYS[0]![1](h, p)
+    await LATCH_FROM_ANOTHER_PATH[1](h, p)
 
     expect(await run.outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED, runs: 1 })
     expect([h.clock.pendingCount(), h.stub.calls.findMissingCalls.length]).toEqual([0, 1])
@@ -1795,7 +1917,7 @@ describe('scheduling: each sequence runs in the background, one per persona at a
 describe('started at a collision ladder replacement site: the launch answers while the sequence runs in the background, the sequence ends in a reuse, and a later retry begins a new episode (SRJ-707, SRJ-706)', () => {
   /** P's row in another directory read `state`, with a session id: a resume would keep the conversation. */
   const elsewhereWithSession = (h: RecoveryHarness, key: string, state: string): Phase1GetResult =>
-    rowOf(h, key, { cwd: h.home, state, claude_session_id: 'a-session-id' })
+    personaRow(h, key, { cwd: h.home, state, claude_session_id: SESSION_ID })
 
   /** The start line of P's sequence as the ladder starts it, the state it last read the seed. */
   const ladderStartLine = (h: RecoveryHarness, key: string, lastReadState: string): string =>
@@ -1807,7 +1929,7 @@ describe('started at a collision ladder replacement site: the launch answers whi
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getQueue: [cannedOk(elsewhereWithSession(h, p, LIVE))],
-      getResult: rowOf(h, p, { state: MISSING, claude_session_id: 'a-session-id' }),
+      getResult: personaRow(h, p, { state: MISSING, claude_session_id: SESSION_ID }),
     })
     const order = recordCallOrder(h)
 
@@ -1829,7 +1951,7 @@ describe('started at a collision ladder replacement site: the launch answers whi
 
   test('a not-judged stop arms P\'s timer; its next retry reaches the same replacement site through the restart path and begins a new sequence episode, which reaches the reuse; one sequence per episode', async () => {
     const { h, p } = build()
-    await clockAt(h, LAUNCH_START_MS + adGraceMsInEffect())
+    await pastSampleGrace(h)
     // Episode 1: the ladder's get reads P's pending row in another directory, and the
     // sequence's own gets read it pending; its run leaves it in neither list.
     let episode = 1
@@ -1838,7 +1960,7 @@ describe('started at a collision ladder replacement site: the launch answers whi
       spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())],
       getFn: () => {
         if (episode === 1) return elsewhereWithSession(h, p, PENDING)
-        return secondGets++ === 0 ? elsewhereWithSession(h, p, LIVE) : rowOf(h, p, { state: ENDED, claude_session_id: 'a-session-id' })
+        return secondGets++ === 0 ? elsewhereWithSession(h, p, LIVE) : personaRow(h, p, { state: ENDED, claude_session_id: SESSION_ID })
       },
     })
 
@@ -1866,7 +1988,7 @@ describe('started at a collision ladder replacement site: the launch answers whi
 
   test('a step-5 escalation of the sequence the ladder started carries the recovery context: P removed meanwhile gets one persona-kill-failed entry with it, and nothing to Slack', async () => {
     const { h, p } = build()
-    h.script({ spawnQueue: [cannedErr(errInstanceIdCollision())], getQueue: [cannedOk(elsewhereWithSession(h, p, LIVE))], getResult: rowOf(h, p) })
+    h.script({ spawnQueue: [cannedErr(errInstanceIdCollision())], getQueue: [cannedOk(elsewhereWithSession(h, p, LIVE))], getResult: personaRow(h, p) })
     // The sequence's last get: after the ladder's spawn and get, its kill, get, three runs and gets, kill, and one run.
     const lastGet = ['spawn', 'get', 'kill', 'get', ...runAndGet(LIVE_ROW_SEQUENCE_STEP3_RUNS), 'kill', ...runAndGet(1)].length - 1
     recordCallOrder(h, { at: lastGet, run: () => h.remove(p) })

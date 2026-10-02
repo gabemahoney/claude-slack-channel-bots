@@ -251,6 +251,7 @@ import {
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
+  LIVENESS_DEAD_ROW_ENDED,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_DEAD_ENDED,
   LIVENESS_READING_DEAD_INSTALL_GONE,
@@ -4500,7 +4501,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
       (calls) => ({
         ...calls,
         spawnError: errInstanceIdCollision(),
-        getResult: cannedGetResult({ state: 'ended', claude_session_id: 'a-session-id' }, p, dir),
+        getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }, p, dir),
         resumeError: errTmuxSessionCreate('resume'),
       }),
       { spawns: 1, resumes: 1 },
@@ -6870,7 +6871,7 @@ describe('b.jg5 SRJ-706, SRJ-303: the restart path makes no attempt while P\'s l
 
   test('a latched P whose sequence runs answers latched first: the running query is not asked', async () => {
     const latch = createConflictLatch({ log: (line) => { errLines.push(line) } })
-    latch.setFromConflict(P, errTmuxSessionConflict('spawn', 'scan-leftover'), { refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: latchRowStateRead('ended') })
+    latch.setFromConflict(P, errTmuxSessionConflict('spawn', 'scan-leftover'), { refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) })
     const deps = sequenceDeps(() => true)
     deps.isLatched = (key) => latch.isLatched(key)
     initRestart(deps)

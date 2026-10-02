@@ -600,6 +600,7 @@ import {
 } from '../../src/reload.ts'
 import {
   cannedGetResult,
+  cannedStatusResult,
   errInstanceIdCollision,
   errSpawnNotFound,
   holdFindMissing,
@@ -3004,7 +3005,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         })
         return entry.restart
       },
-      startSequence(name, lastReadState = 'waiting') {
+      startSequence(name, lastReadState = cannedStatusResult().state) {
         if (!realLaunch || sequences === undefined) throw new Error('reload-harness: run.startSequence() needs opts.realLaunch')
         const key = personaKey(name)
         const answer = startLiveRowSequence({

@@ -66,8 +66,7 @@
  * approver's calls and the restart path's kill, `latchOnRestartKillOutcome`)
  * and the liveness, reconnect and restart-kill adapters in `src/server.ts`:
  * the first two apply the session manager's own-row `status` step, the third
- * `latchOnRestartKillOutcome`. A site still to come latches through the same
- * entry: the re-check's relatch (E30).
+ * `latchOnRestartKillOutcome`.
  *
  * The launch start not recorded (SRJ-513): {@link launchStartNotRecordedSetInput}
  * builds its `set` input: the case "launch start not recorded", the refused
@@ -119,11 +118,10 @@
  * latch kind ({@link LatchKind}) and one of five reasons
  * ({@link LatchRecoveryReason}); nothing here posts it (see its section).
  *
- * Where later Epics plug in: the sites E17 to E22, E26 and E29 convert all
- * latch through `set`, `setFromConflict`, `setFromUnusableName` or
- * `setLaunchStartNotRecorded`; E30's re-check and its timer read the record and
- * relatch through `set`, and post the recovery notice when a latch clears;
- * E31's `clear-latch` clears through the clear E30 adds.
+ * Every latching site latches through `set`, `setFromConflict`,
+ * `setFromUnusableName` or `setLaunchStartNotRecorded`. A latch is dropped
+ * only by the persona's teardown (`forget`, silently); nothing re-checks or
+ * clears a latch, so nothing posts the recovery notice.
  *
  * Log lines, to the injected log (a throwing log is swallowed):
  *

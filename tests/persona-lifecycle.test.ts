@@ -151,6 +151,7 @@ import {
 } from '../src/unavailable-retry.ts'
 import {
   cannedKillResult,
+  cannedStatusResult,
   errConfigMalformed,
   errGeneric,
   errInstanceIdCollision,
@@ -845,7 +846,13 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   // teardown's sequence stop and retry-timer stop bound as main() binds them.
   test('b.jg5 SRJ-706, SRJ-715: a teardown of P during its sequence\'s held step-1 kill, which then answers CONFIG: the turn waits for the kill, the CONFIG answer arms P\'s retry timer, and the teardown\'s later timer stops leave none armed', async () => {
     const h = makeRecoveryHarness()
-    cleanups.push(() => h.cleanup())
+    cleanups.push(() => {
+      try {
+        assertNoLeak(h.captured())
+      } finally {
+        h.cleanup()
+      }
+    })
     const [p, q] = h.keys as [string, string]
     const killEntered = Promise.withResolvers<void>()
     const killAnswer = Promise.withResolvers<void>()
@@ -854,7 +861,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
       await killAnswer.promise
       throw errConfigMalformed()
     }
-    const run = h.startSequence(p, { lastReadState: 'waiting' })
+    const run = h.startSequence(p, { lastReadState: cannedStatusResult().state })
     await killEntered.promise
     h.controller.arm(q, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
     const f = makeFixture({
@@ -897,7 +904,13 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   // flight (`whenLaunchSettled`).
   test('b.jg5 SRJ-715, SRJ-706: P\'s launch in flight at the teardown starts P\'s sequence after the turn\'s first stop; the stop once the launch settled stops that sequence before the teardown goes on: its kill in flight is waited for, and no get, run or reuse spawn follows', async () => {
     const h = makeRecoveryHarness()
-    cleanups.push(() => h.cleanup())
+    cleanups.push(() => {
+      try {
+        assertNoLeak(h.captured())
+      } finally {
+        h.cleanup()
+      }
+    })
     const [p] = h.keys as [string]
     scriptLiveRowElsewhere(h, p)
     // P's launch is held at its collision get, and the sequence's step-1 kill at its call.

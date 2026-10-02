@@ -530,7 +530,12 @@
  *   they armed and left pending fails it too.
  *
  * Shared case helpers, each over a harness: `personaOf` (a configured
- * persona), `expectLostMessageReports` (lose one message through the driver
+ * persona), `personaRow` (a persona's own row as a `get` reads it, with
+ * overrides), `pastSampleGrace` (the clock moved to G past the stub's sample
+ * launch start, so a `pending` row is waited on no longer), `unavailableAt`
+ * (an UNAVAILABLE answer of a verb), `expectUntouched` (a persona left
+ * alone: no trigger, timer, notice, outage flag or call),
+ * `expectLostMessageReports` (lose one message through the driver
  * and assert its state, its stub calls, by default none in states 1 to 5 and
  * one `status` of the persona's instance after them, and no restart asked
  * for or pending unless `restartRequested`; resolves with the outcome), `collided` (the stub answers of a launch whose optimistic spawn
@@ -615,6 +620,7 @@ import type { Phase1SpawnParams } from '../../src/ad-phase1-types.ts'
 
 import {
   adAlertThresholdMsInEffect,
+  adGraceMsInEffect,
   adSettingsInEffect,
   installAdSettings,
   resetAdSettingsForTests,
@@ -650,6 +656,7 @@ import {
   type KillFailureClosing,
 } from '../../src/kill-failure-alert.ts'
 import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
+import { parseLaunchStart } from '../../src/pending-row.ts'
 import { _resetOutageState, clearOutageFlag, getOutageFlags, initOutageState, type OutageClass } from '../../src/outage-state.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
 import {
@@ -782,6 +789,9 @@ import {
   installStubSpawnPath,
   makeStubResolveSystemBinary,
   resetStubSpawnPath,
+  SAMPLE_LAUNCH_START_DEFAULT,
+  unavailableForms,
+  type CannedGetResult,
   type FindMissingHold,
   type PersonaGetResultOverrides,
   type StubCallLog,
@@ -2160,6 +2170,46 @@ export function personaOf(h: RecoveryHarness, key: string): Persona {
   return h.config.personas.find((p) => p.key === key)!
 }
 
+/**
+ * Persona `key`'s own row as a `get` reads it (`cannedGetResult` in persona
+ * form: its `cwd`, labels and instance id, live `waiting` by default), with
+ * `overrides`.
+ */
+export function personaRow(h: RecoveryHarness, key: string, overrides: PersonaGetResultOverrides = {}): CannedGetResult {
+  return cannedGetResult(overrides, personaOf(h, key), h.home)
+}
+
+/**
+ * Move the harness clock, with no timer pending yet, to G (the grace in
+ * effect, `adGraceMsInEffect`) past the stub's sample launch start
+ * (`SAMPLE_LAUNCH_START_DEFAULT`): a `pending` row read from then on is waited
+ * on no longer.
+ */
+export async function pastSampleGrace(h: RecoveryHarness): Promise<void> {
+  expect(h.clock.pendingCount()).toBe(0)
+  await h.clock.advanceTo(parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)! + adGraceMsInEffect())
+}
+
+/** An UNAVAILABLE answer (`ErrCallTimeout`, built by name) of a call of `verb`. */
+export function unavailableAt(verb: string): Error {
+  return unavailableForms('ErrCallTimeout')[0]![1](verb)
+}
+
+/**
+ * Persona `other` was left alone: no trigger, no armed timer, no outage or
+ * session-manager notice, no outage flag, and no stub call of its instance.
+ */
+export function expectUntouched(h: RecoveryHarness, other: string): void {
+  expect(h.triggers.filter((t) => t.key === other)).toEqual([])
+  expect(h.controller.isArmed(other)).toBe(false)
+  expect(h.outageNotices.filter((n) => n.key === other)).toEqual([])
+  expect(h.notices.filter((n) => n.key === other)).toEqual([])
+  expect(getOutageFlags(other).size).toBe(0)
+  const otherId = personaInstanceId(other)
+  const calls = Object.values(h.stub.calls).flat() as Array<{ claude_instance_id?: unknown }>
+  expect(calls.filter((params) => params?.claude_instance_id === otherId)).toEqual([])
+}
+
 /** States 1 to 5 of SRJ-1011: those that apply before the lost-message row read is made. */
 const EARLY_LOST_MESSAGE_STATES: readonly LostMessageState[] = LOST_MESSAGE_STATES.slice(0, LOST_MESSAGE_STATES.indexOf('session-starting'))
 
@@ -2222,7 +2272,7 @@ export function scriptLiveRowElsewhere(h: RecoveryHarness, key: string, script: 
   const persona = personaOf(h, key)
   h.script({
     spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
-    getQueue: [cannedOk(cannedGetResult({ cwd: h.home, state: 'waiting' }, persona, h.home))],
+    getQueue: [cannedOk(cannedGetResult({ cwd: h.home, state: cannedStatusResult().state }, persona, h.home))],
     getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, persona, h.home),
     ...script,
   })
@@ -2335,7 +2385,7 @@ export async function runSequenceStoppedAtKill(
   reason: LiveRowSequenceStopReason,
 ): Promise<{ readonly outcome: LiveRowSequenceOutcome; readonly order: string[] }> {
   const [, make, tries] = answer
-  h.script({ getResult: cannedGetResult({}, personaOf(h, key), h.home) })
+  h.script({ getResult: personaRow(h, key) })
   scriptSequenceKillFailure(h, step, make)
   let run: RecoverySequenceRun | undefined
   // Each further try follows one status read: the last try is the call at this position.
@@ -2383,7 +2433,7 @@ export function ownRowsLiveThenMissing(h: RecoveryHarness): void {
       if (key === undefined) throw new Error(`recovery harness: no configured persona has the instance id ${String(params.claude_instance_id)}`)
       const first = !read.has(key)
       read.add(key)
-      return cannedGetResult(first ? {} : { state: LIVENESS_DEAD_ROW_MISSING }, personaOf(h, key), h.home)
+      return personaRow(h, key, first ? {} : { state: LIVENESS_DEAD_ROW_MISSING })
     },
   })
 }
@@ -2461,7 +2511,7 @@ export function rowReadsUntilSpawn(
     return result
   }
   const statusFn: NonNullable<RecoveryStubScript['statusFn']> = (params) => {
-    if (live.has(String(params.claude_instance_id))) return cannedStatusResult({ state: 'waiting' })
+    if (live.has(String(params.claude_instance_id))) return cannedStatusResult()
     return before === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult(beforeRow)
   }
   h.script({ statusFn })
