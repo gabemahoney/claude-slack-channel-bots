@@ -79,6 +79,15 @@
  * during those awaits.
  * A launch that answers `'skipped'` for a persona that latched at it answers
  * the same. A latched query that throws counts as latched (fail safe).
+ * A persona held on `ErrInvalidFlags` gets no attempt either (b.jg5 SRJ-207,
+ * SRJ-303): the optional held query (`RestartDeps.isHeld`) is asked right
+ * after each latched gate, so a fired restart timer, the retry entry (before
+ * its in-flight and cap checks) and a human-triggered restart all answer
+ * `RESTART_OUTCOME_HELD` with no agent-director call, nothing recorded and
+ * nothing toward the cap, and so does a launch that answers `'skipped'` for a
+ * persona held at it (its reuse spawn met `ErrInvalidFlags`). A held query
+ * that throws counts as held (fail safe). `scheduleRestart` arms no timer for
+ * a held persona.
  * Right after that first latched gate comes the live-row sequence gate
  * (b.jg5 SRJ-706, SRJ-303; the optional `RestartDeps.isLiveRowSequenceRunning`):
  * while P's sequence runs, a fired restart timer, the retry entry and a
@@ -249,6 +258,16 @@ export const RESTART_OUTCOME_LIVENESS_UNKNOWN = 'liveness-unknown'
  */
 export const RESTART_OUTCOME_LATCHED = 'latched'
 /**
+ * The persona is held on `ErrInvalidFlags` (b.jg5 SRJ-207, SRJ-303,
+ * `RestartDeps.isHeld`): the gate right after a latched gate found it so, so
+ * nothing was probed, reconnected, killed or launched, or nothing more was
+ * called; or its launch answered `'skipped'` because its reuse spawn met
+ * `ErrInvalidFlags` and held it. Nothing was recorded and nothing counts
+ * toward the cap. A held query that threw answers this too (fail safe). The
+ * retry timer stops on it (SRJ-305).
+ */
+export const RESTART_OUTCOME_HELD = 'held'
+/**
  * A live-row sequence runs for the persona (b.jg5 SRJ-706, SRJ-303,
  * `RestartDeps.isLiveRowSequenceRunning`): the work's gate right after the
  * latched gate found it so, so nothing was probed, reconnected, killed or
@@ -281,6 +300,7 @@ export type RestartWorkOutcome =
   | typeof RESTART_OUTCOME_LAUNCH_SKIPPED
   | typeof RESTART_OUTCOME_LIVENESS_UNKNOWN
   | typeof RESTART_OUTCOME_LATCHED
+  | typeof RESTART_OUTCOME_HELD
   | typeof RESTART_OUTCOME_SEQUENCE_WAITING
 
 /** What the retry entry (`runRestartRetry`) answers: the work's outcome, or why it did not run. */
@@ -460,6 +480,22 @@ export interface RestartDeps {
    * what it threw); any other answer is not. Absent: no persona is latched.
    */
   isLatched?(key: string): boolean
+  /**
+   * The held query (b.jg5 SRJ-207, SRJ-303): true while the persona is held
+   * on `ErrInvalidFlags` (production: the server's hold's `isHeld`). Asked
+   * right after each latched gate, by every path that reaches the work (a
+   * fired restart timer, the retry entry before its in-flight and cap
+   * checks, a human-triggered restart): for a held persona the work makes no
+   * agent-director call (`status`, kill, `send-keys`, spawn or `resume`),
+   * records no success or failure, adds nothing toward the cap and answers
+   * `RESTART_OUTCOME_HELD`. Asked again wherever the latched query is asked
+   * again, and when the launch answers `'skipped'`, so a persona held at that
+   * launch answers the same. `scheduleRestart` asks it right after the
+   * latched query and arms no timer for a held persona. An answer of exactly
+   * `true` is held, and so is a query that throws (fail safe, logged in the
+   * one line); any other answer is not. Absent: no persona is held.
+   */
+  isHeld?(key: string): boolean
   /**
    * Whether a live-row sequence runs for the persona (b.jg5 SRJ-706, SRJ-303;
    * production: the session manager's running query,
@@ -710,7 +746,8 @@ export function initRestart(d: RestartDeps): void {
  * timer, so the health tick, which skips a persona whose restart is pending,
  * keeps reading the latched persona. Any timer already pending for the
  * persona is left as it is (its work asks the same query first and makes no
- * attempt for a latched persona).
+ * attempt for a latched persona). A persona held on `ErrInvalidFlags` gets no
+ * timer either (b.jg5 SRJ-207: `RestartDeps.isHeld`, asked right after).
  */
 export function scheduleRestart(
   key: string,
@@ -728,6 +765,12 @@ export function scheduleRestart(
   const latched = readLatched(deps, key)
   if (latched.latched) {
     console.error(`[slack] Not scheduling restart for persona=${key} — the persona is latched${latchedFailure(latched)}; no timer armed (b.jg5 SRJ-502)`)
+    return
+  }
+  // b.jg5 SRJ-207: nor does a persona held on ErrInvalidFlags.
+  const held = readHeld(deps, key)
+  if (held.held) {
+    console.error(`[slack] Not scheduling restart for persona=${key} — the persona is held on ErrInvalidFlags${heldFailure(held)}; no timer armed (b.jg5 SRJ-207)`)
     return
   }
 
@@ -819,7 +862,9 @@ async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise
  * bring-up retry's launch or a restart for the persona. Inside that work,
  * first, the latched query (`RestartDeps.isLatched`, b.jg5 SRJ-502): a
  * latched persona (a query that throws included) answers
- * `RESTART_OUTCOME_LATCHED` with no agent-director call. Then `isInFlight(key)`: true answers `RESTART_OUTCOME_IN_FLIGHT` with no
+ * `RESTART_OUTCOME_LATCHED` with no agent-director call. Then the held query
+ * (`RestartDeps.isHeld`, b.jg5 SRJ-207): a persona held on `ErrInvalidFlags`
+ * answers `RESTART_OUTCOME_HELD` with no agent-director call. Then `isInFlight(key)`: true answers `RESTART_OUTCOME_IN_FLIGHT` with no
  * agent-director call (a check that throws counts as true). Then the restart
  * cap: at the cap (an earlier restart work's counted failure reached it while
  * this retry waited its turn, although the retry timer checked the cap before
@@ -851,6 +896,8 @@ export async function runRestartRetry(
     return await (d.serialize ?? runNow)(key, async (): Promise<RestartRetryOutcome> => {
       // b.jg5 SRJ-502: a latched persona gets no attempt, whatever else holds.
       if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+      // b.jg5 SRJ-207, SRJ-303: nor does a persona held on ErrInvalidFlags.
+      if (skipIfHeld(d, key)) return RESTART_OUTCOME_HELD
       if (launchInFlight(key, isInFlight)) {
         console.error(`[slack] Restart retry skipped for persona=${key} — a launch is in flight; no agent-director call`)
         return RESTART_OUTCOME_IN_FLIGHT
@@ -905,6 +952,9 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
   // instance is never probed, reconnected, killed or launched here. The steps
   // ask again after their awaits, before the instance is touched.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+  // b.jg5 SRJ-207, SRJ-303: a persona held on ErrInvalidFlags gets no
+  // attempt: no liveness read, kill or launch, nothing recorded or counted.
+  if (skipIfHeld(d, key)) return RESTART_OUTCOME_HELD
   // b.jg5 SRJ-706, SRJ-303: while P's live-row sequence runs, no other launch
   // path for P starts: no liveness read, kill or launch, nothing recorded.
   if (skipIfSequenceRunning(d, key)) return RESTART_OUTCOME_SEQUENCE_WAITING
@@ -939,6 +989,9 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // with no launch start, SRJ-513, read `unknown`); then nothing is
   // deferred, reconnected or killed, and the arm hook is not called.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+  // b.jg5 SRJ-207: so is the held gate: a launch outside the serializer may
+  // have held the persona while the probe ran (its reuse spawn's ErrInvalidFlags).
+  if (skipIfHeld(d, key, 'after its liveness probe')) return RESTART_OUTCOME_HELD
   // b.jg5 SRJ-706: the sequence gate is asked again wherever the latched gate
   // is: a launch outside the serializer may have started P's live-row
   // sequence while the probe ran (a collision ladder's replacement site).
@@ -1076,6 +1129,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // b.jg5 SRJ-502: the adapter's sweep may have latched the persona (a
     // post-run `get` of its own row); then no re-probe follows.
     if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+    if (skipIfHeld(d, key, 'after its escalate-dead reconnect')) return RESTART_OUTCOME_HELD
     if (skipIfSequenceRunning(d, key, 'after its escalate-dead reconnect')) return RESTART_OUTCOME_SEQUENCE_WAITING
     const reprobed = await reprobeDeadAfterEscalate(d, key)
     if (typeof reprobed === 'string') return reprobed
@@ -1093,6 +1147,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // b.jg5 SRJ-706: so is the sequence gate, before the kill and again before
   // the launch: while P's live-row sequence runs, nothing more is called.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+  if (skipIfHeld(d, key, 'before its kill')) return RESTART_OUTCOME_HELD
   if (skipIfSequenceRunning(d, key, 'before its kill')) return RESTART_OUTCOME_SEQUENCE_WAITING
   if (killBeforeLaunch) {
     const stopped = await killBeforeRelaunch(d, key, cwd, deadRead)
@@ -1124,6 +1179,13 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     if (reading.latched) {
       console.error(`[slack] Session relaunch for persona=${key} ended latched${latchedFailure(reading)} — not counted; nothing more is done for it`)
       return RESTART_OUTCOME_LATCHED
+    }
+    // b.jg5 SRJ-207: the launch's reuse spawn met ErrInvalidFlags and held the
+    // persona (or it was held by the time the launch ran). Nothing is recorded.
+    const heldReading = readHeld(d, key)
+    if (heldReading.held) {
+      console.error(`[slack] Session relaunch for persona=${key} ended held on ErrInvalidFlags${heldFailure(heldReading)} — not counted; nothing more is done for it (b.jg5 SRJ-207)`)
+      return RESTART_OUTCOME_HELD
     }
     // Declined: the persona stopped being up between the last `canRestart`
     // check above and the launch, and the launch's own gate (the same
@@ -1199,7 +1261,7 @@ function countLaunchFailure(
  * latch; a counted failure is recorded, with the cap notice through the
  * installed restart dependencies' `onCapReached` once per episode (none when
  * `initRestart` has not run). The caller decides which results count (a
- * refused, stopping, latched or deferred launch records nothing). Answers
+ * refused, stopping, latched, held or deferred launch records nothing). Answers
  * `launched`, `counted-failure` or `capped`.
  */
 export function recordLaunchResultOutsideRestartWork(
@@ -1343,6 +1405,7 @@ async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<Re
   // reading `pending` with no launch start, read `unknown`): no arm
   // hook, deferral, kill or launch, and nothing recorded.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+  if (skipIfHeld(d, key, 'after its re-probe')) return RESTART_OUTCOME_HELD
   if (skipIfSequenceRunning(d, key, 'after its re-probe')) return RESTART_OUTCOME_SEQUENCE_WAITING
 
   switch (probe.kind) {
@@ -1558,6 +1621,56 @@ function skipIfLatched(d: RestartDeps, key: string): boolean {
   if (!reading.latched) return false
   console.error(
     `[slack] Skipping restart for persona=${key} — the persona is latched${latchedFailure(reading)}; no agent-director call, nothing recorded (b.jg5 SRJ-502)`,
+  )
+  return true
+}
+
+/**
+ * What `RestartDeps.isHeld` answered for a persona: `held` (exactly `true`,
+ * or a query that threw, which counts as held so the work fails safe), with
+ * `failure`, `describeThrownValue` of what it threw, when it threw.
+ */
+interface HeldReading {
+  readonly held: boolean
+  readonly failure?: string
+}
+
+/**
+ * `RestartDeps.isHeld` for persona `key` (`HeldReading`): exactly `true` is
+ * held; an absent query is not; a query that throws counts as held (b.jg5
+ * SRJ-207: never launch a persona that may be held). Logs nothing; never
+ * throws.
+ */
+function readHeld(d: RestartDeps, key: string): HeldReading {
+  if (d.isHeld === undefined) return { held: false }
+  try {
+    return { held: d.isHeld(key) === true }
+  } catch (err) {
+    return { held: true, failure: describeThrownValue(err) }
+  }
+}
+
+/** ` (the held query failed: <why> — taken as held)` for a query that threw, else empty. */
+function heldFailure(reading: HeldReading): string {
+  return reading.failure === undefined ? '' : ` (the held query failed: ${reading.failure} — taken as held)`
+}
+
+/**
+ * The held gate (b.jg5 SRJ-207, SRJ-303): when persona `key` is held on
+ * `ErrInvalidFlags`, or the held query throws, log one line saying the
+ * restart work makes no attempt for it (naming what the query threw, if it
+ * did) and return true, so the caller returns `RESTART_OUTCOME_HELD` before
+ * any agent-director call. Records neither a success nor a failure. With
+ * `askedAgain` (where the work asks it again, wherever it asks the latched
+ * gate again) the line says the work goes no further.
+ */
+function skipIfHeld(d: RestartDeps, key: string, askedAgain?: string): boolean {
+  const reading = readHeld(d, key)
+  if (!reading.held) return false
+  console.error(
+    askedAgain === undefined
+      ? `[slack] Skipping restart for persona=${key} — the persona is held on ErrInvalidFlags${heldFailure(reading)}; no agent-director call, nothing recorded (b.jg5 SRJ-207)`
+      : `[slack] Restart for persona=${key} goes no further ${askedAgain} — the persona is held on ErrInvalidFlags${heldFailure(reading)}; nothing more is called for it, nothing recorded (b.jg5 SRJ-207)`,
   )
   return true
 }

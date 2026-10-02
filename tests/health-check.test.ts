@@ -1897,7 +1897,8 @@ describe('b.jg5 SRJ-316: a CONFIG answer at the health tick', () => {
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-315 — no attempt, still read
 //
-// While a persona is latched (`isLatched`, b.jg5 SRJ-502; checked first), has
+// While a persona is latched (`isLatched`, b.jg5 SRJ-502; checked first), is
+// held on `ErrInvalidFlags` (`isHeld`, b.jg5 SRJ-207; checked next), has
 // work in flight (`isLaunchInFlight`) or has its
 // `tmux-unavailable` outage raised, the tick makes no attempt of its own for
 // it: no `scheduleRestart` and no not-connected notice. It still runs the
@@ -1952,10 +1953,16 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
   const latched: NoAttemptRule = (deps, active = () => true) => {
     deps.isLatched = (key) => key === P && active(deps.tickCount())
   }
+  // b.jg5 SRJ-207: production binds `isHeld` to the server's ErrInvalidFlags
+  // hold (pinned in tests/server-startup-wiring.test.ts); the tick only asks it.
+  const held: NoAttemptRule = (deps, active = () => true) => {
+    deps.isHeld = (key) => key === P && active(deps.tickCount())
+  }
   const RULES: Array<[string, NoAttemptRule, boolean]> = [
     ['a launch in flight', inFlight, false],
     ['tmux-unavailable raised', tmuxUnavailable, true],
     ['P latched (b.jg5 SRJ-502)', latched, false],
+    ['P held on ErrInvalidFlags (b.jg5 SRJ-207)', held, false],
   ]
 
   /** Auto-restart disabled, with every attempt-side and healthy-side hook recorded. */
@@ -2146,6 +2153,50 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(lines.filter((l) => l.includes(`persona=${P}`) && l.includes('simulated latch failure'))).toHaveLength(1)
   })
 
+  test('b.jg5 SRJ-207: a throwing held query ends P\'s work for the tick before any read, logged; B is still checked', async () => {
+    const personas = workList(P, B)
+    const deps = makeDeps({ personas, maxTicks: 1 })
+    deps.isHeld = (key) => {
+      if (key === P) throw new Error('simulated held-query failure')
+      return false
+    }
+
+    const lines = await capturingErrors(() => runTicks(deps, 1))
+
+    expect(deps.statRouteCalls).toEqual([personas[B]!])
+    expect(deps.isSessionAliveCalls).toEqual([B])
+    expect(deps.scheduleRestartCalls).toEqual([{ key: B, cwd: personas[B]! }])
+    expect(lines.filter((l) => l.includes(`persona=${P}`) && l.includes('simulated held-query failure'))).toHaveLength(1)
+  })
+
+  test('b.jg5 SRJ-207: the held query is asked right after the latched one and before the in-flight one: P held, with an in-flight predicate that would throw for it, is still read and makes no attempt; a latched P is never asked it', async () => {
+    const personas = workList(P)
+    const deps = makeDeps({ personas, maxTicks: 1 })
+    held(deps)
+    const inFlightAsked: string[] = []
+    deps.isLaunchInFlight = (key) => {
+      inFlightAsked.push(key)
+      throw new Error('simulated in-flight failure')
+    }
+
+    await capturingErrors(() => runTicks(deps, 1))
+
+    expect(inFlightAsked).toEqual([])
+    expect(deps.isSessionAliveCalls).toEqual([P])
+    expect(deps.scheduleRestartCalls).toEqual([])
+
+    const latchedDeps = makeDeps({ personas, maxTicks: 1 })
+    latched(latchedDeps)
+    const heldAsked: string[] = []
+    latchedDeps.isHeld = (key) => {
+      heldAsked.push(key)
+      return false
+    }
+    await capturingErrors(() => runTicks(latchedDeps, 1))
+    expect(heldAsked).toEqual([])
+    expect(latchedDeps.scheduleRestartCalls).toEqual([])
+  })
+
   test('b.jg5 SRJ-502: the latch is asked first: P latched, with an in-flight predicate that would throw for it, is still read and makes no attempt', async () => {
     const personas = workList(P)
     const deps = makeDeps({ personas, maxTicks: 1 })
@@ -2304,11 +2355,12 @@ describe('b.jg5 SRJ-315: no attempt, still read', () => {
     expect(getOutageFlags(P).has('tmux-unavailable')).toBe(true)
   })
 
-  // b.jg5 SRJ-502: the latch stops P's retry timer, so the tick never arms a
-  // new one for a latched P, even with its tmux-unavailable outage raised.
-  test.each(READ_NOT_HEALTHY)('b.jg5 SRJ-502: P latched with tmux-unavailable raised too and no retry timer armed, read %s on two ticks: the latched reason wins, so nothing is armed, nothing scheduled and the flag stays raised', async (_label, opts) => {
+  // b.jg5 SRJ-502, SRJ-207: the latch and the ErrInvalidFlags hold each stop
+  // P's retry timer, so the tick never arms a new one for a latched or held
+  // P, even with its tmux-unavailable outage raised.
+  test.each(READ_NOT_HEALTHY.flatMap(([label, opts]) => ([['latched', latched], ['held on ErrInvalidFlags', held]] as const).map(([rule, apply]) => [rule, label, opts, apply] as const)))('b.jg5 SRJ-502, SRJ-207: P %s with tmux-unavailable raised too and no retry timer armed, read %s on two ticks: that reason wins, so nothing is armed, nothing scheduled and the flag stays raised', async (_rule, _label, opts, apply) => {
     const deps = makeDeps({ personas: workList(P), ...opts, retryArmedResult: false, recordRetryArms: true, maxTicks: 2 })
-    latched(deps)
+    apply(deps)
     tmuxUnavailable(deps)
     const { notified } = recording(deps)
 
@@ -2506,6 +2558,7 @@ describe('b.jg5 SRJ-308: the tick-end hook runs once per tick body with the tick
     ['a restart pending', { isRestartPendingResult: true }, bindNothing],
     ['a launch in flight', {}, (deps) => { deps.isLaunchInFlight = () => true }],
     ['latched (b.jg5 SRJ-502)', {}, (deps) => { deps.isLatched = () => true }],
+    ['held on ErrInvalidFlags (b.jg5 SRJ-207)', {}, (deps) => { deps.isHeld = () => true }],
     ['tmux-unavailable raised', {}, () => {
       setOutageFlag('persona_a', 'tmux-unavailable')
       setOutageFlag('persona_b', 'tmux-unavailable')

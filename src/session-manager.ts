@@ -112,6 +112,16 @@
  *      tmux-touching call follows it. Every other `ErrInternal` stays
  *      UNCLASSIFIED (step 3). The persona teardown's kill and delete
  *      (`killPersonaInstance`, `deletePersonaInstance`) latch nothing.
+ *   5a. An `ErrInvalidFlags` at a reuse spawn of the same id (b.jg5 SRJ-112,
+ *      SRJ-207; `reuseSpawnFailedAt`) gets one immediate version re-check;
+ *      unless it stops the server, the persona is held on `ErrInvalidFlags`
+ *      through the installed hold (`setInvalidFlagsHold`) and the launch
+ *      answers `held`: no notice, no `spawn-failed` entry, nothing counted or
+ *      armed, and no other launch. A held persona is not launched at all:
+ *      `spawnForPersona`, the live-row sequence's start entry and its
+ *      sequence-launch entry answer `held` with no agent-director call. Only
+ *      a reuse holds: a `resume`'s `ErrInvalidFlags` keeps the re-check,
+ *      then UNCLASSIFIED (step 3).
  *   6. Every kill is a checked kill (`src/checked-kill.ts`; b.jg5 SRJ-110,
  *      SRJ-701): `killPersonaInstance` answers its outcome, `kill_sent`
  *      included, and never throws; its context (`KILL_CONTEXT_ATTEMPT` or
@@ -345,7 +355,14 @@ import {
   unclassifiedClassificationOf,
   type InvalidFlagsError,
 } from './ad-error-class.ts'
-import { RECHECK_OUTCOME_STOP } from './ad-version-gate.ts'
+import { RECHECK_OUTCOME_STOP, lastAdVersionSeen } from './ad-version-gate.ts'
+import {
+  INVALID_FLAGS_HOLD_DECISION_STOP,
+  decideInvalidFlagsHold,
+  describeHoldVersion,
+  invalidFlagsHeldNoLaunchLine,
+  type InvalidFlagsHold,
+} from './invalid-flags-hold.ts'
 import {
   KILL_OUTCOME_NOT_KILLED,
   checkedKill,
@@ -1010,6 +1027,76 @@ function latchGateReadingOf(key: string): LatchGateReading | undefined {
   } catch (err) {
     return { latchCase: LATCH_CASE_UNKNOWN, failure: `its latch record could not be read: ${describeThrownValue(err)}` }
   }
+}
+
+// ---------------------------------------------------------------------------
+// The ErrInvalidFlags hold (b.jg5 SRJ-207)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the session manager uses of the server's one `ErrInvalidFlags` hold
+ * (`src/invalid-flags-hold.ts`): `set` at a reuse spawn's `ErrInvalidFlags`
+ * whose immediate re-check did not stop the server (`reuseSpawnFailedAt`),
+ * and `isHeld` at every launch entry (`spawnForPersona`, the sequence start
+ * entry and the sequence-launch entry).
+ */
+export type SessionInvalidFlagsHold = Pick<InvalidFlagsHold, 'set' | 'isHeld'>
+
+/**
+ * The installed hold. Production installs the server's one hold
+ * (`createInvalidFlagsHold`, built in `main()`) before the start pass. With
+ * none installed (unit tests, the integration driver) no persona is held, so
+ * no launch is held back, and a reuse spawn's `ErrInvalidFlags` whose
+ * re-check did not stop the server still answers `held` with one line saying
+ * that no hold is installed.
+ */
+let invalidFlagsHold: SessionInvalidFlagsHold | undefined
+
+/**
+ * Install the server's `ErrInvalidFlags` hold (production: `main()`; the
+ * recovery harness installs its own the same way), or remove it with
+ * undefined (b.jg5 SRJ-207).
+ */
+export function setInvalidFlagsHold(hold: SessionInvalidFlagsHold | undefined): void {
+  invalidFlagsHold = hold
+}
+
+/** Test-only seam: remove the installed hold. */
+export function _resetInvalidFlagsHold(): void {
+  invalidFlagsHold = undefined
+}
+
+/**
+ * What a launch entry's held gate read of persona `key` (b.jg5 SRJ-207):
+ * `undefined` when no hold is installed or `isHeld` answers anything but
+ * exactly `true`; otherwise held, with `failure`, `describeThrownValue` of
+ * what `isHeld` threw, when it threw (fail safe: a query that throws counts
+ * as held). Logs nothing; never throws.
+ */
+function heldGateReadingOf(key: string): { readonly failure?: string } | undefined {
+  const hold = invalidFlagsHold
+  if (hold === undefined) return undefined
+  try {
+    return hold.isHeld(key) === true ? {} : undefined
+  } catch (err) {
+    return { failure: describeThrownValue(err) }
+  }
+}
+
+/**
+ * The held gate of the launch entries (b.jg5 SRJ-207): when persona `key` is
+ * held on `ErrInvalidFlags` (a held query that throws counts as held) and is
+ * not latched (the latched gate answers for a latched one), log one line
+ * (`invalidFlagsHeldNoLaunchLine`) and answer the `held` result: no
+ * agent-director call, no trust patch, no reply-guard step, no record
+ * written, nothing armed and nothing counted. Otherwise undefined.
+ */
+function heldResult(key: string, ref: string, site: string): SpawnPersonaResult | undefined {
+  const held = heldGateReadingOf(key)
+  if (held === undefined || latchGateReadingOf(key) !== undefined) return undefined
+  const line = invalidFlagsHeldNoLaunchLine(site, ref)
+  console.error(held.failure === undefined ? line : `${line} (the held query failed: ${held.failure} — taken as held)`)
+  return { key, action: 'held' }
 }
 
 /**
@@ -6765,6 +6852,19 @@ export interface SpawnPersonaResult {
      * neither as failed nor as succeeded.
      */
     | 'sequence-waiting'
+    /**
+     * b.jg5 SRJ-207: the persona is held on `ErrInvalidFlags`. Either a reuse
+     * spawn answered `ErrInvalidFlags` and the immediate version re-check
+     * passed, could not run or was not running, so the persona was held
+     * (`reuseSpawnFailedAt`); or it was already held when the launch was asked
+     * for, so no agent-director call was made at all. Not a failure: never
+     * counted, no spawn-failure notice, no `spawn-failed` entry, nothing
+     * armed, and nothing is killed, deleted or launched after it.
+     * `launchSession` maps it to `'skipped'` (SRJ-1015: the hold stops the
+     * retry timer), and the start pass counts it neither as failed nor as
+     * succeeded.
+     */
+    | 'held'
   /** For `deferred`: the claude_config_dir cause (`claude-config-dir` step). */
   deferredBy?: PersonaBringUpFailure
   /**
@@ -8078,7 +8178,9 @@ function sequenceSeedState(lastRead: LatchRowState): string {
  *     No other call is made, and the answer is `sequence-waiting` whatever
  *     the start entry answers (`started`, `already-running`, `closed`,
  *     `not-installed`), each with its own line from the start entry or the
- *     registry; nothing is counted (SRJ-706, SRJ-1015).
+ *     registry, except `held` (the persona is held on `ErrInvalidFlags`,
+ *     b.jg5 SRJ-207), which answers `held`; nothing is counted (SRJ-706,
+ *     SRJ-1015).
  * The step never deletes, never kills and never launches over a live row.
  * `resumeOrFreshSpawn`'s replacements reach it through
  * `replaceAtResumeSite`, so a dead-session path's earlier live read starts
@@ -8107,10 +8209,11 @@ async function replacePersonaRow(run: LadderRun, lastRead: LatchRowState, replac
     launches: true,
     alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
   })
+  const action = startAnswer === LIVE_ROW_START_HELD ? 'held' : 'sequence-waiting'
   console.error(
-    `[slack] spawnForPersona: replacing the row of ${ref} (${replacing}; last read ${describeLatchRowState(lastRead)}): a live row goes through the live-row sequence first, which ends in a reuse spawn of the same id; start answered ${startAnswer} — answering sequence-waiting; no other call, nothing counted (b.jg5 SRJ-707, SRJ-705, SRJ-706)`,
+    `[slack] spawnForPersona: replacing the row of ${ref} (${replacing}; last read ${describeLatchRowState(lastRead)}): a live row goes through the live-row sequence first, which ends in a reuse spawn of the same id; start answered ${startAnswer} — answering ${action}; no other call, nothing counted (b.jg5 SRJ-707, SRJ-705, SRJ-706)`,
   )
-  return { key, action: 'sequence-waiting' }
+  return { key, action }
 }
 
 /**
@@ -8747,9 +8850,14 @@ export const REREAD_LATCHED_OUTCOME = 'the persona is latched: answering latched
 export const NOT_RESUMABLE_PENDING_OUTCOME =
   "a launch in progress, not a failure: nothing counted or posted, and no live-row sequence of its own; the ladder's pending step decides"
 
-/** The outcome of the not-resumable step's sequence answer at the collision ladder, with the start entry's answer. */
+/**
+ * The outcome of the not-resumable step's sequence answer at the collision
+ * ladder, with the start entry's answer: `held` for a persona held on
+ * `ErrInvalidFlags` (b.jg5 SRJ-207), `sequence-waiting` for any other.
+ */
 export function notResumableSequenceOutcome(startAnswer: string): string {
-  return `the path holds dead evidence and the row is live: the live-row sequence, with the conversation kept (alert context ${KILL_FAILURE_CONTEXT_RECOVERY}), ending in resume; start answered ${startAnswer} — answering sequence-waiting; no other call, nothing counted`
+  const answering = startAnswer === LIVE_ROW_START_HELD ? 'held' : 'sequence-waiting'
+  return `the path holds dead evidence and the row is live: the live-row sequence, with the conversation kept (alert context ${KILL_FAILURE_CONTEXT_RECOVERY}), ending in resume; start answered ${startAnswer} — answering ${answering}; no other call, nothing counted`
 }
 
 /** The outcome of a lost race at the collision ladder, with whether the retry timer was armed. */
@@ -8774,8 +8882,9 @@ export function lostRaceOutcome(armed: boolean): string {
  *     entry at step 1, the conversation kept, the key not retired, ending in
  *     a launch, alert context `recovery`; its step 6 is a `resume` when the
  *     row has a session id and the persona may resume it (SRJ-705). The
- *     answer is `sequence-waiting` whatever the start entry answers, with no
- *     other call and nothing counted (SRJ-706);
+ *     answer is `sequence-waiting` whatever the start entry answers but
+ *     `held` (b.jg5 SRJ-207), which answers `held`, with no other call and
+ *     nothing counted (SRJ-706);
  *   - `lost-race`: nothing killed, deleted or launched; the persona's retry
  *     timer armed with the lost-race cause through the outage state's site
  *     entry (`reportLostRaceAtSite`; the attempt records it), and the
@@ -8811,7 +8920,7 @@ async function spawnNotResumableAtLadder(run: LadderRun, err: unknown, deadEvide
         alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
       })
       log(notResumableSequenceOutcome(startAnswer))
-      return { key, action: 'sequence-waiting' }
+      return { key, action: startAnswer === LIVE_ROW_START_HELD ? 'held' : 'sequence-waiting' }
     }
     case NOT_RESUMABLE_LOST_RACE:
       return lostRaceAtLadder(key, log)
@@ -9498,6 +9607,13 @@ export async function whenLaunchSettled(key: string): Promise<void> {
 /**
  * Core per-persona spawn dispatcher (SR-1.4), addressing `cscb_<key>`:
  *
+ * 00. The held gate (b.jg5 SRJ-207): a persona the installed hold
+ *    (`setInvalidFlagsHold`) holds on `ErrInvalidFlags`, and that is not
+ *    latched, answers `held` before any other step, joining no launch in
+ *    flight, with one line: no agent-director call, no trust patch, no
+ *    reply-guard step, no record written, nothing armed or counted. A held
+ *    query that throws counts as held. A latched persona goes on to the
+ *    latched gate.
  * 0. The live-row sequence gate (b.jg5 SRJ-706): while a live-row sequence
  *    runs for the persona (`isLiveRowSequenceRunning`) and it is not
  *    latched, the call answers `sequence-waiting` before any other step,
@@ -9635,8 +9751,8 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    answers a cause for arms the persona's retry timer through the installed
  *    trigger sink, and a `failed` result whose attempt's last agent-director
  *    error armed it carries the refusal marker (`refused`). A joining call,
- *    the latched gate, the claude_config_dir deferral and dry run are no
- *    attempt.
+ *    the held and latched gates, the claude_config_dir deferral and dry run
+ *    are no attempt.
  * 8. Every spawn or resume above that returns success is followed by one
  *    after-launch step (`afterLaunchSucceeded`), which starts the persona's
  *    dialog approver in its own registry (`startDialogApprover`, b.jg5
@@ -9654,9 +9770,9 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  * and every `resumeOrFreshSpawn` call it makes holds dead evidence when that
  * verdict is dead evidence or the path's own cause is. A call that joins a
  * launch already in flight gets that launch's result, and its verdict is
- * dropped with one line. The `sequence-waiting` gate runs before the join
- * check, so it answers either way; the latched gate runs after it, so it
- * answers only a call that starts a ladder (a joining call gets the
+ * dropped with one line. The held and `sequence-waiting` gates run before the
+ * join check, so they answer either way; the latched gate runs after it, so
+ * it answers only a call that starts a ladder (a joining call gets the
  * in-flight launch's result).
  */
 export async function spawnForPersona(
@@ -9668,6 +9784,12 @@ export async function spawnForPersona(
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   const ref = personaRef(persona)
+  // b.jg5 SRJ-207: a persona held on ErrInvalidFlags is not launched, whoever
+  // asks, and joins no launch in flight: no agent-director call, no trust
+  // patch, no reply-guard step, no record. A latched persona still gets the
+  // latched gate's answer.
+  const held = heldResult(key, ref, 'spawnForPersona')
+  if (held !== undefined) return held
   // b.jg5 SRJ-706: while P's live-row sequence runs (its own step-6 launch in
   // flight included), no other launch for P starts or joins one: no
   // agent-director call, no trust patch, no reply-guard step, no record.
@@ -10177,11 +10299,16 @@ export async function reuseSpawnForPersona(
  *   - `ErrInstanceIdCollision`: one line and the collided answer
  *     (`REUSE_SPAWN_COLLIDED`): no notice, no entry, nothing counted; it
  *     never reaches `notifySpawnFailure`;
- *   - `ErrInvalidFlags`: one immediate version re-check (SRJ-204); a stop it
- *     decides answers `failed` marked `stopping`; otherwise SRJ-105's
- *     UNCLASSIFIED row through the outage state's site entry (the retry timer
- *     armed, the unclassified-error episode fed; refused, never counted).
- *     Never another launch;
+ *   - `ErrInvalidFlags`: one immediate version re-check (SRJ-204), and the
+ *     hold decision on its answer (`decideInvalidFlagsHold`, SRJ-207): a stop
+ *     answers `failed` marked `stopping`, with no post, nothing counted and no
+ *     hold (the server stops, SRJ-205); a pass, a could-not-run or a
+ *     not-running answer holds the persona through the installed hold, under
+ *     the pass's version or the re-check's last version seen
+ *     (`lastAdVersionSeen`), and answers `held`: no spawn-failure notice, no
+ *     `spawn-failed` entry, nothing counted, nothing reported to the
+ *     unclassified-error episode and nothing armed. Never another launch, a
+ *     delete or a tmux-touching call;
  *   - CONFLICT (`conflictAt`): the persona latches with the case its
  *     description gives ("another agent-director store" and "conflicting
  *     labels" included) and `lastRead` ("no row" for a reuse of an id with
@@ -10203,7 +10330,7 @@ export async function reuseSpawnForPersona(
  *   - DIRECTORY (`ErrCwdNotFound`, `ErrCwdNotADirectory`): `failed`, counted
  *     (marked `countedClass`), the wrapper having raised `cwd-unreachable`;
  *   - any other value (a GONE name, a STATE name the reuse gives no meaning):
- *     SRJ-105's UNCLASSIFIED row, as for `ErrInvalidFlags` after its re-check.
+ *     SRJ-105's UNCLASSIFIED row.
  * Never throws.
  */
 async function reuseSpawnFailedAt(
@@ -10220,22 +10347,7 @@ async function reuseSpawnFailedAt(
     )
     return { key, action: REUSE_SPAWN_COLLIDED }
   }
-  if (isInvalidFlagsError(err)) {
-    const step = await classifyWithInvalidFlagsRecheck(err)
-    const recheck = `after one immediate agent-director version re-check: ${step.recheck.kind}`
-    // The stop posts nothing to Slack, and a launch it ends is not counted.
-    if (step.recheck.kind === RECHECK_OUTCOME_STOP) {
-      console.error(
-        `[slack] ${REUSE_SPAWN_SITE}: ${REUSE_SPAWN_WHAT} failed for ${ref}: ${describeAdErrorClassification(step.classification)} (${recheck}); no other launch`,
-      )
-      return { key, action: 'failed', stopping: true }
-    }
-    // b.jg5 SRJ-104, SRJ-105, SRJ-313: UNCLASSIFIED handling; never a
-    // fallback to any other launch (SRJ-112).
-    reportUnclassifiedAtSite(key, err, 'spawn', step.classification)
-    logRefusal(REUSE_SPAWN_SITE, REUSE_SPAWN_WHAT, ref, `${describeAdErrorClassification(step.classification)} (${recheck})`)
-    return { key, action: 'failed' }
-  }
+  if (isInvalidFlagsError(err)) return invalidFlagsAtReuse(key, err, ref)
   const latched =
     (await conflictAt(key, err, REFUSED_OPERATION_REUSE_SPAWN, lastRead, REUSE_SPAWN_WHAT, ref, REUSE_SPAWN_SITE)) ??
     (await unusableNameAt(key, err, lastRead, REUSE_SPAWN_SITE, REUSE_SPAWN_WHAT, ref))
@@ -10265,6 +10377,60 @@ async function reuseSpawnFailedAt(
   return { key, action: 'failed' }
 }
 
+/**
+ * The reuse spawn's `ErrInvalidFlags` row (b.jg5 SRJ-112, SRJ-207, SRJ-204):
+ * exactly one immediate version re-check through the `ErrInvalidFlags` step
+ * (`classifyWithInvalidFlagsRecheck`), then the hold decision on its answer
+ * (`decideInvalidFlagsHold`, with the re-check's last version seen,
+ * `lastAdVersionSeen`):
+ *   - stop: one line and `failed` marked `stopping`; nothing posted, nothing
+ *     counted and no hold, since the server stops (SRJ-205);
+ *   - hold (a pass, a could-not-run or a not-running answer): persona `key`
+ *     is held through the installed hold (`setInvalidFlagsHold`) under the
+ *     decision's version, whose set reaction in `main()` stops its retry
+ *     timer and posts SRJ-1008's alert once in its episode; one line
+ *     (`reuseInvalidFlagsHeldLine`), and `held`. With no hold installed the
+ *     answer is the same and the line says nothing is held.
+ * Either way no other launch of any kind, no delete and no tmux-touching
+ * call follows; nothing is reported to the unclassified-error episode and
+ * nothing is armed. Never throws.
+ */
+async function invalidFlagsAtReuse(key: string, err: InvalidFlagsError, ref: string): Promise<SpawnPersonaResult> {
+  const step = await classifyWithInvalidFlagsRecheck(err)
+  const decision = decideInvalidFlagsHold(step.recheck, lastAdVersionSeen())
+  if (decision.kind === INVALID_FLAGS_HOLD_DECISION_STOP) {
+    // The stop posts nothing to Slack, and a launch it ends is not counted.
+    console.error(
+      `[slack] ${REUSE_SPAWN_SITE}: ${REUSE_SPAWN_WHAT} failed for ${ref}: ${describeAdErrorClassification(step.classification)} (after one immediate agent-director version re-check: ${step.recheck.kind}); no other launch`,
+    )
+    return { key, action: 'failed', stopping: true }
+  }
+  let held: string
+  const hold = invalidFlagsHold
+  if (hold === undefined) {
+    held = 'no ErrInvalidFlags hold is installed, so nothing is held'
+  } else {
+    try {
+      hold.set(key, decision.version)
+      held = `the persona is held under agent-director version ${describeHoldVersion(decision.version)}`
+    } catch (thrown) {
+      held = `holding the persona failed: ${describeThrownValue(thrown)}`
+    }
+  }
+  console.error(reuseInvalidFlagsHeldLine(ref, describeAgentDirectorFailure(err), step.recheck.kind, held))
+  return { key, action: 'held' }
+}
+
+/**
+ * The reuse spawn's line for an `ErrInvalidFlags` whose immediate version
+ * re-check answered `recheck` (a pass, could not run or not running), with
+ * `held`, what holding the persona did (b.jg5 SRJ-112, SRJ-207).
+ * `described` is `describeAgentDirectorFailure` of the error.
+ */
+export function reuseInvalidFlagsHeldLine(ref: string, described: string, recheck: string, held: string): string {
+  return `[slack] ${REUSE_SPAWN_SITE}: ${REUSE_SPAWN_WHAT} of ${ref} answered ${described} (after one immediate agent-director version re-check: ${recheck}) — ${held}; answering held: no other launch, no delete, no spawn-failure notice, nothing counted (b.jg5 SRJ-112, SRJ-207)`
+}
+
 // ---------------------------------------------------------------------------
 // The live-row sequence registry (b.jg5 SRJ-706)
 // ---------------------------------------------------------------------------
@@ -10272,8 +10438,14 @@ async function reuseSpawnFailedAt(
 /** The start entry's answer when no registry is installed: nothing was started. */
 export const LIVE_ROW_START_NOT_INSTALLED = 'not-installed'
 
-/** What the session manager's start entry answers: the registry's answer, or that none is installed. */
-export type LiveRowSequenceStartEntryAnswer = LiveRowSequenceStartAnswer | typeof LIVE_ROW_START_NOT_INSTALLED
+/** The start entry's answer for a persona held on `ErrInvalidFlags` (b.jg5 SRJ-207): nothing was started. */
+export const LIVE_ROW_START_HELD = 'held'
+
+/** What the session manager's start entry answers: the registry's answer, that none is installed, or that the persona is held. */
+export type LiveRowSequenceStartEntryAnswer =
+  | LiveRowSequenceStartAnswer
+  | typeof LIVE_ROW_START_NOT_INSTALLED
+  | typeof LIVE_ROW_START_HELD
 
 /**
  * The installed live-row sequence registry (`createLiveRowSequenceRegistry`,
@@ -10299,6 +10471,9 @@ export function setLiveRowSequenceRegistry(registry: LiveRowSequenceRegistry | u
   liveRowSequenceRegistry = registry
   syncSequenceLatchObserver()
 }
+
+/** The site the start entry's held line names. */
+const LIVE_ROW_SEQUENCE_START_SITE = 'startLiveRowSequence'
 
 /** Test-only seam: remove the installed registry and its latch observer (the registry's sequences are not stopped). */
 export function _resetLiveRowSequenceRegistry(): void {
@@ -10335,11 +10510,16 @@ function stopSequenceOnLatch(event: ConflictLatchSetEvent): void {
  * step (`replacePersonaRow`, SRJ-707) and by later starters: forwards `request` to the
  * installed registry and answers its answer (`started`, `already-running`,
  * `closed`); the sequence runs in the background and this never waits for
- * it. A step-2 entry is the same call with the request's entry step 2. With
- * no registry installed: `not-installed`, one line, nothing started. Never
- * throws.
+ * it. A step-2 entry is the same call with the request's entry step 2. For a
+ * persona held on `ErrInvalidFlags` that is not latched (the held gate,
+ * b.jg5 SRJ-207): `held`, one line, nothing started and no agent-director
+ * call. With no registry installed: `not-installed`, one line, nothing
+ * started. Never throws.
  */
 export function startLiveRowSequence(request: LiveRowSequenceRequest): LiveRowSequenceStartEntryAnswer {
+  if (heldResult(request.key, request.ref ?? `persona=${request.key}`, LIVE_ROW_SEQUENCE_START_SITE) !== undefined) {
+    return LIVE_ROW_START_HELD
+  }
   const registry = liveRowSequenceRegistry
   if (registry === undefined) {
     console.error(
@@ -10435,9 +10615,11 @@ export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSeque
  *   - it is exempt from the `sequence-waiting` gate on the persona's launch
  *     paths (`spawnForPersona`): it is the sequence's own launch, made from
  *     inside it, and never passes through that gate;
- *   - the latched gate, the pre-launch `claude_config_dir` check and dry run
- *     come first, as in `spawnForPersona`; then the launch runs as a launch
- *     attempt for the persona (SRJ-301), the trust patch once before it;
+ *   - the latched gate, the held gate (b.jg5 SRJ-207: a persona held on
+ *     `ErrInvalidFlags` answers `held` with no call), the pre-launch
+ *     `claude_config_dir` check and dry run come first, as in
+ *     `spawnForPersona`; then the launch runs as a launch attempt for the
+ *     persona (SRJ-301), the trust patch once before it;
  *   - `resume`: SRJ-113's table through the one `resume` outcome handler
  *     the collision ladder's `resume` uses too (`resumeAtSite`), so every
  *     row matches `resumeOrFreshSpawn`'s but the not-resumable one: one
@@ -10470,7 +10652,8 @@ export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSeque
  *     UNCLASSIFIED) with no further call: no delete, no kill and no further
  *     launch;
  *   - `reuse`: the reuse spawn (`reuseSpawnForPersona`) with
- *     `request.lastRead`, its outcomes SRJ-112's. Its collision answers not
+ *     `request.lastRead`, its outcomes SRJ-112's (its `ErrInvalidFlags` holds
+ *     the persona and answers `held`, SRJ-207). Its collision answers not
  *     launched (`reuse-collision`): no further launch, nothing counted, no
  *     notice; the sequence ends without its launch and arms the persona's
  *     retry timer with the reuse-collision cause (SRJ-112, SRJ-705, SRJ-706);
@@ -10485,7 +10668,7 @@ export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSeque
  * whose class is LAUNCH FAILURE (`ErrTmuxSessionCreate`) or DIRECTORY
  * (`ErrCwdNotFound`, `ErrCwdNotADirectory`), marked `countedClass` where
  * that class is handled, is one counted launch failure; any other `failed`
- * result and a refused, stopping, latched, deferred or not-launched answer
+ * result and a refused, stopping, latched, held, deferred or not-launched answer
  * record nothing.
  * The launch is never part of the start pass, whichever path started the
  * sequence (a start-pass collision ladder's replacement site or
@@ -10573,6 +10756,9 @@ function sequenceLaunchCounted(result: SpawnPersonaResult): boolean {
   return isUnrefusedFailure(result) && result.countedClass === true
 }
 
+/** The site the sequence-launch entry's held line names. */
+const LIVE_ROW_SEQUENCE_LAUNCH_SITE = 'launchForLiveRowSequence'
+
 /** The sequence launch's gates, then its call as a launch attempt for the persona, then its count. Never throws. */
 async function sequenceLaunchAttempt(
   persona: Persona,
@@ -10589,6 +10775,9 @@ async function sequenceLaunchAttempt(
     )
     return { key, action: 'latched' }
   }
+  // b.jg5 SRJ-207: a persona held on ErrInvalidFlags gets no launch.
+  const held = heldResult(key, ref, LIVE_ROW_SEQUENCE_LAUNCH_SITE)
+  if (held !== undefined) return held
   const configDir = checkLaunchConfigDir(persona)
   if (!configDir.ok) {
     deferLaunchForConfigDir(persona, configDir)
@@ -10619,7 +10808,7 @@ async function sequenceLaunchAttempt(
  * `failed` result that is neither refused nor stopping and is marked
  * `countedClass` (LAUNCH FAILURE or DIRECTORY) records one counted launch
  * failure (the cap notice at the cap); any other `failed` result and a
- * latched or deferred result record nothing. The step-6 launch is not routed
+ * latched, held or deferred result record nothing. The step-6 launch is not routed
  * through `launchSession`, so nothing else counts it. Never throws.
  */
 function countSequenceLaunch(key: string, ref: string, result: SpawnPersonaResult): void {
@@ -11705,6 +11894,11 @@ export async function startupSessionManager(
         // b.jg5 SRJ-706, SRJ-1015: held for the persona's live-row sequence;
         // neither failed nor succeeded. The summary line has no count for it.
         break
+      case 'held':
+        // b.jg5 SRJ-207, SRJ-1015: held on ErrInvalidFlags; not a failure and
+        // not a launch, so neither failed nor succeeded. The summary line
+        // does not count it here.
+        break
       case 'spawned':
       default:
         freshSpawned++
@@ -11914,7 +12108,10 @@ function createLaunchPool(size: number): <T>(task: () => Promise<T>) => Promise<
  * `'skipped'` for `deferred` (bug b.g57: its claude_config_dir cannot be
  * resolved; nothing was launched and its row is kept), for `latched` (b.jg5
  * SRJ-502, SRJ-1015: the persona is latched, or latched at this launch;
- * nothing more was launched, and the latch stops its retry timer) and for a `failed`
+ * nothing more was launched, and the latch stops its retry timer), for
+ * `held` (b.jg5 SRJ-207, SRJ-1015: the persona is held on `ErrInvalidFlags`,
+ * or held at this launch; nothing more was launched, and the hold stops its
+ * retry timer) and for a `failed`
  * marked `stopping` (the version re-check of a resume or of the launch wait's
  * evidence read decided the stop), which
  * count toward no failure or cap, and `'refused'` for a `failed` carrying the
@@ -11937,8 +12134,11 @@ export async function launchSession(
   const persona = config.personas.find((p) => p.key === key)
   if (!persona) return false
   const result = await spawnForPersona(persona, config, false, undefined, options?.deadEvidence)
-  // b.jg5 SRJ-1015: a latched persona records nothing; the latch stops its retry timer.
-  if (result.action === 'deferred' || result.action === 'latched' || result.stopping) return 'skipped'
+  // b.jg5 SRJ-1015: a latched or held persona records nothing; the latch or
+  // the hold stops its retry timer (SRJ-305, SRJ-207).
+  if (result.action === 'deferred' || result.action === 'latched' || result.action === 'held' || result.stopping) {
+    return 'skipped'
+  }
   // b.jg5 SRJ-706, SRJ-1015: a launch held for P's live-row sequence records
   // nothing and is a refusal at a retry, which re-arms the timer (SRJ-302).
   if (result.action === 'sequence-waiting') return 'refused'

@@ -59,12 +59,17 @@
  * agent-director's timing settings from this hook).
  * {@link triggerAdVersionRecheck} re-checks at once and answers with the
  * outcome (b.jg5 SRJ-204). Its caller is the `ErrInvalidFlags` step in
- * `src/ad-error-class.ts` (SRJ-104), which the resume path of
- * `resumeOrFreshSpawn` (`src/session-manager.ts`) and the click handler's
- * `decide` (`src/permission-click-handler.ts`) run on an `ErrInvalidFlags`.
+ * `src/ad-error-class.ts` (SRJ-104), which the reuse spawn
+ * (`reuseSpawnForPersona`, `src/session-manager.ts`; its answer decides the
+ * `ErrInvalidFlags` hold, SRJ-207), the resume path of `resumeOrFreshSpawn`
+ * (`src/session-manager.ts`) and the click handler's `decide`
+ * (`src/permission-click-handler.ts`) run on an `ErrInvalidFlags`.
  * {@link onAdVersionChanged} listeners hear of each passing re-check whose
- * version differs from the last version seen (no consumer yet: E23 will end
- * `ErrInvalidFlags` holds on it, SRJ-207).
+ * version differs from the last version seen; the `ErrInvalidFlags` hold
+ * (`src/invalid-flags-hold.ts`, SRJ-207) is its consumer: `main()` ends every
+ * hold whose version differs on it. {@link lastAdVersionSeen} answers the
+ * installed re-check's last version seen, under which a hold begins when the
+ * immediate re-check could not run.
  * `main()` (`src/server.ts`) installs it through {@link installAdVersionRecheck}
  * right after the startup gate passes, and `shutdown()` disposes it through
  * {@link disposeAdVersionRecheck}.
@@ -885,6 +890,8 @@ export interface AdVersionRecheck {
   dispose(): void
   /** The version of the last passing re-check, else the baseline. */
   lastVersionSeen(): string
+  /** True from `start` until `dispose` or a stop ends the chain. */
+  isRunning(): boolean
   /**
    * Re-check at once (b.jg5 SRJ-204) and answer with the outcome acted on.
    * Joins a call in flight (timed or triggered) instead of making a second
@@ -1160,6 +1167,9 @@ export function createAdVersionRecheck(deps: AdVersionRecheckDeps): AdVersionRec
     lastVersionSeen() {
       return lastVersionSeen
     },
+    isRunning() {
+      return started && !ended
+    },
     trigger() {
       if (!started || ended) return Promise.resolve(NOT_RUNNING_ANSWER)
       return runCheck()
@@ -1248,8 +1258,9 @@ export function onAdVersionRecheckTick(listener: AdVersionRecheckTickListener): 
  * Re-check the host binary at once on the installed re-check (b.jg5 SRJ-204)
  * and answer with the outcome it acted on. Called by the `ErrInvalidFlags`
  * step in `src/ad-error-class.ts` (SRJ-104) for an `ErrInvalidFlags` from the
- * resume path of `resumeOrFreshSpawn` (`src/session-manager.ts`) and from the
- * click handler's `decide` (`src/permission-click-handler.ts`). The answer:
+ * reuse spawn (`reuseSpawnForPersona`, `src/session-manager.ts`, whose hold
+ * it decides, SRJ-207), from the resume path of `resumeOrFreshSpawn` and from
+ * the click handler's `decide` (`src/permission-click-handler.ts`). The answer:
  * passed (with the version), stopped, could not run, or
  * {@link RECHECK_OUTCOME_NOT_RUNNING} when none is installed, it was disposed
  * or it already stopped. Joins a check in flight; leaves the 120 s timer's
@@ -1263,8 +1274,10 @@ export function triggerAdVersionRecheck(): Promise<AdVersionRecheckTriggerAnswer
 /**
  * Register a listener run when a passing re-check (timed or triggered) finds
  * a version that differs from the last version seen, with the previous and
- * the new version (b.jg5 SRJ-204's first row; no consumer yet: E23 will end
- * `ErrInvalidFlags` holds on it, SRJ-207).
+ * the new version (b.jg5 SRJ-204's first row). Its consumer is the
+ * `ErrInvalidFlags` hold (`src/invalid-flags-hold.ts`, SRJ-207): `main()`
+ * registers one listener that ends every hold whose version differs from the
+ * new one and retries each ended persona at once.
  * Listeners run in registration order. Independent of install order. Returns
  * its unsubscribe.
  */
@@ -1274,6 +1287,19 @@ export function onAdVersionChanged(listener: AdVersionChangedListener): () => vo
   return () => {
     versionChangedListenerEntries.delete(entry)
   }
+}
+
+/**
+ * The installed re-check's last version seen (b.jg5 SRJ-204, SRJ-207): the
+ * version of its last passing re-check, else its baseline (the version the
+ * startup gate read). `undefined` when none is installed, it was disposed or
+ * a stop ended it. The reuse spawn's `ErrInvalidFlags` hold begins under it
+ * when the immediate re-check could not run or was not running. Never throws.
+ */
+export function lastAdVersionSeen(): string | undefined {
+  const recheck = installedRecheck
+  if (recheck === undefined || recheckDisposed || !recheck.isRunning()) return undefined
+  return recheck.lastVersionSeen()
 }
 
 /**

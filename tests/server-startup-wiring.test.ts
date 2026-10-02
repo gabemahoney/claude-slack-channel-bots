@@ -239,14 +239,33 @@
  *   `isDialogApproverRunning` for the key at call time, and is neither
  *   in-flight binding; its kill-failed query reads the one kill-failure
  *   alerts' `isOpen` through a module-scope holder assigned that instance
- *   once in main() before the start bring-up; the held-on-invalid-flags and
- *   sequence/wait inputs are unbound. Its read gate's in-flight member (`isWorkInFlight`)
+ *   once in main() before the start bring-up; its held-on-invalid-flags
+ *   query (state 3, cannot launch) reads the one `ErrInvalidFlags` hold's
+ *   `isHeld` through a module-scope holder assigned that hold once in main()
+ *   before the start bring-up, which shutdown's forget-all also reads; its
+ *   sequence/wait query asks the session manager's `isLiveRowSequenceRunning`
+ *   for the key at call time. Its read gate's in-flight member (`isWorkInFlight`)
  *   is "in flight for P", and its one row read
  *   (`readRowLiveness`) is the one liveness adapter main() builds
  *   (`_buildIsSessionAliveAdapter`, built once, the restart module's and the
  *   health tick's `isSessionAlive`), read at call time through a module-scope
  *   holder assigned it once in main() before the start bring-up, answering
  *   `unknown` (never `pending`) before then (b.jg5 SRJ-1011, SRJ-115).
+ * - b.jg5 SRJ-207 / SRJ-1008 / SRJ-305 / SRJ-303 / SRJ-315 / SRJ-204: the one
+ *   `ErrInvalidFlags` hold (`createInvalidFlagsHold`) is built once, in
+ *   main()'s own statement list, over the server log, and installed in the
+ *   session manager once (`setInvalidFlagsHold`) before the retry
+ *   controller, the restart module, the start pass and the health check,
+ *   with no await before the retry controller is built; its set reaction is
+ *   bound once (`bindInvalidFlagsHoldSetReaction`) to the retry controller's
+ *   stop entry with `UNAVAILABLE_RETRY_STOP_HELD` and to the one notice
+ *   episodes instance; exactly one version-changed listener
+ *   (`onAdVersionChanged`) runs the version-change reaction over the hold,
+ *   the episodes, the applied-persona lookup and a retry at once through
+ *   `runRestartRetry` with "blocks a retry"; its `isHeld` is bound, as a
+ *   call-time read, into the full-mode retry action, `initRestart` and
+ *   `initHealthCheck`; shutdown forgets every hold through the routing's
+ *   holder; server.ts never sets a hold and the hold module reads no file.
  * - b.jg5 SRJ-311: the one session-disconnect handler is built once, at
  *   module scope, by `_buildRestartDisconnectedPersona` over the
  *   `tmux-unavailable` retry check's one set of production deps (spread
@@ -304,6 +323,14 @@ import type * as AdStartupModule from '../src/agent-director-startup.ts'
 import type * as ServerModule from '../src/server.ts'
 import type { RestartDisconnectedPersonaDeps, TmuxUnavailableRetryDeps } from '../src/server.ts'
 import type { RestartDeps } from '../src/restart.ts'
+import type * as RestartModule from '../src/restart.ts'
+import type * as InvalidFlagsHoldModule from '../src/invalid-flags-hold.ts'
+import type {
+  InvalidFlagsHold,
+  InvalidFlagsHoldDeps,
+  InvalidFlagsHoldSetReactionDeps,
+  InvalidFlagsHoldVersionChangeDeps,
+} from '../src/invalid-flags-hold.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
 import type * as ConflictLatchModule from '../src/conflict-latch.ts'
 import type { ConflictLatch, ConflictLatchDeps, ConflictLatchHolds } from '../src/conflict-latch.ts'
@@ -532,8 +559,10 @@ const SEQUENCE_RUNNING: keyof typeof SessionManagerModule = 'isLiveRowSequenceRu
  *   it), never a running dialog approver (SRJ-303: a running approver does
  *   not skip a retry). No other function or
  *   const/let/var arrow in server.ts wraps `isLaunchInFlight` alone (no second
- *   narrow predicate). It is named exactly three times: its declaration, the
- *   retry action's `isInFlight` and the body of "in flight for P".
+ *   narrow predicate). It is named exactly four times: its declaration, the
+ *   retry action's `isInFlight`, the body of "in flight for P" and the
+ *   `ErrInvalidFlags` hold's version-changed listener, whose retry at once
+ *   runs the restart module's retry entry with it (b.jg5 SRJ-207, SRJ-303).
  * - "in flight for P" (`workInFlight`), as the health tick's
  *   `isLaunchInFlight` binds it: its whole body is
  *   `return <blocks a retry>(<key>) || isDialogApproverRunning(<key>)`, built
@@ -581,12 +610,14 @@ function inFlightBindings(): { retryBlocked: string; workInFlight: string } {
   const key = broad.params[0]!
   expect(broad.body.replace(/\s+/g, ' ').trim()).toBe(`return ${retryBlocked}(${key}) || ${APPROVER_RUNNING}(${key})`)
 
-  // The narrow one: its declaration, the retry action and the broad one's body.
+  // The narrow one: its declaration, the retry action, the broad one's body
+  // and the hold's version-changed listener (b.jg5 SRJ-207).
   const narrowNamed = indicesOf(new RegExp(`\\b${retryBlocked}\\b`, 'g'), SERVER_CODE)
-  expect(narrowNamed).toHaveLength(3)
+  expect(narrowNamed).toHaveLength(4)
   expect(narrowNamed[0]).toBe(SERVER_CODE.indexOf(retryBlocked!, narrow.at))
   expect(withinCall(narrowNamed, onlyCallOf('createFullModeRetryAction'))).toBe(1)
   expect(narrowNamed.filter((offset) => offset > broad.start && offset < broad.end)).toHaveLength(1)
+  expect(withinCall(narrowNamed, onlyCallOf('onAdVersionChanged'))).toBe(1)
 
   // The broad one: its declaration, the health tick, the retry check's deps
   // and the persona routing's read gate, once each, and nowhere else.
@@ -639,14 +670,17 @@ const ROUTING_TMUX_UNRESPONSIVE: keyof PersonaRoutingDeps = 'isTmuxUnresponsive'
  * check's production deps (see retryCheckDeps), each the same call-time
  * query for its own parameter, `(key) => <holder>?.<query>(key) === true`
  * (the latch's: the check's `isLatched`, which the session-disconnect handler
- * and the routing's arm ask, b.jg5 SRJ-311, SRJ-502). Returns the holder's
- * name and the [start, end) of its assignment.
+ * and the routing's arm ask, b.jg5 SRJ-311, SRJ-502), and once inside each
+ * range of `alsoIn` ([start, end) offsets; the `ErrInvalidFlags` hold's:
+ * shutdown's body, whose forget-all reads it, b.jg5 SRJ-207). Returns the
+ * holder's name and the [start, end) of its assignment.
  */
 function routingHolder(
   member: keyof PersonaRoutingDeps,
   query: string,
   instance: string,
   checkReaders: Array<keyof TmuxUnavailableRetryDeps> = [],
+  alsoIn: Array<readonly [number, number]> = [],
 ): { holder: string; at: number; end: number } {
   const binding = onlyCallProps('createPersonaRouting').get(member)
   expect(binding).toBeDefined()
@@ -676,7 +710,8 @@ function routingHolder(
     }
     expect(named.filter((offset) => offset > check.start && offset < check.end)).toHaveLength(checkReaders.length)
   }
-  expect(named).toHaveLength(3 + checkReaders.length)
+  for (const [start, end] of alsoIn) expect(named.filter((offset) => offset > start && offset < end)).toHaveLength(1)
+  expect(named).toHaveLength(3 + checkReaders.length + alsoIn.length)
   return { holder, at, end: at + assigned[0]![0].length }
 }
 
@@ -2302,10 +2337,12 @@ describe('main() builds the one set of per-persona notice episodes before the st
     const at = closes[0]!
     expect(at > start && at < end).toBe(true)
     // No other close anywhere in server.ts, through the handle or the instance,
-    // and no forget-all (which would leave a later begin open).
+    // and no forget-all of the episodes (which would leave a later begin
+    // open). The ErrInvalidFlags hold's own forget-all at shutdown is pinned
+    // in the hold's describe.
     const episodes = constOf(FACTORY)
     expect(indicesOf(new RegExp(`\\b(?:${handle}|${episodes})\\s*[?!]?\\.\\s*${CLOSE}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([at])
-    expect(indicesOf(new RegExp(`\\.\\s*${FORGET_ALL}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
+    expect(indicesOf(new RegExp(`\\b(?:${handle}|${episodes})\\s*[?!]?\\.\\s*${FORGET_ALL}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
 
     // Before shutdown first yields, so a stalled await never keeps an episode open.
     const firstAwait = SERVER_CODE.slice(start, end).search(/\bawait\b/)
@@ -3338,6 +3375,229 @@ describe('main() builds the one slow-recovery tracker over the notice episodes b
 })
 
 // ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-207 / SRJ-1008 / SRJ-305 / SRJ-303 / SRJ-315 /
+// SRJ-204 — the ErrInvalidFlags hold's production bindings
+//
+// The session manager's hold install, the held queries of the retry action,
+// the restart work and the health tick, and the routing's cannot-launch
+// member are all optional: absent, no persona is held (a reuse spawn's
+// ErrInvalidFlags still answers `held`, but nothing holds the persona back,
+// so the next tick, retry or restart calls agent-director again), and a
+// hold's set reaction and version-change reaction take any body. A
+// production wiring that dropped one, bound it twice, to a second hold, to
+// the condition-end entry (whose SRJ-306 exceptions must not apply to a
+// hold), registered no version-changed listener (a hold that never ends) or
+// two (two retries), installed the hold after the start pass, or seeded it
+// from anywhere (a hold that survives a restart) would type-check and pass
+// every behaviour suite. What each does is tested in
+// tests/ad-version-gate.test.ts, tests/session-manager.test.ts,
+// tests/restart.test.ts, tests/unavailable-retry.test.ts,
+// tests/health-check.test.ts and tests/inbound-recovery-drop-branch.test.ts;
+// pinned here: the bindings. The routing's member is pinned in the routing's
+// describe below; the teardown's forget in tests/reload-wiring.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('main() builds the one ErrInvalidFlags hold before the start pass, installs it in the session manager, binds its set reaction to the retry controller\'s stop entry and the notice episodes, ends it on the one version-changed listener, binds its held query into the retry action, the restart work and the health tick, and shutdown forgets every hold (b.jg5 SRJ-207, SRJ-1008, SRJ-305, SRJ-303, SRJ-315, SRJ-204)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const FACTORY: keyof typeof InvalidFlagsHoldModule = 'createInvalidFlagsHold'
+  const BIND_SET: keyof typeof InvalidFlagsHoldModule = 'bindInvalidFlagsHoldSetReaction'
+  const REACTION_FACTORY: keyof typeof InvalidFlagsHoldModule = 'createInvalidFlagsHoldSetReaction'
+  const VERSION_CHANGE: keyof typeof InvalidFlagsHoldModule = 'endInvalidFlagsHoldsOnVersionChange'
+  const LOG: keyof InvalidFlagsHoldDeps = 'log'
+  const SET_STOP: keyof InvalidFlagsHoldSetReactionDeps = 'stopRetryTimer'
+  const SET_EPISODES: keyof InvalidFlagsHoldSetReactionDeps = 'episodes'
+  const SET_LOG: keyof InvalidFlagsHoldSetReactionDeps = 'log'
+  const VC_EPISODES: keyof InvalidFlagsHoldVersionChangeDeps = 'episodes'
+  const VC_APPLIED: keyof InvalidFlagsHoldVersionChangeDeps = 'isApplied'
+  const VC_RETRY: keyof InvalidFlagsHoldVersionChangeDeps = 'retryAtOnce'
+  const VC_LOG: keyof InvalidFlagsHoldVersionChangeDeps = 'log'
+  const IS_HELD: keyof InvalidFlagsHold = 'isHeld'
+  const SET: keyof InvalidFlagsHold = 'set'
+  const VERSION_CHANGED: keyof InvalidFlagsHold = 'versionChanged'
+  const FORGET_ALL: keyof InvalidFlagsHold = 'forgetAll'
+  const ADD_SET_OBSERVER: keyof InvalidFlagsHold = 'addSetObserver'
+  const ADD_END_OBSERVER: keyof InvalidFlagsHold = 'addEndObserver'
+  const RETRY_HELD: keyof FullModeRetryDeps = 'isHeld'
+  const RESTART_HELD: keyof RestartDeps = 'isHeld'
+  const TICK_HELD: keyof HealthCheckDeps = 'isHeld'
+  const ROUTING_HELD: keyof PersonaRoutingDeps = 'isHeldOnInvalidFlags'
+  const STOP: keyof UnavailableRetryController = 'stop'
+  const STOP_HELD: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_STOP_HELD'
+  const INSTALL: keyof typeof SessionManagerModule = 'setInvalidFlagsHold'
+  const RESET: keyof typeof SessionManagerModule = '_resetInvalidFlagsHold'
+  const ON_CHANGED: keyof typeof AdVersionGateModule = 'onAdVersionChanged'
+  const RETRY_ENTRY: keyof typeof RestartModule = 'runRestartRetry'
+  const HOLD_PATH = join(SRC_DIR, 'invalid-flags-hold.ts')
+
+  /** `name` is imported from `module` and declared nowhere in server.ts. */
+  function importedOnly(name: string, module: string): void {
+    expect(importSource(SERVER_CODE, name)).toBe(module)
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)).toEqual([])
+  }
+
+  /** The routing member's module-scope holder (its form and assignment are pinned in the routing's describe). */
+  function holderName(): string {
+    return onlyCallProps('createPersonaRouting').get(ROUTING_HELD)!.match(new RegExp(`=> (\\w+)\\?\\.${IS_HELD}\\(`))![1]!
+  }
+
+  test('the hold is built exactly once, in main()\'s own statement list, its only dependency the server log, and installed in the session manager exactly once (nothing uninstalls it), after its build and its set reaction\'s binding and before the retry controller, initRestart, the start bring-up and initHealthCheck', () => {
+    const at = onlyCallOf(FACTORY)
+    const hold = constOf(FACTORY)
+    declaredOnce(hold)
+    const decl = SERVER_CODE.search(new RegExp(`\\bconst\\s+${hold}\\s*=\\s*${FACTORY}\\s*\\(`))
+    expect(decl).toBeGreaterThan(-1)
+    expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
+    importedOnly(FACTORY, './invalid-flags-hold.ts')
+    const props = onlyCallProps(FACTORY)
+    expect([...props.keys()]).toEqual([LOG])
+    expect(props.get(LOG)).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+
+    const install = onlyCallOf(INSTALL)
+    expect(atMainTopLevel(SERVER_CODE, install)).toBe(true)
+    importedOnly(INSTALL, './session-manager.ts')
+    expect(onlyCallArgs(INSTALL)).toEqual([hold])
+    expect(install).toBeGreaterThan(at)
+    expect(install).toBeGreaterThan(onlyCallOf(BIND_SET))
+    for (const later of latchStartPass()) expect(install).toBeLessThan(later)
+    expect(callsOf(RESET)).toEqual([])
+  })
+
+  test('its set reaction is bound exactly once, in main()\'s own statement list after the build and before the start pass, to the one hold: it stops the persona\'s timer on the one retry controller through its stop entry with the hold\'s own reason, never through the condition-end entry, and posts through the one notice episodes instance, with the server log; server.ts builds no reaction by hand and adds no hold observer (b.jg5 SRJ-305, SRJ-1008, SRJ-1016)', () => {
+    const at = onlyCallOf(BIND_SET)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    importedOnly(BIND_SET, './invalid-flags-hold.ts')
+    const args = onlyCallArgs(BIND_SET)
+    expect(args).toHaveLength(2)
+    expect(args[0]).toBe(constOf(FACTORY))
+    expect(at).toBeGreaterThan(onlyCallOf(FACTORY))
+    for (const later of latchStartPass()) expect(at).toBeLessThan(later)
+
+    const props = objectProperties(args[1]!)
+    expect([...props.keys()].sort()).toEqual([SET_STOP, SET_EPISODES, SET_LOG].sort())
+    const controller = constOf('createUnavailableRetryController')
+    declaredOnce(controller)
+    expect(props.get(SET_STOP)).toMatch(oneKeyArrow(`${controller}\\.${STOP}\\(\\1, ${STOP_HELD}\\)`))
+    expect(props.get(SET_STOP)).not.toContain('conditionEnded')
+    expect(props.get(SET_EPISODES)).toBe(constOf('createPersonaEpisodes'))
+    expect(props.get(SET_LOG)).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+    importedOnly(STOP_HELD, './unavailable-retry.ts')
+    // The hold's reason is named only by its import and this binding.
+    expect(indicesOf(new RegExp(`\\b${STOP_HELD}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+
+    expect(callsOf(REACTION_FACTORY)).toEqual([])
+    for (const add of [ADD_SET_OBSERVER, ADD_END_OBSERVER]) {
+      expect([add, indicesOf(new RegExp(`\\b${constOf(FACTORY)}\\s*[?!]?\\.\\s*${add}\\b`, 'g'), SERVER_CODE)]).toEqual([add, []])
+    }
+  })
+
+  // The reaction names the retry controller, built after the hold is
+  // installed: a set before it exists would throw (and be logged) and leave
+  // the timer running. Only a launch can hold, and none starts before main()
+  // first yields.
+  test('no statement awaits between the hold\'s install and the retry controller\'s build', () => {
+    const install = onlyCallOf(INSTALL)
+    const built = onlyCallOf('createUnavailableRetryController')
+    expect(built).toBeGreaterThan(install)
+    expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(install, built))).toEqual([])
+  })
+
+  test('exactly one version-changed listener is registered (onAdVersionChanged), in main()\'s own statement list after the hold is built and before the start bring-up: it ends the one hold\'s holds on the new version through the version-change reaction, ending each episode on the one notice episodes instance, asking the live applied-persona lookup, and retrying each ended persona at once through the restart module\'s retry entry with "blocks a retry" (b.jg5 SRJ-204, SRJ-207)', () => {
+    const hold = constOf(FACTORY)
+    const at = onlyCallOf(ON_CHANGED)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    importedOnly(ON_CHANGED, './ad-version-gate.ts')
+    expect(at).toBeGreaterThan(onlyCallOf(FACTORY))
+    expect(at).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+
+    // One listener, whose whole body is the version-change reaction over the
+    // one hold and the listener's new version (its second parameter).
+    const listener = onlyCallArgs(ON_CHANGED)
+    expect(listener).toHaveLength(1)
+    const form = listener[0]!.match(new RegExp(`^\\((\\w+), (\\w+)\\) => \\{ ${VERSION_CHANGE}\\(([\\s\\S]*)\\);? \\}$`))
+    expect(form).not.toBeNull()
+    expect(withinCall([onlyCallOf(VERSION_CHANGE)], at)).toBe(1)
+    importedOnly(VERSION_CHANGE, './invalid-flags-hold.ts')
+    const args = onlyCallArgs(VERSION_CHANGE)
+    expect(args).toHaveLength(3)
+    expect([args[0], args[1]]).toEqual([hold, form![2]])
+
+    const props = objectProperties(args[2]!)
+    expect([...props.keys()].sort()).toEqual([VC_EPISODES, VC_APPLIED, VC_RETRY, VC_LOG].sort())
+    expect(props.get(VC_EPISODES)).toBe(constOf('createPersonaEpisodes'))
+    expect(props.get(VC_APPLIED)).toMatch(/^\(?(\w+)\)? => getAppliedPersona\(\1\) !== undefined$/)
+    expect(props.get(VC_LOG)).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+    // Retried at once: the restart module's retry entry (no delay gate) for
+    // the key, in the applied persona's working directory, with "blocks a
+    // retry", only while the persona is applied.
+    const { retryBlocked } = inFlightBindings()
+    const retry = props.get(VC_RETRY)!
+    expect(retry).toMatch(
+      new RegExp(
+        `^\\(?(\\w+)\\)? => \\{ const (\\w+) = getAppliedPersona\\(\\1\\);? if \\(\\2 === undefined\\) return undefined;? ` +
+          `return ${RETRY_ENTRY}\\(\\1, \\2\\.working_directory, ${retryBlocked}\\)`,
+      ),
+    )
+    expect(indicesOf(new RegExp(`\\b${RETRY_ENTRY}\\s*\\(`, 'g'), retry)).toHaveLength(1)
+    importedOnly(RETRY_ENTRY, './restart.ts')
+
+    // The reaction is the hold's only end on a version change: nothing else
+    // calls it, and server.ts asks no hold's versionChanged itself.
+    expect(indicesOf(new RegExp(`\\.\\s*${VERSION_CHANGED}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  test('the held query is bound exactly once into each of the full-mode retry action, the restart work and the health tick, as a call-time read of the one hold\'s isHeld for the key it is given; with the routing\'s member (through its holder) these are server.ts\'s only held members and queries (b.jg5 SRJ-303, SRJ-315)', () => {
+    const hold = constOf(FACTORY)
+    const query = oneKeyArrow(`${hold}\\.${IS_HELD}\\(\\1\\)`)
+    expect(onlyCallProps('createFullModeRetryAction').get(RETRY_HELD)).toMatch(query)
+    expect(onlyCallProps('initRestart').get(RESTART_HELD)).toMatch(query)
+    expect(onlyCallProps('initHealthCheck').get(TICK_HELD)).toMatch(query)
+
+    const members = indicesOf(new RegExp(`\\b${IS_HELD}\\s*:`, 'g'), SERVER_CODE)
+    expect(members).toHaveLength(3)
+    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => withinCall(members, onlyCallOf(call)))).toEqual([1, 1, 1])
+    const queries = indicesOf(new RegExp(`\\.\\s*${IS_HELD}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(queries).toHaveLength(4)
+    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => withinCall(queries, onlyCallOf(call)))).toEqual([1, 1, 1, 1])
+    expect(indicesOf(new RegExp(`\\b${ROUTING_HELD}\\s*:`, 'g'), SERVER_CODE)).toHaveLength(1)
+  })
+
+  test('shutdown forgets every hold exactly once, through the routing\'s holder of the one hold; nothing else in server.ts forgets them all', () => {
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const holder = holderName()
+    const forgets = indicesOf(new RegExp(`\\b${holder}\\s*\\?\\.\\s*${FORGET_ALL}\\s*\\(\\s*\\)`, 'g'), SERVER_CODE)
+    expect(forgets).toHaveLength(1)
+    expect(forgets[0]! > start && forgets[0]! < end).toBe(true)
+    expect(indicesOf(new RegExp(`\\b(?:${holder}|${constOf(FACTORY)})\\s*[?!]?\\.\\s*${FORGET_ALL}\\b`, 'g'), SERVER_CODE)).toEqual(forgets)
+  })
+
+  test('nothing loads a hold: server.ts never sets one, the instance is named only at its build, its set reaction\'s binding, its install, the routing holder\'s assignment, the version-change reaction, its three held queries and the teardown\'s forget, and the hold module imports no file-system module (a server restart holds nothing)', () => {
+    const hold = constOf(FACTORY)
+    expect(indicesOf(new RegExp(`\\b${hold}\\s*[?!]?\\.\\s*${SET}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
+    expect(indicesOf(new RegExp(`\\b${holderName()}\\s*[?!]?\\.\\s*${SET}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
+
+    const named = indicesOf(new RegExp(`\\b${hold}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(9)
+    const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${hold}\\b`))!
+    expect(named[0]).toBe(decl.index! + decl[0].length - hold.length)
+    const within = (call: string) => {
+      const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf(call), '(', ')')
+      return named.filter((offset) => offset >= open && offset < close).length
+    }
+    expect([BIND_SET, INSTALL, VERSION_CHANGE, 'createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaLifecycle'].map(within)).toEqual([1, 1, 1, 1, 1, 1, 1])
+    expect(onlyCallProps('createPersonaLifecycle').get('forgetInvalidFlagsHold')).toContain(`${hold}.`)
+    // The ninth: the routing holder's one assignment, the bare hold.
+    const assigned = assignmentsTo(holderName())
+    expect(assigned.map((a) => a.value)).toEqual([hold])
+    expect(named.filter((offset) => offset >= assigned[0]!.at && offset < assigned[0]!.at + holderName().length + hold.length + 4)).toHaveLength(1)
+
+    const holdCode = stripComments(readFileSync(HOLD_PATH, 'utf-8'))
+    expect(indicesOf(/\bfrom\s*['"](?:node:)?fs(?:\/promises)?['"]/g, holdCode)).toEqual([])
+    expect(indicesOf(/\brequire\s*\(/g, holdCode)).toEqual([])
+    expect(indicesOf(/\bBun\s*\.\s*file\s*\(/g, holdCode)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Static audit: b.jg5 SRJ-1011 — the persona routing's lost-message state
 // inputs
 //
@@ -3365,8 +3625,9 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   const IS_OPEN: keyof KillFailureAlerts = 'isOpen'
   /** The sequence/wait input (b.jg5 SRJ-706, SRJ-1011): a running live-row sequence (or an old-life wait step) reports `restarting`. */
   const SEQUENCE_WAIT: keyof PersonaRoutingDeps = 'isSequenceOrWaitRunning'
-  /** The input a later Epic binds: E23. */
-  const UNBOUND: Array<keyof PersonaRoutingDeps> = ['isHeldOnInvalidFlags']
+  /** The cannot-launch input (b.jg5 SRJ-207, SRJ-1011 state 3): P is held on ErrInvalidFlags. */
+  const HELD_ON_INVALID_FLAGS: keyof PersonaRoutingDeps = 'isHeldOnInvalidFlags'
+  const IS_HELD: keyof InvalidFlagsHold = 'isHeld'
 
   test('the latched query reads the one latch at call time, through a module-scope holder assigned that latch once in main(), before the start bring-up (state 2, held for a human)', () => {
     const latch = constOf(LATCH_FACTORY)
@@ -3439,14 +3700,22 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     expect(props.get(LAUNCH_RUNNING)).not.toContain(SEQUENCE_RUNNING)
   })
 
-  test('the held-on-invalid-flags input is unbound: absent from the routing\'s call and named nowhere in server.ts (its Epic, E23, updates this pin)', () => {
+  // b.jg5 SRJ-1011 state 3, SRJ-207 (E23): P is held on ErrInvalidFlags. The
+  // hold is built in main() (pinned in the hold's describe above); the
+  // routing reads it through a holder assigned that one instance, never a
+  // second one or a copy. Shutdown's forget-all of every hold reads the same
+  // holder, once, and nothing else does.
+  test('the held-on-invalid-flags query reads the one ErrInvalidFlags hold\'s isHeld at call time, through a module-scope holder assigned that hold once in main(), after its build and before the start bring-up, and named elsewhere only by shutdown\'s forget-all (state 3, cannot launch)', () => {
+    const hold = constOf('createInvalidFlagsHold')
+    declaredOnce(hold)
+    const { at } = routingHolder(HELD_ON_INVALID_FLAGS, IS_HELD, hold, [], [shutdownBody(SERVER_CODE)])
+    expect(at).toBeGreaterThan(onlyCallOf('createInvalidFlagsHold'))
+    for (const later of latchStartPass()) expect(at).toBeLessThan(later)
+    // The member is named once in server.ts: in the routing's call.
+    expect(indicesOf(new RegExp(`\\b${HELD_ON_INVALID_FLAGS}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+    // Every lost-message input is bound (each pinned above or in the read-gate describe below).
     const props = onlyCallProps('createPersonaRouting')
-    for (const member of UNBOUND) {
-      expect(props.has(member)).toBe(false)
-      expect(indicesOf(new RegExp(`\\b${member}\\b`, 'g'), SERVER_CODE)).toEqual([])
-    }
-    // The bound inputs are present (each pinned above or in the read-gate describe below).
-    for (const member of [ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ, SEQUENCE_WAIT]) expect(props.has(member)).toBe(true)
+    for (const member of [ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ, SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS]) expect(props.has(member)).toBe(true)
   })
 
   // b.jg5 SRJ-1011 as amended ("state 5 applies only while P's retry timer is
@@ -3480,7 +3749,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     const MEMBERS: Array<keyof PersonaRoutingDeps> = [
       'getPersonaConfig', 'getBotIdentity', 'clientFor', 'resolveUserName', 'archive', 'getReplySettings', 'notify', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
-      'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT,
+      'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS,
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })

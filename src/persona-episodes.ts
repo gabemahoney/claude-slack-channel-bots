@@ -59,7 +59,9 @@
  * (`createSlowRecoveryTracker`, `src/slow-recovery.ts`), which keeps its
  * count here and posts SRJ-1010 once per episode; `kill-failure`'s by the
  * kill-failure alerts (below), which post the ordinary version once per
- * episode and the survivor version with no episode;
+ * episode and the survivor version with no episode; `invalid-flags-hold`'s
+ * by the `ErrInvalidFlags` hold's reactions (`src/invalid-flags-hold.ts`),
+ * which post SRJ-1008's alert once per episode;
  * every other kind has no poster yet: its begin and end triggers and text
  * come with the Epic that posts it, named on its label below.
  *
@@ -355,7 +357,16 @@ export const PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE = 'tmux-unresponsive'
  */
 export const PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED = 'ad-config-malformed'
 
-/** `ErrInvalidFlags` hold: as SRJ-207 states. No poster yet (b.jg5 E23). */
+/**
+ * `ErrInvalidFlags` hold (SRJ-207, SRJ-1008): from the hold being set until
+ * a re-check finds a different binary version, the persona is torn down or
+ * the server restarts. Posted by the hold's set reaction
+ * (`createInvalidFlagsHoldSetReaction`, bound in `main()`,
+ * `src/invalid-flags-hold.ts`): a new hold begins the episode and posts
+ * SRJ-1008's alert once in it. The version-change reaction ends it silently
+ * (`endInvalidFlagsHoldsOnVersionChange`); a teardown's `forget` and
+ * shutdown's `close` drop it.
+ */
 export const PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD = 'invalid-flags-hold'
 
 /**

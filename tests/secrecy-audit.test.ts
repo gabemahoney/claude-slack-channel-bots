@@ -144,6 +144,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/kill-failure-alert\.ts$/, "the kill-failure alert's texts, which quote agent-director's kill-failure descriptions (redacted) in Slack posts, log lines and startup-errors entries"],
   [/^src\/live-row-sequence\.ts$/, "the live-row sequence, whose step lines carry agent-director failure text (a failed get's failure and each kill's outcome, described, redacted) and whose kill results keep agent-director's kill-failure descriptions raw"],
   [/^src\/pane-read\.ts$/, "the read-pane outcome, whose failure outcomes carry the described agent-director failure text (redacted) to the callers' log lines"],
+  [/^src\/invalid-flags-hold\.ts$/, "the ErrInvalidFlags hold, which posts its operator alert and logs the agent-director versions a re-check reported (a version that is not a short version string is logged as unreadable) and its reactions' failures (described, redacted)"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
 ]
 
@@ -484,6 +485,21 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.length).toBeGreaterThan(0)
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
     expect([callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([true, false])
+  })
+
+  // b.jg5 SRJ-207, SRJ-1008: the hold posts its operator alert and logs the versions agent-director reported, and
+  // its reactions log a failing step's error, described.
+  test('src/invalid-flags-hold.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
+    const suite = 'tests/ad-version-gate.test.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/invalid-flags-hold.ts'))).toBe(true)
+    expect(touchReasonsOf(suite, "import { createInvalidFlagsHold } from '../src/invalid-flags-hold.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { invalidFlagsHoldSetLine as line } from '../src/invalid-flags-hold.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { INVALID_FLAGS_HOLD_ALERT_TEXT, INVALID_FLAGS_HOLD_END_FORGOTTEN } from '../src/invalid-flags-hold.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { InvalidFlagsHold } from '../src/invalid-flags-hold.ts'")).toEqual([])
+    expect(touchReasons(suite).some((r) => r.includes('src/invalid-flags-hold.ts'))).toBe(true)
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('src/invalid-flags-hold.ts')))
+    expect(touching).toContain(suite)
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
   // b.jg5 SRJ-117: a read-pane failure outcome carries the described agent-director failure to its callers' log lines.

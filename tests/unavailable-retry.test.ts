@@ -348,6 +348,7 @@ import {
   UNAVAILABLE_RETRY_ROW_ABSENT,
   UNAVAILABLE_RETRY_ROW_PENDING,
   UNAVAILABLE_RETRY_STOP_CAPPED,
+  UNAVAILABLE_RETRY_STOP_HELD,
   UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED,
   UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
@@ -468,6 +469,14 @@ import {
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
 import { stripComments } from './test-helpers/source-audit.ts'
+import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
+import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
+import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { RESTART_OUTCOME_HELD } from '../src/restart.ts'
+import { isDialogApproverRunning } from '../src/session-manager.ts'
+import { _buildRestartDisconnectedPersona } from '../src/server.ts'
+import { launchThroughSequence, scriptLiveRowElsewhere } from './test-helpers/recovery-harness.ts'
+import { errInvalidFlags } from './test-helpers/agent-director-stub.ts'
 
 const KEY = 'alpha'
 const OTHER = 'beta'
@@ -1960,9 +1969,11 @@ const PENDING_ONLY_RETRY = { retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_
 /** The retry action's early stops, before any call, in order: each gate's stand-in overrides and its stop reason. */
 const GATES: ReadonlyArray<readonly [string, Partial<FullModeRetryDeps>, string]> = [
   ['shutting down (before everything else)', { isShuttingDown: () => true, appliedPersona: () => undefined, isLatched: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_SHUTDOWN],
-  ['not applied (before the latched check)', { appliedPersona: () => undefined, isLatched: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_APPLIED],
+  ['not applied (before the latched check)', { appliedPersona: () => undefined, isLatched: () => true, isHeld: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_APPLIED],
   // b.jg5 SRJ-303, SRJ-305: no attempt while P is latched; the timer stops instead.
-  ['latched (before the up check)', { isLatched: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_LATCHED],
+  ['latched (before the held check)', { isLatched: () => true, isHeld: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_LATCHED],
+  // b.jg5 SRJ-207, SRJ-303, SRJ-305: nor while P is held on ErrInvalidFlags.
+  ['held on ErrInvalidFlags (before the up check)', { isHeld: () => true, canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_HELD],
   ['not up (before the cap)', { canRelaunch: () => false, isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_NOT_UP],
   ['at the restart cap', { isAtCap: () => true }, UNAVAILABLE_RETRY_STOP_CAPPED],
 ]
@@ -1976,6 +1987,7 @@ describe('unavailable retry: the retry action’s decisions over stand-ins', () 
     [RESTART_OUTCOME_LAUNCH_SKIPPED, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_LAUNCH_SKIPPED }],
     [RESTART_OUTCOME_SHUTTING_DOWN, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_SHUTDOWN }],
     [RESTART_OUTCOME_LATCHED, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_LATCHED }],
+    [RESTART_OUTCOME_HELD, { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_HELD }],
     [RESTART_OUTCOME_IN_FLIGHT, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT }],
     [RESTART_OUTCOME_REFUSED, { kind: 'again' }],
     [RESTART_OUTCOME_COUNTED_FAILURE, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED }],
@@ -8039,5 +8051,262 @@ describe('unavailable retry: ErrSpawnNotResumable\'s re-read as a trigger: pendi
     expectNothingArmed(h)
     await h.advance(waitMs(0))
     expect(h.attempts).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The ErrInvalidFlags hold and the retry timer (b.jg5 SRJ-207, SRJ-303,
+// SRJ-305), on the recovery harness with both settings 0: the hold's set
+// reaction stops P's timer through the stop entry with the hold's reason
+// (never the condition-end entry, so neither SRJ-306 exception keeps it); a
+// retry of a held P makes no agent-director call and stops the timer the
+// same way, whatever armed it; a hold set by the live-row sequence's step-6
+// reuse leaves no timer; and once the binary's version changes, P is retried
+// at once, at that clock time, with no backoff wait. P is held through a real
+// reuse spawn of its id answering ErrInvalidFlags (`heldLaunch`).
+// ---------------------------------------------------------------------------
+
+/** Script persona `key`'s next launch to replace its row, finished in another directory, by a reuse spawn answering ErrInvalidFlags. */
+function scriptHeldLaunch(h: RecoveryHarness, key: string): void {
+  h.script(collided(h, personaOf(h, key), { cwd: h.home, state: LIVENESS_DEAD_ROW_ENDED }, errInvalidFlags('spawn')))
+}
+
+/** Hold persona `key` through a start-pass launch of it whose reuse spawn answers ErrInvalidFlags. */
+async function heldLaunch(h: RecoveryHarness, key: string): Promise<void> {
+  scriptHeldLaunch(h, key)
+  expect(await h.launch(key)).toEqual({ key, action: 'held' })
+  expect(h.invalidFlagsHold.isHeld(key)).toBe(true)
+}
+
+/** Persona `key`'s timer stopped once, with the hold's reason, its last line saying so; one alert posted; nothing counted or deleted. */
+function expectStoppedByHold(h: RecoveryHarness, key: string): void {
+  expect(h.stops.filter((stop) => stop.key === key)).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_HELD }])
+  expect(retryLinesOf(h, key).filter((line) => line.endsWith(` — ${UNAVAILABLE_RETRY_STOP_HELD}`))).toHaveLength(1)
+  expect(retryLinesOf(h, key).at(-1)).toEndWith(` — ${UNAVAILABLE_RETRY_STOP_HELD}`)
+  expect(h.controller.isArmed(key)).toBe(false)
+  expect(h.episodeNotices.filter((notice) => notice.text === INVALID_FLAGS_HOLD_ALERT_TEXT)).toEqual([{ key, text: INVALID_FLAGS_HOLD_ALERT_TEXT }])
+  expect(h.stub.calls.deleteCalls).toEqual([])
+  expect(getFailureCount(key)).toBe(0)
+}
+
+describe('unavailable retry: a held query that throws counts as held (SRJ-207, fail safe)', () => {
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+
+  beforeEach(() => {
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    assertNoLeak({ errLines })
+  })
+
+  test.each([FULL_RETRY, PENDING_ONLY_RETRY])('$mode mode, over stand-ins: KEY stops with the hold\'s reason before the up and cap checks, the row read and the retry entry, with one redacted line naming what the query threw; OTHER\'s retry runs as before', async (attempt) => {
+    const asked: string[] = []
+    const deps = fullModeDeps(RESTART_OUTCOME_LAUNCHED, {
+      isHeld: (key) => {
+        if (key === KEY) throw Object.assign(new Error(`held query broke (${sentinelInMessage('held')})`), { note: LEAK_SENTINEL })
+        return false
+      },
+      appliedPersona: (key) => ({ working_directory: `/work/${key}` }),
+      canRelaunch: (key) => { asked.push(`up ${key}`); return true },
+      isAtCap: (key) => { asked.push(`cap ${key}`); return false },
+    }, UNAVAILABLE_RETRY_ROW_PENDING)
+    const action = createFullModeRetryAction(deps)
+
+    expect(await action(KEY, attempt)).toEqual({ kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_HELD })
+    expect([asked, deps.calls, deps.reads]).toEqual([[], [], []])
+    expect(errLines).toHaveLength(1)
+    expect(errLines[0]).toStartWith(`[slack] unavailable-retry: persona=${KEY} the held query failed: Error message="held query broke (${REDACTED_SENTINEL_TAIL})"`)
+
+    expect((await action(OTHER, attempt)).kind).toBe('again')
+    expect(asked).toEqual([`up ${OTHER}`, `cap ${OTHER}`])
+  })
+})
+
+describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry is made while P is held, and P is retried at once when the binary changes (SRJ-207, SRJ-303, SRJ-305)', () => {
+  test('P\'s timer armed by an UNAVAILABLE refusal; its retry\'s reuse gets ErrInvalidFlags with a passing re-check: P held and its timer stopped with the hold\'s reason, logged once; past several backoff waits nothing fires or is called for P, and Q\'s timer keeps its schedule', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    const rc = h.versionRecheck({ version: PHASE1_RC_VERSION })
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const refusal = errCallTimeout('spawn')
+    h.script({ spawnError: refusal })
+    const armedAt = h.clock.now()
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    await h.advance(waitMs(0) / 2)
+    const otherArmedAt = h.clock.now()
+    expect(await h.launch(other)).toEqual({ key: other, action: 'failed', refused: true })
+    const otherView = h.controller.view(other)
+
+    // P's first retry: no row, so it launches; the launch replaces P's row,
+    // finished in another directory, by a reuse spawn that answers ErrInvalidFlags.
+    scriptHeldLaunch(h, key)
+    expect(await retryNow(h, key)).toBe(armedAt + waitMs(0))
+
+    expect(h.invalidFlagsHold.isHeld(key)).toBe(true)
+    expect(rc.resolves).toHaveLength(1)
+    expectStoppedByHold(h, key)
+    expect(h.controller.view(other)).toEqual(otherView)
+
+    const pCalls = personaCallCounts(h, key)
+    const pAttempts = h.attempts.filter((attempt) => attempt.key === key).length
+    let otherDue = otherArmedAt
+    for (let n = 0; n < 4; n++) {
+      otherDue += waitMs(n)
+      expect(await retryNow(h, other)).toBe(otherDue)
+      expect([n, h.controller.view(other)]).toEqual([n, expect.objectContaining({ phase: 'waiting', dueAt: otherDue + waitMs(n + 1), refusals: n + 1 })])
+    }
+    expect(otherDue - armedAt).toBeGreaterThan(waitMs(0) + waitMs(1) + waitMs(2))
+    expect(personaCallCounts(h, key)).toEqual(pCalls)
+    expect(h.attempts.filter((attempt) => attempt.key === key)).toHaveLength(pAttempts)
+    expectStoppedByHold(h, key)
+    expect(h.controller.armedKeys()).toEqual([other])
+    expect(h.clock.pendingCount()).toBe(1 + rc.pendingTimers())
+  })
+
+  // SRJ-306's exceptions keep a timer through a condition end; the hold's
+  // stop goes through the stop entry, which no exception keeps.
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
+    ['armed with the kill-failure cause (a refused ErrTmuxKillFailed)', async (h, key) => {
+      modelRow(h, 'ended')
+      h.script({ killError: errTmuxKillFailed() })
+      expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+      await h.settle()
+      h.script({ killError: undefined })
+      expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_KILL_FAILED])
+    }],
+    ['in pending-only mode, its last row read pending', async (h, key) => {
+      modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
+      h.controller.armPendingOnly(key)
+      expect(h.controller.view(key)?.lastRow).toBe(UNAVAILABLE_RETRY_ROW_PENDING)
+    }],
+  ])('P\'s timer %s: P held at its next launch stops it with the hold\'s reason, the exceptions notwithstanding; nothing fires for P however far the clock goes', async (_how, arm) => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    await arm(h, key)
+    expect(h.controller.isArmed(key)).toBe(true)
+
+    await heldLaunch(h, key)
+
+    expectStoppedByHold(h, key)
+    const attempts = h.attempts.length
+    await h.advance(10 * UNAVAILABLE_RETRY_CEILING_S * 1000)
+    expect(h.attempts).toHaveLength(attempts)
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(h.controller.isArmed(other)).toBe(false)
+  })
+
+  test.each(ARMED_MODES)('a timer armed for a held P %s stops at its first fire with the hold\'s reason and no agent-director call', async (_mode, arm) => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    await heldLaunch(h, key)
+    expect(h.stops).toEqual([])
+
+    arm(h, key)
+    const before = callCounts(h)
+    const due = await retryNow(h, key)
+
+    expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, at: due })])
+    expect(callsSince(h, before)).toEqual({})
+    expectStoppedByHold(h, key)
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.advance(10 * UNAVAILABLE_RETRY_CEILING_S * 1000)
+    expect(h.attempts).toHaveLength(1)
+  })
+
+  // The session-disconnect handler (`_buildRestartDisconnectedPersona`, as
+  // main() builds it over the tmux-unavailable retry check's deps): as built
+  // that check (`armMissingTmuxUnavailableRetry`, b.jg5 SRJ-311) asks no held
+  // query, so a held P's disconnect with its tmux-unavailable outage raised
+  // and no timer arms one; that timer stops at its first fire with the hold's
+  // reason and no call. With no outage raised the disconnect asks the restart
+  // module, whose held gate arms no restart timer. A message lost for a held
+  // P reports cannot-launch before that check is reached, and arms nothing.
+  test('a held P whose session disconnects: with its tmux-unavailable outage raised and no timer, the disconnect arms one, which stops at its first fire with the hold\'s reason and no agent-director call; with none raised, no restart timer is armed; a message lost for it reports cannot-launch and arms nothing', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    await heldLaunch(h, key)
+    const disconnected = _buildRestartDisconnectedPersona({
+      isTmuxUnavailable: (k) => getOutageFlags(k).has('tmux-unavailable'),
+      isRetryArmed: (k) => h.controller.isArmed(k),
+      isLatched: (k) => h.latch.isLatched(k) === true,
+      isWorkInFlight: (k) => isLaunchInFlight(k) || isDialogApproverRunning(k),
+      armRetryTimer: (k) => {
+        h.controller.arm(k, { kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT })
+      },
+      log: () => {},
+      getPersona: (k) => personaOf(h, k),
+      scheduleRestart: (k, cwd) => scheduleRestart(k, cwd),
+      isShuttingDown: () => false,
+    })
+
+    // No outage raised: the restart module's held gate arms no restart timer.
+    disconnected(key, '')
+    expect([isRestartPendingOrActive(key), h.controller.isArmed(key)]).toEqual([false, false])
+
+    // Raised, with no timer: a lost message reports cannot-launch and arms nothing.
+    setOutageFlag(key, 'tmux-unavailable')
+    await expectLostMessageReports(h, key, 'cannot-launch')
+    expect(h.controller.isArmed(key)).toBe(false)
+
+    // The disconnect arms the timer, which stops at its first fire with no call.
+    disconnected(key, '')
+    expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT])
+    const before = callCounts(h)
+    await retryNow(h, key)
+    expect(callsSince(h, before)).toEqual({})
+    expectStoppedByHold(h, key)
+    expect(isRestartPendingOrActive(key)).toBe(false)
+  })
+
+  test('a hold set by the live-row sequence\'s step-6 reuse leaves no timer pending for P: the sequence ends launched with the held result and arms nothing', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    scriptLiveRowElsewhere(h, key, { spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInvalidFlags('spawn'))] })
+
+    const outcome = await launchThroughSequence(h, key)
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key, action: 'held' } })
+    expect(outcome).not.toHaveProperty('armed')
+    expect(h.invalidFlagsHold.isHeld(key)).toBe(true)
+    expect(h.triggers.filter((trigger) => trigger.key === key)).toEqual([])
+    expect(h.controller.isArmed(key)).toBe(false)
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test('retried at once: P held by a retry\'s reuse, its timer stopped; the binary\'s version changes and the next timed re-check retries P at that clock time, with no backoff wait and not through the timer, and P comes up', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    const rc = h.versionRecheck({ version: PHASE1_RC_VERSION })
+    const rows = modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    h.script({ spawnError: errCallTimeout('spawn') })
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    scriptHeldLaunch(h, key)
+    await retryNow(h, key)
+    expectStoppedByHold(h, key)
+    const attempts = h.attempts.length
+
+    rc.answer({ version: PHASE1_FLOOR_VERSION })
+    h.script({ ...collided(h, personaOf(h, key), { cwd: h.home, state: LIVENESS_DEAD_ROW_ENDED }), spawnError: undefined })
+    const spawnsBefore = rows.spawnedAt.length
+    const due = rc.nextDueAt()!
+    await h.advance(due - h.clock.now())
+    await h.settle()
+
+    expect(h.invalidFlagsHold.isHeld(key)).toBe(false)
+    expect(h.retriesAtOnce).toEqual([{ key, at: due, outcome: RESTART_OUTCOME_LAUNCHED }])
+    // The colliding plain spawn and the reuse, both at the re-check's time.
+    expect(rows.spawnedAt.slice(spawnsBefore)).toEqual([due, due])
+    expect(h.attempts).toHaveLength(attempts)
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_HELD }])
+    await h.runApproverToStop(key)
+    h.controller.stop(key, UNAVAILABLE_RETRY_STOP_RECOVERED)
   })
 })

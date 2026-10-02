@@ -21,6 +21,7 @@ import {
   RESTART_OUTCOME_CAPPED,
   RESTART_OUTCOME_COUNTED_FAILURE,
   RESTART_OUTCOME_IN_FLIGHT,
+  RESTART_OUTCOME_HELD,
   RESTART_OUTCOME_LATCHED,
   RESTART_OUTCOME_LAUNCHED,
   RESTART_OUTCOME_LAUNCH_SKIPPED,
@@ -273,6 +274,7 @@ import {
   slowRecoveryText,
 } from '../src/slow-recovery.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { createInvalidFlagsHold, INVALID_FLAGS_HOLD_LOG_PREFIX, type InvalidFlagsHold } from '../src/invalid-flags-hold.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
@@ -7033,6 +7035,253 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
       expect(getFailureCount(q)).toBe(0)
       expect(h.latchEvents).toHaveLength(5)
       expect(h.episodeNotices).toHaveLength(1)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-207, SRJ-303 — the restart path holds back for a persona held on
+// ErrInvalidFlags
+//
+// Over the file's deps, with the optional held query (`RestartDeps.isHeld`)
+// over a real hold (`createInvalidFlagsHold`). While P is held, a scheduled
+// restart and a human-triggered restart request arm no timer; the work's
+// held gate, right after its latched gate, answers `RESTART_OUTCOME_HELD` for
+// the retry entry (before its in-flight and cap checks) and for a restart
+// timer armed before P was held: nothing is probed, reconnected, killed or
+// launched, nothing is recorded, the cap state is left as it was. A launch
+// that answers 'skipped' because its reuse held P ends the run held. A held
+// query that throws counts as held. Q restarts as before, and deps with no
+// query behave as before. On the recovery harness, P held through a real
+// reuse: the retry entry makes no stub call for P. Every line is
+// leak-checked; the retry timer's reading of the outcome is
+// tests/unavailable-retry.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-207, SRJ-303: the restart path makes no attempt for a persona held on ErrInvalidFlags', () => {
+  const P = 'persona_p'
+  const Q = 'persona_q'
+  const CWD: Record<string, string> = { [P]: '/cwd/p', [Q]: '/cwd/q' }
+  /** What every line the restart module logs for a held persona says. */
+  const HELD_WORDS = 'held on ErrInvalidFlags'
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+  let hold: InvalidFlagsHold
+  /** Each serialized work's outcome, in order. */
+  let outcomes: Array<{ key: string; outcome: unknown }>
+
+  beforeEach(() => {
+    errLines = []
+    outcomes = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+    hold = createInvalidFlagsHold({ log: (line) => { errLines.push(line) } })
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+    assertNoLeak({ errLines })
+  })
+
+  /**
+   * The file's deps over a dead row, every launch succeeding (P's would
+   * reset its failure on record), the held query over the case's hold and a
+   * serializer that records each work's outcome.
+   */
+  function heldDeps(opts: DepsOpts = {}): ReturnType<typeof makeDeps> {
+    const deps = makeDeps(opts)
+    deps.isHeld = (key) => hold.isHeld(key)
+    deps.serialize = async <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
+      const outcome = await operation()
+      outcomes.push({ key, outcome })
+      return outcome
+    }
+    return deps
+  }
+
+  /** P made no call and recorded nothing: its one failure on record kept, no cap notice, nothing armed. */
+  function expectNothingForP(deps: ReturnType<typeof makeDeps>): void {
+    expect(deps.isSessionAliveCalls.filter((key) => key === P)).toEqual([])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls.filter((key) => key === P)).toEqual([])
+    expect(deps.launchSessionCalls.filter((call) => call.key === P)).toEqual([])
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  }
+
+  /** P's lines that say it is held: exactly `count`. */
+  function expectHeldLines(count: number): void {
+    expect(errLines.filter((line) => line.includes(`persona=${P}`) && line.includes(HELD_WORDS) && !line.startsWith(INVALID_FLAGS_HOLD_LOG_PREFIX))).toHaveLength(count)
+  }
+
+  const SCHEDULE_ENTRIES: Array<[string, { humanTrigger: true } | undefined]> = [
+    ['a scheduled restart', undefined],
+    ['a human-triggered restart request', { humanTrigger: true }],
+  ]
+
+  test.each(SCHEDULE_ENTRIES)('%s for a held P arms no timer: one line, no probe, reconnect, kill or launch, nothing recorded; Q beside it restarts as before', async (_entry, opts) => {
+    recordFailure(P)
+    hold.set(P, PHASE1_RC_VERSION)
+    const deps = heldDeps()
+    initRestart(deps)
+
+    scheduleRestart(P, CWD[P]!, undefined, opts)
+    expect(isRestartPendingOrActive(P)).toBe(false)
+    scheduleRestart(Q, CWD[Q]!, undefined, opts)
+    await Bun.sleep(WAIT_MS)
+
+    expect(outcomes).toEqual([{ key: Q, outcome: RESTART_OUTCOME_LAUNCHED }])
+    expect(deps.launchSessionCalls.map((call) => call.key)).toEqual([Q])
+    expectNothingForP(deps)
+    expectHeldLines(1)
+  })
+
+  test('the retry entry (runRestartRetry) for a held P answers held: nothing probed, reconnected, killed or launched, nothing recorded, one line; Q beside it restarts as before', async () => {
+    recordFailure(P)
+    hold.set(P, PHASE1_RC_VERSION)
+    const deps = heldDeps()
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_HELD)
+    expect(await runRestartRetry(Q, CWD[Q]!, () => false)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expect(outcomes).toEqual([{ key: P, outcome: RESTART_OUTCOME_HELD }, { key: Q, outcome: RESTART_OUTCOME_LAUNCHED }])
+    expectNothingForP(deps)
+    expectHeldLines(1)
+  })
+
+  test('the retry entry for a held P at the cap and with a launch in flight answers held first: the in-flight, shutdown and relaunch checks are never asked', async () => {
+    for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(P)
+    hold.set(P, PHASE1_RC_VERSION)
+    const asked: string[] = []
+    const deps = heldDeps()
+    deps.isShuttingDown = () => { asked.push('shutdown'); return false }
+    deps.canRestart = () => { asked.push('gate'); return true }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => { asked.push('in-flight'); return true })).toBe(RESTART_OUTCOME_HELD)
+
+    expect(asked).toEqual([])
+    expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls]).toEqual([[], [], []])
+    expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
+    expect(deps.onCapReachedCalls).toEqual([])
+  })
+
+  test('a restart timer armed before P was held: when it fires, its work answers held with no call, nothing recorded', async () => {
+    recordFailure(P)
+    const deps = heldDeps()
+    initRestart(deps)
+
+    scheduleRestart(P, CWD[P]!)
+    expect(isRestartPendingOrActive(P)).toBe(true)
+    hold.set(P, PHASE1_RC_VERSION)
+    await Bun.sleep(WAIT_MS)
+
+    expect(outcomes).toEqual([{ key: P, outcome: RESTART_OUTCOME_HELD }])
+    expectNothingForP(deps)
+  })
+
+  test('a run whose launch answers \'skipped\' because its reuse held P answers held: the kill before it, nothing after it, nothing counted, no cap notice and no restart scheduled; a later retry makes no attempt', async () => {
+    recordFailure(P)
+    const deps = heldDeps({
+      launchSession: async (key) => {
+        hold.set(key, PHASE1_RC_VERSION)
+        return 'skipped'
+      },
+    })
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_HELD)
+
+    expect(deps.isSessionAliveCalls).toEqual([P])
+    expect(deps.killSessionCalls).toEqual([P])
+    expect(deps.launchSessionCalls.map((call) => call.key)).toEqual([P])
+    expect(getFailureCount(P)).toBe(1)
+    expect([deps.onCapReachedCalls, deps.armRetryTimerCalls]).toEqual([[], []])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_HELD)
+    expect(deps.launchSessionCalls).toHaveLength(1)
+    expect(deps.isSessionAliveCalls).toEqual([P])
+  })
+
+  test('held during the liveness probe: the work answers held with no reconnect, kill or launch, nothing armed, nothing recorded', async () => {
+    recordFailure(P)
+    const deps = heldDeps()
+    deps.isSessionAlive = async (key) => {
+      deps.isSessionAliveCalls.push(key)
+      hold.set(key, PHASE1_RC_VERSION)
+      return LIVENESS_READING_UNKNOWN
+    }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_HELD)
+
+    expect(deps.isSessionAliveCalls).toEqual([P])
+    expect([deps.reconnectSessionCalls, deps.killSessionCalls, deps.launchSessionCalls, deps.armRetryTimerCalls]).toEqual([[], [], [], []])
+    expect(getFailureCount(P)).toBe(1)
+  })
+
+  test('a held query that throws counts as held (fail safe): no call, held, one line naming what it threw, redacted', async () => {
+    recordFailure(P)
+    const deps = heldDeps()
+    deps.isHeld = (key) => {
+      if (key === P) throw Object.assign(new Error(`held query broke (${sentinelInMessage('held')})`), { note: LEAK_SENTINEL })
+      return false
+    }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_HELD)
+    expect(await runRestartRetry(Q, CWD[Q]!, () => false)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expectNothingForP(deps)
+    const lines = errLines.filter((line) => line.includes(`persona=${P}`) && line.includes(HELD_WORDS))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(`held query failed: Error message="held query broke (${REDACTED_SENTINEL_TAIL})"`)
+  })
+
+  test.each([
+    ['with the held query present, answering false', (_deps: ReturnType<typeof makeDeps>) => {}],
+    ['with a hand-built RestartDeps that has no held query', (deps: ReturnType<typeof makeDeps>) => { delete deps.isHeld }],
+  ] as const)('%s: P restarts as before, its success recorded', async (_label, shape) => {
+    recordFailure(P)
+    const deps = heldDeps()
+    shape(deps)
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(getFailureCount(P)).toBe(0)
+    expectHeldLines(0)
+  })
+
+  describe('on the recovery harness', () => {
+    let h: RecoveryHarness | undefined
+
+    afterEach(() => {
+      if (h === undefined) return
+      assertNoLeak(h.captured())
+      h.cleanup()
+      h = undefined
+    })
+
+    test('P held through a real reuse: the retry entry and a scheduled restart make no status, kill, send-keys, spawn, resume or delete for cscb_<key>, record nothing and arm nothing', async () => {
+      h = makeRecoveryHarness()
+      const [p] = h.keys as [string]
+      const persona = h.config.personas.find((x) => x.key === p)!
+      h.script(collided(h, persona, { cwd: h.home, state: LIVENESS_DEAD_ROW_ENDED }, errInvalidFlags('spawn')))
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'held' })
+      const before = personaCallCounts(h, p)
+
+      expect(await runRestartRetry(p, persona.working_directory, () => false)).toBe(RESTART_OUTCOME_HELD)
+      scheduleRestart(p, persona.working_directory)
+      expect(isRestartPendingOrActive(p)).toBe(false)
+      await h.settle()
+
+      expect(personaCallCounts(h, p)).toEqual(before)
+      expect([getFailureCount(p), h.controller.isArmed(p), h.capReached]).toEqual([0, false, []])
     })
   })
 })

@@ -19,6 +19,9 @@
  * - the latch (b.jg5 SRJ-504): a real `createConflictLatch` with the CONFLICT
  *   notice bound to real notice episodes over a recording sink, its `forget`
  *   as `forgetConflictLatch`;
+ * - the `ErrInvalidFlags` hold (b.jg5 SRJ-207, SRJ-715): a real
+ *   `createInvalidFlagsHold` with its set reaction bound to real notice
+ *   episodes over a recording sink, its `forget` as `forgetInvalidFlagsHold`;
  * - serialization behind a restart: the real restart module
  *   (`initRestart` with `serialize`, real `cancelRestartTimer`). Its timer is
  *   a real `setTimeout` (1 ms here; it takes no fake clock), waited for by a
@@ -81,10 +84,18 @@ import { credentialsDigest, readCredentialsFile } from '../src/persona-credentia
 import {
   createPersonaEpisodes,
   PERSONA_EPISODE_KIND_CONFLICT,
+  PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD,
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
   PERSONA_EPISODE_KINDS,
   type PersonaEpisodes,
 } from '../src/persona-episodes.ts'
+import {
+  bindInvalidFlagsHoldSetReaction,
+  createInvalidFlagsHold,
+  INVALID_FLAGS_HOLD_ALERT_TEXT,
+  invalidFlagsHoldForgetLine,
+  type InvalidFlagsHold,
+} from '../src/invalid-flags-hold.ts'
 import {
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
@@ -252,7 +263,7 @@ type DepName =
   | 'stopApprover' | 'stopLiveRowSequence' | 'whenLaunchSettled' | 'connections.stop'
   | 'routing.forget' | 'forgetAcks' | 'destinations.forget' | 'destinationHold.cancel' | 'notifier.forget' | 'forgetPersonaPrompts'
   | 'dropSession' | 'resetOutageState' | 'killInstance' | 'deleteInstance' | 'forgetFailures'
-  | 'forgetDisconnectedStreak' | 'forgetNotConnectedEpisode' | 'forgetConflictLatch' | 'forgetNoticeEpisodes' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
+  | 'forgetDisconnectedStreak' | 'forgetNotConnectedEpisode' | 'forgetConflictLatch' | 'forgetInvalidFlagsHold' | 'forgetNoticeEpisodes' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
   | 'storageCheck' | 'launch' | 'connections.reconnectCredentials' | 'connections.replaceRetryTokens'
 
 /** Dependencies whose production form returns a promise: their failure is a rejection, the others' a throw. */
@@ -395,6 +406,7 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
     forgetDisconnectedStreak: rec('forgetDisconnectedStreak', byKey, () => undefined),
     forgetNotConnectedEpisode: rec('forgetNotConnectedEpisode', byKey, () => undefined),
     forgetConflictLatch: rec('forgetConflictLatch', byKey, () => false),
+    forgetInvalidFlagsHold: rec('forgetInvalidFlagsHold', byKey, () => false),
     forgetNoticeEpisodes: rec('forgetNoticeEpisodes', byKey, () => undefined),
     resetOutageState: rec('resetOutageState', (keys: string[]) => keys.join(','), () => undefined),
     forgetPersonaPrompts: rec('forgetPersonaPrompts', byKey, () => 0),
@@ -475,7 +487,7 @@ function teardownTurnTrail(p: Persona, launchPass: string): string[] {
     `notifier.forget:${k}`, `forgetPersonaPrompts:${k}`, `dropSession:${k}`,
     `resetOutageState:${k}`, `killInstance:${k}`, `deleteInstance:${k}`, `resetOutageState:${k}`, `stopRetryTimer:${k}`,
     `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`, `forgetNotConnectedEpisode:${k}`, `forgetConflictLatch:${k}`,
-    `forgetNoticeEpisodes:${k}`, `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPass}`,
+    `forgetInvalidFlagsHold:${k}`, `forgetNoticeEpisodes:${k}`, `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPass}`,
   ]
 }
 
@@ -996,6 +1008,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['forgetDisconnectedStreak', ['forgetting its health-check streak']],
     ['forgetNotConnectedEpisode', ['forgetting its not-connected episode']],
     ['forgetConflictLatch', ['forgetting its latch']],
+    ['forgetInvalidFlagsHold', ['forgetting its ErrInvalidFlags hold']],
     ['forgetNoticeEpisodes', ['forgetting its notice episodes']],
     ['replyGuard.launchedWithDir', ['reading its launched-with directory']],
     ['replyGuard.teardown', ['deleting its reply-guard record']],
@@ -1043,16 +1056,16 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
       'stopApprover', 'stopLiveRowSequence', 'bringUps.cancel', 'cancelRestartTimer', 'stopRetryTimer', 'cancelLaunchWait', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
       'forgetAcks', 'destinations.forget', 'destinationHold.cancel', 'notifier.forget', 'forgetPersonaPrompts', 'dropSession',
       'resetOutageState', 'killInstance', 'deleteInstance', 'forgetFailures', 'forgetDisconnectedStreak', 'forgetNotConnectedEpisode',
-      'forgetConflictLatch', 'forgetNoticeEpisodes', 'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
+      'forgetConflictLatch', 'forgetInvalidFlagsHold', 'forgetNoticeEpisodes', 'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
     ]
     const f = makeFixture({ fail: all })
 
     await f.lifecycle.teardown(f.b)
 
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => c !== `deleteInstance:${f.b.key}`))
-    // 26 dependencies, the delete not run after the failed kill (b.jg5 SRJ-701);
+    // 27 dependencies, the delete not run after the failed kill (b.jg5 SRJ-701);
     // resetOutageState and stopLiveRowSequence each run (and fail) twice in the turn, stopRetryTimer three times.
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 29 failed step(s)`)
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 30 failed step(s)`)
     expect(f.lines).toContain(deleteNotMadeLine(f.b))
     assertNoLeak({ lines: f.lines })
   })
@@ -1101,13 +1114,16 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(consumeAck(a, 'C0ALPHA001', '1700000000.000300')).toBe(true)
   })
 
-  // Rows: the forget that fails (b.jg5 SRJ-1016's notice episodes, SRJ-504's latch), its step
-  // phrase, and how (neither production form returns a promise, but a rejection is awaited too).
-  test.each<['forgetNoticeEpisodes' | 'forgetConflictLatch', string, 'throws' | 'rejects']>([
+  // Rows: the forget that fails (b.jg5 SRJ-1016's notice episodes, SRJ-504's latch, SRJ-207's
+  // ErrInvalidFlags hold), its step phrase, and how (no production form returns a promise, but a
+  // rejection is awaited too).
+  test.each<['forgetNoticeEpisodes' | 'forgetConflictLatch' | 'forgetInvalidFlagsHold', string, 'throws' | 'rejects']>([
     ['forgetNoticeEpisodes', 'forgetting its notice episodes', 'throws'],
     ['forgetNoticeEpisodes', 'forgetting its notice episodes', 'rejects'],
     ['forgetConflictLatch', 'forgetting its latch', 'throws'],
     ['forgetConflictLatch', 'forgetting its latch', 'rejects'],
+    ['forgetInvalidFlagsHold', 'forgetting its ErrInvalidFlags hold', 'throws'],
+    ['forgetInvalidFlagsHold', 'forgetting its ErrInvalidFlags hold', 'rejects'],
   ])('b.jg5: %s failing (%s; it %s): its step is logged token-safely by its own phrase, every other step still runs, and the teardown completes with one failed step', async (dep, phrase, how) => {
     const f = makeFixture({
       overrides: {
@@ -1513,6 +1529,137 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
 })
 
 // ---------------------------------------------------------------------------
+// Persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207,
+// SRJ-715): the hold ends silently with its persona, a hold its launch in
+// flight set included.
+// ---------------------------------------------------------------------------
+
+describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SRJ-715): the key\'s hold and hold episode end silently, for that key only', () => {
+  interface HoldFixture {
+    f: Fixture
+    hold: InvalidFlagsHold
+    episodes: PersonaEpisodes
+    /** Every alert the episodes' sink received (the persona notifier in production), in order. */
+    posts: Array<{ key: string; text: string }>
+    /** The hold's and the episodes' log lines. */
+    holdLines: string[]
+    /** Every retry-timer stop the set reaction asked for, by key. */
+    timerStops: string[]
+  }
+
+  /**
+   * A real hold with its set reaction bound to real notice episodes (fake
+   * clock, recording sink), as `main()` binds it; the lifecycle's hold and
+   * episodes forgets are theirs, each recorded in the trail first so the
+   * order is asserted with the other steps. `launchInFlight` is B's launch in
+   * flight, given the hold.
+   */
+  function makeHeld(opts: { launchInFlight?: (hold: InvalidFlagsHold) => Promise<void> } = {}): HoldFixture {
+    const clock = createFakeClock()
+    const posts: HoldFixture['posts'] = []
+    const holdLines: string[] = []
+    const timerStops: string[] = []
+    const episodes = createPersonaEpisodes({ sink: (key, text) => void posts.push({ key, text }), log: (line) => void holdLines.push(line), clock })
+    const hold = createInvalidFlagsHold({ log: (line) => void holdLines.push(line) })
+    bindInvalidFlagsHoldSetReaction(hold, { stopRetryTimer: (key) => void timerStops.push(key), episodes, log: (line) => void holdLines.push(line) })
+    const f: Fixture = makeFixture({
+      ...(opts.launchInFlight !== undefined ? { launchInFlight: () => opts.launchInFlight!(hold) } : {}),
+      overrides: {
+        forgetInvalidFlagsHold: (key) => {
+          f.trail.push(`forgetInvalidFlagsHold:${key}`)
+          return hold.forget(key)
+        },
+        forgetNoticeEpisodes: (key) => {
+          f.trail.push(`forgetNoticeEpisodes:${key}`)
+          episodes.forget(key)
+        },
+      },
+    })
+    cleanups.push(() => {
+      expect(clock.pendingCount()).toBe(0)
+      assertNoLeak({ lines: f.lines, holdLines, posts })
+    })
+    return { f, hold, episodes, posts, holdLines, timerStops }
+  }
+
+  /** The alert as the episodes' sink receives it for persona `key`. */
+  const alertFor = (key: string): { key: string; text: string } => ({ key, text: INVALID_FLAGS_HOLD_ALERT_TEXT })
+
+  test('tearing held B down leaves B unheld with no hold episode open, posts nothing and retries nothing (one forget line); A\'s hold and posted episode stay; B added again and held anew posts exactly one new alert', async () => {
+    const r = makeHeld()
+    const [a, b] = [r.f.a.key, r.f.b.key]
+    expect(r.hold.set(a, PHASE1_RC_VERSION)).toBe(true)
+    expect(r.hold.set(b, PHASE1_RC_VERSION)).toBe(true)
+    await flush()
+    expect(r.posts).toEqual([alertFor(a), alertFor(b)])
+    const aEpisode = r.episodes.view(a, PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD)
+    const postsBefore = [...r.posts]
+    const linesBefore = [...r.holdLines]
+    const stopsBefore = [...r.timerStops]
+
+    await r.f.lifecycle.teardown(r.f.b)
+    await flush()
+
+    expect(r.f.trail).toEqual(fullTeardownTrail(r.f.b, launchPassOf(r.f, undefined)))
+    expect(r.f.lines).toEqual(cleanTeardownLines(r.f.b))
+    expect(r.hold.isHeld(b)).toBe(false)
+    expect(r.hold.heldKeys()).toEqual([a])
+    expect(r.episodes.isOpen(b, PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD)).toBe(false)
+    expect(r.posts).toEqual(postsBefore)
+    expect(r.timerStops).toEqual(stopsBefore)
+    // The forget's one line; no end, retry or post line.
+    expect(r.holdLines.slice(linesBefore.length)).toEqual([invalidFlagsHoldForgetLine(b, PHASE1_RC_VERSION)])
+    expect(r.hold.isHeld(a)).toBe(true)
+    expect(r.hold.beganUnder(a)).toBe(PHASE1_RC_VERSION)
+    expect(r.episodes.view(a, PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD)).toEqual(aEpisode)
+
+    // B added again starts unheld; a new ErrInvalidFlags holds it afresh, with one post.
+    expect(r.hold.set(b, PHASE1_RC_VERSION)).toBe(true)
+    expect(r.hold.set(b, PHASE1_RC_VERSION)).toBe(false)
+    await flush()
+    expect(r.posts.slice(postsBefore.length)).toEqual([alertFor(b)])
+  })
+
+  test('a hold B\'s launch in flight sets as it settles during the teardown is forgotten too (the forget waits for the launch), and its hold episode is not left open: a later hold of B posts again', async () => {
+    const release = Promise.withResolvers<void>()
+    let postsAtSettle = -1
+    const r = makeHeld({
+      // B's held launch: once released, its reuse spawn answers ErrInvalidFlags and holds B.
+      launchInFlight: (hold) =>
+        release.promise.then(async () => {
+          hold.set(r.f.b.key, PHASE1_RC_VERSION)
+          await flush()
+          postsAtSettle = r.posts.length
+        }),
+    })
+    const b = r.f.b.key
+    const full = fullTeardownTrail(r.f.b, launchPassOf(r.f, undefined))
+
+    const done = r.f.lifecycle.teardown(r.f.b)
+    await flush()
+    // The teardown waits for the launch: nothing after the wait has run.
+    expect(r.f.trail).toEqual(untilLaunchSettled(full, r.f.b))
+    expect(r.hold.isHeld(b)).toBe(false)
+
+    release.resolve()
+    await done
+    await flush()
+
+    expect(r.f.trail).toEqual(full)
+    expect(r.hold.isHeld(b)).toBe(false)
+    expect(r.episodes.isOpen(b, PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD)).toBe(false)
+    // The one alert is the set's own, posted as the launch settled; the teardown posted nothing.
+    expect(postsAtSettle).toBe(1)
+    expect(r.posts).toEqual([alertFor(b)])
+
+    // B added again and held anew: a new episode, so exactly one new post.
+    expect(r.hold.set(b, PHASE1_RC_VERSION)).toBe(true)
+    await flush()
+    expect(r.posts).toEqual([alertFor(b), alertFor(b)])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Persona teardown with the real agent-director calls, outage state,
 // notifier and destination hold: no wind-down, no flag and no notice left.
 // ---------------------------------------------------------------------------
@@ -1652,9 +1799,9 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
 
     const id = personaInstanceId(r.f.b.key)
     expect(r.adOrder).toEqual([`kill:${id}`])
-    expect(r.f.trail.slice(-8)).toEqual([
+    expect(r.f.trail.slice(-9)).toEqual([
       `forgetFailures:${r.f.b.key}`, `forgetDisconnectedStreak:${r.f.b.key}`, `forgetNotConnectedEpisode:${r.f.b.key}`,
-      `forgetConflictLatch:${r.f.b.key}`, `forgetNoticeEpisodes:${r.f.b.key}`,
+      `forgetConflictLatch:${r.f.b.key}`, `forgetInvalidFlagsHold:${r.f.b.key}`, `forgetNoticeEpisodes:${r.f.b.key}`,
       `replyGuard.launchedWithDir:${r.f.b.key}`, `replyGuard.teardown:${r.f.b.key}`,
       `replyGuard.launchPass:${launchPassOf(r.f, undefined)}`,
     ])
@@ -1752,9 +1899,9 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     expect(r.adOrder).toEqual([`kill:${id}`])
     expect(stubCallCount(r.calls)).toBe(1)
     // The steps after the agent-director calls still ran.
-    expect(r.f.trail.slice(-8)).toEqual([
+    expect(r.f.trail.slice(-9)).toEqual([
       `forgetFailures:${r.f.b.key}`, `forgetDisconnectedStreak:${r.f.b.key}`, `forgetNotConnectedEpisode:${r.f.b.key}`,
-      `forgetConflictLatch:${r.f.b.key}`, `forgetNoticeEpisodes:${r.f.b.key}`,
+      `forgetConflictLatch:${r.f.b.key}`, `forgetInvalidFlagsHold:${r.f.b.key}`, `forgetNoticeEpisodes:${r.f.b.key}`,
       `replyGuard.launchedWithDir:${r.f.b.key}`, `replyGuard.teardown:${r.f.b.key}`,
       `replyGuard.launchPass:${launchPassOf(r.f, undefined)}`,
     ])

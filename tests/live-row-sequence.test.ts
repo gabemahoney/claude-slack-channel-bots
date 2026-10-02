@@ -255,6 +255,9 @@ import {
 import { UNPARSEABLE_LAUNCH_START, reuseSpawnScanRows, sequenceResumeConflictRowsAt } from './test-helpers/conflict-cases.ts'
 import { LATCH_ROW_STATE_NO_ROW, REFUSED_OPERATION_RESUME, latchRowStateRead } from '../src/conflict-latch.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
+import { AD_VERSION_RECHECK_STOP_EXIT_CODE } from '../src/ad-version-gate.ts'
+import { errNoSessionId } from './test-helpers/agent-director-stub.ts'
 import { assertNoLeak, isTokenLike, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
 import {
@@ -1347,6 +1350,7 @@ const LAUNCH_ACTION_SUCCEEDS: Readonly<Record<SpawnPersonaResult['action'], bool
   deferred: false,
   latched: false,
   'sequence-waiting': false,
+  held: false,
 }
 
 /** One step-6 reuse outcome (b.jg5 SRJ-112, SRJ-301) as the sequence ends with it. */
@@ -2248,5 +2252,72 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
       spawnNotResumableLine(LIVE_ROW_SEQUENCE_LOG_PREFIX, renderPersonaRef(p, p), describeAgentDirectorFailure(errSpawnNotResumable()), { kind: ROW_REREAD_LATCHED }, undefined, SEQUENCE_NOT_RESUMABLE_LATCHED_OUTCOME),
     ])
     expect([h.triggers, h.controller.armedKeys(), getFailureCount(p)]).toEqual([[], [], 0])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Step 6's reuse answering ErrInvalidFlags (b.jg5 SRJ-112, SRJ-207, SRJ-205)
+// ---------------------------------------------------------------------------
+
+/**
+ * Step 6 reaching the reuse: a reuse step 6 over the row finished at step 3,
+ * or a `resume` step 6 whose no-transcript answer (ErrNoSessionId) goes on to
+ * the reuse; with the launch kind, the calls up to and including the reuse
+ * and whether the persona keeps its conversation.
+ */
+const STEP6_REUSES: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => void, LiveRowSequenceLaunchKind, readonly string[], boolean]> = [
+  ['a reuse step 6 on a finished row', (h, key) => finishedAtRun1(h, key, {}), LIVE_ROW_LAUNCH_REUSE, ['kill', 'get', 'findMissing', 'get', 'spawn'], false],
+  [
+    'a resume step 6 whose ErrNoSessionId fallback reaches the reuse',
+    (h, key) => h.script({ resumeError: errNoSessionId(), getResult: personaRow(h, key, { state: ENDED, claude_session_id: SESSION_ID }) }),
+    LIVE_ROW_LAUNCH_RESUME,
+    ['kill', 'get', 'findMissing', 'get', 'resume', 'spawn'],
+    true,
+  ],
+]
+
+describe('step 6\'s reuse answering ErrInvalidFlags holds P: the sequence ends launched with the held result, nothing armed and one alert; below the floor it ends stopping, with no hold (b.jg5 SRJ-112, SRJ-207, SRJ-205)', () => {
+  test.each(STEP6_REUSES)('%s, the reuse answering ErrInvalidFlags with a passing binary: P held, one alert, nothing armed or counted; no second launch, no further resume, no plain spawn, no kill after it and no delete; Q untouched', async (_label, script, launchKind, calls, keepsConversation) => {
+    const { h, p, q } = build()
+    const rc = h.versionRecheck({ version: PHASE1_RC_VERSION })
+    script(h, p)
+    h.script({ spawnError: errInvalidFlags('spawn') })
+    const order = recordCallOrder(h)
+
+    const outcome = await h.runSequence(p, { lastReadState: LIVE, keepsConversation })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind, result: { key: p, action: 'held' } })
+    expect(outcome.armed).toBeUndefined()
+    expect(order).toEqual([...calls])
+    expect(rc.resolves).toHaveLength(1)
+    expect([h.invalidFlagsHold.heldKeys(), h.invalidFlagsHold.beganUnder(p)]).toEqual([[p], PHASE1_RC_VERSION])
+    expect(h.episodeNotices).toEqual([{ key: p, text: INVALID_FLAGS_HOLD_ALERT_TEXT }])
+    // One reuse, the only spawn: no plain spawn in its place.
+    expectOneReuseOf(h, p)
+    expect(h.stub.calls.resumeCalls).toHaveLength(launchKind === LIVE_ROW_LAUNCH_RESUME ? 1 : 0)
+    expect([h.triggers, h.controller.armedKeys(), getFailureCount(p), h.notices]).toEqual([[], [], 0, []])
+    expect(h.unclassifiedErrorOpen(p)).toBe(false)
+    expect(h.lines.filter((line) => line === liveRowSequenceEndLine(`persona=${p}`, outcome))).toHaveLength(1)
+    expect(h.sequenceRunning(p)).toBe(false)
+    // Only the re-check's own timer is left on the clock.
+    expect(h.clock.pendingCount()).toBe(rc.pendingTimers())
+    expectUntouched(h, q)
+  })
+
+  test.each(STEP6_REUSES)('%s, the reuse answering ErrInvalidFlags with a binary below the floor: the server stops once, the launch ends stopping; no hold, no alert, nothing armed or counted', async (_label, script, launchKind, calls, keepsConversation) => {
+    const { h, p } = build()
+    const rc = h.versionRecheck({ version: OLD_AD_VERSION })
+    script(h, p)
+    h.script({ spawnError: errInvalidFlags('spawn') })
+    const order = recordCallOrder(h)
+
+    const outcome = await h.runSequence(p, { lastReadState: LIVE, keepsConversation })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind, result: { key: p, action: 'failed', stopping: true } })
+    expect(outcome.armed).toBeUndefined()
+    expect(order).toEqual([...calls])
+    expect([rc.resolves.length, rc.stops]).toEqual([1, [AD_VERSION_RECHECK_STOP_EXIT_CODE]])
+    expect([h.invalidFlagsHold.heldKeys(), h.episodeNotices, h.triggers, h.controller.armedKeys(), getFailureCount(p)]).toEqual([[], [], [], [], 0])
+    expect(h.clock.pendingCount()).toBe(0)
   })
 })

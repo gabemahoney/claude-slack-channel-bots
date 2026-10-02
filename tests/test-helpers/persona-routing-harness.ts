@@ -92,9 +92,15 @@
  *     real launch started runs on after its launch call returned; the
  *     harness's own launches are recorded fakes and start none); the
  *     `isLaunchOrApproverRunning` option replaces it;
- *   - held on `ErrInvalidFlags` (`cannot-launch`) and kill failed
- *     (`kill-failed`): the key sets `h.heldOnInvalidFlags` and `h.killFailed`
- *     (seeded by the options of the same names, with persona names);
+ *   - held on `ErrInvalidFlags` (`cannot-launch`): `h.invalidFlagsHold`, one
+ *     real hold built by E23's factory (`createInvalidFlagsHold`) bare, with
+ *     no set reaction, so a set (`h.invalidFlagsHold.set(key, version?)`)
+ *     logs one line to `h.logs` and posts nothing; `forget(key)` is its
+ *     silent end. The routing asks its `isHeld`, as `main()` binds it
+ *     (b.jg5 SRJ-207, SRJ-1011 state 3); the `heldOnInvalidFlags` option
+ *     holds the named personas once the harness is built;
+ *   - kill failed (`kill-failed`): the key sets `h.killFailed` (seeded by the
+ *     option of the same name, with persona names);
  *   - a live-row sequence or old-life wait step running (`restarting`): as
  *     `main()` binds it (b.jg5 SRJ-706), the session manager's
  *     `isLiveRowSequenceRunning` for the key, read at call time (false while
@@ -180,6 +186,7 @@ import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-not
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
 import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
 import { createConflictLatch, type ConflictLatch } from '../../src/conflict-latch.ts'
+import { createInvalidFlagsHold, type InvalidFlagsHold } from '../../src/invalid-flags-hold.ts'
 import {
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
@@ -217,6 +224,7 @@ import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './cred
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 import { errTmuxUnresponsive } from './agent-director-stub.ts'
+import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
 import { conflictForPersona } from './conflict-cases.ts'
 
 /** Default restart delay (seconds): the restart timer fires within a few ms. */
@@ -322,7 +330,16 @@ export const LOST_STATE_SETUPS: Readonly<Record<LostMessageState, LostStateSetup
     pending: false,
     launches: 0,
   },
-  'cannot-launch': { opts: {}, arrange: (h, key) => { h.heldOnInvalidFlags.add(key) }, pending: false, launches: 0 },
+  // E23's set, as a reuse spawn's ErrInvalidFlags whose re-check passed sets it.
+  'cannot-launch': {
+    opts: {},
+    arrange: (h, key) => {
+      h.invalidFlagsHold.set(key, PHASE1_RC_VERSION)
+      arranged(h.invalidFlagsHold.isHeld(key), 'P is not held on ErrInvalidFlags')
+    },
+    pending: false,
+    launches: 0,
+  },
   'kill-failed': { opts: {}, arrange: (h, key) => { h.killFailed.add(key) }, pending: false, launches: 0 },
   // E10's entry: a refusal from a tmux-touching verb starts the condition,
   // with P's retry timer armed (state 5 applies only while it is, b.jg5
@@ -637,7 +654,7 @@ export interface RoutingHarnessOptions {
    * binds it.
    */
   isLaunchOrApproverRunning?: PersonaRoutingDeps['isLaunchOrApproverRunning']
-  /** Names first held on `ErrInvalidFlags` (`h.heldOnInvalidFlags`, `cannot-launch`). */
+  /** Names first held on `ErrInvalidFlags` (`h.invalidFlagsHold`, `cannot-launch`). */
   heldOnInvalidFlags?: readonly string[]
   /** Names whose kill failed first (`h.killFailed`, `kill-failed`). */
   killFailed?: readonly string[]
@@ -701,8 +718,8 @@ export interface RoutingHarness {
   tmuxUnresponsive: TmuxUnresponsiveCondition
   /** Every onset or all-clear the outage state emitted (with the `outageState` option), in order; never a Slack post. */
   outageNotices: RaisedNotice[]
-  /** Keys held on `ErrInvalidFlags` (`cannot-launch`), read at call time. */
-  heldOnInvalidFlags: Set<string>
+  /** The hold the routing's held-on-invalid-flags query reads (`cannot-launch`): E23's factory, bare (no set reaction, so a set posts nothing). */
+  invalidFlagsHold: InvalidFlagsHold
   /** Keys whose kill failed (`kill-failed`), read at call time. */
   killFailed: Set<string>
   /** Keys with a live-row sequence or old-life wait step running (`restarting`), read at call time. */
@@ -847,6 +864,7 @@ export function makeRoutingHarness(
   // only with `outageState`. Every sink records apart from the Slack stubs.
   // (`h` is read only when they are called.)
   const latch = createConflictLatch({ log: (line) => { h.logs.push(line) } })
+  const invalidFlagsHold = createInvalidFlagsHold({ log: (line) => { h.logs.push(line) } })
   const episodesClock = createFakeClock()
   const episodes = createPersonaEpisodes({
     sink: (key, text) => { h.episodeNotices.push({ key, text }) },
@@ -923,7 +941,7 @@ export function makeRoutingHarness(
     episodeNotices: [],
     tmuxUnresponsive,
     outageNotices: [],
-    heldOnInvalidFlags: keySet(opts.heldOnInvalidFlags),
+    invalidFlagsHold,
     killFailed: keySet(opts.killFailed),
     sequenceOrWaitRunning: keySet(opts.sequenceOrWaitRunning),
     workInFlight: keySet(opts.workInFlight),
@@ -1026,9 +1044,11 @@ export function makeRoutingHarness(
     // As main() binds it (b.jg5 SRJ-401): a launch call, or the dialog
     // approver that runs after it returned.
     isLaunchOrApproverRunning: opts.isLaunchOrApproverRunning ?? ((key) => h.isLaunchInFlight(key) || isDialogApproverRunning(key)),
-    // A case's own arrangement of each (production leaves the first unbound
-    // and binds the second to its kill-failure alerts' episode).
-    isHeldOnInvalidFlags: (key) => h.heldOnInvalidFlags.has(key),
+    // As main() binds it (b.jg5 SRJ-207, SRJ-1011 state 3): the one hold's
+    // isHeld, read at call time.
+    isHeldOnInvalidFlags: (key) => h.invalidFlagsHold.isHeld(key) === true,
+    // A case's own arrangement (production binds it to its kill-failure
+    // alerts' episode).
     isKillFailed: (key) => h.killFailed.has(key),
     // As main() binds it (b.jg5 SRJ-706, SRJ-1011): the session manager's
     // running query, read at call time, or a case's own arrangement.
@@ -1050,6 +1070,8 @@ export function makeRoutingHarness(
   })
 
   for (const key of keySet(opts.notUp)) notUp.add(key)
+  // Held under the version a passing re-check reads, once `h` exists (the set logs to it).
+  for (const key of keySet(opts.heldOnInvalidFlags)) invalidFlagsHold.set(key, PHASE1_RC_VERSION)
   initRestart(restartDeps)
   return h
 }

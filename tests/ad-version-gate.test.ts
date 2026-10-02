@@ -12,7 +12,15 @@
  * (`settleHostVersionCall`), the one-line redaction its callers apply
  * (`redactToOneLine`), its client-order comparison and its Phase 1 note; and
  * a source audit of the import-cycle fix (`src/install-check-labels.ts`,
- * every label of which `src/install-check.ts` re-exports).
+ * every label of which `src/install-check.ts` re-exports); and the
+ * `ErrInvalidFlags` hold (`src/invalid-flags-hold.ts`, b.jg5 SRJ-207,
+ * SRJ-1008, AC 23): SRJ-1008's text (written out once, in its pin case), the
+ * hold decision on each re-check answer, the last version seen it begins
+ * under (`lastAdVersionSeen`), one alert per hold episode after the retry
+ * timer's stop, its end on the version-changed signal (with the listener
+ * registered as `main()` registers it, a retry at once for each applied
+ * persona), its other ends (a teardown's forget, shutdown, a server restart)
+ * and the below-floor stop, on a hold composed as `main()` composes it.
  *
  * Every version is built from the floor constant's parts or imported from
  * `tests/test-helpers/agent-director-versions.ts`, so a change to
@@ -62,6 +70,7 @@ import {
   HOST_VERSION_OUTCOME_PASS,
   HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR,
   installAdVersionRecheck,
+  lastAdVersionSeen,
   meetsPhase1Floor,
   onAdVersionChanged,
   onAdVersionRecheckTick,
@@ -94,6 +103,27 @@ import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
 import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { recordStartupError } from '../src/startup-errors.ts'
+import {
+  bindInvalidFlagsHoldSetReaction,
+  createInvalidFlagsHold,
+  decideInvalidFlagsHold,
+  describeHoldVersion,
+  endInvalidFlagsHoldsOnVersionChange,
+  HOLD_VERSION_UNKNOWN,
+  HOLD_VERSION_UNREADABLE,
+  INVALID_FLAGS_HOLD_ALERT_TEXT,
+  INVALID_FLAGS_HOLD_DECISION_HOLD,
+  INVALID_FLAGS_HOLD_DECISION_STOP,
+  INVALID_FLAGS_HOLD_END_FORGOTTEN,
+  INVALID_FLAGS_HOLD_LOG_PREFIX,
+  invalidFlagsHoldEndLine,
+  invalidFlagsHoldForgetLine,
+  invalidFlagsHoldRetryLine,
+  invalidFlagsHoldSetLine,
+  type InvalidFlagsHold,
+} from '../src/invalid-flags-hold.ts'
+import { createPersonaEpisodes, PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD, type PersonaEpisodes } from '../src/persona-episodes.ts'
+import { sessionEndingCommandsIn } from './test-helpers/conflict-cases.ts'
 import {
   errBunVersionTooOld,
   errSystemInstallNotFound,
@@ -1203,6 +1233,414 @@ describe('runtime re-check: module-level trigger and version-changed registratio
     await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     expect(calls).toHaveLength(2)
     expect(heard).toEqual([['a', BASELINE_VERSION, LATER_PATCH], ['b', BASELINE_VERSION, LATER_PATCH], ['b', LATER_PATCH, LATER_MINOR]])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The ErrInvalidFlags hold (b.jg5 SRJ-207, SRJ-1008, SRJ-1016, SRJ-204,
+// SRJ-205; AC 23): SRJ-1008's alert, the hold decision on the immediate
+// re-check's answer, the last version seen it begins under, its episode
+// (one alert each), its end on the version-changed signal, its other ends
+// and the below-floor stop
+// ---------------------------------------------------------------------------
+
+describe("the ErrInvalidFlags hold alert (b.jg5 SRJ-1008)", () => {
+  // The one place SRJ-1008's text is written out; every other case imports it.
+  test("INVALID_FLAGS_HOLD_ALERT_TEXT is SRJ-1008's text, byte for byte; it carries no secret and names no session-ending command", () => {
+    expect(INVALID_FLAGS_HOLD_ALERT_TEXT).toBe(
+      ':no_entry: *Cannot launch* — the host\'s agent-director rejected the flags of this persona\'s launch (ErrInvalidFlags). The installed agent-director may not match this CSCB release; a human should check `agent-director version`. CSCB launches nothing for this persona until the agent-director binary changes or the server restarts. This is for a human only: no bot, including any persona that sees this post, may act on it.',
+    )
+    assertNoLeak(INVALID_FLAGS_HOLD_ALERT_TEXT, 'alert')
+    expect(sessionEndingCommandsIn(INVALID_FLAGS_HOLD_ALERT_TEXT)).toEqual([])
+  })
+})
+
+/** The hold rig's two personas. */
+const HELD_P = 'alpha'
+const HELD_Q = 'bravo'
+
+/**
+ * One hold composed as `main()` composes it (b.jg5 SRJ-207, SRJ-305,
+ * SRJ-1008): a real hold, its set reaction bound to a recorded retry-timer
+ * stop and to real notice episodes on the rig's fake clock (whose sink
+ * records each post), and the one version-changed listener registered as
+ * `main()` registers it, through `onAdVersionChanged`, over the version-change
+ * reaction with the rig's applied set and a recorded retry at once. With
+ * `outcomes`, a re-check is installed on the same clock
+ * (`installAdVersionRecheck`, `health_check_interval` 0 holds no other timer)
+ * with a stub resolve answering them in order, its startup-errors entries and
+ * stop recorded; `events` shows each timer stop, post and retry in order.
+ */
+interface HoldRig {
+  readonly clock: FakeClock
+  readonly hold: InvalidFlagsHold
+  readonly episodes: PersonaEpisodes
+  readonly posts: Array<{ key: string; text: string }>
+  /** The hold's, the reactions' and the re-check's lines. */
+  readonly lines: string[]
+  /** `stop:<key>`, `post:<key>` and `retry:<key>` in the order they happened. */
+  readonly events: string[]
+  /** Each retry at once: the persona and the clock time. */
+  readonly retries: Array<{ key: string; at: number }>
+  readonly applied: Set<string>
+  readonly resolveCalls: Array<object | undefined>
+  readonly records: Array<{ classLabel: string; message: string }>
+  readonly stops: number[]
+}
+
+function makeHoldRig(opts: { outcomes?: readonly StubResolveSystemBinaryOutcome[] } = {}): HoldRig {
+  const clock = createFakeClock()
+  const lines: string[] = []
+  const posts: Array<{ key: string; text: string }> = []
+  const events: string[] = []
+  const retries: Array<{ key: string; at: number }> = []
+  const applied = new Set([HELD_P, HELD_Q])
+  const log = (line: string): void => {
+    lines.push(line)
+  }
+  const episodes = createPersonaEpisodes({
+    sink: (key, text) => {
+      posts.push({ key, text })
+      events.push(`post:${key}`)
+    },
+    log,
+    clock,
+  })
+  const hold = createInvalidFlagsHold({ log })
+  bindInvalidFlagsHoldSetReaction(hold, {
+    stopRetryTimer: (key) => {
+      events.push(`stop:${key}`)
+    },
+    episodes,
+    log,
+  })
+  onAdVersionChanged((_previousVersion, newVersion) => {
+    endInvalidFlagsHoldsOnVersionChange(hold, newVersion, {
+      episodes,
+      isApplied: (key) => applied.has(key),
+      retryAtOnce: (key) => {
+        retries.push({ key, at: clock.now() })
+        events.push(`retry:${key}`)
+      },
+      log,
+    })
+  })
+  const resolveCalls: Array<object | undefined> = []
+  const records: Array<{ classLabel: string; message: string }> = []
+  const stops: number[] = []
+  if (opts.outcomes !== undefined) {
+    installAdVersionRecheck({
+      resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls, outcomes: opts.outcomes }),
+      baselineVersion: BASELINE_VERSION,
+      recordStartupError: (classLabel, message) => {
+        records.push({ classLabel, message })
+      },
+      stop: (exitCode) => {
+        stops.push(exitCode)
+      },
+      log,
+      clock,
+    })
+  }
+  return { clock, hold, episodes, posts, lines, events, retries, applied, resolveCalls, records, stops }
+}
+
+/** The alert as the rig's sink receives it for persona `key`. */
+const alertOf = (key: string): { key: string; text: string } => ({ key, text: INVALID_FLAGS_HOLD_ALERT_TEXT })
+
+/**
+ * Hold persona `key` as a reuse spawn's ErrInvalidFlags holds it: one
+ * immediate re-check (`triggerAdVersionRecheck`), then the hold decision on
+ * its answer with the last version seen (`lastAdVersionSeen`), and a set
+ * unless it decided the stop. Answers the decision.
+ */
+async function holdAsAReuseDoes(rig: HoldRig, key: string): Promise<ReturnType<typeof decideInvalidFlagsHold>> {
+  const decision = decideInvalidFlagsHold(await triggerAdVersionRecheck(), lastAdVersionSeen())
+  if (decision.kind === INVALID_FLAGS_HOLD_DECISION_HOLD) rig.hold.set(key, decision.version)
+  return decision
+}
+
+/** The rig's pending timers are only the re-check's next one, when one is installed and running. */
+function expectOnlyTheRecheckPending(rig: HoldRig, running: boolean): void {
+  expect(rig.clock.pendingCount()).toBe(running ? 1 : 0)
+  if (running) expect(rig.clock.pending()[0]!.delayMs).toBe(AD_VERSION_RECHECK_INTERVAL_MS)
+}
+
+describe('the ErrInvalidFlags hold decision (b.jg5 SRJ-207, SRJ-204, SRJ-205): a pass, a could-not-run and a not-running re-check hold; a stop does not', () => {
+  const PATH = binaryPathFor('hold-decision')
+  test.each([
+    ['a pass holds under the version it found', decideAdVersionRecheckOutcome({ kind: 'resolved', value: { version: LATER_PATCH, path: PATH } }), BASELINE_VERSION, { kind: INVALID_FLAGS_HOLD_DECISION_HOLD, version: LATER_PATCH }],
+    ['could not run (the resolve rejected) holds under the last version seen', decideAdVersionRecheckOutcome({ kind: 'rejected', error: errSystemInstallNotFound() }), BASELINE_VERSION, { kind: INVALID_FLAGS_HOLD_DECISION_HOLD, version: BASELINE_VERSION }],
+    ['could not run (the call timed out) holds under the last version seen', decideAdVersionRecheckOutcome({ kind: 'timed-out', timeLimitMs: AD_VERSION_RECHECK_TIME_LIMIT_MS }), BASELINE_VERSION, { kind: INVALID_FLAGS_HOLD_DECISION_HOLD, version: BASELINE_VERSION }],
+    ['could not run with no last version seen holds under none', decideAdVersionRecheckOutcome({ kind: 'rejected', error: errSystemInstallNotFound() }), undefined, { kind: INVALID_FLAGS_HOLD_DECISION_HOLD }],
+    ['not running (none installed, disposed or stopped: no last version seen) holds under none', NOT_RUNNING, undefined, { kind: INVALID_FLAGS_HOLD_DECISION_HOLD }],
+    ['a stop below the floor does not hold', decideAdVersionRecheckOutcome({ kind: 'resolved', value: { version: OLD_AD_VERSION, path: PATH } }), BASELINE_VERSION, { kind: INVALID_FLAGS_HOLD_DECISION_STOP }],
+    ["a stop on the client's too-old refusal does not hold", decideAdVersionRecheckOutcome({ kind: 'rejected', error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, PATH) }), BASELINE_VERSION, { kind: INVALID_FLAGS_HOLD_DECISION_STOP }],
+  ] as const)('%s', (_label, answer, lastSeen, expected) => {
+    expect(decideInvalidFlagsHold(answer, lastSeen)).toEqual(expected)
+  })
+
+  test('a trigger whose resolve throws at once answers could not run, and the decision holds under the last version seen', async () => {
+    const rig = makeRecheckRig({
+      resolveSystemBinary: () => {
+        throw errSystemInstallNotFound()
+      },
+    })
+    const answer = await rig.recheck.trigger()
+    expect(answer.kind).toBe(RECHECK_OUTCOME_COULD_NOT_RUN)
+    expect(decideInvalidFlagsHold(answer, rig.recheck.lastVersionSeen())).toEqual({ kind: INVALID_FLAGS_HOLD_DECISION_HOLD, version: BASELINE_VERSION })
+    expectNextRecheckArmed(rig)
+  })
+})
+
+describe('lastAdVersionSeen (b.jg5 SRJ-204, SRJ-207): the installed re-check\'s last version seen, none when none runs', () => {
+  test('none with nothing installed; the baseline before any pass; a passing new version after it; unchanged by the same version and by a could-not-run; none after dispose', async () => {
+    expect(lastAdVersionSeen()).toBeUndefined()
+    const clock = createFakeClock()
+    installAdVersionRecheck(installDeps(clock, [], [], [{ version: LATER_PATCH }, { version: LATER_PATCH }, { throws: errSystemInstallNotFound() }]))
+    expect(lastAdVersionSeen()).toBe(BASELINE_VERSION)
+    await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(lastAdVersionSeen()).toBe(LATER_PATCH)
+    await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(lastAdVersionSeen()).toBe(LATER_PATCH)
+    await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(lastAdVersionSeen()).toBe(LATER_PATCH)
+    disposeAdVersionRecheck()
+    expect(lastAdVersionSeen()).toBeUndefined()
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test('none once a stop ended the re-check', async () => {
+    const clock = createFakeClock()
+    installAdVersionRecheck(installDeps(clock, [], [], [{ version: OLD_AD_VERSION }]))
+    expect((await triggerAdVersionRecheck()).kind).toBe(RECHECK_OUTCOME_STOP)
+    expect(lastAdVersionSeen()).toBeUndefined()
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test('isRunning: false before start, true from start, false after dispose or a stop', async () => {
+    const idle = makeRecheckRig({ start: false })
+    expect(idle.recheck.isRunning()).toBe(false)
+    idle.recheck.start()
+    expect(idle.recheck.isRunning()).toBe(true)
+    idle.recheck.dispose()
+    expect(idle.recheck.isRunning()).toBe(false)
+    const stopped = makeRecheckRig({ outcomes: [{ version: OLD_AD_VERSION }] })
+    await stopped.recheck.trigger()
+    expect(stopped.recheck.isRunning()).toBe(false)
+    expect(stopped.clock.pendingCount()).toBe(0)
+  })
+})
+
+describe('the ErrInvalidFlags hold episode (b.jg5 SRJ-207, SRJ-1008, SRJ-1016, SRJ-305): one alert per episode, after the retry timer stop', () => {
+  test('holding P stops its timer, then posts the alert once at P; a second set while held changes nothing; Q\'s hold posts its own; ending P and holding it again posts one new alert', async () => {
+    const rig = makeHoldRig()
+
+    expect(rig.hold.set(HELD_P, BASELINE_VERSION)).toBe(true)
+    await rig.clock.flush()
+    expect(rig.events).toEqual([`stop:${HELD_P}`, `post:${HELD_P}`])
+    expect(rig.posts).toEqual([alertOf(HELD_P)])
+    expect(rig.episodes.isOpen(HELD_P, PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD)).toBe(true)
+    expect(rig.lines).toEqual([invalidFlagsHoldSetLine(HELD_P, BASELINE_VERSION)])
+
+    expect(rig.hold.set(HELD_P, BASELINE_VERSION)).toBe(false)
+    expect(rig.hold.set(HELD_P, LATER_PATCH)).toBe(false)
+    await rig.clock.flush()
+    expect(rig.posts).toEqual([alertOf(HELD_P)])
+    expect(rig.events).toHaveLength(2)
+    expect(rig.hold.beganUnder(HELD_P)).toBe(BASELINE_VERSION)
+
+    expect(rig.hold.set(HELD_Q, BASELINE_VERSION)).toBe(true)
+    await rig.clock.flush()
+    expect(rig.posts).toEqual([alertOf(HELD_P), alertOf(HELD_Q)])
+
+    // The holds end (the binary changed), silently; a new ErrInvalidFlags begins a new episode.
+    expect(endInvalidFlagsHoldsOnVersionChange(rig.hold, LATER_PATCH, { episodes: rig.episodes, isApplied: () => false, retryAtOnce: () => undefined, log: () => {} })).toEqual([HELD_P, HELD_Q])
+    expect(rig.posts).toHaveLength(2)
+    expect(rig.hold.set(HELD_P, LATER_PATCH)).toBe(true)
+    await rig.clock.flush()
+    expect(rig.posts).toEqual([alertOf(HELD_P), alertOf(HELD_Q), alertOf(HELD_P)])
+    expect(rig.clock.pendingCount()).toBe(0)
+    assertNoLeak({ lines: rig.lines, posts: rig.posts })
+  })
+
+  test('after the episodes close (shutdown) a set posts nothing; it still stops the timer', async () => {
+    const rig = makeHoldRig()
+    rig.episodes.close()
+    expect(rig.hold.set(HELD_P, BASELINE_VERSION)).toBe(true)
+    await rig.clock.flush()
+    expect(rig.events).toEqual([`stop:${HELD_P}`])
+    expect(rig.posts).toEqual([])
+    expect(rig.clock.pendingCount()).toBe(0)
+  })
+
+  test('a timer stop that throws is logged token-safely and the alert is still posted once', async () => {
+    const clock = createFakeClock()
+    const posts: Array<{ key: string; text: string }> = []
+    const lines: string[] = []
+    const episodes = createPersonaEpisodes({ sink: (key, text) => { posts.push({ key, text }) }, log: (line) => { lines.push(line) }, clock })
+    const hold = createInvalidFlagsHold({ log: (line) => { lines.push(line) } })
+    bindInvalidFlagsHoldSetReaction(hold, {
+      stopRetryTimer: () => {
+        throw new Error(`stop broke (${sentinelInMessage('hold-stop')})`)
+      },
+      episodes,
+      log: (line) => { lines.push(line) },
+    })
+    hold.set(HELD_P, BASELINE_VERSION)
+    await clock.flush()
+    expect(posts).toEqual([alertOf(HELD_P)])
+    expect(lines.filter((line) => line.startsWith(`${INVALID_FLAGS_HOLD_LOG_PREFIX} persona=${HELD_P} retry timer stop failed: `))).toHaveLength(1)
+    assertNoLeak(lines, 'lines')
+    expect(clock.pendingCount()).toBe(0)
+  })
+
+  test('a version that is not a short version string is logged as unreadable, so no other text reaches a line', () => {
+    const lines: string[] = []
+    const hold = createInvalidFlagsHold({ log: (line) => { lines.push(line) } })
+    const odd = `${LEAK_SENTINEL} ${fakeToken(BOT_TOKEN_PREFIX, 'hold')}`
+    hold.set(HELD_P, odd)
+    expect(lines).toEqual([invalidFlagsHoldSetLine(HELD_P, odd)])
+    expect(lines[0]).toContain(HOLD_VERSION_UNREADABLE)
+    expect(describeHoldVersion(undefined)).toBe(HOLD_VERSION_UNKNOWN)
+    assertNoLeak(lines, 'lines')
+  })
+})
+
+describe('the ErrInvalidFlags hold ends on the version-changed signal (b.jg5 SRJ-207, SRJ-204): a re-check passing with a version other than the one a hold began under ends it, silently, and retries the persona at once; the same version or a could-not-run keeps it', () => {
+  test('a timed re-check passing with the same version keeps every hold; a could-not-run keeps them; a pass with a different version ends every hold, posts nothing, and retries each applied persona at once, at the re-check\'s time', async () => {
+    const rig = makeHoldRig({ outcomes: [{ version: BASELINE_VERSION }, { throws: errSystemInstallNotFound() }, { version: LATER_PATCH }] })
+    rig.hold.set(HELD_P, BASELINE_VERSION)
+    rig.hold.set(HELD_Q, BASELINE_VERSION)
+    await rig.clock.flush()
+    const posts = [...rig.posts]
+
+    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(rig.hold.heldKeys()).toEqual([HELD_P, HELD_Q])
+    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(rig.hold.heldKeys()).toEqual([HELD_P, HELD_Q])
+    expect(rig.retries).toEqual([])
+
+    const due = rig.clock.pending()[0]!.dueAt
+    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(rig.resolveCalls).toHaveLength(3)
+    expect(rig.hold.heldKeys()).toEqual([])
+    expect(rig.posts).toEqual(posts)
+    for (const key of [HELD_P, HELD_Q]) {
+      expect(rig.episodes.isOpen(key, PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD)).toBe(false)
+      expect(rig.lines.filter((line) => line === invalidFlagsHoldEndLine(key, BASELINE_VERSION, LATER_PATCH))).toHaveLength(1)
+      expect(rig.lines.filter((line) => line === invalidFlagsHoldRetryLine(key, true))).toHaveLength(1)
+    }
+    expect(rig.retries).toEqual([{ key: HELD_P, at: due }, { key: HELD_Q, at: due }])
+    expectOnlyTheRecheckPending(rig, true)
+    assertNoLeak({ lines: rig.lines, posts: rig.posts })
+  })
+
+  test('a triggered re-check with a different version ends them too, at once', async () => {
+    const rig = makeHoldRig({ outcomes: [{ version: LATER_MINOR }] })
+    rig.hold.set(HELD_P, BASELINE_VERSION)
+    const now = rig.clock.now()
+    expect((await triggerAdVersionRecheck()).kind).toBe(RECHECK_OUTCOME_PASS)
+    expect(rig.hold.isHeld(HELD_P)).toBe(false)
+    expect(rig.retries).toEqual([{ key: HELD_P, at: now }])
+    expectOnlyTheRecheckPending(rig, true)
+  })
+
+  test('a hold begun right after the immediate re-check that reported a new version stays held: it began under that version, which later re-checks keep finding', async () => {
+    const rig = makeHoldRig({ outcomes: [{ version: LATER_PATCH }] })
+    expect(await holdAsAReuseDoes(rig, HELD_P)).toEqual({ kind: INVALID_FLAGS_HOLD_DECISION_HOLD, version: LATER_PATCH })
+    expect(rig.hold.beganUnder(HELD_P)).toBe(LATER_PATCH)
+    await rig.clock.advance(3 * AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(rig.resolveCalls).toHaveLength(4)
+    expect(rig.hold.isHeld(HELD_P)).toBe(true)
+    expect(rig.retries).toEqual([])
+    await rig.clock.flush()
+    expect(rig.posts).toEqual([alertOf(HELD_P)])
+    expectOnlyTheRecheckPending(rig, true)
+  })
+
+  test('a hold that began under no version (its re-check not running) ends at the first version change', async () => {
+    const rig = makeHoldRig()
+    expect(await holdAsAReuseDoes(rig, HELD_P)).toEqual({ kind: INVALID_FLAGS_HOLD_DECISION_HOLD })
+    expect(rig.hold.beganUnder(HELD_P)).toBeUndefined()
+    const clock = createFakeClock()
+    installAdVersionRecheck(installDeps(clock, [], [], [{ version: BASELINE_VERSION }, { version: LATER_PATCH }]))
+    await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(rig.hold.isHeld(HELD_P)).toBe(true)
+    await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(rig.hold.isHeld(HELD_P)).toBe(false)
+    expect(rig.lines.filter((line) => line === invalidFlagsHoldEndLine(HELD_P, undefined, LATER_PATCH))).toHaveLength(1)
+    expect(rig.retries).toHaveLength(1)
+    expectOnlyTheRecheckPending(rig, false)
+  })
+
+  test('a persona no longer applied is not retried when its hold ends; one line says so', async () => {
+    const rig = makeHoldRig({ outcomes: [{ version: LATER_PATCH }] })
+    rig.hold.set(HELD_P, BASELINE_VERSION)
+    rig.hold.set(HELD_Q, BASELINE_VERSION)
+    rig.applied.delete(HELD_Q)
+    await triggerAdVersionRecheck()
+    expect(rig.hold.heldKeys()).toEqual([])
+    expect(rig.retries.map((retry) => retry.key)).toEqual([HELD_P])
+    expect(rig.lines.filter((line) => line === invalidFlagsHoldRetryLine(HELD_Q, false))).toHaveLength(1)
+  })
+})
+
+describe('the ErrInvalidFlags hold\'s other ends (b.jg5 SRJ-207, SRJ-715): a teardown\'s forget and a server restart', () => {
+  test('forgetting P ends P\'s hold silently (no post, no retry) and keeps Q\'s; P held again posts one new alert', async () => {
+    const rig = makeHoldRig()
+    const ends: Array<{ key: string; reason: string }> = []
+    rig.hold.addEndObserver(({ key, reason }) => {
+      ends.push({ key, reason })
+    })
+    rig.hold.set(HELD_P, BASELINE_VERSION)
+    rig.hold.set(HELD_Q, BASELINE_VERSION)
+    await rig.clock.flush()
+    const posts = [...rig.posts]
+
+    expect(rig.hold.forget(HELD_P)).toBe(true)
+    expect(rig.hold.forget(HELD_P)).toBe(false)
+    rig.episodes.forget(HELD_P)
+    await rig.clock.flush()
+    expect(rig.hold.heldKeys()).toEqual([HELD_Q])
+    expect(ends).toEqual([{ key: HELD_P, reason: INVALID_FLAGS_HOLD_END_FORGOTTEN }])
+    expect(rig.posts).toEqual(posts)
+    expect(rig.retries).toEqual([])
+    expect(rig.lines.filter((line) => line === invalidFlagsHoldForgetLine(HELD_P, BASELINE_VERSION))).toHaveLength(1)
+
+    rig.hold.set(HELD_P, BASELINE_VERSION)
+    await rig.clock.flush()
+    expect(rig.posts).toEqual([...posts, alertOf(HELD_P)])
+    expect(rig.clock.pendingCount()).toBe(0)
+  })
+
+  test('forgetAll (shutdown) ends every hold silently; a new hold instance (a server restart) holds no persona', () => {
+    const rig = makeHoldRig()
+    rig.hold.set(HELD_P, BASELINE_VERSION)
+    rig.hold.set(HELD_Q)
+    expect(rig.hold.forgetAll()).toEqual([HELD_P, HELD_Q])
+    expect(rig.hold.heldKeys()).toEqual([])
+    const restarted = createInvalidFlagsHold({ log: () => {} })
+    expect([restarted.heldKeys(), restarted.isHeld(HELD_P), restarted.isHeld(HELD_Q)]).toEqual([[], false, false])
+    expect(rig.clock.pendingCount()).toBe(0)
+  })
+})
+
+describe('the ErrInvalidFlags hold below the floor (b.jg5 SRJ-205, AC 23): a reuse\'s re-check answering stop holds nothing', () => {
+  test('one startup-errors entry of the exported class and one non-zero stop; no hold, no alert, no timer stop, and no further agent-director call', async () => {
+    const rig = makeHoldRig({ outcomes: [{ version: OLD_AD_VERSION, path: binaryPathFor('hold-below-floor') }] })
+
+    expect(await holdAsAReuseDoes(rig, HELD_P)).toEqual({ kind: INVALID_FLAGS_HOLD_DECISION_STOP })
+
+    expect(rig.records.map((record) => record.classLabel)).toEqual([AD_BELOW_PHASE1_FLOOR])
+    expect(rig.stops).toEqual([AD_VERSION_RECHECK_STOP_EXIT_CODE])
+    expect(rig.stops[0]).not.toBe(0)
+    expect([rig.hold.heldKeys(), rig.posts, rig.events]).toEqual([[], [], []])
+    // The re-check ended with the stop: no timed re-check, and a later trigger calls nothing.
+    await rig.clock.advance(3 * AD_VERSION_RECHECK_INTERVAL_MS)
+    expect(await triggerAdVersionRecheck()).toEqual(NOT_RUNNING)
+    expect(rig.resolveCalls).toHaveLength(1)
+    expectOnlyTheRecheckPending(rig, false)
   })
 })
 

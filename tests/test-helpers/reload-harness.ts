@@ -377,13 +377,30 @@
  * ladder spawn or `resume` latches the persona (its launch record's `action`
  * is `latched`, with one CONFLICT notice to its destination) and a latched
  * persona's launch makes no agent-director call. The composition's
- * `forgetConflictLatch` and `forgetNoticeEpisodes` are the latch's and the
- * episodes' `forget`, in the teardown's order. `run.latch` reads it
+ * `forgetConflictLatch`, `forgetInvalidFlagsHold` and `forgetNoticeEpisodes`
+ * are the latch's, the hold's (below) and the episodes' `forget`, in the
+ * teardown's order. `run.latch` reads it
  * (`isLatched`, `record`). The latch is per run: a later run (a server
  * restart) and another harness start with none. The holds `main()` binds
  * before the notice are not bound (a run has no retry controller,
  * tmux-unresponsive condition or unclassified-error episode), and
  * `run.stop()` closes the episodes as `main()`'s shutdown does.
+ *
+ * The `ErrInvalidFlags` hold (b.jg5 SRJ-207, SRJ-1008): every run builds, as
+ * `main()` does, one hold (`createInvalidFlagsHold`, its lines to
+ * `run.logs`) with its set reaction bound to the run's episodes
+ * (`bindInvalidFlagsHoldSetReaction`: a new hold posts SRJ-1008's alert once
+ * through the run's notifier, recorded in `run.episodeNotices`; the reaction's
+ * retry-timer stop stops nothing, as a run has no retry controller). A
+ * realLaunch run installs it in the session manager (`setInvalidFlagsHold`)
+ * beside the latch, so a reuse spawn's `ErrInvalidFlags` holds the persona
+ * (its launch record's `action` is `held`; no version re-check is installed,
+ * so the re-check answers not running and the hold begins under no version)
+ * and a held persona's launch makes no agent-director call. The
+ * composition's `forgetInvalidFlagsHold` is the hold's `forget`, right after
+ * the latch's. `run.invalidFlagsHold` reads it (`isHeld`, `beganUnder`). The
+ * hold is per run: a later run (a server restart) and another harness start
+ * with none; `h.cleanup()` removes the install.
  *
  * Step 5 (b.av2 SR-8.6): with the real composition the refresh calls the
  * stub's `makeTemplate` (params on `run.composition.agentDirector
@@ -419,7 +436,7 @@
  * process's agent-director client — through it the startup-dialog approver
  * reads and types; the prompt-row checks only read —, the approver's 200 ms
  * cap, the spawn home, the trust patcher, the reply guard, the claude_config_dir hook, the
- * session notifier, the latch, the configured-persona query) and captures
+ * session notifier, the latch, the `ErrInvalidFlags` hold, the configured-persona query) and captures
  * `console.error`; `h.cleanup()` first stops every dialog approver a launch
  * started (it runs on its own after the launch call, b.jg5 SRJ-401), then
  * resets and restores them. No launch is a startup launch, so nothing resolves the
@@ -503,6 +520,7 @@ import { resetClientForTests, setClientForTests } from '../../src/agent-director
 import { buildTemplateParams, type TemplateRefreshResult } from '../../src/agent-director-template.ts'
 import { bindConflictNotice, createConflictLatch, type ConflictLatch } from '../../src/conflict-latch.ts'
 import { createPersonaEpisodes } from '../../src/persona-episodes.ts'
+import { bindInvalidFlagsHoldSetReaction, createInvalidFlagsHold, type InvalidFlagsHold } from '../../src/invalid-flags-hold.ts'
 import {
   LIVE_ROW_SEQUENCE_ENTRY_KILL,
   LIVE_ROW_START_STARTED,
@@ -546,6 +564,7 @@ import {
   _resetDialogReadyTimeoutMs,
   _resetFindMissingMemo,
   _resetInFlightLaunches,
+  _resetInvalidFlagsHold,
   _resetLiveRowSequenceRegistry,
   _resetPreLaunchReplyGuard,
   _resetPreLaunchTrustPatcher,
@@ -563,6 +582,7 @@ import {
   setConfigDirUnresolvableHook,
   setConfiguredPersonaQuery,
   setConflictLatch,
+  setInvalidFlagsHold,
   setLiveRowSequenceRegistry,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
@@ -919,7 +939,7 @@ export interface RealLifecycleComposition {
    * `'destinationHold.cancel'`, `'notifier.forget'`, `'forgetPersonaPrompts'`,
    * `'dropSession'`, `'resetOutageState'`, `'killInstance'`,
    * `'deleteInstance'`, `'forgetFailures'`, `'forgetDisconnectedStreak'`,
-   * `'forgetConflictLatch'`, `'forgetNoticeEpisodes'`, `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
+   * `'forgetConflictLatch'`, `'forgetInvalidFlagsHold'`, `'forgetNoticeEpisodes'`, `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
    * `'replyGuard.launchPass'`, `'storageCheck'`, `'bringUps.bringUp'`,
    * `'bringUps.changeCredentials'`, `'connections.reconnectCredentials'`,
    * `'connections.replaceRetryTokens'`, `'launch'`) plus `'outage-notice'`
@@ -1412,6 +1432,9 @@ export interface ReloadRunOptions {
 /** A run's latch, read-only: the latched query and the record. */
 export type ReloadLatchView = Pick<ConflictLatch, 'isLatched' | 'record'>
 
+/** A run's `ErrInvalidFlags` hold, read-only: the held query and the version a hold began under. */
+export type ReloadInvalidFlagsHoldView = Pick<InvalidFlagsHold, 'isHeld' | 'beganUnder'>
+
 /** One server start over the harness's files; see the file comment. */
 export interface ReloadRun {
   /** The real reload controller. */
@@ -1648,9 +1671,17 @@ export interface ReloadRun {
    */
   readonly latch: ReloadLatchView
   /**
+   * The run's one `ErrInvalidFlags` hold, read-only (`isHeld`, `beganUnder`;
+   * b.jg5 SRJ-207): a real launch's reuse spawn answering `ErrInvalidFlags`
+   * sets it, the teardown's `forgetInvalidFlagsHold` forgets the key, and a
+   * later run starts with none (a server restart ends every hold).
+   */
+  readonly invalidFlagsHold: ReloadInvalidFlagsHoldView
+  /**
    * Every post of the run's notice episodes (the CONFLICT notice's body,
-   * b.jg5 SRJ-1004), by persona key, in order, as handed to the run's
-   * notifier (which posts it to the persona's destination).
+   * b.jg5 SRJ-1004, and the `ErrInvalidFlags` hold's alert, SRJ-1008), by
+   * persona key, in order, as handed to the run's notifier (which posts it
+   * to the persona's destination).
    */
   readonly episodeNotices: ReadonlyArray<{ readonly key: string; readonly text: string }>
   /** Stop detection (`controller.stopDetection()`, which stops `run.ticks`), cancel every bring-up retry and stop every connection. Idempotent. */
@@ -2178,6 +2209,12 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     })
     const latch = createConflictLatch({ log })
     bindConflictNotice(latch, episodes)
+    // As main() builds it (b.jg5 SRJ-207, SRJ-1008): the run's one
+    // ErrInvalidFlags hold, in memory only, its set reaction bound to the
+    // run's episodes (one alert per hold episode). The run has no UNAVAILABLE
+    // retry controller, so the reaction's timer stop stops nothing.
+    const invalidFlagsHold = createInvalidFlagsHold({ log })
+    bindInvalidFlagsHoldSetReaction(invalidFlagsHold, { stopRetryTimer: () => {}, episodes, log })
     // server.ts's getReplySettings: config.ts's replySettingsOf over
     // `personaConfig` at call time, so after an apply the start's values
     // (configInEffect). No ack reaction unless the start's config sets one.
@@ -2393,6 +2430,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         // forgets the key silently, then the run's episodes end every kind of
         // the key's episode (its CONFLICT episode included), silently.
         forgetConflictLatch: rec('forgetConflictLatch', (key) => latch.forget(key)),
+        // As main() binds it (b.jg5 SRJ-207, SRJ-715): the run's hold forgets
+        // the key silently (no post, no retry), right after its latch.
+        forgetInvalidFlagsHold: rec('forgetInvalidFlagsHold', (key) => invalidFlagsHold.forget(key)),
         forgetNoticeEpisodes: rec('forgetNoticeEpisodes', (key) => episodes.forget(key)),
         resetOutageState: (keys) => {
           for (const key of keys) calls.push(['resetOutageState', key])
@@ -3030,6 +3070,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       sequenceRunning: (name) => isLiveRowSequenceRunning(personaKey(name)),
       sessionNotices,
       latch: Object.freeze({ isLatched: (key: string) => latch.isLatched(key), record: (key: string) => latch.record(key) }),
+      invalidFlagsHold: Object.freeze({
+        isHeld: (key: string) => invalidFlagsHold.isHeld(key),
+        beganUnder: (key: string) => invalidFlagsHold.beganUnder(key),
+      }),
       episodeNotices,
       async stop() {
         if (stopped) return
@@ -3080,6 +3124,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // the collision ladder latches through the run's latch on a CONFLICT at
       // a spawn or resume, and launches no latched persona.
       setConflictLatch(latch)
+      // As main() installs it beside the latch (b.jg5 SRJ-207): a reuse
+      // spawn's ErrInvalidFlags holds the persona through the run's hold, and
+      // no held persona's launch makes an agent-director call.
+      setInvalidFlagsHold(invalidFlagsHold)
       // As main() installs it beside the latch (b.jg5 SRJ-114): a key counts
       // as configured while the run's applied configuration holds it, read at
       // each call, so a note on a configured persona's own row latches it.
@@ -3406,6 +3454,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           setConfigDirUnresolvableHook(undefined)
           setSessionNotifier(undefined)
           setConflictLatch(undefined)
+          _resetInvalidFlagsHold()
           _resetConfiguredPersonaQuery()
           _resetLiveRowSequenceRegistry()
         }

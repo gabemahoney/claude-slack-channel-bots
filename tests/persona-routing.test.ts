@@ -986,7 +986,7 @@ describe('lost-message row read: gating and isolation in the pipeline (b.jg5 SRJ
       {},
       (h, key) => { h.latch.set(key, { latchCase: HOLD_LATCH_CASES[0], refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE }) },
     ],
-    ['cannot-launch', 'it is held on ErrInvalidFlags', {}, (h, key) => { h.heldOnInvalidFlags.add(key) }],
+    ['cannot-launch', 'it is held on ErrInvalidFlags', {}, (h, key) => { h.invalidFlagsHold.set(key) }],
     ['kill-failed', 'its kill failed', {}, (h, key) => { h.killFailed.add(key) }],
     [
       'not-answering',

@@ -49,6 +49,14 @@
  * and the new half latches, with one post to its own destination, only if its
  * own spawn meets the same refusal.
  *
+ * The `ErrInvalidFlags` hold block (b.jg5 SRJ-207, SRJ-715) holds a persona
+ * through the real launch path (a relaunch over a row finished in another
+ * directory replaces it by a reuse spawn, which answers `ErrInvalidFlags`),
+ * then destructively modifies it, and reads the run's hold
+ * (`run.invalidFlagsHold`), its alert (`run.episodeNotices`) and the posts:
+ * the old half's teardown forgets the hold silently and the new half's
+ * launch reaches agent-director.
+ *
  * The AC 20 block (b.av2 SR-10.3, apply side) drives every apply-time Slack
  * contact, a locally invalid confirmed credentials file, a rejected Web API
  * call, a failing teardown step, both step-5 outcomes, a held reconnect and
@@ -90,7 +98,8 @@ import type { InPlaceSetting } from '../src/reload-plan.ts'
 import { RELOAD_APPLIED, RELOAD_NOOP } from '../src/reload.ts'
 import { personaConfigDirLabelValue } from '../src/session-manager.ts'
 import { REFUSED_OPERATION_PLAIN_SPAWN } from '../src/conflict-latch.ts'
-import { cannedErr, cannedFindMissing, errTemplateMalformed, stubCallCount, type FindMissingHold, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
+import { cannedErr, cannedFindMissing, errInvalidFlags, errTemplateMalformed, stubCallCount, type FindMissingHold, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
+import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import { LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_OUTCOME_LAUNCHED, LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_TEARDOWN, type LiveRowSequenceOutcome } from '../src/live-row-sequence.ts'
 import { CONFLICT_CASE_ROWS } from './test-helpers/conflict-cases.ts'
 import {
@@ -2871,6 +2880,83 @@ describe('b.jg5 SRJ-504: a destructive modify does not carry a latch over to its
     expect(run.isUp('bravo')).toBe(true)
     // alpha: never latched, no lifecycle record, dependency call, agent-director call or Slack activity.
     expect(run.latch.isLatched(alphaKey)).toBe(false)
+    alphaUntouched()
+    expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+    expect(adCallsSince(run, adFrom).filter((c) => c.id !== bravoId)).toEqual([])
+    await expectNothingPendingAfter(run)
+    assertNoLeak(run.captured())
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A destructive modify of a persona held on ErrInvalidFlags (b.jg5 SRJ-207, SRJ-715)
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-207, SRJ-715: a destructive modify ends a held persona\'s ErrInvalidFlags hold at its old half\'s teardown, so its new half launches unheld, with no alert (real launch)', () => {
+  beforeEach(useConfigDirs)
+
+  test("bravo, held because its relaunch's reuse spawn answered ErrInvalidFlags, is destructively modified (working directory moved): the old half's teardown forgets the hold and posts nothing, the new half's bring-up launches bravo (not refused as held), and alpha gets no call", async () => {
+    const spawnQueue: SpawnQueue = []
+    const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { spawnQueue } })
+    const [alpha, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const bravoId = personaInstanceId(bravoKey)
+    expect(run.invalidFlagsHold.isHeld(bravoKey)).toBe(false)
+
+    // Hold bravo: its row finished in another directory, so its relaunch
+    // replaces the row by a reuse spawn of the same id, which answers
+    // ErrInvalidFlags. No version re-check is installed (it answers not
+    // running), so bravo is held under no version; one alert.
+    h.seedRow(bravo!, { state: 'ended', cwd: join(dirname(bravo!.working_directory), 'elsewhere') })
+    spawnQueue.push(cannedErr(errInvalidFlags('spawn')))
+    const heldFrom = run.composition!.instanceCallsOf('bravo').length
+    expect(await run.relaunch('bravo')).toBe('skipped')
+    await turns()
+    expect(instanceCallsSince(run, 'bravo', heldFrom).at(-1)).toBe('reuse-spawn ErrInvalidFlags')
+    expect(instanceCallsSince(run, 'bravo', heldFrom).filter((c) => c.startsWith('kill') || c.startsWith('delete'))).toEqual([])
+    expect(run.invalidFlagsHold.isHeld(bravoKey)).toBe(true)
+    expect(run.invalidFlagsHold.beganUnder(bravoKey)).toBeUndefined()
+    expect(run.episodeNotices).toEqual([{ key: bravoKey, text: INVALID_FLAGS_HOLD_ALERT_TEXT }])
+    // While held, a further relaunch makes no agent-director call.
+    const whileHeld = run.composition!.instanceCallsOf('bravo').length
+    expect(await run.relaunch('bravo')).toBe('skipped')
+    expect(instanceCallsSince(run, 'bravo', whileHeld)).toEqual([])
+
+    const moved = movedDirectory(bravo!)
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const callsFrom = run.composition!.calls.length
+    const noticesFrom = run.episodeNotices.length
+    const postsFrom = run.slackPosts().length
+    const gate = run.lifecycle.hold('bring-up', bravoKey)
+    const cp = run.checkpoint()
+
+    const { applying } = await confirmConfig(run, [alpha!, moved])
+    await gate.entered
+    // Between the halves: the teardown forgot the hold, silently.
+    expect(run.invalidFlagsHold.isHeld(bravoKey)).toBe(false)
+    expect(run.episodeNotices.slice(noticesFrom)).toEqual([])
+    expect(run.slackPosts().slice(postsFrom)).toEqual([])
+    gate.release()
+    await applying
+    await turns()
+
+    // One teardown and one bring-up for bravo; its launch reached agent-director and brought it up.
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: bravoKey, via: 'apply' },
+      { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: bravoKey, via: 'apply', action: 'spawned' },
+    ])
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'delete ok', 'spawn ok'])
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, cwd: moved.working_directory })
+    expect(run.composition!.calls.slice(callsFrom).filter(([member]) => member === 'forgetInvalidFlagsHold')).toEqual([['forgetInvalidFlagsHold', bravoKey]])
+    expect(run.invalidFlagsHold.isHeld(bravoKey)).toBe(false)
+    expect(run.episodeNotices.slice(noticesFrom)).toEqual([])
+    expect(run.slackPosts().slice(postsFrom)).toEqual([])
+    expect(run.isUp('bravo')).toBe(true)
+    // alpha: never held, no lifecycle record, dependency call, agent-director call or Slack activity.
+    expect(run.invalidFlagsHold.isHeld(alphaKey)).toBe(false)
     alphaUntouched()
     expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
     expect(adCallsSince(run, adFrom).filter((c) => c.id !== bravoId)).toEqual([])

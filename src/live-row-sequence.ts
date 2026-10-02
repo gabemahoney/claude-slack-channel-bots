@@ -33,7 +33,7 @@
  *      of the same id (`decideLiveRowLaunchKind`), made through the session
  *      manager's sequence-launch entry, whose reuse is the session manager's
  *      one reuse spawn (SRJ-112). A launch whose result is no success
- *      (`liveRowLaunchSucceeded`: `failed`, `deferred`, `latched`), a reuse
+ *      (`liveRowLaunchSucceeded`: `failed`, `deferred`, `latched`, `held`), a reuse
  *      that collided with a live row (not launched, `reuse-collision`), a
  *      `resume` that answered `ErrSpawnNotResumable` (not launched, after the
  *      entry's one re-read of the row: `not-resumable` for a lost race,
@@ -79,7 +79,8 @@
  * included, whether or not the launch's own refusal handling armed it too; a
  * stop for a latch, a teardown, shutdown or a persona that is not up, an
  * abort that latched P, an abort whose version re-check stops the server, a
- * launch that latched P or whose version re-check stops the server, a
+ * launch that latched P, held it on `ErrInvalidFlags` (SRJ-207) or whose
+ * version re-check stops the server, a
  * launch whose `ErrTmuxSessionCreate` armed the timer in pending-only mode
  * itself (SRJ-112, SRJ-113, SRJ-409), and the no-launch form arm nothing
  * here. Nothing here counts a failure: the session manager's
@@ -443,8 +444,8 @@ export const LIVE_ROW_LAUNCH_ANSWER_LAUNCHED = 'launched'
 /**
  * The launch results that are a success: the session manager's launch result
  * actions that leave P's session running (`launchSession` maps each to true).
- * Every other answer of a launch call (`failed`, `deferred`, `latched`) ends
- * the sequence without its launch.
+ * Every other answer of a launch call (`failed`, `deferred`, `latched`,
+ * `held`) ends the sequence without its launch.
  */
 export const LIVE_ROW_LAUNCH_SUCCESS_ACTIONS: ReadonlySet<string> = new Set([
   'spawned',
@@ -458,6 +459,13 @@ export const LIVE_ROW_LAUNCH_SUCCESS_ACTIONS: ReadonlySet<string> = new Set([
 
 /** The launch result action of a latched P: the launch latched it, or found it latched. */
 export const LIVE_ROW_LAUNCH_RESULT_LATCHED = 'latched'
+
+/**
+ * The launch result action of a P held on `ErrInvalidFlags` (SRJ-207): the
+ * launch's reuse spawn held it, or the launch found it held. The sequence
+ * ends with nothing armed, as for a latch: the hold stops P's retry timer.
+ */
+export const LIVE_ROW_LAUNCH_RESULT_HELD = 'held'
 
 /** Whether a launch call's result is a success (`LIVE_ROW_LAUNCH_SUCCESS_ACTIONS`). */
 export function liveRowLaunchSucceeded(result: LiveRowSequenceLaunchResult): boolean {
@@ -1080,8 +1088,9 @@ export async function runLiveRowSequence(
   /**
    * The retry cause an end arms with (SRJ-301, SRJ-717), or none. A step-6
    * launch whose result is no success ends without the launch and arms with
-   * the other-end cause (SRJ-301, SRJ-112, SRJ-113), unless P latched, the
-   * result says the server is stopping, or the launch's
+   * the other-end cause (SRJ-301, SRJ-112, SRJ-113), unless P latched or is
+   * held on `ErrInvalidFlags` (SRJ-207), the result says the server is
+   * stopping, or the launch's
    * `ErrTmuxSessionCreate` armed the timer in pending-only mode itself
    * (SRJ-112, SRJ-113, SRJ-409: pending-only unless another cause holds); an
    * arm the launch's own refusal handling made already keeps its due time. A
@@ -1097,7 +1106,11 @@ export async function runLiveRowSequence(
     switch (body.kind) {
       case LIVE_ROW_OUTCOME_LAUNCHED:
         if (liveRowLaunchSucceeded(body.result)) return undefined
-        if (body.result.action === LIVE_ROW_LAUNCH_RESULT_LATCHED || body.result.stopping === true) return undefined
+        // SRJ-502, SRJ-207, SRJ-205: a latch or a hold stops P's retry timer, and a stop ends the server.
+        if (body.result.action === LIVE_ROW_LAUNCH_RESULT_LATCHED || body.result.action === LIVE_ROW_LAUNCH_RESULT_HELD) {
+          return undefined
+        }
+        if (body.result.stopping === true) return undefined
         if (body.result.pendingOnlyArmed === true) return undefined
         break
       case LIVE_ROW_OUTCOME_NOT_LAUNCHED:

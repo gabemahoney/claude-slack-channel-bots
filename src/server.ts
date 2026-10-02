@@ -124,6 +124,7 @@ import {
   setConfigDirUnresolvableHook,
   setConfiguredPersonaQuery,
   setConflictLatch,
+  setInvalidFlagsHold,
   setLiveRowSequenceRegistry,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
@@ -175,6 +176,12 @@ import {
   latchRowStateRead,
   type ConflictLatch,
 } from './conflict-latch.ts'
+import {
+  bindInvalidFlagsHoldSetReaction,
+  createInvalidFlagsHold,
+  endInvalidFlagsHoldsOnVersionChange,
+  type InvalidFlagsHold,
+} from './invalid-flags-hold.ts'
 import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createSlowRecoveryTracker } from './slow-recovery.ts'
@@ -261,6 +268,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
+  UNAVAILABLE_RETRY_STOP_HELD,
   UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
@@ -302,7 +310,7 @@ import {
   type SessionEntry,
 } from './registry.ts'
 import { buildPersonaClientOrExit, runAgentDirectorStartupGate } from './agent-director-startup.ts'
-import { disposeAdVersionRecheck, installAdVersionRecheck } from './ad-version-gate.ts'
+import { disposeAdVersionRecheck, installAdVersionRecheck, onAdVersionChanged } from './ad-version-gate.ts'
 import {
   adAlertThresholdMsInEffect,
   adSettingsInEffect,
@@ -442,6 +450,14 @@ let personaKillFailureAlerts: Pick<KillFailureAlerts, 'isOpen'> | undefined
  * before then, when no persona is latched.
  */
 let personaLatch: Pick<ConflictLatch, 'isLatched'> | undefined
+
+/**
+ * The server's one `ErrInvalidFlags` hold (b.jg5 SRJ-207), for the
+ * lost-message state's cannot-launch query (SRJ-1011 state 3) and shutdown's
+ * forget-all; built in main() before the start pass. Undefined before then,
+ * when no persona is held.
+ */
+let personaInvalidFlagsHold: Pick<InvalidFlagsHold, 'isHeld' | 'forgetAll'> | undefined
 
 /**
  * The server's one live-row sequence registry (b.jg5 SRJ-706), built and
@@ -1110,7 +1126,12 @@ const personaRouting = createPersonaRouting({
   // alerts no episode is open. The survivor version opens no episode, so it
   // never reports this state. Only an open episode reports it.
   isKillFailed: (key) => personaKillFailureAlerts?.isOpen(key) === true,
-  // Left unbound, so it answers false: isHeldOnInvalidFlags.
+  // b.jg5 SRJ-1011 state 3, SRJ-207: P is held on ErrInvalidFlags (a reuse
+  // spawn's ErrInvalidFlags whose re-check did not stop the server): a lost
+  // message reports `cannot-launch` and fires no human-triggered restart.
+  // Read at call time through the holder main() sets: before main() builds
+  // the hold no persona is held.
+  isHeldOnInvalidFlags: (key) => personaInvalidFlagsHold?.isHeld(key) === true,
 })
 
 // Permission Block Kit builders moved to src/permission-poller.ts
@@ -1222,7 +1243,7 @@ let cronScheduler: CronScheduler | null = null
  * keep-alives), stops every live-row sequence (b.jg5 SRJ-706; none makes a
  * further call, and none starts after it) and every dialog approver (b.jg5
  * SRJ-404; likewise), forgets every persona's notice
- * episodes, closes HTTP,
+ * episodes and `ErrInvalidFlags` hold (b.jg5 SRJ-207), closes HTTP,
  * the MCP transports and the persona Slack connections, releases the
  * agent-director client handle, removes the PID file and exits with
  * `exitCode`. It makes no agent-director call: every worker and row is left
@@ -1266,6 +1287,9 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // flight that meets UNAVAILABLE or UNCLASSIFIED starts no condition and no
   // episode), so nothing is posted and no alert check is pending after this.
   personaEpisodes?.close()
+  // b.jg5 SRJ-207: every persona's ErrInvalidFlags hold ends with the server,
+  // with no post and no retry; nothing persists it, so a restart holds nothing.
+  personaInvalidFlagsHold?.forgetAll()
   // Every persona's bring-up retry (directory re-checks); the manager's Slack
   // retries stop with stopAll() below.
   bringUps?.cancelAll()
@@ -2983,6 +3007,56 @@ export async function main(): Promise<void> {
   // manager asks the latch itself. It holds no state.
   setPersonaKillKeepGoingQuery({ isPersonaUp, isShuttingDown: () => shuttingDown })
 
+  // b.jg5 SRJ-207, SRJ-1008, SRJ-1016: the server's one ErrInvalidFlags hold,
+  // in memory only (a server restart ends every hold), built before the
+  // start pass so it exists before any reuse spawn can hold a persona. The
+  // session manager holds a persona through it when a reuse spawn answers
+  // ErrInvalidFlags and the immediate version re-check passes or cannot run,
+  // and answers `held` from every launch entry for a held persona with no
+  // agent-director call. b.jg5 SRJ-305: its set reaction first stops the
+  // persona's retry timer through the controller's `stop` with the hold's
+  // reason (never the condition-end entry, whose `pending` and kill-failure
+  // exceptions do not apply to a hold), then begins the persona's
+  // ErrInvalidFlags hold episode and posts SRJ-1008's alert once in it
+  // through the persona notifier; a second ErrInvalidFlags in the same
+  // episode posts nothing. It does not end the persona's unclassified-error
+  // episode (SRJ-313). The controller is built below; no hold can be set
+  // before the start pass, by which time it exists. The restart work, the
+  // retry action and the health tick ask it below; a teardown forgets a
+  // persona's hold silently (bound into the persona lifecycle below) and
+  // shutdown() forgets every hold.
+  const invalidFlagsHold = createInvalidFlagsHold({ log: (line) => console.error(line) })
+  bindInvalidFlagsHoldSetReaction(invalidFlagsHold, {
+    stopRetryTimer: (key) => retryTimers.stop(key, UNAVAILABLE_RETRY_STOP_HELD),
+    episodes: noticeEpisodes,
+    log: (line) => console.error(line),
+  })
+  setInvalidFlagsHold(invalidFlagsHold)
+  // b.jg5 SRJ-1011 state 3: the persona routing's lost-message state reads it.
+  personaInvalidFlagsHold = invalidFlagsHold
+  // b.jg5 SRJ-204, SRJ-207: the runtime re-check's version-changed signal is
+  // the hold's end. A re-check (timed or triggered) that passes with a
+  // version different from the last version seen ends every hold whose
+  // version differs from the new one, or that began under none; each ended
+  // persona's hold episode ends silently and, when it is still applied, it
+  // is retried at once: one run of the restart path's retry entry, without
+  // the delay gate. A new ErrInvalidFlags then starts a new episode with one
+  // new alert.
+  onAdVersionChanged((_previousVersion, newVersion) => {
+    endInvalidFlagsHoldsOnVersionChange(invalidFlagsHold, newVersion, {
+      episodes: noticeEpisodes,
+      isApplied: (key) => getAppliedPersona(key) !== undefined,
+      retryAtOnce: (key) => {
+        const persona = getAppliedPersona(key)
+        if (persona === undefined) return undefined
+        return runRestartRetry(key, persona.working_directory, isPersonaRetryBlocked).then((outcome) => {
+          console.error(`[slack] invalid-flags-hold: persona=${key} retry after its hold ended answered ${outcome} (b.jg5 SRJ-207)`)
+        })
+      },
+      log: (line) => console.error(line),
+    })
+  })
+
   // b.jg5 SRJ-313, SRJ-1009: each persona's unclassified-error episode, held
   // in the notice episodes (so a teardown forgets it and shutdown closes it).
   // The outage state's reporting point feeds it each UNCLASSIFIED outcome in a
@@ -3050,7 +3124,8 @@ export async function main(): Promise<void> {
   // module's retry entry, and so through the one per-persona serializer
   // initRestart gets; a pending-only retry reads the persona's row with the
   // session manager's row read. Either stops on shutdown, a persona no longer
-  // applied, latched, not up (the relaunch gate) or at the restart cap. The gate is built further down and
+  // applied, latched, held on ErrInvalidFlags, not up (the relaunch gate) or
+  // at the restart cap. The gate is built further down and
   // initRestart runs later still: no statement in between awaits, and no
   // retry falls due before 30 s. Dry run arms nothing, since it makes no
   // agent-director call. b.jg5 SRJ-310: a retry that finds the persona's row
@@ -3097,6 +3172,9 @@ export async function main(): Promise<void> {
       isShuttingDown: () => shuttingDown,
       // b.jg5 SRJ-303, SRJ-305: a retry of a latched persona makes no call and stops the timer.
       isLatched: (key) => conflictLatch.isLatched(key),
+      // b.jg5 SRJ-207, SRJ-303, SRJ-305: so does a retry of a persona held on
+      // ErrInvalidFlags, whatever its causes.
+      isHeld: (key) => invalidFlagsHold.isHeld(key),
       // b.jg5 SRJ-303: only work that blocks a retry skips it; a running
       // dialog approver alone never does (SRJ-401).
       isInFlight: isPersonaRetryBlocked,
@@ -3302,6 +3380,10 @@ export async function main(): Promise<void> {
     // observer call, no post, no line), after its launch in flight settled
     // and right before its notice episodes, the CONFLICT episode included.
     forgetConflictLatch: (key) => conflictLatch.forget(key),
+    // b.jg5 SRJ-207, SRJ-715: likewise its ErrInvalidFlags hold, with no post
+    // and no retry, right after its latch and before its notice episodes,
+    // the hold episode included.
+    forgetInvalidFlagsHold: (key) => invalidFlagsHold.forget(key),
     forgetNoticeEpisodes: (key) => noticeEpisodes.forget(key),
     resetOutageState: resetAllToHealthy,
     forgetPersonaPrompts,
@@ -3580,6 +3662,10 @@ export async function main(): Promise<void> {
     // b.jg5 SRJ-502: a latched persona's restart work (a fired timer, a
     // retry, a human-triggered restart) makes no agent-director call.
     isLatched: (key) => conflictLatch.isLatched(key),
+    // b.jg5 SRJ-207, SRJ-303: nor does the restart work of a persona held on
+    // ErrInvalidFlags (no status, kill, send-keys, spawn or resume; nothing
+    // recorded), and no restart timer is armed for it.
+    isHeld: (key) => invalidFlagsHold.isHeld(key),
     // b.jg5 SRJ-706, SRJ-303: while the persona's live-row sequence runs, its
     // restart work (a fired timer, a retry, a human-triggered restart) makes
     // no agent-director call and answers sequence-waiting; the work asks
@@ -3682,6 +3768,8 @@ export async function main(): Promise<void> {
     // b.jg5 SRJ-315, SRJ-502: a latched persona is still read, but the tick
     // makes no attempt for it.
     isLatched: (key) => conflictLatch.isLatched(key),
+    // b.jg5 SRJ-315, SRJ-207: so is a persona held on ErrInvalidFlags.
+    isHeld: (key) => invalidFlagsHold.isHeld(key),
     // b.jg5 SRJ-311: a persona held off on its `tmux-unavailable` outage that
     // the tick does not find healthy, with no retry timer on the controller
     // built above (a retry can stop with the flag still raised), gets one

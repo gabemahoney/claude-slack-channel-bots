@@ -19,7 +19,8 @@
  *   call), the applied-persona lookup over the live applied set, the
  *   relaunch gate below, the restart cap (`isAtCap` at
  *   `RESTART_FAILURE_CAP`), the harness's shutting-down flag, the latch's
- *   latched query (`latch` below) and "blocks a retry" (as `main()`'s
+ *   latched query (`latch` below), the hold's held query (`invalidFlagsHold`
+ *   below) and "blocks a retry" (as `main()`'s
  *   `isPersonaRetryBlocked`, b.jg5 SRJ-303: the session manager's
  *   `isLaunchInFlight` or its `isLiveRowSequenceRunning`, SRJ-706; a running
  *   dialog approver alone never skips a retry, SRJ-401), and the condition's
@@ -68,7 +69,10 @@
  *   `UNAVAILABLE_RETRY_CAUSE_READ_ERROR`, straight to the controller (it is
  *   not recorded in `triggers`); an arm while the timer is armed or running
  *   keeps its due time. `isLatched` is the latch's latched query (`latch`
- *   below). `isLiveRowSequenceRunning` is the session manager's running
+ *   below). `isHeld` is the hold's held query (`invalidFlagsHold` below;
+ *   b.jg5 SRJ-207), so the restart work answers `held` with no call for a
+ *   held persona and arms no restart timer for it.
+ *   `isLiveRowSequenceRunning` is the session manager's running
  *   query (b.jg5 SRJ-706, SRJ-303), so the restart work answers
  *   `sequence-waiting` with no call while the persona's sequence runs.
  *   `slowRecovery`, the slow-recovery observer, is the harness's
@@ -104,7 +108,9 @@
  *   stop observer has already cancelled it), the condition kept; then it
  *   forgets the persona's latch silently (`latch.forget(key)`: no post, no
  *   set observer call, no line), the turn's step that production's
- *   `forgetConflictLatch` binds (b.jg5 SRJ-504). The teardown's turn then
+ *   `forgetConflictLatch` binds (b.jg5 SRJ-504), and then its
+ *   `ErrInvalidFlags` hold (`forget(key)`: no post, no retry), the step
+ *   production's `forgetInvalidFlagsHold` binds (b.jg5 SRJ-207, SRJ-715). The teardown's turn then
  *   forgets the persona's episodes, every kind (its unclassified-error,
  *   CONFLICT and slow-recovery episodes included), and its counts (the
  *   slow-recovery count), as production's `forgetNoticeEpisodes`
@@ -246,6 +252,49 @@
  *   bound here; a tick case binds `latch.isLatched` itself. `teardown(key)`
  *   forgets the persona's latch silently (b.jg5 SRJ-504), as production's
  *   teardown does.
+ * - `invalidFlagsHold` (b.jg5 SRJ-207, SRJ-1008, SRJ-1016, SRJ-305): one
+ *   `ErrInvalidFlags` hold per harness (`createInvalidFlagsHold`, its lines
+ *   to `lines`), composed as `main()` composes it: installed in the session
+ *   manager (`setInvalidFlagsHold`, removed by `cleanup()`), so a reuse
+ *   spawn's `ErrInvalidFlags` whose re-check did not stop the server holds
+ *   the persona (its launch answers `held`) and a held persona's launch makes
+ *   no agent-director call; its held query bound into the full-mode retry
+ *   action (`isHeld`: a retry of a held persona stops with
+ *   `UNAVAILABLE_RETRY_STOP_HELD`, no call), the restart deps
+ *   (`RestartDeps.isHeld`) and the lost-message driver's cannot-launch
+ *   input; and its set reaction (`bindInvalidFlagsHoldSetReaction`), which
+ *   stops the persona's timer through the controller's stop entry with
+ *   `UNAVAILABLE_RETRY_STOP_HELD` (a real stop shows in `stops`) and then
+ *   posts SRJ-1008's alert once in its episode over `episodes` (in
+ *   `episodeNotices`). `invalidFlagsHold` is read-only: `isHeld(key)`,
+ *   `beganUnder(key)` and `heldKeys()`; a tick case binds
+ *   `invalidFlagsHold.isHeld` as `HealthCheckDeps.isHeld` itself.
+ *   `teardown(key)` forgets the persona's hold silently.
+ * - The version-changed listener (b.jg5 SRJ-204, SRJ-207), registered as
+ *   `main()` registers it (`onAdVersionChanged`): the hold's version-change
+ *   reaction (`endInvalidFlagsHoldsOnVersionChange`) over the hold, the
+ *   episodes and the live applied set, its retry at once the restart
+ *   module's retry entry (`runRestartRetry`, no delay gate) with "blocks a
+ *   retry", for each persona still applied. Each retry at once is recorded
+ *   in `retriesAtOnce` (`{ key, at, outcome }`: the clock time it was asked
+ *   for at and, once settled, the retry entry's outcome), and `settle()`
+ *   awaits it. A re-check reset drops every listener, so `recheckAnswers`
+ *   registers it again; `cleanup()` removes it.
+ * - `versionRecheck(initial?)`: installs agent-director's version re-check
+ *   on the harness clock as `main()` installs it (`installAdVersionRecheck`,
+ *   its lines to `lines`), with the baseline `PHASE1_RC_VERSION`; its binary
+ *   resolve (`makeStubResolveSystemBinary`) answers `initial` (that version
+ *   by default) until the case sets another with `answer(outcome)` (a
+ *   version, a below-floor version, a failure); its `recordStartupError`
+ *   writes into the harness's `startup-errors.log` (`startupErrors()`) and
+ *   its stop's exit codes are recorded (`stops`, the server is not stopped).
+ *   It answers its `resolves`, `stops`, `nextDueAt()` (its next timed
+ *   re-check's due time, none once a stop ended it) and `pendingTimers()`
+ *   (its timers among the clock's pending ones: its interval, and a call's
+ *   time limit while one runs). Its 120 s timer is pending for as long as it
+ *   is installed, so a case counting pending timers subtracts it; `cleanup()`
+ *   disposes it before it counts. It throws when a re-check is already
+ *   installed.
  * - The configured-persona query (b.jg5 SRJ-114): installed in the session
  *   manager beside the latch (`setConfiguredPersonaQuery`), as `main()`
  *   installs it, over the live applied set: a key counts as configured while
@@ -379,10 +428,13 @@
  *   (`makeStubResolveSystemBinary`), so an `ErrInvalidFlags` answer's one
  *   immediate re-check reads it: an older version decides that the server
  *   stops. It answers the binary resolves the re-check made and the exit
- *   codes its stop was asked for; `cleanup()` removes the install.
+ *   codes its stop was asked for; `cleanup()` removes the install. It
+ *   resets the re-check module first, which drops every version-changed
+ *   listener, so it registers the harness's again.
  * - `settle()`: awaits every configured persona's launch in flight
- *   (`whenLaunchSettled`) and every retry run in flight (`whenRunSettled`),
- *   with its re-arm or stop, and then until every running dialog approver
+ *   (`whenLaunchSettled`), every retry run in flight (`whenRunSettled`),
+ *   with its re-arm or stop, and every retry at once in flight
+ *   (`retriesAtOnce`), and then until every running dialog approver
  *   waits for its next lap on the harness clock or has stopped (each holds
  *   its cap timer and, while it sleeps, its sleep timer, so all sleep when
  *   their pending timers number twice the running approvers). The spawn path
@@ -443,9 +495,10 @@
  *   manager's running query, read at call time as `main()` binds it, so a
  *   message lost while P's live-row sequence runs reports `restarting`, and
  *   since the sequence is in "in flight for P" no row read is made; state
- *   6's `isLaunchOrApproverRunning` does not include it. The member a later
- *   Epic binds (held on `ErrInvalidFlags`) is left unbound, as in
- *   production.
+ *   6's `isLaunchOrApproverRunning` does not include it.
+ *   Its `isHeldOnInvalidFlags` (b.jg5 SRJ-1011 state 3, SRJ-207) is the
+ *   harness's hold's held query, read at call time as `main()` binds it, so
+ *   a message lost while P is held reports `cannot-launch`.
  *   Each persona has its own Slack stub (`slack(key)`, leak marker on) as its
  *   client and bot identity; the routing's `notify` records each notice in
  *   `lostMessageNotices` (`{ key, text }`, the body without the persona
@@ -499,7 +552,8 @@
  *   `console.error` lines, the four notice lists, the startup-errors
  *   entries, the attempts, the triggers, the condition ends, the outage
  *   clears, the stops, the latch events, the stub's recorded spawn calls,
- *   the driver's Slack calls and the state directory as a written file.
+ *   the retries at once, the driver's Slack calls and the state directory as
+ *   a written file.
  * - `cleanup()`: first stops and forgets every dialog approver
  *   (`_resetDialogApprovers`, silently: none makes a call after the one in
  *   progress) and clears the timers they left on the harness clock, then
@@ -512,7 +566,8 @@
  *   drops the driver's routing and undoes every
  *   install and reset the harness made (`console.error`, the restart module's state and the
  *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
- *   the session manager's latch install and the latch's set observers,
+ *   the session manager's latch install and the latch's set observers, the
+ *   hold's install and its set reaction, the version-changed listener,
  *   the kill-failure alerts' install,
  *   the kill retry's keep-going query,
  *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
@@ -520,7 +575,8 @@
  *   the stub spawn path and client with every launch still in flight and the
  *   approver's clock and cap, the
  *   findMissing memo, the tmux seams, the settings install, the version
- *   re-check's install when `recheckAnswers` made one, the sequence
+ *   re-check's install when `recheckAnswers` or `versionRecheck` made one
+ *   (disposed first, before the pending timers are counted), the sequence
  *   registry's install (`_resetLiveRowSequenceRegistry`), `SLACK_STATE_DIR`) and
  *   removes the temporary directory. The registry is closed (every live-row
  *   sequence still running stopped with the shutdown reason) after the
@@ -711,6 +767,7 @@ import {
   RESTART_FAILURE_CAP,
   runRestartRetry,
   type RestartDeps,
+  type RestartRetryOutcome,
 } from '../../src/restart.ts'
 import {
   _buildIsSessionAliveAdapter,
@@ -725,6 +782,7 @@ import {
   _resetConfiguredPersonaQuery,
   _resetDialogApprovers,
   _resetFindMissingMemo,
+  _resetInvalidFlagsHold,
   _resetLiveRowSequenceRegistry,
   _setApproverClock,
   _setDialogReadyTimeoutMs,
@@ -738,6 +796,7 @@ import {
   readPersonaRowState,
   setConfiguredPersonaQuery,
   setConflictLatch,
+  setInvalidFlagsHold,
   setKillFailureAlerts,
   setLiveRowSequenceRegistry,
   setPersonaKillKeepGoingQuery,
@@ -764,6 +823,7 @@ import {
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_ROW_ABSENT,
+  UNAVAILABLE_RETRY_STOP_HELD,
   UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
@@ -774,7 +834,19 @@ import {
   type UnavailableRetryMode,
   type UnavailableRetryOutcome,
 } from '../../src/unavailable-retry.ts'
-import { installAdVersionRecheck, resetAdVersionRecheckForTests } from '../../src/ad-version-gate.ts'
+import {
+  installAdVersionRecheck,
+  lastAdVersionSeen,
+  onAdVersionChanged,
+  resetAdVersionRecheckForTests,
+  type AdVersionRecheckClock,
+} from '../../src/ad-version-gate.ts'
+import {
+  bindInvalidFlagsHoldSetReaction,
+  createInvalidFlagsHold,
+  endInvalidFlagsHoldsOnVersionChange,
+  type InvalidFlagsHold,
+} from '../../src/invalid-flags-hold.ts'
 import { writeAgentDirectorConfig, type AdConfigInput } from './ad-settings.ts'
 import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
 import {
@@ -799,6 +871,7 @@ import {
   type PersonaGetResultOverrides,
   type StubCallLog,
   type StubClientOptions,
+  type StubResolveSystemBinaryOutcome,
   type StubSpawnPath,
 } from './agent-director-stub.ts'
 import { LEAK_SENTINEL, writtenFile } from './credentials.ts'
@@ -989,6 +1062,38 @@ interface LostMessageDriver {
 /** The harness's latch, read-only: the latched query and the record. */
 export type RecoveryLatchView = Pick<ConflictLatch, 'isLatched' | 'record'>
 
+/** The harness's `ErrInvalidFlags` hold, read-only: the held query, the version a hold began under and the keys held. */
+export type RecoveryInvalidFlagsHoldView = Pick<InvalidFlagsHold, 'isHeld' | 'beganUnder' | 'heldKeys'>
+
+/**
+ * One retry at once the version-changed listener ran (b.jg5 SRJ-207): the
+ * persona, the clock time it was asked for at, and the retry entry's outcome
+ * once it settled (undefined until then).
+ */
+export interface RecoveryRetryAtOnce {
+  readonly key: string
+  readonly at: number
+  outcome?: RestartRetryOutcome
+}
+
+/**
+ * The version re-check `versionRecheck` installed on the harness clock
+ * (b.jg5 SRJ-204): what its binary resolve answers, set by the case, and what
+ * it did.
+ */
+export interface RecoveryVersionRecheck {
+  /** Set what the binary resolve answers from its next call on (a version, a below-floor version, a failure). */
+  answer(outcome: StubResolveSystemBinaryOutcome): void
+  /** Each binary resolve call made, in order. */
+  readonly resolves: readonly unknown[]
+  /** The exit codes the re-check's stop was asked for, in order. */
+  readonly stops: readonly number[]
+  /** The due time of its next timed re-check, or undefined when none is pending. */
+  nextDueAt(): number | undefined
+  /** How many of the harness clock's pending timers are the re-check's (its interval and a call's time limit). */
+  pendingTimers(): number
+}
+
 /** The harness's slow-recovery tracker, read-only: a persona's count and whether its episode is open. */
 export type RecoverySlowRecoveryView = Pick<SlowRecoveryTracker, 'count' | 'isOpen'>
 
@@ -1028,6 +1133,20 @@ export interface RecoveryHarness {
   killFailureOpen(key: string): boolean
   /** The harness's one latch, read-only (`isLatched`, `record`); composed as `main()` composes it. */
   readonly latch: RecoveryLatchView
+  /**
+   * The harness's one `ErrInvalidFlags` hold, read-only (`isHeld`,
+   * `beganUnder`, `heldKeys`; b.jg5 SRJ-207); composed as `main()` composes
+   * it. A tick case binds `invalidFlagsHold.isHeld` as `HealthCheckDeps.isHeld` itself.
+   */
+  readonly invalidFlagsHold: RecoveryInvalidFlagsHoldView
+  /** Every retry at once the version-changed listener ran, in order. */
+  readonly retriesAtOnce: RecoveryRetryAtOnce[]
+  /**
+   * Install agent-director's version re-check on the harness clock as
+   * `main()` installs it, its binary resolve answering `initial` until the
+   * case sets another; see the module comment.
+   */
+  versionRecheck(initial?: StubResolveSystemBinaryOutcome): RecoveryVersionRecheck
   /** Every latch set, each of the three recorded holds and every CONFLICT notice post, in order. */
   readonly latchEvents: RecoveryLatchEvent[]
   /**
@@ -1236,6 +1355,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // As main() binds it (b.jg5 SRJ-303, SRJ-305): a retry of a latched
     // persona makes no call and stops the timer.
     isLatched: (key) => latch.isLatched(key),
+    // As main() binds it (b.jg5 SRJ-207, SRJ-303, SRJ-305): so does a retry
+    // of a persona held on ErrInvalidFlags.
+    isHeld: (key) => invalidFlagsHold.isHeld(key),
     // As main() binds it (b.jg5 SRJ-303): only work that blocks a retry
     // skips it; a running dialog approver alone never does (SRJ-401).
     isInFlight: isPersonaRetryBlocked,
@@ -1377,6 +1499,19 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     bindConflictNotice(latch, recordingNoticeEpisodes(episodes, (key, text) => latchEvents.push({ step: 'notice', key, text }))),
   ]
 
+  // As main() builds it (b.jg5 SRJ-207, SRJ-1008, SRJ-305): one hold per
+  // harness, its lines to `lines`, its set reaction bound to the controller's
+  // stop entry with the hold's reason and to the episodes, so a new hold
+  // stops the persona's timer (a real stop shows in `stops`) and then posts
+  // SRJ-1008's alert once in its episode (in `episodeNotices`). Installed in
+  // the session manager with the other installs below.
+  const invalidFlagsHold = createInvalidFlagsHold({ log })
+  const unbindHold = bindInvalidFlagsHoldSetReaction(invalidFlagsHold, {
+    stopRetryTimer: (key) => controller.stop(key, UNAVAILABLE_RETRY_STOP_HELD),
+    episodes,
+    log,
+  })
+
   const savedStateDir = process.env['SLACK_STATE_DIR']
   process.env['SLACK_STATE_DIR'] = stateDir
   const savedConsoleError = console.error
@@ -1496,6 +1631,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // As main() installs it, before any launch: the collision ladder latches
   // through it and launches no latched persona.
   setConflictLatch(latch)
+  // As main() installs it, before any launch (b.jg5 SRJ-207): a reuse
+  // spawn's ErrInvalidFlags holds the persona through it, and no held
+  // persona's launch makes an agent-director call.
+  setInvalidFlagsHold(invalidFlagsHold)
   // As main() installs it (b.jg5 SRJ-706): the sequence registry, after the
   // latch and before any launch, so the latch's set observer stops a latched
   // persona's running sequence.
@@ -1564,6 +1703,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // As main() binds it (b.jg5 SRJ-502): a latched persona's restart work
     // makes no agent-director call.
     isLatched: (key) => latch.isLatched(key),
+    // As main() binds it (b.jg5 SRJ-207, SRJ-303): nor does a held persona's.
+    isHeld: (key) => invalidFlagsHold.isHeld(key),
     // As main() binds it (b.jg5 SRJ-706, SRJ-303): while the persona's
     // live-row sequence runs, its restart work makes no agent-director call.
     isLiveRowSequenceRunning,
@@ -1585,6 +1726,58 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       return latchedQuery?.(key) ?? false
     },
   })
+
+  // As main() registers it (b.jg5 SRJ-204, SRJ-207): the one version-changed
+  // listener, the hold's version-change reaction over the episodes, the
+  // live applied set and a retry at once through the restart module's retry
+  // entry (no delay gate) with "blocks a retry". Each retry is recorded in
+  // `retriesAtOnce` and awaited by `settle()`. Registered again after a
+  // re-check reset (`recheckAnswers`); removed by `cleanup()`.
+  const retriesAtOnce: RecoveryRetryAtOnce[] = []
+  const retriesAtOnceInFlight = new Set<Promise<unknown>>()
+  function registerVersionChangedListener(): () => void {
+    return onAdVersionChanged((_previousVersion, newVersion) => {
+      endInvalidFlagsHoldsOnVersionChange(invalidFlagsHold, newVersion, {
+        episodes,
+        isApplied: (key) => appliedPersona(key) !== undefined,
+        retryAtOnce: (key) => {
+          const persona = appliedPersona(key)
+          if (persona === undefined) return undefined
+          const record: RecoveryRetryAtOnce = { key, at: clock.now() }
+          retriesAtOnce.push(record)
+          const run = runRestartRetry(key, persona.working_directory, isPersonaRetryBlocked).then((outcome) => {
+            record.outcome = outcome
+          })
+          retriesAtOnceInFlight.add(run)
+          const done = (): void => {
+            retriesAtOnceInFlight.delete(run)
+          }
+          void run.then(done, done)
+          return run
+        },
+        log,
+      })
+    })
+  }
+  let unsubscribeVersionChanged = registerVersionChangedListener()
+
+  // The version re-check on the harness clock (`versionRecheck`), its timers
+  // tracked so a case can tell them from the others.
+  const recheckTimers = new Set<unknown>()
+  const recheckClock: AdVersionRecheckClock = {
+    setTimeout: (callback, delayMs) => {
+      const handle = clock.setTimeout(() => {
+        recheckTimers.delete(handle)
+        callback()
+      }, delayMs)
+      recheckTimers.add(handle)
+      return handle
+    },
+    clearTimeout: (handle) => {
+      recheckTimers.delete(handle)
+      clock.clearTimeout(handle)
+    },
+  }
 
   /** Every key a run may be in flight for: the configured, the armed and those a retry ran for. */
   function runKeys(): string[] {
@@ -1633,6 +1826,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     const all = Promise.all([
       ...keys.map((key) => whenLaunchSettled(key)),
       ...runKeys().map((key) => controller.whenRunSettled(key)),
+      ...retriesAtOnceInFlight,
     ]).then(() => {
       settled = true
     })
@@ -1821,8 +2015,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   /**
    * The driver's routing, built once, bound as `main()` binds it, its one
-   * lost-message row read and its in-flight gate included (b.jg5 SRJ-1011);
-   * the member a later Epic binds stays unbound, as in production.
+   * lost-message row read and its in-flight gate included (b.jg5 SRJ-1011).
    */
   function driver(): LostMessageDriver {
     if (lostMessageDriver !== undefined) return lostMessageDriver
@@ -1865,6 +2058,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // As main() binds it (b.jg5 SRJ-1011 state 4): P's kill-failure
       // episode is open, read at call time from the harness's alerts.
       isKillFailed: (key) => killFailureAlerts.isOpen(key) === true,
+      // As main() binds it (b.jg5 SRJ-1011 state 3, SRJ-207): P is held on
+      // ErrInvalidFlags, read at call time from the harness's hold.
+      isHeldOnInvalidFlags: (key) => invalidFlagsHold.isHeld(key) === true,
       // As main() binds it (b.jg5 SRJ-311): nothing while shutting down, else
       // the server's one check over the harness's own holders.
       armRetryTimerIfMissing: (key) => {
@@ -1934,6 +2130,43 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     unclassifiedErrorOpen: (key) => unclassifiedErrors.isOpen(key),
     killFailureOpen: (key) => killFailureAlerts.isOpen(key),
     latch: Object.freeze({ isLatched: (key: string) => latch.isLatched(key), record: (key: string) => latch.record(key) }),
+    invalidFlagsHold: Object.freeze({
+      isHeld: (key: string) => invalidFlagsHold.isHeld(key),
+      beganUnder: (key: string) => invalidFlagsHold.beganUnder(key),
+      heldKeys: () => invalidFlagsHold.heldKeys(),
+    }),
+    retriesAtOnce,
+    versionRecheck(initial = { version: PHASE1_RC_VERSION }) {
+      // As main() installs it: one re-check, never two (a leftover install
+      // would answer the triggers instead of this one).
+      if (lastAdVersionSeen() !== undefined) throw new Error('recovery harness: a version re-check is already installed')
+      let current: StubResolveSystemBinaryOutcome = initial
+      const resolves: Array<object | undefined> = []
+      const stops: number[] = []
+      const installed = installAdVersionRecheck({
+        resolveSystemBinary: () => makeStubResolveSystemBinary({ calls: resolves, outcomes: [current] })(),
+        baselineVersion: PHASE1_RC_VERSION,
+        // As main() binds it: the startup-errors entry, written under the
+        // harness's state directory (`startupErrors()`).
+        recordStartupError: (classLabel, message) => recordStartupError(classLabel, message),
+        stop: (exitCode) => {
+          stops.push(exitCode)
+        },
+        log,
+        clock: recheckClock,
+      })
+      if (installed === undefined) throw new Error('recovery harness: the version re-check was not installed')
+      recheckInstalled = true
+      return {
+        answer(outcome) {
+          current = outcome
+        },
+        resolves,
+        stops,
+        nextDueAt: () => nextDueOf(recheckTimers),
+        pendingTimers: () => recheckTimers.size,
+      }
+    },
     latchEvents,
     slowRecovery: Object.freeze({ count: (key: string) => slowRecovery.count(key), isOpen: (key: string) => slowRecovery.isOpen(key) }),
     lostMessageNotices,
@@ -1971,6 +2204,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       const resolves: Array<object | undefined> = []
       const stops: number[] = []
       resetAdVersionRecheckForTests()
+      // The reset drops every version-changed listener: register main()'s again.
+      unsubscribeVersionChanged = registerVersionChangedListener()
       installAdVersionRecheck({
         resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolves, outcomes: [{ version }] }),
         baselineVersion: PHASE1_RC_VERSION,
@@ -2057,6 +2292,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // As main()'s `forgetConflictLatch` (b.jg5 SRJ-504): silently, before
       // the turn's episodes forget (the case's `episodes.forget(key)`).
       latch.forget(key)
+      // As main()'s `forgetInvalidFlagsHold` (b.jg5 SRJ-207, SRJ-715): right
+      // after the latch, silently: no post and no retry.
+      invalidFlagsHold.forget(key)
     },
 
     remove(key) {
@@ -2095,6 +2333,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       outageClears: [...outageClears],
       stops: [...stops],
       latchEvents: [...latchEvents],
+      retriesAtOnce: [...retriesAtOnce],
       spawnCalls: [...stub.calls.spawnCalls],
       lostMessageNotices: [...lostMessageNotices],
       slackCalls: Object.fromEntries([...slackStubs].map(([key, slack]) => [key, slack.callLog])),
@@ -2111,6 +2350,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       episodes.forgetAll()
       lostMessageDriver?.hold.cancelAll()
       lostMessageDriver = undefined
+      // The version re-check first, so its own timer is not counted as left
+      // pending (it is armed for as long as it is installed).
+      if (recheckInstalled) resetAdVersionRecheckForTests()
+      else unsubscribeVersionChanged()
       const pendingTimers = clock.pendingCount()
       const sequenceTimersPending = sequenceTimers.size
       const armed = controller.armedKeys()
@@ -2118,12 +2361,13 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // A sequence still running is stopped, so it makes no call after this.
       void sequences.close()
       _resetLiveRowSequenceRegistry()
-      if (recheckInstalled) resetAdVersionRecheckForTests()
       _resetRestartState()
       _resetBackoffState()
       _resetOutageState()
       setSessionNotifier(undefined)
       setConflictLatch(undefined)
+      _resetInvalidFlagsHold()
+      unbindHold()
       setKillFailureAlerts(undefined)
       _resetConfiguredPersonaQuery()
       setPersonaKillKeepGoingQuery(undefined)

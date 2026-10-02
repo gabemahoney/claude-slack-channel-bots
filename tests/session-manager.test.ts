@@ -901,7 +901,7 @@ import {
 } from '../src/agent-director-errors.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
-import { RESTART_FAILURE_CAP, RESTART_OUTCOME_REFUSED, runRestartRetry, type LaunchSessionResult } from '../src/restart.ts'
+import { RESTART_FAILURE_CAP, RESTART_OUTCOME_LAUNCHED, RESTART_OUTCOME_REFUSED, runRestartRetry, type LaunchSessionResult } from '../src/restart.ts'
 import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
@@ -1057,6 +1057,23 @@ import {
   resetAdVersionRecheckForTests,
 } from '../src/ad-version-gate.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import {
+  AD_VERSION_RECHECK_INTERVAL_MS,
+  AD_VERSION_RECHECK_STOP_EXIT_CODE,
+  PHASE1_FLOOR_VERSION,
+  RECHECK_OUTCOME_NOT_RUNNING,
+} from '../src/ad-version-gate.ts'
+import { AD_BELOW_PHASE1_FLOOR } from '../src/install-check-labels.ts'
+import {
+  describeHoldVersion,
+  INVALID_FLAGS_HOLD_ALERT_TEXT,
+  invalidFlagsHeldNoLaunchLine,
+  invalidFlagsHoldEndLine,
+  invalidFlagsHoldSetLine,
+} from '../src/invalid-flags-hold.ts'
+import { LIVE_ROW_START_HELD, reuseInvalidFlagsHeldLine, setInvalidFlagsHold } from '../src/session-manager.ts'
+import { recordFailure } from '../src/backoff.ts'
+import { errSystemInstallNotFound } from './test-helpers/agent-director-stub.ts'
 import {
   createUnavailableRetryController,
   runInAttempt,
@@ -14394,6 +14411,40 @@ function srj105Build(options?: RecoveryHarnessOptions): { h: RecoveryHarness; p:
   return { h, p, b }
 }
 
+/**
+ * The immediate re-check answers that hold P at a reuse's ErrInvalidFlags
+ * (b.jg5 SRJ-207, SRJ-204; a re-check that is not running holds too): the
+ * label, the answer's kind as the reuse's line names it, the binary
+ * resolve's answer (none: no re-check is installed, so it is not running)
+ * and the version the hold begins under: the pass's own (one the re-check
+ * had not seen, so its version-changed signal runs before the hold is set
+ * and ends nothing); the last version seen, the baseline, for one that
+ * could not run; none when none runs.
+ */
+const HOLDING_RECHECKS: ReadonlyArray<readonly [string, string, StubResolveSystemBinaryOutcome | undefined, string | undefined]> = [
+  ['passes with a version not seen before', RECHECK_OUTCOME_PASS, { version: PHASE1_FLOOR_VERSION }, PHASE1_FLOOR_VERSION],
+  ['cannot run', RECHECK_OUTCOME_COULD_NOT_RUN, { throws: errSystemInstallNotFound() }, PHASE1_RC_VERSION],
+  ['is not running (none installed)', RECHECK_OUTCOME_NOT_RUNNING, undefined, undefined],
+]
+
+/**
+ * Persona `p` was held once by a reuse spawn's ErrInvalidFlags `err` whose
+ * re-check answered `kind` (b.jg5 SRJ-207, SRJ-1008): P is the one persona
+ * held, under `version`; one alert at its destination; the hold's one set
+ * line and the reuse's one line (naming the error, the re-check's answer
+ * and the version); nothing counted, posted, armed or reported to P's
+ * unclassified-error episode.
+ */
+function expectHeldOnce(h: RecoveryHarness, p: string, err: Error, kind: string, version: string | undefined): void {
+  expect([h.invalidFlagsHold.heldKeys(), h.invalidFlagsHold.beganUnder(p)]).toEqual([[p], version])
+  expect(h.episodeNotices).toEqual([holdAlert(p)])
+  expect(h.lines.filter((line) => line === invalidFlagsHoldSetLine(p, version))).toHaveLength(1)
+  const [head, tail] = reuseInvalidFlagsHeldLine(renderPersonaRef(p, p), describeAgentDirectorFailure(err), kind, '\u0000').split('\u0000') as [string, string]
+  expect(h.errors.filter((line) => line.startsWith(head) && line.endsWith(tail) && line.includes(describeHoldVersion(version)))).toHaveLength(1)
+  expect([getFailureCount(p), h.notices, h.triggers, h.controller.isArmed(p)]).toEqual([0, [], [], false])
+  expect([h.unclassifiedErrorOpen(p), unclassifiedStartedLines(h, p)]).toEqual([false, []])
+}
+
 /** No call of the case's harness was a `delete` or carried `include_finished` (b.jg5 SRJ-707, SRJ-1001); nothing when no harness was built. */
 function expectNoDeleteOrIncludeFinished(h: RecoveryHarness | undefined): void {
   if (h === undefined) return
@@ -21986,18 +22037,21 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       if (row.answer.action === 'spawned') await h.runApproverToStop(p)
     })
 
-    test('SRJ-112, ErrInvalidFlags: exactly one version re-check, which passes; then the UNCLASSIFIED handling (refused, never counted, reported once to P\'s episode) and no other launch: no plain spawn, no resume, no second reuse', async () => {
+    // b.jg5 SRJ-112, SRJ-207: the reuse's ErrInvalidFlags gets one immediate
+    // version re-check; one that passes, cannot run or is not running holds P
+    // under the version it began under, with one alert, and nothing else.
+    test.each(HOLDING_RECHECKS)('SRJ-112, SRJ-207, ErrInvalidFlags, the one version re-check %s: P held, answering held, with one alert; no other launch (no plain spawn, no resume, no second reuse), nothing counted, armed or reported to P\'s unclassified-error episode', async (_label, kind, answer, version) => {
       const { h, p } = srj105Build()
-      const { resolves, stops } = h.recheckAnswers(PHASE1_RC_VERSION)
-      h.script({ spawnError: errInvalidFlags('spawn') })
+      const rc = answer === undefined ? undefined : h.versionRecheck(answer)
+      const err = errInvalidFlags('spawn')
+      h.script({ spawnError: err })
       const order = recordCallOrder(h)
 
-      expect(await reuseEntry(h, p)).toStrictEqual({ key: p, ...REFUSED })
+      expect(await reuseEntry(h, p)).toStrictEqual({ key: p, action: 'held' })
 
-      expect([resolves.length, stops.length]).toEqual([1, 0])
+      expect([rc?.resolves.length ?? 0, rc?.stops ?? []]).toEqual([answer === undefined ? 0 : 1, []])
       expect(order).toEqual(['spawn'])
-      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-      expect([getFailureCount(p), h.notices, h.unclassifiedErrorOpen(p)]).toEqual([0, [], true])
+      expectHeldOnce(h, p, err, kind, version)
     })
 
     // HO rev 15, SRJ-713: a reuse of an id with no row is an ordinary fresh
@@ -22863,18 +22917,48 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
   })
 
-  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-112, SRJ-104, %s: ErrInvalidFlags at the reuse makes exactly one version re-check, then UNCLASSIFIED: refused, never counted, and no other launch', async (_name, site) => {
+  // b.jg5 SRJ-112, SRJ-207 (AC 23): at every reuse site the reuse's
+  // ErrInvalidFlags gets exactly one immediate version re-check; one that
+  // passes, cannot run or is not running holds P, with one alert at its
+  // destination, and the launch answers held: no further launch of any kind,
+  // no kill and no delete; nothing counted, armed, posted or reported to the
+  // unclassified-error episode.
+  test.each(
+    [...REUSE_SITES, ...NO_TRANSCRIPT_SITES].flatMap((site) => HOLDING_RECHECKS.map(([label, kind, answer, version]) => [site.name, label, site, kind, answer, version] as const)),
+  )('SRJ-112, SRJ-207, %s: ErrInvalidFlags at the reuse, the one version re-check %s: P held, answering held, one alert; no other launch, no kill, nothing counted, armed, posted or reported', async (_name, _label, site, kind, answer, version) => {
+    const { h, p, b } = srj105Build()
+    const tmux: string[] = []
+    recordRawTmux(tmux)
+    const rc = answer === undefined ? undefined : h.versionRecheck(answer)
+    const err = errInvalidFlags('spawn')
+    scriptReuseSite(h, p, site, err)
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'held' })
+
+    expect([rc?.resolves.length ?? 0, rc?.stops ?? []]).toEqual([answer === undefined ? 0 : 1, []])
+    expect(order).toEqual(['spawn', ...site.pass])
+    expect([h.stub.calls.killCalls, tmux]).toEqual([[], []])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expectHeldOnce(h, p, err, kind, version)
+    expect(personaCallCounts(h, b)).toEqual({})
+  })
+
+  // b.jg5 SRJ-205 (AC 23): a re-check that reads a binary below the floor
+  // stops the server; nothing is held and nothing is posted.
+  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-205, %s: ErrInvalidFlags at the reuse whose one re-check reads a binary below the floor answers the stopping result: the server stops once, non-zero; no hold, no alert, nothing counted or armed, no further call', async (_name, site) => {
     const { h, p } = srj105Build()
-    const { resolves, stops } = h.recheckAnswers(PHASE1_RC_VERSION)
+    const rc = h.versionRecheck({ version: OLD_AD_VERSION })
     scriptReuseSite(h, p, site, errInvalidFlags('spawn'))
     const order = recordCallOrder(h)
 
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', stopping: true })
 
-    expect([resolves.length, stops.length]).toEqual([1, 0])
+    expect([rc.resolves.length, rc.stops]).toEqual([1, [AD_VERSION_RECHECK_STOP_EXIT_CODE]])
+    expect(startupEntriesOf(h, AD_BELOW_PHASE1_FLOOR)).toHaveLength(1)
     expect(order).toEqual(['spawn', ...site.pass])
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-    expect([getFailureCount(p), h.notices]).toEqual([0, []])
+    expect([h.invalidFlagsHold.heldKeys(), h.episodeNotices, h.notices, h.triggers, getFailureCount(p)]).toEqual([[], [], [], [], 0])
+    expect(h.unclassifiedErrorOpen(p)).toBe(false)
   })
 
   test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-112, %s: a directory error (ErrCwdNotFound) at the reuse is counted: cwd-unreachable raised, no further launch, nothing armed', async (_name, site) => {
@@ -23746,5 +23830,264 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'resumed' } })
     expect(h.stub.calls.resumeCalls).toHaveLength(2)
     await h.runApproverToStop(p)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-207, SRJ-1008, SRJ-112 (AC 23): the ErrInvalidFlags hold
+//
+// On the recovery harness, whose one hold is composed as main() composes it
+// (installed in the session manager; its set reaction stops P's retry timer
+// and posts SRJ-1008's alert once in P's episode; its held query bound into
+// the restart deps and the retry action; the version-changed listener ends
+// it and retries P at once). P is held through a real reuse spawn of the
+// same id that answers ErrInvalidFlags (`holdP`): its launch meets its row
+// finished in another directory. The reuse sites' rows are in the
+// replacement-site describe above; here: every launch path while P is held,
+// the start pass's tally, a latched and held P, AC 23 end to end with the
+// version re-check on the harness clock, below the floor, a server restart,
+// and only a reuse holds (a plain spawn's and a resume's ErrInvalidFlags
+// keep the re-check, then UNCLASSIFIED).
+// ---------------------------------------------------------------------------
+
+/** One SRJ-1008 alert at persona `key`'s destination, as the harness's episodes capture it. */
+function holdAlert(key: string): { key: string; text: string } {
+  return { key, text: INVALID_FLAGS_HOLD_ALERT_TEXT }
+}
+
+/**
+ * Hold persona `p` through a real reuse (b.jg5 SRJ-207): its launch's first
+ * spawn collides, the collision `get` reads its row `ended` in another
+ * directory, and the reuse spawn of the same id that replaces it answers
+ * ErrInvalidFlags. Asserts the launch answered `held` and P is held.
+ */
+async function holdP(h: RecoveryHarness, p: string): Promise<void> {
+  h.script(collided(h, harnessPersona(h, p), elsewhere(h, LIVENESS_DEAD_ROW_ENDED), errInvalidFlags('spawn')))
+  expect(await h.launch(p)).toStrictEqual({ key: p, action: 'held' })
+  expect(h.invalidFlagsHold.isHeld(p)).toBe(true)
+}
+
+describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers held with no agent-director call; launchSession answers \'skipped\' and the start pass counts it neither failed nor succeeded', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(srj105Harness)
+    srj105AfterEach()
+  })
+
+  /** What the sequence last read before a launch: the row `ended`. */
+  const LAST_READ = latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)
+
+  /** One launch path: the call, the answer for persona `p`, the site its held line names, and how the line names P. */
+  type HeldPath = readonly [string, (h: RecoveryHarness, p: string) => Promise<unknown> | unknown, (p: string) => unknown, string, ((p: string) => string)?]
+
+  const HELD_PATHS: readonly HeldPath[] = [
+    ['the start pass (spawnForPersona, isStartup true)', (h, p) => spawnForPersona(harnessPersona(h, p), h.config, true), (p) => ({ key: p, action: 'held' }), spawnForPersona.name],
+    ['the bring-up (spawnForPersona, isStartup false)', (h, p) => spawnForPersona(harnessPersona(h, p), h.config, false), (p) => ({ key: p, action: 'held' }), spawnForPersona.name],
+    ['the restart path (launchSession)', (h, p) => launchSession(p, h.config), () => 'skipped', spawnForPersona.name],
+    // The harness's request carries no persona reference, so the line names P by its key.
+    ['the sequence start entry (startLiveRowSequence)', (h, p) => startLiveRowSequence(h.sequenceRequest(p, { lastReadState: cannedStatusResult().state })), () => LIVE_ROW_START_HELD, startLiveRowSequence.name, (p) => `persona=${p}`],
+    ['the sequence-launch entry\'s reuse', (h, p) => launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: LAST_READ }), (p) => ({ key: p, action: 'held' }), launchForLiveRowSequence.name],
+    ['the sequence-launch entry\'s resume', (h, p) => launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_RESUME, lastRead: LAST_READ }), (p) => ({ key: p, action: 'held' }), launchForLiveRowSequence.name],
+  ]
+
+  test.each(HELD_PATHS)('%s for a held P: its held answer, with zero stub calls and one held line; no launch, kill, delete or tmux call, nothing counted, recorded, armed or posted, no second alert; Q launches normally afterwards', async (_label, call, answer, site, refOf = (key: string) => renderPersonaRef(key, key)) => {
+    const { h, p, b } = srj105Build()
+    await holdP(h, p)
+    const tmux: string[] = []
+    recordRawTmux(tmux)
+    // One failure on record: a success recorded for P would clear it, a failure add one.
+    recordFailure(p)
+    const order = recordCallOrder(h)
+    const errorsFrom = h.errors.length
+
+    expect(await call(h, p)).toStrictEqual(answer(p))
+
+    expect([order, tmux]).toEqual([[], []])
+    expect(getFailureCount(p)).toBe(1)
+    expect(h.sequenceRunning(p)).toBe(false)
+    expect([h.triggers, h.controller.isArmed(p), h.notices]).toEqual([[], false, []])
+    expect(h.episodeNotices).toEqual([holdAlert(p)])
+    expect(h.errors.slice(errorsFrom).filter((line) => line === invalidFlagsHeldNoLaunchLine(site, refOf(p)))).toHaveLength(1)
+    expect(h.invalidFlagsHold.isHeld(p)).toBe(true)
+
+    // Q is not held: its launch reaches agent-director and brings it up.
+    expect(await h.launch(b)).toStrictEqual({ key: b, action: 'spawned' })
+    expect(h.invalidFlagsHold.heldKeys()).toEqual([p])
+    await h.runApproverToStop(b)
+  })
+
+  test('b.jg5 SRJ-1015: the start pass over a held P and an unheld Q: P\'s outcome is held with no call, counted neither failed nor succeeded; Q is spawned and counted', async () => {
+    const { h, p, b } = srj105Build()
+    await holdP(h, p)
+    const before = personaCallCounts(h, p)
+
+    const result = await startupSessionManager(h.config, { concurrency: 1 })
+
+    expect(result.perPersona).toEqual([{ key: p, action: 'held' }, { key: b, action: 'spawned' }])
+    expect([result.succeeded, result.failed, result.freshSpawned]).toEqual([1, 0, 1])
+    expect(personaCallCounts(h, p)).toEqual(before)
+    expect(h.episodeNotices).toEqual([holdAlert(p)])
+    await h.settle()
+    await h.runApproverToStop(b)
+  })
+
+  // The latched gate answers for a persona both latched and held: the latch
+  // is a human's to clear, and its answer is the one SRJ-502 gives.
+  test('a P both latched and held answers latched, not held, at spawnForPersona and the sequence-launch entry, with no call; launchSession answers \'skipped\'', async () => {
+    const { h, p } = srj105Build()
+    const row = CONFLICT_CASE_ROWS.find((r) => r.site === 'plain spawn' && r.rowState === LATCH_ROW_STATE_NO_ROW)!
+    h.script({ spawnError: row.build(), getError: errSpawnNotFound() })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+    expect(h.latch.isLatched(p)).toBe(true)
+    // P held beside its latch: a hold installed in the harness's place, holding P only.
+    setInvalidFlagsHold({ set: () => false, isHeld: (key) => key === p })
+    const order = recordCallOrder(h)
+
+    expect(await spawnForPersona(harnessPersona(h, p), h.config, false)).toStrictEqual({ key: p, action: 'latched' })
+    expect(await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: LAST_READ })).toStrictEqual({ key: p, action: 'latched' })
+    expect(await launchSession(p, h.config)).toBe('skipped')
+    expect(order).toEqual([])
+    expect(h.errors.filter((line) => line.includes('held on ErrInvalidFlags'))).toEqual([])
+  })
+
+  test('a held query that throws counts as held (fail safe): no call, held, one line naming what it threw', async () => {
+    const { h, p } = srj105Build()
+    setInvalidFlagsHold({
+      set: () => false,
+      isHeld: () => {
+        throw new Error(`hold query broke (${sentinelInMessage('held-query')})`)
+      },
+    })
+    const order = recordCallOrder(h)
+
+    expect(await spawnForPersona(harnessPersona(h, p), h.config, false)).toStrictEqual({ key: p, action: 'held' })
+
+    expect(order).toEqual([])
+    const held = h.errors.filter((line) => line.startsWith(invalidFlagsHeldNoLaunchLine(spawnForPersona.name, renderPersonaRef(p, p))))
+    expect(held).toHaveLength(1)
+    expect(held[0]).toContain('taken as held')
+    expect(held[0]).not.toContain(LEAK_SENTINEL)
+  })
+})
+
+describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse getting ErrInvalidFlags with a passing binary launches nothing for P, alerts once, deletes nothing, and relaunches P at once when the binary\'s version changes', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(srj105Harness)
+    srj105AfterEach()
+  })
+
+  /** A passing version other than the baseline (`PHASE1_RC_VERSION`): the floor itself. */
+  const NEW_VERSION = PHASE1_FLOOR_VERSION
+
+  test('a cwd mismatch on a finished row forces a reuse; held with one alert; several backoff waits and re-check intervals at the same version make no call for P; the version changes and the next re-check retries P once, at that clock time, by one reuse, and P comes up; a second ErrInvalidFlags begins a new hold with one new alert', async () => {
+    const { h, p, b } = srj105Build()
+    const rc = h.versionRecheck({ version: PHASE1_RC_VERSION })
+    await holdP(h, p)
+    expect(rc.resolves).toHaveLength(1)
+    expect(h.invalidFlagsHold.beganUnder(p)).toBe(PHASE1_RC_VERSION)
+    expect(h.episodeNotices).toEqual([holdAlert(p)])
+    const held = personaCallCounts(h, p)
+
+    // Several backoff waits and re-check intervals at the same version.
+    const waited = Math.max(3 * AD_VERSION_RECHECK_INTERVAL_MS, 4 * UNAVAILABLE_RETRY_BASE_S * 1000)
+    await h.advance(waited)
+    await h.settle()
+    expect(rc.resolves.length).toBeGreaterThan(1)
+    expect(personaCallCounts(h, p)).toEqual(held)
+    expect([h.invalidFlagsHold.isHeld(p), h.episodeNotices, h.retriesAtOnce, h.controller.isArmed(p)]).toEqual([true, [holdAlert(p)], [], false])
+
+    // The binary changes. P's next launch meets the same finished row in
+    // another directory, so its one reuse spawn of the id brings it up.
+    rc.answer({ version: NEW_VERSION })
+    h.script({ ...collided(h, harnessPersona(h, p), elsewhere(h, LIVENESS_DEAD_ROW_ENDED)), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) })
+    const reusesBefore = h.reuseSpawns().length
+    const due = rc.nextDueAt()!
+    await h.advance(due - h.clock.now())
+    await h.settle()
+
+    expect(h.invalidFlagsHold.isHeld(p)).toBe(false)
+    expect(h.retriesAtOnce).toEqual([{ key: p, at: due, outcome: RESTART_OUTCOME_LAUNCHED }])
+    expect(h.attempts).toEqual([])
+    expect(h.reuseSpawns().slice(reusesBefore)).toEqual([reuseSpawnOf(h, p)])
+    expect(h.episodeNotices).toEqual([holdAlert(p)])
+    expect(h.lines.filter((line) => line === invalidFlagsHoldEndLine(p, PHASE1_RC_VERSION, NEW_VERSION))).toHaveLength(1)
+    await h.runApproverToStop(p)
+
+    // A new ErrInvalidFlags after that: a new hold, under the version now seen, with one new alert.
+    await holdP(h, p)
+    expect(h.invalidFlagsHold.beganUnder(p)).toBe(NEW_VERSION)
+    expect(h.episodeNotices).toEqual([holdAlert(p), holdAlert(p)])
+    expect(personaCallCounts(h, b)).toEqual({})
+  })
+
+  test('below the floor: the same forced reuse whose re-check reads a below-floor binary stops the server once, non-zero, with one startup-errors entry of its class; no hold, no alert, and no further stub call for P', async () => {
+    const { h, p } = srj105Build()
+    const rc = h.versionRecheck({ version: OLD_AD_VERSION })
+    h.script(collided(h, harnessPersona(h, p), elsewhere(h, LIVENESS_DEAD_ROW_ENDED), errInvalidFlags('spawn')))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', stopping: true })
+    const stopped = personaCallCounts(h, p)
+
+    expect([rc.resolves.length, rc.stops]).toEqual([1, [AD_VERSION_RECHECK_STOP_EXIT_CODE]])
+    expect(AD_VERSION_RECHECK_STOP_EXIT_CODE).not.toBe(0)
+    expect(startupEntriesOf(h, AD_BELOW_PHASE1_FLOOR)).toHaveLength(1)
+    expect([h.invalidFlagsHold.heldKeys(), h.episodeNotices, h.notices, getFailureCount(p), h.triggers]).toEqual([[], [], [], 0, []])
+    // The re-check ended with the stop: nothing is armed and no call follows.
+    expect(rc.nextDueAt()).toBeUndefined()
+    await h.advance(2 * AD_VERSION_RECHECK_INTERVAL_MS)
+    await h.settle()
+    expect(personaCallCounts(h, p)).toEqual(stopped)
+    expect(rc.resolves).toHaveLength(1)
+  })
+
+  test('a server restart holds nothing: a fresh harness after a held run launches P normally', async () => {
+    const first = srj105Build()
+    await holdP(first.h, first.p)
+    expectNoDeleteOrIncludeFinished(first.h)
+    srj105AfterEach()
+
+    const { h, p } = srj105Build()
+    expect(h.invalidFlagsHold.heldKeys()).toEqual([])
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+    expect(h.episodeNotices).toEqual([])
+    await h.runApproverToStop(p)
+  })
+})
+
+describe('b.jg5 SRJ-207, SRJ-111, SRJ-113: only a reuse holds; a plain spawn\'s and a resume\'s ErrInvalidFlags hold nothing and post no alert', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(srj105Harness)
+    srj105AfterEach()
+  })
+
+  // SRJ-113's row: the resume's ErrInvalidFlags keeps the re-check, then UNCLASSIFIED.
+  test('the ladder\'s resume answering ErrInvalidFlags with a passing re-check: exactly one re-check, refused and reported to P\'s unclassified-error episode; P is not held and nothing is posted', async () => {
+    const { h, p } = srj105Build()
+    const rc = h.versionRecheck({ version: PHASE1_RC_VERSION })
+    h.script({ ...collided(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }), resumeError: errInvalidFlags('resume') })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(order).toEqual(['spawn', 'get', 'resume'])
+    expect(rc.resolves).toHaveLength(1)
+    expect([h.invalidFlagsHold.heldKeys(), h.episodeNotices, h.reuseSpawns()]).toEqual([[], [], []])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+    expect(h.unclassifiedErrorOpen(p)).toBe(true)
+    h.controller.stop(p, UNAVAILABLE_RETRY_STOP_RECOVERED)
+  })
+
+  // The ladder's first, plain spawn: its ErrInvalidFlags is SRJ-111's row
+  // (a re-check, then UNCLASSIFIED), which this case does not pin; only that
+  // it holds nothing.
+  test('the ladder\'s plain spawn answering ErrInvalidFlags with a passing binary: no hold, no alert, no reuse spawn and no further call', async () => {
+    const { h, p } = srj105Build()
+    h.versionRecheck({ version: PHASE1_RC_VERSION })
+    h.script({ spawnError: errInvalidFlags('spawn') })
+    const order = recordCallOrder(h)
+
+    expect((await h.launch(p)).action).not.toBe('held')
+
+    expect(order).toEqual(['spawn'])
+    expect([h.invalidFlagsHold.heldKeys(), h.episodeNotices, h.reuseSpawns()]).toEqual([[], [], []])
   })
 })

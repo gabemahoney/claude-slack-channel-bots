@@ -89,7 +89,12 @@
  * the session manager's running query) reports `restarting` there with no
  * read and no restart, P's row `pending` and the sequence's own step-6
  * launch included; a latch beats it, and once the sequence has ended the
- * one read is made again.
+ * one read is made again. State 3 (b.jg5 SRJ-1011, SRJ-207) runs there too,
+ * the driver's held-on-invalid-flags input bound to the harness's one
+ * `ErrInvalidFlags` hold: a message lost while P is held through a real
+ * reuse reports `cannot-launch` with no restart and no call; above an open
+ * kill-failure episode it still does; under a latch `held-for-human` comes
+ * first; once the binary's version changes and the hold ends it never does.
  *
  * main() in src/server.ts cannot run in a test (startup gate, real port, real
  * Slack connections), so describe (7) audits its source for the wiring only:
@@ -113,7 +118,7 @@ import {
 } from '../src/restart.ts'
 import { recordFailure, isAtCap } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
-import type { LostMessageState } from '../src/lost-message.ts'
+import { STATE_WORDING, type LostMessageState } from '../src/lost-message.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
@@ -226,6 +231,12 @@ import {
   type RecoveryHarnessOptions,
   type RecoveryRowState,
 } from './test-helpers/recovery-harness.ts'
+import { collided, personaCallCounts, personaRow, unavailableAt } from './test-helpers/recovery-harness.ts'
+import { errInvalidFlags, provenanceNote } from './test-helpers/agent-director-stub.ts'
+import { launchForLiveRowSequence, readPersonaOwnRow } from '../src/session-manager.ts'
+import { LIVE_ROW_LAUNCH_REUSE } from '../src/live-row-sequence.ts'
+import { latchRowStateRead } from '../src/conflict-latch.ts'
+import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -611,9 +622,13 @@ const INPUTS = {
     },
     clear: (h, key) => { expect(h.latch.forget(key)).toBe(true) },
   },
+  // E23's set, as a reuse spawn's ErrInvalidFlags sets it; `forget` is its silent end.
   'held on ErrInvalidFlags': {
-    set: (h, key) => { h.heldOnInvalidFlags.add(key) },
-    clear: (h, key) => { h.heldOnInvalidFlags.delete(key) },
+    set: (h, key) => {
+      expect(h.invalidFlagsHold.set(key)).toBe(true)
+      expect(h.invalidFlagsHold.isHeld(key)).toBe(true)
+    },
+    clear: (h, key) => { expect(h.invalidFlagsHold.forget(key)).toBe(true) },
   },
   'kill failed': {
     set: (h, key) => { h.killFailed.add(key) },
@@ -1487,6 +1502,99 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
     expect(h.killFailureOpen(key)).toBe(false)
     expect(h.episodeNotices).toHaveLength(1)
     await expectLostMessageReports(h, key, 'auto-restart-disabled')
+  })
+})
+
+// ===========================================================================
+// b.jg5 SRJ-1011 state 3, SRJ-207 (E23 T3): a message lost while P is held
+// on ErrInvalidFlags reports `cannot-launch`
+//
+// Through the recovery harness's lost-message driver, whose held-on-invalid-
+// flags input is bound to the harness's one hold as main() binds it. P is
+// held through a real reuse spawn of its id answering ErrInvalidFlags, its
+// version re-check on the harness clock passing; the restart delay is above
+// 0, so a restart the message wrongly asked for would launch. `cannot-launch`
+// comes after `held-for-human` and before `kill-failed`; once the binary's
+// version changes the hold ends and the message is decided as before. States
+// and wordings come from src/lost-message.ts (`expectLostMessageReports`).
+// ===========================================================================
+
+describe('b.jg5 SRJ-1011 state 3, SRJ-207: a message lost while P is held on ErrInvalidFlags reports cannot launch, through the real routing', () => {
+  /** A finished row of P's in another directory, so P's next launch replaces it by a reuse spawn of the same id that answers ErrInvalidFlags. */
+  function scriptHeldReuse(h: RecoveryHarness, key: string): void {
+    h.script(collided(h, personaOf(h, key), { cwd: h.home, state: LIVENESS_DEAD_ROW_ENDED }, errInvalidFlags('spawn')))
+  }
+
+  test('P held through a reuse: a lost message reports cannot launch with its wording; no restart is asked for, scheduled or launched, and no stub call is made for P', async () => {
+    const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
+    const [key] = h.keys as [string]
+    h.versionRecheck()
+    scriptHeldReuse(h, key)
+    expect(await h.launch(key)).toEqual({ key, action: 'held' })
+    const before = personaCallCounts(h, key)
+
+    const outcome = await expectLostMessageReports(h, key, 'cannot-launch')
+
+    expect(outcome.notice).toContain(STATE_WORDING['cannot-launch'])
+    expect(h.restartAsks).toEqual([])
+    expect(isRestartPendingOrActive(key)).toBe(false)
+    await Bun.sleep(FAST_DELAY_S * 1000 * 4)
+    await h.settle()
+    expect(personaCallCounts(h, key)).toEqual(before)
+    expect(h.invalidFlagsHold.isHeld(key)).toBe(true)
+  })
+
+  test('P held with its kill-failure episode open: cannot launch is reported, not kill failed', async () => {
+    const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
+    const [key] = h.keys as [string]
+    rowReadsUntilSpawn(h, 'ended')
+    h.script({ killError: errTmuxKillFailed() })
+    await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)
+    expect(h.killFailureOpen(key)).toBe(true)
+    // The sequence-launch entry's reuse (no row read first, which would end the episode) holds P.
+    h.script({ killError: undefined, spawnError: errInvalidFlags('spawn') })
+    expect(await launchForLiveRowSequence(personaOf(h, key), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) })).toEqual({ key, action: 'held' })
+    expect([h.invalidFlagsHold.isHeld(key), h.killFailureOpen(key)]).toEqual([true, true])
+
+    await expectLostMessageReports(h, key, 'cannot-launch')
+
+    expect(isRestartPendingOrActive(key)).toBe(false)
+  })
+
+  test('P latched and held: held for a human is reported, not cannot launch', async () => {
+    const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
+    const [key] = h.keys as [string]
+    scriptHeldReuse(h, key)
+    expect(await h.launch(key)).toEqual({ key, action: 'held' })
+    // A provenance_conflict note on P's own row, read by the session manager's shared own-row read, latches P.
+    h.script({ getResult: personaRow(h, key, { liveness_note: provenanceNote }) })
+    expect(await readPersonaOwnRow(key, { site: 'inbound-recovery-drop-branch.test', what: 'own-row get' })).toMatchObject({ latched: true })
+    expect([h.latch.isLatched(key), h.invalidFlagsHold.isHeld(key)]).toEqual([true, true])
+
+    await expectLostMessageReports(h, key, 'held-for-human')
+
+    expect(isRestartPendingOrActive(key)).toBe(false)
+  })
+
+  test('after the binary\'s version changes and the hold ends (P retried at once, its launch refused), a lost message no longer reports cannot launch', async () => {
+    const h = makeRecovery()
+    const [key] = h.keys as [string]
+    const rc = h.versionRecheck()
+    scriptHeldReuse(h, key)
+    expect(await h.launch(key)).toEqual({ key, action: 'held' })
+    await expectLostMessageReports(h, key, 'cannot-launch')
+
+    // The retry at once meets an UNAVAILABLE answer at its first spawn: refused, P's timer armed, P not up.
+    rc.answer({ version: PHASE1_FLOOR_VERSION })
+    h.script({ spawnQueue: [], spawnError: unavailableAt('spawn'), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) })
+    await h.advance(rc.nextDueAt()! - h.clock.now())
+    await h.settle()
+    expect(h.invalidFlagsHold.isHeld(key)).toBe(false)
+    expect(h.retriesAtOnce.map((retry) => retry.key)).toEqual([key])
+
+    const outcome = await h.loseMessage(key)
+    expect(outcome.state).not.toBe('cannot-launch')
+    h.teardown(key)
   })
 })
 

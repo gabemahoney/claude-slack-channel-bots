@@ -492,7 +492,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     // (`templateRefresh` is pinned in the test after this one.)
     const shaped = [
       'log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopApprover', 'stopLiveRowSequence', 'stopRetryTimer',
-      'forgetConflictLatch', 'forgetNoticeEpisodes', 'killInstance',
+      'forgetConflictLatch', 'forgetInvalidFlagsHold', 'forgetNoticeEpisodes', 'killInstance',
     ]
     expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
     for (const [dep, value] of expected) expect([dep, props.get(dep)]).toEqual([dep, value])
@@ -644,6 +644,18 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(forgetLatch).not.toBeNull()
     expect(forgetLatch![2]).toBe(forgetLatch![1])
 
+    // b.jg5 SRJ-207, SRJ-715: the teardown silently forgets the key's
+    // ErrInvalidFlags hold on the server's one hold (its build and bindings
+    // are pinned in tests/server-startup-wiring.test.ts): not a stub, not
+    // another instance's forget, not a local shadow, never every persona's.
+    const hold = constOf('createInvalidFlagsHold')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${hold}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+    const forgetHold = (props.get('forgetInvalidFlagsHold') ?? '').match(
+      new RegExp(`^\\(?(\\w+)\\)? => ${hold}\\.forget\\((\\w+)\\)$`),
+    )
+    expect(forgetHold).not.toBeNull()
+    expect(forgetHold![2]).toBe(forgetHold![1])
+
     // The storage check at apply posts through the persona notifier.
     const storage = (props.get('storageCheck') ?? '').match(new RegExp(`^\\(?(\\w+)\\)? => runPersonaStorageCheck\\((\\w+), ${notifier}\\.notify\\)$`))
     expect(storage).not.toBeNull()
@@ -727,6 +739,37 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(forgets[0]!).toBeGreaterThan(steps[0]!)
     expect(forgets[0]!).toBeLessThan(close)
     expect(indicesOf(new RegExp(`(?<![\\w$.])${latch}\\s*(?:\\?\\.|!)?\\s*\\[`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  // b.jg5 SRJ-207, SRJ-715: `forgetInvalidFlagsHold` is required, so the
+  // typecheck catches it missing; it cannot catch it bound to a stub or to a
+  // second hold (the removed persona would stay held on the one the launch
+  // entries ask, and a later version change would retry a persona that is
+  // gone), nor a second per-key forget of the server's hold elsewhere. The
+  // shutdown's forget-all goes through the module-scope holder, not the
+  // instance (pinned in tests/server-startup-wiring.test.ts). Its form is
+  // pinned in the test above.
+  test('the teardown\'s ErrInvalidFlags hold forget is bound exactly once, to the server\'s one hold: the instance\'s only per-key forget in server.ts is that binding (b.jg5 SRJ-207, SRJ-715)', () => {
+    const hold = constOf('createInvalidFlagsHold')
+    expect(callsOf(SERVER_CODE, 'createInvalidFlagsHold')).toHaveLength(1)
+    expect(insideMain(SERVER_CODE, SERVER_CODE.search(new RegExp(`\\bconst\\s+${hold}\\s*=`)))).toBe(true)
+
+    // The step is named once in server.ts: as a property of the one
+    // createPersonaLifecycle({ … }).
+    const [open, close] = balancedAfter(SERVER_CODE, callsOf(SERVER_CODE, 'createPersonaLifecycle')[0]!, '(', ')')
+    const steps = indicesOf(/(?<![\w$])forgetInvalidFlagsHold\b/g, SERVER_CODE)
+    expect(steps).toHaveLength(1)
+    expect(steps[0]!).toBeGreaterThan(open)
+    expect(steps[0]!).toBeLessThan(close)
+    expect(onlyCallProps('createPersonaLifecycle').get('forgetInvalidFlagsHold')).toMatch(new RegExp(`=> ${hold}\\.forget\\(`))
+
+    // The hold's per-key forget is read nowhere else: not called (with any
+    // key, or in a loop over every persona), not passed on as a reference.
+    const forgets = indicesOf(new RegExp(`(?<![\\w$.])${hold}\\s*[?!]?\\.\\s*forget\\b`, 'g'), SERVER_CODE)
+    expect(forgets).toHaveLength(1)
+    expect(forgets[0]!).toBeGreaterThan(steps[0]!)
+    expect(forgets[0]!).toBeLessThan(close)
+    expect(indicesOf(new RegExp(`(?<![\\w$.])${hold}\\s*(?:\\?\\.|!)?\\s*\\[`, 'g'), SERVER_CODE)).toEqual([])
   })
 })
 
