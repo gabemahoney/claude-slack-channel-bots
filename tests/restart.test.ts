@@ -121,11 +121,21 @@ import {
   ESCALATE_DEAD_VERDICTS,
   isDeadEvidence,
   isLiveRowSequenceRunning,
+  lostRaceOutcome,
+  ROW_REREAD_FINISHED,
+  spawnNotResumableLine,
+  type PersonaRowReread,
   type CarriedDeadEvidence,
   type DeadEvidenceSource,
   type EscalateDeadVerdict,
 } from '../src/session-manager.ts'
 import { FULL_PANE_READ_LINES, PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
+import {
+  LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
+  LIVE_ROW_LAUNCH_RESUME,
+  LIVE_ROW_OUTCOME_LAUNCHED,
+  liveRowSequenceStartLine,
+} from '../src/live-row-sequence.ts'
 import { KILL_FAILURE_ROUTE_NOT_CONFIGURED, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL } from '../src/kill-failure-alert.ts'
 import {
   conflictNoticeText,
@@ -153,7 +163,7 @@ import {
   initOutageState,
 } from '../src/outage-state.ts'
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
-import { AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, CSCB_UNKNOWN_ERROR_NAME } from '../src/ad-error-class.ts'
+import { AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, CSCB_UNKNOWN_ERROR_NAME, describeAgentDirectorFailure } from '../src/ad-error-class.ts'
 import {
   cannedErr,
   cannedOk,
@@ -180,6 +190,7 @@ import {
   errTmuxSessionConflict,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
+  holdFindMissing,
   holdSpawns,
   UNAVAILABLE_FORMS,
   unavailableForms,
@@ -208,6 +219,7 @@ import {
   createUnavailableRetryController,
   UNAVAILABLE_RETRY_BASE_S,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
+  UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
@@ -2973,9 +2985,10 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
 // `working` until that sweep and `missing` after it, and its `read-pane`
 // answers the case's failure. The relaunch's optimistic spawn collides, its
 // collision `get` reads the row `missing` and its `resume` answers
-// `ErrSpawnNotResumable`, so the ladder's finished-row route logs the verdict
-// carried in (`deadSessionRouteLine`) and the lost race names the dead
-// evidence the path holds; the launch is refused and counted nowhere. A
+// `ErrSpawnNotResumable`, whose re-read (b.jg5 SRJ-710) reads it `missing`
+// again, so the ladder's finished-row route logs the verdict carried in
+// (`deadSessionRouteLine`) and the not-resumable step's lost race names the
+// dead evidence the path holds; the launch is refused and counted nowhere. A
 // GONE-based verdict keeps its checked kill; a row-absent one makes none.
 // ---------------------------------------------------------------------------
 
@@ -3018,8 +3031,171 @@ describe('b.jg5 SRJ-611: on the recovery harness, the relaunch after escalate-de
     expect(h.errors.filter((l) => l.startsWith(`[slack] spawnForPersona: dead session for ${ref} `))).toEqual([
       deadSessionRouteLine(ref, LIVENESS_DEAD_ROW_MISSING, CARRIED_DEAD_EVIDENCE_NONE, carried),
     ])
-    expect(h.errors.filter((l) => l.includes(` on resume for ${ref} — a lost race (${describeDeadEvidence(carried)}): `))).toHaveLength(1)
+    const reread: PersonaRowReread = { kind: ROW_REREAD_FINISHED, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_MISSING) }
+    expect(h.errors.filter((l) => l.includes(` on resume for ${ref} — re-read: `))).toEqual([
+      spawnNotResumableLine('[slack] spawnForPersona:', ref, describeAgentDirectorFailure(errSpawnNotResumable()), reread, carried, lostRaceOutcome(true)),
+    ])
+    expect(calls.getCalls).toHaveLength(2)
     expect(calls.deleteCalls).toEqual([])
+    await h.settle()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-611's Test line (homed in T1, observed here), SRJ-710, SRJ-609's
+// AC 59 half (E23 T2): the restart path's relaunch after each escalate-dead
+// verdict meets ErrSpawnNotResumable on a row its re-read finds live.
+//
+// On the recovery harness (the real liveness, reconnect and kill adapters
+// over one stub, the restart deps bound as `main()` binds them, E21's
+// registry installed). Each verdict comes from the reconnect adapter's own
+// reads, P disconnected: its row reads the verdict's state until the
+// escalate-dead sweep and `missing` after it, so the run's re-probe reads it
+// finished. The relaunch's optimistic spawn collides, its collision `get`
+// reads the row `ended`, its `resume` answers ErrSpawnNotResumable once and
+// its re-read finds the row `waiting`; every later `get` (a sequence's) reads
+// it `ended` with a session id. A GONE-based verdict keeps the restart
+// path's checked kill, and the relaunch's ladder starts one live-row
+// sequence with the conversation kept (alert context `recovery`), which
+// ends in one `resume` of the row; nothing is recorded as a failure. A
+// verdict that is not dead evidence makes no kill at any point, no sequence
+// and no launch over the live row: a lost race, nothing counted, no
+// spawn-failure notice, P armed with the lost-race cause (AC 59). A covered
+// `pending` re-read starts no sequence and makes no kill after the relaunch,
+// whatever the verdict. A second run for P while the sequence runs answers
+// `sequence-waiting` with no call.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escalate-dead verdict meets ErrSpawnNotResumable on a row re-read live', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    try {
+      expect(h.stub.calls.deleteCalls).toEqual([])
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  /** One escalate-dead verdict and the reconnect adapter's reads that give it: P's row state before the sweep and the adapter's failing answer. */
+  interface VerdictReach {
+    readonly verdict: EscalateDeadVerdict
+    readonly state: string
+    readonly script: RecoveryStubScript
+  }
+
+  /** Every escalate-dead verdict, as the reconnect adapter reaches it. */
+  const VERDICT_REACHES: readonly VerdictReach[] = [
+    { verdict: 'working-tmux-gone', state: 'working', script: { readPaneError: errTmuxCaptureFailed() } },
+    { verdict: ESCALATE_DEAD_WAITING_ROW_PANE_GONE, state: 'waiting', script: { readPaneError: errTmuxCaptureFailed() } },
+    { verdict: 'dead-session', state: 'waiting', script: { sendKeysError: errTmuxSendKeys() } },
+    { verdict: 'prompt-row-tmux-gone', state: 'check_permission', script: { readPaneError: errTmuxCaptureFailed() } },
+    { verdict: 'row-not-interactive', state: 'waiting', script: { sendKeysError: errSpawnNotInteractive('send-keys') } },
+    { verdict: ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, state: 'working', script: { readPaneError: errSpawnNotFound() } },
+  ]
+
+  /** The GONE-based verdicts (b.jg5 SRJ-611), written out by hand rather than asked of the code under test. */
+  const GONE_BASED: ReadonlySet<EscalateDeadVerdict> = new Set<EscalateDeadVerdict>(['working-tmux-gone', ESCALATE_DEAD_WAITING_ROW_PANE_GONE, 'dead-session', 'prompt-row-tmux-gone'])
+
+  test('every escalate-dead verdict has a reach here', () => {
+    expect(new Set(VERDICT_REACHES.map((reach) => reach.verdict))).toEqual(new Set(ESCALATE_DEAD_VERDICTS))
+  })
+
+  /**
+   * A harness over P's row as `reach` gives its verdict, with the relaunch's
+   * re-read answering `reread`; P's key and working directory.
+   */
+  function build(reach: VerdictReach, reread: (h: RecoveryHarness, persona: Persona) => Record<string, unknown>) {
+    const h = (harness = makeRecoveryHarness({ alertThresholdMs: false }))
+    const persona = h.config.personas[0]!
+    const calls = h.stub.calls
+    h.script({
+      spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
+      getQueue: [
+        cannedOk(cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, persona, h.home)),
+        cannedOk(cannedGetResult(reread(h, persona), persona, h.home)),
+      ],
+      getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }, persona, h.home),
+      statusFn: () => cannedStatusResult({ state: calls.findMissingCalls.length > 0 ? LIVENESS_DEAD_ROW_MISSING : reach.state }),
+      resumeQueue: [cannedErr(errSpawnNotResumable())],
+      ...reach.script,
+    })
+    return { h, p: persona.key, cwd: persona.working_directory }
+  }
+
+  const WAITING = (): Record<string, unknown> => ({ state: 'waiting' })
+
+  test.each(VERDICT_REACHES.map((reach) => [reach.verdict, reach] as const))('verdict %s, the re-read finding the row waiting: a GONE-based verdict\'s checked kill, the relaunch, then one sequence ending in resume; any other verdict: no kill, no sequence, no launch over the live row, P armed with the lost-race cause; never a recordFailure or a spawn-failure notice', async (verdict, reach) => {
+    const { h, p, cwd } = build(reach, WAITING)
+    const gone = GONE_BASED.has(verdict)
+
+    const outcome = await runRestartRetry(p, cwd, isLaunchInFlight)
+
+    expect(getFailureCount(p)).toBe(0)
+    expect(h.notices).toEqual([])
+    if (!gone) {
+      expect(outcome).toBe(RESTART_OUTCOME_REFUSED)
+      expect(h.stub.calls.resumeCalls).toHaveLength(1)
+      expect([h.stub.calls.killCalls, isLiveRowSequenceRunning(p)]).toEqual([[], false])
+      // The relaunch's optimistic spawn, which collided, is its only spawn.
+      expect(h.stub.calls.spawnCalls).toHaveLength(1)
+      expect(h.triggers.filter((t) => t.key === p).map((t) => t.kind)).toEqual([UNAVAILABLE_RETRY_CAUSE_LOST_RACE])
+      return
+    }
+    expect(outcome).toBe(RESTART_OUTCOME_SEQUENCE_WAITING)
+    expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(h.config.personas[0]!.name, p), h.sequenceRequest(p, { lastReadState: 'waiting', keepsConversation: true })))
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_RESUME,
+      reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
+      result: { key: p, action: 'resumed' },
+    })
+    // The restart path's checked kill before the relaunch, then the sequence's own kill and its resume of the row: never a reuse.
+    expect(h.stub.calls.killCalls).toHaveLength(2)
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }, { claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.spawnCalls).toHaveLength(1)
+    expect(getFailureCount(p)).toBe(0)
+    await h.settle()
+  })
+
+  test.each(VERDICT_REACHES.map((reach) => [reach.verdict, reach] as const))('verdict %s, the re-read finding a covered pending row (a launch in progress): no sequence and no kill after the relaunch; nothing counted or posted', async (verdict, reach) => {
+    const { h, p, cwd } = build(reach, () => ({ state: AGENT_DIRECTOR_PENDING_STATE }))
+
+    await runRestartRetry(p, cwd, isLaunchInFlight)
+
+    expect(isLiveRowSequenceRunning(p)).toBe(false)
+    // Only a GONE-based verdict's checked kill, before the relaunch.
+    expect(h.stub.calls.killCalls).toHaveLength(GONE_BASED.has(verdict) ? 1 : 0)
+    expect([getFailureCount(p), h.notices, h.episodeNotices]).toEqual([0, [], []])
+    expect(h.triggers.filter((t) => t.key === p && t.kind === UNAVAILABLE_RETRY_CAUSE_LOST_RACE)).toEqual([])
+  })
+
+  test('a second run for P while the sequence its relaunch started runs answers sequence-waiting with no agent-director call', async () => {
+    const reach = VERDICT_REACHES[0]!
+    const { h, p, cwd } = build(reach, WAITING)
+    const hold = holdFindMissing(h.stub.client)
+    // The held runs are not in the stub's own log: the row reads finished once the escalate-dead sweep was made.
+    h.script({ statusFn: () => cannedStatusResult({ state: hold.calls.length > 0 ? LIVENESS_DEAD_ROW_MISSING : reach.state }) })
+
+    const first = runRestartRetry(p, cwd, isLaunchInFlight)
+    await hold.entered(1)
+    hold.release(cannedFindMissing())
+    expect(await first).toBe(RESTART_OUTCOME_SEQUENCE_WAITING)
+    // The sequence's first run, held.
+    await h.driveSequence(hold.entered(2))
+    expect(isLiveRowSequenceRunning(p)).toBe(true)
+    const before = personaCallCounts(h, p)
+
+    expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_SEQUENCE_WAITING)
+
+    expect(personaCallCounts(h, p)).toEqual(before)
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: p, action: 'resumed' } })
     await h.settle()
   })
 })

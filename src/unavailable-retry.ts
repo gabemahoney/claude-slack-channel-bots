@@ -377,7 +377,10 @@ export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED = 'sequence-not-judged'
  * alert), no kill under the `ad-config-malformed` rule, a launch not made, or
  * a final launch that failed or threw. A stop for a latch, a teardown or
  * shutdown, a launch that latched the persona or stops the server, a reuse
- * collision (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`) and a final launch
+ * collision (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`), a final `resume`'s
+ * `ErrSpawnNotResumable` whose re-read found a lost race
+ * (`UNAVAILABLE_RETRY_CAUSE_LOST_RACE`; one whose re-read found the row
+ * `pending` arms this cause, b.jg5 SRJ-710) and a final launch
  * whose `ErrTmuxSessionCreate` armed the timer in pending-only mode
  * (`armPendingOnly`; SRJ-112, SRJ-113, SRJ-409) arm nothing with it. Never
  * counted.
@@ -400,7 +403,10 @@ export const UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION = 'reuse-collision'
  * SRJ-710, SRJ-301): the row was not finished when the `resume` ran, so
  * nothing was killed, deleted or launched, and the persona is re-evaluated
  * at its next health tick or retry. Armed when the collision ladder's
- * `resume` meets it (`reportLostRaceAtSite`, `src/outage-state.ts`). Never
+ * not-resumable step, or a resume site's replacement after its re-read,
+ * ends in a lost race (`reportLostRaceAtSite`, `src/outage-state.ts`), and
+ * when the live-row sequence's own step-6 `resume` meets it and its re-read
+ * finds a lost race (the sequence's end, `LIVE_ROW_ARM_LOST_RACE`). Never
  * counted.
  */
 export const UNAVAILABLE_RETRY_CAUSE_LOST_RACE = 'spawn-not-resumable-lost-race'

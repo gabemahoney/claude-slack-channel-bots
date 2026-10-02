@@ -38,7 +38,14 @@
  * and the sequence started at the collision ladder's real replacement sites
  * (SRJ-707: the launch answering while it runs, its reuse at step 6, a new
  * episode at the next retry after a not-judged stop, the `recovery`
- * context). Every end without the launch arms P's retry timer with its
+ * context), and the sequence started at the ladder's `ErrSpawnNotResumable`
+ * on a path holding dead evidence (SRJ-710, SRJ-611: the launch answering
+ * while it runs, the conversation kept, step 6's launch kind by the row's
+ * session id, the `recovery` context, a new episode at the next retry after
+ * a not-judged stop) with step 6's `resume` answers through the sequence (a
+ * CONFLICT, `ErrSpawnNotFound`'s plain spawn, and `ErrSpawnNotResumable`'s
+ * one re-read: never a second sequence; the end armed with its cause, or
+ * nothing armed on a latch). Every end without the launch arms P's retry timer with its
  * exported cause, the controller's own label, through the trigger sink
  * (SRJ-301; `expectEndArmed`). Every sequence runs through the registry but
  * `runWithDeps`'s, whose dependencies a case replaces. This file asserts
@@ -80,6 +87,7 @@ import {
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
+  describeAgentDirectorFailure,
 } from '../src/ad-error-class.ts'
 import type { Phase1GetResult } from '../src/ad-phase1-types.ts'
 import { getFailureCount } from '../src/backoff.ts'
@@ -96,6 +104,7 @@ import {
 import { KILL_RETRY_ALERT_NONE, KILL_RETRY_END_SETTLED, KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import {
   LIVE_ROW_ARM_ENDED,
+  LIVE_ROW_ARM_LOST_RACE,
   LIVE_ROW_ARM_NOT_JUDGED,
   LIVE_ROW_ARM_REUSE_COLLISION,
   LIVE_ROW_LAUNCH_REASON_CONFIG_DIR_MISMATCH,
@@ -110,6 +119,8 @@ import {
   LIVE_ROW_LAUNCH_RESUME,
   LIVE_ROW_LAUNCH_REUSE,
   LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED,
+  LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
+  LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_PENDING,
   LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION,
   LIVE_ROW_OUTCOME_ABORTED,
   LIVE_ROW_OUTCOME_CONFIG_MALFORMED,
@@ -154,7 +165,9 @@ import {
   liveRowSequenceStopAskedLine,
   runLiveRowSequence,
   type LiveRowLaunchKindInput,
+  type LiveRowSequenceLaunchKind,
   type LiveRowSequenceLaunchReason,
+  type LiveRowSequenceNotLaunchedReason,
   type LiveRowSequenceArmCause,
   type LiveRowSequenceDeps,
   type LiveRowSequenceOutcome,
@@ -170,13 +183,24 @@ import { KILL_FAILURE_END_ROW_FINISHED } from '../src/persona-episodes.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
 import {
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
+  _resetFindMissingMemo,
   _resetNow,
   _setNow,
   isLaunchInFlight,
   launchSession,
   readPersonaRowState,
+  ROW_REREAD_FINISHED,
+  ROW_REREAD_LATCHED,
+  ROW_REREAD_LIVE,
+  ROW_REREAD_PENDING,
+  ROW_REREAD_REFUSED,
+  SEQUENCE_NOT_RESUMABLE_LATCHED_OUTCOME,
+  SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME,
+  SEQUENCE_NOT_RESUMABLE_PENDING_OUTCOME,
+  spawnNotResumableLine,
   startLiveRowSequence,
   sweepDeadTmuxChannel,
+  type PersonaRowReread,
   type SpawnPersonaResult,
 } from '../src/session-manager.ts'
 import {
@@ -208,9 +232,11 @@ import {
   errInvalidFlags,
   errInternal,
   errSpawnNotFound,
+  errSpawnNotResumable,
   errSystemInstallDisappeared,
   errTmuxKillFailed,
   errTmuxNotAvailable,
+  errTmuxSendKeys,
   errTmuxSessionConflict,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
@@ -226,7 +252,8 @@ import {
   type FindMissingRowPlacement,
   type PersonaGetResultOverrides,
 } from './test-helpers/agent-director-stub.ts'
-import { UNPARSEABLE_LAUNCH_START, reuseSpawnScanRows } from './test-helpers/conflict-cases.ts'
+import { UNPARSEABLE_LAUNCH_START, reuseSpawnScanRows, sequenceResumeConflictRowsAt } from './test-helpers/conflict-cases.ts'
+import { LATCH_ROW_STATE_NO_ROW, REFUSED_OPERATION_RESUME, latchRowStateRead } from '../src/conflict-latch.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { assertNoLeak, isTokenLike, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
@@ -1999,5 +2026,227 @@ describe('started at a collision ladder replacement site: the launch answers whi
     expect(h.lines).toContain(ladderStartLine(h, p, LIVE))
     expect(h.episodeNotices).toEqual([])
     expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureRecoveryEntry(p, ordinaryAlertContent(p), KILL_FAILURE_CONTEXT_RECOVERY)])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Started at the collision ladder's ErrSpawnNotResumable with dead evidence
+// (b.jg5 SRJ-710, SRJ-611, SRJ-705, SRJ-706; E23)
+//
+// A launch of P (`h.launch`) reaches the ladder's `waiting` branch; its
+// reconnect's one `send-keys` answers `ErrTmuxSendKeys` (`tmux-gone`, dead
+// evidence), so after the find-missing run P's `resume` is made; it answers
+// `ErrSpawnNotResumable`, and its one re-read finds the row `waiting`. The
+// ladder starts P's sequence through the session manager's start entry
+// (step 1, seeded `waiting`, the conversation kept, alert context
+// `recovery`) and answers `sequence-waiting` while it runs in the
+// background. Its step 6 is a `resume` of the row when the row it last read
+// has a session id, a reuse of the same id when it has none. A not-judged
+// stop arms P's timer, and the next retry, through the restart path's
+// escalate-dead relaunch, reaches the same site and begins a new episode.
+// Step 6's own `resume` follows SRJ-113's table at the entry (its rows are
+// tests/session-manager.test.ts's, its latches' records
+// tests/conflict-latch.test.ts's): here what the sequence does with each
+// answer: a CONFLICT ends it latched with no further call; ErrSpawnNotFound
+// launches by one plain spawn; ErrSpawnNotResumable makes one re-read, starts
+// no second sequence and ends the sequence without its launch, arming the
+// not-resumable end's cause (nothing when the re-read latches P).
+// ---------------------------------------------------------------------------
+
+describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the launch answers while the sequence runs, the conversation is kept, and step 6\'s resume answers end it by SRJ-113 and SRJ-710 (E23)', () => {
+  /** The ladder's calls before the sequence: the colliding spawn, the collision get, the reconnect, the find-missing run, the resume and its re-read. */
+  const LADDER_CALLS = ['spawn', 'get', 'sendKeys', 'findMissing', 'resume', 'get'] as const
+
+  /**
+   * P's launch over its `waiting` row whose reconnect answers GONE and whose
+   * `resume` answers ErrSpawnNotResumable once, its re-read finding the row
+   * `waiting`; every later `get` (the sequence's) answers `sequenceRow`.
+   */
+  function scriptGoneNotResumable(h: RecoveryHarness, key: string, sequenceRow: Phase1GetResult): void {
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk(personaRow(h, key)), cannedOk(personaRow(h, key))],
+      getResult: sequenceRow,
+      sendKeysError: errTmuxSendKeys(),
+      resumeQueue: [cannedErr(errSpawnNotResumable())],
+    })
+  }
+
+  test('the launch resolves while the sequence it started runs (its first run held), answering sequence-waiting with no launch of its own; released, the sequence reads the row missing with a session id and makes one resume of it, no reuse', async () => {
+    const { h, p } = build()
+    scriptGoneNotResumable(h, p, personaRow(h, p, { state: MISSING, claude_session_id: SESSION_ID }))
+    const hold = holdFindMissing(h.stub.client)
+    const order = recordCallOrder(h)
+
+    const launched = h.launch(p)
+    // The ladder's own find-missing run before its resume.
+    await hold.entered(1)
+    hold.release(cannedFindMissing())
+    expect(await launched).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    await h.driveSequence(hold.entered(2))
+    expect(h.sequenceRunning(p)).toBe(true)
+    expect(order).toEqual([...LADDER_CALLS, 'kill', 'get', 'findMissing'])
+    expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: LIVE, keepsConversation: true })))
+
+    hold.release(placed(p, 'ids'))
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_RESUME,
+      reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
+      result: { key: p, action: 'resumed' },
+    })
+    expectCallsThenApprover(order, [...LADDER_CALLS, 'kill', 'get', 'findMissing', 'get', 'resume'])
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }, { claude_instance_id: personaInstanceId(p) }])
+    expect(h.reuseSpawns()).toEqual([])
+    await h.runApproverToStop(p)
+  })
+
+  test.each<[string, PersonaGetResultOverrides, LiveRowSequenceLaunchKind, LiveRowSequenceLaunchReason]>([
+    ['ended with a session id', { state: ENDED, claude_session_id: SESSION_ID }, LIVE_ROW_LAUNCH_RESUME, LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION],
+    ['missing with a session id', { state: MISSING, claude_session_id: SESSION_ID }, LIVE_ROW_LAUNCH_RESUME, LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION],
+    ['ended with no session id', { state: ENDED }, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_LAUNCH_REASON_NO_SESSION_ID],
+  ])('the sequence kills, gets, runs and gets; a row read %s gives step 6\'s launch kind: a resume of the session id, or one reuse of the same id when it has none', async (_label, row, launchKind, reason) => {
+    const { h, p } = build()
+    scriptGoneNotResumable(h, p, personaRow(h, p, row))
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind, reason, kills: 1, runs: 1 })
+
+    const launch = launchKind === LIVE_ROW_LAUNCH_RESUME ? 'resume' : 'spawn'
+    expectCallsThenApprover(order, [...LADDER_CALLS, 'kill', 'get', 'findMissing', 'get', launch])
+    if (launchKind === LIVE_ROW_LAUNCH_RESUME) expect(h.reuseSpawns()).toEqual([])
+    else expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(getFailureCount(p)).toBe(0)
+    await h.runApproverToStop(p)
+  })
+
+  test('a step-5 escalation of the sequence the not-resumable step started carries the recovery context: P removed meanwhile gets one persona-kill-failed entry with it, and nothing to Slack', async () => {
+    const { h, p } = build()
+    scriptGoneNotResumable(h, p, personaRow(h, p))
+    // The sequence's last get: after the ladder's calls, its kill, get, three runs and gets, kill, and one run.
+    const lastGet = [...LADDER_CALLS, 'kill', 'get', ...runAndGet(LIVE_ROW_SEQUENCE_STEP3_RUNS), 'kill', ...runAndGet(1)].length - 1
+    recordCallOrder(h, { at: lastGet, run: () => h.remove(p) })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_ESCALATED })
+
+    expect(h.episodeNotices).toEqual([])
+    expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureRecoveryEntry(p, ordinaryAlertContent(p), KILL_FAILURE_CONTEXT_RECOVERY)])
+  })
+
+  test('a not-judged stop arms P\'s timer; its next retry, through the restart path\'s escalate-dead relaunch, reaches the not-resumable site again and begins a new sequence episode, which ends in resume', async () => {
+    const { h, p } = build()
+    await pastSampleGrace(h)
+    const calls = h.stub.calls
+    // Episode 1: the sequence reads P's own pending row (past its wait), and its run leaves it in neither list.
+    scriptGoneNotResumable(h, p, personaRow(h, p, { state: PENDING }))
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_NOT_JUDGED })
+    expect(h.controller.view(p)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED])
+
+    // Episode 2: the retry's run reads the row waiting until its escalate-dead
+    // sweep (the reconnect's GONE: verdict dead-session) and ended after it;
+    // its checked kill, then its relaunch: the collision get reads ended, the
+    // resume answers ErrSpawnNotResumable, the re-read finds the row waiting.
+    const sweptAfter = calls.findMissingCalls.length
+    h.script({
+      statusFn: () => cannedStatusResult({ state: calls.findMissingCalls.length > sweptAfter ? ENDED : LIVE }),
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk(personaRow(h, p, { state: ENDED })), cannedOk(personaRow(h, p))],
+      getResult: personaRow(h, p, { state: ENDED, claude_session_id: SESSION_ID }),
+      resumeQueue: [cannedErr(errSpawnNotResumable())],
+    })
+    // The escalate-dead sweep is a new run, not the memo's answer from episode 1.
+    _resetFindMissingMemo()
+    await retryNow(h, p)
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'resumed' } })
+
+    const startLine = liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: LIVE, keepsConversation: true }))
+    expect(h.lines.filter((line) => line.startsWith(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${renderPersonaRef(p, p)}: started at step `))).toEqual([startLine, startLine])
+    expect(h.reuseSpawns()).toEqual([])
+    await h.runApproverToStop(p)
+    h.controller.stop(p, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+  })
+
+  // Step 6's own `resume` (SRJ-113 at the entry, SRJ-710): each sequence
+  // reads the row `ended` with a session id at its step-2 get and after its
+  // one run, so its step 6 is a `resume`, after one kill, get, run and get.
+  const SEQUENCE_CALLS = ['kill', 'get', 'findMissing', 'get', 'resume'] as const
+
+  /** Run P's sequence to its step-6 `resume`, which answers `err`; the `get` after it (the not-resumable step's re-read) answers `reread`. */
+  async function runToStep6Resume(h: RecoveryHarness, key: string, err: Error, reread?: Phase1GetResult | Error): Promise<{ outcome: LiveRowSequenceOutcome; order: string[] }> {
+    const row = personaRow(h, key, { state: ENDED, claude_session_id: SESSION_ID })
+    h.script({ resumeError: err, getResult: row, ...(reread === undefined ? {} : { getQueue: [cannedOk(row), cannedOk(row), reread instanceof Error ? cannedErr(reread) : cannedOk(reread)] }) })
+    const order = recordCallOrder(h)
+    const outcome = await h.runSequence(key, { lastReadState: LIVE, keepsConversation: true })
+    return { outcome, order }
+  }
+
+  test('step 6\'s resume answering CONFLICT: P latched with the refused operation "resume", the sequence ends with no further call and nothing armed', async () => {
+    const { h, p } = build()
+    const row = sequenceResumeConflictRowsAt(ENDED)[0]!
+
+    const { outcome, order } = await runToStep6Resume(h, p, row.build())
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'latched' } })
+    expect(outcome.armed).toBeUndefined()
+    expect(order).toEqual([...SEQUENCE_CALLS])
+    expect(h.latch.record(p)?.refusedOperation).toBe(REFUSED_OPERATION_RESUME)
+    expect(h.triggers).toEqual([])
+  })
+
+  test('step 6\'s resume answering ErrSpawnNotFound: one plain spawn of the id (no reuse flag) and the sequence launches; no spawn-failure notice, nothing counted, nothing armed', async () => {
+    const { h, p } = build()
+
+    const { outcome, order } = await runToStep6Resume(h, p, errSpawnNotFound())
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'spawned' } })
+    expect(outcome.armed).toBeUndefined()
+    expectCallsThenApprover(order, [...SEQUENCE_CALLS, 'spawn'])
+    expect(h.stub.calls.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([[personaInstanceId(p), undefined]])
+    expect([h.notices, h.triggers, getFailureCount(p)]).toEqual([[], [], 0])
+    await h.runApproverToStop(p)
+  })
+
+  /**
+   * Step 6's ErrSpawnNotResumable, by what its re-read finds: the not-launched reason, the line's re-read and outcome, and the cause the end arms (none when the re-read latches P).
+   * A re-read in a state CSCB does not know (an unreadable one included) is the SRJ-611 describe's in tests/session-manager.test.ts, on a sequence a GONE-based path started.
+   */
+  const STEP6_NOT_RESUMABLE: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => Phase1GetResult | Error, LiveRowSequenceNotLaunchedReason, (h: RecoveryHarness, key: string) => PersonaRowReread, string, LiveRowSequenceArmCause | undefined, readonly string[]]> = [
+    ['the row ended (a lost race)', (h, key) => personaRow(h, key, { state: ENDED }), LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE, () => ({ kind: ROW_REREAD_FINISHED, lastRead: latchRowStateRead(ENDED) }), SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, LIVE_ROW_ARM_LOST_RACE, []],
+    ['no row (a lost race)', () => errSpawnNotFound(), LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE, () => ({ kind: ROW_REREAD_FINISHED, lastRead: LATCH_ROW_STATE_NO_ROW }), SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, LIVE_ROW_ARM_LOST_RACE, []],
+    ['the row waiting (live, yet no second sequence: a lost race)', (h, key) => personaRow(h, key), LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE, (h, key) => ({ kind: ROW_REREAD_LIVE, row: personaRow(h, key), lastRead: latchRowStateRead(LIVE) }), SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, LIVE_ROW_ARM_LOST_RACE, []],
+    ['a refused read (UNAVAILABLE): a lost race after the read\'s own cause', () => unavailableAt('get'), LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE, () => ({ kind: ROW_REREAD_REFUSED }), SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, LIVE_ROW_ARM_LOST_RACE, [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE]],
+    ['the row pending (a launch in progress)', (h, key) => personaRow(h, key, { state: PENDING }), LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_PENDING, (h, key) => ({ kind: ROW_REREAD_PENDING, row: personaRow(h, key, { state: PENDING }), lastRead: latchRowStateRead(PENDING) }), SEQUENCE_NOT_RESUMABLE_PENDING_OUTCOME, LIVE_ROW_ARM_ENDED, []],
+  ]
+
+  test.each(STEP6_NOT_RESUMABLE)('step 6\'s resume answering ErrSpawnNotResumable, its re-read finding %s: one get, no second sequence, kill, delete or launch; not launched, nothing counted; the end arms its cause', async (_label, reread, reason, rereadOf, lineOutcome, cause, before) => {
+    const { h, p } = build()
+
+    const { outcome, order } = await runToStep6Resume(h, p, errSpawnNotResumable(), reread(h, p))
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, notLaunched: reason, kills: 1 })
+    expect(order).toEqual([...SEQUENCE_CALLS, 'get'])
+    expect(h.errors.filter((line) => line.includes(` on resume for ${renderPersonaRef(p, p)} — re-read: `))).toEqual([
+      spawnNotResumableLine(LIVE_ROW_SEQUENCE_LOG_PREFIX, renderPersonaRef(p, p), describeAgentDirectorFailure(errSpawnNotResumable()), rereadOf(h, p), undefined, lineOutcome),
+    ])
+    expect(h.sequenceRunning(p)).toBe(false)
+    expectEndArmed(h, outcome, cause!, before)
+  })
+
+  test('step 6\'s resume answering ErrSpawnNotResumable, its re-read latching P (its own pending row with no launch start): the sequence stops for the latch with nothing armed and no further call', async () => {
+    const { h, p } = build()
+
+    const { outcome, order } = await runToStep6Resume(h, p, errSpawnNotResumable(), personaRow(h, p, { state: PENDING, launch_started_at: SAMPLE_LAUNCH_START_NONE }))
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
+    expect(outcome.armed).toBeUndefined()
+    expect(order).toEqual([...SEQUENCE_CALLS, 'get'])
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect(h.errors.filter((line) => line.includes(` on resume for ${renderPersonaRef(p, p)} — re-read: `))).toEqual([
+      spawnNotResumableLine(LIVE_ROW_SEQUENCE_LOG_PREFIX, renderPersonaRef(p, p), describeAgentDirectorFailure(errSpawnNotResumable()), { kind: ROW_REREAD_LATCHED }, undefined, SEQUENCE_NOT_RESUMABLE_LATCHED_OUTCOME),
+    ])
+    expect([h.triggers, h.controller.armedKeys(), getFailureCount(p)]).toEqual([[], [], 0])
   })
 })

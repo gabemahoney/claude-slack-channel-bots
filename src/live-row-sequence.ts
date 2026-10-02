@@ -34,10 +34,15 @@
  *      manager's sequence-launch entry, whose reuse is the session manager's
  *      one reuse spawn (SRJ-112). A launch whose result is no success
  *      (`liveRowLaunchSucceeded`: `failed`, `deferred`, `latched`), a reuse
- *      that collided with a live row (not launched, `reuse-collision`) or a
- *      launch that throws ends the sequence without its launch, with no
- *      further call: no delete, no kill and no fresh spawn. The no-launch
- *      form (an old-life wait) ends as "row finished".
+ *      that collided with a live row (not launched, `reuse-collision`), a
+ *      `resume` that answered `ErrSpawnNotResumable` (not launched, after the
+ *      entry's one re-read of the row: `not-resumable` for a lost race,
+ *      `not-resumable-pending` for a launch in progress; SRJ-710, never a
+ *      second sequence) or a launch that throws ends the sequence without
+ *      its launch, with no further call: no delete, no kill and no further
+ *      launch. A re-read that latched P (`not-resumable-latched`) stops the
+ *      sequence as a latch does. The no-launch form (an old-life wait) ends
+ *      as "row finished".
  * At most 4 runs and 2 kills (each with its tries) per sequence.
  *
  * What a step may do (SRJ-706): before every agent-director call the
@@ -67,7 +72,10 @@
  * Every end without the launch arms P's retry timer through the injected arm
  * (SRJ-301): with the not-judged cause after SRJ-717's stop, with the
  * reuse-collision cause after a reuse collision at step 6 (SRJ-112, SRJ-705),
- * with the other-end cause otherwise, a step-6 launch that failed or threw
+ * with the lost-race cause after a step-6 `resume`'s `ErrSpawnNotResumable`
+ * whose re-read found a lost race (SRJ-710), with the other-end cause
+ * otherwise, that `ErrSpawnNotResumable` on a row re-read `pending`, a step-6
+ * launch that failed or threw
  * included, whether or not the launch's own refusal handling armed it too; a
  * stop for a latch, a teardown, shutdown or a persona that is not up, an
  * abort that latched P, an abort whose version re-check stops the server, a
@@ -91,16 +99,25 @@
  * close stop every one, and after close no start is taken. The running query
  * answers by persona key.
  *
- * Its production starters are the collision ladder's replacement sites
- * (SRJ-707; the session manager's replace step, `replacePersonaRow`, through
- * its start entry `startLiveRowSequence`): a row the ladder cannot keep
- * (`resume_enabled` false, a `cwd` mismatch, a `config_dir` label missing or
- * different, the last at a resume and at a `pending` row) that it last read
- * live, `pending` included. Each such request enters at step 1, seeded with
- * the state the ladder last read, with the conversation not kept, the key
- * not retired, a launch at the end and the alert context `recovery`, so its
- * step 6 is a reuse spawn of the same id; the ladder answers
- * `sequence-waiting` whatever the start answers.
+ * Its production starters, all through the session manager's start entry
+ * `startLiveRowSequence`, are:
+ *   - the collision ladder's replacement sites (SRJ-707; the session
+ *     manager's replace step, `replacePersonaRow`): a row the ladder cannot
+ *     keep (`resume_enabled` false, a `cwd` mismatch, a `config_dir` label
+ *     missing or different, the last at a resume and at a `pending` row)
+ *     that it last read live, `pending` included: the collision `get`'s or a
+ *     re-read's live state, or a dead-session path's earlier live read only
+ *     when that path holds dead evidence (SRJ-609, SRJ-611). Each such
+ *     request enters at step 1, seeded with the state the ladder last read,
+ *     with the conversation not kept, the key not retired, a launch at the
+ *     end and the alert context `recovery`, so its step 6 is a reuse spawn
+ *     of the same id;
+ *   - the collision ladder's `resume` answering `ErrSpawnNotResumable` on a
+ *     path that holds dead evidence (SRJ-710, SRJ-611), whose re-read finds
+ *     the row in a live state other than `pending`: the same request with
+ *     the re-read state as its seed and the conversation kept, so its step 6
+ *     is a `resume` when the row has a session id and P may resume it.
+ * The ladder answers `sequence-waiting` whatever the start answers.
  *
  * The module holds no module-scope state, runs nothing at
  * import, and loads neither the session manager, the server, the notifier
@@ -383,8 +400,25 @@ export interface LiveRowSequenceLaunchResult {
  * the end arms the reuse-collision cause.
  */
 export const LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION = 'reuse-collision'
-/** Not launched: the `resume` answered `ErrSpawnNotResumable` (SRJ-710: no second sequence). */
+/**
+ * Not launched: the `resume` answered `ErrSpawnNotResumable` and the re-read
+ * of the row found a lost race: a live state other than `pending`, `ended`,
+ * `missing` or no row, or the read failed (SRJ-710: no second sequence).
+ * Nothing is counted; the end arms the lost-race cause.
+ */
 export const LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE = 'not-resumable'
+/**
+ * Not launched: the `resume` answered `ErrSpawnNotResumable` and the re-read
+ * found the row `pending`, a launch in progress (SRJ-710: no second
+ * sequence). Nothing is counted or posted; the end arms the other-end cause.
+ */
+export const LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_PENDING = 'not-resumable-pending'
+/**
+ * Not launched: the `resume` answered `ErrSpawnNotResumable` and the re-read
+ * latched P (SRJ-710, SRJ-706): the sequence ends stopped for the latch, with
+ * nothing armed.
+ */
+export const LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_LATCHED = 'not-resumable-latched'
 /** Not launched: P is not in the applied configuration. */
 export const LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED = 'not-applied'
 /**
@@ -398,6 +432,8 @@ export const LIVE_ROW_NOT_LAUNCHED_STOPPED = 'stopped'
 export type LiveRowSequenceNotLaunchedReason =
   | typeof LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION
   | typeof LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE
+  | typeof LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_PENDING
+  | typeof LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_LATCHED
   | typeof LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED
   | typeof LIVE_ROW_NOT_LAUNCHED_STOPPED
 
@@ -506,12 +542,21 @@ export const LIVE_ROW_ARM_ENDED = 'sequence-ended-without-launch'
  * (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`), as for the other causes.
  */
 export const LIVE_ROW_ARM_REUSE_COLLISION = 'reuse-collision'
+/**
+ * Arm P's retry timer with the lost-race cause (SRJ-710, SRJ-301): step 6's
+ * `resume` answered `ErrSpawnNotResumable` and the re-read found a lost race
+ * (`LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE`). The same string as the retry
+ * controller's cause label for it (`UNAVAILABLE_RETRY_CAUSE_LOST_RACE`), as
+ * for the other causes.
+ */
+export const LIVE_ROW_ARM_LOST_RACE = 'spawn-not-resumable-lost-race'
 
 /** Which retry cause an end arms with; the dependency builder maps it to the retry controller's label, the same string. */
 export type LiveRowSequenceArmCause =
   | typeof LIVE_ROW_ARM_NOT_JUDGED
   | typeof LIVE_ROW_ARM_ENDED
   | typeof LIVE_ROW_ARM_REUSE_COLLISION
+  | typeof LIVE_ROW_ARM_LOST_RACE
 
 /** What every outcome carries: the counts, and the cause it armed (absent when it armed nothing). */
 interface OutcomeCounts {
@@ -1041,7 +1086,9 @@ export async function runLiveRowSequence(
    * (SRJ-112, SRJ-113, SRJ-409: pending-only unless another cause holds); an
    * arm the launch's own refusal handling made already keeps its due time. A
    * reuse collision at step 6 arms the reuse-collision cause (SRJ-112,
-   * SRJ-705).
+   * SRJ-705); a `resume`'s `ErrSpawnNotResumable` whose re-read found a lost
+   * race arms the lost-race cause, and one whose re-read found the row
+   * `pending` the other-end cause (SRJ-710).
    */
   const armCauseFor = (body: OutcomeBody): LiveRowSequenceArmCause | undefined => {
     if (!request.launches) return undefined
@@ -1056,6 +1103,9 @@ export async function runLiveRowSequence(
       case LIVE_ROW_OUTCOME_NOT_LAUNCHED:
         if (body.notLaunched === LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION) {
           return latchedNow() ? undefined : LIVE_ROW_ARM_REUSE_COLLISION
+        }
+        if (body.notLaunched === LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE) {
+          return latchedNow() ? undefined : LIVE_ROW_ARM_LOST_RACE
         }
         break
       case LIVE_ROW_OUTCOME_ROW_FINISHED:
@@ -1250,6 +1300,11 @@ export async function runLiveRowSequence(
       return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: droppedBy }
     }
     if (answer.kind === LIVE_ROW_OUTCOME_NOT_LAUNCHED) {
+      // SRJ-710, SRJ-706: a re-read after `ErrSpawnNotResumable` that
+      // latched P ends the sequence as any latch does, with nothing armed.
+      if (answer.reason === LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_LATCHED) {
+        return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED }
+      }
       return { kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, launchKind: decision.kind, notLaunched: answer.reason }
     }
     return { kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: decision.kind, reason: decision.reason, result: answer.result }

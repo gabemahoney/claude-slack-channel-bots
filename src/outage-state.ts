@@ -830,9 +830,11 @@ export function reportReuseCollisionAtSite(key: string): boolean {
 }
 
 /**
- * reportLostRaceAtSite — a lost race on `resume`'s `ErrSpawnNotResumable`
- * (b.jg5 SRJ-710, SRJ-301) at the collision ladder, which ends its attempt
- * on it with nothing killed, deleted or launched: inside a launch or
+ * reportLostRaceAtSite — a lost race at the collision ladder (b.jg5
+ * SRJ-710, SRJ-609, SRJ-301): `resume`'s `ErrSpawnNotResumable` whose
+ * re-read found no reason to act, or a resume site's replacement whose
+ * re-read found the row live on a path with no dead evidence. The ladder
+ * ends its attempt on it with nothing killed, deleted or launched: inside a launch or
  * recovery attempt for `key` it arms the persona's retry timer with the
  * lost-race cause (`UNAVAILABLE_RETRY_CAUSE_LOST_RACE`) through the
  * installed trigger sink, and the attempt records it as its last error, so

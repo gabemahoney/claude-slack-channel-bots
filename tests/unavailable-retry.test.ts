@@ -176,7 +176,7 @@ import {
   type KillRetryResult,
 } from '../src/kill-retry.ts'
 import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
-import type { Phase1SpawnParams } from '../src/ad-phase1-types.ts'
+import type { Phase1GetResult, Phase1SpawnParams } from '../src/ad-phase1-types.ts'
 import { ERR_SCHEMA_MISMATCH_NAME, ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
@@ -199,6 +199,8 @@ import {
   LIVE_ROW_OUTCOME_ESCALATED,
   LIVE_ROW_OUTCOME_LAUNCHED,
   LIVE_ROW_OUTCOME_NOT_JUDGED,
+  LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+  LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
   LIVE_ROW_OUTCOME_STOPPED,
   LIVE_ROW_READ_ROW,
   LIVE_ROW_SEQUENCE_STEP3_RUNS,
@@ -210,6 +212,7 @@ import {
 import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
+  LIVENESS_DEAD_ROW_MISSING,
   LIVENESS_LIVE,
   LIVENESS_PENDING,
   LIVENESS_READING_UNKNOWN,
@@ -400,9 +403,12 @@ import {
   errUnusableName,
   holdFindMissing,
   holdSpawns,
+  errTmuxSendKeys,
   SAMPLE_LAUNCH_START_FRACTIONAL,
+  SAMPLE_LAUNCH_START_NONE,
   SAMPLE_LAUNCH_STARTS,
   unavailableForms,
+  type CannedResponse,
 } from './test-helpers/agent-director-stub.ts'
 import {
   assertNoLeak,
@@ -7820,9 +7826,11 @@ describe('unavailable retry: a running live-row sequence blocks P\'s retry and i
 // On the recovery harness, both settings 0, one start-pass launch each: a
 // second `ErrInstanceIdCollision` from a reuse (the first re-ran
 // get-then-act once, whose `get` read the row finished again) and a lost
-// race on `resume`'s `ErrSpawnNotResumable` each arm P's timer once with
-// their exported cause, count nothing and make no kill, delete or further
-// launch; the lost race's next retry runs the restart path's decision. And a
+// race on `resume`'s `ErrSpawnNotResumable` (its one re-read finding the row
+// `ended`, `missing` or gone, or live on a path with no dead evidence) each
+// arm P's timer once with their exported cause, count nothing and make no
+// kill, delete or further launch; the lost race's next retry runs the
+// restart path's decision, whose `resume` then brings P up. And a
 // full-mode retry whose own launch meets a live row at a replacement site,
 // which starts P's live-row sequence (held at its first run): the restart
 // run answers sequence-waiting, so the timer re-arms naming the sequence.
@@ -7845,27 +7853,42 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
     expectUntouched(h, other)
   })
 
-  test('a lost race: resume answering ErrSpawnNotResumable arms P\'s timer once with the lost-race cause, counts nothing and makes no kill, delete or launch; the next retry re-runs the restart path\'s decision', async () => {
+  // b.jg5 SRJ-710, SRJ-301: resume's ErrSpawnNotResumable makes one re-read;
+  // a finished row, no row, or a live row on a path with no dead evidence is
+  // a lost race, re-evaluated at P's next retry.
+  test.each<[string, (h: RecoveryHarness, key: string) => CannedResponse<Phase1GetResult>]>([
+    ['the row ended', (h, key) => cannedOk(personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED }))],
+    ['the row missing', (h, key) => cannedOk(personaRow(h, key, { state: LIVENESS_DEAD_ROW_MISSING }))],
+    ['no row (ErrSpawnNotFound)', () => cannedErr(errSpawnNotFound())],
+    ['the row waiting, the path holding no dead evidence', (h, key) => cannedOk(personaRow(h, key))],
+  ])('a lost race: resume answering ErrSpawnNotResumable, its re-read finding %s, arms P\'s timer once with the lost-race cause, counts nothing and makes no kill, delete or launch; the next retry re-runs the restart path\'s decision, and a resume that then succeeds brings P up', async (_label, reread) => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key, other] = h.keys as [string, string]
-    h.script({ ...collided(h, personaOf(h, key), { state: LIVENESS_DEAD_ROW_ENDED }), resumeError: errSpawnNotResumable() })
+    h.script({
+      ...collided(h, personaOf(h, key), { state: LIVENESS_DEAD_ROW_ENDED }),
+      getQueue: [cannedOk(personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED })), reread(h, key)],
+      resumeQueue: [cannedErr(errSpawnNotResumable())],
+    })
 
     expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
 
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_LOST_RACE)
-    expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1, resumeCalls: 1 })
+    expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 2, resumeCalls: 1 })
     expect(getFailureCount(key)).toBe(0)
     expect([h.notices, h.episodeNotices, h.startupErrors()]).toEqual([[], [], []])
     expectUntouched(h, other)
 
-    // The row now reads live and P's session connects: the retry's decision finds nothing to recover.
-    h.script({ statusResult: cannedStatusResult() })
-    h.setConnected(key, true)
+    // The retry's decision reads the row finished: its relaunch's spawn collides, its get reads the row ended, and its resume succeeds.
+    h.script({ statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }), spawnQueue: [cannedErr(errInstanceIdCollision())] })
     await retryNow(h, key)
 
     expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, causes: [UNAVAILABLE_RETRY_CAUSE_LOST_RACE] })])
-    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
-    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(key) }, { claude_instance_id: personaInstanceId(key) }])
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_LOST_RACE }])
+    // P was launched: its timer now waits on the launch's pending row (pending-only mode).
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
+    expect(h.controller.view(key)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
+    expect(getFailureCount(key)).toBe(0)
     expect(h.stub.calls.deleteCalls).toEqual([])
   })
 
@@ -7900,5 +7923,121 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
     expect(h.sequenceRunning(key)).toBe(false)
     h.controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
     expectUntouched(h, other)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ErrSpawnNotResumable's re-read as an SRJ-301 trigger (b.jg5 SRJ-710,
+// SRJ-301, SRJ-706; E23)
+//
+// On the recovery harness, both settings 0. A `pending` re-read is a launch
+// in progress: no lost-race cause, and P's timer is armed exactly as the
+// ladder's `pending` branch arms it on the same row (Q's launch meeting that
+// row at its collision `get`: none today; E28 adds the covered row's arm). A
+// path holding dead evidence whose re-read finds the row `waiting` starts
+// P's live-row sequence: no lost-race arm, and a retry that fires while the
+// sequence runs is refused (E21) with nothing counted. Step 6's own
+// ErrSpawnNotResumable ends the sequence without its launch; the arm its end
+// makes (tests/live-row-sequence.test.ts) brings P's next retry, which runs
+// the restart path's decision; after a re-read that latched P nothing is
+// armed and no retry comes.
+// ---------------------------------------------------------------------------
+
+describe('unavailable retry: ErrSpawnNotResumable\'s re-read as a trigger: pending arms only what the ladder\'s pending branch arms, a running sequence refuses the retry, step 6\'s end brings the next retry (SRJ-710, SRJ-301, SRJ-706)', () => {
+  /** P's launch through its `waiting` row's GONE dead-session route (dead evidence), its `resume` answering ErrSpawnNotResumable once and its re-read reading `reread`; every later `get` reads `after`. */
+  function scriptGone(h: RecoveryHarness, key: string, reread: Phase1GetResult, after: Phase1GetResult): void {
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk(personaRow(h, key)), cannedOk(reread)],
+      getResult: after,
+      sendKeysError: errTmuxSendKeys(),
+      resumeQueue: [cannedErr(errSpawnNotResumable())],
+    })
+  }
+
+  /** What `key` has armed: the causes sent for it and its timer's view. */
+  const armsOf = (h: RecoveryHarness, key: string) => ({ sent: h.triggers.filter((t) => t.key === key).map((t) => t.kind), view: h.controller.view(key) })
+
+  test('a pending re-read (a covered row, its launch start recorded): no lost-race cause; P\'s arms equal those of the ladder\'s pending branch on the same row (Q\'s); nothing counted', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    scriptGone(h, key, personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE }), personaRow(h, key, ENDED_WITH_SESSION))
+
+    expect(await h.launch(key)).toEqual({ key, action: 'no-op' })
+    expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_LOST_RACE)).toEqual([])
+
+    h.script({ ...collided(h, personaOf(h, other), { state: AGENT_DIRECTOR_PENDING_STATE }), sendKeysError: undefined })
+    expect(await h.launch(other)).toEqual({ key: other, action: 'no-op' })
+
+    expect(armsOf(h, key)).toEqual(armsOf(h, other))
+    expect([getFailureCount(key), h.notices]).toEqual([0, []])
+  })
+
+  test('dead evidence and a waiting re-read: P\'s sequence starts with no lost-race arm; a retry that fires while it runs is refused at the doubled wait with no call for P, nothing counted', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    scriptGone(h, key, personaRow(h, key), personaRow(h, key, ENDED_WITH_SESSION))
+    const hold = holdFindMissing(h.stub.client)
+
+    const launched = h.launch(key)
+    // The ladder's own find-missing run before its resume; the sequence's first run stays held.
+    await hold.entered(1)
+    hold.release(cannedFindMissing())
+    expect(await launched).toEqual({ key, action: 'sequence-waiting' })
+    await h.driveSequence(hold.entered(2))
+    expect(h.sequenceRunning(key)).toBe(true)
+    expect(h.triggers).toEqual([])
+
+    h.controller.arm(key, UNAVAILABLE)
+    const pCalls = personaCallCounts(h, key)
+    await h.advance(waitMs(0))
+
+    expect(personaCallCounts(h, key)).toEqual(pCalls)
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, 1))
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', refusals: 1 })
+    expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_LOST_RACE)).toEqual([])
+    expect(getFailureCount(key)).toBe(0)
+
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(key)]: 'ids' } }))
+    expect(await h.driveSequence(h.sequenceSettled(key))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME })
+    await h.settle()
+    h.controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+  })
+
+  test('step 6\'s ErrSpawnNotResumable, its re-read finding the row ended: the sequence ends without its launch, P armed with the lost-race cause, nothing counted; the next retry runs the restart path\'s decision', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    const ended = personaRow(h, key, ENDED_WITH_SESSION)
+    h.script({ getQueue: [cannedOk(ended), cannedOk(ended), cannedOk(ended)], getResult: ended, resumeError: errSpawnNotResumable() })
+
+    const outcome = await h.runSequence(key, { lastReadState: LIVE_STATE, keepsConversation: true })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, notLaunched: LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE })
+    expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_LOST_RACE])
+    expect(getFailureCount(key)).toBe(0)
+
+    // The row now reads live and P's session connects: the retry's decision finds nothing to recover.
+    h.script({ statusResult: cannedStatusResult(), resumeError: undefined })
+    h.setConnected(key, true)
+    await retryNow(h, key)
+
+    expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, causes: [UNAVAILABLE_RETRY_CAUSE_LOST_RACE] })])
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
+    expect(h.stub.calls.resumeCalls).toHaveLength(1)
+  })
+
+  test('step 6\'s ErrSpawnNotResumable, its re-read latching P (its own pending row with no launch start): nothing armed, and no retry comes', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    const ended = personaRow(h, key, ENDED_WITH_SESSION)
+    h.script({ getQueue: [cannedOk(ended), cannedOk(ended), cannedOk(personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }))], getResult: ended, resumeError: errSpawnNotResumable() })
+
+    const outcome = await h.runSequence(key, { lastReadState: LIVE_STATE, keepsConversation: true })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED })
+    expect(h.latch.isLatched(key)).toBe(true)
+    expectNothingArmed(h)
+    await h.advance(waitMs(0))
+    expect(h.attempts).toEqual([])
   })
 })

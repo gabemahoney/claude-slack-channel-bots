@@ -583,11 +583,39 @@ export function errTmuxSessionCreate(verb: string = 'resume'): ErrTmuxSessionCre
  * sentence: the retry's read of the row decides (b.jg5 SRJ-112, SRJ-409).
  */
 export function errTmuxSessionCreateStaysPending(verb: string = 'spawn'): ErrTmuxSessionCreate {
-  return new ErrTmuxSessionCreate(
-    verb,
-    'ErrTmuxSessionCreate',
-    'tmux: new-session failed: tmux session already exists; the row could not be restored and stays pending',
-  )
+  return withRestoreSentence(errTmuxSessionCreate(verb), RESTORE_SENTENCE_STAYS_PENDING)
+}
+
+/** HO rev 28's restore sentence for a row agent-director could not restore: it stays `pending`. */
+export const RESTORE_SENTENCE_STAYS_PENDING = 'the row could not be restored and stays pending'
+
+/**
+ * HO rev 28's four restore sentences (ADSRD SR-1.4, SR-8.5): one ends the
+ * description of a `resume` or reuse whose launch failed after its move or
+ * reset (a launch timeout carries none): the row was restored to its prior
+ * state; it changed after the move and was left as it is; it was removed, so
+ * nothing was restored; or it could not be restored and stays `pending`.
+ * CSCB keys no behaviour on them (b.jg5 SRJ-113), and `src/` holds none, so
+ * a case's row stays as the case scripts it (`statusFn`, `getFn`), never
+ * derived from the sentence.
+ */
+export const RESTORE_SENTENCES: readonly string[] = Object.freeze([
+  'the row was restored to its prior state',
+  'the row changed after the move and was left as it is',
+  'the row was removed after the move, so nothing was restored',
+  RESTORE_SENTENCE_STAYS_PENDING,
+])
+
+/**
+ * `err` again, its description ending with `sentence` (one of
+ * {@link RESTORE_SENTENCES}): the same class, verb and name, so it
+ * classifies as `err` does.
+ */
+export function withRestoreSentence<E extends AgentDirectorError>(err: E, sentence: string): E {
+  const Made = err.constructor as new (verb: string, errName: string, description: string) => E
+  const restored = new Made(err.verb, err.errName, `${err.errDescription}; ${sentence}`)
+  restored.name = err.name
+  return restored
 }
 
 /** Build an ErrCwdNotFound (the client's class): the working directory `cwd` does not exist. */
@@ -914,8 +942,9 @@ export const CONFLICT_CASES: readonly ConflictCase[] = [
 /**
  * The variants of `errTmuxSessionConflict` the positional form cannot select.
  * Each is valid on its own cases only:
- *   - `plainSpawn`: `different-id` or `another-store` met by a plain spawn at
- *     "duplicate session";
+ *   - `plainSpawn`: `different-id` or `another-store` met at "duplicate
+ *     session" (by a plain spawn; the reuse and `resume` case rows take it as
+ *     their "duplicate session" form);
  *   - `notAdopted`: `pane-not-found` after a lost create reply whose pane was
  *     not adopted;
  *   - `scan`: `conflicting-labels` from the pre-spawn scan.

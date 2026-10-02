@@ -204,8 +204,45 @@
  *     of the same id, a live row through the live-row sequence first. The
  *     SRJ-707 describe covers each replacement site on the recovery harness:
  *     the reuse's parameters, SRJ-112's rows there, the sequence the ladder
- *     starts for a live row and SRJ-110 at its first kill, the deferred
- *     `cwd` check and the lost race on `ErrSpawnNotResumable` (SRJ-710).
+ *     starts for a live row (a dead-session route's only with GONE-based
+ *     evidence) and SRJ-110 at its first kill, the non-evidence routes'
+ *     re-read, the deferred `cwd` check and the lost race on
+ *     `ErrSpawnNotResumable` after a re-read of a finished row (SRJ-710).
+ *   - b.jg5 SRJ-113 (E23 T2), on `makeRecoveryHarness`: `resume`'s outcome
+ *     table, one case per row (`RESUME_OUTCOME_ROWS`), at both `resume`
+ *     sites: `resumeOrFreshSpawn` (a collision `get` that read the row
+ *     `ended` with a session id) and the sequence-launch entry's `resume`
+ *     leg: success `resumed`; UNAVAILABLE (each form) refused and never
+ *     counted, P armed; ENVIRONMENT `tmux-unavailable`; `ErrTmuxSessionCreate`
+ *     counted once with no kill, P armed at once in pending-only mode (also
+ *     when its description says the row stays pending, with no `get` first);
+ *     the DIRECTORY errors `cwd-unreachable`, counted; the no-transcript
+ *     answers one reuse spawn (the diagnosis's `get` first after
+ *     `ErrJsonlMissing`); `ErrSpawnNotFound` exactly one plain spawn with no
+ *     reuse flag and no spawn-failure notice, its scan CONFLICT latching
+ *     "plain spawn" with the state last read; `ErrSpawnNotResumable` SRJ-710's
+ *     re-read; UNUSABLE NAME, CONFIG and UNCLASSIFIED SRJ-105's;
+ *     `ErrInvalidFlags` one re-check, then UNCLASSIFIED, never the hold. The
+ *     CONFLICT rows (HO rev 15's "another agent-director store" and rev 20's
+ *     "conflicting labels" after "duplicate session" included) latch "resume"
+ *     with the state last read and kill nothing. HO rev 28's four restore
+ *     sentences change no outcome (the stub's `withRestoreSentence`), and no
+ *     file in `src/` holds one.
+ *   - b.jg5 SRJ-710 (E23 T2): `ErrSpawnNotResumable` makes one `get` through
+ *     the shared own-row read (`decideNotResumable` over each re-read):
+ *     `pending` is a launch in progress, neither counted nor posted, with no
+ *     sequence of its own (a covered row left by the ladder's `pending` step,
+ *     its arms those of the ladder's `pending` branch on the same row; a
+ *     `config_dir` mismatch SRJ-411's sequence; AC 3's unit half); a latching
+ *     re-read latches; a finished row, no row, a refused read or a live row on
+ *     a path with no dead evidence is a lost race (nothing killed, deleted,
+ *     launched or counted; P armed with the lost-race cause). SRJ-611's
+ *     per-cause matrix (AC 58, AC 59): on a row re-read `waiting`, only the
+ *     GONE-based causes start one live-row sequence, the conversation kept,
+ *     ending in `resume`; SRJ-110's kill outcomes at that sequence's first
+ *     kill. A replacement at the resume step on a route with no dead
+ *     evidence reads the row again first and never starts the sequence
+ *     itself (SRJ-609, SRJ-707).
  *   - b.av2 SR-6.3: the fixed instance ID, one launch in flight per persona,
  *     and the start sweep (`reconcileOrphans`) keyed by the `persona` label
  *     (AC 4). b.1ix: a pre-persona row (no `persona` label) is kept, never
@@ -378,15 +415,8 @@
  *     (`launchForLiveRowSequence`) is a launch call (in flight while its
  *     launch is held, waiting for a launch already in flight and never
  *     overlapping it, making no call once its sequence is stopped) that
- *     makes one `resume`, its success followed by the `pre_trust` line and
- *     the approver; `ErrNoSessionId`, `ErrJsonlMissing` and
- *     `ErrJsonlNeverWritten` go on to one reuse spawn, `ErrSpawnNotResumable`
- *     answers not launched, UNAVAILABLE ends it uncounted, a CONFLICT latches
- *     P with the state last read, `ErrTmuxSessionCreate` is counted once and
- *     `ErrSpawnNotFound` posts the spawn-failure notice uncounted (the
- *     sequence arming its other-end cause), each with no further call; a
- *     restart-path launch joining the entry's launch gets the uncounted
- *     `'refused'`. The reuse block covers the session manager's reuse spawn
+ *     makes one `resume`, whose outcomes follow SRJ-113's table (below); a
+ *     restart-path launch joining the entry's launch gets its result. The reuse block covers the session manager's reuse spawn
  *     (`reuseSpawnForPersona`) through the entry's reuse kind: its
  *     parameters (AC 57), the deferral on an unresolvable
  *     `claude_config_dir`, the trust patch and reply guard, its success line
@@ -619,9 +649,33 @@ import {
   JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS,
   JSONL_DIAGNOSIS_REUSE_WORDING,
   JSONL_TRANSCRIPT_LOST_ENTRY_CLASS,
+  NOT_RESUMABLE_LATCHED,
+  NOT_RESUMABLE_LOST_RACE,
+  NOT_RESUMABLE_PENDING,
+  NOT_RESUMABLE_PENDING_OUTCOME,
+  NOT_RESUMABLE_SEQUENCE,
+  REPLACE_REREAD_FINISHED_OUTCOME,
+  REPLACE_REREAD_PENDING_OUTCOME,
+  REPLACE_REREAD_REFUSED_OUTCOME,
+  ROW_REREAD_FINISHED,
+  ROW_REREAD_LATCHED,
+  ROW_REREAD_LIVE,
+  ROW_REREAD_PENDING,
+  ROW_REREAD_REFUSED,
+  ROW_REREAD_UNKNOWN,
+  SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME,
+  decideNotResumable,
+  describePersonaRowReread,
+  lostRaceOutcome,
+  notResumableSequenceOutcome,
+  replaceRereadLine,
+  resumeNotFoundSpawnLine,
+  spawnNotResumableLine,
+  type PersonaRowReread,
 } from '../src/session-manager.ts'
 import {
   LIVE_ROW_ARM_ENDED,
+  LIVE_ROW_ARM_LOST_RACE,
   LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
   LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
   LIVE_ROW_LAUNCH_RESUME,
@@ -772,6 +826,10 @@ import {
   unavailableForms,
   UNAVAILABLE_FORMS,
   UNUSABLE_NAME_FAULTS,
+  RESTORE_SENTENCES,
+  STUB_INSTANCE_ID,
+  STUB_TMUX_SESSION_NAME,
+  withRestoreSentence,
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import {
@@ -928,6 +986,7 @@ import {
   startSequenceHeldAtRun,
   startupEntriesOf,
   survivorAlertContent,
+  unavailableAt,
   unclassifiedLinePrefix,
   unclassifiedStartedLine,
   unclassifiedStartedLines,
@@ -955,6 +1014,7 @@ import {
   promptRowPaneConflictRowsAt,
   reconnectConflictRowsAt,
   reuseSpawnScanRows,
+  sequenceResumeConflictRowsAt,
   type ConflictCaseRow,
   type LaunchStartCaseRow,
   type LaunchStartCaseRowOf,
@@ -968,6 +1028,7 @@ import {
   CONFLICT_LATCH_SET_LATCHED,
   LATCH_CASE_CONFLICTING_LABELS,
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+  LATCH_CASE_LEFTOVER,
   LATCH_CASE_UNUSABLE_RECORDED_NAME,
   LATCH_ROW_STATE_KIND_NO_ROW,
   LATCH_ROW_STATE_KIND_READ,
@@ -1013,6 +1074,7 @@ import {
   UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
   UNAVAILABLE_RETRY_ROW_ABSENT,
   UNAVAILABLE_RETRY_STOP_LATCHED,
+  UNAVAILABLE_RETRY_STOP_RECOVERED,
   type AttemptView,
   type UnavailableRetryController,
   type UnavailableRetryRowRead,
@@ -6437,30 +6499,36 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
     expect(readLog()).toBe('')
   })
 
-  // b.jg5 SRJ-710: ErrSpawnNotResumable is a lost race, never by itself a
-  // reason to kill and replace: nothing is killed, deleted or launched.
-  test('spawnForPersona waiting branch (b.3ce): dead session + resume not resumable → a lost race: the uncounted refused result, nothing killed, deleted or launched', async () => {
+  // b.jg5 SRJ-710: ErrSpawnNotResumable is never by itself a reason to kill
+  // and replace: the row is read again, and a row that finished since is a
+  // lost race: nothing is killed, deleted or launched.
+  test('spawnForPersona waiting branch (b.3ce): dead session + resume not resumable, the re-read finds the row ended → a lost race: the uncounted refused result, nothing killed, deleted or launched', async () => {
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const getCalls: import('agent-director').GetParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       sendKeysCalls,
       spawnCalls,
       killCalls,
       deleteCalls,
+      getCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
-      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
+      getQueue: [cannedOk(personaRow(cfg, 'C', { state: 'waiting' }))],
+      getResult: personaRow(cfg, 'C', { state: LIVENESS_DEAD_ROW_ENDED }),
       sendKeysError: errTmuxSendKeys(),
       resumeError: errSpawnNotResumable(), // stale `waiting` row rejects resume
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result).toEqual({ key: 'C', action: 'failed', refused: true })
     expect(sendKeysCalls).toHaveLength(1)
+    // The collision get, then the one re-read after ErrSpawnNotResumable.
+    expect(getCalls).toHaveLength(2)
     expect([killCalls, deleteCalls]).toEqual([[], []])
     expect(spawnCalls).toHaveLength(1) // the initial collision only
   })
@@ -7125,13 +7193,13 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   })
 
   // findMissing rejects → still attempt resume anyway → on a still-live row AD
-  // throws ErrSpawnNotResumable → a lost race (b.jg5 SRJ-710): nothing killed,
-  // deleted or launched.
+  // throws ErrSpawnNotResumable → the re-read finds the row ended since → a
+  // lost race (b.jg5 SRJ-710): nothing killed, deleted or launched.
   // The rejection is one that is no refusal at `find-missing` (an UNUSABLE
   // NAME answer, b.jg5 SRJ-105); an UNAVAILABLE, ENVIRONMENT, CONFIG or
   // UNCLASSIFIED one stops the attempt there (the SRJ-105, SRJ-311, SRJ-316 and
   // SRJ-313 sweep cases below).
-  test('waiting dead-session: findMissing rejects → resume attempted → ErrSpawnNotResumable → a lost race, nothing killed, deleted or launched', async () => {
+  test('waiting dead-session: findMissing rejects → resume attempted → ErrSpawnNotResumable → the re-read finds the row ended → a lost race, nothing killed, deleted or launched', async () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
@@ -7148,7 +7216,8 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
-      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
+      getQueue: [cannedOk(personaRow(cfg, 'C', { state: 'waiting' }))],
+      getResult: personaRow(cfg, 'C', { state: LIVENESS_DEAD_ROW_ENDED }),
       sendKeysError: errTmuxSendKeys(),
       findMissingError: errUnusableName(),
       resumeError: errSpawnNotResumable(), // row still live-state → resume rejects
@@ -14325,6 +14394,29 @@ function srj105Build(options?: RecoveryHarnessOptions): { h: RecoveryHarness; p:
   return { h, p, b }
 }
 
+/** No call of the case's harness was a `delete` or carried `include_finished` (b.jg5 SRJ-707, SRJ-1001); nothing when no harness was built. */
+function expectNoDeleteOrIncludeFinished(h: RecoveryHarness | undefined): void {
+  if (h === undefined) return
+  const everyCall = Object.values(h.stub.calls).flat() as unknown[]
+  expect(everyCall.filter((params) => typeof params === 'object' && params !== null && 'include_finished' in params)).toEqual([])
+  expect(h.stub.calls.deleteCalls).toEqual([])
+}
+
+/** The head of the collision ladder's lines (`spawnForPersona`'s), which the not-resumable step's line opens with there. */
+const LADDER_HEAD = '[slack] spawnForPersona:'
+
+/**
+ * The re-read states that are neither finished, `pending` nor in
+ * `AGENT_DIRECTOR_LIVE_STATES` (b.jg5 SRJ-710, SRJ-611), each with how a line
+ * names it: a short identifier CSCB does not know, named as read, and a value
+ * that is not a short identifier, recorded and named `unreadable`. A re-read
+ * in either is `unknown`, which never leads to a kill.
+ */
+const UNKNOWN_REREAD_STATES: ReadonlyArray<readonly [string, string, string]> = [
+  ['a state CSCB does not know', 'hibernating', 'hibernating'],
+  ['an unreadable state', 'not a state', 'unreadable'],
+]
+
 /** Each SRJ-105 describe's `afterEach`: nothing the case's harness captured leaks a secret, then the harness is cleaned up. */
 function srj105AfterEach(): void {
   const h = srj105Harness
@@ -20837,13 +20929,28 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
 // the ladder: the `ended`/`missing` route names it in one line, and a
 // dead-session route holds dead evidence when its own cause or the carried
 // verdict is GONE-based. What a path hands `resumeOrFreshSpawn` shows in the
-// lost race's line: every such case has its `resume` answer
-// `ErrSpawnNotResumable`, so no dialog approver starts. A call joining a
+// not-resumable step's line: every such case has its `resume` answer
+// `ErrSpawnNotResumable` and the re-read find the row `ended` (a lost race,
+// SRJ-710), so no dialog approver and no live-row sequence starts. A call joining a
 // launch in flight drops its verdict with one line. Each line is compared
 // with its exported builder, with one literal pin per builder. The
 // dead-session routes' own lines and their find-missing run before the
 // resume are the ladder describe's below and the prompt-row describe's.
 // ---------------------------------------------------------------------------
+
+/** The dead-evidence answer of every cause and verdict (b.jg5 SRJ-611): true exactly for the GONE-based ones. */
+const DEAD_EVIDENCE_OF: Readonly<Record<DeadEvidenceSource, boolean>> = {
+  [DEAD_SESSION_CAUSE_TMUX_GONE]: true,
+  [DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE]: true,
+  [DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE]: false,
+  [DEAD_SESSION_CAUSE_ROW_ABSENT]: false,
+  [DEAD_SESSION_CAUSE_ROW_READ_FINISHED]: false,
+  'dead-session': true,
+  'working-tmux-gone': true,
+  [ESCALATE_DEAD_WAITING_ROW_PANE_GONE]: true,
+  [ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ]: false,
+  'prompt-row-tmux-gone': true,
+}
 
 describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause and the verdict a relaunch carries', () => {
   afterEach(() => {
@@ -20857,20 +20964,6 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
    */
   const handBuilt = (source: CarriedDeadEvidence['source'], evidence: boolean): CarriedDeadEvidence =>
     ({ source, evidence }) as unknown as CarriedDeadEvidence
-
-  /** The dead-evidence answer of every cause and verdict: true exactly for the GONE-based ones. */
-  const DEAD_EVIDENCE_OF: Readonly<Record<DeadEvidenceSource, boolean>> = {
-    [DEAD_SESSION_CAUSE_TMUX_GONE]: true,
-    [DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE]: true,
-    [DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE]: false,
-    [DEAD_SESSION_CAUSE_ROW_ABSENT]: false,
-    [DEAD_SESSION_CAUSE_ROW_READ_FINISHED]: false,
-    'dead-session': true,
-    'working-tmux-gone': true,
-    [ESCALATE_DEAD_WAITING_ROW_PANE_GONE]: true,
-    [ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ]: false,
-    'prompt-row-tmux-gone': true,
-  }
 
   /** Every cause and verdict, from the exported lists themselves. */
   const EVERY_SOURCE: readonly DeadEvidenceSource[] = [...new Set<DeadEvidenceSource>([...DEAD_SESSION_CAUSES, ...ESCALATE_DEAD_VERDICTS])]
@@ -20970,17 +21063,23 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
 
   /**
    * A launch through the restart path's entry (`launchSession`) carrying
-   * `carried`, onto P's row as `reach` scripts it, whose `resume` answers
-   * `ErrSpawnNotResumable`: the launch's answer and P's dead-session route
-   * lines and lost-race lines.
+   * `carried`, onto P's row as `reach` scripts it (its collision `get`'s row
+   * in `getResult`), whose `resume` answers `ErrSpawnNotResumable` and whose
+   * re-read then finds the row `ended`: the launch's answer, P's dead-session
+   * route lines and the not-resumable step's lines.
    */
   async function launchCarrying(h: RecoveryHarness, p: string, reach: RecoveryStubScript, carried: CarriedDeadEvidence | undefined) {
-    h.script({ ...reach, resumeError: errSpawnNotResumable() })
+    h.script({
+      ...reach,
+      getQueue: [cannedOk(reach.getResult!)],
+      getResult: harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }),
+      resumeError: errSpawnNotResumable(),
+    })
     const launched = await launchSession(p, h.config, carried === undefined ? {} : { deadEvidence: carried })
     return {
       launched,
       routes: h.errors.filter((l) => l.startsWith('[slack] spawnForPersona: dead session for ')),
-      lostRaces: h.errors.filter((l) => l.includes(` on resume for ${renderPersonaRef(p, p)} — a lost race (`)),
+      notResumable: h.errors.filter((l) => l.includes(` on resume for ${renderPersonaRef(p, p)} — re-read: `)),
     }
   }
 
@@ -21010,18 +21109,21 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
     ['a waiting row whose reconnect answers GONE, a row-not-interactive verdict carried → the path holds its own evidence', waitingRow(errTmuxSendKeys()), 'waiting', NOT_INTERACTIVE, OWN_GONE, OWN_GONE],
   ]
 
-  test.each(CARRIED_ROUTES)('the restart path\'s relaunch: %s; the lost race names it; nothing killed or deleted', async (_label, reach, routeState, carried, own, held) => {
+  test.each(CARRIED_ROUTES)('the restart path\'s relaunch: %s; the not-resumable step\'s line names it, and its re-read of an ended row is a lost race; nothing killed or deleted', async (_label, reach, routeState, carried, own, held) => {
     const { h, p } = srj105Build()
 
-    const { launched, routes, lostRaces } = await launchCarrying(h, p, reach(h, p), carried)
+    const { launched, routes, notResumable } = await launchCarrying(h, p, reach(h, p), carried)
 
     expect(launched).toBe('refused')
     // The finished-row route logs its line only when a verdict was carried in.
     const routed = own !== CARRIED_DEAD_EVIDENCE_NONE || carried !== undefined
     expect(routes).toEqual(routed ? [deadSessionRouteLine(renderPersonaRef(p, p), routeState, own, carriedDeadEvidenceOf(carried?.source))] : [])
-    expect(lostRaces).toHaveLength(1)
-    expect(lostRaces[0]).toContain(`— a lost race (${describeDeadEvidence(held)}): `)
+    const reread: PersonaRowReread = { kind: ROW_REREAD_FINISHED, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) }
+    expect(notResumable).toEqual([
+      spawnNotResumableLine(LADDER_HEAD, renderPersonaRef(p, p), describeAgentDirectorFailure(errSpawnNotResumable()), reread, held, lostRaceOutcome(true)),
+    ])
     expect([h.stub.calls.killCalls, h.stub.calls.deleteCalls]).toEqual([[], []])
+    expect(h.sequenceRunning(p)).toBe(false)
   })
 
   test.each<[string, CarriedDeadEvidence | undefined]>([
@@ -21176,6 +21278,172 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
 })
 
 // ---------------------------------------------------------------------------
+// b.jg5 SRJ-113: `resume`'s outcome table, one row per outcome, shared by
+// its two sites' cases: `resumeOrFreshSpawn` (the collision ladder, its
+// collision `get` reading the row `ended` with a session id) and the
+// live-row sequence's launch entry's `resume` leg (its last `get` read the
+// row `ended`). Each row gives, at each site, the launch's answer, the
+// launch and read calls from the `resume` on, the retry causes sent for P,
+// the outage flags raised, the failures counted (the entry counts its own
+// launch; the restart path counts a ladder launch from its answer), the
+// spawn-failure notices and the reuse spawns. E28's one `get` after an
+// UNAVAILABLE outcome is not pinned. The CONFLICT rows are the case table's
+// (`tests/test-helpers/conflict-cases.ts`): at the ladder every `resume`
+// row crossed with every `resume` site (`LATCH_CROSS`), at the entry the
+// sequence `resume` rows. The latch re-check's site is E30's.
+// ---------------------------------------------------------------------------
+
+/** What one row of SRJ-113's table gives at one `resume` site. */
+interface ResumeSiteOutcome {
+  /** The launch's answer, without its key. */
+  readonly answer: Readonly<Record<string, unknown>>
+  /** The launch and read calls from the `resume` on, in order (`LAUNCH_AND_READ_VERBS`). */
+  readonly calls: readonly string[]
+  /** The retry causes the launch sent for P, in order. */
+  readonly triggers: readonly string[]
+  /** The outage flags raised for P; none when unset. */
+  readonly flags?: readonly OutageClass[]
+  /** P's counted failures afterwards; none when unset. */
+  readonly counted?: number
+  /** The session manager's notices for P (a spawn failure, or the diagnosis's once the reuse brought P up); none when unset. */
+  readonly notices?: number
+  /** The reuse spawns made; none when unset. */
+  readonly reuses?: number
+}
+
+/** One row of SRJ-113's table: the `resume`'s answer (success when `make` is unset) and what it gives at each site. */
+interface ResumeOutcomeRow {
+  readonly name: string
+  readonly make?: () => Error
+  /** E28's one `get` after the outcome: not pinned. */
+  readonly getNotPinned?: true
+  /** Install agent-director's version re-check (ErrInvalidFlags's one immediate re-check, b.jg5 SRJ-204). */
+  readonly recheck?: true
+  readonly ladder: ResumeSiteOutcome
+  readonly entry: ResumeSiteOutcome
+}
+
+/** The verbs a row's call list holds: launches, reads of the row, kills, deletes and sweeps (the dialog approver's `status`, `read-pane` and `send-keys` left out). */
+const LAUNCH_AND_READ_VERBS: ReadonlySet<string> = new Set(['spawn', 'resume', 'get', 'kill', 'delete', 'findMissing'])
+
+/** The uncounted refused result (b.jg5 SRJ-105, SRJ-301). */
+const REFUSED_ANSWER = { action: 'failed', refused: true } as const
+
+/** The same outcome at both sites. */
+const atBothSites = (outcome: ResumeSiteOutcome): Pick<ResumeOutcomeRow, 'ladder' | 'entry'> => ({ ladder: outcome, entry: outcome })
+
+/** SRJ-113's UNAVAILABLE row's forms: still stopping, still starting, a launch timeout, a call timeout and an unknown name (b.jg5 SRJ-104). */
+const RESUME_UNAVAILABLE_FORMS = unavailableForms(
+  'ErrTmuxUnresponsive, still stopping',
+  'ErrTmuxUnresponsive, still starting',
+  'ErrTmuxUnresponsive, launch timeout',
+  'ErrCallTimeout',
+  'ErrUnknownErrorName',
+)
+
+const RESUME_OUTCOME_ROWS: readonly ResumeOutcomeRow[] = [
+  { name: 'success → resumed', ...atBothSites({ answer: { action: 'resumed' }, calls: ['resume'], triggers: [] }) },
+  ...RESUME_UNAVAILABLE_FORMS.map(([label, make, cause]): ResumeOutcomeRow => ({
+    name: `UNAVAILABLE (${label}) → refused, never counted, no notice, P's timer armed`,
+    make: () => make('resume'),
+    getNotPinned: true,
+    ...atBothSites({ answer: REFUSED_ANSWER, calls: ['resume'], triggers: [cause] }),
+  })),
+  {
+    name: 'ENVIRONMENT (ErrTmuxNotAvailable) → tmux-unavailable, refused, never counted',
+    make: () => errTmuxNotAvailable(undefined, 'resume'),
+    ...atBothSites({ answer: REFUSED_ANSWER, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT], flags: ['tmux-unavailable'] }),
+  },
+  {
+    name: 'LAUNCH FAILURE (ErrTmuxSessionCreate) → counted once, no kill, P armed at once in pending-only mode',
+    make: () => errTmuxSessionCreate('resume'),
+    ladder: { answer: { action: 'failed', countedClass: true, pendingOnlyArmed: true }, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], notices: 1 },
+    entry: { answer: { action: 'failed', countedClass: true, pendingOnlyArmed: true }, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], notices: 1, counted: 1 },
+  },
+  ...[errCwdNotFound, errCwdNotADirectory].map((make): ResumeOutcomeRow => ({
+    name: `DIRECTORY (${make('resume').errName}) → cwd-unreachable, counted`,
+    make: () => make('resume'),
+    ladder: { answer: { action: 'failed' }, calls: ['resume'], triggers: [], flags: ['cwd-unreachable'] },
+    entry: { answer: { action: 'failed', countedClass: true }, calls: ['resume'], triggers: [], flags: ['cwd-unreachable'], counted: 1 },
+  })),
+  ...[errNoSessionId, errJsonlNeverWritten].map((make): ResumeOutcomeRow => ({
+    name: `${make().errName} → one reuse spawn of the same id`,
+    make,
+    ...atBothSites({ answer: { action: 'spawned' }, calls: ['resume', 'spawn'], triggers: [], reuses: 1 }),
+  })),
+  {
+    name: 'ErrJsonlMissing → the diagnosis\'s get, then one reuse spawn of the same id',
+    make: () => errJsonlMissing(),
+    ...atBothSites({ answer: { action: 'fresh-after-inconclusive-amnesia' }, calls: ['resume', 'get', 'spawn'], triggers: [], reuses: 1, notices: 1 }),
+  },
+  {
+    name: 'ErrSpawnNotFound → exactly one plain spawn of the same id, no reuse flag, no spawn-failure notice',
+    make: () => errSpawnNotFound(),
+    ...atBothSites({ answer: { action: 'spawned' }, calls: ['resume', 'spawn'], triggers: [] }),
+  },
+  {
+    name: 'ErrSpawnNotResumable → SRJ-710\'s one re-read (here of the ended row: a lost race)',
+    make: () => errSpawnNotResumable(),
+    ladder: { answer: REFUSED_ANSWER, calls: ['resume', 'get'], triggers: [UNAVAILABLE_RETRY_CAUSE_LOST_RACE] },
+    // At the entry the sequence's end arms (tests/live-row-sequence.test.ts); the entry arms nothing itself.
+    entry: { answer: { action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE }, calls: ['resume', 'get'], triggers: [] },
+  },
+  {
+    name: 'UNUSABLE NAME → latched (SRJ-105, SRJ-512), never counted',
+    make: () => errUnusableName(),
+    ...atBothSites({ answer: { action: 'latched' }, calls: ['resume'], triggers: [] }),
+  },
+  {
+    name: 'CONFIG (ErrConfigMalformed) → ad-config-malformed, refused, never counted',
+    make: () => errConfigMalformed(),
+    ...atBothSites({ answer: REFUSED_ANSWER, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_CONFIG], flags: ['ad-config-malformed'] }),
+  },
+  {
+    name: 'UNCLASSIFIED (ErrInternal) → refused, never counted',
+    make: () => errInternal(),
+    ...atBothSites({ answer: REFUSED_ANSWER, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED] }),
+  },
+  {
+    name: 'ErrInvalidFlags → one immediate version re-check, then UNCLASSIFIED; never the hold',
+    make: () => errInvalidFlags('resume'),
+    recheck: true,
+    ...atBothSites({ answer: REFUSED_ANSWER, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED] }),
+  },
+]
+
+/**
+ * Assert what `row`'s outcome `outcome` shows for persona `p` once the launch
+ * answered `result`: the answer, the calls from the `resume` on (`order`,
+ * every stub call in order), the causes sent, the flags raised, the
+ * failures counted, the notices and the reuse spawns; no kill or delete;
+ * one version re-check where the row makes one. Then P's dialog approver,
+ * when a launch started it, is run to its stop.
+ */
+async function expectResumeOutcome(
+  h: RecoveryHarness,
+  p: string,
+  row: ResumeOutcomeRow,
+  outcome: ResumeSiteOutcome,
+  result: unknown,
+  order: readonly string[],
+  rechecks: { readonly resolves: readonly unknown[] } | undefined,
+): Promise<void> {
+  expect(result).toStrictEqual({ key: p, ...outcome.answer })
+  const fromResume = order.slice(order.indexOf('resume')).filter((verb) => LAUNCH_AND_READ_VERBS.has(verb) && !(row.getNotPinned === true && verb === 'get'))
+  expect(fromResume).toEqual([...outcome.calls])
+  expect(h.triggers.filter((t) => t.key === p).map((t) => t.kind)).toEqual([...outcome.triggers])
+  expect([...getOutageFlags(p)]).toEqual([...(outcome.flags ?? [])])
+  expect(getFailureCount(p)).toBe(outcome.counted ?? 0)
+  expect(h.notices.filter((n) => n.key === p)).toHaveLength(outcome.notices ?? 0)
+  expect(h.reuseSpawns()).toHaveLength(outcome.reuses ?? 0)
+  // A plain spawn never carries the reuse flag: only the reuses do.
+  expect(h.stub.calls.spawnCalls.filter((call) => call.reuse_finished === true)).toHaveLength(outcome.reuses ?? 0)
+  expect([h.stub.calls.killCalls, h.stub.calls.deleteCalls]).toEqual([[], []])
+  if (rechecks !== undefined) expect(rechecks.resolves).toHaveLength(1)
+  if (h.approverRunning(p)) await h.runApproverToStop(p)
+}
+
+// ---------------------------------------------------------------------------
 // b.jg5 SRJ-705 step 6, SRJ-706 (E21 T1), SRJ-112, SRJ-708 (E22 T1): the
 // live-row sequence's launch entry (`launchForLiveRowSequence`), its reuse
 // spawn (the session manager's `reuseSpawnForPersona`) and the sequence's
@@ -21183,11 +21451,15 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
 //
 // On the recovery harness, whose `sequenceDeps` come from the builder. The
 // entry is a launch call: a `resume` through the ladder's launch helper whose
-// no-transcript answers go on to the reuse spawn once, any other non-success
-// ending it by class with no further call; only a LAUNCH FAILURE or DIRECTORY
-// result is counted (a `resume`'s ErrSpawnNotFound posts its notice uncounted,
-// the sequence then arming its other-end cause), and a call joining the
-// entry's launch reads a failure as the uncounted refused answer. A reuse is
+// outcomes follow SRJ-113's table (`RESUME_OUTCOME_ROWS`, one case per row,
+// and the sequence `resume` CONFLICT rows of the case table): its
+// no-transcript answers go on to the reuse spawn once, its ErrSpawnNotFound
+// to one plain spawn of the id with no spawn-failure notice (whose scan
+// CONFLICT latches "plain spawn" with the state last read), its
+// ErrSpawnNotResumable to one re-read and not launched, any other
+// non-success ending it by class with no further call; only a LAUNCH
+// FAILURE or DIRECTORY result is counted, and a call joining the entry's
+// launch gets its result. A reuse is
 // the reuse spawn, one stub `spawn` of `cscb_<key>` carrying the reuse flag.
 // The reuse spawn's describe covers its parameters (AC 57: a plain spawn's
 // apart from the flag), its success line (no earlier life kept when the id
@@ -21370,66 +21642,64 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     await h.runApproverToStop(p)
   })
 
-  test.each([
-    ['ErrSpawnNotResumable: not launched, no second sequence', () => errSpawnNotResumable(), { action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE }],
-    ['an UNAVAILABLE answer: ended by class, uncounted', () => errTmuxUnresponsive('resume'), { action: 'failed', refused: true }],
-  ] as const)('resume answering %s; no further call', async (_label, make, answer) => {
+  // b.jg5 SRJ-113 at the sequence-launch entry's `resume` leg: one case per
+  // row of the table (`RESUME_OUTCOME_ROWS`), over the row the sequence last
+  // read `ended`, with a session id. Every non-success but the three
+  // no-transcript fallbacks and ErrSpawnNotFound's plain spawn ends the
+  // launch with no further launch; ErrSpawnNotResumable makes its one re-read.
+  test.each(RESUME_OUTCOME_ROWS.map((row) => [row.name, row] as const))('SRJ-113 at the entry: resume answering %s', async (_name, row) => {
     const { h, p } = srj105Build()
-    h.script({ resumeError: make() })
+    const rechecks = row.recheck === true ? h.recheckAnswers(PHASE1_RC_VERSION) : undefined
+    h.script({ getResult: harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION), ...(row.make === undefined ? {} : { resumeError: row.make() }) })
     const order = recordCallOrder(h)
 
-    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, ...answer })
+    const result = await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)
 
-    expect(order).toEqual(['resume'])
-    expect(h.stub.calls.spawnCalls).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
+    await expectResumeOutcome(h, p, row, row.entry, result, order, rechecks)
+    // No second sequence: the entry starts none, whatever the answer.
+    expect(h.sequenceRunning(p)).toBe(false)
   })
 
-  test('resume answering CONFLICT latches P through the latch\'s entry with the refused operation "resume" and the state last read; no further call', async () => {
+  // b.jg5 SRJ-113, SRJ-501 (HO rev 15, rev 20): each sequence `resume` row of
+  // the case table latches P with its case, the refused operation "resume"
+  // and the state the sequence last read; one post; no further call.
+  test.each(sequenceResumeConflictRowsAt(LIVENESS_DEAD_ROW_ENDED).map((row) => [row.name, row] as const))('SRJ-113 at the entry: resume answering CONFLICT (%s) latches P with the refused operation "resume" and the state last read; one post; no kill and no further call', async (_name, row) => {
     const { h, p } = srj105Build()
-    const row = conflictRowsFor('resume')[0]!
     h.script({ resumeError: row.build() })
     const order = recordCallOrder(h)
 
     expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, action: 'latched' })
 
     expect(order).toEqual(['resume'])
-    expect(h.latch.record(p)).toEqual(
-      expectedLatchRecord(p, {
-        latchCase: row.latchCase,
-        refusedOperation: REFUSED_OPERATION_RESUME,
-        rowState: LAST_READ,
-        sessionName: row.sessionName,
-        description: row.build().errDescription,
-      }),
-    )
-    expect(h.stub.calls.spawnCalls).toEqual([])
+    expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_RESUME, LAST_READ))
   })
 
-  // b.jg5 SRJ-113, SRJ-602 (the E21 T1 reconcile note): the entry counts its
-  // `resume` leg's result once, as the restart path counts a launch's. Its
-  // pending-only arm is tests/unavailable-retry.test.ts's.
-  test('resume answering ErrTmuxSessionCreate: the entry counts it once, with one spawn-failure notice; no kill, reuse or other launch after it', async () => {
+  // b.jg5 SRJ-113, SRJ-111, SRJ-501 (HO rev 15): the plain spawn after the
+  // entry's ErrSpawnNotFound makes agent-director's pre-spawn scan; its
+  // refusal latches P with the refused operation "plain spawn" and the state
+  // the sequence last read (resume is not a read), the stub holding no row.
+  test.each(CONFLICT_CASE_ROWS.filter((row) => row.site === 'plain spawn' && row.rowState === LATCH_ROW_STATE_NO_ROW).map((row) => [row.name, row] as const))('SRJ-113 at the entry: ErrSpawnNotFound, then the plain spawn\'s scan CONFLICT (%s): latched with "plain spawn" and the state last read; no spawn-failure notice, nothing counted, no further call', async (_name, row) => {
     const { h, p } = srj105Build()
-    h.script({ resumeError: errTmuxSessionCreate('resume') })
+    h.script({ resumeError: errSpawnNotFound(), spawnError: row.build(), getError: errSpawnNotFound() })
     const order = recordCallOrder(h)
 
-    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toStrictEqual({ key: p, action: 'failed', countedClass: true, pendingOnlyArmed: true })
+    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, action: 'latched' })
 
-    expect(order).toEqual(['resume'])
-    expect([getFailureCount(p), h.notices.map((notice) => notice.key)]).toEqual([1, [p]])
+    expect(order).toEqual(['resume', 'spawn'])
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined])
+    expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_PLAIN_SPAWN, LAST_READ))
   })
 
-  // b.jg5 SRJ-113: only LAUNCH FAILURE and DIRECTORY are counted. A step-6
-  // `resume` answering ErrSpawnNotFound posts the spawn-failure notice but
-  // counts nothing, and the sequence ends without its launch, arming its
-  // other-end cause. The sequence runs over the harness's dependencies
-  // outside the registry, so a restart-path launch made while the `resume`
-  // is held joins the entry's launch.
-  test('a step-6 resume answering ErrSpawnNotFound: one spawn-failure notice, nothing counted and no spawn; the sequence arms sequence-ended-without-launch, and a restart-path launch that joins it gets refused and counts nothing', async () => {
+  // b.jg5 SRJ-113, SRJ-705: a step-6 `resume` answering ErrSpawnNotFound
+  // makes one plain spawn of the id, with no spawn-failure notice for the
+  // ErrSpawnNotFound itself (the E21-E22 reconcile note), and the sequence
+  // launches. The sequence runs over the harness's dependencies outside the
+  // registry, so a restart-path launch made while the `resume` is held joins
+  // the entry's launch and gets its result.
+  test('a step-6 resume answering ErrSpawnNotFound: one plain spawn of the id (no reuse flag) and the sequence launches; no spawn-failure notice, nothing counted, nothing armed; a restart-path launch that joins it gets its success', async () => {
     const { h, p } = srj105Build()
     const err = errSpawnNotFound()
-    h.script({ getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }, harnessPersona(h, p), h.home), resumeError: err })
+    h.script({ getResult: harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION), resumeError: err })
     const held = holdResume(h)
     const order = recordCallOrder(h)
     const request = h.sequenceRequest(p, { lastReadState: cannedStatusResult().state, keepsConversation: true })
@@ -21442,19 +21712,18 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       kind: LIVE_ROW_OUTCOME_LAUNCHED,
       launchKind: LIVE_ROW_LAUNCH_RESUME,
       reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
-      result: { key: p, action: 'failed' },
+      result: { key: p, action: 'spawned' },
       runs: 1,
       kills: 1,
       judgedRuns: 1,
-      armed: LIVE_ROW_ARM_ENDED,
     })
-    expect(await joined).toBe('refused')
+    expect(await joined).toBe(true)
     expect(h.errors.filter((line) => line.includes(' — joining it'))).toHaveLength(1)
-    expect(getFailureCount(p)).toBe(0)
-    expect(h.notices).toEqual([{ key: p, text: expect.stringContaining(`\`${err.name}\``) }])
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED }])
-    expect(order).toEqual(['kill', 'get', 'findMissing', 'get', 'resume'])
-    expect(h.stub.calls.spawnCalls).toEqual([])
+    expect(h.errors.filter((line) => line === resumeNotFoundSpawnLine(LIVE_ROW_SEQUENCE_LOG_PREFIX, renderPersonaRef(p, p)))).toHaveLength(1)
+    expect([getFailureCount(p), h.notices, h.triggers]).toEqual([0, [], []])
+    expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual(['kill', 'get', 'findMissing', 'get', 'resume', 'spawn'])
+    expect(h.stub.calls.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([[personaInstanceId(p), undefined]])
+    await h.runApproverToStop(p)
   })
 
   describe('b.jg5 SRJ-112, SRJ-708: the reuse spawn through the entry\'s reuse kind', () => {
@@ -22160,19 +22429,29 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
 //   is one counted launch failure that kills nothing, `ErrInvalidFlags` makes
 //   one version re-check and launches nothing more, and a directory error is
 //   counted.
-// - A live row (`pending` with a launch start included): the launch starts
-//   P's live-row sequence through the start entry (entry at step 1, seeded
-//   with that state, the conversation not kept, alert context `recovery`)
-//   and answers `sequence-waiting` with no call of its own, nothing counted;
-//   the sequence's kill, run and `get` follow on the clock and its step 6 is
-//   a reuse spawn although the row carries a session id. SRJ-110 at each
-//   such site: the sequence's first kill answering UNAVAILABLE,
-//   `ErrTmuxKillFailed`, CONFLICT or UNUSABLE NAME is followed by no launch
-//   and no `delete`.
+// - A live row (`pending` with a launch start included) the path may act on
+//   (a row in another directory, a `pending` row whose `config_dir` label is
+//   missing or differs, or a dead-session route holding GONE-based dead
+//   evidence, SRJ-611): the launch starts P's live-row sequence through the
+//   start entry (entry at step 1, seeded with that state, the conversation
+//   not kept, alert context `recovery`) and answers `sequence-waiting` with
+//   no call of its own, nothing counted; the sequence's kill, run and `get`
+//   follow on the clock and its step 6 is a reuse spawn although the row
+//   carries a session id. SRJ-110 at each such site: the sequence's first
+//   kill answering UNAVAILABLE, `ErrTmuxKillFailed`, CONFLICT or UNUSABLE
+//   NAME is followed by no launch and no `delete`.
+// - S4 (SRJ-609, SRJ-611): a dead-session route holding no dead evidence
+//   (`row-not-interactive`) never acts on its earlier live read: the row is
+//   read again first and the fresh state decides. A finished row gets one
+//   reuse spawn; a `pending` row gets the ladder's `pending` step (a covered
+//   row is left, one that is not covered gets SRJ-411's sequence); any other
+//   live state, or a state CSCB does not know (an unreadable one included),
+//   is a lost race with no kill; a refused re-read answers the refusal.
 // - `cwdCheckDeferred` keeps the row: no reuse and no sequence. A resume's
-//   `ErrSpawnNotResumable` is a lost race at every path that resumes (the
-//   ended row's is tests/unavailable-retry.test.ts's): no kill, `delete` or
-//   launch, nothing counted or posted, the lost-race cause armed.
+//   `ErrSpawnNotResumable`, after a re-read that finds the row finished, is
+//   a lost race at every path that resumes (the ended row's is
+//   tests/unavailable-retry.test.ts's): no kill, `delete` or launch, nothing
+//   counted or posted, the lost-race cause armed.
 // - The sequence a start-pass launch starts is not part of the start pass:
 //   its step-6 launch passes the start flag false, so a failure there writes
 //   no startup-errors entry (the ladder's own reuse at the start pass does).
@@ -22181,12 +22460,7 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
 
 describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site replaces P\'s row with no delete: a finished row by one reuse spawn of the same id, a live row through the live-row sequence first', () => {
   afterEach(() => {
-    const h = srj105Harness
-    if (h !== undefined) {
-      const everyCall = Object.values(h.stub.calls).flat() as unknown[]
-      expect(everyCall.filter((params) => typeof params === 'object' && params !== null && 'include_finished' in params)).toEqual([])
-      expect(h.stub.calls.deleteCalls).toEqual([])
-    }
+    expectNoDeleteOrIncludeFinished(srj105Harness)
     srj105AfterEach()
   })
 
@@ -22204,11 +22478,64 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     readonly before: readonly string[]
   }
 
-  /** The dead-session verdict of a `waiting` row: its reconnect's one send-keys answers not interactive. */
-  const DEAD_WAITING: RecoveryStubScript = { sendKeysError: errSpawnNotInteractive('send-keys') }
+  /**
+   * The dead-session verdict of a `waiting` row whose reconnect's one
+   * send-keys answers GONE (`tmux-gone`): dead evidence (b.jg5 SRJ-611), so a
+   * replacement at the resume step acts on the row's earlier live read and
+   * starts the sequence. A verdict that is not dead evidence reads the row
+   * again first (the non-evidence cases below; SRJ-609).
+   */
+  const GONE_WAITING: RecoveryStubScript = { sendKeysError: errTmuxSendKeys() }
+
+  /** The dead-session verdict of a `waiting` row whose reconnect's one send-keys answers not interactive (`row-not-interactive`): no dead evidence. */
+  const NOT_INTERACTIVE_WAITING: RecoveryStubScript = { sendKeysError: errSpawnNotInteractive('send-keys') }
 
   /** The state the stub's default row reads: a live state other than `pending`. */
   const LIVE = cannedStatusResult().state
+
+  /**
+   * The dead-session routes of a `waiting` row that end in a replacement at
+   * the resume step (b.jg5 SRJ-707, SRJ-1504): a `config_dir` label missing
+   * or different (the guard before resume, after the find-missing run), or
+   * `resume_enabled` false (before any run). `row` gives the route's row
+   * reading `state`, at the collision `get` and at a re-read.
+   */
+  interface DeadSessionReplacementRoute {
+    readonly name: string
+    readonly setup?: (h: RecoveryHarness) => void
+    readonly row: (h: RecoveryHarness, p: string, state: RecoveryRowState) => PersonaGetResultOverrides
+    /** Whether the route makes the find-missing run before the replacement. */
+    readonly swept: boolean
+    /** The route's calls up to the replacement. */
+    readonly before: readonly string[]
+    /** Whether the route's row read `pending` is covered (b.jg5 SRJ-409, SRJ-411): a `config_dir` label missing or different never is. */
+    readonly pendingCovered: boolean
+  }
+
+  const DEAD_SESSION_REPLACEMENT_ROUTES: readonly DeadSessionReplacementRoute[] = [
+    {
+      name: 'a waiting row with no config_dir label (the guard before resume)',
+      row: (h, p, state) => unlabelledRow(h, harnessPersona(h, p), state),
+      swept: true,
+      before: ['spawn', 'get', 'sendKeys', 'findMissing'],
+      pendingCovered: false,
+    },
+    {
+      name: 'a waiting row whose config_dir label differs (the guard before resume)',
+      row: (h, p, state) => relabelledRow(h, harnessPersona(h, p), state),
+      swept: true,
+      before: ['spawn', 'get', 'sendKeys', 'findMissing'],
+      pendingCovered: false,
+    },
+    {
+      name: 'a waiting row, resume_enabled false',
+      setup: noResume,
+      row: (_h, _p, state) => ({ state }),
+      swept: false,
+      before: ['spawn', 'get', 'sendKeys'],
+      pendingCovered: true,
+    },
+  ]
 
   const LIVE_SITES: readonly LiveSite[] = [
     ...[...AGENT_DIRECTOR_LIVE_STATES].map((state): LiveSite => ({
@@ -22229,28 +22556,14 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
       row: (h, p) => relabelledRow(h, harnessPersona(h, p), AGENT_DIRECTOR_PENDING_STATE),
       before: ['spawn', 'get'],
     },
-    {
-      name: 'a waiting row with no config_dir label, after its dead-session verdict and sweep (the guard before resume)',
+    ...DEAD_SESSION_REPLACEMENT_ROUTES.map((route): LiveSite => ({
+      name: `${route.name}, after its GONE dead-session verdict${route.swept ? ' and sweep' : ''} (dead evidence)`,
       seed: LIVE,
-      row: (h, p) => unlabelledRow(h, harnessPersona(h, p), LIVE),
-      script: DEAD_WAITING,
-      before: ['spawn', 'get', 'sendKeys', 'findMissing'],
-    },
-    {
-      name: 'a waiting row whose config_dir label differs, after its dead-session verdict and sweep (the guard before resume)',
-      seed: LIVE,
-      row: (h, p) => relabelledRow(h, harnessPersona(h, p), LIVE),
-      script: DEAD_WAITING,
-      before: ['spawn', 'get', 'sendKeys', 'findMissing'],
-    },
-    {
-      name: 'a waiting row after its dead-session verdict, resume_enabled false',
-      seed: LIVE,
-      setup: noResume,
-      row: () => ({ state: LIVE }),
-      script: DEAD_WAITING,
-      before: ['spawn', 'get', 'sendKeys'],
-    },
+      setup: route.setup,
+      row: (h, p) => route.row(h, p, LIVE),
+      script: GONE_WAITING,
+      before: route.before,
+    })),
   ]
 
   /** Script P's launch to meet `site`'s row: the colliding first spawn, the ladder's `get`, then `endedWithSession` at every later `get`. */
@@ -22290,6 +22603,113 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect([getFailureCount(p), h.triggers, h.notices]).toEqual([0, [], []])
     expect(personaCallCounts(h, b)).toEqual({})
     await h.runApproverToStop(p)
+  })
+
+  // b.jg5 SRJ-609, SRJ-611, SRJ-707 (S4): on a route whose verdict is not
+  // dead evidence (`row-not-interactive`), a replacement at the resume step
+  // never acts on the route's earlier live read and never starts the
+  // sequence itself: it reads the row again first through the shared
+  // own-row read, and the fresh state decides. A finished row gets the
+  // replace step's one reuse spawn; a live row other than `pending`, or a
+  // state CSCB does not know (an unreadable one included), is a lost race;
+  // a `pending` row gets the ladder's `pending` step (a covered row is left;
+  // one that is not covered gets SRJ-411's sequence there).
+  const UNKNOWN_STATES: ReadonlySet<string> = new Set(UNKNOWN_REREAD_STATES.map(([, state]) => state))
+  const NOT_EVIDENCE_REREADS = DEAD_SESSION_REPLACEMENT_ROUTES.flatMap((route) =>
+    [LIVENESS_DEAD_ROW_ENDED, LIVE, AGENT_DIRECTOR_PENDING_STATE, ...UNKNOWN_STATES].map((reread) => [route.name, reread, route] as const),
+  )
+  test.each(NOT_EVIDENCE_REREADS)('S4: %s, after its row-not-interactive verdict (no dead evidence): one re-read of the row reading "%s" decides; the route\'s live read starts no sequence and makes no kill', async (_name, reread, route) => {
+    const { h, p } = srj105Build()
+    route.setup?.(h)
+    const persona = harnessPersona(h, p)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, route.row(h, p, LIVE))), cannedOk<Phase1GetResult>(harnessRow(h, persona, route.row(h, p, reread)))],
+      getResult: endedWithSession(h, p),
+      ...NOT_INTERACTIVE_WAITING,
+    })
+    const order = recordCallOrder(h)
+
+    const result = await h.launch(p)
+
+    // The route's calls, then the one re-read.
+    expect(order.slice(0, route.before.length + 1)).toEqual([...route.before, 'get'])
+    const rereadOf = (state: string): PersonaRowReread =>
+      state === LIVENESS_DEAD_ROW_ENDED
+        ? { kind: ROW_REREAD_FINISHED, lastRead: latchRowStateRead(state) }
+        : {
+            kind: state === AGENT_DIRECTOR_PENDING_STATE ? ROW_REREAD_PENDING : UNKNOWN_STATES.has(state) ? ROW_REREAD_UNKNOWN : ROW_REREAD_LIVE,
+            row: harnessRow(h, persona, route.row(h, p, state)),
+            lastRead: latchRowStateRead(state),
+          }
+    const tail = (outcome: string): string => `: re-read: ${describePersonaRowReread(rereadOf(reread))} — ${outcome} (b.jg5 SRJ-609, SRJ-611, SRJ-707)`
+    const rereadLines = h.errors.filter((line) => line.startsWith(`[slack] spawnForPersona: replacing the row of ${renderPersonaRef(p, p)} (`) && line.includes(' — the path holds no dead evidence, so the row is read again first: '))
+    expect(rereadLines).toHaveLength(1)
+    expect(rereadLines[0]).toContain(describeDeadEvidence(carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE)))
+    expect(getFailureCount(p)).toBe(0)
+
+    if (reread === LIVENESS_DEAD_ROW_ENDED) {
+      expect(result).toStrictEqual({ key: p, action: 'spawned' })
+      expect(h.stub.calls.killCalls).toEqual([])
+      expect(rereadLines[0]!.endsWith(tail(REPLACE_REREAD_FINISHED_OUTCOME))).toBe(true)
+      expect(order.slice(route.before.length + 1, route.before.length + 2)).toEqual(['spawn'])
+      expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+      expect([h.sequenceRunning(p), h.triggers]).toEqual([false, []])
+      await h.runApproverToStop(p)
+      return
+    }
+    if (reread === LIVE || UNKNOWN_STATES.has(reread)) {
+      expect(result).toStrictEqual({ key: p, action: 'failed', refused: true })
+      expect(h.stub.calls.killCalls).toEqual([])
+      expect(rereadLines[0]!.endsWith(tail(lostRaceOutcome(true)))).toBe(true)
+      // The line names the state as read, or `unreadable` for a value that is not a short identifier.
+      const named = UNKNOWN_REREAD_STATES.find(([, state]) => state === reread)?.[2] ?? reread
+      expect(rereadLines[0]).toContain(`: re-read: state=${named} — `)
+      expect(order).toEqual([...route.before, 'get'])
+      expect([h.sequenceRunning(p), h.triggers]).toEqual([false, [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_LOST_RACE }]])
+      expect([h.notices, h.episodeNotices]).toEqual([[], []])
+      return
+    }
+    expect(rereadLines[0]!.endsWith(tail(REPLACE_REREAD_PENDING_OUTCOME))).toBe(true)
+    if (route.pendingCovered) {
+      // A covered `pending` row is a launch in progress: left as it is.
+      expect(result).toStrictEqual({ key: p, action: 'no-op' })
+      expect(h.stub.calls.killCalls).toEqual([])
+      expect(order).toEqual([...route.before, 'get'])
+      expect([h.sequenceRunning(p), h.triggers, h.notices]).toEqual([false, [], []])
+      return
+    }
+    // b.jg5 SRJ-411: a `pending` row whose config_dir label is missing or differs is not covered: SRJ-411's sequence, seeded pending, the conversation not kept.
+    expect(result).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })))
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p, action: 'spawned' } })
+    expect([getFailureCount(p), h.notices]).toEqual([0, []])
+    await h.runApproverToStop(p)
+  })
+
+  // The re-read's own error rows (b.jg5 SRJ-114, SRJ-105): a refused re-read
+  // answers the refusal result, armed with the read's own cause only; the
+  // replacement makes no further call.
+  test.each(DEAD_SESSION_REPLACEMENT_ROUTES.map((route) => [route.name, route] as const))('S4: %s, after its row-not-interactive verdict, its re-read refused (UNAVAILABLE): the uncounted refused result, P armed with the read\'s cause; no sequence, kill or launch', async (_name, route) => {
+    const { h, p } = srj105Build()
+    route.setup?.(h)
+    const persona = harnessPersona(h, p)
+    const err = unavailableAt('get')
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, route.row(h, p, LIVE))), cannedErr<Phase1GetResult>(err)],
+      ...NOT_INTERACTIVE_WAITING,
+    })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(order).toEqual([...route.before, 'get'])
+    expect(h.triggers).toEqual([{ key: p, kind: unavailableForms('ErrCallTimeout')[0]![2] }])
+    expect(h.errors.filter((line) => line.includes(' — the path holds no dead evidence, so the row is read again first: '))).toEqual([
+      expect.stringContaining(`re-read: ${describePersonaRowReread({ kind: ROW_REREAD_REFUSED })} — ${REPLACE_REREAD_REFUSED_OUTCOME} `),
+    ])
+    expect([h.sequenceRunning(p), h.stub.calls.killCalls, getFailureCount(p), h.notices]).toEqual([false, [], 0, []])
   })
 
   /**
@@ -22487,14 +22907,22 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
   })
 
   // b.jg5 SRJ-710: ErrSpawnNotResumable is never by itself a reason to kill
-  // and replace, at any path that resumes.
+  // and replace, at any path that resumes: its re-read of a row that has
+  // finished since is a lost race, whatever evidence the path holds.
   test.each<[string, RecoveryStubScript, readonly string[]]>([
-    ['the dead-session path of a waiting row (after its sweep)', { ...DEAD_WAITING }, ['spawn', 'get', 'sendKeys', 'findMissing', 'resume']],
-    ['a check_permission row whose read-pane answered GONE, swept and re-read ended', { readPaneError: errTmuxCaptureFailed(), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) }, ['spawn', 'get', 'readPane', 'findMissing', 'status', 'resume']],
-  ])('SRJ-710: resume answering ErrSpawnNotResumable on %s is a lost race: no kill, delete or launch, nothing counted or posted, P armed with the lost-race cause', async (_name, script, order) => {
+    ['the dead-session path of a waiting row (after its sweep)', { ...NOT_INTERACTIVE_WAITING }, ['spawn', 'get', 'sendKeys', 'findMissing', 'resume', 'get']],
+    ['a check_permission row whose read-pane answered GONE, swept and re-read ended', { readPaneError: errTmuxCaptureFailed(), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) }, ['spawn', 'get', 'readPane', 'findMissing', 'status', 'resume', 'get']],
+  ])('SRJ-710: resume answering ErrSpawnNotResumable on %s, its re-read finding the row ended, is a lost race: no kill, delete or launch, nothing counted or posted, P armed with the lost-race cause', async (_name, script, order) => {
     const { h, p } = srj105Build()
     const state = order.includes('readPane') ? 'check_permission' : LIVE
-    h.script({ ...collided(h, harnessPersona(h, p), { state }), ...script, resumeError: errSpawnNotResumable() })
+    const persona = harnessPersona(h, p)
+    h.script({
+      ...collided(h, persona, { state }),
+      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, { state }))],
+      getResult: harnessRow(h, persona, { state: LIVENESS_DEAD_ROW_ENDED }),
+      ...script,
+      resumeError: errSpawnNotResumable(),
+    })
     const calls = recordCallOrder(h)
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
@@ -22524,6 +22952,44 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(h.notices.map((notice) => notice.key)).toEqual([p])
     expect(getFailureCount(p)).toBe(1)
     expect(h.startupErrors()).toEqual([])
+  })
+
+  // The start flag on the resume leg (b.jg5 SRJ-712, SRJ-611): a sequence a
+  // start-pass launch starts on a GONE-evidence path ends in a `resume`
+  // (the conversation kept); that resume's ErrJsonlMissing runs the
+  // diagnosis and posts its notice once the reuse spawn brings P up, but
+  // writes no startup-errors entry, where the ladder's own ErrJsonlMissing at
+  // the start pass writes one (the T3 describe above).
+  test('the start flag: a sequence a start-pass launch starts on a GONE-evidence path (resume ErrSpawnNotResumable, re-read waiting) makes its step-6 resume outside the start pass: its ErrJsonlMissing runs the diagnosis and posts its notice, the launch answers fresh-after-inconclusive-amnesia, but no jsonl-transcript-lost-on-resume or jsonl-diagnosis-inconclusive entry is written', async () => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: 'waiting' })), cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: 'waiting' }))],
+      getResult: endedWithSession(h, p),
+      resumeQueue: [cannedErr(errSpawnNotResumable()), cannedErr(errJsonlMissing())],
+      ...GONE_WAITING,
+    })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_RESUME,
+      result: { key: p, action: 'fresh-after-inconclusive-amnesia' },
+    })
+
+    // The step-6 resume, then the diagnosis get before the one reuse spawn.
+    const launchAndRead = order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))
+    expect(launchAndRead.slice(launchAndRead.lastIndexOf('resume'))).toEqual(['resume', 'get', 'spawn'])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(h.errors.filter((line) => line.startsWith('[slack] ErrJsonlMissing diagnostic: '))).toHaveLength(1)
+    expect(h.notices.map((notice) => notice.key)).toEqual([p])
+    expect(h.notices[0]!.text).toContain(JSONL_DIAGNOSIS_REUSE_WORDING)
+    const log = h.startupErrors().join('\n')
+    expect([countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS), countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)]).toEqual([0, 0])
+    expect(getFailureCount(p)).toBe(0)
+    await h.runApproverToStop(p)
   })
 })
 
@@ -22621,5 +23087,664 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
     expect(bOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED })
     expect(personaCallCounts(h, p)).toEqual(pCalls)
     expect(h.reuseSpawns().map((reuse) => reuse.claude_instance_id)).toEqual([personaInstanceId(b)])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-113 (E23 T2): `resume`'s outcome table at `resumeOrFreshSpawn`,
+// one case per row (`RESUME_OUTCOME_ROWS`; the entry's are in the
+// sequence-launch entry's describe), on the recovery harness: the
+// optimistic spawn collides and the collision `get` reads the row `ended`
+// with a session id, so the ladder's one `resume` meets the row's answer.
+// HO rev 28's restore sentences change nothing (CSCB keys nothing on them,
+// and `src/` holds none): each of `ErrTmuxSessionCreate`, a `resume`
+// CONFLICT, an `ErrTmuxUnresponsive` after "duplicate session" and
+// `ErrTmuxNotAvailable` gets the same outcome with each of the four. The
+// one-literal pins of the not-resumable step's and the replacement re-read's
+// line builders are here; the cases compare with the builders.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case per row; HO rev 28\'s restore sentences change nothing', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(srj105Harness)
+    srj105AfterEach()
+  })
+
+  /** P's launch: the colliding first spawn, the collision `get` reading the row `ended` with a session id, and the `resume` answering `err` (success when unset). */
+  const endedRowResume = (h: RecoveryHarness, p: string, err?: Error): RecoveryStubScript => ({
+    ...collided(h, harnessPersona(h, p), ENDED_WITH_SESSION),
+    ...(err === undefined ? {} : { resumeError: err }),
+  })
+
+  test.each(RESUME_OUTCOME_ROWS.map((row) => [row.name, row] as const))('SRJ-113 at resumeOrFreshSpawn: resume answering %s', async (_name, row) => {
+    const { h, p } = srj105Build()
+    const rechecks = row.recheck === true ? h.recheckAnswers(PHASE1_RC_VERSION) : undefined
+    h.script(endedRowResume(h, p, row.make?.()))
+    const order = recordCallOrder(h)
+
+    const result = await h.launch(p)
+
+    await expectResumeOutcome(h, p, row, row.ladder, result, order, rechecks)
+    expect(h.sequenceRunning(p)).toBe(false)
+  })
+
+  // HO rev 28 (the E23 reconcile note): a `resume` whose description says
+  // the row could not be restored and stays pending is counted and arms P's
+  // retry timer at once in pending-only mode, with no `get` first, so the
+  // retry's read decides; nothing is killed. What that retry does with the
+  // row is E28's and E29's.
+  test('ErrTmuxSessionCreate saying the row could not be restored and stays pending (session_restart_delay 0): counted once, no kill and no get after it; the stub\'s row stays pending; P armed at once in pending-only mode', async () => {
+    const { h, p } = srj105Build()
+    expect(h.config.session_restart_delay).toBe(0)
+    h.script({ ...endedRowResume(h, p, errTmuxSessionCreateStaysPending('resume')), statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', countedClass: true, pendingOnlyArmed: true })
+
+    expect(order).toEqual(['spawn', 'get', 'resume'])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expect(h.controller.view(p)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
+    expect(h.notices.map((notice) => notice.key)).toEqual([p])
+    expect(h.stub.calls.killCalls).toEqual([])
+  })
+
+  /** One of HO rev 28's four failures met after the `resume`'s move, and the outcome it has whatever restore sentence ends its description. */
+  const RESTORE_FAILURES: ReadonlyArray<readonly [string, () => Error, (h: RecoveryHarness, p: string, err: Error) => void]> = [
+    ['ErrTmuxSessionCreate', () => errTmuxSessionCreate('resume'), (h, p) => {
+      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+      expect(h.notices.map((notice) => notice.key)).toEqual([p])
+    }],
+    ['a resume CONFLICT (a session left over from an earlier life)', () => conflictRowsFor('resume').find((row) => row.latchCase === LATCH_CASE_LEFTOVER)!.build(), (h, p, err) => {
+      expect(h.latch.record(p)).toEqual(
+        expectedLatchRecord(p, { latchCase: LATCH_CASE_LEFTOVER, refusedOperation: REFUSED_OPERATION_RESUME, rowState: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED), sessionName: STUB_TMUX_SESSION_NAME, description: (err as AgentDirectorError).errDescription }),
+      )
+      expect([h.triggers, h.episodeNotices.map((notice) => notice.key)]).toEqual([[], [p]])
+    }],
+    ['ErrTmuxUnresponsive after "duplicate session" (its holder could not be read)', () => errTmuxUnresponsive('resume', 'tmux new-session answered duplicate session and the session holding the name could not be read; nothing was started'), (h, p) => {
+      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    }],
+    ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'resume'), (h, p) => {
+      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
+      expect([...getOutageFlags(p)]).toEqual(['tmux-unavailable'])
+    }],
+  ]
+
+  /** The launch's answer for each restore failure, with or without a sentence. */
+  const RESTORE_ANSWERS: Readonly<Record<string, Omit<SpawnPersonaResult, 'key'>>> = {
+    'ErrTmuxSessionCreate': { action: 'failed', countedClass: true, pendingOnlyArmed: true },
+    'a resume CONFLICT (a session left over from an earlier life)': { action: 'latched' },
+    'ErrTmuxUnresponsive after "duplicate session" (its holder could not be read)': REFUSED_ANSWER,
+    'ErrTmuxNotAvailable': REFUSED_ANSWER,
+  }
+
+  test.each(RESTORE_FAILURES.flatMap(([label, make, check]) => [undefined, ...RESTORE_SENTENCES].map((sentence) => [label, sentence ?? '(no restore sentence)', make, check, sentence] as const)))('SRJ-113, SRJ-1303 (HO rev 28): resume answering %s ending with %s has the same outcome: the launch\'s answer, its causes and latch, no kill, nothing after the resume', async (label, _sentenceLabel, make, check, sentence) => {
+    const { h, p } = srj105Build()
+    const base = make() as AgentDirectorError
+    const err = sentence === undefined ? base : withRestoreSentence(base, sentence)
+    h.script(endedRowResume(h, p, err))
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, ...RESTORE_ANSWERS[label] })
+
+    expect(classifyAdError(err).errorClass).toBe(classifyAdError(base).errorClass)
+    expect(order.slice(order.indexOf('resume'))).toEqual(['resume'])
+    expect(h.stub.calls.killCalls).toEqual([])
+    check(h, p, err)
+  })
+
+  test('src/ holds none of the four restore sentences: CSCB keys no behaviour on them (b.jg5 SRJ-113, SRJ-702)', () => {
+    const srcDir = join(import.meta.dir, '..', 'src')
+    const files = readdirSync(srcDir).filter((name) => name.endsWith('.ts'))
+    expect(files.length).toBeGreaterThan(0)
+    const hits = files.flatMap((name) => {
+      const source = readFileSync(join(srcDir, name), 'utf-8')
+      return RESTORE_SENTENCES.filter((sentence) => source.includes(sentence)).map((sentence) => `${name}: ${sentence}`)
+    })
+    expect(hits).toEqual([])
+  })
+
+  // b.jg5 SRJ-113, SRJ-111, SRJ-501 (HO rev 15): the plain spawn after the
+  // ladder's ErrSpawnNotFound makes agent-director's pre-spawn scan; its
+  // refusal latches P with "plain spawn" and the state the path last read
+  // (`resume` is not a read), the stub holding no row afterwards. Every plain
+  // spawn row at every ladder resume path is `LATCH_CROSS`'s.
+  test('ErrSpawnNotFound, then the plain spawn\'s scan CONFLICT (scan-leftover): latched with "plain spawn" and the state the collision get read; the stub holds no row; nothing counted, no kill, no spawn-failure notice', async () => {
+    const { h, p } = srj105Build()
+    const row = CONFLICT_CASE_ROWS.find((caseRow) => caseRow.site === 'plain spawn' && caseRow.stubCase === 'scan-leftover')!
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(row.build())],
+      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION))],
+      getError: errSpawnNotFound(),
+      resumeError: errSpawnNotFound(),
+    })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(['spawn', 'get', 'resume', 'spawn'])
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, undefined])
+    expect(h.errors.filter((line) => line === resumeNotFoundSpawnLine(LADDER_HEAD, renderPersonaRef(p, p)))).toHaveLength(1)
+    expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_PLAIN_SPAWN, latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)))
+  })
+
+  // The one literal pin of each new line builder (every case compares with the builders).
+  test('the line builders: the not-resumable step\'s line at the ladder and at the entry, the replacement re-read\'s line, the ErrSpawnNotFound spawn line and the outcomes they carry', () => {
+    const ref = renderPersonaRef('C', 'C')
+    const failure = describeAgentDirectorFailure(errSpawnNotResumable())
+    const ended: PersonaRowReread = { kind: ROW_REREAD_FINISHED, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) }
+    expect(spawnNotResumableLine(LADDER_HEAD, ref, failure, ended, carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_TMUX_GONE), lostRaceOutcome(true))).toBe(
+      `[slack] spawnForPersona: ${failure} on resume for ${ref} — re-read: state=ended; cause=tmux-gone: dead evidence (GONE-based) — a lost race: nothing killed, deleted or launched; answering the uncounted refused result, no spawn-failure notice, nothing counted; the retry timer is armed (cause=spawn-not-resumable-lost-race) (b.jg5 SRJ-710, SRJ-611)`,
+    )
+    expect(spawnNotResumableLine(LIVE_ROW_SEQUENCE_LOG_PREFIX, ref, failure, { kind: ROW_REREAD_REFUSED }, undefined, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME)).toBe(
+      `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${failure} on resume for ${ref} — re-read: the read failed — a lost race: no second sequence and no further call; the sequence ends without its launch (cause=spawn-not-resumable-lost-race unless the persona is latched), nothing counted (b.jg5 SRJ-710, SRJ-706)`,
+    )
+    expect(describePersonaRowReread({ kind: ROW_REREAD_LATCHED })).toBe('the read latched the persona')
+    expect(describePersonaRowReread({ kind: ROW_REREAD_FINISHED, lastRead: LATCH_ROW_STATE_NO_ROW })).toBe(`state=${describeLatchRowState(LATCH_ROW_STATE_NO_ROW)}`)
+    expect(notResumableSequenceOutcome('started')).toBe(
+      'the path holds dead evidence and the row is live: the live-row sequence, with the conversation kept (alert context recovery), ending in resume; start answered started — answering sequence-waiting; no other call, nothing counted',
+    )
+    expect(lostRaceOutcome(false)).toContain('the retry timer could not be armed (cause=spawn-not-resumable-lost-race)')
+    expect(replaceRereadLine(ref, 'resume_enabled is false', latchRowStateRead('waiting'), carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE), ended, REPLACE_REREAD_FINISHED_OUTCOME)).toBe(
+      `[slack] spawnForPersona: replacing the row of ${ref} (resume_enabled is false; last read waiting; cause=row-not-interactive: not dead evidence) — the path holds no dead evidence, so the row is read again first: re-read: state=ended — the row is finished: the replace step's reuse spawn of the same id (b.jg5 SRJ-609, SRJ-611, SRJ-707)`,
+    )
+    expect(resumeNotFoundSpawnLine(LADDER_HEAD, ref)).toBe(
+      `[slack] spawnForPersona: ErrSpawnNotFound on resume for ${ref} — fresh-spawn: one plain spawn of the same id, which makes agent-director's pre-spawn scan; no spawn-failure notice for the ErrSpawnNotFound (b.jg5 SRJ-113, SRJ-111)`,
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-710 (E23 T2): `resume`'s ErrSpawnNotResumable at
+// `resumeOrFreshSpawn` makes exactly one `get` of the row through the shared
+// own-row read (SRJ-114: its latch and error rows apply), and the re-read
+// decides (`decideNotResumable`):
+//   - `pending` is a launch in progress: nothing counted or posted, no
+//     sequence of its own whatever evidence the path held; the ladder's
+//     `pending` step answers (a covered row left with no kill; a row that is
+//     not covered, its `config_dir` label differing, gets SRJ-411's sequence
+//     through the replace step). Its arms equal a direct call of the
+//     ladder's `pending` branch on the same row (B's launch, its collision
+//     `get` reading that row: none today; E28 adds the covered row's arm);
+//   - another live state starts the live-row sequence only on a path that
+//     holds dead evidence (the SRJ-611 matrix below); otherwise, and for
+//     `ended`, `missing`, no row, a refused read or a state CSCB does not
+//     know (an unreadable one included, whatever evidence the path holds;
+//     the SRJ-611 describe's unknown-state cases), a lost race: nothing
+//     killed, deleted or launched, nothing counted, P's timer armed with the
+//     lost-race cause (after the read-error cause for a refused read).
+// Each path reaches the `resume` either through the GONE dead-session route
+// of a `waiting` row (dead evidence) or through a collision `get` that read
+// the row `ended` (none). AC 3's unit half is the covered `pending` row held
+// at the dev-channels dialog, its session id kept.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared own-row read decides; pending is a launch in progress, a lost race kills, counts and posts nothing', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(srj105Harness)
+    srj105AfterEach()
+  })
+
+  /** A re-read of each kind, for the pure decision. */
+  const REREADS: ReadonlyArray<readonly [string, PersonaRowReread]> = [
+    ['latched', { kind: ROW_REREAD_LATCHED }],
+    ['refused', { kind: ROW_REREAD_REFUSED }],
+    ['finished', { kind: ROW_REREAD_FINISHED, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) }],
+    ['no row', { kind: ROW_REREAD_FINISHED, lastRead: LATCH_ROW_STATE_NO_ROW }],
+    ['pending', { kind: ROW_REREAD_PENDING, row: cannedGetResult({ claude_instance_id: STUB_INSTANCE_ID, state: AGENT_DIRECTOR_PENDING_STATE }), lastRead: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE) }],
+    ['live', { kind: ROW_REREAD_LIVE, row: cannedGetResult({ claude_instance_id: STUB_INSTANCE_ID, state: 'waiting' }), lastRead: latchRowStateRead('waiting') }],
+    ...UNKNOWN_REREAD_STATES.map(([label, state]) => [`unknown (${label})`, { kind: ROW_REREAD_UNKNOWN, row: cannedGetResult({ claude_instance_id: STUB_INSTANCE_ID, state }), lastRead: latchRowStateRead(state) }] as const),
+  ]
+
+  /** The decision for each re-read: [no evidence, dead evidence, dead evidence with the sequence barred]. */
+  type Answer = ReturnType<typeof decideNotResumable>['answer']
+  const DECISIONS: Readonly<Record<string, readonly [Answer, Answer, Answer]>> = {
+    'latched': [NOT_RESUMABLE_LATCHED, NOT_RESUMABLE_LATCHED, NOT_RESUMABLE_LATCHED],
+    'refused': [NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_LOST_RACE],
+    'finished': [NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_LOST_RACE],
+    'no row': [NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_LOST_RACE],
+    'pending': [NOT_RESUMABLE_PENDING, NOT_RESUMABLE_PENDING, NOT_RESUMABLE_PENDING],
+    'live': [NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_SEQUENCE, NOT_RESUMABLE_LOST_RACE],
+    // An unknown state never leads to a kill, whatever evidence the path holds.
+    ...Object.fromEntries(UNKNOWN_REREAD_STATES.map(([label]) => [`unknown (${label})`, [NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_LOST_RACE] as const])),
+  }
+
+  test.each(REREADS)('decideNotResumable: a %s re-read, with no evidence, with dead evidence, and with the sequence barred (the sequence\'s own step 6)', (label, reread) => {
+    const gone = carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_TMUX_GONE)
+    const answers = [
+      decideNotResumable(reread, CARRIED_DEAD_EVIDENCE_NONE, false),
+      decideNotResumable(reread, gone, false),
+      decideNotResumable(reread, gone, true),
+    ]
+    expect(answers.map((decision) => decision.answer)).toEqual([...DECISIONS[label]!])
+    expect(answers.map((decision) => decision.reread)).toEqual([reread, reread, reread])
+    // Decided again from the source: a hand-built value claiming evidence for a cause that is not GONE-based starts nothing.
+    const claimed = { source: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, evidence: true } as unknown as CarriedDeadEvidence
+    expect(decideNotResumable(reread, claimed, false).answer).toBe(DECISIONS[label]![0])
+  })
+
+  /** Which path reaches the `resume`: the GONE dead-session route of a `waiting` row (dead evidence), or a collision `get` that read the row `ended` (none). */
+  type NotResumablePath = 'dead evidence' | 'no evidence'
+  const PATHS: readonly NotResumablePath[] = ['dead evidence', 'no evidence']
+
+  /** The calls each path makes before its re-read. */
+  const PATH_CALLS: Readonly<Record<NotResumablePath, readonly string[]>> = {
+    'dead evidence': ['spawn', 'get', 'sendKeys', 'findMissing', 'resume'],
+    'no evidence': ['spawn', 'get', 'resume'],
+  }
+
+  /** The dead evidence each path holds (`describeDeadEvidence` in the step's line). */
+  const PATH_EVIDENCE = (path: NotResumablePath): CarriedDeadEvidence =>
+    path === 'dead evidence' ? carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_TMUX_GONE) : CARRIED_DEAD_EVIDENCE_NONE
+
+  /**
+   * P's launch along `path`, its `resume` answering ErrSpawnNotResumable
+   * once (a later `resume` succeeds), its re-read answering `reread`, and
+   * every later `get` (a sequence's) reading the row `ended` with a session id.
+   */
+  function scriptNotResumable(h: RecoveryHarness, p: string, path: NotResumablePath, reread: CannedResponse<Phase1GetResult>): void {
+    const persona = harnessPersona(h, p)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: path === 'dead evidence' ? 'waiting' : LIVENESS_DEAD_ROW_ENDED })), reread],
+      getResult: harnessRow(h, persona, ENDED_WITH_SESSION),
+      resumeQueue: [cannedErr(errSpawnNotResumable())],
+      ...(path === 'dead evidence' ? { sendKeysError: errTmuxSendKeys() } : {}),
+    })
+  }
+
+  /** The not-resumable step's lines for persona `p` at the ladder. */
+  const notResumableLines = (h: RecoveryHarness, p: string): string[] => h.errors.filter((line) => line.startsWith(`${LADDER_HEAD} `) && line.includes(` on resume for ${renderPersonaRef(p, p)} — re-read: `))
+
+  /** What `key` has armed: the causes sent for it, whether its timer is armed, and its causes there. */
+  const armsOf = (h: RecoveryHarness, key: string) => ({
+    sent: h.triggers.filter((t) => t.key === key).map((t) => t.kind),
+    armed: h.controller.isArmed(key),
+    causes: h.controller.view(key)?.causes ?? [],
+  })
+
+  // AC 3's unit half: a `resume` forced on a row held at the dev-channels
+  // dialog (its session id kept, a launch start) gets ErrSpawnNotResumable,
+  // which is neither counted nor posted.
+  test.each([...PATHS])('a covered pending row with a launch start (AC 3: held at the dev-channels dialog, its session id kept), the path holding %s: the ladder\'s pending step answers no-op; no sequence, kill, delete or launch; nothing counted or posted; its arms equal a direct call of the ladder\'s pending branch on the same row', async (path) => {
+    const { h, p, b } = srj105Build()
+    const pendingOf = (key: string) => harnessRow(h, harnessPersona(h, key), { state: AGENT_DIRECTOR_PENDING_STATE, claude_session_id: ENDED_WITH_SESSION.claude_session_id })
+    scriptNotResumable(h, p, path, cannedOk<Phase1GetResult>(pendingOf(p)))
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'no-op' })
+
+    expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb) || verb === 'sendKeys')).toEqual([...PATH_CALLS[path], 'get'])
+    expect(notResumableLines(h, p)).toEqual([
+      spawnNotResumableLine(LADDER_HEAD, renderPersonaRef(p, p), describeAgentDirectorFailure(errSpawnNotResumable()), { kind: ROW_REREAD_PENDING, row: pendingOf(p), lastRead: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE) }, PATH_EVIDENCE(path), NOT_RESUMABLE_PENDING_OUTCOME),
+    ])
+    expect([h.sequenceRunning(p), h.stub.calls.killCalls, getFailureCount(p), h.notices, h.episodeNotices, h.startupErrors()]).toEqual([false, [], 0, [], [], []])
+
+    // B's launch meets the same row at its collision get: the ladder's pending branch, called directly.
+    h.script({ ...collided(h, harnessPersona(h, b), { state: AGENT_DIRECTOR_PENDING_STATE, claude_session_id: ENDED_WITH_SESSION.claude_session_id }), sendKeysError: undefined })
+    expect(await h.launch(b)).toStrictEqual({ key: b, action: 'no-op' })
+    expect(armsOf(h, p)).toEqual(armsOf(h, b))
+  })
+
+  test.each([...PATHS])('a pending row with a launch start whose config_dir label differs (never covered, SRJ-411), the path holding %s: the ErrSpawnNotResumable starts no sequence itself; the ladder\'s pending step starts SRJ-411\'s (seeded pending, the conversation not kept, context recovery) and the launch answers sequence-waiting; nothing counted or posted', async (path) => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const mismatched = harnessRow(h, persona, relabelledRow(h, persona, AGENT_DIRECTOR_PENDING_STATE))
+    scriptNotResumable(h, p, path, cannedOk<Phase1GetResult>(mismatched))
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+
+    expect(order.slice(0, PATH_CALLS[path].length + 1)).toEqual([...PATH_CALLS[path], 'get'])
+    expect(notResumableLines(h, p)).toEqual([expect.stringContaining(` — ${NOT_RESUMABLE_PENDING_OUTCOME} `)])
+    expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })))
+    // The conversation is not kept: the row has a session id, yet step 6 is a reuse.
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p, action: 'spawned' }, kills: 1 })
+    expect(h.stub.calls.resumeCalls).toHaveLength(1)
+    expect([getFailureCount(p), h.notices, h.episodeNotices]).toEqual([0, [], []])
+    await h.runApproverToStop(p)
+  })
+
+  test.each<[string, (h: RecoveryHarness, p: string) => CannedGetResult]>([
+    ['a pending row with no launch start (E16: "launch start not recorded")', (h, p) => harnessRow(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })],
+    ['a waiting row carrying a provenance_conflict note (E14: "conflicting labels")', (h, p) => harnessRow(h, harnessPersona(h, p), { state: 'waiting', liveness_note: provenanceNote })],
+  ])('the re-read latches P on %s: latched, with no further call, no sequence and no kill, though the path holds dead evidence', async (_name, row) => {
+    const { h, p } = srj105Build()
+    scriptNotResumable(h, p, 'dead evidence', cannedOk<Phase1GetResult>(row(h, p)))
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual([...PATH_CALLS['dead evidence'], 'get'])
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect([h.sequenceRunning(p), getFailureCount(p), h.notices]).toEqual([false, 0, []])
+    expect(notResumableLines(h, p)).toEqual([expect.stringContaining(` — re-read: ${describePersonaRowReread({ kind: ROW_REREAD_LATCHED })}; `)])
+  })
+
+  /** Re-reads that are a lost race on a path with no evidence: a finished row, no row, and every live state but `pending`. */
+  const LOST_RACE_REREADS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => CannedResponse<Phase1GetResult>]> = [
+    ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`the row ${state}`, (h: RecoveryHarness, p: string) => cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state }))] as const),
+    ['no row (ErrSpawnNotFound)', () => cannedErr<Phase1GetResult>(errSpawnNotFound())],
+    ...[...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE).map((state) => [`the row ${state}, the path holding no dead evidence`, (h: RecoveryHarness, p: string) => cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state }))] as const),
+  ]
+
+  test.each(LOST_RACE_REREADS)('the re-read reads %s: a lost race: the uncounted refused result; no kill, delete or launch; nothing counted or posted; P armed with the lost-race cause and re-evaluated at its retry', async (_name, reread) => {
+    const { h, p, b } = srj105Build()
+    scriptNotResumable(h, p, 'no evidence', reread(h, p))
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(order).toEqual([...PATH_CALLS['no evidence'], 'get'])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_LOST_RACE }])
+    expect([h.sequenceRunning(p), getFailureCount(p), h.notices, h.episodeNotices, h.startupErrors()]).toEqual([false, 0, [], [], []])
+    const lines = notResumableLines(h, p)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]!.endsWith(` — ${lostRaceOutcome(true)} (b.jg5 SRJ-710, SRJ-611)`)).toBe(true)
+    expect(personaCallCounts(h, b)).toEqual({})
+  })
+
+  // The PM ruling: a refused re-read takes the shared read's own error rows
+  // (the `get` arms P's timer with the cause its error gives: the UNAVAILABLE
+  // cause, or the read-error cause for any other read error, SRJ-301), and
+  // the step then ends as the lost race, nothing counted.
+  const REFUSED_REREADS = PATHS.flatMap((path) =>
+    ([
+      ['UNAVAILABLE (ErrCallTimeout)', () => unavailableAt('get'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      ['UNCLASSIFIED (ErrInternal)', () => errInternal(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+    ] as const).map(([what, make, cause]) => [what, path, make, cause] as const),
+  )
+  test.each(REFUSED_REREADS)('the re-read is refused (%s), the path holding %s: no sequence, kill or launch; nothing counted; P armed with the read\'s own cause, then the lost-race cause', async (_what, path, make, cause) => {
+    const { h, p } = srj105Build()
+    scriptNotResumable(h, p, path, cannedErr<Phase1GetResult>(make()))
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(order).toEqual([...PATH_CALLS[path], 'get'])
+    expect(h.triggers.map((t) => t.kind)).toEqual([cause, UNAVAILABLE_RETRY_CAUSE_LOST_RACE])
+    expect([h.sequenceRunning(p), h.stub.calls.killCalls, getFailureCount(p), h.notices]).toEqual([false, [], 0, []])
+    expect(notResumableLines(h, p)).toEqual([expect.stringContaining(` — re-read: ${describePersonaRowReread({ kind: ROW_REREAD_REFUSED })}; `)])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-611's Test line (homed in T1, observed here), SRJ-710, AC 58,
+// AC 59: for each dead-session path and cause, the `resume` answers
+// ErrSpawnNotResumable and the re-read finds the row `waiting` (live, not
+// `pending`). Only a path holding GONE-based dead evidence (the reconnect's
+// `ErrTmuxSendKeys`, a pane read's `ErrTmuxCaptureFailed`, or an
+// escalate-dead verdict from one) starts exactly one live-row sequence,
+// through the registry the harness installs as `main()` does: step 1,
+// seeded `waiting`, alert context `recovery`, the conversation kept, so on
+// the fake clock it kills, gets, runs and gets, then ends in one `resume` of
+// the row (its session id), never a reuse; the ladder answers
+// `sequence-waiting` and nothing is counted. Every other cause
+// (`row-not-interactive`, the row absent, a finished-row read, nothing
+// carried) starts no sequence and makes no kill, delete or launch: a lost
+// race, nothing counted, P armed with the lost-race cause. A re-read in a
+// state CSCB does not know (an unreadable one included) is a lost race on
+// every GONE-based path, and again at the sequence's own step-6 `resume`:
+// no sequence, kill or launch follows it. Then AC 59 with its later retry,
+// and SRJ-110 at this site: the sequence's first kill's C2 non-successes, on
+// E20's checked kill.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a row re-read waiting starts the live-row sequence, ending in resume, only for a GONE-based cause', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(srj105Harness)
+    srj105AfterEach()
+  })
+
+  /** One dead-session path and cause that reaches the `resume`. */
+  interface PathCause {
+    readonly name: string
+    readonly setup?: (h: RecoveryHarness) => void
+    /** The state the collision `get` reads. */
+    readonly collision: string
+    /** The answers that make the path's verdict. */
+    readonly script: RecoveryStubScript
+    /** The escalate-dead verdict the restart path carries in, if any. */
+    readonly carried?: CarriedDeadEvidence
+    /** Whether the path holds dead evidence (from the hand-written table, never from the code under test). */
+    readonly gone: boolean
+    /** The cause or verdict the path holds, as the not-resumable step's line names it (`describeDeadEvidence`). */
+    readonly evidence: CarriedDeadEvidence
+  }
+
+  /** The reconnect's answers that make a dead-session verdict, with their cause. */
+  const RECONNECT_DEAD_ANSWERS: ReadonlyArray<readonly [string, () => Error, DeadSessionCause]> = [
+    ['ErrTmuxSendKeys', () => errTmuxSendKeys(), DEAD_SESSION_CAUSE_TMUX_GONE],
+    ['ErrSpawnNotInteractive', () => errSpawnNotInteractive('send-keys'), DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE],
+    ['ErrSpawnNotFound', () => errSpawnNotFound(), DEAD_SESSION_CAUSE_ROW_ABSENT],
+  ]
+
+  const PATH_CAUSES: readonly PathCause[] = [
+    ...RECONNECT_DEAD_ANSWERS.map(([what, make, cause]): PathCause => ({
+      name: `the waiting branch, its reconnect answering ${what} (cause ${cause})`,
+      collision: 'waiting',
+      script: { sendKeysError: make() },
+      gone: DEAD_EVIDENCE_OF[cause],
+      evidence: carriedDeadEvidenceOf(cause),
+    })),
+    ...RECONNECT_DEAD_ANSWERS.map(([what, make, cause]): PathCause => ({
+      name: `the working branch through its wait, the wait's reconnect answering ${what} (cause ${cause})`,
+      setup: fastPolls,
+      collision: 'working',
+      script: { statusResult: cannedStatusResult({ state: 'waiting' }), sendKeysError: make() },
+      gone: DEAD_EVIDENCE_OF[cause],
+      evidence: carriedDeadEvidenceOf(cause),
+    })),
+    {
+      name: `the working branch through its wait, its poll's status answering ErrSpawnNotFound (cause ${DEAD_SESSION_CAUSE_ROW_ABSENT})`,
+      setup: fastPolls,
+      collision: 'working',
+      script: { statusError: errSpawnNotFound() },
+      gone: DEAD_EVIDENCE_OF[DEAD_SESSION_CAUSE_ROW_ABSENT],
+      evidence: carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_ABSENT),
+    },
+    ...[...AGENT_DIRECTOR_DEAD_STATES].map((state): PathCause => ({
+      name: `the working branch through its wait, its poll reading the row ${state} (cause ${DEAD_SESSION_CAUSE_ROW_READ_FINISHED})`,
+      setup: fastPolls,
+      collision: 'working',
+      script: { statusResult: cannedStatusResult({ state }) },
+      gone: DEAD_EVIDENCE_OF[DEAD_SESSION_CAUSE_ROW_READ_FINISHED],
+      evidence: carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_READ_FINISHED),
+    })),
+    ...([
+      ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(), DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE],
+      ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), DEAD_SESSION_CAUSE_ROW_ABSENT],
+    ] as const).map(([what, make, cause]): PathCause => ({
+      name: `launchOnPromptRow on a check_permission row, its read-pane answering ${what}, swept and re-read ended (cause ${cause})`,
+      collision: 'check_permission',
+      script: { readPaneError: make(), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) },
+      gone: DEAD_EVIDENCE_OF[cause],
+      evidence: carriedDeadEvidenceOf(cause),
+    })),
+    { name: 'a collision get that read the row ended, nothing carried (no path evidence)', collision: LIVENESS_DEAD_ROW_ENDED, script: {}, gone: false, evidence: CARRIED_DEAD_EVIDENCE_NONE },
+    ...ESCALATE_DEAD_VERDICTS.map((verdict): PathCause => ({
+      name: `spawnForPersona carrying the escalate-dead verdict ${verdict} (as the restart path's relaunch carries it in), its collision get reading the row ended`,
+      collision: LIVENESS_DEAD_ROW_ENDED,
+      script: {},
+      carried: carriedDeadEvidenceOf(verdict),
+      gone: DEAD_EVIDENCE_OF[verdict],
+      evidence: carriedDeadEvidenceOf(verdict),
+    })),
+  ]
+
+  /** P's launch along `path`, its `resume` answering ErrSpawnNotResumable once, its re-read reading `rereadState` (`waiting` by default), and every later `get` (the sequence's) the row `ended` with a session id. */
+  function scriptPath(h: RecoveryHarness, p: string, path: PathCause, more: RecoveryStubScript = {}, rereadState = 'waiting'): void {
+    path.setup?.(h)
+    const persona = harnessPersona(h, p)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: path.collision })), cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: rereadState }))],
+      getResult: harnessRow(h, persona, ENDED_WITH_SESSION),
+      resumeQueue: [cannedErr(errSpawnNotResumable())],
+      ...path.script,
+      ...more,
+    })
+  }
+
+  /** The launch and read calls from the first `resume` on. */
+  const fromResume = (order: readonly string[]): string[] => order.slice(order.indexOf('resume')).filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))
+
+  test.each(PATH_CAUSES.map((path) => [path.name, path] as const))('SRJ-611: %s', async (_name, path) => {
+    const { h, p, b } = srj105Build()
+    scriptPath(h, p, path)
+    const order = recordCallOrder(h)
+    const id = personaInstanceId(p)
+
+    const result = await spawnForPersona(harnessPersona(h, p), h.config, false, undefined, path.carried)
+
+    if (!path.gone) {
+      // AC 59: a lost race: nothing killed, deleted or launched; nothing counted.
+      expect(result).toStrictEqual({ key: p, action: 'failed', refused: true })
+      expect(fromResume(order)).toEqual(['resume', 'get'])
+      expect([h.sequenceRunning(p), h.stub.calls.killCalls, h.reuseSpawns(), h.stub.calls.spawnCalls.length, getFailureCount(p)]).toEqual([false, [], [], 1, 0])
+      expect(h.triggers.filter((t) => t.key === p).map((t) => t.kind)).toEqual([UNAVAILABLE_RETRY_CAUSE_LOST_RACE])
+      expect(h.lines.filter((line) => line.startsWith(LIVE_ROW_SEQUENCE_LOG_PREFIX))).toEqual([])
+      return
+    }
+    // AC 58: one sequence, the conversation kept, ending in resume.
+    expect(result).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(h.sequenceRunning(p)).toBe(true)
+    expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: 'waiting', keepsConversation: true })))
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_RESUME,
+      reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
+      result: { key: p, action: 'resumed' },
+      kills: 1,
+    })
+    expect(fromResume(order)).toEqual(['resume', 'get', 'kill', 'get', 'findMissing', 'get', 'resume'])
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: id }, { claude_instance_id: id }])
+    expect([h.reuseSpawns(), h.stub.calls.spawnCalls.length, getFailureCount(p)]).toEqual([[], 1, 0])
+    expect(h.triggers.filter((t) => t.key === p)).toEqual([])
+    expect(personaCallCounts(h, b)).toEqual({})
+    await h.runApproverToStop(p)
+  })
+
+  /** The not-resumable step's re-read of P's row in `state`, of the `unknown` kind. */
+  const unknownReread = (h: RecoveryHarness, p: string, state: string): PersonaRowReread => ({
+    kind: ROW_REREAD_UNKNOWN,
+    row: harnessRow(h, harnessPersona(h, p), { state }),
+    lastRead: latchRowStateRead(state),
+  })
+
+  // b.jg5 SRJ-710, SRJ-611: GONE-based evidence never makes a re-read in a
+  // state CSCB does not know (an unreadable one included) a reason to kill:
+  // a lost race at the collision ladder, its line naming the state as read,
+  // or `unreadable`, and the evidence the path held.
+  const GONE_UNKNOWN_REREADS = PATH_CAUSES.filter((path) => path.gone).flatMap((path) =>
+    UNKNOWN_REREAD_STATES.map(([label, state, named]) => [path.name, label, path, state, named] as const),
+  )
+  test.each(GONE_UNKNOWN_REREADS)('SRJ-710: %s, the re-read finding %s: a lost race: no sequence, kill, delete or launch; nothing counted or posted; P armed with the lost-race cause', async (_name, _label, path, state, named) => {
+    const { h, p, b } = srj105Build()
+    scriptPath(h, p, path, {}, state)
+    const order = recordCallOrder(h)
+    const ref = renderPersonaRef(p, p)
+
+    expect(await spawnForPersona(harnessPersona(h, p), h.config, false, undefined, path.carried)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(fromResume(order)).toEqual(['resume', 'get'])
+    expect([h.sequenceRunning(p), h.stub.calls.killCalls, h.reuseSpawns(), h.stub.calls.spawnCalls.length, getFailureCount(p)]).toEqual([false, [], [], 1, 0])
+    expect(h.triggers.filter((t) => t.key === p).map((t) => t.kind)).toEqual([UNAVAILABLE_RETRY_CAUSE_LOST_RACE])
+    expect([h.notices, h.episodeNotices]).toEqual([[], []])
+    expect(h.lines.filter((line) => line.startsWith(LIVE_ROW_SEQUENCE_LOG_PREFIX))).toEqual([])
+    const line = spawnNotResumableLine(LADDER_HEAD, ref, describeAgentDirectorFailure(errSpawnNotResumable()), unknownReread(h, p, state), path.evidence, lostRaceOutcome(true))
+    expect(line).toContain(` — re-read: state=${named}; ${describeDeadEvidence(path.evidence)} — `)
+    expect(h.errors.filter((logged) => logged.includes(` on resume for ${ref} — re-read: `))).toEqual([line])
+    expect(personaCallCounts(h, b)).toEqual({})
+  })
+
+  // b.jg5 SRJ-710, SRJ-706: the sequence a GONE-based path starts ends in
+  // its own `resume`; that resume's ErrSpawnNotResumable, its re-read finding
+  // a state CSCB does not know (an unreadable one included), is a lost race
+  // there too: no second sequence, no second kill, no launch.
+  test.each(UNKNOWN_REREAD_STATES)('SRJ-710 at the sequence\'s step 6: GONE-based evidence and a waiting re-read start the sequence; its step-6 resume answering ErrSpawnNotResumable, the re-read finding %s, ends it not launched: no second sequence, kill or launch; nothing counted or posted; the lost-race cause armed', async (_label, state, named) => {
+    const { h, p, b } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const ended = cannedOk<Phase1GetResult>(harnessRow(h, persona, ENDED_WITH_SESSION))
+    // The collision get, the ladder's re-read, the sequence's two gets, then step 6's re-read.
+    scriptPath(h, p, PATH_CAUSES[0]!, {
+      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: 'waiting' })), cannedOk<Phase1GetResult>(harnessRow(h, persona, { state: 'waiting' })), ended, ended, cannedOk<Phase1GetResult>(harnessRow(h, persona, { state }))],
+      resumeQueue: [cannedErr(errSpawnNotResumable()), cannedErr(errSpawnNotResumable())],
+    })
+    const order = recordCallOrder(h)
+    const ref = renderPersonaRef(p, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_RESUME,
+      notLaunched: LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
+      armed: LIVE_ROW_ARM_LOST_RACE,
+      kills: 1,
+    })
+
+    expect(fromResume(order)).toEqual(['resume', 'get', 'kill', 'get', 'findMissing', 'get', 'resume', 'get'])
+    const line = spawnNotResumableLine(LIVE_ROW_SEQUENCE_LOG_PREFIX, ref, describeAgentDirectorFailure(errSpawnNotResumable()), unknownReread(h, p, state), undefined, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME)
+    expect(line).toContain(` — re-read: state=${named} — `)
+    expect(h.errors.filter((logged) => logged.startsWith(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} `) && logged.includes(` on resume for ${ref} — re-read: `))).toEqual([line])
+    expect([h.sequenceRunning(p), h.stub.calls.killCalls.length, h.stub.calls.resumeCalls.length, h.stub.calls.spawnCalls.length, h.reuseSpawns()]).toEqual([false, 1, 2, 1, []])
+    expect(h.triggers.filter((t) => t.key === p).map((t) => t.kind)).toEqual([UNAVAILABLE_RETRY_CAUSE_LOST_RACE])
+    expect([getFailureCount(p), h.notices, h.episodeNotices]).toEqual([0, [], []])
+    expect(personaCallCounts(h, b)).toEqual({})
+  })
+
+  // b.jg5 SRJ-609's AC 59 half: the reconnect's ErrSpawnNotInteractive is a
+  // route into the restart decision only; on a row the re-read finds live it
+  // kills, deletes and counts nothing, and P is re-evaluated at its retry.
+  test('AC 59: the reconnect\'s send-keys answers ErrSpawnNotInteractive, the re-read finds the row waiting and the resume answered ErrSpawnNotResumable: nothing killed, deleted or counted; P\'s next retry re-evaluates it', async () => {
+    const { h, p } = srj105Build()
+    const path = PATH_CAUSES.find((candidate) => candidate.collision === 'waiting' && !candidate.gone && candidate.name.includes('ErrSpawnNotInteractive'))!
+    scriptPath(h, p, path)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect([h.stub.calls.killCalls, getFailureCount(p), h.notices]).toEqual([[], 0, []])
+
+    // The row now reads live and P's session connects: the retry's decision finds nothing to recover.
+    h.script({ statusResult: cannedStatusResult(), sendKeysError: undefined })
+    h.setConnected(p, true)
+    await retryNow(h, p)
+
+    expect(h.attempts).toEqual([expect.objectContaining({ key: p, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_LOST_RACE] })])
+    expect(h.stops).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
+    expect([h.stub.calls.killCalls, getFailureCount(p)]).toEqual([[], 0])
+  })
+
+  /** The sequence's first kill's C2 non-successes (b.jg5 SRJ-110; HO C2's list), each with whether it latches P and the tries it takes. */
+  const FIRST_KILL_NON_SUCCESSES: ReadonlyArray<readonly [string, () => Error, boolean, number]> = [
+    ['ErrTmuxKillFailed', () => errTmuxKillFailed(), false, KILL_RETRY_TRIES],
+    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), false, KILL_RETRY_TRIES],
+    ['CONFLICT', () => errTmuxSessionConflict('kill', 'not-this-launch'), true, 1],
+    ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill'), false, 1],
+    ['ErrInternal', () => errInternal(), false, 1],
+    ['an unknown error name', () => errUnknownErrorName(), false, KILL_RETRY_TRIES],
+    ['ErrCallTimeout', () => errCallTimeout('kill'), false, KILL_RETRY_TRIES],
+  ]
+
+  test.each(FIRST_KILL_NON_SUCCESSES)('SRJ-110 at this site: GONE-based evidence and a waiting re-read start the sequence; its first kill answering %s through the bounded retry aborts it at step 1: no launch and no delete', async (_label, make, latches, tries) => {
+    const { h, p } = srj105Build()
+    scriptPath(h, p, PATH_CAUSES[0]!, { killError: make() })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_ABORTED, step: 1, latched: latches, kills: 1, runs: 0 })
+
+    expect(h.stub.calls.killCalls).toHaveLength(tries)
+    // The ladder's colliding spawn and its one resume only.
+    expect([h.stub.calls.spawnCalls.length, h.stub.calls.resumeCalls.length, h.reuseSpawns()]).toEqual([1, 1, []])
+    expect(h.latch.isLatched(p)).toBe(latches)
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  test('SRJ-110 at this site: the sequence\'s first kill answering ErrSpawnNotFound counts as success: the sequence goes on and ends in its resume', async () => {
+    const { h, p } = srj105Build()
+    scriptPath(h, p, PATH_CAUSES[0]!, { killError: errSpawnNotFound() })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'resumed' } })
+    expect(h.stub.calls.resumeCalls).toHaveLength(2)
+    await h.runApproverToStop(p)
   })
 })

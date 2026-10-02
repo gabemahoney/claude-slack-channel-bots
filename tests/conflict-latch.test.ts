@@ -130,6 +130,16 @@
  * actions" and CSCB's own words name no session-ending command, and a message
  * lost then reports `held-for-human` with no call and no restart; Q's
  * sequence, run beside P's, is not latched and launches its own reuse.
+ * The not-resumable step's re-read (SRJ-710, SRJ-114, SRJ-513; E23, on
+ * `makeRecoveryHarness`): after `resume`'s ErrSpawnNotResumable on a path
+ * holding dead evidence, a re-read carrying a `provenance_conflict` note or
+ * reading P's own `pending` row with no launch start latches P once with its
+ * record and one post, and nothing follows (no sequence, kill, delete or
+ * launch; nothing counted). `resume`'s HO rev 15 and rev 20 cases ("another
+ * agent-director store" in both forms, "conflicting labels") at the collision
+ * ladder and at the sequence's step-6 `resume` latch P with "resume" and the
+ * state the path last read, one post, no call after the `resume`, P's timer
+ * stopped; Q untouched.
  * Recovery: each reason ("row reads" over every live and dead state) under
  * both latch kinds, with no line matching either list.
  *
@@ -502,7 +512,9 @@ import {
   errInternal,
   errNoSessionId,
   errSpawnNotFound,
+  errSpawnNotResumable,
   errTmuxCaptureFailed,
+  errTmuxSendKeys,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
   errUnknownErrorName,
@@ -538,6 +550,7 @@ import {
   SEQUENCE_KILL_STEP,
   SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS,
   sequenceKillConflictRowsAt,
+  sequenceResumeConflictRowsAt,
   SESSION_ENDING_COMMAND_FORMS,
   UNUSABLE_NAME_CASE_ROWS,
   cscbOwnLines,
@@ -4312,5 +4325,136 @@ describe('a running live-row sequence stops when P latches from another path: no
     expect(killFailureLines(h, p)).toEqual([])
     await h.runApproverToStop(q)
     expect([h.sequenceRunning(p), h.sequenceRunning(q), h.clock.pendingCount()]).toEqual([false, false, 0])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The not-resumable step's re-read latches, and `resume`'s HO rev 15 and rev
+// 20 cases at both `resume` sites (E23 T2; b.jg5 SRJ-710, SRJ-114, SRJ-513,
+// SRJ-113, SRJ-501, SRJ-502; AC 46)
+//
+// On `makeRecoveryHarness`. The re-read after `resume`'s ErrSpawnNotResumable
+// goes through the shared own-row read (the E14 hatch note), so its latch
+// rules apply: P's launch reaches its `resume` through the GONE dead-session
+// route of its `waiting` row (dead evidence, so a live re-read would start a
+// sequence), and the re-read reads P's row carrying a `provenance_conflict`
+// note, or `pending` with no launch start: P latches once, with its one post,
+// and nothing follows (no sequence, kill, delete or launch; nothing counted).
+// `resume`'s new CONFLICT cases (the case table's another-store rows, plain
+// and in their "duplicate session" form, and "conflicting labels"), at the
+// collision ladder (its collision `get` read the row `ended`) and at the
+// live-row sequence's step-6 `resume` (its last `get` read the row `ended`):
+// each latches P with its case, the refused operation "resume" and the state
+// the path last read; exactly one post; no call after the `resume`; P's
+// timer, armed before, stopped. Q is untouched throughout.
+// ---------------------------------------------------------------------------
+
+describe('the not-resumable step\'s re-read latches, and resume\'s another-store and conflicting-labels cases at both resume sites (recovery harness; SRJ-710, SRJ-114, SRJ-513, SRJ-113, SRJ-501)', () => {
+  /** A recovery harness, cleaned up and leak-checked in `afterEach`, with P's timer armed so its latch's stop shows. */
+  function makeRun(): { h: RecoveryHarness; p: string; q: string } {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p, q] = h.keys as [string, string]
+    h.controller.arm(p, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
+    return { h, p, q }
+  }
+
+  /** P latched once (`record`, one post `notice`), its timer stopped, nothing counted or posted otherwise, no sequence; Q untouched. */
+  function expectLatchedOnce(h: RecoveryHarness, p: string, q: string, record: ConflictLatchRecord, notice: string): void {
+    expect(h.latch.record(p)).toEqual(record)
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices).toEqual([{ key: p, text: notice }])
+    expect(h.stops).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect([h.sequenceRunning(p), getFailureCount(p), h.notices, h.startupErrors()]).toEqual([false, 0, [], []])
+    expect([h.stub.calls.killCalls, h.stub.calls.deleteCalls]).toEqual([[], []])
+    expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
+  }
+
+  /** P's launch: the colliding spawn, the collision `get` reading P's `waiting` row, its reconnect's GONE, the find-missing run, the `resume`'s ErrSpawnNotResumable and its re-read reading `reread`. */
+  function scriptReread(h: RecoveryHarness, p: string, reread: Record<string, unknown>): void {
+    h.script({
+      ...collided(h, personaOf(h, p), { state: 'waiting' }),
+      getQueue: [cannedOk(cannedGetResult({ state: 'waiting' }, personaOf(h, p), h.home))],
+      getResult: cannedGetResult(reread, personaOf(h, p), h.home),
+      sendKeysError: errTmuxSendKeys(),
+      resumeError: errSpawnNotResumable(),
+    })
+  }
+
+  /** The ladder's calls up to the re-read: nothing after it. */
+  const LADDER_TO_REREAD = ['spawn', 'get', 'sendKeys', 'findMissing', 'resume', 'get']
+
+  test('the re-read carries a provenance_conflict note: P latches once with E14\'s record ("conflicting labels", slack_bot_<key>, no description) and one post; no sequence starts, though the path holds dead evidence; no call after the re-read', async () => {
+    const { h, p, q } = makeRun()
+    scriptReread(h, p, { state: 'waiting', liveness_note: provenanceNote })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(LADDER_TO_REREAD)
+    expectLatchedOnce(
+      h,
+      p,
+      q,
+      { sessionName: personaTmuxSessionName(p), latchCase: LATCH_CASE_CONFLICTING_LABELS, refusedOperation: REFUSED_OPERATION_BRING_UP, rowState: latchRowStateRead('waiting') },
+      expectedConflictNotice({ latchCase: LATCH_CASE_CONFLICTING_LABELS, sessionName: personaTmuxSessionName(p) }).text,
+    )
+  })
+
+  test('the re-read reads P\'s own pending row with no launch start: P latches once with "launch start not recorded" and its one post; no call after the re-read', async () => {
+    const { h, p, q } = makeRun()
+    scriptReread(h, p, { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(LADDER_TO_REREAD)
+    expectLatchedOnce(h, p, q, launchStartRecord(p), launchStartNotRecordedNoticeText(p))
+  })
+
+  /** HO rev 15's and rev 20's `resume` cases: "another agent-director store" in both forms, and "conflicting labels". */
+  const isNewResumeCase = (row: ConflictCaseRow): boolean => row.latchCase === LATCH_CASE_ANOTHER_STORE || row.latchCase === LATCH_CASE_CONFLICTING_LABELS
+
+  test('the case table has an another-store resume row in each form the stub builds, and a conflicting-labels row, at both resume sites', () => {
+    const forms = (rows: readonly ConflictCaseRow[]): Array<readonly [string, boolean]> => rows.filter(isNewResumeCase).map((row) => [row.latchCase, row.options.plainSpawn === true] as const)
+    const expected: Array<readonly [string, boolean]> = [[LATCH_CASE_ANOTHER_STORE, false], [LATCH_CASE_ANOTHER_STORE, true], [LATCH_CASE_CONFLICTING_LABELS, false]]
+    expect(forms(CONFLICT_CASE_ROWS.filter((row) => row.site === 'resume'))).toEqual(expected)
+    expect(forms(sequenceResumeConflictRowsAt(LIVENESS_DEAD_ROW_ENDED))).toEqual(expected)
+  })
+
+  /** The record a latch of `key` from `row` holds, refusing `row`'s operation with the state the path last read. */
+  const recordOf = (key: string, row: ConflictCaseRow, rowState: LatchRowState): ConflictLatchRecord =>
+    expectedLatchRecord(key, { latchCase: row.latchCase, refusedOperation: row.refusedOperation, rowState, sessionName: row.sessionName, description: row.build().errDescription })
+
+  test.each(CONFLICT_CASE_ROWS.filter((row) => row.site === 'resume' && isNewResumeCase(row)).map((row) => [row.name, row] as const))('at resumeOrFreshSpawn, %s: P latches with its case, "resume" and the state the collision get read (ended); one post, compared through E13\'s builder; no call after the resume; P\'s timer stopped', async (_name, row) => {
+    const { h, p, q } = makeRun()
+    h.script({ ...collided(h, personaOf(h, p), { state: LIVENESS_DEAD_ROW_ENDED }), resumeError: row.build() })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(['spawn', 'get', 'resume'])
+    expect(row.refusedOperation).toBe(REFUSED_OPERATION_RESUME)
+    expectLatchedOnce(h, p, q, recordOf(p, row, latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)), row.notice.text)
+  })
+
+  test.each(sequenceResumeConflictRowsAt(LIVENESS_DEAD_ROW_ENDED).filter(isNewResumeCase).map((row) => [row.name, row] as const))('at the live-row sequence\'s step-6 resume, %s: P latches with its case, "resume" and the state the sequence last read; one post; no call after the resume; P\'s timer stopped; the sequence ends with nothing armed', async (_name, row) => {
+    const { h, p, q } = makeRun()
+    h.script({ getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }, personaOf(h, p), h.home), resumeError: row.build() })
+    const order = recordCallOrder(h)
+
+    const outcome = await h.runSequence(p, { lastReadState: cannedStatusResult().state, keepsConversation: true })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: p, action: 'latched' } })
+    expect(outcome.armed).toBeUndefined()
+    expect(order).toEqual(['kill', 'get', 'findMissing', 'get', 'resume'])
+    expect(row.refusedOperation).toBe(REFUSED_OPERATION_RESUME)
+    expect(h.latch.record(p)).toEqual(recordOf(p, row, row.rowState))
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
+    expect(h.stops).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect([h.controller.isArmed(p), getFailureCount(p), h.notices]).toEqual([false, 0, []])
+    expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
   })
 })

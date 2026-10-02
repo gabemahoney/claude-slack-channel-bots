@@ -158,6 +158,22 @@
  * ({@link REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS}). The stuck-launch abort's
  * kill rows (E29) are still to come, with the re-check columns (E30).
  *
+ * The `resume` rows (E13; E23 adds HO rev 15's and rev 20's forms; b.jg5
+ * SRJ-113, SRJ-501, SRJ-507): the site kind `resume`, each refusing the
+ * `resume` (`REFUSED_OPERATION_RESUME`) and recording `ended`, the state the
+ * finished-row path last read, or unreadable for unrecognised text. E23 adds
+ * "another agent-director store" in its "duplicate session" form (the stub's
+ * `plainSpawn` extras) beside its plain form; "conflicting labels" is a
+ * duplicate label's, its "duplicate session" form (the scan's form is a
+ * plain spawn's only). The same rows at the live-row sequence's step-6
+ * `resume` (E21, E23): the site kind {@link SEQUENCE_RESUME_SITE}, for each
+ * state the sequence's last `get` read before it
+ * ({@link SEQUENCE_RESUME_ROW_STATES}: `ended`, `missing`), recording that
+ * state ({@link SEQUENCE_RESUME_CONFLICT_CASE_ROWS},
+ * {@link sequenceResumeConflictRowsAt}; not in {@link CONFLICT_CASE_ROWS},
+ * since only the recorded state differs). E30 still adds the re-check
+ * columns (SRJ-505).
+ *
  * Other exports (E13 T2):
  *   - {@link expectedConflictNotice}: the expected notice for any case,
  *     session and description (none: no description line), assembled from
@@ -335,6 +351,8 @@ import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
   AGENT_DIRECTOR_PENDING_STATE,
+  LIVENESS_DEAD_ROW_ENDED,
+  LIVENESS_DEAD_ROW_MISSING,
 } from '../../src/liveness-reading.ts'
 import { parseLaunchStart } from '../../src/pending-row.ts'
 import type { OwnRowReadInput, RowReadRow } from '../../src/row-read-rules.ts'
@@ -529,6 +547,13 @@ export const SEQUENCE_STEP1_KILL_SITE = 'sequence step-1 kill'
 /** The live-row sequence's step-4 kill as a site kind (b.jg5 SRJ-705 step 4, SRJ-110; E21). */
 export const SEQUENCE_STEP4_KILL_SITE = 'sequence step-4 kill'
 
+/**
+ * The live-row sequence's step-6 `resume` as a site kind: the sequence-launch
+ * entry's `resume` leg (`launchForLiveRowSequence`; b.jg5 SRJ-705 step 6,
+ * SRJ-113; E21, E23).
+ */
+export const SEQUENCE_RESUME_SITE = 'sequence resume'
+
 /** One of the live-row sequence's two kills as a site kind. */
 export type SequenceKillSite = typeof SEQUENCE_STEP1_KILL_SITE | typeof SEQUENCE_STEP4_KILL_SITE
 
@@ -571,6 +596,7 @@ export type ConflictCaseSite =
   | ReconnectSite
   | PromptRowPaneSite
   | KillSite
+  | typeof SEQUENCE_RESUME_SITE
 
 /** One refusal and what latching a persona on it records. */
 export interface ConflictCaseRow {
@@ -867,8 +893,8 @@ const reuseSpawn = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState, o?:
 /** The reuse spawn of an id with no row, refused by the pre-spawn scan: no row recorded, none written (HO rev 15). */
 const reuseSpawnScan = (c: ConflictCase, l: ConflictLatchCase, o?: ConflictOptions): ConflictCaseRow =>
   Object.freeze({ ...reuseSpawn(c, l, LATCH_ROW_STATE_NO_ROW, o), noRowWritten: true as const })
-const resume = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState): ConflictCaseRow =>
-  row('resume', REFUSED_OPERATION_RESUME, 'resume', c, l, s)
+const resume = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState, o?: ConflictOptions): ConflictCaseRow =>
+  row('resume', REFUSED_OPERATION_RESUME, 'resume', c, l, s, o)
 const paneOrKill = (
   verb: PaneOrKillSite,
   c: ConflictCase,
@@ -1074,6 +1100,73 @@ const REUSE_SPAWN_ROWS: readonly ConflictCaseRow[] = [
   reuseSpawn('unrecognised', LATCH_CASE_UNRECOGNISED, ENDED),
 ]
 
+/**
+ * The `resume` CONFLICT rows (E13; b.jg5 SRJ-113, SRJ-501; HO rev 15, rev
+ * 20): a `resume` on the finished-row path records `ended`, the state its
+ * path last read; unrecognised text records unreadable, where the path could
+ * not read the row's state. "another agent-director store" in both its forms
+ * (plain, and with the stub's "duplicate session" extras, its `plainSpawn`
+ * option), and "conflicting labels" in its "duplicate session" form (a
+ * duplicate label; the scan's form is a plain spawn's only, since a `resume`
+ * makes no pre-spawn scan) (E23).
+ */
+const RESUME_ROWS: readonly ConflictCaseRow[] = [
+  resume('no-valid-id', LATCH_CASE_NO_VALID_ID, ENDED),
+  resume('different-id', LATCH_CASE_DIFFERENT_ID, ENDED),
+  resume('another-store', LATCH_CASE_ANOTHER_STORE, ENDED),
+  resume('another-store', LATCH_CASE_ANOTHER_STORE, ENDED, { plainSpawn: true }),
+  resume('own-id', LATCH_CASE_OWN_ID, ENDED),
+  resume('leftover', LATCH_CASE_LEFTOVER, ENDED),
+  resume('conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, ENDED),
+  resume('unrecognised', LATCH_CASE_UNRECOGNISED, LATCH_ROW_STATE_UNREADABLE),
+]
+
+/** A finished state the live-row sequence's last `get` read before a step-6 `resume`: `ended` or `missing`. */
+export type SequenceResumeLastRead = typeof LIVENESS_DEAD_ROW_ENDED | typeof LIVENESS_DEAD_ROW_MISSING
+
+/**
+ * The latch row state the sequence `resume` rows record for each state the
+ * sequence's last `get` read before its step-6 `resume` (b.jg5 SRJ-501,
+ * SRJ-705 step 3), in row order. A row read with no row has no session id,
+ * so its step 6 is a reuse, never a `resume`.
+ */
+export const SEQUENCE_RESUME_ROW_STATES: Readonly<Record<SequenceResumeLastRead, LatchRowState>> = Object.freeze({
+  [LIVENESS_DEAD_ROW_ENDED]: ENDED,
+  [LIVENESS_DEAD_ROW_MISSING]: latchRowStateRead(LIVENESS_DEAD_ROW_MISSING),
+})
+
+/**
+ * The live-row sequence's step-6 `resume` CONFLICT rows (E21, E23; b.jg5
+ * SRJ-113, SRJ-501, SRJ-705): for each state in
+ * {@link SEQUENCE_RESUME_ROW_STATES}, one row per `resume` row (the same
+ * case, option set and latch case), each refusing the `resume` and
+ * recording the state the sequence's last `get` read, named
+ * `sequence resume (<state>): <stub case>`. They are not in
+ * {@link CONFLICT_CASE_ROWS}: the errors are the `resume` rows', and only
+ * the recorded state differs.
+ */
+export const SEQUENCE_RESUME_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
+  (Object.keys(SEQUENCE_RESUME_ROW_STATES) as SequenceResumeLastRead[]).flatMap((lastRead) =>
+    RESUME_ROWS.map((resumeRow) => {
+      const caseRow = row(
+        SEQUENCE_RESUME_SITE,
+        REFUSED_OPERATION_RESUME,
+        'resume',
+        resumeRow.stubCase,
+        resumeRow.latchCase,
+        SEQUENCE_RESUME_ROW_STATES[lastRead],
+        resumeRow.options,
+      )
+      return Object.freeze({ ...caseRow, name: caseRow.name.replace(SEQUENCE_RESUME_SITE, `${SEQUENCE_RESUME_SITE} (${lastRead})`) })
+    }),
+  ),
+)
+
+/** The sequence `resume` CONFLICT rows whose sequence last read `lastRead`, for `test.each`. */
+export function sequenceResumeConflictRowsAt(lastRead: SequenceResumeLastRead): readonly ConflictCaseRow[] {
+  return SEQUENCE_RESUME_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.rowState === SEQUENCE_RESUME_ROW_STATES[lastRead])
+}
+
 /** Every CONFLICT latch row, for `test.each`. */
 export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   // A plain spawn: the pre-spawn scan's refusals (nothing written, no row).
@@ -1090,13 +1183,7 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   ...REUSE_SPAWN_ROWS,
   // A `resume` on the finished-row path; unrecognised text where the path
   // could not read the row's state.
-  resume('no-valid-id', LATCH_CASE_NO_VALID_ID, ENDED),
-  resume('different-id', LATCH_CASE_DIFFERENT_ID, ENDED),
-  resume('another-store', LATCH_CASE_ANOTHER_STORE, ENDED),
-  resume('own-id', LATCH_CASE_OWN_ID, ENDED),
-  resume('leftover', LATCH_CASE_LEFTOVER, ENDED),
-  resume('conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, ENDED),
-  resume('unrecognised', LATCH_CASE_UNRECOGNISED, LATCH_ROW_STATE_UNREADABLE),
+  ...RESUME_ROWS,
   // Pane verbs and kills: P's next check or recovery, the state last read.
   paneOrKill('kill', 'not-this-launch', LATCH_CASE_NOT_THIS_LAUNCH, WAITING),
   paneOrKill('send-keys', 'not-this-launch', LATCH_CASE_NOT_THIS_LAUNCH, WORKING),
