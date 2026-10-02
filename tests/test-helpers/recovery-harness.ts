@@ -123,7 +123,13 @@
  *   kind) is recorded here, then armed on the controller; an ENVIRONMENT
  *   answer (`ErrTmuxNotAvailable`) or a CONFIG answer (`ErrConfigMalformed`)
  *   from any call for a persona, in or out of an attempt, is sent too (b.jg5
- *   SRJ-311, SRJ-316). With
+ *   SRJ-311, SRJ-316). The sink's pending-only arm (`armPendingOnly`, as the
+ *   production sink, the controller, has it), which a launch's
+ *   `ErrTmuxSessionCreate` reaches through the outage state's launch-failure
+ *   arm (`armPendingOnlyAfterLaunchFailure`; b.jg5 SRJ-112, SRJ-113,
+ *   SRJ-409), is recorded the same way, with the kind
+ *   `UNAVAILABLE_RETRY_CAUSE_PENDING_ROW`, then armed on the controller's
+ *   `armPendingOnly`. With
  *   `options.triggerSink: false` no sink is installed: nothing is recorded or
  *   armed.
  * - `outageClears` (b.jg5 SRJ-305, SRJ-306, SRJ-311): the outage state's
@@ -310,14 +316,15 @@
  *   is recorded in `triggers` and armed on the controller), the live applied
  *   set, `lines` as its log, and the sequence clock: the harness clock with
  *   each sequence timer tracked (the step-2 wait, the run spacing, the
- *   step-4 pause and each wait between a kill's tries). A recording reuse
- *   builder is installed through `setSequenceReuseBuilder`: `reuses` records
- *   each call (the persona key, the instance id, the state the sequence last
- *   read and the `resume` answer that sent the launch on to the reuse, if
- *   any), and it answers what `answerReuse` scripted, by default a `spawned`
- *   result with no spawn result (so no after-launch step);
- *   `removeReuseBuilder()` leaves none installed. The `resume` leg runs
- *   through the stub as production binds it. The registry (b.jg5 SRJ-706)
+ *   step-4 pause and each wait between a kill's tries). Step 6 runs as
+ *   production runs it, through the stub: the `resume` leg and the session
+ *   manager's reuse spawn (`reuseSpawnForPersona`, b.jg5 SRJ-112, SRJ-708),
+ *   a stub `spawn` of the persona's id carrying the reuse flag, whose
+ *   success runs the after-launch step (the `pre_trust` line and the dialog
+ *   approver on the harness clock). `reuseSpawns()` is a read-only view of
+ *   the reuse spawns: the stub's recorded `spawn` calls that carry the reuse
+ *   field (`reuse_finished`), in order (a spawn held by `holdSpawns` is not
+ *   in the stub's log, so not in the view). The registry (b.jg5 SRJ-706)
  *   is built and installed as `main()` builds and installs it:
  *   `createLiveRowSequenceRegistry` over those dependencies with
  *   production's attempt runner (`runDetachedRecoveryAttempt`: each sequence
@@ -356,6 +363,13 @@
  *   `runSequenceStoppedAtKill(h, key, step, answer, reason)` runs one whose
  *   step-1 or step-4 kill gets its last try's answer (one of
  *   `LATE_KILL_ANSWERS`) after its stop was set.
+ * - `recheckAnswers(version)`: installs agent-director's version re-check
+ *   (b.jg5 SRJ-204; `installAdVersionRecheck`, on its own fake clock, its
+ *   lines to `lines`) with its `resolveSystemBinary` answering `version`
+ *   (`makeStubResolveSystemBinary`), so an `ErrInvalidFlags` answer's one
+ *   immediate re-check reads it: an older version decides that the server
+ *   stops. It answers the binary resolves the re-check made and the exit
+ *   codes its stop was asked for; `cleanup()` removes the install.
  * - `settle()`: awaits every configured persona's launch in flight
  *   (`whenLaunchSettled`) and every retry run in flight (`whenRunSettled`),
  *   with its re-arm or stop, and then until every running dialog approver
@@ -474,8 +488,8 @@
  * - `captured()`: everything captured, for `assertNoLeak`: the lines, the
  *   `console.error` lines, the four notice lists, the startup-errors
  *   entries, the attempts, the triggers, the condition ends, the outage
- *   clears, the stops, the latch events, the reuse builder's records, the
- *   driver's Slack calls and the state directory as a written file.
+ *   clears, the stops, the latch events, the stub's recorded spawn calls,
+ *   the driver's Slack calls and the state directory as a written file.
  * - `cleanup()`: first stops and forgets every dialog approver
  *   (`_resetDialogApprovers`, silently: none makes a call after the one in
  *   progress) and clears the timers they left on the harness clock, then
@@ -495,9 +509,9 @@
  *   harnesses built one after the other share no query,
  *   the stub spawn path and client with every launch still in flight and the
  *   approver's clock and cap, the
- *   findMissing memo, the tmux seams, the settings install, the sequence's
- *   reuse builder (`_resetSequenceReuseBuilder`), the sequence registry's
- *   install (`_resetLiveRowSequenceRegistry`), `SLACK_STATE_DIR`) and
+ *   findMissing memo, the tmux seams, the settings install, the version
+ *   re-check's install when `recheckAnswers` made one, the sequence
+ *   registry's install (`_resetLiveRowSequenceRegistry`), `SLACK_STATE_DIR`) and
  *   removes the temporary directory. The registry is closed (every live-row
  *   sequence still running stopped with the shutdown reason) after the
  *   pending timers and the running sequences are counted. It
@@ -524,11 +538,14 @@
  * function the client has, `readPane`, `sendKeys`, `pause`, `decide` and
  * `close` included, so a case can assert exactly the calls a launch makes),
  * `retryNow` (fire a
- * persona's next retry and settle it), `startSequenceHeldAtRun` (start a
+ * persona's next retry and settle it), `reuseSpawnOf` (persona `key`'s reuse
+ * spawn as the stub records it, for a comparison: `cscb_<key>` with the reuse
+ * flag and the persona's `extra_env`), `startSequenceHeldAtRun` (start a
  * persona's live-row sequence and resolve once its next `find-missing` run
  * is held by the stub's `holdFindMissing`), `ownRowsLiveThenMissing` (each
- * persona's own row live at its first `get`, `missing` after), `holdSequenceReuse` (hold the
- * reuse builder's answer, so a sequence's step-6 launch stays in flight),
+ * persona's own row live at its first `get`, `missing` after), `holdSequenceReuse` (hold a
+ * persona's reuse spawn open at the stub, so a sequence's step-6 launch
+ * stays in flight),
  * `rowReadsUntilSpawn` (each row reads a
  * state until its spawn resolves, then `waiting`; a `pending` row shows the
  * stub's default launch start unless the case asks for none; it returns the
@@ -587,6 +604,8 @@ import { join } from 'node:path'
 import type { WebClient } from '@slack/web-api'
 import type { Client, SpawnResult } from 'agent-director'
 
+import type { Phase1SpawnParams } from '../../src/ad-phase1-types.ts'
+
 import {
   adAlertThresholdMsInEffect,
   adSettingsInEffect,
@@ -605,7 +624,6 @@ import {
   type ConflictLatchRecord,
   type ConflictLatchSetOutcome,
   type ConflictNoticeEpisodes,
-  type LatchRowState,
 } from '../../src/conflict-latch.ts'
 import { LIVENESS_DEAD_ROW_MISSING, LIVENESS_LIVE } from '../../src/liveness-reading.ts'
 import { classifyAdError, describeAdErrorClassification, killFailedDescriptionOf } from '../../src/ad-error-class.ts'
@@ -649,7 +667,7 @@ import {
   type TmuxUnresponsiveEndResult,
   type UnclassifiedErrorEndReason,
 } from '../../src/persona-episodes.ts'
-import { personaInstanceId, personaTmuxSessionName } from '../../src/persona-identity.ts'
+import { personaInstanceId, personaSpawnEnv, personaTmuxSessionName } from '../../src/persona-identity.ts'
 import { createPersonaRouting, type PersonaRouting } from '../../src/persona-routing.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
 import { createPersonaRelaunchGate, createPersonaUpPredicate, type PersonaUpQuery } from '../../src/persona-start.ts'
@@ -692,7 +710,6 @@ import {
   _resetFindMissingMemo,
   _resetLadderKillClock,
   _resetLiveRowSequenceRegistry,
-  _resetSequenceReuseBuilder,
   _resetTmuxSessionKiller,
   _setApproverClock,
   _setDialogReadyTimeoutMs,
@@ -711,7 +728,6 @@ import {
   setKillFailureAlerts,
   setLiveRowSequenceRegistry,
   setPersonaKillKeepGoingQuery,
-  setSequenceReuseBuilder,
   setSessionNotifier,
   spawnForPersona,
   startLiveRowSequence,
@@ -721,8 +737,6 @@ import {
   whenLaunchSettled,
   type ApproverClock,
   type ApproverOutcome,
-  type SequenceReuseAnswer,
-  type SequenceReuseRequest,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
 import { createSlowRecoveryTracker, type SlowRecoveryTracker } from '../../src/slow-recovery.ts'
@@ -732,6 +746,7 @@ import {
   createUnavailableRetryController,
   runDetachedRecoveryAttempt,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
+  UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
@@ -746,7 +761,9 @@ import {
   type UnavailableRetryMode,
   type UnavailableRetryOutcome,
 } from '../../src/unavailable-retry.ts'
+import { installAdVersionRecheck, resetAdVersionRecheckForTests } from '../../src/ad-version-gate.ts'
 import { writeAgentDirectorConfig, type AdConfigInput } from './ad-settings.ts'
+import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
 import {
   cannedErr,
   cannedGetResult,
@@ -758,7 +775,9 @@ import {
   errTmuxKillFailed,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
+  holdSpawns,
   installStubSpawnPath,
+  makeStubResolveSystemBinary,
   resetStubSpawnPath,
   type FindMissingHold,
   type PersonaGetResultOverrides,
@@ -945,19 +964,6 @@ export interface RecoverySequenceRun {
   stop(reason: LiveRowSequenceStopReason): Promise<boolean>
 }
 
-/** One call of the recording reuse builder. */
-export interface RecoveryReuse {
-  readonly key: string
-  readonly instanceId: string
-  /** The row state the sequence last read, as the sequence-launch entry hands it on. */
-  readonly lastRead: LatchRowState
-  /** The `resume` answer that sent the launch on to the reuse; undefined when step 6 decided the reuse itself. */
-  readonly resumeError: unknown
-}
-
-/** What the recording reuse builder answers for one call. */
-export type RecoveryReuseAnswer = (request: SequenceReuseRequest) => SequenceReuseAnswer | Promise<SequenceReuseAnswer>
-
 /** The driver's pieces, built at the first `loseMessage`. */
 interface LostMessageDriver {
   readonly routing: PersonaRouting
@@ -1050,12 +1056,11 @@ export interface RecoveryHarness {
   drive<T>(work: Promise<T>): Promise<T>
   /** The live-row sequence's dependencies, from the session manager's builder; see the module comment. */
   readonly sequenceDeps: LiveRowSequenceDeps
-  /** Every call of the recording reuse builder, in order. */
-  readonly reuses: RecoveryReuse[]
-  /** What the recording reuse builder answers from now on; `undefined` puts back the default `spawned` result. */
-  answerReuse(answer: RecoveryReuseAnswer | undefined): void
-  /** Remove the recording reuse builder: a reuse at step 6 then makes no call and is not launched. */
-  removeReuseBuilder(): void
+  /**
+   * The reuse spawns the stub recorded (b.jg5 SRJ-112, SRJ-708): its `spawn`
+   * calls carrying the reuse field (`reuse_finished`), in order; read-only.
+   */
+  reuseSpawns(): readonly Phase1SpawnParams[]
   /**
    * The sequence-start request for persona `key` that `startSequence` hands
    * the session manager's start entry, with `request`'s fields and the
@@ -1076,6 +1081,12 @@ export interface RecoveryHarness {
   runSequence(key: string, request: RecoverySequenceRequest): Promise<LiveRowSequenceOutcome>
   /** Await `work` while moving the clock to each pending live-row sequence timer as it is set; see the module comment. */
   driveSequence<T>(work: Promise<T>): Promise<T>
+  /**
+   * Install agent-director's version re-check with its binary resolve
+   * answering `version`; answers the resolves it made and the exit codes its
+   * stop was asked for. See the module comment.
+   */
+  recheckAnswers(version: string): { readonly resolves: readonly unknown[]; readonly stops: readonly number[] }
   settle(): Promise<void>
   /** Whether persona `key`'s dialog approver is running (read-only; the session manager's `isDialogApproverRunning`). */
   approverRunning(key: string): boolean
@@ -1403,13 +1414,20 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       triggers.push({ key, kind: cause.kind })
       return controller.arm(key, cause)
     },
+    // As the production sink (the controller) has it: a launch's
+    // `ErrTmuxSessionCreate` arms pending-only through it (b.jg5 SRJ-112,
+    // SRJ-113, SRJ-409), recorded with the cause it arms.
+    armPendingOnly(key) {
+      triggers.push({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })
+      controller.armPendingOnly(key)
+    },
   }
   // The live-row sequence (b.jg5 SRJ-705), composed as main() composes it:
   // its dependencies from the session manager's one builder, with the
   // harness's kill-failure alerts and the trigger sink as its retry arm; its
   // clock is the harness clock with each sequence timer tracked, so
-  // `driveSequence` can move the clock to it. A recording reuse builder is
-  // installed; cleanup removes it.
+  // `driveSequence` can move the clock to it. Step 6 runs the production
+  // `resume` leg and reuse spawn over the stub.
   const sequenceTimers = new Set<unknown>()
   const sequenceClock: NeverEarlyWaitClock = {
     now: () => clock.now(),
@@ -1438,14 +1456,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // starter's (`runDetachedRecoveryAttempt`); installed below, after the
   // latch. Cleanup closes and removes it.
   const sequences = createLiveRowSequenceRegistry({ deps: sequenceDeps, runAttempt: runDetachedRecoveryAttempt })
-  const reuses: RecoveryReuse[] = []
-  let reuseAnswer: RecoveryReuseAnswer | undefined
-  setSequenceReuseBuilder(async (request) => {
-    const { key } = request.persona
-    reuses.push({ key, instanceId: personaInstanceId(key), lastRead: request.lastRead, resumeError: request.resumeError })
-    if (reuseAnswer !== undefined) return reuseAnswer(request)
-    return { result: { key, action: 'spawned' } }
-  })
+  // Set by `recheckAnswers`; cleanup removes the install it made.
+  let recheckInstalled = false
   _resetOutageState()
   initOutageState({
     notify: (key, text) => {
@@ -1937,14 +1949,24 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     sequenceDeps,
 
-    reuses,
+    reuseSpawns: () => stub.calls.spawnCalls.filter((params) => 'reuse_finished' in params),
 
-    answerReuse(answer) {
-      reuseAnswer = answer
-    },
-
-    removeReuseBuilder() {
-      setSequenceReuseBuilder(undefined)
+    recheckAnswers(version) {
+      const resolves: Array<object | undefined> = []
+      const stops: number[] = []
+      resetAdVersionRecheckForTests()
+      installAdVersionRecheck({
+        resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolves, outcomes: [{ version }] }),
+        baselineVersion: PHASE1_RC_VERSION,
+        recordStartupError: () => {},
+        stop: (exitCode) => {
+          stops.push(exitCode)
+        },
+        log,
+        clock: createFakeClock(),
+      })
+      recheckInstalled = true
+      return { resolves, stops }
     },
 
     sequenceRequest,
@@ -2057,7 +2079,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       outageClears: [...outageClears],
       stops: [...stops],
       latchEvents: [...latchEvents],
-      reuses: [...reuses],
+      spawnCalls: [...stub.calls.spawnCalls],
       lostMessageNotices: [...lostMessageNotices],
       slackCalls: Object.fromEntries([...slackStubs].map(([key, slack]) => [key, slack.callLog])),
       stateDir: writtenFile(stateDir),
@@ -2080,7 +2102,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // A sequence still running is stopped, so it makes no call after this.
       void sequences.close()
       _resetLiveRowSequenceRegistry()
-      _resetSequenceReuseBuilder()
+      if (recheckInstalled) resetAdVersionRecheckForTests()
       _resetRestartState()
       _resetBackoffState()
       _resetOutageState()
@@ -2334,26 +2356,35 @@ export function ownRowsLiveThenMissing(h: RecoveryHarness): void {
 }
 
 /**
- * Hold the recording reuse builder's answer (its default `spawned` result)
- * until `release()`: `entered` resolves once a live-row sequence's step-6
- * reuse has called it, so the sequence's own launch is in flight
- * (`isLaunchInFlight`) while the case drives other work.
+ * Persona `key`'s reuse spawn as the stub records it (b.jg5 SRJ-112,
+ * SRJ-708), for `toEqual`: a `spawn` of `cscb_<key>` with the reuse flag set
+ * and the persona's `extra_env` (`personaSpawnEnv`, prompt suggestions off).
  */
-export function holdSequenceReuse(h: RecoveryHarness): { readonly entered: Promise<void>; release(): void } {
-  let enter!: () => void
-  const entered = new Promise<void>((resolve) => {
-    enter = resolve
+export function reuseSpawnOf(h: RecoveryHarness, key: string): Phase1SpawnParams {
+  const persona = personaOf(h, key)
+  return expect.objectContaining({
+    claude_instance_id: personaInstanceId(key),
+    reuse_finished: true,
+    extra_env: personaSpawnEnv({ key, crontablePath: h.config.cron_table_path, claudeConfigDir: persona.claude_config_dir }),
   })
-  let release!: () => void
-  const released = new Promise<void>((resolve) => {
-    release = resolve
-  })
-  h.answerReuse(async (request) => {
-    enter()
-    await released
-    return { result: { key: request.persona.key, action: 'spawned' } }
-  })
-  return { entered, release }
+}
+
+/**
+ * Hold persona `key`'s spawns open at the stub (`holdSpawns` over the
+ * harness's stub client, only `cscb_<key>`) until `release()`, which answers
+ * the held spawn with success: `entered` resolves once a live-row sequence's
+ * step-6 reuse spawn of `key` has been made, so the sequence's own launch is
+ * in flight (`isLaunchInFlight`) while the case drives other work. `calls`
+ * holds the spawns the hold received, the held reuse's parameters included
+ * (a held spawn is not in the stub's own log).
+ */
+export function holdSequenceReuse(
+  h: RecoveryHarness,
+  key: string,
+): { readonly entered: Promise<void>; readonly calls: readonly Phase1SpawnParams[]; release(): void } {
+  const id = personaInstanceId(key)
+  const hold = holdSpawns(h.stub.client, (spawned) => spawned === id)
+  return { entered: hold.entered(id), calls: hold.calls, release: () => hold.release(id) }
 }
 
 /**

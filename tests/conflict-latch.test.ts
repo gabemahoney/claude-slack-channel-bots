@@ -109,6 +109,21 @@
  * latches "launch start not recorded" with one post and no wait armed, and
  * the same row under an old key latches no one; Q's sequence, run beside
  * P's, is not latched and launches.
+ * The reuse spawn's latches (SRJ-112, SRJ-501, SRJ-507, SRJ-512; HO rev 15,
+ * rev 20; AC 77, AC 85; E22, on `makeRecoveryHarness`'s sequence driver
+ * ending in a reuse): over the case table's reuse rows
+ * (`REUSE_SPAWN_CONFLICT_CASE_ROWS`, every CONFLICT case a spawn can answer,
+ * "another agent-director store" in both forms and "conflicting labels"
+ * after "duplicate session" among them, and
+ * `REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS`), on a finished row and, for the
+ * pre-spawn scan's rows, on an id with no row (step 3's `get` reading none),
+ * P latches once with the reuse spawn's refused operation (none for UNUSABLE
+ * NAME) and the state the sequence last read ("no row" for the scan's), one
+ * post, the reuse is P's last call, nothing is counted and P's armed retry
+ * timer stops latched; SRJ-512's reuse case: the post points to "Operator
+ * actions" and CSCB's own words name no session-ending command, and a message
+ * lost then reports `held-for-human` with no call and no restart; Q's
+ * sequence, run beside P's, is not latched and launches its own reuse.
  * Recovery: each reason ("row reads" over every live and dead state) under
  * both latch kinds, with no line matching either list.
  *
@@ -509,6 +524,8 @@ import {
   LADDER_KILL_CONFLICT_CASE_ROWS,
   RESTART_KILL_CONFLICT_CASE_ROWS,
   RESTART_KILL_UNUSABLE_NAME_CASE_ROWS,
+  REUSE_SPAWN_CONFLICT_CASE_ROWS,
+  REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS,
   SEQUENCE_KILL_CONFLICT_CASE_ROWS,
   SEQUENCE_KILL_STEP,
   SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS,
@@ -555,6 +572,7 @@ import {
   personaCallCounts,
   personaOf,
   recordCallOrder,
+  reuseSpawnOf,
   retryNow,
   startSequenceHeldAtRun,
   unclassifiedEndedLine,
@@ -3994,7 +4012,7 @@ describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME
     expect(qOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED })
     expect([h.latch.isLatched(p), h.latch.isLatched(q)]).toEqual([true, false])
     expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
-    expect(h.reuses.map((reuse) => reuse.key)).toEqual([q])
+    expect(h.reuseSpawns().map((reuse) => reuse.claude_instance_id)).toEqual([personaInstanceId(q)])
   })
 
   test.each([
@@ -4054,6 +4072,124 @@ describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME
 })
 
 // ---------------------------------------------------------------------------
+// The reuse spawn's latches at the live-row sequence's final launch (E22;
+// b.jg5 SRJ-112, SRJ-501, SRJ-507, SRJ-512; HO rev 15, rev 20; AC 77, AC 85)
+//
+// On `makeRecoveryHarness`, P's sequence ending in the session manager's
+// reuse spawn: step 3's `get` reads P's row `ended` (a reuse of a finished
+// row) or, for the pre-spawn scan's rows, no row (a reuse of an id with no
+// row, an ordinary fresh spawn). The reuse at the ladder is T3's.
+// ---------------------------------------------------------------------------
+
+/** How a reuse meets its latch: whether its id has no row, its answer, and what it records and posts. */
+interface ReuseLatchWay {
+  readonly noRow: boolean
+  readonly error: () => Error
+  readonly record: (key: string) => ConflictLatchRecord
+  readonly notice: (key: string) => string
+}
+
+const REUSE_LATCH_WAYS: ReadonlyArray<readonly [string, ReuseLatchWay]> = [
+  ...REUSE_SPAWN_CONFLICT_CASE_ROWS.map((row) => [
+    `CONFLICT (${row.name}${row.noRowWritten === true ? ', an id with no row' : ''})`,
+    {
+      noRow: row.noRowWritten === true,
+      error: row.build,
+      record: (key: string) =>
+        expectedLatchRecord(key, {
+          latchCase: row.latchCase,
+          refusedOperation: row.refusedOperation,
+          rowState: row.rowState,
+          sessionName: row.sessionName,
+          description: row.build().errDescription,
+        }),
+      notice: () => row.notice.text,
+    },
+  ] as const),
+  ...REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS.map((row) => [
+    `UNUSABLE NAME (${row.name})`,
+    { noRow: false, error: row.build, record: row.record, notice: row.notice },
+  ] as const),
+]
+
+/** P's own row as step 3's `get` reads it: `ended`, or no row (`ErrSpawnNotFound`) for a reuse of an id with no row. */
+function reuseRowRead(h: RecoveryHarness, key: string, noRow: boolean): RecoveryStubScript {
+  return noRow ? { getError: errSpawnNotFound() } : { getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, personaOf(h, key), h.home) }
+}
+
+describe('the reuse spawn\'s latches at the sequence\'s final launch: CONFLICT with the reuse spawn refused, UNUSABLE NAME with none (recovery harness; SRJ-112, SRJ-501, SRJ-507, SRJ-512; AC 77, AC 85)', () => {
+  /** A recovery harness, cleaned up and leak-checked in `afterEach`. */
+  function makeReuseRun(): { h: RecoveryHarness; p: string; q: string } {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p, q] = h.keys as [string, string]
+    return { h, p, q }
+  }
+
+  test.each(REUSE_LATCH_WAYS)('%s: P latches once with the row\'s record and one post; the reuse is P\'s last call (no kill, delete or launch after it); nothing counted; P\'s retry timer stops', async (_label, way) => {
+    const { h, p } = makeReuseRun()
+    h.script({ ...reuseRowRead(h, p, way.noRow), spawnError: way.error() })
+    h.controller.arm(p, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
+    const order = recordCallOrder(h)
+
+    const outcome = await h.runSequence(p, { lastReadState: cannedStatusResult().state })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: p, action: 'latched' } })
+    // No latch-time status read and no call of any verb after the reuse.
+    expect(order).toEqual(['kill', 'get', 'findMissing', 'get', 'spawn'])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(h.latch.record(p)).toEqual(way.record(p))
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices).toEqual([{ key: p, text: way.notice(p) }])
+    expect(h.stops).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect([getFailureCount(p), h.notices, h.startupErrors()]).toEqual([0, [], []])
+  })
+
+  test.each(REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS.map((row) => [row.name, row] as const))('SRJ-512\'s reuse case (%s): the one post points to "Operator actions" and CSCB\'s own words name no session-ending command; a message lost then reports held for a human with no call and no restart', async (_name, row) => {
+    const { h, p, q } = makeReuseRun()
+    h.script({ ...reuseRowRead(h, p, false), spawnError: row.build() })
+    await h.runSequence(p, { lastReadState: cannedStatusResult().state })
+    const pCallsAtLatch = personaCallCounts(h, p)
+
+    const [post] = h.episodeNotices
+    expect(post).toEqual({ key: p, text: row.notice(p) })
+    expect(post!.text.includes(JSON.stringify(operatorActionsTitle()))).toBe(true)
+    const own = cscbOwnText(post!.text)
+    expect(sessionEndingCommandsIn(own)).toEqual([])
+    expect(own.split(CONFLICT_NOTICE_LINE_SEPARATOR).flatMap(forbiddenIn)).toEqual([])
+
+    await expectLostMessageReports(h, p, 'held-for-human')
+    expect([h.restartAsks.filter((key) => key === p), isRestartPendingOrActive(p), personaCallCounts(h, p)]).toEqual([[], false, pCallsAtLatch])
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.latch.isLatched(q)).toBe(false)
+  })
+
+  test('Q\'s sequence, run beside P\'s, is unaffected: P\'s reuse latches it, while Q is not latched and its own reuse launches it', async () => {
+    const { h, p, q } = makeReuseRun()
+    const [row] = REUSE_SPAWN_CONFLICT_CASE_ROWS
+    const client = h.stub.client
+    const spawn = client.spawn.bind(client)
+    client.spawn = async (params) => {
+      if (params.claude_instance_id === personaInstanceId(p)) throw row!.build()
+      return spawn(params)
+    }
+    h.script({ getFn: (params) => cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, personaOf(h, params.claude_instance_id === personaInstanceId(p) ? p : q), h.home) })
+    const lastRead = cannedStatusResult().state
+
+    const [pOutcome, qOutcome] = await h.driveSequence(
+      Promise.all([h.startSequence(p, { lastReadState: lastRead }).outcome, h.startSequence(q, { lastReadState: lastRead }).outcome]),
+    )
+
+    expect(pOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: p, action: 'latched' } })
+    expect(qOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: q, action: 'spawned' } })
+    expect([h.latch.isLatched(p), h.latch.isLatched(q)]).toEqual([true, false])
+    expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
+    expect(h.reuseSpawns().map((reuse) => reuse.claude_instance_id)).toEqual([personaInstanceId(q)])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // A running live-row sequence stops when P latches from another path (E21
 // T2; b.jg5 SRJ-502, SRJ-706; the E13 hatch note)
 //
@@ -4089,7 +4225,7 @@ describe('a running live-row sequence stops when P latches from another path: no
     expect(await h.driveSequence(sequence.outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
     expect(callCountsSince(personaCallCounts(h, p), pAtLatch)).toEqual({})
     expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
-    expect([hold.calls.length, h.reuses]).toEqual([1, []])
+    expect([hold.calls.length, h.stub.calls.spawnCalls]).toEqual([1, []])
     expect(h.latch.record(p)?.latchCase).toBe(latchCase)
     expect(latchSteps(h)).toEqual(oneLatch(p))
     expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])

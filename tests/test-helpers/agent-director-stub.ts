@@ -40,6 +40,12 @@
  * runs on its own after the launch call, b.jg5 SRJ-401), and
  * `resetStubSpawnPath` leaves no approver running.
  *
+ * A recorded `spawn` may be a reuse spawn (b.jg5 SRJ-112, SRJ-708): the
+ * stub records its parameters with the CSCB-side reuse flag
+ * (`Phase1SpawnParams.reuse_finished`, declared in `src/ad-phase1-types.ts`),
+ * so a test reads the flag from `spawnCalls` with no cast, and answers it like
+ * any spawn, from the same queue and knobs.
+ *
  * Held calls: `holdSpawns` keeps a stub's `spawn` calls open, and
  * `holdFindMissing` its `find-missing` calls (b.jg5 SRJ-706: a live-row
  * sequence's run held while the start pass, an apply, a stop or a lost
@@ -113,6 +119,8 @@ import {
   ErrAlreadyDecided,
   ErrBunVersionTooOld,
   ErrCallTimeout,
+  ErrCwdNotADirectory,
+  ErrCwdNotFound,
   ErrInstanceIdCollision,
   ErrInvalidFlags,
   ErrJsonlMissing,
@@ -161,7 +169,6 @@ import type {
   ResumeParams,
   SendKeysParams,
   SendKeysResult,
-  SpawnParams,
   SpawnResult,
   StatusParams,
   VersionParams,
@@ -227,6 +234,7 @@ import type {
   Phase1ListResult,
   Phase1ListRow,
   Phase1ResumeResult,
+  Phase1SpawnParams,
   Phase1SpawnResult,
   Phase1StatusResult,
   PreTrust,
@@ -564,6 +572,31 @@ export function errInstanceIdCollision(): ErrInstanceIdCollision {
  */
 export function errTmuxSessionCreate(verb: string = 'resume'): ErrTmuxSessionCreate {
   return new ErrTmuxSessionCreate(verb, 'ErrTmuxSessionCreate', 'tmux: new-session failed: tmux session already exists')
+}
+
+/**
+ * Build an ErrTmuxSessionCreate from a reuse spawn (default verb `spawn`) or
+ * a `resume` of a row agent-director could not restore: its description ends
+ * with HO rev 28's restore sentence "the row could not be restored and stays
+ * pending", so the row then reads `pending`. CSCB matches no restore
+ * sentence: the retry's read of the row decides (b.jg5 SRJ-112, SRJ-409).
+ */
+export function errTmuxSessionCreateStaysPending(verb: string = 'spawn'): ErrTmuxSessionCreate {
+  return new ErrTmuxSessionCreate(
+    verb,
+    'ErrTmuxSessionCreate',
+    'tmux: new-session failed: tmux session already exists; the row could not be restored and stays pending',
+  )
+}
+
+/** Build an ErrCwdNotFound (the client's class): the working directory `cwd` does not exist. */
+export function errCwdNotFound(verb: string = 'spawn', cwd: string = '/x'): ErrCwdNotFound {
+  return new ErrCwdNotFound(verb, 'ErrCwdNotFound', `cwd ${cwd} does not exist`)
+}
+
+/** Build an ErrCwdNotADirectory (the client's class): the working directory `cwd` is not a directory. */
+export function errCwdNotADirectory(verb: string = 'spawn', cwd: string = '/x'): ErrCwdNotADirectory {
+  return new ErrCwdNotADirectory(verb, 'ErrCwdNotADirectory', `cwd ${cwd} is not a directory`)
 }
 
 /**
@@ -1512,10 +1545,14 @@ export interface StubClientOptions {
   makeTemplateCalls?: MakeTemplateParams[]
 
   // spawn() — a result may carry the Phase 1 `pre_trust` (`cannedSpawnResult`).
+  // A recorded call may be a reuse spawn: its parameters carry the CSCB-side
+  // `reuse_finished` (`Phase1SpawnParams`, b.jg5 SRJ-112, SRJ-708), readable
+  // with no cast. The stub answers a reuse like any spawn, from the same
+  // queue and knobs.
   spawnResult?: Phase1SpawnResult
   spawnError?: Error
   spawnQueue?: CannedResponse<Phase1SpawnResult>[]
-  spawnCalls?: SpawnParams[]
+  spawnCalls?: Phase1SpawnParams[]
 
   // status() — a result may carry the Phase 1 `launch_started_at`
   // (`cannedStatusResult`). Default: `cannedStatusResult()`, a `waiting` row
@@ -1636,7 +1673,7 @@ export type StubClient = {
   readonly binaryVersion: string
   version(params: VersionParams): Promise<VersionResult>
   makeTemplate(params: MakeTemplateParams): Promise<MakeTemplateResult>
-  spawn(params: SpawnParams): Promise<Phase1SpawnResult>
+  spawn(params: Phase1SpawnParams): Promise<Phase1SpawnResult>
   status(params: StatusParams): Promise<Phase1StatusResult>
   get(params: GetParams): Promise<Phase1GetResult>
   sendKeys(params: SendKeysParams): Promise<SendKeysResult>
@@ -1698,7 +1735,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
         opts.makeTemplateResult ?? cannedMakeTemplate(`~/.agent-director/templates/${params.name}.toml`)
       )
     },
-    async spawn(params: SpawnParams): Promise<Phase1SpawnResult> {
+    async spawn(params: Phase1SpawnParams): Promise<Phase1SpawnResult> {
       opts.spawnCalls?.push(params)
       return nextResponse('spawn', opts.spawnQueue, opts.spawnResult, opts.spawnError, {
         claude_instance_id: params.claude_instance_id ?? 'cscb_test',
@@ -1805,8 +1842,8 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
 
 /** Handle returned by `holdSpawns`. */
 export interface SpawnHold {
-  /** Every `spawn` the stub received, held or not, in call order. */
-  calls: SpawnParams[]
+  /** Every `spawn` the stub received, held or not, in call order (a reuse spawn's with its `reuse_finished`). */
+  calls: Phase1SpawnParams[]
   /** Instance IDs of the spawns still held open, oldest first. */
   held(): string[]
   /** Resolves once a spawn for `id` has been issued (at once if one already was). */
@@ -1879,7 +1916,7 @@ export function holdFindMissing(stub: StubClient): FindMissingHold {
  * persona's launch in flight while it drives a second call.
  */
 export function holdSpawns(stub: StubClient, shouldHold: (id: string) => boolean = () => true): SpawnHold {
-  const calls: SpawnParams[] = []
+  const calls: Phase1SpawnParams[] = []
   const held: Array<{ id: string; resolve: (r: SpawnResult) => void; reject: (err: Error) => void }> = []
   const entries = new Map<string, { promise: Promise<void>; resolve: () => void }>()
   const entry = (id: string) => {
@@ -1898,7 +1935,7 @@ export function holdSpawns(stub: StubClient, shouldHold: (id: string) => boolean
     return held.splice(i, 1)[0]!
   }
   const original = stub.spawn.bind(stub)
-  stub.spawn = (params: SpawnParams): Promise<SpawnResult> => {
+  stub.spawn = (params: Phase1SpawnParams): Promise<SpawnResult> => {
     calls.push(params)
     const id = String(params.claude_instance_id)
     entry(id).resolve()

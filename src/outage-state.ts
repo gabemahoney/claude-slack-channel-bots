@@ -56,6 +56,10 @@
  *                                            pane reader or the reconnect's send-keys): arms
  *                                            with the UNCLASSIFIED cause and reports it,
  *                                            inside an attempt
+ *   - armPendingOnlyAfterLaunchFailure(key) — a launch's ErrTmuxSessionCreate arms the
+ *                                            persona's retry timer at once in pending-only
+ *                                            mode, inside an attempt, recording no attempt
+ *                                            error (b.jg5 SRJ-112, SRJ-113, SRJ-409)
  *   - _resetOutageState()                  — test-only state reset
  *
  * Template exports (used by tests):
@@ -805,6 +809,32 @@ export function reportUnclassifiedAtSite(
   const armed = reportAttemptCause(key, { kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, error: err }, adCallVerb(call), deps?.triggerSink)
   sendUnclassified(key, err, classification)
   return armed
+}
+
+/**
+ * armPendingOnlyAfterLaunchFailure — a launch's `ErrTmuxSessionCreate`
+ * (b.jg5 SRJ-112, SRJ-113, SRJ-301, SRJ-409): arm persona `key`'s retry
+ * timer at once, with no `get` first, in pending-only mode with the
+ * `pending-row` cause, through the installed trigger sink's optional
+ * `armPendingOnly` (production: the retry controller), so that the retry's
+ * read of the row decides what the failure left (agent-director's restore
+ * may not have applied, HO rev 28). A timer already in full mode stays in
+ * full mode (another SRJ-301 cause holds). Only inside a launch or recovery
+ * attempt for `key`; outside one, or with no sink or none with
+ * `armPendingOnly`, it arms nothing. It records no attempt error, so the
+ * launch's counted `failed` result is never marked refused. Answers whether
+ * the sink was asked to arm. Never throws.
+ */
+export function armPendingOnlyAfterLaunchFailure(key: string): boolean {
+  try {
+    if (!isInsideAttempt(key)) return false
+    const sink = deps?.triggerSink
+    if (sink?.armPendingOnly === undefined) return false
+    sink.armPendingOnly(key)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**

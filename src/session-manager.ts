@@ -203,8 +203,10 @@
  * through the dependencies `buildLiveRowSequenceDeps` binds to the shared
  * entries here, and makes its final launch through one launch call,
  * `launchForLiveRowSequence`: a `resume` whose no-transcript answers go on to
- * the installed reuse builder (`setSequenceReuseBuilder`), or that reuse;
- * with no builder installed a reuse makes no call. Sequences run in the
+ * the reuse spawn, or the reuse spawn (`reuseSpawnForPersona`, b.jg5
+ * SRJ-112, SRJ-708: `buildSpawnParams` with the reuse flag, its outcomes
+ * classified by name), whose collision ends the sequence without its launch;
+ * the entry counts its launch's result once. Sequences run in the
  * server's one registry (`setLiveRowSequenceRegistry`, b.jg5 SRJ-706),
  * reached through the start entry (`startLiveRowSequence`) and the running
  * query (`isLiveRowSequenceRunning`); a latch of the persona stops its
@@ -223,7 +225,14 @@
 
 import type { Client, ListRow, SpawnParams, FindMissingResult, GetResult } from 'agent-director'
 
-import type { Phase1GetResult, Phase1ResumeResult, Phase1SpawnResult, Phase1StatusResult, PreTrust } from './ad-phase1-types.ts'
+import type {
+  Phase1GetResult,
+  Phase1ResumeResult,
+  Phase1SpawnParams,
+  Phase1SpawnResult,
+  Phase1StatusResult,
+  PreTrust,
+} from './ad-phase1-types.ts'
 
 import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
 import {
@@ -251,6 +260,7 @@ import {
 } from './persona-identity.ts'
 import { getClient } from './agent-director-client.ts'
 import {
+  armPendingOnlyAfterLaunchFailure,
   getOutageFlags,
   raiseAdConfigMalformed,
   raiseTmuxUnavailable,
@@ -273,6 +283,7 @@ import {
   ErrCwdNotFound,
   ErrCwdNotADirectory,
   ErrSpawnCapReached,
+  ERR_INSTANCE_ID_COLLISION_NAME,
   ERR_JSONL_MISSING_NAME,
   ERR_JSONL_NEVER_WRITTEN_NAME,
   ERR_NO_SESSION_ID_NAME,
@@ -284,8 +295,10 @@ import {
   AD_CALL_KILL_ROW_READ_LIVE,
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_DIRECTORY,
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_GONE,
+  AD_ERROR_CLASS_LAUNCH_FAILURE,
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNUSABLE_NAME,
   adKillCall,
@@ -388,6 +401,7 @@ import {
   REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
+  REFUSED_OPERATION_REUSE_SPAWN,
   describeLatchRowState,
   isUnusableNameError,
   latchRowStateRead,
@@ -413,6 +427,7 @@ import {
   runInAttempt,
   runOutsideAttempts,
   unavailableRetryCauseFor,
+  UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
   UNAVAILABLE_RETRY_ROW_ABSENT,
@@ -423,11 +438,13 @@ import {
 import {
   LIVE_ROW_ARM_ENDED,
   LIVE_ROW_ARM_NOT_JUDGED,
+  LIVE_ROW_ARM_REUSE_COLLISION,
   LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
   LIVE_ROW_LAUNCH_REUSE,
+  LIVE_ROW_LAUNCH_SUCCESS_ACTIONS,
   LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED,
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
-  LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER,
+  LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION,
   LIVE_ROW_NOT_LAUNCHED_STOPPED,
   LIVE_ROW_OUTCOME_NOT_LAUNCHED,
   LIVE_ROW_READ_ABSENT,
@@ -479,7 +496,7 @@ import {
 } from './persona-connection-errors.ts'
 import { describeDestinationFailureCause } from './persona-destination.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
-import { RESTART_FAILURE_CAP } from './restart.ts'
+import { RESTART_FAILURE_CAP, recordLaunchResultOutsideRestartWork } from './restart.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
@@ -1036,15 +1053,16 @@ const LATCH_TIME_READ_LATCHED_ELSEWHERE =
 
 /**
  * b.jg5 SRJ-105, SRJ-501, SRJ-111, SRJ-113: the CONFLICT row of the ladder's
- * refusal handling, at every spawn and `resume` the collision ladder makes.
- * `err` was thrown by that call for persona `key`. It is the row's only when
+ * refusal handling, at every spawn and `resume` the collision ladder makes
+ * and at the reuse spawn (SRJ-112). `err` was thrown by that call for persona `key`. It is the row's only when
  * the classifier (`classifyAdError`, by name) answers CONFLICT
  * (`ErrTmuxSessionConflict`); for any other value it answers `undefined`
  * and the site goes on as before.
  *
  * For a CONFLICT it latches the persona through the installed latch's
  * `setFromConflict` with
- * `operation` (a plain spawn or a `resume`) and the row state: `lastRead`,
+ * `operation` (a plain spawn, a `resume` or the reuse spawn) and the row
+ * state: `lastRead`,
  * the state the path last read before the refused call, or, when it read
  * nothing (`NOTHING_READ`), exactly one latch-time `status` read
  * (`latchTimeRowState`; when that read latched the persona itself, its latch
@@ -6442,6 +6460,24 @@ export interface SpawnPersonaResult {
    * cap.
    */
   stopping?: true
+  /**
+   * Set on a counted `failed` result only: the launch answered
+   * `ErrTmuxSessionCreate` and armed the persona's retry timer at once in
+   * pending-only mode (`armPendingOnlyAfterLaunchFailure`; b.jg5 SRJ-112,
+   * SRJ-113, SRJ-409), so the retry's read of the row decides. The failure
+   * is still counted. The live-row sequence arms no other cause of its own
+   * after such a final launch.
+   */
+  pendingOnlyArmed?: true
+  /**
+   * Set on a `failed` result only, where its error is handled by class: the
+   * class is LAUNCH FAILURE (`ErrTmuxSessionCreate`) or DIRECTORY
+   * (`ErrCwdNotFound`, `ErrCwdNotADirectory`), the classes SRJ-112 and
+   * SRJ-113 count (b.jg5). The reuse spawn sets it, and so does the live-row
+   * sequence's `resume` leg. The live-row sequence's launch entry counts a
+   * failure only when it is set (`sequenceLaunchCounted`).
+   */
+  countedClass?: true
 }
 
 // ---------------------------------------------------------------------------
@@ -6585,13 +6621,17 @@ function spawnHomeDir(): string {
  * (`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, b.svb/b.f2b; see
  * persona-identity.ts for why). Every spawn in the ladder (the fresh spawn,
  * the replacement and amnesia spawns, the b.vub self-heal respawn) sends
- * these params, and a resume restores the env agent-director stored with the
- * row at its spawn, so every launch of the persona's Claude runs with it.
+ * these params, the reuse spawn (`reuseSpawnForPersona`) sends them with
+ * only `reuse_finished: true` added (b.jg5 SRJ-708: one derivation, so a
+ * reuse carries the same template, `cwd`, labels and `extra_env` as any
+ * launch of the persona), and a resume restores the env agent-director
+ * stored with the row at its spawn, so every launch of the persona's Claude
+ * runs with it.
  *
- * CSCB never passes `no_pre_trust`: not here, and not on a `resume`, so
- * agent-director pre-accepts the persona's folder trust at every launch and
- * reports the outcome as the result's `pre_trust`, which CSCB only logs
- * (`preTrustLogLine`, b.jg5 SRJ-413).
+ * CSCB never passes `no_pre_trust`: not here, not on a reuse and not on a
+ * `resume`, so agent-director pre-accepts the persona's folder trust at
+ * every launch and reports the outcome as the result's `pre_trust`, which
+ * CSCB only logs (`preTrustLogLine`, b.jg5 SRJ-413).
  */
 function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabel: string): SpawnParams {
   const { key } = persona
@@ -8432,20 +8472,22 @@ export function _resetDialogApprovers(): void {
   approversClosed = false
 }
 
-/** The agent-director launch verbs whose success runs the after-launch step. */
-export type LaunchVerb = typeof LAUNCH_VERB_SPAWN | typeof LAUNCH_VERB_RESUME
+/** The launches whose success runs the after-launch step, as the `pre_trust` line names them. */
+export type LaunchVerb = typeof LAUNCH_VERB_SPAWN | typeof LAUNCH_VERB_RESUME | typeof LAUNCH_VERB_REUSE_SPAWN
 /** A plain spawn (a fresh, self-heal, retry, replacement or amnesia spawn). */
 export const LAUNCH_VERB_SPAWN = 'spawn'
 /** A `resume`. */
 export const LAUNCH_VERB_RESUME = 'resume'
+/** A reuse spawn: agent-director's `spawn` with the reuse flag (`reuseSpawnForPersona`; b.jg5 SRJ-112, SRJ-413). */
+export const LAUNCH_VERB_REUSE_SPAWN = 'reuse spawn'
 
 /** The head of every `pre_trust` line. */
 export const PRE_TRUST_LOG_PREFIX = '[slack] spawnForPersona: '
 
 /**
  * The one log line a successful launch writes about its `pre_trust` (b.jg5
- * SRJ-413): the persona reference `ref`, the launch verb and the value the
- * result carried, shown as it arrived (rendered for the log, never checked
+ * SRJ-413): the persona reference `ref`, the launch verb (a plain spawn, a
+ * `resume` or a reuse spawn, `LaunchVerb`) and the value the result carried, shown as it arrived (rendered for the log, never checked
  * against a list); for a result without the field (`preTrust` undefined), that
  * the result came from an agent-director older than Phase 1. The line is
  * information only: no value changes what CSCB does, and a folder-trust prompt
@@ -8481,9 +8523,10 @@ function renderPreTrustValue(value: unknown): string {
  * The one step after a launch call that returned success (b.jg5 SRJ-401):
  * the plain spawn, the self-heal spawn, the retry spawn after the collision
  * `get`'s `ErrSpawnNotFound`, the fresh spawn of a replacement, the
- * `resume`, the amnesia spawn and the spawns after `resume`'s
- * `ErrSpawnNotResumable` and `ErrSpawnNotFound`. `verb` names the launch
- * call and `launched` is its whole result. The step writes the launch's one
+ * `resume`, the amnesia spawn, the spawns after `resume`'s
+ * `ErrSpawnNotResumable` and `ErrSpawnNotFound`, and the reuse spawn
+ * (`reuseSpawnForPersona`). `verb` names the launch and `launched` is the
+ * call's whole result. The step writes the launch's one
  * `pre_trust` line (`preTrustLogLine`, b.jg5 SRJ-413), then starts the
  * persona's dialog approver (`startDialogApprover`) without awaiting it, so
  * the ladder's result is returned as soon as the launch call returned.
@@ -9009,6 +9052,224 @@ async function runPersonaLadder(
 }
 
 // ---------------------------------------------------------------------------
+// The reuse spawn (b.jg5 SRJ-112, SRJ-708)
+// ---------------------------------------------------------------------------
+
+/** The prefix of the reuse spawn's own lines. */
+const REUSE_SPAWN_SITE = 'reuseSpawnForPersona'
+
+/** What the reuse spawn's lines call the call. */
+const REUSE_SPAWN_WHAT = 'reuse spawn'
+
+/**
+ * The reuse spawn's answer to `ErrInstanceIdCollision` (b.jg5 SRJ-112): the
+ * row is live (a launch in progress included), so nothing was launched. Not
+ * a launch result: no notice, no entry, nothing counted and nothing armed by
+ * the reuse itself. Its caller decides what follows (the live-row sequence
+ * ends without its launch and arms the reuse-collision cause).
+ */
+export const REUSE_SPAWN_COLLIDED = 'reuse-collided'
+
+/** The reuse spawn's collided answer (`REUSE_SPAWN_COLLIDED`). */
+export interface ReuseSpawnCollided {
+  readonly key: string
+  readonly action: typeof REUSE_SPAWN_COLLIDED
+}
+
+/**
+ * What the reuse spawn answers: a launch result, or the collided answer.
+ * The collided answer's action is none of `SpawnPersonaResult`'s, so a
+ * caller must tell it apart (`isReuseSpawnCollided`) before it can pass the
+ * answer on as a launch result: no caller can count a collision by mistake.
+ */
+export type ReuseSpawnResult = SpawnPersonaResult | ReuseSpawnCollided
+
+/** Whether a reuse spawn's answer is its collided answer. */
+export function isReuseSpawnCollided(result: ReuseSpawnResult): result is ReuseSpawnCollided {
+  return result.action === REUSE_SPAWN_COLLIDED
+}
+
+/** What the reuse spawn is told by its caller. */
+export interface ReuseSpawnOptions {
+  /** Whether the launch is part of the start pass (a `spawn-failed` entry is written only then). */
+  readonly isStartup: boolean
+  /**
+   * The row state the caller last read before the reuse (`LATCH_ROW_STATE_NO_ROW`
+   * included): the state a CONFLICT or UNUSABLE NAME latch records (b.jg5
+   * SRJ-501). Never re-read here.
+   */
+  readonly lastRead: LatchRowState
+  /**
+   * True when the caller has already run the pre-launch trust patch in this
+   * launch attempt (the collision ladder at its start; a `resume` that went
+   * on to the reuse). Otherwise the reuse runs it once before its call.
+   */
+  readonly trustPatchRan?: boolean
+}
+
+/**
+ * The reuse spawn of persona `persona`'s `cscb_<key>` (b.jg5 SRJ-112,
+ * SRJ-708): agent-director's `spawn` of the same fixed id with the reuse
+ * flag, which brings the persona up fresh on its own id and keeps its row as
+ * an earlier life. One launch, called by every reuse site; it runs inside its
+ * caller's launch or recovery attempt and opens none of its own, and its
+ * caller registers the launch in flight.
+ *   - The launch path's `claude_config_dir` check comes first (bug b.g57):
+ *     a directory that does not resolve goes to the installed deferral hook
+ *     and the answer is `deferred`, with no agent-director call.
+ *   - Its parameters are `buildSpawnParams`'s, with only `reuse_finished:
+ *     true` added (SRJ-708): the same template, `cwd`, labels and `extra_env`
+ *     as any launch of the persona, prompt suggestions off included. No
+ *     `no_pre_trust` is ever set (SRJ-413).
+ *   - The pre-launch trust patch runs once before the call unless the caller
+ *     ran it in this attempt (`options.trustPatchRan`), and the call goes
+ *     through `launchWithReplyGuard` (the reply guard immediately before it,
+ *     then spawn detection, which reports an error by class).
+ *   - A success logs one line naming the reuse spawn and the persona (and,
+ *     when `options.lastRead` is no row, that no earlier life is kept: an
+ *     ordinary fresh spawn, SRJ-112), then
+ *     runs the after-launch step (`afterLaunchSucceeded`: the `pre_trust`
+ *     line naming the reuse spawn, SRJ-413, and the dialog approver on the
+ *     persona's row, SRJ-401), and answers `spawned`.
+ *   - Every failure is handled by SRJ-112's outcome table
+ *     (`reuseSpawnFailedAt`).
+ * Nothing here calls `delete` or `kill`, sets `include_finished`, makes a
+ * second launch or says that a row was deleted. Never throws.
+ */
+export async function reuseSpawnForPersona(
+  persona: Persona,
+  config: PersonaConfig,
+  options: ReuseSpawnOptions,
+): Promise<ReuseSpawnResult> {
+  const { key } = persona
+  const ref = personaRef(persona)
+  const configDir = checkLaunchConfigDir(persona)
+  if (!configDir.ok) {
+    deferLaunchForConfigDir(persona, configDir)
+    return deferredResult(persona, configDir)
+  }
+  const configDirLabel = configDirLabelValue(configDir.realPath, spawnHomeDir())
+  // b.jg5 SRJ-708: one derivation of the parameters; only the flag is added.
+  const params: Phase1SpawnParams = { ...buildSpawnParams(persona, config, configDirLabel), reuse_finished: true }
+  // b.av2 SR-6.2: the trust patch precedes every launch, once per attempt.
+  if (options.trustPatchRan !== true) runPreLaunchTrustPatch(persona, ref)
+  let launched: Phase1SpawnResult
+  try {
+    launched = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
+  } catch (err) {
+    return reuseSpawnFailedAt(persona, err, options.isStartup, ref, options.lastRead)
+  }
+  // b.jg5 SRJ-112: a reuse of an id with no row is an ordinary fresh spawn; no earlier life is kept.
+  const earlierLife =
+    options.lastRead === LATCH_ROW_STATE_NO_ROW
+      ? 'the id had no row when last read (an ordinary fresh spawn), so no earlier life is kept'
+      : 'its row is kept as an earlier life'
+  console.error(
+    `[slack] ${REUSE_SPAWN_SITE}: reuse-spawned ${ref} instanceId=${personaInstanceId(key)} — a new life on its own id; ${earlierLife} (b.jg5 SRJ-112)`,
+  )
+  afterLaunchSucceeded(key, options.isStartup, ref, LAUNCH_VERB_REUSE_SPAWN, launched)
+  return { key, action: 'spawned' }
+}
+
+/**
+ * SRJ-112's outcome table for a value the reuse spawn's call threw (b.jg5
+ * SRJ-112, SRJ-709, SRJ-105), classified by name (`src/ad-error-class.ts`),
+ * with the refused operation "reuse spawn" and `lastRead` as the recorded
+ * row state of a latch:
+ *   - `ErrInstanceIdCollision`: one line and the collided answer
+ *     (`REUSE_SPAWN_COLLIDED`): no notice, no entry, nothing counted; it
+ *     never reaches `notifySpawnFailure`;
+ *   - `ErrInvalidFlags`: one immediate version re-check (SRJ-204); a stop it
+ *     decides answers `failed` marked `stopping`; otherwise SRJ-105's
+ *     UNCLASSIFIED row through the outage state's site entry (the retry timer
+ *     armed, the unclassified-error episode fed; refused, never counted).
+ *     Never another launch;
+ *   - CONFLICT (`conflictAt`): the persona latches with the case its
+ *     description gives ("another agent-director store" and "conflicting
+ *     labels" included) and `lastRead` ("no row" for a reuse of an id with
+ *     no row, which the pre-spawn scan refused, writing no row); `latched`;
+ *   - UNUSABLE NAME (`unusableNameAt`): latched with the refused operation
+ *     none; `latched`;
+ *   - UNAVAILABLE (every form, a launch timeout included), ENVIRONMENT,
+ *     CONFIG and UNCLASSIFIED (`refusalAt`): one line and `failed`, which the
+ *     attempt marks refused: never counted, no notice; the reporting point
+ *     has armed the retry timer, started the condition or raised the outage,
+ *     and fed the unclassified-error episode, by class;
+ *   - LAUNCH FAILURE (`ErrTmuxSessionCreate`): one counted launch failure
+ *     (one line, the spawn-failure notice, a `spawn-failed` entry at start,
+ *     `failed`), never a kill and never a spawn in its place (SRJ-602); the
+ *     persona's retry timer is also armed at once in pending-only mode
+ *     (`armPendingOnlyAfterLaunchFailure`; SRJ-301, SRJ-409; HO rev 28),
+ *     whatever row the reuse was made over, and the result says so
+ *     (`pendingOnlyArmed`); the result is marked `countedClass`;
+ *   - DIRECTORY (`ErrCwdNotFound`, `ErrCwdNotADirectory`): `failed`, counted
+ *     (marked `countedClass`), the wrapper having raised `cwd-unreachable`;
+ *   - any other value (a GONE name, a STATE name the reuse gives no meaning):
+ *     SRJ-105's UNCLASSIFIED row, as for `ErrInvalidFlags` after its re-check.
+ * Never throws.
+ */
+async function reuseSpawnFailedAt(
+  persona: Persona,
+  err: unknown,
+  isStartup: boolean,
+  ref: string,
+  lastRead: LatchRowState,
+): Promise<ReuseSpawnResult> {
+  const { key } = persona
+  if (hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) {
+    console.error(
+      `[slack] ${REUSE_SPAWN_SITE}: ${describeAgentDirectorFailure(err)} on the ${REUSE_SPAWN_WHAT} of ${ref} — its row is live, so nothing was launched; no spawn-failure notice, nothing counted (b.jg5 SRJ-112)`,
+    )
+    return { key, action: REUSE_SPAWN_COLLIDED }
+  }
+  if (isInvalidFlagsError(err)) {
+    const step = await classifyWithInvalidFlagsRecheck(err)
+    const recheck = `after one immediate agent-director version re-check: ${step.recheck.kind}`
+    // The stop posts nothing to Slack, and a launch it ends is not counted.
+    if (step.recheck.kind === RECHECK_OUTCOME_STOP) {
+      console.error(
+        `[slack] ${REUSE_SPAWN_SITE}: ${REUSE_SPAWN_WHAT} failed for ${ref}: ${describeAdErrorClassification(step.classification)} (${recheck}); no other launch`,
+      )
+      return { key, action: 'failed', stopping: true }
+    }
+    // b.jg5 SRJ-104, SRJ-105, SRJ-313: UNCLASSIFIED handling; never a
+    // fallback to any other launch (SRJ-112).
+    reportUnclassifiedAtSite(key, err, 'spawn', step.classification)
+    logRefusal(REUSE_SPAWN_SITE, REUSE_SPAWN_WHAT, ref, `${describeAdErrorClassification(step.classification)} (${recheck})`)
+    return { key, action: 'failed' }
+  }
+  const latched =
+    (await conflictAt(key, err, REFUSED_OPERATION_REUSE_SPAWN, lastRead, REUSE_SPAWN_WHAT, ref, REUSE_SPAWN_SITE)) ??
+    (await unusableNameAt(key, err, lastRead, REUSE_SPAWN_SITE, REUSE_SPAWN_WHAT, ref))
+  if (latched) return latched
+  const refused = refusalAt(key, err, 'spawn', REUSE_SPAWN_SITE, REUSE_SPAWN_WHAT, ref)
+  if (refused) return refused
+  const { errorClass } = classifyAdError(err)
+  // The class is decided by name above; the `instanceof` check only narrows
+  // the type for the describer and the notice.
+  if (errorClass === AD_ERROR_CLASS_LAUNCH_FAILURE && err instanceof AgentDirectorError) {
+    const described = describeAgentDirectorFailure(err)
+    console.error(
+      `[slack] ${REUSE_SPAWN_SITE}: ${REUSE_SPAWN_WHAT} failed for ${ref}: ${described} — a counted launch failure; nothing is killed and no spawn is made in its place (b.jg5 SRJ-112, SRJ-602)`,
+    )
+    if (isStartup) recordStartupError('spawn-failed', `${REUSE_SPAWN_WHAT} failed for ${ref}: ${described}`)
+    notifySpawnFailure(key, err, isStartup)
+    // b.jg5 SRJ-112, SRJ-301, SRJ-409 (HO rev 28): the row may read restored,
+    // live, gone or still `pending`; the retry's read decides.
+    return armPendingOnlyAfterLaunchFailure(key)
+      ? { key, action: 'failed', countedClass: true, pendingOnlyArmed: true }
+      : { key, action: 'failed', countedClass: true }
+  }
+  // b.av2 SR-6.4: `cwd-unreachable` was raised by the spawn's wrapper; counted.
+  if (errorClass === AD_ERROR_CLASS_DIRECTORY) return { key, action: 'failed', countedClass: true }
+  // b.jg5 SRJ-104, SRJ-105, SRJ-313: a name the reuse gives no meaning.
+  const classification = unclassifiedClassificationOf(err)
+  reportUnclassifiedAtSite(key, err, 'spawn', classification)
+  logRefusal(REUSE_SPAWN_SITE, REUSE_SPAWN_WHAT, ref, describeAdErrorClassification(classification))
+  return { key, action: 'failed' }
+}
+
+// ---------------------------------------------------------------------------
 // The live-row sequence registry (b.jg5 SRJ-706)
 // ---------------------------------------------------------------------------
 
@@ -9149,60 +9410,15 @@ export interface LiveRowSequenceLaunchRequest {
   readonly stop?: LiveRowSequenceStopSignal
 }
 
-/** The entry's answer when it made no launch: no reuse builder, `ErrSpawnNotResumable`, the sequence stopped. */
+/** The entry's answer when it made no launch: a reuse collision, `ErrSpawnNotResumable`, the sequence stopped. */
 export interface LiveRowSequenceNotLaunched {
   readonly key: string
   readonly action: typeof LIVE_ROW_OUTCOME_NOT_LAUNCHED
   readonly reason: LiveRowSequenceNotLaunchedReason
 }
 
-/** What the sequence-launch entry answers: the ladder's launch result, or that no launch was made. */
+/** What the sequence-launch entry answers: the launch's result, or that no launch was made. */
 export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSequenceNotLaunched
-
-/** What the reuse builder is given for one reuse spawn of `cscb_<key>`. */
-export interface SequenceReuseRequest {
-  readonly persona: Persona
-  readonly config: PersonaConfig
-  readonly ref: string
-  /** The spawn's `config_dir` label, from the entry's pre-launch check (`checkLaunchConfigDir`). */
-  readonly configDirLabel: string
-  /** The row state the sequence last read: the state a latch records. */
-  readonly lastRead: LatchRowState
-  /**
-   * The `resume` answer (`ErrNoSessionId`, `ErrJsonlMissing`,
-   * `ErrJsonlNeverWritten`) that sent the launch on to the reuse; absent when
-   * step 6 decided the reuse itself.
-   */
-  readonly resumeError?: unknown
-}
-
-/** What the reuse builder answers. */
-export interface SequenceReuseAnswer {
-  /** The reuse launch's result. */
-  readonly result: SpawnPersonaResult
-  /** The spawn call's whole result when it returned success: the entry runs the after-launch step with it. */
-  readonly spawned?: Phase1SpawnResult
-}
-
-/** Makes the live-row sequence's reuse spawn of the persona's id and answers its result. */
-export type SequenceReuseBuilder = (request: SequenceReuseRequest) => Promise<SequenceReuseAnswer>
-
-/**
- * The installed reuse builder. With none installed (the production server
- * today, and tests that install none) the sequence-launch entry makes no
- * reuse: no agent-director call, one line, and a not-launched answer.
- */
-let sequenceReuseBuilder: SequenceReuseBuilder | undefined
-
-/** Install the live-row sequence's reuse builder, or remove it with undefined. */
-export function setSequenceReuseBuilder(builder: SequenceReuseBuilder | undefined): void {
-  sequenceReuseBuilder = builder
-}
-
-/** Test-only seam: remove any installed reuse builder. */
-export function _resetSequenceReuseBuilder(): void {
-  sequenceReuseBuilder = undefined
-}
 
 /** `resume`'s answers that go on to the reuse spawn (b.jg5 SRJ-705, SRJ-113), by name. */
 const NO_TRANSCRIPT_RESUME_ERR_NAMES = [ERR_NO_SESSION_ID_NAME, ERR_JSONL_MISSING_NAME, ERR_JSONL_NEVER_WRITTEN_NAME] as const
@@ -9215,7 +9431,9 @@ const NO_TRANSCRIPT_RESUME_ERR_NAMES = [ERR_NO_SESSION_ID_NAME, ERR_JSONL_MISSIN
  *     map `spawnForPersona` uses, so `isLaunchInFlight` is true and
  *     `whenLaunchSettled` waits for it while it runs (a teardown's wait
  *     covers it, SRJ-715); a call that joins it gets its launch result, a
- *     not-launched answer reading as the uncounted refused result;
+ *     not-launched answer or any failure that is neither refused nor
+ *     stopping reading as the uncounted refused result, so a failure is
+ *     counted only here, once and by class;
  *   - once the sequence's stop signal (`request.stop`) is set, it stops
  *     waiting and makes no call (b.jg5 SRJ-706): one line, nothing
  *     registered, and a not-launched answer (`stopped`);
@@ -9224,23 +9442,38 @@ const NO_TRANSCRIPT_RESUME_ERR_NAMES = [ERR_NO_SESSION_ID_NAME, ERR_JSONL_MISSIN
  *     inside it, and never passes through that gate;
  *   - the latched gate, the pre-launch `claude_config_dir` check and dry run
  *     come first, as in `spawnForPersona`; then the launch runs as a launch
- *     attempt for the persona (SRJ-301), the trust patch before it;
+ *     attempt for the persona (SRJ-301), the trust patch once before it;
  *   - `resume`: one `resume` of the id through the ladder's launch helper
  *     (`launchWithReplyGuard`: the reply guard, spawn detection, arming by
  *     class). `ErrNoSessionId`, `ErrJsonlMissing` and `ErrJsonlNeverWritten`
- *     (by name) go on to the reuse once; `ErrSpawnNotResumable` answers not
- *     launched (SRJ-710: no second sequence); any other non-success ends by
- *     class (`resumeFailedAt`: a CONFLICT or UNUSABLE NAME latches with
- *     `request.lastRead`) with no further call: no delete, no kill and no
- *     fresh spawn;
- *   - `reuse`: the installed reuse builder (`setSequenceReuseBuilder`); with
- *     none installed, no agent-director call, one line naming the missing
- *     builder, and a not-launched answer;
+ *     (by name) go on to the reuse spawn once; `ErrSpawnNotResumable`
+ *     answers not launched (SRJ-710: no second sequence); an
+ *     `ErrTmuxSessionCreate` (by class) is a counted launch failure that also
+ *     arms the persona's retry timer at once in pending-only mode (SRJ-113,
+ *     SRJ-409), and a DIRECTORY error is a counted launch failure; any other
+ *     non-success ends by class (`resumeFailedAt`: a CONFLICT or UNUSABLE
+ *     NAME latches with `request.lastRead`; `ErrSpawnNotFound` gets the
+ *     spawn-failure notice and is not counted) with no further call: no
+ *     delete, no kill and no fresh spawn;
+ *   - `reuse`: the reuse spawn (`reuseSpawnForPersona`) with
+ *     `request.lastRead`, its outcomes SRJ-112's. Its collision answers not
+ *     launched (`reuse-collision`): no further launch, nothing counted, no
+ *     notice; the sequence ends without its launch and arms the persona's
+ *     retry timer with the reuse-collision cause (SRJ-112, SRJ-705, SRJ-706);
  *   - a success runs the after-launch step (`afterLaunchSucceeded`: the
  *     `pre_trust` line and the dialog approver); any other result ends the
- *     sequence without its launch, which arms the persona's retry timer
- *     with the other-end cause unless the persona latched or the server is
- *     stopping (`runLiveRowSequence`, SRJ-301).
+ *     sequence without its launch (`runLiveRowSequence` arms by its rule,
+ *     SRJ-301).
+ * The launch's result is counted once here, as the restart path counts a
+ * launch's result (`recordLaunchResultOutsideRestartWork`, b.jg5 SRJ-112,
+ * SRJ-113, SRJ-602), by class: a success resets the persona's failure
+ * count, and a `failed` result that is neither refused nor stopping and
+ * whose class is LAUNCH FAILURE (`ErrTmuxSessionCreate`) or DIRECTORY
+ * (`ErrCwdNotFound`, `ErrCwdNotADirectory`), marked `countedClass` where
+ * that class is handled, is one counted launch failure; any other `failed`
+ * result (a `resume`'s `ErrSpawnNotFound`, which still posts the
+ * spawn-failure notice, for one) and a refused, stopping, latched, deferred
+ * or not-launched answer record nothing.
  * Never calls `delete` and never sets `include_finished`. Never throws.
  */
 export async function launchForLiveRowSequence(
@@ -9266,10 +9499,12 @@ export async function launchForLiveRowSequence(
     return { key, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_STOPPED }
   }
   const launch = sequenceLaunchAttempt(persona, config, request, ref)
-  // A call that joins this launch gets a launch result; no launch reads as the uncounted refused one.
-  const asLaunch: Promise<SpawnPersonaResult> = launch.then((result) =>
-    result.action === LIVE_ROW_OUTCOME_NOT_LAUNCHED ? { key, action: 'failed', refused: true } : result,
-  )
+  // A call that joins this launch gets a launch result; no launch, and any
+  // failure neither refused nor stopping, read as the uncounted refused one.
+  const asLaunch: Promise<SpawnPersonaResult> = launch.then((result) => {
+    if (result.action === LIVE_ROW_OUTCOME_NOT_LAUNCHED) return { key, action: 'failed', refused: true }
+    return isUnrefusedFailure(result) ? { ...result, refused: true } : result
+  })
   inFlightLaunches.set(key, asLaunch)
   try {
     return await launch
@@ -9298,7 +9533,21 @@ function whenLaunchSettledOrStopped(key: string, stop: LiveRowSequenceStopSignal
   })
 }
 
-/** The sequence launch's gates, then its call as a launch attempt for the persona. Never throws. */
+/** Whether `result` is `failed`, neither refused nor stopping. */
+function isUnrefusedFailure(result: SpawnPersonaResult): boolean {
+  return result.action === 'failed' && result.refused !== true && result.stopping !== true
+}
+
+/**
+ * Whether the entry counts `result` as a launch failure (b.jg5 SRJ-112,
+ * SRJ-113): `failed`, neither refused nor stopping, and marked `countedClass`
+ * (its class is LAUNCH FAILURE or DIRECTORY).
+ */
+function sequenceLaunchCounted(result: SpawnPersonaResult): boolean {
+  return isUnrefusedFailure(result) && result.countedClass === true
+}
+
+/** The sequence launch's gates, then its call as a launch attempt for the persona, then its count. Never throws. */
 async function sequenceLaunchAttempt(
   persona: Persona,
   config: PersonaConfig,
@@ -9323,15 +9572,37 @@ async function sequenceLaunchAttempt(
     console.error(`[slack] dry-run: skipping the live-row sequence's ${request.kind} for ${ref}`)
     return { key, action: 'no-op' }
   }
-  const configDirLabel = configDirLabelValue(configDir.realPath, spawnHomeDir())
   forgetWorkingRowEvidence(key)
   endWorkingRowDeferral(key)
   endPromptRowDeferral(key)
   // b.jg5 SRJ-301: the launch is a launch attempt for the persona.
-  return runInAttempt(key, 'launch', async (attempt) => {
-    const result = await sequenceLaunchCall(persona, config, request, ref, configDirLabel)
-    return result.action === LIVE_ROW_OUTCOME_NOT_LAUNCHED ? result : markRefusal(result, attempt)
+  const result = await runInAttempt(key, 'launch', async (attempt) => {
+    const called = await sequenceLaunchCall(persona, config, request, ref)
+    return called.action === LIVE_ROW_OUTCOME_NOT_LAUNCHED ? called : markRefusal(called, attempt)
   })
+  if (result.action !== LIVE_ROW_OUTCOME_NOT_LAUNCHED) countSequenceLaunch(key, ref, result)
+  return result
+}
+
+/**
+ * Count the sequence launch's `result` once (b.jg5 SRJ-112, SRJ-113,
+ * SRJ-602), as the restart path counts a launch result
+ * (`launchSession`'s reading), by class: a success records a success; a
+ * `failed` result that is neither refused nor stopping and is marked
+ * `countedClass` (LAUNCH FAILURE or DIRECTORY) records one counted launch
+ * failure (the cap notice at the cap); any other `failed` result (a
+ * `resume`'s `ErrSpawnNotFound`, for one) and a latched or deferred result
+ * record nothing. The step-6 launch is not routed through `launchSession`,
+ * so nothing else counts it. Never throws.
+ */
+function countSequenceLaunch(key: string, ref: string, result: SpawnPersonaResult): void {
+  const succeeded = LIVE_ROW_LAUNCH_SUCCESS_ACTIONS.has(result.action)
+  if (!succeeded && !sequenceLaunchCounted(result)) return
+  try {
+    recordLaunchResultOutsideRestartWork(key, succeeded)
+  } catch (err) {
+    console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} counting the launch of ${ref} failed: ${describeThrownValue(err)}`)
+  }
 }
 
 /** The sequence launch's call: the `resume` leg with its fallback to the reuse, or the reuse. Never throws. */
@@ -9340,11 +9611,9 @@ async function sequenceLaunchCall(
   config: PersonaConfig,
   request: LiveRowSequenceLaunchRequest,
   ref: string,
-  configDirLabel: string,
 ): Promise<LiveRowSequenceLaunchEntryResult> {
   const { key } = persona
-  const reuseRequest: SequenceReuseRequest = { persona, config, ref, configDirLabel, lastRead: request.lastRead }
-  if (request.kind === LIVE_ROW_LAUNCH_REUSE) return sequenceReuse(reuseRequest)
+  if (request.kind === LIVE_ROW_LAUNCH_REUSE) return sequenceReuse(persona, config, request.lastRead, false)
   // b.av2 SR-6.2: the trust patch precedes every launch.
   runPreLaunchTrustPatch(persona, ref)
   console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} resuming ${ref} (b.jg5 SRJ-705)`)
@@ -9360,7 +9629,7 @@ async function sequenceLaunchCall(
       console.error(
         `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${describeAgentDirectorFailure(err)} on resume for ${ref} — going on to the reuse spawn (b.jg5 SRJ-705)`,
       )
-      return sequenceReuse({ ...reuseRequest, resumeError: err })
+      return sequenceReuse(persona, config, request.lastRead, true)
     }
     if (hasAdErrorName(err, ERR_SPAWN_NOT_RESUMABLE_NAME)) {
       console.error(
@@ -9368,32 +9637,42 @@ async function sequenceLaunchCall(
       )
       return { key, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE }
     }
-    return resumeFailedAt(key, err, false, ref, request.lastRead)
+    const notResumed = await resumeFailedAt(key, err, false, ref, request.lastRead)
+    // b.jg5 SRJ-113: only LAUNCH FAILURE and DIRECTORY are counted; any
+    // other failure `resumeFailedAt` answers is not (`ErrSpawnNotFound`, for one).
+    const { errorClass } = classifyAdError(err)
+    if (!isUnrefusedFailure(notResumed)) return notResumed
+    if (errorClass === AD_ERROR_CLASS_DIRECTORY) return { ...notResumed, countedClass: true }
+    if (errorClass !== AD_ERROR_CLASS_LAUNCH_FAILURE) return notResumed
+    // b.jg5 SRJ-113, SRJ-301, SRJ-409 (HO rev 28): a `resume`'s
+    // `ErrTmuxSessionCreate` (a counted failure) arms the persona's retry
+    // timer at once in pending-only mode; the retry's read of the row decides.
+    return armPendingOnlyAfterLaunchFailure(key)
+      ? { ...notResumed, countedClass: true, pendingOnlyArmed: true }
+      : { ...notResumed, countedClass: true }
   }
 }
 
-/** The reuse through the installed builder, or the not-launched answer with none installed. Never throws. */
-async function sequenceReuse(request: SequenceReuseRequest): Promise<LiveRowSequenceLaunchEntryResult> {
-  const { persona, ref } = request
+/**
+ * The sequence's reuse spawn (`reuseSpawnForPersona`) with `lastRead`, the
+ * row state the sequence last read; `trustPatchRan` when the `resume` leg
+ * ran the trust patch in this attempt. Its collided answer becomes the
+ * not-launched answer `reuse-collision` (b.jg5 SRJ-112, SRJ-705): no further
+ * launch, nothing counted. Never throws.
+ */
+async function sequenceReuse(
+  persona: Persona,
+  config: PersonaConfig,
+  lastRead: LatchRowState,
+  trustPatchRan: boolean,
+): Promise<LiveRowSequenceLaunchEntryResult> {
   const { key } = persona
-  const builder = sequenceReuseBuilder
-  if (builder === undefined) {
-    console.error(
-      `${LIVE_ROW_SEQUENCE_LOG_PREFIX} no reuse builder is installed, so the reuse spawn of ${ref} is not made — no agent-director call; the sequence ends without its launch (b.jg5 SRJ-705)`,
-    )
-    return { key, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER }
-  }
-  // b.av2 SR-6.2: the trust patch precedes every launch (a `resume` that went on to the reuse has run it).
-  if (request.resumeError === undefined) runPreLaunchTrustPatch(persona, ref)
-  let answer: SequenceReuseAnswer
-  try {
-    answer = await builder(request)
-  } catch (err) {
-    console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} the reuse builder failed for ${ref}: ${describeThrownValue(err)} — answering failed`)
-    return { key, action: 'failed' }
-  }
-  if (answer.spawned !== undefined) afterLaunchSucceeded(key, false, ref, LAUNCH_VERB_SPAWN, answer.spawned)
-  return answer.result
+  const result = await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead, trustPatchRan })
+  if (!isReuseSpawnCollided(result)) return result
+  console.error(
+    `${LIVE_ROW_SEQUENCE_LOG_PREFIX} the reuse spawn of ${personaRef(persona)} collided with a live row — no further launch, nothing counted; the sequence ends without its launch (b.jg5 SRJ-112, SRJ-705)`,
+  )
+  return { key, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION }
 }
 
 /** What the live-row sequence's dependency builder is given (per-server instances). */
@@ -9418,6 +9697,7 @@ export interface LiveRowSequenceDepsInput {
 const LIVE_ROW_SEQUENCE_ARM_CAUSE_LABELS: { readonly [C in LiveRowSequenceArmCause]: C } = Object.freeze({
   [LIVE_ROW_ARM_NOT_JUDGED]: UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
   [LIVE_ROW_ARM_ENDED]: UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
+  [LIVE_ROW_ARM_REUSE_COLLISION]: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
 })
 
 /**
@@ -9440,9 +9720,10 @@ const LIVE_ROW_SEQUENCE_ARM_CAUSE_LABELS: { readonly [C in LiveRowSequenceArmCau
  *   - the latched query, P's `ad-config-malformed` flag, E6's G accessor
  *     (`adGraceMsInEffect`), the applied `resume_enabled` and the row
  *     comparison (`compareRowToPersona`), the sequence-launch entry
- *     (`launchForLiveRowSequence`) and the retry arm with the sequence's two
- *     causes (`UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED`,
- *     `UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED`).
+ *     (`launchForLiveRowSequence`) and the retry arm with the sequence's
+ *     three causes (`UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED`,
+ *     `UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED`,
+ *     `UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`).
  * Every agent-director call goes through `withOutageDetection` inside those
  * entries. The builder reads nothing and starts nothing when called.
  */

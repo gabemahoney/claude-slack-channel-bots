@@ -142,9 +142,25 @@
  * (`killBackstop`). The UNUSABLE NAME rows: one per fault for each sequence
  * kill and each of those states, refused operation none
  * ({@link SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS},
- * {@link sequenceKillUnusableNameRowsAt}). The stuck-launch abort's kill rows
- * (E29) are still to come, with the reuse rows (E22) and the re-check
- * columns (E30).
+ * {@link sequenceKillUnusableNameRowsAt}).
+ *
+ * The reuse spawn's rows (E22; b.jg5 SRJ-112, SRJ-501, SRJ-507, SRJ-512;
+ * HO rev 15, rev 20): the site kind {@link REUSE_SPAWN_SITE}
+ * (`reuseSpawnForPersona`; {@link REUSE_SPAWN_CONFLICT_CASE_ROWS}), one
+ * CONFLICT row per stub case a spawn can answer, each refusing the reuse
+ * spawn (`REFUSED_OPERATION_REUSE_SPAWN`). A reuse of an id with no row is an
+ * ordinary fresh spawn, which the pre-spawn scan refuses with nothing
+ * written: its rows (`scan-leftover`, and `conflicting-labels` in its scan
+ * form) record no row and carry `noRowWritten`, so a test selects them for
+ * the no-row cases ({@link reuseSpawnScanRows}). A reuse of a finished row
+ * records the state its path last read, `ended`: `no-valid-id`,
+ * `different-id` and `another-store` (each with and without the stub's
+ * "duplicate session" extras, its `plainSpawn` option), `own-id`,
+ * `leftover`, `duplicate-session-leftover`, `conflicting-labels` in its
+ * "duplicate session" form and `unrecognised`. The UNUSABLE NAME rows: one
+ * per fault at the reuse spawn, refused operation none, recording `ended`
+ * ({@link REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS}). The stuck-launch abort's
+ * kill rows (E29) are still to come, with the re-check columns (E30).
  *
  * Other exports (E13 T2):
  *   - {@link expectedConflictNotice}: the expected notice for any case,
@@ -175,7 +191,9 @@
  * kind ({@link UNUSABLE_NAME_SITES}): those E16 T1 wires (`resume`, a plain
  * spawn, the ladder's kill, the ladder's delete, `read-pane`, `status`,
  * `get`), then the dialog approver's `status`, `read-pane` and `send-keys`
- * (E17, {@link APPROVER_SITES}; {@link APPROVER_UNUSABLE_NAME_CASE_ROWS}).
+ * (E17, {@link APPROVER_SITES}; {@link APPROVER_UNUSABLE_NAME_CASE_ROWS}),
+ * and the reuse spawn's (E22, {@link REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS},
+ * recording `ended`, the state its path last read).
  * Columns ({@link UnusableNameCaseRow}):
  *   - `name` (`<site>: <fault>`), `site`, `verb` (the agent-director verb
  *     that answers), `fault`, and `build`, a thunk building the stub's
@@ -515,6 +533,9 @@ export const RESTART_KILL_SITE = 'restart kill'
  */
 export const LADDER_KILL_SITE = 'ladder kill'
 
+/** The reuse spawn as a site kind (`reuseSpawnForPersona`, b.jg5 SRJ-112, SRJ-708; E22). */
+export const REUSE_SPAWN_SITE = 'reuse spawn'
+
 /** The live-row sequence's step-1 kill as a site kind (b.jg5 SRJ-705 step 1, SRJ-110; E21). */
 export const SEQUENCE_STEP1_KILL_SITE = 'sequence step-1 kill'
 
@@ -555,7 +576,7 @@ export type KillSite = typeof RESTART_KILL_SITE | typeof LADDER_KILL_SITE | Sequ
  */
 export type ConflictCaseSite =
   | 'plain spawn'
-  | 'reuse spawn'
+  | typeof REUSE_SPAWN_SITE
   | 'resume'
   | PaneOrKillSite
   | ApproverSite
@@ -612,6 +633,12 @@ export interface ConflictCaseRow {
    * with nothing sent; E19 hatch note).
    */
   readonly killBackstop?: true
+  /**
+   * Set on the reuse spawn's pre-spawn scan rows only: a reuse of an id with
+   * no row is an ordinary fresh spawn, whose scan refused it with nothing
+   * written and no row created (HO rev 15); the latch records no row.
+   */
+  readonly noRowWritten?: true
 }
 
 // ---------------------------------------------------------------------------
@@ -849,8 +876,11 @@ function row(
 
 const plainSpawn = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState, o?: ConflictOptions): ConflictCaseRow =>
   row('plain spawn', REFUSED_OPERATION_PLAIN_SPAWN, SPAWN_VERB, c, l, s, o)
-const reuseSpawn = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState): ConflictCaseRow =>
-  row('reuse spawn', REFUSED_OPERATION_REUSE_SPAWN, SPAWN_VERB, c, l, s)
+const reuseSpawn = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState, o?: ConflictOptions): ConflictCaseRow =>
+  row(REUSE_SPAWN_SITE, REFUSED_OPERATION_REUSE_SPAWN, SPAWN_VERB, c, l, s, o)
+/** The reuse spawn of an id with no row, refused by the pre-spawn scan: no row recorded, none written (HO rev 15). */
+const reuseSpawnScan = (c: ConflictCase, l: ConflictLatchCase, o?: ConflictOptions): ConflictCaseRow =>
+  Object.freeze({ ...reuseSpawn(c, l, LATCH_ROW_STATE_NO_ROW, o), noRowWritten: true as const })
 const resume = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState): ConflictCaseRow =>
   row('resume', REFUSED_OPERATION_RESUME, 'resume', c, l, s)
 const paneOrKill = (
@@ -1048,6 +1078,28 @@ const SEQUENCE_KILL_ROWS: readonly ConflictCaseRow[] = SEQUENCE_KILL_SITES.flatM
   ),
 )
 
+/**
+ * The reuse spawn's CONFLICT rows (E22; b.jg5 SRJ-112, SRJ-501, SRJ-507; HO
+ * rev 15, rev 20): one row per stub case a spawn can answer, each refusing
+ * the reuse spawn. A reuse of an id with no row is an ordinary fresh spawn:
+ * its pre-spawn scan's refusals record no row and are marked `noRowWritten`.
+ * A reuse of a finished row records `ended`, the state its path last read.
+ */
+const REUSE_SPAWN_ROWS: readonly ConflictCaseRow[] = [
+  reuseSpawnScan('scan-leftover', LATCH_CASE_LEFTOVER),
+  reuseSpawnScan('conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, { scan: true }),
+  reuseSpawn('no-valid-id', LATCH_CASE_NO_VALID_ID, ENDED),
+  reuseSpawn('different-id', LATCH_CASE_DIFFERENT_ID, ENDED),
+  reuseSpawn('different-id', LATCH_CASE_DIFFERENT_ID, ENDED, { plainSpawn: true }),
+  reuseSpawn('another-store', LATCH_CASE_ANOTHER_STORE, ENDED),
+  reuseSpawn('another-store', LATCH_CASE_ANOTHER_STORE, ENDED, { plainSpawn: true }),
+  reuseSpawn('own-id', LATCH_CASE_OWN_ID, ENDED),
+  reuseSpawn('leftover', LATCH_CASE_LEFTOVER, ENDED),
+  reuseSpawn('duplicate-session-leftover', LATCH_CASE_LEFTOVER, ENDED),
+  reuseSpawn('conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, ENDED),
+  reuseSpawn('unrecognised', LATCH_CASE_UNRECOGNISED, ENDED),
+]
+
 /** Every CONFLICT latch row, for `test.each`. */
 export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   // A plain spawn: the pre-spawn scan's refusals (nothing written, no row).
@@ -1059,15 +1111,9 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   plainSpawn('different-id', LATCH_CASE_DIFFERENT_ID, ENDED, { plainSpawn: true }),
   plainSpawn('another-store', LATCH_CASE_ANOTHER_STORE, ENDED, { plainSpawn: true }),
   plainSpawn('conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, ENDED),
-  // A spawn with `--reuse-finished` of a finished row, and of an id with no
-  // row (an ordinary fresh spawn, which the pre-spawn scan refuses).
-  reuseSpawn('no-valid-id', LATCH_CASE_NO_VALID_ID, ENDED),
-  reuseSpawn('different-id', LATCH_CASE_DIFFERENT_ID, ENDED),
-  reuseSpawn('another-store', LATCH_CASE_ANOTHER_STORE, ENDED),
-  reuseSpawn('own-id', LATCH_CASE_OWN_ID, ENDED),
-  reuseSpawn('leftover', LATCH_CASE_LEFTOVER, ENDED),
-  reuseSpawn('conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, ENDED),
-  reuseSpawn('scan-leftover', LATCH_CASE_LEFTOVER, LATCH_ROW_STATE_NO_ROW),
+  // A spawn with `--reuse-finished` (E22): of a finished row, and of an id
+  // with no row (an ordinary fresh spawn, which the pre-spawn scan refuses).
+  ...REUSE_SPAWN_ROWS,
   // A `resume` on the finished-row path; unrecognised text where the path
   // could not read the row's state.
   resume('no-valid-id', LATCH_CASE_NO_VALID_ID, ENDED),
@@ -1142,6 +1188,16 @@ export function promptRowPaneConflictRowsAt(site: PromptRowPaneSite, state: stri
   )
 }
 
+/** The reuse spawn's CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E22), for `test.each`. */
+export const REUSE_SPAWN_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
+  CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === REUSE_SPAWN_SITE),
+)
+
+/** The reuse spawn's pre-spawn scan rows (a reuse of an id with no row; `noRowWritten`), for `test.each`. */
+export function reuseSpawnScanRows(): readonly ConflictCaseRow[] {
+  return REUSE_SPAWN_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.noRowWritten === true)
+}
+
 /** The restart path's kill CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E20), for `test.each`. */
 export const RESTART_KILL_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
   CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === RESTART_KILL_SITE),
@@ -1204,6 +1260,7 @@ export type UnusableNameSite =
   | ReconnectSite
   | typeof RESTART_KILL_SITE
   | SequenceKillSite
+  | typeof REUSE_SPAWN_SITE
 
 /** The agent-director verb each site kind calls. */
 const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Object.freeze({
@@ -1219,6 +1276,7 @@ const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Obje
   [RESTART_KILL_SITE]: 'kill',
   [SEQUENCE_STEP1_KILL_SITE]: 'kill',
   [SEQUENCE_STEP4_KILL_SITE]: 'kill',
+  [REUSE_SPAWN_SITE]: SPAWN_VERB,
 })
 
 /** Every site kind of {@link UnusableNameSite}, in row order. */
@@ -1277,6 +1335,9 @@ const UNUSABLE_NAME_LAST_READ: Readonly<Record<Exclude<UnusableNameSite, Reconne
   // The restart path's kill records the state its run's `dead` reading
   // carries (b.jg5 SRJ-501), with no latch-time `status` read: `ended` here.
   [RESTART_KILL_SITE]: ENDED,
+  // The reuse spawn records the state its path last read (b.jg5 SRJ-501),
+  // with no latch-time `status` read: `ended` here, a finished row.
+  [REUSE_SPAWN_SITE]: ENDED,
 })
 
 function unusableNameRow(
@@ -1353,6 +1414,11 @@ export const LADDER_KILL_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[]
 /** The live-row sequence's kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E21), for `test.each`. */
 export const SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => isSequenceKillSite(caseRow.site)),
+)
+
+/** The reuse spawn's UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E22), for `test.each`. */
+export const REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
+  UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => caseRow.site === REUSE_SPAWN_SITE),
 )
 
 /** The sequence kill UNUSABLE NAME rows of one site kind whose sequence last read `lastRead`, for `test.each`. */

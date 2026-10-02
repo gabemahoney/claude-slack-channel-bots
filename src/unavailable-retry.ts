@@ -169,7 +169,13 @@
  * persona held off on its `tmux-unavailable` outage that the tick does not
  * find healthy, with no timer armed, is armed with
  * `UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT` (a retry that stopped as not up, on
- * a declined launch or on a failed run leaves the flag raised).
+ * a declined launch or on a failed run leaves the flag raised). A fourth is
+ * the outage state's launch-failure arm (`armPendingOnlyAfterLaunchFailure`,
+ * `src/outage-state.ts`): inside a launch or recovery attempt for the
+ * persona, a reuse's or a sequence `resume`'s `ErrTmuxSessionCreate` arms
+ * its timer at once in pending-only mode through the sink's optional
+ * `armPendingOnly` (b.jg5 SRJ-112, SRJ-113, SRJ-301, SRJ-409). It records
+ * no attempt error, so the counted launch failure stays counted.
  *
  * The retry action (b.jg5 SRJ-303, SRJ-305). The server's action is
  * `createFullModeRetryAction(deps)`, for both modes: at each retry, before
@@ -368,12 +374,22 @@ export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED = 'sequence-not-judged'
  * any other reason (b.jg5 SRJ-705, SRJ-301): a failed `get`, a refused run,
  * a kill's abort that did not latch the persona, step 5 (with or without its
  * alert), no kill under the `ad-config-malformed` rule, a launch not made, or
- * a final launch that failed (an `ErrTmuxSessionCreate` from its `resume` or
- * reuse included; SRJ-112, SRJ-113) or threw. A stop for a latch, a teardown
- * or shutdown, and a launch that latched the persona or stops the server, arm
- * nothing. Never counted.
+ * a final launch that failed or threw. A stop for a latch, a teardown or
+ * shutdown, a launch that latched the persona or stops the server, a reuse
+ * collision (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`) and a final launch
+ * whose `ErrTmuxSessionCreate` armed the timer in pending-only mode
+ * (`armPendingOnly`; SRJ-112, SRJ-113, SRJ-409) arm nothing with it. Never
+ * counted.
  */
 export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED = 'sequence-ended-without-launch'
+
+/**
+ * The cause of a reuse spawn's collision (`ErrInstanceIdCollision`, b.jg5
+ * SRJ-112, SRJ-301): the row is live, so the reuse launched nothing. Armed
+ * when a collision at the live-row sequence's final launch ends the sequence
+ * without its launch (SRJ-705, SRJ-706). Never counted.
+ */
+export const UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION = 'reuse-collision'
 
 // ---------------------------------------------------------------------------
 // Modes (b.jg5 SRJ-301, SRJ-303)
@@ -728,6 +744,15 @@ export interface UnavailableRetryView {
  */
 export interface UnavailableRetryTriggerSink {
   arm(key: string, cause: UnavailableRetryCause): boolean
+  /**
+   * Arm persona `key`'s timer in pending-only mode with the `pending-row`
+   * cause (the controller's `armPendingOnly`). The outage state's
+   * launch-failure arm (`armPendingOnlyAfterLaunchFailure`) calls it for a
+   * launch's `ErrTmuxSessionCreate` (b.jg5 SRJ-112, SRJ-113, SRJ-301,
+   * SRJ-409). Optional: a sink without it arms nothing that way. Must not
+   * throw; a throw counts as not armed.
+   */
+  armPendingOnly?(key: string): void
 }
 
 /** The per-persona UNAVAILABLE retry timers of one server. */

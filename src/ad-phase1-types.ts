@@ -1,9 +1,10 @@
 /**
  * ad-phase1-types.ts — CSCB-side declarations of the Phase 1 agent-director
- * result fields the branch's 0.10.0 client does not declare (b.jg5 SRJ-1303).
+ * result and parameter fields the branch's 0.10.0 client does not declare
+ * (b.jg5 SRJ-1303).
  *
  * Type-only: this module has no runtime code and imports nothing but the
- * 0.10.0 client's own result types, as types. None of it is imported from
+ * 0.10.0 client's own result and parameter types, as types. None of it is imported from
  * `agent-director`, whose 0.10.0 client lacks these fields. The test stub
  * (`tests/test-helpers/agent-director-stub.ts`) types its canned results with
  * the declarations here; later Epics' readers of these fields (E14, E17, E20,
@@ -24,6 +25,12 @@
  *   - `pre_trust` on a spawn (plain or reuse) or `resume` result: `ok`,
  *     `skipped` or `failed`, which CSCB only logs. Absent from a result of a
  *     binary older than Phase 1 (b.jg5 SRJ-413).
+ *   - `reuse_finished` on a spawn's parameters: the reuse spawn's flag (b.jg5
+ *     SRJ-112, SRJ-708). The 0.10.0 client's parameter type does not declare
+ *     it and its flag builder does not emit it, so a spawn made through the
+ *     0.10.0 client never carries `--reuse-finished`; the test stub records
+ *     the parameters as given. The Phase 1 client's own field replaces this
+ *     declaration (b.jg5 E37) and must map to `--reuse-finished`.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -34,6 +41,7 @@ import type {
   ListResult,
   ListRow,
   ResumeResult,
+  SpawnParams,
   SpawnResult,
   StatusResult,
 } from 'agent-director'
@@ -100,4 +108,20 @@ export interface Phase1SpawnResult extends SpawnResult {
 /** A `resume` result. `pre_trust` is absent from a binary older than Phase 1. */
 export interface Phase1ResumeResult extends ResumeResult {
   pre_trust?: PreTrust
+}
+
+// ---------------------------------------------------------------------------
+// Parameters carrying the Phase 1 fields
+// ---------------------------------------------------------------------------
+
+/**
+ * A spawn's parameters with the reuse flag (b.jg5 SRJ-112, SRJ-708).
+ * `reuse_finished: true` asks agent-director to spawn the same fixed id over
+ * its finished row, resetting that row for a new life and keeping it as an
+ * earlier life, instead of answering `ErrInstanceIdCollision`; for an id with
+ * no row it is an ordinary fresh spawn. Absent on every plain spawn. The
+ * 0.10.0 client neither declares nor emits it.
+ */
+export interface Phase1SpawnParams extends SpawnParams {
+  reuse_finished?: boolean
 }

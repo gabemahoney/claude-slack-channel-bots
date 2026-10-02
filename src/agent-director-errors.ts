@@ -184,6 +184,14 @@ export const ERR_JSONL_MISSING_NAME = 'ErrJsonlMissing'
 export const ERR_JSONL_NEVER_WRITTEN_NAME = 'ErrJsonlNeverWritten'
 export const ERR_SPAWN_NOT_RESUMABLE_NAME = 'ErrSpawnNotResumable'
 
+/**
+ * `errName` of the error agent-director answers when a spawn names an id
+ * whose row is live (a reuse spawn's collision, b.jg5 SRJ-112). Every client
+ * declares its class; the name is kept here for the reuse spawn, which tells
+ * it apart by name (`hasAdErrorName`).
+ */
+export const ERR_INSTANCE_ID_COLLISION_NAME = 'ErrInstanceIdCollision'
+
 /** The three store-open error names, in one list. */
 export const STORE_OPEN_ERR_NAMES = [
   ERR_SCHEMA_MISMATCH_NAME,

@@ -18,6 +18,10 @@
  *   `check_permission` row (b.jg5 SRJ-603, SRJ-604, SRJ-606), inside its
  *   recovery attempt, and at the one-line `read-pane` of the `ask_user` row
  *   a launch meets (b.jg5 SRJ-607), inside the launch, with nothing counted;
+ *   each UNAVAILABLE answer of the reuse spawn (unresponsive, still stopping,
+ *   still starting) at the live-row sequence's final launch, inside the
+ *   sequence's recovery attempt, counting nothing and posting nothing before
+ *   the next health tick (b.jg5 SRJ-105, SRJ-112, SRJ-707);
  *   and a wrapped `read-pane` inside a recovery attempt; nothing else (the
  *   kill-failure cause, read and sweep
  *   errors inside an attempt, kills not of a row read live, calls outside
@@ -26,6 +30,8 @@
  * - Held apart from the outages: no flag raised or cleared, no onset or
  *   all-clear, and an outage's own all-clear neither held back nor joined.
  * - What ends it: a tmux-touching success or GONE, in any context (a later
+ *   launch's spawn and the live-row sequence's final reuse spawn among them,
+ *   each with the pending reading; a later
  *   restart run's `read-pane` of a live `working`, `waiting` or
  *   `check_permission` row answering a pane or GONE among them, with the
  *   recovery post only after an onset),
@@ -120,7 +126,7 @@ import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
 import { _resetHealthCheckState, _runHealthCheckTickForTest, initHealthCheck, type HealthCheckDeps } from '../src/health-check.ts'
-import { LIVENESS_LIVE, LIVENESS_READING_DEAD, LIVENESS_READING_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
+import { LIVENESS_DEAD_ROW_ENDED, LIVENESS_LIVE, LIVENESS_READING_DEAD, LIVENESS_READING_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
 import {
   ALL_CLEAR_TEMPLATE,
   getOutageFlags,
@@ -169,6 +175,7 @@ import {
   cannedKillResult,
   cannedListRow,
   cannedOk,
+  cannedGetResult,
   cannedStatusResult,
   errCallTimeout,
   errInstanceIdCollision,
@@ -183,7 +190,7 @@ import {
   holdSpawns,
   unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
-import { LIVE_ROW_SEQUENCE_ENTRY_GET } from '../src/live-row-sequence.ts'
+import { LIVE_ROW_OUTCOME_LAUNCHED, LIVE_ROW_SEQUENCE_ENTRY_GET } from '../src/live-row-sequence.ts'
 import type { AdConfigTables } from './test-helpers/ad-settings.ts'
 import { APPROVER_VERB_CALLS, conflictForPersona, conflictNoticeForPersona } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
@@ -449,6 +456,33 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expect(getFailureCount(p)).toBe(0)
     expectNeverStarted(h, b)
     expectNoPostYet(h)
+  })
+
+  // b.jg5 SRJ-105, SRJ-112, SRJ-707's Test line: the reuse spawn is a
+  // tmux-touching verb. Reached through the live-row sequence's final launch,
+  // entered at its step-2 `get` so no kill comes before it, its UNAVAILABLE
+  // answer starts P's condition inside the sequence's recovery attempt; the
+  // refusal posts nothing itself and counts nothing, and the onset comes only
+  // at the next health tick that started after it.
+  test.each(unavailableForms('ErrTmuxUnresponsive', 'ErrTmuxUnresponsive, still stopping', 'ErrTmuxUnresponsive, still starting'))('%s answering the reuse spawn at the live-row sequence’s final launch starts P’s condition at that time, counting nothing; nothing is posted before the next health tick, whose onset check posts the onset; B’s never starts', async (_what, make) => {
+    const { h, p, b } = build(TICK_MODE)
+    h.script({ getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, personaOf(h, p), h.home), spawnError: make('spawn') })
+    const at = h.clock.now()
+
+    const outcome = await h.runSequence(p, { lastReadState: cannedStatusResult().state, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: p, action: 'failed', refused: true } })
+    expectHolds(h, p, 'spawn', at)
+    expect([h.reuseSpawns().length, h.stub.calls.killCalls.length, getFailureCount(p)]).toEqual([1, 0, 0])
+    // A tick started at the refusal's own time posts no onset.
+    h.tickOnset(at)
+    expectNoPostYet(h)
+
+    await h.advance(tickMs(h))
+    tick(h)
+
+    expectPosts(h, [onset(p)])
+    expectNeverStarted(h, b)
   })
 
   // b.jg5 SRJ-307, SRJ-704, SRJ-1011: ErrTmuxKillFailed goes to the
@@ -926,6 +960,27 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
     await h.advance(halfFirstWaitMs())
     await h.launch(p)
 
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(h.conditionEnds).toEqual([{ key: p, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'kept' }])
+    expect(h.controller.isArmed(p)).toBe(true)
+    expectNeverStarted(h, b)
+    expectNoPostYet(h)
+  })
+
+  // b.jg5 SRJ-112, SRJ-310: the reuse spawn's success at the live-row
+  // sequence's final launch, entered at its step-2 `get` so no kill comes
+  // before it, is the first tmux-touching success: it ends the condition with
+  // the pending reading, as a launch's spawn does.
+  test('the live-row sequence’s final reuse spawn succeeding ends it with the pending reading, and the retry timer is kept', async () => {
+    const { h, p, b } = build()
+    await refuse(h, p)
+
+    await h.advance(halfFirstWaitMs())
+    h.script({ getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, personaOf(h, p), h.home) })
+    const outcome = await h.runSequence(p, { lastReadState: cannedStatusResult().state, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: p, action: 'spawned' } })
+    expect(h.reuseSpawns()).toHaveLength(1)
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(h.conditionEnds).toEqual([{ key: p, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'kept' }])
     expect(h.controller.isArmed(p)).toBe(true)

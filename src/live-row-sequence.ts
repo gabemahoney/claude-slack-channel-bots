@@ -30,11 +30,14 @@
  *      alert, and the sequence ends without its launch.
  *   6. the launch, for a request that ends in one: a `resume` when the row
  *      has a session id and P keeps its conversation, otherwise a reuse spawn
- *      of the same id (`decideLiveRowLaunchKind`). A launch whose result is
- *      no success (`liveRowLaunchSucceeded`: `failed`, `deferred`, `latched`)
- *      or that throws ends the sequence without its launch, with no further
- *      call: no delete, no kill and no fresh spawn. The no-launch form (an
- *      old-life wait) ends as "row finished".
+ *      of the same id (`decideLiveRowLaunchKind`), made through the session
+ *      manager's sequence-launch entry, whose reuse is the session manager's
+ *      one reuse spawn (SRJ-112). A launch whose result is no success
+ *      (`liveRowLaunchSucceeded`: `failed`, `deferred`, `latched`), a reuse
+ *      that collided with a live row (not launched, `reuse-collision`) or a
+ *      launch that throws ends the sequence without its launch, with no
+ *      further call: no delete, no kill and no fresh spawn. The no-launch
+ *      form (an old-life wait) ends as "row finished".
  * At most 4 runs and 2 kills (each with its tries) per sequence.
  *
  * What a step may do (SRJ-706): before every agent-director call the
@@ -60,13 +63,16 @@
  *
  * Every end without the launch arms P's retry timer through the injected arm
  * (SRJ-301): with the not-judged cause after SRJ-717's stop, with the
- * other-end cause otherwise, a step-6 launch that failed or threw included
- * (an `ErrTmuxSessionCreate` from a `resume` or reuse among them; SRJ-112,
- * SRJ-113), whether or not the launch's own refusal handling armed it too; a
+ * reuse-collision cause after a reuse collision at step 6 (SRJ-112, SRJ-705),
+ * with the other-end cause otherwise, a step-6 launch that failed or threw
+ * included, whether or not the launch's own refusal handling armed it too; a
  * stop for a latch, a teardown, shutdown or a persona that is not up, an
  * abort that latched P, an abort whose version re-check stops the server, a
- * launch that latched P or whose version re-check stops the server, and the
- * no-launch form arm nothing. Nothing here counts a failure.
+ * launch that latched P or whose version re-check stops the server, a
+ * launch whose `ErrTmuxSessionCreate` armed the timer in pending-only mode
+ * itself (SRJ-112, SRJ-113, SRJ-409), and the no-launch form arm nothing
+ * here. Nothing here counts a failure: the session manager's
+ * sequence-launch entry counts its launch's result once.
  *
  * It runs in the background, through injected dependencies only
  * (`LiveRowSequenceDeps`): every agent-director call, the latch, the alert,
@@ -347,10 +353,20 @@ export interface LiveRowSequenceLaunchResult {
   readonly action: string
   readonly refused?: true
   readonly stopping?: true
+  /**
+   * The launch's `ErrTmuxSessionCreate` armed P's retry timer at once in
+   * pending-only mode (SRJ-112, SRJ-113, SRJ-409): the sequence arms no
+   * cause of its own after it.
+   */
+  readonly pendingOnlyArmed?: true
 }
 
-/** Not launched: no reuse builder is installed, so the reuse was not made. */
-export const LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER = 'no-reuse-builder'
+/**
+ * Not launched: the reuse spawn answered `ErrInstanceIdCollision`, so the row
+ * is live and nothing was launched (SRJ-112, SRJ-705). Nothing is counted;
+ * the end arms the reuse-collision cause.
+ */
+export const LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION = 'reuse-collision'
 /** Not launched: the `resume` answered `ErrSpawnNotResumable` (SRJ-710: no second sequence). */
 export const LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE = 'not-resumable'
 /** Not launched: P is not in the applied configuration. */
@@ -364,7 +380,7 @@ export const LIVE_ROW_NOT_LAUNCHED_STOPPED = 'stopped'
 
 /** Why step 6 made no launch. */
 export type LiveRowSequenceNotLaunchedReason =
-  | typeof LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER
+  | typeof LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION
   | typeof LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE
   | typeof LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED
   | typeof LIVE_ROW_NOT_LAUNCHED_STOPPED
@@ -467,9 +483,19 @@ export const LIVE_ROW_ARM_NOT_JUDGED = 'sequence-not-judged'
  * (`UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED`), as for the not-judged cause.
  */
 export const LIVE_ROW_ARM_ENDED = 'sequence-ended-without-launch'
+/**
+ * Arm P's retry timer with the reuse-collision cause (SRJ-112, SRJ-301): a
+ * reuse collision at step 6 ended the sequence without its launch. The same
+ * string as the retry controller's cause label for it
+ * (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`), as for the other causes.
+ */
+export const LIVE_ROW_ARM_REUSE_COLLISION = 'reuse-collision'
 
 /** Which retry cause an end arms with; the dependency builder maps it to the retry controller's label, the same string. */
-export type LiveRowSequenceArmCause = typeof LIVE_ROW_ARM_NOT_JUDGED | typeof LIVE_ROW_ARM_ENDED
+export type LiveRowSequenceArmCause =
+  | typeof LIVE_ROW_ARM_NOT_JUDGED
+  | typeof LIVE_ROW_ARM_ENDED
+  | typeof LIVE_ROW_ARM_REUSE_COLLISION
 
 /** What every outcome carries: the counts, and the cause it armed (absent when it armed nothing). */
 interface OutcomeCounts {
@@ -827,10 +853,17 @@ function describeOutcome(outcome: LiveRowSequenceOutcome): string {
 
 /**
  * The end line, one per sequence:
- *   `[slack] live-row-sequence: <ref>: <outcome> — runs=<n> kills=<n> judged=<n>; <retry timer armed with <cause> | no retry timer armed> (b.jg5 SRJ-705, SRJ-717, SRJ-301)`
+ *   `[slack] live-row-sequence: <ref>: <outcome> — runs=<n> kills=<n> judged=<n>; <the retry timer armed (<cause>) | the retry timer armed by the launch (pending-only) | no retry timer armed> (b.jg5 SRJ-705, SRJ-717, SRJ-301)`
+ * The middle form is a step-6 launch whose `ErrTmuxSessionCreate` armed the
+ * timer in pending-only mode itself (SRJ-112, SRJ-113, SRJ-409).
  */
 export function liveRowSequenceEndLine(ref: string, outcome: LiveRowSequenceOutcome): string {
-  const armed = outcome.armed === undefined ? 'no retry timer armed' : `the retry timer armed (${outcome.armed})`
+  const armed =
+    outcome.armed !== undefined
+      ? `the retry timer armed (${outcome.armed})`
+      : outcome.kind === LIVE_ROW_OUTCOME_LAUNCHED && outcome.result.pendingOnlyArmed === true
+        ? 'the retry timer armed by the launch (pending-only)'
+        : 'no retry timer armed'
   return `${head(ref)}: ${describeOutcome(outcome)} — runs=${outcome.runs} kills=${outcome.kills} judged=${outcome.judgedRuns}; ${armed} (b.jg5 SRJ-705, SRJ-717, SRJ-301)`
 }
 
@@ -976,9 +1009,13 @@ export async function runLiveRowSequence(
   /**
    * The retry cause an end arms with (SRJ-301, SRJ-717), or none. A step-6
    * launch whose result is no success ends without the launch and arms with
-   * the other-end cause (SRJ-301, SRJ-112, SRJ-113), unless P latched or the
-   * result says the server is stopping; an arm the launch's own refusal
-   * handling made already keeps its due time.
+   * the other-end cause (SRJ-301, SRJ-112, SRJ-113), unless P latched, the
+   * result says the server is stopping, or the launch's
+   * `ErrTmuxSessionCreate` armed the timer in pending-only mode itself
+   * (SRJ-112, SRJ-113, SRJ-409: pending-only unless another cause holds); an
+   * arm the launch's own refusal handling made already keeps its due time. A
+   * reuse collision at step 6 arms the reuse-collision cause (SRJ-112,
+   * SRJ-705).
    */
   const armCauseFor = (body: OutcomeBody): LiveRowSequenceArmCause | undefined => {
     if (!request.launches) return undefined
@@ -988,6 +1025,12 @@ export async function runLiveRowSequence(
       case LIVE_ROW_OUTCOME_LAUNCHED:
         if (liveRowLaunchSucceeded(body.result)) return undefined
         if (body.result.action === LIVE_ROW_LAUNCH_RESULT_LATCHED || body.result.stopping === true) return undefined
+        if (body.result.pendingOnlyArmed === true) return undefined
+        break
+      case LIVE_ROW_OUTCOME_NOT_LAUNCHED:
+        if (body.notLaunched === LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION) {
+          return latchedNow() ? undefined : LIVE_ROW_ARM_REUSE_COLLISION
+        }
         break
       case LIVE_ROW_OUTCOME_ROW_FINISHED:
       case LIVE_ROW_OUTCOME_STOPPED:

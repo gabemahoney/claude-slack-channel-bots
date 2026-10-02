@@ -1550,7 +1550,7 @@ describe('b.jg5 SRJ-706, SRJ-1011: a message lost while P\'s live-row sequence r
     const h = makeRecovery()
     const [key] = h.keys as [string]
     h.script({ getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, personaOf(h, key), h.home) })
-    const reuse = holdSequenceReuse(h)
+    const reuse = holdSequenceReuse(h, key)
     const run = h.startSequence(key, { lastReadState: cannedStatusResult().state })
     await h.driveSequence(reuse.entered)
     expect(isLaunchInFlight(key)).toBe(true)

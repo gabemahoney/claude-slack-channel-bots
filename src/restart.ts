@@ -1073,24 +1073,60 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     return RESTART_OUTCOME_LAUNCHED
   }
 
-  // Launch failed — increment the failure counter (SINGLE COUNTING SITE:
-  // SR-25.1; counting happens only here at the launchSession boolean).
-  recordFailure(key)
-  console.error(`[slack] Session relaunch failed for persona=${key}`)
+  // Launch failed — increment the failure counter (SR-25.1; the restart
+  // work's launchSession boolean, and a launch whose result does not come
+  // back through it, `recordLaunchResultOutsideRestartWork`, each count their
+  // own launch once).
+  return countLaunchFailure(d, key, `[slack] Session relaunch failed for persona=${key}`)
+}
 
+/**
+ * Count one launch failure for persona `key` (SR-25.1): record it, log
+ * `failedLine`, and, once per episode when the count reaches the cap, notify
+ * through `d.onCapReached` (no further timer is scheduled: the persona is
+ * capped, and the tick guard, `isAtCap` in health-check.ts, keeps later
+ * ticks from re-scheduling it, SR-25.3/25.4). Answers whether the persona is
+ * now at the cap.
+ */
+function countLaunchFailure(
+  d: Pick<RestartDeps, 'onCapReached'> | null,
+  key: string,
+  failedLine: string,
+): typeof RESTART_OUTCOME_CAPPED | typeof RESTART_OUTCOME_COUNTED_FAILURE {
+  recordFailure(key)
+  console.error(failedLine)
   // Once-per-episode cap notification: fires exactly once when the failure
   // count reaches RESTART_FAILURE_CAP. Subsequent calls return false (latched).
   if (shouldNotifyCap(key, RESTART_FAILURE_CAP)) {
     console.error(`[slack] Cap reached for persona=${key} — notifying and stopping restarts`)
-    d.onCapReached(key)
-    // Do NOT schedule another timer — the persona is capped. The
-    // activeLaunches entry is removed in the caller's finally block.
-    // The tick guard (isAtCap in health-check.ts) prevents future ticks
-    // from re-scheduling while capped (SR-25.3/25.4).
+    d?.onCapReached(key)
     return RESTART_OUTCOME_CAPPED
   }
   // A failure past the cap (its notice already sent this episode) is capped too.
   return isAtCap(key, RESTART_FAILURE_CAP) ? RESTART_OUTCOME_CAPPED : RESTART_OUTCOME_COUNTED_FAILURE
+}
+
+/**
+ * Record the result of a launch for persona `key` whose result does not come
+ * back through the restart work's `launchSession` (the live-row sequence's
+ * final launch, `launchForLiveRowSequence` in `src/session-manager.ts`; b.jg5
+ * SRJ-112, SRJ-113, SRJ-602), as the restart work records its own launch's:
+ * a success (`launched` true) resets the persona's failure count and cap
+ * latch; a counted failure is recorded, with the cap notice through the
+ * installed restart dependencies' `onCapReached` once per episode (none when
+ * `initRestart` has not run). The caller decides which results count (a
+ * refused, stopping, latched or deferred launch records nothing). Answers
+ * `launched`, `counted-failure` or `capped`.
+ */
+export function recordLaunchResultOutsideRestartWork(
+  key: string,
+  launched: boolean,
+): typeof RESTART_OUTCOME_LAUNCHED | typeof RESTART_OUTCOME_CAPPED | typeof RESTART_OUTCOME_COUNTED_FAILURE {
+  if (launched) {
+    recordSuccess(key)
+    return RESTART_OUTCOME_LAUNCHED
+  }
+  return countLaunchFailure(deps, key, `[slack] Launch failed for persona=${key} — counted (b.jg5 SRJ-112, SRJ-113, SRJ-602)`)
 }
 
 /**
