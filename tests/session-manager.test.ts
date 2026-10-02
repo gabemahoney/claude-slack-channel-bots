@@ -776,6 +776,7 @@ import {
   type LaunchStartCaseRowOf,
   type LaunchStartNonLatchingRowOf,
   type LaunchStartReadShape,
+  type ReconnectLastRead,
   type UnusableNameCaseRow,
   type UnusableNameSite,
 } from './test-helpers/conflict-cases.ts'
@@ -8366,6 +8367,97 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
     expect(failed).toHaveLength(row.pane instanceof Error ? 1 : 0)
     for (const line of failed) expect(line).toEndWith(`${paneReadClassOpening(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b)`)
     assertNoLeak({ errLog })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-613 (AC 44), the launch wait's half: with no session of the
+// row's current launch there and exactly one leftover of the persona,
+// agent-director's `read-pane` answers the leftover's pane, so the wait acts
+// on no pane alone. A launch of P meets its colliding `working` row and
+// waits; the wait reads an idle pane and reaches its reconnect, either by the
+// positive-idle rule (the pane and the completed transcript unchanged across
+// `STALE_WORKING_WINDOW_MS`) or by a later poll reading `waiting`. The
+// reconnect's one `send-keys` answers CONFLICT "not this launch's session"
+// (the case table's reconnect row marked `leftoverOfEarlierLaunch` for the
+// state the wait last read): nothing typed, P latched once with that state,
+// one post, the wait reads and types nothing more, the launch answers
+// latched (`launchSession` 'skipped'), with no resume, kill, delete or
+// counted failure. On `makeRecoveryHarness` (its latch composed as `main()`
+// composes it); the wait's clock (`useFakeNow`) moves at each status poll,
+// and `srj105AfterEach` runs `assertNoLeak` over every line, notice and
+// startup-errors entry the harness captured. T1's per-cell CONFLICT cases
+// (the ladder's branches, over every reconnect row) are the cells' evidence.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-613: the launch wait for a working row acts on no pane alone; its reconnect\'s send-keys is the backstop (AC 44)', () => {
+  afterEach(srj105AfterEach)
+
+  /** How far the wait's clock moves at each status poll: the positive-idle window is held after a few polls. */
+  const POLL_STEP_MS = STALE_WORKING_WINDOW_MS / 6
+
+  /**
+   * How the wait reaches its reconnect after reading an idle pane: its name,
+   * the state the wait last reads (the backstop row's), and the `status`
+   * answers that take it there.
+   */
+  const ROUTES: ReadonlyArray<readonly [string, ReconnectLastRead, (lastRead: ReconnectLastRead) => RecoveryStubScript]> = [
+    ['the positive-idle rule shows the row stale from an idle pane', 'working', (lastRead) => ({ statusResult: cannedStatusResult({ state: lastRead }) })],
+    [
+      'a poll reads the row waiting after a poll read the row working and its pane idle',
+      'waiting',
+      (lastRead) => ({ statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))], statusResult: cannedStatusResult({ state: lastRead }) }),
+    ],
+  ]
+
+  /** Where P's launch comes from, and what it answers once the backstop latched P. */
+  const ENTRIES: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => Promise<unknown>, (p: string) => unknown]> = [
+    ['the start pass (spawnForPersona)', (h, p) => h.launch(p), (p) => ({ key: p, action: 'latched' })],
+    ['the restart path (launchSession)', (h, p) => launchSession(p, h.config), () => 'skipped'],
+  ]
+
+  const CASES = ROUTES.flatMap(([route, lastRead, statuses]) =>
+    reconnectConflictRowsAt(lastRead)
+      .filter((row) => row.leftoverOfEarlierLaunch === true)
+      .flatMap((row) => ENTRIES.map(([entry, run, answer]) => [route, row.name, entry, lastRead, statuses, run, answer, row] as const)),
+  )
+
+  test.each(CASES)('%s; the reconnect\'s send-keys answering %s; P launched by %s → the launch answers latched with nothing typed: the pane read came first and the one refused send-keys was the last call; P latched once with the state the wait last read and one CONFLICT notice posted; no resume, kill, delete or second send-keys; nothing counted, posted as a failure or recorded; then no launch path reaches agent-director', async (_route, _row, _entry, lastRead, statuses, run, answer, row) => {
+    const { h, p, b } = srj105Build()
+    fastPolls(h)
+    const clock = useFakeNow()
+    const persona = harnessPersona(h, p)
+    const script: RecoveryStubScript = {
+      ...collided(h, persona, { state: 'working', ...transcriptOf().fields }),
+      ...statuses(lastRead),
+      readPaneResults: [{ pane: IDLE_PANE }],
+      sendKeysError: row.build(),
+    }
+    h.script(script)
+    // Each status poll moves the wait's clock first, as `installWorkingRow` does.
+    const client = h.stub.client as unknown as { status: (params: import('agent-director').StatusParams) => Promise<unknown> }
+    const status = client.status.bind(client)
+    client.status = async (params) => {
+      await clock.advance(POLL_STEP_MS)
+      return status(params)
+    }
+    const order = recordCallOrder(h)
+
+    expect(await run(h, p)).toStrictEqual(answer(p))
+
+    // The wait read P's own pane before it typed, and read or typed nothing after the refused send-keys.
+    expect(h.stub.calls.readPaneCalls.length).toBeGreaterThan(0)
+    expect(h.stub.calls.readPaneCalls).toEqual(h.stub.calls.readPaneCalls.map(() => paneReadOf(p)))
+    expect(order.indexOf('readPane')).toBeLessThan(order.indexOf('sendKeys'))
+    expect(order.at(-1)).toBe('sendKeys')
+    expect(h.stub.calls.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([[personaInstanceId(p), RECONNECT_TEXT]])
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
+    const latched = reconnectConflictLatch(p, row)
+    expectLatchedOnce(h, p, latched)
+    expect(latched.lines(h, p)[0]).toContain(RECONNECT_NOT_THIS_LAUNCH_NOTE)
+    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
+
+    await expectLaunchedByNoPath(h, p, b, script)
   })
 })
 

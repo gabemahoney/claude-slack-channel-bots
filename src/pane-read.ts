@@ -10,10 +10,29 @@
  * label marks with the leftover's token. CSCB never reads or sets that label.
  * With neither there the answer is GONE (`ErrTmuxCaptureFailed`); when the
  * worker's pane is not found, the one leftover has no pane carrying its
- * token, or several leftovers run, it is CONFLICT. So a pane never proves on
- * its own that the worker's own session is there (b.jg5 SRJ-613): a pane
- * leads at most to a deferral, a positive-idle fold, Enter or no action, and
- * the later `send-keys` or `kill` is the backstop.
+ * token, or several leftovers run, it is CONFLICT.
+ *
+ * A pane may be a single leftover's: it never proves on its own that the
+ * worker's own session is there (b.jg5 SRJ-117, SRJ-613), and no site acts
+ * on a pane alone. A pane leads at most to a deferral (b.jdc's reconnect
+ * verdict), no action (b.jdc's ladder action), a positive-idle fold that
+ * also needs the transcript (the working-row verdict and the launch wait's
+ * evidence read), the reconnect (the waiting-row check) or Enter (the dialog
+ * approver). The backstop is the `send-keys` that follows, which
+ * agent-director answers by the row's current launch and which types nothing
+ * when it refuses:
+ *   - the reconnect's `/mcp reconnect` (`reconnectMcpWithCause`) on a live
+ *     row that is not `pending` answers CONFLICT "not this launch's
+ *     session": nothing is typed, CSCB latches P (b.jg5 SRJ-501) and posts
+ *     its CONFLICT notice once (SRJ-508), and the refused `send-keys` is
+ *     never retried (SRJ-118, SRJ-505);
+ *   - the approver's Enter on a `pending` row answers
+ *     `ErrSpawnNotInteractive`: the approver stops with nothing typed, no
+ *     kill and one log line (b.jg5 SRJ-404).
+ * A pane that leads to a deferral or to no action is followed by no
+ * keystroke at all; once a later tick reads the row `waiting`, or shows a
+ * `working` row stale, the reconnect's `send-keys` is the backstop again.
+ * Each site's own comment names its backstop.
  *
  * The users of {@link PaneReadOutcome} are the shared reader
  * `readPersonaOwnPane` in `src/session-manager.ts` and, through it, the
@@ -95,10 +114,11 @@ export const FULL_PANE_READ_LINES = 40
  * Trailing pane lines a one-line probe asks for (b.jg5 SRJ-117's `n_lines`
  * at b.jdc's reconnect verdict, `promptRowReconnectVerdict` in
  * `src/server.ts`, and b.jdc's ladder action, `launchOnPromptRow`; SRJ-606,
- * SRJ-607). These read whether a pane of the row's launch is there, not what
- * it shows. SRJ-117's table gives the same count to the latch re-check probe
- * (SRJ-505) and the CLI precheck (SRJ-901); neither reads a pane through this
- * module today.
+ * SRJ-607). These read whether agent-director answers a pane at all, not what
+ * it shows; the pane may be a single leftover's (b.jg5 SRJ-613), so its
+ * answer is no proof that the worker's own session is there. SRJ-117's
+ * table gives the same count to the latch re-check probe (SRJ-505) and the
+ * CLI precheck (SRJ-901); neither reads a pane through this module today.
  */
 export const PROBE_PANE_READ_LINES = 1
 
@@ -146,7 +166,12 @@ export type PaneReadFailureKind = (typeof PANE_READ_FAILURE_KINDS)[number]
 // Outcomes
 // ---------------------------------------------------------------------------
 
-/** The read answered a pane (its text). Never proof on its own (b.jg5 SRJ-613). */
+/**
+ * The read answered a pane (its text). It may be a single leftover's, so it
+ * is never proof on its own that the worker's own session is there (b.jg5
+ * SRJ-613); the `send-keys` that follows it is the backstop (see the module
+ * comment).
+ */
 export interface PaneReadPane {
   readonly kind: typeof PANE_READ_PANE
   readonly pane: string

@@ -476,7 +476,7 @@ The pure mapper `paneReadFailureOf(value)` gives a thrown value exactly one fail
 
 | Outcome (`kind`) | Answers | What it means to a caller |
 |---|---|---|
-| `pane` | a pane | Evidence about a screen only (b.jg5 SRJ-613) |
+| `pane` | a pane | Evidence about a screen only, never acted on alone (b.jg5 SRJ-613; below) |
 | `gone` | GONE (`ErrTmuxCaptureFailed`) | The session is not there |
 | `absent` | `ErrSpawnNotFound` | The row is absent |
 | `conflict` | CONFLICT (`ErrTmuxSessionConflict`), the thrown value kept | The reader latches the persona and answers `latched` |
@@ -498,6 +498,15 @@ The reader:
 Its callers are the working-pane read, `readWorkingPane(key, lastRead)` (site `readWorkingPane`, `FULL_PANE_READ_LINES` = 40 lines), which serves the launch wait's evidence read (Server-Managed Startup step 5) and `checkWaitingRowPane` (Auto-Restart step 3), and the `working`-row verdict, `workingReconnectVerdict` in `src/server.ts` (site `reconnectSession`, 40 lines), whose pane `checkWorkingRowPane` folds (Auto-Restart step 3), and b.jdc's two prompt-row paths, which read an `ask_user` or `check_permission` row with the one-line probe count `PROBE_PANE_READ_LINES` (1 line): the prompt-row verdict `promptRowReconnectVerdict` in `src/server.ts` (site `reconnectSession: prompt row`, Auto-Restart step 3, **Prompt rows**) and the collision ladder's `launchOnPromptRow` (site `spawnForPersona: prompt row`, Server-Managed Startup step 5), each recording the row state it read. On `latched` the wait ends `latched`, the `working`-row verdict and the prompt-row verdict answer `'transient'` with no deferral noted, `checkWaitingRowPane` answers `defer` and the ladder answers `latched`, each with nothing typed. On an UNCLASSIFIED carrying the stop mark, every restart-path and ladder caller calls nothing more for the persona: `checkWaitingRowPane` answers `defer` with nothing typed, the `working`-row verdict answers `'transient'` with its evidence forgotten and no deferral noted, the prompt-row verdict answers `'transient'`, and the ladder answers a `failed` result marked `stopping`, each with its own line. Every other outcome takes the caller's handling, and the caller's line for a failure names its class (`read-pane class=<CLASS>`).
 
 The dialog approver makes its own `read-pane` and keeps its own classification (Server-Managed Startup step 5, **Stops by class**); it shares only the CONFLICT latch helper (`latchOnConflict`) with the reader.
+
+**No site acts on a pane alone (b.jg5 SRJ-613).** The sites that read a pane are the `working`-row verdict (`workingReconnectVerdict`, whose pane `checkWorkingRowPane` folds), the `waiting`-row check (`checkWaitingRowPane`), the launch wait's evidence read (`staleWorkingRowIsIdle`), b.jdc's two prompt-row paths (`promptRowReconnectVerdict`, `launchOnPromptRow`) and the dialog approver (`approverLap`). A pane any of them reads may be a single leftover's, so it leads at most to a deferral (the prompt-row verdict), no action (the ladder's prompt-row action), a positive-idle fold that also needs the transcript (the `working`-row verdict and the launch wait), the reconnect (the `waiting`-row check) or Enter (the approver). On a prompt row nothing is typed on the pane; the reconnect comes only once a later read finds the row `waiting`, or a `working` row stale.
+
+The backstop is the `send-keys` that follows, which agent-director answers by the row's current launch and which types nothing when it refuses:
+
+- the reconnect's one `send-keys` (`reconnectMcpWithCause`) on a live row that is not `pending` answers CONFLICT "not this launch's session" when a leftover holds the persona's session: P latches with its CONFLICT notice posted once, and the refused `send-keys` is never retried. The restart adapter answers `'transient'`; in the launch wait the ladder answers `latched`, which `launchSession` answers `'skipped'`. The reconnect's handling is the `waiting` branch of [Server-Managed Startup](#server-managed-startup-sr-11-event-1) step 5; the hold is [Session conflict latch](#session-conflict-latch-bjg5-srj-501-srj-502);
+- the approver's Enter on a `pending` row answers `ErrSpawnNotInteractive`: the approver stops with nothing typed and no kill (**Pre-session dialog approval**, **Stops by class**, in the same step).
+
+Likewise a GONE (`ErrTmuxCaptureFailed`) says only that no session or pane of the row's current launch is there. It does not prove the worker gone after a kill failure whose description says no session or pane of this launch was found while the worker's process runs.
 
 ### Server-Managed Startup (SR-11 Event 1)
 

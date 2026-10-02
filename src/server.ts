@@ -1684,7 +1684,10 @@ export function _buildKillSessionAdapter(
  *   - a pane → the deferral: once the deferrals have run for
  *     `PROMPT_ROW_SWEEP_AFTER_MS` each one first sweeps and reads the row
  *     again (`checkPromptRowDeferral`), and otherwise `deferPromptRow`
- *     defers with the notice. A pane leads at most to the deferral;
+ *     defers with the notice. A pane leads at most to the deferral: it may
+ *     be a single leftover's (b.jg5 SRJ-117, SRJ-613), nothing is typed on
+ *     it, and the reconnect's `send-keys` a later tick makes is the backstop
+ *     (its CONFLICT "not this launch's session" latches the persona);
  *   - GONE → the dead-tmux sweep (verdict `prompt-row-tmux-gone`) and
  *     'escalate-dead', with no notice; the row absent (`ErrSpawnNotFound`)
  *     → the same with the verdict `row-absent-at-pane-read`;
@@ -1706,8 +1709,10 @@ export function _buildKillSessionAdapter(
  *   - a pane: a running turn or a prompt or dialog on it defers
  *     ('transient') the same way (a prompt raises the same notice);
  *     otherwise the reconnect below goes ahead. The pane may be a single
- *     leftover's (b.jg5 SRJ-613): the reconnect's own `send-keys` is classed
- *     in turn and is the backstop (b.jg5 SRJ-118);
+ *     leftover's (b.jg5 SRJ-117, SRJ-613), so it is no proof that the
+ *     worker's own session is there: the reconnect's own `send-keys` is the
+ *     backstop, and its CONFLICT "not this launch's session" latches the
+ *     persona with nothing typed (b.jg5 SRJ-118, SRJ-501);
  *   - GONE → nothing is typed: the dead-tmux sweep
  *     (`sweepDeadTmuxChannelWithCause`, verdict `waiting-row-pane-gone`) and
  *     'escalate-dead' ('transient' when the sweep was refused), as the
@@ -1745,10 +1750,12 @@ export function _buildKillSessionAdapter(
  *     busy indicator, no prompt) AND the transcript has ended with a
  *     completed turn, both unchanged, at every read across reads spanning
  *     `STALE_WORKING_WINDOW_MS`, the row is stale and the adapter goes on to
- *     the reconnect below, whose own `send-keys` is the backstop (b.jg5
- *     SRJ-118). A busy, changing or blank pane, an idle one whose transcript
- *     doesn't end with a completed turn or can't be located or read, or
- *     evidence not yet held for the window, defers ('transient'), as above;
+ *     the reconnect below, whose own `send-keys` is the backstop: its
+ *     CONFLICT "not this launch's session" latches the persona with nothing
+ *     typed (b.jg5 SRJ-118, SRJ-501). A busy, changing or blank pane, an
+ *     idle one whose transcript doesn't end with a completed turn or can't
+ *     be located or read, or evidence not yet held for the window, defers
+ *     ('transient'), as above;
  *     so does a prompt, which is never typed into, and which raises the
  *     `blocked-on-prompt` notice (once per episode) once shown across reads
  *     spanning the window. The evidence is forgotten when an attempt reads
@@ -1832,7 +1839,12 @@ export function _buildKillSessionAdapter(
  *
  * b.jg5 SRJ-118, SRJ-609 — the reconnect itself (`reconnectMcpWithCause`,
  * with the row state this adapter's `status` read gave as its last read) is
- * one `send-keys`, never retried, with no tmux server start. Its answer maps:
+ * one `send-keys`, never retried, with no tmux server start. It is the
+ * backstop for every pane read above: a pane may be a single leftover's
+ * (b.jg5 SRJ-117, SRJ-613), and this `send-keys` is answered by the row's
+ * current launch, so on a live row that is not `pending` it answers CONFLICT
+ * "not this launch's session" when a leftover holds the persona's session,
+ * with nothing typed; the persona latches (b.jg5 SRJ-501). Its answer maps:
  *   - `ok` → 'success';
  *   - `dead-session` → one dead-tmux sweep (`sweepDeadTmuxChannelWithCause`)
  *     with the verdict its cause gives (`escalateDeadVerdictOfCause`):
@@ -2086,7 +2098,16 @@ function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) |
  *     - latched by the time the read answers (`latchedNow`, the adapter's
  *       `reconnectLatchedAt` for the persona; b.jg5 SRJ-502) → 'transient',
  *       with no sweep, no deferral noted and no notice;
- *     - a pane → the deferral below: a pane leads at most to the deferral;
+ *     - a pane → the deferral below: a pane leads at most to the deferral.
+ *       It may be a single leftover's (b.jg5 SRJ-117, SRJ-613), so it is no
+ *       proof that the worker's own session is there, and nothing is typed
+ *       on it. The backstop is the later reconnect's `send-keys`
+ *       (`reconnectMcpWithCause`), made only once a later tick reads the row
+ *       `waiting`, or shows a `working` row stale: on a live row that is not
+ *       `pending` it answers CONFLICT "not this launch's session" when a
+ *       leftover holds the persona's session, and then nothing is typed, P
+ *       latches (b.jg5 SRJ-501) with its CONFLICT notice posted once, and
+ *       the refused `send-keys` is never retried (SRJ-118);
  *     - GONE (`ErrTmuxCaptureFailed`: agent-director found no pane of the
  *       row's launch) → the run of deferrals on the row ends, the dead-tmux
  *       sweep runs (`escalateRowWithNoPane`, verdict `prompt-row-tmux-gone`)
@@ -2385,7 +2406,15 @@ const WORKING_ROW_PANE_READ_SITE = 'reconnectSession'
  *   - a pane → the positive-idle rule decides on it (b.f2b,
  *     `checkWorkingRowPane`, the transcript located with the persona
  *     `getPersona` returns): 'reconnect' once the row is shown stale, and the
- *     adapter goes on to type `/mcp reconnect`; otherwise 'transient';
+ *     adapter goes on to type `/mcp reconnect`; otherwise 'transient'. The
+ *     pane may be a single leftover's (b.jg5 SRJ-117, SRJ-613), so it is no
+ *     proof that the worker's own session is there. The backstop is the
+ *     reconnect's `send-keys` (`reconnectMcpWithCause`, with the row state
+ *     `working`): on a live row that is not `pending` it answers CONFLICT
+ *     "not this launch's session" when a leftover holds the persona's
+ *     session, and then nothing is typed, P latches (b.jg5 SRJ-501) with its
+ *     CONFLICT notice posted once, the refused `send-keys` is never retried
+ *     (SRJ-118) and the adapter answers 'transient';
  *   - GONE → the sweep with the verdict `working-tmux-gone`
  *     (`escalateRowWithNoPane`) and 'escalate-dead';
  *   - the row absent (`ErrSpawnNotFound`) → the same with the verdict

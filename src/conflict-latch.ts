@@ -61,11 +61,12 @@
  * message as the description and the session quoted in it. Its triggers are
  * in `src/session-manager.ts` (the collision ladder's spawns, `resume`, kill
  * and delete, the shared own-row `status` and `get` reads and their step,
- * and the working-pane read) and the liveness and reconnect adapters in
- * `src/server.ts`, which apply the session manager's own-row `status` step.
- * Later sites latch through the same entry: the dialog approver (E17), the
- * reconnect's keystrokes and the prompt rows' pane reads (E19), the restart
- * path's kill (E20), the reuse spawn (E22) and the re-check's relatch (E30).
+ * the shared pane read behind the working-pane read and the prompt rows'
+ * pane reads, the reconnect's `send-keys` and the dialog approver's calls)
+ * and the liveness and reconnect adapters in `src/server.ts`, which apply
+ * the session manager's own-row `status` step. Sites still to come latch
+ * through the same entry: the restart path's kill (E20), the reuse spawn
+ * (E22) and the re-check's relatch (E30).
  *
  * The launch start not recorded (SRJ-513): {@link launchStartNotRecordedSetInput}
  * builds its `set` input: the case "launch start not recorded", the refused
@@ -73,10 +74,10 @@
  * `slack_bot_<key>` and no description. Its trigger is the row-read rule's
  * launch-start decision (`decideOwnRowRead`, `src/row-read-rules.ts`), acted
  * on by the session manager's shared own-row `get` read and own-row `status`
- * step (so also by the liveness and reconnect adapters in `src/server.ts`),
- * which latch through `set` with this input. Later sites latch through the
- * same input: the start sweep's `list` (E26), the dialog approver (E17) and
- * the re-check's relatch (E30).
+ * step (so also by the dialog approver's `status` read and the liveness and
+ * reconnect adapters in `src/server.ts`), which latch through `set` with
+ * this input. Sites still to come latch through the same input: the start
+ * sweep's `list` (E26) and the re-check's relatch (E30).
  *
  * The notices (SRJ-1004, SRJ-1019, SRJ-1020, SRJ-508, SRJ-1016): {@link conflictNoticeText}
  * builds the CONFLICT notice's body from a CONFLICT latch's record, from the

@@ -126,6 +126,7 @@ import {
   tmuxTouchingCallsIn,
   type ConflictCaseRow,
   type LivenessPaneSite,
+  type ReconnectLastRead,
 } from './test-helpers/conflict-cases.ts'
 import {
   _buildIsSessionAliveAdapter,
@@ -2276,6 +2277,11 @@ describe('_buildReconnectSessionAdapter', () => {
   //     and UNUSABLE NAME latch P with the prompt state; a stop-marked
   //     UNCLASSIFIED calls nothing more; a persona latched elsewhere during
   //     the read gets no notice.
+  //   - b.jg5 SRJ-613 (AC 44), in the nested describe at the end: the named
+  //     sequences across paths whose reconnect `send-keys` answers CONFLICT
+  //     "not this launch's session" (a `waiting` row's pane, its read with
+  //     no pane, a stale `working` row's fold, a prompt row's pane leading
+  //     only to the deferral until the row reads `waiting`).
   // No case makes a tmux call; every line, notice and latch line is
   // leak-checked.
   describe('b.jg5 SRJ-117, SRJ-603, SRJ-604, SRJ-606: a working, waiting or prompt row\'s one read-pane, one case per cell', () => {
@@ -2969,6 +2975,135 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.readPaneCalls).toEqual(probePaneReads(1))
       expect([h.sendKeysCalls, h.findMissingCalls]).toEqual([[], []])
       expectNoTmuxCall(h)
+    })
+
+    // b.jg5 SRJ-613 (AC 44), the server half: with no session of the row's
+    // current launch there and exactly one leftover of the persona,
+    // agent-director's `read-pane` answers the leftover's pane, so no path
+    // acts on a pane alone. Each case is one named sequence over the adapter
+    // whose last step is the reconnect's one `send-keys` answering CONFLICT
+    // "not this launch's session" (the case table's reconnect row marked
+    // `leftoverOfEarlierLaunch` for the state the path last read). The
+    // per-cell CONFLICT cases above stay the cells' evidence; these are the
+    // sequences across paths.
+    describe('b.jg5 SRJ-613: a pane may be a leftover\'s, so the reconnect\'s send-keys is the backstop on every path that reaches it (AC 44)', () => {
+      type Opts = NonNullable<Parameters<typeof makeHarness>[0]>
+
+      /**
+       * One path to the reconnect: its name, the state it last reads before
+       * the `send-keys` (the backstop row's; C1's row reads it unless `row`
+       * says otherwise), C1's row (built in the case, after `dir` exists),
+       * the attempts before the backstop's (each typing nothing; they end
+       * with the row reading `lastRead`), C1's pane reads up to and
+       * including the backstop's attempt, and the retries the backstop
+       * attempt's own `read-pane` arms (the latch arms none).
+       */
+      type BackstopPath = readonly [
+        name: string,
+        lastRead: ReconnectLastRead,
+        row: () => Opts,
+        leadIn: ((h: Harness, opts: Opts, lastRead: ReconnectLastRead) => Promise<void>) | undefined,
+        reads: () => ReadPaneParams[],
+        readTriggers: ReadonlyArray<{ key: string; kind: string }>,
+      ]
+
+      /** A `waiting` row's `read-pane` with no pane: one answer of each class that lets the reconnect go ahead, and the retry it arms inside C1's recovery attempt. */
+      const NO_PANE: ReadonlyArray<readonly [string, () => Error, string]> = [
+        ...PANE_UNAVAILABLE_FORMS.slice(0, 1).map(([label, build, , cause]) => [`UNAVAILABLE (${label})`, () => build('read-pane'), cause] as const),
+        ['CONFIG (ErrConfigMalformed)', paneConfigMalformed, UNAVAILABLE_RETRY_CAUSE_CONFIG],
+        ...PANE_UNCLASSIFIED.slice(0, 1).map(([label, build]) => [`UNCLASSIFIED (${label})`, build, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED] as const),
+      ]
+
+      /**
+       * A prompt row (`state`) whose one-line read-pane answers a pane, across
+       * two attempts: only the deferral and its one blocked-on-prompt notice;
+       * no send-keys, kill or latch. Then the row reads `lastRead`.
+       */
+      const promptRowLeadIn = async (h: Harness, opts: Opts, lastRead: ReconnectLastRead): Promise<void> => {
+        for (let i = 0; i < 2; i++) {
+          if (i > 0) await clock.advance(PROMPT_ROW_SWEEP_AFTER_MS / 2)
+          expect((await attempt(h)).verdict).toBe('transient')
+        }
+        expect(noticeKeys()).toEqual(['C1'])
+        expect([h.sendKeysCalls, h.killCalls, h.findMissingCalls]).toEqual([[], [], []])
+        expect(latch.isLatched('C1')).toBe(false)
+        expect(posts).toEqual([])
+        expect(h.readPaneCalls).toEqual(probePaneReads(2))
+        opts.statusState = lastRead
+      }
+
+      const PATHS: readonly BackstopPath[] = [
+        ['a waiting row whose read-pane answers an idle pane', 'waiting', () => ({ pane: IDLE_PANE }), undefined, () => fullPaneReads(1), []],
+        ...NO_PANE.map(([label, build, cause]): BackstopPath => [
+          `a waiting row whose read-pane gives no pane, ${label}`,
+          'waiting',
+          () => ({ paneError: build() }),
+          undefined,
+          () => fullPaneReads(1),
+          [{ key: 'C1', kind: cause }],
+        ]),
+        [
+          'a stale working row: the idle pane and the completed transcript, unchanged across the window, lead the fold to the reconnect',
+          'working',
+          () => ({ pane: IDLE_PANE, row: endedTranscript() }),
+          async (h) => {
+            expect((await attempt(h)).verdict).toBe('transient')
+            expect(h.sendKeysCalls).toEqual([])
+            expect(hasPendingWorkingRowEvidence('C1')).toBe(true)
+            await clock.advance(STALE_WORKING_WINDOW_MS)
+          },
+          () => fullPaneReads(2),
+          [],
+        ],
+        ...PROMPT_STATES.map((state): BackstopPath => [
+          `a ${state} row whose read-pane answers a pane (the deferral only), then the row reads waiting`,
+          'waiting',
+          () => ({ statusState: state, pane: IDLE_PANE }),
+          promptRowLeadIn,
+          () => [...probePaneReads(2), ...fullPaneReads(1)],
+          [],
+        ]),
+      ]
+
+      /** Each path crossed with the case table's reconnect row marked as a leftover of an earlier launch, for the state it last reads. */
+      const CASES = PATHS.flatMap((path) =>
+        reconnectConflictRowsAt(path[1])
+          .filter((row) => row.leftoverOfEarlierLaunch === true)
+          .map((row) => [path[0], row.name, path, row] as const),
+      )
+
+      test.each(CASES)("%s; the reconnect's send-keys answering %s, inside C1's recovery attempt → 'transient': nothing typed beyond the one refused send-keys, C1 latched once with the state the path last read and its one CONFLICT notice posted; nothing counted, swept, killed or launched, no retry armed by the latch; one reconnect line; no tmux call; the next attempt makes no send-keys and posts nothing", async (_path, _row, [, lastRead, makeRow, leadIn, reads, readTriggers], row) => {
+        const opts: Opts = { statusState: lastRead, ...makeRow(), isLatched: (key) => latch.isLatched(key), triggers, sendKeysThrows: row.build() }
+        const h = makeHarness(opts)
+        await leadIn?.(h, opts, lastRead)
+        const raisedBefore = raised.length
+        const latchedLines = (): string[] => latchLines.filter((line) => line.startsWith('[slack] conflict-latch: persona=C1 latched'))
+
+        const { verdict, lines } = await attempt(h, true)
+
+        expect(verdict).toBe('transient')
+        expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([[personaInstanceId('C1'), `/mcp reconnect ${MCP_SERVER_NAME}`]])
+        expect(h.readPaneCalls).toEqual(reads())
+        expect(latch.record('C1')).toStrictEqual(conflictRecord(row))
+        expect(latchedLines()).toHaveLength(1)
+        expect(posts).toEqual([{ key: 'C1', text: row.notice.text }])
+        expect(getFailureCount('C1')).toBe(0)
+        expect(triggers).toEqual([...readTriggers])
+        expect(reconnectLatchLines(lines, (outcome) => reconnectConflictLine('persona=C1', describeAgentDirectorFailure(row.build()), row.latchCase, outcome))).toHaveLength(1)
+        expect([h.killCalls, h.spawnCalls, h.resumeCalls, h.findMissingCalls]).toEqual([[], [], [], []])
+        expect(raised).toHaveLength(raisedBefore)
+        expectNoTmuxCall(h)
+
+        // The refused send-keys is never retried: the next attempt for C1 types nothing, latches and posts nothing more.
+        const next = await attempt(h, true)
+        expect(next.verdict).toBe('transient')
+        expect(h.sendKeysCalls).toHaveLength(1)
+        expect(latchedLines()).toHaveLength(1)
+        expect(posts).toHaveLength(1)
+        expect(raised).toHaveLength(raisedBefore)
+        expect([h.killCalls, h.spawnCalls, h.resumeCalls]).toEqual([[], [], []])
+        expectNoTmuxCall(h)
+      })
     })
   })
 

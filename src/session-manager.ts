@@ -106,7 +106,13 @@
  * `launchOnPromptRow`) latch on a CONFLICT answer,
  * with the refused operation "P's next check or recovery", and on an
  * UNUSABLE NAME answer, each with the state its caller last read; a latched
- * persona is not read, and its caller ends with nothing typed.
+ * persona is not read, and its caller ends with nothing typed. A pane that
+ * any of them reads, or the dialog approver reads, may be a single
+ * leftover's (b.jg5 SRJ-613), so none acts on a pane alone: the `send-keys`
+ * that follows is the backstop (the reconnect's CONFLICT "not this launch's
+ * session" latches P with nothing typed; the approver's
+ * `ErrSpawnNotInteractive` on a `pending` row stops it with nothing typed
+ * and no kill; see `src/pane-read.ts`).
  *
  * Both row checks go through `compareRowToPersona`. At most one launch per
  * persona is in flight (b.av2 SR-6.3): a concurrent call for the same key
@@ -1532,6 +1538,17 @@ export type OwnPaneReadOutcome = Exclude<PaneReadOutcome, PaneReadConflict | Pan
  *     UNAVAILABLE, UNCLASSIFIED) is returned unchanged for the caller to
  *     handle.
  *
+ * A pane it answers may be a single leftover's: with no session of the
+ * row's current launch there and exactly one leftover of the persona,
+ * agent-director answers the leftover's pane (b.jg5 SRJ-117, SRJ-613). The
+ * reader treats it as no proof that the worker's own session is there, and
+ * no caller acts on it alone: a pane leads at most to a deferral, no action,
+ * a positive-idle fold or the reconnect. The backstop is the reconnect's
+ * one `send-keys` (`reconnectMcpWithCause`), which on a live row that is not
+ * `pending` answers CONFLICT "not this launch's session": CSCB then latches
+ * P (b.jg5 SRJ-501) with nothing typed and never retries the refused
+ * `send-keys` (SRJ-118, SRJ-505).
+ *
  * With no latch installed a CONFLICT or UNUSABLE NAME still answers latched
  * with nothing latched, as the latch's entries do elsewhere (`conflictAt`,
  * `unusableNameAt`). The reader posts nothing and counts nothing, and makes
@@ -1998,6 +2015,16 @@ export async function reconnectMcp(
  *     leftover of an earlier launch holds the persona's session (SRJ-613),
  *     and its line says so. The refused `send-keys` is never retried
  *     (SRJ-505);
+ *
+ *     This CONFLICT is the backstop for every pane read that leads here
+ *     (b.jg5 SRJ-613). A pane may be a single leftover's, so the waiting-row
+ *     check's pane (`checkWaitingRowPane`), the working-row verdict's fold
+ *     (`workingReconnectVerdict`, `checkWorkingRowPane`) and the launch
+ *     wait's evidence read (`staleWorkingRowIsIdle`) never prove that the
+ *     worker's own session is there; this `send-keys` is answered by the
+ *     row's current launch, and when a leftover holds the persona's session
+ *     it types nothing and P latches (its CONFLICT notice posted once,
+ *     SRJ-508), held for a human (SRJ-502);
  *   - UNUSABLE NAME: the persona latches through the unusable-name entry
  *     (`latchOnUnusableName`: refused operation "none", `lastRead`, b.jg5
  *     SRJ-512); `transient` (latched);
@@ -2772,9 +2799,17 @@ function approverStopOrLatched(ctx: ApproverContext): ApproverStopReason | undef
  *     STATE name the approver gives no meaning): poll on within B at the pace
  *     in effect.
  *
- * Every call names only the persona's `claude_instance_id`; agent-director
- * reads and types into the worker's recorded pane of a session carrying this
- * launch's label (HO rev 17), and the server runs no tmux command here.
+ * Every call names only the persona's `claude_instance_id`, and the server
+ * runs no tmux command here; agent-director answers each call by the row's
+ * current launch (HO rev 17). The pane a lap reads may be a single
+ * leftover's: with no session of this launch there and exactly one leftover
+ * of the persona, `read-pane` answers the leftover's pane (b.jg5 SRJ-117,
+ * SRJ-613), so a needle on it is no proof that this launch's session shows
+ * the dialog. The lap acts on it only through its Enter `send-keys`, which is
+ * the backstop: on a `pending` row whose session is not this launch's (by its
+ * label's token), it answers `ErrSpawnNotInteractive`, and the approver stops
+ * with nothing typed, no kill and one log line (`not-interactive`, b.jg5
+ * SRJ-404); a CONFLICT there latches the persona and stops it.
  *
  * Pace (b.jg5 SRJ-403): each lap starts at least `DIALOG_POLL_INTERVAL_MS`
  * after the previous lap's `read-pane` call (or, when the previous lap read
@@ -3007,7 +3042,10 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
   if (afterPane !== undefined) return afterPane
   if (!PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))) return goesOn
   try {
-    // An empty text presses Enter.
+    // An empty text presses Enter. The pane may be a single leftover's
+    // (b.jg5 SRJ-613): this `send-keys` is the backstop, and its
+    // `ErrSpawnNotInteractive` stops the approver with nothing typed and no
+    // kill (SRJ-404).
     await withOutageDetection(key, undefined, 'send-keys', (client) =>
       client.sendKeys({ claude_instance_id, text: '', allow_pending: true }),
     )
@@ -3556,7 +3594,11 @@ async function readIdlePaneTranscript(key: string, pane: string, configDir: stri
  * read (the launch wait's last read, or the `waiting` state the restart
  * path's check was called for), and a persona already latched is not read:
  * either way the outcome is latched, and the caller ends what it was doing
- * with nothing typed (b.jg5 SRJ-501, SRJ-502, SRJ-512). Never throws.
+ * with nothing typed (b.jg5 SRJ-501, SRJ-502, SRJ-512). A pane it answers
+ * may be a single leftover's (b.jg5 SRJ-613): its callers (the launch wait's
+ * evidence read and `checkWaitingRowPane`) act on it only through the
+ * reconnect, whose `send-keys` is the backstop (`reconnectMcpWithCause`).
+ * Never throws.
  */
 async function readWorkingPane(key: string, lastRead: LatchRowState): Promise<OwnPaneReadOutcome> {
   return readPersonaOwnPane(key, { nLines: FULL_PANE_READ_LINES, lastRead, site: 'readWorkingPane' })
@@ -3689,6 +3731,19 @@ interface WorkingPaneWatch {
  * CONFIG, UNCLASSIFIED) is no evidence (b.jg5 SRJ-117, SRJ-608). The state
  * the transcript `get` read, when it was made, becomes the wait's last read
  * (`wait.lastRead`, b.jg5 SRJ-501).
+ *
+ * The pane may be a single leftover's (b.jg5 SRJ-117, SRJ-613: with no
+ * session of the row's current launch there and exactly one leftover of the
+ * persona, agent-director answers the leftover's pane), so it is no proof
+ * that the worker's own session is there: a pane only feeds the fold, which
+ * also needs the transcript. When the fold shows the row stale, the wait's
+ * reconnect (`reconnectInWait`, `reconnectMcpWithCause` with the row state
+ * `working`) is the backstop: its `send-keys` answers CONFLICT "not this
+ * launch's session" on a live row that is not `pending` when a leftover
+ * holds the persona's session, and then nothing is typed, P latches (b.jg5
+ * SRJ-501) with its CONFLICT notice posted once, the refused `send-keys` is
+ * never retried, and the wait answers `transient` noted as latched, so the
+ * ladder answers `latched`.
  */
 async function staleWorkingRowIsIdle(
   key: string,
@@ -3899,11 +3954,16 @@ export interface WorkingRowPaneCheckOptions {
  * transcript with a completed turn, so it is never taken for idle (b.rmy).
  *
  * The pane comes from the caller's one read and may be a single leftover's
- * (b.jg5 SRJ-613: with no session of the row's current launch there and one
- * leftover of the persona, agent-director answers the leftover's pane), so a
- * pane alone is never proof: the fold also needs the transcript, and the
- * `/mcp reconnect` it leads to is classed in turn (its `send-keys` is the
- * backstop, b.jg5 SRJ-118).
+ * (b.jg5 SRJ-117, SRJ-613: with no session of the row's current launch there
+ * and exactly one leftover of the persona, agent-director answers the
+ * leftover's pane), so a pane alone is never proof that the worker's own
+ * session is there: the fold also needs the transcript, and `reconnect` only
+ * lets the caller type `/mcp reconnect`. That reconnect's `send-keys`
+ * (`reconnectMcpWithCause`) is the backstop: on a live row that is not
+ * `pending` it answers CONFLICT "not this launch's session" when a leftover
+ * holds the persona's session, and then nothing is typed, P latches (b.jg5
+ * SRJ-501) with its CONFLICT notice posted once, and the refused `send-keys`
+ * is never retried (SRJ-118).
  *
  * A persona latched during the transcript `get` (it read a
  * `provenance_conflict` note or answered UNUSABLE NAME, b.jg5 SRJ-114,
@@ -4020,9 +4080,14 @@ function logNoWorkingRowEvidence(ref: string, reading: WorkingPaneReading, trans
  * - a pane: a running turn (`busy`) defers; so does a prompt or dialog, which
  *   is never typed into and raises the `blocked-on-prompt` not-connected
  *   notice (once per episode); otherwise `reconnect`. The pane may be a
- *   single leftover's (b.jg5 SRJ-613), so it is no proof the worker's own
- *   session is there: the reconnect's own `send-keys` is classed in turn
- *   and is the backstop (b.jg5 SRJ-118);
+ *   single leftover's (b.jg5 SRJ-117, SRJ-613), so it is no proof the
+ *   worker's own session is there: the reconnect's own `send-keys`
+ *   (`reconnectMcpWithCause`) is the backstop. On a live row that is not
+ *   `pending` it answers CONFLICT "not this launch's session" when a
+ *   leftover holds the persona's session; then nothing is typed, P latches
+ *   (b.jg5 SRJ-501) with its CONFLICT notice posted once, the refused
+ *   `send-keys` is never retried (SRJ-118) and the adapter answers
+ *   'transient';
  * - GONE (`ErrTmuxCaptureFailed`): `gone`; the adapter sweeps and escalates,
  *   typing nothing;
  * - the row absent (`ErrSpawnNotFound`): `absent`, which the adapter
@@ -5492,7 +5557,15 @@ export async function checkPromptRowDeferral(key: string, state: string): Promis
  * shared reader (`readPersonaOwnPane`: `PROBE_PANE_READ_LINES`, the
  * collision `get`'s state as the recorded state), with no tmux call, mapped:
  * - a pane → no action (`no-op`), as before; the health check's restart path
- *   reports the prompt if the persona stays disconnected;
+ *   reports the prompt if the persona stays disconnected. The pane may be a
+ *   single leftover's (b.jg5 SRJ-117, SRJ-613), so it is no proof that the
+ *   worker's own session is there, and nothing is typed on it. The backstop
+ *   is the later reconnect's `send-keys` (`reconnectMcpWithCause`), made
+ *   only once the row reads `waiting`, or shows a `working` row stale: on a
+ *   live row that is not `pending` it answers CONFLICT "not this launch's
+ *   session" when a leftover holds the persona's session, and then nothing
+ *   is typed, P latches (b.jg5 SRJ-501) with its CONFLICT notice posted
+ *   once, and the refused `send-keys` is never retried (SRJ-118);
  * - GONE (`ErrTmuxCaptureFailed`: agent-director found no pane of the row's
  *   launch), or the row absent (`ErrSpawnNotFound`, which takes the GONE
  *   column, b.jg5 SRJ-117) → the memoized findMissing sweep, then the row is

@@ -3609,9 +3609,22 @@ Read the row's state with the persona's server-log lines:
 | No row | `persona teardown of … complete` | The persona was removed by a confirmed change; its instance was destroyed. Expected. |
 | A row | `persona teardown of …: agent-director delete of cscb_<key> failed` | The teardown couldn't delete it. For a removed persona, the next server start removes it; for a destructively modified one, its bring-up replaces it, or may resume it when neither its working directory nor its config directory changed. |
 
-`tmux has-session -t =slack_bot_<key>` confirms whether the instance's tmux
-session exists. Keep the `=`: it matches that exact name only. A bare
-`slack_bot_<key>` also matches another persona's session whose name starts
-with it (`slack_bot_dev_2` for `slack_bot_dev`), so a gone session would read
-as present.
+To check whether a session of the persona is there, read one line of its
+screen through agent-director:
+
+```sh
+agent-director read-pane --claude-instance-id cscb_<key> --n-lines 1
+```
+
+- **A pane:** a session of the persona is there. It can be a single leftover
+  of an earlier launch rather than the row's current launch; then `kill`
+  answers CONFLICT, "not this launch's session" (see
+  [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice)).
+- **`ErrTmuxCaptureFailed`:** no session of the row's current launch is
+  there. That does not prove the worker gone after a kill failure whose
+  description says no session or pane of this launch was found.
+
+For a leftover's pane, or a worker that runs with no session or pane of its
+launch, a human follows the "Operator actions" section of
+agent-director's README. This skill describes no step of it.
 
