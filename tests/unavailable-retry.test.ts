@@ -139,6 +139,16 @@ import {
   describeAgentDirectorFailure,
 } from '../src/ad-error-class.ts'
 import { KILL_OUTCOME_NOT_KILLED } from '../src/checked-kill.ts'
+import {
+  KILL_RETRY_ALERT_ORDINARY,
+  KILL_RETRY_ALERT_SURVIVOR,
+  KILL_RETRY_END_EXHAUSTED,
+  KILL_RETRY_END_SETTLED,
+  KILL_RETRY_SPACING_MS,
+  KILL_RETRY_TRIES,
+  killRetrySeedOfState,
+  type KillRetryResult,
+} from '../src/kill-retry.ts'
 import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
 import { ERR_SCHEMA_MISMATCH_NAME, ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
@@ -230,6 +240,7 @@ import {
   KILL_CONTEXT_TEARDOWN,
   killPersonaInstance,
   reconcileOrphans,
+  retryPersonaKill,
   stopDialogApprover,
   sweepDeadTmuxChannel,
   TRUST_DIALOG_NEEDLE,
@@ -302,7 +313,9 @@ import {
 import type { AdConfigTables } from './test-helpers/ad-settings.ts'
 import {
   cannedErr,
+  cannedKillResult,
   cannedListRow,
+  cannedOk,
   cannedStatusResult,
   errCallTimeout,
   errConfigMalformed,
@@ -936,12 +949,14 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
     action: 'reconnected',
     script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusQueue: [cannedErr(err)] }),
   },
-  // The collision get reads the row `waiting` (live), so its kill is tmux-touching.
+  // The collision get reads the row `waiting` (live), so its kill is
+  // tmux-touching and gets its tries, with the own-row status read before
+  // each further try (b.jg5 SRJ-702); only the outcome that stands arms.
   {
     name: 'the kill of a row in another directory',
     verb: 'kill',
     action: 'failed',
-    ladderCalls: { spawnCalls: 1, getCalls: 1, killCalls: 1 },
+    ladderCalls: { spawnCalls: 1, getCalls: 1, killCalls: KILL_RETRY_TRIES, statusCalls: KILL_RETRY_TRIES - 1 },
     leavesConditionHeld: true,
     script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home }), killError: err }),
   },
@@ -1048,7 +1063,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     const [key] = h.keys as [string]
     h.script(site.script(h, personaOf(h, key), make(verb)))
 
-    const result = await h.launch(key)
+    const result = await h.drive(h.launch(key))
 
     expect(result).toEqual(armedResult(key, site.action))
     expectArmedOnce(h, key, kind)
@@ -3342,16 +3357,18 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expectStopped(h, key)
   })
 
-  test('a start-pass launch whose kill of a live row in another directory is refused UNAVAILABLE stops there (no delete, no spawn), answers refused, leaves the condition holding and arms the timer at the base wait, with no row read and no condition end', async () => {
+  test('a start-pass launch whose kill of a live row in another directory is refused UNAVAILABLE at every try stops there (no delete, no spawn), answers refused, leaves the condition holding and arms the timer at the base wait from the standing refusal, with no row recorded on the timer and no condition end', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key] = h.keys as [string]
     h.script({ ...collided(h, personaOf(h, key), { cwd: h.home }), killError: errTmuxUnresponsive('kill') })
-    const armedAt = h.clock.now()
+    // b.jg5 SRJ-702: the refusal stands after the kill's tries.
+    const armedAt = h.clock.now() + (KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS
 
-    // b.jg5 SRJ-105: the refused kill stops the ladder at once.
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    // b.jg5 SRJ-105: the refusal that stands stops the ladder.
+    expect(await h.drive(h.launch(key))).toEqual({ key, action: 'failed', refused: true })
 
-    expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1, killCalls: 1 })
+    // The status calls are the own-row reads between the tries.
+    expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1, killCalls: KILL_RETRY_TRIES, statusCalls: KILL_RETRY_TRIES - 1 })
     expect(getFailureCount(key)).toBe(0)
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
     const lines = conditionLines(h, key)
@@ -5278,6 +5295,10 @@ describe('unavailable retry: a kill of the last session on a socket, then answer
     expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key), tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
     expectStopped(h, key)
     expectUntouched(h, other)
+    // b.jg5 SRJ-702: the restart path's kill (one try, its dead seed) and
+    // every ENVIRONMENT answer call for no kill-failure alert; nothing latched.
+    expect(killFailureDecisionLines(h)).toEqual([])
+    expect(h.latch.isLatched(key)).toBe(false)
   })
 
   test('ErrTmuxUnresponsive after the kill: the tmux-unresponsive condition, not the outage, with the retries on the backoff and nothing counted, deleted or launched while it lasts; each post at most once, and the timer stopped once the persona is up', async () => {
@@ -5338,6 +5359,202 @@ describe('unavailable retry: a kill of the last session on a socket, then answer
     expect(h.capReached).toEqual([])
     expect(h.stub.calls.deleteCalls).toEqual([])
     expect(h.notices).toEqual([])
+    expectUntouched(h, other)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The bounded retry of a live row's kill and the retry timer (b.jg5 SRJ-702,
+// SRJ-301, SRJ-306, SRJ-311; AD handoff rev 23), on the recovery harness:
+// a try's UNAVAILABLE reports nothing, and only the outcome that stands, once,
+// reaches the retry timer (the kill-failed cause for `ErrTmuxKillFailed`); a
+// tmux server that is exiting after the kill answers by class, a try's
+// `ErrTmuxUnresponsive` tried again and its `ErrTmuxNotAvailable` ending the
+// tries with one onset. The restart path's kill is one try (its dead seed),
+// so the tries are driven at the collision ladder's replacement kill of a
+// row read live in another directory, and directly through the persona
+// kill retry inside a recovery attempt. The waits run on the harness clock
+// (`h.drive`).
+// ---------------------------------------------------------------------------
+
+/** The kill-failure alert decisions, for asserting that no line names one. */
+const KILL_FAILURE_DECISIONS = [KILL_RETRY_ALERT_ORDINARY, KILL_RETRY_ALERT_SURVIVOR].map((kind) => `alert=${kind}`)
+
+/** The harness's lines and errors that name a kill-failure alert decision. */
+function killFailureDecisionLines(h: RecoveryHarness): string[] {
+  return [...h.lines, ...h.errors].filter((line) => KILL_FAILURE_DECISIONS.some((decision) => line.includes(decision)))
+}
+
+/** Persona `key`'s kill of its row read live, retried inside a recovery attempt, on the harness clock. */
+function retriedKillInAttempt(h: RecoveryHarness, key: string): Promise<KillRetryResult> {
+  return h.drive(
+    runInAttempt(key, 'recovery', () =>
+      retryPersonaKill(key, {
+        rowReadLive: true,
+        lastRead: killRetrySeedOfState('waiting'),
+        site: 'kill-retry-case',
+        ref: `persona=${key}`,
+        clock: h.killRetryClock,
+      }),
+    ),
+  )
+}
+
+describe('unavailable retry: a live row’s kill makes its tries before its outcome reaches the retry timer (SRJ-702, SRJ-301, SRJ-306, SRJ-311; AD handoff rev 23)', () => {
+  test('ErrTmuxKillFailed at every try inside a recovery attempt arms the kill-failed cause once, not once per try; the condition-end entry keeps it', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    h.script({ killError: errTmuxKillFailed() })
+
+    const result = await retriedKillInAttempt(h, key)
+
+    expect(result).toMatchObject({ end: KILL_RETRY_END_EXHAUSTED, tries: KILL_RETRY_TRIES, reads: KILL_RETRY_TRIES - 1 })
+    expect(callCounts(h)).toEqual({ killCalls: KILL_RETRY_TRIES, statusCalls: KILL_RETRY_TRIES - 1 })
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(0),
+      waitMs: waitMs(0),
+      refusals: 0,
+      causes: [UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+    })
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expectKeptThroughEveryConditionEnd(h, key, UNAVAILABLE_RETRY_KEPT_KILL_FAILED)
+    expectUntouched(h, other)
+  })
+
+  // The recovery harness puts the waits between tries on its clock (b.jg5
+  // SRJ-702), as every other timer: advancing the clock alone finishes the
+  // tries, and a try still waiting fails the harness's cleanup.
+  test('the waits between tries run on the harness clock: advancing it alone finishes the tries; a try still waiting fails cleanup', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    h.script({ killError: errTmuxUnresponsive('kill') })
+    let result: KillRetryResult | undefined
+    const retried = (on: RecoveryHarness): Promise<KillRetryResult> =>
+      retryPersonaKill(key, { rowReadLive: true, lastRead: killRetrySeedOfState('waiting'), site: 'kill-retry-case', ref: `persona=${key}`, clock: on.killRetryClock })
+    void runInAttempt(key, 'recovery', () => retried(h)).then((r) => { result = r })
+
+    await h.advance((KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS - 1)
+    expect(result).toBeUndefined()
+    await h.advance(1)
+    expect(result).toMatchObject({ end: KILL_RETRY_END_EXHAUSTED, tries: KILL_RETRY_TRIES })
+    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
+
+    // A second harness whose kill is left waiting between its tries.
+    const waiting = makeRecoveryHarness(RETRY_TIMER_ONLY)
+    waiting.script({ killError: errTmuxUnresponsive('kill') })
+    void retried(waiting)
+    await waiting.clock.flush()
+    expect(waiting.clock.pending().map((t) => t.delayMs)).toEqual([KILL_RETRY_SPACING_MS])
+    expect(() => waiting.cleanup()).toThrow(/timer\(s\) still pending/)
+  })
+
+  test.each<[string, Error]>([
+    ['ErrTmuxKillFailed', errTmuxKillFailed()],
+    ['ErrTmuxUnresponsive', errTmuxUnresponsive('kill')],
+  ])('a try answering %s then a success inside a recovery attempt arms nothing and starts nothing', async (_label, err) => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    h.script({ killQueue: [cannedErr(err), cannedOk(cannedKillResult(true))] })
+
+    const result = await retriedKillInAttempt(h, key)
+
+    expect(result).toMatchObject({ end: KILL_RETRY_END_SETTLED, tries: 2, reads: 1 })
+    expect(h.triggers).toEqual([])
+    expect(h.controller.isArmed(key)).toBe(false)
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  // b.jg5 SRJ-301, SRJ-702: the failed read between tries is a read inside
+  // the attempt and arms with its own cause, once (the arming predicate
+  // decides UNAVAILABLE before the read-error rule, so ErrCallTimeout's cause
+  // is `unavailable` and an UNCLASSIFIED read's is `read-error`); the kill's
+  // UNAVAILABLE try, whose success came after, arms nothing and starts no
+  // `tmux-unresponsive` condition.
+  const killFirstTries: ReadonlyArray<readonly [string, () => Error]> = [
+    ['ErrTmuxKillFailed', () => errTmuxKillFailed()],
+    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill')],
+  ]
+  const failedReads: ReadonlyArray<readonly [string, () => Error, string]> = [
+    ['ErrCallTimeout', () => errCallTimeout('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['ErrInternal', () => errInternal(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+  ]
+  test.each(killFirstTries.flatMap(([kill, makeKill]) => failedReads.map(([read, makeRead, cause]) => [kill, read, makeKill, makeRead, cause] as const)))(
+    'a try answering %s, a read between tries answering %s, then a success inside a recovery attempt: the read arms once with its own cause; the try arms nothing and starts no tmux-unresponsive condition',
+    async (_kill, _read, makeKill, makeRead, cause) => {
+      const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+      const [key, other] = h.keys as [string, string]
+      h.script({ killQueue: [cannedErr(makeKill()), cannedOk(cannedKillResult(true))], statusQueue: [cannedErr(makeRead())] })
+
+      const result = await retriedKillInAttempt(h, key)
+
+      expect(result).toMatchObject({ end: KILL_RETRY_END_SETTLED, tries: 2, reads: 1 })
+      expect(callCounts(h)).toEqual({ killCalls: 2, statusCalls: 1 })
+      expect(h.triggers).toEqual([{ key, kind: cause }])
+      expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)).toEqual([])
+      expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', causes: [cause] })
+      expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+      expect(conditionLines(h, key)).toEqual([])
+      expect(killFailureDecisionLines(h)).toEqual([])
+      expectUntouched(h, other)
+    },
+  )
+
+  test('HO rev 23: a replacement kill answering ErrTmuxUnresponsive (the server exiting) then a read of ended: the tries end as a success, the delete and the launch run, nothing is posted or armed, nothing latches', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    h.script({
+      ...collided(h, personaOf(h, key), { cwd: h.home, state: 'waiting' }),
+      killQueue: [cannedErr(errTmuxUnresponsive('kill'))],
+      statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))],
+    })
+
+    const result = await h.drive(h.launch(key))
+
+    expect(result.action).not.toBe('failed')
+    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(h.stub.calls.deleteCalls).toHaveLength(1)
+    expect(h.stub.calls.spawnCalls).toHaveLength(2)
+    expect(h.triggers).toEqual([])
+    expect(h.outageNotices).toEqual([])
+    expect(h.episodeNotices).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(h.latch.isLatched(key)).toBe(false)
+    expect(killFailureDecisionLines(h)).toEqual([])
+    expect(getFailureCount(key)).toBe(0)
+    expectUntouched(h, other)
+  })
+
+  test('HO rev 23: a replacement kill answering ErrTmuxUnresponsive then ErrTmuxNotAvailable at its second try: not tried again, no delete or launch, one onset and one ENVIRONMENT arm (the first try armed nothing), no latch; one all-clear once a tmux-touching call succeeds', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    h.script({
+      ...collided(h, personaOf(h, key), { cwd: h.home, state: 'waiting' }),
+      killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedErr(errTmuxNotAvailable(undefined, 'kill')), cannedErr(errTmuxUnresponsive('kill'))],
+    })
+
+    expect(await h.drive(h.launch(key))).toEqual({ key, action: 'failed', refused: true })
+
+    expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1, killCalls: 2, statusCalls: 1 })
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', refusals: 0, causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT] })
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(h.latch.isLatched(key)).toBe(false)
+    expect(getFailureCount(key)).toBe(0)
+
+    // A status read alone never clears it (SRJ-311); a tmux-touching success does, once.
+    await _buildIsSessionAliveAdapter(() => h.config)(key)
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+    await readPaneSucceeds(h, key)
+    await readPaneSucceeds(h, key)
+    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(killFailureDecisionLines(h)).toEqual([])
+    expect(h.latch.isLatched(key)).toBe(false)
     expectUntouched(h, other)
   })
 })

@@ -26,8 +26,8 @@
  *                       (SRJ-104, SRJ-110); `name` is the GONE name;
  *       `row-finished`  a `status` read of the row between tries read it
  *                       `ended` or `missing`, or answered `ErrSpawnNotFound`
- *                       (SRJ-110, SRJ-702). No code here makes that read; the
- *                       form is declared so the outcome type is complete;
+ *                       (SRJ-110, SRJ-702). No code here makes that read: the
+ *                       bounded retry (`src/kill-retry.ts`) gives this form;
  *   - a non-success ({@link KillFailure}, `not-killed`), with the thrown
  *     value kept for the caller's own handling and one SRJ-110 class:
  *     UNAVAILABLE (`ErrTmuxKillFailed`, told apart as `killFailed` with its
@@ -58,12 +58,13 @@
  *
  * SRJ-110's sites that take the checked kill (each with the result checked):
  *   - the restart path's kill before a relaunch (`_buildKillSessionAdapter`,
- *     `src/server.ts`, through `killPersonaInstance`);
+ *     `src/server.ts`, through `killPersonaInstance` in the bounded retry,
+ *     `src/kill-retry.ts`);
  *   - the collision ladder's replacement kills (`replaceWithFreshSpawn` and
  *     the `ErrSpawnNotResumable` branch, `src/session-manager.ts`, through
- *     `killPersonaInstance`);
+ *     `killPersonaInstance` in the bounded retry);
  *   - the start sweep's kills (`reconcileOrphans`, `src/session-manager.ts`,
- *     on the sweep's own client);
+ *     on the sweep's own client, in the bounded retry with the pass budget);
  *   - the persona teardown's kill (`runTeardown`, `src/persona-lifecycle.ts`,
  *     through `killPersonaInstance`).
  * SRJ-110's other sites take it as each is built: the live-row sequence (E21),

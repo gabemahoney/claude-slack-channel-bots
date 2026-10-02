@@ -35,7 +35,10 @@
  *                                            success (b.jg5 SRJ-312); with `armsNothing` (a
  *                                            persona teardown's kill) it reports nothing and
  *                                            raises an ENVIRONMENT or CONFIG outage only for a
- *                                            configured persona (b.jg5 SRJ-110; hatch A3)
+ *                                            configured persona (b.jg5 SRJ-110; hatch A3);
+ *                                            with `deferUnavailableReport` (one try of a
+ *                                            bounded kill retry) an UNAVAILABLE value is not
+ *                                            reported (b.jg5 SRJ-702)
  *   - withSpawnDetection(key, dir, call, fn)  — like withOutageDetection + clears cwd-unreachable on success
  *   - reportAgentDirectorError(key, err, call) — report an error to the retry timer's trigger sink
  *                                            (inside a launch or recovery attempt, and for
@@ -44,6 +47,9 @@
  *                                            tmux-unresponsive condition (b.jg5 SRJ-307), and
  *                                            report an in-attempt UNCLASSIFIED outcome to the
  *                                            unclassified sink (b.jg5 SRJ-313)
+ *   - reportDeferredUnavailable(key, err, call) — the one report of a bounded kill retry's
+ *                                            outcome that stands, when it is UNAVAILABLE
+ *                                            (b.jg5 SRJ-702, SRJ-301, SRJ-307)
  *   - reportUnclassifiedAtSite(key, err, call, classification) — the site entry for an
  *                                            UNCLASSIFIED outcome a site classifies itself
  *                                            (an ErrInvalidFlags at the resume path, the shared
@@ -90,6 +96,7 @@ import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_GONE,
+  AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
   adCallVerb,
   classifyAdError,
@@ -225,6 +232,19 @@ export interface OutageDetectionOptions {
    * clears on a success or on GONE) is unchanged.
    */
   readonly armsNothing?: { readonly personaConfigured: () => boolean }
+  /**
+   * True for one try of a bounded kill retry made inside a launch or
+   * recovery attempt (b.jg5 SRJ-702, SRJ-110: the UNAVAILABLE rows apply
+   * "after the tries"): an UNAVAILABLE value (by class through
+   * `src/ad-error-class.ts`, `ErrTmuxKillFailed` included) is not reported
+   * here, so it arms no retry timer, starts no `tmux-unresponsive` condition
+   * and is not recorded as the attempt's last error. The caller reports the
+   * outcome that stands, once, through {@link reportDeferredUnavailable}.
+   * Every other value is handled as without it: flags (ENVIRONMENT and
+   * CONFIG raise their outages at once) and the report, since such an
+   * outcome is never tried again and stands at once.
+   */
+  readonly deferUnavailableReport?: boolean
 }
 
 /** `options.armsNothing.personaConfigured()`, a throw counting as false. Never throws. */
@@ -670,7 +690,10 @@ export async function withOutageDetection<T>(
         )
       }
     }
-    if (armsNothing === undefined) reportAgentDirectorError(key, err, call)
+    // b.jg5 SRJ-702: a deferred try's UNAVAILABLE is reported once, by its
+    // caller, only when it is the outcome that stands.
+    const deferred = options?.deferUnavailableReport === true && errorClass === AD_ERROR_CLASS_UNAVAILABLE
+    if (armsNothing === undefined && !deferred) reportAgentDirectorError(key, err, call)
     if (isTmuxTouchingCall(call) && errorClass === AD_ERROR_CLASS_GONE) {
       // b.jg5 SRJ-312: GONE from a tmux-touching call is tmux answering.
       clearOutageFlag(key, 'tmux-unavailable')
@@ -725,6 +748,30 @@ export function reportAgentDirectorError(
   reportAttemptError(key, err, verb, deps?.triggerSink)
   startTmuxUnresponsive(key, err, call, verb)
   if (options?.reportUnclassified !== false) reportUnclassified(key, err, verb)
+}
+
+/**
+ * reportDeferredUnavailable — the one report of a bounded kill retry's
+ * outcome that stands (b.jg5 SRJ-702, SRJ-301, SRJ-307), for tries made with
+ * `OutageDetectionOptions.deferUnavailableReport`: when `err` is UNAVAILABLE
+ * (by class through `src/ad-error-class.ts`), it is reported once through
+ * the reporting point (`reportAgentDirectorError`) with `call`, the kill's
+ * verb and its tmux-touching declaration, so the retry timer is armed once
+ * (with the kill-failed cause for `ErrTmuxKillFailed`), the attempt records
+ * it, and, for a tmux-touching kill and an UNAVAILABLE other than
+ * `ErrTmuxKillFailed`, the `tmux-unresponsive` condition starts or
+ * continues, each by the reporting point's own context rule. Any other value
+ * reports nothing: its try reported it at once. Called only when the tries
+ * end in a failure; a success, and a stop by a latching read or the
+ * caller's keep-going check, report nothing. Never throws.
+ */
+export function reportDeferredUnavailable(key: string, err: unknown, call: AdCall): void {
+  try {
+    if (classifyAdError(err).errorClass !== AD_ERROR_CLASS_UNAVAILABLE) return
+    reportAgentDirectorError(key, err, call)
+  } catch {
+    /* a failing report changes nothing about the kill's own outcome */
+  }
 }
 
 /**

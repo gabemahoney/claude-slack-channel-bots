@@ -668,6 +668,12 @@ import {
   killOutcomeOf,
   type KillOutcome,
 } from '../src/checked-kill.ts'
+import {
+  KILL_RETRY_ALERT_ORDINARY,
+  KILL_RETRY_ALERT_SURVIVOR,
+  KILL_RETRY_SPACING_MS,
+  KILL_RETRY_TRIES,
+} from '../src/kill-retry.ts'
 import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
 import {
   CUSTOM_VERB_SPINNER_PANE,
@@ -847,7 +853,7 @@ import {
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
 import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
-import type { Phase1ResumeResult, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
+import type { Phase1KillResult, Phase1ResumeResult, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -4159,6 +4165,27 @@ function prePersonaRow(state: string, id = `cscb_old_${state}_C0OLD`): import('a
 // b.av2 SR-6.3 (formerly SR-1.6) — the start sweep
 // ---------------------------------------------------------------------------
 
+/**
+ * Run the start sweep with its kill retries on `clock` (b.jg5 SRJ-702),
+ * moving the clock only to each wait between a kill's tries as it is set
+ * (the sweep's own steps run in event-loop turns, bounded); fails the case
+ * if the sweep does not settle or leaves a timer pending.
+ */
+async function reconcileOnClock(cfg: PersonaConfig, clock: FakeClock = createFakeClock()): Promise<Awaited<ReturnType<typeof reconcileOrphans>>> {
+  const work = reconcileOrphans(cfg, clock)
+  let settled = false
+  void work.then(() => { settled = true }, () => { settled = true })
+  for (let turns = 0; !settled && turns < 1_000; turns++) {
+    await clock.flush()
+    if (settled) break
+    if (clock.pendingCount() > 0) await clock.runNext()
+    else await new Promise((resolve) => setImmediate(resolve))
+  }
+  expect(settled).toBe(true)
+  expect(clock.pendingCount()).toBe(0)
+  return work
+}
+
 describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', () => {
   /**
    * Three applied personas in real temp working directories, except that
@@ -4436,32 +4463,41 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       })
     })
 
-    /** Sweep one row (`id`, labelled `persona`) whose kill is scripted by `kill`; returns the result, the calls, the log and the startup-errors entries. */
+    /**
+     * Sweep one row (`id`, labelled `persona`, listed in `state`) whose kill
+     * and between-try reads are scripted by `script`, its kill retries on a
+     * fake clock (b.jg5 SRJ-702); returns the result, the calls, the log and
+     * the startup-errors entries.
+     */
     async function sweepOne(
       id: string,
       persona: string,
-      kill: Pick<StubClientOptions, 'killError' | 'killResult'>,
-    ): Promise<{ result: Awaited<ReturnType<typeof reconcileOrphans>>; killCalls: string[]; deleteCalls: string[][]; errLog: string; entries: string; latch: ConflictLatch }> {
+      script: Pick<StubClientOptions, 'killError' | 'killResult' | 'killQueue' | 'statusQueue' | 'statusError'>,
+      state = 'waiting',
+    ): Promise<{ result: Awaited<ReturnType<typeof reconcileOrphans>>; killCalls: string[]; statusCalls: string[]; deleteCalls: string[][]; errLog: string; entries: string; latch: ConflictLatch }> {
       const readLog = captureStartupErrors()
       const { cfg, home } = sweepConfig()
       const latch = createConflictLatch({ log: () => {} })
       setConflictLatch(latch)
       setConfiguredPersonaQuery((key) => cfg.personas.some((p) => p.key === key))
       const killCalls: import('agent-director').KillParams[] = []
+      const statusCalls: import('agent-director').StatusParams[] = []
       const deleteCalls: import('agent-director').DeleteParams[] = []
       installStub({
         killCalls,
+        statusCalls,
         deleteCalls,
-        listResult: { spawns: [cannedListRow({ claude_instance_id: id, labels: { service: 'cscb', persona } }, personaOf(cfg, 'alpha'), home)] },
-        ...kill,
+        listResult: { spawns: [cannedListRow({ claude_instance_id: id, state, labels: { service: 'cscb', persona } }, personaOf(cfg, 'alpha'), home)] },
+        ...script,
       })
       let result!: Awaited<ReturnType<typeof reconcileOrphans>>
       const errLog = await withCapturedErr(async () => {
-        result = await reconcileOrphans(cfg)
+        result = await reconcileOnClock(cfg)
       })
       return {
         result,
         killCalls: killCalls.map((k) => k.claude_instance_id),
+        statusCalls: statusCalls.map((c) => c.claude_instance_id),
         deleteCalls: deleteCalls.map((d) => d.claude_instance_id),
         errLog,
         entries: readLog(),
@@ -4489,13 +4525,16 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       ['a STATE name (ErrInstanceIdCollision), UNCLASSIFIED', () => errInstanceIdCollision()],
       ['a STATE name (ErrSpawnNotResumable), UNCLASSIFIED', () => errSpawnNotResumable()],
       ['a LAUNCH FAILURE name (ErrTmuxSessionCreate), UNCLASSIFIED', () => errTmuxSessionCreate('kill')],
-    ])('a configured persona\'s swept row whose kill answers %s: kept, no delete call, counted failed, one orphan-cleanup entry naming the outcome; nothing latches, no retry timer, no unclassified report', async (_label, make) => {
+    ])('a configured persona\'s swept row whose kill answers %s (at every try, b.jg5 SRJ-702: only UNAVAILABLE is tried again): kept, no delete call, counted failed, one orphan-cleanup entry naming the outcome that stands; nothing latches, no retry timer, no unclassified report', async (_label, make) => {
       const err = make()
+      const outcome = killOutcomeOf({ thrown: err })
+      const tries = outcome.kind === KILL_OUTCOME_NOT_KILLED && outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE ? KILL_RETRY_TRIES : 1
 
       const r = await sweepOne('cscb_alpha_old', 'alpha', { killError: err })
 
       expect(r.result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
-      expect(r.killCalls).toEqual(['cscb_alpha_old'])
+      expect(r.killCalls).toEqual(Array.from({ length: tries }, () => 'cscb_alpha_old'))
+      expect(r.statusCalls).toEqual(Array.from({ length: tries - 1 }, () => 'cscb_alpha_old'))
       expect(r.deleteCalls).toEqual([])
       expect(countStartupEntries(r.entries, 'orphan-cleanup')).toBe(1)
       expect(r.entries).toContain(keptEntry('cscb_alpha_old', renderPersonaRef('alpha', 'alpha'), killOutcomeOf({ thrown: err })))
@@ -4674,6 +4713,120 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       expect(outageEmissions.map((e) => e.key)).toEqual(configured ? [persona] : [])
       for (const key of ['beta', 'gamma']) expect(getOutageFlags(key).size).toBe(0)
       assertNoLeak({ errLog: r.errLog, entries: r.entries, outageEmissions })
+    })
+
+    // b.jg5 SRJ-702 (AC 56, AC 84): each sweep kill of a row listed live is
+    // tried up to 3 times 2 s apart, with one bare `status` read of the row
+    // before each further try, on the sweep's clock and with one pass budget:
+    // once a row has used its tries on UNAVAILABLE, every later kill in the
+    // pass is made once.
+    describe('b.jg5 SRJ-702: the sweep\'s kills take the bounded retry with one pass budget (AC 56, AC 84)', () => {
+      /** Sweep `rows` with the stub answering `script`, on a fake clock; the calls by instance id, the clock, the log and the result. */
+      async function sweepRows(
+        rows: (cfg: PersonaConfig, home: string) => import('agent-director').ListRow[],
+        script: Pick<StubClientOptions, 'killError' | 'killQueue' | 'statusQueue' | 'statusError'>,
+      ): Promise<{ result: Awaited<ReturnType<typeof reconcileOrphans>>; killCalls: string[]; statusCalls: string[]; deleteCalls: string[][]; clock: FakeClock; errLog: string; entries: string }> {
+        const readLog = captureStartupErrors()
+        const { cfg, home } = sweepConfig()
+        setConfiguredPersonaQuery((key) => cfg.personas.some((p) => p.key === key))
+        const killCalls: import('agent-director').KillParams[] = []
+        const statusCalls: import('agent-director').StatusParams[] = []
+        const deleteCalls: import('agent-director').DeleteParams[] = []
+        installStub({ killCalls, statusCalls, deleteCalls, listResult: { spawns: rows(cfg, home) }, ...script })
+        const clock = createFakeClock()
+        let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+        const errLog = await withCapturedErr(async () => {
+          result = await reconcileOnClock(cfg, clock)
+        })
+        const entries = readLog()
+        assertNoLeak({ errLog, entries, outageEmissions })
+        return {
+          result,
+          killCalls: killCalls.map((k) => k.claude_instance_id),
+          statusCalls: statusCalls.map((c) => c.claude_instance_id),
+          deleteCalls: deleteCalls.map((d) => d.claude_instance_id),
+          clock,
+          errLog,
+          entries,
+        }
+      }
+
+      /** A swept row of persona `persona` (`alpha`'s directory), id `id`, listed `state`. */
+      const sweptRow = (cfg: PersonaConfig, home: string, id: string, persona: string, state = 'waiting'): import('agent-director').ListRow =>
+        cannedListRow({ claude_instance_id: id, state, labels: { service: 'cscb', persona } }, personaOf(cfg, 'alpha'), home)
+
+      test('tmux wedged at start: the first live row gets the exported try count, every later live row (swept or pre-persona) one kill; the pass takes no more virtual time than one row\'s retries; nothing deleted, nothing armed', async () => {
+        const r = await sweepRows(
+          (cfg, home) => [sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'), prePersonaRow('waiting'), sweptRow(cfg, home, 'cscb_departed', 'departed')],
+          { killError: errTmuxUnresponsive('kill') },
+        )
+
+        expect(r.killCalls).toEqual([...Array.from({ length: KILL_RETRY_TRIES }, () => 'cscb_alpha_old'), 'cscb_old_waiting_C0OLD', 'cscb_departed'])
+        expect(r.statusCalls).toEqual(Array.from({ length: KILL_RETRY_TRIES - 1 }, () => 'cscb_alpha_old'))
+        expect(r.clock.now()).toBe((KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS)
+        expect(r.deleteCalls).toEqual([])
+        expect(r.result).toEqual({ found: 2, killed: 0, failed: 2, prePersona: { kept: 1, live: 1, killFailed: 1 } })
+        expect(armed).toEqual([])
+      })
+
+      test('the budget is the pass\'s own: a second pass over the same wedged rows gives its first live row its tries again', async () => {
+        const readLog = captureStartupErrors()
+        const { cfg, home } = sweepConfig()
+        const killCalls: import('agent-director').KillParams[] = []
+        installStub({
+          killCalls,
+          killError: errTmuxUnresponsive('kill'),
+          listResult: { spawns: [sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'), sweptRow(cfg, home, 'cscb_departed', 'departed')] },
+        })
+        const onePass = [...Array.from({ length: KILL_RETRY_TRIES }, () => 'cscb_alpha_old'), 'cscb_departed']
+
+        const errLog = await withCapturedErr(async () => {
+          await reconcileOnClock(cfg)
+          await reconcileOnClock(cfg)
+        })
+
+        expect(killCalls.map((k) => k.claude_instance_id)).toEqual([...onePass, ...onePass])
+        assertNoLeak({ errLog, entries: readLog() })
+      })
+
+      test('a first row whose tries end in a success leaves the budget unspent, so a later row still gets its tries; a row listed ended gets one kill and no read', async () => {
+        const unresponsive = (): CannedResponse<Phase1KillResult> => cannedErr(errTmuxUnresponsive('kill'))
+        const r = await sweepRows(
+          (cfg, home) => [
+            sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'),
+            sweptRow(cfg, home, 'cscb_gamma_old', 'gamma', 'ended'),
+            sweptRow(cfg, home, 'cscb_departed', 'departed'),
+          ],
+          { killQueue: [unresponsive(), cannedOk(cannedKillResult(true)), unresponsive(), unresponsive(), unresponsive(), unresponsive()] },
+        )
+
+        expect(r.killCalls).toEqual(['cscb_alpha_old', 'cscb_alpha_old', 'cscb_gamma_old', 'cscb_departed', 'cscb_departed', 'cscb_departed'])
+        expect(r.statusCalls).toEqual(['cscb_alpha_old', 'cscb_departed', 'cscb_departed'])
+        expect(r.deleteCalls).toEqual([['cscb_alpha_old']])
+        expect(r.result).toEqual({ found: 3, killed: 1, failed: 2, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+      })
+
+      test.each<[string, string, string, number, boolean]>([
+        ['a configured persona\'s row listed pending', 'pending', 'alpha', 1, true],
+        ['a configured persona\'s row listed waiting', 'waiting', 'alpha', KILL_RETRY_TRIES, true],
+        ['an absent persona\'s row listed pending', 'pending', 'departed', 1, false],
+        ['an absent persona\'s row listed waiting', 'waiting', 'departed', KILL_RETRY_TRIES, false],
+      ])('%s whose kill answers ErrTmuxUnresponsive and whose reads between tries answer CONFIG: %i kill(s); ad-config-malformed raised for a configured persona only, otherwise only logged; no retry timer, nothing deleted', async (_label, state, persona, kills, configured) => {
+        const id = persona === 'alpha' ? 'cscb_alpha_old' : 'cscb_departed'
+
+        const r = await sweepOne(id, persona, { killError: errTmuxUnresponsive('kill'), statusError: errConfigMalformed() }, state)
+
+        expect(r.killCalls).toEqual(Array.from({ length: kills }, () => id))
+        expect(r.statusCalls).toEqual(Array.from({ length: kills === 1 ? 1 : kills - 1 }, () => id))
+        expect(r.deleteCalls).toEqual([])
+        expect(r.result.failed).toBe(1)
+        expect([...getOutageFlags(persona)]).toEqual(configured ? ['ad-config-malformed'] : [])
+        expect(outageEmissions.map((e) => e.key)).toEqual(configured ? [persona] : [])
+        for (const key of ['beta', 'gamma']) expect(getOutageFlags(key).size).toBe(0)
+        if (!configured) expect(r.errLog.split('\n').filter((l) => l.includes(`instanceId=${id}`) && l.includes('CONFIG') && l.includes('logged only'))).toHaveLength(kills === 1 ? 1 : kills - 1)
+        expect(armed).toEqual([])
+        assertNoLeak({ errLog: r.errLog, entries: r.entries, outageEmissions })
+      })
     })
   })
 
@@ -13661,6 +13814,12 @@ interface LadderSite {
   /** Every launch and destructive call one such launch makes, the refused one included. */
   readonly calls: LaunchVerbCalls
   /**
+   * Set on a kill site whose row the ladder read live (b.jg5 SRJ-702): an
+   * UNAVAILABLE answer there is tried up to `KILL_RETRY_TRIES` times, so
+   * the launch makes that many kills (`siteCalls`).
+   */
+  readonly killReadLive?: true
+  /**
    * Set on the reconnect's sites only: the ladder branch (`waiting` or
    * `working`) whose reconnect meets the error. The reconnect answers
    * `transient` by SRJ-118's reconnect row, with its own lines in place of
@@ -13790,6 +13949,16 @@ const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
   },
 ]
 
+/**
+ * The calls one launch meeting `err` at `site` makes: the site's own, with
+ * the kill's tries when the site kills a row read live and `err` is
+ * UNAVAILABLE (b.jg5 SRJ-702).
+ */
+function siteCalls(site: LadderSite, err: Error): LaunchVerbCalls {
+  const retried = site.killReadLive === true && classifyAdError(err).errorClass === AD_ERROR_CLASS_UNAVAILABLE
+  return retried ? { ...site.calls, kill: KILL_RETRY_TRIES } : site.calls
+}
+
 /** The kill before each replacement: nothing is deleted or launched after it. */
 const KILL_SITES: readonly LadderSite[] = [
   {
@@ -13804,6 +13973,7 @@ const KILL_SITES: readonly LadderSite[] = [
     verb: 'kill',
     script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'waiting')), killError: err }),
     calls: ladderCallsOf({ spawn: 1, kill: 1 }),
+    killReadLive: true,
   },
   {
     name: 'the kill of a replacement (a row in another directory, read ended)',
@@ -13820,12 +13990,15 @@ const KILL_SITES: readonly LadderSite[] = [
       killError: err,
     }),
     calls: ladderCallsOf({ spawn: 1, sendKeys: 1, kill: 1 }),
+    killReadLive: true,
   },
   {
     name: 'the kill after the resume\'s ErrSpawnNotResumable',
     verb: 'kill',
     script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: err }),
     calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1 }),
+    // agent-director has just called the row live (ErrSpawnNotResumable).
+    killReadLive: true,
   },
 ]
 
@@ -14074,10 +14247,10 @@ async function expectRefusedAt(
   const script = site.script(h, persona, err)
   h.script(script)
 
-  const result = await h.launch(p)
+  const result = await h.drive(h.launch(p))
 
   expect(result).toStrictEqual({ key: p, action: 'failed', refused: true })
-  expect(ladderCallsMade(h)).toEqual(site.calls)
+  expect(ladderCallsMade(h)).toEqual(siteCalls(site, err))
   expect(h.notices).toEqual([])
   if (onsetText === undefined) {
     expect(h.outageNotices).toEqual([])
@@ -14102,7 +14275,7 @@ async function expectRefusedAt(
 
   // The restart path's launch meets the same refusal: 'refused', never counted.
   h.script(site.script(h, persona, err))
-  expect(await launchSession(p, h.config)).toBe('refused')
+  expect(await h.drive(launchSession(p, h.config))).toBe('refused')
   expect(getFailureCount(p)).toBe(0)
   expect(h.notices).toEqual([])
   expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
@@ -14300,8 +14473,9 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     const persona = harnessPersona(h, p)
     h.script({ ...collided(h, persona, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: make('kill') })
 
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
 
+    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
     expect(h.tmuxUnresponsive.holds(p)).toBe(true)
     const started = conditionStartedLines(h, p)
     expect(started).toHaveLength(1)
@@ -14312,7 +14486,9 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     srj105Harness = undefined
     const other = srj105Build()
     other.h.script({ ...collided(other.h, harnessPersona(other.h, other.p), elsewhere(other.h, 'ended')), killError: make('kill') })
-    expect(await other.h.launch(other.p)).toStrictEqual({ key: other.p, action: 'failed', refused: true })
+    expect(await other.h.drive(other.h.launch(other.p))).toStrictEqual({ key: other.p, action: 'failed', refused: true })
+    // A row read ended: its kill is one try (b.jg5 SRJ-702).
+    expect(other.h.stub.calls.killCalls).toHaveLength(1)
     expect(other.h.tmuxUnresponsive.holds(other.p)).toBe(false)
     expect(conditionStartedLines(other.h, other.p)).toEqual([])
   })
@@ -14539,11 +14715,17 @@ describe('b.jg5 SRJ-105, SRJ-605: a read error at the collision get or the ErrJs
 describe('b.jg5 SRJ-105 with E8\'s refusal marker: a refused kill on a replace path is followed by no delete and no launch, answers \'refused\' and is never counted', () => {
   afterEach(srj105AfterEach)
 
-  /** Each replace path, as the stub answers for the launch after the collision; its kill is its first kill. */
-  const REPLACE_PATHS: ReadonlyArray<readonly [string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined, Partial<LaunchVerbCalls>]> = [
-    ['resume_enabled false', (h, p) => collided(h, p, { state: 'ended' }), noResume, { spawn: 1, kill: 1 }],
-    ['a row in another directory', (h, p) => collided(h, p, elsewhere(h, 'ended')), undefined, { spawn: 1, kill: 1 }],
-    ['the resume\'s ErrSpawnNotResumable', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable() }), undefined, { spawn: 1, resume: 1, kill: 1 }],
+  /**
+   * Each replace path, as the stub answers for the launch after the
+   * collision; its kill is its first kill. The resume's ErrSpawnNotResumable
+   * kills a row agent-director has just called live, so an UNAVAILABLE
+   * answer there gets the kill's tries (b.jg5 SRJ-702); the other two kill a
+   * row read ended, one try.
+   */
+  const REPLACE_PATHS: ReadonlyArray<readonly [string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined, Partial<LaunchVerbCalls>, boolean]> = [
+    ['resume_enabled false', (h, p) => collided(h, p, { state: 'ended' }), noResume, { spawn: 1, kill: 1 }, false],
+    ['a row in another directory', (h, p) => collided(h, p, elsewhere(h, 'ended')), undefined, { spawn: 1, kill: 1 }, false],
+    ['the resume\'s ErrSpawnNotResumable', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable() }), undefined, { spawn: 1, resume: 1, kill: 1 }, true],
   ]
 
   /** The kill refusals: the UNAVAILABLE forms, and a CONFIG answer (b.jg5 SRJ-105's CONFIG row, SRJ-110, SRJ-316). */
@@ -14555,30 +14737,203 @@ describe('b.jg5 SRJ-105 with E8\'s refusal marker: a refused kill on a replace p
     ['an UNCLASSIFIED unhandled name (ErrKillBroken, b.jg5 SRJ-313)', (verb) => errGeneric(verb, 'ErrKillBroken'), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
   ]
 
-  const cross = REPLACE_PATHS.flatMap(([path, script, setup, calls]) => KILL_REFUSALS.map(([what, make]) => [path, what, script, setup, calls, make] as const))
+  const cross = REPLACE_PATHS.flatMap(([path, script, setup, calls, readLive]) => KILL_REFUSALS.map(([what, make]) => [path, what, script, setup, calls, readLive, make] as const))
 
-  test.each(cross)('%s, its kill answering %s: { failed, refused } from spawnForPersona, \'refused\' from launchSession, and the restart path\'s retry answers refused with the failure count still 0', async (_path, _what, script, setup, calls, make) => {
+  test.each(cross)('%s, its kill answering %s: { failed, refused } from spawnForPersona, \'refused\' from launchSession, and the restart path\'s retry answers refused with the failure count still 0', async (_path, _what, script, setup, calls, readLive, make) => {
     const { h, p } = srj105Build()
     const persona = harnessPersona(h, p)
     setup?.(h)
     h.script({ ...script(h, persona), killError: make('kill') })
+    const retried = readLive && classifyAdError(make('kill')).errorClass === AD_ERROR_CLASS_UNAVAILABLE
+    const kills = retried ? KILL_RETRY_TRIES : 1
 
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf(calls))
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ ...calls, kill: kills }))
 
     h.script({ ...script(h, persona), killError: make('kill') })
-    expect(await launchSession(p, h.config)).toBe('refused')
+    expect(await h.drive(launchSession(p, h.config))).toBe('refused')
     expect(h.stub.calls.deleteCalls).toEqual([])
 
     // The restart path: its liveness read finds the row dead, its own kill
-    // succeeds, and the launch's replacement kill is refused.
-    h.script({ ...script(h, persona), killError: undefined, killQueue: [cannedOk({}), cannedErr(make('kill'))], statusResult: cannedStatusResult({ state: 'ended' }) })
-    expect(await runRestartRetry(p, persona.working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+    // (one try, after a dead reading) succeeds, and the launch's replacement
+    // kill is refused at each of its tries, the reads between them finding
+    // the row live.
+    h.script({
+      ...script(h, persona),
+      killError: undefined,
+      killQueue: [cannedOk({}), ...Array.from({ length: kills }, () => cannedErr<Phase1KillResult>(make('kill')))],
+      statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))],
+      statusResult: cannedStatusResult({ state: 'waiting' }),
+    })
+    expect(await h.drive(runRestartRetry(p, persona.working_directory, isLaunchInFlight))).toBe(RESTART_OUTCOME_REFUSED)
 
     expect(h.stub.calls.deleteCalls).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     expect(h.notices).toEqual([])
     expect(h.capReached).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-702: the collision ladder's replacement kill of a row read live
+// takes the bounded retry (calling agent's resolution: E21/E22 replace these
+// kills later). On the recovery harness, its waits on the harness clock
+// (`h.drive`): up to 3 tries 2 s apart on UNAVAILABLE, one own-row `status`
+// read before each further try (the shared own-row read, which latches P on
+// an UNUSABLE NAME or its own `pending` row with no launch start), the
+// keep-going check (P not up), and the survivor rule's decision on the end
+// line (T3 raises the alert). The row is `waiting` in another directory.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-702: the collision ladder\'s replacement kill of a row read live makes its tries, reading the row before each further try', () => {
+  afterEach(srj105AfterEach)
+
+  /** P's launch whose optimistic spawn collides with its row read `waiting` in another directory, with `script` on top. */
+  function replaceLiveRow(h: RecoveryHarness, p: string, script: RecoveryStubScript): void {
+    h.script({ ...collided(h, harnessPersona(h, p), elsewhere(h, 'waiting')), ...script })
+  }
+
+  /** The lines naming a kill-failure alert decision of `kind`. */
+  const decisionLines = (h: RecoveryHarness, kind: string): string[] => h.errors.filter((line) => line.includes(`alert=${kind}`))
+
+  test('ErrTmuxUnresponsive at every try: the exported try count, 2 s apart, with one own-row status read before each further try; then no delete and no spawn; refused, uncounted, armed once', async () => {
+    const { h, p } = srj105Build()
+    replaceLiveRow(h, p, { killError: errTmuxUnresponsive('kill') })
+    const order = recordCallOrder(h)
+    const kills: number[] = []
+    const kill = h.stub.client.kill.bind(h.stub.client)
+    h.stub.client.kill = async (params) => {
+      kills.push(h.clock.now())
+      return kill(params)
+    }
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(order.filter((verb) => verb === 'kill' || verb === 'status')).toEqual(['kill', 'status', 'kill', 'status', 'kill'])
+    expect(kills).toEqual(Array.from({ length: KILL_RETRY_TRIES }, (_, i) => i * KILL_RETRY_SPACING_MS))
+    expect(h.stub.calls.statusCalls).toEqual(Array.from({ length: KILL_RETRY_TRIES - 1 }, () => ({ claude_instance_id: personaInstanceId(p) })))
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: KILL_RETRY_TRIES }))
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  test('a second-try success goes on to the delete and the fresh spawn; nothing is armed', async () => {
+    const { h, p } = srj105Build()
+    replaceLiveRow(h, p, { killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))] })
+
+    const result = await h.drive(h.launch(p))
+
+    expect(result.action).not.toBe('failed')
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, kill: 2, delete: 1 }))
+    expect(h.triggers).toEqual([])
+    expect(decisionLines(h, KILL_RETRY_ALERT_SURVIVOR)).toEqual([])
+  })
+
+  test('a survivor-naming ErrTmuxKillFailed, then a read of ended: the tries end as a success with no further kill, the delete and the fresh spawn follow, and the tries call for the survivor version; nothing is armed', async () => {
+    const { h, p } = srj105Build()
+    replaceLiveRow(h, p, {
+      killQueue: [cannedErr(errTmuxKillFailed(undefined, 'pane-process-survived'))],
+      statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))],
+    })
+
+    const result = await h.drive(h.launch(p))
+
+    expect(result.action).not.toBe('failed')
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }))
+    expect(decisionLines(h, KILL_RETRY_ALERT_SURVIVOR)).toHaveLength(1)
+    expect(decisionLines(h, KILL_RETRY_ALERT_ORDINARY)).toEqual([])
+    expect(h.triggers).toEqual([])
+  })
+
+  test('ErrTmuxKillFailed naming no survivor at every try: refused, armed once with the kill-failed cause, and the tries call for the ordinary version', async () => {
+    const { h, p } = srj105Build()
+    replaceLiveRow(h, p, { killError: errTmuxKillFailed() })
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: KILL_RETRY_TRIES }))
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
+    expect(decisionLines(h, KILL_RETRY_ALERT_ORDINARY)).toHaveLength(1)
+  })
+
+  // b.jg5 SRJ-702 (hatch A2), SRJ-502: a read between tries that latches P
+  // ends the tries with no further kill; the ladder answers latched, and
+  // nothing is armed for the latched persona.
+  test.each<[string, CannedResponse<Phase1StatusResult>, Record<string, unknown>]>([
+    ['an UNUSABLE NAME answer', cannedErr(errUnusableName()), { latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE }],
+    ['P\'s own row pending with no launch start', cannedOk(cannedStatusResult({ state: 'pending', launch_started_at: SAMPLE_LAUNCH_START_NONE })), { latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED, rowState: latchRowStateRead('pending') }],
+  ])('a read between tries answering %s latches P and ends the tries with no further kill: the launch answers latched; no delete, no spawn, nothing armed', async (_label, read, record) => {
+    const { h, p } = srj105Build()
+    replaceLiveRow(h, p, { killError: errTmuxUnresponsive('kill'), statusQueue: [read] })
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: 1 }))
+    expect(h.stub.calls.statusCalls).toHaveLength(1)
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect(h.latch.record(p)).toMatchObject(record)
+    expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)).toEqual([])
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  // b.jg5 SRJ-702, SRJ-501, SRJ-704, SRJ-1007: a second try answering
+  // CONFLICT is never tried again and latches P. The tries call for the
+  // ordinary version only after a survivor-naming ErrTmuxKillFailed; an
+  // earlier failure naming no survivor (or ErrTmuxUnresponsive) that the
+  // CONFLICT replaced as the last outcome calls for none.
+  test.each<[string, () => Error, number]>([
+    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), 0],
+    ['an ErrTmuxKillFailed naming no survivor', () => errTmuxKillFailed(), 0],
+    ['a survivor-naming ErrTmuxKillFailed', () => errTmuxKillFailed(undefined, 'pane-process-survived'), 1],
+  ])('a first try answering %s, then a second answering CONFLICT: latched, two kills and one read, no delete and no further spawn, no retry timer armed for P; the ordinary decision lines: %p', async (_label, makeFirst, ordinary) => {
+    const { h, p } = srj105Build()
+    replaceLiveRow(h, p, {
+      killQueue: [cannedErr(makeFirst()), cannedErr(errTmuxSessionConflict('kill', 'not-this-launch')), cannedErr(errTmuxUnresponsive('kill'))],
+    })
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: 2 }))
+    expect(h.stub.calls.statusCalls).toHaveLength(1)
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(h.triggers).toEqual([])
+    expect(decisionLines(h, KILL_RETRY_ALERT_ORDINARY)).toHaveLength(ordinary)
+    expect(decisionLines(h, KILL_RETRY_ALERT_SURVIVOR)).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  // b.jg5 SRJ-702, SRJ-316 (AC 84): the ladder read the row `waiting`, so a
+  // CONFIG answer at a read between tries raises the outage (one onset) and
+  // the next try goes ahead.
+  test('a CONFIG answer at each read between tries of a row read waiting: ad-config-malformed raised with one onset, and every try is made; the UNAVAILABLE outcome that stands is reported once', async () => {
+    const { h, p } = srj105Build()
+    const configErr = errConfigMalformed()
+    replaceLiveRow(h, p, { killError: errTmuxUnresponsive('kill'), statusError: configErr })
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: KILL_RETRY_TRIES }))
+    expect(h.stub.calls.statusCalls).toHaveLength(KILL_RETRY_TRIES - 1)
+    expect([...getOutageFlags(p)]).toEqual(['ad-config-malformed'])
+    expect(h.outageNotices).toEqual([{ key: p, text: adConfigMalformedOnset(configErr) }])
+    expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+  })
+
+  test('the keep-going check: P not up stops the tries after the first wait, with no read and no further kill; the uncounted refused result, nothing armed', async () => {
+    const { h, p } = srj105Build()
+    replaceLiveRow(h, p, { killError: errTmuxUnresponsive('kill') })
+    h.setUp(p, false)
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: 1 }))
+    expect(h.stub.calls.statusCalls).toEqual([])
+    expect(h.triggers).toEqual([])
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(getFailureCount(p)).toBe(0)
   })
 })
 

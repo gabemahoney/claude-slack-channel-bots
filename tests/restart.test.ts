@@ -4182,8 +4182,12 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
     expect(await _buildKillSessionAdapter()(a.key, LIVENESS_READING_DEAD_ENDED)).toMatchObject(expected)
 
     expect(killCalls.map((k) => k.claude_instance_id)).toEqual([personaInstanceId(a.key)])
+    // b.jg5 SRJ-702: the kill's one try (the run read the row dead) has its
+    // own line from the bounded retry; then the adapter's outcome line.
+    const [tryLine, ...outcomeLines] = adapterLines()
+    expect(tryLine).toContain(`: kill try 1 of 1 for ${personaInstanceId(a.key)}: `)
     // The error's stack frames (' at …', up to the line's tail) are left out.
-    expect(adapterLines().map((l) => l.replace(/ at .*?(?= — |$)/, ''))).toEqual([line(a.key)])
+    expect(outcomeLines.map((l) => l.replace(/ at .*?(?= — |$)/, ''))).toEqual([line(a.key)])
     assertNoLeak({ errArgs })
   })
 })
@@ -5572,6 +5576,9 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
 
     const KILL_THREW = new Error('the kill broke')
 
+    /** Whether the stand-in kill of the latched-after-the-kill cases has returned. */
+    let killed = false
+
     /** An `ErrInvalidFlags` non-success whose immediate version re-check decided that the server stops (b.jg5 SRJ-204, SRJ-205). */
     const STOPPING_KILL = { ...killOutcomeOf({ thrown: errInvalidFlags('kill') }), recheck: RECHECK_OUTCOME_STOP } as KillOutcome
 
@@ -5626,6 +5633,36 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       expect(errLines.filter((l) => l === line())).toHaveLength(1)
       // Exactly one of the two kill lines: the relaunch line or the not-succeeded line.
       expect(errLines.filter((l) => l.startsWith(killNotSucceededHead(P)))).toHaveLength(launched ? 0 : 1)
+    })
+
+    // b.jg5 SRJ-702, SRJ-502: a kill whose tries were stopped because P
+    // latched meanwhile (a `status` read between them latched it, or a latch
+    // set elsewhere while the kill ran) answers its last non-success; the
+    // work then asks the latched query again and answers latched, with no
+    // launch and nothing counted. A query that throws counts as latched.
+    test.each<[string, () => boolean]>([
+      ['the latched query answering true once the kill has returned', () => killed],
+      ['the latched query throwing once the kill has returned', () => { if (killed) throw new Error('query failed'); return false }],
+    ])('b.jg5 SRJ-702, SRJ-502: a non-success kill (UNAVAILABLE) after which P is latched, %s → latched: no launch, nothing counted', async (_label, isLatched) => {
+      killed = false
+      for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(P)
+      const answer = killOutcomeOf({ thrown: errTmuxUnresponsive('kill') })
+      const deps = makeDeps({
+        restartDelay: 0,
+        killSession: async () => {
+          killed = true
+          return answer
+        },
+      })
+      initRestart({ ...deps, isLatched })
+
+      expect(await runRestartRetry(P, CWD, () => false)).toBe(RESTART_OUTCOME_LATCHED)
+
+      expect(deps.killSessionCalls).toEqual([P])
+      expect(deps.launchSessionCalls).toEqual([])
+      expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP - 1)
+      expect(deps.onCapReachedCalls).toEqual([])
+      expect(errLines.filter((l) => l === killNotSucceededLine(P, describeKillOutcome(answer), true))).toHaveLength(1)
     })
 
     // b.jg5 SRJ-501: the kill is handed the run's last `dead` reading, which
@@ -5722,6 +5759,30 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       expect(h.stub.spawnedIds()).toEqual([])
       expect(h.errors).toContain(KILL_REFUSED_LINE(p, killOutcomeOf({ thrown: err })))
       expect(h.triggers).toEqual([{ key: p, kind: cause }])
+      expectNothingCounted(h, p)
+      expect(h.episodeNotices).toEqual([])
+    })
+
+    // b.jg5 SRJ-702 (reconcile note): the restart path kills only after a
+    // `dead` reading, so its kill is one try of the bounded retry: an
+    // UNAVAILABLE outcome stands at once, a later answer is never reached, no
+    // `status` read is made between tries and no wait is asked of the clock
+    // (the only timer is the retry timer the refusal armed, once).
+    test.each<[string, () => Error, string]>([
+      ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      ['a survivor-naming ErrTmuxKillFailed', () => errTmuxKillFailed(undefined, 'pane-process-survived'), UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+    ])('b.jg5 SRJ-702: the kill after a dead reading answers %s with a success queued behind it → one kill, refused: no launch, no read between tries, no wait; the timer armed once', async (_label, make, cause) => {
+      const { h, p, cwd } = build()
+      rowReadsUntilSpawn(h, 'ended')
+      h.script({ killQueue: [cannedErr(make()), cannedOk(cannedKillResult(true))] })
+
+      expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+
+      expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
+      expect(h.stub.spawnedIds()).toEqual([])
+      expect(h.triggers).toEqual([{ key: p, kind: cause }])
+      expect(h.clock.pendingCount()).toBe(1)
+      expect(h.controller.isArmed(p)).toBe(true)
       expectNothingCounted(h, p)
       expect(h.episodeNotices).toEqual([])
     })

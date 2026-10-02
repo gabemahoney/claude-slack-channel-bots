@@ -83,8 +83,15 @@
  *      included, and never throws; its context (`KILL_CONTEXT_ATTEMPT` or
  *      `KILL_CONTEXT_TEARDOWN`) is required. The ladder's replacement kills
  *      (`ladderKill`: a delete-then-spawn chain's kill and the
- *      `ErrSpawnNotResumable` branch's) go on to the delete and spawn only
- *      after a success (any `kill_sent`, `ErrSpawnNotFound`, or GONE). A
+ *      `ErrSpawnNotResumable` branch's) run through the bounded retry
+ *      (`retryPersonaKill`, `src/kill-retry.ts`; b.jg5 SRJ-702): a kill of a
+ *      row read live gets up to 3 tries 2 s apart on UNAVAILABLE, with the
+ *      own-row `status` read before each further try, and only the outcome
+ *      that stands is reported to the retry timer. They go on to the delete
+ *      and spawn only after the success that stands (any `kill_sent`,
+ *      `ErrSpawnNotFound`, GONE, or a read that found the row finished); a
+ *      stop of the tries answers `latched` for a latched persona, else the
+ *      uncounted refused result. A
  *      CONFLICT there latches the persona with the refused operation "P's
  *      next check or recovery" and is never sent again (b.jg5 SRJ-501,
  *      SRJ-505), an UNUSABLE NAME takes step 5's row, an `ErrInvalidFlags`
@@ -158,7 +165,8 @@
  * `service=cscb` spawn and kills any with a persona absent from the
  * applied configuration, an instance ID other than `cscb_<key>`, or a `cwd`
  * other than its persona's working directory, deleting it only after a kill
- * that succeeded (each kill a checked kill, b.jg5 SRJ-110, SRJ-701; it latches
+ * that succeeded (each kill a checked kill, b.jg5 SRJ-110, SRJ-701, run
+ * through the bounded retry with one pass budget, SRJ-702; it latches
  * nothing and arms no retry timer). A pre-persona row (no `persona`
  * label) is never deleted: it is kept, and killed only when live, with one
  * findMissing sweep after the kills so a killed row reads `missing` once its
@@ -223,6 +231,7 @@ import {
   raiseAdConfigMalformed,
   raiseTmuxUnavailable,
   reportAgentDirectorError,
+  reportDeferredUnavailable,
   reportUnclassifiedAtSite,
   setOutageFlag,
   withOutageDetection,
@@ -276,6 +285,24 @@ import {
   type KillOutcome,
 } from './checked-kill.ts'
 import {
+  KILL_RETRY_READ_FAILED,
+  KILL_RETRY_READ_LATCHED,
+  KILL_RETRY_READ_NO_ROW,
+  KILL_RETRY_READ_STATE,
+  KILL_RETRY_SEED_LIVE_UNREAD,
+  KILL_RETRY_SEED_NOT_LIVE_VALUE,
+  KILL_RETRY_SYSTEM_CLOCK,
+  createKillRetryPassBudget,
+  killRetrySeedOfState,
+  killRetryStopped,
+  runKillRetry,
+  type KillRetryPassBudget,
+  type KillRetryRead,
+  type KillRetryResult,
+  type KillRetrySeed,
+  type KillRetryWait,
+} from './kill-retry.ts'
+import {
   FULL_PANE_READ_LINES,
   PANE_READ_ABSENT,
   PANE_READ_CONFIG,
@@ -303,6 +330,7 @@ import {
   CONFLICT_LATCH_SET_SAME_CASE,
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   LATCH_CASE_NOT_THIS_LAUNCH,
+  LATCH_ROW_STATE_KIND_READ,
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
   REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
@@ -6460,6 +6488,14 @@ export interface KillPersonaInstanceOptions {
    * reading).
    */
   readonly rowReadLive?: boolean
+  /**
+   * `KILL_CONTEXT_ATTEMPT` only: true for one try of a bounded kill retry
+   * (`retryPersonaKill`; b.jg5 SRJ-702): the wrapper does not report an
+   * UNAVAILABLE answer (`OutageDetectionOptions.deferUnavailableReport`), so
+   * no try but the one whose outcome stands arms the retry timer or starts
+   * the `tmux-unresponsive` condition. Ignored for `KILL_CONTEXT_TEARDOWN`.
+   */
+  readonly deferUnavailableReport?: boolean
 }
 
 /**
@@ -6475,19 +6511,23 @@ export interface KillPersonaInstanceOptions {
  * that the server stops (`killOutcomeStopsServer`), nothing is reported and
  * the caller does nothing more (b.jg5 SRJ-205). In `KILL_CONTEXT_ATTEMPT`
  * an outcome of a class the kill has no row for is then reported as
- * UNCLASSIFIED (`reportUnlistedKillOutcome`). Never throws or rejects, and
+ * UNCLASSIFIED (`reportUnlistedKillOutcome`). With
+ * `options.deferUnavailableReport` (one try of `retryPersonaKill`) an
+ * UNAVAILABLE answer is not reported here. Never throws or rejects, and
  * never retries. Logs nothing, records no startup error, raises no notice of
  * its own and latches nothing: each caller acts on the outcome by its own
  * context. Its callers: the persona teardown (b.av2 SR-6.5, `main()`'s
- * binding, `KILL_CONTEXT_TEARDOWN`), the collision ladder's replacement
- * kills (`ladderKill`) and the restart path's kill
- * (`_buildKillSessionAdapter`, `src/server.ts`), both `KILL_CONTEXT_ATTEMPT`.
+ * binding, `KILL_CONTEXT_TEARDOWN`, one checked kill) and the bounded retry
+ * of the collision ladder's replacement kills and the restart path's kill
+ * (`retryPersonaKill`, `KILL_CONTEXT_ATTEMPT`, one call per try).
  */
 export async function killPersonaInstance(key: string, options: KillPersonaInstanceOptions): Promise<KillOutcome> {
   const call = adKillCall(options.rowReadLive === true)
   const inAttempt = options.context === KILL_CONTEXT_ATTEMPT
   const wrapperOptions = inAttempt
-    ? undefined
+    ? options.deferUnavailableReport === true
+      ? { deferUnavailableReport: true }
+      : undefined
     : { armsNothing: { personaConfigured: () => configuredReadingOf(key).configured } }
   const killed = await checkedKill(personaInstanceId(key), (params) =>
     withOutageDetection(key, undefined, call, (client) => client.kill(params), wrapperOptions),
@@ -6538,6 +6578,155 @@ function reportUnlistedKillOutcome(key: string, outcome: KillOutcome, call: AdKi
   }
 }
 
+// ---------------------------------------------------------------------------
+// The bounded retry of a persona's kill (b.jg5 SRJ-702)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the server tells a persona's kill retry (b.jg5 SRJ-702, SRJ-305):
+ * whether the persona is up (serving, its bring-up `up`, its key applied;
+ * false once it is torn down or not up) and whether the server is shutting
+ * down. Production installs one in `main()`. The latch is asked separately
+ * (`personaLatchedNow`).
+ */
+export interface PersonaKillKeepGoingQuery {
+  isPersonaUp(key: string): boolean
+  isShuttingDown(): boolean
+}
+
+let personaKillKeepGoingQuery: PersonaKillKeepGoingQuery | undefined
+
+/** Install (or, with `undefined`, remove) the persona kill retry's keep-going query. */
+export function setPersonaKillKeepGoingQuery(query: PersonaKillKeepGoingQuery | undefined): void {
+  personaKillKeepGoingQuery = query
+}
+
+/**
+ * The keep-going check of persona `key`'s kill retry: false once the
+ * persona is latched (`personaLatchedNow`, b.jg5 SRJ-502), or, with a query
+ * installed, once the server is shutting down or the persona is not up (a
+ * query that throws counts as false). With no query installed, only the
+ * latch is asked. Never throws.
+ */
+function personaKillKeepsGoing(key: string): boolean {
+  if (personaLatchedNow(key)) return false
+  const query = personaKillKeepGoingQuery
+  if (query === undefined) return true
+  try {
+    return query.isShuttingDown() !== true && query.isPersonaUp(key) === true
+  } catch {
+    return false
+  }
+}
+
+/** The collision ladder's kill retry clock: the production clock unless a suite sets its own. */
+let _ladderKillClock: KillRetryWait = KILL_RETRY_SYSTEM_CLOCK
+
+/** Test-only seam: run the collision ladder's kill retry waits on `clock` (a suite passes `createFakeClock()`). */
+export function _setLadderKillClock(clock: KillRetryWait): void {
+  _ladderKillClock = clock
+}
+
+/** Test-only seam: restore the production clock for the collision ladder's kill retry. */
+export function _resetLadderKillClock(): void {
+  _ladderKillClock = KILL_RETRY_SYSTEM_CLOCK
+}
+
+/** What `retryPersonaKill` is given. */
+export interface PersonaKillRetryOptions {
+  /** True when the path read the row in a live state: each try is a tmux-touching kill (`AdKillCall`). */
+  readonly rowReadLive: boolean
+  /** The row state the path last read (`src/kill-retry.ts`'s seed): only a live one gets the tries. */
+  readonly lastRead: KillRetrySeed
+  /** The head of the tries' and reads' lines (`[slack] <site>: …`). */
+  readonly site: string
+  /** The persona's reference, for the read's lines. */
+  readonly ref: string
+  /** The wait between tries. */
+  readonly clock: KillRetryWait
+}
+
+/** What the between-try read of a persona's own row is called in that read's lines. */
+const KILL_RETRY_READ_WHAT = 'status read between kill tries'
+
+/**
+ * The bounded retry of persona `key`'s kill inside a launch or recovery
+ * attempt (b.jg5 SRJ-702, SRJ-110; `runKillRetry`, `src/kill-retry.ts`):
+ *   - each try is one checked kill (`killPersonaInstance`,
+ *     `KILL_CONTEXT_ATTEMPT`, with `deferUnavailableReport`), so a try's
+ *     UNAVAILABLE answer arms nothing and starts nothing; every other answer
+ *     is reported at once, as it stands at once;
+ *   - the read between tries is the shared own-row `status` read
+ *     (`readPersonaOwnRowStatus`): through `withOutageDetection`, so a CONFIG
+ *     answer raises `ad-config-malformed` (b.jg5 SRJ-316) and, inside the
+ *     attempt, a failed read reports as any read does; a read of the
+ *     persona's own row `pending` with no launch start, or an UNUSABLE NAME
+ *     answer, latches the persona (b.jg5 SRJ-512, SRJ-513), which ends the
+ *     tries with no further kill;
+ *   - the keep-going check (`personaKillKeepsGoing`) ends the tries with no
+ *     further kill once the persona is latched, torn down or not up, or the
+ *     server is shutting down;
+ *   - only a seed read live gets the tries; any other kill is one try.
+ * Then, when the tries ended in a failure that no stop ended, its outcome is
+ * reported once (`reportDeferredUnavailable`, with the kill's declared call):
+ * an UNAVAILABLE outcome arms the persona's retry timer once (the
+ * kill-failed cause for `ErrTmuxKillFailed`) and, for a kill of a row read
+ * live, an UNAVAILABLE other than `ErrTmuxKillFailed` starts or continues
+ * its `tmux-unresponsive` condition. A success reports nothing more, and a
+ * stop reports nothing, so no retry timer is armed for a latched persona.
+ * Answers the retry's result, its alert decision included, for the caller's
+ * own handling of the outcome that stands. Never throws or rejects.
+ */
+export async function retryPersonaKill(key: string, options: PersonaKillRetryOptions): Promise<KillRetryResult> {
+  const call = adKillCall(options.rowReadLive)
+  const result = await runKillRetry({
+    instanceId: personaInstanceId(key),
+    kill: () =>
+      killPersonaInstance(key, { context: KILL_CONTEXT_ATTEMPT, rowReadLive: options.rowReadLive, deferUnavailableReport: true }),
+    read: () => readPersonaKillRow(key, options.site, options.ref),
+    wait: options.clock,
+    lastRead: options.lastRead,
+    keepGoing: () => personaKillKeepsGoing(key),
+    log: (line) => console.error(line),
+    logPrefix: `[slack] ${options.site}`,
+  })
+  if (result.outcome.kind === KILL_OUTCOME_NOT_KILLED && !killRetryStopped(result)) {
+    reportDeferredUnavailable(key, result.outcome.error, call)
+  }
+  return result
+}
+
+/** One between-try `status` read of persona `key`'s own row, as the kill retry takes it. Never throws. */
+async function readPersonaKillRow(key: string, site: string, ref: string): Promise<KillRetryRead> {
+  const read = await readPersonaOwnRowStatus(key, { site, what: KILL_RETRY_READ_WHAT, ref })
+  switch (read.kind) {
+    case OWN_ROW_STATUS_STATE:
+      return { kind: KILL_RETRY_READ_STATE, state: read.state }
+    case OWN_ROW_STATUS_ABSENT:
+      return { kind: KILL_RETRY_READ_NO_ROW }
+    case OWN_ROW_STATUS_LATCHED:
+      return { kind: KILL_RETRY_READ_LATCHED }
+    case OWN_ROW_STATUS_REFUSED:
+      return { kind: KILL_RETRY_READ_FAILED, error: read.error }
+  }
+}
+
+/**
+ * The kill retry's seed for a kill the collision ladder makes (b.jg5
+ * SRJ-702): a kill declared not of a row read live is one try; one declared
+ * live takes the state the ladder last read when that state is live (so a
+ * `pending` read keeps the CONFIG rule), and otherwise a known-live seed (the
+ * `ErrSpawnNotResumable` kill, whose row agent-director has just called
+ * live, or an unreadable state).
+ */
+function ladderKillSeed(call: AdKillCall, lastRead: LatchRowState): KillRetrySeed {
+  if (!call.rowReadLive) return KILL_RETRY_SEED_NOT_LIVE_VALUE
+  if (lastRead.kind === LATCH_ROW_STATE_KIND_READ && !AGENT_DIRECTOR_DEAD_STATES.has(lastRead.state)) {
+    return killRetrySeedOfState(lastRead.state)
+  }
+  return KILL_RETRY_SEED_LIVE_UNREAD
+}
+
 /** Delete persona `key`'s row (`cscb_<key>`) through `withOutageDetection`; rethrows every error. */
 function deleteInstanceRow(key: string): Promise<unknown> {
   return withOutageDetection(key, undefined, 'delete', (client) => client.delete({ claude_instance_id: [personaInstanceId(key)] }))
@@ -6562,15 +6751,23 @@ export async function deletePersonaInstance(key: string): Promise<boolean> {
 }
 
 /**
- * The collision ladder's replacement kill (b.jg5 SRJ-110, SRJ-701): one
- * checked kill through `killPersonaInstance`, inside the launch attempt
- * (`KILL_CONTEXT_ATTEMPT`). Never throws. Answers `undefined` only after a
- * success (any `kill_sent`, `ErrSpawnNotFound`, or GONE), with one line
- * naming the outcome: the chain goes on to its delete and spawn. Every other
- * outcome stops the chain (SRJ-110: "No step follows"), after which the
- * caller deletes and launches nothing and answers the result
- * `ladderKillStop` gives. The kill is never repeated. `call` declares
- * whether the ladder read the row in a live state (`AdKillCall`).
+ * The collision ladder's replacement kill (b.jg5 SRJ-110, SRJ-701, SRJ-702):
+ * the bounded retry of the persona's kill (`retryPersonaKill`), inside the
+ * launch attempt, on the ladder's kill clock (`_setLadderKillClock`). `call`
+ * declares whether the ladder read the row in a live state (`AdKillCall`);
+ * with `lastRead`, the row state the ladder last read, it gives the retry's
+ * seed (`ladderKillSeed`): a kill of a row read live gets up to 3 tries 2 s
+ * apart on UNAVAILABLE, with the own-row `status` read before each further
+ * try; any other kill is one try. Never throws. Answers `undefined` only
+ * after the success that stands (any `kill_sent`, `ErrSpawnNotFound`, GONE,
+ * or a read that found the row finished), with one line naming the outcome:
+ * the chain goes on to its delete and spawn. A stop of the tries (a read
+ * that latched the persona, or the keep-going check) answers `latched` when
+ * the persona is latched, else the uncounted refused result, with one line
+ * and nothing more called (`ladderKillStopped`). Every other outcome stops
+ * the chain (SRJ-110: "No step follows"), after which the caller deletes and
+ * launches nothing and answers the result `ladderKillStop` gives. The
+ * retry's alert decision stays on its result; this site raises no alert.
  */
 async function ladderKill(
   key: string,
@@ -6578,12 +6775,42 @@ async function ladderKill(
   ref: string,
   lastRead: LatchRowState,
 ): Promise<SpawnPersonaResult | undefined> {
-  const outcome = await killPersonaInstance(key, { context: KILL_CONTEXT_ATTEMPT, rowReadLive: call.rowReadLive })
+  const retried = await retryPersonaKill(key, {
+    rowReadLive: call.rowReadLive,
+    lastRead: ladderKillSeed(call, lastRead),
+    site: 'spawnForPersona',
+    ref,
+    clock: _ladderKillClock,
+  })
+  const { outcome } = retried
   if (killLetsNextStepRun(outcome)) {
     console.error(`[slack] spawnForPersona: kill for ${ref}: ${describeKillOutcome(outcome)} — the delete and the fresh spawn follow (b.jg5 SRJ-701)`)
     return undefined
   }
+  if (killRetryStopped(retried)) return ladderKillStopped(key, ref, outcome)
   return ladderKillStop(key, outcome, ref, lastRead)
+}
+
+/**
+ * What the collision ladder answers when its kill's tries were stopped
+ * (b.jg5 SRJ-702, SRJ-502): `latched` when the persona is latched (a read
+ * between tries latched it, or it latched elsewhere), else (torn down, not
+ * up, or the server shutting down) the uncounted refused result, a `failed`
+ * result with the refusal marker that `launchSession` answers as `'refused'`
+ * and the restart path never counts. One line; no delete or launch follows,
+ * and nothing was reported for the kill, so no retry timer was armed by it.
+ */
+function ladderKillStopped(key: string, ref: string, outcome: KillOutcome): SpawnPersonaResult {
+  if (personaLatchedNow(key)) {
+    console.error(
+      `[slack] spawnForPersona: kill for ${ref} did not succeed (${describeKillOutcome(outcome)}) and its tries were stopped: the persona is latched — answering latched; no delete or launch follows (b.jg5 SRJ-702, SRJ-502)`,
+    )
+    return { key, action: 'latched' }
+  }
+  console.error(
+    `[slack] spawnForPersona: kill for ${ref} did not succeed (${describeKillOutcome(outcome)}) and its tries were stopped (the persona is not up or is torn down, or the server is shutting down) — answering the uncounted refused result; no delete or launch follows (b.jg5 SRJ-702)`,
+  )
+  return { key, action: 'failed', refused: true }
 }
 
 /**
@@ -6786,7 +7013,7 @@ async function tryDelete(
 
 /**
  * Replace the persona's row with a fresh spawn: kill it (when `kill` is set,
- * for a row that may still be live; one checked kill, `ladderKill`), delete
+ * for a row that may still be live; the bounded retry, `ladderKill`), delete
  * it only after the kill succeeded, spawn fresh
  * and run dialog approval. The collision ladder's kill+delete+fresh paths go
  * through here: `resume_enabled: false`, a row whose `cwd` differs from the
@@ -6795,8 +7022,9 @@ async function tryDelete(
  * ladder read the row in a live state, which makes the kill tmux-touching
  * (b.jg5 glossary, `AdKillCall`).
  *
- * - A kill that did not succeed (b.jg5 SRJ-110, SRJ-701, `ladderKillStop`)
- *   stops the chain: no delete, no launch. A CONFLICT latches the persona
+ * - A kill whose standing outcome is not a success (b.jg5 SRJ-110, SRJ-701,
+ *   SRJ-702; `ladderKillStopped`, `ladderKillStop`) stops the chain: no
+ *   delete, no launch. A CONFLICT latches the persona
  *   with the refused operation "P's next check or recovery" and
  *   `opts.lastRead`, and an UNUSABLE NAME with `opts.lastRead` (b.jg5
  *   SRJ-512), each returning `latched`; every other class returns `failed`.
@@ -8513,10 +8741,11 @@ function sweepDecision(
  * label (b.1ix; the rows a build that predates personas made, instance IDs
  * `cscb_<name>_<channel>`): the row is kept, never deleted. Its ID is never a
  * persona's `cscb_<key>`, so no launch reuses or resumes it, and keeping it is
- * harmless. A row in a live state gets one checked kill at this start
- * (`sweepKill`; b.jg5 SRJ-110, SRJ-701) and its outcome logged; an `ended` or
- * `missing` row is left alone, with no call and no line. Returns whether it
- * called `kill`.
+ * harmless. A row in a live state gets its kill at this start, through the
+ * bounded retry with the pass's budget (`sweepKill`; b.jg5 SRJ-110, SRJ-701,
+ * SRJ-702), and the outcome that stands logged; an `ended` or `missing` row
+ * is left alone, with no call and no line. Returns whether it called
+ * `kill`.
  *
  * agent-director 0.10.0's `kill` doesn't change the row's state, so a killed
  * row would still read live at every later start and be killed again each
@@ -8544,11 +8773,11 @@ function sweepDecision(
  * so no outage is raised for it and nothing latches.
  */
 async function keepPrePersonaRow(
-  client: Client,
+  pass: SweepPass,
   row: ListRow,
   counts: PrePersonaSweepCounts,
-  stop: SweepStop,
 ): Promise<boolean> {
+  const { stop } = pass
   counts.kept++
   if (!AGENT_DIRECTOR_LIVE_STATES.has(row.state)) return false
   counts.live++
@@ -8556,7 +8785,7 @@ async function keepPrePersonaRow(
   console.error(
     `[slack] reconcileOrphans: pre-persona row (no persona label) instanceId=${id} state=${row.state} tmux_session=${row.tmux_session_name} is live — killing it; the row is kept (a pre-persona row is never deleted)`,
   )
-  const outcome = await sweepKill(client, id, undefined, stop)
+  const { outcome } = await sweepKill(pass, id, row.state, undefined)
   if (!killLetsNextStepRun(outcome)) {
     counts.killFailed++
     if (stop.stopping) {
@@ -8583,6 +8812,22 @@ interface SweepStop {
 }
 
 /**
+ * One start sweep pass's kill context: the sweep's own client, its stop
+ * flag, its pass budget (b.jg5 SRJ-702, AC 56: once one row's kill has used
+ * its tries on UNAVAILABLE, every later kill in the pass is made once) and
+ * the clock its retries wait on.
+ */
+interface SweepPass {
+  readonly client: Client
+  readonly stop: SweepStop
+  readonly budget: KillRetryPassBudget
+  readonly clock: KillRetryWait
+}
+
+/** The start sweep's line prefix, its kill retry's lines included. */
+const SWEEP_LOG_PREFIX = '[slack] reconcileOrphans'
+
+/**
  * The start sweep's line when a kill's `ErrInvalidFlags` re-check decided
  * that the server stops (b.jg5 SRJ-104, SRJ-204, SRJ-205): the row is kept,
  * and the sweep makes no further call. `described` is the outcome's
@@ -8593,41 +8838,109 @@ function sweepStoppedLine(instanceId: string, described: string): string {
 }
 
 /**
- * One start-sweep kill (b.jg5 SRJ-110, SRJ-701): one checked kill of
- * `instanceId` on the sweep's own client, answering its outcome. The start
- * sweep is no launch or recovery attempt: nothing latches (a CONFLICT or an
- * UNUSABLE NAME answer is recorded, b.jg5 SRJ-1002), no retry timer is armed,
- * no `tmux-unresponsive` condition starts and no unclassified-error episode
- * is fed (a class the kill has no row for is UNCLASSIFIED and only recorded).
- * An `ErrInvalidFlags` gets exactly one immediate version re-check
- * (`recheckKillOnInvalidFlags`; b.jg5 SRJ-104, SRJ-204); when it decides that
+ * One start-sweep kill (b.jg5 SRJ-110, SRJ-701, SRJ-702): the bounded retry
+ * (`runKillRetry`, `src/kill-retry.ts`) of `instanceId`'s kill on the
+ * sweep's own client, seeded with `listedState`, the state the sweep listed
+ * the row in, on the pass's clock and with the pass's budget: a row listed
+ * live gets up to 3 tries 2 s apart on UNAVAILABLE, until one row of the
+ * pass has used its tries that way, after which every later kill in the
+ * pass is made once (AC 56); a row listed finished gets one kill. Each try
+ * is one checked kill (`sweepKillTry`); before each further try, one bare
+ * `status` read of the row (`sweepKillRead`). Each try and read is logged
+ * with the sweep's prefix. Answers the retry's result, whose alert decision
+ * this site keeps; it raises no alert.
+ *
+ * The start sweep is no launch or recovery attempt: nothing latches (a
+ * CONFLICT or an UNUSABLE NAME answer is recorded, b.jg5 SRJ-1002), no retry
+ * timer is armed, no `tmux-unresponsive` condition starts and no
+ * unclassified-error episode is fed (a class the kill has no row for is
+ * UNCLASSIFIED and only recorded). An `ErrInvalidFlags` gets exactly one
+ * immediate version re-check (`recheckKillOnInvalidFlags`; b.jg5 SRJ-104,
+ * SRJ-204); when the outcome that stands is one whose re-check decided that
  * the server stops, `stop.stopping` is set and the caller does nothing more
- * (b.jg5 SRJ-205). An ENVIRONMENT answer raises
- * `tmux-unavailable`, and a CONFIG answer `ad-config-malformed`, for
- * `configuredKey` only: the persona of the applied configuration the row's
- * label names, `undefined` for a row of an absent persona or with no persona
- * label, whose answer is only logged and recorded by the caller (b.jg5
- * SRJ-110, SRJ-301, SRJ-1002; hatch A3). Never throws.
+ * (b.jg5 SRJ-205). Of the outcome that stands only (hatch A3, through the
+ * tries), an ENVIRONMENT answer raises `tmux-unavailable`, and a CONFIG
+ * answer `ad-config-malformed`, for `configuredKey` only: the persona of the
+ * applied configuration the row's label names, `undefined` for a row of an
+ * absent persona or with no persona label, whose answer is only logged and
+ * recorded by the caller (b.jg5 SRJ-110, SRJ-301, SRJ-1002). Never throws.
  */
 async function sweepKill(
-  client: Client,
+  pass: SweepPass,
   instanceId: string,
+  listedState: string,
   configuredKey: string | undefined,
-  stop: SweepStop,
-): Promise<KillOutcome> {
-  const outcome = await recheckKillOnInvalidFlags(await checkedKill(instanceId, (params) => client.kill(params)))
-  if (killOutcomeStopsServer(outcome)) stop.stopping = true
+): Promise<KillRetryResult> {
+  const result = await runKillRetry({
+    instanceId,
+    kill: () => sweepKillTry(pass.client, instanceId),
+    read: () => sweepKillRead(pass.client, instanceId, configuredKey),
+    wait: pass.clock,
+    lastRead: killRetrySeedOfState(listedState),
+    budget: pass.budget,
+    log: (line) => console.error(line),
+    logPrefix: SWEEP_LOG_PREFIX,
+  })
+  const { outcome } = result
+  if (killOutcomeStopsServer(outcome)) pass.stop.stopping = true
   if (configuredKey !== undefined && outcome.kind === KILL_OUTCOME_NOT_KILLED) {
     try {
       if (outcome.errorClass === AD_ERROR_CLASS_ENVIRONMENT) raiseTmuxUnavailable(configuredKey, outcome.error)
       else if (outcome.errorClass === AD_ERROR_CLASS_CONFIG) raiseAdConfigMalformed(configuredKey, outcome.error)
     } catch (err) {
       console.error(
-        `[slack] reconcileOrphans: raising the outage for persona=${configuredKey} failed: ${describeThrownValue(err)}`,
+        `${SWEEP_LOG_PREFIX}: raising the outage for persona=${configuredKey} failed: ${describeThrownValue(err)}`,
       )
     }
   }
-  return outcome
+  return result
+}
+
+/**
+ * One try of a start-sweep kill: one checked kill of `instanceId` on the
+ * sweep's own client, with the `ErrInvalidFlags` re-check
+ * (`recheckKillOnInvalidFlags`). Never throws.
+ */
+async function sweepKillTry(client: Client, instanceId: string): Promise<KillOutcome> {
+  return recheckKillOnInvalidFlags(await checkedKill(instanceId, (params) => client.kill(params)))
+}
+
+/**
+ * One `status` read of a swept row between its kill's tries (b.jg5 SRJ-702),
+ * on the sweep's own client: its state, or no row for `ErrSpawnNotFound` (by
+ * name), or a failed read that latches nothing (the start sweep latches
+ * nothing; an UNUSABLE NAME answer is a failed read). A CONFIG answer raises
+ * `ad-config-malformed` for `configuredKey` only, through its raise entry,
+ * arming no retry timer, and is otherwise only logged (b.jg5 SRJ-110,
+ * SRJ-316; hatch A3); the retry then ends the tries when the row was last
+ * read `pending`. Never throws.
+ */
+async function sweepKillRead(client: Client, instanceId: string, configuredKey: string | undefined): Promise<KillRetryRead> {
+  try {
+    const result = await client.status({ claude_instance_id: instanceId })
+    return { kind: KILL_RETRY_READ_STATE, state: result.state }
+  } catch (err) {
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: KILL_RETRY_READ_NO_ROW }
+    if (classifyAdError(err).errorClass === AD_ERROR_CLASS_CONFIG) sweepReadConfigAnswer(instanceId, configuredKey, err)
+    return { kind: KILL_RETRY_READ_FAILED, error: err }
+  }
+}
+
+/** A CONFIG answer at a swept row's between-try read: raised for a configured persona, else one line. Never throws. */
+function sweepReadConfigAnswer(instanceId: string, configuredKey: string | undefined, err: unknown): void {
+  if (configuredKey === undefined) {
+    console.error(
+      `${SWEEP_LOG_PREFIX}: the status read between kill tries for instanceId=${instanceId} answered CONFIG; the row names no persona of the applied configuration, so no outage is raised — logged only (b.jg5 SRJ-110, SRJ-316)`,
+    )
+    return
+  }
+  try {
+    raiseAdConfigMalformed(configuredKey, err)
+  } catch (raiseErr) {
+    console.error(
+      `${SWEEP_LOG_PREFIX}: raising the outage for persona=${configuredKey} failed: ${describeThrownValue(raiseErr)}`,
+    )
+  }
 }
 
 /**
@@ -8699,9 +9012,10 @@ interface KilledPrePersonaRow {
 }
 
 /**
- * Kill one row the start sweep swept (one checked kill, `sweepKill`; b.jg5
- * SRJ-110, SRJ-701), then delete it only after a success (any `kill_sent`,
- * or `ErrSpawnNotFound`). A kill that did not succeed keeps the row: no
+ * Kill one row the start sweep swept (the bounded retry with the pass's
+ * budget, `sweepKill`; b.jg5 SRJ-110, SRJ-701, SRJ-702), then delete it only
+ * after the success that stands (any `kill_sent`, `ErrSpawnNotFound`, GONE,
+ * or a read between tries that found the row finished). A kill that did not succeed keeps the row: no
  * delete call is made, and one `orphan-cleanup` entry names the outcome
  * (`kill did not succeed for orphan instanceId=<id> persona=<persona>:
  * <outcome>; row kept, no delete was made, its session may still be
@@ -8716,14 +9030,14 @@ interface KilledPrePersonaRow {
  *   [slack] reconcileOrphans: kill succeeded for orphan instanceId=<id> (<outcome>) — deleting the row
  */
 async function killAndDeleteSweptRow(
-  client: Client,
+  pass: SweepPass,
   row: ListRow,
   displayPersona: string,
   configuredKey: string | undefined,
-  stop: SweepStop,
 ): Promise<boolean> {
+  const { client, stop } = pass
   const id = row.claude_instance_id
-  const outcome = await sweepKill(client, id, configuredKey, stop)
+  const { outcome } = await sweepKill(pass, id, row.state, configuredKey)
   if (!killLetsNextStepRun(outcome)) {
     if (stop.stopping) {
       console.error(sweepStoppedLine(id, describeKillOutcome(outcome)))
@@ -8773,8 +9087,12 @@ async function killAndDeleteSweptRow(
  *   [slack] reconcileOrphans: persona "<name>" (key=<key>) working_directory="<path>" cannot be resolved to a real path — keeping its rows; the cwd check is deferred to its launch
  *
  * A `channel` label left on a row by an older spawn plays no part. Every kill
- * is a checked kill (`sweepKill`; b.jg5 SRJ-110, SRJ-701): a swept row whose
- * kill did not succeed is kept, with no delete call, and counted failed. A
+ * is a checked kill, run through the bounded retry (`sweepKill`; b.jg5
+ * SRJ-110, SRJ-701, SRJ-702) with one pass budget for the whole pass, so a
+ * wedged tmux delays the pass by at most one row's retries (AC 56), on
+ * `clock` (the production clock unless the caller passes its own): a swept
+ * row whose kill did not succeed is kept, with no delete call, and counted
+ * failed. A
  * kill whose `ErrInvalidFlags` re-check decides that the server stops ends
  * the sweep: no further row is handled and no findMissing sweep follows
  * (b.jg5 SRJ-205); the summary line is still logged. No
@@ -8788,6 +9106,7 @@ async function killAndDeleteSweptRow(
  */
 export async function reconcileOrphans(
   personaConfig: PersonaConfig,
+  clock: KillRetryWait = KILL_RETRY_SYSTEM_CLOCK,
 ): Promise<OrphanReconcileResult> {
   if (isDryRun()) {
     console.error('[slack] dry-run: skipping orphan reconciliation')
@@ -8814,6 +9133,7 @@ export async function reconcileOrphans(
   const deferredLogged = new Set<string>()
   const killedPrePersonaRows: KilledPrePersonaRow[] = []
   const stop: SweepStop = { stopping: false }
+  const pass: SweepPass = { client, stop, budget: createKillRetryPassBudget(), clock }
 
   for (const row of rows) {
     // b.jg5 SRJ-205: a kill's version re-check decided that the server
@@ -8821,7 +9141,7 @@ export async function reconcileOrphans(
     if (stop.stopping) break
     const personaLabel = row.labels?.[PERSONA_LABEL_KEY]
     if (!personaLabel) {
-      if (await keepPrePersonaRow(client, row, result.prePersona, stop)) {
+      if (await keepPrePersonaRow(pass, row, result.prePersona)) {
         killedPrePersonaRows.push({ id: row.claude_instance_id, state: row.state })
       }
       continue
@@ -8849,7 +9169,7 @@ export async function reconcileOrphans(
     console.error(
       `[slack] reconcileOrphans: sweeping row (${reason}) persona=${displayPersona} instanceId=${row.claude_instance_id} state=${row.state}${cwdDetail} — killing and deleting`,
     )
-    if (await killAndDeleteSweptRow(client, row, displayPersona, persona?.key, stop)) result.killed++
+    if (await killAndDeleteSweptRow(pass, row, displayPersona, persona?.key)) result.killed++
     else result.failed++
   }
 

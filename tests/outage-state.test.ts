@@ -43,6 +43,7 @@ import {
   withOutageDetection,
   withSpawnDetection,
   reportAgentDirectorError,
+  reportDeferredUnavailable,
   reportUnclassifiedAtSite,
   ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
@@ -1617,6 +1618,155 @@ async function runIn<T>(context: Context, body: () => Promise<T> | T): Promise<{
     return { result, lastError: attempt.lastError }
   })
 }
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-702, SRJ-301, SRJ-307: one try of a bounded kill retry is wrapped
+// with `deferUnavailableReport`, so its UNAVAILABLE answer reports nothing
+// (no retry-timer arm, no `tmux-unresponsive` start, no attempt record, no
+// flag); the caller reports the outcome that stands once, through
+// `reportDeferredUnavailable`, with the kill's declared call. Every other
+// value is handled as the plain wrapper handles it.
+// ---------------------------------------------------------------------------
+
+describe('a kill try\'s deferred UNAVAILABLE report and the one standing report (b.jg5 SRJ-702, SRJ-301, SRJ-307)', () => {
+  /** A fresh outage state over the default stub client, with recording trigger and condition sinks. */
+  function makeKillReportHarness(): { emissions: Emission[]; arms: Array<{ key: string; kind: string }>; starts: Array<{ key: string; verb: string }>; ends: string[] } {
+    const emissions: Emission[] = []
+    const arms: Array<{ key: string; kind: string }> = []
+    const starts: Array<{ key: string; verb: string }> = []
+    const ends: string[] = []
+    const client = makeStubClient()
+    _resetOutageState()
+    initOutageState({
+      notify: (key, text) => { emissions.push({ key, text }) },
+      getClient: () => client as unknown as Client,
+      triggerSink: { arm: (key, cause) => { arms.push({ key, kind: cause.kind }); return true } },
+      conditionSink: {
+        start: (key, verb) => { starts.push({ key, verb }); return 'started' },
+        end: (key) => { ends.push(key); return 'ended' },
+      },
+    })
+    return { emissions, arms, starts, ends }
+  }
+
+  /** One deferred kill try for P1, declared `call`, whose call answers `answer` (a thrown value, or a result). */
+  async function deferredTry(call: AdCall, answer: { thrown: unknown } | { result: unknown }): Promise<unknown> {
+    try {
+      return await withOutageDetection(P1, undefined, call, async () => {
+        if ('thrown' in answer) throw answer.thrown
+        return answer.result
+      }, { deferUnavailableReport: true })
+    } catch (err) {
+      return err
+    }
+  }
+
+  /** The kill's UNAVAILABLE forms, `ErrTmuxKillFailed` among them, each with the cause it arms. */
+  const KILL_UNAVAILABLE = unavailableForms('ErrTmuxUnresponsive', 'ErrCallTimeout', 'ErrUnknownErrorName', 'a wrapped UnknownError', 'ErrTmuxKillFailed', 'a plain Error')
+
+  /** The kill's two declared calls: of a row read live (tmux-touching) and not. */
+  const KILL_CALLS: ReadonlyArray<readonly [string, AdCall]> = [
+    ['a kill of a row read live', AD_CALL_KILL_ROW_READ_LIVE],
+    ['a kill of a row not read live', AD_CALL_KILL_ROW_NOT_READ_LIVE],
+  ]
+
+  test.each(KILL_UNAVAILABLE.flatMap(([form, make]) => KILL_CALLS.map(([what, call]) => [form, what, make, call] as const)))('inside P\'s attempt, a deferred try answering %s (%s) reports nothing: no arm, no condition start, no attempt record, no flag or notice; rethrown unchanged', async (_form, _what, make, call) => {
+    const { emissions, arms, starts, ends } = makeKillReportHarness()
+    const err = make('kill')
+
+    const { result: rejected, lastError } = await runIn('inside P\'s attempt', () => deferredTry(call, { thrown: err }))
+
+    expect(rejected).toBe(err)
+    expect(arms).toEqual([])
+    expect(starts).toEqual([])
+    expect(ends).toEqual([])
+    expect(lastError).toBeUndefined()
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect(emissions).toEqual([])
+  })
+
+  test.each(KILL_UNAVAILABLE.flatMap(([form, make, kind]) => KILL_CALLS.map(([what, call]) => [form, what, make, kind, call] as const)))('inside P\'s attempt, the standing report of %s (%s) reports it once: one arm with its cause, the attempt record with the kill verb, and a condition start only for a tmux-touching kill and not for ErrTmuxKillFailed', async (_form, _what, make, kind, call) => {
+    const { emissions, arms, starts } = makeKillReportHarness()
+    const err = make('kill')
+
+    const { lastError } = await runIn('inside P\'s attempt', () => reportDeferredUnavailable(P1, err, call))
+
+    expect(arms).toEqual([{ key: P1, kind }])
+    expect(lastError).toEqual({ verb: AD_VERB_KILL, causeKind: kind, armed: true })
+    const startsCondition = call === AD_CALL_KILL_ROW_READ_LIVE && kind !== UNAVAILABLE_RETRY_CAUSE_KILL_FAILED
+    expect(starts).toEqual(startsCondition ? [{ key: P1, verb: AD_VERB_KILL }] : [])
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect(emissions).toEqual([])
+  })
+
+  test.each(CONTEXTS.filter((context) => context !== 'inside P\'s attempt'))('%s, the standing report arms nothing and starts nothing', async (context) => {
+    const { arms, starts } = makeKillReportHarness()
+
+    await runIn(context, () => reportDeferredUnavailable(P1, errTmuxUnresponsive('kill'), AD_CALL_KILL_ROW_READ_LIVE))
+
+    expect(arms).toEqual([])
+    expect(starts).toEqual([])
+  })
+
+  test.each<[string, () => unknown]>([
+    ['ENVIRONMENT (ErrTmuxNotAvailable)', () => errTmuxNotAvailable(undefined, 'kill')],
+    ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed()],
+    ['UNCLASSIFIED (ErrInternal)', () => errInternal()],
+    ['UNUSABLE NAME', () => errUnusableName()],
+    ['ErrSpawnNotFound', () => errSpawnNotFound()],
+  ])('the standing report of %s reports nothing: its try reported it at once', async (_label, make) => {
+    const { emissions, arms, starts } = makeKillReportHarness()
+
+    const { lastError } = await runIn('inside P\'s attempt', () => reportDeferredUnavailable(P1, make(), AD_CALL_KILL_ROW_READ_LIVE))
+
+    expect(arms).toEqual([])
+    expect(starts).toEqual([])
+    expect(lastError).toBeUndefined()
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect(emissions).toEqual([])
+  })
+
+  test.each<[string, () => unknown]>([
+    ['ENVIRONMENT (ErrTmuxNotAvailable)', () => errTmuxNotAvailable(undefined, 'kill')],
+    ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed()],
+    ['UNCLASSIFIED (ErrInternal)', () => errInternal()],
+    ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(undefined, 'kill')],
+  ])('a deferred try answering %s is handled exactly as the plain wrapper handles it, inside P\'s attempt: the same flags, notices, arms, condition calls and attempt record', async (_label, make) => {
+    /** One run of a kill of a row read live answering `make()`, deferred or plain. */
+    async function runWith(deferred: boolean): Promise<unknown> {
+      const { emissions, arms, starts, ends } = makeKillReportHarness()
+      const err = make()
+      const { result: rejected, lastError } = await runIn('inside P\'s attempt', async () => {
+        try {
+          await withOutageDetection(P1, undefined, AD_CALL_KILL_ROW_READ_LIVE, async () => { throw err }, deferred ? { deferUnavailableReport: true } : undefined)
+        } catch (thrown) {
+          return thrown
+        }
+        return undefined
+      })
+      return { same: rejected === err, flags: [...getOutageFlags(P1)].sort(), emissions, arms, starts, ends, lastError }
+    }
+
+    const plain = await runWith(false)
+    const deferred = await runWith(true)
+
+    expect(deferred).toEqual(plain)
+    expect((deferred as { same: boolean }).same).toBe(true)
+  })
+
+  test('a deferred try that succeeds clears and ends as the plain wrapper does: the flags it clears are cleared, and a tmux-touching kill ends the condition', async () => {
+    const { arms, ends } = makeKillReportHarness()
+    setOutageFlag(P1, 'tmux-unavailable')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+
+    const result = await runIn('inside P\'s attempt', () => deferredTry(AD_CALL_KILL_ROW_READ_LIVE, { result: { kill_sent: true } }))
+
+    expect(result.result).toEqual({ kill_sent: true })
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect(ends).toEqual([P1])
+    expect(arms).toEqual([])
+  })
+})
 
 describe('what clears tmux-unavailable (b.jg5 SRJ-312: AC 27, AC 36)', () => {
   test('pin: the calls the not-tmux-touching rows below run over include every one the SRD names (status, get, list, find-missing, delete, kill of a row not read live)', () => {

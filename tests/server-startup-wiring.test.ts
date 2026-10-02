@@ -296,6 +296,7 @@ import type {
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
 import type { FullModeRetryDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
 import type * as LivenessReadingModule from '../src/liveness-reading.ts'
+import type * as KillRetryModule from '../src/kill-retry.ts'
 import type * as SessionManagerModule from '../src/session-manager.ts'
 import type { HealthCheckDeps } from '../src/health-check.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
@@ -311,6 +312,20 @@ const SERVER_PATH = join(SRC_DIR, 'server.ts')
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync(SERVER_PATH, 'utf-8'))
+
+/** session-manager.ts with every comment removed. */
+const SESSION_MANAGER_CODE = stripComments(readFileSync(join(SRC_DIR, 'session-manager.ts'), 'utf-8'))
+
+/** The body of the one function `name` declared in session-manager.ts (exported or not); fails unless there is exactly one. */
+function sessionManagerFunctionBody(name: string): string {
+  const decls = indicesOf(new RegExp(`^(?:export\\s+)?(?:async\\s+)?function\\s+${name}\\s*\\(`, 'gm'), SESSION_MANAGER_CODE)
+  expect(decls).toHaveLength(1)
+  const [, paramsEnd] = balancedAfter(SESSION_MANAGER_CODE, decls[0]!, '(', ')')
+  return SESSION_MANAGER_CODE.slice(...balancedAfter(SESSION_MANAGER_CODE, paramsEnd + 1, '{', '}'))
+}
+
+/** The production kill-retry clock (b.jg5 SRJ-702); renaming it fails the typecheck. */
+const KILL_RETRY_PRODUCTION_CLOCK: keyof typeof KillRetryModule = 'KILL_RETRY_SYSTEM_CLOCK'
 
 /** Offsets of every code call of `name` in server.ts. */
 function callsOf(name: string): number[] {
@@ -1696,12 +1711,66 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
   // Bug b.g57: the adapter's persona lookup is optional; without it a restart
   // of a persona whose claude_config_dir no longer resolves would kill its
   // instance ahead of a launch that cannot be made.
-  test('bug b.g57: the restart module\'s kill is the kill adapter over the live applied persona lookup, getAppliedPersona', () => {
-    expect(onlyCallProps('initRestart').get('killSession')).toBe('_buildKillSessionAdapter(getAppliedPersona)')
+  test('bug b.g57, b.jg5 SRJ-702: the restart module\'s kill is the kill adapter over the live applied persona lookup, getAppliedPersona, and the production kill-retry clock', () => {
+    expect(onlyCallProps('initRestart').get('killSession')).toBe(`_buildKillSessionAdapter(getAppliedPersona, ${KILL_RETRY_PRODUCTION_CLOCK})`)
     // The only adapter built (its declaration aside): no other kill path without the lookup.
     expect(indicesOf(/(?<![\w.$]|function\s+)_buildKillSessionAdapter\s*\(/g, SERVER_CODE)).toHaveLength(1)
     // getAppliedPersona reads the holder at call time (pinned in tests/reload-wiring.test.ts).
     expect(indicesOf(/\bfunction\s+getAppliedPersona\s*\(/g, SERVER_CODE)).toHaveLength(1)
+  })
+
+  // b.jg5 SRJ-702: the clock the adapter's kill retry waits on is the
+  // production one, imported from src/kill-retry.ts: no copy or test clock
+  // declared in server.ts.
+  test('b.jg5 SRJ-702: the production kill-retry clock is the one src/kill-retry.ts exports, imported, never declared in server.ts', () => {
+    expect(importSource(SERVER_CODE, KILL_RETRY_PRODUCTION_CLOCK)).toBe('./kill-retry.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${KILL_RETRY_PRODUCTION_CLOCK}\\b`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  // b.jg5 SRJ-702: the adapter's one kill goes through the session manager's
+  // bounded retry (whose read between tries is the shared own-row status
+  // read), seeded as not read live (the run read the row dead), on the clock
+  // the adapter was built with.
+  test('b.jg5 SRJ-702: the adapter kills through the session manager\'s bounded retry, on the clock it was built with, seeded not live', () => {
+    const decls = indicesOf(/^export function _buildKillSessionAdapter\s*\(/gm, SERVER_CODE)
+    expect(decls).toHaveLength(1)
+    const [paramsStart, paramsEnd] = balancedAfter(SERVER_CODE, decls[0]!, '(', ')')
+    const params = splitTopLevel(SERVER_CODE.slice(paramsStart, paramsEnd))
+    expect(params).toHaveLength(2)
+    expect(params[1]).toBe(`clock: KillRetryWait = ${KILL_RETRY_PRODUCTION_CLOCK}`)
+    const body = SERVER_CODE.slice(...balancedAfter(SERVER_CODE, paramsEnd + 1, '{', '}'))
+    const retries = indicesOf(/(?<![\w.$])retryPersonaKill\s*\(/g, body)
+    expect(retries).toHaveLength(1)
+    const props = objectProperties(splitTopLevel(callArguments(body, retries[0]!))[1]!)
+    expect(props.get('clock')).toBe('clock')
+    expect(props.get('rowReadLive')).toBe('false')
+    expect(props.get('lastRead')).toBe('KILL_RETRY_SEED_NOT_LIVE_VALUE')
+    expect(importSource(SERVER_CODE, 'retryPersonaKill')).toBe('./session-manager.ts')
+    expect(importSource(SERVER_CODE, 'KILL_RETRY_SEED_NOT_LIVE_VALUE')).toBe('./kill-retry.ts')
+    // No other kill path in server.ts but the teardown's checked kill.
+    expect(indicesOf(/(?<![\w.$])killPersonaInstance\s*\(/g, body)).toEqual([])
+    // The session manager's retry reads the row between tries through the
+    // shared own-row status read (b.jg5 SRJ-115, SRJ-702).
+    const retryBody = sessionManagerFunctionBody('retryPersonaKill')
+    expect(indicesOf(/\bread:\s*\(\)\s*=>\s*readPersonaKillRow\s*\(/g, retryBody)).toHaveLength(1)
+    expect(indicesOf(/(?<![\w.$])readPersonaOwnRowStatus\s*\(/g, sessionManagerFunctionBody('readPersonaKillRow'))).toHaveLength(1)
+  })
+
+  // b.jg5 SRJ-702, SRJ-305: main() installs the persona kill retry's
+  // keep-going query once, over the server's up predicate and its
+  // shutting-down flag, before anything can kill (the start sweep, the
+  // restart module, the start bring-up).
+  test('b.jg5 SRJ-702: the kill retry\'s keep-going query is installed once in main(), over isPersonaUp and the shutting-down flag, before the start sweep and the restart module', () => {
+    const at = onlyCallOf('setPersonaKillKeepGoingQuery')
+    expect(insideMain(at)).toBe(true)
+    const props = onlyCallProps('setPersonaKillKeepGoingQuery')
+    expect([...props.keys()].sort()).toEqual(['isPersonaUp', 'isShuttingDown'])
+    expect(props.get('isPersonaUp')).toBe(constOf('createPersonaUpPredicate'))
+    expect(props.get('isShuttingDown')).toBe('() => shuttingDown')
+    expect(importSource(SERVER_CODE, 'setPersonaKillKeepGoingQuery')).toBe('./session-manager.ts')
+    expect(at).toBeLessThan(onlyCallOf('reconcileOrphans'))
+    expect(at).toBeLessThan(onlyCallOf('initRestart'))
+    expect(at).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
   })
 
   test('the health check\'s work list is built over the loaded config with the gate', () => {

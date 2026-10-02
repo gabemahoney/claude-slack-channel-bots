@@ -48,7 +48,8 @@
  *   instance, as `main()`'s `isSessionAliveAdapter`, which the lost-message
  *   driver's row read is too), the
  *   reconnect and kill adapters (`_buildReconnectSessionAdapter`,
- *   `_buildKillSessionAdapter`, over the applied-persona lookup) and
+ *   `_buildKillSessionAdapter`, over the applied-persona lookup, the kill
+ *   adapter with the kill-retry clock below) and
  *   `launchSession` over the applied configuration with the relaunch gate as
  *   `canLaunch`. `getRestartDelay` answers the configuration's
  *   `session_restart_delay` (0 by default). `onCapReached` records the key in
@@ -251,6 +252,29 @@
  *   `_whenDialogApproverStopped`); other timers due on the way fire too, as in
  *   `advance`. A case that counts calls after a launch settles first, or
  *   drives the approver to its stop.
+ * - The bounded retry of a kill (b.jg5 SRJ-702, `src/kill-retry.ts`) runs
+ *   on the harness clock, bound as `main()` binds it: the restart path's kill
+ *   adapter gets the kill-retry clock (its kill is one try, seeded with the
+ *   run's `dead` reading), the collision ladder's replacement kills take it
+ *   through the ladder's kill-clock seam (`_setLadderKillClock`, put back
+ *   with `_resetLadderKillClock` by `cleanup()`), and the kill retry's
+ *   keep-going query (`setPersonaKillKeepGoingQuery`, removed by
+ *   `cleanup()`) is the up predicate over the same serving connection,
+ *   bring-up outcome (`setUp`) and live applied set as the relaunch gate,
+ *   with the harness's shutting-down flag. Each try's read between tries is
+ *   the session manager's shared own-row `status` read, the one `main()`
+ *   uses, so it shows as a stub `status` of the persona's instance. The
+ *   kill-retry clock (`killRetryClock`, which a case also hands the start
+ *   sweep as `reconcileOrphans(config, h.killRetryClock)`, as `main()` hands
+ *   it the production clock) is the harness clock with each 2 s wait
+ *   between tries tracked, so `advance(ms)` fires a wait like every other
+ *   timer, and
+ *   `drive(work)` awaits `work` (a `launch(key)`, a direct restart call)
+ *   while moving the clock to each pending wait's end as it is set (every
+ *   other timer due by then fires too, as in `advance`), in 1 ms real-time
+ *   steps for the spawn path's own file I/O, bounded by `options.settleMs`;
+ *   it throws when `work` is still unsettled at the bound with no wait
+ *   pending. A wait still pending at `cleanup()` fails it, as any timer does.
  * - `settle()`: awaits every configured persona's launch in flight
  *   (`whenLaunchSettled`) and every retry run in flight (`whenRunSettled`),
  *   with its re-arm or stop, and then until every running dialog approver
@@ -372,6 +396,7 @@
  *   install and reset the harness made (`console.error`, the restart module's state and the
  *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
  *   the session manager's latch install and the latch's set observers,
+ *   the ladder's kill clock and the kill retry's keep-going query,
  *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
  *   harnesses built one after the other share no query,
  *   the stub spawn path and client with every launch still in flight and the
@@ -426,8 +451,10 @@
  *
  * Isolation: no top-level `mock.module()`, no real HOME, `~/.agent-director`,
  * tmux, child process or Slack client (the driver's clients are stubs). The
- * retry timer and the dialog approver run on the fake clock only; the one
- * real-time wait is `settle()`'s bounded poll for the spawn path. A retry
+ * retry timer, the dialog approver and the waits between a kill's tries run
+ * on the fake clock only; the one real-time wait is the bounded poll for the
+ * spawn path's own file I/O (`settle()`'s, and `drive`'s between kill-retry
+ * waits). A retry
  * never arms the restart module's own (real) timer: its entry bypasses it. Every file
  * sits under one `mkdtempSync` directory.
  *
@@ -484,6 +511,7 @@ import { createPersonaSerializer, type PersonaSerializer } from '../../src/perso
 import { createPersonaRelaunchGate, createPersonaUpPredicate, type PersonaUpQuery } from '../../src/persona-start.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
 import { createNameResolver, type NameResolverWebClient } from '../../src/message-archive.ts'
+import type { KillRetryClock } from '../../src/kill-retry.ts'
 import { getSessionByPersona } from '../../src/registry.ts'
 import {
   _resetRestartState,
@@ -506,9 +534,11 @@ import {
   _resetConfiguredPersonaQuery,
   _resetDialogApprovers,
   _resetFindMissingMemo,
+  _resetLadderKillClock,
   _resetTmuxSessionKiller,
   _setApproverClock,
   _setDialogReadyTimeoutMs,
+  _setLadderKillClock,
   _setTmuxSessionKiller,
   _whenDialogApproverStopped,
   isDialogApproverRunning,
@@ -518,6 +548,7 @@ import {
   readPersonaRowState,
   setConfiguredPersonaQuery,
   setConflictLatch,
+  setPersonaKillKeepGoingQuery,
   setSessionNotifier,
   spawnForPersona,
   stopAllDialogApprovers,
@@ -786,6 +817,18 @@ export interface RecoveryHarness {
   readonly scriptedAction: UnavailableRetryAction
   script(knobs: RecoveryStubScript): void
   launch(key: string): Promise<SpawnPersonaResult>
+  /**
+   * The harness clock with each wait between a kill's tries tracked (b.jg5
+   * SRJ-702): the restart kill adapter's and the ladder's, and the one a
+   * case hands the start sweep (`reconcileOrphans(config, clock)`), so
+   * `drive` moves the clock to its waits.
+   */
+  readonly killRetryClock: KillRetryClock
+  /**
+   * Await `work` while moving the clock to each pending wait between a
+   * kill's tries as it is set (b.jg5 SRJ-702); see the module comment.
+   */
+  drive<T>(work: Promise<T>): Promise<T>
   settle(): Promise<void>
   /** Whether persona `key`'s dialog approver is running (read-only; the session manager's `isDialogApproverRunning`). */
   approverRunning(key: string): boolean
@@ -1070,6 +1113,22 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   }
   _setApproverClock(approverClock)
   if (options.approverCapMs !== undefined) _setDialogReadyTimeoutMs(options.approverCapMs)
+  // The bounded retry of a kill (b.jg5 SRJ-702) waits on the harness clock,
+  // each wait between tries tracked so `drive` can move the clock to it. As
+  // main() binds it: the restart kill adapter gets this clock (below), and the
+  // ladder's replacement kills take it through their seam. Undone by cleanup.
+  const killRetryTimers = new Set<unknown>()
+  const killRetryClock: KillRetryClock = {
+    setTimeout: (callback, delayMs) => {
+      const handle = clock.setTimeout(() => {
+        killRetryTimers.delete(handle)
+        callback()
+      }, delayMs)
+      killRetryTimers.add(handle)
+      return handle
+    },
+  }
+  _setLadderKillClock(killRetryClock)
   _setTmuxSessionKiller(async () => {})
   _resetFindMissingMemo()
   const triggerSink: UnavailableRetryTriggerSink = {
@@ -1106,6 +1165,14 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // configured while it is in the live applied set, so a note on a persona's
   // own row latches it and a key outside the set, or removed from it, does not.
   setConfiguredPersonaQuery((key) => appliedPersona(key) !== undefined)
+  // As main() installs it (b.jg5 SRJ-702, SRJ-305): a kill's tries stop once
+  // the persona is not up (the up predicate over the relaunch gate's
+  // connection, bring-up outcome and live applied set) or the server is
+  // shutting down; the session manager asks the latch itself.
+  setPersonaKillKeepGoingQuery({
+    isPersonaUp: createPersonaUpPredicate({ status: () => SERVING }, upQuery),
+    isShuttingDown: () => shuttingDown,
+  })
 
   resetAdSettingsForTests()
   if (options.adSettings !== undefined) writeAgentDirectorConfig(home, options.adSettings)
@@ -1122,7 +1189,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     isSessionConnected: (key) => connected.has(key),
     hasSessionStream: (key) => connected.has(key),
     reconnectSession: _buildReconnectSessionAdapter(appliedPersona),
-    killSession: _buildKillSessionAdapter(appliedPersona),
+    killSession: _buildKillSessionAdapter(appliedPersona, killRetryClock),
     launchSession: (key) => launchSession(key, appliedConfig(), { canLaunch: canRelaunch }),
     getRestartDelay: () => config.session_restart_delay,
     isShuttingDown: () => shuttingDown,
@@ -1255,6 +1322,47 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     }
     await clock.advanceTo(target)
     return fired
+  }
+
+  /** The earliest due time of a pending wait between a kill's tries, or undefined. */
+  function nextKillRetryDue(): number | undefined {
+    let due: number | undefined
+    for (const timer of clock.pending()) {
+      if (![...killRetryTimers].some((handle) => (handle as { id?: unknown }).id === timer.id)) continue
+      if (due === undefined || timer.dueAt < due) due = timer.dueAt
+    }
+    return due
+  }
+
+  /**
+   * Await `work`, moving the clock to each pending wait between a kill's
+   * tries (b.jg5 SRJ-702) as it is set, in 1 ms real-time steps for at most
+   * `settleMs` steps that find no wait pending.
+   */
+  async function drive<T>(work: Promise<T>): Promise<T> {
+    let settled = false
+    void work.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+    const realTurn = (): Promise<unknown> => new Promise((resolve) => setTimeout(resolve, 1))
+    for (let idle = 0; idle < settleMs && !settled; ) {
+      await clock.flush()
+      if (settled) break
+      const due = nextKillRetryDue()
+      if (due !== undefined) {
+        await advance(due - clock.now())
+        continue
+      }
+      await Promise.race([work, realTurn()])
+      idle++
+    }
+    if (!settled) throw new Error(`recovery harness: the driven work was still unsettled after ${settleMs} ms with no kill-retry wait pending`)
+    return work
   }
 
   /** The earliest due time of a pending approver timer, or undefined. */
@@ -1439,6 +1547,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       return spawnForPersona(persona, config, true)
     },
 
+    killRetryClock,
+
+    drive,
+
     settle: settleLaunches,
 
     approverRunning: (key) => isDialogApproverRunning(key),
@@ -1547,6 +1659,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       setSessionNotifier(undefined)
       setConflictLatch(undefined)
       _resetConfiguredPersonaQuery()
+      setPersonaKillKeepGoingQuery(undefined)
+      _resetLadderKillClock()
       for (const unbind of unbindLatch) unbind()
       resetStubSpawnPath()
       _resetTmuxSessionKiller()

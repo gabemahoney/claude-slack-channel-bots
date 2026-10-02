@@ -237,10 +237,20 @@ import {
   KILL_OUTCOME_ROW_GONE,
   KILL_OUTCOME_SESSION_GONE,
   describeKillOutcome,
+  killLetsNextStepRun,
   killOutcomeStopsServer,
   type KillFailure,
   type KillOutcome,
 } from '../src/checked-kill.ts'
+import {
+  KILL_RETRY_ALERT_ORDINARY,
+  KILL_RETRY_END_SETTLED,
+  KILL_RETRY_NEXT_NOT_LIVE,
+  KILL_RETRY_NEXT_NOT_RETRIED,
+  KILL_RETRY_NEXT_SUCCESS,
+  killRetryEndLine,
+  killRetryTryLine,
+} from '../src/kill-retry.ts'
 import type { ClientOptions, FindMissingParams, FindMissingResult, GetParams, KillParams, ReadPaneParams, ReadPaneResult, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams } from 'agent-director'
 import { KILL_SESSION_NOT_KILLED_GUARD, RECONNECT_ESCALATE_DEAD_NO_KILL, type KillSessionResult } from '../src/restart.ts'
 import {
@@ -248,6 +258,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   isInsideAttempt,
   runInAttempt,
@@ -4229,12 +4240,21 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
 })
 
 // ---------------------------------------------------------------------------
-// _buildKillSessionAdapter: the checked kill's outcome (b.jg5 SRJ-110, SRJ-701)
+// _buildKillSessionAdapter: the checked kill's outcome (b.jg5 SRJ-110, SRJ-701,
+// SRJ-702)
 //
 // The restart work's kill adapter, run inside a recovery attempt for the
-// persona as `runRestartWork` runs it. It makes one checked kill and answers
-// its outcome, `kill_sent` included, with one line naming it; nothing is
-// swallowed. A success (`kill_sent` true, false or absent) and
+// persona as `runRestartWork` runs it, built with a fake clock. Its kill goes
+// through the bounded retry (`retryPersonaKill`, b.jg5 SRJ-702) seeded with
+// the run's `dead` reading: not a row read live, so one try whose outcome
+// stands at once, with no `status` read and no wait on the clock (the tries,
+// the reads and the survivor rule are proved at the collision ladder's kill
+// of a row read live, in tests/session-manager.test.ts, and in
+// tests/kill-retry.test.ts). The retry logs its one try line (`kill try 1 of
+// 1`, and, for an `ErrTmuxKillFailed`, its end line naming the ordinary
+// decision, which the adapter raises no alert for), then the adapter
+// answers the outcome, `kill_sent` included, with one line naming it; nothing
+// is swallowed. A success (`kill_sent` true, false or absent) and
 // `ErrSpawnNotFound` arm nothing. An UNAVAILABLE kill (by name,
 // `ErrTmuxKillFailed` included, told apart) arms the timer (b.jg5 SRJ-105); an
 // ENVIRONMENT kill (`ErrTmuxNotAvailable`, b.jg5 SRJ-311) also raises
@@ -4283,10 +4303,33 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
   let unbindNotice: () => void
   /** Every `console.error` argument list the case captured, for the leak check. */
   let captured: unknown[][]
+  /** The adapter's kill-retry clock: its kill is one try, so no wait is ever asked of it. */
+  let clock: FakeClock
 
   /** The adapter's one line naming C1's kill outcome. */
   const killLine = (outcome: KillOutcome): string =>
     `[slack] killSession (restart adapter): kill for persona=C1: ${describeKillOutcome(outcome)}`
+
+  /**
+   * The bounded retry's lines for the adapter's one try of C1's kill (b.jg5
+   * SRJ-702: a dead seed, so one try): the try line, then, for an
+   * `ErrTmuxKillFailed`, the end line naming the ordinary decision quoting it.
+   */
+  const retryLines = (outcome: KillOutcome): string[] => {
+    const prefix = '[slack] killSession (restart adapter)'
+    const id = personaInstanceId('C1')
+    const unavailable = outcome.kind === KILL_OUTCOME_NOT_KILLED && outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE
+    const next = killLetsNextStepRun(outcome) ? KILL_RETRY_NEXT_SUCCESS : unavailable ? KILL_RETRY_NEXT_NOT_LIVE : KILL_RETRY_NEXT_NOT_RETRIED
+    const lines = [killRetryTryLine(prefix, id, 1, 1, outcome, next)]
+    if (unavailable && outcome.killFailed && typeof outcome.killFailedDescription === 'string') {
+      const alert = { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: outcome.killFailedDescription } as const
+      lines.push(killRetryEndLine(prefix, id, { outcome, end: KILL_RETRY_END_SETTLED, tries: 1, reads: 0, alert }))
+    }
+    return lines
+  }
+
+  /** Every line the adapter's kill of C1 logs for `outcome`: the retry's, then the adapter's own. */
+  const killLines = (outcome: KillOutcome): string[] => [...retryLines(outcome), killLine(outcome)]
 
   /**
    * Install a stub whose `kill` answers `killError` (else `killResult`), whose
@@ -4294,13 +4337,19 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
    * latch-time read, made only after an install-gone reading), with spy
    * sinks.
    */
-  function install(killError?: Error, killResult: Phase1KillResult = cannedKillResult(true), statusError?: Error): StubClient {
+  function install(
+    killError?: Error,
+    killResult: Phase1KillResult = cannedKillResult(true),
+    statusError?: Error,
+    killQueue?: CannedResponse<Phase1KillResult>[],
+  ): StubClient {
     killErr = killError
     const stub = makeStubClient({
       killCalls,
       statusCalls,
       killError,
       killResult,
+      ...(killQueue === undefined ? {} : { killQueue }),
       ...(statusError === undefined ? { statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) } : { statusError }),
     })
     _resetOutageState()
@@ -4328,7 +4377,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     getPersona?: (key: string) => Persona | undefined,
     lastRead: DeadLivenessReading = LIVENESS_READING_DEAD_ENDED,
   ): Promise<{ result: KillSessionResult; errArgs: unknown[][] }> {
-    const run = await capturingErrorArgs(() => runInAttempt(key, 'recovery', () => _buildKillSessionAdapter(getPersona)(key, lastRead)))
+    const run = await capturingErrorArgs(() => runInAttempt(key, 'recovery', () => _buildKillSessionAdapter(getPersona, clock)(key, lastRead)))
     captured.push(...run.errArgs)
     return run
   }
@@ -4352,6 +4401,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     latchLines = []
     posts = []
     captured = []
+    clock = createFakeClock()
     latch = createConflictLatch({ log: (line) => { latchLines.push(line) } })
     unbindNotice = bindConflictNotice(
       latch,
@@ -4371,6 +4421,9 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     _resetSpawnHomeDir()
     rmSync(dir, { recursive: true, force: true })
     assertNoLeak({ captured, emissions, latchLines, posts })
+    // b.jg5 SRJ-702: a kill after a dead reading is one try: no wait asked.
+    expect(clock.pendingCount()).toBe(0)
+    expect(clock.firedCount()).toBe(0)
   })
 
   test.each([
@@ -4384,7 +4437,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
 
     expect(result).toEqual(killSent === undefined ? { kind: KILL_OUTCOME_KILLED } : { kind: KILL_OUTCOME_KILLED, killSent })
     expect(killCalls).toEqual([{ claude_instance_id: personaInstanceId('C1') }])
-    expect(stringLines(errArgs)).toEqual([killLine(result as KillOutcome)])
+    expect(stringLines(errArgs)).toEqual(killLines(result as KillOutcome))
     expect(triggers).toEqual([])
     expect(starts).toEqual([])
     expect(ends).toEqual([])
@@ -4400,13 +4453,13 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
 
     expect(result).toEqual({ kind: KILL_OUTCOME_ROW_GONE })
     expect(killCalls).toHaveLength(1)
-    expect(stringLines(errArgs)).toEqual([killLine({ kind: KILL_OUTCOME_ROW_GONE })])
+    expect(stringLines(errArgs)).toEqual(killLines({ kind: KILL_OUTCOME_ROW_GONE }))
     expect(triggers).toEqual([])
     expect(starts).toEqual([])
     expect(latch.isLatched('C1')).toBe(false)
   })
 
-  test.each(UNAVAILABLE_FORMS)('b.jg5 SRJ-110, SRJ-105: kill answers %s → the UNAVAILABLE non-success, not swallowed; one kill, one described outcome line; the timer is armed, no condition starts, nothing latched, posted or leaked', async (_label, build, redacted, causeKind) => {
+  test.each(UNAVAILABLE_FORMS)('b.jg5 SRJ-110, SRJ-105, SRJ-702: kill answers %s → the UNAVAILABLE non-success, not swallowed; one kill (one try: the run read the row dead), no status read, the try line and one described outcome line; the timer is armed once, no condition starts, nothing latched, posted or leaked', async (_label, build, redacted, causeKind) => {
     const err = build('kill')
     install(err)
 
@@ -4418,8 +4471,8 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     expect(outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE && outcome.killFailed).toBe(causeKind === UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)
     expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
     const lines = stringLines(errArgs)
-    expect(lines).toEqual([killLine(outcome)])
-    if (redacted) expect(lines[0]).toContain(REDACTED_SENTINEL_TAIL)
+    expect(lines).toEqual(killLines(outcome))
+    if (redacted) for (const line of lines) expect(line).toContain(REDACTED_SENTINEL_TAIL)
     expect(triggers).toEqual([{ key: 'C1', kind: causeKind }])
     expect(starts).toEqual([])
     expect(ends).toEqual([])
@@ -4427,6 +4480,26 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     expect(getOutageFlags('C1').size).toBe(0)
     expect(latch.isLatched('C1')).toBe(false)
     expect(statusCalls).toEqual([])
+  })
+
+  // b.jg5 SRJ-702 (reconcile note): the restart path kills only after a
+  // `dead` reading, so its kill goes through the bounded retry with a seed
+  // that is not live: one try, whose UNAVAILABLE outcome stands at once. A
+  // second answer that would have succeeded is never reached, no read is
+  // made, and the clock is never asked to wait.
+  test('b.jg5 SRJ-702: an UNAVAILABLE first answer with a success queued behind it: one kill, the UNAVAILABLE standing, one try line ("1 of 1"), no status read, no wait, the timer armed once', async () => {
+    const err = errTmuxUnresponsive('kill')
+    install(undefined, cannedKillResult(true), undefined, [cannedErr<Phase1KillResult>(err), cannedOk(cannedKillResult(true))])
+    killErr = err
+
+    const { result, errArgs } = await killInAttempt()
+
+    expect(notKilled(result).error).toBe(err)
+    expect(killCalls).toHaveLength(1)
+    expect(statusCalls).toEqual([])
+    expect(stringLines(errArgs)).toEqual(killLines(result as KillOutcome))
+    expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expect(clock.firedCount()).toBe(0)
   })
 
   // Non-vacuity for "no condition starts": the same refusal from a kill
@@ -4465,7 +4538,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     expect(outcome.errorClass).toBe(AD_ERROR_CLASS_ENVIRONMENT)
     expect(outcome.error).toBe(err)
     expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
-    expect(stringLines(errArgs)).toEqual([killLine(outcome)])
+    expect(stringLines(errArgs)).toEqual(killLines(outcome))
     expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
     expect(emissions).toEqual([{ key: 'C1', text: onset() }])
     expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
@@ -4487,9 +4560,9 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     expect(outcome.errorClass).toBe(AD_ERROR_CLASS_CONFIG)
     expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
     const lines = stringLines(errArgs)
-    expect(lines.filter((l) => l.includes('killSession (restart adapter)'))).toEqual([killLine(outcome)])
+    expect(lines.filter((l) => l.includes('killSession (restart adapter)'))).toEqual(killLines(outcome))
     expect(lines.filter((l) => l.includes('ad-config-malformed raised for persona=C1'))).toHaveLength(1)
-    expect(lines).toHaveLength(2)
+    expect(lines).toHaveLength(killLines(outcome).length + 1)
     expect(lines.join('\n')).toContain(REDACTED_SENTINEL_TAIL)
     expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
     expect(emissions).toEqual([{ key: 'C1', text: adConfigMalformedOnset(err) }])
@@ -4518,7 +4591,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     expect(outcome.errorClass).toBe(AD_ERROR_CLASS_UNCLASSIFIED)
     expect(outcome.error).toBe(err)
     expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
-    expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual([killLine(outcome)])
+    expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual(killLines(outcome))
     expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
     expect(reports).toEqual([{ key: 'C1', same: true }])
     expect(starts).toEqual([])
@@ -4542,7 +4615,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
 
     expect(result).toEqual({ kind: KILL_OUTCOME_SESSION_GONE, name: err.errName })
     expect(killCalls).toEqual([{ claude_instance_id: personaInstanceId('C1') }])
-    expect(stringLines(errArgs)).toEqual([killLine(result as KillOutcome)])
+    expect(stringLines(errArgs)).toEqual(killLines(result as KillOutcome))
     expect(killLine(result as KillOutcome)).toContain(`outcome=${KILL_OUTCOME_SESSION_GONE} (${err.errName})`)
     expect(triggers).toEqual([])
     expect(reports).toEqual([])
@@ -4571,7 +4644,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
 
     expect(result).toEqual({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: err, unlistedClass })
     expect(killCalls).toHaveLength(1)
-    expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual([killLine(result as KillOutcome)])
+    expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual(killLines(result as KillOutcome))
     expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
     expect(reports).toEqual([{ key: 'C1', same: true }])
     expect(starts).toEqual([])
@@ -4628,7 +4701,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
       })
       expect(killOutcomeStopsServer(result)).toBe(false)
       expect(killCalls).toHaveLength(1)
-      expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual([killLine(result as KillOutcome)])
+      expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual(killLines(result as KillOutcome))
       expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
       expect(reports).toEqual([{ key: 'C1', same: true }])
       expect(latch.isLatched('C1')).toBe(false)
@@ -4647,7 +4720,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
       expect(killOutcomeStopsServer(result)).toBe(true)
       expect(notKilled(result)).toMatchObject({ errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: err, recheck: RECHECK_OUTCOME_STOP })
       expect(killCalls).toHaveLength(1)
-      expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual([killLine(result as KillOutcome)])
+      expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual(killLines(result as KillOutcome))
       expect(triggers).toEqual([])
       expect(reports).toEqual([])
       expect(latch.isLatched('C1')).toBe(false)
@@ -4683,7 +4756,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     expect(row.refusedOperation).toBe(REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY)
     expect(posts).toEqual([{ key: 'C1', text: row.notice.text }])
     const lines = stringLines(errArgs)
-    expect(lines[0]).toBe(killLine(outcome))
+    expect(lines.slice(0, killLines(outcome).length)).toEqual(killLines(outcome))
     expect(lines.filter((l) => l.startsWith('[slack] killSession (restart adapter): kill refused for persona=C1: ') && l.includes(' — CONFLICT: the persona latched; '))).toHaveLength(1)
     expect(triggers).toEqual([])
     expect(starts).toEqual([])
@@ -4709,7 +4782,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     expect(row.refusedOperation).toBe(REFUSED_OPERATION_NONE)
     expect(posts).toEqual([{ key: 'C1', text: row.notice('C1') }])
     const lines = stringLines(errArgs)
-    expect(lines[0]).toBe(killLine(outcome))
+    expect(lines.slice(0, killLines(outcome).length)).toEqual(killLines(outcome))
     expect(lines.filter((l) => l.startsWith('[slack] killSession (restart adapter): kill refused for persona=C1: ') && l.includes(' — UNUSABLE NAME: '))).toHaveLength(1)
     expect(triggers).toEqual([])
   })
@@ -4799,6 +4872,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
 
       expect(result).toBe(KILL_SESSION_NOT_KILLED_GUARD)
       expect(killCalls).toEqual([])
+      expect(statusCalls).toEqual([])
       expect(stringLines(errArgs)).toEqual([
         '[slack] killSession (restart adapter): launch already in flight for persona=C1 — not killing',
       ])
@@ -4818,6 +4892,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
 
     expect(result).toBe(KILL_SESSION_NOT_KILLED_GUARD)
     expect(killCalls).toEqual([])
+    expect(statusCalls).toEqual([])
     const lines = stringLines(errArgs)
     expect(lines).toContain(
       '[slack] killSession (restart adapter): persona=C1 claude_config_dir cannot be resolved to a real path — not killing; its row is kept',

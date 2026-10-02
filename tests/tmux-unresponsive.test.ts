@@ -144,6 +144,7 @@ import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
 import { KILL_CONTEXT_TEARDOWN, killPersonaInstance, reconcileOrphans, TRUST_DIALOG_NEEDLE, type ApproverVerb } from '../src/session-manager.ts'
 import { KILL_OUTCOME_NOT_KILLED } from '../src/checked-kill.ts'
+import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import {
   runInAttempt,
   UNAVAILABLE_RETRY_BASE_S,
@@ -164,7 +165,9 @@ import {
 } from '../src/unavailable-retry.ts'
 import {
   cannedErr,
+  cannedKillResult,
   cannedListRow,
+  cannedOk,
   cannedStatusResult,
   errCallTimeout,
   errInstanceIdCollision,
@@ -303,6 +306,12 @@ interface TmuxSite {
   readonly name: string
   readonly verb: string
   script(h: RecoveryHarness, persona: Persona, err: Error): RecoveryStubScript
+  /**
+   * How long after the launch starts the refusal stands: 0, except for a
+   * kill of a row read live, whose UNAVAILABLE outcome stands only after its
+   * tries (b.jg5 SRJ-702), so the condition's first refusal is the standing one.
+   */
+  readonly standsAfterMs?: number
 }
 
 const TMUX_SITES: readonly TmuxSite[] = [
@@ -310,12 +319,14 @@ const TMUX_SITES: readonly TmuxSite[] = [
   { name: 'the resume of an ended row', verb: 'resume', script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: err }) },
   { name: 'the reconnect of a waiting row', verb: 'send-keys', script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: err }) },
   {
-    // The row is `waiting` (read live) in another directory. The refused kill
-    // stops the ladder at once (b.jg5 SRJ-105): no delete and no spawn follow,
+    // The row is `waiting` (read live) in another directory. The kill is
+    // tried up to 3 times 2 s apart (b.jg5 SRJ-702), and its refusal that
+    // stands stops the ladder (b.jg5 SRJ-105): no delete and no spawn follow,
     // so no later launch call touches tmux in this launch.
     name: 'the replacement kill of a row read live in another directory',
     verb: 'kill',
     script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home, state: 'waiting' }), killError: err }),
+    standsAfterMs: (KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS,
   },
 ]
 
@@ -347,18 +358,19 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     return [what, site.name, make, site] as const
   })
 
-  test.each(paired)('%s at %s inside a launch starts P’s condition at the first refusal’s time; a second refusal keeps it; B’s never starts', async (_what, _site, make, site) => {
+  test.each(paired)('%s at %s inside a launch starts P’s condition at the time its refusal stands; a second refusal keeps it; B’s never starts', async (_what, _site, make, site) => {
     const { h, p, b } = build()
-    const firstAt = h.clock.now()
+    const firstAt = h.clock.now() + (site.standsAfterMs ?? 0)
     h.script(site.script(h, personaOf(h, p), make(site.verb)))
 
-    await h.launch(p)
+    await h.drive(h.launch(p))
 
     expectHolds(h, p, site.verb, firstAt)
+    if (site.standsAfterMs !== undefined) expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
 
     await h.advance(halfFirstWaitMs())
     h.script({ spawnQueue: [], spawnError: errTmuxUnresponsive('spawn') })
-    await h.launch(p)
+    await h.drive(h.launch(p))
 
     expect(h.clock.now()).toBeGreaterThan(firstAt)
     expectHolds(h, p, site.verb, firstAt)
@@ -431,14 +443,14 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNoPostYet(h)
   })
 
-  test('ErrTmuxKillFailed from the replacement kill of a row read live starts nothing and posts nothing (the kill-failure cause only); a message lost after it never reports not answering (SRJ-1011)', async () => {
+  test('ErrTmuxKillFailed from the replacement kill of a row read live, at every try, starts nothing and posts nothing (the kill-failure cause only, once); a message lost after it never reports not answering (SRJ-1011)', async () => {
     const { h, p, b } = build()
     h.script({ ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }), killError: errTmuxKillFailed() })
 
-    await h.launch(p)
+    await h.drive(h.launch(p))
 
-    expect(h.stub.calls.killCalls).toHaveLength(1)
-    expect(h.triggers).toContainEqual({ key: p, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED })
+    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
+    expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
     expectNeverStarted(h, p)
     expectNeverStarted(h, b)
     expectNoPostYet(h)
@@ -449,6 +461,51 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expect(getOutageFlags(p).size).toBe(0)
     await expectLostMessageReports(h, p, 'auto-restart-disabled')
     expectNeverStarted(h, p)
+  })
+
+  // b.jg5 SRJ-702, SRJ-307: only the outcome that stands reaches the
+  // condition. A try's UNAVAILABLE that a later try's success replaces starts
+  // nothing and arms nothing, and the own-row `status` read between the tries
+  // (not tmux-touching) neither starts the condition nor ends it.
+  test('an ErrTmuxUnresponsive try then a success at the replacement kill of a row read live starts no condition and arms nothing; the delete and the fresh spawn follow', async () => {
+    const { h, p, b } = build()
+    h.script({
+      ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }),
+      killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))],
+    })
+
+    const result = await h.drive(h.launch(p))
+
+    expect(result.action).not.toBe('failed')
+    expect(h.stub.calls.killCalls).toHaveLength(2)
+    expect(h.stub.calls.deleteCalls).toHaveLength(1)
+    expect(h.stub.calls.spawnCalls).toHaveLength(2)
+    expect(h.triggers).toEqual([])
+    expectNeverStarted(h, p)
+    expectNeverStarted(h, b)
+    expectNoPostYet(h)
+  })
+
+  test.each<[string, RecoveryStubScript['statusQueue']]>([
+    ['a read that finds the row live', [cannedOk(cannedStatusResult({ state: 'waiting' }))]],
+    ['a read that fails (ErrCallTimeout)', [cannedErr(errCallTimeout('status'))]],
+  ])('with P’s condition holding, %s between the replacement kill’s tries neither starts nor ends it; the standing refusal keeps it', async (_label, statusQueue) => {
+    const { h, p, b } = build()
+    const at = await refuse(h, p)
+    h.script({
+      ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }),
+      killError: errTmuxUnresponsive('kill'),
+      statusQueue: [...(statusQueue ?? []), cannedOk(cannedStatusResult({ state: 'waiting' }))],
+    })
+
+    await h.drive(h.launch(p))
+
+    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
+    expectHolds(h, p, 'spawn', at)
+    expect(h.conditionEnds).toEqual([])
+    expect(conditionEndedLines(h, p)).toEqual([])
+    expectNeverStarted(h, b)
+    expectNoPostYet(h)
   })
 
   test.each<[string, string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript]>([
@@ -537,29 +594,32 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNoPostYet(h)
   })
 
-  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>, number]>([
     // b.jg5 SRJ-110 (hatch A3): the teardown's kill answers its outcome and
-    // arms nothing, even run inside a recovery attempt.
+    // arms nothing, even run inside a recovery attempt. Its tries are E25's:
+    // today one call.
     ['a persona teardown’s kill, even inside a recovery attempt (b.jg5 SRJ-110: it answers its outcome and arms nothing)', async (h, key) => {
       const err = errTmuxUnresponsive('kill')
       h.script({ killError: err })
       await runInAttempt(key, 'recovery', async () => {
         expect(await killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, error: err })
       })
-    }],
-    ['a start-sweep kill of the persona’s row in another directory', async (h, key) => {
+    }, 1],
+    // b.jg5 SRJ-702: the sweep's kill of a row listed live makes its tries,
+    // with the status reads between them; none of it starts or arms anything.
+    ['a start-sweep kill of the persona’s row in another directory, at every try', async (h, key) => {
       h.script({
         listResult: { spawns: [cannedListRow({ cwd: h.home, state: 'waiting' }, personaOf(h, key), h.home)] },
         killError: errTmuxUnresponsive('kill'),
       })
-      await reconcileOrphans(h.config)
-    }],
-  ])('%s answering ErrTmuxUnresponsive starts nothing and arms nothing', async (_what, run) => {
+      await h.drive(reconcileOrphans(h.config, h.killRetryClock))
+    }, KILL_RETRY_TRIES],
+  ])('%s answering ErrTmuxUnresponsive starts nothing and arms nothing', async (_what, run, kills) => {
     const { h, p, b } = build()
 
     await run(h, p)
 
-    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(h.stub.calls.killCalls).toHaveLength(kills)
     expect(h.triggers).toEqual([])
     expectNeverStarted(h, p)
     expectNeverStarted(h, b)
@@ -1185,7 +1245,7 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
   test('ErrTmuxKillFailed never posts a tmux-unresponsive notice: not at retries past the floor and the threshold, nor at a tick', async () => {
     const { h, p } = build({ action: 'scripted' })
     h.script({ ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }), killError: errTmuxKillFailed() })
-    await h.launch(p)
+    await h.drive(h.launch(p))
 
     await h.advance(2 * adAlertThresholdMsInEffect())
     h.setHealthCheckInterval(HEALTH_CHECK_S)

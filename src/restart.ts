@@ -328,7 +328,9 @@ export interface RestartDeps {
    * `status` read when it carries one. The work launches only after a
    * success form (`killed`, any `kill_sent`; `row-gone`, `ErrSpawnNotFound`;
    * `session-gone`, GONE; `row-finished`) or the guard answer. A CONFLICT or
-   * an UNUSABLE NAME (which the adapter latched) answers
+   * an UNUSABLE NAME (which the adapter latched), and any other non-success
+   * after which the persona is latched (b.jg5 SRJ-702: a `status` read
+   * between the kill's tries latched it), answer
    * `RESTART_OUTCOME_LATCHED`; an `ErrInvalidFlags` whose re-check decided
    * that the server stops answers `RESTART_OUTCOME_SHUTTING_DOWN` (b.jg5
    * SRJ-205); every other non-success (UNAVAILABLE, `ErrTmuxKillFailed`
@@ -1070,7 +1072,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
  * whose re-check decided that the server stops (b.jg5 SRJ-205: nothing more
  * is called), `RESTART_OUTCOME_LATCHED` for a CONFLICT or an UNUSABLE
  * NAME, which the adapter has latched (b.jg5 SRJ-501, SRJ-512; never sent
- * again), and `RESTART_OUTCOME_REFUSED` for every other non-success
+ * again), and for any other non-success after which the persona is latched
+ * (a `status` read between the kill's tries latched it, b.jg5 SRJ-702, or a
+ * latch set elsewhere; the latched query, a throw counting as latched), and
+ * `RESTART_OUTCOME_REFUSED` for every other non-success
  * (UNAVAILABLE, `ErrTmuxKillFailed` included, ENVIRONMENT, CONFIG,
  * UNCLASSIFIED, `ErrSystemInstallDisappeared` and a class the kill has no
  * row for included, each having armed the retry timer inside the attempt),
@@ -1103,9 +1108,13 @@ async function killBeforeRelaunch(
     console.error(killStopsServerLine(key, describeKillOutcome(killed)))
     return RESTART_OUTCOME_SHUTTING_DOWN
   }
+  // b.jg5 SRJ-702, SRJ-502: a CONFLICT or an UNUSABLE NAME latched the
+  // persona at the adapter; so may a `status` read between the kill's tries,
+  // or a latch set elsewhere while the kill ran.
   const latched =
-    killed.kind === KILL_OUTCOME_NOT_KILLED &&
-    (killed.errorClass === AD_ERROR_CLASS_CONFLICT || killed.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME)
+    (killed.kind === KILL_OUTCOME_NOT_KILLED &&
+      (killed.errorClass === AD_ERROR_CLASS_CONFLICT || killed.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME)) ||
+    readLatched(d, key).latched
   console.error(killNotSucceededLine(key, describeKillOutcome(killed), latched))
   return latched ? RESTART_OUTCOME_LATCHED : RESTART_OUTCOME_REFUSED
 }

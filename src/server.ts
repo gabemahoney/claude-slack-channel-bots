@@ -100,10 +100,11 @@ import {
   holdLaunchIfConfigDirUnresolvable,
   isDialogApproverRunning,
   isLaunchInFlight,
-  KILL_CONTEXT_ATTEMPT,
   KILL_CONTEXT_TEARDOWN,
   killPersonaInstance,
   latchOnRestartKillOutcome,
+  retryPersonaKill,
+  setPersonaKillKeepGoingQuery,
   launchSession,
   noteWorkingRowDeferral,
   notifyDisconnectedWithAutoRestartDisabled,
@@ -189,6 +190,7 @@ import {
 import { createPersonaSerializer } from './persona-serializer.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from './persona-lifecycle.ts'
 import { describeKillOutcome, killOutcomeStopsServer } from './checked-kill.ts'
+import { KILL_RETRY_SEED_NOT_LIVE_VALUE, KILL_RETRY_SYSTEM_CLOCK, killRetryStopped, type KillRetryWait } from './kill-retry.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { resolveSystemBinary } from 'agent-director'
 import {
@@ -1581,17 +1583,23 @@ const KILL_SESSION_ADAPTER_SITE = 'killSession (restart adapter)'
  * would (`holdLaunchIfConfigDirUnresolvable`); the launch that follows is then
  * refused by the relaunch gate (`'skipped'`), counting no failure.
  *
- * b.jg5 SRJ-110, SRJ-701: both guards make no call and answer
+ * b.jg5 SRJ-110, SRJ-701, SRJ-702: both guards make no call and answer
  * `KILL_SESSION_NOT_KILLED_GUARD`, after which the restart work goes on as it
  * always has (the launch joins the launch in flight, or the relaunch gate
- * refuses it). Otherwise the adapter makes one checked kill
- * (`killPersonaInstance` with `KILL_CONTEXT_ATTEMPT`, inside the restart
- * work's recovery attempt; not of a row read live, so not tmux-touching,
- * since the restart path kills only after a `dead` reading), logs its
- * outcome with `kill_sent` (`describeKillOutcome`) and answers it. Every
- * class is decided by name through `src/ad-error-class.ts`. The restart work
- * launches only after a success (any `kill_sent`, `ErrSpawnNotFound`, or
- * GONE). By class:
+ * refuses it). Otherwise the adapter's kill runs through the bounded retry
+ * (`retryPersonaKill`, inside the restart work's recovery attempt, on
+ * `clock`), seeded with the run's `dead` reading: the restart path kills
+ * only after one, so its kill is not of a row read live (not tmux-touching)
+ * and is one try, its outcome standing at once (on a finished row `kill` is
+ * a no-op success, SRJ-110). The adapter logs the outcome that stands with
+ * `kill_sent` (`describeKillOutcome`) and answers it; the retry's alert
+ * decision stays on its result, and the adapter raises no alert. A stop of
+ * the tries (a read between tries that latched the persona, or the
+ * keep-going check) answers the last outcome with nothing more done, and the
+ * restart work answers `latched` when the persona is latched. Every class
+ * is decided by name through `src/ad-error-class.ts`. The restart work
+ * launches only after a success (any `kill_sent`, `ErrSpawnNotFound`,
+ * GONE, or a read that found the row finished). By class:
  *   - CONFLICT: the persona latches through the latch's CONFLICT entry with
  *     the refused operation "P's next check or recovery"
  *     (`latchOnRestartKillOutcome`; b.jg5 SRJ-501, SRJ-505; a "not this
@@ -1620,10 +1628,13 @@ const KILL_SESSION_ADAPTER_SITE = 'killSession (restart adapter)'
  *
  * @param getPersona  The applied persona with a key (production:
  *   `getAppliedPersona`); without it the directory is not checked here.
+ * @param clock  The wait between the kill's tries (a clock with
+ *   `setTimeout`, or a sleep function); the production clock by default.
  * @internal
  */
 export function _buildKillSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
+  clock: KillRetryWait = KILL_RETRY_SYSTEM_CLOCK,
 ): (key: string, lastRead: DeadLivenessReading) => Promise<KillSessionResult> {
   // `key` is the persona key; `lastRead` the restart run's `dead` reading.
   return async (key: string, lastRead: DeadLivenessReading) => {
@@ -1645,13 +1656,24 @@ export function _buildKillSessionAdapter(
       return KILL_SESSION_NOT_KILLED_GUARD
     }
     // The restart path kills only after a `dead` reading (b.jg5 E9), so this
-    // kill is not of a row read live: not tmux-touching. It runs inside the
-    // restart work's recovery attempt.
-    const outcome = await killPersonaInstance(key, { context: KILL_CONTEXT_ATTEMPT })
+    // kill is not of a row read live: not tmux-touching, and one try of the
+    // bounded retry (b.jg5 SRJ-702). It runs inside the restart work's
+    // recovery attempt.
+    const retried = await retryPersonaKill(key, {
+      rowReadLive: false,
+      lastRead: KILL_RETRY_SEED_NOT_LIVE_VALUE,
+      site: KILL_SESSION_ADAPTER_SITE,
+      ref: `persona=${key}`,
+      clock,
+    })
+    const { outcome } = retried
     console.error(`[slack] killSession (restart adapter): kill for persona=${key}: ${describeKillOutcome(outcome)}`)
     // b.jg5 SRJ-205: a stop the re-check decided is answered as it is, and
-    // nothing more is done here.
-    if (!killOutcomeStopsServer(outcome)) await latchOnRestartKillOutcome(key, outcome, KILL_SESSION_ADAPTER_SITE, lastRead)
+    // nothing more is done here. b.jg5 SRJ-702, SRJ-502: so is a stop of the
+    // tries (the persona latched, or is no longer up, or shutdown).
+    if (!killOutcomeStopsServer(outcome) && !killRetryStopped(retried)) {
+      await latchOnRestartKillOutcome(key, outcome, KILL_SESSION_ADAPTER_SITE, lastRead)
+    }
     return outcome
   }
 }
@@ -2847,6 +2869,12 @@ export async function main(): Promise<void> {
   // state, so shutdown has nothing to undo. Installed with the latch, before
   // the start sweep and the start pass.
   setConfiguredPersonaQuery((key) => getAppliedPersona(key) !== undefined)
+  // b.jg5 SRJ-702, SRJ-305: a persona's kill retry (the restart path's kill,
+  // the collision ladder's replacement kills) makes no further try once the
+  // persona is torn down or not up (`isPersonaUp`: serving, its bring-up
+  // `up`, its key applied), or the server is shutting down; the session
+  // manager asks the latch itself. It holds no state.
+  setPersonaKillKeepGoingQuery({ isPersonaUp, isShuttingDown: () => shuttingDown })
 
   // b.jg5 SRJ-313, SRJ-1009: each persona's unclassified-error episode, held
   // in the notice episodes (so a teardown forgets it and shutdown closes it).
@@ -3342,7 +3370,7 @@ export async function main(): Promise<void> {
     // b.f2b: the persona locates a `working` row's transcript (its
     // claude_config_dir) for the positive-idle rule.
     reconnectSession: _buildReconnectSessionAdapter(getAppliedPersona, (key) => conflictLatch.isLatched(key)),
-    killSession: _buildKillSessionAdapter(getAppliedPersona),
+    killSession: _buildKillSessionAdapter(getAppliedPersona, KILL_RETRY_SYSTEM_CLOCK),
     launchSession: async (key) => {
       if (!personaConfig) return false
       // Launches the applied persona with this key; false when there is none.
@@ -3406,7 +3434,7 @@ export async function main(): Promise<void> {
   // killed and kept, and one findMissing sweep after those kills lets a row
   // whose session is gone read `missing`.
   try {
-    await reconcileOrphans(personaConfig)
+    await reconcileOrphans(personaConfig, KILL_RETRY_SYSTEM_CLOCK)
   } catch (err) {
     console.error(`[slack] Warning: orphan reconciliation failed: ${describeThrownValue(err)}`)
   }
