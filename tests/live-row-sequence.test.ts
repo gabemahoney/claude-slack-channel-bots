@@ -17,7 +17,9 @@
  * the `ad-config-malformed` rule (SRJ-316), the reads (SRJ-114, SRJ-513), a
  * failed `get` (hatch A2), the alert's episode (SRJ-704), the launch kind
  * (step 6, its pure decision and through the sequence, a `resume` with no
- * transcript going on to one reuse: every reuse is one
+ * transcript going on to one reuse, after the lost-transcript diagnosis's
+ * `get` on `ErrJsonlMissing`, whose amnesia action the outcome carries,
+ * SRJ-712: every reuse is one
  * stub `spawn` of `cscb_<key>` through the session manager's reuse spawn,
  * carrying the reuse flag and the persona's `extra_env`, read through the
  * harness's `reuseSpawns()`), the launch's end (which launch results are a
@@ -160,6 +162,7 @@ import { KILL_FAILURE_END_ROW_FINISHED } from '../src/persona-episodes.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
 import {
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
+  JSONL_DIAGNOSIS_REUSE_WORDING,
   _resetNow,
   _setNow,
   isLaunchInFlight,
@@ -1175,12 +1178,18 @@ describe('the launch: a resume when the row has a session id and P keeps its con
     await h.runApproverToStop(p)
   })
 
-  // SRJ-705: a `resume` with no transcript to resume goes on to the reuse.
+  // SRJ-705, SRJ-707: a `resume` with no transcript to resume goes on to the
+  // reuse. SRJ-712: after ErrJsonlMissing the lost-transcript diagnosis's
+  // `get` comes first, and the launched outcome carries its amnesia action
+  // (inconclusive: the harness configures no message archive); its line is
+  // logged and its notice posted once (the sequence's launch is no start-pass
+  // launch, so no startup-errors entry is written). The other two make no
+  // diagnosis and answer `spawned`.
   test.each([
-    ['ErrNoSessionId', () => errNoSessionId()],
-    ['ErrJsonlMissing', () => errJsonlMissing()],
-    ['ErrJsonlNeverWritten', () => errJsonlNeverWritten()],
-  ])('the resume answering %s: exactly one reuse spawn of the same id through the session manager\'s reuse spawn, with the flag, and no further call', async (_label, make) => {
+    ['ErrNoSessionId', () => errNoSessionId(), 'spawned', [], 0],
+    ['ErrJsonlMissing', () => errJsonlMissing(), 'fresh-after-inconclusive-amnesia', ['get'], 1],
+    ['ErrJsonlNeverWritten', () => errJsonlNeverWritten(), 'spawned', [], 0],
+  ] as const)('the resume answering %s: exactly one reuse spawn of the same id through the session manager\'s reuse spawn, with the flag, answering %s; the diagnosis get, if any, before it; no further call', async (_label, make, action, diagnosisGets, diagnoses) => {
     const { h, p } = build()
     finishedAtRun1(h, p, { claude_session_id: SESSION_ID })
     h.script({ resumeError: make() })
@@ -1188,10 +1197,14 @@ describe('the launch: a resume when the row has a session id and P keeps its con
 
     const outcome = await h.runSequence(p, { lastReadState: LIVE, keepsConversation: true })
 
-    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'spawned' } })
-    expectCallsThenApprover(order, ['kill', 'get', 'findMissing', 'get', 'resume', 'spawn'])
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action } })
+    expectCallsThenApprover(order, ['kill', 'get', 'findMissing', 'get', 'resume', ...diagnosisGets, 'spawn'])
     expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
     expectOneReuseOf(h, p)
+    expect(h.errors.filter((line) => line.startsWith('[slack] ErrJsonlMissing diagnostic: '))).toHaveLength(diagnoses)
+    expect(h.notices).toEqual(Array.from({ length: diagnoses }, () => ({ key: p, text: expect.stringContaining(`I was ${JSONL_DIAGNOSIS_REUSE_WORDING}`) })))
+    expect(h.startupErrors()).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
     await h.runApproverToStop(p)
   })
 

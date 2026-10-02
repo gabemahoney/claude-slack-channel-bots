@@ -66,9 +66,11 @@
  *   4. A CONFLICT (`ErrTmuxSessionConflict`, b.jg5 SRJ-105, SRJ-501) at any
  *      spawn or resume the ladder makes (the first spawn, the retry spawn
  *      after the collision `get` found no row, the spawn after `resume`
- *      found none, every delete-then-spawn branch, and the resume) takes the CONFLICT row (`conflictAt`): the persona latches
+ *      found none, every delete-then-spawn branch, the resume, and the reuse
+ *      spawn of the same id after resume's no-transcript answer) takes the
+ *      CONFLICT row (`conflictAt`): the persona latches
  *      through the installed latch (`setConflictLatch`) with the refused
- *      operation "plain spawn" or "resume" and the row state the path last
+ *      operation "plain spawn", "reuse spawn" or "resume" and the row state the path last
  *      read before the call (one latch-time `status` read when it read
  *      nothing), and the ladder answers `latched`: no notice from here, no
  *      `spawn-failed` entry, nothing counted, and no kill, delete or further
@@ -211,7 +213,10 @@
  * through the dependencies `buildLiveRowSequenceDeps` binds to the shared
  * entries here, and makes its final launch through one launch call,
  * `launchForLiveRowSequence`: a `resume` whose no-transcript answers go on to
- * the reuse spawn, or the reuse spawn (`reuseSpawnForPersona`, b.jg5
+ * the no-transcript step (`noTranscriptReuse`, b.jg5 SRJ-707, SRJ-712: after
+ * `ErrJsonlMissing` the lost-transcript diagnosis, then the reuse spawn; the
+ * collision ladder's `resume` uses the same step), or the reuse spawn
+ * (`reuseSpawnForPersona`, b.jg5
  * SRJ-112, SRJ-708: `buildSpawnParams` with the reuse flag, its outcomes
  * classified by name), whose collision ends the sequence without its launch;
  * the entry counts its launch's result once. Sequences run in the
@@ -274,6 +279,7 @@ import {
   raiseTmuxUnavailable,
   reportAgentDirectorError,
   reportDeferredUnavailable,
+  reportReuseCollisionAtSite,
   reportUnclassifiedAtSite,
   setOutageFlag,
   withOutageDetection,
@@ -282,9 +288,6 @@ import {
 import {
   AgentDirectorError,
   ErrInstanceIdCollision,
-  ErrJsonlMissing,
-  ErrJsonlNeverWritten,
-  ErrNoSessionId,
   ErrSpawnNotFound,
   ErrSpawnNotResumable,
   ErrCwdNotFound,
@@ -6633,8 +6636,10 @@ function spawnHomeDir(): string {
  * (`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, b.svb/b.f2b; see
  * persona-identity.ts for why). Every plain spawn in the ladder (the first
  * spawn, the retry spawn after the collision `get` found no row, the spawn
- * after `resume` found none, and the replacement and amnesia spawns) sends
- * these params unchanged, the reuse spawn (`reuseSpawnForPersona`) sends
+ * after `resume` found none, and the replacement spawn) sends
+ * these params unchanged, the reuse spawn (`reuseSpawnForPersona`), which
+ * is also the launch after resume's no-transcript answer (b.jg5 SRJ-707,
+ * SRJ-712), sends
  * them with only `reuse_finished: true` added (b.jg5 SRJ-708: one
  * derivation, so a reuse carries the same template, `cwd`, labels and
  * `extra_env` as any launch of the persona), and a resume restores the env
@@ -7298,7 +7303,8 @@ function launchFailureResult(key: string): SpawnPersonaResult {
  * A plain spawn's failure by class (b.jg5 SRJ-111, SRJ-713), at every plain
  * spawn the ladder makes (the first spawn, the retry spawn after the
  * collision `get` found no row, the spawn after `resume` found none, and the
- * replacement and amnesia spawns), with no further launch: the `cwd` errors
+ * replacement spawn; resume's no-transcript answer goes to the reuse spawn
+ * of the same id instead, b.jg5 SRJ-707, SRJ-712), with no further launch: the `cwd` errors
  * answer `failed` quietly (the spawn's wrapper raised `cwd-unreachable`);
  * then the refusal handling (`launchRefusalAt`: a CONFLICT latches with the
  * refused operation "plain spawn" and `lastRead`, an UNUSABLE NAME latches,
@@ -7438,6 +7444,36 @@ async function replaceWithFreshSpawn(
 // ErrJsonlMissing diagnostic (bug b.wrb)
 // ---------------------------------------------------------------------------
 
+/** The startup-errors class of a lost transcript: a resume met `ErrJsonlMissing` after provable activity (b.wrb; b.jg5 SRJ-712). */
+export const JSONL_TRANSCRIPT_LOST_ENTRY_CLASS = 'jsonl-transcript-lost-on-resume'
+
+/** The startup-errors class of an inconclusive lost-transcript diagnosis (b.fwu; b.jg5 SRJ-712). */
+export const JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS = 'jsonl-diagnosis-inconclusive'
+
+/**
+ * What every text of the lost-transcript diagnosis says about the persona
+ * after `ErrJsonlMissing` (b.jg5 SRJ-712): its log lines and startup-errors
+ * details ("the persona is …") and its persona notices ("I was …"). The
+ * persona is brought up fresh by a reuse spawn of its own id, and its row is
+ * kept; none of them says the row goes away.
+ */
+export const JSONL_DIAGNOSIS_REUSE_WORDING =
+  'brought up fresh by a reuse spawn of the same instance, and its row is kept (its history archived to the earlier life)'
+
+/** What the lost-transcript diagnosis concluded (b.wrb, b.fwu). */
+type JsonlDiagnosisVerdict = 'lost' | 'never-created' | 'inconclusive'
+
+/**
+ * The lost-transcript diagnosis's answer when it read the row (or found
+ * none): its verdict, and the persona notice it holds back until the reuse
+ * spawn after it succeeds (`notice`; absent for `never-created`, which posts
+ * none). Its log line and startup-errors entry were written already.
+ */
+interface JsonlDiagnosis {
+  readonly verdict: JsonlDiagnosisVerdict
+  readonly notice?: string
+}
+
 /** The source tokens agent-director stamps on each candidate it stat'd
  *  (AD's `jsonlAttempt.source`): the persisted jsonl_path column, the
  *  CLAUDE_CONFIG_DIR-aware recomputed fallback, and archived session_history
@@ -7505,48 +7541,59 @@ function localStatNote(path: string): string {
 }
 
 /**
- * b.wrb: make an ErrJsonlMissing resume failure LEGIBLE without changing the
- * delete+fresh recovery policy. Fetches the doomed AD row (before delete),
- * logs which transcript path(s) were tried and their provenance, and classifies
- * the loss as never-created (expected, lossless) vs lost (real context
- * destroyed → operator-visible).
+ * b.wrb, b.jg5 SRJ-712: make an `ErrJsonlMissing` resume failure legible.
+ * Reads the persona's row, logs which transcript path(s) were tried and their
+ * provenance, and classifies the loss as never-created (expected, lossless),
+ * lost (real context destroyed, operator-visible) or inconclusive. The
+ * persona is then brought up fresh by a reuse spawn of its own id, which
+ * keeps its row as an earlier life (`JSONL_DIAGNOSIS_REUSE_WORDING`).
  *
- * MUST be called BEFORE tryDelete so the row's jsonl_path / session id / cwd /
- * started_at are still available. Never throws.
+ * It runs before that reuse spawn, because the reuse resets the row it reads
+ * (its `jsonl_path`, session id, `cwd` and `started_at`). Never throws.
+ *
+ * The log line and the startup-errors entry (`JSONL_TRANSCRIPT_LOST_ENTRY_CLASS`,
+ * `JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS`, at start only) are written here.
+ * The persona notice of a `lost` or `inconclusive` verdict is not posted
+ * here: it is answered as `notice`, and the caller posts it only once the
+ * reuse spawn has brought the persona up (`noTranscriptReuse`), since the
+ * notice says the persona was brought up fresh.
  *
  * b.jg5 SRJ-105/SRJ-114: the row `get` is one of SRJ-114's sites, made
  * through the shared own-row read (`readPersonaOwnRow`). No diagnosis is
  * reported (no startup-errors entry, no persona notice, no amnesia count)
  * when it latched the persona (a `provenance_conflict` note on its own row,
  * or an UNUSABLE NAME answer, b.jg5 SRJ-512, which records the state
- * unreadable): the diagnosis answers `latched`, and the caller deletes and
- * launches nothing (b.jg5 SRJ-502). The same when the persona latched
- * elsewhere while the get was awaited (`latchedAfterOwnRowRead`, its one
- * line). Nor when it failed with a refusal
- * (`refusalAt` with verb `get`: any error but `ErrSpawnNotFound` and an
- * UNUSABLE NAME answer, a CONFIG answer included, b.jg5 SRJ-316): the
- * diagnosis answers the refusal result, and the caller deletes nothing and
+ * unreadable): the diagnosis answers `latched`, and the caller launches
+ * nothing (b.jg5 SRJ-502). The same when the persona latched elsewhere while
+ * the get was awaited (`latchedAfterOwnRowRead`, its one line). Nor when it
+ * failed with a refusal (`refusalAt` with verb `get`: any error but
+ * `ErrSpawnNotFound` and an UNUSABLE NAME answer, a CONFIG answer included,
+ * b.jg5 SRJ-316): the diagnosis answers the refusal result, and the caller
  * launches nothing (SRJ-105); any other failure, none today, answers
  * `failed` the same way, with one line and no spawn-failure notice.
  * `ErrSpawnNotFound` (the row is absent) gives 'inconclusive', its reason
  * saying the row is absent.
  *
- * @returns 'lost' when the row had provable prior activity but no transcript
- *          survives (loud), 'never-created' when the archive was consulted and
- *          proved idle-since-spawn (quiet, evidence-based lossless),
- *          'inconclusive' when we could not gather enough evidence to decide
- *          either way (loud-but-uncertain — the diagnosis machinery itself is
- *          degraded, which correlates with the storage faults that cause loss),
- *          or the ladder's result (`failed` or `latched`) when the row `get`
- *          failed or latched the persona.
+ * `read.lastRead` is set to what the `get` read (b.jg5 SRJ-501): the state
+ * the reuse spawn after it records if it latches.
+ *
+ * @returns the diagnosis (`JsonlDiagnosis`): 'lost' when the row had
+ *          provable prior activity but no transcript survives (loud),
+ *          'never-created' when the archive was consulted and proved
+ *          idle-since-spawn (quiet, evidence-based lossless), 'inconclusive'
+ *          when not enough evidence could be gathered to decide either way
+ *          (loud-but-uncertain: the diagnosis machinery itself is degraded,
+ *          which correlates with the storage faults that cause loss); or the
+ *          ladder's result (`failed` or `latched`) when the row `get` failed
+ *          or latched the persona.
  */
 async function diagnoseJsonlMissing(
   persona: Persona,
   config: PersonaConfig,
-  err: ErrJsonlMissing,
+  err: AgentDirectorError,
   isStartup: boolean,
   read: { lastRead?: LatchRowState },
-): Promise<'lost' | 'never-created' | 'inconclusive' | RefusedSiteResult | LatchedSiteResult> {
+): Promise<JsonlDiagnosis | RefusedSiteResult | LatchedSiteResult> {
   const { key } = persona
   const ref = personaRef(persona)
   // --- 1. What paths did AD try, and from where? -------------------------
@@ -7555,46 +7602,44 @@ async function diagnoseJsonlMissing(
   // not. Parse defensively — [] means "no AD detail", not "no paths".
   const adCandidates = parseJsonlMissingCandidates(err.errDescription ?? '')
 
-  // --- 2. Fetch the row we are about to delete (best-effort). -------------
+  // --- 2. Read the row before the reuse spawn resets it (best-effort). ----
   // b.jg5 SRJ-501: this get is the path's last read of the row before the
-  // spawn that follows the delete, so `read.lastRead` records what it gave.
+  // reuse spawn, so `read.lastRead` records what it gave.
   const claudeInstanceId = personaInstanceId(key)
   const what = 'ErrJsonlMissing diagnosis get'
   const ownRead = await readPersonaOwnRow(key, { site: 'spawnForPersona', what, ref })
   if (ownRead.kind === OWN_ROW_READ_LATCHED) {
     // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer latched the persona.
-    // No diagnosis is reported; the caller deletes nothing and launches
-    // nothing.
+    // No diagnosis is reported; the caller launches nothing.
     read.lastRead = LATCH_ROW_STATE_UNREADABLE
     return { key, action: 'latched' }
   }
   // b.jg5 SRJ-502: the get is awaited, and the persona may have latched
   // elsewhere meanwhile (the health tick's liveness read, SRJ-315): no
-  // diagnosis is reported, and the caller deletes nothing and launches
-  // nothing.
+  // diagnosis is reported, and the caller launches nothing.
   if (latchedAfterOwnRowRead(key, 'spawnForPersona', what, ref)) return { key, action: 'latched' }
   if (ownRead.kind === OWN_ROW_READ_REFUSED) {
     // b.jg5 SRJ-105/SRJ-114: a read error on this get is a refusal (the get
     // runs inside the launch attempt, so it arms the retry timer; `get` is
     // not tmux-touching, so it starts no condition). No diagnosis is
-    // reported; the caller deletes nothing and launches nothing.
+    // reported; the caller launches nothing.
     const refused = refusalAt(key, ownRead.error, 'get', 'spawnForPersona', what, ref)
     if (refused) return refused
     // Not reached: every `get` error but ErrSpawnNotFound and UNUSABLE NAME
     // is a refusal. Any other ends the ladder 'failed' as a refusal does: no
-    // diagnosis, no delete, no launch, no spawn-failure notice (b.jg5 SRJ-105).
+    // diagnosis, no launch, no spawn-failure notice (b.jg5 SRJ-105).
     console.error(`[slack] spawnForPersona: ${what} failed for ${ref}: ${describeAgentDirectorFailure(ownRead.error)} — nothing more is called`)
     return { key, action: 'failed' }
   }
   if (ownRead.kind === OWN_ROW_READ_ABSENT) {
     read.lastRead = LATCH_ROW_STATE_NO_ROW
     // (a) Row already gone (ErrSpawnNotFound) — cannot enrich or classify.
-    // Inconclusive: we could not consult the row at all, so we do NOT know
-    // whether history was lost. Report it as uncertainty, not reassurance.
+    // Inconclusive: the row could not be consulted at all, so whether history
+    // was lost is unknown. Report it as uncertainty, not reassurance.
     const adDetail = adCandidates.length
       ? adCandidates.map((c) => `${c.source} ${c.path} (${c.note})`).join('; ')
       : redactSlackLogText(err.errDescription || '(no path detail from agent-director)')
-    reportInconclusiveDiagnosis(
+    const notice = reportInconclusiveDiagnosis(
       key,
       ref,
       claudeInstanceId,
@@ -7602,12 +7647,12 @@ async function diagnoseJsonlMissing(
       isStartup,
       err,
     )
-    return 'inconclusive'
+    return { verdict: 'inconclusive', notice }
   }
   const row = ownRead.row
   read.lastRead = latchRowStateRead(row.state)
-  // b.jg5 SRJ-502: a persona this read latched is not started fresh, so the
-  // diagnosis, whose texts say it is, is not reported either.
+  // b.jg5 SRJ-502: a persona this read latched is not brought up fresh, so
+  // the diagnosis, whose texts say it is, is not reported either.
   if (ownRead.latched) return { key, action: 'latched' }
 
   // --- 3. Assemble the candidate list to log. ----------------------------
@@ -7664,21 +7709,20 @@ async function diagnoseJsonlMissing(
     // LOST: conversation provably happened since spawn, yet no transcript
     // survives. Real context destroyed — must be operator-visible.
     const detail =
-      `${ref} instance=${claudeInstanceId}: resume threw ErrJsonlMissing and the row will be ` +
-      `deleted + fresh-spawned, but the message archive holds ${archivedSinceSpawn} message(s) since spawn ` +
+      `${ref} instance=${claudeInstanceId}: resume threw ErrJsonlMissing and the persona is ` +
+      `${JSONL_DIAGNOSIS_REUSE_WORDING}, but the message archive holds ${archivedSinceSpawn} message(s) since spawn ` +
       `(started_at=${row.started_at}). Conversation history was LOST. Transcript candidates tried ` +
       `(${detailProvenance}): ${candidateStr}.`
     console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
     // Operator-visible signal — reuse the existing startup-errors mechanism.
-    if (isStartup) recordStartupError('jsonl-transcript-lost-on-resume', detail, describeAgentDirectorFailure(err))
-    // And a persona notice so it is not buried in logs.
-    sendPersonaNotice(
-      key,
+    if (isStartup) recordStartupError(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, detail, describeAgentDirectorFailure(err))
+    // And a persona notice so it is not buried in logs, posted once the
+    // reuse spawn has brought the persona up.
+    const notice =
       `⚠️ CSCB: on restart my conversation transcript could not be found, but the message archive shows ` +
-        `${archivedSinceSpawn} message(s) since I started — my conversation memory has been lost and I ` +
-        `was started fresh. An operator should investigate transcript storage. Paths tried: ${candidateStr}`,
-    )
-    return 'lost'
+      `${archivedSinceSpawn} message(s) since I started — my conversation memory has been lost and I ` +
+      `was ${JSONL_DIAGNOSIS_REUSE_WORDING}. An operator should investigate transcript storage. Paths tried: ${candidateStr}`
+    return { verdict: 'lost', notice }
   }
 
   // Below archivedSinceSpawn is 0 or null. Only an attributable 0 (archive
@@ -7690,14 +7734,14 @@ async function diagnoseJsonlMissing(
     // NEVER-CREATED (evidence-based): the archive was consulted and proved zero
     // archived activity since spawn. Claude writes the .jsonl lazily on first
     // message; a persona idle since spawn simply never had one. Expected and
-    // lossless — quiet log, no error, no persona notice, counted as an ordinary
-    // fresh-spawn.
+    // lossless — quiet log, no error, no persona notice; counted with the
+    // diagnosed amnesia (`fresh-after-amnesia`).
     console.error(
       `[slack] ErrJsonlMissing diagnostic: ${ref} instance=${claudeInstanceId} — transcript never ` +
-        `created (archive consulted: 0 archived messages since spawn). Nothing to lose; resume will fresh-spawn. ` +
-        `Transcript candidates tried (${detailProvenance}): ${candidateStr}.`,
+        `created (archive consulted: 0 archived messages since spawn). Nothing to lose; the persona is ` +
+        `${JSONL_DIAGNOSIS_REUSE_WORDING}. Transcript candidates tried (${detailProvenance}): ${candidateStr}.`,
     )
-    return 'never-created'
+    return { verdict: 'never-created' }
   }
 
   // INCONCLUSIVE: we could not gather enough evidence to decide loss vs
@@ -7723,7 +7767,7 @@ async function diagnoseJsonlMissing(
       `the message archive (${config.message_archive_db}) could not be consulted (missing file, ` +
       `unreadable, or the count query failed) — see prior archive-count error line`
   }
-  reportInconclusiveDiagnosis(
+  const notice = reportInconclusiveDiagnosis(
     key,
     ref,
     claudeInstanceId,
@@ -7731,15 +7775,20 @@ async function diagnoseJsonlMissing(
     isStartup,
     err,
   )
-  return 'inconclusive'
+  return { verdict: 'inconclusive', notice }
 }
 
 /**
- * b.fwu: emit the operator-visible signal for an INCONCLUSIVE ErrJsonlMissing
- * diagnosis — one where we could not determine whether prior history was lost.
- * Follows the 'lost' branch's pattern (recordStartupError guarded by isStartup
- * + a persona notice), but worded as UNCERTAINTY, not loss: a false "your history
- * was destroyed" is its own harm. Never throws.
+ * b.fwu, b.jg5 SRJ-712: the operator-visible signal for an INCONCLUSIVE
+ * `ErrJsonlMissing` diagnosis, one where whether prior history was lost
+ * could not be determined. Like the 'lost' verdict, it writes the log line
+ * and, at start, the startup-errors entry
+ * (`JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS`) now, and answers the persona
+ * notice text, which its caller posts once the reuse spawn has brought the
+ * persona up. Every text says the persona is brought up fresh by a reuse
+ * spawn and its row is kept (`JSONL_DIAGNOSIS_REUSE_WORDING`), and is worded
+ * as uncertainty, not loss: a false "your history was destroyed" is its own
+ * harm. Never throws.
  */
 function reportInconclusiveDiagnosis(
   key: string,
@@ -7747,35 +7796,126 @@ function reportInconclusiveDiagnosis(
   claudeInstanceId: string,
   reason: string,
   isStartup: boolean,
-  err: ErrJsonlMissing,
-): void {
+  err: AgentDirectorError,
+): string {
   const detail =
-    `${ref} instance=${claudeInstanceId}: resume threw ErrJsonlMissing and the row will be ` +
-    `deleted + fresh-spawned, but diagnosis was INCONCLUSIVE — could not determine whether conversation ` +
+    `${ref} instance=${claudeInstanceId}: resume threw ErrJsonlMissing and the persona is ` +
+    `${JSONL_DIAGNOSIS_REUSE_WORDING}, but diagnosis was INCONCLUSIVE — could not determine whether conversation ` +
     `history was lost because ${reason}.`
   console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
-  if (isStartup) recordStartupError('jsonl-diagnosis-inconclusive', detail, describeAgentDirectorFailure(err))
-  sendPersonaNotice(
-    key,
-    `⚠️ CSCB: on restart I was started fresh; I could not determine whether my prior ` +
-      `conversation history was preserved (diagnosis inconclusive: ${reason}). An operator should ` +
-      `investigate.`,
+  if (isStartup) recordStartupError(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, detail, describeAgentDirectorFailure(err))
+  return (
+    `⚠️ CSCB: on restart I was ${JSONL_DIAGNOSIS_REUSE_WORDING}; I could not determine whether my prior ` +
+    `conversation history was preserved (diagnosis inconclusive: ${reason}). An operator should ` +
+    `investigate.`
   )
+}
+
+// ---------------------------------------------------------------------------
+// The no-transcript step (b.jg5 SRJ-707, SRJ-712)
+// ---------------------------------------------------------------------------
+
+/** `resume`'s no-transcript answers, which go on to a reuse spawn of the same id (b.jg5 SRJ-707, SRJ-113, SRJ-705), by name. */
+const NO_TRANSCRIPT_RESUME_ERR_NAMES = [ERR_NO_SESSION_ID_NAME, ERR_JSONL_MISSING_NAME, ERR_JSONL_NEVER_WRITTEN_NAME] as const
+
+/**
+ * Whether `err` is one of `resume`'s no-transcript answers (`ErrNoSessionId`,
+ * `ErrJsonlMissing`, `ErrJsonlNeverWritten`). The answer is decided by name
+ * (`hasAdErrorName`); the `instanceof` check only narrows the type.
+ */
+function isNoTranscriptResumeError(err: unknown): err is AgentDirectorError {
+  return err instanceof AgentDirectorError && NO_TRANSCRIPT_RESUME_ERR_NAMES.some((name) => hasAdErrorName(err, name))
+}
+
+/** What the no-transcript step is told by its caller. */
+interface NoTranscriptReuseOptions {
+  /** Whether the launch is part of the start pass (startup-errors entries are written only then). */
+  readonly isStartup: boolean
+  /** The row state the caller last read before the `resume` (the diagnosis's read replaces it when it makes one). */
+  readonly lastRead: LatchRowState
+  /** True when the caller ran the pre-launch trust patch in this launch attempt. */
+  readonly trustPatchRan: boolean
+}
+
+/**
+ * The no-transcript step (b.jg5 SRJ-707, SRJ-712, SRJ-113): what follows a
+ * `resume` of persona `persona`'s id that answered `ErrNoSessionId`,
+ * `ErrJsonlNeverWritten` or `ErrJsonlMissing` (`err`, by name;
+ * `isNoTranscriptResumeError`). The collision ladder (`resumeOrFreshSpawn`)
+ * and the live-row sequence's launch entry's `resume` leg
+ * (`sequenceLaunchCall`) both use it. The row `resume` refused for these
+ * reasons is finished, so no live-row sequence is needed first.
+ *   - `ErrJsonlMissing`: the lost-transcript diagnosis runs first
+ *     (`diagnoseJsonlMissing`), because the reuse spawn resets the row it
+ *     reads. Its latched and refused answers end the step with no launch
+ *     (b.jg5 SRJ-502, SRJ-105), and are answered as they are.
+ *   - Then one reuse spawn of the same id (`reuseSpawnForPersona`), with the
+ *     row state last read: the diagnosis's read when it made one, else
+ *     `options.lastRead`.
+ *   - A success answers `fresh-after-amnesia` after `ErrJsonlMissing`
+ *     (`fresh-after-inconclusive-amnesia` for an inconclusive diagnosis),
+ *     and only then posts the diagnosis's persona notice, which says the
+ *     persona was brought up fresh; `spawned` for the other two answers,
+ *     which lost no history.
+ *   - Every other answer is the reuse spawn's (SRJ-112, `reuseSpawnFailedAt`),
+ *     its collided answer included, which each caller handles; the
+ *     diagnosis's notice is not posted for it, and a later attempt makes its
+ *     own diagnosis.
+ * Nothing here deletes, kills or makes a plain spawn. Never throws.
+ */
+async function noTranscriptReuse(
+  persona: Persona,
+  config: PersonaConfig,
+  err: AgentDirectorError,
+  options: NoTranscriptReuseOptions,
+): Promise<ReuseSpawnResult> {
+  const { key } = persona
+  let diagnosis: JsonlDiagnosis | undefined
+  // b.jg5 SRJ-501: the diagnosis `get`, when made, is the last read before the reuse.
+  const diagnosisRead: { lastRead?: LatchRowState } = {}
+  if (hasAdErrorName(err, ERR_JSONL_MISSING_NAME)) {
+    const diagnosed = await diagnoseJsonlMissing(persona, config, err, options.isStartup, diagnosisRead)
+    if ('action' in diagnosed) return diagnosed
+    diagnosis = diagnosed
+  }
+  const result = await reuseSpawnForPersona(persona, config, {
+    isStartup: options.isStartup,
+    lastRead: diagnosisRead.lastRead ?? options.lastRead,
+    trustPatchRan: options.trustPatchRan,
+  })
+  if (diagnosis === undefined || result.action !== 'spawned') return result
+  // b.jg5 SRJ-712: the persona is up, so the notice that says so is posted now.
+  if (diagnosis.notice !== undefined) sendPersonaNotice(key, diagnosis.notice)
+  // b.fwu: amnesia, not a clean spawn, so the start summary counts it apart:
+  // 'lost' and 'never-created' are diagnosed, 'inconclusive' is not.
+  return {
+    key,
+    action: diagnosis.verdict === 'inconclusive' ? 'fresh-after-inconclusive-amnesia' : 'fresh-after-amnesia',
+  }
 }
 
 /**
  * Recover a collided spawn whose live session cannot be reached: resume-first
  * (preserves session history) when resume_enabled, with these fallbacks:
- * ErrNoSessionId / ErrJsonlMissing / ErrJsonlNeverWritten → delete + fresh;
- * ErrSpawnNotResumable → kill + delete + fresh; ErrSpawnNotFound → fresh, no
- * delete since the row is already gone. A resume's ErrTmuxSessionCreate has
+ * ErrNoSessionId / ErrJsonlMissing / ErrJsonlNeverWritten (by name) → the
+ * no-transcript step (`noTranscriptReuse`, b.jg5 SRJ-707, SRJ-712): after
+ * ErrJsonlMissing the lost-transcript diagnosis, then one reuse spawn of the
+ * same id, with nothing deleted; ErrSpawnNotResumable → kill + delete +
+ * fresh; ErrSpawnNotFound → fresh, no delete since the row is already gone.
+ * A resume's ErrTmuxSessionCreate has
  * no fallback: it is one counted launch failure through `resumeFailedAt`
  * (b.jg5 SRJ-113, SRJ-602), which kills nothing, makes no spawn in its
  * place and arms the persona's retry timer at once in pending-only mode, so
- * that the retry's read of the row decides (SRJ-409; HO rev 28). Every spawn
- * here is a plain spawn from `buildSpawnParams` (no reuse flag, b.jg5
+ * that the retry's read of the row decides (SRJ-409; HO rev 28). Every other
+ * spawn here is a plain spawn from `buildSpawnParams` (no reuse flag, b.jg5
  * SRJ-711) whose failure takes the plain spawn's handling
  * (`plainSpawnFailedAt`), its `ErrTmuxSessionCreate` counted the same way.
+ *
+ * The no-transcript step's reuse spawn has SRJ-112's outcomes
+ * (`reuseSpawnFailedAt`). Its collision (`ErrInstanceIdCollision`: the row
+ * is live again) ends the ladder with the uncounted refused result (`failed`
+ * marked `refused`): nothing counted, no notice, and the persona's retry
+ * timer armed with the reuse-collision cause (`reportReuseCollisionAtSite`).
  * This is the `ended`/`missing` state handling, extracted so the
  * b.3ce dead-session fallback in the `waiting`/`working` branches reuses the
  * exact same decision logic instead of inventing its own.
@@ -7810,10 +7950,11 @@ function reportInconclusiveDiagnosis(
  *
  * b.jg5 SRJ-501, SRJ-113, SRJ-111: a CONFLICT at the resume, or at any
  * spawn after it, latches the persona (`conflictAt`), with the refused
- * operation "resume" or "plain spawn" and the row state the path last read
+ * operation "resume", "plain spawn" or, at the no-transcript step's reuse,
+ * "reuse spawn", and the row state the path last read
  * before that call: `opts.lastRead` (the caller's last read: the collision
  * `get`'s state, the working-row wait's last `status`, or the prompt row's
- * re-read), or, for the spawn after `ErrJsonlMissing`, what its diagnosis
+ * re-read), or, for the reuse after `ErrJsonlMissing`, what its diagnosis
  * `get` read. It answers `latched`: nothing is killed, deleted or launched
  * after it. An UNUSABLE NAME answer at the resume, at any spawn after it, or
  * at a kill or delete of its delete-then-spawn chains latches the persona
@@ -7917,64 +8058,29 @@ async function resumeOrFreshSpawn(
     afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_RESUME, launched)
     return { key, action: 'resumed' }
   } catch (err) {
-    if (err instanceof ErrNoSessionId || err instanceof ErrJsonlMissing || err instanceof ErrJsonlNeverWritten) {
-      console.error(`[slack] spawnForPersona: ${describeAgentDirectorFailure(err)} on resume for ${ref} — delete+fresh`)
-      // b.jgf: AD 0.10.0 split the old "no transcript" condition in two.
-      // ErrJsonlNeverWritten asserts the session never wrote a transcript at
-      // all, so a fresh spawn is lossless BY DEFINITION — it gets no diagnosis
-      // ceremony, no amnesia action and no persona notice, just the delete+fresh
-      // below and a successful action so restart.ts stops retrying. Only
-      // ErrJsonlMissing (a transcript path was recorded but is not there now)
-      // carries the ambiguity that the b.wrb/b.fwu machinery exists to resolve.
-      // b.wrb: diagnose the missing transcript BEFORE deleting the row (its
-      // jsonl_path / session id / started_at are needed). Logging/classification
-      // only — the delete+fresh POLICY below is unchanged. The 'lost' case is
-      // made operator-visible inside diagnoseJsonlMissing itself.
-      // b.jg5 SRJ-105/SRJ-114: a refused diagnosis get stops the chain: no
-      // delete, no launch; the ladder answers failed and markRefusal adds
-      // `refused`. A diagnosis get that latched the persona stops it too, and
-      // the ladder answers latched (b.jg5 SRJ-502).
-      let jsonlDiagnosis: 'lost' | 'never-created' | 'inconclusive' | undefined
-      // b.jg5 SRJ-501: the diagnosis `get`, when made, is the last read before the spawn below.
-      const diagnosisRead: { lastRead?: LatchRowState } = {}
-      if (err instanceof ErrJsonlMissing) {
-        const diagnosis = await diagnoseJsonlMissing(persona, config, err, isStartup, diagnosisRead)
-        if (typeof diagnosis === 'object') return diagnosis
-        jsonlDiagnosis = diagnosis
-      }
-      // b.jg5 SRJ-105, SRJ-512: a refused delete, or one that latched the
-      // persona, stops the chain: no launch.
-      const deleteStop = await tryDelete(key, isStartup, ref, diagnosisRead.lastRead ?? lastRead)
-      if (deleteStop) return deleteStop
-      try {
-        const launched: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
-        console.error(`[slack] spawnForPersona: fresh-spawned (after delete) for ${ref}`)
-        afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
-        // A fresh-spawn that replaced a resume because the transcript was gone
-        // is amnesia, not a clean spawn — surface it as its own action so the
-        // startup summary does not count it as an ordinary "ok". b.fwu: split
-        // the amnesia into two actions by diagnosis. 'lost' and 'never-created'
-        // are DIAGNOSED amnesia (we know whether history was destroyed —
-        // 'lost' was already made loud above, 'never-created' is evidence-based
-        // lossless). 'inconclusive' is UNDIAGNOSABLE amnesia: we could not tell
-        // whether we destroyed anything, which is itself operator-worthy and
-        // must not be lumped with the known-cause cases. ErrNoSessionId and
-        // b.jgf's ErrJsonlNeverWritten fall through to plain 'spawned': no
-        // history existed to lose, so counting them as amnesia would overstate
-        // the damage in the startup summary.
-        if (err instanceof ErrJsonlMissing) {
-          return {
-            key,
-            action:
-              jsonlDiagnosis === 'inconclusive'
-                ? 'fresh-after-inconclusive-amnesia'
-                : 'fresh-after-amnesia',
-          }
-        }
-        return { key, action: 'spawned' }
-      } catch (err2) {
-        return plainSpawnFailedAt(key, err2, isStartup, ref, 'fresh spawn after delete', diagnosisRead.lastRead ?? lastRead)
-      }
+    if (isNoTranscriptResumeError(err)) {
+      console.error(
+        `[slack] spawnForPersona: ${describeAgentDirectorFailure(err)} on resume for ${ref} — a reuse spawn of the same id follows; nothing is deleted (b.jg5 SRJ-707)`,
+      )
+      // b.jg5 SRJ-707, SRJ-712: the no-transcript step. After ErrJsonlMissing
+      // the lost-transcript diagnosis runs first; a refused diagnosis get
+      // ends the ladder with no launch (`failed`, which markRefusal marks
+      // `refused`), and one that latched the persona answers `latched`
+      // (b.jg5 SRJ-105, SRJ-502). ErrNoSessionId and ErrJsonlNeverWritten lost
+      // no history, so they get no diagnosis and a success answers `spawned`.
+      // The reuse spawn's outcomes are SRJ-112's: a CONFLICT latches with the
+      // refused operation "reuse spawn" (b.jg5 SRJ-501).
+      const reused = await noTranscriptReuse(persona, config, err, { isStartup, lastRead, trustPatchRan: true })
+      if (!isReuseSpawnCollided(reused)) return reused
+      // b.jg5 SRJ-112, SRJ-301: the row is live again, so the reuse launched
+      // nothing. The attempt ends with the uncounted refused result, nothing
+      // posted, and the persona's retry timer armed with the reuse-collision
+      // cause, so its retry runs the restart path's decision on the row.
+      const armed = reportReuseCollisionAtSite(key)
+      console.error(
+        `[slack] spawnForPersona: the reuse spawn of ${ref} after its resume's no-transcript answer collided with a live row — nothing launched; answering the uncounted refused result, no spawn-failure notice, nothing counted; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION}; b.jg5 SRJ-112)`,
+      )
+      return { key, action: 'failed', refused: true }
     }
     if (err instanceof ErrSpawnNotResumable) {
       // Row is non-terminal but resume rejected — defensive: kill + delete + spawn
@@ -8450,7 +8556,7 @@ export function _resetDialogApprovers(): void {
 
 /** The launches whose success runs the after-launch step, as the `pre_trust` line names them. */
 export type LaunchVerb = typeof LAUNCH_VERB_SPAWN | typeof LAUNCH_VERB_RESUME | typeof LAUNCH_VERB_REUSE_SPAWN
-/** A plain spawn (a first, retry, replacement or amnesia spawn). */
+/** A plain spawn (a first, retry or replacement spawn, or the spawn after `resume` found no row). */
 export const LAUNCH_VERB_SPAWN = 'spawn'
 /** A `resume`. */
 export const LAUNCH_VERB_RESUME = 'resume'
@@ -8499,9 +8605,10 @@ function renderPreTrustValue(value: unknown): string {
  * The one step after a launch call that returned success (b.jg5 SRJ-401):
  * the plain spawn, the retry spawn after the collision
  * `get`'s `ErrSpawnNotFound`, the fresh spawn of a replacement, the
- * `resume`, the amnesia spawn, the spawns after `resume`'s
+ * `resume`, the spawns after `resume`'s
  * `ErrSpawnNotResumable` and `ErrSpawnNotFound`, and the reuse spawn
- * (`reuseSpawnForPersona`). `verb` names the launch and `launched` is the
+ * (`reuseSpawnForPersona`), including the reuse spawn of the same id after
+ * `resume`'s no-transcript answer (b.jg5 SRJ-707, SRJ-712). `verb` names the launch and `launched` is the
  * call's whole result. The step writes the launch's one
  * `pre_trust` line (`preTrustLogLine`, b.jg5 SRJ-413), then starts the
  * persona's dialog approver (`startDialogApprover`) without awaiting it, so
@@ -8602,7 +8709,9 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      kill, no delete, `cwd-unreachable` raised and `failed` returned
  *      (b.av2 SR-6.4). Otherwise branch on state:
  *    - ended/missing + resume_enabled → resume; on ErrNoSessionId/
- *      ErrJsonlMissing/ErrJsonlNeverWritten → delete + fresh spawn.
+ *      ErrJsonlMissing/ErrJsonlNeverWritten → the no-transcript step: after
+ *      ErrJsonlMissing the lost-transcript diagnosis, then one reuse spawn
+ *      of the same id; nothing is deleted (`noTranscriptReuse`).
  *    - ended/missing + !resume_enabled → kill + delete + fresh spawn.
  *    - waiting → the reconnect (`reconnectMcpWithCause`, one `send-keys`,
  *      b.jg5 SRJ-118); 'dead-session', whatever its cause → the find-missing
@@ -9374,9 +9483,6 @@ export interface LiveRowSequenceNotLaunched {
 /** What the sequence-launch entry answers: the launch's result, or that no launch was made. */
 export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSequenceNotLaunched
 
-/** `resume`'s answers that go on to the reuse spawn (b.jg5 SRJ-705, SRJ-113), by name. */
-const NO_TRANSCRIPT_RESUME_ERR_NAMES = [ERR_NO_SESSION_ID_NAME, ERR_JSONL_MISSING_NAME, ERR_JSONL_NEVER_WRITTEN_NAME] as const
-
 /**
  * The live-row sequence's final launch (b.jg5 SRJ-705 step 6) of persona
  * `persona`'s `cscb_<key>`, of `request.kind`. It is a launch call:
@@ -9400,7 +9506,14 @@ const NO_TRANSCRIPT_RESUME_ERR_NAMES = [ERR_NO_SESSION_ID_NAME, ERR_JSONL_MISSIN
  *   - `resume`: one `resume` of the id through the ladder's launch helper
  *     (`launchWithReplyGuard`: the reply guard, spawn detection, arming by
  *     class). `ErrNoSessionId`, `ErrJsonlMissing` and `ErrJsonlNeverWritten`
- *     (by name) go on to the reuse spawn once; `ErrSpawnNotResumable`
+ *     (by name) go on to the no-transcript step (`noTranscriptReuse`,
+ *     SRJ-707, SRJ-712): after `ErrJsonlMissing` the lost-transcript
+ *     diagnosis first (a latched or refused diagnosis read ends the launch
+ *     with no reuse), then the reuse spawn once with the row state last read
+ *     (the diagnosis's read when it made one); its success answers
+ *     `fresh-after-amnesia` or `fresh-after-inconclusive-amnesia` after
+ *     `ErrJsonlMissing` and `spawned` otherwise, and its collision answers
+ *     not launched as the `reuse` kind's does; `ErrSpawnNotResumable`
  *     answers not launched (SRJ-710: no second sequence); an
  *     `ErrTmuxSessionCreate` (by class) is a counted launch failure that also
  *     arms the persona's retry timer at once in pending-only mode, through
@@ -9580,11 +9693,17 @@ async function sequenceLaunchCall(
     afterLaunchSucceeded(key, false, ref, LAUNCH_VERB_RESUME, launched)
     return { key, action: 'resumed' }
   } catch (err) {
-    if (NO_TRANSCRIPT_RESUME_ERR_NAMES.some((name) => hasAdErrorName(err, name))) {
+    if (isNoTranscriptResumeError(err)) {
       console.error(
-        `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${describeAgentDirectorFailure(err)} on resume for ${ref} — going on to the reuse spawn (b.jg5 SRJ-705)`,
+        `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${describeAgentDirectorFailure(err)} on resume for ${ref} — going on to a reuse spawn of the same id; nothing is deleted (b.jg5 SRJ-705, SRJ-707)`,
       )
-      return sequenceReuse(persona, config, request.lastRead, true)
+      // b.jg5 SRJ-712: after ErrJsonlMissing the diagnosis runs first.
+      const reused = await noTranscriptReuse(persona, config, err, {
+        isStartup: false,
+        lastRead: request.lastRead,
+        trustPatchRan: true,
+      })
+      return sequenceReuseAnswer(persona, reused)
     }
     if (hasAdErrorName(err, ERR_SPAWN_NOT_RESUMABLE_NAME)) {
       console.error(
@@ -9607,11 +9726,10 @@ async function sequenceLaunchCall(
 }
 
 /**
- * The sequence's reuse spawn (`reuseSpawnForPersona`) with `lastRead`, the
- * row state the sequence last read; `trustPatchRan` when the `resume` leg
- * ran the trust patch in this attempt. Its collided answer becomes the
- * not-launched answer `reuse-collision` (b.jg5 SRJ-112, SRJ-705): no further
- * launch, nothing counted. Never throws.
+ * The sequence's reuse spawn (`reuseSpawnForPersona`) of the `reuse` kind,
+ * with `lastRead`, the row state the sequence last read; `trustPatchRan`
+ * when this attempt already ran the trust patch. Its answer is read as
+ * `sequenceReuseAnswer` reads it. Never throws.
  */
 async function sequenceReuse(
   persona: Persona,
@@ -9619,8 +9737,17 @@ async function sequenceReuse(
   lastRead: LatchRowState,
   trustPatchRan: boolean,
 ): Promise<LiveRowSequenceLaunchEntryResult> {
+  return sequenceReuseAnswer(persona, await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead, trustPatchRan }))
+}
+
+/**
+ * A reuse spawn's answer at the sequence's launch, of either leg: its
+ * collided answer becomes the not-launched answer `reuse-collision` (b.jg5
+ * SRJ-112, SRJ-705): no further launch, nothing counted; any other answer is
+ * the launch's result.
+ */
+function sequenceReuseAnswer(persona: Persona, result: ReuseSpawnResult): LiveRowSequenceLaunchEntryResult {
   const { key } = persona
-  const result = await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead, trustPatchRan })
   if (!isReuseSpawnCollided(result)) return result
   console.error(
     `${LIVE_ROW_SEQUENCE_LOG_PREFIX} the reuse spawn of ${personaRef(persona)} collided with a live row — no further launch, nothing counted; the sequence ends without its launch (b.jg5 SRJ-112, SRJ-705)`,
@@ -10673,12 +10800,12 @@ export async function startupSessionManager(
     // the diagnosis machinery could not tell whether history was destroyed. That
     // degraded-diagnosis condition correlates with the storage faults that cause
     // real loss, so it warrants its own attention. Each was recorded to
-    // startup-errors as 'jsonl-diagnosis-inconclusive'.
+    // startup-errors as JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS.
     console.error(
       `[slack] startupSessionManager: ${freshAfterInconclusiveAmnesia} persona(s) were fresh-spawned after ` +
         `ErrJsonlMissing WITHOUT a conclusive diagnosis — could NOT determine whether conversation history was ` +
         `lost. See per-persona "ErrJsonlMissing diagnostic ... INCONCLUSIVE" lines and the ` +
-        `'jsonl-diagnosis-inconclusive' startup errors above.`,
+        `'${JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS}' startup errors above.`,
     )
   }
   if (waitingInBackground > 0) {

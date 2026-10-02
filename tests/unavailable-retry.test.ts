@@ -86,7 +86,12 @@
  * first retry strictly past the alert threshold in effect (agent-director's
  * defaults and AC 80's settings), derived from the accessor; a collision
  * `get` and every retry's row read (`ErrSchemaMismatch`); the log-only route
- * for a persona removed while its retry spawn is held (AC 69); the episode's
+ * for a persona removed while its retry spawn is held (AC 69); at the
+ * collision ladder's no-transcript reuse spawn after `resume`'s
+ * `ErrNoSessionId` (b.jg5 SRJ-707), an `ErrInternal` at every retry
+ * (retried at each due time, never counted, one alert past the threshold,
+ * the log-only route for a persona removed while that reuse is held, P up
+ * once it succeeds) and an UNAVAILABLE answer twice, then success; the episode's
  * ends (nothing left to recover, a pending-only row live, the cap through
  * `onCapReached`, the teardown's forget) and a new episode alerting again;
  * the stop observer once per stop; and nothing armed or opened outside an
@@ -177,7 +182,7 @@ import {
   type KillRetryResult,
 } from '../src/kill-retry.ts'
 import { adAlertThresholdMs, adAlertThresholdMsInEffect, adGraceMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
-import type { Phase1GetResult } from '../src/ad-phase1-types.ts'
+import type { Phase1GetResult, Phase1SpawnParams } from '../src/ad-phase1-types.ts'
 import { ERR_SCHEMA_MISMATCH_NAME, ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
@@ -390,6 +395,7 @@ import {
   errInternal,
   errInvalidFlags,
   errJsonlNeverWritten,
+  errNoSessionId,
   errSchemaMismatch,
   errSpawnNotFound,
   errSpawnNotInteractive,
@@ -448,6 +454,7 @@ import {
   personaOf,
   recordCallOrder,
   retryNow,
+  reuseSpawnOf,
   startSequenceHeldAtRun,
   runSequenceStoppedAtKill,
   unclassifiedEndedLine,
@@ -1222,14 +1229,16 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     else expect(cause).toEqual({ kind, error: value })
   })
 
-  test.each<[string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, SpawnPersonaResult['action']]>([
-    ['a STATE answer from resume (ErrJsonlNeverWritten)', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errJsonlNeverWritten() }), 'spawned'],
-    ['a DIRECTORY answer from spawn', () => ({ spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found') }), 'failed'],
-    ['ErrSpawnNotFound from the collision get', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() }), 'spawned'],
+  test.each<[string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, SpawnPersonaResult['action'], number]>([
+    // b.jg5 SRJ-707: the stub's spawn queue answers the first spawn's
+    // collision; the reuse spawn of the same id after the resume succeeds.
+    ['a STATE answer from resume (ErrJsonlNeverWritten), then the one reuse spawn', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errJsonlNeverWritten() }), 'spawned', 1],
+    ['a DIRECTORY answer from spawn', () => ({ spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found') }), 'failed', 0],
+    ['ErrSpawnNotFound from the collision get', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() }), 'spawned', 0],
     // b.jg5 SRJ-605: the working-row wait's poll reading the row absent is
     // 'dead-session', and the recovery resumes the row the collision read.
-    ['ErrSpawnNotFound from the working-row read (status)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusQueue: [cannedErr(errSpawnNotFound())] }), 'resumed'],
-  ])('%s inside a launch arms nothing and marks nothing', async (_what, script, action) => {
+    ['ErrSpawnNotFound from the working-row read (status)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusQueue: [cannedErr(errSpawnNotFound())] }), 'resumed', 0],
+  ])('%s inside a launch arms nothing and marks nothing', async (_what, script, action, reuses) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     h.script(script(h, personaOf(h, key)))
@@ -1237,6 +1246,8 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     const result = await h.launch(key)
 
     expect(result).toEqual({ key, action })
+    expect(h.reuseSpawns()).toEqual(Array.from({ length: reuses }, () => reuseSpawnOf(h, key)))
+    expect(h.stub.calls.deleteCalls).toEqual([])
     expect(h.triggers).toEqual([])
     expect(h.controller.armedKeys()).toEqual([])
     // A launch that answers spawned starts P's dialog approver, whose cap and
@@ -5955,7 +5966,8 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
 // counted, retried on the backoff, one alert per episode at the first
 // UNCLASSIFIED outcome met strictly past the alert threshold in effect, the
 // log-only route for a persona no longer configured, and the episode's ends.
-// The reuse spawn half is E22's and the latch end E13's.
+// The reuse spawn half is the no-transcript reuse describe's below, and the
+// latch end E13's.
 // ---------------------------------------------------------------------------
 
 /** AC 80's agent-director settings (the AC's input): an alert threshold below the defaults'. */
@@ -6275,6 +6287,197 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
     expect(h.startupErrors()).toHaveLength(1)
     expect(h.episodeNotices).toEqual([])
     expectUntouchedEpisode(h, other)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 69 at a reuse site (b.jg5 SRJ-313's "a reuse spawn included", SRJ-112,
+// SRJ-707; the E12 hatch note): the collision ladder's no-transcript reuse
+// spawn is the first production reuse site a retry reaches. On the recovery
+// harness with both settings 0, P's bring-up collides, the collision `get`
+// reads P's row `ended` with no session id, `resume` answers
+// `ErrNoSessionId`, and the reuse spawn of the same id answers as the case
+// sets it, on every launch (`noSessionIdReuse`). Each retry runs the restart
+// path's decision on the `ended` row: its liveness read, the kill of the
+// dead row and the launch, which ends at that reuse. Nothing is deleted.
+// ---------------------------------------------------------------------------
+
+/** The reuse spawn's answer at `noSessionIdReuse`'s site: an error, or success when it gives none. */
+interface NoSessionIdReuse {
+  /** Set the reuse spawn's answer from now on. */
+  answer(make: (() => Error) | undefined): void
+  /** Hold the next reuse spawn once the stub has recorded it: `entered` resolves then, and `fail(err)` answers it with `err`. */
+  holdNext(): { readonly entered: Promise<void>; fail(err: Error): void }
+}
+
+/**
+ * Script persona `key`'s every launch to reach the no-transcript reuse: its
+ * plain spawn collides, the collision `get` reads its row `ended` with no
+ * session id, `resume` answers `ErrNoSessionId`, and its reuse spawn (the
+ * spawn carrying the reuse flag) answers `make()`, or succeeds once the
+ * answer is cleared. Every spawn is recorded by the stub as made. P's row
+ * reads `ended` until a reuse succeeds, then `waiting`.
+ */
+function noSessionIdReuse(h: RecoveryHarness, key: string, make: () => Error): NoSessionIdReuse {
+  let reuseAnswer: (() => Error) | undefined = make
+  let hold: { readonly enter: () => void; readonly outcome: Promise<Error> } | undefined
+  let up = false
+  const client = h.stub.client
+  const spawn = client.spawn.bind(client)
+  client.spawn = async (params) => {
+    const result = await spawn(params)
+    if ((params as Phase1SpawnParams).reuse_finished !== true) throw errInstanceIdCollision()
+    const held = hold
+    hold = undefined
+    if (held !== undefined) {
+      held.enter()
+      throw await held.outcome
+    }
+    if (reuseAnswer !== undefined) throw reuseAnswer()
+    up = true
+    return result
+  }
+  h.script({
+    getResult: cannedGetResult({ state: 'ended', claude_session_id: '' }, personaOf(h, key), h.home),
+    resumeError: errNoSessionId(),
+    statusFn: () => cannedStatusResult({ state: up ? 'waiting' : 'ended' }),
+  })
+  return {
+    answer: (next) => {
+      reuseAnswer = next
+    },
+    holdNext: () => {
+      let enter!: () => void
+      let fail!: (err: Error) => void
+      const entered = new Promise<void>((resolve) => (enter = resolve))
+      const outcome = new Promise<Error>((resolve) => (fail = resolve))
+      hold = { enter, outcome }
+      return { entered, fail }
+    },
+  }
+}
+
+/** The calls of the bring-up's launch to the refused reuse: the colliding spawn, the collision get, the resume and the reuse spawn. */
+const NO_SESSION_ID_REUSE_LAUNCH = { spawnCalls: 2, getCalls: 1, resumeCalls: 1 } as const
+
+/** The calls of each retry: its liveness read, the kill of the dead row, then the launch to the reuse. */
+const NO_SESSION_ID_REUSE_RETRY = { statusCalls: 1, killCalls: 1, ...NO_SESSION_ID_REUSE_LAUNCH } as const
+
+describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrNoSessionId, refused UNCLASSIFIED or UNAVAILABLE, is retried at each due time and never counted (SRJ-313, SRJ-112, SRJ-707, AC 69)', () => {
+  test('AC 69: an ErrInternal from the reuse at every retry, with both settings 0: no delete, no condition post and no spawn-failure notice; never counted past the restart cap; a retry at each due time; exactly one alert, at the first retry strictly past the alert threshold in effect; once the reuse succeeds P is up and its timer stops', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    const err = errInternal()
+    const reuse = noSessionIdReuse(h, key, () => err)
+    const armedAt = h.clock.now()
+
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+
+    expect(callCounts(h)).toEqual(NO_SESSION_ID_REUSE_LAUNCH)
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, key)])
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED)
+    expect(unclassifiedLines(h, key)).toEqual([unclassifiedStartedLine(key, err)])
+    const thresholdMs = adAlertThresholdMsInEffect()
+    const alert = alertRetry(armedAt, thresholdMs)
+    const retries = Math.max(alert.retry, RESTART_FAILURE_CAP) + 1
+
+    let dueAt = armedAt
+    for (let n = 0; n < retries; n++) {
+      dueAt += waitMs(n)
+      const before = callCounts(h)
+      await h.advance(dueAt - 1 - h.clock.now())
+      expect([n, h.attempts.length, callsSince(h, before)]).toEqual([n, n, {}])
+      expect(await retryNow(h, key)).toBe(dueAt)
+      expect([n, callsSince(h, before)]).toEqual([n, NO_SESSION_ID_REUSE_RETRY])
+      expect([n, h.controller.view(key)]).toEqual([n, expect.objectContaining({ refusals: n + 1, causes: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED], mode: UNAVAILABLE_RETRY_MODE_FULL })])
+      expect([n, h.episodeNotices]).toEqual([n, n + 1 < alert.retry ? [] : [unclassifiedAlert(key, err)]])
+    }
+
+    expect(unclassifiedLines(h, key)).toEqual([unclassifiedStartedLine(key, err), unclassifiedPostedLine(key, alert.dueAt - armedAt, thresholdMs, err)])
+    expect(h.reuseSpawns()).toHaveLength(retries + 1)
+    expectNeverDestructive(h, key)
+
+    // The reuse succeeds at the next retry: P is up, the timer runs on in
+    // pending-only mode, and its next retry reads the row live and stops.
+    reuse.answer(undefined)
+    dueAt += waitMs(retries)
+    expect(await retryNow(h, key)).toBe(dueAt)
+    expect(h.lines).toContain(reArmedLine(key, retries + 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, retries + 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
+    await h.runApproverToStop(key)
+    await retryNow(h, key)
+    expect(h.lines).toContain(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
+    expect(h.controller.isArmed(key)).toBe(false)
+    expect(h.reuseSpawns()).toHaveLength(retries + 2)
+    expect(h.episodeNotices).toEqual([unclassifiedAlert(key, err)])
+    expectNeverDestructive(h, key)
+    expectUntouchedEpisode(h, other)
+  })
+
+  test('AC 69, a persona no longer configured: past the threshold, P removed from the applied configuration without a teardown while its retry\'s reuse spawn is held, then that reuse failing ErrInternal, gives one server-log line and one persona-unclassified-error entry naming P and the alert’s text, and nothing to Slack', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    const reuse = noSessionIdReuse(h, key, () => errInternal())
+    const armedAt = h.clock.now()
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    const thresholdMs = adAlertThresholdMsInEffect()
+    const alert = alertRetry(armedAt, thresholdMs)
+    for (let n = 0; n < alert.retry - 1; n++) await retryNow(h, key)
+    expect(h.episodeNotices).toEqual([])
+
+    // The retry at the alert's due time: its plain spawn collides, then its reuse spawn is held.
+    const hold = reuse.holdNext()
+    expect(await retryNow(h, key, { settle: false })).toBe(alert.dueAt)
+    await hold.entered
+    h.remove(key)
+    const err = errInternal(`the store could not be read (${sentinelInMessage('removed reuse')})`)
+    hold.fail(err)
+    await h.settle()
+
+    expect([h.episodeNotices, h.notices, h.outageNotices]).toEqual([[], [], []])
+    const entries = h.startupErrors()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!.endsWith(`] [${PERSONA_UNCLASSIFIED_ERROR_LABEL}] persona=${key}: ${unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false })}`)).toBe(true)
+    expect(unclassifiedLines(h, key).at(-1)).toBe(unclassifiedLoggedLine(key, alert.dueAt - armedAt, thresholdMs, err))
+    expect(unclassifiedLines(h, key).filter((line) => line.includes(' alert '))).toHaveLength(1)
+    expect([h.stub.calls.deleteCalls, getFailureCount(key)]).toEqual([[], 0])
+    assertNoLeak([entries, h.lines])
+
+    await retryNow(h, key)
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_NOT_APPLIED }])
+    expectUntouchedEpisode(h, other)
+  })
+
+  test('UNAVAILABLE from the reuse twice, then success: P is retried at each due time and launched once the refusal clears; nothing is counted, deleted or posted as a spawn failure', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    const reuse = noSessionIdReuse(h, key, () => errTmuxUnresponsive('spawn'))
+    const armedAt = h.clock.now()
+
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(callCounts(h)).toEqual(NO_SESSION_ID_REUSE_LAUNCH)
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
+
+    let dueAt = armedAt
+    for (let n = 0; n < 2; n++) {
+      dueAt += waitMs(n)
+      if (n === 1) reuse.answer(undefined)
+      const before = callCounts(h)
+      await h.advance(dueAt - 1 - h.clock.now())
+      expect([n, callsSince(h, before)]).toEqual([n, {}])
+      expect(await retryNow(h, key)).toBe(dueAt)
+      // The launch that succeeds is followed by its approver's first lap, which reads the row live.
+      expect([n, callsSince(h, before)]).toEqual([n, n === 0 ? NO_SESSION_ID_REUSE_RETRY : { ...NO_SESSION_ID_REUSE_RETRY, statusCalls: 2 }])
+    }
+
+    // The second retry's reuse launched P: the timer runs on in pending-only mode.
+    expect(h.reuseSpawns()).toHaveLength(3)
+    expect(h.lines).toContain(reArmedLine(key, 2, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 2, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
+    await h.runApproverToStop(key)
+    await retryNow(h, key)
+    expect(h.controller.isArmed(key)).toBe(false)
+    expect([getFailureCount(key), h.capReached, h.notices, h.startupErrors(), h.stub.calls.deleteCalls]).toEqual([0, [], [], [], []])
+    expectUntouched(h, other)
   })
 })
 

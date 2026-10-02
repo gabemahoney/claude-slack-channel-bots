@@ -388,7 +388,9 @@ export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED = 'sequence-ended-without-la
  * The cause of a reuse spawn's collision (`ErrInstanceIdCollision`, b.jg5
  * SRJ-112, SRJ-301): the row is live, so the reuse launched nothing. Armed
  * when a collision at the live-row sequence's final launch ends the sequence
- * without its launch (SRJ-705, SRJ-706). Never counted.
+ * without its launch (SRJ-705, SRJ-706), and when a collision at the
+ * collision ladder's no-transcript reuse ends the launch attempt
+ * (`reportReuseCollisionAtSite`, `src/outage-state.ts`). Never counted.
  */
 export const UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION = 'reuse-collision'
 

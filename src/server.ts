@@ -3563,7 +3563,8 @@ export async function main(): Promise<void> {
   // b.zak: preventative JSONL-persistence safeguard. Detect non-persistent
   // storage roots (Layer 1) and personas whose transcript would be treated as
   // missing on resume (Layer 2) and say so LOUDLY, BEFORE startupSessionManager
-  // runs the resume path that silently deletes+fresh-spawns on ErrJsonlMissing.
+  // runs the resume path, which on ErrJsonlMissing brings the persona up fresh
+  // by a reuse spawn of the same id.
   // Runs over the applied personas. Awaited but wrapped so a rejection can
   // never kill startup. Its notices go through the per-persona notifier, which
   // only logs them in dry run.

@@ -125,6 +125,7 @@ import {
   type UnclassifiedErrorSink,
 } from './persona-episodes.ts'
 import {
+  UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_ROW_PENDING,
@@ -809,6 +810,21 @@ export function reportUnclassifiedAtSite(
   const armed = reportAttemptCause(key, { kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, error: err }, adCallVerb(call), deps?.triggerSink)
   sendUnclassified(key, err, classification)
   return armed
+}
+
+/**
+ * reportReuseCollisionAtSite — a reuse spawn's collision (`ErrInstanceIdCollision`,
+ * b.jg5 SRJ-112, SRJ-301) at a launch site that ends its attempt on it (the
+ * collision ladder's no-transcript step): inside a launch or recovery attempt
+ * for `key` it arms the persona's retry timer with the reuse-collision cause
+ * (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`) through the installed trigger
+ * sink, and the attempt records it as its last error, so a launch it ends is
+ * refused and never counted; outside one it does nothing. It starts no
+ * condition, posts nothing and never throws. Answers whether the timer was
+ * armed.
+ */
+export function reportReuseCollisionAtSite(key: string): boolean {
+  return reportAttemptCause(key, { kind: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION }, 'spawn', deps?.triggerSink)
 }
 
 /**

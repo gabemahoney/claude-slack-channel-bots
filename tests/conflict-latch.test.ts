@@ -175,11 +175,14 @@
  * calls; before the second lifetime's first attempt P is unlatched, with no
  * record, event, post or call. The scan leg: the plain first spawn meets
  * `scan-leftover`, recorded "plain spawn" with no row (the latch-time `status`
- * read answers `ErrSpawnNotFound`). The "no valid label" leg, as today's
- * ladder reaches it (E22 makes its last step the reuse spawn): collision,
- * `get` reading `ended` with no session id, `resume` answering
- * `ErrNoSessionId`, delete, then the plain spawn answering `no-valid-id`,
- * recorded "plain spawn" with the collision `get`'s `ended`.
+ * read answers `ErrSpawnNotFound`). The "no valid label" leg, in its reuse
+ * form (b.jg5 SRJ-707): collision, `get` reading `ended` with no session id,
+ * `resume` answering `ErrNoSessionId`, then the reuse spawn of the same id
+ * answering `no-valid-id`, recorded "reuse spawn" with the collision `get`'s
+ * `ended`; no delete in either lifetime. At that same reuse site the stub's
+ * another-store description, in both forms, latches P with "another
+ * agent-director store" and "reuse spawn" (SRJ-507), its one post carrying
+ * the another-store line.
  *
  * The note rules (SRJ-114; SRJ-501's note trigger and its Test half;
  * SRJ-1004's note notice, hatch A2). The pure decision
@@ -2761,12 +2764,14 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
   const scanRow = rowWhere(
     (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.stubCase === 'scan-leftover' && row.rowState === LATCH_ROW_STATE_NO_ROW,
   )
-  const noValidIdRow = rowWhere((row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.latchCase === LATCH_CASE_NO_VALID_ID)
+  // The reuse spawn of a finished row meeting a session with no valid label at "duplicate session".
+  const noValidIdReuseRow = rowWhere((row) => row.refusedOperation === REFUSED_OPERATION_REUSE_SPAWN && row.latchCase === LATCH_CASE_NO_VALID_ID)
 
   /**
-   * Each leg: the row its refusal is, the stub's answers (the same in both
-   * lifetimes: the condition still holds after the restart), the row state the
-   * latch records by T3's rule, and the calls the bring-up's launch makes.
+   * Each leg: the row its refusal is (whose refused operation the latch
+   * records), the stub's answers (the same in both lifetimes: the condition
+   * still holds after the restart), the row state the latch records by T3's
+   * rule, and the calls the bring-up's launch makes.
    */
   const RESTART_LEGS: ReadonlyArray<
     readonly [string, ConflictCaseRow, (h: RecoveryHarness, key: string) => RecoveryStubScript, LatchRowState, readonly string[]]
@@ -2781,18 +2786,19 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
       ['spawn', 'status'],
     ],
     [
-      // Today's ladder (E22 makes the last step the reuse spawn): the row reads
-      // ended with no session id, so the resume answers ErrNoSessionId, the row
-      // is deleted and the plain spawn meets "duplicate session"; the collision
-      // get's ended is the last read before it (no diagnosis get for ErrNoSessionId).
-      'the "no valid label" leg: collision, get ended with no session id, resume ErrNoSessionId, delete, plain spawn no-valid-id',
-      noValidIdRow,
+      // b.jg5 SRJ-504, SRJ-707: the row reads ended with no session id, so the
+      // resume answers ErrNoSessionId and the bring-up's reuse spawn of the
+      // same id meets the session with no valid label; nothing is deleted, and
+      // the collision get's ended is the last read before the reuse (no
+      // diagnosis get for ErrNoSessionId).
+      'the "no valid label" leg: collision, get ended with no session id, resume ErrNoSessionId, then the reuse spawn answering no-valid-id',
+      noValidIdReuseRow,
       (h, key) => ({
-        ...collided(h, personaOf(h, key), { state: 'ended', claude_session_id: '' }, noValidIdRow.build()),
+        ...collided(h, personaOf(h, key), { state: 'ended', claude_session_id: '' }, noValidIdReuseRow.build()),
         resumeError: errNoSessionId(),
       }),
       ENDED,
-      ['spawn', 'get', 'resume', 'delete', 'spawn'],
+      ['spawn', 'get', 'resume', 'spawn'],
     ],
   ]
 
@@ -2811,9 +2817,10 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
 
   /**
    * One server lifetime's bring-up of P against the condition: the launch
-   * answers latched with the leg's record, the one fresh latch reaction and
-   * exactly one CONFLICT post, no spawn-failure notice and no spawn-failed
-   * entry, and only the leg's calls.
+   * answers latched with the leg's record (its row's refused operation), the
+   * one fresh latch reaction and exactly one CONFLICT post, no spawn-failure
+   * notice and no spawn-failed entry, and only the leg's calls: no delete,
+   * and a spawn with the reuse flag only at the reuse leg.
    */
   async function bringUpLatches(
     h: RecoveryHarness,
@@ -2830,10 +2837,13 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
     expect(h.latch.record(p)).toMatchObject({
       sessionName: row.sessionName,
       latchCase: row.latchCase,
-      refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN,
+      refusedOperation: row.refusedOperation,
       rowState,
     })
     expect(order).toEqual([...calls])
+    // The reuse leg's last spawn is P's one reuse spawn; the scan leg's spawn is plain. No delete in either.
+    expect(h.reuseSpawns()).toEqual(row.refusedOperation === REFUSED_OPERATION_REUSE_SPAWN ? [reuseSpawnOf(h, p)] : [])
+    expect(h.stub.calls.deleteCalls).toEqual([])
     expect(latchReaction(h)).toEqual(freshLatch(p, row.notice.text))
     expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
     expect(h.notices).toEqual([])
@@ -2864,6 +2874,49 @@ describe('SRJ-504: after a server restart a persona that was latched latches aga
     expect([h2.latchEvents, h2.episodeNotices, callCounts(h2)]).toEqual([[], [], {}])
 
     await bringUpLatches(h2, row, script, rowState, calls)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRJ-507 at a real reuse site (the E13 hatch note; b.jg5 SRJ-707): the
+// collision ladder's reuse spawn after `resume`'s `ErrNoSessionId`, on
+// `makeRecoveryHarness`. The reuse meets another agent-director store's
+// session at "duplicate session", in both forms of the stub's description.
+// ---------------------------------------------------------------------------
+
+describe('SRJ-507: the another-store description at the ladder\'s ErrNoSessionId reuse site latches P with "another agent-director store" and "reuse spawn" (recovery harness)', () => {
+  const ANOTHER_STORE_REUSE_ROWS = REUSE_SPAWN_CONFLICT_CASE_ROWS.filter((row) => row.latchCase === LATCH_CASE_ANOTHER_STORE)
+
+  test('both forms of the another-store description are reuse rows: the reuse\'s own and the plain spawn\'s wording', () => {
+    expect(ANOTHER_STORE_REUSE_ROWS.map((row) => row.options.plainSpawn === true)).toEqual([false, true])
+  })
+
+  test.each(ANOTHER_STORE_REUSE_ROWS.map((row) => [row.name, row] as const))('%s: P latches once with "another agent-director store", "reuse spawn" and the collision get\'s ended; one post carrying the another-store line; the reuse spawn is the last call; no delete, kill or count; Q is not latched', async (_name, row) => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p, q] = h.keys as [string, string]
+    h.script({ ...collided(h, personaOf(h, p), { state: 'ended', claude_session_id: '' }, row.build()), resumeError: errNoSessionId() })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(['spawn', 'get', 'resume', 'spawn'])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(h.latch.record(p)).toEqual(
+      expectedLatchRecord(p, {
+        latchCase: LATCH_CASE_ANOTHER_STORE,
+        refusedOperation: REFUSED_OPERATION_REUSE_SPAWN,
+        rowState: ENDED,
+        sessionName: row.sessionName,
+        description: row.build().errDescription,
+      }),
+    )
+    expect(row.build().errDescription).toContain(CONFLICT_ANOTHER_STORE_PHRASE)
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
+    expect(row.notice.text).toContain(CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE)
+    expect([h.stub.calls.deleteCalls, h.stub.calls.killCalls, getFailureCount(p), h.notices, h.startupErrors()]).toEqual([[], [], 0, [], []])
+    expect(h.latch.isLatched(q)).toBe(false)
   })
 })
 
@@ -4071,7 +4124,9 @@ describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME
 // On `makeRecoveryHarness`, P's sequence ending in the session manager's
 // reuse spawn: step 3's `get` reads P's row `ended` (a reuse of a finished
 // row) or, for the pre-spawn scan's rows, no row (a reuse of an id with no
-// row, an ordinary fresh spawn). The reuse at the ladder is T3's.
+// row, an ordinary fresh spawn). The reuse at the collision ladder's
+// no-transcript site is tests/session-manager.test.ts's CONFLICT site table,
+// with SRJ-504's restart leg and SRJ-507's another-store case above.
 // ---------------------------------------------------------------------------
 
 /** How a reuse meets its latch: whether its id has no row, its answer, and what it records and posts. */

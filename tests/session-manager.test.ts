@@ -215,6 +215,20 @@
  *     and a reuse spawn is one counted launch failure: no kill of any kind
  *     and no spawn in its place. SRJ-711: no plain spawn carries the reuse
  *     flag, and a first spawn that collides goes to `get` and `resume`.
+ *   - b.jg5 SRJ-707, SRJ-712: `resume`'s `ErrNoSessionId`,
+ *     `ErrJsonlNeverWritten` and `ErrJsonlMissing` (by name) go on to exactly
+ *     one reuse spawn of `cscb_<key>` with the flag and the persona's
+ *     `extra_env`, deleting nothing, at the collision ladder and at the
+ *     sequence-launch entry's `resume` leg; on `ErrJsonlMissing` the
+ *     diagnosis's `get` comes first. Its lost, never-created and
+ *     inconclusive verdicts keep their startup-errors entries (classes
+ *     imported from `src/`), notices and start-summary counts; each of their
+ *     lines, entries and notices carries `JSONL_DIAGNOSIS_REUSE_WORDING` and
+ *     none says delete; the notice is posted only once the reuse brought the
+ *     persona up. A reuse collision at the ladder ends the attempt refused,
+ *     nothing counted or posted, with the reuse-collision cause armed. The
+ *     reuse sites are rows of the SRJ-105, SRJ-311, SRJ-316, SRJ-313, CONFLICT
+ *     ("reuse spawn"), UNUSABLE NAME and approver site tables.
  *   - b.4ie / b.jg5 SRJ-402 startup-dialog approver, through agent-director
  *     only, on a fake clock (`_setApproverClock`, `useApproverClock`): a
  *     fresh or resumed row reading `pending` with either dialog is cleared
@@ -582,6 +596,9 @@ import {
   LIVE_ROW_START_NOT_INSTALLED,
   startLiveRowSequence,
   stopLiveRowSequence,
+  JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS,
+  JSONL_DIAGNOSIS_REUSE_WORDING,
+  JSONL_TRANSCRIPT_LOST_ENTRY_CLASS,
 } from '../src/session-manager.ts'
 import {
   LIVE_ROW_ARM_ENDED,
@@ -797,6 +814,9 @@ import {
   ErrCwdNotFound,
   ErrJsonlMissing,
   ErrSpawnNotFound,
+  ERR_JSONL_MISSING_NAME,
+  ERR_JSONL_NEVER_WRITTEN_NAME,
+  ERR_NO_SESSION_ID_NAME,
   ERR_STORE_OPEN_NAME,
 } from '../src/agent-director-errors.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
@@ -905,6 +925,7 @@ import {
   RECONNECT_UNUSABLE_NAME_CASE_ROWS,
   LADDER_KILL_CONFLICT_CASE_ROWS,
   REUSE_SPAWN_CONFLICT_CASE_ROWS,
+  REUSE_SPAWN_SITE,
   REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS,
   UNUSABLE_NAME_CASE_ROWS,
   expectedConflictNotice,
@@ -912,6 +933,7 @@ import {
   livenessPaneConflictRowsAt,
   promptRowPaneConflictRowsAt,
   reconnectConflictRowsAt,
+  reuseSpawnScanRows,
   type ConflictCaseRow,
   type LaunchStartCaseRow,
   type LaunchStartCaseRowOf,
@@ -962,6 +984,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
@@ -976,7 +999,7 @@ import {
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED } from '../src/liveness-reading.ts'
 import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
-import type { Phase1KillResult, Phase1ResumeResult, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
+import type { Phase1KillResult, Phase1ResumeResult, Phase1SpawnParams, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -1809,7 +1832,9 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     expect(resumeCalls[0].claude_instance_id).toBe('cscb_C')
   })
 
-  test('ended state + ErrNoSessionId on resume → delete + fresh spawn', async () => {
+  // b.jg5 SRJ-707: the no-transcript answer brings the persona up by one
+  // reuse spawn of the same id; nothing is deleted.
+  test('ended state + ErrNoSessionId on resume → one reuse spawn of the same id, no delete', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
@@ -1825,9 +1850,11 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
-    expect(spawnCalls).toHaveLength(2)
-    expect(deleteCalls).toHaveLength(1)
-    expect(deleteCalls[0].claude_instance_id).toEqual(['cscb_C'])
+    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+      ['cscb_C', undefined],
+      ['cscb_C', true],
+    ])
+    expect(deleteCalls).toEqual([])
   })
 
   test('ended state + resume_enabled=false → kill + delete + fresh spawn (no resume)', async () => {
@@ -2072,14 +2099,14 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     expect(notices).toEqual([])
   })
 
-  test('ErrNoSessionId: no re-check call; delete + fresh spawn as before', async () => {
+  test('ErrNoSessionId: no re-check call; one reuse spawn of the same id and no delete (b.jg5 SRJ-707)', async () => {
     const { cfg, calls } = installEndedRowResumeRejects(errNoSessionId())
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(resolveCalls).toHaveLength(0)
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect(calls.resumeCalls).toHaveLength(1)
-    expect(calls.deleteCalls).toHaveLength(1)
-    expect(calls.spawnCalls).toHaveLength(2)
+    expect(calls.deleteCalls).toEqual([])
+    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
   })
 
   // E8 (b.jg5 SRJ-205, SRJ-302): a re-check that decides the stop posts
@@ -2559,8 +2586,8 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     expect(calls.spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
     // A fresh spawn, not amnesia: no transcript diagnosis, record or notice.
     const log = readLog()
-    expect(log).not.toContain('jsonl-transcript-lost-on-resume')
-    expect(log).not.toContain('jsonl-diagnosis-inconclusive')
+    expect(log).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
+    expect(log).not.toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
     expect(notices).toHaveLength(0)
     const ref = renderPersonaRef('C', 'C')
     if (variant === 'missing') {
@@ -2784,7 +2811,7 @@ describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
       expected: true,
       events: ['patch', 'spawn', 'resume'],
     }],
-    ['delete then fresh spawn after resume ErrJsonlMissing', {
+    ['the reuse spawn after resume ErrJsonlMissing and its diagnosis (b.jg5 SRJ-712)', {
       install: (cfg, calls) =>
         installStub({
           ...calls,
@@ -3067,9 +3094,9 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
    * which between them reach the optimistic spawn, `client.resume` and
    * `replaceWithFreshSpawn`, plus one row for each other spawn call site: the
    * single retry after ErrSpawnNotFound on the post-collision get and each
-   * fallback spawn in `resumeOrFreshSpawn`.
-   * Paths that share a call site with a row here (resume_enabled false, a
-   * dead working row, the other delete-then-spawn resume errors, the restart
+   * fallback spawn in `resumeOrFreshSpawn` (the no-transcript reuse spawn
+   * among them). Paths that share a call site with a row here (resume_enabled
+   * false, a dead working row, the other no-transcript resume errors, the restart
    * adapter — covered end to end in restart.test.ts) have no row of their own.
    */
   const GUARD_PATHS: Array<[string, GuardPath]> = [
@@ -3112,7 +3139,7 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
       expected: 'spawned',
       events: [...COLLIDED, ...SPAWN],
     }],
-    ['resume ErrJsonlMissing: delete + fresh spawn', {
+    ['resume ErrJsonlMissing: its diagnosis, then the reuse spawn (b.jg5 SRJ-712)', {
       install: (cfg, calls) => installResumeRejects(guardRow(cfg, { state: 'ended' }), calls, errJsonlMissing()),
       expected: 'fresh-after-inconclusive-amnesia',
       events: [...COLLIDED, ...RESUME, ...SPAWN],
@@ -3443,11 +3470,11 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
       install: (_cfg, calls) => installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getError: errSpawnNotFound() }),
       expected: spawned, spawns: 2, resumes: 0,
     }],
-    ['resume ErrJsonlMissing: delete + fresh spawn (fresh after amnesia)', {
+    ['resume ErrJsonlMissing: the reuse spawn after its diagnosis (fresh after amnesia; b.jg5 SRJ-712)', {
       install: (cfg, calls) => installResumeRejects(cfg, calls, errJsonlMissing()),
       expected: { key: 'C', action: 'fresh-after-inconclusive-amnesia' }, spawns: 2, resumes: 1,
     }],
-    ['resume ErrNoSessionId: delete + fresh spawn', {
+    ['resume ErrNoSessionId: the reuse spawn (b.jg5 SRJ-707)', {
       install: (cfg, calls) => installResumeRejects(cfg, calls, errNoSessionId()),
       expected: spawned, spawns: 2, resumes: 1,
     }],
@@ -10335,7 +10362,7 @@ function launchCallVerb(launchVerb: LaunchVerb): 'spawn' | 'resume' {
 
 /** The persona's row reading `ended`, its labels its current ones. */
 const endedRow = (cfg: PersonaConfig) => personaRow(cfg, SUCCESS_SITE_KEY, { state: 'ended' })
-/** A collision on the persona's `ended` row whose `resume` answers `err`, then a fresh spawn that succeeds. */
+/** A collision on the persona's `ended` row whose `resume` answers `err`, then a spawn (fresh or reuse) that succeeds. */
 const resumeAnswers = (err: Error) => (cfg: PersonaConfig, preTrust?: PreTrust): StubClientOptions => ({
   spawnQueue: [collision(), spawnOk(preTrust)],
   getResult: endedRow(cfg),
@@ -10404,9 +10431,10 @@ const SUCCESS_SITES: ReadonlyArray<readonly [string, SuccessSite]> = [
       action: 'spawned',
     },
   ],
-  ['the amnesia spawn after resume\'s ErrNoSessionId', { script: resumeAnswers(errNoSessionId()), launchVerb: 'spawn', action: 'spawned' }],
-  ['the amnesia spawn after resume\'s ErrJsonlMissing', { script: resumeAnswers(errJsonlMissing()), launchVerb: 'spawn', action: 'fresh-after-inconclusive-amnesia' }],
-  ['the amnesia spawn after resume\'s ErrJsonlNeverWritten', { script: resumeAnswers(errJsonlNeverWritten()), launchVerb: 'spawn', action: 'spawned' }],
+  // b.jg5 SRJ-707, SRJ-712: the no-transcript answers go on to one reuse spawn of the same id.
+  ['the reuse spawn after resume\'s ErrNoSessionId', { script: resumeAnswers(errNoSessionId()), launchVerb: LAUNCH_VERB_REUSE_SPAWN, action: 'spawned' }],
+  ['the reuse spawn after resume\'s ErrJsonlMissing and its diagnosis', { script: resumeAnswers(errJsonlMissing()), launchVerb: LAUNCH_VERB_REUSE_SPAWN, action: 'fresh-after-inconclusive-amnesia' }],
+  ['the reuse spawn after resume\'s ErrJsonlNeverWritten', { script: resumeAnswers(errJsonlNeverWritten()), launchVerb: LAUNCH_VERB_REUSE_SPAWN, action: 'spawned' }],
   ['the spawn after resume\'s ErrSpawnNotResumable (kill, delete, spawn)', { script: resumeAnswers(errSpawnNotResumable()), launchVerb: 'spawn', action: 'spawned' }],
   ['the spawn after resume\'s ErrSpawnNotFound', { script: resumeAnswers(errSpawnNotFound()), launchVerb: 'spawn', action: 'spawned' }],
   ['the resume of an ended row', ENDED_ROW_RESUME_SITE],
@@ -11169,10 +11197,10 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Site #16 — spawnForPersona spawn after ErrNoSessionId → delete → spawn
+  // Site #16 — spawnForPersona reuse spawn after ErrNoSessionId (b.jg5 SRJ-707)
   // -------------------------------------------------------------------------
 
-  test('site #16: spawn after ErrNoSessionId-delete ErrCwdNotFound → cwd-unreachable, no spawn-failure notice', async () => {
+  test('site #16: reuse spawn after ErrNoSessionId ErrCwdNotFound → cwd-unreachable, no spawn-failure notice', async () => {
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
     installStub({
       spawnQueue: [
@@ -11358,10 +11386,10 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Site #16 — fresh-spawn after ErrNoSessionId → delete → spawn success
+  // Site #16 — reuse spawn after ErrNoSessionId success (b.jg5 SRJ-707)
   // -------------------------------------------------------------------------
 
-  test('site #16: spawn after ErrNoSessionId-delete success clears all three flags', async () => {
+  test('site #16: reuse spawn after ErrNoSessionId success clears all three flags', async () => {
     setupFlags()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     installStub({
@@ -11401,11 +11429,13 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
 // ---------------------------------------------------------------------------
 // b.wrb — ErrJsonlMissing amnesia: legible diagnostic + honest startup counters
 //
-// When resume throws ErrJsonlMissing, CSCB still delete+fresh-spawns (policy
-// unchanged), but must now: (1) log which transcript path(s) were tried and
-// their source; (2) classify never-created (quiet, lossless) vs lost
-// (operator-visible) vs unknown (row fetch failed); (3) count the fresh-spawn
-// as its own 'fresh-after-amnesia' bucket instead of folding it into "ok".
+// When resume throws ErrJsonlMissing, CSCB brings the persona up fresh by one
+// reuse spawn of the same id, after the diagnosis (b.jg5 SRJ-707, SRJ-712),
+// and: (1) logs which transcript path(s) were tried and their source; (2)
+// classifies never-created (quiet, lossless) vs lost (operator-visible) vs
+// unknown (row fetch failed); (3) counts the launch as its own
+// 'fresh-after-amnesia' bucket instead of folding it into "ok". The order of
+// the diagnosis and the reuse, and the texts, are the SRJ-712 describe's.
 // ---------------------------------------------------------------------------
 
 describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
@@ -11429,7 +11459,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   /**
    * Install a stub that drives the ErrJsonlMissing amnesia path: a colliding
    * spawn resolves to an `ended` row, resume rejects with ErrJsonlMissing, then
-   * delete + a fresh spawn succeeds. `getResult` is returned for both the
+   * the reuse spawn succeeds. `getResult` is returned for both the
    * collision-recovery get and the diagnostic get.
    */
   function installAmnesia(opts: {
@@ -11684,8 +11714,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result.action).toBe('fresh-after-amnesia')
     expect(notices).toHaveLength(0) // no persona notice at all
     const log = readLog()
-    expect(log).not.toContain('jsonl-transcript-lost-on-resume') // quiet
-    expect(log).not.toContain('jsonl-diagnosis-inconclusive') // not inconclusive
+    expect(log).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS) // quiet
+    expect(log).not.toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS) // not inconclusive
   })
 
   // --- Classification triad: lost (loud) ----------------------------------
@@ -11724,7 +11754,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result.action).toBe('fresh-after-amnesia')
     // Operator-visible: startup-error entry embedding the archived count.
     const log = readLog()
-    expect(log).toContain('jsonl-transcript-lost-on-resume')
+    expect(log).toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
     expect(log).toContain('4 message(s)')
     // And a persona notice to the persona's destination only.
     const text = expectOneNoticeToDestination(h)
@@ -11736,8 +11766,9 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // --- Classification triad: inconclusive (row fetch finds no row) --------
   // b.fwu case (a): the diagnostic get() finds no row → the row cannot be
   // consulted, so we cannot classify loss vs never-created. Must not throw;
-  // the amnesia fresh-spawn still completes, now bucketed as the dedicated
-  // 'fresh-after-inconclusive-amnesia' action. b.jg5 SRJ-105, SRJ-114: only
+  // the reuse spawn still brings the persona up, bucketed as the dedicated
+  // 'fresh-after-inconclusive-amnesia' action. With no row, the reuse is an
+  // ordinary fresh spawn of the same id (b.jg5 SRJ-112). b.jg5 SRJ-105, SRJ-114: only
   // `ErrSpawnNotFound` (the row is absent) reaches it; every other error at
   // that get, a CONFIG answer included (b.jg5 SRJ-316), is a refusal, and an
   // UNUSABLE NAME answer latches the persona (b.jg5 SRJ-512; the AC 20 case
@@ -11757,8 +11788,12 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
 
     expect(result.action).toBe('fresh-after-inconclusive-amnesia')
-    expect(deleteCalls).toHaveLength(1) // delete+fresh policy unchanged
-    expect(spawnCalls).toHaveLength(2)
+    expect(deleteCalls).toEqual([])
+    // The colliding optimistic spawn, then the one reuse spawn of the same id.
+    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+      [`cscb_${CH}`, undefined],
+      [`cscb_${CH}`, true],
+    ])
     expect(getCalls).toBe(1) // the diagnostic get, after the collision get
   })
 
@@ -11782,7 +11817,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
     expect(result.freshAfterAmnesia).toBe(0)
-    const entry = onlyStartupEntry(readLog(), 'jsonl-diagnosis-inconclusive')
+    const entry = onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
     // Detail names WHICH condition: the row is absent.
     expect(entry).toContain('the agent-director row is absent (ErrSpawnNotFound)')
   })
@@ -11810,7 +11845,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(deleteCalls).toEqual([])
     expect(spawnCalls).toHaveLength(1) // the colliding optimistic spawn only
     const log = readLog()
-    expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
     expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
     expect(notices).toEqual([])
     expect([...getOutageFlags(CH)]).toEqual(['ad-config-malformed'])
@@ -11929,7 +11964,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
     const reports = [
       ...errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith('[slack] ErrJsonlMissing diagnostic: ')),
-      onlyStartupEntry(readLog(), 'jsonl-diagnosis-inconclusive'),
+      onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS),
       ...notices.map((n) => n.text),
     ]
     expect(reports).toHaveLength(3)
@@ -12000,7 +12035,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(line.slice(prefix.length, -suffix.length).split(' at ')[0]).toBe(shown)
     expect(notices).toEqual([])
     const log = readLog()
-    expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
     expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
     expect(errArgs.flat().map(String).filter((l) => l.includes('ErrJsonlMissing diagnosis get failed for '))).toEqual([])
     expect(deleteCalls).toEqual([])
@@ -12028,7 +12063,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
     const reported = `the agent-director row is absent (ErrSpawnNotFound); AD reported: ${REDACTED_AD_DESCRIPTION}`
     expect(errLog.split('\n').filter((l) => l.includes(reported))).toHaveLength(1)
-    const entry = onlyStartupEntry(readLog(), 'jsonl-diagnosis-inconclusive')
+    const entry = onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
     expect(entry).toContain(reported)
     expect(entry.endsWith(` — ErrJsonlMissing message=${JSON.stringify(REDACTED_AD_DESCRIPTION)}`)).toBe(true)
     expect(notices.map((n) => n.text).filter((t) => t.includes(reported))).toHaveLength(1)
@@ -12036,18 +12071,20 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   })
 
   // AC 20 (E13 Director decision 16, Task 0 decision B1): the lost record's
-  // cause is describeAgentDirectorFailure(err): an errName that fails
-  // isSafeIdentifier is replaced by describeThrownValue (type, the message
-  // `<errName>: <errDescription>` redacted, frames); never the error itself.
-  test('AC 20: lost, with an ErrJsonlMissing whose errName is token-shaped and whose description holds a URL and a fake token → the jsonl-transcript-lost-on-resume record names its type and the redacted description; nothing leaks', async () => {
+  // cause is describeAgentDirectorFailure(err): the error's name and its
+  // description redacted as `message="…"`; never the error itself. The
+  // diagnosis runs, then the one reuse spawn (b.jg5 SRJ-712).
+  test('AC 20: lost, with an ErrJsonlMissing whose description holds a URL and a fake token → the diagnosis runs, then the one reuse spawn; the jsonl-transcript-lost-on-resume record names ErrJsonlMissing and the redacted description; nothing leaks', async () => {
     const readLog = captureStartupErrors()
     const startedAt = '2026-09-20T05:00:00Z'
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
       message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
     })
+    const spawnCalls: import('agent-director').SpawnParams[] = []
     installAmnesia({
       cfg,
-      resumeError: new ErrJsonlMissing('resume', tokenErrName(), adDescription()),
+      spawnCalls,
+      jsonlDescription: adDescription(),
       getResult: { jsonl_path: '/data/proj/sess-5.jsonl', claude_session_id: 'sess-5', cwd: CWD, started_at: startedAt },
     })
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
@@ -12056,12 +12093,50 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     })
 
     expect(result?.action).toBe('fresh-after-amnesia')
-    const entry = onlyStartupEntry(readLog(), 'jsonl-transcript-lost-on-resume')
+    expect((spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
+    const entry = onlyStartupEntry(readLog(), JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
     expect(entry).toContain('2 message(s) since spawn')
     const cause = entry.slice(entry.lastIndexOf(' — ') + ' — '.length)
-    expect(cause.startsWith('ErrJsonlMissing message="')).toBe(true)
-    expect(cause).toContain(`${REDACTED_AD_DESCRIPTION}"`)
+    expect(cause).toBe(`ErrJsonlMissing message=${JSON.stringify(REDACTED_AD_DESCRIPTION)}`)
+    expect(notices.map((notice) => notice.key)).toEqual([CH])
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
+
+  // AC 20 with b.jg5 SRJ-712, SRJ-113: `resume`'s answers are classified by
+  // name, so an ErrJsonlMissing value whose errName is token-shaped is not a
+  // no-transcript answer: no diagnosis and no reuse; the resume's failure
+  // handling answers `failed`. Its errName and description never leak into a
+  // line, an entry or a notice.
+  test('AC 20: an ErrJsonlMissing value whose errName is token-shaped and whose description holds a URL and a fake token is no no-transcript answer (by name): failed, with no diagnosis, no reuse and no delete; nothing leaks', async () => {
+    const readLog = captureStartupErrors()
+    const startedAt = '2026-09-20T05:00:00Z'
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
+      message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
+    })
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const getCalls: import('agent-director').GetParams[] = []
+    installStub({
+      spawnCalls,
+      deleteCalls,
+      getCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      resumeError: new ErrJsonlMissing('resume', tokenErrName(), adDescription()),
+      getResult: personaRow(cfg, CH, { state: 'ended', jsonl_path: '/data/proj/sess-5.jsonl', claude_session_id: 'sess-5', cwd: CWD, started_at: startedAt }),
+    })
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    })
+
+    expect(result?.action).toBe('failed')
+    // The collision get only: no diagnosis get, and nothing launched after the resume.
+    expect([getCalls.length, spawnCalls.length, deleteCalls]).toEqual([1, 1, []])
+    const log = readLog()
+    expect(countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(0)
+    expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
+    expect(errLog).not.toContain('ErrJsonlMissing diagnostic: ')
+    assertNoLeak({ errLog, startupErrorsLog: log, notices })
   })
 
   // (b) unparseable/absent started_at — the archive is even configured (a real
@@ -12084,11 +12159,11 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
     expect(result.freshAfterAmnesia).toBe(0)
     const log = readLog()
-    expect(log).toContain('jsonl-diagnosis-inconclusive')
+    expect(log).toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
     // Detail names WHICH condition: started_at could not be parsed. Because it
     // is unparseable, the archive must NOT have been consulted (no lost record).
     expect(log).toContain("started_at is absent or unparseable")
-    expect(log).not.toContain('jsonl-transcript-lost-on-resume')
+    expect(log).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
   })
 
   // (c-config) archive unavailable because none is configured. Distinguished
@@ -12105,7 +12180,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
     expect(result.freshAfterAmnesia).toBe(0)
     const log = readLog()
-    expect(log).toContain('jsonl-diagnosis-inconclusive')
+    expect(log).toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
     expect(log).toContain('no message archive is configured')
   })
 
@@ -12129,7 +12204,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
     expect(result.freshAfterAmnesia).toBe(0)
     const log = readLog()
-    expect(log).toContain('jsonl-diagnosis-inconclusive')
+    expect(log).toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
     // c-other wording names the configured (but unusable) archive path, and is
     // distinct from the c-config "no message archive is configured" hint.
     expect(log).toContain(`the message archive (${missingDb})`)
@@ -12221,10 +12296,10 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     await settleNotices()
 
     expect(result.action).toBe('fresh-after-inconclusive-amnesia')
-    expect(readLog()).toContain('jsonl-diagnosis-inconclusive')
+    expect(readLog()).toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
     const text = expectOneNoticeToDestination(h)
-    // Uncertainty wording present.
-    expect(text).toContain('on restart I was started fresh;')
+    // Uncertainty wording present, after the reuse wording (b.jg5 SRJ-712).
+    expect(text).toContain(`on restart I was ${JSONL_DIAGNOSIS_REUSE_WORDING};`)
     expect(text).toContain('could not determine whether my prior')
     // 'lost'-branch wording absent.
     expect(text).not.toContain('has been lost')
@@ -12343,8 +12418,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     if (c.outcome === 'never-created') {
       // Conclusive and quiet: no record, no notice.
       expect(result).toEqual({ key: SR74_KEY, action: 'fresh-after-amnesia' })
-      expect(log).not.toContain('jsonl-transcript-lost-on-resume')
-      expect(log).not.toContain('jsonl-diagnosis-inconclusive')
+      expect(log).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
+      expect(log).not.toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
       expect(notices).toHaveLength(0)
       expect(errLog).toContain('transcript never created (archive consulted: 0 archived messages since spawn)')
       return
@@ -12356,8 +12431,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 
     if (c.outcome === 'lost') {
       expect(result).toEqual({ key: SR74_KEY, action: 'fresh-after-amnesia' })
-      expect(countStartupEntries(log, 'jsonl-transcript-lost-on-resume')).toBe(1)
-      expect(log).not.toContain('jsonl-diagnosis-inconclusive')
+      expect(countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(1)
+      expect(log).not.toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
       expect(log).toContain(`the message archive holds ${c.lostCount} message(s) since spawn`)
       expect(text).toContain(`message archive shows ${c.lostCount} message(s) since I started`)
       expect(text).toContain('my conversation memory has been lost')
@@ -12367,8 +12442,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 
     // Inconclusive, for the new cause: an unattributable zero.
     expect(result).toEqual({ key: SR74_KEY, action: 'fresh-after-inconclusive-amnesia' })
-    expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(1)
-    expect(log).not.toContain('jsonl-transcript-lost-on-resume')
+    expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(1)
+    expect(log).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
     expect(errLog).not.toContain('transcript never created')
     expect(text).toContain('could not determine whether my prior')
     expect(text).not.toContain('has been lost')
@@ -12414,7 +12489,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(log).toContain(`locally-computed(config-dir fallback) ${expected}`)
     expect(log).not.toContain(resolveJsonlPath(CWD, 'sess-own', topLevel))
     expect(log).not.toContain(`${topLevel}/projects`)
-    // The fresh spawn after the delete runs under the persona's directory too.
+    // The reuse spawn after the diagnosis runs under the persona's directory too.
+    expect((spawnCalls[1] as Phase1SpawnParams | undefined)?.reuse_finished).toBe(true)
     expect(spawnCalls[1]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(own)
   })
 
@@ -12435,10 +12511,130 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
     expect(result.action).toBe('spawned')
   })
+
+  // --- b.jg5 SRJ-712 (AC 60): the diagnosis before the reuse, its texts ----
+
+  /** When P's row was started, for the archive's "since spawn" count. */
+  const SRJ712_STARTED_AT = '2026-09-20T05:00:00Z'
+
+  /**
+   * Wrap `stub`'s `get`, `spawn`, `resume` and `delete` so each call from now
+   * on is recorded in order, a spawn carrying the reuse flag as `reuse spawn`.
+   */
+  function recordAmnesiaCalls(stub: StubClient): string[] {
+    const order: string[] = []
+    const client = stub as unknown as Record<string, (params: object) => Promise<unknown>>
+    for (const verb of ['get', 'spawn', 'resume', 'delete'] as const) {
+      const original = client[verb]!
+      client[verb] = (params) => {
+        order.push(verb === 'spawn' && (params as Phase1SpawnParams).reuse_finished === true ? 'reuse spawn' : verb)
+        return original.call(stub, params)
+      }
+    }
+    return order
+  }
+
+  /** The configuration of CH: a message archive holding `archived` messages since `SRJ712_STARTED_AT`, or none. */
+  function srj712Config(archived: number | undefined): PersonaConfig {
+    const archive = archived === undefined ? {} : { message_archive_db: makeArchiveWithMessagesSince(SRJ712_STARTED_AT, archived) }
+    return makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, archive)
+  }
+
+  /** CH's row as the diagnosis reads it: a transcript path and session id, started at `SRJ712_STARTED_AT`. */
+  const SRJ712_ROW: PersonaGetResultOverrides = {
+    jsonl_path: '/data/proj/sess-712.jsonl',
+    claude_session_id: 'sess-712',
+    cwd: CWD,
+    started_at: SRJ712_STARTED_AT,
+  }
+
+  /** One verdict of the diagnosis: the archive behind it, the launch's amnesia action, its entry class and its notices. */
+  interface Srj712Verdict {
+    readonly archived: number | undefined
+    readonly action: 'fresh-after-amnesia' | 'fresh-after-inconclusive-amnesia'
+    readonly entryClass: string | undefined
+    readonly notices: number
+  }
+
+  const SRJ712_VERDICTS: ReadonlyArray<readonly [string, Srj712Verdict]> = [
+    ['lost (2 archived messages since spawn)', { archived: 2, action: 'fresh-after-amnesia', entryClass: JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, notices: 1 }],
+    ['never-created (0 archived messages since spawn)', { archived: 0, action: 'fresh-after-amnesia', entryClass: undefined, notices: 0 }],
+    ['inconclusive (no message archive configured)', { archived: undefined, action: 'fresh-after-inconclusive-amnesia', entryClass: JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, notices: 1 }],
+  ]
+
+  test.each(SRJ712_VERDICTS)('b.jg5 SRJ-712 (AC 60), %s, through the start pass: the diagnosis get comes before the one reuse spawn and nothing is deleted; the start summary counts the amnesia action; its entry and notice are kept; each of its lines, entries and notices says the persona is brought up fresh by a reuse spawn and its row is kept, and none says delete', async (_label, verdict) => {
+    const readLog = captureStartupErrors()
+    const cfg = srj712Config(verdict.archived)
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const order = recordAmnesiaCalls(installAmnesia({ cfg, deleteCalls, getResult: SRJ712_ROW }))
+
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    const errLog = await withCapturedErr(async () => {
+      result = await startupSessionManager(cfg, { concurrency: 1 })
+    })
+
+    expect(result.perPersona).toEqual([{ key: CH, action: verdict.action }])
+    expect([result.freshAfterAmnesia, result.freshAfterInconclusiveAmnesia, result.freshSpawned, result.failed]).toEqual(
+      verdict.action === 'fresh-after-amnesia' ? [1, 0, 0, 0] : [0, 1, 0, 0],
+    )
+    // The collision get, the resume, then the diagnosis get before the one reuse spawn.
+    expect(order).toEqual(['spawn', 'get', 'resume', 'get', 'reuse spawn'])
+    expect(deleteCalls).toEqual([])
+    const log = readLog()
+    const entries = [JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS].flatMap((entryClass) =>
+      log.split('\n').filter((line) => line.includes(`] [${entryClass}] `)),
+    )
+    expect(entries.map((entry) => entry.includes(`] [${verdict.entryClass}] `))).toEqual(verdict.entryClass === undefined ? [] : [true])
+    expect(notices.map((notice) => notice.key)).toEqual(Array.from({ length: verdict.notices }, () => CH))
+    const lines = errLog.split('\n').filter((line) => line.startsWith('[slack] ErrJsonlMissing diagnostic: '))
+    expect(lines).toHaveLength(1)
+    const texts = [...lines, ...entries, ...notices.map((notice) => notice.text)]
+    for (const text of texts) {
+      expect(text).toContain(JSONL_DIAGNOSIS_REUSE_WORDING)
+      expect(text).not.toMatch(/delet/i)
+    }
+    expect(errLog).not.toMatch(/will be delet/i)
+    assertNoLeak({ errLog, startupErrorsLog: log, notices })
+  })
+
+  // b.jg5 SRJ-712, the E13 hatch note: the diagnosis's notice says the
+  // persona was brought up fresh, so it is posted only once the reuse spawn
+  // did; a reuse that fails posts its own spawn-failure notice alone. The
+  // entry, written with the diagnosis, is kept. A reuse that latches is the
+  // CONFLICT and UNUSABLE NAME describes' (their ErrJsonlMissing rows).
+  test('b.jg5 SRJ-712: lost, then a reuse spawn that fails (ErrTmuxSessionCreate): the lost entry is kept, the lost notice is not posted, and only the spawn-failure notice is; nothing is deleted', async () => {
+    const readLog = captureStartupErrors()
+    const cfg = srj712Config(2)
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const stub = installStub({
+      deleteCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+      ],
+      resumeError: errJsonlMissing(),
+      getResult: personaRow(cfg, CH, { state: 'ended', ...SRJ712_ROW }),
+    })
+    const order = recordAmnesiaCalls(stub)
+
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    })
+
+    expect(result).toMatchObject({ key: CH, action: 'failed', countedClass: true })
+    expect(order).toEqual(['spawn', 'get', 'resume', 'get', 'reuse spawn'])
+    expect(deleteCalls).toEqual([])
+    expect(countStartupEntries(readLog(), JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(1)
+    expect(notices.map((notice) => notice.key)).toEqual([CH])
+    expect(notices[0]!.text).toContain(`\`${errTmuxSessionCreate().errName}\``)
+    expect(notices[0]!.text).not.toContain(JSONL_DIAGNOSIS_REUSE_WORDING)
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
 })
 
 // ---------------------------------------------------------------------------
-// b.jgf — ErrJsonlNeverWritten: lossless delete + fresh spawn
+// b.jgf — ErrJsonlNeverWritten: a lossless reuse spawn of the same id
 //
 // AD 0.10.0 split the old "resume can't find a transcript" condition into
 // ErrJsonlMissing (a transcript path was recorded but is gone now — ambiguous,
@@ -12446,10 +12642,11 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 // never wrote one — provably nothing to lose). Pre-fix the new name matched no
 // branch in the resume ladder, so it hit the generic tail: action 'failed', a
 // spawn-failure notice, and restart.ts retrying the same impossible resume with
-// a doubling backoff forever.
+// a doubling backoff forever. It goes on to one reuse spawn of the same id,
+// deleting nothing (b.jg5 SRJ-707).
 // ---------------------------------------------------------------------------
 
-describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => {
+describe('b.jgf: ErrJsonlNeverWritten → a lossless reuse spawn of the same id', () => {
   const CH = 'C_JGF'
   const CWD = '/repo/jgf'
 
@@ -12460,7 +12657,7 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
 
   /**
    * Drive the wedge: colliding spawn resolves to an `ended` row, resume rejects
-   * with ErrJsonlNeverWritten, then delete + fresh spawn succeeds.
+   * with ErrJsonlNeverWritten, then the reuse spawn succeeds.
    */
   function installNeverWritten(cfg: PersonaConfig, opts?: {
     spawnCalls?: import('agent-director').SpawnParams[]
@@ -12485,12 +12682,10 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
 
   // --- Regression requirement (designated) --------------------------------
   // Pre-fix this same test FAILS on every assertion that matters: the resume
-  // rejection fell through to the generic tail, so action was 'failed', the
-  // row was never deleted, no fresh spawn was issued (spawnCalls === 1) and
-  // a spawn-failure notice was posted into the channel. Verified against
-  // main:src/session-manager.ts, whose branch condition is
-  // `err instanceof ErrNoSessionId || err instanceof ErrJsonlMissing`.
-  test('REGRESSION: resume ErrJsonlNeverWritten → delete + fresh spawn, action=spawned, no spawn-failure notice, no diagnosis get', async () => {
+  // rejection fell through to the generic tail, so action was 'failed', no
+  // second spawn was issued (spawnCalls === 1) and a spawn-failure notice was
+  // posted into the channel.
+  test('REGRESSION: resume ErrJsonlNeverWritten → one reuse spawn of the same id and no delete, action=spawned, no spawn-failure notice, no diagnosis get', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const getCalls: import('agent-director').GetParams[] = []
@@ -12502,11 +12697,12 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
     // AC-2/AC-3: plain success action — not 'failed', and not borrowed from the
     // amnesia vocabulary, because nothing was lost.
     expect(result).toEqual({ key: CH, action: 'spawned' })
-    // Row deleted, then re-spawned with the original params.
-    expect(deleteCalls).toHaveLength(1)
-    expect(deleteCalls[0].claude_instance_id).toEqual([`cscb_${CH}`])
-    expect(spawnCalls).toHaveLength(2)
-    expect(spawnCalls[1].claude_instance_id).toBe(`cscb_${CH}`)
+    // Nothing deleted: the same id is spawned again with the reuse flag (b.jg5 SRJ-707).
+    expect(deleteCalls).toEqual([])
+    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+      [`cscb_${CH}`, undefined],
+      [`cscb_${CH}`, true],
+    ])
     // AC-4: no spawn-failure notice.
     expect(notices).toHaveLength(0)
     // AC-3: only the collision-recovery get ran. diagnoseJsonlMissing fetches
@@ -13870,6 +14066,8 @@ interface LadderSite {
    * `transientReconnectLine`).
    */
   readonly reconnectBranch?: 'waiting' | 'working'
+  /** Set on a reuse spawn site (b.jg5 SRJ-707): its last spawn is P's one reuse spawn; at every other site no spawn carries the reuse flag. */
+  readonly reuse?: true
 }
 
 /** A row for `persona` in its own directory with its current labels (`cannedGetResult` in persona form), with `overrides`. */
@@ -13942,10 +14140,12 @@ const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
   { name: 'the resume of an ended row', verb: 'resume', script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
   { name: 'the resume of a missing row', verb: 'resume', script: (h, p, err) => ({ ...collided(h, p, { state: 'missing' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
   {
-    name: 'the fresh spawn after the resume\'s ErrNoSessionId and its delete',
+    // b.jg5 SRJ-707: the no-transcript answer's reuse spawn of the same id; nothing is deleted.
+    name: 'the reuse spawn after the resume\'s ErrNoSessionId',
     verb: 'spawn',
     script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errNoSessionId() }),
-    calls: ladderCallsOf({ spawn: 2, resume: 1, delete: 1 }),
+    calls: ladderCallsOf({ spawn: 2, resume: 1 }),
+    reuse: true,
   },
   {
     name: 'the fresh spawn after the resume\'s ErrSpawnNotResumable, its kill and its delete',
@@ -14048,12 +14248,6 @@ const DELETE_SITES: readonly LadderSite[] = [
     script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), deleteError: err }),
     calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1, delete: 1 }),
   },
-  {
-    name: 'the delete after the resume\'s ErrNoSessionId',
-    verb: 'delete',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errNoSessionId(), deleteError: err }),
-    calls: ladderCallsOf({ spawn: 1, resume: 1, delete: 1 }),
-  },
 ]
 
 /**
@@ -14086,7 +14280,7 @@ const ACTION_SITES: readonly LadderSite[] = [...SPAWN_AND_RESUME_SITES, ...KILL_
 /**
  * The `get` reads of the ladder (b.jg5 SRJ-105's read-error row): the
  * collision `get` and the ErrJsonlMissing diagnosis `get` (SRJ-114), made
- * after the resume and before its delete and fresh spawn. The working-row
+ * after the resume and before its reuse spawn (SRJ-712). The working-row
  * wait's `status` reads are no refusal (b.jg5 SRJ-605): `WAIT_STATUS_SITES`.
  */
 const READ_SITES: readonly LadderSite[] = [
@@ -14276,6 +14470,7 @@ async function expectRefusedAt(
 
   expect(result).toStrictEqual({ key: p, action: 'failed', refused: true })
   expect(ladderCallsMade(h)).toEqual(siteCalls(site, err))
+  expect(h.reuseSpawns()).toEqual(site.reuse === true ? [reuseSpawnOf(h, p)] : [])
   expect(h.notices).toEqual([])
   if (onsetText === undefined) {
     expect(h.outageNotices).toEqual([])
@@ -14593,7 +14788,7 @@ describe('b.jg5 SRJ-105, SRJ-605: a read error at the collision get or the ErrJs
     const { h, p } = await expectRefusedAt(site, make(site.verb), kind)
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(conditionStartedLines(h, p)).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
     // b.jg5 SRJ-114: a read error at a get site latches no one.
     expect(h.latchEvents).toEqual([])
   })
@@ -14616,7 +14811,7 @@ describe('b.jg5 SRJ-105, SRJ-605: a read error at the collision get or the ErrJs
     const { h, p } = await expectRefusedAt(site, SRJ105_KILL_FAILED[1](site.verb), SRJ105_KILL_FAILED[2])
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(conditionStartedLines(h, p)).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
     expect(h.latchEvents).toEqual([])
   })
 
@@ -14700,11 +14895,12 @@ describe('b.jg5 SRJ-105, SRJ-605: a read error at the collision get or the ErrJs
     ['the working-row wait\'s poll status (an absent row: dead session, resumed)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusError: errSpawnNotFound() }), fastPolls, 'resumed', { spawn: 1, resume: 1 }],
     ['the working-row wait\'s timeout status (an absent row: dead session, resumed)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusError: errSpawnNotFound() }), deadlineAtStart, 'resumed', { spawn: 1, resume: 1 }],
     [
-      'the ErrJsonlMissing diagnosis get (the row went away: inconclusive, delete and fresh spawn)',
+      // b.jg5 SRJ-712: the reuse of an id with no row is an ordinary fresh spawn (SRJ-112); nothing is deleted.
+      'the ErrJsonlMissing diagnosis get (the row went away: inconclusive, then the reuse spawn)',
       (h, p) => jsonlMissingDiagnosisGets(h, p, cannedErr(errSpawnNotFound())),
       undefined,
       'fresh-after-inconclusive-amnesia',
-      { spawn: 2, resume: 1, delete: 1 },
+      { spawn: 2, resume: 1 },
     ],
   ])('regression: ErrSpawnNotFound at %s keeps its meaning; nothing is refused', async (_site, script, setup, action, calls) => {
     const { h, p } = srj105Build()
@@ -14731,7 +14927,7 @@ describe('b.jg5 SRJ-105, SRJ-605: a read error at the collision get or the ErrJs
     expect(await h.launch(p)).toEqual({ key: p, action: 'fresh-after-inconclusive-amnesia' })
 
     expect(h.notices.filter((n) => n.key === p && n.text.includes(ErrSpawnNotFound.name))).toHaveLength(1)
-    expect(onlyStartupEntry(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toContain(ErrSpawnNotFound.name)
+    expect(onlyStartupEntry(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toContain(ErrSpawnNotFound.name)
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
     expect(h.latchEvents).toEqual([])
   })
@@ -15414,7 +15610,7 @@ describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladd
     expect(h.stub.calls.readPaneCalls.filter((c) => c.claude_instance_id === personaInstanceId(p))).toEqual([])
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(conditionStartedLines(h, p)).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
   })
 
   // b.jg5 SRJ-605: at the working-row wait's `status` reads ENVIRONMENT is
@@ -15493,7 +15689,7 @@ describe('b.jg5 SRJ-105, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the co
     const onset = adConfigMalformedOnset(err)
     const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_CONFIG, onset, 'ad-config-malformed')
     expect(h.stub.calls.readPaneCalls.filter((c) => c.claude_instance_id === personaInstanceId(p))).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
     expectConfigOutageOnly(h, p, onset)
   })
 
@@ -15602,7 +15798,7 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNCLASSIFIED outcome at the collision ladde
     const err = errInternal()
     const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
     expect(h.stub.calls.readPaneCalls.filter((c) => c.claude_instance_id === personaInstanceId(p))).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
     expectReportedToEpisode(h, p, err)
   })
 
@@ -16056,8 +16252,15 @@ interface LatchSite {
   readonly reads: { readonly get: number; readonly status: number }
   /** The state the path last read before the refused call; `undefined` when it read nothing (one latch-time `status` read). */
   readonly lastRead: LatchRowState | undefined
-  /** Notices the path posts before the refused call (the ErrJsonlMissing diagnosis's report); none by default. */
-  readonly noticesBefore?: number
+  /**
+   * The `jsonl-diagnosis-inconclusive` entries the path writes before the
+   * refused call (the ErrJsonlMissing diagnosis's); none by default. Its
+   * notice is posted only once the reuse spawn brings P up, so a refused
+   * reuse posts none (b.jg5 SRJ-712).
+   */
+  readonly inconclusiveEntries?: number
+  /** Set on a reuse spawn site (b.jg5 SRJ-707): the refused call is P's one reuse spawn, its refused operation "reuse spawn". */
+  readonly reuse?: true
 }
 
 const ENDED_READ = latchRowStateRead('ended')
@@ -16082,35 +16285,40 @@ const LATCH_SPAWN_SITES: readonly LatchSite[] = [
     reads: { get: 1, status: 0 },
     lastRead: LATCH_ROW_STATE_NO_ROW,
   },
+  // b.jg5 SRJ-707, SRJ-712: resume's no-transcript answers go on to one reuse
+  // spawn of the same id, after the diagnosis on ErrJsonlMissing; no delete.
   {
-    name: 'the fresh spawn after the resume\'s ErrNoSessionId and its delete (an ended row)',
+    name: 'the reuse spawn after the resume\'s ErrNoSessionId (an ended row)',
     verb: 'spawn',
     script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errNoSessionId() }),
-    calls: ladderCallsOf({ spawn: 2, resume: 1, delete: 1 }),
+    calls: ladderCallsOf({ spawn: 2, resume: 1 }),
     reads: { get: 1, status: 0 },
     lastRead: ENDED_READ,
+    reuse: true,
   },
   {
-    name: 'the fresh spawn after the resume\'s ErrJsonlNeverWritten and its delete (a missing row)',
+    name: 'the reuse spawn after the resume\'s ErrJsonlNeverWritten (a missing row)',
     verb: 'spawn',
     script: (h, p, err) => ({ ...collided(h, p, { state: 'missing' }, err), resumeError: errJsonlNeverWritten() }),
-    calls: ladderCallsOf({ spawn: 2, resume: 1, delete: 1 }),
+    calls: ladderCallsOf({ spawn: 2, resume: 1 }),
     reads: { get: 1, status: 0 },
     lastRead: MISSING_READ,
+    reuse: true,
   },
   {
-    name: 'the fresh spawn after the resume\'s ErrJsonlMissing, its diagnosis get (reading missing after the collision get read ended) and its delete',
+    name: 'the reuse spawn after the resume\'s ErrJsonlMissing and its diagnosis get (reading missing after the collision get read ended)',
     verb: 'spawn',
     script: (h, p, err) => ({
       spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(err)],
       getQueue: [cannedOk(harnessRow(h, p, { state: 'ended' })), cannedOk(harnessRow(h, p, { state: 'missing' }))],
       resumeError: errJsonlMissing(),
     }),
-    calls: ladderCallsOf({ spawn: 2, resume: 1, delete: 1 }),
+    calls: ladderCallsOf({ spawn: 2, resume: 1 }),
     reads: { get: 2, status: 0 },
     lastRead: MISSING_READ,
-    // The inconclusive diagnosis (no message archive) reports before the delete.
-    noticesBefore: 1,
+    // The inconclusive diagnosis (no message archive) writes its entry before the reuse.
+    inconclusiveEntries: 1,
+    reuse: true,
   },
   {
     name: 'the fresh spawn after the resume\'s ErrSpawnNotResumable, its kill and its delete (an ended row)',
@@ -16175,16 +16383,17 @@ const LATCH_SPAWN_SITES: readonly LatchSite[] = [
     lastRead: LATCH_ROW_STATE_NO_ROW,
   },
   {
-    name: 'the fresh spawn after a waiting row\'s dead session, its resume\'s ErrNoSessionId and its delete',
+    name: 'the reuse spawn after a waiting row\'s dead session and its resume\'s ErrNoSessionId',
     verb: 'spawn',
     script: (h, p, err) => ({
       ...collided(h, p, { state: 'waiting' }, err),
       sendKeysError: errSpawnNotInteractive('send-keys'),
       resumeError: errNoSessionId(),
     }),
-    calls: ladderCallsOf({ spawn: 2, sendKeys: 1, resume: 1, delete: 1 }),
+    calls: ladderCallsOf({ spawn: 2, sendKeys: 1, resume: 1 }),
     reads: { get: 1, status: 0 },
     lastRead: WAITING_READ,
+    reuse: true,
   },
 ]
 
@@ -16243,9 +16452,10 @@ const LATCH_RESUME_SITES: readonly LatchSite[] = [
   },
 ]
 
-/** The refused operation a site's verb records today (E22 relabels the sites it turns into reuse spawns). */
+/** The refused operation a site records: "resume", "reuse spawn" at a reuse site (b.jg5 SRJ-501), else "plain spawn". */
 function refusedOperationAt(site: LatchSite): RefusedOperation {
-  return site.verb === 'resume' ? REFUSED_OPERATION_RESUME : REFUSED_OPERATION_PLAIN_SPAWN
+  if (site.verb === 'resume') return REFUSED_OPERATION_RESUME
+  return site.reuse === true ? REFUSED_OPERATION_REUSE_SPAWN : REFUSED_OPERATION_PLAIN_SPAWN
 }
 
 /** Every case-table row for `verb`. */
@@ -16253,9 +16463,18 @@ function conflictRowsFor(verb: string): readonly ConflictCaseRow[] {
   return CONFLICT_CASE_ROWS.filter((row) => row.verb === verb)
 }
 
-/** Each site crossed with every case-table row for its verb. */
+/**
+ * The case-table rows a site meets: at a reuse site the reuse spawn's rows of
+ * a finished row (its scan rows are a reuse of an id with no row, which these
+ * sites never make after a read row); elsewhere every row for its verb.
+ */
+function conflictRowsAt(site: LatchSite): readonly ConflictCaseRow[] {
+  return site.reuse === true ? REUSE_SPAWN_CONFLICT_CASE_ROWS.filter((row) => row.noRowWritten !== true) : conflictRowsFor(site.verb)
+}
+
+/** Each site crossed with every case-table row it meets. */
 const LATCH_CROSS = [...LATCH_SPAWN_SITES, ...LATCH_RESUME_SITES].flatMap((site) =>
-  conflictRowsFor(site.verb).map((row) => [site.name, row.name, site, row] as const),
+  conflictRowsAt(site).map((row) => [site.name, row.name, site, row] as const),
 )
 
 /** The session manager's CONFLICT lines in `text`'s lines for persona `key` (`conflictAt`: one per CONFLICT it met). */
@@ -16319,24 +16538,25 @@ function launchStartLatch(p: string, row: LaunchStartCaseRow): ExpectedLatch {
 /**
  * P latched once, as `expected` says: its whole record, the set and the
  * three holds in order before the one notice, one line of the latch's kind
- * saying it latched, and nothing counted, posted as a spawn failure (only the
- * `noticesBefore` the path posted before the latching call: each an
- * inconclusive ErrJsonlMissing diagnosis), recorded `spawn-failed` or as any
- * other diagnosis entry, armed, triggered, refused, started as
- * `tmux-unresponsive` or reported to the unclassified-error episode.
+ * saying it latched, and nothing counted, posted through the session
+ * manager's notices (no spawn-failure notice, and no diagnosis notice: an
+ * ErrJsonlMissing diagnosis's notice waits for the reuse spawn to bring P up,
+ * b.jg5 SRJ-712), recorded `spawn-failed` or as any diagnosis entry but the
+ * `inconclusiveEntries` the path wrote before the latching call, armed,
+ * triggered, refused, started as `tmux-unresponsive` or reported to the
+ * unclassified-error episode.
  */
-function expectLatchedOnce(h: RecoveryHarness, p: string, expected: ExpectedLatch, noticesBefore = 0): void {
+function expectLatchedOnce(h: RecoveryHarness, p: string, expected: ExpectedLatch, inconclusiveEntries = 0): void {
   expect(h.latch.isLatched(p)).toBe(true)
   expect(h.latch.record(p)).toStrictEqual(expected.record)
   expect(h.latchEvents.map((event) => [event.step, event.key])).toEqual(ONE_LATCH_STEPS.map((step) => [step, p]))
   expect(h.latchEvents[0]).toMatchObject({ step: 'set', key: p, outcome: CONFLICT_LATCH_SET_LATCHED })
   expect(h.episodeNotices).toEqual([{ key: p, text: expected.notice }])
-  // No spawn-failure notice: only what the path posted before the latching call.
-  expect(h.notices.map((n) => n.key)).toEqual(Array.from({ length: noticesBefore }, () => p))
+  expect(h.notices).toEqual([])
   const log = h.startupErrors().join('\n')
   expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
-  expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(noticesBefore)
-  expect(countStartupEntries(log, 'jsonl-transcript-lost-on-resume')).toBe(0)
+  expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(inconclusiveEntries)
+  expect(countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(0)
   expect(getFailureCount(p)).toBe(0)
   expect(h.controller.isArmed(p)).toBe(false)
   expect(h.triggers).toEqual([])
@@ -16407,8 +16627,10 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
       Array(site.reads.status + latchTimeReads).fill(`${PERSONA_INSTANCE_ID_PREFIX}${p}`),
     )
     expect(order.slice(order.lastIndexOf(site.verb))).toEqual([site.verb, ...(latchTimeReads === 1 ? ['status'] : [])])
+    // b.jg5 SRJ-707: at a reuse site the refused spawn is P's one reuse; elsewhere no spawn carries the flag.
+    expect(h.reuseSpawns()).toEqual(site.reuse === true ? [reuseSpawnOf(h, p)] : [])
 
-    expectLatchedOnce(h, p, conflictLatch(p, row, refusedOperationAt(site), site.lastRead ?? row.rowState), site.noticesBefore)
+    expectLatchedOnce(h, p, conflictLatch(p, row, refusedOperationAt(site), site.lastRead ?? row.rowState), site.inconclusiveEntries)
 
     await expectLaunchedByNoPath(h, p, b, script)
   })
@@ -16427,13 +16649,15 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     expect(h.latch.isLatched(p)).toBe(true)
     expect(ladderCallsMade(h)).toEqual(site.calls)
     expect(getFailureCount(p)).toBe(0)
-    expect(h.notices).toHaveLength(site.noticesBefore ?? 0)
+    expect(h.notices).toEqual([])
     expect(h.episodeNotices.filter((n) => n.key === p)).toHaveLength(1)
   })
 
-  test('b.jg5 SRJ-501: the ErrJsonlMissing diagnosis get answering ErrSpawnNotFound is the last read: the spawn after its delete latches P with no row, and no status read is added', async () => {
+  // HO rev 15, b.jg5 SRJ-112: with no row, the reuse after the diagnosis is an
+  // ordinary fresh spawn, which the pre-spawn scan refuses.
+  test('b.jg5 SRJ-501: the ErrJsonlMissing diagnosis get answering ErrSpawnNotFound is the last read: the reuse spawn after it, refused by the pre-spawn scan, latches P with "reuse spawn" and no row; no status read is added, no delete, and the inconclusive entry is kept with no notice', async () => {
     const { h, p, b } = srj105Build()
-    const row = conflictRowsFor('spawn')[0]!
+    const row = reuseSpawnScanRows()[0]!
     const script: RecoveryStubScript = {
       spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(row.build())],
       getQueue: [cannedOk(harnessRow(h, harnessPersona(h, p), { state: 'ended' })), cannedErr(errSpawnNotFound())],
@@ -16443,20 +16667,20 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
 
-    expect(h.latch.record(p)?.rowState).toEqual(LATCH_ROW_STATE_NO_ROW)
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, resume: 1, delete: 1 }))
+    expect(h.latch.record(p)).toMatchObject({ refusedOperation: REFUSED_OPERATION_REUSE_SPAWN, rowState: LATCH_ROW_STATE_NO_ROW, latchCase: row.latchCase })
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, resume: 1 }))
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
     expect(h.stub.calls.statusCalls).toEqual([])
-    // The inconclusive diagnosis keeps its own report; no spawn failure is posted or recorded.
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'jsonl-diagnosis-inconclusive')).toBe(1)
+    // The inconclusive diagnosis keeps its entry; its notice waits for a reuse that brings P up, so none is posted.
+    expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(1)
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
-    expect(h.notices.every((n) => n.key === p)).toBe(true)
-    const inconclusiveNotices = h.notices.length
+    expect(h.notices).toEqual([])
     expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
     expect(getFailureCount(p)).toBe(0)
 
     h.script(clearedScript(script))
     expect(await launchSession(p, h.config)).toBe('skipped')
-    expect(h.notices).toHaveLength(inconclusiveNotices)
+    expect(h.notices).toEqual([])
     expect(await h.launch(b)).toEqual({ key: b, action: 'spawned' })
   })
 
@@ -16740,7 +16964,7 @@ const NOTE_SITES: readonly NoteSite[] = [
   {
     name: 'the ErrJsonlMissing diagnosis get (an ended row)',
     script: (h, p, noted) => jsonlMissingDiagnosisGets(h, p, cannedOk(harnessRow(h, p, { state: 'ended', ...noted }))),
-    plain: { action: 'fresh-after-inconclusive-amnesia', calls: ladderCallsOf({ spawn: 2, resume: 1, delete: 1 }) },
+    plain: { action: 'fresh-after-inconclusive-amnesia', calls: ladderCallsOf({ spawn: 2, resume: 1 }) },
     latched: { calls: ladderCallsOf({ spawn: 1, resume: 1 }), gets: 2, statusReads: 0, rowState: ENDED_READ },
   },
   {
@@ -16783,7 +17007,7 @@ function expectNoteLatchedOnce(h: RecoveryHarness, p: string, rowState: LatchRow
   expect(h.notices).toEqual([])
   const log = h.startupErrors().join('\n')
   expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
-  expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(0)
+  expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
   expect(getFailureCount(p)).toBe(0)
   expect(h.controller.isArmed(p)).toBe(false)
   expect(h.triggers).toEqual([])
@@ -18427,36 +18651,14 @@ const UNUSABLE_DELETE_SITES: readonly UnusableLadderSite[] = [
     reads: { get: 1, status: 0 },
     lastRead: ENDED_READ,
   },
-  {
-    name: 'the delete after the resume\'s ErrNoSessionId (an ended row)',
-    kind: 'ladder delete',
-    verb: 'delete',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errNoSessionId(), deleteError: err }),
-    calls: ladderCallsOf({ spawn: 1, resume: 1, delete: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
-  },
-  {
-    name: 'the delete after the resume\'s ErrJsonlMissing and its diagnosis get (reading missing after the collision get read ended)',
-    kind: 'ladder delete',
-    verb: 'delete',
-    script: (h, p, err) => ({
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(harnessRow(h, p, { state: 'ended' })), cannedOk(harnessRow(h, p, { state: 'missing' }))],
-      resumeError: errJsonlMissing(),
-      deleteError: err,
-    }),
-    calls: ladderCallsOf({ spawn: 1, resume: 1, delete: 1 }),
-    reads: { get: 2, status: 0 },
-    lastRead: MISSING_READ,
-    // The inconclusive diagnosis (no message archive) reports before the delete.
-    noticesBefore: 1,
-  },
 ]
 
-/** Every ladder site: each spawn (`plain spawn`) and `resume` of E13's CONFLICT sites, and each kill and delete above. */
+/**
+ * Every ladder site: each spawn (`plain spawn`, or `reuse spawn` at a reuse
+ * site) and `resume` of E13's CONFLICT sites, and each kill and delete above.
+ */
 const UNUSABLE_LADDER_SITES: readonly UnusableLadderSite[] = [
-  ...LATCH_SPAWN_SITES.map((site) => ({ ...site, kind: 'plain spawn' as const })),
+  ...LATCH_SPAWN_SITES.map((site): UnusableLadderSite => ({ ...site, kind: site.reuse === true ? REUSE_SPAWN_SITE : 'plain spawn' })),
   ...LATCH_RESUME_SITES.map((site) => ({ ...site, kind: 'resume' as const })),
   ...UNUSABLE_KILL_SITES,
   ...UNUSABLE_DELETE_SITES,
@@ -18493,7 +18695,8 @@ describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a
     expect(h.stub.calls.getCalls).toHaveLength(site.reads.get)
     expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual(Array(site.reads.status + latchTimeReads).fill(personaInstanceId(p)))
     expect(order.slice(order.lastIndexOf(site.verb))).toEqual([site.verb, ...(latchTimeReads === 1 ? ['status'] : [])])
-    expectLatchedOnce(h, p, unusableNameLatch(p, row, site.lastRead ?? row.rowState), site.noticesBefore)
+    expect(h.reuseSpawns()).toEqual(site.reuse === true ? [reuseSpawnOf(h, p)] : [])
+    expectLatchedOnce(h, p, unusableNameLatch(p, row, site.lastRead ?? row.rowState), site.inconclusiveEntries)
 
     await expectLaunchedByNoPath(h, p, b, script)
   })
@@ -18512,7 +18715,7 @@ describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a
     expect(h.latch.record(p)?.latchCase).toBe(row.latchCase)
     expect(ladderCallsMade(h)).toEqual(site.calls)
     expect(getFailureCount(p)).toBe(0)
-    expect(h.notices).toHaveLength(site.noticesBefore ?? 0)
+    expect(h.notices).toEqual([])
     expect(h.episodeNotices.filter((n) => n.key === p)).toEqual([{ key: p, text: row.notice(p) }])
   })
 
@@ -18579,7 +18782,7 @@ describe('b.jg5 SRJ-110, SRJ-701: the collision ladder\'s replacement kills are 
 
     expect(ladderCallsMade(h)).toEqual(site.calls)
     expect(h.stub.calls.statusCalls).toHaveLength(site.reads.status)
-    expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, site.lastRead!), site.noticesBefore)
+    expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, site.lastRead!), site.inconclusiveEntries)
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
 
     await expectLaunchedByNoPath(h, p, b, script)
@@ -20211,7 +20414,7 @@ describe('b.jg5 SRJ-114, SRJ-105, SRJ-512: an UNUSABLE NAME answer at E14\'s sha
     expect(h.stub.calls.getCalls.map((c) => c.claude_instance_id)).toEqual(Array(site.reads.get).fill(personaInstanceId(p)))
     expect(h.stub.calls.statusCalls).toHaveLength(site.reads.status)
     const log = h.startupErrors().join('\n')
-    expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(0)
+    expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
     expect(h.errors.filter((line) => line.includes('ErrJsonlMissing diagnosis get failed for ') || line.includes('collision get failed for '))).toEqual([])
     expectLatchedOnce(h, p, unusableNameLatch(p, row, LATCH_ROW_STATE_UNREADABLE))
 
@@ -20328,8 +20531,8 @@ function expectLatchedElsewhereOnly(h: RecoveryHarness, p: string, elsewhere: { 
   expect(h.notices).toEqual([])
   const log = h.startupErrors().join('\n')
   expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
-  expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(0)
-  expect(countStartupEntries(log, 'jsonl-transcript-lost-on-resume')).toBe(0)
+  expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
+  expect(countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(0)
   expect(getFailureCount(p)).toBe(0)
   expect(refusalLines(h, p)).toEqual([])
   expect(h.controller.isArmed(p)).toBe(false)
@@ -21439,21 +21642,28 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expect([h.stub.callCount(), isLaunchInFlight(p)]).toEqual([0, false])
   })
 
+  // b.jg5 SRJ-707, SRJ-712: after ErrJsonlMissing the diagnosis's get comes
+  // first and the launch answers its amnesia result (inconclusive: the
+  // harness configures no message archive), its notice posted once the reuse
+  // brought P up; the entry is no start-pass launch, so it writes no
+  // startup-errors entry. The other two answers make no diagnosis.
   test.each([
-    ['ErrNoSessionId', () => errNoSessionId()],
-    ['ErrJsonlMissing', () => errJsonlMissing()],
-    ['ErrJsonlNeverWritten', () => errJsonlNeverWritten()],
-  ])('resume answering %s goes on to exactly one reuse spawn of the id, with the flag; no delete, kill or plain spawn', async (_label, make) => {
+    ['ErrNoSessionId', () => errNoSessionId(), 'spawned', ['resume', 'spawn'], 0],
+    ['ErrJsonlMissing', () => errJsonlMissing(), 'fresh-after-inconclusive-amnesia', ['resume', 'get', 'spawn'], 1],
+    ['ErrJsonlNeverWritten', () => errJsonlNeverWritten(), 'spawned', ['resume', 'spawn'], 0],
+  ] as const)('resume answering %s goes on to exactly one reuse spawn of the id, with the flag, answering %s; no delete, kill or plain spawn', async (_label, make, action, calls, notices) => {
     const { h, p } = srj105Build()
     h.script({ resumeError: make() })
     const order = recordCallOrder(h)
 
-    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, action: 'spawned' })
+    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, action })
 
-    expect(order.slice(0, 2)).toEqual(['resume', 'spawn'])
+    expect(order.slice(0, calls.length)).toEqual([...calls])
     expect(h.stub.calls.resumeCalls).toHaveLength(1)
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
     expect(destructiveCalls(h)).toEqual([[], [], [...h.reuseSpawns()]])
+    expect(h.notices).toEqual(Array.from({ length: notices }, () => ({ key: p, text: expect.stringContaining(`I was ${JSONL_DIAGNOSIS_REUSE_WORDING}`) })))
+    expect(h.startupErrors()).toEqual([])
     await h.runApproverToStop(p)
   })
 
@@ -22101,6 +22311,102 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
     expect('reuse_finished' in h.stub.calls.spawnCalls[0]!).toBe(false)
     expect(h.reuseSpawns()).toEqual([])
     await h.runApproverToStop(p)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-707, SRJ-712 (E22 T3), with SRJ-112 and SRJ-113, on
+// `makeRecoveryHarness`: `resume`'s `ErrNoSessionId`, `ErrJsonlNeverWritten`
+// and `ErrJsonlMissing` (by name) go on to exactly one reuse spawn of
+// `cscb_<key>`, carrying the reuse flag and the persona's `extra_env`, with
+// no `delete`, kill or plain spawn; on `ErrJsonlMissing` the diagnosis's `get`
+// comes first (the harness configures no message archive, so it is
+// inconclusive). At the collision ladder a reuse that collides ends the
+// attempt with the uncounted refused result: nothing posted or counted, P's
+// timer armed with the reuse-collision cause. At the sequence-launch entry a
+// refused or latching diagnosis `get` launches nothing. The ladder's
+// per-outcome rows are the SRJ-105, SRJ-311, SRJ-316, SRJ-313, CONFLICT and
+// UNUSABLE NAME describes' (their reuse sites); the entry's three answers
+// are the SRJ-705 step-6 describe's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one reuse spawn of the same id, the diagnosis first after ErrJsonlMissing, and nothing is deleted', () => {
+  afterEach(srj105AfterEach)
+
+  /** An `ended` row with a session id: the collision `get` (and the diagnosis `get`) read it, and the ladder resumes it. */
+  const ENDED_WITH_SESSION = { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' } as const
+
+  /** One no-transcript answer of `resume`: its builder, the ladder's result on a reuse that succeeds, and the stub calls before the reuse. */
+  const NO_TRANSCRIPT_ANSWERS: ReadonlyArray<readonly [string, () => Error, SpawnPersonaResult['action'], readonly string[]]> = [
+    ['ErrNoSessionId', () => errNoSessionId(), 'spawned', ['spawn', 'get', 'resume']],
+    ['ErrJsonlNeverWritten', () => errJsonlNeverWritten(), 'spawned', ['spawn', 'get', 'resume']],
+    ['ErrJsonlMissing', () => errJsonlMissing(), 'fresh-after-inconclusive-amnesia', ['spawn', 'get', 'resume', 'get']],
+    // Classified by name: a base AgentDirectorError carrying each name is the same answer.
+    [`${ERR_NO_SESSION_ID_NAME} by name (a base AgentDirectorError)`, () => errGeneric('resume', ERR_NO_SESSION_ID_NAME), 'spawned', ['spawn', 'get', 'resume']],
+    [`${ERR_JSONL_NEVER_WRITTEN_NAME} by name (a base AgentDirectorError)`, () => errGeneric('resume', ERR_JSONL_NEVER_WRITTEN_NAME), 'spawned', ['spawn', 'get', 'resume']],
+    [`${ERR_JSONL_MISSING_NAME} by name (a base AgentDirectorError)`, () => errGeneric('resume', ERR_JSONL_MISSING_NAME), 'fresh-after-inconclusive-amnesia', ['spawn', 'get', 'resume', 'get']],
+  ]
+
+  test.each(NO_TRANSCRIPT_ANSWERS)('at the collision ladder, resume answering %s: exactly one reuse spawn of cscb_<key> with the flag and P\'s extra_env, after the diagnosis get on ErrJsonlMissing; no delete, kill or plain spawn after the resume; the launch answers %s', async (_label, make, action, before) => {
+    const { h, p, b } = srj105Build()
+    h.script({ ...collided(h, harnessPersona(h, p), ENDED_WITH_SESSION), resumeError: make() })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toEqual({ key: p, action })
+
+    expect(order).toEqual([...before, 'spawn'])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    // The colliding first spawn is plain; the second is the reuse.
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect([h.stub.calls.deleteCalls, h.stub.calls.killCalls]).toEqual([[], []])
+    expect(personaCallCounts(h, b)).toEqual({})
+    await h.runApproverToStop(p)
+  })
+
+  // The Task's ruling until the ladder's re-run of get-then-act: a reuse
+  // collision there ends the attempt with the refused result (b.jg5 SRJ-112,
+  // SRJ-301). The diagnosis's notice is not posted: the reuse collided and
+  // did not bring P up.
+  test.each(NO_TRANSCRIPT_ANSWERS)('at the collision ladder, resume answering %s, then a reuse spawn that collides: the attempt ends refused, with no further launch; nothing counted, posted or recorded spawn-failed; P\'s timer armed with the reuse-collision cause; the restart path\'s launch answers refused', async (_label, make, _action, before) => {
+    const { h, p, b } = srj105Build()
+    // A fresh script for each launch: the stub consumes its spawn queue.
+    const script = (): RecoveryStubScript => ({ ...collided(h, harnessPersona(h, p), ENDED_WITH_SESSION, errInstanceIdCollision()), resumeError: make() })
+    h.script(script())
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(order).toEqual([...before, 'spawn'])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect([h.stub.calls.deleteCalls, h.stub.calls.killCalls]).toEqual([[], []])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION }])
+    expect(h.controller.isArmed(p)).toBe(true)
+    expect([getFailureCount(p), h.notices, h.episodeNotices, h.outageNotices]).toEqual([0, [], [], []])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(h.unclassifiedErrorOpen(p)).toBe(false)
+
+    h.script(script())
+    expect(await launchSession(p, h.config)).toBe('refused')
+    expect([getFailureCount(p), h.notices]).toEqual([0, []])
+    expect(personaCallCounts(h, b)).toEqual({})
+  })
+
+  // E14 at the entry: the diagnosis get's refusal or latch ends the step
+  // with no reuse (b.jg5 SRJ-105, SRJ-502).
+  test.each<[string, (h: RecoveryHarness, key: string) => RecoveryStubScript, Record<string, unknown>]>([
+    ['refused (UNAVAILABLE)', () => ({ getError: errTmuxUnresponsive('get') }), { action: 'failed', refused: true }],
+    ['latching P (a provenance_conflict note on its own row)', (h, key) => ({ getResult: cannedGetResult({ ...ENDED_WITH_SESSION, liveness_note: provenanceNote }, harnessPersona(h, key), h.home) }), { action: 'latched' }],
+  ])('at the sequence-launch entry, resume answering ErrJsonlMissing and its diagnosis get %s: no reuse spawn and no other launch; no diagnosis notice', async (_label, script, answer) => {
+    const { h, p } = srj105Build()
+    h.script({ ...script(h, p), resumeError: errJsonlMissing() })
+    const order = recordCallOrder(h)
+
+    expect(await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_RESUME, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) })).toStrictEqual<unknown>({ key: p, ...answer })
+
+    expect(order).toEqual(['resume', 'get'])
+    expect([h.stub.calls.spawnCalls, h.stub.calls.deleteCalls, h.stub.calls.killCalls, h.notices]).toEqual([[], [], [], []])
+    expect(getFailureCount(p)).toBe(0)
   })
 })
 
