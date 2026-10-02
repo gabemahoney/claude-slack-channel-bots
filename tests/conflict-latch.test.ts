@@ -389,8 +389,10 @@ import {
 import {
   LIVE_ROW_OUTCOME_ABORTED,
   LIVE_ROW_OUTCOME_LAUNCHED,
+  LIVE_ROW_OUTCOME_STOPPED,
   LIVE_ROW_SEQUENCE_ENTRY_GET,
   LIVE_ROW_SEQUENCE_STEP3_RUNS,
+  LIVE_ROW_STOP_LATCHED,
 } from '../src/live-row-sequence.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
@@ -488,6 +490,7 @@ import {
   STUB_TMUX_SESSION_NAME,
   UNUSABLE_NAME_FAULTS,
   errUnusableName,
+  holdFindMissing,
   unknownNote,
   type CannedRowPersona,
   type UnusableNameFault,
@@ -553,6 +556,7 @@ import {
   personaOf,
   recordCallOrder,
   retryNow,
+  startSequenceHeldAtRun,
   unclassifiedEndedLine,
   unclassifiedLines,
   unclassifiedStartedLine,
@@ -4046,5 +4050,49 @@ describe('the live-row sequence\'s own latches: a kill CONFLICT or UNUSABLE NAME
     expect(h.latch.isLatched(p)).toBe(false)
     expect([h.latchEvents, h.episodeNotices]).toEqual([[], []])
     expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A running live-row sequence stops when P latches from another path (E21
+// T2; b.jg5 SRJ-502, SRJ-706; the E13 hatch note)
+//
+// On `makeAutomatedPathsRun`'s recovery harness, whose registry is installed
+// after the latch as main() installs it, with P's sequence started through
+// the registry and its first run held. P latches through the other paths'
+// own-row reads (a `get` noting `provenance_conflict`, and the tick's and
+// retry's `status` read of P's own `pending` row with no launch start): the
+// latch's set observer stops the sequence, so once its run is released it
+// makes no further `get`, kill or launch, and no kill of `cscb_<key>`
+// follows the latch (AC 46). A start of a latched P's sequence (no call at
+// all) is tests/live-row-sequence.test.ts's; a latch of Q leaving P's
+// sequence running, tests/session-manager.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('a running live-row sequence stops when P latches from another path: no further get, kill or launch for P, and one post (recovery harness; SRJ-502, SRJ-706, AC 46)', () => {
+  test.each(OTHER_LATCH_PATHS.filter(([name]) => name.startsWith('an own-row')))('P latched by %s while its first run is held: a launch of P meanwhile answers latched; once the run is released the sequence ends stopped for the latch and makes no further call for P, with only the latch\'s own post', async (_name, latchP, latchCase) => {
+    const run = makeAutomatedPathsRun()
+    const { h } = run
+    const [p] = h.keys as [string]
+    const hold = holdFindMissing(h.stub.client)
+    const sequence = await startSequenceHeldAtRun(h, p, hold)
+    expect(personaCallCounts(h, p)).toEqual({ killCalls: 1, getCalls: 1 })
+
+    await latchP(run, p)
+    const pAtLatch = personaCallCounts(h, p)
+
+    // Stopped but still settling: the gate gives the latched persona the latched answer, with no call.
+    expect(h.sequenceRunning(p)).toBe(true)
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+
+    expect(await h.driveSequence(sequence.outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
+    expect(callCountsSince(personaCallCounts(h, p), pAtLatch)).toEqual({})
+    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect([hold.calls.length, h.reuses]).toEqual([1, []])
+    expect(h.latch.record(p)?.latchCase).toBe(latchCase)
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
+    expect([h.sequenceRunning(p), h.clock.pendingCount()]).toEqual([false, 0])
   })
 })

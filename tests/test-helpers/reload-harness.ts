@@ -359,7 +359,18 @@
  * bound to those episodes (`bindConflictNotice`). A realLaunch run installs
  * the latch in the session manager (`setConflictLatch`), and beside it, as
  * `main()` does, the configured-persona query over the run's live applied
- * configuration (`setConfiguredPersonaQuery`), so a CONFLICT at a
+ * configuration (`setConfiguredPersonaQuery`) and, after the latch, the
+ * run's live-row sequence registry (b.jg5 SRJ-706:
+ * `createLiveRowSequenceRegistry` over the session manager's builder on
+ * `run.clock` and `run.serverConfig()`, each sequence in its own detached
+ * recovery attempt, its retry arm arming nothing as the run has no retry
+ * controller; `setLiveRowSequenceRegistry`). `run.startSequence(name)`
+ * starts the persona's sequence through the session manager's start entry,
+ * `run.sequenceRunning(name)` reads the running query, and
+ * `run.composition.holdFindMissing()` holds its runs (the stub's
+ * `holdFindMissing`), so a case can hold a sequence across an apply;
+ * `run.stop()` closes the registry, as `main()`'s shutdown does, and
+ * `h.cleanup()` removes it. So a CONFLICT at a
  * ladder spawn or `resume` latches the persona (its launch record's `action`
  * is `latched`, with one CONFLICT notice to its destination) and a latched
  * persona's launch makes no agent-director call. The composition's
@@ -488,6 +499,16 @@ import { resetClientForTests, setClientForTests } from '../../src/agent-director
 import { buildTemplateParams, type TemplateRefreshResult } from '../../src/agent-director-template.ts'
 import { bindConflictNotice, createConflictLatch, type ConflictLatch } from '../../src/conflict-latch.ts'
 import { createPersonaEpisodes } from '../../src/persona-episodes.ts'
+import {
+  LIVE_ROW_SEQUENCE_ENTRY_KILL,
+  LIVE_ROW_START_STARTED,
+  LIVE_ROW_STOP_TEARDOWN,
+  createLiveRowSequenceRegistry,
+  type LiveRowSequenceOutcome,
+  type LiveRowSequenceRegistry,
+} from '../../src/live-row-sequence.ts'
+import { KILL_FAILURE_CONTEXT_RECOVERY } from '../../src/kill-failure-alert.ts'
+import { runDetachedRecoveryAttempt } from '../../src/unavailable-retry.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
 import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from '../../src/persona-lifecycle.ts'
@@ -520,13 +541,16 @@ import {
   _resetDialogReadyTimeoutMs,
   _resetFindMissingMemo,
   _resetInFlightLaunches,
+  _resetLiveRowSequenceRegistry,
   _resetPreLaunchReplyGuard,
   _resetPreLaunchTrustPatcher,
   _resetSpawnHomeDir,
   _setDialogReadyTimeoutMs,
   _setSpawnHomeDir,
+  buildLiveRowSequenceDeps,
   checkLaunchConfigDir,
   deletePersonaInstance,
+  isLiveRowSequenceRunning,
   KILL_CONTEXT_TEARDOWN,
   killPersonaInstance,
   launchSession,
@@ -534,11 +558,14 @@ import {
   setConfigDirUnresolvableHook,
   setConfiguredPersonaQuery,
   setConflictLatch,
+  setLiveRowSequenceRegistry,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setSessionNotifier,
   spawnForPersona,
+  startLiveRowSequence,
   stopDialogApprover,
+  stopLiveRowSequence,
   whenLaunchSettled,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
@@ -570,8 +597,10 @@ import {
   cannedGetResult,
   errInstanceIdCollision,
   errSpawnNotFound,
+  holdFindMissing,
   makeStubCallLog,
   makeStubClient,
+  type FindMissingHold,
   type StubCallLog,
   type StubClientOptions,
 } from './agent-director-stub.ts'
@@ -862,7 +891,10 @@ export interface LifecycleTimelineEntry {
  * session manager's real `whenLaunchSettled` and approver stop
  * (`stopApprover`: `stopDialogApprover` with the teardown reason, as `main()`
  * binds it, so a teardown stops the key's dialog approver first, b.jg5
- * SRJ-404, SRJ-715), and a recording stand-in for every other dependency.
+ * SRJ-404, SRJ-715), its real live-row sequence stop right after
+ * (`stopLiveRowSequence`: the session manager's `stopLiveRowSequence` with
+ * the teardown reason, as `main()` binds it, b.jg5 SRJ-706, SRJ-715), and a
+ * recording stand-in for every other dependency.
  */
 export interface RealLifecycleComposition {
   /** The composition the recorder's `teardown`, `updateInPlace`, `reconnectCredentials` and `bringUp` call. */
@@ -875,7 +907,8 @@ export interface RealLifecycleComposition {
    * Every call of a dependency the composition got, in call order, as
    * `[member, key]` with the member named as in `PersonaLifecycleDeps`
    * (`'stopApprover'`, recorded at a teardown's submission and again as its
-   * first step, `'bringUps.cancel'`, `'cancelRestartTimer'`, `'stopRetryTimer'`, `'whenLaunchSettled'`,
+   * first step, `'stopLiveRowSequence'`, right after it both times,
+   * `'bringUps.cancel'`, `'cancelRestartTimer'`, `'stopRetryTimer'`, `'whenLaunchSettled'`,
    * `'connections.stop'`, `'routing.forget'`, `'forgetAcks'`, `'destinations.forget'`,
    * `'destinationHold.cancel'`, `'notifier.forget'`, `'forgetPersonaPrompts'`,
    * `'dropSession'`, `'resetOutageState'`, `'killInstance'`,
@@ -922,6 +955,14 @@ export interface RealLifecycleComposition {
    * failure line and settles `{ kind: 'failed' }`; later calls succeed.
    */
   failTemplateRefresh(err: Error): void
+  /**
+   * Hold every `find-missing` call the stub gets from now on until the case
+   * settles it (the stub's `holdFindMissing`): with `opts.realLaunch`, a
+   * live-row sequence's run (`run.startSequence`) stays outstanding while
+   * the case drives an apply (b.jg5 SRJ-706). The case releases every held
+   * call before the harness's cleanup.
+   */
+  holdFindMissing(): FindMissingHold
 }
 
 /**
@@ -1572,6 +1613,18 @@ export interface ReloadRun {
    * Resolves with the answer. Throws without `opts.realLaunch`.
    */
   relaunch(name: string): Promise<LaunchSessionResult>
+  /**
+   * Start the persona's live-row sequence (b.jg5 SRJ-706; `opts.realLaunch`)
+   * through the session manager's start entry, as later start sites reach
+   * the run's registry: from step 1, the row last read live (`waiting`
+   * unless `lastReadState` says otherwise), its launch kept, the recovery
+   * context. Throws unless the entry answered `started`. Resolves at once,
+   * with the sequence's outcome promise, which settles once the sequence has
+   * settled. Throws without `opts.realLaunch`.
+   */
+  startSequence(name: string, lastReadState?: string): { readonly outcome: Promise<LiveRowSequenceOutcome> }
+  /** Whether the persona's live-row sequence runs (the session manager's running query). */
+  sequenceRunning(name: string): boolean
   /** Every session-manager notice raised (spawn failure, restart cap, lost history) with `opts.realLaunch`, by persona key, in order. */
   readonly sessionNotices: ReadonlyArray<{ readonly key: string; readonly text: string }>
   /**
@@ -2136,6 +2189,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     )
 
     const composition = realLifecycle ? buildComposition() : undefined
+    /** The run's live-row sequence registry (`opts.realLaunch`), built and installed with the launch seams. */
+    let sequences: LiveRowSequenceRegistry | undefined
 
     /** The real composition over this run (`opts.realLifecycle`); see `RealLifecycleComposition`. */
     function buildComposition(): RealLifecycleComposition & { readonly client: unknown } {
@@ -2304,6 +2359,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         // key's dialog approver first, and the one its launch in flight would
         // start; the real stop over the session manager's approver registry.
         stopApprover: rec('stopApprover', (key) => stopDialogApprover(key, APPROVER_STOP_TEARDOWN)),
+        // As main() binds it (b.jg5 SRJ-706, SRJ-715): right after the
+        // approver, the key's live-row sequence, through the session
+        // manager's stop entry (with a realLaunch run's registry installed;
+        // with none it stops nothing).
+        stopLiveRowSequence: rec('stopLiveRowSequence', (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN)),
         whenLaunchSettled: rec('whenLaunchSettled', (key) => whenLaunchSettled(key)),
         cancelRestartTimer: rec('cancelRestartTimer', () => false),
         // A recording no-op: the run arms no UNAVAILABLE retry timer.
@@ -2370,6 +2430,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           return installedTemplate()
         },
         failTemplateRefresh: (err) => void templateFailures.push(err),
+        holdFindMissing: () => holdFindMissing(stub),
         client,
       }
     }
@@ -2925,6 +2986,29 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         })
         return entry.restart
       },
+      startSequence(name, lastReadState = 'waiting') {
+        if (!realLaunch || sequences === undefined) throw new Error('reload-harness: run.startSequence() needs opts.realLaunch')
+        const key = personaKey(name)
+        const answer = startLiveRowSequence({
+          key,
+          instanceId: personaInstanceId(key),
+          lastReadState,
+          entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
+          keepsConversation: false,
+          retiredKey: false,
+          launches: true,
+          alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
+        })
+        if (answer !== LIVE_ROW_START_STARTED) throw new Error(`reload-harness: the start entry answered ${answer} for ${name}`)
+        const registry = sequences
+        return {
+          outcome: registry._whenSettled(key).then((outcome) => {
+            if (outcome === undefined) throw new Error(`reload-harness: ${name}'s sequence settled with no outcome`)
+            return outcome
+          }),
+        }
+      },
+      sequenceRunning: (name) => isLiveRowSequenceRunning(personaKey(name)),
       sessionNotices,
       latch: Object.freeze({ isLatched: (key: string) => latch.isLatched(key), record: (key: string) => latch.record(key) }),
       episodeNotices,
@@ -2936,6 +3020,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         noticeStack.hold.cancelAll()
         // As main()'s shutdown closes them: nothing opens or posts after it.
         episodes.close()
+        // As main()'s shutdown (b.jg5 SRJ-706): every live-row sequence is
+        // stopped, none starts after it.
+        void sequences?.close()
         for (const client of toolClients.values()) await client.close()
         await connections.manager.stopAll()
       },
@@ -2978,6 +3065,21 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // as configured while the run's applied configuration holds it, read at
       // each call, so a note on a configured persona's own row latches it.
       setConfiguredPersonaQuery((key) => getAppliedPersona(key) !== undefined)
+      // As main() builds and installs it after the latch (b.jg5 SRJ-706): the
+      // run's one live-row sequence registry, its dependencies from the
+      // session manager's builder on the run's clock over the configuration
+      // the server runs, each sequence in its own detached recovery attempt.
+      // A run has no UNAVAILABLE retry controller, so its arm arms nothing.
+      sequences = createLiveRowSequenceRegistry({
+        deps: buildLiveRowSequenceDeps({
+          retryArm: { arm: () => false },
+          clock: connections.clock,
+          log,
+          appliedConfig: serverConfig,
+        }),
+        runAttempt: runDetachedRecoveryAttempt,
+      })
+      setLiveRowSequenceRegistry(sequences)
     }
   }
 
@@ -3286,6 +3388,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           setSessionNotifier(undefined)
           setConflictLatch(undefined)
           _resetConfiguredPersonaQuery()
+          _resetLiveRowSequenceRegistry()
         }
         if (outageStateInstalled) _resetOutageState()
         if (registryTouched) {

@@ -199,7 +199,9 @@
  * `pending` (by the liveness probe, whatever the session's connection shows,
  * or by the reconnect's or b.d61's re-probe's read; recorded as the last row
  * read, and never "nothing left to recover"), a liveness reading of `unknown` (b.jg5
- * SRJ-314; it read no row, so the last row read is kept) and a successful
+ * SRJ-314; it read no row, so the last row read is kept), a run that found
+ * the persona's live-row sequence running (`sequence-waiting`, b.jg5
+ * SRJ-706) and a successful
  * launch retry again at the next wait. A successful launch records the row
  * read `pending` and
  * switches the timer to pending-only mode, the wait count carrying on,
@@ -207,7 +209,8 @@
  * recorded. Each `again` carries its again-reason
  * (the labels under "Again-reasons" below: `launch-in-flight`,
  * `launch-failed`, `reconnect-deferred`, `pending-deferred`, `launched`,
- * `restart-not-initialised`, `liveness-unknown`) for the re-armed line, except a refused launch,
+ * `restart-not-initialised`, `liveness-unknown`,
+ * `live-row-sequence-waiting`) for the re-armed line, except a refused launch,
  * whose line names the UNAVAILABLE cause that armed during the run. The
  * in-flight skip is still a refusal for the schedule: the wait doubles. A
  * retry never counts toward the restart cap itself: only a launch failure
@@ -474,6 +477,14 @@ export const UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN = 'liveness-unknown'
 
 /** A pending-only retry that read the row still `pending` (b.jg5 SRJ-302: a refusal). */
 export const UNAVAILABLE_RETRY_AGAIN_ROW_PENDING = 'row-pending'
+
+/**
+ * A full-mode retry whose restart run found the persona's live-row sequence
+ * running (`sequence-waiting`, b.jg5 SRJ-706, SRJ-303, SRJ-302: a refusal):
+ * no agent-director call, nothing recorded; the timer re-arms at the doubled
+ * wait and never stops for it.
+ */
+export const UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING = 'live-row-sequence-waiting'
 
 // ---------------------------------------------------------------------------
 // Stop reasons (b.jg5 SRJ-305)
@@ -1267,8 +1278,9 @@ export interface FullModeRetryDeps {
   isLatched?: (key: string) => boolean
   /**
    * Whether work in flight for the persona blocks a retry (b.jg5 SRJ-303;
-   * production: the server's `isPersonaRetryBlocked`, today a launch call,
-   * `isLaunchInFlight`). A running dialog approver never counts here: it
+   * production: the server's `isPersonaRetryBlocked`: a launch call,
+   * `isLaunchInFlight`, or a running live-row sequence,
+   * `isLiveRowSequenceRunning`). A running dialog approver never counts here: it
    * runs after its launch call has returned and never blocks a retry
    * (SRJ-401). A retry in either mode that finds it true makes no
    * agent-director call and is a refusal; a throw counts as in flight.
@@ -1459,6 +1471,10 @@ function answerFor(outcome: RestartRetryOutcome): UnavailableRetryOutcome {
       return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
     case 'in-flight':
       return againWith(UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT)
+    case 'sequence-waiting':
+      // b.jg5 SRJ-706, SRJ-303: the restart path made no call while P's
+      // live-row sequence runs; a refusal (SRJ-302), never a stop.
+      return againWith(UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING)
     case 'refused':
       return againWith(undefined)
     case 'counted-failure':
@@ -1738,6 +1754,19 @@ export async function runInAttempt<T>(
  */
 export function runOutsideAttempts<T>(fn: () => T): T {
   return attemptContext.exit(fn)
+}
+
+/**
+ * Run `fn` as a recovery attempt for persona `key` of its own, detached from
+ * whatever attempt the caller runs in (`runOutsideAttempts`, then
+ * `runInAttempt`): an error met in it is recorded there only and arms by the
+ * attempt rule for `key`, never marking the caller's launch as refused. For
+ * work a caller starts in the background and does not await: each live-row
+ * sequence (b.jg5 SRJ-706, the registry's attempt runner in
+ * `src/live-row-sequence.ts`).
+ */
+export function runDetachedRecoveryAttempt<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  return runOutsideAttempts(() => runInAttempt(key, 'recovery', fn))
 }
 
 /** A live view of `frame`: its `lastError` reads the frame's current record. */

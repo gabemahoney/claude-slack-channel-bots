@@ -60,7 +60,8 @@
  * - The onset (SRJ-308): with the health check on, at the end of the first
  *   health tick that started after the first refusal while the condition
  *   still holds; with it off, at the first retry at least the floor after
- *   the first refusal, a retry skipped for a launch in flight included; once
+ *   the first refusal, a retry skipped for a launch in flight or a running
+ *   live-row sequence (b.jg5 SRJ-706) included; once
  *   per episode, and never for `ErrTmuxKillFailed`.
  * - The alert (SRJ-309): once the condition has lasted strictly longer than
  *   the threshold in effect, once per episode, with no onset needed; retries
@@ -177,9 +178,12 @@ import {
   errTmuxSendKeys,
   errTmuxUnresponsive,
   errTmuxUnresponsiveStillStopping,
+  cannedFindMissing,
+  holdFindMissing,
   holdSpawns,
   unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
+import { LIVE_ROW_SEQUENCE_ENTRY_GET } from '../src/live-row-sequence.ts'
 import type { AdConfigTables } from './test-helpers/ad-settings.ts'
 import { APPROVER_VERB_CALLS, conflictForPersona, conflictNoticeForPersona } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
@@ -200,8 +204,10 @@ import {
   killFailureNotice,
   makeRecoveryHarness,
   ordinaryAlertContent,
+  ownRowsLiveThenMissing,
   personaOf,
   retryNow,
+  startSequenceHeldAtRun,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoveryNotice,
@@ -1287,6 +1293,36 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
     await launch
     expect(h.tmuxUnresponsive.firstRefusalAt(p)).toBe(at)
     expectPosts(h, [onset(p)])
+    expectNeverStarted(h, b)
+  })
+
+  // E10's hatch note carried by E21 (SRJ-308, hatch A2): the retry skipped
+  // because P's live-row sequence is in flight (it blocks a retry, SRJ-303,
+  // SRJ-706) still posts the onset. The sequence enters at its step-2 `get`,
+  // so it makes no kill, and its first run is held.
+  test('a retry skipped because P’s live-row sequence runs, at or past the floor, posts the onset and makes no agent-director call', async () => {
+    const { h, p, b } = build(RETRY_MODE)
+    const at = await refuse(h, p)
+    while (h.controller.view(p)!.dueAt! - at < FLOOR_MS) await nextRetry(h, p)
+    expectPosts(h, [])
+
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const run = await startSequenceHeldAtRun(h, p, hold, { entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+    // The server's retry action, which skips a retry while P's sequence runs.
+    h.setAction(undefined)
+    const calls = h.stub.callCount()
+
+    const firedAt = await nextRetry(h, p)
+
+    expect([h.stub.callCount(), hold.calls.length]).toEqual([calls, 1])
+    expect(h.controller.isArmed(p)).toBe(true)
+    expectPosts(h, [onset(p)])
+    expect(noticeAndEndLines(h, p)).toEqual([conditionOnsetLine(p, 'a retry', firedAt - at)])
+
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+    await h.driveSequence(run.outcome)
     expectNeverStarted(h, b)
   })
 

@@ -40,6 +40,14 @@
  * runs on its own after the launch call, b.jg5 SRJ-401), and
  * `resetStubSpawnPath` leaves no approver running.
  *
+ * Held calls: `holdSpawns` keeps a stub's `spawn` calls open, and
+ * `holdFindMissing` its `find-missing` calls (b.jg5 SRJ-706: a live-row
+ * sequence's run held while the start pass, an apply, a stop or a lost
+ * message is driven), until the test settles each, oldest first: its handle
+ * gives the calls received, the number still held, a promise for a call
+ * entered, release with a result (a placement from `cannedFindMissing`),
+ * failure with an error, and release of every held call for cleanup.
+ *
  * Phase 1 errors and results (b.jg5 SRJ-1303):
  *   - Every error builder uses the 0.10.0 client's own class, except:
  *       - `errGeneric`, which builds the base `AgentDirectorError` for any
@@ -1809,6 +1817,59 @@ export interface SpawnHold {
   fail(id: string, err: Error): void
   /** Resolve every held spawn (teardown). */
   releaseAll(): void
+}
+
+/** Handle returned by `holdFindMissing`. */
+export interface FindMissingHold {
+  /** Every `find-missing` call the stub received since the hold, in call order. */
+  readonly calls: FindMissingParams[]
+  /** How many calls are still held open. */
+  heldCount(): number
+  /** Resolves once `count` calls (1 by default) have been received since the hold (at once if they were). */
+  entered(count?: number): Promise<void>
+  /** Resolve the oldest held call with `result` (a placement built with `cannedFindMissing`). */
+  release(result: FindMissingResult): void
+  /** Reject the oldest held call with `err`. */
+  fail(err: Error): void
+  /** Resolve every held call with the empty result (`cannedFindMissing()`), for cleanup. */
+  releaseAll(): void
+}
+
+/**
+ * Replace `stub.findMissing` so every call stays open until the test
+ * releases or fails it, oldest first. Lets a test keep a `find-missing` run
+ * (a live-row sequence's, b.jg5 SRJ-706) outstanding while it drives other
+ * work, then settle it with a placement. Held calls are recorded in the
+ * handle's `calls`, not in the stub's own call log.
+ */
+export function holdFindMissing(stub: StubClient): FindMissingHold {
+  const calls: FindMissingParams[] = []
+  const held: Array<{ resolve: (r: FindMissingResult) => void; reject: (err: Error) => void }> = []
+  const waiters: Array<{ count: number; resolve: () => void }> = []
+  const take = () => {
+    const oldest = held.shift()
+    if (oldest === undefined) throw new Error('holdFindMissing: no held find-missing call')
+    return oldest
+  }
+  stub.findMissing = (params: FindMissingParams): Promise<FindMissingResult> => {
+    calls.push(params)
+    for (const waiter of waiters.filter((w) => w.count <= calls.length)) {
+      waiters.splice(waiters.indexOf(waiter), 1)
+      waiter.resolve()
+    }
+    return new Promise<FindMissingResult>((resolve, reject) => { held.push({ resolve, reject }) })
+  }
+  return {
+    calls,
+    heldCount: () => held.length,
+    entered: (count = 1) =>
+      calls.length >= count ? Promise.resolve() : new Promise<void>((resolve) => { waiters.push({ count, resolve }) }),
+    release: (result) => take().resolve(result),
+    fail: (err) => take().reject(err),
+    releaseAll: () => {
+      for (const h of held.splice(0)) h.resolve(cannedFindMissing())
+    },
+  }
 }
 
 /**

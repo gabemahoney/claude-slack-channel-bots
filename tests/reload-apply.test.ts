@@ -90,7 +90,8 @@ import type { InPlaceSetting } from '../src/reload-plan.ts'
 import { RELOAD_APPLIED, RELOAD_NOOP } from '../src/reload.ts'
 import { personaConfigDirLabelValue } from '../src/session-manager.ts'
 import { REFUSED_OPERATION_PLAIN_SPAWN } from '../src/conflict-latch.ts'
-import { cannedErr, errTemplateMalformed, stubCallCount, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
+import { cannedErr, cannedFindMissing, errTemplateMalformed, stubCallCount, type FindMissingHold, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
+import { LIVE_ROW_OUTCOME_NOT_LAUNCHED, LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_TEARDOWN, type LiveRowSequenceOutcome } from '../src/live-row-sequence.ts'
 import { CONFLICT_CASE_ROWS } from './test-helpers/conflict-cases.ts'
 import {
   APP_TOKEN_PREFIX,
@@ -508,15 +509,18 @@ describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 
 
     expect(run.since(cp).lifecycle).toEqual([{ op: 'teardown', key: bravoKey, via: 'apply' }])
     const composition = run.composition!
-    // The teardown reaches the approver stop first (b.jg5 SRJ-404, SRJ-715): recorded at its submission and again
-    // as its turn's first step, before every other teardown step for bravo, the wait for its launch in flight included.
+    // The teardown reaches the approver stop first and the live-row sequence stop right after it (b.jg5 SRJ-404,
+    // SRJ-706, SRJ-715): both recorded at its submission and again as its turn's first two steps, before every other
+    // teardown step for bravo, the wait for its launch in flight included.
     const bravoTeardownCalls = composition.calls.slice(callsAtCp).filter(([, key]) => key === bravoKey)
-    expect(bravoTeardownCalls.slice(0, 2)).toEqual([
+    expect(bravoTeardownCalls.slice(0, 4)).toEqual([
       ['stopApprover', bravoKey],
+      ['stopLiveRowSequence', bravoKey],
       ['stopApprover', bravoKey],
+      ['stopLiveRowSequence', bravoKey],
     ])
-    expect(bravoTeardownCalls.slice(2).filter(([member]) => member === 'stopApprover')).toEqual([])
-    expect(bravoTeardownCalls.slice(2).map(([member]) => member)).toContain('whenLaunchSettled')
+    expect(bravoTeardownCalls.slice(4).filter(([member]) => member === 'stopApprover' || member === 'stopLiveRowSequence')).toEqual([])
+    expect(bravoTeardownCalls.slice(4).map(([member]) => member)).toContain('whenLaunchSettled')
     expect(composition.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`, `delete ${personaInstanceId(bravoKey)}`])
     expect(stubCallCount(composition.agentDirector)).toBe(2)
     // Every dependency call is for bravo, except the Stop-hook pass, which re-evaluates against the personas still applied.
@@ -2654,6 +2658,96 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
       expectNoPostNoLeak(run)
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-706 (AC 61): an apply is never held up by a live-row sequence,
+// and a teardown stops the persona's sequence before its first
+// agent-director call
+//
+// On a realLaunch run, whose registry is built and installed as main()
+// builds and installs it, with bravo's sequence started through the session
+// manager's start entry and its first run held (`holdFindMissing` on the
+// composition's stub): bravo's row is live, so the sequence kills it, reads
+// it (`ended`) and makes one run. The teardown waits for the sequence's run
+// in flight (as it waits for a launch in flight), so its kill comes only
+// after the run is released.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-706: an apply returns while a live-row sequence runs, and a teardown stops the persona\'s sequence first (real launch)', () => {
+  /** bravo's sequence, started and held at its first run. */
+  async function heldSequence(run: ReloadRun): Promise<{ hold: FindMissingHold; outcome: Promise<LiveRowSequenceOutcome> }> {
+    const hold = run.composition!.holdFindMissing()
+    const { outcome } = run.startSequence('bravo')
+    await hold.entered()
+    expect(run.sequenceRunning('bravo')).toBe(true)
+    return { hold, outcome }
+  }
+
+  /** A run's `find-missing` result that places bravo's row in `ids`: were the sequence not stopped, it would read the row and go on to its launch. */
+  const bravoMarkedMissing = () => cannedFindMissing({ rows: { [personaInstanceId(h.key('bravo'))]: 'ids' } })
+
+  test('a confirmed apply that adds charlie resolves while bravo\'s run is still held, and charlie comes up and launches; bravo\'s sequence runs on', async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
+    const [alpha, bravo] = personas
+    const charlieKey = h.key('charlie')
+    const charlie = h.persona('charlie')
+    h.materialize(charlie)
+    const { hold, outcome } = await heldSequence(run)
+    const cp = run.checkpoint()
+
+    await applyConfig(run, [alpha!, bravo!, charlie])
+
+    expect([hold.heldCount(), run.sequenceRunning('bravo')]).toEqual([1, true])
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'bring-up', key: charlieKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: charlieKey, via: 'apply', action: 'spawned' },
+    ])
+    expect(h.rowOf('charlie')?.state).toBe('waiting')
+
+    hold.release(bravoMarkedMissing())
+    expect(await outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED })
+    expect(run.sequenceRunning('bravo')).toBe(false)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<[string, (alpha: PersonaInput, bravo: PersonaInput) => PersonaInput[], string[]]>([
+    ['a confirmed removal of bravo', (alpha) => [alpha], ['kill ok', 'delete ok']],
+    ['a destructive modify of bravo (its working directory moved)', (alpha, bravo) => [alpha, movedDirectory(bravo)], ['kill ok', 'delete ok', 'spawn ok']],
+  ])('%s while bravo\'s run is held: the teardown stops the sequence (at its submission and as its turn\'s step) before its first agent-director call, waits for the held run, and once it is released the sequence makes no further call; the apply then resolves', async (_label, next, instanceCalls) => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const { hold, outcome } = await heldSequence(run)
+    const composition = run.composition!
+    const adFrom = composition.agentDirectorCalls.length
+    const callsFrom = composition.calls.length
+    const bravoInstanceCalls = composition.instanceCallsOf('bravo').length
+    const bravoCalls = () => composition.calls.slice(callsFrom).filter(([, key]) => key === bravoKey).map(([member]) => member)
+
+    const { applying } = await confirmConfig(run, next(alpha!, bravo!))
+    await until(() => bravoCalls().filter((member) => member === 'stopLiveRowSequence').length === 2)
+    await turns()
+
+    // The sequence stop right after the approver stop, at the submission and as the turn's step; the teardown then
+    // waits on the sequence's run in flight: no kill and no agent-director call yet.
+    const members = bravoCalls()
+    expect(members.slice(0, 2)).toEqual(['stopApprover', 'stopLiveRowSequence'])
+    expect(members.slice(members.lastIndexOf('stopApprover'))).toEqual(['stopApprover', 'stopLiveRowSequence'])
+    expect(members).not.toContain('killInstance')
+    expect(adCallsSince(run, adFrom)).toEqual([])
+    hold.release(bravoMarkedMissing())
+    await applying
+
+    expect(await outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_TEARDOWN })
+    // The teardown's kill and delete (and the new half's spawn), and no get, run or launch from the sequence.
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(instanceCalls)
+    expect(adCallsSince(run, adFrom).filter((call) => call.verb === 'get' || call.verb === 'findMissing' || call.verb === 'resume')).toEqual([])
+    expect(bravoCalls().indexOf('killInstance')).toBeGreaterThan(bravoCalls().lastIndexOf('stopLiveRowSequence'))
+    expect(run.sequenceRunning('bravo')).toBe(false)
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    expectNoPostNoLeak(run)
+  })
 })
 
 // ---------------------------------------------------------------------------

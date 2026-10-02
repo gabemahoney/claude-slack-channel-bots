@@ -80,6 +80,7 @@ import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './per
 import {
   APPROVER_STOP_TEARDOWN,
   applyOwnRowStatusStep,
+  buildLiveRowSequenceDeps,
   cancelWorkingRowWait,
   checkLaunchConfigDir,
   checkPromptRowDeferral,
@@ -100,6 +101,7 @@ import {
   holdLaunchIfConfigDirUnresolvable,
   isDialogApproverRunning,
   isLaunchInFlight,
+  isLiveRowSequenceRunning,
   KILL_CONTEXT_TEARDOWN,
   killPersonaInstance,
   latchOnRestartKillOutcome,
@@ -120,6 +122,7 @@ import {
   setConfigDirUnresolvableHook,
   setConfiguredPersonaQuery,
   setConflictLatch,
+  setLiveRowSequenceRegistry,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setSessionNotifier,
@@ -127,6 +130,7 @@ import {
   startupSessionManager,
   stopAllDialogApprovers,
   stopDialogApprover,
+  stopLiveRowSequence,
   sweepDeadTmuxChannelWithCause,
   WAITING_ROW_PANE_ABSENT,
   WAITING_ROW_PANE_GONE,
@@ -173,7 +177,12 @@ import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createSlowRecoveryTracker } from './slow-recovery.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
-import { createPersonaConnectionManager, type PersonaConnectionManager } from './persona-connections.ts'
+import {
+  createPersonaConnectionManager,
+  SYSTEM_PERSONA_CONNECTION_CLOCK,
+  type PersonaConnectionManager,
+} from './persona-connections.ts'
+import { createLiveRowSequenceRegistry, LIVE_ROW_STOP_TEARDOWN, type LiveRowSequenceRegistry } from './live-row-sequence.ts'
 import { resolveSlackApiUrlOverride } from './persona-slack-clients.ts'
 import { createUnhandledRejectionHandler, describeThrownValue } from './persona-connection-errors.ts'
 import { createPersonaEventRouter } from './persona-event-router.ts'
@@ -245,6 +254,7 @@ import {
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
+  runDetachedRecoveryAttempt,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
@@ -432,9 +442,17 @@ let personaKillFailureAlerts: Pick<KillFailureAlerts, 'isOpen'> | undefined
 let personaLatch: Pick<ConflictLatch, 'isLatched'> | undefined
 
 /**
+ * The server's one live-row sequence registry (b.jg5 SRJ-706), built and
+ * installed in the session manager in main() before the start pass; closed
+ * by shutdown(). Undefined before then, when no sequence runs.
+ */
+let liveRowSequences: LiveRowSequenceRegistry | undefined
+
+/**
  * b.jg5 SRJ-303: true while work in flight for the persona blocks a retry of
- * its retry timer: today a launch call (`isLaunchInFlight`). E21 and E27
- * extend it (a live-row sequence, an old-life wait step). A running dialog
+ * its retry timer: a launch call (`isLaunchInFlight`) or a running live-row
+ * sequence (`isLiveRowSequenceRunning`, b.jg5 SRJ-706; false before main()
+ * installs the registry). A running dialog
  * approver is not here: it runs after its launch call has returned and
  * never blocks a retry (SRJ-401). Given to the retry controller
  * (`isInFlight`). Every member here is also in flight for the persona
@@ -442,7 +460,7 @@ let personaLatch: Pick<ConflictLatch, 'isLatched'> | undefined
  * over work that holds back the retry timer.
  */
 function isPersonaRetryBlocked(key: string): boolean {
-  return isLaunchInFlight(key)
+  return isLaunchInFlight(key) || isLiveRowSequenceRunning(key)
 }
 
 /**
@@ -1033,15 +1051,22 @@ const personaRouting = createPersonaRouting({
   // launch-or-approver member: a launch call, or the dialog approver that
   // runs after it returned, in its own registry (SRJ-401). This is not the
   // "in flight for P" predicate below: a live-row sequence or an old-life
-  // wait step reports `restarting` instead.
+  // wait step reports `restarting` instead (the sequence/wait member below).
   isLatched: (key) => personaLatch?.isLatched(key) ?? false,
   isTmuxUnresponsive: (key) => personaTmuxUnresponsive?.holds(key) ?? false,
   isLaunchOrApproverRunning: (key) => isLaunchInFlight(key) || isDialogApproverRunning(key),
   // b.jg5 SRJ-1011: the lost-message read gate's "in flight for P" is the
-  // health tick's (isPersonaWorkInFlight: a running approver included), so
-  // the in-flight work later Epics add (E21's and E27's sequences and wait
-  // steps) reaches the gate through it.
+  // health tick's (isPersonaWorkInFlight: a running approver and a running
+  // live-row sequence included), so in-flight work reaches the gate through it.
   isWorkInFlight: isPersonaWorkInFlight,
+  // b.jg5 SRJ-706, SRJ-1011: while P's live-row sequence runs, a lost message
+  // reports `restarting`, asked after states 1 to 5 and before
+  // `session-starting`, even while its row reads `pending`, with no status
+  // read and no human-triggered restart. Resolved at call time through the
+  // session manager's running query, which answers false before main()
+  // installs the registry. The registry is keyed by instance id, so an
+  // old-life wait's steps registered there are covered by the same query.
+  isSequenceOrWaitRunning: (key) => isLiveRowSequenceRunning(key),
   // b.jg5 SRJ-115, SRJ-1011: the lost-message read is the liveness adapter's
   // one `status` for P (no new getClient() site), read at call time; before
   // main() builds the adapter no read is made and the answer is `unknown`,
@@ -1083,8 +1108,7 @@ const personaRouting = createPersonaRouting({
   // alerts no episode is open. The survivor version opens no episode, so it
   // never reports this state. Only an open episode reports it.
   isKillFailed: (key) => personaKillFailureAlerts?.isOpen(key) === true,
-  // Left unbound until their Epics bind them, so they answer false:
-  // isHeldOnInvalidFlags (E23) and isSequenceOrWaitRunning (E21, E27).
+  // Left unbound, so it answers false: isHeldOnInvalidFlags.
 })
 
 // Permission Block Kit builders moved to src/permission-poller.ts
@@ -1193,8 +1217,9 @@ let cronScheduler: CronScheduler | null = null
  * timer the server runs (the permission poller, the health check, the
  * runtime version re-check, the reload detection tick, the cron scheduler,
  * restart, UNAVAILABLE retry, bring-up and destination-hold timers,
- * keep-alives), stops every dialog approver (b.jg5 SRJ-404; none makes a
- * further call, and none starts after it), forgets every persona's notice
+ * keep-alives), stops every live-row sequence (b.jg5 SRJ-706; none makes a
+ * further call, and none starts after it) and every dialog approver (b.jg5
+ * SRJ-404; likewise), forgets every persona's notice
  * episodes, closes HTTP,
  * the MCP transports and the persona Slack connections, releases the
  * agent-director client handle, removes the PID file and exits with
@@ -1220,6 +1245,14 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
     cronScheduler.stop()
     cronScheduler = null
   }
+  // b.jg5 SRJ-706: every running live-row sequence stops (its stop signal set
+  // now, so none makes a call after the one in progress returns, and none
+  // holds a timer), and no sequence starts after this; a call in progress is
+  // not waited for, as for the dialog approvers below. Before the retry
+  // controller closes and before the client is released.
+  void liveRowSequences?.close().catch((err: unknown) => {
+    console.error(`[slack] stopping the live-row sequences on shutdown failed: ${describeThrownValue(err)}`)
+  })
   cancelAllRestartTimers()
   // b.jg5 SRJ-305: every persona's UNAVAILABLE retry timer stops, and none is
   // armed again (a launch still in flight that meets UNAVAILABLE arms
@@ -3031,6 +3064,30 @@ export async function main(): Promise<void> {
   })
   unavailableRetry = retryTimers
 
+  // b.jg5 SRJ-705, SRJ-706: the one live-row sequence registry, on the system
+  // clock, its sequences composed by the session manager's one builder over
+  // the kill-failure alerts installed above (the builder's default), the
+  // retry controller's arm and the applied configuration read at each call;
+  // each sequence runs in its own recovery
+  // attempt for its persona, detached from its starter's. Installed in the
+  // session manager before the start pass and before any path that can start
+  // a sequence; the latch installed above gets its set observer here, so a
+  // latch of a persona stops its sequence. Its running query is in "blocks a
+  // retry" (and so in "in flight for P"), the lost-message routing's
+  // sequence/wait member and the restart work's gate; a teardown stops a
+  // persona's sequence right after its approver, and shutdown() closes it.
+  const sequences = createLiveRowSequenceRegistry({
+    deps: buildLiveRowSequenceDeps({
+      retryArm: retryTimers,
+      clock: SYSTEM_PERSONA_CONNECTION_CLOCK,
+      log: (line) => console.error(line),
+      appliedConfig: () => personaConfig,
+    }),
+    runAttempt: runDetachedRecoveryAttempt,
+  })
+  liveRowSequences = sequences
+  setLiveRowSequenceRegistry(sequences)
+
   // b.jg5 SRJ-307, SRJ-310: the per-persona tmux-unresponsive condition,
   // held in the notice episodes, apart from the outage flags. The outage
   // state's wrappers start and end it (installed as its condition sink
@@ -3172,6 +3229,10 @@ export async function main(): Promise<void> {
     // b.jg5 SRJ-404, SRJ-715: a teardown stops the key's dialog approver
     // first, and the one its launch in flight would start.
     stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_TEARDOWN),
+    // b.jg5 SRJ-706, SRJ-715: right after the approver, the key's live-row
+    // sequence, before the wait for its launch in flight; the teardown waits
+    // for the sequence's call in flight to return.
+    stopLiveRowSequence: (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN),
     // b.f2b: a teardown cancels a launch's wait for a `working` row rather
     // than wait it out (up to 10 min).
     cancelLaunchWait: cancelWorkingRowWait,
@@ -3470,6 +3531,10 @@ export async function main(): Promise<void> {
     // b.jg5 SRJ-502: a latched persona's restart work (a fired timer, a
     // retry, a human-triggered restart) makes no agent-director call.
     isLatched: (key) => conflictLatch.isLatched(key),
+    // b.jg5 SRJ-706, SRJ-303: while the persona's live-row sequence runs, its
+    // restart work (a fired timer, a retry, a human-triggered restart) makes
+    // no agent-director call and answers sequence-waiting.
+    isLiveRowSequenceRunning,
     // b.jg5 SRJ-610: each run's readings and verdicts feed the slow-recovery
     // count; nothing in the run changes because of it.
     slowRecovery,

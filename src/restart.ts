@@ -78,6 +78,11 @@
  * during those awaits.
  * A launch that answers `'skipped'` for a persona that latched at it answers
  * the same. A latched query that throws counts as latched (fail safe).
+ * Right after that first latched gate comes the live-row sequence gate
+ * (b.jg5 SRJ-706, SRJ-303; the optional `RestartDeps.isLiveRowSequenceRunning`):
+ * while P's sequence runs, a fired restart timer, the retry entry and a
+ * human-triggered restart answer `RESTART_OUTCOME_SEQUENCE_WAITING` with no
+ * agent-director call and nothing recorded, which a retry takes as a refusal.
  * Isolated from server.ts side effects — injectable deps make it testable.
  *
  * SPDX-License-Identifier: MIT
@@ -225,6 +230,14 @@ export const RESTART_OUTCOME_LIVENESS_UNKNOWN = 'liveness-unknown'
  * threw answers this too (fail safe). The retry timer stops on it.
  */
 export const RESTART_OUTCOME_LATCHED = 'latched'
+/**
+ * A live-row sequence runs for the persona (b.jg5 SRJ-706, SRJ-303,
+ * `RestartDeps.isLiveRowSequenceRunning`): the work's gate right after the
+ * latched gate found it so, so nothing was probed, reconnected, killed or
+ * launched, nothing was recorded and nothing counts toward the cap. A
+ * refusal at a retry (SRJ-302): the retry timer re-arms at the doubled wait.
+ */
+export const RESTART_OUTCOME_SEQUENCE_WAITING = 'sequence-waiting'
 /** Retry entry only: a launch was in flight for the persona, so no agent-director call was made. */
 export const RESTART_OUTCOME_IN_FLIGHT = 'in-flight'
 /** Retry entry only: `initRestart` has not run, so nothing was done. */
@@ -245,6 +258,7 @@ export type RestartWorkOutcome =
   | typeof RESTART_OUTCOME_LAUNCH_SKIPPED
   | typeof RESTART_OUTCOME_LIVENESS_UNKNOWN
   | typeof RESTART_OUTCOME_LATCHED
+  | typeof RESTART_OUTCOME_SEQUENCE_WAITING
 
 /** What the retry entry (`runRestartRetry`) answers: the work's outcome, or why it did not run. */
 export type RestartRetryOutcome =
@@ -418,6 +432,22 @@ export interface RestartDeps {
    * what it threw); any other answer is not. Absent: no persona is latched.
    */
   isLatched?(key: string): boolean
+  /**
+   * Whether a live-row sequence runs for the persona (b.jg5 SRJ-706, SRJ-303;
+   * production: the session manager's running query,
+   * `isLiveRowSequenceRunning`). Asked right after the first latched gate of
+   * the serialized work, before the shutdown and not-up checks and the
+   * liveness read, by every path that reaches it (a fired restart timer, the
+   * retry entry, a human-triggered restart): while it answers true the work
+   * makes no agent-director call, records no success or failure, adds nothing
+   * toward the cap and answers `RESTART_OUTCOME_SEQUENCE_WAITING`. It is the
+   * backstop for restart work queued before the sequence started; the retry
+   * entry's own in-flight check (the server's "blocks a retry", which counts a
+   * running sequence) answers first there. An answer of exactly `true` is
+   * running, and so is a query that throws (fail safe, logged in the one
+   * line); any other answer is not. Absent: no sequence runs.
+   */
+  isLiveRowSequenceRunning?(key: string): boolean
   /**
    * The slow-recovery observer (b.jg5 SRJ-610, SRJ-1016; production: the
    * server's slow-recovery tracker, `src/slow-recovery.ts`). It is told what
@@ -820,6 +850,9 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
   // instance is never probed, reconnected, killed or launched here. The steps
   // ask again after their awaits, before the instance is touched.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+  // b.jg5 SRJ-706, SRJ-303: while P's live-row sequence runs, no other launch
+  // path for P starts: no liveness read, kill or launch, nothing recorded.
+  if (skipIfSequenceRunning(d, key)) return RESTART_OUTCOME_SEQUENCE_WAITING
   return runInAttempt(key, 'recovery', () => restartWorkSteps(d, key, cwd, sessionId))
 }
 
@@ -1400,6 +1433,27 @@ function skipIfLatched(d: RestartDeps, key: string): boolean {
   if (!reading.latched) return false
   console.error(
     `[slack] Skipping restart for persona=${key} — the persona is latched${latchedFailure(reading)}; no agent-director call, nothing recorded (b.jg5 SRJ-502)`,
+  )
+  return true
+}
+
+/**
+ * The live-row sequence gate (b.jg5 SRJ-706, SRJ-303): when a live-row
+ * sequence runs for persona `key`, or the running query throws (counted as
+ * running: fail safe), log one line saying the restart work makes no attempt
+ * and return true, so the caller returns `RESTART_OUTCOME_SEQUENCE_WAITING`
+ * before any agent-director call. Records neither a success nor a failure.
+ */
+function skipIfSequenceRunning(d: RestartDeps, key: string): boolean {
+  if (d.isLiveRowSequenceRunning === undefined) return false
+  let failure = ''
+  try {
+    if (d.isLiveRowSequenceRunning(key) !== true) return false
+  } catch (err) {
+    failure = ` (the running query failed: ${describeThrownValue(err)} — taken as running)`
+  }
+  console.error(
+    `[slack] Skipping restart for persona=${key} — its live-row sequence runs${failure}; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)`,
   )
   return true
 }

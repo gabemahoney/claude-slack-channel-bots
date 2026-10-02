@@ -84,7 +84,12 @@
  * try, or the ladder's tries ending in `ErrTmuxUnresponsive` after a
  * survivor-naming failure) reports `kill-failed`; after the survivor version,
  * or once the episode ended, it never does; a CONFLICT latch gives
- * `held-for-human` first.
+ * `held-for-human` first. A message lost while P's live-row sequence runs
+ * (b.jg5 SRJ-706, the driver's sequence/wait input and read gate bound to
+ * the session manager's running query) reports `restarting` there with no
+ * read and no restart, P's row `pending` and the sequence's own step-6
+ * launch included; a latch beats it, and once the sequence has ended the
+ * one read is made again.
  *
  * main() in src/server.ts cannot run in a test (startup gate, real port, real
  * Slack connections), so describe (7) audits its source for the wiring only:
@@ -111,12 +116,16 @@ import type { Persona } from '../src/config.ts'
 import type { LostMessageState } from '../src/lost-message.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
+  LIVENESS_DEAD_ROW_ENDED,
+  LIVENESS_DEAD_ROW_MISSING,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_LIVE,
   LIVENESS_READING_PENDING,
   LIVENESS_READING_UNKNOWN,
 } from '../src/liveness-reading.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
+import { adGraceMsInEffect } from '../src/ad-settings.ts'
+import { parseLaunchStart } from '../src/pending-row.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
@@ -158,6 +167,8 @@ import { indicesOf, stripComments } from './test-helpers/source-audit.ts'
 import { CONFLICT_CASE_ROWS, conflictForPersona } from './test-helpers/conflict-cases.ts'
 import {
   cannedErr,
+  cannedFindMissing,
+  cannedGetResult,
   cannedOk,
   cannedStatusResult,
   errConfigMalformed,
@@ -168,8 +179,12 @@ import {
   errTmuxNotAvailable,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
+  holdFindMissing,
   holdSpawns,
+  SAMPLE_LAUNCH_START_DEFAULT,
+  SAMPLE_LAUNCH_START_NONE,
   unavailableForms,
+  type FindMissingHold,
 } from './test-helpers/agent-director-stub.ts'
 import {
   makeRestartDeps,
@@ -194,16 +209,20 @@ import {
   DIALOG_POLL_INTERVAL_MS,
   TRUST_DIALOG_NEEDLE,
   isLaunchInFlight,
+  readPersonaRowState,
   stopDialogApprover,
   type ApproverStopReason,
 } from '../src/session-manager.ts'
 import {
   collided,
   expectLostMessageReports,
+  holdSequenceReuse,
   makeRecoveryHarness,
+  ownRowsLiveThenMissing,
   personaOf,
   retryNow,
   rowReadsUntilSpawn,
+  startSequenceHeldAtRun,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoveryRowState,
@@ -1467,6 +1486,95 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
     expect(h.killFailureOpen(key)).toBe(false)
     expect(h.episodeNotices).toHaveLength(1)
     await expectLostMessageReports(h, key, 'auto-restart-disabled')
+  })
+})
+
+// ===========================================================================
+// b.jg5 SRJ-706, SRJ-1011 (E21 T2): a message lost while P's live-row
+// sequence runs reports `restarting`
+//
+// Through the recovery harness's lost-message driver, whose sequence/wait
+// input is the session manager's running query and whose read gate's "in
+// flight for P" counts the sequence, both as main() binds them, with P's
+// sequence started through the registry and its first run held (the stub's
+// `holdFindMissing`). Restarting is decided with no `status` read and no
+// human-triggered restart, even while P's row reads `pending` and during the
+// sequence's own step-6 launch; a latch beats it; once the sequence has
+// ended the message is decided as before, with the one read.
+// ===========================================================================
+
+describe('b.jg5 SRJ-706, SRJ-1011: a message lost while P\'s live-row sequence runs reports restarting, with no status read and no restart, through the real routing', () => {
+  /** Release P's held run with its row placed in `ids` and drive the sequence to its end (its next `get` reads the row missing). */
+  async function endHeldSequence(h: RecoveryHarness, key: string, hold: FindMissingHold, outcome: Promise<unknown>): Promise<void> {
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(key)]: 'ids' } }))
+    await h.driveSequence(outcome)
+    expect(h.sequenceRunning(key)).toBe(false)
+  }
+
+  test('restarting with no read while P\'s first run is held; Q\'s message beside it is decided as before; once P\'s sequence has ended, P\'s next message makes its one read again', async () => {
+    const h = makeRecovery()
+    const [key, other] = h.keys as [string, string]
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const run = await startSequenceHeldAtRun(h, key, hold)
+
+    await expectLostMessageReports(h, key, 'restarting', { calls: {} })
+    await expectLostMessageReports(h, other, 'auto-restart-disabled')
+
+    await endHeldSequence(h, key, hold, run.outcome)
+    await expectLostMessageReports(h, key, 'auto-restart-disabled')
+    expect(isRestartPendingOrActive(key)).toBe(false)
+  })
+
+  test('the row the sequence last read `pending`, and the stub\'s `status` answering `pending`: restarting, never session starting, with no read', async () => {
+    const h = makeRecovery()
+    const [key] = h.keys as [string]
+    await h.clock.advanceTo(parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)! + adGraceMsInEffect())
+    const persona = personaOf(h, key)
+    h.script({
+      statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }),
+      getQueue: [
+        cannedOk(cannedGetResult({ state: AGENT_DIRECTOR_PENDING_STATE }, persona, h.home)),
+        cannedOk(cannedGetResult({ state: LIVENESS_DEAD_ROW_MISSING }, persona, h.home)),
+      ],
+    })
+    const hold = holdFindMissing(h.stub.client)
+    const run = await startSequenceHeldAtRun(h, key, hold, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })
+
+    await expectLostMessageReports(h, key, 'restarting', { calls: {} })
+
+    await endHeldSequence(h, key, hold, run.outcome)
+  })
+
+  test('during the sequence\'s own step-6 launch (a launch in flight for P): restarting, never session starting, with no read', async () => {
+    const h = makeRecovery()
+    const [key] = h.keys as [string]
+    h.script({ getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, personaOf(h, key), h.home) })
+    const reuse = holdSequenceReuse(h)
+    const run = h.startSequence(key, { lastReadState: cannedStatusResult().state })
+    await h.driveSequence(reuse.entered)
+    expect(isLaunchInFlight(key)).toBe(true)
+
+    await expectLostMessageReports(h, key, 'restarting', { calls: {} })
+
+    reuse.release()
+    await h.driveSequence(run.outcome)
+  })
+
+  test('P latched while its stopped sequence\'s run is still held: held for a human beats restarting', async () => {
+    const h = makeRecovery()
+    const [key] = h.keys as [string]
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const run = await startSequenceHeldAtRun(h, key, hold)
+    // Another path's own-row read latches P (SRJ-513); the sequence still runs until its run returns.
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }) })
+    await readPersonaRowState(key)
+    expect([h.latch.isLatched(key), h.sequenceRunning(key)]).toEqual([true, true])
+
+    await expectLostMessageReports(h, key, 'held-for-human')
+
+    await endHeldSequence(h, key, hold, run.outcome)
   })
 })
 

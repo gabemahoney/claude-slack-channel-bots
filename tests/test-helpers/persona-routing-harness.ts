@@ -92,20 +92,26 @@
  *     real launch started runs on after its launch call returned; the
  *     harness's own launches are recorded fakes and start none); the
  *     `isLaunchOrApproverRunning` option replaces it;
- *   - held on `ErrInvalidFlags` (`cannot-launch`), kill failed
- *     (`kill-failed`) and a live-row sequence or old-life wait step running
- *     (`restarting`): the key sets `h.heldOnInvalidFlags`, `h.killFailed`
- *     and `h.sequenceOrWaitRunning` (seeded by the options of the same names,
- *     with persona names), which production leaves unbound;
+ *   - held on `ErrInvalidFlags` (`cannot-launch`) and kill failed
+ *     (`kill-failed`): the key sets `h.heldOnInvalidFlags` and `h.killFailed`
+ *     (seeded by the options of the same names, with persona names);
+ *   - a live-row sequence or old-life wait step running (`restarting`): as
+ *     `main()` binds it (b.jg5 SRJ-706), the session manager's
+ *     `isLiveRowSequenceRunning` for the key, read at call time (false while
+ *     no sequence registry is installed, as here unless a case installs
+ *     one), or the key in `h.sequenceOrWaitRunning` (seeded by the option of
+ *     the same name, with persona names), a case's own arrangement;
  *   - in flight for P (the read gate's `isWorkInFlight`): as `main()`
  *     composes "in flight for P" (`isPersonaWorkInFlight`) from "blocks a
  *     retry" (`isPersonaRetryBlocked`) and a running dialog approver: one of
- *     the harness's own restart launches in flight (`h.isLaunchInFlight`) or
- *     the key in `h.workInFlight` (seeded by `workInFlight`, with persona
- *     names), work in flight that is not a launch (a later Epic's sequence or
- *     wait step), or the session manager's `isDialogApproverRunning`
- *     answering true for the key (b.jg5 SRJ-401). With no approver running, a
- *     harness built with no option behaves as before;
+ *     the harness's own restart launches in flight (`h.isLaunchInFlight`),
+ *     the session manager's `isLiveRowSequenceRunning` answering true for the
+ *     key (b.jg5 SRJ-706), the key in `h.workInFlight` (seeded by
+ *     `workInFlight`, with persona names), work in flight that is not a
+ *     launch (a later Epic's wait step), or the session manager's
+ *     `isDialogApproverRunning` answering true for the key (b.jg5 SRJ-401).
+ *     With no approver and no sequence running, a harness built with no
+ *     option behaves as before;
  *   - the one lost-message row read (`readRowLiveness`), only with the
  *     `rowRead` option; without it the routing gets no read and makes none.
  *     Each persona's answer is scripted in `h.rowReadScripts` (by key, read at
@@ -181,7 +187,7 @@ import {
   type TmuxUnresponsiveCondition,
 } from '../../src/persona-episodes.ts'
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
-import { isDialogApproverRunning } from '../../src/session-manager.ts'
+import { isDialogApproverRunning, isLiveRowSequenceRunning } from '../../src/session-manager.ts'
 import { createSessionServer, registerSession, _resetRegistry, type SessionEntry, type SessionToolDeps } from '../../src/registry.ts'
 import {
   initRestart,
@@ -1020,14 +1026,18 @@ export function makeRoutingHarness(
     // As main() binds it (b.jg5 SRJ-401): a launch call, or the dialog
     // approver that runs after it returned.
     isLaunchOrApproverRunning: opts.isLaunchOrApproverRunning ?? ((key) => h.isLaunchInFlight(key) || isDialogApproverRunning(key)),
-    // Unbound in production until their Epics bind them.
+    // A case's own arrangement of each (production leaves the first unbound
+    // and binds the second to its kill-failure alerts' episode).
     isHeldOnInvalidFlags: (key) => h.heldOnInvalidFlags.has(key),
     isKillFailed: (key) => h.killFailed.has(key),
-    isSequenceOrWaitRunning: (key) => h.sequenceOrWaitRunning.has(key),
-    // As main() composes "in flight for P": "blocks a retry" (a launch call,
-    // plus the non-launch work a case marks), or a running dialog approver
-    // (b.jg5 SRJ-401).
-    isWorkInFlight: (key) => h.isLaunchInFlight(key) || h.workInFlight.has(key) || isDialogApproverRunning(key),
+    // As main() binds it (b.jg5 SRJ-706, SRJ-1011): the session manager's
+    // running query, read at call time, or a case's own arrangement.
+    isSequenceOrWaitRunning: (key) => h.sequenceOrWaitRunning.has(key) || isLiveRowSequenceRunning(key),
+    // As main() composes "in flight for P": "blocks a retry" (a launch call
+    // or a running live-row sequence, plus the non-launch work a case marks),
+    // or a running dialog approver (b.jg5 SRJ-401).
+    isWorkInFlight: (key) =>
+      h.isLaunchInFlight(key) || isLiveRowSequenceRunning(key) || h.workInFlight.has(key) || isDialogApproverRunning(key),
     readRowLiveness,
     ...(opts.armRetryTimer === true
       ? {

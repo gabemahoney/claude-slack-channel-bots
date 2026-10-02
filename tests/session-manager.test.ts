@@ -564,10 +564,15 @@ import {
   type UndeliverableCause,
   type WorkingPaneReading,
   type WorkingPaneRun,
+  _resetLiveRowSequenceRegistry,
   _resetSequenceReuseBuilder,
   buildLiveRowSequenceDeps,
+  isLiveRowSequenceRunning,
   launchForLiveRowSequence,
+  LIVE_ROW_START_NOT_INSTALLED,
   setSequenceReuseBuilder,
+  startLiveRowSequence,
+  stopLiveRowSequence,
 } from '../src/session-manager.ts'
 import {
   LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
@@ -576,12 +581,19 @@ import {
   LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED,
   LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER,
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
+  LIVE_ROW_NOT_LAUNCHED_STOPPED,
+  LIVE_ROW_OUTCOME_LAUNCHED,
   LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+  LIVE_ROW_OUTCOME_STOPPED,
   LIVE_ROW_READ_LATCHED,
   LIVE_ROW_READ_ROW,
   LIVE_ROW_RUN_LEFT_LIVE,
   LIVE_ROW_SEQUENCE_LOG_PREFIX,
   LIVE_ROW_SEQUENCE_NO_ROW,
+  LIVE_ROW_STOP_LATCHED,
+  LIVE_ROW_STOP_SHUTDOWN,
+  LIVE_ROW_STOP_TEARDOWN,
+  createLiveRowSequenceStop,
   type LiveRowSequenceLaunchKind,
 } from '../src/live-row-sequence.ts'
 import type { TranscriptReading, TranscriptSnapshot } from '../src/session-transcript.ts'
@@ -677,6 +689,7 @@ import {
   errSystemInstallDisappeared,
   errUnknownErrorName,
   errSendKeysWhileRelayed,
+  holdFindMissing,
   holdSpawns,
   makeStubCallLog,
   makeStubClient,
@@ -838,9 +851,12 @@ import {
   killFailureStoppedSurvivorLine,
   makeRecoveryHarness,
   ordinaryAlertContent,
+  ownRowsLiveThenMissing,
+  personaCallCounts,
   personaOf as harnessPersona,
   recordCallOrder,
   retryNow,
+  startSequenceHeldAtRun,
   startupEntriesOf,
   survivorAlertContent,
   unclassifiedLinePrefix,
@@ -17535,10 +17551,12 @@ interface HeldFindMissing {
 
 /**
  * Replace `client`'s findMissing so its first `count` calls wait until the
- * case settles each (`held[i]`, in call order); every later call answers the
- * empty result at once. `calls()` counts every call.
+ * case settles each (`held[i]`, in call order, in any order the case
+ * chooses; the stub's `holdFindMissing` settles only the oldest first);
+ * every later call answers the empty result at once. `calls()` counts every
+ * call.
  */
-function holdFindMissing(client: Pick<StubClient, 'findMissing'>, count: number): { held: HeldFindMissing[]; calls: () => number } {
+function holdFirstFindMissingCalls(client: Pick<StubClient, 'findMissing'>, count: number): { held: HeldFindMissing[]; calls: () => number } {
   const held: HeldFindMissing[] = []
   let calls = 0
   client.findMissing = async () => {
@@ -17617,7 +17635,7 @@ describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the sess
 
   test('a bypassing run started while an ordinary run is in flight makes its own call; an ordinary caller arriving during it joins it, and the older run settling first leaves the bypassing run in flight: a caller arriving after that joins the bypassing run, not the older result', async () => {
     const stub = installStub({ listResult: { spawns: [prePersonaRow('waiting')] } })
-    const { held, calls } = holdFindMissing(stub, 2)
+    const { held, calls } = holdFirstFindMissingCalls(stub, 2)
 
     const ordinary = sweepDeadTmuxChannel(C, 'dead-session')
     await settleTurns(clock)
@@ -17647,7 +17665,7 @@ describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the sess
 
   test('an older run resolving after a newer one leaves the newer result: each bypassing caller gets its own run\'s result, and a later ordinary caller reuses the newer one', async () => {
     const stub = installStub({ listResult: { spawns: [prePersonaRow('waiting')] } })
-    const { held, calls } = holdFindMissing(stub, 2)
+    const { held, calls } = holdFirstFindMissingCalls(stub, 2)
 
     const older = bypassingFindMissingSweep(C, BYPASS_SITE)
     await settleTurns(clock)
@@ -17932,7 +17950,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     h.script({ statusResult: cannedStatusResult({ state: 'check_permission' }) })
     expect(await checkPromptRowDeferral(p, 'check_permission')).toBe('defer')
     await clock.advance(PROMPT_ROW_SWEEP_AFTER_MS)
-    const { held, calls } = holdFindMissing(h.stub.client, 1)
+    const { held, calls } = holdFirstFindMissingCalls(h.stub.client, 1)
 
     const starter = sweepDeadTmuxChannel(b, 'dead-session')
     await settleTurns(clock)
@@ -21559,6 +21577,48 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706: the sequence-launch entry, the reuse-bu
     await h.runApproverToStop(p)
   })
 
+  // b.jg5 SRJ-706: the sequence's stop signal goes with its launch; once it
+  // is set (P's teardown, shutdown, P's latch) the entry makes no call.
+  test.each([LIVE_ROW_STOP_TEARDOWN, LIVE_ROW_STOP_SHUTDOWN, LIVE_ROW_STOP_LATCHED] as const)(
+    'with a launch for P held in flight, a stop for %s set while the entry waits for it: the entry answers not launched (stopped) at once with one line, no call and nothing registered as in flight',
+    async (reason) => {
+      const { h, p } = srj105Build()
+      const id = personaInstanceId(p)
+      const hold = holdSpawns(h.stub.client)
+      const first = h.launch(p)
+      await hold.entered(id)
+      const order = recordCallOrder(h)
+      const stop = createLiveRowSequenceStop()
+      const entry = launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_RESUME, lastRead: LAST_READ, stop })
+      await h.clock.flush()
+      expect(order).toEqual([])
+
+      stop.stop(reason)
+
+      expect(await entry).toEqual({ key: p, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_STOPPED })
+      expect(h.errors.filter((line) => line.startsWith(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} not launching `))).toEqual([expect.stringContaining(`the sequence was stopped (${reason})`)])
+      // Still held: only the start-pass launch is in flight.
+      expect([order, hold.held(), isLaunchInFlight(p)]).toEqual([[], [id], true])
+      hold.release(id)
+      expect(await first).toEqual({ key: p, action: 'spawned' })
+      expect([h.stub.calls.resumeCalls, h.reuses, isLaunchInFlight(p)]).toEqual([[], [], false])
+      await h.runApproverToStop(p)
+    },
+  )
+
+  test('a stop set before the entry is called: no wait and no call, not launched (stopped)', async () => {
+    const { h, p } = srj105Build()
+    const stop = createLiveRowSequenceStop()
+    stop.stop(LIVE_ROW_STOP_TEARDOWN)
+
+    expect(await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: LAST_READ, stop })).toEqual({
+      key: p,
+      action: LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+      reason: LIVE_ROW_NOT_LAUNCHED_STOPPED,
+    })
+    expect([h.stub.callCount(), h.reuses, isLaunchInFlight(p)]).toEqual([0, [], false])
+  })
+
   test.each([
     ['ErrNoSessionId', () => errNoSessionId()],
     ['ErrJsonlMissing', () => errJsonlMissing()],
@@ -21755,5 +21815,96 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706: the sequence-launch entry, the reuse-bu
     })
     h.remove(p)
     expect(h.sequenceDeps.personaFacts(p, own)).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-706 (E21 T2): the session manager's registry installer, start
+// entry and running query, the sequence-waiting gate at the start pass, and
+// the latch's set observer that stops a latched persona's sequence
+//
+// On the recovery harness, whose registry is built and installed as main()
+// builds and installs it (after the latch), with P's first run held through
+// the stub's `holdFindMissing`. A launch of P and the restart path's
+// `launchSession` answering `sequence-waiting` and the uncounted `'refused'`
+// while P's sequence runs, Q unaffected, are tests/live-row-sequence.test.ts's
+// scheduling cases; the summary line's count for it is E26's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the start pass while a sequence runs, and the latch\'s sequence stop', () => {
+  afterEach(() => {
+    srj105AfterEach()
+  })
+
+  test('the start pass returns while P\'s sequence still runs: P answers sequence-waiting with no spawn, resume, status, get or kill for P from the launch, and B is launched as today; once the sequence has ended, a launch of P runs as today', async () => {
+    const { h, p, b } = srj105Build()
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const run = await startSequenceHeldAtRun(h, p, hold)
+    const pCalls = personaCallCounts(h, p)
+
+    let returned = false
+    const start = startupSessionManager(h.config, { concurrency: 1 }).then((result) => {
+      returned = true
+      return result
+    })
+    // The start pass's own launch does real file I/O: a bounded poll in 1 ms steps.
+    for (let waited = 0; waited < 2000 && !returned; waited++) await new Promise((resolve) => setTimeout(resolve, 1))
+
+    expect([returned, hold.heldCount(), h.sequenceRunning(p)]).toEqual([true, 1, true])
+    const result = await start
+    expect(result.perPersona).toEqual([{ key: p, action: 'sequence-waiting' }, { key: b, action: 'spawned' }])
+    expect([result.succeeded, result.failed]).toEqual([1, 0])
+    expect(personaCallCounts(h, p)).toEqual(pCalls)
+    expect(personaCallCounts(h, b)).toMatchObject({ spawnCalls: 1 })
+    expect(getFailureCount(p)).toBe(0)
+    await h.runApproverToStop(b)
+
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+    await h.driveSequence(run.outcome)
+    expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
+    expect(h.stub.calls.spawnCalls.map((call) => call.claude_instance_id)).toEqual([personaInstanceId(b), personaInstanceId(p)])
+    await h.runApproverToStop(p)
+  })
+
+  test('with no registry installed, the running query answers false, a stop resolves false, a start answers not-installed with one line and no call, and a launch of P is not held', async () => {
+    const { h, p } = srj105Build()
+    _resetLiveRowSequenceRegistry()
+
+    expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: cannedStatusResult().state }))).toBe(LIVE_ROW_START_NOT_INSTALLED)
+    expect([isLiveRowSequenceRunning(p), await stopLiveRowSequence(p, LIVE_ROW_STOP_TEARDOWN)]).toEqual([false, false])
+    await h.clock.flush()
+
+    expect(h.stub.callCount()).toBe(0)
+    expect(h.errors.filter((line) => line.startsWith(LIVE_ROW_SEQUENCE_LOG_PREFIX))).toEqual([expect.stringContaining('no sequence registry is installed')])
+    expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
+    await h.runApproverToStop(p)
+  })
+
+  test.each<[string, (h: RecoveryHarness) => void]>([
+    ['the registry installed after the latch (as main() installs them)', () => {}],
+    ['a latch installed after the registry', () => setConflictLatch(createConflictLatch({ log: () => {} }))],
+  ])('%s: a latch of P stops P\'s running sequence and makes no further call for it; B\'s sequence, not latched, runs on to its launch', async (_label, install) => {
+    const { h, p, b } = srj105Build()
+    install(h)
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const pRun = await startSequenceHeldAtRun(h, p, hold)
+    const bRun = await startSequenceHeldAtRun(h, b, hold)
+    const pending = cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })
+    h.script({ statusFn: (params) => (params.claude_instance_id === personaInstanceId(p) ? pending : cannedStatusResult()) })
+
+    // Another path's own-row read latches P (SRJ-513).
+    await readPersonaRowState(p)
+    const pCalls = personaCallCounts(h, p)
+    expect(h.lines.filter((line) => line.includes('stop asked'))).toEqual([expect.stringContaining(`persona=${p}: stop asked`)])
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(b)]: 'ids' } }))
+
+    const [pOutcome, bOutcome] = await h.driveSequence(Promise.all([pRun.outcome, bRun.outcome]))
+    expect(pOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
+    expect(bOutcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED })
+    expect(personaCallCounts(h, p)).toEqual(pCalls)
+    expect(h.reuses.map((reuse) => reuse.key)).toEqual([b])
   })
 })

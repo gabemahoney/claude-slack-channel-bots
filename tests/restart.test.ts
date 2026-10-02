@@ -31,6 +31,7 @@ import {
   RESTART_OUTCOME_RECONNECTED,
   RESTART_OUTCOME_RECONNECT_DEFERRED,
   RESTART_OUTCOME_REFUSED,
+  RESTART_OUTCOME_SEQUENCE_WAITING,
   RESTART_OUTCOME_SHUTTING_DOWN,
   KILL_SESSION_NOT_KILLED_GUARD,
   RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE,
@@ -6635,6 +6636,173 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
       expect(h.latchEvents).toHaveLength(5)
       expect(h.episodeNotices).toHaveLength(1)
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-706, SRJ-303 — the restart path makes no attempt while P's
+// live-row sequence runs
+//
+// Over the file's deps, with the optional running query
+// (`RestartDeps.isLiveRowSequenceRunning`) answering for P. Right after the
+// first latched gate of the serialized work, a running sequence answers
+// `RESTART_OUTCOME_SEQUENCE_WAITING` for a fired restart timer (a scheduled
+// restart or a human-triggered restart request) and for the retry entry:
+// nothing is probed, reconnected, killed or launched, nothing is recorded
+// and nothing counts toward the cap. The retry entry's own in-flight check
+// and a latched P answer first. Q restarts as before, and fixtures with no
+// query, or one answering false, behave as before. Every line is
+// leak-checked. The retry timer's reading of the outcome is
+// tests/unavailable-retry.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-706, SRJ-303: the restart path makes no attempt while P\'s live-row sequence runs', () => {
+  const P = 'persona_p'
+  const Q = 'persona_q'
+  const CWD: Record<string, string> = { [P]: '/cwd/p', [Q]: '/cwd/q' }
+  /** The restart work's one line for a persona whose sequence runs. */
+  const sequenceSkipLine = (key: string, failure = ''): string =>
+    `[slack] Skipping restart for persona=${key} — its live-row sequence runs${failure}; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)`
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+  /** Each serialized work's outcome, in order. */
+  let outcomes: Array<{ key: string; outcome: unknown }>
+  /** Every ask of the running query, by key. */
+  let asked: string[]
+
+  beforeEach(() => {
+    errLines = []
+    outcomes = []
+    asked = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+    assertNoLeak({ errLines })
+  })
+
+  /**
+   * The file's deps over a dead row, every launch succeeding, the running
+   * query answering `running(key)` (each ask recorded) and a serializer that
+   * records each work's outcome.
+   */
+  function sequenceDeps(running: (key: string) => boolean): ReturnType<typeof makeDeps> {
+    const deps = makeDeps()
+    deps.isLiveRowSequenceRunning = (key) => {
+      asked.push(key)
+      return running(key)
+    }
+    deps.serialize = async <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
+      const outcome = await operation()
+      outcomes.push({ key, outcome })
+      return outcome
+    }
+    return deps
+  }
+
+  /**
+   * P made no agent-director call and recorded nothing: its one failure on
+   * record kept (a success would reset it, a counted failure raise it; one
+   * keeps P's backoff inside WAIT_MS), no cap notice, nothing armed.
+   */
+  function expectNothingForP(deps: ReturnType<typeof makeDeps>): void {
+    expect(deps.isSessionAliveCalls.filter((key) => key === P)).toEqual([])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls.filter((key) => key === P)).toEqual([])
+    expect(deps.launchSessionCalls.filter((call) => call.key === P)).toEqual([])
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+    expect(errLines.filter((line) => line.includes(`persona=${P}`) && line.startsWith('[slack] Skipping restart'))).toEqual([sequenceSkipLine(P)])
+  }
+
+  test.each<[string, { humanTrigger: true } | undefined]>([
+    ['a scheduled restart', undefined],
+    ['a human-triggered restart request', { humanTrigger: true }],
+  ])('%s for P whose timer fires while its sequence runs: the work answers sequence-waiting with no probe, reconnect, kill or launch, nothing recorded and nothing toward the cap; Q beside it restarts as before', async (_entry, opts) => {
+    recordFailure(P)
+    const deps = sequenceDeps((key) => key === P)
+    initRestart(deps)
+
+    scheduleRestart(P, CWD[P]!, undefined, opts)
+    scheduleRestart(Q, CWD[Q]!, undefined, opts)
+    await Bun.sleep(WAIT_MS)
+
+    // Q, with no failure on record, fires first.
+    expect(outcomes).toEqual([{ key: Q, outcome: RESTART_OUTCOME_LAUNCHED }, { key: P, outcome: RESTART_OUTCOME_SEQUENCE_WAITING }])
+    expectNothingForP(deps)
+    expect(deps.killSessionCalls).toEqual([Q])
+    expect(deps.launchSessionCalls.map((call) => call.key)).toEqual([Q])
+    expect(asked).toEqual([Q, P])
+  })
+
+  test.each<[string, boolean, RestartRetryOutcome]>([
+    ['its in-flight predicate answering false: sequence-waiting', false, RESTART_OUTCOME_SEQUENCE_WAITING],
+    ['its in-flight predicate answering true (a running sequence counts there too): that check answers first, in-flight', true, RESTART_OUTCOME_IN_FLIGHT],
+  ])('the retry entry for P while its sequence runs, %s, with no agent-director call and nothing recorded', async (_label, inFlight, outcome) => {
+    recordFailure(P)
+    const deps = sequenceDeps((key) => key === P)
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => inFlight)).toBe(outcome)
+    expect(await runRestartRetry(Q, CWD[Q]!, () => false)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expect(deps.isSessionAliveCalls).toEqual([Q])
+    expect(deps.killSessionCalls).toEqual([Q])
+    expect(deps.launchSessionCalls.map((call) => call.key)).toEqual([Q])
+    expect(getFailureCount(P)).toBe(1)
+    expect([deps.onCapReachedCalls, deps.armRetryTimerCalls]).toEqual([[], []])
+    // The in-flight check answers before the serialized work: the running query is not asked for P then.
+    expect(asked).toEqual(inFlight ? [Q] : [P, Q])
+  })
+
+  test('a latched P whose sequence runs answers latched first: the running query is not asked', async () => {
+    const latch = createConflictLatch({ log: (line) => { errLines.push(line) } })
+    latch.setFromConflict(P, errTmuxSessionConflict('spawn', 'scan-leftover'), { refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: latchRowStateRead('ended') })
+    const deps = sequenceDeps(() => true)
+    deps.isLatched = (key) => latch.isLatched(key)
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_LATCHED)
+
+    expect(asked).toEqual([])
+    expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls]).toEqual([[], [], []])
+  })
+
+  test('a running query that throws counts as running (fail safe): sequence-waiting, its one line naming what it threw, redacted', async () => {
+    recordFailure(P)
+    const deps = sequenceDeps((key) => {
+      if (key === P) throw Object.assign(new Error(`running query broke (${sentinelInMessage('sequence')})`), { note: LEAK_SENTINEL })
+      return false
+    })
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_SEQUENCE_WAITING)
+
+    const lines = errLines.filter((line) => line.startsWith(`[slack] Skipping restart for persona=${P} — its live-row sequence runs (the running query failed: `))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(`Error message="running query broke (${REDACTED_SENTINEL_TAIL})"`)
+    expect(lines[0]).toEndWith(' — taken as running); no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)')
+    expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls]).toEqual([[], [], []])
+    expect(getFailureCount(P)).toBe(1)
+  })
+
+  test.each<[string, (deps: ReturnType<typeof makeDeps>) => void]>([
+    ['a hand-built RestartDeps with no running query', (deps) => { delete deps.isLiveRowSequenceRunning }],
+    ['the running query answering false', () => {}],
+  ])('%s: P\'s retry runs as before — one probe, one kill, one launch, launched', async (_label, setQuery) => {
+    const deps = sequenceDeps(() => false)
+    setQuery(deps)
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls.map((call) => call.key)]).toEqual([[P], [P], [P]])
+    expect(errLines.filter((line) => line.includes('live-row sequence'))).toEqual([])
   })
 })
 

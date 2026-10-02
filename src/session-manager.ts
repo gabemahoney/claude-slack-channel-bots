@@ -204,8 +204,16 @@
  * entries here, and makes its final launch through one launch call,
  * `launchForLiveRowSequence`: a `resume` whose no-transcript answers go on to
  * the installed reuse builder (`setSequenceReuseBuilder`), or that reuse;
- * with no builder installed a reuse makes no call. No production site starts
- * a sequence yet.
+ * with no builder installed a reuse makes no call. Sequences run in the
+ * server's one registry (`setLiveRowSequenceRegistry`, b.jg5 SRJ-706),
+ * reached through the start entry (`startLiveRowSequence`) and the running
+ * query (`isLiveRowSequenceRunning`); a latch of the persona stops its
+ * sequence (the set observer the installers register). While a sequence runs
+ * for a persona, every launch path for it answers `sequence-waiting` with no
+ * agent-director call (the gate in `spawnForPersona`, which `launchSession`
+ * answers as the uncounted `'refused'`); the sequence's own launch,
+ * `launchForLiveRowSequence`, is exempt, and makes no call once the sequence
+ * is stopped. No production site starts a sequence yet.
  *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
@@ -420,6 +428,7 @@ import {
   LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED,
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
   LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER,
+  LIVE_ROW_NOT_LAUNCHED_STOPPED,
   LIVE_ROW_OUTCOME_NOT_LAUNCHED,
   LIVE_ROW_READ_ABSENT,
   LIVE_ROW_READ_LATCHED,
@@ -435,13 +444,19 @@ import {
   LIVE_ROW_SEQUENCE_LOG_PREFIX,
   LIVE_ROW_SEQUENCE_NO_ROW,
   LIVE_ROW_SEQUENCE_SITE,
+  LIVE_ROW_STOP_LATCHED,
   type LiveRowSequenceArmCause,
   type LiveRowSequenceDeps,
   type LiveRowSequenceLastRead,
   type LiveRowSequenceLaunchKind,
   type LiveRowSequenceNotLaunchedReason,
   type LiveRowSequenceRead,
+  type LiveRowSequenceRegistry,
+  type LiveRowSequenceRequest,
   type LiveRowSequenceRunPlacement,
+  type LiveRowSequenceStartAnswer,
+  type LiveRowSequenceStopReason,
+  type LiveRowSequenceStopSignal,
 } from './live-row-sequence.ts'
 import { recordStartupError } from './startup-errors.ts'
 import {
@@ -876,13 +891,18 @@ let removeApproverLatchObserver: (() => void) | undefined
  * and a same-case set included, stops that persona's running dialog approver
  * with the reason `latched`. The observer registered on a latch installed
  * before is removed first, so exactly one is registered, on the installed
- * latch only.
+ * latch only. When a live-row sequence registry is installed too
+ * (`setLiveRowSequenceRegistry`), a second set observer stops the persona's
+ * running live-row sequence with the latch reason (`stopSequenceOnLatch`,
+ * SRJ-502, SRJ-706), registered once on the installed latch, whichever of
+ * the two is installed second.
  */
 export function setConflictLatch(latch: SessionConflictLatch | undefined): void {
   removeApproverLatchObserver?.()
   removeApproverLatchObserver = undefined
   conflictLatch = latch
   if (latch?.addSetObserver !== undefined) removeApproverLatchObserver = latch.addSetObserver(stopApproverOnLatch)
+  syncSequenceLatchObserver()
 }
 
 /**
@@ -6392,6 +6412,16 @@ export interface SpawnPersonaResult {
      * failed nor as succeeded.
      */
     | 'latched'
+    /**
+     * b.jg5 SRJ-706: a live-row sequence runs for the persona
+     * (`isLiveRowSequenceRunning`), so no other launch for it starts: no
+     * agent-director call, no trust patch, no reply-guard step, no record
+     * written, and nothing armed. Not a failure: `launchSession` maps it to
+     * the uncounted `'refused'` (SRJ-1015), so a retry that meets it re-arms
+     * the persona's retry timer (SRJ-302), and the start pass counts it
+     * neither as failed nor as succeeded.
+     */
+    | 'sequence-waiting'
   /** For `deferred`: the claude_config_dir cause (`claude-config-dir` step). */
   deferredBy?: PersonaBringUpFailure
   /**
@@ -8500,6 +8530,14 @@ export async function whenLaunchSettled(key: string): Promise<void> {
 /**
  * Core per-persona spawn dispatcher (SR-1.4), addressing `cscb_<key>`:
  *
+ * 0. The live-row sequence gate (b.jg5 SRJ-706): while a live-row sequence
+ *    runs for the persona (`isLiveRowSequenceRunning`) and it is not
+ *    latched, the call answers `sequence-waiting` before any other step,
+ *    joining no launch in flight (the sequence's own step-6 launch
+ *    included), with one log line: no agent-director call, no trust patch,
+ *    no reply-guard step, no record written, nothing armed. The sequence's
+ *    own launch (`launchForLiveRowSequence`) does not come through here and
+ *    is exempt. A latched persona goes on to the latched gate.
  * 1. One in-flight launch per persona (b.av2 SR-6.3): while a launch for the
  *    key is in flight, a second call joins it and receives its result instead
  *    of starting a second ladder. The start's worker pool and the restart
@@ -8598,6 +8636,12 @@ export async function spawnForPersona(
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   const ref = personaRef(persona)
+  // b.jg5 SRJ-706: while P's live-row sequence runs (its own step-6 launch in
+  // flight included), no other launch for P starts or joins one: no
+  // agent-director call, no trust patch, no reply-guard step, no record.
+  // A latched persona still gets the latched gate's answer.
+  const sequenceWaiting = sequenceWaitingResult(key, ref, 'spawnForPersona')
+  if (sequenceWaiting !== undefined) return sequenceWaiting
   const inFlight = inFlightLaunches.get(key)
   if (inFlight) {
     console.error(`[slack] spawnForPersona: launch already in flight for ${ref} — joining it`)
@@ -8965,6 +9009,129 @@ async function runPersonaLadder(
 }
 
 // ---------------------------------------------------------------------------
+// The live-row sequence registry (b.jg5 SRJ-706)
+// ---------------------------------------------------------------------------
+
+/** The start entry's answer when no registry is installed: nothing was started. */
+export const LIVE_ROW_START_NOT_INSTALLED = 'not-installed'
+
+/** What the session manager's start entry answers: the registry's answer, or that none is installed. */
+export type LiveRowSequenceStartEntryAnswer = LiveRowSequenceStartAnswer | typeof LIVE_ROW_START_NOT_INSTALLED
+
+/**
+ * The installed live-row sequence registry (`createLiveRowSequenceRegistry`,
+ * one per server; production: built in `main()` before the start pass). With
+ * none installed (unit tests that install none) no sequence runs: the start
+ * entry answers `not-installed` with one line, the running query answers
+ * false and a stop does nothing.
+ */
+let liveRowSequenceRegistry: LiveRowSequenceRegistry | undefined
+
+/** Removes the sequence-stop set observer from the installed latch; undefined while none is registered. */
+let removeSequenceLatchObserver: (() => void) | undefined
+
+/**
+ * Install the server's live-row sequence registry, or remove it with
+ * undefined (b.jg5 SRJ-706). Later start sites reach it through the start
+ * entry here (`startLiveRowSequence`). When a latch with `addSetObserver` is
+ * installed too, one set observer stops a latched persona's running sequence
+ * (`stopSequenceOnLatch`), whichever of the two is installed second.
+ */
+export function setLiveRowSequenceRegistry(registry: LiveRowSequenceRegistry | undefined): void {
+  liveRowSequenceRegistry = registry
+  syncSequenceLatchObserver()
+}
+
+/** Test-only seam: remove the installed registry and its latch observer (the registry's sequences are not stopped). */
+export function _resetLiveRowSequenceRegistry(): void {
+  setLiveRowSequenceRegistry(undefined)
+}
+
+/**
+ * Register the sequence-stop set observer on the installed latch exactly
+ * once while both a registry and a latch with `addSetObserver` are
+ * installed; remove it otherwise. Called by both installers.
+ */
+function syncSequenceLatchObserver(): void {
+  removeSequenceLatchObserver?.()
+  removeSequenceLatchObserver = undefined
+  const latch = conflictLatch
+  if (liveRowSequenceRegistry !== undefined && latch?.addSetObserver !== undefined) {
+    removeSequenceLatchObserver = latch.addSetObserver(stopSequenceOnLatch)
+  }
+}
+
+/**
+ * The latch's set observer for the live-row sequence (b.jg5 SRJ-502,
+ * SRJ-706): stops persona `event.key`'s running sequence with the reason
+ * `latched`. The stop signal is set synchronously, inside this call, so the
+ * sequence makes no call after the one in progress returns. Does nothing
+ * when none runs for the persona. Returns nothing to await; never throws.
+ */
+function stopSequenceOnLatch(event: ConflictLatchSetEvent): void {
+  void stopLiveRowSequence(event.key, LIVE_ROW_STOP_LATCHED)
+}
+
+/**
+ * The start entry for later sites (b.jg5 SRJ-706): forwards `request` to the
+ * installed registry and answers its answer (`started`, `already-running`,
+ * `closed`); the sequence runs in the background and this never waits for
+ * it. A step-2 entry is the same call with the request's entry step 2. With
+ * no registry installed: `not-installed`, one line, nothing started. Never
+ * throws.
+ */
+export function startLiveRowSequence(request: LiveRowSequenceRequest): LiveRowSequenceStartEntryAnswer {
+  const registry = liveRowSequenceRegistry
+  if (registry === undefined) {
+    console.error(
+      `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${request.ref ?? `persona=${request.key}`}: no sequence registry is installed — nothing started (b.jg5 SRJ-706)`,
+    )
+    return LIVE_ROW_START_NOT_INSTALLED
+  }
+  return registry.start(request)
+}
+
+/**
+ * True while a live-row sequence runs for persona `key` (b.jg5 SRJ-706):
+ * from its start's answer until it settles, its step-6 launch included.
+ * False with no registry installed. While it is true every launch path for
+ * the persona but the sequence's own launch answers `sequence-waiting` with
+ * no agent-director call, it blocks a retry of the persona's retry timer and
+ * counts as in flight for the health tick, and a lost message reports
+ * `restarting`.
+ */
+export function isLiveRowSequenceRunning(key: string): boolean {
+  return liveRowSequenceRegistry?.isRunning(key) === true
+}
+
+/**
+ * Stop persona `key`'s running live-row sequence with `reason` (b.jg5
+ * SRJ-706: its latch, its teardown) through the installed registry. The stop
+ * signal is set before this returns; the promise resolves true once the
+ * sequence has settled (its call in flight returned), false at once when
+ * none runs or no registry is installed. Never rejects.
+ */
+export function stopLiveRowSequence(key: string, reason: LiveRowSequenceStopReason): Promise<boolean> {
+  return liveRowSequenceRegistry?.stop(key, reason) ?? Promise.resolve(false)
+}
+
+/**
+ * The live-row sequence gate of the launch paths (b.jg5 SRJ-706): while a
+ * sequence runs for persona `key` and the persona is not latched (the
+ * latched gate answers for a latched one), log one line and answer the
+ * `sequence-waiting` result; otherwise undefined. The sequence's own launch
+ * (`launchForLiveRowSequence`) never passes through it.
+ */
+function sequenceWaitingResult(key: string, ref: string, site: string): SpawnPersonaResult | undefined {
+  if (!isLiveRowSequenceRunning(key)) return undefined
+  if (latchGateReadingOf(key) !== undefined) return undefined
+  console.error(
+    `[slack] ${site}: not launching ${ref} — its live-row sequence runs; no agent-director call (sequence-waiting; b.jg5 SRJ-706)`,
+  )
+  return { key, action: 'sequence-waiting' }
+}
+
+// ---------------------------------------------------------------------------
 // The live-row sequence's final launch and its dependencies (b.jg5 SRJ-705)
 // ---------------------------------------------------------------------------
 
@@ -8974,9 +9141,15 @@ export interface LiveRowSequenceLaunchRequest {
   readonly kind: LiveRowSequenceLaunchKind
   /** The row state the sequence last read (`ended`, `missing` or no row): the state a latch records. */
   readonly lastRead: LatchRowState
+  /**
+   * The sequence's stop signal (b.jg5 SRJ-706): once it is set (P's latch,
+   * its teardown, shutdown), the entry stops waiting for another launch of P
+   * and makes no call. Absent: only the latched gate holds the launch back.
+   */
+  readonly stop?: LiveRowSequenceStopSignal
 }
 
-/** The entry's answer when it made no launch: no reuse builder, `ErrSpawnNotResumable`. */
+/** The entry's answer when it made no launch: no reuse builder, `ErrSpawnNotResumable`, the sequence stopped. */
 export interface LiveRowSequenceNotLaunched {
   readonly key: string
   readonly action: typeof LIVE_ROW_OUTCOME_NOT_LAUNCHED
@@ -9043,8 +9216,12 @@ const NO_TRANSCRIPT_RESUME_ERR_NAMES = [ERR_NO_SESSION_ID_NAME, ERR_JSONL_MISSIN
  *     `whenLaunchSettled` waits for it while it runs (a teardown's wait
  *     covers it, SRJ-715); a call that joins it gets its launch result, a
  *     not-launched answer reading as the uncounted refused result;
- *   - it is not refused by the live-row sequence's own gate on the persona's
- *     launch paths: it is the sequence's own launch, made from inside it;
+ *   - once the sequence's stop signal (`request.stop`) is set, it stops
+ *     waiting and makes no call (b.jg5 SRJ-706): one line, nothing
+ *     registered, and a not-launched answer (`stopped`);
+ *   - it is exempt from the `sequence-waiting` gate on the persona's launch
+ *     paths (`spawnForPersona`): it is the sequence's own launch, made from
+ *     inside it, and never passes through that gate;
  *   - the latched gate, the pre-launch `claude_config_dir` check and dry run
  *     come first, as in `spawnForPersona`; then the launch runs as a launch
  *     attempt for the persona (SRJ-301), the trust patch before it;
@@ -9078,7 +9255,16 @@ export async function launchForLiveRowSequence(
       `${LIVE_ROW_SEQUENCE_LOG_PREFIX} a launch for ${ref} is in flight — the sequence's launch waits for it to settle (b.jg5 SRJ-705, SRJ-706)`,
     )
   }
-  while (inFlightLaunches.has(key)) await whenLaunchSettled(key)
+  while (inFlightLaunches.has(key) && request.stop?.reason === undefined) await whenLaunchSettledOrStopped(key, request.stop)
+  // b.jg5 SRJ-706: a sequence stopped meanwhile (its teardown, shutdown, the
+  // latch) makes no call; nothing is registered as in flight.
+  const stoppedFor = request.stop?.reason
+  if (stoppedFor !== undefined) {
+    console.error(
+      `${LIVE_ROW_SEQUENCE_LOG_PREFIX} not launching ${ref} — the sequence was stopped (${stoppedFor}); no agent-director call (b.jg5 SRJ-706)`,
+    )
+    return { key, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_STOPPED }
+  }
   const launch = sequenceLaunchAttempt(persona, config, request, ref)
   // A call that joins this launch gets a launch result; no launch reads as the uncounted refused one.
   const asLaunch: Promise<SpawnPersonaResult> = launch.then((result) =>
@@ -9094,6 +9280,22 @@ export async function launchForLiveRowSequence(
       cancelledComingApprovers.delete(key)
     }
   }
+}
+
+/**
+ * Resolves once the launch in flight for persona `key` has settled, or once
+ * `stop` is set, whichever comes first; at once when neither is pending.
+ * Never rejects.
+ */
+function whenLaunchSettledOrStopped(key: string, stop: LiveRowSequenceStopSignal | undefined): Promise<void> {
+  if (stop === undefined) return whenLaunchSettled(key)
+  return new Promise<void>((resolve) => {
+    const unsubscribe = stop.onStop(() => resolve())
+    void whenLaunchSettled(key).then(() => {
+      unsubscribe()
+      resolve()
+    })
+  })
 }
 
 /** The sequence launch's gates, then its call as a launch attempt for the persona. Never throws. */
@@ -9287,7 +9489,7 @@ export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveR
         configDirMatches: !comparison.configDirResolved || comparison.configDirMatches === true,
       }
     },
-    launch: async (key, kind, lastRead, ref) => {
+    launch: async (key, kind, lastRead, ref, stop) => {
       const found = applied(key)
       if (found === undefined) {
         console.error(
@@ -9295,7 +9497,11 @@ export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveR
         )
         return { kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED }
       }
-      const result = await launchForLiveRowSequence(found.persona, found.config, { kind, lastRead: latchRowStateOfSequenceRead(lastRead) })
+      const result = await launchForLiveRowSequence(found.persona, found.config, {
+        kind,
+        lastRead: latchRowStateOfSequenceRead(lastRead),
+        stop,
+      })
       return result.action === LIVE_ROW_OUTCOME_NOT_LAUNCHED
         ? { kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: result.reason }
         : { kind: LIVE_ROW_LAUNCH_ANSWER_LAUNCHED, result }
@@ -10140,6 +10346,10 @@ export async function startupSessionManager(
         // b.jg5 SRJ-502, SRJ-1015: not a failure and not a launch, so neither
         // failed nor succeeded. The summary line has no `latched` count yet.
         break
+      case 'sequence-waiting':
+        // b.jg5 SRJ-706, SRJ-1015: held for the persona's live-row sequence;
+        // neither failed nor succeeded. The summary line has no count for it.
+        break
       case 'spawned':
       default:
         freshSpawned++
@@ -10354,7 +10564,9 @@ function createLaunchPool(size: number): <T>(task: () => Promise<T>) => Promise<
  * evidence read decided the stop), which
  * count toward no failure or cap, and `'refused'` for a `failed` carrying the
  * refusal marker (b.jg5 SRJ-301: its UNAVAILABLE retry timer owns the
- * persona), which the restart path never counts (SRJ-302). The richer `SpawnPersonaResult` is collapsed here
+ * persona) and for `sequence-waiting` (b.jg5 SRJ-706, SRJ-1015: the
+ * persona's live-row sequence runs; never `'skipped'`, which would stop the
+ * retry timer), which the restart path never counts (SRJ-302). The richer `SpawnPersonaResult` is collapsed here
  * because the restart subsystem only cares about did-it-relaunch.
  */
 export async function launchSession(
@@ -10368,6 +10580,9 @@ export async function launchSession(
   const result = await spawnForPersona(persona, config, false)
   // b.jg5 SRJ-1015: a latched persona records nothing; the latch stops its retry timer.
   if (result.action === 'deferred' || result.action === 'latched' || result.stopping) return 'skipped'
+  // b.jg5 SRJ-706, SRJ-1015: a launch held for P's live-row sequence records
+  // nothing and is a refusal at a retry, which re-arms the timer (SRJ-302).
+  if (result.action === 'sequence-waiting') return 'refused'
   if (result.refused) return 'refused'
   return result.action !== 'failed'
 }

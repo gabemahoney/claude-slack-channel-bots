@@ -490,7 +490,10 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     ])
     // Functions and objects with a parameter name of the source's choosing.
     // (`templateRefresh` is pinned in the test after this one.)
-    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopApprover', 'stopRetryTimer', 'forgetConflictLatch', 'forgetNoticeEpisodes', 'killInstance']
+    const shaped = [
+      'log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopApprover', 'stopLiveRowSequence', 'stopRetryTimer',
+      'forgetConflictLatch', 'forgetNoticeEpisodes', 'killInstance',
+    ]
     expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
     for (const [dep, value] of expected) expect([dep, props.get(dep)]).toEqual([dep, value])
 
@@ -504,6 +507,8 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       deletePersonaInstance: './session-manager.ts',
       stopDialogApprover: './session-manager.ts',
       APPROVER_STOP_TEARDOWN: './session-manager.ts',
+      stopLiveRowSequence: './session-manager.ts',
+      LIVE_ROW_STOP_TEARDOWN: './live-row-sequence.ts',
       cancelRestartTimer: './restart.ts',
       forgetFailures: './backoff.ts',
       forgetDisconnectedStreak: './health-check.ts',
@@ -569,6 +574,19 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     )
     expect(stopApprover).not.toBeNull()
     expect(stopApprover![2]).toBe(stopApprover![1])
+
+    // b.jg5 SRJ-706, SRJ-715: optional in the deps, so only this pin makes
+    // sure a production teardown stops the key's live-row sequence (right
+    // after the approver, waiting for its call in flight): the session
+    // manager's stop entry over the installed registry for that key with the
+    // teardown reason, not a stub, not another key's stop or every persona's
+    // (`stopAll`, the registry's `close`), not a latch or shutdown reason
+    // (imported above, not shadowed).
+    const stopSequence = (props.get('stopLiveRowSequence') ?? '').match(
+      /^\(?(\w+)\)? => stopLiveRowSequence\((\w+), LIVE_ROW_STOP_TEARDOWN\)$/,
+    )
+    expect(stopSequence).not.toBeNull()
+    expect(stopSequence![2]).toBe(stopSequence![1])
 
     // b.jg5 SRJ-110 (hatch A3): the teardown's kill is the session manager's
     // checked kill of that key with the teardown context (its context is

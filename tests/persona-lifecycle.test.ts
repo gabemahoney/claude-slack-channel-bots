@@ -95,7 +95,7 @@ import {
   PERSONA_SLACK_UNREACHABLE,
 } from '../src/persona-diagnostics.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
-import { createPersonaLifecycle, type PersonaLifecycle, type PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
+import { createPersonaLifecycle, LIVE_ROW_SEQUENCE_STOP_STEP, type PersonaLifecycle, type PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../src/persona-serializer.ts'
 import type { PersonaBringUpStep } from '../src/persona-start.ts'
 import type { InPlaceApplyInput } from '../src/reload-apply.ts'
@@ -118,7 +118,10 @@ import {
   killPersonaInstance,
   setConfiguredPersonaQuery,
   setConflictLatch,
+  stopLiveRowSequence,
 } from '../src/session-manager.ts'
+import { LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_TEARDOWN } from '../src/live-row-sequence.ts'
+import { makeRecoveryHarness, personaOf } from './test-helpers/recovery-harness.ts'
 import {
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_ROW_GONE,
@@ -139,6 +142,7 @@ import type { Phase1KillResult } from '../src/ad-phase1-types.ts'
 import {
   createUnavailableRetryController,
   runInAttempt,
+  UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
@@ -243,7 +247,7 @@ function makeConfig(): PersonaConfig {
 /** Dependency names the recorder fixture can make fail. */
 type DepName =
   | 'bringUps.cancel' | 'bringUps.bringUp' | 'bringUps.state' | 'bringUps.changeCredentials' | 'cancelRestartTimer' | 'stopRetryTimer' | 'cancelLaunchWait'
-  | 'stopApprover' | 'whenLaunchSettled' | 'connections.stop'
+  | 'stopApprover' | 'stopLiveRowSequence' | 'whenLaunchSettled' | 'connections.stop'
   | 'routing.forget' | 'forgetAcks' | 'destinations.forget' | 'destinationHold.cancel' | 'notifier.forget' | 'forgetPersonaPrompts'
   | 'dropSession' | 'resetOutageState' | 'killInstance' | 'deleteInstance' | 'forgetFailures'
   | 'forgetDisconnectedStreak' | 'forgetNotConnectedEpisode' | 'forgetConflictLatch' | 'forgetNoticeEpisodes' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
@@ -251,7 +255,7 @@ type DepName =
 
 /** Dependencies whose production form returns a promise: their failure is a rejection, the others' a throw. */
 const ASYNC_DEPS = new Set<DepName>([
-  'bringUps.bringUp', 'bringUps.changeCredentials', 'stopApprover', 'whenLaunchSettled', 'connections.stop', 'connections.reconnectCredentials',
+  'bringUps.bringUp', 'bringUps.changeCredentials', 'stopApprover', 'stopLiveRowSequence', 'whenLaunchSettled', 'connections.stop', 'connections.reconnectCredentials',
   'dropSession', 'killInstance', 'deleteInstance', 'launch',
 ])
 
@@ -380,6 +384,7 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
     isShuttingDown: () => false,
     log: (line) => void lines.push(line),
     stopApprover: rec('stopApprover', byKey, async () => false),
+    stopLiveRowSequence: rec('stopLiveRowSequence', byKey, async () => false),
     whenLaunchSettled: rec('whenLaunchSettled', byKey, (key: string) => opts.launchInFlight?.(key) ?? Promise.resolve()),
     cancelRestartTimer: rec('cancelRestartTimer', byKey, () => false),
     stopRetryTimer: rec('stopRetryTimer', byKey, () => undefined),
@@ -445,9 +450,10 @@ function cleanTeardownLines(p: Persona, outcome: KillOutcome = KILL_SUCCEEDED): 
 
 /**
  * The teardown's own steps for `p` (its serializer turn), outside dry run,
- * with the recorders' defaults: its dialog approver is stopped first, before
- * every other step and before the wait for its launch in flight (b.jg5
- * SRJ-404, SRJ-715); the launch's wait for a `working` row is
+ * with the recorders' defaults: its dialog approver is stopped first and its
+ * live-row sequence right after, before every other step and before the
+ * wait for its launch in flight (b.jg5 SRJ-404, SRJ-706, SRJ-715); the
+ * launch's wait for a `working` row is
  * cancelled again (b.f2b) right before the teardown waits for the launch,
  * and after the agent-director calls the outage state is forgotten and the
  * UNAVAILABLE retry timer stopped again (b.jg5 SRJ-311: a failing delete's
@@ -456,7 +462,7 @@ function cleanTeardownLines(p: Persona, outcome: KillOutcome = KILL_SUCCEEDED): 
 function teardownTurnTrail(p: Persona, launchPass: string): string[] {
   const k = p.key
   return [
-    `stopApprover:${k}`,
+    `stopApprover:${k}`, `stopLiveRowSequence:${k}`,
     `bringUps.cancel:${k}`, `cancelRestartTimer:${k}`, `stopRetryTimer:${k}`, `cancelLaunchWait:${k}`, `whenLaunchSettled:${k}`,
     `connections.stop:${k}`, `routing.forget:${k}`, `forgetAcks:${k}`, `destinations.forget:${k}`, `destinationHold.cancel:${k}`,
     `notifier.forget:${k}`, `forgetPersonaPrompts:${k}`, `dropSession:${k}`,
@@ -468,11 +474,12 @@ function teardownTurnTrail(p: Persona, launchPass: string): string[] {
 
 /**
  * What every teardown runs at submit, before its turn: its dialog approver
- * stopped first (b.jg5 SRJ-404, SRJ-715), then its launch's wait for a
- * `working` row cancelled (b.f2b).
+ * stopped first (b.jg5 SRJ-404, SRJ-715), its live-row sequence right after
+ * (b.jg5 SRJ-706), then its launch's wait for a `working` row cancelled
+ * (b.f2b).
  */
 function submitCancels(p: Persona): string[] {
-  return [`stopApprover:${p.key}`, `cancelLaunchWait:${p.key}`]
+  return [`stopApprover:${p.key}`, `stopLiveRowSequence:${p.key}`, `cancelLaunchWait:${p.key}`]
 }
 
 /**
@@ -709,6 +716,129 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
   })
 
+  // b.jg5 SRJ-706, SRJ-715: the live-row sequence is stopped right after the
+  // approver, at submit and as the turn's second step, and the turn awaits
+  // that stop (the sequence's call in flight) before any other step and
+  // before it waits for the launch in flight.
+  test('b.jg5 SRJ-706, SRJ-715: B\'s live-row sequence is stopped right after its approver, at submit and as the turn\'s second step, for B only, and the turn awaits that stop before any other step and before it waits for B\'s launch in flight', async () => {
+    const launchInFlight = Promise.withResolvers<void>()
+    const turnStop = Promise.withResolvers<boolean>()
+    let stops = 0
+    const f = makeFixture({
+      launchInFlight: () => launchInFlight.promise,
+      overrides: {
+        stopLiveRowSequence: (key) => {
+          f.trail.push(`stopLiveRowSequence:${key}`)
+          return ++stops === 1 ? Promise.resolve(true) : turnStop.promise
+        },
+      },
+    })
+    const full = fullTeardownTrail(f.b, launchPassOf(f, undefined))
+
+    const done = f.lifecycle.teardown(f.b)
+    await flush()
+    // The turn's sequence stop has not settled: nothing after it ran.
+    expect(f.trail).toEqual([...submitCancels(f.b), `stopApprover:${f.b.key}`, `stopLiveRowSequence:${f.b.key}`])
+
+    turnStop.resolve(true)
+    await flush()
+    expect(f.trail).toEqual(untilLaunchSettled(full, f.b))
+    expect(await settled(done)).toBe(false)
+
+    launchInFlight.resolve()
+    await done
+    expect(f.trail).toEqual(full)
+    expect(f.trail.filter((c) => c.startsWith('stopLiveRowSequence:'))).toEqual([`stopLiveRowSequence:${f.b.key}`, `stopLiveRowSequence:${f.b.key}`])
+    expect(f.lines).toEqual(cleanTeardownLines(f.b))
+  })
+
+  // Rows: how the turn's sequence stop fails (the submit-time stop succeeds).
+  test.each<['throws' | 'rejects']>([['throws'], ['rejects']])('b.jg5 SRJ-706: the live-row sequence\'s stop failing in the turn (it %s): one token-safe line naming B by its step, every later step still runs and the teardown completes with one failed step', async (how) => {
+    let stops = 0
+    const f = makeFixture({
+      overrides: {
+        stopLiveRowSequence: (key) => {
+          f.trail.push(`stopLiveRowSequence:${key}`)
+          if (++stops === 1) return Promise.resolve(true)
+          if (how === 'rejects') return Promise.reject(failure())
+          throw failure()
+        },
+      },
+    })
+
+    await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
+
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.lines).toEqual([
+      `${teardownPrefix(f.b)}: starting`,
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${LIVE_ROW_SEQUENCE_STOP_STEP} failed: Error`)}( |$)`)),
+      killOutcomeLine(f.b),
+      `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
+    ])
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test('a deps object without the optional live-row sequence stop (a hand-built fixture) still tears B down: every other step runs, in order', async () => {
+    const f = makeFixture({ overrides: { stopLiveRowSequence: undefined } })
+
+    await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
+
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => !c.startsWith('stopLiveRowSequence:')))
+    expect(f.lines).toEqual(cleanTeardownLines(f.b))
+  })
+
+  // b.jg5 SRJ-706, SRJ-715 (E21 T1's reconcile note): a kill try already in
+  // flight when the sequence is stopped can still arm P's retry timer from
+  // inside the try (a CONFIG answer through the outage state's detection).
+  // The teardown's sequence stop waits for that call, so its later stops of
+  // P's retry timer clear the arm. Composed over the recovery harness: its
+  // registry, retry controller and sequence dependencies, with the
+  // teardown's sequence stop and retry-timer stop bound as main() binds them.
+  test('b.jg5 SRJ-706, SRJ-715: a teardown of P during its sequence\'s held step-1 kill, which then answers CONFIG: the turn waits for the kill, the CONFIG answer arms P\'s retry timer, and the teardown\'s later timer stops leave none armed', async () => {
+    const h = makeRecoveryHarness()
+    cleanups.push(() => h.cleanup())
+    const [p, q] = h.keys as [string, string]
+    const killEntered = Promise.withResolvers<void>()
+    const killAnswer = Promise.withResolvers<void>()
+    h.stub.client.kill = async () => {
+      killEntered.resolve()
+      await killAnswer.promise
+      throw errConfigMalformed()
+    }
+    const run = h.startSequence(p, { lastReadState: 'waiting' })
+    await killEntered.promise
+    h.controller.arm(q, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+    const f = makeFixture({
+      overrides: {
+        stopLiveRowSequence: (key) => {
+          f.trail.push(`stopLiveRowSequence:${key}`)
+          return stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN)
+        },
+        stopRetryTimer: (key) => {
+          f.trail.push(`stopRetryTimer:${key}`)
+          h.controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+        },
+      },
+    })
+
+    const done = f.lifecycle.teardown(personaOf(h, p))
+    await flush()
+    expect(await settled(done)).toBe(false)
+    expect(f.trail.at(-1)).toBe(`stopLiveRowSequence:${p}`)
+
+    killAnswer.resolve()
+    await h.driveSequence(done)
+
+    expect(await run.outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_TEARDOWN })
+    // The CONFIG answer armed P's timer from inside the kill try, after the stop was set.
+    expect(h.triggers).toContainEqual({ key: p, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG })
+    expect(f.trail.indexOf(`stopRetryTimer:${p}`)).toBeGreaterThan(f.trail.lastIndexOf(`stopLiveRowSequence:${p}`))
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(h.controller.armedKeys()).toEqual([q])
+    expect(h.stub.calls.getCalls).toEqual([])
+    h.controller.stop(q, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+  })
+
   // Rows: the dependency that fails, the step phrase its line names, and how many steps fail.
   // Two deps run twice in the turn under one phrase, so both of their steps fail:
   // resetOutageState (before and after the agent-director calls) and stopRetryTimer
@@ -778,7 +908,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
   test('every step failing: the teardown still resolves, runs each step once but the delete (b.jg5 SRJ-701: the kill did not succeed) and reports all of them', async () => {
     const all: DepName[] = [
-      'stopApprover', 'bringUps.cancel', 'cancelRestartTimer', 'stopRetryTimer', 'cancelLaunchWait', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
+      'stopApprover', 'stopLiveRowSequence', 'bringUps.cancel', 'cancelRestartTimer', 'stopRetryTimer', 'cancelLaunchWait', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
       'forgetAcks', 'destinations.forget', 'destinationHold.cancel', 'notifier.forget', 'forgetPersonaPrompts', 'dropSession',
       'resetOutageState', 'killInstance', 'deleteInstance', 'forgetFailures', 'forgetDisconnectedStreak', 'forgetNotConnectedEpisode',
       'forgetConflictLatch', 'forgetNoticeEpisodes', 'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
@@ -788,9 +918,9 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await f.lifecycle.teardown(f.b)
 
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => c !== `deleteInstance:${f.b.key}`))
-    // 25 dependencies, the delete not run after the failed kill (b.jg5 SRJ-701);
+    // 26 dependencies, the delete not run after the failed kill (b.jg5 SRJ-701);
     // resetOutageState and stopRetryTimer each run (and fail) twice.
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 26 failed step(s)`)
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 27 failed step(s)`)
     expect(f.lines).toContain(deleteNotMadeLine(f.b))
     assertNoLeak({ lines: f.lines })
   })
@@ -977,6 +1107,9 @@ describe('persona teardown of a key still applied (the old half of a destructive
     // b.jg5 SRJ-404, SRJ-715: the approver's stop, first at submit.
     ['stopApprover', 'stopping its dialog approver', 'throws'],
     ['stopApprover', 'stopping its dialog approver', 'rejects'],
+    // b.jg5 SRJ-706, SRJ-715: the live-row sequence's stop, right after it.
+    ['stopLiveRowSequence', LIVE_ROW_SEQUENCE_STOP_STEP, 'throws'],
+    ['stopLiveRowSequence', LIVE_ROW_SEQUENCE_STOP_STEP, 'rejects'],
   ])('%s failing at submit (%s; it %s): one token-safe "before its turn failed" line, the other early cancels still run, and the whole teardown still runs', async (dep, phrase, how) => {
     // A throw also fails the same step in the teardown's turn; a rejection is overridden for the early call only.
     let calls = 0
@@ -984,14 +1117,14 @@ describe('persona teardown of a key still applied (the old half of a destructive
       f.trail.push(`${dep}:${key}`)
       return calls++ === 0 ? Promise.reject(failure()) : false
     }
-    // The approver's stop returns a promise in production (the recorder rejects), so its throw is an override.
+    // The approver's and the sequence's stops return a promise in production (the recorder rejects), so their throw is an override.
     const throwEvery = (key: string): never => {
       f.trail.push(`${dep}:${key}`)
       throw failure()
     }
     const f = makeFixture(
-      dep === 'stopApprover'
-        ? { overrides: { stopApprover: how === 'throws' ? throwEvery : rejectFirst } }
+      dep === 'stopApprover' || dep === 'stopLiveRowSequence'
+        ? { overrides: { [dep]: how === 'throws' ? throwEvery : rejectFirst } }
         : how === 'throws'
           ? { fail: [dep] }
           : { overrides: dep === 'stopRetryTimer' ? { stopRetryTimer: rejectFirst } : { cancelRestartTimer: rejectFirst } },
@@ -2885,7 +3018,9 @@ describe('persona teardown serialization (SR-6.6)', () => {
       launchGate.resolve(true)
       await done
       const launched = f.trail.indexOf(`restart.launchSession:${f.b.key}`)
-      expect(f.trail.slice(launched + 1, launched + 5)).toEqual([...submitCancels(f.b), `stopApprover:${f.b.key}`, `bringUps.cancel:${f.b.key}`])
+      expect(f.trail.slice(launched + 1, launched + 7)).toEqual([
+        ...submitCancels(f.b), `stopApprover:${f.b.key}`, `stopLiveRowSequence:${f.b.key}`, `bringUps.cancel:${f.b.key}`,
+      ])
       expect(teardownOnly(f)).toEqual(expectedTeardown(f))
       expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete`)
       expect(isRestartPendingOrActive(f.b.key)).toBe(false)
@@ -2926,7 +3061,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       // The turn's first step comes right after the retry's work ended (its launch, then the arm).
       const armed = f.trail.indexOf(`restart.retryArmed:${k}`)
       expect(f.trail.indexOf(`restart.launchSession:${k}`)).toBeLessThan(armed)
-      expect(f.trail.slice(armed + 1, armed + 4)).toEqual([`stopApprover:${k}`, `bringUps.cancel:${k}`, `stopRetryTimer:${k}`])
+      expect(f.trail.slice(armed + 1, armed + 5)).toEqual([`stopApprover:${k}`, `stopLiveRowSequence:${k}`, `bringUps.cancel:${k}`, `stopRetryTimer:${k}`])
       expect(teardownOnly(f)).toEqual(
         stillAppliedTeardownTrail(f.b, `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${k}]`)
           .filter((c) => !c.startsWith('cancelRestartTimer:')),
@@ -2962,9 +3097,9 @@ describe('persona teardown serialization (SR-6.6)', () => {
       const k = f.b.key
       expect(restartOnly(f)).toEqual([`restart.canRestart:${k}`, `restart.submitted:${k}`, `restart.canRestart:${k}`])
       // The submit-time approver stop and cancel of a launch's wait (b.f2b), then the refused restart work, then B's turn.
-      expect(f.trail.slice(0, 7)).toEqual([
+      expect(f.trail.slice(0, 9)).toEqual([
         `restart.canRestart:${k}`, `restart.submitted:${k}`, ...submitCancels(f.b), `restart.canRestart:${k}`,
-        `stopApprover:${k}`, `bringUps.cancel:${k}`,
+        `stopApprover:${k}`, `stopLiveRowSequence:${k}`, `bringUps.cancel:${k}`,
       ])
       expect(teardownOnly(f)).toEqual(expectedTeardown(f))
       expect(isRestartPendingOrActive(k)).toBe(false)

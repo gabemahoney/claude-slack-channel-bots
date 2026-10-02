@@ -21,7 +21,16 @@
  * launch that succeeds, fails or throws), the entries and forms, the stop
  * signal (SRJ-706: an answer after the stop, a kill's, its latch's or a
  * dependency's throw, is dropped; a latched persona gets no call), the lines
- * that carry agent-director text, and the module's import boundary. This
+ * that carry agent-director text, the module's import boundary, and the
+ * scheduling (SRJ-706, AC 61: the registry through the session manager's
+ * start, running and stop entries, with a run held by the stub's
+ * `holdFindMissing`: a start that answers before the first call, one
+ * sequence per persona at a time, every other launch of P answering
+ * `sequence-waiting` with no call while Q goes ahead, a new sequence after
+ * each kind of end, the stops at a latch, a teardown and shutdown during a
+ * held run and the waits, `closed` after shutdown, and the sequence's own
+ * detached recovery attempt). Every sequence runs through the registry but
+ * `runWithDeps`'s, whose dependencies a case replaces. This
  * file asserts that the sequence stops; the latches it causes
  * (each kill's CONFLICT and UNUSABLE NAME rows, SRJ-613's kill backstop among
  * them, with their records and posts) are in tests/conflict-latch.test.ts,
@@ -108,6 +117,9 @@ import {
   LIVE_ROW_SEQUENCE_RUN_SPACING_MS,
   LIVE_ROW_SEQUENCE_STEP3_RUNS,
   LIVE_ROW_SEQUENCE_STEP4_PAUSE_MS,
+  LIVE_ROW_START_ALREADY_RUNNING,
+  LIVE_ROW_START_CLOSED,
+  LIVE_ROW_START_STARTED,
   LIVE_ROW_STOP_LATCHED,
   LIVE_ROW_STOP_SHUTDOWN,
   LIVE_ROW_STOP_TEARDOWN,
@@ -119,7 +131,9 @@ import {
   liveRowSequenceFailedLine,
   liveRowSequenceGetLine,
   liveRowSequenceKillLine,
+  liveRowSequenceNotStartedLine,
   liveRowSequenceRunLine,
+  liveRowSequenceStopAskedLine,
   runLiveRowSequence,
   type LiveRowLaunchKindInput,
   type LiveRowSequenceLaunchReason,
@@ -128,6 +142,7 @@ import {
   type LiveRowSequenceOutcome,
   type LiveRowSequenceRequest,
   type LiveRowSequenceStopHandle,
+  type LiveRowSequenceStopReason,
 } from '../src/live-row-sequence.ts'
 import { AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING } from '../src/liveness-reading.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
@@ -139,10 +154,19 @@ import {
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
   _resetNow,
   _setNow,
+  isLaunchInFlight,
+  launchSession,
+  readPersonaRowState,
+  startLiveRowSequence,
   sweepDeadTmuxChannel,
   type SpawnPersonaResult,
 } from '../src/session-manager.ts'
-import { runInAttempt, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED } from '../src/unavailable-retry.ts'
+import {
+  runInAttempt,
+  UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
+  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  type AttemptView,
+} from '../src/unavailable-retry.ts'
 import { raiseAdConfigMalformed } from '../src/outage-state.ts'
 import {
   cannedErr,
@@ -163,6 +187,7 @@ import {
   errTmuxUnresponsive,
   errUnknownErrorName,
   errUnusableName,
+  holdFindMissing,
   KILL_FAILED_DESCRIPTIONS,
   provenanceNote,
   SAMPLE_LAUNCH_START_DEFAULT,
@@ -179,6 +204,7 @@ import { assertNoLeak, isTokenLike, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, senti
 import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
 import {
   callsBeforeSequenceKill,
+  holdSequenceReuse,
   killFailureEndedLine,
   killFailureHeldLine,
   killFailureLines,
@@ -189,14 +215,18 @@ import {
   LATE_KILL_ANSWERS,
   makeRecoveryHarness,
   ordinaryAlertContent,
+  ownRowsLiveThenMissing,
+  personaCallCounts,
   personaOf,
   recordCallOrder,
   runSequenceStoppedAtKill,
   scriptSequenceKillFailure,
+  startSequenceHeldAtRun,
   startupEntriesOf,
   survivorAlertContent,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
+  type RecoverySequenceRequest,
 } from './test-helpers/recovery-harness.ts'
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1187,7 @@ const LAUNCH_ACTION_SUCCEEDS: Readonly<Record<SpawnPersonaResult['action'], bool
   failed: false,
   deferred: false,
   latched: false,
+  'sequence-waiting': false,
 }
 
 describe('the launch\'s end: the outcome carries the launch\'s result, and the end line says whether it launched (SRJ-705 step 6, SRJ-301)', () => {
@@ -1279,32 +1310,9 @@ describe('live-row-sequence: import boundary', () => {
 // The stop signal (SRJ-706's stop, built in S2)
 // ---------------------------------------------------------------------------
 
+// A stop set while a run is in progress (its answer dropped, no further call)
+// is the scheduling describe's stop matrix below, through the registry.
 describe('the stop signal: a result that arrives after the sequence was stopped is dropped, with no further call', () => {
-  test('a stop set while a run is in progress: the run\'s answer is dropped, and no get, kill or launch follows', async () => {
-    const { h, p } = build()
-    h.script({ getResult: rowOf(h, p, { state: ENDED }) })
-    let release!: () => void
-    const released = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    const findMissing = h.stub.client.findMissing.bind(h.stub.client)
-    h.stub.client.findMissing = async (params) => {
-      await released
-      return findMissing(params)
-    }
-    const order = recordCallOrder(h)
-    const run = h.startSequence(p, { lastReadState: LIVE })
-    for (let flushes = 0; flushes < 20 && !order.includes('findMissing'); flushes++) await h.clock.flush()
-    expect(order).toEqual(['kill', 'get', 'findMissing'])
-
-    run.stop.stop(LIVE_ROW_STOP_TEARDOWN)
-    release()
-
-    expect(await run.outcome).toEqual({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_TEARDOWN, runs: 1, kills: 1, judgedRuns: 0 })
-    expect(order).toEqual(['kill', 'get', 'findMissing'])
-    expect(h.reuses).toEqual([])
-  })
-
   // What the dropped kill arms (nothing, and no tmux-unresponsive start) is
   // tests/unavailable-retry.test.ts's.
   test.each(
@@ -1396,5 +1404,233 @@ describe('the lines that carry agent-director text: redacted, on one line', () =
     expect(line).not.toMatch(/[\r\n]/)
     expect(isTokenLike(line)).toBe(false)
     assertNoLeak({ line })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Scheduling (SRJ-706, AC 61; SRJ-502's latch stop): the registry, reached
+// through the session manager's start, running and stop entries
+//
+// On `makeRecoveryHarness`, whose registry is built and installed as `main()`
+// builds and installs it, with P's first run held through the stub's
+// `holdFindMissing`. The start pass returning while a sequence runs is
+// tests/session-manager.test.ts's; an apply and a teardown through the
+// lifecycle, tests/reload-apply.test.ts's; a retry and the restart path,
+// tests/unavailable-retry.test.ts's and tests/restart.test.ts's; a message
+// lost meanwhile, tests/inbound-recovery-drop-branch.test.ts's; the latch's
+// own consequences (its record, its post, no kill on any automated path),
+// tests/conflict-latch.test.ts's.
+// ---------------------------------------------------------------------------
+
+/** A stop of P's running sequence: how a case makes it, and the reason the sequence ends with. */
+type SequenceStopWay = readonly [label: string, stop: (h: RecoveryHarness, key: string) => Promise<unknown> | void, reason: LiveRowSequenceStopReason]
+
+const SEQUENCE_STOP_WAYS: readonly SequenceStopWay[] = [
+  [
+    'a latch of P from another path (the retry\'s own-row status read of its pending row with no launch start)',
+    async (h, key) => {
+      h.script({ statusResult: cannedStatusResult({ state: PENDING, launch_started_at: SAMPLE_LAUNCH_START_NONE }) })
+      await readPersonaRowState(key)
+      expect(h.latch.isLatched(key)).toBe(true)
+    },
+    LIVE_ROW_STOP_LATCHED,
+  ],
+  ['teardown(P)', (h, key) => h.teardown(key), LIVE_ROW_STOP_TEARDOWN],
+  ['shutdown()', (h) => h.shutdown(), LIVE_ROW_STOP_SHUTDOWN],
+]
+
+describe('scheduling: each sequence runs in the background, one per persona at a time, holds every other launch of it, and stops at once on a latch, a teardown and shutdown (SRJ-706, AC 61)', () => {
+  test('the start entry answers started before the sequence\'s first call; P\'s sequence reads as running while its first run is held, and once released it goes on to its launch and no longer runs', async () => {
+    const { h, p } = build()
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const order = recordCallOrder(h)
+
+    const answer = startLiveRowSequence(h.sequenceRequest(p, { lastReadState: LIVE }))
+
+    expect([answer, order, h.sequenceRunning(p)]).toEqual([LIVE_ROW_START_STARTED, [], true])
+    await hold.entered()
+    expect([order, hold.heldCount(), h.sequenceRunning(p)]).toEqual([['kill', 'get', 'findMissing'], 1, true])
+
+    hold.release(placed(p, 'ids'))
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, runs: 1, kills: 1 })
+    expect(order).toEqual(['kill', 'get', 'findMissing', 'get'])
+    expect(h.sequenceRunning(p)).toBe(false)
+  })
+
+  test('a second start for P while its sequence runs answers already-running with one line, makes no call and starts no second chain; a start for Q runs beside it', async () => {
+    const { h, p, q } = build()
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const pRun = await startSequenceHeldAtRun(h, p, hold)
+    const calls = h.stub.callCount()
+
+    expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: LIVE, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET }))).toBe(LIVE_ROW_START_ALREADY_RUNNING)
+    await h.clock.flush()
+
+    expect([h.stub.callCount(), hold.calls.length]).toEqual([calls, 1])
+    const notStarted = liveRowSequenceNotStartedLine(`persona=${p}`, personaInstanceId(p), LIVE_ROW_START_ALREADY_RUNNING)
+    expect(h.lines.filter((line) => line === notStarted)).toHaveLength(1)
+    const qRun = await startSequenceHeldAtRun(h, q, hold)
+    expect([h.sequenceRunning(p), h.sequenceRunning(q)]).toEqual([true, true])
+
+    hold.release(placed(p, 'ids'))
+    hold.release(placed(q, 'ids'))
+    const outcomes = await h.driveSequence(Promise.all([pRun.outcome, qRun.outcome]))
+    expect(outcomes.map((outcome) => outcome.kind)).toEqual([LIVE_ROW_OUTCOME_LAUNCHED, LIVE_ROW_OUTCOME_LAUNCHED])
+    // One chain each: one kill and one run per persona.
+    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }, { claude_instance_id: personaInstanceId(q) }])
+    expect(hold.calls).toHaveLength(2)
+    expect(h.reuses.map((reuse) => reuse.key)).toEqual([p, q])
+  })
+
+  test('while P\'s sequence runs, a start-pass launch of P answers sequence-waiting and a restart-path launchSession the uncounted refused, with no agent-director call for P; Q\'s launch and Q\'s own sequence go ahead', async () => {
+    const { h, p, q } = build()
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const pRun = await startSequenceHeldAtRun(h, p, hold)
+    const pCalls = personaCallCounts(h, p)
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'sequence-waiting' })
+    expect(await launchSession(p, h.config)).toBe('refused')
+
+    expect(personaCallCounts(h, p)).toEqual(pCalls)
+    expect([isLaunchInFlight(p), getFailureCount(p), h.notices, h.triggers]).toEqual([false, 0, [], []])
+    expect(await h.launch(q)).toEqual({ key: q, action: 'spawned' })
+    expect(h.stub.calls.spawnCalls.map((call) => call.claude_instance_id)).toEqual([personaInstanceId(q)])
+    await h.runApproverToStop(q)
+    const qRun = await startSequenceHeldAtRun(h, q, hold)
+
+    hold.release(placed(p, 'ids'))
+    hold.release(placed(q, 'ids'))
+    const outcomes = await h.driveSequence(Promise.all([pRun.outcome, qRun.outcome]))
+    expect(outcomes.map((outcome) => outcome.kind)).toEqual([LIVE_ROW_OUTCOME_LAUNCHED, LIVE_ROW_OUTCOME_LAUNCHED])
+  })
+
+  test('during the sequence\'s own step-6 launch: that launch is a launch in flight and goes ahead, while another launch of P answers sequence-waiting and joins nothing', async () => {
+    const { h, p } = build()
+    h.script({ getResult: rowOf(h, p, { state: ENDED }) })
+    const reuse = holdSequenceReuse(h)
+    const run = h.startSequence(p, { lastReadState: LIVE })
+    await h.driveSequence(reuse.entered)
+
+    expect([isLaunchInFlight(p), h.sequenceRunning(p)]).toEqual([true, true])
+    expect(await h.launch(p)).toEqual({ key: p, action: 'sequence-waiting' })
+
+    reuse.release()
+    expect(await h.driveSequence(run.outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: p, action: 'spawned' } })
+    expect([isLaunchInFlight(p), h.sequenceRunning(p), h.reuses.length]).toEqual([false, false, 1])
+  })
+
+  // An episode ends when the sequence launches, aborts by class, stops on a
+  // run that did not judge its row, or escalates (SRJ-706); a later start
+  // begins a new sequence, which runs its steps again from step 1.
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<RecoverySequenceRequest>, LiveRowSequenceOutcome['kind']]>([
+    ['it launches', async (h, key) => {
+      h.script({ getResult: rowOf(h, key, { state: ENDED }) })
+      return { lastReadState: LIVE }
+    }, LIVE_ROW_OUTCOME_LAUNCHED],
+    ['it aborts by class (ENVIRONMENT at its kill)', async (h) => {
+      h.script({ killError: errTmuxNotAvailable() })
+      return { lastReadState: LIVE }
+    }, LIVE_ROW_OUTCOME_ABORTED],
+    ['it stops on a run that did not judge its pending row', async (h, key) => {
+      await clockAt(h, LAUNCH_START_MS + adGraceMsInEffect())
+      h.script({ getResult: rowOf(h, key, { state: PENDING }) })
+      return { lastReadState: PENDING }
+    }, LIVE_ROW_OUTCOME_NOT_JUDGED],
+    ['it escalates', async (h, key) => {
+      h.script({ getResult: rowOf(h, key), findMissingResult: placed(key, 'unverified_ids') })
+      return { lastReadState: LIVE }
+    }, LIVE_ROW_OUTCOME_ESCALATED],
+  ])('after the sequence ends because %s, P\'s sequence no longer runs and a new start begins a new one', async (_label, setup, kind) => {
+    const { h, p } = build()
+    const request = await setup(h, p)
+
+    expect((await h.runSequence(p, request)).kind).toBe(kind)
+    expect(h.sequenceRunning(p)).toBe(false)
+    const kills = h.stub.calls.killCalls.length
+    expect(kills).toBeGreaterThan(0)
+
+    expect((await h.runSequence(p, request)).kind).toBe(kind)
+    expect(h.stub.calls.killCalls).toHaveLength(2 * kills)
+    expect(h.sequenceRunning(p)).toBe(false)
+  })
+
+  test.each(SEQUENCE_STOP_WAYS)('%s while P\'s first run is held: once the run is released no get, kill, run or launch follows for P, no alert is raised and no timer is left', async (_label, stopP, reason) => {
+    const { h, p } = build()
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const order = recordCallOrder(h)
+    const run = await startSequenceHeldAtRun(h, p, hold)
+    expect(order).toEqual(['kill', 'get', 'findMissing'])
+
+    await stopP(h, p)
+    hold.release(placed(p, 'ids'))
+
+    expect(await h.driveSequence(run.outcome)).toEqual({ kind: LIVE_ROW_OUTCOME_STOPPED, reason, runs: 1, kills: 1, judgedRuns: 0 })
+    expect(order.filter((verb) => verb !== 'status')).toEqual(['kill', 'get', 'findMissing'])
+    expect([h.reuses, killFailureLines(h, p), h.clock.pendingCount(), h.sequenceRunning(p)]).toEqual([[], [], 0, false])
+    expect(h.lines.filter((line) => line === liveRowSequenceStopAskedLine(`persona=${p}`, reason))).toHaveLength(1)
+  })
+
+  test.each(SEQUENCE_STOP_WAYS)('%s during the pending wait until G: the wait\'s timer is cancelled and no run follows', async (_label, stopP, reason) => {
+    const { h, p } = build()
+    await clockAt(h, LAUNCH_START_MS)
+    h.script({ getResult: rowOf(h, p, { state: PENDING }) })
+    const order = recordCallOrder(h)
+    const run = h.startSequence(p, { lastReadState: PENDING, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
+    for (let flushes = 0; flushes < 20 && h.clock.pendingCount() === 0; flushes++) await h.clock.flush()
+    expect(h.clock.pending().map((timer) => timer.dueAt)).toEqual([LAUNCH_START_MS + adGraceMsInEffect()])
+
+    await stopP(h, p)
+
+    expect(await run.outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason, runs: 0 })
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(order.filter((verb) => verb !== 'status')).toEqual(['get'])
+    expect(h.sequenceRunning(p)).toBe(false)
+  })
+
+  // A teardown's and shutdown's stop during the spacing is
+  // tests/unavailable-retry.test.ts's (it arms nothing and cancels the wait).
+  test('a latch of P from another path during the spacing between runs cancels the wait, and no further run follows', async () => {
+    const { h, p } = build()
+    h.script({ getResult: rowOf(h, p) })
+    const run = h.startSequence(p, { lastReadState: LIVE })
+    for (let flushes = 0; flushes < 20 && h.clock.pendingCount() === 0; flushes++) await h.clock.flush()
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+
+    await SEQUENCE_STOP_WAYS[0]![1](h, p)
+
+    expect(await run.outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED, runs: 1 })
+    expect([h.clock.pendingCount(), h.stub.calls.findMissingCalls.length]).toEqual([0, 1])
+  })
+
+  test('after shutdown, a start answers closed with one line and makes no call', async () => {
+    const { h, p } = build()
+    h.shutdown()
+
+    expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: LIVE }))).toBe(LIVE_ROW_START_CLOSED)
+
+    await h.clock.flush()
+    expect([h.stub.callCount(), h.sequenceRunning(p)]).toEqual([0, false])
+    const closed = liveRowSequenceNotStartedLine(`persona=${p}`, personaInstanceId(p), LIVE_ROW_START_CLOSED)
+    expect(h.lines.filter((line) => line === closed)).toHaveLength(1)
+  })
+
+  test('the sequence runs in its own recovery attempt, detached from its starter\'s: an UNAVAILABLE answer at its kill arms P\'s retry timer and is not recorded in the starter\'s launch attempt', async () => {
+    const { h, p } = build()
+    h.script({ killError: errTmuxUnresponsive('kill') })
+    let starter: AttemptView | undefined
+
+    const outcome = await runInAttempt(p, 'launch', async (attempt) => {
+      starter = attempt
+      return h.driveSequence(h.startSequence(p, { lastReadState: LIVE }).outcome)
+    })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_ABORTED, errorClass: AD_ERROR_CLASS_UNAVAILABLE })
+    expect(starter?.lastError).toBeUndefined()
+    expect(h.triggers[0]).toEqual({ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+    expect(h.controller.isArmed(p)).toBe(true)
   })
 })

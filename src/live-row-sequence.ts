@@ -43,11 +43,15 @@
  * made of a row last read `pending` while P's `ad-config-malformed` outage is
  * raised (SRJ-316); every kill's retry is seeded with the state last read and
  * keeps going only while the sequence is neither stopped nor P latched. An
- * answer that arrives once the stop signal is set (a kill's, a `get`'s, a
- * run's, the step-6 launch's, a latch's, a dependency's throw) is dropped
+ * answer that arrives once the stop signal is set for a teardown, shutdown
+ * or a persona not up (a kill's, a `get`'s, a run's, the step-6 launch's, a
+ * latch's, a dependency's throw) is dropped
  * with one line: the sequence ends stopped, with no further call, no latch,
  * no alert and no arm; a kill whose tries the keep-going check stopped raises
- * only the retry's log-only alert (`stopped`). A
+ * only the retry's log-only alert (`stopped`). A stop for P's latch (the
+ * latch's set observer, which also fires for the sequence's own latching
+ * call) drops no answer: it is handled as for a latched P, and the sequence
+ * makes no call after it. A
  * `get` that fails ends the sequence without its launch; a `get` that
  * latched P stops it. A kill CONFLICT latches P with the refused operation
  * "P's next check or recovery" and is never sent again; an UNUSABLE NAME
@@ -66,8 +70,19 @@
  *
  * It runs in the background, through injected dependencies only
  * (`LiveRowSequenceDeps`): every agent-director call, the latch, the alert,
- * the retry arm and the clock are the caller's. No production site starts a
- * sequence yet. The module holds no module-scope state, runs nothing at
+ * the retry arm and the clock are the caller's.
+ *
+ * The registry (`createLiveRowSequenceRegistry`, SRJ-706, SRJ-811), one per
+ * server, schedules the sequences: its start entry starts one without
+ * awaiting it and answers at once, at most one per instance id and per
+ * persona at a time; each runs in its own recovery attempt for P, detached
+ * from its starter's (the injected attempt runner); a stop by persona key
+ * (P's latch, its teardown) sets that sequence's stop signal and resolves
+ * once the sequence has settled, its call in flight returned; stop-all and
+ * close stop every one, and after close no start is taken. The running query
+ * answers by persona key. No production site starts a sequence yet.
+ *
+ * The module holds no module-scope state, runs nothing at
  * import, and loads neither the session manager, the server, the notifier
  * nor any Slack module. Errors are classified by name through
  * `src/ad-error-class.ts`; agent-director text reaches a line only through
@@ -340,12 +355,19 @@ export const LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER = 'no-reuse-builder'
 export const LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE = 'not-resumable'
 /** Not launched: P is not in the applied configuration. */
 export const LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED = 'not-applied'
+/**
+ * Not launched: the sequence was stopped (its teardown, shutdown, P's latch)
+ * while its launch waited for another launch of P to settle (SRJ-706: no call
+ * once the sequence is stopped).
+ */
+export const LIVE_ROW_NOT_LAUNCHED_STOPPED = 'stopped'
 
 /** Why step 6 made no launch. */
 export type LiveRowSequenceNotLaunchedReason =
   | typeof LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER
   | typeof LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE
   | typeof LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED
+  | typeof LIVE_ROW_NOT_LAUNCHED_STOPPED
 
 /** The launch call answered. */
 export const LIVE_ROW_LAUNCH_ANSWER_LAUNCHED = 'launched'
@@ -596,8 +618,19 @@ export interface LiveRowSequenceDeps {
   raiseEscalationAlert(key: string, context: KillFailureAlertContext, ref: string): void
   /** P's facts for step 6, against the row last read; undefined when P is not applied. */
   personaFacts(key: string, row: LiveRowSequenceRow | undefined): LiveRowSequencePersonaFacts | undefined
-  /** Step 6's launch through the session manager's sequence-launch entry. */
-  launch(key: string, kind: LiveRowSequenceLaunchKind, lastRead: LiveRowSequenceLastRead, ref: string): Promise<LiveRowSequenceLaunchAnswer>
+  /**
+   * Step 6's launch through the session manager's sequence-launch entry. The
+   * sequence's stop signal goes with it: a launch that waits for another
+   * launch of P to settle makes no call once the signal is set (SRJ-706).
+   * The sequence always passes it.
+   */
+  launch(
+    key: string,
+    kind: LiveRowSequenceLaunchKind,
+    lastRead: LiveRowSequenceLastRead,
+    ref: string,
+    stop?: LiveRowSequenceStopSignal,
+  ): Promise<LiveRowSequenceLaunchAnswer>
   /** Arm P's retry timer with the cause; never counted. */
   armRetry(key: string, cause: LiveRowSequenceArmCause): void
 }
@@ -868,6 +901,16 @@ export async function runLiveRowSequence(
     return undefined
   }
 
+  /**
+   * The stop that drops an answer arriving after it: a teardown, shutdown or
+   * not-up stop. A stop for P's latch (the latch's set observer, SRJ-502)
+   * drops nothing: the answer is handled as for a latched P (the sequence's
+   * own latching call included), and `halted()` ends the sequence before its
+   * next call.
+   */
+  const dropStop = (): LiveRowSequenceStopReason | undefined =>
+    stop.reason !== undefined && stop.reason !== LIVE_ROW_STOP_LATCHED ? stop.reason : undefined
+
   const lastReadPending = (): boolean => lastRead.kind === 'state' && lastRead.state === AGENT_DIRECTOR_PENDING_STATE
 
   /** Wait `ms` on the clock; ends early (answering false) once the sequence is stopped. */
@@ -977,12 +1020,13 @@ export async function runLiveRowSequence(
       ref,
     })
     log(liveRowSequenceKillLine(ref, step, retried))
-    if (stop.reason !== undefined && retried.end !== KILL_RETRY_END_STOPPED) {
+    const droppedBy = dropStop()
+    if (droppedBy !== undefined && retried.end !== KILL_RETRY_END_STOPPED) {
       // SRJ-706: the kill answered after the stop; its answer is dropped:
       // no latch, no alert, no arm. Tries the keep-going check stopped go on
       // below to their log-only alert (`stopped`), which posts nothing.
       log(liveRowSequenceDroppedLine(ref, `step ${step} kill`))
-      return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: stop.reason }
+      return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: droppedBy }
     }
     const { outcome } = retried
     if (killLetsNextStepRun(outcome)) {
@@ -1005,10 +1049,11 @@ export async function runLiveRowSequence(
     // SRJ-110: the no-launch form latches nothing; its starter routes the answer.
     if (latching && request.launches) {
       latched = await deps.latchOnKillOutcome(key, outcome, lastRead, ref)
-      if (stop.reason !== undefined) {
+      const stoppedBy = dropStop()
+      if (stoppedBy !== undefined) {
         // SRJ-706: stopped while the latch ran; nothing follows it.
         log(liveRowSequenceDroppedLine(ref, `step ${step} kill's latch`))
-        return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: stop.reason }
+        return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: stoppedBy }
       }
     }
     // SRJ-702, SRJ-704: the ordinary version follows the outcome's own handling.
@@ -1038,9 +1083,10 @@ export async function runLiveRowSequence(
     if (stopped) return { end: stopped }
     const read = await deps.readRow(key, ref)
     log(liveRowSequenceGetLine(ref, step, read))
-    if (stop.reason !== undefined) {
+    const droppedBy = dropStop()
+    if (droppedBy !== undefined) {
       log(liveRowSequenceDroppedLine(ref, `step ${step} get`))
-      return { end: { kind: LIVE_ROW_OUTCOME_STOPPED, reason: stop.reason } }
+      return { end: { kind: LIVE_ROW_OUTCOME_STOPPED, reason: droppedBy } }
     }
     switch (read.kind) {
       case LIVE_ROW_READ_LATCHED:
@@ -1064,9 +1110,10 @@ export async function runLiveRowSequence(
     const stateBefore = lastRead.kind === 'state' ? lastRead.state : LIVE_ROW_SEQUENCE_NO_ROW
     const placement = await deps.runFindMissing(key, request.instanceId, stateBefore)
     log(liveRowSequenceRunLine(ref, step, counts.runs, placement))
-    if (stop.reason !== undefined) {
+    const droppedBy = dropStop()
+    if (droppedBy !== undefined) {
       log(liveRowSequenceDroppedLine(ref, `step ${step} run`))
-      return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: stop.reason }
+      return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: droppedBy }
     }
     switch (placement) {
       case LIVE_ROW_RUN_LATCHED:
@@ -1126,11 +1173,12 @@ export async function runLiveRowSequence(
       persona: facts,
     })
     log(liveRowSequenceLaunchLine(ref, decision))
-    const answer = await deps.launch(key, decision.kind, lastRead, ref)
-    if (stop.reason !== undefined) {
+    const answer = await deps.launch(key, decision.kind, lastRead, ref, stop)
+    const droppedBy = dropStop()
+    if (droppedBy !== undefined) {
       // SRJ-706: the launch ran to its end; its result is dropped.
       log(liveRowSequenceDroppedLine(ref, 'step 6 launch'))
-      return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: stop.reason }
+      return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: droppedBy }
     }
     if (answer.kind === LIVE_ROW_OUTCOME_NOT_LAUNCHED) {
       return { kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, launchKind: decision.kind, notLaunched: answer.reason }
@@ -1187,11 +1235,201 @@ export async function runLiveRowSequence(
     return finish(await runSteps())
   } catch (err) {
     log(liveRowSequenceFailedLine(ref, 'a step', describeThrownValue(err)))
-    if (stop.reason !== undefined) {
+    const droppedBy = dropStop()
+    if (droppedBy !== undefined) {
       // SRJ-706: the failure arrived after the stop; it is dropped like any answer.
       log(liveRowSequenceDroppedLine(ref, 'failed step'))
-      return finish({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: stop.reason })
+      return finish({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: droppedBy })
     }
     return finish({ kind: LIVE_ROW_OUTCOME_INTERNAL_ERROR })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The registry (SRJ-706, SRJ-811)
+// ---------------------------------------------------------------------------
+
+/** The start entry started the sequence; it runs in the background. */
+export const LIVE_ROW_START_STARTED = 'started'
+/** A sequence already runs on the request's instance id, or for its persona: nothing was started. */
+export const LIVE_ROW_START_ALREADY_RUNNING = 'already-running'
+/** The registry is closed (shutdown): nothing was started. */
+export const LIVE_ROW_START_CLOSED = 'closed'
+
+/** What the registry's start entry answers. */
+export type LiveRowSequenceStartAnswer =
+  | typeof LIVE_ROW_START_STARTED
+  | typeof LIVE_ROW_START_ALREADY_RUNNING
+  | typeof LIVE_ROW_START_CLOSED
+
+/**
+ * Runs `run` as one recovery attempt for persona `key`, detached from the
+ * caller's attempt (production: `runDetachedRecoveryAttempt` in
+ * `src/unavailable-retry.ts`), and settles with its result. Injected, so this
+ * module loads no module that reaches a Slack module.
+ */
+export type LiveRowSequenceAttemptRunner = <T>(key: string, run: () => Promise<T>) => Promise<T>
+
+/** What the registry is built with. */
+export interface LiveRowSequenceRegistryOptions {
+  /** Every sequence's dependencies (`buildLiveRowSequenceDeps`); the clock and the log line sink are theirs. */
+  readonly deps: LiveRowSequenceDeps
+  /** The recovery attempt each sequence runs in. */
+  readonly runAttempt: LiveRowSequenceAttemptRunner
+}
+
+/** One server's live-row sequences: at most one per instance id and per persona. */
+export interface LiveRowSequenceRegistry {
+  /**
+   * Start a sequence for `request` without awaiting it (SRJ-706). Answers
+   * `started` when nothing runs on the request's instance id or for its
+   * persona (the sequence's first call comes after this answer);
+   * `already-running` otherwise, starting nothing; `closed` after `close`,
+   * with one line. Never throws and never blocks on the sequence.
+   */
+  start(request: LiveRowSequenceRequest): LiveRowSequenceStartAnswer
+  /**
+   * Stop persona `key`'s running sequence with `reason` (SRJ-706): its stop
+   * signal is set before this returns, so it makes no further call and holds
+   * no timer once its call in flight, if any, has returned. Resolves true once
+   * the sequence has settled (that call returned and its end logged), so a
+   * caller that awaits it waits for the call in flight as it waits for a
+   * launch in flight; false at once when none runs. Never rejects.
+   */
+  stop(key: string, reason: LiveRowSequenceStopReason): Promise<boolean>
+  /** Stop every running sequence with `reason`; resolves once all have settled. Never rejects. */
+  stopAll(reason: LiveRowSequenceStopReason): Promise<void>
+  /**
+   * Stop every running sequence for shutdown, and refuse every later start
+   * (`closed`, one line). Resolves once all have settled. Never rejects.
+   */
+  close(): Promise<void>
+  /** True while a sequence runs for persona `key`: from its start's answer until it settles, its step-6 launch included. */
+  isRunning(key: string): boolean
+  /**
+   * Test-only: resolves with how persona `key`'s latest sequence ended: the
+   * running one's outcome once it settles, else at once the last one's;
+   * undefined when none ran. Starts and stops nothing.
+   */
+  _whenSettled(key: string): Promise<LiveRowSequenceOutcome | undefined>
+}
+
+/** One running sequence, by instance id. */
+interface RegisteredSequence {
+  readonly key: string
+  readonly instanceId: string
+  readonly ref: string
+  readonly stop: LiveRowSequenceStopHandle
+  /** Resolves with the outcome once the sequence settled; never rejects. */
+  readonly settled: Promise<LiveRowSequenceOutcome>
+}
+
+/**
+ * The line when a start is refused:
+ *   `[slack] live-row-sequence: <ref>: not started for <id> — <a sequence already runs | the server is shutting down> (b.jg5 SRJ-706)`
+ */
+export function liveRowSequenceNotStartedLine(ref: string, instanceId: string, answer: Exclude<LiveRowSequenceStartAnswer, typeof LIVE_ROW_START_STARTED>): string {
+  const why =
+    answer === LIVE_ROW_START_CLOSED
+      ? 'the server is shutting down; no sequence starts'
+      : 'a sequence already runs for this persona or instance id; nothing more is started'
+  return `${head(ref)}: not started for ${renderId(instanceId)} — ${why} (b.jg5 SRJ-706)`
+}
+
+/**
+ * The line when a stop is asked of a running sequence:
+ *   `[slack] live-row-sequence: <ref>: stop asked — <reason>; no further call (b.jg5 SRJ-706)`
+ */
+export function liveRowSequenceStopAskedLine(ref: string, reason: LiveRowSequenceStopReason): string {
+  return `${head(ref)}: stop asked — ${describeStopReason(reason)}; no further call (b.jg5 SRJ-706)`
+}
+
+/**
+ * Build one server's live-row sequence registry (SRJ-706, SRJ-811). Holds its
+ * state in the returned object only; reads, starts and schedules nothing when
+ * built. Each entry is keyed by its instance id and records its persona key;
+ * it is removed when its sequence settles, whatever the outcome, which the
+ * sequence's own end line logs once.
+ */
+export function createLiveRowSequenceRegistry(options: LiveRowSequenceRegistryOptions): LiveRowSequenceRegistry {
+  const { deps, runAttempt } = options
+  const running = new Map<string, RegisteredSequence>()
+  const lastOutcomes = new Map<string, LiveRowSequenceOutcome>()
+  let closed = false
+
+  const log = (line: string): void => {
+    try {
+      deps.log(line)
+    } catch {
+      /* a failing sink changes nothing about the registry */
+    }
+  }
+
+  const entriesFor = (key: string): RegisteredSequence[] => [...running.values()].filter((entry) => entry.key === key)
+
+  /** Run the sequence after the start answered, inside its own recovery attempt; never rejects. */
+  const runEntry = async (entry: RegisteredSequence, request: LiveRowSequenceRequest): Promise<LiveRowSequenceOutcome> => {
+    let outcome: LiveRowSequenceOutcome
+    try {
+      // Always awaited, so the sequence's first call comes after the start entry answered.
+      await Promise.resolve()
+      outcome = await runAttempt(entry.key, () => runLiveRowSequence(request, deps, entry.stop))
+    } catch (err) {
+      // Not reached: the sequence never rejects; the attempt runner only wraps it.
+      log(liveRowSequenceFailedLine(entry.ref, 'the sequence', describeThrownValue(err)))
+      outcome = { kind: LIVE_ROW_OUTCOME_INTERNAL_ERROR, runs: 0, kills: 0, judgedRuns: 0 }
+    }
+    if (running.get(entry.instanceId) === entry) running.delete(entry.instanceId)
+    lastOutcomes.set(entry.key, outcome)
+    return outcome
+  }
+
+  const stopEntries = (entries: readonly RegisteredSequence[], reason: LiveRowSequenceStopReason): Promise<void> => {
+    for (const entry of entries) {
+      if (entry.stop.stop(reason)) log(liveRowSequenceStopAskedLine(entry.ref, reason))
+    }
+    return Promise.all(entries.map((entry) => entry.settled)).then(() => undefined)
+  }
+
+  return {
+    start(request) {
+      const ref = request.ref ?? `persona=${request.key}`
+      if (closed) {
+        log(liveRowSequenceNotStartedLine(ref, request.instanceId, LIVE_ROW_START_CLOSED))
+        return LIVE_ROW_START_CLOSED
+      }
+      if (running.has(request.instanceId) || entriesFor(request.key).length > 0) {
+        log(liveRowSequenceNotStartedLine(ref, request.instanceId, LIVE_ROW_START_ALREADY_RUNNING))
+        return LIVE_ROW_START_ALREADY_RUNNING
+      }
+      let resolveSettled!: (outcome: LiveRowSequenceOutcome) => void
+      const settled = new Promise<LiveRowSequenceOutcome>((resolve) => {
+        resolveSettled = resolve
+      })
+      const entry: RegisteredSequence = { key: request.key, instanceId: request.instanceId, ref, stop: createLiveRowSequenceStop(), settled }
+      running.set(request.instanceId, entry)
+      void runEntry(entry, request).then(resolveSettled)
+      return LIVE_ROW_START_STARTED
+    },
+    stop(key, reason) {
+      const entries = entriesFor(key)
+      if (entries.length === 0) return Promise.resolve(false)
+      return stopEntries(entries, reason).then(() => true)
+    },
+    stopAll(reason) {
+      return stopEntries([...running.values()], reason)
+    },
+    close() {
+      closed = true
+      return stopEntries([...running.values()], LIVE_ROW_STOP_SHUTDOWN)
+    },
+    isRunning(key) {
+      for (const entry of running.values()) if (entry.key === key) return true
+      return false
+    },
+    _whenSettled(key) {
+      const entry = entriesFor(key)[0]
+      return entry !== undefined ? entry.settled : Promise.resolve(lastOutcomes.get(key))
+    },
   }
 }

@@ -14,7 +14,12 @@
  *   0. its dialog approver is stopped (b.jg5 SRJ-404, SRJ-715), first, when
  *      the teardown is submitted and again as its first step, before it
  *      waits for its launch in flight; the stop also cancels the approver a
- *      launch in flight would start, so no Enter reaches the old life;
+ *      launch in flight would start, so no Enter reaches the old life; right
+ *      after it, its running live-row sequence is stopped (b.jg5 SRJ-706,
+ *      SRJ-715), when the teardown is submitted and again as its second
+ *      step, which waits for the sequence's call in flight (a step-6 launch
+ *      it had started included) before going on, so the sequence makes no
+ *      further call and the retry-timer stops below clear an arm it made;
  *   1. its bring-up retries are cancelled and its bring-up state forgotten,
  *      its pending restart timer is cancelled and its UNAVAILABLE retry timer
  *      stopped (b.jg5 SRJ-305; a retry already running finishes first, since
@@ -313,6 +318,18 @@ export interface PersonaLifecycleDeps {
    * valid; production always passes it.
    */
   stopApprover?: (key: string) => unknown
+  /**
+   * Stop the key's running live-row sequence (b.jg5 SRJ-706, SRJ-715:
+   * production `stopLiveRowSequence` with the teardown reason): it makes no
+   * further call, and the returned promise settles once the sequence has
+   * settled, its call in flight returned (a step-6 launch it had already
+   * started included), so the teardown's later stops of the key's retry
+   * timer clear an arm that call made. Called right after `stopApprover`:
+   * when the teardown is submitted, and awaited as its second step, before
+   * the wait for the launch in flight. Optional, so hand-built fixtures stay
+   * valid; production always passes it.
+   */
+  stopLiveRowSequence?: (key: string) => unknown
   /** Resolves once the launch in flight for the key (if any) settled; never rejects (`whenLaunchSettled`). */
   whenLaunchSettled: (key: string) => Promise<void>
   /**
@@ -474,6 +491,9 @@ const DM_DESTINATION_SETTINGS: ReadonlySet<InPlaceSetting> = new Set<InPlaceSett
 // Factory
 // ---------------------------------------------------------------------------
 
+/** The teardown step that stops the persona's live-row sequence: its log label. */
+export const LIVE_ROW_SEQUENCE_STOP_STEP = 'stopping its live-row sequence'
+
 /** Compose the persona teardown, the apply bring-up (and recovery), the credentials change and the in-place update. Creates, reads and schedules nothing. */
 export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifecycle {
   function log(line: string): void {
@@ -500,7 +520,8 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
   /**
    * Run when a teardown is submitted, before its serializer turn. For every
    * teardown, first (b.jg5 SRJ-404, SRJ-715): stop its dialog approver, and
-   * the one its launch in flight would start. Then (b.f2b): cancel its
+   * the one its launch in flight would start; right after, its running
+   * live-row sequence (b.jg5 SRJ-706). Then (b.f2b): cancel its
    * launch's wait for a `working` row, if one is
    * running, so neither the teardown nor work queued ahead of it for the key
    * (a restart that joined that launch) waits it out, up to 10 minutes. For
@@ -513,8 +534,9 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
    * bring-up retry or its launch finds its entry cancelled.
    * Otherwise that work would launch the new declaration (the launch paths
    * read the applied set) only for the teardown to kill it. Every call acts
-   * synchronously (the approver's stop is not awaited here: its teardown
-   * step awaits it) and runs again in the teardown's own steps. A failure,
+   * synchronously (the approver's and the sequence's stops are not awaited
+   * here: their teardown steps await them) and runs again in the teardown's
+   * own steps. A failure,
    * thrown or rejected, is logged.
    */
   function cancelBeforeTurn(persona: Persona): void {
@@ -522,6 +544,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     const prefix = `[slack] persona teardown of ${renderPersonaRef(persona.name, key)}`
     const cancels: [string, () => unknown][] = [
       ['stopping its dialog approver', () => deps.stopApprover?.(key)],
+      [LIVE_ROW_SEQUENCE_STOP_STEP, () => deps.stopLiveRowSequence?.(key)],
       ["cancelling its launch's wait for a working row", () => deps.cancelLaunchWait?.(key)],
     ]
     if (isApplied(key)) {
@@ -562,6 +585,11 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // step and before the wait for its launch in flight, so no Enter reaches
     // the old life (the approver that launch would start does not start).
     await step('stopping its dialog approver', () => deps.stopApprover?.(key))
+    // b.jg5 SRJ-706, SRJ-715: its live-row sequence right after, before the
+    // wait for its launch in flight: it makes no further call, and this step
+    // waits for its call in flight, so the retry-timer stops below clear an
+    // arm that call made.
+    await step(LIVE_ROW_SEQUENCE_STOP_STEP, () => deps.stopLiveRowSequence?.(key))
     // Retries and timers next, so nothing for the key is started while the
     // teardown waits below.
     await step('cancelling its bring-up retries', () => deps.bringUps.cancel(key))

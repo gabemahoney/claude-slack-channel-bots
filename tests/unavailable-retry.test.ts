@@ -193,6 +193,7 @@ import {
   LIVE_ROW_LAUNCH_REUSE,
   LIVE_ROW_OUTCOME_ESCALATED,
   LIVE_ROW_OUTCOME_LAUNCHED,
+  LIVE_ROW_OUTCOME_NOT_JUDGED,
   LIVE_ROW_OUTCOME_STOPPED,
   LIVE_ROW_READ_ROW,
   LIVE_ROW_SEQUENCE_MAX_RUNS,
@@ -201,6 +202,7 @@ import {
   LIVE_ROW_STOP_TEARDOWN,
   liveRowSequenceEndLine,
   liveRowSequenceGetLine,
+  type LiveRowSequenceOutcome,
 } from '../src/live-row-sequence.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
@@ -257,6 +259,7 @@ import {
   RESTART_OUTCOME_LAUNCH_SKIPPED,
   RESTART_OUTCOME_LAUNCHED,
   RESTART_OUTCOME_LIVENESS_UNKNOWN,
+  RESTART_OUTCOME_SEQUENCE_WAITING,
   RESTART_OUTCOME_NOT_INITIALISED,
   RESTART_OUTCOME_NOT_UP,
   RESTART_OUTCOME_PENDING_DEFERRED,
@@ -312,6 +315,7 @@ import {
   UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT,
   UNAVAILABLE_RETRY_AGAIN_LAUNCHED,
   UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN,
+  UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING,
   UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED,
   UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED,
   UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED,
@@ -387,6 +391,7 @@ import {
   errTmuxSessionCreate,
   errTmuxUnresponsive,
   errUnusableName,
+  holdFindMissing,
   holdSpawns,
   SAMPLE_LAUNCH_START_DEFAULT,
   SAMPLE_LAUNCH_START_FRACTIONAL,
@@ -425,10 +430,13 @@ import {
   LATE_KILL_ANSWERS,
   makeRecoveryHarness,
   ordinaryAlertContent,
+  callCountsSince,
+  ownRowsLiveThenMissing,
   personaCallCounts,
   personaOf,
   recordCallOrder,
   retryNow,
+  startSequenceHeldAtRun,
   runSequenceStoppedAtKill,
   unclassifiedEndedLine,
   unclassifiedLines,
@@ -440,6 +448,7 @@ import {
   type RecoveryHarnessOptions,
   type RecoveryNotice,
   type RecoverySequenceRequest,
+  type RecoverySequenceRun,
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
 import { stripComments } from './test-helpers/source-audit.ts'
@@ -1639,35 +1648,6 @@ describe('unavailable retry: P’s dialog approver is in flight for P, blocks no
 // sweep inside its own attempt is armed once, whoever started the sweep.
 // ---------------------------------------------------------------------------
 
-/** The harness stub's findMissing, held open: every call waits until the test fails them all. */
-interface FindMissingHold {
-  /** findMissing calls made so far. */
-  calls(): number
-  /** Resolves at the first findMissing call. */
-  readonly entered: Promise<void>
-  /** Reject every held call with `err`. */
-  failAll(err: Error): void
-}
-
-function holdFindMissing(h: RecoveryHarness): FindMissingHold {
-  const client = h.stub.client as unknown as { findMissing: (params: unknown) => Promise<unknown> }
-  const held: Array<(err: Error) => void> = []
-  const entered = Promise.withResolvers<void>()
-  let calls = 0
-  client.findMissing = () => {
-    calls++
-    entered.resolve()
-    return new Promise((_resolve, reject) => { held.push(reject) })
-  }
-  return {
-    calls: () => calls,
-    entered: entered.promise,
-    failAll: (err) => {
-      for (const reject of held.splice(0)) reject(err)
-    },
-  }
-}
-
 /** One live pre-persona row (no `persona` label), so the start sweep kills it and then runs its findMissing sweep. */
 function prePersonaRowScript(): RecoveryStubScript {
   return { listResult: { spawns: [cannedListRow({ claude_instance_id: 'cscb_legacy', labels: { service: 'cscb' } })] } }
@@ -1682,14 +1662,14 @@ describe('unavailable retry: a shared findMissing sweep that fails arms each per
   test('P and Q, each inside its own attempt, share one findMissing call; when it fails each is armed once with unavailable', async () => {
     const h = (harness = makeRecoveryHarness())
     const [p, q] = h.keys as [string, string]
-    const hold = holdFindMissing(h)
+    const hold = holdFindMissing(h.stub.client)
 
     const both = Promise.all([sweepInAttempt(p), sweepInAttempt(q)])
-    await hold.entered
-    hold.failAll(errCallTimeout('find-missing'))
+    await hold.entered()
+    hold.fail(errCallTimeout('find-missing'))
     await both
 
-    expect(hold.calls()).toBe(1)
+    expect(hold.calls).toHaveLength(1)
     const byKey = (a: { key: string }, b: { key: string }) => a.key.localeCompare(b.key)
     expect([...h.triggers].sort(byKey)).toEqual(
       [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }, { key: q, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }].sort(byKey),
@@ -1713,17 +1693,17 @@ describe('unavailable retry: a shared findMissing sweep that fails arms each per
     const h = (harness = makeRecoveryHarness())
     const [p] = h.keys as [string]
     h.script(prePersonaRowScript())
-    const hold = holdFindMissing(h)
+    const hold = holdFindMissing(h.stub.client)
 
     const sweep = reconcileOrphans(h.config)
-    await hold.entered
+    await hold.entered()
     const joined = sweepInAttempt(p)
-    hold.failAll(errCallTimeout('find-missing'))
+    hold.fail(errCallTimeout('find-missing'))
     const result = await sweep
     await joined
 
     expect(result.prePersona).toEqual({ kept: 1, live: 1, killFailed: 0 })
-    expect(hold.calls()).toBe(1)
+    expect(hold.calls).toHaveLength(1)
     expectArmedOnce(h, p, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
   })
 
@@ -1734,16 +1714,16 @@ describe('unavailable retry: a shared findMissing sweep that fails arms each per
     const h = (harness = makeRecoveryHarness())
     const [starter, joiner] = h.keys as [string, string]
     h.script(prePersonaRowScript())
-    const hold = holdFindMissing(h)
+    const hold = holdFindMissing(h.stub.client)
 
     const started = start(h, starter)
-    await hold.entered
+    await hold.entered()
     const joined = sweepDeadTmuxChannel(joiner, 'dead-session')
-    hold.failAll(errCallTimeout('find-missing'))
+    hold.fail(errCallTimeout('find-missing'))
     await started
     await joined
 
-    expect(hold.calls()).toBe(1)
+    expect(hold.calls).toHaveLength(1)
     expect(h.controller.isArmed(joiner)).toBe(false)
     if (starterArms) expectArmedOnce(h, starter, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
     else expectNothingArmed(h)
@@ -1992,6 +1972,7 @@ describe('unavailable retry: the retry action’s decisions over stand-ins', () 
     [RESTART_OUTCOME_LAUNCHED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, row: UNAVAILABLE_RETRY_ROW_PENDING, switchToPendingOnly: true }],
     [RESTART_OUTCOME_NOT_INITIALISED, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_RESTART_NOT_INITIALISED }],
     [RESTART_OUTCOME_LIVENESS_UNKNOWN, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN, keepsLastRow: true }],
+    [RESTART_OUTCOME_SEQUENCE_WAITING, { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING }],
   ])('full mode: a retry entry answering %s answers %o, with no row read', async (outcome, answer) => {
     const deps = fullModeDeps(outcome)
 
@@ -7541,7 +7522,7 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
     for (let flushes = 0; flushes < 20 && h.clock.pendingCount() === 0; flushes++) await h.clock.flush()
     expect(h.stub.calls.findMissingCalls).toHaveLength(1)
 
-    expect(run.stop.stop(reason)).toBe(true)
+    expect(await run.stop(reason)).toBe(true)
 
     expect(await run.outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason })
     expect(h.clock.pendingCount()).toBe(0)
@@ -7669,5 +7650,89 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
     expect(h.triggers.filter((trigger) => SEQUENCE_CAUSES.includes(trigger.kind))).toEqual([])
     expect(h.controller.view(key)?.causes ?? []).not.toContainAnyValues([...SEQUENCE_CAUSES])
     expect(h.notices).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A running live-row sequence blocks P's retry (b.jg5 SRJ-303, SRJ-706; the
+// E11 and E17 notes)
+//
+// On the recovery harness, whose "blocks a retry" (the full-mode retry
+// action's in-flight check, from which "in flight for P" is built) counts a
+// running sequence as main()'s does, with P's sequence started through the
+// registry and its first run held. "In flight for P" at the lost-message
+// read gate is tests/inbound-recovery-drop-branch.test.ts's; the restart
+// work's own gate is tests/restart.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('unavailable retry: a running live-row sequence blocks P\'s retry and its restart path, a refusal at the doubled wait (SRJ-303, SRJ-706)', () => {
+  test.each<[string, (run: RecoverySequenceRun) => Promise<boolean> | undefined, LiveRowSequenceOutcome['kind']]>([
+    ['ended (its launch)', () => undefined, LIVE_ROW_OUTCOME_LAUNCHED],
+    ['been stopped (the teardown reason, through the stop entry)', (run) => run.stop(LIVE_ROW_STOP_TEARDOWN), LIVE_ROW_OUTCOME_STOPPED],
+  ])('a retry fire for P while its sequence runs makes no agent-director call for P and re-arms at the doubled wait, while Q\'s retry beside it runs; once the sequence has %s, P\'s next retry runs', async (_label, stop, kind) => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const run = await startSequenceHeldAtRun(h, key, hold)
+    h.controller.arm(key, UNAVAILABLE)
+    h.controller.arm(other, UNAVAILABLE)
+    h.setConnected(other, true)
+    const pCalls = personaCallCounts(h, key)
+
+    await h.advance(waitMs(0))
+
+    expect(personaCallCounts(h, key)).toEqual(pCalls)
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, 1))
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(1), refusals: 1 })
+    // Q's retry ran: its row read found it live and connected, nothing left to recover.
+    expect(h.stops).toEqual([{ key: other, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
+
+    const stopping = stop(run)
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(key)]: 'ids' } }))
+    expect((await h.driveSequence(run.outcome)).kind).toBe(kind)
+    if (stopping !== undefined) expect(await stopping).toBe(true)
+    expect(h.sequenceRunning(key)).toBe(false)
+    h.setConnected(key, true)
+    const before = personaCallCounts(h, key)
+    await retryNow(h, key)
+
+    expect(callCountsSince(personaCallCounts(h, key), before)).toEqual({ statusCalls: 1 })
+    expect(h.stops).toEqual([{ key: other, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }, { key, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
+  })
+
+  // The restart work's own gate (a restart queued before the sequence
+  // started) answers sequence-waiting; the running query is replaced here so
+  // the retry's own in-flight check, which answers first, lets the run reach it.
+  test('a full-mode retry whose restart run answers sequence-waiting re-arms at the doubled wait with the exported again-reason, retry after retry, never stopping the timer and making no call', async () => {
+    let sequenceFor: string | undefined
+    const h = (harness = makeRecoveryHarness({ ...RETRY_TIMER_ONLY, restartDeps: { isLiveRowSequenceRunning: (k: string): boolean => k === sequenceFor } }))
+    const [key] = h.keys as [string]
+    sequenceFor = key
+    h.controller.arm(key, UNAVAILABLE)
+
+    for (let retry = 1; retry <= 3; retry++) {
+      await retryNow(h, key)
+      expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, retry, UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING, retry))
+    }
+
+    expect(h.controller.isArmed(key)).toBe(true)
+    expect([h.stub.callCount(), h.stops, getFailureCount(key)]).toEqual([0, [], 0])
+  })
+
+  test('after SRJ-717\'s not-judged stop, P\'s retry timer is armed with its cause, and its next fire runs E8\'s full-mode retry', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    const notJudged = SEQUENCE_ENDS.find(([, cause]) => cause === UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED)!
+    const request = await notJudged[2](h, key)
+    expect(await h.runSequence(key, request)).toMatchObject({ kind: LIVE_ROW_OUTCOME_NOT_JUDGED })
+    expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED])
+    h.setConnected(key, true)
+    h.script({ statusResult: cannedStatusResult() })
+
+    await retryNow(h, key)
+
+    expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, causes: [UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED] })])
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
   })
 })
