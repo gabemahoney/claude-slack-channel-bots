@@ -273,7 +273,7 @@
  * observer; `afterEach` runs `assertNoLeak` over every line, event and record
  * captured, over every notice post and over each harness's `captured()`,
  * then cleans the harness up (which throws on a pending timer) and resets the
- * health check and the raw tmux seams a case recorded. The notice cases build `createPersonaEpisodes` over
+ * health check and the raw tmux runner a case recorded. The notice cases build `createPersonaEpisodes` over
  * `createFakeClock` with a recording sink; `afterEach` checks no timer is
  * pending and clears the session-manager notifier and its not-connected
  * latch. No `mock.module()`.
@@ -459,7 +459,6 @@ import {
   _resetNotConnectedEpisodes,
   _resetTmuxCommandRunner,
   _setTmuxCommandRunner,
-  _setTmuxSessionKiller,
   isLaunchInFlight,
   notifyPersonaNotConnected,
   OWN_ROW_READ_ROW,
@@ -1894,7 +1893,7 @@ afterEach(() => {
   const built = harnesses
   harnesses = []
   _resetHealthCheckState()
-  // The raw tmux seams a case records (`recordRawTmux`); the harness puts back the killer.
+  // The raw tmux runner a case records (`recordRawTmux`).
   _resetTmuxCommandRunner()
   for (const h of built) {
     try {
@@ -2419,29 +2418,23 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
 // automated path; a lost message then reports held for a human (AC 68, AC 77)
 // ---------------------------------------------------------------------------
 
-/** One raw tmux seam call: the seam and what it targeted (a session name, or the runner's arguments joined). */
+/** One raw tmux runner call: what it targeted (the runner's arguments joined). */
 interface RawTmuxCall {
-  readonly seam: string
   readonly target: string
 }
 
 /**
- * Replace every raw tmux seam of the session manager (the command runner
- * and the session killer) with a recorder that runs
- * nothing; `afterEach` and the harness's `cleanup()` put them back. Answers
- * the recorded calls, in order. The startup-dialog approver has no raw tmux
+ * Replace the session manager's one raw tmux seam (the command runner) with
+ * a recorder that runs nothing; `afterEach` puts it back. Answers the
+ * recorded calls, in order. The startup-dialog approver has no raw tmux
  * seam: its pane reads and keys go through the stub client's `readPane` and
  * `sendKeys`, which `tmuxTouchingCallsIn` counts.
  */
 function recordRawTmux(): RawTmuxCall[] {
   const calls: RawTmuxCall[] = []
-  const record = (seam: string, target: string) => calls.push({ seam, target })
   _setTmuxCommandRunner(async (args) => {
-    record('runner', args.join(' '))
+    calls.push({ target: args.join(' ') })
     return { code: 1, stdout: '' }
-  })
-  _setTmuxSessionKiller(async (name) => {
-    record('killer', name)
   })
   return calls
 }

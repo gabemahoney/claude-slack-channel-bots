@@ -1225,7 +1225,6 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
   test.each<[string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, SpawnPersonaResult['action']]>([
     ['a STATE answer from resume (ErrJsonlNeverWritten)', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errJsonlNeverWritten() }), 'spawned'],
     ['a DIRECTORY answer from spawn', () => ({ spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found') }), 'failed'],
-    ['a LAUNCH FAILURE answer from resume', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errTmuxSessionCreate('resume') }), 'spawned'],
     ['ErrSpawnNotFound from the collision get', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() }), 'spawned'],
     // b.jg5 SRJ-605: the working-row wait's poll reading the row absent is
     // 'dead-session', and the recovery resumes the row the collision read.
@@ -2563,6 +2562,8 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
     for (let n = 1; n < RESTART_FAILURE_CAP; n++) {
       await retryNow(h, key)
       expect(getFailureCount(key)).toBe(n)
+      // Exactly one spawn per retry: none in the failed one's place (b.jg5 SRJ-602).
+      expect(h.stub.calls.spawnCalls).toHaveLength(n)
       expect(h.lines).toContain(reArmedLine(key, n, UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED, n))
       expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(n), refusals: n })
     }
@@ -2570,6 +2571,7 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
     await retryNow(h, key)
 
     expect(getFailureCount(key)).toBe(RESTART_FAILURE_CAP)
+    expect(h.stub.calls.spawnCalls).toHaveLength(RESTART_FAILURE_CAP)
     expect(new Set(row.spawnedAt).size).toBe(RESTART_FAILURE_CAP)
     expect(h.capReached).toEqual([key])
     expect(h.notices.filter((n) => n.text.includes('automatic restarts suspended'))).toEqual([expect.objectContaining({ key })])
@@ -2583,15 +2585,8 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     for (let i = 1; i < RESTART_FAILURE_CAP; i++) recordFailure(key)
-    h.script({ statusFn: () => cannedStatusResult({ state: 'missing' }), spawnError: errTmuxSessionCreate('spawn') })
-    // Only the first spawn is held; the launch's one spawn retry after
-    // ErrTmuxSessionCreate reaches the stub, which fails it too.
-    let first = true
-    const hold = holdSpawns(h.stub.client, () => {
-      const held = first
-      first = false
-      return held
-    })
+    h.script({ statusFn: () => cannedStatusResult({ state: 'missing' }) })
+    const hold = holdSpawns(h.stub.client)
     h.controller.arm(key, UNAVAILABLE)
 
     // Restart work for the persona holds its serializer turn at its launch.
@@ -2603,14 +2598,16 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
     expect(h.attempts).toHaveLength(1)
     expect(h.controller.view(key)?.phase).toBe('running')
 
-    // The held launch fails, counted: that failure reaches the cap.
+    // The held launch fails with a LAUNCH FAILURE, counted, with no spawn in
+    // its place (b.jg5 SRJ-602): that failure reaches the cap.
     hold.fail(personaInstanceId(key), errTmuxSessionCreate('spawn'))
     expect(await restart).toBe(RESTART_OUTCOME_CAPPED)
     await h.settle()
 
     expect(h.errors.filter((line) => line.startsWith(`[slack] Relaunching session for persona=${key} `))).toHaveLength(1)
-    expect(hold.calls).toHaveLength(2)
-    expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1, spawnCalls: 1 })
+    // The one held spawn is the only spawn; it is not in the stub's own log.
+    expect(hold.calls).toHaveLength(1)
+    expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
     expect(getFailureCount(key)).toBe(RESTART_FAILURE_CAP)
     expect(h.capReached).toEqual([key])
     expect(h.notices.filter((n) => n.text.includes('automatic restarts suspended'))).toEqual([expect.objectContaining({ key })])

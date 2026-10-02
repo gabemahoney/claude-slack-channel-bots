@@ -113,8 +113,8 @@
  * - `stub`: one stub client (`makeStubClient`) with its call log
  *   (`stub.calls`), installed through `installStubSpawnPath` with the spawn
  *   home under the harness's temporary HOME, and handed to the outage state
- *   (`initOutageState`) as its client. The tmux session killer the launch
- *   path can reach is inert, so no tmux runs.
+ *   (`initOutageState`) as its client. No launch path kills a tmux session
+ *   or runs tmux: every launch reaches only the stub.
  *   `script(knobs)` sets the stub's answers (`StubClientOptions` knobs such
  *   as `spawnError` or `getQueue`), read at each call.
  * - `triggers`: the outage state's trigger sink (b.jg5 SRJ-301) is the
@@ -710,11 +710,9 @@ import {
   _resetFindMissingMemo,
   _resetLadderKillClock,
   _resetLiveRowSequenceRegistry,
-  _resetTmuxSessionKiller,
   _setApproverClock,
   _setDialogReadyTimeoutMs,
   _setLadderKillClock,
-  _setTmuxSessionKiller,
   _whenDialogApproverStopped,
   buildLiveRowSequenceDeps,
   isDialogApproverRunning,
@@ -1407,7 +1405,6 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     },
   }
   _setLadderKillClock(killRetryClock)
-  _setTmuxSessionKiller(async () => {})
   _resetFindMissingMemo()
   const triggerSink: UnavailableRetryTriggerSink = {
     arm(key, cause) {
@@ -2114,7 +2111,6 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       _resetLadderKillClock()
       for (const unbind of unbindLatch) unbind()
       resetStubSpawnPath()
-      _resetTmuxSessionKiller()
       _resetFindMissingMemo()
       resetAdSettingsForTests()
       console.error = savedConsoleError

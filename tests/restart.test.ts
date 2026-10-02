@@ -85,8 +85,6 @@ import {
   stopAllDialogApprovers,
   _setTmuxCommandRunner,
   _resetTmuxCommandRunner,
-  _setTmuxSessionKiller,
-  _resetTmuxSessionKiller,
   _setDialogReadyTimeoutMs,
   _resetDialogReadyTimeoutMs,
   _setSpawnHomeDir,
@@ -198,10 +196,12 @@ import {
   createUnavailableRetryController,
   UNAVAILABLE_RETRY_BASE_S,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
+  UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_MODE_FULL,
+  UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
   type UnavailableRetryController,
 } from '../src/unavailable-retry.ts'
 import { RECHECK_OUTCOME_PASS, RECHECK_OUTCOME_STOP, installAdVersionRecheck, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
@@ -3363,9 +3363,9 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
 // `waiting`, so the dialog approver a launch starts after it returns (b.jg5
 // SRJ-401) stops at its first lap; a case awaits that stop
 // (`_whenDialogApproverStopped`) before it asserts on what followed the
-// launch, and afterEach stops any still running. Every raw-tmux seam is a
-// no-op, the `config_dir` label derives from a temp home, and every persona
-// path lies under a temp directory removed in afterEach.
+// launch, and afterEach stops any still running. No launch path runs tmux,
+// the `config_dir` label derives from a temp home, and every persona path
+// lies under a temp directory removed in afterEach.
 // ---------------------------------------------------------------------------
 
 describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () => {
@@ -3520,7 +3520,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     expect(errLines.filter((l) => l === skipLine(a))).toHaveLength(1)
   })
 
-  test('same persona: a joined launch that fails counts one failure per launchSession boolean restart receives (single counting site)', async () => {
+  test('same persona: a joined launch that fails with a LAUNCH FAILURE counts one failure per launchSession boolean restart receives (single counting site); nothing is killed and no spawn is made in its place', async () => {
     const deps = makeInFlightDeps()
     initRestart(deps)
     holdIds.add(personaInstanceId(a.key))
@@ -3534,32 +3534,22 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     expect(spawnsFor(a)).toHaveLength(1)
     expect(getFailureCount(a.key)).toBe(0)
 
-    // The one held spawn fails with a LAUNCH FAILURE (ErrTmuxSessionCreate):
-    // the shared ladder's own self-heal kills the orphan tmux session by name
-    // (stubbed) and spawns once more, still held, and that spawn fails too. The
-    // one shared ladder returns `failed`, so each launchSession call hands
-    // restart `false`, and each is counted.
-    const tmuxKills: string[] = []
-    _setTmuxSessionKiller(async (name) => { tmuxKills.push(name) })
-    try {
-      const launchFailure = errTmuxSessionCreate('spawn')
-      hold.fail(personaInstanceId(a.key), launchFailure)
-      await Bun.sleep(WAIT_MS)
-      expect(tmuxKills).toHaveLength(1)
-      expect(spawnsFor(a)).toHaveLength(2)
-      expect(launchResults).toEqual([])
-      hold.fail(personaInstanceId(a.key), errTmuxSessionCreate('spawn'))
-      await Bun.sleep(WAIT_MS)
-      expect(launchResults).toEqual([{ key: a.key, ok: false }, { key: a.key, ok: false }])
-      expect(getFailureCount(a.key)).toBe(2)
-      // One ladder ran: its spawn and its one self-heal spawn, and one
-      // spawn-failure notice, for A.
-      expect(spawnsFor(a)).toHaveLength(2)
-      expect(notices.map((n) => n.key)).toEqual([a.key])
-      expect(notices[0]!.text).toContain(launchFailure.errName)
-    } finally {
-      _resetTmuxSessionKiller()
-    }
+    // The one held spawn fails with a LAUNCH FAILURE (ErrTmuxSessionCreate,
+    // b.jg5 SRJ-602): the one shared ladder answers `failed` with no kill and
+    // no spawn in its place, so each launchSession call hands restart
+    // `false`, and each is counted.
+    const launchFailure = errTmuxSessionCreate('spawn')
+    hold.fail(personaInstanceId(a.key), launchFailure)
+    await Bun.sleep(WAIT_MS)
+    expect(launchResults).toEqual([{ key: a.key, ok: false }, { key: a.key, ok: false }])
+    expect(getFailureCount(a.key)).toBe(2)
+    // One ladder ran: its one spawn, one spawn-failure notice for A, and no
+    // kill after the restart run's own.
+    expect(spawnsFor(a)).toHaveLength(1)
+    expect(killsFor(a)).toBe(1)
+    expect(hold.held()).toEqual([])
+    expect(notices.map((n) => n.key)).toEqual([a.key])
+    expect(notices[0]!.text).toContain(launchFailure.errName)
   })
 
   test('different persona: while A\'s launch is held, a restart for B kills and spawns B and completes without waiting for A', async () => {
@@ -4211,7 +4201,7 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
 // persona's UNAVAILABLE retry timer. A relaunch answered UNAVAILABLE is
 // `'refused'`: the timer owns the persona and restart.ts never counts it, so
 // the cap is never reached on UNAVAILABLE alone. A LAUNCH FAILURE (`false`)
-// still counts and caps.
+// still counts and caps, and arms P's timer at once in pending-only mode.
 //
 // The adapters are server.ts's and the session manager's REAL ones over the
 // stub AD client, and a real retry controller is installed as the outage
@@ -4491,19 +4481,50 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     expectArmedOnce(UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
   })
 
-  test('a relaunch that fails with a LAUNCH FAILURE (ErrTmuxSessionCreate) still answers false: each run counts, the cap is reached and onCapReached fires once; no timer is armed', async () => {
-    installStub({ spawnError: errTmuxSessionCreate('spawn') })
+  // b.jg5 SRJ-602, SRJ-105's LAUNCH FAILURE row: a launch's
+  // ErrTmuxSessionCreate is one counted failure per run, with no kill because
+  // of it and no launch in its place; it arms P's timer at once in
+  // pending-only mode (SRJ-111, SRJ-113, SRJ-409), which never marks the
+  // launch refused, so each run still counts.
+  test.each<[string, (stubOpts: { spawnCalls: SpawnParams[]; resumeCalls: ResumeParams[]; killCalls: KillParams[] }) => Parameters<typeof makeStubClient>[0], { spawns: number; resumes: number }]>([
+    ['the first spawn', (calls) => ({ ...calls, spawnError: errTmuxSessionCreate('spawn') }), { spawns: 1, resumes: 0 }],
+    [
+      'a resume of an ended row',
+      (calls) => ({
+        ...calls,
+        spawnError: errInstanceIdCollision(),
+        getResult: cannedGetResult({ state: 'ended', claude_session_id: 'a-session-id' }, p, dir),
+        resumeError: errTmuxSessionCreate('resume'),
+      }),
+      { spawns: 1, resumes: 1 },
+    ],
+  ])('a relaunch whose %s fails with a LAUNCH FAILURE (ErrTmuxSessionCreate) answers false: each run counts once with one launch call at the failing site and no kill or launch after it, the cap is reached and onCapReached fires once; P\'s timer is armed once, pending-only', async (_label, stubOpts, perRun) => {
+    const calls = { spawnCalls: [] as SpawnParams[], resumeCalls: [] as ResumeParams[], killCalls: [] as KillParams[] }
+    installStub(stubOpts(calls))
     const deps = makeDeps({ restartDelay: CAP_BASE_DELAY_S, launchSession: realLaunch })
     initRestart(deps)
 
-    for (let i = 0; i < RESTART_FAILURE_CAP; i++) await runRestart(p.key)
+    for (let i = 0; i < RESTART_FAILURE_CAP; i++) {
+      await runRestart(p.key)
+      expect(getFailureCount(p.key)).toBe(i + 1)
+    }
 
     expect(launchResults).toEqual(Array(RESTART_FAILURE_CAP).fill(false))
-    expect(getFailureCount(p.key)).toBe(RESTART_FAILURE_CAP)
+    expect([calls.spawnCalls.length, calls.resumeCalls.length]).toEqual([perRun.spawns * RESTART_FAILURE_CAP, perRun.resumes * RESTART_FAILURE_CAP])
+    // The run's own kill comes before its launch; nothing kills after the failure.
+    expect(deps.killSessionCalls).toEqual(Array(RESTART_FAILURE_CAP).fill(p.key))
+    expect(calls.killCalls).toEqual([])
     expect(isAtCap(p.key, RESTART_FAILURE_CAP)).toBe(true)
     expect(deps.onCapReachedCalls).toEqual([p.key])
     expect(errLines.filter((l) => l === REFUSED_LINE(p.key))).toEqual([])
-    expect(retry.armedKeys()).toEqual([])
+    expect(errLines.filter((l) => l === FAILED_LINE(p.key))).toHaveLength(RESTART_FAILURE_CAP)
+    // One arm: later arms while armed log nothing and keep its due time.
+    expect(retryLines.filter((l) => l.startsWith(`[slack] unavailable-retry: persona=${p.key} armed`))).toEqual([
+      expect.stringContaining(`persona=${p.key} armed in pending-only mode (`),
+    ])
+    expect(retry.armedKeys()).toEqual([p.key])
+    expect(retry.view(p.key)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
+    expect(retry.isArmed(q.key)).toBe(false)
   })
 
   // The restart counting site alone: `'refused'` from the deps is neither a

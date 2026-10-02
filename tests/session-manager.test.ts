@@ -48,7 +48,8 @@
  *     afterEach with nothing pending and nothing run), an UNAVAILABLE spawn
  *     and an UNCLASSIFIED collision `get` arm the persona's timer and mark the
  *     failed launch refused (`launchSession` answers `'refused'`); a LAUNCH
- *     FAILURE or DIRECTORY spawn, or no sink at all, marks nothing
+ *     FAILURE spawn arms the timer pending-only and is counted, never
+ *     marked; a DIRECTORY spawn, or no sink at all, marks nothing
  *     (`launchSession` false); a joiner shares the marker; a start pass with
  *     one UNAVAILABLE persona tallies as before and arms only that persona.
  *   - b.jg5 SRJ-105 (AC 25), on `makeRecoveryHarness`: every spawn, resume,
@@ -207,10 +208,13 @@
  *     deleted, and killed only when live; one findMissing sweep after the
  *     kills lets a killed row whose session is gone read `missing`, so the
  *     next start doesn't kill it again.
- *   - b.1ix raw tmux: through the tmux runner seam (`_setTmuxCommandRunner`,
- *     a failing stand-in by default, so no test reaches a real tmux server),
- *     the b.vub kill targets the persona's own session exactly, never a
- *     prefix neighbour (`slack_bot_dev` / `slack_bot_dev_2`).
+ *   - b.1ix raw tmux: the tmux runner seam (`_setTmuxCommandRunner`) is a
+ *     failing stand-in by default, so no test reaches a real tmux server,
+ *     and `src/` starts tmux nowhere else.
+ *   - b.jg5 SRJ-602: `ErrTmuxSessionCreate` from the first spawn, a `resume`
+ *     and a reuse spawn is one counted launch failure: no kill of any kind
+ *     and no spawn in its place. SRJ-711: no plain spawn carries the reuse
+ *     flag, and a first spawn that collides goes to `get` and `resume`.
  *   - b.4ie / b.jg5 SRJ-402 startup-dialog approver, through agent-director
  *     only, on a fake clock (`_setApproverClock`, `useApproverClock`): a
  *     fresh or resumed row reading `pending` with either dialog is cleared
@@ -281,7 +285,7 @@
  *     `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` in `extra_env`, and a
  *     resume passes only the instance ID (agent-director restores the env
  *     stored at the row's spawn, modelled in one case).
- *   - Persona notices (b.av2 SR-7.2): spawn failure (generic, self-heal
+ *   - Persona notices (b.av2 SR-7.2): spawn failure (generic, a launch
  *     failure, restart cap), lost and inconclusive history,
  *     held-until-validated notices (channel and `dm` destinations) and the
  *     `spawn-failure-post` startup error and restart-path stderr line, whose
@@ -446,11 +450,8 @@ import {
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
   type EscalateDeadVerdict,
-  _setTmuxSessionKiller,
-  _resetTmuxSessionKiller,
   _setTmuxCommandRunner,
   _resetTmuxCommandRunner,
-  type TmuxCommandRunner,
   _setApproverClock,
   _resetApproverClock,
   _whenDialogApproverStopped,
@@ -1109,9 +1110,8 @@ beforeEach(() => {
   const defaultHome = fixtureSubdir('default-home')
   mkdirSync(join(defaultHome, '.claude'))
   _setSpawnHomeDir(defaultHome)
-  // Every raw tmux call goes through one runner (b.1ix): a failing stand-in,
-  // so a default seam a test reaches (the b.vub kill) never touches a real
-  // tmux server.
+  // The raw tmux runner, which no launch path calls: a failing stand-in, so
+  // a call that did reach it would never touch a real tmux server.
   _setTmuxCommandRunner(async () => ({ code: 1, stdout: '' }))
 })
 
@@ -1123,7 +1123,6 @@ afterEach(() => {
   _resetDialogReadyTimeoutMs()
   _resetWaitForWaitingTimeoutMs()
   _resetFindMissingMemo()
-  _resetTmuxSessionKiller()
   _resetTmuxCommandRunner()
   // An approver case runs the approver on a fake clock (`useApproverClock`).
   _resetApproverClock()
@@ -1365,17 +1364,14 @@ async function launchThenRunApprover<T>(clock: FakeClock, key: string, launch: P
 /**
  * Record every raw tmux call from now on, in order: each command through the
  * runner seam (`_setTmuxCommandRunner`, answering as the file's failing
- * stand-in does) as its argv, and the session killer as
- * `[<seam>, <session>]`. The file's afterEach puts every seam back. The startup-dialog approver makes none of these calls.
+ * stand-in does) as its argv. The file's afterEach puts the seam back. No
+ * launch path and not the startup-dialog approver makes such a call.
  */
 function recordTmuxCalls(): string[][] {
   const calls: string[][] = []
   _setTmuxCommandRunner(async (args) => {
     calls.push([...args])
     return { code: 1, stdout: '' }
-  })
-  _setTmuxSessionKiller(async (name) => {
-    calls.push(['killer', name])
   })
   return calls
 }
@@ -1924,8 +1920,8 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
 
   // b.2oy — ErrSpawnNotFound recovery still surfaces genuine spawn failures.
   // Resume throws ErrSpawnNotFound, then the fresh spawn fails with a LAUNCH
-  // FAILURE (ErrTmuxSessionCreate; this site has no self-heal) → 'failed' and
-  // a spawn-failure notice goes to the persona's destination (b.av2 SR-7.2).
+  // FAILURE (ErrTmuxSessionCreate, no spawn in its place) → 'failed' and a
+  // spawn-failure notice goes to the persona's destination (b.av2 SR-7.2).
   test('b.2oy: ErrSpawnNotFound on resume + fresh spawn fails → failed + spawn-failure notice to the persona destination', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
@@ -2760,8 +2756,8 @@ describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
 
   /**
    * One row per way a ladder reaches agent-director: a fresh spawn, a resume
-   * (straight, and after a dead session), the restart adapter, and the two
-   * paths that spawn again after a first launch call.
+   * (straight, and after a dead session), the restart adapter, and the
+   * path that spawns again after a first launch call.
    */
   const LAUNCH_PATHS: Array<[string, LaunchPath]> = [
     ['fresh spawn', {
@@ -2802,21 +2798,6 @@ describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
       launch: spawnC,
       expected: { key: 'C', action: 'fresh-after-inconclusive-amnesia' },
       events: ['patch', 'spawn', 'resume', 'spawn'],
-    }],
-    ['self-heal after ErrTmuxSessionCreate', {
-      install: (_cfg, calls) => {
-        _setTmuxSessionKiller(async () => {})
-        return installStub({
-          ...calls,
-          spawnQueue: [
-            cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-            cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
-          ],
-        })
-      },
-      launch: spawnC,
-      expected: { key: 'C', action: 'spawned' },
-      events: ['patch', 'spawn', 'spawn'],
     }],
   ]
 
@@ -3072,7 +3053,6 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
 
   /** A stub whose first spawn collides with a row `row` and whose resume rejects with `resumeError`. */
   function installResumeRejects(row: CannedGetResult, calls: LadderCalls, resumeError: Error): StubClient {
-    _setTmuxSessionKiller(async () => {})
     return installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: row, resumeError })
   }
 
@@ -3086,8 +3066,8 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
    * dead-session recovery; a fresh spawn after a cwd or config_dir mismatch),
    * which between them reach the optimistic spawn, `client.resume` and
    * `replaceWithFreshSpawn`, plus one row for each other spawn call site: the
-   * single retry after ErrSpawnNotFound on the post-collision get, the
-   * self-heal respawn, and each fallback spawn in `resumeOrFreshSpawn`.
+   * single retry after ErrSpawnNotFound on the post-collision get and each
+   * fallback spawn in `resumeOrFreshSpawn`.
    * Paths that share a call site with a row here (resume_enabled false, a
    * dead working row, the other delete-then-spawn resume errors, the restart
    * adapter — covered end to end in restart.test.ts) have no row of their own.
@@ -3131,15 +3111,6 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
       install: (_cfg, calls) => installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getError: errSpawnNotFound() }),
       expected: 'spawned',
       events: [...COLLIDED, ...SPAWN],
-    }],
-    ['self-heal respawn after ErrTmuxSessionCreate on the first spawn', {
-      install: (_cfg, calls) => {
-        _setTmuxSessionKiller(async () => {})
-        return installStub({ ...calls, spawnQueue: [cannedErr<SpawnResult>(errTmuxSessionCreate('spawn')), spawnOk()] })
-      },
-      expected: 'spawned',
-      // Not a collision: the first step is not undone, and the respawn runs its own.
-      events: [...SPAWN, ...SPAWN],
     }],
     ['resume ErrJsonlMissing: delete + fresh spawn', {
       install: (cfg, calls) => installResumeRejects(guardRow(cfg, { state: 'ended' }), calls, errJsonlMissing()),
@@ -3424,7 +3395,6 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
 
   /** A stub whose first spawn collides with an ended row and whose resume rejects with `resumeError`. */
   function installResumeRejects(cfg: PersonaConfig, calls: LadderCalls, resumeError: Error): StubClient {
-    _setTmuxSessionKiller(async () => {})
     return installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: personaRow(cfg, 'C', { state: 'ended' }), resumeError })
   }
 
@@ -3432,8 +3402,7 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
    * Every way a launch reaches agent-director: the fresh spawn; a resume
    * (ended, missing, dead waiting and working rows, the restart relaunch);
    * each replacement spawn (resume_enabled false, cwd and config_dir
-   * mismatches, the retry after ErrSpawnNotFound on the get); the b.vub
-   * self-heal respawn (after the first spawn and after a resume); and each
+   * mismatches, the retry after ErrSpawnNotFound on the get); and each
    * fresh spawn after a rejected resume, the fresh-after-amnesia one included.
    */
   const ENV_PATHS: Array<[string, EnvPath]> = [
@@ -3473,17 +3442,6 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
     ['ErrSpawnNotFound on the post-collision get: the single retry spawn', {
       install: (_cfg, calls) => installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getError: errSpawnNotFound() }),
       expected: spawned, spawns: 2, resumes: 0,
-    }],
-    ['self-heal respawn after ErrTmuxSessionCreate on the first spawn', {
-      install: (_cfg, calls) => {
-        _setTmuxSessionKiller(async () => {})
-        return installStub({ ...calls, spawnQueue: [cannedErr<SpawnResult>(errTmuxSessionCreate('spawn')), spawnOk()] })
-      },
-      expected: spawned, spawns: 2, resumes: 0,
-    }],
-    ['self-heal respawn after ErrTmuxSessionCreate on resume', {
-      install: (cfg, calls) => installResumeRejects(cfg, calls, errTmuxSessionCreate('resume')),
-      expected: spawned, spawns: 2, resumes: 1,
     }],
     ['resume ErrJsonlMissing: delete + fresh spawn (fresh after amnesia)', {
       install: (cfg, calls) => installResumeRejects(cfg, calls, errJsonlMissing()),
@@ -3964,12 +3922,19 @@ describe('launch attempt: the refusal marker and launchSession\'s \'refused\' (b
     })
   }
 
-  /** A sink that records each arm in `armed` and answers true (the persona has a timer), as the real controller's `arm` does. */
+  /**
+   * A sink that records each arm in `armed` and answers true (the persona has
+   * a timer), as the real controller's `arm` does; a pending-only arm (a
+   * launch's `ErrTmuxSessionCreate`) is recorded with the cause it arms.
+   */
   function installRecordingSink(): void {
     installSink({
       arm: (key, cause) => {
         armed.push({ key, kind: cause.kind })
         return true
+      },
+      armPendingOnly: (key) => {
+        armed.push({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })
       },
     })
   }
@@ -3992,28 +3957,39 @@ describe('launch attempt: the refusal marker and launchSession\'s \'refused\' (b
     return retry
   }
 
+  /** One answer of the fresh spawn: the spawn's result but its key, the causes armed, and `launchSession`'s answer. */
+  interface SpawnAnswer {
+    readonly result: Record<string, unknown>
+    readonly armed: readonly string[]
+    readonly launched: LaunchSessionResult
+  }
+
   /**
-   * The fresh spawn's answers: an UNAVAILABLE one arms (and marks), a LAUNCH
-   * FAILURE (ErrTmuxSessionCreate, also after its one self-heal respawn) or
-   * DIRECTORY one does not. Each is built with the stub's builders or the
-   * client's own class.
+   * The fresh spawn's answers: an UNAVAILABLE one arms (and marks) with its
+   * cause; a LAUNCH FAILURE (ErrTmuxSessionCreate) arms P's timer at once in
+   * pending-only mode and is counted, never marked (b.jg5 SRJ-111, SRJ-409);
+   * a DIRECTORY one arms nothing. Each is built with the stub's builders or
+   * the client's own class.
    */
-  const SPAWN_ANSWERS: ReadonlyArray<readonly [string, () => Error, boolean]> = [
-    ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('spawn'), true],
-    ['UNAVAILABLE (a plain Error)', () => new Error('boom'), true],
-    ['LAUNCH FAILURE (ErrTmuxSessionCreate)', () => errTmuxSessionCreate('spawn'), false],
-    ['DIRECTORY (ErrCwdNotFound)', () => new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd /x does not exist'), false],
+  const SPAWN_ANSWERS: ReadonlyArray<readonly [string, () => Error, SpawnAnswer]> = [
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('spawn'), { result: { action: 'failed', refused: true }, armed: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], launched: 'refused' }],
+    ['UNAVAILABLE (a plain Error)', () => new Error('boom'), { result: { action: 'failed', refused: true }, armed: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], launched: 'refused' }],
+    [
+      'LAUNCH FAILURE (ErrTmuxSessionCreate)',
+      () => errTmuxSessionCreate('spawn'),
+      { result: { action: 'failed', countedClass: true, pendingOnlyArmed: true }, armed: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], launched: false },
+    ],
+    ['DIRECTORY (ErrCwdNotFound)', () => new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd /x does not exist'), { result: { action: 'failed' }, armed: [], launched: false }],
   ]
 
-  /** Persona C whose every spawn rejects with `build()`; the self-heal's tmux kill is a no-op. */
+  /** Persona C whose every spawn rejects with `build()`. */
   function installSpawnRejects(build: () => Error): { cfg: PersonaConfig; spawnCalls: import('agent-director').SpawnParams[] } {
-    _setTmuxSessionKiller(async () => {})
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls, spawnError: build() })
     return { cfg: makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir), spawnCalls }
   }
 
-  test.each(SPAWN_ANSWERS)('the spawn answers %s: the marker iff the timer was armed, for C only', async (_label, build, arms) => {
+  test.each(SPAWN_ANSWERS)('the spawn answers %s: the refusal marker iff a refusal armed the timer, for C only', async (_label, build, answer) => {
     installRecordingSink()
     const { cfg } = installSpawnRejects(build)
 
@@ -4022,11 +3998,11 @@ describe('launch attempt: the refusal marker and launchSession\'s \'refused\' (b
       result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     })
 
-    expect(result).toStrictEqual(arms ? { key: 'C', action: 'failed', refused: true } : { key: 'C', action: 'failed' })
-    expect(armed).toEqual(arms ? [{ key: 'C', kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }] : [])
+    expect<unknown>(result).toStrictEqual({ key: 'C', ...answer.result })
+    expect(armed).toEqual(answer.armed.map((kind) => ({ key: 'C', kind })))
   })
 
-  test.each(SPAWN_ANSWERS)('the spawn answers %s: launchSession answers \'refused\' iff the timer was armed, false otherwise', async (_label, build, arms) => {
+  test.each(SPAWN_ANSWERS)('the spawn answers %s: launchSession answers \'refused\' iff a refusal armed the timer, false otherwise', async (_label, build, answer) => {
     installRecordingSink()
     const { cfg } = installSpawnRejects(build)
 
@@ -4035,8 +4011,8 @@ describe('launch attempt: the refusal marker and launchSession\'s \'refused\' (b
       result = await launchSession('C', cfg)
     })
 
-    expect(result).toBe(arms ? 'refused' : false)
-    expect(armed.map((a) => a.key)).toEqual(arms ? ['C'] : [])
+    expect(result).toBe(answer.launched)
+    expect(armed).toEqual(answer.armed.map((kind) => ({ key: 'C', kind })))
   })
 
   test('no trigger sink installed: an UNAVAILABLE spawn arms nothing and carries no marker; launchSession answers false as before', async () => {
@@ -4154,59 +4130,42 @@ describe('launch attempt: the refusal marker and launchSession\'s \'refused\' (b
 })
 
 // ---------------------------------------------------------------------------
-// E3 Task 3: resume_enabled: false now replaces the row through the shared
-// kill+delete+fresh path, which self-heals ErrTmuxSessionCreate (b.vub)
+// resume_enabled: false replaces the row through the shared kill+delete+fresh
+// path; its fresh spawn's ErrTmuxSessionCreate is one counted launch failure
+// (b.jg5 SRJ-602, SRJ-713)
 // ---------------------------------------------------------------------------
 
-describe('resume_enabled: false fresh spawn self-heals ErrTmuxSessionCreate', () => {
-  test('ErrTmuxSessionCreate on the fresh spawn → kill orphan tmux by name, retry once → spawned, no notice', async () => {
-    const killedSessions: string[] = []
-    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+describe('resume_enabled: false fresh spawn answering ErrTmuxSessionCreate', () => {
+  test('one counted launch failure: failed, a spawn-failed entry and one notice; nothing killed for it (no kill call beyond the replacement\'s, no raw tmux call) and no spawn in its place', async () => {
+    const readLog = captureStartupErrors()
+    const tmux = recordTmuxCalls()
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
+    const launchFailure = errTmuxSessionCreate('spawn')
     installStub({
       spawnCalls,
       killCalls,
       deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedErr<import('agent-director').SpawnResult>(launchFailure),
       ],
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
     })
 
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-
-    expect(result).toEqual({ key: 'C', action: 'spawned' })
-    expect(killCalls).toHaveLength(1)
-    expect(deleteCalls).toHaveLength(1)
-    expect(killedSessions).toEqual(['slack_bot_C'])
-    expect(spawnCalls).toHaveLength(3) // collision + fresh (tmux-create) + self-heal retry
-    expect(notices).toHaveLength(0)
-  })
-
-  test('the self-heal retry also fails → failed, spawn-failed recorded and a spawn-failure notice', async () => {
-    const readLog = captureStartupErrors()
-    _setTmuxSessionKiller(async () => {})
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
-    installStub({
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-      ],
-      getResult: personaRow(cfg, 'C', { state: 'ended' }),
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     })
 
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-
-    expect(result).toEqual({ key: 'C', action: 'failed' })
-    expect(readLog()).toContain(`self-heal spawn after ErrTmuxSessionCreate failed for ${renderPersonaRef('C', 'C')}: ErrTmuxSessionCreate`)
-    expect(notices).toHaveLength(1)
-    expect(notices[0].text).toContain('ErrTmuxSessionCreate')
+    expect(result).toStrictEqual({ key: 'C', action: 'failed', countedClass: true })
+    expect([killCalls.length, deleteCalls.length, spawnCalls.length]).toEqual([1, 1, 2])
+    expect(tmux).toEqual([])
+    expect(onlyStartupEntry(readLog(), 'spawn-failed')).toContain(`fresh spawn after delete failed for ${renderPersonaRef('C', 'C')}: ${launchFailure.errName}`)
+    expect(notices.map((n) => n.key)).toEqual(['C'])
+    expect(notices[0].text).toContain(launchFailure.errName)
   })
 })
 
@@ -5996,8 +5955,7 @@ describe('startupSessionManager', () => {
   // JSON-quoted with the key beside it.
   test('a startup spawn failure names the persona in rendered form (JSON-quoted name plus key)', async () => {
     const readLog = captureStartupErrors()
-    // A LAUNCH FAILURE at every spawn: the self-heal's respawn fails too.
-    _setTmuxSessionKiller(async () => {})
+    // A LAUNCH FAILURE at the first spawn: one counted failure, no spawn in its place.
     const launchFailure = errTmuxSessionCreate('spawn')
     installStub({ spawnError: launchFailure })
     const name = 'Ops "Prod" Bot'
@@ -6018,8 +5976,8 @@ describe('startupSessionManager', () => {
     expect(rendered).toBe(renderPersonaRef(name, key))
     const log = readLog()
     expect(log).toContain('[spawn-failed]')
-    expect(log).toContain(`self-heal spawn after ErrTmuxSessionCreate failed for ${rendered}: ${launchFailure.errName}`)
-    expect(lines.some((l) => l.includes(`spawnForPersona: self-heal spawn after ErrTmuxSessionCreate failed for ${rendered}`))).toBe(true)
+    expect(log).toContain(`spawn failed for ${rendered}: ${launchFailure.errName}`)
+    expect(lines.some((l) => l.includes(`spawnForPersona: spawn failed for ${rendered}: ${launchFailure.errName}`))).toBe(true)
   })
 })
 
@@ -6495,16 +6453,14 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
 
   test('spawnForPersona waiting branch: dead session and recovery also fails → action=failed', async () => {
     const readLog = captureStartupErrors()
-    _setTmuxSessionKiller(async () => {})
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const spawnCalls: import('agent-director').SpawnParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       sendKeysCalls,
-      // Recovery fails too: a LAUNCH FAILURE at the resume, and at the self-heal respawn after it.
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-      ],
+      spawnCalls,
+      // Recovery fails too: a LAUNCH FAILURE at the resume, with no spawn in its place.
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
       resumeError: errTmuxSessionCreate('resume'),
@@ -6512,10 +6468,11 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(sendKeysCalls).toHaveLength(1)
+    expect(spawnCalls).toHaveLength(1)
     // The recovery's failure raises a spawn-failure notice and its own one
-    // spawn-failed entry (the self-heal respawn's); no reconnect-failed startup entry.
+    // spawn-failed entry (the resume's); no reconnect-failed startup entry.
     expect(notices.map((n) => n.key)).toEqual(['C'])
-    expect(onlyStartupEntry(readLog(), 'spawn-failed')).toContain(`self-heal spawn after ErrTmuxSessionCreate failed for ${renderPersonaRef('C', 'C')}: `)
+    expect(onlyStartupEntry(readLog(), 'spawn-failed')).toContain(`resume failed for ${renderPersonaRef('C', 'C')}: `)
     expect(readLog()).not.toContain('reconnect failed')
   })
 
@@ -7217,34 +7174,31 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
     expect(deleteCalls).toHaveLength(1)
   })
 
-  // Regression guard for b.vub self-heal: an ErrTmuxSessionCreate on resume in
-  // the dead-session path must still trigger the orphan-tmux-kill self-heal and
-  // a fresh respawn — unchanged by the findMissing insertion.
-  test('waiting dead-session: findMissing then resume ErrTmuxSessionCreate → b.vub self-heal respawn → spawned', async () => {
-    const killedSessions: string[] = []
-    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+  // b.jg5 SRJ-602: an ErrTmuxSessionCreate on resume in the dead-session path,
+  // after the findMissing sweep, is one counted launch failure.
+  test('waiting dead-session: findMissing then resume ErrTmuxSessionCreate → failed and counted; nothing killed and no spawn in its place', async () => {
+    const tmux = recordTmuxCalls()
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
+    const killCalls: import('agent-director').KillParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       findMissingCalls,
       resumeCalls,
       spawnCalls,
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
-      ],
+      killCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
       resumeError: errTmuxSessionCreate('resume'),
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    expect(result.action).toBe('spawned')
+    expect(result).toStrictEqual({ key: 'C', action: 'failed', countedClass: true })
     expect(findMissingCalls).toHaveLength(1) // findMissing still runs once, before resume
     expect(resumeCalls).toHaveLength(1) // resume attempted once, threw ErrTmuxSessionCreate
-    expect(killedSessions).toHaveLength(1) // b.vub self-heal killed the orphan tmux session
-    expect(spawnCalls).toHaveLength(2) // initial collision + self-heal fresh spawn
+    expect([killCalls, tmux]).toEqual([[], []])
+    expect(spawnCalls).toHaveLength(1) // the initial collision only
   })
 })
 
@@ -9957,99 +9911,6 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // b.vub — ErrTmuxSessionCreate self-heal (kill orphan tmux + retry once)
-  // -------------------------------------------------------------------------
-
-  test('b.vub: ErrTmuxSessionCreate on resume → kill orphan tmux by name + retry spawn once', async () => {
-    const killedSessions: string[] = []
-    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    installStub({
-      spawnCalls,
-      // 1st spawn: instance-id collision → get=missing → resume throws tmux-create
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        // 2nd spawn (the self-heal retry) succeeds
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
-      ],
-      getResult: personaRow(cfg, 'C', { state: 'missing' }),
-      resumeError: errTmuxSessionCreate('resume'),
-      // approver on the retry-spawn: already live → returns immediately
-      statusResult: { state: 'waiting' },
-    })
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-
-    expect(result.action).toBe('spawned')
-    // Orphan tmux killed by its deterministic per-channel name.
-    expect(killedSessions).toEqual(['slack_bot_C'])
-    // Exactly one retry spawn after the collision spawn (2 spawn calls total).
-    expect(spawnCalls).toHaveLength(2)
-  })
-
-  test('b.vub: ErrTmuxSessionCreate on fresh spawn → kill orphan tmux by name + retry spawn once', async () => {
-    const killedSessions: string[] = []
-    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    installStub({
-      spawnCalls,
-      // 1st fresh spawn throws tmux-create (no instance-id collision) → self-heal
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
-      ],
-      statusResult: { state: 'waiting' },
-    })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-
-    expect(result.action).toBe('spawned')
-    expect(killedSessions).toEqual(['slack_bot_C'])
-    expect(spawnCalls).toHaveLength(2)
-  })
-
-  test('b.vub: ErrTmuxSessionCreate self-heal kills slack_bot_<key> for a persona whose key differs from its name', async () => {
-    const killedSessions: string[] = []
-    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
-    const key = personaKey('my chan')
-    expect(key).not.toBe('my chan')
-    installStub({
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${key}` }),
-      ],
-      statusResult: { state: 'waiting' },
-    })
-    const cfg = makeMultiPersonaConfig([{ name: 'my chan', working_directory: '/x' }], fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, key), cfg)
-
-    expect(result.action).toBe('spawned')
-    expect(killedSessions).toEqual([`slack_bot_${key}`])
-  })
-
-  test('b.vub: ErrTmuxSessionCreate self-heal that fails on retry → spawn-failure notice to the persona destination', async () => {
-    _setTmuxSessionKiller(async () => { /* orphan killed but retry still fails */ })
-    const readLog = captureStartupErrors()
-    installStub({
-      // fresh spawn throws tmux-create; retry spawn also throws (generic)
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-      ],
-    })
-    const cfg = makeNoticeConfig()
-    const h = installNoticeNotifier(cfg)
-    const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
-    await settleNotices()
-
-    expect(result.action).toBe('failed')
-    const text = expectOneNoticeToDestination(h)
-    expect(text).toContain('Spawn failure:\n')
-    expect(text).toContain(`Error: \`${errTmuxSessionCreate('spawn').errName}\``)
-    expect(readLog()).toContain('[spawn-failed]')
-  })
-
-  // -------------------------------------------------------------------------
   // AC 20 (b.av2 SR-10.3): every line the approver's class handling writes
   // for a refused status, readPane or sendKeys (b.jg5 SRJ-117, SRJ-118,
   // SRJ-404) logs describeAgentDirectorFailure of the error (type, safe code
@@ -10513,24 +10374,6 @@ const SUCCESS_SITES: ReadonlyArray<readonly [string, SuccessSite]> = [
     { script: (_cfg, preTrust) => ({ spawnQueue: [collision(), spawnOk(preTrust)], getError: errSpawnNotFound() }), launchVerb: 'spawn', action: 'spawned' },
   ],
   [
-    'the self-heal spawn after ErrTmuxSessionCreate on the first spawn',
-    {
-      script: (_cfg, preTrust) => ({ spawnQueue: [cannedErr<SpawnResultOf>(errTmuxSessionCreate('spawn')), spawnOk(preTrust)] }),
-      launchVerb: 'spawn',
-      action: 'spawned',
-    },
-  ],
-  ['the self-heal spawn after ErrTmuxSessionCreate on resume', { script: resumeAnswers(errTmuxSessionCreate('resume')), launchVerb: 'spawn', action: 'spawned' }],
-  [
-    'the self-heal spawn after ErrTmuxSessionCreate on a replacement\'s fresh spawn',
-    {
-      script: (cfg, preTrust) => ({ spawnQueue: [collision(), cannedErr<SpawnResultOf>(errTmuxSessionCreate('spawn')), spawnOk(preTrust)], getResult: endedRow(cfg) }),
-      config: { resume_enabled: false },
-      launchVerb: 'spawn',
-      action: 'spawned',
-    },
-  ],
-  [
     'the fresh spawn of a replacement of a row in another directory (kill, delete, spawn)',
     {
       script: (cfg, preTrust) => ({
@@ -10692,7 +10535,6 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
 
   test.each(SUCCESS_SITES_WITH_PRE_TRUST)('%s, its result\'s pre_trust %s: spawnForPersona returns the launch\'s own result while the approver still runs, with no launch in flight and the launch settled; then P\'s status and read-pane follow the launch call on P\'s row, until a live read stops the approver; no spawn or resume call carries no_pre_trust, and the launch writes exactly one pre_trust line, P\'s, for its verb and value (b.jg5 SRJ-413)', async (_name, preTrust, site) => {
     const clock = useApproverClock()
-    _setTmuxSessionKiller(async () => {})
     const cfg = launchConfig(site.config)
     const log = makeStubCallLog()
     const stub = installStub({ ...log, ...site.script(cfg, preTrust), statusFn: approverReadsPendingThenLive(KEY) })
@@ -10993,7 +10835,6 @@ describe('b.jg5 SRJ-413: each launch\'s pre_trust is logged once with the person
 
   test.each(NO_OBJECT_RESULTS)('the resume of an ended row whose result is %s: the launch writes the absent field\'s line, P\'s, and the ladder still returns resumed', async (_name, value) => {
     const clock = useApproverClock()
-    _setTmuxSessionKiller(async () => {})
     const cfg = successSiteConfig()
     installStub({ spawnQueue: [collision()], getResult: endedRow(cfg), resumeQueue: [cannedOk(value as unknown as Phase1ResumeResult)] })
 
@@ -11131,60 +10972,10 @@ const CWD = '/test/cwd'
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// b.1ix — raw tmux calls address the persona's own session exactly
+// b.1ix — src/ starts tmux in one place only, the runner
 // ---------------------------------------------------------------------------
 
-describe('b.1ix: raw tmux calls target the persona’s own session exactly, never a prefix neighbour', () => {
-  /**
-   * A tmux server behind the runner seam: live sessions by name. It resolves
-   * a session target as tmux 3.2a does (checked in the `/ci` image):
-   * `=<name>` is only that exact session; a bare name is the exact session,
-   * else the one session it prefixes (the hazard).
-   */
-  function fakeTmuxServer(sessions: string[]) {
-    const alive = new Set(sessions)
-    const argvs: string[][] = []
-    const resolve = (target: string): string | undefined => {
-      if (target.startsWith('=')) return alive.has(target.slice(1)) ? target.slice(1) : undefined
-      if (alive.has(target)) return target
-      const prefixed = [...alive].filter((s) => s.startsWith(target))
-      return prefixed.length === 1 ? prefixed[0] : undefined
-    }
-    const runner: TmuxCommandRunner = async (args) => {
-      argvs.push([...args])
-      const session = resolve(args[args.indexOf('-t') + 1]!)
-      if (session === undefined) return { code: 1, stdout: '' }
-      if (args[0] === 'kill-session') alive.delete(session)
-      return { code: 0, stdout: '' }
-    }
-    return { runner, alive, argvs }
-  }
-
-  const NEIGHBOUR_ONLY = ['slack_bot_dev_2']
-  const BOTH = ['slack_bot_dev', 'slack_bot_dev_2']
-
-  test.each([
-    ['only its prefix neighbour slack_bot_dev_2 exists', NEIGHBOUR_ONLY],
-    ['it and slack_bot_dev_2 both exist', BOTH],
-  ])('the b.vub self-heal kill for persona dev, when %s: kill-session -t =slack_bot_dev, and slack_bot_dev_2 survives', async (_label, sessions) => {
-    const tmux = fakeTmuxServer(sessions)
-    _setTmuxCommandRunner(tmux.runner)
-    _resetTmuxSessionKiller()
-    installStub({
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_dev' }),
-      ],
-      statusResult: { state: 'waiting' },
-    })
-    const cfg = makeMultiPersonaConfig([{ name: 'dev', working_directory: '/x' }], fixtureDir)
-
-    expect((await spawnForPersona(personaOf(cfg, 'dev'), cfg)).action).toBe('spawned')
-
-    expect(tmux.argvs).toEqual([['kill-session', '-t', '=slack_bot_dev']])
-    expect([...tmux.alive]).toEqual(['slack_bot_dev_2'])
-  })
-
+describe('b.1ix: raw tmux calls go through the one runner', () => {
   test('src/ starts tmux in one place only, the runner, so no raw call can skip its exact targets', () => {
     const srcDir = join(import.meta.dir, '..', 'src')
     const tmuxLaunch = /\b(?:spawn|spawnSync|exec|execSync|execFile|execFileSync)\(\s*['"`]tmux['"`]|\bBun\.spawn(?:Sync)?\(\s*\[\s*['"`]tmux['"`]|\$`tmux\b/g
@@ -12778,13 +12569,11 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
 
 describe('persona notices (b.av2 SR-7.2)', () => {
   /**
-   * A startup spawn whose every spawn call fails with a LAUNCH FAILURE
-   * (`ErrTmuxSessionCreate`): the first spawn's self-heal kills the orphan
-   * session (a no-op here) and respawns once, which fails the same way, so
-   * the spawn-failure notice names it.
+   * A startup spawn whose first spawn fails with a LAUNCH FAILURE
+   * (`ErrTmuxSessionCreate`), one counted failure with no spawn in its
+   * place, so the spawn-failure notice names it.
    */
   function installLaunchFailure(): void {
-    _setTmuxSessionKiller(async () => {})
     installStub({ spawnError: launchFailure })
   }
 
@@ -13950,8 +13739,9 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
-  // A LAUNCH FAILURE answer named by name (the base class, so the plain
-  // spawn's handling, with no self-heal): the record's text is the point.
+  // A LAUNCH FAILURE answer named by name (the base class, which the plain
+  // spawn's handling decides by name: one counted failure, no spawn in its
+  // place): the record's text is the point.
   test('a failed spawn with a safe errName → the spawn-failed record ends in `<errName> message="<redacted description>"`, with no cause tail', async () => {
     const readLog = captureStartupErrors()
     const launchFailureName = errTmuxSessionCreate('spawn').errName
@@ -14144,12 +13934,6 @@ function promptRowPanesGone(h: RecoveryHarness): void {
 const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
   { name: 'the first spawn', verb: 'spawn', script: (_h, _p, err) => ({ spawnError: err }), calls: ladderCallsOf({ spawn: 1 }) },
   {
-    name: 'the self-heal retry spawn after the first spawn\'s ErrTmuxSessionCreate',
-    verb: 'spawn',
-    script: (_h, _p, err) => ({ spawnQueue: [cannedErr(errTmuxSessionCreate('spawn')), cannedErr(err)] }),
-    calls: ladderCallsOf({ spawn: 2 }),
-  },
-  {
     name: 'the retry spawn after the collision get\'s ErrSpawnNotFound',
     verb: 'spawn',
     script: (_h, _p, err) => ({ spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(err)], getError: errSpawnNotFound() }),
@@ -14157,12 +13941,6 @@ const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
   },
   { name: 'the resume of an ended row', verb: 'resume', script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
   { name: 'the resume of a missing row', verb: 'resume', script: (h, p, err) => ({ ...collided(h, p, { state: 'missing' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
-  {
-    name: 'the self-heal spawn after the resume\'s ErrTmuxSessionCreate',
-    verb: 'spawn',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errTmuxSessionCreate('resume') }),
-    calls: ladderCallsOf({ spawn: 2, resume: 1 }),
-  },
   {
     name: 'the fresh spawn after the resume\'s ErrNoSessionId and its delete',
     verb: 'spawn',
@@ -14193,12 +13971,6 @@ const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
     verb: 'spawn',
     script: (h, p, err) => collided(h, p, elsewhere(h, 'ended'), err),
     calls: ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }),
-  },
-  {
-    name: 'the self-heal spawn of a replacement after its fresh spawn\'s ErrTmuxSessionCreate',
-    verb: 'spawn',
-    script: (h, p, err) => collided(h, p, elsewhere(h, 'ended'), errTmuxSessionCreate('spawn'), err),
-    calls: ladderCallsOf({ spawn: 3, kill: 1, delete: 1 }),
   },
 ]
 
@@ -16235,8 +16007,8 @@ describe('b.jg5 SRJ-401, SRJ-404, SRJ-105, SRJ-311, SRJ-313, SRJ-316, SRJ-501, S
 // call: the collision `get`'s state, no row after the collision `get`'s
 // `ErrSpawnNotFound`, the `ErrJsonlMissing` diagnosis `get`'s state, the
 // working-row wait's last `status`, or the prompt row's re-read after its
-// sweep. Where the path read nothing (the first spawn and its self-heal
-// spawn), exactly one latch-time `status` read gives it: no row when the read
+// sweep. Where the path read nothing (the first spawn), exactly one
+// latch-time `status` read gives it: no row when the read
 // answers `ErrSpawnNotFound` (after the pre-spawn scan's refusal), `ended`
 // after "duplicate session". Where the path already read the row, no `status`
 // read is added. The stub's calls are exact and the refused call is the last
@@ -16303,28 +16075,12 @@ const LATCH_SPAWN_SITES: readonly LatchSite[] = [
     lastRead: undefined,
   },
   {
-    name: 'the self-heal spawn after the first spawn\'s ErrTmuxSessionCreate',
-    verb: 'spawn',
-    script: (_h, _p, err, row) => ({ spawnQueue: [cannedErr(errTmuxSessionCreate('spawn')), cannedErr(err)], ...statusAnswering(row.rowState) }),
-    calls: ladderCallsOf({ spawn: 2 }),
-    reads: { get: 0, status: 0 },
-    lastRead: undefined,
-  },
-  {
     name: 'the retry spawn after the collision get\'s ErrSpawnNotFound',
     verb: 'spawn',
     script: (_h, _p, err) => ({ spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(err)], getError: errSpawnNotFound() }),
     calls: ladderCallsOf({ spawn: 2 }),
     reads: { get: 1, status: 0 },
     lastRead: LATCH_ROW_STATE_NO_ROW,
-  },
-  {
-    name: 'the self-heal spawn after the resume\'s ErrTmuxSessionCreate (an ended row)',
-    verb: 'spawn',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errTmuxSessionCreate('resume') }),
-    calls: ladderCallsOf({ spawn: 2, resume: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
   },
   {
     name: 'the fresh spawn after the resume\'s ErrNoSessionId and its delete (an ended row)',
@@ -16388,14 +16144,6 @@ const LATCH_SPAWN_SITES: readonly LatchSite[] = [
     calls: ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }),
     reads: { get: 1, status: 0 },
     lastRead: WAITING_READ,
-  },
-  {
-    name: 'the self-heal spawn of a replacement (a row in another directory read ended) after its fresh spawn\'s ErrTmuxSessionCreate',
-    verb: 'spawn',
-    script: (h, p, err) => collided(h, p, elsewhere(h, 'ended'), errTmuxSessionCreate('spawn'), err),
-    calls: ladderCallsOf({ spawn: 3, kill: 1, delete: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
   },
   {
     name: 'the fresh spawn of a replacement (an ended row with no config_dir label), after its delete',
@@ -18561,15 +18309,11 @@ function unusableNameLinesOf(h: RecoveryHarness, key: string): string[] {
 
 /**
  * Record every raw tmux call into `order` (the call order `recordCallOrder`
- * keeps), as `tmux <what>`: the b.vub session kill, and any other command
- * through the runner seam as `tmux <command>` (failing, as the file's
- * stand-in does; the startup-dialog approver makes none). The file's
- * `afterEach` puts every seam back.
+ * keeps), as `tmux <command>`, through the runner seam (failing, as the
+ * file's stand-in does; no launch path and not the startup-dialog approver
+ * makes one). The file's `afterEach` puts the seam back.
  */
 function recordRawTmux(order: string[]): void {
-  _setTmuxSessionKiller(async () => {
-    order.push('tmux kill-session')
-  })
   _setTmuxCommandRunner(async (args) => {
     order.push(`tmux ${args[0]}`)
     return { code: 1, stdout: '' }
@@ -18578,7 +18322,7 @@ function recordRawTmux(order: string[]): void {
 
 /**
  * Every agent-director and raw tmux call from now on, in call order: the
- * stub's verbs (`recordCallOrder`) and the raw tmux seams (`recordRawTmux`).
+ * stub's verbs (`recordCallOrder`) and the raw tmux runner (`recordRawTmux`).
  */
 function recordEveryCall(h: RecoveryHarness): string[] {
   const order = recordCallOrder(h)
@@ -22210,6 +21954,153 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     })
     h.remove(p)
     expect(h.sequenceDeps.personaFacts(p, own)).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-602 (HO C1, AC 77) and SRJ-711 (AC 57), on `makeRecoveryHarness`
+// (both settings 0).
+//
+// SRJ-602: an `ErrTmuxSessionCreate` from the first spawn, from a `resume` of
+// an `ended` row (each through the start pass's launch, `h.launch`, and the
+// restart path's `launchSession`) and from a reuse spawn (through the
+// live-row sequence's launch entry, the reuse's only caller) is one counted
+// launch failure: exactly the launch calls up to the failing one, none after
+// it (no spawn in its place), no kill of any kind (no stub `kill`, no raw
+// tmux call), a `failed` result that is counted and never refused, one
+// spawn-failure notice, and P's retry timer armed at once in pending-only
+// mode (SRJ-111, SRJ-113, SRJ-409).
+//
+// SRJ-711: no plain spawn carries the reuse flag (the first spawn of a key
+// with no row, as a renamed persona's new key has, the retry spawn after the
+// collision `get` answers `ErrSpawnNotFound`, and the spawn after `resume`
+// answers `ErrSpawnNotFound`), and a first spawn that collides with an
+// `ended` row carrying a session id goes to `get` and then `resume`, with no
+// reuse, so the conversation is kept.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch failure that kills nothing, and a first spawn stays plain', () => {
+  afterEach(srj105AfterEach)
+
+  /** An `ended` row of the persona with a session id, so a `resume` of it would keep the conversation. */
+  const ENDED_WITH_SESSION = { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' } as const
+
+  /** A launch site meeting `ErrTmuxSessionCreate`: the answers that bring the launch there, and the stub calls it makes, in order. */
+  interface LaunchFailureSite {
+    script(h: RecoveryHarness, key: string): RecoveryStubScript
+    readonly order: readonly string[]
+  }
+
+  const FIRST_SPAWN: LaunchFailureSite = { script: () => ({ spawnError: errTmuxSessionCreate('spawn') }), order: ['spawn'] }
+  const ENDED_ROW_RESUME: LaunchFailureSite = {
+    script: (h, key) => ({ ...collided(h, harnessPersona(h, key), ENDED_WITH_SESSION), resumeError: errTmuxSessionCreate('resume') }),
+    order: ['spawn', 'get', 'resume'],
+  }
+
+  /** The two collision-ladder sites, each through the start pass's launch: a `spawn-failed` entry is written. */
+  const LADDER_SITES: ReadonlyArray<readonly [string, LaunchFailureSite]> = [
+    ['the first spawn', FIRST_SPAWN],
+    ['a resume of an ended row', ENDED_ROW_RESUME],
+  ]
+
+  /** Every SRJ-602 site, with how one launch reaches it and how many `spawn-failed` entries it writes. */
+  const SRJ602_SITES: ReadonlyArray<readonly [string, LaunchFailureSite & { launch(h: RecoveryHarness, key: string): Promise<unknown>; readonly entries: number }]> = [
+    ...LADDER_SITES.map(([name, site]) => [`${name} (the start pass)`, { ...site, launch: (h: RecoveryHarness, key: string) => h.launch(key), entries: 1 }] as const),
+    [
+      // The entry is no start-pass launch: it writes no entry and counts its failure itself.
+      'a reuse spawn (the live-row sequence\'s launch entry)',
+      {
+        script: () => ({ spawnError: errTmuxSessionCreate('spawn') }),
+        order: ['spawn'],
+        launch: (h, key) =>
+          launchForLiveRowSequence(harnessPersona(h, key), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) }),
+        entries: 0,
+      },
+    ],
+  ]
+
+  test.each(SRJ602_SITES)('SRJ-602, ErrTmuxSessionCreate from %s: one launch call there and none in its place, no kill of any kind, a counted failed result (never refused), one spawn-failure notice, and P\'s timer armed at once in pending-only mode', async (_name, site) => {
+    const { h, p, b } = srj105Build()
+    h.script(site.script(h, p))
+    const order = recordCallOrder(h)
+    const tmux = recordTmuxCalls()
+
+    expect(await site.launch(h, p)).toStrictEqual({ key: p, action: 'failed', countedClass: true, pendingOnlyArmed: true })
+
+    expect(order).toEqual([...site.order])
+    expect([h.stub.calls.killCalls, h.stub.calls.deleteCalls, tmux]).toEqual([[], [], []])
+    expect(h.notices).toEqual([{ key: p, text: expect.stringContaining(`\`${errTmuxSessionCreate().errName}\``) }])
+    expect(h.startupErrors().filter((entry) => entry.includes('[spawn-failed]'))).toHaveLength(site.entries)
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expect(h.controller.view(p)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
+    // Only the entry counts its own launch's failure; the restart path counts its launches' (tests/restart.test.ts).
+    expect(getFailureCount(p)).toBe(site.entries === 0 ? 1 : 0)
+    expect(personaCallCounts(h, b)).toEqual({})
+  })
+
+  test.each(LADDER_SITES)('SRJ-602, ErrTmuxSessionCreate from %s through the restart path\'s launchSession: it answers false once (counted by the restart path, never \'refused\'), with no kill and no launch after it', async (_name, site) => {
+    const { h, p } = srj105Build()
+    h.script(site.script(h, p))
+    const order = recordCallOrder(h)
+    const tmux = recordTmuxCalls()
+
+    expect(await launchSession(p, h.config)).toBe(false)
+
+    expect(order).toEqual([...site.order])
+    expect([h.stub.calls.killCalls, tmux]).toEqual([[], []])
+    expect(h.notices.map((notice) => notice.key)).toEqual([p])
+  })
+
+  // The removed self-heal, its default killer and the killer's set and reset
+  // seams, matched by the parts of their names (b.jg5 SRJ-601's list).
+  test('SRJ-602: the session manager\'s namespace carries no self-heal and no tmux session killer or its seams', async () => {
+    const sessionManager: Record<string, unknown> = await import('../src/session-manager.ts')
+
+    expect(Object.keys(sessionManager).filter((name) => /selfHeal|TmuxSessionKiller|KillTmuxSession/i.test(name))).toEqual([])
+  })
+
+  /** The plain spawns of the collision ladder, each succeeding, and the stub calls the launch makes up to its last spawn. */
+  const PLAIN_SPAWN_SITES: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => RecoveryStubScript, readonly string[]]> = [
+    ['the first spawn of a key with no row (a renamed persona\'s new key)', () => ({}), ['spawn']],
+    [
+      'the retry spawn after the collision get answers ErrSpawnNotFound',
+      () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() }),
+      ['spawn', 'get', 'spawn'],
+    ],
+    [
+      'the spawn after resume answers ErrSpawnNotFound',
+      (h, key) => ({ ...collided(h, harnessPersona(h, key), ENDED_WITH_SESSION), resumeError: errSpawnNotFound() }),
+      ['spawn', 'get', 'resume', 'spawn'],
+    ],
+  ]
+
+  test.each(PLAIN_SPAWN_SITES)('SRJ-711, %s: every spawn is plain, with no reuse flag, and the launch answers spawned', async (_name, script, order) => {
+    const { h, p } = srj105Build()
+    h.script(script(h, p))
+    const calls = recordCallOrder(h)
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
+
+    expect(calls.slice(0, order.length)).toEqual([...order])
+    expect(h.stub.calls.spawnCalls).toHaveLength(order.filter((verb) => verb === 'spawn').length)
+    expect(h.stub.calls.spawnCalls.filter((params) => 'reuse_finished' in params)).toEqual([])
+    expect(h.reuseSpawns()).toEqual([])
+    await h.runApproverToStop(p)
+  })
+
+  test('SRJ-711: a first spawn that collides with an ended row carrying a session id goes to get and then resume, with no reuse: the conversation is kept', async () => {
+    const { h, p } = srj105Build()
+    h.script(collided(h, harnessPersona(h, p), ENDED_WITH_SESSION))
+    const calls = recordCallOrder(h)
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'resumed' })
+
+    expect(calls.slice(0, 3)).toEqual(['spawn', 'get', 'resume'])
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.spawnCalls).toHaveLength(1)
+    expect('reuse_finished' in h.stub.calls.spawnCalls[0]!).toBe(false)
+    expect(h.reuseSpawns()).toEqual([])
+    await h.runApproverToStop(p)
   })
 })
 

@@ -59,15 +59,15 @@
  * builds its `set` input: the case "unusable recorded name", the refused
  * operation "none", the row state the caller gives, the classification's
  * message as the description and the session quoted in it. Its triggers are
- * in `src/session-manager.ts` (the collision ladder's spawns, `resume`, kill
- * and delete, the shared own-row `status` and `get` reads and their step,
- * the shared pane read behind the working-pane read and the prompt rows'
- * pane reads, the reconnect's `send-keys`, the dialog approver's calls and
- * the restart path's kill, `latchOnRestartKillOutcome`) and the liveness,
- * reconnect and kill-session adapters in `src/server.ts`: the first two
- * apply the session manager's own-row `status` step, the third
- * `latchOnRestartKillOutcome`. Sites still to come latch through the same
- * entry: the reuse spawn (E22) and the re-check's relatch (E30).
+ * in `src/session-manager.ts` (the collision ladder's spawns, the reuse
+ * spawn, `resume`, kill and delete, the shared own-row `status` and `get`
+ * reads and their step, the shared pane read behind the working-pane read
+ * and the prompt rows' pane reads, the reconnect's `send-keys`, the dialog
+ * approver's calls and the restart path's kill, `latchOnRestartKillOutcome`)
+ * and the liveness, reconnect and restart-kill adapters in `src/server.ts`:
+ * the first two apply the session manager's own-row `status` step, the third
+ * `latchOnRestartKillOutcome`. A site still to come latches through the same
+ * entry: the re-check's relatch (E30).
  *
  * The launch start not recorded (SRJ-513): {@link launchStartNotRecordedSetInput}
  * builds its `set` input: the case "launch start not recorded", the refused

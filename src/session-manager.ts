@@ -9,7 +9,9 @@
  * claude_config_dir>`, and no other label. Per-persona reconciliation uses
  * the SR-1.4 collision-then-act dispatch:
  *
- *   1. Try `client.spawn(...)` directly.
+ *   1. Try `client.spawn(...)` directly: a plain first spawn from
+ *      `buildSpawnParams`, with no reuse flag (b.jg5 SRJ-711), so a row that
+ *      is already there collides and step 2 keeps its conversation.
  *   2. On `ErrInstanceIdCollision`, call `client.get(...)` through the shared
  *      own-row read (`readPersonaOwnRow`, b.jg5 SRJ-114). A read that latched
  *      the persona (a configured persona's own row reading `pending` with no
@@ -44,7 +46,14 @@
  *      ENVIRONMENT, CONFIG or UNCLASSIFIED answer included) at the collision
  *      `get`. It is logged once and stops the ladder with `failed`: no
  *      notice, no `spawn-failed` entry, no `dead-session` verdict, and no
- *      further kill, delete or launch. An UNCLASSIFIED outcome has also been
+ *      further kill, delete or launch. An `ErrTmuxSessionCreate` (LAUNCH
+ *      FAILURE, decided by name) at any spawn or resume the ladder makes is
+ *      one counted launch failure (b.jg5 SRJ-602, SRJ-111, SRJ-113): one
+ *      line, the notice, a `spawn-failed` entry at start and `failed`;
+ *      nothing is killed because of it and no spawn is made in its place,
+ *      and the persona's retry timer is armed at once in pending-only mode,
+ *      so that the retry's read of the row decides (`launchFailureResult`;
+ *      SRJ-301, SRJ-409). An UNCLASSIFIED outcome has also been
  *      reported to the persona's unclassified-error episode
  *      (`src/persona-episodes.ts`). A `status` error in the working-row wait
  *      is no refusal: the wait goes on, or at its timeout ends
@@ -55,10 +64,9 @@
  *      ladder `latched` for a latched persona and otherwise `failed` with the
  *      refusal marker, uncounted.
  *   4. A CONFLICT (`ErrTmuxSessionConflict`, b.jg5 SRJ-105, SRJ-501) at any
- *      spawn or resume the ladder makes (the first spawn, its self-heal
- *      spawn, the retry spawn after the collision `get` found no row, the
- *      spawn after `resume` found none, every delete-then-spawn branch, and
- *      the resume) takes the CONFLICT row (`conflictAt`): the persona latches
+ *      spawn or resume the ladder makes (the first spawn, the retry spawn
+ *      after the collision `get` found no row, the spawn after `resume`
+ *      found none, every delete-then-spawn branch, and the resume) takes the CONFLICT row (`conflictAt`): the persona latches
  *      through the installed latch (`setConflictLatch`) with the refused
  *      operation "plain spawn" or "resume" and the row state the path last
  *      read before the call (one latch-time `status` read when it read
@@ -279,7 +287,6 @@ import {
   ErrNoSessionId,
   ErrSpawnNotFound,
   ErrSpawnNotResumable,
-  ErrTmuxSessionCreate,
   ErrCwdNotFound,
   ErrCwdNotADirectory,
   ErrSpawnCapReached,
@@ -980,8 +987,8 @@ function latchGateReadingOf(key: string): LatchGateReading | undefined {
 /**
  * The row state a launch site last read before its refused call (b.jg5
  * SRJ-501): the state read, or no row (the read answered `ErrSpawnNotFound`).
- * `NOTHING_READ` when the path read nothing before it (the first spawn and
- * its self-heal spawn): the CONFLICT row then makes the one latch-time
+ * `NOTHING_READ` when the path read nothing before it (the first spawn):
+ * the CONFLICT row then makes the one latch-time
  * `status` read (`latchTimeRowState`). A state is never re-read after a
  * write the path made since (a delete, a kill, a sweep): only the last read
  * counts.
@@ -2053,9 +2060,10 @@ export interface TmuxRunResult {
 }
 
 /**
- * Runs `tmux <args>` and never rejects. Every raw tmux call in the server goes
- * through this one runner (the b.vub orphan kill), so a unit test can see
- * each argv and no test reaches a real tmux server.
+ * Runs `tmux <args>` and never rejects. No server path makes a raw tmux call
+ * through it: CSCB reaches tmux only through agent-director. The runner and
+ * its seams stay so a unit test can install a recording runner, see that no
+ * argv reaches it, and never reach a real tmux server.
  */
 export type TmuxCommandRunner = (args: readonly string[]) => Promise<TmuxRunResult>
 
@@ -2091,13 +2099,12 @@ export function _resetTmuxCommandRunner(): void {
  * there is one, and otherwise to the one session whose name starts with it.
  * Persona keys can prefix one another (`dev`, `dev_2`), so a bare
  * `slack_bot_dev` reaches `slack_bot_dev_2` whenever `slack_bot_dev` is gone:
- * a kill would hit the neighbour's bot. A `=` prefix accepts only
+ * an operator's `attach` would reach the neighbour's bot. A `=` prefix accepts only
  * the exact name (b.1ix). Verified against tmux 3.2a, the version in the
  * `/ci` image.
  *
- * A session target (the b.vub orphan kill's `kill-session`, and the
- * `attach` command the not-connected notices give an operator) is
- * `=<name>`.
+ * The `attach` command the not-connected notices give an operator names
+ * its session target as `=<name>`.
  */
 function tmuxExactSessionTarget(sessionName: string): string {
   return `=${sessionName}`
@@ -6461,21 +6468,26 @@ export interface SpawnPersonaResult {
    */
   stopping?: true
   /**
-   * Set on a counted `failed` result only: the launch answered
-   * `ErrTmuxSessionCreate` and armed the persona's retry timer at once in
-   * pending-only mode (`armPendingOnlyAfterLaunchFailure`; b.jg5 SRJ-112,
-   * SRJ-113, SRJ-409), so the retry's read of the row decides. The failure
-   * is still counted. The live-row sequence arms no other cause of its own
-   * after such a final launch.
+   * Set on a counted `failed` result only: the launch (a plain spawn, a
+   * reuse or a `resume`) answered `ErrTmuxSessionCreate` and armed the
+   * persona's retry timer at once in pending-only mode
+   * (`launchFailureResult`, `armPendingOnlyAfterLaunchFailure`; b.jg5
+   * SRJ-111, SRJ-112, SRJ-113, SRJ-409), so the retry's read of the row
+   * decides. The failure is still counted. The live-row sequence arms no
+   * other cause of its own after such a final launch.
    */
   pendingOnlyArmed?: true
   /**
    * Set on a `failed` result only, where its error is handled by class: the
    * class is LAUNCH FAILURE (`ErrTmuxSessionCreate`) or DIRECTORY
    * (`ErrCwdNotFound`, `ErrCwdNotADirectory`), the classes SRJ-112 and
-   * SRJ-113 count (b.jg5). The reuse spawn sets it, and so does the live-row
-   * sequence's `resume` leg. The live-row sequence's launch entry counts a
-   * failure only when it is set (`sequenceLaunchCounted`).
+   * SRJ-113 count (b.jg5). Every launch's LAUNCH FAILURE sets it
+   * (`launchFailureResult`: the plain spawn's, the reuse spawn's and the
+   * `resume`'s failure handling); the reuse spawn sets it for DIRECTORY too,
+   * and so does the live-row sequence's `resume` leg. The live-row
+   * sequence's launch entry counts a failure only when it is set
+   * (`sequenceLaunchCounted`); the restart path counts any `failed` result
+   * that is neither refused nor stopping.
    */
   countedClass?: true
 }
@@ -6619,14 +6631,21 @@ function spawnHomeDir(): string {
  *
  * extra_env also always carries `PROMPT_SUGGESTION_OFF_ENV`
  * (`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, b.svb/b.f2b; see
- * persona-identity.ts for why). Every spawn in the ladder (the fresh spawn,
- * the replacement and amnesia spawns, the b.vub self-heal respawn) sends
- * these params, the reuse spawn (`reuseSpawnForPersona`) sends them with
- * only `reuse_finished: true` added (b.jg5 SRJ-708: one derivation, so a
- * reuse carries the same template, `cwd`, labels and `extra_env` as any
- * launch of the persona), and a resume restores the env agent-director
- * stored with the row at its spawn, so every launch of the persona's Claude
- * runs with it.
+ * persona-identity.ts for why). Every plain spawn in the ladder (the first
+ * spawn, the retry spawn after the collision `get` found no row, the spawn
+ * after `resume` found none, and the replacement and amnesia spawns) sends
+ * these params unchanged, the reuse spawn (`reuseSpawnForPersona`) sends
+ * them with only `reuse_finished: true` added (b.jg5 SRJ-708: one
+ * derivation, so a reuse carries the same template, `cwd`, labels and
+ * `extra_env` as any launch of the persona), and a resume restores the env
+ * agent-director stored with the row at its spawn, so every launch of the
+ * persona's Claude runs with it.
+ *
+ * The params never carry the reuse flag (b.jg5 SRJ-711, SRJ-111): only the
+ * reuse launch adds it, so a first spawn of a key that is not retired is
+ * plain, and when the key's row is already there it collides and the ladder
+ * goes on to the collision `get` and `resume`, which keep the conversation.
+ * The only first launch that is a reuse is a retired key's (SRJ-805).
  *
  * CSCB never passes `no_pre_trust`: not here, not on a reuse and not on a
  * `resume`, so agent-director pre-accepts the persona's folder trust at
@@ -7244,65 +7263,69 @@ async function latchOnKillOutcomeAt(
 }
 
 // ---------------------------------------------------------------------------
-// Orphan-tmux self-heal (b.vub)
+// A launch's failure: the plain spawn's handling and LAUNCH FAILURE
 // ---------------------------------------------------------------------------
 
-/**
- * Kill a tmux session by its exact name. Injectable seam so unit tests can
- * assert the self-heal path without spawning real processes. Default impl
- * runs `tmux kill-session -t =<name>` best-effort (tmux missing or the session
- * absent is ignored).
- *
- * b.vub: the field failure is an orphan tmux session that survives the AD row
- * going `missing` — the AD `client.kill` verb does NOT reap it (observed across
- * dozens of restart cycles). Killing the session directly by its deterministic,
- * per-persona name (`personaTmuxSessionName`) is the only reliable reap.
- *
- * b.1ix: the target is exact (`=<name>`). A bare name is resolved by prefix
- * when no session has that exact name, so `slack_bot_dev` would kill persona
- * `dev_2`'s `slack_bot_dev_2`. The kill is still not ownership-checked: a
- * session someone made by hand with this exact name is killed too. The b.fmk
- * CSCB version removes this kill (agent-director's classified spawn and
- * resume replace it).
- */
-export type TmuxSessionKiller = (sessionName: string) => Promise<void>
+/** The tail of the one line a launch's LAUNCH FAILURE writes (b.jg5 SRJ-602). */
+const LAUNCH_FAILURE_LINE_TAIL = ' — a counted launch failure; nothing is killed and no spawn is made in its place (b.jg5 SRJ-602)'
 
-const defaultKillTmuxSession: TmuxSessionKiller = async (sessionName: string): Promise<void> => {
-  await _runTmux(['kill-session', '-t', tmuxExactSessionTarget(sessionName)])
-}
-
-let _killTmuxSession: TmuxSessionKiller = defaultKillTmuxSession
-
-/** Test-only seam: override the tmux-session killer. */
-export function _setTmuxSessionKiller(fn: TmuxSessionKiller): void {
-  _killTmuxSession = fn
-}
-
-/** Test-only seam: restore the default tmux-session killer. */
-export function _resetTmuxSessionKiller(): void {
-  _killTmuxSession = defaultKillTmuxSession
+/** Whether `err` is a LAUNCH FAILURE (`ErrTmuxSessionCreate`), decided by name (`classifyAdError`). Never throws. */
+function isLaunchFailure(err: unknown): boolean {
+  return classifyAdError(err).errorClass === AD_ERROR_CLASS_LAUNCH_FAILURE
 }
 
 /**
- * Self-heal an `ErrTmuxSessionCreate` collision (b.vub): the deterministic tmux
- * session name is still held by an orphaned session while the AD row is
- * terminal/gone, so a fresh spawn/resume cannot create the session. Kill the
- * orphan by name, then retry `client.spawn` ONCE. Returns the retry's whole
- * spawn result on success (its `pre_trust` included, for the after-launch
- * step's line), or rethrows the retry's error (caller surfaces it).
+ * The result of a launch whose `ErrTmuxSessionCreate` (LAUNCH FAILURE) is
+ * one counted launch failure (b.jg5 SRJ-602, SRJ-111, SRJ-112, SRJ-113,
+ * SRJ-713), once its caller has written the line, the notice and the
+ * `spawn-failed` entry. Nothing is killed because of it and no launch
+ * follows it. The persona's retry timer is armed at once, with no `get`
+ * first, in pending-only mode (`armPendingOnlyAfterLaunchFailure`; SRJ-301,
+ * SRJ-409; HO rev 28), so that the retry's read of the row decides: a plain
+ * spawn's row reads `pending`, or `ended` after a "duplicate session" whose
+ * holder had vanished; a `resume`'s or a reuse's reads as agent-director's
+ * restore left it. Answers `failed` marked `countedClass`, and
+ * `pendingOnlyArmed` when the timer was armed (inside a launch attempt with a
+ * sink installed). Never throws.
  */
-async function selfHealTmuxCollisionAndRespawn(
-  persona: Persona,
-  params: SpawnParams,
+function launchFailureResult(key: string): SpawnPersonaResult {
+  return armPendingOnlyAfterLaunchFailure(key)
+    ? { key, action: 'failed', countedClass: true, pendingOnlyArmed: true }
+    : { key, action: 'failed', countedClass: true }
+}
+
+/**
+ * A plain spawn's failure by class (b.jg5 SRJ-111, SRJ-713), at every plain
+ * spawn the ladder makes (the first spawn, the retry spawn after the
+ * collision `get` found no row, the spawn after `resume` found none, and the
+ * replacement and amnesia spawns), with no further launch: the `cwd` errors
+ * answer `failed` quietly (the spawn's wrapper raised `cwd-unreachable`);
+ * then the refusal handling (`launchRefusalAt`: a CONFLICT latches with the
+ * refused operation "plain spawn" and `lastRead`, an UNUSABLE NAME latches,
+ * a refusal answers `failed`); any other error writes one line (`what`
+ * names the spawn), a `spawn-failed` entry at start and the spawn-failure
+ * notice, and answers `failed`. An `ErrTmuxSessionCreate` among those is one
+ * counted launch failure (`launchFailureResult`): nothing is killed and no
+ * spawn is made in its place (SRJ-602). Never throws.
+ */
+async function plainSpawnFailedAt(
+  key: string,
+  err: unknown,
+  isStartup: boolean,
   ref: string,
-): Promise<Phase1SpawnResult> {
-  const { key } = persona
-  const sessionName = personaTmuxSessionName(key)
-  console.error(
-    `[slack] spawnForPersona: ErrTmuxSessionCreate for ${ref} — killing orphan tmux session "${sessionName}" and retrying spawn once`,
-  )
-  await _killTmuxSession(sessionName)
-  return launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
+  what: string,
+  lastRead: LastRowRead,
+): Promise<SpawnPersonaResult> {
+  if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) return { key, action: 'failed' }
+  const refused = await launchRefusalAt(key, err, 'spawn', what, ref, lastRead)
+  if (refused) return refused
+  const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
+  const described = describeAgentDirectorFailure(e)
+  const launchFailure = isLaunchFailure(err)
+  console.error(`[slack] spawnForPersona: ${what} failed for ${ref}: ${described}${launchFailure ? LAUNCH_FAILURE_LINE_TAIL : ''}`)
+  if (isStartup) recordStartupError('spawn-failed', `${what} failed for ${ref}: ${described}`)
+  notifySpawnFailure(key, e, isStartup)
+  return launchFailure ? launchFailureResult(key) : { key, action: 'failed' }
 }
 
 /**
@@ -7370,18 +7393,19 @@ async function tryDelete(
  * - A failed delete returns `failed` (tryDelete records `spawn-failed` at
  *   startup and raises the spawn-failure notice, but not for a refusal), and
  *   one that answered UNUSABLE NAME returns `latched` the same way.
- * - `ErrTmuxSessionCreate` on the fresh spawn takes the b.vub self-heal
- *   (kill the orphan tmux session by name, retry the spawn once).
- * - cwd errors return `failed` quietly, and so does a refusal (an
- *   ENVIRONMENT, CONFIG or UNCLASSIFIED answer included,
- *   `ErrSystemInstallDisappeared` too, b.jg5 SRJ-313), with one line;
- *   a CONFLICT at the fresh spawn or the self-heal spawn latches the
- *   persona with the refused operation "plain spawn" and `opts.lastRead`,
- *   the row state the ladder read before the kill and delete, and returns
- *   `latched` (b.jg5 SRJ-501, `conflictAt`), and so does an UNUSABLE NAME
- *   answer there, with the refused operation "none" (SRJ-512,
- *   `unusableNameAt`); any other error records
- *   `spawn-failed` at startup and raises the spawn-failure notice.
+ * - The fresh spawn's failure takes the plain spawn's handling
+ *   (`plainSpawnFailedAt`): cwd errors return `failed` quietly, and so does
+ *   a refusal (an ENVIRONMENT, CONFIG or UNCLASSIFIED answer included,
+ *   `ErrSystemInstallDisappeared` too, b.jg5 SRJ-313), with one line; a
+ *   CONFLICT latches the persona with the refused operation "plain spawn"
+ *   and `opts.lastRead`, the row state the ladder read before the kill and
+ *   delete, and returns `latched` (b.jg5 SRJ-501, `conflictAt`), and so
+ *   does an UNUSABLE NAME answer, with the refused operation "none"
+ *   (SRJ-512, `unusableNameAt`); any other error records `spawn-failed` at
+ *   startup and raises the spawn-failure notice. An `ErrTmuxSessionCreate`
+ *   is one counted launch failure that kills nothing and arms the
+ *   persona's retry timer at once in pending-only mode (b.jg5 SRJ-602,
+ *   SRJ-713; `launchFailureResult`); no spawn is made in its place.
  * - Success returns `spawned`.
  */
 async function replaceWithFreshSpawn(
@@ -7400,34 +7424,13 @@ async function replaceWithFreshSpawn(
   const deleteStop = await tryDelete(key, isStartup, ref, opts.lastRead)
   if (deleteStop) return deleteStop
 
-  const failed = async (err: unknown, what: string): Promise<SpawnPersonaResult> => {
-    if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
-      return { key, action: 'failed' }
-    }
-    const refused = await launchRefusalAt(key, err, 'spawn', what, ref, opts.lastRead)
-    if (refused) return refused
-    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
-    console.error(`[slack] spawnForPersona: ${what} failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-    if (isStartup) recordStartupError('spawn-failed', `${what} failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-    notifySpawnFailure(key, e, isStartup)
-    return { key, action: 'failed' }
-  }
-
   try {
     const launched: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
     console.error(`[slack] spawnForPersona: fresh-spawned (after ${opts.kill ? 'kill+delete' : 'delete'}) for ${ref}`)
     afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
     return { key, action: 'spawned' }
   } catch (err) {
-    if (!(err instanceof ErrTmuxSessionCreate)) return failed(err, 'fresh spawn after delete')
-  }
-  try {
-    const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
-    console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
-    afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
-    return { key, action: 'spawned' }
-  } catch (err2) {
-    return failed(err2, 'self-heal spawn after ErrTmuxSessionCreate')
+    return plainSpawnFailedAt(key, err, isStartup, ref, 'fresh spawn after delete', opts.lastRead)
   }
 }
 
@@ -7762,10 +7765,17 @@ function reportInconclusiveDiagnosis(
 
 /**
  * Recover a collided spawn whose live session cannot be reached: resume-first
- * (preserves session history) when resume_enabled, with the established
- * fallbacks (ErrTmuxSessionCreate → orphan-kill + respawn; ErrNoSessionId /
- * ErrJsonlMissing / ErrJsonlNeverWritten → delete + fresh; ErrSpawnNotResumable → kill + delete +
- * fresh; ErrSpawnNotFound → fresh, no delete since the row is already gone).
+ * (preserves session history) when resume_enabled, with these fallbacks:
+ * ErrNoSessionId / ErrJsonlMissing / ErrJsonlNeverWritten → delete + fresh;
+ * ErrSpawnNotResumable → kill + delete + fresh; ErrSpawnNotFound → fresh, no
+ * delete since the row is already gone. A resume's ErrTmuxSessionCreate has
+ * no fallback: it is one counted launch failure through `resumeFailedAt`
+ * (b.jg5 SRJ-113, SRJ-602), which kills nothing, makes no spawn in its
+ * place and arms the persona's retry timer at once in pending-only mode, so
+ * that the retry's read of the row decides (SRJ-409; HO rev 28). Every spawn
+ * here is a plain spawn from `buildSpawnParams` (no reuse flag, b.jg5
+ * SRJ-711) whose failure takes the plain spawn's handling
+ * (`plainSpawnFailedAt`), its `ErrTmuxSessionCreate` counted the same way.
  * This is the `ended`/`missing` state handling, extracted so the
  * b.3ce dead-session fallback in the `waiting`/`working` branches reuses the
  * exact same decision logic instead of inventing its own.
@@ -7907,29 +7917,6 @@ async function resumeOrFreshSpawn(
     afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_RESUME, launched)
     return { key, action: 'resumed' }
   } catch (err) {
-    if (err instanceof ErrTmuxSessionCreate) {
-      // b.vub: the deterministic tmux session name is still held by an orphan
-      // session while the AD row is terminal — resume cannot re-create it.
-      // This is the observed field failure (resume throws ErrTmuxSessionCreate
-      // every ~2 min). Self-heal: kill the orphan by name, retry spawn once.
-      try {
-        const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
-        console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
-        afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
-        return { key, action: 'spawned' }
-      } catch (err2) {
-        if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
-          return { key, action: 'failed' }
-        }
-        const refused = await launchRefusalAt(key, err2, 'spawn', 'self-heal spawn after ErrTmuxSessionCreate', ref, lastRead)
-        if (refused) return refused
-        const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
-        console.error(`[slack] spawnForPersona: self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        if (isStartup) recordStartupError('spawn-failed', `self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        notifySpawnFailure(key, e, isStartup)
-        return { key, action: 'failed' }
-      }
-    }
     if (err instanceof ErrNoSessionId || err instanceof ErrJsonlMissing || err instanceof ErrJsonlNeverWritten) {
       console.error(`[slack] spawnForPersona: ${describeAgentDirectorFailure(err)} on resume for ${ref} — delete+fresh`)
       // b.jgf: AD 0.10.0 split the old "no transcript" condition in two.
@@ -7986,16 +7973,7 @@ async function resumeOrFreshSpawn(
         }
         return { key, action: 'spawned' }
       } catch (err2) {
-        if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
-          return { key, action: 'failed' }
-        }
-        const refused = await launchRefusalAt(key, err2, 'spawn', 'fresh spawn after delete', ref, diagnosisRead.lastRead ?? lastRead)
-        if (refused) return refused
-        const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
-        console.error(`[slack] spawnForPersona: fresh spawn after delete failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        if (isStartup) recordStartupError('spawn-failed', `fresh spawn after delete failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        notifySpawnFailure(key, e, isStartup)
-        return { key, action: 'failed' }
+        return plainSpawnFailedAt(key, err2, isStartup, ref, 'fresh spawn after delete', diagnosisRead.lastRead ?? lastRead)
       }
     }
     if (err instanceof ErrSpawnNotResumable) {
@@ -8018,15 +7996,7 @@ async function resumeOrFreshSpawn(
         afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
         return { key, action: 'spawned' }
       } catch (err2) {
-        if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
-          return { key, action: 'failed' }
-        }
-        const refused = await launchRefusalAt(key, err2, 'spawn', 'fresh spawn', ref, lastRead)
-        if (refused) return refused
-        const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
-        if (isStartup) recordStartupError('spawn-failed', `fresh spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        notifySpawnFailure(key, e, isStartup)
-        return { key, action: 'failed' }
+        return plainSpawnFailedAt(key, err2, isStartup, ref, 'fresh spawn', lastRead)
       }
     }
     if (err instanceof ErrSpawnNotFound) {
@@ -8041,17 +8011,8 @@ async function resumeOrFreshSpawn(
         afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
         return { key, action: 'spawned' }
       } catch (err2) {
-        if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
-          return { key, action: 'failed' }
-        }
         // b.jg5 SRJ-501: `resume` is not a read, so the last read is still the caller's.
-        const refused = await launchRefusalAt(key, err2, 'spawn', 'fresh spawn after ErrSpawnNotFound on resume', ref, lastRead)
-        if (refused) return refused
-        const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
-        console.error(`[slack] spawnForPersona: fresh spawn after ErrSpawnNotFound on resume failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        if (isStartup) recordStartupError('spawn-failed', `fresh spawn after ErrSpawnNotFound on resume failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        notifySpawnFailure(key, e, isStartup)
-        return { key, action: 'failed' }
+        return plainSpawnFailedAt(key, err2, isStartup, ref, 'fresh spawn after ErrSpawnNotFound on resume', lastRead)
       }
     }
     return resumeFailedAt(key, err, isStartup, ref, lastRead)
@@ -8067,8 +8028,16 @@ async function resumeOrFreshSpawn(
  * errors answer `failed` quietly; then the refusal handling
  * (`launchRefusalAt`: a CONFLICT latches with the refused operation
  * "resume" and `lastRead`, an UNUSABLE NAME latches, a refusal answers
- * `failed`); any other error answers `failed` with the spawn-failure
- * notice. Never throws.
+ * `failed`); any other error answers `failed` with one line and the
+ * spawn-failure notice. An `ErrTmuxSessionCreate` (LAUNCH FAILURE, by name)
+ * among those is one counted launch failure (b.jg5 SRJ-113, SRJ-602): one
+ * line, the notice, a `spawn-failed` entry at start, and
+ * `launchFailureResult`'s answer: nothing is killed, no spawn is made in its
+ * place, and the persona's retry timer is armed at once in pending-only
+ * mode, since agent-director's restore of the row may not have applied (HO
+ * rev 28), so the retry's read of the row decides (SRJ-301, SRJ-409); the
+ * result is marked `countedClass`, and `pendingOnlyArmed` when it armed.
+ * Never throws.
  */
 async function resumeFailedAt(
   key: string,
@@ -8108,9 +8077,16 @@ async function resumeFailedAt(
   const refused = await launchRefusalAt(key, err, 'resume', 'resume', ref, lastRead)
   if (refused) return refused
   const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('resume', 'UnknownError', String(err))
-  console.error(`[slack] spawnForPersona: resume failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
+  const described = describeAgentDirectorFailure(e)
+  if (!isLaunchFailure(err)) {
+    console.error(`[slack] spawnForPersona: resume failed for ${ref}: ${described}`)
+    notifySpawnFailure(key, e, isStartup)
+    return { key, action: 'failed' }
+  }
+  console.error(`[slack] spawnForPersona: resume failed for ${ref}: ${described}${LAUNCH_FAILURE_LINE_TAIL}`)
+  if (isStartup) recordStartupError('spawn-failed', `resume failed for ${ref}: ${described}`)
   notifySpawnFailure(key, e, isStartup)
-  return { key, action: 'failed' }
+  return launchFailureResult(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -8474,7 +8450,7 @@ export function _resetDialogApprovers(): void {
 
 /** The launches whose success runs the after-launch step, as the `pre_trust` line names them. */
 export type LaunchVerb = typeof LAUNCH_VERB_SPAWN | typeof LAUNCH_VERB_RESUME | typeof LAUNCH_VERB_REUSE_SPAWN
-/** A plain spawn (a fresh, self-heal, retry, replacement or amnesia spawn). */
+/** A plain spawn (a first, retry, replacement or amnesia spawn). */
 export const LAUNCH_VERB_SPAWN = 'spawn'
 /** A `resume`. */
 export const LAUNCH_VERB_RESUME = 'resume'
@@ -8521,7 +8497,7 @@ function renderPreTrustValue(value: unknown): string {
 
 /**
  * The one step after a launch call that returned success (b.jg5 SRJ-401):
- * the plain spawn, the self-heal spawn, the retry spawn after the collision
+ * the plain spawn, the retry spawn after the collision
  * `get`'s `ErrSpawnNotFound`, the fresh spawn of a replacement, the
  * `resume`, the amnesia spawn, the spawns after `resume`'s
  * `ErrSpawnNotResumable` and `ErrSpawnNotFound`, and the reuse spawn
@@ -8599,7 +8575,11 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  * 3. Dry-run: skip the rest, return synthetic success.
  * 4. Run the installed pre-launch trust patcher for the persona (b.av2
  *    SR-6.2) once, before any spawn or resume the ladder makes.
- *    Then attempt `client.spawn(...)`. On success → done. Every spawn and
+ *    Then attempt `client.spawn(...)`: a plain first spawn from
+ *    `buildSpawnParams`, with no reuse flag (b.jg5 SRJ-711), so a key whose
+ *    row is already there collides and step 5's `get` and `resume` keep its
+ *    conversation; only the reuse launch adds the flag, and the only first
+ *    launch that is a reuse is a retired key's (SRJ-805). On success → done. Every spawn and
  *    resume below is immediately preceded by the installed pre-launch reply
  *    guard (b.av2 SR-9.4); the optimistic spawn undoes its reply-guard steps
  *    on `ErrInstanceIdCollision`: the record and launched-with dir are
@@ -8652,7 +8632,13 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    returns `deferred` instead.
  * 6. A CONFLICT at any spawn or resume above latches the persona and
  *    answers `latched` (b.jg5 SRJ-501, `conflictAt`); other errors → surface
- *    to Slack + (when isStartup) startup-errors.log, except a refusal.
+ *    to Slack + (when isStartup) startup-errors.log, except a refusal. An
+ *    `ErrTmuxSessionCreate` (LAUNCH FAILURE, by name) at any of them is one
+ *    counted launch failure (b.jg5 SRJ-602; `plainSpawnFailedAt`,
+ *    `resumeFailedAt`): the notice, a `spawn-failed` entry at start, and
+ *    `failed` marked `countedClass`; nothing is killed because of it, no
+ *    spawn is made in its place, and the persona's retry timer is armed at
+ *    once in pending-only mode (`launchFailureResult`; SRJ-301, SRJ-409).
  * 7. Steps 4 to 6 run as a launch attempt for the key (b.jg5 SRJ-301,
  *    `runInAttempt`): an agent-director error there that the arming predicate
  *    answers a cause for arms the persona's retry timer through the installed
@@ -8827,6 +8813,11 @@ async function runPersonaLadder(
   runPreLaunchTrustPatch(persona, ref)
 
   // Attempt fresh spawn ---
+  // b.jg5 SRJ-711: the first spawn is plain (`buildSpawnParams`, no reuse
+  // flag), so a key whose row is already there collides and goes on to the
+  // collision `get` and `resume` below, which keep the conversation. Only the
+  // reuse launch adds the flag; the only first launch that is a reuse is a
+  // retired key's (SRJ-805).
   // b.av2 SR-9.4: the reply-guard steps run immediately before every spawn or
   // resume, never on a path that only reconnects to a live instance or does
   // nothing. This optimistic spawn is a launch only when no row exists; a
@@ -8846,42 +8837,16 @@ async function runPersonaLadder(
       // Collision → fall through to get-then-act
       undoPreLaunchReplyGuard(replyGuardUndo, ref)
       console.error(`[slack] spawnForPersona: ErrInstanceIdCollision for ${ref} — fetching current state`)
-    } else if (err instanceof ErrTmuxSessionCreate) {
-      // b.vub: fresh spawn collided on the deterministic tmux session name held
-      // by an orphan session (no instance-id collision → no AD row to resolve).
-      // Self-heal: kill the orphan by name, retry spawn once.
-      try {
-        const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
-        console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
-        afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
-        return { key, action: 'spawned' }
-      } catch (err2) {
-        if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
-          return { key, action: 'failed' }
-        }
-        // b.jg5 SRJ-501: nothing of the row was read before this spawn.
-        const refused = await launchRefusalAt(key, err2, 'spawn', 'self-heal spawn after ErrTmuxSessionCreate', ref, NOTHING_READ)
-        if (refused) return refused
-        const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
-        console.error(`[slack] spawnForPersona: self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        if (isStartup) recordStartupError('spawn-failed', `self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        notifySpawnFailure(key, e, isStartup)
-        return { key, action: 'failed' }
-      }
-    } else if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
-      return { key, action: 'failed' }
     } else {
       // b.jg5 SRJ-111: a CONFLICT (the pre-spawn scan's, or one after
       // "duplicate session") latches the persona with the refused operation
       // "plain spawn"; nothing of the row was read before this first spawn,
-      // so the latch-time `status` read gives its state.
-      const refused = await launchRefusalAt(key, err, 'spawn', 'spawn', ref, NOTHING_READ)
-      if (refused) return refused
-      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
-      console.error(`[slack] spawnForPersona: spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-      if (isStartup) recordStartupError('spawn-failed', `spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-      notifySpawnFailure(key, e, isStartup)
-      return { key, action: 'failed' }
+      // so the latch-time `status` read gives its state. An
+      // `ErrTmuxSessionCreate` (by name) is one counted launch failure:
+      // nothing is killed and no spawn is made in its place, and the
+      // persona's retry timer is armed at once in pending-only mode
+      // (b.jg5 SRJ-602, SRJ-713, SRJ-409).
+      return plainSpawnFailedAt(key, err, isStartup, ref, 'spawn', NOTHING_READ)
     }
   }
 
@@ -8910,17 +8875,8 @@ async function runPersonaLadder(
         afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
         return { key, action: 'spawned' }
       } catch (err2) {
-        if (err2 instanceof ErrCwdNotFound || err2 instanceof ErrCwdNotADirectory) {
-          return { key, action: 'failed' }
-        }
         // b.jg5 SRJ-501: the collision `get` read no row.
-        const refused = await launchRefusalAt(key, err2, 'spawn', 'retry-spawn', ref, LATCH_ROW_STATE_NO_ROW)
-        if (refused) return refused
-        const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
-        console.error(`[slack] spawnForPersona: retry-spawn also failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        if (isStartup) recordStartupError('spawn-failed', `retry-spawn failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-        notifySpawnFailure(key, e, isStartup)
-        return { key, action: 'failed' }
+        return plainSpawnFailedAt(key, err2, isStartup, ref, 'retry-spawn', LATCH_ROW_STATE_NO_ROW)
       }
     }
     // b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: a read error is a refusal,
@@ -9256,9 +9212,7 @@ async function reuseSpawnFailedAt(
     notifySpawnFailure(key, err, isStartup)
     // b.jg5 SRJ-112, SRJ-301, SRJ-409 (HO rev 28): the row may read restored,
     // live, gone or still `pending`; the retry's read decides.
-    return armPendingOnlyAfterLaunchFailure(key)
-      ? { key, action: 'failed', countedClass: true, pendingOnlyArmed: true }
-      : { key, action: 'failed', countedClass: true }
+    return launchFailureResult(key)
   }
   // b.av2 SR-6.4: `cwd-unreachable` was raised by the spawn's wrapper; counted.
   if (errorClass === AD_ERROR_CLASS_DIRECTORY) return { key, action: 'failed', countedClass: true }
@@ -9449,8 +9403,9 @@ const NO_TRANSCRIPT_RESUME_ERR_NAMES = [ERR_NO_SESSION_ID_NAME, ERR_JSONL_MISSIN
  *     (by name) go on to the reuse spawn once; `ErrSpawnNotResumable`
  *     answers not launched (SRJ-710: no second sequence); an
  *     `ErrTmuxSessionCreate` (by class) is a counted launch failure that also
- *     arms the persona's retry timer at once in pending-only mode (SRJ-113,
- *     SRJ-409), and a DIRECTORY error is a counted launch failure; any other
+ *     arms the persona's retry timer at once in pending-only mode, through
+ *     the shared `resumeFailedAt` (SRJ-113, SRJ-409), and a DIRECTORY error
+ *     is a counted launch failure; any other
  *     non-success ends by class (`resumeFailedAt`: a CONFLICT or UNUSABLE
  *     NAME latches with `request.lastRead`; `ErrSpawnNotFound` gets the
  *     spawn-failure notice and is not counted) with no further call: no
@@ -9637,19 +9592,17 @@ async function sequenceLaunchCall(
       )
       return { key, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE }
     }
+    // b.jg5 SRJ-113, SRJ-301, SRJ-409 (HO rev 28): `resumeFailedAt` marks
+    // an `ErrTmuxSessionCreate` result `countedClass` (`countSequenceLaunch`
+    // counts it) and arms the persona's retry timer at once in pending-only
+    // mode itself.
     const notResumed = await resumeFailedAt(key, err, false, ref, request.lastRead)
     // b.jg5 SRJ-113: only LAUNCH FAILURE and DIRECTORY are counted; any
     // other failure `resumeFailedAt` answers is not (`ErrSpawnNotFound`, for one).
-    const { errorClass } = classifyAdError(err)
-    if (!isUnrefusedFailure(notResumed)) return notResumed
-    if (errorClass === AD_ERROR_CLASS_DIRECTORY) return { ...notResumed, countedClass: true }
-    if (errorClass !== AD_ERROR_CLASS_LAUNCH_FAILURE) return notResumed
-    // b.jg5 SRJ-113, SRJ-301, SRJ-409 (HO rev 28): a `resume`'s
-    // `ErrTmuxSessionCreate` (a counted failure) arms the persona's retry
-    // timer at once in pending-only mode; the retry's read of the row decides.
-    return armPendingOnlyAfterLaunchFailure(key)
-      ? { ...notResumed, countedClass: true, pendingOnlyArmed: true }
-      : { ...notResumed, countedClass: true }
+    if (isUnrefusedFailure(notResumed) && classifyAdError(err).errorClass === AD_ERROR_CLASS_DIRECTORY) {
+      return { ...notResumed, countedClass: true }
+    }
+    return notResumed
   }
 }
 

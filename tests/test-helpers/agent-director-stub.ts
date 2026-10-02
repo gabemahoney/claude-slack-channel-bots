@@ -566,9 +566,10 @@ export function errInstanceIdCollision(): ErrInstanceIdCollision {
 }
 
 /**
- * Build an ErrTmuxSessionCreate (spawn/resume / b.vub orphan-tmux collision).
- * The `verb` defaults to 'resume' — the observed field failure path — but
- * callers pass 'spawn' to exercise the fresh-spawn self-heal branch.
+ * Build agent-director's session-create failure (`ErrTmuxSessionCreate`, the
+ * LAUNCH FAILURE class) for a `resume` (the default `verb`) or, with
+ * 'spawn', a spawn. CSCB counts it once as a launch failure and never
+ * follows it with a kill or a spawn in its place (b.jg5 SRJ-602).
  */
 export function errTmuxSessionCreate(verb: string = 'resume'): ErrTmuxSessionCreate {
   return new ErrTmuxSessionCreate(verb, 'ErrTmuxSessionCreate', 'tmux: new-session failed: tmux session already exists')

@@ -172,9 +172,10 @@
  * a declined launch or on a failed run leaves the flag raised). A fourth is
  * the outage state's launch-failure arm (`armPendingOnlyAfterLaunchFailure`,
  * `src/outage-state.ts`): inside a launch or recovery attempt for the
- * persona, a reuse's or a sequence `resume`'s `ErrTmuxSessionCreate` arms
- * its timer at once in pending-only mode through the sink's optional
- * `armPendingOnly` (b.jg5 SRJ-112, SRJ-113, SRJ-301, SRJ-409). It records
+ * persona, a launch's `ErrTmuxSessionCreate` (a plain spawn's, a reuse's or
+ * a `resume`'s, the collision ladder's and the live-row sequence's alike)
+ * arms its timer at once in pending-only mode through the sink's optional
+ * `armPendingOnly` (b.jg5 SRJ-111, SRJ-112, SRJ-113, SRJ-301, SRJ-409). It records
  * no attempt error, so the counted launch failure stays counted.
  *
  * The retry action (b.jg5 SRJ-303, SRJ-305). The server's action is
