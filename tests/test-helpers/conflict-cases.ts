@@ -121,9 +121,30 @@
  * {@link RESTART_KILL_UNUSABLE_NAME_CASE_ROWS}, one per fault, refused
  * operation none, their state the one the run's `dead` reading carries; the
  * ladder's are E16 T1's `ladder kill` rows
- * ({@link LADDER_KILL_UNUSABLE_NAME_CASE_ROWS}). The live-row sequence's and
- * the stuck-launch abort's kill rows (E21, E29), the reuse rows (E22) and
- * the re-check columns (E30) are still to come.
+ * ({@link LADDER_KILL_UNUSABLE_NAME_CASE_ROWS}).
+ *
+ * The live-row sequence's kill rows (E21; b.jg5 SRJ-110, SRJ-501, SRJ-512,
+ * SRJ-613, SRJ-705; the E13 and E20 hatch notes): two site kinds
+ * ({@link SequenceKillSite}, {@link SEQUENCE_KILL_SITES}; select their rows
+ * with {@link isSequenceKillSite} or {@link sequenceKillConflictRowsAt}):
+ * {@link SEQUENCE_STEP1_KILL_SITE} (step 1's kill, seeded with the state its
+ * starter last read) and {@link SEQUENCE_STEP4_KILL_SITE} (step 4's, seeded
+ * with the state step 3's last `get` read); {@link SEQUENCE_KILL_STEP} gives
+ * each its step. For each, and for each state the sequence last read before
+ * the kill ({@link SEQUENCE_KILL_ROW_STATES}, keyed by
+ * {@link SequenceKillLastRead}: `pending`, and `waiting`, a live state other
+ * than `pending`), one CONFLICT row per stub case `kill` answers, each
+ * refusing P's next check or recovery and recording that state, with no
+ * latch-time `status` read (`latchTimeRead` false: the sequence hands the
+ * latch the state it last read), named `<site> (<state>): <stub case>`
+ * ({@link SEQUENCE_KILL_CONFLICT_CASE_ROWS}). The step-1 kill's "not this
+ * launch's session" row on a `pending` seed is SRJ-613's kill backstop
+ * (`killBackstop`). The UNUSABLE NAME rows: one per fault for each sequence
+ * kill and each of those states, refused operation none
+ * ({@link SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS},
+ * {@link sequenceKillUnusableNameRowsAt}). The stuck-launch abort's kill rows
+ * (E29) are still to come, with the reuse rows (E22) and the re-check
+ * columns (E30).
  *
  * Other exports (E13 T2):
  *   - {@link expectedConflictNotice}: the expected notice for any case,
@@ -192,6 +213,11 @@
  * has one row per fault for each state in {@link RECONNECT_ROW_STATES}
  * (`waiting`, `working`), each recording the state its caller last read;
  * its row names carry the state (`reconnect send-keys (waiting): <fault>`).
+ * The live-row sequence's two kills (E21, {@link SEQUENCE_KILL_SITES};
+ * {@link SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS}) have one row per fault for
+ * each state in {@link SEQUENCE_KILL_ROW_STATES} (`pending`, `waiting`), each
+ * recording the state the sequence last read, named
+ * `sequence step-1 kill (pending): <fault>`.
  *
  * The expected latch records (SRJ-501), for any test that checks what a
  * hold-case latch holds (the server, restart, health-check, unavailable-retry
@@ -489,8 +515,35 @@ export const RESTART_KILL_SITE = 'restart kill'
  */
 export const LADDER_KILL_SITE = 'ladder kill'
 
-/** One of the checked kill's site kinds (E20): the restart path's kill or the collision ladder's replacement kill. */
-export type KillSite = typeof RESTART_KILL_SITE | typeof LADDER_KILL_SITE
+/** The live-row sequence's step-1 kill as a site kind (b.jg5 SRJ-705 step 1, SRJ-110; E21). */
+export const SEQUENCE_STEP1_KILL_SITE = 'sequence step-1 kill'
+
+/** The live-row sequence's step-4 kill as a site kind (b.jg5 SRJ-705 step 4, SRJ-110; E21). */
+export const SEQUENCE_STEP4_KILL_SITE = 'sequence step-4 kill'
+
+/** One of the live-row sequence's two kills as a site kind. */
+export type SequenceKillSite = typeof SEQUENCE_STEP1_KILL_SITE | typeof SEQUENCE_STEP4_KILL_SITE
+
+/** Each sequence kill site's step in the sequence. */
+export const SEQUENCE_KILL_STEP: Readonly<Record<SequenceKillSite, 1 | 4>> = Object.freeze({
+  [SEQUENCE_STEP1_KILL_SITE]: 1,
+  [SEQUENCE_STEP4_KILL_SITE]: 4,
+})
+
+/** Every sequence kill site kind, in step order. */
+export const SEQUENCE_KILL_SITES: readonly SequenceKillSite[] = Object.freeze(Object.keys(SEQUENCE_KILL_STEP) as SequenceKillSite[])
+
+/** Whether `site` is one of the live-row sequence's kill site kinds. */
+export function isSequenceKillSite(site: string): site is SequenceKillSite {
+  return Object.hasOwn(SEQUENCE_KILL_STEP, site)
+}
+
+/**
+ * One of the checked kill's site kinds: the restart path's kill, the
+ * collision ladder's replacement kill (E20), or one of the live-row
+ * sequence's two kills (E21).
+ */
+export type KillSite = typeof RESTART_KILL_SITE | typeof LADDER_KILL_SITE | SequenceKillSite
 
 /**
  * The site kind that meets a CONFLICT row's refusal: a plain spawn, a reuse
@@ -542,17 +595,21 @@ export interface ConflictCaseRow {
    */
   readonly leftoverOfEarlierLaunch?: true
   /**
-   * Set on the restart kill's rows only, false: the recorded state is the one
-   * the run's `dead` reading carries (`ended`, `missing` or no row; b.jg5
-   * SRJ-501), handed to the kill, so no latch-time `status` read is made.
-   * `rowState` is the state of the `dead` reading a case hands the kill
-   * (`ended`, `LIVENESS_READING_DEAD_ENDED`).
+   * Set on the restart kill's and the live-row sequence's kill rows only,
+   * false: the recorded state is the one the path hands the kill, so no
+   * latch-time `status` read is made. At the restart kill it is the state the
+   * run's `dead` reading carries (`ended`, `missing` or no row; b.jg5
+   * SRJ-501), and `rowState` is that of the `dead` reading a case hands the
+   * kill (`ended`, `LIVENESS_READING_DEAD_ENDED`); at a sequence kill it is
+   * the state the sequence last read.
    */
   readonly latchTimeRead?: false
   /**
-   * Set on the ladder kill's "not this launch's session" row only: SRJ-613's
-   * kill backstop (a kill on a live row answering "not this launch's
-   * session" latches the persona with nothing sent; E19 hatch note).
+   * Set on the ladder kill's "not this launch's session" row and on the
+   * sequence step-1 kill's "not this launch's session" row on a `pending`
+   * seed only: SRJ-613's kill backstop (a kill on a live row, `pending`
+   * included, answering "not this launch's session" latches the persona
+   * with nothing sent; E19 hatch note).
    */
   readonly killBackstop?: true
 }
@@ -956,6 +1013,41 @@ const LADDER_KILL_ROWS: readonly ConflictCaseRow[] = KILL_CASES.map(([stubCase, 
   return Object.freeze(latchCase === LATCH_CASE_NOT_THIS_LAUNCH ? { ...caseRow, killBackstop: true as const } : caseRow)
 })
 
+/** A state the live-row sequence last read before a kill: `pending`, or `waiting` (a live state other than `pending`). */
+export type SequenceKillLastRead = 'pending' | 'waiting'
+
+/** The latch row state each sequence kill row records for the state the sequence last read, in row order. */
+export const SEQUENCE_KILL_ROW_STATES: Readonly<Record<SequenceKillLastRead, LatchRowState>> = Object.freeze({
+  pending: PENDING,
+  waiting: WAITING,
+})
+
+/** Every {@link SequenceKillLastRead}, in row order. */
+const SEQUENCE_KILL_LAST_READS = Object.keys(SEQUENCE_KILL_ROW_STATES) as SequenceKillLastRead[]
+
+/**
+ * The live-row sequence's kill CONFLICT rows (E21; b.jg5 SRJ-110, SRJ-501,
+ * SRJ-705): for each sequence kill and each state the sequence last read,
+ * one row per case `kill` answers, each refusing P's next check or recovery
+ * and recording that state with no latch-time `status` read. The step-1
+ * kill's "not this launch's session" row on a `pending` seed is SRJ-613's
+ * kill backstop (`killBackstop`).
+ */
+const SEQUENCE_KILL_ROWS: readonly ConflictCaseRow[] = SEQUENCE_KILL_SITES.flatMap((site) =>
+  SEQUENCE_KILL_LAST_READS.flatMap((lastRead) =>
+    KILL_CASES.map(([stubCase, latchCase]) => {
+      const caseRow = row(site, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, 'kill', stubCase, latchCase, SEQUENCE_KILL_ROW_STATES[lastRead])
+      const backstop = site === SEQUENCE_STEP1_KILL_SITE && SEQUENCE_KILL_ROW_STATES[lastRead] === PENDING && latchCase === LATCH_CASE_NOT_THIS_LAUNCH
+      return Object.freeze({
+        ...caseRow,
+        name: caseRow.name.replace(site, `${site} (${lastRead})`),
+        latchTimeRead: false as const,
+        ...(backstop ? { killBackstop: true as const } : {}),
+      })
+    }),
+  ),
+)
+
 /** Every CONFLICT latch row, for `test.each`. */
 export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   // A plain spawn: the pre-spawn scan's refusals (nothing written, no row).
@@ -1006,6 +1098,8 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   // The checked kill's sites (E20): the restart path's kill, the ladder's replacement kill.
   ...RESTART_KILL_ROWS,
   ...LADDER_KILL_ROWS,
+  // The live-row sequence's two kills (E21).
+  ...SEQUENCE_KILL_ROWS,
 ])
 
 /** The dialog approver's CONFLICT rows of {@link CONFLICT_CASE_ROWS} (its `read-pane` and `send-keys`), for `test.each`. */
@@ -1058,6 +1152,16 @@ export const LADDER_KILL_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object
   CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === LADDER_KILL_SITE),
 )
 
+/** The live-row sequence's kill CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E21), for `test.each`. */
+export const SEQUENCE_KILL_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
+  CONFLICT_CASE_ROWS.filter((caseRow) => isSequenceKillSite(caseRow.site)),
+)
+
+/** The sequence kill CONFLICT rows of one site kind whose sequence last read `lastRead`, for `test.each`. */
+export function sequenceKillConflictRowsAt(site: SequenceKillSite, lastRead: SequenceKillLastRead): readonly ConflictCaseRow[] {
+  return SEQUENCE_KILL_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === site && caseRow.rowState === SEQUENCE_KILL_ROW_STATES[lastRead])
+}
+
 // ---------------------------------------------------------------------------
 // The expected latch record of a hold case (b.jg5 SRJ-501)
 // ---------------------------------------------------------------------------
@@ -1099,6 +1203,7 @@ export type UnusableNameSite =
   | ApproverSite
   | ReconnectSite
   | typeof RESTART_KILL_SITE
+  | SequenceKillSite
 
 /** The agent-director verb each site kind calls. */
 const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Object.freeze({
@@ -1112,6 +1217,8 @@ const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Obje
   ...APPROVER_SITE_VERB,
   [RECONNECT_SITE]: 'send-keys',
   [RESTART_KILL_SITE]: 'kill',
+  [SEQUENCE_STEP1_KILL_SITE]: 'kill',
+  [SEQUENCE_STEP4_KILL_SITE]: 'kill',
 })
 
 /** Every site kind of {@link UnusableNameSite}, in row order. */
@@ -1152,9 +1259,9 @@ export interface UnusableNameCaseRow {
 /**
  * The state each non-read site kind's path last read before its call (see the
  * header). The reconnect's rows take each state of {@link RECONNECT_ROW_STATES}
- * instead.
+ * instead, and the sequence kills' each state of {@link SEQUENCE_KILL_ROW_STATES}.
  */
-const UNUSABLE_NAME_LAST_READ: Readonly<Record<Exclude<UnusableNameSite, ReconnectSite>, LatchRowState>> = Object.freeze({
+const UNUSABLE_NAME_LAST_READ: Readonly<Record<Exclude<UnusableNameSite, ReconnectSite | SequenceKillSite>, LatchRowState>> = Object.freeze({
   'resume': ENDED,
   'plain spawn': LATCH_ROW_STATE_NO_ROW,
   'ladder kill': ENDED,
@@ -1176,7 +1283,7 @@ function unusableNameRow(
   site: UnusableNameSite,
   fault: UnusableNameFault,
   rowState: LatchRowState,
-  lastRead?: ReconnectLastRead,
+  lastRead?: ReconnectLastRead | SequenceKillLastRead,
 ): UnusableNameCaseRow {
   const build = () => errUnusableName(fault)
   const message = classifyAdError(build()).message
@@ -1205,7 +1312,8 @@ function unusableNameRow(
 
 /**
  * Every UNUSABLE NAME row: each fault of `UNUSABLE_NAME_FAULTS` at each site
- * kind (the reconnect's for each state in {@link RECONNECT_ROW_STATES}), for
+ * kind (the reconnect's for each state in {@link RECONNECT_ROW_STATES}, the
+ * sequence kills' for each state in {@link SEQUENCE_KILL_ROW_STATES}), for
  * `test.each`.
  */
 export const UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
@@ -1214,7 +1322,11 @@ export const UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.fr
       ? RECONNECT_LAST_READS.flatMap((lastRead) =>
           UNUSABLE_NAME_FAULTS.map((fault) => unusableNameRow(site, fault, RECONNECT_ROW_STATES[lastRead], lastRead)),
         )
-      : UNUSABLE_NAME_FAULTS.map((fault) => unusableNameRow(site, fault, UNUSABLE_NAME_LAST_READ[site])),
+      : isSequenceKillSite(site)
+        ? SEQUENCE_KILL_LAST_READS.flatMap((lastRead) =>
+            UNUSABLE_NAME_FAULTS.map((fault) => unusableNameRow(site, fault, SEQUENCE_KILL_ROW_STATES[lastRead], lastRead)),
+          )
+        : UNUSABLE_NAME_FAULTS.map((fault) => unusableNameRow(site, fault, UNUSABLE_NAME_LAST_READ[site])),
   ),
 )
 
@@ -1237,6 +1349,16 @@ export const RESTART_KILL_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[
 export const LADDER_KILL_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => caseRow.site === LADDER_KILL_SITE),
 )
+
+/** The live-row sequence's kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E21), for `test.each`. */
+export const SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
+  UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => isSequenceKillSite(caseRow.site)),
+)
+
+/** The sequence kill UNUSABLE NAME rows of one site kind whose sequence last read `lastRead`, for `test.each`. */
+export function sequenceKillUnusableNameRowsAt(site: SequenceKillSite, lastRead: SequenceKillLastRead): readonly UnusableNameCaseRow[] {
+  return SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => caseRow.site === site && caseRow.rowState === SEQUENCE_KILL_ROW_STATES[lastRead])
+}
 
 /** The reconnect's UNUSABLE NAME rows for a caller that last read `lastRead`, for `test.each`. */
 export function reconnectUnusableNameRowsAt(lastRead: ReconnectLastRead): readonly UnusableNameCaseRow[] {

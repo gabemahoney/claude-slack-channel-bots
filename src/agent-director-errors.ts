@@ -173,6 +173,17 @@ export const ERR_SPAWN_NOT_INTERACTIVE_NAME = 'ErrSpawnNotInteractive'
  */
 export const ERR_SYSTEM_INSTALL_DISAPPEARED_NAME = 'ErrSystemInstallDisappeared'
 
+/**
+ * `errName`s of `resume`'s answers that the live-row sequence's final
+ * launch tells apart by name (`hasAdErrorName`; b.jg5 SRJ-705, SRJ-710):
+ * the three no-transcript answers, which go on to the reuse spawn, and
+ * `ErrSpawnNotResumable`. Every client declares their classes.
+ */
+export const ERR_NO_SESSION_ID_NAME = 'ErrNoSessionId'
+export const ERR_JSONL_MISSING_NAME = 'ErrJsonlMissing'
+export const ERR_JSONL_NEVER_WRITTEN_NAME = 'ErrJsonlNeverWritten'
+export const ERR_SPAWN_NOT_RESUMABLE_NAME = 'ErrSpawnNotResumable'
+
 /** The three store-open error names, in one list. */
 export const STORE_OPEN_ERR_NAMES = [
   ERR_SCHEMA_MISMATCH_NAME,

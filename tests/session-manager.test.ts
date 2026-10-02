@@ -350,6 +350,25 @@
  *     field's line and still returns `resumed`; on those two launches the
  *     four have identical effects otherwise, the approver still clearing the
  *     folder-trust dialog that follows.
+ *   - b.jg5 SRJ-705 step 6, SRJ-706 (on `makeRecoveryHarness`): the live-row
+ *     sequence's launch entry (`launchForLiveRowSequence`) is a launch call
+ *     (in flight while its `resume` is held, waiting for a launch already in
+ *     flight and never overlapping it) that makes one `resume`, its success
+ *     followed by the `pre_trust` line and the approver; `ErrNoSessionId`,
+ *     `ErrJsonlMissing` and `ErrJsonlNeverWritten` go on to the harness's
+ *     recording reuse builder once, `ErrSpawnNotResumable` answers not
+ *     launched, UNAVAILABLE ends it uncounted and a CONFLICT latches P with
+ *     the state last read, each with no further call, and no case deletes,
+ *     kills or spawns; a reuse goes to the installed builder, and with none
+ *     installed (or after the test-only reset) makes no call and answers not
+ *     launched. The dependency builder (`buildLiveRowSequenceDeps`, as the
+ *     harness's `sequenceDeps`) reads and starts nothing when called, reads
+ *     each row through the shared own-row read (a note latches), runs each
+ *     `find-missing` as a bypassing run with P's key as its next-step `get`,
+ *     makes each kill through the bounded retry over the deferred-report
+ *     binding with the shared `status` read between tries, launches no key
+ *     outside the applied set, and takes the launch-kind facts from
+ *     `resume_enabled` and the row comparison.
  *
  * Most blocks use a stand-in persona keyed by its channel ID
  * (`makeStandInPersonaConfig`), so their `cscb_<channelId>` ids and outage
@@ -545,7 +564,26 @@ import {
   type UndeliverableCause,
   type WorkingPaneReading,
   type WorkingPaneRun,
+  _resetSequenceReuseBuilder,
+  buildLiveRowSequenceDeps,
+  launchForLiveRowSequence,
+  setSequenceReuseBuilder,
 } from '../src/session-manager.ts'
+import {
+  LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
+  LIVE_ROW_LAUNCH_RESUME,
+  LIVE_ROW_LAUNCH_REUSE,
+  LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED,
+  LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER,
+  LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
+  LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+  LIVE_ROW_READ_LATCHED,
+  LIVE_ROW_READ_ROW,
+  LIVE_ROW_RUN_LEFT_LIVE,
+  LIVE_ROW_SEQUENCE_LOG_PREFIX,
+  LIVE_ROW_SEQUENCE_NO_ROW,
+  type LiveRowSequenceLaunchKind,
+} from '../src/live-row-sequence.ts'
 import type { TranscriptReading, TranscriptSnapshot } from '../src/session-transcript.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { stripComments } from './test-helpers/source-audit.ts'
@@ -672,6 +710,7 @@ import {
 import {
   KILL_RETRY_ALERT_ORDINARY,
   KILL_RETRY_ALERT_SURVIVOR,
+  KILL_RETRY_END_READ_LATCHED,
   KILL_RETRY_SPACING_MS,
   KILL_RETRY_TRIES,
 } from '../src/kill-retry.ts'
@@ -884,7 +923,7 @@ import {
   type UnavailableRetryRowRead,
   type UnavailableRetryTriggerSink,
 } from '../src/unavailable-retry.ts'
-import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
+import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED } from '../src/liveness-reading.ts'
 import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
 import type { Phase1KillResult, Phase1ResumeResult, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
@@ -21406,5 +21445,315 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
     expect(getFailureCount(p)).toBe(0)
     expect(h.errors.filter((l) => l === transientReconnectLine(renderPersonaRef(p, p), 'waiting', 'stopping'))).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-705 step 6, SRJ-706 (E21 T1): the live-row sequence's launch
+// entry (`launchForLiveRowSequence`), its reuse builder and the sequence's
+// dependency builder (`buildLiveRowSequenceDeps`)
+//
+// On the recovery harness, whose recording reuse builder is installed and
+// whose `sequenceDeps` come from the builder. The entry is a launch call: a
+// `resume` through the ladder's launch helper whose no-transcript answers go
+// on to the reuse builder once, any other non-success ending it by class with
+// no further call; a reuse goes to the builder, and with none installed makes
+// no call. No case makes a `delete`, a `kill` or a plain `spawn` from the
+// entry, and no call sets `include_finished` (checked after each case). The
+// sequence through these is tests/live-row-sequence.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-705 step 6, SRJ-706: the sequence-launch entry, the reuse-builder installer and the sequence\'s dependency builder', () => {
+  afterEach(() => {
+    const h = srj105Harness
+    if (h !== undefined) {
+      const everyCall = Object.values(h.stub.calls).flat() as unknown[]
+      expect(everyCall.filter((params) => typeof params === 'object' && params !== null && 'include_finished' in params)).toEqual([])
+    }
+    srj105AfterEach()
+    _resetSequenceReuseBuilder()
+  })
+
+  /** What the sequence last read before its launch: the row `ended`. */
+  const LAST_READ = latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)
+
+  /** The entry's launch of persona `key` of the harness, of `kind`. */
+  const launchEntry = (h: RecoveryHarness, key: string, kind: LiveRowSequenceLaunchKind) =>
+    launchForLiveRowSequence(harnessPersona(h, key), h.config, { kind, lastRead: LAST_READ })
+
+  /** The calls no case of the entry makes: a delete, a kill or a spawn. */
+  const destructiveCalls = (h: RecoveryHarness) => [h.stub.calls.deleteCalls, h.stub.calls.killCalls, h.stub.calls.spawnCalls]
+
+  /** A `resume` held open until `release()`: `entered` resolves once it is called. */
+  function holdResume(h: RecoveryHarness): { entered: Promise<void>; release: () => void } {
+    let enter!: () => void
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve
+    })
+    let release!: () => void
+    const released = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const resume = h.stub.client.resume.bind(h.stub.client)
+    h.stub.client.resume = async (params) => {
+      enter()
+      await released
+      return resume(params)
+    }
+    return { entered, release }
+  }
+
+  test('the resume kind: one resume of cscb_<key>; on success the after-launch step logs pre_trust once and starts the approver', async () => {
+    const { h, p } = srj105Build()
+    const id = personaInstanceId(p)
+    const [preTrust] = PRE_TRUST_VALUES
+    h.script({ resumeResult: cannedResumeResult(id, preTrust) })
+
+    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, action: 'resumed' })
+
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: id }])
+    expect(preTrustLines(h.errors.join('\n'))).toEqual([preTrustLogLine(renderPersonaRef(p, p), LAUNCH_VERB_RESUME, preTrust)])
+    expect(h.approverRunning(p)).toBe(true)
+    expect(await h.runApproverToStop(p)).toBeDefined()
+    expect(destructiveCalls(h)).toEqual([[], [], []])
+    expect(h.reuses).toEqual([])
+  })
+
+  test('a launch call: isLaunchInFlight is true while its resume is held and whenLaunchSettled waits for it; both clear once it settles', async () => {
+    const { h, p } = srj105Build()
+    const held = holdResume(h)
+    const entry = launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)
+    await held.entered
+    let settled = false
+    const waited = whenLaunchSettled(p).then(() => {
+      settled = true
+    })
+    await h.clock.flush()
+
+    expect([isLaunchInFlight(p), settled]).toEqual([true, false])
+    held.release()
+    expect(await entry).toEqual({ key: p, action: 'resumed' })
+    await waited
+    expect([isLaunchInFlight(p), settled]).toEqual([false, true])
+    await h.runApproverToStop(p)
+  })
+
+  test('with a launch for P already held in flight, the entry waits for it to settle and never overlaps it', async () => {
+    const { h, p } = srj105Build()
+    const id = personaInstanceId(p)
+    const hold = holdSpawns(h.stub.client)
+    const first = h.launch(p)
+    await hold.entered(id)
+    const order = recordCallOrder(h)
+
+    const entry = launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)
+    await h.clock.flush()
+    expect(order).toEqual([])
+    expect(isLaunchInFlight(p)).toBe(true)
+
+    hold.release(id)
+    expect(await first).toEqual({ key: p, action: 'spawned' })
+    expect(await entry).toEqual({ key: p, action: 'resumed' })
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: id }])
+    expect(isLaunchInFlight(p)).toBe(false)
+    await h.runApproverToStop(p)
+  })
+
+  test.each([
+    ['ErrNoSessionId', () => errNoSessionId()],
+    ['ErrJsonlMissing', () => errJsonlMissing()],
+    ['ErrJsonlNeverWritten', () => errJsonlNeverWritten()],
+  ])('resume answering %s goes on to exactly one call of the reuse builder with the id; no delete, kill or plain spawn', async (_label, make) => {
+    const { h, p } = srj105Build()
+    const err = make()
+    h.script({ resumeError: err })
+
+    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, action: 'spawned' })
+
+    expect(h.stub.calls.resumeCalls).toHaveLength(1)
+    expect(h.reuses).toEqual([{ key: p, instanceId: personaInstanceId(p), lastRead: LAST_READ, resumeError: err }])
+    expect(destructiveCalls(h)).toEqual([[], [], []])
+  })
+
+  test.each([
+    ['ErrSpawnNotResumable: not launched, no second sequence', () => errSpawnNotResumable(), { action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE }],
+    ['an UNAVAILABLE answer: ended by class, uncounted', () => errTmuxUnresponsive('resume'), { action: 'failed', refused: true }],
+  ] as const)('resume answering %s; no further call', async (_label, make, answer) => {
+    const { h, p } = srj105Build()
+    h.script({ resumeError: make() })
+    const order = recordCallOrder(h)
+
+    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, ...answer })
+
+    expect(order).toEqual(['resume'])
+    expect(h.reuses).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  test('resume answering CONFLICT latches P through the latch\'s entry with the refused operation "resume" and the state last read; no further call', async () => {
+    const { h, p } = srj105Build()
+    const row = conflictRowsFor('resume')[0]!
+    h.script({ resumeError: row.build() })
+    const order = recordCallOrder(h)
+
+    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(['resume'])
+    expect(h.latch.record(p)).toEqual(
+      expectedLatchRecord(p, {
+        latchCase: row.latchCase,
+        refusedOperation: REFUSED_OPERATION_RESUME,
+        rowState: LAST_READ,
+        sessionName: row.sessionName,
+        description: row.build().errDescription,
+      }),
+    )
+    expect(h.reuses).toEqual([])
+  })
+
+  test('the reuse kind goes to the installed builder once, with the id', async () => {
+    const { h, p } = srj105Build()
+
+    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_REUSE)).toEqual({ key: p, action: 'spawned' })
+
+    expect(h.reuses).toEqual([{ key: p, instanceId: personaInstanceId(p), lastRead: LAST_READ, resumeError: undefined }])
+    expect(h.stub.callCount()).toBe(0)
+  })
+
+  test('no reuse builder installed: a reuse makes no agent-director call, logs one line, and answers not launched', async () => {
+    const { h, p } = srj105Build()
+    h.removeReuseBuilder()
+
+    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_REUSE)).toEqual({ key: p, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER })
+
+    expect(h.stub.callCount()).toBe(0)
+    expect(h.errors.filter((line) => line.startsWith(LIVE_ROW_SEQUENCE_LOG_PREFIX))).toHaveLength(1)
+    expect(h.reuses).toEqual([])
+  })
+
+  test('the test-only reset removes an installed builder: a reuse then calls it not and answers not launched', async () => {
+    const { h, p } = srj105Build()
+    const called: string[] = []
+    setSequenceReuseBuilder(async (request) => {
+      called.push(request.persona.key)
+      return { result: { key: request.persona.key, action: 'spawned' } }
+    })
+    _resetSequenceReuseBuilder()
+
+    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_REUSE)).toMatchObject({ action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER })
+    expect([called, h.reuses, h.stub.callCount()]).toEqual([[], [], 0])
+  })
+
+  // The dependency builder, as the harness builds it (`h.sequenceDeps`).
+
+  test('the builder reads nothing and starts nothing when called', () => {
+    const { h } = srj105Build()
+    const deps = buildLiveRowSequenceDeps({ retryArm: h.controller, clock: h.clock, log: () => {}, appliedConfig: () => h.config })
+
+    expect(typeof deps.readRow).toBe('function')
+    expect([h.stub.callCount(), h.clock.pendingCount()]).toEqual([0, 0])
+  })
+
+  test('each get goes through the shared own-row read: one get of P\'s instance; a provenance_conflict note on P\'s row latches P', async () => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const row = cannedGetResult({}, persona, h.home)
+    h.script({ getQueue: [cannedOk(row), cannedOk(cannedGetResult({ liveness_note: provenanceNote }, persona, h.home))] })
+
+    expect(await h.sequenceDeps.readRow(p, renderPersonaRef(p, p))).toEqual({ kind: LIVE_ROW_READ_ROW, row })
+    expect(await h.sequenceDeps.readRow(p, renderPersonaRef(p, p))).toEqual({ kind: LIVE_ROW_READ_LATCHED })
+
+    expect(h.stub.calls.getCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }, { claude_instance_id: personaInstanceId(p) }])
+    expect(h.latch.record(p)?.latchCase).toBe(LATCH_CASE_CONFLICTING_LABELS)
+  })
+
+  test('each run is a bypassing run with P\'s key as its next-step get: a fresh memo inside its window still yields a new call; P\'s row in unverified_ids gets no post-run get, Q\'s gets one', async () => {
+    const { h, p, b } = srj105Build()
+    _setNow(h.clock.now)
+    const id = personaInstanceId(p)
+    h.script({ findMissingResult: cannedFindMissing({ rows: { [id]: 'unverified_ids', [personaInstanceId(b)]: 'unverified_ids' } }) })
+    await sweepDeadTmuxChannel(b, ESCALATE_DEAD_WAITING_ROW_PANE_GONE)
+    const getsBefore = h.stub.calls.getCalls.length
+
+    expect(await h.sequenceDeps.runFindMissing(p, id, cannedStatusResult().state)).toBe(LIVE_ROW_RUN_LEFT_LIVE)
+
+    expect(h.stub.calls.findMissingCalls).toHaveLength(2)
+    expect(h.stub.calls.getCalls.slice(getsBefore)).toEqual([{ claude_instance_id: personaInstanceId(b) }])
+  })
+
+  /** One kill of P through the dependencies' kill binding, inside P's recovery attempt (as a sequence makes it), driven on the clock. */
+  const killThroughDeps = (h: RecoveryHarness, key: string, lastReadState = cannedStatusResult().state) =>
+    h.drive(
+      runInAttempt(key, 'recovery', () =>
+        h.sequenceDeps.killWithRetry(key, { lastReadState, wait: h.killRetryClock, keepGoing: () => true, ref: renderPersonaRef(key, key) }),
+      ),
+    )
+
+  test('each kill goes through the bounded retry over the deferred-report binding, its between-try read the shared status read: UNAVAILABLE then success arms no timer', async () => {
+    const { h, p } = srj105Build()
+    h.script({ killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))] })
+    const order = recordCallOrder(h)
+
+    expect(await killThroughDeps(h, p)).toMatchObject({ tries: 2, reads: 1 })
+
+    expect(order).toEqual(['kill', 'status', 'kill'])
+    expect(h.stub.calls.statusCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect([h.triggers, h.controller.isArmed(p)]).toEqual([[], false])
+  })
+
+  test('three failed tries arm P\'s retry timer once, with the outcome that stands', async () => {
+    const { h, p } = srj105Build()
+    h.script({ killError: errTmuxUnresponsive('kill') })
+
+    expect(await killThroughDeps(h, p)).toMatchObject({ tries: KILL_RETRY_TRIES })
+
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  test('the between-try read is the shared status read: P\'s own pending row with no launch start there latches P and ends the tries', async () => {
+    const { h, p } = srj105Build()
+    h.script({
+      killError: errTmuxUnresponsive('kill'),
+      statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }),
+    })
+
+    expect(await killThroughDeps(h, p)).toMatchObject({ tries: 1, reads: 1, end: KILL_RETRY_END_READ_LATCHED })
+
+    expect(h.latch.record(p)?.latchCase).toBe(LATCH_CASE_LAUNCH_START_NOT_RECORDED)
+  })
+
+  test('the launch dependency refuses a key outside the applied set with no call, while an applied key beside it launches', async () => {
+    const { h, p, b } = srj105Build()
+    h.remove(p)
+    const noRow = { kind: LIVE_ROW_SEQUENCE_NO_ROW } as const
+
+    expect(await h.sequenceDeps.launch(p, LIVE_ROW_LAUNCH_RESUME, noRow, renderPersonaRef(p, p))).toEqual({
+      kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+      reason: LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED,
+    })
+    expect(h.stub.callCount()).toBe(0)
+
+    expect(await h.sequenceDeps.launch(b, LIVE_ROW_LAUNCH_RESUME, noRow, renderPersonaRef(b, b))).toEqual({
+      kind: LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
+      result: { key: b, action: 'resumed' },
+    })
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(b) }])
+    await h.runApproverToStop(b)
+  })
+
+  test('the launch-kind facts come from the applied resume_enabled and the row comparison', () => {
+    const { h, p } = srj105Build({ resumeEnabled: false })
+    const own = cannedGetResult({}, harnessPersona(h, p), h.home)
+
+    expect(h.sequenceDeps.personaFacts(p, own)).toEqual({ resumeEnabled: false, cwdMatches: true, configDirMatches: true })
+    expect(h.sequenceDeps.personaFacts(p, { ...own, cwd: h.home })).toEqual({ resumeEnabled: false, cwdMatches: false, configDirMatches: true })
+    expect(h.sequenceDeps.personaFacts(p, { ...own, labels: { ...own.labels, config_dir: h.stateDir } })).toEqual({
+      resumeEnabled: false,
+      cwdMatches: true,
+      configDirMatches: false,
+    })
+    h.remove(p)
+    expect(h.sequenceDeps.personaFacts(p, own)).toBeUndefined()
   })
 })

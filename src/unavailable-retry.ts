@@ -353,6 +353,25 @@ export const UNAVAILABLE_RETRY_CAUSE_READ_ERROR = 'read-error'
 /** The cause `armPendingOnly` records: a covered `pending` row (b.jg5 SRJ-303, SRJ-409). */
 export const UNAVAILABLE_RETRY_CAUSE_PENDING_ROW = 'pending-row'
 
+/**
+ * The cause a live-row sequence arms with when a run left its `pending` row
+ * in neither `ids` nor `unverified_ids` and the episode stopped (b.jg5
+ * SRJ-717, SRJ-301; `src/live-row-sequence.ts`). Never counted.
+ */
+export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED = 'sequence-not-judged'
+
+/**
+ * The cause a live-row sequence arms with when it ends without its launch for
+ * any other reason (b.jg5 SRJ-705, SRJ-301): a failed `get`, a refused run,
+ * a kill's abort that did not latch the persona, step 5 (with or without its
+ * alert), no kill under the `ad-config-malformed` rule, a launch not made, or
+ * a final launch that failed (an `ErrTmuxSessionCreate` from its `resume` or
+ * reuse included; SRJ-112, SRJ-113) or threw. A stop for a latch, a teardown
+ * or shutdown, and a launch that latched the persona or stops the server, arm
+ * nothing. Never counted.
+ */
+export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED = 'sequence-ended-without-launch'
+
 // ---------------------------------------------------------------------------
 // Modes (b.jg5 SRJ-301, SRJ-303)
 // ---------------------------------------------------------------------------

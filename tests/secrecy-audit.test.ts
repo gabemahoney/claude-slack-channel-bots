@@ -35,8 +35,11 @@
  *    install, the agent-director error classifier, the agent-director
  *    settings reader, the UNAVAILABLE retry timer, the persona episodes
  *    with their tmux-unresponsive condition, the outage state, whose
- *    config-file onset quotes agent-director, and the conflict latch, whose
- *    lines and record carry agent-director's CONFLICT description), a value
+ *    config-file onset quotes agent-director, the conflict latch, whose
+ *    lines and record carry agent-director's CONFLICT description, the kill
+ *    modules (the checked kill, its bounded retry and the kill-failure
+ *    alert's texts), the read-pane outcome, the persona routing and the
+ *    live-row sequence, whose step lines carry agent-director failure text), a value
  *    import of one
  *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
  *    config-file writer, the agent-director settings-file writer, the reload,
@@ -139,6 +142,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/checked-kill\.ts$/, "the checked kill, whose outcome keeps the thrown agent-director error and an ErrTmuxKillFailed description raw, and whose one-line rendering carries agent-director failure text (described, redacted) to log lines and startup errors"],
   [/^src\/kill-retry\.ts$/, "the bounded retry of a live row's kill, whose per-try and per-read lines carry agent-director failure text (described, redacted) and whose alert decision keeps agent-director's kill-failure descriptions raw"],
   [/^src\/kill-failure-alert\.ts$/, "the kill-failure alert's texts, which quote agent-director's kill-failure descriptions (redacted) in Slack posts, log lines and startup-errors entries"],
+  [/^src\/live-row-sequence\.ts$/, "the live-row sequence, whose step lines carry agent-director failure text (a failed get's failure and each kill's outcome, described, redacted) and whose kill results keep agent-director's kill-failure descriptions raw"],
   [/^src\/pane-read\.ts$/, "the read-pane outcome, whose failure outcomes carry the described agent-director failure text (redacted) to the callers' log lines"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
 ]
@@ -465,6 +469,21 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('src/kill-failure-alert.ts')))
     expect(touching).toContain(suite)
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
+  })
+
+  // b.jg5 SRJ-705, SRJ-1014: each step's line carries the described agent-director failure (a failed get, a kill's
+  // outcome), and a kill's result keeps the kill-failure descriptions raw for the alert to redact.
+  test('src/live-row-sequence.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
+    const suite = 'tests/live-row-sequence.test.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/live-row-sequence.ts'))).toBe(true)
+    expect(touchReasonsOf(suite, "import { runLiveRowSequence } from '../src/live-row-sequence.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { liveRowSequenceGetLine as line } from '../src/live-row-sequence.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { LIVE_ROW_SEQUENCE_MAX_RUNS, LIVE_ROW_OUTCOME_ESCALATED } from '../src/live-row-sequence.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { LiveRowSequenceOutcome } from '../src/live-row-sequence.ts'")).toEqual([])
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('src/live-row-sequence.ts')))
+    expect(touching.length).toBeGreaterThan(0)
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
+    expect([callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([true, false])
   })
 
   // b.jg5 SRJ-117: a read-pane failure outcome carries the described agent-director failure to its callers' log lines.

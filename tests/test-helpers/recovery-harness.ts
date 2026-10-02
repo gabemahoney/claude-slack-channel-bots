@@ -293,6 +293,38 @@
  *   steps for the spawn path's own file I/O, bounded by `options.settleMs`;
  *   it throws when `work` is still unsettled at the bound with no wait
  *   pending. A wait still pending at `cleanup()` fails it, as any timer does.
+ * - The live-row sequence (b.jg5 SRJ-705, SRJ-706, SRJ-717;
+ *   `src/live-row-sequence.ts`): its dependencies (`sequenceDeps`) come
+ *   from the session manager's one builder (`buildLiveRowSequenceDeps`),
+ *   given what `main()` gives it: the harness's kill-failure alerts (over
+ *   `episodes`), the trigger sink above as the retry arm (so each end's arm
+ *   is recorded in `triggers` and armed on the controller), the live applied
+ *   set, `lines` as its log, and the sequence clock: the harness clock with
+ *   each sequence timer tracked (the step-2 wait, the run spacing, the
+ *   step-4 pause and each wait between a kill's tries). A recording reuse
+ *   builder is installed through `setSequenceReuseBuilder`: `reuses` records
+ *   each call (the persona key, the instance id, the state the sequence last
+ *   read and the `resume` answer that sent the launch on to the reuse, if
+ *   any), and it answers what `answerReuse` scripted, by default a `spawned`
+ *   result with no spawn result (so no after-launch step);
+ *   `removeReuseBuilder()` leaves none installed. The `resume` leg runs
+ *   through the stub as production binds it. `startSequence(key, request)`
+ *   starts one sequence (steps 1 to 6) for persona `key`, a configured one
+ *   or one `remove(key)` dropped, inside its own recovery attempt
+ *   (`runInAttempt(key, 'recovery', ...)`), with the request's seed (the
+ *   state last read), entry step (step 1 by default), keep-conversation flag
+ *   and retired-key flag (both false by default), launch flag (true by
+ *   default; false is the no-launch form) and alert context (`recovery` by
+ *   default), and answers the outcome promise and the stop handle.
+ *   `runSequence(key, request)` starts one and drives it to its end;
+ *   `driveSequence(work)` awaits `work` while moving the clock to each
+ *   pending sequence timer as it is set (every other timer due by then fires
+ *   too, as in `advance`), in 1 ms real-time steps for the launch's own file
+ *   I/O, bounded by `options.settleMs` steps that find no sequence timer
+ *   pending; it throws when `work` is still unsettled then. The exported
+ *   `runSequenceStoppedAtKill(h, key, step, answer, reason)` runs one whose
+ *   step-1 or step-4 kill gets its last try's answer (one of
+ *   `LATE_KILL_ANSWERS`) after its stop was set.
  * - `settle()`: awaits every configured persona's launch in flight
  *   (`whenLaunchSettled`) and every retry run in flight (`whenRunSettled`),
  *   with its re-arm or stop, and then until every running dialog approver
@@ -385,10 +417,13 @@
  *   `options.adSettings`, when given, is written there first
  *   (`writeAgentDirectorConfig`); otherwise no file exists and the defaults
  *   are in effect. The reader's lines go to `lines`.
+ *   `rewriteAdSettings(input)` writes the file again and lets the installed
+ *   reader read it, as its next 120 s tick's read would.
  * - `config` and `keys`: a resolved configuration of `options.personas`
  *   (two personas by default) with `session_restart_delay` and
- *   `health_check_interval` from the options, both 0 by default (SRJ-304).
- *   Every persona is applied at first.
+ *   `health_check_interval` from the options, both 0 by default (SRJ-304),
+ *   and `resume_enabled` from `options.resumeEnabled` when given (the
+ *   configuration's default otherwise). Every persona is applied at first.
  * - `advance(ms)`: moves the clock `ms` forward one due time at a time.
  *   Before and after each firing it awaits every in-flight retry run
  *   (`whenRunSettled`) and then every running dialog approver's next sleep,
@@ -403,8 +438,8 @@
  * - `captured()`: everything captured, for `assertNoLeak`: the lines, the
  *   `console.error` lines, the four notice lists, the startup-errors
  *   entries, the attempts, the triggers, the condition ends, the outage
- *   clears, the stops, the latch events, the driver's Slack calls and the
- *   state directory as a written file.
+ *   clears, the stops, the latch events, the reuse builder's records, the
+ *   driver's Slack calls and the state directory as a written file.
  * - `cleanup()`: first stops and forgets every dialog approver
  *   (`_resetDialogApprovers`, silently: none makes a call after the one in
  *   progress) and clears the timers they left on the harness clock, then
@@ -424,9 +459,12 @@
  *   harnesses built one after the other share no query,
  *   the stub spawn path and client with every launch still in flight and the
  *   approver's clock and cap, the
- *   findMissing memo, the tmux seams, the settings install,
- *   `SLACK_STATE_DIR`) and removes the temporary directory. It throws, after
- *   undoing everything, when a timer is still pending on the clock or a
+ *   findMissing memo, the tmux seams, the settings install, the sequence's
+ *   reuse builder (`_resetSequenceReuseBuilder`), `SLACK_STATE_DIR`) and
+ *   removes the temporary directory. Every live-row sequence still running is
+ *   stopped (the shutdown reason), after the pending timers are counted. It
+ *   throws, after undoing everything, when a timer is still pending on the
+ *   clock (a sequence timer included, which the message counts apart) or a
  *   persona is still armed: the episodes run on the harness clock, so a timer
  *   they armed and left pending fails it too.
  *
@@ -464,10 +502,11 @@
  * instance id from the thrown values' raw descriptions:
  * `ordinaryAlertContent`, `survivorAlertContent`, `killFailureNotice` (the
  * destination post as `episodeNotices` holds it), `killFailureRecoveryEntry`
- * (the not-configured route's entry, context `recovery`), with
+ * (the not-configured route's entry, context `recovery` unless given), with
  * `startupEntriesOf` (one class's entries without their timestamp),
  * `killFailureLines` (the alerts' own lines) and the alerts' line builders
- * (context `recovery`): `killFailureEndedLine`, `killFailurePostedLine`,
+ * (context `recovery`; `killFailurePostedLine` takes another):
+ * `killFailureEndedLine`, `killFailurePostedLine`,
  * `killFailureHeldLine`, `killFailureLoggedLine`, `killFailureNotRaisedLine`
  * and `killFailureStoppedSurvivorLine`.
  *
@@ -485,10 +524,10 @@
  *
  * Isolation: no top-level `mock.module()`, no real HOME, `~/.agent-director`,
  * tmux, child process or Slack client (the driver's clients are stubs). The
- * retry timer, the dialog approver and the waits between a kill's tries run
- * on the fake clock only; the one real-time wait is the bounded poll for the
- * spawn path's own file I/O (`settle()`'s, and `drive`'s between kill-retry
- * waits). A retry
+ * retry timer, the dialog approver, the waits between a kill's tries and the
+ * live-row sequence's waits run on the fake clock only; the one real-time
+ * wait is the bounded poll for the spawn path's own file I/O (`settle()`'s,
+ * and `drive`'s and `driveSequence`'s between their timers). A retry
  * never arms the restart module's own (real) timer: its entry bypasses it. Every file
  * sits under one `mkdtempSync` directory.
  *
@@ -503,7 +542,14 @@ import { join } from 'node:path'
 import type { WebClient } from '@slack/web-api'
 import type { Client, SpawnResult } from 'agent-director'
 
-import { adAlertThresholdMsInEffect, adSettingsInEffect, installAdSettings, resetAdSettingsForTests, type AdSettingsInEffect } from '../../src/ad-settings.ts'
+import {
+  adAlertThresholdMsInEffect,
+  adSettingsInEffect,
+  installAdSettings,
+  resetAdSettingsForTests,
+  type AdSettingsInEffect,
+  type NeverEarlyWaitClock,
+} from '../../src/ad-settings.ts'
 import { _resetBackoffState, isAtCap } from '../../src/backoff.ts'
 import { replySettingsOf, type Persona, type PersonaConfig } from '../../src/config.ts'
 import {
@@ -514,6 +560,7 @@ import {
   type ConflictLatchRecord,
   type ConflictLatchSetOutcome,
   type ConflictNoticeEpisodes,
+  type LatchRowState,
 } from '../../src/conflict-latch.ts'
 import { LIVENESS_LIVE } from '../../src/liveness-reading.ts'
 import { classifyAdError, describeAdErrorClassification, killFailedDescriptionOf } from '../../src/ad-error-class.ts'
@@ -528,6 +575,7 @@ import {
   killFailureAlertEntryText,
   killFailureAlertText,
   type KillFailureAlertContent,
+  type KillFailureAlertContext,
   type KillFailureAlertVersion,
   type KillFailureClosing,
 } from '../../src/kill-failure-alert.ts'
@@ -562,7 +610,19 @@ import { createPersonaSerializer, type PersonaSerializer } from '../../src/perso
 import { createPersonaRelaunchGate, createPersonaUpPredicate, type PersonaUpQuery } from '../../src/persona-start.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
 import { createNameResolver, type NameResolverWebClient } from '../../src/message-archive.ts'
-import { KILL_RETRY_ALERT_ORDINARY, type KillRetryAlert, type KillRetryClock } from '../../src/kill-retry.ts'
+import { KILL_RETRY_ALERT_ORDINARY, KILL_RETRY_TRIES, type KillRetryAlert, type KillRetryClock } from '../../src/kill-retry.ts'
+import {
+  LIVE_ROW_SEQUENCE_ENTRY_KILL,
+  LIVE_ROW_SEQUENCE_STEP3_RUNS,
+  LIVE_ROW_STOP_SHUTDOWN,
+  createLiveRowSequenceStop,
+  runLiveRowSequence,
+  type LiveRowSequenceDeps,
+  type LiveRowSequenceEntryStep,
+  type LiveRowSequenceOutcome,
+  type LiveRowSequenceStopHandle,
+  type LiveRowSequenceStopReason,
+} from '../../src/live-row-sequence.ts'
 import { getSessionByPersona } from '../../src/registry.ts'
 import {
   _resetRestartState,
@@ -586,12 +646,14 @@ import {
   _resetDialogApprovers,
   _resetFindMissingMemo,
   _resetLadderKillClock,
+  _resetSequenceReuseBuilder,
   _resetTmuxSessionKiller,
   _setApproverClock,
   _setDialogReadyTimeoutMs,
   _setLadderKillClock,
   _setTmuxSessionKiller,
   _whenDialogApproverStopped,
+  buildLiveRowSequenceDeps,
   isDialogApproverRunning,
   isLaunchInFlight,
   launchSession,
@@ -601,6 +663,7 @@ import {
   setConflictLatch,
   setKillFailureAlerts,
   setPersonaKillKeepGoingQuery,
+  setSequenceReuseBuilder,
   setSessionNotifier,
   spawnForPersona,
   stopAllDialogApprovers,
@@ -608,6 +671,8 @@ import {
   whenLaunchSettled,
   type ApproverClock,
   type ApproverOutcome,
+  type SequenceReuseAnswer,
+  type SequenceReuseRequest,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
 import { createSlowRecoveryTracker, type SlowRecoveryTracker } from '../../src/slow-recovery.ts'
@@ -615,6 +680,7 @@ import { recordStartupError } from '../../src/startup-errors.ts'
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
+  runInAttempt,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
@@ -634,9 +700,14 @@ import { writeAgentDirectorConfig, type AdConfigInput } from './ad-settings.ts'
 import {
   cannedErr,
   cannedGetResult,
+  cannedKillResult,
+  cannedOk,
   cannedStatusResult,
   errInstanceIdCollision,
   errSpawnNotFound,
+  errTmuxKillFailed,
+  errTmuxSessionConflict,
+  errTmuxUnresponsive,
   installStubSpawnPath,
   resetStubSpawnPath,
   type PersonaGetResultOverrides,
@@ -672,6 +743,8 @@ export interface RecoveryHarnessOptions {
   action?: UnavailableRetryAction | 'scripted'
   /** The personas (`makeMultiPersonaConfig` specs); two default personas when unset. */
   personas?: PersonaSpec[]
+  /** The configuration's `resume_enabled`; the configuration's default when unset. */
+  resumeEnabled?: boolean
   /** `session_restart_delay` in seconds; 0 by default. */
   sessionRestartDelay?: number
   /**
@@ -793,6 +866,41 @@ export interface LostMessageOutcome {
   readonly calls: Record<string, number>
 }
 
+/** What a case asks of one live-row sequence (`startSequence`, `runSequence`); see the module comment. */
+export interface RecoverySequenceRequest {
+  /** The row state the starter last read: the seed of step 1's kill and of the first run's reading. */
+  readonly lastReadState: string
+  /** The step the sequence enters at; step 1 when unset. */
+  readonly entryStep?: LiveRowSequenceEntryStep
+  /** Whether the persona keeps its conversation; false when unset. */
+  readonly keepsConversation?: boolean
+  /** Whether the key is retired; false when unset. */
+  readonly retiredKey?: boolean
+  /** Whether the sequence ends in a launch; true when unset (false: the no-launch form). */
+  readonly launches?: boolean
+  /** The kill-failure alert's context; `recovery` when unset. */
+  readonly alertContext?: KillFailureAlertContext
+}
+
+/** One live-row sequence `startSequence` started: its outcome and its stop handle. */
+export interface RecoverySequenceRun {
+  readonly outcome: Promise<LiveRowSequenceOutcome>
+  readonly stop: LiveRowSequenceStopHandle
+}
+
+/** One call of the recording reuse builder. */
+export interface RecoveryReuse {
+  readonly key: string
+  readonly instanceId: string
+  /** The row state the sequence last read, as the sequence-launch entry hands it on. */
+  readonly lastRead: LatchRowState
+  /** The `resume` answer that sent the launch on to the reuse; undefined when step 6 decided the reuse itself. */
+  readonly resumeError: unknown
+}
+
+/** What the recording reuse builder answers for one call. */
+export type RecoveryReuseAnswer = (request: SequenceReuseRequest) => SequenceReuseAnswer | Promise<SequenceReuseAnswer>
+
 /** The driver's pieces, built at the first `loseMessage`. */
 interface LostMessageDriver {
   readonly routing: PersonaRouting
@@ -883,6 +991,20 @@ export interface RecoveryHarness {
    * kill's tries as it is set (b.jg5 SRJ-702); see the module comment.
    */
   drive<T>(work: Promise<T>): Promise<T>
+  /** The live-row sequence's dependencies, from the session manager's builder; see the module comment. */
+  readonly sequenceDeps: LiveRowSequenceDeps
+  /** Every call of the recording reuse builder, in order. */
+  readonly reuses: RecoveryReuse[]
+  /** What the recording reuse builder answers from now on; `undefined` puts back the default `spawned` result. */
+  answerReuse(answer: RecoveryReuseAnswer | undefined): void
+  /** Remove the recording reuse builder: a reuse at step 6 then makes no call and is not launched. */
+  removeReuseBuilder(): void
+  /** Start one live-row sequence for persona `key` inside its recovery attempt; see the module comment. */
+  startSequence(key: string, request: RecoverySequenceRequest): RecoverySequenceRun
+  /** Start one live-row sequence for persona `key` and drive it to its end (`driveSequence`); resolves with its outcome. */
+  runSequence(key: string, request: RecoverySequenceRequest): Promise<LiveRowSequenceOutcome>
+  /** Await `work` while moving the clock to each pending live-row sequence timer as it is set; see the module comment. */
+  driveSequence<T>(work: Promise<T>): Promise<T>
   settle(): Promise<void>
   /** Whether persona `key`'s dialog approver is running (read-only; the session manager's `isDialogApproverRunning`). */
   approverRunning(key: string): boolean
@@ -924,6 +1046,8 @@ export interface RecoveryHarness {
   setHealthCheckInterval(seconds: number): void
   startupErrors(): string[]
   settings(): AdSettingsInEffect
+  /** Write agent-director's settings file again and let the installed reader read it (its next tick's read). */
+  rewriteAdSettings(input: AdConfigInput): void
   advance(ms: number): Promise<number>
   captured(): Record<string, unknown>
   cleanup(): void
@@ -965,6 +1089,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const config = makeMultiPersonaConfig(options.personas ?? [{}, {}], root, {
     session_restart_delay: options.sessionRestartDelay ?? 0,
     health_check_interval: options.healthCheckInterval ?? 0,
+    ...(options.resumeEnabled === undefined ? {} : { resume_enabled: options.resumeEnabled }),
   })
   const keys = config.personas.map((persona) => persona.key)
   for (const persona of config.personas) mkdirSync(persona.working_directory, { recursive: true })
@@ -1205,6 +1330,44 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       return controller.arm(key, cause)
     },
   }
+  // The live-row sequence (b.jg5 SRJ-705), composed as main() composes it:
+  // its dependencies from the session manager's one builder, with the
+  // harness's kill-failure alerts and the trigger sink as its retry arm; its
+  // clock is the harness clock with each sequence timer tracked, so
+  // `driveSequence` can move the clock to it. A recording reuse builder is
+  // installed; cleanup removes it.
+  const sequenceTimers = new Set<unknown>()
+  const sequenceClock: NeverEarlyWaitClock = {
+    now: () => clock.now(),
+    setTimeout: (callback, delayMs) => {
+      const handle = clock.setTimeout(() => {
+        sequenceTimers.delete(handle)
+        callback()
+      }, delayMs)
+      sequenceTimers.add(handle)
+      return handle
+    },
+    clearTimeout: (handle) => {
+      sequenceTimers.delete(handle)
+      clock.clearTimeout(handle)
+    },
+  }
+  const sequenceDeps = buildLiveRowSequenceDeps({
+    killFailureAlerts,
+    retryArm: triggerSink,
+    clock: sequenceClock,
+    log,
+    appliedConfig,
+  })
+  const sequenceStops = new Set<LiveRowSequenceStopHandle>()
+  const reuses: RecoveryReuse[] = []
+  let reuseAnswer: RecoveryReuseAnswer | undefined
+  setSequenceReuseBuilder(async (request) => {
+    const { key } = request.persona
+    reuses.push({ key, instanceId: personaInstanceId(key), lastRead: request.lastRead, resumeError: request.resumeError })
+    if (reuseAnswer !== undefined) return reuseAnswer(request)
+    return { result: { key, action: 'spawned' } }
+  })
   _resetOutageState()
   initOutageState({
     notify: (key, text) => {
@@ -1248,7 +1411,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   resetAdSettingsForTests()
   if (options.adSettings !== undefined) writeAgentDirectorConfig(home, options.adSettings)
-  installAdSettings({ home: () => home, log })
+  const adSettingsReader = installAdSettings({ home: () => home, log })
 
   _resetRestartState()
   _resetBackoffState()
@@ -1396,14 +1559,19 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     return fired
   }
 
-  /** The earliest due time of a pending wait between a kill's tries, or undefined. */
-  function nextKillRetryDue(): number | undefined {
+  /** The earliest due time of a pending timer among `handles` (a tracked clock's), or undefined. */
+  function nextDueOf(handles: ReadonlySet<unknown>): number | undefined {
     let due: number | undefined
     for (const timer of clock.pending()) {
-      if (![...killRetryTimers].some((handle) => (handle as { id?: unknown }).id === timer.id)) continue
+      if (![...handles].some((handle) => (handle as { id?: unknown }).id === timer.id)) continue
       if (due === undefined || timer.dueAt < due) due = timer.dueAt
     }
     return due
+  }
+
+  /** The earliest due time of a pending wait between a kill's tries, or undefined. */
+  function nextKillRetryDue(): number | undefined {
+    return nextDueOf(killRetryTimers)
   }
 
   /**
@@ -1439,12 +1607,63 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   /** The earliest due time of a pending approver timer, or undefined. */
   function nextApproverDue(): number | undefined {
-    let due: number | undefined
-    for (const timer of clock.pending()) {
-      if (![...approverTimers].some((handle) => (handle as { id?: unknown }).id === timer.id)) continue
-      if (due === undefined || timer.dueAt < due) due = timer.dueAt
+    return nextDueOf(approverTimers)
+  }
+
+  /**
+   * Await `work`, moving the clock to each pending live-row sequence timer as
+   * it is set, in 1 ms real-time steps for at most `settleMs` steps that find
+   * no sequence timer pending.
+   */
+  async function driveSequence<T>(work: Promise<T>): Promise<T> {
+    let settled = false
+    void work.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+    const realTurn = (): Promise<unknown> => new Promise((resolve) => setTimeout(resolve, 1))
+    for (let idle = 0; idle < settleMs && !settled; ) {
+      await clock.flush()
+      if (settled) break
+      const due = nextDueOf(sequenceTimers)
+      if (due !== undefined) {
+        await advance(due - clock.now())
+        continue
+      }
+      await Promise.race([work, realTurn()])
+      idle++
     }
-    return due
+    if (!settled) throw new Error(`recovery harness: the driven sequence was still unsettled after ${settleMs} ms with no sequence timer pending`)
+    return work
+  }
+
+  /** Start one live-row sequence for persona `key` inside its own recovery attempt. */
+  function startSequence(key: string, request: RecoverySequenceRequest): RecoverySequenceRun {
+    if (!keys.includes(key)) throw new Error(`recovery harness: no configured persona ${JSON.stringify(key)}`)
+    const stop = createLiveRowSequenceStop()
+    sequenceStops.add(stop)
+    const outcome = runInAttempt(key, 'recovery', () =>
+      runLiveRowSequence(
+        {
+          key,
+          instanceId: personaInstanceId(key),
+          lastReadState: request.lastReadState,
+          entryStep: request.entryStep ?? LIVE_ROW_SEQUENCE_ENTRY_KILL,
+          keepsConversation: request.keepsConversation ?? false,
+          retiredKey: request.retiredKey ?? false,
+          launches: request.launches ?? true,
+          alertContext: request.alertContext ?? KILL_FAILURE_CONTEXT_RECOVERY,
+        },
+        sequenceDeps,
+        stop,
+      ),
+    )
+    void outcome.then(() => sequenceStops.delete(stop))
+    return { outcome, stop }
   }
 
   function startupErrors(): string[] {
@@ -1627,6 +1846,24 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     drive,
 
+    sequenceDeps,
+
+    reuses,
+
+    answerReuse(answer) {
+      reuseAnswer = answer
+    },
+
+    removeReuseBuilder() {
+      setSequenceReuseBuilder(undefined)
+    },
+
+    startSequence,
+
+    runSequence: (key, request) => driveSequence(startSequence(key, request).outcome),
+
+    driveSequence,
+
     settle: settleLaunches,
 
     approverRunning: (key) => isDialogApproverRunning(key),
@@ -1697,6 +1934,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     settings: () => adSettingsInEffect(),
 
+    rewriteAdSettings(input) {
+      writeAgentDirectorConfig(home, input)
+      adSettingsReader.read()
+    },
+
     advance,
 
     captured: () => ({
@@ -1712,6 +1954,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       outageClears: [...outageClears],
       stops: [...stops],
       latchEvents: [...latchEvents],
+      reuses: [...reuses],
       lostMessageNotices: [...lostMessageNotices],
       slackCalls: Object.fromEntries([...slackStubs].map(([key, slack]) => [key, slack.callLog])),
       stateDir: writtenFile(stateDir),
@@ -1728,7 +1971,12 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       lostMessageDriver?.hold.cancelAll()
       lostMessageDriver = undefined
       const pendingTimers = clock.pendingCount()
+      const sequenceTimersPending = sequenceTimers.size
       const armed = controller.armedKeys()
+      // A sequence still running is stopped, so it makes no call after this.
+      for (const stop of sequenceStops) stop.stop(LIVE_ROW_STOP_SHUTDOWN)
+      sequenceStops.clear()
+      _resetSequenceReuseBuilder()
       _resetRestartState()
       _resetBackoffState()
       _resetOutageState()
@@ -1749,7 +1997,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       rmSync(root, { recursive: true, force: true })
       if (pendingTimers !== 0 || armed.length !== 0) {
         throw new Error(
-          `recovery harness: ${pendingTimers} timer(s) still pending and ${armed.length} persona(s) still armed after stopAll`,
+          `recovery harness: ${pendingTimers} timer(s) still pending (${sequenceTimersPending} of them live-row sequence timers) and ${armed.length} persona(s) still armed after stopAll`,
         )
       }
     },
@@ -1883,6 +2131,60 @@ export function recordCallOrder(h: RecoveryHarness, during?: { readonly at: numb
     }
   }
   return order
+}
+
+/**
+ * A kill answer the live-row sequence gets after it was stopped (b.jg5
+ * SRJ-706): its label, its builder, and the tries the bounded retry makes of
+ * a row read live before that answer stands (an UNAVAILABLE one is tried
+ * again until its tries are used; a CONFLICT never is).
+ */
+export type LateKillAnswer = readonly [label: string, make: () => Error, tries: number]
+
+/** The late kill answers a stop must drop: UNAVAILABLE and `ErrTmuxKillFailed` with their tries used, and CONFLICT. */
+export const LATE_KILL_ANSWERS: readonly LateKillAnswer[] = [
+  ['UNAVAILABLE (ErrTmuxUnresponsive), its tries used', () => errTmuxUnresponsive('kill'), KILL_RETRY_TRIES],
+  ['ErrTmuxKillFailed, its tries used', () => errTmuxKillFailed(), KILL_RETRY_TRIES],
+  ['CONFLICT', () => errTmuxSessionConflict('kill', 'not-this-launch'), 1],
+]
+
+/** The calls a live-row sequence over a row read live makes before its step-`step` kill: none, or step 1's kill, the step-2 get and step 3's runs, each with its get. */
+export function callsBeforeSequenceKill(step: 1 | 4): string[] {
+  if (step === 1) return []
+  return ['kill', 'get', ...Array.from({ length: LIVE_ROW_SEQUENCE_STEP3_RUNS }, () => ['findMissing', 'get']).flat()]
+}
+
+/** Every kill answers success but the step-`step` kill of a live-row sequence, which answers `err()` at each try. */
+export function scriptSequenceKillFailure(h: RecoveryHarness, step: 1 | 4, err: () => Error): void {
+  h.script(step === 1 ? { killError: err() } : { killQueue: [cannedOk(cannedKillResult(true))], killError: err() })
+}
+
+/**
+ * Run one live-row sequence for persona `key` over its own row read live
+ * (`waiting`) at every `get`, every run judging it alive, whose step-`step`
+ * kill answers `answer` at each try (`scriptSequenceKillFailure`); the
+ * sequence's stop is set with `reason` as that kill's last try gets its
+ * answer, before the sequence reads it. Resolves, once the sequence is
+ * driven to its end, with its outcome and every stub call in order
+ * (`recordCallOrder`).
+ */
+export async function runSequenceStoppedAtKill(
+  h: RecoveryHarness,
+  key: string,
+  step: 1 | 4,
+  answer: LateKillAnswer,
+  reason: LiveRowSequenceStopReason,
+): Promise<{ readonly outcome: LiveRowSequenceOutcome; readonly order: string[] }> {
+  const [, make, tries] = answer
+  h.script({ getResult: cannedGetResult({}, personaOf(h, key), h.home) })
+  scriptSequenceKillFailure(h, step, make)
+  let run: RecoverySequenceRun | undefined
+  // Each further try follows one status read: the last try is the call at this position.
+  const lastTry = callsBeforeSequenceKill(step).length + 2 * (tries - 1)
+  const order = recordCallOrder(h, { at: lastTry, run: () => run?.stop.stop(reason) })
+  run = h.startSequence(key, { lastReadState: cannedStatusResult().state })
+  const outcome = await h.driveSequence(run.outcome)
+  return { outcome, order }
 }
 
 /**
@@ -2084,13 +2386,18 @@ export function killFailureNotice(key: string, content: KillFailureAlertContent,
 }
 
 /**
- * The startup-errors entry of an alert the restart path or the collision
- * ladder raised for persona `key` no longer in the applied configuration:
- * `persona=<key> (recovery): <text>`, the unescaped text with the log-only
- * closing sentence of its version.
+ * The startup-errors entry of an alert the restart path, the collision
+ * ladder or a live-row sequence raised for persona `key` no longer in the
+ * applied configuration: `persona=<key> (<context>): <text>`, the context
+ * `recovery` by default, the unescaped text with the log-only closing
+ * sentence of its version.
  */
-export function killFailureRecoveryEntry(key: string, content: KillFailureAlertContent): string {
-  return killFailureAlertEntryText(`persona=${key}`, KILL_FAILURE_CONTEXT_RECOVERY, killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false))
+export function killFailureRecoveryEntry(
+  key: string,
+  content: KillFailureAlertContent,
+  context: KillFailureAlertContext = KILL_FAILURE_CONTEXT_RECOVERY,
+): string {
+  return killFailureAlertEntryText(`persona=${key}`, context, killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false))
 }
 
 /** The harness's startup-errors entries of class `classLabel`, each the text after its timestamp and class, in order. */
@@ -2113,7 +2420,8 @@ export function killFailureLines(h: RecoveryHarness, key: string): string[] {
 }
 
 // The kill-failure alerts' own log lines (`createKillFailureAlerts`,
-// `src/persona-episodes.ts`), each for the context `recovery`. As the
+// `src/persona-episodes.ts`), each for the context `recovery` unless a
+// builder takes another (a live-row sequence's request context). As the
 // condition's lines above, the fixed words are held here (pinned as literals
 // only in tests/persona-episodes.test.ts); the kind, the versions, the
 // closings, the classes and the rendering of the descriptions come from `src/`.
@@ -2124,12 +2432,18 @@ export function killFailureEndedLine(key: string, reason: KillFailureEndReason):
 }
 
 /**
- * The line of `content`'s alert posted at persona `key`'s destination: the
- * ordinary version names its `closing` (the not-latched one by default); the
- * survivor version names none.
+ * The line of `content`'s alert posted at persona `key`'s destination with
+ * `context` (`recovery` by default): the ordinary version names its
+ * `closing` (the not-latched one by default); the survivor version names
+ * none.
  */
-export function killFailurePostedLine(key: string, content: KillFailureAlertContent, closing: KillFailureClosing = KILL_FAILURE_CLOSING_DESTINATION): string {
-  const where = content.version === KILL_FAILURE_VERSION_ORDINARY ? `${KILL_FAILURE_CONTEXT_RECOVERY}; ${closing}` : KILL_FAILURE_CONTEXT_RECOVERY
+export function killFailurePostedLine(
+  key: string,
+  content: KillFailureAlertContent,
+  closing: KillFailureClosing = KILL_FAILURE_CLOSING_DESTINATION,
+  context: KillFailureAlertContext = KILL_FAILURE_CONTEXT_RECOVERY,
+): string {
+  const where = content.version === KILL_FAILURE_VERSION_ORDINARY ? `${context}; ${closing}` : context
   return `${killFailureLinePrefix(key)}${content.version} alert posted to its destination (${where})`
 }
 

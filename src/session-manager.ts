@@ -199,6 +199,14 @@
  * launch whose last agent-director error armed it is refused
  * (`SpawnPersonaResult.refused`), which the restart path never counts.
  *
+ * The live-row sequence (`src/live-row-sequence.ts`, b.jg5 SRJ-705) runs
+ * through the dependencies `buildLiveRowSequenceDeps` binds to the shared
+ * entries here, and makes its final launch through one launch call,
+ * `launchForLiveRowSequence`: a `resume` whose no-transcript answers go on to
+ * the installed reuse builder (`setSequenceReuseBuilder`), or that reuse;
+ * with no builder installed a reuse makes no call. No production site starts
+ * a sequence yet.
+ *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
  *
@@ -207,7 +215,7 @@
 
 import type { Client, ListRow, SpawnParams, FindMissingResult, GetResult } from 'agent-director'
 
-import type { Phase1ResumeResult, Phase1SpawnResult, Phase1StatusResult, PreTrust } from './ad-phase1-types.ts'
+import type { Phase1GetResult, Phase1ResumeResult, Phase1SpawnResult, Phase1StatusResult, PreTrust } from './ad-phase1-types.ts'
 
 import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
 import {
@@ -235,6 +243,7 @@ import {
 } from './persona-identity.ts'
 import { getClient } from './agent-director-client.ts'
 import {
+  getOutageFlags,
   raiseAdConfigMalformed,
   raiseTmuxUnavailable,
   reportAgentDirectorError,
@@ -256,8 +265,12 @@ import {
   ErrCwdNotFound,
   ErrCwdNotADirectory,
   ErrSpawnCapReached,
+  ERR_JSONL_MISSING_NAME,
+  ERR_JSONL_NEVER_WRITTEN_NAME,
+  ERR_NO_SESSION_ID_NAME,
   ERR_SPAWN_NOT_FOUND_NAME,
   ERR_SPAWN_NOT_INTERACTIVE_NAME,
+  ERR_SPAWN_NOT_RESUMABLE_NAME,
 } from './agent-director-errors.ts'
 import {
   AD_CALL_KILL_ROW_READ_LIVE,
@@ -302,6 +315,7 @@ import {
   killFailureAlertEntryText,
   killFailureAlertText,
   selectKillFailureAlertRoute,
+  type KillFailureAlertContext,
 } from './kill-failure-alert.ts'
 import {
   KILL_FAILURE_END_ROW_FINISHED,
@@ -311,6 +325,7 @@ import {
 } from './persona-episodes.ts'
 import {
   KILL_RETRY_ALERT_NONE,
+  KILL_RETRY_ALERT_ORDINARY,
   KILL_RETRY_END_READ_LATCHED,
   KILL_RETRY_END_STOPPED,
   KILL_RETRY_READ_FAILED,
@@ -390,10 +405,44 @@ import {
   runInAttempt,
   runOutsideAttempts,
   unavailableRetryCauseFor,
+  UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
+  UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
   UNAVAILABLE_RETRY_ROW_ABSENT,
   type AttemptView,
   type UnavailableRetryRowRead,
+  type UnavailableRetryTriggerSink,
 } from './unavailable-retry.ts'
+import {
+  LIVE_ROW_ARM_ENDED,
+  LIVE_ROW_ARM_NOT_JUDGED,
+  LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
+  LIVE_ROW_LAUNCH_REUSE,
+  LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED,
+  LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
+  LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER,
+  LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+  LIVE_ROW_READ_ABSENT,
+  LIVE_ROW_READ_LATCHED,
+  LIVE_ROW_READ_REFUSED,
+  LIVE_ROW_READ_ROW,
+  LIVE_ROW_RUN_FAILED,
+  LIVE_ROW_RUN_JUDGED_ALIVE,
+  LIVE_ROW_RUN_LATCHED,
+  LIVE_ROW_RUN_LEFT_LIVE,
+  LIVE_ROW_RUN_MARKED_MISSING,
+  LIVE_ROW_RUN_NOT_JUDGED,
+  LIVE_ROW_RUN_REFUSED,
+  LIVE_ROW_SEQUENCE_LOG_PREFIX,
+  LIVE_ROW_SEQUENCE_NO_ROW,
+  LIVE_ROW_SEQUENCE_SITE,
+  type LiveRowSequenceArmCause,
+  type LiveRowSequenceDeps,
+  type LiveRowSequenceLastRead,
+  type LiveRowSequenceLaunchKind,
+  type LiveRowSequenceNotLaunchedReason,
+  type LiveRowSequenceRead,
+  type LiveRowSequenceRunPlacement,
+} from './live-row-sequence.ts'
 import { recordStartupError } from './startup-errors.ts'
 import {
   locateTranscript,
@@ -5241,11 +5290,9 @@ async function readListedPersonaRows(
  *   found the condition cleared, and the run after a latch clears by the
  *   re-check's step 1 or by `clear-latch` (SRJ-506).
  *
- * No path calls it yet. The Epics of Plan b.b6r that will call it: E21 (the
- * live-row sequence, SRJ-705), E27 (the old-life wait, SRJ-811), E29 (the
- * pending-row rule, SRJ-410), E30 (the latch re-check, SRJ-505, SRJ-506) and
- * E31 (`clear-latch`, SRJ-506). Every other findMissing caller is an
- * ordinary run.
+ * The live-row sequence's dependency builder binds it for the sequence's runs
+ * (`buildLiveRowSequenceDeps`, with the persona's key as the next-step
+ * `get`). Every other findMissing caller is an ordinary run.
  *
  * Answers as `reconcileMissingSweep` does: the result, `FIND_MISSING_REFUSED`
  * for a refusal of the run or of the post-run `get` of `key`'s own row (b.jg5
@@ -6735,6 +6782,13 @@ export interface PersonaKillRetryOptions {
   readonly ref: string
   /** The wait between tries. */
   readonly clock: KillRetryWait
+  /**
+   * The caller's own keep-going check, asked beside the server's
+   * (`personaKillKeepsGoing`): the tries go on only while both answer true
+   * (the live-row sequence's: it is not stopped and the persona is not
+   * latched). A throw counts as false. Absent: the server's alone.
+   */
+  readonly keepGoing?: () => boolean
 }
 
 /** What the between-try read of a persona's own row is called in that read's lines. */
@@ -6754,17 +6808,21 @@ const KILL_RETRY_READ_WHAT = 'status read between kill tries'
  *     persona's own row `pending` with no launch start, or an UNUSABLE NAME
  *     answer, latches the persona (b.jg5 SRJ-512, SRJ-513), which ends the
  *     tries with no further kill;
- *   - the keep-going check (`personaKillKeepsGoing`) ends the tries with no
- *     further kill once the persona is latched, torn down or not up, or the
- *     server is shutting down;
+ *   - the keep-going check (`personaKillKeepsGoing`, and the caller's own
+ *     `options.keepGoing` when given) ends the tries with no further kill
+ *     once the persona is latched, torn down or not up, or the server is
+ *     shutting down (or the caller's check answers false);
  *   - only a seed read live gets the tries; any other kill is one try.
- * Then, when the tries ended in a failure that no stop ended, its outcome is
- * reported once (`reportDeferredUnavailable`, with the kill's declared call):
+ * Then, when the tries ended in a failure that no stop ended and the caller's
+ * own keep-going check, when given, still answers true (`callerKeepsGoing`),
+ * its outcome is reported once (`reportDeferredUnavailable`, with the kill's
+ * declared call):
  * an UNAVAILABLE outcome arms the persona's retry timer once (the
  * kill-failed cause for `ErrTmuxKillFailed`) and, for a kill of a row read
  * live, an UNAVAILABLE other than `ErrTmuxKillFailed` starts or continues
  * its `tmux-unresponsive` condition. A success reports nothing more, and a
- * stop reports nothing, so no retry timer is armed for a latched persona.
+ * stop reports nothing, so no retry timer is armed for a latched persona or
+ * for a caller stopped while its last try ran.
  * Answers the retry's result, its alert decision included, for the caller's
  * own handling of the outcome that stands. Never throws or rejects.
  */
@@ -6777,14 +6835,31 @@ export async function retryPersonaKill(key: string, options: PersonaKillRetryOpt
     read: () => readPersonaKillRow(key, options.site, options.ref),
     wait: options.clock,
     lastRead: options.lastRead,
-    keepGoing: () => personaKillKeepsGoing(key),
+    keepGoing: () => personaKillKeepsGoing(key) && (options.keepGoing === undefined || options.keepGoing() === true),
     log: (line) => console.error(line),
     logPrefix: `[slack] ${options.site}`,
   })
-  if (result.outcome.kind === KILL_OUTCOME_NOT_KILLED && !killRetryStopped(result)) {
+  if (result.outcome.kind === KILL_OUTCOME_NOT_KILLED && !killRetryStopped(result) && callerKeepsGoing(options)) {
     reportDeferredUnavailable(key, result.outcome.error, call)
   }
   return result
+}
+
+/**
+ * The caller's own keep-going check of a persona's kill retry, asked once
+ * more after the tries: true with no check given, false when it answers
+ * anything but true or throws. A caller whose check answers false then (the
+ * live-row sequence, stopped or latched while the last try ran) gets no
+ * deferred report: the retry timer is not armed and no `tmux-unresponsive`
+ * condition starts. Never throws.
+ */
+function callerKeepsGoing(options: PersonaKillRetryOptions): boolean {
+  if (options.keepGoing === undefined) return true
+  try {
+    return options.keepGoing() === true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -6796,9 +6871,11 @@ export async function retryPersonaKill(key: string, options: PersonaKillRetryOpt
  * its retry timer, `ErrTmuxKillFailed` with the kill-failed cause and never
  * the `tmux-unresponsive` condition) and, for the survivor version, before
  * the caller's next step (the launch, or the delete and the spawn). The
- * context is `recovery` at both sites (SRJ-1007). Through the installed
- * kill-failure alerts (`setKillFailureAlerts`), which route it by whether
- * the persona is in the applied configuration now:
+ * context is `recovery` at both sites (SRJ-1007); the live-row sequence's
+ * kills pass their request's context and the server's alerts
+ * (`buildLiveRowSequenceDeps`). Through the given kill-failure alerts, the
+ * installed ones (`setKillFailureAlerts`) by default, which route it by
+ * whether the persona is in the applied configuration now:
  *   - `survivor`: its destination, once for this retry, with no episode; or
  *     one `persona-kill-survivor` entry when not configured;
  *   - `ordinary`: its destination, once per kill-failure episode, closing
@@ -6826,20 +6903,26 @@ export async function retryPersonaKill(key: string, options: PersonaKillRetryOpt
  *
  * where `<descriptions>` is `last="<redacted>"` and `earlier survivor-naming="<redacted>"`, each when present, or `survivor-naming="<redacted>"`.
  */
-export function raisePersonaKillFailureAlert(key: string, retried: KillRetryResult, site: string, ref: string): void {
+export function raisePersonaKillFailureAlert(
+  key: string,
+  retried: KillRetryResult,
+  site: string,
+  ref: string,
+  context: KillFailureAlertContext = KILL_FAILURE_CONTEXT_RECOVERY,
+  alerts: KillFailureAlerts | undefined = killFailureAlerts,
+): void {
   try {
     const decision = retried.alert
     if (decision.kind === KILL_RETRY_ALERT_NONE) return
     const latched = retried.end === KILL_RETRY_END_READ_LATCHED || personaLatchedNow(key)
     const stopped = killOutcomeStopsServer(retried.outcome) || (retried.end === KILL_RETRY_END_STOPPED && !latched)
-    const alerts = killFailureAlerts
     if (alerts === undefined) {
       console.error(
         `[slack] ${site}: kill for ${ref}: the kill-failure alert's ${decision.kind} version is not raised — no kill-failure alerts are installed; ${describeKillFailureDescriptions(decision)} (b.jg5 SRJ-704)`,
       )
       return
     }
-    alerts.raise({ key, decision, latched, stopped, context: KILL_FAILURE_CONTEXT_RECOVERY })
+    alerts.raise({ key, decision, latched, stopped, context })
   } catch (err) {
     console.error(`[slack] ${site}: kill for ${ref}: raising the kill-failure alert failed: ${describeThrownValue(err)}`)
   }
@@ -7057,14 +7140,34 @@ export async function latchOnRestartKillOutcome(
   site: string,
   lastRead: LivenessReading,
 ): Promise<boolean> {
+  return latchOnKillOutcomeAt(key, outcome, site, keyRef(key), restartKillLastRead(lastRead))
+}
+
+/**
+ * The latch for a kill's standing outcome inside a launch or recovery
+ * attempt (b.jg5 SRJ-110, SRJ-501, SRJ-512): a CONFLICT latches persona
+ * `key` through the latch's CONFLICT entry (`conflictAt`) with the refused
+ * operation "P's next check or recovery", and an UNUSABLE NAME through the
+ * unusable-name entry (`unusableNameAt`), each with `lastRead`, the row
+ * state the path last read (one latch-time `status` read only when it read
+ * nothing), its line prefixed `site`. Answers true for those two classes,
+ * false for every other outcome, for which it does nothing. The kill is
+ * never repeated. Never throws.
+ */
+async function latchOnKillOutcomeAt(
+  key: string,
+  outcome: KillOutcome,
+  site: string,
+  ref: string,
+  lastRead: LastRowRead,
+): Promise<boolean> {
   if (outcome.kind !== KILL_OUTCOME_NOT_KILLED) return false
-  const ref = keyRef(key)
   if (outcome.errorClass === AD_ERROR_CLASS_CONFLICT) {
-    await conflictAt(key, outcome.error, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, restartKillLastRead(lastRead), 'kill', ref, site)
+    await conflictAt(key, outcome.error, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, lastRead, 'kill', ref, site)
     return true
   }
   if (outcome.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
-    await unusableNameAt(key, outcome.error, restartKillLastRead(lastRead), site, 'kill', ref)
+    await unusableNameAt(key, outcome.error, lastRead, site, 'kill', ref)
     return true
   }
   return false
@@ -7881,41 +7984,63 @@ async function resumeOrFreshSpawn(
         return { key, action: 'failed' }
       }
     }
-    if (isInvalidFlagsError(err)) {
-      // b.jg5 SRJ-104: the resume site gives ErrInvalidFlags no meaning: one
-      // immediate version re-check, then UNCLASSIFIED. The line is built from
-      // the classification's rendered fields, never from the error itself.
-      const step = await classifyWithInvalidFlagsRecheck(err)
-      const recheck = `after one immediate agent-director version re-check: ${step.recheck.kind}`
-      // The stop posts nothing to Slack, and a launch it ends is not counted.
-      if (step.recheck.kind === RECHECK_OUTCOME_STOP) {
-        console.error(
-          `[slack] spawnForPersona: resume failed for ${ref}: ${describeAdErrorClassification(step.classification)} (${recheck})`,
-        )
-        return { key, action: 'failed', stopping: true }
-      }
-      // b.jg5 SRJ-105, SRJ-313: UNCLASSIFIED handling. The site entry arms
-      // the persona's retry timer with the UNCLASSIFIED cause (so the launch
-      // is refused and never counted) and reports the outcome to its
-      // unclassified-error episode. No notice; no delete, kill or launch.
-      reportUnclassifiedAtSite(key, err, 'resume', step.classification)
-      logRefusal('spawnForPersona', 'resume', ref, `${describeAdErrorClassification(step.classification)} (${recheck})`)
-      return { key, action: 'failed' }
+    return resumeFailedAt(key, err, isStartup, ref, lastRead)
+  }
+}
+
+/**
+ * A `resume`'s failure by class, once its site's own branches have passed
+ * it (`resumeOrFreshSpawn`'s, the live-row sequence's launch entry's), with
+ * no further launch: `ErrInvalidFlags` gets one immediate version re-check
+ * (a stop it decides answers `failed` marked `stopping`; otherwise
+ * UNCLASSIFIED through the site entry, b.jg5 SRJ-104, SRJ-313); the `cwd`
+ * errors answer `failed` quietly; then the refusal handling
+ * (`launchRefusalAt`: a CONFLICT latches with the refused operation
+ * "resume" and `lastRead`, an UNUSABLE NAME latches, a refusal answers
+ * `failed`); any other error answers `failed` with the spawn-failure
+ * notice. Never throws.
+ */
+async function resumeFailedAt(
+  key: string,
+  err: unknown,
+  isStartup: boolean,
+  ref: string,
+  lastRead: LastRowRead,
+): Promise<SpawnPersonaResult> {
+  if (isInvalidFlagsError(err)) {
+    // b.jg5 SRJ-104: the resume site gives ErrInvalidFlags no meaning: one
+    // immediate version re-check, then UNCLASSIFIED. The line is built from
+    // the classification's rendered fields, never from the error itself.
+    const step = await classifyWithInvalidFlagsRecheck(err)
+    const recheck = `after one immediate agent-director version re-check: ${step.recheck.kind}`
+    // The stop posts nothing to Slack, and a launch it ends is not counted.
+    if (step.recheck.kind === RECHECK_OUTCOME_STOP) {
+      console.error(
+        `[slack] spawnForPersona: resume failed for ${ref}: ${describeAdErrorClassification(step.classification)} (${recheck})`,
+      )
+      return { key, action: 'failed', stopping: true }
     }
-    if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
-      return { key, action: 'failed' }
-    }
-    // b.jg5 SRJ-104, SRJ-105: `ErrSystemInstallDisappeared` is UNCLASSIFIED
-    // (its wrapper has raised `ad-unreachable`), a refusal like the others.
-    // b.jg5 SRJ-113: a CONFLICT latches the persona (refused operation
-    // "resume"); never a kill.
-    const refused = await launchRefusalAt(key, err, 'resume', 'resume', ref, lastRead)
-    if (refused) return refused
-    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('resume', 'UnknownError', String(err))
-    console.error(`[slack] spawnForPersona: resume failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-    notifySpawnFailure(key, e, isStartup)
+    // b.jg5 SRJ-105, SRJ-313: UNCLASSIFIED handling. The site entry arms
+    // the persona's retry timer with the UNCLASSIFIED cause (so the launch
+    // is refused and never counted) and reports the outcome to its
+    // unclassified-error episode. No notice; no delete, kill or launch.
+    reportUnclassifiedAtSite(key, err, 'resume', step.classification)
+    logRefusal('spawnForPersona', 'resume', ref, `${describeAdErrorClassification(step.classification)} (${recheck})`)
     return { key, action: 'failed' }
   }
+  if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
+    return { key, action: 'failed' }
+  }
+  // b.jg5 SRJ-104, SRJ-105: `ErrSystemInstallDisappeared` is UNCLASSIFIED
+  // (its wrapper has raised `ad-unreachable`), a refusal like the others.
+  // b.jg5 SRJ-113: a CONFLICT latches the persona (refused operation
+  // "resume"); never a kill.
+  const refused = await launchRefusalAt(key, err, 'resume', 'resume', ref, lastRead)
+  if (refused) return refused
+  const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('resume', 'UnknownError', String(err))
+  console.error(`[slack] spawnForPersona: resume failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
+  notifySpawnFailure(key, e, isStartup)
+  return { key, action: 'failed' }
 }
 
 // ---------------------------------------------------------------------------
@@ -8837,6 +8962,423 @@ async function runPersonaLadder(
 
   console.error(`[slack] spawnForPersona: unexpected state=${state} for ${ref} — no action`)
   return { key, action: 'no-op' }
+}
+
+// ---------------------------------------------------------------------------
+// The live-row sequence's final launch and its dependencies (b.jg5 SRJ-705)
+// ---------------------------------------------------------------------------
+
+/** What the sequence-launch entry is asked for. */
+export interface LiveRowSequenceLaunchRequest {
+  /** Step 6's launch kind (`decideLiveRowLaunchKind`, `src/live-row-sequence.ts`). */
+  readonly kind: LiveRowSequenceLaunchKind
+  /** The row state the sequence last read (`ended`, `missing` or no row): the state a latch records. */
+  readonly lastRead: LatchRowState
+}
+
+/** The entry's answer when it made no launch: no reuse builder, `ErrSpawnNotResumable`. */
+export interface LiveRowSequenceNotLaunched {
+  readonly key: string
+  readonly action: typeof LIVE_ROW_OUTCOME_NOT_LAUNCHED
+  readonly reason: LiveRowSequenceNotLaunchedReason
+}
+
+/** What the sequence-launch entry answers: the ladder's launch result, or that no launch was made. */
+export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSequenceNotLaunched
+
+/** What the reuse builder is given for one reuse spawn of `cscb_<key>`. */
+export interface SequenceReuseRequest {
+  readonly persona: Persona
+  readonly config: PersonaConfig
+  readonly ref: string
+  /** The spawn's `config_dir` label, from the entry's pre-launch check (`checkLaunchConfigDir`). */
+  readonly configDirLabel: string
+  /** The row state the sequence last read: the state a latch records. */
+  readonly lastRead: LatchRowState
+  /**
+   * The `resume` answer (`ErrNoSessionId`, `ErrJsonlMissing`,
+   * `ErrJsonlNeverWritten`) that sent the launch on to the reuse; absent when
+   * step 6 decided the reuse itself.
+   */
+  readonly resumeError?: unknown
+}
+
+/** What the reuse builder answers. */
+export interface SequenceReuseAnswer {
+  /** The reuse launch's result. */
+  readonly result: SpawnPersonaResult
+  /** The spawn call's whole result when it returned success: the entry runs the after-launch step with it. */
+  readonly spawned?: Phase1SpawnResult
+}
+
+/** Makes the live-row sequence's reuse spawn of the persona's id and answers its result. */
+export type SequenceReuseBuilder = (request: SequenceReuseRequest) => Promise<SequenceReuseAnswer>
+
+/**
+ * The installed reuse builder. With none installed (the production server
+ * today, and tests that install none) the sequence-launch entry makes no
+ * reuse: no agent-director call, one line, and a not-launched answer.
+ */
+let sequenceReuseBuilder: SequenceReuseBuilder | undefined
+
+/** Install the live-row sequence's reuse builder, or remove it with undefined. */
+export function setSequenceReuseBuilder(builder: SequenceReuseBuilder | undefined): void {
+  sequenceReuseBuilder = builder
+}
+
+/** Test-only seam: remove any installed reuse builder. */
+export function _resetSequenceReuseBuilder(): void {
+  sequenceReuseBuilder = undefined
+}
+
+/** `resume`'s answers that go on to the reuse spawn (b.jg5 SRJ-705, SRJ-113), by name. */
+const NO_TRANSCRIPT_RESUME_ERR_NAMES = [ERR_NO_SESSION_ID_NAME, ERR_JSONL_MISSING_NAME, ERR_JSONL_NEVER_WRITTEN_NAME] as const
+
+/**
+ * The live-row sequence's final launch (b.jg5 SRJ-705 step 6) of persona
+ * `persona`'s `cscb_<key>`, of `request.kind`. It is a launch call:
+ *   - it waits for any launch still in flight for the persona to settle
+ *     (never joining or overlapping it), then registers in the in-flight
+ *     map `spawnForPersona` uses, so `isLaunchInFlight` is true and
+ *     `whenLaunchSettled` waits for it while it runs (a teardown's wait
+ *     covers it, SRJ-715); a call that joins it gets its launch result, a
+ *     not-launched answer reading as the uncounted refused result;
+ *   - it is not refused by the live-row sequence's own gate on the persona's
+ *     launch paths: it is the sequence's own launch, made from inside it;
+ *   - the latched gate, the pre-launch `claude_config_dir` check and dry run
+ *     come first, as in `spawnForPersona`; then the launch runs as a launch
+ *     attempt for the persona (SRJ-301), the trust patch before it;
+ *   - `resume`: one `resume` of the id through the ladder's launch helper
+ *     (`launchWithReplyGuard`: the reply guard, spawn detection, arming by
+ *     class). `ErrNoSessionId`, `ErrJsonlMissing` and `ErrJsonlNeverWritten`
+ *     (by name) go on to the reuse once; `ErrSpawnNotResumable` answers not
+ *     launched (SRJ-710: no second sequence); any other non-success ends by
+ *     class (`resumeFailedAt`: a CONFLICT or UNUSABLE NAME latches with
+ *     `request.lastRead`) with no further call: no delete, no kill and no
+ *     fresh spawn;
+ *   - `reuse`: the installed reuse builder (`setSequenceReuseBuilder`); with
+ *     none installed, no agent-director call, one line naming the missing
+ *     builder, and a not-launched answer;
+ *   - a success runs the after-launch step (`afterLaunchSucceeded`: the
+ *     `pre_trust` line and the dialog approver); any other result ends the
+ *     sequence without its launch, which arms the persona's retry timer
+ *     with the other-end cause unless the persona latched or the server is
+ *     stopping (`runLiveRowSequence`, SRJ-301).
+ * Never calls `delete` and never sets `include_finished`. Never throws.
+ */
+export async function launchForLiveRowSequence(
+  persona: Persona,
+  config: PersonaConfig,
+  request: LiveRowSequenceLaunchRequest,
+): Promise<LiveRowSequenceLaunchEntryResult> {
+  const { key } = persona
+  const ref = personaRef(persona)
+  if (inFlightLaunches.has(key)) {
+    console.error(
+      `${LIVE_ROW_SEQUENCE_LOG_PREFIX} a launch for ${ref} is in flight — the sequence's launch waits for it to settle (b.jg5 SRJ-705, SRJ-706)`,
+    )
+  }
+  while (inFlightLaunches.has(key)) await whenLaunchSettled(key)
+  const launch = sequenceLaunchAttempt(persona, config, request, ref)
+  // A call that joins this launch gets a launch result; no launch reads as the uncounted refused one.
+  const asLaunch: Promise<SpawnPersonaResult> = launch.then((result) =>
+    result.action === LIVE_ROW_OUTCOME_NOT_LAUNCHED ? { key, action: 'failed', refused: true } : result,
+  )
+  inFlightLaunches.set(key, asLaunch)
+  try {
+    return await launch
+  } finally {
+    if (inFlightLaunches.get(key) === asLaunch) {
+      inFlightLaunches.delete(key)
+      cancelledLaunchWaits.delete(key)
+      cancelledComingApprovers.delete(key)
+    }
+  }
+}
+
+/** The sequence launch's gates, then its call as a launch attempt for the persona. Never throws. */
+async function sequenceLaunchAttempt(
+  persona: Persona,
+  config: PersonaConfig,
+  request: LiveRowSequenceLaunchRequest,
+  ref: string,
+): Promise<LiveRowSequenceLaunchEntryResult> {
+  const { key } = persona
+  const latched = latchGateReadingOf(key)
+  if (latched !== undefined) {
+    const why = latched.failure === undefined ? 'it is latched' : `${latched.failure} — taken as latched`
+    console.error(
+      `${LIVE_ROW_SEQUENCE_LOG_PREFIX} not launching ${ref} — ${why} (case=${latched.latchCase}); no agent-director call (b.jg5 SRJ-502)`,
+    )
+    return { key, action: 'latched' }
+  }
+  const configDir = checkLaunchConfigDir(persona)
+  if (!configDir.ok) {
+    deferLaunchForConfigDir(persona, configDir)
+    return deferredResult(persona, configDir)
+  }
+  if (isDryRun()) {
+    console.error(`[slack] dry-run: skipping the live-row sequence's ${request.kind} for ${ref}`)
+    return { key, action: 'no-op' }
+  }
+  const configDirLabel = configDirLabelValue(configDir.realPath, spawnHomeDir())
+  forgetWorkingRowEvidence(key)
+  endWorkingRowDeferral(key)
+  endPromptRowDeferral(key)
+  // b.jg5 SRJ-301: the launch is a launch attempt for the persona.
+  return runInAttempt(key, 'launch', async (attempt) => {
+    const result = await sequenceLaunchCall(persona, config, request, ref, configDirLabel)
+    return result.action === LIVE_ROW_OUTCOME_NOT_LAUNCHED ? result : markRefusal(result, attempt)
+  })
+}
+
+/** The sequence launch's call: the `resume` leg with its fallback to the reuse, or the reuse. Never throws. */
+async function sequenceLaunchCall(
+  persona: Persona,
+  config: PersonaConfig,
+  request: LiveRowSequenceLaunchRequest,
+  ref: string,
+  configDirLabel: string,
+): Promise<LiveRowSequenceLaunchEntryResult> {
+  const { key } = persona
+  const reuseRequest: SequenceReuseRequest = { persona, config, ref, configDirLabel, lastRead: request.lastRead }
+  if (request.kind === LIVE_ROW_LAUNCH_REUSE) return sequenceReuse(reuseRequest)
+  // b.av2 SR-6.2: the trust patch precedes every launch.
+  runPreLaunchTrustPatch(persona, ref)
+  console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} resuming ${ref} (b.jg5 SRJ-705)`)
+  try {
+    const launched: Phase1ResumeResult = await launchWithReplyGuard(persona, ref, 'resume', (client) =>
+      client.resume({ claude_instance_id: personaInstanceId(key) }),
+    )
+    console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} resumed ${ref}`)
+    afterLaunchSucceeded(key, false, ref, LAUNCH_VERB_RESUME, launched)
+    return { key, action: 'resumed' }
+  } catch (err) {
+    if (NO_TRANSCRIPT_RESUME_ERR_NAMES.some((name) => hasAdErrorName(err, name))) {
+      console.error(
+        `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${describeAgentDirectorFailure(err)} on resume for ${ref} — going on to the reuse spawn (b.jg5 SRJ-705)`,
+      )
+      return sequenceReuse({ ...reuseRequest, resumeError: err })
+    }
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_RESUMABLE_NAME)) {
+      console.error(
+        `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${describeAgentDirectorFailure(err)} on resume for ${ref} — no second sequence and no further call; the sequence ends without its launch (b.jg5 SRJ-710)`,
+      )
+      return { key, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE }
+    }
+    return resumeFailedAt(key, err, false, ref, request.lastRead)
+  }
+}
+
+/** The reuse through the installed builder, or the not-launched answer with none installed. Never throws. */
+async function sequenceReuse(request: SequenceReuseRequest): Promise<LiveRowSequenceLaunchEntryResult> {
+  const { persona, ref } = request
+  const { key } = persona
+  const builder = sequenceReuseBuilder
+  if (builder === undefined) {
+    console.error(
+      `${LIVE_ROW_SEQUENCE_LOG_PREFIX} no reuse builder is installed, so the reuse spawn of ${ref} is not made — no agent-director call; the sequence ends without its launch (b.jg5 SRJ-705)`,
+    )
+    return { key, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NO_REUSE_BUILDER }
+  }
+  // b.av2 SR-6.2: the trust patch precedes every launch (a `resume` that went on to the reuse has run it).
+  if (request.resumeError === undefined) runPreLaunchTrustPatch(persona, ref)
+  let answer: SequenceReuseAnswer
+  try {
+    answer = await builder(request)
+  } catch (err) {
+    console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} the reuse builder failed for ${ref}: ${describeThrownValue(err)} — answering failed`)
+    return { key, action: 'failed' }
+  }
+  if (answer.spawned !== undefined) afterLaunchSucceeded(key, false, ref, LAUNCH_VERB_SPAWN, answer.spawned)
+  return answer.result
+}
+
+/** What the live-row sequence's dependency builder is given (per-server instances). */
+export interface LiveRowSequenceDepsInput {
+  /** The server's kill-failure alerts (over its episodes instance); absent: the installed ones (`setKillFailureAlerts`). */
+  readonly killFailureAlerts?: KillFailureAlerts
+  /** The retry controller's arm (or a recorder in front of it). */
+  readonly retryArm: UnavailableRetryTriggerSink
+  /** The sequence's clock: its waits and its kills' waits between tries. */
+  readonly clock: NeverEarlyWaitClock
+  /** Where the sequence's own lines go. */
+  readonly log: (line: string) => void
+  /** The applied configuration now, read at each call. */
+  readonly appliedConfig: () => PersonaConfig | null | undefined
+}
+
+/**
+ * The retry cause label each of the sequence's arm causes arms with (b.jg5
+ * SRJ-301, SRJ-717). Its type holds each label to its cause's own string, so
+ * the sequence's end line and the retry controller's lines name a cause alike.
+ */
+const LIVE_ROW_SEQUENCE_ARM_CAUSE_LABELS: { readonly [C in LiveRowSequenceArmCause]: C } = Object.freeze({
+  [LIVE_ROW_ARM_NOT_JUDGED]: UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
+  [LIVE_ROW_ARM_ENDED]: UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
+})
+
+/**
+ * The live-row sequence's production dependencies (b.jg5 SRJ-705, SRJ-706,
+ * SRJ-717), bound to the shared entries, so `main()` and the recovery
+ * harness compose the sequence identically:
+ *   - each `get` through the shared own-row read (`readPersonaOwnRow`: a
+ *     `provenance_conflict` note, a configured persona's own `pending` row
+ *     with no launch start or an UNUSABLE NAME answer latches the persona);
+ *   - each run as a bypassing run (`bypassingFindMissingSweep`) with the
+ *     persona's key as its next-step `get`, read with `readFindMissingRow`;
+ *   - each kill through the bounded retry over the deferred-report
+ *     persona-kill binding (`retryPersonaKill`), whose between-try read is
+ *     the shared own-row `status` read, with the sequence's keep-going check
+ *     beside the server's and its wait between tries;
+ *   - a kill's CONFLICT and UNUSABLE NAME through the latch's entries
+ *     (`conflictAt`, `unusableNameAt`) with the state last read;
+ *   - the alerts through the server's kill-failure alerts, with the
+ *     request's context;
+ *   - the latched query, P's `ad-config-malformed` flag, E6's G accessor
+ *     (`adGraceMsInEffect`), the applied `resume_enabled` and the row
+ *     comparison (`compareRowToPersona`), the sequence-launch entry
+ *     (`launchForLiveRowSequence`) and the retry arm with the sequence's two
+ *     causes (`UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED`,
+ *     `UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED`).
+ * Every agent-director call goes through `withOutageDetection` inside those
+ * entries. The builder reads nothing and starts nothing when called.
+ */
+export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveRowSequenceDeps {
+  const applied = (key: string): { readonly persona: Persona; readonly config: PersonaConfig } | undefined => {
+    const config = input.appliedConfig() ?? undefined
+    const persona = config?.personas.find((p) => p.key === key)
+    return config !== undefined && persona !== undefined ? { persona, config } : undefined
+  }
+  return {
+    clock: input.clock,
+    log: input.log,
+    isLatched: (key) => personaLatchedNow(key),
+    isConfigMalformedRaised: (key) => getOutageFlags(key).has('ad-config-malformed'),
+    graceMs: adGraceMsInEffect,
+    readRow: (key, ref) => readSequenceRow(key, ref),
+    runFindMissing: (key, instanceId, stateBefore) => runSequenceFindMissing(key, instanceId, stateBefore),
+    killWithRetry: (key, options) =>
+      retryPersonaKill(key, {
+        rowReadLive: true,
+        lastRead:
+          options.lastReadState === LIVE_ROW_SEQUENCE_NO_ROW ? KILL_RETRY_SEED_NOT_LIVE_VALUE : killRetrySeedOfState(options.lastReadState),
+        site: LIVE_ROW_SEQUENCE_SITE,
+        ref: options.ref,
+        clock: options.wait,
+        keepGoing: options.keepGoing,
+      }),
+    latchOnKillOutcome: (key, outcome, lastRead, ref) =>
+      latchOnKillOutcomeAt(key, outcome, LIVE_ROW_SEQUENCE_SITE, ref, latchRowStateOfSequenceRead(lastRead)),
+    raiseKillAlert: (key, retried, context, ref) =>
+      raisePersonaKillFailureAlert(key, retried, LIVE_ROW_SEQUENCE_SITE, ref, context, input.killFailureAlerts),
+    raiseEscalationAlert: (key, context, ref) => raiseSequenceEscalationAlert(key, context, ref, input.killFailureAlerts),
+    personaFacts: (key, row) => {
+      const found = applied(key)
+      if (found === undefined) return undefined
+      const resumeEnabled = found.config.resume_enabled !== false
+      if (row === undefined) return { resumeEnabled, cwdMatches: true, configDirMatches: true }
+      const comparison = compareRowToPersona({ cwd: row.cwd, labels: row.labels }, found.persona, spawnHomeDir(), undefined, _configDirFs)
+      return {
+        resumeEnabled,
+        // b.av2 SR-6.4: a `cwd` check that cannot be made now is no mismatch.
+        cwdMatches: comparison.cwdMatches || comparison.cwdCheckDeferred,
+        // Bug b.g57: an unresolvable directory gives no verdict; the launch's own check holds it.
+        configDirMatches: !comparison.configDirResolved || comparison.configDirMatches === true,
+      }
+    },
+    launch: async (key, kind, lastRead, ref) => {
+      const found = applied(key)
+      if (found === undefined) {
+        console.error(
+          `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}: step 6: the persona is not in the applied configuration — no launch (b.jg5 SRJ-705)`,
+        )
+        return { kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED }
+      }
+      const result = await launchForLiveRowSequence(found.persona, found.config, { kind, lastRead: latchRowStateOfSequenceRead(lastRead) })
+      return result.action === LIVE_ROW_OUTCOME_NOT_LAUNCHED
+        ? { kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: result.reason }
+        : { kind: LIVE_ROW_LAUNCH_ANSWER_LAUNCHED, result }
+    },
+    armRetry: (key, cause) => {
+      try {
+        input.retryArm.arm(key, { kind: LIVE_ROW_SEQUENCE_ARM_CAUSE_LABELS[cause] })
+      } catch (err) {
+        console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} persona=${key}: arming the retry timer failed: ${describeThrownValue(err)}`)
+      }
+    },
+  }
+}
+
+/** The state a latch records for what the sequence last read. */
+function latchRowStateOfSequenceRead(lastRead: LiveRowSequenceLastRead): LatchRowState {
+  return lastRead.kind === LIVE_ROW_SEQUENCE_NO_ROW ? LATCH_ROW_STATE_NO_ROW : latchRowStateRead(lastRead.state)
+}
+
+/** One `get` of persona `key`'s row through the shared own-row read, as the sequence takes it. Never throws. */
+async function readSequenceRow(key: string, ref: string): Promise<LiveRowSequenceRead> {
+  const read = await readPersonaOwnRow(key, { site: LIVE_ROW_SEQUENCE_SITE, what: 'get', ref })
+  switch (read.kind) {
+    case OWN_ROW_READ_ROW:
+      // The row whole, so the sequence reads its launch start and session id.
+      return read.latched ? { kind: LIVE_ROW_READ_LATCHED } : { kind: LIVE_ROW_READ_ROW, row: read.row as Phase1GetResult }
+    case OWN_ROW_READ_ABSENT:
+      return { kind: LIVE_ROW_READ_ABSENT }
+    case OWN_ROW_READ_LATCHED:
+      return { kind: LIVE_ROW_READ_LATCHED }
+    case OWN_ROW_READ_REFUSED:
+      return { kind: LIVE_ROW_READ_REFUSED, error: read.error }
+  }
+}
+
+/**
+ * One bypassing run for persona `key` (`bypassingFindMissingSweep`, its key
+ * as the next-step `get`), with where it put `instanceId`, last read
+ * `stateBefore` (`readFindMissingRow`); or how it failed: refused by class
+ * (`FIND_MISSING_REFUSED`), the persona latched (`FIND_MISSING_LATCHED`),
+ * any other failure. Never throws.
+ */
+async function runSequenceFindMissing(key: string, instanceId: string, stateBefore: string): Promise<LiveRowSequenceRunPlacement> {
+  const answer = await bypassingFindMissingSweep(key, LIVE_ROW_SEQUENCE_SITE, key)
+  if (answer === FIND_MISSING_REFUSED) return LIVE_ROW_RUN_REFUSED
+  if (answer === FIND_MISSING_LATCHED) return LIVE_ROW_RUN_LATCHED
+  if (answer === undefined) return LIVE_ROW_RUN_FAILED
+  switch (readFindMissingRow(answer, instanceId, stateBefore)) {
+    case FIND_MISSING_ROW_MARKED_MISSING:
+      return LIVE_ROW_RUN_MARKED_MISSING
+    case FIND_MISSING_ROW_LEFT_LIVE:
+      return LIVE_ROW_RUN_LEFT_LIVE
+    case FIND_MISSING_ROW_NOT_JUDGED:
+      return LIVE_ROW_RUN_NOT_JUDGED
+    case FIND_MISSING_ROW_JUDGED_ALIVE:
+      return LIVE_ROW_RUN_JUDGED_ALIVE
+  }
+}
+
+/**
+ * Step 5's kill-failure alert (b.jg5 SRJ-705, SRJ-704, SRJ-1007): the
+ * ordinary version with no description, for persona `key`, with the
+ * request's `context`, through `alerts` (the installed ones by default),
+ * which route it and hold it once per episode. With no alerts installed, one
+ * line instead. Never throws.
+ */
+function raiseSequenceEscalationAlert(
+  key: string,
+  context: KillFailureAlertContext,
+  ref: string,
+  alerts: KillFailureAlerts | undefined = killFailureAlerts,
+): void {
+  try {
+    if (alerts === undefined) {
+      console.error(
+        `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}: the kill-failure alert's ordinary version is not raised — no kill-failure alerts are installed (b.jg5 SRJ-704, SRJ-705)`,
+      )
+      return
+    }
+    alerts.raise({ key, decision: { kind: KILL_RETRY_ALERT_ORDINARY }, latched: personaLatchedNow(key), context })
+  } catch (err) {
+    console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}: raising the kill-failure alert failed: ${describeThrownValue(err)}`)
+  }
 }
 
 // ---------------------------------------------------------------------------
