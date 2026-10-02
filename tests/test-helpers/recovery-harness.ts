@@ -856,6 +856,7 @@ import {
   cannedOk,
   cannedStatusResult,
   errInstanceIdCollision,
+  errInvalidFlags,
   errSpawnNotFound,
   errTmuxKillFailed,
   errTmuxSessionConflict,
@@ -2505,6 +2506,29 @@ export function collided(h: RecoveryHarness, persona: Persona, row: PersonaGetRe
     spawnQueue: [errInstanceIdCollision(), ...spawns].map((err) => cannedErr<SpawnResult>(err)),
     getResult: cannedGetResult(row, persona, h.home),
   }
+}
+
+/**
+ * Script persona `key`'s next launch (b.jg5 SRJ-207): its optimistic spawn
+ * collides and the collision `get` reads its row `ended` in another
+ * directory (the harness HOME), so the launch replaces the row by a reuse
+ * spawn of the same id, which answers `err` (an `ErrInvalidFlags` of
+ * `spawn` by default).
+ */
+export function scriptReuseInvalidFlags(h: RecoveryHarness, key: string, err: Error = errInvalidFlags('spawn')): void {
+  h.script(collided(h, personaOf(h, key), { cwd: h.home, state: LIVENESS_DEAD_ROW_ENDED }, err))
+}
+
+/**
+ * Hold persona `key` through a real reuse (b.jg5 SRJ-207): its start-pass
+ * launch (`h.launch`) over the row `scriptReuseInvalidFlags` scripts, whose
+ * reuse spawn answers `ErrInvalidFlags`. Asserts the launch answered `held`
+ * and the harness's hold holds `key`.
+ */
+export async function holdThroughReuse(h: RecoveryHarness, key: string): Promise<void> {
+  scriptReuseInvalidFlags(h, key)
+  expect(await h.launch(key)).toStrictEqual({ key, action: 'held' })
+  expect(h.invalidFlagsHold.isHeld(key)).toBe(true)
 }
 
 /**

@@ -120,7 +120,6 @@ import {
   deadSessionRouteLine,
   describeDeadEvidence,
   ESCALATE_DEAD_VERDICTS,
-  isDeadEvidence,
   isLiveRowSequenceRunning,
   lostRaceOutcome,
   ROW_REREAD_FINISHED,
@@ -240,6 +239,7 @@ import {
   killFailureNotice,
   killFailureRecoveryEntry,
   collided,
+  holdThroughReuse,
   makeRecoveryHarness,
   ordinaryAlertContent,
   personaCallCounts,
@@ -249,6 +249,7 @@ import {
   type RecoveryHarness,
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
+import { DEAD_EVIDENCE_OF } from './test-helpers/dead-evidence.ts'
 import {
   NO_LAUNCH_START_FORMS,
   NO_LAUNCH_START_FORM_NAMES,
@@ -2691,7 +2692,6 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     expect(run.launches).toEqual([run.KEY])
     const carried = carriedDeadEvidenceOf(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)
     expect(run.carriedIn).toEqual([carried])
-    expect(isDeadEvidence(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)).toBe(false)
     expect(errLines.filter((l) => l === relaunchWithoutKillLine(run.KEY, carried))).toHaveLength(1)
     expect(run.outcomes).toEqual([RESTART_OUTCOME_LAUNCHED])
     expect(getFailureCount(run.KEY)).toBe(0)
@@ -2940,11 +2940,9 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
     expect(run.findMissingCalls).toHaveLength(1)
     expect(run.killSessionCalls).toEqual([])
     expect(run.launchSessionCalls).toEqual([run.KEY])
-    // b.jg5 SRJ-611: the relaunch carries the verdict, which the session
-    // manager's decision reads as no dead evidence.
+    // b.jg5 SRJ-611: the relaunch carries the verdict.
     const carried = carriedDeadEvidenceOf('row-not-interactive')
     expect(run.carriedIn).toEqual([carried])
-    expect(isDeadEvidence(run.carriedIn[0]?.source)).toBe(false)
     expect(run.lines.filter((l) => l === relaunchWithoutKillLine(run.KEY, carried))).toHaveLength(1)
     // The no-kill line's one literal pin: it names the verdict carried and says it is not dead evidence.
     expect(relaunchWithoutKillLine(run.KEY, carried)).toBe(
@@ -3045,12 +3043,12 @@ describe('b.jg5 SRJ-611: on the recovery harness, the relaunch after escalate-de
 
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-611's Test line (homed in T1, observed here), SRJ-710, SRJ-609's
-// AC 59 half (E23 T2): the restart path's relaunch after each escalate-dead
+// AC 59 half: the restart path's relaunch after each escalate-dead
 // verdict meets ErrSpawnNotResumable on a row its re-read finds live.
 //
 // On the recovery harness (the real liveness, reconnect and kill adapters
-// over one stub, the restart deps bound as `main()` binds them, E21's
-// registry installed). Each verdict comes from the reconnect adapter's own
+// over one stub, the restart deps bound as `main()` binds them, the live-row
+// sequence's registry installed). Each verdict comes from the reconnect adapter's own
 // reads, P disconnected: its row reads the verdict's state until the
 // escalate-dead sweep and `missing` after it, so the run's re-probe reads it
 // finished. The relaunch's optimistic spawn collides, its collision `get`
@@ -3101,9 +3099,6 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
     { verdict: ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, state: 'working', script: { readPaneError: errSpawnNotFound() } },
   ]
 
-  /** The GONE-based verdicts (b.jg5 SRJ-611), written out by hand rather than asked of the code under test. */
-  const GONE_BASED: ReadonlySet<EscalateDeadVerdict> = new Set<EscalateDeadVerdict>(['working-tmux-gone', ESCALATE_DEAD_WAITING_ROW_PANE_GONE, 'dead-session', 'prompt-row-tmux-gone'])
-
   test('every escalate-dead verdict has a reach here', () => {
     expect(new Set(VERDICT_REACHES.map((reach) => reach.verdict))).toEqual(new Set(ESCALATE_DEAD_VERDICTS))
   })
@@ -3134,7 +3129,7 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
 
   test.each(VERDICT_REACHES.map((reach) => [reach.verdict, reach] as const))('verdict %s, the re-read finding the row waiting: a GONE-based verdict\'s checked kill, the relaunch, then one sequence ending in resume; any other verdict: no kill, no sequence, no launch over the live row, P armed with the lost-race cause; never a recordFailure or a spawn-failure notice', async (verdict, reach) => {
     const { h, p, cwd } = build(reach, WAITING)
-    const gone = GONE_BASED.has(verdict)
+    const gone = DEAD_EVIDENCE_OF[verdict]
 
     const outcome = await runRestartRetry(p, cwd, isLaunchInFlight)
 
@@ -3172,7 +3167,7 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
 
     expect(isLiveRowSequenceRunning(p)).toBe(false)
     // Only a GONE-based verdict's checked kill, before the relaunch.
-    expect(h.stub.calls.killCalls).toHaveLength(GONE_BASED.has(verdict) ? 1 : 0)
+    expect(h.stub.calls.killCalls).toHaveLength(DEAD_EVIDENCE_OF[verdict] ? 1 : 0)
     expect([getFailureCount(p), h.notices, h.episodeNotices]).toEqual([0, [], []])
     expect(h.triggers.filter((t) => t.key === p && t.kind === UNAVAILABLE_RETRY_CAUSE_LOST_RACE)).toEqual([])
   })
@@ -3496,10 +3491,9 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
   // relaunch, which receives the verdict unchanged (none for the bare
   // answer). Only a GONE-based verdict gets the checked kill first; any
   // other gets no kill and the no-kill line naming it.
-  const GONE_BASED_VERDICTS: ReadonlySet<DeadEvidenceSource> = new Set<EscalateDeadVerdict>(['dead-session', 'working-tmux-gone', ESCALATE_DEAD_WAITING_ROW_PANE_GONE, 'prompt-row-tmux-gone'])
   const ADAPTER_VERDICTS: readonly DeadEvidenceSource[] = [...ESCALATE_DEAD_VERDICTS, DEAD_SESSION_CAUSE_ROW_READ_FINISHED]
   const CARRIED_VERDICTS: ReadonlyArray<readonly [string, ReconnectSessionResult, CarriedDeadEvidence | undefined, boolean]> = [
-    ...ADAPTER_VERDICTS.map((verdict) => [`the verdict ${verdict}`, escalateDeadWith(verdict), carriedDeadEvidenceOf(verdict), GONE_BASED_VERDICTS.has(verdict)] as const),
+    ...ADAPTER_VERDICTS.map((verdict) => [`the verdict ${verdict}`, escalateDeadWith(verdict), carriedDeadEvidenceOf(verdict), DEAD_EVIDENCE_OF[verdict]] as const),
     ['no verdict (a bare escalate-dead)', 'escalate-dead', undefined, false],
   ]
 
@@ -3514,8 +3508,6 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
     expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
     expect(timeline).toEqual([...(killed ? [['kill', KEY]] : []), ['launch', KEY]])
     expect(deps.launchSessionCalls).toEqual([{ key: KEY, cwd: CWD, sessionId: undefined, ...(carried === undefined ? {} : { deadEvidence: carried }) }])
-    // The session manager's decision reads the carried verdict as the run did.
-    expect(carried !== undefined && isDeadEvidence(carried.source)).toBe(killed)
     expect(lines().filter((l) => l === relaunchWithoutKillLine(KEY, carried))).toHaveLength(killed ? 0 : 1)
     expect(lines().filter((l) => l.startsWith(`[slack] Relaunching session for persona=${KEY} `))).toEqual([
       relaunchAfterKillLine(KEY, CWD, killed ? KILL_SUCCEEDED : RELAUNCH_KILL_NONE),
@@ -7271,8 +7263,7 @@ describe('b.jg5 SRJ-207, SRJ-303: the restart path makes no attempt for a person
       h = makeRecoveryHarness()
       const [p] = h.keys as [string]
       const persona = h.config.personas.find((x) => x.key === p)!
-      h.script(collided(h, persona, { cwd: h.home, state: LIVENESS_DEAD_ROW_ENDED }, errInvalidFlags('spawn')))
-      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'held' })
+      await holdThroughReuse(h, p)
       const before = personaCallCounts(h, p)
 
       expect(await runRestartRetry(p, persona.working_directory, () => false)).toBe(RESTART_OUTCOME_HELD)

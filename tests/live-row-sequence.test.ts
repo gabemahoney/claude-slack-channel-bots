@@ -1419,10 +1419,6 @@ const REUSE_ENDS: ReadonlyArray<readonly [string, ReuseEnd]> = [
   ['fails with UNCLASSIFIED (ErrInternal), refused', refusedBy(() => errInternal(), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true)],
   ['fails with ErrTmuxSessionCreate, armed pending-only', launchFailure()],
   ['of an id with no row (step 3\'s get read none) fails with ErrTmuxSessionCreate, armed pending-only', launchFailure(true)],
-  [
-    'fails with ErrInvalidFlags whose re-check stops the server',
-    { make: () => errInvalidFlags('spawn'), answer: { action: 'failed', stopping: true }, triggers: [], counted: 0, said: 'the launch failed (reuse; result=failed, stopping)', armedSaid: 'no retry timer armed' },
-  ],
 ]
 
 describe('the launch\'s end: the outcome carries the launch\'s result, and the end line says whether it launched (SRJ-705 step 6, SRJ-301, SRJ-112)', () => {
@@ -1436,7 +1432,6 @@ describe('the launch\'s end: the outcome carries the launch\'s result, and the e
   // tests/session-manager.test.ts's.
   test.each(REUSE_ENDS)('a reuse that %s: the outcome is launched with its result and the arm, its one end line says so, the reuse is the last call, and P\'s triggers, count and notice are its class\'s; Q is untouched', async (_label, row) => {
     const { h, p, q } = build()
-    const stops = row.answer.stopping === true ? h.recheckAnswers(OLD_AD_VERSION).stops : []
     const err = row.make()
     h.script({
       ...(row.noRow === true ? { getError: errSpawnNotFound() } : { getResult: personaRow(h, p, { state: ENDED }) }),
@@ -1465,7 +1460,6 @@ describe('the launch\'s end: the outcome carries the launch\'s result, and the e
     if (row.answer.action === 'spawned') expectCallsThenApprover(order, calls)
     else expect(order).toEqual(calls)
     expectOneReuseOf(h, p)
-    expect(stops).toHaveLength(row.answer.stopping === true ? 1 : 0)
     // P's timer armed with the causes in order (the reuse's own handling's first), or not at all.
     expect(h.triggers).toEqual(row.triggers.map((kind) => ({ key: p, kind })))
     expect(h.controller.view(p)?.causes ?? []).toEqual([...row.triggers])
@@ -1482,7 +1476,6 @@ describe('the launch\'s end: the outcome carries the launch\'s result, and the e
       expect(h.clock.pending().map((timer) => timer.dueAt)).toContain(h.controller.view(p)!.dueAt!)
       expect(h.clock.pendingCount()).toBe(h.tmuxUnresponsive.holds(p) ? 2 : 1)
     }
-    if (row.answer.stopping === true) expect(h.clock.pendingCount()).toBe(0)
     expectUntouched(h, q)
   })
 
@@ -2035,7 +2028,7 @@ describe('started at a collision ladder replacement site: the launch answers whi
 
 // ---------------------------------------------------------------------------
 // Started at the collision ladder's ErrSpawnNotResumable with dead evidence
-// (b.jg5 SRJ-710, SRJ-611, SRJ-705, SRJ-706; E23)
+// (b.jg5 SRJ-710, SRJ-611, SRJ-705, SRJ-706)
 //
 // A launch of P (`h.launch`) reaches the ladder's `waiting` branch; its
 // reconnect's one `send-keys` answers `ErrTmuxSendKeys` (`tmux-gone`, dead
@@ -2048,16 +2041,15 @@ describe('started at a collision ladder replacement site: the launch answers whi
 // has a session id, a reuse of the same id when it has none. A not-judged
 // stop arms P's timer, and the next retry, through the restart path's
 // escalate-dead relaunch, reaches the same site and begins a new episode.
-// Step 6's own `resume` follows SRJ-113's table at the entry (its rows are
-// tests/session-manager.test.ts's, its latches' records
-// tests/conflict-latch.test.ts's): here what the sequence does with each
+// Step 6's own `resume` follows SRJ-113's table at the entry (its rows and
+// its latches' records are tests/session-manager.test.ts's): here what the sequence does with each
 // answer: a CONFLICT ends it latched with no further call; ErrSpawnNotFound
 // launches by one plain spawn; ErrSpawnNotResumable makes one re-read, starts
 // no second sequence and ends the sequence without its launch, arming the
 // not-resumable end's cause (nothing when the re-read latches P).
 // ---------------------------------------------------------------------------
 
-describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the launch answers while the sequence runs, the conversation is kept, and step 6\'s resume answers end it by SRJ-113 and SRJ-710 (E23)', () => {
+describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the launch answers while the sequence runs, the conversation is kept, and step 6\'s resume answers end it by SRJ-113 and SRJ-710', () => {
   /** The ladder's calls before the sequence: the colliding spawn, the collision get, the reconnect, the find-missing run, the resume and its re-read. */
   const LADDER_CALLS = ['spawn', 'get', 'sendKeys', 'findMissing', 'resume', 'get'] as const
 

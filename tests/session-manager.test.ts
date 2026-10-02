@@ -208,10 +208,10 @@
  *     evidence) and SRJ-110 at its first kill, the non-evidence routes'
  *     re-read, the deferred `cwd` check and the lost race on
  *     `ErrSpawnNotResumable` after a re-read of a finished row (SRJ-710).
- *   - b.jg5 SRJ-113 (E23 T2), on `makeRecoveryHarness`: `resume`'s outcome
- *     table, one case per row (`RESUME_OUTCOME_ROWS`), at both `resume`
- *     sites: `resumeOrFreshSpawn` (a collision `get` that read the row
- *     `ended` with a session id) and the sequence-launch entry's `resume`
+ *   - b.jg5 SRJ-113, on `makeRecoveryHarness`: `resume`'s outcome table,
+ *     one case per row (`RESUME_OUTCOME_ROWS`), at both `resume` sites:
+ *     `resumeOrFreshSpawn` (a collision `get` that read the row `ended` with
+ *     a session id) and the sequence-launch entry's `resume`
  *     leg: success `resumed`; UNAVAILABLE (each form) refused and never
  *     counted, P armed; ENVIRONMENT `tmux-unavailable`; `ErrTmuxSessionCreate`
  *     counted once with no kill, P armed at once in pending-only mode (also
@@ -228,7 +228,7 @@
  *     with the state last read and kill nothing. HO rev 28's four restore
  *     sentences change no outcome (the stub's `withRestoreSentence`), and no
  *     file in `src/` holds one.
- *   - b.jg5 SRJ-710 (E23 T2): `ErrSpawnNotResumable` makes one `get` through
+ *   - b.jg5 SRJ-710: `ErrSpawnNotResumable` makes one `get` through
  *     the shared own-row read (`decideNotResumable` over each re-read):
  *     `pending` is a launch in progress, neither counted nor posted, with no
  *     sequence of its own (a covered row left by the ladder's `pending` step,
@@ -1071,9 +1071,11 @@ import {
   invalidFlagsHoldEndLine,
   invalidFlagsHoldSetLine,
 } from '../src/invalid-flags-hold.ts'
-import { LIVE_ROW_START_HELD, reuseInvalidFlagsHeldLine, setInvalidFlagsHold } from '../src/session-manager.ts'
+import { _resetInvalidFlagsHold, LIVE_ROW_START_HELD, reuseInvalidFlagsHeldLine, setInvalidFlagsHold } from '../src/session-manager.ts'
 import { recordFailure } from '../src/backoff.ts'
-import { errSystemInstallNotFound } from './test-helpers/agent-director-stub.ts'
+import { errSystemInstallNotFound, errTmuxUnresponsiveAfterDuplicateSession } from './test-helpers/agent-director-stub.ts'
+import { DEAD_EVIDENCE_OF } from './test-helpers/dead-evidence.ts'
+import { holdThroughReuse, scriptReuseInvalidFlags } from './test-helpers/recovery-harness.ts'
 import {
   createUnavailableRetryController,
   runInAttempt,
@@ -20971,8 +20973,9 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
 //
 // The rule (`isDeadEvidence`) runs over every value of the exported lists
 // (`DEAD_SESSION_CAUSES`, `ESCALATE_DEAD_VERDICTS`); each value's expected
-// answer comes from a record keyed by their union, so a new value fails the
-// typecheck until it has an answer here, and a value or a value the rule
+// answer comes from `DEAD_EVIDENCE_OF` (tests/test-helpers/dead-evidence.ts),
+// keyed by their union, so a new value fails the typecheck until it has an
+// answer there, and a value or a value the rule
 // does not know is never dead evidence (fail safe). The launch wait's
 // `dead-session` carries one cause per end
 // (`waitForWaitingAndReconnectWithCause`). A launch the restart path gives an
@@ -20988,20 +20991,6 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
 // dead-session routes' own lines and their find-missing run before the
 // resume are the ladder describe's below and the prompt-row describe's.
 // ---------------------------------------------------------------------------
-
-/** The dead-evidence answer of every cause and verdict (b.jg5 SRJ-611): true exactly for the GONE-based ones. */
-const DEAD_EVIDENCE_OF: Readonly<Record<DeadEvidenceSource, boolean>> = {
-  [DEAD_SESSION_CAUSE_TMUX_GONE]: true,
-  [DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE]: true,
-  [DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE]: false,
-  [DEAD_SESSION_CAUSE_ROW_ABSENT]: false,
-  [DEAD_SESSION_CAUSE_ROW_READ_FINISHED]: false,
-  'dead-session': true,
-  'working-tmux-gone': true,
-  [ESCALATE_DEAD_WAITING_ROW_PANE_GONE]: true,
-  [ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ]: false,
-  'prompt-row-tmux-gone': true,
-}
 
 describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause and the verdict a relaunch carries', () => {
   afterEach(() => {
@@ -21337,11 +21326,11 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
 // launch and read calls from the `resume` on, the retry causes sent for P,
 // the outage flags raised, the failures counted (the entry counts its own
 // launch; the restart path counts a ladder launch from its answer), the
-// spawn-failure notices and the reuse spawns. E28's one `get` after an
+// spawn-failure notices and the reuse spawns. A `get` after an
 // UNAVAILABLE outcome is not pinned. The CONFLICT rows are the case table's
 // (`tests/test-helpers/conflict-cases.ts`): at the ladder every `resume`
 // row crossed with every `resume` site (`LATCH_CROSS`), at the entry the
-// sequence `resume` rows. The latch re-check's site is E30's.
+// sequence `resume` rows.
 // ---------------------------------------------------------------------------
 
 /** What one row of SRJ-113's table gives at one `resume` site. */
@@ -21366,7 +21355,7 @@ interface ResumeSiteOutcome {
 interface ResumeOutcomeRow {
   readonly name: string
   readonly make?: () => Error
-  /** E28's one `get` after the outcome: not pinned. */
+  /** A `get` after the outcome: not pinned. */
   readonly getNotPinned?: true
   /** Install agent-director's version re-check (ErrInvalidFlags's one immediate re-check, b.jg5 SRJ-204). */
   readonly recheck?: true
@@ -21743,7 +21732,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
   // b.jg5 SRJ-113, SRJ-705: a step-6 `resume` answering ErrSpawnNotFound
   // makes one plain spawn of the id, with no spawn-failure notice for the
-  // ErrSpawnNotFound itself (the E21-E22 reconcile note), and the sequence
+  // ErrSpawnNotFound itself, and the sequence
   // launches. The sequence runs over the harness's dependencies outside the
   // registry, so a restart-path launch made while the `resume` is held joins
   // the entry's launch and gets its result.
@@ -23175,7 +23164,7 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-113 (E23 T2): `resume`'s outcome table at `resumeOrFreshSpawn`,
+// b.jg5 SRJ-113: `resume`'s outcome table at `resumeOrFreshSpawn`,
 // one case per row (`RESUME_OUTCOME_ROWS`; the entry's are in the
 // sequence-launch entry's describe), on the recovery harness: the
 // optimistic spawn collides and the collision `get` reads the row `ended`
@@ -23212,11 +23201,10 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
     expect(h.sequenceRunning(p)).toBe(false)
   })
 
-  // HO rev 28 (the E23 reconcile note): a `resume` whose description says
+  // HO rev 28: a `resume` whose description says
   // the row could not be restored and stays pending is counted and arms P's
   // retry timer at once in pending-only mode, with no `get` first, so the
-  // retry's read decides; nothing is killed. What that retry does with the
-  // row is E28's and E29's.
+  // retry's read decides; nothing is killed.
   test('ErrTmuxSessionCreate saying the row could not be restored and stays pending (session_restart_delay 0): counted once, no kill and no get after it; the stub\'s row stays pending; P armed at once in pending-only mode', async () => {
     const { h, p } = srj105Build()
     expect(h.config.session_restart_delay).toBe(0)
@@ -23244,7 +23232,7 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
       )
       expect([h.triggers, h.episodeNotices.map((notice) => notice.key)]).toEqual([[], [p]])
     }],
-    ['ErrTmuxUnresponsive after "duplicate session" (its holder could not be read)', () => errTmuxUnresponsive('resume', 'tmux new-session answered duplicate session and the session holding the name could not be read; nothing was started'), (h, p) => {
+    ['ErrTmuxUnresponsive after "duplicate session" (its holder could not be read)', () => errTmuxUnresponsiveAfterDuplicateSession('resume'), (h, p) => {
       expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
     }],
     ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'resume'), (h, p) => {
@@ -23338,7 +23326,7 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-710 (E23 T2): `resume`'s ErrSpawnNotResumable at
+// b.jg5 SRJ-710: `resume`'s ErrSpawnNotResumable at
 // `resumeOrFreshSpawn` makes exactly one `get` of the row through the shared
 // own-row read (SRJ-114: its latch and error rows apply), and the re-read
 // decides (`decideNotResumable`):
@@ -23348,7 +23336,7 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
 //     not covered, its `config_dir` label differing, gets SRJ-411's sequence
 //     through the replace step). Its arms equal a direct call of the
 //     ladder's `pending` branch on the same row (B's launch, its collision
-//     `get` reading that row: none today; E28 adds the covered row's arm);
+//     `get` reading that row: none);
 //   - another live state starts the live-row sequence only on a path that
 //     holds dead evidence (the SRJ-611 matrix below); otherwise, and for
 //     `ended`, `missing`, no row, a refused read or a state CSCB does not
@@ -23489,8 +23477,8 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
   })
 
   test.each<[string, (h: RecoveryHarness, p: string) => CannedGetResult]>([
-    ['a pending row with no launch start (E16: "launch start not recorded")', (h, p) => harnessRow(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })],
-    ['a waiting row carrying a provenance_conflict note (E14: "conflicting labels")', (h, p) => harnessRow(h, harnessPersona(h, p), { state: 'waiting', liveness_note: provenanceNote })],
+    ['a pending row with no launch start (latch case "launch start not recorded")', (h, p) => harnessRow(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })],
+    ['a waiting row carrying a provenance_conflict note (latch case "conflicting labels")', (h, p) => harnessRow(h, harnessPersona(h, p), { state: 'waiting', liveness_note: provenanceNote })],
   ])('the re-read latches P on %s: latched, with no further call, no sequence and no kill, though the path holds dead evidence', async (_name, row) => {
     const { h, p } = srj105Build()
     scriptNotResumable(h, p, 'dead evidence', cannedOk<Phase1GetResult>(row(h, p)))
@@ -23570,7 +23558,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
 // every GONE-based path, and again at the sequence's own step-6 `resume`:
 // no sequence, kill or launch follows it. Then AC 59 with its later retry,
 // and SRJ-110 at this site: the sequence's first kill's C2 non-successes, on
-// E20's checked kill.
+// its checked kill.
 // ---------------------------------------------------------------------------
 
 describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a row re-read waiting starts the live-row sequence, ending in resume, only for a GONE-based cause', () => {
@@ -23841,10 +23829,11 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
 // and posts SRJ-1008's alert once in P's episode; its held query bound into
 // the restart deps and the retry action; the version-changed listener ends
 // it and retries P at once). P is held through a real reuse spawn of the
-// same id that answers ErrInvalidFlags (`holdP`): its launch meets its row
-// finished in another directory. The reuse sites' rows are in the
-// replacement-site describe above; here: every launch path while P is held,
-// the start pass's tally, a latched and held P, AC 23 end to end with the
+// same id that answers ErrInvalidFlags (`holdThroughReuse`): its launch
+// meets its row finished in another directory. The reuse sites' rows are in
+// the replacement-site describe above; here: every launch path while P is
+// held, the start pass's tally, a latched and held P, a reuse with no hold
+// installed or a hold whose set throws, AC 23 end to end with the
 // version re-check on the harness clock, below the floor, a server restart,
 // and only a reuse holds (a plain spawn's and a resume's ErrInvalidFlags
 // keep the re-check, then UNCLASSIFIED).
@@ -23853,18 +23842,6 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
 /** One SRJ-1008 alert at persona `key`'s destination, as the harness's episodes capture it. */
 function holdAlert(key: string): { key: string; text: string } {
   return { key, text: INVALID_FLAGS_HOLD_ALERT_TEXT }
-}
-
-/**
- * Hold persona `p` through a real reuse (b.jg5 SRJ-207): its launch's first
- * spawn collides, the collision `get` reads its row `ended` in another
- * directory, and the reuse spawn of the same id that replaces it answers
- * ErrInvalidFlags. Asserts the launch answered `held` and P is held.
- */
-async function holdP(h: RecoveryHarness, p: string): Promise<void> {
-  h.script(collided(h, harnessPersona(h, p), elsewhere(h, LIVENESS_DEAD_ROW_ENDED), errInvalidFlags('spawn')))
-  expect(await h.launch(p)).toStrictEqual({ key: p, action: 'held' })
-  expect(h.invalidFlagsHold.isHeld(p)).toBe(true)
 }
 
 describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers held with no agent-director call; launchSession answers \'skipped\' and the start pass counts it neither failed nor succeeded', () => {
@@ -23891,7 +23868,7 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
 
   test.each(HELD_PATHS)('%s for a held P: its held answer, with zero stub calls and one held line; no launch, kill, delete or tmux call, nothing counted, recorded, armed or posted, no second alert; Q launches normally afterwards', async (_label, call, answer, site, refOf = (key: string) => renderPersonaRef(key, key)) => {
     const { h, p, b } = srj105Build()
-    await holdP(h, p)
+    await holdThroughReuse(h, p)
     const tmux: string[] = []
     recordRawTmux(tmux)
     // One failure on record: a success recorded for P would clear it, a failure add one.
@@ -23917,7 +23894,7 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
 
   test('b.jg5 SRJ-1015: the start pass over a held P and an unheld Q: P\'s outcome is held with no call, counted neither failed nor succeeded; Q is spawned and counted', async () => {
     const { h, p, b } = srj105Build()
-    await holdP(h, p)
+    await holdThroughReuse(h, p)
     const before = personaCallCounts(h, p)
 
     const result = await startupSessionManager(h.config, { concurrency: 1 })
@@ -23962,10 +23939,54 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
     expect(await spawnForPersona(harnessPersona(h, p), h.config, false)).toStrictEqual({ key: p, action: 'held' })
 
     expect(order).toEqual([])
-    const held = h.errors.filter((line) => line.startsWith(invalidFlagsHeldNoLaunchLine(spawnForPersona.name, renderPersonaRef(p, p))))
+    const head = invalidFlagsHeldNoLaunchLine(spawnForPersona.name, renderPersonaRef(p, p))
+    const held = h.errors.filter((line) => line.startsWith(head))
     expect(held).toHaveLength(1)
-    expect(held[0]).toContain('taken as held')
-    expect(held[0]).not.toContain(LEAK_SENTINEL)
+    expect(held[0]).toStartWith(`${head} (the held query failed: Error message="hold query broke (${REDACTED_SENTINEL_TAIL})" at `)
+    expect(held[0]).toEndWith(' — taken as held)')
+    assertNoLeak(h.captured())
+  })
+
+  // With no hold installed (unit tests, the integration driver) the reuse
+  // still answers held, and its line says nothing is held.
+  test('a reuse answering ErrInvalidFlags with no hold installed: held, with one line saying no hold is installed; nothing is held or posted, and P\'s next launch reaches agent-director', async () => {
+    const { h, p } = srj105Build()
+    _resetInvalidFlagsHold()
+    const err = errInvalidFlags('spawn')
+    scriptReuseInvalidFlags(h, p, err)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'held' })
+
+    const line = reuseInvalidFlagsHeldLine(renderPersonaRef(p, p), describeAgentDirectorFailure(err), RECHECK_OUTCOME_NOT_RUNNING, 'no ErrInvalidFlags hold is installed, so nothing is held')
+    expect(h.errors.filter((l) => l === line)).toHaveLength(1)
+    expect([h.invalidFlagsHold.heldKeys(), h.episodeNotices, getFailureCount(p)]).toEqual([[], [], 0])
+
+    const order = recordCallOrder(h)
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+    expect(order[0]).toBe('spawn')
+    await h.runApproverToStop(p)
+  })
+
+  test('a hold whose set throws: the reuse still answers held, with one line naming what the set threw, redacted; nothing is posted', async () => {
+    const { h, p } = srj105Build()
+    setInvalidFlagsHold({
+      set: () => {
+        throw Object.assign(new Error(`hold set broke (${sentinelInMessage('hold-set')})`), { note: LEAK_SENTINEL })
+      },
+      isHeld: () => false,
+    })
+    const err = errInvalidFlags('spawn')
+    scriptReuseInvalidFlags(h, p, err)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'held' })
+
+    const [head, tail] = reuseInvalidFlagsHeldLine(renderPersonaRef(p, p), describeAgentDirectorFailure(err), RECHECK_OUTCOME_NOT_RUNNING, '\u0000').split('\u0000') as [string, string]
+    const held = h.errors.filter((line) => line.startsWith(head))
+    expect(held).toHaveLength(1)
+    expect(held[0]).toStartWith(`${head}holding the persona failed: Error message="hold set broke (${REDACTED_SENTINEL_TAIL})" at `)
+    expect(held[0]).toEndWith(tail)
+    expect(h.episodeNotices).toEqual([])
+    assertNoLeak(h.captured())
   })
 })
 
@@ -23981,7 +24002,7 @@ describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse ge
   test('a cwd mismatch on a finished row forces a reuse; held with one alert; several backoff waits and re-check intervals at the same version make no call for P; the version changes and the next re-check retries P once, at that clock time, by one reuse, and P comes up; a second ErrInvalidFlags begins a new hold with one new alert', async () => {
     const { h, p, b } = srj105Build()
     const rc = h.versionRecheck({ version: PHASE1_RC_VERSION })
-    await holdP(h, p)
+    await holdThroughReuse(h, p)
     expect(rc.resolves).toHaveLength(1)
     expect(h.invalidFlagsHold.beganUnder(p)).toBe(PHASE1_RC_VERSION)
     expect(h.episodeNotices).toEqual([holdAlert(p)])
@@ -24013,7 +24034,7 @@ describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse ge
     await h.runApproverToStop(p)
 
     // A new ErrInvalidFlags after that: a new hold, under the version now seen, with one new alert.
-    await holdP(h, p)
+    await holdThroughReuse(h, p)
     expect(h.invalidFlagsHold.beganUnder(p)).toBe(NEW_VERSION)
     expect(h.episodeNotices).toEqual([holdAlert(p), holdAlert(p)])
     expect(personaCallCounts(h, b)).toEqual({})
@@ -24022,7 +24043,7 @@ describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse ge
   test('below the floor: the same forced reuse whose re-check reads a below-floor binary stops the server once, non-zero, with one startup-errors entry of its class; no hold, no alert, and no further stub call for P', async () => {
     const { h, p } = srj105Build()
     const rc = h.versionRecheck({ version: OLD_AD_VERSION })
-    h.script(collided(h, harnessPersona(h, p), elsewhere(h, LIVENESS_DEAD_ROW_ENDED), errInvalidFlags('spawn')))
+    scriptReuseInvalidFlags(h, p)
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', stopping: true })
     const stopped = personaCallCounts(h, p)
@@ -24041,7 +24062,7 @@ describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse ge
 
   test('a server restart holds nothing: a fresh harness after a held run launches P normally', async () => {
     const first = srj105Build()
-    await holdP(first.h, first.p)
+    await holdThroughReuse(first.h, first.p)
     expectNoDeleteOrIncludeFinished(first.h)
     srj105AfterEach()
 
@@ -24076,9 +24097,8 @@ describe('b.jg5 SRJ-207, SRJ-111, SRJ-113: only a reuse holds; a plain spawn\'s 
     h.controller.stop(p, UNAVAILABLE_RETRY_STOP_RECOVERED)
   })
 
-  // The ladder's first, plain spawn: its ErrInvalidFlags is SRJ-111's row
-  // (a re-check, then UNCLASSIFIED), which this case does not pin; only that
-  // it holds nothing.
+  // The ladder's first, plain spawn: SRJ-111's row for it (a re-check, then
+  // UNCLASSIFIED) is not built yet; this case pins only that it holds nothing.
   test('the ladder\'s plain spawn answering ErrInvalidFlags with a passing binary: no hold, no alert, no reuse spawn and no further call', async () => {
     const { h, p } = srj105Build()
     h.versionRecheck({ version: PHASE1_RC_VERSION })

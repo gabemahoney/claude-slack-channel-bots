@@ -217,7 +217,6 @@ import {
   spawnForPersona,
   carriedDeadEvidenceOf,
   DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
-  isDeadEvidence,
   promptRowSweepFinishedLine,
   type DeadEvidenceSource,
   type EscalateDeadVerdict,
@@ -2799,31 +2798,30 @@ describe('_buildReconnectSessionAdapter', () => {
 
     /**
      * [cell, C1's row state, harness options, the verdict the escalate-dead
-     * answer carries, whether that verdict is dead evidence, the sweep's line
-     * naming it] for every cell of the adapter that escalates: the `read-pane`
+     * answer carries, the sweep's line naming it] for every cell of the adapter that escalates: the `read-pane`
      * of a `working`, `waiting` or prompt row (b.jg5 SRJ-603, SRJ-604,
      * SRJ-606), the reconnect's one `send-keys` on a `waiting` row whose pane
      * is idle (SRJ-609), and a prompt row deferred for
      * `PROMPT_ROW_SWEEP_AFTER_MS` whose re-read after the sweep reads it
-     * finished (its second attempt escalates). Only the GONE-based verdicts are
-     * dead evidence; a row read or the refusal as not interactive never is.
+     * finished (its second attempt escalates). Which verdicts are dead
+     * evidence is the session manager's SRJ-611 describe's.
      */
-    const ESCALATE_DEAD_CELLS: ReadonlyArray<readonly [string, string, Parameters<typeof makeHarness>[0], DeadEvidenceSource, boolean, string]> = [
-      ['a working row, read-pane GONE', 'working', { paneError: paneGone() }, 'working-tmux-gone', true, escalateDeadLine('working-tmux-gone')],
-      ['a working row, read-pane ErrSpawnNotFound', 'working', { paneError: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, false, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)],
-      ['a waiting row, read-pane GONE', 'waiting', { paneError: paneGone() }, ESCALATE_DEAD_WAITING_ROW_PANE_GONE, true, escalateDeadLine(ESCALATE_DEAD_WAITING_ROW_PANE_GONE)],
-      ['a waiting row, read-pane ErrSpawnNotFound', 'waiting', { paneError: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, false, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)],
-      ['a waiting row, the reconnect\'s send-keys ErrTmuxSendKeys', 'waiting', { pane: IDLE_PANE, sendKeysThrows: errTmuxSendKeys() }, 'dead-session', true, escalateDeadLine('dead-session')],
-      ['a waiting row, the reconnect\'s send-keys ErrSpawnNotInteractive', 'waiting', { pane: IDLE_PANE, sendKeysThrows: errSpawnNotInteractive('send-keys') }, 'row-not-interactive', false, escalateDeadLine('row-not-interactive')],
-      ['a waiting row, the reconnect\'s send-keys ErrSpawnNotFound', 'waiting', { pane: IDLE_PANE, sendKeysThrows: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, false, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)],
+    const ESCALATE_DEAD_CELLS: ReadonlyArray<readonly [string, string, Parameters<typeof makeHarness>[0], DeadEvidenceSource, string]> = [
+      ['a working row, read-pane GONE', 'working', { paneError: paneGone() }, 'working-tmux-gone', escalateDeadLine('working-tmux-gone')],
+      ['a working row, read-pane ErrSpawnNotFound', 'working', { paneError: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)],
+      ['a waiting row, read-pane GONE', 'waiting', { paneError: paneGone() }, ESCALATE_DEAD_WAITING_ROW_PANE_GONE, escalateDeadLine(ESCALATE_DEAD_WAITING_ROW_PANE_GONE)],
+      ['a waiting row, read-pane ErrSpawnNotFound', 'waiting', { paneError: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)],
+      ['a waiting row, the reconnect\'s send-keys ErrTmuxSendKeys', 'waiting', { pane: IDLE_PANE, sendKeysThrows: errTmuxSendKeys() }, 'dead-session', escalateDeadLine('dead-session')],
+      ['a waiting row, the reconnect\'s send-keys ErrSpawnNotInteractive', 'waiting', { pane: IDLE_PANE, sendKeysThrows: errSpawnNotInteractive('send-keys') }, 'row-not-interactive', escalateDeadLine('row-not-interactive')],
+      ['a waiting row, the reconnect\'s send-keys ErrSpawnNotFound', 'waiting', { pane: IDLE_PANE, sendKeysThrows: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)],
       ...[...PROMPT_ROW_STATES].flatMap((state) => [
-        [`a ${state} row, read-pane GONE`, state, { paneError: paneGone() }, 'prompt-row-tmux-gone', true, escalateDeadLine('prompt-row-tmux-gone')] as const,
-        [`a ${state} row, read-pane ErrSpawnNotFound`, state, { paneError: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, false, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)] as const,
-        [`a ${state} row deferred for PROMPT_ROW_SWEEP_AFTER_MS, re-read missing after the sweep`, state, { statusAfterSweep: 'missing' }, DEAD_SESSION_CAUSE_ROW_READ_FINISHED, false, promptRowSweepFinishedLine('persona=C1', state, PROMPT_ROW_SWEEP_AFTER_MS, 'missing')] as const,
+        [`a ${state} row, read-pane GONE`, state, { paneError: paneGone() }, 'prompt-row-tmux-gone', escalateDeadLine('prompt-row-tmux-gone')] as const,
+        [`a ${state} row, read-pane ErrSpawnNotFound`, state, { paneError: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)] as const,
+        [`a ${state} row deferred for PROMPT_ROW_SWEEP_AFTER_MS, re-read missing after the sweep`, state, { statusAfterSweep: 'missing' }, DEAD_SESSION_CAUSE_ROW_READ_FINISHED, promptRowSweepFinishedLine('persona=C1', state, PROMPT_ROW_SWEEP_AFTER_MS, 'missing')] as const,
       ]),
     ]
 
-    test.each(ESCALATE_DEAD_CELLS)('b.jg5 SRJ-611: %s → the escalate-dead answer carries the verdict it swept with, and the session manager\'s decision reads it as the row\'s evidence; its line names the same verdict', async (_label, state, opts, verdict, evidence, line) => {
+    test.each(ESCALATE_DEAD_CELLS)('b.jg5 SRJ-611: %s → the escalate-dead answer carries the verdict it swept with; its line names the same verdict', async (_label, state, opts, verdict, line) => {
       const h = cellHarness(state, opts)
       const deferred = verdict === DEAD_SESSION_CAUSE_ROW_READ_FINISHED
       if (deferred) {
@@ -2834,7 +2832,6 @@ describe('_buildReconnectSessionAdapter', () => {
       const { verdict: answer, lines } = await attempt(h)
 
       expect(answer).toEqual({ outcome: 'escalate-dead', deadEvidence: carriedDeadEvidenceOf(verdict) })
-      expect(isDeadEvidence((answer as ReconnectEscalateDead).deadEvidence.source)).toBe(evidence)
       expect(h.findMissingCalls).toHaveLength(1)
       expect(lines.filter((l) => l === line)).toHaveLength(1)
     })

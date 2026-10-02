@@ -8161,6 +8161,44 @@ function sequenceSeedState(lastRead: LatchRowState): string {
 }
 
 /**
+ * The collision ladder's answer to the start entry's answer `startAnswer`:
+ * `held` for a persona held on `ErrInvalidFlags` (b.jg5 SRJ-207),
+ * `sequence-waiting` for any other (SRJ-706).
+ */
+function sequenceStartAction(startAnswer: string): 'held' | 'sequence-waiting' {
+  return startAnswer === LIVE_ROW_START_HELD ? 'held' : 'sequence-waiting'
+}
+
+/**
+ * One start of the live-row sequence (SRJ-705) for a collision ladder site's
+ * live row of persona `run.persona`, through the start entry
+ * (`startLiveRowSequence`): seeded with `lastRead`, entry at step 1, the
+ * conversation kept when `keepsConversation`, the key not retired, ending in
+ * a launch, alert context `recovery`. Answers the start entry's answer and
+ * the ladder's action for it (`sequenceStartAction`). Never throws.
+ */
+function startRecoverySequence(
+  run: LadderRun,
+  lastRead: LatchRowState,
+  keepsConversation: boolean,
+): { startAnswer: LiveRowSequenceStartEntryAnswer; action: 'held' | 'sequence-waiting' } {
+  const { persona, ref } = run
+  const { key } = persona
+  const startAnswer = startLiveRowSequence({
+    key,
+    ref,
+    instanceId: personaInstanceId(key),
+    lastReadState: sequenceSeedState(lastRead),
+    entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
+    keepsConversation,
+    retiredKey: false,
+    launches: true,
+    alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
+  })
+  return { startAnswer, action: sequenceStartAction(startAnswer) }
+}
+
+/**
  * The replace step (b.jg5 SRJ-707, SRJ-1503, SRJ-1504): replace persona P's
  * row `cscb_<key>` at a collision ladder site whose row cannot be kept
  * (`replacing` says why: `resume_enabled` false, a `cwd` mismatch, a
@@ -8198,18 +8236,7 @@ async function replacePersonaRow(run: LadderRun, lastRead: LatchRowState, replac
       reuseSpawnForPersona(persona, config, { isStartup, lastRead, trustPatchRan: true }),
     )
   }
-  const startAnswer = startLiveRowSequence({
-    key,
-    ref,
-    instanceId: personaInstanceId(key),
-    lastReadState: sequenceSeedState(lastRead),
-    entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
-    keepsConversation: false,
-    retiredKey: false,
-    launches: true,
-    alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
-  })
-  const action = startAnswer === LIVE_ROW_START_HELD ? 'held' : 'sequence-waiting'
+  const { startAnswer, action } = startRecoverySequence(run, lastRead, false)
   console.error(
     `[slack] spawnForPersona: replacing the row of ${ref} (${replacing}; last read ${describeLatchRowState(lastRead)}): a live row goes through the live-row sequence first, which ends in a reuse spawn of the same id; start answered ${startAnswer} — answering ${action}; no other call, nothing counted (b.jg5 SRJ-707, SRJ-705, SRJ-706)`,
   )
@@ -8856,8 +8883,7 @@ export const NOT_RESUMABLE_PENDING_OUTCOME =
  * `ErrInvalidFlags` (b.jg5 SRJ-207), `sequence-waiting` for any other.
  */
 export function notResumableSequenceOutcome(startAnswer: string): string {
-  const answering = startAnswer === LIVE_ROW_START_HELD ? 'held' : 'sequence-waiting'
-  return `the path holds dead evidence and the row is live: the live-row sequence, with the conversation kept (alert context ${KILL_FAILURE_CONTEXT_RECOVERY}), ending in resume; start answered ${startAnswer} — answering ${answering}; no other call, nothing counted`
+  return `the path holds dead evidence and the row is live: the live-row sequence, with the conversation kept (alert context ${KILL_FAILURE_CONTEXT_RECOVERY}), ending in resume; start answered ${startAnswer} — answering ${sequenceStartAction(startAnswer)}; no other call, nothing counted`
 }
 
 /** The outcome of a lost race at the collision ladder, with whether the retry timer was armed. */
@@ -8908,19 +8934,9 @@ async function spawnNotResumableAtLadder(run: LadderRun, err: unknown, deadEvide
       log(NOT_RESUMABLE_PENDING_OUTCOME)
       return ladderPendingRowStep(run, decision.reread.row, decision.reread.lastRead)
     case NOT_RESUMABLE_SEQUENCE: {
-      const startAnswer = startLiveRowSequence({
-        key,
-        ref,
-        instanceId: personaInstanceId(key),
-        lastReadState: sequenceSeedState(decision.reread.lastRead),
-        entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
-        keepsConversation: true,
-        retiredKey: false,
-        launches: true,
-        alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
-      })
+      const { startAnswer, action } = startRecoverySequence(run, decision.reread.lastRead, true)
       log(notResumableSequenceOutcome(startAnswer))
-      return { key, action: startAnswer === LIVE_ROW_START_HELD ? 'held' : 'sequence-waiting' }
+      return { key, action }
     }
     case NOT_RESUMABLE_LOST_RACE:
       return lostRaceAtLadder(key, log)

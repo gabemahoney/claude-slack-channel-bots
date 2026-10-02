@@ -118,7 +118,7 @@ import {
 } from '../src/restart.ts'
 import { recordFailure, isAtCap } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
-import { STATE_WORDING, type LostMessageState } from '../src/lost-message.ts'
+import type { LostMessageState } from '../src/lost-message.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
@@ -231,7 +231,7 @@ import {
   type RecoveryHarnessOptions,
   type RecoveryRowState,
 } from './test-helpers/recovery-harness.ts'
-import { collided, personaCallCounts, personaRow, unavailableAt } from './test-helpers/recovery-harness.ts'
+import { holdThroughReuse, personaCallCounts, personaRow, unavailableAt } from './test-helpers/recovery-harness.ts'
 import { errInvalidFlags, provenanceNote } from './test-helpers/agent-director-stub.ts'
 import { launchForLiveRowSequence, readPersonaOwnRow } from '../src/session-manager.ts'
 import { LIVE_ROW_LAUNCH_REUSE } from '../src/live-row-sequence.ts'
@@ -622,7 +622,7 @@ const INPUTS = {
     },
     clear: (h, key) => { expect(h.latch.forget(key)).toBe(true) },
   },
-  // E23's set, as a reuse spawn's ErrInvalidFlags sets it; `forget` is its silent end.
+  // The hold's set, as a reuse spawn's ErrInvalidFlags sets it (SRJ-207); `forget` is its silent end.
   'held on ErrInvalidFlags': {
     set: (h, key) => {
       expect(h.invalidFlagsHold.set(key)).toBe(true)
@@ -1506,7 +1506,7 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 state 3, SRJ-207 (E23 T3): a message lost while P is held
+// b.jg5 SRJ-1011 state 3, SRJ-207: a message lost while P is held
 // on ErrInvalidFlags reports `cannot-launch`
 //
 // Through the recovery harness's lost-message driver, whose held-on-invalid-
@@ -1520,25 +1520,16 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
 // ===========================================================================
 
 describe('b.jg5 SRJ-1011 state 3, SRJ-207: a message lost while P is held on ErrInvalidFlags reports cannot launch, through the real routing', () => {
-  /** A finished row of P's in another directory, so P's next launch replaces it by a reuse spawn of the same id that answers ErrInvalidFlags. */
-  function scriptHeldReuse(h: RecoveryHarness, key: string): void {
-    h.script(collided(h, personaOf(h, key), { cwd: h.home, state: LIVENESS_DEAD_ROW_ENDED }, errInvalidFlags('spawn')))
-  }
-
   test('P held through a reuse: a lost message reports cannot launch with its wording; no restart is asked for, scheduled or launched, and no stub call is made for P', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [key] = h.keys as [string]
     h.versionRecheck()
-    scriptHeldReuse(h, key)
-    expect(await h.launch(key)).toEqual({ key, action: 'held' })
+    await holdThroughReuse(h, key)
     const before = personaCallCounts(h, key)
 
-    const outcome = await expectLostMessageReports(h, key, 'cannot-launch')
+    await expectLostMessageReports(h, key, 'cannot-launch')
 
-    expect(outcome.notice).toContain(STATE_WORDING['cannot-launch'])
-    expect(h.restartAsks).toEqual([])
-    expect(isRestartPendingOrActive(key)).toBe(false)
-    await Bun.sleep(FAST_DELAY_S * 1000 * 4)
+    await Bun.sleep(WAIT_MS) // a restart the message scheduled would have launched by now
     await h.settle()
     expect(personaCallCounts(h, key)).toEqual(before)
     expect(h.invalidFlagsHold.isHeld(key)).toBe(true)
@@ -1564,8 +1555,7 @@ describe('b.jg5 SRJ-1011 state 3, SRJ-207: a message lost while P is held on Err
   test('P latched and held: held for a human is reported, not cannot launch', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [key] = h.keys as [string]
-    scriptHeldReuse(h, key)
-    expect(await h.launch(key)).toEqual({ key, action: 'held' })
+    await holdThroughReuse(h, key)
     // A provenance_conflict note on P's own row, read by the session manager's shared own-row read, latches P.
     h.script({ getResult: personaRow(h, key, { liveness_note: provenanceNote }) })
     expect(await readPersonaOwnRow(key, { site: 'inbound-recovery-drop-branch.test', what: 'own-row get' })).toMatchObject({ latched: true })
@@ -1580,8 +1570,7 @@ describe('b.jg5 SRJ-1011 state 3, SRJ-207: a message lost while P is held on Err
     const h = makeRecovery()
     const [key] = h.keys as [string]
     const rc = h.versionRecheck()
-    scriptHeldReuse(h, key)
-    expect(await h.launch(key)).toEqual({ key, action: 'held' })
+    await holdThroughReuse(h, key)
     await expectLostMessageReports(h, key, 'cannot-launch')
 
     // The retry at once meets an UNAVAILABLE answer at its first spawn: refused, P's timer armed, P not up.
@@ -1592,8 +1581,8 @@ describe('b.jg5 SRJ-1011 state 3, SRJ-207: a message lost while P is held on Err
     expect(h.invalidFlagsHold.isHeld(key)).toBe(false)
     expect(h.retriesAtOnce.map((retry) => retry.key)).toEqual([key])
 
-    const outcome = await h.loseMessage(key)
-    expect(outcome.state).not.toBe('cannot-launch')
+    // P's retry timer runs on the UNAVAILABLE refusal: not answering.
+    await expectLostMessageReports(h, key, 'not-answering')
     h.teardown(key)
   })
 })

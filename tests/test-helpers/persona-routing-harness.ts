@@ -93,7 +93,7 @@
  *     harness's own launches are recorded fakes and start none); the
  *     `isLaunchOrApproverRunning` option replaces it;
  *   - held on `ErrInvalidFlags` (`cannot-launch`): `h.invalidFlagsHold`, one
- *     real hold built by E23's factory (`createInvalidFlagsHold`) bare, with
+ *     real hold built by the hold's factory (`createInvalidFlagsHold`) bare, with
  *     no set reaction, so a set (`h.invalidFlagsHold.set(key, version?)`)
  *     logs one line to `h.logs` and posts nothing; `forget(key)` is its
  *     silent end. The routing asks its `isHeld`, as `main()` binds it
@@ -330,7 +330,7 @@ export const LOST_STATE_SETUPS: Readonly<Record<LostMessageState, LostStateSetup
     pending: false,
     launches: 0,
   },
-  // E23's set, as a reuse spawn's ErrInvalidFlags whose re-check passed sets it.
+  // The hold's set, as a reuse spawn's ErrInvalidFlags whose re-check passed sets it (SRJ-207).
   'cannot-launch': {
     opts: {},
     arrange: (h, key) => {
@@ -718,7 +718,7 @@ export interface RoutingHarness {
   tmuxUnresponsive: TmuxUnresponsiveCondition
   /** Every onset or all-clear the outage state emitted (with the `outageState` option), in order; never a Slack post. */
   outageNotices: RaisedNotice[]
-  /** The hold the routing's held-on-invalid-flags query reads (`cannot-launch`): E23's factory, bare (no set reaction, so a set posts nothing). */
+  /** The hold the routing's held-on-invalid-flags query reads (`cannot-launch`): the hold's factory, bare (no set reaction, so a set posts nothing). */
   invalidFlagsHold: InvalidFlagsHold
   /** Keys whose kill failed (`kill-failed`), read at call time. */
   killFailed: Set<string>

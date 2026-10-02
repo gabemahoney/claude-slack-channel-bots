@@ -774,14 +774,27 @@ function phase1OnlyError(name: Phase1OnlyErrName, verb: string, description: str
  * (default verb `resume`; `status` only reads the store and never returns
  * it). The default description is a call timeout that did nothing; pass
  * `description` for another. See `errTmuxUnresponsiveLaunchTimeout`,
- * `errTmuxUnresponsiveStillStopping` and `errTmuxUnresponsiveStillStarting`
- * for the variants CSCB tells apart.
+ * `errTmuxUnresponsiveStillStopping`, `errTmuxUnresponsiveStillStarting`
+ * and `errTmuxUnresponsiveAfterDuplicateSession` for the variants.
  */
 export function errTmuxUnresponsive(
   verb: string = 'resume',
   description: string = 'tmux display-message did not answer within 5 s; nothing was done; retry later',
 ): AgentDirectorError {
   return phase1OnlyError(ERR_TMUX_UNRESPONSIVE_NAME, verb, description)
+}
+
+/**
+ * Build an `ErrTmuxUnresponsive` (by name) met after tmux answered
+ * "duplicate session": the session holding the name could not be read, so
+ * nothing was started (default verb `resume`).
+ */
+export function errTmuxUnresponsiveAfterDuplicateSession(verb: string = 'resume'): AgentDirectorError {
+  return phase1OnlyError(
+    ERR_TMUX_UNRESPONSIVE_NAME,
+    verb,
+    'tmux new-session answered duplicate session and the session holding the name could not be read; nothing was started',
+  )
 }
 
 /**

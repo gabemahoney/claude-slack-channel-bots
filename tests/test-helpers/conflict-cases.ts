@@ -158,21 +158,20 @@
  * ({@link REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS}). The stuck-launch abort's
  * kill rows (E29) are still to come, with the re-check columns (E30).
  *
- * The `resume` rows (E13; E23 adds HO rev 15's and rev 20's forms; b.jg5
- * SRJ-113, SRJ-501, SRJ-507): the site kind `resume`, each refusing the
- * `resume` (`REFUSED_OPERATION_RESUME`) and recording `ended`, the state the
- * finished-row path last read, or unreadable for unrecognised text. E23 adds
- * "another agent-director store" in its "duplicate session" form (the stub's
- * `plainSpawn` extras) beside its plain form; "conflicting labels" is a
- * duplicate label's, its "duplicate session" form (the scan's form is a
- * plain spawn's only). The same rows at the live-row sequence's step-6
- * `resume` (E21, E23): the site kind {@link SEQUENCE_RESUME_SITE}, for each
+ * The `resume` rows (b.jg5 SRJ-113, SRJ-501, SRJ-507; HO rev 15, rev 20):
+ * the site kind `resume`, each refusing the `resume`
+ * (`REFUSED_OPERATION_RESUME`) and recording `ended`, the state the
+ * finished-row path last read, or unreadable for unrecognised text.
+ * "another agent-director store" is there in its "duplicate session" form
+ * (the stub's `plainSpawn` extras) beside its plain form; "conflicting
+ * labels" is a duplicate label's, its "duplicate session" form (the scan's
+ * form is a plain spawn's only). The same rows at the live-row sequence's
+ * step-6 `resume`: the site kind {@link SEQUENCE_RESUME_SITE}, for each
  * state the sequence's last `get` read before it
  * ({@link SEQUENCE_RESUME_ROW_STATES}: `ended`, `missing`), recording that
  * state ({@link SEQUENCE_RESUME_CONFLICT_CASE_ROWS},
  * {@link sequenceResumeConflictRowsAt}; not in {@link CONFLICT_CASE_ROWS},
- * since only the recorded state differs). E30 still adds the re-check
- * columns (SRJ-505).
+ * since only the recorded state differs).
  *
  * Other exports (E13 T2):
  *   - {@link expectedConflictNotice}: the expected notice for any case,
@@ -550,7 +549,7 @@ export const SEQUENCE_STEP4_KILL_SITE = 'sequence step-4 kill'
 /**
  * The live-row sequence's step-6 `resume` as a site kind: the sequence-launch
  * entry's `resume` leg (`launchForLiveRowSequence`; b.jg5 SRJ-705 step 6,
- * SRJ-113; E21, E23).
+ * SRJ-113).
  */
 export const SEQUENCE_RESUME_SITE = 'sequence resume'
 
@@ -1101,14 +1100,14 @@ const REUSE_SPAWN_ROWS: readonly ConflictCaseRow[] = [
 ]
 
 /**
- * The `resume` CONFLICT rows (E13; b.jg5 SRJ-113, SRJ-501; HO rev 15, rev
- * 20): a `resume` on the finished-row path records `ended`, the state its
- * path last read; unrecognised text records unreadable, where the path could
- * not read the row's state. "another agent-director store" in both its forms
+ * The `resume` CONFLICT rows (b.jg5 SRJ-113, SRJ-501; HO rev 15, rev 20):
+ * a `resume` on the finished-row path records `ended`, the state its path
+ * last read; unrecognised text records unreadable, where the path could not
+ * read the row's state. "another agent-director store" in both its forms
  * (plain, and with the stub's "duplicate session" extras, its `plainSpawn`
  * option), and "conflicting labels" in its "duplicate session" form (a
  * duplicate label; the scan's form is a plain spawn's only, since a `resume`
- * makes no pre-spawn scan) (E23).
+ * makes no pre-spawn scan).
  */
 const RESUME_ROWS: readonly ConflictCaseRow[] = [
   resume('no-valid-id', LATCH_CASE_NO_VALID_ID, ENDED),
@@ -1136,8 +1135,8 @@ export const SEQUENCE_RESUME_ROW_STATES: Readonly<Record<SequenceResumeLastRead,
 })
 
 /**
- * The live-row sequence's step-6 `resume` CONFLICT rows (E21, E23; b.jg5
- * SRJ-113, SRJ-501, SRJ-705): for each state in
+ * The live-row sequence's step-6 `resume` CONFLICT rows (b.jg5 SRJ-113,
+ * SRJ-501, SRJ-705): for each state in
  * {@link SEQUENCE_RESUME_ROW_STATES}, one row per `resume` row (the same
  * case, option set and latch case), each refusing the `resume` and
  * recording the state the sequence's last `get` read, named

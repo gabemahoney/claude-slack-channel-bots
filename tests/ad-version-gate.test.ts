@@ -1209,7 +1209,8 @@ describe('runtime re-check: version-changed signal', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Runtime re-check: the module-level trigger and signal (E4 and E23 use them)
+// Runtime re-check: the module-level trigger and signal (the ErrInvalidFlags
+// step's immediate re-check and the hold's version-change reaction use them)
 // ---------------------------------------------------------------------------
 
 describe('runtime re-check: module-level trigger and version-changed registration', () => {
@@ -1474,25 +1475,111 @@ describe('the ErrInvalidFlags hold episode (b.jg5 SRJ-207, SRJ-1008, SRJ-1016, S
     expect(rig.clock.pendingCount()).toBe(0)
   })
 
-  test('a timer stop that throws is logged token-safely and the alert is still posted once', async () => {
+  /** A step of the hold or its reactions that a case makes fail for P. */
+  type FailingStep = 'stop' | 'alert' | 'episode end' | 'retry' | 'set observer' | 'end observer'
+
+  // Each step is isolated: one that throws or rejects for P is logged once,
+  // described and redacted, and P's other steps and Q's all still run.
+  test.each<[string, FailingStep, 'throws' | 'rejects', string]>([
+    ['the retry timer stop throws', 'stop', 'throws', 'retry timer stop'],
+    ['the alert step throws', 'alert', 'throws', 'alert'],
+    ['ending its hold episode on a version change throws', 'episode end', 'throws', 'ending its hold episode'],
+    ['its retry at once throws', 'retry', 'throws', 'its retry'],
+    ['its retry at once rejects', 'retry', 'rejects', 'its retry'],
+    ['a set observer throws', 'set observer', 'throws', 'set observer'],
+    ['a set observer rejects', 'set observer', 'rejects', 'set observer'],
+    ['an end observer throws', 'end observer', 'throws', 'end observer'],
+    ['an end observer rejects', 'end observer', 'rejects', 'end observer'],
+  ])('for P, %s: one line naming that step, redacted; P\'s other steps and Q\'s set, alert, end and retry still run', async (_label, step, how, what) => {
     const clock = createFakeClock()
-    const posts: Array<{ key: string; text: string }> = []
     const lines: string[] = []
-    const episodes = createPersonaEpisodes({ sink: (key, text) => { posts.push({ key, text }) }, log: (line) => { lines.push(line) }, clock })
-    const hold = createInvalidFlagsHold({ log: (line) => { lines.push(line) } })
+    const posts: Array<{ key: string; text: string }> = []
+    const stops: string[] = []
+    const retries: string[] = []
+    const log = (line: string): void => {
+      lines.push(line)
+    }
+    const err = Object.assign(new Error(`${what} broke (${sentinelInMessage('hold-step')})`), { note: LEAK_SENTINEL })
+    /** P's `at` step fails as the case says; every other step, and every step of Q, does not. */
+    const fail = (key: string, at: FailingStep): Promise<void> | undefined => {
+      if (key !== HELD_P || at !== step) return undefined
+      if (how === 'rejects') return Promise.reject(err)
+      throw err
+    }
+    const episodes = createPersonaEpisodes({ sink: (key, text) => { posts.push({ key, text }) }, log, clock })
+    const hold = createInvalidFlagsHold({ log })
+    hold.addSetObserver(({ key }) => fail(key, 'set observer'))
+    hold.addEndObserver(({ key }) => fail(key, 'end observer'))
     bindInvalidFlagsHoldSetReaction(hold, {
-      stopRetryTimer: () => {
-        throw new Error(`stop broke (${sentinelInMessage('hold-stop')})`)
+      stopRetryTimer: (key) => {
+        stops.push(key)
+        fail(key, 'stop')
       },
-      episodes,
-      log: (line) => { lines.push(line) },
+      episodes: {
+        begin: (key, kind) => episodes.begin(key, kind),
+        post: (key, kind, text) => {
+          fail(key, 'alert')
+          return episodes.post(key, kind, text)
+        },
+      },
+      log,
     })
+
     hold.set(HELD_P, BASELINE_VERSION)
+    hold.set(HELD_Q, BASELINE_VERSION)
+    const ended = endInvalidFlagsHoldsOnVersionChange(hold, LATER_PATCH, {
+      episodes: {
+        end: (key, kind) => {
+          fail(key, 'episode end')
+          return episodes.end(key, kind)
+        },
+      },
+      isApplied: () => true,
+      retryAtOnce: (key) => {
+        retries.push(key)
+        return fail(key, 'retry')
+      },
+      log,
+    })
     await clock.flush()
-    expect(posts).toEqual([alertOf(HELD_P)])
-    expect(lines.filter((line) => line.startsWith(`${INVALID_FLAGS_HOLD_LOG_PREFIX} persona=${HELD_P} retry timer stop failed: `))).toHaveLength(1)
-    assertNoLeak(lines, 'lines')
+
+    const failed = lines.filter((line) => line.includes(' failed: '))
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toStartWith(`${INVALID_FLAGS_HOLD_LOG_PREFIX} persona=${HELD_P} ${what} failed: Error message="${what} broke (${REDACTED_SENTINEL_TAIL})" at `)
+    expect([ended, hold.heldKeys(), stops, retries]).toEqual([[HELD_P, HELD_Q], [], [HELD_P, HELD_Q], [HELD_P, HELD_Q]])
+    expect(posts).toEqual(step === 'alert' ? [alertOf(HELD_Q)] : [alertOf(HELD_P), alertOf(HELD_Q)])
+    for (const key of [HELD_P, HELD_Q]) {
+      expect(lines.filter((line) => line === invalidFlagsHoldEndLine(key, BASELINE_VERSION, LATER_PATCH))).toHaveLength(1)
+      expect(lines.filter((line) => line === invalidFlagsHoldRetryLine(key, true))).toHaveLength(1)
+    }
+    expect([episodes.isOpen(HELD_P, PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD), episodes.isOpen(HELD_Q, PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD)]).toEqual([step === 'episode end', false])
+    assertNoLeak({ lines, posts })
     expect(clock.pendingCount()).toBe(0)
+  })
+
+  test('a version change whose ending of the holds throws: one line naming it, redacted; nothing ends, so nothing is retried', () => {
+    const lines: string[] = []
+    const retries: string[] = []
+    const failing = {
+      versionChanged: (): string[] => {
+        throw Object.assign(new Error(`versionChanged broke (${sentinelInMessage('hold-change')})`), { note: LEAK_SENTINEL })
+      },
+    }
+
+    const ended = endInvalidFlagsHoldsOnVersionChange(failing, LATER_PATCH, {
+      episodes: { end: () => false },
+      isApplied: () => true,
+      retryAtOnce: (key) => {
+        retries.push(key)
+      },
+      log: (line) => {
+        lines.push(line)
+      },
+    })
+
+    expect([ended, retries, lines.length]).toEqual([[], [], 1])
+    expect(lines[0]).toStartWith(`${INVALID_FLAGS_HOLD_LOG_PREFIX} ending the holds on a version change failed: Error message="versionChanged broke (${REDACTED_SENTINEL_TAIL})" at `)
+    assertNoLeak(lines, 'lines')
   })
 
   test('a version that is not a short version string is logged as unreadable, so no other text reaches a line', () => {
@@ -1563,15 +1650,15 @@ describe('the ErrInvalidFlags hold ends on the version-changed signal (b.jg5 SRJ
     const rig = makeHoldRig()
     expect(await holdAsAReuseDoes(rig, HELD_P)).toEqual({ kind: INVALID_FLAGS_HOLD_DECISION_HOLD })
     expect(rig.hold.beganUnder(HELD_P)).toBeUndefined()
-    const clock = createFakeClock()
-    installAdVersionRecheck(installDeps(clock, [], [], [{ version: BASELINE_VERSION }, { version: LATER_PATCH }]))
-    await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    // The re-check installed afterwards, on the rig's clock.
+    installAdVersionRecheck(installDeps(rig.clock, [], [], [{ version: BASELINE_VERSION }, { version: LATER_PATCH }]))
+    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     expect(rig.hold.isHeld(HELD_P)).toBe(true)
-    await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+    await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     expect(rig.hold.isHeld(HELD_P)).toBe(false)
     expect(rig.lines.filter((line) => line === invalidFlagsHoldEndLine(HELD_P, undefined, LATER_PATCH))).toHaveLength(1)
     expect(rig.retries).toHaveLength(1)
-    expectOnlyTheRecheckPending(rig, false)
+    expectOnlyTheRecheckPending(rig, true)
   })
 
   test('a persona no longer applied is not retried when its hold ends; one line says so', async () => {
@@ -1614,14 +1701,20 @@ describe('the ErrInvalidFlags hold\'s other ends (b.jg5 SRJ-207, SRJ-715): a tea
     expect(rig.clock.pendingCount()).toBe(0)
   })
 
-  test('forgetAll (shutdown) ends every hold silently; a new hold instance (a server restart) holds no persona', () => {
+  test('forgetAll (shutdown) ends every hold silently: no end or retry line, and no retry', async () => {
     const rig = makeHoldRig()
     rig.hold.set(HELD_P, BASELINE_VERSION)
     rig.hold.set(HELD_Q)
+    await rig.clock.flush()
+    const before = rig.lines.length
+
     expect(rig.hold.forgetAll()).toEqual([HELD_P, HELD_Q])
+    await rig.clock.flush()
+
     expect(rig.hold.heldKeys()).toEqual([])
-    const restarted = createInvalidFlagsHold({ log: () => {} })
-    expect([restarted.heldKeys(), restarted.isHeld(HELD_P), restarted.isHeld(HELD_Q)]).toEqual([[], false, false])
+    // Only the two forget lines: no end line and no retry line.
+    expect(rig.lines.slice(before)).toEqual([invalidFlagsHoldForgetLine(HELD_P, BASELINE_VERSION), invalidFlagsHoldForgetLine(HELD_Q, undefined)])
+    expect(rig.retries).toEqual([])
     expect(rig.clock.pendingCount()).toBe(0)
   })
 })

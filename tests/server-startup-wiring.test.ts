@@ -3700,7 +3700,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     expect(props.get(LAUNCH_RUNNING)).not.toContain(SEQUENCE_RUNNING)
   })
 
-  // b.jg5 SRJ-1011 state 3, SRJ-207 (E23): P is held on ErrInvalidFlags. The
+  // b.jg5 SRJ-1011 state 3, SRJ-207: P is held on ErrInvalidFlags. The
   // hold is built in main() (pinned in the hold's describe above); the
   // routing reads it through a holder assigned that one instance, never a
   // second one or a copy. Shutdown's forget-all of every hold reads the same
