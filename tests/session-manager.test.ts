@@ -46,6 +46,8 @@ import {
   _resetTmuxSessionKiller,
   _setTmuxServerEnsurer,
   _resetTmuxServerEnsurer,
+  _setTmuxSessionProbe,
+  _resetTmuxSessionProbe,
   _setTmuxCapturePane,
   _setTmuxSendEnter,
   _resetTmuxDialogHelpers,
@@ -119,6 +121,9 @@ beforeEach(() => {
   // out to real tmux (b.vub). Dead-row tests override these to drive behavior.
   _setTmuxCapturePane(async () => '')
   _setTmuxSendEnter(async () => {})
+  // Default the stale-row probe to "the tmux session is there" so live-state
+  // tests exercise reconnect/no-op. Stale-row tests override this.
+  _setTmuxSessionProbe(async () => true)
 })
 
 afterEach(() => {
@@ -128,6 +133,7 @@ afterEach(() => {
   _resetWaitForWaitingTimeoutMs()
   _resetTmuxSessionKiller()
   _resetTmuxServerEnsurer()
+  _resetTmuxSessionProbe()
   _resetTmuxDialogHelpers()
   _resetDialogDeadGracePolls()
   _resetOutageState()
@@ -269,6 +275,98 @@ describe('spawnForRoute: SR-1.4 collision-then-act', () => {
     expect(resumeCalls).toHaveLength(0)
     expect(killCalls).toHaveLength(1)
     expect(deleteCalls).toHaveLength(1)
+  })
+
+  // -------------------------------------------------------------------------
+  // Stale-AD-row self-heal: AD claims a live state but the tmux session is gone
+  // (post-reboot). AD's own find-missing cannot reconcile this, so CSCB must.
+  // -------------------------------------------------------------------------
+
+  for (const state of ['waiting', 'working', 'check_permission', 'ask_user']) {
+    test(`${state} state + tmux session absent → kill + delete + fresh spawn`, async () => {
+      const spawnCalls: import('agent-director').SpawnParams[] = []
+      const killCalls: import('agent-director').KillParams[] = []
+      const deleteCalls: import('agent-director').DeleteParams[] = []
+      const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+      const resumeCalls: import('agent-director').ResumeParams[] = []
+      const probed: string[] = []
+      _setTmuxSessionProbe(async (name) => { probed.push(name); return false })
+      installStub({
+        spawnCalls,
+        killCalls,
+        deleteCalls,
+        sendKeysCalls,
+        resumeCalls,
+        spawnQueue: [
+          cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+          cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        ],
+        getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state }),
+      })
+      const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+      const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+      expect(result.action).toBe('spawned')
+      // probed the deterministic per-channel session name
+      expect(probed).toEqual([tmuxSessionNameFor('C')])
+      // stale row reaped, fresh spawn issued
+      expect(killCalls).toHaveLength(1)
+      expect(deleteCalls).toHaveLength(1)
+      expect(deleteCalls[0].claude_instance_id).toEqual(['cscb_C'])
+      expect(spawnCalls).toHaveLength(2)
+      // never tried to talk to the dead pane, never tried an impossible resume
+      expect(sendKeysCalls).toHaveLength(0)
+      expect(resumeCalls).toHaveLength(0)
+    })
+  }
+
+  test('pending state + tmux session absent → NOT treated as stale (spawn race)', async () => {
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    _setTmuxSessionProbe(async () => false)
+    installStub({
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'pending' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('no-op')
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  test('terminal state + tmux session absent → still resumes (stale-row path not taken)', async () => {
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    _setTmuxSessionProbe(async () => false)
+    installStub({
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('resumed')
+    expect(resumeCalls).toHaveLength(1)
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  test('probe failure is fail-safe: reports exists → reconnect, no delete', async () => {
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    // defaultTmuxSessionExists resolves true when tmux cannot be probed at all
+    _setTmuxSessionProbe(async () => true)
+    installStub({
+      deleteCalls,
+      sendKeysCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('reconnected')
+    expect(deleteCalls).toHaveLength(0)
+    expect(sendKeysCalls).toHaveLength(1)
   })
 
   test('waiting state → reconnectMcp (sendKeys with /mcp reconnect)', async () => {

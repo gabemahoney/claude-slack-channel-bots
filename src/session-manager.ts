@@ -696,6 +696,56 @@ let _killTmuxSession: TmuxSessionKiller = async (sessionName: string): Promise<v
   })
 }
 
+/**
+ * Probe whether a tmux session with the exact given name exists. Injectable
+ * seam so unit tests can assert the stale-row path without spawning real
+ * processes. Default impl runs `tmux has-session -t=<name>` (the `=` prefix
+ * forces an exact-name match rather than tmux's default prefix match).
+ *
+ * Fails SAFE: if the probe cannot be run at all (tmux binary missing, spawn
+ * throws), it reports `true` ("assume the session is there"). A broken probe
+ * must never be read as "every session is dead" — that would delete live AD
+ * rows. Only a clean non-zero exit from tmux itself counts as "absent".
+ */
+export type TmuxSessionProbe = (sessionName: string) => Promise<boolean>
+
+const defaultTmuxSessionExists: TmuxSessionProbe = async (sessionName: string): Promise<boolean> => {
+  const { spawn } = await import('child_process')
+  return new Promise<boolean>((resolve) => {
+    try {
+      const child = spawn('tmux', ['has-session', '-t=' + sessionName], { stdio: 'ignore' })
+      child.on('error', () => resolve(true)) // tmux missing — fail safe
+      child.on('close', (code) => resolve(code === 0))
+    } catch {
+      resolve(true) // fail safe
+    }
+  })
+}
+
+let _tmuxSessionExists: TmuxSessionProbe = defaultTmuxSessionExists
+
+/** Test-only seam: override the tmux-session probe. */
+export function _setTmuxSessionProbe(fn: TmuxSessionProbe): void {
+  _tmuxSessionExists = fn
+}
+
+/** Test-only seam: restore the default tmux-session probe. */
+export function _resetTmuxSessionProbe(): void {
+  _tmuxSessionExists = defaultTmuxSessionExists
+}
+
+/**
+ * AD states that assert a live tmux pane. `pending` is deliberately excluded:
+ * a just-spawned row legitimately races ahead of its tmux session appearing,
+ * and treating that race as a stale row would delete a healthy spawn.
+ */
+const LIVE_AD_STATES: ReadonlySet<string> = new Set([
+  'waiting',
+  'working',
+  'check_permission',
+  'ask_user',
+])
+
 /** Test-only seam: override the tmux-session killer. */
 export function _setTmuxSessionKiller(fn: TmuxSessionKiller): void {
   _killTmuxSession = fn
@@ -879,6 +929,57 @@ export async function spawnForRoute(
   }
 
   console.error(`[slack] spawnForRoute: collision resolved, state=${state} for channel=${channelId}`)
+
+  // Stale-AD-row self-heal: trust tmux over the AD row.
+  //
+  // A host reboot wipes every tmux session while AD's rows stay `waiting` /
+  // `working`, and AD's own `find-missing` refuses to reconcile in exactly
+  // that situation — its /proc probe returns 0 ids and the degraded-mode guard
+  // treats a legitimately empty process table as a broken probe ("refusing to
+  // sweep — probe returned 0 ids but N live row(s) exist"). There is no
+  // --force. CSCB then reconnects into a session that no longer exists and
+  // every startup fails with ErrTmuxSendKeys ("no server running") until an
+  // operator deletes the rows by hand.
+  //
+  // `tmux start-server` (the earlier b.rmy self-heal in reconnectMcp) cannot
+  // fix this: it creates an empty server, so the *session* is still absent and
+  // send-keys still fails.
+  //
+  // Resume is not available here — AD rejects `resume` on a non-terminal row —
+  // so the only recovery is kill + delete + fresh spawn.
+  if (LIVE_AD_STATES.has(state) && !(await _tmuxSessionExists(tmuxSessionNameFor(channelId, normalizedName)))) {
+    console.error(
+      `[slack] spawnForRoute: AD state=${state} but tmux session absent for channel=${channelId} — stale row, kill+delete+fresh`,
+    )
+    if (isStartup) {
+      recordStartupError(
+        'stale-ad-row',
+        `AD row for channel=${channelId} claimed state=${state} with no tmux session — reconciled by kill+delete+fresh spawn`,
+      )
+    }
+    await tryKill(channelId, normalizedName)
+    if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
+    try {
+      await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
+      console.error(`[slack] spawnForRoute: fresh-spawned (stale AD row) for channel=${channelId}`)
+      await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
+      return { channelId, action: 'spawned' }
+    } catch (err) {
+      if (
+        err instanceof ErrSystemInstallDisappeared ||
+        err instanceof ErrTmuxNotAvailable ||
+        err instanceof ErrCwdNotFound ||
+        err instanceof ErrCwdNotADirectory
+      ) {
+        return { channelId, action: 'failed' }
+      }
+      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
+      console.error(`[slack] spawnForRoute: fresh spawn after stale-row cleanup failed for channel=${channelId}: ${e.errName}`)
+      if (isStartup) recordStartupError('spawn-failed', `fresh spawn after stale-row cleanup failed for channel=${channelId}: ${e.errName}`, e)
+      postSpawnFailureToChannel(channelId, e, web, isStartup)
+      return { channelId, action: 'failed' }
+    }
+  }
 
   if (state === 'ended' || state === 'missing') {
     if (routingConfig.resume_enabled === false) {
