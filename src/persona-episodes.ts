@@ -19,6 +19,9 @@
  *   once per mark in the open episode, and never when none is open. A kind
  *   with one text uses the default mark; a kind with two texts (stuck
  *   launch) gives each its own mark, so each posts at most once.
+ * - `postWithoutEpisode(key, kind, text)` hands `text` to the notice sink
+ *   with no episode read or changed (the kill-failure alert's survivor
+ *   version, posted once per bounded retry); never after `close`.
  * - `end(key, kind)` ends the open episode silently: a later `begin` opens a
  *   new one, whose post is made again.
  * - `forget(key)` ends every kind's episode of one persona silently (its
@@ -54,7 +57,9 @@
  * the persona's open episodes of the other latch kinds silently;
  * `slow-dead-session-recovery`'s by the slow-recovery tracker
  * (`createSlowRecoveryTracker`, `src/slow-recovery.ts`), which keeps its
- * count here and posts SRJ-1010 once per episode;
+ * count here and posts SRJ-1010 once per episode; `kill-failure`'s by the
+ * kill-failure alerts (below), which post the ordinary version once per
+ * episode and the survivor version with no episode;
  * every other kind has no poster yet: its begin and end triggers and text
  * come with the Epic that posts it, named on its label below.
  *
@@ -265,9 +270,19 @@ import {
   type AdVerb,
 } from './ad-error-class.ts'
 import { armNeverEarlyWait, wholeMinutes } from './ad-settings.ts'
+import {
+  KILL_FAILURE_VERSION_ORDINARY,
+  describeKillFailureDescriptions,
+  killFailureAlertContentOf,
+  killFailureAlertEntryText,
+  killFailureAlertText,
+  selectKillFailureAlertRoute,
+  type KillFailureAlertContext,
+} from './kill-failure-alert.ts'
+import type { KillRetryAlert } from './kill-retry.ts'
 import { describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
-import { personaTmuxSessionName } from './persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName } from './persona-identity.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 import {
   UNAVAILABLE_RETRY_STOP_RECOVERED,
@@ -314,9 +329,16 @@ export const PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME = 'unusable-recorded-na
 export const PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED = 'launch-start-not-recorded'
 
 /**
- * Kill failure (SRJ-704): from its ordinary version's alert until the row
- * reads `ended` or `missing`, or the persona is torn down. The survivor
- * version opens no episode. No poster yet (b.jg5 E20).
+ * Kill failure (SRJ-704, SRJ-1016): from its ordinary version's alert until
+ * the row reads `ended` or `missing`, or is gone (`ErrSpawnNotFound`), or the
+ * persona is torn down. A later kill that succeeds while the row stays live
+ * does not end it. Posted by the kill-failure alerts
+ * (`createKillFailureAlerts`, below): the ordinary version at a configured
+ * persona's destination begins it and posts once in it; the survivor version
+ * opens no episode, is posted once per bounded retry and is not held back by
+ * an open one. The session manager's own-row reads end it
+ * (`src/session-manager.ts`); a teardown's `forget` and shutdown's `close`
+ * drop it.
  */
 export const PERSONA_EPISODE_KIND_KILL_FAILURE = 'kill-failure'
 
@@ -449,6 +471,13 @@ export interface PersonaEpisodes {
    * over; false when no episode is open or the mark was already posted in it.
    */
   post(key: string, kind: PersonaEpisodeKind, text: string, mark?: string): boolean
+  /**
+   * Hand `text` to the sink for a notice of this kind that has no episode
+   * (the kill-failure alert's survivor version, b.jg5 SRJ-704): no episode is
+   * read, begun or changed. Returns true when it was handed over; false after
+   * `close`.
+   */
+  postWithoutEpisode(key: string, kind: PersonaEpisodeKind, text: string): boolean
   /** Whether this mark (`PERSONA_EPISODE_DEFAULT_MARK` when none is given) was posted in the open episode. */
   hasPosted(key: string, kind: PersonaEpisodeKind, mark?: string): boolean
   /** End the open episode silently. Returns whether one was open. */
@@ -591,6 +620,12 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
       if (current === undefined || current.posted.has(mark)) return false
       // Marked before the sink runs, so a sink that re-enters posts nothing twice.
       current.posted.add(mark)
+      send(key, kind, text)
+      return true
+    },
+
+    postWithoutEpisode(key, kind, text) {
+      if (closed) return false
       send(key, kind, text)
       return true
     },
@@ -1441,6 +1476,227 @@ export function createUnclassifiedErrorEpisodes(deps: UnclassifiedErrorEpisodesD
       }
       if (stopReason === UNAVAILABLE_RETRY_STOP_ROW_GONE) return end(key, UNCLASSIFIED_ERROR_END_ROW_GONE)
       return false
+    },
+
+    isOpen: (key) => episodes.isOpen(key, kind),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)
+// ---------------------------------------------------------------------------
+
+/** End reason: a read of the persona's own row read it `ended` or `missing` (b.jg5 SRJ-704, SRJ-1016). */
+export const KILL_FAILURE_END_ROW_FINISHED = 'its own row read ended or missing'
+
+/** End reason: a read of the persona's own row found it gone (`ErrSpawnNotFound`; b.jg5 SRJ-704, SRJ-1016). */
+export const KILL_FAILURE_END_ROW_GONE = 'its own row is gone (ErrSpawnNotFound)'
+
+/** Why a kill-failure episode ended (a teardown's `forget` and shutdown's `close` drop it with no line). */
+export type KillFailureEndReason = typeof KILL_FAILURE_END_ROW_FINISHED | typeof KILL_FAILURE_END_ROW_GONE
+
+/**
+ * What raising an alert did:
+ *   - `posted`: handed to the persona's destination (the ordinary version
+ *     beginning its episode, or the survivor version with none);
+ *   - `held`: the ordinary version at a destination whose episode has
+ *     already posted it, so nothing is posted;
+ *   - `logged`: written through the log-only route (one entry of the route's
+ *     class, whose writer also writes the server-log line);
+ *   - `not-routed`: a log-only route with no log-only sink installed, or one
+ *     that threw (one line says so);
+ *   - `closed`: after the episodes' `close` (shutdown), nothing is posted;
+ *   - `stopped`: the ordinary version for a configured persona whose tries
+ *     the keep-going check stopped (`KillFailureRaiseInput.stopped`): one
+ *     line, nothing posted and no episode;
+ *   - `none`: the decision called for no alert.
+ */
+export type KillFailureRaiseResult = 'posted' | 'held' | 'logged' | 'not-routed' | 'closed' | 'stopped' | 'none'
+
+/** What a raise is given. */
+export interface KillFailureRaiseInput {
+  /** The persona key the killed row belongs to. */
+  readonly key: string
+  /** The bounded retry's alert decision (`KillRetryResult.alert`, `src/kill-retry.ts`); its descriptions raw. */
+  readonly decision: KillRetryAlert
+  /**
+   * Whether the persona is latched now: by the retry's last outcome (after
+   * that outcome's own handling) or by a `status` read between its tries
+   * (b.jg5 SRJ-702; hatch A2). Read only for the ordinary version at a
+   * destination, whose closing sentence it picks.
+   */
+  readonly latched: boolean
+  /** Where it was raised (`src/kill-failure-alert.ts`'s contexts). */
+  readonly context: KillFailureAlertContext
+  /**
+   * True when the retry's tries were stopped by its keep-going check while
+   * the persona was not latched (it is torn down or not up, or the server is
+   * shutting down), or the last outcome's version re-check decided that the
+   * server stops: nothing retries the kill, so an ordinary version at a
+   * destination, which says CSCB keeps retrying, is not posted; one line
+   * carries the decision and the redacted descriptions, and no episode is
+   * opened (b.jg5 SRJ-702, SRJ-301). A log-only route is written as usual.
+   */
+  readonly stopped?: boolean
+  /** The session the alert names, unquoted; `slack_bot_<key>` when absent. */
+  readonly session?: string
+  /** The row's instance id; `cscb_<key>` when absent. */
+  readonly instanceId?: string
+}
+
+/** Dependencies of `createKillFailureAlerts`. */
+export interface KillFailureAlertsDeps {
+  /** The episodes instance whose `kill-failure` episode is the persona's; its sink posts the destination route. */
+  episodes: PersonaEpisodes
+  /** Receives the alerts' `[slack]` lines (the server log). A throwing log is swallowed. */
+  log: (line: string) => void
+  /**
+   * Whether the persona is in the applied configuration, read when the alert
+   * is raised (production: the applied configuration in effect). Absent:
+   * every key is configured. A throw takes the log-only route.
+   */
+  isConfigured?: (key: string) => boolean
+  /**
+   * The log-only route (production: `recordStartupError(classLabel, entry)`,
+   * which writes the server-log line and the startup-errors entry). Given
+   * the route's class and the entry (`killFailureAlertEntryText`: the
+   * persona reference, the context and the unescaped text). Never posts to
+   * Slack. Absent: one line says the alert had no route.
+   */
+  logOnly?: (classLabel: string, entry: string) => void
+}
+
+/** One server's kill-failure alerts. */
+export interface KillFailureAlerts {
+  /**
+   * Raise the alert the retry's decision calls for (b.jg5 SRJ-704), on the
+   * route `selectKillFailureAlertRoute` gives for the context, whether the
+   * persona is configured now and `latched`:
+   *   - ordinary, at a destination: begins the persona's kill-failure
+   *     episode when none is open and posts the text once in it (a later
+   *     raise in the same episode posts nothing);
+   *   - survivor, at a destination: posts the text once for this call, with
+   *     no episode read or changed;
+   *   - either, on a log-only route: one entry of the route's class through
+   *     the log-only sink, and no episode;
+   *   - ordinary with `stopped`, at a destination: one line, nothing posted
+   *     and no episode.
+   * A `none` decision does nothing. Never throws.
+   */
+  raise(input: KillFailureRaiseInput): KillFailureRaiseResult
+  /** End persona `key`'s open kill-failure episode silently, with one ended line. Answers whether one was open. */
+  end(key: string, reason: KillFailureEndReason): boolean
+  /** Whether persona `key`'s kill-failure episode is open (lost-message state 4, b.jg5 SRJ-1011). */
+  isOpen(key: string): boolean
+}
+
+/**
+ * Build one server's kill-failure alerts over `deps.episodes` (b.jg5
+ * SRJ-704, SRJ-1007, SRJ-1016). No timer, no agent-director call; nothing is
+ * read, posted or logged at creation.
+ *
+ * Log lines, to the injected log (a throwing log is swallowed):
+ *
+ *   [slack] persona-episodes: persona=<key> kill-failure ordinary alert posted to its destination (<context>; <closing>)
+ *   [slack] persona-episodes: persona=<key> kill-failure ordinary alert not posted — its episode's alert already posted
+ *   [slack] persona-episodes: persona=<key> kill-failure survivor alert posted to its destination (<context>)
+ *   [slack] persona-episodes: persona=<key> kill-failure <version> alert written to the server log and startup-errors.log (<class>) — <route>
+ *   [slack] persona-episodes: persona=<key> kill-failure ordinary alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; <descriptions> (<context>)
+ *   [slack] persona-episodes: persona=<key> kill-failure ended — <reason>
+ *
+ * and, only on a failure or a missing route: `configured-key lookup failed:
+ * <error> — the alert takes the log-only route`, `<version> alert not routed
+ * — no log-only route is installed`, `<version> log-only alert failed:
+ * <error>`, `<version> alert not posted — the episodes are closed` and
+ * `raise failed: <error>` (each after `persona=<key> kill-failure`).
+ */
+export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailureAlerts {
+  const kind = PERSONA_EPISODE_KIND_KILL_FAILURE
+  const { episodes } = deps
+
+  function line(key: string, text: string): void {
+    safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} ${text}`)
+  }
+
+  /** The configured-key lookup; absent reads as configured, a throw as not configured (logged). */
+  function configured(key: string): boolean {
+    if (deps.isConfigured === undefined) return true
+    try {
+      return deps.isConfigured(key) === true
+    } catch (err) {
+      line(key, `configured-key lookup failed: ${describeThrownValue(err)} — the alert takes the log-only route`)
+      return false
+    }
+  }
+
+  function raise(input: KillFailureRaiseInput): KillFailureRaiseResult {
+    const { key, context } = input
+    const content = killFailureAlertContentOf(
+      input.decision,
+      input.session ?? personaTmuxSessionName(key),
+      input.instanceId ?? personaInstanceId(key),
+    )
+    if (content === undefined) return 'none'
+    const { version } = content
+    const route = selectKillFailureAlertRoute({ version, context, configured: configured(key), latched: input.latched === true })
+    if (!route.destination) {
+      const entry = killFailureAlertEntryText(`persona=${key}`, context, killFailureAlertText(content, route.closing, false))
+      if (deps.logOnly === undefined || route.classLabel === undefined) {
+        line(key, `${version} alert not routed — no log-only route is installed`)
+        return 'not-routed'
+      }
+      try {
+        deps.logOnly(route.classLabel, entry)
+      } catch (err) {
+        line(key, `${version} log-only alert failed: ${describeThrownValue(err)}`)
+        return 'not-routed'
+      }
+      line(key, `${version} alert written to the server log and startup-errors.log (${route.classLabel}) — ${route.route}`)
+      return 'logged'
+    }
+    if (version === KILL_FAILURE_VERSION_ORDINARY && input.stopped === true) {
+      line(
+        key,
+        `${version} alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; ${describeKillFailureDescriptions(input.decision)} (${context})`,
+      )
+      return 'stopped'
+    }
+    const text = killFailureAlertText(content, route.closing, true)
+    // A destination route that opens no episode (the survivor version) posts once for this call.
+    if (!route.opensEpisode) {
+      if (!episodes.postWithoutEpisode(key, kind, text)) {
+        line(key, `${version} alert not posted — the episodes are closed`)
+        return 'closed'
+      }
+      line(key, `${version} alert posted to its destination (${context})`)
+      return 'posted'
+    }
+    if (episodes.begin(key, kind) === 'closed') {
+      line(key, `${version} alert not posted — the episodes are closed`)
+      return 'closed'
+    }
+    if (!episodes.post(key, kind, text)) {
+      line(key, `${version} alert not posted — its episode's alert already posted`)
+      return 'held'
+    }
+    line(key, `${version} alert posted to its destination (${context}; ${route.closing})`)
+    return 'posted'
+  }
+
+  return {
+    raise(input) {
+      try {
+        return raise(input)
+      } catch (err) {
+        line(input.key, `raise failed: ${describeThrownValue(err)}`)
+        return 'not-routed'
+      }
+    },
+
+    end(key, reason) {
+      if (!episodes.end(key, kind)) return false
+      line(key, `ended — ${reason}`)
+      return true
     },
 
     isOpen: (key) => episodes.isOpen(key, kind),

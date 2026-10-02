@@ -62,11 +62,12 @@
  * in `src/session-manager.ts` (the collision ladder's spawns, `resume`, kill
  * and delete, the shared own-row `status` and `get` reads and their step,
  * the shared pane read behind the working-pane read and the prompt rows'
- * pane reads, the reconnect's `send-keys` and the dialog approver's calls)
- * and the liveness and reconnect adapters in `src/server.ts`, which apply
- * the session manager's own-row `status` step. Sites still to come latch
- * through the same entry: the restart path's kill (E20), the reuse spawn
- * (E22) and the re-check's relatch (E30).
+ * pane reads, the reconnect's `send-keys`, the dialog approver's calls and
+ * the restart path's kill, `latchOnRestartKillOutcome`) and the liveness,
+ * reconnect and kill-session adapters in `src/server.ts`: the first two
+ * apply the session manager's own-row `status` step, the third
+ * `latchOnRestartKillOutcome`. Sites still to come latch through the same
+ * entry: the reuse spawn (E22) and the re-check's relatch (E30).
  *
  * The launch start not recorded (SRJ-513): {@link launchStartNotRecordedSetInput}
  * builds its `set` input: the case "launch start not recorded", the refused

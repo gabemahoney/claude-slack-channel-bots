@@ -11,8 +11,12 @@
  * SRJ-104) matches `UNUSABLE_RECORDED_NAME_PHRASE` and
  * `DIFFERENT_TMUX_SERVER_PHRASE` from here; the conflict latch
  * (`src/conflict-latch.ts`; b.jg5 SRJ-507) matches the nine CONFLICT case
- * words from here, in the order it defines; later Epics (E20, E28) will match
- * the others from here too.
+ * words from here, in the order it defines; and the bounded kill retry
+ * (`src/kill-retry.ts`; b.jg5 SRJ-702) and the kill-failure alert
+ * (`src/kill-failure-alert.ts`; SRJ-1007) match the survivor-naming form
+ * through `survivorPids` from here, in the `ErrTmuxKillFailed` description
+ * that `killFailedDescriptionOf` (`src/ad-error-class.ts`) reads. No `src/`
+ * module matches the other words yet.
  *
  * The CONFLICT case words number nine (b.jg5 SRJ-507), "another
  * agent-director store" among them. The other description words below (the

@@ -69,6 +69,23 @@
  * again. A throwing episodes member, threshold accessor or log breaks no
  * report.
  *
+ * The kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016), direct over
+ * `createKillFailureAlerts` with an injected configured-key lookup and a
+ * recording log-only route, the bounded retry's decisions quoting the stub's
+ * descriptions and every expected text built with `src/kill-failure-alert.ts`'s
+ * builders: the ordinary version posts once per episode (a second raise is
+ * held), a `none` decision (a kill success while the row stays live) leaves
+ * the episode open, and its silent end (row finished, row gone) or a forget
+ * ends it so the next ordinary alert posts; the survivor version posts once
+ * per raise with an episode open or none, leaving that state as it was and
+ * not counting as the episode's alert; a configured persona gets the
+ * not-latched or latched closing sentence (the survivor version always its
+ * destination one); a key the lookup does not know gets one log-only call of
+ * `persona-kill-failed` or `persona-kill-survivor` with the `recovery` entry,
+ * nothing posted and no episode; stopped tries post nothing for a configured
+ * persona (one redacted line) and still write a not-configured persona's
+ * entry; each persona's episode is its own; and after `close` nothing posts.
+ *
  * Per-kind counts (b.jg5 SRJ-610): `addCount` and `resetCount` answer the
  * new and the prior count, per persona and kind; a count is independent of
  * the open episode of its kind (begin, post, a new case and end leave it, and
@@ -97,15 +114,36 @@ import {
   classifyAdError,
   describeAdErrorClassification,
   describeAgentDirectorFailure,
+  killFailedDescriptionOf,
   type AdErrorClassification,
 } from '../src/ad-error-class.ts'
 import { DEFAULT_AD_SETTINGS_IN_EFFECT, adAlertThresholdMs, type AdSettingsInEffect } from '../src/ad-settings.ts'
 import { LIVENESS_LIVE } from '../src/liveness-reading.ts'
-import { MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
 import {
+  KILL_FAILURE_CLOSING_DESTINATION,
+  KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
+  KILL_FAILURE_CLOSING_LOG_ONLY,
+  KILL_FAILURE_CONTEXT_RECOVERY,
+  KILL_FAILURE_ROUTE_NOT_CONFIGURED,
+  KILL_FAILURE_VERSION_ORDINARY,
+  KILL_FAILURE_VERSION_SURVIVOR,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
+  killFailureAlertEntryText,
+  killFailureAlertText,
+  type KillFailureAlertContent,
+  type KillFailureClosing,
+} from '../src/kill-failure-alert.ts'
+import { KILL_RETRY_ALERT_NONE, KILL_RETRY_ALERT_ORDINARY, KILL_RETRY_ALERT_SURVIVOR, type KillRetryAlert } from '../src/kill-retry.ts'
+import { MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
+import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
+import {
+  KILL_FAILURE_END_ROW_FINISHED,
+  KILL_FAILURE_END_ROW_GONE,
   PERSONA_EPISODE_DEFAULT_MARK,
   PERSONA_EPISODE_KINDS,
   PERSONA_EPISODE_KIND_CONFLICT,
+  PERSONA_EPISODE_KIND_KILL_FAILURE,
   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
@@ -121,6 +159,7 @@ import {
   UNCLASSIFIED_ERROR_END_RECOVERED,
   UNCLASSIFIED_ERROR_END_ROW_GONE,
   UNCLASSIFIED_ERROR_END_ROW_LIVE,
+  createKillFailureAlerts,
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
   createUnclassifiedErrorEpisodes,
@@ -128,6 +167,8 @@ import {
   tmuxUnresponsiveOnsetText,
   tmuxUnresponsiveRecoveryText,
   unclassifiedErrorAlertText,
+  type KillFailureAlerts,
+  type KillFailureEndReason,
   type PersonaEpisodeKind,
   type PersonaEpisodeSink,
   type PersonaEpisodesClock,
@@ -167,7 +208,9 @@ import {
   errInternal,
   errSchemaMismatch,
   errSystemInstallDisappeared,
+  errTmuxKillFailed,
   errTmuxUnresponsive,
+  type KillFailedDescription,
 } from './test-helpers/agent-director-stub.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
@@ -2268,6 +2311,234 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
 
     expect(posts).toEqual([alertPost('K', errInternal())])
     expect(lines).toHaveLength(3)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)
+// ---------------------------------------------------------------------------
+
+describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
+  const KIND = PERSONA_EPISODE_KIND_KILL_FAILURE
+
+  /** The keys the injected configured-key lookup knows. */
+  let configured: Set<string>
+  /** Every log-only route call, in order: the class and the entry. */
+  let logOnlyCalls: Array<{ classLabel: string; entry: string }>
+
+  beforeEach(() => {
+    configured = new Set(['K', 'Q'])
+    logOnlyCalls = []
+  })
+
+  afterEach(() => {
+    assertNoLeak({ logOnlyCalls })
+  })
+
+  /** Alerts over `episodes` and the line capture, the lookup over `configured`, the log-only route recorded. */
+  function buildAlerts(): KillFailureAlerts {
+    return createKillFailureAlerts({
+      episodes,
+      log: (line) => lines.push(line),
+      isConfigured: (key) => configured.has(key),
+      logOnly: (classLabel, entry) => {
+        logOnlyCalls.push({ classLabel, entry })
+      },
+    })
+  }
+
+  /** The stub's raw `ErrTmuxKillFailed` description of `form`, a fake token in its quoted session. */
+  function description(form: KillFailedDescription): string {
+    return killFailedDescriptionOf(errTmuxKillFailed(sentinelInMessage(`episodes-${form}`), form))!
+  }
+
+  /** The bounded retry's ordinary decision quoting `form`'s description. */
+  function ordinary(form: KillFailedDescription = 'outlived-exit-wait'): KillRetryAlert {
+    return { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: description(form) }
+  }
+
+  /** The bounded retry's survivor decision quoting the survivor-naming description. */
+  function survivor(): KillRetryAlert {
+    return { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: description('pane-process-survived') }
+  }
+
+  /** What `decision` says for persona `key`'s own row, as the alerts build it. */
+  function contentOf(key: string, decision: KillRetryAlert): KillFailureAlertContent {
+    if (decision.kind === KILL_RETRY_ALERT_SURVIVOR) {
+      return { version: KILL_FAILURE_VERSION_SURVIVOR, session: personaTmuxSessionName(key), survivorDescription: decision.survivorDescription }
+    }
+    if (decision.kind !== KILL_RETRY_ALERT_ORDINARY) throw new Error('no content for a none decision')
+    const quotes = {
+      ...(decision.lastKillFailedDescription === undefined ? {} : { lastKillFailedDescription: decision.lastKillFailedDescription }),
+      ...(decision.earlierSurvivorDescription === undefined ? {} : { earlierSurvivorDescription: decision.earlierSurvivorDescription }),
+    }
+    return { version: KILL_FAILURE_VERSION_ORDINARY, session: personaTmuxSessionName(key), instanceId: personaInstanceId(key), quotes }
+  }
+
+  /** The post at persona `key`'s destination for `decision`, with `closing`. */
+  function destinationPost(key: string, decision: KillRetryAlert, closing: KillFailureClosing = KILL_FAILURE_CLOSING_DESTINATION): Post {
+    return { key, text: killFailureAlertText(contentOf(key, decision), closing, true) }
+  }
+
+  /** A raise for persona `key` of `decision` at the restart path (context `recovery`), not latched unless said. */
+  function raise(alerts: KillFailureAlerts, key: string, decision: KillRetryAlert, extra: { latched?: boolean; stopped?: boolean } = {}): string {
+    return alerts.raise({ key, decision, latched: extra.latched ?? false, context: KILL_FAILURE_CONTEXT_RECOVERY, ...(extra.stopped === undefined ? {} : { stopped: extra.stopped }) })
+  }
+
+  /** Persona `key`'s kill-failure lines. */
+  const killLines = (key: string): string[] => lines.filter((line) => line.startsWith(`[slack] persona-episodes: persona=${key} ${KIND} `))
+
+  test('two ordinary alerts in one episode post once: the second is held; the episode is open', () => {
+    const alerts = buildAlerts()
+    const first = ordinary()
+
+    expect(raise(alerts, 'K', first)).toBe('posted')
+    expect(raise(alerts, 'K', ordinary('unverifiable-session-present'))).toBe('held')
+
+    expect(posts).toEqual([destinationPost('K', first)])
+    expect(alerts.isOpen('K')).toBe(true)
+    expect(killLines('K')).toEqual([
+      `[slack] persona-episodes: persona=K ${KIND} ordinary alert posted to its destination (${KILL_FAILURE_CONTEXT_RECOVERY}; ${KILL_FAILURE_CLOSING_DESTINATION})`,
+      `[slack] persona-episodes: persona=K ${KIND} ordinary alert not posted — its episode's alert already posted`,
+    ])
+  })
+
+  test('a kill success while the row stays live (a none decision) does nothing: the episode stays open and the next ordinary alert is held', () => {
+    const alerts = buildAlerts()
+    raise(alerts, 'K', ordinary())
+
+    expect(raise(alerts, 'K', { kind: KILL_RETRY_ALERT_NONE })).toBe('none')
+
+    expect(alerts.isOpen('K')).toBe(true)
+    expect(raise(alerts, 'K', ordinary())).toBe('held')
+    expect(posts).toHaveLength(1)
+  })
+
+  test.each<KillFailureEndReason>([KILL_FAILURE_END_ROW_FINISHED, KILL_FAILURE_END_ROW_GONE])('the silent end (%s) ends the episode with one ended line and no post; the next ordinary alert posts again', (reason) => {
+    const alerts = buildAlerts()
+    raise(alerts, 'K', ordinary())
+
+    expect(alerts.end('K', reason)).toBe(true)
+
+    expect(alerts.isOpen('K')).toBe(false)
+    expect(posts).toHaveLength(1)
+    expect(killLines('K').at(-1)).toBe(`[slack] persona-episodes: persona=K ${KIND} ended — ${reason}`)
+    expect(alerts.end('K', reason)).toBe(false)
+    expect(killLines('K')).toHaveLength(2)
+
+    const next = ordinary('no-session-no-kill')
+    expect(raise(alerts, 'K', next)).toBe('posted')
+    expect(posts).toEqual([destinationPost('K', ordinary()), destinationPost('K', next)])
+  })
+
+  test('a teardown\'s forget ends the episode silently; the next ordinary alert posts again', () => {
+    const alerts = buildAlerts()
+    raise(alerts, 'K', ordinary())
+
+    episodes.forget('K')
+
+    expect(alerts.isOpen('K')).toBe(false)
+    expect(raise(alerts, 'K', ordinary())).toBe('posted')
+    expect(posts).toHaveLength(2)
+  })
+
+  // b.jg5 SRJ-704, SRJ-1016: the survivor version opens no episode, neither
+  // begins nor ends one, is not held back by an open one and does not count as
+  // the episode's alert.
+  test.each([false, true])('a survivor version with an ordinary episode open %p: posted once per raise, the open or closed state unchanged, and not the episode\'s alert', (open) => {
+    const alerts = buildAlerts()
+    const first = ordinary()
+    if (open) raise(alerts, 'K', first)
+
+    expect(raise(alerts, 'K', survivor())).toBe('posted')
+    expect(alerts.isOpen('K')).toBe(open)
+    expect(raise(alerts, 'K', survivor())).toBe('posted')
+    expect(alerts.isOpen('K')).toBe(open)
+
+    // The episode's own alert: held when it already posted, posted when none was open.
+    expect(raise(alerts, 'K', first)).toBe(open ? 'held' : 'posted')
+    const survivorPost = destinationPost('K', survivor())
+    expect(posts).toEqual(open ? [destinationPost('K', first), survivorPost, survivorPost] : [survivorPost, survivorPost, destinationPost('K', first)])
+    expect(killLines('K').filter((line) => line.includes(' survivor alert posted to its destination ('))).toHaveLength(2)
+  })
+
+  test.each<[string, boolean, KillFailureClosing]>([
+    ['not latched', false, KILL_FAILURE_CLOSING_DESTINATION],
+    ['latched', true, KILL_FAILURE_CLOSING_DESTINATION_LATCHED],
+  ])('a configured persona, %s: the ordinary version at its destination with that closing sentence; the survivor version always with its destination sentence', (_label, latched, closing) => {
+    const alerts = buildAlerts()
+
+    expect(raise(alerts, 'K', ordinary(), { latched })).toBe('posted')
+    expect(raise(alerts, 'K', survivor(), { latched })).toBe('posted')
+
+    expect(posts).toEqual([destinationPost('K', ordinary(), closing), destinationPost('K', survivor())])
+    expect(logOnlyCalls).toEqual([])
+  })
+
+  // b.jg5 SRJ-704, SRJ-1013: a key the lookup does not know takes the
+  // not-configured route: one entry (its writer writes the server-log line),
+  // nothing posted, no episode.
+  test.each<[string, () => KillRetryAlert, string]>([
+    ['ordinary', () => ordinary(), PERSONA_KILL_FAILED_LABEL],
+    ['survivor', () => survivor(), PERSONA_KILL_SURVIVOR_LABEL],
+  ])('a key not in the applied configuration, %s version: one log-only call of its class with the recovery entry, one line, nothing posted, no episode', (version, decision, classLabel) => {
+    const alerts = buildAlerts()
+    configured.delete('K')
+
+    expect(raise(alerts, 'K', decision())).toBe('logged')
+
+    const text = killFailureAlertText(contentOf('K', decision()), KILL_FAILURE_CLOSING_LOG_ONLY, false)
+    expect(logOnlyCalls).toEqual([{ classLabel, entry: killFailureAlertEntryText('persona=K', KILL_FAILURE_CONTEXT_RECOVERY, text) }])
+    expect(posts).toEqual([])
+    expect(alerts.isOpen('K')).toBe(false)
+    expect(killLines('K')).toEqual([
+      `[slack] persona-episodes: persona=K ${KIND} ${version} alert written to the server log and startup-errors.log (${classLabel}) — ${KILL_FAILURE_ROUTE_NOT_CONFIGURED}`,
+    ])
+  })
+
+  // b.jg5 SRJ-702, SRJ-301 (Reconcile note 2's keep-going default): tries the
+  // keep-going check stopped leave nothing retrying the kill, so a configured
+  // persona's ordinary version is one line and no post; a persona no longer
+  // configured still gets its entry (SRJ-704, SRJ-1013).
+  test('stopped tries: a configured persona gets one line carrying the decision and the redacted description, no post and no episode; one no longer configured still gets its persona-kill-failed entry', () => {
+    const alerts = buildAlerts()
+
+    expect(raise(alerts, 'K', ordinary(), { stopped: true })).toBe('stopped')
+
+    expect(posts).toEqual([])
+    expect(alerts.isOpen('K')).toBe(false)
+    const [line] = killLines('K')
+    expect(killLines('K')).toHaveLength(1)
+    expect(line).toContain(`ordinary alert not raised — `)
+    expect(line).toContain(JSON.stringify(renderLogMessageText(description('outlived-exit-wait'))))
+    expect(line).toContain(REDACTED_SENTINEL_TAIL)
+
+    configured.delete('Q')
+    expect(raise(alerts, 'Q', ordinary(), { stopped: true })).toBe('logged')
+    expect(logOnlyCalls.map((call) => call.classLabel)).toEqual([PERSONA_KILL_FAILED_LABEL])
+    expect(posts).toEqual([])
+  })
+
+  test('P\'s episode is independent of B\'s: the open query answers per key, and B\'s end leaves P\'s open', () => {
+    const alerts = buildAlerts()
+
+    raise(alerts, 'K', ordinary())
+    expect([alerts.isOpen('K'), alerts.isOpen('Q')]).toEqual([true, false])
+    expect(raise(alerts, 'Q', ordinary())).toBe('posted')
+    expect(alerts.end('Q', KILL_FAILURE_END_ROW_FINISHED)).toBe(true)
+
+    expect([alerts.isOpen('K'), alerts.isOpen('Q')]).toEqual([true, false])
+    expect(raise(alerts, 'K', ordinary())).toBe('held')
+    expect(posts.map((post) => post.key)).toEqual(['K', 'Q'])
+  })
+
+  test('after the episodes\' close (shutdown) nothing is posted: either version answers closed', () => {
+    const alerts = buildAlerts()
+    episodes.close()
+
+    expect([raise(alerts, 'K', ordinary()), raise(alerts, 'K', survivor())]).toEqual(['closed', 'closed'])
+    expect(posts).toEqual([])
+    expect(alerts.isOpen('K')).toBe(false)
   })
 })
 

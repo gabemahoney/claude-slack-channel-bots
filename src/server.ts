@@ -103,7 +103,9 @@ import {
   KILL_CONTEXT_TEARDOWN,
   killPersonaInstance,
   latchOnRestartKillOutcome,
+  raisePersonaKillFailureAlert,
   retryPersonaKill,
+  setKillFailureAlerts,
   setPersonaKillKeepGoingQuery,
   launchSession,
   noteWorkingRowDeferral,
@@ -146,6 +148,7 @@ import {
 } from './pane-read.ts'
 import { createPersonaNotifier } from './persona-notifier.ts'
 import {
+  createKillFailureAlerts,
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
   createUnclassifiedErrorEpisodes,
@@ -155,6 +158,7 @@ import {
   TMUX_UNRESPONSIVE_END_TICK,
   UNCLASSIFIED_ERROR_END_CAPPED,
   UNCLASSIFIED_ERROR_END_LATCHED,
+  type KillFailureAlerts,
   type PersonaEpisodes,
   type TmuxUnresponsiveCondition,
 } from './persona-episodes.ts'
@@ -411,6 +415,14 @@ let unavailableRetry: UnavailableRetryController | undefined
  * the start pass, every episode forgotten on shutdown.
  */
 let personaEpisodes: PersonaEpisodes | undefined
+
+/**
+ * The kill-failure alerts (b.jg5 SRJ-704, SRJ-1016), for the lost-message
+ * state's kill-failed query (SRJ-1011 state 4); built in main() over the
+ * notice episodes, before the start pass. Undefined before then, when no
+ * kill-failure episode is open.
+ */
+let personaKillFailureAlerts: Pick<KillFailureAlerts, 'isOpen'> | undefined
 
 /**
  * The server's one per-persona latch (b.jg5 SRJ-501), for the lost-message
@@ -1064,9 +1076,16 @@ const personaRouting = createPersonaRouting({
       `[slack] Lost message: persona=${key} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`,
     )
   },
+  // b.jg5 SRJ-1011 state 4: P's kill-failure episode is open (the ordinary
+  // version of the kill-failure alert was raised at P's destination and its
+  // row has not since read `ended` or `missing`, or been found gone). Read at
+  // call time through the holder main() sets: before main() builds the
+  // alerts no episode is open. The survivor version opens no episode, so it
+  // never reports this state. The old-life-hold half of this input (P waits
+  // on an old-life hold whose old key's kill failed) is E27's.
+  isKillFailed: (key) => personaKillFailureAlerts?.isOpen(key) === true,
   // Left unbound until their Epics bind them, so they answer false:
-  // isHeldOnInvalidFlags (E23), isKillFailed (E20, E27) and
-  // isSequenceOrWaitRunning (E21, E27).
+  // isHeldOnInvalidFlags (E23) and isSequenceOrWaitRunning (E21, E27).
 })
 
 // Permission Block Kit builders moved to src/permission-poller.ts
@@ -1592,10 +1611,15 @@ const KILL_SESSION_ADAPTER_SITE = 'killSession (restart adapter)'
  * only after one, so its kill is not of a row read live (not tmux-touching)
  * and is one try, its outcome standing at once (on a finished row `kill` is
  * a no-op success, SRJ-110). The adapter logs the outcome that stands with
- * `kill_sent` (`describeKillOutcome`) and answers it; the retry's alert
- * decision stays on its result, and the adapter raises no alert. A stop of
- * the tries (a read between tries that latched the persona, or the
- * keep-going check) answers the last outcome with nothing more done, and the
+ * `kill_sent` (`describeKillOutcome`), does its class's handling below,
+ * raises the retry's kill-failure alert decision
+ * (`raisePersonaKillFailureAlert`, context `recovery`; b.jg5 SRJ-704) and
+ * answers the outcome: an `ErrTmuxKillFailed` that stands raises the
+ * ordinary version (P's destination once per kill-failure episode, or a log
+ * line and a `persona-kill-failed` entry for a persona no longer in the
+ * applied configuration), and starts no `tmux-unresponsive` condition. A
+ * stop of the tries (a read between tries that latched the persona, or the
+ * keep-going check) answers the last outcome with no class handling, and the
  * restart work answers `latched` when the persona is latched. Every class
  * is decided by name through `src/ad-error-class.ts`. The restart work
  * launches only after a success (any `kill_sent`, `ErrSpawnNotFound`,
@@ -1674,6 +1698,10 @@ export function _buildKillSessionAdapter(
     if (!killOutcomeStopsServer(outcome) && !killRetryStopped(retried)) {
       await latchOnRestartKillOutcome(key, outcome, KILL_SESSION_ADAPTER_SITE, lastRead)
     }
+    // b.jg5 SRJ-702, SRJ-704: the retry's kill-failure alert decision, after
+    // the outcome's own handling and before the launch that a success lets
+    // run; a keep-going stop that is not a latch posts nothing.
+    raisePersonaKillFailureAlert(key, retried, KILL_SESSION_ADAPTER_SITE, `persona=${key}`)
     return outcome
   }
 }
@@ -2897,6 +2925,28 @@ export async function main(): Promise<void> {
     isConfigured: (key) => getAppliedPersona(key) !== undefined,
     logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `persona=${key}: ${text}`),
   })
+
+  // b.jg5 SRJ-704, SRJ-1007, SRJ-1016: the kill-failure alerts, their
+  // episode held in the notice episodes (so a teardown forgets it and
+  // shutdown closes it). The session manager raises them from the bounded
+  // kill retry's decision at the restart path's kill and the collision
+  // ladder's replacement kills (installed here, before the start pass), and
+  // ends a persona's episode at any read of its own row that reads `ended`
+  // or `missing`, or finds it gone. A persona in the applied configuration
+  // gets the alert at its destination (the ordinary version once per
+  // episode, the survivor version once per bounded retry); any other gets
+  // only a server-log line and a startup-errors entry (`persona-kill-failed`
+  // or `persona-kill-survivor`), so the persona notifier, which drops a
+  // notice for a key no longer applied, never sees it. The persona routing's
+  // lost-message state reads its episode (state 4).
+  const killFailureAlerts = createKillFailureAlerts({
+    episodes: noticeEpisodes,
+    log: (line) => console.error(line),
+    isConfigured: (key) => getAppliedPersona(key) !== undefined,
+    logOnly: (classLabel, entry) => recordStartupError(classLabel, entry),
+  })
+  setKillFailureAlerts(killFailureAlerts)
+  personaKillFailureAlerts = killFailureAlerts
 
   // b.jg5 SRJ-610, SRJ-1010, SRJ-1016: the slow dead-session recovery
   // tracker, its count and episode held in the notice episodes (so a

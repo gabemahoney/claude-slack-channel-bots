@@ -138,6 +138,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/conflict-latch\.ts$/, "the conflict latch, whose latch and relatch lines and stored record carry text from agent-director's CONFLICT description (the quoted session and the description, redacted)"],
   [/^src\/checked-kill\.ts$/, "the checked kill, whose outcome keeps the thrown agent-director error and an ErrTmuxKillFailed description raw, and whose one-line rendering carries agent-director failure text (described, redacted) to log lines and startup errors"],
   [/^src\/kill-retry\.ts$/, "the bounded retry of a live row's kill, whose per-try and per-read lines carry agent-director failure text (described, redacted) and whose alert decision keeps agent-director's kill-failure descriptions raw"],
+  [/^src\/kill-failure-alert\.ts$/, "the kill-failure alert's texts, which quote agent-director's kill-failure descriptions (redacted) in Slack posts, log lines and startup-errors entries"],
   [/^src\/pane-read\.ts$/, "the read-pane outcome, whose failure outcomes carry the described agent-director failure text (redacted) to the callers' log lines"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
 ]
@@ -447,6 +448,21 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touchReasonsOf(suite, "import type { KillRetryResult } from '../src/kill-retry.ts'")).toEqual([])
     expect(touchReasons(suite).some((r) => r.includes('src/kill-retry.ts'))).toBe(true)
     const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('src/kill-retry.ts')))
+    expect(touching).toContain(suite)
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
+  })
+
+  // b.jg5 SRJ-704, SRJ-1007: the alert's texts quote agent-director's kill-failure descriptions (redacted) in posts,
+  // log lines and startup-errors entries.
+  test('src/kill-failure-alert.ts is a source surface: its builders touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
+    const suite = 'tests/kill-failure-alert.test.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/kill-failure-alert.ts'))).toBe(true)
+    expect(touchReasonsOf(suite, "import { killFailureAlertText } from '../src/kill-failure-alert.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { killFailureOrdinaryBody as body } from '../src/kill-failure-alert.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL } from '../src/kill-failure-alert.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { KillFailureAlertContent } from '../src/kill-failure-alert.ts'")).toEqual([])
+    expect(touchReasons(suite).some((r) => r.includes('src/kill-failure-alert.ts'))).toBe(true)
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('src/kill-failure-alert.ts')))
     expect(touching).toContain(suite)
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })

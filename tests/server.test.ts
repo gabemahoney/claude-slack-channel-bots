@@ -22,6 +22,7 @@ import {
   AD_ERROR_CLASS_UNUSABLE_NAME,
   CSCB_UNKNOWN_ERROR_NAME,
   describeAgentDirectorFailure,
+  killFailedDescriptionOf,
   type AdErrorClass,
 } from '../src/ad-error-class.ts'
 import {
@@ -105,6 +106,7 @@ import {
   errSpawnNotResumable,
   errSystemInstallDisappeared,
   errTmuxCaptureFailed,
+  errTmuxKillFailed,
   errTmuxNotAvailable,
   errTmuxNotAvailableDifferentServer,
   errTmuxSendKeys,
@@ -210,6 +212,7 @@ import {
   setConflictLatch,
   setConfiguredPersonaQuery,
   _resetConfiguredPersonaQuery,
+  setKillFailureAlerts,
   setSessionNotifier,
   spawnForPersona,
   type EscalateDeadVerdict,
@@ -230,7 +233,16 @@ import {
   type ConflictLatchRecord,
   type LatchRowState,
 } from '../src/conflict-latch.ts'
-import { createPersonaEpisodes, type PersonaEpisodes } from '../src/persona-episodes.ts'
+import {
+  KILL_FAILURE_END_ROW_FINISHED,
+  KILL_FAILURE_END_ROW_GONE,
+  PERSONA_EPISODE_KIND_KILL_FAILURE,
+  createKillFailureAlerts,
+  createPersonaEpisodes,
+  type KillFailureAlerts,
+  type PersonaEpisodes,
+} from '../src/persona-episodes.ts'
+import { KILL_FAILURE_CONTEXT_RECOVERY } from '../src/kill-failure-alert.ts'
 import {
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
@@ -263,7 +275,7 @@ import {
   isInsideAttempt,
   runInAttempt,
 } from '../src/unavailable-retry.ts'
-import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import { describeThrownValue, renderLogMessageText } from '../src/persona-connection-errors.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
@@ -4240,6 +4252,121 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
 })
 
 // ---------------------------------------------------------------------------
+// b.jg5 SRJ-704, SRJ-1016 (E20 T3): the liveness and reconnect adapters'
+// own-row step ends the kill-failure episode
+//
+// The episode runs from the ordinary alert until P's own row reads `ended` or
+// `missing`, or is gone (`ErrSpawnNotFound`). Both adapters read the row
+// through the session manager's own-row `status` step, so either one's read
+// of `ended`, `missing` or `ErrSpawnNotFound` ends P's open episode silently
+// (one ended line, no post); a live reading, any other failed read and a
+// reading of another persona's row leave it open. The kill-failure alerts are
+// built over a recording episodes instance and installed in the session
+// manager (`setKillFailureAlerts`), as main() does; C1's episode is opened by
+// raising the ordinary version for it. The shared reads themselves are
+// covered in tests/session-manager.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-704, SRJ-1016: the liveness and reconnect adapters\' own-row step ends the kill-failure episode', () => {
+  let dir: string
+  let alerts: KillFailureAlerts
+  /** The episodes' posts and the alerts' lines. */
+  let posts: Array<{ key: string; text: string }>
+  let lines: string[]
+  let captured: unknown[][]
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'server-kill-failure-episode-'))
+    posts = []
+    lines = []
+    captured = []
+    const episodes = createPersonaEpisodes({ sink: (key, text) => { posts.push({ key, text }) }, log: (line) => { lines.push(line) }, clock: createFakeClock() })
+    alerts = createKillFailureAlerts({ episodes, log: (line) => { lines.push(line) } })
+    setKillFailureAlerts(alerts)
+    setConfiguredPersonaQuery((key) => key === 'C1' || key === 'C2')
+    // C1's ordinary alert opens its episode.
+    const description = killFailedDescriptionOf(errTmuxKillFailed(sentinelInMessage('server-episode')))!
+    expect(alerts.raise({ key: 'C1', decision: { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: description }, latched: false, context: KILL_FAILURE_CONTEXT_RECOVERY })).toBe('posted')
+  })
+
+  afterEach(() => {
+    setKillFailureAlerts(undefined)
+    _resetConfiguredPersonaQuery()
+    resetClientForTests()
+    _resetOutageState()
+    _resetFindMissingMemo()
+    _resetNotConnectedEpisodes()
+    setSessionNotifier(undefined)
+    rmSync(dir, { recursive: true, force: true })
+    assertNoLeak({ captured, posts, lines })
+  })
+
+  /** A stub whose `status` answers `answer` for `key`'s row (thrown when an error) and `waiting` for every other row; every send-keys succeeds. */
+  function install(key: string, answer: Error | Phase1StatusResult): void {
+    const stub = makeStubClient({
+      statusFn: ({ claude_instance_id }) => (claude_instance_id === personaInstanceId(key) ? answer : cannedStatusResult({ state: 'waiting' })),
+      sendKeysResult: {},
+    })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    setSessionNotifier(() => {})
+  }
+
+  /** The two adapters' reads of `key`'s row, each outside any attempt. */
+  const ADAPTERS: ReadonlyArray<readonly [string, (key: string) => Promise<unknown>]> = [
+    ['the liveness adapter', (key) => {
+      const config = makeStandInPersonaConfig({ C1: {}, C2: {} }, dir)
+      return _buildIsSessionAliveAdapter(() => config)(key)
+    }],
+    ['the reconnect adapter', (key) => _buildReconnectSessionAdapter(undefined, () => false)(key)],
+  ]
+
+  async function read(adapter: (key: string) => Promise<unknown>, key: string): Promise<void> {
+    const { errArgs } = await capturingErrorArgs(() => adapter(key))
+    captured.push(...errArgs)
+  }
+
+  const endedLine = (reason: string): string => `[slack] persona-episodes: persona=C1 ${PERSONA_EPISODE_KIND_KILL_FAILURE} ended — ${reason}`
+
+  test.each(ADAPTERS.flatMap(([name, adapter]) => [
+    [name, 'ended', adapter, () => cannedStatusResult({ state: 'ended' }), KILL_FAILURE_END_ROW_FINISHED],
+    [name, 'missing', adapter, () => cannedStatusResult({ state: 'missing' }), KILL_FAILURE_END_ROW_FINISHED],
+    [name, 'ErrSpawnNotFound', adapter, () => errSpawnNotFound(), KILL_FAILURE_END_ROW_GONE],
+  ] as const))('%s reading C1\'s row %s ends C1\'s episode silently: one ended line, nothing posted', async (_name, _answer, adapter, answer, reason) => {
+    install('C1', answer())
+
+    await read(adapter, 'C1')
+
+    expect(alerts.isOpen('C1')).toBe(false)
+    expect(posts).toHaveLength(1)
+    expect(lines.at(-1)).toBe(endedLine(reason))
+    expect(lines.filter((line) => line.includes(' ended — '))).toHaveLength(1)
+  })
+
+  test.each(ADAPTERS.flatMap(([name, adapter]) => [
+    [name, 'a live reading (waiting)', adapter, () => cannedStatusResult({ state: 'waiting' })],
+    [name, 'a failed read (ErrTmuxUnresponsive)', adapter, () => errTmuxUnresponsive('status')],
+  ] as const))('%s with %s for C1 leaves C1\'s episode open', async (_name, _label, adapter, answer) => {
+    install('C1', answer())
+
+    await read(adapter, 'C1')
+
+    expect(alerts.isOpen('C1')).toBe(true)
+    expect(lines.filter((line) => line.includes(' ended — '))).toEqual([])
+  })
+
+  test.each(ADAPTERS.map(([name, adapter]) => [name, adapter] as const))('%s reading C2\'s row ended leaves C1\'s episode open', async (_name, adapter) => {
+    install('C2', cannedStatusResult({ state: 'ended' }))
+
+    await read(adapter, 'C2')
+
+    expect(alerts.isOpen('C1')).toBe(true)
+    expect(lines.filter((line) => line.includes(' ended — '))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // _buildKillSessionAdapter: the checked kill's outcome (b.jg5 SRJ-110, SRJ-701,
 // SRJ-702)
 //
@@ -4252,9 +4379,11 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
 // of a row read live, in tests/session-manager.test.ts, and in
 // tests/kill-retry.test.ts). The retry logs its one try line (`kill try 1 of
 // 1`, and, for an `ErrTmuxKillFailed`, its end line naming the ordinary
-// decision, which the adapter raises no alert for), then the adapter
-// answers the outcome, `kill_sent` included, with one line naming it; nothing
-// is swallowed. A success (`kill_sent` true, false or absent) and
+// decision), then the adapter answers the outcome, `kill_sent` included, with
+// one line naming it, and raises the decision (b.jg5 SRJ-704): no kill-failure
+// alerts are installed here, so an `ErrTmuxKillFailed`'s ordinary decision is
+// one line saying it is not raised (the routes are proved on the recovery
+// harness, in tests/restart.test.ts); nothing is swallowed. A success (`kill_sent` true, false or absent) and
 // `ErrSpawnNotFound` arm nothing. An UNAVAILABLE kill (by name,
 // `ErrTmuxKillFailed` included, told apart) arms the timer (b.jg5 SRJ-105); an
 // ENVIRONMENT kill (`ErrTmuxNotAvailable`, b.jg5 SRJ-311) also raises
@@ -4328,8 +4457,20 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     return lines
   }
 
-  /** Every line the adapter's kill of C1 logs for `outcome`: the retry's, then the adapter's own. */
-  const killLines = (outcome: KillOutcome): string[] => [...retryLines(outcome), killLine(outcome)]
+  /**
+   * The adapter's line for an `ErrTmuxKillFailed`'s ordinary decision with no
+   * kill-failure alerts installed (b.jg5 SRJ-704): the alert is not raised,
+   * and the line names its description, redacted on one line.
+   */
+  const alertNotRaisedLines = (outcome: KillOutcome): string[] =>
+    outcome.kind === KILL_OUTCOME_NOT_KILLED && outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE && outcome.killFailed && typeof outcome.killFailedDescription === 'string'
+      ? [
+          `[slack] killSession (restart adapter): kill for persona=C1: the kill-failure alert's ${KILL_RETRY_ALERT_ORDINARY} version is not raised — no kill-failure alerts are installed; last=${JSON.stringify(renderLogMessageText(outcome.killFailedDescription))} (b.jg5 SRJ-704)`,
+        ]
+      : []
+
+  /** Every line the adapter's kill of C1 logs for `outcome`: the retry's, the adapter's own, then the alert's when one is decided. */
+  const killLines = (outcome: KillOutcome): string[] => [...retryLines(outcome), killLine(outcome), ...alertNotRaisedLines(outcome)]
 
   /**
    * Install a stub whose `kill` answers `killError` (else `killResult`), whose

@@ -367,6 +367,7 @@ import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import {
   reconcileOrphans,
+  setKillFailureAlerts,
   reconnectMcp,
   reconnectMcpWithCause,
   reconnectConflictLine,
@@ -563,7 +564,7 @@ import { resolveJsonlPath } from '../src/cozempic.ts'
 import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../src/persona-destination-hold.ts'
 import { PERSONA_CONFIG_DIR_UNRESOLVABLE, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
-import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import { describeThrownValue, renderLogMessageText } from '../src/persona-connection-errors.ts'
 import {
   makeDeferredConnect,
   makeStubSlack,
@@ -737,6 +738,7 @@ import {
   classifyAdError,
   describeAdErrorClassification,
   describeAgentDirectorFailure,
+  killFailedDescriptionOf,
   type AdErrorClass,
 } from '../src/ad-error-class.ts'
 import {
@@ -760,16 +762,45 @@ import {
   paneReadFailureOf,
 } from '../src/pane-read.ts'
 import { promptRowAbsentAtPaneReadLine, promptRowPaneGoneLine, workingRowAbsentAtPaneReadLine, workingRowPaneGoneLine } from '../src/server.ts'
-import type { UnclassifiedErrorSink } from '../src/persona-episodes.ts'
+import {
+  KILL_FAILURE_END_ROW_FINISHED,
+  KILL_FAILURE_END_ROW_GONE,
+  PERSONA_EPISODE_KIND_KILL_FAILURE,
+  createKillFailureAlerts,
+  createPersonaEpisodes,
+  type UnclassifiedErrorSink,
+} from '../src/persona-episodes.ts'
+import {
+  KILL_FAILURE_CLOSING_DESTINATION,
+  KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
+  KILL_FAILURE_CLOSING_LOG_ONLY,
+  KILL_FAILURE_CONTEXT_RECOVERY,
+  KILL_FAILURE_CONTEXT_START_SWEEP,
+  KILL_FAILURE_ORDINARY_DESTINATION_CLOSING,
+  KILL_FAILURE_VERSION_ORDINARY,
+  KILL_FAILURE_VERSION_SURVIVOR,
+  ORPHAN_CLEANUP_LABEL,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
+  killFailureAlertEntryText,
+  killFailureAlertText,
+  type KillFailureAlertContent,
+} from '../src/kill-failure-alert.ts'
 import { getFailureCount } from '../src/backoff.ts'
 import {
   adConfigMalformedRaiseLines,
   collided,
   conditionStartedLines,
+  killFailureLines,
+  killFailureNotice,
+  killFailureRecoveryEntry,
   makeRecoveryHarness,
+  ordinaryAlertContent,
   personaOf as harnessPersona,
   recordCallOrder,
   retryNow,
+  startupEntriesOf,
+  survivorAlertContent,
   unclassifiedLinePrefix,
   unclassifiedStartedLine,
   unclassifiedStartedLines,
@@ -4427,7 +4458,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_alpha_old'])
     expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_alpha_old']])
     const log = readLog()
-    expect(countStartupEntries(log, 'orphan-cleanup')).toBe(1)
+    expect(countStartupEntries(log, ORPHAN_CLEANUP_LABEL)).toBe(1)
     expect(log).toContain(`delete failed for orphan instanceId=cscb_alpha_old persona=${renderPersonaRef('alpha', 'alpha')}: ErrDeleteBroken`)
   })
 
@@ -4536,7 +4567,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       expect(r.killCalls).toEqual(Array.from({ length: tries }, () => 'cscb_alpha_old'))
       expect(r.statusCalls).toEqual(Array.from({ length: tries - 1 }, () => 'cscb_alpha_old'))
       expect(r.deleteCalls).toEqual([])
-      expect(countStartupEntries(r.entries, 'orphan-cleanup')).toBe(1)
+      expect(countStartupEntries(r.entries, ORPHAN_CLEANUP_LABEL)).toBe(1)
       expect(r.entries).toContain(keptEntry('cscb_alpha_old', renderPersonaRef('alpha', 'alpha'), killOutcomeOf({ thrown: err })))
       expect(r.latch.isLatched('alpha')).toBe(false)
       expect(armed).toEqual([])
@@ -4558,7 +4589,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       expect(r.result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
       expect(r.deleteCalls).toEqual([['cscb_alpha_old']])
       expect(r.errLog).toContain(`reconcileOrphans: kill succeeded for orphan instanceId=cscb_alpha_old (${describeKillOutcome(outcome)}) — deleting the row`)
-      expect(countStartupEntries(r.entries, 'orphan-cleanup')).toBe(0)
+      expect(countStartupEntries(r.entries, ORPHAN_CLEANUP_LABEL)).toBe(0)
       expect(armed).toEqual([])
     })
 
@@ -4641,7 +4672,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(callLog).toEqual([])
         expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 1, live: 1, killFailed: 0 } })
         const entries = readLog()
-        expect(countStartupEntries(entries, 'orphan-cleanup')).toBe(0)
+        expect(countStartupEntries(entries, ORPHAN_CLEANUP_LABEL)).toBe(0)
         const stopLines = errLog.split('\n').filter((l) => l.includes('the version re-check decided that the server stops'))
         expect(stopLines).toHaveLength(1)
         expect(stopLines[0]).toContain('reconcileOrphans: kill did not succeed for instanceId=cscb_alpha_old: ')
@@ -4683,7 +4714,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(deleteCalls).toEqual([])
         expect(callLog).toEqual([])
         expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 1 } })
-        expect(countStartupEntries(readLog(), 'orphan-cleanup')).toBe(0)
+        expect(countStartupEntries(readLog(), ORPHAN_CLEANUP_LABEL)).toBe(0)
         expect(errLog.split('\n').filter((l) => l.includes('the version re-check decided that the server stops'))).toHaveLength(1)
       })
     })
@@ -4827,6 +4858,106 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(armed).toEqual([])
         assertNoLeak({ errLog: r.errLog, entries: r.entries, outageEmissions })
       })
+
+      // b.jg5 SRJ-704, SRJ-714, SRJ-1013, SRJ-1007 (E20 T3): the start
+      // sweep's kill-failure alert is the server-log line and the
+      // startup-errors entry only: the ordinary version rides in the row's
+      // `orphan-cleanup` entry, the survivor version is one
+      // `persona-kill-survivor` entry. Kill-failure alerts over a recording
+      // sink are installed, as main() installs them, to show the sweep posts
+      // nothing through them. Every text is built with the module's builders.
+      describe('b.jg5 SRJ-704, SRJ-714: the kill-failure alert\'s entries', () => {
+        let sweepPosts: Array<{ key: string; text: string }>
+
+        beforeEach(() => {
+          sweepPosts = []
+          setKillFailureAlerts(
+            createKillFailureAlerts({
+              episodes: createPersonaEpisodes({ sink: (key, text) => { sweepPosts.push({ key, text }) }, log: () => {}, clock: createFakeClock() }),
+              log: () => {},
+            }),
+          )
+        })
+
+        afterEach(() => {
+          setKillFailureAlerts(undefined)
+          expect(sweepPosts).toEqual([])
+        })
+
+        /** The sweep's alert tail for `row`'s id: `instanceId=<id> (start sweep): <text>`, the start-sweep closing, unescaped. */
+        function sweepEntry(row: import('agent-director').ListRow, content: KillFailureAlertContent): string {
+          return killFailureAlertEntryText(`instanceId=${row.claude_instance_id}`, KILL_FAILURE_CONTEXT_START_SWEEP, killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false))
+        }
+
+        /** The ordinary content for `row` quoting `quotes`. */
+        function ordinaryFor(row: import('agent-director').ListRow, quotes: { lastKillFailedDescription?: string; earlierSurvivorDescription?: string }): KillFailureAlertContent {
+          return { version: KILL_FAILURE_VERSION_ORDINARY, session: row.tmux_session_name, instanceId: row.claude_instance_id, quotes }
+        }
+
+        /** Every entry of class `classLabel` in a startup-errors.log body, the text after its timestamp and class. */
+        function entriesOf(log: string, classLabel: string): string[] {
+          const marker = `] [${classLabel}] `
+          return log.split('\n').flatMap((line) => (line.includes(marker) ? [line.slice(line.indexOf(marker) + marker.length)] : []))
+        }
+
+        test('a swept row and a live pre-persona row whose kills answer ErrTmuxKillFailed at every try: each one orphan-cleanup entry carrying the ordinary text for its own id with the start-sweep closing; nothing posted, nothing armed, nothing deleted', async () => {
+          const err = errTmuxKillFailed(sentinelInMessage('sweep-kill'))
+          const rows: import('agent-director').ListRow[] = []
+          const r = await sweepRows((cfg, home) => {
+            rows.push(sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'), prePersonaRow('waiting'))
+            return rows
+          }, { killError: err })
+          const [swept, prePersona] = rows as [import('agent-director').ListRow, import('agent-director').ListRow]
+          const quotes = { lastKillFailedDescription: killFailedDescriptionOf(err)! }
+
+          const entries = entriesOf(r.entries, ORPHAN_CLEANUP_LABEL)
+          expect(entries).toHaveLength(2)
+          expect(entries[0]!.endsWith(`; kill-failure alert: ${sweepEntry(swept, ordinaryFor(swept, quotes))}`)).toBe(true)
+          expect(entries[1]!.endsWith(`; kill-failure alert: ${sweepEntry(prePersona, ordinaryFor(prePersona, quotes))}`)).toBe(true)
+          expect(entriesOf(r.entries, PERSONA_KILL_SURVIVOR_LABEL)).toEqual([])
+          expect(r.deleteCalls).toEqual([])
+          expect(armed).toEqual([])
+          expect(outageEmissions).toEqual([])
+          expect(r.entries).toContain(REDACTED_SENTINEL_TAIL)
+        })
+
+        test('a survivor-naming ErrTmuxKillFailed, then a read of ended: the row counts as killed and is deleted; one persona-kill-survivor entry names it with the survivor text; no orphan-cleanup entry', async () => {
+          const survivor = errTmuxKillFailed(sentinelInMessage('sweep-survivor'), 'pane-process-survived')
+          const rows: import('agent-director').ListRow[] = []
+          const r = await sweepRows((cfg, home) => {
+            rows.push(sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'))
+            return rows
+          }, { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
+          const row = rows[0]!
+
+          expect(r.result).toMatchObject({ found: 1, killed: 1, failed: 0 })
+          expect(r.killCalls).toEqual(['cscb_alpha_old'])
+          expect(r.deleteCalls).toEqual([['cscb_alpha_old']])
+          expect(entriesOf(r.entries, PERSONA_KILL_SURVIVOR_LABEL)).toEqual([
+            sweepEntry(row, { version: KILL_FAILURE_VERSION_SURVIVOR, session: row.tmux_session_name, survivorDescription: killFailedDescriptionOf(survivor)! }),
+          ])
+          expect(entriesOf(r.entries, ORPHAN_CLEANUP_LABEL)).toEqual([])
+          expect(armed).toEqual([])
+        })
+
+        test('a survivor-naming ErrTmuxKillFailed, then ErrTmuxUnresponsive to the end: one orphan-cleanup entry with the ordinary text quoting the survivor-naming description; no persona-kill-survivor entry', async () => {
+          const survivor = errTmuxKillFailed(sentinelInMessage('sweep-survivor-then-unresponsive'), 'pane-process-survived')
+          const rows: import('agent-director').ListRow[] = []
+          const r = await sweepRows((cfg, home) => {
+            rows.push(sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'))
+            return rows
+          }, { killQueue: [cannedErr(survivor), cannedErr(errTmuxUnresponsive('kill')), cannedErr(errTmuxUnresponsive('kill'))] })
+          const row = rows[0]!
+
+          expect(r.killCalls).toEqual(Array.from({ length: KILL_RETRY_TRIES }, () => 'cscb_alpha_old'))
+          const entries = entriesOf(r.entries, ORPHAN_CLEANUP_LABEL)
+          expect(entries).toHaveLength(1)
+          expect(entries[0]!.endsWith(`; kill-failure alert: ${sweepEntry(row, ordinaryFor(row, { earlierSurvivorDescription: killFailedDescriptionOf(survivor)! }))}`)).toBe(true)
+          expect(entriesOf(r.entries, PERSONA_KILL_SURVIVOR_LABEL)).toEqual([])
+          expect(r.deleteCalls).toEqual([])
+          expect(armed).toEqual([])
+        })
+      })
     })
   })
 
@@ -4881,7 +5012,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(entries).toContain(
           `kill did not succeed for pre-persona row instanceId=cscb_old_waiting_C0OLD: ${describeKillOutcome(killOutcomeOf({ thrown: killError }))}; row kept, its session may still be running`,
         )
-        expect(countStartupEntries(entries, 'orphan-cleanup')).toBe(1)
+        expect(countStartupEntries(entries, ORPHAN_CLEANUP_LABEL)).toBe(1)
         expect(errLog).not.toContain('kill succeeded for pre-persona row')
       } else {
         expect(errLog).toContain(`reconcileOrphans: kill succeeded for pre-persona row instanceId=cscb_old_waiting_C0OLD (${describeKillOutcome({ kind: KILL_OUTCOME_KILLED })}) — row kept`)
@@ -13637,7 +13768,7 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
   // (A spawn whose error has a token-shaped errName is UNCLASSIFIED, b.jg5
   // SRJ-313: refused with no spawn-failed record; its case follows this table.)
   test.each<[string, string, string, (err: Error) => Promise<void>]>([
-    ['a failed orphan delete', 'orphan-cleanup', 'delete', async (err) => {
+    ['a failed orphan delete', ORPHAN_CLEANUP_LABEL, 'delete', async (err) => {
       expect(await reconcileOrphans(installOrphan('deleteError', err))).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
     }],
     ['a failed orphan list', 'orphan-cleanup-list-failed', 'list', async (err) => {
@@ -13670,7 +13801,7 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     })
 
     expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
-    const entry = onlyStartupEntry(readLog(), 'orphan-cleanup')
+    const entry = onlyStartupEntry(readLog(), ORPHAN_CLEANUP_LABEL)
     expect(entry).toContain(`: ${describeKillOutcome(killOutcomeOf({ thrown: err }))}; row kept, no delete was made`)
     expect(entry).toContain(`message="${REDACTED_AD_DESCRIPTION}"`)
     expect(entry.split(REDACTED_URL_PLACEHOLDER)).toHaveLength(2)
@@ -14785,13 +14916,13 @@ describe('b.jg5 SRJ-105 with E8\'s refusal marker: a refused kill on a replace p
 // line (T3 raises the alert). The row is `waiting` in another directory.
 // ---------------------------------------------------------------------------
 
+/** P's launch whose optimistic spawn collides with its row read `waiting` in another directory, with `script` on top. */
+function replaceLiveRow(h: RecoveryHarness, p: string, script: RecoveryStubScript): void {
+  h.script({ ...collided(h, harnessPersona(h, p), elsewhere(h, 'waiting')), ...script })
+}
+
 describe('b.jg5 SRJ-702: the collision ladder\'s replacement kill of a row read live makes its tries, reading the row before each further try', () => {
   afterEach(srj105AfterEach)
-
-  /** P's launch whose optimistic spawn collides with its row read `waiting` in another directory, with `script` on top. */
-  function replaceLiveRow(h: RecoveryHarness, p: string, script: RecoveryStubScript): void {
-    h.script({ ...collided(h, harnessPersona(h, p), elsewhere(h, 'waiting')), ...script })
-  }
 
   /** The lines naming a kill-failure alert decision of `kind`. */
   const decisionLines = (h: RecoveryHarness, kind: string): string[] => h.errors.filter((line) => line.includes(`alert=${kind}`))
@@ -14934,6 +15065,362 @@ describe('b.jg5 SRJ-702: the collision ladder\'s replacement kill of a row read 
     expect(h.triggers).toEqual([])
     expect(h.latch.isLatched(p)).toBe(false)
     expect(getFailureCount(p)).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-704, SRJ-1007, SRJ-702 (E20 T3): the kill-failure alert at the
+// collision ladder's replacement kill of a row read live
+//
+// The one place the tries of a row read live raise the alert end to end
+// (E20 T3's reconcile note 2: the restart path's kill is one try, covered in
+// tests/restart.test.ts). On the recovery harness, its kill-failure alerts
+// installed as `main()` installs them: P's launch collides with its row read
+// `waiting` in another directory, and the replacement kill makes up to
+// `KILL_RETRY_TRIES` tries on `h.killRetryClock` (`h.drive`), reading the row
+// before each further try through the shared own-row `status` read. The alert
+// is raised with the context `recovery`: the survivor version after a success,
+// before the delete and the fresh spawn; the ordinary version after the
+// standing outcome's own handling (a latch and its hold post first). Every
+// expected text is built with `src/kill-failure-alert.ts`'s builders (the
+// harness's `killFailureNotice`, `ordinaryAlertContent`, `survivorAlertContent`,
+// `killFailureRecoveryEntry`), each description the stub's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collision ladder\'s replacement kill of a row read live', () => {
+  afterEach(srj105AfterEach)
+
+  /** The stub's survivor-naming `ErrTmuxKillFailed`. */
+  const survivorErr = (): Error => errTmuxKillFailed(undefined, 'pane-process-survived')
+
+  /** The hold posts the latch's notice reaction made (CONFLICT, unusable name, launch start), as `episodeNotices` holds them. */
+  function holdPosts(h: RecoveryHarness, key: string): Array<{ key: string; text: string }> {
+    return h.latchEvents.flatMap((event) => (event.step === 'notice' && event.key === key ? [{ key, text: event.text }] : []))
+  }
+
+  /** Wrap the stub's `delete` so each call records how many episode posts had been made by then. */
+  function postsAtDelete(h: RecoveryHarness): number[] {
+    const at: number[] = []
+    const remove = h.stub.client.delete.bind(h.stub.client)
+    h.stub.client.delete = async (params) => {
+      at.push(h.episodeNotices.length)
+      return remove(params)
+    }
+    return at
+  }
+
+  // AC 64 (demo bullet 8), AC 61's part: after the tries, an ErrTmuxKillFailed
+  // that stands posts one alert at P's destination and opens its episode; a
+  // later failure in the same episode (the row never read ended or missing)
+  // posts nothing.
+  test.each([...KILL_FAILED_DESCRIPTIONS])('ErrTmuxKillFailed (%s) at every try: one ordinary alert at P\'s destination quoting it, with the not-latched closing and the recovery context; no spawn-failed entry; a second launch failing the same way in the same episode posts nothing', async (form) => {
+    const { h, p } = srj105Build()
+    const err = errTmuxKillFailed(undefined, form)
+    replaceLiveRow(h, p, { killError: err })
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    const alert = killFailureNotice(p, ordinaryAlertContent(p, { last: err }))
+    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
+    expect(h.episodeNotices).toEqual([alert])
+    expect(killFailureLines(h, p)).toEqual([
+      `[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ordinary alert posted to its destination (${KILL_FAILURE_CONTEXT_RECOVERY}; ${KILL_FAILURE_CLOSING_DESTINATION})`,
+    ])
+    expect(h.startupErrors()).toEqual([])
+    expect(h.killFailureOpen(p)).toBe(true)
+
+    replaceLiveRow(h, p, { killError: err })
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(h.stub.calls.killCalls).toHaveLength(2 * KILL_RETRY_TRIES)
+    expect(h.episodeNotices).toEqual([alert])
+    expect(killFailureLines(h, p).at(-1)).toBe(`[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ordinary alert not posted — its episode's alert already posted`)
+    expect(h.killFailureOpen(p)).toBe(true)
+  })
+
+  // Demo bullet 4 (HO rev 17, rev 22): after a survivor-naming failure, every
+  // end of the tries as a success posts the survivor version once, before
+  // the caller's next step, and opens no episode.
+  test.each<[string, RecoveryStubScript]>([
+    ['a read of ended', { statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] }],
+    ['a read of missing', { statusQueue: [cannedOk(cannedStatusResult({ state: 'missing' }))] }],
+    ['a read answering ErrSpawnNotFound', { statusQueue: [cannedErr(errSpawnNotFound())] }],
+    ['a second try\'s success with kill_sent true after a live read', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(true))] }],
+    ['a second try\'s success with kill_sent true after a failed read', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(true))], statusQueue: [cannedErr(errCallTimeout('status'))] }],
+    ['a second try\'s success with kill_sent false', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(false))] }],
+    ['a second try answering ErrSpawnNotFound', { killQueue: [cannedErr(survivorErr()), cannedErr(errSpawnNotFound())] }],
+  ])('a survivor-naming ErrTmuxKillFailed, then %s: one survivor version at P\'s destination quoting it, posted before the delete and the fresh spawn, which follow; no kill-failure episode opens', async (_label, script) => {
+    const { h, p } = srj105Build()
+    const survivor = survivorErr()
+    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor)], ...script })
+    const atDelete = postsAtDelete(h)
+
+    const result = await h.drive(h.launch(p))
+
+    expect(result.action).not.toBe('failed')
+    expect(h.episodeNotices).toEqual([killFailureNotice(p, survivorAlertContent(p, survivor))])
+    expect(atDelete).toEqual([1])
+    expect(ladderCallsMade(h)).toMatchObject({ spawn: 2, delete: 1 })
+    expect(h.killFailureOpen(p)).toBe(false)
+    expect(killFailureLines(h, p)).toEqual([
+      `[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} survivor alert posted to its destination (${KILL_FAILURE_CONTEXT_RECOVERY})`,
+    ])
+  })
+
+  test('after the survivor version, a later ordinary kill failure for P still posts its alert', async () => {
+    const { h, p } = srj105Build()
+    const survivor = survivorErr()
+    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
+    await h.drive(h.launch(p))
+    await h.runApproverToStop(p)
+
+    const err = errTmuxKillFailed(undefined, 'no-session-no-kill')
+    h.script({ statusQueue: [], statusResult: cannedStatusResult({ state: 'ended' }), killQueue: [], killError: err })
+    expect(await runRestartRetry(p, harnessPersona(h, p).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+
+    expect(h.episodeNotices).toEqual([killFailureNotice(p, survivorAlertContent(p, survivor)), killFailureNotice(p, ordinaryAlertContent(p, { last: err }))])
+    expect(h.killFailureOpen(p)).toBe(true)
+  })
+
+  // AC 64: the tries end in another failure after a survivor-naming one.
+  test('a survivor-naming ErrTmuxKillFailed, then ErrTmuxUnresponsive twice: one ordinary alert quoting only the survivor-naming description; its episode is open; the UNAVAILABLE outcome armed once', async () => {
+    const { h, p } = srj105Build()
+    const survivor = survivorErr()
+    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor), cannedErr(errTmuxUnresponsive('kill')), cannedErr(errTmuxUnresponsive('kill'))] })
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
+    expect(h.episodeNotices).toEqual([killFailureNotice(p, ordinaryAlertContent(p, { earlierSurvivor: survivor }))])
+    expect(h.killFailureOpen(p)).toBe(true)
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+  })
+
+  test('a survivor-naming ErrTmuxKillFailed, then a non-survivor ErrTmuxKillFailed to the end: one ordinary alert quoting both descriptions, the last kill failure\'s first', async () => {
+    const { h, p } = srj105Build()
+    const survivor = survivorErr()
+    const last = errTmuxKillFailed(undefined, 'unverifiable-session-present')
+    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor), cannedErr(errTmuxKillFailed()), cannedErr(last)] })
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(h.episodeNotices).toEqual([killFailureNotice(p, ordinaryAlertContent(p, { last, earlierSurvivor: survivor }))])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
+  })
+
+  // AC 64, SRJ-704: a CONFLICT after a survivor-naming failure latches P with
+  // its own post, then the ordinary version follows with the latched closing.
+  test('a survivor-naming ErrTmuxKillFailed, then CONFLICT: P latches with its CONFLICT post, then one ordinary alert quoting the survivor-naming description with the latched closing (no "keeps retrying"); no retry timer for P', async () => {
+    const { h, p } = srj105Build()
+    const survivor = survivorErr()
+    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor), cannedErr(errTmuxSessionConflict('kill', 'not-this-launch'))] })
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
+
+    const latchedAlert = killFailureNotice(p, ordinaryAlertContent(p, { earlierSurvivor: survivor }), KILL_FAILURE_CLOSING_DESTINATION_LATCHED)
+    expect(holdPosts(h, p)).toHaveLength(1)
+    expect(h.episodeNotices).toEqual([...holdPosts(h, p), latchedAlert])
+    expect(latchedAlert.text).not.toContain(KILL_FAILURE_ORDINARY_DESTINATION_CLOSING)
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(h.killFailureOpen(p)).toBe(true)
+  })
+
+  // Hatch A2 (SRJ-702, SRJ-1007): a status read between tries that latches P
+  // ends the tries with no further kill; an ErrTmuxKillFailed that then stands
+  // raises the ordinary version with the latched closing, after P's own hold
+  // post, and no retry timer runs for P.
+  test.each<[string, () => Error, CannedResponse<Phase1StatusResult>]>([
+    ['a survivor-naming ErrTmuxKillFailed', survivorErr, cannedErr(errUnusableName())],
+    ['an ErrTmuxKillFailed naming no survivor', () => errTmuxKillFailed(), cannedErr(errUnusableName())],
+    ['an ErrTmuxKillFailed naming no survivor (P\'s own row read pending with no launch start)', () => errTmuxKillFailed(), cannedOk(cannedStatusResult({ state: 'pending', launch_started_at: SAMPLE_LAUNCH_START_NONE }))],
+  ])('%s, then a read between tries that latches P: no second kill; P\'s hold post, then one ordinary alert quoting that description with the latched closing; no retry timer for P', async (_label, makeErr, read) => {
+    const { h, p } = srj105Build()
+    const err = makeErr()
+    replaceLiveRow(h, p, { killQueue: [cannedErr(err)], statusQueue: [read] })
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(holdPosts(h, p)).toHaveLength(1)
+    expect(h.episodeNotices).toEqual([...holdPosts(h, p), killFailureNotice(p, ordinaryAlertContent(p, { last: err }), KILL_FAILURE_CLOSING_DESTINATION_LATCHED)])
+    expect(h.controller.isArmed(p)).toBe(false)
+  })
+
+  // SRJ-702, SRJ-704: with no survivor-naming failure, a standing outcome other
+  // than ErrTmuxKillFailed calls for no alert.
+  test('an ErrTmuxUnresponsive first try with no survivor-naming failure, then a read that latches P: no second kill and no alert of either version; P latched with its own post only', async () => {
+    const { h, p } = srj105Build()
+    replaceLiveRow(h, p, { killQueue: [cannedErr(errTmuxUnresponsive('kill'))], statusQueue: [cannedErr(errUnusableName())] })
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect(h.episodeNotices).toEqual(holdPosts(h, p))
+    expect(holdPosts(h, p)).toHaveLength(1)
+    expect(killFailureLines(h, p)).toEqual([])
+  })
+
+  // SRJ-704, SRJ-1013: a persona no longer in the applied configuration when
+  // the survivor version is raised gets one persona-kill-survivor entry.
+  test('a survivor-naming ErrTmuxKillFailed, then a read of ended with P removed from the applied configuration meanwhile: one persona-kill-survivor entry with the recovery context; nothing posted', async () => {
+    const { h, p } = srj105Build()
+    const survivor = survivorErr()
+    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
+    const status = h.stub.client.status.bind(h.stub.client)
+    h.stub.client.status = async (params) => {
+      try {
+        return await status(params)
+      } finally {
+        h.remove(p)
+      }
+    }
+
+    await h.drive(h.launch(p))
+
+    expect(startupEntriesOf(h, PERSONA_KILL_SURVIVOR_LABEL)).toEqual([killFailureRecoveryEntry(p, survivorAlertContent(p, survivor))])
+    expect(h.episodeNotices).toEqual([])
+    expect(h.killFailureOpen(p)).toBe(false)
+  })
+
+  // Reconcile note 2's keep-going default (open for the user): tries stopped
+  // by the keep-going check while ErrTmuxKillFailed stands leave nothing to
+  // retry the kill, so no "CSCB keeps retrying" alert is posted.
+  test('the keep-going check stops the tries because the server is shutting down while ErrTmuxKillFailed stands: one line carrying the decision and the redacted description, no post and no episode', async () => {
+    const { h, p } = srj105Build()
+    const err = errTmuxKillFailed()
+    replaceLiveRow(h, p, { killError: err })
+    const kill = h.stub.client.kill.bind(h.stub.client)
+    h.stub.client.kill = async (params) => {
+      try {
+        return await kill(params)
+      } finally {
+        h.shutdown()
+      }
+    }
+
+    await h.drive(h.launch(p))
+
+    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(h.episodeNotices).toEqual([])
+    expect(h.killFailureOpen(p)).toBe(false)
+    const lines = killFailureLines(h, p)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(`[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ordinary alert not raised — its tries were stopped`)
+    expect(lines[0]).toContain(JSON.stringify(renderLogMessageText(killFailedDescriptionOf(err))))
+  })
+
+  // SRJ-704 rule 4 before the stop's line: P removed from the applied
+  // configuration during the tries is not up, so the keep-going check stops
+  // them, and the ordinary decision takes the not-configured route.
+  test('the keep-going check stops the tries because P was removed from the applied configuration while ErrTmuxKillFailed stands: one persona-kill-failed entry with the recovery context; no post, no episode, no further kill', async () => {
+    const { h, p } = srj105Build()
+    const err = errTmuxKillFailed()
+    replaceLiveRow(h, p, { killError: err })
+    const kill = h.stub.client.kill.bind(h.stub.client)
+    h.stub.client.kill = async (params) => {
+      try {
+        return await kill(params)
+      } finally {
+        h.remove(p)
+      }
+    }
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+    await h.advance(KILL_RETRY_TRIES * KILL_RETRY_SPACING_MS)
+
+    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(h.stub.calls.statusCalls).toEqual([])
+    expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureRecoveryEntry(p, ordinaryAlertContent(p, { last: err }))])
+    expect(startupEntriesOf(h, PERSONA_KILL_SURVIVOR_LABEL)).toEqual([])
+    expect(h.episodeNotices).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.killFailureOpen(p)).toBe(false)
+    expect(h.triggers).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-704, SRJ-1016 (E20 T3): the shared own-row reads end P's
+// kill-failure episode
+//
+// The episode runs from the ordinary alert until P's own row reads `ended` or
+// `missing`, or is gone (`ErrSpawnNotFound`). The shared own-row `status`
+// read (`readPersonaOwnRowStatus`, through `applyOwnRowStatusStep`) and E14's
+// shared `get` read (`readPersonaOwnRow`) end it silently; a live reading,
+// any other failed read and a read of another persona's row do not. The
+// episode is opened by a ladder kill failing at every try, on the recovery
+// harness with its kill-failure alerts installed as main() installs them.
+// The liveness and reconnect adapters' own-row step is covered in
+// tests/server.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P\'s kill-failure episode', () => {
+  afterEach(srj105AfterEach)
+
+  /** Open P's kill-failure episode: a launch whose ladder kill fails ErrTmuxKillFailed at every try; resolves with its one alert. */
+  async function openEpisode(h: RecoveryHarness, p: string): Promise<{ key: string; text: string }> {
+    const err = errTmuxKillFailed()
+    replaceLiveRow(h, p, { killError: err })
+    await h.drive(h.launch(p))
+    const alert = killFailureNotice(p, ordinaryAlertContent(p, { last: err }))
+    expect(h.episodeNotices).toEqual([alert])
+    expect(h.killFailureOpen(p)).toBe(true)
+    h.script({ statusQueue: [], killError: undefined })
+    return alert
+  }
+
+  /** One shared own-row read of `key`, `status` or `get`, answering `answer` (a state, or a thrown error). */
+  async function readOwnRow(h: RecoveryHarness, key: string, read: 'status' | 'get', answer: string | Error): Promise<void> {
+    if (read === 'status') {
+      h.script(answer instanceof Error ? { statusResult: undefined, statusError: answer } : { statusError: undefined, statusResult: cannedStatusResult({ state: answer }) })
+      await readPersonaOwnRowStatus(key, STATUS_READ_SITE)
+    } else {
+      h.script(answer instanceof Error ? { getResult: undefined, getError: answer } : { getError: undefined, getResult: cannedGetResult({ state: answer }, harnessPersona(h, key), h.home) })
+      await readPersonaOwnRow(key, STATUS_READ_SITE)
+    }
+  }
+
+  const READS = ['status', 'get'] as const
+
+  test.each(READS.flatMap((read) => [
+    [read, 'ended', KILL_FAILURE_END_ROW_FINISHED],
+    [read, 'missing', KILL_FAILURE_END_ROW_FINISHED],
+    [read, 'ErrSpawnNotFound', KILL_FAILURE_END_ROW_GONE],
+  ] as const))('the shared %s read answering %s ends P\'s episode silently, with one ended line; nothing posted', async (read, answer, reason) => {
+    const { h, p } = srj105Build()
+    const alert = await openEpisode(h, p)
+
+    await readOwnRow(h, p, read, answer === 'ErrSpawnNotFound' ? errSpawnNotFound() : answer)
+
+    expect(h.killFailureOpen(p)).toBe(false)
+    expect(h.episodeNotices).toEqual([alert])
+    expect(killFailureLines(h, p).at(-1)).toBe(`[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ended — ${reason}`)
+  })
+
+  test.each(READS.flatMap((read) => [
+    [read, 'a live reading (waiting)', 'waiting'],
+    [read, 'a failed read (ErrTmuxUnresponsive)', errTmuxUnresponsive(read)],
+  ] as const))('the shared %s read answering %s leaves P\'s episode open', async (read, _label, answer) => {
+    const { h, p } = srj105Build()
+    await openEpisode(h, p)
+    const before = killFailureLines(h, p)
+
+    await readOwnRow(h, p, read, answer)
+
+    expect(h.killFailureOpen(p)).toBe(true)
+    expect(killFailureLines(h, p)).toEqual(before)
+  })
+
+  test.each([...READS])('the shared %s read of Q\'s own row reading ended leaves P\'s episode open', async (read) => {
+    const { h, p, b } = srj105Build()
+    await openEpisode(h, p)
+
+    await readOwnRow(h, b, read, 'ended')
+
+    expect(h.killFailureOpen(p)).toBe(true)
+    expect(killFailureLines(h, p).filter((line) => line.includes(' ended — '))).toEqual([])
   })
 })
 

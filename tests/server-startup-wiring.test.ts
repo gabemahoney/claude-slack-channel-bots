@@ -207,6 +207,16 @@
  *   (`(key) => getAppliedPersona(key) !== undefined`), never reset; it and
  *   the latch's install both come before the start sweep (`reconcileOrphans`)
  *   and the start pass, with no await between them.
+ * - b.jg5 SRJ-704 / SRJ-1007 / SRJ-1016: the kill-failure alerts are built
+ *   exactly once (`createKillFailureAlerts`), in main()'s own statement list,
+ *   over the one notice episodes instance and the server log, with the live
+ *   applied-persona lookup as their configured-key lookup and one
+ *   `recordStartupError(<class>, <entry>)` as their log-only route; they are
+ *   installed in the session manager once (`setKillFailureAlerts`), after
+ *   their build and before the restart module, the start sweep and the start
+ *   pass, and named only at the build, the install and the routing holder's
+ *   assignment; the restart kill adapter raises the kill retry's decision
+ *   once, after the outcome's own handling.
  * - b.jg5 SRJ-1011: the module-scope persona routing's lost-message inputs
  *   are read at call time: its latched query through a module-scope holder
  *   assigned the one latch once in main(), its `tmux-unresponsive` query
@@ -214,8 +224,10 @@
  *   holds query), both before the start bring-up; its launch-or-approver
  *   query asks the session manager's `isLaunchInFlight` and
  *   `isDialogApproverRunning` for the key at call time, and is neither
- *   in-flight binding; the held-on-invalid-flags, kill-failed and sequence/wait
- *   inputs are unbound. Its read gate's in-flight member (`isWorkInFlight`)
+ *   in-flight binding; its kill-failed query reads the one kill-failure
+ *   alerts' `isOpen` through a module-scope holder assigned that instance
+ *   once in main() before the start bring-up; the held-on-invalid-flags and
+ *   sequence/wait inputs are unbound. Its read gate's in-flight member (`isWorkInFlight`)
  *   is "in flight for P", and its one row read
  *   (`readRowLiveness`) is the one liveness adapter main() builds
  *   (`_buildIsSessionAliveAdapter`, built once, the restart module's and the
@@ -286,6 +298,8 @@ import type * as PersonaEpisodesModule from '../src/persona-episodes.ts'
 import type * as SlowRecoveryModule from '../src/slow-recovery.ts'
 import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-recovery.ts'
 import type {
+  KillFailureAlerts,
+  KillFailureAlertsDeps,
   PersonaEpisodes,
   PersonaEpisodesDeps,
   TmuxUnresponsiveCondition,
@@ -2726,6 +2740,115 @@ describe('main() builds the one unclassified-error episodes instance over the no
 })
 
 // ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-704 / SRJ-1007 / SRJ-1016 — the kill-failure
+// alerts' production bindings
+//
+// `KillFailureAlertsDeps.isConfigured` and `logOnly` are optional (absent,
+// every key reads as configured, so an alert for a persona no longer in the
+// applied configuration would reach Slack, and a log-only alert goes
+// nowhere), the session manager's install is optional (absent, every alert is
+// one log line and no episode ever opens or ends), and any episodes object
+// type-checks as `episodes` (one a teardown never forgets and shutdown never
+// closes). So a production wiring that dropped one, bound it to a constant or
+// a second instance, installed the alerts after the start sweep or the start
+// pass, or kept a module-scope copy would type-check and pass every behaviour
+// suite. What the alerts do is tested in tests/persona-episodes.test.ts and
+// end to end on the recovery harness (tests/restart.test.ts,
+// tests/session-manager.test.ts); the routing's kill-failed query is pinned in
+// the routing's describe below. Pinned here: the build, the install and the
+// restart adapter's raise.
+// ---------------------------------------------------------------------------
+
+describe('main() builds the one kill-failure alerts instance over the notice episodes, with the live applied-persona lookup and recordStartupError as its log-only route, and installs it in the session manager before the restart module, the start sweep and the start pass (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const FACTORY: keyof typeof PersonaEpisodesModule = 'createKillFailureAlerts'
+  const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
+  const INSTALL: keyof typeof SessionManagerModule = 'setKillFailureAlerts'
+  const RAISE: keyof typeof SessionManagerModule = 'raisePersonaKillFailureAlert'
+  const START_SWEEP: keyof typeof SessionManagerModule = 'reconcileOrphans'
+  const KILL_ADAPTER: keyof typeof ServerModule = '_buildKillSessionAdapter'
+  const EPISODES: keyof KillFailureAlertsDeps = 'episodes'
+  const LOG: keyof KillFailureAlertsDeps = 'log'
+  const IS_CONFIGURED: keyof KillFailureAlertsDeps = 'isConfigured'
+  const LOG_ONLY: keyof KillFailureAlertsDeps = 'logOnly'
+
+  test('the instance is built exactly once, in main()\'s own statement list (not at module scope, behind no branch), over the one notice episodes instance, after it; its deps are exactly these four', () => {
+    const at = onlyCallOf(FACTORY)
+    const alerts = constOf(FACTORY)
+    declaredOnce(alerts)
+    const decl = SERVER_CODE.search(new RegExp(`\\bconst\\s+${alerts}\\s*=\\s*${FACTORY}\\s*\\(`))
+    expect(decl).toBeGreaterThan(-1)
+    expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
+    expect(importSource(SERVER_CODE, FACTORY)).toBe('./persona-episodes.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+
+    // Over the one episodes instance: a teardown's forget and shutdown's
+    // close reach its episode, and its destination post is the notifier's.
+    expect(onlyCallProps(FACTORY).get(EPISODES)).toBe(constOf(EPISODES_FACTORY))
+    expect(at).toBeGreaterThan(onlyCallOf(EPISODES_FACTORY))
+    expect([...onlyCallProps(FACTORY).keys()].sort()).toEqual([EPISODES, IS_CONFIGURED, LOG, LOG_ONLY].sort())
+  })
+
+  test('its log is the server log; its configured-key lookup asks the live applied-persona lookup, getAppliedPersona, for the key it is given, at each raise', () => {
+    const props = onlyCallProps(FACTORY)
+    expect(props.get(LOG)).toMatch(/^\((\w+)\) => console\.error\(\1\)$/)
+    // `(key) => getAppliedPersona(key) !== undefined`; the parameter's name is free.
+    expect(props.get(IS_CONFIGURED)).toMatch(/^\(?(\w+)\)? => getAppliedPersona\(\1\) !== undefined$/)
+    declaredOnce('getAppliedPersona')
+    expect(importSource(SERVER_CODE, 'getAppliedPersona')).toBeUndefined()
+  })
+
+  test('its log-only route is one recordStartupError call with the class and the entry it is given, unchanged', () => {
+    // `(classLabel, entry) => recordStartupError(classLabel, entry)` (block or
+    // expression body); the parameters' names are free.
+    const call = 'recordStartupError\\(\\1, \\2\\)'
+    expect(onlyCallProps(FACTORY).get(LOG_ONLY)).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
+    expect(importSource(SERVER_CODE, 'recordStartupError')).toBe('./startup-errors.ts')
+  })
+
+  test('it is installed in the session manager exactly once, in main()\'s own statement list, after its build and before the restart module, the start sweep and the start pass; the install is the session manager\'s import', () => {
+    const alerts = constOf(FACTORY)
+    const install = onlyCallOf(INSTALL)
+    expect(onlyCallArgs(INSTALL)).toEqual([alerts])
+    expect(atMainTopLevel(SERVER_CODE, install)).toBe(true)
+    expect(install).toBeGreaterThan(onlyCallOf(FACTORY))
+    for (const later of [onlyCallOf('initRestart'), onlyCallOf(START_SWEEP), startResolution(SERVER_CODE).bringUpAt]) {
+      expect(install).toBeLessThan(later)
+    }
+    for (const name of [INSTALL, RAISE]) {
+      expect([name, importSource(SERVER_CODE, name)]).toEqual([name, './session-manager.ts'])
+      expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
+    }
+  })
+
+  test('the instance is named only at its build, its install and the routing holder\'s assignment (no module-scope copy, no second use)', () => {
+    const alerts = constOf(FACTORY)
+    const named = indicesOf(new RegExp(`\\b${alerts}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(3)
+    // The install's one argument starts right at its opening parenthesis.
+    expect(named).toContain(balancedAfter(SERVER_CODE, onlyCallOf(INSTALL), '(', ')')[0])
+    // The third is the routing holder's assignment (pinned in the routing's describe below).
+    for (const at of named) expect(insideMain(at)).toBe(true)
+  })
+
+  test('the restart kill adapter raises the kill retry\'s decision once, for its key and the retry\'s result, after the outcome\'s own handling (latchOnRestartKillOutcome) and before it answers the outcome; server.ts raises it nowhere else', () => {
+    const [start, end] = exportedFunctionBody(KILL_ADAPTER)
+    const raises = callsOf(RAISE)
+    expect(raises).toHaveLength(1)
+    const at = raises[0]!
+    expect(at > start && at < end).toBe(true)
+    const body = SERVER_CODE.slice(start, end)
+    // The adapter's key (the returned arrow's first parameter; its name is free) and the retry's result.
+    const key = body.match(/\breturn\s+async\s+\(\s*(\w+)/)![1]!
+    const retried = body.match(/\bconst\s+(\w+)\s*=\s*await\s+retryPersonaKill\s*\(/)![1]!
+    const [first, second] = splitTopLevel(callArguments(SERVER_CODE, at))
+    expect([first, second]).toEqual([key, retried])
+    expect(at).toBeGreaterThan(callsOf('latchOnRestartKillOutcome').find((offset) => offset > start && offset < end)!)
+    expect(at).toBeLessThan(start + body.lastIndexOf('return outcome'))
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Static audit: b.jg5 SRJ-501 / SRJ-508 — the one per-persona latch and its
 // CONFLICT notice binding
 //
@@ -3127,13 +3250,15 @@ describe('main() builds the one slow-recovery tracker over the notice episodes b
 // here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('server.ts binds the persona routing\'s lost-message state inputs to the one latch, the one tmux-unresponsive condition and the session manager\'s launch-in-flight and approver-running queries, each read at call time (b.jg5 SRJ-1011, SRJ-502, SRJ-307, SRJ-401)', () => {
+describe('server.ts binds the persona routing\'s lost-message state inputs to the one latch, the one tmux-unresponsive condition, the one kill-failure alerts\' episode and the session manager\'s launch-in-flight and approver-running queries, each read at call time (b.jg5 SRJ-1011, SRJ-502, SRJ-307, SRJ-401, SRJ-704)', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const IS_LATCHED: keyof ConflictLatch = 'isLatched'
   const HOLDS: keyof TmuxUnresponsiveCondition = 'holds'
   const LAUNCH_RUNNING: keyof PersonaRoutingDeps = 'isLaunchOrApproverRunning'
-  /** The three inputs later Epics bind: E23, E20 and E27, E21 and E27. */
-  const UNBOUND: Array<keyof PersonaRoutingDeps> = ['isHeldOnInvalidFlags', 'isKillFailed', 'isSequenceOrWaitRunning']
+  const KILL_FAILED: keyof PersonaRoutingDeps = 'isKillFailed'
+  const IS_OPEN: keyof KillFailureAlerts = 'isOpen'
+  /** The two inputs later Epics bind: E23, and E21 and E27. */
+  const UNBOUND: Array<keyof PersonaRoutingDeps> = ['isHeldOnInvalidFlags', 'isSequenceOrWaitRunning']
 
   test('the latched query reads the one latch at call time, through a module-scope holder assigned that latch once in main(), before the start bring-up (state 2, held for a human)', () => {
     const latch = constOf(LATCH_FACTORY)
@@ -3185,14 +3310,25 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     expect(withinCall(asked, onlyCallOf('createPersonaRouting'))).toBe(1)
   })
 
-  test('the held-on-invalid-flags, kill-failed and sequence/wait inputs are unbound: absent from the routing\'s call and named nowhere in server.ts (their Epics, E23, E20, E21 and E27, update this pin)', () => {
+  // b.jg5 SRJ-1011 state 4, SRJ-704 (E20): P's kill-failure episode is open.
+  // The alerts are built in main() over the notice episodes (pinned in the
+  // kill-failure alerts' describe below); the routing reads their episode
+  // through a holder assigned that one instance, never a second one or a copy.
+  test('the kill-failed query reads the one kill-failure alerts\' isOpen at call time, through a module-scope holder assigned that instance once in main(), after its build and before the start bring-up (state 4, kill failed)', () => {
+    const alerts = constOf('createKillFailureAlerts')
+    declaredOnce(alerts)
+    const { at } = routingHolder(KILL_FAILED, IS_OPEN, alerts)
+    expect(at).toBeGreaterThan(onlyCallOf('createKillFailureAlerts'))
+  })
+
+  test('the held-on-invalid-flags and sequence/wait inputs are unbound: absent from the routing\'s call and named nowhere in server.ts (their Epics, E23, E21 and E27, update this pin)', () => {
     const props = onlyCallProps('createPersonaRouting')
     for (const member of UNBOUND) {
       expect(props.has(member)).toBe(false)
       expect(indicesOf(new RegExp(`\\b${member}\\b`, 'g'), SERVER_CODE)).toEqual([])
     }
     // The bound inputs are present (each pinned above or in the read-gate describe below).
-    for (const member of [ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ]) expect(props.has(member)).toBe(true)
+    for (const member of [ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ]) expect(props.has(member)).toBe(true)
   })
 
   // b.jg5 SRJ-1011 as amended ("state 5 applies only while P's retry timer is
@@ -3225,7 +3361,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   test('the routing\'s call binds exactly these members, no more', () => {
     const MEMBERS: Array<keyof PersonaRoutingDeps> = [
       'getPersonaConfig', 'getBotIdentity', 'clientFor', 'resolveUserName', 'archive', 'getReplySettings', 'notify', 'log',
-      'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
+      'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())

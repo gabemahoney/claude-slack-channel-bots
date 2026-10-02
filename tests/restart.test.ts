@@ -115,6 +115,7 @@ import {
   type EscalateDeadVerdict,
 } from '../src/session-manager.ts'
 import { FULL_PANE_READ_LINES, PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
+import { KILL_FAILURE_ROUTE_NOT_CONFIGURED, PERSONA_KILL_FAILED_LABEL } from '../src/kill-failure-alert.ts'
 import {
   conflictNoticeText,
   createConflictLatch,
@@ -208,11 +209,17 @@ import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
   callCounts,
   callCountsSince,
+  killFailureLines,
+  killFailureNotice,
+  killFailureRecoveryEntry,
   makeRecoveryHarness,
+  ordinaryAlertContent,
   personaCallCounts,
+  startupEntriesOf,
   retryNow,
   rowReadsUntilSpawn,
   type RecoveryHarness,
+  type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
 import {
   NO_LAUNCH_START_FORMS,
@@ -226,6 +233,8 @@ import {
 } from './test-helpers/conflict-cases.ts'
 import {
   createPersonaEpisodes,
+  KILL_FAILURE_END_ROW_FINISHED,
+  PERSONA_EPISODE_KIND_KILL_FAILURE,
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
   tmuxUnresponsiveOnsetText,
 } from '../src/persona-episodes.ts'
@@ -5746,7 +5755,9 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
 
     // b.jg5 SRJ-110, SRJ-313 (AC 69 for the UNCLASSIFIED rows): the kill's
     // refusal is the adapter's, so no step follows it and nothing is counted.
-    test.each(REFUSING_ANSWERS)('the kill after a dead reading answers %s → refused: no launch, no recordFailure, no onCapReached; nothing posted; the timer is armed (cause %s)', async (_label, make, cause) => {
+    // b.jg5 SRJ-704: of these, only an ErrTmuxKillFailed raises the ordinary
+    // kill-failure alert at P's destination; every other answer posts nothing.
+    test.each(REFUSING_ANSWERS)('the kill after a dead reading answers %s → refused: no launch, no recordFailure, no onCapReached; nothing posted but an ErrTmuxKillFailed\'s kill-failure alert; the timer is armed (cause %s)', async (_label, make, cause) => {
       const { h, p, cwd } = build()
       rowReadsUntilSpawn(h, 'ended')
       const err = make('kill')
@@ -5760,7 +5771,7 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       expect(h.errors).toContain(KILL_REFUSED_LINE(p, killOutcomeOf({ thrown: err })))
       expect(h.triggers).toEqual([{ key: p, kind: cause }])
       expectNothingCounted(h, p)
-      expect(h.episodeNotices).toEqual([])
+      expect(h.episodeNotices).toEqual(cause === UNAVAILABLE_RETRY_CAUSE_KILL_FAILED ? [killFailureNotice(p, ordinaryAlertContent(p, { last: err }))] : [])
     })
 
     // b.jg5 SRJ-702 (reconcile note): the restart path kills only after a
@@ -5771,10 +5782,11 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
     test.each<[string, () => Error, string]>([
       ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
       ['a survivor-naming ErrTmuxKillFailed', () => errTmuxKillFailed(undefined, 'pane-process-survived'), UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
-    ])('b.jg5 SRJ-702: the kill after a dead reading answers %s with a success queued behind it → one kill, refused: no launch, no read between tries, no wait; the timer armed once', async (_label, make, cause) => {
+    ])('b.jg5 SRJ-702: the kill after a dead reading answers %s with a success queued behind it → one kill, refused: no launch, no read between tries, no wait; the timer armed once; only the ErrTmuxKillFailed posts its ordinary alert, quoting it', async (_label, make, cause) => {
       const { h, p, cwd } = build()
       rowReadsUntilSpawn(h, 'ended')
-      h.script({ killQueue: [cannedErr(make()), cannedOk(cannedKillResult(true))] })
+      const err = make()
+      h.script({ killQueue: [cannedErr(err), cannedOk(cannedKillResult(true))] })
 
       expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
 
@@ -5784,7 +5796,9 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       expect(h.clock.pendingCount()).toBe(1)
       expect(h.controller.isArmed(p)).toBe(true)
       expectNothingCounted(h, p)
-      expect(h.episodeNotices).toEqual([])
+      // b.jg5 SRJ-702, SRJ-704: one try, so a survivor-naming ErrTmuxKillFailed
+      // is the standing outcome and the ordinary version quotes it alone.
+      expect(h.episodeNotices).toEqual(cause === UNAVAILABLE_RETRY_CAUSE_KILL_FAILED ? [killFailureNotice(p, ordinaryAlertContent(p, { last: err }))] : [])
     })
 
     test('the kill after a dead reading answers ErrSpawnNotFound (regression) → the run still launches P; no refusal', async () => {
@@ -6849,4 +6863,142 @@ describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches 
       expect(h.errors.filter((line) => line === latchedSkipLine(p))).toEqual([])
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-704, SRJ-1007, SRJ-1016: the kill-failure alert at the restart
+// path's kill (E20 T3)
+//
+// The restart path kills only after a `dead` reading, so its kill is one try
+// of the bounded retry (b.jg5 SRJ-702; E20 T2's reconcile note): an
+// `ErrTmuxKillFailed` stands at once and raises the ordinary version through
+// the harness's kill-failure alerts, installed as `main()` installs them,
+// with the context `recovery`. On the recovery harness (both settings 0): P's
+// liveness read answers `ended` (`rowReadsUntilSpawn`) and its kill answers
+// through the stub. Every expected text is built with
+// `src/kill-failure-alert.ts`'s builders (the harness's `killFailureNotice`,
+// `ordinaryAlertContent`, `killFailureRecoveryEntry`). The tries of a row read
+// live (the survivor matrix, the latching reads, AC 64's three tries) and
+// "a later failure in the same episode posts nothing" are proved at the
+// collision ladder's replacement kill, in tests/session-manager.test.ts: here
+// each run's own liveness read of `ended` ends the episode before its kill
+// (b.jg5 SRJ-704), so a later run's failure opens a new one. The lost-message
+// legs are in tests/inbound-recovery-drop-branch.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-704, SRJ-1007: the kill-failure alert at the restart path\'s kill (one try)', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    try {
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  /** A harness whose P reads `ended` until its spawn; P first. */
+  function build(): { h: RecoveryHarness; p: string; cwd: string } {
+    const h = (harness = makeRecoveryHarness())
+    const p = h.keys[0]!
+    rowReadsUntilSpawn(h, 'ended')
+    return { h, p, cwd: h.config.personas[0]!.working_directory }
+  }
+
+  /** The restart run for P, the stub's `kill` answering `err`. */
+  async function runWithKill(h: RecoveryHarness, p: string, cwd: string, err: Error): Promise<RestartRetryOutcome> {
+    h.script({ killError: err })
+    return runRestartRetry(p, cwd, isLaunchInFlight)
+  }
+
+  // AC 64, demo bullet 8 (reconcile note 2: one try at the restart path).
+  test.each([...KILL_FAILED_DESCRIPTIONS])('an ErrTmuxKillFailed (%s) that stands at the one try: one ordinary alert at P\'s destination quoting it, with the not-latched closing; no tmux-unresponsive condition or notice; no launch; P\'s timer armed with the kill-failed cause; P\'s episode open', async (form) => {
+    const { h, p, cwd } = build()
+    const err = errTmuxKillFailed(undefined, form)
+
+    expect(await runWithKill(h, p, cwd, err)).toBe(RESTART_OUTCOME_REFUSED)
+
+    expect(h.episodeNotices).toEqual([killFailureNotice(p, ordinaryAlertContent(p, { last: err }))])
+    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(h.stub.spawnedIds()).toEqual([])
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(h.outageNotices).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
+    expect(h.controller.isArmed(p)).toBe(true)
+    expect(h.killFailureOpen(p)).toBe(true)
+    expect(h.startupErrors()).toEqual([])
+    expect(killFailureLines(h, p)).toHaveLength(1)
+  })
+
+  // b.jg5 SRJ-704, SRJ-1016: the episode runs until P's row reads `ended` or
+  // `missing`, or is gone. The next run's own liveness read of `ended` ends
+  // it, silently, before that run's kill, whose failure then opens a new
+  // episode with its own alert.
+  test('a later run\'s liveness read of ended ends the episode silently; that run\'s kill failure posts a new alert', async () => {
+    const { h, p, cwd } = build()
+    const err = errTmuxKillFailed()
+    await runWithKill(h, p, cwd, err)
+    const alert = killFailureNotice(p, ordinaryAlertContent(p, { last: err }))
+    const firstLines = killFailureLines(h, p)
+
+    await retryNow(h, p)
+
+    expect(h.stub.calls.killCalls).toHaveLength(2)
+    expect(h.episodeNotices).toEqual([alert, alert])
+    const added = killFailureLines(h, p).slice(firstLines.length)
+    expect(added).toHaveLength(2)
+    expect(added[0]).toBe(`[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ended — ${KILL_FAILURE_END_ROW_FINISHED}`)
+    expect(added[1]).toBe(firstLines[0])
+    expect(h.killFailureOpen(p)).toBe(true)
+  })
+
+  // b.jg5 SRJ-704, SRJ-1013, SRJ-1007 (hatch A2): a persona no longer in the
+  // applied configuration when the alert is raised gets the server-log line
+  // and one persona-kill-failed entry carrying the context `recovery`.
+  test('P removed from the applied configuration during its kill: the ordinary version goes to one persona-kill-failed entry with the recovery context and the log-only closing; nothing posted; no episode', async () => {
+    const { h, p, cwd } = build()
+    const err = errTmuxKillFailed(undefined, 'unverifiable-session-present')
+    const kill = h.stub.client.kill.bind(h.stub.client)
+    h.stub.client.kill = async (params) => {
+      try {
+        return await kill(params)
+      } finally {
+        h.remove(p)
+      }
+    }
+
+    expect(await runWithKill(h, p, cwd, err)).toBe(RESTART_OUTCOME_REFUSED)
+
+    expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureRecoveryEntry(p, ordinaryAlertContent(p, { last: err }))])
+    expect(h.startupErrors()).toHaveLength(1)
+    expect(h.episodeNotices).toEqual([])
+    expect(h.killFailureOpen(p)).toBe(false)
+    expect(killFailureLines(h, p)).toEqual([
+      `[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ordinary alert written to the server log and startup-errors.log (${PERSONA_KILL_FAILED_LABEL}) — ${KILL_FAILURE_ROUTE_NOT_CONFIGURED}`,
+    ])
+  })
+
+  // b.jg5 SRJ-703, SRJ-702: a success with no survivor-naming failure before
+  // it raises no alert of either version, and the run launches P.
+  test.each<[string, () => RecoveryStubScript]>([
+    ['a success with kill_sent false', () => ({ killResult: cannedKillResult(false) })],
+    ['ErrSpawnNotFound (the row-gone success)', () => ({ killError: errSpawnNotFound() })],
+  ])('%s at the one try: no alert of either version; P is launched', async (_label, knobs) => {
+    const { h, p, cwd } = build()
+    h.script(knobs())
+
+    expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_LAUNCHED)
+    await h.settle()
+
+    expect(h.stub.spawnedIds()).toEqual([personaInstanceId(p)])
+    expect(h.episodeNotices).toEqual([])
+    expect(killFailureLines(h, p)).toEqual([])
+    expect(h.killFailureOpen(p)).toBe(false)
+    expect(h.startupErrors()).toEqual([])
+  })
 })

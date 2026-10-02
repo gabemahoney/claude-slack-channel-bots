@@ -366,7 +366,9 @@ import {
   conditionRecoveryLine,
   adConfigMalformedRaiseLines,
   expectLostMessageReports,
+  killFailureNotice,
   makeRecoveryHarness,
+  ordinaryAlertContent,
   personaCallCounts,
   personaOf,
   retryNow,
@@ -3527,12 +3529,18 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     const [key] = h.keys as [string]
     const row = modelRow(h, 'ended')
     // A recovery attempt whose kill fails with ErrTmuxKillFailed: the
-    // kill-failure cause, with no launch after it (b.jg5 SRJ-105).
-    h.script({ killError: errTmuxKillFailed() })
+    // kill-failure cause, with no launch after it (b.jg5 SRJ-105), and its
+    // ordinary kill-failure alert, the case's one post (b.jg5 SRJ-704): the
+    // condition's end posts nothing beside it.
+    const killErr = errTmuxKillFailed()
+    h.script({ killError: killErr })
     expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
     await h.settle()
     expect(row.spawnedAt).toEqual([])
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    const killAlert = killFailureNotice(key, ordinaryAlertContent(key, { last: killErr }))
+    expect(h.episodeNotices).toEqual([killAlert])
+    harnessEndCheck = (done) => expect(done.episodeNotices).toEqual([killAlert])
     // Its retry's kill answers and its launch is refused UNAVAILABLE: the
     // condition's start, with the kill-failure cause still recorded.
     h.script({ killError: undefined, spawnError: errTmuxUnresponsive('spawn') })

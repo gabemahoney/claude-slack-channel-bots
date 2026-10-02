@@ -197,7 +197,9 @@ import {
   conditionSilentEndLine,
   conditionStartedLines,
   expectLostMessageReports,
+  killFailureNotice,
   makeRecoveryHarness,
+  ordinaryAlertContent,
   personaOf,
   retryNow,
   type RecoveryHarness,
@@ -443,9 +445,13 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNoPostYet(h)
   })
 
-  test('ErrTmuxKillFailed from the replacement kill of a row read live, at every try, starts nothing and posts nothing (the kill-failure cause only, once); a message lost after it never reports not answering (SRJ-1011)', async () => {
+  // b.jg5 SRJ-307, SRJ-704, SRJ-1011: ErrTmuxKillFailed goes to the
+  // kill-failure alert, never to the condition. Its ordinary version is the
+  // one post, and the episode it opens gives a message lost afterwards state 4.
+  test('ErrTmuxKillFailed from the replacement kill of a row read live, at every try, starts nothing; its one post is the ordinary kill-failure alert (the kill-failure cause only, once); a message lost after it reports kill failed, never not answering (SRJ-1011)', async () => {
     const { h, p, b } = build()
-    h.script({ ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }), killError: errTmuxKillFailed() })
+    const err = errTmuxKillFailed()
+    h.script({ ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }), killError: err })
 
     await h.drive(h.launch(p))
 
@@ -453,14 +459,56 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
     expectNeverStarted(h, p)
     expectNeverStarted(h, b)
-    expectNoPostYet(h)
+    expectPosts(h, [killFailureNotice(p, ordinaryAlertContent(p, { last: err }))])
 
-    // No condition, no outage: not state 5. State 4 (kill failed) has no
-    // binding yet, so the state that applies at the delay 0 is
-    // auto-restart disabled.
+    // No condition, no outage: not state 5; P's kill-failure episode is open: state 4.
     expect(getOutageFlags(p).size).toBe(0)
-    await expectLostMessageReports(h, p, 'auto-restart-disabled')
+    await expectLostMessageReports(h, p, 'kill-failed')
     expectNeverStarted(h, p)
+  })
+
+  // b.jg5 SRJ-702, SRJ-704, SRJ-307: after a survivor-naming failure, tries
+  // that end in ErrTmuxUnresponsive raise the ordinary version, and the last
+  // outcome keeps its own handling besides: it starts the condition once, at
+  // the time it stands (the earlier try's ErrTmuxKillFailed started nothing).
+  test('a survivor-naming ErrTmuxKillFailed, then ErrTmuxUnresponsive twice, at the replacement kill of a row read live: the condition starts once, when the last outcome stands, beside one ordinary alert quoting the survivor-naming description; B’s never starts', async () => {
+    const { h, p, b } = build()
+    const survivor = errTmuxKillFailed(undefined, 'pane-process-survived')
+    h.script({
+      ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }),
+      killQueue: [cannedErr(survivor), cannedErr(errTmuxUnresponsive('kill')), cannedErr(errTmuxUnresponsive('kill'))],
+    })
+    const standsAt = h.clock.now() + (KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS
+
+    await h.drive(h.launch(p))
+
+    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
+    expectHolds(h, p, 'kill', standsAt)
+    expectNeverStarted(h, b)
+    expectPosts(h, [killFailureNotice(p, ordinaryAlertContent(p, { earlierSurvivor: survivor }))])
+  })
+
+  // b.jg5 SRJ-307, SRJ-1016: the kill-failure episode and the condition are
+  // kept apart: the alert neither ends a condition that holds nor is held
+  // back by it, and the condition's own onset still posts at its next tick.
+  test('a condition already holding for P is neither ended nor held back by the ordinary alert: the alert posts, the condition keeps its first refusal, and its onset still posts at the next tick', async () => {
+    const { h, p } = build(TICK_MODE)
+    const at = await refuse(h, p)
+    const err = errTmuxKillFailed()
+    h.script({ ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }), killError: err })
+
+    await h.drive(h.launch(p))
+
+    const killAlert = killFailureNotice(p, ordinaryAlertContent(p, { last: err }))
+    expectHolds(h, p, 'spawn', at)
+    expect(h.conditionEnds).toEqual([])
+    expectPosts(h, [killAlert])
+
+    await h.advance(tickMs(h))
+    tick(h)
+
+    expectHolds(h, p, 'spawn', at)
+    expectPosts(h, [killAlert, onset(p)])
   })
 
   // b.jg5 SRJ-702, SRJ-307: only the outcome that stands reaches the
@@ -1242,9 +1290,11 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
     expectNeverStarted(h, b)
   })
 
-  test('ErrTmuxKillFailed never posts a tmux-unresponsive notice: not at retries past the floor and the threshold, nor at a tick', async () => {
+  // b.jg5 SRJ-307, SRJ-704 (AC 64): its one post is the kill-failure alert.
+  test('ErrTmuxKillFailed never posts a tmux-unresponsive notice: not at retries past the floor and the threshold, nor at a tick; its one post is the ordinary kill-failure alert', async () => {
     const { h, p } = build({ action: 'scripted' })
-    h.script({ ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }), killError: errTmuxKillFailed() })
+    const err = errTmuxKillFailed()
+    h.script({ ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }), killError: err })
     await h.drive(h.launch(p))
 
     await h.advance(2 * adAlertThresholdMsInEffect())
@@ -1253,7 +1303,7 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
 
     expect(retriesOf(h, p)).toBeGreaterThan(1)
     expectNeverStarted(h, p)
-    expectPosts(h, [])
+    expectPosts(h, [killFailureNotice(p, ordinaryAlertContent(p, { last: err }))])
   })
 })
 

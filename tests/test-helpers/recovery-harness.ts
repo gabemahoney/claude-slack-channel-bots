@@ -177,6 +177,24 @@
  *   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY)` and `episodes.isOpen`);
  *   a case moves it only through restart runs, a latch, a forget or
  *   `shutdown()`.
+ * - The kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016;
+ *   `createKillFailureAlerts`) over the same episodes instance, built and
+ *   installed in the session manager (`setKillFailureAlerts`, removed by
+ *   `cleanup()`) as `main()` builds and installs them, before any launch:
+ *   the restart path's kill adapter and the collision ladder's replacement
+ *   kills raise the bounded retry's decision through them (context
+ *   `recovery`), and every own-row read of the session manager that reads
+ *   the row `ended` or `missing`, or finds it gone (`ErrSpawnNotFound`), ends
+ *   the persona's episode silently. The destination route posts through the
+ *   episodes' sink, so the alert lands in `episodeNotices`; the
+ *   configured-key lookup reads the live applied set, so after `remove(key)`
+ *   (also mid-run, from inside a stub call, e.g. through
+ *   `recordCallOrder`'s `during`) the alert takes the log-only route, one
+ *   `recordStartupError(<class>, <entry>)` into the harness's
+ *   `startup-errors.log` (`startupErrors()`); their lines go to `lines`.
+ *   `killFailureOpen(key)` reads whether the persona's episode is open
+ *   (the lost-message driver's kill-failed input); nothing sets it by hand.
+ *   The applied set is the harness's own, so a removal ends with it.
  * - `latch` and `latchEvents` (b.jg5 SRJ-501, SRJ-502, SRJ-508): one latch
  *   per harness (`createConflictLatch`, its lines to `lines`), composed as
  *   `main()` composes it: installed in the session manager
@@ -330,8 +348,12 @@
  *   flag raised, no timer armed, below the restart cap, not latched and
  *   nothing in flight arms its timer before the state is decided, and so
  *   reports `not-answering`, with no restart asked for.
- *   The members later Epics bind (held on `ErrInvalidFlags`, kill-failed, a
- *   sequence or wait step running) are left unbound, as in production.
+ *   Its `isKillFailed` (b.jg5 SRJ-1011 state 4) is bound as `main()` binds
+ *   it: the harness's kill-failure alerts' "episode open" query
+ *   (`killFailureOpen`, below), read at call time, so a message lost while
+ *   P's kill-failure episode is open reports `kill-failed`.
+ *   The members later Epics bind (held on `ErrInvalidFlags`, a sequence or
+ *   wait step running) are left unbound, as in production.
  *   Each persona has its own Slack stub (`slack(key)`, leak marker on) as its
  *   client and bot identity; the routing's `notify` records each notice in
  *   `lostMessageNotices` (`{ key, text }`, the body without the persona
@@ -396,6 +418,7 @@
  *   install and reset the harness made (`console.error`, the restart module's state and the
  *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
  *   the session manager's latch install and the latch's set observers,
+ *   the kill-failure alerts' install,
  *   the ladder's kill clock and the kill retry's keep-going query,
  *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
  *   harnesses built one after the other share no query,
@@ -434,8 +457,16 @@
  * `unclassifiedLinePrefix`, `unclassifiedLines`, `unclassifiedStartedLines`
  * and the line builders `unclassifiedStartedLine`, `unclassifiedEndedLine`
  * (for any end reason), `unclassifiedPostedLine` and
- * `unclassifiedLoggedLine`; and `adConfigMalformedRaiseLines`, the outage
- * state's `ad-config-malformed` raise lines.
+ * `unclassifiedLoggedLine`; `adConfigMalformedRaiseLines`, the outage
+ * state's `ad-config-malformed` raise lines; and the kill-failure alert's
+ * texts (b.jg5 SRJ-704, SRJ-1007), each built with
+ * `src/kill-failure-alert.ts`'s builders for the persona's own session and
+ * instance id from the thrown values' raw descriptions:
+ * `ordinaryAlertContent`, `survivorAlertContent`, `killFailureNotice` (the
+ * destination post as `episodeNotices` holds it), `killFailureRecoveryEntry`
+ * (the not-configured route's entry, context `recovery`), with
+ * `startupEntriesOf` (one class's entries without their timestamp) and
+ * `killFailureLines` (the alerts' own lines).
  *
  * Pending-only mode is armed directly (`controller.armPendingOnly`) until
  * covered `pending` rows exist. Later work extends this harness in place.
@@ -482,14 +513,27 @@ import {
   type ConflictNoticeEpisodes,
 } from '../../src/conflict-latch.ts'
 import { LIVENESS_LIVE } from '../../src/liveness-reading.ts'
-import { classifyAdError, describeAdErrorClassification } from '../../src/ad-error-class.ts'
+import { classifyAdError, describeAdErrorClassification, killFailedDescriptionOf } from '../../src/ad-error-class.ts'
+import {
+  KILL_FAILURE_CLOSING_DESTINATION,
+  KILL_FAILURE_CLOSING_LOG_ONLY,
+  KILL_FAILURE_CONTEXT_RECOVERY,
+  KILL_FAILURE_VERSION_ORDINARY,
+  KILL_FAILURE_VERSION_SURVIVOR,
+  killFailureAlertEntryText,
+  killFailureAlertText,
+  type KillFailureAlertContent,
+  type KillFailureClosing,
+} from '../../src/kill-failure-alert.ts'
 import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
 import { _resetOutageState, clearOutageFlag, getOutageFlags, initOutageState, type OutageClass } from '../../src/outage-state.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
 import {
+  createKillFailureAlerts,
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
   createUnclassifiedErrorEpisodes,
+  PERSONA_EPISODE_KIND_KILL_FAILURE,
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
   PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
@@ -505,7 +549,7 @@ import {
   type TmuxUnresponsiveEndResult,
   type UnclassifiedErrorEndReason,
 } from '../../src/persona-episodes.ts'
-import { personaInstanceId } from '../../src/persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName } from '../../src/persona-identity.ts'
 import { createPersonaRouting, type PersonaRouting } from '../../src/persona-routing.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
 import { createPersonaRelaunchGate, createPersonaUpPredicate, type PersonaUpQuery } from '../../src/persona-start.ts'
@@ -548,6 +592,7 @@ import {
   readPersonaRowState,
   setConfiguredPersonaQuery,
   setConflictLatch,
+  setKillFailureAlerts,
   setPersonaKillKeepGoingQuery,
   setSessionNotifier,
   spawnForPersona,
@@ -785,6 +830,8 @@ export interface RecoveryHarness {
   readonly stops: RecoveryStop[]
   /** Whether persona `key`'s unclassified-error episode is open (read-only). */
   unclassifiedErrorOpen(key: string): boolean
+  /** Whether persona `key`'s kill-failure episode is open (read-only; the alerts' `isOpen`, the driver's kill-failed input). */
+  killFailureOpen(key: string): boolean
   /** The harness's one latch, read-only (`isLatched`, `record`); composed as `main()` composes it. */
   readonly latch: RecoveryLatchView
   /** Every latch set, each of the three recorded holds and every CONFLICT notice post, in order. */
@@ -1036,6 +1083,20 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // to `lines`. It is the restart deps' slow-recovery observer below, and its
   // latch end is the latch's fourth hold.
   const slowRecovery = createSlowRecoveryTracker({ episodes, log })
+  // As main() builds them (b.jg5 SRJ-704, SRJ-1007, SRJ-1016): the
+  // kill-failure alerts over the same episodes instance, so a destination
+  // post lands in `episodeNotices` and the episode is forgotten and closed
+  // with the others; the configured-key lookup over the live applied set (a
+  // persona `remove(key)` dropped takes the log-only route); the log-only
+  // route through `recordStartupError` into the harness's startup-errors
+  // capture. Installed in the session manager below; the driver's kill-failed
+  // input reads its episode.
+  const killFailureAlerts = createKillFailureAlerts({
+    episodes,
+    log,
+    isConfigured: (key) => appliedPersona(key) !== undefined,
+    logOnly: (classLabel, entry) => recordStartupError(classLabel, entry),
+  })
 
   // As main() builds it (b.jg5 SRJ-501, SRJ-502, SRJ-508): one latch per
   // harness, its lines to `lines`. A recorder observer first (it only records
@@ -1165,6 +1226,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // configured while it is in the live applied set, so a note on a persona's
   // own row latches it and a key outside the set, or removed from it, does not.
   setConfiguredPersonaQuery((key) => appliedPersona(key) !== undefined)
+  // As main() installs them, before any launch (b.jg5 SRJ-704, SRJ-1016):
+  // the restart path's kill and the ladder's replacement kills raise through
+  // them, and the session manager's own-row reads end a persona's episode.
+  setKillFailureAlerts(killFailureAlerts)
   // As main() installs it (b.jg5 SRJ-702, SRJ-305): a kill's tries stop once
   // the persona is not up (the up predicate over the relaunch gate's
   // connection, bring-up outcome and live applied set) or the server is
@@ -1454,6 +1519,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // read is the harness's liveness adapter, so it shows as a stub `status`.
       isWorkInFlight: isPersonaWorkInFlight,
       readRowLiveness: isSessionAliveAdapter,
+      // As main() binds it (b.jg5 SRJ-1011 state 4): P's kill-failure
+      // episode is open, read at call time from the harness's alerts.
+      isKillFailed: (key) => killFailureAlerts.isOpen(key) === true,
       // As main() binds it (b.jg5 SRJ-311): nothing while shutting down, else
       // the server's one check over the harness's own holders.
       armRetryTimerIfMissing: (key) => {
@@ -1521,6 +1589,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     capReached,
     stops,
     unclassifiedErrorOpen: (key) => unclassifiedErrors.isOpen(key),
+    killFailureOpen: (key) => killFailureAlerts.isOpen(key),
     latch: Object.freeze({ isLatched: (key: string) => latch.isLatched(key), record: (key: string) => latch.record(key) }),
     latchEvents,
     slowRecovery: Object.freeze({ count: (key: string) => slowRecovery.count(key), isOpen: (key: string) => slowRecovery.isOpen(key) }),
@@ -1658,6 +1727,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       _resetOutageState()
       setSessionNotifier(undefined)
       setConflictLatch(undefined)
+      setKillFailureAlerts(undefined)
       _resetConfiguredPersonaQuery()
       setPersonaKillKeepGoingQuery(undefined)
       _resetLadderKillClock()
@@ -1959,6 +2029,75 @@ export function unclassifiedPostedLine(key: string, elapsedMs: number, threshold
 /** The line of an alert for a persona not in the applied configuration, written only to the logs. */
 export function unclassifiedLoggedLine(key: string, elapsedMs: number, thresholdMs: number, err: unknown): string {
   return `${unclassifiedLinePrefix(key)}alert written to the server log and startup-errors.log (${PERSONA_UNCLASSIFIED_ERROR_LABEL}) — the persona is not in the applied configuration; ${unclassifiedMet(elapsedMs, thresholdMs, err)}`
+}
+
+// The kill-failure alert's texts as the harness captures them (b.jg5
+// SRJ-704, SRJ-1007), each built with `src/kill-failure-alert.ts`'s builders
+// for persona `key`'s own session and instance id; every description is the
+// thrown value's own (`killFailedDescriptionOf`), raw, so the builders redact
+// it as the alert does.
+
+/** The raw description an `ErrTmuxKillFailed` carries; throws when `err` carries none. */
+function killFailedDescription(err: Error): string {
+  const description = killFailedDescriptionOf(err)
+  if (description === undefined) throw new Error('recovery harness: the value is no ErrTmuxKillFailed with a description')
+  return description
+}
+
+/**
+ * The ordinary version's content for persona `key`'s own row: quoting the
+ * description of `last` (the standing `ErrTmuxKillFailed`) and of
+ * `earlierSurvivor` (an earlier try's survivor-naming one), each when given;
+ * neither leaves the "agent-director said" sentence out.
+ */
+export function ordinaryAlertContent(key: string, quoted: { last?: Error; earlierSurvivor?: Error } = {}): KillFailureAlertContent {
+  return {
+    version: KILL_FAILURE_VERSION_ORDINARY,
+    session: personaTmuxSessionName(key),
+    instanceId: personaInstanceId(key),
+    quotes: {
+      ...(quoted.last === undefined ? {} : { lastKillFailedDescription: killFailedDescription(quoted.last) }),
+      ...(quoted.earlierSurvivor === undefined ? {} : { earlierSurvivorDescription: killFailedDescription(quoted.earlierSurvivor) }),
+    },
+  }
+}
+
+/** The survivor version's content for persona `key`'s own session, quoting `survivor`'s description. */
+export function survivorAlertContent(key: string, survivor: Error): KillFailureAlertContent {
+  return { version: KILL_FAILURE_VERSION_SURVIVOR, session: personaTmuxSessionName(key), survivorDescription: killFailedDescription(survivor) }
+}
+
+/**
+ * The alert at persona `key`'s destination, as `episodeNotices` holds it:
+ * the Slack text with `closing` (the destination sentence by default; the
+ * latched one with `KILL_FAILURE_CLOSING_DESTINATION_LATCHED`).
+ */
+export function killFailureNotice(key: string, content: KillFailureAlertContent, closing: KillFailureClosing = KILL_FAILURE_CLOSING_DESTINATION): RecoveryNotice {
+  return { key, text: killFailureAlertText(content, closing, true) }
+}
+
+/**
+ * The startup-errors entry of an alert the restart path or the collision
+ * ladder raised for persona `key` no longer in the applied configuration:
+ * `persona=<key> (recovery): <text>`, the unescaped text with the log-only
+ * closing sentence of its version.
+ */
+export function killFailureRecoveryEntry(key: string, content: KillFailureAlertContent): string {
+  return killFailureAlertEntryText(`persona=${key}`, KILL_FAILURE_CONTEXT_RECOVERY, killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false))
+}
+
+/** The harness's startup-errors entries of class `classLabel`, each the text after its timestamp and class, in order. */
+export function startupEntriesOf(h: RecoveryHarness, classLabel: string): string[] {
+  const marker = `] [${classLabel}] `
+  return h.startupErrors().flatMap((line) => {
+    const at = line.indexOf(marker)
+    return at === -1 ? [] : [line.slice(at + marker.length)]
+  })
+}
+
+/** Persona `key`'s kill-failure alert lines (the alerts' own, in `lines`), in order. */
+export function killFailureLines(h: RecoveryHarness, key: string): string[] {
+  return h.lines.filter((line) => line.startsWith(`[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_KILL_FAILURE} `))
 }
 
 /** The outage class a CONFIG answer raises (b.jg5 SRJ-316). */

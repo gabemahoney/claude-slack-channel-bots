@@ -98,7 +98,11 @@
  *      gets one immediate version re-check (a stop it decides answers
  *      `failed` marked `stopping`), a class the kill has no row for is
  *      reported as UNCLASSIFIED (step 3's refusal, never counted), and every
- *      other outcome is step 3's refusal.
+ *      other outcome is step 3's refusal. The retry's kill-failure alert
+ *      decision is then raised (`raisePersonaKillFailureAlert`, through the
+ *      installed kill-failure alerts; b.jg5 SRJ-704): the survivor version
+ *      before the delete and spawn, the ordinary version after the
+ *      outcome's own handling.
  *
  * Own-row reads (b.jg5 SRJ-114, SRJ-115): every `get` of a persona's own row
  * at SRJ-114's sites goes through `readPersonaOwnRow`, and every own-row
@@ -115,7 +119,10 @@
  * An UNUSABLE NAME answer to either read latches the persona with the state
  * unreadable. A read that latched answers `latched`, and the caller calls
  * nothing more for the persona: no `send-keys`, kill, delete or launch, and
- * no hand-off to the `pending` deferral or the pending-only retry. Every
+ * no hand-off to the `pending` deferral or the pending-only retry. A row
+ * either read reads `ended` or `missing`, or an `ErrSpawnNotFound` answer,
+ * ends the persona's kill-failure episode silently (b.jg5 SRJ-704,
+ * SRJ-1016). Every
  * `read-pane` of a persona's own row outside the dialog approver goes
  * through the shared read-pane (`readPersonaOwnPane`, b.jg5 SRJ-117; the
  * outcome and its class in `src/pane-read.ts`). Its uses (the launch wait's
@@ -285,6 +292,27 @@ import {
   type KillOutcome,
 } from './checked-kill.ts'
 import {
+  KILL_FAILURE_CONTEXT_RECOVERY,
+  KILL_FAILURE_CONTEXT_START_SWEEP,
+  KILL_FAILURE_VERSION_ORDINARY,
+  KILL_FAILURE_VERSION_SURVIVOR,
+  ORPHAN_CLEANUP_LABEL,
+  describeKillFailureDescriptions,
+  killFailureAlertContentOf,
+  killFailureAlertEntryText,
+  killFailureAlertText,
+  selectKillFailureAlertRoute,
+} from './kill-failure-alert.ts'
+import {
+  KILL_FAILURE_END_ROW_FINISHED,
+  KILL_FAILURE_END_ROW_GONE,
+  type KillFailureAlerts,
+  type KillFailureEndReason,
+} from './persona-episodes.ts'
+import {
+  KILL_RETRY_ALERT_NONE,
+  KILL_RETRY_END_READ_LATCHED,
+  KILL_RETRY_END_STOPPED,
   KILL_RETRY_READ_FAILED,
   KILL_RETRY_READ_LATCHED,
   KILL_RETRY_READ_NO_ROW,
@@ -296,6 +324,7 @@ import {
   killRetrySeedOfState,
   killRetryStopped,
   runKillRetry,
+  type KillRetryAlert,
   type KillRetryPassBudget,
   type KillRetryRead,
   type KillRetryResult,
@@ -1140,6 +1169,50 @@ export function _resetConfiguredPersonaQuery(): void {
   configuredPersonaQuery = undefined
 }
 
+/**
+ * The installed kill-failure alerts (b.jg5 SRJ-704, SRJ-1016;
+ * `createKillFailureAlerts`, `src/persona-episodes.ts`). Production installs
+ * `main()`'s, built over its notice episodes. The persona kills' alert
+ * (`raisePersonaKillFailureAlert`) raises through it, and every own-row read
+ * that reads the row `ended` or `missing`, or finds it gone, ends the
+ * persona's kill-failure episode through it (`endKillFailureEpisodeOnRead`).
+ * With none installed (unit tests, the integration driver) an alert is
+ * written as one log line only, and no episode is ended.
+ */
+let killFailureAlerts: KillFailureAlerts | undefined
+
+/** Install the kill-failure alerts (production: `main()`), or remove them with undefined. */
+export function setKillFailureAlerts(alerts: KillFailureAlerts | undefined): void {
+  killFailureAlerts = alerts
+}
+
+/** End persona `key`'s kill-failure episode for `reason` through the installed alerts. Never throws. */
+function endKillFailureEpisode(key: string, reason: KillFailureEndReason): void {
+  try {
+    killFailureAlerts?.end(key, reason)
+  } catch (err) {
+    console.error(`[slack] kill-failure episode end for ${keyRef(key)} failed: ${describeThrownValue(err)}`)
+  }
+}
+
+/**
+ * The kill-failure episode's end at a read of persona `key`'s own row
+ * (b.jg5 SRJ-704, SRJ-1016): a row read `ended` or `missing`
+ * (`AGENT_DIRECTOR_DEAD_STATES`), or an answer of `ErrSpawnNotFound` (by
+ * name: the row is gone), ends the persona's open episode silently. No other
+ * answer ends it: not a live state, not `ErrSystemInstallDisappeared` (which
+ * reads no row), and no kill's success. Never throws.
+ */
+function endKillFailureEpisodeOnRead(key: string, answer: { readonly state: unknown } | { readonly thrown: unknown }): void {
+  if ('thrown' in answer) {
+    if (hasAdErrorName(answer.thrown, ERR_SPAWN_NOT_FOUND_NAME)) endKillFailureEpisode(key, KILL_FAILURE_END_ROW_GONE)
+    return
+  }
+  if (typeof answer.state === 'string' && AGENT_DIRECTOR_DEAD_STATES.has(answer.state)) {
+    endKillFailureEpisode(key, KILL_FAILURE_END_ROW_FINISHED)
+  }
+}
+
 /** `readPersonaOwnRow` read the row: `latched` is true when this read latched the persona. */
 export const OWN_ROW_READ_ROW = 'row'
 /** `readPersonaOwnRow`'s `get` answered `ErrSpawnNotFound`: the row is absent. */
@@ -1212,6 +1285,10 @@ export interface OwnRowReadSite {
  *   - `refused` for any other error, carried unchanged for the caller's
  *     refusal handling (`refusalAt`, b.jg5 SRJ-105) or its own row.
  *
+ * A row read `ended` or `missing`, or `ErrSpawnNotFound`, also ends the
+ * persona's kill-failure episode silently (`endKillFailureEpisodeOnRead`;
+ * b.jg5 SRJ-704, SRJ-1016).
+ *
  * Log lines (no line carries a token: the note and the instance id are
  * agent-director's text, rendered by `renderLogMessageText`, and an
  * UNUSABLE NAME answer by the redacting describer):
@@ -1240,7 +1317,11 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
       client.get({ claude_instance_id: personaInstanceId(key) }),
     )
   } catch (err) {
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: OWN_ROW_READ_ABSENT }
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+      // b.jg5 SRJ-704, SRJ-1016: the row is gone; the kill-failure episode ends.
+      endKillFailureEpisodeOnRead(key, { thrown: err })
+      return { kind: OWN_ROW_READ_ABSENT }
+    }
     if (at.unusableNameRoutedIn !== undefined) {
       // b.jg5 SRJ-512, SRJ-1002: routed, so nothing latches; carried as a failed read.
       if (isUnusableNameError(err)) logUnusableNameRouted(key, at, at.unusableNameRoutedIn, err)
@@ -1249,6 +1330,8 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
     if (latchOnUnusableNameRead(key, err, at)) return { kind: OWN_ROW_READ_LATCHED }
     return { kind: OWN_ROW_READ_REFUSED, error: err }
   }
+  // b.jg5 SRJ-704, SRJ-1016: a row read `ended` or `missing` ends the kill-failure episode.
+  endKillFailureEpisodeOnRead(key, { state: row.state })
   try {
     return { kind: OWN_ROW_READ_ROW, row, latched: applyOwnRowRules(key, row, at) }
   } catch (err) {
@@ -1459,6 +1542,10 @@ export type OwnRowStatusAnswer =
  *     name) latches the persona with the state unreadable
  *     (`latchOnUnusableNameRead`: one line, no further read). Any other
  *     value, `ErrSpawnNotFound` included, is left to the caller.
+ *   - Either way, first: a result reading `ended` or `missing`, or an
+ *     `ErrSpawnNotFound` answer (the row is gone), ends the persona's
+ *     kill-failure episode silently (`endKillFailureEpisodeOnRead`; b.jg5
+ *     SRJ-704, SRJ-1016).
  *
  * With no latch installed a latching answer still answers true, with
  * nothing latched, as at the CONFLICT row. Log lines:
@@ -1468,6 +1555,9 @@ export type OwnRowStatusAnswer =
  */
 export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, at: OwnRowReadSite): boolean {
   try {
+    // b.jg5 SRJ-704, SRJ-1016: a row read `ended` or `missing`, or gone, ends
+    // the persona's kill-failure episode, whoever made the call.
+    endKillFailureEpisodeOnRead(key, 'thrown' in answer ? { thrown: answer.thrown } : { state: answer.result.state })
     if ('thrown' in answer) return latchOnUnusableNameRead(key, answer.thrown, at)
     const row = { ...answer.result, claude_instance_id: personaInstanceId(key) }
     const decision = decideOwnRowRead({ key, row, configured: configuredReadingOf(key).configured })
@@ -6696,6 +6786,60 @@ export async function retryPersonaKill(key: string, options: PersonaKillRetryOpt
   return result
 }
 
+/**
+ * Raise the kill-failure alert that persona `key`'s kill retry decided
+ * (`retried.alert`; b.jg5 SRJ-704, SRJ-702, SRJ-1007), at the restart path
+ * (`_buildKillSessionAdapter`, `src/server.ts`) and the collision ladder
+ * (`ladderKill`), after the standing outcome's own handling (a CONFLICT has
+ * latched the persona with its own post; an UNAVAILABLE outcome has armed
+ * its retry timer, `ErrTmuxKillFailed` with the kill-failed cause and never
+ * the `tmux-unresponsive` condition) and, for the survivor version, before
+ * the caller's next step (the launch, or the delete and the spawn). The
+ * context is `recovery` at both sites (SRJ-1007). Through the installed
+ * kill-failure alerts (`setKillFailureAlerts`), which route it by whether
+ * the persona is in the applied configuration now:
+ *   - `survivor`: its destination, once for this retry, with no episode; or
+ *     one `persona-kill-survivor` entry when not configured;
+ *   - `ordinary`: its destination, once per kill-failure episode, closing
+ *     with the latched sentence when the persona is latched now (the last
+ *     outcome latched it, a read between tries did, or it latched while the
+ *     tries ran), and otherwise with "CSCB keeps retrying"; or one
+ *     `persona-kill-failed` entry when not configured.
+ * The keep-going stop (b.jg5 SRJ-702, SRJ-301): an `ordinary` decision whose
+ * tries the keep-going check stopped while the persona is not latched (it
+ * is torn down or not up, or the server is shutting down), or whose last
+ * outcome's version re-check decided that the server stops, is raised with
+ * `stopped`: no retry follows, so for a configured persona the alerts post
+ * nothing (their text would say CSCB keeps retrying) and open no episode,
+ * and write one line with the decision and the redacted descriptions; for a
+ * persona no longer in the applied configuration (one removed while the
+ * tries ran) the not-configured route's entry is written as usual. With no
+ * alerts installed, one line carries the decision instead. A `none`
+ * decision does nothing. Never throws.
+ *
+ *   [slack] <site>: kill for <ref>: the kill-failure alert's <version> version is not raised — no kill-failure alerts are installed; <descriptions> (b.jg5 SRJ-704)
+ *
+ * where `<descriptions>` is `last="<redacted>"` and `earlier survivor-naming="<redacted>"`, each when present, or `survivor-naming="<redacted>"`.
+ */
+export function raisePersonaKillFailureAlert(key: string, retried: KillRetryResult, site: string, ref: string): void {
+  try {
+    const decision = retried.alert
+    if (decision.kind === KILL_RETRY_ALERT_NONE) return
+    const latched = retried.end === KILL_RETRY_END_READ_LATCHED || personaLatchedNow(key)
+    const stopped = killOutcomeStopsServer(retried.outcome) || (retried.end === KILL_RETRY_END_STOPPED && !latched)
+    const alerts = killFailureAlerts
+    if (alerts === undefined) {
+      console.error(
+        `[slack] ${site}: kill for ${ref}: the kill-failure alert's ${decision.kind} version is not raised — no kill-failure alerts are installed; ${describeKillFailureDescriptions(decision)} (b.jg5 SRJ-704)`,
+      )
+      return
+    }
+    alerts.raise({ key, decision, latched, stopped, context: KILL_FAILURE_CONTEXT_RECOVERY })
+  } catch (err) {
+    console.error(`[slack] ${site}: kill for ${ref}: raising the kill-failure alert failed: ${describeThrownValue(err)}`)
+  }
+}
+
 /** One between-try `status` read of persona `key`'s own row, as the kill retry takes it. Never throws. */
 async function readPersonaKillRow(key: string, site: string, ref: string): Promise<KillRetryRead> {
   const read = await readPersonaOwnRowStatus(key, { site, what: KILL_RETRY_READ_WHAT, ref })
@@ -6767,7 +6911,10 @@ export async function deletePersonaInstance(key: string): Promise<boolean> {
  * and nothing more called (`ladderKillStopped`). Every other outcome stops
  * the chain (SRJ-110: "No step follows"), after which the caller deletes and
  * launches nothing and answers the result `ladderKillStop` gives. The
- * retry's alert decision stays on its result; this site raises no alert.
+ * retry's alert decision is raised (`raisePersonaKillFailureAlert`, context
+ * `recovery`): the survivor version after a success, before the chain's
+ * delete and spawn; the ordinary version after the outcome's own handling
+ * (b.jg5 SRJ-702, SRJ-704).
  */
 async function ladderKill(
   key: string,
@@ -6785,10 +6932,16 @@ async function ladderKill(
   const { outcome } = retried
   if (killLetsNextStepRun(outcome)) {
     console.error(`[slack] spawnForPersona: kill for ${ref}: ${describeKillOutcome(outcome)} — the delete and the fresh spawn follow (b.jg5 SRJ-701)`)
+    // b.jg5 SRJ-702, SRJ-704: a survivor-naming failure earlier in these
+    // tries raises the survivor version once, before the delete and spawn.
+    raisePersonaKillFailureAlert(key, retried, 'spawnForPersona', ref)
     return undefined
   }
-  if (killRetryStopped(retried)) return ladderKillStopped(key, ref, outcome)
-  return ladderKillStop(key, outcome, ref, lastRead)
+  // b.jg5 SRJ-702, SRJ-704: the ordinary version follows the standing
+  // outcome's own handling (a CONFLICT's latch and its post first).
+  const answered = killRetryStopped(retried) ? ladderKillStopped(key, ref, outcome) : await ladderKillStop(key, outcome, ref, lastRead)
+  raisePersonaKillFailureAlert(key, retried, 'spawnForPersona', ref)
+  return answered
 }
 
 /**
@@ -8771,6 +8924,14 @@ function sweepDecision(
  * re-check decided that the server stops (`stop.stopping` is then set): one
  * line (`sweepStoppedLine`), and nothing more. The row has no persona label,
  * so no outage is raised for it and nothing latches.
+ *
+ * The kill-failure alert (b.jg5 SRJ-704, SRJ-714, SRJ-1007), from the
+ * retry's decision, with the start sweep's context and closing sentence and
+ * the row's own id: the ordinary version's text rides in that
+ * `orphan-cleanup` entry (`; kill-failure alert: instanceId=<id> (start
+ * sweep): <text>`); after a success that stands, the survivor version is one
+ * `persona-kill-survivor` entry naming the row. Nothing is posted, no retry
+ * timer is armed and nothing latches.
  */
 async function keepPrePersonaRow(
   pass: SweepPass,
@@ -8785,7 +8946,7 @@ async function keepPrePersonaRow(
   console.error(
     `[slack] reconcileOrphans: pre-persona row (no persona label) instanceId=${id} state=${row.state} tmux_session=${row.tmux_session_name} is live — killing it; the row is kept (a pre-persona row is never deleted)`,
   )
-  const { outcome } = await sweepKill(pass, id, row.state, undefined)
+  const { outcome, alert } = await sweepKill(pass, id, row.state, undefined)
   if (!killLetsNextStepRun(outcome)) {
     counts.killFailed++
     if (stop.stopping) {
@@ -8793,13 +8954,68 @@ async function keepPrePersonaRow(
       return true
     }
     recordStartupError(
-      'orphan-cleanup',
-      `kill did not succeed for pre-persona row instanceId=${id}: ${describeKillOutcome(outcome)}; row kept, its session may still be running`,
+      ORPHAN_CLEANUP_LABEL,
+      `kill did not succeed for pre-persona row instanceId=${id}: ${describeKillOutcome(outcome)}; row kept, its session may still be running` +
+        sweepOrdinaryAlertTail(row, alert),
     )
     return true
   }
   console.error(`[slack] reconcileOrphans: kill succeeded for pre-persona row instanceId=${id} (${describeKillOutcome(outcome)}) — row kept`)
+  recordSweepSurvivorAlert(row, alert)
   return true
+}
+
+/**
+ * The kill-failure alert for a start-sweep kill of `row` (b.jg5 SRJ-704,
+ * SRJ-714, SRJ-1007): the route `selectKillFailureAlertRoute` gives for the
+ * start sweep (the sweep acts for no persona: no destination, no episode, no
+ * retry timer) and the entry's text, `instanceId=<id> (start sweep): <text>`,
+ * the text naming the row's session and its instance id (a pre-persona row's
+ * id as it is) with the start sweep's closing sentence, unescaped. Undefined
+ * when `alert` is not of `version`. Never throws.
+ */
+function sweepKillAlertEntry(
+  row: ListRow,
+  alert: KillRetryAlert,
+  version: typeof KILL_FAILURE_VERSION_ORDINARY | typeof KILL_FAILURE_VERSION_SURVIVOR,
+): { readonly classLabel: string; readonly entry: string } | undefined {
+  try {
+    const session = typeof row.tmux_session_name === 'string' ? row.tmux_session_name : ''
+    const content = killFailureAlertContentOf(alert, session, row.claude_instance_id)
+    if (content === undefined || content.version !== version) return undefined
+    const route = selectKillFailureAlertRoute({ version, context: KILL_FAILURE_CONTEXT_START_SWEEP, configured: false, latched: false })
+    if (route.classLabel === undefined) return undefined
+    const text = killFailureAlertText(content, route.closing, false)
+    return { classLabel: route.classLabel, entry: killFailureAlertEntryText(`instanceId=${row.claude_instance_id}`, KILL_FAILURE_CONTEXT_START_SWEEP, text) }
+  } catch (err) {
+    console.error(`${SWEEP_LOG_PREFIX}: building the kill-failure alert for instanceId=${row.claude_instance_id} failed: ${describeThrownValue(err)}`)
+    return undefined
+  }
+}
+
+/**
+ * The tail a start-sweep kill's `orphan-cleanup` entry gains for the
+ * kill-failure alert's ordinary version (b.jg5 SRJ-714, SRJ-1007):
+ * `; kill-failure alert: <entry>` when the retry decided it (an
+ * `ErrTmuxKillFailed` that stands, or any failure after a survivor-naming
+ * one), else the empty string, so the entry stays as it was. Never throws.
+ */
+function sweepOrdinaryAlertTail(row: ListRow, alert: KillRetryAlert): string {
+  const built = sweepKillAlertEntry(row, alert, KILL_FAILURE_VERSION_ORDINARY)
+  return built === undefined ? '' : `; kill-failure alert: ${built.entry}`
+}
+
+/**
+ * After a start-sweep kill whose success stands: when the retry decided the
+ * survivor version (a survivor-naming `ErrTmuxKillFailed` earlier in its
+ * tries; b.jg5 SRJ-702, SRJ-704, SRJ-1013), one `persona-kill-survivor`
+ * entry names the row with the survivor text and the start sweep's closing
+ * sentence, its writer also writing the server-log line. Nothing else is
+ * done: the row counts as killed. Never throws.
+ */
+function recordSweepSurvivorAlert(row: ListRow, alert: KillRetryAlert): void {
+  const built = sweepKillAlertEntry(row, alert, KILL_FAILURE_VERSION_SURVIVOR)
+  if (built !== undefined) recordStartupError(built.classLabel, built.entry)
 }
 
 /**
@@ -8847,8 +9063,9 @@ function sweepStoppedLine(instanceId: string, described: string): string {
  * pass is made once (AC 56); a row listed finished gets one kill. Each try
  * is one checked kill (`sweepKillTry`); before each further try, one bare
  * `status` read of the row (`sweepKillRead`). Each try and read is logged
- * with the sweep's prefix. Answers the retry's result, whose alert decision
- * this site keeps; it raises no alert.
+ * with the sweep's prefix. Answers the retry's result; its caller writes the
+ * alert decision's entries (`sweepOrdinaryAlertTail`,
+ * `recordSweepSurvivorAlert`; b.jg5 SRJ-704, SRJ-714).
  *
  * The start sweep is no launch or recovery attempt: nothing latches (a
  * CONFLICT or an UNUSABLE NAME answer is recorded, b.jg5 SRJ-1002), no retry
@@ -9027,6 +9244,14 @@ interface KilledPrePersonaRow {
  * Returns whether the delete succeeded; a failed delete records
  * `orphan-cleanup` too.
  *
+ * The kill-failure alert (b.jg5 SRJ-704, SRJ-714, SRJ-1007), from the
+ * retry's decision, with the start sweep's context and closing sentence: the
+ * ordinary version's text rides in the kill's `orphan-cleanup` entry (`;
+ * kill-failure alert: instanceId=<id> (start sweep): <text>`); after a
+ * success that stands, the survivor version is one `persona-kill-survivor`
+ * entry naming the row, written before the delete. Nothing is posted, even
+ * for a configured persona's row: the sweep acts for no persona.
+ *
  *   [slack] reconcileOrphans: kill succeeded for orphan instanceId=<id> (<outcome>) — deleting the row
  */
 async function killAndDeleteSweptRow(
@@ -9037,25 +9262,27 @@ async function killAndDeleteSweptRow(
 ): Promise<boolean> {
   const { client, stop } = pass
   const id = row.claude_instance_id
-  const { outcome } = await sweepKill(pass, id, row.state, configuredKey)
+  const { outcome, alert } = await sweepKill(pass, id, row.state, configuredKey)
   if (!killLetsNextStepRun(outcome)) {
     if (stop.stopping) {
       console.error(sweepStoppedLine(id, describeKillOutcome(outcome)))
       return false
     }
     recordStartupError(
-      'orphan-cleanup',
-      `kill did not succeed for orphan instanceId=${id} persona=${displayPersona}: ${describeKillOutcome(outcome)}; row kept, no delete was made, its session may still be running`,
+      ORPHAN_CLEANUP_LABEL,
+      `kill did not succeed for orphan instanceId=${id} persona=${displayPersona}: ${describeKillOutcome(outcome)}; row kept, no delete was made, its session may still be running` +
+        sweepOrdinaryAlertTail(row, alert),
     )
     return false
   }
   console.error(`[slack] reconcileOrphans: kill succeeded for orphan instanceId=${id} (${describeKillOutcome(outcome)}) — deleting the row`)
+  recordSweepSurvivorAlert(row, alert)
   try {
     await client.delete({ claude_instance_id: [id] })
     return true
   } catch (err) {
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
-    recordStartupError('orphan-cleanup', `delete failed for orphan instanceId=${id} persona=${displayPersona}: ${describeAgentDirectorFailure(e)}`)
+    recordStartupError(ORPHAN_CLEANUP_LABEL, `delete failed for orphan instanceId=${id} persona=${displayPersona}: ${describeAgentDirectorFailure(e)}`)
     return false
   }
 }
